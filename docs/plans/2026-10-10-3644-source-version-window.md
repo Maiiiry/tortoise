@@ -186,6 +186,17 @@ tests/test_source_fts.py + test_log.py + test_7369_journal_param_boundary.py
                                              → 99 passed, 3 skipped
 tests/test_projection.py -k "source or Source or declaration"
                                              → 6 passed, 176 deselected
+tests/test_ingest_mode.py                    → 18 passed
+
+# found by the PR's own CI (test-slow (b)), then fixed and pinned:
+#   tests/test_ingest_mode.py::TestModeIsomorphism::{test_isomorphic_gated,
+#   test_isomorphic_auto} compared the bulk and granular graphs' full property
+#   tuples, and the two modes honestly mint DIFFERENT `validFrom` instants —
+#   the same class as the `createdAt`/`updatedAt`/`ingestedAt` clock values
+#   already listed in that file's `_VOLATILE_PROPS`. `validFrom` now sits in
+#   that set (with the reason recorded there); the isomorphism contract keeps
+#   comparing every semantic prop (title/contentHash/externalId/version,
+#   node/edge sets, statuses, counts).
 
 # lint + CI selection
 .venv/bin/ruff check tortoise/sdk.py tortoise/projection/entities.py \

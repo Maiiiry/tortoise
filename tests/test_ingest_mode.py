@@ -82,6 +82,17 @@ _CROCKFORD_ULID_RE = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$", re.IGNORECASE)
 # per mode must not be invisible (review-gate P2-1).
 _VOLATILE_PROPS = frozenset({
     "id", "batch_id", "createdAt", "updatedAt", "ingestedAt",
+    # #3644: the `:Source` version WINDOW start — the instant the version was
+    # OBSERVED, minted per call by `create_source` on the same clock as
+    # `updatedAt` and written only through `_upsert_source`'s hash-diff gate.
+    # It is the same class of value as the three timestamps above (a per-call
+    # clock read, not a fact the caller asserted), so two ingest modes of the
+    # SAME bundle honestly carry different instants. Its PRESENCE is excluded
+    # with it, exactly as for `ingestedAt` — the window is guarded where the
+    # writers are (`tests/test_source_version_window_3644.py`: create,
+    # transition, stub, legacy replay), not by this signature, which exists to
+    # catch a mode writing a DIFFERENT node/edge/status/count.
+    "validFrom",
 })
 
 
