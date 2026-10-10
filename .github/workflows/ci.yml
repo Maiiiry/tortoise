@@ -1058,6 +1058,10 @@ jobs:
             --markdownlint-expected-files "$EXPECTED_MD_FILES" \
             --lychee-output "$RUNNER_TEMP/lychee-mh.json" \
             --baseline config/docs-lint-baseline.json
+      - name: Relative link sweep (tracked tree, whole repo)
+        run: |
+          python3 tools/docs_lint_baseline.py sweep \
+            --baseline config/docs-lint-baseline.json
 
   dashboard-js-tests:
     needs: changes
