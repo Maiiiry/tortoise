@@ -2979,7 +2979,7 @@ jobs:
       # required `surface-guard` job would go green on a rewritten gate.
       #
       # PIN THE ENFORCEMENT, NOT THE GENERATOR. `tools/surface-guard.py` is the
-      # gate — it compares the declaration against the approved baseline, and it
+      # gate — it compares the declaration against the frozen baseline, and it
       # is SELF-CONTAINED (its own `_read_manifest`, deliberately independent of
       # `tools/surface_manifest.py`), so nothing in the PR's tree can influence
       # it. Pinning `tools/surface_manifest.py` as well looked symmetrical and was
