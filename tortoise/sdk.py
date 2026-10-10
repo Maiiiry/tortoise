@@ -25572,7 +25572,46 @@ class TortoiseSDK:
         # before this change. So the instant is minted ONCE, rides the payload
         # as `updatedAt`, the fold's `coalesce` picks it up, and the record
         # carries the SAME string — live and replay cannot disagree.
-        ev["updatedAt"] = _now_iso()
+        #
+        # ── #3644 (§4.6 window half): the version's valid-time START ────
+        # The SAME minted instant is the version's `validFrom`, and the two
+        # fields are one clock read, not two (a second `_now_iso()` here is
+        # exactly the live-vs-replay divergence the block above removes).
+        #
+        # WHY THE OBSERVATION INSTANT IS A LEGITIMATE `validFrom`.
+        # §4.7 forbids borrowing the WRITE clock as a valid-time start for a
+        # POINT (#3654): a session's occurrence date is a fact about the
+        # content, so synthesizing one from the ingest clock asserts something
+        # we do not know. A `:Source` VERSION has no such content-side date:
+        # a version IS "the content as read at an instant", so the instant it
+        # was read is definitional, not borrowed — and §4.6 requires the
+        # transition to CLOSE the prior version's window, which can only be
+        # closed at a boundary we observed (`validTo` of the old =
+        # `validFrom` of the new, contiguity by construction).
+        #
+        # The instant is minted for EVERY call and lands on the node ONLY
+        # through `_upsert_source`'s hash-diff gate (create, stub completion,
+        # hash change) — so a no-op re-check moves nothing, live or replayed,
+        # and `validFrom` is added to `_SOURCE_NOOP_IGNORED_KEYS` for the same
+        # reason `updatedAt` is (minted per call ⇒ it can never be the fact
+        # that makes an otherwise-identical re-check "different"). A producer
+        # that KNOWS an earlier instant (a publication date) is a separate
+        # additive input — deliberately not accepted here, because a
+        # caller-asserted start needs the inversion guards the Point window
+        # needed (#3980, #4021, #5358, #5360) and this lane has no such input.
+        #
+        # A SAME-HASH write that changes an extra still emits a `SourceCreated`
+        # carrying this minted instant, exactly as it already carries the
+        # minted `updatedAt` — the gate ignores both on that arm, so the record
+        # over-states neither: reading the version timeline means reading the
+        # FIRST `SourceCreated` plus the `SourceVersioned` records (there is one
+        # node per `url` and only a create or a hash transition opens a
+        # window). Stripping the key on that one arm would buy journal tidiness
+        # the `updatedAt` precedent does not have, at the cost of two emission
+        # variants that can drift.
+        _version_instant = _now_iso()
+        ev["updatedAt"] = _version_instant
+        ev["validFrom"] = _version_instant
         # #5024 P2-2: the pre-state rides THIS CALL's own return value, not a
         # projection-level slot. A slot is shared by every call on the SDK, so
         # two threads sharing one SDK on DIFFERENT urls (different per-url
@@ -25651,7 +25690,17 @@ class TortoiseSDK:
                 # as well would be a second derivation that can disagree.
                 self._emit_event(
                     "SourceVersioned", id=url,
-                    previousContentHash=_old_hash, **payload,
+                    previousContentHash=_old_hash,
+                    # #3644: the PRIOR window's close, named as a recorded act.
+                    # Equal to the payload's `validFrom` BY CONSTRUCTION (the
+                    # same minted instant, above) — contiguity is the whole
+                    # point of §4.6's "the journal record that opens a new
+                    # version closes the old one in the same act". It is a
+                    # JOURNAL-ONLY fact: the node holds the CURRENT version, so
+                    # the fold must not write it (`_SOURCE_HANDLED` skips it,
+                    # like `previousContentHash`).
+                    previousValidTo=payload["validFrom"],
+                    **payload,
                 )
             elif self._source_payload_is_noop(payload, _stored_before):
                 # Genuine re-check: the caller re-sent what we already hold.
@@ -25681,6 +25730,15 @@ class TortoiseSDK:
     # disqualify a no-op.
     _SOURCE_NOOP_IGNORED_KEYS: frozenset = frozenset({
         "ingestedAt", "_merge_run_id", "id",
+        # #3644: the window start, for exactly the reason `updatedAt` below is
+        # here — it is minted by the producer on EVERY call (one clock, shared
+        # with `updatedAt`), so it is not a fact the caller asserted and can
+        # never make an otherwise-identical re-check "different". Leaving it
+        # in the comparison would have re-introduced the unbounded journal
+        # growth #5024 removed (measured there: 12 -> 13 lines on a no-op
+        # re-check). The node is protected independently: `_upsert_source`
+        # writes `validFrom` only through its hash-diff gate.
+        "validFrom",
         # #5024: minted by the producer on EVERY call (the one clock the write
         # and the record share). It is not a fact the caller asserted, so it
         # can never make an otherwise-identical re-check "different" — and

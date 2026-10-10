@@ -716,6 +716,16 @@ class _EntityHandlers:
         "id", "url", "canonicalUrl", "urlAliases", "sourceKind", "externalId",
         # version
         "contentHash", "version", "ingestedAt", "updatedAt", "sourceDate",
+        # #3644 (§4.6 window half): the CURRENT version's valid-time start.
+        # Declared because it IS written to the node now, and the declaration is
+        # the read filter's contract (an undeclared property is dropped from
+        # every read bag — the #3998 'declared vs dropped' class). `validTo` /
+        # `expiredAt` are deliberately NOT declared yet: no writer writes them
+        # on a `:Source` (the removal field is #3590 S2's decision), so
+        # declaring them would open a read/write surface with nothing behind
+        # it. The PRIOR version's close is a journal fact on the
+        # `SourceVersioned` record (`previousValidTo`), not a node property.
+        "validFrom",
         # availability (#3998 — the third value on the source record)
         "rawState", "rawStateAt",
         # transient merge token (`_index_source_merge`'s `s.__runId = $rid`).
@@ -784,6 +794,24 @@ class _EntityHandlers:
         # record alone, and `_persist_extra_props` must not also write it (the
         # #330/#3312 one-sided-property class).
         "previousContentHash",
+        # #3644 (§4.6 window half): the `SourceVersioned` record's PRIOR-window
+        # close. Like `previousContentHash`, it describes the TRANSITION, not
+        # the node — the node holds the CURRENT version's window (open end), so
+        # `_persist_extra_props` must not also write this one. Same #330/#3312
+        # one-sided-property class.
+        "previousValidTo",
+        # #3644: the window start is owned by the fixed SET clauses above (ON
+        # CREATE + the hash-diff ON MATCH gate), never by the open-set
+        # passthrough — a payload must not be able to move a version's window
+        # without moving the version (see `_SOURCE_SERVER_MANAGED_PROPS`). The
+        # `_upsert_document` lane mints no window of its own (a document IS a
+        # `:Source`, but its window belongs to the versioned `create_source`
+        # lane), so a `validFrom` in a `DocumentCreated` payload is skipped
+        # there rather than persisted: before this key was handled it landed as
+        # an UNDECLARED node property, which `filter_source_props` then dropped
+        # from every read bag — i.e. it was never served on any surface, and
+        # adding it to the declaration is what makes that explicit.
+        "validFrom",
         # S0a/S0b (#5012): server-managed source-identity props.  They are
         # written by `_upsert_source`'s fixed SET clauses, never by the
         # open-set passthrough (which would let a payload clobber the
@@ -3651,6 +3679,19 @@ class _EntityHandlers:
             # ...57.047168 on the same 12-instance run). `coalesce` keeps a
             # legacy/foreign record without the key working exactly as before.
             "              s.ingestedAt = coalesce($ingestedAt, $now), "
+            # ── #3644 (§4.6 window half) ────────────────────────────────
+            # The CURRENT version's valid-time start. Written from the
+            # RECORDED instant (`$vf`, minted once by `create_source` and
+            # carried on the record) — never `coalesce($vf, $now)`, which would
+            # stamp the REPLAY clock on a record that carries no window (every
+            # legacy journal line, and every stub-targeted write). A legacy
+            # record therefore replays to a source with NO `validFrom`: an
+            # ABSENT start is an open/unbounded start (§4.1/#3654), which is
+            # both the honest value and byte-identical to what the pre-change
+            # live write produced. There is no ON CREATE `validTo`: the current
+            # version's window is OPEN while it is current, and Cypher cannot
+            # write a NULL property anyway — absent IS the open end.
+            "              s.validFrom = $vf, "
             "              s.version = 1, "
             "              s.externalId = $ext, "
             "              s.format = coalesce($fmt, s.format), "
@@ -3691,6 +3732,24 @@ class _EntityHandlers:
             "                     WHEN s.contentHash IS NULL OR s.contentHash <> $hash "
             "                     THEN coalesce($updatedAt, $now) ELSE s.updatedAt END, "
             "           s.sourcePath = coalesce($sp, s.sourcePath), "
+            # #3644: the window start moves ONLY on the same hash-diff gate as
+            # `version`/`updatedAt` — a create/stub-completion (stored hash
+            # NULL) or a real version transition. A same-hash write leaves it
+            # untouched (there is no new version to open a window for), and a
+            # hash-less write (`$hash IS NULL`, the preserve-everything arm)
+            # never moves it either. On the gate, the value is `$vf` ITSELF —
+            # deliberately NOT `coalesce($vf, s.validFrom)`: a transition whose
+            # record carries no window start (a foreign or pre-#3644 journal
+            # line) leaves the new version's start UNKNOWN, and `$vf = null`
+            # clears the property (verified: the ON CREATE arm relies on the
+            # same `SET … = $vf` removal, pinned by the legacy-replay test).
+            # Inheriting the PRIOR version's start would be a false claim about
+            # the current version — the old window's open is not the new one's,
+            # and the prior close is exactly what the record could not state.
+            "           s.validFrom = CASE WHEN $hash IS NULL THEN s.validFrom "
+            "                       WHEN s.contentHash IS NULL OR s.contentHash <> $hash "
+            "                       THEN $vf "
+            "                       ELSE s.validFrom END, "
             "           s.canonicalUrl = coalesce(s.canonicalUrl, $cu), "
             "           s.urlAliases = CASE WHEN $raw_url IN coalesce(s.urlAliases, []) "
             "               THEN coalesce(s.urlAliases, []) "
@@ -3744,6 +3803,10 @@ class _EntityHandlers:
                 # #5024: the recorded instants (None for a legacy record —
                 # `coalesce` falls back to `$now`, the pre-#5024 behaviour).
                 "ingestedAt": ev.get("ingestedAt"),
+                # #3644: the record's own window start (None for a legacy
+                # record — the clause above then leaves the node's window
+                # alone rather than synthesizing one from `$now`).
+                "vf": ev.get("validFrom"),
                 "updatedAt": ev.get("updatedAt"),
                 "ext": ev.get("externalId", ""),
                 "fmt": ev.get("format"),
@@ -3846,6 +3909,14 @@ _SOURCE_NODE_PROP_NAMES: frozenset = _EntityHandlers._SOURCE_NODE_PROPS
 # (what a caller may set).
 _SOURCE_SERVER_MANAGED_PROPS: frozenset = frozenset({
     "rawState", "rawStateAt",
+    # #3644: a version's valid-time window is minted by the writer (one clock,
+    # shared with `updatedAt`) and journalled — it is never a caller-asserted
+    # property. Declaring it on the node makes it readable and makes the read
+    # filter keep it; listing it HERE is what stops
+    # `tortoise_update_entity(url, validFrom=...)` from writing a window no
+    # transition produced (the same "declared ⇒ writable" trap #5196 round 3
+    # found for `__runId`).
+    "validFrom",
     # `__runId` is DECLARED (it is written to the node by `_upsert_source`'s
     # `run_clause`) but must stay CALLER-UNSETTABLE. `_update_entity` uses the
     # declaration as its WRITE allowlist, so declaring it without listing it here

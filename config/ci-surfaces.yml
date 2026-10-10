@@ -1118,6 +1118,27 @@ surfaces:
   # blanket-skips `contentHash` as "hash-gated"), not fail-before evidence —
   # do not count it among the pins that fail on the unfixed base.
   - test_source_rematerialisation_5024.py
+  # #3644 (§4.6 *Versioning*, the WINDOW half): a version transition must OPEN
+  # the new version's window and CLOSE the prior one in the same act —
+  # `create_source` mints the window instant once (the same clock as
+  # `updatedAt`), `_upsert_source` writes the node's `validFrom` through the
+  # same hash-diff gate as `version`, and the `SourceVersioned` record carries
+  # `validFrom` + `previousValidTo`. `core` is the arm that owns the change:
+  # `tortoise/projection/entities.py` (where `_upsert_source` and
+  # `_fold_source_versioned` live) selects `core`, per
+  # `python3 tools/ci_selection.py --changed tortoise/projection/entities.py`.
+  # `tortoise/sdk.py` and `tortoise/projection/__init__.py` are SHARED_MODULES
+  # (already the full matrix). The prior-window test closes the graph and reads
+  # the JOURNAL alone (there is one node per `url`, so the history can only live
+  # in the record chain), so this file is the guard for that invariant.
+  # Fail-before/pass-after evidence: on the unfixed base (production files
+  # stashed, test file in place) **9 of the 14 fail** — everything that reads a
+  # window. The 5 that pass are FORWARD guards, not fail-before evidence: the
+  # no-op repeat-safety pin, the legacy open-start pin, the legacy-hash-change
+  # pin (nothing writes a window on the base, so "not inherited" holds
+  # trivially), the stub open-start pin and the journal-only-payload pin. All 14
+  # pass here.
+  - test_source_version_window_3644.py
   # #5199: the derivation-link version anchor (`sourceVersion` on a derivation
   # `references` link) — `tortoise/projection/edges.py` + `tortoise/projection/entities.py`
   # select the `core` surface, so the guard for the anchor runs with the code it
@@ -3600,6 +3621,7 @@ durations:
   test_source_version_extractedfrom_5038.py: 38.5  # #5256: 33 tests; docker lane (#1647 default) — not carve_out-registered; locally measured
   test_source_change_notice_5516.py: 65.0  # #5516: 12 tests; docker lane (#1647 default) — locally measured (64s docker, 66s embedded)
   test_source_rematerialisation_5024.py: 20.0  # #5024: 30 tests (21 + 9 review-round-6 pins), docker FalkorDB; locally measured (11-30s across runs, fleet-contention sensitive)
+  test_source_version_window_3644.py: 22.0  # #3644: 14 tests, embedded carve-out lane; locally measured (8-27s across clean runs; fleet-contention sensitive — redislite start failures under load, not assertions)
   test_rebuild_event_meta_watermark_4653.py: 25.0  # #4653: 29 tests, docker FalkorDB; locally measured
   test_restore_seq_3902.py: 0.8
   test_retention_promise.py: 2.7
