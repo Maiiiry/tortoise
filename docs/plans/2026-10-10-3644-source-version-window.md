@@ -115,7 +115,7 @@ until that input exists no inversion is reachable, so no guard is warranted.
 | Repeat-safety (§9.6 journal cost bound) | hash-diff gate + `_SOURCE_NOOP_IGNORED_KEYS` | `…::test_a_noop_recheck_moves_neither_the_window_nor_the_journal` |
 | Declared `:Source` node surface | `_SOURCE_NODE_PROPS` (+ the #3998 mirror list) | `tests/test_3998_raw_absent_state.py` (41 passed) |
 | Tenant write surface | `_SOURCE_SERVER_MANAGED_PROPS` | `…::test_the_window_start_cannot_be_forged_through_the_entity_surface` |
-| CI selection | `config/ci-surfaces.yml` (`core`) | `python3 tools/ci_selection.py --changed tortoise/projection/entities.py`; `--integrity` |
+| CI selection | `config/ci-surfaces.yml` (`core`) | `uv run python tools/ci_selection.py --changed tortoise/projection/entities.py`; `--integrity` |
 
 No DB migration, no MCP tool, no public SDK method or signature change
 (`create_source`'s signature is untouched — the instant is minted internally), so the
@@ -191,8 +191,8 @@ tests/test_projection.py -k "source or Source or declaration"
 .venv/bin/ruff check tortoise/sdk.py tortoise/projection/entities.py \
     tests/test_source_version_window_3644.py tests/test_3998_raw_absent_state.py
                                              → All checks passed
-python3 tools/ci_selection.py --integrity    → ✅ all test files classified
-python3 tools/ci_selection.py --changed tortoise/projection/entities.py
+uv run python tools/ci_selection.py --integrity    → ✅ all test files classified
+uv run python tools/ci_selection.py --changed tortoise/projection/entities.py
     → surfaces ["core"], test_files include test_source_version_window_3644.py
 ```
 
