@@ -528,6 +528,9 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("up to and including ", False),
         ("one and a half to ", True),
         ("1½ to ", True),
+        ("at 3pm ", False),          # a digit joined to LETTERS is not a number
+        ("at 4k ", False),
+        ("at 5G ", False),
         ("between 2 and about ", True),   # a connective CHAIN
         ("2 to roughly ", True),
         ("from 2 up to and including ", True),
@@ -560,8 +563,11 @@ def test_count_fragment_scan_crosses_a_connective_chain():
 
 def test_count_fragment_scan_ignores_a_preceding_ordinal():
     """An ordinal is a DATE reference, not a number span: 'on 3rd, 4 days
-    ago' must still promote count=4."""
-    for prefix in ("on 3rd, ", "on the 22nd, ", "since the 1st, "):
+    ago' must still promote count=4. Same for a token whose digits are joined
+    to letters — a time if it ends in 'pm', a label if it ends in 'k'/'G'."""
+    for prefix in ("on 3rd, ", "on the 22nd, ", "since the 1st, ",
+                   "what did I do at 3pm ", "I raised 4k ",
+                   "the 5G ", "on 3d "):
         assert _count_is_fragment(prefix) is False, prefix
 
 

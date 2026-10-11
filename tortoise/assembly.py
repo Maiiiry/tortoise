@@ -184,8 +184,7 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #: tokens that can sit BETWEEN two parts of one number, or between the bounds
 #: of a range, and so are part of neither bound: conjunctions, range
 #: connectors, place-value markers, fraction words, the offset units, degree
-#: adverbs that can qualify a bound ('and about five'), and the scale words
-#: ('hundred', 'thousand') a bound may be built from. A plain SENTENCE word
+#: adverbs that can qualify a bound ('and about five'). A plain SENTENCE word
 #: ('things', 'store', 'Wednesday', 'May', 'iPhone') is deliberately absent:
 #: that is what ends the scan, and so what makes a legitimately standalone
 #: count ('I bought 2 things 3 days ago' → 3) promote.
@@ -243,21 +242,22 @@ _NUMBER_WORDS = frozenset({
     "millions", "billion", "billions", "dozen", "dozens", "score",
     "scores",
 })
-#: a numeral token may carry letters the tokenizer does not split off —
-#: '1½', '3¾' — and those still continue the number; an ORDINAL ('3rd',
-#: '22nd') does NOT, because it is a date reference and not a number span
-_ORDINAL_SUFFIXES = ("st", "nd", "rd", "th")
+#: a numeral token may carry a fraction glyph the tokenizer does not split
+#: off ('1½', '3¾') and still be a number; but a token whose digits are joined
+#: to LETTERS ('3pm', '4k', '5G', '3rd') is NOT a number span — it is a time,
+#: a quantity label or an ordinal, and a count after it is a whole number.
+#: (`origin/main` agreed for the first three: its branch matched a digit
+#: followed only by non-word characters, so 'at 3pm 5 days ago' promoted 5.)
 _FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
 
 
 def _is_number_token(token: str) -> bool:
     """True when `token` IS a bound of a number expression."""
     low = token.lower()
-    if low in _NUMBER_WORDS or token.isdigit():
+    if low in _NUMBER_WORDS:
         return True
-    if any(ch.isdigit() or ch in _FRACTION_GLYPHS for ch in token):
-        return not low.endswith(_ORDINAL_SUFFIXES)
-    return False
+    return bool(token) and all(
+        ch.isdigit() or ch in _FRACTION_GLYPHS for ch in token)
 
 
 def _continues_number(token: str) -> bool:
