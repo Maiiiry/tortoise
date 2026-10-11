@@ -1407,6 +1407,14 @@ function claimIntentInFlight() {
   // just-created org on the first-run path; sessionRef keeps the mount
   // session so the step-1 submit can provision.
   const [welcomeTeamReady, setWelcomeTeamReady] = React.useState(false)
+  // #3728: `teams` is HOISTED here (from the graph/team block ~750 lines below)
+  // so `welcomeHasOrg` — derived from `welcomeTeamReady` and `teams` — can be
+  // declared ABOVE the step-announcement effect and become a LEGAL dep of it.
+  // A deps array evaluates eagerly DURING render, so a later-declared const
+  // cannot sit in one (the #2426/#2621/#2709 TDZ white-screen) — the same
+  // constraint that kept `isBuildFork` body-only until it was hoisted for
+  // #3428/#2937. Nothing else moves, and the state is inert until read.
+  const [teams, setTeams] = React.useState([])
   const sessionRef = React.useRef(null)
   // #1643/#1692: the getting-started wizard (post-key steps: harness →
   // integrations → skills → seed → done). For first-timers it follows the
@@ -1838,6 +1846,17 @@ function claimIntentInFlight() {
   const wizardFork = wizardForkChosen || (onboarding && onboarding.fork) || ''
   const isBuildFork = wizardFork === 'build'
 
+  // #2323 (Option B): name-first first-run — an org exists once the wizard
+  // provisioned it (welcomeTeamReady) or the account already held one
+  // (re-entry / invite-held paths). Drives the welcome exit gate + heading.
+  // #3728: HOISTED above the step-announcement effect (with `teams`, further
+  // up) so it can be a DEP. It used to be declared ~5,400 lines below, which
+  // left it readable only in the effect BODY: an invite accept or a late
+  // `loadTeams` landing while the user sat on step 0 flipped the <h1> to the
+  // organisation variant while the sr-only region kept announcing the
+  // create-your-organisation label, with no other dep changing to re-run it.
+  const welcomeHasOrg = welcomeTeamReady || (Array.isArray(teams) && teams.length > 0)
+
   // #2361 review-r2 (a11y P1): announce + move focus on wizard step change.
   // Step 1 (org input) and step 3 (paste field / copy button) carry their own
   // autofocus targets — the container must not steal from them, so those two
@@ -1854,8 +1873,11 @@ function claimIntentInFlight() {
     setWizardStepAnnounce(`Step ${wizardStep + 1} of 4: ${label}`)
     if (!wizardFocusInit.current) { wizardFocusInit.current = true; return }
     // #2361 review-r4 (P3): focus ONLY on step changes — toggling the paste
-    // disclosure (wizardShowPaste) or an invite accept (welcomeHasOrg) must
-    // not yank focus from the control the user just activated.
+    // disclosure (wizardShowPaste) must not yank focus from the control the
+    // user just activated, and neither must an invite accept: `welcomeHasOrg`
+    // IS a dep (#3728) so accepting an invite DOES re-run this effect, and the
+    // stepChanged guard below is what keeps focus on the control the user
+    // just activated (no step change, no focus move).
     const stepChanged = lastWizardStepRef.current !== wizardStep
     lastWizardStepRef.current = wizardStep
     if (!stepChanged) return
@@ -1878,17 +1900,22 @@ function claimIntentInFlight() {
     // `effectivelyPaused` unchanged, which would leave the announcement saying
     // "Not connected yet" beneath a <h1> that had already flipped to "You're
     // all set": the same disagreement this dep list exists to prevent.
-  }, [wizardStep, welcomeMode, authed, wizardPaused, effectivelyPaused, serverHarnessConnected, isBuildFork])
-  // ⛔ #2426 e2e catch (P0): welcomeHasOrg (~line 4890) and wizardShowPaste
-  // (~1832) are declared LATER in this giant component — a hook dep array
-  // evaluates eagerly DURING render, so listing either here threw "Cannot
-  // access … before initialization" on every authenticated render and
-  // blanked the whole dashboard on main (introduced when 38498ab4 added
-  // both to this effect's deps). The effect BODY is a closure that runs
-  // post-render (safe to read them there). Semantics of dropping them:
-  // toggling the paste disclosure on the SAME step now does not re-run the
-  // effect, which is exactly the "must not yank focus on disclosure toggle"
-  // intent — the stepChanged guard already no-ops it.
+    // #3728: `welcomeHasOrg` must be a dep for the same reason. It is one of
+    // the label inputs (`hasOrg:`), and it is now declared ABOVE this effect
+    // (with `teams`), so listing it is legal. Without it a flag flip at step 0
+    // re-rendered the <h1> to the organisation variant while the sr-only region
+    // kept the create-your-organisation label until some unrelated dep moved.
+  }, [wizardStep, welcomeMode, authed, wizardPaused, effectivelyPaused, serverHarnessConnected, isBuildFork, welcomeHasOrg])
+  // ⛔ #2426 e2e catch (P0): `wizardShowPaste` (~1832) is declared LATER in
+  // this giant component — a hook dep array evaluates eagerly DURING render, so
+  // listing it here would throw "Cannot access … before initialization" on
+  // every authenticated render and blank the whole dashboard on main
+  // (introduced when 38498ab4 added it and welcomeHasOrg to this effect's deps;
+  // #3728 hoisted welcomeHasOrg above, so THAT identifier is a dep now). The
+  // effect BODY is a closure that runs post-render (safe to read them there).
+  // Semantics of dropping wizardShowPaste: toggling the paste disclosure on the
+  // SAME step now does not re-run the effect, which is exactly the "must not
+  // yank focus on disclosure toggle" intent — the stepChanged guard no-ops it.
   const [onboardingComplete, setOnboardingComplete] = React.useState(false)
   const [welcomeOriented, setWelcomeOriented] = React.useState(false)
   const [wizardSubject, setWizardSubject] = React.useState('')
@@ -2153,7 +2180,10 @@ function claimIntentInFlight() {
   // #1680: the session user metadata is captured at mount for component-
   // scope reads (the seed-step prefill for returning users).
   const sessionMetaRef = React.useRef(null)
-  const [teams, setTeams] = React.useState([])
+  // #3728: `teams` is declared ABOVE (next to welcomeTeamReady) so
+  // `welcomeHasOrg` — derived from it — can be hoisted above the
+  // step-announcement effect and listed in that effect's deps; it is NOT
+  // declared here any more (see the note on the hoisted state).
   const [graphs, setGraphs] = React.useState([])
   const [currentOrgId, setCurrentOrgId] = React.useState(null)
   // #1893 one-shot hydration: reconcile the persisted scope against the
@@ -7284,10 +7314,8 @@ function claimIntentInFlight() {
   // holds no plaintext at all. (No localStorage is involved: the legacy key slot
   // was removed in #2246 and mintTripwire.test.js pins its absence.)
   const harnessKey = wizardDurableKey || durableConnect.key || ''
-  // #2323 (Option B): name-first first-run — an org exists once the wizard
-  // provisioned it (welcomeTeamReady) or the account already held one
-  // (re-entry / invite-held paths). Drives the welcome exit gate + heading.
-  const welcomeHasOrg = welcomeTeamReady || (Array.isArray(teams) && teams.length > 0)
+  // #3728: `welcomeHasOrg` is declared ABOVE (next to the step-announcement
+  // effect, so it can be one of that effect's deps) — see the derivation there.
   // The org name shown in the welcome header/step-1 summary is the CURRENT
   // team's name — welcomeOrgName (the first-run provision) only wins right
   // after creation, before loadTeams pins `team` (code-review P2: a stale

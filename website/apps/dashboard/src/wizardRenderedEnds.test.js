@@ -110,7 +110,12 @@ function extractH1(source) {
 // prefix and reading what it hands the setter is what makes the announcement's
 // rendered end observable — a widened local (shape 1) is inside the prefix and
 // therefore changes the string.
-function extractAnnouncementPrefix(source) {
+// Locate the ONE effect that produces the announcement, structurally: the `{`
+// that opens its body, the offset of the `React.useEffect(` call, and the
+// matching `}` of the body. The rendered-end probe and the #3728 deps pin both
+// walk from here, so the two cannot disagree about WHICH effect owns the
+// announcement.
+function announcementEffectBlock(source) {
   const masked = maskCode(source)
   const marker = 'setWizardStepAnnounce('
   const count = masked.split(marker).length - 1
@@ -133,6 +138,19 @@ function extractAnnouncementPrefix(source) {
   assert.notEqual(effectStart, -1, 'the announcement must be produced by a React.useEffect')
   assert.match(source.slice(effectStart, open), /^React\.useEffect\([\s\S]*?\)\s*=>\s*$/,
     'the sliced block must be the useEffect arrow body that precedes the announcement call')
+  let d = 0
+  let close = -1
+  for (let i = open; i < masked.length; i++) {
+    const c = masked[i]
+    if (c === '{') d++
+    else if (c === '}') { d--; if (d === 0) { close = i; break } }
+  }
+  assert.notEqual(close, -1, 'the announcement effect body must be closed')
+  return { masked, call, open, effectStart, close }
+}
+
+function extractAnnouncementPrefix(source) {
+  const { masked, call, open } = announcementEffectBlock(source)
   // The matching close paren of the call (the template argument is masked, so its
   // braces cannot be mistaken for the call's).
   let d = 0
@@ -144,6 +162,48 @@ function extractAnnouncementPrefix(source) {
   }
   assert.notEqual(end, -1, 'the setWizardStepAnnounce call must be closed')
   return source.slice(open + 1, end + 1)
+}
+
+// ── #3728: the announcement's DEPS must cover every input that decides it ────
+// JS literals a label option may be set to inline: they are not inputs.
+const LITERALS = new Set(['true', 'false', 'null', 'undefined'])
+
+// `wizardStageLabel` is pure, so the announced stage is a function of the step
+// argument plus the identifier-valued options of the `wizardStageLabel(...)`
+// call in the effect BODY. React re-runs the effect only when a DEP changes, so
+// any of those read-but-unlisted inputs leaves the sr-only region frozen on a
+// stage the <h1> has already left — #3728's shape, where `welcomeHasOrg` was
+// declared ~5,400 lines below the effect and therefore could not legally appear
+// in its deps at all (the #2426/#2621/#2709 TDZ white-screen). Hoisting the
+// derivation ABOVE the effect (as #3428/#2937 did for `isBuildFork`) is what
+// makes the dep legal; this pin derives the required set FROM the label call, so
+// a NEW input is covered the moment it is read — unlike the frozen whole-list
+// regex it replaces (wizardConnectTripwire.test.js, #2912).
+function announcementInputsAndDeps(source) {
+  const { open, close } = announcementEffectBlock(source)
+  const body = source.slice(open + 1, close)
+  const call = body.match(/wizardStageLabel\(\s*([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}/)
+  assert.ok(call, 'the effect body must build the label through wizardStageLabel(step, {...})')
+  const inputs = [call[1]]
+  for (const pair of call[2].split(',')) {
+    const value = (pair.split(':')[1] || '').trim()
+    // A literal can never change, so it can never need a re-run (and no literal
+    // may be demanded as a dep).
+    if (/^[A-Za-z_$][\w$]*$/.test(value) && !LITERALS.has(value)) inputs.push(value)
+  }
+  // The deps array is the first `}, [` AFTER the effect body's close brace.
+  const depsStart = source.indexOf('}, [', close)
+  assert.notEqual(depsStart, -1, 'the announcement effect must close with a deps array')
+  const depsEnd = source.indexOf('])', depsStart)
+  assert.notEqual(depsEnd, -1, 'the announcement effect deps array must be closed')
+  const deps = source.slice(depsStart + 4, depsEnd).split(',').map((s) => s.trim()).filter(Boolean)
+  return { inputs, deps }
+}
+
+// The property: no input that decides the announcement may be absent from deps.
+function missingAnnouncementDeps(source) {
+  const { inputs, deps } = announcementInputsAndDeps(source)
+  return inputs.filter((n) => !deps.includes(n))
 }
 
 // renderToStaticMarkup escapes text; decode what the probe's own renderer emits.
@@ -311,6 +371,57 @@ test('#5820 falsifiability: a DIFFERENT option set between the two ends fails', 
   assert.equal(bad.length, 1, 'the rendered-end pin must catch a divergent option set')
   assert.equal(bad[0].h1, SETUP_PAUSED_NO_CONNECTION_OBSERVED)
   assert.equal(bad[0].announcement, `Step 4 of 4: ${NO_CONNECTION_OBSERVED}`)
+})
+
+// ── #3728: the deps pin, with its own falsifiability ────────────────────────
+// Synthetic snippets first, so the analyzer cannot rot into a no-op: it must
+// flag a read-but-unlisted label input, and must NOT demand a dep for an option
+// passed as a literal (a literal cannot change, so it can never need a re-run).
+function depsSnippet(deps) {
+  return [
+    'function App() {',
+    '  const [step, setStep] = React.useState(0)',
+    '  const welcomeHasOrg = true',
+    '  const serverHarnessConnected = false',
+    '  React.useEffect(() => {',
+    '    const label = wizardStageLabel(step, { hasOrg: welcomeHasOrg, paused: false, connected: serverHarnessConnected, buildFork: false })',
+    '    setWizardStepAnnounce(`Step ${step + 1} of 4: ${label}`)',
+    `  }, [${deps}])`,
+    '  return null',
+    '}',
+  ].join('\n')
+}
+
+test('#3728 falsifiability: a label input missing from the deps is a violation', () => {
+  assert.deepEqual(missingAnnouncementDeps(depsSnippet('step, serverHarnessConnected')), ['welcomeHasOrg'],
+    'a label input read in the body but absent from deps must be reported')
+  assert.deepEqual(missingAnnouncementDeps(depsSnippet('step, welcomeHasOrg, serverHarnessConnected')), [],
+    'literal options (paused/buildFork) must NOT be demanded as deps')
+  assert.deepEqual(announcementInputsAndDeps(depsSnippet('step')).deps, ['step'],
+    'the deps parser must read the array, not a slice of the body')
+})
+
+test('#3728: the real file lists every announcement input as a dep', () => {
+  const { inputs, deps } = announcementInputsAndDeps(mainJsxSrc)
+  assert.deepEqual(missingAnnouncementDeps(mainJsxSrc), [],
+    `every input of the announced label must be a dep (inputs=${inputs}, deps=${deps})`)
+  // Non-vacuity: the probe must be reading the REAL label call — the five
+  // identifiers below are exactly the ones the live call passes.
+  for (const name of ['wizardStep', 'welcomeHasOrg', 'effectivelyPaused', 'serverHarnessConnected', 'isBuildFork']) {
+    assert.ok(inputs.includes(name), `${name} must be extracted as an announcement input (got ${inputs})`)
+  }
+  assert.ok(deps.includes('welcomeMode') && deps.includes('authed'),
+    `the parsed deps must be the effect's real list (got ${deps})`)
+})
+
+test('#3728 falsifiability: dropping welcomeHasOrg from the real deps goes red', () => {
+  // The shipped-before regression shape, applied to the real source: the dep is
+  // removed while the label call still reads the flag.
+  const reverted = patch(mainJsxSrc, ', isBuildFork, welcomeHasOrg])', ', isBuildFork])', 'revert the #3728 dep')
+  assert.equal(announcementInputsAndDeps(reverted).inputs.includes('welcomeHasOrg'), true,
+    'the reverted source must still read welcomeHasOrg in the label call')
+  assert.deepEqual(missingAnnouncementDeps(reverted), ['welcomeHasOrg'],
+    'the guard must go red on the exact shape #3728 shipped')
 })
 
 test('#5820: the extractors fail LOUD rather than passing vacuously', async () => {
