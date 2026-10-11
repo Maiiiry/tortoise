@@ -53,8 +53,29 @@ The two non-measured states are **not** interchangeable:
 
 | State | Means | Examples |
 | --- | --- | --- |
-| `unavailable` | the metric exists but could not be read *now* — a retry or a repair fixes it | `analytics_store_unreachable`, `analytics_write_path_unconfigured`, `analytics_page_cap_truncated`, `window_predicate_not_applied`, `unparseable_created_at`, `first_memory_at_missing`, `unparseable_analytic_rows`, `unclassifiable_analytic_rows` |
+| `unavailable` | the metric exists but could not be read *now* — a retry or a repair fixes it | `analytics_store_unreachable`, `analytics_write_path_unconfigured`, `analytics_page_cap_truncated`, `window_predicate_not_applied`, `unparseable_created_at`, `first_memory_at_missing`, `unparseable_analytic_rows`, `unclassifiable_analytic_rows`, `no_memory_in_default_graph_org_scope_unknown` |
 | `not_measurable` | there is nothing to measure, and no retry changes that | `no_memory_produced_in_lifetime` (nothing to recall from); `value_confirmed` (no instrument exists — the stage always reports this) |
+
+**Stage 4's gate and its count have different scopes (#4039).** The gate is the
+org **default graph**'s `first_memory_at`; the count is the org-wide analytics
+stream (`analytics_events` carries no `graph_id`). For a multi-graph org that
+produced memory only outside the default graph, the graph-scoped absence is not
+a fact about the org, so `no_memory_produced_in_lifetime` would be a false claim
+about it. When that org's windowed retrieval count is **exact and positive** —
+org-wide evidence contradicting the graph-scoped gate — the stage reports
+`unavailable` / `no_memory_in_default_graph_org_scope_unknown` instead. The
+same org with an exact `0` (or a withheld count: a truncated page, an
+unplaceable or unclassifiable row) still reads
+`no_memory_produced_in_lifetime`: no org-wide evidence contradicts the gate, and
+this read cannot enumerate the org's other graphs, so that case is
+indistinguishable from a single-graph org with no memory. Making the gate itself
+org-scoped (an org's graph list, then a lifetime memory scan per graph) would
+remove that residual; it is a new read rather than a disclosure choice — tracked
+in #8149.
+
+In the cohort roll-up this reason is attributed **per org** rather than hoisted
+as a store-level note: it is the org that is ambiguous, not the analytics store.
+The affected orgs are named in `stages.recall_attempted.orgs_unavailable`.
 
 The window guard **fails closed**: a row that is out of window, or that cannot
 be placed on the timeline at all (unparseable, naive, an unexpected type),
@@ -242,7 +263,10 @@ straddles it. This is in the payload's `limitations` too.
 
 Carried in the payload's `limitations` list — read it before citing a number.
 `recall_attempted` cannot distinguish an answered query from an empty one; it
-cannot be attributed to a session or a graph; the analytics read is capped at
+cannot be attributed to a session or a graph; its gate is graph-scoped while
+its count is org-wide, which is refused as
+`no_memory_in_default_graph_org_scope_unknown` when the exact org-wide count
+contradicts the gate (see above); the analytics read is capped at
 1000 rows (a truncated page reports `unavailable`, never a partial count);
 `value_confirmed` is not measurable; and `memory_produced` is
 extraction-succeeded, not memory-that-helped.

@@ -15884,7 +15884,12 @@ def _read_recall(org: dict, since: str, until: str, lifetime: dict | None,
     support, so a full page is a lower bound), and `not_measurable` for an org
     that has never produced memory, where there is nothing to recall from and
     no retry would change it. Conflating those two would accuse a healthy org
-    of failing to report.
+    of failing to report — and the converse (#4039) is just as wrong: an org
+    whose DEFAULT graph has no memory while its org-wide windowed retrieval
+    count is exactly positive is not an org that has nothing to recall from,
+    it is one whose memory may lie outside the graph this read opens, so the
+    fold refuses it as `unavailable` /
+    `no_memory_in_default_graph_org_scope_unknown`.
     """
     from tortoise.activation_scorecard import (
         recall_stages as _recall_stages,
