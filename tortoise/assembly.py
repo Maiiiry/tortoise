@@ -163,12 +163,17 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 # the number words a COMPOUND count can end on ('twenty two weeks ago'):
 # the offset regex matches the trailing word alone, so its presence just
 # before a determiner means the count is NOT the one the regex read.
-# The separator class carries the HYPHENATED/DASHED spellings too: a hyphen
-# is a word separator, so `\b` sees a boundary there ('twenty-one') and the
-# whitespace-only form let the regex read 'one' — a window ~20 units wrong.
+# The separator is `\W+` — deliberately NOT an allow-list. `\W` is
+# Unicode-aware, so SPACE, the ASCII hyphen, the whole Unicode
+# hyphen/dash/minus family (U+2010..U+2015, U+2212) and a comma all
+# qualify, and `\b` sees a boundary before the trailing count word for
+# every one of them. An allow-list is what let 'twenty-one' (and U+2010 /
+# U+2011 / U+2212) slip through and anchor a 21-week question at one week.
+# The `and` connective ('twenty and one') is the one separator that is not
+# `\W`, so it is named explicitly.
 _RE_COMPOUND_NUMBER = re.compile(
     r"\b(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
-    r"thousand|million)[\s\-–—]+$", re.IGNORECASE)
+    r"thousand|million)(?:\W+|\s+and\s+)+$", re.IGNORECASE)
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how
 # many <unit> did I spend / had I been", "how long did (I|the narrator)
@@ -196,12 +201,16 @@ _RE_FREQUENCY = re.compile(
     r"have\s+passed\s+since\s+|did\s+it\s+take\s+|"
     r"(?:weeks?|months?|years?)\s+before\s+)",
     re.IGNORECASE)
-# recency / 'latest' — the ORDERING-INSTRUCTION residue ('latest' as in
-# 'from earliest to latest') stays a guard; the adverbial 'most recently'
-# is promoted to AGO_RELATIVE above, and the attributive 'most recent' is
-# neither promoted nor guarded — it falls through as it always did.
+# recency / 'latest' / the ATTRIBUTIVE 'most recent' — the ORDERING-
+# INSTRUCTION residue ('latest' as in 'from earliest to latest'; 'most
+# recent' as in 'from earliest to most recent' or 'my most recent phone')
+# stays a guard, exactly as on main. Only the ADVERBIAL 'most recently' is
+# promoted to AGO_RELATIVE above, and `\bmost\s+recent\b` does NOT match it
+# ('recently' has no word boundary after 'recent'). The guard is checked
+# BEFORE the shape templates, so an attributive recency question can never
+# fall through and fire ORDERING/CURRENT_STATE/INTERVAL.
 _RE_RECENCY = re.compile(
-    r"\blatest\b|\bthe\s+last\s+one\b", re.IGNORECASE)
+    r"\bmost\s+recent\b|\blatest\b|\bthe\s+last\s+one\b", re.IGNORECASE)
 # advice / preference / recommendation (R16 misfire): "which SHOULD I do
 # first, A or B" carries ordering morphology but is preference, not fact —
 # firing would REPLACE the working pool with a shape block. Modal + advice

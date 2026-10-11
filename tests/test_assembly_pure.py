@@ -349,13 +349,20 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         # units wrong
         "What did I do twenty two weeks ago?",
         "What did I do thirty one days ago?",
-        # ... for EVERY separator spelling: a hyphen is a word separator, so
-        # 'twenty-one' presents the same `\b` to the offset template and
-        # must reject identically (a whitespace-only guard read 'one' and
-        # anchored a 21-week question at one week)
+        # ... for EVERY separator spelling. A hyphen is a word separator
+        # too, so 'twenty-one' presents the same `\b` to the offset template
+        # as 'twenty one' — the guard must be spelling-independent (`\W+`),
+        # not an allow-list: U+2010/U+2011/U+2212 are non-word characters
+        # exactly like ASCII '-', and an allow-list read 'one' from a
+        # twenty-one-week question and anchored it at one week.
         "What did I do twenty-one weeks ago?",
-        "What did I do thirty–one days ago?",
-        "What did I do thirty—one days ago?",
+        "What did I do twenty‐one weeks ago?",   # U+2010 HYPHEN
+        "What did I do twenty‑one weeks ago?",   # U+2011 NB-HYPHEN
+        "What did I do twenty−one weeks ago?",   # U+2212 MINUS
+        "What did I do twenty–one weeks ago?",   # U+2013 EN DASH
+        "What did I do thirty—one days ago?",    # U+2014 EM DASH
+        "What did I do thirty, one days ago?",
+        "What did I do thirty and one days ago?",
     ]:
         assert classify_question(q) is None, q
         assert extract_subject_terms(q) == [], q
@@ -712,10 +719,16 @@ def test_nary_and_order_instruction_never_fire():
         "months, from earliest to latest?",
         # the SAME ordering instruction spelled with the ATTRIBUTIVE 'most
         # recent' — only the adverbial 'most recently' names a time, so the
-        # instruction is not promoted (it falls through, as before #2652)
+        # attributive stays a guard (as on main) and is not promoted
         "What is the order of the six museums I visited from earliest to "
         "most recent?",
         "List the events from most recent to oldest.",
+        # ... and the guard must catch it BEFORE the shape templates, or the
+        # question falls through and fires ORDERING/CURRENT_STATE on a
+        # recency question main deliberately rejected
+        "Which did I buy first, my most recent phone or my laptop?",
+        "what is the current status of my most recent car?",
+        "Which came first, my most recent trip to Paris or my graduation?",
         "How many days passed between the two deep-subject milestones?",
         "When did I buy the couch?",  # date-lookup w/o shape support (v1)
         # 3+ option lists (review r2 P1 — every delimiter family)
