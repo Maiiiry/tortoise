@@ -48,8 +48,9 @@ non-adjudicated denominator is rejected 37/37 — see the floor test):
   relative-date-lookup, nary-ordering, other, pattern/recurring,
   offset-comparison and recency/current-state. 2 fire, both pinned
   ADJUDICATED label-noise rows (370a8ff4 + gpt4_70e84552_abs). NOTE the
-  #2165 figure (76/78) is NOT comparable: 33 of those 78 are now deliberate
-  positives of the ``ago-relative`` shape;
+  #2165 figure (76/78) is NOT comparable: 34 of those 78 are now deliberate
+  positives of the ``ago-relative`` shape (78 − 34 − the 5 #2654
+  state-entry rows = the pinned 39-row residual);
 * duration-state residual forms — "how long did I take … combined" (a
   summed span: #2886's aggregate lane owns it) and "how old was I when …"
   (an age: no state entry to resolve); plus every other duration/count
@@ -160,20 +161,29 @@ _RE_MOST_RECENT = re.compile(r"\bmost\s+recently\b", re.IGNORECASE)
 # consume (minutes/hours/centuries, 'a long time ago'). Checked only AFTER
 # the promoted vocabulary routes, so it can never eat a promoted offset.
 _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
-# the number words a COMPOUND count can end on ('twenty two weeks ago'):
-# the offset regex matches the trailing word alone, so its presence just
-# before a determiner means the count is NOT the one the regex read.
-# The separator is `\W+` — deliberately NOT an allow-list. `\W` is
-# Unicode-aware, so SPACE, the ASCII hyphen, the whole Unicode
-# hyphen/dash/minus family (U+2010..U+2015, U+2212) and a comma all
-# qualify, and `\b` sees a boundary before the trailing count word for
-# every one of them. An allow-list is what let 'twenty-one' (and U+2010 /
-# U+2011 / U+2212) slip through and anchor a 21-week question at one week.
-# The `and` connective ('twenty and one') is the one separator that is not
-# `\W`, so it is named explicitly.
+# A count that is the TRAILING PART of a multi-part number, matched against
+# the text just before the count. Two spellings, one invariant ('the matched
+# count is the whole number'):
+#   * a compound NUMBER WORD — 'twenty two' / 'twenty-one' / 'twenty–one'.
+#     The separator is `\W+` — deliberately NOT an allow-list. `\W` is
+#     Unicode-aware, so SPACE, the ASCII hyphen, the whole Unicode
+#     hyphen/dash/minus family (U+2010..U+2015, U+2212) and a comma all
+#     qualify, and `\b` sees a boundary before the trailing count word for
+#     every one of them. An allow-list is what let 'twenty-one' (and U+2010
+#     / U+2011 / U+2212) slip through and anchor a 21-week question at one
+#     week. The `and` connective ('twenty and one') is the one separator
+#     that is not `\W`, so it is named explicitly.
+#   * a multi-part NUMERAL — '2.5', '2,000', '2 000', '1-2'. `_RE_AGO_OFFSET`
+#     reads `\d+`, so it matches the LAST digit run alone and the question
+#     promoted at that fragment ('2.5 weeks ago' → 5 weeks; '2,000 days
+#     ago' → 0 days, a window collapsed to question_date). `\d\W*$` catches
+#     it: a digit followed only by non-word characters up to the count.
+#     A digit followed by a WORD character is not a fragment ('2 things 3
+#     days ago' must still promote count=3, and '3rd, 4 days ago' count=4).
 _RE_COMPOUND_NUMBER = re.compile(
     r"\b(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
-    r"thousand|million)(?:\W+|\s+and\s+)+$", re.IGNORECASE)
+    r"thousand|million)\b(?:\W+|\s+and\s+)+$"
+    r"|\d\W*$", re.IGNORECASE)
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how
 # many <unit> did I spend / had I been", "how long did (I|the narrator)

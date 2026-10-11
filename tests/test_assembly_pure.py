@@ -238,8 +238,9 @@ def test_census_negative_set_precision_floor():
     as a ratio would only restate it.
 
     Re-measured against ``tests/_assembly_census.json``. The #2165 figure
-    (76/78 rejected) is NOT comparable: 33 of those 78 rows are now
-    deliberate positives.
+    (76/78 rejected) is NOT comparable: 34 of those 78 rows are now
+    deliberate positives (78 − 34 − the 5 #2654 state-entry rows = the 39
+    asserted below).
     """
     rows = [r for r in _CENSUS["rows"]
             if r["cls"] in _NEG_CLASSES
@@ -363,10 +364,33 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         "What did I do thirty—one days ago?",    # U+2014 EM DASH
         "What did I do thirty, one days ago?",
         "What did I do thirty and one days ago?",
+        # a multi-part NUMERAL is the same defect for digits: `_RE_AGO_OFFSET`
+        # reads `\d+`, so it matches the LAST digit run alone — '2.5 weeks
+        # ago' anchored at 5 weeks and '2,000 days ago' at 0 days (a window
+        # collapsed onto question_date). A digit followed by a WORD char is
+        # not a fragment, so the positive cases below must keep promoting.
+        "What did I do 2.5 weeks ago?",
+        "What did I do 2,000 days ago?",
+        "What did I do 2 000 days ago?",
+        "What did I do 1-2 weeks ago?",
     ]:
         assert classify_question(q) is None, q
         assert extract_subject_terms(q) == [], q
         assert resolve_relative_anchor(q, "2026-09-10") is None, q
+
+
+def test_ago_relative_still_reads_a_standalone_digit_count():
+    """The multi-part-numeral guard must not eat a count that IS the whole
+    number: a digit followed by a WORD character is not a fragment."""
+    for q, count in [
+        ("I bought 2 things 3 days ago", 3),
+        ("on 3rd, 4 days ago", 4),
+        ("What did I do 22 weeks ago?", 22),
+        ("What did I do 10 days ago?", 10),
+    ]:
+        a = resolve_relative_anchor(q, "2026-09-10")
+        assert a is not None, q
+        assert (a.kind, a.count) == ("ago-offset", count), (q, a)
 
 
 def test_ago_relative_shape_fires():
