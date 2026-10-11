@@ -48,7 +48,6 @@ import tortoise
 # a monkeypatch/override of the canonical constant reaches BOTH surfaces instead
 # of leaving a stale copy in this module.
 from tortoise import body_limits as _body_limits  # #2048 shared streaming body cap
-from tortoise.epistemic_labels import epistemic_clause
 from tortoise import embed_metering as _embed_metering  # #4488 encode measurement
 from tortoise import mcp_auth as _mcp_auth
 from tortoise import monitoring as _monitoring  # #2924: call-time bound read
@@ -77,6 +76,7 @@ from tortoise.embed_metering import (  # #4488: pure-ASGI encode-work flusher
     EmbedMeteringMiddleware as _EmbedMeteringMiddleware,
 )
 from tortoise.env_truthy import env_flag, is_truthy  # #4097: the declared truthy contract
+from tortoise.epistemic_labels import epistemic_clause
 from tortoise.file_indexer import (  # #4005 shared identity primitives
     derive_session_source_url,
     provenance_basename,

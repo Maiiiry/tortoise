@@ -5,8 +5,8 @@ import logging
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
+from tortoise.epistemic_labels import endpoint_clause
 from tortoise.source_identity import normalize_source_url, resolve_source_key
-from tortoise.epistemic_labels import endpoint_clause, epistemic_clause
 
 logger = logging.getLogger(__name__)
 

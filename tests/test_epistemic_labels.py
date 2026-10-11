@@ -90,7 +90,7 @@ def test_create_operator_gate_admits_exactly_what_its_write_can_connect():
     # ... and both sides of the pair are present, so this cannot pass by the write having moved out.
     assert body.count("endpoint_clause(") >= 2, (
         "expected BOTH the input-existence gate and the edge-creating write to name the endpoint "
-        "set; found only %d use(s)" % body.count("endpoint_clause("))
+        f"set; found only {body.count('endpoint_clause(')} use(s)")
 
 
 def test_no_ad_hoc_epistemic_label_pair_survives_in_the_source():

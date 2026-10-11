@@ -22,8 +22,8 @@ from .entity_identity import (  # #3633 structured non-folded record
     display_holder_ids,
     record_non_folded,
 )
-from .live import is_terminal_status  # #2498 shared terminal vocabulary
 from .epistemic_labels import epistemic_clause
+from .live import is_terminal_status  # #2498 shared terminal vocabulary
 
 _logger = logging.getLogger(__name__)
 
