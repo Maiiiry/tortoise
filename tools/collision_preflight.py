@@ -122,6 +122,20 @@ taking ownership, or ordinary prose?"). A lane's OWN claim comment still blocks
 its own dispatch, because the exit-code consumers (``issue-workflow`` /
 ``executing-plans``) read the exit code ALONE: there is no advisory tier.
 
+A model-decided ownership claim (`COLLISION` with a probability) that NAMES a
+branch or worktree is re-verified before it is allowed to block (#8175): if
+EVERY artifact it names is gone (branch deleted, path absent from the worktree
+listing) or demonstrably not live (a terminal/merged branch, a worktree
+`_worktree_liveness` reports as dead), the claim is VOID — reported as a weak,
+named non-blocking signal (`stale claim — its named artifacts are gone/empty;
+safe to re-dispatch`) and unable to force the refusal. A claim naming NOTHING,
+an UNTRUSTED author's claim (blocked without a model call by design), a
+JEV-UNAVAILABLE hit (the rollback seam must reproduce `origin/main`), and any
+verification that could not be performed all keep blocking — a missing
+measurement is never a downgrade. See the decision table at
+`_claim_artifact_verifier`, which preserves #6108: a branch or worktree that
+EXISTS keeps blocking even at 0 commits ahead.
+
 A JEV outage, missing key, timeout, or malformed/unparseable response body
 degrades to ``origin/main``'s behaviour — every pre-filtered candidate WITHOUT
 a cached decision is a hit (fail-closed), and the run says so in the surface
@@ -3467,6 +3481,7 @@ def _claim_gate_note(
     untrusted: int,
     classifier: ClaimClassifier | None,
     identity_unresolved: bool = False,
+    voids: int = 0,
 ) -> str:
     """One line stating the gate's rules, the thresholds, the call count and
     the cost — and, exactly, which degradation applied (never claiming that
@@ -3477,6 +3492,15 @@ def _claim_gate_note(
         f"COLLISION p>={JEV_COLLISION_MIN:.2f}, else COLLISION-uncertain); "
         f"{cleaned} CLEAN, {confident + uncertain} hit ({uncertain} uncertain)"
     )
+    if voids:
+        # #8175: a model-decided ownership claim whose NAMED artifacts are all
+        # gone/non-live is VOID — reported (weak) but unable to block. Say so in
+        # the surface note as well as in WEAK SIGNALS, so the count is never
+        # silently folded into the CLEAN side of the ledger.
+        note += (
+            f"; {voids} stale claim(s) demoted to non-blocking (their named "
+            "branch/worktree is gone or not live — see WEAK SIGNALS)"
+        )
     if untrusted:
         if identity_unresolved:
             note += (
@@ -3507,10 +3531,273 @@ def _claim_gate_note(
     )
 
 
+# ── claim artifact re-verification (#8175) ───────────────────────────────────
+#
+# A claim comment is only allowed to block while an artifact it NAMES is still
+# live. Correct by design (#5070 / #6108), the claim gate never re-verified
+# those artifacts, so a lane that claimed an issue, created a branch and a
+# worktree, committed nothing and abandoned both blocked the issue FOREVER.
+# Measured on #6151: its worktree was clean, its branch was 0 commits ahead of
+# `origin/main`, and DELETING BOTH did not clear the refusal — the comment alone
+# kept blocking. It cleared only when a human hand-edited the comment.
+#
+# ⛔ THE DECISION TABLE, AND WHY THE DEMOTION IS THIS NARROW. #6108 is a
+# RECORDED decision pinned by 8 tests: a branch/worktree that EXISTS keeps
+# blocking even at 0 commits ahead, because a lane between `git worktree add`
+# and its first commit is indistinguishable from an abandoned one. Changing it
+# is a reopen to argue with the owner, never a quiet edit. So re-verification
+# may demote ONLY what is GONE or demonstrably NOT LIVE:
+#
+#   a live worktree, or a local branch that exists        -> BLOCKS (unchanged)
+#   a named artifact that is gone (branch deleted, path
+#     absent from the worktree listing)                   -> void (weak)
+#   a named artifact terminal/merged, or a worktree
+#     `_worktree_liveness` reports as not live            -> void (weak)
+#   the claim names NO artifacts (prose-only)             -> BLOCKS (unchanged)
+#   verification could not be performed (git failed)      -> BLOCKS (fail-closed)
+#
+# A claim is void ONLY when it named at least one artifact AND EVERY named
+# artifact is gone/non-live; naming two artifacts where one is alive BLOCKS.
+#
+# ⛔ THIS IS NOT A DISMISSAL SWITCH. There is no flag, no env var and no human
+# input: every named artifact is re-measured on every run. It also applies ONLY
+# to a model-decided ownership claim (`collision` WITH a probability):
+#   * an UNTRUSTED author's comment is blocked WITHOUT a model call by design
+#     (the repo is public), so demoting it on its own self-declared artifacts
+#     would let an outsider clear the gate by naming a branch that does not
+#     exist — the false-CLEAN direction this gate exists to prevent;
+#   * a JEV-UNAVAILABLE hit is the documented rollback seam and must reproduce
+#     `origin/main` EXACTLY, so it is never demoted either;
+#   * the uncertain band stays a hit BY CONSTRUCTION (an ambiguous case is still
+#     a hit), so it is never demoted.
+_CLAIM_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_CLAIM_BACKTICK_RE = re.compile(r"`([^`\n]+)`")
+# Bound the work: a claim names a handful of artifacts, and each branch check is
+# a subprocess. A body that backticks dozens of tokens cannot buy extra git
+# calls, and the cap is fail-closed (an unexamined token is never a demotion).
+_CLAIM_ARTIFACT_CAP = 8
+
+
+@dataclass
+class ClaimArtifactVerdict:
+    """Whether a claim's NAMED artifacts are still live work (#8175).
+
+    `live=True` (or a `None` return from the verifier) means the claim keeps
+    BLOCKING. `live=False` is the ONLY demoting state, and it is reached only
+    when the claim named at least one artifact and EVERY named artifact measured
+    gone/non-live. `basis` is the plain-language evidence, printed in the report.
+    """
+
+    live: bool
+    basis: str
+
+
+def _normalize_claim_ref(token: str) -> str | None:
+    """The branch SHORT name a backticked token spells, or None.
+
+    Conservative on purpose: a `refs/heads/` prefix is stripped, any other
+    `refs/…` namespace is refused (this arm verifies local branches only), and a
+    token git would reject as a ref name (`..`, `//`, a trailing `/` or
+    `.lock`) is refused rather than fed to `rev-parse`, whose exit code for a
+    MALFORMED name (1) is the same code a genuinely ABSENT ref returns — so
+    accepting one would read a parse artifact as a measured absence.
+    """
+    ref = token
+    if ref.startswith("refs/heads/"):
+        ref = ref[len("refs/heads/"):]
+    elif ref.startswith("refs/"):
+        return None
+    if ".." in ref or "//" in ref or ref.endswith("/") or ref.endswith(".lock"):
+        return None
+    if not ref or ref.startswith(".") or ref.startswith("-"):
+        return None
+    if not _CLAIM_REF_TOKEN_RE.match(ref):
+        return None
+    if "/" not in ref:
+        return None
+    return ref
+
+
+def _looks_like_claim_branch(token: str, issue: int) -> bool:
+    """Is `token` this repo's OWN branch convention for `issue`?
+
+    The convention this module documents is `<type>/<issue#>-<slug>`, so the
+    ISSUE NUMBER must be the SECOND path segment's prefix. That is the
+    discriminator that keeps a backticked FILE path out: a token such as
+    `tests/test_3061_collision.py` has a slash and the number, but the segment
+    after the first `/` starts with `test_`, not `3061` — so it is not a branch
+    and is ignored. A token that is not a plausible ref names NOTHING, and a
+    claim that names nothing still blocks (fail-closed).
+    """
+    ref = _normalize_claim_ref(token)
+    if ref is None:
+        return False
+    _first, _sep, rest = ref.partition("/")
+    return re.match(rf"{issue}(?![0-9])", rest) is not None
+
+
+def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str]]:
+    """(branches, worktrees) a claim-shaped comment names, deduped and capped.
+
+    Extraction is SHAPE-based, never existence-based: a GONE branch is exactly
+    what must be recognised, so "does it exist?" cannot be the filter. A token
+    that is not confidently a branch or a worktree is not extracted at all, so a
+    claim that names nothing keeps blocking (fail-closed).
+
+    * a BRANCH is a backticked token that matches the repo's `<type>/<issue#>`
+      convention (see `_looks_like_claim_branch`);
+    * a WORKTREE is a backticked token containing `.worktrees/` and this issue's
+      number — matched against the enumerated listing by the caller.
+
+    `refs/heads/x/3061-y`-style and bare (`3061-y`, no slash) tokens are NOT
+    extracted: the first is normalised, the second names nothing this arm can
+    verify by convention, and both directions are fail-closed.
+    """
+    branches: list[str] = []
+    worktrees: list[str] = []
+    for raw in _CLAIM_BACKTICK_RE.findall(body or ""):
+        if len(branches) + len(worktrees) >= _CLAIM_ARTIFACT_CAP:
+            break
+        token = raw.strip()
+        if not token:
+            continue
+        if ".worktrees/" in token:
+            tail = token.split(".worktrees/", 1)[1].strip("/")
+            if tail and number_present(token, issue):
+                normalized = token.rstrip("/")
+                if normalized not in worktrees:
+                    worktrees.append(normalized)
+            continue
+        if _looks_like_claim_branch(token, issue):
+            ref = _normalize_claim_ref(token)
+            if ref and ref not in branches:
+                branches.append(ref)
+    return branches, worktrees
+
+
+def _claim_artifact_verifier(
+    git_bin: str, cwd: str, timeout: float, issue: int,
+    blocks: list[dict] | None,
+    merged_head_shas: set[str], ancestor_merged: set[str] | None,
+    main_tip: str | None, first_parent: set[str] | None,
+):
+    """Build the callable the claim gate threads in (#8175).
+
+    Built at the CALL SITE because that is where the git binary, the timeout,
+    the enumerated worktree `blocks` and the terminal-test witnesses live — the
+    same precedent as the `_branch_counts` callable threaded into
+    `scan_branch_surface` for #6108.
+
+    It returns `None` when the answer could not be MEASURED (git failed, the
+    worktree listing is unavailable) or when the claim names NOTHING;
+    `scan_issue_surface` treats `None` as "keep BLOCKING" — a missing
+    measurement must never become a downgrade.
+    """
+
+    def _branch_state(branch: str) -> str | None:
+        """`live` | `gone` | `terminal`, or None when unreadable.
+
+        ⛔ EXISTENCE IS THE GATE, and #6108 is preserved: a branch that resolves
+        BLOCKS even at 0 commits ahead (a lane between `git worktree add` and its
+        first commit is not distinguishable from an abandoned one). Terminality
+        is the one existing-ref case that is void, and it is decided by the same
+        guarded predicates the branch surface uses — never by the ahead count.
+        """
+        ref = f"refs/heads/{branch}"
+        rc, out, _err, timed_out = _run(
+            [git_bin, "rev-parse", "--verify", "--quiet", ref], cwd, timeout,
+        )
+        if timed_out:
+            return None
+        if rc == 0:
+            sha = out.strip()
+            if sha and _branch_terminal_state(
+                ref, sha, merged_head_shas, ancestor_merged, main_tip,
+                first_parent,
+            ) is not None:
+                return "terminal"
+            return "live"
+        if rc == 1:
+            # `--verify --quiet` exits 1 for a ref that does not resolve, and a
+            # MALFORMED name never reaches here (`_normalize_claim_ref` refuses
+            # it), so rc==1 is a MEASURED absence. Every other code (128 for an
+            # unreadable repo) is "could not measure" -> fail closed.
+            return "gone"
+        return None
+
+    def _worktree_state(token: str) -> tuple[str, str] | None:
+        """(live|gone|dead, basis), or None when the listing is unavailable."""
+        if blocks is None:
+            return None
+        normalized = token.rstrip("/")
+        for block in blocks:
+            path = block.get("path") or ""
+            if not path:
+                continue
+            if path == normalized or path.endswith(normalized) \
+                    or normalized.endswith(path):
+                live, basis = _worktree_liveness(
+                    path, block.get("locked"), block.get("prunable"),
+                )
+                return ("live" if live else "dead"), basis
+        return "gone", "not in the registered worktree list"
+
+    def _verify(body: str) -> ClaimArtifactVerdict | None:
+        branches, worktrees = claim_named_artifacts(body, issue)
+        if not branches and not worktrees:
+            # Named NOTHING -> fail closed (the claim keeps blocking).
+            return None
+        alive: list[str] = []
+        dead: list[str] = []
+        unmeasured = False
+        for branch in branches:
+            state = _branch_state(branch)
+            if state is None:
+                unmeasured = True
+                continue
+            if state == "live":
+                # #6108's count, REPORTED not acted on — reused rather than
+                # re-derived, so a live branch's distance from main is visible
+                # without a second ahead/behind implementation.
+                measured = _ahead_behind(git_bin, cwd, branch, timeout)
+                if measured is None:
+                    alive.append(
+                        f"{branch}: branch exists (ahead count unreadable)"
+                    )
+                else:
+                    ahead, behind = measured
+                    alive.append(
+                        f"{branch}: branch exists, {ahead} ahead / {behind} "
+                        "behind origin/main"
+                    )
+            else:
+                dead.append(f"{branch}: branch {state}")
+        for worktree in worktrees:
+            state = _worktree_state(worktree)
+            if state is None:
+                unmeasured = True
+                continue
+            status, basis = state
+            if status == "live":
+                alive.append(f"{worktree}: worktree live ({basis})")
+            else:
+                dead.append(f"{worktree}: worktree {status} ({basis})")
+        if unmeasured:
+            # An unreadable artifact leaves the claim BLOCKING (fail-closed).
+            return None
+        if alive:
+            return ClaimArtifactVerdict(True, "; ".join(alive + dead))
+        return ClaimArtifactVerdict(False, "; ".join(dead))
+
+    return _verify
+
+
 def scan_issue_surface(
     surface: Surface, issue_data: dict, identity: Identity,
     classifier: ClaimClassifier | None = None,
     issue_context: str = "",
+    *,
+    verify_claim: object = None,
 ) -> None:
     """Assignee + claim comments.
 
@@ -3534,6 +3821,14 @@ def scan_issue_surface(
     blocks. The previous rule blocked the shared-account case too, which made
     the repo owner's own triage assignments (86 of 622 open issues) permanent
     false COLLISIONs (#3504 class 3).
+
+    `verify_claim` is the #8175 seam: an optional callable `body ->
+    ClaimArtifactVerdict | None` that re-verifies the branch/worktree a claim
+    NAMES. It is threaded in (never inferred) because it needs git state — the
+    worktree listing and the terminal-test witnesses — that this scan does not
+    hold. A `live=False` verdict demotes THAT comment to `weak`, so a stale
+    claim is reported by name but cannot force the refusal; `None` (named
+    nothing, or could not measure) keeps it BLOCKING.
     """
     for assignee in issue_data.get("assignees") or []:
         login = assignee.get("login") if isinstance(assignee, dict) else str(assignee)
@@ -3618,7 +3913,7 @@ def scan_issue_surface(
                     else "author is not the fleet account",
                 )
             ] * len(untrusted)
-        cleaned = uncertain = 0
+        cleaned = uncertain = voids = 0
         for index, (comment, body) in enumerate(candidates):
             # Index-guarded, fail-closed: a candidate with no slot in `verdicts`
             # (impossible today — both branches produce one verdict per
@@ -3651,14 +3946,36 @@ def scan_issue_surface(
                 detail = f"claim-style comment ({who}): " + _one_line(body, 90)
             else:
                 detail = "claim-style comment: " + _one_line(body, 90)
+            # #8175: re-verify the artifacts this claim NAMES before the comment
+            # is allowed to block. Only a model-decided ownership claim is
+            # demotable — see the decision table above `_claim_artifact_verifier`.
+            strength = "strong"
+            if (
+                verify_claim is not None
+                and verdict.label == "collision"
+                and verdict.probability is not None
+            ):
+                checked = verify_claim(body)  # type: ignore[operator]
+                if checked is not None:
+                    if checked.live:
+                        # Report the evidence for the BLOCKING case too, so a
+                        # live claim's verdict is auditable (the #6108 lesson).
+                        detail += f" [artifacts verified live: {checked.basis}]"
+                    else:
+                        strength = "weak"
+                        voids += 1
+                        detail = (
+                            "stale claim — its named artifacts are gone/empty; "
+                            f"safe to re-dispatch (verified: {checked.basis})"
+                        )
             author = comment.get("author") or {}
             login = author.get("login") if isinstance(author, dict) else (
                 str(author) if author else None
             )
-            surface.add(_comment_ref(comment, login), detail, "strong")
+            surface.add(_comment_ref(comment, login), detail, strength)
         surface.note = _claim_gate_note(
             len(candidates), cleaned, len(candidates) - cleaned - uncertain,
-            uncertain, len(untrusted), classifier, identity_unresolved,
+            uncertain, len(untrusted), classifier, identity_unresolved, voids,
         )
     if not surface.hits:
         state = issue_data.get("state")
@@ -3908,12 +4225,10 @@ def run_preflight(
             else:
                 msg = f"gh-unavailable: {exc}"
             surfaces[SURFACE_ISSUE].incomplete(msg)
-    if isinstance(issue_data, dict):
-        scan_issue_surface(
-            surfaces[SURFACE_ISSUE], issue_data, identity,
-            classifier=ClaimClassifier(git_bin=git_bin, cwd=cwd),
-            issue_context=_claim_context(issue, slug),
-        )
+    # NOTE: the issue surface (assignee + claim comments) is scanned LATER,
+    # after the git surfaces — see the #8175 note at its call site. The claim
+    # gate must be able to re-verify the artifacts a claim names, and the
+    # worktree listing and the terminal-test witnesses are measured by then.
 
     # The keyword dimension is GONE (#3504) — see the note where the stoplists
     # used to live. Nothing is derived from the title any more; `title` is kept
@@ -4277,6 +4592,11 @@ def run_preflight(
             surface.incomplete(f"git-unavailable: {exc}")
 
     # 4. Worktree surface — UNTRUNCATED by construction; the count is proof.
+    #    `blocks` is HOISTED so the claim gate (#8175) can re-verify a worktree a
+    #    claim names against the SAME listing this surface scanned. It stays
+    #    `None` when there is no local checkout or the enumeration failed, and
+    #    the verifier treats that as "not measured" (fail-closed).
+    blocks: list[dict] | None = None
     surface = surfaces[SURFACE_WORKTREES]
     if target.path is None:
         surface.incomplete(
@@ -4318,6 +4638,29 @@ def run_preflight(
                 )
         except SurfaceError as exc:
             surface.incomplete(f"git-unavailable: {exc}")
+
+    # 5. Issue surface — scanned LAST (#8175) so the claim gate can re-verify the
+    #    artifacts a claim names: the worktree listing (step 4) and the
+    #    terminal-test witnesses (`merged_head_shas`, `ancestor_merged_local`,
+    #    `main_tip`, `first_parent`) are all measured by now. Everything else in
+    #    the scan is unchanged.
+    if isinstance(issue_data, dict):
+        # Only built when there is a local checkout to measure against: with no
+        # clone the git surfaces are INCOMPLETE anyway, and running rev-parse
+        # against the cwd (a DIFFERENT repo) could demote on the wrong repo's
+        # state. `None` keeps the claim gate blocking.
+        verifier = None
+        if target.path is not None:
+            verifier = _claim_artifact_verifier(
+                git_bin, cwd, timeout, issue, blocks,
+                merged_head_shas, ancestor_merged_local, main_tip, first_parent,
+            )
+        scan_issue_surface(
+            surfaces[SURFACE_ISSUE], issue_data, identity,
+            classifier=ClaimClassifier(git_bin=git_bin, cwd=cwd),
+            issue_context=_claim_context(issue, slug),
+            verify_claim=verifier,
+        )
 
     ordered = [surfaces[name] for name in ALL_SURFACES]
     return ordered, title, issue

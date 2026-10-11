@@ -219,6 +219,25 @@ fi
 exec "${REAL_GIT:?REAL_GIT unset}" "$@"
 """
 
+# Fails ONLY a `rev-parse` that names a local branch. That is the ONE call the
+# #8175 claim-artifact verifier makes to decide whether a named branch still
+# exists, so this stub reaches "verification could not be performed" while every
+# other git surface (main tip, first-parent, refs) stays readable. An unreadable
+# measurement must keep the claim BLOCKING.
+GIT_STUB_NO_REF_VERIFY = r"""#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = "rev-parse" ]; then
+  for a in "$@"; do
+    case "$a" in
+      refs/heads/*)
+        echo "git-stub: refusing local ref verification" >&2
+        exit 128 ;;
+    esac
+  done
+fi
+exec "${REAL_GIT:?REAL_GIT unset}" "$@"
+"""
+
 SURFACE_ROWS = (
     "open PRs",
     "recently-closed PRs",
@@ -4539,6 +4558,261 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("comment by other-agent [id IC_kwDOAAA123]", out)
         self.assertIn("REMEDY", out)
+
+    # ── claim artifact re-verification (#8175) ─────────────────────────────
+    #
+    # The claim gate re-measures the branch/worktree a claim NAMES. The
+    # decision table preserves #6108: an artifact that EXISTS blocks even at 0
+    # commits ahead, and only what is GONE or demonstrably NOT LIVE is void.
+    # Every test here opts into JEV (the demotion is scoped to a model-decided
+    # ownership claim); the JEV-off rollback stays byte-for-byte `origin/main`
+    # and is pinned by the tests above.
+
+    def test_claim_artifact_extraction_is_conservative(self):
+        # Extraction is SHAPE-based (a gone branch cannot be recognised by
+        # asking whether it exists) and must not mistake a backticked FILE path
+        # for a branch — a false extraction would void a genuine claim.
+        cp = _tool_module()
+        self.assertEqual(
+            cp.claim_named_artifacts(f"lane `fix/{ISSUE}-x`", ISSUE),
+            ([f"fix/{ISSUE}-x"], []),
+        )
+        self.assertEqual(
+            cp.claim_named_artifacts(
+                f"see `tests/test_{ISSUE}_x.py`", ISSUE),
+            ([], []),
+        )
+        self.assertEqual(
+            cp.claim_named_artifacts(f"wt `.worktrees/{ISSUE}-x`", ISSUE),
+            ([], [f".worktrees/{ISSUE}-x"]),
+        )
+        self.assertEqual(
+            cp.claim_named_artifacts("wt `.worktrees/other-thing`", ISSUE),
+            ([], []),
+        )
+        self.assertEqual(
+            cp.claim_named_artifacts(f"`refs/heads/fix/{ISSUE}-x`", ISSUE),
+            ([f"fix/{ISSUE}-x"], []),
+        )
+        # A name git would reject is refused rather than fed to `rev-parse`,
+        # whose exit 1 for a MALFORMED name is the same code a genuinely ABSENT
+        # ref returns — so accepting it would read a parse artifact as absence.
+        self.assertEqual(
+            cp.claim_named_artifacts(f"`fix/{ISSUE}..x`", ISSUE), ([], []))
+
+    def test_claim_verifier_demotes_a_dead_worktree_record(self):
+        # The "worktree not live" arm of the decision table. `_worktree_liveness`
+        # demotes ONLY git's aborted-add marker (`locked initializing`); every
+        # other record fails closed. The verifier must honour that verdict —
+        # reusing the function rather than re-deriving liveness from the path.
+        cp = _tool_module()
+        blocks = [{
+            "path": f"/hub/.worktrees/{ISSUE}-dead",
+            "branch": f"refs/heads/fix/{ISSUE}-dead",
+            "head": "0" * 40,
+            "locked": "initializing",
+        }]
+        verify = cp._claim_artifact_verifier(
+            "git", str(self.repo), 30, ISSUE, blocks, set(), None, None, None,
+        )
+        verdict = verify(
+            f"Claiming this (worktree `.worktrees/{ISSUE}-dead`).")
+        self.assertIsNotNone(verdict, "a dead record must produce a verdict")
+        self.assertFalse(verdict.live)
+        self.assertIn("worktree dead", verdict.basis)
+        self.assertIn("aborted", verdict.basis)
+
+    def test_claim_naming_a_live_branch_still_blocks(self):
+        # #6108 PRESERVED: the branch exists AT origin/main's tip with 0 commits
+        # of its own — the lane-between-`worktree add`-and-first-commit window —
+        # so the claim naming it must NOT be demoted.
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        _git(self.repo, "branch", f"fix/{ISSUE}-live")
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent", f"Claiming this — lane `fix/{ISSUE}-live`."),
+            ]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
+        # The claim gate measured the artifact and reported WHY it blocked.
+        self.assertIn("artifacts verified live", out)
+        self.assertIn("branch exists", out)
+
+    def test_stale_claim_with_gone_artifacts_is_advisory(self):
+        # The #8175 defect, in the #6151 shape: the claim names a branch AND a
+        # worktree, both since removed. The claim is VOID — reported BY NAME as
+        # a weak, non-blocking signal — and the dispatch is allowed (exit 0).
+        body = (
+            f"Claiming this — lane `fix/{ISSUE}-refutes-magnitude` "
+            f"(worktree `.worktrees/{ISSUE}-ep-refutes-weight`)."
+        )
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[("test-agent", body)]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertNotIn("VERDICT: COLLISION", out)
+        self.assertIn(
+            "stale claim — its named artifacts are gone/empty; safe to "
+            "re-dispatch",
+            out,
+        )
+        # Named: the comment AND the dead artifacts are visible in the report.
+        self.assertIn("comment by test-agent", out)
+        self.assertIn(f"fix/{ISSUE}-refutes-magnitude: branch gone", out)
+        self.assertIn(
+            f".worktrees/{ISSUE}-ep-refutes-weight: worktree gone", out)
+
+    def test_stale_claim_never_demotes_outside_a_model_decision(self):
+        # The demotion is scoped to a MODEL-DECIDED ownership claim. Two
+        # fail-closed paths must keep blocking even when the named artifacts are
+        # gone: the JEV-OFF rollback seam (which must reproduce origin/main
+        # EXACTLY), and an UNTRUSTED author (blocked without a model call by
+        # design, so demoting on its own self-declared artifacts would let an
+        # outsider clear the gate).
+        body = f"Claiming this — lane `fix/{ISSUE}-gone`."
+        for case, author, env_extra in (
+            ("jev-off", "test-agent", None),
+            ("untrusted-author", "other-agent", self.jev_env()),
+        ):
+            with self.subTest(case=case):
+                self.gh_fixtures(
+                    issue=self.issue_payload(comments=[(author, body)]),
+                    closed_prs=[],
+                )
+                self.jev_rules(default=0.95)
+                rc, out = self.run_tool(env_extra=env_extra)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("VERDICT: COLLISION", out)
+                self.assertNotIn("stale claim", out)
+
+    def test_claim_naming_a_live_worktree_still_blocks(self):
+        # The other live arm: a registered worktree that `_worktree_liveness`
+        # reports LIVE keeps the claim BLOCKING.
+        self.add_worktree(f".worktrees/{ISSUE}-live", branch=f"fix/{ISSUE}-live")
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent",
+                 f"Claiming this (worktree `.worktrees/{ISSUE}-live`)."),
+            ]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
+        self.assertIn("worktree live", out)
+
+    def test_claim_naming_no_artifacts_still_blocks(self):
+        # A prose-only claim names NOTHING. "Could not extract an artifact" is
+        # not "the artifacts are gone" — it keeps blocking (fail-closed).
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent", "I'm working on this now."),
+            ]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
+        self.assertIn("claim-style comment", out)
+
+    def test_claim_whose_zero_ahead_branch_exists_still_blocks(self):
+        # The regression half of #6151 that must NOT fire: the artifact is EMPTY
+        # (0 commits ahead of origin/main) but NOT GONE. #6108's decision is
+        # explicit that an existing branch keeps blocking at 0 ahead, so the
+        # demotion must never be triggered by "no commits yet".
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        _git(self.repo, "branch", f"fix/{ISSUE}-empty")
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent", f"Claiming this — lane `fix/{ISSUE}-empty`."),
+            ]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
+        self.assertIn("0 ahead", out)
+
+    def test_6151_regression_abandoned_claim_clears_only_when_artifacts_go(self):
+        # The MEASURED #6151 sequence, end to end. A lane claims the issue,
+        # creates `fix/N-refutes-magnitude` at origin/main's tip (0 commits of
+        # its own) and a clean worktree, then abandons both. While the artifacts
+        # EXIST the claim blocks (#6108's decision, pinned above). Deleting the
+        # worktree and the branch — with the comment left UNTOUCHED — must now
+        # clear the refusal, which is precisely what it could not do before
+        # #8175: the comment alone blocked forever and only a human hand-edit
+        # cleared it.
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        branch = f"fix/{ISSUE}-refutes-magnitude"
+        wt = self.add_worktree(f".worktrees/{ISSUE}-ep-refutes-weight",
+                               branch=branch)
+        # Precondition: 0 commits ahead of origin/main.
+        counts = self._git_out(
+            "rev-list", "--count", "--left-right", f"origin/main...{branch}",
+        ).split()
+        self.assertEqual(counts[1], "0", counts)
+        body = (
+            f"Claiming this — lane `{branch}` "
+            f"(worktree `.worktrees/{ISSUE}-ep-refutes-weight`)."
+        )
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[("test-agent", body)]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        # (a) EMPTY BUT PRESENT -> BLOCKS.
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
+        # (b) GONE -> the untouched claim is VOID and the dispatch is allowed.
+        _git(self.repo, "worktree", "remove", "--force", str(wt))
+        _git(self.repo, "branch", "-D", branch)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertIn(
+            "stale claim — its named artifacts are gone/empty; safe to "
+            "re-dispatch",
+            out,
+        )
+        self.assertIn("comment by test-agent", out)
+
+    def test_unverifiable_claim_never_demotes(self):
+        # "Verification could not be performed" is NOT "the artifacts are
+        # gone": a git that cannot resolve the ref leaves the claim BLOCKING.
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent",
+                 f"Claiming this — lane `fix/{ISSUE}-unverifiable`."),
+            ]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        stub = _write_exec(self.tmp / "git-stub-no-ref-verify",
+                           GIT_STUB_NO_REF_VERIFY)
+        rc, out = self.run_tool(
+            git_bin=stub,
+            env_extra={**self.jev_env(), "REAL_GIT": shutil.which("git")},
+        )
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
 
     # ── terminal-injection hardening (#4027 P2-J) ──────────────────────────
 
