@@ -1,0 +1,439 @@
+"""Framework injection middleware — issue #2125 (epic #2080 end-state seams).
+
+W3-style seam grade for the three framework extension points, mirroring
+``test_platform_seams.py``'s posture for the harness seams:
+
+1. **One shared reflex.** A REAL seeded embedded graph drives EVERY framework
+   adapter through ``sdk_reflex`` → ``TortoiseSDK.volunteer_context()`` →
+   ``tortoise/volunteer.py``. The same block text must land in all three
+   framework prompts — there is no per-framework pipeline.
+2. **Fail-open content.** A raising / degraded / clean-empty reflex injects
+   NOTHING through any adapter and never raises into the app's turn; a failed
+   HTTP POST is the same silence. Semantic Kernel's own ``next`` error is the
+   exception that DOES propagate (framework failure, not ours).
+3. **The documented extension point, duck-typed.** ADK mutates through
+   ``LlmRequest.append_instructions`` (google/adk-python
+   ``models/llm_request.py``), LangGraph returns state with a new message
+   (``langgraph`` pre-model node), Semantic Kernel overrides
+   ``context.rendered_prompt`` after ``await next(context)``
+   (learn.microsoft.com Semantic Kernel filters — Prompt Render Filter).
+4. **Opt-in + dependency-free (W4 user-exposure gate).** Importing
+   ``tortoise.framework`` pulls in no framework and registers nothing; the
+   app must construct a provider and register the hook explicitly.
+
+The real-reflex leg builds its graph IN-PROCESS on the embedded lane (an
+explicit ``db_path`` beats an env URI by construction), so the module needs no
+``TORTOISE_DB_URI`` and no child process.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import threading
+import types as _pytypes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
+
+import pytest
+
+os.environ.setdefault("TORTOISE_SECRET_PEPPER", "test-static-pepper")
+
+from tortoise.framework import (
+    adk_before_model_callback,
+    block_from,
+    http_reflex,
+    langgraph_pre_model_node,
+    sdk_reflex,
+    semantic_kernel_prompt_render_filter,
+)
+from tortoise.volunteer import degraded_response, empty_response
+
+_CLAIM = "The CI pipeline deploys via GitHub Actions on main merge."
+_PROMPT = "How is CI deploy triggered?"
+
+
+# ── Faithful fakes of the three documented shapes ──────────────────────────
+
+
+class _Part:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _Content:
+    """``google.genai.types.Content`` — the ADK LlmRequest turn shape."""
+
+    def __init__(self, role: str, text: str) -> None:
+        self.role = role
+        self.parts = [_Part(text)]
+
+
+class _AdkRequest:
+    """ADK ``LlmRequest``: mutable ``contents`` + the mutator the docs name."""
+
+    def __init__(self, turns: list[tuple[str, str]]) -> None:
+        self.contents = [_Content(role, text) for role, text in turns]
+        self.system_instruction: list[str] = []
+
+    def append_instructions(self, instructions: str) -> None:
+        self.system_instruction.append(instructions)
+
+
+class _AdkRequestNoAppend:
+    """An ADK build without ``append_instructions`` — the fallback branch."""
+
+    def __init__(self, turns: list[tuple[str, str]]) -> None:
+        self.contents = [_Content(role, text) for role, text in turns]
+
+
+class _Msg:
+    """A LangChain message: ``.type`` + ``.content`` (str or content blocks)."""
+
+    def __init__(self, type_: str, content) -> None:
+        self.type = type_
+        self.content = content
+
+
+class _SkContext:
+    def __init__(self, rendered: str | None) -> None:
+        self.rendered_prompt = rendered
+
+
+def _reflex(block: str = "REFLEX BLOCK", *, error: Exception | None = None):
+    def reflex(window):
+        assert window, "an adapter must never call the reflex with an empty window"
+        if error is not None:
+            raise error
+        return {
+            "pointers": [], "why": [], "surfaced": [],
+            "block": block, "degraded_reason": None,
+        }
+    return reflex
+
+
+def _spy():
+    """A reflex capturing the window the adapter built, then injecting."""
+    seen: dict = {}
+
+    def reflex(window):
+        seen["window"] = window
+        return {"block": "REFLEX BLOCK", "degraded_reason": None}
+
+    return reflex, seen
+
+
+def _lg(reflex):
+    """A LangGraph node with the test's message type (``langchain_core`` is not a
+    dependency here; the DEFAULT factory's own branch has a dedicated test)."""
+    return langgraph_pre_model_node(reflex, message_factory=lambda text: _Msg("human", text))
+
+
+class _NeverNext:
+    async def __call__(self, context) -> None:
+        return None
+
+
+# ── The real pipeline through every adapter (the seam grade) ───────────────
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _offline_embedder_cache():
+    """Read the embedder from the LOCAL cache, never from the hub.
+
+    The suite's hermetic egress guard (#4387) blocks the hub by design, so the
+    implicit HEAD request in the default hub client would retry against it for
+    ~160 s per process — all of it sleeps, none of it work. The model is a
+    local cache read, so declaring that explicitly is both faster and a MORE
+    faithful read (the embedder actually loads instead of tripping the 90 s
+    warm-up watchdog into a keyword-only fallback). Scoped to this module and
+    undone at teardown.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("HF_HUB_OFFLINE", "1")
+    mp.setenv("TRANSFORMERS_OFFLINE", "1")
+    yield
+    mp.undo()
+
+
+@pytest.fixture(scope="module")
+def seeded_sdk(tmp_path_factory, _offline_embedder_cache):
+    """One EP-measured embedded graph (module-cached: the seed dominates)."""
+    from tortoise.sdk import TortoiseSDK
+
+    db = tmp_path_factory.mktemp("framework") / "framework.db"
+    sdk = TortoiseSDK(db_path=str(db))
+    proj = sdk._get_proj()
+    evidence = sdk.create_point(
+        "evidence", "CI deploys on main merge via GitHub Actions [supporting record]")
+    claim = sdk.create_point("statement", _CLAIM)
+    sdk.create_operator("IMPL", evidence["id"], [claim["id"]])
+    for pid, alpha, beta in ((claim["id"], 12.0, 1.0), (evidence["id"], 12.0, 1.0)):
+        proj.g.query(
+            "MATCH (n:Point {id:$id}) SET n.confidence=$c, "
+            "n.posterior_alpha=$a, n.posterior_beta=$b",
+            params={"id": pid, "a": alpha, "b": beta,
+                    "c": round(alpha / (alpha + beta), 4)})
+    yield sdk
+    sdk.close()
+
+
+def test_real_reflex_block_rides_every_framework_prompt(seeded_sdk):
+    """One seeded graph, one reflex, three prompts — the SAME block lands."""
+    reflex = sdk_reflex(seeded_sdk)
+    # The reflex's own answer for this window — every adapter must carry it verbatim.
+    expected = seeded_sdk.volunteer_context(
+        window=[{"role": "user", "content": _PROMPT}])["block"]
+    assert "point/" in expected and _CLAIM in expected, (
+        "fixture produced no block — the framework grade would be vacuous")
+
+    # Google ADK — before_model_callback
+    adk_request = _AdkRequest([("user", _PROMPT)])
+    assert adk_before_model_callback(reflex)(None, adk_request) is None  # model call proceeds
+    assert adk_request.system_instruction == [expected]
+
+    # LangGraph — pre-model node
+    langgraph_out = _lg(reflex)({"messages": [_Msg("human", _PROMPT)]})
+    assert len(langgraph_out["messages"]) == 1
+    assert langgraph_out["messages"][0].content == expected
+
+    # Semantic Kernel — Prompt Render Filter (block PREPENDED to the rendered prompt)
+    sk_context = _SkContext(_PROMPT)
+    asyncio.run(semantic_kernel_prompt_render_filter(reflex)(sk_context, _NeverNext()))
+    assert sk_context.rendered_prompt == f"{expected}\n\n{_PROMPT}"
+
+
+# ── Fail-open content ──────────────────────────────────────────────────────
+
+
+def test_fail_open_when_the_reflex_raises():
+    boom = _reflex(error=RuntimeError("tortoise unreachable"))
+
+    adk_request = _AdkRequest([("user", _PROMPT)])
+    assert adk_before_model_callback(boom)(None, adk_request) is None
+    assert adk_request.system_instruction == []
+    assert len(adk_request.contents) == 1  # no extra turn injected
+
+    assert _lg(boom)({"messages": [_Msg("human", _PROMPT)]}) == {}
+
+    sk_context = _SkContext(_PROMPT)
+    asyncio.run(semantic_kernel_prompt_render_filter(boom)(sk_context, _NeverNext()))
+    assert sk_context.rendered_prompt == _PROMPT  # untouched, no raise
+
+
+@pytest.mark.parametrize(
+    "response", [degraded_response("timeout"), empty_response(), None, "garbage"],
+    ids=["degraded", "clean-empty", "none", "non-dict"],
+)
+def test_degraded_and_clean_empty_inject_nothing(response):
+    assert block_from(response) == ""
+    reflex = lambda window: response  # noqa: E731
+    assert _lg(reflex)({"messages": [_Msg("human", _PROMPT)]}) == {}
+    sk_context = _SkContext(_PROMPT)
+    asyncio.run(semantic_kernel_prompt_render_filter(reflex)(sk_context, _NeverNext()))
+    assert sk_context.rendered_prompt == _PROMPT
+
+
+def test_blank_block_is_not_injected():
+    assert block_from({"block": "   \n ", "degraded_reason": None}) == ""
+
+
+def test_semantic_kernel_propagates_the_frameworks_own_error():
+    """Only Tortoise's half is fail-open; SK's ``next`` failure is the app's."""
+    async def failing_next(context):
+        raise RuntimeError("semantic kernel render failed")
+
+    with pytest.raises(RuntimeError, match="semantic kernel render failed"):
+        asyncio.run(
+            semantic_kernel_prompt_render_filter(_reflex())(_SkContext(_PROMPT), failing_next))
+
+
+# ── The documented extension points, duck-typed ────────────────────────────
+
+
+def test_adk_uses_append_instructions_and_leaves_contents_alone():
+    request = _AdkRequest([("user", _PROMPT)])
+    adk_before_model_callback(_reflex())(None, request)
+    assert request.system_instruction == ["REFLEX BLOCK"]
+    assert len(request.contents) == 1  # no extra turn injected
+
+
+def test_adk_fallback_appends_a_user_content(monkeypatch):
+    """An ADK build without ``append_instructions`` still gets the block."""
+    class _FakeContent:
+        def __init__(self, role=None, parts=None):
+            self.role, self.parts = role, parts or []
+
+    class _FakePart:
+        def __init__(self, text=None):
+            self.text = text
+
+    genai = _pytypes.ModuleType("google.genai")
+    genai.types = _pytypes.SimpleNamespace(Content=_FakeContent, Part=_FakePart)
+    monkeypatch.setitem(sys.modules, "google", _pytypes.ModuleType("google"))
+    monkeypatch.setitem(sys.modules, "google.genai", genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", genai.types)
+
+    request = _AdkRequestNoAppend([("user", _PROMPT)])
+    adk_before_model_callback(_reflex())(None, request)
+    assert request.contents[-1].role == "user"
+    assert request.contents[-1].parts[0].text == "REFLEX BLOCK"
+
+
+def test_langgraph_default_message_factory_builds_a_human_message(monkeypatch):
+    """The shipped default constructs ``langchain_core.messages.HumanMessage``."""
+    class _FakeHumanMessage:
+        def __init__(self, content=None):
+            self.type, self.content = "human", content
+
+    fake = _pytypes.ModuleType("langchain_core.messages")
+    fake.HumanMessage = _FakeHumanMessage
+    core = _pytypes.ModuleType("langchain_core")
+    core.messages = fake
+    monkeypatch.setitem(sys.modules, "langchain_core", core)
+    monkeypatch.setitem(sys.modules, "langchain_core.messages", fake)
+
+    out = langgraph_pre_model_node(_reflex())({"messages": [_Msg("human", _PROMPT)]})
+    assert isinstance(out["messages"][0], _FakeHumanMessage)
+    assert out["messages"][0].content == "REFLEX BLOCK"
+
+
+def test_langgraph_maps_roles_and_multimodal_blocks():
+    reflex, seen = _spy()
+    _lg(reflex)({"messages": [
+        _Msg("human", "hello"), _Msg("ai", "hi"), _Msg("tool", "{}"),
+        _Msg("human", [{"type": "text", "text": "multi "},
+                       {"type": "text", "text": "modal"}]),
+    ]})
+    assert [turn["role"] for turn in seen["window"]] == [
+        "user", "assistant", "system", "user"]
+    assert seen["window"][-1]["content"] == "multi modal"
+
+
+def test_langgraph_message_factory_override():
+    """A graph whose model rejects a second system message can choose its own type."""
+    out = langgraph_pre_model_node(
+        _reflex(), message_factory=lambda text: _Msg("system", text),
+    )({"messages": [_Msg("human", _PROMPT)]})
+    assert out["messages"][0].type == "system"
+
+
+def test_semantic_kernel_prepends_to_the_rendered_prompt():
+    context = _SkContext("USER TEMPLATE OUTPUT")
+    asyncio.run(semantic_kernel_prompt_render_filter(_reflex())(
+        context, _NeverNext()))
+    assert context.rendered_prompt == "REFLEX BLOCK\n\nUSER TEMPLATE OUTPUT"
+
+
+# ── Window bounding (the reflex validates 1..20 turns / 15 KB) ─────────────
+
+
+def test_window_is_bounded_to_the_last_twenty_turns():
+    reflex, seen = _spy()
+    _lg(reflex)({"messages": [_Msg("human", f"turn {i}") for i in range(40)]})
+    window = seen["window"]
+    assert len(window) == 20
+    assert window[-1]["content"] == "turn 39"  # the tail — the turn being answered
+    assert window[0]["content"] == "turn 20"
+
+
+def test_overlong_turn_is_truncated_keeping_the_tail():
+    reflex, seen = _spy()
+    _lg(reflex)({"messages": [_Msg("human", "A" * 10_000 + "Z" * 10_000)]})
+    content = seen["window"][0]["content"]
+    assert len(content) == 15_000
+    assert content.endswith("Z" * 1_000)
+
+
+def test_empty_window_never_calls_the_reflex():
+    calls = []
+
+    def reflex(window):
+        calls.append(window)
+        return {"block": "REFLEX BLOCK", "degraded_reason": None}
+
+    assert _lg(reflex)({"messages": []}) == {}
+    assert _lg(reflex)({}) == {}
+    assert _lg(reflex)({"messages": [_Msg("human", "   ")]}) == {}
+    assert calls == []
+
+
+# ── HTTP provider (POST /v1/context) ───────────────────────────────────────
+
+
+class _ContextRecorder(BaseHTTPRequestHandler):
+    captured: ClassVar[dict] = {}
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        type(self).captured = {
+            "path": self.path,
+            "auth": self.headers.get("Authorization"),
+            "body": json.loads(self.rfile.read(length)),
+        }
+        payload = json.dumps({
+            "pointers": [], "why": [], "surfaced": [],
+            "block": "HTTP REFLEX BLOCK", "degraded_reason": None,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):  # keep the test output clean
+        return None
+
+
+def _stub_context_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ContextRecorder)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def test_http_reflex_posts_the_canonical_body_and_injects():
+    server, thread = _stub_context_server()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        reflex = http_reflex(base + "/", "tsk_test", min_confidence=0.8)
+        out = _lg(reflex)({"messages": [_Msg("human", _PROMPT)]})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert out["messages"][0].content == "HTTP REFLEX BLOCK"
+    captured = _ContextRecorder.captured
+    assert captured["path"] == "/v1/context"
+    assert captured["auth"] == "Bearer tsk_test"
+    assert captured["body"]["window"] == [{"role": "user", "content": _PROMPT}]
+    assert captured["body"]["min_confidence"] == 0.8
+
+
+def test_http_reflex_unreachable_is_fail_open():
+    reflex = http_reflex("http://127.0.0.1:1", "tsk_test")
+    assert _lg(reflex)({"messages": [_Msg("human", _PROMPT)]}) == {}
+
+
+# ── Opt-in + dependency-free (W4 user-exposure gate) ───────────────────────
+
+
+def test_import_registers_nothing_and_pulls_in_no_framework():
+    code = (
+        "import sys\n"
+        "import tortoise\n"
+        "assert 'tortoise.framework' not in sys.modules, 'tortoise auto-imported the middleware'\n"
+        "import tortoise.framework\n"
+        "roots = {m.split('.')[0] for m in sys.modules}\n"
+        "pulled = roots & {'google', 'langgraph', 'langchain_core', 'semantic_kernel'}\n"
+        "assert not pulled, f'framework imported at import time: {sorted(pulled)}'\n"
+        "print('clean')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("clean")
