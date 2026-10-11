@@ -520,10 +520,13 @@ _RE_OR_CHAIN = re.compile(r"\sor\s.+?\sor\s", re.IGNORECASE | re.DOTALL)
 # first to last: A, B, and C" / "What is the order of the three events:
 # 'A', 'B', and 'C'"). The colon is the strong signal: the two head forms
 # carry no " or " at all, so _RE_ORDERING cannot see them.
+# The "earliest to latest" head form is deliberately NOT an alternative here:
+# a question containing it always matches ``_RE_RECENCY`` ("\blatest\b") and
+# is rejected by the R13 guard before this pattern is ever tried, so the
+# alternative was dead code that contradicted that guard.
 _RE_ORDERING_LIST = re.compile(
     r"^\s*(?:which|who|what)\b[^?:]*?"
-    r"(?:\border\b|\bsequence\b|\bfirst\s+to\s+last\b|"
-    r"\bearliest\s+to\s+latest\b)"
+    r"(?:\border\b|\bsequence\b|\bfirst\s+to\s+last\b)"
     r"[^?:]*:\s*[^?]+?\??\s*$",
     re.IGNORECASE | re.DOTALL)
 
@@ -711,10 +714,14 @@ def classify_question(question: str) -> AssemblyShape | None:
     # N-ary (3+ options) is a R13 reject for EVERY shape template that
     # follows — including duration-state — so it stays ahead of all of
     # them (#2654's ordering: main ran this before `_RE_DURATION_STATE`).
-    # #2653 lifts that reject for a DECOMPOSABLE 3+ option list: that shape
-    # fires as ORDERING below (the option-list branch reads `_nary_terms`),
-    # so a genuine N-ary list is exempt here.
-    if _RE_OR_CHAIN.search(q) and not _nary_terms(q):
+    # #2653 lifts that reject ONLY for a genuine N-ary ORDERING list: the
+    # exemption is gated on an ordering HEAD as well as a decomposable
+    # option span, so an or-chain that is not an ordering question keeps
+    # main's hard reject here instead of falling through to the
+    # duration-state/interval arms below.
+    if _RE_OR_CHAIN.search(q) and not (
+            _nary_terms(q)
+            and (_RE_ORDERING.match(q) or _RE_ORDERING_LIST.match(q))):
         return None
     # #2654 — duration-state ("how long had I been X when Y"): the state is
     # a single resolved subject and the span runs from its state entry to
@@ -760,6 +767,12 @@ def classify_question(question: str) -> AssemblyShape | None:
         return AssemblyShape.INTERVAL
     m_ord = _RE_ORDERING.match(q)
     m_list = None if m_ord else _RE_ORDERING_LIST.match(q)
+    if m_list and _RE_CURRENT.match(q):
+        # "the order I placed:" is a CURRENT_STATE subject, not an option
+        # list — the ordering-list arm must not steal it. (`_RE_CURRENT_STILL`
+        # cannot match here: it is anchored on "is …", which `_RE_ORDERING_LIST`
+        # — anchored on which/who/what — can never share.)
+        m_list = None
     if m_ord or m_list:
         # N-ary (#2653): 3+ named options DECOMPOSE instead of being rejected
         # (R13's "N-ary out of v1" is lifted here). classify and extract read
@@ -798,21 +811,76 @@ def _strip_time_clause(seg: str) -> str:
     return _RE_TIME_CLAUSE.sub("", seg, count=1)
 
 
+def _reads_as_list(opts: list[str], prefix: str) -> bool:
+    """Does this split actually read as an OPTION LIST?
+
+    A colon inside a quoted option ("'Star Wars: A New Hope', 'Empire', …")
+    leaves a FRAGMENT first — a term that closes a quote it never opened —
+    followed by an option that opens the SAME quote. A whole first option
+    that merely ends in a quote (an inch mark `5"`, a possessive "the
+    girls'") is told apart by the PREFIX: the fragment's opening quote is
+    real, so `prefix` holds an unmatched delimiter of that kind, whereas an
+    inch mark's or a possessive's quote has none before the colon (and a
+    possessive apostrophe is not an opening one — it follows a word
+    character).
+    """
+    if len(opts) < 2:
+        return False
+    first = opts[0]
+    if first[:1] in ("'", '"') or first[-1:] not in ("'", '"'):
+        return True
+    closer = first[-1:]
+    if opts[1][:1] != closer:
+        return True
+    at = prefix.rfind(closer)
+    if at < 0:
+        return True
+    return at != 0 and prefix[at - 1].isalnum()      # an apostrophe, not a quote
+
+
+def _list_colon_index(q: str) -> int:
+    """Index of the option-list colon, or -1 when the question has none.
+
+    The introducer is the last colon whose TAIL actually reads as an option
+    list: at least two options, each with balanced quotes. Walking right to
+    left is what stops a colon inside a quoted option ("'Star Wars: A New
+    Hope'") from cutting the list in two, WITHOUT having to decide whether
+    any particular `'` is a quote or an apostrophe — the tail after such a
+    colon is not a list ("A New Hope', 'Empire', …" starts a term on a stray
+    quote), so the scan steps over it. The same test disposes of a
+    time-of-day head colon and a trailing time clause ("… and the meeting at
+    3:00?"): their tails hold a single option.
+    """
+    for i in range(len(q) - 1, -1, -1):
+        if q[i] != ":":
+            continue
+        if q[i - 1:i].isdigit() and q[i + 1:i + 2].isdigit():
+            continue        # a time-of-day colon ("at 3:00"), not an introducer
+        if _reads_as_list(_split_option_list(q[i + 1:]), q[:i]):
+            return i
+    return -1
+
+
 def _option_list_segment(question: str) -> str:
     """The option-list span of an ordering question.
 
-    A list-introducing colon WINS when present ("…the order of the three
-    events: A, B, and C"); otherwise everything after the FIRST ordering
-    marker word ("which did I get first, A, B or C"). The marker search is
-    first-occurrence on purpose: "my first child" must not be read as the
-    marker.
+    The list-introducing colon WINS when the question carries one — the span
+    is cut there, never at a colon inside a quoted option ("'Star Wars: A
+    New Hope'"). The ordering-list template alone cannot decide this: its
+    tail after the first colon admits further colons, so it matches a
+    question whose HEAD carries a time ("the events at 3:00: the couch, …")
+    with the TIME colon as the introducer. With no such colon, everything
+    after the FIRST ordering marker word ("which did I get first, A, B or
+    C") — first-occurrence on purpose, so "my first child" is not read as
+    the marker.
     """
     q = question.strip()
-    if ":" in q:
-        seg = q.rsplit(":", 1)[-1]
+    ci = _list_colon_index(q)
+    if ci >= 0:
+        seg = q[ci + 1:]
     else:
         m = _RE_ORDER_MARKER.search(q)
-        seg = q[m.end():] if m else ""
+        seg = q[m.end():] if m is not None else ""
     return _strip_time_clause(re.sub(r"^[\s,:;–—-]+", "", seg))
 
 
@@ -862,7 +930,13 @@ def _nary_terms(question: str) -> list[str]:
     disagree (an N-ary fire with 2 terms would silently narrow the shape).
     """
     q = question.strip()
-    explicit = _RE_ORDERING_LIST.match(q) is not None
+    # The list is EXPLICIT when a real introducer colon was found — not merely
+    # when the template matched. On a question whose only colon sits inside an
+    # OPTION ("the meeting at 3:00"), the template matches yet there is no
+    # introducer, the marker fallback leaves the ordering head in the segment,
+    # and `explicit` would wave the `_RE_OPTION_LEAD` shape check through on a
+    # leaked first term.
+    explicit = _list_colon_index(q) >= 0
     opts = _split_option_list(_option_list_segment(q))
     if not _nary_option_list(opts, explicit=explicit):
         return []

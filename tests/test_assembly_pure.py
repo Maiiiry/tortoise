@@ -1084,9 +1084,70 @@ def test_nary_ordering_fires_with_n_terms():
         ("Which did I get first, the couch, the chair, the lamp or the "
          "table?",
          ["the couch", "the chair", "the lamp", "the table"]),
+        # a colon INSIDE a quoted option is not the list introducer — the
+        # span must not be cut there (the rsplit(":", 1) truncation)
+        ("Which did I get first, 'Star Wars: A New Hope', 'Empire', or "
+         "'Jedi'?",
+         ["'Star Wars: A New Hope'", "'Empire'", "'Jedi'"]),
+        # a time-of-day colon in the ordering HEAD is not the introducer
+        # either — the list colon after it is (the first-colon-cut
+        # regression)
+        ("What is the order of the events at 3:00: the couch, the chair, "
+         "and the lamp?",
+         ["the couch", "the chair", "the lamp"]),
+        # a POSSESSIVE apostrophe before the colon is not an opening quote —
+        # counting it as one hid the list colon and fell back to the marker
+        # span
+        ("What is the order of Sarah's events: the wedding, the trip, and "
+         "the party?",
+         ["the wedding", "the trip", "the party"]),
     ]:
         assert classify_question(q) is AssemblyShape.ORDERING, q
         assert extract_subject_terms(q) == expected, q
+
+
+def test_nary_ordering_introducer_and_current_state_guards():
+    """The option-list introducer survives an apostrophe, an inch mark and a
+    time-of-day head, and a CURRENT_STATE subject is not an option list.
+
+    Each case is a family the colon-cut rewrite had to keep correct: a
+    possessive head ("day's") whose `'` must not mask the introducer; an
+    inch mark that leaves the quotes unpaired; a trailing time clause that
+    must not be taken for the introducer; and a quoted option that itself
+    contains a colon, which is ONE option and not two.
+    """
+    for q, expected in [
+        ("What is the order of the day's events at 3:00: the couch, the "
+         "chair, and the table?",
+         ["the couch", "the chair", "the table"]),
+        ("What is the order of the events at 5\" : the couch, the chair, and "
+         "the meeting at 3:00?",
+         ["the couch", "the chair", "the meeting at 3:00"]),
+        ("What is the order of: 'Star Wars: A New Hope', 'Empire', and "
+         "'Jedi'?",
+         ["'Star Wars: A New Hope'", "'Empire'", "'Jedi'"]),
+    ]:
+        assert classify_question(q) is AssemblyShape.ORDERING, q
+        assert extract_subject_terms(q) == expected, q
+    # "the order I placed:" is a CURRENT_STATE subject, not an option list
+    assert classify_question(
+        "What is the current status of the order I placed: the couch, the "
+        "chair, and the table?") is AssemblyShape.CURRENT_STATE
+    # an or-chain outside an ordering head is not a shape at all, even though
+    # `_nary_terms` alone would decompose it (origin/main answers None here).
+    # Without the ordering-head half of the exemption these come back as the
+    # duration-state / interval shapes.
+    for q in ["How long had I been dating: the lamp or the table or the chair "
+              "when it ended?",
+              "How many days had passed since I bought: the couch or the lamp "
+              "or the table when it ended?"]:
+        assert classify_question(q) is None, q
+    # an introducer colon inside an OPTION is not an introducer: the template
+    # matches, but with no introducer the segment keeps the ordering head, and
+    # the list must not fire on that leaked first term
+    assert classify_question(
+        "What is the order of the couch, the chair, and the meeting at "
+        "3:00") is None
 
 
 def test_binary_ordering_unaffected_by_the_nary_arm():
