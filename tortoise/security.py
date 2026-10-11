@@ -20,6 +20,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -995,6 +996,20 @@ _BLOCKED_WEBHOOK_HOST_SUFFIXES = (
 )
 
 
+def _refuse_non_public_webhook_addr(host: str, addr: ipaddress._BaseAddress) -> None:
+    """Refuse a webhook target that resolved to anything but a public address.
+
+    ``is_global`` alone is NOT the predicate: ``224.0.0.1`` is multicast and
+    ``is_global`` is True for it, so multicast needs its own check. The plan's
+    §2 claimed multicast was refused; measured, it was accepted (#8104 review).
+    """
+    if not addr.is_global or addr.is_multicast:
+        raise ValueError(
+            f"webhook url host {host!r} is not a globally routable address "
+            f"(loopback/private/link-local/reserved/multicast targets are "
+            f"refused)")
+
+
 def validate_webhook_url(url: str) -> str:
     """Validate an OUTBOUND webhook target (SSRF guard). Returns the URL.
 
@@ -1061,6 +1076,13 @@ def validate_webhook_url(url: str) -> str:
         raise ValueError("webhook url has no host")
     if port is not None and not 1 <= port <= 65535:
         raise ValueError(f"webhook url port {port} is outside 1-65535")
+    # RFC 1034 §3.1: a fully-qualified name may carry a trailing dot, and
+    # `localhost.` is the same host as `localhost` to every resolver. The name
+    # checks below MUST see the undotted form or they are trivially bypassed:
+    # `http://localhost./` reached the loopback in the #8104 review.
+    host = host.rstrip(".")
+    if not host:
+        raise ValueError("webhook url has no host")
     if host in _BLOCKED_WEBHOOK_HOSTS or host.endswith(_BLOCKED_WEBHOOK_HOST_SUFFIXES):
         raise ValueError(
             f"webhook url host {host!r} is a local/private name — a webhook "
@@ -1076,11 +1098,37 @@ def validate_webhook_url(url: str) -> str:
     try:
         addr = ipaddress.ip_address(literal)
     except ValueError:
-        addr = None  # a DNS name — the residual above applies
-    if addr is not None and not addr.is_global:
-        raise ValueError(
-            f"webhook url host {host!r} is not a globally routable address "
-            f"(loopback/private/link-local/reserved targets are refused)")
+        # The legacy IPv4 forms — `127.1`, `0x7f.0.0.1`, `0x7f000001`,
+        # `2130706433`, `0177.0.0.1` — are accepted by every resolver but NOT by
+        # `ipaddress`. Parsing them is the whole point: treating an unparseable
+        # literal as "not an address, therefore allowed" is what let them reach
+        # loopback, and the measured transport issued the request (#8104 review).
+        # `inet_aton` is numeric-only, so a genuine name still lands below.
+        try:
+            addr = ipaddress.IPv4Address(socket.inet_aton(literal))
+        except OSError:
+            addr = None
+
+    if addr is not None:
+        _refuse_non_public_webhook_addr(host, addr)
+        return url
+
+    # A genuine DNS name. Resolve it and check EVERY answer: this is the
+    # documented residual (#8103 — a public name pointing at a private IP), and
+    # checking only the literal is how it stays open. Unresolvable at
+    # registration is NOT refused: a legitimately new target may not be live
+    # yet, and delivery re-validates nothing, so failing open here preserves the
+    # existing contract while closing every case that resolves to a bad address.
+    try:
+        infos = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return url
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        try:
+            resolved = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        _refuse_non_public_webhook_addr(host, resolved)
     return url
 
 

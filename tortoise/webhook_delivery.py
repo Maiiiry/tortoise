@@ -360,9 +360,16 @@ class WebhookTransport:
         import httpx
 
         try:
-            resp = httpx.post(url, content=body, headers=headers,
-                              timeout=self.timeout_s, follow_redirects=False)
-            return resp.status_code, None
+            # Stream, and read NOTHING: only the status is used, and the
+            # subscriber controls the body. `httpx.post` defaults to
+            # `stream=False`, which reads the whole response into memory — an
+            # unbounded body (or a drip-feed inside the per-read timeout) then
+            # grows the shared delivery worker on demand (#8104 review). The
+            # `with` block closes the response without ever calling `.read()`.
+            with httpx.stream("POST", url, content=body, headers=headers,
+                              timeout=self.timeout_s,
+                              follow_redirects=False) as resp:
+                return resp.status_code, None
         except Exception as e:
             return None, redact_error(e)
 

@@ -548,3 +548,86 @@ def test_rest_requires_auth(client):
         assert tc.delete("/v1/context/subscriptions/sub_x").status_code == 401
         assert tc.get("/v1/context/subscriptions/sub_x/deliveries").status_code == 401
     assert ha_mod  # imported for the harness parity above
+
+
+@pytest.mark.parametrize("url", [
+    # #8104 review: every one of these reached the loopback through the real
+    # transport. The legacy IPv4 forms are unparseable by `ipaddress`, so they
+    # fell through as "not an address, therefore allowed"; the NAME forms slipped
+    # the suffix check because its entries carry no trailing dot.
+    "http://127.1/cb",                    # 1-part loopback
+    "http://127.0.1/cb",                  # 3-part loopback
+    "http://0x7f.0.0.1/cb",               # hex-octet loopback
+    "http://0x7f000001/cb",               # 32-bit hex loopback
+    "http://2130706433/cb",               # 32-bit decimal loopback
+    "http://0177.0.0.1/cb",               # octal loopback
+    "http://localhost./cb",               # trailing dot (RFC 1034 §3.1)
+    "http://metadata.google.internal./cb",
+    "http://localhost.localdomain./cb",
+    "http://224.0.0.1/cb",                # multicast — is_global is TRUE for it
+    "http://239.255.255.250/cb",          # SSDP multicast
+])
+def test_guard_refuses_disguised_forms_of_a_blocked_target(url):
+    """The #8104 bypass: forms of a blocked host the literal/suffix checks miss.
+
+    These are not variants of the *documented* residual (#8103, a public name
+    resolving to a private IP — that one needs a DNS answer). These need none:
+    the payload is a literal the validator simply could not parse, or a name
+    spelled with the trailing dot every resolver accepts.
+    """
+    assert validate_webhook_url  # the guard is a public, reusable primitive
+    with pytest.raises(ValueError):
+        validate_webhook_url(url)
+
+
+def test_guard_refuses_every_blocked_name_in_its_trailing_dot_form():
+    """The dot-strip pin — a mutation of THIS is a restored bypass.
+
+    `localhost.` and `localhost` are the same host to every resolver, but the
+    suffix tuple has no trailing dot, so normalizing before the name check is
+    load-bearing rather than cosmetic. Measured: removing the strip lets
+    `http://metadata.google.internal./` through (it needs no DNS to be wrong).
+    """
+    from tortoise.security import _BLOCKED_WEBHOOK_HOSTS
+
+    assert _BLOCKED_WEBHOOK_HOSTS, "the blocked-name set went empty — pin broke"
+    for host in sorted(_BLOCKED_WEBHOOK_HOSTS):
+        with pytest.raises(ValueError):
+            validate_webhook_url(f"http://{host}./cb")
+
+
+def test_transport_streams_and_never_reads_the_response_body(monkeypatch):
+    """The subscriber controls the body; only the status is used (#8104 review).
+
+    `httpx.post` defaults to `stream=False`, which reads the whole response into
+    memory — an unbounded body, or a drip-feed inside the per-read timeout, then
+    grows the shared delivery worker on demand.
+    """
+    import httpx
+
+    calls = []
+
+    class _Resp:
+        status_code = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_stream(method, url, **kw):
+        calls.append((method, url, kw.get("follow_redirects")))
+        return _Resp()
+
+    def _boom(*a, **kw):
+        raise AssertionError(
+            "httpx.post() reads the whole response body — the transport must stream")
+
+    monkeypatch.setattr(httpx, "stream", _fake_stream)
+    monkeypatch.setattr(httpx, "post", _boom)
+
+    status, err = wd.WebhookTransport().post(
+        "https://hooks.example.com/cb", b"{}", {})
+    assert (status, err) == (204, None)
+    assert calls == [("POST", "https://hooks.example.com/cb", False)], calls
