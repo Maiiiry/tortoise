@@ -932,10 +932,13 @@ def test_unrelated_tools_change_still_tier1():
 
 
 def test_activation_cohort_change_does_not_drop_to_tier1():
-    # #B7 (#3674): tools/activation_cohort.py owns part of
-    # tests/test_activation_scorecard.py (its roll_up cohort-summing logic).
-    # Without the TOOL_CARVEOUTS entry the flat "tools/" prefix swallows it ->
-    # tier-1 smoke only, and the suite that pins the cohort number never runs.
+    # #B7 (#3674, restated by #3676): tools/activation_cohort.py's transport
+    # guards (https-only, no-redirect, credential hygiene) are pinned by
+    # tests/test_activation_scorecard.py. Without the TOOL_CARVEOUTS entry the
+    # flat "tools/" prefix swallows it -> tier-1 smoke only, and the suite that
+    # pins those controls never runs. (The cohort FOLD moved into
+    # tortoise/activation_scorecard.py in #3676 — the `core` surface covers
+    # that file, so the carve-out's reason narrowed rather than vanished.)
     r = _sel(["tools/activation_cohort.py"])
     assert r["surfaces"], r
     assert set(r["test_files"]) != _tier1(), r
