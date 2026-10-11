@@ -763,6 +763,18 @@ surfaces:
   # `_EXPORT_SKIP_LABELS`), so a change to that classifier alone must still
   # run the pin that says export-skip is not a durability statement.
   - test_rebuild_event_meta_watermark_4653.py
+  # #2081 (epic #2080 W4 phase 2): the outbound webhook delivery layer —
+  # subscription registry, dispatcher, retry/backoff, receipts, HMAC signing,
+  # the SSRF-gated registration REST routes (POST/GET/DELETE
+  # /v1/context/subscriptions + /deliveries) and the dream-cycle dispatch hook
+  # in `_dream_worker`. `tortoise/hosted_api.py` is an exact `api` SOURCE_PATTERN
+  # match, so this arm runs the routes' auth/422 assertions on a hosted change.
+  # DUAL-REGISTERED with `core` (below): the module that carries the delivery
+  # semantics is `tortoise/webhook_delivery.py` (plus the
+  # `security.validate_webhook_url` guard), and NEITHER matches a named surface
+  # — they fall through to `core` — so without that arm a webhook_delivery-only
+  # change would run no guard at all.
+  - test_webhook_delivery.py
   battery:
   - test_battery_arms.py
   # (removed a duplicate test_battery_derive_truth_leg.py entry here on the
@@ -2246,6 +2258,12 @@ surfaces:
   # to the instrument. Hermetic: pure arithmetic + a module-attribute swap, no
   # graph / embedder / network.
   - test_fusion_formula_ab.py
+  # #2081: the delivery engine's own file (`tortoise/webhook_delivery.py`) and
+  # the SSRF guard (`tortoise/security.py`) match no named SOURCE_PATTERN, so a
+  # change to either selects `core` — this is the registration that keeps the
+  # engine's contract tests on that diff. Dual-registered under `api` (above)
+  # for `tortoise/hosted_api.py`, which is an exact `api` match.
+  - test_webhook_delivery.py
   ep:
   # #2884 D3: the EP/dream belief-state journal+replay guard. `tortoise/dream.py`
   # selects `ep`, so this registration is what runs the guard on a dream.py
