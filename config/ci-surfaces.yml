@@ -805,6 +805,11 @@ surfaces:
   # never runs on the change that can delete it.
   - test_7856_goal_state.py
   - test_audit_fallback_home_isolation.py
+  # #2655: guards `tortoise/calendar_anchors.py` (the deterministic
+  # calendar-anchor resolver). That module matches no SOURCE_PATTERNS rule, so
+  # a resolver-only change falls through to `core` — this entry is what makes
+  # the guard run on the diff that can break it.
+  - test_calendar_anchors.py
   - test_ci_stall_identify.py
   # #4071: guards that the URI-less embedded test lane cannot resolve a bare
   # TortoiseSDK() to the owner's canonical store (~/.tortoise/tortoise.db) —
