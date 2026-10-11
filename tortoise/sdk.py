@@ -3851,6 +3851,10 @@ def _decorate_fallback_hits(results: list[dict], graph) -> list[dict]:
             r["superseded_by"] = st["superseded_by"]
         if st.get("supersedes"):
             r["supersedes"] = st["supersedes"]
+        # #2294: the legacy flag half of the terminal vocabulary — the embedded
+        # fallback owes the same terminality signal as the primary path.
+        if st.get("outdated"):
+            r["outdated"] = True
         # E6 (#1538) D7: promoted window fields — additive, only when present.
         for key in ("valid_from", "valid_to", "expired_at"):
             if st.get(key):
@@ -19187,6 +19191,13 @@ class TortoiseSDK:
                 superseded_by=point_state.get(pid, {}).get("superseded_by")
                 or pt.get("superseded_by") or None,
                 supersedes=point_state.get(pid, {}).get("supersedes") or [],
+                # #2294: the legacy ``outdated=true`` half of the terminal
+                # vocabulary. ``invalidate_point`` writes this flag WITHOUT
+                # touching ``status``, so a status-only reader cannot see the
+                # point is dead — carried here so every reader (the ask lane's
+                # decoration gate included) can apply the shared
+                # ``live.is_terminal_status``. Additive in ``to_dict``.
+                outdated=bool(point_state.get(pid, {}).get("outdated")),
                 # E6 (#1538) D7: promoted window fields (additive — empty
                 # string when undated ⇒ no marker, byte-identical output).
                 valid_from=point_state.get(pid, {}).get("valid_from")
@@ -25738,6 +25749,29 @@ class TortoiseSDK:
                     f"{_svk!r} is a server-managed provenance field and cannot "
                     f"be set via props."
                 )
+        # #3644 review (P2b) + PR #8016 code-review ISSUE 1: the version
+        # window and the version-TRANSITION keys are server-minted/journalled,
+        # never caller-asserted. Before this guard the passthrough silently
+        # DISCARDED a caller `validFrom` (the node got the minted instant while
+        # the journal `SourceCreated` carried the caller's value — a wrong
+        # window start reported OK), and `previousValidTo`/`previousContentHash`
+        # collided with the explicit `previousValidTo=`/`previousContentHash=`
+        # keywords on the `SourceVersioned` emit -> a swallowed `TypeError`
+        # DROPPED the transition record while the live node had already moved
+        # (fail-open, live != replay). Rejected loudly here, mirroring
+        # `rawState`/`sourceVersion`: the sanctioned route is the server mint
+        # (`create_source` mints `validFrom` once, on the `updatedAt` clock) and
+        # the `SourceVersioned` record (`previousValidTo`/`previousContentHash`
+        # are transition facts, `_SOURCE_HANDLED`).
+        for _wk in ("validFrom", "validTo", "valid_to", "previousValidTo",
+                    "previousContentHash"):
+            if _wk in props:
+                raise ValueError(
+                    f"{_wk!r} is a server-managed version-window/transition "
+                    f"field and cannot be set via props — `validFrom` is "
+                    f"minted by the server on the `updatedAt` clock and the "
+                    f"transition facts are journal-only (#3644)."
+                )
         ev = {
             "url": url,
             "sourceKind": sourceKind,
@@ -25791,7 +25825,46 @@ class TortoiseSDK:
         # before this change. So the instant is minted ONCE, rides the payload
         # as `updatedAt`, the fold's `coalesce` picks it up, and the record
         # carries the SAME string — live and replay cannot disagree.
-        ev["updatedAt"] = _now_iso()
+        #
+        # ── #3644 (§4.6 window half): the version's valid-time START ────
+        # The SAME minted instant is the version's `validFrom`, and the two
+        # fields are one clock read, not two (a second `_now_iso()` here is
+        # exactly the live-vs-replay divergence the block above removes).
+        #
+        # WHY THE OBSERVATION INSTANT IS A LEGITIMATE `validFrom`.
+        # §4.7 forbids borrowing the WRITE clock as a valid-time start for a
+        # POINT (#3654): a session's occurrence date is a fact about the
+        # content, so synthesizing one from the ingest clock asserts something
+        # we do not know. A `:Source` VERSION has no such content-side date:
+        # a version IS "the content as read at an instant", so the instant it
+        # was read is definitional, not borrowed — and §4.6 requires the
+        # transition to CLOSE the prior version's window, which can only be
+        # closed at a boundary we observed (`validTo` of the old =
+        # `validFrom` of the new, contiguity by construction).
+        #
+        # The instant is minted for EVERY call and lands on the node ONLY
+        # through `_upsert_source`'s hash-diff gate (create, stub completion,
+        # hash change) — so a no-op re-check moves nothing, live or replayed,
+        # and `validFrom` is added to `_SOURCE_NOOP_IGNORED_KEYS` for the same
+        # reason `updatedAt` is (minted per call ⇒ it can never be the fact
+        # that makes an otherwise-identical re-check "different"). A producer
+        # that KNOWS an earlier instant (a publication date) is a separate
+        # additive input — deliberately not accepted here, because a
+        # caller-asserted start needs the inversion guards the Point window
+        # needed (#3980, #4021, #5358, #5360) and this lane has no such input.
+        #
+        # A SAME-HASH write that changes an extra still emits a `SourceCreated`
+        # carrying this minted instant, exactly as it already carries the
+        # minted `updatedAt` — the gate ignores both on that arm, so the record
+        # over-states neither: reading the version timeline means reading the
+        # FIRST `SourceCreated` plus the `SourceVersioned` records (there is one
+        # node per `url` and only a create or a hash transition opens a
+        # window). Stripping the key on that one arm would buy journal tidiness
+        # the `updatedAt` precedent does not have, at the cost of two emission
+        # variants that can drift.
+        _version_instant = _mint_source_window_instant()
+        ev["updatedAt"] = _version_instant
+        ev["validFrom"] = _version_instant
         # #5024 P2-2: the pre-state rides THIS CALL's own return value, not a
         # projection-level slot. A slot is shared by every call on the SDK, so
         # two threads sharing one SDK on DIFFERENT urls (different per-url
@@ -25870,7 +25943,17 @@ class TortoiseSDK:
                 # as well would be a second derivation that can disagree.
                 self._emit_event(
                     "SourceVersioned", id=url,
-                    previousContentHash=_old_hash, **payload,
+                    previousContentHash=_old_hash,
+                    # #3644: the PRIOR window's close, named as a recorded act.
+                    # Equal to the payload's `validFrom` BY CONSTRUCTION (the
+                    # same minted instant, above) — contiguity is the whole
+                    # point of §4.6's "the journal record that opens a new
+                    # version closes the old one in the same act". It is a
+                    # JOURNAL-ONLY fact: the node holds the CURRENT version, so
+                    # the fold must not write it (`_SOURCE_HANDLED` skips it,
+                    # like `previousContentHash`).
+                    previousValidTo=payload["validFrom"],
+                    **payload,
                 )
             elif self._source_payload_is_noop(payload, _stored_before):
                 # Genuine re-check: the caller re-sent what we already hold.
@@ -25900,6 +25983,15 @@ class TortoiseSDK:
     # disqualify a no-op.
     _SOURCE_NOOP_IGNORED_KEYS: frozenset = frozenset({
         "ingestedAt", "_merge_run_id", "id",
+        # #3644: the window start, for exactly the reason `updatedAt` below is
+        # here — it is minted by the producer on EVERY call (one clock, shared
+        # with `updatedAt`), so it is not a fact the caller asserted and can
+        # never make an otherwise-identical re-check "different". Leaving it
+        # in the comparison would have re-introduced the unbounded journal
+        # growth #5024 removed (measured there: 12 -> 13 lines on a no-op
+        # re-check). The node is protected independently: `_upsert_source`
+        # writes `validFrom` only through its hash-diff gate.
+        "validFrom",
         # #5024: minted by the producer on EVERY call (the one clock the write
         # and the record share). It is not a fact the caller asserted, so it
         # can never make an otherwise-identical re-check "different" — and
@@ -27284,6 +27376,50 @@ def _now_iso() -> str:
     """
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017
+
+
+# #3644 review P1: the `:Source` version-window instant must be STRICTLY
+# increasing. `create_source` mints it from the WALL CLOCK and `_upsert_source`
+# writes `s.validFrom = $vf` on the hash-diff gate with NO comparison against
+# the stored value, so a fixed clock made consecutive windows zero-width
+# (`prev == cur`) and a backward-stepped clock made them INVERTED (`prev > cur`)
+# — the class `audit.inverted_validity_window` rates HIGH for a Point. The floor
+# below makes the mint monotone against every prior mint in this process, so a
+# transition can never open a window at or before the version it superseded.
+# (`updatedAt` uses the same returned value, so the two never disagree — one
+# clock. This closes the reachable in-process case: every `validFrom` the node
+# holds in this process was minted here, so the next mint is strictly above it.)
+_source_window_instant_guard = threading.Lock()
+_source_window_instant_floor: str | None = None
+
+
+def _mint_source_window_instant() -> str:
+    """`_now_iso()`, clamped strictly ABOVE the last instant this module minted.
+
+    A version window must be strictly increasing; a wall clock can stall or
+    step backward. When the fresh read is not strictly greater than the last
+    minted instant, return one microsecond past it instead.
+    """
+    global _source_window_instant_floor
+    with _source_window_instant_guard:
+        now = _now_iso()
+        floor = _source_window_instant_floor
+        if floor is not None and now <= floor:
+            now = _bump_instant(floor)
+        _source_window_instant_floor = now
+        return now
+
+
+def _bump_instant(value: str) -> str:
+    """One microsecond past ``value``, else the clock when it is unparseable."""
+    from datetime import UTC, datetime, timedelta
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return (dt + timedelta(microseconds=1)).isoformat()
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return _now_iso()
 
 
 def _post_commit(payload: dict, *, base_url=None, api_key=None) -> dict:
