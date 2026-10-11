@@ -2744,7 +2744,8 @@ def _cmd_install_hooks(args) -> int:
 
     Two independent halves:
 
-    * the per-turn READ hook (``volunteer-turn.sh``) — codex / claude / cline;
+    * the per-turn READ hook (``volunteer-turn.sh``) — codex / claude /
+      cline / devin;
     * the per-session CAPTURE seam (``tortoise.capture_install``) — claude
       (SessionStart/SessionEnd scripts + merged ``settings.json`` entry),
       codex (the SessionEnd capture hook + its merged ``$CODEX_HOME/
@@ -3000,7 +3001,7 @@ def _install_read_hook_impl(args) -> int:
     Writes the per-harness UserPromptSubmit hook registration pointing at the
     SHIPPED volunteer-turn.sh (resolved from this package, so the registration
     survives site-package installs), enabling the per-turn volunteering-memory
-    reflex in codex / claude / cline.
+    reflex in codex / claude / cline / devin.
 
     Safety contract:
     - Existing unrelated registrations are NEVER touched: claude settings.json
@@ -3041,6 +3042,16 @@ def _install_read_hook_impl(args) -> int:
               "with a merged SessionStart/SessionEnd entry (timeout 60)")
         print("  tortoise install cline   → <dir>/.cline/hooks/UserPromptSubmit "
               "(→ volunteer-turn.sh cline)")
+        # Devin's file is the ONE JSON seam with no ``"hooks"`` wrapper: the
+        # hooks object IS the file (docs.devin.ai/cli/extensibility/hooks —
+        # "In .devin/hooks.v1.json, the hooks object is the entire file (no
+        # wrapper key needed)").  Devin ALSO reads `.claude/settings.json`
+        # hooks when read_config_from.claude is on (the default), so this
+        # standalone file is the seam that survives that compat toggle being
+        # turned off.
+        print("  tortoise install devin   → <dir>/.devin/hooks.v1.json "
+              "(UserPromptSubmit → volunteer-turn.sh devin; Claude-hooks "
+              "output contract)")
         print("  tortoise install pi      → ~/.pi/agent/extensions/"
               "tortoise-capture.ts (the capture extension; Pi has no "
               "shell-hook read seam)")
@@ -3048,7 +3059,7 @@ def _install_read_hook_impl(args) -> int:
               "(the sessionEnd capture hook; Cursor has no shell-hook read "
               "seam. IDE-ONLY: Cursor cloud agent sessions are not captured)")
         print("Other seams (docs/matrix only, this wave): "
-              "devin, gemini, opencode — see "
+              "gemini, opencode — see "
               "docs/research/2026-09-01-gbrain-learnings/platform-seams.md")
         return 0
 
@@ -3064,12 +3075,21 @@ def _install_read_hook_impl(args) -> int:
     quoted_script = _shlex.quote(str(script))
 
     # Per-harness registration targets. Registration contracts verified
-    # against harness primary docs: BOTH codex (.codex/hooks.json) and claude
-    # (.claude/settings.json) use the same event → matcher-group shape, where
-    # each event entry wraps handlers in {"hooks": [{type, command}]} — a flat
-    # {type, command} under the event key is silently ignored by codex's
-    # parser (hook_config.rs deserializes events as Vec<MatcherGroup>). Cline
-    # hooks are executable files at .cline/hooks/<EventName>.
+    # against harness primary docs: codex (.codex/hooks.json), claude
+    # (.claude/settings.json) and devin (.devin/hooks.v1.json) all use the
+    # same event → matcher-group shape, where each event entry wraps handlers
+    # in {"hooks": [{type, command}]} — a flat {type, command} under the
+    # event key is silently ignored by codex's parser (hook_config.rs
+    # deserializes events as Vec<MatcherGroup>). Cline hooks are executable
+    # files at .cline/hooks/<EventName>.
+    #
+    # Devin's file is the one JSON seam with NO wrapper key (see the
+    # `wrapped` flag below): ``.devin/hooks.v1.json`` IS the hooks object.
+    # Its UserPromptSubmit stdin carries ``prompt`` and its output contract is
+    # ``hookSpecificOutput.additionalContext`` — the same contract the shared
+    # script already emits for the ``devin`` harness arg (verified against
+    # docs.devin.ai/cli/extensibility/hooks + /hooks/lifecycle-hooks, the
+    # re-fetch the wave-1 matrix row left pending).
     if harness == "codex":
         target = root / ".codex" / "hooks.json"
         # Nested matcher-group shape (verified against codex primary docs).
@@ -3079,6 +3099,15 @@ def _install_read_hook_impl(args) -> int:
         target = root / ".claude" / "settings.json"
         registration = [{"hooks": [{"type": "command",
                                     "command": f"{quoted_script} claude"}]}]
+    elif harness == "devin":
+        target = root / ".devin" / "hooks.v1.json"
+        # Same nested matcher-group shape as codex/claude. The matcher key is
+        # omitted deliberately: Devin documents it as tool-event-only and says
+        # to "use "" or omit the matcher" for UserPromptSubmit — so the one
+        # registration shape is shared verbatim across all three JSON seams
+        # and the ownership/idempotency logic below stays single-path.
+        registration = [{"hooks": [{"type": "command",
+                                    "command": f"{quoted_script} devin"}]}]
     elif harness == "cline":
         target = root / ".cline" / "hooks" / "UserPromptSubmit"
         registration = None
@@ -3093,6 +3122,21 @@ def _install_read_hook_impl(args) -> int:
 
     dry = getattr(args, "dry_run", False)
     uninstall = getattr(args, "uninstall", False)
+
+    # The JSON seams differ in ONE way: codex/claude nest their hooks under a
+    # top-level ``"hooks"`` key, while Devin's ``.devin/hooks.v1.json`` IS the
+    # hooks object (docs.devin.ai/cli/extensibility/hooks: "In
+    # .devin/hooks.v1.json, the hooks object is the entire file (no wrapper
+    # key needed). In all other locations, hooks are nested under the
+    # \"hooks\" key").  Every other line of the read/merge/repair/uninstall
+    # path below is shared — one code path, two document shapes.
+    wrapped = harness in ("codex", "claude")
+
+    def _document(entries) -> dict:
+        """The on-disk document carrying ``entries`` for this harness."""
+        if wrapped:
+            return {"hooks": {"UserPromptSubmit": entries}}
+        return {"UserPromptSubmit": entries}
 
     # ── Root-shape guard (#7807): a ``--dir`` ROOT that is not a real
     #    directory — a regular FILE, a symlink to a file, or a DANGLING
@@ -3305,13 +3349,21 @@ def _install_read_hook_impl(args) -> int:
             print(f"{target} exists but its top level is not a JSON object — "
                   "refusing to touch it. Merge manually.", file=_sys.stderr)
             return 1
-        hooks = existing_json.get("hooks")
-        if hooks is not None and not isinstance(hooks, dict):
-            print(f"{target} exists but its \"hooks\" field is not a JSON "
-                  "object — refusing to touch it. Merge manually.",
-                  file=_sys.stderr)
-            return 1
-        hooks = hooks or {}
+        # Unwrapped (devin): the top-level object IS the hooks map, so the
+        # other event keys (PreToolUse/SessionStart/…) live beside
+        # UserPromptSubmit and are preserved by the round-trip below.  The
+        # ``"hooks"`` shape check is codex/claude-only: on a devin file a
+        # ``hooks`` key would be a foreign event name, not a wrapper.
+        if wrapped:
+            hooks = existing_json.get("hooks")
+            if hooks is not None and not isinstance(hooks, dict):
+                print(f"{target} exists but its \"hooks\" field is not a JSON "
+                      "object — refusing to touch it. Merge manually.",
+                      file=_sys.stderr)
+                return 1
+            hooks = hooks or {}
+        else:
+            hooks = existing_json
         ups = hooks.get("UserPromptSubmit")
         if ups is not None and not isinstance(ups, list):
             print(f"{target} exists but its UserPromptSubmit entries are not "
@@ -3346,9 +3398,16 @@ def _install_read_hook_impl(args) -> int:
                 hooks["UserPromptSubmit"] = remaining
             else:
                 hooks.pop("UserPromptSubmit", None)
-            existing_json["hooks"] = hooks
-            if not hooks:
-                existing_json.pop("hooks", None)
+            if wrapped:
+                existing_json["hooks"] = hooks
+                if not hooks:
+                    existing_json.pop("hooks", None)
+            # Unwrapped (devin): ``hooks`` IS ``existing_json``, already
+            # updated in place.  Assigning ``existing_json["hooks"] =
+            # hooks`` here would self-reference the dict (json.dumps then
+            # recurses forever) and plant a bogus "hooks" event key.  An
+            # emptied document is left as ``{}`` and the FILE is never
+            # deleted — we did not necessarily create it.
             out = _json.dumps(existing_json, indent=2) + "\n"
             if dry:
                 print(f"[dry-run] would uninstall from {target}:")
@@ -3361,7 +3420,10 @@ def _install_read_hook_impl(args) -> int:
         # volunteer-turn.sh entry is present (idempotent — wrapper-aware).
         if not ours:
             ups.append(registration[0])
-            existing_json.setdefault("hooks", {})["UserPromptSubmit"] = ups
+            if wrapped:
+                existing_json.setdefault("hooks", {})["UserPromptSubmit"] = ups
+            else:
+                existing_json["UserPromptSubmit"] = ups
         else:
             # #2383/R2: an entry whose command points at a STALE script path
             # (venv/python relocation, or a committed config cloned to
@@ -3437,17 +3499,55 @@ def _install_read_hook_impl(args) -> int:
 
     if dry:
         print(f"[dry-run] would write {target}:")
-        print(_json.dumps({"hooks": {"UserPromptSubmit": registration}},
-                          indent=2))
+        print(_json.dumps(_document(registration), indent=2))
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            _json.dumps({"hooks": {"UserPromptSubmit": registration}},
-                        indent=2) + "\n")
+        target.write_text(_json.dumps(_document(registration), indent=2) + "\n")
         print(f"Installed {target}")
         if harness == "codex":
             print("Project-local codex hooks require one-time trust: run "
                   "`codex /hooks` in the project and approve the hook.")
+        if harness == "devin":
+            # Devin ALSO reads `.claude/settings.json` hooks (loaded when
+            # read_config_from.claude is on — the DEFAULT), so a repo that
+            # already carries our claude read-hook fires the reflex TWICE per
+            # turn: the duplicate is silent, and the injected block lands in
+            # the context twice.  Say so where the user chose this install
+            # instead of letting them discover it.  Nothing is removed for
+            # them — the claude registration may serve Claude Code too.
+            _claude_reg = root / ".claude" / "settings.json"
+            _cj = None
+            if _claude_reg.exists():
+                try:
+                    _cj = _json.loads(_claude_reg.read_text(encoding="utf-8"))
+                except MemoryError:
+                    raise  # exhaustion is not a refusal — the module's rule
+                except Exception:
+                    # ADVISORY ONLY. This note must never convert an install
+                    # that already wrote its registration into a reported
+                    # FAILURE.  The read is over a file we do not own, so any
+                    # shape it has — deeply nested JSON (RecursionError), a
+                    # non-UTF-8 byte (UnicodeDecodeError), a list — is a
+                    # reason to SAY NOTHING.  A bare `except Exception` (not a
+                    # tuple) is deliberate: an enumerated tuple is refutable
+                    # by the next member it omits, the exact escape that
+                    # shipped `TypeError` (#3987) and `UnicodeDecodeError`
+                    # (#3988) through this module's earlier boundaries.
+                    _cj = None
+            _inner = _cj.get("hooks") if isinstance(_cj, dict) else None
+            _cups = (_inner.get("UserPromptSubmit")
+                     if isinstance(_inner, dict) else None)
+            _dup = isinstance(_cups, list) and any(
+                "volunteer-turn.sh" in _entry_command(e) for e in _cups)
+            if _dup:
+                print(
+                    f"Note: {_claude_reg} ALSO registers "
+                    "volunteer-turn.sh, and Devin CLI reads `.claude/` hooks "
+                    "by default (read_config_from.claude) — the reflex will "
+                    "run twice per turn and inject the block twice. Keep one "
+                    "registration: `tortoise install claude --uninstall` "
+                    "removes the claude one, or disable "
+                    "read_config_from.claude in the Devin user config.")
         print("Hook fires on every user prompt; empty output = clean silence "
               "(nothing above the confidence gate or reflex unavailable).")
     return 0
@@ -9896,8 +9996,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Install a harness seam (per-turn memory hook + session capture)")
     inst.add_argument(
         "harness", nargs="?",
-        choices=["codex", "claude", "cline", "cursor", "pi"],
-        help="Harness to install (codex | claude | cline | cursor | pi)")
+        choices=["codex", "claude", "cline", "devin", "cursor", "pi"],
+        help="Harness to install (codex | claude | cline | devin | cursor | pi)")
     inst.add_argument(
         "--dir", default=".",
         help="Project directory to install into (default: cwd)")
