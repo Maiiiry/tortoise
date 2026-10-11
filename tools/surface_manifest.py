@@ -175,6 +175,82 @@ ORDER_FILE = ROOT / "config" / "surface-order.yml"
 MANIFEST_FILE = ROOT / "config" / "surface-manifest.yml"
 RENDERED_FILE = ROOT / "docs" / "product" / "mcp-sdk-surface.md"
 
+# The baseline's banner, and #7292 R1. `cmd_cut` owns this file and rewrites it WHOLESALE, so a
+# header added by hand is destroyed on the next re-cut: `build_doc` emits no header, and the
+# write site replaces the document rather than merging into it. Measured — the file carried a
+# hand-added banner, `cut` left it with none, and nothing went red, because a YAML comment is
+# invisible to every reader of the parsed document (the guard and `cmd_check` both load it with
+# `yaml.safe_load`). Writing it here makes the banner a property of the GENERATOR instead of a
+# property of whoever happened to edit the YAML last.
+#
+# It is a TEMPLATE rather than a plain constant for a measured reason: a banner that hard-codes
+# "82 live + 16 retired / 150 SDK methods" is emitted over a document whose `counts:` block the
+# SAME run derives from the live registry, so the first sanctioned re-cut (CONTRIBUTING.md, "To
+# propose an addition", step 2) leaves the file asserting numbers its own `counts:` block
+# contradicts — and no assertion can catch it, because a stale banner still matches a stale
+# constant. Substituting the counts makes banner and document agree BY CONSTRUCTION at every
+# cut. Only `{declared}`, `{live}`, `{retired}` and `{sdk}` are substitutions, so the text must
+# not grow any other brace.
+#
+# The pointer block is load-bearing, not narration. `approval_status: pending-owner-approval` is
+# the DELIBERATE per-re-cut reset (see the write site for why the control is kept), and read
+# alone it is indistinguishable from "the owner has not decided" — so the single artifact that
+# DECLARES the surface was silent about the two target approvals that already exist, and the
+# decision had to be re-derived by every reader who opened it. It names them instead.
+MANIFEST_HEADER_TEMPLATE = """\
+# ⛔ THE SURFACE THIS BASELINE APPROVES CANNOT CHANGE WITHOUT DANIEL'S APPROVAL.
+# Re-running `tools/surface_manifest.py cut` records a NEW surface — it does not approve it.
+# Adding, removing or renaming an MCP tool or a public SDK method is the owner's decision: the
+# surface is what every agent and customer integration can see and call, so a change to it
+# materially affects customer outcomes. Get Daniel's explicit approval FIRST — raise it as a
+# USER QUESTION / DECISION RELAY per AGENTS.md; CONTRIBUTING.md has the procedure.
+# `tools/surface-guard.py` and this file's `check` catch an UNRECORDED drift only, never an
+# unapproved one: an expansion that re-cuts the baseline passes both. A green gate is NOT approval.
+#
+# ⛔ ONLY THIS BANNER IS DURABLE. `cut` re-emits the document FROM CODE, and a YAML comment is
+# not part of the parsed document — so every comment in the BODY below is destroyed by the next
+# re-cut, silently, and no gate can see it. This banner is durable only because the generator
+# emits it; anything else that must survive a re-cut belongs in the tool or in a doc, never in a
+# body comment (#7292 R1).
+#
+# ── READ THIS BEFORE ASKING THE OWNER TO DECIDE THIS AGAIN ────────────────────────────────────
+# `approval_status: pending-owner-approval` BELOW IS NOT "the owner has not decided". It is the
+# reset CONTRIBUTING.md ("To propose an addition", steps 2-4) requires on every re-cut, and it
+# describes THIS FILE — the surface that still exists, per its own counts below. On this cut:
+# {declared} declared tools ({live} live + {retired} retired), {sdk} public SDK methods.
+# The owner HAS approved the TARGET surface, and that approval is recorded in the canonical
+# docs, not here:
+#
+#   * MCP — `docs/product/canonical-mcp-tools.md` (approved 2026-09-18 by daniel-ospina, PR 4120)
+#   * SDK — `docs/product/beta-sdk-surface.md`    (approved 2026-09-21 by daniel-ospina)
+#
+# Target: 26 MCP tools / 40 SDK methods, tracked by #4282, whose phase tables live in
+# `docs/product/vision-mcp-sdk-surface.md`. Test that against the `counts:` block below: if this
+# file does not declare 26 tools and 40 methods, the migration has not completed. The half that
+# IS on main is the declaration — the approved lists, the MCP rename table, this manifest and the
+# gate. So the surface is split between an APPROVED TARGET and an UNAPPROVED PRESENT, and a lane
+# that reads `pending` here must not re-request the target decision: it exists, it is above, and
+# re-asking it is a loop this banner exists to break. Read #4282 first.
+"""
+
+
+def manifest_header(counts: dict) -> str:
+    """The banner for a baseline carrying `counts` — the same counts the document carries.
+
+    Every number the banner states is derived here rather than written into the text, so the
+    banner and the `counts:` block below it cannot disagree (#7292 R1 review, P2). Derived from
+    the counts the CALLER is about to write, not from the file on disk, so a re-cut that changes
+    the surface states the new surface.
+    """
+    live = int(counts["tools"])
+    retired = int(counts["retired"])
+    return MANIFEST_HEADER_TEMPLATE.format(
+        declared=live + retired,
+        live=live,
+        retired=retired,
+        sdk=int(counts["sdk_public_methods"]),
+    )
+
 
 class SurfaceEvidenceUnreadable(Exception):
     """The evidence a check needs could not be read — a failure, never a skip.
@@ -1170,8 +1246,15 @@ def cmd_cut(args: argparse.Namespace) -> int:
               "--allow-approval-reset to drop them deliberately.")
         return 1
 
+    # The banner is written HERE, by the generator, and not carried from the file being
+    # overwritten (#7292 R1): a hand-added header did not survive the next cut, because this
+    # write replaces the document. Reading the OLD file's header and preserving it would make
+    # the banner depend on what someone previously put there; emitting it makes the generator
+    # the single owner of a document the generator owns. It is built from `doc["counts"]` — the
+    # counts being written on THIS run — so the banner cannot contradict the block below it.
     MANIFEST_FILE.write_text(
-        yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=110, default_flow_style=False),
+        manifest_header(doc["counts"])
+        + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=110, default_flow_style=False),
         encoding="utf-8",
     )
 

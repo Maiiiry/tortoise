@@ -2345,3 +2345,171 @@ def test_the_render_does_not_claim_a_client_cap_binds_a_smaller_surface(tmp_path
                 f"{sm.LARGEST_COMPARABLE}), so 'pins a smaller set' is false here"
             )
             assert f"the biggest comparable, Letta, pins {sm.LARGEST_COMPARABLE}" in text
+
+
+def test_the_generator_writes_the_banner_rather_than_carrying_one(monkeypatch, tmp_path, derived_baseline):
+    """A banner the GENERATOR does not emit is destroyed by the generator (#7292 R1).
+
+    `cut` owns `config/surface-manifest.yml` and replaces the document wholesale, so a header
+    added by hand cannot survive it: the file carried one, a re-cut left it with none, and
+    nothing went red — a YAML comment is invisible to `yaml.safe_load`, which is how BOTH the
+    guard and `cmd_check` read the file, so the loss has no gate to trip. The banner is
+    therefore a property of the generator, and this pins the generator doing it.
+
+    The second assertion is the other half of the same contract, and it is why the fix is
+    *emit* rather than *preserve*: `cut` deliberately does NOT carry the previous file's
+    banner forward. Preserving it would make the header depend on whatever a previous author
+    happened to write, which for a file the tool owns is how the header went missing in the
+    first place.
+    """
+    sm = _load_manifest_tool()
+    path = tmp_path / "surface-manifest.yml"
+    prior = copy.deepcopy(_manifest())
+    prior["approval_status"] = "approved"
+    path.write_text(
+        "# A HAND-ADDED BANNER\n"
+        + yaml.safe_dump(prior, sort_keys=False, allow_unicode=True, width=110),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(sm, "MANIFEST_FILE", path)
+    monkeypatch.setattr(sm, "build_doc", lambda *a, **k: copy.deepcopy(derived_baseline))
+    assert sm.cmd_cut(argparse.Namespace(commit="deadbeef", allow_approval_reset=True)) == 0
+
+    written = path.read_text(encoding="utf-8")
+    assert written.startswith(sm.manifest_header(derived_baseline["counts"])), (
+        "`cut` left the baseline without the generator's banner, so the next hand-added header "
+        "is destroyed again by the tool that owns the file (#7292 R1)"
+    )
+    # An EMPTY banner satisfies every `startswith` in this file, so the sentence the banner
+    # exists to carry is pinned here as well (review finding: the trio caught an emptied banner
+    # only through the third test).
+    assert 'BELOW IS NOT "the owner has not decided"' in written, (
+        "the banner `cut` wrote does not carry the sentence that stops the reset being read as "
+        "an open question, which is the whole reason it is emitted"
+    )
+    assert "A HAND-ADDED BANNER" not in written, (
+        "`cut` carried a hand-written header across the re-cut; the tool owns this file, so "
+        "the banner has to be what the generator emits and not a residue of the last edit"
+    )
+
+
+def test_the_checked_in_baseline_carries_the_banner_the_generator_emits():
+    """The committed file and the constant must not drift, in either direction.
+
+    The banner is only durable if the file on `main` is the one `cut` would write. A file
+    edited to disagree with the constant is the R1 failure in reverse: the next re-cut
+    silently replaces whatever it says, so a reader would be reading a header that is already
+    scheduled for deletion.
+    """
+    sm = _load_manifest_tool()
+    committed = (sm.ROOT / "config" / "surface-manifest.yml").read_text(encoding="utf-8")
+    parsed = yaml.safe_load(committed)
+    assert committed.startswith(sm.manifest_header(parsed["counts"])), (
+        "config/surface-manifest.yml does not begin with the banner the generator derives from "
+        "its own `counts:` block, so the next `cut` would rewrite it and the committed text is "
+        "not the one that survives"
+    )
+
+
+def test_the_banner_points_at_the_approved_targets_and_they_exist():
+    """The banner's POINTER half is load-bearing, not narration.
+
+    `approval_status: pending-owner-approval` is the deliberate per-re-cut reset, and on its
+    own it is indistinguishable from "the owner has not decided" — which is how the one
+    artifact that DECLARES the surface came to be silent about an approval that already
+    existed, so the decision had to be re-derived by every reader who opened it. The banner
+    breaks that loop by naming the approved targets, the tracking issue and the target size.
+
+    The paths are asserted to EXIST: a banner that points at a renamed doc is worse than no
+    banner, because it reads as evidence while sending the reader nowhere.
+    """
+    sm = _load_manifest_tool()
+    banner = sm.manifest_header(sm._read_manifest()["counts"])
+
+    for rel in ("docs/product/canonical-mcp-tools.md", "docs/product/beta-sdk-surface.md"):
+        assert rel in banner, f"the banner no longer names the approved target {rel}"
+        assert (sm.ROOT / rel).exists(), (
+            f"the banner points at {rel}, which does not exist — a dangling pointer reads as "
+            "evidence while sending the reader nowhere"
+        )
+
+    # A path that EXISTS is not a claim that is TRUE. The likelier way this pointer goes stale
+    # is that the doc stays where it is while its approval is withdrawn, re-recorded or
+    # renumbered, and the banner keeps asserting the old one — a mode the existence check above
+    # cannot see, because nothing else in the repo pins these fields (review finding). So the
+    # values the banner QUOTES are read back from the docs themselves.
+    for rel, status, date in (
+        ("docs/product/canonical-mcp-tools.md", "approved", "2026-09-18"),
+        ("docs/product/beta-sdk-surface.md", "approved", "2026-09-21"),
+    ):
+        text = (sm.ROOT / rel).read_text(encoding="utf-8")
+        assert f"approval_status: {status}" in text, (
+            f"{rel} no longer records `approval_status: {status}`, so the banner's claim that "
+            "this surface is approved is FALSE"
+        )
+        assert f"approved: {date}" in text, (
+            f"{rel} no longer records `approved: {date}`, which the banner states as fact"
+        )
+        assert "approvedBy: daniel-ospina" in text, (
+            f"{rel} no longer records daniel-ospina as the approver, which the banner states"
+        )
+        assert date in banner, (
+            f"the banner no longer carries {rel}'s recorded approval date ({date}), so the "
+            "pointer is not bound to the record it points at"
+        )
+
+    assert "ONLY THIS BANNER IS DURABLE" in banner, (
+        "the banner must keep saying that the BODY comments below it are still destroyed by a "
+        "re-cut — without that sentence this banner reads as 'comments in this file survive', "
+        "which is the residual #7292 R1 does not fix"
+    )
+    assert "#4282" in banner, (
+        "the banner must name the issue tracking the migration, or a reader cannot find the "
+        "state of the approved surface"
+    )
+    for target in ("26 MCP tools", "40 SDK methods"):
+        assert target in banner, f"the banner no longer states the approved target size: {target}"
+    assert "pending-owner-approval" in banner and "has not decided" in banner, (
+        "the banner must say plainly that `pending-owner-approval` here does NOT mean the "
+        "owner has not decided — without that sentence the reset reads as an open question"
+    )
+
+
+def test_a_re_cut_states_the_counts_it_wrote_not_a_frozen_constant(
+    monkeypatch, tmp_path, derived_baseline
+):
+    """The banner must describe the surface being written, not the surface of the last edit.
+
+    `cut` is the documented route for every surface change (CONTRIBUTING.md, "To propose an
+    addition", step 2), and it emits the banner unconditionally over a document whose `counts:`
+    block the same run derives from the live registry. Hard-coded counts therefore leave the
+    file asserting numbers its own `counts:` block contradicts, and no assertion can see it:
+    a stale banner still matches a stale constant. Measured before the fix — a grown surface
+    wrote `counts: 83 / 151` under a banner still claiming 82 live + 16 retired and 150 methods.
+
+    This is the property the template exists for, so it is asserted with a surface whose counts
+    DIFFER from the committed one: a banner that happens to agree with the current baseline
+    proves nothing about the next cut.
+    """
+    sm = _load_manifest_tool()
+    grown = copy.deepcopy(derived_baseline)
+    grown["counts"] = {**grown["counts"], "tools": 83, "sdk_public_methods": 151, "retired": 16}
+
+    path = tmp_path / "surface-manifest.yml"
+    monkeypatch.setattr(sm, "MANIFEST_FILE", path)
+    monkeypatch.setattr(sm, "build_doc", lambda *a, **k: copy.deepcopy(grown))
+    assert sm.cmd_cut(argparse.Namespace(commit="deadbeef")) == 0
+
+    written = path.read_text(encoding="utf-8")
+    assert "99 declared tools (83 live + 16 retired)" in written, (
+        "the banner does not state the counts written on this run, so it describes a surface "
+        "the document no longer is"
+    )
+    assert "151 public SDK methods" in written, (
+        "the banner's SDK count is not the one this run wrote"
+    )
+    assert "98 declared tools" not in written, (
+        "the banner still carries the previous surface's counts under a changed surface (#7292 "
+        "R1 review, P2)"
+    )

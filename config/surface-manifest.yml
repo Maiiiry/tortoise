@@ -1,3 +1,36 @@
+# ⛔ THE SURFACE THIS BASELINE APPROVES CANNOT CHANGE WITHOUT DANIEL'S APPROVAL.
+# Re-running `tools/surface_manifest.py cut` records a NEW surface — it does not approve it.
+# Adding, removing or renaming an MCP tool or a public SDK method is the owner's decision: the
+# surface is what every agent and customer integration can see and call, so a change to it
+# materially affects customer outcomes. Get Daniel's explicit approval FIRST — raise it as a
+# USER QUESTION / DECISION RELAY per AGENTS.md; CONTRIBUTING.md has the procedure.
+# `tools/surface-guard.py` and this file's `check` catch an UNRECORDED drift only, never an
+# unapproved one: an expansion that re-cuts the baseline passes both. A green gate is NOT approval.
+#
+# ⛔ ONLY THIS BANNER IS DURABLE. `cut` re-emits the document FROM CODE, and a YAML comment is
+# not part of the parsed document — so every comment in the BODY below is destroyed by the next
+# re-cut, silently, and no gate can see it. This banner is durable only because the generator
+# emits it; anything else that must survive a re-cut belongs in the tool or in a doc, never in a
+# body comment (#7292 R1).
+#
+# ── READ THIS BEFORE ASKING THE OWNER TO DECIDE THIS AGAIN ────────────────────────────────────
+# `approval_status: pending-owner-approval` BELOW IS NOT "the owner has not decided". It is the
+# reset CONTRIBUTING.md ("To propose an addition", steps 2-4) requires on every re-cut, and it
+# describes THIS FILE — the surface that still exists, per its own counts below. On this cut:
+# 98 declared tools (82 live + 16 retired), 150 public SDK methods.
+# The owner HAS approved the TARGET surface, and that approval is recorded in the canonical
+# docs, not here:
+#
+#   * MCP — `docs/product/canonical-mcp-tools.md` (approved 2026-09-18 by daniel-ospina, PR 4120)
+#   * SDK — `docs/product/beta-sdk-surface.md`    (approved 2026-09-21 by daniel-ospina)
+#
+# Target: 26 MCP tools / 40 SDK methods, tracked by #4282, whose phase tables live in
+# `docs/product/vision-mcp-sdk-surface.md`. Test that against the `counts:` block below: if this
+# file does not declare 26 tools and 40 methods, the migration has not completed. The half that
+# IS on main is the declaration — the approved lists, the MCP rename table, this manifest and the
+# gate. So the surface is split between an APPROVED TARGET and an UNAPPROVED PRESENT, and a lane
+# that reads `pending` here must not re-request the target decision: it exists, it is above, and
+# re-asking it is a loop this banner exists to break. Read #4282 first.
 manifest_version: 1
 issue: 3863
 cut_at_commit: 4d11a7b40f8c1dbb5d099acc4b54e09324af5452
