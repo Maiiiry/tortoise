@@ -28,14 +28,20 @@ WHAT `check` DOES NOT PROVE — APPROVAL IS NOT MACHINE-CARRIED
     review. A green run is not consent. (The repository ruleset the #3863 scope doc
     proposed as the carrier was REJECTED on #4282 as over-engineering.)
 
-    The one thing `check` DOES enforce about approval is PROVENANCE (#4185): the
-    manifest's `approval_status` / `approval_principal` / `approval_pr` /
-    `approval_date` are DERIVED from `docs/product/canonical-mcp-tools.md` by
-    `read_approval`, and compared, so a hand-edited manifest cannot disagree with the
-    owner's own approval record. That is consistency, not consent — and it is not the
-    same question as compliance with the owner-approved TARGET recorded in
-    `docs/product/canonical-mcp-tools.md` and `docs/product/beta-sdk-surface.md`, which
-    `tools/surface-target-check.py` answers against the live surface.
+    PROVENANCE IS STAGED, NOT YET COMPARED HERE (#4185, first PR). `read_approval` reads
+    the owner's approval from `docs/product/canonical-mcp-tools.md`; it is landed and
+    tested, but the manifest's top-level `approval_status` / `approval_principal` /
+    `approval_pr` / `approval_date` remain in `NON_DERIVABLE_DOC_KEYS`, so `check` does
+    NOT compare them yet. That is deliberate: CI's required `surface-guard` job pins the
+    BASE copy of `tools/surface-guard.py`, whose per-row `approval` rule fires on
+    `approval_status: approved`, so flipping the committed manifest in this PR cannot be
+    green. A follow-up PR — once the new guard is on `main` — removes these keys from the
+    deny-list, flips the manifest to the derived `approved`, and arms the comparison.
+    Until then `tools/surface-guard.py` still enforces provenance whenever a manifest
+    CLAIMS an approval. Compliance with the owner-approved TARGET recorded in
+    `docs/product/canonical-mcp-tools.md` and `docs/product/beta-sdk-surface.md` is a
+    separate question, answered against the live surface by
+    `tools/surface-target-check.py`.
 
     OVERRIDES: the frozen-snapshot-as-approval-baseline practice — a snapshot of the implementation cannot be the approved target; the target is read from docs/product/canonical-mcp-tools.md (owner, 26/40, re-confirmed 2026-10-10).
 
@@ -193,11 +199,17 @@ RENDERED_FILE = ROOT / "docs" / "product" / "mcp-sdk-surface.md"
 MANIFEST_HEADER = (
     "# OVERRIDES: the frozen-snapshot-as-approval-baseline practice — a snapshot of the implementation cannot be the approved target; the target is read from docs/product/canonical-mcp-tools.md (owner, 26/40, re-confirmed 2026-10-10).\n"
     "#\n"
-    "# The top-level approval is READ from docs/product/canonical-mcp-tools.md (#4185) by\n"
-    "# `tools/surface_manifest.py::read_approval` and compared by `surface_manifest.py check`.\n"
-    "# It is not a second hand-maintained field, but it is a COPY: `tools/surface_manifest.py cut`\n"
-    "# copies the four values from the doc into this file. Approve in the doc, then re-cut.\n"
-    "# Do not hand-edit these four values — re-cut instead.\n"
+    "# The top-level approval is STAGED from docs/product/canonical-mcp-tools.md (#4185) by\n"
+    "# `tools/surface_manifest.py::read_approval`; the committed copy is still\n"
+    "# `pending-owner-approval` because CI's required `surface-guard` pins the BASE guard,\n"
+    "# whose per-row `approval` rule fires on `approved`. A follow-up PR flips it once the\n"
+    "# new guard is on main; do not hand-edit the four values — re-cut (the cut copies the\n"
+    "# doc).\n"
+    "#\n"
+    "# `high_water_counts` is a GROWTH PIN, not a derivation: `cut` carries it forward and\n"
+    "# `tools/surface-guard.py` reds when the live surface EXCEEDS it. Raising it is a\n"
+    "# deliberate, reviewable act in the approving PR — so a re-cut over a grown surface\n"
+    "# cannot be green by construction.\n"
     "#\n"
     "# ⚠️ A re-cut emits ONLY this header, then the `yaml.safe_dump` of the derived document.\n"
     "# YAML dumps no comments, so any comment below this block is SILENTLY DROPPED. Keep\n"
@@ -422,11 +434,16 @@ def read_approval(path: Path | None = None) -> dict:
 #     makes the guard report "1 exempt" and the check FAIL "recorded {True}, derived {False}".
 #   * `cut_at_commit` is provenance: `cut` records the commit it ran at.
 #   * the top-level `approval_status` / `approval_principal` / `approval_pr` /
-#     `approval_date` keys are NOT excluded: they are DERIVED from
-#     `docs/product/canonical-mcp-tools.md` by `read_approval`, so `check` compares
-#     them and a hand-set field cannot disagree with the owner's own approval record.
-#     (Before #4185 they were excluded and hand-maintained, which is how the manifest
-#     said `pending` while the canonical doc said `approved`.)
+#     `approval_date` keys are excluded for THIS PR (#4185, first PR): `read_approval`
+#     is landed, but flipping the committed manifest to the derived `approved` reds CI's
+#     required `surface-guard`, which pins the BASE guard's per-row `approval` rule. A
+#     follow-up PR (new guard on `main`) removes them from this set and arms the
+#     comparison. `tools/surface-guard.py` still enforces provenance whenever a manifest
+#     CLAIMS an approval.
+#   * `high_water_counts` is a hand-set GROWTH PIN, not a derivation: `cut` carries it
+#     forward and `tools/surface-guard.py` reds when the live surface EXCEEDS it. It is
+#     excluded here because it is not a function of the code — it is the ceiling the
+#     owner froze, raised only by a deliberate edit in an approving PR.
 #
 # The exclusion is a DENY-list applied to BOTH sides, so a key the generator grows later is
 # compared by default (present on one side only, and ABSENCE is compared as absence — a
@@ -438,6 +455,14 @@ NON_DERIVABLE_ROW_KEYS = frozenset(
 NON_DERIVABLE_DOC_KEYS = frozenset(
     {
         "cut_at_commit",
+        # Staged provenance (#4185, first PR): see the block above. A follow-up PR removes
+        # these four keys once the new guard is on `main`.
+        "approval_status",
+        "approval_principal",
+        "approval_pr",
+        "approval_date",
+        # The growth pin (#4185 review P1): carried by `cut`, enforced by the guard.
+        "high_water_counts",
         # `response_fields` records hand-authored response FIELDS, outside the gated
         # surface. `build_doc` carries the committed block forward (see
         # `_carried_response_fields`), so a derivation of it is the artifact compared
@@ -906,6 +931,50 @@ def _carried_response_fields() -> list:
     return fields if isinstance(fields, list) else []
 
 
+def _carried_high_water_counts(fallback: dict) -> dict:
+    """The frozen GROWTH PIN, carried forward verbatim across a re-cut (#4185).
+
+    `counts:` is re-derived on every `cut`, so a re-cut over a surface that GREW moves
+    the very number a drift check would compare against and the growth disappears. This
+    pin is NOT re-derived: `cut` copies the committed value forward, and
+    `tools/surface-guard.py` reds when the live counts EXCEED it. Raising it is therefore
+    a deliberate, reviewable edit in the approving PR — the machine half of "a re-cut
+    over a grown surface cannot be green by construction" (review P1).
+
+    Missing pin (e.g. the first cut, or an older manifest): fall back to the fresh counts
+    so the field is always emitted. PRESENT but malformed: refuse rather than silently
+    reset the ceiling — a silent reset is exactly the failure this pin exists to prevent.
+    """
+    try:
+        with MANIFEST_FILE.open() as fh:
+            doc = yaml.safe_load(fh)
+    except FileNotFoundError:
+        return dict(fallback)
+    except (OSError, yaml.YAMLError) as exc:
+        raise SurfaceEvidenceUnreadable(
+            f"could not read {MANIFEST_FILE} to carry the `high_water_counts` pin: {exc}. "
+            "Refusing to reset the growth ceiling silently."
+        ) from exc
+    if not isinstance(doc, dict) or "high_water_counts" not in doc:
+        return dict(fallback)
+    pin = doc.get("high_water_counts")
+    if not isinstance(pin, dict):
+        raise SurfaceEvidenceUnreadable(
+            f"{MANIFEST_FILE}'s `high_water_counts` is {pin!r}, not a mapping — refusing "
+            "to reset the growth ceiling silently."
+        )
+    out: dict[str, int] = {}
+    for key in ("tools", "sdk_public_methods"):
+        value = pin.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SurfaceEvidenceUnreadable(
+                f"{MANIFEST_FILE}'s `high_water_counts.{key}` is {value!r}, not an "
+                "integer — refusing to reset the growth ceiling silently."
+            )
+        out[key] = value
+    return out
+
+
 def build_doc(commit: str | None = None) -> dict:
     """Derive the baseline from the declaration. THE single derivation.
 
@@ -1249,6 +1318,13 @@ def build_doc(commit: str | None = None) -> dict:
             "retired": len(retired_out),
             "keyword_distribution": keyword_counts,
         },
+        # A GROWTH PIN, not a derivation (see `NON_DERIVABLE_DOC_KEYS` and
+        # `_carried_high_water_counts`): carried forward by `cut` so a re-cut over a
+        # grown surface cannot raise it silently; the guard reds when the live surface
+        # exceeds it.
+        "high_water_counts": _carried_high_water_counts(
+            {"tools": len(tools_out), "sdk_public_methods": len(sdk_out)}
+        ),
         "retired": retired_out,
         "rows": tools_out + sdk_rows,
     }

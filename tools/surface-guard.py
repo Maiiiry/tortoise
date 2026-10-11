@@ -879,43 +879,86 @@ def main(argv: list[str]) -> int:
             f"{type(exc).__name__}: {exc}. The gate cannot tell whether this surface is "
             "approved, so it must not pass."
         )
-    if status != canonical["status"]:
-        problems.append(
-            f"`approval_status` is {status!r} in the manifest but {canonical['status']!r} "
-            f"in {approval_doc}. The manifest's approval is DERIVED from that document "
-            "(#4185) — the manifest holds a stale COPY: re-cut (`tools/surface_manifest.py cut`, "
-            "adding `--allow-approval-reset` if it reports recorded per-row references) "
-            "so it re-reads the document. Edit the document only if the document is the thing "
-            "that is wrong; do not hand-edit the manifest."
-        )
-    if status == "approved" and (
-        canonical["status"] != "approved"
-        or not canonical["principal"]
-        or not canonical["pr"]
-    ):
-        problems.append(
-            f"`approval_status: approved` is not backed by {approval_doc}: it records "
-            f"status={canonical['status']!r}, principal={canonical['principal']!r}, "
-            f"pr={canonical['pr']!r}. The approval is READ from that document, not "
-            "typed into the manifest."
-        )
-    # No hand-set field may disagree with the source of truth. The manifest carries a
-    # COPY of the approval for readers; this catches an edit that made the copy lie.
-    for field, want in (
-        ("approval_principal", canonical["principal"]),
-        ("approval_pr", canonical["pr"]),
-        ("approval_date", canonical["date"]),
-    ):
-        got = doc.get(field)
-        if (got or None) != (want or None):
+    # A claim is either the `approved` STATUS or any non-null copy field. A manifest on
+    # `pending-owner-approval` with all four fields null is the PRE-#4185 state and is
+    # skipped on purpose (#4185 landed in two PRs: CI's required `surface-guard` pins the
+    # BASE copy, whose per-row rule fires on `approved`, so the committed manifest must
+    # stay `pending` in this PR). The moment a manifest CLAIMS an approval — status or a
+    # field — it must be a faithful copy of the canonical doc, and every branch below
+    # applies exactly as before. So the skip is scoped to the empty claim, never a
+    # tampered one.
+    claimed = status == "approved" or any(
+        doc.get(f) for f in ("approval_principal", "approval_pr", "approval_date")
+    )
+    if claimed:
+        if status != canonical["status"]:
             problems.append(
-                f"`{field}` is {got!r} in the manifest but {want!r} in "
-                f"{approval_doc}. The manifest's approval is DERIVED from that document — if the "
-                "document itself is missing a field, record it there (a re-cut refuses an `approved` "
-                "with no principal or PR); otherwise re-cut (`tools/surface_manifest.py cut`, adding "
-                "`--allow-approval-reset` if it reports recorded per-row references) to "
-                "re-read it. Do not hand-edit the manifest."
+                f"`approval_status` is {status!r} in the manifest but {canonical['status']!r} "
+                f"in {approval_doc}. The manifest's approval is DERIVED from that document "
+                "(#4185) — the manifest holds a stale COPY: re-cut (`tools/surface_manifest.py cut`, "
+                "adding `--allow-approval-reset` if it reports recorded per-row references) "
+                "so it re-reads the document. Edit the document only if the document is the thing "
+                "that is wrong; do not hand-edit the manifest."
             )
+        if status == "approved" and (
+            canonical["status"] != "approved"
+            or not canonical["principal"]
+            or not canonical["pr"]
+        ):
+            problems.append(
+                f"`approval_status: approved` is not backed by {approval_doc}: it records "
+                f"status={canonical['status']!r}, principal={canonical['principal']!r}, "
+                f"pr={canonical['pr']!r}. The approval is READ from that document, not "
+                "typed into the manifest."
+            )
+        # No hand-set field may disagree with the source of truth. The manifest carries a
+        # COPY of the approval for readers; this catches an edit that made the copy lie.
+        for field, want in (
+            ("approval_principal", canonical["principal"]),
+            ("approval_pr", canonical["pr"]),
+            ("approval_date", canonical["date"]),
+        ):
+            got = doc.get(field)
+            if (got or None) != (want or None):
+                problems.append(
+                    f"`{field}` is {got!r} in the manifest but {want!r} in "
+                    f"{approval_doc}. The manifest's approval is DERIVED from that document — if the "
+                    "document itself is missing a field, record it there (a re-cut refuses an `approved` "
+                    "with no principal or PR); otherwise re-cut (`tools/surface_manifest.py cut`, adding "
+                    "`--allow-approval-reset` if it reports recorded per-row references) to "
+                    "re-read it. Do not hand-edit the manifest."
+                )
+
+    # --- 7. the growth pin, checked INDEPENDENTLY of the re-cut (#4185 review P1) -----
+    # `counts:` is re-derived on every `cut`, so a PR that adds a tool and re-cuts the
+    # baseline moves the number every drift check compares against and the growth is
+    # invisible — the baseline cannot be its own growth control. This pin is NOT
+    # re-derived: `cut` carries it forward (`_carried_high_water_counts`) and the gate
+    # reds when the live surface EXCEEDS it, so growth stays visible even across a re-cut.
+    # Raising it is a deliberate edit in the approving PR, and it is the machine half of
+    # "a re-cut over a grown surface cannot be green by construction".
+    high_water = doc.get("high_water_counts")
+    if not isinstance(high_water, dict) or not all(
+        isinstance(high_water.get(k), int) and not isinstance(high_water.get(k), bool)
+        for k in ("tools", "sdk_public_methods")
+    ):
+        problems.append(
+            "the frozen baseline carries no usable `high_water_counts` pin (it needs "
+            "integer `tools` and `sdk_public_methods`). Without it a re-cut over a grown "
+            "surface is green by construction; restore it (see CONTRIBUTING.md)."
+        )
+    else:
+        for label, live_n, key in (
+            ("MCP tools", len(declared_tools), "tools"),
+            ("public SDK methods", len(declared_sdk), "sdk_public_methods"),
+        ):
+            if live_n > high_water[key]:
+                problems.append(
+                    f"the live surface GREW past the frozen high-water pin: {label} live "
+                    f"{live_n} > pin {high_water[key]}. A re-cut CANNOT raise this pin "
+                    "silently — raise `high_water_counts` explicitly in the PR that "
+                    "records the owner's approval for the growth."
+                )
 
     if problems:
         print(f"::error::{len(problems)} surface violation(s) — the frozen baseline is out of date.")

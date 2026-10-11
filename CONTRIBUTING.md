@@ -232,12 +232,20 @@ uv run python tools/surface-target-check.py
 
 **CI's `surface-guard` pins the BASE copy of `tools/surface-guard.py`**: it copies `origin/main`'s
 guard over the PR's and runs it against the PR tree, so a change to what the guard *enforces*
-cannot be green in its own PR. This change derives `approval_status` from
-`docs/product/canonical-mcp-tools.md`, which flips the manifest to `approved`; the base copy still
-enforces the per-row `approval` rule, which fires on that status and then demands a recorded
-`approval` on **every** row and every `retired:` entry that lacks one — 226 of the 232 live rows and
-all 16 retired rows on this tree. Do not resolve it by stamping them with the doc's approval: that
-would record per-row owner approvals nobody gave.
+cannot be green in its own PR. #4185 therefore lands in **two PRs**, and this paragraph is the
+prescription:
+
+1. **This PR** lands `read_approval` and `tools/surface-target-check.py` with the committed manifest
+   still `approval_status: pending-owner-approval` and the four top-level `approval_*` keys still in
+   `NON_DERIVABLE_DOC_KEYS`. The base guard sees `pending` (passes) and `check` excludes the keys
+   (passes). The guard's provenance comparison is scoped to a manifest that *claims* an approval, so
+   the empty `pending` copy is skipped rather than treated as a stale copy.
+2. **The follow-up PR** — after the new guard is on `main` — removes the four keys from
+   `NON_DERIVABLE_DOC_KEYS` and flips the committed copy to the derived `approved`. The base-pinned
+   guard is now the *new* guard, which no longer demands per-row approvals, so the flip is green.
+
+Do not "resolve" the red by stamping every row with the doc's approval: that would record per-row
+owner approvals nobody gave, and the per-row field is an audit reference, not the gate.
 
 **To propose an addition**, in the same PR:
 

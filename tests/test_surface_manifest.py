@@ -159,7 +159,16 @@ def test_approval_cannot_be_claimed_without_the_canonical_doc_recording_it(tmp_p
         "--approval-doc", str(pending_doc),
     )
     assert result.returncode == 1, "`approved` against a pending canonical doc must red"
-    assert "approval_status" in result.stdout
+    # Assert the SPECIFIC branch, not a substring a sibling also emits (#4185 review P2):
+    # `assert "approval_status" in stdout` also passes from the `not backed by` branch, and
+    # `"in the manifest but"` is NOT safe either — the per-field comparison loop emits the SAME
+    # phrase (`\`approval_principal\` is ... in the manifest but ...`), so it still passed with
+    # the stale-copy comparison disabled by `if False:`. `"stale COPY"` is emitted by the
+    # stale-copy branch ALONE, so this assertion isolates it.
+    assert "stale COPY" in result.stdout, (
+        "the stale-copy branch did not fire — the red came from elsewhere, so this test is "
+        f"not exercising what it claims:\n{result.stdout}"
+    )
 
 
 def test_unknown_approval_status_is_a_failure(tmp_path):
@@ -866,11 +875,19 @@ def test_each_declared_non_derivable_row_key_is_actually_excluded(derived_baseli
 
 def test_each_declared_non_derivable_doc_key_is_actually_excluded(derived_baseline):
     sm = _load_manifest_tool()
-    # The top-level `approval_*` keys are deliberately NOT here: they are DERIVED from
-    # `docs/product/canonical-mcp-tools.md` (#4185), so `check` compares them and a
-    # hand-set field cannot disagree with the owner's approval record.
+    # The top-level `approval_*` keys ARE here FOR THIS PR (#4185, first PR): CI's required
+    # `surface-guard` pins the BASE guard, whose per-row rule fires on `approved`, so the
+    # committed manifest must stay `pending-owner-approval` and `check` must not compare the
+    # copy yet. A follow-up PR removes them once the new guard is on `main`. Provenance is
+    # enforced by `tools/surface-guard.py` in the meantime, whenever a manifest CLAIMS an
+    # approval. `high_water_counts` is the hand-set growth pin (also not derived).
     assert {
         "cut_at_commit",
+        "approval_status",
+        "approval_principal",
+        "approval_pr",
+        "approval_date",
+        "high_water_counts",
         "response_fields",
     } == sm.NON_DERIVABLE_DOC_KEYS
     for key in sorted(sm.NON_DERIVABLE_DOC_KEYS):
@@ -897,27 +914,67 @@ def test_a_nonderivable_key_is_still_seen_when_it_is_the_ONLY_difference(derived
     assert problems, "a renamed row slipped through the projection"
 
 
-def test_the_check_reds_when_the_manifest_approval_disagrees_with_the_doc(checker, tmp_path):
-    """#4185: the approval is DERIVED, so `check` must catch a hand-edited copy.
+# The two `check`-based provenance tests that used to live here
+# (`test_the_check_reds_when_the_manifest_approval_disagrees_with_the_doc` and
+# `test_the_check_reds_when_the_manifest_claims_an_approval_the_doc_does_not`) are moved to
+# the FOLLOW-UP PR (#4185, second PR): the approval keys are back in NON_DERIVABLE_DOC_KEYS
+# in this PR, so `check` cannot compare them yet. Provenance is pinned by the guard in the
+# meantime — `test_approval_cannot_be_claimed_without_the_canonical_doc_recording_it` and
+# `test_approval_principal_cannot_disagree_with_the_canonical_doc` both exercise the exact
+# comparisons, so the behaviour is not unpinned; only its `check`-side home is deferred.
 
-    Removing the approval keys from `NON_DERIVABLE_DOC_KEYS` is what arms this: before,
-    `check` could not see a doctored `approval_principal`, which is how the manifest said
-    `pending` for an approved surface for a month.
+
+def test_the_guard_reds_when_the_live_surface_grows_past_the_high_water_pin(tmp_path):
+    """#4185 review P1: a re-cut over a GROWN surface must not be green by construction.
+
+    `counts:` is re-derived by every `cut`, so it cannot be its own growth control — a PR
+    that adds a tool AND re-cuts moves the number every drift check compares against. The
+    `high_water_counts` pin is carried forward instead, and this pins that the guard reds
+    when the live surface EXCEEDS it. On the pre-fix guard there is no such field and no
+    such check, so the run is green and this test fails — the check is non-vacuous.
     """
     doc = _manifest()
-    doc["approval_principal"] = "a-hand-typed-imposter"
-    rc, out = _check(checker, doc, tmp_path)
-    assert rc == 1, "a hand-edited approval principal did not red the lint"
-    assert "approval_principal" in out, out
+    doc["high_water_counts"] = {"tools": 81, "sdk_public_methods": 150}
+    result = _run("tools/surface-guard.py", "--manifest", _write(doc, tmp_path))
+    assert result.returncode == 1, "growth past the frozen pin did not red the gate"
+    assert "high-water pin" in result.stdout, result.stdout
 
 
-def test_the_check_reds_when_the_manifest_claims_an_approval_the_doc_does_not(checker, tmp_path):
-    """The `approval_status` copy is compared too — the field that caused the defect."""
+def test_the_guard_reds_when_the_high_water_pin_is_missing_or_malformed(tmp_path):
+    """Fail closed: a baseline whose growth pin is gone has no growth control left."""
     doc = _manifest()
-    doc["approval_status"] = "pending-owner-approval"
-    rc, out = _check(checker, doc, tmp_path)
-    assert rc == 1, "a hand-edited approval status did not red the lint"
-    assert "approval_status" in out, out
+    doc.pop("high_water_counts")
+    missing = _run("tools/surface-guard.py", "--manifest", _write(doc, tmp_path))
+    assert missing.returncode == 1, "a missing growth pin did not red the gate"
+    assert "high_water_counts" in missing.stdout, missing.stdout
+    doc["high_water_counts"] = {"tools": "eighty-two", "sdk_public_methods": 150}
+    malformed = _run("tools/surface-guard.py", "--manifest", _write(doc, tmp_path))
+    assert malformed.returncode == 1, "a malformed growth pin did not red the gate"
+    assert "high_water_counts" in malformed.stdout, malformed.stdout
+
+
+def test_a_re_cut_CARRIES_the_high_water_pin_forward(monkeypatch, tmp_path, derived_baseline):
+    """The pin is NOT re-derived: `cut` copies it, so growth needs an explicit edit.
+
+    If a re-cut recomputed it from the (grown) counts, the pin would move with the growth
+    and the guard's growth check would be defeated. Pinned here at the write site.
+    """
+    sm = _load_manifest_tool()
+    path = tmp_path / "surface-manifest.yml"
+    prior = copy.deepcopy(_manifest())
+    prior["high_water_counts"] = {"tools": 82, "sdk_public_methods": 150}
+    path.write_text(yaml.safe_dump(prior, sort_keys=False, allow_unicode=True, width=110))
+    monkeypatch.setattr(sm, "MANIFEST_FILE", path)
+    grown = copy.deepcopy(derived_baseline)
+    grown["counts"] = {**grown["counts"], "tools": 83}
+    grown["rows"].append({"name": "tortoise_brand_new", "approval": None})
+    monkeypatch.setattr(sm, "build_doc", lambda *a, **k: copy.deepcopy(grown))
+    assert sm.cmd_cut(argparse.Namespace(commit="deadbeef", allow_approval_reset=True)) == 0
+    written = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert written["high_water_counts"] == {"tools": 82, "sdk_public_methods": 150}, (
+        "a re-cut recomputed the growth pin from the grown counts — the growth is now "
+        "invisible to the guard"
+    )
 
 
 def test_the_guard_reds_on_a_duplicate_registry_entry():
@@ -1552,7 +1609,10 @@ def test_a_re_cut_re_emits_the_OVERRIDES_header(monkeypatch, tmp_path, derived_b
     assert "OVERRIDES: the frozen-snapshot-as-approval-baseline practice" in written
     # The approval-provenance comment must survive too: the committed manifest carries it,
     # and a re-cut that dropped it would erase the record of WHERE the approval is read from.
-    assert "The top-level approval is READ from docs/product/canonical-mcp-tools.md" in written
+    assert "The top-level approval is STAGED from docs/product/canonical-mcp-tools.md" in written
+    # The growth pin's rationale must survive too — a re-cut that dropped it would leave the
+    # next reader with no idea why `high_water_counts` cannot be edited by hand.
+    assert "`high_water_counts` is a GROWTH PIN" in written
     # …and the header must not carry a FORMATTED count of the target (`26 MCP tools` / `40 SDK`):
     # the target lives in the product docs, read by `tools/surface-target-check.py`, and a
     # restated literal here would go stale silently. The mandated `OVERRIDES:` marker above is
@@ -2726,6 +2786,36 @@ def test_the_target_is_read_from_the_docs_not_a_constant(tmp_path):
     assert targets["sdk"] == 13
     assert targets["approval"]["principal"] == "someone-else"
     assert targets["approval"]["pr"] == "9999"
+
+
+def test_the_canonical_docs_beta_target_number_is_not_read_as_the_mcp_target(tmp_path):
+    """#4185 review P3: each pattern is scoped to the document that OWNS the phrase.
+
+    `beta target (is|becomes) N` names the BETA list's own count when it appears in the
+    canonical doc, not the MCP target. Running the full pattern set over both docs meant a
+    future amendment that moved only the canonical `MCP target count` looked ambiguous and
+    the tool refused a correctly-readable target. Pre-fix this fixture raises
+    `TargetUnreadable` (canonical yields {26, 40}); post-fix the canonical doc's own pattern
+    reads 26 and the `beta target` phrase is ignored.
+    """
+    tc = _load_target_check()
+    canonical = tmp_path / "canonical-mcp-tools.md"
+    beta = tmp_path / "beta-sdk-surface.md"
+    canonical.write_text(
+        "---\n"
+        "approval_status: approved\n"
+        "approved: 2030-01-02\n"
+        "approvedBy: someone-else\n"
+        "approval_pr: 9999\n"
+        "---\n\n"
+        "# Canonical MCP tool list — 23 proposed tools (the beta target is 40)\n\n"
+        "**MCP target count is unchanged at 26**\n",
+        encoding="utf-8",
+    )
+    _write_beta_fixture(beta, mcp=26, sdk=40)
+    targets = tc.read_targets(canonical, beta)
+    assert targets["mcp"] == 26, "the canonical doc's `beta target` number leaked into the MCP target"
+    assert targets["sdk"] == 40
 
 
 def test_an_unapproved_canonical_doc_is_a_refusal(tmp_path):

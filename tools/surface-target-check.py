@@ -105,17 +105,24 @@ def _frontmatter(path: Path) -> dict:
     return data
 
 
-# The MCP target appears in both docs. Each pattern is anchored to a phrase the owner's
-# docs actually use; every number they yield must agree, or the tool refuses rather than
-# picking one. `[\s*]*` lets the phrase span a markdown bold boundary and a line wrap.
-_MCP_PATTERNS = (
-    re.compile(r"\*\*MCP:\s*(\d+)\s*tools\*\*", re.I),
+# The MCP target appears in BOTH docs, so each doc must yield its own number and the two
+# must agree. The patterns are SCOPED TO THE DOCUMENT THAT OWNS THE PHRASE (#4185 review
+# P3): `beta target (is|becomes) N` is the beta list's own count when it appears in the
+# canonical doc, NOT the MCP target, so running the whole set over both docs made a future
+# amendment that moved only the canonical `MCP target count` look ambiguous
+# (`len(mcp_numbers) != 1`) and refuse a correctly-readable target. `[\s*]*` lets a phrase
+# span a markdown bold boundary and a line wrap.
+# The canonical doc states it as `MCP target count is unchanged at 26` AND as `MCP target
+# is 26`; the single optional-chain pattern matches both. It must NEVER be `beta target`,
+# which names a DIFFERENT number (the beta list's own count).
+_CANONICAL_MCP_PATTERNS = (
     re.compile(
         r"MCP[\s*]*target[\s*]*(?:count[\s*]*)?is[\s*]*(?:unchanged[\s*]*at[\s*]*)?(\d+)",
         re.I,
     ),
-    re.compile(r"beta[\s*]*target[\s*]*(?:is|becomes)[\s*]*(\d+)", re.I),
 )
+# The beta doc states the same number in its own voice.
+_BETA_MCP_PATTERNS = (re.compile(r"\*\*MCP:\s*(\d+)\s*tools\*\*", re.I),)
 # The SDK target: beta-sdk-surface.md's "**N methods** against **M** today".
 _SDK_PATTERNS = (re.compile(r"\*\*(\d+)\s*methods\*\*\s*against\s*\*\*\d+\*\*", re.I),)
 
@@ -181,8 +188,8 @@ def read_targets(canonical: Path | None = None, beta: Path | None = None) -> dic
     # a one-doc edit cannot move it silently. A UNION would tolerate a doc that yields NOTHING
     # and the "cross-checked" claim would be decorative, so require EACH doc to carry the
     # number and the two per-doc sets to agree.
-    canonical_mcp = _numbers(_MCP_PATTERNS, _read(canonical))
-    beta_mcp = _numbers(_MCP_PATTERNS, _read(beta))
+    canonical_mcp = _numbers(_CANONICAL_MCP_PATTERNS, _read(canonical))
+    beta_mcp = _numbers(_BETA_MCP_PATTERNS, _read(beta))
     if not canonical_mcp:
         raise TargetUnreadable(
             f"{canonical} yields no MCP target — the target cannot be read from it alone."

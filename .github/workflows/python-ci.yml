@@ -3042,6 +3042,16 @@ jobs:
         run: |
           python3 tools/surface_manifest.py render
           git diff --exit-code -- docs/product/mcp-sdk-surface.md
+      # ── THE TARGET COMPLIANCE GAP, SURFACED BUT NOT GATING (#4185) ─────────
+      # The gap between the live surface (82/150) and the owner-approved target
+      # (26/40) is genuine, so a REQUIRED check would red `main` and block every
+      # unrelated merge while the migration is in flight. But a check nobody runs
+      # reports to nobody: this step prints the numbers and the deltas on EVERY
+      # run, and `continue-on-error` keeps it informational. The `::error::`
+      # annotation still shows up on the run page, so the gap stays visible.
+      - name: Surface target compliance (informational, #4185)
+        continue-on-error: true
+        run: python3 tools/surface-target-check.py
 
   # ── THE REQUIRED GATE OBSERVES EVERY SHARD IT CERTIFIES ──────────────────
   # `python-ci-gate` is a REQUIRED status check AND the only `merge_condition`
