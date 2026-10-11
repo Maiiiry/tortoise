@@ -194,13 +194,18 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #:   (a) a CONNECTIVE that is not in the list below ends the scan and lets the
 #:       count promote, so a range written with it ('2 to <unlisted> 5 weeks
 #:       ago') still promotes 5;
-#:   (b) a NUMERAL spelling the digit/unit split below does not recognise —
-#:       a numeral in words the number set does not carry, or a unit
-#:       abbreviation outside `_NUMERAL_UNIT_SUFFIXES` — likewise ends the
-#:       scan, so a range's left bound written that way promotes the right
-#:       bound.
+#:   (b) a UNIT spelling outside `_NUMERAL_UNIT_SUFFIXES` — which is the
+#:       set BOTH paths use, so this residual is the same for glued and
+#:       spaced bounds — likewise ends the scan, so a range's left bound
+#:       written that way promotes the right bound.
 #: Both directions are recorded here so the next reader does not over-trust the
 #: guard.
+_NUMERAL_UNIT_SUFFIXES = frozenset({
+    "d", "day", "days", "w", "wk", "wks", "week", "weeks",
+    "mo", "mos", "month", "months", "y", "yr", "yrs", "year", "years",
+    "h", "hr", "hrs", "hour", "hours", "m", "min", "mins", "minute",
+    "minutes", "s", "sec", "secs", "second", "seconds",
+})
 _NUMBER_CONTINUATION_WORDS = frozenset({
     # conjunctions and range connectors — 'up' is here precisely so that
     # EVERY 'up <connector>' spelling ('up to', 'up till', 'up through',
@@ -217,15 +222,19 @@ _NUMBER_CONTINUATION_WORDS = frozenset({
     "of",
     # fractions, built or bare
     "half", "halves", "quarter", "quarters", "third", "thirds",
-    # the offset units — a RANGE's left bound may carry its own ('from 2
-    # weeks – 3 months ago'), and the dash/'-'/'or' between the two bounds is
-    # then just a separator, so the unit is what the scan must bridge
-    "day", "days", "week", "weeks", "month", "months", "year", "years",
     # degree adverbs that can qualify a bound without being one
     "about", "around", "roughly", "nearly", "approximately", "almost",
     "exactly", "precisely", "just", "only", "merely", "some", "another",
     "less", "more", "than", "over", "under",
-})
+}) | _NUMERAL_UNIT_SUFFIXES
+# ⛔ The unit spellings are NOT listed above — they are UNIONED IN, because a
+# RANGE's left bound may carry its own unit ('from 2 weeks – 3 months ago',
+# 'between 2 hrs and 5 days ago') and the connector between the two bounds is
+# then just a separator, so the unit is what the scan must bridge. Deriving
+# them from `_NUMERAL_UNIT_SUFFIXES` is deliberate: when the two vocabularies
+# were written out separately the glued path learned 'hrs'/'hours' and the
+# spaced path did not, so '2hrs to 5 days ago' rejected while '2 hrs to 5 days
+# ago' promoted 5. One source, so they cannot drift apart again.
 #: the NUMBER vocabulary: a token that IS a number expression's bound. The
 #: cardinals and the quantifiers are here (NOT in the connective set) because
 #: reaching one is exactly what proves the count is a right bound — 'twenty
@@ -260,12 +269,11 @@ _NUMBER_WORDS = frozenset({
 #: failure the guard exists to prevent. Treating it as a number costs the
 #: promotion on 'at 3pm 5 days ago', which falls back to the legacy lane and
 #: never anchors wrongly. Where the two collide, fail safe.
-_NUMERAL_UNIT_SUFFIXES = frozenset({
-    "d", "day", "days", "w", "wk", "wks", "week", "weeks",
-    "mo", "mos", "month", "months", "y", "yr", "yrs", "year", "years",
-    "h", "hr", "hrs", "hour", "hours", "m", "min", "mins", "minute",
-    "minutes", "s", "sec", "secs", "second", "seconds",
-})
+#:
+#: ⛔ This set is ALSO the unit vocabulary the SPACED path bridges, unioned
+#: into `_NUMBER_CONTINUATION_WORDS` above — do not re-list the units there.
+#: Same set, both spellings: '2 hrs to 5 days ago' and '2hrs to 5 days ago'
+#: must not disagree.
 _FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
 
 

@@ -535,6 +535,11 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("24h to ", True),
         ("2mo to ", True),
         ("3d to ", True),
+        ("2 hrs to ", True),          # ... and the SPACED spelling of every
+        ("2hrs to ", True),           # one the glued path knows
+        ("2hours to ", True),
+        ("between 2 hrs and ", True),
+        ("2 mins to ", True),
         ("between 2 and about ", True),   # a connective CHAIN
         ("2 to roughly ", True),
         ("from 2 up to and including ", True),
