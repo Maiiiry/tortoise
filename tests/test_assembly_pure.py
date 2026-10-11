@@ -368,11 +368,21 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         # a VERBAL RANGE / connector: the connector is word characters, so
         # neither the word nor the numeral branch sees it, and the range's
         # LAST bound is promoted as the count (a 2–5-week question answered
-        # from the 5-week window alone)
+        # from the 5-week window alone). The left bound is a NUMBER, word or
+        # digit — a digit-only left bound leaves the class half-open, so the
+        # SPELLED forms below are the pin for that fix: they promote if the
+        # range's left bound ever reverts to `\d+`.
         "What did I do 2 to 5 weeks ago?",
         "What did I do between 2 and 5 weeks ago?",
         "What did I do 2 or 5 weeks ago?",
         "What did I do 2 through 5 weeks ago?",
+        "What did I do two to five weeks ago?",
+        "What did I do two or five weeks ago?",
+        "What did I do one to three weeks ago?",
+        "What did I do two through five weeks ago?",
+        "What did I do two until five weeks ago?",
+        "What did I do two up to five weeks ago?",
+        "What did I do two–five weeks ago?",   # U+2013, no word connector
         # a multi-part NUMERAL is the same defect for digits: `_RE_AGO_OFFSET`
         # reads `\d+`, so it matches the LAST digit run alone — '2.5 weeks
         # ago' anchored at 5 weeks and '2,000 days ago' at 0 days (a window
