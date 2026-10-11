@@ -557,7 +557,15 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("2 weeks, ", False),
         ("2 weeks – ", True),
         ("2 hours 5 days ", False),
-        ("between 2 and about ", True),   # a connective CHAIN
+        # ... and the SAME termination holds across a DEGREE ADVERB: an
+        # adverb modifies the count, it does not link it to the earlier
+        # duration, so the scan must NOT cross the unit behind it
+        ("2 hours about ", False),
+        ("2 hours nearly ", False),
+        ("2 hours just ", False),
+        ("2hrs about ", False),
+        ("2 hours ~ about ", True),   # ... unless a GLYPH does link them
+        ("between 2 and about ", True),   # a connective CHAIN (already above)
         ("2 to roughly ", True),
         ("from 2 up to and including ", True),
         ("twenty ", True),           # compound number word
@@ -573,6 +581,53 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("two point zero ", True),
     ]:
         assert _count_is_fragment(prefix) is fragment, prefix
+
+
+def test_count_fragment_duration_ends_across_a_degree_adverb():
+    """Regression (PR #8097 review, P1): a standalone count preceded by a
+    DURATION + degree adverb must still promote.
+
+    The unit-terminates rule used to key on the unit being the FIRST token
+    left of the count, so a degree adverb between a duration and the count
+    defeated it: the scan crossed the adverb, then the unit, then reached the
+    earlier duration's number and reported Fragment=True. That is a false
+    reject against the merge-base `5d75752f7` — the count is standalone and
+    must route to AGO_RELATIVE, not fall through to the legacy lane.
+
+    The fix keys the termination on whether a RANGE LINKER (connector word or
+    glyph) sits between the unit and the count, not on the unit's position.
+    On the pre-fix tree the first two assertions fail (`_count_is_fragment`
+    reports True; `classify_question` reports None); the control rows below
+    hold on both trees and pin that a real range is still rejected.
+    """
+    # mechanism probe: the duration's number lies behind an adverb, not a
+    # connector, so it is a NEW number — the count is whole
+    for prefix in ("I ran for 2 hours about ", "I ran for 2 hours nearly ",
+                   "I studied for 3 hours just ", "I slept for 8 hours "
+                   "exactly ", "I ran for a couple of hours about "):
+        assert _count_is_fragment(prefix) is False, prefix
+    # ... and through the two entry points the reviewer reproduced on, which
+    # must now route to AGO_RELATIVE with the STANDALONE count
+    for q, count in [
+        ("I ran for 2 hours about 3 days ago", 3),
+        ("I ran for a couple of hours about 3 days ago", 3),
+        ("I studied for 3 hours nearly 5 days ago", 5),
+        ("I trained for 2 hours just 3 days ago", 3),
+        ("I slept for 8 hours exactly 3 days ago", 3),
+        # controls: no adverb, or a bare adverb with no preceding duration
+        ("I ran for 2 hours 3 days ago", 3),
+        ("I ran about 3 days ago", 3),
+    ]:
+        assert classify_question(q) is AssemblyShape.AGO_RELATIVE, q
+        anchor = resolve_relative_anchor(q, "2026-09-10")
+        assert anchor is not None, q
+        assert (anchor.kind, anchor.count) == ("ago-offset", count), (q, anchor)
+    # control: a real RANGE that merely qualifies its right bound is still a
+    # fragment, so the adverb does not blanket-disable the guard
+    for q in ("between 2 and about 5 weeks ago",
+              "2 to roughly 5 weeks ago"):
+        assert _count_is_fragment(q[:q.rfind(" 5 weeks ago") + 1]) is True, q
+        assert classify_question(q) is not AssemblyShape.AGO_RELATIVE, q
 
 
 def test_count_fragment_scan_crosses_a_connective_chain():

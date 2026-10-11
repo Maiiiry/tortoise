@@ -201,7 +201,8 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #:       a range's left bound written that way promotes the right bound;
 #:   (c) a range joined by a SEPARATOR GLYPH outside `_RANGE_GLYPHS`: the bare
 #:       unit before the count then reads as the end of a duration and the
-#:       right bound is promoted (the `first`-token rule's price).
+#:       right bound is promoted (the unit-terminates rule's price: the glyph
+#:       is not a linker, so it does not keep the unit a bridge).
 #: Every direction is recorded here so the next reader does not over-trust the
 #: guard — and so a later tightening does not "simplify" one of these away.
 #:
@@ -215,27 +216,48 @@ _NUMERAL_UNIT_SUFFIXES = frozenset({
     "h", "hr", "hrs", "hour", "hours", "m", "min", "mins", "minute",
     "minutes", "s", "sec", "secs", "second", "seconds",
 })
-_NUMBER_CONTINUATION_WORDS = frozenset({
-    # conjunctions and range connectors — 'up' is here precisely so that
-    # EVERY 'up <connector>' spelling ('up to', 'up till', 'up through',
-    # 'up until') is traversed without being listed
+#: the words that LINK two bounds of a range. A duration's unit is a range's
+#: LEFT BOUND only when one of these sits between it and the count ('2 weeks
+#: to 5 days ago', 'between 2 hrs and 5 days ago'); across a DEGREE ADVERB it
+#: is still the end of a duration ('2 hours about 5 days ago'). Kept separate
+#: from `_DEGREE_ADVERBS` for exactly that reason — they used to share a set,
+#: so the scan saw a number to the left of an adverb and mistook it for a
+#: second bound (a false reject against `origin/main`).
+#: 'up' is here precisely so that EVERY 'up <connector>' spelling ('up to',
+#: 'up till', 'up through', 'up until') is traversed without being listed.
+_RANGE_CONNECTORS = frozenset({
     "and", "or", "to", "up", "upto", "unto", "till", "til", "until",
     "through", "thru",
     # ... and the rest of an inclusive-connector PHRASE, which is traversed
     # token by token: 'up to and including 5', 'to or beyond 5'
     "including", "inclusive", "inclusively", "onwards", "onward",
     "beyond", "before", "after",
-    # place-value / decimal markers (the ZEROS are cardinals, not markers)
-    "point", "dot", "oh", "o",
-    # the link word inside a quantifier phrase ('a couple of', 'dozens of')
-    "of",
-    # fractions, built or bare
-    "half", "halves", "quarter", "quarters", "third", "thirds",
-    # degree adverbs that can qualify a bound without being one
+})
+#: degree adverbs that can QUALIFY a bound without being one. They stay
+#: traversable — a range's right bound may be qualified ('between 2 and about
+#: 5 weeks ago', '2 to roughly 5 weeks ago') — but they do NOT link two
+#: bounds, so they never turn a preceding unit into a range's left bound. A
+#: token in this set therefore leaves the scan's `bridged` flag unset.
+_DEGREE_ADVERBS = frozenset({
     "about", "around", "roughly", "nearly", "approximately", "almost",
     "exactly", "precisely", "just", "only", "merely", "some", "another",
     "less", "more", "than", "over", "under",
-}) | _NUMERAL_UNIT_SUFFIXES
+})
+#: tokens that sit INSIDE a number expression but link nothing: place-value /
+#: decimal markers, the quantifier link word, and the fraction words (the
+#: ZEROS are cardinals, not markers). Traversable, but not range linkers.
+_NUMBER_INTERNAL_WORDS = frozenset({
+    "point", "dot", "oh", "o",
+    "of",
+    "half", "halves", "quarter", "quarters", "third", "thirds",
+})
+#: every token the scan crosses while looking for a number behind the count.
+#: The three groups are UNIONED IN deliberately; they differ only in whether
+#: crossing them makes a preceding unit a range's left bound (`_RANGE_CONNECTORS`)
+#: or not (the adverbs and the number-internal markers).
+_NUMBER_CONTINUATION_WORDS = (_RANGE_CONNECTORS | _DEGREE_ADVERBS
+                              | _NUMBER_INTERNAL_WORDS
+                              | _NUMERAL_UNIT_SUFFIXES)
 # ⛔ The unit spellings are NOT listed above — they are UNIONED IN, because a
 # RANGE's left bound may carry its own unit ('from 2 weeks – 3 months ago',
 # 'between 2 hrs and 5 days ago') and the connector between the two bounds is
@@ -346,13 +368,24 @@ def _count_is_fragment(text_before: str) -> bool:
     while '2 to 5 weeks ago' and 'one and a half to five weeks ago' are
     fragments (a number waits behind the connectives).
 
+    A duration's unit ('hours', '2hrs') terminates the scan — it starts a
+    NEW number — UNLESS a RANGE LINKER (a `_RANGE_CONNECTORS` word or a
+    `_RANGE_GLYPHS` glyph) sits between the unit and the count. So '2 hours
+    5 days ago' is two durations (whole), '2 hrs to 5 days ago' is a range
+    (fragment), and '2 hours about 5 days ago' is two durations again: the
+    adverb MODIFIES the count, it does not link a second bound, so it must
+    not let the scan reach the earlier duration's number. Tracking the
+    linker (`bridged`) across the whole scan — not just the first token — is
+    what keeps the adverb from re-opening the false reject the first-token
+    rule closed.
+
     Linear in len(text_before) — a plain scan, no regex, so it cannot
     backtrack (the regex this replaced was an availability defect: an
     ambiguous nested quantifier that took 3 s at N=24 and never returned
     beyond, in an ask path with no timeout).
     """
     i = len(text_before)
-    first = True
+    bridged = False
     while True:
         j = i
         while j > 0 and not text_before[j - 1].isalnum():
@@ -363,23 +396,31 @@ def _count_is_fragment(text_before: str) -> bool:
         if k == j:            # ran off the start: nothing to the left
             return False
         token = text_before[k:j]
-        if first and _is_unit_length_token(token) and not any(
-                ch in _RANGE_GLYPHS for ch in text_before[j:i]):
+        if any(ch in _RANGE_GLYPHS for ch in text_before[j:i]):
+            # a range GLYPH between the count and this token links them even
+            # though no connector WORD is present ('2 weeks / 5 days ago',
+            # 'from 2 weeks – 3 months ago'): record it so a duration's unit
+            # stays a bridge there.
+            bridged = True
+        if _is_unit_length_token(token) and not bridged:
             # A DURATION ENDS HERE. '2 hours 5 days ago' is two durations, not
             # a range: the count starts a NEW number, and the unit in front of
-            # it belongs to the number before that. So a unit is a bridge only
-            # when something else sits between it and the count ('2 hrs to 5
-            # days ago', 'between 2 hrs and 5 days ago') — as the FIRST token
-            # it terminates the scan instead. Without this the union above
-            # made the guard reject '2 hours 5 days ago', which promotes on
-            # `origin/main`. The GLYPH exception is the other half: a range
-            # joined by a dash or a slash keeps the unit as a bridge.
+            # it belongs to the number before that. A unit is a bridge only
+            # when a RANGE LINKER sits between it and the count ('2 hrs to 5
+            # days ago', 'between 2 hrs and 5 days ago', '2 weeks / 5 days
+            # ago') — across an adverb or nothing at all it terminates the
+            # scan instead. Without this the union above made the guard reject
+            # '2 hours 5 days ago', which promotes on `origin/main`; keying it
+            # on the LINKER rather than on the FIRST token keeps the adverb
+            # spellings ('2 hours about 5 days ago') from re-opening that
+            # reject.
             return False
         if _is_number_token(token):
             return True
         if not _continues_number(token):
             return False
-        first = False
+        if token.lower() in _RANGE_CONNECTORS:
+            bridged = True
         i = k
 
 # duration-state semantics that are STILL never a two-subject shape: "how
