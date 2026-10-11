@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from tortoise.assembly import (
+    _RE_OR_CHAIN,
     AssemblyShape,
     RelativeAnchor,
     ResolveResult,
@@ -448,8 +449,8 @@ def test_ago_relative_still_reads_a_standalone_digit_count():
         assert (a.kind, a.count) == ("ago-offset", count), (q, a)
 
 
-def test_count_fragment_walk_is_linear():
-    r"""The count-fragment walk must stay LINEAR on a pathological input.
+def test_count_fragment_scan_is_linear():
+    r"""The count-fragment scan must stay LINEAR on a pathological input.
 
     The guard it replaced was a regex with an ambiguous nested quantifier
     (`(?:\W+|\s+and\s+)+$`), which backtracked over 2**N partitions:
@@ -457,9 +458,14 @@ def test_count_fragment_walk_is_linear():
     (`MAX_ASK_QUESTION_CHARS`) but `run_ask_lane` has no timeout and a HANG
     is not an exception the ask envelope can catch, so it was an
     availability defect. This test does not time anything: it asserts the
-    walk terminates and returns the right verdict at the boundary sizes.
+    scan terminates and returns the right verdict at the boundary sizes.
 
-    The question MUST carry an `ago-offset`: the walk is only reached from
+    ⚠️ This pins the SCAN only. `classify_question` is super-linear for an
+    unrelated reason (`_RE_OR_CHAIN`, pinned separately below), so timing
+    the classifier here would assert the wrong thing; what matters is that
+    the guard the question reaches cannot hang on its input.
+
+    The question MUST carry an `ago-offset`: the scan is only reached from
     `_relative_match` under `kind == "ago-offset"`, so a probe with no
     offset ('twenty…x') never consults the guard and asserts nothing about
     the ask path. '…x 1 day ago' is the production shape — on the ambiguous
@@ -467,7 +473,7 @@ def test_count_fragment_walk_is_linear():
     """
     for n in (24, 200, 1900, 2000):
         pad = "twenty" + " " * n + "x"
-        # the walk itself, addressed directly: 'x' stops it, so the count
+        # the scan itself, addressed directly: 'x' stops it, so the count
         # in 'twenty   …   x 1 day ago' is the WHOLE number
         assert _count_is_fragment(pad + " ") is False, n
         # ... and through the entry points, where the guard is consulted
@@ -476,36 +482,79 @@ def test_count_fragment_walk_is_linear():
         assert resolve_relative_anchor(q, "2026-09-10") is not None, n
 
 
-def test_count_fragment_walk_stops_at_a_sentence_word():
-    """The walk's stopping rule is what makes a legitimate standalone count
-    promote: it consumes number-continuation tokens and stops at the first
-    plain SENTENCE word, so nothing beyond that word can be part of the
-    number."""
-    # (text before the count, is it a fragment?)
+def test_or_chain_does_not_backtrack():
+    r"""`_RE_OR_CHAIN` must not be super-linear on a one-'or' question.
+
+    Its whitespace runs were `\s+` on both sides of a lazy `.+?`, which
+    overlap on whitespace, so a question with ONE 'or' and long space runs
+    retried every (start, split, end) triple before failing: 307 ms at
+    len 204 and ~4.8 s at len 404 for 'a' + ' '*200 + 'or' + ' '*200 + 'b'
+    (O(n^3.8)). It runs unconditionally in `classify_question` on the ask
+    path, which has no timeout, so this is the same availability defect the
+    ago guard was rewritten to remove — and it is the DOMINANT cost of the
+    classifier once the guard is linear.
+
+    The assertion is on the MATCH VERDICT at the boundary sizes, not on a
+    duration: under the `\s+` form this does not fail, it HANGS.
+    """
+    for n in (200, 500, 1000, 2000):
+        # one 'or', so there is NO chain — and the verdict must be False
+        assert _RE_OR_CHAIN.search(
+            "a" + " " * (n // 2) + "or" + " " * (n // 2) + "b") is None, n
+    # a real chain is still detected, both compactly and across padding
+    assert _RE_OR_CHAIN.search("A or B or C") is not None
+    assert _RE_OR_CHAIN.search("A or" + " " * 500 + "B or C") is not None
+
+
+def test_count_fragment_scan_stops_at_a_sentence_word():
+    """The scan's stopping rule is what makes a legitimate standalone count
+    promote: it crosses CONNECTIVE tokens and reports a whole number at the
+    first plain SENTENCE word, because nothing beyond that word can be part
+    of this number."""
+    # (text before the count, is it a fragment?). The `to ` row is the key
+    # one a single-token lookbehind gets WRONG: 'to' is a connective, but
+    # there is no number behind it, so the count is whole.
     for prefix, fragment in [
         ("I bought 2 things ", False),
         ("on the 3rd of May, ", False),
         ("I went to the store ", False),
         ("I mentioned it to my friend ", False),
-        ("twenty ", True),            # compound number word
-        ("twenty-", True),
-        ("2.", True),                 # multi-part numeral
-        ("2,", True),
-        ("2 to ", True),              # range
+        ("", False),
+        ("to ", False),              # connective with no number behind it
+        ("up to ", False),
+        ("2 to ", True),             # range
         ("2 weeks to ", True),
         ("2 weeks up till ", True),
+        ("up to and including ", False),
         ("one and a half to ", True),
         ("1½ to ", True),
-        ("two point ", True),         # spelled place value
+        ("between 2 and about ", True),   # a connective CHAIN
+        ("2 to roughly ", True),
+        ("from 2 up to and including ", True),
+        ("twenty ", True),           # compound number word
+        ("twenty-", True),
+        ("2.", True),                # multi-part numeral
+        ("2,", True),
+        ("two point ", True),        # spelled place value
         ("two point oh ", True),
         ("two point zero ", True),
-        ("", False),
-        ("to ", True),
     ]:
         assert _count_is_fragment(prefix) is fragment, prefix
 
 
-def test_count_fragment_walk_ignores_a_preceding_ordinal():
+def test_count_fragment_scan_crosses_a_connective_chain():
+    """The scan must cross an ARBITRARY run of connectives, not just one
+    token: a chain that reaches no number is whole ('up to and including 5'),
+    a chain that reaches one is a fragment ('2 up to and including 5').
+
+    A single-token check cannot tell these apart — both have a connective
+    immediately before the count — which is the defect this pins.
+    """
+    for prefix in ("up to ", "up to and including ", "from 2 and about "):
+        assert _count_is_fragment(prefix) is ("2" in prefix), prefix
+
+
+def test_count_fragment_scan_ignores_a_preceding_ordinal():
     """An ordinal is a DATE reference, not a number span: 'on 3rd, 4 days
     ago' must still promote count=4."""
     for prefix in ("on 3rd, ", "on the 22nd, ", "since the 1st, "):

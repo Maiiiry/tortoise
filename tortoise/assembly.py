@@ -198,53 +198,78 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #     promoted as the count and a 2–5-week question is answered from the
 #     5-week window alone.
 #
-# ⛔ WHY THIS IS A TOKEN WALK AND NOT A REGEX OF NUMBER SPELLINGS.
-# Four review rounds of #8097 each closed one member of this class and each
-# found the next: a digit-only left bound left the SPELLED bounds open ('two
-# to five' → 5); making the left a number word left the ones carrying their
-# OWN unit open ('from 2 weeks to 3 months' → 3); a connector list left
-# 'til'/'upto'/'up until' open; a place-value list left 'point zero'/'point
-# o' open; a cardinal left bound left fractions open ('one and a half to
-# five' → 5, '1½ to 2' → 2). Enumerating NUMBER SPELLINGS is open-ended —
-# there is always another way to write a number — so the guard no longer
-# tries. It asks the INVARIANT directly instead:
+# ⛔ WHY THIS IS A TOKEN SCAN AND NOT A REGEX OF NUMBER SPELLINGS.
+# Five review rounds of #8097 each closed one spelling of a multi-part number,
+# and each found the next: a digit-only left bound left the SPELLED bounds open
+# ('two to five weeks ago' → 5); making the left a number word left the ones
+# carrying their OWN unit open ('from 2 weeks to 3 months ago' → 3); a
+# connector list left 'til'/'upto'/'up until' open; a place-value list left
+# 'point zero'/'point o' open; a cardinal left bound left fractions open ('one
+# and a half to five weeks ago' → 5, '1½ to 2 weeks ago' → 2); and a dash was
+# not in the connector class ('2 weeks - 5 weeks ago' → 5). Enumerating NUMBER
+# SPELLINGS is open-ended — there is always another way to write a number — so
+# the guard no longer tries. It asks the INVARIANT instead:
 #
-#     the count is trustworthy iff, walking LEFT from it, we run out of
-#     NUMBER-CONTINUATION tokens before we run out of number
+#     the count is trustworthy iff, scanning LEFT from it, we reach the end
+#     of the number expression — i.e. we run out of CONNECTIVE tokens —
+#     BEFORE we reach another NUMBER token
 #
-# 'number-continuation' is the small CLOSED set of words that can only be
-# joining or scaling the parts of one number, bridging two bounds of a
-# range, or naming a fraction — plus any token that carries a digit. That
-# set is finite and principled, which is what the number SPELLINGS were not:
-# 'twenty' is in it, and so is 'up', which is why 'up till'/'up through'
-# need no entry of their own.
-#: words that can only be CONTINUING a number expression to the left of a
-#: count — a conjunction, a range connector, a place-value marker, a
-#: fraction, a scale word, a quantifier, or a cardinal. A plain SENTENCE word
+# Reaching a number token through nothing but connectives means the count is
+# the RIGHT BOUND (or the trailing piece) of a longer number, and the template
+# read only that piece. That is the whole rule.
+#: tokens that can sit BETWEEN two parts of one number, or between the bounds
+#: of a range, and so are part of neither bound: conjunctions, range
+#: connectors, place-value markers, fraction words, the offset units, degree
+#: adverbs that can qualify a bound ('and about five'), and the scale words
+#: ('hundred', 'thousand') a bound may be built from. A plain SENTENCE word
 #: ('things', 'store', 'Wednesday', 'May', 'iPhone') is deliberately absent:
-#: that is exactly what stops the walk, and so what makes a legitimately
-#: standalone count ('I bought 2 things 3 days ago' → 3) promote.
+#: that is what ends the scan, and so what makes a legitimately standalone
+#: count ('I bought 2 things 3 days ago' → 3) promote.
+#:
+#: ⛔ THE LIMIT, STATED HONESTLY: this vocabulary is a CLOSED list, and a
+#: connective that is not in it ends the scan and lets the count promote. That
+#: is the residual of the class (#8097): an unlisted connective in a range
+#: ('2 to <unlisted> 5 weeks ago') still promotes 5. It is bounded work, not
+#: an invariant over natural language, and the direction is recorded here so
+#: the next reader does not over-trust it.
 _NUMBER_CONTINUATION_WORDS = frozenset({
     # conjunctions and range connectors — 'up' is here precisely so that
     # EVERY 'up <connector>' spelling ('up to', 'up till', 'up through',
-    # 'up until') is covered without being listed
-    "and", "or", "to", "up", "upto", "till", "til", "until",
+    # 'up until') is traversed without being listed
+    "and", "or", "to", "up", "upto", "unto", "till", "til", "until",
     "through", "thru",
+    # ... and the rest of an inclusive-connector PHRASE, which is traversed
+    # token by token: 'up to and including 5', 'to or beyond 5'
+    "including", "inclusive", "inclusively", "onwards", "onward",
+    "beyond", "before", "after",
     # place-value / decimal markers, and the zero one of them may carry
     "point", "dot", "oh", "o", "zero", "nought", "naught",
+    # the link word inside a quantifier phrase ('a couple of', 'dozens of')
+    "of",
     # fractions, built or bare
     "half", "halves", "quarter", "quarters", "third", "thirds",
     # the offset units — a RANGE's left bound may carry its own ('from 2
     # weeks – 3 months ago'), and the dash/'-'/'or' between the two bounds is
-    # then just a separator, so the unit is what the walk must bridge
+    # then just a separator, so the unit is what the scan must bridge
     "day", "days", "week", "weeks", "month", "months", "year", "years",
-    # scales and quantifiers a bound may be built from
+    # degree adverbs that can qualify a bound without being one
+    "about", "around", "roughly", "nearly", "approximately", "almost",
+    "exactly", "precisely", "just", "only", "merely", "some", "another",
+    "less", "more", "than", "over", "under",
+    # scales a bound may be built from (they are not themselves a bound)
     "hundred", "hundreds", "thousand", "thousands", "million",
-    "millions", "dozen", "dozens", "score", "scores", "couple",
-    "few", "several", "a", "an",
-    # the cardinals — including the TENS/SCALE words `_RE_AGO_OFFSET` itself
-    # does not read (it stops at 'twelve'), which is the whole reason the
-    # guard exists: it rejects the counts that template would read WRONG
+    "millions", "billion", "billions", "dozen", "dozens", "score",
+    "scores",
+})
+#: the NUMBER vocabulary: a token that IS a number expression's bound. The
+#: cardinals and the quantifiers are here (NOT in the connective set) because
+#: reaching one is exactly what proves the count is a right bound — 'twenty
+#: two weeks ago' reaches 'twenty' and is a fragment; 'up to 3 weeks ago'
+#: reaches only connectives ('to', 'up') and is a whole number. Includes the
+#: TENS/SCALE words `_RE_AGO_OFFSET` itself does not read (it stops at
+#: 'twelve') — rejecting those counts is the whole reason the guard exists.
+_NUMBER_WORDS = frozenset({
+    "a", "an", "couple", "few", "several",
     "one", "two", "three", "four", "five", "six", "seven", "eight",
     "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
     "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
@@ -258,23 +283,33 @@ _ORDINAL_SUFFIXES = ("st", "nd", "rd", "th")
 _FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
 
 
-def _continues_number(token: str) -> bool:
-    """True when `token` can only be continuing the number the count ends."""
+def _is_number_token(token: str) -> bool:
+    """True when `token` IS a bound of a number expression."""
     low = token.lower()
-    if low in _NUMBER_CONTINUATION_WORDS or token.isdigit():
+    if low in _NUMBER_WORDS or token.isdigit():
         return True
     if any(ch.isdigit() or ch in _FRACTION_GLYPHS for ch in token):
         return not low.endswith(_ORDINAL_SUFFIXES)
     return False
 
 
-def _count_is_fragment(text_before: str) -> bool:
-    """True when the count is only the TRAILING PIECE of a longer number.
+def _continues_number(token: str) -> bool:
+    """True when `token` can be sitting INSIDE the number expression."""
+    return token.lower() in _NUMBER_CONTINUATION_WORDS
 
-    Walks LEFT from the count over separator runs and
-    `_continues_number` tokens. A fragment is exactly 'we consumed at least
-    one continuation token and then stopped': the token that stops the walk
-    is a sentence word, so nothing to its left can be part of this number.
+
+def _count_is_fragment(text_before: str) -> bool:
+    """True when the count is the RIGHT BOUND (or trailing piece) of a
+    longer number, so promoting it would answer from a confidently wrong
+    window.
+
+    Scans LEFT from the count, token by token, over separator runs. It stops
+    — and reports a WHOLE number — at the first token that is neither a
+    number nor a connective; it reports a FRAGMENT at the first token that
+    IS a number. So the scan crosses any run of connectives, which is what
+    makes 'up to 3 weeks ago' a whole number (only 'to'/'up' on the left)
+    while '2 to 5 weeks ago' and 'one and a half to five weeks ago' are
+    fragments (a number waits behind the connectives).
 
     Linear in len(text_before) — a plain scan, no regex, so it cannot
     backtrack (the regex this replaced was an availability defect: an
@@ -282,7 +317,6 @@ def _count_is_fragment(text_before: str) -> bool:
     beyond, in an ask path with no timeout).
     """
     i = len(text_before)
-    consumed = False
     while True:
         j = i
         while j > 0 and not text_before[j - 1].isalnum():
@@ -290,11 +324,13 @@ def _count_is_fragment(text_before: str) -> bool:
         k = j
         while k > 0 and text_before[k - 1].isalnum():
             k -= 1
-        if k == j:            # ran off the start of the text
-            return consumed
-        if not _continues_number(text_before[k:j]):
-            return consumed
-        consumed = True
+        if k == j:            # ran off the start: nothing to the left
+            return False
+        token = text_before[k:j]
+        if _is_number_token(token):
+            return True
+        if not _continues_number(token):
+            return False
         i = k
 
 # duration-state semantics that are STILL never a two-subject shape: "how
@@ -352,7 +388,18 @@ _RE_ADVICE = re.compile(
 # ("first, A, B or C") — both checked in classify_question after the
 # ordering match (bounded two-option questions carry exactly one " or " and
 # a comma-free A-side).
-_RE_OR_CHAIN = re.compile(r"\s+or\s+.+?\s+or\s+", re.IGNORECASE | re.DOTALL)
+#
+# ⛔ The whitespace runs are SINGLE `\s`, not `\s+`. With `\s+` on both
+# sides of the lazy `.+?` the quantifiers overlap — '\s+' and '.' both match
+# whitespace — so on a question with ONE 'or' and long space runs the engine
+# retries every (start, split, end) triple before failing: measured 307 ms at
+# len 204 and ~4.8 s at len 404 for 'a' + ' '*200 + 'or' + ' '*200 + 'b', i.e.
+# O(n^3.8). `_RE_OR_CHAIN.search` runs unconditionally in `classify_question`
+# on the ask path and `run_ask_lane` has no timeout, so a question inside
+# MAX_ASK_QUESTION_CHARS could wedge a lane — the same availability defect the
+# ago guard above was rewritten to remove. A single `\s` absorbs the same
+# whitespace (the lazy `.+?` covers any extra) and removes the ambiguity.
+_RE_OR_CHAIN = re.compile(r"\sor\s.+?\sor\s", re.IGNORECASE | re.DOTALL)
 
 # ── shape templates (ordered high-precision) ─────────────────────────────
 
