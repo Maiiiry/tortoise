@@ -70,6 +70,10 @@ from .embedded_lifecycle import atexit_fast_close  # #1371: the fast-close seam
 # self-hosted CLI can derive from it too; re-exported here because the SDK read
 # and `tests/test_hosted_api.py` bind it under this name.
 from .session_projection import SESSION_READ_FIELDS  # noqa: F401
+# #3520: the per-session extraction-status derivation — imported from the SAME
+# module as the projection it is a field of, so the SDK read and the hosted
+# reads cannot disagree about one session's status.
+from .session_projection import session_extraction_status
 from .retrieval import (DEFAULT_POOL_SIZE, _safe_session_tag,
                         is_turn_echo_row, resolve_pool_size)
 from . import monitoring
@@ -23573,7 +23577,12 @@ class TortoiseSDK:
         rows = proj.g.query(
             "MATCH (s:Session {id:$sid}) RETURN s.id, s.created_at, "
             "s.turn_count, s.actor_user_id, s.harness, "
-            "s.machine_id, s.model",
+            "s.machine_id, s.model, "
+            # #3520: APPENDED at the END (sess[7]/sess[8]) — the existing
+            # sess[0..6] mapping is unchanged, and the SDK read must serve the
+            # SAME extraction status the hosted surfaces do (#5498 binds the
+            # three key sets to one declaration).
+            "s.capture_ok, s.capture_extractor",
             params={"sid": session_id},
         ).result_set
         if not rows:
@@ -23629,6 +23638,14 @@ class TortoiseSDK:
             "harness": sess[4],
             "machine_id": sess[5],
             "model": sess[6],
+            # #3520: the per-session extraction status, derived by the ONE
+            # shared helper so the SDK and the hosted reads cannot disagree on
+            # one session. Additive key at the END of the projection — no
+            # existing key changes value and no method is added (#3557's
+            # parity contract consumes the shared declaration, so this key is
+            # part of the SDK read by construction rather than a second
+            # opinion).
+            "extraction": session_extraction_status(sess[7], sess[8]),
             "extracted": extracted_count,
             "turn_points": turn_points,
             "extracted_points": extracted_points,
