@@ -3884,6 +3884,13 @@ def _cmd_session(args) -> int:
         # or a CORRUPT one — there is simply nothing to file, and that is not an
         # error the caller can act on.
         return _cmd_session_drain_best_effort(args)
+    if args.session_cmd == "disclosure":
+        # #3517: dispatched BEFORE the api_key gate on purpose. The disclosure is
+        # the accuracy artifact the agent-prompt install prints, and a
+        # self-hosted or not-yet-configured install still has to state the facts
+        # it just created — refusing it for want of a hosted key would make the
+        # one surface that exists to be accurate silent exactly there.
+        return _cmd_session_disclosure(args)
 
     # Transmitting-identity resolver (#2369 D1.2, #3660): this resolver runs
     # BEFORE dispatch, so the uploaders (`capture`) and the read-only
@@ -4576,6 +4583,98 @@ def _cmd_session_spool(args) -> int:
         # on stderr and in `discarded.jsonl`.
         return 0
     print(f"Spooled session: {prep['session_id']}")
+    return 0
+
+
+def _cmd_session_disclosure(args) -> int:
+    """#3517: print the capture disclosure from runtime structured data.
+
+    This is the ONE renderer the onboarding prompt points at: the agent prints
+    this output verbatim, so the facts a user reads are mechanically derived and
+    can neither be model-authored nor drift from the dashboard's render of the
+    same source (``tortoise/config/capture_disclosure.json``).
+
+    Identity resolution is BEST-EFFORT and the exit code is always 0: the
+    disclosure is printed in the install environment, and a self-hosted or
+    not-yet-configured install still needs to state the facts. The hosted leg
+    adds the organization's LIVE ``session_recording`` flag and install-probe
+    key; when that read cannot happen, the reason goes to stderr and the
+    disclosure is rendered from the product defaults — never a fabricated
+    "live" value.
+    """
+    import json as _json
+    import sys as _sys
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    from tortoise import capture_disclosure as _cd
+
+    harness = getattr(args, "harness", None) or "claude"
+    api_key = api_url = None
+    try:
+        _cfg_path, _config, api_key, api_url = _resolve_transmit_config()
+    except _ConfigError as e:
+        print(f"Config at {e} is invalid — cannot read the live recording "
+              "setting; rendering the self-hosted wording.", file=_sys.stderr)
+
+    hosted = bool(api_key and api_url)
+    recording: bool | None = None
+    probe_key = _cd.source()["recording"][
+        "install_probe_key_template"].format(harness=harness)
+    install_probe: str | None = None
+    state_read: str = "not-attempted"
+    if hosted:
+        try:
+            req = Request(
+                f"{api_url}/v1/onboarding/state",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urlopen(req, timeout=15) as resp:
+                body = _json.loads(resp.read())
+            state = body.get("onboarding") or {}
+            # Absent key reads the product default (default-ON, #1927) — the
+            # same `.get(..., True)` the capture gate itself uses, so the
+            # disclosure and the data plane cannot disagree about "on".
+            recording = bool(state.get("session_recording", True))
+            install_probe = state.get(probe_key) or None
+            state_read = "ok"
+        except HTTPError as e:
+            state_read = f"http-error-{e.code}"
+        except URLError as e:
+            state_read = f"unreachable: {e.reason}"
+        except ValueError as e:  # non-JSON body
+            state_read = f"unparseable-response: {e}"
+        if state_read != "ok":
+            print(f"Could not read the live onboarding state ({state_read}) — "
+                  "the disclosure below states the product defaults.",
+                  file=_sys.stderr)
+
+    kw = dict(harness=harness, hosted=hosted,
+              api_host=_cd.host_of(api_url), recording=recording)
+    kind = getattr(args, "kind", None) or "disclosure"
+    rendered = {
+        "disclosure": _cd.render_install_disclosure,
+        "confirmation": _cd.render_installed_confirmation,
+        "declined": _cd.render_declined_confirmation,
+    }[kind](**kw)
+    if getattr(args, "json", False):
+        print(_json.dumps({
+            "harness": harness,
+            "hosted": hosted,
+            "api_host": _cd.host_of(api_url),
+            "session_recording": recording,
+            "state_read": state_read,
+            probe_key: install_probe,
+            "kind": kind,
+            "text": rendered,
+            "disclosure": _cd.render_install_disclosure(**kw),
+            "first_capture_line": _cd.render_first_capture_line(**kw),
+            "installed_confirmation": _cd.render_installed_confirmation(**kw),
+            "declined_confirmation": _cd.render_declined_confirmation(**kw),
+            "step_accounting": _cd.step_accounting(),
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(rendered)
     return 0
 
 
@@ -9193,6 +9292,27 @@ def main(argv: list[str] | None = None) -> int:
     session_list = session_sp.add_parser("list", help="List all sessions")  # noqa: F841
     session_view = session_sp.add_parser("view", help="View a specific session")
     session_view.add_argument("id", help="Session ID")
+    # #3517: the capture disclosure, rendered from runtime structured data. The
+    # onboarding prompt prints THIS output verbatim — the agent never authors the
+    # facts (epic #1714 R7 / decision 1). Sits in the existing session grammar
+    # (`capture|probe|verify|list|view`) rather than adding a top-level verb.
+    session_disclosure = session_sp.add_parser(
+        "disclosure",
+        help="Print the capture disclosure (what is recorded, where it goes, "
+             "where the off-switch is) — rendered from runtime state, never "
+             "model-authored (#3517)")
+    session_disclosure.add_argument(
+        "--harness", default="claude",
+        help="Harness the disclosure is about (default: claude)")
+    session_disclosure.add_argument(
+        "--kind", default="disclosure",
+        choices=["disclosure", "confirmation", "declined"],
+        help="Which template to render: `disclosure` (the facts, printed "
+             "after an install), `confirmation` (the short yes-branch line "
+             "naming the off-switch) or `declined` (the no-branch line)")
+    session_disclosure.add_argument(
+        "--json", action="store_true",
+        help="Emit the machine-readable form (facts + every rendered text)")
     # #3809: one-command behavioural install verification — fire the installed
     # seam and assert installed -> captured -> in-memory, exiting non-zero on
     # any broken link. Named `verify` to sit in the existing
