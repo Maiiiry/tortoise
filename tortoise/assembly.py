@@ -196,56 +196,107 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #     ago', 'between 2 and 5 weeks ago'. The connector is word characters, so
 #     neither branch above sees it; without this the range's LAST bound is
 #     promoted as the count and a 2–5-week question is answered from the
-#     5-week window alone. The LEFT bound must be a NUMBER, word or digit —
-#     a digit-only left bound leaves the class half-open, because the spelled
-#     spelling ('two to five weeks ago' → count 5) escapes it.
-#: a count-like token. This must be a SUPERSET of what `_RE_AGO_OFFSET`
-#: READS (that template's group stops at `twelve`, which is exactly why the
-#: guard needs the tens/scale words: it exists to reject the counts the
-#: template would read WRONG), and it carries the approximate quantifiers the
-#: template accepts ('a couple of', 'a few', 'several') because a range can
-#: have one on its left. The CLASS is closed (the English cardinal words +
-#: the quantifiers), so listing it is complete — unlike a separator or a
-#: connector, where 'some other spelling' is open-ended.
-_NUM_WORDS = (r"(?:a\s+couple\s+of|couple\s+of|a\s+few|few|several|a|an|"
-              r"one|two|three|four|five|six|seven|eight|nine|ten|"
-              r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
-              r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|"
-              r"sixty|seventy|eighty|ninety|hundred|thousand|million)")
-#: the unit vocabulary, shared with `_RE_AGO_OFFSET`
-_AGO_UNITS = r"(?:days?|weeks?|months?|years?)"
-#: a RANGE's LEFT side: a count-like token that may carry its OWN unit
-#: ('from 2 weeks to 3 months ago') or none ('2 to 5 weeks ago'). The unit
-#: is optional because both spellings are natural, and the left side is built
-#: from `_NUM_WORDS` rather than enumerated: enumerating BARE left bounds is
-#: what left the class half-open ('two to five', 'several to five',
-#: 'from 2 weeks to 3 months' all escaped a `\d+`-only left bound).
-_RANGE_LEFT = r"(?:" + _NUM_WORDS + r"|\d+)(?:\s+" + _AGO_UNITS + r")?"
-#: the range connectors — a small CLOSED class, unlike a separator (which is
-#: why this one may be enumerated: there is no principled way to say 'any
-#: separator' for words, and a new English synonym is not the failure mode
-#: the guard exists for). The DASH family is in here because a dash is the
-#: canonical range connector ('2 weeks - 5 weeks ago') and branch 1 CANNOT
-#: reach it when the left bound carries its own unit — '2 weeks' is not
-#: adjacent to the count, so only this branch sees the range at all.
-_RANGE_CONN = (r"(?:up\s+to|up\s+until|upto|to|and|or|through|thru|until|"
-               r"till|til|[\-\u2010-\u2015\u2212])")
-_RE_COMPOUND_NUMBER = re.compile(
-    r"\b" + _NUM_WORDS + r"\b(?:[\W]|\band\b)+$"
-    r"|\d\W*$"
-    r"|\b" + _RANGE_LEFT + r"\W+" + _RANGE_CONN + r"\W+$"
-    # a SPELLED place-value/decimal tail — 'two point five weeks ago',
-    # 'twelve point three days ago', 'two point oh five weeks ago'. The
-    # offset template reads the trailing word alone, so the count is a
-    # fragment of a multi-part number exactly as in the digit case. The
-    # PLACE-VALUE MARKER immediately before the count is the discriminator
-    # ('point'/'dot'/'oh'), not the whole chain: 'two point oh five' has
-    # TWO fragments before the count, and anchoring on the marker catches
-    # any number of them without a nested quantifier. Conservative by
-    # construction — 'I made a point 3 days ago' rejects too and falls back
-    # to the legacy lane, the same fail-safe direction as the numeral branch.
-    r"|\b(?:point|dot|oh)\W+$",
-    re.IGNORECASE)
+#     5-week window alone.
+#
+# ⛔ WHY THIS IS A TOKEN WALK AND NOT A REGEX OF NUMBER SPELLINGS.
+# Four review rounds of #8097 each closed one member of this class and each
+# found the next: a digit-only left bound left the SPELLED bounds open ('two
+# to five' → 5); making the left a number word left the ones carrying their
+# OWN unit open ('from 2 weeks to 3 months' → 3); a connector list left
+# 'til'/'upto'/'up until' open; a place-value list left 'point zero'/'point
+# o' open; a cardinal left bound left fractions open ('one and a half to
+# five' → 5, '1½ to 2' → 2). Enumerating NUMBER SPELLINGS is open-ended —
+# there is always another way to write a number — so the guard no longer
+# tries. It asks the INVARIANT directly instead:
+#
+#     the count is trustworthy iff, walking LEFT from it, we run out of
+#     NUMBER-CONTINUATION tokens before we run out of number
+#
+# 'number-continuation' is the small CLOSED set of words that can only be
+# joining or scaling the parts of one number, bridging two bounds of a
+# range, or naming a fraction — plus any token that carries a digit. That
+# set is finite and principled, which is what the number SPELLINGS were not:
+# 'twenty' is in it, and so is 'up', which is why 'up till'/'up through'
+# need no entry of their own.
+#: words that can only be CONTINUING a number expression to the left of a
+#: count — a conjunction, a range connector, a place-value marker, a
+#: fraction, a scale word, a quantifier, or a cardinal. A plain SENTENCE word
+#: ('things', 'store', 'Wednesday', 'May', 'iPhone') is deliberately absent:
+#: that is exactly what stops the walk, and so what makes a legitimately
+#: standalone count ('I bought 2 things 3 days ago' → 3) promote.
+_NUMBER_CONTINUATION_WORDS = frozenset({
+    # conjunctions and range connectors — 'up' is here precisely so that
+    # EVERY 'up <connector>' spelling ('up to', 'up till', 'up through',
+    # 'up until') is covered without being listed
+    "and", "or", "to", "up", "upto", "till", "til", "until",
+    "through", "thru",
+    # place-value / decimal markers, and the zero one of them may carry
+    "point", "dot", "oh", "o", "zero", "nought", "naught",
+    # fractions, built or bare
+    "half", "halves", "quarter", "quarters", "third", "thirds",
+    # the offset units — a RANGE's left bound may carry its own ('from 2
+    # weeks – 3 months ago'), and the dash/'-'/'or' between the two bounds is
+    # then just a separator, so the unit is what the walk must bridge
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    # scales and quantifiers a bound may be built from
+    "hundred", "hundreds", "thousand", "thousands", "million",
+    "millions", "dozen", "dozens", "score", "scores", "couple",
+    "few", "several", "a", "an",
+    # the cardinals — including the TENS/SCALE words `_RE_AGO_OFFSET` itself
+    # does not read (it stops at 'twelve'), which is the whole reason the
+    # guard exists: it rejects the counts that template would read WRONG
+    "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+    "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+    "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+    "eighty", "ninety",
+})
+#: a numeral token may carry letters the tokenizer does not split off —
+#: '1½', '3¾' — and those still continue the number; an ORDINAL ('3rd',
+#: '22nd') does NOT, because it is a date reference and not a number span
+_ORDINAL_SUFFIXES = ("st", "nd", "rd", "th")
+_FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
+
+
+def _continues_number(token: str) -> bool:
+    """True when `token` can only be continuing the number the count ends."""
+    low = token.lower()
+    if low in _NUMBER_CONTINUATION_WORDS or token.isdigit():
+        return True
+    if any(ch.isdigit() or ch in _FRACTION_GLYPHS for ch in token):
+        return not low.endswith(_ORDINAL_SUFFIXES)
+    return False
+
+
+def _count_is_fragment(text_before: str) -> bool:
+    """True when the count is only the TRAILING PIECE of a longer number.
+
+    Walks LEFT from the count over separator runs and
+    `_continues_number` tokens. A fragment is exactly 'we consumed at least
+    one continuation token and then stopped': the token that stops the walk
+    is a sentence word, so nothing to its left can be part of this number.
+
+    Linear in len(text_before) — a plain scan, no regex, so it cannot
+    backtrack (the regex this replaced was an availability defect: an
+    ambiguous nested quantifier that took 3 s at N=24 and never returned
+    beyond, in an ask path with no timeout).
+    """
+    i = len(text_before)
+    consumed = False
+    while True:
+        j = i
+        while j > 0 and not text_before[j - 1].isalnum():
+            j -= 1
+        k = j
+        while k > 0 and text_before[k - 1].isalnum():
+            k -= 1
+        if k == j:            # ran off the start of the text
+            return consumed
+        if not _continues_number(text_before[k:j]):
+            return consumed
+        consumed = True
+        i = k
+
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how
 # many <unit> did I spend / had I been", "how long did (I|the narrator)
@@ -383,12 +434,15 @@ def _relative_match(question: str):
         m = rx.search(question)
         if m is None:
             continue
-        if kind == "ago-offset" and _RE_COMPOUND_NUMBER.search(
+        if kind == "ago-offset" and _count_is_fragment(
                 question[:m.start("count")]):
-            # a COMPOUND number word ('twenty two weeks ago') — the
-            # determiner alternation matched only its LAST word, which
-            # would anchor the window ~20 units wrong. Not a promoted
-            # form: fall through (the bare-'ago' residue then rejects it).
+            # a count that is the TRAILING PIECE of a longer number — a
+            # compound number word ('twenty two weeks ago'), a multi-part
+            # numeral ('2.5 weeks ago'), a range ('2 to 5 weeks ago'), a
+            # spelled place-value tail ('two point oh five weeks ago'). The
+            # template matched only the last piece, which would anchor the
+            # window ~20 units wrong. Not a promoted form: fall through
+            # (the bare-'ago' residue then rejects it).
             continue
         return kind, m
     return None

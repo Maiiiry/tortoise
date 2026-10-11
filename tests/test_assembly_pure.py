@@ -43,10 +43,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from tortoise.assembly import (
-    _RE_COMPOUND_NUMBER,
     AssemblyShape,
     RelativeAnchor,
     ResolveResult,
+    _count_is_fragment,
     classify_question,
     extract_subject_terms,
     resolve_relative_anchor,
@@ -404,10 +404,21 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         "What did I do 2 weeks — 5 weeks ago?",         # U+2014
         "What did I do 2 weeks - 5 weeks ago?",         # ASCII
         # ... and a SPELLED place-value/decimal tail is a multi-part number
-        # too: the offset template reads the trailing word alone
+        # too: the offset template reads the trailing word alone. The zero of
+        # 'two point oh five' may be spelled several ways
         "What did I do two point five weeks ago?",
         "What did I do twelve point three days ago?",
         "What did I do two point oh five weeks ago?",
+        "What did I do two point zero five weeks ago?",
+        "What did I do two point o five weeks ago?",
+        # ... the connector may carry an 'up' prefix, in any of its spellings
+        "What did I do 2 weeks up till 5 weeks ago?",
+        "What did I do 2 weeks up through 5 weeks ago?",
+        "What did I do 2 weeks up thru 5 weeks ago?",
+        # ... and a BOUND may be a fraction, spelt or glyph
+        "What did I do one and a half to five weeks ago?",
+        "What did I do two and a half to five weeks ago?",
+        "What did I do 1½ to 2 weeks ago?",
         # a multi-part NUMERAL is the same defect for digits: `_RE_AGO_OFFSET`
         # reads `\d+`, so it matches the LAST digit run alone — '2.5 weeks
         # ago' anchored at 5 weeks and '2,000 days ago' at 0 days (a window
@@ -437,33 +448,68 @@ def test_ago_relative_still_reads_a_standalone_digit_count():
         assert (a.kind, a.count) == ("ago-offset", count), (q, a)
 
 
-def test_compound_guard_does_not_backtrack_exponentially():
-    r"""The compound guard must stay LINEAR on a pathological question.
+def test_count_fragment_walk_is_linear():
+    r"""The count-fragment walk must stay LINEAR on a pathological input.
 
-    `(?:\W+|\s+and\s+)+$` is an ambiguous nested quantifier: `search` on
-    'twenty' + N spaces + 'x' backtracks over 2**N partitions — measured
-    3 s at N=24 and unbounded beyond. The input is bounded
-    (MAX_ASK_QUESTION_CHARS = 2000) but `run_ask_lane` has no timeout and a
-    HANG is not an exception the envelope can catch, so it is an
-    availability defect in the ask path. This test does not time anything:
-    under the ambiguous form it HANGS rather than failing, which is the
-    regression it guards.
+    The guard it replaced was a regex with an ambiguous nested quantifier
+    (`(?:\W+|\s+and\s+)+$`), which backtracked over 2**N partitions:
+    measured 3 s at N=24 and never returned beyond. The input is bounded
+    (`MAX_ASK_QUESTION_CHARS`) but `run_ask_lane` has no timeout and a HANG
+    is not an exception the ask envelope can catch, so it was an
+    availability defect. This test does not time anything: it asserts the
+    walk terminates and returns the right verdict at the boundary sizes.
 
-    The question MUST carry an `ago-offset`: `_RE_COMPOUND_NUMBER` is only
-    reached from `_relative_match` under `kind == "ago-offset"`, so a probe
-    with no offset ('twenty…x') never consults the guard and asserts nothing
-    about the ask path. '…x 1 day ago' is the production shape — on the
-    ambiguous form `classify_question` took 4.8 s at N=24 and hung at N=200.
+    The question MUST carry an `ago-offset`: the walk is only reached from
+    `_relative_match` under `kind == "ago-offset"`, so a probe with no
+    offset ('twenty…x') never consults the guard and asserts nothing about
+    the ask path. '…x 1 day ago' is the production shape — on the ambiguous
+    form `classify_question` took 4.8 s at N=24 and hung at N=200.
     """
-    for n in (24, 200, 1900):
+    for n in (24, 200, 1900, 2000):
         pad = "twenty" + " " * n + "x"
-        # the guard itself, addressed directly
-        assert _RE_COMPOUND_NUMBER.search(pad) is None
+        # the walk itself, addressed directly: 'x' stops it, so the count
+        # in 'twenty   …   x 1 day ago' is the WHOLE number
+        assert _count_is_fragment(pad + " ") is False, n
         # ... and through the entry points, where the guard is consulted
-        # (THESE are the lines that hang under the ambiguous form)
         q = pad + " 1 day ago"
         assert classify_question(q) is AssemblyShape.AGO_RELATIVE, n
         assert resolve_relative_anchor(q, "2026-09-10") is not None, n
+
+
+def test_count_fragment_walk_stops_at_a_sentence_word():
+    """The walk's stopping rule is what makes a legitimate standalone count
+    promote: it consumes number-continuation tokens and stops at the first
+    plain SENTENCE word, so nothing beyond that word can be part of the
+    number."""
+    # (text before the count, is it a fragment?)
+    for prefix, fragment in [
+        ("I bought 2 things ", False),
+        ("on the 3rd of May, ", False),
+        ("I went to the store ", False),
+        ("I mentioned it to my friend ", False),
+        ("twenty ", True),            # compound number word
+        ("twenty-", True),
+        ("2.", True),                 # multi-part numeral
+        ("2,", True),
+        ("2 to ", True),              # range
+        ("2 weeks to ", True),
+        ("2 weeks up till ", True),
+        ("one and a half to ", True),
+        ("1½ to ", True),
+        ("two point ", True),         # spelled place value
+        ("two point oh ", True),
+        ("two point zero ", True),
+        ("", False),
+        ("to ", True),
+    ]:
+        assert _count_is_fragment(prefix) is fragment, prefix
+
+
+def test_count_fragment_walk_ignores_a_preceding_ordinal():
+    """An ordinal is a DATE reference, not a number span: 'on 3rd, 4 days
+    ago' must still promote count=4."""
+    for prefix in ("on 3rd, ", "on the 22nd, ", "since the 1st, "):
+        assert _count_is_fragment(prefix) is False, prefix
 
 
 def test_ago_relative_shape_fires():
