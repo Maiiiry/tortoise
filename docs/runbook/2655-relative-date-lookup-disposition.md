@@ -135,7 +135,9 @@ end-to-end on the real pipeline
 TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
   tests/test_assembly_pure.py tests/test_calendar_anchors.py -q \
   -p no:cacheprovider -k "not docker"
-# -> 206 passed, 3 skipped, 12 deselected
+# -> 206 passed, 3 skipped, 12 deselected on this lane's own commit;
+#    221 passed, 3 skipped, 12 deselected after the origin/main merge that
+#    brought #2654's duration-state shape in (the +15 are that shape's tests).
 
 # committed-census neighbours (temporal leg + measurement subset + eval-only lane):
 TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
