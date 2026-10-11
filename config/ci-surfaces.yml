@@ -2568,7 +2568,8 @@ surfaces:
   - test_ids.py
   # #7955: the Interface E canonical-id contract test pins `tortoise/ids.py`
   # (`ulid`/`_is_ulid`), `tortoise/sdk.py`'s id regexes, and
-  # `tortoise/projection/edges.py` (`stub_key`/`resolve_structural_target`) —
+  # `tortoise/projection/edges.py` (`DERIVABLE_STRUCTURAL_RELS`,
+  # `STRUCTURAL_REL_LABELS`, `stub_key`) —
   # the same `sdk` SOURCE_PATTERNS that own `test_ids.py`, so the pin runs on
   # the PRs that can break it instead of reading as unregistered manifest drift.
   - test_identity_contract.py
