@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 import threading
 import time
@@ -1013,6 +1015,66 @@ def test_write_state_json_survives_concurrent_repairs_of_one_cache(tmp_path) -> 
 
     assert all(results), f"a concurrent repair was silently dropped: {results}"
     assert json.loads(path.read_text()) == payload, "the cache was left torn"
+    assert not list(tmp_path.glob("*.tmp")), "a temp file was leaked"
+
+
+def test_write_state_json_does_not_narrow_the_cache_mode(tmp_path) -> None:
+    """`mkstemp` creates 0600, and `os.replace` makes THAT the cache's final mode — so an
+    atomic write silently narrows a file that was 0644 and locks out any non-owner reader
+    (a container, a group process) with no error at write time, only a failure to read
+    later. The mode must match what the previous `write_text` produced."""
+    path = tmp_path / "state.json"
+    assert fs._write_state_json(path, {"generated_at": "2020-01-01T00:00:00+0000"}) is True
+    assert stat.S_IMODE(path.stat().st_mode) == fs._DEFAULT_FILE_MODE
+    assert fs._DEFAULT_FILE_MODE != 0o600, "a cache readable only by its OWNER is a regression"
+
+
+def test_write_state_json_closes_the_descriptor_when_fdopen_fails(tmp_path, monkeypatch) -> None:
+    """`os.fdopen` taking ownership of the descriptor is not guaranteed once it raises, so
+    the failure path must close it: the previous `write_text` could not leak an fd here,
+    and the atomic rewrite must not introduce one."""
+    closed: list[int] = []
+    real_close = os.close
+
+    def spy_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    def explode(*_a: object, **_k: object) -> object:
+        raise OSError(5, "injected fdopen failure")
+
+    monkeypatch.setattr(fs.os, "close", spy_close)
+    monkeypatch.setattr(fs.os, "fdopen", explode)
+    before = len(closed)
+
+    assert fs._write_state_json(tmp_path / "state.json", {"generated_at": _stamp(0)}) is False
+    assert len(closed) > before, "the descriptor mkstemp opened was leaked"
+    assert not list(tmp_path.glob("*.tmp")), "the temp file must still be removed"
+
+
+def test_write_state_json_cleans_up_when_the_payload_is_unserialisable(tmp_path) -> None:
+    """A payload `json.dumps` cannot render (a circular reference) is a CALLER bug, not an
+    I/O failure, so it propagates rather than being reported as a failed cache write — but
+    it must still leave neither a temp file nor a half-written cache nor a leaked
+    descriptor behind, because every reader that finds a stale cache takes this path."""
+    path = tmp_path / "state.json"
+    circular: dict[str, object] = {"generated_at": _stamp(0)}
+    circular["self"] = circular
+    closed: list[int] = []
+    real_close = os.close
+
+    def spy_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(fs.os, "close", spy_close)
+        before = len(closed)
+        with pytest.raises(ValueError):
+            fs._write_state_json(path, circular)
+        assert len(closed) > before, "the descriptor mkstemp opened was leaked"
+
+    assert not path.exists(), "a failed write must not fabricate a cache"
     assert not list(tmp_path.glob("*.tmp")), "a temp file was leaked"
 
 

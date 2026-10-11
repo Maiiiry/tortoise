@@ -1746,6 +1746,18 @@ def _report_state_age(fr: Mapping[str, Any], *, source: str) -> None:
     print(f"fleet-state: {render_state_age(fr)} (source={source})", file=sys.stderr)
 
 
+def _umask_default_mode() -> int:
+    """0o666 minus the process umask — what ``Path.write_text`` would have created."""
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
+#: Probed ONCE at import: ``os.umask`` is process-global, so reading it on every write
+#: would race whenever concurrent readers repair the same cache (#7957 H2).
+_DEFAULT_FILE_MODE = _umask_default_mode()
+
+
 def _write_state_json(path: Path, state: Mapping[str, Any]) -> bool:
     """Best-effort atomic cache write. A torn cache is worse than none."""
     try:
@@ -1760,8 +1772,18 @@ def _write_state_json(path: Path, state: Mapping[str, Any]) -> bool:
         try:
             with os.fdopen(fd, "w") as fh:
                 fh.write(json.dumps(state, indent=2, default=str))
+            # `mkstemp` creates 0600 and `os.replace` makes THAT the cache's final mode,
+            # silently narrowing a file that was 0644 — locking out any non-owner reader
+            # (a container, a group process) with no error at write time, only a failure
+            # to read later. The previous `write_text` created 0o666 & ~umask.
+            os.chmod(tmp_name, _DEFAULT_FILE_MODE)
             os.replace(tmp_name, path)
         except BaseException:
+            # `os.fdopen` taking ownership is NOT guaranteed once it raises, so close the
+            # descriptor here (suppressed when the `with` already closed it): otherwise a
+            # failed open leaks an fd that the previous `write_text` could not leak.
+            with contextlib.suppress(OSError):
+                os.close(fd)
             with contextlib.suppress(OSError):
                 os.unlink(tmp_name)
             raise
