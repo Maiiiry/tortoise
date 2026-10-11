@@ -529,6 +529,8 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("one and a half to ", True),
         ("1½ to ", True),
         ("at 3pm ", False),          # a digit joined to LETTERS is not a number
+        ("zero to ", True),          # a spelled zero is a cardinal, not a marker
+        ("nought to ", True),
         ("at 4k ", False),
         ("at 5G ", False),
         ("2wks to ", True),          # ... unless the letters are its UNIT
@@ -540,6 +542,12 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("2hours to ", True),
         ("between 2 hrs and ", True),
         ("2 mins to ", True),
+        ("2 hours ", False),         # a duration ENDS before the count: two
+        ("2 mins ", False),          # durations, not a range
+        ("3 secs ", False),
+        ("2 weeks ", False),
+        ("2 weeks – ", True),        # ... unless a DASH connects the two bounds
+        ("2 hours 5 days ", False),
         ("between 2 and about ", True),   # a connective CHAIN
         ("2 to roughly ", True),
         ("from 2 up to and including ", True),

@@ -194,10 +194,11 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #:   (a) a CONNECTIVE that is not in the list below ends the scan and lets the
 #:       count promote, so a range written with it ('2 to <unlisted> 5 weeks
 #:       ago') still promotes 5;
-#:   (b) a UNIT spelling outside `_NUMERAL_UNIT_SUFFIXES` — which is the
-#:       set BOTH paths use, so this residual is the same for glued and
-#:       spaced bounds — likewise ends the scan, so a range's left bound
-#:       written that way promotes the right bound.
+#:   (b) a NUMERAL spelling the vocabularies do not carry — a cardinal word
+#:       outside `_NUMBER_WORDS`, or a unit spelling outside
+#:       `_NUMERAL_UNIT_SUFFIXES` (the one set BOTH paths use, so this residual
+#:       is the same for glued and spaced bounds) — likewise ends the scan, so
+#:       a range's left bound written that way promotes the right bound.
 #: Both directions are recorded here so the next reader does not over-trust the
 #: guard.
 _NUMERAL_UNIT_SUFFIXES = frozenset({
@@ -216,8 +217,8 @@ _NUMBER_CONTINUATION_WORDS = frozenset({
     # token by token: 'up to and including 5', 'to or beyond 5'
     "including", "inclusive", "inclusively", "onwards", "onward",
     "beyond", "before", "after",
-    # place-value / decimal markers, and the zero one of them may carry
-    "point", "dot", "oh", "o", "zero", "nought", "naught",
+    # place-value / decimal markers (the ZEROS are cardinals, not markers)
+    "point", "dot", "oh", "o",
     # the link word inside a quantifier phrase ('a couple of', 'dozens of')
     "of",
     # fractions, built or bare
@@ -248,6 +249,7 @@ _NUMBER_CONTINUATION_WORDS = frozenset({
 #: `origin/main` refused.
 _NUMBER_WORDS = frozenset({
     "a", "an", "couple", "few", "several",
+    "zero", "nought", "naught",
     "one", "two", "three", "four", "five", "six", "seven", "eight",
     "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
     "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
@@ -275,6 +277,10 @@ _NUMBER_WORDS = frozenset({
 #: Same set, both spellings: '2 hrs to 5 days ago' and '2hrs to 5 days ago'
 #: must not disagree.
 _FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
+#: the Unicode dash family. A bare unit before the count TERMINATES a duration
+#: ('2 hours 5 days ago'), but a dash between them is itself a range connector
+#: ('from 2 weeks – 3 months ago'), so the unit is a bridge there after all.
+_RANGE_DASHES = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
 
 
 def _is_numeric(ch: str) -> bool:
@@ -321,6 +327,7 @@ def _count_is_fragment(text_before: str) -> bool:
     beyond, in an ask path with no timeout).
     """
     i = len(text_before)
+    first = True
     while True:
         j = i
         while j > 0 and not text_before[j - 1].isalnum():
@@ -331,10 +338,23 @@ def _count_is_fragment(text_before: str) -> bool:
         if k == j:            # ran off the start: nothing to the left
             return False
         token = text_before[k:j]
+        low = token.lower()
         if _is_number_token(token):
             return True
+        if first and low in _NUMERAL_UNIT_SUFFIXES and not any(
+                ch in _RANGE_DASHES for ch in text_before[j:i]):
+            # A DURATION ENDS HERE. '2 hours 5 days ago' is two durations, not
+            # a range: the count starts a NEW number, and the unit in front of
+            # it belongs to the number before that. So a unit is a bridge only
+            # when something else sits between it and the count ('2 hrs to 5
+            # days ago', 'between 2 hrs and 5 days ago') — as the FIRST token
+            # it terminates the scan instead. Without this the union above
+            # made the guard reject '2 hours 5 days ago', which promotes on
+            # `origin/main`.
+            return False
         if not _continues_number(token):
             return False
+        first = False
         i = k
 
 # duration-state semantics that are STILL never a two-subject shape: "how
