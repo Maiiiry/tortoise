@@ -1705,6 +1705,17 @@ surfaces:
   # #3301: the four search legs must apply the canonical OBJECT vocabulary —
   # per-leg returned-set tests (docker lane).
   - test_object_search_visibility_3301.py
+  # #1423: Subject supersession — the write path (a Subject-addressed
+  # supersession applies instead of the #1370 warn-and-skip), the journaled
+  # `EntityMutated op=supersede` record, rebuild_all byte-parity including the
+  # ORIGINAL supersededAt, the #1350/#2194 clobber guard ported to Subject
+  # (a re-mention cannot resurrect a superseded team/role/person), and the
+  # read-side family vocabulary + per-leg returned sets. Same surface as its
+  # siblings test_object_registered_journal.py / test_object_search_
+  # visibility_3301.py / test_unjournaled_mutation_class.py (the projection +
+  # journal + search-leg seam; `tortoise/sdk.py` is a SHARED_MODULE -> full
+  # matrix, so `core` is the default home).
+  - test_subject_supersession_1423.py
   - test_open_kinds.py
   - test_operator_annotator_rebuild.py   # #3689 journaled OperatorAnnotated + PointRevised annotator dims survive rebuild_all
   - test_operator_source_search.py
@@ -3339,6 +3350,7 @@ durations:
   test_mcp_server_auth_modes.py: 0.7
   test_object_registered_journal.py: 1.7
   test_object_search_visibility_3301.py: 2.0
+  test_subject_supersession_1423.py: 210.8  # unmeasured — locally measured (24 tests, 210.79s session total, this worktree, 2026-10-11). Needed here rather than left to the sweep because `tools/ci_timing.py --refresh-durations` samples push-to-main runs only, so a file ADDED BY A PR can never have a measured duration at PR time (the >=90% coverage floor, #2876). The cost is the per-test SDK/embedder setup plus the four `rebuild_all` replays; refresh from CI junit once this file has run on main.
   test_session_extraction_modes.py: 5.3
   test_claim_lifecycle.py: 1.4
   test_e2e_journey.py: 0.9

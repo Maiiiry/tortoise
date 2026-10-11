@@ -4,7 +4,7 @@ type: data
 domain: data
 status: live
 created: 2026-08-05
-updated: 2026-10-10
+updated: 2026-10-11
 ownedBy: epistemic-team
 aboutSubjects: epistemic-team
 aboutObjects: tortoise
@@ -32,6 +32,20 @@ doc_status: live
 > **⭐ If this document and the code disagree, THIS DOCUMENT IS RIGHT and the code
 > has a defect.** The single exception is a *factual* error — the model itself
 > being wrong — which is corrected here and recorded in the changelog.
+>
+> **Changelog v3.22 (2026-10-11 — issue #1423 — Subject status is projection-owned, and supersession reaches the Subject family):**
+> §4.2's `status` cell recorded a **capability gap** ("projection-owned status is planned, NOT yet
+> implemented on Subject", #2295) and the Subject family had no supersession path at all:
+> `commit_ops.apply_supersessions` refused a record whose successor was a `:Subject` (the #1370
+> warn-and-skip), so a replaced team/role/person stayed `live` and search-visible forever. Both are
+> now built. `_upsert_subject` **seeds** `status` ON CREATE and `status` ∈ `_SUBJECT_HANDLED`, so the
+> Object's #1350/#2194 clobber guard applies to Subjects too; the supersession write goes through the
+> generic entity surface (`EntityMutated op="supersede"`, journaled with `status`/`supersededBy`/
+> `supersededAt`), which the ONE `SET n += $state` arm replays in all four engines; and
+> `commit_ops.SUBJECT_TERMINAL_STATUSES` excludes terminal Subjects from the four retrieval legs by
+> default. §4.2's `status` row moves ⚠️ → ✅ and gains `supersededBy`/`supersededAt`. **No model
+> change** — the Subject lifecycle vocabulary and the `superseded, never deleted` doctrine are
+> unchanged; this is the declaration catching up to the build.
 >
 > **Changelog v3.22 (2026-10-10 — issue #2767 — `milestone` is a core EVENT kind, not an Object kind):**
 > §5's event-kind vocabulary did not list `milestone`, while the `project-management` pack declared it
@@ -912,7 +926,8 @@ About edges: `aboutSubject`, `aboutObject`, `aboutEvent`, `aboutPoint`, `aboutDo
 | `id` | string | ✅ | `dc:identifier` | ✅ | Canonical identifier |
 | `name` | string | ✅ | `foaf:name` / `schema:name` | ⚠️ | Human-readable name |
 | `subjectKind` | string | ✅ | `dcterms:type` | ✅ | organization, team, role, legalPerson, naturalPerson, other |
-| `status` | string | — | `pav:status` | ⚠️ | Lifecycle: draft, live, superseded, deprecated, archived — **projection-owned status is planned, NOT yet implemented on Subject**; SDK-created subjects currently carry `status: "live"` via the extra-props path (`_persist_extra_props` — `status` ∉ `_SUBJECT_HANDLED`, #2295): `_upsert_subject` itself writes only `id`/`subjectKind`/`createdAt`/`embedding` |
+| `status` | string | — | `pav:status` | ✅ | Lifecycle: draft, live, superseded, deprecated, archived. **Projection-owned since #1423** — the Subject twin of the Object status cache (§11: the journal is the reconstruction source, the property is a cache). `_upsert_subject` SEEDS it ON CREATE (`status=coalesce($st,'live')`) and `status` ∈ `_SUBJECT_HANDLED`, so `_persist_extra_props` never rewrites it on MATCH — the #1350/#2194 clobber guard ported to Subject (before #1423 `status` rode the extras lane, which applies ON MATCH, so a **re-mention of a superseded team/role/person reset it to `live` live-side while replay kept the supersession** — the #2193 live≠replay class, pinned by `tests/test_subject_supersession_1423.py`). Supersession folds through the generic entity surface: `commit_ops.apply_supersessions` writes `status`/`supersededBy`/`supersededAt` and journals `EntityMutated op="supersede"`, which the ONE `SET n += $state` arm replays in all four engines. Read side: `commit_ops.SUBJECT_TERMINAL_STATUSES` (superseded / deprecated / archived) excludes terminal Subjects from the four retrieval legs by default |
+| `supersededBy` / `supersededAt` | string / ISO8601 | — | — | ✅ | #1423: successor NAME (stored verbatim) and the fold instant, written together with `status='superseded'` by the subject supersession lane. Carried in the journaled `EntityMutated` `state` map, so a wipe+rebuild restores the ORIGINAL instant rather than a rebuild-time one — the #2164-P4 drift class the Object twin still exhibits (`_fold_object_superseded` falls back to `now` on the live path while replay reads the journaled `ts`). Absent on non-superseded Subjects |
 | `validFrom` / `validTo` | ISO8601 | — | `prov:generatedAtTime` / `prov:invalidatedAtTime` | ❌ | Valid-time window — when the Subject held in the world (declared §4.7, #3642; not yet written by `_upsert_subject`) |
 | `expiredAt` | ISO8601 | — | — | ❌ | Transaction-time expiry — when our record of the Subject stopped being current (declared §4.7, #3642) |
 | `createdAt` | ISO8601 | ✅ | `dc:created` | ✅ | Timestamp (set ON CREATE; adopted ON MATCH only when absent — #2295) |

@@ -3713,8 +3713,8 @@ def secondary_entity_id_props(label: str) -> tuple[str, ...]:
 # tests/test_unjournaled_mutation_class.py derives the relationship so that an
 # op added without a fold arm REDs instead of shipping.
 _ENTITY_MUTATION_OPS: tuple[str, ...] = (
-    "delete", "rename", "restatus", "revise",       # fold arms exist
-    "retract", "supersede",                          # recorded on #3299 — no arm yet
+    "delete", "rename", "restatus", "revise", "supersede",  # fold arms exist
+    "retract",                                       # recorded on #3299 — no arm yet
 )
 # FOLD capability, not producer reach: the `rename` arm is implemented and must
 # stay so, but the PRODUCER deliberately does not emit `rename` yet — see
@@ -3723,30 +3723,61 @@ _ENTITY_MUTATION_OPS: tuple[str, ...] = (
 # `state["name"]`; a record carrying just a top-level `name` unfolds and is
 # reported as a fold miss. #3377 returned to
 # open; #4769 lands rename journalling WITH the structural sweep-ordering fix.
+#
+# #1423: `supersede` joined the implemented set. It is a STATE op — the record's
+# `state` map carries the applied `status`/`supersededBy`/`supersededAt`, so the
+# ONE generic `SET n += $state` arm folds it on every canonical label (Subject
+# included) in all four replay engines, with no new event type and no new
+# per-label fold. The producer is `commit_ops._apply_subject_supersession`
+# (the Subject arm of `apply_supersessions`), so a role/team/person
+# replacement is journaled and replayed instead of refused.
 _ENTITY_MUTATION_IMPLEMENTED_OPS: frozenset[str] = frozenset(
-    {"delete", "rename", "restatus", "revise"})
+    {"delete", "rename", "restatus", "revise", "supersede"})
 # The ops that carry a `state` payload (everything implemented except delete).
 _ENTITY_MUTATION_STATE_OPS: frozenset[str] = frozenset(
-    {"rename", "restatus", "revise"})
+    {"rename", "restatus", "revise", "supersede"})
 # HAND-MAINTAINED, not derived from the set difference: a derived set would
 # auto-absorb an op added to ``_ENTITY_MUTATION_OPS`` with no classification,
 # leaving the derivation test green on exactly the addition it exists to catch.
 _ENTITY_MUTATION_PENDING_OPS: frozenset[str] = frozenset(
-    {"retract", "supersede"})
+    {"retract"})
+
+
+#: #1423: keys the record envelope OWNS, so an optional ``provenance`` dict
+#: passed to ``_journal_entity_mutation`` cannot corrupt the line. ``_emit_event``
+#: takes ``point``/``payload``/``id`` as named params and its envelope carries
+#: ``type``/``event_id``/``ts``/``initiated_by``/``projection_version`` — the
+#: exact reason the EntityMutated payload is nested under ``state`` in the first
+#: place, which an unguarded provenance merge would re-open.
+_ENTITY_MUTATION_RESERVED_KEYS: frozenset[str] = frozenset({
+    "type", "id", "op", "label", "state", "name",
+    "point", "payload", "event_id", "ts", "initiated_by",
+    "projection_version", "recorded_ts",
+})
 
 
 def classify_entity_mutation_op(props: dict) -> str:
     """The write's PRIMARY INTENT → its ``EntityMutated`` ``op`` value.
 
-    Precedence ``name`` > ``status`` > other. ``state`` always carries the
-    write's full applied map, so a mixed write loses nothing by the labelling —
-    a consumer wanting EVERY status transition must read ``state["status"]``
-    and must NOT filter on ``op``.
+    Precedence ``supersededBy`` > ``name`` > ``status`` > other. ``state``
+    always carries the write's full applied map, so a mixed write loses nothing
+    by the labelling — a consumer wanting EVERY status transition must read
+    ``state["status"]`` and must NOT filter on ``op``.
+
+    ``supersededBy`` is checked FIRST (#1423): it is the successor pointer, the
+    one prop no other write sets, so a record carrying it IS a supersession
+    whatever else it carries. Labelling it ``supersede`` keeps that intent in
+    the op instead of flattening it into the generic ``restatus``. The fold is
+    the SAME generic state arm either way (``supersede`` is a member of
+    ``_ENTITY_MUTATION_STATE_OPS``), so the label decides audibility, never
+    behaviour.
 
     Lives here (not in ``sdk``) so the producer cannot invent a name; its return
     set is AST-asserted equal to ``_ENTITY_MUTATION_STATE_OPS`` by the test
     suite.
     """
+    if "supersededBy" in props:
+        return "supersede"
     if "name" in props:
         return "rename"
     if "status" in props:

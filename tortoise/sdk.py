@@ -13815,7 +13815,14 @@ class TortoiseSDK:
             return {**chain, "subject": None}
         sub = rows[0][0]
         chain["subject"] = {"id": sub.get("id"), "name": sub.get("name"),
-                             "kind": sub.get("subjectKind", "")}
+                             "kind": sub.get("subjectKind", ""),
+                             # #1423: the deciding subject's own lifecycle status
+                             # rides the chain, so "who decided this?" can also
+                             # report that the role/team has since been
+                             # superseded. Empty string when unset (a
+                             # pre-#1423 / raw-producer node), never absent —
+                             # additive for existing consumers.
+                             "status": sub.get("status", "") or ""}
         # ponytail: follow outgoing rels for Role → Org delegation
         rels = proj.g.query(
             "MATCH (s:Subject {id:$sid})-[r]->(n) RETURN type(r), labels(n)[0], properties(n)",
@@ -22381,7 +22388,8 @@ class TortoiseSDK:
 
     def _journal_entity_mutation(self, label: str, id_val: str, op: str, *,
                                  state: dict | None = None,
-                                 name: str | None = None) -> None:
+                                 name: str | None = None,
+                                 provenance: dict | None = None) -> None:
         # NOTE ON ``name``: RESERVED AND CURRENTLY UNREAD. No producer passes it
         # (the rename op is deferred to #4769), and `_fold_entity_mutation` does
         # NOT read it — the fold's `rename` arm applies `state`, so a record
@@ -22418,6 +22426,16 @@ class TortoiseSDK:
         Identity is recorded AS WRITTEN (``label`` + the key the live write
         matched + ``name``) and never re-derived from the live node at replay
         time.
+
+        ``provenance``
+            OPTIONAL audit keys merged onto the record BESIDE ``state``
+            (``session_id`` / ``evidence``), never inside it — a key in
+            ``state`` would be re-applied as a node property by the fold's
+            ``SET n += $state``. Added by #1423 so the Subject supersession
+            write carries the same provenance the Object twin's
+            ``ObjectSuperseded`` event does
+            (``commit_ops.apply_supersessions``). ``None`` (the default, and
+            every ``_update_entity`` call) leaves the record byte-identical.
         """
         from tortoise.projection import _ENTITY_MUTATION_IMPLEMENTED_OPS
         if op not in _ENTITY_MUTATION_IMPLEMENTED_OPS:
@@ -22432,6 +22450,20 @@ class TortoiseSDK:
             record["state"] = state
         if name is not None:
             record["name"] = name
+        if provenance:
+            # #1423: the envelope's own keys win — drop (loudly) any reserved
+            # key a caller tried to merge, so a provenance dict can never
+            # rewrite `type`/`id`/`state`/`event_id`/…. See
+            # `_ENTITY_MUTATION_RESERVED_KEYS`.
+            from tortoise.projection import _ENTITY_MUTATION_RESERVED_KEYS
+            _clash = sorted(k for k in provenance
+                            if k in _ENTITY_MUTATION_RESERVED_KEYS)
+            if _clash:
+                _logger.warning(
+                    "EntityMutated provenance keys %r are reserved on the "
+                    "record envelope and were DROPPED (#1423)", _clash)
+            record.update({k: v for k, v in provenance.items()
+                           if k not in _ENTITY_MUTATION_RESERVED_KEYS})
         self._emit_event(_ENTITY_MUTATION_RECORD_TYPE, **record)
 
     def _update_entity(self, id_val: str, **props) -> dict:
