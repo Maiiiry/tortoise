@@ -58,12 +58,17 @@ _CENSUS = json.loads(
     (Path(__file__).resolve().parent / "_assembly_census.json").read_text())
 
 # the measured-negative classes (the census's non-fireable sub-classes).
-# #2655: `relative-date-lookup` is NO LONGER here — the shape now owns the
-# class's calendar-anchored rows, and the three rows the census misfiled out
-# of it (see _RELATIVE_DATE_CLASS_EXPANSION).
+# TWO labels have had their fireable subsets moved into a shape, and BOTH stay
+# listed here — the label IS the census's non-fireable class, and the rows whose
+# morphology a shape now covers are excluded by QID in
+# ``test_census_negative_set_precision_floor``:
+#   * #2654 "duration-state" — ``_DURATION_STATE_COVERED`` (5 of 7 rows);
+#   * #2655 "relative-date-lookup" — ``_RELATIVE_DATE_ANCHORED`` (3 of 6 rows).
+# The residual rows of both classes stay in the denominator and stay
+# non-firing.
 _NEG_CLASSES = {
     "ago-relative", "frequency/count", "duration-state",
-    "nary-ordering", "other",
+    "relative-date-lookup", "nary-ordering", "other",
     "pattern/recurring", "offset-comparison", "recency",
     "recency/current-state",
 }
@@ -104,11 +109,34 @@ _IN_SCOPE_NO_FIRE = {
     "How long did I use my new binoculars before I saw the American "
     "goldfinches returning to the area?",
 }
-# the qids of those five pinned in-scope non-fires (kept as ids so the census
-# assertion cannot be satisfied by a re-worded question)
-_IN_SCOPE_NO_FIRE_QIDS = {
-    "2c63a862", "a3838d2b", "gpt4_93159ced", "gpt4_cd90e484",
-    "gpt4_93159ced_abs",
+# #2655: the calendar-anchored rows of the relative-date-lookup class (the
+# CLASS LABEL stays in _NEG_CLASSES; these three rows are excluded from its
+# denominator because the shape now fires on them). Pinned by qid.
+_RELATIVE_DATE_ANCHORED = {
+    "71017277",       # "…jewelry last Saturday from whom?"
+    "gpt4_f420262d",  # "…airline … on Valentine's day?"
+    "gpt4_e414231f",  # "…bike … the past weekend?"
+}
+
+# #2654: the duration-state rows the state-entry variant COVERS, pinned by
+# qid — a coverage regression on any of them fails loudly.
+_DURATION_STATE_COVERED = {
+    "e4e14d04",   # "…been a member of 'Book Lovers Unite' when … meetup?"
+    "c9f37c46",   # "…been watching stand-up comedy specials regularly …"
+    "cc6d1ec1",   # "…been bird watching when … workshop?"
+    "993da5e2",   # "…been using the new area rug when … furniture?"
+    "b29f3365",   # "…been taking guitar lessons when … amp?"
+}
+#: #2654: the duration-state rows whose morphology is NOT the state-entry
+#: form, pinned as still-non-firing WITH the reason — a template widening
+#: onto either of them fails here.
+_DURATION_STATE_RESIDUAL = {
+    # a SUMMED span over two books ("… and … combined"): the #2886 aggregate
+    # lane owns the TOTAL morphology, and no state entry exists to anchor
+    "b9cfe692",
+    # an AGE ("how old was I when I moved"): the state entry would be a
+    # birth date the graph does not hold
+    "d01c6aa8",
 }
 
 
@@ -294,13 +322,22 @@ def test_relative_date_lookup_does_not_hijack_another_shape(question,
 # ── measured precision floor on the census negative set (R15/R16) ─────────
 
 def test_census_negative_set_precision_floor():
-    """Precision on the measured negative set ≥ 0.95: of the 69 non-fireable
-    rows (72 after #2655 moved the relative-date-lookup class out, minus the 3
-    calendar-anchor rows the census misfiled under OTHER classes), at most 2
-    may fire, and those 2 are pinned to the adjudicated label-noise rows (a
-    NEW false fire fails — the floor is monotonic)."""
-    rows = [r for r in _CENSUS["rows"] if r["cls"] in _NEG_CLASSES]
-    assert len(rows) == 72
+    """Precision on the measured negative set >= 0.95.
+
+    The denominator is the census rows in the non-fireable class labels MINUS
+    every row whose morphology a shape now covers — #2654's 5 state-entry
+    duration-state rows and #2655's 3 calendar-anchored relative-date-lookup
+    rows — and MINUS the 3 rows the census misfiled OUT of relative-date-lookup
+    that are adjudicated INTO it by morphology (they fire as RELATIVE_DATE).
+    What remains is 67 rows, of which at most 2 may fire, and those 2 are
+    pinned to the adjudicated label-noise rows (a NEW false fire fails — the
+    floor is monotonic).
+    """
+    rows = [r for r in _CENSUS["rows"]
+            if r["cls"] in _NEG_CLASSES
+            and r["qid"] not in _DURATION_STATE_COVERED
+            and r["qid"] not in _RELATIVE_DATE_ANCHORED]
+    assert len(rows) == 70
     false_fires = [
         r for r in rows
         if classify_question(r["question"]) is not None]
@@ -319,7 +356,7 @@ def test_census_negative_set_precision_floor():
     assert len(remaining) <= 2, \
         f"precision floor breached: {len(remaining)} fired"
     denominator = len(rows) - len(reclassified)
-    assert denominator == 69
+    assert denominator == 67
     assert 1 - len(remaining) / denominator >= 0.95
     # the two adjudicated rows fire as their shapes (they are in-shape)
     for r in remaining:
@@ -327,25 +364,48 @@ def test_census_negative_set_precision_floor():
 
 
 def test_census_in_scope_recall_and_shape_rejections():
-    """In-scope census rows (#2655: 53 of 61 fire): the 5 pinned
-    duration/count mis-files + the 3 relative-date-lookup rows that name no
-    calendar anchor do NOT (shape-based rejection is the point)."""
+    """In-scope census rows: the 50 shape-typical rows fire; the 5 pinned
+    duration/count mis-files do NOT (shape-based rejection is the point).
+
+    Unchanged by #2655: the relative-date-lookup class stays a NEGATIVE class
+    label (see ``_NEG_CLASSES``), so it is not part of this in-scope set, and
+    the anchor branch preserves every pre-#2655 in-scope decision by falling
+    through to the unchanged body.
+    """
     rows = [r for r in _CENSUS["rows"] if r["cls"] not in _NEG_CLASSES]
-    assert len(rows) == 61
+    assert len(rows) == 55
     fired = [r for r in rows if classify_question(r["question"]) is not None]
     no_fire = [r for r in rows if classify_question(r["question"]) is None]
-    assert len(fired) == 53, \
-        f"in-scope fires drifted: {len(fired)} (expected 53)"
-    assert len(no_fire) == 8
-    # the 8 = the 5 pinned duration/count mis-files + the 3 relative-date-lookup
-    # rows that name NO calendar anchor at all
-    assert {r["qid"] for r in no_fire} - _RELATIVE_DATE_NON_ANCHOR \
-        == _IN_SCOPE_NO_FIRE_QIDS, \
-        f"in-scope rejection set drifted: {sorted({r['qid'] for r in no_fire})}"
-    by_text = {r["question"]: r for r in no_fire
-               if r["qid"] not in _RELATIVE_DATE_NON_ANCHOR}
+    assert len(fired) == 50, \
+        f"in-scope fires drifted: {len(fired)} (expected 50)"
+    assert len(no_fire) == 5
+    by_text = {r["question"]: r for r in no_fire}
     assert set(by_text) == _IN_SCOPE_NO_FIRE, \
         f"in-scope rejection set drifted: {sorted(set(by_text) ^ _IN_SCOPE_NO_FIRE)}"
+
+
+def test_census_duration_state_coverage():
+    """#2654 census coverage (the issue's target, RE-MEASURED): all 7
+    duration-state rows — 5 fire as the state-entry shape with exactly one
+    usable term each; the 2 residual-morphology rows stay non-firing (pinned
+    by qid). The class is not "fired coverage" by count alone: each fired
+    row must also extract a non-empty term, because the shape's R1 gate
+    needs one resolved subject to fire at all."""
+    rows = {r["qid"]: r for r in _CENSUS["rows"]
+            if r["cls"] == "duration-state"}
+    assert len(rows) == 7
+    fired = {q for q, r in rows.items()
+             if classify_question(r["question"])
+             is AssemblyShape.DURATION_STATE}
+    assert fired == _DURATION_STATE_COVERED, \
+        f"duration-state coverage drifted: {sorted(fired)}"
+    for q in sorted(fired):
+        terms = extract_subject_terms(rows[q]["question"])
+        assert len(terms) == 1 and terms[0].strip(), (q, terms)
+    residual = {q for q, r in rows.items()
+                if classify_question(r["question"]) is None}
+    assert residual == set(_DURATION_STATE_RESIDUAL), \
+        f"residual duration-state set drifted: {sorted(residual)}"
 
 
 def test_ago_relative_never_fires_even_with_state_morphology():
@@ -411,17 +471,22 @@ def test_misfire_preference_with_two_named_options():
         assert classify_question(q) is None, q
 
 
-def test_duration_frequency_never_fire():
-    """Duration-state / frequency-count / offset-count morphology never
-    fires — 'how long', 'how many X did I spend/take', single-anchor 'since',
-    'how many X before Y'."""
+def test_duration_state_never_fires():
+    """The RESIDUAL duration/count morphology never fires — single-anchor
+    "how long" (no reference event), "how many X did I spend/take",
+    single-anchor 'since', 'how many X before Y'.
+
+    #2654: the state-entry form ("how long had I been <state> when
+    <event>") moved OUT of this list — it is the duration-state shape now,
+    pinned by ``test_duration_state_fires``."""
     for q in [
         "How long have I been working before I started my current job at "
         "NovaTech?",
-        "How long had I been a member of 'Book Lovers Unite' when I "
-        "attended the meetup?",
         "How long did I use my new binoculars before I saw the American "
         "goldfinches returning to the area?",
+        "How long did I take to finish 'The Seven Husbands of Evelyn Hugo' "
+        "and 'The Nightingale' combined?",
+        "How old was I when I moved to the United States?",
         "How many days did I spend on my solo camping trip to Yosemite "
         "National Park?",
         "How many times did I go to the gym in June?",
@@ -432,6 +497,108 @@ def test_duration_frequency_never_fire():
         "How many months before my anniversary did Rachel get engaged?",
         "How many days did it take for me to find a house I loved after "
         "starting to work with Rachel?",
+    ]:
+        assert classify_question(q) is None, q
+        assert extract_subject_terms(q) == [], q
+
+
+# ── #2654 duration-state — the state-entry anchor variant ────────────────
+
+_DURATION_STATE_FIRE = [
+    # the five census rows whose morphology IS the state-entry form
+    "How long had I been a member of 'Book Lovers Unite' when I attended "
+    "the meetup?",
+    "How long had I been watching stand-up comedy specials regularly when "
+    "I attended the open mic night at the local comedy club?",
+    "How long had I been bird watching when I attended the bird watching "
+    "workshop?",
+    "How long had I been using the new area rug when I rearranged my "
+    "living room furniture?",
+    "How long had I been taking guitar lessons when I bought the new "
+    "guitar amp?",
+    # auxiliary/pronoun variants — the TEMPLATE is the contract, not the
+    # census's vocabulary
+    "how long have I been studying spanish when i moved to madrid?",
+    "How long has she been working at the clinic when the merger "
+    "happened?",
+    "How long had the narrator been living in Berlin when the wall fell?",
+]
+
+
+@pytest.mark.parametrize("question", _DURATION_STATE_FIRE)
+def test_duration_state_fires(question):
+    """#2654: "how long had I been <state> when <event>" is the state-entry
+    anchor shape — no longer the blanket duration rejection. It needs a
+    state's ENTRY date and the as-of anchor, so it is not an interval (no
+    two named events)."""
+    assert classify_question(question) is AssemblyShape.DURATION_STATE
+
+
+def test_duration_state_extraction_peels_the_state_predicate():
+    """The STATE span is a PREDICATED state, not an entity name: the lead
+    predicate is peeled so the resolver probes the ENTITY, never the
+    predicate phrase. The "when <event>" clause is deliberately NOT a
+    second term — the window's other end is the as-of date the caller
+    supplies, so a second term would gate the shape on a span the
+    arithmetic never reads."""
+    assert extract_subject_terms(
+        "How long had I been a member of 'Book Lovers Unite' when I "
+        "attended the meetup?") == ["'Book Lovers Unite'"]
+    assert extract_subject_terms(
+        "How long had I been watching stand-up comedy specials regularly "
+        "when I attended the open mic night?") == ["stand-up comedy specials"]
+    assert extract_subject_terms(
+        "How long had I been taking guitar lessons when I bought the new "
+        "guitar amp?") == ["guitar lessons"]
+    # no predicate lead -> the _clean-ed span survives unchanged
+    assert extract_subject_terms(
+        "How long had I been bird watching when I attended the "
+        "workshop?") == ["bird watching"]
+    # exactly ONE term per duration-state question
+    assert len(extract_subject_terms(
+        "How long had I been using the new area rug when I rearranged my "
+        "living room furniture?")) == 1
+    # no state span to peel (empty template capture) -> no terms at all
+    assert extract_subject_terms("How long had I been when I left?") == []
+
+
+def test_duration_state_both_halves_is_the_single_subject_gate():
+    """#2654: the state-entry shape has ONE graph anchor (the state
+    subject); the as-of date needs no resolution. So it takes the
+    single-subject gate — one resolved subject fires, an unresolved or
+    empty one does not."""
+    res = ResolveResult(
+        candidates=(_cand("obj-club", "Book Lovers Unite", 0),),
+        unresolved=())
+    assert res.both_halves_ok(AssemblyShape.DURATION_STATE) is True
+    assert ResolveResult().both_halves_ok(
+        AssemblyShape.DURATION_STATE) is False
+    assert ResolveResult(
+        candidates=(_cand("obj-x", "x", 0),),
+        unresolved=("term",)).both_halves_ok(
+            AssemblyShape.DURATION_STATE) is False
+    # the two-subject shapes keep the both-halves gate (no relaxation)
+    assert ResolveResult(
+        candidates=(_cand("obj-x", "x", 0),),
+        unresolved=()).both_halves_ok(AssemblyShape.INTERVAL) is False
+
+
+def test_duration_state_does_not_steal_interval_or_rejected_forms():
+    """#2654 no-regression at the classifier: the new template changes no
+    other shape's verdict — the since-until interval still classifies
+    INTERVAL, the rejected duration forms stay None, and a relative offset
+    still kills the duration-state form itself (R13)."""
+    assert classify_question(
+        "how many days had passed since I bought the couch when I sold the "
+        "dog bed?") is AssemblyShape.INTERVAL
+    for q in [
+        "How long have I been working before I started my current job at "
+        "NovaTech?",
+        "How long did I take to finish 'A' and 'B' combined?",
+        "How old was I when I moved to the United States?",
+        # R13: 'ago' kills the duration-state form too
+        "How long had I been a member of 'Book Lovers Unite' two weeks ago "
+        "when I attended the meetup?",
     ]:
         assert classify_question(q) is None, q
         assert extract_subject_terms(q) == [], q
@@ -1435,6 +1602,7 @@ def test_resolver_docker_embedder_on_name_match_survives_vector_crowd(
 # ══════════════════════════════════════════════════════════════════════════
 
 from tortoise.assembly import (  # noqa: E402
+    _state_entry_date,
     collect_slices,
     docker_walker_port,
 )
@@ -2119,6 +2287,120 @@ def test_render_interval_diff_via_shared_helper():
     assert hits[0]["content"] == \
         "22 days between buying the couch and selling the couch", \
         f"interval golden drifted: {hits[0]['content']!r}"
+
+
+def test_render_duration_state_entry_anchor_and_asof_span():
+    """#2654: the duration-state render states the two anchors it used. The
+    graph end is the subject's state entry — the ObjectRegistered stamp or
+    the earliest dated row, whichever is EARLIER (this fixture carries no
+    stamp, so the status-start fallback supplies 2026-08-10) — and the other
+    end is the caller's as-of date."""
+    from datetime import date as _d
+
+    slices, _ = _rfixture_current()
+    assert _state_entry_date(slices, "obj-couch") == _d(2026, 8, 10)
+    hits = synthesize_hits(slices, shape=AssemblyShape.DURATION_STATE,
+                           candidates=[_cand("obj-couch", "couch", 0)],
+                           question_date="2026-09-10")
+    lines = [h["content"] for h in hits if h["kind"] == "duration-state"]
+    assert lines == [
+        "STATE ENTRY (couch): 2026-08-10",
+        "31 days from couch state entry (2026-08-10) to the as-of date "
+        "(2026-09-10)",
+    ], lines
+
+
+def test_render_duration_state_entry_takes_earlier_of_stamp_and_rows():
+    """#2654: the entry is min(stamp, earliest dated row). The v2 lane's
+    ObjectRegistered stamp is the INGEST clock, so a recorded row MUST be
+    able to pull the anchor EARLIER — and a late stamp must never push it
+    later. (The Book-Lovers-Unite shape: registered at ingest 2026-09-20,
+    the membership recorded 2026-05-07.)"""
+    from datetime import date as _d
+
+    g = {"obj-club": {
+        "state": {"object_id": "obj-club", "name": "Book Lovers Unite",
+                  "status": "live", "superseded_by": None,
+                  "superseded_at": None,
+                  "created_at": "2026-09-20T00:00:00Z"},   # ingest clock
+        "points": [{"object_id": "obj-club", "kind": "point",
+                    "id": "p-join", "content": "joined the club",
+                    "when": "2026-05-07", "created_at": "2026-05-07",
+                    "status": "live"}],
+        "events": []}}
+    cands = [_cand("obj-club", "Book Lovers Unite", 0)]
+    slices = collect_slices(_DictWalkerPort(g), cands,
+                            shape=AssemblyShape.DURATION_STATE)
+    assert _state_entry_date(slices, "obj-club") == _d(2026, 5, 7)
+    hits = synthesize_hits(slices, shape=AssemblyShape.DURATION_STATE,
+                           candidates=cands, question_date="2026-05-28")
+    lines = [h["content"] for h in hits if h["kind"] == "duration-state"]
+    assert lines == [
+        "STATE ENTRY (Book Lovers Unite): 2026-05-07",
+        "21 days from Book Lovers Unite state entry (2026-05-07) to the "
+        "as-of date (2026-05-28)",
+    ], lines
+    # the anchor can never be dated AFTER the as-of: an entry outside the
+    # question's window is NOT an entry, so the whole duration-state pair is
+    # suppressed (the row dates are already as-of-windowed by the walker —
+    # only the ObjectRegistered stamp can fall outside it)
+    hits2 = synthesize_hits(slices, shape=AssemblyShape.DURATION_STATE,
+                            candidates=cands, question_date="2026-05-01")
+    assert [h["content"] for h in hits2
+            if h["kind"] == "duration-state"] == []
+
+
+def test_render_duration_state_honest_absence():
+    """#2654 honest-absence: no usable entry -> NO anchor line (never a
+    fabricated date); no as-of date -> the anchor line alone (the span is
+    never computed against an invented 'today')."""
+    g = {"obj-x": {"state": {"object_id": "obj-x", "name": "mystery",
+                              "status": "live", "superseded_by": None,
+                              "superseded_at": None},
+                   "points": [{"object_id": "obj-x", "kind": "point",
+                               "id": "p-u", "content": "undated",
+                               "when": None,
+                               "created_at": "1970-01-01T00:00:00Z",
+                               "status": "live"}],
+                   "events": []}}
+    cands = [_cand("obj-x", "mystery", 0)]
+    slices = collect_slices(_DictWalkerPort(g), cands,
+                            shape=AssemblyShape.DURATION_STATE)
+    assert _state_entry_date(slices, "obj-x") is None
+    hits = synthesize_hits(slices, shape=AssemblyShape.DURATION_STATE,
+                           candidates=cands, question_date="2026-09-10")
+    assert [h["content"] for h in hits
+            if h["kind"] == "duration-state"] == []
+    # dated subject, no as-of supplied
+    slices2, _ = _rfixture_current()
+    hits2 = synthesize_hits(slices2, shape=AssemblyShape.DURATION_STATE,
+                            candidates=[_cand("obj-couch", "couch", 0)])
+    assert [h["content"] for h in hits2
+            if h["kind"] == "duration-state"] == \
+        ["STATE ENTRY (couch): 2026-08-10"]
+    # the ingest-clock leak the as-of guard exists for: the subject has NO
+    # dated row, so its only candidate date is the ObjectRegistered stamp —
+    # and that stamp is the v2 lane's INGEST time, AFTER the historical
+    # as-of. An entry outside the window is not an entry: no anchor line.
+    g2 = {"obj-club": {
+        "state": {"object_id": "obj-club", "name": "Book Lovers Unite",
+                  "status": "live", "superseded_by": None,
+                  "superseded_at": None,
+                  "created_at": "2026-09-20T00:00:00Z"},  # the ingest clock
+        "points": [{"object_id": "obj-club", "kind": "point",
+                    "id": "p-u", "content": "joined the club",
+                    "when": None,
+                    "created_at": "1970-01-01T00:00:00Z",
+                    "status": "live"}],
+        "events": []}}
+    cands2 = [_cand("obj-club", "Book Lovers Unite", 0)]
+    slices3 = collect_slices(_DictWalkerPort(g2), cands2,
+                             shape=AssemblyShape.DURATION_STATE)
+    assert _state_entry_date(slices3, "obj-club") is not None  # stamp only
+    hits3 = synthesize_hits(slices3, shape=AssemblyShape.DURATION_STATE,
+                            candidates=cands2, question_date="2023-05-28")
+    assert [h["content"] for h in hits3
+            if h["kind"] == "duration-state"] == []
 
 
 def test_render_same_name_collision_two_sections():
