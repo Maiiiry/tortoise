@@ -123,6 +123,10 @@ TIMESTAMPTZ_COLUMNS: set[tuple[str, str]] = {
     ("invitations", "otp_expires_at"),
     ("invitations", "otp_sent_at"),
     ("invitations", "otp_verified_at"),
+    # #7968 the record: the journal's own append-only envelope (the event
+    # stream layer). recorded_at is the row's write clock, not an ontology
+    # property — the ontology instants ride the payload verbatim.
+    ("journal_event", "recorded_at"),
     ("link_intents", "consumed_at"),
     ("link_intents", "created_at"),
     ("link_intents", "expires_at"),
@@ -132,6 +136,9 @@ TIMESTAMPTZ_COLUMNS: set[tuple[str, str]] = {
     ("metering_records", "updated_at"),
     ("metering_unmetered_increments", "first_observed_at"),
     ("metering_unmetered_increments", "last_observed_at"),
+    # #7968 the record: the (label, key) identity registry — one row per node in
+    # every layer. key_property is generated from node_label (W1's contract).
+    ("node_identity", "created_at"),
     ("oauth_access_tokens", "created_at"),
     ("oauth_access_tokens", "expires_at"),
     ("oauth_access_tokens", "revoked_at"),
