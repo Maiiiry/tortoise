@@ -154,7 +154,12 @@ tortoise = ["config/routing.yaml", "../tests/sample_transcript.txt",
           # wheel without it fails the install with "shipped capture extension
           # not found". Named exactly (not *.ts) so the behavioural test file is
           # NOT shipped to users.
-          "pi-hooks/tortoise-capture.ts"]
+          "pi-hooks/tortoise-capture.ts",
+          # #2121: the Hermes seam ships as a directory PLUGIN (`tortoise
+          # install hermes` copies plugin.yaml + __init__.py into
+          # <dir>/.hermes/plugins/tortoise-volunteer/), so a wheel without it
+          # fails the install with "shipped Hermes plugin not found".
+          "hermes-plugin/*.py", "hermes-plugin/*.yaml"]
 # Quoted key (TOML dot-key): ships every packs/<ns>/manifest.yaml as
 # tortoise/packs/<ns>/manifest.yaml in the wheel (recursive glob — a pack
 # added by a later slice, e.g. #1933 agent-ops, needs no pyproject change).

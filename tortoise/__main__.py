@@ -3025,7 +3025,7 @@ def _install_read_hook_impl(args) -> int:
     - The shipped hook path is shlex-quoted into every registration command
       so spaces/quotes in the install path cannot break the harness exec.
     """
-    import json as _json, os as _os, shlex as _shlex, sys as _sys  # noqa: E401, I001
+    import json as _json, os as _os, shlex as _shlex, shutil as _shutil, sys as _sys  # noqa: E401, I001
     from pathlib import Path as _P
 
     if getattr(args, "list", False) or not getattr(args, "harness", None):
@@ -3047,6 +3047,10 @@ def _install_read_hook_impl(args) -> int:
         print("  tortoise install cursor  → ~/.cursor/hooks.json "
               "(the sessionEnd capture hook; Cursor has no shell-hook read "
               "seam. IDE-ONLY: Cursor cloud agent sessions are not captured)")
+        print("  tortoise install hermes  → <dir>/.hermes/plugins/"
+              "tortoise-volunteer/ (the pre_llm_call PLUGIN — Hermes' per-turn "
+              "injection surface; ingestion is `tortoise sessions import "
+              "--harness hermes <state.db>`)")
         print("Other seams (docs/matrix only, this wave): "
               "devin, gemini, opencode — see "
               "docs/research/2026-09-01-gbrain-learnings/platform-seams.md")
@@ -3081,6 +3085,18 @@ def _install_read_hook_impl(args) -> int:
                                     "command": f"{quoted_script} claude"}]}]
     elif harness == "cline":
         target = root / ".cline" / "hooks" / "UserPromptSubmit"
+        registration = None
+    elif harness == "hermes":
+        # Hermes' per-turn surface is the ``pre_llm_call`` PLUGIN hook — a
+        # Python callback, not a shell command (verified against hermes-agent
+        # @ main 2026-10-11: plugins/AGENTS.md + website/docs/developer-guide/
+        # plugins/index.md + agent/turn_context.py). There is therefore no
+        # config file whose "command" can point at volunteer-turn.sh: the read
+        # half installs the shipped plugin DIRECTORY, which Hermes discovers
+        # from ``<root>/.hermes/plugins/`` (project) or ``$HERMES_HOME/plugins/``
+        # (global). ``registration`` stays None — the JSON-merge path below is
+        # for the command-shaped harnesses only.
+        target = root / ".hermes" / "plugins" / "tortoise-volunteer"
         registration = None
     else:
         # Never let a harness with no read seam fall into the cline target —
@@ -3228,6 +3244,79 @@ def _install_read_hook_impl(args) -> int:
             print(f"Installed {target}")
             print("Then enable hooks in Cline settings (Hook feature) — "
                   "project .cline/hooks or global ~/.cline/hooks both work.")
+        return 0
+
+    # ── hermes: a directory PLUGIN (plugin.yaml + __init__.py), not a
+    #    command registration. See the target assignment above for why.
+    #    Ownership is the shipped marker line: an existing
+    #    ``tortoise-volunteer`` directory this installer cannot prove it wrote
+    #    is never overwritten and never deleted (#2383's rule applied to a
+    #    directory-shaped seam). ──────────────────────────────────────────
+    if harness == "hermes":
+        src_dir = Path(__file__).resolve().parent / "hermes-plugin"
+        bundled = {name: src_dir / name
+                   for name in ("plugin.yaml", "__init__.py")}
+        missing = sorted(n for n, p in bundled.items() if not p.is_file())
+        if missing:
+            print(f"shipped Hermes plugin not found ({', '.join(missing)} "
+                  f"under {src_dir}) — cannot install", file=_sys.stderr)
+            return 1
+        marker = "tortoise-hermes-plugin"
+        if target.exists() and not target.is_dir():
+            print(f"{target} exists and is not a directory — refusing to "
+                  "touch it.", file=_sys.stderr)
+            return 1
+        ours = False
+        if target.is_dir():
+            try:
+                ours = marker in (target / "__init__.py").read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                ours = False
+            if not ours:
+                if uninstall:
+                    print(f"{target} is not our {marker} plugin — refusing "
+                          "to delete it.", file=_sys.stderr)
+                else:
+                    print(f"{target} already exists and is not our "
+                          f"{marker} plugin — refusing to overwrite it. "
+                          "Move it aside or install into another dir.",
+                          file=_sys.stderr)
+                return 1
+        if dry:
+            verb = "uninstall from" if uninstall else "write"
+            print(f"[dry-run] would {verb} {target}:")
+            for name in sorted(bundled):
+                print(f"  {name}")
+            return 0
+        if uninstall:
+            # Remove ONLY the files this installer wrote. Anything else left in
+            # the directory (a user's extra module, a __pycache__ Hermes's own
+            # import created) keeps the directory alive — an uninstall must
+            # never delete config it cannot prove it created.
+            for name in bundled:
+                (target / name).unlink(missing_ok=True)
+            cache = target / "__pycache__"
+            if cache.is_dir():
+                _shutil.rmtree(cache, ignore_errors=True)
+            leftovers = sorted(p.name for p in target.iterdir())
+            if leftovers:
+                print(f"Removed the {marker} plugin files from {target} — "
+                      f"left unrelated files in place: "
+                      f"{', '.join(leftovers)}")
+            else:
+                target.rmdir()
+                print(f"Removed {target}")
+            return 0
+        target.mkdir(parents=True, exist_ok=True)
+        for name, src in sorted(bundled.items()):
+            (target / name).write_text(
+                src.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"{'Updated' if ours else 'Installed'} {target}")
+        print("Hermes discovers project plugins from ./.hermes/plugins/ (and "
+              "global ones from $HERMES_HOME/plugins/). Validate with "
+              "`hermes plugins doctor --ci`; session ingestion is "
+              "`tortoise sessions import --harness hermes <state.db>`.")
         return 0
 
     # ── codex / claude: JSON registration file (merge-aware). ──────────
@@ -9844,12 +9933,16 @@ def main(argv: list[str] | None = None) -> int:
              "(requires TORTOISE_CAPTURE=1 — explicit consent; a credential "
              "is not consent)")
     sess_import.add_argument("--file", required=True,
-                             help="Path to the session transcript (JSONL or text)")
+                             help="Path to the session transcript (JSONL, text, "
+                                  "or a Hermes state.db[::session-id])")
     sess_import.add_argument(
         "--harness", required=True,
-        choices=["codex", "claude-desktop", "desktop", "cursor", "pi"],
+        choices=["codex", "claude-desktop", "desktop", "cursor", "hermes",
+                 "pi"],
         help="Harness format to parse (each harness has its own record "
-             "shape; 'desktop' is an alias for claude-desktop)")
+             "shape; 'desktop' is an alias for claude-desktop; 'hermes' reads "
+             "$HERMES_HOME/state.db and selects its most recent session "
+             "unless the path carries '::<session-id>')")
     sess_import.add_argument(
         "--session-id", default=None,
         help="Explicit idempotency key (default: content-hash derived)")
@@ -9896,8 +9989,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Install a harness seam (per-turn memory hook + session capture)")
     inst.add_argument(
         "harness", nargs="?",
-        choices=["codex", "claude", "cline", "cursor", "pi"],
-        help="Harness to install (codex | claude | cline | cursor | pi)")
+        choices=["codex", "claude", "cline", "cursor", "hermes", "pi"],
+        help="Harness to install (codex | claude | cline | cursor | hermes | pi)")
     inst.add_argument(
         "--dir", default=".",
         help="Project directory to install into (default: cwd)")

@@ -34,6 +34,11 @@ Supported stores:
     — the shape Cursor's ``Tgd``/``ECf`` emit (verified against the installed
     bundle, Cursor 3.20.21).  The optional ``metadata`` header and the
     ``turn_ended`` markers carry no ``role`` and are skipped.
+  - ``hermes``: Hermes (NousResearch/hermes-agent) ``$HERMES_HOME/state.db``
+    — SQLite ``sessions`` + ``messages`` tables, MANY sessions per file (the
+    only many-per-file store here).  ``<state.db>`` selects the most recent
+    session; ``<state.db>::<session-id>`` selects one explicitly.  Read
+    ``mode=ro`` — the store is never mutated (#2121).
 """
 from __future__ import annotations
 
@@ -78,9 +83,16 @@ def window_turns(turns: list[dict]) -> tuple[list[dict], int]:
 
 def _text_from_parts(parts) -> str:
     """Flatten an LLM content array (codex input_text/output_text, Claude
-    text blocks) into one string. Non-text parts are skipped."""
+    text blocks) into one string. Non-text parts are skipped.
+
+    The STRING branch trims: every caller treats the result as an utterance
+    and skips it on falsiness (``if not text``), so an untrimmed
+    whitespace-only string was a phantom turn — while the list branch above
+    already trimmed each part (#2121 caught it through the Hermes store, but
+    it reached the legacy string-shaped codex records too).
+    """
     if isinstance(parts, str):
-        return parts
+        return parts.strip()
     if not isinstance(parts, list):
         return ""
     out = []
@@ -218,10 +230,139 @@ def parse_cursor(path: str | Path) -> list[dict]:
     return _walk_codex_records(Path(path), role_key="cursor")
 
 
+# Hermes `state.db` selector separator: ``<state.db>::<session-id>``.
+#
+# Hermes is the FIRST harness whose store holds MANY sessions in ONE file — a
+# SQLite ``$HERMES_HOME/state.db`` with ``sessions`` + ``messages`` tables
+# (verified against hermes-agent @ main, 2026-10-11: `hermes_state.py`
+# ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``; the DDL lives in
+# `hermes_state_common.py`). Every other parser here reads a transcript that
+# already IS one session (codex/pi/claude/cursor: one file per session), so
+# the shared ``parse_transcript(path, harness)`` signature has no session
+# argument to carry. The selector keeps that signature intact for the common
+# case (``state.db`` alone → the most recent session) and gives the escape
+# hatch for a specific one without inventing a new CLI flag or changing the
+# parser dispatch contract.
+_HERMES_SELECTOR = "::"
+
+
+def _hermes_split_selector(path: str | Path) -> tuple[Path, str | None]:
+    """Split ``<state.db>::<session-id>`` into (db path, session id or None)."""
+    raw = str(path)
+    db, sep, session_id = raw.rpartition(_HERMES_SELECTOR)
+    if not sep or not db:
+        return Path(raw), None
+    return Path(db), (session_id.strip() or None)
+
+
+def _hermes_rows(conn, sql: str, params: tuple = ()):
+    """Run one read against the store, converting every sqlite failure into
+    an honest ``ValueError`` (the CLI surfaces it as a parse failure and
+    writes a breadcrumb — never a silent 0-turn import)."""
+    import sqlite3
+    try:
+        return conn.execute(sql, params).fetchall()
+    except sqlite3.DatabaseError as e:
+        raise ValueError(f"cannot read Hermes session store: {e}") from e
+
+
+def parse_hermes(path: str | Path) -> list[dict]:
+    """Parse a Hermes `state.db` session into conversation turns.
+
+    Hermes (NousResearch/hermes-agent) keeps its sessions in ONE SQLite file
+    — ``$HERMES_HOME/state.db`` (default ``~/.hermes/state.db``), tables
+    ``sessions`` (``id``, ``started_at``, ...) and ``messages`` (``session_id``,
+    ``role``, ``content``, ``active``, ``_compressed_summary``, ordered by
+    ``id`` — ``timestamp`` is NOT monotonic, the store's own reads page by
+    ``id``: `hermes_state_messages.py::get_messages`).
+
+    Selection:
+      * ``<state.db>`` — the most recently started session
+        (``started_at DESC, id DESC``; deterministic ties);
+      * ``<state.db>::<session-id>`` — that explicit session.
+
+    Row filter — the LIVE model-visible transcript, which is what a memory
+    backfill should capture:
+      * ``active = 1`` (``active = 0`` rows are rewound/taken-back turns);
+      * ``_compressed_summary = 0`` (post-compaction summary rows are
+        GENERATED text, not an utterance — capturing them would file the
+        summariser as a user);
+      * ``role IN ('user', 'assistant')`` (tool/system/session_meta rows are
+        context noise, skipped — never coerced).
+
+    Reads ONLY: the connection is opened ``mode=ro`` so a live/recent Hermes
+    store is never mutated (Hermes runs WAL + a cross-process write guard; a
+    writable open could create ``-wal``/``-shm`` under it). A WAL store whose
+    ``-shm`` has been reaped needs a writable directory to init read-only, so
+    quit Hermes before backfilling if SQLite refuses the open — the refusal
+    is surfaced honestly, never worked around by opening writable.
+
+    NOT walked: Hermes' compression lineage (``sessions.parent_session_id``,
+    the ``include_ancestors`` read in ``get_messages_as_conversation``). A
+    rotation after compaction puts the pre-rotation transcript in a parent
+    session; this parser reads the one selected session. Filed as #8113 rather
+    than silently absorbed.
+    """
+    import sqlite3
+
+    db_path, wanted_session = _hermes_split_selector(path)
+    if not db_path.exists():
+        raise ValueError(f"Hermes session store not found: {db_path}")
+    if db_path.is_dir():
+        candidate = db_path / "state.db"
+        if not candidate.exists():
+            raise ValueError(
+                f"Hermes session store is a directory without a state.db: "
+                f"{db_path}")
+        db_path = candidate
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        raise ValueError(
+            f"cannot open Hermes session store {db_path} read-only: {e}") from e
+    conn.row_factory = sqlite3.Row
+    try:
+        if wanted_session:
+            session_id = wanted_session
+            known = _hermes_rows(
+                conn, "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                (session_id,))
+            if not known:
+                raise ValueError(
+                    f"no Hermes session {session_id!r} in {db_path}")
+        else:
+            newest = _hermes_rows(
+                conn,
+                "SELECT id FROM sessions ORDER BY started_at DESC, id DESC "
+                "LIMIT 1")
+            if not newest:
+                raise ValueError(
+                    f"no sessions in Hermes session store {db_path}")
+            session_id = str(newest[0]["id"])
+        rows = _hermes_rows(
+            conn,
+            "SELECT role, content FROM messages WHERE session_id = ? "
+            "AND active = 1 AND _compressed_summary = 0 "
+            "AND role IN ('user', 'assistant') ORDER BY id ASC",
+            (session_id,))
+    finally:
+        conn.close()
+
+    turns: list[dict] = []
+    for row in rows:
+        text = _text_from_parts(row["content"])
+        if not text:
+            continue
+        turns.append({"role": row["role"], "content": text})
+    return turns
+
+
 PARSERS: dict[str, Callable[[str | Path], list[dict]]] = {
     "codex": parse_codex,
     "claude-desktop": parse_claude_desktop,
     "cursor": parse_cursor,
+    "hermes": parse_hermes,
     "pi": parse_pi,
 }
 
