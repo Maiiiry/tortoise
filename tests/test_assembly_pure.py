@@ -383,6 +383,20 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         "What did I do two until five weeks ago?",
         "What did I do two up to five weeks ago?",
         "What did I do two–five weeks ago?",   # U+2013, no word connector
+        # ... and the range's LEFT side is not only a BARE bound: the same
+        # class the digit-only left bound left half-open, one level down — a
+        # left bound that repeats its unit, a quantifier left, a teen word
+        # and a connector outside the first pass's list all promoted the
+        # RIGHT bound as the count
+        "What did I do from 2 weeks to 3 months ago?",
+        "What did I do from one week to three weeks ago?",
+        "What did I do 2 weeks or 5 weeks ago?",
+        "What did I do 2 til 5 weeks ago?",
+        "What did I do 2 upto 5 weeks ago?",
+        "What did I do 2 up until 5 weeks ago?",
+        "What did I do several to five weeks ago?",
+        "What did I do a few to five weeks ago?",
+        "What did I do thirteen to five weeks ago?",
         # a multi-part NUMERAL is the same defect for digits: `_RE_AGO_OFFSET`
         # reads `\d+`, so it matches the LAST digit run alone — '2.5 weeks
         # ago' anchored at 5 weeks and '2,000 days ago' at 0 days (a window

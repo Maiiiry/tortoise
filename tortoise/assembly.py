@@ -199,14 +199,38 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #     5-week window alone. The LEFT bound must be a NUMBER, word or digit —
 #     a digit-only left bound leaves the class half-open, because the spelled
 #     spelling ('two to five weeks ago' → count 5) escapes it.
-_NUM_WORDS = (r"(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|"
-              r"eleven|twelve|twenty|thirty|forty|fifty|sixty|seventy|"
-              r"eighty|ninety|hundred|thousand|million)")
+#: a count-like token. This must be a SUPERSET of what `_RE_AGO_OFFSET`
+#: READS (that template's group stops at `twelve`, which is exactly why the
+#: guard needs the tens/scale words: it exists to reject the counts the
+#: template would read WRONG), and it carries the approximate quantifiers the
+#: template accepts ('a couple of', 'a few', 'several') because a range can
+#: have one on its left. The CLASS is closed (the English cardinal words +
+#: the quantifiers), so listing it is complete — unlike a separator or a
+#: connector, where 'some other spelling' is open-ended.
+_NUM_WORDS = (r"(?:a\s+couple\s+of|couple\s+of|a\s+few|few|several|a|an|"
+              r"one|two|three|four|five|six|seven|eight|nine|ten|"
+              r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+              r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|"
+              r"sixty|seventy|eighty|ninety|hundred|thousand|million)")
+#: the unit vocabulary, shared with `_RE_AGO_OFFSET`
+_AGO_UNITS = r"(?:days?|weeks?|months?|years?)"
+#: a RANGE's LEFT side: a count-like token that may carry its OWN unit
+#: ('from 2 weeks to 3 months ago') or none ('2 to 5 weeks ago'). The unit
+#: is optional because both spellings are natural, and the left side is built
+#: from `_NUM_WORDS` rather than enumerated: enumerating BARE left bounds is
+#: what left the class half-open ('two to five', 'several to five',
+#: 'from 2 weeks to 3 months' all escaped a `\d+`-only left bound).
+_RANGE_LEFT = r"(?:" + _NUM_WORDS + r"|\d+)(?:\s+" + _AGO_UNITS + r")?"
+#: the range connectors — a small CLOSED class, unlike a separator (which is
+#: why this one may be enumerated: there is no principled way to say 'any
+#: separator' for words, and a new English synonym is not the failure mode
+#: the guard exists for).
+_RANGE_CONN = (r"(?:up\s+to|up\s+until|upto|to|and|or|through|thru|until|"
+               r"till|til)")
 _RE_COMPOUND_NUMBER = re.compile(
     r"\b" + _NUM_WORDS + r"\b(?:[\W]|\band\b)+$"
     r"|\d\W*$"
-    r"|\b(?:" + _NUM_WORDS + r"|\d+)"
-    + r"\W+(?:to|and|or|through|thru|until|till|up\s+to)\W+$",
+    r"|\b" + _RANGE_LEFT + r"\W+" + _RANGE_CONN + r"\W+$",
     re.IGNORECASE)
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how
