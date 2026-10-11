@@ -122,6 +122,9 @@ surfaces:
   - test_battery_parity_mabench_run.py
   - test_battery_parity_mabench_tortoise.py
   - test_battery_parity_migration.py
+  # #3065: bounded-socket guard for the raw FalkorDB clients in the product
+  # package (dual-registered with `core`, its fallback surface — see there).
+  - test_bounded_raw_clients_3065.py
   # #2922/#2923: DB-free static guards for boot-path regressions (credential
   # redaction in entrypoint.sh, function-scope import shadowing in _lifespan).
   # Registered under `api` as well as `core` deliberately: the file it guards most
@@ -1122,6 +1125,16 @@ surfaces:
   - test_backup_sweep.py
   - test_backup_watcher.py
   - test_bfs_audit.py
+  # #3065: every raw FalkorDB client in `tortoise/` must carry a bounded
+  # socket READ (`session_indexer`'s graph-entity lookup carried none — an
+  # unbounded `recv()` — and `backup`/`__main__` carried knob-blind literals).
+  # DUAL-REGISTERED with `api` for the reason every dual entry above exists:
+  # `tortoise/__main__.py` is an exact `api` SOURCE_PATTERN match, and the
+  # file guards a construction site in that module — an `__main__.py`-only
+  # change must run it. `tortoise/session_indexer.py` and `tortoise/backup.py`
+  # match no named pattern, so they fall through to `core`: without THIS entry
+  # the guard would not run on a change to the site it was written for.
+  - test_bounded_raw_clients_3065.py
   - test_boot_regressions.py
   - test_collision_preflight.py
   - test_who_is_on.py  # #4256: "who is on #N?" verb — local-only branches/worktrees included
