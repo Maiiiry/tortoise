@@ -189,12 +189,18 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #: that is what ends the scan, and so what makes a legitimately standalone
 #: count ('I bought 2 things 3 days ago' → 3) promote.
 #:
-#: ⛔ THE LIMIT, STATED HONESTLY: this vocabulary is a CLOSED list, and a
-#: connective that is not in it ends the scan and lets the count promote. That
-#: is the residual of the class (#8097): an unlisted connective in a range
-#: ('2 to <unlisted> 5 weeks ago') still promotes 5. It is bounded work, not
-#: an invariant over natural language, and the direction is recorded here so
-#: the next reader does not over-trust it.
+#: ⛔ THE LIMIT, STATED HONESTLY. TWO residuals, both bounded work rather than
+#: an invariant over natural language:
+#:   (a) a CONNECTIVE that is not in the list below ends the scan and lets the
+#:       count promote, so a range written with it ('2 to <unlisted> 5 weeks
+#:       ago') still promotes 5;
+#:   (b) a NUMERAL spelling the digit/unit split below does not recognise —
+#:       a numeral in words the number set does not carry, or a unit
+#:       abbreviation outside `_NUMERAL_UNIT_SUFFIXES` — likewise ends the
+#:       scan, so a range's left bound written that way promotes the right
+#:       bound.
+#: Both directions are recorded here so the next reader does not over-trust the
+#: guard.
 _NUMBER_CONTINUATION_WORDS = frozenset({
     # conjunctions and range connectors — 'up' is here precisely so that
     # EVERY 'up <connector>' spelling ('up to', 'up till', 'up through',
@@ -244,20 +250,43 @@ _NUMBER_WORDS = frozenset({
 })
 #: a numeral token may carry a fraction glyph the tokenizer does not split
 #: off ('1½', '3¾') and still be a number; but a token whose digits are joined
-#: to LETTERS ('3pm', '4k', '5G', '3rd') is NOT a number span — it is a time,
-#: a quantity label or an ordinal, and a count after it is a whole number.
-#: (`origin/main` agreed for the first three: its branch matched a digit
-#: followed only by non-word characters, so 'at 3pm 5 days ago' promoted 5.)
+#: to LETTERS is a number only when those letters are its UNIT ('2wks', '24h',
+#: '2mo') — otherwise it is a time, a quantity label or an ordinal ('3pm',
+#: '4k', '5G', '3rd') and a count after it is a whole number.
+#:
+#: The distinction matters in ONE direction more than the other. Treating a
+#: glued numeral as NOT a number deletes a range's left bound from the scan,
+#: so '2wks to 5 days ago' would promote the RIGHT bound — the wrong-window
+#: failure the guard exists to prevent. Treating it as a number costs the
+#: promotion on 'at 3pm 5 days ago', which falls back to the legacy lane and
+#: never anchors wrongly. Where the two collide, fail safe.
+_NUMERAL_UNIT_SUFFIXES = frozenset({
+    "d", "day", "days", "w", "wk", "wks", "week", "weeks",
+    "mo", "mos", "month", "months", "y", "yr", "yrs", "year", "years",
+    "h", "hr", "hrs", "hour", "hours", "m", "min", "mins", "minute",
+    "minutes", "s", "sec", "secs", "second", "seconds",
+})
 _FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
+
+
+def _is_numeric(ch: str) -> bool:
+    return ch.isdigit() or ch in _FRACTION_GLYPHS
 
 
 def _is_number_token(token: str) -> bool:
     """True when `token` IS a bound of a number expression."""
-    low = token.lower()
-    if low in _NUMBER_WORDS:
+    if not token:
+        return False
+    if token.lower() in _NUMBER_WORDS:
         return True
-    return bool(token) and all(
-        ch.isdigit() or ch in _FRACTION_GLYPHS for ch in token)
+    if all(_is_numeric(ch) for ch in token):
+        return True
+    split = 0
+    while split < len(token) and _is_numeric(token[split]):
+        split += 1
+    if split == 0:
+        return False
+    return token[split:].lower() in _NUMERAL_UNIT_SUFFIXES
 
 
 def _continues_number(token: str) -> bool:

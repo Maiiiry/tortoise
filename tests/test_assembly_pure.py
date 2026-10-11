@@ -531,6 +531,10 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("at 3pm ", False),          # a digit joined to LETTERS is not a number
         ("at 4k ", False),
         ("at 5G ", False),
+        ("2wks to ", True),          # ... unless the letters are its UNIT
+        ("24h to ", True),
+        ("2mo to ", True),
+        ("3d to ", True),
         ("between 2 and about ", True),   # a connective CHAIN
         ("2 to roughly ", True),
         ("from 2 up to and including ", True),
@@ -567,7 +571,7 @@ def test_count_fragment_scan_ignores_a_preceding_ordinal():
     to letters — a time if it ends in 'pm', a label if it ends in 'k'/'G'."""
     for prefix in ("on 3rd, ", "on the 22nd, ", "since the 1st, ",
                    "what did I do at 3pm ", "I raised 4k ",
-                   "the 5G ", "on 3d "):
+                   "the 5G "):
         assert _count_is_fragment(prefix) is False, prefix
 
 
