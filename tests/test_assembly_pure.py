@@ -349,6 +349,13 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         # units wrong
         "What did I do twenty two weeks ago?",
         "What did I do thirty one days ago?",
+        # ... for EVERY separator spelling: a hyphen is a word separator, so
+        # 'twenty-one' presents the same `\b` to the offset template and
+        # must reject identically (a whitespace-only guard read 'one' and
+        # anchored a 21-week question at one week)
+        "What did I do twenty-one weeks ago?",
+        "What did I do thirty–one days ago?",
+        "What did I do thirty—one days ago?",
     ]:
         assert classify_question(q) is None, q
         assert extract_subject_terms(q) == [], q
@@ -475,18 +482,22 @@ def test_relative_anchor_recency_is_an_open_as_of_window():
     assert (a.window_hi - a.window_lo).days == 400
 
 
-def test_relative_anchor_base_question_strips_the_time_clause():
-    """The anchor carries the question's BASE form (the time clause
-    removed) so the caller can classify/extract the underlying question.
-    The base of an as-of state question is the CURRENT_STATE template, and
-    the CURRENT_STATE shape itself is NOT what the past-time question
-    routes to (the R13 intent, preserved)."""
-    q = "what is the current status of the couch two weeks ago?"
-    assert classify_question(q) is AssemblyShape.AGO_RELATIVE
-    a = resolve_relative_anchor(q, "2026-09-10")
-    assert a is not None
-    assert a.base_question == "what is the current status of the couch?"
-    assert classify_question(a.base_question) is AssemblyShape.CURRENT_STATE
+def test_resolver_and_router_agree_on_the_shape_boundary():
+    """The resolver is the router's second half, not a parallel definition
+    of the boundary. A question ``classify_question`` does NOT route to
+    AGO_RELATIVE must never yield an anchor, even when a promoted offset is
+    textually present — ``_relative_guarded`` alone is only the two-subject
+    half of that boundary. (Before this was pinned, 'How long had I been X
+    two weeks ago when Y' classified as None but resolved to a window, so a
+    caller that skipped the router could fire the wrong shape.)"""
+    q = ("How long had I been a member of 'Book Lovers Unite' two weeks "
+         "ago when I attended the meetup?")
+    assert classify_question(q) is None
+    assert resolve_relative_anchor(q, "2026-09-10") is None
+    # ... while the as-of state question the shape DOES own still resolves
+    q2 = "what is the current status of the couch two weeks ago?"
+    assert classify_question(q2) is AssemblyShape.AGO_RELATIVE
+    assert resolve_relative_anchor(q2, "2026-09-10") is not None
 
 
 def test_relative_anchor_never_raises():
@@ -699,6 +710,12 @@ def test_nary_and_order_instruction_never_fire():
         "latest?",
         "What is the order of the three trips I took in the past three "
         "months, from earliest to latest?",
+        # the SAME ordering instruction spelled with the ATTRIBUTIVE 'most
+        # recent' — only the adverbial 'most recently' names a time, so the
+        # instruction is not promoted (it falls through, as before #2652)
+        "What is the order of the six museums I visited from earliest to "
+        "most recent?",
+        "List the events from most recent to oldest.",
         "How many days passed between the two deep-subject milestones?",
         "When did I buy the couch?",  # date-lookup w/o shape support (v1)
         # 3+ option lists (review r2 P1 — every delimiter family)

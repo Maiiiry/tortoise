@@ -120,13 +120,18 @@ class AssemblyShape(StrEnum):
 #         ``resolve_relative_anchor``)
 #       * 'N days/weeks/months/years ago' + the article/fuzzy determiners
 #         ('a week ago', 'a couple of days ago')
-#       * 'most recently' / 'most recent' (the open as-of window)
+#       * 'most recently' (adverbial — the open as-of window)
 # (b) STILL A GUARD — vocabulary this shape does NOT own:
 #       * 'yesterday'/'tomorrow'/'last <weekday|week|month>'/holidays — the
 #         CALENDAR-ANCHOR family of sibling #2655 (census
 #         relative-date-lookup: Valentine's / last Saturday)
 #       * bare 'latest' / 'the last one' — an ORDERING INSTRUCTION
 #         ('from earliest to latest'), sibling #2653's discovery family
+#       * the ATTRIBUTIVE 'most recent' — the SAME ordering instruction
+#         spelled the other way ('from earliest to most recent'): it is
+#         deliberately NOT promoted, so it falls through to the legacy
+#         lane exactly as it did before #2652. Only the adverbial
+#         'most recently' names a time.
 #     Keeping (b) as a guard is what holds the R13 reject and the
 #     precision floor while (a) becomes a shape.
 _RE_AGO_OTHER = re.compile(
@@ -146,8 +151,11 @@ _RE_AGO_OFFSET = re.compile(
     r"eleven|twelve|\d+|a\s+couple\s+of|couple\s+of|a\s+few|few|"
     r"several)\s+(?P<unit>days?|weeks?|months?|years?)\s+ago\b",
     re.IGNORECASE)
-_RE_MOST_RECENT = re.compile(r"\bmost\s+recently\b|\bmost\s+recent\b",
-                            re.IGNORECASE)
+# the ADVERBIAL recency only. 'most recent' is NOT promoted: as an
+# attributive it is the ordering bound in 'from earliest to most recent',
+# the semantic twin of the guarded bare 'latest' (sibling #2653) — the
+# 2 census recency rows both use 'most recently'.
+_RE_MOST_RECENT = re.compile(r"\bmost\s+recently\b", re.IGNORECASE)
 # the UN-PROMOTED residue: a bare 'ago' the promoted forms above do not
 # consume (minutes/hours/centuries, 'a long time ago'). Checked only AFTER
 # the promoted vocabulary routes, so it can never eat a promoted offset.
@@ -155,9 +163,12 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 # the number words a COMPOUND count can end on ('twenty two weeks ago'):
 # the offset regex matches the trailing word alone, so its presence just
 # before a determiner means the count is NOT the one the regex read.
+# The separator class carries the HYPHENATED/DASHED spellings too: a hyphen
+# is a word separator, so `\b` sees a boundary there ('twenty-one') and the
+# whitespace-only form let the regex read 'one' — a window ~20 units wrong.
 _RE_COMPOUND_NUMBER = re.compile(
     r"\b(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
-    r"thousand|million)\s+$", re.IGNORECASE)
+    r"thousand|million)[\s\-–—]+$", re.IGNORECASE)
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how
 # many <unit> did I spend / had I been", "how long did (I|the narrator)
@@ -185,9 +196,10 @@ _RE_FREQUENCY = re.compile(
     r"have\s+passed\s+since\s+|did\s+it\s+take\s+|"
     r"(?:weeks?|months?|years?)\s+before\s+)",
     re.IGNORECASE)
-# recency / 'most recently / latest' — the ORDERING-INSTRUCTION residue
-# ('latest' as in 'from earliest to latest') stays a guard; 'most recently'
-# is promoted to AGO_RELATIVE above.
+# recency / 'latest' — the ORDERING-INSTRUCTION residue ('latest' as in
+# 'from earliest to latest') stays a guard; the adverbial 'most recently'
+# is promoted to AGO_RELATIVE above, and the attributive 'most recent' is
+# neither promoted nor guarded — it falls through as it always did.
 _RE_RECENCY = re.compile(
     r"\blatest\b|\bthe\s+last\s+one\b", re.IGNORECASE)
 # advice / preference / recommendation (R16 misfire): "which SHOULD I do
@@ -266,8 +278,8 @@ def _relative_match(question: str):
     """Text-only relative-time match for #2652 (no question_date needed).
 
     Returns ``(kind, match)`` where kind is ``"ago-count" | "ago-offset"
-    | "recency"`` and ``match`` is the ``re.Match`` carrying the span (used
-    to build the base question), else None. Text-only on purpose:
+    | "recency"`` and ``match`` is the ``re.Match`` carrying the span, else
+    None. Text-only on purpose:
     ``classify_question`` must stay a pure function of the question, and
     the DATE resolution (which needs question_date) lives in
     :func:`resolve_relative_anchor`.
@@ -298,8 +310,8 @@ def _relative_match(question: str):
 
 
 def _relative_guarded(question: str):
-    """The R13 boundary for the promoted vocabulary (shared by
-    ``classify_question`` and ``extract_subject_terms``).
+    """The R13 boundary for the promoted vocabulary (called by
+    ``classify_question`` and ``resolve_relative_anchor``).
 
     A relative offset inside a TWO-SUBJECT template (ordering / interval)
     stays REJECTED: there the offset is narrative anchor text ('since I
@@ -1896,9 +1908,7 @@ class RelativeAnchor:
 
     ``anchor`` is None for the offset-less forms (count / recency) — the
     window is then the bounded recent past. ``fuzzy`` records whether the
-    count came from an approximate determiner. ``base_question`` is the
-    question with the time clause REMOVED, so a caller can classify the
-    underlying question (e.g. an as-of state question).
+    count came from an approximate determiner.
     """
     kind: str                   # "ago-count" | "ago-offset" | "recency"
     unit: str | None            # "day" | "week" | "month" | "year"
@@ -1906,7 +1916,6 @@ class RelativeAnchor:
     anchor: _date | None
     window_lo: _date | None
     window_hi: _date | None
-    base_question: str = ""
     fuzzy: bool = False
     #: render newest-first (the answer locus for 'most recently' is the
     #: most recent entry, so the surviving budget must hold it first)
@@ -1939,15 +1948,19 @@ def resolve_relative_anchor(question: str,
     qd = _norm_date(question_date)
     if qd is None:
         return None
+    # The two entry points must never disagree about which questions the
+    # shape owns. ``_relative_guarded`` is only the TWO-SUBJECT half of the
+    # boundary; ``classify_question`` also refuses the calendar-anchor,
+    # frequency/count, advice and duration-state families. Gate on it, so a
+    # caller that skips the router is never handed an anchor for a question
+    # the shape does not own (a no-op on the production path, which routes
+    # through ``classify_question`` first).
+    if classify_question(question) is not AssemblyShape.AGO_RELATIVE:
+        return None
     rel = _relative_guarded(question)
     if rel is None:
         return None
     kind, m = rel
-    start, end = m.span()
-    base = " ".join((question[:start] + " " + question[end:]).split())
-    # re-attach punctuation the removed span had separated ('the couch ?' →
-    # 'the couch?') so the base question classifies like the un-suffixed form
-    base = re.sub(r"\s+([?!.,;:])", r"\1", base)
     # the offset-less forms share the bounded recent-past envelope; the
     # subtraction is inside a guard so the 'never raises' contract is
     # structural rather than incidental (it currently cannot overflow only
@@ -1959,7 +1972,7 @@ def resolve_relative_anchor(question: str,
     if kind == "recency":
         return RelativeAnchor(
             kind=kind, unit=None, count=None, anchor=None,
-            window_lo=lookback_lo, window_hi=qd, base_question=base,
+            window_lo=lookback_lo, window_hi=qd,
             newest_first=True)
     unit = _singular(m.group("unit"))
     if unit not in _UNIT_HALFSPAN:
@@ -1974,7 +1987,7 @@ def resolve_relative_anchor(question: str,
         # budget exactly the rows the fetch deprioritised.
         return RelativeAnchor(
             kind=kind, unit=unit, count=None, anchor=None,
-            window_lo=lookback_lo, window_hi=qd, base_question=base,
+            window_lo=lookback_lo, window_hi=qd,
             newest_first=True)
     parsed = _parse_count(m.group("count"))
     if parsed is None:
@@ -2010,8 +2023,7 @@ def resolve_relative_anchor(question: str,
         return None
     return RelativeAnchor(
         kind=kind, unit=unit, count=count, anchor=anchor,
-        window_lo=window_lo, window_hi=window_hi,
-        base_question=base, fuzzy=fuzzy)
+        window_lo=window_lo, window_hi=window_hi, fuzzy=fuzzy)
 
 
 def collect_window_slices(port, anchor: RelativeAnchor, *,
