@@ -1,3 +1,16 @@
+---
+title: "Research — Platform Seams Matrix for the Volunteering-Memory Reflex (#2080)"
+type: product
+issue: "#2080"
+date: 2026-09-01
+created: 2026-09-01
+domain: product
+doc_status: draft
+subjects.team: epistemic-team
+aboutSubjects: tortoise-memory, tortoise-volunteering-reflex
+aboutObjects: tortoise-mcp, tortoise-why-recall
+---
+
 # Platform Seams Matrix — per-turn volunteering-memory injection
 
 Epic #2080 end-state delivery (issues #2119–#2126). Each seam = a thin
