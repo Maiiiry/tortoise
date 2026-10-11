@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from tortoise.source_identity import normalize_source_url, resolve_source_key
+from tortoise.epistemic_labels import epistemic_anchored_union, endpoint_clause, epistemic_clause
 
 logger = logging.getLogger(__name__)
 
@@ -589,7 +590,7 @@ class _EdgeHandlers:
                     )
                     continue
                 exists = self.g.query(
-                    "MATCH (s) WHERE (s:Point OR s:Event) "
+                    f"MATCH (s) WHERE {endpoint_clause('s')} "
                     "AND s.id = $sid RETURN count(s) > 0",
                     params={"sid": src}
                 ).result_set[0][0]
@@ -617,7 +618,7 @@ class _EdgeHandlers:
                 # A source that doesn't resolve would silently match nothing
                 # in the MERGE below; warn instead of dropping the input.
                 exists = self.g.query(
-                    "MATCH (s) WHERE (s:Point OR s:Event) "
+                    f"MATCH (s) WHERE {endpoint_clause('s')} "
                     "AND s.id = $sid RETURN count(s) > 0",
                     params={"sid": src},
                 ).result_set[0][0]
@@ -633,7 +634,7 @@ class _EdgeHandlers:
                 # Known op_type → typed edge + reverse INPUT
                 self.g.query(
                     f"MATCH (o:Point {{id:$oid}}), (s) "
-                    f"WHERE (s:Point OR s:Event) AND s.id = $sid "
+                    f"WHERE {endpoint_clause('s')} AND s.id = $sid "
                     f"MERGE (o)-[:{rel_type} {{idx:$idx}}]->(s) "
                     f"MERGE (s)-[:INPUT {{idx:$idx}}]->(o)",
                     params={"oid": p["id"], "sid": src, "idx": idx},
@@ -642,7 +643,7 @@ class _EdgeHandlers:
                 # Unknown op_type → INPUT edge only (convention: source → operator)
                 self.g.query(
                     "MATCH (o:Point {id:$oid}), (s) "
-                    "WHERE (s:Point OR s:Event) AND s.id = $sid "
+                    f"WHERE {endpoint_clause('s')} AND s.id = $sid "
                     "MERGE (s)-[:INPUT {idx:$idx}]->(o)",
                     params={"oid": p["id"], "sid": src, "idx": idx},
                 )

@@ -39,6 +39,7 @@ from time import monotonic as _monotonic
 from typing import Any, ClassVar
 
 from .domain_loader import known_kinds, register_kind
+from .epistemic_labels import epistemic_anchored_union, endpoint_clause, epistemic_clause
 from .numeric_domain import (  # #7174: the numeric domain lives in ONE place
     reject_unrepresentable_number as _reject_unrepresentable_number,
 )
@@ -10235,7 +10236,7 @@ class TortoiseSDK:
         # before validation produced phantom OperatorAdded events on missing
         # inputs, visible to subscription poll consumers.
         existing = proj.g.query(
-            "MATCH (n) WHERE (n:Point OR n:Event) AND n.id IN $ids RETURN n.id",
+            epistemic_anchored_union("n", "n.id IN $ids", "n.id"),
             params={"ids": inputs},
         ).result_set
         existing_ids = {row[0] for row in existing}
@@ -10269,7 +10270,7 @@ class TortoiseSDK:
         edge_type = "hasPart" if op_type not in ("IMPL", "NAND") else op_type
         for i, inp_id in enumerate(inputs):
             proj.g.query(
-                f"MATCH (o:Point {{id:$oid}}), (s) WHERE (s:Point OR s:Event) "
+                f"MATCH (o:Point {{id:$oid}}), (s) WHERE {endpoint_clause('s')} "
                 f"AND s.id = $sid "
                 f"CREATE (o)-[:{edge_type} {{idx:$i}}]->(s) "
                 f"CREATE (s)-[:INPUT {{idx:$i}}]->(o)",
@@ -12408,7 +12409,7 @@ class TortoiseSDK:
                         # replay convention (fold-parity).
                         proj.g.query(
                             f"MATCH (o:Point {{id:$oid}}), (t) "
-                            f"WHERE (t:Point OR t:Event) AND t.id = $inp "
+                            f"WHERE {endpoint_clause('t')} AND t.id = $inp "
                             f"MERGE (o)-[r:{op_type if op_type in ('IMPL','NAND') else 'hasPart'}]->(t) "
                             f"SET r.idx = $idx "
                             f"MERGE (t)-[:INPUT {{idx:$idx}}]->(o)",
@@ -13010,7 +13011,7 @@ class TortoiseSDK:
         rows = proj.g.query(
             f"MATCH (o:Point {{is_operator:true, op_type:$op}}) "
             f"OPTIONAL MATCH (o)-[r:{edge_rel}]->(t) "
-            f"WHERE (t:Point OR t:Event) "
+            f"WHERE {epistemic_clause('t')} "
             f"WITH o, collect(t.id) AS targets, collect(r) AS _ "
             f"WHERE {' AND '.join(conds)} "
             f"RETURN o.id, o.status LIMIT 1",
@@ -13038,7 +13039,7 @@ class TortoiseSDK:
         prows = proj.g.query(
             f"MATCH (o:Point {{is_operator:true, op_type:$op}}) "
             f"OPTIONAL MATCH (o)-[r:{edge_rel}]->(t) "
-            f"WHERE (t:Point OR t:Event) "
+            f"WHERE {epistemic_clause('t')} "
             f"WITH o, collect(t.id) AS targets "
             f"WHERE {' AND '.join(pcond)} "
             f"RETURN o.id, o.status, targets",

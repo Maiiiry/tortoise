@@ -48,6 +48,7 @@ import tortoise
 # a monkeypatch/override of the canonical constant reaches BOTH surfaces instead
 # of leaving a stale copy in this module.
 from tortoise import body_limits as _body_limits  # #2048 shared streaming body cap
+from tortoise.epistemic_labels import epistemic_clause
 from tortoise import embed_metering as _embed_metering  # #4488 encode measurement
 from tortoise import mcp_auth as _mcp_auth
 from tortoise import monitoring as _monitoring  # #2924: call-time bound read
@@ -14011,7 +14012,7 @@ def _load_commit_graph_state(sdk: TortoiseSDK, payload: CommitPayload):  # noqa:
     state.entities = {(r[0], r[1] or "") for r in rows}
     rows = proj.g.query(
         "MATCH (o:Point {is_operator:true})-[r]->(t) "
-        "WHERE type(r) IN ['IMPL','NAND'] AND (t:Point OR t:Event) "
+        f"WHERE type(r) IN ['IMPL','NAND'] AND {epistemic_clause('t')} "
         "RETURN o.id, o.op_type, r.idx, t.id ORDER BY o.id, r.idx",
     ).result_set
     ops: dict[str, dict] = {}
@@ -14030,8 +14031,8 @@ def _load_commit_graph_state(sdk: TortoiseSDK, payload: CommitPayload):  # noqa:
         t = op.target
         mit_rows = proj.g.query(
             "MATCH (o:Point {is_operator:true, op_type:'IMPL'}) "
-            "MATCH (o)-[:IMPL {idx:0}]->(s) WHERE (s:Point OR s:Event) AND s.id = $src "
-            "MATCH (o)-[:IMPL {idx:1}]->(d) WHERE (d:Point OR d:Event) AND d.id = $dst "
+            f"MATCH (o)-[:IMPL {{idx:0}}]->(s) WHERE {epistemic_clause('s')} AND s.id = $src "
+            f"MATCH (o)-[:IMPL {{idx:1}}]->(d) WHERE {epistemic_clause('d')} AND d.id = $dst "
             "MATCH (o)-[:mitigated_by]->(m) RETURN count(m)",
             params={"src": t.src, "dst": t.dst},
         ).result_set
