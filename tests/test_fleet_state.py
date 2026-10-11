@@ -1026,7 +1026,20 @@ def test_write_state_json_does_not_narrow_the_cache_mode(tmp_path) -> None:
     path = tmp_path / "state.json"
     assert fs._write_state_json(path, {"generated_at": "2020-01-01T00:00:00+0000"}) is True
     assert stat.S_IMODE(path.stat().st_mode) == fs._DEFAULT_FILE_MODE
-    assert fs._DEFAULT_FILE_MODE != 0o600, "a cache readable only by its OWNER is a regression"
+    # NB: no assertion that the mode is not 0600 — under `umask 077` that is EXACTLY what
+    # `write_text` would have produced, so asserting it would fail on a correct tree for
+    # any runner with a restrictive umask.
+
+
+def test_write_state_json_preserves_an_existing_cache_mode(tmp_path) -> None:
+    """An existing cache keeps its mode: the previous `Path.write_text` truncated in place
+    and so preserved it, and an atomic replace must not silently change it (#7957 H2)."""
+    path = tmp_path / "state.json"
+    path.write_text("{}")
+    os.chmod(path, 0o640)
+
+    assert fs._write_state_json(path, {"generated_at": _stamp(0)}) is True
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
 def test_write_state_json_closes_the_descriptor_when_fdopen_fails(tmp_path, monkeypatch) -> None:
@@ -1052,14 +1065,12 @@ def test_write_state_json_closes_the_descriptor_when_fdopen_fails(tmp_path, monk
     assert not list(tmp_path.glob("*.tmp")), "the temp file must still be removed"
 
 
-def test_write_state_json_cleans_up_when_the_payload_is_unserialisable(tmp_path) -> None:
-    """A payload `json.dumps` cannot render (a circular reference) is a CALLER bug, not an
-    I/O failure, so it propagates rather than being reported as a failed cache write — but
-    it must still leave neither a temp file nor a half-written cache nor a leaked
-    descriptor behind, because every reader that finds a stale cache takes this path."""
-    path = tmp_path / "state.json"
-    circular: dict[str, object] = {"generated_at": _stamp(0)}
-    circular["self"] = circular
+def test_write_state_json_does_not_double_close_the_descriptor(tmp_path, monkeypatch) -> None:
+    """The descriptor must be closed EXACTLY once. A second close of an already-closed
+    number is a suppressed EBADF at best; at worst the number has been reused by another
+    thread between the two calls and an unrelated file is closed (#7957 H2: readers
+    repair the same cache concurrently). On this path `os.fdopen` SUCCEEDS and a LATER
+    step fails — so the `with` has already closed it and this function must not."""
     closed: list[int] = []
     real_close = os.close
 
@@ -1067,12 +1078,30 @@ def test_write_state_json_cleans_up_when_the_payload_is_unserialisable(tmp_path)
         closed.append(fd)
         real_close(fd)
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(fs.os, "close", spy_close)
-        before = len(closed)
-        with pytest.raises(ValueError):
-            fs._write_state_json(path, circular)
-        assert len(closed) > before, "the descriptor mkstemp opened was leaked"
+    monkeypatch.setattr(fs.os, "close", spy_close)
+    circular: dict[str, object] = {"generated_at": _stamp(0)}
+    circular["self"] = circular
+
+    with pytest.raises(ValueError):
+        fs._write_state_json(tmp_path / "state.json", circular)
+
+    assert closed == [], (
+        "`with fh` already closed the descriptor; a second close can hit another "
+        f"thread's file: {closed}"
+    )
+
+
+def test_write_state_json_cleans_up_when_the_payload_is_unserialisable(tmp_path) -> None:
+    """A payload `json.dumps` cannot render (a circular reference) is a CALLER bug, not an
+    I/O failure, so it propagates rather than being reported as a failed cache write — but
+    it must still leave neither a temp file nor a half-written cache behind, because every
+    reader that finds a stale cache takes this path."""
+    path = tmp_path / "state.json"
+    circular: dict[str, object] = {"generated_at": _stamp(0)}
+    circular["self"] = circular
+
+    with pytest.raises(ValueError):
+        fs._write_state_json(path, circular)
 
     assert not path.exists(), "a failed write must not fabricate a cache"
     assert not list(tmp_path.glob("*.tmp")), "a temp file was leaked"

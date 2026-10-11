@@ -148,6 +148,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -1747,10 +1748,17 @@ def _report_state_age(fr: Mapping[str, Any], *, source: str) -> None:
 
 
 def _umask_default_mode() -> int:
-    """0o666 minus the process umask — what ``Path.write_text`` would have created."""
+    """0o666 minus the process umask — what ``Path.write_text`` would have created.
+
+    ``os.umask`` is the only way to READ the umask, and it is process-global: the restore
+    is in a ``finally`` so that an interrupt during this import-time probe cannot leave
+    the process world-writable.
+    """
     umask = os.umask(0)
-    os.umask(umask)
-    return 0o666 & ~umask
+    try:
+        return 0o666 & ~umask
+    finally:
+        os.umask(umask)
 
 
 #: Probed ONCE at import: ``os.umask`` is process-global, so reading it on every write
@@ -1770,20 +1778,33 @@ def _write_state_json(path: Path, state: Mapping[str, Any]) -> bool:
             dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
         )
         try:
-            with os.fdopen(fd, "w") as fh:
+            # `os.fdopen` owns the descriptor only once it RETURNS, so its failure must be
+            # handled around the call itself. Closing `fd` in the outer handler instead
+            # would close it a SECOND time on every later failure path (write, chmod,
+            # replace) — and `contextlib.suppress(OSError)` would hide the EBADF while the
+            # number may already belong to another thread's file, closing a descriptor
+            # this function does not own (#7957 H2: readers repair concurrently).
+            try:
+                fh = os.fdopen(fd, "w")
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            with fh:
                 fh.write(json.dumps(state, indent=2, default=str))
             # `mkstemp` creates 0600 and `os.replace` makes THAT the cache's final mode,
             # silently narrowing a file that was 0644 — locking out any non-owner reader
             # (a container, a group process) with no error at write time, only a failure
-            # to read later. The previous `write_text` created 0o666 & ~umask.
-            os.chmod(tmp_name, _DEFAULT_FILE_MODE)
+            # to read later. An EXISTING cache keeps its mode, as the previous
+            # `write_text` did by truncating in place; a fresh one gets what `write_text`
+            # would have created (0o666 & ~umask).
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except OSError:
+                mode = _DEFAULT_FILE_MODE
+            os.chmod(tmp_name, mode)
             os.replace(tmp_name, path)
         except BaseException:
-            # `os.fdopen` taking ownership is NOT guaranteed once it raises, so close the
-            # descriptor here (suppressed when the `with` already closed it): otherwise a
-            # failed open leaks an fd that the previous `write_text` could not leak.
-            with contextlib.suppress(OSError):
-                os.close(fd)
             with contextlib.suppress(OSError):
                 os.unlink(tmp_name)
             raise
