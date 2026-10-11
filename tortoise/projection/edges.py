@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from tortoise.source_identity import normalize_source_url, resolve_source_key
-from tortoise.epistemic_labels import epistemic_anchored_union, endpoint_clause, epistemic_clause
+from tortoise.epistemic_labels import endpoint_clause, epistemic_clause
 
 logger = logging.getLogger(__name__)
 

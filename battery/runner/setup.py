@@ -45,6 +45,8 @@ graph-semantics reference and naive_setup has no namespace concept).
 from __future__ import annotations
 
 import hashlib
+
+from tortoise.epistemic_labels import endpoint_clause
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -433,7 +435,7 @@ def batch_setup(proj, scenarios: Sequence[Scenario], *,
                 f"ON CREATE SET o.is_operator = true, o.op_type = r.op_type, "  # noqa: F541
                 f"o.direction = r.direction, o.label = r.label "  # noqa: F541
                 f"WITH o, r UNWIND r.inputs AS inp "  # noqa: F541
-                f"MATCH (s) WHERE (s:Point OR s:Event) AND s.id = inp.id "  # noqa: F541
+                f"MATCH (s) WHERE {endpoint_clause('s')} AND s.id = inp.id "  # noqa: F541
                 f"MERGE (o)-[:NAND {{idx: inp.idx}}]->(s) "  # noqa: F541
                 f"WITH DISTINCT o, r "  # noqa: F541
                 f"MATCH (src:Point {{id: r.source_id}}) "  # noqa: F541

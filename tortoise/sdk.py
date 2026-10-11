@@ -39,7 +39,7 @@ from time import monotonic as _monotonic
 from typing import Any, ClassVar
 
 from .domain_loader import known_kinds, register_kind
-from .epistemic_labels import epistemic_anchored_union, endpoint_clause, epistemic_clause
+from .epistemic_labels import endpoint_clause, epistemic_clause
 from .numeric_domain import (  # #7174: the numeric domain lives in ONE place
     reject_unrepresentable_number as _reject_unrepresentable_number,
 )
@@ -10236,7 +10236,11 @@ class TortoiseSDK:
         # before validation produced phantom OperatorAdded events on missing
         # inputs, visible to subscription poll consumers.
         existing = proj.g.query(
-            epistemic_anchored_union("n", "n.id IN $ids", "n.id"),
+            # The GATE must admit exactly what the write it gates can connect
+            # (endpoint_clause, NOT epistemic_clause): a four-label gate would let a
+            # :Subject-only input pass validation and then MERGE nothing, producing a
+            # phantom operator + an OperatorAdded event where the old code raised.
+            f"MATCH (n) WHERE {endpoint_clause('n')} AND n.id IN $ids RETURN n.id",
             params={"ids": inputs},
         ).result_set
         existing_ids = {row[0] for row in existing}

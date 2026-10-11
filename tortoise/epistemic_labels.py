@@ -29,11 +29,11 @@ label may simply be dropped from the pattern::
     MATCH (o:Point {is_operator:true})-[r:IMPL|NAND]->(c)
     WHERE o.id IN $ids AND (c:Point OR c:Object OR c:Event OR c:Subject)
 
-**2. :func:`epistemic_anchored_union` — a UNION ALL of label-anchored lookups, for a node
-addressed BY ID (or any query whose only anchor would otherwise be the label itself).**
-``_ensure_indexes`` creates a separate index per ``(label, property)``, so the disjunctive form has
-nothing to anchor on and the planner falls back to a whole-graph scan. Measured on this host,
-8,400 nodes / 1,200 ``IMPL`` edges, 30 runs after 5 warmups:
+**2. ⚠️ The shape a BY-ID query needs, and why THIS PR does not ship it.**
+``_ensure_indexes`` creates a separate index per ``(label, property)``, so a disjunctive label test
+on a node addressed by id has nothing to anchor on and the planner falls back to a whole-graph scan.
+The fast shape is a ``UNION ALL`` of label-anchored lookups. Measured on this host, 8,400 nodes /
+1,200 ``IMPL`` edges, 30 runs after 5 warmups:
 
 ===============================  =========  =========
 shape                            p50        p95
@@ -42,13 +42,17 @@ shape                            p50        p95
 ``UNION ALL`` of label-anchored id lookups                  1.823 ms   3.127 ms
 ===============================  =========  =========
 
-⇒ **2.3× faster**, and ``search_engine.py`` carries the same finding independently (~5.9 ms whole-
-graph scan vs ~0.5 ms label-anchored at 9k nodes) from before this change.
+⇒ **2.3× faster**; ``search_engine.py`` records the same finding independently (~5.9 ms whole-graph
+scan vs ~0.5 ms label-anchored at 9k nodes).
 
-⚠️ **A WRITE cannot use shape 2** (there is no ``UNION`` of ``CREATE``/``MERGE``). A write that must
-address a node by id and admit all four labels therefore has to **resolve the label first** and then
-issue a label-anchored write — a follow-up, deliberately not done here, because it changes write-path
-behaviour rather than consolidating a definition.
+**It is deliberately NOT implemented here, and that is the correction review round 1 forced.** A
+helper was written, and the one site it was applied to (``create_operator``'s "do the inputs exist?"
+gate) must use the **ENDPOINT** set, not this one: the ``MERGE`` it gates admits ``Point|Event`` only,
+so a four-label gate lets a ``:Subject``-only input pass validation and then produces an operator with
+NO ``IMPL``/``NAND`` and NO ``INPUT`` edges plus an ``OperatorAdded`` event — where the old code raised
+``ValueError``. **A gate must admit exactly what the write it gates can connect.** Every by-id site on
+the epistemic path is a gate or a write, so the shape has no correct caller until the writable-endpoint
+question is answered — shipping it would have been dead code with a live trap next to it.
 
 ⚠️ **What is REACHABLE today.** The write path is asymmetric: ``create_operator`` accepts endpoints as
 ``(s:Point OR s:Event)`` while ``create_direct_edge`` still validates ``Point`` only. So ``:Event``
@@ -113,23 +117,3 @@ def epistemic_clause(var: str) -> str:
     ``var`` is interpolated verbatim, so pass a bare Cypher identifier — never user input.
     """
     return _clause(var, EPISTEMIC_LABELS)
-
-
-def epistemic_anchored_union(var: str, id_expr: str, ret: str) -> str:
-    """A ``UNION ALL`` of label-anchored lookups on ``id_expr`` — shape 2.
-
-    For a node addressed BY ID, where a disjunctive label test has nothing to anchor on and the
-    planner would scan the whole graph (see the module docstring for the measurement). Each leg is
-    anchored on ``(var:Label)`` so it uses that label's ``id`` index, and each projects the SAME
-    column name so the union is well-formed. Duplicates cannot arise: a node carries one of these
-    labels, so at most one leg matches it.
-
-    ``var``, ``id_expr`` and ``ret`` are interpolated verbatim — hence ``noqa: S608`` at the callers'
-    bandit gate; pass Cypher text you control, never user input::
-
-        epistemic_anchored_union("n", "$ids", "n.id")   # ... plus the caller's own WHERE
-    """
-    if not var or not id_expr or not ret:
-        raise ValueError("epistemic_anchored_union needs var, id_expr and ret")
-    return " UNION ALL ".join(
-        f"MATCH ({var}:{label}) WHERE {id_expr} RETURN {ret}" for label in EPISTEMIC_LABELS)
