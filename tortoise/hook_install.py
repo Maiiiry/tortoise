@@ -671,7 +671,7 @@ def _claude_layout() -> HarnessLayout:
 
 
 def _cursor_layout() -> HarnessLayout:
-    """The Cursor capture seam as a layout (#3819) — NOT a fork of the logic.
+    """The Cursor seam as a layout (#3819, extended by #2122).
 
     Cursor reads hook registrations from ``~/.cursor/hooks.json`` (verified
     against the installed bundle: ``CursorHooksService`` resolves
@@ -684,6 +684,28 @@ def _cursor_layout() -> HarnessLayout:
     command runs from the hook cwd, not the install dir), and there is no
     matcher key.  ``sessionEnd`` is an IDE-only event: Cursor's docs state
     cloud agents have no editor-lifetime session boundary.
+
+    TWO scripts, because Cursor's seam has two jobs (#2122):
+
+    * ``sessionEnd`` — the capture half (#3819): file the session.
+    * ``sessionStart`` — the injection half (#2122): Cursor's ONE push seam.
+      ``sessionStart`` is the only Cursor event whose output contract carries
+      ``additional_context`` (the cold-context digest). Its per-turn event,
+      ``beforeSubmitPrompt``, can observe/block a prompt but cannot inject
+      (verified against Cursor's hook reference 2026-10-11), so the shared
+      per-turn reflex is deliberately NOT registered here — claiming it would
+      be claiming an unshipped seam.
+
+    ``timeout`` is declared for NEITHER script: ``sessionEnd`` is IDE-only
+    and joined by Cursor's shutdown, and ``sessionStart`` is fire-and-forget —
+    Cursor's third-party-hooks reference lists "Timeout configuration" as
+    supported, but the UNIT and the kill semantics for a fire-and-forget
+    session event are not documented, and writing a value Cursor reads as
+    milliseconds (60 ⇒ 60 ms) would kill the digest before it is produced and
+    silently disable the injection. The verified-current install (what Cursor
+    3.20.21 reads today) carries no ``timeout`` key, so ``None`` is the
+    non-speculative choice; the spec field stays available for the day that
+    semantic is measured.
     """
     return HarnessLayout(
         harness="cursor",
@@ -699,6 +721,11 @@ def _cursor_layout() -> HarnessLayout:
                 "tortoise-session-end.sh", "sessionEnd", None,
                 "hooks/tortoise-session-end.sh",
                 source_subdir="cursor-hooks", source_name="session-end.sh",
+            ),
+            HookScriptSpec(
+                "tortoise-session-start.sh", "sessionStart", None,
+                "hooks/tortoise-session-start.sh",
+                source_subdir="cursor-hooks", source_name="session-start.sh",
             ),
         ),
     )

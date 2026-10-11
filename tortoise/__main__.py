@@ -2748,7 +2748,9 @@ def _cmd_install_hooks(args) -> int:
     * the per-session CAPTURE seam (``tortoise.capture_install``) — claude
       (SessionStart/SessionEnd scripts + merged ``settings.json`` entry),
       codex (the SessionEnd capture hook + its merged ``$CODEX_HOME/
-      hooks.json`` registration), and pi (the in-repo capture extension).
+      hooks.json`` registration), cursor (the sessionEnd capture hook PLUS the
+      sessionStart cold-context injection hook, #2122) and pi (the in-repo
+      capture extension).
 
     Capture used to be a copy-paste block in the dashboard: the installer gave
     a user the read path and nothing that files a session — and because the
@@ -2781,11 +2783,20 @@ def _cmd_install_hooks(args) -> int:
     # HOME-scoped capture hook stayed live — the opposite of what a user
     # asking to uninstall capture concluded (#3819).
     if uninstall and harness == "cursor":
+        # Derived from the layout (never retyped): a Cursor install writes
+        # EVERY script in `_cursor_layout().scripts`, and naming only
+        # session-end.sh read as "capture uninstalled" while the sessionStart
+        # injection registration stayed live (#2122, the #3963 accounting rule).
+        from tortoise import hook_install as _hook_install
+
+        layout = _hook_install.get_layout("cursor")
+        scripts = " and ".join(f"~/.cursor/hooks/{s.name}"
+                               for s in layout.scripts)
+        events = "/".join(s.event for s in layout.scripts)
         print("cursor has no shell-hook read seam — nothing for --uninstall to "
-              "remove. The capture seam is left in place: delete "
-              "~/.cursor/hooks/tortoise-session-end.sh and its "
-              "sessionEnd entry in ~/.cursor/hooks.json to "
-              "uninstall capture.")
+              f"remove. The capture/injection seam is left in place: delete "
+              f"{scripts} and their {events} entries in "
+              "~/.cursor/hooks.json to uninstall it.")
         return 0
     # `--list` / no harness prints the catalogue.
     if listing or uninstall:
@@ -2847,10 +2858,12 @@ def _cmd_install_hooks(args) -> int:
         return 0
     if harness == "cursor":
         # Cursor has no shell-hook read seam either: the sessionEnd capture
-        # hook is its only seam, and `_install_capture_seam` already reported
-        # the install, the no-op, and the IDE-only disclosure.  Falling
-        # through to `_install_read_hook` would inspect (and could rewrite) a
-        # CLINE registration as if it were Cursor's.
+        # hook and the sessionStart injection hook are its whole seam (the
+        # per-turn beforeSubmitPrompt event cannot inject), and
+        # `_install_capture_seam` already reported the install, the no-op, and
+        # the IDE-only disclosure.  Falling through to `_install_read_hook`
+        # would inspect (and could rewrite) a CLINE registration as if it were
+        # Cursor's.
         return 0
     return _install_read_hook(args)
 
@@ -2916,6 +2929,18 @@ def _install_capture_seam(args, install_capture) -> int:
         # docs: "Cloud agents have no editor-lifetime session boundary."
         from tortoise.capture_install import cursor_home
         cursor_root = cursor_home(_P.home())
+        # #2122: the same install registers Cursor's sessionStart injection
+        # hook. Say WHAT was registered and on which event — the contract the
+        # hook emits is `additional_context`; whether Cursor delivers it to the
+        # model is Cursor's side of the seam (community-reported reliability
+        # caveats), so this names the artifact, not a delivery promise.
+        print(
+            f"Cursor memory is installed in {cursor_root / 'hooks.json'}: "
+            "the sessionEnd capture hook, plus the sessionStart hook that "
+            "injects the cold-context digest as Cursor's "
+            "`additional_context` (sessionStart is Cursor's only context-"
+            "injection seam — its per-turn beforeSubmitPrompt event can "
+            "observe/block a prompt but cannot inject).")
         print(
             f"Cursor's sessionEnd hook is IDE-ONLY. The capture hook "
             f"registered in {cursor_root / 'hooks.json'} fires for LOCAL "
@@ -3045,8 +3070,10 @@ def _install_read_hook_impl(args) -> int:
               "tortoise-capture.ts (the capture extension; Pi has no "
               "shell-hook read seam)")
         print("  tortoise install cursor  → ~/.cursor/hooks.json "
-              "(the sessionEnd capture hook; Cursor has no shell-hook read "
-              "seam. IDE-ONLY: Cursor cloud agent sessions are not captured)")
+              "(the sessionEnd capture hook + the sessionStart cold-context "
+              "injection hook; Cursor has no per-turn shell-hook read seam — "
+              "its beforeSubmitPrompt event cannot inject. IDE-ONLY: Cursor "
+              "cloud agent sessions are not captured)")
         print("Other seams (docs/matrix only, this wave): "
               "devin, gemini, opencode — see "
               "docs/research/2026-09-01-gbrain-learnings/platform-seams.md")
