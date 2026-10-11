@@ -161,46 +161,10 @@ _RE_MOST_RECENT = re.compile(r"\bmost\s+recently\b", re.IGNORECASE)
 # consume (minutes/hours/centuries, 'a long time ago'). Checked only AFTER
 # the promoted vocabulary routes, so it can never eat a promoted offset.
 _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
-# A count that is the TRAILING PART of a multi-part number, matched against
-# the text just before the count. Three spellings, one invariant ('the
-# matched count is the whole number'):
-#   * a compound NUMBER WORD — 'twenty two' / 'twenty-one' / 'twenty–one'.
-#     The separator is `\W` — deliberately NOT an allow-list. `\W` is
-#     Unicode-aware, so SPACE, the ASCII hyphen, the whole Unicode
-#     hyphen/dash/minus family (U+2010..U+2015, U+2212), a comma and even a
-#     non-breaking space all qualify, and `\b` sees a boundary before the
-#     trailing count word for every one of them. `and` is the one separator
-#     that is not `\W`, so it is named explicitly.
-#     ⛔ It is `(?:[\W]|\band\b)+`, NOT `(?:\W+|\s+and\s+)+`: the nested
-#     `\W+` inside a `+` is an AMBIGUOUS quantifier, so `search` on
-#     'twenty' + N spaces + 'x' backtracks over 2**N partitions — measured
-#     3 s at N=24 and unbounded beyond. A question is bounded
-#     (MAX_ASK_QUESTION_CHARS) but a hang is not an exception the ask
-#     envelope can catch, so it is an availability defect, and `run_ask_lane`
-#     has no timeout. The single-character alternative is linear (each
-#     position admits exactly one partition).
-#   * a multi-part NUMERAL — '2.5', '2,000', '2 000', '1-2'. `_RE_AGO_OFFSET`
-#     reads `\d+`, so it matches the LAST digit run alone and the question
-#     promoted at that fragment ('2.5 weeks ago' → 5 weeks; '2,000 days
-#     ago' → 0 days, a window collapsed to question_date). `\d\W*$` catches
-#     it: a digit followed only by non-word characters up to the count. A
-#     digit followed by a WORD character is not a fragment ('2 things 3 days
-#     ago' must still promote count=3, and '3rd, 4 days ago' count=4).
-#     DELIBERATE false negative: a bare numeral that merely PRECEDES the
-#     count ('I bought the iPhone 15 3 days ago') is rejected too, and the
-#     question falls through to the legacy lane. Telling '15 3' (two numbers)
-#     from '2 000' (one number) is not decidable here, and the other side of
-#     the error is a confidently WRONG window that replaces the pool. Fail
-#     safe: no promotion, never a wrong anchor.
-#   * a verbal RANGE / connector — '2 to 5 weeks ago', 'two to five weeks
-#     ago', 'between 2 and 5 weeks ago'. The connector is word characters, so
-#     neither branch above sees it; without this the range's LAST bound is
-#     promoted as the count and a 2–5-week question is answered from the
-#     5-week window alone.
-#
 # ⛔ WHY THIS IS A TOKEN SCAN AND NOT A REGEX OF NUMBER SPELLINGS.
-# Five review rounds of #8097 each closed one spelling of a multi-part number,
-# and each found the next: a digit-only left bound left the SPELLED bounds open
+# Earlier revisions of this guard were a REGEX denylist of number SPELLINGS,
+# and six review rounds each closed one spelling and found the next: a
+# digit-only left bound left the SPELLED bounds open
 # ('two to five weeks ago' → 5); making the left a number word left the ones
 # carrying their OWN unit open ('from 2 weeks to 3 months ago' → 3); a
 # connector list left 'til'/'upto'/'up until' open; a place-value list left
@@ -256,10 +220,6 @@ _NUMBER_CONTINUATION_WORDS = frozenset({
     "about", "around", "roughly", "nearly", "approximately", "almost",
     "exactly", "precisely", "just", "only", "merely", "some", "another",
     "less", "more", "than", "over", "under",
-    # scales a bound may be built from (they are not themselves a bound)
-    "hundred", "hundreds", "thousand", "thousands", "million",
-    "millions", "billion", "billions", "dozen", "dozens", "score",
-    "scores",
 })
 #: the NUMBER vocabulary: a token that IS a number expression's bound. The
 #: cardinals and the quantifiers are here (NOT in the connective set) because
@@ -268,6 +228,10 @@ _NUMBER_CONTINUATION_WORDS = frozenset({
 #: reaches only connectives ('to', 'up') and is a whole number. Includes the
 #: TENS/SCALE words `_RE_AGO_OFFSET` itself does not read (it stops at
 #: 'twelve') — rejecting those counts is the whole reason the guard exists.
+#: The SCALE words are here too, in both numbers: a bare one IS the bound
+#: ('hundred 5 weeks ago', 'dozens of 5 weeks ago'), so classifying them as
+#: connectives let the scan run off the start and promote a count
+#: `origin/main` refused.
 _NUMBER_WORDS = frozenset({
     "a", "an", "couple", "few", "several",
     "one", "two", "three", "four", "five", "six", "seven", "eight",
@@ -275,6 +239,9 @@ _NUMBER_WORDS = frozenset({
     "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
     "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
     "eighty", "ninety",
+    "hundred", "hundreds", "thousand", "thousands", "million",
+    "millions", "billion", "billions", "dozen", "dozens", "score",
+    "scores",
 })
 #: a numeral token may carry letters the tokenizer does not split off —
 #: '1½', '3¾' — and those still continue the number; an ORDINAL ('3rd',

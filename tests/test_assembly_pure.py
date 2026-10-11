@@ -533,6 +533,10 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("from 2 up to and including ", True),
         ("twenty ", True),           # compound number word
         ("twenty-", True),
+        ("hundred ", True),          # a bare SCALE word IS a bound
+        ("thousand ", True),
+        ("dozens of ", True),
+        ("two hundred ", True),
         ("2.", True),                # multi-part numeral
         ("2,", True),
         ("two point ", True),        # spelled place value
