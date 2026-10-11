@@ -2566,6 +2566,12 @@ surfaces:
   - test_ci_timing.py
   - test_ci_manifest.py  # #5050: the measured durations map validator (READ-ONLY; `ci_timing.py --refresh-durations` is the sole writer)
   - test_ids.py
+  # #7955: the Interface E canonical-id contract test pins `tortoise/ids.py`
+  # (`ulid`/`_is_ulid`), `tortoise/sdk.py`'s id regexes, and
+  # `tortoise/projection/edges.py` (`stub_key`/`resolve_structural_target`) —
+  # the same `sdk` SOURCE_PATTERNS that own `test_ids.py`, so the pin runs on
+  # the PRs that can break it instead of reading as unregistered manifest drift.
+  - test_identity_contract.py
   - test_sdk_now_iso_single_definition.py   # #5375: sdk.py must declare exactly one module-level `_now_iso` (hermetic — ast.parse + the bound global)
   - test_validity_window_contract_5374.py   # #5374: the shared `commit_schema.validate_validity_window` contract + read-path (`_covers`) agreement (docker-lane)
   - test_log.py

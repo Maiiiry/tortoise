@@ -15,9 +15,9 @@ aboutObjects: "issue #7955, epic #7879, interface E, canonical id contract, plac
 **Issue:** **#7955** — *§17.5 the field-level PLACEMENT TABLE*. **Lane:** `c6-durability`. **Parent epic:** **#7879**.
 **Ruling:** `docs/architecture/STORAGE-ARCHITECTURE.md` §2.0 (owner, 2026-10-08) — **Postgres is the system of record; FalkorDB is a derived hot cache.** §17's five are its consequences, **not new decisions**.
 **Scope ruling:** owner, 2026-10-10 — **the only customer is the dogfood instance.** Migration safety apparatus is deliberately absent; this document adds none.
-**Interface:** the workstream plan's **E** (`/tmp/plan-storage.md` §2.5) · **units W1 (identity) and W2 (placement)**.
+**Interface:** the workstream plan's **E** (`#7879` plan comment `6097743519` §2.5; local copy `/tmp/plan-storage.md`) · **units W1 (identity) and W2 (placement)**.
 **Test-design consumers:** `#7967` surfaces **S1**, **S3**, **S6** (capstone **S5** is the criterion this table is the evidence for).
-**Measured at:** `origin/main` `9201b731b`, 2026-10-11.
+**Measured at:** the placement enumeration and its writer table are the **2026-10-10 pass** (recorded durably in `#7955` comment `6097993997`; local copy `/tmp/w2-placement.md`), not the head of this branch. The canonical id contract and the stable-name replay keys were **re-verified against the code** on 2026-10-11. ⚠️ **A code citation below is `file → symbol / query text`, never `file:line`** — line numbers drift with every unrelated edit, so the writer column names the file and the clause, and the load-bearing claims are symbol-pinned (§1.2, §1.3, §2.7) and machine-pinned by `tests/test_identity_contract.py`.
 
 > ⚠️ **This is a contract, so it is test-pinnable.** Every claim below that a machine can check is pinned by `tests/test_identity_contract.py`. A claim without a pin is marked as prose.
 
@@ -78,6 +78,8 @@ The graph does not key every node by one property, and pretending otherwise is w
 
 **The rule that follows from the table, and it is the one the schema needs:** a **foreign key is `(label, key)`**, never a bare id. `aboutDocument` is the worked example — it targets a `:Source`, so it resolves by `url`; the same string used as a `:Subject` would be a *different* node. This is why `STRUCTURAL_REL_LABELS` exists (§1.3).
 
+**⚠️ Two key roles — the identity key above is NOT the structural replay key.** The table fixes the property a store mints / MERGEs a label by. §1.3 fixes a **second, narrower** map: the key a rebuilt structural edge resolves its sibling by. For `aboutPoint` / `aboutEvent` the replay key is the target's **`name`**, not `id` / `eventId` — `stub_key` returns `target.get('name')` for every derivable rel except `aboutDocument` / `extractedFrom` (which key on `url`), and `resolve_structural_target` matches a `:Point` / `:Event` by `MATCH (x:{label} {name:$key})` (`projection/edges.py`). So `name` is the **required key property** for a structural target of those two rels; an id-only `aboutPoint` / `aboutEvent` target emits **no descriptor** and the edge dies at rebuild. The two maps are deliberately different and must not be collapsed (the §1.5 pin fabricates `name` in the target dict, so it does **not** exercise this seam).
+
 ### 1.2 The mint format and the stability rule
 
 **Format (minted `:Point` / `:Event` ids).** `ulid()` returns `<lowercase hex of the millisecond timestamp>-<12 lowercase hex>` — e.g. `1a121bfbe39-5a056891dd27`. It is validated on input by `_is_ulid` (`tortoise/sdk.py`), which accepts the canonical form (`^[0-9a-f]+-[0-9a-f]{12}$`) **and** a standard Crockford base32 ULID (26 chars). Entity handles minted by `_entity_name_id` are `<label[:3]>-<sha256[:26]>` (e.g. `sub-<hex26>`).
@@ -99,7 +101,7 @@ A rebuilt structural edge must find its sibling by **stable name**, never by a g
 - **`stub_key(rel, target)`** returns the replayable `(label, key)` — **`target.get('url')` for `aboutDocument` and `extractedFrom`, `target.get('name')` for all other derivable rels**, and `None` (skip emission) for an empty/non-string key. The function's own docstring states the rule: ***"NEVER `target.id`"***.
 - **`resolve_structural_target(g, label, key, rel)`** is the replay-side resolver; it matches label-scoped by `name` (Subject/Event/Point) or `url` (Source), and it is the *single* resolution point (`sdk.py`'s 2b emission and the projection replay both import the same map — no duplicate key map to drift).
 
-**⚠️ Correction to the plan / test-design as written — `coalesce(title, name)` is NOT a current replay key.** The plan §2.5, the test-design map's **S6** row, and `EXTRACTOR-V4` / `STORAGE-ARCHITECTURE` §9.5 all still list the keys as `url` / `name` / `coalesce(title, name)`. That third key is **stale**: it was the **pre-D10** `aboutDocument` key, when a document was a `:Document` resolved by name-or-title. `#2489` moved it to **`url`** when a document became a `:Source` (a `:Source` resolves by `url`), and the code moved with it. Today the code returns `url` for `aboutDocument`, and a title-only target resolves to **nothing** (`stub_key` → `None`). The test at `tests/test_document_source_gold.py::…old_key == "coalesce(title, name)"` pins the **migration fixture's old key**, not the live key — the two are not in conflict, but a reader taking the string as current is wrong.
+**⚠️ Correction to the plan / test-design as written — `coalesce(title, name)` is NOT a current replay key.** The plan §2.5, the test-design map's **S6** row, and `EXTRACTOR-V4` all still list the keys as `url` / `name` / `coalesce(title, name)`. That third key is **stale**: it was the **pre-D10** `aboutDocument` key, when a document was a `:Document` resolved by name-or-title. `#2489` moved it to **`url`** when a document became a `:Source` (a `:Source` resolves by `url`), and the code moved with it. Today the code returns `url` for `aboutDocument`, and a title-only target resolves to **nothing** (`stub_key` → `None`). The test at `tests/test_document_source_gold.py::…old_key == "coalesce(title, name)"` pins the **migration fixture's old key**, not the live key — the two are not in conflict, but a reader taking the string as current is wrong.
 
 > **OVERRIDES:** none — this is an application of the recorded D10/`#2489` decision, not a departure from it. The correction is to the *prose that describes* the key, not to the key. (Recorded because §2.5/S6 read as authority to a lane that never opens `edges.py`.)
 
@@ -129,7 +131,8 @@ A rebuilt structural edge must find its sibling by **stable name**, never by a g
 | `test_structural_rel_labels_is_the_pinned_map` | a rel added to `DERIVABLE_STRUCTURAL_RELS` without a label, or the label map changing silently |
 | `test_stub_key_resolves_by_stable_name_never_id` | `stub_key` returning `target['id']` instead of `name`/`url` — **the exact regression `#2489`/`#5086` exist to prevent** |
 | `test_about_document_key_is_url_not_coalesce_title` | a revert to the pre-D10 `coalesce(title, name)` key, which would resolve to nothing on a `:Source` |
-| `test_stub_key_skips_unresolvable_keys` | emitting a null-key descriptor where the caller must SKIP |
+| `test_stub_key_id_only_target_is_unresolvable` | emitting a null-key descriptor where the caller must SKIP |
+| `test_every_derivable_rel_is_keyed_by_its_pinned_property` | a derivable rel whose key property is not the one `EXPECTED_KEY_PROP` pins, or that consults the other spelling (`name` / `url`) |
 
 **The `target.id` pin is the load-bearing one.** It constructs a target `{"id": "<opaque graph id>", "name": "acme"}` and asserts `stub_key("aboutSubject", target) == ("Subject", "acme")` — a resolver that preferred `id` returns `("<opaque>", …)` and fails. No graph connection is needed, so the pin runs in the carve-out lane too.
 
@@ -174,13 +177,13 @@ The narrowing is **not a reopening of §2.0**: the carve-out's own test is *"rec
 
 ### 2.3–2.6 The table, per layer
 
-**Read the "journal carrier" column as the *why*: it is §3's per-write test, source-cited.** A `PRIMARY` row names the event+key that carries it (or is marked `PRIMARY-WITHOUT-CARRIER`); a `DERIVED` row names the recomputation; a `VOLATILE` row names why the value need not survive replay. Weights are the **floor** the prior pass measured (`/tmp/w2-placement.md`, #7955 comment `6097993997`): the open-set `SET n += $props` passthrough makes the surface unbounded, exactly as §17.5's 87 is a floor.
+**Read the "journal carrier" column as the *why*: it is §3's per-write test, source-cited.** A `PRIMARY` row names the event+key that carries it (or is marked `PRIMARY-WITHOUT-CARRIER`); a `DERIVED` row names the recomputation; a `VOLATILE` row names why the value need not survive replay. Weights are the **floor** the prior pass measured (recorded durably in `#7955` comment `6097993997`; local copy `/tmp/w2-placement.md`): the open-set `SET n += $props` passthrough makes the surface unbounded, exactly as §17.5's 87 is a floor.
 
-**Layer assignment.** `Object`+`Subject` → **semantic**; `Point`+operators/edges → **epistemic**; `Event`+`Source`+`Session` → **event stream**. ⚠️ `:Source` is filed under **Semantic** in `ONTOLOGY.md` §5 *and* is part of §3's truth set — the two are **different axes** (what-exists vs who-writes) and do not conflict; it is listed under the event stream here because it is an append-only truth row the journal writes. The **procedural** layer owns **no property name of its own** (§2.6).
+**Layer assignment.** `Object`+`Subject` → **semantic**; `Point`+operators/edges → **epistemic**; `Event`+`Source`+`Session` → the **Episodic** layer. **Naming:** this document's “event stream” is the ontology's **Episodic** layer (`ONTOLOGY.md` §2), *not* the journal — the ontology itself uses “journal/event stream” for the reconstruction source, so read “event stream” here as the layer, never the record. ⚠️ `:Source` is filed under **Semantic** in `ONTOLOGY.md` §2 *and* is part of §3's truth set — the two are **different axes** (what-exists vs who-writes) and do not conflict; it is listed under the Episodic layer here because it is an append-only truth row the journal writes. The **procedural** layer owns **no property name of its own** (§2.6).
 
 **LEGEND:** `P` = PRIMARY · `D` = DERIVED/VOLATILE · `U` = UNRESOLVED (as measured) · `P*` = PRIMARY-WITHOUT-CARRIER (journal it).
 
-#### 2.3 Event stream — `Event` · `Source` · `Session` (100 names · 94 P · 6 D · 0 U)
+#### 2.3 Episodic (the plan's “event stream”) — `Event` · `Source` · `Session` (100 names · 94 P · 6 D · 0 U)
 
 `Event` (30: 29 P / 1 D) · `Source` (49: 44 P / 5 D) · `Session` (21: 21 P).
 
@@ -198,9 +201,13 @@ The narrowing is **not a reopening of §2.0**: the carve-out's own test is *"rec
 
 *This is where the EP scalars live: `ep_alpha`, `ep_beta`, `ep_dirty`, `ep_dirty_at`, `posterior_alpha`, `posterior_beta`, `confidence`, `c_cal`, `lastDreamedAt`, and the four BP `msg_*`/`back_msg_*` slots — all DERIVED per the carve-out. `content_hash` is DERIVED (a pure function of `content`; deliberately stripped from the journal). The 8 UNRESOLVED are resolved in §2.7.*
 
-#### 2.6 Procedural — the fold over the event stream (0 own names)
+#### 2.6 Procedural — the fold over the Episodic layer (0 own names)
 
-**The procedural layer owns no property name.** Per `ONTOLOGY.md` §5 it is *"Event + folded `Object.status`"*: `Object.status`, `supersededBy` and `supersededAt` are **DERIVED** (a mechanical fold over the lifecycle `Event`s, `#2193` resolved, keep-first per Object), and they live on the **semantic `Object` row** — counted there in §2.4. The work-state counters a session carries (`turn_count`, `commit_count`, …) live on the **`Session` row** — counted in §2.3. **Reconciliation:** a future schema must not look for a procedural table of its own; the procedural layer is a *view/read*, and its fields are classified where they physically live.
+**The procedural layer owns no property name.** Per `ONTOLOGY.md` §2 it is *“Event + folded `Object.status`”*: `Object.status`, `supersededBy` and `supersededAt` are the **fold targets of lifecycle events, and they are PRIMARY** — §2.1 rule 1 classifies a value the journal carries verbatim as a record column, and the journal carries all three (`ObjectRegistered.status`; `ObjectSuperseded.supersedes_by`; `ObjectSuperseded`'s timestamp). They live on the **semantic `Object` row** — counted there in §2.4 (23 P · 0 D).
+
+**Why `confidence` is the exception, not the precedent.** `confidence` is *also* journal-carried (`ConfidenceChanged`, and the `PointAdded` payload) yet §2.2 keeps it **DERIVED**: §2.0's EP-scalar carve-out names it as *recomputed from the structure and never stored as authority*, so the journal value is a cache, not the record. The rule is therefore: **a journal-carried value is PRIMARY unless a recorded carve-out names it as recomputed-from-structure.** `status` / `supersededBy` / `supersededAt` have no such carve-out.
+
+The work-state counters a session carries (`turn_count`, `commit_count`, …) live on the **`Session` row** — counted in §2.3. **Reconciliation:** a future schema must not look for a procedural table of its own; the procedural layer is a *view/read*, and its fields are classified where they physically live.
 
 ### 2.7 The 8 UNRESOLVED rows — resolved, each with the check that confirms it
 
@@ -208,14 +215,14 @@ The prior pass left 8 names unresolved because their polarity was contestable. A
 
 | # | property | layer | was | **resolved** | why (the test) | confirmation |
 |---|---|---|---|---|---|---|
-| 1 | `updatedAt` | epistemic (`Point`) | U | **P\*** (journal the write-time) | minted inside the fold (`projection/entities.py:1218` `n.updatedAt=$now`), so replay re-mints → `live ≠ replay`. It is a mutable fact the record must keep, not a recompute and not a stamp the record may lose → §2.1 class 4 | live `update_point` → `rebuild_all` → `DIFF n.updatedAt`; if it differs, add it to the `PointRevised`/`PointAdded` payload |
+| 1 | `updatedAt` | epistemic (`Point`) | U | **P\*** (journal the write-time) | minted inside the fold (`_upsert_point_props` `n.updatedAt=$now`, `projection/entities.py`), so replay re-mints → `live ≠ replay`. It is a mutable fact the record must keep, not a recompute and not a stamp the record may lose → §2.1 class 4 | live `update_point` → `rebuild_all` → `DIFF n.updatedAt`; if it differs, add it to the `PointRevised`/`PointAdded` payload |
 | 2 | `version` | epistemic (`Point`) | U | **DERIVED** | an ordinal counted by the fold over `PointRevised` — replay reconstructs it **iff** the journal is complete; it is `coalesce(n.version,0)+1`, i.e. a fold counter, not an independent fact | same live-vs-rebuild `DIFF n.version`; a divergence means a `PointRevised` is missing from the journal (`#5089`), not that `version` is a record column |
-| 3 | `inherited_at` | epistemic (`Point`) | U | **VOLATILE** | it stamps **when** an inherited baseline was last recomputed (`sdk.py:16097`); like `reliability_derived_at` it stamps a derived recomputation — the value need not survive replay because the recomputation re-stamps it | rebuild → assert the recomputed inherited baselines carry a fresh `inherited_at` (the gate is re-applied, not replayed) |
+| 3 | `inherited_at` | epistemic (`Point`) | U | **VOLATILE** | it stamps **when** an inherited baseline was last recomputed (`_touch_inherited_at` `SET n.inherited_at = $ts`, `sdk.py`); like `reliability_derived_at` it stamps a derived recomputation — the value need not survive replay because the recomputation re-stamps it | rebuild → assert the recomputed inherited baselines carry a fresh `inherited_at` (the gate is re-applied, not replayed) |
 | 4 | `baseline_source` | epistemic (`Point`) | U | **PRIMARY when `='set-by-author'`; DERIVED otherwise** | §2.8 — the author token records a non-reconstructible input | group by token → rebuild → count; any `set-by-author` row that disappears is the lost input |
 | 5 | `baseline_set` | epistemic (`Point`) | U | **DERIVED** | a boolean mirror of "a baseline exists" — derivable from `baseline_source IS NOT NULL` / `ep_alpha IS NOT NULL`; carries no independent information | falls out of #4's check |
-| 6 | `temporal_reviewed` | epistemic (`Point`) | U | **P\*** (journal it) | a human review decision (`sdk.py:10090`), a *decision output* with no dedicated event found → §2.1 class 4; `reviewed` rides `PointPromoted`/`DedupeRecorded`, `temporal_reviewed` does not | grep the journal for a carrier after a live mining review; absent ⇒ add it to the mining event (mirror `DedupeRecorded`) |
-| 7 | `IMPL.confidence` | epistemic (edges) | U | **PRIMARY** | carried verbatim by `DirectEdgeCreated` (`sdk.py:12988`) — the caller's recorded edge attribute, §2.1 class 1 | already journaled; confirm the replay writes the same value (a naive `DirectEdgeCreated` replay test) |
-| 8 | `IMPL.weight` | epistemic (edges) | U | **PRIMARY** | carried verbatim by `DirectEdgeCreated` (`sdk.py:12989`) | as #7 |
+| 6 | `temporal_reviewed` | epistemic (`Point`) | U | **P\*** (journal it) | a human review decision (`approve_merge` `SET n.temporal_reviewed = $a`, `sdk.py`), a *decision output* with no dedicated event found → §2.1 class 4; `reviewed` rides `PointPromoted`/`DedupeRecorded`, `temporal_reviewed` does not | grep the journal for a carrier after a live mining review; absent ⇒ add it to the mining event (mirror `DedupeRecorded`) |
+| 7 | `IMPL.confidence` | epistemic (edges) | U | **PRIMARY** | carried verbatim by `DirectEdgeCreated` (`create_direct_edge` → `attrs["confidence"]`, `sdk.py`) — the caller's recorded edge attribute, §2.1 class 1 | already journaled; confirm the replay writes the same value (a naive `DirectEdgeCreated` replay test) |
+| 8 | `IMPL.weight` | epistemic (edges) | U | **PRIMARY** | carried verbatim by `DirectEdgeCreated` (`create_direct_edge` → `attrs["weight"]`, `sdk.py`) | as #7 |
 
 **The `IMPL.confidence` / `weight` tension is resolved by *home*, not by polarity:** the *edge attribute* is the caller's input (PRIMARY, on the edge); *EP confidence* is the propagated belief (DERIVED, on the operator). They are different fields with the same word; the schema must not collapse them.
 
@@ -223,10 +230,10 @@ The prior pass left 8 names unresolved because their polarity was contestable. A
 
 ### 2.8 The `baseline_*` correction to §17.5 (as delivered)
 
-> **⛔ CORRECTION — §17.5 lists `baseline_set` / `baseline_source` as unconditionally DERIVED/VOLATILE. They are not: when an author sets the prior (`baseline_source = 'set-by-author'`, the `set_point_baseline` default), the value is a NON-RECONSTRUCTIBLE human/agent input, and §3's own per-write test calls that PRIMARY.**
+> **⛔ CORRECTION — §17.5 lists `baseline_set` / `baseline_source` together as unconditionally DERIVED/VOLATILE. `baseline_source` is not: when an author sets the prior (`baseline_source = 'set-by-author'`, the `set_point_baseline` default), the value is a NON-RECONSTRUCTIBLE human/agent input, and §3's own per-write test calls that PRIMARY. `baseline_set` stays **unconditionally DERIVED** — a boolean mirror of baseline existence (`baseline_source IS NOT NULL` / `ep_alpha IS NOT NULL`) with no input of its own.**
 
 - **The token family** (`sdk.py`, `#2199`): `set-by-author` — *"NEVER recomputed by `_apply_source_inheritance`"*; `inherited-from-source` — recomputed per EP run; `system-default` — a deterministic default. **Only the first is an input; the other two are recomputable.**
-- **Today the value is LOST on rebuild**, and the code says so itself: `sdk.py:16431-16440` — *"the SAME statement also writes `ep_alpha`, `ep_beta`, `baseline_set` and `baseline_source`, and NO journaled event carries those four — they are in `_POINT_DENY` … An author-set baseline is therefore LOST on rebuild (and `_hydrate_evidence` then finds no prior, refusing the next EP run)."*
+- **Today the value is LOST on rebuild**, and the code says so itself: `set_point_baseline` (`sdk.py`) — *“the SAME statement also writes `ep_alpha`, `ep_beta`, `baseline_set` and `baseline_source`, and NO journaled event carries those four — they are in `_POINT_DENY` … An author-set baseline is therefore LOST on rebuild (and `_hydrate_evidence` then finds no prior, refusing the next EP run).”*
 - **Placement:** `baseline_source` → **PRIMARY when `set-by-author`** (the record must keep the token and the α/β it names); `baseline_set` → **DERIVED** (a mirror). The fix is to **journal the author-set baseline as an explicit input** (the §3 E3 pre-write); once the input is carried, `ep_alpha`/`ep_beta` stay DERIVED as the carve-out says.
 - **Not a reopened decision.** The carve-out is for values *"recomputed from the structure"*; an author-stated prior is not. This applies §2.0, it does not override it.
 
@@ -236,8 +243,8 @@ This correction is also recorded on the graph (`CORR-17.5-baseline-author-set-is
 
 These are **findings, not this unit's work**; each is a §3 invariant violation that the table makes visible, and each belongs to the journal-completeness root (`#4240` / `#5089`):
 
-1. **`confidence` is not actually protected.** It is persisted from the payload by the fixed clause `n.confidence=coalesce($cf, n.confidence)` (`projection/entities.py:1214`) and sits in `_POINT_HANDLED`, **not `_POINT_DENY`** — so the deny-list does not guard a field `ONTOLOGY.md` §2 calls *"derived at read time … never stored independently"*. **Doc-vs-code disagreement, now visible.**
-2. **Unjournalled raw `SET`s** (each a live≠rebuild divergence): `Point.ep_dirty`/`ep_dirty_at` and `inherited_at`; `Session.commit_count`/`draft_count`/`value_nodes_created`/`value_nodes_held`/`updated_at` (`hosted_api.py:14262,15092`); `Object.routed_team`/`routed_role`/`routed_product`/`complexity`/`ux_rating` (`connectors/github.py:267`); `Event.embeddingRepairFailedAt` (`sdk.py:24165`).
+1. **`confidence` is not actually protected.** It is persisted from the payload by the fixed clause `n.confidence=coalesce($cf, n.confidence)` (`_upsert_point_props`, `projection/entities.py`) and sits in `_POINT_HANDLED`, **not `_POINT_DENY`** — so the deny-list does not guard a field `ONTOLOGY.md` §2 calls *“derived at read time … never stored independently”*. **Doc-vs-code disagreement, now visible.**
+2. **Unjournalled raw `SET`s** (each a live≠rebuild divergence): `Point.ep_dirty`/`ep_dirty_at` and `inherited_at`; `Session.commit_count`/`draft_count`/`value_nodes_created`/`value_nodes_held`/`updated_at` (`_execute_commit_writes` / `_commit_region`, `hosted_api.py`); `Object.routed_team`/`routed_role`/`routed_product`/`complexity`/`ux_rating` (`ingest`, `connectors/github.py`); `Event.embeddingRepairFailedAt` (`_embedding_repair_attempt`, `sdk.py`).
 3. **Point `updatedAt` live≠replay** (§2.7 #1) — same defect class `#5024` fixed for `Source`.
 4. **`Source.reliability*`** is the **correct** CQRS pattern (declared, recomputed, never authoritative) — the template the volatile set should converge to.
 
@@ -247,129 +254,129 @@ These are **findings, not this unit's work**; each is a §3 invariant violation 
 
 ## Appendix — the raw table, with every writer and carrier
 
-The full per-property table (216 rows, with the `file:line` writer and the journal carrier for each) is reproduced below from the measurement pass that produced the 185/23/8 counts (`/tmp/w2-placement.md`, #7955 comment `6097993997`), grouped by layer.
-> ⚠️ **The classes below are the MEASURED (pre-resolution) classes** from the 2026-10-10 pass. The 8 `U` rows are resolved in §2.7 — read the resolution there, not the `U` here. Numbers are a **floor** (the open-set `SET n += $props` passthrough is unbounded).
+The full per-property table (216 rows, with the writer clause and the journal carrier for each) is reproduced below from the measurement pass that produced the 185/23/8 counts (recorded durably in `#7955` comment `6097993997`; local copy `/tmp/w2-placement.md`), grouped by layer.
+> ⚠️ **The classes below are the MEASURED (pre-resolution) classes** from the 2026-10-10 pass, and the writer column is cited as **`file → clause`** — never `file:line`, which drifts (see the header). The 8 `U` rows are resolved in §2.7 — read the resolution there, not the `U` here. Numbers are a **floor** (the open-set `SET n += $props` passthrough is unbounded).
 
-### Event stream — `Event`
+### Episodic — `Event`
 
 ## Event (node) — 30 properties (PRIMARY 29 · DERIVED/VOLATILE 1 · UNRESOLVED 0)
 
 | property | class | evidence (writer) | journal carrier | notes |
 |---|---|---|---|---|
-| `id` | P | projection/entities.py:3085 props['id']=eid; hosted_api.py:14296 SET e.id | EventRecorded.id | dual of eventId (#122) |
-| `eventId` | P | projection/entities.py:3135 MERGE (e:Event {eventId:$eid}) | EventRecorded via id= kwarg | MERGE key |
-| `eventKind` | P | projection/entities.py:3086 e.eventKind / $props | EventRecorded.eventKind |  |
-| `subject` | P | projection/entities.py:3087 | EventRecorded.subject |  |
-| `object` | P | projection/entities.py:3088 | EventRecorded.object |  |
-| `startedAt` | P | projection/entities.py:3089 | EventRecorded.startedAt |  |
-| `endedAt` | P | projection/entities.py:3090 | EventRecorded.endedAt |  |
-| `parentEvent` | P | projection/entities.py:3091 (via $props) | `_EVENT_HANDLED`; no EventRecorded kwarg — open-set |  |
-| `participants` | P | projection/entities.py:3092 | EventRecorded.participants |  |
-| `classificationLevel` | P | projection/entities.py:3093 | EventRecorded.classificationLevel |  |
-| `format` | P | projection/entities.py:3094 | EventRecorded.format |  |
-| `embedding` | P | projection/entities.py:3137 e.embedding=CASE..vecf32 | EventRecorded payload via inner.embedding | stored; computed from subject/kind/object if absent |
-| `eventStatus` | P | hosted_api.py:14296; entities.py `_event_plain_merge` open-set | open-set passthrough ($props) | lifecycle |
-| `name` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `summary` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `story_arc` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `keywords` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `capturedAt` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `sessionId` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `is_episodic` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `is_operator` | P | ranking.py:986 | open-set passthrough | DEFENSIVE — a non-Point node carrying a Point flag |
-| `session_id` | P | sdk.py:22963 | open-set passthrough |  |
-| `source_file` | P | projection/entities.py:3491; meeting guard | guard comparison prop (meeting branch) | §4.2 |
-| `source_ref` | P | hosted_api.py:14317 | open-set passthrough |  |
-| `updatedAt` | P | hosted_api.py:14296 | open-set passthrough |  |
-| `mined_at` | P | mining.py:1242 | mining write (check carrier) |  |
-| `mined_hash` | P | mining.py:1242 | mining write (check carrier) |  |
-| `embeddingRepairFailedAt` | P | sdk.py:24165 SET e.embeddingRepairFailedAt | repair path raw write (check carrier) | ⚠ raw repair write |
-| `confidence` | D | hosted_api.py:14317 | — | EP scalar on Event (should be derived) |
-| `content` | P | hosted_api.py:14317 | — | event content |
+| `id` | P | projection/entities.py props['id']=eid; hosted_api.py SET e.id | EventRecorded.id | dual of eventId (#122) |
+| `eventId` | P | projection/entities.py MERGE (e:Event {eventId:$eid}) | EventRecorded via id= kwarg | MERGE key |
+| `eventKind` | P | projection/entities.py e.eventKind / $props | EventRecorded.eventKind |  |
+| `subject` | P | projection/entities.py | EventRecorded.subject |  |
+| `object` | P | projection/entities.py | EventRecorded.object |  |
+| `startedAt` | P | projection/entities.py | EventRecorded.startedAt |  |
+| `endedAt` | P | projection/entities.py | EventRecorded.endedAt |  |
+| `parentEvent` | P | projection/entities.py (via $props) | `_EVENT_HANDLED`; no EventRecorded kwarg — open-set |  |
+| `participants` | P | projection/entities.py | EventRecorded.participants |  |
+| `classificationLevel` | P | projection/entities.py | EventRecorded.classificationLevel |  |
+| `format` | P | projection/entities.py | EventRecorded.format |  |
+| `embedding` | P | projection/entities.py e.embedding=CASE..vecf32 | EventRecorded payload via inner.embedding | stored; computed from subject/kind/object if absent |
+| `eventStatus` | P | hosted_api.py; entities.py `_event_plain_merge` open-set | open-set passthrough ($props) | lifecycle |
+| `name` | P | hosted_api.py | open-set passthrough |  |
+| `summary` | P | hosted_api.py | open-set passthrough |  |
+| `story_arc` | P | hosted_api.py | open-set passthrough |  |
+| `keywords` | P | hosted_api.py | open-set passthrough |  |
+| `capturedAt` | P | hosted_api.py | open-set passthrough |  |
+| `sessionId` | P | hosted_api.py | open-set passthrough |  |
+| `is_episodic` | P | hosted_api.py | open-set passthrough |  |
+| `is_operator` | P | ranking.py | open-set passthrough | DEFENSIVE — a non-Point node carrying a Point flag |
+| `session_id` | P | sdk.py | open-set passthrough |  |
+| `source_file` | P | projection/entities.py; meeting guard | guard comparison prop (meeting branch) | §4.2 |
+| `source_ref` | P | hosted_api.py | open-set passthrough |  |
+| `updatedAt` | P | hosted_api.py | open-set passthrough |  |
+| `mined_at` | P | mining.py | mining write (check carrier) |  |
+| `mined_hash` | P | mining.py | mining write (check carrier) |  |
+| `embeddingRepairFailedAt` | P | sdk.py SET e.embeddingRepairFailedAt | repair path raw write (check carrier) | ⚠ raw repair write |
+| `confidence` | D | hosted_api.py | — | EP scalar on Event (should be derived) |
+| `content` | P | hosted_api.py | — | event content |
 
-### Event stream — `Source`
+### Episodic — `Source`
 
 ## Source (node) — 49 properties (PRIMARY 44 · DERIVED/VOLATILE 5 · UNRESOLVED 0)
 
 | property | class | evidence (writer) | journal carrier | notes |
 |---|---|---|---|---|
-| `id` | P | projection/entities.py:3643 s.id=coalesce($id,$url); hosted_api.py:14277 | SourceCreated payload **ev (create_source) | identity |
-| `url` | P | projection/entities.py:3643 MERGE (s:Source {url:$url}); edges.py:779 | SourceCreated ev.url | MERGE key |
-| `canonicalUrl` | P | projection/entities.py:3644 s.canonicalUrl=$cu; edges.py:151 | SourceCreated ev (S0a/S0b #5012) | identity |
-| `urlAliases` | P | projection/entities.py:3645 s.urlAliases=[$raw_url] | SourceCreated ev | identity aliases |
-| `sourceKind` | P | projection/entities.py:3646 s.sourceKind=$sk | SourceCreated ev.sourceKind |  |
-| `contentHash` | P | projection/entities.py:3647,3676 hash-diff; sdk.py:26429 | SourceCreated/SourceVersioned.contentHash | version anchor |
-| `title` | P | projection/entities.py:3648,3677 | SourceCreated ev.title |  |
-| `ingestedAt` | P | projection/entities.py:3649 s.ingestedAt=coalesce($ingestedAt,$now) | SourceCreated ev.ingestedAt (#5024) | recorded instant, not replay clock |
-| `version` | P | projection/entities.py:3650 s.version=1; 3679 bump; sdk.py:26430 | SourceCreated/SourceVersioned (reproduced by the hash gate) | ordinal reproduced by the SAME hash-diff gate |
-| `externalId` | P | projection/entities.py:3651 | SourceCreated ev.externalId |  |
-| `format` | P | projection/entities.py:3652 | SourceCreated ev.format | D10: moved onto :Source |
-| `sourcePath` | P | projection/entities.py:3653 s.sourcePath=coalesce($sp,..) | SourceCreated ev.source_path | #4.1 |
-| `rawState` | P | projection/entities.py:3656 s.rawState=$rawState | SourceCreated ev.rawState (#3998 D30) | availability, third value on the record |
-| `rawStateAt` | P | projection/entities.py:3657,3684 | SourceCreated ev.rawStateAt |  |
-| `_searchText` | P | projection/entities.py:3658 s.`_searchText`=$st | SourceCreated ev.`_searchText` | fulltext index text |
-| `updatedAt` | P | projection/entities.py:3681 coalesce($updatedAt,$now); sdk.py:25312 ev[updatedAt] | SourceCreated/SourceVersioned ev.updatedAt (#5024) | ONE clock minted by the caller |
+| `id` | P | projection/entities.py s.id=coalesce($id,$url); hosted_api.py | SourceCreated payload **ev (create_source) | identity |
+| `url` | P | projection/entities.py MERGE (s:Source {url:$url}); edges.py | SourceCreated ev.url | MERGE key |
+| `canonicalUrl` | P | projection/entities.py s.canonicalUrl=$cu; edges.py | SourceCreated ev (S0a/S0b #5012) | identity |
+| `urlAliases` | P | projection/entities.py s.urlAliases=[$raw_url] | SourceCreated ev | identity aliases |
+| `sourceKind` | P | projection/entities.py s.sourceKind=$sk | SourceCreated ev.sourceKind |  |
+| `contentHash` | P | projection/entities.py hash-diff; sdk.py | SourceCreated/SourceVersioned.contentHash | version anchor |
+| `title` | P | projection/entities.py | SourceCreated ev.title |  |
+| `ingestedAt` | P | projection/entities.py s.ingestedAt=coalesce($ingestedAt,$now) | SourceCreated ev.ingestedAt (#5024) | recorded instant, not replay clock |
+| `version` | P | projection/entities.py s.version=1 (and the version bump); sdk.py | SourceCreated/SourceVersioned (reproduced by the hash gate) | ordinal reproduced by the SAME hash-diff gate |
+| `externalId` | P | projection/entities.py | SourceCreated ev.externalId |  |
+| `format` | P | projection/entities.py | SourceCreated ev.format | D10: moved onto :Source |
+| `sourcePath` | P | projection/entities.py s.sourcePath=coalesce($sp,..) | SourceCreated ev.source_path | #4.1 |
+| `rawState` | P | projection/entities.py s.rawState=$rawState | SourceCreated ev.rawState (#3998 D30) | availability, third value on the record |
+| `rawStateAt` | P | projection/entities.py | SourceCreated ev.rawStateAt |  |
+| `_searchText` | P | projection/entities.py s.`_searchText`=$st | SourceCreated ev.`_searchText` | fulltext index text |
+| `updatedAt` | P | projection/entities.py coalesce($updatedAt,$now); sdk.py ev[updatedAt] | SourceCreated/SourceVersioned ev.updatedAt (#5024) | ONE clock minted by the caller |
 | `sourceDate` | P | `_SOURCE_EXTRA_PROPS`; create_source(sourceDate=) | SourceCreated ev.sourceDate | evidence-age clock |
-| `credibilityTier` | P | `_SOURCE_EXTRA_PROPS`; projection/entities.py:3424 | SourceCreated ev.credibilityTier | #388 |
-| `is_episodic` | P | `_SOURCE_EXTRA_PROPS`; projection/entities.py:3424 | SourceCreated ev.is_episodic | quota discriminator |
+| `credibilityTier` | P | `_SOURCE_EXTRA_PROPS`; projection/entities.py | SourceCreated ev.credibilityTier | #388 |
+| `is_episodic` | P | `_SOURCE_EXTRA_PROPS`; projection/entities.py | SourceCreated ev.is_episodic | quota discriminator |
 | `name` | P | `_SOURCE_EXTRA_PROPS` | SourceCreated ev.name |  |
 | `team` | P | `_SOURCE_EXTRA_PROPS` | SourceCreated ev.team |  |
 | `provenance_spans` | P | `_SOURCE_EXTRA_PROPS` | SourceCreated ev.provenance_spans |  |
 | `domain` | P | `_SOURCE_EXTRA_PROPS` (D10 B6) | SourceCreated ev.domain |  |
-| `summary` | P | `_SOURCE_EXTRA_PROPS`; hosted_api.py:14277 | SourceCreated ev.summary |  |
+| `summary` | P | `_SOURCE_EXTRA_PROPS`; hosted_api.py | SourceCreated ev.summary |  |
 | `topics` | P | `_SOURCE_EXTRA_PROPS` | SourceCreated ev.topics |  |
 | `status` | P | `_SOURCE_EXTRA_PROPS` (D10 B6) | SourceCreated ev.status |  |
 | `embedding` | P | `_SOURCE_EXTRA_PROPS` | SourceCreated ev.embedding | vector retrieval leg |
 | `about_entities` | P | `_SOURCE_EXTRA_PROPS` | SourceCreated ev.about_entities |  |
-| `documentKind` | P | `_SOURCE_EXTRA_PROPS`; hosted_api.py:14277 | SourceCreated ev.documentKind | D10 document-is-a-Source |
+| `documentKind` | P | `_SOURCE_EXTRA_PROPS`; hosted_api.py | SourceCreated ev.documentKind | D10 document-is-a-Source |
 | `document_kind` | P | `_SOURCE_EXTRA_PROPS` | SourceCreated ev.document_kind |  |
 | `sessionId` | P | `_SOURCE_EXTRA_PROPS`; `_SOURCE_NODE_PROPS` | SourceCreated ev.sessionId | capture writer |
 | `capturedAt` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.capturedAt | session-capture writer |
-| `eventId` | P | `_SOURCE_NODE_PROPS`; hosted_api.py:14277 | SourceCreated ev.eventId |  |
+| `eventId` | P | `_SOURCE_NODE_PROPS`; hosted_api.py | SourceCreated ev.eventId |  |
 | `session_id` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.session_id |  |
 | `event_id` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.event_id |  |
 | `source_path` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.source_path |  |
-| `needs_extraction` | P | `_SOURCE_NODE_PROPS`; ingest.py:271 | SourceCreated ev.needs_extraction | read back by ingest |
-| `story_arc` | P | `_SOURCE_NODE_PROPS`; hosted_api.py:14277 | SourceCreated ev.story_arc |  |
+| `needs_extraction` | P | `_SOURCE_NODE_PROPS`; ingest.py | SourceCreated ev.needs_extraction | read back by ingest |
+| `story_arc` | P | `_SOURCE_NODE_PROPS`; hosted_api.py | SourceCreated ev.story_arc |  |
 | `document_knowledge_domain` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.document_knowledge_domain |  |
 | `authored_by` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.authored_by | document provenance metadata |
 | `owned_by` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.owned_by |  |
 | `managed_by` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.managed_by |  |
 | `governing_agreement` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.governing_agreement |  |
 | `createdAt` | P | `_SOURCE_NODE_PROPS` | SourceCreated ev.createdAt |  |
-| `__runId` | D | projection/entities.py:3660 s.__runId=$rid transient merge token | NEVER journalled (stripped, sdk.py:25380 excludes __runId) | transient merge token, removed best-effort — not a record field |
-| `reliability` | D | sdk.py:25967 `_write_reliability_cache` | NOT carried | documented CQRS cache (#398) — recomputed |
-| `reliabilityComponents` | D | sdk.py:25967 | NOT carried | cache |
-| `reliability_derived_at` | D | sdk.py:25967 | NOT carried | cache timestamp |
+| `__runId` | D | projection/entities.py s.__runId=$rid transient merge token | NEVER journalled (stripped, sdk.py excludes __runId) | transient merge token, removed best-effort — not a record field |
+| `reliability` | D | sdk.py `_write_reliability_cache` | NOT carried | documented CQRS cache (#398) — recomputed |
+| `reliabilityComponents` | D | sdk.py | NOT carried | cache |
+| `reliability_derived_at` | D | sdk.py | NOT carried | cache timestamp |
 | `previousContentHash` | D | sdk.py SourceVersioned kwarg | SourceVersioned.previousContentHash (event key, NOT a node prop) | `_SOURCE_HANDLED` excludes it — describes the transition, not the node |
 
-### Event stream — `Session`
+### Episodic — `Session`
 
 ## Session (node) — 21 properties (PRIMARY 21 · DERIVED/VOLATILE 0 · UNRESOLVED 0)
 
 | property | class | evidence (writer) | journal carrier | notes |
 |---|---|---|---|---|
-| `id` | P | sdk.py:2317 MERGE (s:Session {id:$sid}); projection/entities.py:1819 | SessionRecorded.id | MERGE key |
-| `created_at` | P | sdk.py:2244 s.created_at=coalesce(s.created_at,$now); projection/entities.py:1758 | SessionRecorded.created_at | first-writer-wins |
-| `turn_count` | P | sdk.py:2245 s.turn_count=$tc; projection/entities.py:1811 | SessionRecorded.turn_count | latest capture wins |
-| `is_episodic` | P | sdk.py:2246 s.is_episodic=true; projection/entities.py:1817 | SessionRecorded fold hardcodes true | session container flag (ONTOLOGY §4.5) |
-| `harness` | P | sdk.py:2248 s.harness=$harness; projection/entities.py:1811 | SessionRecorded.harness | #1727 first-writer-wins |
-| `capture_lane` | P | sdk.py:2256 s.capture_lane=coalesce(..); projection/entities.py:1768 | SessionRecorded.capture_lane (#3516) | producer lane |
-| `client_captured_at` | P | sdk.py:2277 s.client_captured_at=coalesce(..); projection/entities.py:1802 | SessionRecorded.client_captured_at | #3516 client clock |
-| `client_captured_at_source` | P | sdk.py:2272 CASE; projection/entities.py:1797 | SessionRecorded.client_captured_at_source | clock identity pair |
-| `actor_user_id` | P | sdk.py:2282 s.actor_user_id=coalesce(..); projection/entities.py:1821 | SessionRecorded.actor_user_id (#2600) |  |
-| `machine_id` | P | sdk.py:2286 s.machine_id=coalesce(..) | SessionRecorded.machine_id (hosted-only, #2599) |  |
-| `model` | P | sdk.py:2289 s.model=coalesce(..) | SessionRecorded.model |  |
-| `capture_redactions` | P | sdk.py:1758 SET s.capture_redactions; projection/entities.py:1811 | SessionRecorded.capture_redactions (#4911) | overwrite semantics |
-| `entity_links_attempted` | P | sdk.py:6821 SET; projection/entities.py:1811 | SessionRecorded.entity_links_attempted (#3664) |  |
-| `entity_links_created` | P | sdk.py:6821; projection/entities.py:1811 | SessionRecorded.entity_links_created |  |
-| `capture_ok` | P | hosted_api.py:12218; projection/entities.py:1811 | SessionRecorded.capture_ok (#3722) | retry gate input |
-| `capture_extractor` | P | hosted_api.py:12218; projection/entities.py:1811 | SessionRecorded.capture_extractor |  |
-| `commit_count` | P | hosted_api.py:14262 SET s.commit_count=coalesce+1 | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled → lost on rebuild |
-| `draft_count` | P | hosted_api.py:14262 | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
-| `value_nodes_created` | P | hosted_api.py:14262 | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
-| `value_nodes_held` | P | hosted_api.py:15092 | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
-| `updated_at` | P | hosted_api.py:14262 SET s.updated_at=$now | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
+| `id` | P | sdk.py MERGE (s:Session {id:$sid}); projection/entities.py | SessionRecorded.id | MERGE key |
+| `created_at` | P | sdk.py s.created_at=coalesce(s.created_at,$now); projection/entities.py | SessionRecorded.created_at | first-writer-wins |
+| `turn_count` | P | sdk.py s.turn_count=$tc; projection/entities.py | SessionRecorded.turn_count | latest capture wins |
+| `is_episodic` | P | sdk.py s.is_episodic=true; projection/entities.py | SessionRecorded fold hardcodes true | session container flag (ONTOLOGY §4.5) |
+| `harness` | P | sdk.py s.harness=$harness; projection/entities.py | SessionRecorded.harness | #1727 first-writer-wins |
+| `capture_lane` | P | sdk.py s.capture_lane=coalesce(..); projection/entities.py | SessionRecorded.capture_lane (#3516) | producer lane |
+| `client_captured_at` | P | sdk.py s.client_captured_at=coalesce(..); projection/entities.py | SessionRecorded.client_captured_at | #3516 client clock |
+| `client_captured_at_source` | P | sdk.py CASE; projection/entities.py | SessionRecorded.client_captured_at_source | clock identity pair |
+| `actor_user_id` | P | sdk.py s.actor_user_id=coalesce(..); projection/entities.py | SessionRecorded.actor_user_id (#2600) |  |
+| `machine_id` | P | sdk.py s.machine_id=coalesce(..) | SessionRecorded.machine_id (hosted-only, #2599) |  |
+| `model` | P | sdk.py s.model=coalesce(..) | SessionRecorded.model |  |
+| `capture_redactions` | P | sdk.py SET s.capture_redactions; projection/entities.py | SessionRecorded.capture_redactions (#4911) | overwrite semantics |
+| `entity_links_attempted` | P | sdk.py SET; projection/entities.py | SessionRecorded.entity_links_attempted (#3664) |  |
+| `entity_links_created` | P | sdk.py; projection/entities.py | SessionRecorded.entity_links_created |  |
+| `capture_ok` | P | hosted_api.py; projection/entities.py | SessionRecorded.capture_ok (#3722) | retry gate input |
+| `capture_extractor` | P | hosted_api.py; projection/entities.py | SessionRecorded.capture_extractor |  |
+| `commit_count` | P | hosted_api.py SET s.commit_count=coalesce+1 | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled → lost on rebuild |
+| `draft_count` | P | hosted_api.py | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
+| `value_nodes_created` | P | hosted_api.py | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
+| `value_nodes_held` | P | hosted_api.py | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
+| `updated_at` | P | hosted_api.py SET s.updated_at=$now | NO SessionRecorded carrier found | ⚠ raw SET, unjournalled |
 
 ### Semantic — `Object`
 
@@ -377,24 +384,24 @@ The full per-property table (216 rows, with the `file:line` writer and the journ
 
 | property | class | evidence (writer) | journal carrier | notes |
 |---|---|---|---|---|
-| `id` | P | projection/entities.py:2661 ON CREATE o.id=$id; commit_ops.py:916 | ObjectRegistered.id | identity |
-| `name` | P | projection/entities.py:2661 MERGE (o:Object {name:$name}) | ObjectRegistered.name | MERGE key; #1155 |
-| `objectKind` | P | projection/entities.py:2661 o.objectKind=coalesce($ok,'other') | ObjectRegistered.object_kind |  |
-| `createdAt` | P | projection/entities.py:2661 o.createdAt=coalesce($ca,$now) | ObjectRegistered.createdAt | #2295/#2194 |
-| `title` | P | projection/entities.py:2661 o.title=coalesce($title,'') | ObjectRegistered (open-set snapshot) |  |
-| `embedding` | P | projection/entities.py:2661 o.embedding=CASE..vecf32; #4524 REMOVE | computed/recomputed from name (#7845) | derived-from-name but stored; not journaled as a payload key on ObjectRegistered → recomputable (name is primary) |
-| `status` | P | projection/entities.py:2661 o.status=coalesce($st,'live'); `_fold_object_superseded` 2730 | ObjectRegistered.status; ObjectSuperseded (folded) | §3: mechanical fold over lifecycle events; mutable in place (safe because recomputable) |
-| `supersededBy` | P | projection/entities.py:2730 SET o.supersededBy=$sb | ObjectSuperseded.supersedes_by | #1350 |
-| `supersededAt` | P | projection/entities.py:2731 SET o.supersededAt=$sa | ObjectSuperseded (fold timestamp) |  |
-| `canonical_name` | P | sdk.py:9773 (read/alias match) — writer via open-set | open-set passthrough | topic alias |
-| `repo` | P | sdk.py:25064 MERGE (o:Object) SET o.repo=$repo | connector write (check journal carrier) | github entity field |
-| `issue_number` | P | sdk.py:25064 SET o.issue_number=$issue_number | connector write (check) | github entity field |
-| `url` | P | sdk.py:25064 SET o.url=$url | connector write (check) | github entity field |
-| `routed_team` | P | connectors/github.py:267 SET o.routed_team | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled (#4240 class) |
-| `routed_role` | P | connectors/github.py:267 | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
-| `routed_product` | P | connectors/github.py:267 | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
-| `complexity` | P | connectors/github.py:267 | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
-| `ux_rating` | P | connectors/github.py:267 | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
+| `id` | P | projection/entities.py ON CREATE o.id=$id; commit_ops.py | ObjectRegistered.id | identity |
+| `name` | P | projection/entities.py MERGE (o:Object {name:$name}) | ObjectRegistered.name | MERGE key; #1155 |
+| `objectKind` | P | projection/entities.py o.objectKind=coalesce($ok,'other') | ObjectRegistered.object_kind |  |
+| `createdAt` | P | projection/entities.py o.createdAt=coalesce($ca,$now) | ObjectRegistered.createdAt | #2295/#2194 |
+| `title` | P | projection/entities.py o.title=coalesce($title,'') | ObjectRegistered (open-set snapshot) |  |
+| `embedding` | P | projection/entities.py o.embedding=CASE..vecf32; #4524 REMOVE | computed/recomputed from name (#7845) | derived-from-name but stored; not journaled as a payload key on ObjectRegistered → recomputable (name is primary) |
+| `status` | P | projection/entities.py o.status=coalesce($st,'live'); `_fold_object_superseded` 2730 | ObjectRegistered.status; ObjectSuperseded (folded) | §3: mechanical fold over lifecycle events; mutable in place (safe because recomputable) |
+| `supersededBy` | P | projection/entities.py SET o.supersededBy=$sb | ObjectSuperseded.supersedes_by | #1350 |
+| `supersededAt` | P | projection/entities.py SET o.supersededAt=$sa | ObjectSuperseded (fold timestamp) |  |
+| `canonical_name` | P | sdk.py (read/alias match) — writer via open-set | open-set passthrough | topic alias |
+| `repo` | P | sdk.py MERGE (o:Object) SET o.repo=$repo | connector write (check journal carrier) | github entity field |
+| `issue_number` | P | sdk.py SET o.issue_number=$issue_number | connector write (check) | github entity field |
+| `url` | P | sdk.py SET o.url=$url | connector write (check) | github entity field |
+| `routed_team` | P | connectors/github.py SET o.routed_team | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled (#4240 class) |
+| `routed_role` | P | connectors/github.py | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
+| `routed_product` | P | connectors/github.py | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
+| `complexity` | P | connectors/github.py | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
+| `ux_rating` | P | connectors/github.py | raw connector write — NO journal carrier | ⚠ raw SET, unjournalled |
 
 ### Semantic — `Subject`
 
@@ -402,11 +409,11 @@ The full per-property table (216 rows, with the `file:line` writer and the journ
 
 | property | class | evidence (writer) | journal carrier | notes |
 |---|---|---|---|---|
-| `id` | P | projection/entities.py:2585 s.id=$id / coalesce; edges.py:104 stub | SubjectAdded.id | #1918 canonical id wins |
-| `name` | P | projection/entities.py:2585 MERGE (s:Subject {name:$name}) | SubjectAdded.name | MERGE key |
-| `subjectKind` | P | projection/entities.py:2585 s.subjectKind=coalesce($sk,'other') | SubjectAdded.subject_kind |  |
-| `createdAt` | P | projection/entities.py:2585 s.createdAt=coalesce($ca,$now) | SubjectAdded.createdAt | #2295 |
-| `embedding` | P | projection/entities.py:2585 s.embedding=CASE..vecf32; #4524 REMOVE | computed from name (#7845) | recomputable from name (primary) |
+| `id` | P | projection/entities.py s.id=$id / coalesce; edges.py stub | SubjectAdded.id | #1918 canonical id wins |
+| `name` | P | projection/entities.py MERGE (s:Subject {name:$name}) | SubjectAdded.name | MERGE key |
+| `subjectKind` | P | projection/entities.py s.subjectKind=coalesce($sk,'other') | SubjectAdded.subject_kind |  |
+| `createdAt` | P | projection/entities.py s.createdAt=coalesce($ca,$now) | SubjectAdded.createdAt | #2295 |
+| `embedding` | P | projection/entities.py s.embedding=CASE..vecf32; #4524 REMOVE | computed from name (#7845) | recomputable from name (primary) |
 
 ### Epistemic — `Point`
 
@@ -414,36 +421,36 @@ The full per-property table (216 rows, with the `file:line` writer and the journ
 
 | property | class | evidence (writer) | journal carrier | notes |
 |---|---|---|---|---|
-| `id` | P | projection/entities.py:1163 MERGE (n:Point {id:$id}); sdk.py create_point CREATE map | PointAdded.point.id / PointPromoted.point.id / OperatorAdded.point.id | identity / MERGE key |
-| `content` | P | projection/entities.py:1166 n.content=$content | PointAdded.point.content (full snapshot) | §3: JOURNAL — decision output |
-| `is_operator` | P | projection/entities.py:1167 n.is_operator=$isop | PointAdded.point.is_operator | identity flag; #5048 |
-| `op_type` | P | projection/entities.py:1168 n.op_type=$opt | OperatorAdded.point.op_type | operator kind |
-| `pointKind` | P | projection/entities.py:1169 n.pointKind=coalesce($pk,..) | PointAdded.point.pointKind | kind |
-| `status` | P | projection/entities.py:1170 n.status=coalesce($st,..,'live'); sdk.py:8410 | PointAdded.point.status, PointRevised, PointPromoted, PointRetracted | lifecycle, journaled by dedicated events |
-| `authoredBy` | P | projection/entities.py:1171 n.authoredBy=coalesce($ab,..) | PointAdded.point.authoredBy (`_META_KEY` handled as edge) |  |
-| `confidence` | D | projection/entities.py:1214 n.confidence=coalesce($cf,..); ep.py:199; dream.py:272 | ConfidenceChanged {confidence}; ALSO written from PointAdded payload | §17.5 + §3: EP scalar 'never stored independently'. ⚠ TENSION: the fixed clause DOES persist a payload value (coalesce), so the code stores what the doc calls derived |
-| `createdAt` | P | projection/entities.py:1215 n.createdAt=coalesce($ca,..,$now) | PointAdded.point.createdAt |  |
-| `validFrom` | P | projection/entities.py:1216 | PointAdded.point.validFrom; PointSuperseded.valid_from |  |
-| `validTo` | P | projection/entities.py:1217; sdk.py:8762 | PointSuperseded.valid_to; PointInvalidated.valid_to |  |
-| `updatedAt` | U | projection/entities.py:1218 n.updatedAt=$now | NOT carried — replay re-mints via `_now_iso`() | replay clock, not recorded instant → live≠replay; journal it or accept volatile |
-| `embedding` | P | projection/entities.py:1172/CASE,1244 REMOVE; sdk.py:5140 stamp_journal_embedding | PointAdded.point.embedding + embedding_model/revision/text_hash (#5004) | §3: JOURNAL IT — re-embed is a re-run not a replay |
-| `embedding_verbatim` | P | projection/entities.py:1176 n.embedding_verbatim | PointAdded.point.embedding_verbatim | caller-owned vector storage form |
-| `content_hash` | D | projection/entities.py:1213 n.content_hash=coalesce($ch,..) via `_content_hash`() | STRIPPED from journal: sdk.py:5140 `if k != 'content_hash'` | §3: RECOMPUTE — pure function of content (#2795 D2) |
-| `direction` | P | projection/entities.py:1310 (op branch) n.direction=$dir | OperatorAdded.point.direction | operator edge direction |
-| `label` | P | projection/entities.py:1312 n.label=$label | OperatorAdded.point.label | operator domain verb |
-| `extractedFrom` | P | projection/entities.py:1348 SET n.extractedFrom=$ref | PointAdded.point.extractedFrom (edge authoritative) | query-convenience scalar; edges authoritative |
-| `provenanceSource` | P | projection/entities.py:1352 SET n.provenanceSource=$sid | PointAdded.point.provenance.source_id | P1-2 cached provenance id |
-| `is_episodic` | P | projection/entities.py:1330 n.is_episodic=$episodic | PointAdded.point.is_episodic | server-managed quota discriminator (#1486) |
-| `sourceVersionTransit` | P | projection/entities.py:1304 n.sourceVersionTransit=$sv | PointAdded.point.sourceVersionTransit (#5256) | replay carrier for extractedFrom version |
-| `mitigation_strength` | P | sdk.py:10582 CREATE (m:Point {.., mitigation_strength:$s}); `projection/__init__.py`:11119 n.mitigation_strength | OperatorAdded.point.mitigation_strength (open-set) | #2315 graded dampener; edge read |
-| `batch_id` | P | sdk.py:12678 / `projection/__init__.py`:8387 SET n.batch_id; mining.py:312 | BatchIdStamped (JSONL-only record) | #902 A4; restored by pass-2b |
-| `version` | U | sdk.py:8413/8422 n.version=coalesce(n.version,0)+1 | not carried on PointRevised | counter; replay increments from a different base → divergence candidate |
-| `promotedAt` | P | sdk.py:9500 SET n.promotedAt=$now | PointPromoted.point.promotedAt (full snapshot) | #785 reviewer-gated promotion |
-| `reviewed` | P | sdk.py:9500 SET n.reviewed=true; 10091/10107 | PointPromoted.point.reviewed; DedupeRecorded | DERIVED reviewer flag per code comment, but rides the journaled snapshot → in record |
-| `outdated` | P | sdk.py:8761 SET n.outdated=true; projection/entities.py:2323 | PointInvalidated {expired_at,valid_to}; PointSuperseded | lifecycle terminal flag; deny-listed from PointAdded passthrough |
-| `expiredAt` | P | sdk.py:8762/9312; projection/entities.py:2324 | PointInvalidated.expired_at; PointSuperseded.expired_at |  |
+| `id` | P | projection/entities.py MERGE (n:Point {id:$id}); sdk.py create_point CREATE map | PointAdded.point.id / PointPromoted.point.id / OperatorAdded.point.id | identity / MERGE key |
+| `content` | P | projection/entities.py n.content=$content | PointAdded.point.content (full snapshot) | §3: JOURNAL — decision output |
+| `is_operator` | P | projection/entities.py n.is_operator=$isop | PointAdded.point.is_operator | identity flag; #5048 |
+| `op_type` | P | projection/entities.py n.op_type=$opt | OperatorAdded.point.op_type | operator kind |
+| `pointKind` | P | projection/entities.py n.pointKind=coalesce($pk,..) | PointAdded.point.pointKind | kind |
+| `status` | P | projection/entities.py n.status=coalesce($st,..,'live'); sdk.py | PointAdded.point.status, PointRevised, PointPromoted, PointRetracted | lifecycle, journaled by dedicated events |
+| `authoredBy` | P | projection/entities.py n.authoredBy=coalesce($ab,..) | PointAdded.point.authoredBy (`_META_KEY` handled as edge) |  |
+| `confidence` | D | projection/entities.py n.confidence=coalesce($cf,..); ep.py; dream.py | ConfidenceChanged {confidence}; ALSO written from PointAdded payload | §17.5 + §3: EP scalar 'never stored independently'. ⚠ TENSION: the fixed clause DOES persist a payload value (coalesce), so the code stores what the doc calls derived |
+| `createdAt` | P | projection/entities.py n.createdAt=coalesce($ca,..,$now) | PointAdded.point.createdAt |  |
+| `validFrom` | P | projection/entities.py | PointAdded.point.validFrom; PointSuperseded.valid_from |  |
+| `validTo` | P | projection/entities.py; sdk.py | PointSuperseded.valid_to; PointInvalidated.valid_to |  |
+| `updatedAt` | U | projection/entities.py n.updatedAt=$now | NOT carried — replay re-mints via `_now_iso`() | replay clock, not recorded instant → live≠replay; journal it or accept volatile |
+| `embedding` | P | projection/entities.py/CASE,1244 REMOVE; sdk.py stamp_journal_embedding | PointAdded.point.embedding + embedding_model/revision/text_hash (#5004) | §3: JOURNAL IT — re-embed is a re-run not a replay |
+| `embedding_verbatim` | P | projection/entities.py n.embedding_verbatim | PointAdded.point.embedding_verbatim | caller-owned vector storage form |
+| `content_hash` | D | projection/entities.py n.content_hash=coalesce($ch,..) via `_content_hash`() | STRIPPED from journal: sdk.py `if k != 'content_hash'` | §3: RECOMPUTE — pure function of content (#2795 D2) |
+| `direction` | P | projection/entities.py (op branch) n.direction=$dir | OperatorAdded.point.direction | operator edge direction |
+| `label` | P | projection/entities.py n.label=$label | OperatorAdded.point.label | operator domain verb |
+| `extractedFrom` | P | projection/entities.py SET n.extractedFrom=$ref | PointAdded.point.extractedFrom (edge authoritative) | query-convenience scalar; edges authoritative |
+| `provenanceSource` | P | projection/entities.py SET n.provenanceSource=$sid | PointAdded.point.provenance.source_id | P1-2 cached provenance id |
+| `is_episodic` | P | projection/entities.py n.is_episodic=$episodic | PointAdded.point.is_episodic | server-managed quota discriminator (#1486) |
+| `sourceVersionTransit` | P | projection/entities.py n.sourceVersionTransit=$sv | PointAdded.point.sourceVersionTransit (#5256) | replay carrier for extractedFrom version |
+| `mitigation_strength` | P | sdk.py CREATE (m:Point {.., mitigation_strength:$s}); `projection/__init__.py`:11119 n.mitigation_strength | OperatorAdded.point.mitigation_strength (open-set) | #2315 graded dampener; edge read |
+| `batch_id` | P | sdk.py / `projection/__init__.py`:8387 SET n.batch_id; mining.py | BatchIdStamped (JSONL-only record) | #902 A4; restored by pass-2b |
+| `version` | U | sdk.py/8422 n.version=coalesce(n.version,0)+1 | not carried on PointRevised | counter; replay increments from a different base → divergence candidate |
+| `promotedAt` | P | sdk.py SET n.promotedAt=$now | PointPromoted.point.promotedAt (full snapshot) | #785 reviewer-gated promotion |
+| `reviewed` | P | sdk.py SET n.reviewed=true; 10091/10107 | PointPromoted.point.reviewed; DedupeRecorded | DERIVED reviewer flag per code comment, but rides the journaled snapshot → in record |
+| `outdated` | P | sdk.py SET n.outdated=true; projection/entities.py | PointInvalidated {expired_at,valid_to}; PointSuperseded | lifecycle terminal flag; deny-listed from PointAdded passthrough |
+| `expiredAt` | P | sdk.py/9312; projection/entities.py | PointInvalidated.expired_at; PointSuperseded.expired_at |  |
 | `search_keys` | P | `projection/__init__.py`:10233 SET n.search_keys=$flat | PointAdded.point.search_keys (declared list prop) | declared payload prop; the FLATTENED value is a pure function |
-| `speaker` | P | sdk.py:1758; `_POINT_DECLARED_PROPS` | PointAdded.point.speaker | declared payload prop |
+| `speaker` | P | sdk.py; `_POINT_DECLARED_PROPS` | PointAdded.point.speaker | declared payload prop |
 | `quote` | P | `_POINT_DECLARED_PROPS` | PointAdded.point.quote | declared payload prop |
 | `when` | P | `_POINT_DECLARED_PROPS` | PointAdded.point.when | declared payload prop |
 | `source_turn_id` | P | `_POINT_DECLARED_PROPS` | PointAdded.point.source_turn_id | declared payload prop |
@@ -455,35 +462,35 @@ The full per-property table (216 rows, with the `file:line` writer and the journ
 | `annotator_consistency` | P | `_POINT_DECLARED_PROPS` (#3689) | PointAdded.point.annotator_consistency; OperatorAnnotated.consistency |  |
 | `annotator_directness` | P | `_POINT_DECLARED_PROPS` (#3689) | PointAdded.point.annotator_directness; OperatorAnnotated.directness |  |
 | `goalState` | P | `_POINT_DECLARED_PROPS` (#7856) | PointAdded.point.goalState | closed vocabulary, separate from status |
-| `source_harness` | P | hosted_api.py:13044 | open-set passthrough on PointAdded snapshot | capture provenance prop |
-| `source_session` | P | hosted_api.py:13044 | open-set passthrough | capture provenance prop |
-| `ingested_at` | P | hosted_api.py:13044 | open-set passthrough |  |
-| `eventId` | P | hosted_api.py:13044 | open-set passthrough | link to Event |
-| `sourceDate` | P | audit.py:364 | open-set passthrough | evidence-age clock |
-| `assessor` | P | sdk.py:25904 | open-set passthrough |  |
-| `targetSource` | P | sdk.py:25703 | open-set passthrough |  |
-| `grounding` | P | projection/grounding.py:83 SET n.grounding=$g | open-set passthrough |  |
-| `lme_question_id` | P | session_reinjection.py:1 | open-set passthrough | eval-lane tag |
-| `dedup_candidate` | P | sdk.py:9950 | DedupeRecorded.point | #784 |
-| `dedup_method` | P | sdk.py:9950 | DedupeRecorded.point | #784 |
-| `dedup_similarity` | P | sdk.py:9950 | DedupeRecorded.point | #784 |
-| `dedup_target_id` | P | sdk.py:9950 | DedupeRecorded.point | #784 |
-| `dedup_reviewed` | P | sdk.py:10107 | open-set / DedupeRecorded |  |
-| `temporal_candidate` | P | mining.py:566 | mining record (check)  | temporal-mining family |
-| `temporal_target_ids` | P | mining.py:567 | mining record (check) |  |
-| `temporal_target_id` | P | mining.py:568 | mining record (check) |  |
-| `temporal_replacement` | P | mining.py:569 | mining record (check) |  |
-| `temporal_reviewed` | U | sdk.py:10090 SET n.temporal_reviewed, n.reviewed=true | no dedicated event found | confirm whether a journal carrier exists |
-| `lastDreamedAt` | D | dream.py:272 SET n.lastDreamedAt=$now | ConfidenceChanged via `_journal_belief_writeback` (lastDreamedAt) | EP-owned recompute stamp; deny-listed |
-| `ep_alpha` | D | ep.py:199 SET n.ep_alpha; sdk.py:15666 | NOT carried (fold drops; `_POINT_DENY`) | §17.5 |
-| `ep_beta` | D | ep.py:199 SET n.ep_beta; sdk.py:15666 | NOT carried | §17.5 |
-| `baseline_set` | U | sdk.py:15666 SET n.baseline_set=true | NOT carried — sdk.py:15733 states the 4 baseline props are in `_POINT_DENY` and lost on rebuild | set-by-author prior is a non-reconstructible INPUT (§3 test ⇒ PRIMARY), inherited/system-default are recomputable (⇒ DERIVED). §17.5's blanket 'derived' is wrong for the first |
-| `baseline_source` | U | sdk.py:15666 SET n.baseline_source=$src | NOT carried | same as baseline_set — separates set-by-author from inherited/system-default |
-| `posterior_alpha` | D | ep.py:199 SET n.posterior_alpha; sdk.py:15744 | ConfidenceChanged.posterior_alpha | §17.5; recomputed posterior |
-| `posterior_beta` | D | ep.py:199 SET n.posterior_beta; sdk.py:15744 | ConfidenceChanged.posterior_beta | §17.5; recomputed posterior |
-| `ep_dirty` | D | sdk.py:14351 SET n.ep_dirty=null; `_mark_dirty` | NOT journalled (#5166, stated sdk.py:10564) | §17.5; volatile dirty flag |
-| `ep_dirty_at` | D | sdk.py:14351 SET n.ep_dirty_at=null | NOT journalled (#5166) | §17.5; volatile dirty timestamp |
-| `inherited_at` | U | sdk.py:16097 SET n.inherited_at=$ts | NOT carried | per-run time gate for inherited baselines — an input to a decision, not a pure recompute; decide journal-vs-derive |
+| `source_harness` | P | hosted_api.py | open-set passthrough on PointAdded snapshot | capture provenance prop |
+| `source_session` | P | hosted_api.py | open-set passthrough | capture provenance prop |
+| `ingested_at` | P | hosted_api.py | open-set passthrough |  |
+| `eventId` | P | hosted_api.py | open-set passthrough | link to Event |
+| `sourceDate` | P | audit.py | open-set passthrough | evidence-age clock |
+| `assessor` | P | sdk.py | open-set passthrough |  |
+| `targetSource` | P | sdk.py | open-set passthrough |  |
+| `grounding` | P | projection/grounding.py SET n.grounding=$g | open-set passthrough |  |
+| `lme_question_id` | P | session_reinjection.py | open-set passthrough | eval-lane tag |
+| `dedup_candidate` | P | sdk.py | DedupeRecorded.point | #784 |
+| `dedup_method` | P | sdk.py | DedupeRecorded.point | #784 |
+| `dedup_similarity` | P | sdk.py | DedupeRecorded.point | #784 |
+| `dedup_target_id` | P | sdk.py | DedupeRecorded.point | #784 |
+| `dedup_reviewed` | P | sdk.py | open-set / DedupeRecorded |  |
+| `temporal_candidate` | P | mining.py | mining record (check)  | temporal-mining family |
+| `temporal_target_ids` | P | mining.py | mining record (check) |  |
+| `temporal_target_id` | P | mining.py | mining record (check) |  |
+| `temporal_replacement` | P | mining.py | mining record (check) |  |
+| `temporal_reviewed` | U | sdk.py SET n.temporal_reviewed, n.reviewed=true | no dedicated event found | confirm whether a journal carrier exists |
+| `lastDreamedAt` | D | dream.py SET n.lastDreamedAt=$now | ConfidenceChanged via `_journal_belief_writeback` (lastDreamedAt) | EP-owned recompute stamp; deny-listed |
+| `ep_alpha` | D | ep.py SET n.ep_alpha; sdk.py | NOT carried (fold drops; `_POINT_DENY`) | §17.5 |
+| `ep_beta` | D | ep.py SET n.ep_beta; sdk.py | NOT carried | §17.5 |
+| `baseline_set` | U | sdk.py SET n.baseline_set=true | NOT carried — sdk.py states the 4 baseline props are in `_POINT_DENY` and lost on rebuild | set-by-author prior is a non-reconstructible INPUT (§3 test ⇒ PRIMARY), inherited/system-default are recomputable (⇒ DERIVED). §17.5's blanket 'derived' is wrong for the first |
+| `baseline_source` | U | sdk.py SET n.baseline_source=$src | NOT carried | same as baseline_set — separates set-by-author from inherited/system-default |
+| `posterior_alpha` | D | ep.py SET n.posterior_alpha; sdk.py | ConfidenceChanged.posterior_alpha | §17.5; recomputed posterior |
+| `posterior_beta` | D | ep.py SET n.posterior_beta; sdk.py | ConfidenceChanged.posterior_beta | §17.5; recomputed posterior |
+| `ep_dirty` | D | sdk.py SET n.ep_dirty=null; `_mark_dirty` | NOT journalled (#5166, stated sdk.py) | §17.5; volatile dirty flag |
+| `ep_dirty_at` | D | sdk.py SET n.ep_dirty_at=null | NOT journalled (#5166) | §17.5; volatile dirty timestamp |
+| `inherited_at` | U | sdk.py SET n.inherited_at=$ts | NOT carried | per-run time gate for inherited baselines — an input to a decision, not a pure recompute; decide journal-vs-derive |
 | `c_cal` | D | `_POINT_DENY` (calibration cache; written by calibration path) | deny-listed from passthrough | EP calibration cache |
 | `_nid` | D | `_POINT_DENY` / projection replay bookkeeping | never a payload prop | replay bookkeeping, not a record field |
 | `_graph_id` | D | `_POINT_DENY` / projection replay bookkeeping | never a payload prop | replay bookkeeping |
@@ -495,22 +502,22 @@ The full per-property table (216 rows, with the `file:line` writer and the journ
 
 | property | class | evidence (writer) | journal carrier | notes |
 |---|---|---|---|---|
-| `IMPL.idx` | P | sdk.py:12492/10411 CREATE (o)-[:IMPL {idx:$i}]; projection/edges.py:644 | OperatorAdded (edge re-created by fold from inputs+idx) | position index; replayed from OperatorAdded.inputs |
+| `IMPL.idx` | P | sdk.py/10411 CREATE (o)-[:IMPL {idx:$i}]; projection/edges.py | OperatorAdded (edge re-created by fold from inputs+idx) | position index; replayed from OperatorAdded.inputs |
 | `NAND.idx` | P | same as IMPL | OperatorAdded |  |
-| `INPUT.idx` | P | projection/edges.py:648/718 CREATE (s)-[:INPUT {idx:$i}]->(o) | OperatorAdded.inputs order |  |
-| `IMPL.direction` | P | sdk.py:12986 create_direct_edge SET r += attrs{direction} | DirectEdgeCreated.direction; DirectEdgeRepoint.direction |  |
-| `IMPL.confidence` | U | sdk.py:12988 attrs['confidence']=float(confidence) | DirectEdgeCreated (confidence kwarg) | EP also derives confidence → stored raw edge confidence may conflict with EP; classify |
-| `IMPL.weight` | U | sdk.py:12989 attrs['weight']=float(weight) | DirectEdgeCreated.weight | same tension as confidence |
-| `IMPL.label` | P | sdk.py:12990 attrs['label']=label | DirectEdgeCreated.label |  |
-| `IMPL.batch_id` | P | sdk.py:12991 attrs['batch_id']=batch_id | DirectEdgeCreated.batch_id; BatchIdStamped |  |
+| `INPUT.idx` | P | projection/edges.py/718 CREATE (s)-[:INPUT {idx:$i}]->(o) | OperatorAdded.inputs order |  |
+| `IMPL.direction` | P | sdk.py create_direct_edge SET r += attrs{direction} | DirectEdgeCreated.direction; DirectEdgeRepoint.direction |  |
+| `IMPL.confidence` | U | sdk.py attrs['confidence']=float(confidence) | DirectEdgeCreated (confidence kwarg) | EP also derives confidence → stored raw edge confidence may conflict with EP; classify |
+| `IMPL.weight` | U | sdk.py attrs['weight']=float(weight) | DirectEdgeCreated.weight | same tension as confidence |
+| `IMPL.label` | P | sdk.py attrs['label']=label | DirectEdgeCreated.label |  |
+| `IMPL.batch_id` | P | sdk.py attrs['batch_id']=batch_id | DirectEdgeCreated.batch_id; BatchIdStamped |  |
 | `NAND.direction/confidence/weight/label/batch_id` | P | same writers with rel_type=NAND | DirectEdgeCreated |  |
-| `IMPL.msg_alpha` | D | ep.py:241/333 SET r.msg_alpha=p.a | NOT carried | BP message — recomputed each EP run; REMOVE'd by invalidate_messages |
-| `IMPL.msg_beta` | D | ep.py:241/333 | NOT carried | BP message |
-| `IMPL.back_msg_alpha` | D | ep.py:256/366 SET r.back_msg_alpha | NOT carried | BP back-message |
-| `IMPL.back_msg_beta` | D | ep.py:256/366 | NOT carried | BP back-message |
-| `references.sourceVersion` | P | projection/edges.py:358 `_anchor_on_create`; edges.py:1010/1043/1063 | SourceCreated/SourceVersioned (sourceVersionTransit on the Point snapshot) | #5199 version anchor |
-| `extractedFrom.sourceVersion` | P | projection/edges.py:892/927 `_link_source` | Point.sourceVersionTransit (#5256) | replay passes the Point's own transit |
-| `mitigated_by.*` | P | projection/edges.py:710 MERGE (s)-[:mitigated_by]->(o) — no props | OperatorAdded.point.mitigation_strength | no edge properties |
-| `aboutSubject/aboutObject/aboutEvent/aboutPoint/aboutDocument.*` | P | projection/edges.py:754/`_create_about_edges` — no props | about_entities / about* keys on the snapshot | no edge properties |
+| `IMPL.msg_alpha` | D | ep.py/333 SET r.msg_alpha=p.a | NOT carried | BP message — recomputed each EP run; REMOVE'd by invalidate_messages |
+| `IMPL.msg_beta` | D | ep.py/333 | NOT carried | BP message |
+| `IMPL.back_msg_alpha` | D | ep.py/366 SET r.back_msg_alpha | NOT carried | BP back-message |
+| `IMPL.back_msg_beta` | D | ep.py/366 | NOT carried | BP back-message |
+| `references.sourceVersion` | P | projection/edges.py `_anchor_on_create`; edges.py/1043/1063 | SourceCreated/SourceVersioned (sourceVersionTransit on the Point snapshot) | #5199 version anchor |
+| `extractedFrom.sourceVersion` | P | projection/edges.py/927 `_link_source` | Point.sourceVersionTransit (#5256) | replay passes the Point's own transit |
+| `mitigated_by.*` | P | projection/edges.py MERGE (s)-[:mitigated_by]->(o) — no props | OperatorAdded.point.mitigation_strength | no edge properties |
+| `aboutSubject/aboutObject/aboutEvent/aboutPoint/aboutDocument.*` | P | projection/edges.py/`_create_about_edges` — no props | about_entities / about* keys on the snapshot | no edge properties |
 | `CONTAINS.*` | P | sdk.py turn loop MERGE (s)-[:CONTAINS]->(t) — no props | PointAdded envelope contains_session (#3947) | no edge properties |
 | `authoredBy/ownedBy/managedBy/performs/produces/uses/participatesIn/TAGGED.*` | P | projection/entities.py, `_META_KEYS` handled as edges — no props | event.subject/object/uses/participants; about_entities | no edge properties |
