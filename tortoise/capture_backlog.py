@@ -1,0 +1,396 @@
+"""The SAVED-BACKLOG ledger — the local record #4197's choice needs (#4197).
+
+A capture made with no LLM provider key STORES its turns and SKIPS extraction
+(the #3892 owner ruling), and so does a capture made while the team's
+``capture_extract`` setting is OFF (#4258).  BOTH are *store-only*: the Session
+and its turn Points exist and are searchable, but no memory point was ever
+extracted from them.  The design already allows a LATER keyed re-capture to
+extract (the #2335 TRUE-retry gate), but **nothing offered that to the user and
+nothing recommended it** — and nothing could, because a store-only 2xx was the
+ONE capture outcome that left NO local trace at all:
+
+* a successful extraction writes ``~/.tortoise/import-receipts/<session>.json``;
+* a failure writes ``~/.tortoise/capture-errors/<harness>.json``;
+* a store-only deferral writes **neither** — deliberately, because a receipt
+  would make every later ``sessions import`` skip the POST on a stale receipt
+  and the session could then never gain its memory points.
+
+So the machine could not enumerate its own backlog, could not show what the
+backlog would cost, could not remember whether the user chose to process it or
+to keep only future conversations, and could not report which of the three
+states it was in.  This module is that missing record, and nothing else: it is
+a LEDGER, not an extraction mechanism.  Processing a backlog entry goes through
+the EXISTING ``sessions import`` re-capture path (the #2335 gate), which is also
+what re-runs the capture's turn write — so the #4194 turn embedding lands for
+the stored turns too, and the semantic-retrieval gap the option is offered for
+is actually closed (verified by census, never by the option's own claim).
+
+Three states, and the names are the issue's own — this module does not mint
+vocabulary:
+
+* ``not-processed`` — a saved transcript captured store-only, never extracted;
+* ``processed``     — the backlog run re-captured it and extraction ran;
+* ``declined``      — the user chose "only future conversations" (a POLICY, not
+  a per-session verdict: the saved sessions stay listed as ``not-processed``,
+  and the declined state is recorded once, so it is distinguishable from
+  "backlog processed" and re-offerable later).
+
+THE DERIVATION IS SHARED, NEVER SPELLED TWICE.  The ledger lives under
+:func:`tortoise.hook_install.local_state_dir` — the same HOME-scoped base the
+breadcrumb and the hook-run observation use — so it follows the SAME
+``TORTOISE_IMPORT_RECEIPT_DIR`` override the receipt writers honour and cannot
+drift into a second tree (the #4373 class).
+
+EVERY WRITE IS BEST-EFFORT AND NEVER RAISES.  Two of the three writers run
+inside a capture path whose contract is fail-open (a hook's capture must never
+be blocked or turned into a traceback by local bookkeeping).  A ledger bug
+loses the *offer*, never the capture — which is why every writer returns a bool
+and swallows its exception rather than propagating one.
+
+THIS IS NOT THE READ PATH'S STATUS SURFACE.  The server-side state
+(``capture_ok`` / ``capture_extractor``) is exposed by no read surface yet
+(#3520 owns that), and the dashboard's onboarding offer is the hosted half of
+#4197.  What this module can report is what the MACHINE can know on its own:
+the transcript it kept, and the choice its user made.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+__all__ = [
+    "BACKLOG_DIR_LEAF",
+    "CHOICE_BACKLOG",
+    "CHOICE_FUTURE_ONLY",
+    "STATUS_DECLINED",
+    "STATUS_NOT_PROCESSED",
+    "STATUS_PROCESSED",
+    "backlog_dir",
+    "estimate_units",
+    "format_report",
+    "mark_processed",
+    "read_policy",
+    "recommendation",
+    "record_not_processed",
+    "sessions",
+    "set_policy",
+    "summary",
+]
+
+#: The leaf under the shared local-state base.  Read through
+#: :func:`tortoise.hook_install.local_state_dir`, never re-derived here.
+BACKLOG_DIR_LEAF = "capture-backlog"
+
+#: The filename of the policy record.  A v4-style session id can never be
+#: ``policy`` (the writers mint ``imp_`` / ``session_`` prefixed ids), and the
+#: scan skips this name explicitly rather than relying on that.
+_POLICY_FILE = "policy.json"
+
+#: The three states.  Taken from #4197's own acceptance criteria — "the read
+#: path's status reflects all three states (not processed / processed /
+#: declined) without coining new vocabulary".
+STATUS_NOT_PROCESSED = "not-processed"
+STATUS_PROCESSED = "processed"
+STATUS_DECLINED = "declined"
+BACKLOG_STATUSES = (STATUS_NOT_PROCESSED, STATUS_PROCESSED)
+
+#: The two CHOICES the user can make.  ``declined`` is not a session status —
+#: it is the recorded policy, and it is what makes "future only" distinguishable
+#: from "backlog processed" while leaving the saved sessions listed.
+CHOICE_BACKLOG = "backlog"
+CHOICE_FUTURE_ONLY = "future-only"
+_POLICY_CHOICES = (CHOICE_BACKLOG, CHOICE_FUTURE_ONLY)
+
+
+def backlog_dir() -> Path:
+    """The ledger directory — the shared local-state base plus its leaf.
+
+    Fallible exactly as its base is (``Path.home()`` can raise when ``$HOME``
+    is a literal ``~``): every caller treats the derivation as fallible, and
+    the writers catch, never propagate.
+    """
+    from tortoise.hook_install import local_state_dir
+    return local_state_dir(BACKLOG_DIR_LEAF)
+
+
+def _session_path(session_id: str) -> Path:
+    """The record path for one ``session_id``.
+
+    ``session_id`` reaches this from a CLI argument and from a server response,
+    so it is a path segment derived from untrusted text: the separator, dot
+    segments and the empty name are all refused by substitution rather than
+    left to ``pathlib`` (a ``../..`` id would otherwise write OUTSIDE the
+    ledger and a reader scanning the directory would never see the record it
+    wrote — a silent write-nothing).
+    """
+    safe = str(session_id).strip()
+    for bad in ("/", "\\"):
+        safe = safe.replace(bad, "_")
+    safe = safe.replace("..", "_") or "_unnamed"
+    return backlog_dir() / f"{safe}.json"
+
+
+def _write_json(path: Path, record: dict) -> bool:
+    """Write ``record`` at ``path`` atomically-enough, never raising.
+
+    Written to a sibling temp then ``replace``d: two capture hooks can defer at
+    the same moment (per-turn hooks fire concurrently), and a reader that
+    catches a half-written record would report a session with no file and no
+    estimate — the offer would understate the backlog it exists to show.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(record, indent=2, sort_keys=True),
+                       encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _read_json(path: Path) -> dict | None:
+    """``path`` parsed as an object, or ``None``.
+
+    Broad catch on purpose: this runs in a status report and in a capture
+    path, and a malformed/unreadable record must read as "nothing recorded"
+    rather than as a traceback.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def estimate_units(conversation: list[dict] | None) -> int:
+    """The product's OWN pre-write cost unit for extracting ``conversation``.
+
+    Delegates to :func:`tortoise.sdk._session_extraction_estimate` — the same
+    v2-aware estimator the hosted 402 quota gate uses — so the number the offer
+    shows and the number the server charges cannot disagree.  A missing/odd
+    conversation yields 0 rather than raising (the offer must degrade to "cost
+    unknown", never to no offer).
+    """
+    if not conversation:
+        return 0
+    try:
+        from tortoise.sdk import _session_extraction_estimate
+        return int(_session_extraction_estimate(conversation))
+    except Exception:
+        return 0
+
+
+def record_not_processed(*, session_id: str, harness: str | None = None,
+                         file: str | None = None, turns: int = 0,
+                         estimate: int = 0, reason: str | None = None,
+                         recorded_at: str | None = None) -> bool:
+    """Record that ``session_id`` was captured STORE-ONLY — never extracted.
+
+    Called from the two deferral points (``sessions import`` and
+    ``session capture``) at the moment the server's receipt says the capture
+    stored its turns and skipped extraction.
+
+    IDEMPOTENT AND MONOTONIC: an existing ``processed`` record is never
+    downgraded back to ``not-processed``.  A later store-only re-capture of a
+    session whose backlog run ALREADY extracted it (a keyless re-capture of a
+    grown transcript, say) must not re-list it as backlog — it would otherwise
+    be offered, and processed, a second time.
+
+    Returns ``True`` when a record was written, ``False`` when the write failed
+    or the record already said ``processed``.  Never raises.
+    """
+    try:
+        path = _session_path(session_id)
+        existing = _read_json(path)
+        if existing and existing.get("status") == STATUS_PROCESSED:
+            return False
+        record = {
+            "session_id": str(session_id),
+            "status": STATUS_NOT_PROCESSED,
+            "harness": harness,
+            "file": str(file) if file else None,
+            "turns": int(turns or 0),
+            "estimate": int(estimate or 0),
+            # WHY it was store-only.  The two reasons are independent levers
+            # (#4258): naming the wrong one sends the user to a remedy that
+            # cannot work, which is exactly what the CLI's deferral message
+            # exists to prevent.
+            "reason": reason,
+            "recorded_at": recorded_at,
+        }
+        if existing and existing.get("processed_at"):
+            # Preserve the historical processed facts on a re-record (only
+            # reachable if a caller explicitly re-recorded after a keyless
+            # re-capture of a processed session, which the guard above returns
+            # False for — kept as belt-and-braces so a future edit to the guard
+            # cannot silently drop them).
+            record["processed_at"] = existing.get("processed_at")
+        return _write_json(path, record)
+    except Exception:
+        return False
+
+
+def mark_processed(session_id: str, *, processed_at: str | None = None) -> bool:
+    """Mark ``session_id``'s backlog entry as EXTRACTED.  Never raises.
+
+    Called after a re-capture whose receipt says extraction ran.  A session
+    with no ledger record is a no-op (``False``) — the ledger records only
+    sessions that were store-only, and inventing a ``processed`` record for a
+    normal capture would report a backlog that never existed.
+    """
+    try:
+        path = _session_path(session_id)
+        existing = _read_json(path)
+        if not existing:
+            return False
+        existing["status"] = STATUS_PROCESSED
+        existing["processed_at"] = processed_at
+        return _write_json(path, existing)
+    except Exception:
+        return False
+
+
+def read_policy() -> dict:
+    """The recorded choice, or ``{}`` — with no default invented here.
+
+    An ABSENT policy is the honest state: the user has not been asked (or has
+    not answered), which is emphatically not the same thing as "declined".  The
+    three-state report must keep those apart or it would report a choice the
+    user never made.
+    """
+    return _read_json(backlog_dir() / _POLICY_FILE) or {}
+
+
+def set_policy(choice: str, *, decided_at: str | None = None) -> bool:
+    """Record ``choice`` (``backlog`` | ``future-only``).  Never raises.
+
+    Refuses an unknown choice rather than storing it: this record is what the
+    three-state report reads, and a typo'd policy would read as "asked and
+    answered" with a state nothing can interpret.
+    """
+    if choice not in _POLICY_CHOICES:
+        return False
+    return _write_json(backlog_dir() / _POLICY_FILE,
+                       {"choice": choice, "decided_at": decided_at})
+
+
+def sessions() -> list[dict]:
+    """Every ledger record, oldest first, malformed entries skipped.
+
+    Ordered by ``recorded_at`` then id so a report and its follow-up agree
+    (filesystem order is not an ordering).
+    """
+
+    def _sort_key(rec: dict) -> tuple[str, str]:
+        return (str(rec.get("recorded_at") or ""), str(rec.get("session_id") or ""))
+
+    try:
+        directory = backlog_dir()
+    except Exception:
+        return []
+    try:
+        paths = [p for p in directory.glob("*.json")
+                 if p.name not in (_POLICY_FILE,)
+                 and not p.name.endswith(".tmp")]
+    except Exception:
+        return []
+    records: list[dict] = []
+    for path in paths:
+        rec = _read_json(path)
+        if rec and rec.get("status") in BACKLOG_STATUSES:
+            records.append(rec)
+    records.sort(key=_sort_key)
+    return records
+
+
+def summary() -> dict:
+    """The three-state view of the saved backlog.  Never raises.
+
+    ``cost_units`` counts only what a backlog run would now spend — the
+    ``not-processed`` entries.  A ``processed`` entry's spend already happened,
+    and including it would make the number rise as the user worked through the
+    backlog, which is the opposite of what it is for.
+    """
+    records = sessions()
+    not_processed = [r for r in records
+                     if r.get("status") == STATUS_NOT_PROCESSED]
+    processed = [r for r in records if r.get("status") == STATUS_PROCESSED]
+    policy = read_policy()
+    choice = policy.get("choice")
+    return {
+        "statuses": list(BACKLOG_STATUSES),
+        "not_processed": not_processed,
+        "processed": processed,
+        "counts": {
+            STATUS_NOT_PROCESSED: len(not_processed),
+            STATUS_PROCESSED: len(processed),
+        },
+        "cost_units": sum(int(r.get("estimate") or 0) for r in not_processed),
+        "turns": sum(int(r.get("turns") or 0) for r in not_processed),
+        "policy": policy,
+        "choice": choice,
+        # The vocabulary the report renders.  ``declined`` is reported from the
+        # POLICY, never from the entries — see the module docstring.
+        "declined": choice == CHOICE_FUTURE_ONLY,
+    }
+
+
+def format_report(state: dict, *, provider: str | None = None,
+                  model: str | None = None) -> str:
+    """The human report for :func:`summary` — the offer, cost first.
+
+    The cost and the recommendation are printed BEFORE the run is possible, so
+    the spend is consented to rather than discovered (the owner is explicitly
+    sensitive to LLM budget — a silent background backlog run is a promise we
+    have not made).
+    """
+    lines: list[str] = []
+    counts = state.get("counts", {})
+    pending = int(counts.get(STATUS_NOT_PROCESSED, 0))
+    processed = int(counts.get(STATUS_PROCESSED, 0))
+    lines.append(f"Saved backlog: {pending} not-processed, "
+                 f"{processed} processed, "
+                 f"{'declined' if state.get('declined') else 'not declined'}.")
+    if pending:
+        provider_note = ""
+        if provider:
+            provider_note = (f" (extraction provider: {provider}"
+                             f"{', model ' + model if model else ''})")
+        lines.append(
+            f"  Cost if processed now: ~{int(state.get('cost_units') or 0)} "
+            f"estimated extraction unit(s) across "
+            f"{int(state.get('turns') or 0)} saved turn(s){provider_note}.")
+        for rec in state.get("not_processed", []):
+            lines.append(
+                f"  - {rec.get('session_id')} [{rec.get('harness') or 'harness?'}]"
+                f" {rec.get('turns') or 0} turn(s), est. "
+                f"{rec.get('estimate') or 0} unit(s)"
+                f"{' — ' + str(rec.get('reason')) if rec.get('reason') else ''}")
+    rec = recommendation(state)
+    if rec:
+        lines.append(f"  {rec}")
+    return "\n".join(lines)
+
+
+def recommendation(state: dict) -> str | None:
+    """The recommended action for a backlog state, or ``None`` when there is none.
+
+    PROCESSING THE BACKLOG IS THE VISIBLY RECOMMENDED OPTION (#4197 owner
+    decision, recorded verbatim on the issue): the backlog turns already-stored
+    transcripts into retrievable memory, and the reason search felt thin becomes
+    legible instead of mysterious.  It is recommended and not silently run
+    because it SPENDS model budget.
+
+    ``None`` when the backlog is empty — a recommendation over nothing is noise,
+    and it would turn every capture into an advertisement.
+    """
+    if not state.get("not_processed"):
+        return None
+    if state.get("declined"):
+        return ("Choice recorded: future conversations only. The saved backlog "
+                "is NOT extracted — run `tortoise sessions backlog --process` "
+                "to change that (recommended).")
+    return ("Recommended: `tortoise sessions backlog --process` extracts the "
+            "saved backlog now at the estimated cost shown above; "
+            "`--future-only` keeps only future conversations.")

@@ -205,6 +205,36 @@ Over hosted HTTP the `tortoise_mine_conversations` tool is stdio-only for
 security (#1090); run `tortoise serve` locally and connect your agent to it
 (stdio) to use it, or mine with the CLI against a local DB.
 
+### The saved backlog: sessions captured without a provider key
+
+A capture made with no LLM provider key — or while your team's extraction
+toggle is off — **stores its turns and skips extraction** (#3892 / #4258). The
+transcript is saved and searchable, but no memory was distilled from it, so
+search feels thinner than the stored material suggests. Adding a key later does
+not extract it by itself: **you choose** (#4197).
+
+```bash
+tortoise sessions backlog              # what is saved, what it would cost
+tortoise sessions backlog --process    # extract it now (RECOMMENDED)
+tortoise sessions backlog --future-only  # keep only future conversations
+```
+
+The report is the offer, and it prices the run **before** anything is spent
+(~N estimated extraction units across M turns, with the provider that would be
+used). Processing re-runs the capture for the saved transcripts through the
+existing re-capture gate, so it also writes the turn vectors the dense
+retrieval leg needs — the option fixes the retrieval gap it is offered for, not
+just the extraction gap. `tortoise doctor` prints the same state (and the
+recommendation) wherever it reports your provider key, so a backlog is visible
+instead of staying mysterious.
+
+The three states are distinguishable and the choice stays reversible: sessions
+are reported as **not-processed**, **processed**, or the run is **declined**
+(`--future-only`), and a later `--process` overrides a decline. The local
+ledger lives beside your import receipts (`~/.tortoise/capture-backlog/`, or
+under `$TORTOISE_IMPORT_RECEIPT_DIR`'s parent). It records the transcript path,
+harness, turn count and estimate — never transcript content.
+
 ## 4. Use the REST API
 
 Base URL `https://api.premiselabs.co`, header `Authorization: Bearer tt_YOUR_KEY` on every request.

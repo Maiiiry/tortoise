@@ -783,6 +783,13 @@ surfaces:
   # falls through to `core`, so without this entry the declaration's guard
   # never runs on the change that can delete it.
   - test_7856_goal_state.py
+  # #4197: the saved-backlog ledger (`tortoise/capture_backlog.py`) and its
+  # CLI surface (`tortoise/__main__.py`). `capture_backlog.py` matches no
+  # named SOURCE_PATTERN, so it falls through to `core` — registering the
+  # guard here is what makes it run on a change to the ledger alone. (A
+  # `__main__.py` change selects the FULL matrix, so the CLI half is covered
+  # either way; the module-only PR is the one this entry exists for.)
+  - test_capture_backlog_4197.py
   - test_ci_stall_identify.py
   # #4071: guards that the URI-less embedded test lane cannot resolve a bare
   # TortoiseSDK() to the owner's canonical store (~/.tortoise/tortoise.db) —

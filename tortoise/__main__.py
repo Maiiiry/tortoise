@@ -4442,6 +4442,28 @@ def _cmd_session_capture(args, api_key: str, api_url: str) -> int:
                          _CAPTURE_EXTRACTION_DISABLED_MODE):
         print(f"  Extraction: {_capture_mode} — the turns were STORED but no "
               "memory points were extracted", file=_sys.stderr)
+        # #4197: this is a STORE-ONLY capture of a transcript the machine still
+        # has — record it in the saved-backlog ledger so the user can later be
+        # OFFERED (and priced) the choice to extract it, or to keep only future
+        # conversations. Best-effort; the offer must never cost the capture.
+        import time as _time
+
+        from tortoise import capture_backlog as _backlog
+        _backlog.record_not_processed(
+            session_id=session_id, harness=harness,
+            file=getattr(args, "file", None), turns=len(turns),
+            estimate=_backlog.estimate_units(turns),
+            reason=(_CAPTURE_NO_PROVIDER_MODE
+                    if _capture_mode == _CAPTURE_NO_PROVIDER_MODE
+                    else _CAPTURE_EXTRACTION_DISABLED_MODE),
+            recorded_at=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()))
+    else:
+        # #4197: extraction ran for this session — if it had been deferred
+        # before, its backlog entry is now retired. No offer here (see
+        # `_flush_backlog_offer`): this path is the hook's, and it runs on
+        # every capture.
+        _flush_backlog_offer(session_id=session_id,
+                             server_session_id=server_session, offer=False)
     if body.get("warnings"):
         print("capture warnings: " + "; ".join(
             str(w) for w in body["warnings"]), file=_sys.stderr)
@@ -5083,6 +5105,211 @@ def _clear_capture_error(harness: str) -> None:
         _capture_error_file(harness).unlink()
 
 
+# ── The saved-backlog offer and its action (#4197) ─────────────────────────
+#
+# #4197 (owner decision, recorded verbatim on the issue): the user is OFFERED
+# the choice to process the saved backlog — transcripts captured store-only
+# (no provider key, or extraction turned off) and never extracted — or to
+# keep only future conversations, with the backlog option visibly RECOMMENDED
+# and its COST visible before the spend. The three states (not-processed /
+# processed / declined) and the ledger live in `tortoise.capture_backlog`.
+#
+# The processing path deliberately REUSES `_cmd_sessions_import` (below) for
+# every entry: that path already drives the #2335 TRUE-retry re-capture, which
+# re-runs the capture's turn WRITE as well as its extraction — so the #4194
+# turn embedding lands for the stored turns too. A backlog run that re-ran
+# extraction only would leave every stored turn un-embedded and the option
+# would silently not fix the retrieval gap it is offered for.
+
+
+def _backlog_provider_note() -> tuple[str | None, str | None]:
+    """``(provider, model)`` for the backlog cost line — best-effort.
+
+    Mirrors the doctor's seam exactly (``sdk._session_llm_provider`` /
+    ``_SESSION_LLM_DEFAULT_MODELS``) so the cost the offer shows names the same
+    provider the run would use. Never raises: the offer degrades to a cost
+    without a provider name, never to no offer.
+    """
+    import os
+    try:
+        from tortoise.sdk import (
+            _SESSION_LLM_DEFAULT_MODELS,
+            _session_llm_provider,
+        )
+        provider = _session_llm_provider()
+        model = (os.environ.get("TORTOISE_SESSION_LLM_MODEL", "").strip()
+                 or _SESSION_LLM_DEFAULT_MODELS.get(provider or "", ""))
+        return provider, (model or None)
+    except Exception:
+        return None, None
+
+
+def _print_backlog_offer() -> int:
+    """Print the backlog state + its recommended action; return the pending count.
+
+    SILENT when there is nothing to offer (an empty backlog yields no
+    recommendation) — otherwise every ordinary import would turn into an
+    advertisement for a feature the user has no reason to use.
+    """
+    from tortoise import capture_backlog
+    state = capture_backlog.summary()
+    if not capture_backlog.recommendation(state):
+        return 0
+    provider, model = _backlog_provider_note()
+    print(capture_backlog.format_report(state, provider=provider, model=model))
+    return int(state["counts"][capture_backlog.STATUS_NOT_PROCESSED])
+
+
+def _flush_backlog_offer(*, session_id: str,
+                         server_session_id: str | None = None,
+                         offer: bool = True) -> None:
+    """Retire the extracted session's backlog entry, then offer what remains.
+
+    Called from the places a re-capture's extraction provably ran (the
+    receipt-write success paths). Both the client-side idempotency key and the
+    server's echoed ``session_id`` are retired: they are the same value today
+    (the client sends it), and marking both keeps the ledger truthful if a
+    future server ever mints its own.
+
+    ``offer=False`` for the HOOK-DRIVEN capture path (``session capture``):
+    the bookkeeping must happen, but a hook's output is discarded or read by
+    an agent on every turn, and a recommendation repeated on every capture is
+    noise — not a recommendation. The offer belongs where a human is looking:
+    ``tortoise doctor``, the manual ``sessions import``, and
+    ``tortoise sessions backlog``.
+    """
+    import time
+
+    from tortoise import capture_backlog
+    _stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for _sid in {session_id, server_session_id}:
+        if _sid:
+            capture_backlog.mark_processed(_sid, processed_at=_stamp)
+    if offer:
+        _print_backlog_offer()
+
+
+def _cmd_sessions_backlog(args) -> int:
+    """#4197: report, process, or decline the SAVED backlog.
+
+    Three states, read from the local ledger (`tortoise.capture_backlog`):
+    ``not-processed`` (saved, never extracted), ``processed`` (the backlog run
+    extracted it), and ``declined`` (the recorded policy: future conversations
+    only). The names are the issue's own — no vocabulary is minted here.
+
+    ``--process`` is the ONLY path that spends model budget, it is reached only
+    by an explicit request, and the estimated cost is printed BEFORE the first
+    POST. An explicit later ``--process`` also overrides a previous
+    ``--future-only`` (the choice is re-offerable, #4197 AC5).
+    """
+    import time
+
+    from tortoise import capture_backlog
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state = capture_backlog.summary()
+
+    if getattr(args, "future_only", False):
+        pending = int(state["counts"][capture_backlog.STATUS_NOT_PROCESSED])
+        if not capture_backlog.set_policy(capture_backlog.CHOICE_FUTURE_ONLY,
+                                         decided_at=now):
+            print("Could not record the choice (the local ledger is not "
+                  "writable).")
+            return 1
+        print(f"Choice recorded: only future conversations will be "
+              f"extracted. {pending} saved session(s) stay un-extracted and "
+              f"are NOT re-extracted on their own.")
+        print(capture_backlog.recommendation(capture_backlog.summary()))
+        return 0
+
+    if getattr(args, "process", False):
+        return _process_saved_backlog(state, decided_at=now)
+
+    if not state["not_processed"] and not state["processed"]:
+        print("No saved backlog — nothing was captured without extraction.")
+        return 0
+    provider, model = _backlog_provider_note()
+    print(capture_backlog.format_report(state, provider=provider, model=model))
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(state, indent=2, sort_keys=True))
+    return 0
+
+
+def _process_saved_backlog(state: dict, *, decided_at: str) -> int:
+    """Run the saved backlog through the EXISTING re-capture path.
+
+    Progress and completion are printed for every entry, so a long model-spend
+    run is never silent (#4197 AC6). The verdict per entry is read back from
+    the LEDGER, never inferred from the import's exit code: a re-import of a
+    still-keyless session exits 0 while staying store-only, and reporting that
+    as processed would be the one lie this whole feature exists to prevent.
+    """
+    import argparse as _argparse
+
+    from tortoise import capture_backlog
+
+    entries = [r for r in state["not_processed"] if r.get("file")]
+    without_file = [r for r in state["not_processed"] if not r.get("file")]
+    if not entries:
+        print("No saved backlog to process.")
+        return 0
+
+    # The key gates extraction, not storage (#3892): without a provider every
+    # re-import would STORE/defers again, spend nothing, extract nothing, and
+    # the run would end by claiming a progress it did not make. Refuse up
+    # front instead, naming the remedy.
+    try:
+        from tortoise.hosted_api import _llm_provider_available
+        _provider_ok = bool(_llm_provider_available())
+    except Exception:
+        _provider_ok = False
+    if not _provider_ok:
+        print("Cannot process the saved backlog: no LLM provider key is "
+              "configured — the re-capture would store the turns again and "
+              "extract nothing. Set one of OPENROUTER_API_KEY / "
+              "DEEPSEEK_API_KEY (etc.) and re-run "
+              "`tortoise sessions backlog --process`.")
+        return 1
+
+    provider, model = _backlog_provider_note()
+    print(capture_backlog.format_report(state, provider=provider, model=model))
+    capture_backlog.set_policy(capture_backlog.CHOICE_BACKLOG,
+                              decided_at=decided_at)
+
+    total = len(entries)
+    processed = failed = 0
+    for index, record in enumerate(entries, start=1):
+        session_id = str(record.get("session_id") or "")
+        print(f"  [{index}/{total}] re-capturing {session_id} "
+              f"({record.get('turns') or 0} turn(s)) …")
+        rc = _cmd_sessions_import(_argparse.Namespace(
+            file=record.get("file"), harness=record.get("harness"),
+            session_id=session_id or None,
+            # Inside a run, the per-entry progress line IS the report: letting
+            # the import's own offer print too would repeat the whole backlog
+            # summary once per entry, which reads as noise and buries the
+            # completion line (the one thing the run must be judged by).
+            _suppress_backlog_offer=True))
+        rec_status = next(
+            (r.get("status") for r in capture_backlog.sessions()
+             if r.get("session_id") == session_id), None)
+        if rc == 0 and rec_status == capture_backlog.STATUS_PROCESSED:
+            processed += 1
+            print(f"  [{index}/{total}] {session_id}: extracted ✓")
+        else:
+            failed += 1
+            print(f"  [{index}/{total}] {session_id}: still not extracted "
+                  f"(see the import output above) — kept in the backlog")
+
+    for record in without_file:
+        print(f"  skipped {record.get('session_id')}: no transcript path was "
+              "recorded for it (re-run its import to set one)")
+    print(f"Saved backlog run complete: {processed} processed, {failed} "
+          f"still not-processed, {len(without_file)} skipped.")
+    return 1 if failed else 0
+
+
 def _cmd_sessions_import(args) -> int:
     """T2 backfill (#1727 Slice 2, Task 15): import a historical session
     transcript from a harness store (codex / claude-desktop / pi).
@@ -5391,6 +5618,14 @@ def _cmd_sessions_import(args) -> int:
             print(f"Imported session {session_id} ({len(turns)} turns, "
                   f"harness={harness}) — the refusal arrived after the "
                   "server committed it.", file=_sys.stderr)
+            # #4197: the server committed an extraction for this session, so
+            # any backlog entry for it is retired here too — this receipt is
+            # the OTHER success path (a retryable refusal the server had in
+            # fact committed), and leaving the entry pending would offer the
+            # user a session that is already extracted.
+            _flush_backlog_offer(
+                session_id=session_id,
+                offer=not getattr(args, "_suppress_backlog_offer", False))
             return True
         except Exception as exc:
             print(f"post-refusal confirmation failed: {exc}", file=_sys.stderr)
@@ -5539,6 +5774,20 @@ def _cmd_sessions_import(args) -> int:
             _remedy = "re-run this import once a key is configured."
         print(f"import deferred: {_why} — turns stored, extraction skipped; "
               f"{_remedy}", file=_sys.stderr)
+        # #4197: a store-only deferral is the ONLY capture outcome that would
+        # otherwise leave NO local trace (no receipt by design — a receipt
+        # would make every later re-import skip the POST on a stale receipt
+        # and the session could never gain its memory points — and the
+        # capture-failure breadcrumb was cleared by this 2xx). Record it in
+        # the SAVED-BACKLOG ledger, so the machine can enumerate its own
+        # backlog, price it, and report the user's choice (#4197).
+        # Best-effort: losing the offer must never cost the capture.
+        from tortoise import capture_backlog as _backlog
+        _backlog.record_not_processed(
+            session_id=session_id, harness=harness, file=str(file_path),
+            turns=len(turns), estimate=_backlog.estimate_units(turns),
+            reason=_why,
+            recorded_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         return 0
     receipt_dir.mkdir(parents=True, exist_ok=True)
     receipt.write_text(_json.dumps({
@@ -5547,6 +5796,14 @@ def _cmd_sessions_import(args) -> int:
         "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "turns": len(turns),
     }, indent=2), encoding="utf-8")
+    # #4197: extraction ran for a session that may have been deferred before —
+    # retire its backlog entry, and OFFER the remaining backlog (recommended)
+    # at exactly the point the provider key just proved it works. The offer is
+    # silent when the backlog is empty, so an ordinary import is unchanged.
+    _flush_backlog_offer(
+        session_id=session_id,
+        server_session_id=result.get("session_id", session_id),
+        offer=not getattr(args, "_suppress_backlog_offer", False))
     print(f"Imported session {result.get('session_id', session_id)} "
           f"({len(turns)} turns, harness={harness})")
     return 0
@@ -7669,6 +7926,31 @@ def _cmd_doctor(args):
     except Exception as e:
         results.append(("Session extraction", "⚠️", f"check unavailable: {str(e)[:60]}"))
 
+    # 5.6 Saved backlog (#4197) — the SAVED transcripts that were captured
+    # store-only (no provider key, or extraction turned off) and never
+    # extracted, with their cost and the RECOMMENDED action. This is the point
+    # where the provider key's state is reported, so it is where the owner's
+    # choice belongs: the user learns that memory is present-but-undistilled
+    # and gets the one command that fixes it. Silent when the backlog is empty,
+    # so a clean environment's doctor output is byte-identical.
+    try:
+        from tortoise import capture_backlog
+        _backlog_state = capture_backlog.summary()
+        _backlog_rec = capture_backlog.recommendation(_backlog_state)
+        if _backlog_rec:
+            _bp, _bm = _backlog_provider_note()
+            _pending = _backlog_state["counts"][
+                capture_backlog.STATUS_NOT_PROCESSED]
+            results.append((
+                "Saved backlog", "⚠️",
+                f"{_pending} saved session(s) were captured without "
+                f"extraction (~{_backlog_state['cost_units']} estimated "
+                f"extraction unit(s){', ' + _bp if _bp else ''}). "
+                f"{_backlog_rec}"))
+    except Exception as e:
+        results.append(("Saved backlog", "⚠️",
+                        f"check unavailable: {str(e)[:60]}"))
+
     # 6. Harness detection.  `Path.home()` sits INSIDE this boundary because
     # it can RAISE, not merely return: with `$HOME` a literal `~` (`~/x`
     # alike) the expansion is a no-op and `pathlib` raises
@@ -9243,6 +9525,30 @@ def main(argv: list[str] | None = None) -> int:
     sess_import.add_argument(
         "--session-id", default=None,
         help="Explicit idempotency key (default: content-hash derived)")
+    # #4197 (owner decision): the SAVED BACKLOG — transcripts captured without a
+    # provider key (or with extraction turned off) and never extracted. The
+    # choice is offered with the backlog option RECOMMENDED and its cost visible
+    # BEFORE the spend, and it stays re-offerable. Processing reuses the
+    # `sessions import` re-capture path (the #2335 TRUE-retry gate), so the
+    # #4194 turn embedding lands for the stored turns too. A noun-verb
+    # subcommand of the existing `sessions` (backfill) namespace — NOT a new
+    # top-level verb, which would duplicate what `sessions import` owns.
+    sess_backlog = sessions_sp.add_parser(
+        "backlog",
+        help="Report, process, or decline the saved backlog — sessions "
+             "captured without extraction (#4197)")
+    _backlog_choice = sess_backlog.add_mutually_exclusive_group()
+    _backlog_choice.add_argument(
+        "--process", action="store_true",
+        help="Extract the saved backlog now (RECOMMENDED; spends model "
+             "budget — the estimate is printed first)")
+    _backlog_choice.add_argument(
+        "--future-only", action="store_true",
+        help="Keep only future conversations: record the choice, leave the "
+             "saved transcripts un-extracted")
+    sess_backlog.add_argument(
+        "--json", action="store_true",
+        help="Also emit the machine-readable state (the report only)")
     # tortoise list-kinds
     lk = sp.add_parser("list-kinds", help="List all pointKinds present in the graph with counts")  # noqa: F841
     # tortoise context — memory digest for agent session-start hooks
@@ -9488,6 +9794,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "sessions":
         if args.sessions_cmd == "import":
             return _cmd_sessions_import(args)
+        if args.sessions_cmd == "backlog":
+            return _cmd_sessions_backlog(args)
         print("Unknown sessions command. Try import.", file=sys.stderr)
         return 1
     elif args.cmd == "index":
