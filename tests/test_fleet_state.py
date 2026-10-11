@@ -1019,58 +1019,62 @@ def test_write_state_json_survives_concurrent_repairs_of_one_cache(tmp_path) -> 
 
 
 def test_write_state_json_does_not_narrow_the_cache_mode(tmp_path) -> None:
-    """`mkstemp` creates 0600, and `os.replace` makes THAT the cache's final mode — so an
-    atomic write silently narrows a file that was 0644 and locks out any non-owner reader
-    (a container, a group process) with no error at write time, only a failure to read
-    later. The mode must match what the previous `write_text` produced."""
+    """`tempfile.mkstemp` creates 0600 and `os.replace` made THAT the cache's final mode,
+    silently narrowing a file that was 0644 and locking out a non-owner reader (a
+    container, a group process) with no error at write time, only a failure to read later.
+    The mode must be what `Path.write_text` produces — compared against a real file rather
+    than a constant, so the assertion holds under any umask (#7957 H2)."""
+    reference = tmp_path / "reference"
+    reference.write_text("x")
+
     path = tmp_path / "state.json"
-    assert fs._write_state_json(path, {"generated_at": "2020-01-01T00:00:00+0000"}) is True
-    assert stat.S_IMODE(path.stat().st_mode) == fs._DEFAULT_FILE_MODE
-    # NB: no assertion that the mode is not 0600 — under `umask 077` that is EXACTLY what
-    # `write_text` would have produced, so asserting it would fail on a correct tree for
-    # any runner with a restrictive umask.
+    assert fs._write_state_json(path, {"generated_at": _stamp(0)}) is True
+    assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(reference.stat().st_mode)
 
 
-def test_write_state_json_preserves_an_existing_cache_mode(tmp_path) -> None:
-    """An existing cache keeps its mode: the previous `Path.write_text` truncated in place
-    and so preserved it, and an atomic replace must not silently change it (#7957 H2)."""
+def test_write_state_json_does_not_leave_a_cache_unreadable(tmp_path) -> None:
+    """Copying an existing cache's mode verbatim perpetuates the very failure the mode
+    handling exists to prevent: a 0o000 cache would be rewritten 0o000, unreadable by
+    everyone including its writer, so every read rebuilds and rewrites the same unusable
+    file (#7957 H2)."""
     path = tmp_path / "state.json"
     path.write_text("{}")
-    os.chmod(path, 0o640)
+    os.chmod(path, 0o000)
 
     assert fs._write_state_json(path, {"generated_at": _stamp(0)}) is True
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert stat.S_IMODE(path.stat().st_mode) != 0o000, "the cache must not stay unreadable"
+    assert json.loads(path.read_text())["generated_at"]
 
 
-def test_write_state_json_closes_the_descriptor_when_fdopen_fails(tmp_path, monkeypatch) -> None:
-    """`os.fdopen` taking ownership of the descriptor is not guaranteed once it raises, so
-    the failure path must close it: the previous `write_text` could not leak an fd here,
-    and the atomic rewrite must not introduce one."""
-    closed: list[int] = []
-    real_close = os.close
+def test_write_state_json_does_not_leak_the_descriptor_it_opened(tmp_path, monkeypatch) -> None:
+    """`with os.fdopen(...)` must own the descriptor on EVERY path, including a
+    `json.dumps` failure inside the block. A spy on `os.close` cannot see this — the
+    `with` closes at the C level — so prove it with `fstat`, which fails with EBADF only
+    if the descriptor was really closed."""
+    opened: list[int] = []
+    real_open = os.open
 
-    def spy_close(fd: int) -> None:
-        closed.append(fd)
-        real_close(fd)
+    def spy_open(path_: object, flags: int, mode: int = 0o777) -> int:
+        fd = real_open(path_, flags, mode)
+        opened.append(fd)
+        return fd
 
-    def explode(*_a: object, **_k: object) -> object:
-        raise OSError(5, "injected fdopen failure")
+    monkeypatch.setattr(fs.os, "open", spy_open)
+    circular: dict[str, object] = {"generated_at": _stamp(0)}
+    circular["self"] = circular
 
-    monkeypatch.setattr(fs.os, "close", spy_close)
-    monkeypatch.setattr(fs.os, "fdopen", explode)
-    before = len(closed)
+    with pytest.raises(ValueError):
+        fs._write_state_json(tmp_path / "state.json", circular)
 
-    assert fs._write_state_json(tmp_path / "state.json", {"generated_at": _stamp(0)}) is False
-    assert len(closed) > before, "the descriptor mkstemp opened was leaked"
-    assert not list(tmp_path.glob("*.tmp")), "the temp file must still be removed"
+    assert opened, "the temp was never created"
+    with pytest.raises(OSError):
+        os.fstat(opened[0])  # EBADF: the descriptor was really closed
 
 
-def test_write_state_json_does_not_double_close_the_descriptor(tmp_path, monkeypatch) -> None:
-    """The descriptor must be closed EXACTLY once. A second close of an already-closed
-    number is a suppressed EBADF at best; at worst the number has been reused by another
-    thread between the two calls and an unrelated file is closed (#7957 H2: readers
-    repair the same cache concurrently). On this path `os.fdopen` SUCCEEDS and a LATER
-    step fails — so the `with` has already closed it and this function must not."""
+def test_write_state_json_closes_no_descriptor_it_does_not_own(tmp_path, monkeypatch) -> None:
+    """This function must not close a descriptor by hand at all: `os.fdopen` finalises and
+    closes the FileIO when a later stage of the call fails, so a second close hits
+    whatever the freed number was reused for (#7957 H2: readers repair concurrently)."""
     closed: list[int] = []
     real_close = os.close
 
@@ -1085,10 +1089,7 @@ def test_write_state_json_does_not_double_close_the_descriptor(tmp_path, monkeyp
     with pytest.raises(ValueError):
         fs._write_state_json(tmp_path / "state.json", circular)
 
-    assert closed == [], (
-        "`with fh` already closed the descriptor; a second close can hit another "
-        f"thread's file: {closed}"
-    )
+    assert closed == [], f"the `with` owns the descriptor; it must not be closed here: {closed}"
 
 
 def test_write_state_json_cleans_up_when_the_payload_is_unserialisable(tmp_path) -> None:

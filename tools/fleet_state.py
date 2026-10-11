@@ -145,12 +145,11 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
 import argparse
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import re
-import stat
 import subprocess
-import tempfile
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -1747,62 +1746,48 @@ def _report_state_age(fr: Mapping[str, Any], *, source: str) -> None:
     print(f"fleet-state: {render_state_age(fr)} (source={source})", file=sys.stderr)
 
 
-def _umask_default_mode() -> int:
-    """0o666 minus the process umask — what ``Path.write_text`` would have created.
-
-    ``os.umask`` is the only way to READ the umask, and it is process-global: the restore
-    is in a ``finally`` so that an interrupt during this import-time probe cannot leave
-    the process world-writable.
-    """
-    umask = os.umask(0)
-    try:
-        return 0o666 & ~umask
-    finally:
-        os.umask(umask)
-
-
-#: Probed ONCE at import: ``os.umask`` is process-global, so reading it on every write
-#: would race whenever concurrent readers repair the same cache (#7957 H2).
-_DEFAULT_FILE_MODE = _umask_default_mode()
+#: Attempts to create a collision-free temp beside the cache. `O_EXCL` refuses an
+#: existing path, so even a collision fails SAFE instead of clobbering another writer.
+_TMP_ATTEMPTS = 8
+_TMP_SEQ = itertools.count()
 
 
 def _write_state_json(path: Path, state: Mapping[str, Any]) -> bool:
-    """Best-effort atomic cache write. A torn cache is worse than none."""
+    """Best-effort atomic cache write. A torn cache is worse than none.
+
+    The temp is created with mode ``0o666`` so the KERNEL applies the process umask —
+    exactly what ``Path.write_text`` produced. ``tempfile.mkstemp`` was tried first here
+    and creates ``0o600``, which ``os.replace`` then made the cache's FINAL mode: the
+    cache silently narrowed to owner-only, locking out a non-owner reader (a container, a
+    group process) with no error at write time, only a failure to read later (#7957 H2).
+    """
+    tmp_name = ""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # A UNIQUE temp per writer. Every reader that finds a stale cache tries to
-        # repair it, so a fixed `<name>.tmp` is shared by concurrent writers: the one
-        # that loses the race gets FileNotFoundError from `os.replace` and its repair
-        # is dropped, re-paying the full rebuild on the next read (#7957 H2).
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
-        )
+        # A UNIQUE temp per writer: every reader that finds a stale cache tries to repair
+        # it, so a fixed `<name>.tmp` is shared and the writers that lose the race have
+        # their repair silently dropped, re-paying the full rebuild on the next read
+        # (#7957 H2). pid + a per-process counter is unique without a random name, and
+        # `O_EXCL` turns even a collision into a retry rather than a clobber.
+        fd = -1
+        for _ in range(_TMP_ATTEMPTS):
+            candidate = f"{path.name}.{os.getpid()}.{next(_TMP_SEQ)}.tmp"
+            tmp_name = str(path.parent / candidate)
+            try:
+                fd = os.open(tmp_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+                break
+            except FileExistsError:
+                continue
+        if fd < 0:
+            return False
         try:
-            # `os.fdopen` owns the descriptor only once it RETURNS, so its failure must be
-            # handled around the call itself. Closing `fd` in the outer handler instead
-            # would close it a SECOND time on every later failure path (write, chmod,
-            # replace) — and `contextlib.suppress(OSError)` would hide the EBADF while the
-            # number may already belong to another thread's file, closing a descriptor
-            # this function does not own (#7957 H2: readers repair concurrently).
-            try:
-                fh = os.fdopen(fd, "w")
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-                raise
-            with fh:
+            # `with` owns the descriptor: it is closed on EVERY path through this block,
+            # including a `json.dumps` failure. Nothing here closes `fd` by hand, and it
+            # must not — `os.fdopen` finalises and closes the FileIO when a later stage of
+            # the call fails, so a second close would hit whatever the number had been
+            # reused for (#7957 H2: readers repair the same cache concurrently).
+            with os.fdopen(fd, "w") as fh:
                 fh.write(json.dumps(state, indent=2, default=str))
-            # `mkstemp` creates 0600 and `os.replace` makes THAT the cache's final mode,
-            # silently narrowing a file that was 0644 — locking out any non-owner reader
-            # (a container, a group process) with no error at write time, only a failure
-            # to read later. An EXISTING cache keeps its mode, as the previous
-            # `write_text` did by truncating in place; a fresh one gets what `write_text`
-            # would have created (0o666 & ~umask).
-            try:
-                mode = stat.S_IMODE(path.stat().st_mode)
-            except OSError:
-                mode = _DEFAULT_FILE_MODE
-            os.chmod(tmp_name, mode)
             os.replace(tmp_name, path)
         except BaseException:
             with contextlib.suppress(OSError):
