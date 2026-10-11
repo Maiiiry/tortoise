@@ -26303,7 +26303,35 @@ def _run_onboarding_seed(org_id: str, *, org_name: str | None = None,
     seeded → two Subjects (compact: org-anchor seed-lite only) + memberOf
     + onboards edge/org_subject_id + first-points-filed step edge
     (created-signal) + fork-aware gate eval. Graph-down → 503 fail-loud
-    (FLOW-bearing write, retry-safe)."""
+    (FLOW-bearing write, retry-safe).
+
+    #2007 (W12): the SELFHOST placeholder org has no control plane and no
+    hosted anchor data — the two prompts ARE the anchor data. It is
+    delegated to the graph-only self-hosted lane
+    (``tortoise/onboarding/selfhost.py`` — the SAME implementation the
+    self-hosted REST route ``POST /v1/onboarding/seed`` calls), checked
+    BEFORE any control-plane read so no Supabase call can be reached on the
+    self-hosted path."""
+    from tortoise.mcp_auth import SELFHOST_ORG_ID
+    if org_id == SELFHOST_ORG_ID:
+        from tortoise.mcp_auth import _get_org_sdk
+        from tortoise.onboarding import selfhost as _selfhost_lane
+        missing = [name for name, value in (("person_name", person_name),
+                                            ("org_name", org_name))
+                   if not (value or "").strip()]
+        if missing:
+            # Never invent an identity (DM-3): the agent asks the user the
+            # two questions, then calls again with both answers.
+            return {
+                "status": "needs_confirmation",
+                "gaps": missing,
+                "detail": ("Self-hosted onboarding asks the user two "
+                           "questions — their name and the organization's "
+                           "name. Never invent either; ask, then call again "
+                           "with both answers."),
+            }
+        return _selfhost_lane.seed_selfhost_anchors(
+            _get_org_sdk(), org_name=org_name, person_name=person_name)
     from tortoise.onboarding import seed as _seed
     if not _graph_available(org_id):
         raise HTTPException(status_code=503,
