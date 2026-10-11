@@ -224,13 +224,27 @@ _RANGE_LEFT = r"(?:" + _NUM_WORDS + r"|\d+)(?:\s+" + _AGO_UNITS + r")?"
 #: the range connectors — a small CLOSED class, unlike a separator (which is
 #: why this one may be enumerated: there is no principled way to say 'any
 #: separator' for words, and a new English synonym is not the failure mode
-#: the guard exists for).
+#: the guard exists for). The DASH family is in here because a dash is the
+#: canonical range connector ('2 weeks - 5 weeks ago') and branch 1 CANNOT
+#: reach it when the left bound carries its own unit — '2 weeks' is not
+#: adjacent to the count, so only this branch sees the range at all.
 _RANGE_CONN = (r"(?:up\s+to|up\s+until|upto|to|and|or|through|thru|until|"
-               r"till|til)")
+               r"till|til|[\-\u2010-\u2015\u2212])")
 _RE_COMPOUND_NUMBER = re.compile(
     r"\b" + _NUM_WORDS + r"\b(?:[\W]|\band\b)+$"
     r"|\d\W*$"
-    r"|\b" + _RANGE_LEFT + r"\W+" + _RANGE_CONN + r"\W+$",
+    r"|\b" + _RANGE_LEFT + r"\W+" + _RANGE_CONN + r"\W+$"
+    # a SPELLED place-value/decimal tail — 'two point five weeks ago',
+    # 'twelve point three days ago', 'two point oh five weeks ago'. The
+    # offset template reads the trailing word alone, so the count is a
+    # fragment of a multi-part number exactly as in the digit case. The
+    # PLACE-VALUE MARKER immediately before the count is the discriminator
+    # ('point'/'dot'/'oh'), not the whole chain: 'two point oh five' has
+    # TWO fragments before the count, and anchoring on the marker catches
+    # any number of them without a nested quantifier. Conservative by
+    # construction — 'I made a point 3 days ago' rejects too and falls back
+    # to the legacy lane, the same fail-safe direction as the numeral branch.
+    r"|\b(?:point|dot|oh)\W+$",
     re.IGNORECASE)
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how

@@ -397,6 +397,17 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         "What did I do several to five weeks ago?",
         "What did I do a few to five weeks ago?",
         "What did I do thirteen to five weeks ago?",
+        # ... and the connector can be a DASH, which branch 1 cannot reach
+        # once the left bound carries its own unit ('2 weeks' is not adjacent
+        # to the count) — the dash is the canonical range connector
+        "What did I do from 2 weeks – 3 months ago?",   # U+2013
+        "What did I do 2 weeks — 5 weeks ago?",         # U+2014
+        "What did I do 2 weeks - 5 weeks ago?",         # ASCII
+        # ... and a SPELLED place-value/decimal tail is a multi-part number
+        # too: the offset template reads the trailing word alone
+        "What did I do two point five weeks ago?",
+        "What did I do twelve point three days ago?",
+        "What did I do two point oh five weeks ago?",
         # a multi-part NUMERAL is the same defect for digits: `_RE_AGO_OFFSET`
         # reads `\d+`, so it matches the LAST digit run alone — '2.5 weeks
         # ago' anchored at 5 weeks and '2,000 days ago' at 0 days (a window
