@@ -186,9 +186,21 @@ export TORTOISE_INDEX_NO_NETWORK=1
 .venv/bin/python -m tortoise index directory /tmp/t11-live/corpus-frozen --corpus-name t11_clean
 .venv/bin/python -m tortoise index directory /tmp/t11-live/corpus-frozen --corpus-name t11_clean
 
-# coherence checkpoints (read-only)
-python /tmp/t11-live/checkpoint.py post-run-2   # queries as pinned in §2
+# coherence checkpoints (read-only; the epic's own pins)
+TORTOISE_DB_URI='docker://:@127.0.0.1:<port>/t11_clean' .venv/bin/python - <<'EOF'
+from tortoise.sdk import TortoiseSDK
+g = TortoiseSDK()._get_proj().g
+q = lambda c: g.query(c).result_set[0][0]
+print('nodes', q('MATCH (n) RETURN count(n)'), 'edges', q('MATCH ()-[r]->() RETURN count(r)'))
+print('event_id_forks', q('MATCH (e:Event) WITH e.eventId AS eid, count(*) AS c WHERE c > 1 RETURN count(*)'))
+print('duplicate_urls', q('MATCH (s:Source) WITH s.url AS u, count(*) AS c WHERE c > 1 RETURN count(*)'))
+print('hash_pair_sweep', q('MATCH (s:Source)-[:references]->(e:Event) WHERE s.contentHash <> e.file_hash RETURN count(*)'))
+print('required_sweep(D10)', q("MATCH (s:Source) WHERE (s.documentKind IS NULL AND (s.url IS NULL OR s.url='' OR s.sourceKind IS NULL OR s.contentHash IS NULL OR s.contentHash='' OR s.ingestedAt IS NULL)) OR (s.documentKind IS NOT NULL AND (s.url IS NULL OR s.url='' OR s.ingestedAt IS NULL)) RETURN count(s)"))
+print('health', TortoiseSDK().session_index_health('/tmp/t11-live/corpus-frozen'))
+EOF
 ```
 
-Raw journal kept for this run: per-run stdout JSON, stderr, durations, and the
-interleaved checkpoint JSONs (the tables above are transcribed from it verbatim).
+Raw journal committed next to this report as **`t11-live-corpus-smoke.json`** —
+per-run report JSON, the interleaved checkpoint JSONs, and the durations for both
+legs; every table above is transcribed from it verbatim. (The lane container was
+brought down after the run; the frozen corpus copy lives only in `/tmp`.)
