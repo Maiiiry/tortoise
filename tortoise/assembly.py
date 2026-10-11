@@ -189,8 +189,8 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #: that is what ends the scan, and so what makes a legitimately standalone
 #: count ('I bought 2 things 3 days ago' → 3) promote.
 #:
-#: ⛔ THE LIMIT, STATED HONESTLY. TWO residuals, both bounded work rather than
-#: an invariant over natural language:
+#: ⛔ THE LIMIT, STATED HONESTLY. THREE residuals, all bounded work rather
+#: than an invariant over natural language:
 #:   (a) a CONNECTIVE that is not in the list below ends the scan and lets the
 #:       count promote, so a range written with it ('2 to <unlisted> 5 weeks
 #:       ago') still promotes 5;
@@ -198,9 +198,12 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #:       outside `_NUMBER_WORDS`, or a unit spelling outside
 #:       `_NUMERAL_UNIT_SUFFIXES` (the one set BOTH paths use, so this residual
 #:       is the same for glued and spaced bounds) — likewise ends the scan, so
-#:       a range's left bound written that way promotes the right bound.
-#: Both directions are recorded here so the next reader does not over-trust the
-#: guard.
+#:       a range's left bound written that way promotes the right bound;
+#:   (c) a range joined by a SEPARATOR GLYPH outside `_RANGE_GLYPHS`: the bare
+#:       unit before the count then reads as the end of a duration and the
+#:       right bound is promoted (the `first`-token rule's price).
+#: Every direction is recorded here so the next reader does not over-trust the
+#: guard — and so a later tightening does not "simplify" one of these away.
 _NUMERAL_UNIT_SUFFIXES = frozenset({
     "d", "day", "days", "w", "wk", "wks", "week", "weeks",
     "mo", "mos", "month", "months", "y", "yr", "yrs", "year", "years",
@@ -277,10 +280,12 @@ _NUMBER_WORDS = frozenset({
 #: Same set, both spellings: '2 hrs to 5 days ago' and '2hrs to 5 days ago'
 #: must not disagree.
 _FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
-#: the Unicode dash family. A bare unit before the count TERMINATES a duration
-#: ('2 hours 5 days ago'), but a dash between them is itself a range connector
-#: ('from 2 weeks – 3 months ago'), so the unit is a bridge there after all.
-_RANGE_DASHES = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+#: the range/alternative GLYPHS. A bare duration before the count TERMINATES it
+#: ('2 hours 5 days ago'), but a glyph between them is itself a range connector
+#: ('from 2 weeks – 3 months ago', '2 weeks / 5 days ago'), so the unit is a
+#: bridge there after all. Sentence punctuation ('.', ',', ';') is deliberately
+#: NOT here — '2 weeks. 5 days ago' is two sentences, not a range.
+_RANGE_GLYPHS = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212/\\|~&+"
 
 
 def _is_numeric(ch: str) -> bool:
@@ -306,6 +311,21 @@ def _is_number_token(token: str) -> bool:
 def _continues_number(token: str) -> bool:
     """True when `token` can be sitting INSIDE the number expression."""
     return token.lower() in _NUMBER_CONTINUATION_WORDS
+
+
+def _is_unit_length_token(token: str) -> bool:
+    """True when `token` is the TAIL of a duration: a bare unit ('hrs'), or a
+    numeral glued to one ('2hrs'). Both spellings must behave the same way in
+    the scan — '2hrs 5 days ago' and '2 hrs 5 days ago' are the same sentence.
+    """
+    low = token.lower()
+    if low in _NUMERAL_UNIT_SUFFIXES:
+        return True
+    split = 0
+    while split < len(token) and _is_numeric(token[split]):
+        split += 1
+    return 0 < split < len(token) and token[split:].lower() in (
+        _NUMERAL_UNIT_SUFFIXES)
 
 
 def _count_is_fragment(text_before: str) -> bool:
@@ -338,11 +358,8 @@ def _count_is_fragment(text_before: str) -> bool:
         if k == j:            # ran off the start: nothing to the left
             return False
         token = text_before[k:j]
-        low = token.lower()
-        if _is_number_token(token):
-            return True
-        if first and low in _NUMERAL_UNIT_SUFFIXES and not any(
-                ch in _RANGE_DASHES for ch in text_before[j:i]):
+        if first and _is_unit_length_token(token) and not any(
+                ch in _RANGE_GLYPHS for ch in text_before[j:i]):
             # A DURATION ENDS HERE. '2 hours 5 days ago' is two durations, not
             # a range: the count starts a NEW number, and the unit in front of
             # it belongs to the number before that. So a unit is a bridge only
@@ -350,8 +367,11 @@ def _count_is_fragment(text_before: str) -> bool:
             # days ago', 'between 2 hrs and 5 days ago') — as the FIRST token
             # it terminates the scan instead. Without this the union above
             # made the guard reject '2 hours 5 days ago', which promotes on
-            # `origin/main`.
+            # `origin/main`. The GLYPH exception is the other half: a range
+            # joined by a dash or a slash keeps the unit as a bridge.
             return False
+        if _is_number_token(token):
+            return True
         if not _continues_number(token):
             return False
         first = False

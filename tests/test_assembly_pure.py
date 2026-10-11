@@ -546,7 +546,16 @@ def test_count_fragment_scan_stops_at_a_sentence_word():
         ("2 mins ", False),          # durations, not a range
         ("3 secs ", False),
         ("2 weeks ", False),
-        ("2 weeks – ", True),        # ... unless a DASH connects the two bounds
+        ("2hrs ", False),            # ... and the GLUED duration agrees with
+        ("2hours " , False),         # its spaced twin
+        ("24h ", False),
+        ("2wks ", False),
+        ("2 weeks / ", True),        # ... unless a range GLYPH connects them
+        ("2 weeks ~ ", True),
+        ("2 weeks & ", True),
+        ("2 weeks. ", False),        # sentence punctuation is not a connector
+        ("2 weeks, ", False),
+        ("2 weeks – ", True),
         ("2 hours 5 days ", False),
         ("between 2 and about ", True),   # a connective CHAIN
         ("2 to roughly ", True),
