@@ -3655,3 +3655,60 @@ def test_ago_relative_window_walk_live_empty_and_unresolvable(
     assert _assemble_connected(
         _docker_sdk, "what did I do a month ago?",
         question_date=None).fired is False
+
+
+def test_ordering_list_regex_is_linear_and_still_reads_the_colon_form():
+    """#2653's colon-list guard is anchored on "…: A, B, and C".
+
+    It must stay that way in BOTH directions, because the two failure modes
+    pull against each other and the regex originally failed the first one.
+
+    LINEARITY. The tail was ``:\\s*[^?]+?\\??\\s*$``, where ``\\s*`` and
+    ``[^?]+?`` both match whitespace: every offset inside a whitespace run is a
+    distinct split the engine re-tries before the ``$`` fails. Measured on the
+    PR head, ``_RE_ORDERING_LIST.match("which order: " + " "*1985 + "?x")`` took
+    25.3 s and ``classify_question`` on the same string took 21.5 s — and
+    ``tortoise.ask_lane._ask_validate`` ACCEPTS that string (2000 chars
+    = ``MAX_ASK_QUESTION_CHARS``), so a crafted question parked the ask lane for
+    twenty seconds with no timeout to catch it. `run_ask_lane` has no timeout:
+    a hang is not an exception its envelope can see.
+
+    The tail is now ``:\\s*[^?\\s][^?]*\\??\\s*$`` — ``\\s*`` and the option span
+    start on DISJOINT classes, so there is nothing to re-split: measured
+    0.0000 s at len 2000. The bound below is deliberately loose (4 orders of
+    magnitude above the fixed time, ~7x below the broken one) so it cannot be
+    a verdict about machine load — see #5049 for why that distinction matters.
+
+    FALSE NEGATIVES. The strictness is not free: the old form also matched a
+    colon followed by whitespace ALONE (``"which order: "`` -- the space was
+    consumed as the "option list"). Rejecting that is the intent, and the
+    control below pins it. Over all 133 questions of ``_assembly_census.json``
+    old and new agree on every row (0 mismatches), so the tightening is
+    invisible to real input.
+    """
+    import time
+
+    from tortoise.assembly import _RE_ORDERING_LIST
+
+    # Positive control: the measured corpus form still fires.
+    assert _RE_ORDERING_LIST.match(
+        "Which three events happened in the order from first to last: A, B, and C")
+    assert _RE_ORDERING_LIST.match(
+        "What is the order of the three events: 'A', 'B', and 'C'")
+    assert _RE_ORDERING_LIST.match("which order did I place: the bike, the car, and the train?")
+
+    # Negative control: no option list after the colon is not a list question.
+    assert not _RE_ORDERING_LIST.match("which order:")
+    assert not _RE_ORDERING_LIST.match("which order: ")
+    assert not _RE_ORDERING_LIST.match("which order: ?")
+
+    # Linearity: the adversarial shape must not be quadratic.
+    worst = "which order: " + " " * 1985 + "?x"
+    assert len(worst) <= 2000, "the probe must stay inside MAX_ASK_QUESTION_CHARS"
+    started = time.monotonic()
+    _RE_ORDERING_LIST.match(worst)
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, (
+        "the colon-list guard backtracked on whitespace again: "
+        f"{elapsed:.2f}s on a {len(worst)}-char question that _ask_validate "
+        "accepts. Keep the option span's first class disjoint from \\s*.")

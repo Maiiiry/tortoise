@@ -527,7 +527,7 @@ _RE_OR_CHAIN = re.compile(r"\sor\s.+?\sor\s", re.IGNORECASE | re.DOTALL)
 _RE_ORDERING_LIST = re.compile(
     r"^\s*(?:which|who|what)\b[^?:]*?"
     r"(?:\border\b|\bsequence\b|\bfirst\s+to\s+last\b)"
-    r"[^?:]*:\s*[^?]+?\??\s*$",
+    r"[^?:]*:\s*[^?\s][^?]*\??\s*$",
     re.IGNORECASE | re.DOTALL)
 
 # the ordering-marker words that introduce an option list when the question
