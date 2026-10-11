@@ -192,15 +192,21 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #     from '2 000' (one number) is not decidable here, and the other side of
 #     the error is a confidently WRONG window that replaces the pool. Fail
 #     safe: no promotion, never a wrong anchor.
-#   * a verbal RANGE / connector — '2 to 5 weeks ago', 'between 2 and 5
-#     weeks ago'. The connector is word characters, so neither branch above
-#     sees it; without this the range's LAST bound is promoted as the count
-#     and a 2–5-week question is answered from the 5-week window alone.
+#   * a verbal RANGE / connector — '2 to 5 weeks ago', 'two to five weeks
+#     ago', 'between 2 and 5 weeks ago'. The connector is word characters, so
+#     neither branch above sees it; without this the range's LAST bound is
+#     promoted as the count and a 2–5-week question is answered from the
+#     5-week window alone. The LEFT bound must be a NUMBER, word or digit —
+#     a digit-only left bound leaves the class half-open, because the spelled
+#     spelling ('two to five weeks ago' → count 5) escapes it.
+_NUM_WORDS = (r"(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|"
+              r"eleven|twelve|twenty|thirty|forty|fifty|sixty|seventy|"
+              r"eighty|ninety|hundred|thousand|million)")
 _RE_COMPOUND_NUMBER = re.compile(
-    r"\b(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
-    r"thousand|million)\b(?:[\W]|\band\b)+$"
+    r"\b" + _NUM_WORDS + r"\b(?:[\W]|\band\b)+$"
     r"|\d\W*$"
-    r"|\d\W+(?:to|and|or|through|thru|until|till|up\s+to)\W+$",
+    r"|\b(?:" + _NUM_WORDS + r"|\d+)"
+    + r"\W+(?:to|and|or|through|thru|until|till|up\s+to)\W+$",
     re.IGNORECASE)
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how

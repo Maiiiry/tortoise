@@ -412,12 +412,23 @@ def test_compound_guard_does_not_backtrack_exponentially():
     HANG is not an exception the envelope can catch, so it is an
     availability defect in the ask path. This test does not time anything:
     under the ambiguous form it HANGS rather than failing, which is the
-    regression it guards."""
+    regression it guards.
+
+    The question MUST carry an `ago-offset`: `_RE_COMPOUND_NUMBER` is only
+    reached from `_relative_match` under `kind == "ago-offset"`, so a probe
+    with no offset ('twenty…x') never consults the guard and asserts nothing
+    about the ask path. '…x 1 day ago' is the production shape — on the
+    ambiguous form `classify_question` took 4.8 s at N=24 and hung at N=200.
+    """
     for n in (24, 200, 1900):
-        assert _RE_COMPOUND_NUMBER.search("twenty" + " " * n + "x") is None
-        q = "twenty" + " " * n + "x"
-        assert classify_question(q) is None
-        assert resolve_relative_anchor(q, "2026-09-10") is None
+        pad = "twenty" + " " * n + "x"
+        # the guard itself, addressed directly
+        assert _RE_COMPOUND_NUMBER.search(pad) is None
+        # ... and through the entry points, where the guard is consulted
+        # (THESE are the lines that hang under the ambiguous form)
+        q = pad + " 1 day ago"
+        assert classify_question(q) is AssemblyShape.AGO_RELATIVE, n
+        assert resolve_relative_anchor(q, "2026-09-10") is not None, n
 
 
 def test_ago_relative_shape_fires():
