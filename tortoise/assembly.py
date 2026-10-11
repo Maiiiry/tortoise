@@ -204,6 +204,11 @@ _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 #:       right bound is promoted (the `first`-token rule's price).
 #: Every direction is recorded here so the next reader does not over-trust the
 #: guard — and so a later tightening does not "simplify" one of these away.
+#:
+#: ⛔ `_NUMERAL_UNIT_SUFFIXES` is ALSO the unit vocabulary the SPACED path
+#: bridges, unioned into `_NUMBER_CONTINUATION_WORDS` above — do not re-list
+#: the units there. Same set, both spellings: '2 hrs to 5 days ago' and
+#: '2hrs to 5 days ago' must not disagree.
 _NUMERAL_UNIT_SUFFIXES = frozenset({
     "d", "day", "days", "w", "wk", "wks", "week", "weeks",
     "mo", "mos", "month", "months", "y", "yr", "yrs", "year", "years",
@@ -275,10 +280,10 @@ _NUMBER_WORDS = frozenset({
 #: promotion on 'at 3pm 5 days ago', which falls back to the legacy lane and
 #: never anchors wrongly. Where the two collide, fail safe.
 #:
-#: ⛔ This set is ALSO the unit vocabulary the SPACED path bridges, unioned
-#: into `_NUMBER_CONTINUATION_WORDS` above — do not re-list the units there.
-#: Same set, both spellings: '2 hrs to 5 days ago' and '2hrs to 5 days ago'
-#: must not disagree.
+#: ⛔ `_NUMERAL_UNIT_SUFFIXES` is ALSO the unit vocabulary the SPACED path
+#: bridges, unioned into `_NUMBER_CONTINUATION_WORDS` above — do not re-list
+#: the units there. Same set, both spellings: '2 hrs to 5 days ago' and
+#: '2hrs to 5 days ago' must not disagree.
 _FRACTION_GLYPHS = "½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
 #: the range/alternative GLYPHS. A bare duration before the count TERMINATES it
 #: ('2 hours 5 days ago'), but a glyph between them is itself a range connector
