@@ -1103,6 +1103,14 @@ class _EntityHandlers:
         # text, declared so the replay open-set passthrough does not log a
         # FALSE undeclared-prop drift warning on every rebuild.
         "span_start", "span_end",
+        # #1724: the STABLE external anchor carried by extractor-minted
+        # statement Points (``github:issue:*`` from the GitHub indexer's
+        # dormant statement path, ``docs:<doc_id>#<claim key>`` from the docs
+        # miner). Both are IN-TREE producers, so the reason the two entries
+        # above carry applies verbatim: without this, the live write and every
+        # rebuild log a false "not declared" drift warning for a prop that is
+        # part of the documented statement contract.
+        "externalId",
         # #3689 review P2 (A): the four canonical annotator dims are legitimately
         # carried on a PointAdded snapshot by `create_point(annotator_*=…)` /
         # `_update_entity` — declaring them keeps the replay open-set
