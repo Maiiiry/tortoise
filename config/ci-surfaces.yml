@@ -2567,7 +2567,7 @@ surfaces:
   - test_ci_manifest.py  # #5050: the measured durations map validator (READ-ONLY; `ci_timing.py --refresh-durations` is the sole writer)
   - test_ids.py
   # #7955: the Interface E canonical-id contract test pins `tortoise/ids.py`
-  # (`ulid`/`_is_ulid`), `tortoise/sdk.py`'s id regexes, and
+  # (`ulid`), `tortoise/sdk.py`'s id regexes and `_is_ulid`, and
   # `tortoise/projection/edges.py` (`DERIVABLE_STRUCTURAL_RELS`,
   # `STRUCTURAL_REL_LABELS`, `stub_key`) —
   # the same `sdk` SOURCE_PATTERNS that own `test_ids.py`, so the pin runs on

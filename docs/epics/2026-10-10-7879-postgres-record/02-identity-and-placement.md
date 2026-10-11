@@ -191,9 +191,9 @@ The narrowing is **not a reopening of §2.0**: the carve-out's own test is *"rec
 
 #### 2.4 Semantic — `Object` · `Subject` (23 names · 22 P · 1 D · 0 U)
 
-`Object` (17 P — one of them `P*` · 1 D) · `Subject` (5 P).
+`Object` (17 P · 1 D) · `Subject` (5 P).
 
-*The properties are journaled on `ObjectRegistered` / `SubjectAdded` snapshots; `embedding` on both is recomputed from `name` but is carried on the snapshot, so it is PRIMARY-with-a-recompute (the recompute is an optimisation, not the authority). The `Object` lifecycle-fold fields are split three ways in §2.6: `supersededBy` is journal-carried verbatim (**PRIMARY**), `status` is a projection-owned **cache** (**DERIVED**), and `supersededAt` is **P\*** (live ≠ replay).*
+*The properties are journaled on `ObjectRegistered` / `SubjectAdded` snapshots; `embedding` on both is recomputed from `name` (the journal carries `name`, from which it is recomputed), so it is PRIMARY-with-a-recompute (the recompute is an optimisation, not the authority). The `Object` lifecycle-fold fields are split in §2.6: `supersededBy` is journal-carried verbatim (**PRIMARY**), `status` is a projection-owned **cache** (**DERIVED**), and `supersededAt` is **PRIMARY** — carried by the event's envelope `ts`, which the live fold must pass (§2.6).*
 
 #### 2.5 Epistemic — `Point` · operators/edges (93 names · 68 P · 17 D · 8 U)
 
@@ -203,13 +203,13 @@ The narrowing is **not a reopening of §2.0**: the carve-out's own test is *"rec
 
 #### 2.6 Procedural — the fold over the Episodic layer (0 own names)
 
-**The procedural layer owns no property name.** Per `ONTOLOGY.md` §2 it is *“Event + folded `Object.status`”*: `Object.status`, `supersededBy` and `supersededAt` are the **fold targets of lifecycle events**, and they live on the **semantic `Object` row** — counted there in §2.4 (22 P · 1 D). They are **not one class**: the deciding test splits them three ways.
+**The procedural layer owns no property name.** Per `ONTOLOGY.md` §2 it is *“Event + folded `Object.status`”*: `Object.status`, `supersededBy` and `supersededAt` are the **fold targets of lifecycle events**, and they live on the **semantic `Object` row** — counted there in §2.4 (22 P · 1 D). They are **not one class**: the deciding test splits them.
 
 - **`supersededBy` — PRIMARY.** The journal carries it verbatim (`ObjectSuperseded.supersedes_by`) and the fold copies it through unchanged (`str(ev.get("supersedes_by") or "")`) → §2.1 rule 1, a record column.
 - **`status` — DERIVED (a cache).** It is journal-carried too (`ObjectRegistered.status`), but the ontology names it a cache in three places: §2 *“Object.status is a write-through cache of lifecycle events … a performance cache, folded keep-first per Object”*; the §2 state note *“status is a fold cache over the events — never the truth itself”*; §4.3 *“the event stream is the reconstruction source for Object.status (§11 cache doctrine)”*. The fold's own docstring says the same — *“Projection-owned cache of the event stream”* (`_fold_object_superseded`, `projection/entities.py`). A recorded carve-out naming a field a **cache** is exactly what §2.2's `confidence` rule handles: the journal value is not the record.
-- **`supersededAt` — P\* (journal the write-time).** Live and replay do **not** agree. The live fold builds its event with no instant (`fold_ev = {"name": …, "supersedes_by": …}` in `commit_ops.py`) and computes `superseded_at = _journal_instant(ev)`, which falls back to `_now_iso()`; replay folds the raw journaled `ObjectSuperseded`, whose envelope `ts` is the recorded instant. The helper's own docstring states the divergence — *“a live caller that folds an event dict it built itself (`commit_ops`'s `fold_ev` for `ObjectSuperseded`) passes no `ts`, so the live write, the record's envelope `ts` and this helper each hold a different read.”* This is §2.7 #1's `Point.updatedAt` precedent: a mutable fact the record must keep → §2.1 class 4.
+- **`supersededAt` — PRIMARY (the event envelope `ts` carries it).** The record carries the instant: `_emit_event("ObjectSuperseded", …)` stamps the JSONL envelope `ts` (`sdk.py`) and rebuild replays the raw journaled event, so `_journal_instant(ev)` restores the recorded instant. The **live** fold is the defect — it builds its event with no instant (`fold_ev = {"name": …, "supersedes_by": …}` in `commit_ops.py`) and so falls back to `_now_iso()`, minting a *different* read than the envelope it just emitted. The helper's own docstring states the divergence — *“a live caller that folds an event dict it built itself (`commit_ops`'s `fold_ev` for `ObjectSuperseded`) passes no `ts`, so the live write, the record's envelope `ts` and this helper each hold a different read.”* The fix is a **live-write fix, not a class change**: `commit_ops` must mint the instant once (the `recorded_ts` seam on `_emit_event`, #5048) and fold that same value, so live and replay agree.
 
-**The rule.** A journal-carried value is PRIMARY unless **(a)** a recorded carve-out names it recomputed-from-structure or a **cache**, or **(b)** live and replay disagree (class 4, not class 1). `confidence` is the carve-out; `Object.status` is the cache; `supersededAt` is the live≠replay case; `supersededBy` is the plain PRIMARY case.
+**The rule.** A journal-carried value is PRIMARY unless **(a)** a recorded carve-out names it recomputed-from-structure or a **cache**, or **(b)** the journal carries **no** value for it and live would have to mint one (class 4, not class 1). A divergence where the live writer **ignores a carrier the record already holds** is a live-write defect, not a class change. `confidence` is the carve-out; `Object.status` is the cache; `supersededAt` is the live-write defect case; `supersededBy` is the plain PRIMARY case.
 
 The work-state counters a session carries (`turn_count`, `commit_count`, …) live on the **`Session` row** — counted in §2.3. **Reconciliation:** a future schema must not look for a procedural table of its own; the procedural layer is a *view/read*, and its fields are classified where they physically live.
 
@@ -396,7 +396,7 @@ The full per-property table (216 rows, with the writer clause and the journal ca
 | `embedding` | P | projection/entities.py o.embedding=CASE..vecf32; #4524 REMOVE | computed/recomputed from name (#7845) | derived-from-name but stored; not journaled as a payload key on ObjectRegistered → recomputable (name is primary) |
 | `status` | D | projection/entities.py o.status=coalesce($st,'live'); `_fold_object_superseded` | ObjectRegistered.status; ObjectSuperseded (folded) | **projection-owned CACHE** (`_fold_object_superseded` docstring: *"Projection-owned cache of the event stream"*; `ONTOLOGY.md` §2/§4.3) — the measurement recorded P, corrected to D in review (§2.6) |
 | `supersededBy` | P | projection/entities.py SET o.supersededBy=$sb | ObjectSuperseded.supersedes_by | #1350 — carried verbatim; the fold copies it through unchanged |
-| `supersededAt` | P | projection/entities.py SET o.supersededAt=$sa; live `fold_ev` carries no `ts` (`commit_ops.py`) | ObjectSuperseded envelope `ts` (replay) | **P\*** — live mints `_journal_instant(ev)` → `_now_iso()` fallback, replay uses the journaled `ts` (§2.6; §2.7 #1 precedent) |
+| `supersededAt` | P | projection/entities.py SET o.supersededAt=$sa; live `fold_ev` carries no `ts` (`commit_ops.py`) | ObjectSuperseded envelope `ts` (replay) | **PRIMARY** — the envelope `ts` is the record; the live `fold_ev` carries no `ts`, so it mints `_journal_instant(ev)` → `_now_iso()` ≠ the emitted envelope `ts` — a **live-write fix, not a class change** (§2.6) |
 | `canonical_name` | P | sdk.py (read/alias match) — writer via open-set | open-set passthrough | topic alias |
 | `repo` | P | sdk.py MERGE (o:Object) SET o.repo=$repo | connector write (check journal carrier) | github entity field |
 | `issue_number` | P | sdk.py SET o.issue_number=$issue_number | connector write (check) | github entity field |
@@ -508,7 +508,7 @@ The full per-property table (216 rows, with the writer clause and the journal ca
 |---|---|---|---|---|
 | `IMPL.idx` | P | `create_operator` (`CREATE (o)-[:IMPL {idx:$i}]->(s)`, `sdk.py`); `_create_edges` (`projection/edges.py`) | OperatorAdded (edge re-created by fold from inputs+idx) | position index; replayed from OperatorAdded.inputs |
 | `NAND.idx` | P | same as IMPL | OperatorAdded |  |
-| `INPUT.idx` | P | `_create_edges` (`CREATE (s)-[:INPUT {idx:$i}]->(o)`, `projection/edges.py`) | OperatorAdded.inputs order |  |
+| `INPUT.idx` | P | `_create_edges` (`MERGE (s)-[:INPUT {idx:$idx}]->(o)`, `projection/edges.py`) | OperatorAdded.inputs order |  |
 | `IMPL.direction` | P | sdk.py create_direct_edge SET r += attrs{direction} | DirectEdgeCreated.direction; DirectEdgeRepoint.direction |  |
 | `IMPL.confidence` | U | sdk.py attrs['confidence']=float(confidence) | DirectEdgeCreated (confidence kwarg) | EP also derives confidence → stored raw edge confidence may conflict with EP; classify |
 | `IMPL.weight` | U | sdk.py attrs['weight']=float(weight) | DirectEdgeCreated.weight | same tension as confidence |
