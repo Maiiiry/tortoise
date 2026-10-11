@@ -243,6 +243,27 @@ def test_backlog_report_shows_the_cost_before_the_choice(places, capsys):
         "the backlog option must be the visibly recommended one"
 
 
+def test_backlog_json_emits_the_machine_readable_state(places, capsys):
+    """`--json` is the machine-readable half of the same state the report
+    renders — so the three states are consumable without parsing prose."""
+    home, _ = places
+    backlog.record_not_processed(session_id="s_1", harness="pi", turns=4,
+                                 estimate=12, reason="no LLM provider key",
+                                 file=str(home / "a.jsonl"))
+    rc = main.main(["sessions", "backlog", "--json"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    # The report comes first, then the JSON document.
+    document = out[out.index("\n{") + 1:]
+    state = json.loads(document)
+    assert state["counts"][backlog.STATUS_NOT_PROCESSED] == 1
+    assert state["cost_units"] == 12
+    assert state["declined"] is False
+    assert state["statuses"] == [backlog.STATUS_NOT_PROCESSED,
+                                 backlog.STATUS_PROCESSED]
+
+
 def test_backlog_process_without_a_provider_refuses_and_spends_nothing(
         places, capsys):
     home, _ = places
