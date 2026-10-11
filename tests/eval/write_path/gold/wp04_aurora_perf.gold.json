@@ -299,5 +299,39 @@
   ],
   "scenario": "Priya investigates aurora (customer dashboard) latency regressions: N+1 embedding calls behind the p95 spike, fixed with a bounded cache and a batch lookup.",
   "schema_version": 1,
-  "session_id": "wp04_aurora_perf"
+  "session_id": "wp04_aurora_perf",
+  "planted_qualifiers": [
+    {
+      "id": "wp04_aurora_perf_q_01",
+      "planted_turn": 3,
+      "verbatim_qualifier": "correlates with",
+      "class": "hedge",
+      "bound_claim": "wp04_aurora_perf_u_02",
+      "notes": "correlation framing (not causation) of the release/spike link"
+    },
+    {
+      "id": "wp04_aurora_perf_q_02",
+      "planted_turn": 11,
+      "verbatim_qualifier": "about",
+      "class": "hedge",
+      "bound_claim": "wp04_aurora_perf_u_08",
+      "notes": "marks the daily request volume as approximate"
+    },
+    {
+      "id": "wp04_aurora_perf_q_03",
+      "planted_turn": 13,
+      "verbatim_qualifier": "until the perf review signs off",
+      "class": "scope",
+      "bound_claim": "wp04_aurora_perf_u_09",
+      "notes": "flag stays off until the perf-review gate; bounds when the rollout is live"
+    },
+    {
+      "id": "wp04_aurora_perf_q_04",
+      "planted_turn": 19,
+      "verbatim_qualifier": "Realistically",
+      "class": "hedge",
+      "bound_claim": "wp04_aurora_perf_u_12",
+      "notes": "hedges the predicted p95 recovery target"
+    }
+  ]
 }

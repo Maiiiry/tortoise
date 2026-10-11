@@ -203,5 +203,39 @@
   ],
   "scenario": "Diego and Maya decide the rollout shape for the quarry lease fix: the chaos harness supports the scope-independence claim (SUPPORTS) and they commit to all-at-once behind a single global kill flag (the decision the follow-up session overturns).",
   "schema_version": 1,
-  "session_id": "wp06_quarry_rollout"
+  "session_id": "wp06_quarry_rollout",
+  "planted_qualifiers": [
+    {
+      "id": "wp06_quarry_rollout_q_01",
+      "planted_turn": 9,
+      "verbatim_qualifier": "That is my read too",
+      "class": "hedge",
+      "bound_claim": null,
+      "notes": "marks the scope-independence claim as the speaker's interpretation; that claim is an operator endpoint, not a planted unit"
+    },
+    {
+      "id": "wp06_quarry_rollout_q_02",
+      "planted_turn": 11,
+      "verbatim_qualifier": "tempting",
+      "class": "stance",
+      "bound_claim": "wp06_quarry_rollout_u_06",
+      "notes": "speaker's attitude toward all-at-once rollout, qualifying the speed-benefit claim"
+    },
+    {
+      "id": "wp06_quarry_rollout_q_03",
+      "planted_turn": 19,
+      "verbatim_qualifier": "I would rather",
+      "class": "stance",
+      "bound_claim": "wp06_quarry_rollout_u_07",
+      "notes": "preference framing of the single-driver decision"
+    },
+    {
+      "id": "wp06_quarry_rollout_q_04",
+      "planted_turn": 21,
+      "verbatim_qualifier": "as agreed",
+      "class": "stance",
+      "bound_claim": null,
+      "notes": "warrant (prior agreement) for keeping the September 30 cutoff; that cutoff is not a planted unit in this session"
+    }
+  ]
 }

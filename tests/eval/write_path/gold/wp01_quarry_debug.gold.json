@@ -348,5 +348,31 @@
   ],
   "scenario": "Diego debugs a stalled quarry (ingest pipeline) backfill replay for customer Halcyon Retail; root cause is a duplicate-processing race on the wire queue.",
   "schema_version": 1,
-  "session_id": "wp01_quarry_debug"
+  "session_id": "wp01_quarry_debug",
+  "planted_qualifiers": [
+    {
+      "id": "wp01_quarry_debug_q_01",
+      "planted_turn": 6,
+      "verbatim_qualifier": "probably",
+      "class": "hedge",
+      "bound_claim": "wp01_quarry_debug_u_04",
+      "notes": "hedges the assistant's bypass hypothesis on the retry path"
+    },
+    {
+      "id": "wp01_quarry_debug_q_02",
+      "planted_turn": 13,
+      "verbatim_qualifier": "I would rather",
+      "class": "stance",
+      "bound_claim": "wp01_quarry_debug_u_09",
+      "notes": "preference framing of the sixty-second-backoff decision; softer than a directive"
+    },
+    {
+      "id": "wp01_quarry_debug_q_03",
+      "planted_turn": 17,
+      "verbatim_qualifier": "about",
+      "class": "hedge",
+      "bound_claim": "wp01_quarry_debug_u_13",
+      "notes": "marks the Halcyon re-ingest magnitude as approximate"
+    }
+  ]
 }

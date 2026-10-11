@@ -232,5 +232,31 @@
   ],
   "scenario": "Maya and Diego investigate a six-minute duplicate anomaly after the all-at-once rollout: the flag hypothesis is counter-claimed by clock-skew evidence (NEGATE), a grace period closes the skew risk (MITIGATES), and the all-at-once global-flag decision from the prior session is overturned for per-service flags (SUPERSEDE, cross-session).",
   "schema_version": 1,
-  "session_id": "wp07_bluepeak_followup"
+  "session_id": "wp07_bluepeak_followup",
+  "planted_qualifiers": [
+    {
+      "id": "wp07_bluepeak_followup_q_01",
+      "planted_turn": 1,
+      "verbatim_qualifier": "about",
+      "class": "hedge",
+      "bound_claim": "wp07_bluepeak_followup_u_01",
+      "notes": "marks the duplicate window as approximate"
+    },
+    {
+      "id": "wp07_bluepeak_followup_q_02",
+      "planted_turn": 5,
+      "verbatim_qualifier": "My first hypothesis is",
+      "class": "hedge",
+      "bound_claim": null,
+      "notes": "presents the flag-raced-renewal claim as a hypothesis; that claim is the operator NEGATE target, not a planted unit"
+    },
+    {
+      "id": "wp07_bluepeak_followup_q_03",
+      "planted_turn": 15,
+      "verbatim_qualifier": "I would size",
+      "class": "stance",
+      "bound_claim": "wp07_bluepeak_followup_u_07",
+      "notes": "recommendation framing of the thirty-second grace decision"
+    }
+  ]
 }

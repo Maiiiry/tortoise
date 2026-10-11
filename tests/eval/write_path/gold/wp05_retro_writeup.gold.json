@@ -319,5 +319,31 @@
   ],
   "scenario": "Sam drafts the Bluepeak incident retro with Aisha: timeline, root cause, follow-ups with owners and dates, published as an opt-out incident writeup.",
   "schema_version": 1,
-  "session_id": "wp05_retro_writeup"
+  "session_id": "wp05_retro_writeup",
+  "planted_qualifiers": [
+    {
+      "id": "wp05_retro_writeup_q_01",
+      "planted_turn": 1,
+      "verbatim_qualifier": "about",
+      "class": "hedge",
+      "bound_claim": "wp05_retro_writeup_u_01",
+      "notes": "marks the outage duration as approximate"
+    },
+    {
+      "id": "wp05_retro_writeup_q_02",
+      "planted_turn": 11,
+      "verbatim_qualifier": "they are both good",
+      "class": "stance",
+      "bound_claim": null,
+      "notes": "speaker's endorsement of the two follow-up decisions (u_07, u_08); no single planted unit carries the endorsed claim"
+    },
+    {
+      "id": "wp05_retro_writeup_q_03",
+      "planted_turn": 17,
+      "verbatim_qualifier": "that was the decision after the August incident",
+      "class": "stance",
+      "bound_claim": "wp05_retro_writeup_u_13",
+      "notes": "cites the prior decision as warrant for opt-out publication"
+    }
+  ]
 }

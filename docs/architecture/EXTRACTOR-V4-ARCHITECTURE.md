@@ -942,6 +942,59 @@ Option 4 (narrative as *focus*, raw as *source*) **hedges precisely this unresol
 
 The research names it: **does the summary lose the hedging / scope / stance information that a claim's confidence depends on?** Adjacent evidence (no head-to-head study exists): summaries can be unfaithful, hallucination propagates across summary chains, and summarising raises precision while **dropping recall**. **Any measurement must be run on OUR corpus — none of these transferred cleanly.**
 
+#### ✅ MEASURED 2026-10-10 (`#7947`) — the falsifier did NOT fire, and the loss is not the narrative's
+
+**Design (pre-registered before the run:** see `#7947` comment `6102402694`**).** Two arms differing in exactly
+one value: the production pipeline feeds S2 either `story = compile_stories(chunk_stories)` (**narrative**, as
+shipped) or `story = _edus_to_text(edus)` (**raw**), with the same pinned model
+(`deepseek/deepseek-v4-flash`), the same `run_s2` (so one prompt scaffolding), the same chunking and the same
+`edus`. Corpus: our planted-gold write-path corpus (`tests/eval/write_path/`, wp01–wp07); split fixed as
+**wp01–wp04 tuning / wp05–wp07 holdout**. 25 planted qualifiers (hedge/scope/stance, annotated into the gold
+as `planted_qualifiers` before the run), 90 planted units. Harness:
+`tests/eval/write_path/raw_vs_narrative.py` + `score_qualifiers.py`.
+
+| arm | qualifier loss | distortion (of claims that survived) | recall | precision | claims emitted |
+|---|---|---|---|---|---|
+| **raw** | 80.0% (20/25) | 44.4% | 54.4% (49/90) | 62.8% | 113 |
+| **narrative** | **48.0%** (12/25) | **27.8%** | **80.0%** (72/90) | 59.9% | 152 |
+
+Holdout alone (wp05–wp07): raw 100% loss / 42.4% recall; narrative **40% loss / 66.7% recall** with precision
+parity (49.2% vs 50.0%).
+
+**Reading.** The narrative does not lose hedging/scope/stance relative to raw — it loses **less** on every
+measured axis, and recalls materially more planted facts at parity precision. **The falsifier as stated
+does not fire.** But the more important number is the one both arms share: **qualifier survival is poor
+regardless of input (48–80%)**, so §10's question has a real answer — claim-confidence information *is* being
+lost at the S2 layer — and the narrative is not the cause. The raw arm's loss is dominated by *absence*
+(16 of 25: it never emitted the claim), not by distortion; the narrative's smaller loss is mostly distortion
+(it emitted the claim but flattened the qualifier).
+
+**⚠️ Not established, and why the number is directional not settled:** n=25 qualifiers across 7 sessions
+(holdout n=10, and the raw holdout arm matched only 2 claims); the instrument is lexical and can only
+**under-credit** preservation, so the narrative's advantage may be understated, not overstated; the 9 of 25
+qualifiers with no bound planted unit use the qualifier's own words as anchor, a stricter and differently-
+semantic test (lost ~equally by both arms). **A judge-arbitration pass over the decisive `flattened` cases
+was registered but not run** — the deterministic instrument needed no session-to-session variance estimate,
+so its registered repeat-run check was never exercised. Treat the direction as measured and the magnitude
+as provisional.
+
+**Decision rule — applied literally, against the registration.** The rule had three branches; Δ(loss) on the
+holdout is **−60 pp** and Δ(precision) is **−0.8 pp**. So branch 1 (falsifier fires: Δ > +10 pp or a P/R drop
+> 5 pp) **does not fire**, and branch 2 (settled in the narrative's favour: |Δ| ≤ 10 pp with P/R within
+±5 pp) **does not apply either**, because the narrative exceeded parity rather than merely matching it.
+That leaves branch 3: **Option 4 stays provisional**, with this measurement recorded as its cost rather than
+as a settlement. ⚠️ **That is a defect in the registration, not a finding**: it contemplated "the narrative
+loses" and "the narrative is on par" but had no branch for "the narrative wins", and the number is not
+being retro-fitted to it. The decision — what a 32 pp favourable gap on n=25 does to Option 4's provisional
+status — is therefore **owner-facing**, and it is raised on `#7947` rather than decided here.
+
+**⇒ A SEPARATE premise is now in question, and it is E1's.** The narrative arm emitted **more** claims in
+every session (152 vs 113 overall, +35%), and its higher recall is bought with that volume. So the narrative
+is **not** a volume-reduction mechanism at the S2 layer — which is a direct challenge to §1's framing that
+v4's promise is that "node volume FALLS", and it is evidence for `#7949`'s E1 that the volume question must
+be settled on *what kind* of nodes are emitted, not on the narrative's input substitution. Recorded here
+because §10 produced it; the E1 verdict belongs to the epic.
+
 ### ✅ Update 2026-09-23 — a STATED reason for raw extraction now exists
 
 Hindsight is the first system found with a *stated* reason, and it supports **Option 4**:
@@ -1172,7 +1225,7 @@ From migration `e9b2c7d1f3a4_drop_entity_memory_links.py` (2026-05-26):
 
 **Not yet filed from this document (candidates, not decisions):**
 
-- **The raw-vs-narrative measurement** (D3's falsifier, §10) — the next real work, and the one that settles whether Option 4 stays provisional.
+- ~~**The raw-vs-narrative measurement** (D3's falsifier, §10) — the next real work, and the one that settles whether Option 4 stays provisional.~~ **✅ FILED as `#7947`, MEASURED 2026-10-10 — see §10.** Verdict: the falsifier did not fire (the narrative loses *less*), but qualifier survival is poor in **both** arms and Option 4 stays provisional pending the owner's reading of a 32 pp favourable gap on n=25. The written-back numbers, caveats and the registration defect are in §10.
 - **Fan-out caps** and **the `aboutObject` join-vs-edge question** — mirrored in `STORAGE-ARCHITECTURE.md` §13, because they are storage decisions as much as extraction ones. ⚠️ **(2026-09-24: both now have filed gaps — the fan-out cap `#5010`, the derive-vs-store question still owner-pending.)**
 
 ---

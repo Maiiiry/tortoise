@@ -333,5 +333,39 @@
   ],
   "scenario": "Maya and Tomas review the ember alerting redesign: route alerts by service ownership, cut unactionable pages, and target a sustainable on-call load.",
   "schema_version": 1,
-  "session_id": "wp03_ember_design"
+  "session_id": "wp03_ember_design",
+  "planted_qualifiers": [
+    {
+      "id": "wp03_ember_design_q_01",
+      "planted_turn": 3,
+      "verbatim_qualifier": "mostly",
+      "class": "hedge",
+      "bound_claim": null,
+      "notes": "weakens the claim that on-call load falls on the platform team (not exclusively); that claim is not a planted unit"
+    },
+    {
+      "id": "wp03_ember_design_q_02",
+      "planted_turn": 5,
+      "verbatim_qualifier": "Roughly",
+      "class": "hedge",
+      "bound_claim": "wp03_ember_design_u_02",
+      "notes": "marks the unactionable-page share as approximate"
+    },
+    {
+      "id": "wp03_ember_design_q_03",
+      "planted_turn": 17,
+      "verbatim_qualifier": "which I agree with",
+      "class": "stance",
+      "bound_claim": "wp03_ember_design_u_09",
+      "notes": "speaker endorses Aisha's human-owned-declarations suggestion"
+    },
+    {
+      "id": "wp03_ember_design_q_04",
+      "planted_turn": 21,
+      "verbatim_qualifier": "before we expand",
+      "class": "scope",
+      "bound_claim": null,
+      "notes": "limits expansion of ownership-based routing until the first two weeks are watched; the stance 'Tomas wants' rides on the same clause"
+    }
+  ]
 }
