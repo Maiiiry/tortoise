@@ -542,6 +542,15 @@ surfaces:
   # predicate is not vacuous (#5100, #5013). Sits with the quota surface
   # because the predicate under test IS the `documents` cap.
   - test_document_source_gold.py
+  # #1724: DUAL-REGISTERED with `core`. No single arm covers every file the
+  # change touches — `tortoise/docs_miner.py` matches no SOURCE_PATTERNS entry
+  # (so it falls through to `core`), while `tortoise/__main__.py` is an EXACT
+  # `api` SOURCE_PATTERNS match that REPLACES the `core` fallback, so a
+  # `mine-docs`-verb-only edit (the `_cmd_mine_docs` wiring this file pins)
+  # would select `api` alone. Registered on both arms for the same reason as
+  # test_7809_hosted_prewarm_warmup_flag.py above: a guard that never runs on
+  # the diff it guards is the #1349/#2938/#3154 silent-drop class.
+  - test_docs_miner.py
   - test_redis_guard.py
   - test_selfhost.py
   - test_selfhost_rest.py
@@ -806,6 +815,7 @@ surfaces:
   - test_7856_goal_state.py
   - test_audit_fallback_home_isolation.py
   - test_ci_stall_identify.py
+  - test_docs_miner.py
   # #4071: guards that the URI-less embedded test lane cannot resolve a bare
   # TortoiseSDK() to the owner's canonical store (~/.tortoise/tortoise.db) —
   # the writer path #4028 left open, so residue regenerated after each purge.
