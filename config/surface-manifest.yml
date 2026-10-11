@@ -1,3 +1,26 @@
+# OVERRIDES: the frozen-snapshot-as-approval-baseline practice — a snapshot of the implementation cannot be the approved target; the target is read from docs/product/canonical-mcp-tools.md (owner, 26/40, re-confirmed 2026-10-10).
+#
+# The top-level approval is STAGED from docs/product/canonical-mcp-tools.md (#4185) by
+# `tools/surface_manifest.py::read_approval`; the committed copy is still
+# `pending-owner-approval` because CI's required `surface-guard` pins the BASE guard,
+# whose per-row `approval` rule fires on `approved`. A follow-up PR (#8144) flips it
+# once the new guard is on main; do not hand-edit the four values — re-cut (the cut
+# copies the doc).
+#
+# `high_water_counts` is a GROWTH PIN, not a derivation: `cut` carries it forward and
+# `tools/surface-guard.py` reds when the live surface EXCEEDS it. Raising it is a
+# deliberate, reviewable act in the approving PR — so a re-cut over a grown surface
+# cannot be green by construction.
+#
+# ⚠️ A re-cut emits ONLY this header, then the `yaml.safe_dump` of the derived document.
+# YAML dumps no comments, so any comment below this block is SILENTLY DROPPED. Keep
+# rationale here or in the docs, never in an ad-hoc comment in the body.
+#
+# THE BASELINE BELOW IS A FREEZE OF WHAT EXISTS, NOT THE APPROVED TARGET. It exists so
+# drift is visible (tools/surface-guard.py). The approved TARGET is recorded in
+# docs/product/canonical-mcp-tools.md and docs/product/beta-sdk-surface.md; compliance
+# with it is checked by tools/surface-target-check.py, which reads those docs rather than
+# a constant here.
 manifest_version: 1
 issue: 3863
 cut_at_commit: 4d11a7b40f8c1dbb5d099acc4b54e09324af5452
@@ -7,6 +30,7 @@ allowed_transforms:
 approval_status: pending-owner-approval
 approval_principal: null
 approval_pr: null
+approval_date: null
 # Response FIELDS are outside the frozen surface — the freeze is on tools and
 # endpoints — but each one is recorded here so this manifest stays the single
 # source of truth for what we tell agents we return. A field that is off by
@@ -96,6 +120,29 @@ response_fields:
   field: _idx
   emitted_when: 'always, on every connected node — the traversed edge''s idx (underscore-prefixed like the sibling _relationship key, #6101)'
   unchanged_when_off: 'n/a — not flag-gated; additive key on each connected node, present (null where the edge carries no idx), and the categorised lists are unchanged'
+# #2598 (the draft-honesty half; the ingest-default half needs a registry +
+# baseline re-cut, so it is NOT here): a DRAFT row's belief rendering on the
+# state recall. Two entries because the change is two things — an ADDITIVE key
+# and a VALUE change on an existing one — and neither is flag-gated, so both
+# are recorded rather than left to the #4282 carve-out. The tool/method rule is
+# not engaged: no tool is added or removed, and no SDK method is; the read is on
+# the EXISTING recall surface (the #5038 Policy B precedent recorded above in this
+# this block). The value change is strictly scoped — only a row whose status is
+# `draft` AND whose belief EP has not measured, i.e. exactly the rows that used
+# to render a fabricated 0.5. Every live row keeps its number, its key set and
+# its order.
+- response: tortoise_recall
+  field: recall_ranking.draft
+  emitted_when: 'the row is a Point with status `draft` — present only when true (the #1353 D8 / #2294 additive rule), so every live hit is byte-identical. It is the machine-readable badge: the status vocabulary is not something a consumer should have to know to see that a row is staged. tortoise_recall mode=state and mode=custom (both serve recall_state); mode=gaps has its own ranker'
+  unchanged_when_off: 'yes — not flag-gated; the key is ABSENT on every non-draft row'
+- response: tortoise_recall
+  field: recall_ranking.confidence
+  emitted_when: 'the same rows as recall_ranking.draft, and only when EP has NOT measured the claim (no persisted posterior, and no non-baseline legacy ep_alpha — the #3276 measured predicate): confidence becomes null. A draft that DOES carry a persisted posterior (demoted after a real EP run) keeps its measured number, because there the number is real and only the staging is the news. Rationale: a draft is EP-inert (live._live_only excludes it at every factor-extraction call site), so no belief is computed for it, and the neutral 0.5 it used to report could outrank a measured live claim below 0.5 (#2598 repro). The min_confidence floor refuses an uncomputed draft for any POSITIVE floor; the default 0.0 floor keeps it, so drafts stay recallable and the ranker places them after every live row'
+  unchanged_when_off: 'NO for an unmeasured draft, yes for everything else — deliberately not flag-gated. This is a value change on an existing key, scoped to rows whose rendered number was never measured. Live rows: identical number, identical key set, identical order. Uncalibrated LIVE rows keep the documented #898 neutral 0.5 (a recorded decision this change does not reopen)'
+- response: tortoise_recall
+  field: recall_ranking.confidence_source
+  emitted_when: 'the same rows as recall_ranking.confidence becomes null — the source reads "uncomputed" instead of "neutral", so a consumer can tell "no belief was computed for this staged row" from "a live row nobody measured" without knowing the status vocabulary'
+  unchanged_when_off: 'NO for an unmeasured draft, yes for everything else — the same scoping as recall_ranking.confidence; every live row keeps its "posterior"/"neutral" verdict'
 counts:
   tools: 82
   sdk_public_methods: 150
@@ -111,6 +158,9 @@ counts:
     check: 8
     link: 4
     operate: 7
+high_water_counts:
+  tools: 82
+  sdk_public_methods: 150
 retired:
 - name: tortoise_get
   use_instead: tortoise_get_entity(id, type=...)
@@ -5719,11 +5769,11 @@ rows:
   cluster: null
   canonical: null
   job: Public SDK method TortoiseSDK.volunteer_context.
-  dependency: 'reached by no registered MCP tool; caller categories: cli, tenant-rest'
+  dependency: 'reached by no registered MCP tool; caller categories: cli, engine, tenant-rest'
   lifecycle: active
   used_by: tooling, docs
   recommendation: review
-  reason: 'no MCP tool binds it; callers: cli, tenant-rest'
+  reason: 'no MCP tool binds it; callers: cli, engine, tenant-rest'
   recommended_family: null
   proposed: false
   exemption: false

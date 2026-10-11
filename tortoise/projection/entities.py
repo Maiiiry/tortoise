@@ -747,6 +747,10 @@ class _EntityHandlers:
     # Keys explicitly handled by each _upsert_* method.
     _SUBJECT_HANDLED: frozenset = frozenset({
         "id", "name", "subject_kind", "subjectKind", "createdAt", "embedding",
+        "status",  # #1423: status is projection-owned — a SubjectAdded replay
+        # must NOT rewrite it via _persist_extra_props (the clobber guard ported
+        # from #1350's Object clause: a re-mention of a superseded team/role/
+        # person cannot reset superseded→live). Mirrors _OBJECT_HANDLED below.
     })
     _OBJECT_HANDLED: frozenset = frozenset({
         "id", "name", "object_kind", "objectKind", "createdAt", "title",
@@ -1103,6 +1107,14 @@ class _EntityHandlers:
         # text, declared so the replay open-set passthrough does not log a
         # FALSE undeclared-prop drift warning on every rebuild.
         "span_start", "span_end",
+        # #1724: the STABLE external anchor carried by extractor-minted
+        # statement Points (``github:issue:*`` from the GitHub indexer's
+        # dormant statement path, ``docs:<doc_id>#<claim key>`` from the docs
+        # miner). Both are IN-TREE producers, so the reason the two entries
+        # above carry applies verbatim: without this, the live write and every
+        # rebuild log a false "not declared" drift warning for a prop that is
+        # part of the documented statement contract.
+        "externalId",
         # #3689 review P2 (A): the four canonical annotator dims are legitimately
         # carried on a PointAdded snapshot by `create_point(annotator_*=…)` /
         # `_update_entity` — declaring them keeps the replay open-set
@@ -2013,6 +2025,15 @@ class _EntityHandlers:
         if not _writable_id(session_id):
             _log_identity_skip("Session", session_id, "id (MERGE key)")
             return
+        # #7951 R2-P2: mirror `_link_source`'s pre-delete gate. A `CONTAINS`
+        # edge derived from a `PointAdded` that precedes a later
+        # `SessionDeleted` was severed live by the delete's `DETACH DELETE`;
+        # a re-capture's fresh Session must not inherit the old incarnation's
+        # edge. Only active during `rebuild_all` pass 2.
+        _replay_del = self._replay_session_deleted_seq
+        if (_replay_del is not None
+                and _replay_del.get(session_id, -1) > self._replay_seq):
+            return
         self.g.query(
             "MERGE (s:Session {id:$sid}) SET s.is_episodic=true",
             params={"sid": session_id},
@@ -2022,6 +2043,69 @@ class _EntityHandlers:
             "MERGE (s)-[:CONTAINS]->(t)",
             params={"sid": session_id, "tid": point_id},
         )
+
+    def _fold_session_deleted(self, ev: dict, *, remove_session: bool = True,
+                              remove_source: bool = True) -> int:
+        """#7951: the ``:Session`` node's hard-delete carrier.
+
+        ``hosted_api._delete_session_sync`` removes the ``:Session`` with a raw
+        ``DETACH DELETE``. The node is NOT a canonical entity label
+        (``_CANONICAL_ENTITY_ID_PROPS`` has no ``Session``), so no
+        ``EntityMutated`` record can delete it — that fold would fall back to
+        the id-wide canonical delete and leave the Session standing while
+        ``SessionRecorded`` re-materialised it on replay. Without a carrier the
+        whole session deletion is invisible to ``derived = replay(journal)`` and
+        the next rebuild RESURRECTS it (with its ``CONTAINS`` edges re-wired).
+
+        The fold removes the ``:Source`` the session delete removes in the same
+        step — its agentSession stub, ``url = session:{id}`` — because that
+        node is re-materialised by ``rebuild_all``'s pass-2 ``_link_source``
+        from the deleted Points' own payloads, so it must be re-asserted
+        together with the container. Both nodes are keyed off the SAME
+        re-creation anchor (a later ``SessionRecorded`` for the id), so one
+        carrier cannot drift from the other.
+
+        Idempotent: a 0-row delete is the record's END STATE (a retried delete,
+        or a replay onto a graph the record already cleared), so it is NEVER a
+        fold-miss and must not be refused. ``DETACH`` drops the ``CONTAINS``
+        edges; the owned Points and Events themselves are removed by their own
+        ``EntityMutated`` op=delete records, which the same delete site emits.
+
+        ``remove_session`` / ``remove_source`` (#7951 P1-a) let the caller
+        suppress ONE of the two removals. They exist for ``rebuild_all``'s
+        DEFERRED re-apply: the Source has a SECOND journal re-creation path
+        the container anchor cannot see — ``_link_source`` mints
+        ``session:{id}`` from ANY journaled ``PointAdded`` carrying
+        ``extractedFrom=session:{id}`` — so a deferred re-apply carried out
+        after pass 2 must not delete a Source a LATER record re-materialised
+        while still deleting a container no later record re-materialised.
+        Both default ``True``: the inline folds (``apply`` / ``rebuild`` /
+        ``rebuild_all`` pass 1b) are chronology-ordered, so a later record's
+        own fold re-creates whatever the delete removed and no suppression is
+        needed.
+
+        Returns the number of Session nodes deleted (0 when ``remove_session``
+        is False, whatever the Source removal did).
+        """
+        from tortoise.projection import _writable_id
+
+        if not isinstance(ev, dict):
+            return 0
+        sid = ev.get("id")
+        if not _writable_id(sid):
+            return 0
+        if remove_source:
+            self.g.query(
+                "MATCH (src:Source {url:$url}) DETACH DELETE src",
+                params={"url": f"session:{sid}"},
+            )
+        if not remove_session:
+            return 0
+        r = self.g.query(
+            "MATCH (s:Session {id:$sid}) DETACH DELETE s RETURN count(s)",
+            params={"sid": sid},
+        )
+        return int(r.result_set[0][0]) if r.result_set else 0
 
     def _upsert(self, p: dict, contains_session: str | None = None) -> None:
         """Upsert a Point: node properties via _upsert_point_props, then edges."""
@@ -2765,6 +2849,15 @@ class _EntityHandlers:
         self.g.query(
             "MERGE (s:Subject {name:$name}) "
             "ON CREATE SET s.id=$id, s.subjectKind=$sk, s.createdAt=coalesce($ca, $now), "
+            # #1423: status ON CREATE only — the Subject twin of the #1350
+            # Object clause. Before this, `status` rode the extra-props lane
+            # (`_SUBJECT_HANDLED` lacked it, #2295), which applies on MATCH as
+            # well — so ANY SubjectAdded replayed over a superseded node reset
+            # it to 'live' (measured), and a re-mention clobbered the live node
+            # while replay kept the supersession: the #2193 live≠replay class.
+            # With status projection-owned, this clause SEEDS a fresh/
+            # re-created Subject and ON MATCH never touches it.
+            "            s.status=coalesce($st, 'live'), "
             "            s.embedding=CASE WHEN $embedding IS NOT NULL THEN vecf32($embedding) ELSE s.embedding END "
             "ON MATCH SET s.id=coalesce($id, s.id), "
             "            s.subjectKind=coalesce($sk, s.subjectKind), "
@@ -2783,6 +2876,7 @@ class _EntityHandlers:
             params={"id": sid, "name": name,
                     "sk": ev.get("subject_kind", "other"),
                     "ca": ev.get("createdAt"), "now": _now_iso(),
+                    "st": ev.get("status"),  # #1423: status ON CREATE only
                     "embedding": embedding},
         )
         # #228: persist arbitrary caller-supplied props

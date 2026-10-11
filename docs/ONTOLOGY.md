@@ -4,7 +4,7 @@ type: data
 domain: data
 status: live
 created: 2026-08-05
-updated: 2026-10-10
+updated: 2026-10-11
 ownedBy: epistemic-team
 aboutSubjects: epistemic-team
 aboutObjects: tortoise
@@ -87,6 +87,42 @@ doc_status: live
 > meaning is **#3590** S2's decision — and a caller-asserted valid-time start
 > needs the inversion guards the Point window needed (#3980/#4021/#5358/#5360);
 > `Subject`/`Object` windows remain ❌ (§4.2/§4.3).
+>
+> **Changelog v3.23 (2026-10-11 — issue #1423 — Subject status is projection-owned, and supersession reaches the Subject family):**
+> §4.2's `status` cell recorded a **capability gap** ("projection-owned status is planned, NOT yet
+> implemented on Subject", #2295) and the Subject family had no supersession path at all:
+> `commit_ops.apply_supersessions` refused a record whose successor was a `:Subject` (the #1370
+> warn-and-skip), so a replaced team/role/person stayed `live` and search-visible forever. Both are
+> now built. `_upsert_subject` **seeds** `status` ON CREATE and `status` ∈ `_SUBJECT_HANDLED`, so the
+> Object's #1350/#2194 clobber guard applies to Subjects too; the supersession write goes through the
+> generic entity surface (`EntityMutated op="supersede"`, journaled with `status`/`supersededBy`/
+> `supersededAt`), which the ONE `SET n += $state` arm replays in all four engines; and
+> `commit_ops.SUBJECT_TERMINAL_STATUSES` excludes terminal Subjects from the four retrieval legs by
+> default. §4.2's `status` row moves ⚠️ → ✅ and gains `supersededBy`/`supersededAt`. **No model
+> change** — the Subject lifecycle vocabulary and the `superseded, never deleted` doctrine are
+> unchanged; this is the declaration catching up to the build. (The Subject `validFrom`/`validTo`
+> WINDOW is a separate row and stays ❌ — #1423 does not touch it.)
+>
+> **Changelog v3.22 (2026-10-10 — issue #7902 — the operator-endpoint WRITE path admits the four epistemic labels):**
+> The owner ruling #7813 makes confidence propagate across :Point/:Subject/:Object/:Event. (#7853's
+> read-widening branch is unmerged; on `main` the EP reads and the WRITE path are still Point/Event.)
+> #7902 widens `create_operator`, `create_direct_edge` and the operator-dedup id sweep to the four
+> labels (one declaration, `tortoise/live.py::EPISTEMIC_LABELS`), and widens the EP reads the write
+> path depends on — `_affected_factors` Batches 1/2/3, `_affected_claims`/`_live_neighbors`, the
+> `_load_cache`/`_flush_cache` node + message + back-message I/O, `_read_node`/`_write_node`,
+> `invalidate_messages`, the `projection/edges.py` operator fold, and the sdk promotion/partial-absorb
+> joins, so a newly-writable endpoint is not EP-inert in the writing process (the operator/direct edge
+> is visible to the EP run and to `dream`'s affected-set traversal). **Not claimed, and deliberately
+> so: the EP DIRTY MARKER is graph-persisted for `:Point` writers only.** `_mark_dirty`'s persist and
+> zombie-classification queries, `_hydrate_dirty_roots`, `_sweep_dirty_roots` and
+> `_prune_nonexistent_dirty_roots` all anchor `MATCH (n:Point)`, so a write whose endpoints are ALL
+> non-`:Point` is EP-inert across the request/process boundary — and the write-triggered
+> `dream(mode='local')` then returns an empty affected set. That is the residual split to **#7927**
+> (the `:Point`-only epistemic surfaces outside the EP engine, which already names
+> `analyze._bfs_select_operators`), extended there with the dirty-lifecycle sites, and it is **pinned,
+> not silenced**, by `tests/test_7902_write_path_label_widening.py::test_pinned_gap__*`. Direct edges
+> therefore connect any two plain epistemic nodes — **not** Point→Point only. #7853's branch converges
+> on the same shared declaration.
 >
 > **Changelog v3.22 (2026-10-10 — issue #2767 — `milestone` is a core EVENT kind, not an Object kind):**
 > §5's event-kind vocabulary did not list `milestone`, while the `project-management` pack declared it
@@ -973,7 +1009,8 @@ About edges: `aboutSubject`, `aboutObject`, `aboutEvent`, `aboutPoint`, `aboutDo
 | `id` | string | ✅ | `dc:identifier` | ✅ | Canonical identifier |
 | `name` | string | ✅ | `foaf:name` / `schema:name` | ⚠️ | Human-readable name |
 | `subjectKind` | string | ✅ | `dcterms:type` | ✅ | organization, team, role, legalPerson, naturalPerson, other |
-| `status` | string | — | `pav:status` | ⚠️ | Lifecycle: draft, live, superseded, deprecated, archived — **projection-owned status is planned, NOT yet implemented on Subject**; SDK-created subjects currently carry `status: "live"` via the extra-props path (`_persist_extra_props` — `status` ∉ `_SUBJECT_HANDLED`, #2295): `_upsert_subject` itself writes only `id`/`subjectKind`/`createdAt`/`embedding` |
+| `status` | string | — | `pav:status` | ✅ | Lifecycle: draft, live, superseded, deprecated, archived. **Projection-owned since #1423** — the Subject twin of the Object status cache (§11: the journal is the reconstruction source, the property is a cache). `_upsert_subject` SEEDS it ON CREATE (`status=coalesce($st,'live')`) and `status` ∈ `_SUBJECT_HANDLED`, so `_persist_extra_props` never rewrites it on MATCH — the #1350/#2194 clobber guard ported to Subject (before #1423 `status` rode the extras lane, which applies ON MATCH, so a **re-mention of a superseded team/role/person reset it to `live` live-side while replay kept the supersession** — the #2193 live≠replay class, pinned by `tests/test_subject_supersession_1423.py`). Supersession folds through the generic entity surface: `commit_ops.apply_supersessions` writes `status`/`supersededBy`/`supersededAt` and journals `EntityMutated op="supersede"`, which the ONE `SET n += $state` arm replays in all four engines. **Write side (review P1)**: `create_entity`/`update_entity` validate a Subject `status` against `commit_ops.SUBJECT_STATUS_VALUES` (this §4.2 lifecycle) and raise for anything else, so an undeclared value (e.g. `dead`) can neither be stored nor leak. Read side: `commit_ops.SUBJECT_TERMINAL_STATUSES` (superseded / deprecated / archived / retracted — `retracted` is not among the §4.2 declared verbs and the write guard REFUSES it, but the read set is the NET for a state a legacy/pre-fix SDK or a raw producer may already have stored, on the Object family's own precedent (#2977), where a read vocabulary kept `retracted` with no in-tree writer) excludes terminal Subjects from the four retrieval legs by default |
+| `supersededBy` / `supersededAt` | string / ISO8601 | — | — | ✅ | #1423: successor NAME (stored verbatim) and the fold instant, written together with `status='superseded'` by the subject supersession lane. Carried in the journaled `EntityMutated` `state` map, so a wipe+rebuild restores the ORIGINAL instant rather than a rebuild-time one — the #2164-P4 drift class the Object twin still exhibits (`_fold_object_superseded` falls back to `now` on the live path while replay reads the journaled `ts`). Absent on non-superseded Subjects |
 | `validFrom` / `validTo` | ISO8601 | — | `prov:generatedAtTime` / `prov:invalidatedAtTime` | ❌ | Valid-time window — when the Subject held in the world (declared §4.7, #3642; not yet written by `_upsert_subject`) |
 | `expiredAt` | ISO8601 | — | — | ❌ | Transaction-time expiry — when our record of the Subject stopped being current (declared §4.7, #3642) |
 | `createdAt` | ISO8601 | ✅ | `dc:created` | ✅ | Timestamp (set ON CREATE; adopted ON MATCH only when absent — #2295) |
@@ -1453,13 +1490,10 @@ optional free data). It carries an operator **only when it needs one**.
 
 **An edge carries an operator iff it needs mitigation, or is an epistemic
 support/contradict between epistemic nodes (any of `:Point`, `:Subject`,
-`:Object`, `:Event` — see §5 on the point↔object/point↔event overlap,
-per #7813/#7853).** The operator node itself is always a
-`:Point {is_operator:true}`; its children/targets may carry any of the four
-labels. ⚠️ `:Subject`/`:Object` operator endpoints are spec-only until #7902
-lands — the write path admits `:Point`/`:Event` only (the #7853 READ widening
-already admits all four). All other edges stay plain and carry confidence as an
-edge attribute.
+`:Object`, `:Event` — see §5 on the point↔object/point↔event overlap; #7813/#7853).**
+The operator node itself is always a `:Point {is_operator:true}`; its
+children/targets may carry any of the four labels. All other edges stay plain
+and carry confidence as an edge attribute.
 
 > **OVERRIDES:** the pre-#7813 "Point→Event operators are write-only in v1, no
 > EP propagation" rule — #7813 rules that confidence propagates across
@@ -1468,7 +1502,7 @@ edge attribute.
 
 | Edge | Operator? | Confidence |
 |---|---|---|
-| :Point/:Subject/:Object/:Event ↔ same support / contradict (IMPL/NAND) | **Yes** | EP over the IMPL/NAND edge |
+| Support / contradict (IMPL/NAND) between epistemic nodes (:Point/:Subject/:Object/:Event) | **Yes** | EP over the IMPL/NAND edge |
 | Any edge needing mitigation (+/− relevance) | **Yes** — mitigations attach to the operator | EP over IMPL/NAND |
 | Structural edge without mitigation (about\*, performs/produces/uses, memberOf/ownedBy, provenance) | **No** — plain edge | confidence edge attribute |
 | `related` — the neutral association edge (§3.9) | **No** — plain edge | **none** — evidence-free by construction; no belief path may read it |
@@ -1484,8 +1518,9 @@ edge attribute.
   closed by **#5566** (the affected-set traversal is now `IMPL`/`NAND`-filtered **and**
   directed, so only operator inputs are admitted).
 
-- **Operator-less propagation:** an IMPL/NAND edge may be direct Point→Point
-  (no operator); EP propagates over it the same way.
+- **Operator-less propagation:** an IMPL/NAND edge may be direct between any two plain epistemic
+  nodes (`:Point`/`:Subject`/`:Object`/`:Event` — #7902; no operator); EP propagates over it the
+  same way.
 - **Direction:** four values, **recorded on the write**: `->` (source → target), `<-` (target →
   source), `<->` (both ways), `-` (none). Lives on the operator node when present, else on the
   edge. EP reads the operator node first, falls back to the edge.
