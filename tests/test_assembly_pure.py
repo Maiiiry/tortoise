@@ -38,24 +38,43 @@ import pytest
 
 from tortoise.assembly import (
     AssemblyShape,
+    RelativeAnchor,
     ResolveResult,
     classify_question,
     extract_subject_terms,
+    resolve_relative_anchor,
     resolve_subjects,
 )
 
 _CENSUS = json.loads(
     (Path(__file__).resolve().parent / "_assembly_census.json").read_text())
 
-# the measured-negative classes (the census's non-fireable sub-classes)
+# ── #2652 census re-measurement ──────────────────────────────────────────
+# The R13 reject-guard's ago/recency vocabulary was PROMOTED to the
+# AGO_RELATIVE shape (explicit offsets + recency — see
+# ``_REL_TIME_CLASSES``). The negative set for the precision floor is
+# therefore the RESIDUAL measured set: every census class EXCEPT the two
+# promoted ones (133 - 31 - 2 = 100 rows). The two rows #2165 Task 2
+# already adjudicated as label noise stay in it, plus ONE new adjudication
+# (``gpt4_4929293b``, filed relative-date-lookup but morphologically an
+# explicit-offset 'a week ago' row — the same family as the promoted 31).
 _NEG_CLASSES = {
-    "ago-relative", "frequency/count", "duration-state",
-    "relative-date-lookup", "nary-ordering", "other",
-    "pattern/recurring", "offset-comparison", "recency",
+    "frequency/count", "duration-state", "relative-date-lookup",
+    "nary-ordering", "other", "pattern/recurring", "offset-comparison",
     "recency/current-state",
 }
-# the two adjudicated label-noise rows that MAY fire (pinned — do not grow
-# this list without a documented census divergence)
+# the census classes #2652 promotes to a FIRING shape (recall contract)
+_REL_TIME_CLASSES = {"ago-relative", "recency"}
+#: census rows FILED under a residual class that are MORPHOLOGICALLY part of
+#: the promoted family (a mis-file). They are removed from the negative set
+#: and asserted as promotions instead — scoring a known positive as a false
+#: fire would make the precision figure meaningless.
+_PROMOTED_MISFILED = {
+    "gpt4_4929293b",          # 'a week ago' — explicit offset, filed
+                              # relative-date-lookup
+}
+# the adjudicated label-noise rows that MAY fire (pinned — do not grow this
+# list without a documented census divergence)
 _ADJUDICATED_FIRE = {
     "370a8ff4",               # interval-since twin (filed frequency/count)
     "gpt4_70e84552_abs",      # ordering twin (filed nary-ordering)
@@ -158,27 +177,54 @@ def test_current_state_fires(question, expected):
 # ── measured precision floor on the census negative set (R15/R16) ─────────
 
 def test_census_negative_set_precision_floor():
-    """Precision on the measured negative set ≥ 0.95: at most 2 of the 78
-    non-fireable rows may fire, and those 2 are pinned to the adjudicated
-    label-noise rows (a NEW false fire fails — the floor is monotonic)."""
-    rows = [r for r in _CENSUS["rows"] if r["cls"] in _NEG_CLASSES]
-    assert len(rows) == 78
+    """Precision on the RESIDUAL measured negative set ≥ 0.95 (#2652
+    re-measurement).
+
+    The promoted classes (``_REL_TIME_CLASSES``: ago-relative 31 + recency
+    2) are no longer negatives — they are the recall contract asserted
+    below, and the one morphologically-promoted mis-file
+    (``_PROMOTED_MISFILED``) is scored there too. The residual set is the
+    remaining 44 census rows; at most 2 of them may fire and both are
+    pinned ADJUDICATED label-noise rows (a NEW false fire fails — the floor
+    is monotonic).
+
+    Re-measured against ``tests/_assembly_census.json``: 42/44 rejected =
+    0.9545 ≥ the 0.95 floor. The #2165 figure (76/78 rejected) is NOT
+    comparable: 33 of those 78 rows are now deliberate positives.
+    """
+    rows = [r for r in _CENSUS["rows"]
+            if r["cls"] in _NEG_CLASSES
+            and r["qid"] not in _PROMOTED_MISFILED]
+    assert len(rows) == 44
     false_fires = [
         r for r in rows
         if classify_question(r["question"]) is not None]
     assert {r["qid"] for r in false_fires} <= _ADJUDICATED_FIRE, \
-        f"unexpected false fires: {[(r['qid'], r['question'][:70]) for r in false_fires]}"
+        f"unexpected false fires: {[(r['qid'], r['cls'], r['question'][:70]) for r in false_fires]}"
     assert len(false_fires) <= 2, \
-        f"precision floor breached: {len(false_fires)}/78 fired"
-    # the two adjudicated rows fire as their shapes (they are in-shape)
-    for r in false_fires:
-        assert classify_question(r["question"]) is not None
+        f"precision floor breached: {len(false_fires)}/44 fired"
+    assert (len(rows) - len(false_fires)) / len(rows) >= 0.95
+
+
+def test_census_relative_time_recall():
+    """#2652 recall contract: EVERY promoted census row routes to the
+    AGO_RELATIVE shape — ago-relative 31/31 + recency 2/2 + the one
+    morphologically-promoted mis-file (measured)."""
+    rows = [r for r in _CENSUS["rows"]
+            if r["cls"] in _REL_TIME_CLASSES
+            or r["qid"] in _PROMOTED_MISFILED]
+    assert len(rows) == 34
+    misses = [(r["qid"], r["question"][:80]) for r in rows
+              if classify_question(r["question"])
+              is not AssemblyShape.AGO_RELATIVE]
+    assert not misses, f"promoted rows failed to route: {misses}"
 
 
 def test_census_in_scope_recall_and_shape_rejections():
     """In-scope census rows: the 50 shape-typical rows fire; the 5 pinned
     duration/count mis-files do NOT (shape-based rejection is the point)."""
-    rows = [r for r in _CENSUS["rows"] if r["cls"] not in _NEG_CLASSES]
+    rows = [r for r in _CENSUS["rows"]
+            if r["cls"] not in _NEG_CLASSES | _REL_TIME_CLASSES]
     assert len(rows) == 55
     fired = [r for r in rows if classify_question(r["question"]) is not None]
     no_fire = [r for r in rows if classify_question(r["question"]) is None]
@@ -190,24 +236,165 @@ def test_census_in_scope_recall_and_shape_rejections():
         f"in-scope rejection set drifted: {sorted(set(by_text) ^ _IN_SCOPE_NO_FIRE)}"
 
 
-def test_ago_relative_never_fires_even_with_state_morphology():
-    """R13 reject-on-relative-offset: 'ago'/'last <time>' kills the shape
-    even when the phrasing carries state morphology."""
+def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
+    """#2652 boundary: the relative-offset vocabulary is PROMOTED (see
+    ``test_ago_relative_shape_fires``); what still rejects is
+
+    * the R13 COMPOUND pin — a relative offset inside a two-subject
+      ordering/interval template (the offset is narrative anchor text
+      there, not the question's window), and
+    * the vocabulary two live sibling issues own: 'last <weekday>' /
+      'the past weekend' (calendar anchors — #2655) and bare 'latest' as
+      an ORDERING INSTRUCTION ('from earliest to latest' — #2653).
+    """
     for q in [
-        "what is the current status of the couch two weeks ago?",
-        "What was the status of the couch two weeks ago?",
+        # R13 compound pin (relative offset + interval/ordering template)
         "How many days had passed since I bought the couch two weeks ago "
         "when I sold the dog bed?",
-        "How many weeks ago did I meet up with my aunt and receive the "
-        "crystal chandelier?",
-        "How many months ago did I start my current job at Google?",
         "Which came first, buying the couch two months ago or selling the "
         "dog bed last Saturday?",
+        # #2655 vocabulary (weekday/holiday calendar anchors)
         "I received a piece of jewelry last Saturday from whom?",
         "What was the airline that I flied with on Valentine's day?",
+        "Which bike did I fixed or serviced the past weekend?",
     ]:
         assert classify_question(q) is None, q
         assert extract_subject_terms(q) == [], q
+
+
+def test_ago_relative_shape_fires():
+    """#2652: explicit relative offsets route to AGO_RELATIVE — including
+    the state-morphology form the R13 guard used to kill (the CURRENT_STATE
+    shape must not claim *current* state for a past-time question; the
+    window shape answers the as-of question instead)."""
+    for q in [
+        "what is the current status of the couch two weeks ago?",
+        "What was the status of the couch two weeks ago?",
+        "How many weeks ago did I meet up with my aunt and receive the "
+        "crystal chandelier?",
+        "How many months ago did I start my current job at Google?",
+        "What kitchen appliance did I buy 10 days ago?",
+        "I mentioned participating in a sports event two weeks ago. What "
+        "was the event?",
+        "What did I do with Rachel on the Wednesday two months ago?",
+        "What was the significant buisiness milestone I mentioned four "
+        "weeks ago?",
+        "I mentioned cooking something for my friend a couple of days "
+        "ago. What was it?",
+        "Which book did I finish a week ago?",
+    ]:
+        assert classify_question(q) is AssemblyShape.AGO_RELATIVE, q
+
+
+def test_most_recently_shape_fires():
+    """#2652 recency: 'most recently/most recent' routes to AGO_RELATIVE
+    (the open as-of window: everything up to question_date)."""
+    for q in [
+        "Which mode of transport did I use most recently, a bus or a "
+        "train?",
+        "Which streaming service did I start using most recently?",
+        "Which mode of transport did I use most recently?",
+    ]:
+        assert classify_question(q) is AssemblyShape.AGO_RELATIVE, q
+
+
+# ── #2652 anchor+offset arithmetic (deterministic, question_date minus
+#    offset → as-of window) ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("question,qdate,kind,unit,count,anchor,lo,hi", [
+    # explicit numeric offsets: the window is the unit's half-span around
+    # the anchor (a '2 weeks ago' claim rounds to the nearest week)
+    ("what did I do 2 weeks ago?", "2026-09-10", "ago-offset", "week", 2,
+     "2026-08-27", "2026-08-24", "2026-08-30"),
+    ("What kitchen appliance did I buy 10 days ago?", "2026-09-10",
+     "ago-offset", "day", 10, "2026-08-31", "2026-08-31",
+     "2026-08-31"),
+    ("What was the significant buisiness milestone I mentioned four "
+     "weeks ago?", "2026-09-10", "ago-offset", "week", 4,
+     "2026-08-13", "2026-08-10", "2026-08-16"),
+    # 'a week ago' / 'a month ago' — the article is the count 1
+    ("Which book did I finish a week ago?", "2026-09-10", "ago-offset",
+     "week", 1, "2026-09-03", "2026-08-31", "2026-09-06"),
+    # calendar months/years (NOT 30/365 days) — the anchor is the same
+    # day-of-month a month earlier
+    ("What did I buy a month ago?", "2026-09-10", "ago-offset", "month",
+     1, "2026-08-10", "2026-07-26", "2026-08-25"),
+    ("how many months ago did I attend the festival?", "2026-09-10",
+     "ago-count", "month", None, None, "2025-08-06", "2026-09-10"),
+    # month-end clamp: 2026-03-31 minus one month = 2026-02-28
+    ("What did I do a month ago?", "2026-03-31", "ago-offset", "month",
+     1, "2026-02-28", "2026-02-13", "2026-03-15"),
+    ("how many years ago did I move here?", "2026-09-10", "ago-count",
+     "year", None, None, "2025-08-06", "2026-09-10"),
+])
+def test_relative_anchor_arithmetic(
+        question, qdate, kind, unit, count, anchor, lo, hi):
+    a = resolve_relative_anchor(question, qdate)
+    assert isinstance(a, RelativeAnchor), question
+    assert a.kind == kind
+    assert a.unit == unit
+    assert a.count == count
+    assert (a.anchor.isoformat() if a.anchor else None) == anchor
+    assert (a.window_lo.isoformat() if a.window_lo else None) == lo
+    assert (a.window_hi.isoformat() if a.window_hi else None) == hi
+
+
+def test_relative_anchor_fuzzy_determiners_widen_the_window():
+    """'a couple of days ago' is not exactly 2 days — the window widens by
+    the fuzzy tolerance instead of pinning a single day (never a
+    confidently wrong anchor)."""
+    a = resolve_relative_anchor(
+        "I mentioned cooking something for my friend a couple of days "
+        "ago. What was it?", "2026-09-10")
+    assert a is not None and a.kind == "ago-offset"
+    assert a.unit == "day" and a.count == 2 and a.fuzzy is True
+    assert a.anchor.isoformat() == "2026-09-08"
+    assert a.window_lo.isoformat() == "2026-09-06"
+    assert a.window_hi.isoformat() == "2026-09-10"
+    # an exact numeric count keeps a one-day window
+    exact = resolve_relative_anchor("what did I do 2 days ago?",
+                                    "2026-09-10")
+    assert exact.fuzzy is False
+    assert exact.window_lo == exact.window_hi == exact.anchor
+
+
+def test_relative_anchor_recency_is_an_open_as_of_window():
+    """Recency has no offset to subtract — the anchor is unknown and the
+    window is the open past up to question_date (never a fabricated date)."""
+    a = resolve_relative_anchor(
+        "Which streaming service did I start using most recently?",
+        "2026-09-10")
+    assert a is not None and a.kind == "recency"
+    assert a.unit is None and a.count is None and a.anchor is None
+    assert a.window_hi.isoformat() == "2026-09-10"
+    assert (a.window_hi - a.window_lo).days == 400
+
+
+def test_relative_anchor_base_question_strips_the_time_clause():
+    """The anchor carries the question's BASE form (the time clause
+    removed) so the caller can classify/extract the underlying question.
+    The base of an as-of state question is the CURRENT_STATE template, and
+    the CURRENT_STATE shape itself is NOT what the past-time question
+    routes to (the R13 intent, preserved)."""
+    q = "what is the current status of the couch two weeks ago?"
+    assert classify_question(q) is AssemblyShape.AGO_RELATIVE
+    a = resolve_relative_anchor(q, "2026-09-10")
+    assert a is not None
+    assert a.base_question == "what is the current status of the couch?"
+    assert classify_question(a.base_question) is AssemblyShape.CURRENT_STATE
+
+
+def test_relative_anchor_never_raises():
+    """Deterministic degrade: no/invalid question_date, no anchor, blank
+    input — all return None (the caller then falls through to legacy)."""
+    assert resolve_relative_anchor("what did I do 2 weeks ago?",
+                                  None) is None
+    assert resolve_relative_anchor("what did I do 2 weeks ago?",
+                                  "not-a-date") is None
+    assert resolve_relative_anchor("what is the current status of the "
+                                  "couch?", "2026-09-10") is None
+    assert resolve_relative_anchor("", "2026-09-10") is None
+    assert resolve_relative_anchor(None, "2026-09-10") is None
 
 
 def test_misfire_preference_with_two_named_options():
@@ -263,18 +450,19 @@ def test_duration_frequency_never_fire():
         assert extract_subject_terms(q) == [], q
 
 
-def test_nary_and_recency_never_fire():
-    """N-ary lists (3+ options), recency ('most recently'), and the
-    'how many days passed between the two Xs' compound single-subject form
-    never fire."""
+def test_nary_and_order_instruction_never_fire():
+    """N-ary lists (3+ options — sibling #2653), the 'earliest … latest'
+    ORDERING INSTRUCTION, and the 'how many days passed between the two Xs'
+    compound single-subject form never fire. The retired members of this
+    list ('most recently' rows) are #2652's AGO_RELATIVE recall contract —
+    see ``test_most_recently_shape_fires``."""
     for q in [
         "Which three events happened in order: the day I helped my friend, "
         "the trip, and the party?",
         "What is the order of the six museums I visited from earliest to "
         "latest?",
-        "Which mode of transport did I use most recently, a bus or a "
-        "train?",
-        "Which streaming service did I start using most recently?",
+        "What is the order of the three trips I took in the past three "
+        "months, from earliest to latest?",
         "How many days passed between the two deep-subject milestones?",
         "When did I buy the couch?",  # date-lookup w/o shape support (v1)
         # 3+ option lists (review r2 P1 — every delimiter family)
@@ -2196,3 +2384,233 @@ def test_render_headers_follow_candidate_order_not_state_rows():
                            candidates=cands)
     assert [h["content"] for h in hits] == ["STATE (alpha): live",
                                             "STATE (beta): live"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2652 — window walk + AGO_RELATIVE render (stub port; the docker-lane
+# integration goldens live in tests/test_assembly_sdk.py)
+# ══════════════════════════════════════════════════════════════════════════
+
+from tortoise.assembly import (  # noqa: E402
+    collect_window_slices,
+)
+
+
+class _DictWindowPort:
+    """In-memory window port: rows is the raw ``window_rows`` reply."""
+
+    def __init__(self, rows, *, raise_on_fetch=False):
+        self.rows = rows
+        self.calls = []
+        self.raise_on_fetch = raise_on_fetch
+
+    def window_rows(self, lo, hi, cap):
+        self.calls.append((lo, hi, cap))
+        if self.raise_on_fetch:
+            raise RuntimeError("boom")
+        return list(self.rows)
+
+
+def _win_rows():
+    return [
+        {"kind": "point", "id": "p-in-when", "content": "in window by when",
+         "when": "2026-08-10", "status": "live"},
+        # junk `when` + REAL createdAt: the R2 ladder must place this row by
+        # its real date, NOT drop it into the undated tier
+        {"kind": "point", "id": "p-junk-when", "content": "junk when",
+         "when": "garbage", "created_at": "2026-08-11", "status": "live"},
+        {"kind": "point", "id": "p-outside", "content": "too late",
+         "when": "2026-09-01", "status": "live"},
+        {"kind": "point", "id": "p-undated", "content": "no date at all",
+         "when": None, "created_at": "1970-01-01T00:00:00Z",
+         "status": "live"},
+        {"kind": "event", "id": "ev-1", "content": "an event",
+         "started_at": "2026-08-10", "status": "live"},
+    ]
+
+
+def test_window_slices_tier_filter_and_undated_exclusion():
+    """The window is a DATE-ARITHMETIC selector: rows are placed by the R2
+    ladder's normalized date (a junk `when` with a real createdAt is dated,
+    never dropped as undated), rows outside the window are excluded, and
+    UNDATED rows are excluded too (an undated line cannot satisfy an
+    elapsed-time window)."""
+    anchor = resolve_relative_anchor("what did I do a month ago?", "2026-09-10")
+    assert anchor.window_lo.isoformat() == "2026-07-26"
+    assert anchor.window_hi.isoformat() == "2026-08-25"
+    port = _DictWindowPort(_win_rows())
+    slices = collect_window_slices(port, anchor)
+    got = [r["id"] for r in slices.timeline_rows]
+    # chronological, ties broken deterministically by id ('ev-1' < 'p-in-when')
+    assert got == ["ev-1", "p-in-when", "p-junk-when"]
+    assert [r["tier"] for r in slices.timeline_rows] == [
+        "started", "when", "created"]
+    assert [r["date"].isoformat() for r in slices.timeline_rows] == [
+        "2026-08-10", "2026-08-10", "2026-08-11"]
+    assert slices.admission["rows_admitted"] == 3
+    # ONE batched fetch, bounded
+    assert len(port.calls) == 1
+    assert slices.state_rows == ()
+
+
+def test_window_slices_recency_is_newest_first():
+    """'most recently' answers about the LATEST entries, so its spine is
+    ordered newest-first (the budget must hold the answer locus first)."""
+    anchor = resolve_relative_anchor("Which streaming service did I start using most recently?",
+                  "2026-09-10")
+    assert anchor.newest_first is True
+    slices = collect_window_slices(_DictWindowPort(_win_rows()), anchor)
+    assert [r["date"].isoformat() for r in slices.timeline_rows] == [
+        "2026-09-01", "2026-08-11", "2026-08-10", "2026-08-10"]
+    assert next(r["id"] for r in slices.timeline_rows) == "p-outside"
+
+
+def test_window_slices_port_raise_degrades_to_empty():
+    """A raising port degrades to empty slices (never a raise) — the caller's
+    empty-block guard then falls back to legacy."""
+    anchor = resolve_relative_anchor("what did I do a month ago?", "2026-09-10")
+    slices = collect_window_slices(_DictWindowPort([], raise_on_fetch=True),
+                                   anchor)
+    assert slices.timeline_rows == ()
+    assert slices.admission["rows_admitted"] == 0
+    # a port with no window leg at all is the same degrade
+    class _NoLeg:
+        pass
+    assert collect_window_slices(_NoLeg(), anchor).timeline_rows == ()
+
+
+def test_ago_render_window_header_and_elapsed_lines():
+    """The fired AGO block: ONE window header + a deterministic elapsed line
+    immediately before each dated row (`<date> — N days before <qd>`), so
+    the reader gets the offset arithmetic the deterministic tier owns.
+    Never a fabricated date: the header states the RANGE."""
+    anchor = resolve_relative_anchor("what did I do a month ago?", "2026-09-10")
+    slices = collect_window_slices(_DictWindowPort(_win_rows()), anchor)
+    hits = synthesize_hits(slices, shape=AssemblyShape.AGO_RELATIVE,
+                           question_date="2026-09-10", anchor=anchor)
+    contents = [h["content"] for h in hits]
+    assert contents[0] == ("WINDOW (2026-07-26 -> 2026-08-25): "
+                           "1 month before 2026-09-10")
+    # per-row offset lines + the untouched real rows (no `date`/`tier`
+    # derivation keys leak into the render input)
+    assert "2026-08-10 — 31 days before 2026-09-10" in contents
+    assert "2026-08-11 — 30 days before 2026-09-10" in contents
+    assert [h["kind"] for h in hits[:3]] == ["time-window", "ago-offset",
+                                             "event"]
+    for h in hits:
+        assert "date" not in h and "tier" not in h
+
+
+def test_ago_render_empty_window_returns_nothing():
+    """A window with no dated row renders NOTHING (the caller's empty-block
+    guard then falls back to legacy) — never a content-less window header
+    replacing a working pool (#2165 P1-1)."""
+    anchor = resolve_relative_anchor("what did I do a month ago?", "2026-09-10")
+    empty = AssemblySlices(timeline_rows=(), evidence_rows=(),
+                           admission={})
+    assert synthesize_hits(empty, shape=AssemblyShape.AGO_RELATIVE,
+                           question_date="2026-09-10", anchor=anchor) == []
+    # ...and without an anchor the shape renders nothing either
+    slices = collect_window_slices(_DictWindowPort(_win_rows()), anchor)
+    assert synthesize_hits(slices, shape=AssemblyShape.AGO_RELATIVE,
+                           question_date="2026-09-10", anchor=None) == []
+
+
+def test_ago_render_week_and_recency_wording():
+    wk = resolve_relative_anchor("what did I do 2 weeks ago?", "2026-09-10")
+    assert wk.window_lo.isoformat() == "2026-08-24"
+    assert wk.window_hi.isoformat() == "2026-08-30"
+    rec = resolve_relative_anchor("Which streaming service did I start using most recently?",
+               "2026-09-10")
+    slices = collect_window_slices(_DictWindowPort(_win_rows()), rec)
+    hits = synthesize_hits(slices, shape=AssemblyShape.AGO_RELATIVE,
+                           question_date="2026-09-10", anchor=rec)
+    assert hits[0]["content"] == (
+        "WINDOW (2025-08-06 -> 2026-09-10): most recent activity before "
+        "2026-09-10")
+
+
+def _ago_window_fixture(sdk, monkeypatch):
+    """#2652 live-lane window substrate — deliberately MINIMAL (three dated
+    points, no Objects/events/distractors): the assertion under test is DATE
+    selection, and a heavy fixture only adds unrelated failure modes
+    (embedder encodes, index builds) to it.
+
+    The embedder is PINNED OFF (the #2165 sdk module's autouse fixture does
+    the same): without it every ``create_point`` runs a real
+    sentence-transformers BERT encode — minutes-per-call on a loaded host and
+    irrelevant to a DATE-window assertion.
+
+    Geometry with question_date 2026-09-10: pw-a (2026-08-10) is EXACTLY 'a
+    month ago', pw-b (2026-09-01) is '9 days ago', pw-c (2026-07-01) is the
+    empty-window (2026-08-24..2026-08-30) substrate.
+    """
+    import tortoise.embeddings as _emb
+    monkeypatch.setattr(_emb, "compute_embedding",
+                        staticmethod(lambda content: None))
+    monkeypatch.setattr(_emb.EmbeddingModel, "get",
+                        staticmethod(lambda: None))
+    for pid, sess, when in (("pw-a", "sess-w-a", "2026-08-10"),
+                            ("pw-b", "sess-w-b", "2026-09-01"),
+                            ("pw-c", "sess-w-c", "2026-07-01")):
+        sdk.create_point("statement", f"windowed marker {pid}", id=pid,
+                         session_id=sess, is_episodic=True, status="draft",
+                         when=when, createdAt=when)
+
+
+@_docker_only
+def test_ago_relative_window_walk_live_month(_docker_sdk, monkeypatch):
+    """#2652 live lane: question_date MINUS a calendar month → the as-of
+    window over stored dates. The window is a HARD selector at BOTH ends —
+    the too-late (2026-09-01) and too-early (2026-07-01) rows are absent —
+    and no Object subject is involved (the selector is the TIME)."""
+    from tortoise.assembly import _assemble_connected
+    _ago_window_fixture(_docker_sdk, monkeypatch)
+    block = _assemble_connected(_docker_sdk, "what did I do a month ago?",
+                                question_date="2026-09-10")
+    assert block.fired is True and block.shape == "ago-relative"
+    joined = "\n".join(str(h.get("content")) for h in block.post_cap_lines)
+    assert "WINDOW (2026-07-26 -> 2026-08-25): 1 month before 2026-09-10" \
+        in joined
+    assert "windowed marker pw-a" in joined
+    assert "windowed marker pw-b" not in joined
+    assert "windowed marker pw-c" not in joined
+    assert block.subjects == ()
+    assert block.admission["rows_admitted"] == 1
+
+
+@_docker_only
+def test_ago_relative_window_walk_live_day(_docker_sdk, monkeypatch):
+    """#2652 live lane: a ONE-DAY window ('9 days ago') selects exactly the
+    row dated 2026-09-01 — no neighbours, no fabrication."""
+    from tortoise.assembly import _assemble_connected
+    _ago_window_fixture(_docker_sdk, monkeypatch)
+    day = _assemble_connected(_docker_sdk, "what did I do 9 days ago?",
+                              question_date="2026-09-10")
+    assert day.fired is True
+    day_joined = "\n".join(str(h.get("content")) for h in day.post_cap_lines)
+    assert "WINDOW (2026-09-01 -> 2026-09-01): 9 days before 2026-09-10" \
+        in day_joined
+    assert "windowed marker pw-b" in day_joined
+    assert "windowed marker pw-a" not in day_joined
+    assert "windowed marker pw-c" not in day_joined
+
+
+@_docker_only
+def test_ago_relative_window_walk_live_empty_and_unresolvable(
+        _docker_sdk, monkeypatch):
+    """#2652 live lane: a window with NO dated row falls back to legacy
+    (fired=False + empty block — never an empty pool replacement, #2165
+    P1-1); an absent/unparseable question_date never fires and never raises
+    (the caller falls through to the legacy lane)."""
+    from tortoise.assembly import _assemble_connected
+    _ago_window_fixture(_docker_sdk, monkeypatch)
+    empty = _assemble_connected(_docker_sdk, "what did I do 2 weeks ago?",
+                               question_date="2026-09-10")
+    assert empty.fired is False and empty.post_cap_lines == []
+    assert _assemble_connected(
+        _docker_sdk, "what did I do a month ago?",
+        question_date="not-a-date").fired is False
+    assert _assemble_connected(
+        _docker_sdk, "what did I do a month ago?",
+        question_date=None).fired is False
