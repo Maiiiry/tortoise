@@ -91,8 +91,11 @@ read filter keeps it) and listed in `_SOURCE_SERVER_MANAGED_PROPS` (so
 `tortoise_update_entity(url, validFrom=…)` cannot write a window no transition
 produced — the same *declared ⇒ writable* trap `#5196` round 3 found for `__runId`).
 No caller-supplied valid-time start is accepted, deliberately: a caller-asserted start
-needs the inversion guards the Point window needed (#3980, #4021, #5358, #5360), and
-until that input exists no inversion is reachable, so no guard is warranted.
+needs the inversion guards the Point window needed (#3980, #4021, #5358, #5360). The
+server-minted instant is guarded instead — `_mint_source_window_instant` clamps the
+mint strictly above the last instant minted in the process, so a fixed or
+backward-stepped wall clock can no longer open a zero-width or inverted version
+window (the read-path class `audit.inverted_validity_window`).
 
 ### Rejected alternatives
 

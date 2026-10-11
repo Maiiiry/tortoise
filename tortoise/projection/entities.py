@@ -3746,6 +3746,11 @@ class _EntityHandlers:
             # Inheriting the PRIOR version's start would be a false claim about
             # the current version — the old window's open is not the new one's,
             # and the prior close is exactly what the record could not state.
+            # #3644 review P1: `$vf` is STRICTLY monotone by construction —
+            # `create_source` mints it through `_mint_source_window_instant`,
+            # which clamps above the prior mint, so this unconditional SET
+            # cannot move the window backward or leave it zero-width under a
+            # stalled/stepped wall clock.
             "           s.validFrom = CASE WHEN $hash IS NULL THEN s.validFrom "
             "                       WHEN s.contentHash IS NULL OR s.contentHash <> $hash "
             "                       THEN $vf "
@@ -3915,8 +3920,12 @@ _SOURCE_SERVER_MANAGED_PROPS: frozenset = frozenset({
     # filter keep it; listing it HERE is what stops
     # `tortoise_update_entity(url, validFrom=...)` from writing a window no
     # transition produced (the same "declared ⇒ writable" trap #5196 round 3
-    # found for `__runId`).
-    "validFrom",
+    # found for `__runId`). The transition facts (`previousValidTo`,
+    # `previousContentHash`) and the remove-side spelling (`validTo`,
+    # `valid_to`) are the same class — PR #8016 code-review ISSUE 1: a caller
+    # `previousValidTo` collided with the explicit keyword on the journal emit.
+    "validFrom", "validTo", "valid_to", "previousValidTo",
+    "previousContentHash",
     # `__runId` is DECLARED (it is written to the node by `_upsert_source`'s
     # `run_clause`) but must stay CALLER-UNSETTABLE. `_update_entity` uses the
     # declaration as its WRITE allowlist, so declaring it without listing it here

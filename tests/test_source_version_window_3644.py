@@ -55,7 +55,21 @@ WHAT IS DELIBERATELY *NOT* DONE HERE (`Refs`, not `Closes`)
     ("the content as read at an instant") and is what §4.6 requires to be able
     to close the prior window at all. A caller-asserted start needs the
     inversion guards the Point window needed (`#3980`, `#4021`, `#5358`,
-    `#5360`); until it exists, no inversion is reachable and no guard is needed.
+    `#5360`); until it exists, the server-minted instant is guarded by
+    `_mint_source_window_instant`, which clamps the mint strictly above the
+    prior mint so the wall clock cannot open a zero-width or inverted version
+    window.
+
+DISCLOSURE (review note, not a hidden defect): five of these tests are FORWARD
+guards for rejected alternatives — they assert an ABSENCE the pre-#3644 writer
+also produced, so they pass against a full production revert and cannot prove
+non-vacuity: `test_a_noop_recheck_moves_neither_the_window_nor_the_journal`,
+`test_a_legacy_record_without_a_window_replays_to_an_open_start`,
+`test_a_legacy_hash_change_does_not_inherit_the_prior_window_start`,
+`test_a_stub_minted_source_has_an_open_start`, and
+`test_the_transition_payload_does_not_leak_onto_the_node`. They pin behaviour
+that must NOT regress once the window exists (and that the rejected
+alternatives would have broken); they are not fail-before evidence.
 
 Run (embedded carve-out lane):
     TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
@@ -437,3 +451,121 @@ def test_the_window_start_cannot_be_forged_through_the_entity_surface(src):
         sdk.update_entity(_URL, validFrom="2020-01-01T00:00:00+00:00")
     assert _props(sdk, _URL)["validFrom"] == minted, (
         "the forged window start landed on the node")
+
+
+# ── 7. the window instant is monotone against a stalled/stepped clock ────
+
+def test_a_stalled_clock_cannot_open_a_zero_width_window(src, monkeypatch):
+    """#3644 review P1: a fixed wall clock must not produce duplicate opens.
+
+    FAILS BEFORE: the instant came straight from the wall clock with no
+    monotonicity guard, so two transitions under a fixed clock opened windows
+    at the SAME instant (``prev == cur``) — a zero-width prior window.
+    """
+    events, sdk = src
+    import tortoise.sdk as _sdkmod
+    monkeypatch.setattr(_sdkmod, "_now_iso",
+                        lambda: "2026-01-01T12:00:00+00:00")
+    monkeypatch.setattr(_sdkmod, "_source_window_instant_floor", None,
+                        raising=False)
+
+    for i in range(3):
+        sdk.create_source(_URL, "document", title=f"v{i}",
+                          contentHash=f"h-{i}")
+
+    create = _of_type(events, "SourceCreated")[0]
+    transitions = _of_type(events, "SourceVersioned")
+    opens = [create["validFrom"]] + [t["validFrom"] for t in transitions]
+    assert len(set(opens)) == len(opens), (
+        f"a stalled clock produced duplicate window opens: {opens}")
+    for prev, cur in itertools.pairwise(opens):
+        assert prev < cur, (
+            f"the window chain is not strictly increasing: {prev!r} -> {cur!r}")
+
+
+def test_a_backward_clock_step_cannot_invert_the_window(src, monkeypatch):
+    """#3644 review P1: a clock step backward must not invert prior windows.
+
+    FAILS BEFORE: the prior window's close (`previousValidTo`, the new open)
+    landed BEFORE the prior open, so the earlier version's window was inverted
+    (`validTo < validFrom`) — the class `audit.inverted_validity_window` rates
+    HIGH. The monotone mint clamps above the prior mint.
+    """
+    events, sdk = src
+    import tortoise.sdk as _sdkmod
+    _vals = ["2026-01-01T12:00:10+00:00",
+             "2026-01-01T12:00:05+00:00",
+             "2026-01-01T12:00:07+00:00"]
+    _state = {"i": 0}
+
+    def _clock():
+        v = _vals[min(_state["i"], len(_vals) - 1)]
+        _state["i"] += 1
+        return v
+
+    monkeypatch.setattr(_sdkmod, "_now_iso", _clock)
+    monkeypatch.setattr(_sdkmod, "_source_window_instant_floor", None,
+                        raising=False)
+
+    for i in range(3):
+        sdk.create_source(_URL, "document", title=f"v{i}",
+                          contentHash=f"h-{i}")
+
+    create = _of_type(events, "SourceCreated")[0]
+    transitions = _of_type(events, "SourceVersioned")
+    opens = [create["validFrom"]] + [t["validFrom"] for t in transitions]
+    for prev, cur in itertools.pairwise(opens):
+        assert prev < cur, (
+            f"the backward clock step inverted the window chain: "
+            f"{prev!r} -> {cur!r}")
+    for (prev_open, _), t in zip(itertools.pairwise(opens), transitions,
+                                 strict=True):
+        assert prev_open < t["previousValidTo"], (
+            f"the prior version's window is inverted: open {prev_open!r} >= "
+            f"close {t['previousValidTo']!r}")
+
+
+# ── 8. the window and transition keys are server-managed (PR #8016 review) ─
+
+_WINDOW_KEYS = ("validFrom", "validTo", "valid_to", "previousValidTo",
+                "previousContentHash")
+
+
+def test_a_caller_asserted_window_or_transition_key_is_refused(src):
+    """#3644 review P2b + PR #8016 code-review ISSUE 1.
+
+    FAILS BEFORE: `validFrom`/`validTo` were silently DISCARDED (the node got
+    the minted instant while the journal carried the caller's value), and a
+    caller `previousValidTo` collided with the explicit keyword on the
+    `SourceVersioned` emit — a swallowed `TypeError` DROPPED the record while
+    the live node had already moved (fail-open, live != replay).
+    """
+    _events, sdk = src
+    for key in _WINDOW_KEYS:
+        with pytest.raises(ValueError, match="server-managed"):
+            sdk.create_source(_URL, "document", contentHash="h-0",
+                              **{key: "2020-01-01T00:00:00+00:00"})
+    # fail-closed: nothing was written before the refusal
+    assert sdk._get_proj().g.query(
+        "MATCH (n:Source {url:$u}) RETURN count(n)",
+        params={"u": _URL}).result_set[0][0] == 0, (
+        "a refused write still landed a :Source")
+
+
+def test_the_entity_surface_refuses_window_and_transition_keys(src):
+    """The same keys are unwritable through `update_entity` (write filter)."""
+    _events, sdk = src
+    sdk.create_source(_URL, "document", title="v0", contentHash="h-0")
+    for key in _WINDOW_KEYS:
+        with pytest.raises(ValueError, match="server-managed"):
+            sdk.update_entity(_URL, **{key: "2020-01-01T00:00:00+00:00"})
+
+
+def test_the_mcp_boundary_refuses_window_and_transition_keys():
+    """The MCP `props=` splat route is the boundary the SDK guard cannot see."""
+    from tortoise import mcp_server
+    for key in _WINDOW_KEYS:
+        assert key in mcp_server._SERVER_MANAGED_PROPS, (
+            f"{key} left the MCP server-managed boundary")
+        assert mcp_server._reject_server_managed_props({key: "X"}), (
+            f"{key} was not rejected at the MCP boundary")

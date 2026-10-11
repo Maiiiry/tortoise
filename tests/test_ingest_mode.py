@@ -328,6 +328,30 @@ class TestModeIsomorphism:
         assert results[1]["deduped"] is False
         assert all("deduped" in r for r in results)
 
+    def test_the_window_is_served_on_the_entity_read_surface(self):
+        """#3644 review P2b read-back: every window assertion in this file
+        reads raw Cypher, so nothing proved the `:Source` DECLARATION actually
+        serves the minted window. `get_entity` is the read path the
+        declaration feeds — a mode that failed to write `validFrom` AT ALL
+        would be invisible to `_graph_signature` (it drops volatile keys
+        entirely), so this is the one assertion that closes that hole.
+        """
+        g = _fresh_sdk()
+        try:
+            g.ingest(json.loads(json.dumps(_canonical_bundle())),
+                     granularity="bulk", promotion_policy="gated")
+            url = "https://example.com/rust-report"
+            ent = g.get_entity(url)
+            assert ent.get("validFrom"), (
+                "the minted window start is not served by the entity read "
+                "path — it is missing from get_entity()'s property bag")
+            stored = _query(g, "MATCH (n:Source {url:$u}) RETURN n.validFrom",
+                            {"u": url})[0][0]
+            assert ent["validFrom"] == stored, (
+                "the served window start differs from the stored one")
+        finally:
+            g.close()
+
 
 # ── E2E-5 assertion 3: invalid mode value ───────────────────────────
 

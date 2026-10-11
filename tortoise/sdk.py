@@ -25519,6 +25519,29 @@ class TortoiseSDK:
                     f"{_svk!r} is a server-managed provenance field and cannot "
                     f"be set via props."
                 )
+        # #3644 review (P2b) + PR #8016 code-review ISSUE 1: the version
+        # window and the version-TRANSITION keys are server-minted/journalled,
+        # never caller-asserted. Before this guard the passthrough silently
+        # DISCARDED a caller `validFrom` (the node got the minted instant while
+        # the journal `SourceCreated` carried the caller's value — a wrong
+        # window start reported OK), and `previousValidTo`/`previousContentHash`
+        # collided with the explicit `previousValidTo=`/`previousContentHash=`
+        # keywords on the `SourceVersioned` emit -> a swallowed `TypeError`
+        # DROPPED the transition record while the live node had already moved
+        # (fail-open, live != replay). Rejected loudly here, mirroring
+        # `rawState`/`sourceVersion`: the sanctioned route is the server mint
+        # (`create_source` mints `validFrom` once, on the `updatedAt` clock) and
+        # the `SourceVersioned` record (`previousValidTo`/`previousContentHash`
+        # are transition facts, `_SOURCE_HANDLED`).
+        for _wk in ("validFrom", "validTo", "valid_to", "previousValidTo",
+                    "previousContentHash"):
+            if _wk in props:
+                raise ValueError(
+                    f"{_wk!r} is a server-managed version-window/transition "
+                    f"field and cannot be set via props — `validFrom` is "
+                    f"minted by the server on the `updatedAt` clock and the "
+                    f"transition facts are journal-only (#3644)."
+                )
         ev = {
             "url": url,
             "sourceKind": sourceKind,
@@ -25609,7 +25632,7 @@ class TortoiseSDK:
         # window). Stripping the key on that one arm would buy journal tidiness
         # the `updatedAt` precedent does not have, at the cost of two emission
         # variants that can drift.
-        _version_instant = _now_iso()
+        _version_instant = _mint_source_window_instant()
         ev["updatedAt"] = _version_instant
         ev["validFrom"] = _version_instant
         # #5024 P2-2: the pre-state rides THIS CALL's own return value, not a
@@ -27102,6 +27125,50 @@ def _now_iso() -> str:
     """
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017
+
+
+# #3644 review P1: the `:Source` version-window instant must be STRICTLY
+# increasing. `create_source` mints it from the WALL CLOCK and `_upsert_source`
+# writes `s.validFrom = $vf` on the hash-diff gate with NO comparison against
+# the stored value, so a fixed clock made consecutive windows zero-width
+# (`prev == cur`) and a backward-stepped clock made them INVERTED (`prev > cur`)
+# — the class `audit.inverted_validity_window` rates HIGH for a Point. The floor
+# below makes the mint monotone against every prior mint in this process, so a
+# transition can never open a window at or before the version it superseded.
+# (`updatedAt` uses the same returned value, so the two never disagree — one
+# clock. This closes the reachable in-process case: every `validFrom` the node
+# holds in this process was minted here, so the next mint is strictly above it.)
+_source_window_instant_guard = threading.Lock()
+_source_window_instant_floor: str | None = None
+
+
+def _mint_source_window_instant() -> str:
+    """`_now_iso()`, clamped strictly ABOVE the last instant this module minted.
+
+    A version window must be strictly increasing; a wall clock can stall or
+    step backward. When the fresh read is not strictly greater than the last
+    minted instant, return one microsecond past it instead.
+    """
+    global _source_window_instant_floor
+    with _source_window_instant_guard:
+        now = _now_iso()
+        floor = _source_window_instant_floor
+        if floor is not None and now <= floor:
+            now = _bump_instant(floor)
+        _source_window_instant_floor = now
+        return now
+
+
+def _bump_instant(value: str) -> str:
+    """One microsecond past ``value``, else the clock when it is unparseable."""
+    from datetime import UTC, datetime, timedelta
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return (dt + timedelta(microseconds=1)).isoformat()
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return _now_iso()
 
 
 def _post_commit(payload: dict, *, base_url=None, api_key=None) -> dict:

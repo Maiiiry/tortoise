@@ -1332,7 +1332,17 @@ _SERVER_MANAGED_PROPS = frozenset({  # #3947: envelope capture directive (not a 
     # the Point's journaled snapshot). A tenant setting either would forge
     # provenance and break live/replay parity. Rejected on ALL spellings, at
     # this boundary AND in `sdk._sanitize_props` (the fail-closed backstop).
-    "sourceVersion", "sourceVersions", "sourceVersionTransit"})
+    "sourceVersion", "sourceVersions", "sourceVersionTransit",
+    # #3644 review P2b / PR #8016 code-review ISSUE 1: the version's valid-time
+    # WINDOW and the version-TRANSITION facts are server-minted/journalled —
+    # never caller-asserted. This boundary is load-bearing because the MCP
+    # `tortoise_create_source` tool splats caller `props` into
+    # `create_source(**props)`, so a `previousValidTo` here would bind the
+    # explicit keyword on the `SourceVersioned` emit (the SDK reject cannot see
+    # the collision) and a swallowed `TypeError` would DROP the record while the
+    # live node moved (fail-open, live != replay).
+    "validFrom", "validTo", "valid_to", "previousValidTo",
+    "previousContentHash"})
 
 
 # #2600: client-supplied actor claims are STRIP-AND-IGNORE (never a 4xx —
