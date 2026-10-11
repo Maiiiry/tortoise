@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from tortoise.assembly import (
+    _RE_COMPOUND_NUMBER,
     AssemblyShape,
     RelativeAnchor,
     ResolveResult,
@@ -364,6 +365,14 @@ def test_ago_relative_rejects_compounds_and_the_sibling_vocabulary():
         "What did I do thirty—one days ago?",    # U+2014 EM DASH
         "What did I do thirty, one days ago?",
         "What did I do thirty and one days ago?",
+        # a VERBAL RANGE / connector: the connector is word characters, so
+        # neither the word nor the numeral branch sees it, and the range's
+        # LAST bound is promoted as the count (a 2–5-week question answered
+        # from the 5-week window alone)
+        "What did I do 2 to 5 weeks ago?",
+        "What did I do between 2 and 5 weeks ago?",
+        "What did I do 2 or 5 weeks ago?",
+        "What did I do 2 through 5 weeks ago?",
         # a multi-part NUMERAL is the same defect for digits: `_RE_AGO_OFFSET`
         # reads `\d+`, so it matches the LAST digit run alone — '2.5 weeks
         # ago' anchored at 5 weeks and '2,000 days ago' at 0 days (a window
@@ -393,6 +402,24 @@ def test_ago_relative_still_reads_a_standalone_digit_count():
         assert (a.kind, a.count) == ("ago-offset", count), (q, a)
 
 
+def test_compound_guard_does_not_backtrack_exponentially():
+    r"""The compound guard must stay LINEAR on a pathological question.
+
+    `(?:\W+|\s+and\s+)+$` is an ambiguous nested quantifier: `search` on
+    'twenty' + N spaces + 'x' backtracks over 2**N partitions — measured
+    3 s at N=24 and unbounded beyond. The input is bounded
+    (MAX_ASK_QUESTION_CHARS = 2000) but `run_ask_lane` has no timeout and a
+    HANG is not an exception the envelope can catch, so it is an
+    availability defect in the ask path. This test does not time anything:
+    under the ambiguous form it HANGS rather than failing, which is the
+    regression it guards."""
+    for n in (24, 200, 1900):
+        assert _RE_COMPOUND_NUMBER.search("twenty" + " " * n + "x") is None
+        q = "twenty" + " " * n + "x"
+        assert classify_question(q) is None
+        assert resolve_relative_anchor(q, "2026-09-10") is None
+
+
 def test_ago_relative_shape_fires():
     """#2652: explicit relative offsets route to AGO_RELATIVE — including
     the state-morphology form the R13 guard used to kill (the CURRENT_STATE
@@ -418,8 +445,10 @@ def test_ago_relative_shape_fires():
 
 
 def test_most_recently_shape_fires():
-    """#2652 recency: 'most recently/most recent' routes to AGO_RELATIVE
-    (the open as-of window: everything up to question_date)."""
+    """#2652 recency: the ADVERBIAL 'most recently' routes to AGO_RELATIVE
+    (the open as-of window: everything up to question_date). The
+    ATTRIBUTIVE 'most recent' does NOT — it stays a guard (main parity),
+    see ``test_nary_and_order_instruction_never_fire``."""
     for q in [
         "Which mode of transport did I use most recently, a bus or a "
         "train?",
@@ -753,6 +782,10 @@ def test_nary_and_order_instruction_never_fire():
         "Which did I buy first, my most recent phone or my laptop?",
         "what is the current status of my most recent car?",
         "Which came first, my most recent trip to Paris or my graduation?",
+        # ... including the hyphen/dash spellings: `\W+` makes the guard
+        # spelling-independent, so 'most-recent' is the same instruction
+        "Which did I buy first, my most-recent phone or my laptop?",
+        "what is the current status of my most‑recent car?",  # U+2010
         "How many days passed between the two deep-subject milestones?",
         "When did I buy the couch?",  # date-lookup w/o shape support (v1)
         # 3+ option lists (review r2 P1 — every delimiter family)
@@ -2896,6 +2929,34 @@ def test_window_slices_port_raise_degrades_to_empty():
     class _NoLeg:
         pass
     assert collect_window_slices(_NoLeg(), anchor).timeline_rows == ()
+
+
+def test_window_slices_truncation_is_per_leg_not_a_row_count():
+    """`window_rows` issues TWO LIMIT-ed statements — points and events,
+    each `cap` — so truncation is a PER-LEG verdict. `len(rows) >= cap`
+    reported `truncated=True` for a window where NEITHER leg saturated
+    (3 points + 1 event at cap 4 is 4 rows), and `rows_requested = cap`
+    understated the walk (it asks for up to `2 * cap`)."""
+    anchor = resolve_relative_anchor("what did I do a month ago?", "2026-09-10")
+
+    def _rows(n, kind):
+        dt = "when" if kind == "point" else "started_at"
+        return [{"kind": kind, "id": f"{kind}{i}", "content": "c",
+                 dt: "2026-08-10", "status": "live"} for i in range(n)]
+
+    both_short = collect_window_slices(
+        _DictWindowPort(_rows(3, "point") + _rows(1, "event")), anchor,
+        per_window_cap=4)
+    assert len(both_short.timeline_rows) == 4
+    assert both_short.admission["rows_requested"] == 8
+    assert both_short.admission["truncated"] is False
+    # ... a saturated leg IS truncation, at the SAME admitted row count
+    pts = collect_window_slices(_DictWindowPort(_rows(4, "point")), anchor,
+                                per_window_cap=4)
+    assert pts.admission["truncated"] is True
+    evs = collect_window_slices(_DictWindowPort(_rows(4, "event")), anchor,
+                                per_window_cap=4)
+    assert evs.admission["truncated"] is True
 
 
 def test_ago_render_window_header_and_elapsed_lines():

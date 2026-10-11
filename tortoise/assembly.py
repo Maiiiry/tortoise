@@ -162,28 +162,46 @@ _RE_MOST_RECENT = re.compile(r"\bmost\s+recently\b", re.IGNORECASE)
 # the promoted vocabulary routes, so it can never eat a promoted offset.
 _RE_AGO_RESIDUAL = re.compile(r"\bago\b", re.IGNORECASE)
 # A count that is the TRAILING PART of a multi-part number, matched against
-# the text just before the count. Two spellings, one invariant ('the matched
-# count is the whole number'):
+# the text just before the count. Three spellings, one invariant ('the
+# matched count is the whole number'):
 #   * a compound NUMBER WORD — 'twenty two' / 'twenty-one' / 'twenty–one'.
-#     The separator is `\W+` — deliberately NOT an allow-list. `\W` is
+#     The separator is `\W` — deliberately NOT an allow-list. `\W` is
 #     Unicode-aware, so SPACE, the ASCII hyphen, the whole Unicode
-#     hyphen/dash/minus family (U+2010..U+2015, U+2212) and a comma all
-#     qualify, and `\b` sees a boundary before the trailing count word for
-#     every one of them. An allow-list is what let 'twenty-one' (and U+2010
-#     / U+2011 / U+2212) slip through and anchor a 21-week question at one
-#     week. The `and` connective ('twenty and one') is the one separator
+#     hyphen/dash/minus family (U+2010..U+2015, U+2212), a comma and even a
+#     non-breaking space all qualify, and `\b` sees a boundary before the
+#     trailing count word for every one of them. `and` is the one separator
 #     that is not `\W`, so it is named explicitly.
+#     ⛔ It is `(?:[\W]|\band\b)+`, NOT `(?:\W+|\s+and\s+)+`: the nested
+#     `\W+` inside a `+` is an AMBIGUOUS quantifier, so `search` on
+#     'twenty' + N spaces + 'x' backtracks over 2**N partitions — measured
+#     3 s at N=24 and unbounded beyond. A question is bounded
+#     (MAX_ASK_QUESTION_CHARS) but a hang is not an exception the ask
+#     envelope can catch, so it is an availability defect, and `run_ask_lane`
+#     has no timeout. The single-character alternative is linear (each
+#     position admits exactly one partition).
 #   * a multi-part NUMERAL — '2.5', '2,000', '2 000', '1-2'. `_RE_AGO_OFFSET`
 #     reads `\d+`, so it matches the LAST digit run alone and the question
 #     promoted at that fragment ('2.5 weeks ago' → 5 weeks; '2,000 days
 #     ago' → 0 days, a window collapsed to question_date). `\d\W*$` catches
-#     it: a digit followed only by non-word characters up to the count.
-#     A digit followed by a WORD character is not a fragment ('2 things 3
-#     days ago' must still promote count=3, and '3rd, 4 days ago' count=4).
+#     it: a digit followed only by non-word characters up to the count. A
+#     digit followed by a WORD character is not a fragment ('2 things 3 days
+#     ago' must still promote count=3, and '3rd, 4 days ago' count=4).
+#     DELIBERATE false negative: a bare numeral that merely PRECEDES the
+#     count ('I bought the iPhone 15 3 days ago') is rejected too, and the
+#     question falls through to the legacy lane. Telling '15 3' (two numbers)
+#     from '2 000' (one number) is not decidable here, and the other side of
+#     the error is a confidently WRONG window that replaces the pool. Fail
+#     safe: no promotion, never a wrong anchor.
+#   * a verbal RANGE / connector — '2 to 5 weeks ago', 'between 2 and 5
+#     weeks ago'. The connector is word characters, so neither branch above
+#     sees it; without this the range's LAST bound is promoted as the count
+#     and a 2–5-week question is answered from the 5-week window alone.
 _RE_COMPOUND_NUMBER = re.compile(
     r"\b(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
-    r"thousand|million)\b(?:\W+|\s+and\s+)+$"
-    r"|\d\W*$", re.IGNORECASE)
+    r"thousand|million)\b(?:[\W]|\band\b)+$"
+    r"|\d\W*$"
+    r"|\d\W+(?:to|and|or|through|thru|until|till|up\s+to)\W+$",
+    re.IGNORECASE)
 # duration-state semantics that are STILL never a two-subject shape: "how
 # long" with a state verb ("how long have I been working before …"), "how
 # many <unit> did I spend / had I been", "how long did (I|the narrator)
@@ -215,12 +233,16 @@ _RE_FREQUENCY = re.compile(
 # INSTRUCTION residue ('latest' as in 'from earliest to latest'; 'most
 # recent' as in 'from earliest to most recent' or 'my most recent phone')
 # stays a guard, exactly as on main. Only the ADVERBIAL 'most recently' is
-# promoted to AGO_RELATIVE above, and `\bmost\s+recent\b` does NOT match it
-# ('recently' has no word boundary after 'recent'). The guard is checked
-# BEFORE the shape templates, so an attributive recency question can never
-# fall through and fire ORDERING/CURRENT_STATE/INTERVAL.
+# promoted to AGO_RELATIVE above. `\W+` (not `\s+`) is what makes the guard
+# spelling-independent: 'most-recent' / 'most‑recent' (U+2010) are the same
+# instruction — the class the sibling compound guard was hardened for — and
+# `\W+` still cannot match the adverbial, because it must be followed by
+# `recent` and then `\b`, and 'recently' has no boundary after 'recent'.
+# The guard is checked BEFORE the shape templates, so an attributive
+# recency question can never fall through and fire
+# ORDERING/CURRENT_STATE/INTERVAL.
 _RE_RECENCY = re.compile(
-    r"\bmost\s+recent\b|\blatest\b|\bthe\s+last\s+one\b", re.IGNORECASE)
+    r"\bmost\W+recent\b|\blatest\b|\bthe\s+last\s+one\b", re.IGNORECASE)
 # advice / preference / recommendation (R16 misfire): "which SHOULD I do
 # first, A or B" carries ordering morphology but is preference, not fact —
 # firing would REPLACE the working pool with a shape block. Modal + advice
@@ -2089,13 +2111,23 @@ def collect_window_slices(port, anchor: RelativeAnchor, *,
         timeline.append(row)
     timeline.sort(key=lambda r: (r.get("date"), r.get("id", "")),
                   reverse=anchor.newest_first)
+    # `window_rows` issues TWO LIMIT-ed statements — points and events, each
+    # `cap` — so "was anything truncated" is a PER-LEG question and
+    # `len(rows) >= cap` answers it wrongly: 3 points + 1 event at cap=4 is
+    # 4 rows with neither leg saturated, reported truncated. The port tags
+    # each row with its leg (`kind`, the discriminator `evidence_rows`
+    # already uses), so the per-leg counts are recoverable without changing
+    # the port contract. `rows_requested` is the sum of the two caps for the
+    # same reason — the walk asked for up to `2 * cap` rows.
+    event_rows = sum(1 for r in rows if r.get("kind") == "event")
+    truncated = (len(rows) - event_rows) >= cap or event_rows >= cap
     return AssemblySlices(
         state_rows=(),
         timeline_rows=tuple(timeline),
         evidence_rows=tuple(r for r in timeline
                             if r.get("kind") == "point"),
-        admission={"rows_requested": cap, "rows_admitted": len(timeline),
-                   "truncated": len(rows) >= cap})
+        admission={"rows_requested": 2 * cap, "rows_admitted": len(timeline),
+                   "truncated": truncated})
 
 
 # ══════════════════════════════════════════════════════════════════════════
