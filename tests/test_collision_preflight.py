@@ -4575,30 +4575,46 @@ class CollisionPreflightTest(unittest.TestCase):
         cp = _tool_module()
         self.assertEqual(
             cp.claim_named_artifacts(f"lane `fix/{ISSUE}-x`", ISSUE),
-            ([f"fix/{ISSUE}-x"], []),
+            ([f"fix/{ISSUE}-x"], [], False),
         )
         self.assertEqual(
             cp.claim_named_artifacts(
                 f"see `tests/test_{ISSUE}_x.py`", ISSUE),
-            ([], []),
+            ([], [], False),
         )
         self.assertEqual(
             cp.claim_named_artifacts(f"wt `.worktrees/{ISSUE}-x`", ISSUE),
-            ([], [f".worktrees/{ISSUE}-x"]),
+            ([], [f".worktrees/{ISSUE}-x"], False),
         )
         self.assertEqual(
             cp.claim_named_artifacts("wt `.worktrees/other-thing`", ISSUE),
-            ([], []),
+            ([], [], False),
         )
         self.assertEqual(
             cp.claim_named_artifacts(f"`refs/heads/fix/{ISSUE}-x`", ISSUE),
-            ([f"fix/{ISSUE}-x"], []),
+            ([f"fix/{ISSUE}-x"], [], False),
         )
         # A name git would reject is refused rather than fed to `rev-parse`,
         # whose exit 1 for a MALFORMED name is the same code a genuinely ABSENT
         # ref returns — so accepting it would read a parse artifact as absence.
+        # ⛔ But REFUSING is not BLOCKING, and it is not DROPPING either: the
+        # token is artifact-SHAPED, so it is reported UNMEASURED and the caller
+        # keeps the claim blocking. A refused token silently DROPPED from the
+        # set would leave a claim that names a LIVE artifact looking abandoned.
         self.assertEqual(
-            cp.claim_named_artifacts(f"`fix/{ISSUE}..x`", ISSUE), ([], []))
+            cp.claim_named_artifacts(f"`fix/{ISSUE}..x`", ISSUE), ([], [], True))
+        # The same rule for a token git ACCEPTS and this arm's charset refuses:
+        # dropping it would demote a claim naming live work.
+        self.assertEqual(
+            cp.claim_named_artifacts(f"`fix/{ISSUE}-a+b`", ISSUE), ([], [], True))
+        # Past the cap the set is incomplete, so it must not be used to demote.
+        # The tokens it DID read are returned for the report; the `True` is what
+        # stops the caller — an incomplete set can never void a claim.
+        nine = " ".join(f"`fix/{ISSUE}-z{i}`" for i in range(9))
+        self.assertEqual(
+            cp.claim_named_artifacts(nine, ISSUE),
+            ([f"fix/{ISSUE}-z{i}" for i in range(8)], [], True),
+        )
 
     def test_claim_verifier_demotes_a_dead_worktree_record(self):
         # The "worktree not live" arm of the decision table. `_worktree_liveness`

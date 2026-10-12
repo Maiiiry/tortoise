@@ -3647,8 +3647,31 @@ def _looks_like_claim_branch(token: str, issue: int) -> bool:
     return re.match(rf"{issue}(?![0-9])", rest) is not None
 
 
-def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str]]:
-    """(branches, worktrees) a claim-shaped comment names, deduped and capped.
+def _artifact_shaped(token: str, issue: int) -> bool:
+    """Could `token` be trying to name this issue's work, IGNORING legality?
+
+    Used ONLY to stay fail-closed. `_normalize_claim_ref` refuses names git
+    would reject so they are never fed to `rev-parse` — but a refused token must
+    not be silently DROPPED from the artifact set: dropping a LIVE artifact
+    leaves the claim looking abandoned, which is the demotion direction this arm
+    exists to avoid. So the shape test here is deliberately LOOSER than
+    `_looks_like_claim_branch` — it only asks "is this trying to name a branch or
+    worktree for this issue?" — and a yes routes to UNMEASURED (keep blocking),
+    never to a refusal that discards it.
+    """
+    if ".worktrees/" in token:
+        return number_present(token, issue)
+    body = token[len("refs/heads/"):] if token.startswith("refs/heads/") else token
+    if token.startswith("refs/"):
+        return False
+    _head, sep, rest = body.partition("/")
+    if not sep:
+        return False
+    return re.match(rf"{issue}(?![0-9])", rest) is not None
+
+
+def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str], bool]:
+    """(branches, worktrees, unmeasured) a claim-shaped comment names.
 
     Extraction is SHAPE-based, never existence-based: a GONE branch is exactly
     what must be recognised, so "does it exist?" cannot be the filter. A token
@@ -3663,16 +3686,23 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str]]:
     A `refs/heads/x/3061-y` token IS extracted (the prefix is stripped first);
     a bare `3061-y` with no slash is NOT, because it names nothing this arm can
     verify by convention — and a claim that names nothing keeps blocking.
+
+    ⛔ `unmeasured` is NOT "named nothing", and the caller must keep such a claim
+    BLOCKING. It is True when a token COULD name this issue's work but could not
+    be turned into a verifiable artifact: a token past `_CLAIM_ARTIFACT_CAP`, or
+    an artifact-SHAPED token that is not a legal ref name. Both cases mean the
+    artifact set is INCOMPLETE, and an incomplete set can never justify a
+    demotion — the verdict would rest on the artifacts that happened to be
+    readable.
     """
     branches: list[str] = []
     worktrees: list[str] = []
-    truncated = False
+    unmeasured = False
     for raw in _CLAIM_BACKTICK_RE.findall(body or ""):
         if len(branches) + len(worktrees) >= _CLAIM_ARTIFACT_CAP:
-            # An UNEXAMINED token is never a demotion: a token past the cap could
-            # name a LIVE artifact, so a truncated read can never void a claim.
-            # Report "names nothing" so the caller keeps BLOCKING.
-            truncated = True
+            # A token past the cap is never EXAMINED, and it could name a LIVE
+            # artifact, so a truncated read can never void a claim.
+            unmeasured = True
             break
         token = raw.strip()
         if not token:
@@ -3688,9 +3718,11 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str]]:
             ref = _normalize_claim_ref(token)
             if ref and ref not in branches:
                 branches.append(ref)
-    if truncated:
-        return [], []
-    return branches, worktrees
+        elif _artifact_shaped(token, issue):
+            # Artifact-SHAPED but not a legal ref name. Refusing it must not
+            # DROP it: a dropped live artifact is a demotion. Unmeasured -> block.
+            unmeasured = True
+    return branches, worktrees, unmeasured
 
 
 def _claim_artifact_verifier(
@@ -3713,7 +3745,7 @@ def _claim_artifact_verifier(
     """
 
     def _branch_state(branch: str) -> str | None:
-        """`live` | `gone` | `terminal`, or None when unreadable.
+        """`live` | `live_remote` | `gone` | `terminal`, or None when unreadable.
 
         ⛔ EXISTENCE IS THE GATE, and #6108 is preserved: a branch that resolves
         BLOCKS even at 0 commits ahead (a lane between `git worktree add` and its
@@ -3738,8 +3770,20 @@ def _claim_artifact_verifier(
         if rc == 1:
             # `--verify --quiet` exits 1 for a ref that does not resolve, and a
             # MALFORMED name never reaches here (`_normalize_claim_ref` refuses
-            # it), so rc==1 is a MEASURED absence. Every other code (128 for an
-            # unreadable repo) is "could not measure" -> fail closed.
+            # it), so rc==1 is a MEASURED absence -- LOCALLY. Local absence is
+            # evidence about THIS CLONE, not about the artifact: a lane that
+            # pushed from another clone, or from the GitHub UI, is not in
+            # `refs/heads` here. A remote-tracking ref for the same name
+            # therefore keeps the claim BLOCKING. This direction is safe by
+            # construction — it can only PREVENT a demotion, never cause one.
+            rc_r, out_r, _err_r, timed_out_r = _run(
+                [git_bin, "for-each-ref", "--format=%(refname)",
+                 f"refs/remotes/*/{branch}"], cwd, timeout,
+            )
+            if timed_out_r:
+                return None
+            if rc_r == 0 and out_r.strip():
+                return "live_remote"
             return "gone"
         return None
 
@@ -3761,7 +3805,14 @@ def _claim_artifact_verifier(
         return "gone", "not in the registered worktree list"
 
     def _verify(body: str) -> ClaimArtifactVerdict | None:
-        branches, worktrees = claim_named_artifacts(body, issue)
+        branches, worktrees, unmeasured_extraction = claim_named_artifacts(
+            body, issue,
+        )
+        if unmeasured_extraction:
+            # An INCOMPLETE artifact set can never justify a demotion: the token
+            # we could not turn into an artifact might name live work. Blocking
+            # is the fail-closed reading of a missing measurement.
+            return None
         if not branches and not worktrees:
             # Named NOTHING -> fail closed (the claim keeps blocking).
             return None
@@ -3773,10 +3824,15 @@ def _claim_artifact_verifier(
             if state is None:
                 unmeasured = True
                 continue
-            if state == "live":
+            if state in ("live", "live_remote"):
                 # #6108's count, REPORTED not acted on — reused rather than
                 # re-derived, so a live branch's distance from main is visible
                 # without a second ahead/behind implementation.
+                if state == "live_remote":
+                    alive.append(
+                        f"{branch}: branch exists as a remote-tracking ref"
+                    )
+                    continue
                 measured = _ahead_behind(git_bin, cwd, branch, timeout)
                 if measured is None:
                     alive.append(
