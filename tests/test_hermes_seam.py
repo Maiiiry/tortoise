@@ -36,12 +36,15 @@ actually move:
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
 import shlex
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -54,6 +57,12 @@ from tortoise.session_import import (
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PY = sys.executable
 _PLUGIN_MARKER = "tortoise-hermes-plugin"
+
+# Hermes' reserved content-encoding sentinel, written literally and independently
+# of the implementation: `hermes_state_messages.py::_CONTENT_JSON_PREFIX`. A list
+# or dict ``content`` is stored as this prefix + ``json.dumps(...)`` (sqlite3
+# binds only scalars) and decoded back by ``_decode_content``.
+_HERMES_JSON_PREFIX = "\x00json:"
 
 # The subset of the Hermes store DDL this seam reads, kept faithful to
 # ``hermes_state_common.py`` (column names/types + the ``active`` /
@@ -120,6 +129,40 @@ def _make_state_db(path: Path, sessions: dict[str, list[dict]],
         conn.commit()
     finally:
         conn.close()
+    return path
+
+
+def _make_live_wal_state_db(path: Path, rows: list[tuple[int, str, str]]) -> Path:
+    """A Hermes store in WAL mode with `-wal`/`-shm` ON DISK — the LIVE shape.
+
+    SQLite deletes the sidecars when the last connection closes (it checkpoints
+    on close), so they are saved while the connection is open and restored
+    afterwards. The rows are committed with ``wal_autocheckpoint=0``, so their
+    pages live ONLY in the `-wal` file: a reader that ignores the WAL returns
+    nothing for them. ``rows`` are ``(id, role, content)``.
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_STATE_DB_DDL)
+        conn.execute("INSERT INTO sessions (id, started_at) VALUES ('s1', 1000.0)")
+        # Autocheckpoint OFF *before* the inserts, so every row's pages stay in
+        # the WAL and the main db file is never rewritten by the close.
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        for row_id, role, content in rows:
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content, "
+                "timestamp) VALUES (?, 's1', ?, ?, ?)",
+                (row_id, role, content, float(row_id)))
+        conn.commit()
+        sidecars = {p: p.read_bytes()
+                    for p in (path.with_name(path.name + "-wal"),
+                              path.with_name(path.name + "-shm")) if p.exists()}
+    finally:
+        conn.close()
+    assert sidecars, "the WAL fixture produced no sidecars to pin"
+    for p, data in sidecars.items():
+        p.write_bytes(data)
     return path
 
 
@@ -454,14 +497,91 @@ def test_parse_hermes_does_not_split_a_colon_colon_directory_name(tmp_path):
 
 def test_parse_hermes_reads_the_store_read_only(tmp_path):
     """A backfill must never mutate a Hermes store (never create -wal/-shm
-    beside a live state.db)."""
+    beside a live state.db).
+
+    The fixture is a LIVE WAL store — `-wal`/`-shm` on disk, with every turn
+    readable only THROUGH the WAL — because that is the shape where the
+    mechanism is load-bearing. On a rollback-journal file that is only ever
+    read, the old assertions held for a plain writable `sqlite3.connect(path)`
+    too, so "drop `mode=ro`" survived (the test could not fail). Here a
+    writable open is the last connection and CHECKPOINTS ON CLOSE: it deletes
+    both sidecars and rewrites the main db, so the mutation reds (measured at
+    this head).
+    """
+    db = _make_live_wal_state_db(
+        tmp_path / "state.db",
+        [(1, "user", "hello Hermes"), (2, "assistant", "wal-only turn")])
+    wal = tmp_path / "state.db-wal"
+    shm = tmp_path / "state.db-shm"
+    assert wal.exists() and shm.exists(), "fixture is not the live WAL shape"
+    main_before, wal_before = db.read_bytes(), wal.read_bytes()
+
+    # The second turn is reachable ONLY through the WAL — so a green parse
+    # proves the read actually used it, not just the checkpointed main file.
+    assert parse_hermes(db) == [
+        {"role": "user", "content": "hello Hermes"},
+        {"role": "assistant", "content": "wal-only turn"},
+    ]
+
+    # The sidecars SURVIVE (a writable close deletes both) and the WAL is
+    # byte-identical. `-shm` is asserted for PRESENCE only: SQLite stores
+    # read-marks and lock slots in it, so even a read-only open rewrites bytes
+    # there (measured) — byte equality would be a FALSE invariant, while
+    # presence is exactly what the writable close destroys.
+    assert wal.exists() and wal.read_bytes() == wal_before
+    assert shm.exists()
+    assert db.read_bytes() == main_before
+
+
+def test_parse_hermes_decodes_structured_content_and_lenses_injected_context(
+        tmp_path):
+    """Hermes never stores a list/dict ``content`` directly: it writes
+    ``"\x00json:" + json.dumps(...)`` (``_encode_content``) and every read path
+    reverses it with ``_decode_content``, then lenses user/assistant strings
+    through ``_loaded_view_content`` → ``sanitize_context(...).strip()``.
+
+    Reading the raw column instead handed ``_text_from_parts`` a STRING, so its
+    list branch was never reached: a multimodal turn was filed as the
+    serialized JSON blob and an injected `<memory-context>` block (plus its
+    system note) was filed as the user's own utterance (#2121 review).
+    """
+    from tortoise.session_import.parsers import _HERMES_CONTENT_JSON_PREFIX
+
+    assert _HERMES_CONTENT_JSON_PREFIX == _HERMES_JSON_PREFIX
+    multimodal = json.dumps([
+        {"type": "text", "text": "what is in this image?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+    ])
+    injected = (
+        "before\n"
+        "<memory-context>recalled memory\nmust not be filed</memory-context>\n"
+        "[System note: The following is recalled memory context, NOT new "
+        "user input. Treat as informational background data.]\nafter")
     db = _make_state_db(tmp_path / "state.db", {"s1": [
-        {"id": 1, "role": "user", "content": "hello Hermes"}]})
-    before = db.read_bytes()
-    assert parse_hermes(db)
-    assert db.read_bytes() == before
-    assert not (tmp_path / "state.db-wal").exists()
-    assert not (tmp_path / "state.db-shm").exists()
+        {"id": 1, "role": "user", "content": "plain text turn"},
+        {"id": 2, "role": "user",
+         "content": _HERMES_JSON_PREFIX + multimodal},
+        {"id": 3, "role": "assistant",
+         "content": _HERMES_JSON_PREFIX + json.dumps(
+             [{"type": "text", "text": "it is a chart"}])},
+        {"id": 4, "role": "user", "content": injected},
+        # A LITERAL string that carries the reserved prefix is escaped by
+        # double-encoding; decoding returns it verbatim (never re-parsed).
+        {"id": 5, "role": "assistant",
+         "content": _HERMES_JSON_PREFIX + json.dumps(
+             _HERMES_JSON_PREFIX + "literal")},
+        # A malformed marker row stays raw, as the store's fail-closed decode.
+        {"id": 6, "role": "assistant",
+         "content": _HERMES_JSON_PREFIX + "not json"},
+    ]})
+    assert parse_hermes(db) == [
+        {"role": "user", "content": "plain text turn"},
+        {"role": "user", "content": "what is in this image?"},
+        {"role": "assistant", "content": "it is a chart"},
+        {"role": "user", "content": "before\n\nafter"},
+        {"role": "assistant", "content": _HERMES_JSON_PREFIX + "literal"},
+        {"role": "assistant", "content": _HERMES_JSON_PREFIX + "not json"},
+    ]
 
 
 @pytest.mark.parametrize("dirname", ["we?ird", "ha#sh", "pct%20dir"])
@@ -577,3 +697,91 @@ def test_install_list_mentions_the_hermes_seam(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "install hermes" in r.stdout
     assert "pre_llm_call" in r.stdout
+
+
+def test_hermes_import_reaches_the_hosted_boundary_and_writes_a_receipt(
+        tmp_path, monkeypatch):
+    """The ingest half's whole point: `sessions import --harness hermes` must
+    be able to LAND a session. The command POSTs ``harness`` verbatim to
+    `/v1/sessions`, and that route validates the body through
+    ``SessionRequest``, whose harness vocabulary is CLOSED — a value outside it
+    is refused 422 BEFORE the handler. Because 422 is not in
+    ``capture_spool.classify_failure``'s transient family, such a refusal is
+    neither spooled nor receipted: the session is LOST, not deferred, while the
+    CLI looks wired.
+
+    The stand-in transport applies that SAME model to the posted body before
+    accepting it, so a harness the real server would reject is rejected here.
+
+    MUTATION THAT REDS THIS: drop "hermes" from ``_SESSION_HARNESS_VALUES`` —
+    the boundary refuses 422, rc is 1, and no receipt is written (#2121 review
+    P1).
+    """
+    from types import SimpleNamespace
+
+    from pydantic import ValidationError
+
+    from tortoise.__main__ import _cmd_sessions_import
+    from tortoise.hosted_api import (
+        _SESSION_HARNESS_VALUES,
+        SessionRequest,
+        _capture_server_owned_keys,
+    )
+
+    # The DERIVED server-owned receipt family must exist for the harness, or
+    # even a successful POST has no key to record its receipt under.
+    assert "hermes" in _SESSION_HARNESS_VALUES
+    assert {"session_capture_receipt_hermes",
+            "session_capture_last_error_hermes"} <= _capture_server_owned_keys()
+
+    db = _make_state_db(tmp_path / "state.db", {"s1": [
+        {"id": 1, "role": "user", "content": "hello Hermes"},
+        {"id": 2, "role": "assistant", "content": "hi there"}]})
+
+    monkeypatch.setenv("TORTOISE_API_KEY", "tt_test")
+    monkeypatch.setenv("TORTOISE_CAPTURE", "1")
+    monkeypatch.delenv("TORTOISE_API_URL", raising=False)
+    monkeypatch.setenv("TORTOISE_IMPORT_RECEIPT_DIR",
+                       str(tmp_path / "receipts"))
+    monkeypatch.setenv("TORTOISE_CAPTURE_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    posted: dict = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps({"session_id": "s1"}).encode("utf-8")
+
+    def _open(req, timeout=None):
+        body = json.loads(req.data.decode("utf-8"))
+        try:
+            # Exactly what the route does with a JSON body before the handler.
+            SessionRequest(**body)
+        except ValidationError as exc:
+            raise HTTPError("https://api.tortoise.test/v1/sessions", 422,
+                            "unprocessable", hdrs=None,
+                            fp=io.BytesIO(b'{"detail":"invalid harness"}')
+                            ) from exc
+        posted.update(body)
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _open)
+    rc = _cmd_sessions_import(SimpleNamespace(
+        file=str(db), harness="hermes", session_id="imp-hermes"))
+
+    assert rc == 0, posted
+    assert posted["harness"] == "hermes"
+    assert posted["conversation"] == [
+        {"role": "user", "content": "hello Hermes"},
+        {"role": "assistant", "content": "hi there"},
+    ]
+    receipts = list((tmp_path / "receipts").glob("*.json"))
+    assert [p.name for p in receipts] == ["imp-hermes.json"], receipts
+    assert json.loads(receipts[0].read_text())["harness"] == "hermes"

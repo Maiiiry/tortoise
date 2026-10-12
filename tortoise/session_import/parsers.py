@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import quote
@@ -290,6 +291,62 @@ def _hermes_rows(conn, sql: str, params: tuple = ()):
         raise ValueError(f"cannot read Hermes session store: {e}") from e
 
 
+# Hermes does NOT store a list/dict ``content`` directly: ``sqlite3`` binds only
+# scalars, so `hermes_state_messages.py::_encode_content` writes it as a
+# SENTINEL-PREFIXED JSON string and every read path reverses that with
+# ``_decode_content`` (a reserved prefix that is not valid JSON is returned raw
+# — fail closed). Reading the raw column instead hands ``_text_from_parts`` a
+# STRING, so its list branch is never reached and the serialized JSON (NUL byte
+# included) is filed as the utterance. Hermes persists list content for real
+# (``compose_user_api_content`` / ``append_notes_to_multimodal_content``), so
+# this is the multimodal user turn, not a hypothetical (#2121 review).
+_HERMES_CONTENT_JSON_PREFIX = "\x00json:"
+
+# `sanitize_context` ported from hermes-agent `agent/memory_manager.py`: the
+# three patterns, verbatim and in the source's own substitution order. Hermes'
+# memory provider fences recalled context in `<memory-context>` tags and adds a
+# system note; ``_loaded_view_content`` strips both from user/assistant rows
+# before the model sees them, so a backfill that skips it can file an INJECTED
+# context block as the user's own words. Ported, not imported: Hermes is the
+# harness being read, not a dependency of tortoise. Drift is possible and is
+# pinned by `tests/test_hermes_seam.py` (which asserts the stripped result, not
+# the regex source).
+_HERMES_INTERNAL_CONTEXT_RE = re.compile(
+    r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>", re.IGNORECASE)
+_HERMES_INTERNAL_NOTE_RE = re.compile(
+    r"\[System note:\s*The following is recalled memory context,\s*"
+    r"NOT new user input\.\s*Treat as (?:informational background data|"
+    r"authoritative reference data[^\]]*)\.\]\s*", re.IGNORECASE)
+_HERMES_FENCE_TAG_RE = re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE)
+
+
+def _hermes_decode_content(content):
+    """Reverse ``_encode_content``: a sentinel-prefixed JSON string decodes back
+    to its list/dict; anything else — including a malformed marker row — stays
+    raw, exactly as the store's own fail-closed ``_decode_content`` does."""
+    if isinstance(content, str) and content.startswith(_HERMES_CONTENT_JSON_PREFIX):
+        try:
+            return json.loads(content[len(_HERMES_CONTENT_JSON_PREFIX):])
+        except (TypeError, ValueError):
+            return content
+    return content
+
+
+def _hermes_loaded_view(role: str, content):
+    """One stored ``messages.content`` as Hermes' own loader hands it over:
+    decoded, then ``sanitize_context(...).strip()`` for user/assistant STRINGS
+    (`_loaded_view_content`). Non-string content — the decoded parts list — is
+    passed through UNSANITIZED, matching the loader rather than improving on
+    it."""
+    content = _hermes_decode_content(content)
+    if role in _KEEP_ROLES and isinstance(content, str):
+        for pattern in (_HERMES_INTERNAL_CONTEXT_RE, _HERMES_INTERNAL_NOTE_RE,
+                        _HERMES_FENCE_TAG_RE):
+            content = pattern.sub("", content)
+        return content.strip()
+    return content
+
+
 def parse_hermes(path: str | Path) -> list[dict]:
     """Parse a Hermes `state.db` session into conversation turns.
 
@@ -313,6 +370,13 @@ def parse_hermes(path: str | Path) -> list[dict]:
         summariser as a user);
       * ``role IN ('user', 'assistant')`` (tool/system/session_meta rows are
         context noise, skipped — never coerced).
+
+    Each row's ``content`` goes through the store's OWN read lens before it is
+    treated as an utterance (``_decode_content`` → ``_loaded_view_content``):
+    a ``"\x00json:"``-prefixed JSON string decodes back to its parts list, and
+    injected ``<memory-context>`` blocks / system notes are stripped — a
+    backfill must not file the store's storage encoding or its injected
+    context as the user's words.
 
     Reads ONLY: the connection is opened ``mode=ro`` so a live/recent Hermes
     store is never mutated (Hermes runs WAL + a cross-process write guard; a
@@ -380,7 +444,11 @@ def parse_hermes(path: str | Path) -> list[dict]:
 
     turns: list[dict] = []
     for row in rows:
-        text = _text_from_parts(row["content"])
+        # Decode the store's content encoding and lens the row the way Hermes'
+        # own loader does BEFORE flattening parts — otherwise structured
+        # (multimodal) turns are filed as a `"\x00json:"` blob and injected
+        # context is filed as the user's utterance (#2121 review).
+        text = _text_from_parts(_hermes_loaded_view(row["role"], row["content"]))
         if not text:
             continue
         turns.append({"role": row["role"], "content": text})
