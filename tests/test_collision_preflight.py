@@ -4582,6 +4582,23 @@ class CollisionPreflightTest(unittest.TestCase):
                 f"see `tests/test_{ISSUE}_x.py`", ISSUE),
             ([], [], False),
         )
+        # ⛔ A FILE PATH IS NOT A BRANCH, even when its BASENAME names the issue.
+        # `<dir>/<issue#>-<name>` is exactly the branch convention, so
+        # `docs/<N>-notes.md` passes every shape test — and extracting it demotes
+        # a claim that named NO artifact, because the path then verifies as
+        # "gone". The original discriminator only caught basenames NOT beginning
+        # with the issue number, which is the wrong half. This is the false-CLEAN
+        # direction, so it is pinned here rather than left to the branch surface.
+        for file_path in (f"docs/{ISSUE}-notes.md", f"src/{ISSUE}_fix.py",
+                          f"tests/{ISSUE}_test.py", f"docs/{ISSUE}-plan.txt"):
+            with self.subTest(file_path=file_path):
+                self.assertEqual(
+                    cp.claim_named_artifacts(f"see `{file_path}`", ISSUE),
+                    ([], [], False),
+                )
+                self.assertFalse(
+                    cp._looks_like_claim_branch(file_path, ISSUE), file_path,
+                )
         self.assertEqual(
             cp.claim_named_artifacts(f"wt `.worktrees/{ISSUE}-x`", ISSUE),
             ([], [f".worktrees/{ISSUE}-x"], False),

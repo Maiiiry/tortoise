@@ -3571,6 +3571,11 @@ def _claim_gate_note(
 #   * the uncertain band stays a hit BY CONSTRUCTION (an ambiguous case is still
 #     a hit), so it is never demoted.
 _CLAIM_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+# A final path segment carrying a FILE EXTENSION is a file, not a branch (see
+# `_looks_like_claim_branch`). A STEM character must precede the dot, so a
+# malformed REF like `3061..x` is not mistaken for one — that case belongs to the
+# refused-but-artifact-shaped arm (unmeasured), not to the names-nothing arm.
+_CLAIM_FILE_EXT_RE = re.compile(r"[A-Za-z0-9_-]\.[A-Za-z0-9]{1,5}$")
 _CLAIM_BACKTICK_RE = re.compile(r"`([^`\n]+)`")
 # Bound the work: a claim names a handful of artifacts, and each branch check is
 # a subprocess. A body that backticks dozens of tokens cannot buy extra git
@@ -3644,7 +3649,21 @@ def _looks_like_claim_branch(token: str, issue: int) -> bool:
     if ref is None:
         return False
     _first, _sep, rest = ref.partition("/")
-    return re.match(rf"{issue}(?![0-9])", rest) is not None
+    if re.match(rf"{issue}(?![0-9])", rest) is None:
+        return False
+    # ⛔ A FILE PATH MUST NOT BE READ AS A BRANCH. `<dir>/<issue#>-<name>` IS the
+    # branch convention, so `docs/3061-notes.md` and `src/3061_fix.py` satisfy
+    # every test above — and extracting one is a DEMOTION on a claim that named
+    # no artifact at all, because the path then verifies as "gone". The original
+    # discriminator only caught basenames that did not begin with the issue
+    # number (`tests/test_3061_x.py`), which is the wrong half. A final segment
+    # carrying a file extension is therefore NOT a branch. Refusing is the safe
+    # direction: an unextracted token names nothing, and a claim that names
+    # nothing keeps blocking — so the cost of a false refusal is an over-block,
+    # never a false CLEAN.
+    if _CLAIM_FILE_EXT_RE.search(ref.rsplit("/", 1)[-1]):
+        return False
+    return True
 
 
 def _artifact_shaped(token: str, issue: int) -> bool:
@@ -3661,8 +3680,24 @@ def _artifact_shaped(token: str, issue: int) -> bool:
     """
     if ".worktrees/" in token:
         return number_present(token, issue)
-    body = token[len("refs/heads/"):] if token.startswith("refs/heads/") else token
-    if token.startswith("refs/"):
+    # ⛔ The guard must test the STRIPPED body, not the original token: a
+    # `refs/heads/…` token is a branch (the prefix is stripped), and only OTHER
+    # `refs/…` namespaces are out of this arm's scope. Testing the original made
+    # every `refs/`-prefixed token return False, silently DROPPING a live
+    # artifact the normaliser had refused — the exact failure this function
+    # exists to prevent.
+    if token.startswith("refs/heads/"):
+        body = token[len("refs/heads/"):]
+    elif token.startswith("refs/"):
+        return False
+    else:
+        body = token
+    # The same file-extension rule as `_looks_like_claim_branch`: a path ending
+    # in `.md`/`.py`/`.txt` names a FILE, so it is not artifact-shaped and the
+    # claim it appears in "names nothing" (which still blocks). Without this the
+    # loose test would call every file path UNMEASURED — the same verdict, but a
+    # wrong reason, and it would blur the three-way distinction the caller reads.
+    if _CLAIM_FILE_EXT_RE.search(body.rsplit("/", 1)[-1]):
         return False
     _head, sep, rest = body.partition("/")
     if not sep:
@@ -3780,9 +3815,12 @@ def _claim_artifact_verifier(
                 [git_bin, "for-each-ref", "--format=%(refname)",
                  f"refs/remotes/*/{branch}"], cwd, timeout,
             )
-            if timed_out_r:
+            if timed_out_r or rc_r != 0:
+                # ANY non-zero return means the question was not ANSWERED — not
+                # that the ref is absent. Treating a failed command as a measured
+                # absence is the downgrade this arm's contract forbids.
                 return None
-            if rc_r == 0 and out_r.strip():
+            if out_r.strip():
                 return "live_remote"
             return "gone"
         return None
