@@ -1156,6 +1156,22 @@ TOOL_CARVEOUTS = (
     # matrix) is the safe default for a tool whose answer drives dispatch.
     "tools/who_is_on.py",
     "tools/who-is-on.sh",
+    # #3554: the `:Session` writer inventory + D9 retrofit instrument
+    # (tools/session_retrofit_audit.py) owns
+    # tests/test_session_schema_3554.py. Same silent-drop class as the
+    # carve-outs above: the flat "tools/" prefix in NON_PYTHON_PREFIXES
+    # swallows the path, so a tool-only change comes back as `changed=[]`,
+    # select() takes the docs-only early return — which bypasses the
+    # `if not matched: matched.add("core")` fallback entirely — and the
+    # inventory/D9 guard never runs on the very change that can widen or
+    # narrow the predicate. Registering tests/test_session_schema_3554.py
+    # under `core` in ci-surfaces.yml does NOT cover this: it applies to
+    # edits of the TEST file, not of the tool. No SOURCE_PATTERNS entry
+    # matches the path, so it lands in the unknown-path branch -> FULL
+    # matrix (fail closed).
+    # Pinned by test_ci_selection.
+    # test_session_retrofit_audit_tool_change_fails_closed_to_full.
+    "tools/session_retrofit_audit.py",
 )
 
 

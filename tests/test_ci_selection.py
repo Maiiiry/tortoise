@@ -1364,6 +1364,44 @@ def test_who_is_on_tool_change_fails_closed_to_full():
         assert "core" in r["surfaces"], path
 
 
+def test_session_retrofit_audit_tool_change_fails_closed_to_full():
+    # #3554: tools/session_retrofit_audit.py owns
+    # tests/test_session_schema_3554.py, whose guards pin the :Session writer
+    # inventory predicate (it must be CLEAN on the tree it ships with) and the
+    # D9 retrofit CLI. Same silent-drop class as the carve-outs above: the flat
+    # "tools/" NON_PYTHON_PREFIXES entry swallows a tool-only change, so
+    # without a TOOL_CARVEOUTS entry `changed` is empty and select() takes the
+    # docs-only return (surfaces=[], tier-1 smoke only) — and that early return
+    # bypasses the `if not matched: matched.add("core")` fallback, so the guard
+    # suite would never run on the PR that changes the instrument. Registering
+    # the TEST under `core` in ci-surfaces.yml does NOT cover this: it applies
+    # to edits of the test file, not of the tool. No SOURCE_PATTERNS entry
+    # matches the path, so it lands in the unknown-path fail-closed branch ->
+    # FULL matrix + both legs. Mutation check: removing the TOOL_CARVEOUTS
+    # entry filters the path out (docs-only early return), failing all three
+    # asserts below.
+    r = _sel(["tools/session_retrofit_audit.py"])
+    assert r["full"] is True
+    assert r["test_files"] == "ALL"
+    assert "core" in r["surfaces"]
+
+
+def test_session_schema_guard_runs_on_every_declared_writer_surface():
+    # #3554: the declared :Session writer inventory SPANS surfaces —
+    # tools/longmem_eval/ingest.py and ingest_v2.py select `eval`, and
+    # tools/ask_spotcheck.py selects `sdk` — so the drift guard
+    # (tests/test_session_schema_3554.py) must be registered on each surface
+    # its subjects select. A named-surface match REPLACES the `core` fallback
+    # (#2938), so a core+api-only registration silently drops the guard on an
+    # eval- or sdk-only change. Mutation check: removing either ci-surfaces.yml
+    # arm fails the corresponding assert below.
+    for path in ("tools/longmem_eval/ingest.py",
+                 "tools/longmem_eval/ingest_v2.py",
+                 "tools/ask_spotcheck.py"):
+        r = _sel([path])
+        assert "test_session_schema_3554.py" in r["test_files"], path
+
+
 def test_backfill_script_only_change_selects_eval():
     # graph-scripts/backfill_embeddings.py is a SOURCE_PATTERNS["eval"]
     # path — a backfill-only PR selects the eval surface (its test,

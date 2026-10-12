@@ -30,16 +30,21 @@ same constraint ``tortoise/session_projection.py`` (the READ declaration this
 module is the write-side twin of) states for itself.
 
 **The demo session's id is declared here too** (``demo_session_id``), for the
-reason #2360 gives for ``_DEMO_POINT_IDS``: one source of truth for the exclusion.
-The seeder writes the id and every session READ surface excludes it, so sample
-content can never be presented as a captured session.
+reason #2360 gives for ``_DEMO_POINT_IDS``: ONE derivation for the seeder's
+write — ``hosted_api._seed_demo_graph`` calls it rather than re-spelling the
+f-string. ⚠️ **The read-side exclusion is NOT implemented for the Session
+container.** #2360's exclusion is Point-scoped (``_DEMO_POINT_IDS``: the demo
+Points and the sentinel), so the demo ``:Session`` is still returned by
+``GET /v1/sessions``, ``GET /v1/sessions/{id}`` and ``TortoiseSDK.get_session``.
+That is recorded here as an open gap, never read as coverage.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 __all__ = [
     "DEMO_SESSION_ID_PREFIX",
@@ -56,18 +61,20 @@ __all__ = [
 ]
 
 #: The prefix the demo/sample seeder derives its Session id with. ONE
-#: declaration: ``hosted_api._seed_demo_graph`` writes it and every session
-#: read surface (`GET /v1/sessions`, `GET /v1/sessions/{id}`,
-#: ``TortoiseSDK.get_session``) excludes it (#2360's rule, applied to the
-#: session container: opt-in sample content is never presented as the user's
-#: own captured sessions).
+#: declaration: ``hosted_api._seed_demo_graph`` writes the id through
+#: :func:`demo_session_id`. The session READ surfaces do NOT exclude it today —
+#: #2360's exclusion covers the demo POINTS (``_DEMO_POINT_IDS``), not the demo
+#: Session container — and that gap is recorded rather than claimed closed.
 DEMO_SESSION_ID_PREFIX = "session_demo_"
 
 
 def demo_session_id(org_id: str) -> str:
-    """The deterministic demo-session id for an org — the seeder's WRITER and
-    the read surfaces' EXCLUSION share this one derivation, so a demo id can
-    never drift between them."""
+    """The deterministic demo-session id for an org.
+
+    The seeder's WRITER derives the id here, so a read-surface exclusion (when
+    one is written) reuses this derivation instead of re-spelling the f-string
+    and drifting. Today the only consumer is ``_seed_demo_graph``.
+    """
     return f"{DEMO_SESSION_ID_PREFIX}{org_id[:8]}"
 
 
@@ -275,8 +282,9 @@ SESSION_WRITERS: tuple[SessionWriter, ...] = (
             "The opt-in sample seeder — a THIRD shape, deliberately excluded "
             "from the capture primitive (#3551): no `is_episodic`, no "
             "`capture_ok`, and 3 hand-written demo turns. Its Session id comes "
-            "from `demo_session_id` and every session read surface excludes it "
-            "(#2360's rule for the sample content)."),
+            "from `demo_session_id` (the ONE derivation, #3554); the session "
+            "read surfaces do NOT yet exclude the demo Session — a recorded "
+            "gap, not a claim of coverage."),
     ),
     SessionWriter(
         key="tortoise/projection/entities.py::_fold_session_recorded",
@@ -631,11 +639,18 @@ def iter_declared_properties() -> Iterable[str]:
 
 #: The label + write verbs the source predicate keys on. Declared HERE, next
 #: to the inventory it proves, so the tool cannot silently widen its own
-#: predicate without the same reviewed diff that changes this line.
+#: predicate without the same reviewed diff that changes this dict: the scanner
+#: COMPILES :data:`PREDICATE`'s ``write_verbs`` (binding ``<alias>`` to the
+#: variable in the matched literal) and SKIPS the path prefixes in ``excluded``.
+#: Comments are excluded by construction — the scan is AST-based, so a Cypher
+#: write shape in a ``#`` comment or a docstring is not a site.
 PREDICATE = {
     "label": ":Session",
-    "write_verbs": ("MERGE (<alias>:Session", "SET <alias>."),
+    "write_verbs": (
+        r"MERGE\s*\(\s*<alias>\s*:\s*Session",
+        r"\bSET\s+<alias>\.",
+    ),
     "client_route": "/v1/sessions",
-    "excluded": ("tests/", "docs/", "comments (the scan is AST-based)"),
+    "excluded": ("tests/", "docs/"),
 }
 _SESSION_LABEL_RE = re.compile(r"\(\s*(\w+)\s*:\s*Session\s*[{)$\s]")

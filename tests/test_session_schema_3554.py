@@ -264,3 +264,106 @@ def test_retrofit_json_is_valid_json(
     assert payload["short_turn_count"]["all_short"] == 2
     assert payload["entity_links_under_count"]["sessions"] == 1
     assert payload["verdicts"] == session_schema.RETROFIT_VERDICTS
+
+
+# ── the recorded decisions must have a real home ───────────────────────────
+
+ONTOLOGY = REPO_ROOT / "docs/ONTOLOGY.md"
+PLAN = REPO_ROOT / "docs/plans/2026-08-25-1714-memory-capture-onboarding.md"
+
+
+def _session_section() -> str:
+    """The §4.8 body, with the §5 heading as its exclusive end."""
+    ontology = ONTOLOGY.read_text(encoding="utf-8")
+    start = ontology.index("### §4.8")
+    return ontology[start:ontology.index("## §5.", start)]
+
+
+def test_retrofit_verdicts_cite_documentation_homes_that_exist() -> None:
+    """A ``recorded-honest-gap`` decision is only recorded if its home exists.
+
+    The module's framing is that these three divergences are *recorded*
+    decisions; pre-fix every ``where_recorded`` pointed at
+    ``docs/ONTOLOGY.md §4.8`` and a plan ``#3554 amendment``, neither of which
+    existed.
+    """
+    ontology = ONTOLOGY.read_text(encoding="utf-8")
+    plan = PLAN.read_text(encoding="utf-8")
+    assert "### §4.8" in ontology
+    assert "#3554 amendment" in plan
+    for name, verdict in session_schema.RETROFIT_VERDICTS.items():
+        where = verdict["where_recorded"]
+        assert "docs/ONTOLOGY.md §4.8" in where, name
+        assert "§ '#3554 amendment'" in where, name
+
+
+def test_ontology_section_4_8_names_the_whole_declared_schema() -> None:
+    """The doc mirror must name every property the machine declaration holds."""
+    section = _session_section()
+    for prop in session_schema.SESSION_PROPERTIES:
+        assert f"`{prop}`" in section, prop
+
+
+def test_scanner_write_verbs_come_from_the_declared_predicate(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The writer test reads ``PREDICATE['write_verbs']``, not a literal.
+
+    Pre-fix the scanner hardcoded ``MERGE``/``SET`` while the declaration
+    claimed the tool "cannot silently widen its own predicate": editing the
+    declared verbs changed nothing. Here a ``MERGE`` file and an ``UPSERT``
+    file are scanned with an UPSERT-only predicate — the declared binding
+    admits only the UPSERT site, and the hardcoded pair would also admit the
+    MERGE one (both carry ``SET s.``).
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "merge_writer.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    (pkg / "upsert_writer.py").write_text(
+        'QUERY = "UPSERT (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    monkeypatch.setitem(audit.PREDICATE, "write_verbs",
+                        (r"UPSERT\s*\(\s*<alias>\s*:\s*Session",))
+    assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
+        "tortoise/upsert_writer.py::QUERY"}
+
+
+def test_scanner_skips_the_declared_excluded_prefixes(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The walk reads ``PREDICATE['excluded']``, not a private constant."""
+    pkg = tmp_path / "tortoise" / "vendored"
+    pkg.mkdir(parents=True)
+    (pkg / "writer.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    assert {s.path for s in audit.scan_graph_writers(tmp_path)} == {
+        "tortoise/vendored/writer.py"}
+    monkeypatch.setitem(audit.PREDICATE, "excluded", ("tortoise/vendored/",))
+    assert audit.scan_graph_writers(tmp_path) == []
+
+
+# ── the demo session id has ONE derivation ─────────────────────────────────
+
+
+def test_demo_session_id_is_the_one_derivation() -> None:
+    assert session_schema.DEMO_SESSION_ID_PREFIX == "session_demo_"
+    assert session_schema.demo_session_id("abcdef123456") == \
+        "session_demo_abcdef12"
+
+
+def test_seed_demo_graph_derives_its_session_id_from_the_declaration() -> None:
+    """#3554: the seeder calls ``demo_session_id``, not a local f-string.
+
+    Pre-fix the function was dead code (never called anywhere) and the seeder
+    re-spelled ``f"session_demo_{org_id[:8]}"`` — the "one derivation" the
+    module claimed did not exist.
+    """
+    src = (REPO_ROOT / "tortoise/hosted_api.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next(node for node in ast.walk(tree)
+              if isinstance(node, ast.FunctionDef)
+              and node.name == "_seed_demo_graph")
+    body = ast.get_source_segment(src, fn) or ""
+    assert "demo_session_id(org_id)" in body
+    assert "session_demo_" not in body

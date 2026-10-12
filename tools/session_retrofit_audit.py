@@ -81,7 +81,7 @@ SCAN_ROOTS: tuple[str, ...] = (
     "capability", "integrations", "services", "validation", ".github/scripts",
 )
 SCAN_SKIP_PARTS: frozenset[str] = frozenset(
-    {".venv", "node_modules", "tests", "__pycache__", "bakeoff"})
+    {".venv", "node_modules", "__pycache__", "bakeoff"})
 PY_EXTENSIONS = (".py",)
 CLIENT_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".sh", ".bash")
 
@@ -234,6 +234,30 @@ def _ast_index(tree: ast.AST) -> _AstIndex:
                      tuple(calls), frozenset(decorators))
 
 
+def _excluded(rel: str) -> bool:
+    """True when a repo-relative path sits under a DECLARED excluded prefix.
+
+    The prefixes come from :data:`PREDICATE`'s ``excluded`` (the declaration),
+    never from a literal in this tool — so the scan's scope is part of the same
+    reviewed predicate as its verbs and route.
+    """
+    return any(rel == prefix.rstrip("/") or rel.startswith(prefix)
+               for prefix in PREDICATE["excluded"])
+
+
+def _write_matchers(alias: str) -> tuple[re.Pattern[str], ...]:
+    """Compile the DECLARED write verbs with ``<alias>`` bound.
+
+    The verbs come from :data:`PREDICATE`'s ``write_verbs``: a widened
+    predicate is a reviewed diff to ``tortoise/session_schema.py``, not a
+    private edit here. Until this was read, the guarantee the declaration
+    stated ("the tool cannot silently widen its own predicate") did not hold —
+    the scanner hardcoded ``MERGE``/``SET`` while claiming to key on the dict.
+    """
+    return tuple(re.compile(verb.replace("<alias>", re.escape(alias)))
+                 for verb in PREDICATE["write_verbs"])
+
+
 def _iter_source(root: Path, extensions: tuple[str, ...]):
     for rel_root in SCAN_ROOTS:
         base = root / rel_root
@@ -246,7 +270,8 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
                 continue
             if path.is_symlink():
                 continue
-            if path.relative_to(root).as_posix() == DECLARATION_MODULE:
+            rel = path.relative_to(root).as_posix()
+            if rel == DECLARATION_MODULE or _excluded(rel):
                 continue
             yield path
 
@@ -280,10 +305,10 @@ def scan_graph_writers(root: Path) -> list[Site]:
             if not match:
                 continue
             alias = match.group(1)
-            writes = bool(re.search(
-                rf"MERGE\s*\(\s*{re.escape(alias)}\s*:\s*Session", text))
-            writes = writes or bool(re.search(
-                rf"\bSET\s+{re.escape(alias)}\.", text))
+            # The write test reads the DECLARED verbs (PREDICATE), so widening
+            # the predicate is a reviewed diff to the declaration rather than a
+            # hardcoded regex here.
+            writes = any(rx.search(text) for rx in _write_matchers(alias))
             # ``SET a += $props`` (the rebuild_all snapshot restore) carries no
             # property NAME at the site — it is the one writer whose property
             # set is the whole schema, and it is declared as such.

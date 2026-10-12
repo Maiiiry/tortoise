@@ -2796,6 +2796,14 @@ surfaces:
   # other file this pins — is a SHARED_MODULE, so a sdk.py change runs it under
   # the full matrix regardless. See the `core` arm's entry for the same file.
   - test_references_boundary_5213.py
+  # #3554: the `:Session` writer inventory's declared universe SPANS this
+  # surface — `SESSION_WRITERS` declares `tools/ask_spotcheck.py::
+  # merge_capture_session` (a SOURCE_PATTERNS["sdk"] path), so a change that
+  # adds or removes a writer there selects `sdk` and would otherwise skip the
+  # drift guard. DUAL-REGISTERED with `api`/`core`/`eval`: a named-surface
+  # match REPLACES the `core` fallback, so each surface the declaration reaches
+  # needs its own arm (#2938).
+  - test_session_schema_3554.py
   classify:
   # Issue #1695 (extractor-v3 classify-later): the kind-classification and
   # chain-enforcement surface. Pure-logic files (stub encoders, golden
@@ -2919,6 +2927,15 @@ surfaces:
   - test_provenance_extractedfrom_3263.py  # #3263: pins tools/longmem_eval/ingest_v2._write_payload provenance (dual-registered with ep; #2938 precedent)
   - test_load_test.py
   - test_pair_label_runner.py
+  # #3554: the `:Session` writer inventory's declared universe SPANS this
+  # surface — `SESSION_WRITERS` declares `tools/longmem_eval/ingest.py::
+  # ingest_haystack` and `tools/longmem_eval/ingest_v2.py::_write_v2_phase_a`
+  # (both SOURCE_PATTERNS["eval"] paths), so a change that adds or removes a
+  # writer there selects `eval` and would otherwise skip the drift guard.
+  # DUAL-REGISTERED with `api`/`core`/`sdk`: a named-surface match REPLACES the
+  # `core` fallback, so each surface the declaration reaches needs its own arm
+  # (#2938).
+  - test_session_schema_3554.py
 tier1:
 - test_cli_serve.py
 - test_config.py
