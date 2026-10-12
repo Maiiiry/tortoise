@@ -35,10 +35,12 @@ MARKER: tortoise-hermes-plugin — ``tortoise install hermes`` and its
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -59,14 +61,54 @@ _REFLEX_TIMEOUT_S = 5.0
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
+#: The breadcrumb kind the shipped shell hooks write when the install leg is
+#: inert (``hook_install.KIND_INSTALL_INERT``). An inert install must leave
+#: EVIDENCE, never silence (#4314): fail-open injects nothing on a healthy
+#: empty graph AND on a dead seam, so without this the two are
+#: indistinguishable to a user or to ``session verify``.
+_INSTALL_INERT_KIND = "install-inert"
+
 
 def _disabled() -> bool:
     return os.environ.get("TORTOISE_VOLUNTEER_DISABLE", "").strip().lower() in _TRUTHY
 
 
+def _record_install_inert(detail: str) -> None:
+    """Best-effort ``install-inert`` breadcrumb, mirroring the shell hooks.
+
+    Same slot layout as ``hook_install.local_state_dir`` /
+    ``breadcrumb_name``: ``<receipt-dir>.parent/capture-errors/
+    <harness>-install.json``, where the receipt dir is
+    ``$TORTOISE_IMPORT_RECEIPT_DIR`` or ``$HOME/.tortoise/import-receipts``.
+
+    Stdlib-only by construction — this module is loaded by the HOST
+    interpreter and must not import ``tortoise.*``. A failed write can never
+    raise into the agent turn, and an unset ``$HOME`` falls to the
+    ``/nonexistent`` sentinel (never ``Path("")``, which is the process CWD —
+    an agent-writable workspace, #2121 review).
+    """
+    try:
+        override = os.environ.get("TORTOISE_IMPORT_RECEIPT_DIR")
+        if override:
+            receipt_dir = Path(override)
+        else:
+            receipt_dir = (Path(os.environ.get("HOME") or "/nonexistent")
+                           / ".tortoise" / "import-receipts")
+        crumb = receipt_dir.parent / "capture-errors" / "hermes-install.json"
+        crumb.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "harness": "hermes",
+            "detail": detail,
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "kind": _INSTALL_INERT_KIND,
+        }
+        crumb.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except Exception:  # evidence is best-effort, never fatal
+        pass
+
+
 def _tortoise_candidates() -> list[list[str]]:
-    """The reflex entry points to try, in the same order the shipped shell
-    hook (``tortoise/claude-hooks/volunteer-turn.sh``) walks them.
+    """The reflex entry points to try, PATH first then the venv fallbacks.
 
     Hermes' per-turn hook is a Python PLUGIN, not a shell command, so the
     chain is re-expressed here rather than shelled out: PATH install → the
@@ -74,6 +116,16 @@ def _tortoise_candidates() -> list[list[str]]:
     ``TORTOISE_SRC_DIR`` overriding it) → the ambient venv. Each candidate is
     only used if it exists: a wrong candidate is a skipped attempt, never a
     traceback on the agent path.
+
+    This is a SUBSET of the shipped shell hook's chain
+    (``tortoise/claude-hooks/volunteer-turn.sh``): the shell hook additionally
+    walks up for the ``pyvenv.cfg`` that OWNS a wheel's ``site-packages``
+    (#2385 item 3) and falls back to running the module directly. The middle
+    rung here is populated only by ``TORTOISE_SRC_DIR`` or a record some other
+    seam's install wrote — ``install hermes`` writes no record. A machine
+    whose only Tortoise install is Hermes and which lacks a ``tortoise`` on
+    PATH/VIRTUAL_ENV therefore injects nothing; that is why the no-candidate
+    path leaves an ``install-inert`` breadcrumb instead of silence.
     """
     cmds: list[list[str]] = []
     exe = shutil.which("tortoise")
@@ -105,10 +157,23 @@ def _reflex_block(user_message: str, session_id: str) -> str:
     input, which is what suppresses re-mentioning a pointer it already
     surfaced earlier in the same session (cross-turn dedupe). No session id
     means no continuity, never an error.
+
+    A turn where NO reflex resolves, or where every resolved reflex FAILS, is
+    an inert install or a broken one — not an empty graph — so it leaves an
+    ``install-inert`` breadcrumb before returning "" (an empty graph exits 0
+    and stays silent, which is the documented content fail-open).
     """
     if not user_message.strip():
         return ""
-    for argv in _tortoise_candidates():
+    candidates = _tortoise_candidates()
+    if not candidates:
+        _record_install_inert(
+            "the installed Hermes plugin resolved no tortoise reflex (checked "
+            "PATH, the installer's ~/.tortoise/hook-src-dir record, and "
+            "$VIRTUAL_ENV) and injected nothing")
+        return ""
+    last_error = ""
+    for argv in candidates:
         cmd = list(argv)
         if session_id:
             cmd += ["--session-id", session_id]
@@ -117,10 +182,15 @@ def _reflex_block(user_message: str, session_id: str) -> str:
                 cmd, input=user_message, capture_output=True, text=True,
                 timeout=_REFLEX_TIMEOUT_S,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
             continue
         if proc.returncode == 0:
             return (proc.stdout or "").strip()
+        last_error = f"exit {proc.returncode}"
+    _record_install_inert(
+        "every resolved tortoise reflex failed "
+        f"({last_error or 'no candidate ran'}) and injected nothing")
     return ""
 
 

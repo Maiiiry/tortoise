@@ -3335,8 +3335,11 @@ def _install_read_hook_impl(args) -> int:
               "cloud agent sessions are not captured)")
         print("  tortoise install hermes  → <dir>/.hermes/plugins/"
               "tortoise-volunteer/ (the pre_llm_call PLUGIN — Hermes' per-turn "
-              "injection surface; ingestion is `tortoise sessions import "
-              "--harness hermes <state.db>`)")
+              "injection surface; import with `tortoise sessions import "
+              "--harness hermes --file <state.db>`. ACTIVATION: a project "
+              "install needs HERMES_ENABLE_PROJECT_PLUGINS=1 AND "
+              "`hermes plugins enable tortoise-volunteer` — Hermes plugins "
+              "are opt-in, so the directory alone injects nothing)")
         print("Other seams (docs/matrix only, this wave): "
               "gemini, opencode — see "
               "docs/research/2026-09-01-gbrain-learnings/platform-seams.md")
@@ -3345,7 +3348,11 @@ def _install_read_hook_impl(args) -> int:
     root = _P(getattr(args, "dir", "."))
     harness = args.harness
     script = Path(__file__).resolve().parent / "claude-hooks" / "volunteer-turn.sh"
-    if not script.exists():
+    # The shared shell hook is only read by the command-shaped seams. Hermes'
+    # read half is a Python plugin that never executes it, so gating the
+    # install on a file it does not use reported an unrelated failure on any
+    # surface shipping the plugin without the shared hook (#2121 review P3).
+    if harness != "hermes" and not script.exists():
         print(f"volunteer-turn.sh not found at {script} — cannot install",
               file=_sys.stderr)
         return 1
@@ -3641,7 +3648,19 @@ def _install_read_hook_impl(args) -> int:
         print("Hermes discovers project plugins from ./.hermes/plugins/ (and "
               "global ones from $HERMES_HOME/plugins/). Validate with "
               "`hermes plugins doctor --ci`; session ingestion is "
-              "`tortoise sessions import --harness hermes <state.db>`.")
+              "`tortoise sessions import --harness hermes --file <state.db>`.")
+        # Hermes loads plugins through TWO opt-ins, and this installer
+        # performs neither: project plugins are OFF by default
+        # (``HERMES_ENABLE_PROJECT_PLUGINS``, plugins_discovery.py)
+        # and non-bundled plugins are opt-in via ``plugins.enabled``
+        # (``gate_manifest``). Printing success without them is an inert
+        # install read as a working seam (#3808 R13, #2121 review P1).
+        print("ACTIVATION (required — Hermes plugins are opt-in; without "
+              "both steps this plugin is discovered but never loaded and "
+              "injects nothing): set HERMES_ENABLE_PROJECT_PLUGINS=1 in the "
+              "environment Hermes runs in (project plugins are disabled by "
+              "default), then run `hermes plugins enable "
+              "tortoise-volunteer` and restart Hermes.")
         return 0
 
     # ── codex / claude: JSON registration file (merge-aware). ──────────
@@ -6339,7 +6358,9 @@ def _cmd_sessions_import(args) -> int:
     from urllib.error import URLError, HTTPError
     from http.client import HTTPException as _HTTPException
 
-    from tortoise.session_import import MAX_TURNS, parse_transcript, window_turns
+    from tortoise.session_import import (
+        MAX_TURNS, hermes_selected_session_id, parse_transcript,
+        window_turns)
     # #3615: this is the SECOND transcript-upload primitive (same
     # POST /v1/sessions) — it carries the same explicit-consent gate so it
     # cannot be used as a consent bypass for the first.
@@ -6368,13 +6389,12 @@ def _cmd_sessions_import(args) -> int:
     # before the content-hash read) — otherwise the selector that the `--file`
     # help text and `parse_hermes` both advertise dies here with a misleading
     # "Session file not found". `parse_transcript` still receives the FULL
-    # argument (it re-splits); we resolve only for the existence check, the
-    # hash, and the selector salt that keeps two sessions of one store apart.
+    # argument (it re-splits); we resolve only for the existence check and the
+    # DB path the key is derived from.
     read_path = file_path
-    selector: str | None = None
     if harness == "hermes":
         from tortoise.session_import.parsers import _hermes_split_selector
-        db_path, selector = _hermes_split_selector(file_path)
+        db_path, _selector = _hermes_split_selector(file_path)
         # `parse_hermes` accepts the store DIRECTORY too (it appends state.db);
         # read/hash the real DB file in that case.
         read_path = db_path / "state.db" if db_path.is_dir() else db_path
@@ -6413,13 +6433,25 @@ def _cmd_sessions_import(args) -> int:
             file=_sys.stderr,
         )
 
-    raw = read_path.read_bytes()
-    # #2121: a Hermes store holds MANY sessions, so the whole-file hash alone
-    # collides across `::<a>` and `::<b>` — the second would report "Already
-    # imported" and never be captured. Salt the key with the selected session
-    # id (the unselected case is unchanged: hash of the store bytes).
-    key_material = raw if selector is None else (
-        raw + b"\x00" + selector.encode("utf-8"))
+    if harness == "hermes":
+        # #2121: a Hermes store holds MANY sessions and MUTATES as Hermes runs,
+        # so hashing the store FILE is not a per-session key — `<db>` (newest)
+        # and `<db>::<that same id>` derived two ids for ONE session (filed
+        # twice), an unrelated session's appended turn re-keyed it, and a live
+        # WAL store's byte-identical main file made a genuine re-import look
+        # "already imported". Key on the SESSION the argument resolves to plus
+        # its parsed turns, identically for both spellings (#2121 review).
+        try:
+            resolved_session = hermes_selected_session_id(str(file_path))
+        except ValueError:
+            # parse_transcript already succeeded, so this is unreachable in
+            # practice; fall back to a content-only key rather than failing.
+            resolved_session = ""
+        key_material = ("hermes\x00" + resolved_session + "\x00"
+                        + _json.dumps(turns, ensure_ascii=False,
+                                      sort_keys=True)).encode("utf-8")
+    else:
+        key_material = read_path.read_bytes()
     session_id = args.session_id or (
         "imp_" + hashlib.sha256(key_material).hexdigest()[:12])
 

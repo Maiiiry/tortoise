@@ -467,10 +467,10 @@ _LEDGER_LITERAL_OWNERS: dict[str, tuple[int, str]] = {
         1, "deferred to #4128: `=on` would suppress the ENUM_DELTA incident guard, so its "
            "widening needs its own decision"),
     "tortoise/hermes-plugin/__init__.py": (
-        1, "pinned mirror — the Hermes plugin is loaded by the host from its PATH, not as "
-           "`tortoise.<sub>`, and imports only the stdlib (no `tortoise.*` import: that "
-           "would run `tortoise/__init__.py`, which imports redislite unconditionally) — "
-           "the same standalone-consumer reason as the embedded reaper"),
+        1, "pinned mirror — the Hermes plugin is copied OUT of the package and loaded "
+           "by the HOST interpreter from its PATH, so `tortoise` need not be importable "
+           "there at all; it imports only the stdlib — the same standalone-consumer "
+           "reason as the embedded reaper"),
 }
 
 #: Narrow `== "1"` reads that REMAIN after #4097, with their site COUNT as an UPPER

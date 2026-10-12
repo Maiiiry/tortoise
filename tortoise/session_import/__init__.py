@@ -19,6 +19,7 @@ from __future__ import annotations
 from .parsers import (
     MAX_TURNS,
     PARSERS,
+    hermes_selected_session_id,
     parse_claude_desktop,
     parse_codex,
     parse_cursor,
@@ -32,6 +33,7 @@ from .parsers import (
 __all__ = [
     "MAX_TURNS",
     "PARSERS",
+    "hermes_selected_session_id",
     "parse_claude_desktop",
     "parse_codex",
     "parse_cursor",

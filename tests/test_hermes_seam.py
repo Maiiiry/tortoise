@@ -237,6 +237,26 @@ def test_install_hermes_writes_atomically(tmp_path):
     assert (target / "plugin.yaml").is_file()
 
 
+def test_install_hermes_prints_the_required_activation_steps(tmp_path):
+    """Hermes gates a project plugin through TWO opt-ins this installer cannot
+    perform: ``HERMES_ENABLE_PROJECT_PLUGINS`` (off by default) and
+    ``plugins.enabled`` (``hermes plugins enable``). Printing plain success
+    over a plugin Hermes never loads is an inert install read as a working
+    seam (#3808 R13), so BOTH required steps plus the real ingestion command
+    must be in the output (#2121 review P1).
+    """
+    r = _run(["install", "hermes", "--dir", str(tmp_path)], _env())
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "HERMES_ENABLE_PROJECT_PLUGINS=1" in out
+    assert "hermes plugins enable tortoise-volunteer" in out
+    # The documented ingestion command must actually run — `--file` is
+    # required, so the old `sessions import --harness hermes <state.db>` form
+    # failed with an argparse error.
+    assert ("tortoise sessions import --harness hermes --file <state.db>"
+            in out)
+
+
 def test_install_hermes_dry_run_writes_nothing(tmp_path):
     r = _run(["install", "hermes", "--dir", str(tmp_path), "--dry-run"],
              _env())
@@ -320,6 +340,8 @@ def _install_and_load(tmp_path, monkeypatch, *, block: str = "",
     monkeypatch.setenv("TORTOISE_SRC_DIR", "")
     monkeypatch.setenv("VIRTUAL_ENV", "")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # The breadcrumb path must come from HOME, not a leaked override.
+    monkeypatch.delenv("TORTOISE_IMPORT_RECEIPT_DIR", raising=False)
     for key, value in env_extra.items():
         monkeypatch.setenv(key, value)
 
@@ -428,6 +450,59 @@ def test_plugin_resolves_the_installer_recorded_module_dir(tmp_path,
         "context": _BLOCK}
 
 
+def _install_inert_crumb(tmp_path) -> Path:
+    return (tmp_path / "home" / ".tortoise" / "capture-errors"
+            / "hermes-install.json")
+
+
+def test_plugin_leaves_install_inert_evidence_when_no_reflex_resolves(
+        tmp_path, monkeypatch):
+    """A dead seam must leave EVIDENCE, not silence (#4314). Fail-open injects
+    nothing on a healthy empty graph AND on an unresolved reflex, so without a
+    breadcrumb the two are indistinguishable; the shipped shell hooks write
+    exactly this record for exactly this case. The path mirrors
+    `hook_install.local_state_dir`/`breadcrumb_name`
+    (`<home>/.tortoise/capture-errors/<harness>-install.json`)."""
+    module = _install_and_load(tmp_path, monkeypatch)
+    (tmp_path / "bin" / "tortoise").unlink()  # nothing resolvable
+    crumb = _install_inert_crumb(tmp_path)
+    assert not crumb.exists()
+    assert module.on_pre_llm_call(user_message="hi there") is None
+    record = json.loads(crumb.read_text(encoding="utf-8"))
+    assert record["kind"] == "install-inert"
+    assert record["harness"] == "hermes"
+    assert "resolved no tortoise reflex" in record["detail"]
+
+
+def test_plugin_leaves_install_inert_evidence_when_every_reflex_fails(
+        tmp_path, monkeypatch):
+    """Every resolved reflex exited non-zero (or raised) → the install is
+    broken, not the graph empty — evidence, not silence (#4314)."""
+    module = _install_and_load(tmp_path, monkeypatch)
+    fake = tmp_path / "bin" / "tortoise"
+    fake.write_text("#!/bin/bash\nexit 3\n")
+    fake.chmod(0o755)
+    assert module.on_pre_llm_call(user_message="hi there") is None
+    record = json.loads(_install_inert_crumb(tmp_path).read_text(
+        encoding="utf-8"))
+    assert record["kind"] == "install-inert"
+    assert "failed" in record["detail"]
+
+
+def test_plugin_truthy_mirror_is_the_canonical_vocabulary(tmp_path,
+                                                          monkeypatch):
+    """The plugin is loaded by the HOST interpreter from a copied-out
+    directory and cannot import `tortoise.env_truthy`, so its kill-switch
+    vocabulary is a standalone mirror. Pin it to the canonical set (the reaper
+    has the same assertion) so a future widening of `TRUTHY` cannot diverge
+    silently in the one seam whose kill switch is this literal (#2121
+    review)."""
+    from tortoise.env_truthy import TRUTHY
+
+    module = _install_and_load(tmp_path, monkeypatch)
+    assert set(module._TRUTHY) == set(TRUTHY)
+
+
 # ── 3. `parse_hermes` — the ingest half over a real state.db ─────────────
 
 
@@ -453,6 +528,25 @@ def test_parse_hermes_live_transcript_in_id_order(tmp_path):
         {"role": "assistant", "content": "Agreed — the plugin first."},
         {"role": "user", "content": "Ship the parser too."},
     ]
+
+
+def test_parse_hermes_captures_only_active_non_summary_utterances(tmp_path):
+    """In-place compaction archives the summarized turns (``active = 0``) AND
+    writes a generated summary row (``_compressed_summary = 1``); both are
+    outside the captured set, so a compacted session yields only its tail.
+    Pins the docstring's precise claim — not a "live model-visible
+    transcript" that would include the summary (#2121 review P2)."""
+    db = _make_state_db(tmp_path / "state.db", {"s1": [
+        {"id": 1, "role": "user", "content": "archived turn",
+         "active": False},
+        {"id": 2, "role": "assistant", "content": "archived reply",
+         "active": False},
+        {"id": 3, "role": "user", "content": "generated summary",
+         "summary": True},
+        {"id": 4, "role": "user", "content": "post-compaction turn"},
+    ]})
+    assert parse_hermes(db) == [
+        {"role": "user", "content": "post-compaction turn"}]
 
 
 def test_parse_hermes_defaults_to_the_most_recent_session(tmp_path):
@@ -697,6 +791,10 @@ def test_install_list_mentions_the_hermes_seam(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "install hermes" in r.stdout
     assert "pre_llm_call" in r.stdout
+    # The listing must not advertise a seam as ready when Hermes will not load
+    # it without two opt-ins (#2121 review P1).
+    assert "HERMES_ENABLE_PROJECT_PLUGINS" in r.stdout
+    assert "hermes plugins enable tortoise-volunteer" in r.stdout
 
 
 def test_hermes_import_reaches_the_hosted_boundary_and_writes_a_receipt(
@@ -785,3 +883,64 @@ def test_hermes_import_reaches_the_hosted_boundary_and_writes_a_receipt(
     receipts = list((tmp_path / "receipts").glob("*.json"))
     assert [p.name for p in receipts] == ["imp-hermes.json"], receipts
     assert json.loads(receipts[0].read_text())["harness"] == "hermes"
+
+
+def test_hermes_import_key_is_per_session_not_per_store_file(
+        tmp_path, monkeypatch):
+    """The derived ``session_id`` must be a function of the SELECTED SESSION,
+    not of the mutating store FILE: ``<db>`` (newest) and ``<db>::<that id>``
+    are the SAME session and must share one key, while a different session
+    must not.
+
+    Pre-fix the key was the whole-store hash salted with the raw selector, so
+    the two spellings derived TWO ids and the same session was POSTed twice
+    (and an unrelated session's appended turn re-keyed it) — #2121 review P2.
+    """
+    from types import SimpleNamespace
+
+    from tortoise.__main__ import _cmd_sessions_import
+
+    db = _make_state_db(
+        tmp_path / "state.db",
+        {"old": [{"id": 1, "role": "user", "content": "old session"}],
+         "new": [{"id": 2, "role": "user", "content": "new session"}]},
+        started={"old": 1_000.0, "new": 2_000.0})
+
+    monkeypatch.setenv("TORTOISE_API_KEY", "tt_test")
+    monkeypatch.setenv("TORTOISE_CAPTURE", "1")
+    monkeypatch.delenv("TORTOISE_API_URL", raising=False)
+    monkeypatch.setenv("TORTOISE_IMPORT_RECEIPT_DIR",
+                       str(tmp_path / "receipts"))
+    monkeypatch.setenv("TORTOISE_CAPTURE_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    posted: list[str] = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"session_id": "s1"}'
+
+    def _open(req, timeout=None):
+        posted.append(json.loads(req.data.decode("utf-8"))["session_id"])
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _open)
+
+    def _import(arg: str) -> int:
+        return _cmd_sessions_import(SimpleNamespace(
+            file=arg, harness="hermes", session_id=None))
+
+    assert _import(str(db)) == 0                 # newest session
+    assert _import(f"{db}::new") == 0            # SAME session, second spelling
+    assert len(posted) == 1, posted              # receipt short-circuited it
+    assert len(list((tmp_path / "receipts").glob("*.json"))) == 1
+    assert _import(f"{db}::old") == 0            # a DIFFERENT session
+    assert len(posted) == 2, posted
+    assert posted[0] != posted[1]

@@ -58,7 +58,7 @@ warns when a claude registration would make the reflex fire twice per turn.
 | #2119 | Pi (pi-coding-agent) | session lifecycle only (no per-turn prompt hook in the extension API today) | `~/.pi/agent/extensions/` TS extension | n/a — per-turn injection not reachable via extension API | MCP pull + session-start digest (existing) + documented limitation |
 | #2122 | Cursor | `sessionStart` → `additional_context`; per-turn `beforeSubmitPrompt` is observe/block ONLY | `~/.cursor/hooks.json` (flat script entries, absolute command; project `.cursor/hooks.json` is workspace-trust-gated) | `{"additional_context": …}` (snake_case) on `sessionStart` | **shipped** — `tortoise install cursor` registers the `sessionStart` cold-context hook (contract v4) *plus* the `sessionEnd` capture hook; per-turn push stays Cursor-blocked (watch item) |
 | #2120 | OpenClaw | **native plugin** — per-turn hook `before_prompt_build` → `{prependContext}` (in-process; OpenClaw has NO shell-hook surface) | `~/.openclaw/extensions/tortoise/` (plugin dir; `openclaw.plugin.json` + entry `index.mjs`) → `before_prompt_build`; capture via the `llm_output` hook → `$OPENCLAW_STATE_DIR/tortoise/turns/<session>.jsonl` (one file per session) → `tortoise sessions import --harness openclaw <file>` | `PluginHookBeforePromptBuildResult.prependContext` | **shipped** — `tortoise install openclaw` writes the plugin + `plugins.entries.tortoise.enabled`; injection graded by `tortoise/openclaw-plugin/index.test.mjs`, install by `tests/test_openclaw_seam.py` |
-| #2121 | Hermes | `pre_llm_call` (directory plugin: `register(ctx)` + `ctx.register_hook`) | `<dir>/.hermes/plugins/tortoise-volunteer/` (`plugin.yaml` + `__init__.py`, written by `tortoise install hermes`) | the callback RETURNS `{"context": "<block>"}`, injected into the current turn's user message | shipped (`install hermes`) + ingestion: `tortoise sessions import --harness hermes <state.db>` (reads `$HERMES_HOME/state.db` read-only) |
+| #2121 | Hermes | `pre_llm_call` (directory plugin: `register(ctx)` + `ctx.register_hook`) | `<dir>/.hermes/plugins/tortoise-volunteer/` (`plugin.yaml` + `__init__.py`, written by `tortoise install hermes`) | the callback RETURNS `{"context": "<block>"}`, injected into the current turn's user message | written by `install hermes`, but **INERT until two opt-ins** (`HERMES_ENABLE_PROJECT_PLUGINS=1` + `hermes plugins enable tortoise-volunteer`) — the installer prints both; ingestion: `tortoise sessions import --harness hermes --file <state.db>` (reads `$HERMES_HOME/state.db` read-only) |
 | #2124* | Gemini CLI / OpenCode / other Claude-hooks-compatibles | `UserPromptSubmit`/equivalent | harness-specific | harness-specific | shared script's default emits the bare block (harmless where unsupported) |
 | #2125 | Frameworks (SDK-level middleware: Google ADK / LangGraph / Semantic Kernel) | ADK `before_model_callback`; LangGraph pre-model node; SK Prompt Render Filter | project code imports `tortoise/framework.py` and registers the returned hook | the reflex `block` appended to the prompt (ADK: request instructions; LangGraph: one appended message; SK: `rendered_prompt` prefix) | shipped, **opt-in** — `tortoise/framework.py` + the `#2125` seam grade |
 
@@ -155,6 +155,21 @@ dead code) — the plugin invokes the SAME `tortoise volunteer` CLI the shell
 hook does, with the harness `session_id` passed through for the reflex's
 cross-turn re-mention suppression. Ingestion rides `tortoise sessions import`
 as the wave-1 note on #2121 prescribes (no hook-driven live capture).
+
+**Activation is TWO opt-ins, and the installer names both (correction
+2026-10-12).** A `tortoise install hermes` write is not by itself a live
+seam, because Hermes gates plugin loading twice
+(`hermes_cli/plugins_discovery.py` @ main): project plugins under
+`./.hermes/plugins/` are scanned only when `HERMES_ENABLE_PROJECT_PLUGINS`
+is enabled (disabled by default), and a non-bundled manifest is loaded only
+when its key is in `plugins.enabled` (`gate_manifest` — "not enabled in
+config (run `hermes plugins enable <lookup_key>` to activate)"; upstream
+docs: "plugins are opt-in"). So the install prints the two required steps
+(`HERMES_ENABLE_PROJECT_PLUGINS=1` and
+`hermes plugins enable tortoise-volunteer`), and the plugin writes the same
+`capture-errors/<harness>-install.json` (`kind: install-inert`) breadcrumb the
+shipped shell hooks write when its reflex cannot resolve — an inert install
+must leave evidence, never read as a working seam (#4314).
 
 ## Fail-open / fail-closed posture (all seams)
 
