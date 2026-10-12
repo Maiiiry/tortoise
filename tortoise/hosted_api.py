@@ -169,7 +169,10 @@ from tortoise.sdk import (
     _supersede_window_start_source,  # #3985: the ONE home for the stored-start predicate
     _write_session_and_turns,  # #3551: the ONE :Session + turn store writer (shared with sdk.capture_session)
 )
-from tortoise.security import redact_error  # billing webhook + checkout error logging
+from tortoise.security import (  # billing webhook + checkout error logging; #3293 drill incident detail
+    redact_error,
+    redact_for_publication,
+)
 from tortoise.session_auth import get_current_user, verify_session_jwt
 from tortoise.session_projection import (  # #5498: the ONE session projection
     SESSION_DETAIL_FIELDS,
@@ -6647,8 +6650,10 @@ class CreatePointRequest(BaseModel):
     # and never make it EP-able through this surface. Forwarded to
     # ``create_point``'s ``credibility=`` and consumed into the
     # ep_alpha/ep_beta baseline — NOT stored as a Point prop (unlike
-    # confidence/authoredBy above). On a DEDUP HIT ``create_point`` drops it
-    # with a logged warning (the existing point keeps its own baseline).
+    # confidence/authoredBy above). On a DEDUP HIT ``create_point`` applies it
+    # to the existing point IF that point carries no baseline yet, and keeps
+    # the baseline it already has otherwise (with a logged warning) — never a
+    # silent drop either way (#7980).
     credibility: str | int | float | None = None
 
     @field_validator("kind")
@@ -33080,9 +33085,15 @@ async def backups_drill(request: Request):
             org_id=org_id, backup_key=backup_key,
         )
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=f"Drill rejected: {e}") from e
+        raise HTTPException(
+            status_code=409,
+            detail=f"Drill rejected: {redact_for_publication(str(e))}",
+        ) from e
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=f"Drill failed: {e}") from e
+        raise HTTPException(
+            status_code=503,
+            detail=f"Drill failed: {redact_for_publication(str(e))}",
+        ) from e
 
 
 @app.post("/v1/internal/backups/drill-scheduled")
@@ -33128,20 +33139,46 @@ async def backups_drill_scheduled(request: Request):
         try:
             await asyncio.to_thread(
                 alerts.open_incident, _DRILL_FAILED_KIND, "global",
-                {"error": str(e), "source": "drill-scheduled"},
+                # #3293: an exception MESSAGE is app-controlled text and this
+                # detail is published verbatim into a PUBLIC issue body
+                # (``alert_store._body``). ``error_type`` is the bounded half
+                # the other operator incidents already carry
+                # (``operator_alert.alert_abuse_fault``); the message goes
+                # through the publication scrubber before it joins it.
+                {"error_type": type(e).__name__,
+                 "error": redact_for_publication(str(e)),
+                 "source": "drill-scheduled"},
             )
         except Exception:
             _logger.warning("RESTORE_DRILL_FAILED open failed (ValueError path)", exc_info=True)
-        raise HTTPException(status_code=409, detail=f"Drill rejected: {e}") from e
+        # #3293 review: the response body is echoed verbatim into a PUBLIC
+        # Actions log by the drill drivers (``registry-drill*.sh``), so the
+        # raw exception is a publication sink too — scrub it here, not only in
+        # the incident detail above. Internal-key auth gates WHO may call, not
+        # where the caller writes the response.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Drill rejected: {redact_for_publication(str(e))}",
+        ) from e
     except RuntimeError as e:
         try:
             await asyncio.to_thread(
                 alerts.open_incident, _DRILL_FAILED_KIND, "global",
-                {"error": str(e), "source": "drill-scheduled"},
+                # #3293: see the ValueError path above — same public sink, same
+                # scrub. This is the path a STORAGE error takes, i.e. the one
+                # most likely to echo a signed URL or endpoint in its message.
+                {"error_type": type(e).__name__,
+                 "error": redact_for_publication(str(e)),
+                 "source": "drill-scheduled"},
             )
         except Exception:
             _logger.warning("RESTORE_DRILL_FAILED open failed (RuntimeError path)", exc_info=True)
-        raise HTTPException(status_code=503, detail=f"Drill failed: {e}") from e
+        # #3293 review: see the ValueError path above — same public-Actions-log
+        # sink, same boundary scrub.
+        raise HTTPException(
+            status_code=503,
+            detail=f"Drill failed: {redact_for_publication(str(e))}",
+        ) from e
     if result.get("status") == "drill_ok" and not result.get("within_rto", True):
         # Restore succeeded but missed the committed RTO — incident-worthy
         # (restore speed is a target, not an accident).

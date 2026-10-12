@@ -94,6 +94,16 @@ from .projection.entities import (  # #3998: the declared :Source surface
     _SOURCE_SERVER_MANAGED_PROPS,
     filter_source_props,
 )
+# #8006: the `search_keys` flatten rule has ONE home — the projection module that
+# owns the Point prop contract (`_POINT_DECLARED_PROPS` / `_POINT_LIST_PROPS` /
+# `_upsert_point_props`). The SDK write doors below call it under their
+# historical private name, so the three write doors and the replay share ONE
+# implementation instead of two that can drift — which is exactly what #8006
+# was: the SDK doors flattened, the shared projection writer did not, so
+# `EventAPI.add_point` stored NOTHING.
+from .projection.entities import (
+    flatten_search_keys_prop as _flatten_search_keys_prop,
+)
 from .projection import _ANNOTATOR_PROPS as _ANNOTATOR_PROP_NAMES
 from .projection import _ENTITY_ID_PROP  # #3998: the write's own Source predicate
 from .projection import is_missing_graph_error  # #2163: absent-graph family == success
@@ -2989,32 +2999,12 @@ def _sanitize_props(props: dict, *, reject_id: bool = False) -> dict:
     return props
 
 
-def _flatten_search_keys_prop(props: dict) -> None:
-    """R2 (#1541) D3: search_keys must be a FLAT space-joined STRING in the
-    graph — FalkorDB's fulltext index (``db.idx.fulltext.createNodeIndex``)
-    does NOT index array-valued properties (verified on server v4.16.7: a
-    list-valued search_keys never matches, the flat string does). E3's
-    canonical payload keeps the list (commit_schema pins ``list[str]`` and
-    E3's persistence tests assert the list at the node); the GRAPH value is
-    flattened here — a cross-lane deviation the R2 plan pre-authorized with
-    an owner flag (plan D3: "R2 normalizes at index time via ' '.join(...) in
-    the projection"). The FTS index then matches unqualified query tokens
-    against content ∪ search_keys — the issue's "question ∪ search_keys"
-    query expansion, at the index level.
-
-    No-op for str values, None, and absent keys (absent search_keys → no
-    prop written, the pre-E3 shape). An empty list drops the prop (E3's
-    ``or None`` convention).
-    """
-    sk = props.get("search_keys")
-    if sk is None:
-        return
-    if isinstance(sk, (list, tuple)):
-        flat = " ".join(str(s).strip() for s in sk if str(s).strip())
-        if flat:
-            props["search_keys"] = flat
-        else:
-            props.pop("search_keys", None)
+# R2 (#1541) D3: `_flatten_search_keys_prop` used to be DEFINED here. It now
+# lives with the Point prop contract it serves — `tortoise/projection/
+# entities.py::flatten_search_keys_prop`, imported at the top of this module —
+# because the SHARED projection writer (`_upsert_point_props`) is the door every
+# write reaches and it needs the same rule (#8006). `create_point`,
+# `update_point` and `update_entity` still call it here, under this name.
 
 
 def _coerce_props(props: dict) -> dict:
@@ -4567,6 +4557,29 @@ def _installed_namespaces_for_gate(sdk) -> frozenset[str] | None:
     return graph_installed_namespaces(sdk)
 
 
+def _read_stored_number(value, default):
+    """Coerce a STORED numeric property for display/sorting; never raise (#6151).
+
+    ``annotator_*`` and ``mitigation_strength`` are writable through the generic
+    entity surface, which does not validate, so a stored string or an int past
+    float range reaches the readers. ``weights.compute_operator_weight`` degrades
+    such a value to a harmless default rather than aborting the run, and the state
+    readers must hold the SAME contract: they read the same two properties, and
+    `recall_state` is an agent-facing path, so one malformed row would otherwise
+    make every state query touching that operator raise while the weight read on
+    the identical input succeeded.
+
+    ``default`` is the caller's own "nothing usable here" value, because the two
+    sites disagree on it on purpose: a rating falls back to the neutral term (the
+    value an unrated operator yields), while a mitigation strength falls back to
+    ``None`` (the value an absent strength yields).
+    """
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 class TortoiseSDK:
     """Layer 1 facade for Tortoise epistemic graph interaction.
 
@@ -5765,10 +5778,6 @@ class TortoiseSDK:
                 # (would make the `if props:` guard always truthy and bump
                 # updatedAt on every dedup hit, #80 review).
                 props.pop("content_hash", None)
-                if credibility is not None:
-                    _logger.warning(
-                        "credibility=%r ignored — point %s already exists and dedup=True",
-                        credibility, pid)
                 # #3263 (review P1): `extractedFrom` must NOT ride the
                 # update_point prop path on a dedup hit. update_point writes the
                 # node property but never calls _link_source, so the Point would
@@ -5826,6 +5835,54 @@ class TortoiseSDK:
                     # P2-1: re-capture would churn confidence for every point).
                     props["updatedAt"] = now
                     self.update_point(pid, **props)
+                # #7980: an authored ``credibility`` is a WRITE, not a no-op.
+                # This path used to log-and-drop it, so a caller that supplied
+                # one got HTTP 200 back on a point that has NO baseline: not
+                # EP-able, and the fail-closed #344/#1157 calibration gate then
+                # refuses the whole graph (`/v1/dream` errors). That is the
+                # #4032 silent-false-green shape, on the field #7909 added to
+                # BOTH REST surfaces — and on self-host it was the DEFAULT path
+                # (``selfhost_api.CreatePointRequest.dedup`` defaults True).
+                #
+                # FIRST-WRITER-WINS: the prior is applied only while the
+                # existing point has none. That is the contract this suite
+                # already pins (tests/test_sdk_dedup.py::
+                # test_dedup_with_extra_props — "must not overwrite the
+                # existing baseline"), and it follows #844: a set baseline is
+                # IMMUTABLE evidence, so a dedup hit — which matches by
+                # CONTENT HASH, and so may be an unrelated writer stating a
+                # different belief — never rewrites the one already there. A
+                # point that does carry one keeps it and SAYS SO, loudly:
+                # never a silent drop. Consistency: ``confidence`` (a plain
+                # prop) is already applied on a dedup hit, and
+                # ``mitigate_operator``'s idempotent path applies an authored
+                # belief to an existing point rather than dropping it.
+                if cred_prior is not None:
+                    _existing = self.get_point(pid)
+                    if not _existing.get("baseline_set"):
+                        self.set_point_baseline(
+                            pid, cred_prior[0], cred_prior[1],
+                            source=BASELINE_SOURCE_SET_BY_AUTHOR)
+                    elif (_existing.get("baseline_source"),
+                          _existing.get("ep_alpha"),
+                          _existing.get("ep_beta")) != (
+                              BASELINE_SOURCE_SET_BY_AUTHOR,
+                              cred_prior[0], cred_prior[1]):
+                        # Nothing was dropped when the point ALREADY carries
+                        # exactly this author-stated prior — the self-host
+                        # default path makes that the NORMAL idempotent retry,
+                        # and a WARNING on every healthy retry is how a
+                        # warning stops being read. The provenance token is
+                        # compared too: an equal-valued baseline that is
+                        # INHERITED (or a legacy token-less row) is still a
+                        # different claim, and inheritance will recompute it.
+                        _logger.warning(
+                            "credibility=%r not applied — point %s already "
+                            "exists with a %r baseline, and a dedup hit never "
+                            "overwrites the baseline a point already carries "
+                            "(#7980, #844)",
+                            credibility, pid,
+                            _existing.get("baseline_source"))
                 return self.get_point(pid)
 
         # Issue #52 — warn when caller passes an explicit non-ULID id
@@ -10883,12 +10940,36 @@ class TortoiseSDK:
                           consistency: float, directness: float) -> dict:
         """Annotate an operator Point with structured epistemic dimensions.
 
+        These dimensions are not inert: they modulate the operator's EP weight in a
+        symmetric bounded band, so a well-rated connection counts for MORE than an
+        unrated one and the worst-rated for less. Leaving them unset is exactly
+        neutral (factor 1.0) and is the default — set them only to express a
+        deliberate judgement about the connection's quality.
+
         Args:
             id: Operator Point ID (must have is_operator=true).
             bias: 0-1, how much hidden stake/additional interest beyond stated position.
-            precision: 0-1, how narrow/well-defined the relevance claim is.
-            consistency: 0-1, how stable this relevance is across contexts.
-            directness: 0-1, how directly the source bears on the target.
+                INVERTED: higher bias means LESS weight, because a one-sided source
+                should count for less than a disinterested one.
+            precision: 0-1, how narrow/well-defined the relevance claim is (higher = more weight).
+            consistency: 0-1, how stable this relevance is across contexts (higher = more weight).
+            directness: 0-1, how directly the source bears on the target (higher = more weight).
+
+        The four are averaged (never multiplied), so rating one well cannot penalise
+        the others, and a partial rating moves the weight only as far as that
+        dimension justifies. Do not use these to disagree with a connection — that is
+        NAND's job; use them to grade how much the connection contributes. A rating
+        does not require a source.
+
+        HOW FAR IT MOVES depends on the operator's base weight, because the rating
+        multiplies the base and the result is then clamped to ``[0.1, 10.0]``. A
+        NAND starts at 8.0 and DOUBLES when it targets another operator, so a
+        best-rated operator-targeting NAND is clamped both before and after the
+        rating and gains NOTHING; even a top-level NAND gains only 1.25x
+        (8.0 -> 16.0 -> clamped to 10.0). On an ordinary IMPL the base is 1.0
+        (2.0 when operator-targeting), and the band applies in full there. So the
+        band is exact near the low end of the range and compresses as the base
+        approaches the ceiling — a rating on a contradiction is rarely worth much.
 
         Raises ValueError if id not found, not an operator, or dims out of [0,1].
         """
@@ -20659,18 +20740,26 @@ class TortoiseSDK:
         """
         if not point_ids:
             return {}, {}
+        # The ranking default is the weight mechanism's own neutral constant, not a
+        # literal: a literal here would silently disagree with the weight the same
+        # dimension produces if that constant ever moves (#6151). Imported locally
+        # because `weights` is a leaf module this file otherwise does not need.
+        from tortoise.weights import ANNOTATION_TERM_NEUTRAL
+
         rows = self._get_proj().g.query(
             "MATCH (op:Point {is_operator:true})-[r:IMPL|NAND|hasPart]-(n:Point) "
             "WHERE n.id IN $ids "
             "RETURN n.id, op.id, op.label, op.op_type, "
-            "  coalesce(op.annotator_precision, op.precision, 0.5), type(r)",
-            params={"ids": point_ids},
+            "  coalesce(op.annotator_precision, op.precision, $n), type(r)",
+            params={"ids": point_ids, "n": ANNOTATION_TERM_NEUTRAL},
         ).result_set
         args: dict[str, list[dict]] = {}
         nands: dict[str, list[dict]] = {}
         for nid, op_id, label, op_type, precision, rel in rows:
             op = {"id": op_id, "label": label or "", "op_type": op_type or "",
-                  "precision": round(float(precision), 4), "mechanism": rel}
+                  "precision": round(
+                      _read_stored_number(precision, ANNOTATION_TERM_NEUTRAL), 4),
+                  "mechanism": rel}
             if rel == "NAND":
                 nands.setdefault(nid, []).append(op)
             else:
@@ -20704,7 +20793,8 @@ class TortoiseSDK:
         for op_id, mid, content, strength in rows:
             out.setdefault(op_id, []).append(
                 {"id": mid, "content": content or "",
-                 "strength": float(strength) if strength is not None else None})
+                 "strength": None if strength is None
+                 else _read_stored_number(strength, None)})
         # Attach under the owning result point (via its surfaced operator).
         # Dedup: an operator can appear in BOTH arguments and nands for the
         # same target (mixed IMPL+NAND edges) — mitigations must not double.
