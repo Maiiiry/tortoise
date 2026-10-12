@@ -36,6 +36,7 @@ from tortoise.mcp_auth import (_current_org_id, _current_org_limits,
 # FastAPI app — and a patch of the canonical constant reaches this surface.
 from tortoise import mcp_auth as _mcp_auth
 from tortoise import embed_metering as _embed_metering  # #4488 encode measurement
+from tortoise import retrieval_metering as _retrieval_metering  # #4489 retrieval measurement
 
 _log = logging.getLogger(__name__)
 
@@ -835,6 +836,14 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
         return await _original_call_tool(name, arguments, version=version,
                                          run_middleware=False, task_meta=task_meta)
     org_id = _current_org_id.get() or ""
+    # #4489: bind the org to this request's RETRIEVAL tally. The hosted ASGI
+    # boundary that arms and flushes it cannot see the ``mcp_auth`` ContextVar
+    # this lane resolves the org in, so an MCP retrieval would otherwise be
+    # written to the honest-but-empty unattributed row. This is the single
+    # dispatch point for every client tool call (read and write), so one bind
+    # here covers the whole MCP read surface. A no-op when no tally is armed
+    # (stdio) and for an unresolved org.
+    _retrieval_metering.bind_org(org_id)
     # #2050: budget BEFORE the scope gate — the REST twin charges before its
     # scope check too, so the two surfaces agree on what consumes budget.
     await _check_mcp_op_budget(name, org_id)

@@ -88,6 +88,9 @@ from tortoise.file_indexer import (  # #4005 shared identity primitives
     derive_session_source_url,
     provenance_basename,
 )
+from tortoise.retrieval_metering import (  # #4489: pure-ASGI retrieval-work flusher
+    RetrievalMeteringMiddleware as _RetrievalMeteringMiddleware,
+)
 from tortoise.graph_ops import (  # #3359: per-capture graph-op accounting
     GraphOpsCounter,
     counts_capture_ops_async,
@@ -3629,6 +3632,18 @@ class InFlightMiddleware:
             workload_exit()
 
 
+# #4489: the RETRIEVAL work boundary. Registered on the same seat as the embed
+# boundary below it — inside ``InFlightMiddleware`` and therefore inside the
+# WaitBound-owned task, and outside every route — for the same reason: a request
+# the transport bound refuses must not be credited with retrieval work. It arms
+# EVERY HTTP method (a read is a GET as well as a POST; the embed boundary arms
+# non-GET only because an encode is a write-lane activity), takes the tally in a
+# ``finally`` with NO early return (a return there would discard the app's own
+# exception), and flushes OFF the loop. The org comes from
+# ``scope["state"]["org_id"]`` at flush time — the auth-written dict, never a
+# client-supplied header — and an MCP call, whose org lives in a ContextVar this
+# layer cannot see, is bound by ``mcp_server._wrapped_call_tool`` instead.
+app.add_middleware(_RetrievalMeteringMiddleware)
 app.add_middleware(_EmbedMeteringMiddleware)
 app.add_middleware(InFlightMiddleware)
 
@@ -6780,6 +6795,20 @@ class OrgInfoResponse(BaseModel):
     #: Sticky: TRUE once two different encoder identities were seen in the
     #: window. A figure that silently averaged two models would be unusable.
     embed_identity_mixed: bool = False
+    # #4489: per-org RETRIEVAL work for the current period — the read-side cost
+    # base behind the `reads_free` decision (`product/pricing.json`). WORKLOAD,
+    # not a price: nothing here can bill, cap or throttle. Read next to
+    # `write_ops_used` above (indicator 3's read/write split) and to `embed_*`
+    # (the encode half of the SAME reads). Additive + defaulted, so every
+    # existing consumer of this response is unaffected; a fresh org reads zeros
+    # (the MERGE creates the row on first write).
+    retrieval_queries: int = 0
+    retrieval_leg_runs: int = 0
+    retrieval_leg_degraded: int = 0
+    retrieval_wall_ms: float = 0.0
+    retrieval_leg_fts: int = 0
+    retrieval_leg_vector: int = 0
+    retrieval_leg_structural: int = 0
 
 
 # ── Billing: Checkout + Portal request/response models (#310, Task 5) ───────
@@ -8891,14 +8920,16 @@ async def org_info(org: dict = Depends(get_current_org_session_ungated)):  # noq
     #
     # All three degrade internally to a zero view (never raising), so the
     # best-effort contract is unchanged by where they run.
-    from tortoise.metering import get_ask_usage, get_current_usage, get_embedding_usage
+    from tortoise.metering import (get_ask_usage, get_current_usage,
+                                   get_embedding_usage, get_retrieval_usage)
 
     def _read_usage():
         oid = org["org_id"]
         return (get_current_usage(oid), get_ask_usage(oid),
-                get_embedding_usage(oid))
+                get_embedding_usage(oid), get_retrieval_usage(oid))
 
-    usage, ask_usage, embed_usage = await asyncio.to_thread(_read_usage)
+    usage, ask_usage, embed_usage, retrieval_usage = await asyncio.to_thread(
+        _read_usage)
 
     return OrgInfoResponse(
         org_id=org["org_id"],
@@ -8950,6 +8981,18 @@ async def org_info(org: dict = Depends(get_current_org_session_ungated)):  # noq
         embed_revision=embed_usage.get("embed_revision"),
         embed_identity_mixed=bool(
             embed_usage.get("embed_identity_mixed", False)),
+        # #4489: retrieval workload for the current period — the read-side cost
+        # base. The read degrades to the zero view on failure (never 500), so a
+        # fresh org renders zeros rather than an error.
+        retrieval_queries=retrieval_usage.get("retrieval_queries", 0),
+        retrieval_leg_runs=retrieval_usage.get("retrieval_leg_runs", 0),
+        retrieval_leg_degraded=retrieval_usage.get(
+            "retrieval_leg_degraded", 0),
+        retrieval_wall_ms=retrieval_usage.get("retrieval_wall_ms", 0.0),
+        retrieval_leg_fts=retrieval_usage.get("retrieval_leg_fts", 0),
+        retrieval_leg_vector=retrieval_usage.get("retrieval_leg_vector", 0),
+        retrieval_leg_structural=retrieval_usage.get(
+            "retrieval_leg_structural", 0),
         # #1082 (PR1): anon flag drives the dashboard claim card — the shared
         # is_anon_org predicate (Supabase mode only; registry = False).
         anon=_org_is_anon(org["org_id"]),

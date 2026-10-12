@@ -252,6 +252,12 @@ surfaces:
   # the writer in tortoise/metering.py, so a change to EITHER must run it — a
   # registration in only one surface would leave the other silently unguarded.
   - test_embed_metering.py
+  # #4489: retrieval measurement. Dual-registered with `core` — the leg hooks live
+  # in tortoise/search_engine.py and the funnel note in tortoise/sdk.py (both
+  # `core`-selecting), while the writer is tortoise/metering.py and the render +
+  # middleware are tortoise/hosted_api.py (both `api`). A registration in only one
+  # surface would leave the other silently unguarded.
+  - test_retrieval_metering.py
   # #3981: dual-registered with `core` for the same reason as test_boot_regressions.py
   # above. `api` is an exact-surface match that REPLACES the `core` fallback, so a
   # tortoise/hosted_api.py-only change would otherwise never run this file — which
@@ -1175,6 +1181,7 @@ surfaces:
   - test_dry_run_preview.py
   - test_cmux_dispatch.py
   - test_embed_metering.py   # #4488: the tally/middleware/hook + the registry-lane writer/reader (dual with `api`/`eval`)
+  - test_retrieval_metering.py   # #4489: the retrieval dimension — tally/boundaries/leg hooks + the registry-lane writer/reader (dual with `api`)
   - test_embedder_provision.py
   - test_embedding_model_required.py   # #4861: the REQUIRED-embedder contract (core: embeddings.py + exceptions.py)
   - test_hermetic_egress_guard.py  # #4387: pins the suite-wide egress guard installed by tests/conftest.py — a conftest change already forces `full`, so this registration exists to keep the guard's own file in the surface it protects

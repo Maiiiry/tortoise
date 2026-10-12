@@ -662,6 +662,51 @@ class FakeControlPlane:
                              "embed_identity_mixed": bool(
                                  p.get("p_identity_mixed"))})
             return None
+        if fn == "metering_increment_retrieval":
+            # #4489: the retrieval lane's additive upsert on the SAME
+            # ``(org_id, period_start)`` row (migration
+            # 20261012000001_metering_retrieval_columns). ADDITIVE here and
+            # NOTHING more — the sibling gauge arm below exists precisely
+            # because a test that cannot tell a gauge from an increment cannot
+            # catch a double-count.
+            p = body or {}
+            # Mirror the SQL's degenerate-window guard: the real RPC RAISES
+            # before the INSERT, so without this the fake would accept a window
+            # production refuses, and a test would pass on behaviour that cannot
+            # happen (the SQL never executes in CI — this fake is the only
+            # behavioural proxy for the lane).
+            _ps, _pe = _as_dt(p.get("p_period_start")), _as_dt(
+                p.get("p_period_end"))
+            if _ps is not None and _pe is not None and _pe <= _ps:
+                raise RuntimeError(
+                    "metering_increment_retrieval: period_end must be after "
+                    "period_start")
+            rows = self.tables.setdefault("metering_records", [])
+            row = next((r for r in rows if r["org_id"] == p.get("p_org_id")
+                        and r.get("period_start") == p.get("p_period_start")),
+                       None)
+            values = {
+                "retrieval_queries": int(p.get("p_queries") or 0),
+                "retrieval_leg_runs": int(p.get("p_leg_runs") or 0),
+                "retrieval_leg_degraded": int(p.get("p_leg_degraded") or 0),
+                "retrieval_wall_ms": float(p.get("p_wall_ms") or 0.0),
+                "retrieval_leg_fts": int(p.get("p_leg_fts") or 0),
+                "retrieval_leg_vector": int(p.get("p_leg_vector") or 0),
+                "retrieval_leg_structural": int(
+                    p.get("p_leg_structural") or 0),
+            }
+            if row:
+                _refresh_period_end(row, p)
+                for key, value in values.items():
+                    row[key] = row.get(key, 0) + value
+            else:
+                rows.append({"org_id": p.get("p_org_id"),
+                             "period_start": p.get("p_period_start"),
+                             "period_end": p.get("p_period_end"),
+                             "period": _metering_period_label(
+                                 p.get("p_period_start")),
+                             **values})
+            return None
         if fn == "metering_set_graph_storage":
             # #5331: migration 20261001000005_metering_graph_storage.sql — a GAUGE SETTER mirroring the SQL
             # RPC. The fake must OVERWRITE (``= EXCLUDED`` semantics), not add:

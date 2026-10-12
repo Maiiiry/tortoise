@@ -53,6 +53,10 @@ from .commit_ops import OBJECT_TERMINAL_STATUSES as _OBJECT_TERMINAL_STATUSES
 # `_update_entity`. Imported so neither surface re-literals the vocabulary.
 from .commit_ops import SUBJECT_STATUS_VALUES as _SUBJECT_STATUS_VALUES
 from .env_truthy import env_flag, is_truthy  # #4097: the declared truthy contract
+# #4489: the RETRIEVAL dimension's hot-path note. Module-level (not lazy): the
+# module imports stdlib only, so there is no cycle to avoid, and a lazy import
+# would sit inside the measured window.
+from .retrieval_metering import note_query as _note_retrieval_query
 from .ids import ulid
 from .live import TERMINAL_EXCLUDED_STATUSES  # EP terminal vocabulary (shared)
 from .live import _live_only  # #6597 dream coverage closure mirrors EP liveness
@@ -18826,6 +18830,12 @@ class TortoiseSDK:
             `_get_proj()` failure returns before any of these paths. So the
             store is known to be DECLARED and to have ANSWERED, and
             ``configured=True`` / ``reached=True`` are facts, not defaults.
+
+            #4489: this closure is ALSO the retrieval dimension's ONE query
+            note — it wraps every terminal return of the funnel, so the query
+            count and the wall time are recorded exactly once per served read
+            (the only paths that skip it are the ones that returned BEFORE a
+            leg ran: a store that would not open, or a probe that failed).
             """
             if read_status_out is not None:
                 read_status_out["status"] = _classify_leg_trace(
@@ -18834,7 +18844,17 @@ class TortoiseSDK:
                     reached=True)
                 if _caller_trace is not None and _caller_trace is not status_trace:
                     _caller_trace.extend(status_trace or ())
+            # #4489: total and unarmed-safe — an unarmed process pays one
+            # ContextVar read, and a fault here can never fail the read.
+            _note_retrieval_query(
+                wall_ms=(_monotonic() - _retrieval_t0) * 1000.0)
             return rows
+
+        # #4489: the retrieval window opens HERE — after the input validation
+        # above (an argument error is a refused call, not a served read) and
+        # before the first store touch, so the figure covers the store probe,
+        # every leg, the fusion and the post-processing the funnel does.
+        _retrieval_t0 = _monotonic()
 
         try:
             proj = self._get_proj()
