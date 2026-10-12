@@ -41,11 +41,12 @@ console.log("summary table (#4481 — the reported page)");
   const html = renderMarkdown(md);
   assertEq(
     html,
-    "<table><thead><tr><th>Type</th><th>Identity</th><th>Epistemic</th></tr></thead>" +
+    '<div class="table-wrap"><table><thead><tr><th>Type</th><th>Identity</th><th>Epistemic</th></tr></thead>' +
       "<tbody><tr><td>Consumer agents</td><td>✓</td><td>~</td></tr>" +
-      "<tr><td>Coding harnesses</td><td>✓</td><td>~</td></tr></tbody></table>",
+      "<tr><td>Coding harnesses</td><td>✓</td><td>~</td></tr></tbody></table></div>",
     "a table cell containing \\~ renders the bare tilde",
   );
+  assert(html.includes('<div class="table-wrap">'), "wide tables sit in a horizontally scrollable wrapper");
   assert(!html.includes("\\~"), "no escape backslash survives into the table HTML");
 }
 
@@ -132,6 +133,100 @@ console.log("regression — raw HTML stays escaped (stored-XSS contract)");
   const html = renderMarkdown("<script>alert(1)</script>");
   assert(!html.includes("<script>"), "no <script> element is emitted from body text");
   assert(html.includes("&lt;script&gt;"), "raw HTML is entity-escaped");
+}
+
+// ── Heading anchors, table of contents, callouts (#8291) ──────────────────
+console.log("heading anchors (#8291 — a TOC link needs a real target)");
+{
+  assertEq(
+    renderMarkdown("## What is agent memory—and what isn't it?"),
+    '<h2 id="what-is-agent-memory-and-what-isnt-it">What is agent memory—and what isn&#39;t it?</h2>',
+    "a heading gets a slug id derived from its text",
+  );
+  assertEq(
+    renderMarkdown("### Cost & latency"),
+    '<h3 id="cost-and-latency">Cost &amp; latency</h3>',
+    "punctuation collapses to a single dash and `&` becomes `and`",
+  );
+  assertEq(
+    renderMarkdown("## One\n\n## One"),
+    '<h2 id="one">One</h2>\n<h2 id="one-1">One</h2>',
+    "duplicate headings get unique ids",
+  );
+  assertEq(
+    renderMarkdown("## **Bold** and `code`"),
+    '<h2 id="bold-and-code"><strong>Bold</strong> and <code>code</code></h2>',
+    "the slug comes from heading TEXT, the heading keeps its markup",
+  );
+}
+
+console.log("heading ids cannot carry markup out of the attribute");
+{
+  const html = renderMarkdown("## <img src=x onerror=alert(1)>");
+  assertEq(
+    html,
+    '<h2 id="img-src-x-onerror-alert-1">&lt;img src=x onerror=alert(1)&gt;</h2>',
+    "a heading containing raw HTML yields an inert id and an escaped body",
+  );
+  assert(!/id="[^"]*<img/.test(html), "no raw markup is interpolated into the id attribute");
+}
+
+console.log("table of contents (#8291 — cannot drift from the headings)");
+{
+  const md = ["[[toc]]", "", "## First section", "", "### A sub-heading", "", "## Second section"].join("\n");
+  const html = renderMarkdown(md);
+  assertEq(
+    html.split("\n")[0],
+    '<nav class="toc" aria-label="Table of contents"><ol>' +
+      '<li><a href="#first-section">First section</a></li>' +
+      '<li><a href="#second-section">Second section</a></li></ol></nav>',
+    "[[toc]] expands to a linked list of the H2 headings",
+  );
+  assert(!html.includes("#a-sub-heading"), "sub-headings stay out of the top-level list");
+  assert(html.includes('<h3 id="a-sub-heading">'), "sub-headings still get an anchor of their own");
+  assert(
+    renderMarkdown("\\[\\[toc\\]\\]\n\n## One").includes('<nav class="toc"'),
+    "the editor's backslash-escaped form of the marker is recognised too",
+  );
+  assert(!renderMarkdown("## One").includes('<nav class="toc"'), "no marker means no TOC is injected");
+}
+
+console.log("callouts (#8291 — the answer box needs a real primitive)");
+{
+  assertEq(
+    renderMarkdown("> [!ANSWER] Agent memory is any system that retains information."),
+    '<aside class="callout callout-answer"><p class="callout-label">Quick answer</p>' +
+      "<p>Agent memory is any system that retains information.</p></aside>",
+    "> [!ANSWER] renders an answer box, not a quote",
+  );
+  assert(
+    renderMarkdown("> \\[!ANSWER\\] Short.").includes('callout-answer'),
+    "the editor's escaped alert marker is recognised",
+  );
+  assert(
+    renderMarkdown("> [!WARNING] Careful.").includes('callout callout-warning'),
+    "[!WARNING] gets its own modifier class",
+  );
+  assertEq(
+    renderMarkdown("> [!NOPE] Just a quote."),
+    "<blockquote>[!NOPE] Just a quote.</blockquote>",
+    "an unrecognised marker degrades to an ordinary blockquote",
+  );
+  const multi = renderMarkdown("> [!NOTE] Line one\n> line two");
+  assert(multi.includes("Line one line two"), "a multi-line alert body stays one paragraph");
+  assert(
+    renderMarkdown("> [!ANSWER] **Bold** claim.").includes("<strong>Bold</strong>"),
+    "inline markdown inside an alert body still renders",
+  );
+}
+
+console.log("regression — a plain blockquote is untouched by the callout path");
+{
+  assertEq(
+    renderMarkdown("> Just a quote."),
+    "<blockquote>Just a quote.</blockquote>",
+    "an ordinary blockquote still renders as <blockquote>",
+  );
 }
 
 console.log("");

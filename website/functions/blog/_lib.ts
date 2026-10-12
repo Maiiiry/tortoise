@@ -171,11 +171,74 @@ function inline(text: string): string {
   return out;
 }
 
+// ── Headings, table of contents, callouts ──────────────────────────────────
+// A heading gets a stable `id` so an in-article table of contents (and a shared
+// deep link) has a real target. The slug is derived from the heading's TEXT, so
+// it never depends on surrounding markup, and it is restricted to [a-z0-9-] —
+// the only characters that may appear in an unescaped HTML attribute.
+
+const HEADING_SLUG_MAX = 80;
+
+/** Markdown → plain text (for slugs and TOC labels). Input is RAW markdown, so
+ *  this strips markdown — it must never be handed escaped HTML. */
+function plainText(md: string): string {
+  return unescapeMd(md)
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // image → alt text
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // link → link text
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)(.*?)\1/g, "$2")
+    .replace(/~~(.*?)~~/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Heading text → URL-safe anchor id. Empty results fall back to "section". */
+function slugifyHeading(md: string): string {
+  const slug = plainText(md)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/['\u2019]/g, "") // apostrophes vanish: isn't → isnt
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, HEADING_SLUG_MAX)
+    .replace(/-+$/g, "");
+  return slug || "section";
+}
+
+// GitHub-style alerts: `> [!ANSWER]` / `[!NOTE]` / `[!TIP]` / `[!WARNING]`.
+// TipTap backslash-escapes the brackets, so the pattern tolerates `\[`.
+const MD_ALERT_RE = /^\\?\[!(\w+)\\?\]\s*(.*)$/;
+const MD_ALERTS: Record<string, { slug: string; label: string }> = {
+  ANSWER: { slug: "answer", label: "Quick answer" },
+  KEY: { slug: "key", label: "Key takeaways" },
+  TAKEAWAY: { slug: "key", label: "Key takeaways" },
+  TAKEAWAYS: { slug: "key", label: "Key takeaways" },
+  NOTE: { slug: "note", label: "Note" },
+  TIP: { slug: "tip", label: "Tip" },
+  IMPORTANT: { slug: "important", label: "Important" },
+  WARNING: { slug: "warning", label: "Warning" },
+};
+
+// Table-of-contents placeholder. Replaced after every heading is known, so the
+// list can never drift from the headings it points at.
+const MD_TOC_RE = /^\\?\[\\?\[\s*toc\s*\\?\]\\?\]$/i;
+
 export function renderMarkdown(markdown: string): string {
   const paragraphBuf: string[] = []; // per-render buffer (no cross-render leakage)
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   const out: string[] = [];
+  const tocEntries: { level: number; id: string; text: string }[] = [];
+  const slugCounts = new Map<string, number>();
+  let tocIndex = -1;
   let i = 0;
+
+  // Duplicate headings get `-1`, `-2`, … so every id stays unique and stable.
+  const uniqueSlug = (base: string): string => {
+    const n = slugCounts.get(base) ?? 0;
+    slugCounts.set(base, n + 1);
+    return n === 0 ? base : `${base}-${n}`;
+  };
 
   const flushPara = (buf: string[]): void => {
     if (buf.length) out.push(`<p>${inline(buf.join("\n"))}</p>`);
@@ -184,6 +247,15 @@ export function renderMarkdown(markdown: string): string {
 
   while (i < lines.length) {
     const line = lines[i];
+
+    // Table-of-contents placeholder (filled in once every heading is known)
+    if (MD_TOC_RE.test(line.trim())) {
+      flushPara(paragraphBuf);
+      tocIndex = out.length;
+      out.push("");
+      i++;
+      continue;
+    }
 
     // Fenced code block
     if (/^```/.test(line)) {
@@ -204,7 +276,10 @@ export function renderMarkdown(markdown: string): string {
     if (h) {
       flushPara(paragraphBuf);
       const level = h[1].length;
-      out.push(`<h${level}>${inline(h[2])}</h${level}>`);
+      const text = h[2];
+      const id = uniqueSlug(slugifyHeading(text));
+      tocEntries.push({ level, id, text });
+      out.push(`<h${level} id="${escapeHtml(id)}">${inline(text)}</h${level}>`);
       i++;
       continue;
     }
@@ -217,7 +292,22 @@ export function renderMarkdown(markdown: string): string {
         buf.push(lines[i].replace(/^>\s?/, ""));
         i++;
       }
-      out.push(`<blockquote>${inline(buf.join(" "))}</blockquote>`);
+      const alert = MD_ALERT_RE.exec(buf[0] ?? "");
+      const kind = alert ? MD_ALERTS[alert[1].toUpperCase()] : undefined;
+      if (kind && alert) {
+        const body = [alert[2], ...buf.slice(1)]
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .join(" ");
+        out.push(
+          `<aside class="callout callout-${kind.slug}">` +
+            `<p class="callout-label">${escapeHtml(kind.label)}</p>` +
+            (body ? `<p>${inline(body)}</p>` : "") +
+            `</aside>`,
+        );
+      } else {
+        out.push(`<blockquote>${inline(buf.join(" "))}</blockquote>`);
+      }
       continue;
     }
 
@@ -256,8 +346,8 @@ export function renderMarkdown(markdown: string): string {
         i++;
       }
       out.push(
-        `<table><thead><tr>${headerCells.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead>` +
-        `<tbody>${bodyRows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`,
+        `<div class="table-wrap"><table><thead><tr>${headerCells.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead>` +
+        `<tbody>${bodyRows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`,
       );
       continue;
     }
@@ -280,6 +370,16 @@ export function renderMarkdown(markdown: string): string {
     i++;
   }
   flushPara(paragraphBuf);
+
+  if (tocIndex !== -1) {
+    // H2 only — the article's section structure, matching the author's intent.
+    const top = tocEntries.filter((e) => e.level === 2);
+    out[tocIndex] = top.length
+      ? `<nav class="toc" aria-label="Table of contents">` +
+        `<ol>${top.map((e) => `<li><a href="#${escapeHtml(e.id)}">${inline(e.text)}</a></li>`).join("")}</ol>` +
+        `</nav>`
+      : "";
+  }
 
   return out.join("\n");
 }
@@ -368,18 +468,33 @@ h1.art-title{font-family:var(--serif);font-size:40px;line-height:1.2;color:#fff;
 .share-bar a:hover,.share-bar button:hover{color:var(--accent);border-color:var(--accent)}
 .cover-img{margin:24px 0;border-radius:12px;border:1px solid var(--border);min-height:320px;background-size:cover;background-position:center;background-color:#0e7490}
 .art-body{font-size:15px;line-height:1.75;color:var(--text)}
-.art-body h2{font-family:var(--serif);font-size:26px;color:#fff;font-weight:400;margin:40px 0 14px}
-.art-body h3{font-family:var(--serif);font-size:20px;color:#fff;font-weight:400;margin:28px 0 10px}
-.art-body h4{font-family:var(--serif);font-size:17px;color:#fff;font-weight:400;margin:22px 0 8px}
+.art-body h2{font-family:var(--serif);font-size:26px;color:#fff;font-weight:400;margin:40px 0 14px;scroll-margin-top:84px}
+.art-body h3{font-family:var(--serif);font-size:20px;color:#fff;font-weight:400;margin:28px 0 10px;scroll-margin-top:84px}
+.art-body h4{font-family:var(--serif);font-size:17px;color:#fff;font-weight:400;margin:22px 0 8px;scroll-margin-top:84px}
 .art-body p{margin:14px 0}
 .art-body ul,.art-body ol{margin:14px 0 14px 22px}
 .art-body li{margin:6px 0}
 .art-body blockquote{border-left:2px solid var(--accent);padding-left:16px;color:var(--text-dim);margin:20px 0;font-style:italic}
+.art-body .toc{border:1px solid var(--border);border-radius:10px;background:var(--bg-soft);padding:18px 24px;margin:22px 0}
+.art-body .toc ol{margin:0 0 0 20px}
+.art-body .toc li{margin:5px 0}
+.art-body .toc a{color:var(--text);text-decoration:none;border-bottom:1px solid transparent;transition:color .15s,border-color .15s}
+.art-body .toc a:hover{color:var(--accent);border-bottom-color:var(--accent)}
+.art-body .callout{border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:10px;background:var(--bg-soft);padding:18px 20px;margin:22px 0;font-style:normal}
+.art-body .callout-label{margin:0 0 6px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:600}
+.art-body .callout p:last-child{margin-bottom:0}
+.art-body .callout-note{border-left-color:#64748b}.art-body .callout-note .callout-label{color:#94a3b8}
+.art-body .callout-tip{border-left-color:#22c55e}.art-body .callout-tip .callout-label{color:#4ade80}
+.art-body .callout-important{border-left-color:#8b5cf6}.art-body .callout-important .callout-label{color:#a78bfa}
+.art-body .callout-warning{border-left-color:#f59e0b}.art-body .callout-warning .callout-label{color:#fbbf24}
 .art-body code{background:#0b1220;border:1px solid var(--border);padding:1px 6px;border-radius:4px;font-size:13px;color:#4ade80}
 .art-body pre{background:#0b1220;border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;margin:16px 0}
 .art-body pre code{border:0;background:transparent;padding:0;color:inherit}
+.art-body .table-wrap{overflow-x:auto;margin:16px 0}
 .art-body table{border-collapse:collapse;margin:16px 0;width:100%}
+.art-body .table-wrap table{margin:0}
 .art-body th,.art-body td{border:1px solid var(--border);padding:8px 12px;text-align:left}
+.art-body th{background:var(--bg-soft);color:#fff;font-weight:600}
 .art-body img{max-width:100%;border-radius:8px;border:1px solid var(--border);margin:20px 0}
 .art-body hr{border:0;border-top:1px solid var(--border);margin:24px 0}
 .end-note{margin-top:40px;padding:20px;border:1px solid var(--border);border-radius:10px;background:var(--bg-soft);color:var(--text-dim);font-size:13px}
