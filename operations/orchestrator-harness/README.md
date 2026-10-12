@@ -101,8 +101,10 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane. **Append-only — never expires** (see §7.1) |
 | `checked.txt` | issues already pre-flighted; prevents re-running the collision check |
+| `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR |
 | `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
+| `state/parked-<PR>` | terminal state: the fixer cap was reached at the head recorded inside the file, so the sweep skips it until a new push re-arms it |
 | `state/rerun-<PR>-<runid>` | CI re-run already requested for this run — prevents loops |
 | `state/merged-<PR>.done` | merge confirmation |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
@@ -164,6 +166,19 @@ launchctl unload -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 
 `install.sh --uninstall` unloads the agent and removes the plist.
 
+Run the offline self-test first — it needs no network, tmux or git writes, and every check
+corresponds to a defect found in review (each fails on the pre-fix copy):
+
+```bash
+./selftest.sh          # 16 checks: script syntax, exact session matching, fail-closed gate,
+                       # the dispatch gate's load clause, claim atomicity, renderer escaping,
+                       # template/renderer placeholder parity, no credential material
+```
+
+**The gate key only reaches the daemon if it is a FILE.** `install.sh` deliberately does not copy a
+secret into a world-readable plist, and launchd inherits no shell environment — so an env-only
+`AI_REVIEW_GATE_KEY` is reported as insufficient, not as "present". The box cannot merge without it.
+
 ### Tuning (8 GB / 8-core box — the values that were actually used)
 
 | Var | Value | Why |
@@ -188,9 +203,14 @@ after a restart until it was fixed).
 ## 5. Merge policy and safety invariants
 
 1. **The gate is never bypassed.** A merge requires `record-review.sh` to have written a
-   signed marker for the *exact head SHA* into the PR body, and the `ai-review-gate` check to
-   go `SUCCESS`. `merge-one.sh` refuses to merge if the recorded head ≠ the current head, so
+   signed marker for the *exact head SHA* into the PR body, and the `ai-review-gate` check to go
+   **`SUCCESS`** — `SKIPPED`/`NEUTRAL`/absent do **not** count, because that means no signed review
+   exists. `merge-one.sh` refuses to merge if the recorded head ≠ the current head, so
    a post-review push invalidates the evidence automatically.
+1b. **One owner per PR.** Every path into `merge-one.sh` (the lane's `chain-<N>`, a `fix-<PR>`, and
+   the controller's sweep) takes the same atomic `state/mergeclaim-<PR>.lock` first. Without it a
+   freshly opened PR gets two concurrent reviewers racing one head: duplicate evidence comments,
+   duplicate `record-review` writes, and an `ISSUES`/`CLEAN` interleaving.
 2. **The reviewer must state a plain outcome.** Its final line is exactly `CLEAN <comment-url>`
    or `ISSUES <n>`. A CLEAN comment may not contain "issues remain", "NOT CLEAN", or
    "requires human attention" — forbidden phrases, so an equivocal review cannot be laundered
@@ -291,16 +311,36 @@ Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, n
 no way to hand it to another box, and no way to know which of the 14 scripts were live. §9
 records which are live and which are retired.
 
-### 7.4 Other rough edges found while writing this up
+### 7.4 Defects found in the first review of this artifact (all fixed here)
 
-- The pre-fix sweep logged `#<PR> re-record` even when the concurrency cap suppressed the
-  spawn (`{A||B||C;} || D && echo` parses as `({A||B||C} || D) && echo`), so a stalled drain
-  looked busy. Fixed in the shipped `orch-loop.sh`.
-- `[ -z "$WT" ] && { … }` as the last command of a function/script makes the exit status
-  that of the test — a latent trap in two scripts; the shipped `fix-one.sh` ends with a
-  positive `echo` so it no longer leaks a non-zero status.
-- `state/` and `wip/` grow without bound; nothing prunes `merged-*.done`, `needsfix-*`, or
-  `fixcount-*`.
+These are kept as a record because each one is a *failure mode of the design*, not a typo, and
+because `selftest.sh` now pins every one of them:
+
+| Defect | Impact | Fix |
+|---|---|---|
+| `MAX_LOAD` was rendered into the plist and documented as live back-pressure, but never compared to anything | the load ceiling did not exist; a lanes-bound stall logged itself as a load stall | the dispatch gate now tests load first and names the binding gate in `[dispatch] skipped (…)` |
+| `SKIPPED`/`NEUTRAL` counted as satisfying **every** required check, including the merge authority | a skipped `ai-review-gate` read as `GREEN` and the PR merged **without any signed review** — a fail-open on the one gate that matters | the classifier requires explicit `SUCCESS` for `ai-review-gate` (absent counts as failed) |
+| A lane's PR is driven by `chain-<N>`, whose session name the controller's in-flight guard could not see | two concurrent `merge-one.sh` runs per PR: duplicate evidence comments, duplicate `record-review` writes, `ISSUES`/`CLEAN` interleaving | atomic per-PR claim file, honoured by all three paths |
+| `fixcount` was incremented and the findings marker deleted *before* the fixer spawn was attempted | a killed/failed spawn consumed one of `MAX_FIX_TRIES` and destroyed the findings, so no fixer ever ran | spawn first; bookkeep only on success, message the failure otherwise |
+| Reaching `MAX_FIX_TRIES` fell through to the re-record branch | an unfixable PR burned a full fresh-context review **every cycle, forever** | terminal `state/parked-<PR>` state, keyed to the head so a new push re-arms it |
+| `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … | grep -qx`) |
+| `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
+| `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
+| Plist rendered with unescaped `sed` replacements | a `&` in a path expanded to the matched placeholder, producing a *valid* plist pointing at wrong paths (so `plutil -lint` cannot catch it) | escape `\`, `&` and `\|` in every substituted value |
+| `retired/do-merge.sh` logged `rc=$?` after an unquoted `$(date)` | every merge failure logged as `rc=0` | capture the status first |
+| `retired/watch-one.sh` built the fixer prompt from a log the reviewer had not written yet | the fixer always ran against an empty FINDINGS section | build the prompt after the reviewer run |
+| the pre-fix sweep logged `#<PR> re-record` even when the concurrency cap suppressed the spawn (`{A\|\|B\|\|C;} \|\| D && echo` parses as `({A\|\|B\|\|C} \|\| D) && echo`) | a stalled drain looked busy | explicit `if/elif` branches |
+
+### 7.5 Still open, deliberately not fixed here
+
+- **`state/` and `wip/` grow without bound.** Nothing prunes `merged-*.done`, `needsfix-*`,
+  `fixcount-*`, `mergeclaim-*.lock` or expired `rerun-*`. Needs a retention rule rather than an
+  ad-hoc `find -mtime`.
+- **`[ -z "$WT" ] && { … }` as a script's last statement** makes the exit status that of the
+  test. The shipped `fix-one.sh` ends with a positive `echo` so it no longer leaks a non-zero
+  status, but the pattern is easy to reintroduce — a `exit 0` at the end of each script would pin it.
+- **Worktree reaping.** Every dispatch and every foreign-branch fixer adds a worktree; the box
+  carried ~150 by the end of the run. Nothing removes them after their PR merges.
 
 ---
 
@@ -349,6 +389,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
+| `selftest.sh` | offline checks; pins every fixed defect. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
 

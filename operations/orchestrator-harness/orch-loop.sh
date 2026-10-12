@@ -34,6 +34,9 @@ trap 'rm -f "$LOCKF"' EXIT INT TERM
 
 heartbeat() { date +%s > "$O/heartbeat"; }
 load1() { sysctl -n vm.loadavg 2>/dev/null | awk '{print int($2)}'; }
+# Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
+# would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
+sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
 
 while true; do
   heartbeat
@@ -54,7 +57,11 @@ while true; do
     --jq ".[]|select(.isDraft|not)|$SEL|\"\(.number)\t\(.headRefName)\"" 2>/dev/null |
   while IFS="$(printf '\t')" read -r PR BR; do
     [ -z "${PR:-}" ] && continue
-    [ "$(gh pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)" = "MERGED" ] && continue
+    PR_ST="$(gh pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
+    [ "${PR_ST:-}" = "MERGED" ] && continue
+    HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
+    [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
     V="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | python3 -c "
 import sys,json
 try: d=json.load(sys.stdin)
@@ -63,6 +70,11 @@ m={c['name']:c['state'] for c in d}
 want='$REQ'.split()
 bad=lambda s: s in ('FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED')
 ok=lambda s: s in ('SUCCESS','FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED','SKIPPED','NEUTRAL')
+# ai-review-gate IS the merge authority, so it must be an explicit SUCCESS. SKIPPED/NEUTRAL
+# there means no signed review exists; reading that as satisfied would merge without evidence.
+gate=m.get('ai-review-gate','')
+if gate != 'SUCCESS' and not bad(gate):
+    print('FAILED:ai-review-gate'); raise SystemExit
 fail=[n for n in want if bad(m.get(n,''))]
 pend=[n for n in want if not ok(m.get(n,''))]
 print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pend else 'GREEN'))
@@ -73,10 +85,11 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
       FAILED:*)
         echo "#$PR $V" >>"$LOG"
         if echo "$V" | grep -q ai-review-gate; then
-          if tmux has-session -t "fix-$PR" 2>/dev/null || tmux has-session -t "merge-$PR" 2>/dev/null; then
+          # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
+          # path (which invokes merge-one.sh directly and whose session name is invisible here).
+          if [ -f "$O/state/mergeclaim-$PR.lock" ] || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
-            HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             case "$NF" in ''|*[!0-9]*) NF=0 ;; esac
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
@@ -84,9 +97,20 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
                && [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ]; then
-              echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
-              tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' '$REPO' '$OR' $PR '$BR'" 2>/dev/null \
-                && echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
+              # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
+              # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
+              # findings marker, so no fixer ever runs and the findings are lost.
+              if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' '$REPO' '$OR' $PR '$BR'" 2>/dev/null; then
+                echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
+                echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
+              else
+                echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
+              fi
+            elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
+              # Terminal state. Without this the cap just falls through to the re-record branch
+              # every cycle: an unfixable PR would burn a full fresh-context review forever.
+              echo "${HEAD_N:-}" > "$O/state/parked-$PR"
+              echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "${MAX_REVIEW:-4}" ]; then
               tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' '$REPO' '$OR' $PR '$BR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
@@ -118,9 +142,16 @@ PY
   SWFREE="$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="free"){print int($(i+2)); exit}}')"
   SWTOTAL="$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="total"){print int($(i+2)); exit}}')"
   : "${SWFREE:=9999}"; : "${SWTOTAL:=0}"
-  echo "[cap] lanes=$LANES swap_free=${SWFREE}M swap_total=${SWTOTAL}M load=$L" >> "$LOG"
-  # swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow dispatch.
-  if [ "$LANES" -lt "$MAX_LANES" ] && { [ "$SWTOTAL" -eq 0 ] || [ "$SWFREE" -gt "${MIN_SWAP_FREE:-600}" ]; }; then
+  echo "[cap] lanes=$LANES swap_free=${SWFREE}M swap_total=${SWTOTAL}M load=$L max_load=$MAX_LOAD" >> "$LOG"
+  # Three gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
+  # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
+  # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
+  GATE_WHY=""
+  if [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
+  elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
+  elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ]; then GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M"
+  fi
+  if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
@@ -132,7 +163,7 @@ PY
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
     else echo "[dispatch] backlog empty" >> "$LOG"; fi
   else
-    echo "[dispatch] skipped (load=$L lanes=$LANES)" >> "$LOG"
+    echo "[dispatch] skipped ($GATE_WHY)" >> "$LOG"
   fi
   heartbeat
 

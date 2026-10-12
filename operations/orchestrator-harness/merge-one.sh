@@ -13,6 +13,23 @@ export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=
 cd "$REPO" || exit 1
 git fetch origin "$BR" --quiet 2>/dev/null || true   # external (other-machine) branches may not be fetched locally
 
+# ── single-owner claim ────────────────────────────────────────────────────────
+# Three paths reach this script: chain-<N> (waits for a lane's PR), fix-<PR>, and the
+# controller's merge sweep. Only the last two are visible to the controller by session name,
+# so without a shared claim a freshly opened PR gets TWO concurrent reviewers racing the same
+# head: duplicate evidence comments, duplicate record-review writes, and an
+# ISSUES/CLEAN interleaving where one worker's needsfix marker lands after the other merged.
+# Atomic noclobber create is the lock; the controller also tests this file.
+CLAIM="$O/state/mergeclaim-$PR.lock"
+claim() { ( set -o noclobber; echo $$ > "$CLAIM" ) 2>/dev/null; }
+if ! claim; then
+  OPID="$(cat "$CLAIM" 2>/dev/null || echo 0)"
+  if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[merge $PR] pid $OPID already owns this PR — exiting" >> "$L.log"; exit 0; fi
+  rm -f "$CLAIM"
+  claim || { echo "[merge $PR] claim race — exiting" >> "$L.log"; exit 0; }
+fi
+trap 'rm -f "$CLAIM"' EXIT INT TERM
+
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
 echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
 

@@ -34,6 +34,13 @@ FINAL MESSAGE: per issue "### [P0|P1|P2] <title>" then file:line, what is wrong,
 Do NOT modify files, commit, or merge. $TESTCMD Bound every command.
 EOF
 
+
+cd "$REPO"
+pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$O/$TAG-reviewer.txt")" > "$LOG-review1.log" 2>&1
+if grep -qE '^### \[P[012]\]' "$LOG-review1.log"; then
+# NOTE: build the fixer prompt HERE, after the reviewer has written its log. Constructing it
+# above expanded $(sed ... "$LOG-review1.log") before that file existed, so the fixer always
+# ran against an empty (or stale previous-run) FINDINGS section.
 cat > "$O/$TAG-fixer.txt" <<EOF
 You are a FIX agent for branch $BR. A fresh-context reviewer found the issues below. Fix them on the existing branch, make the tests genuinely pin the fixes, run the tests, commit with \`git commit -F <message-file>\`, push to the SAME branch. Do NOT merge.
 
@@ -43,10 +50,6 @@ FINDINGS:
 $(sed -n '/### \[P0/,$p' "$LOG-review1.log" 2>/dev/null | head -140)
 FINAL MESSAGE: status, files changed, exact test commands + results, how each finding was addressed (or why you disagree).
 EOF
-
-cd "$REPO"
-pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$O/$TAG-reviewer.txt")" > "$LOG-review1.log" 2>&1
-if grep -qE '^### \[P[012]\]' "$LOG-review1.log"; then
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$O/$TAG-fixer.txt")" > "$LOG-fix1.log" 2>&1
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$O/$TAG-reviewer.txt")" > "$LOG-review2.log" 2>&1
 fi

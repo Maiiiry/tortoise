@@ -57,13 +57,20 @@ gh auth status >/dev/null 2>&1 && ok "gh authenticated" || die "gh is not authen
 
 # ── the merge authority ──────────────────────────────────────────────────────────
 # The harness can review and record, but it cannot MERGE without the gate key.
-if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
-  ok "AI_REVIEW_GATE_KEY present in env"
-elif [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
-  ok "gate key found at ~/.pi/agent/.ai-review-gate-key"
+# IMPORTANT: only the key FILE reaches the daemon. launchd inherits no shell environment, and
+# install.sh deliberately does not copy a secret into a world-readable plist — so an env-only key
+# must be reported as insufficient rather than as "present", or the box silently degrades to
+# review-only while everyone believes it holds the merge authority.
+KEY_FILE="$HOME/.pi/agent/.ai-review-gate-key"
+if [ -f "$KEY_FILE" ]; then
+  ok "gate key file present ($KEY_FILE)"
+  [ -n "${AI_REVIEW_GATE_KEY:-}" ] && ok "AI_REVIEW_GATE_KEY also exported in this shell"
+elif [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
+  warn "AI_REVIEW_GATE_KEY is set in THIS SHELL ONLY — launchd will not see it."
+  warn "  → the daemon will record reviews UNSIGNED and ai-review-gate will fail: no merge role."
+  warn "  → fix: printf '%s' \"\$AI_REVIEW_GATE_KEY\" > $KEY_FILE && chmod 600 $KEY_FILE"
 else
-  warn "no AI_REVIEW_GATE_KEY (env or ~/.pi/agent/.ai-review-gate-key)"
-  warn "  → reviews will be recorded UNSIGNED and ai-review-gate will fail: this box cannot merge."
+  warn "no AI_REVIEW_GATE_KEY (neither $KEY_FILE nor the environment)"
   warn "  → the loop degrades to review/record only. Fine for evaluation; not for a merge role."
 fi
 [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] \
@@ -78,6 +85,11 @@ git -C "$REPO" check-ignore -q .worktrees \
 [ -f "$REPO/tools/collision_preflight.py" ] \
   && ok "collision pre-flight present" \
   || warn "tools/collision_preflight.py missing — refresh-candidates.sh will add nothing to the backlog"
+if [ ! -x "$REPO/.worktrees/dispatch-scout/.venv/bin/python" ]; then
+  warn "scout worktree/venv not provisioned at $REPO/.worktrees/dispatch-scout"
+  warn "  → refresh-candidates.sh will provision it on first run (git worktree add + uv sync),"
+  warn "    which takes a couple of minutes and needs network access."
+fi
 
 # ── shipped scripts ──────────────────────────────────────────────────────────────
 for f in "$HERE"/*.sh; do
@@ -92,11 +104,15 @@ ok "state dir $O"
 
 # ── render plist ─────────────────────────────────────────────────────────────────
 echo "==> rendering $PLIST"
+# Substitution values are escaped: in sed a bare `&` in the replacement expands to the matched
+# text (so O=/tmp/a&b rendered the path as /tmp/a__O__b) and a `|` closes the s command. Both
+# produce a syntactically valid plist pointing at the wrong paths, so plutil -lint cannot catch it.
+esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 sed \
-  -e "s|__O__|$O|g" \
-  -e "s|__REPO__|$REPO|g" \
-  -e "s|__OR__|$OR|g" \
-  -e "s|__HOME__|$HOME|g" \
+  -e "s|__O__|$(esc "$O")|g" \
+  -e "s|__REPO__|$(esc "$REPO")|g" \
+  -e "s|__OR__|$(esc "$OR")|g" \
+  -e "s|__HOME__|$(esc "$HOME")|g" \
   -e "s|__MAX_LOAD__|$MAX_LOAD|g" \
   -e "s|__MAX_LANES__|$MAX_LANES|g" \
   -e "s|__MAX_REVIEW__|$MAX_REVIEW|g" \

@@ -9,7 +9,29 @@ O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 LIMIT="${1:-24}"
 mkdir -p "$O"
-cd "$SC" || exit 1
+
+# The scout is a dedicated throwaway worktree used only to run tools/collision_preflight.py.
+# Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
+# refresh subshell exited 1 every cycle, wrote nothing, and the backlog silently never refilled.
+if [ ! -d "$SC" ]; then
+  echo "[refresh] provisioning scout worktree at $SC"
+  cd "$REPO" || { echo "[refresh] ABORT: repo not found at $REPO"; exit 1; }
+  git fetch origin main --quiet 2>/dev/null || true
+  if git rev-parse --verify -q "refs/heads/chore/dispatch-scout" >/dev/null 2>&1; then
+    git worktree add "$SC" chore/dispatch-scout >/dev/null 2>&1
+  else
+    git worktree add "$SC" -b chore/dispatch-scout origin/main >/dev/null 2>&1
+  fi
+fi
+cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit 1; }
+
+# collision_preflight.py needs the project's dev environment; without it every check errors and
+# the backlog stays empty. Provision once, fail loudly if that is impossible.
+if [ ! -x "$SC/.venv/bin/python" ]; then
+  echo "[refresh] provisioning scout venv (uv sync)"
+  ( uv sync --extra embeddings --extra parity ) >/dev/null 2>&1 \
+    || { echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"; exit 1; }
+fi
 git fetch origin --quiet 2>/dev/null || true
 
 touch "$O/checked.txt" "$O/candidates.txt"
