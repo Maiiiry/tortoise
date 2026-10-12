@@ -46,6 +46,7 @@ import json
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import quote
 
 from tortoise.quota import MAX_SESSION_TURNS
 
@@ -247,11 +248,21 @@ _HERMES_SELECTOR = "::"
 
 
 def _hermes_split_selector(path: str | Path) -> tuple[Path, str | None]:
-    """Split ``<state.db>::<session-id>`` into (db path, session id or None)."""
+    """Split ``<state.db>::<session-id>`` into (db path, session id or None).
+
+    A ``::`` that is part of a path that EXISTS on disk is never a selector:
+    the split is only applied when the whole argument does not resolve, so a
+    store living under a directory whose name legitimately contains ``::``
+    (``/tmp/a::b/state.db``) is read literally rather than misread as
+    ``/tmp/a`` + session ``b/state.db`` (#2121 review).
+    """
     raw = str(path)
+    literal = Path(raw)
+    if literal.exists():
+        return literal, None
     db, sep, session_id = raw.rpartition(_HERMES_SELECTOR)
     if not sep or not db:
-        return Path(raw), None
+        return literal, None
     return Path(db), (session_id.strip() or None)
 
 
@@ -317,7 +328,12 @@ def parse_hermes(path: str | Path) -> list[dict]:
         db_path = candidate
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Percent-encode the path before it goes into the URI: a raw ``?`` /
+        # ``#`` would be parsed as the query / fragment (silently dropping
+        # ``mode=ro`` AND reading — or CREATING — a different, truncated path)
+        # and a raw ``%`` would be decoded. ``quote`` keeps ``/`` (safe='/'),
+        # so the file component survives intact (#2121 review).
+        conn = sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True)
     except sqlite3.Error as e:
         raise ValueError(
             f"cannot open Hermes session store {db_path} read-only: {e}") from e

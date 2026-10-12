@@ -3542,8 +3542,12 @@ def _install_read_hook_impl(args) -> int:
             return 0
         target.mkdir(parents=True, exist_ok=True)
         for name, src in sorted(bundled.items()):
-            (target / name).write_text(
-                src.read_text(encoding="utf-8"), encoding="utf-8")
+            # #3918: ATOMIC write, like every other seam in this function.
+            # `write_text` truncates in place (a crash/ENOSPC mid-write can
+            # leave a truncated plugin), and it writes THROUGH a leaf symlink
+            # in `target` — the guard above only walks root → target, never
+            # the leaf files. `os.replace` closes both.
+            _atomic_write_text(target / name, src.read_text(encoding="utf-8"))
         print(f"{'Updated' if ours else 'Installed'} {target}")
         print("Hermes discovers project plugins from ./.hermes/plugins/ (and "
               "global ones from $HERMES_HOME/plugins/). Validate with "
@@ -6266,7 +6270,26 @@ def _cmd_sessions_import(args) -> int:
     # claude-desktop). Resolved BEFORE the existence check so a missing file
     # still records its breadcrumb under the right harness.
     harness = {"desktop": "claude-desktop"}.get(args.harness, args.harness)
-    if not file_path.exists():
+    # #2121: Hermes is the ONE many-sessions-per-file store, so its argument
+    # may carry the documented `::<session-id>` selector. The composite string
+    # is not a filesystem path, so resolve it BEFORE the existence check (and
+    # before the content-hash read) — otherwise the selector that the `--file`
+    # help text and `parse_hermes` both advertise dies here with a misleading
+    # "Session file not found". `parse_transcript` still receives the FULL
+    # argument (it re-splits); we resolve only for the existence check, the
+    # hash, and the selector salt that keeps two sessions of one store apart.
+    read_path = file_path
+    selector: str | None = None
+    if harness == "hermes":
+        from tortoise.session_import.parsers import _hermes_split_selector
+        db_path, selector = _hermes_split_selector(file_path)
+        # `parse_hermes` accepts the store DIRECTORY too (it appends state.db);
+        # read/hash the real DB file in that case.
+        read_path = db_path / "state.db" if db_path.is_dir() else db_path
+        check_path = db_path
+    else:
+        check_path = file_path
+    if not check_path.exists():
         print(f"Session file not found: {args.file}", file=_sys.stderr)
         _record_capture_error(harness, f"session file not found: {args.file}")
         return 1
@@ -6298,9 +6321,15 @@ def _cmd_sessions_import(args) -> int:
             file=_sys.stderr,
         )
 
-    raw = file_path.read_bytes()
+    raw = read_path.read_bytes()
+    # #2121: a Hermes store holds MANY sessions, so the whole-file hash alone
+    # collides across `::<a>` and `::<b>` — the second would report "Already
+    # imported" and never be captured. Salt the key with the selected session
+    # id (the unselected case is unchanged: hash of the store bytes).
+    key_material = raw if selector is None else (
+        raw + b"\x00" + selector.encode("utf-8"))
     session_id = args.session_id or (
-        "imp_" + hashlib.sha256(raw).hexdigest()[:12])
+        "imp_" + hashlib.sha256(key_material).hexdigest()[:12])
 
     # Local receipt — 2xx-only (a failed POST must never look imported).
     receipt = _import_receipt_for(session_id)

@@ -167,6 +167,33 @@ def test_install_hermes_is_idempotent_and_uninstalls(tmp_path):
     assert not target.exists()
 
 
+def test_install_hermes_writes_atomically(tmp_path):
+    """The plugin files go through `_atomic_write_text` (#3918): a reinstall
+    REPLACES the directory entry (fresh temp + ``os.replace``) instead of
+    truncating in place, and a planted leaf symlink pointing outside the
+    install dir is replaced rather than written THROUGH (#2121 review)."""
+    _run(["install", "hermes", "--dir", str(tmp_path)], _env())
+    target = _plugin_dir(tmp_path)
+    before = os.stat(target / "plugin.yaml").st_ino
+    r = _run(["install", "hermes", "--dir", str(tmp_path)], _env())
+    assert r.returncode == 0, r.stderr
+    # write_text keeps the inode (truncate-in-place); os.replace swaps it.
+    assert os.stat(target / "plugin.yaml").st_ino != before
+
+    # The root→target symlink guard never inspects the LEAF files, so only
+    # the atomic replace stops a planted `plugin.yaml` symlink from writing
+    # through to a file outside the install dir.
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("ORIGINAL\n")
+    (target / "plugin.yaml").unlink()
+    (target / "plugin.yaml").symlink_to(outside)
+    r = _run(["install", "hermes", "--dir", str(tmp_path)], _env())
+    assert r.returncode == 0, r.stderr
+    assert outside.read_text() == "ORIGINAL\n"
+    assert not (target / "plugin.yaml").is_symlink()
+    assert (target / "plugin.yaml").is_file()
+
+
 def test_install_hermes_dry_run_writes_nothing(tmp_path):
     r = _run(["install", "hermes", "--dir", str(tmp_path), "--dry-run"],
              _env())
@@ -414,6 +441,17 @@ def test_parse_hermes_explicit_session_selector(tmp_path):
     assert PARSERS["hermes"] is parse_hermes
 
 
+def test_parse_hermes_does_not_split_a_colon_colon_directory_name(tmp_path):
+    """`::` is a session selector only when the whole argument does not exist
+    on disk — a store under a directory legitimately named ``a::b`` must be
+    read literally, not truncated to ``a`` (#2121 review)."""
+    store = tmp_path / "a::b"
+    store.mkdir()
+    db = _make_state_db(store / "state.db", {"s1": [
+        {"id": 1, "role": "user", "content": "colon dir"}]})
+    assert parse_hermes(db) == [{"role": "user", "content": "colon dir"}]
+
+
 def test_parse_hermes_reads_the_store_read_only(tmp_path):
     """A backfill must never mutate a Hermes store (never create -wal/-shm
     beside a live state.db)."""
@@ -424,6 +462,22 @@ def test_parse_hermes_reads_the_store_read_only(tmp_path):
     assert db.read_bytes() == before
     assert not (tmp_path / "state.db-wal").exists()
     assert not (tmp_path / "state.db-shm").exists()
+
+
+@pytest.mark.parametrize("dirname", ["we?ird", "ha#sh", "pct%20dir"])
+def test_parse_hermes_escapes_the_store_path_in_the_sqlite_uri(tmp_path,
+                                                               dirname):
+    """A `?` / `#` / `%` in the store path must not become SQLite URI
+    structure: the raw interpolation swallowed ``mode=ro``, read a different
+    (truncated) path, and CREATED a stray empty file beside it (#2121
+    review)."""
+    store = tmp_path / dirname
+    store.mkdir()
+    db = _make_state_db(store / "state.db", {"s1": [
+        {"id": 1, "role": "user", "content": "escaped path"}]})
+    assert parse_hermes(db) == [{"role": "user", "content": "escaped path"}]
+    # No stray sibling produced by URI parsing (e.g. `<tmp>/we` from `we?ird`).
+    assert sorted(p.name for p in tmp_path.iterdir()) == [dirname]
 
 
 @pytest.mark.parametrize("build,needle", [
@@ -486,6 +540,36 @@ def test_cli_accepts_the_hermes_harness(tmp_path):
     assert r.returncode == 1
     assert "Session file not found" in r.stderr
     assert "invalid choice" not in r.stderr
+
+
+def test_cli_resolves_the_hermes_session_selector(tmp_path):
+    """The documented `<state.db>::<session-id>` selector must clear the CLI
+    existence guard and reach the PARSER — the composite string is not a
+    filesystem path, so judging it as one made the selector unreachable
+    (#2121 review)."""
+    db = _make_state_db(
+        tmp_path / "state.db",
+        {
+            "old": [{"id": 1, "role": "user", "content": "old session"}],
+            "new": [{"id": 2, "role": "user", "content": "new session"}],
+        },
+        started={"old": 1_000.0, "new": 2_000.0},
+    )
+    env = _env(TORTOISE_CAPTURE="1", HOME=str(tmp_path / "home"))
+    # The unknown-session error is emitted ONLY by parse_hermes, so seeing it
+    # proves the selector cleared the existence check and reached the parser.
+    r = _run(["sessions", "import", "--harness", "hermes",
+              "--file", f"{db}::nope"], env)
+    assert r.returncode == 1
+    assert "Session file not found" not in r.stderr
+    assert "no Hermes session 'nope'" in r.stderr
+    # A REAL selector clears the guard too and proceeds down the shared
+    # import path (here stopping at the user-global config, as every other
+    # harness does in this isolated HOME).
+    r = _run(["sessions", "import", "--harness", "hermes",
+              "--file", f"{db}::old"], env)
+    assert "Session file not found" not in r.stderr
+    assert "No .tortoise config found" in r.stderr
 
 
 def test_install_list_mentions_the_hermes_seam(tmp_path):

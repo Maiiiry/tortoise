@@ -237,7 +237,8 @@ The framework seams are graded the same way by
 all three adapters through the REAL `sdk_reflex` provider and asserts the
 identical block lands in each framework's prompt, plus the fail-open / opt-in /
 window-bounding contract.
-test in tests/). The Hermes seam grades the same way at its own surface:
+
+The Hermes seam grades the same way at its own surface:
 `tests/test_hermes_seam.py` installs the shipped plugin into a temp root,
 imports it, fakes the reflex CLI, and asserts the `register(ctx)` →
 `pre_llm_call` → `{"context": ...}` path (plus the cap, fail-open, and the
