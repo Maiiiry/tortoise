@@ -51,7 +51,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 
 ## 2. Architecture
 
-```
+```text
                       launchd  com.eldato.orchestrator-loop  (RunAtLoad + KeepAlive)
                                         │
                                   orch-loop.sh        ← the controller, one process
@@ -61,7 +61,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
    (1) merge sweep              (2) capacity-gated dispatch      (3) backlog refresh
         │                               │                                │
         │  for every open non-draft PR  │  read candidates.txt            │  refresh-candidates.sh
-        │  read the 8 required checks   │  skip if in dispatched.txt      │  pre-flight each issue
+        │  read the 7 required checks   │  skip if in dispatched.txt      │  pre-flight each issue
         │                               │  dispatch-merge.sh:             │  (collision_preflight.py)
         │   GREEN   → gh pr merge       │    git worktree add             │  append CLEAN ones
         │   PENDING → --auto            │    tmux new lane-<N>  ──┐       │
@@ -172,8 +172,8 @@ Run the offline self-test first — it needs no network, tmux server or git writ
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
 reaper, or runs `install.sh` for real) rather than re-implementing the logic — a test that
 re-implements the fix passes on the broken copy and proves nothing. That failure mode was found in
-review of this very file, and 19 of its checks fail when it is dropped into the
-pre-fix tree.
+review of this very file. Every check is written to fail on the pre-fix tree it
+pins; the live total is printed by `./selftest.sh` rather than quoted here.
 
 ```bash
 ./selftest.sh          # run it for the live list. Covers: syntax, exact session matching, the
@@ -305,7 +305,7 @@ record that they existed. Today this is recovered by reading `git worktree list`
 
 `$O/logs/orch-loop.log` is the controller's decision log; every line is prefixed by a tag:
 
-```
+```text
 [scope] open=24 -> BROAD (help drain all)
 [cap]   lanes=4 swap_free=588M swap_total=4096M load=7
 [dispatch] load=7 lanes=4 -> 4429 4489
@@ -353,9 +353,7 @@ another box's draft and is correctly left alone.
 ### 7.2c Conflicted PRs — **FIXED in this PR**
 
 A CONFLICTING PR can never merge, but the sweep classified it GREEN/PENDING and called `gh pr merge`
-on it every cycle, so the queue looked busy while nothing moved (observed: #8245, #8226, #8193,
-#8104). They are now routed to `fix-one.sh`, which integrates `origin/main`, resolves the conflict,
-and re-runs the review chain — capped by `MAX_FIX_TRIES` and parkable like any other fix loop. The
+on it every cycle, so the queue looked busy while nothing moved (observed: #8245, #8226, #8193, #8104). They are now routed to `fix-one.sh`, which integrates `origin/main`, resolves the conflict, and re-runs the review chain — capped by `MAX_FIX_TRIES` and parkable like any other fix loop. The
 fixer prompt states that when a PR is CONFLICTING the conflict *is* the task.
 
 ### 7.2b Cross-box duplicate work — **OPEN**
@@ -383,7 +381,7 @@ because the self-test now drives every one of them:
 | A lane's PR is driven by `chain-<N>`, whose session name the controller's in-flight guard could not see | two concurrent `merge-one.sh` runs per PR: duplicate evidence comments, duplicate `record-review` writes, `ISSUES`/`CLEAN` interleaving | atomic per-PR claim file, honoured by all three paths |
 | `fixcount` was incremented and the findings marker deleted *before* the fixer spawn was attempted | a killed/failed spawn consumed one of `MAX_FIX_TRIES` and destroyed the findings, so no fixer ever ran | spawn first; bookkeep only on success, message the failure otherwise |
 | Reaching `MAX_FIX_TRIES` fell through to the re-record branch | an unfixable PR burned a full fresh-context review **every cycle, forever** | terminal `state/parked-<PR>` state, keyed to the head so a new push re-arms it |
-| `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … | grep -qx`) |
+| `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
 | Plist rendered with unescaped `sed` replacements | a `&` in a path expanded to the matched placeholder, producing a *valid* plist pointing at wrong paths (so `plutil -lint` cannot catch it) | escape `\`, `&` and `\|` in every substituted value |
@@ -395,9 +393,9 @@ because the self-test now drives every one of them:
 | the live sweep dropped the `CLOSED` guard that `retired/sweep.sh` had, keeping only `MERGED` | a PR listed open that closed in between fell through to `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever | `case "$PR_ST" in MERGED\|CLOSED) continue ;;` |
 | `retired/auto-loop.sh` and `retired/sweep.sh` still carried the fail-open `ai-review-gate` classifier | shipping "the record" with the very bug being fixed invites reuse of it | both annotated in place as retired-with-known-fail-open |
 | §3 and §8 admitted cross-box duplication while §5.1b said "one owner per PR" | the invariant was stated more strongly than the code delivers | §5.1b scoped to per-box; §7.2b states the open cross-box gap |
-| **a PR branch name was interpolated into the `sh -c` string `tmux new-session` executes** | **arbitrary command execution on the unattended host that holds the merge key.** git permits `'` `;` `$` `` ` `` `&` `|` `(` `)` `{` `}` `"` `<` `>` `#` in a ref name, so a fork PR on `fix/x';touch${IFS}/tmp/x;#` broke out of the quotes. Reproduced end-to-end before fixing | `safe_ref` allowlist + `check-ref-format`; numeric-only PR ids; and worker args now travel in a file (`--argv`) so no PR-derived value is interpolated at all |
+| **a PR branch name was interpolated into the `sh -c` string `tmux new-session` executes** | **arbitrary command execution on the unattended host that holds the merge key.** git permits `'` `;` `$` `` ` `` `&` `\|` `(` `)` `{` `}` `"` `<` `>` `#` in a ref name, so a fork PR on `fix/x';touch${IFS}/tmp/x;#` broke out of the quotes. Reproduced end-to-end before fixing | `safe_ref` allowlist + `check-ref-format`; numeric-only PR ids; and worker args now travel in a file (`--argv`) so no PR-derived value is interpolated at all |
 | the claim-file guard added in the first fix round introduced a permanent stall | the controller treated *the existence of* `mergeclaim-<PR>.lock` as "in flight", but only `merge-one.sh` removes it — a SIGKILLed worker or a reboot mid-merge left the PR skipped forever with no fixer and no re-record | `claim_live()` tests the recorded pid with `kill -0` and removes a dead owner's claim |
-| 6 self-test checks passed vacuously because an empty extraction did not fail the check | the round-1 vacuity fix was incomplete: checks depending on `sess()`, the claim block or the reaper passed when the shipped script had no such code | `need()` turns a missing extraction into a FAIL; measured 7/30 on the pre-fix tree vs 46/46 shipped |
+| 6 self-test checks passed vacuously because an empty extraction did not fail the check | the round-1 vacuity fix was incomplete: checks depending on `sess()`, the claim block or the reaper passed when the shipped script had no such code | `need()` turns a missing extraction into a FAIL; each check was then re-proved against the pre-fix tree it pins |
 
 ### 7.5 Still open, deliberately not fixed here
 
@@ -427,7 +425,7 @@ certificate — but the split is unambiguous.
 
 Hourly histogram (00:00Z–23:00Z on 2026-10-11, merged / this-box):
 
-```
+```text
 04: 1/1   05: 4/3   06: 3/2   07: 5/5   09: 3/3   10: 3/2   11: 3/3
 13: 2/1   14: 3/2   15: 4/2   16: 6/5   17: 7/5   18: 8/8   19: 3/3
 20: 3/1   21: 3/1   22: 5/4   23: 2/1
@@ -483,7 +481,7 @@ them (`cp <harness>/*.sh $O/`) and restart the loop before trusting any §5 inva
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `uv sync --extra embeddings --extra parity`, the
 `TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest` invocation, the
-`tools/collision_preflight.py` path, and the eight required check names
+`tools/collision_preflight.py` path, and the seven required check names
 (`ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact`).
 
 ---

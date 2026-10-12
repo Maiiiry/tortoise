@@ -80,7 +80,7 @@ fi
 
 # ── target repo ──────────────────────────────────────────────────────────────────
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout: $REPO"
-git -C "$REPO" check-ignore -q .worktrees \
+git -C "$REPO" check-ignore -q .worktrees/ \
   && ok "$REPO/.worktrees is gitignored" \
   || die "$REPO/.worktrees is NOT gitignored — worktrees would be committed. Fix .gitignore first."
 [ -f "$REPO/tools/collision_preflight.py" ] \

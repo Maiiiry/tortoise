@@ -96,8 +96,8 @@ while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
   grep -qx "$N" "$O/dispatched.txt" 2>/dev/null && continue
-  echo "$N" >> "$O/checked.txt"
   n=$((n+1)); [ "$n" -gt "$LIMIT" ] && break
+  echo "$N" >> "$O/checked.txt"
   V="$("$SC/.venv/bin/python" tools/collision_preflight.py "$N" --repo . 2>&1 | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION).*/\1/')"
   if [ "$V" = "CLEAN" ]; then
     echo "$N" >> "$O/candidates.txt"

@@ -127,6 +127,33 @@ ck "shipped reaper: the reaped entry is removed from checked.txt" $rc
 fi
 unset -f tmux
 
+# ── 5b) the shipped refresh loop never blacklists a candidate it did not pre-flight ─
+# `echo "$N" >> checked.txt` sat BEFORE `n=$((n+1)); [ "$n" -gt "$LIMIT" ] && break`, so the
+# (LIMIT+1)-th candidate was recorded as checked and then the loop broke without ever running
+# collision_preflight.py for it. checked.txt suppresses that issue forever and the §7.1 reaper
+# only un-blacklists dispatched.txt entries — so one dispatchable issue was lost per refresh.
+awk '/^n=0$/{f=1} f{print} /^done < /{f=0}' "$REFRESH" > "$TMP/refreshloop.sh"
+if need "$TMP/refreshloop.sh" "the refresh loop body is extracted from the shipped refresh-candidates.sh"; then
+  RL="$TMP/refresh"; mkdir -p "$RL/fakesc/.venv/bin"
+  printf '10\n20\n30\n40\n50\n' > "$RL/.pool"
+  : > "$RL/checked.txt"; : > "$RL/candidates.txt"; : > "$RL/dispatched.txt"
+  cat > "$RL/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# stand-in for the scout's venv python: every candidate pre-flights CLEAN
+echo "VERDICT: CLEAN"
+PY
+  chmod +x "$RL/fakesc/.venv/bin/python"
+  O="$RL" LIMIT=3 SC="$RL/fakesc" bash "$TMP/refreshloop.sh" > "$TMP/refreshloop.out" 2>&1
+  checked="$(tr '\n' ' ' < "$RL/checked.txt")"
+  case "$checked" in *40*) rc=1;; *) rc=0;; esac
+  ck "shipped refresh loop: the candidate past LIMIT is NOT marked checked" $rc
+  case "$checked" in *10*20*30*) rc=0;; *) rc=1;; esac
+  ck "shipped refresh loop: the first LIMIT candidates are marked checked" $rc
+  cands="$(tr '\n' ' ' < "$RL/candidates.txt")"
+  case "$cands" in *10*20*30*) rc=0;; *) rc=1;; esac
+  ck "shipped refresh loop: the pre-flighted CLEAN candidates reach the backlog" $rc
+fi
+
 # ── 6) install.sh renders correctly, including values sed would mangle ───────────
 # Runs the real installer with a hostile $O containing '&' (in sed, & expands to the matched
 # text, so `O=/tmp/a&b` used to render the path as /tmp/a__O__b — a VALID plist pointing at
@@ -135,7 +162,7 @@ SB="$TMP/sb"; mkdir -p "$SB/Library/LaunchAgents" "$SB/.config" "$SB/.pi/agent/s
 ln -s "$HOME/.config/gh" "$SB/.config/gh" 2>/dev/null || true
 [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$SB/.pi/agent/scripts/record-review.sh"
 HOSTILE="$TMP/x&y"
-HOME="$SB" O="$HOSTILE" REPO="$HERE/../../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
+HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
 PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL" ] && rc=0 || { rc=1; echo "      install.sh did not render a plist: $(tail -3 "$TMP/inst.out")"; }
 ck "install.sh renders a plist" $rc
@@ -153,6 +180,37 @@ if [ -f "$PL" ]; then
   [ "$decoded" = "$HOSTILE" ] && rc=0 || { rc=1; echo "      decoded '$decoded' != '$HOSTILE'"; }
   ck "the hostile path round-trips through the plist unchanged" $rc
 fi
+
+# ── 6b) install.sh on a fresh checkout: dir-only gitignore, .worktrees not created yet ─
+# install.sh is the FIRST step on a fresh box (README §4) and dispatch-merge.sh creates the
+# worktree lazily — but `git check-ignore -q .worktrees` returns non-zero when the path does not
+# exist and the repo ignores it with the directory-only pattern `.worktrees/`. The installer then
+# died before rendering the plist. Reproduced in a throwaway git repo whose parent is not a repo.
+FR="$TMP/freshrepo"; mkdir -p "$FR/repo"
+git -C "$FR/repo" init -q >/dev/null 2>&1
+printf '.worktrees/\n' > "$FR/repo/.gitignore"
+# Non-vacuous: this exact repo really does defeat the pre-fix bare-path form.
+( cd "$FR/repo" && git check-ignore -q .worktrees ) && rc=1 || rc=0
+ck "non-vacuity: the pre-fix bare .worktrees guard fails on a fresh checkout" $rc
+grep -q 'check-ignore -q .worktrees/' "$INST" && rc=0 || rc=1
+ck "install.sh's gitignore guard uses the directory form .worktrees/" $rc
+SB2="$TMP/sb2"; mkdir -p "$SB2/Library/LaunchAgents" "$SB2/.config" "$SB2/.pi/agent/scripts"
+ln -s "$HOME/.config/gh" "$SB2/.config/gh" 2>/dev/null || true
+HOME="$SB2" O="$TMP/fresh-o" REPO="$FR/repo" OR="acme/widget" bash "$INST" > "$TMP/inst-fresh.out" 2>&1
+PL2="$SB2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+[ -f "$PL2" ] && rc=0 || { rc=1; echo "      fresh checkout: $(tail -2 "$TMP/inst-fresh.out")"; }
+ck "install.sh renders a plist on a fresh checkout (no .worktrees dir yet)" $rc
+
+# ── 6c) the self-test resolves REPO to the checkout, not its parent ─────────────
+# It passed `$HERE/../../..` (the PARENT of the repo root) to install.sh, which died
+# "not a git checkout" on any fresh clone whose parent is not a git repo — the exact second box
+# this harness exists to hand over. `$HERE/../..` is the root (check #13 already uses it).
+grep -qE 'REPO="\$HERE/\.\./\.\./\.\."' "$HERE/selftest.sh" && rc=1 || rc=0
+ck "selftest.sh does not point install.sh at the repo's parent" $rc
+grep -qF 'REPO="$HERE/../.."' "$HERE/selftest.sh" && rc=0 || rc=1
+ck "selftest.sh passes the repo root to install.sh" $rc
+[ -e "$HERE/../../.git" ] && rc=0 || rc=1
+ck "the repo-root path selftest.sh uses resolves to a git checkout" $rc
 
 # ── 7) in-script defaults agree with install.sh's defaults ───────────────────────
 # A limit documented in README §4 and rendered by install.sh must not be silently different in
@@ -230,10 +288,40 @@ grep -q 'One owner per PR, per box' "$HERE/README.md" && rc=0 || rc=1
 ck "README scopes the claim invariant to one box" $rc
 grep -q 'serialises one box only' "$HERE/README.md" && rc=0 || rc=1
 ck "README states the cross-box limitation explicitly" $rc
-# The README must not state a check COUNT — it drifts the moment a check is added (it said 29
-# while the file had 42). Assert the absence of the claim instead of a magic number.
-grep -qE '[0-9]+ checks' "$HERE/README.md" && rc=1 || rc=0
-ck "README states no check count that can drift" $rc
+# The README must not state a self-test check COUNT — it drifts the moment a check is added
+# (it said 29 while the file had 42, then 46/46 while the file ran 57). The guard matches the
+# PHRASINGS that actually drifted and is proved non-vacuous against a fixture of pre-fix text.
+OVERC='[0-9]+ checks|[0-9]+ of its checks|measured [0-9]+/[0-9]+|[0-9]+/[0-9]+ shipped'
+grep -qE "$OVERC" "$HERE/README.md" && rc=1 || rc=0
+ck "README states no self-test check count that can drift" $rc
+cat > "$TMP/overclaim.md" <<'MD'
+review of this very file, and 19 of its checks fail when it is dropped into the
+| measured 7/30 on the pre-fix tree vs 46/46 shipped |
+MD
+grep -qE "$OVERC" "$TMP/overclaim.md" && rc=0 || rc=1
+ck "the drift guard matches the pre-fix phrasings (non-vacuous)" $rc
+# The REQUIRED-check count is the page's own invariant, not a drifting number: it is fixed by the
+# repo's protection. It must equal REQ and the README must never spell a different count beside
+# the list it ships (it said "eight"/"8" against a live set of 7).
+nreq="$(sed -n 's/^REQ="\(.*\)"$/\1/p' "$LOOP" | tr ' ' '\n' | grep -c .)"
+case "$nreq" in 7) rword=seven;; 8) rword=eight;; *) rword="" ;; esac
+[ -n "$rword" ] && grep -qE "($nreq|$rword) required check" "$HERE/README.md" && rc=0 || rc=1
+ck "README states the required-check count REQ has ($nreq)" $rc
+numerals='([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten) required check'
+bad=""
+while read -r tok _; do
+  [ -z "$tok" ] && continue
+  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
+done < <(grep -oE "$numerals" "$HERE/README.md")
+[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad required check'"; }
+ck "README never disagrees with REQ on the required-check count" $rc
+bad=""
+while read -r tok _; do
+  [ -z "$tok" ] && continue
+  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
+done < <(printf 'read the 8 required checks\nand the eight required check names\n' | grep -oE "$numerals")
+[ -n "$bad" ] && rc=0 || rc=1
+ck "non-vacuity: the required-count guard flags the pre-fix '8'/'eight' (saw '$bad')" $rc
 grep -q 'selftest.sh' "$HERE/README.md" && rc=0 || rc=1
 ck "README points at the self-test" $rc
 
