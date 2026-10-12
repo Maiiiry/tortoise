@@ -15,7 +15,10 @@ disk, and fails on either direction of disagreement:
 
 WHY IT DERIVES RATHER THAN RESTATES. A hand-copied expectation is a second
 declaration of the placement, and the second declaration is the one that goes
-stale. Editing either side alone turns the test red, which is the point.
+stale. Editing either side alone turns the test red, which is the point — and
+the CORE_ALSO entries in `tools/ci_selection.py` make CI SELECT this pin on a
+migration-only or placement-doc-only change, so the claim holds in CI and not
+only in a manual run (#8179 review P2).
 
 THE MUTATION THAT MAKES IT FAIL. `test_mutation_adding_a_derived_column_fails`
 performs it in-memory: it adds `confidence` (a DERIVED EP scalar) to the
@@ -199,7 +202,12 @@ def check_placement(rows, columns_by_table) -> list[str]:
         if cols is None:
             problems.append(f"no CREATE TABLE for {table!r} (section {section})")
             continue
-        names = expand_edge_property(prop) if section == "Edges" and cls == "P" else [prop]
+        # Expand an Edges property's leaf name for BOTH classes: `IMPL.msg_beta`
+        # is DERIVED, and the whole dotted name normalises to `i_m_p_l.msg_beta`,
+        # which can never equal a column — so a `cls == "P"`-only expansion left
+        # the DERIVED branch unable to fire for the four BP message props (#8179
+        # review P2). The leaf name is what the relation table could carry.
+        names = expand_edge_property(prop) if section == "Edges" else [prop]
         for name in names:
             col = normalize(name)
             if cls == "P":
@@ -283,6 +291,9 @@ def test_every_predicate_the_table_names_is_declared():
         ("subject", "embedding"),
         ("source", "reliability"),
         ("relation", "msg_alpha"),
+        ("relation", "msg_beta"),
+        ("relation", "back_msg_alpha"),
+        ("relation", "back_msg_beta"),
         ("event", "confidence"),
     ],
 )
@@ -322,8 +333,8 @@ def test_relation_is_never_a_bare_id():
         ("point", "id"),
     ):
         assert re.search(
-            rf"chk_{table}_node_key_is_contract_key CHECK \(node_key = {keycol}\)", text
-        ), f"{table} does not pin node_key to {keycol}"
+            rf"chk_{table}_node_key_is_contract_key CHECK \({keycol} IS NOT NULL AND node_key = {keycol}\)", text
+        ), f"{table} does not pin node_key to {keycol} (with the NULL guard)"
 
 
 def test_every_table_is_tenant_scoped_and_rls_enabled():
@@ -355,3 +366,20 @@ def test_mutation_removing_a_primary_column_fails():
     columns["point"].discard("content")
     problems = check_placement(rows, columns)
     assert any(p.startswith("MISSING COLUMN") and "point.content" in p for p in problems), problems
+
+
+def test_mutation_adding_a_derived_edge_property_fails():
+    """The dotted DERIVED edge props must be checked by their LEAF name.
+
+    `IMPL.back_msg_beta` normalises as a whole to `i_m_p_l.back_msg_beta`, which
+    can never equal a relation column — so before the `Edges` expansion covered
+    DERIVED as well as PRIMARY (#8179 review P2), adding `back_msg_beta` to
+    `public.relation` left `check_placement` empty and the derived edge value
+    could be stored as authority undetected."""
+    rows = parse_placement()
+    columns = {t: set(c) for t, c in parse_sql_columns().items()}
+    columns["relation"].add("back_msg_beta")
+    problems = check_placement(rows, columns)
+    assert any(
+        p.startswith("DERIVED") and "relation.back_msg_beta" in p for p in problems
+    ), problems

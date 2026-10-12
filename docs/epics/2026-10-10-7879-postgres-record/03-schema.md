@@ -118,7 +118,7 @@ W1 fixes the key **by label** — `:Point → id`, `:Event → eventId`, `:Subje
 Three enforcements, and each closes a different hole:
 
 1. **`node_identity.key_property` is `GENERATED ALWAYS AS (CASE node_label …) STORED`** — the contract is in the database, so a caller cannot write a row that disagrees with W1 without changing the schema.
-2. **Each layer table pins its own key** — `chk_source_node_key_is_contract_key CHECK (node_key = url)`, `chk_point_node_key_is_contract_key CHECK (node_key = id)`, and the same for `event`/`session`/`object`/`subject`. A label and its key are **one unit** (W1 §3's warning): a retargeted label with a stale key resolves to nothing.
+2. **Each layer table pins its own key** — `chk_source_node_key_is_contract_key CHECK (url IS NOT NULL AND node_key = url)`, `chk_point_node_key_is_contract_key CHECK (id IS NOT NULL AND node_key = id)`, and the same for `event`/`session`/`object`/`subject`. The `IS NOT NULL` guard is load-bearing: a bare `node_key = url` is SQL NULL (not FALSE) when `url` is NULL, so the constraint would be satisfied and the key would resolve to nothing in silence (#8179 review P1). A label and its key are **one unit** (W1 §3's warning): a retargeted label with a stale key resolves to nothing.
 3. **`relation` carries `src_label`/`src_key` and `tgt_label`/`tgt_key`, each a composite FK into `node_identity`.** This is what makes the contract a *constraint* rather than a convention — and it is why the registry table exists at all: SQL cannot reference two tables from one column, so without it *"the FK is `(label, key)`"* would be unenforceable by construction.
 
 **The stable-name replay keys are NOT re-declared here.** `stub_key` + `STRUCTURAL_REL_LABELS` (`tortoise/projection/edges.py`) stay the single home for *replay* resolution, pinned by `tests/test_identity_contract.py`. This schema stores the resolved endpoints; it does not become a second key map.
@@ -183,6 +183,8 @@ Reads the placement table, applies §2.7's resolutions, reads the `CREATE TABLE`
 
 * add `confidence double precision,` to `public.point` → `DERIVED/VOLATILE AS AUTHORITY: point.confidence — Point.confidence is D (§17.5 carve-out)`;
 * remove `content text,` from `public.point` → `MISSING COLUMN: point.content — Point.content is PRIMARY`.
+
+The dotted BP edge props (`IMPL.msg_*` / `IMPL.back_msg_*`) are DERIVED too, so the checker expands an `Edges` row to its leaf name in BOTH classes — without that, `i_m_p_l.back_msg_beta` could never match a column and a derived edge value could be stored as authority undetected (#8179 review P2).
 
 `test_mutation_adding_a_derived_column_fails` / `test_mutation_removing_a_primary_column_fails` perform those mutations **in memory** on every run, so the checker's own polarity is pinned even if nobody edits the SQL.
 

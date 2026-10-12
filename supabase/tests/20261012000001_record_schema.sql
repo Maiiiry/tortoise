@@ -175,6 +175,82 @@ BEGIN
   END;
 END $$;
 
+-- ── 4b. The (label, key) CHECKs refuse a NULL key column (the fail-open hole) ─
+-- A bare `CHECK (node_key = <keycol>)` is SQL NULL — not FALSE — when the key
+-- column is NULL, so the row was ACCEPTED and node_key resolved to nothing in
+-- silence (review of PR #8179 P1). Each block seeds the matching node_identity
+-- row first, so the ONLY constraint that can reject the row is the key pin —
+-- if the CHECK is still fail-open the INSERT succeeds and the P0002 sentinel
+-- escapes the `check_violation` handler, failing the suite.
+INSERT INTO public.node_identity (org_id, graph_id, node_label, node_key)
+VALUES ('org_7968','g_7968','Source','s-null-url'),
+       ('org_7968','g_7968','Event','e-null-eventid'),
+       ('org_7968','g_7968','Session','sess-null-id'),
+       ('org_7968','g_7968','Object','obj-null-name'),
+       ('org_7968','g_7968','Subject','subj-null-name'),
+       ('org_7968','g_7968','Point','p-null-id')
+ON CONFLICT DO NOTHING;
+
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.source (org_id, graph_id, node_key, url)
+    VALUES ('org_7968','g_7968','s-null-url', NULL);
+    RAISE EXCEPTION '7968: source accepted a NULL url (fail-open key pin)' USING ERRCODE = 'P0002';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.event (org_id, graph_id, node_key, event_id)
+    VALUES ('org_7968','g_7968','e-null-eventid', NULL);
+    RAISE EXCEPTION '7968: event accepted a NULL event_id (fail-open key pin)' USING ERRCODE = 'P0002';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.session (org_id, graph_id, node_key, id)
+    VALUES ('org_7968','g_7968','sess-null-id', NULL);
+    RAISE EXCEPTION '7968: session accepted a NULL id (fail-open key pin)' USING ERRCODE = 'P0002';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.object (org_id, graph_id, node_key, name)
+    VALUES ('org_7968','g_7968','obj-null-name', NULL);
+    RAISE EXCEPTION '7968: object accepted a NULL name (fail-open key pin)' USING ERRCODE = 'P0002';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.subject (org_id, graph_id, node_key, name)
+    VALUES ('org_7968','g_7968','subj-null-name', NULL);
+    RAISE EXCEPTION '7968: subject accepted a NULL name (fail-open key pin)' USING ERRCODE = 'P0002';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.point (org_id, graph_id, node_key, id, content)
+    VALUES ('org_7968','g_7968','p-null-id', NULL, 'a claim');
+    RAISE EXCEPTION '7968: point accepted a NULL id (fail-open key pin)' USING ERRCODE = 'P0002';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
+
 -- The valid rows the rest of the suite needs (as service_role: the write path).
 SET ROLE service_role;
 INSERT INTO public.point (org_id, graph_id, node_key, id, content)

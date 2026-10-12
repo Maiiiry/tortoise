@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS public.object (
     PRIMARY KEY (org_id, graph_id, node_key),
     FOREIGN KEY (org_id, graph_id, node_label, node_key)
         REFERENCES public.node_identity (org_id, graph_id, node_label, node_key) ON DELETE CASCADE,
-    CONSTRAINT chk_object_node_key_is_contract_key CHECK (node_key = name),
+    -- `name IS NOT NULL` makes the pin total: a bare `node_key = name` is NULL
+    -- (not FALSE) when name is NULL and would be silently satisfied (#8179 P1).
+    CONSTRAINT chk_object_node_key_is_contract_key CHECK (name IS NOT NULL AND node_key = name),
     CONSTRAINT chk_object_props_no_derived CHECK (
         NOT (props ?| ARRAY['embedding', 'status']::text[])
     )
@@ -83,7 +85,8 @@ CREATE TABLE IF NOT EXISTS public.subject (
     PRIMARY KEY (org_id, graph_id, node_key),
     FOREIGN KEY (org_id, graph_id, node_label, node_key)
         REFERENCES public.node_identity (org_id, graph_id, node_label, node_key) ON DELETE CASCADE,
-    CONSTRAINT chk_subject_node_key_is_contract_key CHECK (node_key = name),
+    -- see the NULL note on chk_object_node_key_is_contract_key (#8179 review P1)
+    CONSTRAINT chk_subject_node_key_is_contract_key CHECK (name IS NOT NULL AND node_key = name),
     CONSTRAINT chk_subject_props_no_derived CHECK (
         NOT (props ?| ARRAY['embedding']::text[])
     )

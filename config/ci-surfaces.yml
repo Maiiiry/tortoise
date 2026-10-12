@@ -67,6 +67,13 @@ surfaces:
   # `eval` arm below covers `tortoise/embeddings.py`, which the same guard pins.
   - test_7809_hosted_prewarm_warmup_flag.py
   - test_7677_create_org_retry_idempotent.py  # #7677: wait-bound retry must not 409 on the caller's own org; owns to `api` (the change pins tortoise/hosted_api.py + tortoise/supabase_control.py create-org lanes)
+  # #7968 / PR #8179 review P1: DUAL-REGISTERED with `core` below. The guard
+  # pins `purge_org_control_plane` in `tortoise/supabase_control.py`, which IS a
+  # SOURCE_PATTERNS["api"] entry — so a supabase_control.py-only change matches
+  # `api`, REPLACES the `core` fallback in select(), and would never run the
+  # `core`-only registration. Without this `api` arm the guard is skipped on the
+  # exact change it exists to guard (the #2938/#3154/#4367 silent-drop class).
+  - test_7968_org_purge_rpc.py
   # #3561/#3359: per-capture graph-op accounting. Dual-registered because NO
   # single arm covers every file the change touches: `hosted_api.py` and
   # `metering.py` are SOURCE_PATTERNS["api"], `graph_ops.py` matches no named
@@ -950,13 +957,15 @@ surfaces:
   # write/read marker split. No DB, no network — default `core` surface is correct.
   - test_4220_blog_residue_cleanup.py
   - test_record_schema_placement.py
-  # #7968 / PR #8179 P2: guards the org-erasure wiring — `purge_org_control_plane`
+  # #7968 / PR #8179 review P1: guards the org-erasure wiring — `purge_org_control_plane`
   # must route the organizations delete through the `purge_org_record` RPC
   # (migration 20261012000005), which sets app.record_journal_purge so the
   # organizations -> graphs -> journal_event cascade can pass the append-only
-  # trigger. Hermetic (FakeControlPlane), so the default `core` surface is
-  # correct: a `tortoise/supabase_control.py`-only change matches no
-  # SOURCE_PATTERNS rule and falls through to `core`.
+  # trigger. Hermetic (FakeControlPlane), so `core` is a correct home — but the
+  # earlier claim here that a `tortoise/supabase_control.py`-only change "falls
+  # through to core" was FALSE: that file IS a `SOURCE_PATTERNS["api"]` entry, so
+  # the change selects `api` and this `core` arm never runs. The file is now
+  # DUAL-REGISTERED (see the `api` arm above).
   - test_7968_org_purge_rpc.py
   # #2886: the wiring seam's hermetic adapter guard
   # (`tools/longmem_eval/retrieve.py::temporal_aggregate_verdict` over the

@@ -190,7 +190,11 @@ CREATE TABLE IF NOT EXISTS public.source (
     PRIMARY KEY (org_id, graph_id, node_key),
     FOREIGN KEY (org_id, graph_id, node_label, node_key)
         REFERENCES public.node_identity (org_id, graph_id, node_label, node_key) ON DELETE CASCADE,
-    CONSTRAINT chk_source_node_key_is_contract_key CHECK (node_key = url),
+    -- `url IS NOT NULL` is NOT redundant: a bare `node_key = url` evaluates to
+    -- SQL NULL (not FALSE) when url is NULL, so the constraint would be
+    -- SATISFIED and node_key would resolve to nothing in silence (#7968 review
+    -- of PR #8179 P1). The key column must be present for the pin to mean.
+    CONSTRAINT chk_source_node_key_is_contract_key CHECK (url IS NOT NULL AND node_key = url),
     CONSTRAINT chk_source_props_no_derived CHECK (
         NOT (props ?| ARRAY['__runId', 'previousContentHash', 'reliability', 'reliabilityComponents', 'reliability_derived_at']::text[])
     )
@@ -247,7 +251,8 @@ CREATE TABLE IF NOT EXISTS public.event (
     PRIMARY KEY (org_id, graph_id, node_key),
     FOREIGN KEY (org_id, graph_id, node_label, node_key)
         REFERENCES public.node_identity (org_id, graph_id, node_label, node_key) ON DELETE CASCADE,
-    CONSTRAINT chk_event_node_key_is_contract_key CHECK (node_key = event_id),
+    -- see the NULL note on chk_source_node_key_is_contract_key (#8179 review P1)
+    CONSTRAINT chk_event_node_key_is_contract_key CHECK (event_id IS NOT NULL AND node_key = event_id),
     CONSTRAINT chk_event_props_no_derived CHECK (
         NOT (props ?| ARRAY['confidence']::text[])
     )
@@ -297,7 +302,8 @@ CREATE TABLE IF NOT EXISTS public.session (
     PRIMARY KEY (org_id, graph_id, node_key),
     FOREIGN KEY (org_id, graph_id, node_label, node_key)
         REFERENCES public.node_identity (org_id, graph_id, node_label, node_key) ON DELETE CASCADE,
-    CONSTRAINT chk_session_node_key_is_contract_key CHECK (node_key = id),
+    -- see the NULL note on chk_source_node_key_is_contract_key (#8179 review P1)
+    CONSTRAINT chk_session_node_key_is_contract_key CHECK (id IS NOT NULL AND node_key = id),
     CONSTRAINT chk_session_props_no_derived CHECK (
         NOT (props ?| ARRAY[]::text[])
     )

@@ -118,7 +118,9 @@ CREATE TABLE IF NOT EXISTS public.point (
     PRIMARY KEY (org_id, graph_id, node_key),
     FOREIGN KEY (org_id, graph_id, node_label, node_key)
         REFERENCES public.node_identity (org_id, graph_id, node_label, node_key) ON DELETE CASCADE,
-    CONSTRAINT chk_point_node_key_is_contract_key CHECK (node_key = id),
+    -- `id IS NOT NULL` makes the pin total: a bare `node_key = id` is NULL (not
+    -- FALSE) when id is NULL and would be silently satisfied (#8179 review P1).
+    CONSTRAINT chk_point_node_key_is_contract_key CHECK (id IS NOT NULL AND node_key = id),
     CONSTRAINT chk_point_baseline_author_set CHECK (baseline_source IS NULL OR baseline_source = 'set-by-author'),
     CONSTRAINT chk_point_baseline_complete CHECK (
         (baseline_source IS NULL) = (baseline_alpha IS NULL)
