@@ -154,8 +154,15 @@ _MINIMAL_RECORDS: dict[str, dict] = {
     "PointRevised": {"id": "p1", "new_content": "c2"},
     "OperatorAnnotated": {"id": "p1", "annotator_bias": 0.5},
     "PointRetracted": {"id": "p1"},
-    "PointSuperseded": {"id": "p1", "new_id": "p2"},
-    "PointInvalidated": {"id": "p1", "corrected_by": "p2"},
+    "PointSuperseded": {"id": "p1", "new_id": "p2",
+                        # The real producer payload (#2423): the bi-temporal
+                        # stamps the fold replays verbatim.
+                        "valid_from": "2026-10-12T00:00:00Z",
+                        "valid_to": "2026-10-12T00:00:24Z",
+                        "expired_at": "2026-10-12T00:00:24Z"},
+    "PointInvalidated": {"id": "p1", "corrected_by": "p2",
+                         "valid_to": "2026-10-12T00:00:25Z",
+                         "expired_at": "2026-10-12T00:00:25Z"},
     "ConfidenceChanged": {"id": "p1", "confidence": 0.4},
     "ObjectRegistered": {"id": "o1", "name": "n1", "objectKind": "document"},
     "ObjectSuperseded": {"id": "o1", "name": "n1", "supersedes_by": "o2"},
@@ -206,7 +213,12 @@ def test_each_declared_type_materializes_or_declares_a_no_effect(record_type):
 def test_entity_mutated_dispatches_on_op_and_refuses_undeclared_ops():
     base = {"type": "EntityMutated", "ts": "T", "id": "p1", "label": "Point"}
     delete = rp.mutations_for({**base, "op": "delete"}, org_id="o", graph_id="g")
-    assert len(delete) == 1 and delete[0].sql.startswith("DELETE FROM public.point")
+    # The hard delete is the identity parent's removal (cascades the node and
+    # its incident relations, matching the fold's `DETACH DELETE`) then the
+    # node row itself.
+    assert len(delete) == 2, delete
+    assert delete[0].sql.startswith("DELETE FROM public.node_identity"), delete
+    assert delete[1].sql.startswith("DELETE FROM public.point"), delete
 
     patch = rp.mutations_for(
         {**base, "op": "restatus", "state": {"status": "retracted"}},
@@ -394,6 +406,65 @@ def test_every_primary_property_the_journal_carries_is_storable():
             "field the journal carries must be storable (column or the "
             "declared props tail)"
         )
+
+
+#: §17.5's PRIMARY Point properties whose journal carrier is a PATCH record,
+#: not the `PointAdded` full snapshot the generic leg above always builds.
+#: The bi-temporal window and the terminal `outdated` flag ride these two
+#: carriers, and the fold replays them verbatim (`SET n.outdated=true,
+#: n.validTo=$vt, n.expiredAt=$ea`). Payloads are the real producer shapes
+#: (`sdk.py::supersede_point` / `invalidate_point`).
+_LIFECYCLE_CARRIERS: dict[str, tuple[dict[str, Any], set[str]]] = {
+    "PointSuperseded": (
+        {"id": "p1", "new_id": "p2", "valid_from": "vf",
+         "valid_to": "vt", "expired_at": "ea"},
+        {"valid_to", "expired_at", "outdated"},
+    ),
+    "PointInvalidated": (
+        {"id": "p1", "corrected_by": "p2", "valid_to": "vt",
+         "expired_at": "ea"},
+        {"valid_to", "expired_at", "outdated"},
+    ),
+}
+
+
+def test_the_lifecycle_patch_carriers_store_their_primary_columns():
+    """Drives the PRIMARY-storable leg from the LIFECYCLE carriers, not the snapshot.
+
+    The generic leg above builds a `PointAdded` for every Point property, so it
+    never constructs `PointSuperseded`/`PointInvalidated`; a patch whose
+    `from_payload` was empty silently dropped these PRIMARY columns while the
+    fold wrote them — a vacuous green for exactly the §17.5 rows that name
+    these carriers.
+    """
+    for record_type, (payload, required) in _LIFECYCLE_CARRIERS.items():
+        stored = _stored_names(rp.mutations_for(
+            {"type": record_type, "ts": "T", **payload},
+            org_id="o", graph_id="g"))
+        assert required <= stored, (
+            f"{record_type} dropped §17.5 PRIMARY {sorted(required - stored)} — "
+            "the fold replays them verbatim, so the record must store them"
+        )
+
+
+def test_point_superseded_does_not_rewrite_the_predecessors_valid_from():
+    """`PointSuperseded.valid_from` is the SUCCESSOR's start, not the old point's.
+
+    The producer emits `valid_from=succ_vf` (#4021) and the fold writes it as the
+    PREDECESSOR's `validTo` (`valid_to`); neither the live `supersede_point` SET
+    nor `_fold_point_superseded` touches the predecessor's `validFrom`. Storing
+    it here would overwrite the old point's own window start with the
+    successor's boundary.
+    """
+    stored = _stored_names(rp.mutations_for(
+        {"type": "PointSuperseded", "ts": "T", "id": "p1", "new_id": "p2",
+         "valid_from": "succ-vf", "valid_to": "succ-vf", "expired_at": "ea"},
+        org_id="o", graph_id="g"))
+    assert "valid_from" not in stored, (
+        "PointSuperseded wrote the successor's window start onto the "
+        "predecessor's validFrom — the fold does not"
+    )
+    assert {"valid_to", "expired_at", "outdated"} <= stored
 
 
 def _synthetic_record_for(table: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -613,13 +684,20 @@ def test_entity_mutated_state_ops_match_the_entity_id_column_not_node_key():
             {"type": "EntityMutated", "ts": "T", "id": ident, "label": label,
              "op": "delete"},
             org_id="o", graph_id="g",
-        )[0]
-        assert delete.sql.startswith(f"DELETE FROM public.{table}")
-        delete_predicate = (delete.sql.split(" WHERE ", 1)[1]
+        )
+        # The record's hard delete is `DETACH DELETE`'s two halves: the
+        # identity parent (its removal cascades the node row and the incident
+        # relations) resolved from the node id, then the node row itself.
+        assert len(delete) == 2, delete
+        assert delete[0].sql.startswith("DELETE FROM public.node_identity"), delete
+        assert f"node_key IN (SELECT node_key FROM public.{table} " in delete[0].sql
+        node_delete = next(s for s in delete
+                           if s.sql.startswith(f"DELETE FROM public.{table}"))
+        delete_predicate = (node_delete.sql.split(" WHERE ", 1)[1]
                             .replace("org_id = %s", "")
                             .replace("graph_id = %s", ""))
         assert "id = %s" in delete_predicate and "node_key" not in delete_predicate
-        assert ident in delete.params
+        assert ident in node_delete.params
 
 
 def test_entity_mutated_matches_a_url_only_source_by_its_node_key_too():
@@ -696,6 +774,71 @@ def test_a_node_upsert_serializes_jsonb_column_values():
         "to an ARRAY and the jsonb insert would fail"
     )
     assert "[0.1, 0.2]" in insert.params and '["a"]' in insert.params
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4b. HARD DELETE — the record's half of the graph's `DETACH DELETE`
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_a_hard_delete_cascades_the_identity_and_incident_relations():
+    """The graph's hard delete is `MATCH … DETACH DELETE n` — node AND edges.
+
+    `relation`'s endpoints are composite FKs into `node_identity`
+    (`ON DELETE CASCADE`), so removing the identity row IS the edge removal. A
+    bare node `DELETE` left the identity parent and every incident relation
+    alive: the record kept `IMPL(op1 -> p2)` after `p2` was gone, while the fold
+    did not. The record identity for Object/Subject is the `id` column, not
+    `node_key`, so the identity key is resolved from the node row before it is
+    removed — which is why the identity delete is emitted FIRST.
+    """
+    statements = rp.mutations_for(
+        {"type": "EntityMutated", "ts": "T", "id": "p2", "label": "Point",
+         "op": "delete"},
+        org_id="o", graph_id="g",
+    )
+    assert len(statements) == 2, statements
+    identity = statements[0]
+    assert identity.sql.startswith("DELETE FROM public.node_identity")
+    assert "node_key IN (SELECT node_key FROM public.point" in identity.sql
+    assert statements[1].sql.startswith("DELETE FROM public.point")
+    # The identity cascade works for a name-keyed Object too (delete matched by
+    # `id`, while `node_key` is the name the relation FKs into).
+    obj = rp.mutations_for(
+        {"type": "EntityMutated", "ts": "T", "id": "o1", "label": "Object",
+         "op": "delete"},
+        org_id="o", graph_id="g",
+    )
+    assert obj[0].sql.startswith("DELETE FROM public.node_identity")
+    assert "node_key IN (SELECT node_key FROM public.object" in obj[0].sql
+    assert "id = %s" in obj[0].sql and "node_key = %s" not in obj[0].sql
+
+
+def test_session_deleted_removes_the_agent_session_source_stub():
+    """The fold removes the `session:{id}` `:Source` in the SAME step.
+
+    `_fold_session_deleted(remove_source=True)` DETACH-DELETEs both the
+    `:Session` and its agentSession `:Source` stub; the record's note claimed the
+    stub was "removed with it" while the mutation did not remove it. The stub's
+    identity row is removed too, so its incident `CONTAINS`/`extractedFrom`
+    edges cascade — the graph's DETACH DELETE behaviour.
+    """
+    statements = rp.mutations_for(
+        {"type": "SessionDeleted", "ts": "T", "id": "sess1"},
+        org_id="o", graph_id="g",
+    )
+    node_sql = [s.sql for s in statements]
+    assert any(s.startswith("DELETE FROM public.session") for s in node_sql), node_sql
+    assert any(s.startswith("DELETE FROM public.source") for s in node_sql), node_sql
+    # The source stub is keyed `session:{id}`; its identity row is the FK parent
+    # whose removal cascades the stub's edges.
+    source = next(s for s in statements
+                  if s.sql.startswith("DELETE FROM public.source"))
+    assert "session:sess1" in source.params
+    assert any(s.startswith("DELETE FROM public.node_identity")
+               and "public.source" in s for s in node_sql), node_sql
+    assert any(s.startswith("DELETE FROM public.node_identity")
+               and "public.session" in s for s in node_sql), node_sql
 
 
 # ════════════════════════════════════════════════════════════════════════════

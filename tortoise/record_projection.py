@@ -254,10 +254,19 @@ class NodePatch:
 
 @dataclass(frozen=True)
 class NodeDelete:
-    """Remove an existing row (a re-delete is a 0-row no-op)."""
+    """Remove an existing row (a re-delete is a 0-row no-op).
+
+    ``companion_deletes`` names rows the same record removes beside the node
+    itself — the record's half of the graph's ``DETACH DELETE``. The fold's
+    ``SessionDeleted`` removes the session's agentSession ``:Source`` stub
+    (``url = session:{id}``) in the SAME step, so the record must too or the
+    note claiming it would be describing behaviour the code does not
+    implement. The template's ``{key}`` is the deleted node's key.
+    """
 
     node: Node
     key_from: str
+    companion_deletes: tuple[tuple[Node, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -391,16 +400,29 @@ RECORD_MUTATIONS: dict[str, Mutation] = {
     ),
     "PointSuperseded": Mutation(
         NodePatch(Node("point", "Point", "id"), key_from="id",
-                  literals=(("status", "superseded"),),
-                  from_payload=frozenset(),
+                  literals=(("status", "superseded"), ("outdated", True)),
+                  # ⚠️ NOT `valid_from`: the producer emits the SUCCESSOR's window
+                  # start under that name (#4021) and the fold writes it
+                  # verbatim as the PREDECESSOR's `validTo` (`valid_to`), never
+                  # as the predecessor's own `validFrom`. The old point's
+                  # `validFrom` already rides `PointAdded`; writing the
+                  # successor's start here would invert/rewrite the window.
+                  from_payload=frozenset({"valid_to", "expired_at"}),
                   renames=(("superseded_by", "new_id"),)),
+        note="§17.5 names this record as the carrier of `validTo`/`expiredAt`/"
+             "`outdated`; the fold replays them verbatim "
+             "(`SET n.status='superseded', n.outdated=true, n.validTo=$vt, "
+             "n.expiredAt=$ea`) — and does NOT touch `validFrom`, which is why "
+             "the payload's `valid_from` (the successor's start) is not stored",
     ),
     "PointInvalidated": Mutation(
         NodePatch(Node("point", "Point", "id"), key_from="id",
                   literals=(("outdated", True),),
-                  from_payload=frozenset(),
+                  from_payload=frozenset({"valid_to", "expired_at"}),
                   renames=(("superseded_by", "corrected_by"),)),
-        note="#2488 — `outdated` flag + CORRECTS; no status change",
+        note="#2488 — `outdated` flag + CORRECTS; no status change. §17.5's "
+             "carrier for `validTo`/`expiredAt` — the fold replays both "
+             "verbatim, so the record's columns carry them too",
     ),
     # ⚠️ THE EP-SCALAR CARVE-OUT, in its executable form: `confidence` is
     # DERIVED (§2.0/§17.5 — recomputed from the structure, "never stored as
@@ -516,10 +538,15 @@ RECORD_MUTATIONS: dict[str, Mutation] = {
              "first-writer-wins / last-writer-wins split below",
     ),
     "SessionDeleted": Mutation(
-        NodeDelete(Node("session", "Session", "id"), key_from="id"),
+        NodeDelete(
+            Node("session", "Session", "id"), key_from="id",
+            companion_deletes=(
+                (Node("source", "Source", "url"), "session:{key}"),
+            ),
+        ),
         note="#7951 — the hard-delete carrier; the session's agentSession "
              "`:Source` stub is a `Source` row keyed `session:{id}` and is "
-             "removed with it",
+             "removed with it (the fold's `remove_source=True`)",
     ),
     # ── Edges ────────────────────────────────────────────────────────────────
     "EntityLinked": Mutation(
@@ -872,6 +899,57 @@ def _delete_statement(
     )
 
 
+def _identity_delete_statement(
+    org_id: str,
+    graph_id: str,
+    node: Node,
+    key: str,
+    match: tuple[str, ...] = ("node_key",),
+) -> Statement:
+    """The FK parent's removal — the record's half of the graph's `DETACH DELETE`.
+
+    `node_identity` is the composite-FK parent of BOTH the node row and every
+    incident `relation` row, and the schema declares both FKs `ON DELETE
+    CASCADE` for exactly this purpose. A bare node `DELETE` therefore left the
+    identity row and each incident edge alive — the record kept edges to a node
+    it had removed, while the graph's `MATCH … DETACH DELETE n` (the fold's
+    `_delete_entity_by_id`) dropped the node AND its edges.
+
+    An Object/Subject delete matches on the `id` column, not `node_key`
+    (Object/Subject key `node_key` on `name`), so the identity row's key is
+    resolved from the node row — which still exists at this point, because this
+    statement MUST run before `_delete_statement`. The subquery reads the node
+    table, so the cascade then removes that row and every incident relation.
+    """
+    predicate = " OR ".join(f"{c} = %s" for c in match)
+    if len(match) > 1:
+        predicate = f"({predicate})"
+    return Statement(
+        "DELETE FROM public.node_identity "
+        "WHERE org_id = %s AND graph_id = %s AND node_label = %s "
+        f"AND node_key IN (SELECT node_key FROM public.{node.table} "
+        f"WHERE org_id = %s AND graph_id = %s AND {predicate})",
+        (org_id, graph_id, node.label, org_id, graph_id, *([key] * len(match))),
+    )
+
+
+def _delete_statements(
+    org_id: str,
+    graph_id: str,
+    node: Node,
+    key: str,
+    match: tuple[str, ...] = ("node_key",),
+) -> list[Statement]:
+    """A hard delete: the identity parent FIRST (so the subquery sees the node
+    row), then the node row. The identity delete cascades the incident edges,
+    matching the graph's `DETACH DELETE`; the explicit node delete is the
+    child-first form and a no-op once the cascade has run."""
+    return [
+        _identity_delete_statement(org_id, graph_id, node, key, match),
+        _delete_statement(org_id, graph_id, node, key, match),
+    ]
+
+
 def _relation_coordinates(
     rel: RelationUpsert | RelationDelete,
     payload: Mapping[str, Any],
@@ -991,7 +1069,7 @@ def _op_dispatch_statements(
         raise RecordProjectionError(f"EntityMutated op={op!r} carries no key")
     match = _ENTITY_MATCH_COLUMNS.get(table, ("node_key",))
     if op in dispatch.delete_ops:
-        return [_delete_statement(org_id, graph_id, node, key, match=match)]
+        return _delete_statements(org_id, graph_id, node, key, match=match)
     if op in dispatch.patch_ops:
         col_values, tail = _split_properties(
             table, {k: v for k, v in state.items() if k != "name"},
@@ -1097,7 +1175,12 @@ def mutations_for(
     if isinstance(effect, NodeDelete):
         node = effect.node
         key = _key_value(node, record, effect.key_from)
-        return [_delete_statement(org_id, graph_id, node, key)]
+        statements = _delete_statements(org_id, graph_id, node, key)
+        for companion, template in effect.companion_deletes:
+            statements += _delete_statements(
+                org_id, graph_id, companion, template.format(key=key)
+            )
+        return statements
     raise RecordProjectionError(
         f"{record_type!r} declares an effect this engine does not implement: "
         f"{type(effect).__name__}"

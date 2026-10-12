@@ -707,11 +707,13 @@ try {
   // the totality evidence (a skip would land one short) plus the fold's own
   // verdicts: p2 is hard-deleted by its EntityMutated, sess1 by SessionDeleted,
   // the `delete_only` DirectEdgeRepoint removes the `aboutPoint` row its
-  // DirectEdgeCreated landed, and the two sources + one object + one subject +
-  // three relations survive.
+  // DirectEdgeCreated landed, the hard delete's identity cascade removes the
+  // `IMPL(op1 -> p2)` edge incident to the deleted p2, the `session:{id}`
+  // agentSession Source stub is created then removed with its session, and the
+  // two surviving sources + one object + one subject + two relations remain.
   const expected = { journal: String(wantJournal), points: '2',
                      sources: '2', objects: '1', subjects: '1',
-                     sessions: '0', relations: '3' };
+                     sessions: '0', relations: '2' };
   for (const [key, value] of Object.entries(expected)) {
     if (String(c[key]) !== value) {
       console.error(`✗ #7969: record.${key} = ${c[key]}, expected ${value}`);
@@ -743,6 +745,41 @@ try {
     `SELECT superseded_by FROM public.subject WHERE node_key = 'team-x'`);
   if (superseded.rows[0]?.superseded_by !== 'team-y') {
     console.error(`✗ #7969: the Subject supersede was silently dropped: ${JSON.stringify(superseded.rows)}`);
+    process.exit(1);
+  }
+
+  // The hard delete is the graph's `DETACH DELETE`: the node row AND its edges.
+  // `relation`'s endpoints are composite FKs into `node_identity` with
+  // ON DELETE CASCADE, so the identity row's removal is the edge removal. A
+  // bare node DELETE left both alive — the record kept `IMPL(op1 -> p2)` after
+  // p2 was gone. Assert both halves directly, not via the relation count.
+  const p2Identity = await db.query(
+    `SELECT count(*) AS n FROM public.node_identity
+      WHERE node_label = 'Point' AND node_key = 'p2'`);
+  if (Number(p2Identity.rows[0].n)) {
+    console.error('✗ #7969: the hard-deleted Point left a stale node_identity row');
+    process.exit(1);
+  }
+  const p2Edges = await db.query(
+    `SELECT count(*) AS n FROM public.relation
+      WHERE (src_label = 'Point' AND src_key = 'p2')
+         OR (tgt_label = 'Point' AND tgt_key = 'p2')`);
+  if (Number(p2Edges.rows[0].n)) {
+    console.error(`✗ #7969: ${p2Edges.rows[0].n} relation(s) still reference the hard-deleted p2`);
+    process.exit(1);
+  }
+
+  // The `SessionDeleted` companion: the `session:{id}` agentSession Source stub
+  // is created (ev-35) then removed in the same step as its session
+  // (the fold's `remove_source=True`). Neither the stub nor its identity row
+  // survives; the two real sources do (a count assertion alone cannot see it).
+  const stub = await db.query(
+    `SELECT
+       (SELECT count(*) FROM public.source WHERE node_key = 'session:sess1') AS source_row,
+       (SELECT count(*) FROM public.node_identity
+          WHERE node_label = 'Source' AND node_key = 'session:sess1')       AS identity_row`);
+  if (Number(stub.rows[0].source_row) || Number(stub.rows[0].identity_row)) {
+    console.error(`✗ #7969: the SessionDeleted left its agentSession Source stub: ${JSON.stringify(stub.rows)}`);
     process.exit(1);
   }
 
