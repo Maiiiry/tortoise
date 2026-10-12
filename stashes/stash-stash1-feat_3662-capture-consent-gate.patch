@@ -1,0 +1,388 @@
+diff --git a/.env.example b/.env.example
+index 605136aeb..876f5b639 100644
+--- a/.env.example
++++ b/.env.example
+@@ -648,10 +648,15 @@ FALKORDB_PASSWORD=falkordb
+ #   (unset/blank/any other value ⇒ no transcript leaves the machine). Truthy:
+ #   1 / true / yes / on. Applies to every transcript upload regardless of
+ #   endpoint (hosted or self-hosted), to the Claude Code session-end.sh hook,
+-#   and to `tortoise session capture` / `tortoise sessions import`. NOTE: that
+-#   list is exhaustive for the IN-REPO paths only — the Pi reflect-hook
+-#   extension lives in agent-infra and keys capture on credential presence
+-#   instead of this variable (agent-infra#1117, open).
++#   to `tortoise session capture` / `tortoise sessions import`, and to the
++#   SDK's client transmission (`TortoiseSDK.commit_session` → `_post_commit`,
++#   #3662). NOTE: that list is exhaustive for the IN-REPO paths only —
++#   the hosted MCP tool `tortoise_session_capture` runs SERVER-side, so the
++#   client host cannot gate it (it carries the server policy
++#   `session_recording`, default-ON per #1927; making it require a
++#   client-carried consent assertion is an open product question, #3662), and
++#   the Pi reflect-hook extension lives in agent-infra and keys capture on
++#   credential presence instead of this variable (agent-infra#1117, open).
+ # TORTOISE_CAPTURE=1
+ 
+ # TORTOISE_INDEX_CHILD_STDERR — debug-redirect for the backgrounded hook
+diff --git a/docs/quickstart-cloud.md b/docs/quickstart-cloud.md
+index 20cae40fc..0a55c4291 100644
+--- a/docs/quickstart-cloud.md
++++ b/docs/quickstart-cloud.md
+@@ -135,7 +135,17 @@ is **per-surface**, not uniform (#3615):
+ - **The in-repo paths** fail closed on the explicit `TORTOISE_CAPTURE=1` opt-in
+   (`tortoise/capture_consent.py`), which is credential-independent — exporting
+   `TORTOISE_API_KEY` for the MCP `Authorization` header (section 2) does **not**
+-  enable capture there; it only authenticates the connection.
++  enable capture there; it only authenticates the connection. The gated paths
++  are the Claude Code `session-end.sh` hook, `tortoise session capture` /
++  `tortoise sessions import`, and the SDK's client transmission
++  (`TortoiseSDK.commit_session` → `POST /v1/sessions/commit`).
++- **The hosted MCP tool `tortoise_session_capture` is not gated by this
++  variable** — it executes on the server, which cannot read the client host's
++  `TORTOISE_CAPTURE`. It carries the server-side recording policy
++  (`session_recording`, default-ON) instead. Whether an explicit, agent-invoked
++  capture should also require a *client-carried* consent assertion is an open
++  product question (#3662). `TortoiseSDK.capture_session` is likewise ungated —
++  it writes the local graph, it does not transmit to the vendor.
+ - **The Pi agent-harness `reflect-hook` is not gated that way.** It lives in
+   `agent-infra` and starts hosted capture on **credential presence**, never
+   reading `TORTOISE_CAPTURE` — so on a Pi host, exporting `TORTOISE_API_KEY` is
+diff --git a/docs/research/2026-09-16-3615-capture-consent.md b/docs/research/2026-09-16-3615-capture-consent.md
+index bc47217fd..ad6bbbe50 100644
+--- a/docs/research/2026-09-16-3615-capture-consent.md
++++ b/docs/research/2026-09-16-3615-capture-consent.md
+@@ -99,6 +99,28 @@ The predicate is deliberately **host-agnostic**: a self-hosted daemon is still
+ data leaving the machine, so the requirement does not depend on the endpoint
+ the resolved config names.
+ 
++### Surface inventory — which in-repo paths the predicate reaches (#3662)
++
++#3615 gated the paths it owned and declared the rest out of scope. #3662 closed
++the one remaining CLIENT-side hole it left, and recorded the two surfaces it
++deliberately did **not** gate — otherwise #3615's claim ("no in-repo path
++requires an explicit non-credential opt-in") stays false for them without anyone
++noticing:
++
++| In-repo surface | Executes | `TORTOISE_CAPTURE` gate | Why |
++|---|---|---|---|
++| `tortoise/__main__.py` — `session capture`, `sessions import`, `session drain` | client | **YES** | transcript upload to `{TORTOISE_API_URL}` |
++| `tortoise/claude-hooks/session-end.sh` | client (bash twin) | **YES** | same upload, ambient path |
++| `TortoiseSDK.commit_session` → `_post_commit` | client | **YES** (#3662) | POSTs the derived payload to `/v1/sessions/commit` |
++| `tortoise/mcp_server.py::tortoise_session_capture` | **server** | **NO** (deferred) | the client host's env is unreadable server-side; gate is the server policy `session_recording` (default-ON, #1927). The real fix is a *client-carried* signal (an MCP request header) — an open product decision, #3662 |
++| `TortoiseSDK.capture_session` | client | **NO** (by design) | a graph write (embedded / `TORTOISE_DB_URI`), not a vendor transmission; gating it would also refuse pure local writes |
++| Pi `reflect-hook` (agent-infra) | client | **NO** (open) | keys capture on credential presence; agent-infra#1117 |
++
++The enforcement shape for the #3662 row follows the layer model above: the
++predicate lives once in `tortoise/capture_consent.py`, and the gate sits on the
++primitive that TRANSMITS (`_post_commit`), with `commit_session` refusing first
++so no extraction is spent on an unauthorised upload.
++
+ ## Rejected alternatives (#3615 solution-diverge) and why
+ 
+ - **B1 — a `capture` key in the existing credential file** (`./.tortoise` /
+diff --git a/tests/test_capture_consent.py b/tests/test_capture_consent.py
+index 481768624..83ae0c785 100644
+--- a/tests/test_capture_consent.py
++++ b/tests/test_capture_consent.py
+@@ -16,6 +16,7 @@ import os
+ import stat
+ import sys
+ import threading
++from pathlib import Path
+ from unittest import mock
+ 
+ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+@@ -25,13 +26,17 @@ import pytest
+ from tests._signal_hygiene import harness_safe_sigalrm
+ from tortoise.__main__ import main
+ from tortoise.capture_consent import (
++    CAPTURE_DECLINED_HINT,
+     CAPTURE_OPT_IN_ENV,
+     capture_consent_enabled,
++    capture_declined_reason,
+     capture_notice_path,
+     capture_notice_shown_path,
+     pending_capture_notice,
+ )
+ 
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
+ GLOBAL_CFG = {
+     "api_key": "tt_global", "api_url": "https://api.premiselabs.co",
+     "org_id": "team-g", "org_name": "Global", "device_id": "anon-g",
+@@ -476,3 +481,98 @@ def test_install_probe_is_not_capture_gated(tmp_path):
+         rc = main(["session", "probe", "--harness", "claude"])
+     assert rc == 0
+     assert urlopen.called
++
++
++# ── #3662: the SDK client TRANSMISSION path is consent-gated ──────────────
++# The defect this pins: #3615's confirmed problem statement said "no in-repo
++# path requires an explicit non-credential opt-in", but `TortoiseSDK`'s
++# `_post_commit` (POST `/v1/sessions/commit`) shipped session-derived content
++# with no consent check — the one in-repo, CLIENT-side transmission primitive
++# the predicate did not reach. The hosted MCP tool
++# (`mcp_server.tortoise_session_capture`) is deliberately NOT gated here: it
++# executes server-side, so the client host's `TORTOISE_CAPTURE` is unreadable
++# there (its gate is the server policy `session_recording`, #1927). See the
++# consumer inventory in `tortoise/capture_consent.py`.
++
++
++def test_capture_declined_reason_is_none_when_opted_in(monkeypatch):
++    """The decline side of the predicate is inert once the host opts in."""
++    monkeypatch.setenv(CAPTURE_OPT_IN_ENV, "1")
++    assert capture_declined_reason() is None
++
++
++def test_capture_declined_reason_records_the_durable_notice(tmp_path):
++    """One call decides the refusal AND records the migration notice.
++
++    Single-sourcing the decline is what stops a new transmitting surface from
++    refusing without writing the `~/.tortoise/capture-consent-notice` channel
++    the migration depends on (`_isolated` pins HOME to `tmp_path`)."""
++    reason = capture_declined_reason()
++    assert reason == CAPTURE_DECLINED_HINT
++    assert capture_notice_path(tmp_path).exists(), (
++        "the refusal must record the durable migration notice")
++
++
++def test_sdk_post_commit_refuses_without_consent_and_never_posts(monkeypatch):
++    """#3662: the client transmission primitive fails closed.
++
++    FAIL-ON (before the fix): `_post_commit` POSTs the derived payload with no
++    consent consulted — the test's `requests.post` recorder is hit.
++    REACHABLE: the consent variable is genuinely UNSET (`_isolated` deletes it,
++    ordered after the suite-wide grant in tests/conftest.py)."""
++    import requests
++
++    from tortoise.sdk import _post_commit
++
++    posted: list = []
++    monkeypatch.setattr(requests, "post", lambda *a, **k: posted.append(a))
++    payload = {"session_id": "s1", "points": [], "entities": [],
++               "operators": [], "summary": "", "story_arc": ""}
++    with pytest.raises(PermissionError) as excinfo:
++        _post_commit(payload, base_url="http://unused", api_key="tt_k")
++    assert CAPTURE_OPT_IN_ENV in str(excinfo.value), excinfo.value
++    assert posted == [], "an unconsented capture must not POST"
++
++
++def test_sdk_post_commit_transmits_when_consented(monkeypatch):
++    """Control for the gate: the opt-in takes the authorised branch.
++
++    Without this, a gate that always refuses would pass the test above."""
++    import requests
++
++    from tortoise.sdk import _post_commit
++
++    calls: list = []
++
++    class _Resp:
++        def raise_for_status(self):
++            return None
++
++        def json(self):
++            return {"duplicate": False}
++
++    monkeypatch.setenv(CAPTURE_OPT_IN_ENV, "1")
++    monkeypatch.setattr(requests, "post",
++                        lambda url, **k: calls.append(url) or _Resp())
++    payload = {"session_id": "s1", "points": [], "entities": [],
++               "operators": [], "summary": "", "story_arc": ""}
++    out = _post_commit(payload, base_url="http://unused.example", api_key="tt_k")
++    assert out == {"duplicate": False}
++    assert calls == ["http://unused.example/v1/sessions/commit"], calls
++
++
++def test_quickstart_documents_both_consent_contracts():
++    """#3662's minimum requirement: document the SDK gate next to #3615's
++    opt-in AND name the surface that is deliberately NOT client-gated, so the
++    two contracts cannot drift apart in the doc a user actually reads.
++
++    The refusal hint points readers at this file by name
++    (`CAPTURE_DECLINED_HINT`), so it is the surface the two claims must agree
++    on."""
++    doc = (REPO_ROOT / "docs" / "quickstart-cloud.md").read_text(encoding="utf-8")
++    assert "TortoiseSDK.commit_session" in doc, (
++        "the quickstart must name the SDK's consent-gated transmission path")
++    assert "tortoise_session_capture" in doc, (
++        "the quickstart must name the server-side MCP tool whose gate is the "
++        "server policy, not the client opt-in")
++    assert "#3662" in doc, "the deferred hosted-side decision must be traceable"
+diff --git a/tests/test_capture_session.py b/tests/test_capture_session.py
+index 0e5e2743b..28fef2262 100644
+--- a/tests/test_capture_session.py
++++ b/tests/test_capture_session.py
+@@ -61,6 +61,58 @@ def test_commit_session_threads_session_date(sdk, monkeypatch):
+     assert received[1] == "2026-08-01"
+ 
+ 
++# ── #3662: the SDK transmission path requires explicit consent ────────────
++# `_post_commit` is the in-repo CLIENT-side transmission primitive for
++# session-derived content; #3615's predicate did not reach it, so
++# `commit_session` uploaded with no opt-in. The gate now runs twice: first here
++# (before any extraction is spent), then at `_post_commit` itself (the
++# bypass-proof chokepoint, pinned in tests/test_capture_consent.py).
++
++def test_commit_session_refuses_without_consent_before_extraction(
++        sdk, monkeypatch):
++    """FAIL-ON (before the fix): extraction runs and `_post_commit` is reached,
++    so the recorder is hit and the result is `ok=True`.
++
++    The refusal must land BEFORE extraction: an unconsented transmission must
++    not spend a BYOK provider call over the raw conversation, and the CLI's
++    gated twins (`session capture` / `sessions import`) also refuse before any
++    work. `monkeypatch.delenv` is the explicit negative the suite-wide
++    `_capture_consent_default_on` grant (tests/conftest.py) requires."""
++    import tortoise.extractor_v2 as ev2
++
++    monkeypatch.delenv("TORTOISE_CAPTURE", raising=False)
++    posted: list = []
++    monkeypatch.setattr("tortoise.sdk._post_commit",
++                        lambda *a, **k: posted.append(a) or {"ok": True})
++    extracted: list = []
++    monkeypatch.setattr(ev2, "extract_session_v2",
++                        lambda *a, **k: extracted.append(a) or {})
++    out = sdk.commit_session(CONV)
++    assert out["ok"] is False, out
++    assert any("explicit consent" in e for e in out["errors"]), out["errors"]
++    assert extracted == [], "the refusal must precede extraction"
++    assert posted == [], "an unconsented commit must not POST"
++
++
++def test_commit_session_is_not_refused_when_consented(sdk, monkeypatch):
++    """Control: the refusal is consent-dependent, not always-on.
++
++    Without this, a gate that refused unconditionally would pass the negative
++    test above."""
++    import tortoise.extractor_v2 as ev2
++
++    monkeypatch.setenv("TORTOISE_CAPTURE", "1")
++    extracted: list = []
++    monkeypatch.setattr(
++        ev2, "extract_session_v2",
++        lambda *a, **k: (extracted.append(a) or
++                         {"payload": None, "errors": ["no payload produced"]}))
++    out = sdk.commit_session(CONV)
++    assert extracted, "the consented path must not be refused before extraction"
++    assert not any("explicit consent" in str(e)
++                   for e in out.get("errors", [])), out
++
++
+ # Legacy predicate name for negative-direction tests (#281). Kept as a
+ # constant so no edge-syntax literal appears in source (Task 5 sweep requires
+ # zero hits) — same pattern as tests/test_ranking.py.
+diff --git a/tortoise/capture_consent.py b/tortoise/capture_consent.py
+index a39659196..19eb988f9 100644
+--- a/tortoise/capture_consent.py
++++ b/tortoise/capture_consent.py
+@@ -25,6 +25,27 @@ Consumers:
+     that never updates itself). The bash↔Python **parity is pinned by
+     tests/test_session_capture_e2e.py** (the truthy/falsy matrix); the CLI-side
+     gate is covered by tests/test_capture_consent.py.
++  * `tortoise/sdk.py` — the SDK's client TRANSMISSION primitive
++    (``_post_commit`` → ``POST {TORTOISE_API_URL}/v1/sessions/commit``) is the
++    third client-side upload path (#3662), and it refuses here too. Its public
++    caller ``TortoiseSDK.commit_session`` refuses FIRST, before any extraction
++    runs, so no provider call is spent on an unauthorised transmission; the
++    primitive re-checks so a future caller cannot bypass consent by calling it
++    directly. Two ENFORCEMENT points, one predicate — the verdict string comes
++    from ``capture_declined_reason`` below.
++
++NOT gated here, by design (recorded so the two consent contracts cannot drift,
++#3662):
++  * ``tortoise/mcp_server.py::tortoise_session_capture`` executes SERVER-side
++    (it answers "session capture requires hosted mode" for stdio/self-host),
++    so the client host's ``TORTOISE_CAPTURE`` is unreadable there. Its gate is
++    the server policy ``session_recording`` — default-ON, ToS-covered, an
++    off-switch and explicitly NOT a consent gate (#1927). Gating this surface
++    needs a CLIENT-CARRIED signal (an MCP request header) and is an open
++    product question, not a client-side predicate (see #3662).
++  * ``TortoiseSDK.capture_session`` writes to the GRAPH (embedded, or
++    ``TORTOISE_DB_URI``) — a local write, not a vendor transmission. It is out
++    of scope here because gating it would also refuse pure local writes.
+ 
+ The truthy vocabulary is NOT declared here: it delegates to the tree's single
+ declared contract, `tortoise/env_truthy.py` (#4097), so this module cannot drift
+@@ -81,6 +102,27 @@ def capture_consent_enabled(env: Mapping[str, str] | None = None) -> bool:
+     return str(source.get(CAPTURE_OPT_IN_ENV, "")).strip(_ASCII_WS).lower() in TRUTHY
+ 
+ 
++def capture_declined_reason() -> str | None:
++    """The refusal message when the host has NOT opted in, else ``None`` (#3662).
++
++    The single *decline* side of the predicate. A transmitting surface refuses
++    on a non-``None`` answer, so:
++
++    * the durable migration notice is recorded on the SAME call that decides the
++      refusal (a surface cannot refuse and forget the notice), and
++    * a new surface cannot re-implement the refusal text — the returned string
++      IS ``CAPTURE_DECLINED_HINT``, so returning it to a caller and printing it
++      to stderr cannot diverge.
++
++    Deliberately NOT a boolean: ``capture_consent_enabled()`` is the predicate,
++    this is the refusal. Callers that only need the predicate keep calling it.
++    """
++    if capture_consent_enabled():
++        return None
++    record_capture_declined()
++    return CAPTURE_DECLINED_HINT
++
++
+ def capture_notice_path(home: Path | str | None = None) -> Path:
+     """Path of the durable one-time migration notice (``$HOME/.tortoise/…``).
+ 
+diff --git a/tortoise/sdk.py b/tortoise/sdk.py
+index cf3cfac6d..42db94264 100644
+--- a/tortoise/sdk.py
++++ b/tortoise/sdk.py
+@@ -5891,6 +5891,22 @@ class TortoiseSDK:
+         import os
+         import uuid
+         session_id = session_id or f"session_{uuid.uuid4().hex[:12]}"
++        # #3662: consent FIRST — this is the SDK sibling of the gated CLI
++        # primitives (`session capture` / `sessions import`), which also refuse
++        # before doing any work, so no extraction (and therefore no BYOK provider
++        # call over the raw conversation) is spent on a transmission the host has
++        # not authorised. The check is NOT the only enforcement point: the
++        # transmitting primitive `_post_commit` re-checks, so a future caller
++        # cannot bypass consent by calling it directly. One predicate
++        # (`tortoise/capture_consent.py::capture_declined_reason`), two
++        # enforcement points (defense in depth).
++        from tortoise.capture_consent import capture_declined_reason
++        declined = capture_declined_reason()
++        if declined is not None:
++            # A structured `ok=False` — the method's own contract is "errors are
++            # surfaced", never a raise out of a public entry point.
++            return {"session_id": session_id, "ok": False,
++                    "errors": [declined], "error": declined}
+         extractor = (extractor or os.environ.get("TORTOISE_EXTRACTOR", "v2")).lower()
+         if extractor == "v1" or summary is not None:
+             return self._commit_session_v1(
+@@ -26686,9 +26702,26 @@ def _now_iso() -> str:
+ 
+ 
+ def _post_commit(payload: dict, *, base_url=None, api_key=None) -> dict:
+-    """POST the derived payload to /v1/sessions/commit (replay-safe)."""
+-    import os  # noqa: I001
++    """POST the derived payload to /v1/sessions/commit (replay-safe).
++
++    #3662: this is the client TRANSMISSION primitive for session-derived content
++    (summary / points / entities / story_arc), so it fails closed on the
++    explicit `TORTOISE_CAPTURE` consent (#3615). Placed HERE — not on a shared
++    helper and not only on the public caller — because #3615's recorded model is
++    "the gate belongs on the primitives that TRANSMIT": every caller of this
++    function, present or future, inherits the gate.
++
++    Raises `PermissionError` rather than returning a refusal dict: the two
++    callers merge a returned dict into the response and set `ok=True`, so a
++    dict-shaped refusal would read as a successful commit. Their existing
++    `except Exception` channel already turns this into a structured `ok=False`.
++    """
++    import os  # noqa: I001 — `requests` is imported mid-block, same as before
++    from tortoise.capture_consent import capture_declined_reason
+     from tortoise.commit_schema import compute_client_commit_id
++    declined = capture_declined_reason()
++    if declined is not None:
++        raise PermissionError(declined)
+     payload["client_commit_id"] = compute_client_commit_id(
+         payload["session_id"], payload["points"], payload["entities"],
+         payload["operators"], payload["summary"], payload["story_arc"],

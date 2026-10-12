@@ -1,0 +1,165 @@
+diff --git a/tortoise/__pycache__/sdk.cpython-314.pyc b/tortoise/__pycache__/sdk.cpython-314.pyc
+index 27987ffb9..af3464209 100644
+Binary files a/tortoise/__pycache__/sdk.cpython-314.pyc and b/tortoise/__pycache__/sdk.cpython-314.pyc differ
+diff --git a/tortoise/mcp_server.py b/tortoise/mcp_server.py
+index 78234160f..bceb78e36 100644
+--- a/tortoise/mcp_server.py
++++ b/tortoise/mcp_server.py
+@@ -211,6 +211,11 @@ def tortoise_search(query: str | None = None, kind: str | None = None,
+ 
+     Point results annotated with EP breakdown (confidence_mean + evidence + contention).
+     min_confidence defaults to 0.0 (no filter).
++
++    Note: threshold default changed from 0.3 (Phase 0 semantic search) to 0.0.
++    RRF scores are rank-based (0.01-0.05 range typical), not cosine similarity (0-1).
++    Use threshold > 0 to filter out very weak matches; the old 0.3 default would
++    reject nearly all RRF results. (#20)
+     """
+     return _safe(sdk.tortoise_fts_query, query, kind=kind, context=context,
+                  threshold=threshold, limit=limit,
+diff --git a/tortoise/projection.py b/tortoise/projection.py
+index a26079e4e..02c3f1ad8 100644
+--- a/tortoise/projection.py
++++ b/tortoise/projection.py
+@@ -447,7 +447,10 @@ class FalkorProjection:
+             if fname.endswith('.jsonl'):
+                 events.extend(EventLog(os.path.join(log_dir, fname)).read_all())
+ 
+-        # Pass 1: create all Point/Operator nodes (skip edges) + non-edge events
++        # Pass 1: create all Point/Operator nodes first (skip edges),
++        # then apply PointRevised and other non-edge events.
++        # Sub-ordering within pass 1 ensures PointAdded always runs before
++        # PointRevised regardless of cross-file sort order (#21).
+         for ev in events:
+             t = ev["type"]
+             if t in ("PointAdded", "OperatorAdded"):
+@@ -473,6 +476,12 @@ class FalkorProjection:
+                             "ca": p.get("createdAt") or p.get("created_at"),
+                             "now": _now_iso()},
+                 )
++
++        # Pass 1b: apply revisions + other non-edge events AFTER all nodes exist
++        for ev in events:
++            t = ev["type"]
++            if t in ("PointAdded", "OperatorAdded"):
++                continue  # already handled in pass 1a
+             elif t == "PointRetracted":
+                 self._delete(ev["id"])
+             elif t == "PointsMerged":
+diff --git a/tortoise/projection/__init__.py b/tortoise/projection/__init__.py
+index 3c45186a5..1ef9a34c1 100644
+--- a/tortoise/projection/__init__.py
++++ b/tortoise/projection/__init__.py
+@@ -227,6 +227,8 @@ class FalkorProjection(
+                 events.extend(EventLog(os.path.join(log_dir, fname)).read_all())
+ 
+         # Pass 1: create all Point/Operator nodes (skip edges) + non-edge events
++        # Pass 1a: create all Point/Operator nodes first
++        # (skip edges), so cross-file PointRevised always has a node to revise (#21).
+         for ev in events:
+             t = ev["type"]
+             if t in ("PointAdded", "OperatorAdded"):
+@@ -252,6 +254,12 @@ class FalkorProjection(
+                             "ca": p.get("createdAt") or p.get("created_at"),
+                             "now": _now_iso()},
+                 )
++
++        # Pass 1b: apply revisions + other non-edge events AFTER all nodes exist
++        for ev in events:
++            t = ev["type"]
++            if t in ("PointAdded", "OperatorAdded"):
++                continue  # already handled in pass 1a
+             elif t == "PointRetracted":
+                 self._delete(ev.get("id") or ev["event_id"])
+             elif t == "PointsMerged":
+@@ -386,14 +394,16 @@ class FalkorProjection(
+         pid = ev.get("id") or ev["event_id"]
+         params: dict = {"id": pid, "c": new_content, "x": ev.get("new_context")}
+ 
+-        # Re-compute embedding when content changes (even to empty — wipe stale)
++        # Re-compute embedding when content changes (even to empty — wipe stale).
++        # Always set params["embedding"] so SET overwrites any stale value;
++        # on compute failure, set to None rather than preserving old embedding (#19).
+         if new_content is not None:
+             try:
+                 from tortoise.embeddings import compute_embedding
+                 emb = compute_embedding(new_content) if new_content else None
+                 params["embedding"] = emb  # None = wipe stale embedding for empty content
+             except Exception:
+-                pass
++                params["embedding"] = None  # wipe stale embedding on failure (#19)
+ 
+         set_clauses = ["n.content = coalesce($c, n.content)",
+                        "n.context = coalesce($x, n.context)"]
+diff --git a/tortoise/sdk.py b/tortoise/sdk.py
+index 47aec09eb..697dda08d 100644
+--- a/tortoise/sdk.py
++++ b/tortoise/sdk.py
+@@ -1172,7 +1172,17 @@ class TortoiseSDK:
+             # ponytail: guard empty content (stub nodes may have '')
+             if not content:
+                 continue
+-            confidence = 1.0 if content.lower() == q_lower else round(len(q) / len(content), 4)
++            # Confidence formula (#22): exact match → 1.0, partial match →
++            # [0.5, 1.0) via length ratio, smoothed to avoid scale collapse.
++            # len(q)/len(content) alone would give 0.001 for 1-char in 1000-char
++            # doc and 0.5 for 5-char in 10-char — not comparable. The 0.5 offset
++            # ensures all substring matches score ≥ 0.5, reserving [0, 0.5) for
++            # the hybrid fallback path (which has no substring match at all).
++            if content.lower() == q_lower:
++                confidence = 1.0
++            else:
++                ratio = len(q) / len(content)
++                confidence = round(0.5 + 0.5 * ratio, 4)
+             results.append({"id": pid, "name": content, "kind": kind or "", "confidence": confidence})
+ 
+         results.sort(key=lambda r: r["confidence"], reverse=True)
+diff --git a/tortoise/search_engine.py b/tortoise/search_engine.py
+index e2ffefa66..6f2aa75f5 100644
+--- a/tortoise/search_engine.py
++++ b/tortoise/search_engine.py
+@@ -58,7 +58,10 @@ class SearchResult:
+             "point_kind": self.point_kind,
+             "context": self.context,
+             "match_source": self.match_source,
+-            # Backward-compat aliases (Phase 0 migration from old search() API)
++            # Backward-compat aliases (Phase 0 migration from old search() API).
++            # IMPORTANT: "similarity" was cosine (0-1) in Phase 0; now it's the
++            # RRF fusion score (rank-based, typically 0.01-0.05). Clients that
++            # threshold on similarity must recalibrate. (#23)
+             "similarity": self.scores.rrf if self.scores else 0.0,
+             "snippet": self.content[:200] if len(self.content) > 200 else self.content,
+         }
+@@ -95,6 +98,11 @@ def run_fts_query(
+ 
+     Falls back gracefully if index doesn't exist or query fails.
+     entity_type: 'point' (default), 'event', or 'subject'.
++
++    Note: timeout_ms is checked AFTER the query completes (post-hoc).
++    A slow query still consumes DB resources — this is a soft guard,
++    not a connection-level kill. For connection-level timeout, set it
++    at the FalkorDB driver level. (#18)
+     """
+     label = entity_type.capitalize()  # point→Point, event→Event, subject→Subject
+     try:
+@@ -109,8 +117,7 @@ def run_fts_query(
+         rows = graph.query(
+             cypher, params={"query": query, "limit": limit}
+         ).result_set
+-        # NOTE: Timeout is checked AFTER query completes (post-hoc filter).
+-        # A slow query still consumes DB resources. Future: connection-level timeout.
++        # Post-hoc timeout check (see docstring for rationale)
+         elapsed = (time.monotonic() - start) * 1000
+         if elapsed > timeout_ms:
+             logger.warning("FTS query exceeded timeout: %.0fms > %dms", elapsed, timeout_ms)
+@@ -137,6 +144,10 @@ def run_vector_query(
+     via CALL db.idx.vector.queryNodes. Falls back to brute-force
+     vec.euclideanDistance if the index is unavailable (embedded mode,
+     old FalkorDB, or index creation failed).
++
++    Note: timeout_ms is checked AFTER the query completes (post-hoc).
++    A slow query still consumes DB resources — this is a soft guard,
++    not a connection-level kill. (#18)
+     """
+     if not query_vec:
+         return []

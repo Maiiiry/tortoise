@@ -1,233 +1,59 @@
----
-title: "Tortoise — Semantic + Epistemic + Episodic + Procedural Graph Engine"
-type: readme
-domain: epistemic
-status: live
-created: 2026-07-24
-updated: 2026-08-10
----
+# Local git stashes, exported before a machine handover — 2026-10-12
 
-# Tortoise
+Six `git stash` entries were sitting on the box that had been running the autonomous
+dispatch loop. Stashes exist only on local disk, so they were about to become
+unrecoverable when the machine was handed over.
 
-A graph engine for agent memory: claims are **Points**, relationships are **edges**, and belief scores are computed by propagating evidence through the graph (EP — Evidence Propagation).
+Each `.patch` below is the output of `git stash show -p <ref>` — a plain diff that can be
+applied with `git apply`, or inspected with `git apply --stat`.
 
-## Core hypothesis: the graph is the memory, not the summaries
+## Index
 
-The graph stores **STATE, not decisions**. Competitors store decision objects
-("Decision X was made because of Reasons"); we do not. The record is: state
-(objects/options with queryable lifecycle events — promoted/deprecated/
-superseded — and confidence) + points (the logic: claims connected to the
-state, the arguments that move confidence) + events (what happened, including
-the decision moment as an Event node, so the decision dimension stays
-queryable as a timeline). The graph says "this state is based on these
-reasons". The narrative lives in the graph's content, structure, **and** its metadata; agents are the computational layer that reads and maintains it; semantic summaries are
-derived projections, never the record. Evidence stays authoritative: every
-Point keeps its quoted source span, and the graph is an auditable index over
-unrewritten evidence.
+| File | Origin branch | Size | Issue | Issue state |
+|---|---|---|---|---|
+| `stash-stash1-feat_3662-capture-consent-gate.patch` | `feat/3662-capture-consent-gate` | +271 / 7 files | **#3662** | **OPEN, no PR** — at risk |
+| `stash-stash0-feat_2654-tm.patch` | `feat/2654-tm` | +206 / 1 file | #2654 | CLOSED — superseded |
+| `stash-stash5-feat_7697-hybrid-search-v2.patch` | `feat/7697-hybrid-search-v2` | +55 / 3 files | **#7697** | **OPEN, no PR** — at risk |
+| `stash-stash3-feat_7697-hybrid-search-v2.patch` | `feat/7697-hybrid-search-v2` | +52 / 6 files | **#7697** | **OPEN, no PR** — at risk |
+| `stash-stash4-feat_7697-hybrid-search-v2.patch` | `feat/7697-hybrid-search-v2` | +4 / 2 files | **#7697** | OPEN, no PR — trivial |
+| `stash-stash2-feat_167-story-arch.patch` | `feat/167-story-arch` | +0 / 1 file | #167 | CLOSED — empty |
 
-This is the product's core, falsifiable hypothesis (evidence: temporal-KG
-memory beats vector-summary memory — Graphiti arXiv:2501.13956; n26modi
-head-to-head: staleness error 87%→20%, historical-belief retrieval 60%→100%;
-event sourcing precedent). Full framing + the falsification experiments:
-`docs/drafts/2026-08-12-graph-as-memory-hypothesis.md`. Every epic takes it
-into account (filed 2026-08-12).
+## What is in the substantial ones
 
-Tortoise runs **as a service** — self-hosted or hosted — and your tools **connect** to it over MCP (Model Context Protocol). You don't import it into your application; you run it and point your agent at it, the way you'd run MongoDB and connect a driver.
+**#3662** (`+271 lines, 7 files`) — in-repo MCP `tortoise_session_capture` consent gate:
 
-A product of [Premise Labs](https://premiselabs.co).
+```
+ tortoise/capture_consent.py                     |  42 +++
+ tortoise/sdk.py                                 |  37 +-
+ tests/test_capture_consent.py                   | 100 ++++++++++
+ tests/test_capture_session.py                   |  52 +++++
+ docs/research/2026-09-16-3615-capture-consent.md|  22 ++
+ docs/quickstart-cloud.md                        |  12 +-
+ .env.example                                    |  13 +-
+```
 
-## Quickstart — Install → Connect → Query
+**#7697** (`+55` and `+52 lines`) — hybrid-search v2 work on the docs-baseline lychee leg.
 
-### 1. Install
-
-New to Tortoise? There are two ways to run it:
-
-- **Hosted (managed)** — no install, just connect your agent: [docs/quickstart-cloud.md](docs/quickstart-cloud.md)
-- **Self-hosted — durable (recommended): Docker compose.** Runs the daemon
-  plus a FalkorDB sidecar (AOF, named volume, healthcheck) from the repo root:
-
-  ```bash
-  git clone https://github.com/daniel-ospina/tortoise.git && cd tortoise
-  docker compose up -d          # daemon on http://localhost:8000 (MCP at /mcp)
-  ```
-
-  Durable multi-writer: the compose sidecar is the supported team/production
-  path. For a single-agent eval without Docker, use the pip path below —
-  embedded FalkorDBLite is SINGLE-WRITER / EVAL-ONLY (concurrent writers lose data).
-
-- **Eval substrate only — embedded, no Docker (NOT a way to run the product):**
-  This is what evals and parity runs execute on; a deployment is the compose
-  path above. Requires **Python ≥ 3.12**:
-
-  ```bash
-  git clone https://github.com/daniel-ospina/tortoise.git && cd tortoise
-  uv sync --extra embeddings --extra parity   # canonical dev env incl. the eval/parity extras
-  # or straight from GitHub (no clone):
-  pip install git+https://github.com/daniel-ospina/tortoise.git
-  ```
-
-  ⚠️ `uv sync` on its own gives you a **keyword-only product**
-  (`EmbeddingModel.get()` → `None`, hybrid retrieval silently degrades to
-  FTS-only). And an explicit `--extra` list is EXACT — it removes every extra
-  you leave out (`uv sync --extra embeddings` drops `parity`/pyarrow, which is
-  how a measurement run broke mid-investigation). Name every extra in ONE
-  command, or use `--all-extras`. Real measurement lanes fail closed on a
-  keyword-only env (#2985).
-
-  Embedded (no Docker) is the EVAL-ONLY fallback: `tortoise init` creates
-  `~/.tortoise/tortoise.db` (a bare init prints a one-line "embedded engine
-  active — eval-only fallback" notice first) and your agent connects over
-  **stdio** (quickstart
-  §5) — FalkorDBLite is SINGLE-WRITER / EVAL-ONLY, one agent evaluating
-  Tortoise, never a team deployment. Want the daemon's HTTP surface on
-  embedded anyway? `uv run python -m tortoise.selfhost` serves
-  `http://localhost:8000` — still eval-only on embedded.
-
-Operator/infra (deploying and maintaining the daemon): [docs/infra-runbook.md](docs/infra-runbook.md).
-
-### 2. Connect
-
-One transport per setup — daemon MCP over **HTTP** for hosted + the Docker
-path; **stdio** for the no-Docker single-agent eval path (quickstart §5):
+## How to use
 
 ```bash
-# Hosted — export it in this shell (and in your profile for later sessions;
-# if your profile is version-controlled, use a non-committed include instead)
-export TORTOISE_API_KEY=tt_YOUR_KEY
-claude mcp add --transport http tortoise https://api.premiselabs.co/mcp/ \
-  --header "Authorization: Bearer ${TORTOISE_API_KEY}"
-# Self-hosted — Docker path (compose daemon from §1): daemon MCP over HTTP
-claude mcp add --transport http tortoise http://localhost:8000/mcp
+# inspect without applying
+git apply --stat  stashes/stash-stash1-feat_3662-capture-consent-gate.patch
+
+# apply onto a fresh branch off main
+git checkout -b feat/3662-capture-consent-gate origin/main
+git apply stashes/stash-stash1-feat_3662-capture-consent-gate.patch
 ```
 
-> ℹ️ **Claude Code scope + approval.** `claude mcp add` writes **local**
-> scope by default — `~/.claude.json`, under this project's entry: private to
-> you, this project only, **never committed**. It skips the project-scope
-> server approval, but no scope is approval-free: Claude Code asks permission
-> the first time it calls each MCP tool (allow it once, or pre-allow
-> `mcp__tortoise__*`). `Added …` means the entry was written, not that it
-> connected — `claude mcp list` is the check.
->
-> **Sharing the config with the repo instead?** `--scope project` writes a
-> **committable** `.mcp.json` at the project root, approved once per machine —
-> start `claude` in the project and allow the prompt, or run `/mcp`
-> (`claude mcp reset-project-choices` resets the choice). ⛔ Re-using the hosted
-> `--header` there? **Single-quote it** (`'Authorization: Bearer
-> ${TORTOISE_API_KEY}'`) so the shell writes the reference, not your key, into a
-> file you are about to commit.
+**Status: unverified.** These are raw working-tree snapshots taken by an agent mid-task.
+They were never reviewed, and their tests were not run to completion. Treat them as a
+starting point, not as a candidate for merge — and expect context drift, since the branch
+they were stashed on may have moved since.
 
-```bash
-# Codex
-codex mcp add tortoise --url http://localhost:8000/mcp --bearer-token-env-var TORTOISE_API_KEY
-```
+## Why this file exists
 
-Or add to `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "tortoise": {
-      "type": "http",
-      "url": "http://localhost:8000/mcp"
-    }
-  }
-}
-```
-
-No Docker — single-agent eval on embedded FalkorDBLite (SINGLE-WRITER, eval
-only)? Connect over **stdio**, not the daemon HTTP: `tortoise init` creates
-`~/.tortoise/tortoise.db`, then use the stdio `.mcp.json` form
-(`command: python3 -m tortoise.mcp_server`, `TORTOISE_DB_PATH` set) from
-[quickstart §5](docs/quickstart-selfhosted.md). The Docker path never
-connects over stdio; the eval path never needs the daemon.
-
-### 3. Query
-
-Your agent now has Tortoise's tools — create points, query the graph, check belief structure, run evidence propagation. See the [MCP tool surface](tortoise/tool_registry.py) for the full registry (58 tools) and the [REST reference](tortoise/tool_registry.py) (as it lands).
-
-## Client & server packages (#526)
-
-Tortoise ships as **two distributions** — the MongoDB-driver model: the engine runs on the server, and you connect to it with a thin driver.
-
-| Distribution | What it is | License | Install where |
-|---|---|---|---|
-| `tortoise-graph` | The **server**: engine (SDK, projection, EP), daemon, MCP server, CLIs (`tortoise`, `tortoise-serve`, `tortoise-ingest`) | BSL-1.1 | Docker image / server host |
-| `tortoise-client` | The **thin driver**: MCP client + config + types + a `tortoise-client` CLI — connects, never embeds the engine | Apache-2.0 | anywhere you script / integrate |
-
-**Scripting / integration / agent tooling — install the client:**
-
-```bash
-pip install tortoise-client
-```
-
-Point it at a running server (`TORTOISE_MCP_URL`, default `http://localhost:8000/mcp`; `TORTOISE_API_KEY` when auth is on) and run `tortoise-client status`. A clean client install contains no engine code and pulls no engine dependencies (no FalkorDB / numpy / scipy / fastapi).
-
-**Running the server** (self-hosted): Docker compose (`docker compose up -d`) or `pip install tortoise-graph` + `tortoise-serve` — see [docs/quickstart-selfhosted.md](docs/quickstart-selfhosted.md). The `tortoise-graph` package still ships the full SDK surface for server-side power use and local eval. (The bare `tortoise` PyPI name is squatted by an unrelated library — engine = `tortoise-graph`, client = `tortoise-client`, #258/#526.)
-
-```bash
-pip install tortoise-graph   # server package: engine + daemon + MCP server
-# from source (clone): uv sync --extra embeddings --extra parity && uv run python -m tortoise.selfhost
-#   The explicit --extra list is EXACT: name every extra the env needs in ONE
-#   command (or use --all-extras) — `uv sync --extra embeddings` alone drops parity.
-```
-
-Full split mechanics (build, version coupling, license boundary): [docs/client-server-split.md](docs/client-server-split.md).
-
-## Self-host configuration
-
-| Env var | Default | Purpose |
-|---|---|---|
-| `TORTOISE_DB_URI` | — | Durable FalkorDB connection string — the recommended path (docker compose sidecar or managed Cloud); multi-writer safe |
-| `TORTOISE_DB_PATH` | `~/.tortoise/tortoise.db` | Embedded FalkorDBLite eval path — SINGLE-WRITER, eval only (concurrent writers lose data); AOF is **opt-in** (`TORTOISE_EMBEDDED_AOF=1`), **default off** since #915 — without it durability is up to the next snapshot/clean close, **not ≤1s** (#2879); delete the db + `<db>-appendonlydir` to reset |
-| `TORTOISE_API_KEY` | unset | Set → `auth_mode=static` (Bearer key); unset → `auth_mode=none` — ⚠️ a non-localhost bind with no key exposes an unauthenticated engine |
-| `TORTOISE_HOST` / `TORTOISE_PORT` | `127.0.0.1` / `8000` | Daemon bind |
-| `TORTOISE_RATE_LIMIT` | `100` | Requests per minute per IP (MCP SSE bursts ≈ 5–10 req/call) |
-| `TORTOISE_ALLOWED_ORIGINS` | `http://localhost:8000` | CORS allowlist (comma-separated) |
-| `TORTOISE_TOOL_GROUP` | unset | Role-scoped MCP surface (#523) — e.g. `memory` exposes only memory tools (tool-selection accuracy degrades past ~20 tools; groups: memory, reasoning, graph, sessions, sources, journal, admin, onboarding) |
-
-Also: `tortoise-serve http [--host] [--port] [--api-key]` (flags override env), and `tortoise-serve` (stdio MCP) for scripting.
-
-## License & FAQ
-
-Tortoise is **Business Source License 1.1** — see [LICENSE](LICENSE) and the [license notes](docs/license-notes.md) (clause-by-clause precedent + audit).
-
-- **Self-hosted:** free production use for organizations under **US $5,000,000** annual revenue (trailing 12 months); above that, a commercial license is required.
-- **Hosted (api.premiselabs.co):** a separate commercial product with a **free tier** — not covered by the BSL grant.
-- **MIT products are never blocked:** connect over MCP/REST and you never import Tortoise — the license boundary sits at the network, so your distribution stays clean.
-- **MPL 2.0 conversion:** every version converts to Mozilla Public License 2.0 (file-level copyleft — enterprise-safe) four years after publication.
-- **Can't offer Tortoise as a service:** the grant never permits reselling Tortoise (or a substantially similar product) to third parties as a hosted/managed service.
-- **Thin client is Apache-2.0 (#526):** the `tortoise-client` driver distribution is permissively licensed (MongoDB/Redis driver precedent) — a client-only install never ships BSL code, so the license boundary sits at the network. The engine stays BSL-1.1. Rationale + boundary mechanics: [docs/client-server-split.md](docs/client-server-split.md).
-
-## What's here
-
-- `tortoise/` — the SDK, MCP server, projection, search engine, backup/restore, and the self-host daemon (`tortoise/selfhost.py`)
-- `client/` — the thin `tortoise-client` driver distribution (staging build + acceptance-gate scripts, client shim package, #526)
-- `integrations/` — thin connectors that talk to Tortoise over MCP (not SDK imports)
-- `website/` — the hosted product's landing pages + dashboard (deploys to Cloudflare Pages)
-- `docs/ONTOLOGY.md` — **canonical ontology v3.4** (co-located with the code it governs)
-- `tests/` — test suite
-
-## Canonical ontology
-
-`docs/ONTOLOGY.md` is the single source of truth for the entity model (Point, Subject, Object, Event, Source), edge topology (IMPL/NAND/structural/about*), kind vocabularies, and EP semantics. It is **canonical** — product gaps are filed as issues, never added to the ontology as roadmap detail.
-
-## Repository layout
-
-**`daniel-ospina/tortoise` (this repo)** is the **full product** — graph runtime, SDK, MCP server, self-host daemon + docker compose, Fly.io deployment config (`fly.toml`), Dockerfile.selfhost, embedded reaper, Supabase edge functions (`supabase/functions/tenant-provision/`), backup pipeline, and the hosted dashboard (`website/` dir → Cloudflare Pages). This is the canonical source of truth. If you want to deploy Tortoise (self-host or hosted), this is the only repo you need.
-
-**`daniel-ospina/premise-labs`** is a **partial copy** of the tortoise tree used as an **SDK-import surface** by dependent repos (notably `daniel-ospina/swarm`, which sets `PYTHONPATH` to import `tortoise/projection.py`, `tortoise/ids.py`, `tortoise/pipeline_cli.py`, and `config/` from it). It is **not** the full product — it lacks `docker-compose.yml`, `Dockerfile.selfhost`, `tortoise/embedded_reaper.py`, `tortoise/selfhost.py`, `fly.toml`, and `supabase/functions/tenant-provision/`. It also carries an outdated `.env.example` (a passwordless `:6379` URI example vs this repo's canonical `docker://:falkordb@localhost:6379/tortoise` — compose publishes 127.0.0.1:6379).
-
-**Guidance:** if you clone `premise-labs` for swarm imports, also clone `tortoise` for deployment infrastructure. `premise-labs` is SDK-only — it cannot run a Tortoise server. (#761)
-
-## Repo map & issue routing
-
-File issues in the repo that owns the code:
-
-| Repo | Owns | File issues for |
-|---|---|---|
-| **daniel-ospina/tortoise** (this repo) | Tortoise product: SDK, MCP, hosted API, graph engine, ontology, deployment infra | Tortoise product bugs, features, ontology gaps |
-| **daniel-ospina/agent-infra** | Agent infrastructure: Pi extensions, skills, commit-workflow, CI gates, review-enforcer | Skill/pipeline/extension/CI work |
-| **daniel-ospina/premise-labs** | Premise Labs internal ops: meetings recorder, CRM (Twenty), bridge scripts, health checks; also an SDK-import surface for the swarm (partial tortoise tree — see above) | Ops tooling, CRM, meeting pipeline |
-| **daniel-ospina/eldato** | El Dato app (eldato.com.mx): scanner, webapp, deals/offers, notifications, ads, SEO | El Dato product work |
-
-**Rule of thumb:** if the issue is about Tortoise code (this repo's `tortoise/` or `website/` dirs), file it here. If it's about agent tooling, file in agent-infra. If it's about Premise Labs ops (meetings/CRM), file in premise-labs.
+The box running the loop was handed over, and its dispatch reaper treats
+*"open issue + no PR"* as an undelivered dispatch that must be re-queued. Without this
+export, the work in these stashes would have been either lost with the disk or silently
+re-done from scratch on another machine. Exporting them to a branch makes them durable and
+visible to whoever picks the issues up next.

@@ -1,0 +1,127 @@
+diff --git a/tortoise/__pycache__/sdk.cpython-314.pyc b/tortoise/__pycache__/sdk.cpython-314.pyc
+index 27987ffb9..317a4b963 100644
+Binary files a/tortoise/__pycache__/sdk.cpython-314.pyc and b/tortoise/__pycache__/sdk.cpython-314.pyc differ
+diff --git a/tortoise/projection/entities.py b/tortoise/projection/entities.py
+index b2ff1325d..33d74b4e0 100644
+--- a/tortoise/projection/entities.py
++++ b/tortoise/projection/entities.py
+@@ -14,6 +14,16 @@ class _EntityHandlers:
+     def _upsert(self, p: dict) -> None:
+         op = p.get("operator")
+         prov = p.get("provenance", {})
++
++        # Compute embedding for non-operator Points (#7778)
++        embedding = None
++        if not op:
++            try:
++                from tortoise.embeddings import compute_embedding
++                embedding = compute_embedding(p["content"])
++            except Exception:
++                pass
++
+         self.g.query(
+             "MERGE (n:Point {id:$id}) "
+             "SET n.content=$content, n.context=$context, "
+@@ -21,6 +31,7 @@ class _EntityHandlers:
+             "    n.pointKind=coalesce($pk, n.pointKind), "
+             "    n.status=coalesce($st, n.status, 'live'), "
+             "    n.authoredBy=coalesce($ab, n.authoredBy), "
++            "    n.embedding=coalesce($embedding, n.embedding), "
+ 
+             "    n.confidence=coalesce($cf, n.confidence), "
+             "    n.createdAt=coalesce($ca, n.createdAt, $now), "
+@@ -32,6 +43,7 @@ class _EntityHandlers:
+                     "pk": p.get("pointKind"),
+                     "st": p.get("status"),
+                     "ab": p.get("authoredBy"),
++                    "embedding": embedding,
+ 
+                     "cf": p.get("confidence"),
+                     "ca": p.get("createdAt") or p.get("created_at"),
+diff --git a/tortoise/search_engine.py b/tortoise/search_engine.py
+index 814ec826d..d6705c2a3 100644
+--- a/tortoise/search_engine.py
++++ b/tortoise/search_engine.py
+@@ -251,39 +251,57 @@ def degradation_chain(
+     entity_type: str = "point",
+     limit: int = 20,
+ ) -> dict[str, list[tuple[str, float]]]:
+-    """Run retrieval strategies with per-strategy degradation.
++    """Run retrieval strategies in parallel with per-strategy degradation.
+ 
+     Each strategy wraps in try/except → on failure, skip and log.
+     Supports partial failure: one strategy down, others continue.
++    Strategies run in parallel via ThreadPoolExecutor (P0 fix: #7780).
+ 
+     Returns:
+         {strategy_name: [(id, score), ...]} — only strategies that succeeded
+     """
+-    results: dict[str, list[tuple[str, float]]] = {}
+-
+-    # FTS strategy
+-    if strategies.get("fts") and query:
+-        fts_results = run_fts_query(graph, query, entity_type=entity_type, limit=limit)
+-        if fts_results:
+-            results["fts"] = fts_results
+-        else:
+-            logger.info("FTS strategy returned no results — degraded")
+-
+-    # Vector strategy
+-    if strategies.get("vector") and query_vec:
+-        vec_results = run_vector_query(graph, query_vec, limit=limit)
+-        if vec_results:
+-            results["vector"] = vec_results
+-        else:
+-            logger.info("Vector strategy returned no results — degraded")
++    import concurrent.futures
+ 
+-    # Structural strategy
+-    if strategies.get("structural"):
+-        struct_results = run_structural_query(graph, kind, context, entity_type=entity_type, limit=limit)
+-        if struct_results:
+-            results["structural"] = struct_results
+-        else:
+-            logger.info("Structural strategy returned no results — degraded")
++    results: dict[str, list[tuple[str, float]]] = {}
++    futures: dict[concurrent.futures.Future, str] = {}
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
++        # Submit all enabled strategies in parallel
++        if strategies.get("fts") and query:
++            futures[executor.submit(
++                run_fts_query, graph, query, entity_type=entity_type, limit=limit
++            )] = "fts"
++
++        if strategies.get("vector") and query_vec:
++            futures[executor.submit(
++                run_vector_query, graph, query_vec, limit=limit
++            )] = "vector"
++
++        if strategies.get("structural"):
++            futures[executor.submit(
++                run_structural_query, graph, kind, context, entity_type=entity_type, limit=limit
++            )] = "structural"
++
++        # Collect results with 500ms total timeout across all strategies.
++        # as_completed(timeout=0.5) raises TimeoutError if any future
++        # hasn't completed within 500ms from start of iteration.
++        try:
++            for future in concurrent.futures.as_completed(futures, timeout=0.5):
++                strategy_name = futures[future]
++                strategy_results = future.result()  # already done — no timeout needed
++                if strategy_results:
++                    results[strategy_name] = strategy_results
++                else:
++                    logger.info("%s strategy returned no results — degraded", strategy_name)
++        except concurrent.futures.TimeoutError:
++            logger.warning(
++                "Strategies timed out (500ms) — collected %d/%d, cancelling remaining",
++                len(results), len(futures),
++            )
++            for f in futures:
++                f.cancel()
++        except Exception as e:
++            logger.warning("Strategy execution failed: %s — degraded", e)
+ 
+     return results
+ 
