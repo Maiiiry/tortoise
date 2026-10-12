@@ -224,6 +224,15 @@ exec "${REAL_GIT:?REAL_GIT unset}" "$@"
 # exists, so this stub reaches "verification could not be performed" while every
 # other git surface (main tip, first-parent, refs) stays readable. An unreadable
 # measurement must keep the claim BLOCKING.
+GIT_STUB_WORKTREE_LIST_FAILS = r"""#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = "worktree" ] && [ "${2:-}" = "list" ]; then
+  echo "git-stub: worktree listing unavailable" >&2
+  exit 128
+fi
+exec "${REAL_GIT:?REAL_GIT unset}" "$@"
+"""
+
 GIT_STUB_NO_REF_VERIFY = r"""#!/usr/bin/env bash
 set -u
 if [ "${1:-}" = "rev-parse" ]; then
@@ -4914,18 +4923,25 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("comment by test-agent", out)
 
     def test_unverifiable_claim_never_demotes(self):
-        # "Verification could not be performed" is NOT "the artifacts are
-        # gone": a git that cannot resolve the ref leaves the claim BLOCKING.
+        # "Verification could not be performed" is NOT "the worktree is gone".
+        # The claim names a WORKTREE and the worktree LISTING is unavailable, so
+        # the verifier holds no measurement — and a missing measurement must
+        # never become a downgrade, so the claim keeps BLOCKING.
+        #
+        # ⚠️ This replaces an earlier form that stubbed `rev-parse refs/heads/*`.
+        # After the branch arm was retired, that stub guarded a path nothing
+        # calls any more, so the test passed with or without it and proved
+        # nothing. It now exercises the arm that actually runs.
         self.gh_fixtures(
             issue=self.issue_payload(comments=[
                 ("test-agent",
-                 f"Claiming this — lane `fix/{ISSUE}-unverifiable`."),
+                 f"Claiming this (worktree `.worktrees/{ISSUE}-x`)."),
             ]),
             closed_prs=[],
         )
         self.jev_rules(default=0.95)
-        stub = _write_exec(self.tmp / "git-stub-no-ref-verify",
-                           GIT_STUB_NO_REF_VERIFY)
+        stub = _write_exec(self.tmp / "git-stub-worktree-list-fails",
+                           GIT_STUB_WORKTREE_LIST_FAILS)
         rc, out = self.run_tool(
             git_bin=stub,
             env_extra={**self.jev_env(), "REAL_GIT": shutil.which("git")},
@@ -4933,6 +4949,8 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("VERDICT: COLLISION", out)
         self.assertNotIn("stale claim", out)
+        # An unreadable listing is INCOMPLETE, never an empty answer.
+        self.assertIn("INCOMPLETE", out)
 
     # ── terminal-injection hardening (#4027 P2-J) ──────────────────────────
 

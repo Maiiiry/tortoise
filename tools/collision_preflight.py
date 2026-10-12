@@ -123,17 +123,24 @@ its own dispatch, because the exit-code consumers (``issue-workflow`` /
 ``executing-plans``) read the exit code ALONE: there is no advisory tier.
 
 A model-decided ownership claim (`COLLISION` with a probability) that NAMES a
-branch or worktree is re-verified before it is allowed to block (#8175): if
-EVERY artifact it names is gone (branch deleted, path absent from the worktree
-listing) or demonstrably not live (a terminal/merged branch, a worktree
-`_worktree_liveness` reports as dead), the claim is VOID — reported as a weak,
+WORKTREE is re-verified before it is allowed to block (#8175): if every worktree
+it names is absent from the enumerated listing, or present but
+`_worktree_liveness` reports it dead, the claim is VOID — reported as a weak,
 named non-blocking signal (`stale claim — its named artifacts are gone/empty;
-safe to re-dispatch`) and unable to force the refusal. A claim naming NOTHING,
-an UNTRUSTED author's claim (blocked without a model call by design), a
-JEV-UNAVAILABLE hit (the rollback seam must reproduce `origin/main`), and any
-verification that could not be performed all keep blocking — a missing
-measurement is never a downgrade. See the decision table at
-`_claim_artifact_verifier`, which preserves #6108: a branch or worktree that
+safe to re-dispatch`) and unable to force the refusal.
+
+⛔ ONLY A WORKTREE PATH IS VERIFIED. A BRANCH NAME IS NOT, and that is
+deliberate: no rule can tell a branch name from a FILE PATH, so four review
+cycles each found a fresh false CLEAN in a branch arm — `docs/N-notes` and
+`docs/N-notes.md` both read as branches, then as "gone", and voided a claim that
+named no artifact. A claim naming only branches therefore names no artifact and
+keeps BLOCKING (an over-block, never a false CLEAN), while a LIVE branch still
+refuses the dispatch, because the branch surface enumerates branches
+independently of this arm. A claim naming NOTHING, an UNTRUSTED author's claim
+(blocked without a model call by design), a JEV-UNAVAILABLE hit (the rollback
+seam must reproduce `origin/main`), and any verification that could not be
+performed all keep blocking — a missing measurement is never a downgrade. See the
+decision table at `_claim_artifact_verifier`, which preserves #6108: a ref that
 EXISTS keeps blocking even at 0 commits ahead.
 
 A JEV outage, missing key, timeout, or malformed/unparseable response body
@@ -3548,16 +3555,26 @@ def _claim_gate_note(
 # is a reopen to argue with the owner, never a quiet edit. So re-verification
 # may demote ONLY what is GONE or demonstrably NOT LIVE:
 #
-#   a live worktree, or a local branch that exists        -> BLOCKS (unchanged)
-#   a named artifact that is gone (branch deleted, path
-#     absent from the worktree listing)                   -> void (weak)
-#   a named artifact terminal/merged, or a worktree
-#     `_worktree_liveness` reports as not live            -> void (weak)
-#   the claim names NO artifacts (prose-only)             -> BLOCKS (unchanged)
-#   verification could not be performed (git failed)      -> BLOCKS (fail-closed)
+#   a registered worktree that is LIVE                     -> BLOCKS (unchanged)
+#   a named worktree ABSENT from the enumerated listing    -> void (weak)
+#   a named worktree `_worktree_liveness` reports as dead  -> void (weak)
+#   the claim names NO worktree — a branch-only claim, or a
+#     name that is not a worktree slug (see below)         -> BLOCKS (unchanged)
+#   verification could not be performed (git failed, no
+#     listing, or an EMPTY listing)                        -> BLOCKS (fail-closed)
 #
-# A claim is void ONLY when it named at least one artifact AND EVERY named
-# artifact is gone/non-live; naming two artifacts where one is alive BLOCKS.
+# A claim is void ONLY when it named at least one worktree AND EVERY named
+# worktree is gone/non-live; naming two where one is alive BLOCKS.
+#
+# ⛔ BRANCHES ARE NOT IN THIS TABLE. There is no branch row: a branch name cannot
+# be told from a file path, and every attempt to do so produced a false CLEAN.
+# In particular a "terminal/merged branch -> void" row does NOT exist — a claim
+# naming a terminal branch over-blocks rather than clearing.
+#
+# A named worktree must be a `.worktrees/<tail>` path whose LAST segment carries
+# this issue's number and is a SLUG (no dot). That refuses a FILE directly in
+# `.worktrees/` and a FILE inside a worktree; either would otherwise match no
+# enumerated entry, verify "gone", and demote a claim that named no artifact.
 #
 # ⛔ THIS IS NOT A DISMISSAL SWITCH. There is no flag, no env var and no human
 # input: every named artifact is re-measured on every run. It also applies ONLY
@@ -3571,11 +3588,11 @@ def _claim_gate_note(
 #   * the uncertain band stays a hit BY CONSTRUCTION (an ambiguous case is still
 #     a hit), so it is never demoted.
 # ⛔ RETIRED — each name individually, NOT a range. Dead and NOT CALLED:
-# `_normalize_claim_ref`, `_looks_like_claim_branch`, `_artifact_shaped`, and
-# `_CLAIM_REF_TOKEN_RE` (used only by the first). ⚠️ `_CLAIM_FILE_EXT_RE` below
-# IS LIVE — the worktree arm uses it to refuse a FILE under `.worktrees/` — and
-# so are `_CLAIM_BACKTICK_RE`, `_CLAIM_ARTIFACT_CAP` and `ClaimArtifactVerdict`,
-# which sit after this marker. Do NOT delete them with the retired ones.
+# `_normalize_claim_ref`, `_looks_like_claim_branch`, `_artifact_shaped`,
+# `_CLAIM_REF_TOKEN_RE`, and `_CLAIM_FILE_EXT_RE` (the last two are referenced
+# only by the retired three). ⚠️ These ARE LIVE, and sit inside or after this
+# marker — do NOT delete them with the retired ones: `_CLAIM_BACKTICK_RE`,
+# `_CLAIM_ARTIFACT_CAP`, `_CLAIM_WORKTREE_NAME_RE`, `ClaimArtifactVerdict`.
 #
 # The retired three are kept as the RECORD of four review cycles, each of which found a fresh false CLEAN in the branch arm: the shape test accepted
 # file paths (`docs/N-notes`, `docs/N-notes.md`), the extension rule let
@@ -3588,10 +3605,10 @@ def _claim_gate_note(
 # traded a real over-block for a theoretical false CLEAN, or the reverse. Delete
 # them when the record has served its purpose.
 _CLAIM_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-# A final path segment carrying a FILE EXTENSION is a file, not a branch (see
-# `_looks_like_claim_branch`). A STEM character must precede the dot, so a
-# malformed REF like `3061..x` is not mistaken for one — that case belongs to the
-# refused-but-artifact-shaped arm (unmeasured), not to the names-nothing arm.
+# RETIRED with the branch arm: a file-extension test on a BRANCH name. The
+# worktree arm uses `_CLAIM_WORKTREE_NAME_RE` instead — a slug check — because an
+# extension-length rule let `.markdown` through AND wrongly refused the real
+# branch `chore/1128-bump-agent-infra-v0.1.3`.
 _CLAIM_FILE_EXT_RE = re.compile(r"[A-Za-z0-9_-]\.[A-Za-z0-9]{1,5}$")
 # A worktree directory is named after a BRANCH, so its name is a slug. A name
 # containing ANY dot is therefore refused: a dot is what a FILE has, and
@@ -5026,7 +5043,7 @@ def format_report(
         if rest:
             lines.append(
                 f"  {rest} further non-blocking hit(s) that are NOT prose — "
-                "a stale claim whose named branch/worktree is gone, your own "
+                "a stale claim whose named worktree is gone, your own "
                 "work, a terminal branch/PR, the shared fleet account, "
                 "a fetch-cache ref under a namespace no configured remote "
                 "fetches into, or a worktree RECORD that cannot be live work "
