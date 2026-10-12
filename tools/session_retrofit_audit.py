@@ -15,10 +15,17 @@ a* ``:Session`` *node, and what does the graph hold because of them*:
 
     * **graph writers** — Python string literals (AST nodes, so comments are
       excluded by construction) that mention ``:Session`` *and* carry a write
-      verb against the Session alias (``MERGE (a:Session`` / ``SET a.``);
+      verb against the Session alias (``MERGE (a:Session`` / ``SET a.``).
+      A DOCSTRING is an AST ``Constant`` too, so it is excluded by identity:
+      ``seed_capture_turn_store`` quotes the Session MERGE shape in its
+      docstring without writing it, and the declaration module's ``note=``
+      strings quote sites rather than being sites — neither is a writer;
     * **HTTP clients** — call-shaped POSTs to ``/v1/sessions`` in TS / shell /
       Python entrypoints (prose mentions of the route are NOT sites: the
-      matcher requires a call expression).
+      matcher requires a call expression). A handler DECORATOR
+      (``@app.post("/v1/sessions")``) is the route's DEFINITION, not a caller,
+      and the route must be the full terminal segment — ``/v1/sessions/commit``
+      and ``/v1/sessions/install-probe`` are different routes.
 
 ``retrofit`` (D9 — the audit #3554 owns)
     Quantifies, per graph, the three divergences the epic pushed down:
@@ -53,10 +60,11 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tortoise.session_schema import (  # noqa: E402
+from tortoise.session_schema import (
     PREDICATE,
     RETROFIT_VERDICTS,
     SESSION_CLIENTS,
@@ -77,6 +85,19 @@ SCAN_SKIP_PARTS: frozenset[str] = frozenset(
 PY_EXTENSIONS = (".py",)
 CLIENT_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".sh", ".bash")
 
+#: The declaration module itself. Every string in it is a declaration ABOUT a
+#: site — a ``note=`` quoting a writer's Cypher, a ``marker=`` quoting a
+#: client's call — never a site. The module is not a ``:Session`` writer and
+#: cannot be its own client, so scanning it could only manufacture false
+#: positives the inventory can never clear.
+DECLARATION_MODULE = "tortoise/session_schema.py"
+
+#: The route's FULL terminal segment. ``/v1/sessions/commit`` and
+#: ``/v1/sessions/install-probe`` are DIFFERENT routes served by different
+#: handlers, so a caller of one is not a capture client: a bare substring test
+#: turns the commit endpoint's ``_post_commit`` into an undeclared "client".
+_ROUTE = r"/v1/sessions(?![-/\w])"
+
 #: A string literal carries the Session alias for the write-verb test.
 _SESSION_ALIAS_RE = re.compile(r"\(\s*(\w+)\s*:\s*Session\s*[{)$\s]")
 _SESSION_PROP_RE = re.compile(
@@ -88,14 +109,14 @@ _SESSION_PROP_RE = re.compile(
 #: and the site together, in one reviewed diff).
 _CLIENT_CALL_RES = (
     # TS/JS: post(cfg, "/v1/sessions", ...) / fetch("…/v1/sessions", {…POST…})
-    re.compile(r"""\bpost\s*\([^)]*["'`][^"'`]*/v1/sessions["'`]"""),
-    re.compile(r"""\bfetch\s*\([^)]*["'`][^"'`]*/v1/sessions["'`]"""),
+    re.compile(rf"""\bpost\s*\([^)]*["'`][^"'`]*{_ROUTE}"""),
+    re.compile(rf"""\bfetch\s*\([^)]*["'`][^"'`]*{_ROUTE}"""),
     # Python: requests.post(...) / urlopen(Request("…/v1/sessions"))
-    re.compile(r"""\.post\s*\([^)]*["'`f][^"'`]*/v1/sessions"""),
-    re.compile(r"""Request\s*\([^)]*["'`f][^"'`]*/v1/sessions"""),
+    re.compile(rf"""\.post\s*\([^)]*["'`f][^"'`]*{_ROUTE}"""),
+    re.compile(rf"""Request\s*\([^)]*["'`f][^"'`]*{_ROUTE}"""),
     # curl with an explicit POST
-    re.compile(r"""curl\b[^\n]*(-X\s*POST|--request\s+POST)[^\n]*/v1/sessions"""),
-    re.compile(r"""curl\b[^\n]*/v1/sessions[^\n]*(-X\s*POST|--request\s+POST)"""),
+    re.compile(rf"""curl\b[^\n]*(-X\s*POST|--request\s+POST)[^\n]*{_ROUTE}"""),
+    re.compile(rf"""curl\b[^\n]*{_ROUTE}[^\n]*(-X\s*POST|--request\s+POST)"""),
 )
 
 
@@ -121,7 +142,7 @@ class Site:
         return f"{self.kind} {self.cid} owner={self.owner} props=[{props}]"
 
 
-def _owner_of(tree: ast.AST, lineno: int) -> str:
+def _owner_of(scopes: tuple[tuple[int, int, str, int], ...], lineno: int) -> str:
     """The narrowest declaring scope: the enclosing FUNCTION, else the
     module-level name an assignment binds the literal to, else ``<module>``.
 
@@ -130,29 +151,87 @@ def _owner_of(tree: ast.AST, lineno: int) -> str:
     binding happens to span the line: ``_TURN_WRITE_CYPHER`` (the ONE turn
     store), ``BACKFILL_STATEMENTS`` (the R-18 migration). Naming those is what
     makes the rows reviewable rather than "somewhere in a 24k-line module".
+
+    ``scopes`` is :attr:`_AstIndex.scopes` — built in the ONE walk, so this is
+    a scan of the file's few hundred scopes, not another whole-tree walk.
     """
     func: tuple[int, str] | None = None
     assign: tuple[int, str] | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            end = node.end_lineno or node.lineno
-            if node.lineno <= lineno <= end:
-                span = end - node.lineno
-                if func is None or span < func[0]:
-                    func = (span, node.name)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            end = node.end_lineno or node.lineno
-            if node.lineno <= lineno <= end:
-                targets = (node.targets if isinstance(node, ast.Assign)
-                           else [node.target])
-                names = [t.id for t in targets if isinstance(t, ast.Name)]
-                if names:
-                    span = end - node.lineno
-                    if assign is None or span < assign[0]:
-                        assign = (span, names[0])
+    for start, end, name, kind in scopes:
+        if not (start <= lineno <= end):
+            continue
+        span = end - start
+        if kind == 0:               # function — beats any assignment
+            if func is None or span < func[0]:
+                func = (span, name)
+        elif assign is None or span < assign[0]:
+            assign = (span, name)
     if func is not None:
         return func[1]
     return assign[1] if assign is not None else "<module>"
+
+
+class _AstIndex(NamedTuple):
+    """Everything the two halves need, built in ONE ``ast.walk`` of a file.
+
+    Three separate walks (docstrings, then every literal, then one more per
+    candidate for its owning scope) made ``inventory`` take the better part of
+    a minute on this tree — and the inventory test runs it, so that cost is a
+    gate rather than an inconvenience. One pass builds all of it.
+
+    * ``docstrings`` — the ``id()`` of every DOCSTRING ``Constant``. A
+      docstring is an AST ``Constant``, so the "comments are excluded by
+      construction" framing does not cover it; it DESCRIBES a write shape
+      (``seed_capture_turn_store`` quotes the Session MERGE) without being one.
+      Excluded by identity, so a sibling literal on the same statement stays;
+    * ``scopes`` — ``(start, end, name, kind)`` for every function (kind 0) and
+      every assignment (kind 1), consumed by :func:`_owner_of`;
+    * ``literals`` — every ``str`` ``Constant``, in ``ast.walk`` order;
+    * ``calls`` — every ``Call``, in ``ast.walk`` order;
+    * ``decorators`` — the ``id()`` of every ``Call`` inside a DECORATOR.
+      ``@app.post("/v1/sessions")`` is the route's DEFINITION — the server
+      that serves it — not a caller of it.
+    """
+    docstrings: frozenset[int]
+    scopes: tuple[tuple[int, int, str, int], ...]
+    literals: tuple[ast.Constant, ...]
+    calls: tuple[ast.Call, ...]
+    decorators: frozenset[int]
+
+
+def _ast_index(tree: ast.AST) -> _AstIndex:
+    docstrings: set[int] = set()
+    scopes: list[tuple[int, int, str, int]] = []
+    literals: list[ast.Constant] = []
+    calls: list[ast.Call] = []
+    decorators: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef,
+                             ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", ())
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scopes.append(
+                    (node.lineno, node.end_lineno or node.lineno, node.name, 0))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            end = node.end_lineno or node.lineno
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target])
+            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            if names:
+                scopes.append((node.lineno, end, names[0], 1))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            literals.append(node)
+        if isinstance(node, ast.Call):
+            calls.append(node)
+        for dec in getattr(node, "decorator_list", ()) or ():
+            decorators.update(id(sub) for sub in ast.walk(dec)
+                              if isinstance(sub, ast.Call))
+    return _AstIndex(frozenset(docstrings), tuple(scopes), tuple(literals),
+                     tuple(calls), frozenset(decorators))
 
 
 def _iter_source(root: Path, extensions: tuple[str, ...]):
@@ -167,6 +246,8 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
                 continue
             if path.is_symlink():
                 continue
+            if path.relative_to(root).as_posix() == DECLARATION_MODULE:
+                continue
             yield path
 
 
@@ -175,11 +256,22 @@ def scan_graph_writers(root: Path) -> list[Site]:
     sites: list[Site] = []
     for path in _iter_source(root, PY_EXTENSIONS):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError, OSError):
+            raw = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        # The site is a LITERAL containing ``:Session``, so a file whose text
+        # never mentions the label cannot hold one. Without this prefilter the
+        # scan ``ast.parse``s every ``.py`` under the roots (hundreds of files)
+        # on every run — the dominant cost of a scan the inventory test runs.
+        if PREDICATE["label"] not in raw:
+            continue
+        try:
+            tree = ast.parse(raw)
+        except SyntaxError:
+            continue
+        index = _ast_index(tree)
+        for node in index.literals:
+            if id(node) in index.docstrings:
                 continue
             text = node.value
             if ":Session" not in text:
@@ -202,7 +294,7 @@ def scan_graph_writers(root: Path) -> list[Site]:
                 if owner_alias == alias}))
             sites.append(Site(
                 kind="graph-writer", path=str(path.relative_to(root)),
-                owner=_owner_of(tree, node.lineno), line=node.lineno,
+                owner=_owner_of(index.scopes, node.lineno), line=node.lineno,
                 properties=props))
     return sorted(sites, key=lambda s: (s.path, s.owner, s.line))
 
@@ -232,13 +324,22 @@ def scan_http_clients(root: Path) -> list[Site]:
                 tree = ast.parse(text)
             except SyntaxError:
                 continue
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
+            index = _ast_index(tree)
+            # ``ast.get_source_segment`` re-splits the WHOLE file on every
+            # call, so using it in this loop is O(calls × file length) — on
+            # ``tortoise/sdk.py`` alone that is minutes, for a scan the
+            # inventory test runs. Slice the pre-split lines instead: each
+            # call costs only its own span.
+            lines = text.splitlines(keepends=True)
+            for node in index.calls:
+                if id(node) in index.decorators:
                     continue
-                src = ast.get_source_segment(text, node) or ""
+                if node.end_lineno is None:
+                    continue
+                src = "".join(lines[node.lineno - 1:node.end_lineno])
                 if any(rx.search(src) for rx in _CLIENT_CALL_RES):
                     line = node.lineno
-                    comment = _owner_of(tree, node.lineno)
+                    comment = _owner_of(index.scopes, node.lineno)
                     break
         else:
             for idx, raw in enumerate(text.splitlines(), start=1):
@@ -282,6 +383,9 @@ def inventory_report(root: Path) -> dict:
 def _cmd_inventory(args) -> int:
     report = inventory_report(Path(args.root).resolve())
     if args.json:
+        # Machine-readable means the payload is the ONLY thing on stdout. The
+        # verdict is `report["ok"]` (and the process exit code); appending the
+        # human verdict line here is what made `--json` unparseable.
         print(json.dumps(report, indent=2))
     else:
         for row in SESSION_WRITERS:
@@ -298,7 +402,7 @@ def _cmd_inventory(args) -> int:
               f"{len(report['graph_writers_declared'])} declared")
         print(f"  http clients:  {len(report['http_clients_found'])} found / "
               f"{len(report['http_clients_declared'])} declared")
-    print("INVENTORY CLEAN" if report["ok"] else "INVENTORY DRIFT")
+        print("INVENTORY CLEAN" if report["ok"] else "INVENTORY DRIFT")
     return 0 if report["ok"] else 1
 
 
@@ -329,7 +433,7 @@ def _cmd_retrofit(args) -> int:
         print(f"graph: {report['graph']}")
         print(f"  sessions total          : {report['sessions']}")
         print(f"  (a) capture_ok=true, short turn count : "
-              f"{report['short_turn_count']['sessions']} "
+              f"{report['short_turn_count']['capture_ok_true']} "
               f"(of {report['short_turn_count']['candidates_measured']} measured)")
         print(f"  (b) capture_ok=true (ordering-ambiguous upper bound): "
               f"{report['ordering_ambiguous']['sessions']} — "

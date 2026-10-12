@@ -484,6 +484,16 @@ surfaces:
   # `tortoise/sdk.py::TortoiseSDK.capture_session`, and `tortoise/sdk.py` is a
   # SHARED_MODULE (so an sdk.py change selects the full matrix regardless).
   - test_write_session_and_turns_3551.py
+  # #3554: the `:Session` write-schema declaration (tortoise/session_schema.py)
+  # and its writer inventory + D9 retrofit instrument
+  # (tools/session_retrofit_audit.py). DUAL-REGISTERED (`api` + `core`), same
+  # #2938 convention as test_write_session_and_turns_3551.py above:
+  # `session_schema.py` matches no SOURCE_PATTERNS entry (it falls to the
+  # `core` fallback), while the inventory predicate scans
+  # tortoise/hosted_api.py — so an api-only PR that adds or removes a
+  # `:Session` writer must still run the drift guard. No graph lane: the
+  # retrofit half drives a fake graph handle.
+  - test_session_schema_3554.py
   # #3665: pre-spend cohort cost cap. DUAL-REGISTERED (also under `core`): the
   # admission gate, the ledger write, the reader and the RPC wrappers all live
   # in tortoise/hosted_api.py, metering.py and supabase_control.py, which
@@ -1416,6 +1426,9 @@ surfaces:
   - test_capture_validfrom_3945.py
   - test_v4_declared_mechanisms.py
   - test_write_session_and_turns_3551.py  # #3551: the shared _write_session_and_turns primitive (Session MERGE + turn store); dual: api
+  # #3554: the `:Session` write-schema declaration + its writer inventory/D9
+  # retrofit instrument; dual: api (the inventory predicate scans hosted_api.py).
+  - test_session_schema_3554.py
   # #2006 (W11): onboarding funnel telemetry (seed/decide events gated on the
   # COMPLETED_STEP edge's new creation). Registered under `core` for the
   # `tortoise/analytics.py` seam, which matches no SOURCE_PATTERNS entry — and

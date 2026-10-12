@@ -1,0 +1,266 @@
+"""#3554 — the ``:Session`` write-schema declaration and its inventory predicate.
+
+``tortoise/session_schema.py`` names this file as the enforcement of its own
+claim ("``tools/session_retrofit_audit.py inventory`` re-runs the recorded
+search predicate over the tree and diffs what it finds against
+``SESSION_WRITERS`` / ``SESSION_CLIENTS`` … and
+``tests/test_session_schema_3554.py`` fails on it"). Two halves, both guarded
+here:
+
+* the **inventory** half — the predicate must be CLEAN on the tree it ships
+  with. The three false-positive mechanisms that made its clean verdict
+  UNREACHABLE are pinned individually, not only through the aggregate: the
+  declaration module quoting its own sites, a docstring quoting a write shape,
+  and an HTTP-side handler DECORATOR / sibling route counted as a client;
+* the **retrofit** half — ``audit_session_retrofit``'s report shape and the CLI
+  that prints it, including the metric key the CLI reads (a key that did not
+  exist once, and crashed the verb before it printed anything).
+
+The full-tree scan is genuinely expensive (hundreds of files), so it runs ONCE
+in a module-scoped fixture and every aggregate assertion shares it. No graph
+and no live SDK: ``tortoise/session_schema.py`` is deliberately dependency-free,
+so the retrofit CLI is exercised against a fake graph handle injected through a
+fake ``tortoise.sdk`` module rather than a real one.
+"""
+from __future__ import annotations
+
+import ast
+import json
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from tools import session_retrofit_audit as audit
+from tortoise import session_schema
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(scope="module")
+def repo_inventory() -> dict:
+    """ONE full scan of the real tree; the scan is the cost, not the assert."""
+    return audit.inventory_report(REPO_ROOT)
+
+
+# ── the inventory half ─────────────────────────────────────────────────────
+
+
+def test_inventory_is_clean_on_this_tree(repo_inventory: dict) -> None:
+    """The predicate and the declaration must agree, in BOTH directions."""
+    assert repo_inventory["ok"], (
+        "the :Session writer/client predicate drifted from the declaration:\n"
+        f"  undeclared writers: {repo_inventory['graph_writers_undeclared']}\n"
+        f"  stale writers:      {repo_inventory['graph_writers_stale']}\n"
+        f"  undeclared clients: {repo_inventory['http_clients_undeclared']}\n"
+        f"  stale clients:      {repo_inventory['http_clients_stale']}\n"
+        "Declare the new site (or drop the stale row) in "
+        "tortoise/session_schema.py in the same reviewed diff.")
+
+
+def test_declaration_module_is_not_its_own_site(repo_inventory: dict) -> None:
+    """``tortoise/session_schema.py`` DECLARES sites; it never is one.
+
+    Its ``note=`` strings quote a writer's Cypher and its ``marker=`` strings
+    quote a client's call. Scanning the file reports the declaration as an
+    undeclared writer/client the inventory can never clear.
+    """
+    assert (REPO_ROOT / audit.DECLARATION_MODULE).exists()
+    assert ("tortoise/session_schema.py::SESSION_WRITERS"
+            not in repo_inventory["graph_writers_found"])
+    assert "tortoise/session_schema.py" not in repo_inventory["http_clients_found"]
+
+
+def test_ask_fixture_declares_the_writer_not_its_docstring(
+        repo_inventory: dict) -> None:
+    """The ask fixture's declared row is the function that WRITES."""
+    found = set(repo_inventory["graph_writers_found"])
+    assert "tools/ask_spotcheck.py::merge_capture_session" in found
+    assert "tools/ask_spotcheck.py::seed_capture_turn_store" not in found
+
+
+def test_declared_http_client_markers_are_present() -> None:
+    """A declared row cannot survive its call site being deleted silently."""
+    for client in session_schema.SESSION_CLIENTS:
+        text = (REPO_ROOT / client.path).read_text(encoding="utf-8")
+        assert client.marker in text, (client.path, client.marker)
+
+
+def test_ast_index_excludes_only_the_docstring_constant() -> None:
+    """A docstring is an AST ``Constant``; it is excluded BY IDENTITY."""
+    tree = ast.parse(
+        'def seed(sdk):\n'
+        '    """MERGE (s:Session {id:$sid}) SET s.turn_count = 1."""\n'
+        '    QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n'
+        '    return QUERY\n')
+    index = audit._ast_index(tree)
+    assert len(index.literals) == 2
+    doc_literals = [n for n in index.literals if id(n) in index.docstrings]
+    kept = [n for n in index.literals if id(n) not in index.docstrings]
+    assert len(doc_literals) == 1
+    assert doc_literals[0].value.startswith("MERGE")
+    assert len(kept) == 1                  # the sibling literal survives
+
+
+def test_declaration_module_path_is_skipped(tmp_path: Path) -> None:
+    """``session_schema.py`` is excluded from BOTH halves by path.
+
+    Its ``note=`` is a writer-shaped literal and its ``SessionClient(...)``
+    call carries a client-shaped ``marker=`` — the two self-matches that made
+    the real tree's inventory permanently red.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "session_schema.py").write_text(
+        'NOTE = "MATCH (s:Session) WHERE s.is_episodic IS NULL '
+        'SET s.is_episodic = true"\n'
+        'ROWS = SessionClient(marker=\'post(cfg, "/v1/sessions", payload\')\n',
+        encoding="utf-8")
+    assert audit.scan_graph_writers(tmp_path) == []
+    assert audit.scan_http_clients(tmp_path) == []
+
+
+def test_docstring_mention_is_not_a_writer_site(tmp_path: Path) -> None:
+    """A docstring that QUOTES a write shape is not a writer."""
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "seeder.py").write_text(
+        'def seed(sdk):\n'
+        '    """MERGE (s:Session {id:$sid}) SET s.turn_count = 1."""\n'
+        '    raise NotImplementedError\n',
+        encoding="utf-8")
+    assert audit.scan_graph_writers(tmp_path) == []
+    # …and the exclusion is not over-broad: the same literal in real code IS a
+    # site, so the test above cannot pass by weakening the predicate entirely.
+    (pkg / "real_writer.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
+        "tortoise/real_writer.py::QUERY"}
+
+
+def test_route_definition_and_sibling_routes_are_not_client_sites(
+        tmp_path: Path) -> None:
+    """Only a CALL to the capture route is a client; its definition is not.
+
+    ``@app.post("/v1/sessions")`` is the server that serves the route, and
+    ``/v1/sessions/commit`` is a DIFFERENT route. Counting either as a capture
+    client is the false positive that made the inventory permanently red.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "capture_client.py").write_text(
+        'import requests\n'
+        'def post_capture(base):\n'
+        '    return requests.post(f"{base}/v1/sessions", json={})\n',
+        encoding="utf-8")
+    (pkg / "commit_client.py").write_text(
+        'import requests\n'
+        'def post_commit(base):\n'
+        '    return requests.post(f"{base}/v1/sessions/commit", json={})\n',
+        encoding="utf-8")
+    (pkg / "route_server.py").write_text(
+        'app = None\n'
+        '@app.post("/v1/sessions")\n'
+        'def handler():\n'
+        '    return None\n',
+        encoding="utf-8")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/capture_client.py"}
+
+
+def test_inventory_cli_reports_clean_and_exits_zero(
+        repo_inventory: dict, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """The CLI's verdict/exit mapping, without a second full scan."""
+    monkeypatch.setattr(audit, "inventory_report", lambda root: repo_inventory)
+    rc = audit.main(["inventory"])
+    assert rc == 0
+    assert capsys.readouterr().out.rstrip().endswith("INVENTORY CLEAN")
+
+
+def test_inventory_json_stdout_is_only_json(tmp_path: Path, capsys) -> None:
+    """``--json`` is the machine-readable form: the payload and nothing else.
+
+    An empty root matches no declaration, so the verdict is DRIFT — but the
+    point is the parse: pre-fix the appended verdict line broke ``json.loads``.
+    """
+    rc = audit.main(["inventory", "--root", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["ok"] is False
+
+
+# ── the retrofit half ──────────────────────────────────────────────────────
+
+
+class _FakeResult:
+    def __init__(self, rows: list) -> None:
+        self.result_set = rows
+
+
+class _FakeGraph:
+    """The five reads ``audit_session_retrofit`` issues, answered from fixtures.
+
+    Two short sessions under ``capture_ok``, only ONE of them ``capture_ok``
+    true — so ``capture_ok_true`` (1) and ``all_short`` (2) differ and a test
+    can tell which key the CLI printed.
+    """
+
+    def query(self, cypher: str, params: dict | None = None) -> _FakeResult:
+        if "stored_turns < s.turn_count" in cypher:
+            return _FakeResult([
+                ("s-short-ok", 5, 2, True, "llm", "claude", "hosted"),
+                ("s-short-fail", 5, 2, False, "llm", "claude", "sdk"),
+            ])
+        if "live_edges > s.entity_links_created" in cypher:
+            return _FakeResult([("s-links", 1, 3, 4)])
+        if "s.turn_count IS NOT NULL RETURN count(s)" in cypher:
+            return _FakeResult([[2]])
+        if "s.capture_ok = true RETURN count(s)" in cypher:
+            return _FakeResult([[1]])
+        if "MATCH (s:Session) RETURN count(s)" in cypher:
+            return _FakeResult([[2]])
+        raise AssertionError(f"unexpected query: {cypher}")
+
+
+class _FakeSDK:
+    def __init__(self, *args, **kwargs) -> None:
+        self.graph = _FakeGraph()
+        self.closed = False
+
+    def _get_proj(self) -> types.SimpleNamespace:
+        return types.SimpleNamespace(g=self.graph)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture()
+def fake_sdk_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """A fake ``tortoise.sdk`` — the schema module stays dependency-free."""
+    module = types.ModuleType("tortoise.sdk")
+    module.TortoiseSDK = _FakeSDK          # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tortoise.sdk", module)
+    return module
+
+
+def test_retrofit_verb_prints_the_capture_ok_true_short_count(
+        fake_sdk_module: types.ModuleType, capsys) -> None:
+    """The ``retrofit`` verb must print a metric, not raise ``KeyError``."""
+    rc = audit.main(["retrofit", "--db", "fake-graph.db"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "capture_ok=true, short turn count : 1" in out
+    assert "of 2 measured" in out
+
+
+def test_retrofit_json_is_valid_json(
+        fake_sdk_module: types.ModuleType, capsys) -> None:
+    rc = audit.main(["retrofit", "--db", "fake-graph.db", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["short_turn_count"]["capture_ok_true"] == 1
+    assert payload["short_turn_count"]["all_short"] == 2
+    assert payload["entity_links_under_count"]["sessions"] == 1
+    assert payload["verdicts"] == session_schema.RETROFIT_VERDICTS
