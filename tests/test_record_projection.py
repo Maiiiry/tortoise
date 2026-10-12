@@ -35,6 +35,7 @@ subject is the same statement set this module emits.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -774,6 +775,61 @@ def test_a_node_upsert_serializes_jsonb_column_values():
         "to an ARRAY and the jsonb insert would fail"
     )
     assert "[0.1, 0.2]" in insert.params and '["a"]' in insert.params
+
+
+def _insert_columns(statement: rp.Statement) -> list[str]:
+    """The column list of an `INSERT INTO public.<table> (…)` statement."""
+    return [c.strip() for c in
+            statement.sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+
+
+def test_a_node_property_named_like_a_bookkeeping_column_stays_off_it():
+    """A payload may never write the record's own bookkeeping column.
+
+    `create_point(kind, content, **props)` stores a node property verbatim —
+    `props=1` is a real node property the graph folds
+    (`get_point(pid)["props"] == 1`). Routing it to the table's own column
+    emitted `INSERT … (…, props, props)` (Postgres: `column "props" specified
+    more than once`) and duplicated `node_key` too. The property must instead
+    be preserved as DATA in the `props` tail: dropping it would make the record
+    poorer than the graph, the failure Interface A forbids.
+    """
+    for prop in ("props", "nodeKey", "nodeLabel", "orgId", "graphId"):
+        insert = _node_insert(
+            rp.mutations_for(
+                {"type": "PointAdded", "ts": "T", "id": "p1",
+                 "point": {"id": "p1", "content": "c", prop: "sentinel"}},
+                org_id="o", graph_id="g"),
+            "point",
+        )
+        columns = _insert_columns(insert)
+        assert len(columns) == len(set(columns)), (
+            f"{prop}: the payload duplicated a bookkeeping column: {columns}"
+        )
+        assert prop in json.loads(insert.params[-1]), (
+            f"{prop}: the node property was dropped instead of preserved in "
+            "the props tail"
+        )
+
+
+def test_a_patch_payload_cannot_rewrite_the_node_key():
+    """A `nodeKey` extra would otherwise emit `SET … node_key = %s`.
+
+    `PointRevised`/`OperatorAnnotated` carry their extras verbatim, so a
+    property named `nodeKey` is a real node property — it must never rewrite
+    the row's canonical key through the patch's `SET node_key = %s`.
+    """
+    patch = rp.mutations_for(
+        {"type": "PointRevised", "ts": "T", "id": "p1", "new_content": "c2",
+         "nodeKey": "p-other"},
+        org_id="o", graph_id="g",
+    )[0]
+    set_clause = patch.sql.split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+    assert "node_key" not in set_clause, (
+        f"a payload property rewrote the node key: {patch.sql}"
+    )
+    # The property survives as data under its own journal name, not dropped.
+    assert json.loads(patch.params[2]) == {"nodeKey": "p-other"}
 
 
 # ════════════════════════════════════════════════════════════════════════════

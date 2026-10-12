@@ -730,6 +730,21 @@ def _jsonb_or_scalar(column: str, value: Any) -> Any:
     return value
 
 
+#: The record's own bookkeeping columns — supplied by the projection, never by
+#: a journal payload. A payload property whose `snake()` form collides with one
+#: of these must land in the `props` tail: routing it to the column either
+#: emitted that column TWICE (`INSERT … (…, props, props)` — Postgres refuses
+#: `column "props" specified more than once`) or silently rewrote the row's
+#: identity (`node_key` via a `NodePatch`). `props` is itself the open-set tail,
+#: so a node property literally named `props` nests inside it, preserving the
+#: graph's property instead of dropping it.
+_BOOKKEEPING_COLUMNS: frozenset[str] = frozenset({
+    "org_id", "graph_id", "props",
+    "node_label", "node_key",
+    "rel_type", "src_label", "src_key", "tgt_label", "tgt_key", "idx",
+})
+
+
 def _split_properties(
     table: str,
     props: Mapping[str, Any],
@@ -741,7 +756,9 @@ def _split_properties(
     """Split a journal property dict into `(columns, props_tail)`.
 
     Three destinations, and no fourth:
-      * a property with a column is written to that column;
+      * a property with a column is written to that column — UNLESS the
+        column is the record's own bookkeeping (`_BOOKKEEPING_COLUMNS`),
+        which a payload may never write;
       * a property the schema refuses as a props key is **dropped** (it is
         DERIVED/VOLATILE — recomputed from the structure, never authority);
       * everything else lands in the declared `props` tail.
@@ -758,7 +775,13 @@ def _split_properties(
         if prop in drop:
             continue
         column = snake(prop)
-        if column in cols:
+        if column in _BOOKKEEPING_COLUMNS:
+            # A payload may never write the record's own coordinates. The
+            # property is preserved as DATA in the tail instead — dropping it
+            # would make the record poorer than the graph, which is the
+            # failure Interface A forbids.
+            tail[prop] = value
+        elif column in cols:
             col_values[column] = value
         elif prop in refused_here or column in refused_here:
             # DERIVED/VOLATILE — the carve-out. Dropping is the correct
