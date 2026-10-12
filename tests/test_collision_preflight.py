@@ -4569,36 +4569,35 @@ class CollisionPreflightTest(unittest.TestCase):
     # and is pinned by the tests above.
 
     def test_claim_artifact_extraction_is_conservative(self):
-        # Extraction is SHAPE-based (a gone branch cannot be recognised by
-        # asking whether it exists) and must not mistake a backticked FILE path
-        # for a branch — a false extraction would void a genuine claim.
+        # ⛔ ONLY A WORKTREE PATH MAY DEMOTE. A bare branch NAME is a string, and
+        # no string rule can tell a branch from a FILE PATH: `docs/N-notes`,
+        # `docs/N-notes.md`, `docs/N-notes.markdown` and the REAL branch
+        # `chore/1128-bump-agent-infra-v0.1.3` all have the same shape, so
+        # extracting one as a branch voids a claim that named NO artifact.
+        # This pins the narrowing: every branch-shaped token extracts NOTHING,
+        # and a claim that names nothing keeps BLOCKING.
         cp = _tool_module()
-        self.assertEqual(
-            cp.claim_named_artifacts(f"lane `fix/{ISSUE}-x`", ISSUE),
-            ([f"fix/{ISSUE}-x"], [], False),
-        )
-        self.assertEqual(
-            cp.claim_named_artifacts(
-                f"see `tests/test_{ISSUE}_x.py`", ISSUE),
-            ([], [], False),
-        )
-        # ⛔ A FILE PATH IS NOT A BRANCH, even when its BASENAME names the issue.
-        # `<dir>/<issue#>-<name>` is exactly the branch convention, so
-        # `docs/<N>-notes.md` passes every shape test — and extracting it demotes
-        # a claim that named NO artifact, because the path then verifies as
-        # "gone". The original discriminator only caught basenames NOT beginning
-        # with the issue number, which is the wrong half. This is the false-CLEAN
-        # direction, so it is pinned here rather than left to the branch surface.
-        for file_path in (f"docs/{ISSUE}-notes.md", f"src/{ISSUE}_fix.py",
-                          f"tests/{ISSUE}_test.py", f"docs/{ISSUE}-plan.txt"):
-            with self.subTest(file_path=file_path):
+        for not_an_artifact in (
+            f"fix/{ISSUE}-x",
+            f"refs/heads/fix/{ISSUE}-x",
+            f"docs/{ISSUE}-notes",
+            f"docs/{ISSUE}-notes.md",
+            f"docs/{ISSUE}-notes.markdown",
+            f"src/{ISSUE}_fix.py",
+            f"tests/{ISSUE}_test.py",
+            f"fix/{ISSUE}..x",
+            f"fix/{ISSUE}-a+b",
+            f"chore/{ISSUE}-bump-agent-infra-v0.1.3",
+            f"tests/test_{ISSUE}_x.py",
+        ):
+            with self.subTest(token=not_an_artifact):
                 self.assertEqual(
-                    cp.claim_named_artifacts(f"see `{file_path}`", ISSUE),
+                    cp.claim_named_artifacts(f"see `{not_an_artifact}`", ISSUE),
                     ([], [], False),
                 )
-                self.assertFalse(
-                    cp._looks_like_claim_branch(file_path, ISSUE), file_path,
-                )
+        # A WORKTREE PATH does extract: it names a directory this tool
+        # ENUMERATES, so live/gone is measured against the listing the worktree
+        # surface reports.
         self.assertEqual(
             cp.claim_named_artifacts(f"wt `.worktrees/{ISSUE}-x`", ISSUE),
             ([], [f".worktrees/{ISSUE}-x"], False),
@@ -4607,30 +4606,21 @@ class CollisionPreflightTest(unittest.TestCase):
             cp.claim_named_artifacts("wt `.worktrees/other-thing`", ISSUE),
             ([], [], False),
         )
+        # ⛔ A FILE INSIDE a worktree is NOT the worktree. It matches no
+        # enumerated entry, so reading it as a worktree would verify "gone" and
+        # demote a claim that named no artifact.
         self.assertEqual(
-            cp.claim_named_artifacts(f"`refs/heads/fix/{ISSUE}-x`", ISSUE),
-            ([f"fix/{ISSUE}-x"], [], False),
+            cp.claim_named_artifacts(
+                f"wt `.worktrees/{ISSUE}-x/tools/foo.py`", ISSUE),
+            ([], [], False),
         )
-        # A name git would reject is refused rather than fed to `rev-parse`,
-        # whose exit 1 for a MALFORMED name is the same code a genuinely ABSENT
-        # ref returns — so accepting it would read a parse artifact as absence.
-        # ⛔ But REFUSING is not BLOCKING, and it is not DROPPING either: the
-        # token is artifact-SHAPED, so it is reported UNMEASURED and the caller
-        # keeps the claim blocking. A refused token silently DROPPED from the
-        # set would leave a claim that names a LIVE artifact looking abandoned.
-        self.assertEqual(
-            cp.claim_named_artifacts(f"`fix/{ISSUE}..x`", ISSUE), ([], [], True))
-        # The same rule for a token git ACCEPTS and this arm's charset refuses:
-        # dropping it would demote a claim naming live work.
-        self.assertEqual(
-            cp.claim_named_artifacts(f"`fix/{ISSUE}-a+b`", ISSUE), ([], [], True))
         # Past the cap the set is incomplete, so it must not be used to demote.
         # The tokens it DID read are returned for the report; the `True` is what
         # stops the caller — an incomplete set can never void a claim.
-        nine = " ".join(f"`fix/{ISSUE}-z{i}`" for i in range(9))
+        nine = " ".join(f"`.worktrees/{ISSUE}-z{i}`" for i in range(9))
         self.assertEqual(
             cp.claim_named_artifacts(nine, ISSUE),
-            ([f"fix/{ISSUE}-z{i}" for i in range(8)], [], True),
+            ([], [f".worktrees/{ISSUE}-z{i}" for i in range(8)], True),
         )
 
     def test_claim_verifier_demotes_a_dead_worktree_record(self):
@@ -4672,9 +4662,13 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("VERDICT: COLLISION", out)
         self.assertNotIn("stale claim", out)
-        # The claim gate measured the artifact and reported WHY it blocked.
-        self.assertIn("artifacts verified live", out)
-        self.assertIn("branch exists", out)
+        # ⛔ A BARE BRANCH IS NOT AN ARTIFACT the claim arm can verify — a string
+        # cannot be told from a file path — so this claim names nothing and keeps
+        # blocking, the safe direction. What matches the live ref and reports the
+        # measurement is the BRANCH SURFACE, which is also why a LIVE branch
+        # named in a claim still refuses the dispatch.
+        self.assertIn(f"refs/heads/fix/{ISSUE}-live", out)
+        self.assertIn("0 commit(s) ahead", out)
 
     def test_stale_claim_with_gone_artifacts_is_advisory(self):
         # The #8175 defect, in the #6151 shape: the claim names a branch AND a
@@ -4698,9 +4692,11 @@ class CollisionPreflightTest(unittest.TestCase):
             "re-dispatch",
             out,
         )
-        # Named: the comment AND the dead artifacts are visible in the report.
+        # Named: the comment AND the dead artifact are visible in the report.
+        # The BRANCH this claim also names is not measured at all — a branch name
+        # is not extractable (see `claim_named_artifacts`) — and the WORKTREE
+        # alone carries the demotion.
         self.assertIn("comment by test-agent", out)
-        self.assertIn(f"fix/{ISSUE}-refutes-magnitude: branch gone", out)
         self.assertIn(
             f".worktrees/{ISSUE}-ep-refutes-weight: worktree gone", out)
 
@@ -4779,7 +4775,7 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("VERDICT: COLLISION", out)
         self.assertNotIn("stale claim", out)
-        self.assertIn("0 ahead", out)
+        self.assertIn("0 commit(s) ahead", out)
 
     def test_claim_naming_one_live_and_one_gone_artifact_still_blocks(self):
         # The load-bearing "EVERY named artifact" rule. ONE alive artifact keeps
@@ -4805,18 +4801,14 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertNotIn("stale claim", out)
         self.assertIn("artifacts verified live", out)
 
-    def test_claim_naming_a_terminal_branch_is_advisory(self):
-        # The OTHER demoting row: a named branch that still EXISTS but is
-        # TERMINAL — its tip is a merged PR's head, so it is not live work.
-        # Without this, dropping the terminal arm (a merged branch read as live)
-        # would over-block forever and no test would notice.
-        #
-        # `refs/remotes/origin/main` is deliberately NOT set here, exactly as in
-        # `test_squash_merged_branch_is_terminal_and_cannot_block`: with a
-        # RESOLVABLE main tip, a branch sitting ON that tip which matches a merged
-        # PR head is the protected "fresh branch at main's tip" case and must
-        # still BLOCK (its partner test pins that half). Leaving the tip
-        # unresolvable isolates the exact tip-SHA arm this row is about.
+    def test_claim_naming_only_a_branch_still_blocks(self):
+        # The narrowing's COST, pinned deliberately. Because a bare branch name
+        # is not extracted, a claim naming ONLY a branch names no artifact and
+        # keeps BLOCKING — including a TERMINAL branch, which an earlier revision
+        # of this change would have voided. Over-blocking is the safe direction;
+        # a false CLEAN is not. A LIVE branch refuses the dispatch anyway, since
+        # the branch surface enumerates branches independently of this arm.
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
         ref = f"fix/{ISSUE}-abandoned"
         _git(self.repo, "branch", ref)
         self.gh_fixtures(
@@ -4827,10 +4819,9 @@ class CollisionPreflightTest(unittest.TestCase):
         )
         self.jev_rules(default=0.95)
         rc, out = self.run_tool(env_extra=self.jev_env())
-        self.assertEqual(rc, 0, out)
-        self.assertIn("VERDICT: CLEAN", out)
-        self.assertIn("stale claim", out)
-        self.assertIn("branch terminal", out)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
 
     def test_claim_extraction_cap_is_fail_closed(self):
         # Past the cap a backticked token is never EXAMINED, and an unexamined

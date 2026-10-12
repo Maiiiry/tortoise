@@ -3570,6 +3570,18 @@ def _claim_gate_note(
 #     `origin/main` EXACTLY, so it is never demoted either;
 #   * the uncertain band stays a hit BY CONSTRUCTION (an ambiguous case is still
 #     a hit), so it is never demoted.
+# ⛔ RETIRED — NOT CALLED. Everything from `_CLAIM_REF_TOKEN_RE` to the end of
+# `_artifact_shaped` below is retained as the RECORD of four review cycles, each
+# of which found a fresh false CLEAN in the branch arm: the shape test accepted
+# file paths (`docs/N-notes`, `docs/N-notes.md`), the extension rule let
+# extension-less paths through AND wrongly refused the real branch
+# `chore/1128-bump-agent-infra-v0.1.3`, the refs/ guard dropped prefixed tokens,
+# and `_artifact_shaped` leaked file paths back in. The conclusion is that a
+# BRANCH NAME IS A STRING and no string rule separates it from a file path, so
+# `claim_named_artifacts` no longer extracts branches at all and `_verify` no
+# longer measures them. Do NOT revive these to "close the gap": every revival
+# traded a real over-block for a theoretical false CLEAN, or the reverse. Delete
+# them when the record has served its purpose.
 _CLAIM_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 # A final path segment carrying a FILE EXTENSION is a file, not a branch (see
 # `_looks_like_claim_branch`). A STEM character must precede the dot, so a
@@ -3722,42 +3734,51 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str], 
     a bare `3061-y` with no slash is NOT, because it names nothing this arm can
     verify by convention — and a claim that names nothing keeps blocking.
 
-    ⛔ `unmeasured` is NOT "named nothing", and the caller must keep such a claim
-    BLOCKING. It is True when a token COULD name this issue's work but could not
-    be turned into a verifiable artifact: a token past `_CLAIM_ARTIFACT_CAP`, or
-    an artifact-SHAPED token that is not a legal ref name. Both cases mean the
-    artifact set is INCOMPLETE, and an incomplete set can never justify a
-    demotion — the verdict would rest on the artifacts that happened to be
-    readable.
+    ⛔ ONLY A WORKTREE PATH MAY DEMOTE — A BARE BRANCH NAME MAY NOT, and this is
+    a deliberate narrowing after four review cycles each found a fresh false
+    CLEAN in the branch arm. A branch NAME is a string, and no string rule can
+    tell a branch from a FILE PATH: `docs/3061-notes`, `docs/3061-notes.md` and
+    `docs/3061-notes.markdown` are all indistinguishable from `<type>/<issue#>-
+    <slug>` branches, and each one, extracted as a branch, then "verifies gone"
+    and voids a claim that named no artifact at all. Tuning the rule only moved
+    the hole (an extension-length cutoff let the extension-less form through and
+    wrongly refused the real branch `chore/1128-bump-agent-infra-v0.1.3`).
+
+    A worktree PATH is different in kind: it names a directory this tool already
+    ENUMERATES, so "live" and "gone" are measured against the same listing the
+    worktree surface reports, and a file path is not mistaken for one because the
+    name must be a SINGLE segment directly under `.worktrees/`.
+
+    The branches a claim names are not lost: the branch surface independently
+    enumerates local and remote branches and blocks on the issue number, so a
+    live branch named in a claim still refuses the dispatch. The cost of this
+    narrowing is the reverse direction, which is the safe one — a claim naming
+    ONLY a branch keeps BLOCKING (it names no worktree), so the failure mode is
+    an over-block, never a false CLEAN. `#6151`, the case this fixes, named a
+    worktree and is still cleared.
     """
-    branches: list[str] = []
     worktrees: list[str] = []
     unmeasured = False
     for raw in _CLAIM_BACKTICK_RE.findall(body or ""):
-        if len(branches) + len(worktrees) >= _CLAIM_ARTIFACT_CAP:
+        if len(worktrees) >= _CLAIM_ARTIFACT_CAP:
             # A token past the cap is never EXAMINED, and it could name a LIVE
             # artifact, so a truncated read can never void a claim.
             unmeasured = True
             break
         token = raw.strip()
-        if not token:
+        if not token or ".worktrees/" not in token:
             continue
-        if ".worktrees/" in token:
-            tail = token.split(".worktrees/", 1)[1].strip("/")
-            if tail and number_present(token, issue):
-                normalized = token.rstrip("/")
-                if normalized not in worktrees:
-                    worktrees.append(normalized)
+        tail = token.split(".worktrees/", 1)[1].strip("/")
+        # ⛔ SINGLE SEGMENT ONLY: `.worktrees/3061-x` is a worktree, but
+        # `.worktrees/3061-x/tools/foo.py` is a FILE INSIDE one. The latter
+        # matches no enumerated worktree, which would read as "gone" and demote a
+        # claim that named no artifact. A multi-segment tail names nothing.
+        if not tail or "/" in tail or not number_present(token, issue):
             continue
-        if _looks_like_claim_branch(token, issue):
-            ref = _normalize_claim_ref(token)
-            if ref and ref not in branches:
-                branches.append(ref)
-        elif _artifact_shaped(token, issue):
-            # Artifact-SHAPED but not a legal ref name. Refusing it must not
-            # DROP it: a dropped live artifact is a demotion. Unmeasured -> block.
-            unmeasured = True
-    return branches, worktrees, unmeasured
+        normalized = token.rstrip("/")
+        if normalized not in worktrees:
+            worktrees.append(normalized)
+    return [], worktrees, unmeasured
 
 
 def _claim_artifact_verifier(
@@ -3780,7 +3801,9 @@ def _claim_artifact_verifier(
     """
 
     def _branch_state(branch: str) -> str | None:
-        """`live` | `live_remote` | `gone` | `terminal`, or None when unreadable.
+        """RETIRED — not called: `claim_named_artifacts` no longer yields branches.
+
+        `live` | `live_remote` | `gone` | `terminal`, or None when unreadable.
 
         ⛔ EXISTENCE IS THE GATE, and #6108 is preserved: a branch that resolves
         BLOCKS even at 0 commits ahead (a lane between `git worktree add` and its
@@ -3857,7 +3880,7 @@ def _claim_artifact_verifier(
         alive: list[str] = []
         dead: list[str] = []
         unmeasured = False
-        for branch in branches:
+        for branch in branches:  # retired: `branches` is always empty now
             state = _branch_state(branch)
             if state is None:
                 unmeasured = True
