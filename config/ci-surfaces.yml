@@ -950,6 +950,14 @@ surfaces:
   # write/read marker split. No DB, no network — default `core` surface is correct.
   - test_4220_blog_residue_cleanup.py
   - test_record_schema_placement.py
+  # #7968 / PR #8179 P2: guards the org-erasure wiring — `purge_org_control_plane`
+  # must route the organizations delete through the `purge_org_record` RPC
+  # (migration 20261012000005), which sets app.record_journal_purge so the
+  # organizations -> graphs -> journal_event cascade can pass the append-only
+  # trigger. Hermetic (FakeControlPlane), so the default `core` surface is
+  # correct: a `tortoise/supabase_control.py`-only change matches no
+  # SOURCE_PATTERNS rule and falls through to `core`.
+  - test_7968_org_purge_rpc.py
   # #2886: the wiring seam's hermetic adapter guard
   # (`tools/longmem_eval/retrieve.py::temporal_aggregate_verdict` over the
   # core's `resolve_temporal_aggregate`). Dual-registered (`core` + `eval`,

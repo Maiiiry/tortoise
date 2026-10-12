@@ -1281,6 +1281,23 @@ class FakeControlPlane:
                         raise RuntimeError(
                             "duplicate key value violates unique constraint "
                             "\"uq_member_identity_active\"")
+        if fn == "purge_org_record":
+            # #7968 / PR #8179 P2: the SECURITY DEFINER org-erasure RPC
+            # (migration 20261012000005). It sets
+            # `app.record_journal_purge='on'` transaction-locally so the
+            # organizations -> graphs -> journal_event cascade may pass the
+            # append-only trigger, then hard-deletes the org row. The fake
+            # models the OBSERVABLE effect (the org row is gone) — the GUC
+            # and the cascade are the real DB's, exercised by the PGlite
+            # suite. Returning None for this fn silently would let
+            # `purge_org_control_plane` leave the org row behind and hide the
+            # defect the RPC fixes.
+            oid = (body or {}).get("p_org_id")
+            self.tables["organizations"] = [
+                t for t in self.tables.get("organizations", [])
+                if t.get("id") != oid
+            ]
+            return None
         if fn != "provision_team":
             return None
         return self._provision_team_emulation(body or {})

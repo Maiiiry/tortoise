@@ -225,7 +225,13 @@ DO $$
 BEGIN
   BEGIN
     UPDATE public.journal_event SET event_type = 'Tampered' WHERE org_id = 'org_7968';
-    RAISE EXCEPTION '7968: the journal_event append-only trigger did NOT fire on UPDATE';
+    -- The sentinel MUST carry a DIFFERENT errcode from the trigger's bare
+    -- RAISE EXCEPTION (SQLSTATE P0001 = raise_exception). Catching
+    -- `raise_exception` while the sentinel also raises P0001 swallowed BOTH
+    -- paths and made this assertion vacuous (review of PR #8179 P1). The
+    -- sentinel is P0002 (the repo convention), so it escapes the handler and
+    -- the block fails when the trigger does NOT fire.
+    RAISE EXCEPTION '7968: the journal_event append-only trigger did NOT fire on UPDATE' USING ERRCODE = 'P0002';
   EXCEPTION WHEN raise_exception THEN NULL;
   END;
 END $$;
@@ -234,7 +240,7 @@ DO $$
 BEGIN
   BEGIN
     DELETE FROM public.journal_event WHERE org_id = 'org_7968';
-    RAISE EXCEPTION '7968: the journal_event append-only trigger did NOT fire on DELETE';
+    RAISE EXCEPTION '7968: the journal_event append-only trigger did NOT fire on DELETE' USING ERRCODE = 'P0002';
   EXCEPTION WHEN raise_exception THEN NULL;
   END;
 END $$;
@@ -287,13 +293,32 @@ END $$;
 RESET ROLE;
 
 -- ── 7. Clean up (the harness spot-checks for leftovers afterwards) ─────────
--- The journal is append-only, so a full tenant erasure is the ONE path that
--- sets the purge flag — the same path a real deletion request takes.
+-- The journal is append-only; the ONE production path that erases a tenant
+-- is the SECURITY DEFINER RPC `purge_org_record` (migration 20261012000005)
+-- — exactly what `purge_org_control_plane` calls. It sets
+-- app.record_journal_purge transaction-locally, so this exercises the real
+-- erasure path end to end rather than hand-setting the GUC.
 SET ROLE service_role;
-SET app.record_journal_purge = 'on';
-DELETE FROM public.organizations WHERE id IN ('org_7968','org_7968_other');
-RESET app.record_journal_purge;
+SELECT public.purge_org_record('org_7968');
+SELECT public.purge_org_record('org_7968_other');
 RESET ROLE;
 SELECT tests.assert(
   (SELECT count(*) FROM public.point WHERE org_id = 'org_7968') = 0,
-  '7968: teardown cascaded from organizations');
+  '7968: purge_org_record cascaded the tenant from organizations');
+SELECT tests.assert(
+  (SELECT count(*) FROM public.journal_event WHERE org_id = 'org_7968') = 0,
+  '7968: purge_org_record cascaded the append-only journal');
+
+-- The RPC is the ONLY caller allowed to set the purge flag: an
+-- authenticated session must not be able to execute it (nor, therefore, to
+-- erase a tenant).
+SET ROLE authenticated;
+DO $$
+BEGIN
+  BEGIN
+    PERFORM public.purge_org_record('org_7968_other');
+    RAISE EXCEPTION '7968: authenticated could execute purge_org_record' USING ERRCODE = 'P0002';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+END $$;
+RESET ROLE;
