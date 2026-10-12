@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from tortoise.ids import content_hash as _content_hash
 from tortoise.live import (
     decay_clause,  # #2490: rebuild folds decay terminal posteriors
+    epistemic_disjunction,  # #5380: the target-position widening
     epistemic_label_queries,  # #7853: id-anchored reads sweep labels, one query per label
 )
 
@@ -319,6 +320,42 @@ def _belief_prop_value_ok(key: str, value) -> bool:
     except UnicodeEncodeError:
         return False  # lone surrogate (driver rejects at encode)
     return True
+
+
+#: #5380: the four edge-resident EP message slots, paired by the direction
+#: each pair is written by. Read by the edge-message fold below; the producer
+#: side reads ``TortoiseEP.EDGE_MESSAGE_SLOTS`` — a test pins the two equal
+#: (``tests/test_4503_edge_relationship_accounting.py``).
+EDGE_MESSAGE_PROPS: tuple = ("msg_alpha", "msg_beta",
+                             "back_msg_alpha", "back_msg_beta")
+
+
+def _edge_message_value_ok(value) -> bool:
+    """True when ``value`` may be folded as an EP edge message slot.
+
+    Mirrors ``_belief_prop_value_ok``'s numeric branch EXACTLY, and for the
+    same reasons (#2884): ``None`` is VALID — it is the journaled CLEAR, which
+    the live ``SET r.x = null`` also performs — while ``bool`` and a
+    non-finite float are refused, because the driver persists them verbatim
+    and the next EP run's ``float(rows[0][0])`` read then raises, bricking the
+    EP lane until a hand repair. A non-numeric (str/list) value is refused for
+    the same reason. A corrupt line degrades to a DROPPED slot, never an
+    aborted recovery pass AFTER the wipe.
+
+    The numeric branch is TOTAL: an ``int`` no double can hold returns
+    ``False``, never raises (``json.loads`` parses an integer literal of ANY
+    magnitude as an arbitrary-precision ``int``; ``math.isfinite`` coerces to a
+    C double), which is the exact abort-after-the-wipe failure the guard in
+    ``_belief_prop_value_ok`` documents.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 # #388: connector sourceKinds eligible for choke-point Source materialization in
@@ -2899,6 +2936,119 @@ class _EntityHandlers:
             if r.result_set:
                 matched += len(r.result_set)
         return matched
+
+    def _fold_edge_message_changed(self, ev: dict) -> int:
+        """#5380: fold a journaled EP edge-message write-back or invalidation.
+
+        The EDGE half of ``_fold_confidence_changed``. Before this, the four
+        edge-resident message slots (``msg_alpha``/``msg_beta``,
+        ``back_msg_alpha``/``back_msg_beta``) were written by every EP run and
+        journaled NOWHERE — so a JSONL wipe+rebuild discarded the entire
+        edge-level belief state while the #2884 node half was restored, leaving
+        a graph that was only half restored and a next EP run warm-starting
+        from a different state than the graph it replaced.
+
+        ``op`` discriminates the two legs (the ``EntityMutated`` precedent):
+
+        * ``set`` — ONE edge's committed slot pair. ``src``/``tgt``/``rel``
+          identify the edge (an edge has no node id of its own; the flat
+          composite is the ``DirectEdgeCreated`` convention). Presence-
+          conditional, like the node fold: only the keys the record carries
+          are written, and ``None`` is the journaled CLEAR.
+
+        * ``clear`` — the committed effect of one live
+          ``invalidate_messages`` / ``invalidate_factor_messages`` call, as a
+          BULK record. ``scope`` names the live query replayed here verbatim
+          (``all`` / ``touching`` / ``operator-neighbourhood``), so a replay
+          re-derives the same edge set from the graph the journal just built
+          rather than from an enumerated id list the record would have to
+          carry. Without this leg the ``set`` leg would RESURRECT seeds the
+          live graph dropped on a prior/topology change (#1242's stale-seed
+          class), i.e. the fix would trade a loss for a divergence.
+
+        Returns the matched-edge count for ``set`` (0 = no such edge) and the
+        dropped-edge count for ``clear``. A ``set`` miss is NOT a refusal: a
+        plain direct edge is legitimately absent after a rebuild (A10 #1048 —
+        ``DirectEdgeCreated`` replay is deferred and unimplemented, so the
+        EDGE itself is lost, which the callers report and the fold cannot
+        change), and a hard-deleted edge is gone live too.
+        """
+        from tortoise.projection import _writable_id
+        op = ev.get("op")
+        if op == "set":
+            src, tgt, rel = ev.get("src"), ev.get("tgt"), ev.get("rel")
+            # The relation type is INTERPOLATED into the query (Cypher cannot
+            # parameterize a relationship type), so it is gated to the closed
+            # set the live writers use — a hand-edited record must not inject.
+            if rel not in ("IMPL", "NAND"):
+                return 0
+            if not (_writable_id(src) and _writable_id(tgt)):
+                return 0
+            set_parts: list[str] = []
+            params: dict = {"src": src, "tgt": tgt}
+            for key in EDGE_MESSAGE_PROPS:
+                if key not in ev:
+                    continue
+                value = ev[key]
+                if not _edge_message_value_ok(value):
+                    continue
+                set_parts.append(f"r.{key} = ${key}")
+                params[key] = value
+            if not set_parts:
+                return 0
+            # Source label SWEEP, target widened — the same index-preserving
+            # shape ``ep._write_back_message`` and ``_flush_cache`` use
+            # (#7853/#7902): the source keeps its ``(label, id)`` anchor and
+            # the target position takes the disjunction, so a non-Point edge
+            # endpoint still folds.
+            matched = 0
+            for _q in epistemic_label_queries(
+                    "MATCH (o:{label} {id:$src})-[r:" + rel + "]->(c) "
+                    f"WHERE {epistemic_disjunction('c')} AND c.id = $tgt "
+                    "SET " + ", ".join(set_parts) + " RETURN c.id"):
+                r = self.g.query(_q, params=params)
+                if r.result_set:
+                    matched += len(r.result_set)
+            return matched
+
+        if op == "clear":
+            scope = ev.get("scope")
+            if scope == "all":
+                rows = self.g.query(
+                    "MATCH ()-[r:IMPL|NAND]->() "
+                    "REMOVE r.msg_alpha, r.msg_beta, "
+                    "       r.back_msg_alpha, r.back_msg_beta "
+                    "RETURN count(r)").result_set
+                return int(rows[0][0]) if rows else 0
+            point_ids = ev.get("point_ids")
+            if not isinstance(point_ids, list):
+                return 0
+            ids = [p for p in point_ids if _writable_id(p)]
+            if not ids:
+                return 0
+            if scope == "touching":
+                rows = self.g.query(
+                    "MATCH (p)-[r:IMPL|NAND]-() "
+                    f"WHERE {epistemic_disjunction('p')} AND p.id IN $ids "
+                    "REMOVE r.msg_alpha, r.msg_beta, "
+                    "       r.back_msg_alpha, r.back_msg_beta "
+                    "RETURN count(DISTINCT r)",
+                    params={"ids": ids}).result_set
+                return int(rows[0][0]) if rows else 0
+            if scope == "operator-neighbourhood":
+                rows = self.g.query(
+                    "MATCH (op:Point)-[conn:IMPL|NAND]->(p) "
+                    f"WHERE {epistemic_disjunction('p')} AND p.id IN $ids "
+                    "AND (op.is_operator = true OR op.op_type IS NOT NULL) "
+                    "WITH DISTINCT op "
+                    "MATCH (op)-[r:IMPL|NAND]->(x) "
+                    f"WHERE {epistemic_disjunction('x')} "
+                    "REMOVE r.msg_alpha, r.msg_beta, "
+                    "       r.back_msg_alpha, r.back_msg_beta "
+                    "RETURN count(DISTINCT r)",
+                    params={"ids": ids}).result_set
+                return int(rows[0][0]) if rows else 0
+        return 0
 
     # ── Entity nodes ───────────────────────────────────────────────
 
