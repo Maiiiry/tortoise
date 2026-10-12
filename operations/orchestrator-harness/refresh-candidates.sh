@@ -34,6 +34,51 @@ if [ ! -x "$SC/.venv/bin/python" ]; then
 fi
 git fetch origin --quiet 2>/dev/null || true
 
+# ── reap stale dispatch bookkeeping ────────────────────────────────────────────
+# `dispatched.txt` is append-only: an issue is recorded as handled the first time it is handed
+# to a lane, and nothing re-checks whether that dispatch DELIVERED. A lane that dies (reboot,
+# OOM, crash) therefore blacklists its issue forever — invisibly, because the issue stays open
+# with no PR. Real cases: #4114, #4095, #3554 sat for >24h. Un-blacklist an entry whose issue is
+# still open, has no PR, and has no live lane, so the pre-flight below can re-queue it.
+gh issue list --repo "$OR" --state open --limit 500 --json number --jq '.[].number' > "$O/.open_iss" 2>/dev/null || : > "$O/.open_iss"
+gh pr list --repo "$OR" --state all --limit 500 --json headRefName --jq '.[].headRefName' > "$O/.pr_brs" 2>/dev/null || : > "$O/.pr_brs"
+python3 - "$O" <<'PY'
+import os, re, subprocess, sys
+O = sys.argv[1]
+def lines(name):
+    p = os.path.join(O, name)
+    return [l.strip() for l in open(p)] if os.path.exists(p) else []
+open_iss = {l for l in lines(".open_iss") if l}
+brs = [l for l in lines(".pr_brs") if l]
+try:
+    out = subprocess.run(["tmux", "ls", "-F", "#{session_name}"], capture_output=True, text=True).stdout
+except Exception:
+    out = ""
+live = {m.group(1) for m in re.finditer(r"^lane-(\d+)$", out, re.M)}
+keep, reaped = [], []
+for n in lines("dispatched.txt"):
+    if not n:
+        continue
+    if n in live:
+        keep.append(n); continue
+    has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
+    if n in open_iss and not has_pr:
+        reaped.append(n)
+    else:
+        keep.append(n)
+with open(os.path.join(O, "dispatched.txt"), "w") as fh:
+    fh.write("\n".join(keep) + ("\n" if keep else ""))
+if reaped:
+    gone = set(reaped)
+    ck = os.path.join(O, "checked.txt")
+    kept = [l for l in lines("checked.txt") if l and l not in gone]
+    if os.path.exists(ck):
+        with open(ck, "w") as fh:
+            fh.write("\n".join(kept) + ("\n" if kept else ""))
+    print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+PY
+for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
+
 touch "$O/checked.txt" "$O/candidates.txt"
 
 # pool = open unassigned P1-severe ∪ P2-moderate, minus epics/owner-decisions

@@ -104,10 +104,15 @@ ok "state dir $O"
 
 # ── render plist ─────────────────────────────────────────────────────────────────
 echo "==> rendering $PLIST"
-# Substitution values are escaped: in sed a bare `&` in the replacement expands to the matched
-# text (so O=/tmp/a&b rendered the path as /tmp/a__O__b) and a `|` closes the s command. Both
-# produce a syntactically valid plist pointing at the wrong paths, so plutil -lint cannot catch it.
-esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+# Two independent levels of escaping are required, and they fail differently:
+#  1. XML — a bare & < > makes the plist invalid XML and launchd will not load it. (plutil -lint
+#     catches this, so it fails loudly rather than silently.)
+#  2. sed — an unescaped & in the REPLACEMENT expands to the matched text, so `O=/tmp/a&b`
+#     rendered the path as /tmp/a__O__b: a syntactically VALID plist pointing at wrong paths,
+#     which plutil -lint cannot catch. Escape \, & and the | delimiter too.
+xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+sed_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+esc() { sed_esc "$(xml_esc "$1")"; }
 sed \
   -e "s|__O__|$(esc "$O")|g" \
   -e "s|__REPO__|$(esc "$REPO")|g" \
@@ -125,11 +130,18 @@ sed \
 plutil -lint "$PLIST" >/dev/null || die "rendered plist is invalid"
 ok "plist valid"
 
-# launchd needs the harness at $O; make sure the running copy is the one installed here.
-if ! diff -q "$HERE/orch-loop.sh" "$O/orch-loop.sh" >/dev/null 2>&1; then
-  warn "$O/orch-loop.sh differs from the copy in this directory"
-  warn "  the daemon runs \$O/orch-loop.sh — copy the shipped scripts into \$O first:"
-  warn "  cp '$HERE'/*.sh '$O'/"
+# launchd runs $O/<script>, not the copies in this directory — check EVERY script the daemon
+# invokes, not just orch-loop.sh. A drift here is silent and serious: a fix applied only to the
+# shipped copy (e.g. the fail-closed ai-review-gate classifier) would never reach the running box.
+DRIFTED=""
+for f in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
+  diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
+done
+if [ -n "$DRIFTED" ]; then
+  warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
+  warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
+  warn "  cp '$HERE'/*.sh '$O'/";
 fi
 
 cat <<EOF

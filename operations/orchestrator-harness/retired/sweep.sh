@@ -21,6 +21,9 @@ except: print('NOCHECKS'); raise SystemExit
 want='$REQ'.split()
 m={c['name']:c['state'] for c in d}
 bad=[n for n in want if m.get(n) in ('FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED')]
+# RETIRED, kept for the record. NOTE: this copy still carries the fail-open reading of
+# ai-review-gate (SKIPPED/NEUTRAL counted as satisfied) that orch-loop.sh fixed — do not reuse
+# this file without requiring an explicit SUCCESS for that check.
 pend=[n for n in want if m.get(n) not in ('SUCCESS','FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED','SKIPPED','NEUTRAL')]
 if bad: print('FAILED:' + ','.join(bad))
 elif pend: print('PENDING:' + ','.join(pend))

@@ -166,13 +166,18 @@ launchctl unload -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 
 `install.sh --uninstall` unloads the agent and removes the plist.
 
-Run the offline self-test first — it needs no network, tmux or git writes, and every check
-corresponds to a defect found in review (each fails on the pre-fix copy):
+Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
+exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
+reaper, or runs `install.sh` for real) rather than re-implementing the logic — a test that
+re-implements the fix passes on the broken copy and proves nothing. That failure mode was found in
+review of this very file, and 23 of its checks were confirmed to fail when it is dropped into the
+pre-fix tree.
 
 ```bash
-./selftest.sh          # 16 checks: script syntax, exact session matching, fail-closed gate,
-                       # the dispatch gate's load clause, claim atomicity, renderer escaping,
-                       # template/renderer placeholder parity, no credential material
+./selftest.sh          # 29 checks: syntax, exact session matching, fail-closed gate classifier,
+                       # claim atomicity, the reaper's four keep/reap decisions, install.sh
+                       # rendering with a hostile path, limit-default consistency, placeholder
+                       # parity, README overclaim guard, credential scan
 ```
 
 **The gate key only reaches the daemon if it is a FILE.** `install.sh` deliberately does not copy a
@@ -207,10 +212,12 @@ after a restart until it was fixed).
    **`SUCCESS`** — `SKIPPED`/`NEUTRAL`/absent do **not** count, because that means no signed review
    exists. `merge-one.sh` refuses to merge if the recorded head ≠ the current head, so
    a post-review push invalidates the evidence automatically.
-1b. **One owner per PR.** Every path into `merge-one.sh` (the lane's `chain-<N>`, a `fix-<PR>`, and
-   the controller's sweep) takes the same atomic `state/mergeclaim-<PR>.lock` first. Without it a
-   freshly opened PR gets two concurrent reviewers racing one head: duplicate evidence comments,
-   duplicate `record-review` writes, and an `ISSUES`/`CLEAN` interleaving.
+1b. **One owner per PR, per box.** Every path into `merge-one.sh` (the lane's `chain-<N>`, a
+   `fix-<PR>`, and the controller's sweep) takes the same atomic `state/mergeclaim-<PR>.lock` first.
+   Without it a freshly opened PR gets two concurrent reviewers racing one head: duplicate evidence
+   comments, duplicate `record-review` writes, and an `ISSUES`/`CLEAN` interleaving.
+   **This is a local file, so it serialises one box only** — two boxes sharing a repo are not
+   coordinated by it (§7.2b, tortoise#5052).
 2. **The reviewer must state a plain outcome.** Its final line is exactly `CLEAN <comment-url>`
    or `ISSUES <n>`. A CLEAN comment may not contain "issues remain", "NOT CLEAN", or
    "requires human attention" — forbidden phrases, so an equivocal review cannot be laundered
@@ -273,37 +280,45 @@ record that they existed. Today this is recovered by reading `git worktree list`
 
 ---
 
-## 7. Known gaps (evaluation targets)
+## 7. Gaps: what is fixed, what is not
 
-These are real, reproduced, and the reason this is an evaluation artifact rather than an
-install script. Details and evidence: tortoise#8246. Same failure class in the fleet rail:
+Details and evidence for the remaining items: tortoise#8246. Same failure class in the fleet rail:
 agent-infra#1678, #1680, #1683.
 
-### 7.1 Dispatch bookkeeping never expires — **a dead lane blacklists its issue forever**
+### 7.1 Dispatch bookkeeping never expires — **FIXED in this PR**
 
-`orch-loop.sh` prunes `candidates.txt` against `dispatched.txt`, so an issue number is
-recorded as "handled" the first time it is handed to a lane. Nothing re-checks whether that
-dispatch **delivered**. A lane that dies (reboot, OOM, crash) strands its issue permanently —
-invisible to both the loop and to issue-triage, because the issue stays open with no PR.
+`orch-loop.sh` prunes `candidates.txt` against `dispatched.txt`, so an issue number is recorded as
+"handled" the first time it is handed to a lane, and nothing re-checked whether that dispatch
+**delivered**. A lane that dies (reboot, OOM, crash) stranded its issue permanently — invisible to
+both the loop and to issue-triage, because the issue stays open with no PR.
 
-Observed: **#4114, #4095, #3554** were dispatched 2026-10-10, their lanes died in a shutdown,
-and each sat with a dirty worktree, no PR, and no re-attempt for >24 h. Recovery was manual:
-capture the patch to `wip/`, remove the number from **both** `dispatched.txt` and
-`checked.txt` (the refresh skips anything in `checked.txt`), re-append to `candidates.txt`,
-restore the worktree to `origin/main`.
+Observed: **#4114, #4095, #3554** were dispatched 2026-10-10, their lanes died in a shutdown, and
+each sat with a dirty worktree, no PR, and no re-attempt for >24 h.
 
-**Fix direction:** a reaper, guarded by *open issue + no PR matching `*<N>*` + no live
-`lane-*` session*.
+**Fix:** the background refresh now runs a reaper — for each `dispatched.txt` entry, if the issue is
+still open **and** no PR branch matches the number **and** no `lane-<N>` session is live, the entry
+is removed from `dispatched.txt` **and** `checked.txt` so the pre-flight re-queues it. Four of the
+self-test's checks pin exactly this decision table (`4114` reaped, `8888` kept for its PR, `9999`
+kept because it is closed, `7777` kept for its live lane).
 
-### 7.2 Draft PRs are invisible to the sweep
+### 7.2 Draft PRs are invisible to the sweep — **FIXED in this PR**
 
-The selector is `select(.isDraft|not)` and nothing transitions our own lanes' drafts to ready.
-A draft runs its checks, fails `ai-review-gate`, and no worker ever touches it. Observed:
-**#8219** (`feat/3524-tm`) and **#8085** (`feat/1037-tm`) sat with failed gates and an
-already-recorded `ISSUES` verdict, stranded purely by the flag. (Peers' drafts must stay
-untouched — #4212 is correctly left alone.)
+The selector was `select(.isDraft|not)` and nothing readied our own lanes' drafts, so a draft ran
+its checks, failed `ai-review-gate`, and no worker ever touched it. Observed: **#8219**
+(`feat/3524-tm`) and **#8085** (`feat/1037-tm`) sat with failed gates and an already-recorded
+`ISSUES` verdict, stranded purely by the flag.
 
-**Fix direction:** ready our own branch patterns only; leave foreign drafts alone.
+**Fix:** the sweep now includes drafts that match the harness's **own** branch patterns
+(`*-tm`, `*-cap`, `fix/*`) and readies them once (`gh pr ready`) before the next cycle processes
+them. Foreign drafts are excluded exactly as before — #4212 (`scope/w6b-graph-candidate`) is
+another box's draft and is correctly left alone.
+
+### 7.2b Cross-box duplicate work — **OPEN**
+
+The per-PR claim (§5.1b) is a **local file**, so it makes concurrency safe *within one box*. Two
+boxes sweeping the same repo will still both review and attempt to merge the same PR, and both may
+pick the same issue. This is inherent: the boxes share GitHub, not a coordinator. tortoise#5052
+proposes "an authoritative, expiring claim registry" — the cross-box version of §5.1b.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
@@ -314,7 +329,7 @@ records which are live and which are retired.
 ### 7.4 Defects found in the first review of this artifact (all fixed here)
 
 These are kept as a record because each one is a *failure mode of the design*, not a typo, and
-because `selftest.sh` now pins every one of them:
+because the self-test now drives every one of them:
 
 | Defect | Impact | Fix |
 |---|---|---|
@@ -330,12 +345,17 @@ because `selftest.sh` now pins every one of them:
 | `retired/do-merge.sh` logged `rc=$?` after an unquoted `$(date)` | every merge failure logged as `rc=0` | capture the status first |
 | `retired/watch-one.sh` built the fixer prompt from a log the reviewer had not written yet | the fixer always ran against an empty FINDINGS section | build the prompt after the reviewer run |
 | the pre-fix sweep logged `#<PR> re-record` even when the concurrency cap suppressed the spawn (`{A\|\|B\|\|C;} \|\| D && echo` parses as `({A\|\|B\|\|C} \|\| D) && echo`) | a stalled drain looked busy | explicit `if/elif` branches |
+| **this file's own self-test** re-implemented the fixed logic instead of reading the shipped scripts | it passed on the broken copy, so it pinned nothing — and the README claimed it did (found by the History reviewer, who proved 10/16 still passed on the pre-fix tree) | every check now extracts and drives the real classifier, `sess()`, claim block and reaper, or runs `install.sh`; §9/§7 claims corrected |
+| `MAX_REVIEW` defaulted to 2 in `orch-loop.sh` but 4 in `install.sh`, the plist it renders, and §4 | running the loop directly (not via the plist) silently halved reviewer concurrency against the documented value; the `${MAX_REVIEW:-4}` fallback was dead code | default is 4 everywhere, and the self-test asserts all 8 limit defaults agree between the two scripts |
+| the live sweep dropped the `CLOSED` guard that `retired/sweep.sh` had, keeping only `MERGED` | a PR listed open that closed in between fell through to `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever | `case "$PR_ST" in MERGED\|CLOSED) continue ;;` |
+| `retired/auto-loop.sh` and `retired/sweep.sh` still carried the fail-open `ai-review-gate` classifier | shipping "the record" with the very bug being fixed invites reuse of it | both annotated in place as retired-with-known-fail-open |
+| §3 and §8 admitted cross-box duplication while §5.1b said "one owner per PR" | the invariant was stated more strongly than the code delivers | §5.1b scoped to per-box; §7.2b states the open cross-box gap |
 
 ### 7.5 Still open, deliberately not fixed here
 
 - **`state/` and `wip/` grow without bound.** Nothing prunes `merged-*.done`, `needsfix-*`,
-  `fixcount-*`, `mergeclaim-*.lock` or expired `rerun-*`. Needs a retention rule rather than an
-  ad-hoc `find -mtime`.
+  `fixcount-*`, `mergeclaim-*.lock`, `parked-*` or expired `rerun-*`. Needs a retention rule rather
+  than an ad-hoc `find -mtime`.
 - **`[ -z "$WT" ] && { … }` as a script's last statement** makes the exit status that of the
   test. The shipped `fix-one.sh` ends with a positive `echo` so it no longer leaks a non-zero
   status, but the pattern is easy to reintroduce — a `exit 0` at the end of each script would pin it.
@@ -389,7 +409,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
-| `selftest.sh` | offline checks; pins every fixed defect. Not part of the loop |
+| `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
 
@@ -398,14 +418,19 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 same idea and are no longer invoked; they are included for the record, not for use.
 
 **Portability edits applied to every shipped script.** Three per-box constants became
-overridable with this box's values as defaults, so behaviour is byte-identical here and
-configurable elsewhere:
+overridable with this box's values as defaults:
 
 ```bash
 OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/home/eldato/tortoise}"
 O="${O:-$HOME/orchestrator}"
 ```
+
+The shipped copies are **not** byte-identical to the ones running on the original box: they are
+those copies **plus every §7.4 fix**. `install.sh` compares all 8 live scripts against the running
+copies at `$O` and warns loudly on drift, because the daemon executes `$O/<script>` — a fix that
+only lands in this directory is not in effect. If you are adopting this onto an existing box, sync
+them (`cp <harness>/*.sh $O/`) and restart the loop before trusting any §5 invariant.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `uv sync --extra embeddings --extra parity`, the

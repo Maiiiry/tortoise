@@ -8,9 +8,11 @@ O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
 
+MAX_FIX="${MAX_FIX:-3}"
+MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MAX_LOAD="${MAX_LOAD:-16}"
 MAX_LANES="${MAX_LANES:-4}"
-MAX_REVIEW="${MAX_REVIEW:-2}"
+MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
@@ -46,6 +48,9 @@ while true; do
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
   OPEN_N="$(gh pr list --repo "$OR" --state open --limit 300 --json number --jq 'length' 2>/dev/null)"; : "${OPEN_N:=0}"
+  # Scope: >10 open PRs -> BROAD (help drain everyone's). Our OWN patterns are always included
+  # even while drafts, because a draft is invisible to the checks below and nothing else would
+  # ever ready it — our lanes' own drafts used to stall red forever (#8219, #8085).
   if [ "$OPEN_N" -gt 10 ]; then
     SEL='select(.headRefName|test("^design/|^scope/|^dependabot/")|not)'
     echo "[scope] open=$OPEN_N -> BROAD (help drain all)" >> "$LOG"
@@ -54,11 +59,18 @@ while true; do
     echo "[scope] open=$OPEN_N -> OWN" >> "$LOG"
   fi
   gh pr list --repo "$OR" --state open --limit 300 --json number,headRefName,isDraft \
-    --jq ".[]|select(.isDraft|not)|$SEL|\"\(.number)\t\(.headRefName)\"" 2>/dev/null |
-  while IFS="$(printf '\t')" read -r PR BR; do
+    --jq ".[]|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\"" 2>/dev/null |
+  while IFS="$(printf '\t')" read -r PR BR DRAFT; do
     [ -z "${PR:-}" ] && continue
+    if [ "${DRAFT:-}" = "true" ]; then
+      gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 && echo "#$PR readied (was a draft)" >>"$LOG"
+      continue
+    fi
     PR_ST="$(gh pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
-    [ "${PR_ST:-}" = "MERGED" ] && continue
+    # CLOSED too: a PR listed open can close between `gh pr list` and here. The retired sweep.sh
+    # guarded both; the live rewrite kept only MERGED, so a closed PR fell through to
+    # `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever.
+    case "${PR_ST:-}" in MERGED|CLOSED) continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue

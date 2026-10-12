@@ -32,6 +32,9 @@ m={c['name']:c['state'] for c in d}
 want='$REQ'.split()
 bad=lambda s: s in ('FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED')
 ok=lambda s: s in ('SUCCESS','FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED','SKIPPED','NEUTRAL')
+# RETIRED, kept for the record. NOTE: this copy still carries the fail-open reading of
+# ai-review-gate (SKIPPED/NEUTRAL counted as satisfied) that orch-loop.sh fixed — do not reuse
+# this file without porting `if gate != 'SUCCESS' and not bad(gate): print('FAILED:ai-review-gate')`.
 fail=[n for n in want if bad(m.get(n,''))]
 pend=[n for n in want if not ok(m.get(n,''))]
 print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pend else 'GREEN'))
