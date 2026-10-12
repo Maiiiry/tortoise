@@ -83,8 +83,10 @@ Interface A states four properties, and the failure each one prevents:
 
 ### 0.4 Verification
 
-* `tests/test_record_projection.py` — 49 hermetic tests (no DB): totality against
-  the graph fold's own dispatch vocabulary and `log.py`'s own type list; the
+* `tests/test_record_projection.py` — 57 hermetic tests (no DB): totality against
+  the graph fold's own dispatch vocabulary, the producers' own emit sites
+  (including the `_*_RECORD_TYPE` constants — so a NEW producer reds the suite),
+  and `log.py`'s torn-tail-harmless classification; the
   carve-out proven by the projection's **output** rather than by its intent;
   every PRIMARY property storable (the "record poorer than the history" failure);
   idempotence by statement shape; the `(label, key)` refusals.

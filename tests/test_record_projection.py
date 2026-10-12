@@ -6,10 +6,10 @@ doc:
 
 1. **TOTAL.** Every record type the journal can carry has a declared mutation,
    and a type with no handler is a **failure, not a skip** (`#5285`'s rule
-   applied to the record's destination). Two halves: the registry covers the
-   vocabulary the code can emit (checked against the graph fold's own dispatch
-   and the journal's own type list — a NEW producer reds this suite), and an
-   undeclared type raises.
+   applied to the record's destination). Three legs: the registry covers the
+   types the graph fold dispatches on, the types `tortoise/log.py` classifies as
+   torn-tail-harmless, and — the one that makes "a NEW producer reds the suite"
+   true — the record types the producers actually emit.
 2. **IDEMPOTENT.** Structural, not sampled: every node mutation is an
    `INSERT … ON CONFLICT … DO UPDATE`, every patch writes absolute values, every
    delete is a `DELETE`, and the journal position is `ON CONFLICT DO NOTHING`.
@@ -83,8 +83,15 @@ def _fold_dispatch_vocabulary() -> set[str]:
     return found
 
 
-def _journal_type_registry_vocabulary() -> set[str]:
-    """`tortoise/log.py`'s own enumeration of journal record types."""
+def _log_torn_tail_harmless_vocabulary() -> set[str]:
+    """`tortoise/log.py`'s executable torn-tail-harmless classification set.
+
+    This is NOT the full journal vocabulary: log.py's refused/terminal types
+    live in prose, not in an executable list. The full producer surface is
+    pinned by :func:`_producer_emit_vocabulary` and
+    :func:`_fold_dispatch_vocabulary`; this leg only proves that no type
+    log.py *classifies* is missing from the registry.
+    """
     text = (REPO_ROOT / "tortoise" / "log.py").read_text(encoding="utf-8")
     block = re.search(
         r"TORN_TAIL_HARMLESS_EVENT_TYPES\s*=\s*frozenset\(\{(.*?)\n\}\)",
@@ -109,11 +116,11 @@ def test_every_type_the_fold_dispatches_on_has_a_record_mutation():
     )
 
 
-def test_every_type_the_journal_lists_has_a_record_mutation():
-    missing = sorted(_journal_type_registry_vocabulary() - set(rp.JOURNAL_EVENT_TYPES))
+def test_every_torn_tail_harmless_type_has_a_record_mutation():
+    missing = sorted(_log_torn_tail_harmless_vocabulary() - set(rp.JOURNAL_EVENT_TYPES))
     assert not missing, (
-        f"{missing} are named by tortoise/log.py as journal record types but "
-        "have no declared record mutation"
+        f"{missing} are in log.py's TORN_TAIL_HARMLESS_EVENT_TYPES but have no "
+        "declared record mutation"
     )
 
 
@@ -510,3 +517,230 @@ def test_edge_record_only_carries_the_callers_attributes():
     insert = statements[-1]
     assert "confidence" in insert.sql and "weight" in insert.sql
     assert 0.7 in insert.params and 0.3 in insert.params
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4. IDENTITY FIDELITY — record == graph on every key the fold MERGEs on
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _node_insert(statements: list[rp.Statement], table: str) -> rp.Statement:
+    return next(s for s in statements
+                if s.sql.startswith(f"INSERT INTO public.{table}"))
+
+
+def test_the_journal_envelope_event_id_is_never_a_node_property():
+    """`event_id` is the `_emit_event` envelope, never a node property.
+
+    `_emit_event` stamps `"event_id": ulid()` on every JSONL line, distinct
+    from the node's own `id`/`eventId`. The fold lists it in `_META_KEYS`
+    ("structural, never node properties"), so a record that stores it leaks a
+    per-record ULID into the node. `ENVELOPE_KEYS` names it, so
+    `_RECORD_ONLY_KEYS` must too.
+    """
+    assert "event_id" in rp.ENVELOPE_KEYS
+    records = [
+        ("ObjectRegistered", "object", {"id": "o1", "name": "n1"}),
+        ("SubjectAdded", "subject", {"id": "s1", "name": "sub1"}),
+        ("SessionRecorded", "session", {"id": "sess1", "turn_count": 2}),
+        ("SourceCreated", "source", {"id": "u1", "url": "u1"}),
+    ]
+    for record_type, table, payload in records:
+        record = {"type": record_type, "ts": "T", "event_id": "ev-envelope",
+                  **payload}
+        statements = rp.mutations_for(record, org_id="o", graph_id="g")
+        insert = _node_insert(statements, table)
+        assert "ev-envelope" not in insert.params, (
+            f"{record_type}: the journal envelope `event_id` leaked into the "
+            f"{table} row"
+        )
+        assert "event_id" not in insert.params[-1], (
+            f"{record_type}: the journal envelope landed in {table}.props"
+        )
+
+
+def test_event_recorded_keys_on_the_domain_event_id_not_the_envelope():
+    """The Event row is keyed by the fold's MERGE key, never the envelope ULID."""
+    record = {"type": "EventRecorded", "ts": "T", "event_id": "ev-14",
+              "id": "e1", "eventId": "e1", "eventKind": "pointAdded"}
+    statements = rp.mutations_for(record, org_id="o", graph_id="g")
+    insert = _node_insert(statements, "event")
+    columns = [c.strip() for c in
+               insert.sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+    assert insert.params[3] == "e1", (
+        "the Event row was keyed by the journal envelope ULID, not the "
+        "payload eventId"
+    )
+    assert insert.params[columns.index("event_id")] == "e1"
+    assert "ev-14" not in insert.params
+    # A payload lacking `eventId` still keys off the fold's `id` fallback.
+    fallback = rp.mutations_for(
+        {"type": "EventRecorded", "ts": "T", "event_id": "ev-99", "id": "e2"},
+        org_id="o", graph_id="g",
+    )
+    assert _node_insert(fallback, "event").params[3] == "e2"
+
+
+def test_entity_mutated_state_ops_match_the_entity_id_column_not_node_key():
+    """Object/Subject `node_key` is `name`; the record identity is `id`.
+
+    The graph fold matches an `EntityMutated` by `_ENTITY_ID_PROP[label]`
+    (`id` for Object/Subject), so a `node_key = id` predicate silently updates
+    0 rows — the exact silent skip Interface A forbids.
+    """
+    for label, table, ident in (("Subject", "subject", "sub1"),
+                                ("Object", "object", "o1")):
+        statements = rp.mutations_for(
+            {"type": "EntityMutated", "ts": "T", "id": ident, "label": label,
+             "op": "restatus",
+             "state": {"status": "superseded", "supersededBy": "next",
+                       "supersededAt": "2026-10-12T00:00:00Z"}},
+            org_id="o", graph_id="g",
+        )
+        sql, params = statements[0].sql, statements[0].params
+        assert sql.startswith(f"UPDATE public.{table}")
+        predicate = (sql.split(" WHERE ", 1)[1]
+                     .replace("org_id = %s", "").replace("graph_id = %s", ""))
+        assert "id = %s" in predicate and "node_key" not in predicate, sql
+        assert ident in params
+        assert "superseded_by" in sql and "next" in params
+        # `status` is the projection-owned cache and must stay out.
+        set_clause = sql.split(" SET ", 1)[1].split(" WHERE ")[0]
+        assert "status" not in {p.split("=")[0].strip()
+                                for p in set_clause.split(",")}
+
+        delete = rp.mutations_for(
+            {"type": "EntityMutated", "ts": "T", "id": ident, "label": label,
+             "op": "delete"},
+            org_id="o", graph_id="g",
+        )[0]
+        assert delete.sql.startswith(f"DELETE FROM public.{table}")
+        delete_predicate = (delete.sql.split(" WHERE ", 1)[1]
+                            .replace("org_id = %s", "")
+                            .replace("graph_id = %s", ""))
+        assert "id = %s" in delete_predicate and "node_key" not in delete_predicate
+        assert ident in delete.params
+
+
+def test_entity_mutated_matches_a_url_only_source_by_its_node_key_too():
+    """A url-only `:Source` carries no `id`, so the OR-set falls back to `url`."""
+    statements = rp.mutations_for(
+        {"type": "EntityMutated", "ts": "T", "id": "https://example.test/x",
+         "label": "Source", "op": "revise", "state": {"title": "t"}},
+        org_id="o", graph_id="g",
+    )
+    sql = statements[0].sql
+    assert sql.startswith("UPDATE public.source")
+    predicate = (sql.split(" WHERE ", 1)[1]
+                 .replace("org_id = %s", "").replace("graph_id = %s", ""))
+    assert "id = %s" in predicate and "node_key = %s" in predicate
+
+
+def test_direct_edge_repoint_delete_only_deletes_rather_than_upserts():
+    """A `delete_only` descriptor is the graph's DELETE leg, not an edge write.
+
+    The producer emits it for the #2489 no-self-edge guard; the fold treats
+    `delete_only is True` as a delete. An upsert here re-created the edge the
+    graph removed AND minted a phantom `node_identity` row from the
+    descriptor's structural `target_label`.
+    """
+    statements = rp.mutations_for(
+        {"type": "DirectEdgeRepoint", "ts": "T",
+         "id": "p1->p2:aboutPoint:self", "src": "p1", "tgt": "p2",
+         "target_label": "Source", "edge_type": "aboutPoint",
+         "delete_only": True},
+        org_id="o", graph_id="g",
+    )
+    assert len(statements) == 1, statements
+    sql, params = statements[0].sql, statements[0].params
+    assert sql.startswith("DELETE FROM public.relation"), sql
+    assert "INSERT" not in sql and "node_identity" not in sql
+    # Both endpoints are `:Point` (old point -> successor); the descriptor's
+    # structural `target_label` is deliberately NOT the row's tgt_label.
+    assert "src_label = 'Point'" in sql and "tgt_label = 'Point'" in sql
+    assert params == ("o", "g", "aboutPoint", "p1", "p2", 0)
+
+
+def test_a_node_upsert_merges_the_props_tail_rather_than_replacing_it():
+    """The record must not be poorer than the graph on a partial carrier.
+
+    The graph applies an open-set tail with `SET n += $props`, preserving a prop
+    an earlier record landed; `props = EXCLUDED.props` would drop it for a
+    second `SessionRecorded` / a `SourceVersioned`.
+    """
+    for record_type, table, payload in (
+        ("SessionRecorded", "session", {"id": "sess1", "turn_count": 2}),
+        ("SourceVersioned", "source", {"id": "u1", "url": "u1",
+                                       "contentHash": "h2"}),
+    ):
+        insert = _node_insert(
+            rp.mutations_for({"type": record_type, "ts": "T", **payload},
+                             org_id="o", graph_id="g"),
+            table,
+        )
+        assert f"props = {table}.props || EXCLUDED.props" in insert.sql, insert.sql
+        assert "props = EXCLUDED.props" not in insert.sql
+
+
+def test_a_node_upsert_serializes_jsonb_column_values():
+    """A DB-API `list`/`dict` adapted raw is an ARRAY, not a jsonb value."""
+    insert = _node_insert(
+        rp.mutations_for(
+            {"type": "PointAdded", "ts": "T", "id": "p1",
+             "point": {"id": "p1", "embedding": [0.1, 0.2], "tags": ["a"]}},
+            org_id="o", graph_id="g"),
+        "point",
+    )
+    assert not any(isinstance(p, (dict, list)) for p in insert.params), (
+        "a jsonb column value was passed raw; the DB-API driver would adapt it "
+        "to an ARRAY and the jsonb insert would fail"
+    )
+    assert "[0.1, 0.2]" in insert.params and '["a"]' in insert.params
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5. THE PRODUCER SURFACE — a NEW producer reds the suite
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _producer_emit_vocabulary() -> set[str]:
+    """Every record type the producers actually emit.
+
+    The registry's docstring claims its vocabulary is sourced from the graph
+    fold's dispatch AND "the producers' emit sites". The fold leg is
+    `test_every_type_the_fold_dispatches_on_has_a_record_mutation`; this is the
+    producers' half made executable, so a new `_emit_event("NewType", ...)`
+    (or a new `_*_RECORD_TYPE = "NewType"` constant it is called with) reds the
+    suite even before a fold arm or a torn-tail classification names it.
+    """
+    found: set[str] = set()
+    for path in sorted((REPO_ROOT / "tortoise").glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        found |= set(re.findall(
+            r'(?:_emit_event|_emit)\(\s*"([A-Z][A-Za-z0-9_]*)"', text))
+        constants = dict(re.findall(
+            r'([A-Za-z_][A-Za-z0-9_]*_RECORD_TYPE)\s*=\s*"([A-Z][A-Za-z0-9_]*)"',
+            text))
+        for name, record_type in constants.items():
+            if re.search(r'(?:_emit_event|_emit)\(\s*' + re.escape(name) + r'\b',
+                         text):
+                found.add(record_type)
+    return found
+
+
+def test_every_type_a_producer_emits_has_a_record_mutation():
+    emitted = _producer_emit_vocabulary()
+    # Non-vacuity: the scan must resolve the whole producer surface, including
+    # the types emitted only through a `_*_RECORD_TYPE` constant. A stale regex
+    # would silently stop proving anything.
+    assert {"EntityMutated", "BatchIdStamped"} <= emitted
+    assert len(emitted) >= 28, (
+        f"the producer scan found only {len(emitted)} emit types — the regex "
+        "went stale and this leg stopped proving anything"
+    )
+    missing = sorted(emitted - set(rp.JOURNAL_EVENT_TYPES))
+    assert not missing, (
+        f"{missing} are emitted by a producer but have no declared record "
+        "mutation — a NEW producer must red this suite (Interface A's total "
+        "clause), or the silent skip returns"
+    )

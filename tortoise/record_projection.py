@@ -117,6 +117,23 @@ NODE_TABLES: dict[str, tuple[str, str]] = {
     "point": ("Point", "id"),
 }
 
+#: The columns an `EntityMutated` record's identity (`payload["id"]`) is matched
+#: against, per node table. The graph fold matches the label's OR-set identity
+#: (`_ENTITY_ID_PROP` + `_CANONICAL_ENTITY_SECONDARY_ID_PROPS`), NOT the table's
+#: `node_key` column: a Point/Session/Event keys `node_key` on its id/eventId,
+#: but an Object/Subject keys `node_key` on `name` (its record identity is the
+#: `id` column) and a Source keys `node_key` on `url` while its record identity
+#: is usually `id`. Matching `node_key` against the record's `id` silently
+#: touches 0 rows.
+_ENTITY_MATCH_COLUMNS: dict[str, tuple[str, ...]] = {
+    "point": ("node_key",),
+    "session": ("node_key",),
+    "event": ("node_key",),
+    "object": ("id",),
+    "subject": ("id",),
+    "source": ("id", "node_key"),
+}
+
 #: ``_emit_event`` owns these envelope keys; they are never node properties.
 ENVELOPE_KEYS: frozenset[str] = frozenset({
     "type", "ts", "event_id", "initiated_by", "projection_version", "seq",
@@ -469,9 +486,10 @@ RECORD_MUTATIONS: dict[str, Mutation] = {
     # ── The event stream, materialized (the episodic layer) ──────────────────
     "EventRecorded": Mutation(
         NodeSnapshot(Node("event", "Event", "event_id"), path=None,
-                     key_from="event_id", drop=frozenset({"eventId"})),
-        note="the key column is `event_id`; a flat `eventId` is the same key "
-             "under the record column's name, never a second property",
+                     key_from="eventId"),
+        note="the key column is `event_id`; the Event is named by the payload's "
+             "`eventId`/`id` (the fold's MERGE key), NEVER the `_emit_event` "
+             "envelope `event_id` — that is a per-record ULID, record-only",
     ),
     "SourceCreated": Mutation(
         NodeSnapshot(Node("source", "Source", "url"), path=None, key_from="url"),
@@ -647,7 +665,7 @@ def snake(prop: str) -> str:
 #: field from the layer rows — exactly the "record poorer than the history"
 #: failure Interface A forbids.
 _RECORD_ONLY_KEYS: frozenset[str] = frozenset({
-    "type", "ts", "initiated_by", "projection_version", "seq",
+    "type", "ts", "event_id", "initiated_by", "projection_version", "seq",
     "point", "contains_session", "keep_id", "merge_ids", "corrects",
     # Creating-record embedding identity (a DESCRIPTION of the record, never a
     # node property — the fold's `_POINT_HANDLED` drops them too).
@@ -741,8 +759,11 @@ def _key_value(node: Node, payload: Mapping[str, Any], key_from: str) -> str:
     would be silent. Fail here instead, where the record is known.
     """
     value = payload.get(key_from)
-    if value is None and key_from == "event_id":
-        value = payload.get("eventId")
+    if value is None and key_from in ("event_id", "eventId"):
+        # The Event's canonical key is the payload's `eventId` (the fold's
+        # MERGE key is `inner.get("id") or inner.get("eventId")`); the
+        # envelope `event_id` is a per-record ULID and must never be used.
+        value = payload.get("eventId") or payload.get("id")
     if not isinstance(value, str) or not value:
         raise RecordProjectionError(
             f"record has no usable {key_from!r} key for {node.label} "
@@ -776,15 +797,24 @@ def _upsert_statement(
     tail: Mapping[str, Any],
 ) -> Statement:
     columns = ["org_id", "graph_id", "node_label", "node_key", *col_values, "props"]
-    params: list[Any] = [org_id, graph_id, node.label, key,
-                         *col_values.values(), json.dumps(tail)]
+    params: list[Any] = [
+        org_id, graph_id, node.label, key,
+        *(_jsonb_or_scalar(c, v) for c, v in col_values.items()),
+        json.dumps(tail),
+    ]
     placeholders = ", ".join(["%s"] * len(columns))
-    updates = ", ".join(
-        f"{c} = EXCLUDED.{c}" for c in [*col_values, "props"]
-    )
     # IDEMPOTENCE, stated once: re-applying the same record writes the same
     # absolute values onto the same row. A second replay of the journal
     # therefore produces the same record (Interface A's second clause).
+    # FIDELITY: the `props` tail is MERGED, not replaced — the graph fold
+    # applies an open-set tail with `SET n += $props` (entities.py), so a
+    # partial carrier (a second `SessionRecorded`, a `SourceVersioned`) that
+    # omitted a prop an earlier record landed would otherwise drop it from the
+    # record while the graph preserved it.
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in col_values)
+    if updates:
+        updates += ", "
+    updates += f"props = {node.table}.props || EXCLUDED.props"
     sql = (
         f"INSERT INTO public.{node.table} ({', '.join(columns)}) "
         f"VALUES ({placeholders}) "
@@ -800,6 +830,7 @@ def _patch_statement(
     key: str,
     col_values: Mapping[str, Any],
     tail: Mapping[str, Any],
+    match: tuple[str, ...] = ("node_key",),
 ) -> Statement:
     sets: list[str] = []
     params: list[Any] = []
@@ -813,30 +844,39 @@ def _patch_statement(
         # A patch with nothing to write is a 0-row no-op by construction; make
         # it a real statement so the caller still sees the record was consumed.
         sets.append("node_key = node_key")
-    params.extend([org_id, graph_id, key])
+    params.extend([org_id, graph_id, *([key] * len(match))])
+    predicate = " OR ".join(f"{c} = %s" for c in match)
+    if len(match) > 1:
+        predicate = f"({predicate})"
     sql = (
         f"UPDATE public.{node.table} SET {', '.join(sets)} "
-        "WHERE org_id = %s AND graph_id = %s AND node_key = %s"
+        f"WHERE org_id = %s AND graph_id = %s AND {predicate}"
     )
     return Statement(sql, tuple(params))
 
 
-def _delete_statement(org_id: str, graph_id: str, node: Node, key: str) -> Statement:
+def _delete_statement(
+    org_id: str,
+    graph_id: str,
+    node: Node,
+    key: str,
+    match: tuple[str, ...] = ("node_key",),
+) -> Statement:
+    predicate = " OR ".join(f"{c} = %s" for c in match)
+    if len(match) > 1:
+        predicate = f"({predicate})"
     return Statement(
         f"DELETE FROM public.{node.table} "
-        "WHERE org_id = %s AND graph_id = %s AND node_key = %s",
-        (org_id, graph_id, key),
+        f"WHERE org_id = %s AND graph_id = %s AND {predicate}",
+        (org_id, graph_id, *([key] * len(match))),
     )
 
 
-def _relation_upsert_statement(
-    org_id: str,
-    graph_id: str,
-    rel: RelationUpsert,
+def _relation_coordinates(
+    rel: RelationUpsert | RelationDelete,
     payload: Mapping[str, Any],
-    columns: Mapping[str, frozenset[str]],
-    refused: Mapping[str, frozenset[str]],
-) -> list[Statement]:
+) -> tuple[str, str, str, str, str, Any]:
+    """The `(rel_type, src_label, src, tgt_label, tgt, idx)` of an edge record."""
     rel_type = payload.get(rel.rel_type_from) or payload.get("type_of_edge")
     src = payload.get(rel.src_from) or payload.get("source_id")
     tgt = payload.get(rel.tgt_from) or payload.get("target_id")
@@ -851,19 +891,32 @@ def _relation_upsert_statement(
         raise RecordProjectionError(
             f"edge record has no usable endpoints (src={src!r}, tgt={tgt!r})"
         )
+    return rel_type, str(src_label), src, str(tgt_label), tgt, payload.get("idx", 0)
+
+
+def _relation_upsert_statement(
+    org_id: str,
+    graph_id: str,
+    rel: RelationUpsert,
+    payload: Mapping[str, Any],
+    columns: Mapping[str, frozenset[str]],
+    refused: Mapping[str, frozenset[str]],
+) -> list[Statement]:
+    rel_type, src_label, src, tgt_label, tgt, idx = _relation_coordinates(rel, payload)
     col_values, tail = _split_properties(
         "relation", {k: payload[k] for k in rel.attrs if k in payload},
         columns=columns, refused=refused,
     )
     statements = [
-        _identity_statement(org_id, graph_id, Node("point", str(src_label), "id"), src),
-        _identity_statement(org_id, graph_id, Node("point", str(tgt_label), "id"), tgt),
+        _identity_statement(org_id, graph_id, Node("point", src_label, "id"), src),
+        _identity_statement(org_id, graph_id, Node("point", tgt_label, "id"), tgt),
     ]
     columns_ = ["org_id", "graph_id", "rel_type", "src_label", "src_key",
                 "tgt_label", "tgt_key", "idx", *col_values, "props"]
-    idx = payload.get("idx", 0)
-    params: list[Any] = [org_id, graph_id, rel_type, src_label, src, tgt_label,
-                         tgt, idx, *col_values.values(), json.dumps(tail)]
+    params: list[Any] = [
+        org_id, graph_id, rel_type, src_label, src, tgt_label, tgt, idx,
+        *(_jsonb_or_scalar(c, v) for c, v in col_values.items()), json.dumps(tail),
+    ]
     placeholders = ", ".join(["%s"] * len(columns_))
     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in [*col_values, "props"])
     statements.append(Statement(
@@ -874,6 +927,33 @@ def _relation_upsert_statement(
         tuple(params),
     ))
     return statements
+
+
+def _relation_delete_statement(
+    org_id: str,
+    graph_id: str,
+    rel: RelationUpsert | RelationDelete,
+    payload: Mapping[str, Any],
+) -> Statement:
+    """Remove one relation row — the `delete_only` leg of a `DirectEdgeRepoint`.
+
+    A `delete_only` descriptor (#2489, the supersede no-self-edge guard)
+    describes the edge the graph DELETES: the OLD point (`src`) and the
+    successor point its edge terminated at (`tgt`). BOTH endpoints are
+    `:Point`, so the descriptor's `target_label` — which names the STRUCTURAL
+    rel family, not the edge's actual target — is deliberately ignored here;
+    using it would target a nonexistent `(Point, Source, …)` row (and the
+    upsert path additionally minted a phantom `node_identity` for it). No
+    identity row is minted: a delete materializes nothing.
+    """
+    rel_type, _src_label, src, _tgt_label, tgt, idx = _relation_coordinates(
+        rel, payload)
+    return Statement(
+        "DELETE FROM public.relation WHERE org_id = %s AND graph_id = %s "
+        "AND rel_type = %s AND src_label = 'Point' AND src_key = %s "
+        "AND tgt_label = 'Point' AND tgt_key = %s AND idx = %s",
+        (org_id, graph_id, rel_type, src, tgt, idx),
+    )
 
 
 def _op_dispatch_statements(
@@ -899,18 +979,27 @@ def _op_dispatch_statements(
     node = Node(table, str(label), NODE_TABLES[table][1])
     state = payload.get("state")
     state = state if isinstance(state, Mapping) else {}
-    key = payload.get("key") or payload.get("id") or state.get("name")
+    # The record's identity is the journal `id` — the SAME key the graph fold
+    # matches (`_ENTITY_ID_PROP`), NOT the table's `node_key` column. For
+    # Object/Subject `node_key` is `name` and for Source it is `url`, so a
+    # `node_key = id` predicate silently touches 0 rows and the state op is
+    # lost. `state.name`/`state.url` are a defensive fallback for a record that
+    # omits `id`.
+    key = (payload.get("id") or payload.get("key")
+           or state.get("name") or state.get("url"))
     if not isinstance(key, str) or not key:
         raise RecordProjectionError(f"EntityMutated op={op!r} carries no key")
+    match = _ENTITY_MATCH_COLUMNS.get(table, ("node_key",))
     if op in dispatch.delete_ops:
-        return [_delete_statement(org_id, graph_id, node, key)]
+        return [_delete_statement(org_id, graph_id, node, key, match=match)]
     if op in dispatch.patch_ops:
         col_values, tail = _split_properties(
             table, {k: v for k, v in state.items() if k != "name"},
             columns=columns, refused=refused,
             drop=dispatch.never_store.get(table, frozenset()),
         )
-        return [_patch_statement(org_id, graph_id, node, key, col_values, tail)]
+        return [_patch_statement(org_id, graph_id, node, key, col_values, tail,
+                                 match=match)]
     raise RecordProjectionError(
         f"EntityMutated op={op!r} is neither patched nor deleted nor declared "
         "refused — an undeclared op is the silent-skip defect"
@@ -948,13 +1037,15 @@ def mutations_for(
         return _op_dispatch_statements(org_id, graph_id, effect, record,
                                        columns, refused)
     if isinstance(effect, RelationUpsert):
+        if record.get("delete_only") is True:
+            # #2489/#7969: a `delete_only` descriptor is the graph's pass-2b
+            # delete of a resurrected phantom edge. An UPSERT here re-created
+            # the edge the graph removed; a DELETE is the faithful mutation.
+            return [_relation_delete_statement(org_id, graph_id, effect, record)]
         return _relation_upsert_statement(org_id, graph_id, effect, record,
                                           columns, refused)
     if isinstance(effect, RelationDelete):
-        raise RefusedJournalOperation(
-            "relation deletes ride the repoint's own record; no record type "
-            "carries a bare relation delete today"
-        )
+        return [_relation_delete_statement(org_id, graph_id, effect, record)]
     if isinstance(effect, NodeSnapshot):
         node = effect.node
         _node_table(node, columns)

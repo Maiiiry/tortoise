@@ -15,6 +15,8 @@
 {"type":"EntityLinked","ts":"2026-10-12T00:00:14Z","event_id":"ev-15","projection_version":2,"id":"p1","source_label":"Point","source_id":"p1","target_label":"Object","target_id":"release-1.0","edge_type":"aboutObject","confidence":0.8}
 {"type":"DirectEdgeCreated","ts":"2026-10-12T00:00:15Z","event_id":"ev-16","projection_version":2,"id":"op1->p1:IMPL","src":"op1","tgt":"p1","edge_type":"IMPL","direction":"forward","weight":0.4}
 {"type":"DirectEdgeRepoint","ts":"2026-10-12T00:00:16Z","event_id":"ev-17","projection_version":2,"id":"op1->p2:IMPL","src":"op1","tgt":"p2","edge_type":"IMPL","direction":"forward"}
+{"type":"DirectEdgeCreated","ts":"2026-10-12T00:00:16.1Z","event_id":"ev-33","projection_version":2,"id":"p1->p2:aboutPoint","src":"p1","tgt":"p2","edge_type":"aboutPoint"}
+{"type":"DirectEdgeRepoint","ts":"2026-10-12T00:00:16.2Z","event_id":"ev-34","projection_version":2,"id":"p1->p2:aboutPoint:self","src":"p1","tgt":"p2","target_label":"Source","edge_type":"aboutPoint","delete_only":true}
 {"type":"DedupeRecorded","ts":"2026-10-12T00:00:17Z","event_id":"ev-18","projection_version":2,"id":"p2","point":{"id":"p2","content":"second reading","pointKind":"observation","status":"live","dedupCandidate":true,"dedupReviewed":"pending"}}
 {"type":"DedupeRejected","ts":"2026-10-12T00:00:18Z","event_id":"ev-19","projection_version":2,"id":"p2","point":{"id":"p2","content":"second reading","pointKind":"observation","status":"live","dedupReviewed":"rejected"}}
 {"type":"EntityBindingRefused","ts":"2026-10-12T00:00:19Z","event_id":"ev-20","projection_version":2,"id":"p2","point":{"id":"p2","content":"second reading","pointKind":"observation","status":"live"}}

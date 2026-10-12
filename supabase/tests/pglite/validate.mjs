@@ -706,13 +706,52 @@ try {
   // Every fixture project is replayed to the same record twice; the counts are
   // the totality evidence (a skip would land one short) plus the fold's own
   // verdicts: p2 is hard-deleted by its EntityMutated, sess1 by SessionDeleted,
-  // and the two sources + one object + one subject + four relations survive.
+  // the `delete_only` DirectEdgeRepoint removes the `aboutPoint` row its
+  // DirectEdgeCreated landed, and the two sources + one object + one subject +
+  // three relations survive.
   const expected = { journal: String(wantJournal), points: '2',
                      sources: '2', objects: '1', subjects: '1',
                      sessions: '0', relations: '3' };
   for (const [key, value] of Object.entries(expected)) {
     if (String(c[key]) !== value) {
       console.error(`✗ #7969: record.${key} = ${c[key]}, expected ${value}`);
+      process.exit(1);
+    }
+  }
+
+  // The Event row is keyed by the payload `eventId` (the fold's MERGE key), NOT
+  // the `_emit_event` envelope `event_id` (a per-record ULID). A count-only
+  // assertion cannot see the wrong key (both spellings satisfy the CHECK), so
+  // this asserts the key itself.
+  const eventKey = await db.query(
+    `SELECT node_key, event_id FROM public.event WHERE node_key = 'e1'`);
+  if (eventKey.rows.length !== 1 || eventKey.rows[0].event_id !== 'e1') {
+    console.error(`✗ #7969: the Event row is not keyed by the payload eventId: ${JSON.stringify(eventKey.rows)}`);
+    process.exit(1);
+  }
+  const envelopeKey = await db.query(
+    `SELECT count(*) AS n FROM public.event WHERE node_key = 'ev-14'`);
+  if (Number(envelopeKey.rows[0].n)) {
+    console.error('✗ #7969: the journal envelope `event_id` keyed an Event row');
+    process.exit(1);
+  }
+
+  // The `EntityMutated` Subject supersede is a state op whose record identity
+  // is the entity `id` — the row's `node_key` is `name`, so a `node_key`-keyed
+  // patch silently touches 0 rows (the count assertion above cannot see it).
+  const superseded = await db.query(
+    `SELECT superseded_by FROM public.subject WHERE node_key = 'team-x'`);
+  if (superseded.rows[0]?.superseded_by !== 'team-y') {
+    console.error(`✗ #7969: the Subject supersede was silently dropped: ${JSON.stringify(superseded.rows)}`);
+    process.exit(1);
+  }
+
+  // The envelope `event_id` must not reach any node's props tail either.
+  for (const table of ['object', 'subject', 'session', 'source', 'event']) {
+    const leaked = await db.query(
+      `SELECT count(*) AS n FROM public.${table} WHERE props ? 'event_id'`);
+    if (Number(leaked.rows[0].n)) {
+      console.error(`✗ #7969: the journal envelope leaked into ${table}.props`);
       process.exit(1);
     }
   }
