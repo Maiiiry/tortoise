@@ -20,7 +20,8 @@ a* ``:Session`` *node, and what does the graph hold because of them*:
       ``seed_capture_turn_store`` quotes the Session MERGE shape in its
       docstring without writing it, and the declaration module's ``note=``
       strings quote sites rather than being sites — neither is a writer;
-    * **HTTP clients** — call-shaped POSTs to ``/v1/sessions`` in TS / shell /
+    * **HTTP clients** — call-shaped POSTs to the DECLARED route
+      (``PREDICATE['client_route']``, compiled at scan time) in TS / shell /
       Python entrypoints (prose mentions of the route are NOT sites: the
       matcher requires a call expression). A handler DECORATOR
       (``@app.post("/v1/sessions")``) is the route's DEFINITION, not a caller,
@@ -92,32 +93,44 @@ CLIENT_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".sh", ".bash")
 #: positives the inventory can never clear.
 DECLARATION_MODULE = "tortoise/session_schema.py"
 
-#: The route's FULL terminal segment. ``/v1/sessions/commit`` and
-#: ``/v1/sessions/install-probe`` are DIFFERENT routes served by different
-#: handlers, so a caller of one is not a capture client: a bare substring test
-#: turns the commit endpoint's ``_post_commit`` into an undeclared "client".
-_ROUTE = r"/v1/sessions(?![-/\w])"
-
 #: A string literal carries the Session alias for the write-verb test.
 _SESSION_ALIAS_RE = re.compile(r"\(\s*(\w+)\s*:\s*Session\s*[{)$\s]")
 _SESSION_PROP_RE = re.compile(
     r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=(?!=)")
 
-#: An HTTP POST to the sessions route — a CALL, never a prose mention. Each
-#: alternative is a shape that appears in the tree today; a new transport the
-#: matcher cannot see is exactly what the inventory diff is for (add the shape
-#: and the site together, in one reviewed diff).
-_CLIENT_CALL_RES = (
-    # TS/JS: post(cfg, "/v1/sessions", ...) / fetch("…/v1/sessions", {…POST…})
-    re.compile(rf"""\bpost\s*\([^)]*["'`][^"'`]*{_ROUTE}"""),
-    re.compile(rf"""\bfetch\s*\([^)]*["'`][^"'`]*{_ROUTE}"""),
-    # Python: requests.post(...) / urlopen(Request("…/v1/sessions"))
-    re.compile(rf"""\.post\s*\([^)]*["'`f][^"'`]*{_ROUTE}"""),
-    re.compile(rf"""Request\s*\([^)]*["'`f][^"'`]*{_ROUTE}"""),
-    # curl with an explicit POST
-    re.compile(rf"""curl\b[^\n]*(-X\s*POST|--request\s+POST)[^\n]*{_ROUTE}"""),
-    re.compile(rf"""curl\b[^\n]*{_ROUTE}[^\n]*(-X\s*POST|--request\s+POST)"""),
-)
+#: An HTTP POST to the sessions route — a CALL, never a prose mention. The
+#: ROUTE is compiled from :data:`PREDICATE`'s ``client_route`` at scan time (see
+#: :func:`_client_matchers`), so editing the declaration changes what is
+#: matched and a private edit here cannot widen the scan. Each alternative is a
+#: call shape that appears in the tree today; a new transport the matcher cannot
+#: see is exactly what the inventory diff is for (add the shape AND the site
+#: together, in one reviewed diff).
+
+
+def _client_matchers() -> tuple[re.Pattern[str], ...]:
+    """Compile the DECLARED client route into the known call shapes.
+
+    The route comes from :data:`PREDICATE`'s ``client_route`` — the same
+    binding contract as :func:`_write_matchers` for ``write_verbs`` — so the
+    declaration, not a private literal in this tool, decides what a client site
+    is. The route is anchored to its FULL terminal segment (``(?![-/\\w])``):
+    ``/v1/sessions/commit`` and ``/v1/sessions/install-probe`` are DIFFERENT
+    routes served by different handlers, so a caller of one is not a capture
+    client — a bare substring test turns the commit endpoint's ``_post_commit``
+    into an undeclared "client".
+    """
+    route = re.escape(PREDICATE["client_route"]) + r"(?![-/\w])"
+    return (
+        # TS/JS: post(cfg, "/v1/sessions", ...) / fetch("…/v1/sessions", …)
+        re.compile(rf"""\bpost\s*\([^)]*["'`][^"'`]*{route}"""),
+        re.compile(rf"""\bfetch\s*\([^)]*["'`][^"'`]*{route}"""),
+        # Python: requests.post(...) / urlopen(Request("…/v1/sessions"))
+        re.compile(rf"""\.post\s*\([^)]*["'`f][^"'`]*{route}"""),
+        re.compile(rf"""Request\s*\([^)]*["'`f][^"'`]*{route}"""),
+        # curl with an explicit POST
+        re.compile(rf"""curl\b[^\n]*(-X\s*POST|--request\s+POST)[^\n]*{route}"""),
+        re.compile(rf"""curl\b[^\n]*{route}[^\n]*(-X\s*POST|--request\s+POST)"""),
+    )
 
 
 @dataclass
@@ -335,6 +348,7 @@ def scan_http_clients(root: Path) -> list[Site]:
     diff here catches a file nobody declared.
     """
     sites: list[Site] = []
+    matchers = _client_matchers()
     for path in _iter_source(root, CLIENT_EXTENSIONS):
         try:
             text = path.read_text(encoding="utf-8")
@@ -362,13 +376,13 @@ def scan_http_clients(root: Path) -> list[Site]:
                 if node.end_lineno is None:
                     continue
                 src = "".join(lines[node.lineno - 1:node.end_lineno])
-                if any(rx.search(src) for rx in _CLIENT_CALL_RES):
+                if any(rx.search(src) for rx in matchers):
                     line = node.lineno
                     comment = _owner_of(index.scopes, node.lineno)
                     break
         else:
             for idx, raw in enumerate(text.splitlines(), start=1):
-                if any(rx.search(raw) for rx in _CLIENT_CALL_RES):
+                if any(rx.search(raw) for rx in matchers):
                     line = idx
                     comment = raw.strip()[:60]
                     break
@@ -380,10 +394,16 @@ def scan_http_clients(root: Path) -> list[Site]:
     return sorted(sites, key=lambda s: s.path)
 
 
-def inventory_report(root: Path) -> dict:
-    """The predicate's verdict: declared vs found, both directions."""
-    writers = scan_graph_writers(root)
-    clients = scan_http_clients(root)
+def inventory_report(root: Path, *, writers: list[Site] | None = None,
+                    clients: list[Site] | None = None) -> dict:
+    """The predicate's verdict: declared vs found, both directions.
+
+    ``writers``/``clients`` let a caller that already scanned (the test
+    module's module-scoped fixture) reuse the sites instead of paying for a
+    second full-tree walk. Omitted, each half is scanned here as before.
+    """
+    writers = scan_graph_writers(root) if writers is None else writers
+    clients = scan_http_clients(root) if clients is None else clients
     writers_expected = {w.key for w in SESSION_WRITERS}
     declared_clients_expected = {c.path for c in SESSION_CLIENTS
                                  if c.transport == "http"}

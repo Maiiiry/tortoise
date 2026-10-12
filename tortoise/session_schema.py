@@ -293,14 +293,19 @@ SESSION_WRITERS: tuple[SessionWriter, ...] = (
         kind="replay",
         lane="journal fold",
         properties=frozenset({
-            "turn_count", "harness", "is_episodic", "actor_user_id",
+            "created_at", "capture_lane", "turn_count", "harness",
+            "is_episodic", "actor_user_id",
             "client_captured_at", "client_captured_at_source",
             "entity_links_attempted", "entity_links_created",
             "capture_ok", "capture_extractor", "capture_redactions",
         }),
         note=(
             "The `SessionRecorded` fold — replay's re-creation of the capture "
-            "record. It mirrors the live writers' truthiness guards so a "
+            "record. `created_at` and `capture_lane` ride the same "
+            "coalesce-preserved branch as `actor_user_id` (`s.created_at="
+            "coalesce(...)`, `s.capture_lane=coalesce(...)`), so the fold is a "
+            "writer of both and the §4.8 owner lists must name it. It mirrors "
+            "the live writers' truthiness guards so a "
             "rebuild cannot disagree with the graph it is rebuilding; a "
             "journal with no `SessionRecorded` (pre-#3664, or a journal-less "
             "lane) restores only the `_link_session` stub."),
@@ -587,11 +592,25 @@ def audit_session_retrofit(g, *, graph: str | None = None) -> dict[str, Any]:
     ).result_set[0][0])
 
     # (c) the entity-link counter's under-count: recorded vs LIVE aboutObject
-    # edges from the Session.
+    # edges. The counter (`link_session_entities`' `created`) sums BOTH the
+    # Session-origin and the turn-Point-origin edges — both `_link` call sites —
+    # so the live side must count the SAME universe. A Session-origin-only
+    # count understates it and can print ZERO for a real gap (a session whose
+    # refs resolve on its turn points only): `0 > 3` is false, so the report
+    # would read clean while the graph holds edges the counter does not.
+    #
+    # The two OPTIONAL MATCHes are aggregated in SEPARATE `WITH` stages on
+    # purpose: matching both in one row scope multiplies the counts by the
+    # cross-product (session_edges x turn_edges), which would over-report the
+    # gap — the mirror-image defect.
     link_rows = g.query(
         "MATCH (s:Session) WHERE s.entity_links_created IS NOT NULL "
-        "OPTIONAL MATCH (s)-[r:aboutObject]->() "
-        "WITH s, count(r) AS live_edges "
+        "OPTIONAL MATCH (s)-[r1:aboutObject]->() "
+        "WITH s, count(r1) AS session_edges "
+        "OPTIONAL MATCH (s)-[:CONTAINS]->(t:Point)-[r2:aboutObject]->() "
+        "  WHERE t.pointKind = 'event' AND t.is_episodic = true "
+        "WITH s, session_edges, count(r2) AS turn_edges "
+        "WITH s, session_edges + turn_edges AS live_edges "
         "WHERE live_edges > s.entity_links_created "
         "RETURN s.id, s.entity_links_created, live_edges, "
         "       s.entity_links_attempted "
@@ -639,13 +658,15 @@ def iter_declared_properties() -> Iterable[str]:
     return iter(SESSION_PROPERTIES)
 
 
-#: The label + write verbs the source predicate keys on. Declared HERE, next
-#: to the inventory it proves, so the tool cannot silently widen its own
-#: predicate without the same reviewed diff that changes this dict: the scanner
-#: COMPILES :data:`PREDICATE`'s ``write_verbs`` (binding ``<alias>`` to the
-#: variable in the matched literal) and SKIPS the path prefixes in ``excluded``.
-#: Comments are excluded by construction — the scan is AST-based, so a Cypher
-#: write shape in a ``#`` comment or a docstring is not a site.
+#: The label + write verbs + client route the source predicate keys on.
+#: Declared HERE, next to the inventory it proves, so the tool cannot silently
+#: widen its own predicate without the same reviewed diff that changes this
+#: dict: the scanner COMPILES :data:`PREDICATE`'s ``write_verbs`` (binding
+#: ``<alias>`` to the variable in the matched literal) AND its ``client_route``
+#: (anchored to the route's full terminal segment), and SKIPS the path prefixes
+#: in ``excluded``. Comments are excluded by construction — the scan is
+#: AST-based, so a Cypher write shape in a ``#`` comment or a docstring is not
+#: a site.
 PREDICATE = {
     "label": ":Session",
     "write_verbs": (

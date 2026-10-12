@@ -1270,18 +1270,20 @@ folds that re-create the node on replay.
 property set and the owner of each property; this section is its doc mirror,
 and `tools/session_retrofit_audit.py inventory` re-runs the writer predicate and
 fails on drift in either direction (a new writer, or a declared one the
-predicate no longer finds). The per-property owners below are generated from
-that declaration — a property with no owning writer is an import-time assertion
-failure, never a silently-empty cell.
+predicate no longer finds). The per-property owners below **mirror that
+declaration** and are pinned against it by `tests/test_session_schema_3554.py`
+(an owner cell that disagrees with `SESSION_PROPERTY_OWNERS` fails the test); a
+property with no owning writer is an import-time assertion failure, never a
+silently-empty cell.
 
 | Property | Owning writers (`<module>::<function/constant>`) |
 |----------|--------------------------------------------------|
 | `id` | `rebuild_all` |
-| `created_at` | `_write_session_and_turns`, `_execute_commit_writes`, `_commit_region`, `_seed_demo_graph`, `merge_capture_session`, `ingest_haystack`, `_write_v2_phase_a`, `rebuild_all` |
+| `created_at` | `_write_session_and_turns`, `_execute_commit_writes`, `_commit_region`, `_seed_demo_graph`, `merge_capture_session`, `ingest_haystack`, `_write_v2_phase_a`, `_fold_session_recorded`, `rebuild_all` |
 | `turn_count` | `_write_session_and_turns`, `_seed_demo_graph`, `merge_capture_session`, `ingest_haystack`, `_write_v2_phase_a`, `_fold_session_recorded`, `rebuild_all` |
 | `is_episodic` | `_write_session_and_turns`, `_link_session`, `_fold_session_recorded`, `_execute_commit_writes`, `_commit_region`, `BACKFILL_STATEMENTS`, `merge_capture_session`, `ingest_haystack`, `_write_v2_phase_a`, `rebuild_all` |
 | `harness` | `_write_session_and_turns`, `_fold_session_recorded`, `rebuild_all` |
-| `capture_lane` | `_write_session_and_turns`, `rebuild_all` |
+| `capture_lane` | `_write_session_and_turns`, `_fold_session_recorded`, `rebuild_all` |
 | `actor_user_id` | `_write_session_and_turns`, `_fold_session_recorded`, `rebuild_all` |
 | `machine_id` | `_write_session_and_turns`, `rebuild_all` |
 | `model` | `_write_session_and_turns`, `rebuild_all` |

@@ -1443,16 +1443,22 @@ def test_session_retrofit_audit_tool_change_fails_closed_to_full():
 
 def test_session_schema_guard_runs_on_every_declared_writer_surface():
     # #3554: the declared :Session writer inventory SPANS surfaces —
-    # tools/longmem_eval/ingest.py and ingest_v2.py select `eval`, and
-    # tools/ask_spotcheck.py selects `sdk` — so the drift guard
+    # tools/longmem_eval/ingest.py and ingest_v2.py select `eval`,
+    # tools/ask_spotcheck.py selects `sdk`, tortoise/hosted_api.py selects
+    # `api`, and tortoise/session_schema.py (the declaration itself) falls to
+    # the `core` fallback — so the drift guard
     # (tests/test_session_schema_3554.py) must be registered on each surface
     # its subjects select. A named-surface match REPLACES the `core` fallback
     # (#2938), so a core+api-only registration silently drops the guard on an
-    # eval- or sdk-only change. Mutation check: removing either ci-surfaces.yml
-    # arm fails the corresponding assert below.
+    # eval- or sdk-only change. Mutation check: removing ANY ci-surfaces.yml
+    # arm fails the corresponding assert below — the `api` and `core` arms were
+    # unpinned (the whole suite stayed green with either removed), so they are
+    # in this list too.
     for path in ("tools/longmem_eval/ingest.py",
                  "tools/longmem_eval/ingest_v2.py",
-                 "tools/ask_spotcheck.py"):
+                 "tools/ask_spotcheck.py",
+                 "tortoise/hosted_api.py",
+                 "tortoise/session_schema.py"):
         r = _sel([path])
         assert "test_session_schema_3554.py" in r["test_files"], path
 

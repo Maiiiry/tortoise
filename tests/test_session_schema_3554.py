@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -39,9 +40,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(scope="module")
-def repo_inventory() -> dict:
+def repo_sites() -> tuple[list, list]:
     """ONE full scan of the real tree; the scan is the cost, not the assert."""
-    return audit.inventory_report(REPO_ROOT)
+    return audit.scan_graph_writers(REPO_ROOT), audit.scan_http_clients(REPO_ROOT)
+
+
+@pytest.fixture(scope="module")
+def repo_inventory(repo_sites) -> dict:
+    """The report, built from the ONE scan above rather than a second walk."""
+    writers, clients = repo_sites
+    return audit.inventory_report(REPO_ROOT, writers=writers, clients=clients)
 
 
 # ── the inventory half ─────────────────────────────────────────────────────
@@ -85,6 +93,52 @@ def test_declared_http_client_markers_are_present() -> None:
     for client in session_schema.SESSION_CLIENTS:
         text = (REPO_ROOT / client.path).read_text(encoding="utf-8")
         assert client.marker in text, (client.path, client.marker)
+
+
+#: The declared writers whose property names the scanner CANNOT read from the
+#: source literal: each builds its ``SET`` clause with an f-string (a shared
+#: helper or a ``for prop in (...)`` loop), so no ``s.<prop> =`` name sits in
+#: the literal. Their property sets are hand-declared. ``rebuild_all`` is
+#: excluded separately — it is the whole-schema writer (``SET s += $props``)
+#: and is declared as such.
+_FSTRING_WRITERS: frozenset[str] = frozenset({
+    "tools/ask_spotcheck.py::merge_capture_session",
+    "tortoise/projection/entities.py::_fold_session_recorded",
+    "tortoise/sdk.py::_write_session_and_turns",
+})
+
+
+def test_scanner_properties_match_the_declaration(repo_sites) -> None:
+    """Every writer whose literal carries property names declares exactly them.
+
+    ``inventory_report`` diffs writer KEYS only, so a declared property set that
+    disagrees with the properties its site writes is invisible to the inventory
+    — the drift the §4.8 owner column and this declaration exist to answer.
+    The exemption for the f-string writers is itself pinned: a new writer cannot
+    join the unreadable set unnoticed.
+    """
+    writers, _ = repo_sites
+    scanned: dict[str, set[str]] = {}
+    for site in writers:
+        scanned.setdefault(site.key, set()).update(site.properties)
+    mismatched: dict[str, dict[str, list[str]]] = {}
+    for writer in session_schema.SESSION_WRITERS:
+        if writer.writes_whole_schema or not scanned.get(writer.key):
+            continue
+        if scanned[writer.key] != set(writer.properties):
+            mismatched[writer.key] = {
+                "declared_only": sorted(set(writer.properties)
+                                        - scanned[writer.key]),
+                "site_only": sorted(scanned[writer.key]
+                                    - set(writer.properties)),
+            }
+    assert not mismatched, mismatched
+    unreadable = {
+        w.key for w in session_schema.SESSION_WRITERS
+        if not w.writes_whole_schema and not scanned.get(w.key)}
+    assert unreadable == _FSTRING_WRITERS, (
+        "only the declared f-string writers may have no literal property "
+        f"names; got {sorted(unreadable)}")
 
 
 def test_ast_index_excludes_only_the_docstring_constant() -> None:
@@ -205,6 +259,12 @@ class _FakeGraph:
     Two short sessions under ``capture_ok``, only ONE of them ``capture_ok``
     true — so ``capture_ok_true`` (1) and ``all_short`` (2) differ and a test
     can tell which key the CLI printed.
+
+    The (c) branch is DELIBERATELY universe-sensitive: it reports an
+    under-count only when the query reaches the turn points through
+    ``CONTAINS``, because the recorded counter sums the Session-origin AND the
+    turn-Point-origin edges (``link_session_entities``). A Session-origin-only
+    query would understate the gap — and can print a clean zero for a real one.
     """
 
     def query(self, cypher: str, params: dict | None = None) -> _FakeResult:
@@ -214,6 +274,8 @@ class _FakeGraph:
                 ("s-short-fail", 5, 2, False, "llm", "claude", "sdk"),
             ])
         if "live_edges > s.entity_links_created" in cypher:
+            if "CONTAINS" not in cypher:
+                return _FakeResult([])
             return _FakeResult([("s-links", 1, 3, 4)])
         if "s.turn_count IS NOT NULL RETURN count(s)" in cypher:
             return _FakeResult([[2]])
@@ -266,6 +328,53 @@ def test_retrofit_json_is_valid_json(
     assert payload["verdicts"] == session_schema.RETROFIT_VERDICTS
 
 
+class _RecordingGraph(_FakeGraph):
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def query(self, cypher: str, params: dict | None = None) -> _FakeResult:
+        self.queries.append(cypher)
+        return super().query(cypher, params)
+
+    def undercount_query(self) -> str:
+        return next(q for q in self.queries
+                    if "live_edges > s.entity_links_created" in q)
+
+
+def test_undercount_counts_the_same_edge_universe_as_the_counter() -> None:
+    """(c) must count Session-origin AND turn-Point-origin ``aboutObject`` edges.
+
+    The recorded counter is ``link_session_entities``' ``created``, which sums
+    BOTH ``_link(proj, "Session", …)`` and ``_link(proj, "Point", tid, …)``.
+    A Session-origin-only count understates the gap and can print a clean ZERO
+    for a real one: ``0 > 3`` is false, so a session holding 3 turn-point edges
+    against a counter of 1 reads clean. Pre-fix this test fails — the fake
+    graph answers the (c) query with an under-count only when it reaches the
+    turn points through ``CONTAINS``.
+    """
+    report = session_schema.audit_session_retrofit(_RecordingGraph())
+    assert report["entity_links_under_count"]["sessions"] == 1
+    assert report["entity_links_under_count"]["edges"] == 2
+
+
+def test_undercount_query_aggregates_the_two_legs_separately() -> None:
+    """The two ``OPTIONAL MATCH``es must not cross-product their counts.
+
+    Counting both legs in ONE row scope multiplies them
+    (``session_edges x turn_edges``) and over-reports the gap — the
+    mirror-image defect of the under-count. Each leg is aggregated in its own
+    ``WITH`` stage before the sum.
+    """
+    graph = _RecordingGraph()
+    session_schema.audit_session_retrofit(graph)
+    q = graph.undercount_query()
+    assert "CONTAINS" in q
+    assert "pointKind = 'event'" in q and "is_episodic = true" in q
+    assert "count(r1) AS session_edges" in q
+    assert "count(r2) AS turn_edges" in q
+    assert "count(r1) + count(r2)" not in q
+
+
 # ── the recorded decisions must have a real home ───────────────────────────
 
 ONTOLOGY = REPO_ROOT / "docs/ONTOLOGY.md"
@@ -297,11 +406,68 @@ def test_retrofit_verdicts_cite_documentation_homes_that_exist() -> None:
         assert "§ '#3554 amendment'" in where, name
 
 
-def test_ontology_section_4_8_names_the_whole_declared_schema() -> None:
-    """The doc mirror must name every property the machine declaration holds."""
+def test_ontology_section_4_8_owner_lists_match_the_declaration() -> None:
+    """The doc mirror must name every property AND its exact owner set.
+
+    The section claims the owners mirror ``SESSION_PROPERTY_OWNERS``; the
+    pre-fix test asserted only that each property NAME appeared, so a row could
+    lose an owner (or the declaration could gain one) with the table still
+    green. Pre-fix this test fails on the ``created_at`` and ``capture_lane``
+    rows: ``_fold_session_recorded`` writes both (``s.created_at=coalesce(…)``,
+    ``s.capture_lane=coalesce(…)``) and the declaration omitted them.
+    """
     section = _session_section()
-    for prop in session_schema.SESSION_PROPERTIES:
-        assert f"`{prop}`" in section, prop
+    row_re = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*(.*?)\s*\|\s*$", re.M)
+    rows: dict[str, set[str]] = {}
+    for prop, owners in row_re.findall(section):
+        if prop in session_schema.SESSION_PROPERTIES:
+            rows[prop] = {o.strip().strip("`")
+                          for o in owners.split(",") if o.strip()}
+    assert set(rows) == set(session_schema.SESSION_PROPERTIES), (
+        "§4.8 must name every declared property, and no other")
+    mismatched: dict[str, dict[str, list[str]]] = {}
+    for prop, owners in session_schema.SESSION_PROPERTY_OWNERS.items():
+        expected = {key.split("::")[1] for key in owners}
+        if rows[prop] != expected:
+            mismatched[prop] = {
+                "doc_only": sorted(rows[prop] - expected),
+                "declaration_only": sorted(expected - rows[prop]),
+            }
+    assert not mismatched, mismatched
+
+
+def test_fold_session_recorded_declares_every_property_it_writes() -> None:
+    """The fold's declared row must name every property its own Cypher writes.
+
+    The fold builds ``sets`` with an f-string, so ``tools/session_retrofit_audit.py
+    `` reads no property names at its site (it is one of the declared f-string
+    writers). This reads the function's source instead. Pre-fix the row omitted
+    ``created_at`` and ``capture_lane``, which the fold writes on every
+    journaled rebuild (both coalesce-preserved, like ``actor_user_id``).
+    """
+    src = (REPO_ROOT / "tortoise/projection/entities.py").read_text(
+        encoding="utf-8")
+    fn = next(node for node in ast.walk(ast.parse(src))
+              if isinstance(node, ast.FunctionDef)
+              and node.name == "_fold_session_recorded")
+    set_re = re.compile(r"\bs\.([A-Za-z_]\w*)\s*=(?!=)")
+    written: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            written.update(set_re.findall(node.value))
+        elif isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple):
+            # ``for prop in ("turn_count", …): sets.append(f"s.{prop}=$v_{prop}")``
+            # — the property names live in the loop's tuple, not the literal.
+            for elt in node.iter.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    written.add(elt.value)
+    declared = next(
+        w.properties for w in session_schema.SESSION_WRITERS
+        if w.key == "tortoise/projection/entities.py::_fold_session_recorded")
+    assert written == set(declared), (
+        "declaration disagrees with the fold: "
+        f"declared-only={sorted(set(declared) - written)} "
+        f"code-only={sorted(written - set(declared))}")
 
 
 def test_scanner_write_verbs_come_from_the_declared_predicate(
@@ -327,6 +493,33 @@ def test_scanner_write_verbs_come_from_the_declared_predicate(
                         (r"UPSERT\s*\(\s*<alias>\s*:\s*Session",))
     assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
         "tortoise/upsert_writer.py::QUERY"}
+
+
+def test_scanner_client_matchers_come_from_the_declared_route(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The client matcher reads ``PREDICATE['client_route']``, not a literal.
+
+    Pre-fix the call matchers were compiled at import from a hardcoded
+    ``/v1/sessions``: editing the declared route changed only the text
+    prefilter, so the declared clients read as STALE while the matchers kept
+    scanning the old route. Here the declaration moves to ``/v9/sessions`` and
+    only the v9 caller may be found.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "v9_client.py").write_text(
+        'import requests\n'
+        'def post_v9(base):\n'
+        '    return requests.post(f"{base}/v9/sessions", json={})\n',
+        encoding="utf-8")
+    (pkg / "v1_client.py").write_text(
+        'import requests\n'
+        'def post_v1(base):\n'
+        '    return requests.post(f"{base}/v1/sessions", json={})\n',
+        encoding="utf-8")
+    monkeypatch.setitem(audit.PREDICATE, "client_route", "/v9/sessions")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/v9_client.py"}
 
 
 def test_scanner_skips_the_declared_excluded_prefixes(
