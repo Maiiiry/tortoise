@@ -501,7 +501,8 @@ _REDACTION_VALUE = "[REDACTED:{kind}]"
 #      swallowing is real and is fixed by CONSTRUCTION — but by TWO
 #      constructions, not one: the password class is LAZY, excludes the
 #      structured-text delimiters (``_CONNECTION_URL_PASSWORD_STOPS``), and the
-#      host is host-shaped and must not be followed by another ``@``. Laziness
+#      host is host-shaped and must not be followed by a REACHABLE ``@`` (the
+#      two boundary assertions below). Laziness
 #      alone is NOT enough: with no host in its OWN authority the walk leaves
 #      the URL, crosses the delimiters to the NEXT field's ``@``-token and
 #      treats that token's domain as the host — the
@@ -638,8 +639,26 @@ _CONNECTION_URL_PLACEHOLDER = (
 #:     requirement from becoming a leak in the other direction: they are host
 #:     characters the class consumes, so excluding them here is redundant, while
 #:     a boundary that also excluded them would reject a real ``@host-``/``@host.``
-#:     URL whose next character is a sentence's punctuation. Both directions are
-#:     pinned in ``tests/test_connection_url_redaction_5326.py``.
+#:     URL whose next character is a sentence's punctuation.
+#:   * ``(?![^\s/?#"',;{}<>]{0,512}@)`` — and the host must be the URL's OWN
+#:     authority: no further ``@`` may be reachable from the END of the host
+#:     through PASSWORD-LEGAL characters. The maximality check alone is NOT
+#:     enough: on ``postgres://user:p@ss:123@host`` the host class accepts ``ss``
+#:     and the character after it (``:``) is neither a host-body character nor a
+#:     password stop, so the first boundary is satisfied, the match settles on
+#:     the FIRST ``@``, and ``ss:123`` — the tail of the real password
+#:     ``p@ss:123`` — is left in the graph with a redaction reported (#5470
+#:     again). With this assertion the password expands across the reachable
+#:     ``@`` to ``p@ss:123`` and the whole span goes. The scan is BOUNDED at 512
+#:     — the password's own bound — which keeps it a constant-cost lookahead
+#:     rather than a re-scan of the run from every candidate start (#5296): a
+#:     later ``@`` reachable by a ``<=512`` password is always within 509
+#:     characters of the host end, so the bound loses no reachable ``@``. A
+#:     ``@`` shielded by a password STOP (`"` `'` `,` `;` `{` `}` `<` `>`)
+#:     is NOT reachable — it lies outside the password by the class's own
+#:     definition — so it does not force an expansion; that is the delimiter
+#:     trade residual 5 records below. Both directions are pinned in
+#:     ``tests/test_connection_url_redaction_5326.py``.
 #: Only the PASSWORD is replaced (the ``sub`` leaves the port, path, query and
 #: fragment outside the match), so the stored record keeps its scheme, user,
 #: host and database name and stays diagnostic.
@@ -651,7 +670,8 @@ _CONNECTION_URL_RE = re.compile(
     r"(?P<password>[^\s/?#"
     + re.escape(_CONNECTION_URL_PASSWORD_STOPS)
     + r"]{1,512}?)@"
-    r"(?P<host>" + _CONNECTION_URL_HOST + r")(?![A-Za-z0-9_@.-])"
+    r"(?P<host>" + _CONNECTION_URL_HOST + r")"
+    r"(?![A-Za-z0-9_@.-])(?![^\s/?#\"',;{}<>]{0,512}@)"
 )
 
 _CONNECTION_URL_REPLACEMENT = (
@@ -687,6 +707,16 @@ _CONNECTION_URL_REPLACEMENT = (
 #      ``%3B`` / ``%27``) IS matched. Pinned by
 #      ``test_a_hostless_url_does_not_swallow_a_following_at_token`` and
 #      ``test_a_password_containing_a_field_delimiter_is_declined_whole``.
+#      ⚠️ A delimiter AFTER the authority's ``@`` is a DIFFERENT thing: it
+#      bounds the rule's URL rather than sitting inside the password (a password
+#      cannot contain a stop — that is the class's own definition). On
+#      ``postgres://user:abc@def,ghi@host`` the matched URL is therefore
+#      ``postgres://user:abc@def`` (password ``abc``, host ``def``) and the
+#      trailing ``,ghi@host`` is a SEPARATE token OUTSIDE the match, so no byte
+#      of the matched span's password survives. The stricter RFC 3986 reading
+#      (``,`` is a legal reg-name character, so ``abc@def,ghi`` is one userinfo)
+#      is the recall gap this trade accepts, recorded here rather than implied;
+#      it is pinned by ``test_a_delimiter_after_the_at_bounds_the_url``.
 
 #: ``(kind, pattern, replacement)`` — ordered, and the ORDER IS LOAD-BEARING.
 _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (

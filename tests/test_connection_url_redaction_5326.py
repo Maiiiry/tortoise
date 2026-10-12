@@ -21,10 +21,10 @@ bound here:
   an over-bound password and as SWALLOWING up to 200 chars of surrounding text
   around a greedy class. ⇒ §5: the swallowing is fixed by construction (a lazy
   password that also STOPS at the structured-text delimiters + a host shape + a
-  MAXIMAL-host boundary — laziness alone still walks into the next field's
-  ``@``-token when the URL has no host of its own), and the bound's one
-  residual is pinned as a whole-candidate miss — never a prefix left behind
-  (§8).
+  MAXIMAL-host boundary + an assertion that no further ``@`` is reachable from
+  the host — laziness alone still walks into the next field's ``@``-token when
+  the URL has no host of its own), and the bound's one residual is pinned as a
+  whole-candidate miss — never a prefix left behind (§8).
 
 Two things this file records rather than asserts silently:
 
@@ -45,6 +45,7 @@ import re
 from urllib.parse import urlsplit
 
 from tortoise.security import (
+    _CONNECTION_URL_HOST,
     _CONNECTION_URL_PASSWORD_STOPS,
     _CONNECTION_URL_PLACEHOLDER,
     _CONNECTION_URL_RE,
@@ -268,9 +269,11 @@ def test_a_greedy_class_does_not_swallow_the_surrounding_text():
     the last ``@`` in the whitespace/``/?#``-free run, which for minified JSON
     is the next field's ``@``.
 
-    The shipped rule is LAZY and its host is host-SHAPED, so the first ``@``
-    that yields a host wins. The greedy twin is built here and asserted to
-    fail, so this test reds if the laziness is ever "tidied" back to greedy.
+    The shipped rule is LAZY, its host is host-SHAPED, and it asserts no further
+    ``@`` is reachable from the host — so the first ``@`` that yields a host with
+    nothing reachable beyond it wins, and a ``@`` beyond one of the stops does
+    not force an expansion. The greedy twin is built here and asserted to fail,
+    so this test reds if the laziness is ever "tidied" back to greedy.
     """
     blob = ('{"url":"postgres://user:pw@host","region":"eu-west-1",'
             '"owner":"ops@example.com","ttl":30}')
@@ -315,12 +318,95 @@ def test_the_host_must_be_maximal_or_a_password_fragment_survives():
         assert password not in out, (url, out)
         assert out == f"postgres://user:{MARK}@host.internal:5432/db", out
 
+    # ⛔ #5326 review (P1): an `@` AND a `:` together — the maximal-host check
+    # ALONE stopped at the FIRST `@` whenever the tail after it was host-shaped
+    # and followed by `:` (neither a host-body character nor a password stop),
+    # leaving that tail in the graph with a redaction reported. The ``no further
+    # reachable @`` assertion is what makes these go whole. `a:b@c:d` also pins
+    # that the expansion crosses a `:` INSIDE the password, not only an `@`.
+    for password in ("p@ss:123", "top@secret:9999", "p@ss:1234", "a:b@c:d"):
+        url = f"postgres://user:{password}@prod-db.internal"
+        out = _assert_redacts(url)
+        assert out == f"postgres://user:{MARK}@prod-db.internal", out
+        assert password not in out, (url, out)
+
     # A host whose last character is a `-`/`.` (both host characters the class
     # consumes) must still be redacted, or the maximality requirement becomes a
     # leak in the other direction.
     for url in ("postgres://user:pw@host-", "postgres://user:pw@host.",
                 "postgres://user:pw@db..internal"):
         _assert_redacts(url)
+
+
+def test_a_password_tail_after_the_first_at_goes_whole_and_the_fix_is_pinned():
+    """⛔ #5326 review (P1), with the pre-fix twin built so this cannot go vacuous.
+
+    The maximal-host check alone is satisfied by ``postgres://user:p@ss:123@host``:
+    the host class accepts ``ss`` and the next character (``:``) is neither a
+    host-body character nor a password stop, so the match settled on the FIRST
+    ``@`` and left ``ss:123`` — the tail of the real password ``p@ss:123`` — in
+    the graph with a redaction counted (#5470's false-assurance class). The
+    shipped boundary now also asserts no further ``@`` is reachable, so the whole
+    password goes. The pre-fix twin below reproduces the partial redaction the
+    assertion rejects, so the test reds if the second lookahead is ever dropped.
+    """
+    for url, expected in (
+        ("postgres://user:p@ss:123@host",
+         f"postgres://user:{MARK}@host"),
+        ("postgres://user:top@secret:9999@prod-db.internal",
+         f"postgres://user:{MARK}@prod-db.internal"),
+        ("postgres://user:p@ss:1234@host:5432/db",
+         f"postgres://user:{MARK}@host:5432/db"),
+    ):
+        # ⛔ EXACT output — "the password is absent" and
+        # ``_password_span_is_gone`` are BOTH vacuous here: on the pre-fix
+        # pattern the match settles on the first ``@``, so its own span agrees
+        # with the truncated result and neither can see the lost tail. The exact
+        # string is what the fix changes, and the pre-fix code produces
+        # ``postgres://user:[REDACTED:connection_url]@ss:123@host``.
+        out = _assert_redacts(url)
+        assert out == expected, (url, out)
+
+    prefix_twin = re.compile(
+        r"(?i)(?P<scheme>postgres)://(?P<user>[^\s/?#:@]{0,64}):"
+        r"(?P<password>[^\s/?#"
+        + re.escape(_CONNECTION_URL_PASSWORD_STOPS)
+        + r"]{1,512}?)@(?P<host>" + _CONNECTION_URL_HOST + r")"
+        r"(?![A-Za-z0-9_@.-])")
+    twin, _n = prefix_twin.subn(
+        r"\g<scheme>://\g<user>:[R]@\g<host>",
+        "postgres://user:p@ss:123@host")
+    assert "ss:123" in twin, (
+        "the pre-fix twin no longer leaves the password tail — this test has "
+        "stopped binding the boundary it exists to pin")
+
+
+def test_a_delimiter_after_the_at_bounds_the_url():
+    """Residual 5, `@`-first direction: a stop after the authority `@` ends the
+    rule's URL rather than joining the password.
+
+    A password cannot contain a stop (that is the class's own definition), so a
+    ``,`` after the authority's ``@`` cannot be part of the password — it bounds
+    the rule's URL. On ``postgres://user:abc@def,ghi@host`` the matched URL is
+    ``postgres://user:abc@def`` (password ``abc``, host ``def``) and the trailing
+    ``,ghi@host`` is a SEPARATE token outside the match; every byte of the
+    matched span's password is gone. The stricter RFC 3986 reading (``,`` is a
+    legal reg-name character, so ``abc@def,ghi`` is one userinfo) is the recall
+    gap the delimiter trade accepts (residual 5) — never a partial rewrite of the
+    span the rule matched.
+    """
+    url = "postgres://user:abc@def,ghi@host"
+    match = _CONNECTION_URL_RE.search(url)
+    assert match is not None, "the delimiter no longer bounds a URL"
+    assert match.group("password") == "abc", match.group(0)
+    assert match.group("host") == "def", match.group(0)
+    out = _assert_redacts(url)
+    assert out == f"postgres://user:{MARK}@def,ghi@host", out
+
+    # The other side of the same trade, so the two are not confused: a ``,``
+    # after a host that IS the URL's own still leaves the URL's password whole.
+    out = _assert_redacts("postgres://user:pw@host,email=ops@example.com")
+    assert out == f"postgres://user:{MARK}@host,email=ops@example.com", out
 
 
 def test_a_hostless_url_does_not_swallow_a_following_at_token():

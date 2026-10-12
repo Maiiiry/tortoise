@@ -4194,7 +4194,7 @@ durations:
   test_capture_graph_ops.py: 0.8
   test_capture_redaction_sinks_5445.py: 0.1
   test_capture_secret_redaction_4911.py: 9.7
-  test_connection_url_redaction_5326.py: 2.7  # #5326: measured locally this turn (19 tests, 2.67 s wall on an idle-ish box). A NEW file has no CI junit measurement (a file that never ran cannot appear in an artifact), and the registration is load-bearing in BOTH halves: the surface entry alone leaves durations coverage below the 90% floor and `tools/ci_selection.py --integrity` reds (#4348 trap — do not drop without re-deriving the floor at that head). The file is CPU-light (one 6,000-case in-process fuzz, no DB), so unlike the #4921 entry above it does NOT move much with box load. Refresh from the first post-merge run that includes it.
+  test_connection_url_redaction_5326.py: 2.7  # #5326: 23 tests (21 at the first cut; #5326 review added 2 that pin the authority-boundary leak). Local wall is fuzz- and box-dependent (~2.7-8 s), so the numeric value stays the pre-merge estimate; a NEW file has no CI junit measurement (a file that never ran cannot appear in an artifact). The registration is load-bearing in BOTH halves: the surface entry alone leaves durations coverage below the 90% floor and `tools/ci_selection.py --integrity` reds (#4348 trap — do not drop without re-deriving the floor at that head). The file is CPU-light (one 6,000-case in-process fuzz, no DB), so unlike the #4921 entry above it does NOT move much with box load. Refresh the value from the first post-merge run that includes it.
   test_capture_validfrom_3945.py: 0.5
   test_ci_last_failed.py: 1.9
   test_ci_manifest.py: 7.2

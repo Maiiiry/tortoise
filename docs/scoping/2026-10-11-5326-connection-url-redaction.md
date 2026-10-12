@@ -116,15 +116,22 @@ port, path, query and fragment and stays diagnostic.
   deliberately **no dotted-host gate** (revision 2's leak: it dropped `@dbserver`,
   `@cache` and every IP literal).
 * **The class that "swallowed surrounding text" is fixed by construction.**
-  The password class is **lazy** and the host is host-shaped, so minified JSON
-  round a URL keeps every key and address:
-  `{"url":"postgres://user:pw@host","owner":"ops@example.com"}` redacts `pw` and
-  nothing else. Pinned from **both** sides — a greedy twin is built in the test
-  and asserted to destroy the neighbouring keys, so the laziness cannot be
-  "tidied" away — and the other direction too: a LAX host boundary lets the host
-  class backtrack one character, the match settles on the FIRST `@`, and the tail
-  of a password containing `@` (`postgres://user:pw@abcd-@x`) survives while the
-  count reports a redaction. The shipped boundary demands a **maximal** host.
+  The password class is **lazy**, stops at the structured-text delimiters, and
+  the host is host-shaped, so minified JSON round a URL keeps every key and
+  address: `{"url":"postgres://user:pw@host","owner":"ops@example.com"}` redacts
+  `pw` and nothing else. Pinned from **both** sides — a greedy twin is built in
+  the test and asserted to destroy the neighbouring keys, so the laziness cannot
+  be "tidied" away — and the other direction too: a LAX host boundary lets the
+  host class backtrack one character, the match settles on the FIRST `@`, and
+  the tail of a password containing `@` (`postgres://user:pw@abcd-@x`) survives
+  while the count reports a redaction. The shipped boundary therefore demands
+  **two** things: a **maximal** host AND that the host is the URL's own
+  authority — **no further `@` reachable** through password-legal characters
+  from the host end. The second assertion closes `postgres://user:p@ss:123@host`,
+  where the tail `ss:123` is host-shaped and `:` is neither a host-body
+  character nor a password stop, so maximality alone settled on the first `@`
+  and left the password tail behind with a redaction counted (#5470). The scan
+  is bounded at 512, the password's own bound, which keeps it constant-cost.
 * **Refusals are in the PATTERN, not in a callable — and that is a correctness
   requirement, not a style choice.** `re.subn` counts MATCHES, so a replacement
   function that returns a candidate unchanged is still counted: it would inflate
@@ -168,7 +175,15 @@ port, path, query and fragment and stays diagnostic.
 4. A URL whose credential is a **bare userinfo token with no `:`**
    (`https://<token>@host`) is not matched here; the token is claimed by its own
    vendor rule where one exists (`ghp_`).
-5. **The count on this corpus moves.** ~167 production turn nodes quote this
+5. **The delimiter trade (#5326 review).** A raw `'`/`,`/`;` (and
+   `"`/`<`/`>`/`{`/`}`) is treated as ending the rule's URL. Inside a password it
+   declines the candidate whole (never a prefix, the #5470 direction); AFTER the
+   authority's `@` it bounds the URL, so `postgres://user:abc@def,ghi@host`
+   matches `postgres://user:abc@def` (password `abc`, host `def`) and the
+   trailing `,ghi@host` is a separate token. The stricter RFC 3986 reading (`,`
+   is a legal reg-name character, so `abc@def,ghi` is one userinfo) is the recall
+   gap accepted here.
+6. **The count on this corpus moves.** ~167 production turn nodes quote this
    repo's own documented dev URI, and it is now matched. That is the intended
    consequence of the decision below, not an accident.
 
