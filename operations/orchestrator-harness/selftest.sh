@@ -18,6 +18,9 @@ ck() { # ck <name> <0|1>
 }
 LOOP="$HERE/orch-loop.sh"; MERGE="$HERE/merge-one.sh"; INST="$HERE/install.sh"; REFRESH="$HERE/refresh-candidates.sh"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
+# dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
+need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
 echo "==> offline self-test ($HERE)"
 
 # ── 1) every script parses ───────────────────────────────────────────────────────
@@ -34,22 +37,23 @@ ck "all shell scripts parse (bash -n)" $rc
 # a running worker's session name.
 # sess() is a one-liner, so extract the single line (a range to /^}/ would swallow the whole loop).
 grep -m1 '^sess() {' "$LOOP" > "$TMP/sess.sh"
-[ -s "$TMP/sess.sh" ] || echo "      could not extract sess()" >&2
-tmux() { printf 'fix-820\nmerge-821\nlane-5\n'; }
-# shellcheck disable=SC1090
-. "$TMP/sess.sh"
-sess "fix-82"  && rc=1 || rc=0; ck "shipped sess(): fix-82 does NOT match fix-820" $rc
-sess "fix-820" && rc=0 || rc=1; ck "shipped sess(): fix-820 matches its own name" $rc
-sess "fix-8200" && rc=1 || rc=0; ck "shipped sess(): fix-8200 does NOT match fix-820" $rc
-unset -f tmux
+if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
+  tmux() { printf 'fix-820\nmerge-821\nlane-5\n'; }
+  # shellcheck disable=SC1090
+  . "$TMP/sess.sh"
+  sess "fix-82"  && rc=1 || rc=0; ck "shipped sess(): fix-82 does NOT match fix-820" $rc
+  sess "fix-820" && rc=0 || rc=1; ck "shipped sess(): fix-820 matches its own name" $rc
+  sess "fix-8200" && rc=1 || rc=0; ck "shipped sess(): fix-8200 does NOT match fix-820" $rc
+  unset -f tmux
+fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
 # Extracted from orch-loop.sh verbatim; only the bash-side $REQ is substituted.
 REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
 awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
   | sed "s/'\\\$REQ'/'$REQ'/" | sed -n '1,/^print(/p' > "$TMP/classify.py"
-[ -s "$TMP/classify.py" ] || echo "      could not extract the classifier" >&2
 cl() { printf '%s' "$1" | python3 "$TMP/classify.py" 2>/dev/null; }
+if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: ai-review-gate SKIPPED is not satisfied" $rc
@@ -65,12 +69,13 @@ ck "shipped classifier: gate SUCCESS + path-filtered legs skipped = GREEN" $rc
 got="$(cl '[{"name":"ai-review-gate","state":"FAILURE"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: gate FAILURE is reported failed" $rc
+fi
 
 # ── 4) the shipped claim block refuses a second owner ────────────────────────────
 # Extracted from merge-one.sh and executed, so this pins the real lock, not a copy of the idiom.
 sed -n '/^CLAIM="\$O\/state\/mergeclaim-\$PR.lock"/,/^trap .rm -f "\$CLAIM".*$/p' "$MERGE" > "$TMP/claim.sh"
-[ -s "$TMP/claim.sh" ] || echo "      could not extract the claim block" >&2
 mkdir -p "$TMP/O/state"
+if need "$TMP/claim.sh" "the claim block is extracted from the shipped merge-one.sh"; then
 # The claim block logs to "$L.log", so assert on the log, not on stdout.
 # (a) a claim held by a LIVE pid must be refused
 printf '%s' "$$" > "$TMP/O/state/mergeclaim-900.lock"
@@ -84,6 +89,7 @@ printf '%s' "999999" > "$TMP/O/state/mergeclaim-901.lock"
 out="$( O="$TMP/O" PR=901 L="$TMP/claimtest2" bash -c "set -u; . '$TMP/claim.sh'; echo ALIVE" 2>&1 )"
 case "$out" in *ALIVE*) rc=0 ;; *) rc=1; echo "      got '$out'";; esac
 ck "shipped claim block: a dead owner's claim is reclaimed" $rc
+fi
 
 # ── 5) the shipped reaper un-blacklists only undelivered dispatches ──────────────
 # Extracted from refresh-candidates.sh and run against fixtures:
@@ -99,7 +105,7 @@ printf 'feat/8888-tm\n' > "$R/.pr_brs"
 tmux() { printf 'lane-7777\nmerge-100\n'; }
 # extract the embedded reaper (the heredoc body only)
 awk '/^python3 - "\$O" <<.PY.$/{f=1;next} /^PY$/{f=0} f' "$REFRESH" > "$R/reap.py"
-[ -s "$R/reap.py" ] || echo "      could not extract the reaper" >&2
+if need "$R/reap.py" "the reaper is extracted from the shipped refresh-candidates.sh"; then
 # the extracted body shells out to tmux; export the fake so the child sees it
 cat > "$R/tmux" <<'SH'
 #!/bin/bash
@@ -118,6 +124,7 @@ case "$kept" in *7777*) rc=0;; *) rc=1;; esac
 ck "shipped reaper: an issue with a live lane is kept" $rc
 case "$(tr '\n' ' ' < "$R/checked.txt")" in *4114*) rc=1;; *) rc=0;; esac
 ck "shipped reaper: the reaped entry is removed from checked.txt" $rc
+fi
 unset -f tmux
 
 # ── 6) install.sh renders correctly, including values sed would mangle ───────────
@@ -172,7 +179,7 @@ grep -q 'if tmux new-session -d -s "fix-\$PR"' "$LOOP" && rc=0 || rc=1
 ck "fixer spawn is attempted before the attempt is recorded" $rc
 grep -q 'PARKED after' "$LOOP" && rc=0 || rc=1
 ck "reaching MAX_FIX_TRIES parks the PR instead of re-reviewing forever" $rc
-grep -q 'mergeclaim-\$PR.lock' "$LOOP" && rc=0 || rc=1
+grep -q 'claim_live "\$PR"' "$LOOP" && rc=0 || rc=1
 ck "controller honours the claim written by the chain path" $rc
 
 # ── 10) template / renderer placeholder parity ───────────────────────────────────
@@ -197,6 +204,55 @@ grep -q 'One owner per PR, per box' "$HERE/README.md" && rc=0 || rc=1
 ck "README scopes the claim invariant to one box" $rc
 grep -q 'serialises one box only' "$HERE/README.md" && rc=0 || rc=1
 ck "README states the cross-box limitation explicitly" $rc
+# The README must not state a check COUNT — it drifts the moment a check is added (it said 29
+# while the file had 42). Assert the absence of the claim instead of a magic number.
+grep -qE '[0-9]+ checks' "$HERE/README.md" && rc=1 || rc=0
+ck "README states no check count that can drift" $rc
+grep -q 'selftest.sh' "$HERE/README.md" && rc=0 || rc=1
+ck "README points at the self-test" $rc
+
+# ── 13) a hostile branch name cannot reach a shell ───────────────────────────────
+# git PERMITS ' ; $ ` & | ( ) { } " < > # in a ref name — only spaces are forbidden, and ${IFS}
+# supplies those. The controller embedded headRefName inside a tmux `sh -c` string, so a fork PR on
+# branch `fix/x';touch${IFS}/tmp/VULN;#` got arbitrary command execution on the host that holds the
+# merge key. This was reproduced end-to-end before the fix.
+sed -n '/^safe_ref() {/,/^}/p' "$LOOP" > "$TMP/saferef.sh"
+if need "$TMP/saferef.sh" "safe_ref() is extracted from the shipped orch-loop.sh"; then
+  REPO="$HERE/../.."
+  # shellcheck disable=SC1090
+  . "$TMP/saferef.sh"
+  HOSTILE="fix/x';touch\${IFS}/tmp/VULN;#"
+  safe_ref "$HOSTILE" && rc=1 || rc=0
+  ck "shipped safe_ref() rejects a hostile branch name" $rc
+  safe_ref "fix/8246-orchestrator-harness-handover" && rc=0 || rc=1
+  ck "shipped safe_ref() accepts a normal branch name" $rc
+  safe_ref "feat/1234-tm" && rc=0 || rc=1
+  ck "shipped safe_ref() accepts a generated branch name" $rc
+fi
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+grep -q '^is_num() {' "$LOOP" && rc=0 || rc=1
+ck "the shipped loop defines is_num() for PR ids" $rc
+grep -q -- "--argv" "$LOOP" && rc=0 || rc=1
+ck "worker launches pass args via --argv, not string interpolation" $rc
+grep -qE "'\\\$OR' \\\$PR '\\\$BR'" "$LOOP" && rc=1 || rc=0
+ck "no \$OR/\$PR/\$BR interpolation remains in the spawn commands" $rc
+
+# ── 14) the controller does not treat a stale claim as in-flight ────────────────
+sed -n '/^claim_live() {/,/^}/p' "$LOOP" > "$TMP/claimlive.sh"
+if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loop.sh"; then
+  mkdir -p "$TMP/CL/state"
+  O="$TMP/CL"
+  # shellcheck disable=SC1090
+  . "$TMP/claimlive.sh"
+  printf '%s' "$$" > "$O/state/mergeclaim-1.lock"
+  claim_live 1 && rc=0 || rc=1
+  ck "shipped claim_live(): a live owner counts as in flight" $rc
+  printf '%s' "999999" > "$O/state/mergeclaim-2.lock"
+  claim_live 2 && rc=1 || rc=0
+  ck "shipped claim_live(): a dead owner is not in flight" $rc
+  [ -f "$O/state/mergeclaim-2.lock" ] && rc=1 || rc=0
+  ck "shipped claim_live(): the stale claim file is removed" $rc
+fi
 
 echo
 echo "==> $pass passed, $fail failed"

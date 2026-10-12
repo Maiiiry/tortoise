@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
 # merge-one.sh <repo-path> <owner/repo> <pr> <branch>
+# merge-one.sh --argv <file>            (4 lines: repo, owner/repo, pr, branch)
 # Full chain for ONE PR: fresh-context review -> evidence comment -> record-review -> wait green -> merge.
 # This box holds the AI_REVIEW_GATE_KEY, so it owns the merge authority for its own PRs.
 set -u
-REPO="$1"; OR="$2"; PR="$3"; BR="$4"
+# --argv exists because these values are attacker-influenced (a PR branch name may contain quotes,
+# semicolons, $ and backticks) and the controller must launch us from a tmux `sh -c` string.
+# Passing them through a file keeps every PR-derived value out of that string entirely.
+if [ "${1:-}" = "--argv" ]; then
+  ARGV="${2:-}"
+  [ -f "$ARGV" ] || { echo "[merge] missing argv file: $ARGV" >&2; exit 1; }
+  { read -r REPO; read -r OR; read -r PR; read -r BR; } < "$ARGV"
+  rm -f "$ARGV"
+else
+  REPO="$1"; OR="$2"; PR="$3"; BR="$4"
+fi
+case "${PR:-}" in ''|*[!0-9]*) echo "[merge] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH

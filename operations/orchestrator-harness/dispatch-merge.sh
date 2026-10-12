@@ -10,6 +10,8 @@ cd "$REPO" || exit 1
 git fetch origin main --quiet 2>/dev/null
 
 for N in "$@"; do
+  # Issue numbers come from the GitHub API via candidates.txt; never let one reach a shell string.
+  case "${N:-}" in ''|*[!0-9]*) echo "#$N: SKIPPED (non-numeric issue id)"; continue ;; esac
   WT="tm-$N"; BR="feat/$N-tm"
   if ! git worktree list | grep -q "/$WT "; then
     git worktree add ".worktrees/$WT" -b "$BR" origin/main >/dev/null 2>&1 \

@@ -170,14 +170,15 @@ Run the offline self-test first — it needs no network, tmux server or git writ
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
 reaper, or runs `install.sh` for real) rather than re-implementing the logic — a test that
 re-implements the fix passes on the broken copy and proves nothing. That failure mode was found in
-review of this very file, and 23 of its checks were confirmed to fail when it is dropped into the
+review of this very file, and 19 of its checks fail when it is dropped into the
 pre-fix tree.
 
 ```bash
-./selftest.sh          # 29 checks: syntax, exact session matching, fail-closed gate classifier,
-                       # claim atomicity, the reaper's four keep/reap decisions, install.sh
-                       # rendering with a hostile path, limit-default consistency, placeholder
-                       # parity, README overclaim guard, credential scan
+./selftest.sh          # run it for the live list. Covers: syntax, exact session matching, the
+                       # fail-closed gate classifier, claim atomicity and stale-claim recovery,
+                       # the reaper's keep/reap decisions, rejection of a hostile branch name,
+                       # install.sh rendering with a hostile path, limit-default consistency,
+                       # placeholder parity, README overclaim guards, credential scan
 ```
 
 **The gate key only reaches the daemon if it is a FILE.** `install.sh` deliberately does not copy a
@@ -238,6 +239,37 @@ after a restart until it was fixed).
    never copied into this bundle.
 8. **One controller.** `.orch.lock` is created with `set -o noclobber`; a second start exits
    immediately, and a lock whose PID is dead is reclaimed.
+9. **GitHub data never reaches a shell.** Inputs from the API are validated before use:
+   `safe_ref` admits only `[A-Za-z0-9._/-]` **and** requires `git check-ref-format --branch`; PR ids
+   must be all digits (`is_num`); worker arguments travel in a file and the daemon launches
+   `merge-one.sh --argv <file>`, so no PR-derived value is ever embedded in the `sh -c` string that
+   `tmux new-session` executes. Branch names were the hole: git **permits** `'` `;` `$` `` ` `` `&` `|`
+   `(` `)` `{` `}` `"` `<` `>` `#` in a ref (only spaces are forbidden, and `${IFS}` supplies
+   those), so a fork PR on `fix/x';touch${IFS}/tmp/x;#` achieved arbitrary command execution on the
+   host holding the merge key. Reproduced before the fix; the self-test now pins the validator.
+
+### 5.3 Untrusted input and worker containment — read before running this unattended
+
+This harness passes **attacker-controlled text** to language-model agents with shell access. Be
+clear about what is and is not enforced:
+
+- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_SKIP_REVIEW_GATE=1`,
+  `ELDATO_SKIP_VGATE=1`, `AGENT_ALLOW_MAIN_EDITS=1`, `SKILL_ENFORCER_DISABLED=1` and
+  `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`. "Do NOT merge" and "do not touch the
+  main checkout" are **prompt instructions, not controls**.
+- **Prompt injection is possible.** `fix-one.sh` reads the PR's comments into the fixer prompt as
+  the authoritative review, and `merge-one.sh` feeds the reviewer the PR title, body and diff. A
+  malicious PR body can therefore attempt to steer an agent that has shell access.
+- **What actually constrains it.** The harness's own gate: only `orch-loop.sh` calls
+  `gh pr merge`, and only after `record-review.sh` has written a signed marker for the exact head
+  (§5.1) — so a rogue *agent* cannot merge through the harness path. It could still `gh pr merge`
+  or `git push` directly if the token permits, which is a property of the token, not this code.
+- **What is deliberately not done:** the gate key is never placed in a prompt, a plist, a log or a
+  command line, and no script creates a secret-bearing file.
+- **Open item (tortoise#8246):** contain the workers properly — a read-only key path, no
+  merge-scoped token during review, and treating PR content as delimited data rather than
+  instructions. Until then, run this on a box whose GitHub token you would accept being used by an
+  agent that has read a hostile PR body.
 
 ---
 
@@ -350,6 +382,9 @@ because the self-test now drives every one of them:
 | the live sweep dropped the `CLOSED` guard that `retired/sweep.sh` had, keeping only `MERGED` | a PR listed open that closed in between fell through to `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever | `case "$PR_ST" in MERGED\|CLOSED) continue ;;` |
 | `retired/auto-loop.sh` and `retired/sweep.sh` still carried the fail-open `ai-review-gate` classifier | shipping "the record" with the very bug being fixed invites reuse of it | both annotated in place as retired-with-known-fail-open |
 | §3 and §8 admitted cross-box duplication while §5.1b said "one owner per PR" | the invariant was stated more strongly than the code delivers | §5.1b scoped to per-box; §7.2b states the open cross-box gap |
+| **a PR branch name was interpolated into the `sh -c` string `tmux new-session` executes** | **arbitrary command execution on the unattended host that holds the merge key.** git permits `'` `;` `$` `` ` `` `&` `|` `(` `)` `{` `}` `"` `<` `>` `#` in a ref name, so a fork PR on `fix/x';touch${IFS}/tmp/x;#` broke out of the quotes. Reproduced end-to-end before fixing | `safe_ref` allowlist + `check-ref-format`; numeric-only PR ids; and worker args now travel in a file (`--argv`) so no PR-derived value is interpolated at all |
+| the claim-file guard added in the first fix round introduced a permanent stall | the controller treated *the existence of* `mergeclaim-<PR>.lock` as "in flight", but only `merge-one.sh` removes it — a SIGKILLed worker or a reboot mid-merge left the PR skipped forever with no fixer and no re-record | `claim_live()` tests the recorded pid with `kill -0` and removes a dead owner's claim |
+| 6 self-test checks passed vacuously because an empty extraction did not fail the check | the round-1 vacuity fix was incomplete: checks depending on `sess()`, the claim block or the reaper passed when the shipped script had no such code | `need()` turns a missing extraction into a FAIL; measured 7/30 on the pre-fix tree vs 46/46 shipped |
 
 ### 7.5 Still open, deliberately not fixed here
 
