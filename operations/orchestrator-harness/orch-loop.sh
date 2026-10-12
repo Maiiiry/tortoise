@@ -67,6 +67,20 @@ load1() { sysctl -n vm.loadavg 2>/dev/null | awk '{print int($2)}'; }
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
 
+# Merge priority: a merge backlog means the box's scarce capacity belongs to review+merge, not to
+# opening more PRs. These two functions hold the rule so it is directly testable (and so a
+# regression cannot hide behind a comment):
+#   mp_reason    -> the gate reason when draining should outrank dispatching (empty otherwise)
+#   review_slots -> reviewer concurrency, with headroom once a backlog exists
+mp_reason() { # <open_prs> <lanes>
+  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ "${2:-0}" -ge 1 ]; then
+    echo "merge-priority (${1} open PRs — draining before opening more)"
+  fi
+}
+review_slots() { # <open_prs>
+  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $((MAX_REVIEW + 2)); else echo "$MAX_REVIEW"; fi
+}
+
 while true; do
   heartbeat
   L="$(load1)"
@@ -78,8 +92,7 @@ while true; do
   # Merge priority: a merge backlog means the box's scarce capacity belongs to review+merge, not to
   # opening more PRs. Give reviewers extra headroom above the backlog threshold (and section 2 stops
   # dispatching new lanes). Below it, run a mix. Tune with MERGE_PRIORITY_AT.
-  MR="$MAX_REVIEW"
-  if [ "$OPEN_N" -gt "${MERGE_PRIORITY_AT:-10}" ]; then MR=$((MAX_REVIEW + 2)); fi
+  MR="$(review_slots "$OPEN_N")"
   # Scope: >10 open PRs -> BROAD (help drain everyone's). Our OWN patterns are always included
   # even while drafts, because a draft is invisible to the checks below and nothing else would
   # ever ready it — our lanes' own drafts used to stall red forever (#8219, #8085).
@@ -198,9 +211,8 @@ PY
   # Three gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
-  GATE_WHY=""
-  if [ "${OPEN_N:-0}" -gt "${MERGE_PRIORITY_AT:-10}" ] && [ "$LANES" -ge 1 ]; then
-    GATE_WHY="merge-priority (${OPEN_N} open PRs — draining before opening more)"
+  GATE_WHY="$(mp_reason "${OPEN_N:-0}" "$LANES")"
+  if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
   elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ]; then GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M"

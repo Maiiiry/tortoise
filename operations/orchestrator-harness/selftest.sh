@@ -173,6 +173,24 @@ grep -q 'GATE_WHY=' "$LOOP" && rc=0 || rc=1
 ck "dispatch skip message names the binding gate" $rc
 grep -q 'merge-priority' "$LOOP" && rc=0 || rc=1
 ck "the loop implements merge-priority above the backlog threshold" $rc
+# Drive the shipped rule rather than grepping for a comment: a regression that dropped the
+# 'lanes >= 1' exception or the headroom arithmetic must fail here.
+sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"
+if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped loop"; then
+  MERGE_PRIORITY_AT=10; MAX_REVIEW=4
+  # shellcheck disable=SC1090
+  . "$TMP/mp.sh"
+  [ -n "$(mp_reason 11 1)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 open PRs with a lane running -> drain" $rc
+  [ -z "$(mp_reason 11 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 open PRs with NO lane -> dispatch still allowed" $rc
+  [ -z "$(mp_reason 10 3)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): at the threshold, no drain override" $rc
+  [ "$(review_slots 11)" = "6" ] && rc=0 || rc=1
+  ck "shipped review_slots(): backlog raises reviewer headroom to MAX_REVIEW+2" $rc
+  [ "$(review_slots 10)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): below the threshold, headroom is MAX_REVIEW" $rc
+fi
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
 
@@ -238,6 +256,12 @@ grep -q -- "--argv" "$LOOP" && rc=0 || rc=1
 ck "worker launches pass args via --argv, not string interpolation" $rc
 grep -qE "'\\\$OR' \\\$PR '\\\$BR'" "$LOOP" && rc=1 || rc=0
 ck "no \$OR/\$PR/\$BR interpolation remains in the spawn commands" $rc
+# The retired tree ships next to the live scripts and is executable, so an unsafe interpolation
+# there is a re-armable P0 for anyone who reuses it. It must be annotated as such.
+grep -q 'RETIRED: unsafe interpolation' "$HERE/retired/auto-loop.sh" && rc=0 || rc=1
+ck "the retired copy's unsafe interpolation is annotated in place" $rc
+grep -q 'Prefer the live scripts' "$HERE/retired/auto-loop.sh" && rc=0 || rc=1
+ck "the retired copy's banner warns against reuse" $rc
 
 # ── 14) the controller does not treat a stale claim as in-flight ────────────────
 sed -n '/^claim_live() {/,/^}/p' "$LOOP" > "$TMP/claimlive.sh"

@@ -245,8 +245,10 @@ after a restart until it was fixed).
 9. **GitHub data never reaches a shell.** Inputs from the API are validated before use:
    `safe_ref` admits only `[A-Za-z0-9._/-]` **and** requires `git check-ref-format --branch`; PR ids
    must be all digits (`is_num`); worker arguments travel in a file and the daemon launches
-   `merge-one.sh --argv <file>`, so no PR-derived value is ever embedded in the `sh -c` string that
-   `tmux new-session` executes. Branch names were the hole: git **permits** `'` `;` `$` `` ` `` `&` `|`
+   `merge-one.sh --argv <file>`, so no PR-derived value is embedded in the `sh -c` string that
+   `tmux new-session` executes **on any live path**. (`retired/auto-loop.sh` still contains the old
+   unsafe interpolation, annotated in place — it is unreachable from the live scripts and exists
+   only as history; do not reuse it.) Branch names were the hole: git **permits** `'` `;` `$` `` ` `` `&` `|`
    `(` `)` `{` `}` `"` `<` `>` `#` in a ref (only spaces are forbidden, and `${IFS}` supplies
    those), so a fork PR on `fix/x';touch${IFS}/tmp/x;#` achieved arbitrary command execution on the
    host holding the merge key. Reproduced before the fix; the self-test now pins the validator.

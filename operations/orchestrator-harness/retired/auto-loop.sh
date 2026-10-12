@@ -30,6 +30,11 @@ try: d=json.load(sys.stdin)
 except Exception: print('NOCHECKS'); raise SystemExit
 m={c['name']:c['state'] for c in d}
 want='$REQ'.split()
+# RETIRED, kept for the record. NOTE: this copy still carries the fail-open reading of
+# ai-review-gate (SKIPPED/NEUTRAL counted as satisfied) that orch-loop.sh fixed — do not reuse
+# this file without requiring an explicit SUCCESS for that check. It ALSO still interpolates the
+# untrusted headRefName straight into the tmux sh -c string (line ~51); orch-loop.sh gates that
+# behind safe_ref()/is_num()/--argv. Prefer the live scripts.
 bad=lambda s: s in ('FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED')
 ok=lambda s: s in ('SUCCESS','FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED','SKIPPED','NEUTRAL')
 # RETIRED, kept for the record. NOTE: this copy still carries the fail-open reading of
@@ -48,6 +53,7 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
         echo "#$PR ${verdict}" >>"$LOG"
         if echo "$verdict" | grep -q "ai-review-gate"; then
           if ! tmux has-session -t "merge-$PR" 2>/dev/null && ! tmux has-session -t "fix-$PR" 2>/dev/null; then
+            # RETIRED: unsafe interpolation of the API-supplied branch name (see the header note).
             tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' '$REPO' '$OR' $PR '$BR'" 2>/dev/null \
               && echo "#$PR re-running review->record chain" >>"$LOG"
           fi
