@@ -223,14 +223,14 @@ _EXCLUSION_REASONS = {
 # `_uncarried`) because the loss has its own issue and its own reason. They are
 # excluded from the comparison PER POINT, by `_uncarried` — not statically — so a
 # graph-only value is still compared and can still be reported as a divergence.
-_UNCARRIED_CONTENT_PROPS: dict[str, str] = {
-    "tags": (
-        "#2897 — the live writer stores the raw list (`SET n += $props`), the "
-        "REPLAYED writer refuses it (`_POINT_LIST_PROPS` is empty, #2795), so "
-        "live and replay disagree by construction; the loss is REPORTED, not "
-        "treated as a divergence"
-    ),
-}
+#
+# EMPTY since #2897 landed: `tags` was the only entry, and it is now CARRIED
+# (`_POINT_HANDLED`, with its own node-property clause plus the pass-2
+# `:Tag`/`TAGGED` sync), so the checker COMPARES it instead of exempting it —
+# which is what makes a future regression on that door visible instead of
+# silently tolerated. The dict is kept (rather than deleted) because the
+# mechanism is the right home for the next declared live/replay asymmetry.
+_UNCARRIED_CONTENT_PROPS: dict[str, str] = {}
 
 # A key whose EXISTENCE legitimately depends on the payload, so a one-sided
 # presence is a representation asymmetry rather than content the journal
@@ -331,7 +331,8 @@ _UNCARRIED_NON_PERSISTABLE = (
 )
 _UNCARRIED_LIST = (
     "list-valued prop the REPLAYED writer refuses (`_POINT_LIST_PROPS` is empty, "
-    "#2795); the live path may still write it (#2897 class)"
+    "#2795); the live path may still write it raw — the live/replay asymmetry "
+    "class (`tags` was the named instance until #2897 replayed it)"
 )
 
 
@@ -704,8 +705,8 @@ def _graph_fingerprint(graph_by_id: dict,
 
     It reads ONLY the graph, but it is NOT independent of the journal: one skip
     set below (`uncarried`) is journal-derived, deliberately — a digest that
-    ignored it would move on every legitimate repair of a #2897 `tags` list and
-    report that repair as an unrecorded mutation. The journal dependence is
+    ignored it would move on every legitimate repair of an uncarried list prop
+    and report that repair as an unrecorded mutation. The journal dependence is
     therefore narrow and declared, not absent.
 
     The keys the COMPARISON declares undecidable are dropped here too, because a
@@ -715,9 +716,9 @@ def _graph_fingerprint(graph_by_id: dict,
       * the one-sided parity keys — a live-only `speaker`/`embedding_verbatim`;
       * `_GRAPH_DEFAULTED_PROPS` — the non-deterministic writer fallbacks the
         journal never states (the baseline is what catches a rewrite of those);
-      * the per-point `uncarried` keys — a `tags` list survives on a LIVE graph
-        and is DROPPED by the replayed writer (#2897), so without this a repair
-        reads as an unrecorded mutation for ever;
+      * the per-point `uncarried` keys — an undeclared list survives on a LIVE
+        graph and is DROPPED by the replayed writer (#2795), so without this a
+        repair reads as an unrecorded mutation for ever;
       * the operator `content`/`pointKind` (#548) — the live node lacks them and
         a replayed one has them.
 

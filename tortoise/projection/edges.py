@@ -747,6 +747,55 @@ class _EdgeHandlers:
                     params={"oid": p["id"], "sid": src, "idx": idx},
                 )
 
+    def _sync_tags(self, point_id: str, tags) -> None:
+        """Reconcile `TAGGED` edges for a point against a tags value (#485).
+
+        ONE routine for BOTH writers (#2897): the SDK live path
+        (`create_point` / `update_point`) delegates here, and the replay fold
+        (`_upsert_point_edges` pass 2, and `_revise_point` for a tag EDIT)
+        calls it too — so live and replay can never drift into the raw-list
+        half-restore the old replay refused. The `:Tag`/`TAGGED` half is
+        SNAPSHOT-DERIVABLE from the Point's own `tags` property, exactly like
+        `extractedFrom` → `_link_source` (#2489); it is never journaled
+        separately.
+
+        Idempotent: MERGE creates any missing :Tag nodes + TAGGED edges, and
+        edges to tags no longer in the list are deleted. Only list values are
+        synced — matching create_point's behavior, a non-list tag value is
+        stored as a plain property but gets no edges (and leaves existing
+        edges untouched).
+        """
+        if not isinstance(tags, list):
+            return
+        for tag in tags:
+            self.g.query(
+                "MATCH (p:Point {id:$pid}) "
+                "MERGE (t:Tag {name:$tag}) "
+                "MERGE (p)-[:TAGGED]->(t)",
+                params={"pid": point_id, "tag": tag},
+            )
+        # Delete edges to tags no longer in the list (diff via graph read to
+        # avoid list-parameter IN-clause portability concerns on FalkorDB).
+        stale = self.g.query(
+            "MATCH (p:Point {id:$pid})-[:TAGGED]->(t:Tag) RETURN t.name",
+            params={"pid": point_id},
+        ).result_set
+        removed = 0
+        for row in stale:
+            if row[0] not in tags:
+                self.g.query(
+                    "MATCH (p:Point {id:$pid})-[r:TAGGED]->(t:Tag {name:$tag}) "
+                    "DELETE r",
+                    params={"pid": point_id, "tag": row[0]},
+                )
+                removed += 1
+        # GC orphaned :Tag nodes when the sync actually removed edges — tag
+        # removal can leave a Tag with no TAGGED referrers (#485). Skipped on
+        # create_point (no stale edges there), so new-point creation never pays
+        # the scan.
+        if removed:
+            self.g.query("MATCH (t:Tag) WHERE NOT (t)<-[:TAGGED]-() DELETE t")
+
     def _create_about_edges(self, source_id: str, entity_name: str) -> None:
         """Link entity (Point, Document, Event, or Object) to a named entity.
 

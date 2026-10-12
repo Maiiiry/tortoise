@@ -8891,6 +8891,9 @@ class FalkorProjection(
         last_embed_write_by_source: dict[tuple[tuple[str, str], int], int] = {}
         last_hash_write_by_source: dict[tuple[tuple[str, str], int], int] = {}
         last_ms_write_by_source: dict[tuple[tuple[str, str], int], int] = {}
+        # #2897: the same class as `last_ms_write_by_source`, for `tags` — the
+        # last creation whose own clause actually WROTE the tag list.
+        last_tags_write_by_source: dict[tuple[tuple[str, str], int], int] = {}
         # #4305: id-WIDE (cross-file) journal-owned derived markers for the
         # pass-1b restore tail. The per-source anchors above are a WITHIN-file
         # chronology boundary; the restore tail runs AFTER every journal file,
@@ -9113,6 +9116,11 @@ class FalkorProjection(
                     # test would wrongly count as a write).
                     if "mitigation_strength" in persisted_extras:
                         last_ms_write_by_source[key] = seq
+                    # #2897: `tags` rides the same reported set (its own
+                    # explicit clause placed it there) — the pass-1b boundary
+                    # for a tag EDIT.
+                    if "tags" in persisted_extras:
+                        last_tags_write_by_source[key] = seq
                     # #4305: the id-wide counterpart (see the sets'
                     # declaration). A re-creation explicitly cleared both
                     # conditional fields before the upsert, so it owns them
@@ -9534,6 +9542,7 @@ class FalkorProjection(
                 skip_embedding = False
                 skip_hash = False
                 skip_mitigation_strength = False
+                skip_tags = False
                 if isinstance(rid, str) and src is not None:
                     # #3860 composition: a PointRevised revises a ``:Point``,
                     # so its anchor key carries the same kind-scoped inner key
@@ -9568,6 +9577,14 @@ class FalkorProjection(
                         skip_mitigation_strength = (
                             last_recreate_seq_by_source.get(key, -1) > seq
                             or last_ms_write_by_source.get(key, -1) > seq)
+                        # #2897: `tags` is the same class again — an open-set
+                        # prop whose own clause writes only a LIST. The anchor
+                        # is the creation that actually WROTE it (read from
+                        # the writer's reported key set, never a second copy
+                        # of its `isinstance(..., list)` condition).
+                        skip_tags = (
+                            last_recreate_seq_by_source.get(key, -1) > seq
+                            or last_tags_write_by_source.get(key, -1) > seq)
                 wrote_embedding, wrote_content_hash = self._revise_point(
                     ev, set_updated_at=True,
                     skip_annotator_dims=(
@@ -9583,7 +9600,8 @@ class FalkorProjection(
                     skip_content=superseded,
                     skip_embedding=skip_embedding,
                     skip_hash=skip_hash,
-                    skip_mitigation_strength=skip_mitigation_strength)
+                    skip_mitigation_strength=skip_mitigation_strength,
+                    skip_tags=skip_tags)
                 if isinstance(rid, str):
                     # #4305: id-wide journal-owned derived marks — the revision
                     # wrote (or explicitly wiped) each field it was not told
@@ -13067,7 +13085,8 @@ class FalkorProjection(
                       skip_content: bool = False,
                       skip_embedding: bool = False,
                       skip_hash: bool = False,
-                      skip_mitigation_strength: bool = False) -> tuple[bool, bool]:
+                      skip_mitigation_strength: bool = False,
+                      skip_tags: bool = False) -> tuple[bool, bool]:
         """Apply PointRevised event — update content, context, and re-compute embedding.
 
         ``skip_annotator_dims`` (#3689): suppress ONLY the annotator-dim
@@ -13184,6 +13203,20 @@ class FalkorProjection(
             set_clauses.append(
                 "n.mitigation_strength = $mitigation_strength")
             params["mitigation_strength"] = ev["mitigation_strength"]
+        # #2897 (OD-4 disposition #3856 — ADOPT): fold a `tags` EDIT. The
+        # PointRevised payload carries the NEW list (`update_point(tags=…)`,
+        # whose live write is `SET n += $props`), and pass 1a has already
+        # written the point's CREATION list; without this clause a rebuild
+        # leaves the creation list on the node and pass 2 then re-creates the
+        # edges for a tag the journal REMOVED — the #3299/#2488 resurrection
+        # class. `skip_tags` is the SAME boundary as `mitigation_strength`: a
+        # later same-file creation that actually WROTE tags, or a hard
+        # delete→recreate, owns the final value, so a dead incarnation's tag
+        # cannot leak onto the re-created node. Only a LIST folds, matching
+        # `_upsert_point_props`'s clause and the live writer.
+        if not skip_tags and isinstance(ev.get("tags"), list):
+            set_clauses.append("n.tags = $tags")
+            params["tags"] = ev["tags"]
 
         if new_content is not None:
             # Re-compute embedding when content changes (even to empty — wipe
@@ -13291,6 +13324,13 @@ class FalkorProjection(
             f"SET {', '.join(set_clauses)}",
             params=params,
         )
+        # #2897: reconcile the `:Tag`/`TAGGED` half for a tag EDIT — AFTER the
+        # property write, so the edges match what the node now holds (the live
+        # `update_point` runs the same two steps). Placed outside the atomic
+        # query for the same reason as the live path: the edge sync is a
+        # multi-statement MERGE/DELETE sweep, not a single SET.
+        if not skip_tags and isinstance(ev.get("tags"), list):
+            self._sync_tags(pid, ev["tags"])
         return wrote_embedding, wrote_content_hash
 
     def _delete_entity_by_id(self, id_val: str,

@@ -276,24 +276,52 @@ def test_unrecorded_graph_write_is_named_unrecorded_mutation(proj, tmp_path):
 
 
 def test_uncarried_journal_content_is_named_not_hidden(proj, tmp_path):
-    """``tags`` is journal content the projection writer drops (#2897).
+    """An undeclared list prop is journal content the projection writer drops,
+    and the loss is NAMED — never silently hidden.
     (1) Fails if the loss is reported as an empty list — i.e. hidden.
-    (2) Reachable: the fixture's point carries ``tags``."""
-    log_path = str(tmp_path / "tags.jsonl")
-    _seed(proj, log_path, [_pt("p1", "tagged", tags=["alpha", "beta"])])
+    (2) Reachable: the fixture's point carries ``custom_list``.
+
+    ``tags`` was this test's exemplar until #2897 replayed it; the mechanism is
+    unchanged and is now pinned on a prop that is still uncarried."""
+    log_path = str(tmp_path / "listy.jsonl")
+    _seed(proj, log_path, [_pt("p1", "listy", custom_list=["a", "b"])])
 
     r = check_consistency(log_path, proj)
-    assert "tags" in r["uncarried_journal_fields"], r
+    assert "custom_list" in r["uncarried_journal_fields"], r
     # The gap is reported as a COVERAGE GAP; it does not masquerade as a
-    # content divergence (which would make the check unusable until #2897).
+    # content divergence (which would make the check unusable until #2795).
     assert r["ok"] is True
     assert r["divergence"] is None
+
+
+def test_tags_are_compared_not_exempted(proj, tmp_path):
+    """#2897: ``tags`` is replay-carried now, so the #5011 check must COMPARE it.
+
+    An exemption (an ``_uncarried``/exclusion entry) is the blind spot that
+    would let the old loss return unseen — the reason the field moved out of
+    ``_UNCARRIED_CONTENT_PROPS`` and into ``_POINT_HANDLED``.
+    (1) Fails if ``tags`` is put back into a skip list (the tampered graph then
+        reads healthy), or if the replay writer stops carrying it (the faithful
+        ``ok`` assertion fails).
+    (2) Reachable: the fixture's point carries ``tags`` and the graph's copy is
+        then tampered.
+    """
+    log_path = str(tmp_path / "tags.jsonl")
+    _seed(proj, log_path, [_pt("p1", "tagged", tags=["alpha", "beta"])])
+    assert "tags" not in check_consistency(
+        log_path, proj)["uncarried_journal_fields"]
+    assert check_consistency(log_path, proj)["ok"] is True
+
+    proj.g.query("MATCH (n:Point {id:'p1'}) SET n.tags=['beta']")
+    r = check_consistency(log_path, proj)
+    assert r["ok"] is False, r
+    assert "tags" in {f for d in r["divergent_points"] for f in d["fields"]}, r
 
 
 def test_uncarried_list_is_empty_when_the_journal_has_no_such_field(proj, tmp_path):
     """The negative control for the test above: without the field, the report
     must be empty — otherwise ``uncarried_journal_fields`` is a constant.
-    (1) Fails if it is non-empty. (2) The fixture has no ``tags`` row."""
+    (1) Fails if it is non-empty. (2) The fixture has no such field row."""
     log_path = str(tmp_path / "notags.jsonl")
     _seed(proj, log_path, [_pt("p1", "plain")])
     r = check_consistency(log_path, proj)
@@ -1279,20 +1307,22 @@ def test_a_promotion_snapshot_without_the_operator_key_resets_operator_ness(
 def test_a_repair_that_drops_an_uncarried_key_is_not_an_unrecorded_mutation(
         proj, tmp_path):
     """A DECLARED live/replay asymmetry must not move the baseline: the live
-    writer stores `tags`, the replayed writer drops it (#2897), so a repair over
-    the same journal leaves a graph the baseline no longer matches. Excluding the
-    per-point `uncarried` keys from the fingerprint is what keeps a repair from
-    reading as an unrecorded mutation for ever.
+    writer stores an undeclared list prop, the replayed writer drops it
+    (#2795), so a repair over the same journal leaves a graph the baseline no
+    longer matches. Excluding the per-point `uncarried` keys from the
+    fingerprint is what keeps a repair from reading as an unrecorded mutation
+    for ever.
     (1) Fails if the fingerprint includes comparison-skipped keys.
-    (2) Reachable: `tags` on a live write, then `rebuild_all`.
+    (2) Reachable: `custom_list` on a live write, then `rebuild_all`.
+    (``tags`` was this test's exemplar until #2897 replayed it.)
     """
-    events_dir = tmp_path / "tags"
+    events_dir = tmp_path / "listy"
     events_dir.mkdir()
     log_path = str(events_dir / "events.jsonl")
-    _seed(proj, log_path, [_pt("p1", "a", tags=["alpha", "beta"])])
+    _seed(proj, log_path, [_pt("p1", "a", custom_list=["alpha", "beta"])])
     first = check_consistency(log_path, proj)
     assert first["ok"] is True and first["state_recorded"] is True
-    assert "tags" in first["uncarried_journal_fields"]
+    assert "custom_list" in first["uncarried_journal_fields"]
 
     proj.query("MATCH (n) DETACH DELETE n")
     proj.rebuild_all(str(events_dir), confirm_destructive=True)

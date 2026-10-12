@@ -1119,6 +1119,14 @@ class _EntityHandlers:
         # structural / edge-carried — never node props via passthrough
         "operator", "provenance", "about_entities", "aboutEntities",
         "extractedFrom", "is_episodic", "_nid", "_graph_id",
+        # #2897 (OD-4 disposition #3856: ADOPT — a Tag is an `:Tag` Object
+        # subclass shared via MERGE, i.e. first-class data by construction,
+        # not a derived label). Its own clause (`_upsert_point_props`) owns
+        # the raw-list node property and pass 2 (`_upsert_point_edges` →
+        # `_sync_tags`) reconciles the `:Tag`/`TAGGED` half from the SAME
+        # payload — the `extractedFrom` split (#2489). Handled also keeps the
+        # undeclared-list drop report from firing for a prop the fold restores.
+        "tags",
         # #5256: a DECLARED node property (own conditional clause below), the
         # extractedFrom READ-VERSION transit. It rides on the NODE because
         # `extractedFrom` is a replay-derived projection (the `#4042` recreate
@@ -1166,12 +1174,11 @@ class _EntityHandlers:
     # BEFORE they can reach the extras dict the drift warning inspects.
     # `search_keys` is the case that does NOT reach that policy: its list form
     # is flattened to the canonical graph STRING by `_upsert_point_props`
-    # before the list rule can be consulted (#8006). `tags` is the case the
-    # NOTE describes: it is DENIED on replay (its raw-list half-restore is
-    # refused — #2897) and the drop is reported by the undeclared-list warning
-    # below, NOT suppressed here.
+    # before the list rule can be consulted (#8006). (`tags` was the other
+    # case this NOTE described until #2897 landed: it is replayed now, so it
+    # is in `_POINT_HANDLED` and needs no entry here.)
     _POINT_DECLARED_PROPS: frozenset = frozenset({
-        "quote", "when", "search_keys", "speaker", "source_turn_id", "tags",
+        "quote", "when", "search_keys", "speaker", "source_turn_id",
         # E4 (#5007): the verbatim span POINTER — offsets into the Source's raw
         # text, declared so the replay open-set passthrough does not log a
         # FALSE undeclared-prop drift warning on every rebuild.
@@ -1202,14 +1209,11 @@ class _EntityHandlers:
     # key is declared here. Arrays are not fulltext-indexed and the canonical
     # form is the declared `flatten=list` STRING (`search_keys` -> space-joined
     # by `flatten_search_keys_prop`, applied on the SHARED Point writer so all
-    # three doors agree — #8006); `tags` is owned by its own `_sync_tags`
-    # path and its TAGGED-edge replay is out of scope (#2897), so a raw-list
-    # half-restore is refused. NOTE the live/rebuild boundary this creates:
-    # `sdk.create_point` still writes raw lists directly (`SET n += $props`),
-    # so a live `n.tags` exists while replay drops it — the pre-existing #2897
-    # gap (the drop is now REPORTED, not silent). Empty pre-D1: no list prop
-    # passes through the generic Point filter today. Replaced by contract.py's
-    # declared set in D1.
+    # three doors agree — #8006); `tags` (the one such prop in practice) is
+    # reconciled by its own clause plus the pass-2 edge sync, BOTH halves from
+    # the same payload (#2897), so it never reaches the generic filter. Empty
+    # pre-D1: no other list prop passes through the generic Point filter today.
+    # Replaced by contract.py's declared set in D1.
     # ⛔ NOT the fix for `search_keys`: populating this set stores an ARRAY,
     # which the FTS index cannot match — it re-mints #5482. `search_keys` is
     # populated as a flattened STRING instead (module-level
@@ -1594,6 +1598,20 @@ class _EntityHandlers:
         if p.get("is_episodic") is not None:
             set_clauses.append("n.is_episodic=$episodic")
             params["episodic"] = bool(p["is_episodic"])
+        # #2897 (OD-4 disposition #3856 — ADOPT): re-apply the `tags` PROPERTY
+        # half from the payload. The `PointAdded` snapshot already carries it
+        # (`get_point` returns raw `properties(n)`); the fold simply never wrote
+        # it, so a rebuilt graph answered no tag query. Only a LIST is written,
+        # matching the live writer's rule (a non-list tag value gets no edges —
+        # see `create_point`); an absent/None payload leaves the property alone
+        # rather than stamping a null over a value the point still owns. The
+        # `:Tag`/`TAGGED` half is reconciled in pass 2 (`_upsert_point_edges`).
+        # `tags` is in `_POINT_HANDLED`, so the open-set passthrough does not
+        # also write it.
+        tags = p.get("tags")
+        if isinstance(tags, list):
+            set_clauses.append("n.tags=$tags")
+            params["tags"] = tags
         # Phase 2 #49: context removed — never written
         # #4457/#4520: the shared clear-then-set seam (`tortoise/vector_write.py`)
         # clears the property FIRST, in the same atomic query, so the
@@ -1685,6 +1703,13 @@ class _EntityHandlers:
         # the docstring). `embedding`/`point_content_hash` are exactly the
         # values the `CASE`/`coalesce` clauses above gate on, plus the open-set
         # key set the passthrough ACTUALLY persisted (#5048).
+        # #2897: `tags` rides the same report even though its own clause — not
+        # the passthrough — wrote it. The pass-1b tag boundary reads the
+        # WRITER'S OUTCOME rather than re-spelling its condition (the same rule
+        # `mitigation_strength` follows, #5048); the drift warning above has
+        # already run, so adding it here cannot produce a false "not declared".
+        if isinstance(p.get("tags"), list):
+            extras["tags"] = p["tags"]
         return (embedding is not None, point_content_hash is not None,
                 frozenset(extras))
 
@@ -1751,6 +1776,24 @@ class _EntityHandlers:
         if about and isinstance(about, list):
             for entity_name in about:
                 self._create_about_edges(p["id"], str(entity_name))
+        # #2897 (OD-4 disposition #3856 — ADOPT): the `:Tag`/`TAGGED` half — a
+        # SNAPSHOT-DERIVABLE edge of exactly the kind #2489 established for
+        # `extractedFrom`/`about*`: the point property determines the edge, so
+        # it is never journaled separately and live/replay share ONE
+        # reconciliation routine (the projection's `_sync_tags`; the SDK live
+        # path delegates to it).
+        # The value is read from the NODE, not from `p`: pass 1 has already
+        # folded every `PointRevised` (including a tag EDIT), so the node holds
+        # the journal's FINAL tag list — while the `PointAdded` payload this
+        # pass iterates holds only the point's CREATION list. Syncing from the
+        # payload would resurrect a tag the journal removed (the #3299/#2488
+        # class; `test_a_removed_tag_is_not_resurrected`). One indexed read per
+        # point, and idempotent when the same id is added more than once.
+        _tag_row = self.g.query(
+            "MATCH (n:Point {id:$id}) RETURN n.tags", params={"id": p["id"]},
+        ).result_set
+        if _tag_row and isinstance(_tag_row[0][0], list):
+            self._sync_tags(p["id"], _tag_row[0][0])
         if p.get("operator"):
             self._create_edges(p)
 
