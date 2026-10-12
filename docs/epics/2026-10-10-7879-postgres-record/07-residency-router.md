@@ -1,3 +1,15 @@
+---
+title: "The residency router — a cache miss is not an insufficiency (#7953)"
+type: plan
+domain: engineering
+doc_status: draft
+created: 2026-10-13
+updated: 2026-10-13
+subjects.team: epistemic-team
+aboutSubjects: Tortoise memory graph
+aboutObjects: "issue #7953, epic #7879, interface D, residency router, sufficiency router, completeness marker, known-hot set, Postgres record, FalkorDB cache"
+---
+
 # W7 — the residency router (`#7953`, §17.3)
 
 > **Interface D, part 2.** The marker (W6b, `#7952`) is the router's INPUT; this

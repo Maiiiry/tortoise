@@ -19038,9 +19038,9 @@ class TortoiseSDK:
                 if _residency is not None:
                     # §17.3: a `not-hot` read may not be reported as `empty` —
                     # a partial store cannot establish "nothing matched". The
-                    # truth store was NOT consulted on this path (no residency
-                    # router exists yet — #7953), so a zero-hit read of a
-                    # declared-partial store is `degraded`, never `empty`.
+                    # truth store was NOT consulted on this path (the residency
+                    # router is not wired here yet — #7970), so a zero-hit read
+                    # of a declared-partial store is `degraded`, never `empty`.
                     marker = _mark_residency(
                         _residency, hits=len(rows), key=_residency_key)
                     status = _apply_residency(

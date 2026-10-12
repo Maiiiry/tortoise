@@ -91,10 +91,24 @@ class TestVocabulary:
         assert ROUTE_ESCALATE_TIER == "escalate-tier"
 
     def test_a_route_is_never_a_container(self):
-        """The S5 seam's presence set: a route must not collide with []/None/{}."""
-        for route in ROUTES:
-            assert route not in ([], None, {}, ())
+        """The S5 seam's presence set: a route must not collide with []/None/{}.
+
+        Read off the DECISION, not only the ``ROUTES`` constant — the
+        exact-names test already pins the constant, so this one asserts the
+        property its name claims at the point a route is emitted. A route that
+        ever became a container sentinel (the ``[]``/``None``/``{}`` collision
+        S5 names) reddens here.
+        """
+        decisions = (
+            route_residency(marker=RESIDENCY_HOT, sufficient=True),
+            route_residency(marker=RESIDENCY_HOT, sufficient=False),
+            route_residency(marker=RESIDENCY_NOT_HOT),
+            route_residency(marker=None, cache_reachable=False),
+        )
+        for decision in decisions:
+            route = decision.route
             assert isinstance(route, str) and route
+            assert not isinstance(route, (list, dict, tuple, set))
 
 
 class TestRouteResidency:
