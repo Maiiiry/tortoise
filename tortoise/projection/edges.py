@@ -760,10 +760,21 @@ class _EdgeHandlers:
         separately.
 
         Idempotent: MERGE creates any missing :Tag nodes + TAGGED edges, and
-        edges to tags no longer in the list are deleted. Only list values are
-        synced — matching create_point's behavior, a non-list tag value is
-        stored as a plain property but gets no edges (and leaves existing
-        edges untouched).
+        edges to tags no longer in the list are deleted. Only LIST values are
+        synced — the live rule and the replay rule both. A falsy value is
+        normalised to `[]` by the CALLER on the live path
+        (`props["tags"] or []`) and by the replay fold (`_revise_point` uses
+        the same expression), so `None`/`""` clear the edges; a truthy
+        non-list value (a scalar `tags`) is stored as a plain property and
+        gets no edges.
+
+        ⚠️ BOUND, stated rather than implied: for a TRUTHY non-list value the
+        live path leaves a pre-existing edge in place (this early return)
+        where a rebuild starts from a wiped graph and so has none. That value
+        is junk input, the #5011 check compares the `tags` PROPERTY rather
+        than the edge, and the property halves agree — a narrow live/replay
+        parity gap of the class `consistency._ONE_SIDED_REASONS` records, not
+        a divergence any instrument reports.
         """
         if not isinstance(tags, list):
             return

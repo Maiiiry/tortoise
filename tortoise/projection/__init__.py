@@ -5377,6 +5377,19 @@ def _apply_one(points: dict[str, dict], ev: dict,
             _ms = ev.get("mitigation_strength")
             if "mitigation_strength" in ev and _annotator_value_ok(_ms):
                 p["mitigation_strength"] = _ms
+            # #2897: fold a `tags` EDIT — parity with `_revise_point` (the
+            # graph fold) and with the live `update_point`. `tags` is COMPARED
+            # by `check_consistency` (it is no longer in
+            # `_UNCARRIED_CONTENT_PROPS`), so a fold that ignored the edit
+            # reported a FALSE `content` divergence on the ordinary tag-edit
+            # path — with an `action` ("reconcile by replaying the journal")
+            # that could never clear it, because replay produces exactly the
+            # graph that is already there (#8317 review P1, reproduced).
+            # Presence-conditional, like the clause above: an explicit `None`
+            # is the documented clear and folds as an absent value, which
+            # `_canonical_point_fields` drops on BOTH sides.
+            if "tags" in ev:
+                p["tags"] = ev["tags"]
     elif t == "OperatorAnnotated":
         # #3689: the explicit annotation record — parity with apply() /
         # rebuild_all pass-1b. A plain property write on the operator's
@@ -9075,11 +9088,23 @@ class FalkorProjection(
                     # (The dead incarnation's `extractedFrom` EDGE is a
                     # separate, PRE-EXISTING pass-2 resurrection — see the
                     # change's residual note; this wipe is the node-prop half.)
+                    #
+                    # #2897: `tags` is wiped here too. Its own clause is
+                    # presence-based and pass 2 re-derives the `:Tag`/`TAGGED`
+                    # half from the node's value, so a re-creation that omits
+                    # `tags` would otherwise resurrect the dead incarnation's
+                    # tag list AND its edges — state the journal never authored
+                    # for that incarnation. This is the explicit rule the #3817
+                    # negative control said a restore would need ("a restore
+                    # needs an explicit rule for state the journal never
+                    # authored"), and it is the same premise as the sibling
+                    # fields: a re-creation is a FRESH node live.
                     self.g.query(
                         "MATCH (n:Point {id:$id}) "
                         "SET n.embedding = NULL, n.content_hash = NULL, "
                         "    n.embedding_verbatim = NULL, "
-                        "    n.sourceVersionTransit = NULL",
+                        "    n.sourceVersionTransit = NULL, "
+                        "    n.tags = NULL",
                         params={"id": p["id"]})
                 # Property parity with apply()/apply_one (#330): the shared
                 # helper writes ALL node properties incl. authoredBy,
@@ -9578,10 +9603,11 @@ class FalkorProjection(
                             last_recreate_seq_by_source.get(key, -1) > seq
                             or last_ms_write_by_source.get(key, -1) > seq)
                         # #2897: `tags` is the same class again — an open-set
-                        # prop whose own clause writes only a LIST. The anchor
-                        # is the creation that actually WROTE it (read from
-                        # the writer's reported key set, never a second copy
-                        # of its `isinstance(..., list)` condition).
+                        # prop whose clause writes only when the payload
+                        # STATES a persistable value. The anchor is the
+                        # creation that actually WROTE it (read from the
+                        # writer's reported key set, never a second copy of
+                        # its own condition).
                         skip_tags = (
                             last_recreate_seq_by_source.get(key, -1) > seq
                             or last_tags_write_by_source.get(key, -1) > seq)
@@ -13212,11 +13238,20 @@ class FalkorProjection(
         # class. `skip_tags` is the SAME boundary as `mitigation_strength`: a
         # later same-file creation that actually WROTE tags, or a hard
         # delete→recreate, owns the final value, so a dead incarnation's tag
-        # cannot leak onto the re-created node. Only a LIST folds, matching
-        # `_upsert_point_props`'s clause and the live writer.
-        if not skip_tags and isinstance(ev.get("tags"), list):
-            set_clauses.append("n.tags = $tags")
-            params["tags"] = ev["tags"]
+        # cannot leak onto the re-created node.
+        # PRESENCE-based, mirroring the live `update_point` EXACTLY: an explicit
+        # `None` is the documented clear (`SET n += {tags: null}` removes the
+        # property live, measured) and must remove it here — a list-only clause
+        # skipped the clear, so pass 1a's creation list survived on the node and
+        # pass 2 resurrected the tag (#8317 review P1, reproduced). A
+        # persistable non-None value is written VERBATIM (a scalar included, as
+        # the live writer stores it).
+        if not skip_tags and "tags" in ev:
+            if ev["tags"] is None:
+                set_clauses.append("n.tags = NULL")
+            elif _is_persistable_prop_value(ev["tags"]):
+                set_clauses.append("n.tags = $tags")
+                params["tags"] = ev["tags"]
 
         if new_content is not None:
             # Re-compute embedding when content changes (even to empty — wipe
@@ -13329,8 +13364,13 @@ class FalkorProjection(
         # `update_point` runs the same two steps). Placed outside the atomic
         # query for the same reason as the live path: the edge sync is a
         # multi-statement MERGE/DELETE sweep, not a single SET.
-        if not skip_tags and isinstance(ev.get("tags"), list):
-            self._sync_tags(pid, ev["tags"])
+        if not skip_tags and "tags" in ev:
+            # The argument is the LIVE expression (`sdk.update_point` →
+            # `self._sync_tags(proj, id, props["tags"] or [])`), so parity holds
+            # by construction: a falsy value (`None`/`""`) normalises to `[]`
+            # and clears the edges, a list syncs, and `_sync_tags`' own
+            # list-only guard makes a truthy non-list a no-op on both paths.
+            self._sync_tags(pid, ev["tags"] or [])
         return wrote_embedding, wrote_content_hash
 
     def _delete_entity_by_id(self, id_val: str,

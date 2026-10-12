@@ -16,8 +16,17 @@ is the category the repo's own rule **excludes** from "a recorded decision"
 (*"not merely an existing practice, and not a thing the code happens to do
 today"*).
 
-What *is* recorded points the other way, and was recorded **before** the
-refusal landed:
+What *is* recorded points the other way. **The primary artifact is on this
+issue**: the 2026-09-14 owner design comment for the rebuild-fidelity class,
+whose decision **D2** reads *"``TAGGED`` joins the snapshot-derivable edge set
+… write ``n.tags`` in the props pass, and move ``_sync_tags`` (``sdk.py:2115``)
+into the projection so ``_upsert_point_edges`` calls it in pass 2 — one
+reconciliation routine for live and replay, no second implementation, no new
+journaling."* That is a **decision section on the issue** — the highest form
+of recorded decision in the repo's own rule — and it is the design this module
+measures.
+
+Supporting (not primary) context:
 
 * **#3856 (OD-4 — "are tags permanent data or something we may rebuild?") is
   CLOSED**, disposition **"ADOPT, withdraw the question"**: a Tag is an ``:Tag``
@@ -26,21 +35,45 @@ refusal landed:
   it names is literally *"#3817 — prove tags survive ``rebuild_all``"*.
 * ``docs/ONTOLOGY.md`` (canonical) — ``TAGGED``: *"Tags are ``:Tag`` nodes
   (Object subclass, ``objectKind: tag``) shared across Points via MERGE."*
-* The launch plan's objective 6 done-state — a plan-doc decision section.
+  ⚠️ The row is CONFIRMING for the permanence question and unreliable for the
+  implementation ones: it also carried a stale *"Write-only today — no
+  tag-filter query surfaced yet"* note, while the query this module asserts
+  through (``SDK.query_points_by_tag``) is exactly what the note says does not
+  exist, and it attributed creation to hosted-api ingestion alone. The row was
+  corrected in the same change; the ``objectKind``/Object-subclass claim is a
+  doc-vs-code divergence filed as **#8325**.
+* The launch plan's objective 6 **done-state** (premise-labs
+  ``product/2026-09-22-tortoise-beta-plan.md`` §6 — *"props, **tags** and EP
+  state survive"*): an acceptance criterion, **not** a decision section. It
+  states the required outcome without deciding the mechanism, so it corroborates
+  D2 rather than authorising it.
 
-So restoring tags on replay is the **implementation** of that disposition, not a
-reversal of any decision — and this module was edited **deliberately** (the ⚠️
-it used to carry said exactly that was required) once that was established by a
-fresh-context adversarial verification, recorded on #2897.
+⚠️ An earlier version of this module said that disposition *"was recorded
+**before** the refusal landed"*. **That was false and is deleted.** The refusal
+landed in PR #2958 (``37d5ef00c``, merged 2026-09-17T15:58Z); #3856 was created
+at 17:51Z and its disposition comment posted at 23:46Z — later, the same day.
+The repo's rule turns on whether an artifact is a *recorded decision*, never on
+the order in which two artifacts appeared, so the chronology was never
+load-bearing — and a wrong date only invites a reader to distrust the rest.
+
+So restoring tags on replay is the **implementation** of D2 / #3856 / objective
+6, not a reversal of any decision — and this module was edited **deliberately**
+(the ⚠️ it used to carry said exactly that was required) once that was
+established by a fresh-context adversarial verification, recorded on #2897.
 
 ## What the fold now does (and why it needs the journal, not the graph)
 
 * ``_upsert_point_props`` writes the ``n.tags`` **property** half from the
-  payload; ``_upsert_point_edges`` (pass 2) reconciles the ``:Tag``/``TAGGED``
-  **edge** half from the node's own final value; ``_revise_point`` folds a
-  ``tags`` EDIT and re-syncs. One reconciliation routine (the projection's
-  ``_sync_tags``) is shared by the live SDK writers — so live and replay cannot
-  drift.
+  payload, **presence-based** — the live writer's own rule (``SET n += $props``):
+  any persistable value the payload states is written verbatim (a non-list
+  scalar included), an absent/``None`` one leaves the property alone;
+  ``_upsert_point_edges`` (pass 2) reconciles the ``:Tag``/``TAGGED`` **edge**
+  half from the node's own final value; ``_revise_point`` folds a ``tags`` EDIT
+  — including the explicit ``None`` **clear**, which removes the property
+  (``SET n += {tags: null}`` removes it live, measured) — and re-syncs with the
+  live expression ``ev["tags"] or []``. One reconciliation routine (the
+  projection's ``_sync_tags``) is shared by the live SDK writers — so live and
+  replay cannot drift.
 * The journal is a **sufficient** source and needs no backfill or new event
   type: the ``PointAdded`` snapshot carries ``tags`` and a tag-editing
   ``PointRevised`` carries the new list (asserted below — AC2 keeps that pill).
@@ -53,6 +86,15 @@ fresh-context adversarial verification, recorded on #2897.
 
 * **Reverse the fix** — drop the ``n.tags`` clause (or the pass-2 sync, or the
   ``_revise_point`` fold): AC1/AC5 fails.
+* **Re-gate the fold on ``isinstance(ev.get("tags"), list)``** — the clear form
+  (``tags=None``) then skips BOTH halves, pass 1a's creation list survives on
+  the node and pass 2 resurrects the tag; ``test_a_cleared_tag_is_not_
+  resurrected`` fails. This is the mutation the #8317 review actually found
+  live, so it is the one the suite most needs to be able to catch.
+* **Write only a list in ``_upsert_point_props``** — a scalar ``tags`` the live
+  writer stored is dropped on replay and ``check_consistency`` reports a
+  ``tags`` divergence on a graph the live path wrote:
+  ``test_a_non_list_tag_value_is_restored_verbatim`` fails.
 * **Steal from the graph instead of the journal** — recompute tags from the
   pre-wipe node for a journaled Point whose tag is graph-only: AC4 fails.
 * **Sync from the PointAdded payload instead of the node** — the removed tag is
@@ -313,3 +355,76 @@ def test_a_removed_tag_is_not_resurrected(env):
     assert replayed == {"keep"}, (
         f"a rebuilt tag set contains state the journal's final record does "
         f"not carry: {sorted(replayed - {'keep'})}")
+
+
+@pytest.mark.parametrize("clear_value", [None, ""], ids=["None", "empty-string"])
+def test_a_cleared_tag_is_not_resurrected(env, clear_value):
+    """AC3, the CLEAR form: a documented clear must be as durable as a removal.
+
+    ``update_point(tags=None)`` is the pinned clear idiom
+    (``tests/test_sdk.py::test_update_none_clears_tags``): the live write is
+    ``SET n += {tags: null}`` — which REMOVES the property (measured on the
+    embedded engine) — plus ``_sync_tags(id, props["tags"] or [])``, so BOTH
+    halves go. A replay fold gated on ``isinstance(ev["tags"], list)`` skipped
+    both: pass 1a's creation list stayed on the node and pass 2 re-derived the
+    edges from it, so the cleared tag came back. Worse, the checker's reference
+    fold (``_apply_one``) skipped the same clause, so ``check_consistency`` was
+    BLIND to it — both sides agreed on the wrong value (#8317 review P1,
+    reproduced). ``""`` rides the same path with a property that is SET rather
+    than removed, so both forms are asserted.
+    """
+    sdk, events = env
+    pid = sdk.create_point("statement", "clear me",
+                           tags=["alpha", "beta"])["id"]
+    sdk.update_point(pid, tags=clear_value)
+    assert _tag_hits(sdk, "alpha") == [] and _tag_hits(sdk, "beta") == [], (
+        "precondition: the live clear must remove the tag, or this measures "
+        "the wrong thing")
+
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
+
+    assert _tag_hits(sdk, "alpha") == [], (
+        "a cleared tag must not be resurrected by a rebuild — the fold is "
+        "skipping the clear form (#8317 review P1)")
+    assert _tag_hits(sdk, "beta") == [], (
+        "...nor may the sibling it was cleared WITH")
+    assert _tag_nodes(sdk) == set(), "no orphan :Tag node may survive either"
+    expected = "" if isinstance(clear_value, str) else None
+    assert sdk._get_proj().g.query(
+        "MATCH (n:Point {id:$i}) RETURN n.tags",
+        params={"i": pid}).result_set == [[expected]], (
+        "the property half must match what the live writer left: removed for "
+        "None, the empty string for \"\"")
+
+
+def test_a_non_list_tag_value_is_restored_verbatim(env):
+    """A scalar ``tags`` value is junk input, but the live writer STORES it —
+    so a replay must too, or ``check_consistency`` reports a divergence on a
+    graph the live path itself wrote.
+
+    ``create_point``/``update_point`` write through ``SET n += $props``, so
+    ``tags="scalar"`` lands as a plain property (``_sync_tags`` is list-only,
+    so it gets no edges) — pinned by
+    ``tests/test_sdk.py::test_update_non_list_tags_no_crash``. The replay's
+    list-only clause dropped the property while the checker — which now
+    COMPARES ``tags`` — still saw it in the journal: a false ``content``
+    divergence whose ``action`` (*reconcile by replaying the journal*) could
+    never clear it, because replay produced exactly the graph that was already
+    there (#8317 review P1, reproduced).
+    """
+    sdk, events = env
+    pid = sdk.create_point("statement", "scalar tags",
+                           tags="scalar")["id"]
+    assert sdk.get_point(pid).get("tags") == "scalar", (
+        "precondition: the live writer stores a non-list value verbatim")
+
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
+
+    assert sdk._get_proj().g.query(
+        "MATCH (n:Point {id:$i}) RETURN n.tags",
+        params={"i": pid}).result_set == [["scalar"]], (
+        "the scalar the live writer stored must be restored verbatim, not "
+        "dropped for not being a list")
+    assert _tag_nodes(sdk) == set(), (
+        "a non-list value is not a tag membership — it must not mint :Tag "
+        "nodes, on the replay path any more than on the live one")

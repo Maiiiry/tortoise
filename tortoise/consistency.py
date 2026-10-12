@@ -228,8 +228,11 @@ _EXCLUSION_REASONS = {
 # (`_POINT_HANDLED`, with its own node-property clause plus the pass-2
 # `:Tag`/`TAGGED` sync), so the checker COMPARES it instead of exempting it —
 # which is what makes a future regression on that door visible instead of
-# silently tolerated. The dict is kept (rather than deleted) because the
-# mechanism is the right home for the next declared live/replay asymmetry.
+# silently tolerated. ⚠️ That widening also moves the graph FINGERPRINT for
+# every baseline whose graph holds a tag, which is why
+# `_PROJECTION_STATE_FORMAT` went to 2 in the same change. The dict is kept
+# (rather than deleted) because the mechanism is the right home for the next
+# declared live/replay asymmetry.
 _UNCARRIED_CONTENT_PROPS: dict[str, str] = {}
 
 # A key whose EXISTENCE legitimately depends on the payload, so a one-sided
@@ -768,7 +771,20 @@ def _graph_fingerprint(graph_by_id: dict,
 # deployment shape, and the journal is the reconstruction source the invariant
 # names.
 _PROJECTION_STATE_SUFFIX = ".projection-state.json"
-_PROJECTION_STATE_FORMAT = 1
+# v2 (#2897): the per-point canonical view widened by `tags`. It left
+# `_UNCARRIED_CONTENT_PROPS` so the field-aware comparison would SEE it, and the
+# same view feeds `_graph_fingerprint` — so `projection_hash_sha256` MOVES for
+# every existing baseline whose graph holds a tag. The sidecar has no migration
+# (an untrusted/differing state is never re-recorded), so a v1 baseline must be
+# read as UNTRUSTED — adoption plus a `state_error` naming the format — rather
+# than as a graph that moved while the journal did not. That second reading is
+# `unrecorded-mutation`, whose `action` sends the operator hunting a phantom
+# unjournalled writer for a digest this change moved deliberately.
+# ⚠️ This bump is the PRECURSOR only, and it is the change the file's own note on
+# the `(label, id)` re-key says must come first. The MIGRATION that retires the
+# untrusted state (recognising a known-old format and re-baselining it, instead
+# of refusing it for ever) stays #7936's remaining durable step.
+_PROJECTION_STATE_FORMAT = 2
 
 
 def projection_state_path(log_path) -> str:

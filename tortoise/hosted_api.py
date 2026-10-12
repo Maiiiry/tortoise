@@ -10246,7 +10246,16 @@ def _seed_demo_graph(org_id: str) -> dict:
     (sentinel). #2360: NEVER called on the fresh-org provisioning path —
     fresh orgs get the REAL starter seed (/internal/starter-seed) instead.
     Every Point written here is excluded from org.point_count, so opt-in
-    sample content is never counted as the user's own filings."""
+    sample content is never counted as the user's own filings.
+
+    #2897: each layer writes its Point with the `tags` PROPERTY beside the
+    `:Tag`/`TAGGED` MERGE loop. The edge half is snapshot-derivable from that
+    property (`_upsert_point_edges` pass 2 reads the node's own value), so a
+    seeder that wrote only the edge left its tags with nothing for a rebuild to
+    re-derive — this is the one tag producer outside the SDK↔projection
+    `_sync_tags` pair, and without the property the "ONE routine for BOTH
+    writers" contract is only as good as its callers.
+    """
     sdk = _make_sdk(namespace=org_id)
     proj = sdk._get_proj()
     now = datetime.now(UTC).isoformat()
@@ -10264,8 +10273,10 @@ def _seed_demo_graph(org_id: str) -> dict:
         proj.g.query(
             "MERGE (p:Point {id:$id}) "
             "SET p.content=$c, p.pointKind=$k, p.is_operator=false, "
-            "p.status='live', p.createdAt=$now, p.updatedAt=$now",
-            params={"id": pid, "c": content, "k": kind, "now": now},
+            "p.status='live', p.createdAt=$now, p.updatedAt=$now, "
+            "p.tags=$tags",
+            params={"id": pid, "c": content, "k": kind, "now": now,
+                    "tags": tags},
         )
         for tag in tags:
             proj.g.query(
@@ -10302,8 +10313,10 @@ def _seed_demo_graph(org_id: str) -> dict:
         proj.g.query(
             "MERGE (p:Point {id:$id}) "
             "SET p.content=$c, p.pointKind=$k, p.is_operator=false, "
-            "p.status='live', p.confidence=$conf, p.createdAt=$now, p.updatedAt=$now",
-            params={"id": pid, "c": content, "k": kind, "conf": confidence, "now": now},
+            "p.status='live', p.confidence=$conf, p.createdAt=$now, "
+            "p.updatedAt=$now, p.tags=$tags",
+            params={"id": pid, "c": content, "k": kind, "conf": confidence,
+                    "now": now, "tags": tags},
         )
         for tag in tags:
             proj.g.query(
@@ -10319,8 +10332,10 @@ def _seed_demo_graph(org_id: str) -> dict:
         proj.g.query(
             "MERGE (p:Point {id:$id}) "
             "SET p.content=$c, p.pointKind=$k, p.is_operator=false, "
-            "p.status='live', p.createdAt=$now, p.updatedAt=$now",
-            params={"id": pid, "c": content, "k": kind, "now": now},
+            "p.status='live', p.createdAt=$now, p.updatedAt=$now, "
+            "p.tags=$tags",
+            params={"id": pid, "c": content, "k": kind, "now": now,
+                    "tags": tags},
         )
         for tag in tags:
             proj.g.query(

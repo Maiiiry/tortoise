@@ -183,6 +183,37 @@ def _is_persistable_prop_value(value, _depth: int = 0) -> bool:
     return False
 
 
+def _stated_tags(payload) -> tuple[bool, object]:
+    """``(writes_property, value)`` for a payload's ``tags`` key (#2897).
+
+    The ONE rule for *"the payload states a ``tags`` value this writer must
+    apply"*, shared by the Point create fold (``_upsert_point_props``) and the
+    pass-1b boundary report that reads its outcome — never re-spelled at either
+    site (#5048). The live writer's rule is ``SET n += $props``: a persistable
+    value the payload states becomes the property VERBATIM (a non-list scalar
+    included — ``create_point`` stores one, and only the EDGE half is
+    list-only), while ``None``/absent states NO property (Cypher's map-merge
+    writes nothing for a null, so the live caller leaves the node's own value
+    alone rather than stamping a null over it).
+
+    A LIST-only reading was a live/replay divergence, not a safety property:
+    ``create_point(tags="scalar")`` stores ``"scalar"`` live, and the replayed
+    node kept nothing — which ``check_consistency`` then reported as a ``tags``
+    divergence (#8317 review P1, reproduced).
+
+    Total, deliberately: this reads a possibly hand-edited journal line, and a
+    raise here would abort a replay whose wipe has already run — the recovery
+    path's own rule. A non-dict payload, a missing key, a ``None`` and a value
+    this store cannot persist all answer ``(False, None)``.
+    """
+    if not isinstance(payload, dict) or "tags" not in payload:
+        return False, None
+    value = payload.get("tags")
+    if value is None or not _is_persistable_prop_value(value):
+        return False, None
+    return True, value
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017
 
@@ -1601,17 +1632,15 @@ class _EntityHandlers:
         # #2897 (OD-4 disposition #3856 — ADOPT): re-apply the `tags` PROPERTY
         # half from the payload. The `PointAdded` snapshot already carries it
         # (`get_point` returns raw `properties(n)`); the fold simply never wrote
-        # it, so a rebuilt graph answered no tag query. Only a LIST is written,
-        # matching the live writer's rule (a non-list tag value gets no edges —
-        # see `create_point`); an absent/None payload leaves the property alone
-        # rather than stamping a null over a value the point still owns. The
-        # `:Tag`/`TAGGED` half is reconciled in pass 2 (`_upsert_point_edges`).
-        # `tags` is in `_POINT_HANDLED`, so the open-set passthrough does not
-        # also write it.
-        tags = p.get("tags")
-        if isinstance(tags, list):
+        # it, so a rebuilt graph answered no tag query. The `:Tag`/`TAGGED` half
+        # is reconciled in pass 2 (`_upsert_point_edges`), and `tags` is in
+        # `_POINT_HANDLED`, so the open-set passthrough does not also write it.
+        # PRESENCE-based (`_stated_tags`) — the live writer's own rule, so a
+        # scalar value is restored rather than silently dropped (#8317 P1).
+        wrote_tags, tags_value = _stated_tags(p)
+        if wrote_tags:
             set_clauses.append("n.tags=$tags")
-            params["tags"] = tags
+            params["tags"] = tags_value
         # Phase 2 #49: context removed — never written
         # #4457/#4520: the shared clear-then-set seam (`tortoise/vector_write.py`)
         # clears the property FIRST, in the same atomic query, so the
@@ -1686,9 +1715,14 @@ class _EntityHandlers:
             logger.warning(
                 "Point prop %r dropped — deny-listed (recompute/EP-owned, "
                 "#2795); not restorable from the payload", key)
-        # (b) a policy-denied list is also reported: the live SDK writer
-        # still stores raw lists (e.g. `tags`), but replay refuses them, so the
-        # drop MUST be visible (#2795 indicator 4 / D7; `tags` -> #2897).
+        # (b) a policy-denied list is also reported: the live SDK writer stores
+        # raw lists, but replay refuses an UNDECLARED one, so the drop MUST be
+        # visible (#2795 indicator 4 / D7). `tags` was this branch's exemplar
+        # until #2897 landed — it is `_POINT_HANDLED` now and replayed by its
+        # own clause, so a `custom_list`-shaped prop is what the branch
+        # actually covers. The message below ("not restorable from the
+        # payload") carries the same stale attribution class for a key the
+        # journal DOES carry; #8018 owns that wording.
         # #2958 review: tuples count as arrays here too (engine parity).
         for key, val in p.items():
             if not (isinstance(val, (list, tuple)) and val):
@@ -1708,8 +1742,8 @@ class _EntityHandlers:
         # WRITER'S OUTCOME rather than re-spelling its condition (the same rule
         # `mitigation_strength` follows, #5048); the drift warning above has
         # already run, so adding it here cannot produce a false "not declared".
-        if isinstance(p.get("tags"), list):
-            extras["tags"] = p["tags"]
+        if wrote_tags:
+            extras["tags"] = tags_value
         return (embedding is not None, point_content_hash is not None,
                 frozenset(extras))
 
@@ -1783,12 +1817,16 @@ class _EntityHandlers:
         # reconciliation routine (the projection's `_sync_tags`; the SDK live
         # path delegates to it).
         # The value is read from the NODE, not from `p`: pass 1 has already
-        # folded every `PointRevised` (including a tag EDIT), so the node holds
-        # the journal's FINAL tag list — while the `PointAdded` payload this
-        # pass iterates holds only the point's CREATION list. Syncing from the
-        # payload would resurrect a tag the journal removed (the #3299/#2488
-        # class; `test_a_removed_tag_is_not_resurrected`). One indexed read per
-        # point, and idempotent when the same id is added more than once.
+        # folded every `PointRevised` (including a tag EDIT and its explicit
+        # clear), so the node holds the journal's FINAL tag value — while the
+        # `PointAdded` payload this pass iterates holds only the point's
+        # CREATION list. Syncing from the payload would resurrect a tag the
+        # journal removed (the #3299/#2488 class;
+        # `test_a_removed_tag_is_not_resurrected`). One indexed read per point,
+        # and idempotent when the same id is added more than once.
+        # The `isinstance(..., list)` test is `_sync_tags`' own list-only rule
+        # (the live rule too), so a payload that stated a scalar `tags` restores
+        # the PROPERTY without inventing edges on either path.
         _tag_row = self.g.query(
             "MATCH (n:Point {id:$id}) RETURN n.tags", params={"id": p["id"]},
         ).result_set

@@ -30,6 +30,7 @@ import pytest
 
 from tortoise.consistency import (
     _GRAPH_DEFAULTED_PROPS,
+    _PROJECTION_STATE_FORMAT,
     _WRITER_DEFAULTS,
     _compare_views,
     _fold_journal,
@@ -68,6 +69,20 @@ def _seed(proj, log_path: str, events: list[dict]) -> EventLog:
         log.append(ev)
         proj.apply(ev)
     return log
+
+
+def _state_json(*, seq: str = "0", digest: str = "0" * 64,
+                fmt: int | None = None) -> str:
+    """A projection-state sidecar for the tamper tests.
+
+    ``fmt`` defaults to the CURRENT ``_PROJECTION_STATE_FORMAT``, so a test whose
+    subject is a FIFO, a planted symlink or a boolean watermark keeps THAT
+    subject instead of silently becoming a format-mismatch test on the next
+    format bump. ``seq`` is a raw JSON token (``0``, ``true``, …).
+    """
+    return (f'{{"format_version": {fmt or _PROJECTION_STATE_FORMAT}, '
+            f'"last_applied_seq": {seq}, '
+            f'"projection_hash_sha256": "{digest}"}}')
 
 
 @pytest.fixture
@@ -316,6 +331,44 @@ def test_tags_are_compared_not_exempted(proj, tmp_path):
     r = check_consistency(log_path, proj)
     assert r["ok"] is False, r
     assert "tags" in {f for d in r["divergent_points"] for f in d["fields"]}, r
+
+
+def test_a_tag_edit_does_not_read_as_a_false_divergence(proj, tmp_path):
+    """#2897: the CHECKER's reference fold must mirror the writer's tag fold.
+
+    ``check_consistency`` builds its journal view through ``_apply_one`` — the
+    same function the pure fold loops over, and the base its own docstring calls
+    ground truth — so emptying ``_UNCARRIED_CONTENT_PROPS`` made ``tags``
+    COMPARED while the reference fold still ignored every ``PointRevised``
+    carrying one. The journal side kept the CREATION list, the faithfully
+    replayed graph held the EDITED one, and the run reported
+    ``divergence="content"`` on ``tags`` — with an ``action`` (*reconcile by
+    replaying the journal*) that could never clear it, because replay produces
+    exactly the graph that was already there. That is the false-divergence class
+    ``_canonical_point_fields``'s own docstring calls a defect (#8317 review P1,
+    reproduced).
+    (1) Fails if ``_apply_one`` stops folding the edit or the clear, or if the
+        writer stops carrying them — either way the two views disagree and the
+        run goes red on a graph that is byte-faithful.
+    (2) Reachable: the journal holds a create carrying two tags, then an edit
+        carrying one, then an explicit ``None`` clear.
+    """
+    log_path = str(tmp_path / "tagedit.jsonl")
+    _seed(proj, log_path, [_pt("p1", "tag churn", tags=["alpha", "beta"])])
+    assert check_consistency(log_path, proj)["ok"] is True
+
+    for revision in ({"tags": ["alpha"]}, {"tags": None}):
+        EventLog(log_path).append(
+            {"type": "PointRevised", "id": "p1", **revision})
+        proj.apply({"type": "PointRevised", "id": "p1", **revision})
+        r = check_consistency(log_path, proj)
+        assert r["ok"] is True, (
+            f"the tag revision {revision!r} read as a divergence — the "
+            f"reference fold is not mirroring the writer: "
+            f"{r['divergent_points']}")
+        assert "tags" not in {
+            f for d in r["divergent_points"] for f in d["fields"]
+        }, r
 
 
 def test_uncarried_list_is_empty_when_the_journal_has_no_such_field(proj, tmp_path):
@@ -1639,8 +1692,7 @@ def test_a_torn_sidecar_is_reported_and_never_re_baselined(proj, tmp_path):
     # A SYMLINK to a valid sidecar elsewhere is not this journal's baseline.
     foreign = str(tmp_path / "foreign.json")
     with open(foreign, "w", encoding="utf-8") as fh:
-        fh.write('{"format_version": 1, "last_applied_seq": 0,'
-                 ' "projection_hash_sha256": "' + "0" * 64 + '"}')
+        fh.write(_state_json(seq="0"))
     os.symlink(foreign, state_path)
     r2 = check_consistency(log_path, proj)
     assert r2["state_error"], r2
@@ -1669,9 +1721,47 @@ def test_a_torn_sidecar_is_reported_and_never_re_baselined(proj, tmp_path):
     # rule `_values_equal` applies, on the path that reads operator-planted
     # sidecars.
     with open(state_path, "w", encoding="utf-8") as fh:
-        fh.write('{"format_version": 1, "last_applied_seq": true,'
-                 ' "projection_hash_sha256": "' + "0" * 64 + '"}')
+        fh.write(_state_json(seq="true"))
     r5 = check_consistency(log_path, proj)
     assert r5["state_error"], r5
     assert r5["state_recorded"] is False, r5
     os.unlink(state_path)
+
+
+def test_a_predecessor_format_baseline_is_untrusted_not_a_mutation(proj, tmp_path):
+    """#2897: the digest SHAPE changed with the ``tags`` widening, so a v1
+    baseline must read as UNTRUSTED — never as ``unrecorded-mutation``.
+
+    Emptying ``_UNCARRIED_CONTENT_PROPS`` removed ``tags`` from the graph
+    fingerprint's per-point skip set, so ``projection_hash_sha256`` moves for
+    every pre-existing baseline whose graph holds a tag. The sidecar has no
+    migration, so without the format bump the next run would find
+    ``journal_moved=False, graph_moved=True`` and report
+    ``divergence="unrecorded-mutation"`` on a healthy graph — an ``action``
+    telling the operator to hunt an unjournalled writer that does not exist.
+    Reading the PREDECESSOR format as untrusted instead yields ``adopted=True``
+    plus a ``state_error`` that names the actual cause.
+    (1) Fails if ``_PROJECTION_STATE_FORMAT`` does not move with the digest
+        shape: the run reports a phantom mutation instead (the assertion
+        ``divergence != "unrecorded-mutation"`` is then the one that fires).
+    (2) Reachable: the journal and the graph are byte-faithful — only the
+        recorded baseline is from the predecessor format.
+    """
+    log_path = str(tmp_path / "prevfmt.jsonl")
+    _seed(proj, log_path, [_pt("p1", "tagged", tags=["alpha"])])
+    check_consistency(log_path, proj)  # adopt at the CURRENT format
+
+    with open(log_path + ".projection-state.json", "w",
+              encoding="utf-8") as fh:
+        fh.write(_state_json(seq="1", fmt=_PROJECTION_STATE_FORMAT - 1))
+
+    r = check_consistency(log_path, proj)
+    assert r["divergence"] != "unrecorded-mutation", (
+        "a predecessor-format baseline read as a graph mutation — the "
+        "operator is sent after a phantom unjournalled writer: " + str(r))
+    assert r["state_error"], (
+        "a predecessor-format baseline must be REPORTED as untrusted, not "
+        "silently trusted")
+    assert r["state_recorded"] is False, r
+    assert r["ok"] is True, r
+    assert r["adopted"] is True, r

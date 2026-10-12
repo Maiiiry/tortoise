@@ -138,6 +138,14 @@ status above applied. Where the body asserts a gap that has since closed, this t
 > (`_session_capture_event_id`, which uses `hashlib.sha256` **directly** and so falls OUTSIDE the
 > `ids.content_hash` golden-vector guard — noted as a coverage gap in that guard); and the revision-c
 > paragraph's two inaccurate claims were corrected.
+>
+> **Post-landing status (2026-10-12) — `tags` is no longer `replay_source="none"`.** #2897 landed:
+> the tags replay the revision-c paragraph filed is now IMPLEMENTED (property + the snapshot-derivable
+> `:Tag`/`TAGGED` half, one `_sync_tags` routine shared by the live writers and the replay fold).
+> The `tags` declaration in D1's block below is therefore marked ⚠️ SUPERSEDED in place rather than
+> rewritten: it is the record of what this design PROPOSED, and the review cycle's finding — that the
+> `none` bucket's "no journal event exists" justification was **false for `tags`** — is what closed it.
+> `contract.py` itself has still NOT landed, so nothing in this document is a live contract.
 
 ---
 
@@ -318,7 +326,15 @@ POINT_PROPS: dict[str, Prop] = {
     "search_keys":    Prop(str, flatten=list,  source="payload", replay_source="journal", replayable=True),
     "speaker":        Prop(str,                source="capture", replay_source="journal", replayable=True),
     "source_turn_id": Prop(str | int,          source="payload", replay_source="journal", replayable=True),  # type pending OD1
-    # The one explicit EXEMPTION — declared so the omission is visible, not accidental (D2):
+    # The one explicit EXEMPTION in THIS contract — declared so the omission is visible,
+    # not accidental (D2).
+    # ⚠️ SUPERSEDED 2026-10-12 — #2897 LANDED and `tags` is CARRIED: `replay_source="journal"`,
+    # `replayable=True`. The fold writes `n.tags` presence-based (`_upsert_point_props`,
+    # `_revise_point`) and re-derives the `:Tag`/`TAGGED` half in pass 2 from the node's own
+    # final value, through the one `_sync_tags` routine the live writers also call. Kept
+    # verbatim because it is what THIS design proposed and what its review cycle found — but
+    # nothing downstream should read the two lines below as the current contract. The row in
+    # `docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md` was updated.
     "tags":           Prop(list, source="capture", replay_source="none", replayable=False,
                            owned_by="_sync_tags"),  # raw list + :Tag/TAGGED edges; edge replay out of scope
     # derived — the replay writer RECOMPUTES these; it never copies them from the payload.
