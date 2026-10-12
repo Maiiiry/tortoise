@@ -3615,6 +3615,17 @@ def _normalize_claim_ref(token: str) -> str | None:
         return None
     if "/" not in ref:
         return None
+    # `git check-ref-format` refuses more than the two cases above: NO component
+    # may begin with `.` or end in `.lock`, and the whole ref may not end in `.`.
+    # `rev-parse --verify --quiet` exits 1 for such a name EXACTLY as it does for
+    # a ref that is genuinely absent, so a name accepted here would be read as a
+    # MEASURED ABSENCE and counted as a dead named artifact — the arm below
+    # promises that no malformed name ever reaches it.
+    if ref.endswith("."):
+        return None
+    for component in ref.split("/"):
+        if not component or component.startswith(".") or component.endswith(".lock"):
+            return None
     return ref
 
 
@@ -3649,14 +3660,19 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str]]:
     * a WORKTREE is a backticked token containing `.worktrees/` and this issue's
       number — matched against the enumerated listing by the caller.
 
-    `refs/heads/x/3061-y`-style and bare (`3061-y`, no slash) tokens are NOT
-    extracted: the first is normalised, the second names nothing this arm can
-    verify by convention, and both directions are fail-closed.
+    A `refs/heads/x/3061-y` token IS extracted (the prefix is stripped first);
+    a bare `3061-y` with no slash is NOT, because it names nothing this arm can
+    verify by convention — and a claim that names nothing keeps blocking.
     """
     branches: list[str] = []
     worktrees: list[str] = []
+    truncated = False
     for raw in _CLAIM_BACKTICK_RE.findall(body or ""):
         if len(branches) + len(worktrees) >= _CLAIM_ARTIFACT_CAP:
+            # An UNEXAMINED token is never a demotion: a token past the cap could
+            # name a LIVE artifact, so a truncated read can never void a claim.
+            # Report "names nothing" so the caller keeps BLOCKING.
+            truncated = True
             break
         token = raw.strip()
         if not token:
@@ -3672,6 +3688,8 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str]]:
             ref = _normalize_claim_ref(token)
             if ref and ref not in branches:
                 branches.append(ref)
+    if truncated:
+        return [], []
     return branches, worktrees
 
 
@@ -4850,7 +4868,8 @@ def format_report(
         if rest:
             lines.append(
                 f"  {rest} further non-blocking hit(s) that are NOT prose — "
-                "your own work, a terminal branch/PR, the shared fleet account, "
+                "a stale claim whose named branch/worktree is gone, your own "
+                "work, a terminal branch/PR, the shared fleet account, "
                 "a fetch-cache ref under a namespace no configured remote "
                 "fetches into, or a worktree RECORD that cannot be live work "
                 "(#6622)."

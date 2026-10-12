@@ -4748,6 +4748,79 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertNotIn("stale claim", out)
         self.assertIn("0 ahead", out)
 
+    def test_claim_naming_one_live_and_one_gone_artifact_still_blocks(self):
+        # The load-bearing "EVERY named artifact" rule. ONE alive artifact keeps
+        # the claim BLOCKING even when another named artifact is gone. A mutation
+        # that demoted when ANY named artifact was dead would pass every other
+        # test in this block, so this pins the direction: the void state is
+        # reachable only when NOTHING the claim named is still live.
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.add_worktree(f".worktrees/{ISSUE}-live", branch=f"fix/{ISSUE}-live")
+        gone = f"fix/{ISSUE}-gone"  # named by the claim, never created
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent",
+                 f"Claiming this — lane `{gone}` "
+                 f"(worktree `.worktrees/{ISSUE}-live`)."),
+            ]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
+        self.assertIn("artifacts verified live", out)
+
+    def test_claim_naming_a_terminal_branch_is_advisory(self):
+        # The OTHER demoting row: a named branch that still EXISTS but is
+        # TERMINAL — its tip is a merged PR's head, so it is not live work.
+        # Without this, dropping the terminal arm (a merged branch read as live)
+        # would over-block forever and no test would notice.
+        #
+        # `refs/remotes/origin/main` is deliberately NOT set here, exactly as in
+        # `test_squash_merged_branch_is_terminal_and_cannot_block`: with a
+        # RESOLVABLE main tip, a branch sitting ON that tip which matches a merged
+        # PR head is the protected "fresh branch at main's tip" case and must
+        # still BLOCK (its partner test pins that half). Leaving the tip
+        # unresolvable isolates the exact tip-SHA arm this row is about.
+        ref = f"fix/{ISSUE}-abandoned"
+        _git(self.repo, "branch", ref)
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent", f"Claiming this — lane `{ref}`."),
+            ]),
+            closed_prs=[self._merged_pr_fixture(ref)],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertIn("stale claim", out)
+        self.assertIn("branch terminal", out)
+
+    def test_claim_extraction_cap_is_fail_closed(self):
+        # Past the cap a backticked token is never EXAMINED, and an unexamined
+        # token could name a LIVE artifact — so a truncated read must never void
+        # the claim. Eight dead branches plus a ninth LIVE artifact is exactly
+        # the body that would otherwise demote on the eight it managed to read.
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.add_worktree(f".worktrees/{ISSUE}-live", branch=f"fix/{ISSUE}-live")
+        dead = " ".join(f"`fix/{ISSUE}-dead{i}`" for i in range(1, 9))
+        self.gh_fixtures(
+            issue=self.issue_payload(comments=[
+                ("test-agent",
+                 f"Claiming this — {dead} and the live worktree "
+                 f"`.worktrees/{ISSUE}-live`."),
+            ]),
+            closed_prs=[],
+        )
+        self.jev_rules(default=0.95)
+        rc, out = self.run_tool(env_extra=self.jev_env())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertNotIn("stale claim", out)
+
     def test_6151_regression_abandoned_claim_clears_only_when_artifacts_go(self):
         # The MEASURED #6151 sequence, end to end. A lane claims the issue,
         # creates `fix/N-refutes-magnitude` at origin/main's tip (0 commits of
