@@ -8,6 +8,7 @@
 //        npm run validate
 // Exit:  0 = all migrations applied + all assertions passed; 1 = any failure.
 import { PGlite } from '@electric-sql/pglite';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -611,6 +612,166 @@ try {
   process.exit(1);
 }
 
-console.log('✅ ALL MIGRATIONS + BOTH TEST SUITES + SPOT CHECKS PASSED');
+// ── #7969: the record projection — replay a journal TWICE, assert idempotence ─
+//
+// Interface A (`journal → Postgres, replayable and idempotent`, epic #7879) is a
+// claim about a REAL database, so it is checked on one. The statements come from
+// `tortoise/record_projection.py` itself — the harness never restates a mutation,
+// or it would be testing its own copy of the projection rather than the
+// projection. The Python half is spawned with `-c` and loads the module by FILE
+// PATH, so it needs neither a venv nor the `tortoise` package (stdlib only) and
+// cannot drift from the code under test.
+//
+// Three assertions, one per Interface A clause:
+//   TOTAL     — every record type in the fixture materialized (the fixture
+//               carries the whole declared vocabulary), and an UNDECLARED type
+//               is a hard failure;
+//   IDEMPOTENT— replay twice ⇒ byte-identical tables;
+//   PLACEMENT — the EP scalars the journal carries (`ep_alpha`, `confidence`,
+//               `version`, `content_hash`) are stored NOWHERE, as a column or as
+//               a props key (STORAGE-ARCHITECTURE §2.0/§17.5).
+const PROJECTION_PY = `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("record_projection", sys.argv[1])
+rp = importlib.util.module_from_spec(spec)
+# Register BEFORE exec: dataclasses resolves the defining module through
+# sys.modules[cls.__module__] on 3.14, and an unregistered module is None.
+sys.modules["record_projection"] = rp
+spec.loader.exec_module(rp)
+records = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
+plan = []
+for statement in rp.replay_plan(records, org_id="7969-org", graph_id="7969-graph"):
+    sql, params = rp.to_dollar_placeholders(statement)
+    plan.append({"sql": sql, "params": params})
+json.dump({"records": len(records), "plan": plan}, sys.stdout)
+`;
+const PROJECTION_RECORD_TABLES = [
+  'node_identity', 'journal_event', 'source', 'event', 'session',
+  'object', 'subject', 'point', 'relation',
+];
 
+async function projectionSnapshot() {
+  const out = [];
+  for (const table of PROJECTION_RECORD_TABLES) {
+    const r = await db.query(`SELECT * FROM public.${table}`);
+    out.push([table, r.rows.map((row) => JSON.stringify(row)).sort()]);
+  }
+  return JSON.stringify(out);
+}
+
+try {
+  await db.exec(`
+    INSERT INTO public.organizations (id, name, graph_name)
+      VALUES ('7969-org', '7969-org', 'org_7969-org');
+    INSERT INTO public.graphs (id, org_id, name, namespace)
+      VALUES ('7969-graph', '7969-org', '7969-graph', 'org_7969-org_7969-graph');
+  `);
+  const fixture = join(HERE, '..', 'fixtures', 'record_projection_journal.jsonl');
+  const modulePath = join(REPO_ROOT, 'tortoise', 'record_projection.py');
+  const emitted = JSON.parse(execFileSync(
+    'python3', ['-c', PROJECTION_PY, modulePath, fixture], { encoding: 'utf8' },
+  ));
+  if (!emitted.plan.length) {
+    throw new Error('the projection emitted no statements for a non-empty journal');
+  }
+
+  // ONE transaction per replay — §3: "One transaction covers the journal and
+  // its projection — no dual write between them".
+  const applyOnce = async () => {
+    await db.exec('BEGIN');
+    for (const statement of emitted.plan) {
+      await db.query(statement.sql, statement.params);
+    }
+    await db.exec('COMMIT');
+  };
+  await applyOnce();
+  const first = await projectionSnapshot();
+  await applyOnce();
+  const second = await projectionSnapshot();
+  if (first !== second) {
+    console.error('✗ #7969: a SECOND replay of the same journal CHANGED the record');
+    process.exit(1);
+  }
+
+  const counts = await db.query(`SELECT
+      (SELECT count(*) FROM public.journal_event) AS journal,
+      (SELECT count(*) FROM public.point)         AS points,
+      (SELECT count(*) FROM public.source)        AS sources,
+      (SELECT count(*) FROM public.object)        AS objects,
+      (SELECT count(*) FROM public.subject)       AS subjects,
+      (SELECT count(*) FROM public.session)       AS sessions,
+      (SELECT count(*) FROM public.relation)      AS relations`);
+  const c = counts.rows[0];
+  const wantJournal = emitted.records;
+  // Every fixture project is replayed to the same record twice; the counts are
+  // the totality evidence (a skip would land one short) plus the fold's own
+  // verdicts: p2 is hard-deleted by its EntityMutated, sess1 by SessionDeleted,
+  // and the two sources + one object + one subject + four relations survive.
+  const expected = { journal: String(wantJournal), points: '2',
+                     sources: '2', objects: '1', subjects: '1',
+                     sessions: '0', relations: '3' };
+  for (const [key, value] of Object.entries(expected)) {
+    if (String(c[key]) !== value) {
+      console.error(`✗ #7969: record.${key} = ${c[key]}, expected ${value}`);
+      process.exit(1);
+    }
+  }
+
+  const folded = await db.query(
+    `SELECT content FROM public.point WHERE node_key = 'p1'`);
+  if (folded.rows[0]?.content !== 'second reading of p1') {
+    console.error(`✗ #7969: PointRevised did not fold in order: ${JSON.stringify(folded.rows)}`);
+    process.exit(1);
+  }
+
+  // The EP-scalar carve-out, on the stored rows rather than in the emitter.
+  const leak = await db.query(`SELECT
+      (SELECT count(*) FROM public.point
+        WHERE props ?| ARRAY['ep_alpha','ep_beta','confidence','version','content_hash']::text[]) AS point_props,
+      (SELECT count(*) FROM public.point
+        WHERE props ? 'lastDreamedAt')                                        AS point_extra,
+      (SELECT count(*) FROM public.source WHERE props ? 'reliability')        AS source_props,
+      (SELECT count(*) FROM public.subject WHERE props ? 'status')            AS subject_cache,
+      (SELECT count(*) FROM public.source
+        WHERE props ?| ARRAY['content','doc_status','object_kind']::text[])   AS retired_props`);
+  const l = leak.rows[0];
+  if (Number(l.point_props) || Number(l.point_extra) || Number(l.source_props) ||
+      Number(l.subject_cache) || Number(l.retired_props)) {
+    console.error(`✗ #7969: a DERIVED/cache/retired value was stored as authority: ${JSON.stringify(l)}`);
+    process.exit(1);
+  }
+
+  // TOTALITY, the other half: an undeclared record type must FAIL the replay,
+  // not be skipped. Spawned (not imported) so the failure is the real one a
+  // caller sees: a raised exception and a non-zero exit.
+  let refused = false;
+  try {
+    execFileSync('python3', ['-c', `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("record_projection", sys.argv[1])
+rp = importlib.util.module_from_spec(spec)
+sys.modules["record_projection"] = rp
+spec.loader.exec_module(rp)
+rp.replay_plan([{"type": "PointTeleported", "id": "p1"}], org_id="o", graph_id="g")
+`, modulePath], { encoding: 'utf8', stdio: 'pipe' });
+  } catch {
+    refused = true;
+  }
+  if (!refused) {
+    console.error('✗ #7969: an UNDECLARED record type was SKIPPED — Interface A is total');
+    process.exit(1);
+  }
+
+  // NO cleanup: `public.journal_event` is append-only by TRIGGER (a DELETE is
+  // refused unless the tenant-erasure GUC is set), and the harness database is
+  // thrown away at the end of the run — a cleanup that tried to satisfy the
+  // trigger here would be testing the erasure path, which #7968's own suite
+  // already covers.
+  console.log(`✓ #7969: the record projection replays ${wantJournal} journal records, is idempotent, total, and stores no EP scalar`);
+} catch (e) {
+  console.error(`✗ #7969 record projection FAILED:\n  ${e.message.split('\n').slice(0, 6).join('\n  ')}`);
+  process.exit(1);
+}
+
+console.log('✅ ALL MIGRATIONS + BOTH TEST SUITES + SPOT CHECKS PASSED');
 await db.close();
