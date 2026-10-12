@@ -12,6 +12,7 @@ import {
   type Env, fetchPublishedPosts, fetchPostBySlug, renderMarkdown,
   headHtml, htmlPage, navHtml, formatDate, shareBarHtml, validCoverUrl,
   ok, notFound, upstreamError, SITE_URL, escapeHtml, SLUG_RE,
+  extractFaq, faqPageJsonLd,
 } from "./_lib.ts";
 
 export const onRequestGet: PagesFunction<Env> = async (context) => {
@@ -118,6 +119,9 @@ async function renderArticle(env: Env, slug: string): Promise<Response> {
   const description = post.meta_description ?? (post.excerpt ?? post.title);
   const url = `${SITE_URL}/blog/${post.slug}`;
   const bodyHtml = renderMarkdown(post.body);
+  // FAQPage is derived from the same markdown that renders the visible FAQ, so
+  // the schema cannot drift from the page. Absent an FAQ section, none is emitted.
+  const faqSchema = faqPageJsonLd(extractFaq(post.body));
   const updated = formatDate(post.updated_at);
   const published = formatDate(post.published_at);
   const noCache = isRecentlyEdited(post.updated_at) ? "no-cache" : "public, max-age=300";
@@ -148,6 +152,7 @@ async function renderArticle(env: Env, slug: string): Promise<Response> {
           { "@type": "ListItem", position: 2, name: post.title, item: url },
         ],
       },
+      ...(faqSchema ? [faqSchema] : []),
     ],
   });
 
