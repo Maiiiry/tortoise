@@ -36,7 +36,8 @@ f-string. ⚠️ **The read-side exclusion is NOT implemented for the Session
 container.** #2360's exclusion is Point-scoped (``_DEMO_POINT_IDS``: the demo
 Points and the sentinel), so the demo ``:Session`` is still returned by
 ``GET /v1/sessions``, ``GET /v1/sessions/{id}`` and ``TortoiseSDK.get_session``.
-That is recorded here as an open gap, never read as coverage.
+That is recorded here as an open gap, never read as coverage — tracked on
+**#8290**.
 """
 
 from __future__ import annotations
@@ -64,7 +65,8 @@ __all__ = [
 #: declaration: ``hosted_api._seed_demo_graph`` writes the id through
 #: :func:`demo_session_id`. The session READ surfaces do NOT exclude it today —
 #: #2360's exclusion covers the demo POINTS (``_DEMO_POINT_IDS``), not the demo
-#: Session container — and that gap is recorded rather than claimed closed.
+#: Session container — and that gap is recorded rather than claimed closed
+#: (**#8290** tracks the decision).
 DEMO_SESSION_ID_PREFIX = "session_demo_"
 
 
@@ -284,7 +286,7 @@ SESSION_WRITERS: tuple[SessionWriter, ...] = (
             "`capture_ok`, and 3 hand-written demo turns. Its Session id comes "
             "from `demo_session_id` (the ONE derivation, #3554); the session "
             "read surfaces do NOT yet exclude the demo Session — a recorded "
-            "gap, not a claim of coverage."),
+            "gap (**#8290**), not a claim of coverage."),
     ),
     SessionWriter(
         key="tortoise/projection/entities.py::_fold_session_recorded",
