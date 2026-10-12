@@ -498,13 +498,22 @@ _REDACTION_VALUE = "[REDACTED:{kind}]"
 #      ⇒ the ``/`` claim is a URL-grammar error, not a bound: a raw ``/`` in a
 #      URL authority ENDS the authority (it starts the path), so it can never be
 #      part of a password and the class must exclude it either way. The
-#      swallowing is real and is fixed by CONSTRUCTION: the password class is
-#      LAZY and the host is host-shaped and must not be followed by another
-#      ``@``, so ``{"url":"postgres://user:pw@host","email":"a@b.com"}`` redacts
-#      ``pw`` and leaves every key and address byte-identical. A GREEDY class
-#      here re-breaks it — the last-``@`` heuristic walks into the next field —
-#      measured in review of #5326 and pinned by
-#      ``test_a_greedy_class_does_not_swallow_the_surrounding_text``.
+#      swallowing is real and is fixed by CONSTRUCTION — but by TWO
+#      constructions, not one: the password class is LAZY, excludes the
+#      structured-text delimiters (``_CONNECTION_URL_PASSWORD_STOPS``), and the
+#      host is host-shaped and must not be followed by another ``@``. Laziness
+#      alone is NOT enough: with no host in its OWN authority the walk leaves
+#      the URL, crosses the delimiters to the NEXT field's ``@``-token and
+#      treats that token's domain as the host — the
+#      ``{"url":"postgres://user:pw","email":"ops@example.com"}`` case
+#      measured in review of #5326, which destroyed the JSON keys and the
+#      address. With both, ``{"url":"postgres://user:pw@host","email":"a@b.com"}``
+#      redacts ``pw`` and leaves every key and address byte-identical. A GREEDY
+#      class here re-breaks it — the last-``@`` heuristic walks into the next
+#      field — measured in review of #5326 and pinned by
+#      ``test_a_greedy_class_does_not_swallow_the_surrounding_text``; the
+#      host-absent direction is pinned by
+#      ``test_a_hostless_url_does_not_swallow_a_following_at_token``.
 #      The bound itself (512) is the module's own idiom (see ``jwt``'s 512 and
 #      the PEM label's 40): it keeps per-candidate work a LOCAL, auditable
 #      constant instead of an argument about which runs can overlap. Its recall
@@ -564,6 +573,24 @@ _CONNECTION_URL_HOST = (
     r"|\[[0-9A-Fa-f:.]{2,45}\])"
 )
 
+#: Characters that terminate a candidate password even though they are not
+#: whitespace or ``/?#``. Two kinds, both of which separate a URL from the
+#: structured text around it: (a) characters that CANNOT appear raw in a URL
+#: userinfo (``"`` ``<`` ``>`` ``{`` ``}``) and (b) the field delimiters
+#: (``'`` ``,`` ``;``) that bound one value from the next in the JSON, CSV and
+#: shell pastes this rule meets.
+#: ⛔ WITHOUT them the LAZY password walk does not stay in its OWN authority:
+#: when the URL has NO host of its own it keeps consuming delimiters until it
+#: reaches the NEXT ``@``-token in the run, reads that token's domain as the
+#: host and eats every key and value in between — measured in review of #5326
+#: on ``{"url":"postgres://user:pw","email":"ops@example.com"}``, where
+#: laziness ALONE (the ``@host`` form) was not enough. Each is a RECALL trade
+#: (a real password may contain ``'``/``,``/``;``): it is taken deliberately,
+#: recorded as residual 5 below, and pinned by
+#: ``test_a_hostless_url_does_not_swallow_a_following_at_token`` and
+#: ``test_a_password_containing_a_field_delimiter_is_declined_whole``.
+_CONNECTION_URL_PASSWORD_STOPS = "\"',;{}<>"
+
 #: Placeholders are not credentials, and refusing them HERE (in the pattern)
 #: rather than in a replacement callable is load-bearing: ``re.subn`` counts
 #: MATCHES, so a callable that returns the match unchanged would still be
@@ -592,7 +619,9 @@ _CONNECTION_URL_PLACEHOLDER = (
 #:     ``user:password``), so the user class excludes ``:`` and ``@``.
 #:   * the password is LAZY and terminated by ``@`` — see revision 3 above. It
 #:     excludes ``/`` (which ENDS the authority), ``?``/``#`` (which start the
-#:     query/fragment), and whitespace; it deliberately ALLOWS ``:`` and ``@``,
+#:     query/fragment), whitespace, and the delimiter stops
+#:     (``_CONNECTION_URL_PASSWORD_STOPS`` — see revision 3); it deliberately
+#:     ALLOWS ``:`` and ``@``,
 #:     because a raw ``:`` in a password is legal and an ``@`` is resolved by the
 #:     host-shape requirement (``user:p@ss@host`` redacts ``p@ss`` whole rather
 #:     than stopping at the first ``@`` and leaving ``ss`` in the graph).
@@ -619,7 +648,9 @@ _CONNECTION_URL_RE = re.compile(
     r"(?P<scheme>" + _CONNECTION_URL_SCHEME_ALT + r")://"
     r"(?P<user>[^\s/?#:@]{0,64}):"
     + _CONNECTION_URL_PLACEHOLDER +
-    r"(?P<password>[^\s/?#]{1,512}?)@"
+    r"(?P<password>[^\s/?#"
+    + re.escape(_CONNECTION_URL_PASSWORD_STOPS)
+    + r"]{1,512}?)@"
     r"(?P<host>" + _CONNECTION_URL_HOST + r")(?![A-Za-z0-9_@.-])"
 )
 
@@ -646,6 +677,16 @@ _CONNECTION_URL_REPLACEMENT = (
 #   4. A URL whose credential is a BARE userinfo token with no ``:``
 #      (``https://<token>@host`` — a PAT in a clone URL) is not matched here;
 #      the token itself is claimed by its own vendor rule where one exists.
+#   5. A raw ``'``/``,``/``;`` (and ``"``/``<``/``>``/``{``/``}``) INSIDE a
+#      password is refused: those delimiters are ALSO what separates a password
+#      from the NEXT field in a pasted JSON/CSV line, so they terminate the
+#      candidate (the recall side of the trade that stops the host-absent
+#      swallow in revision 3). A password that really contains one is declined
+#      AS A WHOLE — never partially rewritten with a prefix redacted, the
+#      #5470 false-assurance direction. The percent-encoded form (``%2C`` /
+#      ``%3B`` / ``%27``) IS matched. Pinned by
+#      ``test_a_hostless_url_does_not_swallow_a_following_at_token`` and
+#      ``test_a_password_containing_a_field_delimiter_is_declined_whole``.
 
 #: ``(kind, pattern, replacement)`` — ordered, and the ORDER IS LOAD-BEARING.
 _SECRET_SHAPES: tuple[tuple[str, re.Pattern[str], str], ...] = (

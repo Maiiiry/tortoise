@@ -20,7 +20,9 @@ bound here:
 * revision 3 (``+ bounded user/password classes``) was recorded as leaking on
   an over-bound password and as SWALLOWING up to 200 chars of surrounding text
   around a greedy class. ⇒ §5: the swallowing is fixed by construction (a lazy
-  password + a host shape + a MAXIMAL-host boundary), and the bound's one
+  password that also STOPS at the structured-text delimiters + a host shape + a
+  MAXIMAL-host boundary — laziness alone still walks into the next field's
+  ``@``-token when the URL has no host of its own), and the bound's one
   residual is pinned as a whole-candidate miss — never a prefix left behind
   (§8).
 
@@ -43,6 +45,7 @@ import re
 from urllib.parse import urlsplit
 
 from tortoise.security import (
+    _CONNECTION_URL_PASSWORD_STOPS,
     _CONNECTION_URL_PLACEHOLDER,
     _CONNECTION_URL_RE,
     _CONNECTION_URL_SCHEMES,
@@ -320,6 +323,59 @@ def test_the_host_must_be_maximal_or_a_password_fragment_survives():
         _assert_redacts(url)
 
 
+def test_a_hostless_url_does_not_swallow_a_following_at_token():
+    """⛔ Revision 3's OTHER direction, and laziness alone does NOT pin it.
+
+    ``test_a_greedy_class_does_not_swallow_the_surrounding_text`` pins the case
+    where the URL has its OWN ``@host``. But when it does NOT — a pasted
+    ``postgres://user:pw`` that is missing its authority host — the LAZY walk
+    still leaves the URL, crosses the surrounding delimiters to the NEXT
+    ``@``-token in the run and reads that token's domain as the host. The
+    password class therefore also STOPS at the structured-text delimiters
+    (``_CONNECTION_URL_PASSWORD_STOPS``); with them the candidate cannot reach
+    the neighbour's ``@`` and the whole blob is returned byte-identical.
+
+    Measured in review of #5326: pre-fix this destroyed the JSON keys, the CSV
+    field and the ``ops@example.com`` address on every one of these.
+    """
+    assert _CONNECTION_URL_PASSWORD_STOPS, "an empty stop set fixes nothing"
+    for blob in (
+        '{"url":"postgres://user:pw","email":"ops@example.com"}',
+        'config: postgres://user:pw,email=ops@example.com',
+        'csv,postgres://u:p,ops@example.com,more',
+        '{"a":"mysql://root:hunter2","b":"x@y.io"}',
+        "redis://default:mypassword;owner=bob@example.com",
+    ):
+        _assert_spared(blob)
+
+
+def test_a_password_containing_a_field_delimiter_is_declined_whole():
+    """The recall side of the delimiter trade — never a PARTIAL redaction.
+
+    A password that really contains one of the stop characters is refused as a
+    WHOLE candidate (the ``@host`` after it is unreachable once the class
+    cannot cross the delimiter), so no prefix of a credential is ever written
+    to the graph with a redaction reported — the #5470 false-assurance
+    direction. The percent-encoded spelling of the same delimiter is URL-legal
+    and IS matched.
+    """
+    for url in (
+        "postgres://user:pw,ss@host.internal",
+        "postgres://user:pw;ss@host.internal",
+        "postgres://user:pw'ss@host.internal",
+        'postgres://user:pw"ss@host.internal',
+        "postgres://user:pw{ss@host.internal",
+        "postgres://user:pw<ss@host.internal",
+    ):
+        out, counts = redact_secrets(url)
+        assert (out, counts) == (url, {}), (
+            f"a declined delimiter password must be left byte-identical: "
+            f"{url!r} -> {out!r} {counts!r}")
+
+    out = _assert_redacts("postgres://user:pw%2Css@host.internal")
+    assert out == f"postgres://user:{MARK}@host.internal", out
+
+
 # ── §6 Placeholders are not credentials ───────────────────────────────────
 
 def test_placeholders_are_not_credentials():
@@ -565,6 +621,7 @@ def test_the_rule_is_idempotent_and_declines_nothing_but_a_placeholder():
                 is_placeholder
                 or len(password) > 512
                 or any(ch in password for ch in "/?#")
+                or any(ch in password for ch in _CONNECTION_URL_PASSWORD_STOPS)
                 or any(ch.isspace() for ch in password)
                 or any(ch in user for ch in "/?#:@")
             )
