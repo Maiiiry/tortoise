@@ -173,6 +173,12 @@ grep -q 'GATE_WHY=' "$LOOP" && rc=0 || rc=1
 ck "dispatch skip message names the binding gate" $rc
 grep -q 'merge-priority' "$LOOP" && rc=0 || rc=1
 ck "the loop implements merge-priority above the backlog threshold" $rc
+grep -q '= "CONFLICTING"' "$LOOP" && rc=0 || rc=1
+ck "a CONFLICTING PR is routed to the fixer, not retried as a merge" $rc
+grep -q 'CONFLICTING -> fixer attempt' "$LOOP" && rc=0 || rc=1
+ck "the conflict fixer is logged and capped like other fix loops" $rc
+grep -q 'resolving the conflict IS the task' "$HERE/fix-one.sh" && rc=0 || rc=1
+ck "the fixer prompt treats a conflict as the task" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
 sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"

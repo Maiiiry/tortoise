@@ -350,6 +350,14 @@ its checks, failed `ai-review-gate`, and no worker ever touched it. Observed: **
 them. Foreign drafts are excluded exactly as before — #4212 (`scope/w6b-graph-candidate`) is
 another box's draft and is correctly left alone.
 
+### 7.2c Conflicted PRs — **FIXED in this PR**
+
+A CONFLICTING PR can never merge, but the sweep classified it GREEN/PENDING and called `gh pr merge`
+on it every cycle, so the queue looked busy while nothing moved (observed: #8245, #8226, #8193,
+#8104). They are now routed to `fix-one.sh`, which integrates `origin/main`, resolves the conflict,
+and re-runs the review chain — capped by `MAX_FIX_TRIES` and parkable like any other fix loop. The
+fixer prompt states that when a PR is CONFLICTING the conflict *is* the task.
+
 ### 7.2b Cross-box duplicate work — **OPEN**
 
 The per-PR claim (§5.1b) is a **local file**, so it makes concurrency safe *within one box*. Two

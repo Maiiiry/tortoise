@@ -44,7 +44,8 @@ You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewe
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
 If \`.venv\` is missing in the worktree, run \`uv sync --extra embeddings --extra parity\` once before testing.
-If the branch is behind \`origin/main\`, integrate it first (\`git fetch origin main && git merge origin/main\`) and resolve any conflicts so the PR stays mergeable.
+If the branch is behind \`origin/main\`, integrate it first (\`git fetch origin main\` then a plain merge of origin/main) and resolve any conflicts so the PR stays mergeable.
+**If this PR is CONFLICTING (mergeable=CONFLICTING), resolving the conflict IS the task** — GitHub reports it as unmergeable right now, so integrate \`origin/main\`, resolve every conflict hunk keeping both sides' intent, run the targeted tests, commit and push. If there are no review findings, the conflict is the whole job.
 
 Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirements:
 - Make the fix at the stated location, and add/adjust tests so they genuinely FAIL on the pre-fix code (prove non-vacuity where you can).

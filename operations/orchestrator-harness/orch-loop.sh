@@ -139,6 +139,31 @@ fail=[n for n in want if bad(m.get(n,''))]
 pend=[n for n in want if not ok(m.get(n,''))]
 print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pend else 'GREEN'))
 " 2>/dev/null)"
+    # A CONFLICTING PR can never merge: `gh pr merge` fails every cycle and the queue looks stuck
+    # while nothing changes. Route it to the fixer, which integrates origin/main and resolves the
+    # conflict, then re-runs the review chain. Capped and parkable like any other fix loop.
+    case "$V" in
+      GREEN|PENDING:*)
+        MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
+        if [ "${MSTAT:-}" = "CONFLICTING" ]; then
+          CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
+          case "$NFC" in ''|*[!0-9]*) NFC=0 ;; esac
+          if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
+            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
+          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+            : # a worker is already rebasing it
+          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ]; then
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+              echo $((NFC + 1)) > "$CF"
+              echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
+            else
+              echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
+            fi
+          fi
+          continue
+        fi ;;
+    esac
     case "$V" in
       GREEN)     gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true; gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG" ;;
       PENDING:*) gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true; gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true ;;
