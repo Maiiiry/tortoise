@@ -183,8 +183,15 @@ const HEADING_SLUG_MAX = 80;
  *  this strips markdown — it must never be handed escaped HTML. */
 function plainText(md: string): string {
   return unescapeMd(md)
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // image → alt text
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // link → link text
+    // Bounded quantifiers + an escape-aware text class, the same shape inline()
+    // uses. The unbounded forms re-scanned to end-of-string at every `[`, so on
+    // many unclosed `[` the match at each position was O(n) → O(n²) overall
+    // (measured ~6.5s at 20K `[`), a CPU blowup on this renderer's two new
+    // unbounded paths: slugifyHeading() (every heading) and extractFaq() (every
+    // FAQ answer). Bounded, each position has exactly one parse and the run is
+    // linear; ordinary links are unaffected.
+    .replace(/!\[((?:\\.|[^\\\]\n]){0,200})\]\(([^)\s]{1,300})\)/g, "$1") // image → alt text
+    .replace(/\[((?:\\.|[^\\\]\n]){0,200})\]\(([^)\s]{1,300})\)/g, "$1") // link → link text
     .replace(/^\s*[-*+]\s+/gm, "") // list markers
     .replace(/^\s*\d+\.\s+/gm, "")
     .replace(/`([^`]*)`/g, "$1")
@@ -231,15 +238,19 @@ export function renderMarkdown(markdown: string): string {
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   const out: string[] = [];
   const tocEntries: { level: number; id: string; text: string }[] = [];
-  const slugCounts = new Map<string, number>();
+  const usedSlugs = new Set<string>();
   let tocIndex = -1;
   let i = 0;
 
-  // Duplicate headings get `-1`, `-2`, … so every id stays unique and stable.
+  // Duplicate headings get `-1`, `-2`, … allocated against the ids ALREADY
+  // ISSUED — not just the base's own counter, or `A`, `A`, `A 1` both take
+  // `a-1`. Every id stays unique and stable.
   const uniqueSlug = (base: string): string => {
-    const n = slugCounts.get(base) ?? 0;
-    slugCounts.set(base, n + 1);
-    return n === 0 ? base : `${base}-${n}`;
+    let n = 0;
+    let candidate = base;
+    while (usedSlugs.has(candidate)) candidate = `${base}-${++n}`;
+    usedSlugs.add(candidate);
+    return candidate;
   };
 
   const flushPara = (buf: string[]): void => {
@@ -280,7 +291,10 @@ export function renderMarkdown(markdown: string): string {
       const level = h[1].length;
       const text = h[2];
       const id = uniqueSlug(slugifyHeading(text));
-      tocEntries.push({ level, id, text });
+      // The TOC label is PLAIN TEXT (markdown stripped), like the slug. Inline
+      // markup here would nest an <a> inside the TOC's <a> (invalid HTML — a
+      // browser closes the outer one) or inject an <img>.
+      tocEntries.push({ level, id, text: plainText(text) });
       out.push(`<h${level} id="${escapeHtml(id)}">${inline(text)}</h${level}>`);
       i++;
       continue;
@@ -378,7 +392,7 @@ export function renderMarkdown(markdown: string): string {
     const top = tocEntries.filter((e) => e.level === 2);
     out[tocIndex] = top.length
       ? `<nav class="toc" aria-label="Table of contents">` +
-        `<ol>${top.map((e) => `<li><a href="#${escapeHtml(e.id)}">${inline(e.text)}</a></li>`).join("")}</ol>` +
+        `<ol>${top.map((e) => `<li><a href="#${escapeHtml(e.id)}">${escapeHtml(e.text)}</a></li>`).join("")}</ol>` +
         `</nav>`
       : "";
   }
@@ -421,12 +435,24 @@ export function extractFaq(markdown: string): FaqEntry[] {
     answer = [];
   };
 
-  for (const line of lines) {
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
     if (/^```/.test(line)) {
       inFence = !inFence;
+      i++;
       continue;
     }
-    if (inFence) continue;
+    if (inFence) {
+      // Fenced code IS visible to the reader (rendered as <pre><code>), so its
+      // content belongs in the answer — otherwise an answer that is only a code
+      // block yields an empty text and the whole question is dropped. Its lines
+      // are never scanned for headings, so the fence cannot open a question.
+      if (inFaq && question) answer.push(line);
+      i++;
+      continue;
+    }
 
     const h = /^(#{2,4})\s+(.*)$/.exec(line);
     if (h) {
@@ -442,10 +468,38 @@ export function extractFaq(markdown: string): FaqEntry[] {
         // to the reader, so the schema must carry it too.
         answer.push(h[2]);
       }
+      i++;
       continue;
     }
 
-    if (inFaq && question) answer.push(line);
+    if (inFaq && question) {
+      // Blockquote run — mirror the renderer: the `>` prefix and a GitHub alert
+      // marker are block structure the page renders away, so neither is answer
+      // text (the callout label is chrome, not the answer).
+      if (/^>\s?/.test(line)) {
+        const buf: string[] = [];
+        while (i < lines.length && /^>\s?/.test(lines[i])) {
+          buf.push(lines[i].replace(/^>\s?/, ""));
+          i++;
+        }
+        const alert = MD_ALERT_RE.exec(buf[0] ?? "");
+        answer.push(alert ? [alert[2], ...buf.slice(1)].join("\n") : buf.join("\n"));
+        continue;
+      }
+      // Table rows — the separator row is invisible on the page and the pipes
+      // are structure; the reader sees just the cell text.
+      if (/^\|/.test(line.trim())) {
+        if (!/^\|[\s:|-]+\|?$/.test(line.trim())) {
+          answer.push(
+            line.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim()).join(" "),
+          );
+        }
+        i++;
+        continue;
+      }
+      answer.push(line);
+    }
+    i++;
   }
 
   flush();
@@ -464,6 +518,39 @@ export function faqPageJsonLd(entries: FaqEntry[]): unknown | null {
       acceptedAnswer: { "@type": "Answer", text: e.answer },
     })),
   };
+}
+
+/**
+ * The JSON-LD array for an article: `BlogPosting` + `BreadcrumbList`, with a
+ * `FAQPage` appended only when the article actually has an FAQ section. Pure, so
+ * the wiring is testable without a Cloudflare runtime, and the single seam a
+ * future schema type (e.g. `VideoObject`) lands on.
+ */
+export function articleJsonLd(post: BlogPost, url: string): unknown[] {
+  const description = post.meta_description ?? (post.excerpt ?? post.title);
+  const faqSchema = faqPageJsonLd(extractFaq(post.body));
+  return [
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      headline: post.title,
+      description,
+      url,
+      image: post.cover_image_url ?? undefined,
+      author: { "@type": "Organization", name: post.author ?? "Tortoise team" },
+      datePublished: post.published_at,
+      dateModified: post.updated_at,
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Blog", item: `${SITE_URL}/blog` },
+        { "@type": "ListItem", position: 2, name: post.title, item: url },
+      ],
+    },
+    ...(faqSchema ? [faqSchema] : []),
+  ];
 }
 
 // ── HTML shell ─────────────────────────────────────────────────────────────

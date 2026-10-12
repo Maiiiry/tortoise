@@ -14,7 +14,7 @@
 // Run (Node >= 22.6):
 //   node --experimental-strip-types tests/test_blog_markdown.mjs
 
-import { renderMarkdown, extractFaq, faqPageJsonLd, jsonLd } from "../website/functions/blog/_lib.ts";
+import { renderMarkdown, extractFaq, faqPageJsonLd, articleJsonLd, jsonLd } from "../website/functions/blog/_lib.ts";
 
 let failures = 0;
 const ok = (msg) => console.log(`  ✓ ${msg}`);
@@ -46,7 +46,6 @@ console.log("summary table (#4481 — the reported page)");
       "<tr><td>Coding harnesses</td><td>✓</td><td>~</td></tr></tbody></table></div>",
     "a table cell containing \\~ renders the bare tilde",
   );
-  assert(html.includes('<div class="table-wrap">'), "wide tables sit in a horizontally scrollable wrapper");
   assert(!html.includes("\\~"), "no escape backslash survives into the table HTML");
 }
 
@@ -99,6 +98,21 @@ console.log("bounded span content stays linear on adversarial input");
   renderMarkdown(pathological);
   const ms = Date.now() - t0;
   assert(ms < 1000, `pathological emphasis run completes fast (${ms}ms)`);
+
+  // The new entry points share plainText(): slugifyHeading() runs on EVERY
+  // heading and extractFaq() on EVERY FAQ answer. Unbounded link/image
+  // quantifiers re-scanned to end-of-string at each `[` → O(n²) (pre-fix,
+  // 20000 `[`: heading ≈6.8s, FAQ answer ≈6.4s — a CPU DoS at BODY_MAX=100KB).
+  // Post-fix on this machine: heading ≈460ms, FAQ answer ≈80ms (medians).
+  const t1 = Date.now();
+  renderMarkdown("## " + "[".repeat(20000));
+  const headMs = Date.now() - t1;
+  assert(headMs < 1500, `a '['-heavy heading stays linear (${headMs}ms; pre-fix ≈6.8s)`);
+
+  const t2 = Date.now();
+  extractFaq("## FAQ\n\n### Q?\n\n" + "[".repeat(20000));
+  const faqMs = Date.now() - t2;
+  assert(faqMs < 1500, `a '['-heavy FAQ answer stays linear (${faqMs}ms; pre-fix ≈6.4s)`);
 }
 
 console.log("code spans are exempt from unescaping (CommonMark)");
@@ -189,6 +203,42 @@ console.log("table of contents (#8291 — cannot drift from the headings)");
     "the editor's backslash-escaped form of the marker is recognised too",
   );
   assert(!renderMarkdown("## One").includes('<nav class="toc"'), "no marker means no TOC is injected");
+}
+
+console.log("TOC labels are plain, escaped text (#8294 — no nested anchor, no injected markup)");
+{
+  const tocOf = (html) => html.slice(html.indexOf("<nav"), html.indexOf("</nav>") + 6);
+
+  const raw = renderMarkdown("[[toc]]\n\n## <img src=x onerror=alert(1)>");
+  assert(!raw.includes("<img src=x"), "raw markup in a heading injects no raw <img> into the page");
+  assert(tocOf(raw).includes("&lt;img src=x onerror=alert(1)&gt;"), "the TOC label carries the entity-escaped form");
+
+  const markedUp = renderMarkdown("[[toc]]\n\n## Hi ![shot](https://e.com/i.png)");
+  assert(!tocOf(markedUp).includes("<img"), "a markdown image in a heading injects no <img> into the TOC");
+  assert(tocOf(markedUp).includes(">Hi shot</a>"), "the image contributes its alt text to the label");
+
+  const linked = renderMarkdown("[[toc]]\n\n## Read the [docs](https://x.com)");
+  assertEq((tocOf(linked).match(/<a /g) ?? []).length, 1, "the TOC label has exactly one anchor (no nested <a>)");
+  assert(tocOf(linked).includes('href="#read-the-docs"'), "the TOC still links to the heading's anchor");
+  assert(linked.includes('<h2 id="read-the-docs">Read the <a href="https://x.com"'), "the heading itself keeps its rendered link");
+}
+
+console.log("heading ids are unique across dedup suffixes (#8294)");
+{
+  const idsOf = (html) => [...html.matchAll(/id="([^"]*)"/g)].map((m) => m[1]);
+
+  const mixed = idsOf(renderMarkdown("## A\n\n## A\n\n## A 1"));
+  assertEq(mixed.join(","), "a,a-1,a-1-1", "A, A, A 1 → a, a-1, a-1-1 (no collision)");
+  assertEq(new Set(mixed).size, mixed.length, "every emitted id is distinct");
+
+  const four = idsOf(renderMarkdown("## A\n\n## A\n\n## A 1\n\n## A"));
+  assertEq(new Set(four).size, four.length, `four headings stay distinct (${four.join(", ")})`);
+
+  const three = idsOf(renderMarkdown("## One\n\n## One\n\n## One"));
+  assertEq(three.join(","), "one,one-1,one-2", "three identical headings get one, one-1, one-2");
+
+  const hrefs = [...renderMarkdown("[[toc]]\n\n## A\n\n## A\n\n## A 1").matchAll(/href="#([^"]*)"/g)].map((m) => m[1]);
+  assertEq(new Set(hrefs).size, hrefs.length, "every TOC anchor target is distinct");
 }
 
 console.log("callouts (#8291 — the answer box needs a real primitive)");
@@ -288,17 +338,73 @@ const FAQ_MD = [
 
 console.log("FAQ answers are harvested from the same markdown the page renders");
 {
-  // A fenced block inside an answer must not leak its contents into the schema.
+  // Fenced code is VISIBLE on the page (<pre><code>), so its content is part of
+  // the answer; its lines are never scanned for headings.
   const fenced = extractFaq(
     "## FAQ\n\n### How?\n\nProse.\n\n```\nsecret();\n```\n",
   );
-  assertEq(fenced[0].answer, "Prose.", "a fenced code block is excluded from the answer");
+  assertEq(fenced[0].answer, "Prose. secret();", "a fenced code block's visible content is part of the answer");
   // A heading deeper than h3 stays inside the answer rather than opening a question.
   assertEq(
     extractFaq("## FAQ\n\n### Q?\n\nIntro.\n\n#### Detail\n\nMore.")[0].answer,
     "Intro. Detail More.",
     "an h4 inside an answer does not start a new question",
   );
+}
+
+console.log("FAQ answers publish the text the page shows (#8294)");
+{
+  const blockquote = extractFaq("## FAQ\n\n### Is it fast?\n\n> Yes, extremely fast.");
+  assertEq(blockquote[0].answer, "Yes, extremely fast.", "a blockquote answer drops the `> ` marker");
+
+  const table = extractFaq(
+    "## FAQ\n\n### Which plan?\n\n| Plan | Price |\n|---|---|\n| Free | $0 |",
+  );
+  assertEq(table[0].answer, "Plan Price Free $0", "a table answer drops pipes and the invisible separator row");
+
+  const callout = extractFaq("## FAQ\n\n### Fast?\n\n> [!NOTE] It is fast.");
+  assertEq(callout[0].answer, "It is fast.", "a callout answer drops the [!NOTE] marker");
+
+  const escaped = extractFaq("## FAQ\n\n### Fast?\n\n> \\[!TIP\\] Try it.");
+  assertEq(escaped[0].answer, "Try it.", "the editor's escaped alert marker is dropped too");
+
+  const codeOnly = extractFaq("## FAQ\n\n### How?\n\n```sh\nnpm i x\n```");
+  assertEq(codeOnly.length, 1, "a code-only answer keeps its question");
+  assertEq(codeOnly[0].answer, "npm i x", "the code block's visible text is the answer");
+  assert(!codeOnly.some((f) => f.answer.includes("`")), "fence markers never reach the schema");
+}
+
+console.log("article JSON-LD wiring (#8294 — BlogPosting + BreadcrumbList, FAQPage only when present)");
+{
+  const post = (body) => ({
+    id: "1",
+    slug: "an-article",
+    title: "An article",
+    body,
+    excerpt: "An excerpt",
+    cover_image_url: null,
+    tags: [],
+    author: null,
+    meta_title: null,
+    meta_description: null,
+    published_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+  });
+  const url = "https://tortoise.premiselabs.co/blog/an-article";
+  const withFaq = articleJsonLd(post("## FAQ\n\n### Q one?\n\nA one.\n\n### Q two?\n\nA two."), url);
+  assertEq(withFaq.length, 3, "an FAQ article emits three schema nodes");
+  assertEq(withFaq[0]["@type"], "BlogPosting", "node 1 is BlogPosting");
+  assertEq(withFaq[1]["@type"], "BreadcrumbList", "node 2 is BreadcrumbList");
+  assertEq(withFaq[2]["@type"], "FAQPage", "node 3 is FAQPage");
+  assertEq(withFaq[2].mainEntity.length, 2, "the FAQPage carries one Question per pair");
+  assertEq(withFaq[2].mainEntity[0].name, "Q one?", "Question.name is the FAQ question");
+  assertEq(withFaq[2].mainEntity[0].acceptedAnswer.text, "A one.", "acceptedAnswer.text is the visible answer");
+
+  const noFaq = articleJsonLd(post("## Just a section\n\nText."), url);
+  assertEq(noFaq.length, 2, "a post with no FAQ emits only two nodes");
+  assert(!noFaq.some((n) => n["@type"] === "FAQPage"), "no FAQPage node without an FAQ section");
+  assert(noFaq.some((n) => n["@type"] === "BlogPosting"), "BlogPosting is still present");
+  assert(noFaq.some((n) => n["@type"] === "BreadcrumbList"), "BreadcrumbList is still present");
 }
 
 console.log("JSON-LD cannot break out of its script element");
