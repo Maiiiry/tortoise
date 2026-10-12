@@ -4589,6 +4589,14 @@ class CollisionPreflightTest(unittest.TestCase):
             f"fix/{ISSUE}-a+b",
             f"chore/{ISSUE}-bump-agent-infra-v0.1.3",
             f"tests/test_{ISSUE}_x.py",
+            # A FILE directly under `.worktrees/` is not a worktree. The name is
+            # the LAST segment and must be a slug: any dot is refused, because a
+            # dot is what a FILE has and `{ISSUE}-notes.markdown` (a file) is
+            # indistinguishable from `{ISSUE}-bump-v0.1.3` (a real branch).
+            f".worktrees/{ISSUE}-notes.md",
+            f".worktrees/{ISSUE}-notes.markdown",
+            f".worktrees/{ISSUE}-bump-v0.1.3",
+            f".worktrees/{ISSUE}-x status",
         ):
             with self.subTest(token=not_an_artifact):
                 self.assertEqual(
@@ -4597,11 +4605,26 @@ class CollisionPreflightTest(unittest.TestCase):
                 )
         # A WORKTREE PATH does extract: it names a directory this tool
         # ENUMERATES, so live/gone is measured against the listing the worktree
-        # surface reports.
-        self.assertEqual(
-            cp.claim_named_artifacts(f"wt `.worktrees/{ISSUE}-x`", ISSUE),
-            ([], [f".worktrees/{ISSUE}-x"], False),
-        )
+        # surface reports. BOTH layouts this repo uses must extract, and a
+        # differently-written reference to the same directory must normalise to
+        # ONE value so it matches the registered path instead of reading as gone.
+        for spelling in (
+            f".worktrees/{ISSUE}-x",
+            f".worktrees/fix/{ISSUE}-x",
+            f"./.worktrees/{ISSUE}-x",
+            f"../elsewhere/.worktrees/{ISSUE}-x",
+            f"/abs/path/.worktrees/{ISSUE}-x",
+        ):
+            # The normalised form is `.worktrees/` + the tail VERBATIM, so a
+            # nested layout keeps its depth — that is what lets it match the
+            # registered path — while every writing of the same NON-nested
+            # directory collapses to one value.
+            expected = ".worktrees/" + spelling.split(".worktrees/", 1)[1]
+            with self.subTest(spelling=spelling):
+                self.assertEqual(
+                    cp.claim_named_artifacts(f"wt `{spelling}`", ISSUE),
+                    ([], [expected], False),
+                )
         self.assertEqual(
             cp.claim_named_artifacts("wt `.worktrees/other-thing`", ISSUE),
             ([], [], False),

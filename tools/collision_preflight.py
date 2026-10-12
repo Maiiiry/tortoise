@@ -3570,9 +3570,14 @@ def _claim_gate_note(
 #     `origin/main` EXACTLY, so it is never demoted either;
 #   * the uncertain band stays a hit BY CONSTRUCTION (an ambiguous case is still
 #     a hit), so it is never demoted.
-# ⛔ RETIRED — NOT CALLED. Everything from `_CLAIM_REF_TOKEN_RE` to the end of
-# `_artifact_shaped` below is retained as the RECORD of four review cycles, each
-# of which found a fresh false CLEAN in the branch arm: the shape test accepted
+# ⛔ RETIRED — each name individually, NOT a range. Dead and NOT CALLED:
+# `_normalize_claim_ref`, `_looks_like_claim_branch`, `_artifact_shaped`, and
+# `_CLAIM_REF_TOKEN_RE` (used only by the first). ⚠️ `_CLAIM_FILE_EXT_RE` below
+# IS LIVE — the worktree arm uses it to refuse a FILE under `.worktrees/` — and
+# so are `_CLAIM_BACKTICK_RE`, `_CLAIM_ARTIFACT_CAP` and `ClaimArtifactVerdict`,
+# which sit after this marker. Do NOT delete them with the retired ones.
+#
+# The retired three are kept as the RECORD of four review cycles, each of which found a fresh false CLEAN in the branch arm: the shape test accepted
 # file paths (`docs/N-notes`, `docs/N-notes.md`), the extension rule let
 # extension-less paths through AND wrongly refused the real branch
 # `chore/1128-bump-agent-infra-v0.1.3`, the refs/ guard dropped prefixed tokens,
@@ -3588,6 +3593,13 @@ _CLAIM_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 # malformed REF like `3061..x` is not mistaken for one — that case belongs to the
 # refused-but-artifact-shaped arm (unmeasured), not to the names-nothing arm.
 _CLAIM_FILE_EXT_RE = re.compile(r"[A-Za-z0-9_-]\.[A-Za-z0-9]{1,5}$")
+# A worktree directory is named after a BRANCH, so its name is a slug. A name
+# containing ANY dot is therefore refused: a dot is what a FILE has, and
+# `3061-notes.markdown` (a file) and `3061-bump-v0.1.3` (a real branch) cannot be
+# told apart — the same indistinguishability that retired the branch arm. The
+# refusal is fail-closed: a claim naming such a worktree names nothing and keeps
+# BLOCKING, so the cost is an over-block, never a false CLEAN.
+_CLAIM_WORKTREE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CLAIM_BACKTICK_RE = re.compile(r"`([^`\n]+)`")
 # Bound the work: a claim names a handful of artifacts, and each branch check is
 # a subprocess. A body that backticks dozens of tokens cannot buy extra git
@@ -3769,13 +3781,30 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str], 
         if not token or ".worktrees/" not in token:
             continue
         tail = token.split(".worktrees/", 1)[1].strip("/")
-        # ⛔ SINGLE SEGMENT ONLY: `.worktrees/3061-x` is a worktree, but
-        # `.worktrees/3061-x/tools/foo.py` is a FILE INSIDE one. The latter
-        # matches no enumerated worktree, which would read as "gone" and demote a
-        # claim that named no artifact. A multi-segment tail names nothing.
-        if not tail or "/" in tail or not number_present(token, issue):
+        # ⛔ The WORKTREE NAME is the LAST segment, and it must (a) carry this
+        # issue's number, (b) carry no FILE EXTENSION, and (c) sit in a tail with
+        # no whitespace — otherwise the token names a FILE, not a worktree:
+        #   `.worktrees/3061-x`               -> worktree
+        #   `.worktrees/fix/3061-x`           -> worktree (this repo uses BOTH
+        #                                        layouts, so depth may not be 1)
+        #   `.worktrees/3061-notes.md`        -> a FILE in `.worktrees/`
+        #   `.worktrees/3061-x/tools/foo.py`  -> a FILE inside a worktree
+        # Extracting a file is a DEMOTION on a claim that named no artifact — the
+        # false-CLEAN direction, and the fifth review found exactly that in the
+        # first of those two shapes.
+        name = tail.rsplit("/", 1)[-1] if tail else ""
+        if (
+            not name
+            or not number_present(name, issue)
+            or not _CLAIM_WORKTREE_NAME_RE.match(name)
+            or any(ch.isspace() for ch in tail)
+        ):
             continue
-        normalized = token.rstrip("/")
+        # Normalise to the `.worktrees/…` TAIL so `./.worktrees/N-x` and
+        # `../elsewhere/.worktrees/N-x` resolve to the same registered worktree as
+        # `.worktrees/N-x`, instead of failing a literal comparison and reading as
+        # gone (a false demotion that the report then calls "gone").
+        normalized = ".worktrees/" + tail
         if normalized not in worktrees:
             worktrees.append(normalized)
     return [], worktrees, unmeasured
@@ -3849,16 +3878,28 @@ def _claim_artifact_verifier(
         return None
 
     def _worktree_state(token: str) -> tuple[str, str] | None:
-        """(live|gone|dead, basis), or None when the listing is unavailable."""
-        if blocks is None:
+        """(live|gone|dead, basis), or None when the measurement is unavailable.
+
+        `token` is already `.worktrees/<tail>` (normalised at extraction), so a
+        registered path is matched by its TAIL. Matching on the tail is what makes
+        a differently-WRITTEN reference to the same live worktree — `./`, an
+        absolute path, a `../other/.worktrees/…` form — resolve to it instead of
+        reading as gone. `normalized.endswith(path)` is deliberately NOT used: it
+        could select a non-exact registered path on a first-match-wins scan.
+
+        ⛔ An EMPTY listing is treated as unmeasured, NOT as an empty answer:
+        `git worktree list` always reports the main worktree of a checked-out
+        repo, so a legitimate `[]` cannot occur, and a missing measurement must
+        never become a downgrade.
+        """
+        if not blocks:
             return None
         normalized = token.rstrip("/")
         for block in blocks:
-            path = block.get("path") or ""
+            path = (block.get("path") or "").rstrip("/")
             if not path:
                 continue
-            if path == normalized or path.endswith(normalized) \
-                    or normalized.endswith(path):
+            if path == normalized or path.endswith(normalized):
                 live, basis = _worktree_liveness(
                     path, block.get("locked"), block.get("prunable"),
                 )
