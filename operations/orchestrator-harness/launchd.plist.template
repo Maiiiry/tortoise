@@ -47,6 +47,8 @@
     <string>__MAX_LANES__</string>
     <key>MAX_REVIEW</key>
     <string>__MAX_REVIEW__</string>
+    <key>MERGE_PRIORITY_AT</key>
+    <string>__MERGE_PRIORITY_AT__</string>
     <key>MAX_FIX</key>
     <string>__MAX_FIX__</string>
     <key>MAX_FIX_TRIES</key>

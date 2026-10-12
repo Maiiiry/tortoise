@@ -158,12 +158,12 @@ fi
 # A limit documented in README §4 and rendered by install.sh must not be silently different in
 # orch-loop.sh — MAX_REVIEW was 2 in the loop and 4 everywhere else.
 rc=0
-for v in MAX_LOAD MAX_LANES MAX_REVIEW MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE BATCH CYC; do
+for v in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE BATCH CYC; do
   a="$(grep -oE "^$v=\"\\\$\{$v:-[0-9]+\}\"" "$LOOP" | grep -oE '[0-9]+' | head -1)"
   b="$(grep -oE "^$v=\"\\\$\{$v:-[0-9]+\}\"" "$INST" | grep -oE '[0-9]+' | head -1)"
   [ -n "$a" ] && [ "$a" = "$b" ] || { echo "      $v: orch-loop=${a:-?} install=${b:-?}"; rc=1; }
 done
-ck "orch-loop.sh defaults match install.sh for all 8 limits" $rc
+ck "orch-loop.sh defaults match install.sh for all 9 limits" $rc
 
 # ── 8) the dispatch gate consults load and names the binding gate ────────────────
 # MAX_LOAD was rendered into the plist and documented, but never compared to anything.
@@ -171,6 +171,8 @@ grep -qE '\[ "\$L" -ge "\$MAX_LOAD" \]' "$LOOP" && rc=0 || rc=1
 ck "dispatch gate compares load against MAX_LOAD" $rc
 grep -q 'GATE_WHY=' "$LOOP" && rc=0 || rc=1
 ck "dispatch skip message names the binding gate" $rc
+grep -q 'merge-priority' "$LOOP" && rc=0 || rc=1
+ck "the loop implements merge-priority above the backlog threshold" $rc
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
 

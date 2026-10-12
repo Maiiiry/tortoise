@@ -20,6 +20,7 @@ OR="${OR:-daniel-ospina/tortoise}"
 MAX_LOAD="${MAX_LOAD:-16}"
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"
+MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
@@ -121,6 +122,7 @@ sed \
   -e "s|__MAX_LOAD__|$MAX_LOAD|g" \
   -e "s|__MAX_LANES__|$MAX_LANES|g" \
   -e "s|__MAX_REVIEW__|$MAX_REVIEW|g" \
+  -e "s|__MERGE_PRIORITY_AT__|$MERGE_PRIORITY_AT|g" \
   -e "s|__MAX_FIX__|$MAX_FIX|g" \
   -e "s|__MAX_FIX_TRIES__|$MAX_FIX_TRIES|g" \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
@@ -152,6 +154,7 @@ cat <<EOF
   repo      $REPO   ($OR)
   limits    lanes=$MAX_LANES review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M batch=$BATCH cycle=${CYC}s
+            merge_priority_at=${MERGE_PRIORITY_AT} open PRs
 
 The loop is NOT running. To start it:
 

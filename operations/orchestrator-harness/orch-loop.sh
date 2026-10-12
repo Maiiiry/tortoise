@@ -13,6 +13,7 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MAX_LOAD="${MAX_LOAD:-16}"
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
+MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"   # above this many open PRs, drain before dispatching
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
@@ -74,6 +75,11 @@ while true; do
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
   OPEN_N="$(gh pr list --repo "$OR" --state open --limit 300 --json number --jq 'length' 2>/dev/null)"; : "${OPEN_N:=0}"
+  # Merge priority: a merge backlog means the box's scarce capacity belongs to review+merge, not to
+  # opening more PRs. Give reviewers extra headroom above the backlog threshold (and section 2 stops
+  # dispatching new lanes). Below it, run a mix. Tune with MERGE_PRIORITY_AT.
+  MR="$MAX_REVIEW"
+  if [ "$OPEN_N" -gt "${MERGE_PRIORITY_AT:-10}" ]; then MR=$((MAX_REVIEW + 2)); fi
   # Scope: >10 open PRs -> BROAD (help drain everyone's). Our OWN patterns are always included
   # even while drafts, because a draft is invisible to the checks below and nothing else would
   # ever ready it — our lanes' own drafts used to stall red forever (#8219, #8085).
@@ -156,7 +162,7 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
               echo "${HEAD_N:-}" > "$O/state/parked-$PR"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
-            elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "${MAX_REVIEW:-4}" ]; then
+            elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ]; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
@@ -193,7 +199,9 @@ PY
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
   GATE_WHY=""
-  if [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
+  if [ "${OPEN_N:-0}" -gt "${MERGE_PRIORITY_AT:-10}" ] && [ "$LANES" -ge 1 ]; then
+    GATE_WHY="merge-priority (${OPEN_N} open PRs — draining before opening more)"
+  elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
   elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ]; then GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M"
   fi
