@@ -70,7 +70,7 @@ import { docsIndexedLabel, docsSourceOn, formatRelativeTime, issuesSourceOn, job
 // session mode; durableConnectKey + usableDurableRows resolve the connect
 // step's gate from the keys-table rows (Never-keys-only embed policy, #2426
 // decision 2).
-import { isManagedKey, durableConnectKey, connectKeyGate, keyDisplayName } from './sessionKey.js'
+import { isManagedKey, durableConnectKey, connectKeyGate, keyDisplayName, heldRowEmbeddable } from './sessionKey.js'
 // #3874: the org's API-key allowance as the SERVER states it — the pre-cap
 // line + the at-cap notices derive from one server field so they cannot
 // desync, and no client-side number is ever fabricated.
@@ -126,6 +126,11 @@ import { readSession, sessionGateAction } from './sessionGate.js'
 // `node --test` unit-tested (authBounce.test.js), and mirrored by the /auth
 // page's return-to allowlist.
 import { authBounceTarget } from './authBounce.js'
+// #1871: what the OAuth return for a LINK flow must do — commit or not, and what
+// to tell the user. Pure and `node --test` unit-tested (linkReturn.test.js); the
+// verdict exists because a link return is the one round-trip that must never
+// continue under an account the user did not start from.
+import { LINK_UID_KEY, linkReturnPlan } from './linkReturn.js'
 
 // #3501: the dashboard talks to its OWN origin. `functions/api/v1/[[path]].ts`
 // resolves the `__Host-session` cookie server-side and attaches the Bearer to
@@ -462,7 +467,7 @@ function SettingsTab(props) {
     state, loading, onResumeSetup,
     github, githubConnected, reposCount, onConnectGithub, githubError,
     githubDisconnect, onOpenGithubDisconnect, onCloseGithubDisconnect, onConfirmGithubDisconnect,
-    sessions, sessionsOn, sessionsLoading,
+    sessions, sessionsOn, sessionsLoading, sessionsLoaded, onRetrySessions,
     memorySourcesProps,
     // #2002 (W6): captured-sessions view/delete consumer props (the W4 seam:
     // W4 built the home + named the seam; W6 consumes it).
@@ -590,6 +595,18 @@ function SettingsTab(props) {
           <p className="dim">
             Session recording is off — new sessions are not captured. Turn it on under Memory sources above.
           </p>
+        ) : !sessionsLoaded ? (
+          /* #3520 (§8): the Captured-sessions screen's own fetch-error state —
+             retryable, and NEVER a fabricated empty list. `sessions` is [] both
+             when the read failed and when the org has no captures, so the
+             `sessionsLoaded` bit is what tells them apart; without it this arm
+             would be unreachable and a failed read would read as "no captures". */
+          <p className="dim small">
+            Couldn&apos;t load captured sessions.{' '}
+            {onRetrySessions && (
+              <button type="button" className="ghost small" onClick={onRetrySessions}>Retry</button>
+            )}
+          </p>
         ) : sessions.length === 0 ? (
           <p className="dim">No captured sessions yet — recordings appear here after your agent's first session.</p>
         ) : (
@@ -604,6 +621,26 @@ function SettingsTab(props) {
                   <li key={sid} className="captured-session" style={{ display: 'flex', gap: '0.75rem', alignItems: 'baseline', padding: '0.35rem 0', borderBottom: '1px solid var(--border,#1e293b)' }}>
                     <span className="small">{fmt(s.created_at)}</span>
                     <span className="dim small">{meta.turns} turns · {meta.extracted} extracted</span>
+                    {/* #3520: the PER-SESSION extraction status — the second
+                        status axis, and the only home for it. `stored`,
+                        `stored-and-processed` and `stored-extraction-failed`
+                        are distinguished here, so a capture that returned 200
+                        having extracted nothing no longer renders as a clean
+                        success. The label comes from capturedSessions.js and
+                        is null on a pre-#3520 payload — nothing is fabricated.
+                        R10: the status region is a POLITE live region, and the
+                        qualifier REPLACES the status word when the server
+                        recorded no outcome (`outcome not recorded`), so an
+                        unknown outcome can never read as `stored`.
+                        There is deliberately NO harness-level rollup of this
+                        axis: the install pill stays `active` beside a failed
+                        session, and no aggregate is computed anywhere. */}
+                    {meta.extractionLabel && (
+                      <span className="capture-state dim small" aria-live="polite"
+                        title={meta.extractionStatus ? `extraction: ${meta.extractionStatus}` : undefined}>
+                        {meta.extractionLabel}
+                      </span>
+                    )}
                     {/* #2600: server-resolved actor (membership email when the
                         seam retains it, else the raw id) — legacy null renders
                         nothing, never a crash. */}
@@ -710,6 +747,16 @@ function SessionTranscriptPanel({ sessionId, detail, loading, error, onRetry, on
     <div className="session-detail" aria-label={`Session ${sessionId} transcript`}>
       <div className="dim small" style={{ margin: '0.5rem 0 0.25rem' }}>
         Transcript — {tm.counts.turns} turns · {tm.counts.extracted} extracted memory
+        {/* #3520: the SAME per-session extraction status the row shows. The
+            detail payload carries the same object and transcriptModel derives
+            it through the same helpers, so an expanded row cannot disagree
+            with the row that opened it — and the two endpoints agree on
+            `extracted` by construction (#3555's unified non-turn predicate). */}
+        {tm.extractionLabel && (
+          <span className="dim small" style={{ marginLeft: '0.5rem' }} aria-live="polite">
+            · {tm.extractionLabel}
+          </span>
+        )}
         {/* #2600: same actor normalization as the row (display or raw id;
             legacy null renders blank, never a crash). */}
         {tm.actor && <span style={{ marginLeft: '0.5rem' }}>{tm.actor.includes('@') ? `by ${tm.actor}` : tm.actor}</span>}
@@ -1323,6 +1370,12 @@ function claimIntentInFlight() {
     setKeysLoadNonce((n) => n + 1)
   }
   const [sessions, setSessions] = React.useState([])
+  // #3520 (§8, the Captured-sessions screen's own state contract): whether a
+  // sessions read has EVER landed for the current team. `sessions === []` is
+  // ambiguous on its own — the fetch failing and an org with no captures both
+  // leave an empty array — so the card rendered "No captured sessions yet" for
+  // a failed read. This is the discriminator the honest fetch-error arm reads.
+  const [sessionsLoaded, setSessionsLoaded] = React.useState(false)
   const [error, setError] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [newKey, setNewKey] = React.useState(null)
@@ -2563,7 +2616,23 @@ function claimIntentInFlight() {
       // then 302s the browser. The app's ?link_flow= search param +
       // sessionStorage marker carry the ref; the mount effect POSTs
       // link-commit on return.
-      try { sessionStorage.setItem('tt_link_flow', intent_ref) } catch { /* best-effort */ }
+      //
+      // #1871: persist the PRE-round-trip uid alongside the ref, exactly as the
+      // same-provider re-auth does (`tt_reauth_pending`). It is the "pre" half
+      // of the return-path comparison: if the provider round-trip comes back as
+      // another account, the mount effect sees it and stops instead of
+      // committing the link under whoever the browser is now signed in as. The
+      // read is the SAME `/api/session` the mount gate uses — there is no client
+      // session to ask.
+      let preLinkUid = null
+      try {
+        const pre = await readSession()
+        preLinkUid = pre.kind === 'signed-in' ? pre.user.id : null
+      } catch { /* best-effort: no stored uid means no client-side comparison */ }
+      try {
+        sessionStorage.setItem('tt_link_flow', intent_ref)
+        sessionStorage.setItem(LINK_UID_KEY, preLinkUid || '')
+      } catch { /* best-effort */ }
       // Navigate — never fetch: the response is a cross-origin redirect and
       // the link call needs the server-held token, which only the BFF has.
       const linkNext = `${window.location.pathname}?link_flow=${encodeURIComponent(intent_ref)}`
@@ -2859,6 +2928,9 @@ function claimIntentInFlight() {
 
   // #1765: OAuth-return intent-ref contract — POST link-commit on return
   // (the server-authority gates must actually run), then land on Profile.
+  // #1871: but ONLY when the round-trip came back as the same account, and only
+  // once the account question has been answered — the verdict is `linkReturnPlan`
+  // (pure, unit-tested).
   // Also resumes a re-auth-pending change-email after the provider round.
   React.useEffect(() => {
     if (!sessionBooted) return  // review-fix: the OAuth-return commit must
@@ -2869,6 +2941,40 @@ function claimIntentInFlight() {
     if (!linkFlow && !reauth) return
     ;(async () => {
       if (linkFlow && sessionTokenRef.current) {
+        let storedUid = null
+        try { storedUid = sessionStorage.getItem(LINK_UID_KEY) || null } catch { /* best-effort */ }
+        // What the browser is signed in as NOW. `/api/session` is the only
+        // authority (the BFF holds the session); `unavailable` is deliberately
+        // not a mismatch — a transient store fault must not read as an account
+        // switch (the #3485 class).
+        let returnedUid = null
+        try {
+          const returned = await readSession()
+          returnedUid = returned.kind === 'signed-in' ? returned.user.id : null
+        } catch { /* best-effort */ }
+        const plan = linkReturnPlan({
+          mismatchFlag: params.get('link_mismatch') === '1',
+          providerError: params.get('link_failed') || '',
+          storedUid,
+          returnedUid,
+        })
+        if (!plan.commit) {
+          // The link did not complete as THIS account. Say so on the profile —
+          // never POST link-commit from here: that is a write, and the account
+          // is exactly what is in doubt (and pointless after a failed
+          // round-trip).
+          setProfileError(plan.notice)
+          setTab('profile')
+          await fetchIdentity()
+          try { sessionStorage.removeItem('tt_link_flow') } catch { /* best-effort */ }
+          try { sessionStorage.removeItem(LINK_UID_KEY) } catch { /* best-effort */ }
+          const u = new URL(window.location.href)
+          u.searchParams.delete('link_flow')
+          u.searchParams.delete('link_mismatch')
+          u.searchParams.delete('link_failed')
+          window.history.replaceState({}, '', u.pathname + u.search + u.hash)
+          return
+        }
         try {
           const res = await api('/v1/user/identity/link-commit', {
             method: 'POST', useSession: true,
@@ -2884,6 +2990,7 @@ function claimIntentInFlight() {
           setProfileError(e.message || 'Could not complete linking — refresh your profile')
         } finally {
           try { sessionStorage.removeItem('tt_link_flow') } catch { /* best-effort */ }
+          try { sessionStorage.removeItem(LINK_UID_KEY) } catch { /* best-effort */ }
           const u = new URL(window.location.href)
           u.searchParams.delete('link_flow')
           window.history.replaceState({}, '', u.pathname + u.search + u.hash)
@@ -4954,6 +5061,7 @@ function claimIntentInFlight() {
       // managedKeys (isManagedKey render filter) + durableConnectKey's
       // rows-resolution keep working off the full payload.
       setSessions(Array.isArray(s) ? s : s.sessions || [])
+      setSessionsLoaded(true)
       // #4355: return the loaded rows so a caller that must decide something
       // from the TRUE state (the rotate catch's ambiguous-failure branch) reads
       // the same payload this call landed in `keys` — state updates are async,
@@ -4964,6 +5072,10 @@ function claimIntentInFlight() {
       // Round-12: a stale switch's error must not land under the newer team's header
       if (orgIdRef.current === _teamAtCall) {
         setError(e)
+        // #3520: the sessions read failed as part of the same Promise.all —
+        // the card must render its retryable error arm, never a fabricated
+        // empty list.
+        setSessionsLoaded(false)
         // #3783 (review P2): Promise.all rejects both reads together, so a
         // failure here means the keys payload never landed. Record it, so the
         // connect gate resolves 'error' (retryable) instead of waiting on a
@@ -5530,6 +5642,10 @@ function claimIntentInFlight() {
     // effect below re-run and schedule a fresh timer.
     resetKeysLoadUnresolved()
     setSessions([])
+    // #3520: same discipline as `setKeysLoaded(false)` above — a switch must
+    // not inherit the previous team's "a sessions read landed" bit, or the
+    // next team's failed read would render as an honest empty list.
+    setSessionsLoaded(false)
     clearSessionDetail()          // #2002 (W6): a switch must never show the previous team's transcript
     setSessionDeletingId(null)
     setSessionsActionError(null)
@@ -6928,10 +7044,14 @@ function claimIntentInFlight() {
   // deleted classifyHeldKey drop hook owned this invariant pre-#2246 (the
   // held slot was cleared when its row died); with no held slot these state
   // strings are the only key material left, so the keys-table reload is the
-  // row-truth source. Guard: keys null/[] = not loaded yet — do nothing, so
-  // the pre-load welcome reveal is never cleared (the provisioned row IS in
-  // the loadAll response after finishWelcomeLoads). Deps [keys] only: a
-  // clear changes welcomeKey/wizardDurableKey, never keys, so no loop.
+  // row-truth source. #4371: the RULE is not declared here — the effect
+  // resolves the row and hands it to `heldRowEmbeddable` (sessionKey.js), the
+  // ONE declaration `durableConnectKey`'s welcome-stale tail also consumes
+  // (the two used to inline the same predicate, held together by prose only).
+  // Guard: keys null/[] = not loaded yet — do nothing, so the pre-load welcome
+  // reveal is never cleared (the provisioned row IS in the loadAll response
+  // after finishWelcomeLoads). Deps [keys] only: a clear changes
+  // welcomeKey/wizardDurableKey, never keys, so no loop.
   React.useEffect(() => {
     if (!keys || keys.length === 0) return
     const rowFor = (plaintext) => {
@@ -6941,14 +7061,12 @@ function claimIntentInFlight() {
     for (const [plaintext, clear] of [[welcomeKey, setWelcomeKey], [wizardDurableKey, setWizardDurableKey]]) {
       if (!plaintext) continue
       const r = rowFor(plaintext)
-      // #2246 (review, P2): a bootstrap/expiring row is dead for embedding
-      // too — symmetric with durableConnectKey's paste tail (sessionKey.js,
-      // identical predicate): a 24h session credential (or any expiring
-      // row) must never back an embed, so a plaintext whose row later
-      // resolves to one is invalidated like any revoked/disabled row.
-      // First-timer welcome keys are provisioned (created_via
-      // 'provisioned'), so this never fires on the legit reveal.
-      if (!r || r.revoked_at || r.enabled === false || r.created_via === 'bootstrap' || !!r.expires_at) clear('')
+      // A bootstrap/expiring row is dead for embedding too — a 24h session
+      // credential (or any expiring row) must never back an embed, so a
+      // plaintext whose row later resolves to one is invalidated like any
+      // revoked/disabled row. First-timer welcome keys are provisioned
+      // (created_via 'provisioned'), so this never fires on the legit reveal.
+      if (!heldRowEmbeddable(r)) clear('')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keys])
@@ -6986,6 +7104,16 @@ function claimIntentInFlight() {
     setSelectedSessionId(null)
     setSessionDetail(null)
     setSessionDetailError(null)
+  }
+
+  // #3520 (§8): the Captured-sessions card's retry. Re-runs the SAME overview
+  // read the card is fed from (`refreshTeam` — the /v1/sessions and onboarding
+  // reads are one batched call), through the same seq guard every other refresh
+  // caller uses, so a retry cannot land a stale team's rows. Failure is already
+  // recorded in `sessionsLoaded`/`error` by `loadAll` — nothing to catch here
+  // beyond not producing an unhandled rejection.
+  function retrySessions() {
+    refreshTeam('', undefined, teamRefreshSeqRef.current).catch(() => {})
   }
 
   // #2002 (W6): delete a captured session (Settings Captured-sessions home,
@@ -9564,6 +9692,8 @@ function claimIntentInFlight() {
             sessions={sessions}
             sessionsOn={!!(onboarding && onboarding.session_recording)}
             sessionsLoading={onboardingLoading}
+            sessionsLoaded={sessionsLoaded}
+            onRetrySessions={retrySessions}
             selectedSessionId={selectedSessionId}
             onViewSession={fetchSessionDetail}
             onClearSessionDetail={clearSessionDetail}
