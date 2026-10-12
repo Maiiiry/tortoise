@@ -14,7 +14,7 @@
 // Run (Node >= 22.6):
 //   node --experimental-strip-types tests/test_blog_markdown.mjs
 
-import { renderMarkdown } from "../website/functions/blog/_lib.ts";
+import { renderMarkdown, extractFaq, faqPageJsonLd, jsonLd } from "../website/functions/blog/_lib.ts";
 
 let failures = 0;
 const ok = (msg) => console.log(`  ✓ ${msg}`);
@@ -227,6 +227,86 @@ console.log("regression — a plain blockquote is untouched by the callout path"
     "<blockquote>Just a quote.</blockquote>",
     "an ordinary blockquote still renders as <blockquote>",
   );
+}
+
+// ── FAQ structured data (#8292) ───────────────────────────────────────────
+console.log("FAQ extraction (#8292 — the schema cannot claim what the page hides)");
+const FAQ_MD = [
+  "## Some section",
+  "",
+  "Body text.",
+  "",
+  "## Frequently asked questions",
+  "",
+  "### What is LLM memory?",
+  "",
+  "LLM memory preserves information across calls. It is distinct from weights.",
+  "",
+  "### Do I need a graph database?",
+  "",
+  "No. Files and relational stores can work too.",
+  "",
+  "### Can markdown work?",
+  "",
+  "- Yes, and it is easy to inspect",
+  "- but test how evidence survives a rewrite",
+].join("\n");
+{
+  const faqs = extractFaq(FAQ_MD);
+  assertEq(faqs.length, 3, "every H3 under the FAQ heading becomes a question");
+  assertEq(faqs[0].question, "What is LLM memory?", "the question is the heading text");
+  assertEq(
+    faqs[0].answer,
+    "LLM memory preserves information across calls. It is distinct from weights.",
+    "the answer is the prose beneath the question, joined",
+  );
+  assertEq(faqs[2].answer, "Yes, and it is easy to inspect but test how evidence survives a rewrite", "list markers are stripped from the answer");
+  assert(faqs.every((f) => f.answer.length > 0), "no empty answers are emitted");
+  assert(
+    !faqs.some((f) => f.question === "Some section"), "a non-FAQ H2 contributes nothing",
+  );
+
+  assert(extractFaq("## Just a section\n\nText.").length === 0, "no FAQ section → no entries");
+  assert(extractFaq("").length === 0, "empty body → no entries");
+  assertEq(
+    extractFaq("## 5 FAQs about memory\n\n### Q?\n\nA.").length,
+    1,
+    "a heading naming FAQs opens a section",
+  );
+
+  const schema = faqPageJsonLd(faqs);
+  assertEq(schema["@type"], "FAQPage", "the node is an FAQPage");
+  assertEq(schema.mainEntity.length, 3, "one Question per pair");
+  assertEq(schema.mainEntity[0].name, faqs[0].question, "Question.name is the question");
+  assertEq(
+    schema.mainEntity[0].acceptedAnswer.text,
+    faqs[0].answer,
+    "acceptedAnswer.text is the answer",
+  );
+  assertEq(faqPageJsonLd([]), null, "no FAQ → no schema node (the caller skips it)");
+}
+
+console.log("FAQ answers are harvested from the same markdown the page renders");
+{
+  // A fenced block inside an answer must not leak its contents into the schema.
+  const fenced = extractFaq(
+    "## FAQ\n\n### How?\n\nProse.\n\n```\nsecret();\n```\n",
+  );
+  assertEq(fenced[0].answer, "Prose.", "a fenced code block is excluded from the answer");
+  // A heading deeper than h3 stays inside the answer rather than opening a question.
+  assertEq(
+    extractFaq("## FAQ\n\n### Q?\n\nIntro.\n\n#### Detail\n\nMore.")[0].answer,
+    "Intro. Detail More.",
+    "an h4 inside an answer does not start a new question",
+  );
+}
+
+console.log("JSON-LD cannot break out of its script element");
+{
+  const tag = jsonLd(faqPageJsonLd(extractFaq("## FAQ\n\n### Q?</script><script>alert(1)</script>\n\nA.")));
+  assert(!tag.includes("</script><script>"), "a `</script>` in the content is neutralised");
+  assert(tag.includes("\\u003c"), "angle brackets are escaped as unicode");
+  assert(tag.startsWith('<script type="application/ld+json">'), "the tag is a JSON-LD script");
 }
 
 console.log("");

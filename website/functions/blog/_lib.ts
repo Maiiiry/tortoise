@@ -185,6 +185,8 @@ function plainText(md: string): string {
   return unescapeMd(md)
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // image → alt text
     .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // link → link text
+    .replace(/^\s*[-*+]\s+/gm, "") // list markers
+    .replace(/^\s*\d+\.\s+/gm, "")
     .replace(/`([^`]*)`/g, "$1")
     .replace(/(\*\*|__)(.*?)\1/g, "$2")
     .replace(/(\*|_)(.*?)\1/g, "$2")
@@ -382,6 +384,86 @@ export function renderMarkdown(markdown: string): string {
   }
 
   return out.join("\n");
+}
+
+// ── FAQ extraction (#8292) ─────────────────────────────────────────────────
+// The `FAQPage` structured data is derived from the SAME markdown the page
+// renders, so the schema can never claim a question the reader cannot see.
+
+export interface FaqEntry {
+  question: string;
+  answer: string;
+}
+
+const FAQ_SECTION_RE = /^##\s+.*(faq|frequently asked)/i;
+
+/**
+ * Pull the question/answer pairs out of an article's FAQ section.
+ *
+ * The section is the `## … FAQ/frequently asked …` block; each `###` heading in
+ * it is a question and the text beneath it is the answer. Returns `[]` when the
+ * article has no FAQ section, so the caller can simply skip the schema.
+ */
+export function extractFaq(markdown: string): FaqEntry[] {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const entries: FaqEntry[] = [];
+  let inFaq = false;
+  let inFence = false;
+  let question: string | null = null;
+  let answer: string[] = [];
+
+  const flush = (): void => {
+    if (question) {
+      const text = plainText(answer.join("\n"));
+      if (text) entries.push({ question, answer: text });
+    }
+    question = null;
+    answer = [];
+  };
+
+  for (const line of lines) {
+    if (/^```/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+
+    const h = /^(#{2,4})\s+(.*)$/.exec(line);
+    if (h) {
+      const level = h[1].length;
+      if (level === 2) {
+        flush();
+        inFaq = FAQ_SECTION_RE.test(line);
+      } else if (level === 3 && inFaq) {
+        flush();
+        question = plainText(h[2]);
+      } else if (inFaq && question) {
+        // An h4 inside an answer is part of that answer — its text is visible
+        // to the reader, so the schema must carry it too.
+        answer.push(h[2]);
+      }
+      continue;
+    }
+
+    if (inFaq && question) answer.push(line);
+  }
+
+  flush();
+  return entries;
+}
+
+/** The `FAQPage` node for an article's FAQ section (or `null`). */
+export function faqPageJsonLd(entries: FaqEntry[]): unknown | null {
+  if (!entries.length) return null;
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: entries.map((e) => ({
+      "@type": "Question",
+      name: e.question,
+      acceptedAnswer: { "@type": "Answer", text: e.answer },
+    })),
+  };
 }
 
 // ── HTML shell ─────────────────────────────────────────────────────────────
