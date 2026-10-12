@@ -18732,6 +18732,13 @@ class TortoiseSDK:
         exclude_turn_echo_session: str | None = None,
         include_terminal: bool = False,
         _elevated_timeout_ms: int | None = None,
+        # #7953 (§17.3): PRIVATE — the residency COORDINATE a NODE-naming read
+        # asked about, as ``label:key`` (``cache_projection.declared_key``).
+        # The read path passes it to the marker so a partial declaration can
+        # tell "outside the known-hot set" from "inside it and genuinely
+        # absent"; a SET read names no node and passes nothing, keeping
+        # today's set-level polarity. Default None = byte-identical.
+        _residency_key: str | None = None,
         pool_size: int | None = None,
         leg_trace: list[dict] | None = None,
         # B6 (#3892): the read-path status sink — one of the four recorded terms
@@ -18827,6 +18834,16 @@ class TortoiseSDK:
             collective-cap override into degradation_chain to measure uncensored
             true-completion latency. Default None = production 500ms cap. Never
             passed by production callers.
+        _residency_key (#7953, §17.3): PRIVATE — the residency coordinate this
+            read named, as ``label:key`` (build it with
+            ``cache_projection.declared_key``, the SAME function the cache
+            projection declares hot keys with). It is handed to the
+            completeness marker (#7952) so a PARTIAL declaration can separate
+            "outside the known-hot set" (a residency miss → fetch the record)
+            from "inside it and genuinely absent" (a real in-store finding).
+            A SET read names no node and leaves this None, which is the
+            set-level polarity the marker already had — so default None is
+            byte-identical behavior.
         leg_trace (R3 #1542 D4): PRIVATE trace contract — when provided,
             appends per-leg entries (vector/fts/structural/fallback — the
             R2 #1541 shared shape {"leg", "ran", "degraded", "reason",
@@ -19025,7 +19042,7 @@ class TortoiseSDK:
                     # router exists yet — #7953), so a zero-hit read of a
                     # declared-partial store is `degraded`, never `empty`.
                     marker = _mark_residency(
-                        _residency, hits=len(rows))
+                        _residency, hits=len(rows), key=_residency_key)
                     status = _apply_residency(
                         status, marker, record_consulted=False)
                     read_status_out[_RESIDENCY_FIELD] = marker

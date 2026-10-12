@@ -972,6 +972,12 @@ surfaces:
   # guards, dry-run is non-destructive, delete verifies 0 remain) and the suite's
   # write/read marker split. No DB, no network — default `core` surface is correct.
   - test_4220_blog_residue_cleanup.py
+  # #7953 (§17.3): the RESIDENCY ROUTER — a cache miss is not an insufficiency.
+  # It pins tortoise/residency_router.py (no SOURCE_PATTERN) and the per-key
+  # coordinate on the shipped read path in tortoise/sdk.py, so a sdk.py change
+  # that stops reporting the coordinate still runs this guard. No hosted route
+  # emits it yet (`#7970` is the consumer), so `core` alone is correct.
+  - test_residency_router.py
   - test_sdk_retirement.py
   - test_record_schema_placement.py
   # #7969 (epic #7879, Interface A): the record projection — journal →
