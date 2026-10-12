@@ -14,8 +14,11 @@ completeness claim had to be re-derived by hand on every rebase.
 This module is that declaration, and it is deliberately **verifiable rather
 than trusted**: ``tools/session_retrofit_audit.py inventory`` re-runs the
 recorded search predicate over the tree and diffs what it finds against
-``SESSION_WRITERS`` / ``SESSION_CLIENTS``. A new writer — or a removed one —
-is `INVENTORY DRIFT`, and ``tests/test_session_schema_3554.py`` fails on it.
+``SESSION_WRITERS`` / ``SESSION_CLIENTS``. The scan is the whole tree minus
+what :data:`PREDICATE` declares excluded (``tests/``/``docs/`` and the
+third-party/cache directory names), so a writer under ANY other directory is a
+site. A new writer — or a removed one — is `INVENTORY DRIFT`, and
+``tests/test_session_schema_3554.py`` fails on it.
 
 **This declares the schema; it does not create one.** Every property below is
 already written by the code named in its row. The declaration exists so that
@@ -104,8 +107,12 @@ class SessionClient:
     """One component that drives a writer over HTTP (or in process).
 
     ``transport`` separates the two: only ``http`` rows are asserted by the
-    predicate, the rest document the route a caller takes so the inventory
-    answers "who can create a session?" and not only "who runs the Cypher?".
+    predicate, the rest enumerate EVERY shipped hook recorder (one per
+    harness: pi/cursor/claude/codex) so the inventory answers "who can create
+    a session?" and not only "who runs the Cypher?". That enumeration is
+    exhaustive, and it is pinned by ``tests/test_session_schema_3554.py`` — a
+    missing ``cli`` row is otherwise invisible, because ``inventory_report``
+    diffs only the ``http`` rows.
     """
     path: str
     transport: str
@@ -415,6 +422,26 @@ SESSION_CLIENTS: tuple[SessionClient, ...] = (
              "`tortoise/__main__.py` client, not a second client.",
     ),
     SessionClient(
+        path="tortoise/codex-hooks/session-end.sh",
+        transport="cli",
+        lane="hook",
+        marker="sessions import --file",
+        note="The Codex recorder shells out to `tortoise sessions import "
+             "--harness codex` — the SAME command family as the Cursor "
+             "recorder and the same `/v1/sessions` contract the Claude seam's "
+             "`session capture` uses, so it is a caller of the "
+             "`tortoise/__main__.py` client, not a second client.",
+    ),
+    SessionClient(
+        path="tortoise/claude-hooks/session-end.sh",
+        transport="cli",
+        lane="hook",
+        marker="session capture",
+        note="The Claude Code recorder shells out to `tortoise session "
+             "capture`, the `tortoise/__main__.py` client's other subcommand "
+             "(it spools then drains), so it too is a caller of that client.",
+    ),
+    SessionClient(
         path="tortoise/capture_spool.py",
         transport="in-process",
         lane="store_sync",
@@ -658,15 +685,19 @@ def iter_declared_properties() -> Iterable[str]:
     return iter(SESSION_PROPERTIES)
 
 
-#: The label + write verbs + client route the source predicate keys on.
-#: Declared HERE, next to the inventory it proves, so the tool cannot silently
-#: widen its own predicate without the same reviewed diff that changes this
-#: dict: the scanner COMPILES :data:`PREDICATE`'s ``write_verbs`` (binding
-#: ``<alias>`` to the variable in the matched literal) AND its ``client_route``
-#: (anchored to the route's full terminal segment), and SKIPS the path prefixes
-#: in ``excluded``. Comments are excluded by construction — the scan is
-#: AST-based, so a Cypher write shape in a ``#`` comment or a docstring is not
-#: a site.
+#: The label + write verbs + client route + SCAN SCOPE the source predicate
+#: keys on. Declared HERE, next to the inventory it proves, so the tool cannot
+#: silently widen OR narrow its own predicate without the same reviewed diff
+#: that changes this dict: the scanner COMPILES :data:`PREDICATE`'s
+#: ``write_verbs`` (binding ``<alias>`` to the variable in the matched literal)
+#: AND its ``client_route`` (anchored to the route's full terminal segment),
+#: and walks the WHOLE tree minus the path prefixes in ``excluded`` and the
+#: directory names in ``skip_parts``. The scope is the predicate, not a private
+#: allow-list inside the tool: an allow-list let a new ``:Session`` writer
+#: under an unlisted directory print INVENTORY CLEAN, the fail-open direction
+#: of a guard whose whole purpose is to be trusted (#3554 review). Comments are
+#: excluded by construction — the scan is AST-based, so a Cypher write shape in
+#: a ``#`` comment or a docstring is not a site.
 PREDICATE = {
     "label": ":Session",
     "write_verbs": (
@@ -674,6 +705,15 @@ PREDICATE = {
         r"\bSET\s+<alias>\.",
     ),
     "client_route": "/v1/sessions",
+    # Path PREFIXES never scanned: a test fixture or a doc table is not a site.
     "excluded": ("tests/", "docs/"),
+    # Directory NAME parts never scanned: VCS metadata, third-party trees, and
+    # generated/cache output. Everything else under the root IS scanned, so
+    # this list must stay limited to trees that can hold no project source.
+    "skip_parts": (
+        ".git", ".venv", "venv", "node_modules", "__pycache__",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next",
+        "dist", "build", "bakeoff",
+    ),
 }
 _SESSION_LABEL_RE = re.compile(r"\(\s*(\w+)\s*:\s*Session\s*[{)$\s]")

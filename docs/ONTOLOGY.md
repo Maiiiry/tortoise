@@ -1286,9 +1286,12 @@ folds that re-create the node on replay.
 **The machine declaration is `tortoise/session_schema.py`** (`SESSION_PROPERTIES`
 / `SESSION_WRITERS` / `SESSION_PROPERTY_OWNERS`). It is authoritative for the
 property set and the owner of each property; this section is its doc mirror,
-and `tools/session_retrofit_audit.py inventory` re-runs the writer predicate and
-fails on drift in either direction (a new writer, or a declared one the
-predicate no longer finds). The per-property owners below **mirror that
+and `tools/session_retrofit_audit.py inventory` re-runs the writer predicate
+over the **whole tree** — minus the path prefixes and third-party/cache
+directories `PREDICATE` declares out of scope — and fails on drift in either
+direction (a new writer, or a declared one the predicate no longer finds). The
+scan scope is part of that declared predicate, not a private allow-list inside
+the tool. The per-property owners below **mirror that
 declaration** and are pinned against it by `tests/test_session_schema_3554.py`
 (an owner cell that disagrees with `SESSION_PROPERTY_OWNERS` fails the test); a
 property with no owning writer is an import-time assertion failure, never a

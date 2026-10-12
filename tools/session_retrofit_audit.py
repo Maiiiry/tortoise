@@ -5,11 +5,16 @@ Two verbs, one instrument, because both answer the same question — *who writes
 a* ``:Session`` *node, and what does the graph hold because of them*:
 
 ``inventory``
-    Re-runs the RECORDED search predicate over the tree and diffs the sites it
-    finds against the declared inventory in ``tortoise/session_schema.py``.
-    The completeness claim is a predicate, never a number: run this on every
-    rebase instead of trusting the table. Exit 1 on any undeclared site (a new
-    writer) or any declared site the predicate no longer finds (a stale row).
+    Re-runs the RECORDED search predicate over the WHOLE tree — minus the
+    path prefixes :data:`PREDICATE` declares ``excluded`` (``tests/``,
+    ``docs/``) and the third-party/cache directory names it declares in
+    ``skip_parts`` — and diffs the sites it finds against the declared
+    inventory in ``tortoise/session_schema.py``. The scope is the predicate,
+    not a private allow-list in this tool, so a ``:Session`` writer under ANY
+    other directory is a site the inventory must declare. The completeness
+    claim is a predicate, never a number: run this on every rebase instead of
+    trusting the table. Exit 1 on any undeclared site (a new writer) or any
+    declared site the predicate no longer finds (a stale row).
 
     Two halves, per #3554's Target:
 
@@ -43,8 +48,8 @@ a* ``:Session`` *node, and what does the graph hold because of them*:
 
     A graph URI is never invented: pass ``--db`` (embedded) or ``--uri`` with
     ``TORTOISE_DB_URI`` set, exactly like ``tools/subject_binding_audit.py``.
-    Without either, the tool reports the classes as UNMEASURED rather than
-    printing a zero that reads like a clean graph.
+    Without either, the verb REFUSES TO RUN — ``SystemExit``, non-zero, nothing
+    printed on stdout — rather than printing a zero for a graph nobody read.
 
 Usage:
     uv run python tools/session_retrofit_audit.py inventory [--root .]
@@ -73,25 +78,14 @@ from tortoise.session_schema import (
     audit_session_retrofit,
 )
 
-#: The predicate's declared scan scope. A directory here is walked for the
-#: file extensions its half needs; ``tests/``/``docs/`` are excluded (the
-#: predicate is a source scan, and a test fixture or a doc table is not a
-#: writer) and ``.venv``/``node_modules`` are third-party.
-SCAN_ROOTS: tuple[str, ...] = (
-    "tortoise", "tools", "graph-scripts", "battery", "benchmarks", "spike",
-    "capability", "integrations", "services", "validation", ".github/scripts",
-)
-SCAN_SKIP_PARTS: frozenset[str] = frozenset(
-    {".venv", "node_modules", "__pycache__", "bakeoff"})
-PY_EXTENSIONS = (".py",)
-CLIENT_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".sh", ".bash")
-
 #: The declaration module itself. Every string in it is a declaration ABOUT a
 #: site — a ``note=`` quoting a writer's Cypher, a ``marker=`` quoting a
 #: client's call — never a site. The module is not a ``:Session`` writer and
 #: cannot be its own client, so scanning it could only manufacture false
 #: positives the inventory can never clear.
 DECLARATION_MODULE = "tortoise/session_schema.py"
+PY_EXTENSIONS = (".py",)
+CLIENT_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".sh", ".bash")
 
 #: A string literal carries the Session alias for the write-verb test.
 _SESSION_ALIAS_RE = re.compile(r"\(\s*(\w+)\s*:\s*Session\s*[{)$\s]")
@@ -271,20 +265,46 @@ def _write_matchers(alias: str) -> tuple[re.Pattern[str], ...]:
                  for verb in PREDICATE["write_verbs"])
 
 
+def _skip_parts() -> frozenset[str]:
+    """The DECLARED directory-name parts the walk never descends into.
+
+    Read from :data:`PREDICATE`'s ``skip_parts`` (the declaration), never from
+    a literal in this tool — so the scan's scope is part of the same reviewed
+    predicate as its verbs and route. This is the ONLY thing that can narrow
+    the walk besides the declared ``excluded`` prefixes.
+    """
+    return frozenset(PREDICATE["skip_parts"])
+
+
 def _iter_source(root: Path, extensions: tuple[str, ...]):
-    for rel_root in SCAN_ROOTS:
-        base = root / rel_root
-        if not base.exists() or base.is_symlink():
+    """Walk the WHOLE tree minus what ``PREDICATE`` declares out of scope.
+
+    The scope is the predicate, not a private allow-list: an allow-list let a
+    ``:Session`` writer under any unlisted tracked directory stay invisible, so
+    ``inventory`` printed INVENTORY CLEAN with an undeclared writer present —
+    the fail-open direction of a guard whose whole purpose is to be trusted
+    (#3554 review). Only the declared ``excluded`` path prefixes and
+    ``skip_parts`` directory names are skipped.
+
+    ``os.walk`` with PRUNED ``dirnames`` rather than ``Path.rglob``: rglob
+    descends into ``.venv``/``.git``/``node_modules`` and filters afterwards,
+    which costs ~25s on this tree; pruning never opens them.
+    """
+    skip_parts = _skip_parts()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in skip_parts)
+        top = Path(dirpath)
+        rel_dir = top.relative_to(root).as_posix()
+        if rel_dir != "." and _excluded(rel_dir + "/"):
+            dirnames[:] = []          # an excluded subtree is not walked
             continue
-        for path in sorted(base.rglob("*")):
-            if path.suffix not in extensions or not path.is_file():
+        for name in sorted(filenames):
+            if Path(name).suffix not in extensions:
                 continue
-            if any(part in SCAN_SKIP_PARTS for part in path.parts):
-                continue
+            path = top / name
             if path.is_symlink():
                 continue
-            rel = path.relative_to(root).as_posix()
-            if rel == DECLARATION_MODULE or _excluded(rel):
+            if path.relative_to(root).as_posix() == DECLARATION_MODULE:
                 continue
             yield path
 

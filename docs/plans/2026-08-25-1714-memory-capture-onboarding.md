@@ -781,9 +781,12 @@ store (`tortoise/sdk.py::_TURN_WRITE_CYPHER`, #3086/#3551) — the row's earlier
 false.
 
 **The re-runnable predicate is the completeness claim.** `tools/session_retrofit_audit.py inventory`
-re-runs the RECORDED search predicate over the tree and diffs the sites it finds against the
-declaration, in both directions; `tests/test_session_schema_3554.py` fails on `INVENTORY DRIFT`. A
-new writer — or a removed one — is a red build, not a stale table.
+re-runs the RECORDED search predicate over the **whole tree** — minus the path prefixes and directory
+names `PREDICATE` declares out of scope (`tests/`, `docs/`, and the third-party/cache directories) —
+and diffs the sites it finds against the declaration, in both directions;
+`tests/test_session_schema_3554.py` fails on `INVENTORY DRIFT`. The scan scope is part of that
+declared predicate, not a private allow-list inside the tool, so a writer under any other directory
+cannot print `INVENTORY CLEAN`. A new writer — or a removed one — is a red build, not a stale table.
 
 **The three D9 decisions — record the gap; do not rewrite the stored record.** All three live in
 `RETROFIT_VERDICTS` (`tortoise/session_schema.py`) with their falsification conditions, and are
@@ -797,6 +800,6 @@ summarised in `docs/ONTOLOGY.md` §4.8:
 
 **Quantification ships as a read-only instrument, not a backfill.**
 `tools/session_retrofit_audit.py retrofit` issues MATCH-only reads against a graph it is given
-explicitly (`--db`, or `--uri` with `TORTOISE_DB_URI`) and refuses to invent one; without a graph it
-reports the classes UNMEASURED rather than printing a zero that reads like a clean graph. Each
-verdict's `where_recorded` field points at §4.8 and at this amendment.
+explicitly (`--db`, or `--uri` with `TORTOISE_DB_URI`); without a graph it REFUSES TO RUN (non-zero
+exit, nothing on stdout) rather than printing a zero that reads like a clean graph. Each verdict's
+`where_recorded` field points at §4.8 and at this amendment.

@@ -95,6 +95,54 @@ def test_declared_http_client_markers_are_present() -> None:
         assert client.marker in text, (client.path, client.marker)
 
 
+def test_declared_clients_name_every_shipped_hook_recorder() -> None:
+    """Every shipped hook recorder is a declared client.
+
+    ``SESSION_CLIENTS``' non-http rows exist so the inventory answers "who can
+    create a session?", not only "who runs the Cypher?" — but
+    ``inventory_report`` diffs only the ``transport == "http"`` rows, so a
+    missing ``cli`` row is invisible to every other guard. Pre-fix two of the
+    four shipped recorders were absent (Claude and Codex; only pi and cursor
+    were declared).
+    """
+    declared = {c.path for c in session_schema.SESSION_CLIENTS}
+    for path in ("tortoise/pi-hooks/tortoise-capture.ts",
+                 "tortoise/claude-hooks/session-end.sh",
+                 "tortoise/codex-hooks/session-end.sh",
+                 "tortoise/cursor-hooks/session-end.sh"):
+        assert path in declared, path
+
+
+def test_scanner_scope_is_the_declared_predicate(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The walk covers the WHOLE tree minus the DECLARED exclusions.
+
+    Pre-fix the scope was a private 11-directory allow-list inside the tool
+    while every statement of the predicate described it as "the tree minus
+    tests/ and docs/": a writer under any unlisted tracked directory
+    (``website/``, ``apps/``, ``operations/``) was invisible, so ``inventory``
+    printed INVENTORY CLEAN with an undeclared writer present — the fail-open
+    direction of a guard whose whole purpose is to be trusted. This pins both
+    halves of the declared scope: the default walk reaches a directory outside
+    the old allow-list, and each declared field drives the walk. Pre-fix the
+    first assertion fails (the allow-list does not contain ``website/``).
+    """
+    pkg = tmp_path / "website" / "src"
+    pkg.mkdir(parents=True)
+    (pkg / "writer.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
+        "website/src/writer.py::QUERY"}
+    # ``excluded`` decides the path prefixes...
+    monkeypatch.setitem(audit.PREDICATE, "excluded", ("website/",))
+    assert audit.scan_graph_writers(tmp_path) == []
+    monkeypatch.setitem(audit.PREDICATE, "excluded", ())
+    # ...and ``skip_parts`` decides the directory names.
+    monkeypatch.setitem(audit.PREDICATE, "skip_parts", ("src",))
+    assert audit.scan_graph_writers(tmp_path) == []
+
+
 #: The declared writers whose property names the scanner CANNOT read from the
 #: source literal: each builds its ``SET`` clause with an f-string (a shared
 #: helper or a ``for prop in (...)`` loop), so no ``s.<prop> =`` name sits in
@@ -326,6 +374,27 @@ def test_retrofit_json_is_valid_json(
     assert payload["short_turn_count"]["all_short"] == 2
     assert payload["entity_links_under_count"]["sessions"] == 1
     assert payload["verdicts"] == session_schema.RETROFIT_VERDICTS
+
+
+def test_retrofit_without_a_graph_refuses_instead_of_printing_a_zero(
+        fake_sdk_module: types.ModuleType, capsys) -> None:
+    """No graph → ``SystemExit`` and NOTHING on stdout.
+
+    The module docstring and the plan amendment used to state that without a
+    graph "the tool reports the classes as UNMEASURED", a path that does not
+    exist: the verb refuses to invent a graph. This pins the actual behaviour
+    (the sentence's intent) so the docs and the code cannot drift apart again —
+    and so a later refactor cannot quietly start printing a zero for a graph
+    nobody read.
+    """
+    with pytest.raises(SystemExit) as exc:
+        audit.main(["retrofit"])
+    assert "--db" in str(exc.value)
+    assert capsys.readouterr().out == ""
+    # The claim and the code agree: neither home still describes an UNMEASURED
+    # *report*. Pre-fix both did, and no code path could produce one.
+    assert "UNMEASURED" not in (audit.__doc__ or "")
+    assert "UNMEASURED" not in PLAN.read_text(encoding="utf-8")
 
 
 class _RecordingGraph(_FakeGraph):
