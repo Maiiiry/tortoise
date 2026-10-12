@@ -171,6 +171,48 @@ function inline(text: string): string {
   return out;
 }
 
+/**
+ * Render a callout body as blocks: prose paragraphs plus real lists. The body
+ * is a blockquote's lines with the `>` prefix already stripped, so a `-`/`1.`
+ * run becomes a <ul>/<ol> instead of one run-on paragraph. Runs of non-list
+ * lines stay a single paragraph (spaces joined), matching the previous shape.
+ */
+function renderCalloutBody(lines: string[]): string {
+  const parts: string[] = [];
+  let buf: string[] = [];
+  const flush = (): void => {
+    if (buf.length) parts.push(`<p>${inline(buf.join(" "))}</p>`);
+    buf = [];
+  };
+  let i = 0;
+  while (i < lines.length) {
+    if (/^[-*]\s+/.test(lines[i])) {
+      flush();
+      const items: string[] = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^[-*]\s+/, ""));
+        i++;
+      }
+      parts.push(`<ul>${items.map((it) => `<li>${inline(it)}</li>`).join("")}</ul>`);
+      continue;
+    }
+    if (/^\d+\.\s+/.test(lines[i])) {
+      flush();
+      const items: string[] = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\d+\.\s+/, ""));
+        i++;
+      }
+      parts.push(`<ol>${items.map((it) => `<li>${inline(it)}</li>`).join("")}</ol>`);
+      continue;
+    }
+    buf.push(lines[i]);
+    i++;
+  }
+  flush();
+  return parts.join("");
+}
+
 // ── Headings, table of contents, callouts ──────────────────────────────────
 // A heading gets a stable `id` so an in-article table of contents (and a shared
 // deep link) has a real target. The slug is derived from the heading's TEXT, so
@@ -195,9 +237,42 @@ function plainText(md: string): string {
     .replace(/^\s*[-*+]\s+/gm, "") // list markers
     .replace(/^\s*\d+\.\s+/gm, "")
     .replace(/`([^`]*)`/g, "$1")
-    .replace(/(\*\*|__)(.*?)\1/g, "$2")
-    .replace(/(\*|_)(.*?)\1/g, "$2")
-    .replace(/~~(.*?)~~/g, "$1")
+    // Mirror inline() exactly: it implements ONLY `**…**` and `*…*`. Stripping
+    // `_`/`__`/`~~` here removed characters the reader still sees (`snake_case`
+    // → `snakecase`, `~~old~~` → `old`), so the slug/TOC label diverged from the
+    // rendered heading. Underscores/tildes are literal text to inline(), so they
+    // must survive this pass too.
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Plain text of a markdown fragment, derived from the renderer itself: render
+ * with the SAME block/inline logic the page uses, then strip the allowlisted
+ * tags and decode the entities `escapeHtml()` emitted. This is what keeps
+ * `FAQPage.acceptedAnswer.text` byte-equal to the visible answer — a second
+ * hand-rolled stripper is what let the two drift.
+ */
+function markdownToText(md: string): string {
+  return htmlToText(renderMarkdown(md));
+}
+
+/** HTML → text for an already-rendered fragment (see `markdownToText`). */
+function htmlToText(html: string): string {
+  return html
+    // A callout's label is chrome (its own styled heading), not answer text.
+    .replace(/<p class="callout-label">[\s\S]*?<\/p>/g, " ")
+    // An image contributes its alt text, the same rule the renderer applies to
+    // a heading label.
+    .replace(/<img[^>]*\balt="([^"]*)"[^>]*>/g, " $1 ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -311,14 +386,11 @@ export function renderMarkdown(markdown: string): string {
       const alert = MD_ALERT_RE.exec(buf[0] ?? "");
       const kind = alert ? MD_ALERTS[alert[1].toUpperCase()] : undefined;
       if (kind && alert) {
-        const body = [alert[2], ...buf.slice(1)]
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .join(" ");
+        const bodyLines = [alert[2], ...buf.slice(1)].map((s) => s.trim()).filter(Boolean);
         out.push(
           `<aside class="callout callout-${kind.slug}">` +
             `<p class="callout-label">${escapeHtml(kind.label)}</p>` +
-            (body ? `<p>${inline(body)}</p>` : "") +
+            renderCalloutBody(bodyLines) +
             `</aside>`,
         );
       } else {
@@ -402,7 +474,9 @@ export function renderMarkdown(markdown: string): string {
 
 // ── FAQ extraction (#8292) ─────────────────────────────────────────────────
 // The `FAQPage` structured data is derived from the SAME markdown the page
-// renders, so the schema can never claim a question the reader cannot see.
+// renders: the question is the rendered heading text and the answer is the
+// RENDERED text of the answer's markdown (markdownToText), so the schema can
+// never claim a question the reader cannot see — or publish text they cannot.
 
 export interface FaqEntry {
   question: string;
@@ -428,7 +502,12 @@ export function extractFaq(markdown: string): FaqEntry[] {
 
   const flush = (): void => {
     if (question) {
-      const text = plainText(answer.join("\n"));
+      // The answer text is the RENDERED text of the answer's own markdown — the
+      // same renderMarkdown() the page uses — so the schema cannot drift from
+      // what the reader sees (underscores/tildes stay, `---` is an <hr>, a lone
+      // `|` line is a paragraph, an unknown `[!WORD]` is literal, `[[toc]]` is
+      // replaced by nav). A second hand-rolled stripper is what let them drift.
+      const text = answer.length ? markdownToText(answer.join("\n")) : "";
       if (text) entries.push({ question, answer: text });
     }
     question = null;
@@ -441,6 +520,9 @@ export function extractFaq(markdown: string): FaqEntry[] {
 
     if (/^```/.test(line)) {
       inFence = !inFence;
+      // Keep the fence markers so markdownToText renders the block as code
+      // (otherwise a `#` inside the snippet would parse as a heading).
+      if (inFaq && question) answer.push(line);
       i++;
       continue;
     }
@@ -472,33 +554,10 @@ export function extractFaq(markdown: string): FaqEntry[] {
       continue;
     }
 
-    if (inFaq && question) {
-      // Blockquote run — mirror the renderer: the `>` prefix and a GitHub alert
-      // marker are block structure the page renders away, so neither is answer
-      // text (the callout label is chrome, not the answer).
-      if (/^>\s?/.test(line)) {
-        const buf: string[] = [];
-        while (i < lines.length && /^>\s?/.test(lines[i])) {
-          buf.push(lines[i].replace(/^>\s?/, ""));
-          i++;
-        }
-        const alert = MD_ALERT_RE.exec(buf[0] ?? "");
-        answer.push(alert ? [alert[2], ...buf.slice(1)].join("\n") : buf.join("\n"));
-        continue;
-      }
-      // Table rows — the separator row is invisible on the page and the pipes
-      // are structure; the reader sees just the cell text.
-      if (/^\|/.test(line.trim())) {
-        if (!/^\|[\s:|-]+\|?$/.test(line.trim())) {
-          answer.push(
-            line.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim()).join(" "),
-          );
-        }
-        i++;
-        continue;
-      }
-      answer.push(line);
-    }
+    // Every other line is kept verbatim; the block structure (blockquote,
+    // table, list, `[[toc]]`) is resolved by the renderer in markdownToText,
+    // so extraction and rendering share one classifier instead of two.
+    if (inFaq && question) answer.push(line);
     i++;
   }
 

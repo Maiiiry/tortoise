@@ -517,33 +517,39 @@ function functionNodes(ast) {
  * a concat, a computed key) counts as an UNATTRIBUTABLE stamp — fail-closed, and
  * the surplus above the expected count names the file.
  */
-function stampCount(relPath) {
-  const ast = parseSource(readFileSync(join(repoRoot, relPath), 'utf8'), relPath)
+function countStamps(ast) {
   let count = 0
   visitNodes(ast.program, (node) => {
     // The same header-name reading as `stampConstants`: case-insensitive, and a
     // computed object key or an unreadable `.set/append` name FAILS CLOSED (counts
-    // as a stamp) because a second CSP is intersected rather than ignored.
+    // as a stamp) — but only when the value is an actual policy binding. A
+    // collection write whose value is not a policy (`map.set(k, n + 1)`) or a
+    // computed member assignment of non-policy data (`out[i] = cond ? html : ""`)
+    // is NOT a stamp; counting those false-positived the guard on unrelated code.
     if (node.type === 'ObjectProperty') {
       const name = cspHeaderName(node.key)
       if (name === 'content-security-policy' && isCspValue(node.value)) count += 1
-      else if (node.computed && name === null) count += 1
+      else if (node.computed && name === null && isCspValue(node.value)) count += 1
       return
     }
     const method = headerCallMethod(node)
     if (method === 'set' || method === 'append') {
       const name = cspHeaderName(node.arguments?.[0])
       if (name === 'content-security-policy' && isCspValue(node.arguments?.[1])) count += 1
-      else if (name === null) count += 1
+      else if (name === null && isCspValue(node.arguments?.[1])) count += 1
     }
     // A third stamp shape: `h["Content-Security-Policy"] = CONST`.
     if (node.type === 'AssignmentExpression' && node.left?.type === 'MemberExpression') {
       const name = cspHeaderName(node.left.property)
       if (name === 'content-security-policy' && isCspValue(node.right)) count += 1
-      else if (name === null && node.left.computed) count += 1
+      else if (name === null && node.left.computed && isCspValue(node.right)) count += 1
     }
   })
   return count
+}
+
+function stampCount(relPath) {
+  return countStamps(parseSource(readFileSync(join(repoRoot, relPath), 'utf8'), relPath))
 }
 
 /**
@@ -648,8 +654,7 @@ function badPolicyBindings(relPath) {
  * `HTML_SITE_POLICY`). Same AST shapes as `stampCount`, so the two cannot
  * disagree about what a stamp is.
  */
-function stampConstants(relPath) {
-  const ast = parseSource(readFileSync(join(repoRoot, relPath), 'utf8'), relPath)
+function stampNames(ast) {
   const names = []
   const record = (node) => {
     if (!isCspValue(node)) {
@@ -679,8 +684,11 @@ function stampConstants(relPath) {
       }
       // A COMPUTED key (`{ [CSP_HDR]: … }`) is as unreadable as a variable passed
       // to `.set`, and the object-property shape is a second way to stamp a header
-      // — so it fails closed the same way rather than being dropped.
-      if (node.computed && name === null) names.push('(unreadable header name)')
+      // — so it fails closed the same way rather than being dropped. Only when the
+      // value is a policy binding, or an unrelated `{ [k]: 1 }` false-positives.
+      if (node.computed && name === null && isCspValue(node.value)) {
+        names.push('(unreadable header name)')
+      }
       return
     }
     const method = headerCallMethod(node)
@@ -688,8 +696,9 @@ function stampConstants(relPath) {
       const name = cspHeaderName(node.arguments?.[0])
       if (name === 'content-security-policy') record(node.arguments?.[1])
       // An UNREADABLE header name (a variable, a concat) means this call may or
-      // may not stamp a CSP, so assuming it does not is a fail-open guess.
-      else if (name === null) names.push('(unreadable header name)')
+      // may not stamp a CSP, so assuming it does not is a fail-open guess — but
+      // only a policy-valued call can be one; `map.set(k, v)` is not.
+      else if (name === null && isCspValue(node.arguments?.[1])) names.push('(unreadable header name)')
     }
     // A third stamp shape: `h["Content-Security-Policy"] = <value>`. Modelled
     // because a browser INTERSECTS a second CSP, and an assignment is the shape a
@@ -697,10 +706,16 @@ function stampConstants(relPath) {
     if (node.type === 'AssignmentExpression' && node.left?.type === 'MemberExpression') {
       const name = cspHeaderName(node.left.property)
       if (name === 'content-security-policy') record(node.right)
-      else if (name === null && node.left.computed) names.push('(unreadable header name)')
+      else if (name === null && node.left.computed && isCspValue(node.right)) {
+        names.push('(unreadable header name)')
+      }
     }
   })
   return names
+}
+
+function stampConstants(relPath) {
+  return stampNames(parseSource(readFileSync(join(repoRoot, relPath), 'utf8'), relPath))
 }
 
 /**
@@ -1806,4 +1821,46 @@ test('the header-call readers see every direct member-call spelling', () => {
   // the set/append filtering — so a non-set method is a read, not a null.
   assert.deepEqual(read('h.get("Content-Type")'), [['get', 'content-type']])
   assert.deepEqual(read('h.set(SOME_VAR, v)'), [['set', null]])
+})
+
+test('the stamp readers ignore unrelated collection writes but fail closed on a policy value', () => {
+  // A false positive here reds the guard on code that touched no header: a
+  // `Map.set` and a computed member assignment are the two shapes that bit
+  // `website/functions/blog/_lib.ts`. They are NOT stamps — but the same shapes
+  // carrying a policy binding still must be, or the guard loses its fail-closed
+  // property. Pinned directly so neither half can regress silently.
+  const count = (src) => countStamps(parseSource(src, 'probe.ts'))
+  const names = (src) => stampNames(parseSource(src, 'probe.ts'))
+
+  assert.equal(count('slugCounts.set(base, n + 1)'), 0, 'a Map.set with a computed value is not a CSP stamp')
+  assert.deepEqual(names('slugCounts.set(base, n + 1)'), [], 'a Map.set records no stamp name')
+  assert.equal(
+    count('out[tocIndex] = top.length ? "<nav></nav>" : ""'),
+    0,
+    'a computed member assignment of non-policy data is not a CSP stamp',
+  )
+  assert.deepEqual(
+    names('out[tocIndex] = top.length ? "<nav></nav>" : ""'),
+    [],
+    'a computed member assignment of non-policy data records no stamp name',
+  )
+
+  assert.equal(count('h.set(HDR_VAR, RELAXED_CSP)'), 1, 'an unreadable .set name with a policy value still fails closed')
+  assert.deepEqual(
+    names('h.set(HDR_VAR, RELAXED_CSP)'),
+    ['(unreadable header name)'],
+    'an unreadable .set name with a policy value is recorded as unattributable',
+  )
+  assert.equal(count('h[HDR_VAR] = RELAXED_CSP'), 1, 'a computed assignment of a policy value still fails closed')
+  assert.deepEqual(
+    names('h[HDR_VAR] = RELAXED_CSP'),
+    ['(unreadable header name)'],
+    'a computed assignment of a policy value is recorded as unattributable',
+  )
+  assert.equal(
+    count('const h = {"Content-Security-Policy": RELAXED_CSP}'),
+    1,
+    'a literal CSP object property still counts',
+  )
+  assert.deepEqual(names('const h = {"Content-Security-Policy": RELAXED_CSP}'), ['RELAXED_CSP'])
 })

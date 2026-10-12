@@ -223,6 +223,34 @@ console.log("TOC labels are plain, escaped text (#8294 — no nested anchor, no 
   assert(linked.includes('<h2 id="read-the-docs">Read the <a href="https://x.com"'), "the heading itself keeps its rendered link");
 }
 
+console.log("TOC labels match the rendered heading text (#8294 — no second stripper)");
+{
+  const tocLabel = (html) => (html.match(/<li><a href="#([^"]*)">([\s\S]*?)<\/a><\/li>/) ?? []).slice(1);
+  // inline() implements only `**…**` and `*…*`; `_`, `__` and `~~` are literal
+  // text it renders. The label/id must be derived from the SAME visible text, or
+  // the TOC entry points at a heading whose text differs from the label.
+  assertEq(
+    tocLabel(renderMarkdown("[[toc]]\n\n## A _B_ C")).join(" → "),
+    "a-b-c → A _B_ C",
+    "an underscored heading keeps the underscores in the label and slug",
+  );
+  assertEq(
+    tocLabel(renderMarkdown("[[toc]]\n\n## A __B__ C")).join(" → "),
+    "a-b-c → A __B__ C",
+    "a double-underscore heading is not stripped (inline() does not implement it)",
+  );
+  assertEq(
+    tocLabel(renderMarkdown("[[toc]]\n\n## A ~~B~~ C")).join(" → "),
+    "a-b-c → A ~~B~~ C",
+    "a strikethrough heading is not stripped (inline() does not implement it)",
+  );
+  assertEq(
+    tocLabel(renderMarkdown("[[toc]]\n\n## **Bold** and `code`")).join(" → "),
+    "bold-and-code → Bold and code",
+    "markup inline() DOES implement is still stripped from the label",
+  );
+}
+
 console.log("heading ids are unique across dedup suffixes (#8294)");
 {
   const idsOf = (html) => [...html.matchAll(/id="([^"]*)"/g)].map((m) => m[1]);
@@ -267,6 +295,32 @@ console.log("callouts (#8291 — the answer box needs a real primitive)");
   assert(
     renderMarkdown("> [!ANSWER] **Bold** claim.").includes("<strong>Bold</strong>"),
     "inline markdown inside an alert body still renders",
+  );
+}
+
+console.log("callout bodies carry lists (#8291 — the Key-takeaways furniture)");
+{
+  const key = renderMarkdown("> [!KEY] Five things\n> - first claim\n> - second claim\n> - third claim");
+  assert(key.includes("<p>Five things</p>"), "the label line stays a paragraph");
+  assert(
+    key.includes("<ul><li>first claim</li><li>second claim</li><li>third claim</li></ul>"),
+    "a bullet run becomes a real <ul>",
+  );
+  assert(!key.includes("- first claim"), "literal bullet markers do not survive into the text");
+
+  const ordered = renderMarkdown("> [!ANSWER] Steps\n> 1. do this\n> 2. then that");
+  assert(
+    ordered.includes("<ol><li>do this</li><li>then that</li></ol>"),
+    "an ordered run becomes a real <ol>",
+  );
+
+  // The pre-callout shape must not regress: non-list lines stay one paragraph.
+  const prose = renderMarkdown("> [!NOTE] Line one\n> line two");
+  assert(prose.includes("<p>Line one line two</p>"), "non-list lines stay a single paragraph");
+  assertEq(
+    renderMarkdown("> [!NOPE] Just a quote."),
+    "<blockquote>[!NOPE] Just a quote.</blockquote>",
+    "an unknown marker still degrades to a blockquote (no list support leaks into it)",
   );
 }
 
@@ -372,6 +426,43 @@ console.log("FAQ answers publish the text the page shows (#8294)");
   assertEq(codeOnly.length, 1, "a code-only answer keeps its question");
   assertEq(codeOnly[0].answer, "npm i x", "the code block's visible text is the answer");
   assert(!codeOnly.some((f) => f.answer.includes("`")), "fence markers never reach the schema");
+}
+
+console.log("FAQ answer text equals the rendered answer text (#8292 — fails if either side changes alone)");
+{
+  // Derive the visible text INDEPENDENTLY in the test: render the answer's
+  // markdown with renderMarkdown, strip the allowlisted tags, decode the
+  // entities. If the extraction side (or the renderer) drifts, this reddens.
+  // The pre-fix extractor failed this on underscores, tildes, `---`/`***`,
+  // a lone pipe line, an unknown `[!WORD]` and `[[toc]]`.
+  const visible = (md) =>
+    renderMarkdown(md)
+      .replace(/<p class="callout-label">[\s\S]*?<\/p>/g, " ")
+      .replace(/<img[^>]*\balt="([^"]*)"[^>]*>/g, " $1 ")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, "&")
+      .replace(/\s+/g, " ")
+      .trim();
+  const faqAnswer = (md) => extractFaq(`## FAQ\n\n### Q?\n\n${md}`)[0]?.answer;
+
+  for (const [name, answerMd] of [
+    ["underscored identifiers survive", "Use snake_case_naming."],
+    ["strikethrough is literal text inline() does not implement", "~~deprecated~~ API is out."],
+    ["a `---` thematic break contributes no answer text", "A paragraph.\n\n---\n\nAnother."],
+    ["a `***` thematic break contributes no answer text", "Before.\n\n***\n\nAfter."],
+    ["a lone pipe line is a paragraph, not a table", "| not a table |"],
+    ["a real table contributes its cell text", "| Plan | Price |\n|---|---|\n| Free | $0 |"],
+    ["an unknown `[!WORD]` marker is literal", "> [!NOPE] Just a quote."],
+    ["a known callout drops its chrome label", "> [!NOTE] It is fast."],
+    ["a `[[toc]]` marker contributes no answer text", "[[toc]]\n\nA."],
+    ["a fence contributes its visible code", "```\nsecret();\n```"],
+  ]) {
+    assertEq(faqAnswer(answerMd), visible(answerMd), `answer text equals the rendered text: ${name}`);
+  }
 }
 
 console.log("article JSON-LD wiring (#8294 — BlogPosting + BreadcrumbList, FAQPage only when present)");
