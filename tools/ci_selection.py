@@ -362,6 +362,20 @@ SOURCE_PATTERNS = {
                    "website/functions/contact/submit.ts",
                    "website/website_architecture.md",
                    "docs/auth-architecture.md",
+                   # #3524: `test_oauth_consent_bridge.py` also pins the two auth
+                   # records its subject is specified in — the consent bridge spec
+                   # (`docs/engineering/auth/consent-identity-bridge.md`) and the
+                   # redirect-allowlist record (`docs/ops/auth-email-flows.md`).
+                   # `docs/` is in NON_PYTHON_PREFIXES, so without these entries a
+                   # docs-only edit to either record selects NO surface and the
+                   # guard never runs on the change it exists to catch (the
+                   # #1349/#3332 silent-drop class, one level up — see
+                   # `docs/auth-architecture.md` above and `test_ci_selection.py::
+                   # test_the_consent_bridge_guard_runs_on_its_docs_records_too`).
+                   # Named as CONCRETE files, not globs: `select()` matches with
+                   # `startswith` and has no glob support.
+                   "docs/engineering/auth/consent-identity-bridge.md",
+                   "docs/ops/auth-email-flows.md",
                    # The guards read the moved Functions themselves — and not only
                    # the gate: `test_admin_return_to.py` reads the gate by exact
                    # path and derives the console's mount path from its directory,
@@ -635,6 +649,14 @@ SOURCE_PATTERNS = {
             # here (in addition to sdk): its only direct unit test is
             # test_metering.py::test_selfhost_transport_exemption.
             "tortoise/metering.py", "tortoise/selfhost.py",
+            # #4489: the retrieval meter. Its writer/reader live in metering.py
+            # (already above) but the module itself is the read-funnel wrapper
+            # and the per-leg hooks' caller, and its guard
+            # (tests/test_retrieval_metering.py) is registered in `api`. Without
+            # this entry a retrieval_metering.py-only diff matched no pattern,
+            # fell through to `core`, and skipped the guard that pins it — the
+            # #7076 self-guard class the test below refuses.
+            "tortoise/retrieval_metering.py",
             "tortoise/transport.py",
             # #2938: EventAPI — the append surface `ingest.py`, `mining.py`,
             # `extractor.py`, `m0.py` and `__main__.py` all write through.

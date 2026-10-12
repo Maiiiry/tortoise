@@ -61,6 +61,34 @@ if ! acq; then
 fi
 trap 'rm -f "$LOCKF"' EXIT INT TERM
 
+# A worker whose log has not grown in this many minutes is hung. `pi -p` has no internal
+# timeout and a runaway child it spawns (a reviewer's `find /` ran for 8 hours on 2026-10-12)
+# keeps the pane alive, so the concurrency caps — which count SESSIONS — silently halve.
+STALE_MIN="${STALE_MIN:-40}"
+
+# ── stale-worker reaper ───────────────────────────────────────────────────────
+# Kill a worker that has gone silent. It only ever touches tmux sessions, so it can never reach
+# the operator's own shell or any process outside the harness. The PR is re-dispatched by the
+# normal sweep on the next cycle (the claim_live() check then sees a dead owner and frees it).
+reap_stale_workers() {
+  local s f age pid
+  for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep -E '^(merge|lane|fix)-'); do
+    f="$O/logs/$s.log"
+    [ -f "$f" ] || continue
+    age=$(( $(date +%s) - $(stat -f '%m' "$f" 2>/dev/null || echo "$(date +%s)") ))
+    [ "$age" -gt $((STALE_MIN * 60)) ] || continue
+    pid="$(tmux list-panes -t "=$s" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    echo "[reap-worker] $s silent ${age}s -> killing session (pane_pid=${pid:-?})" >> "$LOG"
+    # `=name` forces an EXACT session match. Without it tmux prefix-matches, so if this session
+    # exited between the `tmux ls` snapshot above and here, `-t merge-82` would resolve to the
+    # healthy `merge-821` and kill an in-flight worker (verified: `-t zzproof-10` killed
+    # `zzproof-101`, while `-t =zzproof-10` errors instead).
+    tmux kill-session -t "=$s" 2>/dev/null
+    # tmux HUPs the pane's process group; a child that ignored it (e.g. a stuck find) is killed here.
+    if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null; fi
+  done
+}
+
 heartbeat() { date +%s > "$O/heartbeat"; }
 load1() { sysctl -n vm.loadavg 2>/dev/null | awk '{print int($2)}'; }
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
@@ -83,6 +111,7 @@ review_slots() { # <open_prs>
 
 while true; do
   heartbeat
+  reap_stale_workers
   L="$(load1)"
   echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') ===" >> "$LOG"
 
@@ -204,6 +233,27 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
+            fi
+          fi
+        elif echo "$V" | grep -qE 'docs|test-isolation|license-surface|legal-e2e|pricing-artifact'; then
+          # A required check OTHER than the review gate or python CI is red — docs lint, a committed
+          # conflict marker, legal-e2e, test isolation. Nothing re-recorded or reran those, so such a
+          # PR sat red forever with no worker at all (observed: #8278 had conflict markers committed,
+          # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
+          # which now also receives the failing CI log, capped like every other fix loop.
+          NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
+          case "$NFC2" in ''|*[!0-9]*) NFC2=0 ;; esac
+          if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
+            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
+          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+            : # a worker is already on it
+          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ]; then
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+              echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
+              echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
+            else
+              echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
             fi
           fi
         fi

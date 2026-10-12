@@ -19,6 +19,23 @@ export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELD
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
+
+# Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
+# model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
+# silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
+# agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
+# reaper in orch-loop.sh is the second line of defence.
+run_agent() { # run_agent <seconds> <logfile> <promptfile>
+  local t="$1" log="$2" prompt="$3" pid w rc
+  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  pid=$!
+  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$pid" 2>/dev/null; rc=$?
+  kill "$w" 2>/dev/null
+  echo "[timeout] agent pid=$pid wall_limit=${t}s rc=$rc" >> "$log"
+  return "$rc"
+}
 # locate the branch's worktree
 WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
 echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
@@ -35,11 +52,30 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
   echo "[fix $PR] materialised worktree=$WT" >> "$L.log"
 }
 
+# Capture the FAILING REQUIRED CHECK and its log. The fixer is also dispatched for CI failures
+# that are not a reviewer finding (docs lint, a committed conflict marker, legal-e2e,
+# test-isolation, license-surface, pricing-artifact). Without this it would read only the review
+# comment — which for such a PR may not exist at all — and fix blind.
+: > "$L-failing.txt"
+FAILING_CHECKS="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | python3 -c "
+import sys,json
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+print(' '.join(c['name'] for c in d if c.get('state') in ('FAILURE','ERROR','CANCELLED','TIMED_OUT')))
+" 2>/dev/null)"
+for c in $FAILING_CHECKS; do
+  echo "=== failing required check: $c ===" >> "$L-failing.txt"
+  RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq ".[]|select(.name==\"$c\")|.link" 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p' | head -1)"
+  if [ -n "${RID:-}" ]; then gh run view "$RID" --repo "$OR" --log-failed 2>/dev/null | tail -80 >> "$L-failing.txt"; fi
+done
+
 # capture the reviewer's findings (the latest code-review comment on the PR)
 gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 
 cat > "$L-fixer.txt" <<EOF
-You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
+
+If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
@@ -56,7 +92,7 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
-pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$L-fixer.txt")" >> "$L.log" 2>&1
+run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt"
 echo "[fix $PR] fixer done $(date) — re-running merge chain" >> "$L.log"
 # re-run the full chain at the new head
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1

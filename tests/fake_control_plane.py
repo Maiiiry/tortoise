@@ -422,17 +422,24 @@ class FakeControlPlane:
                 self._mint_org_locks[org_id] = lock
             return lock
 
-    def _slot_count(self, org_id: str, now, *, exclude_bootstrap: bool = True) -> int:
-        """#1879: the fake's SQL-side cap predicate — `api_key_slot_count`.
+    def _slot_rows(self, org_id: str, now, *,
+                   exclude_bootstrap: bool = True) -> list[dict]:
+        """#1879/#4550: the fake's ONE cap predicate — the rows
+        `public.api_key_slot_count` would count.
 
-        Mirrors `quota._count_resource("api_keys")` / the migration's
-        `public.api_key_slot_count`: non-revoked, non-expired, and (when
-        `exclude_bootstrap`) created_via not bootstrap — NULL-TOLERANT so a
-        legacy row with no created_via still COUNTS.
+        Non-revoked, non-expired, and (when `exclude_bootstrap`)
+        created_via not bootstrap — NULL-TOLERANT so a legacy row with no
+        created_via still COUNTS. Mirrors
+        `quota._count_resource("api_keys")`.
+
+        ⛔ #4550: this is the ONLY place the predicate is expressed. The
+        `recover_team_key` emulation used to re-derive it inline and dropped
+        the expiry arm, so the fake faithfully reproduced the RPC's own
+        divergence — a second copy of a predicate is how one copy drifts.
         """
         from datetime import UTC, datetime
         now_dt = _as_dt(now) or datetime.now(UTC)
-        n = 0
+        rows: list[dict] = []
         for k in self.tables.get("api_keys", []):
             if k.get("org_id") != org_id or k.get("revoked_at") is not None:
                 continue
@@ -441,8 +448,19 @@ class FakeControlPlane:
                 continue
             if exclude_bootstrap and k.get("created_via") == "bootstrap":
                 continue
-            n += 1
-        return n
+            rows.append(k)
+        return rows
+
+    def _slot_count(self, org_id: str, now, *, exclude_bootstrap: bool = True) -> int:
+        """#1879: the fake's SQL-side cap predicate — `api_key_slot_count`.
+
+        Mirrors `quota._count_resource("api_keys")` / the migration's
+        `public.api_key_slot_count`: non-revoked, non-expired, and (when
+        `exclude_bootstrap`) created_via not bootstrap — NULL-TOLERANT so a
+        legacy row with no created_via still COUNTS.
+        """
+        return len(self._slot_rows(org_id, now,
+                                   exclude_bootstrap=exclude_bootstrap))
 
     def _claim_migrate_created_by(self, org_id: str, user_id: str) -> None:
         """#1765: claim attributes anon-/reg- created_by keys in the team to
@@ -668,6 +686,48 @@ class FakeControlPlane:
                              "embed_revision": revision,
                              "embed_identity_mixed": bool(
                                  p.get("p_identity_mixed"))})
+            return None
+        if fn == "metering_increment_retrieval":
+            # #4489: the retrieval lane's additive upsert on the SAME
+            # ``(org_id, period_start)`` row (migration 20261013000001). The
+            # fake is the ONLY behavioural proxy for this RPC in CI (the SQL
+            # never runs in the Python lane), so it mirrors the SQL: additive
+            # counters and the #4242 window refresh.
+            p = body or {}
+            _ps, _pe = _as_dt(p.get("p_period_start")), _as_dt(
+                p.get("p_period_end"))
+            if _ps is not None and _pe is not None and _pe <= _ps:
+                raise RuntimeError(
+                    "metering_increment_retrieval: period_end must be after "
+                    "period_start")
+            rows = self.tables.setdefault("metering_records", [])
+            row = next((r for r in rows if r["org_id"] == p.get("p_org_id")
+                        and r.get("period_start") == p.get("p_period_start")),
+                       None)
+            counters = {
+                "retrieval_queries": int(p.get("p_queries") or 0),
+                "retrieval_leg_runs": int(p.get("p_leg_runs") or 0),
+                "retrieval_leg_degraded": int(p.get("p_leg_degraded") or 0),
+                "retrieval_wall_ms": float(p.get("p_wall_ms") or 0.0),
+                "retrieval_leg_fts": int(p.get("p_leg_fts") or 0),
+                "retrieval_leg_vector": int(p.get("p_leg_vector") or 0),
+                "retrieval_leg_structural": int(
+                    p.get("p_leg_structural") or 0),
+            }
+            if row:
+                _refresh_period_end(row, p)
+                for key, value in counters.items():
+                    if key.endswith("wall_ms"):
+                        row[key] = float(row.get(key) or 0.0) + value
+                    else:
+                        row[key] = int(row.get(key) or 0) + value
+            else:
+                rows.append({"org_id": p.get("p_org_id"),
+                             "period_start": p.get("p_period_start"),
+                             "period_end": p.get("p_period_end"),
+                             "period": _metering_period_label(
+                                 p.get("p_period_start")),
+                             **counters})
             return None
         if fn == "metering_set_graph_storage":
             # #5331: migration 20261001000005_metering_graph_storage.sql — a GAUGE SETTER mirroring the SQL
@@ -1200,10 +1260,12 @@ class FakeControlPlane:
                     # revoke a live key. (Count-before-insert with >= cap is
                     # outcome-equivalent to the SQL's count-after-insert with
                     # > cap.)
-                    active = [k for k in key_rows
-                              if k.get("org_id") == tid
-                              and k.get("revoked_at") is None
-                              and k.get("created_via") != "bootstrap"]
+                    # #4550: the cap pool is the ONE predicate — `_slot_rows`
+                    # (non-revoked, non-expired, non-bootstrap), exactly what
+                    # the RPC's `api_key_slot_count` count and victim scan now
+                    # share. Re-deriving the predicate inline here is what let
+                    # the expiry arm go missing on this lane.
+                    active = self._slot_rows(tid, now_iso)
                     if len(active) >= cap:
                         # #1872: the victim is the LEAST-RECENTLY-USED key
                         # (never-used first), mirroring recover_team_key's
