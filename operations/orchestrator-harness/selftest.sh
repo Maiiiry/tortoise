@@ -157,6 +157,50 @@ got="$(fc '[{"name":"docs","state":"SUCCESS"},{"name":"python-ci-gate","state":"
 ck "shipped fixer list: a green/in-flight surface yields no failing check" $rc
 fi
 
+# ── 3d) the classifier travels through BASH: no backtick command-substitution ────
+# The checks above extract the Python with awk/sed, so they never exercise the shell. The
+# classifier is built as `V="$(… | python3 -c " <python> ")"`; an UNESCAPED backtick inside that
+# double-quoted string is COMMAND-SUBSTITUTED by bash before Python ever sees it. A comment that
+# spells `gh pr merge --auto` therefore RAN that command every cycle (the exact fail-open this
+# PR exists to close), and a backticked `gh pr checks` spliced a multi-line table into the Python
+# source (SyntaxError -> V="" -> no case arm matched). Extract the real assignment and drive it
+# through a logged `gh` shim so the shell, not an awk extraction, is what runs.
+awk '/^    V="\$\(gh pr checks/{f=1} f{print} /^" 2>\/dev\/null\)"$/{f=0}' "$LOOP" > "$TMP/classify_bash.sh"
+if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
+  mkdir -p "$TMP/bin"
+  cat > "$TMP/bin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'GH_INVOKED: %s\n' "$*" >> "$GH_LOG"
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "checks" ]; then
+  printf '[{"name":"ai-review-gate","state":"SUCCESS"},{"name":"python-ci-gate","state":"SUCCESS"},{"name":"docs","state":"SUCCESS"},{"name":"test-isolation","state":"SUCCESS"},{"name":"license-surface","state":"SUCCESS"},{"name":"legal-e2e","state":"SUCCESS"},{"name":"pricing-artifact","state":"SUCCESS"}]'
+fi
+exit 0
+SH
+  chmod +x "$TMP/bin/gh"
+  # Assemble a driver: the real assignment verbatim, with the bash-side inputs it reads.
+  {
+    printf '%s\n' 'set -u'
+    printf '%s\n' "OR='example/repo'"
+    printf '%s\n' 'PR=8518'
+    printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
+    cat "$TMP/classify_bash.sh"
+    printf '%s\n' 'printf "V=%s\n" "$V"'
+  } > "$TMP/drive.sh"
+  # Only the pipeline's own `gh pr checks <PR> --json …` may run. A `pr merge` (or a bare
+  # `pr checks`) in the log is a backtick leaking out of a comment as an executed command.
+  : > "$TMP/gh.log"
+  out="$(PATH="$TMP/bin:$PATH" GH_LOG="$TMP/gh.log" bash "$TMP/drive.sh" 2>"$TMP/drive.err")"
+  n="$(wc -l < "$TMP/gh.log" | tr -d ' ')"
+  [ "$n" = "1" ] && rc=0 || { rc=1; echo "      gh calls ($n): $(tr '\n' ';' < "$TMP/gh.log")"; }
+  ck "shipped classifier: comments are not executed as commands (exactly one gh call)" $rc
+  if grep -q 'pr merge' "$TMP/gh.log" 2>/dev/null; then rc=1; else rc=0; fi
+  ck "shipped classifier: no backticked \`gh pr merge\` escapes from a comment" $rc
+  if grep -q 'command not found' "$TMP/drive.err" 2>/dev/null; then rc=1; else rc=0; fi
+  ck "shipped classifier: no backticked word is run as a command" $rc
+  case "$out" in *V=GREEN*) rc=0;; *) rc=1; echo "      out: $out";; esac
+  ck "shipped classifier: the bash substitution still yields GREEN" $rc
+fi
+
 # ── 4) the shipped claim block refuses a second owner ────────────────────────────
 # Extracted from merge-one.sh and executed, so this pins the real lock, not a copy of the idiom.
 sed -n '/^CLAIM="\$O\/state\/mergeclaim-\$PR.lock"/,/^trap .rm -f "\$CLAIM".*$/p' "$MERGE" > "$TMP/claim.sh"

@@ -289,7 +289,7 @@ import sys,json
 try: d=json.load(sys.stdin)
 except Exception: print('NOCHECKS'); raise SystemExit
 # The source is either the check-runs API shape (an object carrying a check_runs list) or the flat
-# list `gh pr checks --json` prints. Both normalise to one row list; anything else is unreadable.
+# list \`gh pr checks --json\` prints. Both normalise to one row list; anything else is unreadable.
 rows=d.get('check_runs') if isinstance(d,dict) else d
 if not isinstance(rows,list): print('NOCHECKS'); raise SystemExit
 want='$REQ'.split()
@@ -299,19 +299,19 @@ want='$REQ'.split()
 # not a synonym for non-red: a token this code has never seen (a vendor adds a conclusion, GitHub
 # returns a newer spelling, the value is null) must FAIL CLOSED, so it is RED. The deny-list this
 # replaced named the red tokens and filed EVERYTHING ELSE as PENDING, so an unrecognised or NULL
-# conclusion reached `gh pr merge --auto` instead of blocking - the fail-open the issue is about.
+# conclusion reached \`gh pr merge --auto\` instead of blocking - the fail-open the issue is about.
 NONRED=('success','neutral','skipped','cancelled','stale')
 # IN FLIGHT means a status the API NAMES as in flight - the same five the rail uses. Any OTHER
 # non-completed spelling is judged by its CONCLUSION under the allow-list, so an unrecognised status
 # with a null conclusion is RED, not pending (the rail's #1353 fail-open shape, closed the same
-# way). `expected` is deliberately NOT here: it is not a named in-flight spelling, so a check
+# way). \`expected\` is deliberately NOT here: it is not a named in-flight spelling, so a check
 # GitHub has announced but not reported reads RED - the fail-closed direction, matching the rule.
 INFLIGHT=('queued','in_progress','waiting','requested','pending')
 # One entry per (app, name) - NOT per name: a same-named check under two apps must not let one
-# app's result mask the other's (agent-infra#1714). `app.slug` when the source supplies it (the
-# check-runs API), otherwise the workflow name (`gh pr checks` exposes no app field), and the
+# app's result mask the other's (agent-infra#1714). \`app.slug\` when the source supplies it (the
+# check-runs API), otherwise the workflow name (\`gh pr checks\` exposes no app field), and the
 # NEWEST attempt by id when the source supplies one. Ties, and sources with no id at all, take the
-# last row seen - all the information `gh pr checks` carries.
+# last row seen - all the information \`gh pr checks\` carries.
 groups={}
 for c in rows:
     if not isinstance(c,dict): continue
