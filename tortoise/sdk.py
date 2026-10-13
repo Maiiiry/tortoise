@@ -2683,9 +2683,15 @@ _GRAPH_EVENT_TYPES = frozenset({
 # (`_emit_event` is best-effort). They are left as-is in this increment because
 # reordering them rides the #2194/#2295/#2309 first-registration hardening and
 # its pinned tests; `create_point`'s payload is genuinely post-apply
-# (exception 2). The chokepoint's atomic write removes both windows by
-# construction. Every OTHER live door reaches the journal FIRST and treats the
-# append as the commit point (`_apply_and_journal` does).
+# (exception 2). The `DocumentCreated` arm (#2296) DOES append first (its
+# record is a plain id-keyed entity create, and its append is replay-healable)
+# but shares the fail-soft half: one funnel applies once for every arm, and
+# its Object/Subject/Event blocks pin `test_object_registered_journal.py::
+# test_log_append_failure_warns_and_keeps_live` (an append failure must not
+# crash the create), so a fail-closed arm inside the same function would be a
+# second, contradictory convention. The chokepoint's atomic write removes both
+# windows by construction. Every OTHER live door reaches the journal FIRST and
+# treats the append as the commit point (`_apply_and_journal` does).
 # ═══════════════════════════════════════════════════════════════════════════
 
 # #7951: the envelope keys ``_emit_event`` OWNS. A record that is journalled
@@ -2699,8 +2705,11 @@ _JOURNAL_ENVELOPE_KEYS = (
 )
 
 #: The canonical record types a live entity door may journal.
+# `DocumentCreated` (#2296) joins the set: the last unjournaled canonical
+# create, now appended by `_create_entity`'s Document arm (`.query`-invisible —
+# it folds through `proj.apply`, so no raw-Cypher scan catches it).
 _JOURNALED_ENTITY_EVENT_TYPES = (
-    "ObjectRegistered", "SubjectAdded", "EventRecorded",
+    "ObjectRegistered", "SubjectAdded", "EventRecorded", "DocumentCreated",
 )
 
 
@@ -24004,6 +24013,29 @@ class TortoiseSDK:
             # base behavior.
             from .ids import now_iso
             event["createdAt"] = now_iso()
+        # (#2296) SDK-created Documents journal `DocumentCreated` — the last
+        # unjournaled canonical create. `create_document` and
+        # `create_entity(type='document')` both funnel through here (the label
+        # is normalised to "Source" above, so this arm is keyed on the EVENT
+        # TYPE, not the label); before this they folded live-only, so
+        # `rebuild_all` destroyed every Document they created — disclosed as
+        # #2296's residual by tests/test_unjournaled_mutation_class.py.
+        # NO first-registration probe (unlike Object/Subject, #2194/#2295): the
+        # id is a fresh ulid and `_upsert_document` MERGEs by id, so every
+        # create is a new node. That is what earns the emit-on-every-write
+        # cadence on its own terms — each call mints a distinct id, so there is
+        # no re-check on an existing Document for a probe to be silent about.
+        # `create_source`'s cadence is NOT this one: since #5024 (T6) it is
+        # per-OUTCOME (`SourceCreated` on create/stub-completion,
+        # `SourceVersioned` on a real hash transition, NOTHING on a provable
+        # no-op re-check), and this door deliberately differs by construction
+        # — its id is fresh per call and can never address an existing node.
+        # The append PRECEDES the fold (the module-top ordering contract) so a
+        # crash between the two is replay-healable; the append itself stays
+        # best-effort (an append failure leaves the Document live-only, as the
+        # Object/Subject/Event blocks already do — see KNOWN DEVIATIONS).
+        if event_type == "DocumentCreated":
+            self._journal_entity_event(event)
         # Apply through projection (writes to FalkorDB)
         apply_result = proj.apply(event)
         if label == "Event":
@@ -24804,8 +24836,9 @@ class TortoiseSDK:
 
                     if matched:
                         # #2296 residual, deliberately NOT promised away here: if
-                        # this label's CREATION was never journaled (a `Document`
-                        # made by `_create_entity`), `rebuild_all` does not merely
+                        # this label's CREATION was never journaled (an `Object`
+                        # minted by `_connect_issue_objects`' bare live MERGE,
+                        # which emits no record), `rebuild_all` does not merely
                         # revert the `name`, it DESTROYS the node. The warning
                         # below therefore claims only what the deferred rename
                         # does — it does not promise the node or its siblings
