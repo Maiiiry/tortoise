@@ -10728,6 +10728,29 @@ function claimIntentInFlight() {
                           <ul className="dim small">
                             <li>Deleted: {trashInspect.deleted_at ? fmtTime(trashInspect.deleted_at) : '—'}</li>
                             <li>Restorable archives: {trashInspect.archive_count != null ? trashInspect.archive_count : 0}</li>
+                            {/* #3103 DECISION — this line deliberately keeps the
+                                ENGINE terms, and must NOT be swept to the #2361
+                                memories anchor. The numbers are the backup
+                                ARTIFACT's own counts (latest_backup.node_count /
+                                edge_count): every data node the dump projection
+                                carries — Points INCLUDING operators, Session
+                                nodes, capture receipts — minus the three
+                                export-skip bookkeeping labels. That is NOT the
+                                memory count, which is the non-operator Point
+                                count (team.point_count) behind the Memories card.
+                                Relabelling would assert a number that is not the
+                                memory count — the exact false-equivalence the
+                                billing cards already avoid (Nodes used from the
+                                server node metric vs Memories from point_count,
+                                #4331). The sibling edge count has no user-facing
+                                anchor at all (#2361 anchored only the stored
+                                object), so relabelling the node half alone would
+                                MIX two vocabularies in one phrase — worse than
+                                today. Pinned by the #3103 test in
+                                overview.test.js — read it before relabelling.
+                                OVERRIDES: sweep-every-user-facing-surface-to-the-
+                                anchor (#2361) — deliberately NOT applied here,
+                                this panel is an artifact-side diagnostic. */}
                             {trashInspect.latest_backup ? (
                               <li>
                                 Latest backup:{' '}
