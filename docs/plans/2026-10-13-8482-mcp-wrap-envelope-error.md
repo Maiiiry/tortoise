@@ -34,12 +34,12 @@ part of it this seam must fix to stay self-consistent.
 
 | # | Step | Anchor |
 |---|------|--------|
-| 1 | `tortoise_search` is annotated `-> list[dict]` — a NON-object return | `tortoise/mcp_server.py:2112` |
+| 1 | `tortoise_search` is annotated `-> list[dict]` — a NON-object return | `tortoise/mcp_server.py:2147` (`def tortoise_search`) |
 | 2 | FastMCP turns a non-object annotation into a wrap envelope: `{result: {type: array}, required: [result], x-fastmcp-wrap-result: true}` | `fastmcp/tools/function_parsing.py:349-351` |
-| 3 | `_safe` answers EVERY failure with a **dict** (`_SafeError`), never a list | `tortoise/mcp_server.py:1481,1499` |
+| 3 | `_safe` answers EVERY failure with a **dict** (`_SafeError`), never a list | `tortoise/mcp_server.py:1516,1534` (`_SafeError`, `_safe`) |
 | 4 | `Tool._convert_result` wraps the serialized value **unconditionally** when the flag is set → `{"result": {"error": …}}`, and `is_error` stays **False** | `fastmcp/tools/base.py:363-369` |
 | 5 | A conforming client validates `structuredContent` against `outputSchema` whenever it is PRESENT → `-32602 InvalidParams: data/result must be array`; the SDK's message is discarded | TS SDK `callTool`, `utilsBundle.js:86191-86203` |
-| 6 | Second producer: the transport wait-bound refusal is built OUTSIDE FastMCP's envelope → `{"error": {…}}` with no `result`, while `result` is **required** | `tortoise/mcp_server.py:693-704` |
+| 6 | Second producer: the transport wait-bound refusal is built OUTSIDE FastMCP's envelope → `{"error": {…}}` with no `result`, while `result` is **required** | `tortoise/mcp_server.py:696-706` (`_await_under_mcp_wait_bound`) |
 
 **The discriminator the issue could not find** is the RAISE, not the annotation. The four tools it
 could not separate (`tortoise_check_structure`, `tortoise_packs_list`, `tortoise_list_batches`,
@@ -53,7 +53,7 @@ shape is the **failure delivered in the success channel**.
 
 ## Architecture
 
-One seam: `_wrapped_call_tool` (`tortoise/mcp_server.py:1019`), the documented single dispatch point
+One seam: `_wrapped_call_tool` (`tortoise/mcp_server.py:1046`), the documented single dispatch point
 every tenant tool call crosses, which already inspects result shape (`_mcp_result_count`) and
 classifies failures. When the tool's own advertised schema proves the payload unreadable, the result
 is rewritten to the channel MCP has for failure — `content` kept (it carries the real message),
@@ -138,11 +138,27 @@ No MCP tool is added, removed or renamed — the surface is owner-approved (82 r
 - Reproduced: `tortoise_search` on an SDK raise → `structuredContent={"result":{"error":"Type
   mismatch: expected Null or VectorF32 but was List"}}`, `isError=False`, declared
   `result: array` → the client's own `-32602`. Confirmed end to end through a real MCP session.
-- Red first: `8 failed, 4 passed` with the fix reverted; `12 passed` with it.
-- Repo-wide: 13 registry tools carry the envelope (11 typed + 2 union) — swept, not just the two named.
+- Red first, against `origin/main` (the 12 tests that existed then): `8 failed, 4 passed`;
+  `12 passed` with the fix. Red first for the follow-up tests: `10 failed, 4 passed` with the repair
+  neutralised at runtime (the working-tree-discard guard refuses an in-place revert, #709), `14
+  passed` with it. The 4 that pass either way are the do-not-break guards.
+- Repo-wide: 13 registry tools carry the envelope (11 typed + 2 union) — swept, not just the two
+  named. The guard now forces a refusal for ALL 82 registry tools and validates the result a client
+  would receive against each tool's OWN schema.
 - No regression: `test_mcp_server.py`, `test_mcp_telemetry.py`,
-  `test_mcp_result_count_telemetry.py`, `test_3926_error_prop_guard.py`, `test_markers.py`,
-  `test_ci_timing.py`, `test_ci_selection.py` — 290 + 371 passed. The single failure,
+  `test_mcp_result_count_telemetry.py`, `test_3926_error_prop_guard.py`,
+  `test_transport_wait_bound.py`, `test_surface_guard_pin_4606.py`, `test_markers.py` + the new file
+  — **224 passed, 17 skipped**. `test_ci_selection.py` + `test_ci_timing.py` — **371 passed**.
+  `tools/ci_manifest.py`, `tools/registry_integrity.py`, `tools/surface_manifest.py check` and
+  `tools/surface-guard.py` all exit 0. The one intermittent failure seen earlier,
   `TestOverhead::test_p95_under_5ms`, fails identically on a clean tree (6.70 / 8.92 ms vs
   7.96 / 6.76 / 8.50 ms with the fix; the repair performs ZERO lookups on that path) and is the
   already-filed load-sensitive flake **#3678**.
+- Independent review (fresh context) found four defects in the first commit — the wait-bound retry
+  signal dropped, the wrapped-scalar escape, the repaired failure recorded `ok`, and a tautological
+  class guard with an invalid success sample. All four are fixed and pinned in `aebabcb32`; the
+  dropped retry payload is re-homed on `_meta.tortoise_error`, recorded in
+  `config/surface-manifest.yml`'s `response_fields` (13 entries, the gate cannot see it by design).
+- Known limit, deliberately not closed: the repair recognises the ENVELOPE, not the payload's
+  contents, so array ITEMS violating the declared `items` schema are not caught — no producer in the
+  registry today, and a partial JSON-Schema re-implementation would imply a completeness it lacks.
