@@ -134,11 +134,19 @@ def is_defect(db, name: str, exc: BaseException) -> bool:
     have treated a genuine concurrent deletion as the reload defect. One classifier, reused.
     """
     from tortoise.graph_delete_guard import graph_exists
-    from tortoise.retry import retryable_aborted_write
+    from tortoise.retry import graph_abort_family
 
     try:
-        return bool(retryable_aborted_write(
-            exc, graph_exists=lambda: graph_exists(db, name)))
+        # ⛔ `graph_abort_family`, NOT `retryable_aborted_write`. The latter is a RETRY
+        # predicate: it also returns True for the STATE-INDEPENDENT arms -- the per-graph
+        # write slot's "another write is in progress" and MISCONF -- and it never probes
+        # presence. Using it here meant ordinary write CONTENTION on a HEALTHY graph
+        # authorised the full copy-and-swap: every fleet write between the COPY and the
+        # RENAME was discarded and the tool reported success. Measured by review cycle 2 on
+        # the shipped fakes, with a healthy 1500-node source.
+        # `graph_abort_family` is True ONLY for the graph-deleted-or-replaced literals, and
+        # the presence probe keeps the C-core "empty key" deletion on the UNKNOWN side.
+        return bool(graph_abort_family(exc)) and bool(graph_exists(db, name))
     except Exception:
         return False
 
@@ -256,13 +264,25 @@ def repair(db, name: str, verbose: bool = True) -> tuple[bool, str]:
                                f"swap; clone {scratch} retained")
             say("  [3/4] clone is complete (nodes AND edges) and writable")
 
-            # Re-read immediately before the irreversible step: the section may have outlived
-            # the lock's TTL, and a second run's stale clone must not overwrite a graph the
-            # fleet has written to since.
+            # ⛔ PRESENCE FIRST -- BEFORE THE READ. `fingerprint()` READS, and a read on an
+            # ABSENT graph AUTO-CREATES an empty one (the module's own premise). So testing
+            # presence AFTER the read was both useless (the read had already materialised it)
+            # and DESTRUCTIVE: `now_fp[0] < before_nodes` fired on the re-created empty
+            # graph, and `drop_clone` then DELETED THE ONLY REMAINING COPY -- leaving an
+            # empty `tortoise` and no fallback anywhere. That contradicted this function's
+            # own rule two branches up ("RETAIN the clone: it may be the only copy").
+            # Measured by review cycle 2: 1500/7 nodes before, 0/0 after, clone gone.
+            # The source can genuinely vanish here: the lock TTL is 10 s and NOT renewed,
+            # the section contains a full GRAPH.COPY, and the container is restartpolicy=always.
+            if not graph_exists(db, name):
+                return False, (f"the source {name!r} disappeared during the repair -- clone "
+                               f"{scratch} RETAINED (it may be the only copy)")
             now_fp = fingerprint(db.select_graph(name))
-            if now_fp[0] < before_nodes or not graph_exists(db, name):
-                drop_clone("source changed under us")
-                return False, (f"the source changed during the repair ({now_fp} vs "
+            # Edges too: an edge-only concurrent change is otherwise invisible, and RENAME is
+            # irreversible.
+            if now_fp[0] < before_nodes or now_fp[1] < before_edges:
+                drop_clone("source shrank under us")
+                return False, (f"the source shrank during the repair ({now_fp} vs "
                                f"{(before_nodes, before_edges)}) - refusing to swap over it")
 
             # ATOMIC. `RENAME` overwrites in one step, so there is never a window in which
@@ -285,6 +305,11 @@ def repair(db, name: str, verbose: bool = True) -> tuple[bool, str]:
                        f"did not complete; NOT reporting success")
 
     try:
+        # Presence FIRST: this read would otherwise materialise an empty `tortoise` if the
+        # swap had been immediately undone, and then report a count from the graph it created.
+        if not graph_exists(db, name):
+            return False, ("the swap left no readable source graph -- NOT reporting success; "
+                           "the clone was moved by RENAME and no copy remains")
         after = node_count(db.select_graph(name))
     except Exception as exc:
         return False, (f"the repair ran but the post-repair count could not be read ({exc}) "
