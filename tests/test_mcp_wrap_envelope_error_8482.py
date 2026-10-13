@@ -590,3 +590,101 @@ async def test_the_auth_gate_is_classified_through_a_wrap_envelope(monkeypatch):
     assert result.is_error is True
     assert result.structured_content is None
     assert "Authentication required" in _wire_payload(result)["text"]
+
+
+# ── The two review findings that pin cost and readability ──────────────────
+
+@pytest.mark.asyncio
+async def test_a_union_envelope_is_classified_once_not_every_success(quiet):
+    """A union tool's legitimate non-list success must not be re-classified
+    (via a full `mcp.get_tool` rebuild) on every dispatch.
+
+    `tortoise_delete_entity` returns a bool and `tortoise_query` returns
+    `{results, total, hasMore}` on the paginated path — both non-list, so both
+    reach `_maybe_wrap_envelope_violation` on EVERY success and would resolve
+    the schema each time. `_wrap_envelope_schema` memoises the classification
+    per stored tool, so the rebuild is paid once per tool.
+
+    Non-vacuity is proven in-process: the same 20 dispatches are then measured
+    with the memo NEUTRALISED (`_local_tool_cache_key` forced to ``None``), and
+    the count must double. Before this memo existed the count was the
+    neutralised one for every dispatch.
+    """
+    def _union() -> list[dict] | dict:
+        return {"results": [], "total": 0, "hasMore": False}
+
+    _probe("_8482_union_memo", _union)
+
+    async def _run(*, neutralise: bool) -> int:
+        ms._WRAP_ENVELOPE_SCHEMA_CACHE.clear()
+        seen: list[str] = []
+        real_get_tool = ms.mcp.get_tool
+
+        async def _counting(name, *a, **k):
+            seen.append(name)
+            return await real_get_tool(name, *a, **k)
+
+        patches = [mock.patch.object(ms.mcp, "get_tool", _counting)]
+        if neutralise:
+            patches.append(mock.patch.object(
+                ms, "_local_tool_cache_key", lambda name: None))
+        for p in patches:
+            p.start()
+        try:
+            for _ in range(20):
+                result = await ms.mcp.call_tool("_8482_union_memo", {})
+                assert result.is_error is False
+                assert result.structured_content == {
+                    "result": {"results": [], "total": 0, "hasMore": False}}
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return len(seen)
+
+    try:
+        cached = await _run(neutralise=False)
+        uncached = await _run(neutralise=True)
+    finally:
+        _drop("_8482_union_memo")
+
+    # The neutralised arm is FastMCP's own dispatch lookup PLUS the seam's read
+    # on every call (2 × 20). The memoised arm keeps only the dispatch lookups
+    # plus the ONE classification the cache now holds.
+    assert uncached == 40, (
+        f"neutralised arm measured {uncached} get_tool calls over 20 union "
+        "dispatches; expected 20 dispatch + 20 seam")
+    assert cached == 21, (
+        f"the union success re-resolved the schema per dispatch: {cached} "
+        "get_tool calls (21 = 20 FastMCP dispatch lookups + 1 classification)")
+
+
+@pytest.mark.asyncio
+async def test_a_repaired_error_is_never_message_less(quiet):
+    """A `-> list[dict]` tool that returns `None` ships `{"result": None}` —
+    a schema violation with NO text block. The repair used to rewrite it to
+    `is_error=True` with `content=[]`: an error the caller cannot read, which
+    is exactly the unreadable degradation #8482 exists to prevent. When the
+    kept content is empty the repair must SYNTHESISE a message naming the tool
+    and the violated schema.
+
+    No typed registry tool has this return path today (AST-checked across all
+    11) — the test pins the class, not a live producer.
+    """
+    def _none() -> list[dict]:
+        return None  # type: ignore[return-value]
+
+    _probe("_8482_none", _none)
+    try:
+        result = await ms.mcp.call_tool("_8482_none", {})
+        schema = await _registered_schema("_8482_none")
+    finally:
+        _drop("_8482_none")
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert _schema_validates_against(_wire_payload(result), schema)
+    text = _wire_payload(result)["text"]
+    assert text.strip(), "a repaired error must never be message-less"
+    assert "_8482_none" in text, "the message must name the tool"
+    assert "array" in text, (
+        "the message must name the schema violation it repaired")

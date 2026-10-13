@@ -871,6 +871,43 @@ _WRAP_ENVELOPE_TYPE_CHECKS: dict[str, type | tuple[type, ...]] = {
 }
 
 
+#: Resolved wrap-envelope schemas, keyed by the LOCAL provider component key
+#: (``tool:<name>@<version>``) the schema belongs to. ``mcp.get_tool`` REBUILDS
+#: the tool on every call (measured p50 ≈ 0.13–0.4 ms), and a UNION envelope's
+#: legitimate non-list success (`tortoise_delete_entity` → bool,
+#: `tortoise_query` → ``{results, total, hasMore}``) reaches the pre-filter on
+#: EVERY call — without this the classification would be relearned at a full
+#: rebuild, on the product's read path, for a repair the payload never needed.
+#: The key carries the stored VERSION, and registration is additive-only
+#: (``FastMCPAdapter.register_all`` skips a duplicate) — a name is never
+#: re-registered with a different schema at runtime, so a stale classification
+#: cannot be served. An unreadable schema is never cached.
+_WRAP_ENVELOPE_SCHEMA_CACHE: dict[str, dict | None] = {}
+
+
+def _local_tool_cache_key(name: str) -> str | None:
+    """The local provider's stored key for ``name``, or ``None`` when the name
+    is not served locally (a transform/shim or a mounted provider).
+
+    Cheap by design (no tool rebuild): it reads the provider's component store
+    directly — the same source ``FastMCPAdapter.register_all`` uses for its
+    duplicate check — and is ``getattr``-guarded so an upstream layout change
+    degrades to "not cached", never a crash. ``None`` makes the caller read
+    through ``get_tool`` without caching, exactly as before.
+    """
+    provider = getattr(mcp, "_local_provider", None)
+    components = getattr(provider, "_components", None)
+    if not components:
+        return None
+    matches = [c for c in components.values()
+               if getattr(c, "name", None) == name
+               and hasattr(c, "output_schema")]
+    if not matches:
+        return None
+    return max(matches,
+               key=lambda c: (c.version is not None, str(c.version))).key
+
+
 async def _wrap_envelope_schema(name: str) -> dict | None:
     """The tool's OWN advertised wrap-envelope output schema, or ``None``.
 
@@ -881,15 +918,24 @@ async def _wrap_envelope_schema(name: str) -> dict | None:
     leaves a working tool working. (Fail-closed would be wrong here: an
     object-annotated tool's `_safe` error dict is perfectly valid, and a
     repair applied without the schema to prove the violation would break it.)
+
+    The classification is memoised per stored tool (see
+    ``_WRAP_ENVELOPE_SCHEMA_CACHE``) so a union tool's non-list success pays
+    the rebuild ONCE, not once per call.
     """
+    cache_key = _local_tool_cache_key(name)
+    if cache_key is not None and cache_key in _WRAP_ENVELOPE_SCHEMA_CACHE:
+        return _WRAP_ENVELOPE_SCHEMA_CACHE[cache_key]
     try:
         tool = await mcp.get_tool(name)
     except Exception:  # an unreadable schema must never break a tool call
         return None
     schema = getattr(tool, "output_schema", None)
-    if isinstance(schema, dict) and schema.get("x-fastmcp-wrap-result"):
-        return schema
-    return None
+    if not (isinstance(schema, dict) and schema.get("x-fastmcp-wrap-result")):
+        schema = None
+    if cache_key is not None:
+        _WRAP_ENVELOPE_SCHEMA_CACHE[cache_key] = schema
+    return schema
 
 
 async def _wrap_envelope_result_type(name: str) -> str | None:
@@ -947,20 +993,22 @@ def _maybe_wrap_envelope_violation(result) -> bool:
     """CHEAP pre-filter: could this result violate a wrap envelope at all?
 
     Resolving the schema is NOT free on the dispatch path — it goes through
-    ``mcp.get_tool``, measured here at p50 ≈ 0.4 ms / p95 ≈ 1.2 ms per call
-    because FastMCP rebuilds the tool. Probing it on every tool call would
-    spend that on the whole surface to protect a failure path, so the shapes a
-    violation can have are recognised from data ALREADY on the result, and the
-    schema is resolved only when one is present:
+    ``mcp.get_tool``, measured here at p50 ≈ 0.13–0.4 ms / p95 ≈ 1.2 ms per
+    call because FastMCP rebuilds the tool. Probing it on every tool call
+    would spend that on the whole surface to protect a failure path, so the
+    shapes a violation can have are recognised from data ALREADY on the
+    result, and the schema is resolved only when one is present:
 
     * the transport wait-bound refusal — its payload carries no ``result``;
     * a FastMCP-marked wrap envelope whose ``result`` is NOT a list — a dict is
       the only shape :func:`_safe` ever returns for a failure, and a scalar is
       a payload no array envelope can hold either. A UNION envelope
       legitimately admits the dict — and deciding THAT is precisely what the
-      schema read is for.
+      schema read is for. That read is MEMOISED per stored tool
+      (:data:`_WRAP_ENVELOPE_SCHEMA_CACHE`), so the union success pays it once
+      rather than on every dispatch.
 
-    The healthy path costs two dict lookups: a successful array-envelope tool
+    An ARRAY-envelope success costs two dict lookups and no schema read: it
     carries a list under ``result``, and an object-annotated tool carries no
     ``fastmcp`` wrap marker at all. One deliberate limit: this recognises the
     ENVELOPE, not the payload's contents, so an array whose ITEMS violate the
@@ -1006,7 +1054,7 @@ def _safe_failure_message(payload: Any) -> str | None:
     return None
 
 
-def _schema_error_result(result) -> ToolResult:
+def _schema_error_result(result, name: str, schema: dict) -> ToolResult:
     """Rewrite a schema-violating envelope as an MCP ERROR result.
 
     ``content`` is kept verbatim — it already carries the SDK's real message —
@@ -1014,6 +1062,12 @@ def _schema_error_result(result) -> ToolResult:
     That pair is exactly what a conforming client accepts for a tool it holds
     an output schema for, so the caller can READ the failure instead of the
     -32602 that used to replace it.
+
+    When the kept ``content`` is EMPTY (a tool that returned ``None`` produces
+    ``{"result": None}`` with no text block), a message naming the tool and
+    the violated schema is SYNTHESISED: a repaired error with no message is
+    exactly the unreadable degradation #8482 exists to prevent, so this
+    channel must never be empty.
 
     ``meta`` is preserved (the wait-bound marker decides how the call is
     classified downstream) except FastMCP's own ``wrap_result`` claim, which
@@ -1035,8 +1089,17 @@ def _schema_error_result(result) -> ToolResult:
     inner = payload.get("error") if isinstance(payload, dict) else None
     if isinstance(inner, dict):
         meta[_SCHEMA_ERROR_META_KEY] = inner
+    content = getattr(result, "content", None)
+    if not content:
+        from mcp.types import TextContent
+        declared = ((schema.get("properties") or {}).get("result") or {}).get(
+            "type")
+        detail = f" (result must be {declared})" if isinstance(declared, str) else ""
+        content = [TextContent(type="text", text=(
+            f"Tool '{name}' produced a result that violates its declared "
+            f"output schema{detail}; the failure carried no message."))]
     return ToolResult(
-        content=getattr(result, "content", None),
+        content=content,
         structured_content=None,
         meta=meta or None,
         is_error=True,
@@ -1116,7 +1179,7 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
         if _maybe_wrap_envelope_violation(result):
             envelope = await _wrap_envelope_schema(name)
             if envelope is not None and _violates_wrap_envelope(envelope, payload):
-                result = _schema_error_result(result)
+                result = _schema_error_result(result, name, envelope)
                 if status == "ok":
                     # The seam has just PROVEN this dispatch failed and told the
                     # client so (`is_error`); leaving the row `ok` would put the

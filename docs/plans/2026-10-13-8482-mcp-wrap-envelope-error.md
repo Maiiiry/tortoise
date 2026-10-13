@@ -46,10 +46,10 @@ could not separate (`tortoise_check_structure`, `tortoise_packs_list`, `tortoise
 `tortoise_list_namespaces`) carry the SAME envelope and work — because their SDK calls succeed and
 yield a real list.
 
-**Which side is wrong:** the declared schema. It is the product's *success* contract
-(`tortoise_search` does return an array); widening it to admit the error dict converts a loud
-failure into a silent false negative — the exact failure mode the issue warns against. The wrong
-shape is the **failure delivered in the success channel**.
+**Which side is wrong:** the failure payload, not the declared schema — the schema is the
+product's *success* contract (`tortoise_search` does return an array) and is not relaxed; widening
+it to admit the error dict converts a loud failure into a silent false negative — the exact failure
+mode the issue warns against. The wrong shape is the **failure delivered in the success channel**.
 
 ## Architecture
 
@@ -62,11 +62,18 @@ payload is present) and the schema is **not** relaxed.
 
 Two costs decided the design:
 
-- **The schema read is behind a cheap pre-filter.** `mcp.get_tool` is measured p50 ≈ 0.4 ms /
-  p95 ≈ 1.2 ms per call (FastMCP rebuilds the tool), so probing it unconditionally would tax the
-  whole surface to protect a failure path. `_maybe_wrap_envelope_violation` recognises the two
-  violation shapes from data already on the result; the healthy path is two dict lookups and
-  **zero** schema reads (measured: 0/200 lookups on a successful `tortoise_search`).
+- **The schema read is behind a cheap pre-filter, and memoised.** `mcp.get_tool` is measured
+  p50 ≈ 0.13–0.4 ms / p95 ≈ 1.2 ms per call (FastMCP rebuilds the tool), so probing it
+  unconditionally would tax the whole surface to protect a failure path.
+  `_maybe_wrap_envelope_violation` recognises the two violation shapes from data already on the
+  result; for an **array**-envelope success that is two dict lookups and **zero** schema reads
+  (measured: 0/200 lookups on a successful `tortoise_search`). The two **union** tools have
+  legitimate non-list successes (`tortoise_delete_entity` → bool, `tortoise_query` →
+  `{results, total, hasMore}`), so their success DOES schedule a schema read — but
+  `_wrap_envelope_schema` memoises the classification per stored tool
+  (`_WRAP_ENVELOPE_SCHEMA_CACHE`, keyed `tool:<name>@<version>`), so the rebuild is paid once per
+  tool, not once per dispatch (measured: 40 → 21 `get_tool` calls over 20 union dispatches; the 21st
+  is FastMCP's own dispatch lookup).
 - **Fail-open on an unreadable schema.** The repair only ever applies to a payload PROVEN to
   violate the declared schema, so a tool whose schema cannot be read keeps working. Fail-closed
   would break object-annotated tools, whose `_safe` dict is perfectly valid.
@@ -87,9 +94,11 @@ load-bearing fact: absent payload + `isError` is accepted; present payload is al
 about a payload nobody can read.
 **Acceptance:** for every array-envelope tool, a `_safe` failure and the wait-bound refusal both
 produce `is_error=True` with no `structured_content` and the message intact; a union envelope and an
-object tool are untouched; the success path performs zero schema reads.
+object tool are untouched; the array-envelope success path performs zero schema reads, and a union
+tool's success pays at most one memoised classification.
 **Files:**
-- Modify: `tortoise/mcp_server.py` (`_wrap_envelope_schema`, `_wrap_envelope_result_type`,
+- Modify: `tortoise/mcp_server.py` (`_WRAP_ENVELOPE_SCHEMA_CACHE`, `_local_tool_cache_key`,
+  `_wrap_envelope_schema`, `_wrap_envelope_result_type`,
   `_violates_wrap_envelope`, `_maybe_wrap_envelope_violation`, `_safe_failure_message`,
   `_schema_error_result`; the repair in `_wrapped_call_tool`)
 
@@ -159,6 +168,12 @@ No MCP tool is added, removed or renamed — the surface is owner-approved (82 r
   class guard with an invalid success sample. All four are fixed and pinned in `aebabcb32`; the
   dropped retry payload is re-homed on `_meta.tortoise_error`, recorded in
   `config/surface-manifest.yml`'s `response_fields` (13 entries, the gate cannot see it by design).
+- The repair never ships a message-less error: a `-> list[dict]` tool that returns `None` produces
+  `{"result": None}` with no text block, so `_schema_error_result` SYNTHESISES a text block naming
+  the tool and the violated schema when the kept `content` is empty. No typed registry tool has
+  that return path today (AST-checked across all 11), but a repaired error with no message is
+  exactly the unreadable degradation this issue is about, so the channel is closed rather than
+  documented as a limit.
 - Known limit, deliberately not closed: the repair recognises the ENVELOPE, not the payload's
   contents, so array ITEMS violating the declared `items` schema are not caught — no producer in the
   registry today, and a partial JSON-Schema re-implementation would imply a completeness it lacks.
