@@ -15,10 +15,13 @@ pytest run.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import pathlib
 import subprocess
 import sys
+import types
+import warnings
 from pathlib import Path
 
 import pytest
@@ -1212,6 +1215,166 @@ def test_code_digest_is_move_invariant_and_constant_sensitive():
     exec(compile(spaced, "<t>", "exec"), g2)
     assert g1["f"].__code__.co_firstlineno != g2["f"].__code__.co_firstlineno
     assert guard._code_digest(g1["f"].__code__) == guard._code_digest(g2["f"].__code__)
+
+
+# ── #4828: the two drivers must carry ONE identity contract ──────────────────
+#
+# `tools/surface_manifest.py` and `tools/surface-guard.py` each carry their own copy of
+# `_code_digest` / `_attribute_digest` / `_served_attributes` — the #3863 gate's identity
+# contract — with NOTHING comparing them. Two copies of an identity function are two
+# answers to one question, and the disagreement is SILENT: each gate still compares the
+# declaration against the baseline it produced with its own copy. A fix folded into one
+# copy (a new `co_*` attribute, a changed truncation length, a changed const-recursion
+# rule) left the other stale, and the two gates then disagreed about the identity of the
+# SAME served handler. THIS section is the contract that holds them together; unifying
+# the trio into a single shared module is #4828's remaining step.
+
+PINNED_CODE_DIGEST = "7441f0e919010609"
+
+IDENTITY_FUNCTIONS = ("_code_digest", "_attribute_digest", "_served_attributes")
+
+
+def _identity_fixture_code():
+    """A DETERMINISTIC code object carrying a docstring, a nested code object and a
+    non-ASCII constant.
+
+    Built with `co_code=b""` on purpose. A COMPILED fixture's bytecode is a function of
+    the interpreter version, so a digest pinned over one would differ between CI's 3.12
+    and a developer's newer CPython — a red test that says nothing about this change. An
+    empty bytecode is accepted by `CodeType.replace` on 3.12 and 3.14 alike (measured),
+    and `_code_digest` reads only `co_code`, `co_names`, `co_varnames`, `co_freevars`,
+    `co_cellvars` and `co_consts` — every one of which is set explicitly below, so the
+    pinned value is interpreter-independent (verified: the same digest on 3.12.13 and
+    3.14.6).
+    """
+    base = (lambda: None).__code__
+    # The nested object is synthetic too — recursing into a COMPILED one would drag its
+    # version-specific bytecode back into the pinned value.
+    nested = base.replace(co_code=b"", co_consts=(None,), co_names=())
+    return base.replace(
+        co_code=b"",
+        # [0] is the docstring slot, which is what makes the digest docstring-sensitive.
+        co_consts=("dóc—ünïcode", nested, None),
+        co_names=("name_a", "name_b"),
+    )
+
+
+def _contract_shapes(name: str) -> dict[str, str]:
+    """{module: `name`'s definition as AST} for every tooling module that DEFINES it.
+
+    Parsed, not grepped: the drivers' own comments name `_code_digest` a dozen times, so a
+    text scan fires on prose (measured: the grep form false-positived on a stub the pin
+    test embeds as a string). An AST walk answers the question actually asked — is this
+    name DEFINED here — and it is also the only form that catches an unused second copy.
+
+    The DOCSTRING is dropped before comparing: the two drivers legitimately frame the same
+    rule for their own file, and prose is not the contract. Comments are not in an AST at
+    all, so those are free to differ too — only the CODE must agree.
+
+    Scope is `tools/` + `graph-scripts/` (the tooling tree, where another copy would live),
+    not the whole repo: parsing `tests/` costs ~6s against ~0.8s for this set, and a test
+    module is not a home for the gate's identity contract.
+    """
+    shapes: dict[str, str] = {}
+    for package in ("tools", "graph-scripts"):
+        for path in (ROOT / package).rglob("*.py"):
+            if "fixtures" in path.parts:
+                continue
+            # Parsing every module surfaces OTHER modules' pre-existing `SyntaxWarning`s
+            # (a legacy `"\."` in a graph-script). This scan is not a lint gate, so it must
+            # not turn someone else's latent warning into noise here.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                    if (
+                        node.body
+                        and isinstance(node.body[0], ast.Expr)
+                        and isinstance(node.body[0].value, ast.Constant)
+                        and isinstance(node.body[0].value.value, str)
+                    ):
+                        node.body = node.body[1:]
+                    shapes[str(path.relative_to(ROOT))] = ast.dump(node)
+    return shapes
+
+
+def test_the_two_drivers_carry_one_identity_contract():
+    """#4828: the drivers' copies of the identity contract must not diverge.
+
+    The defect this closes: both drivers carried their own copy of the trio with nothing
+    comparing them, so a fix folded into one copy left the other stale — and the two gates
+    then disagreed about the identity of the SAME served handler, silently, because each
+    still compared against the baseline it produced with its own copy.
+
+    Asserted over EVERY tooling module that defines a name in the trio, not over the two
+    drivers by name: a THIRD copy is caught wherever it appears, and the assertion survives
+    #4828's remaining step (unifying the trio into one shared module), which shrinks this
+    to a single shape instead of breaking it.
+    """
+    drivers = ((_load_guard(), "surface-guard.py"), (_load_manifest_tool(), "surface_manifest.py"))
+
+    for fn_name in IDENTITY_FUNCTIONS:
+        shapes = _contract_shapes(fn_name)
+        assert shapes, f"nothing in the tooling tree defines {fn_name}"
+        assert len(set(shapes.values())) == 1, (
+            f"the copies of {fn_name} have DIVERGED — {', '.join(sorted(shapes))} no longer "
+            "agree, so the two gates can disagree about the identity of the same served "
+            "handler. Apply the fix to every copy, or unify them (#4828)."
+        )
+        for driver, label in drivers:
+            assert callable(getattr(driver, fn_name, None)), (
+                f"{label} no longer exposes {fn_name} — the gate would fail at call time"
+            )
+
+
+def test_the_code_digest_is_pinned_docstring_sensitive_and_driver_independent():
+    """#4828: both drivers digest the SAME fixture to the SAME pinned value.
+
+    From the two drivers' own entry points, not from a shared helper: the two are asserted
+    to agree here because THAT agreement is the contract (see the parity test above). The
+    pinned value freezes the ALGORITHM: a fix applied to one copy, a new `co_*` attribute
+    folded in, a changed truncation length or a changed const-recursion rule all move it,
+    so the drift cannot land as a silent parity break. The properties are pinned alongside
+    it because each is load-bearing and each was expensive to measure: a docstring lives in
+    `co_consts[0]` (so the digest is docstring-sensitive), a nested code object must be
+    RECURSED (its repr carries a memory address and is not stable), a non-ASCII constant
+    must encode deterministically, and a pure code move must not count as a served change
+    (`co_firstlineno` is excluded).
+    """
+    guard = _load_guard()
+
+    fixture = _identity_fixture_code()
+
+    # The fixture really carries what the docstring above claims, or the value below
+    # pins a shape nobody meant to freeze.
+    assert any(isinstance(c, types.CodeType) for c in fixture.co_consts), "no nested object"
+    docstrings = [c for c in fixture.co_consts if isinstance(c, str)]
+    assert docstrings and not docstrings[0].isascii(), "no non-ASCII docstring constant"
+
+    digest = guard._code_digest(fixture)
+    assert digest == PINNED_CODE_DIGEST, (
+        f"the digest algorithm changed ({digest} != {PINNED_CODE_DIGEST}) — if that is "
+        "intended, re-derive and re-cut the BASELINE in the same PR"
+    )
+    assert _load_manifest_tool()._code_digest(fixture) == digest, (
+        "the manifest driver digests this fixture differently — the two gates disagree "
+        "about the identity of the same served handler"
+    )
+
+    # A docstring-only edit must move the digest.
+    docstring_edit = fixture.replace(
+        co_consts=("dóc—ünïcode CHANGED", fixture.co_consts[1], fixture.co_consts[2]),
+    )
+    assert guard._code_digest(docstring_edit) != digest
+
+    # A pure line shift must NOT (the served behaviour is unchanged).
+    assert guard._code_digest(fixture.replace(co_firstlineno=9999)) == digest
+
+    # ...and neither must `co_filename`/`co_qualname`, which move with a rename.
+    assert guard._code_digest(
+        fixture.replace(co_name="renamed", co_filename="/elsewhere/t.py")
+    ) == digest
 
 
 def test_served_attributes_sees_what_the_code_object_cannot():

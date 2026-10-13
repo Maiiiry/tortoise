@@ -1320,6 +1320,33 @@ def test_test_lane_tool_change_selects_core_not_tier1():
     assert set(r["test_files"]) != _tier1()
 
 
+def test_surface_tooling_change_selects_core_and_the_parity_net():
+    # #4828: tools/surface_manifest.py and tools/surface-guard.py carry the #3863
+    # surface gate, and tools/_code_identity.py is the shared identity contract
+    # both now import. All three were swallowed by the flat "tools/"
+    # NON_PYTHON_PREFIXES entry (no SOURCE_PATTERNS entry matches any of them), so
+    # a driver-only or contract-only edit selected NO surface and fell back to
+    # tier-1 smoke — where neither the parity net (tests/test_surface_manifest.py:
+    # both drivers must hand back the SAME `_code_digest`) nor the pin test
+    # (tests/test_surface_guard_pin_4606.py) runs. A fix applied to ONE copy was
+    # therefore invisible to the very suite that compares the copies.
+    for path in ("tools/surface_manifest.py", "tools/surface-guard.py",
+                 "tools/_code_identity.py"):
+        r = _sel([path])
+        assert r["full"] is False, (path, r)
+        assert "core" in r["surfaces"], (path, r)
+        assert set(r["test_files"]) != _tier1(), (path, r)
+
+    r = _sel(["tools/_code_identity.py"])
+    # The fast half of the net: the pin that protects the shared contract.
+    assert "test_surface_guard_pin_4606.py" in r["test_files"], r
+    # The slow half: test_surface_manifest.py is `core`-owned AND a slow file, so
+    # the selection must turn the slow leg on and name it — a `core` surface that
+    # did not would silently skip the parity net it was registered for.
+    assert r["slow_run"] is True, r
+    assert "test_surface_manifest.py" in r["slow_selected"], r
+
+
 def test_queue_conflict_census_tool_change_selects_core_not_tier1():
     # #6138 review P1: tools/queue_conflict_census.py owns
     # tests/test_queue_conflict_census.py (`core`). Without the CORE_ALSO entry

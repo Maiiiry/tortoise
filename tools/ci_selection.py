@@ -853,6 +853,31 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # guard. Same silent-drop class as tools/tmpdir_sweep.py above,
              # and the same defect #4174 describes a gate having.
              "tools/drift-guard.py",
+             # #4828: the #3863 surface gate's two drivers and the shared identity
+             # contract they now BOTH import. `tools/` is in NON_PYTHON_PREFIXES, and
+             # no SOURCE_PATTERNS entry matches any of the three, so a driver-only or
+             # contract-only edit was filtered out BEFORE the "not matched -> core"
+             # fallback, took the docs-only early return and dropped to tier-1 smoke —
+             # where NEITHER `tests/test_surface_manifest.py` (the parity net asserting
+             # both drivers hand back the SAME `_code_digest`, plus the pinned fixture
+             # digest) nor `tests/test_surface_guard_pin_4606.py` (which pins the
+             # base-ref override that protects that contract) runs. The gap mattered
+             # most for the exact diff this issue is about: a fix applied to ONE copy
+             # was invisible to the suite that compares them.
+             #
+             # CORE_ALSO, not TOOL_CARVEOUTS: every consumer of these tools is
+             # core-registered (`test_surface_manifest.py` — core AND slow,
+             # `test_surface_guard_pin_4606.py`, `test_finding_provenance.py`,
+             # `test_retired_tools.py`, `test_docs_lint_baseline.py`), so `core` is
+             # the whole blast radius and the full matrix would be paid for nothing
+             # — the same reason tools/test_lane.py and tools/drift-guard.py sit
+             # here. Measured: `select(["tools/_code_identity.py"])` ->
+             # surfaces=['core'], full=False, slow_run=True, and both guard test
+             # files are in the selected set (the slow one via the slow leg). Same
+             # #1349/#3332/#3616 silent-drop class as the entries above.
+             "tools/surface_manifest.py",
+             "tools/surface-guard.py",
+             "tools/_code_identity.py",
              # #5084 review P1: tools/test_lane.py owns
              # tests/test_test_lane_tool.py (registered `core`), but `tools/` is
              # swallowed by NON_PYTHON_PREFIXES and no SOURCE_PATTERNS entry
