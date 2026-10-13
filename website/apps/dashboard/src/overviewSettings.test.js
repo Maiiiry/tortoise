@@ -5,6 +5,16 @@
 // github_docs_indexed, session_recording) is reachable ONLY via
 // Settings → Memory sources. Reads main.jsx as TEXT (no React runtime —
 // wizardArchived.test.js pattern).
+//
+// #3245: a placement assertion is only worth its line if it can FAIL. The
+// original Backups check asserted the quoted literal `"Backups"`, a string
+// main.jsx has never contained (the label is JSX text) and that a
+// reintroduced card could not emit, so it passed whether or not a backups card
+// existed anywhere. Every NEGATIVE check below now runs against a token this
+// file is asserted to actually use elsewhere (`OVERVIEW_FORBIDDEN` + its
+// non-vacuity guard), and the Backups card's home is pinned in BOTH directions
+// — present on the API Keys tab, absent from the Overview — so a silent
+// relocation can no longer be green.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -21,9 +31,33 @@ const src = readFileSync(join(__dirname, 'main.jsx'), 'utf8')
 const OVERVIEW_POPULATED = "(team.point_count ?? 0) > 0 && ("
 const SETTINGS_SECTION = "{tab === 'settings' && team && ("
 const PROFILE_SECTION = "{tab === 'profile' && ("
+// #3245: the two branch anchors that bracket the Backups card's home. Both are
+// STRUCTURAL (a tab-branch condition), not line offsets — the ~600-line drift
+// that invalidated the issue/brief line citations cannot move them.
+const KEYS_SECTION = "{tab === 'keys' && ("
+const GRAPHS_SECTION = "{tab === 'graphs' && ("
 const ARCHIVED_MARK = 'LEGACY_WIZARD_ARCHIVED && welcomeOriented'
 const SETTINGS_TAB_DEF = 'function SettingsTab(props) {'
 const NEXT_TOP_DEF = 'function setClaimPendingMarker'
+
+// #3245: the tokens the populated Overview must NOT contain, each with the
+// reason it is forbidden. The non-vacuity test below asserts every token is
+// used SOMEWHERE in main.jsx — a negative check whose token exists nowhere
+// cannot be produced by the regression it guards (the `"Backups"` original:
+// a QUOTED literal the file never held, which no JSX reintroduction of the
+// card could ever emit) is a tautology, which is the defect this file was
+// fixed for. The `Data points` original was weaker in the same direction — it
+// pinned one label string; `card-val` below pins the stat-card FRAME the
+// retired card actually used (`<div className="card"><div className="card-val">`).
+const OVERVIEW_FORBIDDEN = [
+  { token: '<MemorySources', why: 'no source list on the Overview (Settings + the wizard step own it, #3513)' },
+  { token: 'SetupGuideCard', why: 'the setup-guide checklist lives in Settings → Setup guide (DE2E-6)' },
+  { token: 'role="switch"', why: 'a toggle on the calm Overview means a feature switch leaked back (DE2E-2)' },
+  { token: 'card-val', why: 'the old stat-card frame must not return (#2000 W4: EXACTLY 3 elements, zero stat cards)' },
+  { token: '<BackupsCard', why: 'the Backups summary card lives on the API Keys tab (#2000 W4 relocation, #3245)' },
+  { token: 'card-label">Backups', why: 'the Backups label, were its markup inlined instead of the component (#3245)' },
+  { token: 'backupsStatus', why: 'no backup state is threaded into an Overview render (#3245)' },
+]
 
 test('DE2E-2: Settings nav tab exists (data-tab settings, tab-switch handler)', () => {
   assert.ok(/data-tab="settings"/.test(src), 'Settings nav button with data-tab')
@@ -34,17 +68,89 @@ test('DE2E-2: populated Overview renders EXACTLY the 3 elements (zero toggles)',
   const ovStart = src.indexOf(OVERVIEW_POPULATED)
   const setStart = src.indexOf(SETTINGS_SECTION)
   assert.ok(ovStart > -1 && setStart > -1, 'overview + settings anchors present')
+  // #3245: ordering is asserted, not implied. If the Settings branch ever
+  // precedes the populated Overview, `slice(ovStart, setStart)` is EMPTY and
+  // every negative below would pass on nothing — the exact vacuity class this
+  // file was fixed for.
+  assert.ok(setStart > ovStart, 'the Settings branch follows the populated Overview (else the slice is empty)')
   const ovText = src.slice(ovStart, setStart)
+  assert.ok(ovText.includes('OverviewConnectionCard state={onboarding}'),
+    'the slice really is the populated Overview (non-vacuity guard)')
   // the three elements
   assert.ok(ovText.includes('OverviewConnectionCard state={onboarding}'), 'connection-status element')
   assert.ok(ovText.includes('OverviewDigestCard points={team.point_count'), 'memory-digest element')
   assert.ok(ovText.includes('OverviewNextActionCard state={onboarding}'), 'next-action element')
-  // zero toggles / panels / stat cards on the Overview
-  assert.ok(!ovText.includes('<MemorySources'), 'no MemorySources on the Overview')
-  assert.ok(!ovText.includes('SetupGuideCard'), 'no Setup-guide checklist card on the Overview')
-  assert.ok(!ovText.includes('role="switch"'), 'no switch component on the Overview')
-  assert.ok(!ovText.includes('Data points'), 'stat card label gone from the Overview')
-  assert.ok(!ovText.includes('"Backups"'), 'backups stat card gone from the Overview')
+  // EXACTLY three: the .cards block's own children are a closed whitelist, so
+  // a 4th element (a reintroduced stat card, an extra panel) fails here even
+  // when it is not one of the forbidden tokens below. The block has no nested
+  // <div>, so its first closing tag is its own.
+  const cardsStart = ovText.indexOf('<div className="cards">')
+  const cardsEnd = ovText.indexOf('</div>', cardsStart)
+  assert.ok(cardsStart > -1 && cardsEnd > cardsStart, 'the Overview .cards container resolves')
+  const rendered = [...ovText.slice(cardsStart, cardsEnd).matchAll(/<([A-Z][A-Za-z0-9]*)/g)].map((m) => m[1])
+  assert.deepEqual(rendered,
+    ['OverviewConnectionCard', 'OverviewDigestCard', 'OverviewNextActionCard'],
+    'the Overview .cards block renders EXACTLY the three calm elements')
+  // zero toggles / panels / stat cards on the Overview. #3245: the original
+  // check was `"Backups"` — a QUOTED literal main.jsx has never contained and
+  // that no JSX reintroduction of the card could emit, so it was
+  // unconditionally true. Its `Data points` neighbour pinned only one label
+  // string; `card-val` (the retired stat-card frame) replaces it with the
+  // structure a reintroduction would have to use. Every token below is proven
+  // real by the non-vacuity guard beneath.
+  for (const { token, why } of OVERVIEW_FORBIDDEN) {
+    assert.ok(!ovText.includes(token),
+      `${why} — the populated Overview must not contain ${JSON.stringify(token)}`)
+  }
+})
+
+test('#3245: every Overview negative token is used ELSEWHERE in main.jsx (non-vacuity)', () => {
+  // A negative assertion whose token exists nowhere in the file cannot be
+  // produced by the regression it guards, so it can never fail. This is the
+  // guard that makes the test above meaningful: if a token is renamed or
+  // deleted from its real home, this fails FIRST and names the fix, instead of
+  // the negative check silently degrading into a tautology (the `"Backups"`
+  // defect #3245).
+  for (const { token } of OVERVIEW_FORBIDDEN) {
+    assert.ok(src.includes(token),
+      `the forbidden token ${JSON.stringify(token)} must exist somewhere in main.jsx — ` +
+      'a token that exists nowhere cannot be emitted by a reintroduction, which makes the ' +
+      'Overview negative check a tautology (#3245). ' +
+      'If the surface was removed, drop the token from OVERVIEW_FORBIDDEN in the same change.')
+  }
+})
+
+test('#3245: the BackupsCard has exactly ONE home — the API Keys branch, never the Overview', () => {
+  // #2784/#3136 moved the per-graph last-backup view to the Graphs tab while
+  // deliberately KEEPING this pool-wide summary card on API Keys
+  // (`tests/e2e/test_keys_table_mixed.py`: "the relocated BackupsCard"). The
+  // card moving is a product decision, so this pin is deliberately two-way: if
+  // it is relocated or deleted, update this test in the SAME PR and say where
+  // its replacement home is pinned instead.
+  const sites = [...src.matchAll(/<BackupsCard\b/g)].map((m) => m.index)
+  assert.equal(sites.length, 1,
+    `expected exactly one <BackupsCard> render site, got ${sites.length} ` +
+    '(the component DEFINITION is `function BackupsCard`, so a second match means a second mount)')
+  const keysStart = src.indexOf(KEYS_SECTION)
+  const graphsStart = src.indexOf(GRAPHS_SECTION)
+  assert.ok(keysStart > -1 && graphsStart > -1, 'keys + graphs branch anchors present')
+  assert.ok(graphsStart > keysStart, 'the Graphs branch follows the API Keys branch (else the slice is empty)')
+  const keysText = src.slice(keysStart, graphsStart)
+  assert.ok(keysText.includes('<h2>API Keys</h2>'), 'the slice really is the API Keys branch (non-vacuity guard)')
+  const [site] = sites
+  assert.ok(site > keysStart && site < graphsStart,
+    `the BackupsCard must render inside the API Keys branch (${keysStart}..${graphsStart}), found it at ${site}. ` +
+    'If the card is being relocated, pin its new home here in the same PR (#2784/#3136/#3245).')
+  const ovStart = src.indexOf(OVERVIEW_POPULATED)
+  const setStart = src.indexOf(SETTINGS_SECTION)
+  assert.ok(ovStart > -1 && setStart > ovStart, 'overview anchors present')
+  assert.ok(!(site > ovStart && site < setStart),
+    'the BackupsCard must never render on the populated Overview — the relocation #2000 (W4) performed')
+  // The mount is fed the real backup state (the e2e suite locates this card's
+  // label in the browser on the keys tab, so the source pin and the browser
+  // assertion cannot drift apart silently).
+  assert.ok(keysText.includes('<BackupsCard status={backupsStatus} count={(backupInfo && backupInfo.count) || null} />'),
+    'the API Keys branch mounts the card with the live backup state')
 })
 
 test('DE2E-2/#3513: MemorySources is the SINGLE source-list presentation — Settings + the wizard step (archived block dead)', () => {
