@@ -202,10 +202,10 @@ spool would file every session as one merged conversation — and
 `tortoise sessions import --harness openclaw` parses THAT, which keeps consent,
 receipts, provenance and REPHRASE dedup in the one existing import pipeline.
 
-- **Content fail-open**: any reflex failure (unreachable, misconfig, empty
+* **Content fail-open**: any reflex failure (unreachable, misconfig, empty
   graph, nothing above the confidence gate) → the hook emits NOTHING and
   exits 0. The agent turn proceeds untouched.
-- **Auth fail-closed**: hosted capture/auth channels keep their own deny
+* **Auth fail-closed**: hosted capture/auth channels keep their own deny
   rules. The hook process carries no credentials of its own, but the reflex
   it invokes transmits the Bearer identity resolved from ONE source chain
   (#2369 D1, hardened): a file-sourced key transmits only to the SAME
@@ -218,7 +218,7 @@ receipts, provenance and REPHRASE dedup in the one existing import pipeline.
   relays to the harness log, so a future redirect is loud at run time.
   Env alone (a bare `TORTOISE_API_KEY`) still never flips the hook to
   hosted mode (#1708 D1b).
-- W4 user-exposure opt-in: per-turn injection ships behind the `install`
+* W4 user-exposure opt-in: per-turn injection ships behind the `install`
   command — nothing auto-registers.
 
 ## Frameworks (#2125) — SDK-level middleware, injection only

@@ -3636,6 +3636,18 @@ def _install_read_hook_impl(args) -> int:
                 target.rmdir()
                 print(f"Removed {target}")
             return 0
+        if target.is_symlink() and not target.exists():
+            # #2121 review: a DANGLING in-root symlink at the plugin path is
+            # neither a directory nor a file — ``exists()`` follows the link
+            # and is False, so the ownership guards above skip it and the
+            # ``mkdir(exist_ok=True)`` below re-raises ``FileExistsError``
+            # (opaque, rc 1) while the write-free dry run reports success
+            # over the same tree. The file seams REPLACE a dangling leaf
+            # symlink (``_atomic_write_text`` → ``os.replace``); a
+            # directory-shaped seam does the same — drop the dead link and
+            # create the real dir. The symlink-escape guard above already
+            # refused any link resolving OUTSIDE the install root.
+            target.unlink()
         target.mkdir(parents=True, exist_ok=True)
         for name, src in sorted(bundled.items()):
             # #3918: ATOMIC write, like every other seam in this function.

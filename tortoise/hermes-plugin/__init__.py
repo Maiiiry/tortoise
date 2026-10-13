@@ -107,21 +107,49 @@ def _record_install_inert(detail: str) -> None:
         pass
 
 
+def _venv_owner_of(module_dir: Path) -> Path | None:
+    """The venv that OWNS ``module_dir`` — the nearest ancestor holding a
+    ``pyvenv.cfg`` (bounded walk), or ``None``.
+
+    A WHEEL install puts the module in ``<venv>/lib/python3.x/site-packages``
+    (POSIX) or ``<venv>/Lib/site-packages`` (Windows); there is no ``.venv``
+    beneath it, so the source-checkout probe misses and the reflex would fall
+    back to an ambient interpreter that lacks the wheel's dependencies. The
+    venv root is marked by ``pyvenv.cfg``; walk up (bounded) to find it — the
+    same #2385 item-3 step the shipped shell hook performs.
+    """
+    probe = module_dir
+    for _ in range(5):
+        if not str(probe) or str(probe) == "/":
+            break
+        if (probe / "pyvenv.cfg").is_file():
+            return probe
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    return None
+
+
 def _tortoise_candidates() -> list[list[str]]:
     """The reflex entry points to try, PATH first then the venv fallbacks.
 
     Hermes' per-turn hook is a Python PLUGIN, not a shell command, so the
-    chain is re-expressed here rather than shelled out: PATH install → the
-    module dir the installer recorded (``~/.tortoise/hook-src-dir``, with
-    ``TORTOISE_SRC_DIR`` overriding it) → the ambient venv. Each candidate is
-    only used if it exists: a wrong candidate is a skipped attempt, never a
-    traceback on the agent path.
+    chain is re-expressed here rather than shelled out, mirroring the shipped
+    shell hook (``tortoise/claude-hooks/volunteer-turn.sh``): PATH install →
+    the module dir the installer recorded (``~/.tortoise/hook-src-dir``, with
+    ``TORTOISE_SRC_DIR`` overriding it; its own ``.venv`` for a source
+    checkout, else the venv that OWNS it via ``pyvenv.cfg`` for a wheel) →
+    the ambient ``VIRTUAL_ENV``. Each candidate is only used if it exists: a
+    wrong candidate is a skipped attempt, never a traceback on the agent path.
 
-    This is a SUBSET of the shipped shell hook's chain
-    (``tortoise/claude-hooks/volunteer-turn.sh``): the shell hook additionally
-    walks up for the ``pyvenv.cfg`` that OWNS a wheel's ``site-packages``
-    (#2385 item 3) and falls back to running the module directly. The middle
-    rung here is populated only by ``TORTOISE_SRC_DIR`` or a record some other
+    ``HOME`` uses the shell hook's ``/nonexistent`` sentinel (``${HOME:-
+    /nonexistent}``): an unset HOME must NEVER resolve a CWD-relative
+    ``./.tortoise/hook-src-dir`` in the agent's (writable) workspace.
+
+    Still a SUBSET of the shell hook's chain: the hook additionally falls back
+    to a ``python -c`` module invocation for the resolved venv. The middle
+    rung is populated only by ``TORTOISE_SRC_DIR`` or a record some other
     seam's install wrote — ``install hermes`` writes no record. A machine
     whose only Tortoise install is Hermes and which lacks a ``tortoise`` on
     PATH/VIRTUAL_ENV therefore injects nothing; that is why the no-candidate
@@ -134,14 +162,21 @@ def _tortoise_candidates() -> list[list[str]]:
     src = os.environ.get("TORTOISE_SRC_DIR", "").strip()
     if not src:
         try:
-            src = (Path(os.environ.get("HOME") or "") / ".tortoise"
-                   / "hook-src-dir").read_text(encoding="utf-8").strip()
+            src = (Path(os.environ.get("HOME") or "/nonexistent")
+                   / ".tortoise" / "hook-src-dir").read_text(
+                       encoding="utf-8").strip()
         except OSError:
             src = ""
     if src:
-        venv_bin = Path(src) / ".venv" / "bin" / "tortoise"
+        module_dir = Path(src)
+        venv_bin = module_dir / ".venv" / "bin" / "tortoise"
         if venv_bin.is_file():
             cmds.append([str(venv_bin), "volunteer"])
+        else:
+            owner = _venv_owner_of(module_dir)
+            owner_bin = (owner / "bin" / "tortoise") if owner else None
+            if owner_bin is not None and owner_bin.is_file():
+                cmds.append([str(owner_bin), "volunteer"])
     venv = os.environ.get("VIRTUAL_ENV", "").strip()
     if venv:
         vb = Path(venv) / "bin" / "tortoise"

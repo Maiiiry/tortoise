@@ -109,10 +109,17 @@ def _make_state_db(path: Path, sessions: dict[str, list[dict]],
     ``sessions``: {session_id: [message dicts]}; each message carries ``id``
     (insertion order), ``role``, ``content`` and optional ``active`` /
     ``summary`` flags.
+
+    The store is written in WAL mode — Hermes' own mode — and closed, which
+    checkpoints and reaps ``-wal``/``-shm``. That leaves a WAL store whose
+    ``-shm`` is ABSENT: exactly the shape where an IN-PLACE read-only open
+    makes SQLite CREATE the sidecars beside it (the source directory is
+    written), which the snapshot reader must avoid.
     """
     started = started or {}
     conn = sqlite3.connect(path)
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_STATE_DB_DDL)
         for sid, msgs in sessions.items():
             conn.execute("INSERT INTO sessions (id, started_at) VALUES (?, ?)",
@@ -293,6 +300,34 @@ def test_install_hermes_refuses_file_where_plugin_dir_belongs(tmp_path):
     assert target.read_text() == "not a directory"
 
 
+def test_install_hermes_replaces_a_dangling_plugin_symlink(tmp_path):
+    """A DANGLING in-root symlink at the plugin path is neither a directory
+    nor a file: ``exists()`` follows the link and is False, so the ownership
+    guards skip it and ``mkdir(exist_ok=True)`` re-raises FileExistsError —
+    rc 1 with an opaque traceback — while the write-free dry run reports
+    success over the SAME tree (#2121 review). The file seams REPLACE a
+    dangling leaf symlink, so a directory-shaped seam does too: the link is
+    dropped, the real directory created, and the install succeeds.
+
+    MUTATION: drop the ``unlink()`` → the real install exits 1 (RED).
+    """
+    target = _plugin_dir(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.symlink_to("./missing-dir")  # dangling, resolves INSIDE root
+    assert target.is_symlink() and not target.exists()
+
+    # The dry run must not report a success the real run cannot deliver.
+    r = _run(["install", "hermes", "--dir", str(tmp_path), "--dry-run"],
+             _env())
+    assert r.returncode == 0, r.stderr
+
+    r = _run(["install", "hermes", "--dir", str(tmp_path)], _env())
+    assert r.returncode == 0, r.stderr
+    assert not target.is_symlink()
+    assert (target / "plugin.yaml").is_file()
+    assert (target / "__init__.py").is_file()
+
+
 def test_install_hermes_uninstall_keeps_unrelated_files(tmp_path):
     """Only the two files the installer wrote are removed; a file the USER
     added keeps the directory alive (an uninstall never deletes what it
@@ -432,9 +467,10 @@ def test_pre_llm_call_kill_switch_skips_the_reflex(tmp_path, monkeypatch):
 
 def test_plugin_resolves_the_installer_recorded_module_dir(tmp_path,
                                                            monkeypatch):
-    """No `tortoise` on PATH → the plugin falls back to the module dir
-    `tortoise install` records (`~/.tortoise/hook-src-dir`), the same chain
-    the shipped shell hook walks."""
+    """No `tortoise` on PATH → the plugin falls back to the module dir the
+    `~/.tortoise/hook-src-dir` record names — the same rung the shipped shell
+    hook walks. The record is written by the shell-hook seams (`install
+    hermes` writes NO record); `TORTOISE_SRC_DIR` populates the same rung."""
     module = _install_and_load(tmp_path, monkeypatch, block=_BLOCK)
     (tmp_path / "bin" / "tortoise").unlink()
     home = Path(os.environ["HOME"])
@@ -446,6 +482,67 @@ def test_plugin_resolves_the_installer_recorded_module_dir(tmp_path,
     console.chmod(0o755)
     (home / ".tortoise").mkdir(parents=True)
     (home / ".tortoise" / "hook-src-dir").write_text(str(src))
+    assert module.on_pre_llm_call(user_message="how is CI deployed?") == {
+        "context": _BLOCK}
+
+
+def test_plugin_home_unset_never_resolves_a_cwd_relative_record(
+        tmp_path, monkeypatch):
+    """An UNSET ``HOME`` must not fall back to a CWD-relative
+    ``./.tortoise/hook-src-dir`` — the agent's own (writable, often untrusted)
+    workspace. The plugin uses the shell hook's ``/nonexistent`` sentinel
+    (``${HOME:-/nonexistent}``), so a planted record in the CWD is never read
+    (#2121 review).
+
+    MUTATION: ``os.environ.get("HOME") or ""`` → ``Path("")`` is ``.``, so
+    the planted ``./.tortoise/hook-src-dir`` (pointing at a planted
+    ``.venv/bin/tortoise``) becomes a candidate and the empty-list assertion
+    goes RED.
+    """
+    module = _install_and_load(tmp_path, monkeypatch, block=_BLOCK)
+    (tmp_path / "bin" / "tortoise").unlink()  # nothing on PATH
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("TORTOISE_SRC_DIR", "")
+    monkeypatch.setenv("VIRTUAL_ENV", "")
+    workspace = tmp_path / "workspace"
+    evil_src = workspace / "evil-src"
+    (evil_src / ".venv" / "bin").mkdir(parents=True)
+    console = evil_src / ".venv" / "bin" / "tortoise"
+    console.write_text("#!/bin/bash\ncat > /dev/null\nprintf '%s\\n' "
+                       f"{shlex.quote('PLANTED-EXECUTED')}\n")
+    console.chmod(0o755)
+    (workspace / ".tortoise").mkdir(parents=True)
+    (workspace / ".tortoise" / "hook-src-dir").write_text(str(evil_src))
+    monkeypatch.chdir(workspace)
+    assert module._tortoise_candidates() == []
+    assert module.on_pre_llm_call(user_message="how is CI deployed?") is None
+
+
+def test_plugin_falls_back_to_the_venv_that_owns_a_wheel_module_dir(
+        tmp_path, monkeypatch):
+    """A WHEEL install records a ``site-packages`` module dir with no
+    ``.venv`` beneath it; the plugin walks up to the ``pyvenv.cfg`` owner and
+    uses THAT venv's console script (#2385 item 3) — the step the shipped
+    shell hook takes (#2121 review).
+
+    MUTATION: drop the owner walk → no candidate resolves and
+    ``on_pre_llm_call`` returns ``None`` → RED.
+    """
+    module = _install_and_load(tmp_path, monkeypatch, block=_BLOCK)
+    (tmp_path / "bin" / "tortoise").unlink()  # nothing on PATH
+    home = Path(os.environ["HOME"])
+    venv = tmp_path / "venv"
+    site_packages = venv / "lib" / "python3.12" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    console = venv / "bin" / "tortoise"
+    console.parent.mkdir(parents=True)
+    console.write_text("#!/bin/bash\ncat > /dev/null\nprintf '%s\\n' "
+                       f"{shlex.quote(_BLOCK)}\n")
+    console.chmod(0o755)
+    (home / ".tortoise").mkdir(parents=True)
+    (home / ".tortoise" / "hook-src-dir").write_text(str(site_packages))
+    assert [str(console), "volunteer"] in module._tortoise_candidates()
     assert module.on_pre_llm_call(user_message="how is CI deployed?") == {
         "context": _BLOCK}
 
@@ -625,6 +722,30 @@ def test_parse_hermes_reads_the_store_read_only(tmp_path):
     assert wal.exists() and wal.read_bytes() == wal_before
     assert shm.exists()
     assert db.read_bytes() == main_before
+
+
+def test_parse_hermes_snapshots_so_the_source_dir_is_never_written(tmp_path):
+    """A WAL store whose ``-shm`` was reaped — what a clean close leaves — is
+    exactly the shape where a DIRECT read-only open CREATES ``-wal``/``-shm``
+    beside the live store, writing its DIRECTORY even though the main DB
+    bytes survive. The parser reads a private temp snapshot, so nothing new
+    appears beside the source (#2121 review).
+
+    MUTATION: open ``db_path`` in place instead of the snapshot → both
+    sidecar assertions go RED (measured: the in-place ``mode=ro`` open
+    creates ``state.db-shm`` + ``state.db-wal`` on the first query).
+    """
+    db = _make_state_db(tmp_path / "state.db", {"s1": [
+        {"id": 1, "role": "user", "content": "hello Hermes"}]})
+    # The fixture really is a WAL store (SQLite header offsets 18/19 = 2).
+    assert db.read_bytes()[18:20] == b"\x02\x02", "fixture is not WAL-mode"
+    assert not (tmp_path / "state.db-wal").exists()
+    assert not (tmp_path / "state.db-shm").exists()
+    before = db.read_bytes()
+    assert parse_hermes(db) == [{"role": "user", "content": "hello Hermes"}]
+    assert db.read_bytes() == before
+    assert not (tmp_path / "state.db-wal").exists()
+    assert not (tmp_path / "state.db-shm").exists()
 
 
 def test_parse_hermes_decodes_structured_content_and_lenses_injected_context(

@@ -242,6 +242,15 @@ python_version = "3.12"
 # config so the caller's typecheck-command stays a bare `mypy tortoise/`.
 ignore_missing_imports = true
 check_untyped_defs = true
+# The Hermes plugin ships in a HYPHENATED directory: Hermes loads a plugin
+# DIRECTORY by path, so the directory name is the install contract, not an
+# import name. mypy walks `tortoise/` recursively and refuses a package dir
+# whose name is not a valid identifier (`hermes-plugin contains __init__.py
+# but is not a valid Python package name`); the plugin is loaded by the host
+# interpreter and never as `tortoise.<sub>`, so it is not part of the typed
+# package. Excluded at the config layer so the CI `mypy tortoise/` command
+# stays a bare invocation (#2121).
+exclude = ["tortoise/hermes-plugin/"]
 # Baseline (#1503): every error code present in the 406-error first pass is
 # disabled so the full typecheck runs green. Per-code counts + cleanup order
 # are documented in docs/lint-baseline-1503.md.

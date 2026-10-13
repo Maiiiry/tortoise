@@ -50,8 +50,9 @@ Supported stores:
   - ``hermes``: Hermes (NousResearch/hermes-agent) ``$HERMES_HOME/state.db``
     — SQLite ``sessions`` + ``messages`` tables, MANY sessions per file (the
     only many-per-file store here).  ``<state.db>`` selects the most recent
-    session; ``<state.db>::<session-id>`` selects one explicitly.  Read
-    ``mode=ro`` — no DATA is written to the store (#2121).
+    session; ``<state.db>::<session-id>`` selects one explicitly.  Read from a
+    private temp SNAPSHOT ``mode=ro`` — the source directory is never written
+    (#2121).
 """
 from __future__ import annotations
 
@@ -59,6 +60,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
 
@@ -390,16 +392,15 @@ def parse_hermes(path: str | Path) -> list[dict]:
     backfill must not file the store's storage encoding or its injected
     context as the user's words.
 
-    Reads ONLY: the connection is opened ``mode=ro`` so no DATA is ever
-    written to a live/recent Hermes store and the main DB bytes are unchanged
-    (Hermes runs WAL + a cross-process write guard).  ``mode=ro`` does NOT
-    stop SQLite creating/refreshing the ``-wal``/``-shm`` wal-INDEX sidecars
-    beside a WAL store when they are absent — those carry index bookkeeping,
-    not content, and the store's own next reader rebuilds them.  A WAL store
-    whose ``-shm`` has been reaped therefore needs a writable directory to
-    init read-only, so quit Hermes before backfilling if SQLite refuses the
-    open — the refusal is surfaced honestly, never worked around by opening
-    writable.
+    Reads ONLY: the store is copied to a PRIVATE temp dir (``state.db`` plus a
+    present ``-wal``) and the COPY is opened ``mode=ro``.  A direct read-only
+    open of a WAL database whose ``-shm`` is absent makes SQLite CREATE
+    ``state.db-shm``/``state.db-wal`` beside the original — writing the live
+    store's DIRECTORY even though the main DB bytes stay intact.  Hermes runs
+    WAL, so the source is never opened in place; the snapshot confines any
+    sidecar creation to the temp dir and the source directory is never
+    written.  A copy taken while Hermes is mid-write is a point-in-time
+    approximation, never a writable open of the source (#2121 review).
 
     NOT walked: Hermes' compression lineage (``sessions.parent_session_id``,
     the ``include_ancestors`` read in ``get_messages_as_conversation``). A
@@ -408,8 +409,7 @@ def parse_hermes(path: str | Path) -> list[dict]:
     than silently absorbed.
     """
     db_path, wanted_session = _hermes_resolve_store(path)
-    conn = _hermes_connect_ro(db_path)
-    try:
+    with _hermes_ro_connection(db_path) as conn:
         session_id = _hermes_selected_session(conn, db_path, wanted_session)
         rows = _hermes_rows(
             conn,
@@ -417,8 +417,6 @@ def parse_hermes(path: str | Path) -> list[dict]:
             "AND active = 1 AND _compressed_summary = 0 "
             "AND role IN ('user', 'assistant') ORDER BY id ASC",
             (session_id,))
-    finally:
-        conn.close()
 
     turns: list[dict] = []
     for row in rows:
@@ -454,24 +452,54 @@ def _hermes_resolve_store(path: str | Path) -> tuple[Path, str | None]:
     return db_path, wanted_session
 
 
-def _hermes_connect_ro(db_path: Path):
-    """A READ-ONLY connection to ``db_path`` (``row_factory`` set).
+@contextmanager
+def _hermes_ro_connection(db_path: Path):
+    """Yield a READ-ONLY connection to a PRIVATE SNAPSHOT of ``db_path``.
 
-    Percent-encode the path before it goes into the URI: a raw ``?`` / ``#``
+    ``mode=ro`` does NOT stop SQLite creating/refreshing the ``-wal``/``-shm``
+    wal-INDEX sidecars beside a WAL store when they are absent, so an in-place
+    open writes the live store's DIRECTORY even though the main DB bytes are
+    untouched (Hermes runs WAL + a cross-process write guard, so a direct open
+    is the common case). The store is therefore copied to a private temp dir
+    — ``state.db`` plus a present ``-wal`` (committed transactions not yet
+    checkpointed; SQLite rebuilds ``-shm`` from it in the writable temp dir)
+    — and the COPY is opened ``mode=ro``. Any sidecar SQLite needs lands in
+    the temp dir; the source directory is never written (#2121 review).
+
+    The path is percent-encoded before it goes into the URI: a raw ``?`` / ``#``
     would be parsed as the query / fragment (silently dropping ``mode=ro`` AND
     reading — or CREATING — a different, truncated path) and a raw ``%`` would
     be decoded. ``quote`` keeps ``/`` (safe='/'), so the file component
-    survives intact (#2121 review).
+    survives intact.
     """
+    import shutil
     import sqlite3
+    import tempfile
 
-    try:
-        conn = sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True)
-    except sqlite3.Error as e:
-        raise ValueError(
-            f"cannot open Hermes session store {db_path} read-only: {e}") from e
-    conn.row_factory = sqlite3.Row
-    return conn
+    with tempfile.TemporaryDirectory(prefix="tortoise-hermes-") as tmp:
+        snapshot = Path(tmp) / "state.db"
+        try:
+            shutil.copy2(db_path, snapshot)
+            source_wal = Path(f"{db_path}-wal")
+            if source_wal.exists():
+                # The -wal carries committed-but-uncheckpointed transactions;
+                # copy it so the snapshot is the full store, not a stale one.
+                shutil.copy2(source_wal, Path(f"{snapshot}-wal"))
+        except OSError as e:
+            raise ValueError(
+                f"cannot snapshot Hermes session store {db_path}: {e}") from e
+        try:
+            conn = sqlite3.connect(
+                f"file:{quote(str(snapshot))}?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            raise ValueError(
+                f"cannot open Hermes session store {db_path} read-only: "
+                f"{e}") from e
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def _hermes_selected_session(conn, db_path: Path, wanted: str | None) -> str:
@@ -506,11 +534,8 @@ def hermes_selected_session_id(path: str | Path) -> str:
     (#2121 review).
     """
     db_path, wanted_session = _hermes_resolve_store(path)
-    conn = _hermes_connect_ro(db_path)
-    try:
+    with _hermes_ro_connection(db_path) as conn:
         return _hermes_selected_session(conn, db_path, wanted_session)
-    finally:
-        conn.close()
 
 
 def parse_openclaw(path: str | Path) -> list[dict]:
