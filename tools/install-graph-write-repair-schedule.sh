@@ -210,6 +210,16 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
+# VERIFY THE NEW JOB LOADED. Without this, a failed `bootstrap` aborts under `set -e` and
+# leaves a plist on disk with NO job loaded -- the repair silently stops, which is the exact
+# failure the worktree guard above exists to prevent. (The uninstall path already verifies.)
+if ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  echo "ERROR: '$LABEL' did NOT load after bootstrap -- the repair would be silently dead." >&2
+  echo "       The plist is at $PLIST; inspect with:" >&2
+  echo "         launchctl print gui/$(id -u)/$LABEL" >&2
+  exit 3
+fi
+
 echo
 echo "installed and bootstrapped."
 echo "Run the tool once NOW to prove the path works end to end:"

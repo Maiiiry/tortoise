@@ -67,26 +67,29 @@ Exit codes: 0 healthy or repaired | 2 cannot connect or state UNKNOWN | 3 broken
 
 from __future__ import annotations
 
-import argparse
-import os
 import sys
-import time
+
+# #5128: refuse a <3.12 interpreter before the imports below — a module-level
+# 3.11+-only import would fail first (D9 shape).
+if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
+    raise SystemExit(
+        f"tools/graph_write_repair.py requires Python >= 3.12 (got "
+        f"{sys.version_info[0]}.{sys.version_info[1]}) — run it as "
+        f"`uv run python tools/graph_write_repair.py`"
+    )
+
+import argparse
+import contextlib
+import os
 import uuid
 
 DEFAULT_GRAPH = "tortoise"
 PROBE_LABEL = "GraphWriteRepairProbe"
 
-# The ONE error text that authorises a repair. Everything else is UNKNOWN.
-_DEFECT = "graph was deleted or replaced while the query was running"
-# Errors that mean "cannot determine", never "broken": the server is not ready, or the
-# transport failed. Repairing on any of these is how the graph was destroyed.
-_UNKNOWN_MARKERS = (
-    "is loading the dataset in memory",
-    "BusyLoadingError",
-    "ConnectionError",
-    "TimeoutError",
-    "No connection",
-)
+# A swap below this many nodes is refused outright. The graph is the fleet's collective
+# memory (~20300 nodes); an EMPTIED graph must never be "repaired" into place. This is what
+# makes the `0 < 0` false-success impossible even if a presence check is somehow missed.
+MIN_NODES = 1000
 
 
 class Unreachable(RuntimeError):
@@ -98,7 +101,7 @@ class Defect(RuntimeError):
 
 
 def connect(port: int):
-    import falkordb  # noqa: PLC0415
+    import falkordb
 
     # Pin 127.0.0.1, never `localhost` (#6666).
     return falkordb.FalkorDB(host="127.0.0.1", port=port)
@@ -108,52 +111,89 @@ def node_count(graph) -> int:
     return int(graph.query("MATCH (n) RETURN count(n)").result_set[0][0])
 
 
-def probe(db, name: str, attempts: int = 2, delay: float = 2.0) -> tuple[str, str]:
-    """Return ("ok"|"defect"|"unknown", detail). Never raises.
+def edge_count(graph) -> int:
+    """Relied on by the copy gate. A node count alone cannot see relationship loss -- the
+    live graph carries ~25967 edges, and `RENAME` is irreversible, so a clone that lost every
+    edge while keeping every node would previously have been swapped in."""
+    return int(graph.query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0])
 
-    Establishes PRESENCE FIRST with the key catalogue, because a Cypher read on a missing
-    graph auto-creates an empty one and would then report a healthy zero-node graph.
+
+def fingerprint(graph) -> tuple[int, int]:
+    return (node_count(graph), edge_count(graph))
+
+
+def is_defect(db, name: str, exc: BaseException) -> bool:
+    """Is this exception the reload defect -- via the REPO'S classifier, not a new one.
+
+    ⛔ DO NOT hand-roll a substring test for this sentence. `tortoise/retry.py` already
+    measured and rejected that: `retryable_aborted_write` anchors the clause (and requires
+    the trailing `, aborting`), specifically because a MID-MESSAGE occurrence must not
+    match, and it takes a PRESENCE PROBE because on the v6 core the one sentence covers two
+    realities -- a rebuild and a plain deletion. An unanchored `in` test (this module's first
+    version) both matched the sentence inside `could not parse query: <sentence>` AND would
+    have treated a genuine concurrent deletion as the reload defect. One classifier, reused.
     """
-    from tortoise.graph_delete_guard import graph_exists  # noqa: PLC0415
+    from tortoise.graph_delete_guard import graph_exists
+    from tortoise.retry import retryable_aborted_write
 
+    try:
+        return bool(retryable_aborted_write(
+            exc, graph_exists=lambda: graph_exists(db, name)))
+    except Exception:
+        return False
+
+
+def probe(db, name: str) -> tuple[str, str]:
+    """Return ("ok"|"defect"|"unknown"|"absent", detail). Never raises.
+
+    Establishes PRESENCE FIRST, because a Cypher read on a missing graph auto-creates an
+    empty one -- and then reports a healthy zero-node graph. Presence is RE-CHECKED after the
+    write, because the graph can be deleted between the two, in which case the write
+    auto-creates an empty graph whose write is ACCEPTED and would read as healthy.
+    """
+    from tortoise.graph_delete_guard import graph_exists
+
+    try:
+        if not graph_exists(db, name):
+            return "absent", f"graph {name!r} does not exist"
+        graph = db.select_graph(name)
+        before = node_count(graph)
+    except Exception as exc:
+        return "unknown", f"presence/count read failed: {type(exc).__name__}: {exc}"
+
+    # Scope the probe to THIS run: a bare `MATCH (t:Label) DELETE t` would destroy a node
+    # left by an earlier failed cleanup, or any pre-existing node carrying the label.
+    probe_id = f"probe-{uuid.uuid4().hex}"
+    try:
+        graph.query(f"CREATE (t:{PROBE_LABEL} {{id:$pid}})", {"pid": probe_id})
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        if is_defect(db, name, exc):
+            return "defect", detail
+        return "unknown", f"unclassified failure (refusing to repair): {detail}"
+
+    # The write was ACCEPTED. Only now is it meaningful to look further.
+    try:
+        after = node_count(graph)
+    except Exception as exc:
+        return "unknown", f"write accepted but the count read failed ({exc})"
     if not graph_exists(db, name):
-        return "absent", f"graph {name!r} does not exist"
-
-    graph = db.select_graph(name)
-    last = ""
-    for i in range(attempts):
-        try:
-            graph.query(f"CREATE (t:{PROBE_LABEL} {{id:'probe'}})")
-        except Exception as exc:  # noqa: BLE001 - classifying is the whole job
-            last = f"{type(exc).__name__}: {exc}"
-            if _DEFECT in last:
-                if i + 1 < attempts:
-                    time.sleep(delay)
-                    continue
-                return "defect", last
-            if any(m in last for m in _UNKNOWN_MARKERS):
-                if i + 1 < attempts:
-                    time.sleep(delay)
-                    continue
-                return "unknown", last
-            return "unknown", f"unclassified failure (refusing to repair): {last}"
-        # The write was accepted. Clean up; a failed cleanup is NOT a graph failure.
-        try:
-            graph.query(f"MATCH (t:{PROBE_LABEL}) DELETE t")
-        except Exception as exc:  # noqa: BLE001
-            return "unknown", (f"the probe write was ACCEPTED but cleanup failed ({exc}) -- "
-                               f"the graph writes; leaving a {PROBE_LABEL} node behind")
-        return "ok", "writes accepted"
-    return "unknown", last
+        return "unknown", ("the write was accepted but the graph is now ABSENT -- it was "
+                           "deleted during the probe and the write auto-created an empty one")
+    if after != before + 1:
+        return "unknown", (f"the write was accepted but the count moved {before} -> {after} "
+                           f"(expected +1) -- the graph is not behaving like a healthy one")
+    try:
+        graph.query(f"MATCH (t:{PROBE_LABEL} {{id:$pid}}) DELETE t", {"pid": probe_id})
+    except Exception as exc:
+        return "unknown", (f"the probe write was ACCEPTED but cleanup failed ({exc}) -- the "
+                           f"graph writes; leaving one {PROBE_LABEL} node behind")
+    return "ok", "writes accepted"
 
 
 def repair(db, name: str, verbose: bool = True) -> tuple[bool, str]:
     """COPY -> verify clone -> atomic RENAME. No GRAPH.DELETE of the live graph, ever."""
-    from tortoise.graph_delete_guard import (  # noqa: PLC0415
-        graph_delete_lock,
-        graph_exists,
-        safe_graph_delete,
-    )
+    from tortoise.graph_delete_guard import graph_delete_lock, graph_exists
 
     def say(msg: str) -> None:
         if verbose:
@@ -162,55 +202,104 @@ def repair(db, name: str, verbose: bool = True) -> tuple[bool, str]:
     # A per-run scratch name: a FIXED name lets two runs (the timer and a hand-run) delete
     # each other's clone.
     scratch = f"__gwr_{uuid.uuid4().hex[:12]}"
+    clone_db = db.select_graph(scratch)
 
-    with graph_delete_lock(db) as acquired:
-        if not acquired:
-            return False, "could not take the graph-delete lock (another repair may be running)"
+    def drop_clone(reason: str) -> None:
+        # ⛔ DROP THE CLONE OUTSIDE THE LOCK. `safe_graph_delete` takes `graph_delete_lock`
+        # itself, so calling it INSIDE an already-held lock cannot acquire and refuses after
+        # its full wait -- the clone leaks and the run stalls, while the caller believes it
+        # cleaned up (measured by review: `inner safe_graph_delete returned=False after 1.0s`).
+        # A leaked clone is not worth failing the run over.
+        with contextlib.suppress(Exception):
+            clone_db.delete()
+        say(f"  note: dropped clone {scratch} ({reason})")
 
-        before = node_count(db.select_graph(name))
-        say(f"  node count before repair: {before}")
-        say(f"  [1/4] GRAPH.COPY {name} -> {scratch}   (the clone is also the fallback)")
-        try:
-            db.connection.execute_command("GRAPH.COPY", name, scratch)
-        except Exception as exc:  # noqa: BLE001
-            return False, f"GRAPH.COPY failed: {exc}"
+    try:
+        with graph_delete_lock(db) as acquired:
+            if not acquired:
+                return False, "could not take the graph-delete lock (another repair is running)"
 
-        clone_nodes = node_count(db.select_graph(scratch))
-        say(f"  [2/4] clone node count: {clone_nodes}")
-        if clone_nodes != before:
-            safe_graph_delete(db, scratch)
-            return False, f"clone has {clone_nodes} nodes, source has {before} - refusing to swap"
+            # ⛔ PRESENCE INSIDE THE LOCK, IMMEDIATELY BEFORE ANY READ. A Cypher read on a
+            # missing graph AUTO-CREATES an empty one, so this read without the guard is how
+            # `before=0` -> clone 0 -> RENAME -> `after=0` -> `0 < 0` is False -> exit 0
+            # "repaired: 0 nodes": a FALSE SUCCESS on a destroyed graph.
+            if not graph_exists(db, name):
+                return False, (f"graph {name!r} is ABSENT inside the repair -- refusing to "
+                               f"create or repair it")
 
-        kind, detail = probe(db, scratch, attempts=1)
-        if kind != "ok":
-            # RETAIN the clone: it may be the only copy. Never clean up a failed repair.
-            return False, (f"the clone is not usable ({kind}: {detail}) - refusing to swap; "
-                           f"clone {scratch} retained")
-        say("  [3/4] clone is complete and writable")
+            before_nodes, before_edges = fingerprint(db.select_graph(name))
+            say(f"  fingerprint before repair: {before_nodes} nodes / {before_edges} edges")
+            if before_nodes < MIN_NODES:
+                return False, (f"refusing to repair a graph of {before_nodes} nodes "
+                               f"(< MIN_NODES={MIN_NODES}) -- this is not the shared graph, "
+                               f"and 'repairing' it would put an empty one in its place")
 
-        # ATOMIC. `RENAME` overwrites the destination in one step, so there is never a window
-        # in which `name` is absent -- the window is what auto-created an empty graph and
-        # destroyed this graph on 2026-10-13.
-        say(f"  [4/4] RENAME {scratch} -> {name}   (atomic overwrite; no delete window)")
-        try:
-            db.connection.execute_command("RENAME", scratch, name)
-        except Exception as exc:  # noqa: BLE001
-            present = graph_exists(db, name)
-            return False, (f"RENAME failed: {exc}; source graph present={present}, "
-                           f"clone {scratch} retained as the fallback")
+            say(f"  [1/4] GRAPH.COPY {name} -> {scratch}")
+            try:
+                db.connection.execute_command("GRAPH.COPY", name, scratch)
+            except Exception as exc:
+                return False, f"GRAPH.COPY failed: {exc}"
 
-    after = node_count(db.select_graph(name))
+            clone_fp = fingerprint(clone_db)
+            say(f"  [2/4] clone fingerprint: {clone_fp[0]} nodes / {clone_fp[1]} edges")
+            if clone_fp != (before_nodes, before_edges):
+                # A count cannot catch property/label/type loss, but node AND edge equality is
+                # the strongest check available cheaply, and RENAME is irreversible.
+                drop_clone("incomplete copy")
+                return False, (f"clone {clone_fp} != source {(before_nodes, before_edges)} "
+                               f"- refusing to swap")
+
+            kind, detail = probe(db, scratch)
+            if kind != "ok":
+                # RETAIN the clone: it may be the only copy. Never clean up a failed repair.
+                return False, (f"the clone is not usable ({kind}: {detail}) - refusing to "
+                               f"swap; clone {scratch} retained")
+            say("  [3/4] clone is complete (nodes AND edges) and writable")
+
+            # Re-read immediately before the irreversible step: the section may have outlived
+            # the lock's TTL, and a second run's stale clone must not overwrite a graph the
+            # fleet has written to since.
+            now_fp = fingerprint(db.select_graph(name))
+            if now_fp[0] < before_nodes or not graph_exists(db, name):
+                drop_clone("source changed under us")
+                return False, (f"the source changed during the repair ({now_fp} vs "
+                               f"{(before_nodes, before_edges)}) - refusing to swap over it")
+
+            # ATOMIC. `RENAME` overwrites in one step, so there is never a window in which
+            # `name` is absent -- that window is what auto-created an empty graph and
+            # destroyed this graph on 2026-10-13.
+            say(f"  [4/4] RENAME {scratch} -> {name}   (atomic; no delete window)")
+            try:
+                db.connection.execute_command("RENAME", scratch, name)
+            except Exception as exc:
+                present = graph_exists(db, name)
+                return False, (f"RENAME failed: {exc}; source present={present}, "
+                               f"clone {scratch} retained as the fallback")
+    except Exception as exc:
+        return False, f"repair aborted: {type(exc).__name__}: {exc}"
+
+    # ⛔ NO COPY IS RETAINED AFTER A SUCCESSFUL SWAP: `RENAME` MOVES the clone, it does not
+    # copy it. If the source still exists the swap did not happen, and that IS a failure.
+    if graph_exists(db, scratch):
+        return False, (f"the scratch graph {scratch} still exists after RENAME -- the swap "
+                       f"did not complete; NOT reporting success")
+
+    try:
+        after = node_count(db.select_graph(name))
+    except Exception as exc:
+        return False, (f"the repair ran but the post-repair count could not be read ({exc}) "
+                       f"- the outcome is NOT verified")
     say(f"  node count after repair: {after}")
     # Only a LOSS is a failure. A gain is a concurrent fleet write landing on a now-healthy
     # graph, which is the outcome we wanted.
-    if after < before:
-        return False, f"post-repair count {after} < pre-repair {before} - DATA LOSS, investigate"
+    if after < before_nodes:
+        return False, f"post-repair count {after} < pre-repair {before_nodes} - DATA LOSS"
+    if after < MIN_NODES:
+        return False, f"post-repair count {after} < MIN_NODES={MIN_NODES} - refusing to call this repaired"
 
-    kind, detail = probe(db, name, attempts=2)
+    kind, detail = probe(db, name)
     if kind != "ok":
         return False, f"still not writable after repair ({kind}: {detail})"
-    if not graph_exists(db, scratch):
-        pass  # RENAME removed the source; expected.
     return True, f"repaired: {after} nodes, writes restored"
 
 
@@ -229,24 +318,36 @@ def main() -> int:
 
     try:
         db = connect(args.port)
-        from tortoise.graph_delete_guard import graph_exists  # noqa: PLC0415
+        from tortoise.graph_delete_guard import graph_exists
         if not graph_exists(db, args.graph):
             print(f"⛔ graph '{args.graph}' is ABSENT on 127.0.0.1:{args.port} -- "
                   f"this is not a repair case (the defect leaves the key present and "
                   f"readable). Do not create it here: investigate why it is gone.",
                   file=sys.stderr)
             return 3
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"ERROR: cannot reach FalkorDB on 127.0.0.1:{args.port}: {exc}", file=sys.stderr)
         return 2
 
     say(f"graph '{args.graph}': probing the write path...")
-    kind, detail = probe(db, args.graph)
+    try:
+        kind, detail = probe(db, args.graph)
+    except Exception as exc:
+        print(f"ERROR: the probe could not complete: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 2
 
     if kind == "ok":
-        # Counts print even under --quiet: a log that cannot answer "did the repair
-        # preserve the data?" is not a read artifact.
-        print(f"graph '{args.graph}': HEALTHY - {detail}")
+        # ⛔ PRINT THE COUNTS ON THE HEALTHY PATH TOO. A bare "HEALTHY" cannot answer the one
+        # question the log exists for -- "did the repair preserve the data?" -- and a
+        # writable-but-emptied graph would read HEALTHY with nothing to notice. This is also
+        # what makes the `--quiet` help text true: counts print regardless.
+        try:
+            nodes, edges = fingerprint(db.select_graph(args.graph))
+            print(f"graph '{args.graph}': HEALTHY - {detail} "
+                  f"({nodes} nodes / {edges} edges)")
+        except Exception as exc:
+            print(f"graph '{args.graph}': HEALTHY - {detail} (counts unreadable: {exc})")
         return 0
 
     if kind in ("unknown", "absent"):
@@ -263,7 +364,12 @@ def main() -> int:
         return 3
 
     say(f"graph '{args.graph}': repairing...")
-    ok, msg = repair(db, args.graph, verbose=not args.quiet)
+    try:
+        ok, msg = repair(db, args.graph, verbose=not args.quiet)
+    except Exception as exc:
+        print(f"⛔ REPAIR RAISED for graph '{args.graph}': "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
     if ok:
         print(f"graph '{args.graph}': REPAIRED - {msg}")
         print("note: this recurs on the next container restart (upstream, RDB load path).")
