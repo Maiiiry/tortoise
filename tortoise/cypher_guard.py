@@ -104,8 +104,10 @@ which is its own class of harm even though it is loud rather than silent.
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import functools
+import re
 from contextlib import contextmanager
 
 from tortoise.exceptions import (
@@ -278,10 +280,316 @@ def _guard_numeric_params(params) -> None:
             raise UnrepresentableNumberError(reason)
 
 
-def _guard_query(cypher: str, params=None) -> None:
-    """Both pre-dispatch refusals in one call: unsupported operator, then domain."""
+# ---------------------------------------------------------------------------
+# #7162 — the predicate-drop class: normalise the shape, gated by an engine probe.
+#
+# MEASURED 2026-10-13 against throwaway containers (this worktree), one requested
+# id over a graph where the CORRECT answer and the DEFECT answer differ:
+#
+#   image                          engine   no barrier        `WITH *` barrier
+#   -----------------------------  -------  ----------------  ----------------
+#   falkordb/falkordb:v4.20.4      4.20.4   ['p1'] (correct)  ['p1'] (no-op)
+#   falkordb/falkordb-server:v4.20.6 4.20.6 ['p1'] (correct)  ['p1'] (no-op)
+#   falkordb/falkordb-server:latest 6.0.0   FOREIGN x1..x4     ['p1'] (fixes)
+#   falkordb/falkordb:6.0.1        6.0.1    FOREIGN x1..x4     ['p1'] (fixes)
+#
+# So the defect is a property of the ENGINE VERSION, not of any query builder:
+# a plain `MATCH` that re-binds a variable already constrained by a `WHERE`
+# makes the engine DROP that predicate and return other nodes' rows — a silent
+# filter BYPASS, not an empty read. 4.x binds correctly, 6.x does not.
+#
+# **The barrier is `WITH *`, not `WITH <var>`.** The shape's own issue text says
+# `WITH V`; measured, that is a FALSE-POSITIVE hazard: a variable bound BEFORE
+# the predicate and still referenced later is DROPPED by `WITH V`, and the query
+# fails with `'a' not defined` (measured on both 4.20.4 and 6.0.1). `WITH *`
+# passes every in-scope variable through, restores the predicate on 6.x and is a
+# no-op on 4.x, so it cannot break a legitimate query this way.
+#
+# **Why a runtime normaliser and not a source-shape rail.** #7050 (closed, never
+# merged) scanned the SOURCE and required a literal property on the left of the
+# predicate — blind to `n.{id_field} IN $ids` and to a whole interpolated
+# predicate (`WHERE {sup4_w}`), so it reported "0 offenders" over a tree that
+# held the live defect. This seam runs on the FINAL statement, after every f-string
+# and interpolation has been resolved, so there is nothing for an interpolated
+# fragment to hide behind. `tests/test_id_predicate_barrier_6976.py` documents the
+# measured failure of the source-shape approach in the same terms.
+# ---------------------------------------------------------------------------
+
+#: Clause-STARTING keywords, longest-first so `OPTIONAL MATCH`/`DETACH DELETE` are
+#: consumed whole rather than re-matched at their second word. A `WHERE` predicate
+#: ends where the next one begins, and a scope is reset by `WITH`/`RETURN`/`UNION`.
+_CLAUSE_STARTER_RE = re.compile(
+    r"\b(?:OPTIONAL\s+MATCH|DETACH\s+DELETE|LOAD\s+CSV|MATCH|WITH|RETURN|CALL|"
+    r"UNWIND|CREATE|MERGE|DELETE|SET|REMOVE|FOREACH|UNION|USE)\b",
+    re.IGNORECASE,
+)
+_WHERE_RE = re.compile(r"\bWHERE\b", re.IGNORECASE)
+#: A node/relationship pattern binds the identifier that follows `(` or `[`:
+#: `(n:Point)`, `(n)`, `-[r:T]->`, `(path=(n)` all bind their first name; `(:Point)`,
+#: `()`, `({a:1})` bind none. Applied to the MASKED text, so labels/maps/params
+#: cannot contribute a variable.
+_PATTERN_VAR_RE = re.compile(r"[\[(]\s*([A-Za-z_][A-Za-z0-9_]*)")
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PROPERTY_ACCESS_RE = re.compile(r"\.\s*[A-Za-z_][A-Za-z0-9_]*")
+_PARAM_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+_FUNCTION_CALL_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*(?=\()")
+
+#: Words that can never be a `WHERE`-referenced variable, so a predicate reading
+#: `n IS NULL` or `STARTS WITH` cannot make one look re-bound to a later MATCH.
+_CYPHER_RESERVED = frozenset({
+    "AND", "OR", "XOR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE",
+    "CONTAINS", "STARTS", "ENDS", "WITH", "DISTINCT", "AS", "ORDER", "BY",
+    "SKIP", "LIMIT", "ASC", "DESC", "ASCENDING", "DESCENDING", "CASE",
+    "WHEN", "THEN", "ELSE", "END", "EXISTS", "COUNT", "ALL", "ANY", "NONE",
+    "SINGLE", "WHERE", "MATCH", "RETURN", "CREATE", "MERGE", "DELETE",
+    "DETACH", "SET", "REMOVE", "UNWIND", "CALL", "YIELD", "UNION",
+    "OPTIONAL", "FOREACH", "USE", "LOAD", "CSV", "ON", "INDEX",
+    "CONSTRAINT", "ASSERT", "HAVING", "REDUCE", "EXTRACT", "FILTER", "SIZE",
+    "TO", "OF",
+})
+
+
+def _mask_literals(cypher: str) -> str:
+    """Blank out every string/identifier literal and comment, keeping LENGTH.
+
+    Every clause/`WHERE`/pattern scan below runs on this masked copy, so a
+    keyword inside `'a MATCH b'`, `` `n` ``, `// MATCH` or `/* MATCH */` is data
+    or prose and cannot be mistaken for syntax — the same discipline
+    :func:`_unsupported_cypher_operator` already applies for `=~`. Because the
+    length is preserved, an index into the mask is the same index into the
+    original, and the ORIGINAL text is what gets sliced for predicates/patterns.
+    """
+    if not isinstance(cypher, str):
+        return ""
+    out = list(cypher)
+    i, n = 0, len(cypher)
+    while i < n:
+        c = cypher[i]
+        if c in ("'", '"', "`"):
+            end = _skip_cypher_quoted(cypher, i, c)
+        elif c == "/" and i + 1 < n and cypher[i + 1] == "/":
+            stop = min(
+                [j for j in (cypher.find("\n", i + 2), cypher.find("\r", i + 2))
+                 if j != -1], default=-1)
+            end = n if stop == -1 else stop
+        elif c == "/" and i + 1 < n and cypher[i + 1] == "*":
+            close = cypher.find("*/", i + 2)
+            end = n if close == -1 else close + 2
+        else:
+            i += 1
+            continue
+        for j in range(i, end):
+            if out[j] not in ("\n", "\r"):
+                out[j] = " "
+        i = end
+    return "".join(out)
+
+
+def _brace_depth(masked: str, index: int) -> int:
+    """`{` nesting at *index* — 0 is the statement's own (top) query level.
+
+    Only braces matter: `CALL { … }` and `EXISTS { … }` open a new scope whose
+    inner `MATCH`/`WHERE` must NOT be read as a top-level clause, while `( … )`
+    and `[ … ]` are pattern-local and leave the level unchanged.
+    """
+    return masked.count("{", 0, index) - masked.count("}", 0, index)
+
+
+def _predicate_vars(predicate: str) -> set[str]:
+    """Identifiers a `WHERE` predicate could be constraining.
+
+    Parameters (`$ids`), property accesses (`n.id`) and function names (`toLower(`)
+    are stripped first: none of them can be a variable bound by a later pattern,
+    so leaving them in would over-trigger the barrier. Over-collecting is
+    otherwise harmless — a variable is only ever considered when a later MATCH
+    actually RE-BINDS that same name.
+    """
+    text = _mask_literals(predicate)
+    text = _PARAM_RE.sub(" ", text)
+    text = _PROPERTY_ACCESS_RE.sub(" ", text)
+    text = _FUNCTION_CALL_RE.sub(" ", text)
+    return {
+        tok for tok in _IDENT_RE.findall(text)
+        if tok.upper() not in _CYPHER_RESERVED
+    }
+
+
+def _predicate_drop_barrier(cypher: str) -> str:
+    """Insert a `WITH *` barrier before a plain MATCH that re-binds a filtered var.
+
+    The #6976 shape: `MATCH … WHERE <pred on V>` followed, at the same query
+    level, by a plain `MATCH` whose pattern re-binds `V`. On the affected engines
+    the predicate is DROPPED and foreign rows are returned. `WITH *` between them
+    keeps the predicate bound.
+
+    Conservative by construction, one barrier per qualifying `WHERE`:
+
+    * only a PLAIN `MATCH` triggers — a later `OPTIONAL MATCH` is MEASURED
+      unaffected, and `WITH`/`RETURN`/`UNION` already end the scope;
+    * the trigger is an INTERSECTION — the later pattern must re-bind a name the
+      predicate actually references, so an unrelated expansion is untouched;
+    * top-level only (`_brace_depth == 0`) — a nested `CALL { … }`/`EXISTS { … }`
+      has its own scope and is skipped;
+    * idempotent — after insertion the clause after the `WHERE` is the `WITH`,
+      which is not a plain `MATCH`, so a second pass inserts nothing.
+
+    Returns *cypher* unchanged when the shape is absent (including a non-str).
+    """
+    if not isinstance(cypher, str) or not cypher:
+        return cypher
+    masked = _mask_literals(cypher)
+    clauses = [
+        m for m in _CLAUSE_STARTER_RE.finditer(masked)
+        if _brace_depth(masked, m.start()) == 0
+    ]
+    if not clauses:
+        return cypher
+    insertions: set[int] = set()
+    for where in _WHERE_RE.finditer(masked):
+        w_start, w_end = where.start(), where.end()
+        if _brace_depth(masked, w_start) != 0:
+            continue
+        # The clause this WHERE modifies.
+        preceding = None
+        for clause in clauses:
+            if clause.end() <= w_start:
+                preceding = clause
+            else:
+                break
+        if preceding is None or preceding.group().upper().split() != ["MATCH"]:
+            continue
+        # The predicate runs to the next clause; that clause must be a plain MATCH.
+        following = None
+        for clause in clauses:
+            if clause.start() >= w_end:
+                following = clause
+                break
+        if following is None or following.group().upper().split() != ["MATCH"]:
+            continue
+        pred_vars = _predicate_vars(cypher[w_end:following.start()])
+        if not pred_vars:
+            continue
+        # The re-binding MATCH's own pattern runs to its next clause/WHERE.
+        pattern_end = len(cypher)
+        for nxt in _CLAUSE_STARTER_RE.finditer(masked, following.end()):
+            if _brace_depth(masked, nxt.start()) == 0:
+                pattern_end = nxt.start()
+                break
+        for nxt in _WHERE_RE.finditer(masked, following.end()):
+            if _brace_depth(masked, nxt.start()) == 0:
+                pattern_end = min(pattern_end, nxt.start())
+                break
+        rebound = set(_PATTERN_VAR_RE.findall(masked[following.end():pattern_end]))
+        if rebound & pred_vars:
+            insertions.add(following.start())
+    if not insertions:
+        return cypher
+    for at in sorted(insertions, reverse=True):
+        cypher = f"{cypher[:at]}WITH * {cypher[at:]}"
+    return cypher
+
+
+#: ``MODULE LIST`` encodes the engine as ``MAJOR*10000 + MINOR*100 + PATCH``
+#: (measured: 4.20.4 -> 42004, 6.0.1 -> 60001). The predicate drop is present
+#: in the 6.x line and absent from the 4.x line this repo pins, so the barrier
+#: is emitted for ``>= 6.0.0`` — and for an UNREADABLE version, because the
+#: barrier is a measured no-op on the engines that already bind while a missing
+#: barrier is a SILENT filter bypass. A wrong probe must never be a false CLEAN.
+_PREDICATE_DROP_AFFECTED_FROM = (6, 0, 0)
+_ENGINE_VERSION_MARKER = "_tortoise_falkordb_engine_version"
+
+
+def _graph_module_version(client):
+    """``(major, minor, patch)`` of the FalkorDB ``graph`` module, else ``None``.
+
+    Read from ``MODULE LIST`` — the same channel
+    :func:`tortoise.acl_graph_users._falkordb_present` uses — and decoded from the
+    module's own ``ver`` integer. Every failure mode (a bare redis with no graph
+    module, a permission error, a duck-typed double, a closed socket) returns
+    ``None``, which the caller treats as UNKNOWN rather than as safe.
+    """
+    try:
+        rows = client.execute_command("MODULE", "LIST") or []
+    except Exception:
+        return None
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            continue
+        fields = {
+            str(_as_text(row[i])).lower(): _as_text(row[i + 1])
+            for i in range(0, len(row) - 1, 2)
+        }
+        if fields.get("name") not in ("graph", "falkordb"):
+            continue
+        try:
+            n = int(fields.get("ver"))
+        except (TypeError, ValueError):
+            return None
+        return (n // 10000, (n // 100) % 100, n % 100)
+    return None
+
+
+def _engine_module_version(client):
+    """Cached :func:`_graph_module_version` — ONE probe per client, not per query.
+
+    Cached as a 1-tuple so an UNREADABLE version is cached too: storing a bare
+    ``None`` would be indistinguishable from "not probed yet" and re-issue
+    ``MODULE LIST`` on every query. A client that refuses the attribute
+    (``__slots__``) is probed every time, which is correct if slower.
+    """
+    if client is None:
+        return None
+    cached = getattr(client, _ENGINE_VERSION_MARKER, None)
+    if cached is not None:
+        return cached[0]
+    version = _graph_module_version(client)
+    with contextlib.suppress(Exception):
+        setattr(client, _ENGINE_VERSION_MARKER, (version,))
+    return version
+
+
+def _engine_needs_predicate_barrier(client) -> bool:
+    """Whether *client*'s engine needs the `WITH *` barrier (`True` if unknown).
+
+    The decision is made ONCE per client from the server's own version, not
+    assumed per call site (the gap that let 27 hand-patched literals coexist with
+    an engine that still drops the predicate). An UNREADABLE version is treated
+    as affected: the barrier is a measured no-op on the engines that already
+    bind, while a missing barrier is a SILENT filter bypass — a wrong probe must
+    never be a false CLEAN.
+    """
+    version = _engine_module_version(client)
+    if version is None:
+        return True
+    return version >= _PREDICATE_DROP_AFFECTED_FROM
+
+
+def _predicate_barrier_required(handle) -> bool:
+    """Whether the engine behind *handle* needs the barrier (`True` if unknown).
+
+    A HANDLE-level convenience over :func:`_engine_needs_predicate_barrier`: it
+    resolves ``handle.client`` first. The two MUST stay separate — a raw command
+    channel holds the CLIENT, not a handle, and passing a client here would read
+    ``client.client`` (absent) and silently downgrade every version to UNKNOWN.
+    """
+    client = getattr(handle, "client", None) if handle is not None else None
+    return _engine_needs_predicate_barrier(client)
+
+
+def _guard_query(cypher: str, params=None, *, handle=None) -> str:
+    """Both pre-dispatch refusals, then the #7162 normaliser; returns the statement.
+
+    This is the ONE place the refusals TURN INTO a decision, and now also the one
+    place the predicate barrier is applied — every guarded entry point calls it,
+    so a new builder inherits both without remembering to opt in. The RETURN
+    VALUE is the statement to dispatch: callers must send it, not their original
+    argument (the barrier is an insertion into the text).
+    """
     _guard_unsupported_cypher(cypher)
     _guard_numeric_params(params)
+    if _predicate_barrier_required(handle):
+        return _predicate_drop_barrier(cypher)
+    return cypher
 
 
 #: #7174/#5011: set while a REPLAY is writing. A journal is a FILE — a record
@@ -353,8 +661,8 @@ def _as_text(value):
     return value
 
 
-def _guard_execute_command(args) -> None:
-    """Refuse a ``=~`` in a raw ``execute_command`` payload.
+def _guard_execute_command(args, client=None):
+    """Refuse a ``=~`` in a raw ``execute_command`` payload; return args to send.
 
     The vendor binds ``Graph.execute_command = client.execute_command`` as an
     INSTANCE attribute, so it is NOT shadowed by a class-level method; the
@@ -364,6 +672,13 @@ def _guard_execute_command(args) -> None:
     is positional (``(cmd, graph_name, cypher, ...)``). Every other command
     (``GRAPH.DELETE``, ``GRAPH.COPY``, ``GRAPH.CONFIG``, ``INFO``, ...) and
     every non-``GRAPH`` command is forwarded untouched.
+
+    #7162 — the returned tuple is the statement to SEND: the #7162 normaliser can
+    insert a ``WITH *`` barrier into ``args[2]``, exactly as it does on the
+    ``query(...)`` verb. The caller must dispatch the RETURN VALUE, not ``args``.
+    The barrier decision rides on *client* the same way it does on a handle (an
+    unknown engine gets the barrier), so the raw command channel cannot be the
+    hole a new caller slips through.
 
     #7174 — deliberately NO numeric check here, and the reason is MEASURED, not
     assumed: a raw ``GRAPH.QUERY`` has no positional params argument. The pinned
@@ -386,6 +701,11 @@ def _guard_execute_command(args) -> None:
             and isinstance(statement, str)
         ):
             _guard_unsupported_cypher(statement)
+            if _engine_needs_predicate_barrier(client):
+                barred = _predicate_drop_barrier(statement)
+                if barred != statement:
+                    return tuple([args[0], args[1], barred, *args[3:]])
+    return args
 
 
 class _GuardedExecuteCommand:
@@ -400,30 +720,33 @@ class _GuardedExecuteCommand:
     "already guarded" and skip the guard entirely.
     """
 
-    __slots__ = ("__weakref__", "_raw")
+    __slots__ = ("__weakref__", "_client", "_raw")
 
-    def __init__(self, raw):
+    def __init__(self, raw, client=None):
         self._raw = raw
+        self._client = client
 
     def __call__(self, *args, **kwargs):
-        _guard_execute_command(args)
-        return self._raw(*args, **kwargs)
+        return self._raw(*_guard_execute_command(args, self._client), **kwargs)
 
 
 setattr(_GuardedExecuteCommand, _GUARDED_CHANNEL_MARKER, True)
 
 
-def _guarded_execute_command(raw):
+def _guarded_execute_command(raw, client=None):
     """Wrap a bound ``execute_command`` with :func:`_guard_execute_command`.
 
     Idempotent: an already-guarded channel — or ``None`` — is returned
     unchanged, so a client and its connection (or two clients sharing one
     connection) cannot stack wrappers. The test is :func:`_carries_marker`, the
     module's unforgeable MRO read — see :class:`_GuardedExecuteCommand`.
+
+    *client* rides along so the wrapper's own ``GRAPH.QUERY`` payload gets the
+    same engine-version decision its handle verbs do (#7162).
     """
     if raw is None or _carries_marker(raw, _GUARDED_CHANNEL_MARKER):
         return raw
-    return _GuardedExecuteCommand(raw)
+    return _GuardedExecuteCommand(raw, client)
 
 
 #: The command-entry attributes a client connection exposes. BOTH are bound when
@@ -435,7 +758,7 @@ def _guarded_execute_command(raw):
 _CONNECTION_COMMAND_ATTRS = ("execute_command", "_execute_command")
 
 
-def _guard_connection(conn) -> bool:
+def _guard_connection(conn, client=None) -> bool:
     """Guard a client's raw command channel IN PLACE. True when anything wrapped.
 
     ``falkordb.FalkorDB.__init__`` binds ``self.connection`` as an INSTANCE
@@ -476,7 +799,7 @@ def _guard_connection(conn) -> bool:
         raw = getattr(conn, attr, None)
         if raw is None:
             continue
-        wrapped = _guarded_execute_command(raw)
+        wrapped = _guarded_execute_command(raw, client)
         if wrapped is raw:
             continue
         setattr(conn, attr, wrapped)
@@ -510,28 +833,28 @@ class _UnsupportedOperatorGuardedQueries:
         # attribute that SHADOWS any method we define on this class. Re-bind it
         # AFTER the vendor assignment so the raw command channel is guarded too.
         super().__init__(client, name)
-        self.execute_command = _guarded_execute_command(client.execute_command)
+        self.execute_command = _guarded_execute_command(client.execute_command, client)
 
     def query(self, q, params=None, timeout=None):
-        _guard_query(q, params)
+        q = _guard_query(q, params, handle=self)
         return super().query(q, params=params, timeout=timeout)
 
     def ro_query(self, q, params=None, timeout=None):
-        _guard_query(q, params)
+        q = _guard_query(q, params, handle=self)
         return super().ro_query(q, params=params, timeout=timeout)
 
     def _query(self, q, params=None, timeout=None, read_only=False):
-        _guard_query(q, params)
+        q = _guard_query(q, params, handle=self)
         return super()._query(
             q, params=params, timeout=timeout, read_only=read_only
         )
 
     def profile(self, query, params=None):
-        _guard_query(query, params)
+        query = _guard_query(query, params, handle=self)
         return super().profile(query, params=params)
 
     def explain(self, query, params=None):
-        _guard_query(query, params)
+        query = _guard_query(query, params, handle=self)
         return super().explain(query, params=params)
 
     def copy(self, clone):
@@ -558,36 +881,37 @@ class _GuardedHandleProxy:
     so a narrow duck-typed ``query(self, q)`` stays callable.
     """
 
-    __slots__ = ("__weakref__", "_handle")
+    __slots__ = ("__weakref__", "_client", "_handle")
 
     def __init__(self, handle):
         self._handle = handle
+        self._client = getattr(handle, "client", None)
 
     def query(self, q, params=None, timeout=None):
-        _guard_query(q, params)
+        q = _guard_query(q, params, handle=self._handle)
         return _forward_query(self._handle.query, q, params, timeout)
 
     def ro_query(self, q, params=None, timeout=None):
-        _guard_query(q, params)
+        q = _guard_query(q, params, handle=self._handle)
         return _forward_query(self._handle.ro_query, q, params, timeout)
 
     def _query(self, q, params=None, timeout=None, read_only=False):
-        _guard_query(q, params)
+        q = _guard_query(q, params, handle=self._handle)
         extra = {"read_only": True} if read_only else {}
         return _forward_query(
             self._handle._query, q, params, timeout, **extra
         )
 
     def profile(self, query, params=None):
-        _guard_query(query, params)
+        query = _guard_query(query, params, handle=self._handle)
         return _forward_query(self._handle.profile, query, params)
 
     def explain(self, query, params=None):
-        _guard_query(query, params)
+        query = _guard_query(query, params, handle=self._handle)
         return _forward_query(self._handle.explain, query, params)
 
     def execute_command(self, *args, **kwargs):
-        _guard_execute_command(args)
+        args = _guard_execute_command(args, self._client)
         return self._handle.execute_command(*args, **kwargs)
 
     def copy(self, clone):
@@ -617,12 +941,12 @@ class _GuardedClientProxy:
         # hand back the unguarded bound method (#3595 review).
         raw = getattr(client, "execute_command", None)
         if raw is not None:
-            self.execute_command = _guarded_execute_command(raw)
+            self.execute_command = _guarded_execute_command(raw, client)
         # #6882: the proxied client's connection is the same second channel.
         # Mutated IN PLACE — the proxy itself is untouched, so ``__slots__`` is
         # unchanged — which makes ``__getattr__("connection")`` return a
         # guarded channel instead of the raw one.
-        _guard_connection(getattr(client, "connection", None))
+        _guard_connection(getattr(client, "connection", None), client)
 
     def select_graph(self, graph_id):
         return _guard_handle(self._client.select_graph(graph_id))
@@ -796,13 +1120,13 @@ def guarded_client_class(base_client):
             # channel at all is left alone.
             raw = getattr(self, "execute_command", None)
             if raw is not None:
-                self.execute_command = _guarded_execute_command(raw)
+                self.execute_command = _guarded_execute_command(raw, self)
             # #6882: the client's CONNECTION is a SECOND command channel and it
             # was raw — ``proj.db.connection.execute_command("GRAPH.QUERY", …)``
             # (and ``graph.client.connection.…``) reached the wire unrefused.
             # Guarded IN PLACE so the object, its type and every forwarded
             # attribute survive; no-ops on a duck-typed base with no connection.
-            _guard_connection(getattr(self, "connection", None))
+            _guard_connection(getattr(self, "connection", None), self)
 
         def select_graph(self, graph_id):
             return _guard_handle(super().select_graph(graph_id))

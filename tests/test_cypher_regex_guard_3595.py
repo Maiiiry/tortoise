@@ -374,10 +374,23 @@ def test_raw_select_graph_handle_refuses_every_other_query_entry_point(verb):
 
 
 def test_raw_select_graph_supported_query_reaches_the_wire():
-    """Anti-overfix guard: the guarded handle still passes supported queries."""
+    """Anti-overfix guard: the guarded handle still passes supported queries.
+
+    #7162: the engine-version probe is a SECOND, one-time command on this wire —
+    the lazy, per-client read that gates the `WITH *` barrier. Both halves are
+    pinned here: the supported statement reaches the wire BYTE-IDENTICAL (it
+    carries no defect shape, so nothing is inserted), and the probe is issued
+    ONCE per client rather than once per query.
+    """
     g, wire = _guarded_vendor_handle()
-    g.query("MATCH (n) WHERE n.id STARTS WITH 'obj-' RETURN n.id")
-    assert len(wire.commands) == 1, wire.commands
+    statement = "MATCH (n) WHERE n.id STARTS WITH 'obj-' RETURN n.id"
+    g.query(statement)
+    assert [c[0] for c in wire.commands] == ["MODULE", "GRAPH.QUERY"], wire.commands
+    assert wire.commands[1][2] == statement, "a legitimate query was rewritten"
+    g.query(statement)
+    assert [c[0] for c in wire.commands] == [
+        "MODULE", "GRAPH.QUERY", "GRAPH.QUERY"
+    ], f"the version probe is per-QUERY, not per-client: {wire.commands}"
 
 
 def test_projection_wrapper_refuses_on_every_query_entry_point():
@@ -561,11 +574,14 @@ def test_the_real_vendor_client_guards_the_handles_it_yields():
     g = client.select_graph("g")
     assert isinstance(g, falkordb.Graph), "the vendor Graph contract was broken"
     g.query("MATCH (n) WHERE n.id STARTS WITH 'obj-' RETURN n.id")
-    assert len(wire) == 1, wire
+    # #7162: one engine-version probe, then the dispatch. The probe is the
+    # per-client read that gates the `WITH *` barrier; it is issued lazily, so a
+    # REFUSED statement below never causes one.
+    assert [c[0] for c in wire] == ["MODULE", "GRAPH.QUERY"], wire
     with pytest.raises(UnsupportedCypherOperatorError) as exc:
         g.query(LEGACY_SHAPE_CHECK)
     assert exc.value.operator == "=~"
-    assert len(wire) == 1, "the unsupported statement reached the wire"
+    assert len(wire) == 2, "the unsupported statement reached the wire"
 
 
 def test_the_embedded_client_class_is_guarded_too():
@@ -690,7 +706,11 @@ def test_execute_command_refuses_the_operator_in_a_bytes_payload():
     assert wire.commands == [], "the bytes payload reached the wire"
     # A supported bytes query still passes through.
     g.execute_command(b"GRAPH.QUERY", b"g", b"RETURN 1")
-    assert wire.commands == [(b"GRAPH.QUERY", b"g", b"RETURN 1")]
+    # #7162: the one-time per-client engine-version probe precedes the dispatch;
+    # the supported statement itself is forwarded byte-for-byte.
+    assert wire.commands == [
+        ("MODULE", "LIST"), (b"GRAPH.QUERY", b"g", b"RETURN 1")
+    ], wire.commands
 
 
 def test_the_client_command_channel_is_guarded_too():
