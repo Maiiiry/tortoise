@@ -848,12 +848,13 @@ def test_on_record_predicate_has_one_source(monkeypatch):
 
 #: The DECLARED residual raw builders — ``_backup_config_safe()`` /
 #: ``load_config()`` -> ``_alert_store_from`` — that bypass the ALERT-only
-#: policy in ``alert_channel.incident_alert_store`` (D5a class). Each is a
-#: follow-up issue, not a licence for a seventh: a NEW site must route through
-#: ``_incident_alert_store`` instead. Counted by AST call node, so a docstring
-#: mention (``hosted_api._incident_alert_store``'s seam map has one) is not
-#: mistaken for a call site.
-_DECLARED_RAW_BUILDER_SITES = {"hosted_api.py": 4, "notify.py": 2}
+#: policy in ``alert_channel.incident_alert_store`` (D5a class). **The set is now
+#: EMPTY**: #4778 routed every site through the seam, so a raw site is no longer
+#: a known residual but a REGRESSION — the fix is to route it through
+#: ``_incident_alert_store``, never to add it here. Counted by AST call node, so
+#: a docstring mention (``hosted_api._incident_alert_store``'s seam map has one)
+#: is not mistaken for a call site.
+_DECLARED_RAW_BUILDER_SITES: dict[str, int] = {}
 
 
 def _raw_builder_call_sites() -> dict[str, int]:
@@ -875,16 +876,22 @@ def _raw_builder_call_sites() -> dict[str, int]:
 
 
 def test_no_new_raw_alert_channel_builder_sites():
-    """Recurrence guard for the D5a class this PR partly removes.
+    """Recurrence guard for the D5a class #4778 REMOVED.
 
     The raw chain builds the channel WITHOUT the ALERT-only policy, so a site
-    on it is silently sweep-gated. The sites below are the declared, filed
-    residuals; a new one turns this RED, which is the point — the fix is to
-    route it through the seam, not to bump the number here.
+    on it is silently sweep-gated: its incidents are invisible on a deployment
+    whose backups are off (the production default). #4778 routed all six sites
+    (``hosted_api.py`` x4, ``notify.py`` x2) through ``_incident_alert_store``,
+    so the declared residual set is EMPTY — any site now turns this RED.
+
+    The fix is ALWAYS to route the site through the seam; never to add it to
+    ``_DECLARED_RAW_BUILDER_SITES``.
     """
     assert _raw_builder_call_sites() == _DECLARED_RAW_BUILDER_SITES, (
-        "a raw alert-channel builder site was added or removed; the declared "
-        "residual set is " + repr(_DECLARED_RAW_BUILDER_SITES))
+        "a raw alert-channel builder site exists; the declared residual set is "
+        + repr(_DECLARED_RAW_BUILDER_SITES)
+        + " — route the site through `_incident_alert_store` instead"
+    )
 
 
 def test_kind_constants_match_the_runbook():

@@ -2205,8 +2205,27 @@ async def _lifespan(app):
                         return None
 
                 from tortoise.alert_store import WRITER_WATCHER
+                # #4778: the ALERT-only policy seam, not the sweep-gated raw
+                # chain. `cfg` is non-None here (the branch above requires it),
+                # so this builds the SAME store
+                # `_alert_store_from(cfg, writer=WRITER_WATCHER)` built — the
+                # difference is that the channel now comes from the ONE declared
+                # builder, so the D5a class of raw sites is REMOVED rather than
+                # merely enumerated by a guard.
+                watcher_alerts = _incident_alert_store(writer=WRITER_WATCHER)
+                if watcher_alerts is None:
+                    # Reachable only where the raw constructor RAISED (an
+                    # unusable object store): `incident_alert_store` answers
+                    # None instead. Re-raising keeps #2922's contract — the
+                    # enclosing handler logs loudly and records
+                    # `_WATCHER_START_ERROR`, so a watcher with no channel is
+                    # never a silent "all clear".
+                    raise RuntimeError(
+                        "backup watcher alert channel unavailable (no "
+                        "DR_ISSUES_PAT, or the object store cannot be built)"
+                    )
                 watcher = BackupWatcher(
-                    _backup_storage(), _alert_store_from(cfg, writer=WRITER_WATCHER),
+                    _backup_storage(), watcher_alerts,
                     org_provider=_sweep_orgs,
                     eligible_provider=_eligible_orgs if cfg.org_sweep_enabled else None,
                     graph_provider=_graph_provider,
@@ -32955,20 +32974,36 @@ async def backups_sweep(request: Request):
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=f"Sweep failed: {e}")  # noqa: B904
 
-        alerts = _alert_store_from(cfg)
+        # #4778: the ALERT-only policy seam. `cfg` is non-None here (the handler
+        # 503s otherwise), so this is the store the raw chain built — but the
+        # channel now comes from the ONE declared builder, and that builder
+        # ANSWERS None instead of raising when no channel can exist, which both
+        # loops below REPORT rather than swallow.
+        alerts = _incident_alert_store()
         alerts_failed = []
-        for inc in result.get("incidents", []):
-            try:
-                # #2313: graph-scoped incidents (custom graphs) route under
-                # the "{org}:{gid}" subject — coherent with the watcher and
-                # re-baseline. Default/org incidents keep the bare org.
-                await asyncio.to_thread(
-                    alerts.open_incident, inc["kind"],
-                    _incident_subject(inc), inc.get("detail")
-                )
-            except Exception as e:  # incident-filing must never fail the run (review P3)
-                _logger.warning("incident routing failed for %s: %s", inc.get("kind"), e)
-                alerts_failed.append(inc.get("kind"))
+        if alerts is None:
+            # No channel (no `DR_ISSUES_PAT`, or an unusable object store):
+            # every incident this run emitted is UNSENT, and the response must
+            # say so — a sweep whose incidents vanished silently reads as a
+            # clean sweep.
+            alerts_failed = [inc.get("kind") for inc in result.get("incidents", [])]
+            _logger.warning(
+                "sweep incidents could not be filed: no alert channel "
+                "(DR_ISSUES_PAT unset, or the object store is unusable)"
+            )
+        else:
+            for inc in result.get("incidents", []):
+                try:
+                    # #2313: graph-scoped incidents (custom graphs) route under
+                    # the "{org}:{gid}" subject — coherent with the watcher and
+                    # re-baseline. Default/org incidents keep the bare org.
+                    await asyncio.to_thread(
+                        alerts.open_incident, inc["kind"],
+                        _incident_subject(inc), inc.get("detail")
+                    )
+                except Exception as e:  # incident-filing must never fail the run (review P3)
+                    _logger.warning("incident routing failed for %s: %s", inc.get("kind"), e)
+                    alerts_failed.append(inc.get("kind"))
         if alerts_failed:
             result["alerts_failed"] = alerts_failed
 
@@ -32990,6 +33025,12 @@ async def backups_sweep(request: Request):
         failed: list[str] = []
         open_cache: dict[str, set[str]] = {}
         for kind, subject in candidates:
+            if alerts is None:
+                # #4778: no channel — the resolve cannot be attempted, and the
+                # run must not read as clean (the same contract the failed-close
+                # branch below enforces for a raised close).
+                failed.append(f"{kind}/{subject}" if subject else kind)
+                continue
             try:
                 if kind not in open_cache:
                     # strict: a failed LIST must not be indistinguishable from
@@ -33414,7 +33455,14 @@ async def backups_rebaseline(request: Request):
     if graph_id == "default":
         _write_json(storage, f"ops/teams/{org_id}/state.json", state)
     subject = f"{org_id}:{graph_id}" if graph_id != "default" else org_id
-    alerts = _alert_store_from(_backup_config_safe())
+    # #4778/#4777: the ALERT-only policy seam. The raw chain handed
+    # `_backup_config_safe()` — None whenever `BACKUP_SWEEP_ENABLED` is off (the
+    # production default) — to a constructor that dereferences it, so a
+    # sweep-disabled re-baseline raised AFTER the recovery writes above and
+    # BEFORE both resolves, stranding the incidents behind a 500. The seam is
+    # ungated on the sweep switch, and it ANSWERS None (instead of raising) when
+    # there is no channel at all — which `_resolve_incidents` now reports.
+    alerts = _incident_alert_store()
     # #3718 round-3 review P2: both resolves are blocking NETWORK round
     # trips — a storage read plus a GitHub issue close / Telegram push — the
     # same offload `backups_sweep` already gives `alerts.open_incident`.
@@ -33432,6 +33480,11 @@ async def backups_rebaseline(request: Request):
     # per kind so the operator can re-run re-baseline after GitHub recovers.
     def _resolve_incidents() -> list[str]:
         failed: list[str] = []
+        if alerts is None:
+            # #4778: no channel — nothing can be resolved. Report it per kind so
+            # the operator never reads a 200 as "the incident closed".
+            return [f"{k}/{subject}"
+                    for k in ("DATA_LOSS_CANDIDATE", "SIZE_GUARD_ABORT")]
         for kind in ("DATA_LOSS_CANDIDATE", "SIZE_GUARD_ABORT"):
             try:
                 alerts.resolve_incident(kind, subject)
@@ -33732,27 +33785,47 @@ async def backups_drill_scheduled(request: Request):
     # the registry namespace (see _control_plane_source's docstring).
     _data_sdk, db = await asyncio.to_thread(_data_plane_db)
     storage = _backup_storage()
-    alerts = _alert_store_from(cfg)
+    # #4778: the ALERT-only policy seam (`cfg` is non-None here — the handler
+    # 503s otherwise — so this is the store the raw chain built). It ANSWERS
+    # None when no channel can exist, and a scheduled drill whose
+    # RESTORE_DRILL_FAILED could not be filed is exactly the silence D5a
+    # forbids — so every use below is guarded, and every skip is logged rather
+    # than degrading into an AttributeError caught by the wrong handler.
+    alerts = _incident_alert_store()
+    if alerts is None:
+        _logger.warning(
+            "scheduled drill is running WITHOUT an alert channel "
+            "(DR_ISSUES_PAT unset, or the object store is unusable) — a "
+            "RESTORE_DRILL_FAILED this run would be UNSENT and any open "
+            "incident stays OPEN"
+        )
     try:
         result = await asyncio.to_thread(
             _scheduled_drill, cfg=cfg, registry=registry, db=db, storage=storage,
         )
     except ValueError as e:
-        try:
-            await asyncio.to_thread(
-                alerts.open_incident, _DRILL_FAILED_KIND, "global",
-                # #3293: an exception MESSAGE is app-controlled text and this
-                # detail is published verbatim into a PUBLIC issue body
-                # (``alert_store._body``). ``error_type`` is the bounded half
-                # the other operator incidents already carry
-                # (``operator_alert.alert_abuse_fault``); the message goes
-                # through the publication scrubber before it joins it.
-                {"error_type": type(e).__name__,
-                 "error": redact_for_publication(str(e)),
-                 "source": "drill-scheduled"},
+        if alerts is None:
+            _logger.error(
+                "RESTORE_DRILL_FAILED NOT FILED (no alert channel) — the "
+                "scheduled drill was rejected: %s",
+                redact_for_publication(str(e)),
             )
-        except Exception:
-            _logger.warning("RESTORE_DRILL_FAILED open failed (ValueError path)", exc_info=True)
+        else:
+            try:
+                await asyncio.to_thread(
+                    alerts.open_incident, _DRILL_FAILED_KIND, "global",
+                    # #3293: an exception MESSAGE is app-controlled text and this
+                    # detail is published verbatim into a PUBLIC issue body
+                    # (``alert_store._body``). ``error_type`` is the bounded half
+                    # the other operator incidents already carry
+                    # (``operator_alert.alert_abuse_fault``); the message goes
+                    # through the publication scrubber before it joins it.
+                    {"error_type": type(e).__name__,
+                     "error": redact_for_publication(str(e)),
+                     "source": "drill-scheduled"},
+                )
+            except Exception:
+                _logger.warning("RESTORE_DRILL_FAILED open failed (ValueError path)", exc_info=True)
         # #3293 review: the response body is echoed verbatim into a PUBLIC
         # Actions log by the drill drivers (``registry-drill*.sh``), so the
         # raw exception is a publication sink too — scrub it here, not only in
@@ -33763,18 +33836,24 @@ async def backups_drill_scheduled(request: Request):
             detail=f"Drill rejected: {redact_for_publication(str(e))}",
         ) from e
     except RuntimeError as e:
-        try:
-            await asyncio.to_thread(
-                alerts.open_incident, _DRILL_FAILED_KIND, "global",
-                # #3293: see the ValueError path above — same public sink, same
-                # scrub. This is the path a STORAGE error takes, i.e. the one
-                # most likely to echo a signed URL or endpoint in its message.
-                {"error_type": type(e).__name__,
-                 "error": redact_for_publication(str(e)),
-                 "source": "drill-scheduled"},
+        if alerts is None:
+            _logger.error(
+                "RESTORE_DRILL_FAILED NOT FILED (no alert channel) — the "
+                "scheduled drill failed: %s", redact_for_publication(str(e)),
             )
-        except Exception:
-            _logger.warning("RESTORE_DRILL_FAILED open failed (RuntimeError path)", exc_info=True)
+        else:
+            try:
+                await asyncio.to_thread(
+                    alerts.open_incident, _DRILL_FAILED_KIND, "global",
+                    # #3293: see the ValueError path above — same public sink, same
+                    # scrub. This is the path a STORAGE error takes, i.e. the one
+                    # most likely to echo a signed URL or endpoint in its message.
+                    {"error_type": type(e).__name__,
+                     "error": redact_for_publication(str(e)),
+                     "source": "drill-scheduled"},
+                )
+            except Exception:
+                _logger.warning("RESTORE_DRILL_FAILED open failed (RuntimeError path)", exc_info=True)
         # #3293 review: see the ValueError path above — same public-Actions-log
         # sink, same boundary scrub.
         raise HTTPException(
@@ -33784,29 +33863,39 @@ async def backups_drill_scheduled(request: Request):
     if result.get("status") == "drill_ok" and not result.get("within_rto", True):
         # Restore succeeded but missed the committed RTO — incident-worthy
         # (restore speed is a target, not an accident).
-        try:
-            await asyncio.to_thread(
-                alerts.open_incident, _DRILL_FAILED_KIND, "global",
-                {
-                    "error": "restore exceeded the committed RTO",
-                    "duration_s": result.get("duration_s"),
-                    "rto_s": result.get("rto_s"),
-                    "org_id": (result.get("record") or {}).get("org_id"),
-                    "backup_key": (result.get("record") or {}).get("backup_key"),
-                    # #4233: if either GRAPH.COPY (pre-restore safety copy or
-                    # swap) outlived the restore's read bound, name it — that
-                    # is the attributable cause.
-                    "copy_read_bound_overrun": result.get(
-                        "copy_read_bound_overrun"),
-                },
+        if alerts is None:
+            _logger.error(
+                "RESTORE_DRILL_FAILED NOT FILED (no alert channel) — the "
+                "restore exceeded the committed RTO"
             )
-        except Exception:
-            _logger.warning("RESTORE_DRILL_FAILED open failed (RTO-breach path)", exc_info=True)
+        else:
+            try:
+                await asyncio.to_thread(
+                    alerts.open_incident, _DRILL_FAILED_KIND, "global",
+                    {
+                        "error": "restore exceeded the committed RTO",
+                        "duration_s": result.get("duration_s"),
+                        "rto_s": result.get("rto_s"),
+                        "org_id": (result.get("record") or {}).get("org_id"),
+                        "backup_key": (result.get("record") or {}).get("backup_key"),
+                        # #4233: if either GRAPH.COPY (pre-restore safety copy or
+                        # swap) outlived the restore's read bound, name it — that
+                        # is the attributable cause.
+                        "copy_read_bound_overrun": result.get(
+                            "copy_read_bound_overrun"),
+                    },
+                )
+            except Exception:
+                _logger.warning("RESTORE_DRILL_FAILED open failed (RTO-breach path)", exc_info=True)
     else:
         # success (or no eligible archive) closes any open incident. A failed
         # close has NO retry until the next monthly drill, so report it in the
         # response (final-cycle review P2 — the runbook claimed this field).
         try:
+            if alerts is None:
+                # #4778: no channel — the incident cannot be closed, and the run
+                # must REPORT it rather than return a `drill_ok` implying it was.
+                raise RuntimeError("no alert channel")
             await asyncio.to_thread(
                 alerts.resolve_incident, _DRILL_FAILED_KIND, "global"
             )
