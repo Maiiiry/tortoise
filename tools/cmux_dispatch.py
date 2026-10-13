@@ -287,6 +287,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Callable, Iterable
@@ -1472,11 +1473,51 @@ class CmuxResult:
     argv: list[str] = field(default_factory=list)
 
 
+#: ⛔ `cmux` IS NOT ON PATH FOR A DAEMON (measured 2026-10-13). The heartbeat's launchd
+#: environment carries NO PATH at all — `launchctl print gui/$UID/com.tortoise.heartbeat-loop`
+#: shows only SSH_AUTH_SOCK — so a bare `"cmux"` raises FileNotFoundError, `run()` returns rc=127,
+#: and the caller falls back to the durable inbox and logs `NOT DELIVERED … the lane did NOT get
+#: it`. Measured across pr-doctor's log: 164 `NOT DELIVERED` and 79 `no lane accepted the order` —
+#: the last mile looked automated while landing nothing. Same root cause as the degraded fleet read
+#: in lane-status.py (both are "a daemon cannot find a binary a login shell finds easily"), and the
+#: same class as the `gh` shim (#8246). Resolve explicitly; do not trust an inherited PATH.
+_CMUX_BIN_CANDIDATES = (
+    "/Applications/cmux.app/Contents/Resources/bin/cmux",
+    os.path.expanduser("~/.local/bin/cmux"),
+    "/opt/homebrew/bin/cmux",
+    "/usr/local/bin/cmux",
+)
+
+
+def _resolve_cmux(binary: str) -> str:
+    """Absolute path for a bare `cmux`. A caller-supplied path is left untouched.
+
+    ⛔ A MISS STAYS A MISS. If nothing is found this returns the original name, so `run()` still
+    raises FileNotFoundError and reports rc=127 LOUDLY. Resolution must never invent a binary, and
+    it must never quietly substitute a different program.
+    """
+    if os.sep in binary:
+        return binary                       # already a path — respect the caller
+    found = shutil.which(binary)
+    if found and "shims" not in found:
+        return found
+    # ⛔ NEVER SUBSTITUTE ONE BINARY FOR ANOTHER. An earlier version of this function fell through
+    # to the cmux candidates for ANY unresolved bare name, so `_resolve_cmux("nosuchx")` returned
+    # the cmux binary — a silent substitution, and the exact opposite of the "a miss stays a miss"
+    # rule this function documents. Caught by a non-vacuity check, not by the happy path.
+    if binary != "cmux":
+        return binary
+    for cand in _CMUX_BIN_CANDIDATES:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return binary
+
+
 class Cmux:
     """Thin, injectable wrapper over the cmux CLI."""
 
     def __init__(self, binary: str = "cmux", timeout: float = 30.0) -> None:
-        self.binary = binary
+        self.binary = _resolve_cmux(binary)
         self.timeout = timeout
 
     def run(self, argv: list[str], timeout: float | None = None) -> CmuxResult:
