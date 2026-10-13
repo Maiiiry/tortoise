@@ -55,6 +55,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "EXTRACTOR-V4-ARCHITECTURE.md"
+#: The sibling architecture document. Several of the claims below were asserted
+#: in BOTH documents, and a repair that fixes one copy while leaving the other
+#: is how the drift survived a pass — so the sibling is scanned too.
+SIBLING = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
 
 #: Literal sentences that were TRUE when the document was pinned and are FALSE
 #: at HEAD. Each was live in the pre-fix document (this file is red on it).
@@ -90,6 +94,20 @@ RETRACTED: dict[str, str] = {
     "§D's provenance table says `:Document` is still written and quota-counted": (
         "| `:Document` is written, read, **and quota-counted** (`quota.py:524`, `#1726`) |"
     ),
+}
+
+#: The same class of claim, asserted in the SIBLING document. A repair that
+#: edits one document and not the other leaves the pair asserting OPPOSITE facts
+#: about the same label — a contradiction between two documents — so these are
+#: pinned in the sibling as well.
+RETRACTED_IN_SIBLING: dict[str, str] = {
+    "the `:Document` writer is cited as live": "MERGE (d:Document {id:$id})",
+    "the `:Document` reader is cited as live": "ingest.py:188/266/307/412",
+    "`quota.py` is cited as metering `:Document`": "quota.py:524",
+    "`ONTOLOGY.md` §4.4 is cited as still declaring the label": (
+        "§4.4 still declares it"
+    ),
+    "the ontology half is cited as still-outstanding work": "filed as **`#5013`**",
 }
 
 #: The repaired passages must SAY what landed, not merely omit the old claim —
@@ -139,6 +157,19 @@ def test_the_retracted_passages_do_not_reappear():
         "these passages were false at the pin and are false at HEAD; the "
         "#8506 repair removed them, so their return means the document is "
         "re-rotating:\n  - " + "\n  - ".join(still_live)
+    )
+
+
+def test_the_sibling_document_does_not_carry_the_retracted_claims():
+    text = SIBLING.read_text(encoding="utf-8")
+    still_live = [
+        name for name, literal in RETRACTED_IN_SIBLING.items() if literal in text
+    ]
+    assert not still_live, (
+        "these claims were retracted for both architecture documents, and the "
+        "sibling still carries them — a repair that fixes one copy and leaves "
+        "the other makes the two documents contradict each other:\n  - "
+        + "\n  - ".join(still_live)
     )
 
 
