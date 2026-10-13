@@ -227,12 +227,12 @@ and §4.2:
 - **`Event`** — an *ontology* type: a domain occurrence ("what happened when"). Episodic layer.
 - **`GraphEvent`** — the graph's **own mutation journal** (34,020 exist). Not a domain occurrence.
 
-### Why these four are truth — the test is PER-WRITE, not per-class
+### Why these are truth — the test is PER-WRITE, not per-class
 
-**⚠️ CORRECTED 2026-09-23 after review. An earlier draft stated the test as *"append-only — rows are added, never updated"*. That test is FALSE for two of the four types it places in the truth layer**, and it put one class in both layers:
+**The naive test — *"append-only: rows are added, never updated"* — is FALSE for one of these types.**
 
 - `Source.updatedAt` is **set ON MATCH** by `_upsert_source`; `Source.reliability` is a **derived** query-time cache written onto the node (`#398`, `sdk.py:20667` `_write_reliability_cache`).
-- `Document.updatedAt` is set, and `doc_status` transitions **`captured`→`extracted`**. **⚠️ `doc_status` is RETIRED under D10/v3.15 (Q3)** — liveness is a READ, not a stored field, and this flip is **one of only two unjournalled raw-`SET` writes in the system** (`ingest.py:262-266`). The statement above describes the code **as it stands today**, not the target.
+- `Document.updatedAt` was set, and `doc_status` transitioned **`captured`→`extracted`** — **both retired under D10/v3.15 (Q3)**: `doc_status` is **RETIRED** (`tortoise/api.py:458`) and liveness is a READ, not a stored field. This was a second counterexample while `Document` was still a separate class; it is not one today.
 - **`Document ⊂ Object`** (`ONTOLOGY.md` §1/§4.4/§6 — `objectKind: document`), so the class appeared in **both** layers. **⚠️ SUPERSEDED (v3.15/D10): a document is a `:Source`, not an Object subclass** — see §9.3/§9.5. This bullet records the state that motivated the change.
 
 **✅ The test that DOES hold, and it binds at the WRITE/FIELD level rather than the class or table level:**
@@ -452,7 +452,7 @@ The extraction document states no target and no aggregate reduction; the number 
 
 **⚠️ STATUS — and the two documents disagreed until 2026-09-24** (extractor §9 records D8 as `DECIDED (retain half landed)`; this section is headed *PLACEMENT is DECIDED* as of 2026-10-06, and was headed *open* until then). **Both are right about different halves, and the split is the resolution:**
 
-- ✅ **RETAINING verbatim operational values is DECIDED and LANDED** — commit `4a690d0be` / PR `#2456` (2026-09-07): `STATE_VALUE_CARVE_OUT` (`extractor_v2.py:145-171`) plus `VALUE_FIDELITY_RULE` (`:230`, rendered into the S2/S4 `{anti_routine}` slot and appended to S1). **The rule reaches the model.**
+- ✅ **RETAINING verbatim operational values is DECIDED and LANDED** — commit `4a690d0be` / PR `#2456` (2026-09-07): `STATE_VALUE_CARVE_OUT` (`extractor_v2.py:145-171`) plus `VALUE_FIDELITY_RULE` (`:230`, rendered into the S2/S4 `{anti_routine}` slot via `_s2s4_rules()`, `:299`); **`_granularity_text()` (`:732-744`) appends `STATE_VALUE_CARVE_OUT` to S1.** **The rule reaches the model.**
 - ⛔ **What is MISSING is mechanical enforcement** — the rule was prompt-only; `valueGate` now EXISTS in code (`tortoise/value_gate.py`). **`#4899` is CLOSED** — whether the gate is enabled by default is not asserted here.
 - ✅ **PLACEMENT is NO LONGER OPEN — it is DECIDED (owner, 2026-10-06; the decision paragraph follows immediately below).** It was: whether a state value becomes a `Point`, or a **structural field on an entity**. The paragraphs AFTER the decision record the reasoning that was open when they were written.
 
@@ -756,7 +756,7 @@ The convergence is on **two layers with different jobs**: the **source** carries
 
 **⇒ This is why the version goes on the extraction link and not only on the source** — and it is why the storage cost lands on the edge, not on a document store.
 
-**Research:** `docs/research/2026-09-24-source-versioning/research-brief.md`. **Adoption gate: ADOPT** — no recorded decision contradicted; D7 governs it; the ontology's `§4.7` already declares the Source window; D30 bounds the cost. **Tracked:** `#5038` (open) · version-link work done: `#5024`, `#5025`, `#5026`.
+**Research:** `docs/research/2026-09-24-source-versioning/research-brief.md`. **Adoption gate: ADOPT** — no recorded decision contradicted; D7 governs it; the ontology's `§4.7` already declares the Source window; D30 bounds the cost. **Tracked:** `#5038` (open) · D10 code-half work done: `#5024`, `#5025`, `#5026`.
 
 #### ⭐ Where this stands (2026-09-25) — a status pointer, not a new rule
 

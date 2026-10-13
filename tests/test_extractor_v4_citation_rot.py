@@ -127,6 +127,9 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "the operator write path is cited as `:Point`/`:Event` only": (
         "the write path admits `:Point`/`:Event` only"
     ),
+    "the S1 slot is attributed to `VALUE_FIDELITY_RULE`": (
+        "`{anti_routine}` slot and appended to S1"
+    ),
 }
 
 #: The repaired passages must SAY what landed, not merely omit the old claim —
