@@ -11,6 +11,8 @@ aboutObjects: STORAGE-ARCHITECTURE.md, records ledger, vector index, raw storage
 
 # Storage Architecture — the physical layout of the record
 
+**This document states target state.** Decisions, issue states and code facts are stated as they are **now**, with their authority (`#N`, PR, or `file:line`). How a passage changed is not recorded here — history lives in git and the tracker.
+
 **Status:** design — **AMENDED 2026-10-08 to the owner's hybrid ruling** (§2.0): **Postgres is the system of record for every layer; FalkorDB is a derived hot cache.** Read §2.0 and §3's table first. **Scope:** where Tortoise's data physically lives, and what that costs. This document is written in the vocabulary of `docs/ONTOLOGY.md` (v3.15) — it does not introduce new layers.
 
 **⚠️ ONE WORD, TWO PRODUCTS — read this before any section mentioning "Supabase".** **Supabase *is* Postgres** (a managed Postgres is its core product). This document uses the single word for **three different things**, and the overload has already caused a real misreading — the owner asked *"why both Postgres and Supabase?"*, when **there is ONE database**: **(1)** the **Postgres vendor** (§14) · **(2)** the **Postgres database itself** (e.g. *"vectors move to Supabase Postgres (`pgvector`)"*, §12.1c — `pgvector` is a Postgres extension) · **(3)** **Supabase Storage**, the **object bucket** (true binaries only). **Every mention means one of these three; nothing here describes two databases.**
@@ -477,7 +479,7 @@ State values are personal/entity attribute values that must survive verbatim —
 | **Personal state** | *"personal best 5K = 27:12"* | retained (E2 carve-out, `#1534`) | retained |
 | **Operational / decision values** | *"p99 latency 480 ms at 3k rps"* | ⚠️ **RETAINED — the fix LANDED** (commit `4a690d0be`, 2026-09-07; PR `#2456`) | retained |
 
-**⚠️ THIS ROW WAS WRONG AND THE ERROR MATTERED.** An earlier draft said operational values are *"DROPPED as a mechanics token (`#2453`)"*. **`#2453` already landed.** `STATE_VALUE_CARVE_OUT` was **extended** with an operational-value paragraph — *"a concrete value that is the SUBJECT of a decision, observation, or plan is DURABLE too … Measurements, deadlines/freezes, thresholds/TTLs, versions, and counts are carried VERBATIM"* — with the very examples the draft called dropped (*"the p95 hit 4.2 seconds"*, *"a ten minute TTL"*). It is **rendered**, not merely defined (`_granularity_text()`, `:732-744`). **What is actually missing is MECHANICAL ENFORCEMENT** — the rule was prompt-only; `valueGate` now EXISTS in code (`tortoise/value_gate.py`) and **`#4899` is CLOSED**.
+**Operational values are DURABLE.** `#2453` landed and **extended** `STATE_VALUE_CARVE_OUT` with an operational-value paragraph — *"a concrete value that is the SUBJECT of a decision, observation, or plan is DURABLE too … Measurements, deadlines/freezes, thresholds/TTLs, versions, and counts are carried VERBATIM"* — covering *"the p95 hit 4.2 seconds"* and *"a ten minute TTL"*. It is **rendered, not merely defined** (`_granularity_text()`, `:732-744`), and a mechanical gate exists (`tortoise/value_gate.py` — `identifier_only()` strips identifier-like residues).
 
 **⚠️ Harmonise, do not duplicate.** `#2453` (retain operational values verbatim) · `#2817` (no numeric/locale canonicalisation exists — PT-BR/EN amounts) · `#2782` (money needs amount + currency on entities) · `#2521` (numeric aggregation across sessions) · `#2820` (tracking map — its **"state & value model"** workstream owns all of this). **Read this section together with extractor §7; neither can be built alone.**
 
@@ -491,11 +493,19 @@ State values are personal/entity attribute values that must survive verbatim —
 
 **This bounds how far volume reduction may go.** The Epistemic layer's operators (`IMPL`, `NAND`) act on **individual claims** — and the mitigation mechanism is the **`mitigated_by` edge on an operator Point**, graded by `mitigation_strength` (`ONTOLOGY.md` §3.9, `#2315`). ⚠️ *`MITIGATES` is **not** a registered predicate* — an earlier draft of this line listed it as one, which invites a lane to implement a type that does not exist. A Point containing several fused claims cannot be argued about:
 
-- Operators connect only epistemic targets (any of `:Point`/`:Subject`/`:Object`/`:Event`) — you cannot `NAND` a paragraph. ⚠️ `:Subject`/`:Object` operator endpoints are spec-only until #7902 lands — the write path admits `:Point`/`:Event` only (`ONTOLOGY.md` §3.1/§5).
+- Operators connect only epistemic targets (any of `:Point`/`:Subject`/`:Object`/`:Event`) — you cannot `NAND` a paragraph. The `:Subject`/`:Object` operator endpoints are live (`#7902`); the write path admits all four (`ONTOLOGY.md` §3.1/§5).
 - EP confidence propagates over a **factor graph of atomic claims**; a fused claim gives one confidence number to several distinct beliefs.
 - Relevance modulation (a mitigation reducing one claim's weight) requires the claims be separable.
 
-**⇒ Volume reduction must come from *not writing* claims, never from *fusing* them.** The extractor's move to atomic Points (`#1509` E3) is a **requirement of the epistemic layer**, not an optimisation — and this document must not be read as licence to merge them.
+**Every claim is a single logical Point.** Operators act on individual claims — you cannot `NAND` or `IMPL` a paragraph, nor modulate the relevance of a bundle. `#1509` E3 is a **requirement of the epistemic layer**, not an optimisation.
+
+**Two moves are permitted, one is forbidden:**
+
+- ✅ **De-duplicate** — near-duplicates may be `MERGE`d. Admissible set: `KEEP` / `NOOP` / `DISCARD` / `MERGE`.
+- ✅ **Discard noise** — a claim not worth keeping is not written.
+- ⛔ **Do not aggregate** — distinct claims are never combined into one composite claim. A combined claim carries a single confidence number for several distinct beliefs, which is exactly what the belief layer exists to avoid.
+
+**The aim is quality, not volume.** What enters the graph must be worth keeping — a durable memory, not noise. Compared with earlier extractors this yields fewer nodes, but that is a **consequence** of extracting better, **never a goal in its own right**. **No volume target exists in this document**; `M6` (§15) measures what was kept, so a quality change can be checked for what it discarded.
 
 ---
 
@@ -642,29 +652,17 @@ Two link types look like near-duplicates:
 | fold it into the node cap | ⛔ **silently starts metering ~2,193 sources** that were never metered — a price change disguised as a cleanup |
 | **keep it, re-point at `:Source`** | ✅ **keeps both the protection and the reason** |
 
-#### Q5 — the replay key: **fold, change the key, migrate — and it is free today.**
+#### Q5 — the replay key: **`:Document` → `coalesce(title, name)`; `:Source` → `url`.**
 
 A `:Document` resolved by `coalesce(title, name)`; a `:Source` resolves by `url`. **A source keyed the old way would resolve to nothing and mis-point the rebuilt edge.**
 
-**⭐ The whole risk is currently worth $0, and this is the single most time-sensitive item in D10:**
+**The fold and the key change are version-scoped**, so a `:Document` key and a `:Source` key are not interchangeable. `#2489`'s own boundary is that **rebuild does NOT repair pre-existing graphs** (a `#2500`-style backfill is explicitly out of scope), so a graph written before the change has no later recovery path.
 
-- **Production holds zero `:Document` nodes**, and
-- **the commit lane creator has never run** (`commit_count = 0`).
+#### ⚠️ T6 — a `:Source` re-materialises in place, and it is journalled
 
-**⇒ The migration is free NOW and stops being free the moment that lane first runs.** `#2489`'s own boundary is that **rebuild does NOT repair pre-existing graphs** (a `#2500`-style backfill is explicitly out of scope), so there is no later recovery path. **This is why Q5 cannot be deferred behind the commit lane.**
+`_upsert_source` bumps `updatedAt` / `version` / `contentHash` on an `ON MATCH` when the hash differs. **A source that is re-fetched and found changed is a NEW VERSION, not an edit.** That transition is **journalled as `SourceVersioned`** (`#5024`, `log.py:149`), whose fold delegates to the same `_upsert_source` fold `SourceCreated` rides — so §3's central invariant (`derived = replay(journal)`) holds and D7's append-only rule is honoured.
 
-#### ⚠️ And the finding that is NOT about D10 at all — **T6**
-
-While checking D10, a separate defect surfaced and it may be the more consequential one: **a `:Source` mutates in place.** `_upsert_source` bumps `updatedAt` / `version` / `contentHash` on an `ON MATCH` when the hash differs, and the hosted commit path flips a status — **neither is journalled.**
-
-**That breaks §3's central invariant** (`derived = replay(journal)`) **and it contradicts the field's own rule for evidence** — the append-only/write-once convergence is explicit that *"changes are handled by new correction events, not in-place edits"*, which is also what **our own D7** says. **A source that is re-fetched and found changed is a NEW VERSION, not an edit.**
-
-**Two options, and they are not mutually exclusive:**
-
-- **journal the re-materialisation** — makes §3's invariant true, at the cost of log growth unless re-checks are made repeat-safe; or
-- **declare the re-materialised fields *recomputable*** — which fits the field's model and must be applied **field by field, not by class**, or it becomes the same category error as Q2.
-
-**This belongs to §3, not to D10**, and it is tracked separately.
+**T6 carries S6 COMMIT's extractor-side obligation** (§5.1): record the version read on the extraction link as `sourceVersion`.
 
 ---
 
