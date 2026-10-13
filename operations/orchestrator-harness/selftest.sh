@@ -69,6 +69,92 @@ ck "shipped classifier: gate SUCCESS + path-filtered legs skipped = GREEN" $rc
 got="$(cl '[{"name":"ai-review-gate","state":"FAILURE"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: gate FAILURE is reported failed" $rc
+
+# ── 3b) the classifier's POLARITY — an allow-list, not a deny-list ───────────────
+# agent-infra#1714: the classifier named the red conclusions and filed EVERYTHING ELSE as PENDING,
+# so an unrecognised or null conclusion reached `gh pr merge --auto` (fail OPEN), while CANCELLED —
+# non-red, a superseded run is normal — was named red and routed to the fixer. The rule is the one
+# admin-merge.sh and record-review.sh already implement, so these fixtures pin the shipped
+# classifier TO THAT RULE rather than to a copy of it. Every check below fails on the deny-list.
+full() { # full <required-name> <state|conclusion, or the literal null> -> a full required surface
+  python3 - "$1" "$2" <<'PY'
+import json,sys
+n,s=sys.argv[1],sys.argv[2]
+rows=[{"name":x,"state":"SUCCESS"} for x in ("ai-review-gate","python-ci-gate","docs",
+      "test-isolation","license-surface","legal-e2e","pricing-artifact")]
+for r in rows:
+    if r["name"]==n: r["state"]=None if s=="null" else s
+print(json.dumps(rows))
+PY
+}
+# (a) THE FALSE-GREEN: a null conclusion is RED, never PENDING (PENDING arms auto-merge).
+got="$(cl "$(full docs null)")"
+[ "$got" = "FAILED:docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a null conclusion is RED, not PENDING" $rc
+# (b) a conclusion GitHub has not documented is RED too — the allow-list, not a red-token list.
+got="$(cl "$(full docs MYSTERY_FAILURE)")"
+[ "$got" = "FAILED:docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: an unrecognised conclusion is RED, not PENDING" $rc
+# (c) an unrecognised STATUS is judged by its conclusion (the rail's #1353 shape): null -> RED.
+got="$(cl '[{"name":"ai-review-gate","status":"completed","conclusion":"success"},{"name":"docs","status":"completely_finished","conclusion":null}]')"
+[ "$got" = "FAILED:docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: an unrecognised status with a null conclusion is RED" $rc
+# (d) CANCELLED/STALE are NON-RED: a superseded run must not block the merge.
+got="$(cl "$(full python-ci-gate CANCELLED)")"
+[ "$got" = "GREEN" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: CANCELLED does not block (non-red)" $rc
+got="$(cl "$(full legal-e2e STALE)")"
+[ "$got" = "GREEN" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: STALE does not block (non-red)" $rc
+# (e) …but they are NOT green either: a surface of nothing but cancelled/stale proves nothing,
+# so it must never read GREEN (a skipped/cancelled shard is not coverage — the rail's doctrine).
+got="$(cl '[{"name":"docs","state":"CANCELLED"},{"name":"legal-e2e","state":"STALE"}]')"
+[ "$got" != "GREEN" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: an all-cancelled/stale surface is not GREEN" $rc
+# (f) an EMPTY surface is not green — a missing check is not a green check (absence != green).
+got="$(cl '[]')"
+[ "$got" = "NOCHECKS" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: an EMPTY check surface is NOCHECKS, not GREEN" $rc
+got="$(cl '{}')"
+[ "$got" = "NOCHECKS" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: an unreadable payload is NOCHECKS, not GREEN" $rc
+# (g) RED beats PENDING and beats the greens: a completed red is final.
+got="$(cl "$(full docs FAILURE)")"
+[ "$got" = "FAILED:docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a red among several green is RED" $rc
+got="$(cl '[{"name":"ai-review-gate","state":"SUCCESS"},{"name":"docs","state":"FAILURE"},{"name":"python-ci-gate","state":"IN_PROGRESS"}]')"
+[ "$got" = "FAILED:docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a red is final — it is not masked by an in-flight check" $rc
+# (h) grouping is per (app, name): one app's result must not mask the other's.
+got="$(cl '[{"name":"ai-review-gate","state":"SUCCESS"},{"name":"docs","state":"NEUTRAL","workflow":"w1"},{"name":"docs","state":"FAILURE","workflow":"w2"}]')"
+[ "$got" = "FAILED:docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a same-named check under two apps cannot mask a red" $rc
+# (i) the NEWEST attempt by id governs (the check-runs API shape).
+got="$(cl '{"check_runs":[{"id":1,"name":"ai-review-gate","status":"completed","conclusion":"success","app":{"slug":"a"}},{"id":5,"name":"docs","status":"completed","conclusion":"failure","app":{"slug":"a"}},{"id":9,"name":"docs","status":"completed","conclusion":"success","app":{"slug":"a"}}]}')"
+case "$got" in FAILED:*) rc=1; echo "      got '$got'";; *) rc=0;; esac
+ck "shipped classifier: a newer passing attempt supersedes an older red" $rc
+got="$(cl '{"check_runs":[{"id":1,"name":"ai-review-gate","status":"completed","conclusion":"success","app":{"slug":"a"}},{"id":9,"name":"docs","status":"completed","conclusion":"success","app":{"slug":"a"}},{"id":12,"name":"docs","status":"completed","conclusion":"failure","app":{"slug":"a"}}]}')"
+[ "$got" = "FAILED:docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a newer failing attempt supersedes an older green" $rc
+fi
+
+# ── 3c) the fixer's failing-check list uses the SAME polarity (agent-infra#1714) ──
+# The loop hands a red required check to fix-one.sh; its list named CANCELLED as failing, so a
+# normally-superseded run burned a capped fixer attempt on a PR that was not red. Extracted from
+# the shipped fix-one.sh, so this pins the real list rather than a re-implementation of it.
+awk '/^FAILING_CHECKS="/,/^" 2>\/dev\/null\)"$/' "$HERE/fix-one.sh" \
+  | sed -n '/^import sys,json$/,$p' | sed '/^" 2>\/dev\/null)"$/d' > "$TMP/failing_checks.py"
+fc() { printf '%s' "$1" | python3 "$TMP/failing_checks.py" 2>/dev/null; }
+if need "$TMP/failing_checks.py" "the fixer's failing-check list is extracted from fix-one.sh"; then
+got="$(fc '[{"name":"docs","state":"FAILURE"},{"name":"legal-e2e","state":"CANCELLED"},{"name":"test-isolation","state":"STALE"},{"name":"license-surface","state":"NEUTRAL"}]')"
+[ "$got" = "docs" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped fixer list: CANCELLED/STALE are not handed to the fixer" $rc
+got="$(fc '[{"name":"docs","state":null},{"name":"legal-e2e","state":"MYSTERY_FAILURE"}]')"
+[ "$got" = "docs legal-e2e" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped fixer list: a null/unrecognised state IS handed to the fixer (fail closed)" $rc
+got="$(fc '[{"name":"docs","state":"SUCCESS"},{"name":"python-ci-gate","state":"IN_PROGRESS"}]')"
+[ -z "$got" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped fixer list: a green/in-flight surface yields no failing check" $rc
 fi
 
 # ── 4) the shipped claim block refuses a second owner ────────────────────────────
