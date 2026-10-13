@@ -102,7 +102,7 @@ RETRACTED: dict[str, str] = {
 LANDED_STATEMENTS: dict[str, str] = {
     "§S0 states the D10 code half as landed": "D10 is LANDED — both halves.",
     "§D's provenance row records the retirement": (
-        "the `:Document` NODE label retired by PR `#5127`"
+        "✅ **NOW TRUE** — the `:Document` NODE label is **retired**"
     ),
     "§S0's Q3 row says `doc_status` is retired": (
         "RETIRED** (`tortoise/api.py:458`)"

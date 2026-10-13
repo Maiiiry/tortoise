@@ -11,7 +11,7 @@ aboutObjects: STORAGE-ARCHITECTURE.md, records ledger, vector index, raw storage
 
 # Storage Architecture — the physical layout of the record
 
-**This document states target state.** Decisions, issue states and code facts are stated as they are **now**, with their authority (`#N`, PR, or `file:line`). How a passage changed is not recorded here — history lives in git and the tracker.
+**This document states target state.** Decisions, issue states and code facts are stated as they are **now**, with their authority (`#N`, PR, or `file:line`), and do not record how a passage changed — history lives in git and the tracker. **Legacy drift narrative in sections not yet re-read is removed as each is reached (`#8542`).**
 
 **Status:** design — **AMENDED 2026-10-08 to the owner's hybrid ruling** (§2.0): **Postgres is the system of record for every layer; FalkorDB is a derived hot cache.** Read §2.0 and §3's table first. **Scope:** where Tortoise's data physically lives, and what that costs. This document is written in the vocabulary of `docs/ONTOLOGY.md` (v3.15) — it does not introduce new layers.
 
@@ -662,7 +662,7 @@ A `:Document` resolved by `coalesce(title, name)`; a `:Source` resolves by `url`
 
 `_upsert_source` bumps `updatedAt` / `version` / `contentHash` on an `ON MATCH` when the hash differs. **A source that is re-fetched and found changed is a NEW VERSION, not an edit.** That transition is **journalled as `SourceVersioned`** (`#5024`, `log.py:149`), whose fold delegates to the same `_upsert_source` fold `SourceCreated` rides — so §3's central invariant (`derived = replay(journal)`) holds and D7's append-only rule is honoured.
 
-**T6 carries S6 COMMIT's extractor-side obligation** (§5.1): record the version read on the extraction link as `sourceVersion`.
+**T6 carries S6 COMMIT's extractor-side obligation** (§9.6): record the version read on the extraction link as `sourceVersion`.
 
 ---
 
