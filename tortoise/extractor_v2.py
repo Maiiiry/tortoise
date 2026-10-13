@@ -492,8 +492,9 @@ def _build_master_from_brief(brief: dict,
     of the build_master_list loop body).
 
     The pack_kinds section is **derived from the brief itself** (#5165):
-    every namespaced key that is not part of a fixed section (``objects`` =
-    ``CORE_OBJECT_KEYS``; ``memory_granularity``) is a pack kind. There is no
+    every brief key that is neither reserved (``value_extractor.
+    RESERVED_BRIEF_KEYS`` — the fixed sections ``memory_granularity`` and
+    ``pack_hints``) nor a core kind is a pack kind. There is no
     second namespace allowlist on either leg, so a filter here can only ever
     DROP a pack the brief carries. (How the brief was narrowed is
     ``compile_value_brief``'s business: on the ``sdk`` path it is gated to the
@@ -515,7 +516,7 @@ def _build_master_from_brief(brief: dict,
     content must be emitted as ``unclassified`` — contradicting the same
     prompt's "core kinds are in-context".
 
-    Loop semantics preserved: the ``memory_granularity`` skip comes first,
+    Loop semantics preserved: the RESERVED-section skip comes first,
     and pack_kinds keeps the brief's insertion order (prompt-visible)."""
     objects = {k: _desc(brief, k) for k in CORE_OBJECT_KEYS}
     pack_kinds = {}

@@ -90,6 +90,18 @@ ontology:
 """
 
 
+#: HINTED_MANIFEST with `valueGate.keep` MALFORMED — a scalar, not a list.
+#: `pack_registry` rejects the shape and `PackRegistry` isolates the pack, but
+#: `compile_value_brief` reads the raw manifests independently of the registry's
+#: accepted set, so one bad installed manifest must degrade its own section, not
+#: raise out of the whole compile (#4894 review).
+MALFORMED_HINTED_MANIFEST = HINTED_MANIFEST.replace(
+    "    keep:\n"
+    "    - design rationale\n"
+    "    - a trade-off stated with its reason\n",
+    "    keep: 5\n")
+
+
 def _packs_dir(tmp_path: Path, manifest: str) -> Path:
     packs_dir = tmp_path / "packs"
     (packs_dir / "hinted").mkdir(parents=True)
@@ -135,10 +147,36 @@ def test_one_malformed_slot_degrades_itself_and_nothing_else(tmp_path):
     assert ve._extraction_hints({"valueGate": "keep everything"}) == {}
     assert ve._extraction_hints({"promptFragments": {"a": 1}}) == {}
     assert ve._extraction_hints(None) == {}
+    # The INNER keep/drop values: a scalar must be ABSENT, not a TypeError out
+    # of compile_value_brief and not (for a string) a per-character hint list.
+    assert ve._extraction_hints({"valueGate": {"keep": 5}}) == {}
+    assert ve._extraction_hints({"valueGate": {"drop": True}}) == {}
+    assert ve._extraction_hints({"valueGate": {"keep": "design rationale"}}) == {}
+    # A well-formed sibling KEY survives a malformed one.
+    assert ve._extraction_hints(
+        {"valueGate": {"keep": 5, "drop": ["logistics"]}}
+    ) == {"drop": ["logistics"]}
     # A well-formed sibling survives a malformed one.
     assert ve._extraction_hints(
         {"valueGate": ["nope"], "promptFragments": ["keep this"]}
     ) == {"fragments": ["keep this"]}
+
+
+def test_a_malformed_keep_does_not_take_down_the_whole_compile(tmp_path):
+    """The reviewer's reproduction (#4894). `PackRegistry` ISOLATES a manifest
+    that fails shape validation — but the catalog loop reads `ns_files` (every
+    manifest with a namespace) independently of `reg.packs`, so a scalar
+    `keep: 5` raised out of `compile_value_brief`: prompt compilation and the
+    `validate_summary` vocabulary went down for the WHOLE deployment, not just
+    the malformed pack."""
+    assert "keep: 5" in MALFORMED_HINTED_MANIFEST  # the mutation actually landed
+    packs_dir = _packs_dir(tmp_path, MALFORMED_HINTED_MANIFEST)
+    brief = ve.compile_value_brief(packs_dir=packs_dir)  # must not raise
+    hinted = brief["pack_hints"]["hinted"]
+    assert "keep" not in hinted  # the malformed slot itself is ABSENT
+    # ...and only itself: the sibling slots are well-formed and survive.
+    assert hinted["drop"] == ["logistics", "tool mechanics"]
+    assert hinted["fragments"]
 
 
 # ── the prompts carry them ─────────────────────────────────────────────────
@@ -252,6 +290,22 @@ def test_a_pack_may_not_be_named_after_a_reserved_section():
             f"namespace: {ns}\nname: X\nversion: 0.1.0\ntier: free\n")
         assert not r.ok, f"{ns} was accepted as a tenant namespace"
         assert "reserved namespace" in r.errors[0], r.errors
+
+
+def test_a_drop_hint_never_removes_an_artefact(tmp_path):
+    """#1026's ruling, behaviourally. The mechanical gate judges an utterance
+    with NO access to the pack's hints, so an entry on a declared `drop:` list
+    is still not an identifier and still KEEPs. (The source pin below guards
+    the plumbing; this guards the OUTCOME.)"""
+    from tortoise.value_gate import mechanical_verdict
+
+    brief = ve.compile_value_brief(packs_dir=_packs_dir(tmp_path, HINTED_MANIFEST))
+    master = v2._build_master_from_brief(brief)
+    dropped = master["pack_hints"]["hinted"]["drop"]
+    assert dropped == ["logistics", "tool mechanics"]
+    for artefact in dropped:
+        assert mechanical_verdict(artefact) is None, (
+            f"a declared drop hint removed the artefact: {artefact}")
 
 
 def test_the_gate_modules_never_read_the_hint_section():

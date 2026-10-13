@@ -59,8 +59,19 @@ def _extraction_hints(extraction: object) -> dict:
     gate = ex.get("valueGate")
     if isinstance(gate, dict):
         for key in ("keep", "drop"):
-            vals = [v for v in (gate.get(key) or [])
-                    if isinstance(v, str) and v.strip()]
+            listed = gate.get(key)
+            # The INNER values are the ones ``pack_registry`` shape-validates
+            # (a list of non-empty strings), but this normalizer promises not
+            # to DEPEND on that having run. A scalar ``keep: 5`` (or ``drop:
+            # true``) used to raise ``TypeError`` out of ``compile_value_brief``
+            # — taking down the whole brief, not just the malformed pack, since
+            # the catalog loop reads ``ns_files`` independently of the
+            # registry's accepted set — and a string char-split into a
+            # per-character hint list. Both now degrade the slot to absent,
+            # like every other malformed shape.
+            if not isinstance(listed, list):
+                continue
+            vals = [v for v in listed if isinstance(v, str) and v.strip()]
             if vals:
                 out[key] = vals
     fragments = ex.get("promptFragments")
