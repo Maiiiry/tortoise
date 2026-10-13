@@ -394,6 +394,72 @@ def test_an_identifier_position_keyword_does_not_make_the_scan_fire(
     assert _predicate_drop_barrier(statement) == statement
 
 
+# ── the relationship-type ALTERNATION: `|` is identifier position too ────────
+#
+# A type list `-[:A|B]->` writes its SECOND and later types after `|`, which the
+# position set did not cover. Two consequences (MEASURED):
+#
+#   * fail-OPEN — a keyword type in the 2nd slot is read as a clause, the pattern
+#     is truncated, the re-bound name is never seen and the shape reaches a 6.x
+#     engine UNBARRED (a silent filter bypass);
+#   * invalid Cypher — with `MATCH` as the type the barrier was injected INSIDE
+#     the pattern (`-[:A|WITH * MATCH]->`), breaking an honest query.
+
+
+def _alternation_rebind(keyword: str) -> str:
+    return f"MATCH (a)-[:R|{keyword}]->(n)"
+
+
+@pytest.mark.parametrize("keyword", _KEYWORD_REL_TYPES)
+def test_a_keyword_type_in_an_alternation_does_not_truncate_the_scan(
+    keyword: str,
+) -> None:
+    """`[:A|SET]` — the type after `|` is an IDENTIFIER to the clause scan.
+
+    The barrier must land BEFORE the re-binding `MATCH` (so the statement is
+    valid Cypher), never inside the bracketed type list.
+    """
+    rebind = _alternation_rebind(keyword)
+    statement = f"MATCH (n:Point) WHERE n.id IN $ids {rebind} RETURN n.id"
+    out = _predicate_drop_barrier(statement)
+    assert out != statement, (
+        f"a keyword type `|{keyword}` in an alternation truncated the pattern "
+        f"scan, so the predicate stays unbarred: {out!r}"
+    )
+    assert out == statement.replace(rebind, f"WITH * {rebind}", 1), out
+    assert "|WITH *" not in out, (
+        f"the barrier was injected INSIDE the pattern (invalid Cypher): {out!r}"
+    )
+
+
+@pytest.mark.parametrize("keyword", ["SET", "USE", "RETURN"])
+def test_a_keyword_type_in_the_where_own_pattern_does_not_lose_the_where(
+    keyword: str,
+) -> None:
+    """The bogus clause was also picked as the `WHERE`'s PRECEDING clause, so the
+    `WHERE` was skipped entirely and the shape stayed unbarred (fail-open)."""
+    rebind = "MATCH (n)-[:REL]->(m)"
+    statement = (
+        f"MATCH (n:Point)-[:R|{keyword}]->(k) WHERE n.id IN $ids "
+        f"{rebind} RETURN n.id"
+    )
+    out = _predicate_drop_barrier(statement)
+    assert out == statement.replace(rebind, f"WITH * {rebind}", 1), out
+
+
+@pytest.mark.parametrize("keyword", ["SET", "USE", "MATCH", "RETURN"])
+def test_a_keyword_type_in_an_alternation_that_binds_nothing_stays_identical(
+    keyword: str,
+) -> None:
+    """The false-positive rail, alternation spelling: a keyword-named type whose
+    pattern does NOT re-bind the filtered name stays byte-identical."""
+    statement = (
+        f"MATCH (n:Point) WHERE n.id IN $ids "
+        f"MATCH (a)-[:R|{keyword}]->(m) RETURN n.id"
+    )
+    assert _predicate_drop_barrier(statement) == statement
+
+
 # ── a PREDICATE OPERATOR's `WITH`, and a LATER re-bind, still bar the shape ──
 #
 # Two more shapes the engine drops (MEASURED on falkordb 6.0.1 -> foreign rows):
@@ -600,4 +666,26 @@ def test_an_operator_or_later_rebind_cannot_reach_a_6x_engine(statement: str) ->
     assert len(sent) == 1, wire.commands
     assert "WITH *" in sent[0], (
         f"an unbarred shape reached a 6.0.1 engine: {sent[0]!r}"
+    )
+
+
+@pytest.mark.parametrize("keyword", ["SET", "USE", "MATCH", "RETURN"])
+def test_an_alternation_keyword_type_cannot_reach_a_6x_engine(keyword: str) -> None:
+    """The class rail for the alternation spelling: whatever builder assembles a
+    `[:A|<keyword>]` type list, the barred statement must be the one on the wire
+    — and it must be valid Cypher (the barrier before the MATCH, not inside the
+    type list)."""
+    statement = (
+        f"MATCH (n:Point) WHERE n.id IN $ids "
+        f"MATCH (a)-[:R|{keyword}]->(n) RETURN n.id"
+    )
+    handle, wire = _handle_on(60001)
+    handle.query(statement, {"ids": ["p1"]})
+    sent = _sent(wire)
+    assert len(sent) == 1, wire.commands
+    assert "WITH *" in sent[0], (
+        f"an unbarred alternation reached a 6.0.1 engine: {sent[0]!r}"
+    )
+    assert "|WITH *" not in sent[0], (
+        f"the barrier was injected inside the type list: {sent[0]!r}"
     )

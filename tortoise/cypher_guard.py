@@ -397,10 +397,14 @@ def _brace_depth(masked: str, index: int) -> int:
 
 #: Characters that, immediately before a keyword (modulo whitespace), make it an
 #: IDENTIFIER rather than a clause: a label `(:Return)`, a relationship type
-#: `[:USE]`, a property `n.use`, a map key `{match: 1}` or a parameter `$set`. A
-#: real clause is preceded by whitespace, `)`/`}` (the end of a pattern) or the
+#: `[:USE]`, a property `n.use`, a map key `{match: 1}` or a parameter `$set`.
+#: `|` covers the SECOND and later types of a relationship-type alternation
+#: (`[:A|B]`), where `B` is preceded by `|`: missing it truncated the pattern at
+#: `B`, left the shape UNBARRED (a silent filter bypass) and — when `B` was
+#: `MATCH` — injected the barrier INSIDE the pattern, invalid Cypher. A real
+#: clause is preceded by whitespace, `)`/`}` (the end of a pattern) or the
 #: string start, so any of these is a marker of identifier position.
-_IDENTIFIER_BEFORE = frozenset(":.([{$")
+_IDENTIFIER_BEFORE = frozenset(":.([{$|")
 
 #: Predicate OPERATORS that carry a bare clause keyword: `STARTS WITH` and
 #: `ENDS WITH` each contain a `WITH`, but it is the second word of the operator,
@@ -432,12 +436,13 @@ def _is_clause_keyword(masked: str, index: int) -> bool:
     """Whether the clause-regex match at *index* is a CLAUSE, not an identifier.
 
     `_CLAUSE_STARTER_RE` matches on word boundaries, so a keyword-named label or
-    relationship type (`MATCH (u:Return)-[:USE]->(n)`) satisfies it as soon as a
-    `:` precedes the name. Left unchecked the scan is not POSITION-AWARE: such a
-    token truncates the re-binding pattern at the label/type, so a variable bound
-    LATER in the same pattern is never seen, `rebound & pred_vars` is empty and
-    NO barrier is inserted — the silent filter bypass this rail exists to stop.
-    Rejecting identifier-position matches leaves the scan with real clauses only.
+    relationship type (`MATCH (u:Return)`, or a type written after a `|` in a
+    bracketed type list) satisfies it as soon as a `:` or `|` precedes the name.
+    Left unchecked the scan is not POSITION-AWARE: such a token truncates the
+    re-binding pattern at the label/type, so a variable bound LATER in the same
+    pattern is never seen, `rebound & pred_vars` is empty and NO barrier is
+    inserted — the silent filter bypass this rail exists to stop. Rejecting
+    identifier-position matches leaves the scan with real clauses only.
 
     The same position awareness rejects a PREDICATE OPERATOR: the `WITH` inside
     `STARTS WITH`/`ENDS WITH` is preceded by whitespace (not a `:`), so it has to
