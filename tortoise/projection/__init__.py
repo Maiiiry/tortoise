@@ -176,9 +176,12 @@ def _bounded_server_socket_kwargs() -> dict[str, float | None]:
     (parsed by ``_resolve_socket_timeout``, which fails loud on a typo) with
     ``_socket_timeouts()`` supplying the default.
 
-    NOT for the embedded (unix-socket) lane: redis-py does not forward
-    ``socket_connect_timeout`` for a unix socket (see that branch), so the
-    embedded client deliberately carries only the read bound.
+    NOT for the embedded (unix-socket) lane: redis-py's ``Redis.__init__``
+    drops ``socket_connect_timeout`` on that branch (see
+    ``_apply_embedded_connect_timeout``), so passing this pair there would
+    wire a connect bound that does not exist — the embedded lane delivers its
+    connect bound to the POOL instead (#3421) and takes its read bound from
+    ``_socket_timeouts()`` directly, as it always has.
     """
     connect_to, read_to = _socket_timeouts()
     return {
@@ -362,6 +365,61 @@ def _embedded_retry():
     )
 
 
+def _apply_embedded_connect_timeout(db, connect_to: float | None) -> bool:
+    """Deliver a socket CONNECT bound to an EMBEDDED client's pool (#3421).
+
+    Why this is not a constructor kwarg — measured, not inferred, on the
+    pinned ``redis 7.4.1``: ``redis.Redis.__init__`` assembles its
+    ``ConnectionPool`` kwargs as an explicit dict and on the unix-socket
+    branch adds ONLY ``path``/``connection_class``. ``socket_connect_timeout``
+    is added in the TCP/SSL branch alone, so
+    ``Redis(unix_socket_path=..., socket_connect_timeout=1.5)`` leaves the pool
+    kwargs WITHOUT the key and the built connection at
+    ``socket_connect_timeout=None``. redislite rewrites its call to
+    ``unix_socket_path=`` (``RedisMixin.__init__``), so the embedded lane goes
+    down that branch and ``UnixDomainSocketConnection._connect`` did
+    ``sock.settimeout(None)`` — an UNBOUNDED connect, not the "redis-py's own
+    5s default" this branch used to claim. The connection class itself already
+    honours the kwarg (``UnixDomainSocketConnection(path=...,
+    socket_connect_timeout=1.5)`` → ``1.5``); only the delivery was missing.
+
+    Two writes, both required:
+
+    * the pool's ``connection_kwargs``, so every connection built from now on
+      carries the bound (``make_connection`` hands a COPY of that dict to the
+      connection class);
+    * drop the connections the pool ALREADY holds. redislite PINGS the daemon
+      during construction (``_wait_for_server_start``), so the pool owns a
+      live connection built WITHOUT the bound — and ``get_connection`` hands a
+      pooled connection back before it ever makes a new one, so mutating the
+      kwargs alone would leave the whole client on the unbounded connect leg:
+      exactly the "bound that looks wired but is not" this helper exists to
+      prevent (a live connection cannot be repaired in place through redis-py's
+      public API, so it is closed and rebuilt).
+
+    Returns ``False`` when no real pool is reachable — a duck-typed/mock
+    construction in tests. A real client always has one, and the
+    daemon-backed test asserts the bound on the connection the pool actually
+    hands out, so a silent no-op here fails a test rather than shipping.
+    """
+    for holder in (getattr(db, "client", None),
+                   getattr(db, "connection", None), db):
+        pool = getattr(holder, "connection_pool", None)
+        kwargs = getattr(pool, "connection_kwargs", None)
+        if isinstance(kwargs, dict):
+            break
+    else:
+        return False
+    kwargs["socket_connect_timeout"] = connect_to
+    # Close the pre-bound connections (fds), then forget them so the next
+    # command builds a fresh one from the corrected kwargs. ``reset()`` alone
+    # would leak the open sockets to the GC; ``disconnect()`` alone would hand
+    # the stale connection back on the next ``get_connection()``.
+    pool.disconnect()
+    pool.reset()
+    return True
+
+
 def _socket_timeouts() -> tuple[float, float]:
     """``(socket_connect_timeout, socket_timeout)`` from env, with defaults.
 
@@ -373,6 +431,11 @@ def _socket_timeouts() -> tuple[float, float]:
     mean the same and an ``inf`` socket timeout raises ``OverflowError`` inside
     redis-py, bricking the client at boot; ``1e-9`` times out every operation
     before it can complete).
+
+    Both values reach BOTH lanes — the host branch as constructor kwargs, the
+    embedded branch as the retry-bounded read kwarg plus a pool-level connect
+    delivery (``_apply_embedded_connect_timeout``, #3421). Where a value lands
+    per lane is the only asymmetry; neither lane silently ignores one.
     """
     def _one(name: str, default: float) -> float:
         raw = os.environ.get(name)
@@ -6587,16 +6650,13 @@ class FalkorProjection(
             # the worst case is a knowable `2 x socket_timeout`, not an
             # 11x-multiplied dependency default.
             #
-            # NOT passed here: `socket_connect_timeout`. redis-py 8's
-            # ConnectionPool does not forward it for a unix-domain socket
-            # (verified: `Redis(unix_socket_path=..., socket_connect_timeout=
-            # 1.5)` leaves `conn.socket_connect_timeout` at redis-py's own 5s
-            # default), so passing it would be a bound that looks wired but
-            # is not — the trap this change exists to remove. Its own 5s
-            # default still applies, and a local UDS connect cannot be the
-            # black hole: the read leg is. (Operators wanting that leg too
-            # need a custom connection class — filed separately.)
-            read_to = _socket_timeouts()[1]
+            # NOT passed here: `socket_connect_timeout`. redis-py's
+            # `Redis.__init__` drops it on the unix-socket branch (measured on
+            # the pinned redis 7.4.1 — see `_apply_embedded_connect_timeout`),
+            # so passing it in these kwargs would be a bound that looks wired
+            # but is not: the trap this change exists to remove. It is
+            # delivered to the POOL below instead (#3421).
+            connect_to, read_to = _socket_timeouts()
             # #3595: build through `cypher_guard.guarded_client` — the ONE
             # client-construction seam — so every handle this client yields
             # (here and from the direct `proj.db.select_graph(...)` sites
@@ -6613,6 +6673,12 @@ class FalkorProjection(
                 socket_timeout=read_to,
                 retry=_embedded_retry(),
             )
+            # #3421: the CONNECT leg goes to the pool rather than the vendor
+            # call — see the helper's docstring for the measurement that makes
+            # the constructor kwarg a no-op. Before this, the embedded lane's
+            # connect leg was unbounded (`sock.settimeout(None)`), so
+            # TORTOISE_FALKORDB_CONNECT_TIMEOUT_S had no effect on it at all.
+            _apply_embedded_connect_timeout(self.db, connect_to)
         elif host is not None:
             # Docker FalkorDB
             from falkordb import FalkorDB  # ponytail: lazy import, only needed for Docker mode
