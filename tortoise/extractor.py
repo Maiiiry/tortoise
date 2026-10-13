@@ -379,6 +379,12 @@ _ISSUE_REF_RE = re.compile(r"([a-zA-Z0-9_-]+)#(\d+)")
 _OBJECT_KIND_VOCAB = frozenset({
     "project", "workitem", "problem", "tag", "user", "skill", "tool",
     "agent", "workflow", "agreement", "standard", "other",
+    # #7860: `indicator` is core now, so the legacy extractor recognises it as an extraction
+    # surface rather than collapsing it to `other`. It is deliberately NOT added to the
+    # commitment-state omission set that tests/test_pack_kinds.py pins -- that set stays exactly
+    # {strategy, plan, goal, target}, and this comment exists so a later reader does not
+    # "tidy" indicator into it for symmetry with those four.
+    "indicator",
 })
 
 

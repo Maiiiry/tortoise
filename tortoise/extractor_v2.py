@@ -407,6 +407,7 @@ CORE_OBJECT_KEYS = (
     "core:user", "core:skill", "core:tool", "core:agent",
     "core:workflow", "core:agreement", "core:standard", "core:other",
     "core:strategy", "core:plan", "core:goal", "core:target",
+    "core:indicator",
 )
 
 

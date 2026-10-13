@@ -1318,17 +1318,25 @@ decision, vision, strategy, plan, goal, target, observation, hypothesis, humanAp
 
 ```text
 Project, WorkItem, Problem, tag, user, skill, tool, agent, workflow, agreement, standard, other,
-strategy, plan, goal, target    # commitment-state family (state-centric, 2026-08-12) — states that
+strategy, plan, goal, target,   # commitment-state family (state-centric, 2026-08-12) — states that
                                 # commitments produce; carry lifecycle + derived confidence
+indicator                       # a measured quantity — a DEFINITION (unit, source, cadence, owner);
+                                # carries no pass/fail. An optional inline `target` is a condition on
+                                # it (#7860). General, NOT dev-scoped: DORA/DRIVE metrics are one
+                                # family of indicators. Owner ruled metric ≡ indicator — no `metric`
+                                # kind exists. Owner-approved 2026-10-13.
 ```
 
 > **Legacy extraction path (pinned, #2727):** the Phase-2 entity stage in
 > `tortoise/extractor.py` (`_OBJECT_KIND_VOCAB`) intentionally supports a
-> narrower 12-kind subset only — it omits the four commitment-state kinds
+> narrower 13-kind subset only — it omits the four commitment-state kinds
 > (`strategy`/`plan`/`goal`/`target`), which are extraction surfaces of
 > `extractor_v2.CORE_OBJECT_KEYS` (state-centric); `_intersect_object_kinds`
 > drops them from the prompt vocabulary and `_normalize_object_kind` collapses
-> any that still appear to `other`. The test
+> any that still appear to `other`. `indicator` is ADDED to
+> `extractor._OBJECT_KIND_VOCAB` (#7860), so it is NOT among the omitted kinds
+> and the pin in `tests/test_pack_kinds.py` stays exactly
+> `{strategy, plan, goal, target}`. The test
 > `test_legacy_extractor_vocab_is_a_documented_subset` pins exactly that gap.
 > **Problem family (2026-08-31):** `Problem` = a deviation between actual and desired
 > state (anchored in a core `standard`, SLO/target, or declared need). The problem-family
@@ -1369,8 +1377,10 @@ meeting, decision, experiment, deployment, review, friction, extraction,
 documentCreated, roleCreated, pointAdded, sessionCaptured, AgentSession, humanApproval,  # #531
 milestone,          # #2767: a milestone is REACHED at a moment — core event (a
                     # `pm:milestone` objectKind declaration was the deformation)
-occurrence, turn    # state-centric (2026-08-12): occurrence = generic extracted occurrence;
+occurrence, turn,   # state-centric (2026-08-12): occurrence = generic extracted occurrence;
                     # turn = capture turn records (replaces pointKind 'event', issue #1013)
+measurement         # #7860: one observation of an indicator — {amount, currency, unit, at,
+                    # createdAt, method}. Append-only; the indicator node is never mutated.
 ```
 
 > **State-centric alignment (2026-08-12):** eventKind `decision` is the

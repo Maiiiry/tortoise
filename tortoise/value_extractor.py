@@ -125,11 +125,12 @@ def compile_value_brief(packs_dir: Path | str | None = None,
                 "nearMisses": spec.get("nearMisses", []),
             }
     # T12 (#1272): the core objectKind set is aligned to ONTOLOGY §5 Object
-    # Kind Vocabulary (16 kinds — Problem added by the #2238 problem-family
+    # Kind Vocabulary (17 kinds — Problem added by the #2238 problem-family
     # salvage landing, 2026-09-05) — the prior brief
     # (concept/standard/document/tool/workflow/WorkItem/other)
     # missed project/tag/user/skill/agent/agreement + strategy/plan/goal/
     # target and added concept (not in §5). `concept` is mapped to core:other.
+    # `indicator` joined the set in #7860 (owner ruling 2026-10-13: core, discoverable from §5).
     granularity = {}
     for ns, path in ns_files.items():
         if _gate is not None and ns not in _gate:

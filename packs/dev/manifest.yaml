@@ -15,7 +15,6 @@ ontology:
   - database
   - software
   - infrastructure
-  - indicator
   - theme
   - pullRequest
   - bug

@@ -50,7 +50,7 @@ CANONICAL_OBJECT_KINDS = frozenset({
     # objects commitments produce (lifecycle + derived confidence). Lowercase,
     # like the rest of the §5 object vocabulary. #2727 aligned this set with
     # ONTOLOGY §5 and extractor_v2.CORE_OBJECT_KEYS — the three-way diff is now
-    # empty (16 kinds each). `tag` was the other silent omission; both were
+    # empty (17 kinds each). `tag` was the other silent omission; both were
     # missing while the §5 doc + extractor already carried them, which is why a
     # pack could not declare `subclassOf: target`.
     # `document` was removed from all three by D10 (#5013, ONTOLOGY v3.15, #5022):
@@ -62,6 +62,11 @@ CANONICAL_OBJECT_KINDS = frozenset({
     # ontology does NOT declare (e.g. `aggregate`/`cluster`) are deliberately
     # absent — the canonical set mirrors §5, it does not invent.
     "strategy", "plan", "goal", "target",
+    # A measured quantity — a DEFINITION (unit/source/cadence/owner), carrying no pass/fail.
+    # General, NOT dev-scoped: `indicator` was the dev pack's own objectKind until #7860, which
+    # made it core — the dev pack now USES this kind and keeps its DORA description as a
+    # kindDef (owner ruling 2026-10-13). `metric` is deliberately absent: metric ≡ indicator.
+    "indicator",
 })
 
 CANONICAL_EVENT_KINDS = frozenset({
@@ -73,6 +78,9 @@ CANONICAL_EVENT_KINDS = frozenset({
     # so the bare name has ONE canonical identity, and so the miner's
     # `event_kind="milestone"` write is declared.
     "milestone",
+    # #7860: one observation of an indicator ({amount, currency, unit, at, createdAt, method}),
+    # append-only — the indicator node is never mutated by a measurement.
+    "measurement",
 })
 
 CANONICAL_POINT_KINDS = frozenset({
