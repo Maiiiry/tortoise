@@ -433,6 +433,12 @@ def test_undercount_query_aggregates_the_two_legs_separately() -> None:
     (``session_edges x turn_edges``) and over-reports the gap — the
     mirror-image defect of the under-count. Each leg is aggregated in its own
     ``WITH`` stage before the sum.
+
+    The assertions are structural, not substring presence: a single-scope
+    cross-product query still CONTAINS ``count(r1) AS session_edges`` and
+    ``count(r2) AS turn_edges``, so the pre-fix substrings-only test passed on
+    the very shape it names. Here the session leg's aggregation must close
+    before the turn leg's ``OPTIONAL MATCH`` opens.
     """
     graph = _RecordingGraph()
     session_schema.audit_session_retrofit(graph)
@@ -442,6 +448,19 @@ def test_undercount_query_aggregates_the_two_legs_separately() -> None:
     assert "count(r1) AS session_edges" in q
     assert "count(r2) AS turn_edges" in q
     assert "count(r1) + count(r2)" not in q
+    # The stage boundary: ``count(r1) AS session_edges`` must be emitted by a
+    # WITH that precedes the turn leg's ``OPTIONAL MATCH (s)-[:CONTAINS]``.
+    # In the single-scope cross-product the count lands AFTER that match, so
+    # this fails on the shape the test exists to catch.
+    leg1_aggregated = q.index("count(r1) AS session_edges")
+    leg2_opens = q.index("OPTIONAL MATCH (s)-[:CONTAINS]")
+    assert leg1_aggregated < leg2_opens, (
+        "the session-edge count must be aggregated in its own WITH before the "
+        "turn leg opens; counting both legs in one scope cross-products them "
+        "and over-reports the gap")
+    # ...and the aggregation is introduced by a WITH clause, not appended to
+    # the first match's row scope.
+    assert "WITH s, count(r1) AS session_edges" in q
 
 
 # ── the recorded decisions must have a real home ───────────────────────────
@@ -473,6 +492,22 @@ def test_retrofit_verdicts_cite_documentation_homes_that_exist() -> None:
         where = verdict["where_recorded"]
         assert "docs/ONTOLOGY.md §4.8" in where, name
         assert "§ '#3554 amendment'" in where, name
+
+
+def test_section_4_8_changelog_entry_sits_under_its_own_version_block() -> None:
+    """The §4.8 changelog bullet belongs to its own version/date/issue header.
+
+    Pre-fix the bullet was the FIRST item of the ``v3.23 (2026-10-10 —
+    issues #7813 + #7853)`` block, making that header's date and issue
+    enumeration false and sending a reader looking up "when was §4.8 added"
+    to the wrong version. The document is v3.24 (2026-10-12), so the entry
+    sits under the v3.24 header.
+    """
+    ontology = ONTOLOGY.read_text(encoding="utf-8")
+    bullet = ontology.index("§4.8 (added by #3554")
+    header = ontology.rindex("> **Changelog v3.", 0, bullet)
+    header_line = ontology[header:ontology.index("\n", header)]
+    assert "v3.24" in header_line, header_line
 
 
 def test_ontology_section_4_8_owner_lists_match_the_declaration() -> None:

@@ -35,14 +35,6 @@ doc_status: live
 >
 > **Changelog v3.23 (2026-10-10 — issues #7813 + #7853 — confidence propagates across all four epistemic labels):**
 >
-> - §4.8 (added by #3554, 2026-10-12): the canonical `:Session` capture-container schema and
->   its owning writers — the doc half of the machine declaration
->   `tortoise/session_schema.py`, plus the three D9 *recorded honest gap* decisions (the
->   turn-count shortfall under `capture_ok = true`, the pre/post-verification-read
->   `capture_ok` ordering, and the non-monotone `entity_links_created` counter). §4.1's
->   `speaker` row is corrected in the same change: BOTH hosted capture and the SDK write
->   it, via the one shared turn store (#3551/#3086), not the SDK alone.
->
 > - §5/§8: the point↔object and point↔event kind overlap is stated as the model,
 >   not compatibility residue. The #7813 owner ruling is that **confidence (EP)
 >   propagates across `:Point`, `:Subject`, `:Object` and `:Event`**. §5 now names
@@ -157,7 +149,7 @@ doc_status: live
 >   safety net. Under `promotion_policy='gated'` ingest still writes every
 >   point — goal included — as `draft`.
 >
-> **Changelog v3.24 (2026-10-12 — issue #7852 W1 — the Layer-2 `semantics` reaches the write path):**
+> **Changelog v3.24 (2026-10-12 — issues #7852 W1 + #3554 — the Layer-2 `semantics` reaches the write path):**
 > `create_operator` (SDK) and `tortoise_create_operator` (MCP) accept an additive, defaulted
 > `semantics` input — the closed Layer-2 vocabulary. A declared meaning RESOLVES the direction (a
 > one-way meaning records `unidirectional`, a mutual one `bidirectional`); the basis the resolution
@@ -171,6 +163,14 @@ doc_status: live
 > **storage** vocabulary is unchanged (see *Transition state*): the model's `-` maps to no runtime
 > value, and `<-` is deliberately left unmapped rather than recorded as the opposite (`unidirectional`
 > is source→target only).
+>
+> - §4.8 (added by #3554, 2026-10-12): the canonical `:Session` capture-container schema and
+>   its owning writers — the doc half of the machine declaration
+>   `tortoise/session_schema.py`, plus the three D9 *recorded honest gap* decisions (the
+>   turn-count shortfall under `capture_ok = true`, the pre/post-verification-read
+>   `capture_ok` ordering, and the non-monotone `entity_links_created` counter). §4.1's
+>   `speaker` row is corrected in the same change: BOTH hosted capture and the SDK write
+>   it, via the one shared turn store (#3551/#3086), not the SDK alone.
 >
 > **Changelog v3.22 (2026-10-11 — issue #7852 — the Layer-2 semantics vocabulary is closed, and validated):**
 > §8 now states the semantics vocabulary as **the** canonical table — one list, with each value's
