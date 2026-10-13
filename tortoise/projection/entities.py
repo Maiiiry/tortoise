@@ -26,6 +26,11 @@ from tortoise.live import (
     epistemic_label_queries,  # #7853: id-anchored reads sweep labels, one query per label
 )
 
+# #2897: the store's numeric-domain rule — a `tags` value the store would
+# silently ALTER (clamp/round) is not one it can carry (see
+# `_tags_value_faithful`). stdlib-only leaf, so this import cannot cycle.
+from tortoise.numeric_domain import numeric_alteration_reason
+
 # #7719: the SHARED terminalizer-miss classifier and the non-folded recorder.
 # ``nonfolded`` is a stdlib-only leaf module, so this import cannot cycle.
 from tortoise.projection.nonfolded import (
@@ -185,6 +190,33 @@ def _is_persistable_prop_value(value, _depth: int = 0) -> bool:
     return False
 
 
+def _tags_value_faithful(value) -> bool:
+    """True when the replay writer can store ``value`` in ``n.tags`` faithfully.
+
+    The writer's EFFECTIVE predicate, not `_is_persistable_prop_value`'s type
+    allowlist: the transport gate (`_journal_safe_params`) judges a stored
+    value by ``projection._value_ok``, and the numeric-domain rule
+    (#4647/#7174) refuses a number the store would SILENTLY ALTER. Both are
+    narrower than "the allowlist says yes": ``[..., float("nan")]`` is nulled
+    by the gate, and ``[..., 2**70]`` is clamped to INT64_MAX — neither is
+    held, so neither can be carried.
+
+    A ``tags`` value the store cannot hold faithfully must be NAMED as
+    uncarried (never written, never compared): comparing it against a graph the
+    store altered produces an UNCLEARABLE ``divergence="content"`` whose own
+    ``action`` ("replay the journal") reproduces exactly the altered graph
+    (#8317 review round 3, reproduced with ``nan`` / a NUL string / ``2**70`` in
+    a hand-written ``PointAdded``).
+    """
+    # Lazy: ``projection/__init__`` imports THIS module at line ~3510, before
+    # ``_value_ok`` is defined — the same cycle-break the other handlers use.
+    from tortoise.projection import _value_ok
+
+    if not _value_ok(value):
+        return False
+    return numeric_alteration_reason("tags", value) is None
+
+
 def _stated_tags(payload) -> tuple[bool, object]:
     """``(writes_property, value)`` for a payload's ``tags`` key (#2897).
 
@@ -193,9 +225,11 @@ def _stated_tags(payload) -> tuple[bool, object]:
     pass-1b boundary report that reads its outcome — never re-spelled at either
     site (#5048).
 
-    A persistable value the payload states is written VERBATIM (a non-list
-    scalar included — live stores one, and only the EDGE half is list-only).
-    ``None``/absent states NO property.
+    A value the store can hold FAITHFULLY the payload states is written
+    VERBATIM (a non-list scalar included — live stores one, and only the EDGE
+    half is list-only). ``None``/absent states NO property, and neither does a
+    value the writer could not hold without alteration (`_tags_value_faithful`
+    — the transport gate plus the numeric domain, #8317 review round 3).
 
     ⚠️ Three corrections to an earlier version of this paragraph, all MEASURED
     on the embedded engine — the helper's ANSWERS were right, its reasoning was
@@ -225,12 +259,12 @@ def _stated_tags(payload) -> tuple[bool, object]:
     Total, deliberately: this reads a possibly hand-edited journal line, and a
     raise here would abort a replay whose wipe has already run — the recovery
     path's own rule. A non-dict payload, a missing key, a ``None`` and a value
-    this store cannot persist all answer ``(False, None)``.
+    this store cannot hold faithfully all answer ``(False, None)``.
     """
     if not isinstance(payload, dict) or "tags" not in payload:
         return False, None
     value = payload.get("tags")
-    if value is None or not _is_persistable_prop_value(value):
+    if value is None or not _tags_value_faithful(value):
         return False, None
     return True, value
 

@@ -166,6 +166,25 @@ def _tag_nodes(sdk) -> set[str]:
         "MATCH (t:Tag) RETURN t.name").result_set}
 
 
+def _raw_append(events, sdk, type_: str, **fields) -> None:
+    """Append a raw-producer JSONL line (the live graph never sees it; only
+    ``rebuild_all`` replays it) — the same leverage the sibling rebuild tests
+    use, needed for values the SDK's early numeric refusal rejects at the
+    write boundary (a hand-edited/alternate producer's journal)."""
+    import datetime as _dt
+    import json as _json
+    line = {
+        "event_id": sdk.ulid(),
+        "ts": _dt.datetime.now(_dt.UTC).isoformat(),
+        "type": type_,
+        "initiated_by": "raw-producer",
+        "projection_version": 2,
+    }
+    line.update(fields)
+    with open(events / "events.jsonl", "a") as fh:
+        fh.write(_json.dumps(line) + "\n")
+
+
 # ══ AC2 — the source of truth is named: the JOURNAL carries the tag ═══════
 
 def test_the_journal_carries_the_tag(env):
@@ -551,4 +570,77 @@ def test_a_tuple_tag_value_syncs_edges_on_both_arms(env):
     report = check_consistency(str(events / "events.jsonl"), sdk._get_proj())
     assert report["ok"] is True, (
         "a faithful tuple replay must not be red: "
+        + str(report.get("divergent_points")))
+
+
+# ══ #8317 review round 3 — the reference view must match the MERGE ═════════
+
+@pytest.mark.parametrize("label,value", [
+    ("nan", ["alpha", float("nan")]),
+    ("nul", ["alpha", "b\x00c"]),
+    ("int64", ["alpha", 2 ** 70]),
+])
+def test_an_unholdable_tag_value_is_named_not_a_false_divergence(env, label, value):
+    """A `tags` value the STORE cannot hold faithfully must be NAMED as
+    uncarried, never compared against the altered graph (#8317 review round 3).
+
+    The ``#7369`` transport gate nulls a non-finite float / NUL string and the
+    numeric domain clamps an out-of-INT64 integer. The round-2 `tags` branch
+    asked `_is_persistable_prop_value`, which says YES to all three, so the value
+    was neither written faithfully nor named — `check_consistency` reported an
+    UNCLEARABLE ``divergence="content"`` whose action ("replay the journal")
+    reproduces exactly the altered graph. This reds on the pre-fix code at the
+    ``ok is True`` assertion.
+    """
+    sdk, events = env
+    proj = sdk._get_proj()
+    _raw_append(events, sdk, "PointAdded",
+                point={"id": "p1", "content": "c", "pointKind": "statement",
+                       "status": "live", "tags": value})
+    proj.rebuild_all(str(events), confirm_destructive=True)
+
+    report = check_consistency(str(events / "events.jsonl"), proj)
+    assert report["ok"] is True, (
+        f"{label}: a tags value the store cannot hold faithfully must not be "
+        "compared against the altered graph: "
+        + str(report.get("divergent_points")))
+    assert "tags" in report["uncarried_journal_fields"], (
+        f"{label}: the drop must be NAMED, not silent — otherwise an operator "
+        f"cannot tell it from a faithful replay: "
+        f"{report['uncarried_journal_fields']}")
+
+
+def test_a_same_id_reemit_that_omits_tags_keeps_them(env):
+    """A same-id `PointAdded` re-emit that omits `tags` must not drop the prior
+    value from the reference view (#8317 review round 3).
+
+    `_upsert_point_props` MERGEs, so the re-emit leaves the node's existing list
+    in place; the reference fold replaced the entry outright and lost it, making
+    the checker report an UNCLEARABLE ``content`` divergence on a graph the
+    writer itself produced. A hard delete→recreate is deliberately NOT this
+    case: `EntityMutated op=delete` pops the entry and the writer wipes the
+    property, so a fresh incarnation starts with no tags (pinned by
+    `test_a_dead_incarnations_tags_do_not_leak`).
+
+    The re-emit shape is reachable from the capture turn loop, which re-emits
+    `PointAdded` for a turn on every capture of an existing session window
+    without a `tags` key.
+    """
+    sdk, events = env
+    proj = sdk._get_proj()
+    _raw_append(events, sdk, "PointAdded",
+                point={"id": "p1", "content": "v1", "pointKind": "statement",
+                       "status": "live", "tags": ["alpha"]})
+    _raw_append(events, sdk, "PointAdded",
+                point={"id": "p1", "content": "v2", "pointKind": "statement",
+                       "status": "live"})
+    proj.rebuild_all(str(events), confirm_destructive=True)
+
+    assert proj.g.query(
+        "MATCH (n:Point {id:'p1'}) RETURN n.tags").result_set == [[["alpha"]]], (
+        "precondition: the writer's MERGE preserves the node's tags on a "
+        "re-emit that omits the key")
+    report = check_consistency(str(events / "events.jsonl"), proj)
+    assert report["ok"] is True, (
+        "the reference fold must preserve the same keys the graph MERGE does: "
         + str(report.get("divergent_points")))

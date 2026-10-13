@@ -84,6 +84,7 @@ from .projection.entities import (
     BELIEF_PROPS,
     _EntityHandlers,
     _is_persistable_prop_value,
+    _tags_value_faithful,
     _usable_instant,
     _writable_journalled_vector,
     flatten_search_keys_prop,
@@ -329,8 +330,10 @@ _MAX_DIVERGENT_POINTS = 50
 # sub-rule. Read from the writer's own predicate so the two cannot drift.
 _UNCARRIED_NULL = "explicit null — the writer cannot persist a null property"
 _UNCARRIED_NON_PERSISTABLE = (
-    "a value FalkorDB rejects as a node property (map/dict at any depth, bytes, "
-    "set) — `_is_persistable_prop_value` filters it before the SET"
+    "a value the store cannot hold as a node property (map/dict at any depth, "
+    "bytes, set; for `tags`, also a non-finite float / NUL-or-surrogate "
+    "string / out-of-INT64 number) — the writer's own value gate drops it "
+    "before the SET"
 )
 _UNCARRIED_LIST = (
     "list-valued prop the REPLAYED writer refuses (`_POINT_LIST_PROPS` is empty, "
@@ -531,21 +534,27 @@ def _uncarried(journal_by_id: dict) -> dict[str, dict[str, str]]:
         for k, v in props.items():
             if k == "tags":
                 # #2897: the one `_POINT_HANDLED` key whose carriage depends on
-                # the VALUE's type rather than the key's presence. Its writer's
-                # clause is presence+persistable gated (`_stated_tags`), so a
-                # value this store cannot persist is genuinely uncarried and
-                # must be NAMED — the `_POINT_HANDLED` short-circuit below would
+                # the VALUE rather than the key's presence. Its writer's clause
+                # is presence+faithfully-holdable gated (`_stated_tags`), so a
+                # value this store cannot hold is genuinely uncarried and must
+                # be NAMED — the `_POINT_HANDLED` short-circuit below would
                 # swallow it, and an unnamed drop surfaced as an UNCLEARABLE
                 # `divergence="content"` whose `action` ("replay the journal")
-                # produces exactly the graph that is already there (#8317 review
-                # round 2, reproduced with a hand-written `PointAdded` carrying
-                # a map). Excluding it is safe on the graph side too: the store
-                # cannot hold such a value at all, so no legitimate divergence
-                # is hidden. (Deliberately a NARROW `tags` case, not a reorder of
-                # the generic list/persistable tests above the `_POINT_HANDLED`
-                # check: `provenance` is also handled-and-dict-valued, and a
-                # generic reorder would newly flag it.)
-                if v is not None and not _is_persistable_prop_value(v):
+                # produces exactly the graph that is already there (#8317
+                # review round 2, reproduced with a hand-written `PointAdded`
+                # carrying a map). The predicate is the writer's EFFECTIVE one
+                # (`_tags_value_faithful`), NOT the `_is_persistable_prop_value`
+                # allowlist: a finite-looking but unholdable leaf (`nan`, a NUL
+                # string, `2**70`) passes the allowlist and is nulled/clamped by
+                # the transport + numeric domain, so naming it requires the
+                # wider rule (#8317 review round 3). Excluding it is safe on the
+                # graph side too: the store cannot hold such a value faithfully,
+                # so no legitimate divergence is hidden. (Deliberately a NARROW
+                # `tags` case, not a reorder of the generic list/persistable
+                # tests above the `_POINT_HANDLED` check: `provenance` is also
+                # handled-and-dict-valued, and a generic reorder would newly flag
+                # it.)
+                if v is not None and not _tags_value_faithful(v):
                     found[k] = _UNCARRIED_NON_PERSISTABLE
                 continue
             if k in _POINT_HANDLED or k in _NOT_COMPARED:

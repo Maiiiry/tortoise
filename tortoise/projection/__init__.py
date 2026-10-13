@@ -3515,6 +3515,7 @@ from tortoise.projection.entities import (  # noqa: E402, I001
     _EntityHandlers,
     _is_persistable_prop_value,
     _PERSISTABLE_MAX_DEPTH,
+    _tags_value_faithful as _tags_value_faithful,
     _usable_instant,
 )
 from tortoise.projection.edges import _EdgeHandlers  # noqa: E402
@@ -5336,6 +5337,18 @@ def _apply_one(points: dict[str, dict], ev: dict,
         # Phase 1 stop-writes: strip context from v2+ events (#49)
         if ev.get("projection_version", 0) >= 2:
             p.pop("context", None)
+        # #2897/#8317 review round 3: a same-id `PointAdded` re-emit that OMITS
+        # `tags` must not drop the prior entry's tags from the reference view.
+        # `_upsert_point_props` MERGEs, so on the graph a re-emit without a
+        # `tags` clause leaves the node's existing list in place; replacing the
+        # entry outright here made the journal view lose it and `check_consistency`
+        # report an UNCLEARABLE `content` divergence (replaying the journal
+        # reproduces the same graph). A HARD delete→recreate cannot reach this:
+        # `EntityMutated op=delete` POPS the entry, so the re-creation starts
+        # fresh — matching the writer's recreate wipe (`n.tags = NULL`).
+        _prev = points.get(p["id"])
+        if isinstance(_prev, dict) and "tags" in _prev and "tags" not in p:
+            p = {**p, "tags": _prev["tags"]}
         points[p["id"]] = p
         # Flatten speaker from point's provenance into node data
         # #331: non-dict provenance (null/string) must not crash flattening.
