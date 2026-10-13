@@ -402,6 +402,31 @@ def _brace_depth(masked: str, index: int) -> int:
 #: string start, so any of these is a marker of identifier position.
 _IDENTIFIER_BEFORE = frozenset(":.([{$")
 
+#: Predicate OPERATORS that carry a bare clause keyword: `STARTS WITH` and
+#: `ENDS WITH` each contain a `WITH`, but it is the second word of the operator,
+#: not a scope boundary. The clause scan matches on word boundaries, so without
+#: this rejection it read that `WITH` as the clause following the `WHERE`, the
+#: scan `continue`d, and the shape was left UNBARRED — while the engine still
+#: dropped the predicate (MEASURED on falkordb 6.0.1: `name STARTS WITH 'pio'`
+#: and `name ENDS WITH 'neer'` return FOREIGN rows, the same silent filter
+#: BYPASS as the id spelling). `CONTAINS` carries no keyword, which is why the
+#: curated positive cases did not catch this collision.
+_PREDICATE_OPERATOR_BEFORE = frozenset({"STARTS", "ENDS"})
+
+
+def _is_predicate_operator_with(masked: str, index: int, before: int) -> bool:
+    """Whether the token at *index* is the `WITH` of a `STARTS/ENDS WITH`.
+
+    *before* is the index of the last non-space character preceding the token
+    (as computed by :func:`_is_clause_keyword`), or -1 at the string start.
+    """
+    if masked[index:index + 4].upper() != "WITH":
+        return False
+    k = before
+    while k >= 0 and (masked[k].isalnum() or masked[k] == "_"):
+        k -= 1
+    return masked[k + 1:before + 1].upper() in _PREDICATE_OPERATOR_BEFORE
+
 
 def _is_clause_keyword(masked: str, index: int) -> bool:
     """Whether the clause-regex match at *index* is a CLAUSE, not an identifier.
@@ -413,11 +438,58 @@ def _is_clause_keyword(masked: str, index: int) -> bool:
     LATER in the same pattern is never seen, `rebound & pred_vars` is empty and
     NO barrier is inserted — the silent filter bypass this rail exists to stop.
     Rejecting identifier-position matches leaves the scan with real clauses only.
+
+    The same position awareness rejects a PREDICATE OPERATOR: the `WITH` inside
+    `STARTS WITH`/`ENDS WITH` is preceded by whitespace (not a `:`), so it has to
+    be rejected on its preceding WORD — otherwise the clause after the `WHERE`
+    reads as `WITH`, the scan `continue`s and the shape is left unbarred.
     """
     j = index - 1
     while j >= 0 and masked[j] in " \t\r\n":
         j -= 1
-    return j < 0 or masked[j] not in _IDENTIFIER_BEFORE
+    if j >= 0 and masked[j] in _IDENTIFIER_BEFORE:
+        return False
+    return not _is_predicate_operator_with(masked, index, j)
+
+
+def _pattern_end(masked: str, start: int) -> int:
+    """Index where the pattern/expression beginning at *start* ends.
+
+    The next top-level clause or `WHERE`, whichever comes first: a `WHERE` can
+    interrupt two patterns, and a nested `CALL { … }` clause is not the end of
+    THIS pattern (`_brace_depth == 0` filters those out).
+    """
+    end = len(masked)
+    for nxt in _CLAUSE_STARTER_RE.finditer(masked, start):
+        if _brace_depth(masked, nxt.start()) == 0 and _is_clause_keyword(
+            masked, nxt.start()
+        ):
+            end = nxt.start()
+            break
+    for nxt in _WHERE_RE.finditer(masked, start):
+        if _brace_depth(masked, nxt.start()) == 0:
+            end = min(end, nxt.start())
+            break
+    return end
+
+
+def _first_rebinding_match(masked, clauses, following, pred_vars) -> int | None:
+    """Start of the first plain `MATCH` at this level that re-binds a pred var.
+
+    Walks the clauses in order from *following*: a plain `MATCH` whose pattern
+    binds a name in *pred_vars* is the barrier site; ANY other clause ends the
+    search, because it ends the scope the `WHERE` constrains. Returns ``None``
+    when no later plain `MATCH` re-binds the filtered name.
+    """
+    for clause in clauses:
+        if clause.start() < following.start():
+            continue
+        if clause.group().upper().split() != ["MATCH"]:
+            return None
+        pattern = masked[clause.end():_pattern_end(masked, clause.end())]
+        if set(_PATTERN_VAR_RE.findall(pattern)) & pred_vars:
+            return clause.start()
+    return None
 
 
 def _predicate_vars(predicate: str) -> set[str]:
@@ -484,7 +556,9 @@ def _predicate_drop_barrier(cypher: str) -> str:
                 break
         if preceding is None or preceding.group().upper().split() != ["MATCH"]:
             continue
-        # The predicate runs to the next clause; that clause must be a plain MATCH.
+        # The predicate runs to the next clause, which must be a plain MATCH —
+        # a `WITH`/`RETURN`/`UNION`/`OPTIONAL MATCH`/`CALL { … }` ends the scope
+        # the `WHERE` constrains, so no barrier is owed.
         following = None
         for clause in clauses:
             if clause.start() >= w_end:
@@ -495,21 +569,13 @@ def _predicate_drop_barrier(cypher: str) -> str:
         pred_vars = _predicate_vars(cypher[w_end:following.start()])
         if not pred_vars:
             continue
-        # The re-binding MATCH's own pattern runs to its next clause/WHERE.
-        pattern_end = len(cypher)
-        for nxt in _CLAUSE_STARTER_RE.finditer(masked, following.end()):
-            if _brace_depth(masked, nxt.start()) == 0 and _is_clause_keyword(
-                masked, nxt.start()
-            ):
-                pattern_end = nxt.start()
-                break
-        for nxt in _WHERE_RE.finditer(masked, following.end()):
-            if _brace_depth(masked, nxt.start()) == 0:
-                pattern_end = min(pattern_end, nxt.start())
-                break
-        rebound = set(_PATTERN_VAR_RE.findall(masked[following.end():pattern_end]))
-        if rebound & pred_vars:
-            insertions.add(following.start())
+        # Search FORWARD for the first plain MATCH whose pattern re-binds a name
+        # the predicate references. "The NEXT MATCH" is too weak a trigger: an
+        # intervening plain MATCH binding only unrelated names does not disarm
+        # the shape (MEASURED on 6.0.1 — the predicate is still dropped).
+        barrier_at = _first_rebinding_match(masked, clauses, following, pred_vars)
+        if barrier_at is not None:
+            insertions.add(barrier_at)
     if not insertions:
         return cypher
     for at in sorted(insertions, reverse=True):

@@ -394,6 +394,67 @@ def test_an_identifier_position_keyword_does_not_make_the_scan_fire(
     assert _predicate_drop_barrier(statement) == statement
 
 
+# ── a PREDICATE OPERATOR's `WITH`, and a LATER re-bind, still bar the shape ──
+#
+# Two more shapes the engine drops (MEASURED on falkordb 6.0.1 -> foreign rows):
+#
+#   1. `STARTS WITH` / `ENDS WITH`. The `WITH` is the second word of the
+#      OPERATOR, but the clause scan matched it as a clause, so the clause after
+#      the `WHERE` read as `WITH`, the scan `continue`d and NO barrier was
+#      inserted. `CONTAINS` carries no keyword, which is why the curated cases
+#      missed the collision.
+#   2. a LATER plain MATCH that re-binds the filtered name. The trigger was read
+#      off the IMMEDIATELY FOLLOWING MATCH only, so an intervening
+#      `MATCH (m:Target)` (binding only `m`) made the shape look safe while the
+#      engine still dropped the predicate and returned foreign rows.
+#
+#: The re-binding MATCH every shape below must be barred in front of.
+_REBINDING_MATCH = "MATCH (n)-[:REL]"
+_OPERATOR_OFFENDERS = [
+    "MATCH (n:Point) WHERE n.name STARTS WITH 'a' "
+    "MATCH (n)-[:REL]->(m:Point) RETURN n.id",
+    "MATCH (n:Point) WHERE n.name ENDS WITH 'neer' "
+    "MATCH (n)-[:REL]->(m:Point) RETURN n.id",
+    # the first following plain MATCH binds only an unrelated name
+    "MATCH (n:Point) WHERE n.id IN $ids MATCH (m:Target) "
+    "MATCH (n)-[:REL]->(m) RETURN n.id",
+]
+
+
+@pytest.mark.parametrize("statement", _OPERATOR_OFFENDERS)
+def test_a_predicate_operator_or_a_later_rebind_still_gets_the_barrier(
+    statement: str,
+) -> None:
+    """The barrier lands IMMEDIATELY before the MATCH that re-binds the filtered
+    name — not before the intervening unrelated MATCH, and not nowhere at all.
+
+    Value that makes this fail: (1) reading the operator `WITH` as a clause, or
+    (2) requiring the FIRST following MATCH to intersect ``pred_vars``.
+    """
+    out = _predicate_drop_barrier(statement)
+    assert out != statement, f"the shape was left unbarred: {out!r}"
+    assert out.count("WITH *") == 1, out
+    assert out == statement.replace(
+        _REBINDING_MATCH, f"WITH * {_REBINDING_MATCH}", 1
+    ), out
+
+
+@pytest.mark.parametrize("statement", [
+    # `STARTS WITH` where the later MATCH does NOT re-bind the filtered name
+    "MATCH (n:Point) WHERE n.name STARTS WITH 'a' "
+    "MATCH (m:Point)-[:REL]->(z) RETURN n.id",
+    # `ENDS WITH` followed by a genuine `WITH` barrier — already safe
+    "MATCH (n:Point) WHERE n.name ENDS WITH 'a' "
+    "WITH n MATCH (n)-[:REL]->(m) RETURN n.id",
+])
+def test_a_predicate_operator_is_not_by_itself_a_reason_to_rewrite(
+    statement: str,
+) -> None:
+    """The false-positive rail: the operator's `WITH` must not be rewritten, and
+    rejecting it must not make a legitimate `WITH` barrier invisible either."""
+    assert _predicate_drop_barrier(statement) == statement
+
+
 # ── the version gate, decided from the SERVER's own version ──────────────────
 
 
@@ -521,3 +582,22 @@ def test_the_same_statement_is_untouched_on_a_binding_engine() -> None:
     assert len(sent) == 1, wire.commands
     assert "WITH *" not in sent[0], f"a binding engine had a barrier inserted: {sent[0]!r}"
     assert sent[0].endswith(_OFFENDER), sent[0]
+
+
+@pytest.mark.parametrize("statement", _OPERATOR_OFFENDERS)
+def test_an_operator_or_later_rebind_cannot_reach_a_6x_engine(statement: str) -> None:
+    """The class rail for the operator/later-rebind shapes.
+
+    These are the shapes a bare clause scan let through: the operator `WITH`
+    truncated the clause after the `WHERE`, and the re-bind trigger was read off
+    only the NEXT MATCH. Both must be barred on the wire to a 6.0.1 engine, not
+    merely in the unit call — the rail's whole point is that no builder can emit
+    an unbarred offender.
+    """
+    handle, wire = _handle_on(60001)
+    handle.query(statement, {"ids": ["p1"]})
+    sent = _sent(wire)
+    assert len(sent) == 1, wire.commands
+    assert "WITH *" in sent[0], (
+        f"an unbarred shape reached a 6.0.1 engine: {sent[0]!r}"
+    )
