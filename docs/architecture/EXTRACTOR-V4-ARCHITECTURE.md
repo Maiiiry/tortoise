@@ -124,7 +124,7 @@ Production graph: **~25,000 quota nodes in 3–4 active days** (~27 per emitting
 **Why this is not a detail:**
 
 - **A narrative in the graph is a narrative in RAM.** The graph is the RAM-resident layer (`STORAGE-ARCHITECTURE.md` §2), so putting prose there pays memory prices forever for text that is only ever **read**, never **argued about**. **The narrative is a searchable string, not a belief** — it has no confidence, is not `NAND`-able, and takes part in no operator.
-- **The graph keeps a reference, not the text.** The `Source` entity stays in the graph — it is the provenance anchor every claim points at — while the **heavy text** (turns and narrative) stays in Supabase, reached through it.
+- **The graph keeps a reference, not the text.** The `Source` entity stays in the graph — it is the provenance anchor every claim points at — while the **heavy text** (turns and narrative) stays in Postgres — the owner's *"supabase"*, meaning the DATABASE, not the object bucket — reached through it.
 - **It is far cheaper than the graph** — the storage research measured **~580× on disk-resident data** (⚠️ **not the *"~1,000×"* an earlier draft stated — that number was unsourced; 580× applies to the disk-resident leg, not to the vector index).** ⚠️ **And *"carries most of the retrieval value"* is NOT measured and is REMOVED** — §10 of this document itself says *"No head-to-head measurement exists."* **The claim to keep is the one that IS supported: the narrative is the middle ground that makes raw turns droppable.**
 - **It is the middle ground** that makes raw turns droppable without losing *"what happened in this session?"*
 - **It is connected by construction** (§4, S1) — so it links to Objects/Events/Points rather than being an island.
@@ -138,7 +138,7 @@ Production graph: **~25,000 quota nodes in 3–4 active days** (~27 per emitting
 
 **The problem it solves:** extraction **rephrases**. A `Point` is the model's rendering of what was said, not what was said. During the LongMemEval work, **raw facts were being deformed** — and that deformation is silently baked into the belief layer, where nothing downstream can detect it.
 
-**The layer:** the **minimal verbatim span** each `Point` was derived from, kept **verbatim in raw storage (Supabase), not in the graph**, and **linked to the `Point`/`Object` it supports**. Distinct from the other three by granularity and purpose:
+**The layer:** the **minimal verbatim span** each `Point` was derived from, kept **verbatim in Postgres (the owner's *"supabase"* = the DATABASE, not the object bucket)**, not in the graph, and **linked to the `Point`/`Object` it supports**. Distinct from the other three by granularity and purpose:
 
 | layer | what it is | granularity | purpose |
 |---|---|---|---|
@@ -197,7 +197,7 @@ Production graph: **~25,000 quota nodes in 3–4 active days** (~27 per emitting
 
 **⚠️ COORDINATION NOT TO MISS (reviewer B2.23): §2.4 WIDENS `#2684`'s scope** — from *value-bearing* `Point`s to *all* `Point`s — **without recording it.** It is a deliberate widening, but **`#2684` is the other issue's scope and the change must be recorded there, not only here.**
 
-**⚠️ Storage consequence, harmonised with `STORAGE-ARCHITECTURE.md`:** the raw fact is **Supabase storage, not the graph**, joined to its `Point` by a reference — exactly the pattern §9.1 uses for the narrative. **If the belief layer carries the span, it stops being cheap; if it carries a reference, the fidelity is free.** That is the design rule this layer depends on.
+**⚠️ Storage consequence, harmonised with `STORAGE-ARCHITECTURE.md` §9.1:** the raw fact is **Postgres text, not a graph node** (the owner's *"supabase"* = the DATABASE, not the object bucket; destination corrected 2026-10-09), joined to its `Point` by a reference — exactly the pattern §9.1 uses for the narrative. **If the belief layer carries the span, it stops being cheap; if it carries a reference, the fidelity is free.** That is the design rule this layer depends on.
 
 #### 2.4.1 ⭐ Why the LINK is the load-bearing half — and the pattern has a name (2026-09-24)
 
@@ -213,7 +213,7 @@ The mechanism is **parent-document retrieval** / **small-to-big**: *embed the sm
 | # | rule | why |
 |---|---|---|
 | **1** | **Every committed `Point`/`Object` must carry a reachable link to its `Source` span.** A node that cannot walk up cannot be served as evidence | **the link is how the evidence reaches the model** — without it, the 15.9-pt finding is unreachable and all we can serve is the derived claim |
-| **2** | **A `Source` MAY additionally carry one summary vector** (the S1 narrative, kept in Supabase) | it buys one query class nothing else serves — *"which SOURCE is about X"*. Framework practice, **not** a measurement. Storage §9.4 |
+| **2** | **A `Source` MAY additionally carry one summary vector** (the S1 narrative, kept in Postgres) | it buys one query class nothing else serves — *"which SOURCE is about X"*. Framework practice, **not** a measurement. Storage §9.4 |
 
 **And what is explicitly NOT the mechanism:** *"are these two sources the same?"* is **never** answered by a vector — similarity detects the same **topic**, not the same **document**. Identity is **canonicalised URL + content hash** (storage §9.4 ③).
 
@@ -235,7 +235,7 @@ The mechanism is **parent-document retrieval** / **small-to-big**: *embed the sm
 Point (graph — carries live / superseded / draft, EP confidence, operators)
    │  span reference  (point_id → source_turn_id + char span)
    ▼
-raw fact (Supabase — immutable text. Carries NO status. Ever.)
+raw fact (Postgres — immutable text. Carries NO status. Ever.)
 ```
 
 **Three consequences that follow, and each is a rule:**
