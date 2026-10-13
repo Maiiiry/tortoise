@@ -99,8 +99,9 @@ function cardsBlock(source) {
 // cannot be produced by the regression it guards (the `"Backups"` original:
 // a QUOTED literal the file never held, which no JSX reintroduction of the
 // card could ever emit) is a tautology, which is the defect this file was
-// fixed for. The `Data points` original was weaker in the same direction — it
-// pinned one label string; `card-val` below pins the stat-card FRAME the
+// fixed for. The `Data points` original was vacuous for the same reason —
+// `grep -c 'Data points' main.jsx` is `0`, so it pinned a label string the file
+// never held either; `card-val` below replaces it with the stat-card FRAME the
 // retired card actually used (`<div className="card"><div className="card-val">`).
 const OVERVIEW_FORBIDDEN = [
   { token: '<MemorySources', why: 'no source list on the Overview (Settings + the wizard step own it, #3513)' },
@@ -139,9 +140,10 @@ test('DE2E-2: populated Overview renders EXACTLY the 3 elements (zero toggles)',
   // zero toggles / panels / stat cards on the Overview. #3245: the original
   // check was `"Backups"` — a QUOTED literal main.jsx has never contained and
   // that no JSX reintroduction of the card could emit, so it was
-  // unconditionally true. Its `Data points` neighbour pinned only one label
-  // string; `card-val` (the retired stat-card frame) replaces it with the
-  // structure a reintroduction would have to use. Every token below is proven
+  // unconditionally true. Its `Data points` neighbour was vacuous for the same
+  // reason (`grep -c 'Data points' main.jsx` is `0`); `card-val` (the retired
+  // stat-card frame) replaces it with the structure a reintroduction would have
+  // to use. Every token below is proven
   // real by the non-vacuity guard beneath.
   for (const { token, why } of OVERVIEW_FORBIDDEN) {
     assert.ok(!ovText.includes(token),
