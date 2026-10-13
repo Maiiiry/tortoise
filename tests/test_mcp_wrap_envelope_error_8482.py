@@ -94,6 +94,11 @@ def _schema_validates_against(payload, output_schema) -> bool:
     structured = payload["structuredContent"]
     if structured is None:
         return payload["isError"]          # absent payload is allowed on an error
+    if not output_schema:
+        # No advertised schema → a conforming client has no validator for this
+        # tool and cannot refuse the payload. Several registry tools are in
+        # this form, so the sweep must not read it as a violation.
+        return True
     prop = (output_schema.get("properties") or {}).get("result") or {}
     value = structured.get("result")
     if isinstance(prop.get("type"), str):
@@ -207,14 +212,19 @@ async def test_the_wait_bound_refusal_is_repaired_for_a_wrap_tool(quiet,
     """Same class, second producer: the refusal payload is `{"error": {...}}`
     with no `result` key, which a wrap schema rejects just as hard. It must
     still carry its wait-bound marker so the timeout classification is not
-    lost."""
-    from tortoise.mcp_auth import _TRANSPORT_WAIT_BOUND_MESSAGE, ERR_TIMEOUT
+    lost, and the retry delay it advertises must still be READABLE."""
+    from tortoise.mcp_auth import (
+        _TRANSPORT_WAIT_BOUND_MESSAGE,
+        _TRANSPORT_WAIT_RETRY_AFTER_S,
+        ERR_TIMEOUT,
+    )
 
     refusal = ms.ToolResult(
         content=_TRANSPORT_WAIT_BOUND_MESSAGE,
         structured_content={"error": {"code": ERR_TIMEOUT,
                                       "message": _TRANSPORT_WAIT_BOUND_MESSAGE,
-                                      "data": {"retry_after": 5}}},
+                                      "data": {"retry_after":
+                                               _TRANSPORT_WAIT_RETRY_AFTER_S}}},
         meta={ms._WAIT_BOUND_META_KEY: True},
         is_error=True,
     )
@@ -227,9 +237,16 @@ async def test_the_wait_bound_refusal_is_repaired_for_a_wrap_tool(quiet,
     assert result.is_error is True
     assert result.structured_content is None
     assert _TRANSPORT_WAIT_BOUND_MESSAGE in _wire_payload(result)["text"]
-    assert result.meta == {ms._WAIT_BOUND_META_KEY: True}, (
+    assert result.meta[ms._WAIT_BOUND_META_KEY] is True, (
         "dropping the envelope must not drop the wait-bound marker — it is "
         "what classifies the call as a timeout rather than a failure")
+    # The refusal's prose is digit-free BY DESIGN (`mcp_auth`: the advertised
+    # delay has exactly one source, and that source is this payload), so a
+    # repair that dropped it would tell the caller to wait for a delay it never
+    # advertises. It must be re-homed where the client still reads it.
+    rehomed = result.meta[ms._SCHEMA_ERROR_META_KEY]
+    assert rehomed["code"] == ERR_TIMEOUT
+    assert rehomed["data"]["retry_after"] == _TRANSPORT_WAIT_RETRY_AFTER_S
     # `fastmcp.wrap_result` described a payload that is no longer there.
     assert "fastmcp" not in (result.meta or {})
 
@@ -272,36 +289,125 @@ def test_the_raw_tool_function_still_returns_the_safe_error_dict(quiet, stdio):
     assert raw["error"] == "boom"
 
 
-# ── The surface guard: this holds for EVERY array-envelope tool ───────────
+# ── The surface guard: EVERY registry tool, not the two the issue named ───
 
 @pytest.mark.asyncio
-async def test_every_array_envelope_tool_is_recognised():
-    """The class fix, not a two-tool patch (#8482 named `tortoise_search` and
-    `tortoise_expand_relationships`, but 12 registry tools carry the envelope).
+async def test_no_registry_tool_can_deliver_a_payload_its_schema_rejects(
+        quiet, monkeypatch):
+    """The class guard, over all 82 registry tools — the #8482 invariant.
 
-    `_wrap_envelope_result_type` is the seam's READ of the advertised schema;
-    if it stops agreeing with the schema, the repair silently stops firing and
-    the -32602 comes back unnoticed. This is the assertion that would have
-    caught the defect for every affected tool at once.
+    The issue could only name two tools and explicitly asked for a repo-wide
+    sweep of declared-vs-returned shape. A refusal is forced for EVERY registry
+    tool at the dispatch seam (so no per-tool arguments are needed) and the
+    result a conforming client would receive is checked against the tool's OWN
+    advertised schema. Before the fix every array-envelope tool failed this;
+    after it, none can.
+
+    It also pins the retry signal across the whole surface: the wait-bound
+    refusal's delay must be findable whichever channel the schema permits
+    (structured payload for an object tool, the re-homed `_meta` for a wrap
+    tool). A repair that made a call legible but dropped the delay would fail
+    here for all 11 typed tools at once.
     """
+    from tortoise.mcp_auth import _TRANSPORT_WAIT_BOUND_MESSAGE, ERR_TIMEOUT
     from tortoise.tool_registry import TOOL_REGISTRY
 
-    checked = 0
+    retry_after = 5
+    refusal = ms.ToolResult(
+        content=_TRANSPORT_WAIT_BOUND_MESSAGE,
+        structured_content={"error": {"code": ERR_TIMEOUT,
+                                      "message": _TRANSPORT_WAIT_BOUND_MESSAGE,
+                                      "data": {"retry_after": retry_after}}},
+        meta={ms._WAIT_BOUND_META_KEY: True},
+        is_error=True,
+    )
+
+    async def _refuse(*a, **k):
+        return refusal
+
+    monkeypatch.setattr(ms, "_await_under_mcp_wait_bound", _refuse)
+
+    repaired = delivered = 0
     for entry in TOOL_REGISTRY:
         schema = await _registered_schema(entry.name)
-        if not isinstance(schema, dict) or not schema.get("x-fastmcp-wrap-result"):
-            continue
-        prop = (schema.get("properties") or {}).get("result") or {}
-        expected = prop.get("type") if isinstance(prop.get("type"), str) else ""
-        resolved = await ms._wrap_envelope_result_type(entry.name)
-        assert resolved == (expected or None), (
-            f"{entry.name}: seam resolved {resolved!r} but the advertised "
-            f"schema declares {expected!r}")
-        checked += 1
-    assert checked >= 10, (
-        f"only {checked} wrap-envelope tools found — the registry or FastMCP's "
-        "envelope convention changed, so this guard is no longer measuring what "
-        "it was written for")
+        result = await ms.mcp.call_tool(entry.name, {})
+        wire = _wire_payload(result)
+        assert result.is_error is True, entry.name
+        assert _schema_validates_against(wire, schema), (
+            f"{entry.name}: a conforming client would reject this payload "
+            "against the schema the tool itself advertises")
+        if isinstance(schema, dict) and schema.get("x-fastmcp-wrap-result"):
+            repaired += 1
+            assert wire["structuredContent"] is None, entry.name
+        else:
+            delivered += 1
+        assert _TRANSPORT_WAIT_BOUND_MESSAGE in wire["text"], entry.name
+        # The retry delay, on whichever channel this tool's schema permits.
+        carried = (getattr(result, "meta", None) or {}).get(
+            ms._SCHEMA_ERROR_META_KEY) or (wire["structuredContent"] or {}).get(
+                "error") or {}
+        assert carried.get("data", {}).get("retry_after") == retry_after, (
+            f"{entry.name}: the refusal tells the caller to wait for an "
+            "advertised delay — that delay must survive the repair")
+
+    # Shrinkage is the dangerous direction: the sweep must keep measuring the
+    # surface it was written for. Growth (a new envelope tool) is fine and is
+    # covered by the loop itself.
+    assert repaired >= 11 and delivered >= 60, (
+        f"sweep saw {repaired} wrap + {delivered} object tools; measured at "
+        "11 + 71 when this guard was written")
+
+
+@pytest.mark.asyncio
+async def test_a_wrapped_scalar_is_repaired_too():
+    """A wrap envelope whose `result` is a SCALAR is the same escape.
+
+    `_safe` returns the SDK value unchanged on success, so a tool whose SDK
+    answers with the wrong shape (the non-exception sibling of the raise this
+    issue is about) ships `{"result": <scalar>}` — admitted by neither an
+    array nor a union envelope, and refused by the client just as hard. The
+    pre-filter must schedule the schema read for it; a dict-only pre-filter
+    would have let it through.
+    """
+    def _scalar() -> list[dict]:
+        return "boom"  # type: ignore[return-value]
+
+    _probe("_8482_scalar", _scalar)
+    try:
+        result = await ms.mcp.call_tool("_8482_scalar", {})
+        schema = await _registered_schema("_8482_scalar")
+    finally:
+        _drop("_8482_scalar")
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert _schema_validates_against(_wire_payload(result), schema)
+
+
+@pytest.mark.asyncio
+async def test_a_repaired_failure_is_not_recorded_as_ok(monkeypatch, stdio):
+    """The wire and the scorecard must agree about the same call.
+
+    The repair PROVES the dispatch failed and tells the client so
+    (`is_error`), so leaving the `mcp_tool_call` row `ok` would re-create the
+    exact "a failure that reads as a success" defect this issue is about — and
+    it would be newly *created* by the repair rather than merely inherited
+    (#8135 owns the general `_SafeError` case).
+    """
+    events: list[dict] = []
+    monkeypatch.setattr(
+        ms, "_emit_mcp_tool_call_telemetry",
+        lambda org, name, status, latency, kind, count=None:
+        events.append({"status": status, "error_kind": kind}))
+
+    class _RaisingSDK:
+        def tortoise_fts_query(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    with mock.patch.object(ms, "_get_org_sdk", _RaisingSDK):
+        result = await ms.mcp.call_tool("tortoise_search", {"query": "q"})
+    assert result.is_error is True
+    assert events and events[0]["status"] == "exec_error"
+    assert events[0]["error_kind"] == "safe_error"
 
 
 @pytest.mark.asyncio
@@ -316,10 +422,21 @@ async def test_every_wrap_envelope_tool_cannot_satisfy_a_failed_payload():
     """
     from tortoise.tool_registry import TOOL_REGISTRY
 
-    #: A `result` each declared type must ACCEPT — the success shape.
-    _ACCEPTED = {"array": [{"id": "p1"}], "object": {"id": "p1"},
-                 "string": "s", "boolean": True, "number": 1.0,
-                 "integer": 1}
+    #: A `result` the declared schema ACCEPTS, built FROM that schema (its own
+    #: `type`, and for an array its `items.type`) rather than hardcoded: a fixed
+    #: `[{"id": "p1"}]` is NOT valid for, say, `tortoise_list_graphs`
+    #: (`items: {type: string}`), so a "must pass untouched" assertion against it
+    #: would be about a payload that is not a success shape at all.
+    def _accepted(prop):
+        kind = prop.get("type")
+        if kind != "array":
+            return {"object": {"id": "p1"}, "string": "s", "boolean": True,
+                    "number": 1.0, "integer": 1}.get(kind)
+        element = {"string": "s", "object": {"id": "p1"}, "number": 1.0,
+                   "integer": 1, "boolean": True}.get(
+                       (prop.get("items") or {}).get("type"))
+        return [] if element is None else [element]
+
     #: (1) `_safe`'s error dict lands INSIDE the envelope.
     _SAFE_FAILURE = {"result": {"error": "boom"}}
     #: (2) the wait-bound refusal carries no `result` at all — and `result` is
@@ -344,7 +461,8 @@ async def test_every_wrap_envelope_tool_cannot_satisfy_a_failed_payload():
         typed += 1
         assert ms._violates_wrap_envelope(schema, _SAFE_FAILURE), entry.name
         assert not ms._violates_wrap_envelope(
-            schema, {"result": _ACCEPTED[kind]}), (
+            schema, {"result": _accepted(
+                (schema.get("properties") or {}).get("result") or {})}), (
             f"{entry.name}: a successful `{kind}` payload must pass untouched")
         assert not ms._violates_wrap_envelope(schema, None), (
             f"{entry.name}: FastMCP's own no-payload form is out of scope")

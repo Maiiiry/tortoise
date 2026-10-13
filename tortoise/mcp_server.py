@@ -273,7 +273,10 @@ def _emit_mcp_tool_call_telemetry(org_id: str, tool_name: str, status: str,
       exception class, or the unwrapped cause's class name, respectively);
       the #236 stdio auth gate is the OTHER ``auth_error`` producer, with
       ``error_kind = "stdio_auth_gate"`` — it is not an exception class, so it
-      is not produced by that classifier.
+      is not produced by that classifier. ``exec_error`` has ONE more producer
+      with ``error_kind = "safe_error"``: a dispatch whose `_safe` failure was
+      shipped inside a wrap envelope the tool's own schema forbids (#8482) —
+      it is not an exception either, because `_safe` ANSWERED with a dict.
     - ``timeout`` — the transport wait bound fired at this seam
       (``error_kind = "wait_bound"``).
     - ``cancelled`` — the caller cancelled the dispatch
@@ -849,6 +852,10 @@ async def _check_mcp_op_budget(name: str, org_id: str) -> None:
 # does return an array) — widening it to admit the error dict would convert a
 # loud failure into a silent false negative.
 
+#: The `_meta` key a repaired failure uses to re-home the machine-readable
+#: error payload its envelope could not carry — see :func:`_schema_error_result`.
+_SCHEMA_ERROR_META_KEY = "tortoise_error"
+
 #: JSON-schema ``type`` → the Python type a value must satisfy. Only the types
 #: a wrap envelope can declare for its ``result`` key. A declared ``anyOf`` (or
 #: no ``type`` at all) is deliberately ABSENT: a dict ``result`` is admissible
@@ -947,15 +954,20 @@ def _maybe_wrap_envelope_violation(result) -> bool:
     schema is resolved only when one is present:
 
     * the transport wait-bound refusal — its payload carries no ``result``;
-    * a FastMCP-marked wrap envelope whose ``result`` is a DICT. An object can
-      never satisfy an array/string/number/boolean envelope, and a dict is the
-      only shape :func:`_safe` ever returns for a failure. A UNION envelope
-      legitimately admits it — and deciding THAT is precisely what the schema
-      read is for.
+    * a FastMCP-marked wrap envelope whose ``result`` is NOT a list — a dict is
+      the only shape :func:`_safe` ever returns for a failure, and a scalar is
+      a payload no array envelope can hold either. A UNION envelope
+      legitimately admits the dict — and deciding THAT is precisely what the
+      schema read is for.
 
     The healthy path costs two dict lookups: a successful array-envelope tool
     carries a list under ``result``, and an object-annotated tool carries no
-    ``fastmcp`` wrap marker at all.
+    ``fastmcp`` wrap marker at all. One deliberate limit: this recognises the
+    ENVELOPE, not the payload's contents, so an array whose ITEMS violate the
+    declared ``items`` schema is not caught — that is validation of the tool's
+    data rather than of the envelope, it has no producer in the registry
+    today, and a partial re-implementation of JSON Schema would imply a
+    completeness it would not have.
     """
     payload = getattr(result, "structured_content", None)
     if not isinstance(payload, dict):
@@ -964,7 +976,9 @@ def _maybe_wrap_envelope_violation(result) -> bool:
     if meta.get(_WAIT_BOUND_META_KEY):
         return True
     wrapped = (meta.get("fastmcp") or {}).get("wrap_result")
-    return bool(wrapped) and isinstance(payload.get("result"), dict)
+    if not wrapped:
+        return False
+    return not isinstance(payload.get("result"), list)
 
 
 def _safe_failure_message(payload: Any) -> str | None:
@@ -1005,9 +1019,22 @@ def _schema_error_result(result) -> ToolResult:
     classified downstream) except FastMCP's own ``wrap_result`` claim, which
     described a payload that is no longer there — a client that trusted it
     would unwrap a ``None``.
+
+    A dropped error payload that is a MAPPING is re-homed under
+    ``_SCHEMA_ERROR_META_KEY``, because it carries the machine-readable half of
+    the failure. The producer that matters is the transport wait-bound refusal:
+    its retry delay ships ONLY as ``error.data.retry_after`` (``mcp_auth`` keeps
+    the refusal prose digit-free BECAUSE that payload is the delay's one
+    source), so dropping it would tell the caller to wait for an advertised
+    delay and then not advertise it. ``_meta`` is the other channel a conforming
+    client accepts, and this seam already carries the wait-bound marker there.
     """
     meta = dict(getattr(result, "meta", None) or {})
     meta.pop("fastmcp", None)
+    payload = getattr(result, "structured_content", None)
+    inner = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(inner, dict):
+        meta[_SCHEMA_ERROR_META_KEY] = inner
     return ToolResult(
         content=getattr(result, "content", None),
         structured_content=None,
@@ -1090,6 +1117,14 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
             envelope = await _wrap_envelope_schema(name)
             if envelope is not None and _violates_wrap_envelope(envelope, payload):
                 result = _schema_error_result(result)
+                if status == "ok":
+                    # The seam has just PROVEN this dispatch failed and told the
+                    # client so (`is_error`); leaving the row `ok` would put the
+                    # scorecard and the wire in disagreement — the same
+                    # "a failure that reads as a success" defect #8135 owns for
+                    # the general `_SafeError` case. Only when nothing else has
+                    # classified it: the wait-bound statuses are set above.
+                    status, error_kind = "exec_error", "safe_error"
         return result
     except asyncio.CancelledError:
         # A cancelled dispatch is neither an "ok" nor an exec error — classifying
