@@ -26,6 +26,14 @@ from tortoise.live import (
     epistemic_label_queries,  # #7853: id-anchored reads sweep labels, one query per label
 )
 
+# #8317 review round 3: the store's NUMERIC domain (INT64 clamp / non-finite
+# reject) — a leaf module, so this cannot cycle. `_annotator_value_ok` answers
+# the WRITE question (shape + the `#7369` parameter-parse refusals); the numeric
+# axis is the second half of the COMPARISON question only, because an int
+# outside INT64 IS written (clamped), so clearing it on replay would drop a
+# property the live graph carries.
+from tortoise.numeric_domain import numeric_alteration_reason
+
 # #7719: the SHARED terminalizer-miss classifier and the non-folded recorder.
 # ``nonfolded`` is a stdlib-only leaf module, so this import cannot cycle.
 from tortoise.projection.nonfolded import (
@@ -185,6 +193,53 @@ def _is_persistable_prop_value(value, _depth: int = 0) -> bool:
     return False
 
 
+def _store_holds_prop_value(value) -> bool:
+    """True when the store holds ``value`` EXACTLY as the payload states it.
+
+    ⛔ This is the bar for BOTH questions the `tags` fix asks — *does the writer
+    put the property on the node?* (``_stated_tags``, ``_revise_point``) and
+    *may the journal's value be compared against the node's?*
+    (``consistency._uncarried``) — because the two REPLAY ENGINES disagree about
+    what they do to a value the numeric domain refuses: FalkorDB CLAMPS a
+    Python ``int`` outside INT64 (the ``numeric_alteration_reason`` reason says
+    "would be SILENTLY clamped"), while the EMBEDDED engine REJECTS it at
+    parameter parse (``Failed to parse the value of parameter 'tags'``,
+    measured). Writing it would therefore ABORT a ``rebuild_all`` after the
+    wipe on one engine — the class the content and dim clauses above refuse to
+    crash on (#325/#3689 review P1) — so a recovery fold must contribute NO
+    property for it and a comparison must not compare it. "The store holds it
+    exactly as stated" is the only bar that is safe on both engines, which is
+    why the WRITE question is answered here rather than by the transport gate
+    alone (#8317 review round 3).
+
+    On top of the shape allowlist ``_is_persistable_prop_value`` and the write
+    gate, the numeric domain is the second test — a value either gate would
+    ALTER (or refuse to parse) is carried in a different form than the journal
+    states (or not at all), so it must not be written or compared:
+
+      * the ``#7369`` transport gate nulls anything ``_value_ok`` refuses — a
+        non-finite float, a NUL/lone-surrogate string, a null inside an array,
+        a map/bytes/set;
+      * the engine CLAMPS a Python ``int`` outside INT64 (``2**70`` reads back
+        ``9223372036854775807``, measured — ``tortoise/numeric_domain.py``), so
+        the journal's value is not the graph's.
+
+    Its ONLY caller is ``consistency._uncarried`` — the comparison surface:
+    declaring "the graph holds the journal's value" for something the engine
+    clamps contradicts the graph that was just read (#8317 review round 3,
+    reproduced with a hand-written ``PointAdded(tags=[nan])`` and with
+    ``tags=[2**70]``). The WRITE question is ``_annotator_value_ok``'s, asked by
+    ``_stated_tags`` and ``_revise_point``.
+
+    ``_annotator_value_ok`` lives in the package ``__init__`` — this module is
+    imported BY that package, so the import is function-local; by the time any
+    replay calls this, the package is fully initialised.
+    """
+    from tortoise.projection import _annotator_value_ok
+    return (_annotator_value_ok(value)
+            and numeric_alteration_reason("tags", value) is None)
+
+
 def _stated_tags(payload) -> tuple[bool, object]:
     """``(writes_property, value)`` for a payload's ``tags`` key (#2897).
 
@@ -193,9 +248,17 @@ def _stated_tags(payload) -> tuple[bool, object]:
     pass-1b boundary report that reads its outcome — never re-spelled at either
     site (#5048).
 
-    A persistable value the payload states is written VERBATIM (a non-list
-    scalar included — live stores one, and only the EDGE half is list-only).
-    ``None``/absent states NO property.
+    A value ``_store_holds_prop_value`` accepts is written VERBATIM (a
+    non-list scalar included — live stores one, and only the EDGE half is
+    list-only). ``None``/absent, and any value the transport gate refuses (a
+    map, a non-finite float, a NUL string) or the numeric domain would alter or
+    reject, states NO property. The predicate is the store-EXACTNESS gate the
+    comparison also uses, deliberately: the replay must be fail-safe on BOTH
+    engines (docker clamps an over-range int, embedded rejects it at parameter
+    parse), so a value the store would not hold as stated contributes no
+    property rather than aborting the rebuild after the wipe (#8317 review
+    round 3). The same gate answers ``_revise_point``'s property clause, so the
+    add and edit arms cannot disagree.
 
     ⚠️ Three corrections to an earlier version of this paragraph, all MEASURED
     on the embedded engine — the helper's ANSWERS were right, its reasoning was
@@ -230,7 +293,7 @@ def _stated_tags(payload) -> tuple[bool, object]:
     if not isinstance(payload, dict) or "tags" not in payload:
         return False, None
     value = payload.get("tags")
-    if value is None or not _is_persistable_prop_value(value):
+    if value is None or not _store_holds_prop_value(value):
         return False, None
     return True, value
 
@@ -1212,13 +1275,18 @@ class _EntityHandlers:
         # structural / edge-carried — never node props via passthrough
         "operator", "provenance", "about_entities", "aboutEntities",
         "extractedFrom", "is_episodic", "_nid", "_graph_id",
-        # #2897 (OD-4 disposition #3856: ADOPT — a Tag is an `:Tag` Object
-        # subclass shared via MERGE, i.e. first-class data by construction,
-        # not a derived label). Its own clause (`_upsert_point_props`) owns
-        # the raw-list node property and pass 2 (`_upsert_point_edges` →
-        # `_sync_tags`) reconciles the `:Tag`/`TAGGED` half from the SAME
-        # payload — the `extractedFrom` split (#2489). Handled also keeps the
-        # undeclared-list drop report from firing for a prop the fold restores.
+        # #2897 (OD-4 disposition #3856: ADOPT — a Tag is first-class data by
+        # construction: a SHARED, MERGEd node is data. The ontology specifies
+        # an `:Object` subclass while the code creates a bare `:Tag`; that
+        # doc-vs-code gap is filed as #8325, and the durability argument rests
+        # on "shared and MERGEd", not on the label). Its own clause
+        # (`_upsert_point_props`) owns the raw-list node property; pass 2
+        # (`_upsert_point_edges` → `_sync_tags`) reconciles the `:Tag`/`TAGGED`
+        # half from the NODE'S FINAL value — never from this payload, which
+        # holds only the creation list and would resurrect a removed tag (the
+        # `#3299`/`#2488` class) — the `extractedFrom` split (#2489). Handled
+        # also keeps the undeclared-list drop report from firing for a prop the
+        # fold restores.
         "tags",
         # #5256: a DECLARED node property (own conditional clause below), the
         # extractedFrom READ-VERSION transit. It rides on the NODE because
@@ -1303,8 +1371,9 @@ class _EntityHandlers:
     # form is the declared `flatten=list` STRING (`search_keys` -> space-joined
     # by `flatten_search_keys_prop`, applied on the SHARED Point writer so all
     # three doors agree — #8006); `tags` (the one such prop in practice) is
-    # reconciled by its own clause plus the pass-2 edge sync, BOTH halves from
-    # the same payload (#2897), so it never reaches the generic filter. Empty
+    # reconciled by its own clause plus the pass-2 edge sync, which reads the
+    # NODE's final value rather than the payload (#2897), so it never reaches
+    # the generic filter. Empty
     # pre-D1: no other list prop passes through the generic Point filter today.
     # Replaced by contract.py's declared set in D1.
     # ⛔ NOT the fix for `search_keys`: populating this set stores an ARRAY,

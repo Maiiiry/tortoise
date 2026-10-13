@@ -124,6 +124,8 @@ replays the JSONL journal on disk. Locally:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tortoise.consistency import check_consistency
@@ -413,7 +415,8 @@ def test_a_non_list_tag_value_is_restored_verbatim(env):
     so a replay must too, or ``check_consistency`` reports a divergence on a
     graph the live path itself wrote.
 
-    ``create_point``/``update_point`` write through ``SET n += $props``, so
+    ``create_point`` writes ``tags`` in its ``CREATE (n:Point {…})`` property
+    MAP while ``update_point`` merges it with ``SET n += $props`` — either way
     ``tags="scalar"`` lands as a plain property (``_sync_tags`` is list-only,
     so it gets no edges) — pinned by
     ``tests/test_sdk.py::test_update_non_list_tags_no_crash``. The replay's
@@ -551,4 +554,135 @@ def test_a_tuple_tag_value_syncs_edges_on_both_arms(env):
     report = check_consistency(str(events / "events.jsonl"), sdk._get_proj())
     assert report["ok"] is True, (
         "a faithful tuple replay must not be red: "
+        + str(report.get("divergent_points")))
+
+
+# ══ The checker's CARRIAGE predicate is the writer's EFFECTIVE one ═════════
+#
+# #8317 review round 3. The `tags` branch of `_uncarried` classified carriage
+# with `_is_persistable_prop_value` — the SHAPE allowlist — while the writer's
+# effective rule is that predicate PLUS the `#7369` transport gate (a value
+# `_value_ok` refuses is nulled before dispatch) PLUS the store's numeric domain
+# (an int outside INT64 is CLAMPED by the engine). A value that passes the shape
+# test but fails either of the other two is written by nobody and was named by
+# nobody, so it fell through to the field-aware comparison: the journal held it,
+# the graph did not (or held a clamped value), and `check_consistency` reported
+# an UNCLEARABLE `divergence="content"` whose `action` ("reconcile by replaying
+# the journal") reproduces exactly the graph already present. Each `value` below
+# is measured on the embedded engine; the first three FAIL on the pre-fix code
+# (`ok is False`), which is the non-vacuity proof. The map case is a control:
+# the shape predicate already refused it, so it passed pre-fix too.
+
+
+def _write_journal(events, records: list[dict]) -> None:
+    """Replace the JSONL journal with ``records`` — the hand-edited/alternate-
+    producer shape the finder's own repro used, so the test cannot be satisfied
+    by the SDK's `_sanitize_props` boundary instead of the replay boundary."""
+    (events / "events.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in records))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(["a", float("nan")], id="non-finite-float"),
+        pytest.param(["a", "b\x00c"], id="nul-string"),
+        pytest.param(["a", 2 ** 70], id="int-outside-int64"),
+        pytest.param({"a": 1}, id="map-shape (control)"),
+    ],
+)
+def test_a_tag_value_the_store_cannot_hold_is_named_not_a_false_divergence(
+        env, value):
+    """A `tags` value the writer's EFFECTIVE gate refuses is UNCURRIED, so the
+    checker NAMES the drop instead of comparing a value the graph never holds.
+
+    The graph is produced by the replay itself, so any `divergence` here is a
+    false red about the graph this code just wrote. `main` named every
+    list-valued `tags` as uncarried; #2897 correctly started COMPARING writable
+    lists, and this pins the boundary of that widening: a value either the
+    transport gate nulls or the engine clamps is still a named drop, not a
+    comparison.
+    """
+    sdk, events = env
+    _write_journal(events, [{
+        "type": "PointAdded",
+        "point": {"id": "p1", "content": "c", "tags": value},
+    }])
+
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
+
+    report = check_consistency(str(events / "events.jsonl"), sdk._get_proj())
+    assert report["ok"] is True, (
+        "a graph the replay itself produced must not be reported as diverged: "
+        + str(report.get("divergent_points")))
+    assert "tags" in report["uncarried_journal_fields"], (
+        "the value was dropped, so the drop must be NAMED — silence leaves an "
+        "operator unable to tell it from a faithful replay: "
+        f"{report['uncarried_journal_fields']}")
+
+
+# ══ A bare same-id re-emit MERGEs — the fold must mirror that ═════════════
+#
+# #8317 review round 3. `_upsert_point_props` writes `tags` with a
+# PRESENCE-based clause and pass 1a MERGEs, so a same-id `PointAdded` whose
+# payload OMITS `tags` PRESERVES the node's list — while the reference fold's
+# PointAdded arm REPLACED the entry and dropped it. Journal view had no tags,
+# the graph had them, and `check_consistency` reported an un-clearable
+# `divergence="content"`. This is a production shape: the capture turn loop
+# re-emits `PointAdded` for a turn on every capture of an existing session
+# window with a hand-built snapshot that carries no `tags` (`tortoise/sdk.py`).
+# The test FAILS on the pre-fix code (`ok is False`).
+
+
+def test_a_bare_reemit_that_omits_tags_does_not_drop_them(env):
+    """A re-emit that states no `tags` must not delete the tag the graph holds.
+
+    Differential against the node's own value: the re-emit is a MERGE, so the
+    rebuild keeps `alpha` (the property) and its `TAGGED` half. The reference
+    fold must agree with that, or the export/health gate is permanently red on
+    a faithful graph.
+    """
+    sdk, events = env
+    _write_journal(events, [
+        {"type": "PointAdded",
+         "point": {"id": "p1", "content": "v1", "tags": ["alpha"]}},
+        {"type": "PointAdded", "point": {"id": "p1", "content": "v2"}},
+    ])
+
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
+
+    assert _tag_hits(sdk, "alpha") == ["p1"], (
+        "the re-emit MERGEs, so the graph keeps the tag — if this changes, the "
+        "fold's job changes with it")
+    report = check_consistency(str(events / "events.jsonl"), sdk._get_proj())
+    assert report["ok"] is True, (
+        "the fold dropped a tag the graph's own MERGE preserved, so a faithful "
+        "graph read as diverged: " + str(report.get("divergent_points")))
+
+
+def test_a_recreation_that_omits_tags_still_drops_the_dead_incarnations(env):
+    """The re-emit fix must NOT reach a real delete→recreate.
+
+    A re-creation is a FRESH node live and the graph wipes `n.tags` (the #4042
+    pass-1a wipe), so the fold must drop the dead incarnation's list — the
+    `journal_recreate` gate. This is the anti-regression control for the fix
+    above: a naive "preserve on omit" fold leaks `ghost` here.
+    """
+    sdk, events = env
+    _write_journal(events, [
+        {"type": "PointAdded",
+         "point": {"id": "p1", "content": "v1", "tags": ["ghost"]}},
+        {"type": "EntityMutated", "op": "delete", "id": "p1",
+         "label": "Point"},
+        {"type": "PointAdded", "point": {"id": "p1", "content": "v2"}},
+    ])
+
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
+
+    assert _tag_hits(sdk, "ghost") == [], (
+        "the dead incarnation's tag leaked onto the re-created node — the "
+        "fold must treat a re-creation as a fresh node, not a MERGE")
+    report = check_consistency(str(events / "events.jsonl"), sdk._get_proj())
+    assert report["ok"] is True, (
+        "the wipe and the fold must agree on a re-creation: "
         + str(report.get("divergent_points")))

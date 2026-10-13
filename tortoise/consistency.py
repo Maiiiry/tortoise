@@ -76,6 +76,7 @@ from .projection import (
     journal_first_materialization,
     journal_hard_delete_seqs,
     journal_object_surviving_keys,
+    journal_recreate_seqs,
     plan_point_restamp_folds,
     prewipe_snapshot_path,
 )
@@ -84,6 +85,7 @@ from .projection.entities import (
     BELIEF_PROPS,
     _EntityHandlers,
     _is_persistable_prop_value,
+    _store_holds_prop_value,
     _usable_instant,
     _writable_journalled_vector,
     flatten_search_keys_prop,
@@ -332,6 +334,17 @@ _UNCARRIED_NON_PERSISTABLE = (
     "a value FalkorDB rejects as a node property (map/dict at any depth, bytes, "
     "set) — `_is_persistable_prop_value` filters it before the SET"
 )
+# #8317 review round 3: the `tags` carriage question asks the writer's EFFECTIVE
+# predicate (transport gate + numeric domain), not the shape allowlist — so a
+# value that passes the shape test but is nulled by the `#7369` transport gate
+# (a non-finite float, a NUL/surrogate string, a null inside an array) or
+# CLAMPED by the engine (an int outside INT64) gets its own, accurate reason.
+_UNCARRIED_TAGS_UNWRITABLE = (
+    "a `tags` value the store cannot hold as stated — the `#7369` transport "
+    "gate nulls what `_value_ok` refuses (non-finite float, NUL/surrogate "
+    "string, null inside an array, map/bytes/set) and an int outside INT64 is "
+    "clamped (`_store_holds_prop_value`)"
+)
 _UNCARRIED_LIST = (
     "list-valued prop the REPLAYED writer refuses (`_POINT_LIST_PROPS` is empty, "
     "#2795); the live path may still write it raw — the live/replay asymmetry "
@@ -532,21 +545,24 @@ def _uncarried(journal_by_id: dict) -> dict[str, dict[str, str]]:
             if k == "tags":
                 # #2897: the one `_POINT_HANDLED` key whose carriage depends on
                 # the VALUE's type rather than the key's presence. Its writer's
-                # clause is presence+persistable gated (`_stated_tags`), so a
-                # value this store cannot persist is genuinely uncarried and
-                # must be NAMED — the `_POINT_HANDLED` short-circuit below would
-                # swallow it, and an unnamed drop surfaced as an UNCLEARABLE
-                # `divergence="content"` whose `action` ("replay the journal")
-                # produces exactly the graph that is already there (#8317 review
-                # round 2, reproduced with a hand-written `PointAdded` carrying
-                # a map). Excluding it is safe on the graph side too: the store
-                # cannot hold such a value at all, so no legitimate divergence
-                # is hidden. (Deliberately a NARROW `tags` case, not a reorder of
-                # the generic list/persistable tests above the `_POINT_HANDLED`
-                # check: `provenance` is also handled-and-dict-valued, and a
-                # generic reorder would newly flag it.)
-                if v is not None and not _is_persistable_prop_value(v):
-                    found[k] = _UNCARRIED_NON_PERSISTABLE
+                # clause is presence+`_store_holds_prop_value` gated
+                # (`_stated_tags`), so a value the store cannot HOLD AS STATED
+                # is genuinely uncarried and must be NAMED — the `_POINT_HANDLED`
+                # short-circuit below would swallow it, and an unnamed drop
+                # surfaced as an UNCLEARABLE `divergence="content"` whose
+                # `action` ("replay the journal") produces exactly the graph that
+                # is already there (#8317 review round 2 with a map; round 3 with
+                # `[nan]`/`[NUL]`/`[2**70]`, all reproduced). The predicate is
+                # the writer's EFFECTIVE one, NOT `_is_persistable_prop_value`:
+                # the shape allowlist admits a non-finite float and a huge int,
+                # which the transport gate nulls and the engine clamps
+                # respectively. (Deliberately a NARROW `tags` case, not a reorder
+                # of the generic list/persistable tests above the
+                # `_POINT_HANDLED` check: `provenance` is also
+                # handled-and-dict-valued, and a generic reorder would newly flag
+                # it.)
+                if v is not None and not _store_holds_prop_value(v):
+                    found[k] = _UNCARRIED_TAGS_UNWRITABLE
                 continue
             if k in _POINT_HANDLED or k in _NOT_COMPARED:
                 continue
@@ -802,7 +818,10 @@ _PROJECTION_STATE_SUFFIX = ".projection-state.json"
 # ⚠️ This bump is the PRECURSOR only, and it is the change the file's own note on
 # the `(label, id)` re-key says must come first. The MIGRATION that retires the
 # untrusted state (recognising a known-old format and re-baselining it, instead
-# of refusing it for ever) stays #7936's remaining durable step.
+# of refusing it for ever) is owned by **#8268** ("a superseded projection-state
+# format_version disables the baseline for ever — format migration is
+# unreachable"), whose residual this is; #7936 is the parent that widened the
+# digest (the tags trigger is a SECOND, landed one — note it on #8268).
 _PROJECTION_STATE_FORMAT = 2
 
 
@@ -1040,6 +1059,10 @@ def _fold_journal(events: list[dict]) -> dict:
     # side of the write, so the reference verdict would disagree with
     # `rebuild_all`.
     _epistemic_existence = journal_epistemic_existence(events)
+    # #8317 review round 3: the re-creation boundary, so `_apply_one` preserves a
+    # presence-based prop (`tags`) the payload omits on a bare re-emit, and drops
+    # it on a real delete→recreate — the writer's own MERGE-vs-wipe semantics.
+    _recreate_seqs = journal_recreate_seqs(events)
     by_id: dict = {}
     for seq, ev in enumerate(events):
         # Same normalisation the writer applies (`_apply_one`/`apply`): the
@@ -1186,7 +1209,8 @@ def _fold_journal(events: list[dict]) -> dict:
         _apply_one(by_id, ev,
                    journal_first_materialized=_first_materialized,
                    journal_seq=seq,
-                   journal_existence=_epistemic_existence)
+                   journal_existence=_epistemic_existence,
+                   journal_recreate=seq in _recreate_seqs)
         # #4208: a content EDIT re-derives the vector. The live `update_point`
         # and the replay's `_revise_point` both re-encode from the new content,
         # so the journal states no vector for the edited point — yet the entry
@@ -1338,7 +1362,8 @@ _NAME_MERGE_LABELS: frozenset[str] = frozenset({"Object", "Subject"})
 #: ``content_hash`` for every existing baseline, which the check reports as an
 #: ``unrecorded-mutation`` and — because it never re-records over an
 #: untrusted/differing baseline — would report for ever. Widening the digest
-#: needs a baseline-format migration, which is #7936's remaining durable step.
+#: needs a baseline-format migration (#8268 owns the unreachable-migration class;
+#: #7936 is the parent that widened the digest).
 _ENTITY_BELIEF_FIELDS: tuple[str, ...] = tuple(BELIEF_PROPS) + tuple(
     BELIEF_BOOL_PROPS)
 

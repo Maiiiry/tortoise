@@ -782,9 +782,14 @@ class _EdgeHandlers:
             `tests/test_sdk.py::test_update_non_list_tags_no_crash` ("Non-list
             tag values match create_point: property set, no edge sync") asserts
             the old edge is still there.
-          * A REBUILD REMOVES them: the graph is wiped, and the derived pass
-            (`_upsert_point_edges`) mints only from a LIST, so a membership the
-            live graph still answers for is gone afterwards.
+          * A `rebuild_all` REMOVES them: the graph is wiped, and the derived
+            pass (`_upsert_point_edges`) mints only from a LIST, so a membership
+            the live graph still answers for is gone afterwards. ⚠️
+            `rebuild(EventLog)` — the non-destructive arm — KEEPS them, because
+            it does not wipe and no pass runs; so the two replay engines
+            disagree with each other on this input as well (the three-arm test
+            above asserts they agree on every OTHER shape). #8333 owns both
+            halves of that divergence.
 
         Which half is right is not in doubt. The `tags` PROPERTY is the SOURCE
         of this derived half (that is what "snapshot-derivable" means, #2489's
