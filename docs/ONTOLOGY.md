@@ -78,9 +78,9 @@ doc_status: live
 >   From→To cell and its Meaning cell (the pre-#7813 Meaning said Point→Event was
 >   **write-only in v1 with no EP propagation** — under #7813 an Event target is
 >   epistemic and propagates). The departure is marked `OVERRIDES` at §8.
-> - Spec-only markers accompany each declaration of `:Subject`/`:Object` operator
->   endpoints: the write path admits `:Point`/`:Event` only until #7902 lands, so
->   the model must not read as a live end-to-end shape.
+> - The write path admits `:Point`/`:Subject`/`:Object`/`:Event` operator
+>   endpoints (`#7902`), so each declaration of a `:Subject`/`:Object` operator
+>   endpoint is a live end-to-end shape.
 >
 > **Changelog v3.23 (2026-10-10 — issue #3644 — the §4.6 *Versioning* WINDOW half is implemented on `:Source`):**
 > §4.6 declared the Source version window and `#5024` landed the *version-anchor*

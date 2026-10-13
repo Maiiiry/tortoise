@@ -11,9 +11,7 @@ aboutObjects: STORAGE-ARCHITECTURE.md, records ledger, vector index, raw storage
 
 # Storage Architecture — the physical layout of the record
 
-**This document states target state.** Decisions, issue states and code facts are stated as they are **now**, with their authority (`#N`, PR, or `file:line`), and do not record how a passage changed — history lives in git and the tracker. **Legacy drift narrative in sections not yet re-read is removed as each is reached (`#8542`).**
-
-**Status:** design — **AMENDED 2026-10-08 to the owner's hybrid ruling** (§2.0): **Postgres is the system of record for every layer; FalkorDB is a derived hot cache.** Read §2.0 and §3's table first. **Scope:** where Tortoise's data physically lives, and what that costs. This document is written in the vocabulary of `docs/ONTOLOGY.md` (v3.15) — it does not introduce new layers.
+**Status:** design — **AMENDED 2026-10-08 to the owner's hybrid ruling** (§2.0): **Postgres is the system of record for every layer; FalkorDB is a derived hot cache.** Read §2.0 and §3's table first. **Scope:** where Tortoise's data physically lives, and what that costs. This document is written in the vocabulary of `docs/ONTOLOGY.md` (v3.15) — it does not introduce new layers. **This document states target state** — decisions, issue states and code facts are stated as they are **now**, with their authority (`#N`, PR, or `file:line`), never as a record of how a passage changed; history lives in git and the tracker. **Legacy drift narrative in sections not yet re-read is removed as each is reached (`#8542`).**
 
 **⚠️ ONE WORD, TWO PRODUCTS — read this before any section mentioning "Supabase".** **Supabase *is* Postgres** (a managed Postgres is its core product). This document uses the single word for **three different things**, and the overload has already caused a real misreading — the owner asked *"why both Postgres and Supabase?"*, when **there is ONE database**: **(1)** the **Postgres vendor** (§14) · **(2)** the **Postgres database itself** (e.g. *"vectors move to Supabase Postgres (`pgvector`)"*, §12.1c — `pgvector` is a Postgres extension) · **(3)** **Supabase Storage**, the **object bucket** (true binaries only). **Every mention means one of these three; nothing here describes two databases.**
 
@@ -656,11 +654,11 @@ Two link types look like near-duplicates:
 
 A `:Document` resolved by `coalesce(title, name)`; a `:Source` resolves by `url`. **A source keyed the old way would resolve to nothing and mis-point the rebuilt edge.**
 
-**The fold and the key change are version-scoped**, so a `:Document` key and a `:Source` key are not interchangeable. `#2489`'s own boundary is that **rebuild does NOT repair pre-existing graphs** (a `#2500`-style backfill is explicitly out of scope), so a graph written before the change has no later recovery path.
+**A `:Document` key and a `:Source` key are not interchangeable** — `coalesce(title, name)` does not resolve a node keyed by `url`. `#2489`'s own boundary is that **rebuild does NOT repair pre-existing graphs** (a `#2500`-style backfill is explicitly out of scope), so a graph written before the change has no later recovery path.
 
 #### ⚠️ T6 — a `:Source` re-materialises in place, and it is journalled
 
-`_upsert_source` bumps `updatedAt` / `version` / `contentHash` on an `ON MATCH` when the hash differs. **A source that is re-fetched and found changed is a NEW VERSION, not an edit.** That transition is **journalled as `SourceVersioned`** (`#5024`, `log.py:149`), whose fold delegates to the same `_upsert_source` fold `SourceCreated` rides — so §3's central invariant (`derived = replay(journal)`) holds and D7's append-only rule is honoured.
+`_upsert_source` bumps `updatedAt` / `version` / `contentHash` on an `ON MATCH` when the hash differs. **A source that is re-fetched and found changed is a NEW VERSION, not an edit.** That transition is **journalled as `SourceVersioned`** (`#5024`, `log.py:155`), whose fold delegates to the same `_upsert_source` fold `SourceCreated` rides — so §3's central invariant (`derived = replay(journal)`) holds and D7's append-only rule is honoured.
 
 **T6 carries S6 COMMIT's extractor-side obligation** (§9.6): record the version read on the extraction link as `sourceVersion`.
 
@@ -686,7 +684,7 @@ The owner raised the gap the D10 pass left open: *"shouldn't we have some form o
 
 **⭐ What is superseded is the FACTS, not the source.** No Source→Source supersession edge exists or is needed. Successor facts attach to the standing `:Source` (`extractedFrom` is keyed by `url`, which a version change does not move), and the earlier facts are replaced through the ordinary `CORRECTS` mechanism. **The source is the identity; the entities are the belief.**
 
-**And one rule that is a write-time obligation, not a later repair: closing the interval is part of the write.** An unclosed `validTo` reads as *"still true"* indefinitely — the field names this as **the #1 production bug** in temporal knowledge graphs, and it is exactly what T6 above produces today.
+**And one rule that is a write-time obligation, not a later repair: closing the interval is part of the write.** An unclosed `validTo` reads as *"still true"* indefinitely — the field names this as **the #1 production bug** in temporal knowledge graphs.
 
 #### ⭐ The missing piece, in one line
 
@@ -758,7 +756,7 @@ The convergence is on **two layers with different jobs**: the **source** carries
 
 **⇒ This is why the version goes on the extraction link and not only on the source** — and it is why the storage cost lands on the edge, not on a document store.
 
-**Research:** `docs/research/2026-09-24-source-versioning/research-brief.md`. **Adoption gate: ADOPT** — no recorded decision contradicted; D7 governs it; the ontology's `§4.7` already declares the Source window; D30 bounds the cost. **Tracked:** `#5038` (the model) · `#5024` (the in-place mutation that blocks it) · `#5025` · `#5026`.
+**Research:** `docs/research/2026-09-24-source-versioning/research-brief.md`. **Adoption gate: ADOPT** — no recorded decision contradicted; D7 governs it; the ontology's `§4.7` already declares the Source window; D30 bounds the cost. **Tracked:** `#5038` (open) · version-link work done: `#5024`, `#5025`, `#5026`.
 
 #### ⭐ Where this stands (2026-09-25) — a status pointer, not a new rule
 
@@ -766,7 +764,7 @@ The convergence is on **two layers with different jobs**: the **source** carries
 - **The currency CHECK is a read** (this section's model): it compares the recorded `sourceVersion` against the source's current `contentHash`, with **no stored `status`** field — so it belongs on the **existing** read surfaces and needs **no new tool and no new SDK method**.
 - **What a stale fact does — Policy B, REFINED by the owner on 2026-09-26** (`#5038` comment `5845802608`): *"We should not return an out-of-date fact when we have a newer one"* — so when a newer fact exists, the out-of-date fact is **withheld as an answer** and **disclosed as an FYI carrying its source** (*"let the user know that (newer fact but no source, and older fact from source X) … so I can disambiguate"*). This **refines rather than reverses** Policy B: Policy B's prohibition was on the fact being *"silently"* withdrawn, and the required disclosure is exactly what keeps this non-silent. **OVERRIDES:** the field's practice of returning a stale fact **alongside** its replacement with a flag (Zep/Graphiti's temporal fields; the RAG `is_latest` norm) — the withheld-as-answer + disclosed-as-FYI form is deliberate, because a visible flag is measurably not acted on (`arXiv 2609.08258`; `2605.06527`: 77.5% visible vs 3.3% adjudicated). The **write-time** notice the owner also asked for (*"ideally at write time it would have told me"*) is **`lane:c1-capture`'s** surface, not this one. **⚠️ Open alongside it:** how mechanical validity reconciles with **EP confidence** (owner, same comment — *"not sure how we reconcile the two here"*), tracked as **O9** in `docs/plans/2026-09-25-5038-source-version-anchor.md`; research first, and no second truth signal is added beside EP in the meantime.
 - **A non-re-read successor records no version** (owner, O1) and reads `unknown` until it is itself read from a source; `ONTOLOGY.md` §4.6 is unmodified and the §4.6 reopen was not taken.
-- **The re-inference step has no owner** — filed as **#5422**, because acceptance A2 of `#5038` cannot complete without it. **`#5024` is its precondition** (a re-fetched `:Source` currently mutates in place, unjournalled: if the old version is overwritten there is nothing to mark stale).
+- **The re-inference step has no owner** — filed as **#5422**, because acceptance A2 of `#5038` cannot complete without it. **`#5024` landed** (`SourceVersioned`, `log.py:155`): a re-fetched `:Source` that changed is a **new version** whose prior window closes in the record, so there is something to mark stale.
 
 *This pointer records status only. `ONTOLOGY.md` §4.6 is owner-gated and is NOT edited by this work.*
 
