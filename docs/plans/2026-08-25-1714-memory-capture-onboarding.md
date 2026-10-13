@@ -781,7 +781,7 @@ store (`tortoise/sdk.py::_TURN_WRITE_CYPHER`, #3086/#3551) — the row's earlier
 false.
 
 **The re-runnable predicate is the completeness claim.** `tools/session_retrofit_audit.py inventory`
-re-runs the RECORDED search predicate over the **whole tree** — minus the path prefixes and directory
+re-runs the RECORDED search predicate over the **tracked tree** (`git ls-files`) — minus the path prefixes and directory
 names `PREDICATE` declares out of scope (`tests/`, `docs/`, and the third-party/cache directories) —
 and diffs the sites it finds against the declaration, in both directions;
 `tests/test_session_schema_3554.py` fails on `INVENTORY DRIFT`. The scan scope is part of that

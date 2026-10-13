@@ -14,10 +14,11 @@ completeness claim had to be re-derived by hand on every rebase.
 This module is that declaration, and it is deliberately **verifiable rather
 than trusted**: ``tools/session_retrofit_audit.py inventory`` re-runs the
 recorded search predicate over the tree and diffs what it finds against
-``SESSION_WRITERS`` / ``SESSION_CLIENTS``. The scan is the whole tree minus
-what :data:`PREDICATE` declares excluded (``tests/``/``docs/`` and the
-third-party/cache directory names), so a writer under ANY other directory is a
-site. A new writer — or a removed one — is `INVENTORY DRIFT`, and
+``SESSION_WRITERS`` / ``SESSION_CLIENTS``. The scan is the tracked tree
+(``git ls-files``) minus what :data:`PREDICATE` declares excluded (``tests/``/
+``docs/`` and the third-party/cache directory names), so a writer under ANY
+other tracked directory is a site. A new writer — or a removed one — is
+`INVENTORY DRIFT`, and
 ``tests/test_session_schema_3554.py`` fails on it.
 
 **This declares the schema; it does not create one.** Every property below is
@@ -45,7 +46,6 @@ That is recorded here as an open gap, never read as coverage — tracked on
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -691,7 +691,7 @@ def iter_declared_properties() -> Iterable[str]:
 #: that changes this dict: the scanner COMPILES :data:`PREDICATE`'s
 #: ``write_verbs`` (binding ``<alias>`` to the variable in the matched literal)
 #: AND its ``client_route`` (anchored to the route's full terminal segment),
-#: and walks the WHOLE tree minus the path prefixes in ``excluded`` and the
+#: and walks the TRACKED tree minus the path prefixes in ``excluded`` and the
 #: directory names in ``skip_parts``. The scope is the predicate, not a private
 #: allow-list inside the tool: an allow-list let a new ``:Session`` writer
 #: under an unlisted directory print INVENTORY CLEAN, the fail-open direction
@@ -716,4 +716,3 @@ PREDICATE = {
         "dist", "build", "bakeoff",
     ),
 }
-_SESSION_LABEL_RE = re.compile(r"\(\s*(\w+)\s*:\s*Session\s*[{)$\s]")

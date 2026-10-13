@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -141,6 +142,56 @@ def test_scanner_scope_is_the_declared_predicate(
     # ...and ``skip_parts`` decides the directory names.
     monkeypatch.setitem(audit.PREDICATE, "skip_parts", ("src",))
     assert audit.scan_graph_writers(tmp_path) == []
+
+
+def test_worktree_scope_is_the_tracked_corpus_not_disk_copies(
+        tmp_path: Path) -> None:
+    """A linked worktree's copy of the tree is not a second site.
+
+    ``.worktrees/<lane>/`` is this repo's documented, gitignored project-local
+    worktree root (``.gitignore:3``; ``operations/skills/using-git-worktrees``).
+    Each lane is a full copy of the source tree, so a filesystem walk reports
+    every writer at a second, undeclared path
+    (``.worktrees/<lane>/tortoise/sdk.py::…``) and ``inventory`` prints
+    INVENTORY DRIFT on the repo's own canonical checkout (189 lanes there) while
+    ``test_inventory_is_clean_on_this_tree`` reds on a tracked tree that is
+    clean. The corpus is therefore the ``git ls-files`` tracked scope, not
+    "whatever is on disk". Pre-fix this test fails: the untracked lane copy is
+    scanned as a site.
+    """
+    (tmp_path / "tortoise").mkdir()
+    (tmp_path / "tortoise" / "sdk.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    lane = tmp_path / ".worktrees" / "lane-1" / "tortoise"
+    lane.mkdir(parents=True)
+    (lane / "sdk.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tortoise/sdk.py"],
+                   check=True)
+    assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
+        "tortoise/sdk.py::QUERY"}
+
+
+def test_declaration_module_skip_is_root_independent(tmp_path: Path) -> None:
+    """The declaration module is skipped for a scan rooted anywhere.
+
+    ``--root tortoise`` (or any root other than the repo root) previously
+    compared ``path.relative_to(root)`` against the fixed repo-relative
+    ``tortoise/session_schema.py``, so it never matched and the declaration's
+    own ``note=``/``marker=`` strings became sites — INVENTORY DRIFT for a scan
+    of the declaration's own directory. Pre-fix this test fails with
+    ``['session_schema.py::NOTE']``.
+    """
+    root = tmp_path / "tortoise"
+    root.mkdir()
+    (root / "session_schema.py").write_text(
+        'NOTE = "MATCH (s:Session) WHERE s.is_episodic IS NULL '
+        'SET s.is_episodic = true"\n',
+        encoding="utf-8")
+    assert audit.scan_graph_writers(root) == []
 
 
 #: The declared writers whose property names the scanner CANNOT read from the

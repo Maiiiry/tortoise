@@ -5,16 +5,20 @@ Two verbs, one instrument, because both answer the same question — *who writes
 a* ``:Session`` *node, and what does the graph hold because of them*:
 
 ``inventory``
-    Re-runs the RECORDED search predicate over the WHOLE tree — minus the
+    Re-runs the RECORDED search predicate over the TRACKED tree — minus the
     path prefixes :data:`PREDICATE` declares ``excluded`` (``tests/``,
     ``docs/``) and the third-party/cache directory names it declares in
     ``skip_parts`` — and diffs the sites it finds against the declared
-    inventory in ``tortoise/session_schema.py``. The scope is the predicate,
-    not a private allow-list in this tool, so a ``:Session`` writer under ANY
-    other directory is a site the inventory must declare. The completeness
-    claim is a predicate, never a number: run this on every rebase instead of
-    trusting the table. Exit 1 on any undeclared site (a new writer) or any
-    declared site the predicate no longer finds (a stale row).
+    inventory in ``tortoise/session_schema.py``. The corpus is ``git ls-files``
+    (tracked, reviewable scope), not "whatever is on disk": a linked worktree
+    under ``.worktrees/<lane>/`` is a full second copy of the source tree and
+    would otherwise report every writer at a second, undeclared path. The
+    scope is the predicate, not a private allow-list in this tool, so a
+    ``:Session`` writer under ANY other tracked directory is a site the
+    inventory must declare. The completeness claim is a predicate, never a
+    number: run this on every rebase instead of trusting the table. Exit 1 on
+    any undeclared site (a new writer) or any declared site the predicate no
+    longer finds (a stale row).
 
     Two halves, per #3554's Target:
 
@@ -74,6 +78,7 @@ import ast
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -286,20 +291,81 @@ def _skip_parts() -> frozenset[str]:
     return frozenset(PREDICATE["skip_parts"])
 
 
+def _tracked_files(root: Path) -> frozenset[str] | None:
+    """The TRACKED repo-relative paths under ``root``, or ``None`` if not a repo.
+
+    The scan corpus is tracked, reviewable scope — not "whatever is on disk".
+    A linked worktree under ``.worktrees/<lane>/`` is a full copy of the source
+    tree, so every writer inside it appears at a second, undeclared path
+    (``.worktrees/<lane>/tortoise/sdk.py::…``) that by construction is not in
+    :data:`SESSION_WRITERS`; on the repo's own hub checkout (189 lanes) the
+    walk reports INVENTORY DRIFT on a tree whose tracked content is clean.
+    Intersecting the corpus with ``git ls-files`` — the pattern
+    ``tests/test_entry_point_python_guard.py`` uses for a whole-tree scope —
+    keeps the fail-closed property for every tracked directory while excluding
+    parallel checkouts and any untracked scratch tree, neither of which can be
+    a merged writer (#3554 review).
+
+    ``None`` (``root`` is not a git work tree, e.g. a synthetic test root)
+    makes :func:`_iter_source` fall back to the filesystem walk.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--"],
+            capture_output=True, check=False)
+    except OSError:                                    # git not on PATH
+        return None
+    if proc.returncode != 0:                           # not a work tree
+        return None
+    return frozenset(
+        rel for rel in
+        proc.stdout.decode("utf-8", "surrogateescape").split("\0") if rel)
+
+
+def _is_declaration_module(path: Path) -> bool:
+    """True for the declaration module, independent of the scan ``root``.
+
+    The module's repo-relative path is fixed, but a scan may be rooted
+    anywhere (``--root tortoise``), so compare the path's trailing parts rather
+    than ``path.relative_to(root)``: a root-relative literal matched only when
+    the root WAS the repo root, so a scan from any other root reported the
+    declaration's own ``note=``/``marker=`` strings as sites (#3554 review).
+    """
+    parts = Path(DECLARATION_MODULE).parts
+    return path.parts[-len(parts):] == parts
+
+
 def _iter_source(root: Path, extensions: tuple[str, ...]):
-    """Walk the WHOLE tree minus what ``PREDICATE`` declares out of scope.
+    """Walk the TRACKED tree minus what ``PREDICATE`` declares out of scope.
 
     The scope is the predicate, not a private allow-list: an allow-list let a
     ``:Session`` writer under any unlisted tracked directory stay invisible, so
     ``inventory`` printed INVENTORY CLEAN with an undeclared writer present —
     the fail-open direction of a guard whose whole purpose is to be trusted
-    (#3554 review). Only the declared ``excluded`` path prefixes and
-    ``skip_parts`` directory names are skipped.
+    (#3554 review). The corpus is intersected with ``git ls-files`` (see
+    :func:`_tracked_files`) so parallel checkouts and untracked scratch trees —
+    which can never be a merged writer — are not sites; only the declared
+    ``excluded`` path prefixes and ``skip_parts`` directory names are then
+    skipped.
 
     ``os.walk`` with PRUNED ``dirnames`` rather than ``Path.rglob``: rglob
     descends into ``.venv``/``.git``/``node_modules`` and filters afterwards,
-    which costs ~25s on this tree; pruning never opens them.
+    which costs ~25s on this tree; pruning never opens them. A root that is not
+    a git work tree (a synthetic test root) falls back to that walk with the
+    same declared pruning.
     """
+    tracked = _tracked_files(root)
+    if tracked is not None:
+        for rel in sorted(tracked):
+            if Path(rel).suffix not in extensions or _excluded(rel):
+                continue
+            path = root / rel
+            if _is_declaration_module(path):
+                continue
+            if not path.is_file() or path.is_symlink():
+                continue
+            yield path
+        return
     skip_parts = _skip_parts()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in skip_parts)
@@ -314,7 +380,7 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
             path = top / name
             if path.is_symlink():
                 continue
-            if path.relative_to(root).as_posix() == DECLARATION_MODULE:
+            if _is_declaration_module(path):
                 continue
             yield path
 

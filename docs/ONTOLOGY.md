@@ -1287,9 +1287,9 @@ folds that re-create the node on replay.
 / `SESSION_WRITERS` / `SESSION_PROPERTY_OWNERS`). It is authoritative for the
 property set and the owner of each property; this section is its doc mirror,
 and `tools/session_retrofit_audit.py inventory` re-runs the writer predicate
-over the **whole tree** — minus the path prefixes and third-party/cache
-directories `PREDICATE` declares out of scope — and fails on drift in either
-direction (a new writer, or a declared one the predicate no longer finds). The
+over the **tracked tree** (`git ls-files`) — minus the path prefixes and
+third-party/cache directories `PREDICATE` declares out of scope — and fails on
+drift in either direction (a new writer, or a declared one the predicate no longer finds). The
 scan scope is part of that declared predicate, not a private allow-list inside
 the tool. The per-property owners below **mirror that
 declaration** and are pinned against it by `tests/test_session_schema_3554.py`
