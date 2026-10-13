@@ -819,6 +819,203 @@ async def _check_mcp_op_budget(name: str, org_id: str) -> None:
         ) from None
 
 
+# ── #8482: a wrap-envelope tool must not ship a payload its schema forbids ──
+#
+# A tool annotated `-> list[dict]` gets FastMCP's wrap envelope: the output
+# schema becomes `{result: <array schema>, required: [result],
+# x-fastmcp-wrap-result: true}` and `Tool._convert_result` writes
+# `structured_content = {"result": <value>}` (fastmcp/tools/base.py:363-369).
+# The envelope is a promise about the SUCCESS shape, and every conforming
+# client enforces it: the TS SDK validates `structuredContent` against the
+# advertised `outputSchema` whenever that field is PRESENT and refuses the
+# whole call with -32602 on a mismatch; an ABSENT payload is accepted only
+# when `isError` is true (client `callTool`).
+#
+# `_safe` answers every failure with a dict (`_SafeError`, defined below) —
+# never a list. So a FAILED wrap-envelope tool ships
+# `{"result": {"error": ...}}`, which is not an array; the client then
+# discards the SDK's real message and reports a schema complaint about a
+# payload nobody can read. That is the whole of #8482: a failure delivered in
+# the success channel. It is NOT "the tool returns a list" — the four sibling
+# tools the issue could not separate (`tortoise_check_structure`,
+# `tortoise_packs_list`, `tortoise_list_batches`, `tortoise_list_namespaces`)
+# carry the SAME envelope and work, because their SDK calls succeed. The
+# discriminator is the RAISE.
+#
+# The repair is at the WIRE seam, and it does not relax the schema: the
+# failure moves to the channel MCP has for it (`is_error`, no
+# `structured_content`), where the client accepts it and the message survives.
+# The declared schema is the product's success contract (`tortoise_search`
+# does return an array) — widening it to admit the error dict would convert a
+# loud failure into a silent false negative.
+
+#: JSON-schema ``type`` → the Python type a value must satisfy. Only the types
+#: a wrap envelope can declare for its ``result`` key. A declared ``anyOf`` (or
+#: no ``type`` at all) is deliberately ABSENT: a dict ``result`` is admissible
+#: there, so there is nothing to repair (`tortoise_query` and
+#: `tortoise_delete_entity` are the two registry tools in that form).
+_WRAP_ENVELOPE_TYPE_CHECKS: dict[str, type | tuple[type, ...]] = {
+    "array": list,
+    "object": dict,
+    "string": str,
+    "boolean": bool,
+    "number": (int, float),
+    "integer": int,
+}
+
+
+async def _wrap_envelope_schema(name: str) -> dict | None:
+    """The tool's OWN advertised wrap-envelope output schema, or ``None``.
+
+    ``None`` means "not a wrap-envelope tool, or the schema could not be
+    read" — and the caller must then repair NOTHING. That is deliberately
+    fail-OPEN: the repair is only ever applied to a payload PROVEN to violate
+    the schema the tool itself advertises, so a schema this seam cannot read
+    leaves a working tool working. (Fail-closed would be wrong here: an
+    object-annotated tool's `_safe` error dict is perfectly valid, and a
+    repair applied without the schema to prove the violation would break it.)
+    """
+    try:
+        tool = await mcp.get_tool(name)
+    except Exception:  # an unreadable schema must never break a tool call
+        return None
+    schema = getattr(tool, "output_schema", None)
+    if isinstance(schema, dict) and schema.get("x-fastmcp-wrap-result"):
+        return schema
+    return None
+
+
+async def _wrap_envelope_result_type(name: str) -> str | None:
+    """The JSON-schema ``type`` the tool requires for its envelope's
+    ``result`` key, or ``None`` when it has no envelope or declares a union.
+
+    This is the seam's READ of the contract it enforces. It is a named
+    function (rather than an inline schema poke) so a guard can assert it still
+    agrees with the advertised schemas: if it silently stops resolving, the
+    repair stops firing and the -32602 returns unnoticed (#8482).
+    """
+    schema = await _wrap_envelope_schema(name)
+    if schema is None:
+        return None
+    prop = (schema.get("properties") or {}).get("result")
+    declared = prop.get("type") if isinstance(prop, dict) else None
+    return declared if isinstance(declared, str) else None
+
+
+def _violates_wrap_envelope(schema: dict, structured: Any) -> bool:
+    """Whether ``structured`` can satisfy ``schema``'s own envelope contract.
+
+    Two producers reach this as a violation, and they are the two #8482
+    observed:
+
+    1. a ``result`` present but of the wrong type — `_safe`'s error dict inside
+       an array envelope, `{"result": {"error": ...}}`;
+    2. ``result`` MISSING entirely — the transport wait-bound refusal
+       (:func:`_await_under_mcp_wait_bound`), which answers
+       ``{"error": {...}}``. ``result`` is ``required``, so this is just as
+       unreadable to a conforming client — and it hits the ``anyOf`` tools too,
+       which is why the check is driven by ``required`` and not by the
+       declared type alone.
+
+    ``structured is None`` is NOT a violation: FastMCP omits the payload when
+    serialization fails (fastmcp/tools/base.py:352-354). Repairing that would
+    mark a possibly-successful call as an error on a shape this defect has no
+    producer for — a different root, deliberately left alone.
+    """
+    if structured is None:
+        return False
+    if not isinstance(structured, dict):
+        return True  # the envelope is an object; a list/scalar cannot be one
+    if "result" not in structured:
+        return True  # `result` is required — see (2) above
+    prop = (schema.get("properties") or {}).get("result")
+    declared = prop.get("type") if isinstance(prop, dict) else None
+    check = _WRAP_ENVELOPE_TYPE_CHECKS.get(declared) if isinstance(declared, str) else None
+    if check is None:
+        return False  # anyOf / undeclared: a dict `result` is admissible
+    return not isinstance(structured["result"], check)
+
+
+def _maybe_wrap_envelope_violation(result) -> bool:
+    """CHEAP pre-filter: could this result violate a wrap envelope at all?
+
+    Resolving the schema is NOT free on the dispatch path — it goes through
+    ``mcp.get_tool``, measured here at p50 ≈ 0.4 ms / p95 ≈ 1.2 ms per call
+    because FastMCP rebuilds the tool. Probing it on every tool call would
+    spend that on the whole surface to protect a failure path, so the shapes a
+    violation can have are recognised from data ALREADY on the result, and the
+    schema is resolved only when one is present:
+
+    * the transport wait-bound refusal — its payload carries no ``result``;
+    * a FastMCP-marked wrap envelope whose ``result`` is a DICT. An object can
+      never satisfy an array/string/number/boolean envelope, and a dict is the
+      only shape :func:`_safe` ever returns for a failure. A UNION envelope
+      legitimately admits it — and deciding THAT is precisely what the schema
+      read is for.
+
+    The healthy path costs two dict lookups: a successful array-envelope tool
+    carries a list under ``result``, and an object-annotated tool carries no
+    ``fastmcp`` wrap marker at all.
+    """
+    payload = getattr(result, "structured_content", None)
+    if not isinstance(payload, dict):
+        return False
+    meta = getattr(result, "meta", None) or {}
+    if meta.get(_WAIT_BOUND_META_KEY):
+        return True
+    wrapped = (meta.get("fastmcp") or {}).get("wrap_result")
+    return bool(wrapped) and isinstance(payload.get("result"), dict)
+
+
+def _safe_failure_message(payload: Any) -> str | None:
+    """The `_safe` failure TEXT a payload carries, read THROUGH the envelope.
+
+    `_safe` answers every failure with a string ``error``. `_wrapped_call_tool`
+    uses this to classify the stdio auth gate (#236) — and that probe read the
+    TOP LEVEL only, so for a wrap-envelope tool the gate's refusal
+    (``{"result": {"error": "Authentication required..."}}``) was missed and
+    the call was recorded as ``ok``. Same class as #8482: a failure that reads
+    as a success. Both shapes are read here so the classification cannot
+    depend on whether FastMCP wrapped the payload.
+
+    Returns the message only when it IS a string — the wait-bound refusal's
+    ``{"error": {"code": ..., "message": ...}}`` is not one, so it keeps its
+    own ``timeout``/``refused`` classification.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("error"), str):
+        return payload["error"]
+    inner = payload.get("result")
+    if isinstance(inner, dict) and isinstance(inner.get("error"), str):
+        return inner["error"]
+    return None
+
+
+def _schema_error_result(result) -> ToolResult:
+    """Rewrite a schema-violating envelope as an MCP ERROR result.
+
+    ``content`` is kept verbatim — it already carries the SDK's real message —
+    the invalid ``structured_content`` is dropped, and ``is_error`` is set.
+    That pair is exactly what a conforming client accepts for a tool it holds
+    an output schema for, so the caller can READ the failure instead of the
+    -32602 that used to replace it.
+
+    ``meta`` is preserved (the wait-bound marker decides how the call is
+    classified downstream) except FastMCP's own ``wrap_result`` claim, which
+    described a payload that is no longer there — a client that trusted it
+    would unwrap a ``None``.
+    """
+    meta = dict(getattr(result, "meta", None) or {})
+    meta.pop("fastmcp", None)
+    return ToolResult(
+        content=getattr(result, "content", None),
+        structured_content=None,
+        meta=meta or None,
+        is_error=True,
+    )
+
+
 async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None, *,
                              version=None, run_middleware: bool = True,
                              task_meta=None):
@@ -879,10 +1076,20 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
         # (TORTOISE_API_KEY set → every call is rejected). Classify it so
         # unauthenticated stdio calls don't masquerade as ok.
         payload = getattr(result, "structured_content", result)
-        if (isinstance(payload, dict)
-                and isinstance(payload.get("error"), str)
-                and payload["error"].startswith("Authentication required")):
+        # #8482: read the `_safe` text THROUGH the wrap envelope — the stdio
+        # auth gate is one of the failures FastMCP wraps, so a top-level probe
+        # alone recorded it as `ok` for every array-envelope tool.
+        failure = _safe_failure_message(payload)
+        if failure is not None and failure.startswith("Authentication required"):
             status, error_kind = "auth_error", "stdio_auth_gate"
+        # #8482: ...and repair the payload the tool's OWN schema forbids. Last,
+        # so the classification above still sees the shape the dispatch
+        # produced rather than the repaired one. The schema read is behind a
+        # cheap pre-filter — see `_maybe_wrap_envelope_violation`.
+        if _maybe_wrap_envelope_violation(result):
+            envelope = await _wrap_envelope_schema(name)
+            if envelope is not None and _violates_wrap_envelope(envelope, payload):
+                result = _schema_error_result(result)
         return result
     except asyncio.CancelledError:
         # A cancelled dispatch is neither an "ok" nor an exec error — classifying
