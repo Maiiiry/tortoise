@@ -760,23 +760,57 @@ class _EdgeHandlers:
         separately.
 
         Idempotent: MERGE creates any missing :Tag nodes + TAGGED edges, and
-        edges to tags no longer in the list are deleted. Only LIST values are
-        synced — the live rule and the replay rule both. A falsy value is
-        normalised to `[]` by the CALLER on the live path
-        (`props["tags"] or []`) and by the replay fold (`_revise_point` uses
-        the same expression), so `None`/`""` clear the edges; a truthy
-        non-list value (a scalar `tags`) is stored as a plain property and
-        gets no edges.
+        edges to tags no longer in the list are deleted.
 
-        ⚠️ BOUND, stated rather than implied: for a TRUTHY non-list value the
-        live path leaves a pre-existing edge in place (this early return)
-        where a rebuild starts from a wiped graph and so has none. That value
-        is junk input, the #5011 check compares the `tags` PROPERTY rather
-        than the edge, and the property halves agree — a narrow live/replay
-        parity gap of the class `consistency._ONE_SIDED_REASONS` records, not
-        a divergence any instrument reports.
+        The normalisation is TOTAL for the shapes the signature allows — a
+        `list`, or a `tuple` (the engine stores both as an array, cf.
+        `_is_persistable_prop_value`) — and a FALSY value, which both callers
+        normalise to `[]` with the same `or []` expression (`props["tags"] or
+        []` live, `ev["tags"] or []` in `_revise_point`), so `None`/`""` CLEAR
+        the edges. The live create/update gates accept a tuple as well as a
+        list (#8317 review R2), so a tuple round-tripping through the journal
+        as a list does not make the replay invent edges live never wrote.
+
+        ⚠️ BOUND, stated rather than implied — a TRUTHY NON-ARRAY (`tags` set to
+        a number, a string, a dict). The PROPERTY halves AGREE (`_stated_tags`
+        writes a persistable scalar verbatim; `_revise_point` clears a value the
+        store cannot hold, which is what `#7369`'s null-degradation leaves the
+        live write too), but the EDGE halves DIFFER, in this direction:
+
+          * LIVE KEEPS the node's EXISTING edges — this guard returns early.
+            That is deliberate and PINNED:
+            `tests/test_sdk.py::test_update_non_list_tags_no_crash` ("Non-list
+            tag values match create_point: property set, no edge sync") asserts
+            the old edge is still there.
+          * A REBUILD REMOVES them: the graph is wiped, and the derived pass
+            (`_upsert_point_edges`) mints only from a LIST, so a membership the
+            live graph still answers for is gone afterwards.
+
+        Which half is right is not in doubt. The `tags` PROPERTY is the SOURCE
+        of this derived half (that is what "snapshot-derivable" means, #2489's
+        shape), so a non-array derives NO edges and the rebuilt graph is the
+        self-consistent one — LIVE is the half carrying a stale derived
+        artifact. That is the same stale-edge class #485 fixed for a list
+        ("update_point previously set the property but left edges stale, so
+        query_points_by_tag missed updated points"), left in place for the
+        non-list case.
+
+        The tightest fix is HERE and is one line — normalise a non-array to `[]`
+        instead of returning early, making the edge half a pure function of the
+        NORMALISED property value on every path (live create, live update,
+        replay revise, the derived pass) — so `create_point` is unaffected (a
+        fresh point has no edges to clear). It is deliberately NOT taken here:
+        it alters a LIVE write for an input the public signature excludes
+        (`tags: list[str] | None`) and reverses a pinned test, which is not a
+        change to bundle into a durability fix. Filed with the measurement as
+        **#8333**, which owns it and the pin.
+
+        The drop is REPORTED, not silent: for a value the store cannot hold,
+        `check_consistency` names `tags` in `uncarried_journal_fields` (see
+        `consistency._uncarried`), so the check stays green on a byte-faithful
+        replay without hiding that the property half was not carried.
         """
-        if not isinstance(tags, list):
+        if not isinstance(tags, (list, tuple)):
             return
         for tag in tags:
             self.g.query(

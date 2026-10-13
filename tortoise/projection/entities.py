@@ -189,19 +189,38 @@ def _stated_tags(payload) -> tuple[bool, object]:
     """``(writes_property, value)`` for a payload's ``tags`` key (#2897).
 
     The ONE rule for *"the payload states a ``tags`` value this writer must
-    apply"*, shared by the Point create fold (``_upsert_point_props``) and the
+    apply"* to the Point create/upsert fold (``_upsert_point_props``) and the
     pass-1b boundary report that reads its outcome — never re-spelled at either
-    site (#5048). The live writer's rule is ``SET n += $props``: a persistable
-    value the payload states becomes the property VERBATIM (a non-list scalar
-    included — ``create_point`` stores one, and only the EDGE half is
-    list-only), while ``None``/absent states NO property (Cypher's map-merge
-    writes nothing for a null, so the live caller leaves the node's own value
-    alone rather than stamping a null over it).
+    site (#5048).
 
-    A LIST-only reading was a live/replay divergence, not a safety property:
-    ``create_point(tags="scalar")`` stores ``"scalar"`` live, and the replayed
-    node kept nothing — which ``check_consistency`` then reported as a ``tags``
-    divergence (#8317 review P1, reproduced).
+    A persistable value the payload states is written VERBATIM (a non-list
+    scalar included — live stores one, and only the EDGE half is list-only).
+    ``None``/absent states NO property.
+
+    ⚠️ Three corrections to an earlier version of this paragraph, all MEASURED
+    on the embedded engine — the helper's ANSWERS were right, its reasoning was
+    not, and a wrong reason is what the next lane copies:
+
+      * a create here builds the node from a ``CREATE (n:Point {…})`` property
+        MAP; it is ``update_point`` whose write is ``SET n += $props`` (the
+        post-CREATE passthrough loop was removed in #2952). The rule is the same
+        either way — the payload's value IS the property — but do not attribute
+        the create path to ``SET``.
+      * ``SET n += {tags: null}`` does NOT "leave the node's own value alone":
+        it REMOVES the property. That is why ``None`` is a create-side no-op
+        (a fresh node has nothing to remove) while the EDIT path must spell the
+        clear explicitly — ``_revise_point`` emits ``n.tags = NULL``.
+      * a value the driver cannot send (a dict) is degraded to null by the
+        ``#7369`` guard BEFORE dispatch, so live ALSO ends with no property
+        (measured: ``update_point(tags={"a": 1})`` → ``'tags' IN keys(n)`` is
+        False). Answering ``(False, None)`` here therefore matches live on the
+        create path; the edit path's clear is ``_revise_point``'s, which spells
+        it explicitly for exactly this case.
+
+    A LIST-only reading was a live/replay divergence, not a safety property: a
+    scalar ``tags`` is stored live and the replayed node kept nothing — which
+    ``check_consistency`` then reported as a ``tags`` divergence (#8317 review
+    P1, reproduced).
 
     Total, deliberately: this reads a possibly hand-edited journal line, and a
     raise here would abort a replay whose wipe has already run — the recovery

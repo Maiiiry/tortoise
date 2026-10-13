@@ -13415,13 +13415,20 @@ class FalkorProjection(
         # `None` is the documented clear (`SET n += {tags: null}` removes the
         # property live, measured) and must remove it here — a list-only clause
         # skipped the clear, so pass 1a's creation list survived on the node and
-        # pass 2 resurrected the tag (#8317 review P1, reproduced). A
-        # persistable non-None value is written VERBATIM (a scalar included, as
-        # the live writer stores it).
+        # pass 2 resurrected the tag (#8317 review P1, reproduced).
+        # A NON-PERSISTABLE value clears too: the driver degrades a value it
+        # cannot send to null before dispatch (#7369), so live's map-merge
+        # REMOVES the property (measured: `update_point(tags={"a": 1})` leaves
+        # `'tags' IN keys(n)` False). Without this leg the replay kept pass 1a's
+        # creation list where live had removed it — and the checker reported the
+        # mismatch as an unclearable `divergence="content"` (#8317 review
+        # round 2). The value is REPORTED as uncarried by `consistency._uncarried`
+        # rather than silently dropped.
         if not skip_tags and "tags" in ev:
-            if ev["tags"] is None:
+            if ev["tags"] is None \
+                    or not _is_persistable_prop_value(ev["tags"]):
                 set_clauses.append("n.tags = NULL")
-            elif _is_persistable_prop_value(ev["tags"]):
+            else:
                 set_clauses.append("n.tags = $tags")
                 params["tags"] = ev["tags"]
 
@@ -13538,10 +13545,15 @@ class FalkorProjection(
         # multi-statement MERGE/DELETE sweep, not a single SET.
         if not skip_tags and "tags" in ev:
             # The argument is the LIVE expression (`sdk.update_point` →
-            # `self._sync_tags(proj, id, props["tags"] or [])`), so parity holds
-            # by construction: a falsy value (`None`/`""`) normalises to `[]`
-            # and clears the edges, a list syncs, and `_sync_tags`' own
-            # list-only guard makes a truthy non-list a no-op on both paths.
+            # `self._sync_tags(proj, id, props["tags"] or [])`): a falsy value
+            # (`None`/`""`) normalises to `[]` and clears the edges; a list or
+            # tuple syncs; and a truthy non-array is a no-op at THIS call on
+            # both paths.
+            # ⚠️ That last case is not overall parity: the live node KEEPS its
+            # existing edges while the replay's derived pass
+            # (`_upsert_point_edges`) mints none, so a rebuild drops a stale
+            # membership the live graph still answers for. The bound is stated
+            # on `_sync_tags`, which owns it — see #8333.
             self._sync_tags(pid, ev["tags"] or [])
         return wrote_embedding, wrote_content_hash
 

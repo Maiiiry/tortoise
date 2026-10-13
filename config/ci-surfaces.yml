@@ -1547,12 +1547,17 @@ surfaces:
   - test_rebuild_recreate_content_parity.py  # #4042: a pre-recreation PointRevised must not leak content/embedding/content_hash onto a re-created same-id Point (live apply()/fold() parity; same-journal-file content boundary)
   - test_5048_mitigated_by_replay.py  # #5048: a mitigation's mitigated_by edge, NON-operator identity and revised strength must survive rebuild_all, and check_consistency must not call the faithful rebuild diverged. `tortoise/consistency.py` and `tortoise/projection/entities.py` select `core`; `projection/edges.py` and `projection/__init__.py` are SHARED_MODULEs, and `tortoise/api.py` selects `api`+`core`, so `core` alone reaches every seam this file guards. Lane: DOCKER (the #1647 default) — URI-less it FAILS at the session fixture unless `TORTOISE_TEST_CARVE_OUT=1`.
   - test_rebuild_graph_only_derived_parity.py  # #4305: rebuild_all must not lose live-valid content_hash/embedding for a graph-only Point on a falsy re-emit, nor let the synthetic #548 tail clobber it (live apply() parity, 21 shapes)
-  # #3817: the objective-6 TAGS guard — does a Point's tags survive rebuild_all?
+  # #3817: the objective-6 TAGS guard — do a Point's tags survive rebuild_all?
   # It measures the journal carriage (AC2), the tag-filtered retrieval through
   # `SDK.query_points_by_tag` before and after the rebuild (AC1/AC5), the
-  # no-resurrection case (AC3) and the negative control (AC4), and it pins the
-  # RECORDED DECISION that replay refuses `tags` + reports the drop (#2897;
-  # `tortoise/projection/entities.py:_POINT_LIST_PROPS`). `tortoise/projection/`
+  # no-resurrection cases (AC3, incl. the `None`/`""` clear and the dict edit),
+  # the non-list forms (a scalar and the tuple array) and the negative control
+  # (AC4). The verdict it pins is the CURRENT one after #2897 landed: the
+  # `n.tags` property AND its snapshot-derivable `:Tag`/`TAGGED` half are
+  # CARRIED by the replay (the property by `_upsert_point_props`/`_revise_point`,
+  # the edges by the pass-2 `_sync_tags`) — the reverse of the old "replay
+  # refuses `tags` + reports the drop" pin, which `_POINT_LIST_PROPS` (now
+  # EMPTY) no longer describes. `tortoise/projection/`
   # matches no named surface and falls through to `core` (#2795/
   # `test_unjournaled_mutation_class.py` is the sibling registered here), and
   # `tortoise/sdk.py` is a SHARED_MODULE — so `core` reaches every seam this

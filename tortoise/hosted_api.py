@@ -10248,13 +10248,24 @@ def _seed_demo_graph(org_id: str) -> dict:
     Every Point written here is excluded from org.point_count, so opt-in
     sample content is never counted as the user's own filings.
 
-    #2897: each layer writes its Point with the `tags` PROPERTY beside the
-    `:Tag`/`TAGGED` MERGE loop. The edge half is snapshot-derivable from that
-    property (`_upsert_point_edges` pass 2 reads the node's own value), so a
-    seeder that wrote only the edge left its tags with nothing for a rebuild to
-    re-derive — this is the one tag producer outside the SDK↔projection
-    `_sync_tags` pair, and without the property the "ONE routine for BOTH
-    writers" contract is only as good as its callers.
+    #2897: each of the THREE TAG-BEARING layers (semantic, epistemic,
+    procedural — the episodic layer carries none) writes its Point with the
+    `tags` PROPERTY beside the `:Tag`/`TAGGED` MERGE loop. The edge half is
+    snapshot-derivable from that property (`_upsert_point_edges` pass 2 reads
+    the node's own final value), so a seeder that wrote only the edge left its
+    tags with nothing for a rebuild to re-derive. This is the one tag producer
+    OUTSIDE the SDK↔projection `_sync_tags` pair, and its edges are still
+    hand-rolled MERGEs rather than routed through that routine — the property
+    is what makes them durable, and this duplication is why the "ONE routine
+    for BOTH writers" claim is scoped to the SDK and the projection rather than
+    to every producer.
+
+    ⚠️ NOT RETROACTIVE: the sentinel short-circuit above returns before any
+    write, so a graph seeded BEFORE this landed keeps its edge-only tags and
+    still loses them to the #548 snapshot on the next `rebuild_all`. Blast
+    radius is opt-in sample content (excluded from `org.point_count`), not user
+    filings; deleting the sentinel and re-seeding, or a one-shot backfill of
+    `tags` from the existing `TAGGED` edges, closes it per graph.
     """
     sdk = _make_sdk(namespace=org_id)
     proj = sdk._get_proj()

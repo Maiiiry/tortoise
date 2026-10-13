@@ -529,6 +529,25 @@ def _uncarried(journal_by_id: dict) -> dict[str, dict[str, str]]:
             continue
         found: dict[str, str] = {}
         for k, v in props.items():
+            if k == "tags":
+                # #2897: the one `_POINT_HANDLED` key whose carriage depends on
+                # the VALUE's type rather than the key's presence. Its writer's
+                # clause is presence+persistable gated (`_stated_tags`), so a
+                # value this store cannot persist is genuinely uncarried and
+                # must be NAMED — the `_POINT_HANDLED` short-circuit below would
+                # swallow it, and an unnamed drop surfaced as an UNCLEARABLE
+                # `divergence="content"` whose `action` ("replay the journal")
+                # produces exactly the graph that is already there (#8317 review
+                # round 2, reproduced with a hand-written `PointAdded` carrying
+                # a map). Excluding it is safe on the graph side too: the store
+                # cannot hold such a value at all, so no legitimate divergence
+                # is hidden. (Deliberately a NARROW `tags` case, not a reorder of
+                # the generic list/persistable tests above the `_POINT_HANDLED`
+                # check: `provenance` is also handled-and-dict-valued, and a
+                # generic reorder would newly flag it.)
+                if v is not None and not _is_persistable_prop_value(v):
+                    found[k] = _UNCARRIED_NON_PERSISTABLE
+                continue
             if k in _POINT_HANDLED or k in _NOT_COMPARED:
                 continue
             if v is None:
@@ -791,6 +810,37 @@ def projection_state_path(log_path) -> str:
     """The sidecar path for a journal. `.json`, never `.jsonl`, so it can never
     be mistaken for a second journal by `recover_from_log`'s single-log check."""
     return str(log_path) + _PROJECTION_STATE_SUFFIX
+
+
+def baseline_warning(result: dict, log_path) -> str | None:
+    """The operator-visible warning for a STRANDED baseline, or ``None``.
+
+    #2897 review round 2: ``check_consistency`` can return ``ok=True`` while the
+    BASELINE half of the invariant is inert. An untrusted sidecar — a
+    predecessor format after a digest-shape change, a torn file, a planted
+    FIFO/symlink — makes :func:`read_projection_state` error, so ``stored`` is
+    ``None`` and every run ADOPTS. ``state_recorded`` is gated on
+    ``state_error is None`` (deliberately: recording over an untrusted state
+    would destroy the only evidence of what the graph looked like before), so
+    the state is never replaced either. The green verdict says nothing about any
+    of that, which is how an inert guard reads as a healthy graph — so the
+    surface names it, with the recovery, instead of leaving it to a field the
+    CLI never printed.
+
+    A function rather than inline prose in ``__main__`` so the surface is
+    PINNED by a test without needing a live URI (the CLI's ``--db`` resolves
+    only ``docker``/``redis``/``rediss``).
+    """
+    error = result.get("state_error")
+    if not error:
+        return None
+    return (
+        f"projection baseline UNTRUSTED ({error}) — the baseline check is INERT "
+        "until it is re-baselined, so a graph write that bypasses the journal "
+        "cannot be detected on this graph. Confirm no unjournalled writer "
+        f"exists, then remove {projection_state_path(log_path)} and re-run to "
+        "record a fresh baseline."
+    )
 
 
 def read_projection_state(log_path) -> tuple[dict | None, str | None]:

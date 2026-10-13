@@ -10882,6 +10882,17 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if result["ok"]:
             print(f"\u2713 Consistent: {result['log_points']} points in both log and graph")
+            # #2897 review round 2: a green verdict says nothing about the
+            # BASELINE half of the invariant. An untrusted sidecar (a
+            # predecessor format after a digest-shape change, a torn file, a
+            # planted FIFO/symlink) makes `read_projection_state` error, so
+            # every run ADOPTS and `state_recorded` stays False — the baseline
+            # check is silently INERT. Printing only the green tick hid that;
+            # `baseline_warning` names it and the recovery.
+            from tortoise.consistency import baseline_warning
+            _warn = baseline_warning(result, args.log)
+            if _warn:
+                print(f"  \u26a0 {_warn}", file=_sys.stderr)
             return 0
         else:
             # #3585 review: a `non-folded` divergence is counts-equal and

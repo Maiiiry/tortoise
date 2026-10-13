@@ -35,6 +35,7 @@ from tortoise.consistency import (
     _compare_views,
     _fold_journal,
     _values_equal,
+    baseline_warning,
     check_consistency,
     read_projection_state,
     recover_from_log,
@@ -1765,3 +1766,75 @@ def test_a_predecessor_format_baseline_is_untrusted_not_a_mutation(proj, tmp_pat
     assert r["state_recorded"] is False, r
     assert r["ok"] is True, r
     assert r["adopted"] is True, r
+
+
+def test_a_non_persistable_tag_value_is_reported_not_a_false_divergence(
+        proj, tmp_path):
+    """#2897 review round 2: a `tags` value the STORE cannot hold is uncarried,
+    and that must be a REPORT — never an unclearable `content` divergence.
+
+    The writer's clause is presence+persistable gated, and the driver degrades a
+    value it cannot send to null before dispatch (#7369), so for a map-valued
+    `tags` the node ends with NO property (measured: `'tags' IN keys(n)` is
+    False). The journal still carries the map, so a checker that compared it
+    reds a byte-faithful graph — with an `action` (*reconcile by replaying the
+    journal*) that can never clear it, because replay produces exactly that
+    graph. The fix routes it through the declared `uncarried` channel, so the
+    drop is NAMED and the verdict stays green.
+    (1) Fails if `_uncarried` stops flagging a non-persistable `tags` (the run
+        goes red on a healthy graph); the opposite direction — flagging a
+        persistable one — is pinned by `test_tags_are_compared_not_exempted`.
+    (2) Reachable: the journal row carries `tags` as a map. No writer can
+        produce it, which is precisely why it must neither crash nor red the
+        check.
+    """
+    log_path = str(tmp_path / "maptags.jsonl")
+    _seed(proj, log_path, [_pt("p1", "map tags", tags={"a": 1})])
+    r = check_consistency(log_path, proj)
+    assert r["ok"] is True, r
+    assert "tags" in r["uncarried_journal_fields"], (
+        "a `tags` value the store cannot hold must be NAMED as uncarried, "
+        f"not silently dropped or compared: {r['uncarried_journal_fields']}")
+    assert "tags" not in {
+        f for d in r["divergent_points"] for f in d["fields"]
+    }, r
+
+
+def test_a_stranded_baseline_is_surfaced_on_the_green_path(proj, tmp_path):
+    """#2897 review round 2: a green verdict must not hide an INERT baseline.
+
+    A predecessor-format sidecar makes every run adopt, so the baseline half of
+    the invariant — the only thing that catches a graph moving while the journal
+    did not — is silently disabled, and `state_recorded` stays False so the
+    state is never replaced. `check_consistency` still returns `ok=True`, and
+    the CLI printed only its green tick, so an inert guard read as a healthy
+    graph.
+    The surface asserted here is `consistency.baseline_warning` — what
+    `tortoise check-consistency` prints on its green path — rather than the CLI
+    process itself: the CLI's `--db` resolves only `docker`/`redis`/`rediss`
+    URIs, so pinning the wording at the seam keeps the assertion on the embedded
+    lane while still failing if the surface goes silent.
+    (1) Fails if the surface stops naming a stranded baseline (an operator sees
+        a green tick over an inert guard) — or if it warns when there is nothing
+        wrong (the first assertion), which would make the signal noise.
+    (2) Reachable: the journal and graph are byte-faithful; only the recorded
+        baseline is from the predecessor format.
+    """
+    log_path = str(tmp_path / "stranded.jsonl")
+    _seed(proj, log_path, [_pt("p1", "tagged", tags=["alpha"])])
+    check_consistency(log_path, proj)  # adopt at the CURRENT format
+
+    assert baseline_warning({"state_error": None}, log_path) is None, (
+        "a healthy baseline must not warn, or the signal is noise")
+
+    with open(log_path + ".projection-state.json", "w", encoding="utf-8") as fh:
+        fh.write(_state_json(seq="1", fmt=_PROJECTION_STATE_FORMAT - 1))
+    r = check_consistency(log_path, proj)
+    assert r["ok"] is True, r
+
+    warning = baseline_warning(r, log_path)
+    assert warning and "UNTRUSTED" in warning, (
+        f"a stranded baseline must be surfaced with its reason: {warning!r}")
+    assert "projection-state.json" in warning, (
+        f"the warning must name the recovery (the sidecar to remove): "
+        f"{warning!r}")

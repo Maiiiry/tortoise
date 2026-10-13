@@ -6144,7 +6144,7 @@ class TortoiseSDK:
         # cannot duplicate anything — the abort means the statement did not
         # land, exactly the contract `retryable_aborted_write` is built on.
         tags = props.get("tags") or []
-        if isinstance(tags, list):
+        if isinstance(tags, (list, tuple)):
             self._graph_write_with_retry(
                 lambda: self._sync_tags(proj, pid, tags),
                 what="create_point TAGGED edges",
