@@ -414,6 +414,19 @@ class TestReviewRegressions:
         stores a CALLER-supplied embedding verbatim by a recorded decision —
         PR #3018), so once the dense read normalises the shape the node ranks
         on that vector like any other.
+
+        NOTE (measured): the ``s1`` assertion is NOT discriminating — ``s1``
+        carries an FTS score, so it is returned whether or not the vector leg
+        lives (pre-fix it is still present: measured ``['s1']``). The #8316
+        discriminator is the ``s_legacy`` inclusion below (``['s1']`` pre-fix
+        vs ``['s1', 's_legacy']`` once the read normalises the shape). The #244
+        degradation contract — "a dead vector leg must not cost the FTS match"
+        — is therefore NOT what this test pins; it is pinned where the LEG
+        reasons are observable:
+        ``test_longmem_runner.py::test_wrong_dim_node_fts_still_hits``
+        (``vector.reason == 'query_failed'`` AND ``fts.reason == 'ok'`` AND the
+        row returned) and ``test_search_engine.py::
+        test_vector_trace_wrong_dim_node_is_query_failed``.
         """
         sdk = _fresh_sdk()
         try:
@@ -426,11 +439,31 @@ class TestReviewRegressions:
                 _index_session_with_embedding(sdk, "s1", "FalkorDB port migration",
                                               keywords=["migration"])
                 _index_session_plain_list_embedding(sdk, "s_legacy", "legacy poison node")
+                # #8316: the vector strategy circuit breaker is PROCESS-GLOBAL
+                # (three consecutive failures → 30 s open). Sibling files that
+                # deliberately record a vector ``query_failed`` (e.g.
+                # test_search_engine.py / test_longmem_runner.py) can leave it
+                # OPEN in the same pytest process, which would short-circuit
+                # this read as ``breaker_open`` and fail this test for a reason
+                # that has nothing to do with the shape it pins.
+                from tortoise.search_engine import reset_circuit_breakers
+                reset_circuit_breakers()
                 # Semantic route must still return the matching session (the
                 # legacy node must not take the whole dense leg down with it).
                 res = sdk.search_sessions("port migration", limit=5)
                 ids = _ids(res)
                 assert "s1" in ids, res
+                # Premise (the #8316 file asserts the same for Point): the legacy
+                # node really IS the plain-`List` shape. Without this, a future
+                # change that made the write typed would leave the assertion
+                # below green while the read seam this test exists for was never
+                # exercised — a false green on the one Event-lane surface.
+                legacy_typeof = sdk._get_proj().g.query(
+                    "MATCH (e:Event {eventId:'s_legacy'}) "
+                    "RETURN typeof(e.embedding)").result_set
+                assert legacy_typeof and legacy_typeof[0][0] == "List", (
+                    f"premise broken — the legacy node is not a plain List: "
+                    f"{legacy_typeof!r}")
                 # #8316: the legacy node is now dense-readable rather than
                 # poisoning the leg — the fix normalises the stored shape at
                 # the read boundary (the stored value itself is untouched).

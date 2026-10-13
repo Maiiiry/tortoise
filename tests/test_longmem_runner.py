@@ -5892,7 +5892,7 @@ def test_tortoise_fts_query_records_no_embedder_and_encode_failed(
         sdk.close()
 
 
-def test_poisoned_plain_list_node_fts_still_hits(tmp_path):
+def test_wrong_dim_node_fts_still_hits(tmp_path):
     """D4 (R3): a malformed embedding node → leg reason='query_failed' (NOT
     no_embeddings), and FTS still returns hits — the leg-mix shows the failure,
     never a silent empty vector leg.

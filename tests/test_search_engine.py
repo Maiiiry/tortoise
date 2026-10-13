@@ -267,7 +267,7 @@ def test_vector_trace_ok_on_healthy_graph(tmp_path):
         sdk.close()
 
 
-def test_vector_trace_poisoned_plain_list_node(tmp_path):
+def test_vector_trace_wrong_dim_node_is_query_failed(tmp_path):
     """D4 (R3): a malformed embedding node costs the brute-force MATCH.
 
     The node here is malformed by DIMENSION (a 2-dim list against the 384-dim
