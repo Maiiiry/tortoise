@@ -65,7 +65,18 @@ _TRUTHY = {"1", "true", "yes", "on"}
 #: inert (``hook_install.KIND_INSTALL_INERT``). An inert install must leave
 #: EVIDENCE, never silence (#4314): fail-open injects nothing on a healthy
 #: empty graph AND on a dead seam, so without this the two are
-#: indistinguishable to a user or to ``session verify``.
+#: indistinguishable to a user.
+#:
+#: NOTE: the record lands in the canonical
+#: ``capture-errors/<harness>-install.json`` slot, but a capture-less Python
+#: seam has NO automated reader yet (unlike the shell seams, whose
+#: ``session-start.sh`` renders ``install-inert``). ``session verify``
+#: enumerates ``capture_install.CAPTURE_SEAM`` and has no ``hermes`` arm
+#: (Hermes has no capture hook — ingestion rides ``sessions import``), and
+#: ``capture_breadcrumb.render()`` deliberately owns only
+#: ``capture-failure``. Do not claim otherwise: the record is
+#: operator-inspectable at its canonical slot, and the missing reader is
+#: tracked by #8360.
 _INSTALL_INERT_KIND = "install-inert"
 
 

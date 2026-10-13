@@ -169,7 +169,12 @@ docs: "plugins are opt-in"). So the install prints the two required steps
 `hermes plugins enable tortoise-volunteer`), and the plugin writes the same
 `capture-errors/<harness>-install.json` (`kind: install-inert`) breadcrumb the
 shipped shell hooks write when its reflex cannot resolve — an inert install
-must leave evidence, never read as a working seam (#4314).
+must leave evidence, never read as a working seam (#4314). Caveat
+(2026-10-13): unlike the shell seams, whose `session-start.sh` renders the
+record, a capture-less Python plugin has **no automated reader** — `session
+verify` enumerates `capture_install.CAPTURE_SEAM` (no `hermes` arm) and the
+Python renderer owns only `capture-failure`; the record is operator-inspectable
+at its canonical slot, and the reader is tracked by #8360.
 
 ## Fail-open / fail-closed posture (all seams)
 

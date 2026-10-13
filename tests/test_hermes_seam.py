@@ -548,8 +548,18 @@ def test_plugin_falls_back_to_the_venv_that_owns_a_wheel_module_dir(
 
 
 def _install_inert_crumb(tmp_path) -> Path:
+    """The canonical ``install-inert`` slot for ``hermes``.
+
+    Derived from the SHARED filename rule (``hook_install.breadcrumb_name``)
+    rather than a second literal, so the plugin's stdlib-only mirror of the
+    slot (it cannot import ``tortoise.*``) cannot drift from the slot a
+    reader will read. The plugin's automated reader is still missing (#8360);
+    this pins that the record at least lands where that reader must look.
+    """
+    from tortoise.hook_install import KIND_INSTALL_INERT, breadcrumb_name
+
     return (tmp_path / "home" / ".tortoise" / "capture-errors"
-            / "hermes-install.json")
+            / breadcrumb_name("hermes", KIND_INSTALL_INERT))
 
 
 def test_plugin_leaves_install_inert_evidence_when_no_reflex_resolves(
