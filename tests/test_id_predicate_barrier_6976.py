@@ -65,8 +65,10 @@ import pytest
 
 from tortoise.audit import audit_graph
 from tortoise.cypher_guard import (
+    _engine_module_version,
     _engine_needs_predicate_barrier,
     _graph_module_version,
+    _guard_query,
     _predicate_drop_barrier,
     guarded_client,
 )
@@ -261,6 +263,135 @@ def test_an_interpolated_predicate_is_seen_at_runtime() -> None:
     out = _predicate_drop_barrier(statement)
     assert out != statement
     assert "WITH *" in out, out
+
+
+# ── permissive doubles: the probe must never raise out of the guard (#7162 P2) ─
+
+def test_a_permissive_double_never_raises_out_of_the_guard() -> None:
+    """A duck-typed client answers EVERY name, so the version cache read and the
+    version comparison must both be type-checked.
+
+    Before the fix, a bare ``getattr`` returned the double's own ``MagicMock``
+    for the cache marker, which was then subscripted / compared against a tuple:
+    ``TypeError: 'Mock' object is not subscriptable`` and ``'>=' not supported
+    between instances of 'MagicMock' and 'tuple'``. That raise escaped the guard
+    (``_engine_module_version`` is not the refusal path), so a guarded query was
+    refused BEFORE dispatch instead of being barred. Value that makes this fail:
+    reverting to the bare ``getattr`` + ``cached[0]`` / ``version >=`` form.
+    """
+    from unittest import mock
+
+    for double in (mock.Mock(), mock.MagicMock()):
+        assert _engine_module_version(double) is None
+        assert _engine_needs_predicate_barrier(double) is True
+
+
+def test_a_probe_that_answers_a_non_list_is_unknown_not_a_crash() -> None:
+    """A double can answer ``MODULE LIST`` with an arbitrary object. Iterating
+    it would raise out of the probe; the shape must decode to UNKNOWN (barrier)
+    instead. Value that makes this fail: the unguarded ``for row in rows``."""
+    from unittest import mock
+
+    assert _graph_module_version(mock.Mock()) is None
+
+
+def test_a_forged_version_cache_is_discarded_and_the_probe_runs() -> None:
+    """A permissive ``__getattr__`` FORGES the cache; the probe must still run.
+
+    The forged value is not the exact 1-tuple this module writes, so it is
+    discarded rather than used, and the real (6, 0, 1) answer decides. Value
+    that makes this fail: trusting any non-``None`` cache attribute.
+    """
+
+    class _Forged:
+        def __getattr__(self, name):
+            return "not-a-version"
+
+        def execute_command(self, *args):
+            return [[b"name", b"graph", b"ver", 60001]]
+
+    assert _engine_module_version(_Forged()) == (6, 0, 1)
+    assert _engine_needs_predicate_barrier(_Forged()) is True
+
+
+def test_a_permissive_handle_still_reaches_dispatch_with_the_barrier() -> None:
+    """The seam's contract: an offending query is BARRED, never a TypeError.
+
+    The handle's ``.client`` is a permissive double (a ``MagicMock``, as a test
+    stub or a proxied client can be). Before the fix this raised ``TypeError``
+    out of :func:`_guard_query` and the statement was not dispatched at all —
+    the failure `tests/test_projection.py::test_server_projection_receives_the_
+    bounded_timeouts` hit. Assert the RETURNED statement is the barred one.
+    """
+    from unittest import mock
+
+    class _Handle:
+        client = mock.MagicMock()
+
+    out = _guard_query(_OFFENDER, {"ids": ["p1"]}, handle=_Handle())
+    assert "WITH *" in out, out
+    assert out != _OFFENDER, out
+
+
+# ── identifier-position keywords are labels/types, not clauses (#7162 P1) ─────
+#
+# `_CLAUSE_STARTER_RE` matches on WORD BOUNDARIES, so a keyword-named label or
+# relationship type (`(u:Return)`, `-[:USE]->`) matched as a clause. That
+# truncated the re-binding pattern at the label/type, so a variable bound LATER
+# in the same pattern was never seen and NO barrier was inserted — the silent
+# filter bypass this rail exists to stop. The scan is now position-aware.
+
+#: Keywords `_CLAUSE_STARTER_RE` recognises that are ALSO legal rel types.
+_KEYWORD_REL_TYPES = [
+    "USE", "SET", "CALL", "MERGE", "DELETE", "CREATE", "UNWIND",
+    "WITH", "RETURN", "FOREACH", "UNION", "MATCH", "REMOVE",
+]
+#: The same for labels (case is irrelevant to the identifier match).
+_KEYWORD_LABELS = ["SET", "Return", "Match", "Merge", "Call", "Unwind", "Use"]
+
+
+@pytest.mark.parametrize("keyword", _KEYWORD_REL_TYPES)
+def test_a_keyword_named_relationship_type_does_not_truncate_the_scan(
+    keyword: str,
+) -> None:
+    """`[:USE]` is an IDENTIFIER; the re-bound `n` after it must still be seen."""
+    statement = (
+        f"MATCH (n:Point) WHERE n.id IN $ids "
+        f"MATCH (u)-[:{keyword}]->(n) RETURN n.id"
+    )
+    out = _predicate_drop_barrier(statement)
+    assert out != statement, (
+        f"a keyword-named relationship type `[:{keyword}]` truncated the pattern "
+        f"scan, so the predicate stays unbarred: {out!r}"
+    )
+    assert "WITH *" in out, out
+
+
+@pytest.mark.parametrize("keyword", _KEYWORD_LABELS)
+def test_a_keyword_named_label_does_not_truncate_the_scan(keyword: str) -> None:
+    """`(u:Return)` is an IDENTIFIER; the re-bound `n` after it must still be seen."""
+    statement = (
+        f"MATCH (n:Point) WHERE n.id IN $ids "
+        f"MATCH (u:{keyword})-[:R]->(n) RETURN n.id"
+    )
+    out = _predicate_drop_barrier(statement)
+    assert out != statement, (
+        f"a keyword-named label `:{keyword}` truncated the pattern scan: {out!r}"
+    )
+    assert "WITH *" in out, out
+
+
+@pytest.mark.parametrize("keyword", ["USE", "Return", "Set", "With"])
+def test_an_identifier_position_keyword_does_not_make_the_scan_fire(
+    keyword: str,
+) -> None:
+    """The false-positive rail for the position fix: a keyword-named label/type
+    whose pattern does NOT re-bind the filtered variable stays byte-identical."""
+    statement = (
+        f"MATCH (n:Point) WHERE n.id IN $ids "
+        f"MATCH (u:{keyword})-[:R]->(m) RETURN n.id"
+    )
+    assert _predicate_drop_barrier(statement) == statement
 
 
 # ── the version gate, decided from the SERVER's own version ──────────────────

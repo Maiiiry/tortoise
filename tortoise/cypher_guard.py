@@ -395,6 +395,31 @@ def _brace_depth(masked: str, index: int) -> int:
     return masked.count("{", 0, index) - masked.count("}", 0, index)
 
 
+#: Characters that, immediately before a keyword (modulo whitespace), make it an
+#: IDENTIFIER rather than a clause: a label `(:Return)`, a relationship type
+#: `[:USE]`, a property `n.use`, a map key `{match: 1}` or a parameter `$set`. A
+#: real clause is preceded by whitespace, `)`/`}` (the end of a pattern) or the
+#: string start, so any of these is a marker of identifier position.
+_IDENTIFIER_BEFORE = frozenset(":.([{$")
+
+
+def _is_clause_keyword(masked: str, index: int) -> bool:
+    """Whether the clause-regex match at *index* is a CLAUSE, not an identifier.
+
+    `_CLAUSE_STARTER_RE` matches on word boundaries, so a keyword-named label or
+    relationship type (`MATCH (u:Return)-[:USE]->(n)`) satisfies it as soon as a
+    `:` precedes the name. Left unchecked the scan is not POSITION-AWARE: such a
+    token truncates the re-binding pattern at the label/type, so a variable bound
+    LATER in the same pattern is never seen, `rebound & pred_vars` is empty and
+    NO barrier is inserted — the silent filter bypass this rail exists to stop.
+    Rejecting identifier-position matches leaves the scan with real clauses only.
+    """
+    j = index - 1
+    while j >= 0 and masked[j] in " \t\r\n":
+        j -= 1
+    return j < 0 or masked[j] not in _IDENTIFIER_BEFORE
+
+
 def _predicate_vars(predicate: str) -> set[str]:
     """Identifiers a `WHERE` predicate could be constraining.
 
@@ -441,6 +466,7 @@ def _predicate_drop_barrier(cypher: str) -> str:
     clauses = [
         m for m in _CLAUSE_STARTER_RE.finditer(masked)
         if _brace_depth(masked, m.start()) == 0
+        and _is_clause_keyword(masked, m.start())
     ]
     if not clauses:
         return cypher
@@ -472,7 +498,9 @@ def _predicate_drop_barrier(cypher: str) -> str:
         # The re-binding MATCH's own pattern runs to its next clause/WHERE.
         pattern_end = len(cypher)
         for nxt in _CLAUSE_STARTER_RE.finditer(masked, following.end()):
-            if _brace_depth(masked, nxt.start()) == 0:
+            if _brace_depth(masked, nxt.start()) == 0 and _is_clause_keyword(
+                masked, nxt.start()
+            ):
                 pattern_end = nxt.start()
                 break
         for nxt in _WHERE_RE.finditer(masked, following.end()):
@@ -499,6 +527,39 @@ _PREDICATE_DROP_AFFECTED_FROM = (6, 0, 0)
 _ENGINE_VERSION_MARKER = "_tortoise_falkordb_engine_version"
 
 
+def _is_version_triple(value) -> bool:
+    """Whether *value* is a decoded ``(major, minor, patch)`` integer triple."""
+    return (
+        isinstance(value, tuple)
+        and len(value) == 3
+        and all(isinstance(part, int) and not isinstance(part, bool) for part in value)
+    )
+
+
+def _cached_engine_version(client):
+    """The cached ``(version,)`` sentinel, or ``None`` when absent/FORGED.
+
+    The read is a bare ``getattr`` because the cache is a per-INSTANCE value (a
+    class-MRO check cannot see it), but the answer is TYPE-CHECKED before use:
+    a permissive ``__getattr__`` object — a ``Mock``, a ``MagicMock``, a proxy —
+    answers EVERY name, so an unchecked value would be subscripted or compared
+    and raise ``TypeError`` out of the guard, refusing a statement before it is
+    dispatched. A value that is not exactly the 1-tuple this module writes is
+    discarded and the probe runs, so a duck-typed client can neither crash the
+    guard nor forge a `False` (no-barrier) verdict.
+    """
+    try:
+        cached = getattr(client, _ENGINE_VERSION_MARKER, None)
+    except Exception:
+        return None
+    if not isinstance(cached, tuple) or len(cached) != 1:
+        return None
+    version = cached[0]
+    if version is not None and not _is_version_triple(version):
+        return None
+    return cached
+
+
 def _graph_module_version(client):
     """``(major, minor, patch)`` of the FalkorDB ``graph`` module, else ``None``.
 
@@ -511,6 +572,11 @@ def _graph_module_version(client):
     try:
         rows = client.execute_command("MODULE", "LIST") or []
     except Exception:
+        return None
+    # A duck-typed double (a bare ``Mock``, a proxy) can answer the command with
+    # an arbitrary object; iterating it would raise out of the guard, so a shape
+    # this probe does not recognise is UNKNOWN (barrier) rather than a crash.
+    if not isinstance(rows, (list, tuple)):
         return None
     for row in rows:
         if not isinstance(row, (list, tuple)):
@@ -539,7 +605,7 @@ def _engine_module_version(client):
     """
     if client is None:
         return None
-    cached = getattr(client, _ENGINE_VERSION_MARKER, None)
+    cached = _cached_engine_version(client)
     if cached is not None:
         return cached[0]
     version = _graph_module_version(client)
@@ -559,9 +625,14 @@ def _engine_needs_predicate_barrier(client) -> bool:
     never be a false CLEAN.
     """
     version = _engine_module_version(client)
-    if version is None:
+    # Anything that is not a decoded integer triple is UNKNOWN, and UNKNOWN gets
+    # the barrier: a forged or malformed value must never become a false CLEAN.
+    if not _is_version_triple(version):
         return True
-    return version >= _PREDICATE_DROP_AFFECTED_FROM
+    try:
+        return version >= _PREDICATE_DROP_AFFECTED_FROM
+    except TypeError:  # pragma: no cover - defensive: _is_version_triple pins ints
+        return True
 
 
 def _predicate_barrier_required(handle) -> bool:
