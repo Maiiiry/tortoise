@@ -550,6 +550,106 @@ def generator_module():
 
 
 # ─────────────────────────────────────────────────────────────────────
+# THE VOCABULARY GUARD — a malformed declaration must fail LOUD, at its one home
+# (#4722: `basis` was a declared axis the guard did not name, so a `basis`-less file
+# walked past it and died as a bare `KeyError` in the `AXIS_VALUES` comprehension —
+# at import, with no readable message, while the legend renders a `Basis` row from it).
+# ─────────────────────────────────────────────────────────────────────
+def _declared_axes() -> tuple[str, ...]:
+    """The axes the VOCABULARY FILE declares — read here, never from the generator."""
+    return tuple(_vocabulary_doc()["axes"])
+
+
+def _vocabulary_doc() -> dict:
+    """A fresh parse of the real declaration, as the oracle for the tests below."""
+    import yaml
+
+    return yaml.safe_load(
+        (ROOT / "config" / "disposition-vocabulary.yml").read_text(encoding="utf-8")
+    )
+
+
+def _write_vocabulary(tmp_path: Path, doc: dict) -> Path:
+    import yaml
+
+    path = tmp_path / "disposition-vocabulary.yml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    return path
+
+
+# Parametrised over the axes THE FILE declares, not a literal triple: a declared axis is
+# exactly the unit the guard must cover, so a fourth one is checked the moment it is
+# declared. A literal here would pin today's three and re-arm the very omission the
+# reported defect was (`lifecycle`/`visibility` were named while `basis` was not).
+DECLARED_AXES = _declared_axes()
+
+
+@pytest.mark.parametrize("axis", DECLARED_AXES)
+def test_every_declared_axis_without_values_fails_loud(
+    generator_module, monkeypatch, tmp_path: Path, axis: str
+) -> None:
+    """A declared axis with no `values` must raise the guard, naming the axis.
+
+    Reproduced before the fix (#4722): `_load_vocabulary()` returned CLEANLY for a
+    vocabulary with `axes.basis.values` removed, and the failure surfaced one line later
+    as `KeyError: 'values'` in `AXIS_VALUES = {axis: tuple(spec["values"]) …}` — the
+    intended `SystemExit` never fired. The message must name the axis, because the file
+    is the only thing that knows which axis is wrong.
+    """
+    doc = _vocabulary_doc()
+    del doc["axes"][axis]["values"]
+    monkeypatch.setattr(generator_module, "VOCAB_PATH", _write_vocabulary(tmp_path, doc))
+    with pytest.raises(SystemExit) as excinfo:
+        generator_module._load_vocabulary()
+    assert f"`{axis}`" in str(excinfo.value), (
+        f"the guard fired but did not name the axis it rejected: {excinfo.value}"
+    )
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        pytest.param("values-empty", id="axis-values-empty"),
+        pytest.param("axes-not-a-mapping", id="axes-not-a-mapping"),
+        pytest.param("axis-spec-not-a-mapping", id="axis-spec-not-a-mapping"),
+        pytest.param("delete-values-missing", id="delete-instruction-values-missing"),
+        pytest.param("dispositions-empty", id="dispositions-empty"),
+    ],
+)
+def test_a_structurally_malformed_vocabulary_fails_loud(
+    generator_module, monkeypatch, tmp_path: Path, broken: str
+) -> None:
+    """Every block the guard reads must raise `SystemExit`, never a bare exception.
+
+    The reported defect's SHAPE is a guard that skips a block the module then reads, so
+    the neighbouring blocks are checked rather than just the one that was reported: an
+    empty `values` (an empty legend cell and `AXIS_VALUES[axis] == ()` — no crash at
+    all), a non-mapping `axes` or axis spec (an `AttributeError` where the guard should
+    have spoken), `delete_instruction.values` — the `DELETE_VALUES` read one line below
+    `AXIS_VALUES`, with the identical hole — and an empty `dispositions`, where every row
+    would silently fall through to the implicit UNCHANGED/RENAMED pair in `_disposition`
+    and the `—` caveat would render an empty list of unstaked axes.
+    """
+    doc = _vocabulary_doc()
+    if broken == "values-empty":
+        doc["axes"]["basis"]["values"] = {}
+    elif broken == "axes-not-a-mapping":
+        doc["axes"] = list(doc["axes"])
+    elif broken == "axis-spec-not-a-mapping":
+        doc["axes"]["basis"] = "stated"
+    elif broken == "delete-values-missing":
+        del doc["delete_instruction"]["values"]
+    elif broken == "dispositions-empty":
+        doc["dispositions"] = {}
+    else:  # pragma: no cover — a param added without a mutation
+        raise AssertionError(f"no mutation is defined for {broken!r}")
+    monkeypatch.setattr(generator_module, "VOCAB_PATH", _write_vocabulary(tmp_path, doc))
+    with pytest.raises(SystemExit) as excinfo:
+        generator_module._load_vocabulary()
+    assert str(excinfo.value), "the guard exited without a message"
+
+
+# ─────────────────────────────────────────────────────────────────────
 # THE GATE — `--check` must be clean, and must RED on drift
 # ─────────────────────────────────────────────────────────────────────
 def test_check_mode_is_clean() -> None:
@@ -1382,6 +1482,51 @@ def test_the_axes_are_consistent_with_the_declared_vocabulary() -> None:
             )
         if r["basis"] == "contested":
             assert r["target"] == "", f"{r['name']}: a contested row states no destination"
+
+
+def test_the_em_dash_caveat_states_the_cells_the_declaration_leaves_unstaked() -> None:
+    """The legend's `—` caveat must claim exactly the cells the DECLARATION leaves null.
+
+    The sentence it replaced said a `—` marks "an `unbacked` or `contested` row", and the
+    prose test above pinned it VERBATIM — so the pin held the wording still while the
+    wording contradicted the rendering: `contested` states `basis: contested` and
+    `delete: retain`, so only its `Lifecycle` and `Visibility` cells render `—`. A
+    wording pin cannot catch that, and did not. This derives the unstaked cells from
+    `config/disposition-vocabulary.yml` and requires the rendered claim to name exactly
+    them, so the caveat is checked against the file that decides it rather than against
+    what someone last typed (#4722).
+    """
+    vocab = _vocabulary_doc()
+    # The three axes the legend renders as cells a `—` can occupy. `Basis` is not one:
+    # a row's basis is declared by its disposition or computed from its citation, so it
+    # always carries an evidence value. The clauses below must claim these three axes
+    # and NO others — including not `Basis`, which is the over-statement that was filed.
+    state_axes = ("lifecycle", "visibility", "delete")
+    expected = {
+        spec.get("basis", key.lower()): {
+            a.capitalize() for a in state_axes if spec.get(a) is None
+        }
+        for key, spec in vocab["dispositions"].items()
+    }
+    expected = {name: cells for name, cells in expected.items() if cells}
+    assert expected, (
+        "no disposition leaves an axis unstaked — the caveat describes nothing and this "
+        "check is inert"
+    )
+    claimed = {
+        name: set(re.findall(r"`([A-Za-z_]+)`", cells))
+        for name, cells in re.findall(r"`([a-z_]+)` leaves ([^;(]+)", _doc())
+    }
+    assert claimed == expected, (
+        "the `—` caveat does not match what the declaration leaves unstaked:\n"
+        f"  caveat claims: {claimed}\n  declaration:   {expected}"
+    )
+    assert "`Basis` is never `—`" in _doc(), (
+        "the caveat no longer states that the `Basis` cell never renders `—`"
+    )
+    assert all(r["basis"] != "—" for r in part_a_rows()), (
+        "a row renders `—` in its `Basis` cell — the caveat's claim is now false"
+    )
 
 
 def test_the_axes_are_pinned() -> None:
@@ -2340,7 +2485,7 @@ def test_legend_structural_prose_and_reproduce_block_are_read() -> None:
         "“not on the public surface” and “DELETE this” at once, so one word carried a "
         "visibility fact and a delete COMMAND. Now the visibility is `internal` **and** "
         "the delete instruction is `delete`, each in its own cell. A `—` in an axis cell "
-        "means the doc states nothing for that axis (an `unbacked` or `contested` row)."
+        "means the declared disposition leaves that axis unstaked:"
     ) in doc, "the axes-independence rationale changed or was dropped"
     assert (
         "`Target` names the destination method; `—` means no destination is stated."
