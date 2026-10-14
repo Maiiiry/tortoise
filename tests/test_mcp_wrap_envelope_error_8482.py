@@ -38,6 +38,7 @@ for them:
 from __future__ import annotations
 
 import contextlib
+import gc
 from unittest import mock
 
 import pytest
@@ -703,6 +704,49 @@ async def test_a_replaced_component_is_not_served_from_the_memo(quiet):
         ms._local_tool_cache_key = clean
         ms._WRAP_ENVELOPE_SCHEMA_CACHE.clear()
         _drop("_8482_stale")
+
+
+@pytest.mark.asyncio
+async def test_a_removed_and_re_added_component_is_not_served_from_the_memo(quiet):
+    """A key built from an ``id`` is sound only while something holds the object.
+
+    ``remove_tool`` drops the component, so CPython can reuse its address for
+    a later component under the same key — the memo would then answer with the
+    replaced schema and repair a legitimate success into a visible failure,
+    which is the reverse of this PR's bug. The cache VALUE holds the component
+    itself, which pins that identity. The first assertion is the pin and is
+    deterministic; the rest drives the path it protects.
+    """
+    def _array() -> list[dict]:
+        return [{"id": "p1"}]
+
+    def _union() -> list[dict] | dict:
+        return {"results": [], "total": 0, "hasMore": False}
+
+    _probe("_8482_readd", _array)
+    try:
+        ms._WRAP_ENVELOPE_SCHEMA_CACHE.clear()
+        assert await ms._wrap_envelope_schema("_8482_readd") is not None
+        live = ms._local_tool_component("_8482_readd")
+        pinned = next(iter(ms._WRAP_ENVELOPE_SCHEMA_CACHE.values()))[0]
+        assert pinned is live, (
+            "the memo key embeds the component's address but the entry does "
+            "not hold the component, so that address can be recycled by a "
+            "later component and the key collides")
+
+        _drop("_8482_readd")
+        gc.collect()
+        _probe("_8482_readd", _union)
+
+        result = await ms.mcp.call_tool("_8482_readd", {})
+        assert result.is_error is False, (
+            "a removed-and-re-added component was served from the memo: a "
+            "union tool's legitimate dict success was repaired")
+        assert result.structured_content == {
+            "result": {"results": [], "total": 0, "hasMore": False}}
+    finally:
+        ms._WRAP_ENVELOPE_SCHEMA_CACHE.clear()
+        _drop("_8482_readd")
 
 
 @pytest.mark.asyncio

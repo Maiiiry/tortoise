@@ -879,23 +879,24 @@ _WRAP_ENVELOPE_TYPE_CHECKS: dict[str, type | tuple[type, ...]] = {
 #: EVERY call — without this the classification would be relearned at a full
 #: rebuild, on the product's read path, for a repair the payload never needed.
 #: The key carries the stored VERSION **and the identity of the live component**,
-#: so a stale classification cannot be served even if a name is re-registered
-#: in-place: ``register_all`` skips a duplicate, but FastMCP's own ``add_tool``
-#: REPLACES on a duplicate name, and a replacement is a new object — its key
-#: therefore differs and the memo misses rather than answering with the old
-#: schema. An unreadable schema is never cached.
-_WRAP_ENVELOPE_SCHEMA_CACHE: dict[str, dict | None] = {}
+#: so a stale classification cannot be served even if a name is re-registered:
+#: ``register_all`` skips a duplicate, but FastMCP's own ``add_tool`` REPLACES
+#: on a duplicate name, and ``remove_tool`` + a re-add drops the object
+#: entirely. The VALUE holds the component itself, not just its ``id`` — a
+#: bare ``id`` is an address, and CPython recycles an address once the object
+#: is freed, so a key built from it would collide with a later component and
+#: serve the replaced schema. Holding the component pins that identity for as
+#: long as the entry lives. An unreadable schema is never cached.
+_WRAP_ENVELOPE_SCHEMA_CACHE: dict[str, tuple[object, dict | None]] = {}
 
 
-def _local_tool_cache_key(name: str) -> str | None:
-    """The local provider's stored key for ``name``, or ``None`` when the name
-    is not served locally (a transform/shim or a mounted provider).
+def _local_tool_component(name: str):
+    """The local provider's stored component for ``name``, or ``None``.
 
     Cheap by design (no tool rebuild): it reads the provider's component store
     directly — the same source ``FastMCPAdapter.register_all`` uses for its
     duplicate check — and is ``getattr``-guarded so an upstream layout change
-    degrades to "not cached", never a crash. ``None`` makes the caller read
-    through ``get_tool`` without caching, exactly as before.
+    degrades to "not cached", never a crash.
     """
     provider = getattr(mcp, "_local_provider", None)
     components = getattr(provider, "_components", None)
@@ -906,12 +907,22 @@ def _local_tool_cache_key(name: str) -> str | None:
                and hasattr(c, "output_schema")]
     if not matches:
         return None
-    chosen = max(matches,
-                 key=lambda c: (c.version is not None, str(c.version)))
-    # The ``id`` disambiguates an in-place re-registration under the same key:
-    # a replaced component is a new object, so the memo misses instead of
-    # serving the replaced schema's classification. The provider holds the
-    # component alive, so the id cannot be recycled while its entry is cached.
+    return max(matches,
+               key=lambda c: (c.version is not None, str(c.version)))
+
+
+def _local_tool_cache_key(name: str) -> str | None:
+    """The local provider's stored key for ``name``, or ``None`` when the name
+    is not served locally (a transform/shim or a mounted provider).
+
+    ``None`` makes the caller read through ``get_tool`` without caching,
+    exactly as before. The ``id`` half disambiguates a re-registration under
+    the same key; the cache VALUE holds the component, which is what keeps
+    that ``id`` from being recycled out from under the entry.
+    """
+    chosen = _local_tool_component(name)
+    if chosen is None:
+        return None
     return f"{chosen.key}#{id(chosen)}"
 
 
@@ -932,7 +943,7 @@ async def _wrap_envelope_schema(name: str) -> dict | None:
     """
     cache_key = _local_tool_cache_key(name)
     if cache_key is not None and cache_key in _WRAP_ENVELOPE_SCHEMA_CACHE:
-        return _WRAP_ENVELOPE_SCHEMA_CACHE[cache_key]
+        return _WRAP_ENVELOPE_SCHEMA_CACHE[cache_key][1]
     try:
         tool = await mcp.get_tool(name)
     except Exception:  # an unreadable schema must never break a tool call
@@ -941,7 +952,11 @@ async def _wrap_envelope_schema(name: str) -> dict | None:
     if not (isinstance(schema, dict) and schema.get("x-fastmcp-wrap-result")):
         schema = None
     if cache_key is not None:
-        _WRAP_ENVELOPE_SCHEMA_CACHE[cache_key] = schema
+        # Pin the component: the key embeds its address, and this reference is
+        # what stops that address being reused by a later component.
+        component = _local_tool_component(name)
+        if component is not None:
+            _WRAP_ENVELOPE_SCHEMA_CACHE[cache_key] = (component, schema)
     return schema
 
 
