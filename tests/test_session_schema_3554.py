@@ -175,6 +175,43 @@ def test_worktree_scope_is_the_tracked_corpus_not_disk_copies(
         "tortoise/sdk.py::QUERY"}
 
 
+def test_tracked_scan_applies_the_declared_skip_parts(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``skip_parts`` narrows the TRACKED corpus, not only the fallback walk.
+
+    ``_iter_source`` reads ``skip_parts`` from :data:`PREDICATE` — but pre-fix
+    it consulted the declared directory names only in its non-git fallback, so
+    on the path CI and every lane actually use (a real work tree, ``git
+    ls-files``) a TRACKED file under a declared-out directory was still a site.
+    ``website/apps/blog-admin/dist/assets/*.js`` is tracked today, so a future
+    vendor bundle carrying a ``:Session`` shape (or the capture route) would
+    read as INVENTORY DRIFT on a non-site. Pre-fix this test fails:
+    ``dist/writer.py::QUERY`` is scanned as a site.
+    """
+    (tmp_path / "tortoise").mkdir()
+    (tmp_path / "tortoise" / "sdk.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    generated = tmp_path / "dist"
+    generated.mkdir()
+    (generated / "writer.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add",
+                    "tortoise/sdk.py", "dist/writer.py"], check=True)
+    # The TRACKED branch is the one under test: this root IS a work tree.
+    assert audit._tracked_files(tmp_path) is not None
+    assert "dist" in audit.PREDICATE["skip_parts"]
+    assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
+        "tortoise/sdk.py::QUERY"}
+    # ...and the DECLARED field really decides it: drop the declaration and
+    # the tracked file becomes a site again.
+    monkeypatch.setitem(audit.PREDICATE, "skip_parts", ())
+    assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
+        "dist/writer.py::QUERY", "tortoise/sdk.py::QUERY"}
+
+
 def test_declaration_module_skip_is_root_independent(tmp_path: Path) -> None:
     """The declaration module is skipped for a scan rooted anywhere.
 

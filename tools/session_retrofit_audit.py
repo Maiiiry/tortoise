@@ -291,6 +291,23 @@ def _skip_parts() -> frozenset[str]:
     return frozenset(PREDICATE["skip_parts"])
 
 
+def _skipped(rel: str) -> bool:
+    """True when a repo-relative path sits under a DECLARED skipped directory.
+
+    The directory NAMES come from :data:`PREDICATE`'s ``skip_parts`` (the
+    declaration), never from a literal in this tool — so the scan's scope is
+    part of the same reviewed predicate as its verbs and route. This applies to
+    the TRACKED branch too: a tracked file under a declared-out directory is
+    still out of scope, and pre-fix the ``git ls-files`` branch consulted the
+    declared parts only in its non-git fallback, so a tracked vendor bundle
+    under ``dist/`` (``website/apps/blog-admin/dist/assets/*.js`` is tracked
+    today) carrying a ``:Session`` shape or the capture route would read as
+    INVENTORY DRIFT on a non-site (#3554 review).
+    """
+    skip = _skip_parts()
+    return any(part in skip for part in Path(rel).parts)
+
+
 def _tracked_files(root: Path) -> frozenset[str] | None:
     """The TRACKED repo-relative paths under ``root``, or ``None`` if not a repo.
 
@@ -357,7 +374,8 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
     tracked = _tracked_files(root)
     if tracked is not None:
         for rel in sorted(tracked):
-            if Path(rel).suffix not in extensions or _excluded(rel):
+            if (Path(rel).suffix not in extensions or _excluded(rel)
+                    or _skipped(rel)):
                 continue
             path = root / rel
             if _is_declaration_module(path):
@@ -381,6 +399,8 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
             if path.is_symlink():
                 continue
             if _is_declaration_module(path):
+                continue
+            if _skipped(path.relative_to(root).as_posix()):
                 continue
             yield path
 
