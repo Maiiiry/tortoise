@@ -44,6 +44,8 @@ from contextlib import suppress
 import httpx
 import pytest
 
+from tests._verdict import require_answered
+
 # Hosted-surface tests reuse test_hosted_api's authenticated TestClient
 # fixture (temp-DB SDK patching + the session-recording consent seed), which
 # also installs the module-level env (pepper/encryption key) on import.
@@ -2179,6 +2181,10 @@ def _measure_on_loop_graph_work(monkeypatch, turns: int, sid: str):
     """
     resp, records, writer_threads = _measure_capture_graph_work(
         monkeypatch, turns, sid)
+    # #5049: the capture route is not exempt from the transport wait bound, so a
+    # 504 here is a non-answer — INCONCLUSIVE, never the bare FAIL these callers
+    # would otherwise read off `resp.status_code`.
+    require_answered(resp, what=f"POST /v1/sessions answered (capture {sid})")
     on_loop = [d for name, _, d in records if name == "MainThread"]
     return (resp, len(on_loop), sum(on_loop), writer_threads,
             [c for _, c, _ in records])

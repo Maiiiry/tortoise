@@ -46,6 +46,7 @@ os.environ.setdefault("TORTOISE_SECRET_PEPPER", "test-static-pepper")
 os.environ.setdefault("RATE_LIMIT_DISABLED", "1")
 
 from tests._http_fixtures import patched_tortoise_sdk
+from tests._verdict import require_answered
 from tortoise.commit_schema import (
     compute_client_commit_id,
     point_content_id,
@@ -264,9 +265,16 @@ def _finalize(raw: dict) -> dict:
 
 
 def _commit(client, raw: dict) -> dict:
-    """Finalize + POST /v1/sessions/commit."""
+    """Finalize + POST /v1/sessions/commit.
+
+    #5049: the route is not exempt from the transport wait bound, so a request
+    that outlives it is answered with the legible 504 refusal rather than an
+    answer. `require_answered` turns that non-answer into an INCONCLUSIVE skip
+    naming the bound; every other response — including the 4xx refusals this
+    file's callers assert on — is returned unchanged.
+    """
     r = client.post("/v1/sessions/commit", json=_finalize(raw))
-    return r
+    return require_answered(r, what="POST /v1/sessions/commit answered")
 
 
 def _inject_session_state(session_id: str, *, value_nodes_created: int = 0,

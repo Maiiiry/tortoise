@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from tests._github_docs_mock import MockGitHubDocsTransport, gh_docs_entry
 from tests._http_fixtures import patched_tortoise_sdk
+from tests._verdict import require_answered
 from tortoise.hosted_api import (
     _ALLOWED_STATE_KEYS,
     _INDEX_JOBS,
@@ -211,6 +212,9 @@ def _poll_until(client, job_id: str, status: str, timeout_s: float = 10.0):
     deadline = time.time() + timeout_s
     while True:
         r = client.get(f"/v1/index/docs/{job_id}")
+        # #5049: the poll route is not exempt from the transport wait bound —
+        # a 504 is the product refusing legibly, not an answer.
+        require_answered(r, what=f"GET /v1/index/docs/{job_id} answered")
         assert r.status_code == 200, r.text
         body = r.json()
         if body["status"] == status:

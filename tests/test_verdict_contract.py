@@ -32,12 +32,29 @@ from tests._verdict import (
     ProcessGlobal,
     host_capability,
     inconclusive_on_timeout,
+    is_transport_wait_bound_refusal,
     node_meets,
+    require_answered,
     require_node_floor,
     require_within,
     reset_process_globals,
+    transport_wait_bound_s,
     wait_for,
 )
+
+
+def _refusal_response(*, status: int = 504, body: str | None = None):
+    """A canned HTTP response standing in for the hosted API's refusal."""
+    from tortoise import mcp_auth
+
+    class _Response:
+        def __init__(self) -> None:
+            self.status_code = status
+            self.text = (
+                mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE if body is None else body
+            )
+
+    return _Response()
 
 _ATEXIT = "tortoise.embedded_lifecycle._atexit_deadline"
 
@@ -97,6 +114,64 @@ def test_a_non_timeout_error_is_not_swallowed():
         what="the probe", deadline_s=4.0, exceptions=(_ClientTimeout,)
     ):
         raise ValueError("a real product defect")
+
+
+# ── rule 1, product side: the transport wait-bound refusal ─────────────────
+def test_the_transport_bound_refusal_skips_and_names_the_product_bound():
+    """A bound reached with no answer is INCONCLUSIVE, and names the budget."""
+    response = _refusal_response()
+    assert is_transport_wait_bound_refusal(response) is True
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        require_answered(response, what="POST /v1/sessions answered")
+    message = str(excinfo.value)
+    assert "INCONCLUSIVE [#5049]" in message
+    # The deadline NAMED is the product's own bound, not an invented one.
+    assert f"{transport_wait_bound_s():g}" in message
+
+
+def test_sabotage_the_pre_fix_shape_fails_the_same_refusal():
+    """The shape #5049 replaces: `assert r.status_code == 200` on the refusal.
+
+    The same canned refusal that now SKIPs used to FAIL with `assert 504 == 200`.
+    This is the must-fail leg proving the conversion changes the verdict.
+    """
+    with pytest.raises(AssertionError):
+        response = _refusal_response()
+        assert response.status_code == 200, response.text
+
+
+def test_an_unrelated_504_is_returned_to_the_caller():
+    """Only the product's OWN refusal is converted — a bare 504 is not it."""
+    response = _refusal_response(body='{"detail": "gateway timeout"}')
+    assert is_transport_wait_bound_refusal(response) is False
+    assert require_answered(response, what="a probe") is response
+
+
+def test_the_product_message_alone_is_not_a_refusal():
+    """The MCP arm's refusal rides a 200, so the STATUS cannot be the gate.
+
+    `mcp_server._await_under_mcp_wait_bound` answers a breach with a
+    `CallToolResult(isError=True)` inside the SSE stream — HTTP 200 carrying the
+    SAME message. A status-gated detector would read that as a silent PASS; the
+    product's own message is the signal, on every surface.
+    """
+    response = _refusal_response(status=200)
+    assert is_transport_wait_bound_refusal(response) is True
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        require_answered(response, what="MCP tools/call answered")
+    assert "INCONCLUSIVE [#5049]" in str(excinfo.value)
+
+
+def test_an_answered_response_is_returned_untouched():
+    response = _refusal_response(status=200, body='{"ok": true}')
+    assert require_answered(response, what="a probe") is response
+
+
+def test_a_non_504_error_still_reaches_the_callers_own_assertion():
+    """A genuine product failure must FAIL, not skip: 402/500 are returned."""
+    for status in (402, 500, 409, 429):
+        response = _refusal_response(status=status, body='{"detail": "refused"}')
+        assert require_answered(response, what="a probe") is response, status
 
 
 # ── rule 2: sufficiency is a RECORDED property, never a live measurement ───
