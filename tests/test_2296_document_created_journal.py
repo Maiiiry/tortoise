@@ -1,9 +1,8 @@
 """#2296 — a Document created through the SDK survives ``rebuild_all``.
 
 The epic's own Indicator-2 gap list (scope hook from #2295) named this the
-*last unjournaled canonical create* — that is the PRE-#2296 state, and this
-change updates ``tests/test_unjournaled_mutation_class.py`` to record it as
-closed. ``create_document`` / ``create_entity(type="document")`` route ``_create_entity("Document", <ulid>, …, "DocumentCreated")``
+*last unjournaled canonical create* — that is the PRE-#2296 state, recorded as
+closed in ``tests/test_unjournaled_mutation_class.py``. ``create_document`` / ``create_entity(type="document")`` route ``_create_entity("Document", <ulid>, …, "DocumentCreated")``
 and emitted **no journal record** on that route. ``DocumentCreated`` is a
 fold the replay engines honour (``_upsert_document``), but with no record to
 replay a journal-enabled SDK's Documents were live-only — every
@@ -386,14 +385,38 @@ def test_update_entity_source_refuses_reserved_props_loudly(env):
 
     RED without the pre-strip capture: ``update_entity(<Source>, payload=...)``
     returned normally (measured at the pre-fix head).
+
+    ``event_id`` is deliberately EXCLUDED from that loop: it is both a reserved
+    envelope name and a DECLARED `:Source` property, so the reservation drops it
+    while the update must still LAND — see the assertions below.
     """
     sdk, _events = env
     url = "https://example.com/refuse"
     sdk.create_source(url, "document")
-    for name in ("payload", "point", "type", "ts", "event_id",
+    # UNDECLARED reserved names: the loud D30 refusal still fires even though the
+    # intake strip already removed them from `props` — the pre-strip capture is
+    # what keeps the guard answerable.
+    for name in ("payload", "point", "type", "ts",
                  "projection_version", "type_", "new_content"):
         with pytest.raises(ValueError, match="cannot be set on a :Source"):
             sdk.update_entity(url, **{name: {"k": "v"}})
+    # `event_id` is the one reserved name that is ALSO declared on a `:Source`,
+    # so it must not be pushed into the guard's undeclared set: measured, the
+    # unsubtracted union refused the WHOLE update — the legitimate co-supplied
+    # `summary` was lost — with a message whose own "Declared :Source
+    # properties" list names `event_id` as settable. The update must land, and
+    # the name must not persist (the envelope owns it; a live-only `event_id`
+    # would be the #8553 live != replay divergence).
+    sdk.update_entity(url, event_id="FORGED-EVENT-ID", summary="kept")
+    live = sdk._get_proj().g.query(
+        "MATCH (s:Source {url:$u}) RETURN s.summary, s.event_id",
+        params={"u": url}).result_set[0]
+    assert live[0] == "kept", (
+        "a declared reserved prop (`event_id`) refused the whole update: the "
+        "legitimate co-supplied `summary` was discarded")
+    assert live[1] is None, (
+        "a caller `event_id` prop persisted live on the :Source while the "
+        "record strips it — the #8553 live != replay divergence")
     # The reserved ACTOR keys keep their strip-and-ignore contract (#2600):
     # never a 4xx — the server owns attribution.
     sdk.update_entity(url, initiated_by="FORGED-ACTOR")

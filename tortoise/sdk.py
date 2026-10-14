@@ -24315,9 +24315,13 @@ class TortoiseSDK:
         # measured, `create_document(type="SourceCreated")` journalled nothing
         # and `rebuild_all` destroyed the node. `_sanitize_props` strips it for
         # every sanitizing caller, and the `_skip_sanitize` door
-        # (`create_source`) drops the name itself — so this re-assert is a
-        # SECOND layer, kept in case that drop is ever removed. Assigned rather
-        # than reordered so the dict's key order is unchanged.
+        # (`create_source`) drops the name itself. This line is NOT a substitute
+        # for either: it repairs the dispatch key of THIS local dict, which is
+        # what the live fold consumes — the RECORD `create_source` journals is
+        # built from that door's own payload, so with its drop removed the
+        # journaled type is still caller-forged (measured) and only the strip
+        # keeps it honest. Assigned rather than reordered so the dict's key
+        # order is unchanged.
         event = {"type": event_type, "id": id_val, **props}
         event["type"] = event_type
         # Normalize field names for projection compatibility
@@ -24797,12 +24801,15 @@ class TortoiseSDK:
 
     def _update_entity(self, id_val: str, **props) -> dict:
         # #2296 review: the intake strip below removes caller props that collide
-        # with an `_emit_event` name. On a `:Source` those names are UNDECLARED,
-        # and the #3998/D30 closed-surface guard below exists so that undeclared
-        # spelling gets the LOUD refusal the raw-body mistake needs — not a
-        # silent drop. Capture them BEFORE the strip so that guard can still
-        # fire for the target it owns. The reserved ACTOR keys are NOT captured:
-        # their contract is strip-and-ignore, never a 4xx (#2600).
+        # with an `_emit_event` name. On a `:Source` most of those names are
+        # UNDECLARED, and the #3998/D30 closed-surface guard below exists so that
+        # undeclared spelling gets the LOUD refusal the raw-body mistake needs —
+        # not a silent drop. Capture them BEFORE the strip so that guard can
+        # still fire for the target it owns. The reserved ACTOR keys are NOT
+        # captured: their contract is strip-and-ignore, never a 4xx (#2600).
+        # NOTE: a reserved name that IS a declared `:Source` property
+        # (`event_id`) must not be pushed into the guard's "undeclared" set —
+        # see the subtraction where that set is built below.
         _reserved_supplied = sorted(
             k for k in props
             if (k in _RESERVED_ENVELOPE_PROPS or k in _RESERVED_EMIT_CALL_PROPS)
@@ -24869,7 +24876,18 @@ class TortoiseSDK:
                     {k for k in props
                      if k not in _SOURCE_NODE_PROP_NAMES
                      and k not in self._get_proj()._DOC_RETIRED_KEYS}
-                    | set(_reserved_supplied)
+                    # The reserved names are unioned in because the intake strip
+                    # above already removed them from `props` — the guard must
+                    # still answer them. Subtracting the DECLARED surface keeps
+                    # a reserved name that is ALSO a declared `:Source`
+                    # property (`event_id`) out of the refusal: measured, the
+                    # unsubtracted union refused `update_entity(url,
+                    # event_id=…)` — a write that landed live and survived
+                    # `rebuild_all` before this review change — with a message
+                    # whose own "Declared :Source properties" list names that
+                    # key as settable. Declared reserved names stay
+                    # strip-and-ignore, like the actor keys.
+                    | (set(_reserved_supplied) - _SOURCE_NODE_PROP_NAMES)
                 )
                 if _undeclared:
                     raise ValueError(
