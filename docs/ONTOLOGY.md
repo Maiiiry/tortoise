@@ -1405,6 +1405,13 @@ silently-empty cell.
 | `lme_session_index` | `ingest_haystack`, `_write_v2_phase_a`, `rebuild_all` |
 | `lme_source_session_id` | `ingest_haystack`, `_write_v2_phase_a`, `rebuild_all` |
 
+**Who is an owner in this table.** A writer owns a property when it carries a
+`SET <alias>.<prop>` clause for it. A property used only as a `MERGE` key is **not** attributed
+— so the `id` row names `rebuild_all` (whose `SET s += $props` restores the whole
+schema) and not the ten writers whose `MERGE (s:Session {id: …})` mints the key.
+`id` is the Session's identity key, minted by every writer above; the cell records
+who *sets* it.
+
 **The one write primitive.** Every capture lane funnels through
 `tortoise/sdk.py::_write_session_and_turns` (#3551) plus the one turn store
 `_TURN_WRITE_CYPHER` (#3086); the hosted `POST /v1/sessions` handler and

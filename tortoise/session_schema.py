@@ -132,8 +132,14 @@ CAPTURE_PRIMITIVE = "tortoise/sdk.py::_write_session_and_turns"
 #: derivation asserts it at import, so a property can never be declared
 #: without a named owner.
 SESSION_PROPERTIES: tuple[str, ...] = (
-    # ── identity + capture shape (the shared primitive, #3551) ──
+    # ── the identity KEY. Every minting writer spells it in its
+    # `MERGE (s:Session {id:…})`, but a MERGE key is not a `SET
+    # <alias>.<prop>` clause and :func:`session_property_owners` attributes
+    # only SET properties — so the `id` row names the whole-schema replay
+    # restore, not the ten writers that mint the key (see that function's
+    # "who owns a property" convention) ──
     "id",
+    # ── capture shape (the shared primitive, #3551) ──
     "created_at",
     "turn_count",
     "is_episodic",
@@ -468,6 +474,16 @@ def session_property_owners() -> dict[str, tuple[str, ...]]:
 
     Derived from :data:`SESSION_WRITERS`, never hand-maintained: a row that
     forgets a property, or a property with no row, is caught here.
+
+    **Who is an owner:** a writer that carries a ``SET <alias>.<prop>`` clause
+    for the property — that is what a :class:`SessionWriter`'s ``properties``
+    enumerates (and what the scanner reads back at the site). A property used
+    only as a ``MERGE`` key is NOT attributed: ten writers mint the node with
+    ``MERGE (s:Session {id: …})``, but only ``rebuild_all``'s
+    ``SET s += $props`` owns ``id``. Without that convention the ``id`` row
+    reads as "a replay restore owns the Session id", which is the opposite of
+    what the code does — the contradiction the §4.8 table inherits (#3554
+    review).
     """
     owners: dict[str, list[str]] = {prop: [] for prop in SESSION_PROPERTIES}
     for writer in SESSION_WRITERS:

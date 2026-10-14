@@ -999,7 +999,25 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # silent-drop class), the same shape as tools/queue_resweep.py and
              # tools/drift-guard.py above. Pinned by
              # tests/test_ci_selection.py::test_orchestrator_harness_change_selects_core_not_tier1.
-             "operations/orchestrator-harness/")
+             "operations/orchestrator-harness/",
+             # #3554 review (P2, Finding 2): the :Session declaration's own doc
+             # subjects — `docs/ONTOLOGY.md` §4.8 (the owner table the machine
+             # declaration mirrors) and
+             # `docs/plans/2026-08-25-1714-memory-capture-onboarding.md` (the
+             # `#3554 amendment` the D9 verdicts cite) — own
+             # tests/test_session_schema_3554.py, registered `core`. `docs/` is a
+             # flat NON_PYTHON_PREFIXES entry and neither path is a concrete
+             # SOURCE_PATTERNS row, so a docs-only edit of either filtered to
+             # `changed == []`, took the docs-only early return and fell back to
+             # tier-1 smoke — whose set does NOT contain that file. The §4.8
+             # owner rows could then drop an owner (or the plan amendment lose a
+             # decision) and merge green against the declaration it claims to be
+             # pinned to. Same #1349/#3332/#3616 silent-drop class as
+             # `docs/auth-architecture.md` and the #3524 consent-bridge records;
+             # pinned by
+             # tests/test_ci_selection.py::test_the_session_declaration_guard_runs_on_its_docs_subjects_too.
+             "docs/ONTOLOGY.md",
+             "docs/plans/2026-08-25-1714-memory-capture-onboarding.md")
 
 # Paths that are NOT python-relevant (docs/config PRs skip the matrix).
 NON_PYTHON_PREFIXES = (

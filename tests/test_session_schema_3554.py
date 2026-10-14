@@ -434,6 +434,45 @@ def test_default_method_reads_of_the_route_are_not_client_sites(
         "tortoise/post_sessions.js", "tortoise/post_sessions.py"}
 
 
+def test_multiline_post_calls_are_still_client_sites(tmp_path: Path) -> None:
+    """A POST whose evidence sits on ANOTHER line is still a client site.
+
+    The POST evidence was tested per PHYSICAL line, so the route on one line
+    and ``method: "POST"`` on the next — the shape a formatter produces for
+    ``fetch(url, {\n  method: "POST",\n  …\n});``, and the idiomatic spelling
+    in this repo's TS — was invisible: ``inventory`` printed INVENTORY CLEAN
+    with an undeclared client present, the fail-OPEN mirror of the
+    false-positive class the same commit removed. A backslash-continued
+    ``curl`` is the same defect for the shell transport. Pre-fix this test
+    fails: none of the three files is a site.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "multiline_fetch.ts").write_text(
+        'const r = fetch("/v1/sessions", {\n'
+        '  method: "POST",\n'
+        '  body: JSON.stringify(payload),\n'
+        '});\n', encoding="utf-8")
+    (pkg / "multiline_post.ts").write_text(
+        'post(\n  cfg,\n  "/v1/sessions",\n  payload,\n);\n',
+        encoding="utf-8")
+    (pkg / "wrapped_curl.sh").write_text(
+        'curl \\\n  -X POST \\\n'
+        '  -H "content-type: application/json" \\\n'
+        '  "$BASE/v1/sessions" \\\n  -d @payload.json\n', encoding="utf-8")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/multiline_fetch.ts", "tortoise/multiline_post.ts",
+        "tortoise/wrapped_curl.sh"}
+    # …and a multi-line READ stays a non-site, so the assertions above cannot
+    # pass by dropping the POST requirement entirely.
+    (pkg / "multiline_fetch.ts").write_text(
+        'const r = fetch("/v1/sessions", {\n'
+        '  headers: { accept: "application/json" },\n'
+        '});\n', encoding="utf-8")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/multiline_post.ts", "tortoise/wrapped_curl.sh"}
+
+
 def test_inventory_cli_reports_clean_and_exits_zero(
         repo_inventory: dict, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     """The CLI's verdict/exit mapping, without a second full scan."""
@@ -700,6 +739,33 @@ def test_ontology_section_4_8_owner_lists_match_the_declaration() -> None:
                 "declaration_only": sorted(expected - rows[prop]),
             }
     assert not mismatched, mismatched
+
+
+def test_the_set_property_owner_convention_is_stated_in_both_homes() -> None:
+    """The ``id`` row's convention must be stated where the row is read.
+
+    ``SESSION_PROPERTY_OWNERS["id"]`` names only ``rebuild_all`` while ten
+    declared writers mint the node with ``MERGE (s:Session {id: …})`` — and the
+    module's grouping comment filed ``id`` under "identity + capture shape (the
+    shared primitive, #3551)", the opposite of the derived table. The doc pin
+    cannot catch it: it compares §4.8 against the same declaration, so both
+    sides agree on the (incomplete) answer. This pins the CONVENTION: an owner
+    is a ``SET <alias>.<prop>`` writer; a ``MERGE`` key is not attributed.
+    Pre-fix this test fails — no home stated it.
+    """
+    src = (REPO_ROOT / "tortoise/session_schema.py").read_text(encoding="utf-8")
+    assert "MERGE key is not a `SET" in src, (
+        "the SESSION_PROPERTIES grouping must say why `id` is not filed with "
+        "the capture shape")
+    assert "identity + capture shape" not in src, (
+        "the pre-fix grouping comment claimed the capture primitive owns the "
+        "Session identity, which the derived owner table contradicts")
+    assert "MERGE`` key is NOT attributed" in (
+        session_schema.session_property_owners.__doc__ or ""), (
+        "session_property_owners() must state that a MERGE key is not an owner")
+    assert "MERGE` key is **not** attributed" in _session_section(), (
+        "docs/ONTOLOGY.md §4.8 must state the convention its `id` row uses, so a "
+        "reader is not told a replay restore owns the Session identity")
 
 
 def test_fold_session_recorded_declares_every_property_it_writes() -> None:

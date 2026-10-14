@@ -987,6 +987,37 @@ def test_the_blog_authoring_doc_guard_runs_on_its_doc_too():
     )
 
 
+def test_the_session_declaration_guard_runs_on_its_docs_subjects_too():
+    """#3554 review (P2, Finding 2): the guard's `docs/` subjects must select it.
+
+    `test_session_schema_3554.py` pins `docs/ONTOLOGY.md` §4.8's owner table
+    against the machine declaration and reads the plan's `#3554 amendment`. Both
+    are `docs/` paths: `docs/` is in NON_PYTHON_PREFIXES and neither is a
+    concrete SOURCE_PATTERNS entry, so a docs-only edit selected NO surface
+    (`surfaces=[]`) and fell back to tier-1 smoke — whose set does not contain
+    this file. A §4.8 edit could then drop an owner and merge green against the
+    declaration it claims to be pinned to. Same silent-drop class as the #3524
+    consent-bridge records; the `core` registration alone cannot fix it, because
+    a name in a surface's test_files only runs when that surface is ALREADY
+    selected.
+    """
+    root = Path(__file__).resolve().parents[1]
+    for changed in ("docs/ONTOLOGY.md",
+                    "docs/plans/2026-08-25-1714-memory-capture-onboarding.md"):
+        assert (root / changed).exists(), f"guarded doc subject is gone: {changed}"
+        r = _sel([changed])
+        assert r["full"] is False
+        assert "core" in r["surfaces"], (
+            f"{changed} selects {r['surfaces']} — the guard is not in tier1, so "
+            "a docs-only edit to this record runs it nowhere"
+        )
+        assert "test_session_schema_3554.py" in r["test_files"], (
+            f"a docs-only edit to {changed} does not run "
+            "tests/test_session_schema_3554.py, so its declaration mirror cannot "
+            "fire on the change it pins (#3554 review)"
+        )
+
+
 def test_session_import_change_selects_the_window_guard():
     """#3575 P1-A: `tortoise/session_import/` maps to no named surface, so a
     parsers.py change selects `core` via the fallback. The window guard must be

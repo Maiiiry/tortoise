@@ -160,23 +160,118 @@ def _client_matchers() -> tuple[re.Pattern[str], ...]:
     # ``fetch`` (either side of the route, so source order cannot hide it), and
     # ``method="POST"`` or ``data=`` for urllib's ``Request`` (``data=``
     # implies POST) (#3554 review).
+    # The gaps are line-scanning (``[\s\S]*?``) rather than line-bounded
+    # (``[^)]*``) because the CALL is what is scoped, not the line: a
+    # Prettier-formatted ``fetch(url, {\n  method: "POST",\n …\n})`` puts the
+    # POST evidence on its own line, and ``[^)]*`` also refuses to cross a
+    # nested call's ``)`` (``fetch(buildUrl(route), {method: "POST"})``). The
+    # caller slices a BALANCED call span for JS/TS (:func:`_call_spans`) and
+    # the whole source span for Python, so the matchers run over the call —
+    # a per-line loop made a multi-line ``fetch`` POST invisible and
+    # ``inventory`` print INVENTORY CLEAN with an undeclared client present
+    # (#3554 review).
+    gap = r"[\s\S]*?"
     return (
         # TS/JS: post(cfg, "/v1/sessions", ...)
-        re.compile(rf"""\bpost\s*\([^)]*["'`][^"'`]*{route}"""),
+        re.compile(rf"""\bpost\s*\({gap}["'`][^"'`]*{route}"""),
         # fetch(url, {method: "POST", …}) — the method after the route …
-        re.compile(rf"""\bfetch\s*\([^)]*["'`][^"'`]*{route}[^)]*"""
+        re.compile(rf"""\bfetch\s*\({gap}["'`][^"'`]*{route}{gap}"""
                    rf"""method\s*:\s*["'`]POST"""),
         # … and the same call with the method spelled before the route.
-        re.compile(rf"""\bfetch\s*\([^)]*method\s*:\s*["'`]POST[^)]*"""
+        re.compile(rf"""\bfetch\s*\({gap}method\s*:\s*["'`]POST{gap}"""
                    rf"""["'`][^"'`]*{route}"""),
         # Python: requests.post(...) / Request(url, data=… | method="POST")
-        re.compile(rf"""\.post\s*\([^)]*["'`f][^"'`]*{route}"""),
-        re.compile(rf"""Request\s*\([^)]*["'`f][^"'`]*{route}[^)]*"""
+        re.compile(rf"""\.post\s*\({gap}["'`f][^"'`]*{route}"""),
+        re.compile(rf"""Request\s*\({gap}["'`f][^"'`]*{route}{gap}"""
                    rf"""(?:method\s*=\s*["']POST|data\s*=)"""),
         # curl with an explicit POST
         re.compile(rf"""curl\b[^\n]*(-X\s*POST|--request\s+POST)[^\n]*{route}"""),
         re.compile(rf"""curl\b[^\n]*{route}[^\n]*(-X\s*POST|--request\s+POST)"""),
     )
+
+
+#: The call tokens the non-Python half scopes its matchers on. A ``fetch`` /
+#: ``post`` / ``Request`` call is sliced as a BALANCED SPAN (see
+#: :func:`_call_spans`) rather than matched on a single physical line, so the
+#: route and its POST evidence may sit on DIFFERENT lines — the shape a
+#: formatter produces for ``fetch(url, {\n  method: "POST",\n …\n});``, and
+#: the shape that made the POST requirement a per-line gate (#3554 review).
+_CALL_TOKEN_RE = re.compile(r"\b(?:fetch|post|Request)\s*\(")
+
+
+def _balanced_span(text: str, open_idx: int) -> int:
+    """Index one past the ``)`` that closes ``text[open_idx] == '('``.
+
+    String-literal aware (single, double and backtick quotes), so a ``)``
+    inside a body or a URL does not close the call early —
+    ``fetch(url, {body: ")"})`` is one call, not one and a half. Returns
+    ``-1`` for an unbalanced tail (a truncated file), which the caller skips
+    rather than mis-slicing.
+    """
+    depth = 0
+    quote = ""
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _call_spans(text: str) -> list[tuple[int, str]]:
+    """Every balanced ``fetch(``/``post(``/``Request(`` call in ``text``.
+
+    Yields ``(1-based line of the token, the call's own source)``. This is
+    what makes the JS/TS half CALL-scoped: pre-fix it matched each PHYSICAL
+    line, so a multi-line POST — the idiomatic Prettier spelling — was
+    invisible and ``inventory`` printed INVENTORY CLEAN with an undeclared
+    client present, the fail-OPEN direction of a guard whose whole purpose is
+    to be trusted (#3554 review).
+    """
+    spans: list[tuple[int, str]] = []
+    for match in _CALL_TOKEN_RE.finditer(text):
+        end = _balanced_span(text, match.end() - 1)
+        if end < 0:
+            continue
+        spans.append((text.count("\n", 0, match.start()) + 1,
+                      text[match.start():end]))
+    return spans
+
+
+def _logical_lines(text: str) -> list[tuple[int, str]]:
+    """Shell logical lines: a ``\\``-continued command is ONE line.
+
+    ``curl`` is the one transport with no parens to balance, so a wrapped
+    command (``curl \\\n  -X POST \\\n  …/v1/sessions``) hid the POST evidence
+    from the per-line matchers exactly the way the multi-line ``fetch`` hid it
+    (#3554 review). The line number reported is the command's FIRST line.
+    """
+    out: list[tuple[int, str]] = []
+    buf, start = "", 0
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        if not buf:
+            start = idx
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1] + " "
+            continue
+        out.append((start, buf + raw))
+        buf = ""
+    if buf:
+        out.append((start, buf))
+    return out
 
 
 @dataclass
@@ -504,6 +599,13 @@ def scan_http_clients(root: Path) -> list[Site]:
     pins the call site inside the file, so a row cannot survive the call
     being deleted — the marker assertion is in the test, and the file-level
     diff here catches a file nobody declared.
+
+    The match itself is CALL-scoped, not line-scoped: a Python site is sliced
+    from its AST call span and a JS/TS site from its balanced call
+    (:func:`_call_spans`), so a POST whose route and ``method: "POST"`` sit
+    on different lines is still a site — pre-fix only the physical line was
+    tested and a formatted multi-line ``fetch`` POST was invisible
+    (#3554 review).
     """
     sites: list[Site] = []
     matchers = _client_matchers()
@@ -539,10 +641,19 @@ def scan_http_clients(root: Path) -> list[Site]:
                     comment = _owner_of(index.scopes, node.lineno)
                     break
         else:
-            for idx, raw in enumerate(text.splitlines(), start=1):
-                if any(rx.search(raw) for rx in matchers):
-                    line = idx
-                    comment = raw.strip()[:60]
+            # CALL-scoped, not line-scoped: the route and its POST evidence
+            # may be on different lines (see :func:`_call_spans`). A shell
+            # transport has no call parens, so backslash-continued logical
+            # lines are scanned too — a wrapped `curl` is one command. The
+            # logical lines are emitted for EVERY non-Python file, not only
+            # `.sh`: they are a strict SUPERSET of the pre-fix per-physical-line
+            # scan, so the call scoping can only ADD sites, never lose one a
+            # `curl`-in-a-`.js`-string would have matched before.
+            spans = _call_spans(text) + _logical_lines(text)
+            for span_line, span in sorted(spans):
+                if any(rx.search(span) for rx in matchers):
+                    line = span_line
+                    comment = span.strip()[:60]
                     break
         if not line:
             continue
