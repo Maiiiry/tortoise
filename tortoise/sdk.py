@@ -2726,9 +2726,12 @@ def _journal_record_payload(event: dict) -> dict:
     (``_create_entity`` and ``_journal_entity_event``), so the record's PAYLOAD
     is byte-identical to the live event's payload. The RECORD is not: the
     envelope keys above are added by ``_emit_event`` after this call, and the
-    fold re-derives ``ingestedAt``/``updatedAt`` at replay. A caller prop whose
-    NAME collides with an envelope key is dropped here while the LIVE fold
-    keeps it — the live ≠ replay residue tracked as #8553.
+    fold re-derives ``ingestedAt``/``updatedAt`` at replay. For an envelope name
+    a write door does NOT drop from the live event, the caller prop survives
+    LIVE while this strips it — the live ≠ replay residue tracked as #8553.
+    ``recorded_ts`` is NOT in that residue: it is an `_emit_event` parameter
+    name and is dropped from the live event at both doors that can emit it
+    (``_create_entity`` and ``create_source``).
     """
     return {k: v for k, v in event.items() if k not in _JOURNAL_ENVELOPE_KEYS}
 
@@ -5458,11 +5461,13 @@ class TortoiseSDK:
         ``ObjectSuperseded``. Promoting the name to a named parameter silently
         REMOVES it from that payload — a client-visible change to a durable
         artifact (``poll_events`` returns the payload verbatim), invisible to
-        every existing test. No existing caller passes ``recorded_ts``, so the
-        default path is additive in the strict sense: every existing caller's
-        envelope, graph payload and JSONL record are byte-identical. It is a
-        RESERVED envelope name (``_JOURNAL_ENVELOPE_KEYS``), stripped by the
-        entity doors — a caller prop of that name must never bind this
+        every existing test. No caller passes a PROP named ``recorded_ts`` (the
+        parameter itself IS passed by the SDK's own callers, ``retract_point`` /
+        ``invalidate_point``), so the default path is additive in the strict
+        sense: every existing caller's envelope, graph payload and JSONL record
+        are byte-identical. It is a RESERVED envelope name
+        (``_JOURNAL_ENVELOPE_KEYS``), dropped by the entity doors and by
+        ``create_source``, so a caller prop of that name cannot bind this
         parameter and forge the recorded instant (#2296 review). A caller that
         passes BOTH keeps the old ``event.update(extra)`` precedence.
         """
@@ -27921,6 +27926,14 @@ class TortoiseSDK:
                 __import__('datetime').timezone.utc).isoformat(),
             **props,
         }
+        # #2296 review: `recorded_ts` is `_emit_event`'s own PARAMETER (it binds
+        # the envelope `ts`). This door emits its OWN record (`SourceCreated` /
+        # `SourceVersioned`) and does not go through `_journal_entity_event`, so
+        # `_create_entity`'s live pop cannot cover it — a caller prop of that
+        # name would bind the parameter and forge the record's envelope `ts`.
+        # Envelope-reserved: drop it (same semantics as point/payload in
+        # `_create_entity`).
+        ev.pop("recorded_ts", None)
         if is_episodic is not None:
             # #1488: server-managed quota discriminator — explicit param only
             # (mirrors create_point). The props passthrough is rejected above.

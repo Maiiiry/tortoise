@@ -177,8 +177,11 @@ def test_a_recorded_ts_prop_cannot_forge_the_envelope(env):
     a domain prop. It must not bind the envelope ``ts`` (the record's ts is
     minted by ``_emit_event``), and it must not persist live either — the
     record strips it, so keeping it live would be the #8553 live ≠ replay
-    divergence. FAILS IF ``recorded_ts`` leaves ``_JOURNAL_ENVELOPE_KEYS``
-    (the record's ``ts`` becomes caller-controlled) or the live pop is
+    divergence. Both doors that can emit an entity record are checked:
+    ``create_document`` (via ``_create_entity``'s live pop) and
+    ``create_source`` (which emits its own ``SourceCreated`` and needs its own
+    drop). FAILS IF ``recorded_ts`` leaves ``_JOURNAL_ENVELOPE_KEYS`` (the
+    record's ``ts`` becomes caller-controlled), or either door's live drop is
     removed."""
     sdk, events = env
     forged = "1999-01-01T00:00:00+00:00"
@@ -199,6 +202,14 @@ def test_a_recorded_ts_prop_cannot_forge_the_envelope(env):
     assert "recorded_ts" not in live, (
         "a caller `recorded_ts` prop persisted live while the record strips "
         "it — the #8553 live != replay divergence")
+    # The Source door emits its OWN record (`SourceCreated`) and does not route
+    # through `_journal_entity_event`, so it needs its own drop.
+    sdk.create_source("https://example.com/rt", "document",
+                      recorded_ts=forged, summary="rt")
+    src_rec = next(e for e in _journal(events)
+                   if e.get("type") == "SourceCreated")
+    assert src_rec["ts"] != forged, (
+        "a caller `recorded_ts` prop forged the SourceCreated record's ts")
 
 
 def test_document_mutation_survives_rebuild(env):
