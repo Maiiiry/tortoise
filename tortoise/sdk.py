@@ -9128,10 +9128,12 @@ class TortoiseSDK:
         (#6131).
 
         Note what this path does NOT do: unlike ``create_operator``, which returns
-        a structured ``undeclared_relation`` warning when no installed pack
-        declares the predicate, ``update(<operator_id>, label=...)`` performs no
+        a structured ``undeclared_relation`` warning when the predicate is neither
+        a core operator label (``pack_registry.CORE_OPERATOR_LABELS`` — ONTOLOGY
+        §3.9's ``IMPL``/``NAND`` plus §8's semantics vocabulary) nor a predicate an
+        installed pack declares, ``update(<operator_id>, label=...)`` performs no
         declaredness check and installs the label silently. Take valid predicates
-        from ``list_relations()``.
+        from ``list_relations()`` for the pack-declared leg, or the core set above.
 
         Detects the node type by label:
           - Point → point-lifecycle semantics (delegates to update_point):
@@ -9419,7 +9421,7 @@ class TortoiseSDK:
         # silently MISSING from the index-served Point dense leg (#8429) — the
         # write seam exists so a server-owned vector is always the typed,
         # indexable shape. (#8316 has since normalised a right-width `List` at
-        # the READ boundary, so the "expected Null or VectorF32 but was List"
+        # the READ boundary, so the "expected Null or Vectorf32 but was List"
         # abort this comment used to cite no longer happens for the right-width
         # case; a wrong-width or non-numeric value still aborts the MATCH —
         # #8430.) That is the #4521 class on the LIVE path
@@ -10960,23 +10962,32 @@ class TortoiseSDK:
         sorts FIRST — before every dated entry — never as the newest belief
         (#3654).
 
-        NOTE: ``limit`` currently truncates on an ASCENDING window
-        (``ORDER BY p.validFrom LIMIT``), so it selects the OLDEST rows and a
-        small ``limit`` will NOT return the current belief. That is a
-        pre-existing defect tracked separately (#7293), not a property this
-        ordering guarantees — the order below is not a promise of a
-        newest-end window.
+        ``limit`` is a NEWEST-END window: it returns at most the newest
+        ``limit`` entries of the chain — the current belief is the last of
+        them — never the oldest (#7293).
         """
         if limit < 1:
             raise ValueError(f"limit must be >= 1, got {limit}")
         proj = self._get_proj()
+        # The DB window MUST be taken from the NEWEST end (#7293). The former
+        # `ORDER BY p.validFrom LIMIT` was ASCENDING, so it truncated to the
+        # OLDEST rows and the `entries[-limit:]` tail below could only re-take
+        # the tail of an already-oldest set — `limit=1` returned the earliest
+        # belief, not the current one.
+        #
+        # FalkorDB orders NULL LAST ascending and FIRST descending (measured
+        # on four points, #7293): a bare `validFrom DESC` would pull an undated
+        # row — the OLDEST belief per §4.7 — into a small window and could
+        # evict the genuinely newest dated point. `(p.validFrom IS NULL)` sorts
+        # `false` (dated) before `true` (undated), so this DESC window is
+        # newest-dated first, undated last, matching the Python global sort.
         rows = proj.g.query(
             "MATCH (p:Point {pointKind:'decision'})-[:aboutObject]->"
             "(o:Object) "
             "WHERE (p.is_operator IS NULL OR p.is_operator = false) "
             "AND (o.name = $topic OR o.canonical_name = $topic) "
             "RETURN p.id, p.content, p.validFrom, p.status, p.outdated "
-            "ORDER BY p.validFrom LIMIT $limit",
+            "ORDER BY (p.validFrom IS NULL), p.validFrom DESC LIMIT $limit",
             params={"topic": topic, "limit": limit},
         ).result_set
         entries = [list(r) for r in rows]
@@ -11467,8 +11478,15 @@ class TortoiseSDK:
         # #1934 (epic #1891 slice 3): relation-level write validation —
         # warn-not-block (governance D1/D2). An undeclared domain label is
         # warned (structured) and the write proceeds; the violations event
-        # feeds the future governance app. Consults the pack registry's
-        # declared relation predicates — the ladder is no longer dead config.
+        # feeds the future governance app.
+        #
+        # #7551: the declared set is the CORE operator-label vocabulary
+        # (`pack_registry.CORE_OPERATOR_LABELS` — the §3.9 mechanism pair plus
+        # the closed §8 semantics vocabulary) UNIONED with every pack-declared
+        # relation predicate. It used to be pack relations alone, so EVERY core
+        # predicate read as undeclared and the warning carried no information:
+        # `supports` — the graph's own evidence→claim convention — warned
+        # exactly like an invented name, which is how `measures` accumulated.
         #
         # #2030 (verified, NOT a bug): relation predicates are declared and
         # matched BARE by contract — manifests declare bare `relations[]
@@ -11484,15 +11502,16 @@ class TortoiseSDK:
         if label:
             from tortoise.domain_loader import _get_registry
             from tortoise.enforcement import emit_violation, warning_for_relation
+            from tortoise.pack_registry import CORE_OPERATOR_LABELS
             reg = _get_registry()
-            declared = set()
+            declared = set(CORE_OPERATOR_LABELS)
             if reg is not None:
-                declared = {r.get("predicate") for r in reg.list_relations()}
-            # #4937: the generic operator menu is IMPL/NAND (+ pack-declared
-            # relations) — MITIGATES is NOT a built-in operator label. A
-            # caller spelling it here gets the undeclared-relation warning
-            # instead of a silent peer spelling of mitigation.
-            if label not in declared and label not in ("IMPL", "NAND"):
+                declared |= {r.get("predicate") for r in reg.list_relations()}
+            # #4937: MITIGATES is NOT a built-in operator label — it is absent
+            # from both legs above, so a caller spelling it here gets the
+            # undeclared-relation warning instead of a silent peer spelling of
+            # mitigation.
+            if label not in declared:
                 warnings.append(warning_for_relation(label))
                 emit_violation(code="undeclared_relation", relation=label,
                                detail=f"op_type={op_type}")
@@ -25017,7 +25036,7 @@ class TortoiseSDK:
                 #     Decimal/numpy reaches this point — the write guard refuses
                 #     the rest);
                 #   * keys the write did NOT apply are absent, so replay never
-                #     overwrites the typed VectorF32 the upsert created
+                #     overwrites the typed Vectorf32 the upsert created
                 #     (`properties(n)` returns a vector as a plain list;
                 #     re-applying it would demote it and break the vector leg).
                 if "name" in props:
