@@ -159,6 +159,9 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "the vector trace is cited as unable to tell an index hit from a scan": (
         "cannot distinguish an index hit from a table scan"
     ),
+    "the direction-sourcing gap is cited as `#7813`'s and still open": (
+        "(#7813) — a separate, still-open gap"
+    ),
 }
 
 #: Sibling passages that must POSITIVELY state the landed fact. The retracted-only

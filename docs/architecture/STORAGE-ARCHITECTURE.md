@@ -1003,7 +1003,7 @@ d = 384, M = 16 → 1,830 B ≈ 1.79 KB/vector
 
 **⚠️ The mechanism, and it is a drift, not an oversight:** `#172` (`[P1][bug] run_vector_query lacks entity_type`, closed 2026-08-06) made the **query label dynamic** — `label = entity_type.capitalize()`. **The index creation was never made dynamic**; `_ensure_indexes()` still carries the literal `'Point'`. **So the query side advertises four entity types the index side never created — and by making those paths return rows, the fix also made the gap invisible.**
 
-**⇒ Filed as `#4997` — CLOSED `COMPLETED`.** ⚠️ REFRAMED 2026-09-24 (owner): the *"stop storing OR index them"* framing was a FALSE CHOICE.** The third option is better than either: **keep the vectors, make them searchable, and put them where RAM is cheap — i.e. this is the SAME decision as V1.** See §12.1c. **The one defect that is NOT gated on V1 was filed as `#4999` — CLOSED `COMPLETED` (PR `#5159`):** the trace then reported `ok` for a full scan, so degradation was unobservable to any caller — **the same shape as a silently-switched backend:** the system keeps working, more expensively, and nothing says so. **Fixing `#4997` would not have fixed it** — a future missing index, or a future linear-scan wall, would have reported `ok` too.
+**⇒ Filed as `#4997` — CLOSED `COMPLETED`. ⚠️ REFRAMED 2026-09-24 (owner): the *"stop storing OR index them"* framing was a FALSE CHOICE.** The third option is better than either: **keep the vectors, make them searchable, and put them where RAM is cheap — i.e. this is the SAME decision as V1.** See §12.1c. **The one defect that is NOT gated on V1 was filed as `#4999` — CLOSED `COMPLETED` (PR `#5159`):** the trace then reported `ok` for a full scan, so degradation was unobservable to any caller — **the same shape as a silently-switched backend:** the system keeps working, more expensively, and nothing says so. **Fixing `#4997` would not have fixed it** — a future missing index, or a future linear-scan wall, would have reported `ok` too.
 
 **★ Practical footnote for `:Source`:** `Source` carries **no** embedding and has **no** vector index — but it **already holds `summary`, `topics`, `url` and `contentHash`**. So §9.4's summary vector would be **indexing an existing field**, and §9.4 ③'s *"identity is URL + content hash"* is **already implemented**. *(Avg `Source.title` = 44 bytes — a Source's own text is tiny, so its 1.5 KB vector would be ~35× its title.)*
 
@@ -1338,7 +1338,7 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 
 **Filed from this document — the tracking issue is named on each bullet:**
 
-- **`aboutObject` as a stored edge vs a derived join** — **`#7948` (OPEN)** — the measurement is DONE (research brief, 2026-09-23) and the answer is SPLIT, which decides it.**
+- **`aboutObject` as a stored edge vs a derived join** — **`#7948` (OPEN)** — the measurement is DONE (research brief, 2026-09-23) and the answer is SPLIT, which decides it.
 
   **The primary search path does NOT read it.** `rg -n 'aboutObject' tortoise/retrieval.py tortoise/search_engine.py tortoise/session_reinjection.py` → **exit 1, zero matches**, case-insensitive. **Hindsight's premise holds for this path.**
 
