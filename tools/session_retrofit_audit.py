@@ -107,6 +107,27 @@ _SESSION_ALIAS_RE = re.compile(r"\(\s*(\w+)\s*:\s*Session\s*[{)$\s]")
 _SESSION_PROP_RE = re.compile(
     r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=(?!=)")
 
+
+def _label_pattern() -> re.Pattern[str]:
+    """Compile the DECLARED label into a whitespace-tolerant matcher.
+
+    Every stage AFTER the prefilter already accepts ``(s: Session {`` — legal
+    Cypher (``oC_NodeLabel : ':' SP? oC_LabelName``), matched by
+    :data:`_SESSION_ALIAS_RE` and by both declared write verbs, each of which
+    spells the colon and the name with ``\\s*``. The prefilter that GATES them
+    used the declaration as an EXACT SUBSTRING (``PREDICATE['label'] not in
+    raw`` / ``":Session" not in text``), so the tolerance was dead and a
+    writer spelled with whitespace after the colon was invisible: ``inventory``
+    printed INVENTORY CLEAN with an undeclared writer present — the fail-OPEN
+    mirror of the false-positive class the tracked-corpus fix removed (#3554
+    review). The pattern is derived from :data:`PREDICATE`'s ``label`` (the
+    declaration), never a private literal here, and it is a SUPERSET of what
+    the alias/verb matchers accept, so the prefilter can only ever ADMIT.
+    """
+    head, _, name = PREDICATE["label"].partition(":")
+    return re.compile(rf"{re.escape(head)}:\s*{re.escape(name)}\b")
+
+
 #: An HTTP POST to the sessions route — a CALL, never a prose mention. The
 #: ROUTE is compiled from :data:`PREDICATE`'s ``client_route`` at scan time (see
 #: :func:`_client_matchers`), so editing the declaration changes what is
@@ -129,13 +150,29 @@ def _client_matchers() -> tuple[re.Pattern[str], ...]:
     into an undeclared "client".
     """
     route = re.escape(PREDICATE["client_route"]) + r"(?![-/\w])"
+    # ``fetch``/``Request`` default to GET, so the route ALONE is not a capture
+    # CALL: ``fetch("/v1/sessions")`` is a READ of the route (the dashboard's
+    # session-list call has exactly this shape) and ``urllib.request.Request(
+    # url)`` is a GET too, so counting either as a client is the same false
+    # positive the decorator/sibling-route matchers already exclude — DRIFT on
+    # a non-site whose only clearable answer is to declare a read as a client.
+    # Both matchers therefore require the POST evidence: ``method: "POST"`` for
+    # ``fetch`` (either side of the route, so source order cannot hide it), and
+    # ``method="POST"`` or ``data=`` for urllib's ``Request`` (``data=``
+    # implies POST) (#3554 review).
     return (
-        # TS/JS: post(cfg, "/v1/sessions", ...) / fetch("…/v1/sessions", …)
+        # TS/JS: post(cfg, "/v1/sessions", ...)
         re.compile(rf"""\bpost\s*\([^)]*["'`][^"'`]*{route}"""),
-        re.compile(rf"""\bfetch\s*\([^)]*["'`][^"'`]*{route}"""),
-        # Python: requests.post(...) / urlopen(Request("…/v1/sessions"))
+        # fetch(url, {method: "POST", …}) — the method after the route …
+        re.compile(rf"""\bfetch\s*\([^)]*["'`][^"'`]*{route}[^)]*"""
+                   rf"""method\s*:\s*["'`]POST"""),
+        # … and the same call with the method spelled before the route.
+        re.compile(rf"""\bfetch\s*\([^)]*method\s*:\s*["'`]POST[^)]*"""
+                   rf"""["'`][^"'`]*{route}"""),
+        # Python: requests.post(...) / Request(url, data=… | method="POST")
         re.compile(rf"""\.post\s*\([^)]*["'`f][^"'`]*{route}"""),
-        re.compile(rf"""Request\s*\([^)]*["'`f][^"'`]*{route}"""),
+        re.compile(rf"""Request\s*\([^)]*["'`f][^"'`]*{route}[^)]*"""
+                   rf"""(?:method\s*=\s*["']POST|data\s*=)"""),
         # curl with an explicit POST
         re.compile(rf"""curl\b[^\n]*(-X\s*POST|--request\s+POST)[^\n]*{route}"""),
         re.compile(rf"""curl\b[^\n]*{route}[^\n]*(-X\s*POST|--request\s+POST)"""),
@@ -408,16 +445,21 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
 def scan_graph_writers(root: Path) -> list[Site]:
     """Half 1 — every Python literal that WRITES a ``:Session`` node."""
     sites: list[Site] = []
+    # Compiled from the DECLARED label (whitespace-tolerant) so the prefilter
+    # can only ever admit a superset of what the alias/verb matchers below
+    # accept — an exact-substring test here was the binding stage and made the
+    # predicate's own tolerance dead (#3554 review).
+    label = _label_pattern()
     for path in _iter_source(root, PY_EXTENSIONS):
         try:
             raw = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        # The site is a LITERAL containing ``:Session``, so a file whose text
-        # never mentions the label cannot hold one. Without this prefilter the
+        # The site is a LITERAL containing the label, so a file whose text
+        # never mentions it cannot hold one. Without this prefilter the
         # scan ``ast.parse``s every ``.py`` under the roots (hundreds of files)
         # on every run — the dominant cost of a scan the inventory test runs.
-        if PREDICATE["label"] not in raw:
+        if not label.search(raw):
             continue
         try:
             tree = ast.parse(raw)
@@ -428,7 +470,7 @@ def scan_graph_writers(root: Path) -> list[Site]:
             if id(node) in index.docstrings:
                 continue
             text = node.value
-            if ":Session" not in text:
+            if not label.search(text):
                 continue
             match = _SESSION_ALIAS_RE.search(text)
             if not match:

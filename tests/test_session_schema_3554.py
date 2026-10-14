@@ -330,6 +330,45 @@ def test_docstring_mention_is_not_a_writer_site(tmp_path: Path) -> None:
         "tortoise/real_writer.py::QUERY"}
 
 
+def test_label_prefilter_admits_every_spelling_the_predicate_matches(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prefilter is a SUPERSET of the alias/verb matchers, never a gate.
+
+    ``(s: Session {`` is legal Cypher (``oC_NodeLabel : ':' SP? oC_LabelName``)
+    and every stage AFTER the prefilter accepts it — :data:`_SESSION_ALIAS_RE`
+    and both declared write verbs spell the colon with ``\\s*`` — but the
+    prefilter that GATES them tested the declaration as an EXACT SUBSTRING, so
+    the tolerance was dead: a writer spelled with whitespace after the colon
+    was invisible and ``inventory`` printed INVENTORY CLEAN with an undeclared
+    writer present, the fail-open mirror of the false-positive class the
+    tracked-corpus fix removed. Pre-fix this test fails: no site is found.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "spaced.py").write_text(
+        'QUERY = "MERGE (s: Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    assert {s.key for s in audit.scan_graph_writers(tmp_path)} == {
+        "tortoise/spaced.py::QUERY"}
+    # …and the prefilter is still the DECLARED label, not "admit everything":
+    # a different label name is not a site (the ``\\b`` is load-bearing).
+    (pkg / "spaced.py").write_text(
+        'QUERY = "MERGE (s: Sessionish {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    assert audit.scan_graph_writers(tmp_path) == []
+    # …and the pattern is compiled from the DECLARATION, not a private literal:
+    # moving the declared label makes the prefilter stop admitting the site it
+    # just admitted (a hardcoded ``:Session`` here would keep finding it).
+    monkeypatch.setitem(audit.PREDICATE, "label", ":Other")
+    monkeypatch.setitem(audit.PREDICATE, "write_verbs",
+                        (r"MERGE\s*\(\s*<alias>\s*:\s*Session",
+                         r"\bSET\s+<alias>\."))
+    (pkg / "spaced.py").write_text(
+        'QUERY = "MERGE (s: Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    assert audit.scan_graph_writers(tmp_path) == []
+
+
 def test_route_definition_and_sibling_routes_are_not_client_sites(
         tmp_path: Path) -> None:
     """Only a CALL to the capture route is a client; its definition is not.
@@ -358,6 +397,41 @@ def test_route_definition_and_sibling_routes_are_not_client_sites(
         encoding="utf-8")
     assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
         "tortoise/capture_client.py"}
+
+
+def test_default_method_reads_of_the_route_are_not_client_sites(
+        tmp_path: Path) -> None:
+    """A GET of the route is not a capture client.
+
+    ``fetch("/v1/sessions")`` and ``urllib.request.Request(url)`` both default
+    to GET, so the route alone is not a capture CALL — a reader (the dashboard's
+    session list uses exactly the ``fetch`` shape) was otherwise a false
+    INVENTORY DRIFT whose only clearable answer is to declare a read as a
+    client. Pre-fix this test fails: both read files are reported as sites.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "list_sessions.js").write_text(
+        'const r = fetch("/v1/sessions");\n', encoding="utf-8")
+    (pkg / "list_sessions.py").write_text(
+        'import urllib.request as u\n'
+        'def list_sessions(base):\n'
+        '    return u.urlopen(u.Request(f"{base}/v1/sessions"))\n',
+        encoding="utf-8")
+    assert audit.scan_http_clients(tmp_path) == []
+    # …and the POST shapes are still sites, so the assertion above cannot pass
+    # by deleting the two matchers: the POST evidence is what decides.
+    (pkg / "post_sessions.js").write_text(
+        'const r = fetch("/v1/sessions", { method: "POST", body: "{}" });\n',
+        encoding="utf-8")
+    (pkg / "post_sessions.py").write_text(
+        'import urllib.request as u\n'
+        'def post_sessions(base, payload):\n'
+        '    return u.urlopen(u.Request(f"{base}/v1/sessions", data=payload,\n'
+        '                               method="POST"))\n',
+        encoding="utf-8")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/post_sessions.js", "tortoise/post_sessions.py"}
 
 
 def test_inventory_cli_reports_clean_and_exits_zero(

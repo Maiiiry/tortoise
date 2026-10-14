@@ -689,11 +689,13 @@ def iter_declared_properties() -> Iterable[str]:
 #: keys on. Declared HERE, next to the inventory it proves, so the tool cannot
 #: silently widen OR narrow its own predicate without the same reviewed diff
 #: that changes this dict: the scanner COMPILES :data:`PREDICATE`'s
-#: ``write_verbs`` (binding ``<alias>`` to the variable in the matched literal)
-#: AND its ``client_route`` (anchored to the route's full terminal segment),
-#: and walks the TRACKED tree minus the path prefixes in ``excluded`` and the
-#: directory names in ``skip_parts``. The scope is the predicate, not a private
-#: allow-list inside the tool: an allow-list let a new ``:Session`` writer
+#: ``label`` (whitespace-tolerant, so the LABEL gate is a superset of the alias
+#: and verb matchers rather than an exact-substring test that rejects legal
+#: Cypher), ``write_verbs`` (binding ``<alias>`` to the variable in the matched
+#: literal) AND its ``client_route`` (anchored to the route's full terminal
+#: segment), and walks the TRACKED tree minus the path prefixes in ``excluded``
+#: and the directory names in ``skip_parts``. The scope is the predicate, not
+#: a private allow-list inside the tool: an allow-list let a new ``:Session`` writer
 #: under an unlisted directory print INVENTORY CLEAN, the fail-open direction
 #: of a guard whose whole purpose is to be trusted (#3554 review). Comments are
 #: excluded by construction — the scan is AST-based, so a Cypher write shape in
