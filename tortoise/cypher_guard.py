@@ -594,6 +594,12 @@ def _predicate_drop_barrier(cypher: str) -> str:
 #: is emitted for ``>= 6.0.0`` — and for an UNREADABLE version, because the
 #: barrier is a measured no-op on the engines that already bind while a missing
 #: barrier is a SILENT filter bypass. A wrong probe must never be a false CLEAN.
+#: One MEASURED exception to "no-op on the engines that bind": on 4.20.4 a
+#: PATTERN-predicate shape — a `WHERE` whose predicate is itself a relationship
+#: pattern, followed by a second `MATCH` that binds the pattern's endpoint — IS
+#: rewritten and then errors (``Unable to resolve filtered alias 'a'``). It is
+#: reachable ONLY through the UNREADABLE-version path above — a readable 4.20.4
+#: shuts this gate — so the gate, not the normaliser, keeps that shape safe.
 _PREDICATE_DROP_AFFECTED_FROM = (6, 0, 0)
 _ENGINE_VERSION_MARKER = "_tortoise_falkordb_engine_version"
 
@@ -692,8 +698,9 @@ def _engine_needs_predicate_barrier(client) -> bool:
     assumed per call site (the gap that let 27 hand-patched literals coexist with
     an engine that still drops the predicate). An UNREADABLE version is treated
     as affected: the barrier is a measured no-op on the engines that already
-    bind, while a missing barrier is a SILENT filter bypass — a wrong probe must
-    never be a false CLEAN.
+    bind (with ONE measured 4.20.4 pattern-predicate exception — see
+    ``_PREDICATE_DROP_AFFECTED_FROM``), while a missing barrier is a SILENT
+    filter bypass — a wrong probe must never be a false CLEAN.
     """
     version = _engine_module_version(client)
     # Anything that is not a decoded integer triple is UNKNOWN, and UNKNOWN gets
