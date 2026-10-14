@@ -306,7 +306,7 @@ caller behind them):
 
 | Site / seam | Covers |
 |---|---|
-| `test_commit_endpoint.py::_commit` | every hosted-app `/v1/sessions/commit` POST in the file — the seam plus the direct posts in `test_failed_write_retry_applies_the_counters_once`, `TestLayer1`, the 401 and body-cap sites (#4627's own reproducer) |
+| `test_commit_endpoint.py::_commit` + its eight direct-post bodies | every hosted-app `/v1/sessions/commit` POST in the file — the seam plus the direct posts in `test_failed_write_retry_applies_the_counters_once`, `TestLayer1`, the 401 and body-cap sites (#4627's own reproducer). Those eight bypass the seam, so each is named individually in the registry (#8579 review P3 — pinning `_commit` alone left them unpinned) |
 | `test_github_index_lifecycle.py::_poll_until` + `_post_index` | the file's whole poll path (`GET /v1/index/github/<id>` including the pump-and-observe loops) AND every `POST /v1/index/github[/re-poll]` call site through one seam — the direct posts left unwrapped were the `KeyError: 'job_id'` mode (#8579 P3-2) |
 | `test_index_docs_api.py::_poll_until` | the file's whole `_poll_until` path, plus the pump-and-observe polls in `test_docs_live_progress_written_during_walk` and `test_docs_live_progress_all_branches_site` |
 | `test_capture_loop_responsiveness.py::_measure_capture_graph_work` | the measured `#3086` capture through **both** callers (`_measure_on_loop_graph_work` and the direct schema-bootstrap caller) — the LOWER seam, not the wrapper |

@@ -702,7 +702,19 @@ _CONVERTED_SITES: dict[str, frozenset[str]] = {
         {"test_hosted_capture_emits_that_session_s_measured_cost_row"}),
     "tests/test_capture_loop_responsiveness.py": frozenset(
         {"_measure_capture_graph_work"}),
-    "tests/test_commit_endpoint.py": frozenset({"_commit"}),
+    # `_commit` is the seam, but eight bodies post directly and so bypass it —
+    # each is a converted site in its own right (#8579 review P3).
+    "tests/test_commit_endpoint.py": frozenset({
+        "_commit",
+        "test_failed_write_retry_applies_the_counters_once",
+        "test_missing_required_field_400",
+        "test_missing_client_commit_id_400",
+        "test_commit_id_mismatch_422",
+        "test_401_unauthenticated",
+        "test_commit_oversized_chunked_413",
+        "test_commit_malformed_400_preserved",
+        "test_commit_empty_400_preserved",
+    }),
     "tests/test_github_index_lifecycle.py": frozenset(
         {"_poll_until", "_post_index", "test_progress_beat_stamps_heartbeat",
          "test_live_progress_written_during_walk"}),
