@@ -1326,7 +1326,7 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 | §9.2 PR / Object / Event | `#1844` | object-only sources; the anchor is a document, **never an event** |
 | §10.1 relocation | `#4240` | the hot table stays the working set — which is the invariant this document rests on |
 | §10.2 allowlist | — | a reusable correctness rule (no issue needed) |
-| §12.1b unindexed embeddings | ⭐ **`#4997`** | **only `:Point` has a vector index; `Object`/`Event` full-scan and report `ok`; 19 MB stored unindexed** |
+| §12.1b unindexed embeddings | ⭐ **`#4997`** · **`#4999`** | **only `:Point` has a vector index; `Object`/`Event` full-scan (`leg_trace.reason` remains `ok`; since PR `#5159` the entry also carries the `mechanism` — `#4999` CLOSED `COMPLETED`); 19 MB stored unindexed — and the unindexed-embeddings defect itself is still LIVE, homed on the V1/§12.1c decision** |
 | §12.2c vector vs traversal | ⭐ **`#4997`** · `#2730` | **the entity vector is an ENTRY/RESOLUTION key, never the reasoning mechanism — and our Objects have no description to embed** |
 | §9.4 source summary vector | — | **needs a ruling (V2); `Source` already carries `summary`, `topics`, `url`, `contentHash`** |
 | §9.6 source versioning | — | **the version must be recorded on the extraction link as `sourceVersion`**; a version costs **three timestamps + a hash** (D30 keeps content out of the graph) — **bound it: windows and hashes only, never content copies** |

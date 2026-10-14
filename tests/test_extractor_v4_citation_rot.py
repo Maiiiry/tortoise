@@ -175,6 +175,9 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "the §14.3 V4 row is cited as still unable to tell an index hit from a full scan": (
         "the trace cannot tell an index hit from a full scan"
     ),
+    "the §13 §12.1b row is cited as a full scan reporting `ok` with no mechanism": (
+        "`Object`/`Event` full-scan and report `ok`"
+    ),
     "the §12.1b observability defect is cited as a separate, still-open filing": (
         "is filed separately as `#4999`"
     ),
