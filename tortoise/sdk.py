@@ -2730,8 +2730,9 @@ def _journal_record_payload(event: dict) -> dict:
     a write door does NOT drop from the live event, the caller prop survives
     LIVE while this strips it — the live ≠ replay residue tracked as #8553.
     ``recorded_ts`` is NOT in that residue: it is an `_emit_event` parameter
-    name and is dropped from the live event at both doors that can emit it
-    (``_create_entity`` and ``create_source``).
+    name, stripped at prop INTAKE (``_sanitize_props``) so it can never be bound
+    to that parameter, and popped explicitly by the doors that bypass intake
+    (``create_source``) or emit unconditionally (``_create_entity``).
     """
     return {k: v for k, v in event.items() if k not in _JOURNAL_ENVELOPE_KEYS}
 
@@ -2919,6 +2920,24 @@ def _sanitize_props(props: dict, *, reject_id: bool = False,
             _logger.warning(
                 "ignoring client-supplied %r on tenant props", _reserved)
             props.pop(_reserved)
+    # #2296 review: `recorded_ts` is `_emit_event`'s own PARAMETER name, and
+    # Python binds a `**props` key to a named parameter AT THE CALL — so every
+    # door that splats caller props into `_emit_event` (`update_point` splats
+    # straight through) turns the prop into the RECORDED instant and forges the
+    # record's envelope `ts`; `_emit_event` cannot see the collision from
+    # inside. Strip it HERE, at the one intake every props surface passes
+    # through (`create_point`/`update_point`/`create_entity`/`update_entity`),
+    # rather than at each emitting door — the same fix shape #5196 used for the
+    # parameter spelling of the index-merge run token, after a per-door patch
+    # left this class of door open. Strip-and-ignore, matching the doors that
+    # bypass this intake (`create_source` pops the key itself) and the reserved
+    # actor keys above: it is an ENVELOPE name (`_JOURNAL_ENVELOPE_KEYS`), not a
+    # tenant property, so dropping it also keeps live == replay.
+    if "recorded_ts" in props:
+        _logger.warning(
+            "ignoring client-supplied 'recorded_ts' on tenant props "
+            "(reserved journal-envelope name)")
+        props.pop("recorded_ts")
     # #4647: a value the store cannot hold without altering it must fail here,
     # not be silently clamped/rounded by FalkorDB on the way in.
     for _key, _value in props.items():
@@ -5461,15 +5480,24 @@ class TortoiseSDK:
         ``ObjectSuperseded``. Promoting the name to a named parameter silently
         REMOVES it from that payload — a client-visible change to a durable
         artifact (``poll_events`` returns the payload verbatim), invisible to
-        every existing test. No caller passes a PROP named ``recorded_ts`` (the
-        parameter itself IS passed by the SDK's own callers, ``retract_point`` /
-        ``supersede_point``), so the default path is additive in the strict
-        sense: every existing caller's envelope, graph payload and JSONL record
-        are byte-identical. It is a RESERVED envelope name
-        (``_JOURNAL_ENVELOPE_KEYS``), dropped by the entity doors and by
-        ``create_source``, so a caller prop of that name cannot bind this
-        parameter and forge the recorded instant (#2296 review). A caller that
-        passes BOTH keeps the old ``event.update(extra)`` precedence.
+        every existing test. The name is RESERVED, and the reservation cannot be
+        enforced HERE: Python binds a ``**props`` key to a named parameter AT
+        THE CALL, so a caller prop of that name becomes *recorded_ts* and forges
+        ``event["ts"]`` — this function cannot observe the collision. The strip
+        therefore happens at prop INTAKE (``_sanitize_props``, the one surface
+        ``create_point``/``update_point``/``create_entity``/``update_entity``
+        all pass through) and explicitly at the doors that bypass intake
+        (``create_source`` pops it) or emit unconditionally (``_create_entity``)
+        — the same all-labels rule those doors apply to ``point``/``payload``.
+        Measured before the intake strip: ``update_point``'s props splat turned
+        the prop into the ``PointRevised`` record's ``ts`` (#2296 review). The
+        name is also in ``_JOURNAL_ENVELOPE_KEYS``, so the record strips it
+        regardless, and ``_ENTITY_MUTATION_RESERVED_KEYS`` already reserved it
+        for the entity-mutation record. With the prop gone before the call, the
+        default path is additive in the strict sense: every existing caller's
+        envelope, graph payload and JSONL record are byte-identical. A caller
+        that passes the parameter explicitly AND a prop named ``ts`` keeps the
+        old ``event.update(extra)`` precedence.
         """
         # ── Graph event store (#432) ──────────────────────────────
         if type_ in _GRAPH_EVENT_TYPES:

@@ -177,12 +177,14 @@ def test_a_recorded_ts_prop_cannot_forge_the_envelope(env):
     a domain prop. It must not bind the envelope ``ts`` (the record's ts is
     minted by ``_emit_event``), and it must not persist live either — the
     record strips it, so keeping it live would be the #8553 live ≠ replay
-    divergence. Both doors that can emit an entity record are checked:
-    ``create_document`` (via ``_create_entity``'s live pop) and
+    divergence. Every emitter that can turn the prop into an envelope ``ts`` is
+    checked: ``create_document`` (via ``_create_entity``'s live pop),
     ``create_source`` (which emits its own ``SourceCreated`` and needs its own
-    drop). FAILS IF ``recorded_ts`` leaves ``_JOURNAL_ENVELOPE_KEYS`` (the
-    record's ``ts`` becomes caller-controlled), or either door's live drop is
-    removed."""
+    drop), and ``update_point`` (which splats caller props straight into
+    ``_emit_event`` — the shared intake strip in ``_sanitize_props`` is what
+    covers it). FAILS IF ``recorded_ts`` leaves ``_JOURNAL_ENVELOPE_KEYS`` (the
+    record's ``ts`` becomes caller-controlled), or the intake strip / either
+    door's live drop is removed."""
     sdk, events = env
     forged = "1999-01-01T00:00:00+00:00"
     # The record side: `recorded_ts` is an `_emit_event` PARAMETER name, so it
@@ -210,6 +212,22 @@ def test_a_recorded_ts_prop_cannot_forge_the_envelope(env):
                    if e.get("type") == "SourceCreated")
     assert src_rec["ts"] != forged, (
         "a caller `recorded_ts` prop forged the SourceCreated record's ts")
+    # The generic update door: `update_point` splats caller props into
+    # `_emit_event` directly, so before the intake strip a prop of this name
+    # bound the `recorded_ts` PARAMETER and forged the `PointRevised` record's
+    # `ts` (measured). `_sanitize_props` is the shared intake it passes through.
+    pt = sdk.create_point("note", "a point")
+    sdk.update_point(pt["id"], recorded_ts=forged, summary="rt")
+    rev = next(e for e in _journal(events)
+               if e.get("type") == "PointRevised")
+    assert rev["ts"] != forged, (
+        "a caller `recorded_ts` prop forged the PointRevised record's ts")
+    pt_live = sdk._get_proj().g.query(
+        "MATCH (n:Point {id:$id}) RETURN properties(n)",
+        params={"id": pt["id"]}).result_set[0][0]
+    assert "recorded_ts" not in pt_live, (
+        "a caller `recorded_ts` prop persisted live on the Point while the "
+        "record strips it — the #8553 live != replay divergence")
 
 
 def test_document_mutation_survives_rebuild(env):
@@ -241,7 +259,7 @@ def test_one_create_is_one_record(env):
 def test_journal_less_sdk_still_creates_the_document(tmp_path):
     """A journal-less SDK still creates the Document — the fix must not require
     a journal. This is the deliberate CONTROL in the pre-fix mutation pass: the
-    other six tests redden when ``DocumentCreated`` is unjournaled, this one
+    other seven tests redden when ``DocumentCreated`` is unjournaled, this one
     stays green because the live create is independent of the record."""
     sdk = TortoiseSDK(str(tmp_path / "nojournal.db"))
     try:
