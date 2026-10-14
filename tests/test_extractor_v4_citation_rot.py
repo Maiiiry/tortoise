@@ -156,6 +156,9 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "the Q5 migration is offered as a free-today window": (
         "fold, change the key, migrate — and it is free today"
     ),
+    "the vector trace is cited as unable to tell an index hit from a scan": (
+        "cannot distinguish an index hit from a table scan"
+    ),
 }
 
 #: Sibling passages that must POSITIVELY state the landed fact. The retracted-only
@@ -166,6 +169,21 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
 #: a combined-text check cannot tell a correction from a relocation, so a landed
 #: passage deleted from one sibling would pass on the strength of the other.
 LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
+    (
+        STORAGE,
+        "STORAGE records the vector-trace mechanism as landed",
+        "the trace now records the mechanism (`index` / `scan` / `scan_fallback`)",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY tracks the direction-sourcing gap as `#7852`",
+        "tracked as `#7852` (`#7813` is CLOSED `COMPLETED`)",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY states `#2421` closed with the triage untracked",
+        "the per-edge triage is NOT yet implemented and has no open tracker",
+    ),
     (
         STORAGE,
         "STORAGE states the `:Document` label as retired",
