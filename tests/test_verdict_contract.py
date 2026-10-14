@@ -13,6 +13,7 @@ These pin the contract's discriminating power:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -43,18 +44,76 @@ from tests._verdict import (
 )
 
 
-def _refusal_response(*, status: int = 504, body: str | None = None):
-    """A canned HTTP response standing in for the hosted API's refusal."""
-    from tortoise import mcp_auth
+def _canned(*, status: int, text: str | None = None,
+            json_body: dict | None = None):
+    """A canned HTTP response; ``json_body`` and ``text`` are the body channels."""
 
     class _Response:
         def __init__(self) -> None:
             self.status_code = status
-            self.text = (
-                mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE if body is None else body
-            )
+            if text is not None:
+                self.text = text
+            elif json_body is not None:
+                self.text = json.dumps(json_body)
+            else:
+                self.text = ""
+
+        def json(self):
+            if json_body is not None:
+                return json_body
+            return json.loads(self.text)
 
     return _Response()
+
+
+def _rest_refusal(*, status: int = 504):
+    """The REST arm's refusal: ``{"detail": MESSAGE}`` (504 when the product
+    is answering, but the status is the caller's to vary — #8579 P2-1)."""
+    from tortoise import mcp_auth
+
+    return _canned(status=status, json_body={
+        "detail": mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE})
+
+
+def _jsonrpc_refusal(*, status: int = 504):
+    """The ``/mcp`` JSON-RPC arm: ``error.code == ERR_TIMEOUT`` + the message."""
+    from tortoise import mcp_auth
+
+    return _canned(status=status, json_body={
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": mcp_auth.ERR_TIMEOUT,
+                  "message": mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE,
+                  "data": {"retry_after": 10}},
+    })
+
+
+def _sse_result(*, status: int = 200, home: str = "structuredContent"):
+    """The MCP SSE arm: HTTP 200 whose ``data:`` payload carries the refusal.
+
+    ``mcp_server._await_under_mcp_wait_bound`` answers a breach with a
+    ``CallToolResult(isError=True)``; the ``{code, message, data}`` mapping is at
+    ``structuredContent.error`` for a tool with no wrap envelope, or
+    ``_meta.tortoise_error`` for a wrap-envelope tool (#8482).
+    """
+    from tortoise import mcp_auth
+
+    mapping = {"code": mcp_auth.ERR_TIMEOUT,
+               "message": mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE,
+               "data": {"retry_after": 10}}
+    result: dict = {
+        "content": [{"type": "text",
+                     "text": mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE}],
+        "isError": True,
+    }
+    if home == "structuredContent":
+        result["structuredContent"] = {"error": mapping}
+    else:
+        result["_meta"] = {"tortoise_error": mapping}
+    return _canned(
+        status=status,
+        text=f"event: message\ndata: {json.dumps(result)}\n\n",
+    )
 
 _ATEXIT = "tortoise.embedded_lifecycle._atexit_deadline"
 
@@ -119,7 +178,7 @@ def test_a_non_timeout_error_is_not_swallowed():
 # ── rule 1, product side: the transport wait-bound refusal ─────────────────
 def test_the_transport_bound_refusal_skips_and_names_the_product_bound():
     """A bound reached with no answer is INCONCLUSIVE, and names the budget."""
-    response = _refusal_response()
+    response = _rest_refusal()
     assert is_transport_wait_bound_refusal(response) is True
     with pytest.raises(pytest.skip.Exception) as excinfo:
         require_answered(response, what="POST /v1/sessions answered")
@@ -129,6 +188,46 @@ def test_the_transport_bound_refusal_skips_and_names_the_product_bound():
     assert f"{transport_wait_bound_s():g}" in message
 
 
+def test_every_refusal_envelope_is_caught_on_its_own_surface():
+    """The signal is the per-surface ENVELOPE, and each surface's is caught.
+
+    REST: 504 + `{"detail": MESSAGE}`. `/mcp` JSON-RPC: `ERR_TIMEOUT` + the
+    message on 504. MCP SSE: a 200 whose `CallToolResult(isError=True)` homes the
+    mapping. A status-gated detector would MISS the 200; a message-gated one
+    catches all three *and* every innocent body that merely mentions it — which
+    is the bug being fixed.
+    """
+    for response in (_rest_refusal(), _jsonrpc_refusal(), _sse_result()):
+        assert is_transport_wait_bound_refusal(response) is True, response.text
+        with pytest.raises(pytest.skip.Exception):
+            require_answered(response, what="a probe")
+
+
+def test_the_wrap_envelope_refusal_is_caught_at_its_re_homed_meta():
+    """#8482: a wrap-envelope tool's refusal is re-homed on `_meta`."""
+    response = _sse_result(home="_meta")
+    assert is_transport_wait_bound_refusal(response) is True
+    with pytest.raises(pytest.skip.Exception):
+        require_answered(response, what="MCP wrap tool answered")
+
+
+def test_the_diagnosis_reports_the_refusals_own_status_not_an_assumed_504():
+    """P3-1: the diagnosis names the OBSERVED surface, never a hardcoded 504.
+
+    The MCP arm's refusal rides a 200; a diagnosis that hardcoded "(HTTP 504)"
+    sends the reader of an MCP-arm skip looking for a REST/proxy 504 that never
+    occurred.
+    """
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        require_answered(_rest_refusal(), what="a probe")
+    assert "HTTP 504" in str(excinfo.value)
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        require_answered(_sse_result(), what="a probe")
+    message = str(excinfo.value)
+    assert "HTTP 200" in message, message
+    assert "HTTP 504" not in message, message
+
+
 def test_sabotage_the_pre_fix_shape_fails_the_same_refusal():
     """The shape #5049 replaces: `assert r.status_code == 200` on the refusal.
 
@@ -136,42 +235,59 @@ def test_sabotage_the_pre_fix_shape_fails_the_same_refusal():
     This is the must-fail leg proving the conversion changes the verdict.
     """
     with pytest.raises(AssertionError):
-        response = _refusal_response()
+        response = _rest_refusal()
         assert response.status_code == 200, response.text
 
 
 def test_an_unrelated_504_is_returned_to_the_caller():
     """Only the product's OWN refusal is converted — a bare 504 is not it."""
-    response = _refusal_response(body='{"detail": "gateway timeout"}')
+    response = _canned(status=504, json_body={"detail": "gateway timeout"})
     assert is_transport_wait_bound_refusal(response) is False
     assert require_answered(response, what="a probe") is response
 
 
 def test_the_product_message_alone_is_not_a_refusal():
-    """The MCP arm's refusal rides a 200, so the STATUS cannot be the gate.
+    """P2-1: the message TEXT is not the signal — the envelope is.
 
-    `mcp_server._await_under_mcp_wait_bound` answers a breach with a
-    `CallToolResult(isError=True)` inside the SSE stream — HTTP 200 carrying the
-    SAME message. A status-gated detector would read that as a silent PASS; the
-    product's own message is the signal, on every surface.
+    The pre-fix detector was `MESSAGE in body_text`, status-blind, so a genuine
+    500 (or a 200) whose body merely CONTAINED the message was reported as the
+    refusal and a true red became INCONCLUSIVE. Each case below carries the
+    message without the envelope and must NOT be converted.
     """
-    response = _refusal_response(status=200)
-    assert is_transport_wait_bound_refusal(response) is True
-    with pytest.raises(pytest.skip.Exception) as excinfo:
-        require_answered(response, what="MCP tools/call answered")
-    assert "INCONCLUSIVE [#5049]" in str(excinfo.value)
+    from tortoise import mcp_auth
+
+    message = mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE
+    assert is_transport_wait_bound_refusal(
+        _canned(status=504, text=message)) is False  # bare text, no envelope
+    assert is_transport_wait_bound_refusal(
+        _rest_refusal(status=200)) is False  # REST detail on the wrong status
+    assert is_transport_wait_bound_refusal(
+        _canned(status=504, json_body={"detail": f"proxy: {message}"})
+    ) is False  # substring, not the detail
+    assert is_transport_wait_bound_refusal(
+        _canned(status=504, json_body={
+            "error": {"code": -32001, "message": message}})
+    ) is False  # right message, WRONG error code
 
 
 def test_an_answered_response_is_returned_untouched():
-    response = _refusal_response(status=200, body='{"ok": true}')
+    response = _canned(status=200, json_body={"ok": True})
     assert require_answered(response, what="a probe") is response
 
 
 def test_a_non_504_error_still_reaches_the_callers_own_assertion():
-    """A genuine product failure must FAIL, not skip: 402/500 are returned."""
+    """P2-1 must-fail leg: a NON-504 error CARRYING the message reaches the caller.
+
+    The status-blind message-substring detector made this case SKIP; the fix must
+    let the caller's own assertion see it — `assert resp.status_code == 200` on a
+    500 is then a real red, not a swallowed one.
+    """
     for status in (402, 500, 409, 429):
-        response = _refusal_response(status=status, body='{"detail": "refused"}')
+        response = _rest_refusal(status=status)
+        assert is_transport_wait_bound_refusal(response) is False, status
         assert require_answered(response, what="a probe") is response, status
+        with pytest.raises(AssertionError):
+            assert response.status_code == 200, response.text
 
 
 # ── rule 2: sufficiency is a RECORDED property, never a live measurement ───

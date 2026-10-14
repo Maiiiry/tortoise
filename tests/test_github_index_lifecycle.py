@@ -8,6 +8,7 @@ script (dry-run + opt-in merge).
 """
 from __future__ import annotations
 
+import json
 import os
 
 os.environ.setdefault("TORTOISE_SECRET_PEPPER", "test-static-pepper")
@@ -28,7 +29,7 @@ from fastapi.testclient import TestClient
 
 from tests._github_mock import MockGitHubTransport, gh_issue
 from tests._http_fixtures import patched_tortoise_sdk
-from tests._verdict import require_answered
+from tests._verdict import require_answered, require_within, transport_wait_bound_s
 from tortoise.hosted_api import (
     _ALLOWED_STATE_KEYS,
     _INDEX_JOBS,
@@ -157,12 +158,16 @@ def _load_dedup_script():
 
 def _wait_for(predicate, timeout_s: float = 8.0):
     """Poll for a fire-and-forget side effect (background _run_indexing task
-    on the TestClient's portal loop). Raises AssertionError on timeout."""
-    deadline = time.time() + timeout_s
-    while not predicate():
-        if time.time() > deadline:
-            raise AssertionError("timed out waiting for background job")
-        time.sleep(0.02)
+    on the TestClient's portal loop).
+
+    #5049 rule 1: a deadline expiry here is a machine-load event, so it is
+    INCONCLUSIVE naming the budget — never the `AssertionError` this used to
+    raise (the same wall-clock-FAIL class as `_poll_until`, #8579 review P2-2).
+    """
+    require_within(
+        predicate, timeout_s=timeout_s,
+        what="a background index job reached its terminal state",
+    )
 
 
 def _drain_jobs(client, timeout_s: float = 5.0):
@@ -183,21 +188,41 @@ def _drain_jobs(client, timeout_s: float = 5.0):
         time.sleep(0.02)
 
 
-def _poll_until(client, job_id: str, status: str, timeout_s: float = 8.0):
-    deadline = time.time() + timeout_s
-    while True:
-        r = client.get(f"/v1/index/github/{job_id}")
-        # #5049: `GET /v1/index/github/<id>` is not exempt from the transport
-        # wait bound, so a 504 here is the product refusing legibly, not an
-        # answer — INCONCLUSIVE, never the bare FAIL this assert used to make.
-        require_answered(r, what=f"GET /v1/index/github/{job_id} answered")
+def _poll_until(client, job_id: str, status: str, timeout_s: float | None = None):
+    """Poll the index job; INCONCLUSIVE (never FAIL) on either deadline.
+
+    TWO clocks meet here, and they are deliberately reconciled (#8579 P2-2):
+
+    * the PRODUCT's transport wait bound (10 s) bounds ONE request — a request
+      that outlives it is answered with the legible refusal, which
+      `require_answered` turns INCONCLUSIVE. The pre-fix 8 s default was
+      SHORTER than that bound, so under load this poll's own budget fired
+      before the refusal could even be read;
+    * this poll's deadline bounds the WHOLE poll loop, so it must outlast a
+      single request's bound or it decides the verdict first. The default is the
+      product bound plus a 2 s margin, and a caller may still pass an explicit
+      budget for a deterministic test.
+    """
+    budget = transport_wait_bound_s() + 2.0 if timeout_s is None else timeout_s
+    observed: dict = {}
+
+    def _reached() -> bool:
+        r = require_answered(
+            client.get(f"/v1/index/github/{job_id}"),
+            what=f"GET /v1/index/github/{job_id} answered",
+        )
         assert r.status_code == 200, r.text
-        body = r.json()
-        if body["status"] == status:
-            return body
-        if time.time() > deadline:
-            raise AssertionError(f"job {job_id} not {status}: {body}")
-        time.sleep(0.02)
+        observed["body"] = r.json()
+        return observed["body"]["status"] == status
+
+    # #5049 rule 1: the poll's own deadline is a wall-clock budget, so its
+    # expiry is INCONCLUSIVE and names the budget — never the AssertionError
+    # (`job <id> not <status>`) this used to raise.
+    require_within(
+        _reached, timeout_s=budget,
+        what=f"job {job_id} reached status {status!r}",
+    )
+    return observed["body"]
 
 
 def test_poll_until_is_inconclusive_on_a_bound_refusal():
@@ -214,14 +239,48 @@ def test_poll_until_is_inconclusive_on_a_bound_refusal():
         def __init__(self) -> None:
             from tortoise import mcp_auth
 
-            self.text = mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE
+            self._message = mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE
+            self.text = json.dumps({"detail": self._message})
 
         def get(self, *_args, **_kwargs):
             return self
 
+        def json(self):
+            return {"detail": self._message}
+
     with pytest.raises(pytest.skip.Exception) as excinfo:
         _poll_until(_Refusing(), "job-1", "completed")
     assert "INCONCLUSIVE [#5049]" in str(excinfo.value)
+
+
+def test_poll_until_deadline_is_inconclusive_never_an_assertion():
+    """#8579 P2-2: the poll's OWN deadline must not produce FAIL.
+
+    Deterministic: a 200 whose body never reaches the target status, with the
+    budget spent. Pre-fix this raised
+    `AssertionError: job job-1 not completed: {'status': 'running'}` from the
+    same helper that already converted the transport refusal; the rule-1
+    budget expiry must SKIP and name the budget it spent.
+    """
+
+    class _Stuck:
+        status_code = 200
+
+        def __init__(self) -> None:
+            self.text = '{"status": "running"}'
+
+        def get(self, *_args, **_kwargs):
+            return self
+
+        def json(self):
+            return {"status": "running"}
+
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        _poll_until(_Stuck(), "job-1", "completed", timeout_s=0.0)
+    message = str(excinfo.value)
+    assert "INCONCLUSIVE [#5049]" in message
+    assert "0s" in message, message
+    assert "job job-1 reached status 'completed'" in message, message
 
 
 # ── State-key registration (cycle-3 P1-2) ─────────────────────────
@@ -400,7 +459,11 @@ def test_progress_beat_stamps_heartbeat(provisioned, mock_github, monkeypatch):
     # the walk has been entered
     deadline = time.time() + 10.0
     while not beats and time.time() < deadline:
-        provisioned.tc.get(f"/v1/index/github/{job_id}")
+        # #5049: a bound refusal on the pump GET is a non-answer, not a FAIL.
+        require_answered(
+            provisioned.tc.get(f"/v1/index/github/{job_id}"),
+            what=f"GET /v1/index/github/{job_id} answered (pump)",
+        )
         time.sleep(0.02)
     assert beats, "the walk was never entered with an on_progress beat"
     assert _INDEX_JOBS[job_id]["status"] == "started", (
@@ -499,6 +562,10 @@ def test_live_progress_written_during_walk(provisioned, mock_github, monkeypatch
     deadline = time.time() + 10.0
     while time.time() < deadline:
         rp = provisioned.tc.get(f"/v1/index/github/{job_id}")
+        # #5049: this pump-and-observe loop is a separate poll path from
+        # `_poll_until`; without its own conversion a bound refusal exits on
+        # the loop's own deadline into a rule-1 `assert mid["seen"]` FAIL.
+        require_answered(rp, what=f"GET /v1/index/github/{job_id} answered")
         body = rp.json()
         if (body.get("repos_processed", 0) >= 1
                 and 0 < body.get("progress", 0) < 100):
