@@ -30,6 +30,10 @@ WHAT THIS PINS
 5. The spec-change warning stays TRUE: while `extractor_v2.py` still says
    "assume everything is new", the doc must keep saying the code implements the
    inverted policy. Fix the code and this reds, forcing the doc to follow.
+6. §4.4's state-of-code citation names its revision pin. The header pins every
+   `file.py:NNNN` to `c79ba1cf2` *except where a passage names a later pin*;
+   `extractor_v2.py:2353` is a `7d348d351` line (2042 at the default pin), so a
+   bare number here is ambiguous. Naming the pin reds if it is dropped.
 
 Non-vacuity: the pre-fix document has no `### 4.4` heading, so check 1 fails.
 
@@ -187,4 +191,26 @@ def test_the_shipped_code_still_matches_the_documented_warning():
         "`tortoise/extractor_v2.py` no longer says 'assume everything is new' — "
         "the §4.4 state-of-code warning is now stale; update it to describe what "
         "the code does instead (#8495)."
+    )
+
+
+def test_the_state_of_code_citation_names_its_revision_pin():
+    """P2 (#8600): the §4.4 citation must not be a bare `file.py:NNNN`.
+
+    The header pins every `file.py:NNNN` in this document to `c79ba1cf2`
+    *except where a passage names a later pin*. `extractor_v2.py:2353` is the
+    `7d348d351` (current-HEAD) line; at the declared default pin `c79ba1cf2`
+    the same symbol sits at 2042. A bare number therefore reads as the wrong
+    revision — the exact ambiguity `#8506` added the third-pin clause to kill.
+    """
+    section = _policy_section()
+    assert "_render_search_results" in section, (
+        "§4.4 no longer cites `_render_search_results`; the state-of-code "
+        "warning in this section depends on it (#8600)."
+    )
+    assert "at `7d348d351`" in section, (
+        "§4.4 cites `extractor_v2.py:2353` without naming its revision pin. The "
+        "header pins every unqualified `file.py:NNNN` to `c79ba1cf2`, where "
+        "that line is 2042 — name the pin (`at `7d348d351``) in the passage or "
+        "add the citation to the header's `7d348d351` list (#8600)."
     )
