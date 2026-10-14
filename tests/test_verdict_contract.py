@@ -716,13 +716,12 @@ _CONVERTED_SITES: dict[str, frozenset[str]] = {
         "test_commit_empty_400_preserved",
     }),
     "tests/test_github_index_lifecycle.py": frozenset(
-        {"_poll_until", "_post_index", "test_progress_beat_stamps_heartbeat",
-         "test_live_progress_written_during_walk"}),
+        {"_poll_until", "_post_index", "_pump_until_walk_entered",
+         "_pump_until_midwalk"}),
     "tests/test_hosted_api.py": frozenset({"test_dream_incremental"}),
     "tests/test_index_docs_api.py": frozenset(
-        {"_poll_until", "test_cross_team_job_poll_404",
-         "test_docs_live_progress_written_during_walk",
-         "test_docs_live_progress_all_branches_site"}),
+        {"_poll_until", "_pump_until_midwalk",
+         "test_cross_team_job_poll_404"}),
     "tests/test_oauth_mcp.py": frozenset(
         {"test_oauth_sessionless_create_point_actor_stamped"}),
     "tests/test_onboarding_endpoints.py": frozenset(

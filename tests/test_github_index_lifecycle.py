@@ -157,16 +157,85 @@ def _load_dedup_script():
 
 
 def _wait_for(predicate, timeout_s: float = 8.0):
-    """Poll for a fire-and-forget side effect (background _run_indexing task
+    """Wait for a fire-and-forget side effect (background _run_indexing task
     on the TestClient's portal loop).
 
     #5049 rule 1: a deadline expiry here is a machine-load event, so it is
     INCONCLUSIVE naming the budget — never the `AssertionError` this used to
     raise (the same wall-clock-FAIL class as `_poll_until`, #8579 review P2-2).
+
+    #8579 review P2 (fail-open): pass the **event** ("the run was invoked"),
+    not an exact-equality predicate over the captured payload. An exact
+    predicate is false forever on a wrong forward too, so its expiry would
+    report a regression as a machine-load SKIP. The event is the only part
+    that legitimately depends on load; callers assert the captured payload
+    deterministically AFTER it returns.
     """
     require_within(
         predicate, timeout_s=timeout_s,
         what="a background index job reached its terminal state",
+    )
+
+
+def _pump_until_walk_entered(client, job_id: str, beats: list,
+                            *, timeout_s: float = 10.0) -> None:
+    """Pump the poll GET until the walk has been entered (an `on_progress`
+    beat is captured).
+
+    #5049 rule 1 + #8579 review P2: the loop's OWN wall-clock budget is a
+    machine-load clock, so its expiry is INCONCLUSIVE naming that budget —
+    never the rule-1 `assert beats` FAIL this used to raise. The request is
+    converted through `require_answered`, so a bound refusal is a non-answer.
+    """
+
+    def _entered() -> bool:
+        if beats:
+            return True
+        # #5049: a bound refusal on the pump GET is a non-answer, not a FAIL.
+        require_answered(
+            client.get(f"/v1/index/github/{job_id}"),
+            what=f"GET /v1/index/github/{job_id} answered (pump)",
+        )
+        return bool(beats)
+
+    require_within(
+        _entered, timeout_s=timeout_s,
+        what="the index walk was entered with an on_progress beat",
+    )
+
+
+def _pump_until_midwalk(client, job_id: str, mid: dict,
+                       *, timeout_s: float = 10.0) -> None:
+    """Pump `GET /v1/index/github/<id>` until the walk's mid-progress window
+    is observed, recording `repos_processed`/`progress`/`repos_total` into
+    `mid`.
+
+    #5049 rule 1 + #8579 review P2: the pump-and-observe loop carries its own
+    wall-clock budget in addition to the request's transport bound. Its expiry
+    is a machine-load event — INCONCLUSIVE naming the budget — never the
+    rule-1 `assert mid["seen"]` FAIL this used to raise. The request itself is
+    converted through `require_answered`.
+    """
+
+    def _observe() -> bool:
+        rp = require_answered(
+            client.get(f"/v1/index/github/{job_id}"),
+            what=f"GET /v1/index/github/{job_id} answered",
+        )
+        body = rp.json()
+        if (body.get("repos_processed", 0) >= 1
+                and 0 < body.get("progress", 0) < 100):
+            mid["seen"] = True
+            mid["repos_processed"] = body["repos_processed"]
+            mid["progress"] = body["progress"]
+            mid["repos_total"] = body.get("repos_total", 0)
+            return True
+        return False
+
+    require_within(
+        _observe, timeout_s=timeout_s,
+        what="mid-walk live progress on GET /v1/index/github/<id>",
+        diagnosis="_job() must write repos_processed/progress after each repo",
     )
 
 
@@ -501,16 +570,9 @@ def test_progress_beat_stamps_heartbeat(provisioned, mock_github, monkeypatch):
     job_id = r.json()["job_id"]
 
     # pump the portal (the poll GET both advances and observes the run) until
-    # the walk has been entered
-    deadline = time.time() + 10.0
-    while not beats and time.time() < deadline:
-        # #5049: a bound refusal on the pump GET is a non-answer, not a FAIL.
-        require_answered(
-            provisioned.tc.get(f"/v1/index/github/{job_id}"),
-            what=f"GET /v1/index/github/{job_id} answered (pump)",
-        )
-        time.sleep(0.02)
-    assert beats, "the walk was never entered with an on_progress beat"
+    # the walk has been entered; the loop's own deadline is INCONCLUSIVE
+    # (never the rule-1 `assert beats` FAIL) — #8579 review P2.
+    _pump_until_walk_entered(provisioned.tc, job_id, beats)
     assert _INDEX_JOBS[job_id]["status"] == "started", (
         "the hold must keep the run in flight for a mid-walk assertion")
 
@@ -604,26 +666,12 @@ def test_live_progress_written_during_walk(provisioned, mock_github, monkeypatch
     # a request, so the poll GET both pumps and observes (mirrors _drain_jobs).
     mid = {"seen": False, "repos_processed": 0, "progress": 0,
            "repos_total": 0}
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        rp = provisioned.tc.get(f"/v1/index/github/{job_id}")
-        # #5049: this pump-and-observe loop is a separate poll path from
-        # `_poll_until`; without its own conversion a bound refusal exits on
-        # the loop's own deadline into a rule-1 `assert mid["seen"]` FAIL.
-        require_answered(rp, what=f"GET /v1/index/github/{job_id} answered")
-        body = rp.json()
-        if (body.get("repos_processed", 0) >= 1
-                and 0 < body.get("progress", 0) < 100):
-            mid["seen"] = True
-            mid["repos_processed"] = body["repos_processed"]
-            mid["progress"] = body["progress"]
-            mid["repos_total"] = body.get("repos_total", 0)
-            break
-        time.sleep(0.02)
+    # #5049: this pump-and-observe loop is a separate poll path from
+    # `_poll_until`; its GET is converted through `require_answered` AND its
+    # own wall-clock deadline through `require_within` (#8579 review P2), so
+    # neither a bound refusal nor a load event exits into a rule-1 FAIL.
+    _pump_until_midwalk(provisioned.tc, job_id, mid)
 
-    assert mid["seen"], (
-        "mid-walk live progress never observed — _job() must write "
-        "repos_processed/progress after each repo")
     assert mid["repos_processed"] == 1
     assert mid["repos_total"] == 2
     assert 0 < mid["progress"] < 100  # 1 of 2 repos → 50
@@ -722,7 +770,11 @@ def test_re_poll_scoped_repo(provisioned, monkeypatch):
     r = _post_index(provisioned.tc, "/v1/index/github/re-poll", json={"repo": "repo2"})
     assert r.status_code == 200
     assert r.json()["status"] == "started"
-    _wait_for(lambda: seen == [("acme", ["repo2"])])
+    # #8579 review P2: wait for the EVENT (the run was invoked), then assert
+    # the forwarded scope deterministically — an exact-equality predicate makes
+    # a wrong scope a machine-load SKIP instead of the FAIL it is.
+    _wait_for(lambda: bool(seen))
+    assert seen == [("acme", ["repo2"])]
 
 
 def test_re_poll_multi_repo_scope(provisioned, monkeypatch):
@@ -739,7 +791,8 @@ def test_re_poll_multi_repo_scope(provisioned, monkeypatch):
     r = _post_index(provisioned.tc, "/v1/index/github/re-poll",
                             json={"repos": ["repo1", "repo2"]})
     assert r.status_code == 200
-    _wait_for(lambda: seen == [("acme", ["repo1", "repo2"])])
+    _wait_for(lambda: bool(seen))
+    assert seen == [("acme", ["repo1", "repo2"])]
 
 
 def test_re_poll_empty_repos_is_full_org(provisioned, monkeypatch):
@@ -755,7 +808,8 @@ def test_re_poll_empty_repos_is_full_org(provisioned, monkeypatch):
     monkeypatch.setattr(ha, "_run_indexing", _capture)
     r = _post_index(provisioned.tc, "/v1/index/github/re-poll", json={"repos": []})
     assert r.status_code == 200
-    _wait_for(lambda: seen == [("acme", None)])
+    _wait_for(lambda: bool(seen))
+    assert seen == [("acme", None)]
 
 
 def test_re_poll_invalid_repo_400(provisioned, monkeypatch):
@@ -793,7 +847,8 @@ def test_re_poll_whitespace_repo_is_full_org(provisioned, monkeypatch):
     monkeypatch.setattr(ha, "_run_indexing", _capture)
     r = _post_index(provisioned.tc, "/v1/index/github/re-poll", json={"repo": "   "})
     assert r.status_code == 200
-    _wait_for(lambda: seen == [("acme", None)])
+    _wait_for(lambda: bool(seen))
+    assert seen == [("acme", None)]
 
 
 def test_re_poll_no_repo_is_full_org(provisioned, monkeypatch):
@@ -809,7 +864,35 @@ def test_re_poll_no_repo_is_full_org(provisioned, monkeypatch):
     monkeypatch.setattr(ha, "_run_indexing", _capture)
     r = _post_index(provisioned.tc, "/v1/index/github/re-poll")
     assert r.status_code == 200
-    _wait_for(lambda: seen == [("acme", None)])
+    _wait_for(lambda: bool(seen))
+    assert seen == [("acme", None)]
+
+
+def test_pump_until_midwalk_deadline_is_inconclusive_never_an_assertion():
+    """#8579 review P2: the pump-and-observe loop's OWN budget must SKIP, not
+    FAIL. Deterministic: a 200 whose body never reaches the mid-walk window,
+    with the budget already spent. Pre-fix the loop exited its deadline into
+    `assert mid["seen"]` — this pins the conversion through `require_within`.
+    """
+
+    class _AnsweredButNeverMidwalk:
+        status_code = 200
+        text = '{"repos_processed": 0, "progress": 0}'
+
+        def get(self, *_args, **_kwargs):
+            return self
+
+        def json(self):
+            return {"repos_processed": 0, "progress": 0}
+
+    mid: dict = {"seen": False}
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        _pump_until_midwalk(_AnsweredButNeverMidwalk(), "job-1", mid,
+                            timeout_s=0.0)
+    message = str(excinfo.value)
+    assert "INCONCLUSIVE [#5049]" in message
+    assert "0s" in message, message
+    assert "mid-walk live progress" in message, message
 
 
 # ── Cursor + backfill marker persistence (Tasks 2/3) ──────────────

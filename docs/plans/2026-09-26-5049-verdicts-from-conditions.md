@@ -307,8 +307,8 @@ caller behind them):
 | Site / seam | Covers |
 |---|---|
 | `test_commit_endpoint.py::_commit` + its eight direct-post bodies | every hosted-app `/v1/sessions/commit` POST in the file — the seam plus the direct posts in `test_failed_write_retry_applies_the_counters_once`, `TestLayer1`, the 401 and body-cap sites (#4627's own reproducer). Those eight bypass the seam, so each is named individually in the registry (#8579 review P3 — pinning `_commit` alone left them unpinned) |
-| `test_github_index_lifecycle.py::_poll_until` + `_post_index` | the file's whole poll path (`GET /v1/index/github/<id>` including the pump-and-observe loops) AND every `POST /v1/index/github[/re-poll]` call site through one seam — the direct posts left unwrapped were the `KeyError: 'job_id'` mode (#8579 P3-2) |
-| `test_index_docs_api.py::_poll_until` | the file's whole `_poll_until` path, plus the pump-and-observe polls in `test_docs_live_progress_written_during_walk` and `test_docs_live_progress_all_branches_site` |
+| `test_github_index_lifecycle.py::_poll_until` + `_post_index` + `_pump_until_walk_entered` + `_pump_until_midwalk` | the file's whole poll path (`GET /v1/index/github/<id>` including the pump-and-observe loops) AND every `POST /v1/index/github[/re-poll]` call site through one seam — the direct posts left unwrapped were the `KeyError: 'job_id'` mode (#8579 P3-2). The two pump helpers own their loops' wall-clock budgets, so a load event that misses the transient window SKIPs naming the budget instead of raising the rule-1 `assert beats` / `assert mid["seen"]` FAIL (#8579 review P2) |
+| `test_index_docs_api.py::_poll_until` + `_pump_until_midwalk` | the file's whole `_poll_until` path, plus the pump-and-observe polls in `test_docs_live_progress_written_during_walk` and `test_docs_live_progress_all_branches_site` (GET and the loops' own budget, #8579 review P2) |
 | `test_capture_loop_responsiveness.py::_measure_capture_graph_work` | the measured `#3086` capture through **both** callers (`_measure_on_loop_graph_work` and the direct schema-bootstrap caller) — the LOWER seam, not the wrapper |
 | `test_one_free_org_entitlement.py::_post_signed` | the `/webhooks/stripe` seam |
 | `test_activation_scorecard.py::test_default_window_is_24h` | `#5049`'s `KeyError: 'window'` instance |
@@ -322,7 +322,9 @@ asserts each named seam/test body still calls `require_answered` (#8579 P3-3), s
 conversion cannot be silently deleted back to a wall-clock FAIL. Both `_poll_until`s
 additionally route their OWN wall-clock deadline through `require_within`, so a poll
 exhausting its budget SKIPs naming that budget instead of raising `AssertionError`
-(#8579 P2-2).
+(#8579 P2-2); the four pump-and-observe loops do the same through the two
+`_pump_until_*` helpers, closing the residual budget the P2-2 pass left unconverted
+(#8579 review P2).
 
 **Remaining, deliberately not converted here:** the bare `assert r.status_code == 200`
 reads on non-exempt routes that sit behind no shared seam (≈1.7k across `tests/`, top
@@ -339,10 +341,16 @@ exhausted; `#5049` stays open until #8582 lands.
 
 ### Rule-1 driver inventory (the `wait_for` family the contract unifies)
 
-The contract's `wait_for` is adopted at the converted sites only. The pre-existing predicate
-waiters — `tests/test_index_docs_api.py`, `tests/test_github_index_lifecycle.py`,
-`tests/test_4314_inert_hooks.py`, `tests/test_agent_signup.py`,
-`tests/test_agent_signup_idempotency.py` (five `_wait_for(predicate, timeout)` copies);
+The contract's `wait_for` is adopted at the converted sites only. `_wait_for` in
+`tests/test_github_index_lifecycle.py` is converted to an **event** wait (the run was
+invoked) whose callers then assert the captured payload deterministically — an
+exact-equality predicate over that payload was fail-open, reporting a wrong forward as a
+machine-load SKIP (#8579 review P2). `tests/test_index_docs_api.py`'s `_wait_for` was
+unused at head and at base and has been removed along with its conversion.
+
+The pre-existing predicate
+waiters — `tests/test_4314_inert_hooks.py`, `tests/test_agent_signup.py`,
+`tests/test_agent_signup_idempotency.py` (three `_wait_for(predicate, timeout)` copies);
 `tests/test_embedded_lifecycle.py::{_wait_server_dead, _wait_for_registry_redis,
 _wait_ready_file}`; `tests/e2e/auth/bff_test_helpers.py::wait_for_port`; and the per-file `_wait*`
 copies in `test_embedded_concurrency.py`, `test_cursor_capture_hook.py`,
