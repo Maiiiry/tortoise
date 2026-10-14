@@ -814,9 +814,15 @@ def off_box_backup_state(env: dict | None = None) -> str:
 def off_box_backup_signal(state: str | None = None) -> str:
     """The one-line setup/startup signal for a resolved off-box state.
 
-    Every branch is scoped to AOF (the mechanism that actually exists on this
-    lane) and none of them claims an off-box copy is present. The configured
-    branch names the #8544 driver gap for exactly that reason.
+    The message never asserts a store MECHANISM (AOF/RDB): the resolver reads
+    only the backup env vars, so it cannot observe the store, and the mechanism
+    is INVERTED across the two self-host paths — embedded has AOF OFF by
+    default (``TORTOISE_EMBEDDED_AOF``; RDB is the mechanism) while compose has
+    AOF `everysec` on. A mode-specific claim here is the #101 incident shape
+    (a deployment believed durable on a mechanism it did not have), so every
+    branch instead SCOPES the local-copy claim to the store paths where it
+    holds and never claims an off-box copy is present. The configured branch
+    names the #8544 driver gap for the same reason (#8552 review).
     """
     state = off_box_backup_state() if state is None else state
     if state == OFF_BOX_CONFIGURED:
@@ -828,13 +834,18 @@ def off_box_backup_signal(state: str | None = None) -> str:
         )
     if state == OFF_BOX_DECLINED:
         return (
-            "off-box backup EXPLICITLY DECLINED — durability is AOF on this host "
-            "only (≤1s process-crash window). A lost volume or host is TOTAL LOSS."
+            "off-box backup EXPLICITLY DECLINED — this deployment produces no "
+            "off-box copy, so durability rests on the store it points at: on the "
+            "compose and embedded paths that is a SINGLE LOCAL COPY (a "
+            "process-crash window at best; losing that volume or host is TOTAL "
+            "LOSS)."
         )
     return (
         "NO off-box backup target declared and none declined — this deployment "
-        "holds a SINGLE LOCAL COPY (AOF on the named volume; RDB is off). A lost "
-        "volume or host is TOTAL LOSS. Declare an R2_* target, or set "
+        "produces no off-box copy. On the compose and embedded paths the store "
+        "is a SINGLE LOCAL COPY, so a lost volume or host is TOTAL LOSS; a "
+        "remote store's durability is its vendor's, not one this deployment "
+        "arranges. Declare an R2_* target, or set "
         f"{_OFF_BOX_DECLINE_ENV}=1 to decline explicitly."
     )
 

@@ -127,6 +127,28 @@ class TestOffBoxBackupSignal:
         # dead end.
         assert selfhost._OFF_BOX_DECLINE_ENV in msg
 
+    def test_messages_never_assert_a_store_mechanism(self):
+        """#8552 review P1: the resolver reads only the BACKUP env vars, so it
+        cannot observe the store — and the mechanism is INVERTED between the two
+        self-host paths (embedded: AOF OFF by default per
+        ``projection._embedded_aof_enabled``, RDB the mechanism; compose: AOF
+        `everysec` on). A message that names the mechanism is therefore false on
+        one path — the #101 incident shape (a deployment believed durable on a
+        mechanism it did not have). Non-vacuous: the pre-fix ABSENT text said
+        "(AOF on the named volume; RDB is off)".
+        """
+        from tortoise import selfhost
+
+        absent = selfhost.off_box_backup_signal(selfhost.OFF_BOX_ABSENT)
+        declined = selfhost.off_box_backup_signal(selfhost.OFF_BOX_DECLINED)
+        for msg in (absent, declined):
+            low = msg.lower()
+            assert "rdb" not in low, msg
+            assert "aof" not in low, msg
+            # The local-copy claim is SCOPED to the paths where it holds, so a
+            # remote store's own off-box durability is not denied.
+            assert "compose and embedded" in low, msg
+
     def test_declined_flag_is_explicit_not_the_default(self):
         from tortoise import selfhost
 
@@ -137,7 +159,9 @@ class TestOffBoxBackupSignal:
             {selfhost._OFF_BOX_DECLINE_ENV: "0"}) == selfhost.OFF_BOX_ABSENT
         msg = selfhost.off_box_backup_signal(selfhost.OFF_BOX_DECLINED)
         assert "explicitly declined" in msg.lower()
-        assert "AOF" in msg
+        # Declining does not license a mechanism claim: the message states the
+        # residual (no off-box copy) without naming AOF/RDB (#8552 review).
+        assert "no off-box copy" in msg.lower()
 
     @pytest.mark.parametrize("var", [
         "R2_BUCKET", "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
@@ -172,16 +196,48 @@ class TestOffBoxBackupSignal:
         assert "no off-box copy is being produced" in low
         assert "declared" in low
 
-    def test_boot_signal_is_printed_and_logged(self, monkeypatch, capsys):
-        """The signal fires at daemon boot (module load) — the deploy ladder
-        ``docker compose up`` shows it, so the omission cannot pass unnoticed."""
+    def _reload_with_no_backup_env(self, monkeypatch):
+        """Reload selfhost with EVERY input of ``off_box_backup_state`` scrubbed.
+
+        Derived from the resolver's OWN registries (``_OFF_BOX_TARGET_ENVS`` +
+        the hosted driver switch + the decline flag) rather than a hand list, so
+        a new target var cannot silently re-introduce the ambient-shell premise
+        (#8552 review; #3695/#5477 doctrine). Returns the captured stderr.
+        """
         import importlib
 
         from tortoise import selfhost
 
-        monkeypatch.delenv("R2_BUCKET", raising=False)
+        for var in (*selfhost._OFF_BOX_TARGET_ENVS, "BACKUP_SWEEP_ENABLED"):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv(selfhost._OFF_BOX_DECLINE_ENV, raising=False)
         importlib.reload(selfhost)
+
+    @pytest.mark.parametrize("var", [
+        "R2_BUCKET", "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+        "BACKUP_SWEEP_ENABLED",
+    ])
+    def test_boot_signal_premise_ignores_ambient_target_env(
+            self, monkeypatch, capsys, var):
+        """#8552 review P2: the boot-emission test asserts "nothing is
+        declared", so it must scrub ALL FIVE inputs the resolver reads — an
+        ambient ``R2_ACCOUNT_ID`` (a real exported var on this box's deploy and
+        backup lanes) otherwise flips the resolver to CONFIGURED and the
+        assertion fails on a clean tree. Non-vacuous by construction: pre-fix
+        the reload cleared only ``R2_BUCKET`` + the decline flag, so setting any
+        of the other four made the boot message read DECLARED.
+        """
+        monkeypatch.setenv(var, "ambient-value")
+        self._reload_with_no_backup_env(monkeypatch)
+        err = capsys.readouterr().err
+        assert "SINGLE LOCAL COPY" in err
+        assert "target DECLARED" not in err
+
+    def test_boot_signal_is_printed_and_logged(self, monkeypatch, capsys):
+        """The signal fires at daemon boot (module load) — the deploy ladder
+        ``docker compose up`` shows it, so the omission cannot pass unnoticed.
+        """
+        self._reload_with_no_backup_env(monkeypatch)
         err = capsys.readouterr().err
         assert "off-box backup" in err
         assert "SINGLE LOCAL COPY" in err
