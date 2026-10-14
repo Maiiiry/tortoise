@@ -1,9 +1,9 @@
 """#2296 — a Document created through the SDK survives ``rebuild_all``.
 
-The epic's own Indicator-2 gap list (scope hook from #2295) and
-``tests/test_unjournaled_mutation_class.py`` both name this as the *last
-unjournaled canonical create*: ``create_document`` / ``create_entity(type=
-"document")`` route ``_create_entity("Document", <ulid>, …, "DocumentCreated")``
+The epic's own Indicator-2 gap list (scope hook from #2295) named this the
+*last unjournaled canonical create* — that is the PRE-#2296 state, and this
+change updates ``tests/test_unjournaled_mutation_class.py`` to record it as
+closed. ``create_document`` / ``create_entity(type="document")`` route ``_create_entity("Document", <ulid>, …, "DocumentCreated")``
 and emitted **no journal record** on that route. ``DocumentCreated`` is a
 fold the replay engines honour (``_upsert_document``), but with no record to
 replay a journal-enabled SDK's Documents were live-only — every
@@ -172,30 +172,38 @@ def test_the_record_carries_the_applied_payload(env):
         "survive the replay")
 
 
-def test_a_recorded_ts_prop_cannot_forge_the_envelope(env):
-    """A caller ``recorded_ts`` prop is an ``_emit_event`` PARAMETER name, not
-    a domain prop. It must not bind the envelope ``ts`` (the record's ts is
-    minted by ``_emit_event``), and it must not persist live either — the
-    record strips it, so keeping it live would be the #8553 live ≠ replay
-    divergence. Every emitter that can turn the prop into an envelope ``ts`` is
-    checked: ``create_document`` (via ``_create_entity``'s live pop),
-    ``create_source`` (which emits its own ``SourceCreated`` and needs its own
-    drop), and ``update_point`` (which splats caller props straight into
-    ``_emit_event`` — the shared intake strip in ``_sanitize_props`` is what
-    covers it). FAILS IF ``recorded_ts`` leaves ``_JOURNAL_ENVELOPE_KEYS`` (the
-    record's ``ts`` becomes caller-controlled), or the intake strip / either
-    door's live drop is removed."""
+def test_a_reserved_envelope_prop_cannot_forge_or_suppress_the_record(env):
+    """An ``_emit_event`` ENVELOPE name must never reach it as a caller prop.
+
+    ``recorded_ts`` / ``point`` / ``payload`` are `_emit_event` PARAMETERS:
+    Python binds a ``**props`` key to a named parameter AT THE CALL, so a door
+    that splats caller props into the call (``update_point`` does) turns the
+    prop into that parameter — ``recorded_ts`` forges the record's envelope
+    ``ts``, ``point`` hands the record the node snapshot a rebuild then
+    replays. ``type`` is not a parameter but the key the live fold and the
+    record BOTH dispatch on, so a prop of that name re-types or silently
+    SUPPRESSES the record: measured, ``create_document(type="SourceCreated")``
+    journalled nothing and ``rebuild_all`` destroyed the node — the #2296
+    defect itself, reachable through a caller prop.
+
+    All four are stripped at prop intake (``_sanitize_props``), the one surface
+    ``create_point``/``update_point``/``create_entity``/``update_entity`` all
+    pass through; ``create_source`` bypasses that intake and drops them itself.
+    FAILS IF any of them leaves ``_JOURNAL_ENVELOPE_KEYS`` /
+    ``_RESERVED_ENVELOPE_PROPS``, IF the intake strip is removed, or IF
+    ``_create_entity`` stops owning the ``type`` it emits."""
     sdk, events = env
     forged = "1999-01-01T00:00:00+00:00"
-    # The record side: `recorded_ts` is an `_emit_event` PARAMETER name, so it
-    # must be stripped from EVERY entity-door payload (the tuple entry), not
-    # only from the one call this test happens to drive.
+    # The record side: all four are `_emit_event` envelope names, so they must
+    # be stripped from EVERY entity-door payload, not only from the one call
+    # this test happens to drive.
     from tortoise.sdk import _journal_record_payload
-    assert "recorded_ts" not in _journal_record_payload(
-        {"type": "DocumentCreated", "id": "x", "recorded_ts": forged}), (
-        "`recorded_ts` is an `_emit_event` parameter name and must be stripped "
-        "from every entity-door record payload — leaving it in lets a caller "
-        "prop bind the `recorded_ts` parameter and forge the envelope `ts`")
+    for name in ("recorded_ts", "type", "point", "payload"):
+        assert name not in _journal_record_payload(
+            {"type": "DocumentCreated", "id": "x", name: forged}), (
+            f"{name!r} is an `_emit_event` envelope name and must be stripped "
+            "from every entity-door record payload — leaving it in lets a "
+            "caller prop bind that parameter or re-type the record")
     doc = sdk.create_document("Forged", "report", recorded_ts=forged)
     rec = _document_created(events)[0]
     assert rec["ts"] != forged, (
@@ -212,22 +220,37 @@ def test_a_recorded_ts_prop_cannot_forge_the_envelope(env):
                    if e.get("type") == "SourceCreated")
     assert src_rec["ts"] != forged, (
         "a caller `recorded_ts` prop forged the SourceCreated record's ts")
-    # The generic update door: `update_point` splats caller props into
-    # `_emit_event` directly, so before the intake strip a prop of this name
-    # bound the `recorded_ts` PARAMETER and forged the `PointRevised` record's
-    # `ts` (measured). `_sanitize_props` is the shared intake it passes through.
-    pt = sdk.create_point("note", "a point")
-    sdk.update_point(pt["id"], recorded_ts=forged, summary="rt")
+    # The generic update door splats caller props straight into `_emit_event`,
+    # so before the intake strip each of these bound its own parameter.
+    pt = sdk.create_point("statement", "a point")
+    sdk.update_point(pt["id"], recorded_ts=forged, type="PointAdded",
+                     point={"id": "forged"}, payload={"forged": True},
+                     summary="rt")
     rev = next(e for e in _journal(events)
                if e.get("type") == "PointRevised")
     assert rev["ts"] != forged, (
         "a caller `recorded_ts` prop forged the PointRevised record's ts")
+    assert rev.get("point") is None and rev.get("payload") is None, (
+        "a caller `point`/`payload` prop became the record's snapshot/payload "
+        "— the rebuild replays it onto the node")
     pt_live = sdk._get_proj().g.query(
         "MATCH (n:Point {id:$id}) RETURN properties(n)",
         params={"id": pt["id"]}).result_set[0][0]
-    assert "recorded_ts" not in pt_live, (
-        "a caller `recorded_ts` prop persisted live on the Point while the "
-        "record strips it — the #8553 live != replay divergence")
+    for name in ("recorded_ts", "type", "point", "payload"):
+        assert name not in pt_live, (
+            f"a caller {name!r} prop persisted live on the Point while the "
+            "record strips it — the #8553 live != replay divergence")
+    # A `type` prop must not suppress a Document's record: with it suppressed
+    # the node is live-only and `rebuild_all` destroys it.
+    n_before = len(_document_created(events))
+    doc2 = sdk.create_document("Forged2", "report", type="SourceCreated")
+    recs = _document_created(events)
+    assert len(recs) == n_before + 1 and recs[-1].get("type") == "DocumentCreated", (
+        "a caller `type` prop re-typed or suppressed the DocumentCreated record")
+    sdk._get_proj().rebuild_all(str(events), confirm_destructive=True)
+    for _id in (doc["id"], doc2["id"]):
+        assert _sources(sdk._get_proj(), _id), (
+            "a Document was live-only: `rebuild_all` destroyed it (#2296)")
 
 
 def test_document_mutation_survives_rebuild(env):
