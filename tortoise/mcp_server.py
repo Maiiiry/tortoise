@@ -878,10 +878,12 @@ _WRAP_ENVELOPE_TYPE_CHECKS: dict[str, type | tuple[type, ...]] = {
 #: `tortoise_query` → ``{results, total, hasMore}``) reaches the pre-filter on
 #: EVERY call — without this the classification would be relearned at a full
 #: rebuild, on the product's read path, for a repair the payload never needed.
-#: The key carries the stored VERSION, and registration is additive-only
-#: (``FastMCPAdapter.register_all`` skips a duplicate) — a name is never
-#: re-registered with a different schema at runtime, so a stale classification
-#: cannot be served. An unreadable schema is never cached.
+#: The key carries the stored VERSION **and the identity of the live component**,
+#: so a stale classification cannot be served even if a name is re-registered
+#: in-place: ``register_all`` skips a duplicate, but FastMCP's own ``add_tool``
+#: REPLACES on a duplicate name, and a replacement is a new object — its key
+#: therefore differs and the memo misses rather than answering with the old
+#: schema. An unreadable schema is never cached.
 _WRAP_ENVELOPE_SCHEMA_CACHE: dict[str, dict | None] = {}
 
 
@@ -904,8 +906,13 @@ def _local_tool_cache_key(name: str) -> str | None:
                and hasattr(c, "output_schema")]
     if not matches:
         return None
-    return max(matches,
-               key=lambda c: (c.version is not None, str(c.version))).key
+    chosen = max(matches,
+                 key=lambda c: (c.version is not None, str(c.version)))
+    # The ``id`` disambiguates an in-place re-registration under the same key:
+    # a replaced component is a new object, so the memo misses instead of
+    # serving the replaced schema's classification. The provider holds the
+    # component alive, so the id cannot be recycled while its entry is cached.
+    return f"{chosen.key}#{id(chosen)}"
 
 
 async def _wrap_envelope_schema(name: str) -> dict | None:

@@ -659,6 +659,53 @@ async def test_a_union_envelope_is_classified_once_not_every_success(quiet):
 
 
 @pytest.mark.asyncio
+async def test_a_replaced_component_is_not_served_from_the_memo(quiet):
+    """A name re-registered in place must not answer from the memo.
+
+    ``FastMCPAdapter.register_all`` skips a duplicate, but FastMCP's own
+    ``add_tool`` REPLACES on a duplicate name. The memo is keyed on the stored
+    component, so a replacement must miss rather than answer with the replaced
+    schema's classification — otherwise the reverse of this PR's bug comes
+    back: a union tool's legitimate dict success would be judged against a
+    stale ``array`` envelope and repaired into a visible failure.
+
+    Non-vacuity: with ``_local_tool_cache_key`` forced to include only
+    ``component.key`` (the pre-fix form) the second call is repaired and
+    ``is_error`` flips to True.
+    """
+    def _array() -> list[dict]:
+        return [{"id": "p1"}]
+
+    def _union() -> list[dict] | dict:
+        return {"results": [], "total": 0, "hasMore": False}
+
+    clean = ms._local_tool_cache_key
+    _probe("_8482_stale", _array)
+    try:
+        ms._WRAP_ENVELOPE_SCHEMA_CACHE.clear()
+        # Prime the memo with the ARRAY classification. A list success is
+        # short-circuited by the pre-filter and never reaches the schema read,
+        # so prime the classifier directly — it is the unit that memoises.
+        assert await ms._wrap_envelope_schema("_8482_stale") is not None
+        assert ms._WRAP_ENVELOPE_SCHEMA_CACHE, "priming cached nothing"
+
+        # Same name, different envelope shape.
+        _probe("_8482_stale", _union)
+
+        result = await ms.mcp.call_tool("_8482_stale", {})
+        assert result.is_error is False, (
+            "a replaced component was served from the memo: the union tool's "
+            "legitimate dict success was repaired against the stale array "
+            "classification")
+        assert result.structured_content == {
+            "result": {"results": [], "total": 0, "hasMore": False}}
+    finally:
+        ms._local_tool_cache_key = clean
+        ms._WRAP_ENVELOPE_SCHEMA_CACHE.clear()
+        _drop("_8482_stale")
+
+
+@pytest.mark.asyncio
 async def test_a_repaired_error_is_never_message_less(quiet):
     """A `-> list[dict]` tool that returns `None` ships `{"result": None}` —
     a schema violation with NO text block. The repair used to rewrite it to
