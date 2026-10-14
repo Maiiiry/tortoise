@@ -289,7 +289,8 @@ here:
   turns the refusal into `INCONCLUSIVE [#5049]` naming the 10 s bound. It detects the
   refusal by its per-surface **envelope** — REST `504` + `{"detail": MESSAGE}`, JSON-RPC/MCP
   `error.code == ERR_TIMEOUT` + `message == MESSAGE` on the `/mcp` 504 or the SSE arm's 200
-  (`structuredContent.error` / `_meta.tortoise_error`) — never by the message text alone,
+  (the JSON-RPC response's `result.structuredContent.error` /
+  `result._meta.tortoise_error`) — never by the message text alone,
   so the MCP arm's 200 cannot be read as a silent pass while a genuine 4xx/5xx error that
   merely mentions the message still reaches the caller's own assertion. Every other
   response is returned unchanged. (#8579 review P2-1: the message-substring test this

@@ -92,9 +92,15 @@ def _jsonrpc_refusal(*, status: int = 504):
 def _sse_result(*, status: int = 200, home: str = "structuredContent"):
     """The MCP SSE arm: HTTP 200 whose ``data:`` payload carries the refusal.
 
-    The ``{code, message, data}`` mapping is at ``structuredContent.error`` for a
-    tool with no wrap envelope, or ``_meta.tortoise_error`` for a wrap-envelope
-    tool (#8482).
+    The ``data:`` payload is the JSON-RPC **response** the product actually
+    emits — ``{"jsonrpc", "id", "result"}`` — so the ``CallToolResult`` is at
+    ``result``. `test_transport_wait_bound.py` reads the real wire that way
+    (``body = _parse_sse(r.text)`` then ``payload = body["result"]``); a bare
+    ``CallToolResult`` as the payload is a shape the product never produces.
+
+    The ``{code, message, data}`` mapping is at ``result.structuredContent.error``
+    for a tool with no wrap envelope, or ``result._meta.tortoise_error`` for a
+    wrap-envelope tool (#8482).
     """
     from tortoise import mcp_auth
 
@@ -110,9 +116,10 @@ def _sse_result(*, status: int = 200, home: str = "structuredContent"):
         result["structuredContent"] = {"error": mapping}
     else:
         result["_meta"] = {"tortoise_error": mapping}
+    response = {"jsonrpc": "2.0", "id": 1, "result": result}
     return _canned(
         status=status,
-        text=f"event: message\ndata: {json.dumps(result)}\n\n",
+        text=f"event: message\ndata: {json.dumps(response)}\n\n",
     )
 
 _ATEXIT = "tortoise.embedded_lifecycle._atexit_deadline"
@@ -192,10 +199,11 @@ def test_every_refusal_envelope_is_caught_on_its_own_surface():
     """#8579 P2-1: the signal is the per-surface ENVELOPE, and each is caught.
 
     REST: 504 + `{"detail": MESSAGE}`. `/mcp` JSON-RPC: `ERR_TIMEOUT` + the
-    message on 504. MCP SSE: a 200 whose `CallToolResult(isError=True)` homes the
-    mapping. A status-gated detector would MISS the 200; a message-gated one
-    catches all three *and* every innocent body that merely mentions the
-    message — which is the bug this replaces.
+    message on 504. MCP SSE: a 200 whose JSON-RPC `result` carries a
+    `CallToolResult(isError=True)` homing the mapping. A status-gated detector
+    would MISS the 200; a message-gated one catches all three *and* every
+    innocent body that merely mentions the message — which is the bug this
+    replaces.
     """
     for response in (_rest_refusal(), _jsonrpc_refusal(), _sse_result()):
         assert is_transport_wait_bound_refusal(response) is True, response.text
@@ -204,11 +212,56 @@ def test_every_refusal_envelope_is_caught_on_its_own_surface():
 
 
 def test_the_wrap_envelope_refusal_is_caught_at_its_re_homed_meta():
-    """#8482: a wrap-envelope tool's refusal is re-homed on `_meta`."""
+    """#8482: a wrap-envelope tool's refusal is re-homed on `result._meta`."""
     response = _sse_result(home="_meta")
     assert is_transport_wait_bound_refusal(response) is True
     with pytest.raises(pytest.skip.Exception):
         require_answered(response, what="MCP wrap tool answered")
+
+
+def test_the_sse_fixture_mirrors_the_real_jsonrpc_framing():
+    """The SSE `data:` payload is a JSON-RPC RESPONSE — the mapping is at `result`.
+
+    The pre-fix `_refusal_error_mapping` probed only the TOP level while the
+    pre-fix fixture put a bare `CallToolResult` there, so the pair certified a
+    shape the product never emits and the whole SSE arm silently regressed to
+    the caller's assertion. The real wire frames it as a JSON-RPC response
+    (`test_transport_wait_bound.py`: `_parse_sse(r.text)` then `body["result"]`),
+    which is what this pins: the homes must be under `result`, absent at the top.
+    """
+    for home in ("structuredContent", "_meta"):
+        text = _sse_result(home=home).text
+        line = next(ln for ln in text.splitlines() if ln.startswith("data:"))
+        payload = json.loads(line[len("data:"):].strip())
+        assert payload["jsonrpc"] == "2.0" and "id" in payload, payload
+        assert isinstance(payload["result"], dict), payload
+        assert home in payload["result"], payload
+        assert home not in payload, (
+            "the refusal home must sit under `result` — a top-level home is the "
+            "unemitted shape the pre-fix fixture drilled")
+        # The pre-fix top-level-only probe read exactly these three keys, all of
+        # which are absent on the real frame — hence the P1 regression.
+        assert "error" not in payload, payload
+        assert is_transport_wait_bound_refusal(_sse_result(home=home)) is True
+
+
+def test_a_bare_sse_result_is_still_caught_when_it_is_the_payload():
+    """Defence in depth: the pre-#8579 shape (bare result) is not a regression.
+
+    The product frames the SSE payload as JSON-RPC, but a `structuredContent` /
+    `_meta` mapping at the top level of a `data:` payload is still the refusal —
+    the probe descends rather than demanding the wrapper.
+    """
+    from tortoise import mcp_auth
+
+    mapping = {"code": mcp_auth.ERR_TIMEOUT,
+               "message": mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE,
+               "data": {"retry_after": 10}}
+    for result in ({"isError": True, "structuredContent": {"error": mapping}},
+                   {"isError": True, "_meta": {"tortoise_error": mapping}}):
+        response = _canned(
+            status=200, text=f"event: message\ndata: {json.dumps(result)}\n\n")
+        assert is_transport_wait_bound_refusal(response) is True, result
 
 
 def test_the_inconclusive_diagnosis_names_no_surface_status():

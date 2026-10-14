@@ -156,9 +156,12 @@ def inconclusive_on_timeout(
 #     `mcp_auth.ERR_TIMEOUT` + the same message, on status 504 for the `/mcp`
 #     route and inside a `CallToolResult(isError=True)` on the SSE arm (HTTP
 #     200), the SDK having collapsed a raised `McpError` into that shape — see
-#     `mcp_server._await_under_mcp_wait_bound`. The mapping is homed at
-#     `structuredContent.error` (no wrap envelope) or `_meta.tortoise_error`
-#     (a wrap-envelope tool — #8482).
+#     `mcp_server._await_under_mcp_wait_bound`. The SSE `data:` payload is a
+#     JSON-RPC RESPONSE, so the `CallToolResult` sits one level down at
+#     `result`, and the mapping is homed at `result.structuredContent.error`
+#     (no wrap envelope) or `result._meta.tortoise_error` (a wrap-envelope tool
+#     — #8482). (`test_transport_wait_bound.py` reads the real wire the same
+#     way: `_parse_sse(r.text)` then `body["result"]`.)
 #
 # That refusal is the LEGIBLE REFUSAL the ruling requires — it is the product
 # saying "no answer yet", not an answer. A test that reads it as a FAIL is
@@ -242,20 +245,28 @@ def _json_objects(response: Any) -> list[dict]:
 def _refusal_error_mapping(body: dict) -> dict | None:
     """The ``{code, message}`` mapping a JSON-RPC/MCP refusal carries.
 
-    JSON-RPC homes it at ``error``; the MCP SSE arm homes the same mapping at
-    ``structuredContent.error`` (no wrap envelope) or ``_meta.tortoise_error``
-    (the wrap-envelope repair, #8482).
+    JSON-RPC homes it at ``error``. The MCP SSE arm's ``data:`` payload is a
+    JSON-RPC *response*, so the ``CallToolResult`` is one level down at
+    ``result`` and the same mapping lives at ``result.structuredContent.error``
+    (no wrap envelope) or ``result._meta.tortoise_error`` (the wrap-envelope
+    repair, #8482). Both levels are probed: the `/mcp` pre-SSE 504 carries the
+    mapping at the TOP level, the SSE frame carries it under ``result``.
     """
-    homes: list[Any] = [body.get("error")]
-    structured = body.get("structuredContent")
-    if isinstance(structured, dict):
-        homes.append(structured.get("error"))
-    meta = body.get("_meta")
-    if isinstance(meta, dict):
-        homes.append(meta.get("tortoise_error"))
-    for home in homes:
-        if isinstance(home, dict):
-            return home
+    layers: list[dict] = [body]
+    result = body.get("result")
+    if isinstance(result, dict):
+        layers.append(result)
+    for layer in layers:
+        homes: list[Any] = [layer.get("error")]
+        structured = layer.get("structuredContent")
+        if isinstance(structured, dict):
+            homes.append(structured.get("error"))
+        meta = layer.get("_meta")
+        if isinstance(meta, dict):
+            homes.append(meta.get("tortoise_error"))
+        for home in homes:
+            if isinstance(home, dict):
+                return home
     return None
 
 
