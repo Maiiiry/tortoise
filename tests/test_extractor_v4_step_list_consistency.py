@@ -47,9 +47,12 @@ cite either and revert the decision:
   * §15's issue map read *"the mechanical DISCARD outcome on E7"* — the site
     `#4899`'s **DEC-1** (2026-09-25) reversed to **`S2.2b`**, and the only line
     in the document coupling the DISCARD with `E7`;
-  * §4.2 still required *"Any reduction target must be paired with a measured
-    retention floor"*, which §16.3's **O2** (owner, 2026-09-24) withdrew
-    outright — *"no volume target, no recall floor, no node budget"*;
+  * §4.2's recall-arithmetic paragraph carried no record that §16.3's **O2**
+    (owner, 2026-09-24) had withdrawn the retention-floor framing outright —
+    *"no volume target, no recall floor, no node budget"* — so the arithmetic
+    still read as a volume floor (`main` removed the floor sentence itself in
+    `#8529`, but left no trace of *why*; this PR restores the record, not the
+    requirement);
   * the review's **D6** was still listed as an open decision-grade question
     (`REVIEW-CONSOLIDATED-2026-09-23.md`) with no disposition.
 
@@ -57,10 +60,14 @@ So the class this file guards is wider than one MERGE: **the v4 design must not
 assert two conflicting things about one operation or one recorded decision.**
 Pinned additionally: (5) no passage sites the mechanical DISCARD on `E7` unless
 it is the reversal record (naming `S2.2b` *and* negating `E7` in the same line);
-(6) §15's issue-map row names `S2.2b` before any mention of `E7`; (7) the
-retention-floor obligation appears only inside its own withdrawal, and the
-recall-arithmetic paragraph carries O2's withdrawal verbatim; (8) the review's
-`D6` carries a disposition naming the decided site and the shipped commit.
+(6) §15's issue-map row itself states the decided site — named, `E7` negated,
+and the shipped predicate symbols cited — not merely quoting a title that
+mentions both; (7) the retention-floor obligation appears only inside its own
+withdrawal (**a FORWARD guard**: `main` had already removed the live obligation,
+so this half cannot red on the merge base) and the recall-arithmetic paragraph
+carries O2's withdrawal verbatim (**the regression pin that does**); (8) the
+review's `D6` carries a disposition naming the decided site, the shipped commit,
+and the symbol of the pass it cites.
 
 NOT promised:
 
@@ -71,9 +78,11 @@ NOT promised:
    `STORAGE-ARCHITECTURE.md` §8, which the issues track separately). Rules 5–7
    are token-level, so a restatement in different words is a NAMED gap, not a
    caught one: the exact obligation `"must be paired with a measured retention
-   floor"` reds, a newly-worded equivalent an editor invents does not (rule 7's
-   second half — the recall paragraph must carry O2's withdrawal verbatim — is
-   the structural half that survives rewording).
+   floor"` reds only while it is live, and a newly-worded equivalent an editor
+   invents does not. Rule (7a) is a FORWARD guard — `main` had already removed
+   the live obligation before the merge base, so it cannot red there; rule (7b)
+   — the recall paragraph must carry O2's withdrawal verbatim — is the
+   structural half, and the non-vacuous pin, that survives rewording.
 2. Rule 3 is deliberately FAIL-CLOSED and slightly over-broad: a pre-gate row
    that merely *mentions* `MERGE` in a parenthetical reds too. That is the safe
    direction — the flag belongs to the gate's row — but a legitimate future
@@ -242,7 +251,7 @@ def test_the_gate_passage_separates_the_verdict_from_the_action():
 #: The decided site (`#4899` DEC-1; shipped in PR `#5237`). The predicate is
 #: `tortoise/value_gate.py:370` (`mechanical_verdict`), called from
 #: `tortoise/vet_gate.py:469` — Level-2 of `vet_candidates`, before the arbiter
-#: and before S3 RESOLVE (`tortoise/extractor_v2.py:7343`).
+#: and before S3 RESOLVE (`tortoise/extractor_v2.py:7419`, `_run_vet_pass`).
 DISCARD_SITE = "S2.2b"
 
 #: The site DEC-1 reversed. The TOKEN is still legitimate — `E7`
@@ -322,6 +331,11 @@ def test_the_issue_map_row_names_the_decided_site():
     It said *"the mechanical DISCARD outcome on E7"* while §4.1/§4.2/§4.3 and
     the shipped code all said `S2.2b`, so the document asserted both again
     (#5198) — exactly what #5092 eliminated inside the blocks.
+
+    The row must STATE the site in its own words (`THE GATE SITE IS `S2.2b`,
+    NOT `E7``), not merely embed the tokens inside the quoted `#5198` title:
+    that quote satisfied the bare-token checks on the pre-fix row, which is how
+    this pin first passed vacuously (the #8443 review).
     """
     # `main` replaced the row header (`the mechanism (\`^the <X>\`)`) with
     # `the mechanism — **two halves**`; anchor on the prefix both spellings
@@ -349,12 +363,17 @@ def test_the_issue_map_row_names_the_decided_site():
         "62.3% `the <X>` class is explicitly NOT owned by this row "
         "(#8498 / #5198):\n" + row
     )
-    if REJECTED_SITE in row:
-        assert row.index(DISCARD_SITE) < row.index(REJECTED_SITE), (
-            "§15's issue-map row names E7 BEFORE the decided site — so the row "
-            "still asserts the losing site (`#4899` DEC-1). Put `S2.2b` first, "
-            "or drop the E7 mention (#5198):\n" + row
-        )
+    assert _NEGATES_REJECTED.search(row), (
+        "§15's issue-map row does not STATE the decided site — it must name "
+        "`S2.2b` and negate `E7` in its own words (`THE GATE SITE IS `S2.2b`, "
+        "NOT `E7``). Merely quoting the `#5198` title, which mentions both "
+        "sites, is what let this pin pass before the fix (#8443):\n" + row
+    )
+    assert row.index(DISCARD_SITE) < row.index(REJECTED_SITE), (
+        "§15's issue-map row names E7 BEFORE the decided site — so the row "
+        "still asserts the losing site (`#4899` DEC-1). Put `S2.2b` first "
+        "(#5198):\n" + row
+    )
 
 
 def test_the_withdrawn_floor_requirement_is_never_reasserted():
@@ -363,6 +382,11 @@ def test_the_withdrawn_floor_requirement_is_never_reasserted():
     The obligation is ALLOWED only inside its own withdrawal — the document
     records the reversal by quoting what it no longer says. Anywhere else it
     is the contradiction `#5198` is filed for.
+
+    This half is a FORWARD guard. `main` (`#8529`) had already removed the live
+    obligation before the merge base, so this scan cannot red there; the
+    non-vacuous pin on the merge base is
+    `test_the_recall_arithmetic_paragraph_carries_o2s_withdrawal` (rule 7b).
     """
     text = _document()
     assert O2_WITHDRAWAL in text, (
@@ -448,4 +472,11 @@ def test_the_reviews_d6_question_carries_a_disposition():
         "the D6 disposition does not cite the shipped commit (`#5237`, "
         "`ea70025aa`) — an unverified disposition is the class that review's "
         "§E was written about (#5198)"
+    )
+    assert "_run_vet_pass" in disposition, (
+        "the D6 disposition cites the VET pass by line number only; the "
+        "document's own rule is that the SYMBOL is authoritative — name "
+        "`_run_vet_pass` so a verifier can find it when the line moves "
+        "(the cited `extractor_v2.py` line was already wrong as of #8443):\n"
+        + disposition[:600]
     )
