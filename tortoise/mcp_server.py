@@ -273,7 +273,11 @@ def _emit_mcp_tool_call_telemetry(org_id: str, tool_name: str, status: str,
       exception class, or the unwrapped cause's class name, respectively);
       the #236 stdio auth gate is the OTHER ``auth_error`` producer, with
       ``error_kind = "stdio_auth_gate"`` — it is not an exception class, so it
-      is not produced by that classifier. ``exec_error`` has ONE more producer
+      is not produced by that classifier. That kind is emitted ONLY when the
+      transport in force is ``"stdio"``: the gate's message prefix is shared
+      by the HTTP tenant-context refusal and by `_safe`'s unset-transport
+      refusal, which record ``auth_error`` with ``error_kind = None`` rather
+      than claim a gate they never touched. ``exec_error`` has ONE more producer
       with ``error_kind = "safe_error"``: a dispatch whose `_safe` failure was
       shipped inside a wrap envelope the tool's own schema forbids (#8482) —
       it is not an exception either, because `_safe` ANSWERED with a dict.
@@ -960,23 +964,6 @@ async def _wrap_envelope_schema(name: str) -> dict | None:
     return schema
 
 
-async def _wrap_envelope_result_type(name: str) -> str | None:
-    """The JSON-schema ``type`` the tool requires for its envelope's
-    ``result`` key, or ``None`` when it has no envelope or declares a union.
-
-    This is the seam's READ of the contract it enforces. It is a named
-    function (rather than an inline schema poke) so a guard can assert it still
-    agrees with the advertised schemas: if it silently stops resolving, the
-    repair stops firing and the -32602 returns unnoticed (#8482).
-    """
-    schema = await _wrap_envelope_schema(name)
-    if schema is None:
-        return None
-    prop = (schema.get("properties") or {}).get("result")
-    declared = prop.get("type") if isinstance(prop, dict) else None
-    return declared if isinstance(declared, str) else None
-
-
 def _violates_wrap_envelope(schema: dict, structured: Any) -> bool:
     """Whether ``structured`` can satisfy ``schema``'s own envelope contract.
 
@@ -1193,7 +1180,16 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
         # alone recorded it as `ok` for every array-envelope tool.
         failure = _safe_failure_message(payload)
         if failure is not None and failure.startswith("Authentication required"):
-            status, error_kind = "auth_error", "stdio_auth_gate"
+            status = "auth_error"
+            # The prefix is shared by producers that are NOT the #236 gate:
+            # `tortoise_packs_list`'s HTTP no-tenant refusal and `_safe`'s
+            # unset-transport refusal both open with it. Stamping
+            # `stdio_auth_gate` on those would make the metric's documented
+            # meaning false and fold hosted tenant refusals into it, so the
+            # KIND follows the transport that actually refused. The STATUS is
+            # `auth_error` either way — each of them IS an auth refusal.
+            error_kind = ("stdio_auth_gate"
+                          if _transport_mode.get() == "stdio" else None)
         # #8482: ...and repair the payload the tool's OWN schema forbids. Last,
         # so the classification above still sees the shape the dispatch
         # produced rather than the repaired one. The schema read is behind a

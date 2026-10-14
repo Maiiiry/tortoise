@@ -87,10 +87,16 @@ def _wire_payload(result) -> dict:
 
 
 def _schema_validates_against(payload, output_schema) -> bool:
-    """The rule the client applies — expressed without the 'array' shortcut.
+    """The client's rule — but only for ENVELOPE-shaped schemas.
 
-    The envelope's `result` must satisfy whatever the schema declares for it,
-    including the `anyOf` forms two registry tools use.
+    The envelope's `result` must satisfy whatever the schema declares for it.
+    ⚠️ SCOPE, stated because the sweep's prose used to overstate it: this reads
+    ``properties.result``, so it can only ever fail for a tool that HAS a
+    declared `result` contract — i.e. the 13 wrap-envelope tools. For the 69
+    object-annotated rows (`tortoise_recall`, `tortoise_status`, …) there is no
+    such property and this returns ``True`` unconditionally; those rows are
+    exercised for the refusal's shape and the retry signal, never validated
+    here. A union row (`anyOf`) is likewise accepted by construction.
     """
     structured = payload["structuredContent"]
     if structured is None:
@@ -111,6 +117,20 @@ def _schema_validates_against(payload, output_schema) -> bool:
 
 async def _registered_schema(name: str):
     return (await ms.mcp.get_tool(name)).output_schema
+
+
+def _envelope_result_type(schema: dict) -> str | None:
+    """The JSON-schema `type` an envelope declares for its `result` key.
+
+    A guard-LOCAL classifier (moved out of the production module: the seam
+    reads the same contract through ``_violates_wrap_envelope``, and a
+    production function with no production caller was flagged in review). It
+    buckets the sweep into typed vs union from the schema the sweep already
+    fetched. A union envelope declares `anyOf` (or nothing) and returns None.
+    """
+    prop = (schema.get("properties") or {}).get("result") or {}
+    declared = prop.get("type") if isinstance(prop, dict) else None
+    return declared if isinstance(declared, str) else None
 
 
 # ── The second factor: the RAISE, not the annotation ──────────────────────
@@ -452,7 +472,7 @@ async def test_every_wrap_envelope_tool_cannot_satisfy_a_failed_payload():
         assert ms._violates_wrap_envelope(schema, _WAIT_BOUND), (
             f"{entry.name}: a payload with no `result` is invalid against an "
             "envelope that requires one")
-        kind = await ms._wrap_envelope_result_type(entry.name)
+        kind = _envelope_result_type(schema)
         if kind is None:
             unions += 1
             assert not ms._violates_wrap_envelope(schema, _SAFE_FAILURE), (
@@ -588,6 +608,41 @@ async def test_the_auth_gate_is_classified_through_a_wrap_envelope(monkeypatch):
 
     assert events and events[0]["status"] == "auth_error"
     assert events[0]["error_kind"] == "stdio_auth_gate"
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "Authentication required" in _wire_payload(result)["text"]
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_tenant_refusal_is_not_labelled_the_stdio_gate(monkeypatch):
+    """The `auth_error` STATUS is right; the #236 KIND is not the producer.
+
+    `tortoise_packs_list` refuses on its OWN fail-closed branch when the HTTP
+    transport carries no tenant context — a hosted guard that never touches the
+    stdio gate (``tortoise/mcp_server.py``, the ``_current_org_id is None and
+    _transport_mode == "http"`` return). Its text shares the gate's
+    ``Authentication required`` prefix, so a prefix-only classifier claims it
+    for #236 and the metric no longer isolates the gate. The kind must follow
+    the TRANSPORT that refused.
+    """
+    events: list[dict] = []
+    monkeypatch.setattr(
+        ms, "_emit_mcp_tool_call_telemetry",
+        lambda org, name, status, latency, kind, count=None:
+        events.append({"status": status, "error_kind": kind}))
+    token = ms._transport_mode.set("http")
+    org = ms._current_org_id.set(None)
+    try:
+        result = await ms.mcp.call_tool("tortoise_packs_list", {})
+    finally:
+        ms._current_org_id.reset(org)
+        ms._transport_mode.reset(token)
+
+    assert events and events[0]["status"] == "auth_error", events
+    assert events[0]["error_kind"] is None, (
+        "an HTTP tenant-context refusal is not the #236 stdio gate: "
+        f"got {events[0]['error_kind']!r}")
+    # ...and the refusal is still legible to the client (the #8482 repair).
     assert result.is_error is True
     assert result.structured_content is None
     assert "Authentication required" in _wire_payload(result)["text"]

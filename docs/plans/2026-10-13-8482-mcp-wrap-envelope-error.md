@@ -34,9 +34,9 @@ part of it this seam must fix to stay self-consistent.
 
 | # | Step | Anchor |
 |---|------|--------|
-| 1 | `tortoise_search` is annotated `-> list[dict]` — a NON-object return | `tortoise/mcp_server.py:2147` (`def tortoise_search`) |
+| 1 | `tortoise_search` is annotated `-> list[dict]` — a NON-object return | `tortoise/mcp_server.py:2232` (`def tortoise_search`) |
 | 2 | FastMCP turns a non-object annotation into a wrap envelope: `{result: {type: array}, required: [result], x-fastmcp-wrap-result: true}` | `fastmcp/tools/function_parsing.py:349-351` |
-| 3 | `_safe` answers EVERY failure with a **dict** (`_SafeError`), never a list | `tortoise/mcp_server.py:1516,1534` (`_SafeError`, `_safe`) |
+| 3 | `_safe` answers EVERY failure with a **dict** (`_SafeError`), never a list | `tortoise/mcp_server.py:1601,1619` (`_SafeError`, `_safe`) |
 | 4 | `Tool._convert_result` wraps the serialized value **unconditionally** when the flag is set → `{"result": {"error": …}}`, and `is_error` stays **False** | `fastmcp/tools/base.py:363-369` |
 | 5 | A conforming client validates `structuredContent` against `outputSchema` whenever it is PRESENT → `-32602 InvalidParams: data/result must be array`; the SDK's message is discarded | TS SDK `callTool`, `utilsBundle.js:86191-86203` |
 | 6 | Second producer: the transport wait-bound refusal is built OUTSIDE FastMCP's envelope → `{"error": {…}}` with no `result`, while `result` is **required** | `tortoise/mcp_server.py:696-706` (`_await_under_mcp_wait_bound`) |
@@ -53,7 +53,7 @@ mode the issue warns against. The wrong shape is the **failure delivered in the 
 
 ## Architecture
 
-One seam: `_wrapped_call_tool` (`tortoise/mcp_server.py:1046`), the documented single dispatch point
+One seam: `_wrapped_call_tool` (`tortoise/mcp_server.py:1131`), the documented single dispatch point
 every tenant tool call crosses, which already inspects result shape (`_mcp_result_count`) and
 classifies failures. When the tool's own advertised schema proves the payload unreadable, the result
 is rewritten to the channel MCP has for failure — `content` kept (it carries the real message),
@@ -71,9 +71,10 @@ Two costs decided the design:
   legitimate non-list successes (`tortoise_delete_entity` → bool, `tortoise_query` →
   `{results, total, hasMore}`), so their success DOES schedule a schema read — but
   `_wrap_envelope_schema` memoises the classification per stored tool
-  (`_WRAP_ENVELOPE_SCHEMA_CACHE`, keyed `tool:<name>@<version>`), so the rebuild is paid once per
-  tool, not once per dispatch (measured: 40 → 21 `get_tool` calls over 20 union dispatches; the 21st
-  is FastMCP's own dispatch lookup).
+  (`_WRAP_ENVELOPE_SCHEMA_CACHE`, keyed `tool:<name>@<version>#<component id>` — the stored key
+  plus the identity of the LIVE component, so a same-name re-registration cannot be served a stale
+  schema), so the rebuild is paid once per tool, not once per dispatch (measured: 40 → 21 `get_tool`
+  calls over 20 union dispatches; the 21st is FastMCP's own dispatch lookup).
 - **Fail-open on an unreadable schema.** The repair only ever applies to a payload PROVEN to
   violate the declared schema, so a tool whose schema cannot be read keeps working. Fail-closed
   would break object-annotated tools, whose `_safe` dict is perfectly valid.
@@ -99,9 +100,10 @@ tool's success pays at most one memoised classification.
 **Files:**
 
 - Modify: `tortoise/mcp_server.py` (`_WRAP_ENVELOPE_SCHEMA_CACHE`, `_local_tool_cache_key`,
-  `_wrap_envelope_schema`, `_wrap_envelope_result_type`,
-  `_violates_wrap_envelope`, `_maybe_wrap_envelope_violation`, `_safe_failure_message`,
-  `_schema_error_result`; the repair in `_wrapped_call_tool`)
+  `_wrap_envelope_schema`, `_violates_wrap_envelope`, `_maybe_wrap_envelope_violation`,
+  `_safe_failure_message`, `_schema_error_result`; the repair in `_wrapped_call_tool`). The
+  typed-vs-union classifier lives in the guard as `_envelope_result_type` (a test helper — no
+  production caller)
 
 ### Task 2: the red-first test
 
@@ -154,10 +156,16 @@ No MCP tool is added, removed or renamed — the surface is owner-approved (82 r
 - Red first, against `origin/main` (the 12 tests that existed then): `8 failed, 4 passed`;
   `12 passed` with the fix. Red first for the follow-up tests: `10 failed, 4 passed` with the repair
   neutralised at runtime (the working-tree-discard guard refuses an in-place revert, #709), `14
-  passed` with it. The 4 that pass either way are the do-not-break guards.
+  passed` with it. The 4 that pass either way are the do-not-break guards. **Those counts are
+  historical and belong to the commit that produced them** — the guard has grown since (the auth
+  classification and envelope-memo cases were added later), so read the test file itself, not this
+  line, for the current total.
 - Repo-wide: 13 registry tools carry the envelope (11 typed + 2 union) — swept, not just the two
-  named. The guard now forces a refusal for ALL 82 registry tools and validates the result a client
-  would receive against each tool's OWN schema.
+  named. The guard forces a refusal for ALL 82 registry tools; the result a client would receive is
+  validated against the tool's OWN schema for the 13 wrap-envelope rows (the ones the helper can
+  read a `result` contract from). The 69 object/`anyOf` rows are exercised for the refusal's shape
+  and the retry signal only — `_schema_validates_against` is envelope-shaped by construction and
+  does not validate an object row's payload.
 - No regression: `test_mcp_server.py`, `test_mcp_telemetry.py`,
   `test_mcp_result_count_telemetry.py`, `test_3926_error_prop_guard.py`,
   `test_transport_wait_bound.py`, `test_surface_guard_pin_4606.py`, `test_markers.py` + the new file
