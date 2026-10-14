@@ -1001,6 +1001,14 @@ surfaces:
   # `test_durability_posture.py`), because a docs-only `docs/ONTOLOGY.md`
   # wording edit is what this guard is FOR.
   - test_5142_ontology_record.py
+  # #7818: the §4.7 coverage-boundary record vs `_covers` (closed `[vF, vT]`, the
+  # one shared instant of a well-formed contiguous chain, and the OPEN
+  # closed-vs-half-open decision). The hermetic doc half of the #7818 guard — the
+  # docker-lane contract half (`test_7818_boundary_ambiguity_contract.py`, `sdk`)
+  # cannot be reached by a docs edit. Same shape and same reason as the #5142 pin
+  # above; also registered in `tier1`, because a docs-only `docs/ONTOLOGY.md`
+  # wording edit is exactly what this pin is FOR.
+  - test_7818_ontology_record.py
   - test_2294_ask_degradation_gate.py
   - test_5051_capture_receipt_key_registry.py
   - test_5089_operator_prop_parity.py
@@ -3159,6 +3167,16 @@ surfaces:
   - test_identity_contract.py
   - test_sdk_now_iso_single_definition.py   # #5375: sdk.py must declare exactly one module-level `_now_iso` (hermetic — ast.parse + the bound global)
   - test_validity_window_contract_5374.py   # #5374: the shared `commit_schema.validate_validity_window` contract + read-path (`_covers`) agreement (docker-lane)
+  # #7818: the `get_historical_knowledge` reply contract (`status`/`found` on
+  # every shape — the `ambiguous` reply used to omit `found`, so a `.get("found")`
+  # consumer read two candidates as honest absence) AND the §4.7 coverage-boundary
+  # record (closed `_covers`, its shared-instant consequence, and the OPEN
+  # closed-vs-half-open decision). Registered under `sdk` because `tortoise/sdk.py`
+  # — a SHARED_MODULE that already forces the full matrix — carries the code half,
+  # and the doc half is `docs/ONTOLOGY.md`; without a registration
+  # test_integrity_covers_all_test_files reds (docker-lane; URI-less it needs
+  # TORTOISE_TEST_CARVE_OUT=1).
+  - test_7818_boundary_ambiguity_contract.py
   - test_log.py
   - test_5917_torn_tail_seal.py   # #5917: a torn tail is sealed by the next append + read byte-safely (the record after a tear used to be lost)
   - test_longmem_reader_aggregation.py
@@ -3385,6 +3403,7 @@ tier1:
 - test_decide.py
 - test_durability_posture.py  # #2881: durability authority + scoped source-of-truth gate
 - test_5142_ontology_record.py  # #5142: docs/ONTOLOGY.md §4.4/§4.6 record vs the code (format/`_SOURCE_HANDLED`, the deferred node collapse + its `OVERRIDES:`, the document `:Source` scoping) — dual-registered with `core`
+- test_7818_ontology_record.py  # #7818: docs/ONTOLOGY.md §4.7 coverage-boundary record vs `_covers` (hermetic doc pin; a docs-only ONTOLOGY edit runs only tier1) — dual-registered with `core`
 - test_ep_draft_filter.py
 - test_ep_operatorless.py
 - test_event_store.py

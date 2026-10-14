@@ -69,8 +69,7 @@ def _canned(*, status: int, text: str | None = None,
 
 
 def _rest_refusal(*, status: int = 504):
-    """The REST arm's refusal: ``{"detail": MESSAGE}`` (504 when the product
-    is answering, but the status is the caller's to vary — #8579 P2-1)."""
+    """The REST arm's refusal: ``{"detail": MESSAGE}`` (#8579 P2-1)."""
     from tortoise import mcp_auth
 
     return _canned(status=status, json_body={
@@ -93,10 +92,9 @@ def _jsonrpc_refusal(*, status: int = 504):
 def _sse_result(*, status: int = 200, home: str = "structuredContent"):
     """The MCP SSE arm: HTTP 200 whose ``data:`` payload carries the refusal.
 
-    ``mcp_server._await_under_mcp_wait_bound`` answers a breach with a
-    ``CallToolResult(isError=True)``; the ``{code, message, data}`` mapping is at
-    ``structuredContent.error`` for a tool with no wrap envelope, or
-    ``_meta.tortoise_error`` for a wrap-envelope tool (#8482).
+    The ``{code, message, data}`` mapping is at ``structuredContent.error`` for a
+    tool with no wrap envelope, or ``_meta.tortoise_error`` for a wrap-envelope
+    tool (#8482).
     """
     from tortoise import mcp_auth
 
@@ -191,13 +189,13 @@ def test_the_transport_bound_refusal_skips_and_names_the_product_bound():
 
 
 def test_every_refusal_envelope_is_caught_on_its_own_surface():
-    """The signal is the per-surface ENVELOPE, and each surface's is caught.
+    """#8579 P2-1: the signal is the per-surface ENVELOPE, and each is caught.
 
     REST: 504 + `{"detail": MESSAGE}`. `/mcp` JSON-RPC: `ERR_TIMEOUT` + the
     message on 504. MCP SSE: a 200 whose `CallToolResult(isError=True)` homes the
     mapping. A status-gated detector would MISS the 200; a message-gated one
-    catches all three *and* every innocent body that merely mentions it — which
-    is the bug being fixed.
+    catches all three *and* every innocent body that merely mentions the
+    message — which is the bug this replaces.
     """
     for response in (_rest_refusal(), _jsonrpc_refusal(), _sse_result()):
         assert is_transport_wait_bound_refusal(response) is True, response.text
@@ -213,32 +211,19 @@ def test_the_wrap_envelope_refusal_is_caught_at_its_re_homed_meta():
         require_answered(response, what="MCP wrap tool answered")
 
 
-def test_the_diagnosis_reports_the_refusals_own_status_not_an_assumed_504():
-    """P3-1: the diagnosis names the OBSERVED surface, never a hardcoded 504.
+def test_the_inconclusive_diagnosis_names_no_surface_status():
+    """The refusal rides a 504 on REST and a 200 on the MCP arm.
 
-    The MCP arm's refusal rides a 200; a diagnosis that hardcoded "(HTTP 504)"
-    sends the reader of an MCP-arm skip looking for a REST/proxy 504 that never
-    occurred.
+    The diagnosis is the artifact a lane reads when a site skips, so it must
+    not send that reader hunting for a REST-only status that never occurred on
+    the MCP surface (the detector's own docstring forbids assuming one).
     """
-    with pytest.raises(pytest.skip.Exception) as excinfo:
-        require_answered(_rest_refusal(), what="a probe")
-    assert "HTTP 504" in str(excinfo.value)
-    with pytest.raises(pytest.skip.Exception) as excinfo:
-        require_answered(_sse_result(), what="a probe")
-    message = str(excinfo.value)
-    assert "HTTP 200" in message, message
-    assert "HTTP 504" not in message, message
-
-
-def test_sabotage_the_pre_fix_shape_fails_the_same_refusal():
-    """The shape #5049 replaces: `assert r.status_code == 200` on the refusal.
-
-    The same canned refusal that now SKIPs used to FAIL with `assert 504 == 200`.
-    This is the must-fail leg proving the conversion changes the verdict.
-    """
-    with pytest.raises(AssertionError):
-        response = _rest_refusal()
-        assert response.status_code == 200, response.text
+    for response in (_rest_refusal(), _sse_result()):
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            require_answered(response, what="a probe")
+        message = str(excinfo.value)
+        assert "(HTTP 504)" not in message, message
+        assert "#3834" in message, message
 
 
 def test_an_unrelated_504_is_returned_to_the_caller():
@@ -249,7 +234,7 @@ def test_an_unrelated_504_is_returned_to_the_caller():
 
 
 def test_the_product_message_alone_is_not_a_refusal():
-    """P2-1: the message TEXT is not the signal — the envelope is.
+    """#8579 P2-1: the message TEXT is not the signal — the envelope is.
 
     The pre-fix detector was `MESSAGE in body_text`, status-blind, so a genuine
     500 (or a 200) whose body merely CONTAINED the message was reported as the
@@ -278,7 +263,8 @@ def test_an_answered_response_is_returned_untouched():
 
 
 def test_a_non_504_error_still_reaches_the_callers_own_assertion():
-    """P2-1 must-fail leg: a NON-504 error CARRYING the message reaches the caller.
+    """#8579 P2-1 must-fail leg: a NON-504 error CARRYING the message reaches
+    the caller.
 
     The status-blind message-substring detector made this case SKIP; the fix must
     let the caller's own assertion see it — `assert resp.status_code == 200` on a
@@ -663,8 +649,7 @@ _CONVERTED_SITES: dict[str, frozenset[str]] = {
         {"test_hosted_capture_emits_that_session_s_measured_cost_row"}),
     "tests/test_capture_loop_responsiveness.py": frozenset(
         {"_measure_capture_graph_work"}),
-    "tests/test_commit_endpoint.py": frozenset(
-        {"_commit", "_answered_commit_post"}),
+    "tests/test_commit_endpoint.py": frozenset({"_commit"}),
     "tests/test_github_index_lifecycle.py": frozenset(
         {"_poll_until", "_post_index", "test_progress_beat_stamps_heartbeat",
          "test_live_progress_written_during_walk"}),

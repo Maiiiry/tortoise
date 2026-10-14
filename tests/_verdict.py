@@ -303,27 +303,15 @@ def require_answered(response: Any, *, what: str) -> Any:
     unchanged.
     """
     if is_transport_wait_bound_refusal(response):
-        # The refusal's status differs by surface — 504 on the REST arm, a 200
-        # carrying `CallToolResult(isError=True)` on the MCP arm — so the
-        # diagnosis REPORTS the observed surface/status rather than assuming one.
-        # A hardcoded "(HTTP 504)" sent the reader of an MCP-arm skip looking
-        # for a REST/proxy 504 that never occurred (#8579 review).
-        refusal_status = getattr(response, "status_code", None)
-        if refusal_status == 504:
-            observed = "HTTP 504"
-        elif refusal_status == 200:
-            observed = "HTTP 200 carrying an MCP `isError` result"
-        else:
-            observed = "an unstated status"
-        diagnosis = (
-            "The product's transport wait bound refused the request "
-            f"({observed}) instead of answering it (#3834); the property "
-            "under test was never observed."
-        )
         inconclusive(
             what,
             deadline_s=transport_wait_bound_s(),
-            diagnosis=diagnosis,
+            diagnosis=(
+                "The product's transport wait bound refused the request instead "
+                "of answering it (#3834); the refusal's status differs by "
+                "surface (REST 504, MCP 200 with an isError result), so it is "
+                "named by neither — the property under test was never observed."
+            ),
         )
     return response
 

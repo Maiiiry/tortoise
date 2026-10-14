@@ -305,10 +305,10 @@ caller behind them):
 
 | Site / seam | Covers |
 |---|---|
-| `test_commit_endpoint.py::_commit` + `_answered_commit_post` | every `/v1/sessions/commit` POST in the file, including the direct raw-body / mismatched-id / unauthenticated posts that bypass `_commit` (#4627's own reproducer) |
-| `test_github_index_lifecycle.py::_poll_until` + `_post_index` + the two direct pump loops | the file's whole index path — every `GET /v1/index/github/<id>` AND every `POST /v1/index/github[/re-poll]` call site (the direct posts the first pass left unwrapped are the `KeyError: 'job_id'` mode, #8579 P3-2) |
-| `test_index_docs_api.py::_poll_until` + the three direct poll GETs | the file's whole poll path (`GET /v1/index/docs/<id>` at every call site) |
-| `test_capture_loop_responsiveness.py::_measure_capture_graph_work` | the measured `#3086` capture — the LOWER seam, so both the `_measure_on_loop_graph_work` wrapper and the direct `test_capture_does_not_repeat_the_schema_bootstrap_on_the_loop` caller are covered |
+| `test_commit_endpoint.py::_commit` | every hosted-app `/v1/sessions/commit` POST in the file — the seam plus the direct posts in `test_failed_write_retry_applies_the_counters_once`, `TestLayer1`, the 401 and body-cap sites (#4627's own reproducer) |
+| `test_github_index_lifecycle.py::_poll_until` + `_post_index` | the file's whole poll path (`GET /v1/index/github/<id>` including the pump-and-observe loops) AND every `POST /v1/index/github[/re-poll]` call site through one seam — the direct posts left unwrapped were the `KeyError: 'job_id'` mode (#8579 P3-2) |
+| `test_index_docs_api.py::_poll_until` | the file's whole `_poll_until` path, plus the pump-and-observe polls in `test_docs_live_progress_written_during_walk` and `test_docs_live_progress_all_branches_site` |
+| `test_capture_loop_responsiveness.py::_measure_capture_graph_work` | the measured `#3086` capture through **both** callers (`_measure_on_loop_graph_work` and the direct schema-bootstrap caller) — the LOWER seam, not the wrapper |
 | `test_one_free_org_entitlement.py::_post_signed` | the `/webhooks/stripe` seam |
 | `test_activation_scorecard.py::test_default_window_is_24h` | `#5049`'s `KeyError: 'window'` instance |
 | `test_pack_state.py::TestGetV1Packs` (2) | `#4883`/`#4816`'s measured GETs |
@@ -318,7 +318,10 @@ caller behind them):
 A dropped conversion at any row of this table is itself pinned:
 `tests/test_verdict_contract.py::test_every_converted_site_wires_the_verdict_contract`
 asserts each named seam/test body still calls `require_answered` (#8579 P3-3), so the
-conversion cannot be silently deleted back to a wall-clock FAIL.
+conversion cannot be silently deleted back to a wall-clock FAIL. Both `_poll_until`s
+additionally route their OWN wall-clock deadline through `require_within`, so a poll
+exhausting its budget SKIPs naming that budget instead of raising `AssertionError`
+(#8579 P2-2).
 
 **Remaining, deliberately not converted here:** the bare `assert r.status_code == 200`
 reads on non-exempt routes that sit behind no shared seam (≈1.7k across `tests/`, top
@@ -326,6 +329,12 @@ files `test_hosted_api.py`, `test_dr_endpoints.py`, `test_invites_http.py`). The
 one mechanism and one fix — route the response through `require_answered` — so the next
 lane converts the seam, not the leaf. `test_hosted_api.py`'s other three `#8122` nodeids
 are left to that issue's own retry-class handling.
+
+**Scope of the closure (recorded so the tracker does not read rule 1 as globally closed):**
+this increment closes rule 1 for the **transport-bound** path — every route and seam named
+in the table above — not for the ≈1.7k bare status reads behind no shared seam. The
+residual is tracked as **#8582** (the no-seam class), not an endorsement that the class is
+exhausted; `#5049` stays open until #8582 lands.
 
 ### Rule-1 driver inventory (the `wait_for` family the contract unifies)
 
