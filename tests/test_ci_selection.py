@@ -1225,12 +1225,18 @@ def test_record_schema_pin_runs_on_migration_or_doc_change():
     # fails the corresponding arm below (surfaces == []).
     for changed in (
         "supabase/migrations/20261012000003_record_epistemic.sql",
+        # #8263: the FORWARD record migration sorts outside the `2026101200000`
+        # CORE_ALSO prefix, so it carries its own entry. Both readers must run on
+        # a change to this file alone — `test_record_projection.py` reads its
+        # ALTER, `test_record_schema_placement.py` pins the record schema.
+        "supabase/migrations/20261014000001_record_subject_props_no_derived.sql",
         "docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md",
     ):
         r = _sel([changed])
         assert r["full"] is False, (changed, r)
         assert r["surfaces"] == ["core"], (changed, r)
         assert "test_record_schema_placement.py" in r["test_files"], (changed, r)
+        assert "test_record_projection.py" in r["test_files"], (changed, r)
 
 
 def test_a_linter_policy_file_at_any_depth_runs_the_full_matrix():
@@ -3146,7 +3152,12 @@ def test_pmv_job_carries_uri_manifest_guard():
     provision = next(s for s in steps
                      if str(s.get("uses", "")).endswith("falkordb-provision"))
     assert provision["with"]["uri_graph"] == "tortoise_test_matrix"
-    assert provision["with"]["image"] == "falkordb/falkordb-server:latest"
+    # #6386: this used to assert `:latest` — i.e. it GUARDED the drift instead
+    # of catching it, so the tag was free to float to engine 6.x while every
+    # other job ran the v4.20.6 pin. It must name the same immutable engine the
+    # gate uses (pinned across all provisioned jobs in
+    # tests/test_runner_ports_6673.py).
+    assert provision["with"]["image"] == "falkordb/falkordb-server:v4.20.6"
     assert provision.get("if") == "needs.dedup-check.outputs.skip != 'true'"
     assert any(str(s.get("uses", "")).endswith("falkordb-teardown")
                and s.get("if") == "always()" for s in steps), \

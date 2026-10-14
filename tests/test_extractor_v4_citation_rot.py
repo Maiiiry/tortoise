@@ -55,6 +55,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "EXTRACTOR-V4-ARCHITECTURE.md"
+STORAGE = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
+ONTOLOGY = ROOT / "docs" / "ONTOLOGY.md"
+INGEST = ROOT / "docs" / "INGEST_CONTRACT.md"
+EVAL_SPEC = ROOT / "docs" / "epistemic-layer-eval-spec.md"
+#: The documents that carry the same claims as `DOC`. Several of these claims
+#: were asserted in more than one document, and a repair that fixes one copy
+#: while leaving the others is how the drift survived a pass — so they are
+#: scanned too. `INGEST_CONTRACT.md` carries the `#2421` supersession claim in
+#: its recovery table; leaving it out is how a closed issue stayed named as the
+#: home of outstanding work after the siblings were swept (#8562 review round 2).
+#: `epistemic-layer-eval-spec.md` carries it too, at P6 (`Scoped per #2421`,
+#: `Case-2 TODO (#2421)`) — and it is the sibling `ONTOLOGY.md` cites for the
+#: P6.1/P6.2 belief-preservation assertions, so it is swept here as well
+#: (#8562 review round 3).
+SIBLINGS: tuple[Path, ...] = (
+    STORAGE,
+    ONTOLOGY,
+    INGEST,
+    EVAL_SPEC,
+)
 
 #: Literal sentences that were TRUE when the document was pinned and are FALSE
 #: at HEAD. Each was live in the pre-fix document (this file is red on it).
@@ -66,7 +86,7 @@ RETRACTED: dict[str, str] = {
         "The code half has NOT landed, and it is bounded by `#2489`"
     ),
     "§S0's Q5 row offers the migration as a live free-today window": (
-        "fold + change the replay key + migrate — **free TODAY, and that expires**"
+        "Fold + change the replay key + migrate — **free TODAY, and that expires**"
     ),
     "§S0's T6 finding states the version transition as unjournalled": (
         "**and neither is journalled.**"
@@ -92,33 +112,236 @@ RETRACTED: dict[str, str] = {
     ),
 }
 
+#: The same class of claim, asserted in the SIBLING documents. A repair that
+#: edits one document and not the others leaves the set asserting OPPOSITE facts
+#: about the same label — a contradiction between documents — so these are
+#: pinned in the siblings as well.
+#:
+#: Each literal is the ASSERTING phrasing, not a bare citation token: a bare
+#: token (`MATCH (d:Document`) also occurs inside the sentence that RETRACTS the
+#: claim, so it would red on an already-clean tree and tell a reader nothing.
+RETRACTED_IN_SIBLINGS: dict[str, str] = {
+    "the `:Document` writer is cited as live": (
+        "`_upsert_document`, `projection/entities.py:1527` → `MERGE (d:Document {id:$id})`"
+    ),
+    "the `:Document` reader is cited as live": (
+        "**read** (`ingest.py:188/266/307/412`"
+    ),
+    "`quota.py` is cited as metering `:Document`": (
+        "**quota-metered** (`quota.py:524`, `#1726`)"
+    ),
+    "`ONTOLOGY.md` §4.4 is cited as still declaring the label": (
+        "`ONTOLOGY.md` §4.4 still declares it"
+    ),
+    "the ontology half is cited as still-outstanding work": (
+        "the ontology change is filed as **`#5013`**"
+    ),
+    "the operator write path is cited as `:Point`/`:Event` only": (
+        "the write path admits `:Point`/`:Event` only"
+    ),
+    "the S1 slot is attributed to `VALUE_FIDELITY_RULE`": (
+        "`{anti_routine}` slot and appended to S1"
+    ),
+    "T6 is cited as producing the defect today": (
+        "and it is exactly what T6 above produces today"
+    ),
+    "`#5024` is cited as an outstanding precondition": (
+        "**`#5024` is its precondition**"
+    ),
+    "`doc_status` is cited as transitioning": (
+        "`doc_status` transitions **`captured`→`extracted`**"
+    ),
+    "`doc_status` is cited as a live unjournalled write": (
+        "its `captured`→`extracted` flip is currently an **unjournalled raw Cypher write**"
+    ),
+    "the truth set is counted as four types": (
+        "**The truth set is these four types ∪ the preserved config classes**"
+    ),
+    "the node cap is enumerated without `:Event`": (
+        "the main node cap counts `(:Point …) OR (:Object) OR (:Subject)`"
+    ),
+    "mechanical enforcement is cited as missing rather than off": (
+        "What is MISSING is mechanical enforcement"
+    ),
+    "the Q5 migration is offered as a free-today window": (
+        "fold, change the key, migrate — and it is free today"
+    ),
+    "the vector trace is cited as unable to tell an index hit from a scan": (
+        "cannot distinguish an index hit from a table scan"
+    ),
+    "§12.1b is cited as still reporting `ok` on the full-scan path": (
+        "the trace reports `ok` for a full scan"
+    ),
+    "the §14.3 V4 row is cited as still unable to tell an index hit from a full scan": (
+        "the trace cannot tell an index hit from a full scan"
+    ),
+    "the §13 §12.1b row is cited as a full scan reporting `ok` with no mechanism": (
+        "`Object`/`Event` full-scan and report `ok`"
+    ),
+    "the §12.1b observability defect is cited as a separate, still-open filing": (
+        "is filed separately as `#4999`"
+    ),
+    "`§13` marks the `#4997` measurement as closing the still-live defect": (
+        "MEASURED ON THE LIVE GRAPH AND FILED: `#4997` — CLOSED `COMPLETED`"
+    ),
+    "the direction-sourcing gap is cited as `#7813`'s and still open": (
+        "(#7813) — a separate, still-open gap"
+    ),
+    "the `CORRECTS` row attributes the untracked triage to `#2421`": (
+        "restatement-scoped per #2421"
+    ),
+    "ONTOLOGY §5.5 says the unimplemented triage decomposes under `#2421`": (
+        "the per-edge triage decomposes under #2421"
+    ),
+    "the lifecycle table reads `#2421`'s triage as implemented": (
+        "(#2421 — semantic edges triaged per-edge, not bulk-transferred)"
+    ),
+    "`INGEST_CONTRACT` names `#2421` as the future policy home": (
+        "the #2421 restatement-vs-correction policy will replace the universal transfer"
+    ),
+    "the shared replacement-edge semantics name `#2421` with no closed-design qualifier": (
+        "restatement-vs-correction policy** (#2421)."
+    ),
+    "the eval spec scopes belief-preservation to `#2421` with no closed-design qualifier": (
+        "**Scoped per #2421:**"
+    ),
+    "the eval spec names `#2421` as the home of the outstanding Case-2 TODO": (
+        "**Case-2 TODO (#2421):**"
+    ),
+}
+
+#: Sibling passages that must POSITIVELY state the landed fact. The retracted-only
+#: scan above catches a stale claim PUT BACK; this catches the opposite — a
+#: corrected passage silently DELETED, which would otherwise pass by omission.
+#:
+#: Each entry names its OWN document and is checked against THAT document only:
+#: a combined-text check cannot tell a correction from a relocation, so a landed
+#: passage deleted from one sibling would pass on the strength of the other.
+LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
+    (
+        STORAGE,
+        "STORAGE records the vector-trace mechanism as landed",
+        "the trace now records the mechanism (`index` / `scan` / `scan_fallback`)",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY tracks the direction-sourcing gap as `#7852`",
+        "tracked as `#7852` (`#7813` is CLOSED `COMPLETED`)",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY states `#2421` closed with the triage untracked",
+        "the per-edge triage is NOT yet implemented and has no open tracker",
+    ),
+    (
+        STORAGE,
+        "STORAGE separates the closed `#4997` measurement from the still-live defect",
+        "the measurement half is CLOSED `COMPLETED`; the unindexed-embeddings defect it measured is still LIVE",
+    ),
+    (
+        STORAGE,
+        "STORAGE's §14.3 V4 row states the trace mechanism as landed",
+        "so a full scan is distinguishable from an index hit",
+    ),
+    (
+        INGEST,
+        "INGEST_CONTRACT records `#2421` as the closed design, not the open tracker",
+        "the restatement-vs-correction policy (designed in `#2421`, CLOSED `COMPLETED`)",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY attributes the untracked triage to the closed design, not a tracker",
+        "the design was #2421 (CLOSED `COMPLETED`) and it has no open tracker",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY's shared replacement-edge semantics qualify `#2421` as the closed design",
+        "restatement-vs-correction policy** (#2421 — the design is CLOSED `COMPLETED`; the per-edge triage is not implemented and has no open tracker)",
+    ),
+    (
+        EVAL_SPEC,
+        "the eval spec scopes P6 to the `#2421` design with the triage untracked",
+        "**Scoped per the `#2421` design (CLOSED `COMPLETED`; the per-edge triage is not implemented and has no open tracker):**",
+    ),
+    (
+        EVAL_SPEC,
+        "the eval spec names the closed `#2421` design, not a tracker, on the Case-2 TODO",
+        "the design was `#2421`, CLOSED `COMPLETED`; no open tracker",
+    ),
+    (
+        STORAGE,
+        "STORAGE states the `:Document` label as retired",
+        "The `:Document` NODE label is retired",
+    ),
+    (
+        STORAGE,
+        "STORAGE states `doc_status` as retired",
+        "`doc_status` is **RETIRED** (`tortoise/api.py:458`)",
+    ),
+    (
+        STORAGE,
+        "STORAGE separates the open tracker entry from the landed D10 work",
+        "D10 code-half work done: `#5024`, `#5025`, `#5026`",
+    ),
+    (
+        STORAGE,
+        "STORAGE states the Q5 keys as non-interchangeable",
+        "**A `:Document` key and a `:Source` key are not interchangeable**",
+    ),
+    (
+        STORAGE,
+        "STORAGE counts the truth set as three types",
+        "**The truth set is these three types ∪ the preserved config classes**",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY states the operator endpoints as live",
+        "operator endpoints are live (`#7902`)",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY records `#5126` as landed, not as an open residual",
+        "**Landed:** `#5126`",
+    ),
+    (
+        STORAGE,
+        "STORAGE states the `#5422` ownership gap as closed",
+        "`#5422` (its ownership gap) is CLOSED `COMPLETED`",
+    ),
+)
+
 #: The repaired passages must SAY what landed, not merely omit the old claim —
 #: an omission-only guard passes over a passage that is silently deleted rather
-#: than corrected.
+#: than corrected. The literals are the documents' CANONICAL wording: each
+#: repaired passage states the fact together with its authority (`#N`, PR,
+#: `file:line`) and does not record how the passage changed — history lives in
+#: git, and a claim about a correction has no artifact to check it against, so
+#: it can only re-stale.
 LANDED_STATEMENTS: dict[str, str] = {
-    "§S0 states the D10 code half as landed": "#5026` is **CLOSED `COMPLETED`**",
-    "§S0 states both D10 halves landed": "BOTH halves are landed",
-    "§S0's Q3 row says `doc_status` is no longer an extractor input": (
-        "**It is no longer an extractor input:**"
+    "§S0 states the D10 code half as landed": "D10 is LANDED — both halves.",
+    "§D's provenance row records the retirement": (
+        "✅ **NOW TRUE** — the `:Document` NODE label is **retired**"
+    ),
+    "§S0's Q3 row says `doc_status` is retired": (
+        "RETIRED** (`tortoise/api.py:458`)"
     ),
     "§S0's Q5 row says the migration is done": (
         "Fold + change the replay key + migrate — **✅ DONE 2026-09-25**"
     ),
-    "§S0's T6 finding says the transition is now journalled": (
-        "**✅ Today the transition IS journalled:**"
+    "§S0's T6 finding says the transition is journalled": (
+        "journalled as `SourceVersioned`"
     ),
-    "§7 says the operator endpoints are no longer spec-only": (
-        "`#7902` is CLOSED `COMPLETED` (2026-10-11)"
+    "§7 says the operator endpoints are live": (
+        "operator endpoints are live (`#7902`)"
     ),
-    "§S2.3's row says `llm_tail` is not a Jev seam": "**⚠️ NOT a Jev seam**",
+    "§S2.3's row says Jev needs an adapter, not a seam": (
+        "Jev requires an adapter, a prompt and a parser"
+    ),
     "§7 names the constant the S1 slot actually appends": (
-        "`_granularity_text()` appends `STATE_VALUE_CARVE_OUT` to S1"
+        "appends `STATE_VALUE_CARVE_OUT` to S1"
     ),
-    "§S0 separates the open tracker entry from the three closed ones": (
-        "**Tracked: `#5038` (OPEN"
-    ),
-    "§D's provenance table records the retirement": (
-        "**D10 has since retired the label**"
+    "§S0 separates the open tracker entry from the three landed ones": (
+        "**`#5038`** (open)"
     ),
 }
 
@@ -134,6 +357,36 @@ def test_the_retracted_passages_do_not_reappear():
         "these passages were false at the pin and are false at HEAD; the "
         "#8506 repair removed them, so their return means the document is "
         "re-rotating:\n  - " + "\n  - ".join(still_live)
+    )
+
+
+def test_the_sibling_documents_do_not_carry_the_retracted_claims():
+    hits = []
+    for doc in SIBLINGS:
+        text = doc.read_text(encoding="utf-8")
+        hits += [
+            f"{doc.name}: {name}"
+            for name, literal in RETRACTED_IN_SIBLINGS.items()
+            if literal in text
+        ]
+    assert not hits, (
+        "these claims were retracted across the document set, and a document "
+        "still carries them — a repair that fixes one copy and leaves the others "
+        "makes the documents contradict each other:\n  - " + "\n  - ".join(hits)
+    )
+
+
+def test_the_sibling_documents_state_the_landed_facts():
+    missing = [
+        f"{doc.name}: {name}"
+        for doc, name, literal in LANDED_STATEMENTS_IN_SIBLINGS
+        if literal not in doc.read_text(encoding="utf-8")
+    ]
+    assert not missing, (
+        "the corrected sibling passages no longer state the landed fact in their "
+        "OWN document — a passage was silently deleted rather than corrected, or "
+        "moved to a document that does not own the claim:\n  - "
+        + "\n  - ".join(missing)
     )
 
 
