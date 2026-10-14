@@ -2710,6 +2710,29 @@ _JOURNAL_ENVELOPE_KEYS = (
     "event_id", "ts", "recorded_ts", "initiated_by", "projection_version",
 )
 
+#: The `_JOURNAL_ENVELOPE_KEYS` names that must be refused at prop INTAKE, not
+# merely stripped from the record. Two collision mechanisms, neither visible
+# from inside `_emit_event`:
+#
+# * ``recorded_ts`` / ``point`` / ``payload`` are `_emit_event` PARAMETERS, and
+#   Python binds a ``**props`` key to a named parameter AT THE CALL — so any
+#   door that splats caller props into the call turns the prop into that
+#   parameter. ``recorded_ts`` forges the record's envelope ``ts``;
+#   ``point`` hands the record a CALLER-AUTHORED node snapshot, which the
+#   rebuild then replays (measured on ``update_point``, #2296 review).
+# * ``type`` is the key BOTH the live fold and the journal record dispatch on,
+#   so a prop of that name re-types or silently SUPPRESSES the record
+#   (measured: ``create_document(type="SourceCreated")`` journalled NOTHING,
+#   and ``rebuild_all`` destroyed the node — the #2296 defect itself, reachable
+#   through a caller prop).
+#
+# ``id`` is deliberately absent: it has its own FAIL-CLOSED contract
+# (`_sanitize_props(reject_id=True)` raises), which a silent strip would
+# weaken. ``ts`` / ``event_id`` / ``initiated_by`` / ``projection_version`` are
+# absent too: they collide only through ``event.update(extra)`` precedence (a
+# documented, pre-existing contract) and stay the #8553 live != replay residue.
+_RESERVED_ENVELOPE_PROPS = ("recorded_ts", "type", "point", "payload")
+
 #: The canonical record types a live entity door may journal.
 # `DocumentCreated` (#2296) joins the set: the last unjournaled canonical
 # create, now appended by `_create_entity`'s Document arm (`.query`-invisible —
@@ -2729,10 +2752,10 @@ def _journal_record_payload(event: dict) -> dict:
     fold re-derives ``ingestedAt``/``updatedAt`` at replay. For an envelope name
     a write door does NOT drop from the live event, the caller prop survives
     LIVE while this strips it — the live ≠ replay residue tracked as #8553.
-    ``recorded_ts`` is NOT in that residue: it is an `_emit_event` parameter
-    name, stripped at prop INTAKE (``_sanitize_props``) so it can never be bound
-    to that parameter, and popped explicitly by the doors that bypass intake
-    (``create_source``) or emit unconditionally (``_create_entity``).
+    ``recorded_ts``, ``type``, ``point`` and ``payload`` are NOT in that
+    residue: they are `_RESERVED_ENVELOPE_PROPS`, stripped at prop INTAKE
+    (``_sanitize_props``) so none of them can reach ``_emit_event`` as a call
+    argument, and dropped by the door that bypasses intake (``create_source``).
     """
     return {k: v for k, v in event.items() if k not in _JOURNAL_ENVELOPE_KEYS}
 
@@ -2933,11 +2956,12 @@ def _sanitize_props(props: dict, *, reject_id: bool = False,
     # bypass this intake (`create_source` pops the key itself) and the reserved
     # actor keys above: it is an ENVELOPE name (`_JOURNAL_ENVELOPE_KEYS`), not a
     # tenant property, so dropping it also keeps live == replay.
-    if "recorded_ts" in props:
-        _logger.warning(
-            "ignoring client-supplied 'recorded_ts' on tenant props "
-            "(reserved journal-envelope name)")
-        props.pop("recorded_ts")
+    for _envelope_prop in _RESERVED_ENVELOPE_PROPS:
+        if _envelope_prop in props:
+            _logger.warning(
+                "ignoring client-supplied %r on tenant props "
+                "(reserved journal-envelope name)", _envelope_prop)
+            props.pop(_envelope_prop)
     # #4647: a value the store cannot hold without altering it must fail here,
     # not be silently clamped/rounded by FalkorDB on the way in.
     for _key, _value in props.items():
@@ -5486,9 +5510,10 @@ class TortoiseSDK:
         ``event["ts"]`` — this function cannot observe the collision. The strip
         therefore happens at prop INTAKE (``_sanitize_props``, the one surface
         ``create_point``/``update_point``/``create_entity``/``update_entity``
-        all pass through) and explicitly at the doors that bypass intake
-        (``create_source`` pops it) or emit unconditionally (``_create_entity``)
-        — the same all-labels rule those doors apply to ``point``/``payload``.
+        all pass through) and explicitly at the door that bypasses intake
+        (``create_source``) — see ``_RESERVED_ENVELOPE_PROPS``, which reserves
+        the same way (and for the same call-time-binding reason) this
+        function's other parameter names ``point``/``payload``.
         Measured before the intake strip: ``update_point``'s props splat turned
         the prop into the ``PointRevised`` record's ``ts`` (#2296 review). The
         name is also in ``_JOURNAL_ENVELOPE_KEYS``, so the record strips it
@@ -24094,8 +24119,16 @@ class TortoiseSDK:
         if is_episodic is not None:
             props["is_episodic"] = is_episodic  # server-managed (explicit param only)
         proj = self._get_proj()
-        # Build event dict
+        # Build event dict. (#2296 review) The ENVELOPE owns `type`: the
+        # `**props` splat would otherwise let a caller prop of that name become
+        # the type BOTH the live fold and the journal record dispatch on —
+        # measured, `create_document(type="SourceCreated")` journalled nothing
+        # and `rebuild_all` destroyed the node. `_sanitize_props` strips it for
+        # every sanitizing caller; this re-assert covers the `_skip_sanitize`
+        # lane (`create_source`), which bypasses that intake. Assigned rather
+        # than reordered so the dict's key order is unchanged.
         event = {"type": event_type, "id": id_val, **props}
+        event["type"] = event_type
         # Normalize field names for projection compatibility
         if label == "Subject" and "subjectKind" in props:
             event["subject_kind"] = props["subjectKind"]
@@ -24134,14 +24167,12 @@ class TortoiseSDK:
             # (Tenant-visible narrowing — see docs/ONTOLOGY.md §4.2/§4.3.)
             event.pop("point", None)
             event.pop("payload", None)
-        # #2296 review: `recorded_ts` is `_emit_event`'s own PARAMETER (it binds
-        # the envelope `ts`), so — like point/payload — a caller prop of that
-        # name must not persist LIVE either. The record strips it
-        # (`_JOURNAL_ENVELOPE_KEYS`), so keeping it here would be the live ≠
-        # replay divergence #8553 tracks. Unconditional (all labels) for the
-        # same reason the block above is: the pop must not depend on journal
-        # config.
-        event.pop("recorded_ts", None)
+        # #2296 review: `recorded_ts`/`type`/`point`/`payload` are reserved
+        # envelope names and are stripped at prop intake (`_sanitize_props`),
+        # and `point`/`payload` are ALSO popped just above for the lane that
+        # bypasses that intake. No separate `recorded_ts` pop is needed here:
+        # `create_source` (the only `_skip_sanitize` caller) drops it from its
+        # own event dict before this funnel ever sees it.
         # (#2194) Journal ObjectRegistered on FIRST canonical registration
         # only — probe the deterministic canonical id + name
         # (obj-<sha26(name)>) before apply. The name conjunct hardens against
@@ -27954,14 +27985,15 @@ class TortoiseSDK:
                 __import__('datetime').timezone.utc).isoformat(),
             **props,
         }
-        # #2296 review: `recorded_ts` is `_emit_event`'s own PARAMETER (it binds
-        # the envelope `ts`). This door emits its OWN record (`SourceCreated` /
-        # `SourceVersioned`) and does not go through `_journal_entity_event`, so
-        # `_create_entity`'s live pop cannot cover it — a caller prop of that
-        # name would bind the parameter and forge the record's envelope `ts`.
-        # Envelope-reserved: drop it (same semantics as point/payload in
-        # `_create_entity`).
-        ev.pop("recorded_ts", None)
+        # #2296 review: this door bypasses `_sanitize_props`
+        # (`_skip_sanitize=True`), so the shared intake strip cannot cover it —
+        # and these are the envelope names that are `_emit_event` PARAMETERS
+        # (`recorded_ts` binds the record's `ts`; `point`/`payload` bind the
+        # record's snapshot/payload) or the record's dispatch key (`type`).
+        # Envelope-reserved: drop them, as `_create_entity` drops
+        # point/payload on its own route.
+        for _envelope_prop in _RESERVED_ENVELOPE_PROPS:
+            ev.pop(_envelope_prop, None)
         if is_episodic is not None:
             # #1488: server-managed quota discriminator — explicit param only
             # (mirrors create_point). The props passthrough is rejected above.
