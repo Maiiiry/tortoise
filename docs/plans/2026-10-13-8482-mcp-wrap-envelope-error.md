@@ -34,12 +34,16 @@ part of it this seam must fix to stay self-consistent.
 
 | # | Step | Anchor |
 |---|------|--------|
-| 1 | `tortoise_search` is annotated `-> list[dict]` — a NON-object return | `tortoise/mcp_server.py:2232` (`def tortoise_search`) |
+| 1 | `tortoise_search` is annotated `-> list[dict]` — a NON-object return | `tortoise/mcp_server.py` (`def tortoise_search`) |
 | 2 | FastMCP turns a non-object annotation into a wrap envelope: `{result: {type: array}, required: [result], x-fastmcp-wrap-result: true}` | `fastmcp/tools/function_parsing.py:349-351` |
-| 3 | `_safe` answers EVERY failure with a **dict** (`_SafeError`), never a list | `tortoise/mcp_server.py:1601,1619` (`_SafeError`, `_safe`) |
+| 3 | `_safe` answers EVERY failure with a **dict** (`_SafeError`), never a list | `tortoise/mcp_server.py` (`_SafeError`, `_safe`) |
 | 4 | `Tool._convert_result` wraps the serialized value **unconditionally** when the flag is set → `{"result": {"error": …}}`, and `is_error` stays **False** | `fastmcp/tools/base.py:363-369` |
 | 5 | A conforming client validates `structuredContent` against `outputSchema` whenever it is PRESENT → `-32602 InvalidParams: data/result must be array`; the SDK's message is discarded | TS SDK `callTool`, `utilsBundle.js:86191-86203` |
-| 6 | Second producer: the transport wait-bound refusal is built OUTSIDE FastMCP's envelope → `{"error": {…}}` with no `result`, while `result` is **required** | `tortoise/mcp_server.py:696-706` (`_await_under_mcp_wait_bound`) |
+| 6 | Second producer: the transport wait-bound refusal is built OUTSIDE FastMCP's envelope → `{"error": {…}}` with no `result`, while `result` is **required** | `tortoise/mcp_server.py` (`_await_under_mcp_wait_bound`) |
+
+> Anchor convention: `tortoise/mcp_server.py` rows name the SYMBOL, not a line number. Two review
+> rounds corrected four line anchors and a main merge invalidated all four again — the symbol
+> locates the code and does not drift.
 
 **The discriminator the issue could not find** is the RAISE, not the annotation. The four tools it
 could not separate (`tortoise_check_structure`, `tortoise_packs_list`, `tortoise_list_batches`,
@@ -53,7 +57,7 @@ mode the issue warns against. The wrong shape is the **failure delivered in the 
 
 ## Architecture
 
-One seam: `_wrapped_call_tool` (`tortoise/mcp_server.py:1131`), the documented single dispatch point
+One seam: `_wrapped_call_tool` (`tortoise/mcp_server.py`), the documented single dispatch point
 every tenant tool call crosses, which already inspects result shape (`_mcp_result_count`) and
 classifies failures. When the tool's own advertised schema proves the payload unreadable, the result
 is rewritten to the channel MCP has for failure — `content` kept (it carries the real message),
