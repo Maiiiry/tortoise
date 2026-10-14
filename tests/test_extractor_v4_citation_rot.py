@@ -57,13 +57,17 @@ ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "EXTRACTOR-V4-ARCHITECTURE.md"
 STORAGE = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
 ONTOLOGY = ROOT / "docs" / "ONTOLOGY.md"
+INGEST = ROOT / "docs" / "INGEST_CONTRACT.md"
 #: The documents that carry the same claims as `DOC`. Several of these claims
 #: were asserted in more than one document, and a repair that fixes one copy
 #: while leaving the others is how the drift survived a pass — so they are
-#: scanned too.
+#: scanned too. `INGEST_CONTRACT.md` carries the `#2421` supersession claim in
+#: its recovery table; leaving it out is how a closed issue stayed named as the
+#: home of outstanding work after the siblings were swept (#8562 review round 2).
 SIBLINGS: tuple[Path, ...] = (
     STORAGE,
     ONTOLOGY,
+    INGEST,
 )
 
 #: Literal sentences that were TRUE when the document was pinned and are FALSE
@@ -159,8 +163,32 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "the vector trace is cited as unable to tell an index hit from a scan": (
         "cannot distinguish an index hit from a table scan"
     ),
+    "§12.1b is cited as still reporting `ok` on the full-scan path": (
+        "the trace reports `ok` for a full scan"
+    ),
+    "the §14.3 V4 row is cited as still unable to tell an index hit from a full scan": (
+        "the trace cannot tell an index hit from a full scan"
+    ),
+    "the §12.1b observability defect is cited as a separate, still-open filing": (
+        "is filed separately as `#4999`"
+    ),
+    "`§13` marks the `#4997` measurement as closing the still-live defect": (
+        "MEASURED ON THE LIVE GRAPH AND FILED: `#4997` — CLOSED `COMPLETED`"
+    ),
     "the direction-sourcing gap is cited as `#7813`'s and still open": (
         "(#7813) — a separate, still-open gap"
+    ),
+    "the `CORRECTS` row attributes the untracked triage to `#2421`": (
+        "restatement-scoped per #2421"
+    ),
+    "ONTOLOGY §5.5 says the unimplemented triage decomposes under `#2421`": (
+        "the per-edge triage decomposes under #2421"
+    ),
+    "the lifecycle table reads `#2421`'s triage as implemented": (
+        "(#2421 — semantic edges triaged per-edge, not bulk-transferred)"
+    ),
+    "`INGEST_CONTRACT` names `#2421` as the future policy home": (
+        "the #2421 restatement-vs-correction policy will replace the universal transfer"
     ),
 }
 
@@ -186,6 +214,26 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
         ONTOLOGY,
         "ONTOLOGY states `#2421` closed with the triage untracked",
         "the per-edge triage is NOT yet implemented and has no open tracker",
+    ),
+    (
+        STORAGE,
+        "STORAGE separates the closed `#4997` measurement from the still-live defect",
+        "the measurement half is CLOSED `COMPLETED`; the unindexed-embeddings defect it measured is still LIVE",
+    ),
+    (
+        STORAGE,
+        "STORAGE's §14.3 V4 row states the trace mechanism as landed",
+        "so a full scan is distinguishable from an index hit",
+    ),
+    (
+        INGEST,
+        "INGEST_CONTRACT records `#2421` as the closed design, not the open tracker",
+        "the restatement-vs-correction policy (designed in `#2421`, CLOSED `COMPLETED`)",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY attributes the untracked triage to the closed design, not a tracker",
+        "the design was #2421 (CLOSED `COMPLETED`) and it has no open tracker",
     ),
     (
         STORAGE,
