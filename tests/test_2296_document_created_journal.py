@@ -127,7 +127,11 @@ def test_the_record_carries_the_applied_payload(env):
     the envelope value), so live ≠ replay for that key. That is the
     pre-existing envelope-key class — also reachable via ``create_source``'s
     ``**props`` splat — not introduced by #2296, tracked as #8553, and not
-    asserted here.
+    asserted here. ``recorded_ts`` is EXCLUDED by the code rather than left to
+    #8553: it is the name of an ``_emit_event`` PARAMETER, so a caller prop of
+    it would bind that parameter and forge the record's envelope ``ts``; it is
+    in ``_JOURNAL_ENVELOPE_KEYS`` and popped from the live event in
+    ``_create_entity``.
     """
     sdk, events = env
     doc = sdk.create_document("Payload Doc", "report")
@@ -166,6 +170,35 @@ def test_the_record_carries_the_applied_payload(env):
     assert after["updatedAt"] != live["updatedAt"], (
         "updatedAt is re-stamped at rebuild time — the live value must not "
         "survive the replay")
+
+
+def test_a_recorded_ts_prop_cannot_forge_the_envelope(env):
+    """A caller ``recorded_ts`` prop is an ``_emit_event`` PARAMETER name, not
+    a domain prop. It must not bind the envelope ``ts`` (the record's ts is
+    minted by ``_emit_event``), and it must not persist live either — the
+    record strips it, so keeping it live would be the #8553 live ≠ replay
+    divergence. FAILS IF ``recorded_ts`` leaves ``_JOURNAL_ENVELOPE_KEYS``
+    (the record's ``ts`` becomes caller-controlled) or the live pop is
+    removed."""
+    sdk, events = env
+    forged = "1999-01-01T00:00:00+00:00"
+    # The record side: `recorded_ts` is an `_emit_event` PARAMETER name, so it
+    # must be stripped from EVERY entity-door payload (the tuple entry), not
+    # only from the one call this test happens to drive.
+    from tortoise.sdk import _journal_record_payload
+    assert "recorded_ts" not in _journal_record_payload(
+        {"type": "DocumentCreated", "id": "x", "recorded_ts": forged}), (
+        "`recorded_ts` is an `_emit_event` parameter name and must be stripped "
+        "from every entity-door record payload — leaving it in lets a caller "
+        "prop bind the `recorded_ts` parameter and forge the envelope `ts`")
+    doc = sdk.create_document("Forged", "report", recorded_ts=forged)
+    rec = _document_created(events)[0]
+    assert rec["ts"] != forged, (
+        "a caller `recorded_ts` prop forged the record's envelope ts")
+    live = _sources(sdk._get_proj(), doc["id"])[0][0]
+    assert "recorded_ts" not in live, (
+        "a caller `recorded_ts` prop persisted live while the record strips "
+        "it — the #8553 live != replay divergence")
 
 
 def test_document_mutation_survives_rebuild(env):

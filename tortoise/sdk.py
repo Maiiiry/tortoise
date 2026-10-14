@@ -2680,12 +2680,13 @@ _GRAPH_EVENT_TYPES = frozenset({
 # KNOWN DEVIATIONS in this tree (recorded, not concealed):
 # `TortoiseSDK._create_entity`'s Object/Subject/Event registration blocks are
 # apply-first although their payload (`event`) is fully built BEFORE the fold,
-# so they qualify for neither exception; they also fold after a FAILED append
-# (`_emit_event` is best-effort). They are left as-is in this increment because
-# reordering them rides the #2194/#2295/#2309 first-registration hardening and
-# its pinned tests; `create_point`'s payload is genuinely post-apply
-# (exception 2). The `DocumentCreated` arm (#2296) DOES append first (its
-# record is a plain id-keyed entity create, and its append is replay-healable)
+# so they qualify for neither exception; they also fold regardless of a FAILED
+# append (`_emit_event` is best-effort). They are left as-is in this increment
+# because reordering them rides the #2194/#2295/#2309 first-registration
+# hardening and its pinned tests; `create_point`'s payload is genuinely
+# post-apply (exception 2). The `DocumentCreated` arm (#2296) DOES append
+# first (its record is a plain id-keyed entity create, and its append is
+# replay-healable)
 # but shares the fail-soft half: one funnel applies once for every arm, and
 # its Object/Subject/Event blocks pin `test_object_registered_journal.py::
 # test_log_append_failure_warns_and_keeps_live` (an append failure must not
@@ -2699,10 +2700,14 @@ _GRAPH_EVENT_TYPES = frozenset({
 # from an already-built event dict must not carry its own copy of these — a
 # caller prop of the same name would shadow the envelope on replay (see
 # ``_emit_event``'s ``event.update(extra)``). Kept as one tuple so the live
-# entity doors cannot drift from each other.
+# entity doors cannot drift from each other. `recorded_ts` (#5048) is the
+# NAMED-PARAMETER twin of `ts` and is owned the same way: without it here, a
+# caller prop of that name binds the timestamp parameter and forges the
+# record's envelope `ts` (#2296 review). The caller-prop live/replay residue
+# for these names generally is #8553.
 _JOURNAL_ENVELOPE_KEYS = (
     "type", "id", "point", "payload",
-    "event_id", "ts", "initiated_by", "projection_version",
+    "event_id", "ts", "recorded_ts", "initiated_by", "projection_version",
 )
 
 #: The canonical record types a live entity door may journal.
@@ -2718,8 +2723,12 @@ def _journal_record_payload(event: dict) -> dict:
     """``event``'s payload minus the keys ``_emit_event`` owns.
 
     THE single source of the rule every entity-door journal call uses
-    (``_create_entity`` and ``_journal_entity_event``), so live and replay
-    fold a byte-identical record — ``derived = replay(journal)``.
+    (``_create_entity`` and ``_journal_entity_event``), so the record's PAYLOAD
+    is byte-identical to the live event's payload. The RECORD is not: the
+    envelope keys above are added by ``_emit_event`` after this call, and the
+    fold re-derives ``ingestedAt``/``updatedAt`` at replay. A caller prop whose
+    NAME collides with an envelope key is dropped here while the LIVE fold
+    keeps it — the live ≠ replay residue tracked as #8553.
     """
     return {k: v for k, v in event.items() if k not in _JOURNAL_ENVELOPE_KEYS}
 
@@ -5449,11 +5458,13 @@ class TortoiseSDK:
         ``ObjectSuperseded``. Promoting the name to a named parameter silently
         REMOVES it from that payload — a client-visible change to a durable
         artifact (``poll_events`` returns the payload verbatim), invisible to
-        every existing test. ``recorded_ts`` collides with no caller key, so
-        the default path is additive in the strict sense: every existing
-        caller's envelope, graph payload and JSONL record are byte-identical.
-        A caller that passes BOTH keeps the old ``event.update(extra)``
-        precedence.
+        every existing test. No existing caller passes ``recorded_ts``, so the
+        default path is additive in the strict sense: every existing caller's
+        envelope, graph payload and JSONL record are byte-identical. It is a
+        RESERVED envelope name (``_JOURNAL_ENVELOPE_KEYS``), stripped by the
+        entity doors — a caller prop of that name must never bind this
+        parameter and forge the recorded instant (#2296 review). A caller that
+        passes BOTH keeps the old ``event.update(extra)`` precedence.
         """
         # ── Graph event store (#432) ──────────────────────────────
         if type_ in _GRAPH_EVENT_TYPES:
@@ -24090,6 +24101,14 @@ class TortoiseSDK:
             # (Tenant-visible narrowing — see docs/ONTOLOGY.md §4.2/§4.3.)
             event.pop("point", None)
             event.pop("payload", None)
+        # #2296 review: `recorded_ts` is `_emit_event`'s own PARAMETER (it binds
+        # the envelope `ts`), so — like point/payload — a caller prop of that
+        # name must not persist LIVE either. The record strips it
+        # (`_JOURNAL_ENVELOPE_KEYS`), so keeping it here would be the live ≠
+        # replay divergence #8553 tracks. Unconditional (all labels) for the
+        # same reason the block above is: the pop must not depend on journal
+        # config.
+        event.pop("recorded_ts", None)
         # (#2194) Journal ObjectRegistered on FIRST canonical registration
         # only — probe the deterministic canonical id + name
         # (obj-<sha26(name)>) before apply. The name conjunct hardens against
