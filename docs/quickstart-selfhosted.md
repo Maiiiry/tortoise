@@ -89,6 +89,7 @@ Point Tortoise at it with `TORTOISE_DB_URI=docker://:falkordb@localhost:6379/tor
 |---|---|---|
 | `TORTOISE_DB_URI` | Docker (Option A/B) | `docker://:falkordb@localhost:6379/tortoise` |
 | `TORTOISE_DB_PATH` | Embedded (Option C) | `~/.tortoise/tortoise.db` (the default) |
+| `TORTOISE_EVENT_LOG_BASE_DIR` | Rebuild journal (daemon) | `/data/events` — set by `docker-compose.yml`; the daemon also defaults it when `/data` is a mount. Per-graph JSONL: `derived = replay(journal)`, so `tortoise rebuild --dir` can reconstruct the graph. It is the **REBUILD source, not the durability mechanism** — see [docs/durability-posture.md](durability-posture.md) |
 
 ⚠️ Set these in your **MCP client's `env` block** (step 5) — **not** in a `.env` file. A repo-root `.env` is only auto-loaded for editable installs; the CLI reads the process environment only. (With the compose daemon, the URI is already wired inside compose — host-side clients only need it if they talk to the sidecar directly.)
 
@@ -146,7 +147,7 @@ tortoise index directory ~/notes --db docker://:falkordb@localhost:6379/tortoise
 
 | Var | Default | Precedence / notes |
 |-----|---------|--------------------|
-| `TORTOISE_DB_URI` | (unset → embedded) | Docker URI for the durable multi-writer graph; concurrent writers verified at 2 processes |
+| `TORTOISE_DB_URI` | (unset → embedded) | Docker URI for the durable multi-writer graph; concurrent writers verified at 5 processes |
 | `TORTOISE_INGEST_BASE_DIR` | (unset → no sandbox) | SECURITY sandbox: corpus dirs + progress files + resolved symlink targets must stay under it. Not the corpus selector. A typo here = pre-walk error |
 | `TORTOISE_SESSION_CORPUS` | `~/.tortoise/docs/conversations` | The session-end hook's sweep-corpus selector (passed positionally). ⚠️ The base-dir-vs-corpus confusion: setting this to the real corpus while the DB points at a test graph sweeps the whole corpus into the wrong DB |
 | `TORTOISE_MAX_FILE_MB` | `50` | Two-layer size guard (float MB); at/over the limit → rejected before any read |
@@ -338,8 +339,9 @@ what actually carries the new order to an existing install.
 ### How to restore (backup → wipe → rebuild → re-index)
 
 1. Back up: (1) the corpus files (source of truth), (2) the FULL `events/`
-   JSONL directory (the sole replay source for Sources/Events/Documents),
-   (3) the db file.
+   JSONL directory — the sole replay source for Sources/Events/Documents; on
+   the compose daemon this is the `tortoise-data` volume at `/data/events`
+   (`TORTOISE_EVENT_LOG_BASE_DIR`); (3) the db file.
 2. Restore onto a fresh graph — `rebuild_all` is line-tolerant (a torn
    trailing line from a crash is skipped, never fatal). The rebuild wipes the
    target graph first, so it requires an explicit per-call opt-in (#2944) —
@@ -411,9 +413,15 @@ your active packs.
 - **One graph + N corpora**: give each corpus a unique `corpus_name`
   (same-basename corpora collide on the urls).
 - **Concurrent writers**: `bolt://` (docker) — design-supported via
-  MERGE-keyed writes; **integration-tested to 2 concurrent writers**. Two
-  embedded DBs never sync (no replication exists); NFS/shared-volume
-  multi-writer is untested.
+  MERGE-keyed writes; **integration-tested to 5 concurrent writers**
+  (`tests/test_embedded_concurrency.py::test_concurrent_writers_live_falkor_no_lost_writes`,
+  five writer processes on one graph, no lost writes). That is verified
+  coverage, not a supported ceiling. Two embedded DBs never sync (no
+  replication exists); NFS/shared-volume multi-writer is untested.
+
+  Measured capacity per deployment mode — concurrency, rate limits,
+  graph-size caps, retrieval latency, storage footprint, belief-propagation
+  cost — with every number's source: [docs/capacity.md](capacity.md).
 
 ## 5. Connect your agent (MCP)
 

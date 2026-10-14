@@ -179,6 +179,7 @@ Full split mechanics (build, version coupling, license boundary): [docs/client-s
 |---|---|---|
 | `TORTOISE_DB_URI` | — | Durable FalkorDB connection string — the recommended path (docker compose sidecar or managed Cloud); multi-writer safe |
 | `TORTOISE_DB_PATH` | `~/.tortoise/tortoise.db` | Embedded FalkorDBLite eval path — SINGLE-WRITER, eval only (concurrent writers lose data); AOF is **opt-in** (`TORTOISE_EMBEDDED_AOF=1`), **default off** since #915 — without it durability is up to the next snapshot/clean close, **not ≤1s** (#2879); delete the db + `<db>-appendonlydir` to reset |
+| `TORTOISE_EVENT_LOG_BASE_DIR` | `/data/events` when `/data` is a mount (compose sets it) | Per-graph JSONL **rebuild journal** (`<base>/<graph>/events.jsonl`) — the source `tortoise rebuild --dir` replays, so the derived graph is not the only copy. The daemon arms this automatically for a persistent `/data` volume and logs loudly instead of pretending to record when it cannot be written. **The journal is NOT the durability mechanism** — durability is the store's own persistence + an off-box copy ([docs/durability-posture.md](docs/durability-posture.md), #2881) |
 | `TORTOISE_API_KEY` | unset | Set → `auth_mode=static` (Bearer key); unset → `auth_mode=none` — ⚠️ a non-localhost bind with no key exposes an unauthenticated engine |
 | `TORTOISE_HOST` / `TORTOISE_PORT` | `127.0.0.1` / `8000` | Daemon bind |
 | `TORTOISE_RATE_LIMIT` | `100` | Requests per minute per IP (MCP SSE bursts ≈ 5–10 req/call) |
@@ -186,6 +187,8 @@ Full split mechanics (build, version coupling, license boundary): [docs/client-s
 | `TORTOISE_TOOL_GROUP` | unset | Role-scoped MCP surface (#523) — e.g. `memory` exposes only memory tools (tool-selection accuracy degrades past ~20 tools; groups: memory, reasoning, graph, sessions, sources, journal, admin, onboarding) |
 
 Also: `tortoise-serve http [--host] [--port] [--api-key]` (flags override env), and `tortoise-serve` (stdio MCP) for scripting.
+
+**Capacity and limits** — write concurrency per deployment mode, request rate limits, graph-size caps, retrieval latency, storage footprint per element, and belief-propagation cost. Every published number names the committed artifact or code symbol it comes from; dimensions with no measurement are listed as unmeasured rather than estimated: [docs/capacity.md](docs/capacity.md).
 
 ## License & FAQ
 
@@ -205,6 +208,7 @@ Tortoise is **Business Source License 1.1** — see [LICENSE](LICENSE) and the [
 - `integrations/` — thin connectors that talk to Tortoise over MCP (not SDK imports)
 - `website/` — the hosted product's landing pages + dashboard (deploys to Cloudflare Pages)
 - `docs/ONTOLOGY.md` — **canonical ontology v3.4** (co-located with the code it governs)
+- `docs/capacity.md` — **capacity and limits**, measured per deployment mode, with the unmeasured dimensions named
 - `tests/` — test suite
 
 ## Canonical ontology
