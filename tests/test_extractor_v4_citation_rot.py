@@ -58,16 +58,22 @@ DOC = ROOT / "docs" / "architecture" / "EXTRACTOR-V4-ARCHITECTURE.md"
 STORAGE = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
 ONTOLOGY = ROOT / "docs" / "ONTOLOGY.md"
 INGEST = ROOT / "docs" / "INGEST_CONTRACT.md"
+EVAL_SPEC = ROOT / "docs" / "epistemic-layer-eval-spec.md"
 #: The documents that carry the same claims as `DOC`. Several of these claims
 #: were asserted in more than one document, and a repair that fixes one copy
 #: while leaving the others is how the drift survived a pass — so they are
 #: scanned too. `INGEST_CONTRACT.md` carries the `#2421` supersession claim in
 #: its recovery table; leaving it out is how a closed issue stayed named as the
 #: home of outstanding work after the siblings were swept (#8562 review round 2).
+#: `epistemic-layer-eval-spec.md` carries it too, at P6 (`Scoped per #2421`,
+#: `Case-2 TODO (#2421)`) — and it is the sibling `ONTOLOGY.md` cites for the
+#: P6.1/P6.2 belief-preservation assertions, so it is swept here as well
+#: (#8562 review round 3).
 SIBLINGS: tuple[Path, ...] = (
     STORAGE,
     ONTOLOGY,
     INGEST,
+    EVAL_SPEC,
 )
 
 #: Literal sentences that were TRUE when the document was pinned and are FALSE
@@ -190,6 +196,15 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "`INGEST_CONTRACT` names `#2421` as the future policy home": (
         "the #2421 restatement-vs-correction policy will replace the universal transfer"
     ),
+    "the shared replacement-edge semantics name `#2421` with no closed-design qualifier": (
+        "restatement-vs-correction policy** (#2421)."
+    ),
+    "the eval spec scopes belief-preservation to `#2421` with no closed-design qualifier": (
+        "**Scoped per #2421:**"
+    ),
+    "the eval spec names `#2421` as the home of the outstanding Case-2 TODO": (
+        "**Case-2 TODO (#2421):**"
+    ),
 }
 
 #: Sibling passages that must POSITIVELY state the landed fact. The retracted-only
@@ -234,6 +249,21 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
         ONTOLOGY,
         "ONTOLOGY attributes the untracked triage to the closed design, not a tracker",
         "the design was #2421 (CLOSED `COMPLETED`) and it has no open tracker",
+    ),
+    (
+        ONTOLOGY,
+        "ONTOLOGY's shared replacement-edge semantics qualify `#2421` as the closed design",
+        "restatement-vs-correction policy** (#2421 — the design is CLOSED `COMPLETED`; the per-edge triage is not implemented and has no open tracker)",
+    ),
+    (
+        EVAL_SPEC,
+        "the eval spec scopes P6 to the `#2421` design with the triage untracked",
+        "**Scoped per the `#2421` design (CLOSED `COMPLETED`; the per-edge triage is not implemented and has no open tracker):**",
+    ),
+    (
+        EVAL_SPEC,
+        "the eval spec names the closed `#2421` design, not a tracker, on the Case-2 TODO",
+        "the design was `#2421`, CLOSED `COMPLETED`; no open tracker",
     ),
     (
         STORAGE,
