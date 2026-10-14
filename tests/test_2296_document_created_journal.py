@@ -121,17 +121,16 @@ def test_the_record_carries_the_applied_payload(env):
     map (not just the three payload keys), so a NEW unintended divergence
     fails here instead of passing silently.
 
-    NOT COVERED HERE: a caller ``props`` key that collides with an envelope
-    key (``event_id``, ``ts``, ``point``, …) reaches the live node but is
-    stripped from the record by ``_journal_record_payload`` (or shadowed by
-    the envelope value), so live ≠ replay for that key. That is the
-    pre-existing envelope-key class — also reachable via ``create_source``'s
-    ``**props`` splat — not introduced by #2296, tracked as #8553, and not
-    asserted here. ``recorded_ts`` is EXCLUDED by the code rather than left to
-    #8553: it is the name of an ``_emit_event`` PARAMETER, so a caller prop of
-    it would bind that parameter and forge the record's envelope ``ts``; it is
-    in ``_JOURNAL_ENVELOPE_KEYS`` and popped from the live event in
-    ``_create_entity``.
+    NOT COVERED HERE: an envelope key the caller also supplies as a ``props``
+    key. Those no longer reach this record at all — ``_RESERVED_ENVELOPE_PROPS``
+    (every ``_JOURNAL_ENVELOPE_KEYS`` name but ``id``) is stripped at prop
+    INTAKE by ``_sanitize_props``, and ``create_source`` — which bypasses that
+    intake — drops the same set plus the reserved actor keys, so the caller's
+    value reaches neither the live node nor the record. That refusal, and the
+    ``type``-suppression path it closes, are asserted in
+    ``test_a_reserved_envelope_prop_cannot_forge_or_suppress_the_record``.
+    ``id`` is the one envelope name not in that set: it keeps its own
+    fail-closed ``ValueError`` contract instead.
     """
     sdk, events = env
     doc = sdk.create_document("Payload Doc", "report")
@@ -192,9 +191,11 @@ def test_a_reserved_envelope_prop_cannot_forge_or_suppress_the_record(env):
     ``create_point``/``update_point``/``create_entity``/``update_entity`` all
     pass through; ``create_source`` bypasses that intake and drops the set —
     plus the reserved actor keys — itself. FAILS IF any of them leaves
-    ``_JOURNAL_ENVELOPE_KEYS`` / ``_RESERVED_ENVELOPE_PROPS``, IF the intake
-    strip is removed, or IF ``_create_entity`` stops owning the ``type`` it
-    emits."""
+    ``_JOURNAL_ENVELOPE_KEYS`` / ``_RESERVED_ENVELOPE_PROPS``, or IF the intake
+    strip is removed. (``_create_entity`` also re-asserts the ``type`` it
+    emits, which covers the ``_skip_sanitize`` lane defensively; no assertion
+    here depends on it, because ``create_source`` drops the name before that
+    funnel sees it.)"""
     sdk, events = env
     forged = "1999-01-01T00:00:00+00:00"
     # The record side: every envelope name must be stripped from EVERY

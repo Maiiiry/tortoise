@@ -2722,8 +2722,10 @@ _JOURNAL_ENVELOPE_KEYS = (
 #   door that splats caller props into the call turns the prop into that
 #   parameter. ``recorded_ts`` forges the record's envelope ``ts``; ``point``
 #   hands the record a CALLER-AUTHORED node snapshot, which the rebuild then
-#   replays (measured on ``update_point``); ``payload`` becomes the
-#   ``:GraphEvent`` payload instead of a node property.
+#   replays (measured on ``update_point``); ``payload`` is swallowed by the
+#   parameter instead of becoming a node property (it would otherwise become
+#   the ``:GraphEvent`` payload on a graph-event type, none of which splats
+#   caller props today).
 # * ``type`` is the key BOTH the live fold and the journal record dispatch on,
 #   so a prop of that name re-types or silently SUPPRESSES the record
 #   (measured: ``create_document(type="SourceCreated")`` journalled NOTHING,
@@ -24181,12 +24183,11 @@ class TortoiseSDK:
             # (Tenant-visible narrowing — see docs/ONTOLOGY.md §4.2/§4.3.)
             event.pop("point", None)
             event.pop("payload", None)
-        # #2296 review: `recorded_ts`/`type`/`point`/`payload` are reserved
-        # envelope names and are stripped at prop intake (`_sanitize_props`),
-        # and `point`/`payload` are ALSO popped just above for the lane that
-        # bypasses that intake. No separate `recorded_ts` pop is needed here:
-        # `create_source` (the only `_skip_sanitize` caller) drops it from its
-        # own event dict before this funnel ever sees it.
+        # #2296 review: every reserved envelope name (`_RESERVED_ENVELOPE_PROPS`)
+        # is stripped at prop intake (`_sanitize_props`) and dropped by the one
+        # door that bypasses that intake (`create_source`), so this funnel needs
+        # no per-name pop of its own. The `point`/`payload` pops just above
+        # predate that rule and still cover the bypass lane.
         # (#2194) Journal ObjectRegistered on FIRST canonical registration
         # only — probe the deterministic canonical id + name
         # (obj-<sha26(name)>) before apply. The name conjunct hardens against
