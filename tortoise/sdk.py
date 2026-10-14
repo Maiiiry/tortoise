@@ -5463,7 +5463,7 @@ class TortoiseSDK:
         artifact (``poll_events`` returns the payload verbatim), invisible to
         every existing test. No caller passes a PROP named ``recorded_ts`` (the
         parameter itself IS passed by the SDK's own callers, ``retract_point`` /
-        ``invalidate_point``), so the default path is additive in the strict
+        ``supersede_point``), so the default path is additive in the strict
         sense: every existing caller's envelope, graph payload and JSONL record
         are byte-identical. It is a RESERVED envelope name
         (``_JOURNAL_ENVELOPE_KEYS``), dropped by the entity doors and by
