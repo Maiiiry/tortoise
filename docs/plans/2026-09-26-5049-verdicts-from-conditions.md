@@ -324,7 +324,11 @@ additionally route their OWN wall-clock deadline through `require_within`, so a 
 exhausting its budget SKIPs naming that budget instead of raising `AssertionError`
 (#8579 P2-2); the four pump-and-observe loops do the same through the two
 `_pump_until_*` helpers, closing the residual budget the P2-2 pass left unconverted
-(#8579 review P2).
+(#8579 review P2). Those helpers keep `require_answered`'s P2-1 principle too:
+the refusal is a non-answer, but an **answered** 4xx/5xx is not — each helper asserts
+the answered status (`assert rp.status_code == 200`) before reading the body, so a
+genuine 404 stays a FAIL instead of exiting the budget as a machine-load SKIP that
+hides the regression (#8590 review P2).
 
 **Remaining, deliberately not converted here:** the bare `assert r.status_code == 200`
 reads on non-exempt routes that sit behind no shared seam (≈1.7k across `tests/`, top

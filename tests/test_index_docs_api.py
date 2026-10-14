@@ -199,7 +199,8 @@ def _pump_until_midwalk(client, job_id: str, mid: dict,
     wall-clock budget in addition to the request's transport bound. Its expiry
     is a machine-load event — INCONCLUSIVE naming the budget — never the
     rule-1 `assert mid["seen"]` FAIL this used to raise. The request itself is
-    converted through `require_answered`.
+    converted through `require_answered`, and an ANSWERED error status is
+    asserted, so a genuine 404/403 stays a FAIL (#8590 review P2).
 
     Replaces the dead `_wait_for` this file used to carry (unused at head and
     at base — #8579 review P2).
@@ -210,6 +211,10 @@ def _pump_until_midwalk(client, job_id: str, mid: dict,
             client.get(f"/v1/index/docs/{job_id}"),
             what=f"GET /v1/index/docs/{job_id} answered",
         )
+        # #8590 review P2: an ANSWERED error (404/403) is not a non-answer —
+        # assert it here (as `_poll_until._reached` does) so it stays a FAIL
+        # instead of a load-event SKIP.
+        assert rp.status_code == 200, rp.text
         body = rp.json()
         if (body.get("repos_processed", 0) >= 1
                 and 0 < body.get("progress", 0) < 100):
@@ -349,6 +354,39 @@ def test_pump_until_midwalk_deadline_is_inconclusive_never_an_assertion():
     assert "INCONCLUSIVE [#5049]" in message
     assert "0s" in message, message
     assert "mid-walk live progress" in message, message
+
+
+def test_pump_until_midwalk_answered_error_is_a_fail_not_a_skip():
+    """#8590 review P2 must-fail leg: a genuine ANSWERED error on the docs pump
+    GET reaches the caller's own assertion — never a machine-load SKIP.
+
+    Pre-fix (no status assertion after `require_answered`) the 404 missed the
+    mid-walk window on every iteration and the budget exited as
+    `INCONCLUSIVE [#5049]`; the conversion must leave it a FAIL.
+    """
+
+    class _NotFound:
+        status_code = 404
+        text = '{"detail": "job not found"}'
+
+        def get(self, *_args, **_kwargs):
+            return self
+
+        def json(self):
+            return {"detail": "job not found"}
+
+    mid: dict = {"seen": False}
+    try:
+        _pump_until_midwalk(_NotFound(), "job-1", mid, timeout_s=0.0)
+    except AssertionError:
+        return  # expected: the answered 404 reaches the caller's assertion
+    except pytest.skip.Exception as exc:
+        raise AssertionError(
+            "an answered 404 was swallowed as an INCONCLUSIVE skip instead of "
+            f"failing: {exc}"
+        ) from exc
+    raise AssertionError(
+        "the pump helper returned without asserting the answered 404 status")
 
 
 # ── state-key registration ───────────────────────────────────────
