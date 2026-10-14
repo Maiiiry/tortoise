@@ -982,9 +982,10 @@ def test_create_entity_deviation_is_documented_in_the_contract():
     blocks fold apply-first, while the #2296 `DocumentCreated` arm journals
     FIRST. Both orders are a RECORDED deviation in the module-top contract,
     not a silent door. FAILS IF the documentation is deleted, if the
-    Object/Subject/Event blocks stop folding first (the deviation goes stale),
-    or if the Document arm stops journalling first (the #2296 durability fix
-    has regressed to live-only)."""
+    Object/Subject/Event blocks stop folding first, or if the Document arm's
+    journal call stops preceding the fold (a reorder — this scan is
+    ORDER-ONLY; that the arm actually selects `DocumentCreated` is pinned
+    behaviourally by tests/test_2296_document_created_journal.py)."""
     server = REPO_ROOT / "tortoise" / "sdk.py"
     source = server.read_text(encoding="utf-8")
     head = source[:source.index("_JOURNAL_ENVELOPE_KEYS")]
@@ -1039,7 +1040,7 @@ def test_create_entity_deviation_is_documented_in_the_contract():
         "apply-first — the KNOWN DEVIATIONS entry is stale and must be removed"
     )
     assert min(j.lineno for j in journal_first) < first_fold, (
-        "`_create_entity`'s DocumentCreated arm no longer journals before it "
-        "folds — the Document is live-only again (#2296) and the deviation's "
-        "'DocumentCreated arm DOES append first' claim is false"
+        "`_create_entity`'s DocumentCreated arm is no longer ordered "
+        "journal-first (a reorder) — the deviation's 'DocumentCreated arm "
+        "DOES append first' claim is false for this call site"
     )

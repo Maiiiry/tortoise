@@ -23975,9 +23975,11 @@ class TortoiseSDK:
         via ``_emit_event`` (#2061); SDK-created Objects journal
         ``ObjectRegistered`` on first canonical registration (probe-gated,
         #2194 — a canonical re-mention never double-journals); SDK-created
-        Subjects journal ``SubjectAdded`` the same way (probe-gated, #2295 —
-        the #2296 durability audit tracks the remaining Document surface;
-        Source already journals via create_source's own emit).
+        Subjects journal ``SubjectAdded`` the same way (probe-gated, #2295);
+        Documents journal ``DocumentCreated`` on EVERY create (#2296 —
+        emit-on-every-write, since each create mints a fresh ulid and
+        ``_upsert_document`` MERGEs by that id). Source journals via
+        create_source's own emit.
 
         ``_skip_sanitize=True`` (epic #900 T3, create_source's sanctioned
         source_path route): the caller has already extracted the server-

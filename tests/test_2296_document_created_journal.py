@@ -105,9 +105,10 @@ def test_the_record_carries_the_applied_payload(env):
     """The journal line reproduces the applied payload — NOT byte for byte.
 
     ``_journal_record_payload`` drops the envelope keys ``_emit_event`` owns,
-    and ``_upsert_document`` re-merges the record onto a FRESH node at replay,
-    so three properties of the LIVE node are NOT reproduced. The rebuild below
-    asserts that EXACT set:
+    and ``_upsert_document`` re-merges the record onto a FRESH node at replay.
+    For this create (no ``props``, so no caller key collides with an envelope
+    key) exactly three properties of the LIVE node are NOT reproduced, and the
+    rebuild below asserts that EXACT set:
 
     * ``eventId`` — the live create carries no ``event_id``, so the fold
       coalesces it to ``""``; replay reads the record's ``event_id`` envelope
@@ -119,6 +120,14 @@ def test_the_record_carries_the_applied_payload(env):
     derived ``_searchText`` — IS reproduced. The assertion is the FULL property
     map (not just the three payload keys), so a NEW unintended divergence
     fails here instead of passing silently.
+
+    NOT COVERED HERE: a caller ``props`` key that collides with an envelope
+    key (``event_id``, ``ts``, ``point``, …) reaches the live node but is
+    stripped from the record by ``_journal_record_payload`` (or shadowed by
+    the envelope value), so live ≠ replay for that key. That is the
+    pre-existing envelope-key class — also reachable via ``create_source``'s
+    ``**props`` splat — not introduced by #2296, tracked as #8553, and not
+    asserted here.
     """
     sdk, events = env
     doc = sdk.create_document("Payload Doc", "report")
@@ -185,8 +194,11 @@ def test_one_create_is_one_record(env):
     assert len(_document_created(events)) == 2
 
 
-def test_journal_less_sdk_is_byte_identical(tmp_path):
-    """A journal-less SDK persists the Document exactly as before (no crash)."""
+def test_journal_less_sdk_still_creates_the_document(tmp_path):
+    """A journal-less SDK still creates the Document — the fix must not require
+    a journal. This is the deliberate CONTROL in the pre-fix mutation pass: the
+    other six tests redden when ``DocumentCreated`` is unjournaled, this one
+    stays green because the live create is independent of the record."""
     sdk = TortoiseSDK(str(tmp_path / "nojournal.db"))
     try:
         doc = sdk.create_document("No Journal", "report")
