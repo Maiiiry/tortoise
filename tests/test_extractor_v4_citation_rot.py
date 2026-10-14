@@ -55,13 +55,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "EXTRACTOR-V4-ARCHITECTURE.md"
+STORAGE = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
+ONTOLOGY = ROOT / "docs" / "ONTOLOGY.md"
 #: The documents that carry the same claims as `DOC`. Several of these claims
 #: were asserted in more than one document, and a repair that fixes one copy
 #: while leaving the others is how the drift survived a pass — so they are
 #: scanned too.
 SIBLINGS: tuple[Path, ...] = (
-    ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md",
-    ROOT / "docs" / "ONTOLOGY.md",
+    STORAGE,
+    ONTOLOGY,
 )
 
 #: Literal sentences that were TRUE when the document was pinned and are FALSE
@@ -159,26 +161,52 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
 #: Sibling passages that must POSITIVELY state the landed fact. The retracted-only
 #: scan above catches a stale claim PUT BACK; this catches the opposite — a
 #: corrected passage silently DELETED, which would otherwise pass by omission.
-LANDED_STATEMENTS_IN_SIBLINGS: dict[str, str] = {
-    "STORAGE states the `:Document` label as retired": (
-        "The `:Document` NODE label is retired"
+#:
+#: Each entry names its OWN document and is checked against THAT document only:
+#: a combined-text check cannot tell a correction from a relocation, so a landed
+#: passage deleted from one sibling would pass on the strength of the other.
+LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
+    (
+        STORAGE,
+        "STORAGE states the `:Document` label as retired",
+        "The `:Document` NODE label is retired",
     ),
-    "STORAGE states `doc_status` as retired": (
-        "`doc_status` is **RETIRED** (`tortoise/api.py:458`)"
+    (
+        STORAGE,
+        "STORAGE states `doc_status` as retired",
+        "`doc_status` is **RETIRED** (`tortoise/api.py:458`)",
     ),
-    "STORAGE separates the open tracker entry from the landed D10 work": (
-        "D10 code-half work done: `#5024`, `#5025`, `#5026`"
+    (
+        STORAGE,
+        "STORAGE separates the open tracker entry from the landed D10 work",
+        "D10 code-half work done: `#5024`, `#5025`, `#5026`",
     ),
-    "STORAGE states the Q5 keys as non-interchangeable": (
-        "**A `:Document` key and a `:Source` key are not interchangeable**"
+    (
+        STORAGE,
+        "STORAGE states the Q5 keys as non-interchangeable",
+        "**A `:Document` key and a `:Source` key are not interchangeable**",
     ),
-    "STORAGE counts the truth set as three types": (
-        "**The truth set is these three types ∪ the preserved config classes**"
+    (
+        STORAGE,
+        "STORAGE counts the truth set as three types",
+        "**The truth set is these three types ∪ the preserved config classes**",
     ),
-    "ONTOLOGY states the operator endpoints as live": (
-        "operator endpoints are live (`#7902`)"
+    (
+        ONTOLOGY,
+        "ONTOLOGY states the operator endpoints as live",
+        "operator endpoints are live (`#7902`)",
     ),
-}
+    (
+        ONTOLOGY,
+        "ONTOLOGY records `#5126` as landed, not as an open residual",
+        "**Landed:** `#5126`",
+    ),
+    (
+        STORAGE,
+        "STORAGE states the `#5422` ownership gap as closed",
+        "`#5422` (its ownership gap) is CLOSED `COMPLETED`",
+    ),
+)
 
 #: The repaired passages must SAY what landed, not merely omit the old claim —
 #: an omission-only guard passes over a passage that is silently deleted rather
@@ -247,15 +275,15 @@ def test_the_sibling_documents_do_not_carry_the_retracted_claims():
 
 
 def test_the_sibling_documents_state_the_landed_facts():
-    combined = "\n".join(d.read_text(encoding="utf-8") for d in SIBLINGS)
     missing = [
-        name
-        for name, literal in LANDED_STATEMENTS_IN_SIBLINGS.items()
-        if literal not in combined
+        f"{doc.name}: {name}"
+        for doc, name, literal in LANDED_STATEMENTS_IN_SIBLINGS
+        if literal not in doc.read_text(encoding="utf-8")
     ]
     assert not missing, (
-        "the corrected sibling passages no longer state the landed fact — a "
-        "passage was silently deleted rather than corrected:\n  - "
+        "the corrected sibling passages no longer state the landed fact in their "
+        "OWN document — a passage was silently deleted rather than corrected, or "
+        "moved to a document that does not own the claim:\n  - "
         + "\n  - ".join(missing)
     )
 

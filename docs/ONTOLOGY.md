@@ -484,11 +484,10 @@ doc_status: live
 >   `#5038` (the version model). **The D10 code half's own residuals are named and
 >   open:** `#5082` (the document `:Source` carries no `sourceKind`, while §4.6 marks
 >   it REQUIRED — scoped at §4.6), `#5121` (the MCP surface still describes a
->   `:Document` graph node; needs a surface-manifest re-cut), `#5126`
->   (`graph-scripts/backfill_embeddings.py` still targets the retired `:Document`
->   label and reads the retired `content` — a silent no-op), and `#5140` (the ten
+>   `:Document` graph node; needs a surface-manifest re-cut), and `#5140` (the ten
 >   residuals outside the declared B1–B6 threat surface, including three reproduced
->   P1s).
+>   P1s). **Landed:** `#5126` — `graph-scripts/backfill_embeddings.py` now targets
+>   `:Source` (PR `#8420`).
 >
 > **Changelog v3.14 (2026-09-20, issue #4369 — the "claim" gloss is declared):**
 >
