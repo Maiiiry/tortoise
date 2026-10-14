@@ -287,9 +287,14 @@ here:
   its verdict is reading the host's load, which is rule 1's subject. The contract now
   expresses it: `tests/_verdict.py::require_answered` returns an ANSWERED response and
   turns the refusal into `INCONCLUSIVE [#5049]` naming the 10 s bound. It detects the
-  refusal by the product's own message, not by the status, so the MCP arm's 200 cannot be
-  read as a silent pass. Every other response — including the 4xx refusals the callers
-  assert on — is returned unchanged.
+  refusal by its per-surface **envelope** — REST `504` + `{"detail": MESSAGE}`, JSON-RPC/MCP
+  `error.code == ERR_TIMEOUT` + `message == MESSAGE` on the `/mcp` 504 or the SSE arm's 200
+  (`structuredContent.error` / `_meta.tortoise_error`) — never by the message text alone,
+  so the MCP arm's 200 cannot be read as a silent pass while a genuine 4xx/5xx error that
+  merely mentions the message still reaches the caller's own assertion. Every other
+  response is returned unchanged. (#8579 review P2-1: the message-substring test this
+  replaced was status-blind, so a real red whose body contained the message was reported
+  INCONCLUSIVE.)
 - **Product half (owner).** Whether the bound's VALUE is right for a cold commit, whether
   to warm the embedder, or whether to reopen the exemption, is the recorded **#3834**
   ruling's territory. Nothing here changes the product: the bound stays 10 s and the
@@ -300,15 +305,20 @@ caller behind them):
 
 | Site / seam | Covers |
 |---|---|
-| `test_commit_endpoint.py::_commit` | every `/v1/sessions/commit` POST in the file (#4627's own reproducer) |
-| `test_github_index_lifecycle.py::_poll_until` | the file's whole poll path |
-| `test_index_docs_api.py::_poll_until` | the file's whole poll path |
-| `test_capture_loop_responsiveness.py::_measure_on_loop_graph_work` | the measured `#3086` capture |
+| `test_commit_endpoint.py::_commit` + `_answered_commit_post` | every `/v1/sessions/commit` POST in the file, including the direct raw-body / mismatched-id / unauthenticated posts that bypass `_commit` (#4627's own reproducer) |
+| `test_github_index_lifecycle.py::_poll_until` + `_post_index` + the two direct pump loops | the file's whole index path — every `GET /v1/index/github/<id>` AND every `POST /v1/index/github[/re-poll]` call site (the direct posts the first pass left unwrapped are the `KeyError: 'job_id'` mode, #8579 P3-2) |
+| `test_index_docs_api.py::_poll_until` + the three direct poll GETs | the file's whole poll path (`GET /v1/index/docs/<id>` at every call site) |
+| `test_capture_loop_responsiveness.py::_measure_capture_graph_work` | the measured `#3086` capture — the LOWER seam, so both the `_measure_on_loop_graph_work` wrapper and the direct `test_capture_does_not_repeat_the_schema_bootstrap_on_the_loop` caller are covered |
 | `test_one_free_org_entitlement.py::_post_signed` | the `/webhooks/stripe` seam |
 | `test_activation_scorecard.py::test_default_window_is_24h` | `#5049`'s `KeyError: 'window'` instance |
 | `test_pack_state.py::TestGetV1Packs` (2) | `#4883`/`#4816`'s measured GETs |
 | `test_writer_inventory.py` (2) | the `#7931` signup / graph-write instances |
 | `test_capture_cost_measurement.py`, `test_onboarding_endpoints.py`, `test_oauth_mcp.py`, `test_signup_token_revoke.py`, `test_hosted_api.py::TestDreamEndpoint` | each issue-measured instance |
+
+A dropped conversion at any row of this table is itself pinned:
+`tests/test_verdict_contract.py::test_every_converted_site_wires_the_verdict_contract`
+asserts each named seam/test body still calls `require_answered` (#8579 P3-3), so the
+conversion cannot be silently deleted back to a wall-clock FAIL.
 
 **Remaining, deliberately not converted here:** the bare `assert r.status_code == 200`
 reads on non-exempt routes that sit behind no shared seam (≈1.7k across `tests/`, top

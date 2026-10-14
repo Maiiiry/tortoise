@@ -2181,10 +2181,6 @@ def _measure_on_loop_graph_work(monkeypatch, turns: int, sid: str):
     """
     resp, records, writer_threads = _measure_capture_graph_work(
         monkeypatch, turns, sid)
-    # #5049: the capture route is not exempt from the transport wait bound, so a
-    # 504 here is a non-answer — INCONCLUSIVE, never the bare FAIL these callers
-    # would otherwise read off `resp.status_code`.
-    require_answered(resp, what=f"POST /v1/sessions answered (capture {sid})")
     on_loop = [d for name, _, d in records if name == "MainThread"]
     return (resp, len(on_loop), sum(on_loop), writer_threads,
             [c for _, c, _ in records])
@@ -2238,6 +2234,13 @@ def _measure_capture_graph_work(monkeypatch, turns: int, sid: str):
     resp = asyncio.run(_run())
     monkeypatch.setattr(graph_cls, "query", orig_query)
     monkeypatch.setattr(sdk_mod, "_write_capture_turns", orig_writer)
+    # #5049: the capture route is not exempt from the transport wait bound, so a
+    # refusal here is a non-answer — INCONCLUSIVE, never the bare FAIL every
+    # caller would otherwise read off `resp.status_code`. The conversion lives
+    # at THIS seam (not the `_measure_on_loop_graph_work` wrapper above) so it
+    # covers both callers, including the direct
+    # `test_capture_does_not_repeat_the_schema_bootstrap_on_the_loop` call.
+    require_answered(resp, what=f"POST /v1/sessions answered (capture {sid})")
     return resp, records, writer_threads
 
 

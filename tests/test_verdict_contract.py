@@ -13,10 +13,12 @@ These pin the contract's discriminating power:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import time
+from pathlib import Path
 
 import pytest
 
@@ -642,3 +644,87 @@ def test_fixed_race_wrong_clone_count_fails_despite_a_race_timeout():
     result["last_err"] = "Timeout reading from socket"
     result["clone_nodes"] = 0
     _must_fail(result, match="clone_nodes")
+
+
+# ── #8579 P3-3: the conversion is WIRED, not merely available ──────────────
+# The contract pins above prove `require_answered` BEHAVES. None of them can see
+# a converted SITE that silently drops the call: that site reverts to reading a
+# wall-clock refusal as a product FAIL, and no amount of contract testing
+# detects it. This registry pins the wiring itself — each converted seam/test
+# must contain a direct `require_answered` call in its own body. Deleting the
+# call goes RED here; `test_the_wiring_checker_discriminates` proves the checker
+# is not vacuously true.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+_CONVERTED_SITES: dict[str, frozenset[str]] = {
+    "tests/test_activation_scorecard.py": frozenset(
+        {"test_default_window_is_24h"}),
+    "tests/test_capture_cost_measurement.py": frozenset(
+        {"test_hosted_capture_emits_that_session_s_measured_cost_row"}),
+    "tests/test_capture_loop_responsiveness.py": frozenset(
+        {"_measure_capture_graph_work"}),
+    "tests/test_commit_endpoint.py": frozenset(
+        {"_commit", "_answered_commit_post"}),
+    "tests/test_github_index_lifecycle.py": frozenset(
+        {"_poll_until", "_post_index", "test_progress_beat_stamps_heartbeat",
+         "test_live_progress_written_during_walk"}),
+    "tests/test_hosted_api.py": frozenset({"test_dream_incremental"}),
+    "tests/test_index_docs_api.py": frozenset(
+        {"_poll_until", "test_cross_team_job_poll_404",
+         "test_docs_live_progress_written_during_walk",
+         "test_docs_live_progress_all_branches_site"}),
+    "tests/test_oauth_mcp.py": frozenset(
+        {"test_oauth_sessionless_create_point_actor_stamped"}),
+    "tests/test_onboarding_endpoints.py": frozenset(
+        {"test_off_switch_patch_stops_capture_409"}),
+    "tests/test_one_free_org_entitlement.py": frozenset({"_post_signed"}),
+    "tests/test_pack_state.py": frozenset(
+        {"test_returns_tenant_packs_with_auth",
+         "test_empty_masking_when_nothing_to_see"}),
+    "tests/test_signup_token_revoke.py": frozenset(
+        {"test_registry_revoke_pbkdf2_only_node"}),
+    "tests/test_writer_inventory.py": frozenset(
+        {"test_signup_provisions_identity_path",
+         "test_create_graph_writes_row_supabase_mode"}),
+}
+
+
+def _functions_calling(source: str, name: str) -> set[str]:
+    """Names of the functions whose body contains a call to ``name``."""
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            callee = sub.func
+            callee_name = (
+                callee.id if isinstance(callee, ast.Name)
+                else callee.attr if isinstance(callee, ast.Attribute)
+                else None
+            )
+            if callee_name == name:
+                found.add(node.name)
+                break
+    return found
+
+
+def test_the_wiring_checker_discriminates():
+    """Non-vacuity control: the checker sees the call, and its absence."""
+    with_call = "def a():\n    return require_answered(x, what='w')\n"
+    without_call = "def a():\n    return x\n"
+    assert _functions_calling(with_call, "require_answered") == {"a"}
+    assert _functions_calling(without_call, "require_answered") == set()
+
+
+@pytest.mark.parametrize("path,expected", sorted(_CONVERTED_SITES.items()))
+def test_every_converted_site_wires_the_verdict_contract(path, expected):
+    """#8579 P3-3: a dropped conversion at a converted site goes RED."""
+    source = (_REPO_ROOT / path).read_text()
+    missing = expected - _functions_calling(source, "require_answered")
+    assert not missing, (
+        f"{path}: {sorted(missing)} no longer call `require_answered` — the "
+        "#5049 conversion was dropped, so a wall-clock refusal at that site is "
+        "read as a product FAIL again"
+    )

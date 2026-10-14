@@ -225,6 +225,23 @@ def _poll_until(client, job_id: str, status: str, timeout_s: float | None = None
     return observed["body"]
 
 
+def _post_index(client, path: str = "/v1/index/github", **kwargs):
+    """POST an index route through the #5049 verdict seam.
+
+    `POST /v1/index/github` and its `/re-poll` sibling are not exempt from the
+    transport wait bound, so a request that outlives it is answered with the
+    legible refusal — which carries no `job_id`, so dereferencing it is the
+    `KeyError: 'job_id'` #8122 measured as a red (four times). Routing EVERY
+    post in this file through one seam — not the two leaves an earlier pass
+    converted — leaves no unwrapped poster to reintroduce that error
+    (#8579 review P3-2/P3-3).
+    """
+    return require_answered(
+        client.post(path, **kwargs),
+        what=f"POST {path} answered",
+    )
+
+
 def test_poll_until_is_inconclusive_on_a_bound_refusal():
     """#5049: the poll's own 504 refusal is a non-answer — never a FAIL.
 
@@ -281,6 +298,34 @@ def test_poll_until_deadline_is_inconclusive_never_an_assertion():
     assert "INCONCLUSIVE [#5049]" in message
     assert "0s" in message, message
     assert "job job-1 reached status 'completed'" in message, message
+
+
+def test_post_index_is_inconclusive_on_a_bound_refusal():
+    """#8579 P3-2/P3-3: the file's ONE post seam converts the refusal.
+
+    Every `/v1/index/github` POST in this file goes through `_post_index`, so
+    pinning the seam pins all of them: a bound refusal is a non-answer — never
+    the `KeyError: 'job_id'` a bare `.json()["job_id"]` would raise.
+    """
+
+    class _Refusing:
+        status_code = 504
+
+        def __init__(self) -> None:
+            from tortoise import mcp_auth
+
+            self._message = mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE
+            self.text = json.dumps({"detail": self._message})
+
+        def post(self, *_args, **_kwargs):
+            return self
+
+        def json(self):
+            return {"detail": self._message}
+
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        _post_index(_Refusing(), json={"org": "acme"})
+    assert "INCONCLUSIVE [#5049]" in str(excinfo.value)
 
 
 # ── State-key registration (cycle-3 P1-2) ─────────────────────────
@@ -345,11 +390,11 @@ def test_in_flight_single_flight_reuses(provisioned, mock_github, monkeypatch):
         await orig_run(*args, **kw)
 
     monkeypatch.setattr(ha, "_run_indexing", _counting)
-    r1 = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r1 = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     assert r1.status_code == 200
     job_id = r1.json()["job_id"]
     assert _INDEX_JOBS[job_id]["status"] == "started"
-    r2 = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r2 = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     assert r2.status_code == 200
     assert r2.json()["job_id"] == job_id, "in-flight job must be reused"
     body = _poll_until(provisioned.tc, job_id, "completed")
@@ -372,7 +417,7 @@ def test_stuck_started_evicted(provisioned, mock_github):
     dead_at = time.time() - _INDEX_JOB_STALE_S - 10
     _INDEX_JOBS[stale]["started_at"] = dead_at
     _INDEX_JOBS[stale]["heartbeat_at"] = dead_at
-    r = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     assert r.status_code == 200
     new_job = r.json()["job_id"]
     assert new_job != stale
@@ -406,7 +451,7 @@ def test_long_live_run_not_duplicated_by_ttl_expiry(provisioned, mock_github,
         await orig_run(*args, **kw)
 
     monkeypatch.setattr(ha, "_run_indexing", _counting)
-    r1 = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r1 = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     assert r1.status_code == 200
     job_id = r1.json()["job_id"]
     assert _INDEX_JOBS[job_id]["status"] == "started"
@@ -414,7 +459,7 @@ def test_long_live_run_not_duplicated_by_ttl_expiry(provisioned, mock_github,
     # TTL — and it is STILL BEATING (the heartbeat is kept fresh by progress).
     _INDEX_JOBS[job_id]["started_at"] = time.time() - _INDEX_JOB_STALE_S * 4
     _INDEX_JOBS[job_id]["heartbeat_at"] = time.time()
-    r2 = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r2 = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     assert r2.status_code == 200
     assert r2.json()["job_id"] == job_id, (
         "a LONG but LIVE run must keep its claim — entry age is not a "
@@ -451,7 +496,7 @@ def test_progress_beat_stamps_heartbeat(provisioned, mock_github, monkeypatch):
         return await orig_index_repo(self, sdk, repo, **kw)
 
     monkeypatch.setattr(GitHubIndexer, "index_repo", _held_index_repo)
-    r = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     assert r.status_code == 200
     job_id = r.json()["job_id"]
 
@@ -485,7 +530,7 @@ def test_terminal_jobs_evicted_on_enqueue(provisioned, mock_github):
     org_id = provisioned.org_id
     job_id, _ = _start_index_job(org_id)
     _INDEX_JOBS[job_id]["status"] = "completed"
-    r = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     new_job = r.json()["job_id"]
     assert new_job != job_id
     assert job_id not in _INDEX_JOBS
@@ -497,7 +542,7 @@ def test_terminal_jobs_evicted_on_enqueue(provisioned, mock_github):
 def test_first_run_single_repo(provisioned, mock_github):
     """First-run scope = ONE repo regardless of org size; job status reports
     repos_total vs repos_processed (the honest 'index more' affordance)."""
-    r = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     job_id = r.json()["job_id"]
     body = _poll_until(provisioned.tc, job_id, "completed")
     assert body["repos_total"] == 1
@@ -510,9 +555,9 @@ def test_first_run_single_repo(provisioned, mock_github):
 def test_second_run_full_org_with_cursors(provisioned, mock_github):
     """After the first run (github_indexed=True), a re-poll walks ALL repos
     with their persisted cursors."""
-    r = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     _poll_until(provisioned.tc, r.json()["job_id"], "completed")
-    r = provisioned.tc.post("/v1/index/github/re-poll")
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll")
     job_id = r.json()["job_id"]
     body = _poll_until(provisioned.tc, job_id, "completed")
     assert body["repos_total"] == 2
@@ -549,7 +594,7 @@ def test_live_progress_written_during_walk(provisioned, mock_github, monkeypatch
         return await orig_index_repo(self, sdk, repo, **kw)
 
     monkeypatch.setattr(GitHubIndexer, "index_repo", _slow_repo2)
-    r = provisioned.tc.post("/v1/index/github/re-poll")
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll")
     assert r.status_code == 200, r.text
     job_id = r.json()["job_id"]
 
@@ -614,7 +659,7 @@ def test_midwalk_fetch_error_stamps_indexed_at(provisioned, mock_github,
         return await orig_index_repo(self, sdk, repo, **kw)
 
     monkeypatch.setattr(GitHubIndexer, "index_repo", _fail_repo2)
-    r = provisioned.tc.post("/v1/index/github/re-poll")
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll")
     assert r.status_code == 200, r.text
     body = _poll_until(provisioned.tc, r.json()["job_id"], "failed")
     assert body["status"] == "failed"
@@ -656,7 +701,7 @@ def test_auto_index_after_connect(provisioned, mock_github, monkeypatch):
 
 
 def test_re_poll_requires_connection(client):
-    r = client.tc.post("/v1/index/github/re-poll")
+    r = _post_index(client.tc, "/v1/index/github/re-poll")
     assert r.status_code == 400
     assert "GitHub not connected" in r.json()["detail"]
 
@@ -674,7 +719,7 @@ def test_re_poll_scoped_repo(provisioned, monkeypatch):
         ha._INDEX_JOBS[job_id]["status"] = "completed"  # settle the drain
 
     monkeypatch.setattr(ha, "_run_indexing", _capture)
-    r = provisioned.tc.post("/v1/index/github/re-poll", json={"repo": "repo2"})
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll", json={"repo": "repo2"})
     assert r.status_code == 200
     assert r.json()["status"] == "started"
     _wait_for(lambda: seen == [("acme", ["repo2"])])
@@ -691,7 +736,7 @@ def test_re_poll_multi_repo_scope(provisioned, monkeypatch):
         ha._INDEX_JOBS[job_id]["status"] = "completed"
 
     monkeypatch.setattr(ha, "_run_indexing", _capture)
-    r = provisioned.tc.post("/v1/index/github/re-poll",
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll",
                             json={"repos": ["repo1", "repo2"]})
     assert r.status_code == 200
     _wait_for(lambda: seen == [("acme", ["repo1", "repo2"])])
@@ -708,7 +753,7 @@ def test_re_poll_empty_repos_is_full_org(provisioned, monkeypatch):
         ha._INDEX_JOBS[job_id]["status"] = "completed"
 
     monkeypatch.setattr(ha, "_run_indexing", _capture)
-    r = provisioned.tc.post("/v1/index/github/re-poll", json={"repos": []})
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll", json={"repos": []})
     assert r.status_code == 200
     _wait_for(lambda: seen == [("acme", None)])
 
@@ -726,10 +771,10 @@ def test_re_poll_invalid_repo_400(provisioned, monkeypatch):
 
     monkeypatch.setattr(ha, "_run_indexing", _capture)
     for bad in ("../victimorg/secret", "a/b?q=1", "repo name", "../.."):
-        r = provisioned.tc.post("/v1/index/github/re-poll", json={"repo": bad})
+        r = _post_index(provisioned.tc, "/v1/index/github/re-poll", json={"repo": bad})
         assert r.status_code == 400, f"repo={bad!r} should 400"
         assert "Invalid repo name" in r.json()["detail"]
-        r2 = provisioned.tc.post("/v1/index/github/re-poll",
+        r2 = _post_index(provisioned.tc, "/v1/index/github/re-poll",
                                  json={"repos": [bad]})
         assert r2.status_code == 400, f"repos=[{bad!r}] should 400"
     assert seen == [], "no job must be spawned for an invalid repo"
@@ -746,7 +791,7 @@ def test_re_poll_whitespace_repo_is_full_org(provisioned, monkeypatch):
         ha._INDEX_JOBS[job_id]["status"] = "completed"
 
     monkeypatch.setattr(ha, "_run_indexing", _capture)
-    r = provisioned.tc.post("/v1/index/github/re-poll", json={"repo": "   "})
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll", json={"repo": "   "})
     assert r.status_code == 200
     _wait_for(lambda: seen == [("acme", None)])
 
@@ -762,7 +807,7 @@ def test_re_poll_no_repo_is_full_org(provisioned, monkeypatch):
         ha._INDEX_JOBS[job_id]["status"] = "completed"
 
     monkeypatch.setattr(ha, "_run_indexing", _capture)
-    r = provisioned.tc.post("/v1/index/github/re-poll")
+    r = _post_index(provisioned.tc, "/v1/index/github/re-poll")
     assert r.status_code == 200
     _wait_for(lambda: seen == [("acme", None)])
 
@@ -770,7 +815,7 @@ def test_re_poll_no_repo_is_full_org(provisioned, monkeypatch):
 # ── Cursor + backfill marker persistence (Tasks 2/3) ──────────────
 
 def test_cursor_and_backfill_marker_persisted(provisioned, mock_github):
-    r = provisioned.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(provisioned.tc, "/v1/index/github", json={"org": "acme"})
     _poll_until(provisioned.tc, r.json()["job_id"], "completed")
     state = provisioned.tc.get("/v1/onboarding/state").json()["onboarding"]
     assert state["github_indexed"] is True
@@ -808,18 +853,14 @@ def test_repoll_drains_and_clears_truncated_persisted(client, tmp_path,
 
     monkeypatch.setattr(GitHubIndexer, "_get_client", _fake_get_client)
     # run 1: cap 500 → truncated cursor persisted
-    r = client.tc.post("/v1/index/github", json={"org": "acme"})
-    # #5049: `POST /v1/index/github` is not exempt from the transport wait
-    # bound — a 504 refusal has no `job_id`, so dereferencing it produced the
-    # `KeyError: 'job_id'` that was read as a red (#8122, measured four times).
-    require_answered(r, what="POST /v1/index/github returned a job id")
+    r = _post_index(client.tc, "/v1/index/github", json={"org": "acme"})
     body = _poll_until(client.tc, r.json()["job_id"], "completed")
     assert body["repos_processed"] == 1
     state = client.tc.get("/v1/onboarding/state").json()["onboarding"]
     assert state["github_index_cursor"]["acme/repo1"] == {
         "updated_at": S, "number": 500, "truncated": True}
     # re-poll 1 (DRAIN): drains the remaining 100 → CLEAN persisted cursor
-    r2 = client.tc.post("/v1/index/github/re-poll")
+    r2 = _post_index(client.tc, "/v1/index/github/re-poll")
     body2 = _poll_until(client.tc, r2.json()["job_id"], "completed")
     assert body2["repos_processed"] == 1
     state = client.tc.get("/v1/onboarding/state").json()["onboarding"]
@@ -829,7 +870,7 @@ def test_repoll_drains_and_clears_truncated_persisted(client, tmp_path,
     # re-poll 2 (DIFF): first issues request carries `since` — no DRAIN,
     # and the run stays exact-once (0 new mints)
     n_queries_before = len(t.issue_query_params())
-    r3 = client.tc.post("/v1/index/github/re-poll")
+    r3 = _post_index(client.tc, "/v1/index/github/re-poll")
     body3 = _poll_until(client.tc, r3.json()["job_id"], "completed")
     assert body3["events_minted"] == 0, "exact-once — 0 new mints"
     new_queries = t.issue_query_params()[n_queries_before:]
@@ -861,14 +902,14 @@ def test_backfill_marker_set_only_on_success(client, tmp_path, monkeypatch):
 
     monkeypatch.setattr(GitHubIndexer, "backfill_legacy_closed",
                         _flaky_backfill)
-    r = client.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(client.tc, "/v1/index/github", json={"org": "acme"})
     _poll_until(client.tc, r.json()["job_id"], "completed")
     state = client.tc.get("/v1/onboarding/state").json()["onboarding"]
     assert state["github_legacy_backfill_done"] is False, \
         "marker must stay UNSET when the backfill raises"
     # heal the backfill → the next run re-runs it and sets the marker
     fail_backfill["fail"] = False
-    r2 = client.tc.post("/v1/index/github/re-poll")
+    r2 = _post_index(client.tc, "/v1/index/github/re-poll")
     _poll_until(client.tc, r2.json()["job_id"], "completed")
     state = client.tc.get("/v1/onboarding/state").json()["onboarding"]
     assert state["github_legacy_backfill_done"] is True
@@ -887,7 +928,7 @@ def test_resolve_repos_404_fails_job(client, tmp_path, monkeypatch):
         return self._client
 
     monkeypatch.setattr(GitHubIndexer, "_get_client", _fake_get_client)
-    r = client.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(client.tc, "/v1/index/github", json={"org": "acme"})
     job_id = r.json()["job_id"]
     body = _poll_until(client.tc, job_id, "failed")
     assert "not found" in body["error"] or "no access" in body["error"]
@@ -922,7 +963,7 @@ def test_issue_ingest_no_longer_consumes_points_quota(client, tmp_path,
         return self._client
 
     monkeypatch.setattr(GitHubIndexer, "_get_client", _fake_get_client)
-    r = client.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(client.tc, "/v1/index/github", json={"org": "acme"})
     job_id = r.json()["job_id"]
     body = _poll_until(client.tc, job_id, "completed")
     assert body["quota_hit"] is False, \
@@ -969,7 +1010,7 @@ def test_resolve_repos_failure_preserves_persisted_cursors(client, tmp_path,
         raise GitHubFetchError("org not found")
 
     monkeypatch.setattr(GitHubIndexer, "resolve_repos", _boom)
-    r = client.tc.post("/v1/index/github", json={"org": "acme"})
+    r = _post_index(client.tc, "/v1/index/github", json={"org": "acme"})
     body = _poll_until(client.tc, r.json()["job_id"], "failed")
     assert "org not found" in body["error"]
     state = client.tc.get("/v1/onboarding/state").json()["onboarding"]
