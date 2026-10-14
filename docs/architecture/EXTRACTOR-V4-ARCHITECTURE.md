@@ -1279,7 +1279,7 @@ Each open decision was run through the mandated sequence: **contradiction test f
 
 ### 16.1 The review cycle — outcome recorded (2026-09-23)
 
-**Two fresh-context reviewers per document, complementary lenses; full consolidation in `REVIEW-CONSOLIDATED-2026-09-23.md` (6 P0 · 34 P1 · 18 P2).** This section records **what was done with each category**, so a later lane can tell a correction from an omission.
+**Two fresh-context reviewers per document, complementary lenses; full consolidation in `REVIEW-CONSOLIDATED-2026-09-23.md` (that review's own summary: 6 P0 · 34 P1 · 18 P2).** This section records **what was done with each category**, so a later lane can tell a correction from an omission.
 
 | category | count | disposition |
 |---|---|---|

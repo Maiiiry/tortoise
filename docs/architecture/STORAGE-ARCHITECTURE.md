@@ -238,11 +238,11 @@ and §4.2:
 **✅ The test that DOES hold, and it binds at the WRITE/FIELD level rather than the class or table level:**
 > **TRUTH = a derivation root — nothing else can reconstruct it. DERIVED = reconstructible by replaying the journal.**
 
-The mechanical form of the same test: **is this write carried by the journal?** (`Source`/`Document`/`Event` are **not** in `_GRAPH_EVENT_TYPES` → primary; `Point`/`Object`/operators **are** journaled → derived.)
+The mechanical form of the same test: **is this write carried by the journal?** (`Source`/`Event` are **not** in `_GRAPH_EVENT_TYPES` → primary; `Point`/`Object`/operators **are** journaled → derived.)
 
 | | **The truth** | **The derived layer** |
 |---|---|---|
-| **write pattern** | **append-only** — rows are added, **never updated** | **updated in place** — revised, superseded, promoted, status-flipped |
+| **write pattern** | **versions are appended** — a truth row is never rewritten *as the authority* (`Source.updatedAt` is set ON MATCH) | **updated in place** — revised, superseded, promoted, status-flipped |
 | **read pattern** | written once, read rarely (rebuild, provenance lookup) | **read constantly** — it is what every query hits |
 | **what it costs** | stays **cold on disk** — no churn, cheap per GB | is the **working set** — this is what earns the indexes and the RAM cache |
 | **role** | **the rebuild source** | **droppable and regenerable** |
@@ -257,17 +257,17 @@ The mechanical form of the same test: **is this write carried by the journal?** 
 4. it is **never the only home**;
 5. it is **recomputed on rebuild, never restored**.
 
-**`Source.reliability` already satisfies all five** — `ONTOLOGY.md` calls it a *"documented cache, never authoritative"* (`#398`). **`Document` needs placing explicitly**: its **existence is truth** (a connector discovered it); its `doc_status` is a **mutable field on a truth row** — and ⚠️ its `captured`→`extracted` flip is currently an **unjournalled raw Cypher write** (`ingest.py:262-266`, `hosted_api.py:10929`), which is a **journal-completeness gap**, filed alongside `#4240`.
+**`Source.reliability` already satisfies all five** — `ONTOLOGY.md` calls it a *"documented cache, never authoritative"* (`#398`). **`Document` was once placed explicitly** — its existence was truth, and its `doc_status` a mutable field on a truth row whose `captured`→`extracted` flip was an unjournalled raw Cypher write. **Both are retired:** a document is a `:Source` (D10/v3.15, §9.3) and `doc_status` is **RETIRED** (`tortoise/api.py:458`), so that write no longer exists. **The live counterexample is `Source.updatedAt` set ON MATCH (`:234`).**
 
-#### ⚠️ The truth set is larger than these four — and the invariant is false today
+#### ⚠️ The truth set is larger than these three — and the invariant is false today
 
-**The truth set is these four types ∪ the preserved config classes** (`_config_classes()`; see `#4641`, `#4653`). So the invariant is:
+**The truth set is these three types ∪ the preserved config classes** (`_config_classes()`; see `#4641`, `#4653`). So the invariant is:
 
 ```text
 derived  =  replay(journal)  ∪  preserved_config
 ```
 
-**⚠️ And `derived = replay(journal)` is FALSE in the code as it stands** (`#4641`, `#4653`). **Journal completeness is a PRECONDITION of this design, not an observation about it** — raw-Cypher writes (`#4240`, the `doc_status` flip above) bypass the journal today.
+**⚠️ And `derived = replay(journal)` is FALSE in the code as it stands** (`#4641`, `#4653`). **Journal completeness is a PRECONDITION of this design, not an observation about it** — raw-Cypher writes that bypass the journal break it.
 
 #### ✅ THE `#2881` COLLISION IS CLOSED — by SCOPING, not by overriding (see §14.1 **O1**)
 
@@ -453,7 +453,7 @@ The extraction document states no target and no aggregate reduction; the number 
 **⚠️ STATUS — and the two documents disagreed until 2026-09-24** (extractor §9 records D8 as `DECIDED (retain half landed)`; this section is headed *PLACEMENT is DECIDED* as of 2026-10-06, and was headed *open* until then). **Both are right about different halves, and the split is the resolution:**
 
 - ✅ **RETAINING verbatim operational values is DECIDED and LANDED** — commit `4a690d0be` / PR `#2456` (2026-09-07): `STATE_VALUE_CARVE_OUT` (`extractor_v2.py:145-171`) plus `VALUE_FIDELITY_RULE` (`:230`, rendered into the S2/S4 `{anti_routine}` slot via `_s2s4_rules()`, `:299`); **`_granularity_text()` (`:732-744`) appends `STATE_VALUE_CARVE_OUT` to S1.** **The rule reaches the model.**
-- ⛔ **What is MISSING is mechanical enforcement** — the rule was prompt-only; `valueGate` now EXISTS in code (`tortoise/value_gate.py`). **`#4899` is CLOSED** — whether the gate is enabled by default is not asserted here.
+- ⛔ **What is missing is enforcement BY DEFAULT — not the mechanism.** `valueGate` exists in code (`tortoise/value_gate.py`) and ships **OFF**, subordinate to VET. **`#4899` is CLOSED.**
 - ✅ **PLACEMENT is NO LONGER OPEN — it is DECIDED (owner, 2026-10-06; the decision paragraph follows immediately below).** It was: whether a state value becomes a `Point`, or a **structural field on an entity**. The paragraphs AFTER the decision record the reasoning that was open when they were written.
 
 **✅ PLACEMENT ACCEPTED (owner, 2026-10-06): a state/numeric value is a STRUCTURAL FIELD ON AN ENTITY, not a `Point`.** The reasoning is the ontology's own: operators connect only epistemic targets, EP confidence propagates over atomic beliefs, and relevance modulation needs beliefs separable (§8) — **a belief can be argued with, an attribute cannot.** The grounded requirement (*"75% of tranche 1 spent → tranche 2 unlocks"*) is a **comparison of an attribute**, so an amount is an entity field: no confidence, **no NAND-ability, and no embedding**. **⚠️ COST — CORRECTED 2026-10-06. An earlier version of this line read *"the cost lever is therefore skipping the vector, not leaving the graph"*, and that OVERSTATES it.** The measured model (§2.1, §12.1b): **on FalkorDB the WHOLE graph is RAM — no spill-to-disk, and no eviction on Cloud *as far as we can establish*; §2.1 names confirming that with the vendor as the single most valuable thing to confirm — so cost is proportional to total data and there is NO cold-data tier.** The three measured classes this cost model turns on, on a ~141 MB graph, are **45 MB of indices + 51.6 MB of embeddings + 16 MB of text — ≈113 MB of the ~141 MB** (a PARTIAL accounting, not the whole graph: the remainder is label matrices, edges and events, and the three do not sum to the total) — ⚠️ **the 141 MB / 45 MB pair is the one §1's ruling block declares superseded (it reads 143 MB / 46 MB; see its *"This block SUPERSEDES the body's older figures"*).** The vector class is the *biggest single* lever, but **the 45 MB of indices MIXES node- and text-driven fulltext indices with the embedding-driven `Point` HNSW index (§12.1b — exactly ONE vector index in the graph, on `Point`), so node count is an INDEPENDENT lever: reifying each value into its own node adds node- and label-matrix index entries that have nothing to do with embeddings** — and an index on the value itself is RAM rented forever, proportional to how many entities carry it, read or not. **⇒ Skipping the embedding makes a value CHEAPER, not FREE** — a value is cheap only if it is **neither embedded NOR indexed**, and the moment the requirement is *sum the amounts* or *filter by amount* that is an index and recurring RAM. **This is a COST question, separate from the PLACEMENT decision above, which stands on semantics** — and it is why the disk-tier option stays live (§2.2: *"the escape exists in Postgres"*). ⚠️ **Owner ruling, 2026-10-06: a zero `Object` count on the graph inspected is CONTEXTUAL, not a finding** — other graphs hold `Object`s, so such a count says nothing about the placement, and **no live-graph count is asserted here.** **An earlier draft of this line cited a zero `Object` count on this graph as evidence that the entity tier was empty — that reading is WITHDRAWN, and the figure is dropped as evidence.** The dated measurements this cost model rests on are §12.1b's and §12.2's, each against the snapshot recorded there — **none of them states or implies that an entity tier is empty or unpopulated.** ⚠️ **A NAMING conflict is open here, and it is NOT evidence about the placement:** this document calls the graph it measures *the live graph*, *the production graph* and *a dogfood instance* interchangeably, and §12.1b's **7,859 `:Object` embeddings** (2026-09-24) cannot be reconciled with a zero count until that naming is settled. **Recorded as an open item so that a later lane settles it by measurement rather than by assuming which graph a figure describes.** ⚠️ **Where a sentence ASSERTS a figure** ("I think we spent 2 million") that assertion is a belief and may be a `Point` — the separate, smaller prose question, not this placement.
@@ -640,7 +640,7 @@ Two link types look like near-duplicates:
 
 #### Q4 — the `documents` cap: **KEEP IT, RE-POINT IT AT `:Source`.**
 
-**Why the cap exists at all:** the main node cap counts `(:Point …) OR (:Object) OR (:Subject)`. **A `:Document` is none of those, so documents were invisible to it** — `#1726`'s own recorded rationale is *"the points gate is vacuous for Documents."* The separate `documents` resource closed that hole and gates `/v1/index/docs`.
+**Why the cap exists at all:** the main node cap counts `(:Point …) OR (:Object) OR (:Subject) OR (non-episodic :Event)`. **A `:Document` is none of those, so documents were invisible to it** — `#1726`'s own recorded rationale is *"the points gate is vacuous for Documents."* The separate `documents` resource closed that hole and gates `/v1/index/docs`.
 
 **⚠️ The reason does not expire when a document becomes a source — a `:Source` is equally invisible to the main cap.** So:
 

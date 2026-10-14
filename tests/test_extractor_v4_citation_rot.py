@@ -130,6 +130,54 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "the S1 slot is attributed to `VALUE_FIDELITY_RULE`": (
         "`{anti_routine}` slot and appended to S1"
     ),
+    "T6 is cited as producing the defect today": (
+        "and it is exactly what T6 above produces today"
+    ),
+    "`#5024` is cited as an outstanding precondition": (
+        "**`#5024` is its precondition**"
+    ),
+    "`doc_status` is cited as transitioning": (
+        "`doc_status` transitions **`captured`→`extracted`**"
+    ),
+    "`doc_status` is cited as a live unjournalled write": (
+        "its `captured`→`extracted` flip is currently an **unjournalled raw Cypher write**"
+    ),
+    "the truth set is counted as four types": (
+        "**The truth set is these four types ∪ the preserved config classes**"
+    ),
+    "the node cap is enumerated without `:Event`": (
+        "the main node cap counts `(:Point …) OR (:Object) OR (:Subject)`"
+    ),
+    "mechanical enforcement is cited as missing rather than off": (
+        "What is MISSING is mechanical enforcement"
+    ),
+    "the Q5 migration is offered as a free-today window": (
+        "fold, change the key, migrate — and it is free today"
+    ),
+}
+
+#: Sibling passages that must POSITIVELY state the landed fact. The retracted-only
+#: scan above catches a stale claim PUT BACK; this catches the opposite — a
+#: corrected passage silently DELETED, which would otherwise pass by omission.
+LANDED_STATEMENTS_IN_SIBLINGS: dict[str, str] = {
+    "STORAGE states the `:Document` label as retired": (
+        "The `:Document` NODE label is retired"
+    ),
+    "STORAGE states `doc_status` as retired": (
+        "`doc_status` is **RETIRED** (`tortoise/api.py:458`)"
+    ),
+    "STORAGE separates the open tracker entry from the landed D10 work": (
+        "D10 code-half work done: `#5024`, `#5025`, `#5026`"
+    ),
+    "STORAGE states the Q5 keys as non-interchangeable": (
+        "**A `:Document` key and a `:Source` key are not interchangeable**"
+    ),
+    "STORAGE counts the truth set as three types": (
+        "**The truth set is these three types ∪ the preserved config classes**"
+    ),
+    "ONTOLOGY states the operator endpoints as live": (
+        "operator endpoints are live (`#7902`)"
+    ),
 }
 
 #: The repaired passages must SAY what landed, not merely omit the old claim —
@@ -195,6 +243,20 @@ def test_the_sibling_documents_do_not_carry_the_retracted_claims():
         "these claims were retracted across the document set, and a document "
         "still carries them — a repair that fixes one copy and leaves the others "
         "makes the documents contradict each other:\n  - " + "\n  - ".join(hits)
+    )
+
+
+def test_the_sibling_documents_state_the_landed_facts():
+    combined = "\n".join(d.read_text(encoding="utf-8") for d in SIBLINGS)
+    missing = [
+        name
+        for name, literal in LANDED_STATEMENTS_IN_SIBLINGS.items()
+        if literal not in combined
+    ]
+    assert not missing, (
+        "the corrected sibling passages no longer state the landed fact — a "
+        "passage was silently deleted rather than corrected:\n  - "
+        + "\n  - ".join(missing)
     )
 
 
