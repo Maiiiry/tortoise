@@ -2024,6 +2024,14 @@ surfaces:
   # diff takes `select()`'s early return, so `tier1` is where it must live;
   # `core` is its home for the code diffs that can re-rotate a passage.
   - test_extractor_v4_citation_rot.py
+  # #8495: the FOURTH guard over the same document — §4.4's per-step failure
+  # policy. Pins that every §4.0 canonical step keeps a declared direction, that
+  # the three invariants and the re-narrate tie-break survive, and that `HOLD` is
+  # not silently added to `vet_gate.OUTCOMES`. Same docs-only reason as the three
+  # guards above: a `docs/`-only diff takes `select()`'s early return, so `tier1`
+  # is where it must live; `core` is its home for the code diffs (a fixed
+  # `_render_search_results`, or a new step) that can re-rot the passage.
+  - test_extractor_v4_failure_policy.py
   - test_falkordb_compat.py
   # #7076: the degraded-fallback snapshot's OWN guard. test_fallback_snapshot.py
   # was registered only under `api`, while the module it guards
@@ -3457,6 +3465,10 @@ tier1:
 # and the same docs-only PR is exactly the change that can re-introduce a
 # retracted passage.
 - test_extractor_v4_citation_rot.py
+# #8495: the same document's per-step FAILURE-POLICY guard (`core` above) — same
+# no-DB shape, and the same docs-only PR is exactly the change that can drop or
+# contradict the declared policy.
+- test_extractor_v4_failure_policy.py
 slow_files:
 - test_3311_multilabel_status_vocab.py
 - test_about_edges.py
@@ -4428,6 +4440,7 @@ durations:
   test_extractor_v4_step_list_consistency.py: 0.1  # #5092: two fenced blocks + one paragraph read; measured 0.01s of test body (session setup excluded)
   test_extractor_v4_doc_citations.py: 0.1  # #8498 review P2: one row + two module assertions; same no-DB shape as the step-list guard
   test_extractor_v4_citation_rot.py: 0.1  # #8506: doc-text scans + a handful of file reads; same no-DB shape as the two guards above
+  test_extractor_v4_failure_policy.py: 0.1  # #8495: §4.4 doc-text scan + two module reads; same no-DB shape as the three guards above
   test_file_indexer.py: 0.7
   test_open_kinds.py: 0.3
   test_postmerge_verdict.py: 0.4
