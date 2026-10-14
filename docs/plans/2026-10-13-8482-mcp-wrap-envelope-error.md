@@ -97,6 +97,7 @@ produce `is_error=True` with no `structured_content` and the message intact; a u
 object tool are untouched; the array-envelope success path performs zero schema reads, and a union
 tool's success pays at most one memoised classification.
 **Files:**
+
 - Modify: `tortoise/mcp_server.py` (`_WRAP_ENVELOPE_SCHEMA_CACHE`, `_local_tool_cache_key`,
   `_wrap_envelope_schema`, `_wrap_envelope_result_type`,
   `_violates_wrap_envelope`, `_maybe_wrap_envelope_violation`, `_safe_failure_message`,
@@ -107,6 +108,7 @@ tool's success pays at most one memoised classification.
 **Intent:** Prove the repair is what fixes it, and pin the class rather than the two named tools.
 **Acceptance:** the file fails before the change and passes after; the sweep walks the REAL registry.
 **Files:**
+
 - Create: `tests/test_mcp_wrap_envelope_error_8482.py`
 
 ### Task 3: registration
@@ -114,6 +116,7 @@ tool's success pays at most one memoised classification.
 **Intent:** Make the guard actually run when the seam it pins moves.
 **Acceptance:** `tools/ci_manifest.py` exits 0; `tests/test_ci_selection.py` leg/time coverage passes.
 **Files:**
+
 - Modify: `config/ci-surfaces.yml` (register the new file on `api`, the `mcp_server` family surface;
   **no** `durations` weight — the collector is that map's sole writer and 86 registered files
   legitimately carry none)
@@ -126,6 +129,7 @@ success" class, and the reason this defect could go unnoticed (#8135).
 **Acceptance:** a wrap-envelope tool under the stdio auth gate records
 `status=auth_error, error_kind=stdio_auth_gate`, and the refusal is legible to the client.
 **Files:**
+
 - Modify: `tortoise/mcp_server.py` (`_safe_failure_message` read through the envelope)
 
 ---
