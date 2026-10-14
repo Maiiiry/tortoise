@@ -241,7 +241,7 @@ def test_the_gate_passage_separates_the_verdict_from_the_action():
 
 #: The decided site (`#4899` DEC-1; shipped in PR `#5237`). The predicate is
 #: `tortoise/value_gate.py:370` (`mechanical_verdict`), called from
-#: `tortoise/vet_gate.py:466` — Level-2 of `vet_candidates`, before the arbiter
+#: `tortoise/vet_gate.py:469` — Level-2 of `vet_candidates`, before the arbiter
 #: and before S3 RESOLVE (`tortoise/extractor_v2.py:7343`).
 DISCARD_SITE = "S2.2b"
 
@@ -259,16 +259,30 @@ O2_WITHDRAWAL = (
 
 #: The withdrawn OBLIGATION (not the words around it), so the same requirement
 #: re-worded in the same shape still reds. It may appear in the document only
-#: as a quoted, withdrawn record — see `_WITHDRAWAL_MARK`.
+#: as a quoted, withdrawn record — see `_WITHDRAWN_REQUIREMENT`.
 _FLOOR_OBLIGATION = re.compile(
     r"\b(?:must|shall|has to|needs to)\s+be\s+paired\s+with\s+a\s+measured\s+"
     r"retention\s+floor",
     re.IGNORECASE,
 )
 
-#: How a withdrawal is marked at the point of quotation. A line carrying the
-#: obligation AND one of these is the reversal record, not the requirement.
-_WITHDRAWAL_MARK = re.compile(r"withdrawn|superseded|no longer", re.IGNORECASE)
+#: The withdrawal must bind to the OBLIGATION, not merely share its line. The
+#: §4.2 passage is ONE long line, so a line-scoped exemption lets an incidental
+#: `withdrawn` (e.g. *"…before rows are withdrawn"*) exempt a live re-assertion
+#: of the very requirement O2 withdrew — the fail-open the `#5198` review found.
+#: Requiring the mark to name the requirement/floor/obligation closes it: the
+#: reversal record quotes the requirement and then states *that it* is gone.
+_WITHDRAWN_REQUIREMENT = re.compile(
+    r"(?:requirement|obligation|floor|framing|target)[^.\n]{0,40}?"
+    r"\b(?:is|was|are|were|has been|had been|now)\s+"
+    r"(?:withdrawn|superseded|no longer|reversed|rejected|dropped)",
+    re.IGNORECASE,
+)
+
+#: How far after an obligation occurrence its own withdrawal may sit on the
+#: line. A bounded window stops a re-assertion appended to the far end of a
+#: one-line paragraph from inheriting an earlier reversal's mark.
+_REVERSAL_WINDOW = 200
 
 #: `DISCARD` and `E7` on one line is only legitimate as the reversal record:
 #: it must also name the decided site and negate the rejected one. That is the
@@ -309,10 +323,14 @@ def test_the_issue_map_row_names_the_decided_site():
     the shipped code all said `S2.2b`, so the document asserted both again
     (#5198) — exactly what #5092 eliminated inside the blocks.
     """
+    # `main` replaced the row header (`the mechanism (\`^the <X>\`)`) with
+    # `the mechanism — **two halves**`; anchor on the prefix both spellings
+    # share so the row stays findable, and keep its scope text intact — the
+    # identifier-only predicate does NOT own the `the <X>` class (#8498).
     rows = [
         line
         for line in _document().splitlines()
-        if "the mechanism (`^the <X>`" in line
+        if "§1 the mechanism" in line
     ]
     assert len(rows) == 1, (
         "§15's issue-map row for §1 is not uniquely identifiable — the guard "
@@ -324,11 +342,19 @@ def test_the_issue_map_row_names_the_decided_site():
         f"({DISCARD_SITE!r}). It is the index a lane holding `#4899` reads "
         "(#5198):\n" + row
     )
-    assert row.index(DISCARD_SITE) < row.index(REJECTED_SITE), (
-        "§15's issue-map row names E7 BEFORE the decided site — so the row "
-        "still asserts the losing site (`#4899` DEC-1). Order it the other way "
-        "or drop the E7 mention (#5198):\n" + row
+    assert "value_gate._REFERENCE" in row and "identifier_only()" in row, (
+        "§15's issue-map row must name the shipped predicate symbols "
+        "(`value_gate._REFERENCE` / `identifier_only()`), not a hand-written "
+        "pattern, and must scope itself to the identifier-only half — the "
+        "62.3% `the <X>` class is explicitly NOT owned by this row "
+        "(#8498 / #5198):\n" + row
     )
+    if REJECTED_SITE in row:
+        assert row.index(DISCARD_SITE) < row.index(REJECTED_SITE), (
+            "§15's issue-map row names E7 BEFORE the decided site — so the row "
+            "still asserts the losing site (`#4899` DEC-1). Put `S2.2b` first, "
+            "or drop the E7 mention (#5198):\n" + row
+        )
 
 
 def test_the_withdrawn_floor_requirement_is_never_reasserted():
@@ -344,11 +370,16 @@ def test_the_withdrawn_floor_requirement_is_never_reasserted():
         "recall-arithmetic paragraph is reconciled against — without it, a "
         "retention floor reads as the documented rule again (#5198)"
     )
-    offenders = [
-        f"{DOC.name}:{number}: {line.strip()[:200]}"
-        for number, line in enumerate(text.splitlines(), 1)
-        if _FLOOR_OBLIGATION.search(line) and not _WITHDRAWAL_MARK.search(line)
-    ]
+    offenders = []
+    for number, line in enumerate(text.splitlines(), 1):
+        for match in _FLOOR_OBLIGATION.finditer(line):
+            # The mark must bind to THIS obligation, not merely the line: an
+            # incidental "withdrawn" elsewhere in a one-line paragraph must not
+            # exempt a live re-assertion (the #5198 review's fail-open).
+            window = line[match.end() : match.end() + _REVERSAL_WINDOW]
+            if not _WITHDRAWN_REQUIREMENT.search(window):
+                offenders.append(f"{DOC.name}:{number}: {line.strip()[:200]}")
+                break
     assert not offenders, (
         "a line requires a measured retention floor without recording that the "
         "requirement is withdrawn — O2 (owner, 2026-09-24) withdrew it "
@@ -384,9 +415,9 @@ def test_the_recall_arithmetic_paragraph_carries_o2s_withdrawal():
         "next lane cites it to demand a retention floor (#5198):\n"
         + paragraph[:600]
     )
-    assert _WITHDRAWAL_MARK.search(paragraph), (
-        "the paragraph does not mark the old requirement as withdrawn — it "
-        "reads as a live obligation again (#5198)"
+    assert _WITHDRAWN_REQUIREMENT.search(paragraph), (
+        "the paragraph does not mark the old requirement itself as withdrawn — "
+        "it reads as a live obligation again (#5198)"
     )
 
 
