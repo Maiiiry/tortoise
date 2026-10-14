@@ -186,19 +186,22 @@ def test_a_reserved_envelope_prop_cannot_forge_or_suppress_the_record(env):
     journalled nothing and ``rebuild_all`` destroyed the node — the #2296
     defect itself, reachable through a caller prop.
 
-    All four are stripped at prop intake (``_sanitize_props``), the one surface
+    All of ``_RESERVED_ENVELOPE_PROPS`` (every `_emit_event` envelope name
+    except ``id``, which keeps its own fail-closed contract) is stripped at prop
+    intake (``_sanitize_props``), the one surface
     ``create_point``/``update_point``/``create_entity``/``update_entity`` all
-    pass through; ``create_source`` bypasses that intake and drops them itself.
-    FAILS IF any of them leaves ``_JOURNAL_ENVELOPE_KEYS`` /
-    ``_RESERVED_ENVELOPE_PROPS``, IF the intake strip is removed, or IF
-    ``_create_entity`` stops owning the ``type`` it emits."""
+    pass through; ``create_source`` bypasses that intake and drops the set —
+    plus the reserved actor keys — itself. FAILS IF any of them leaves
+    ``_JOURNAL_ENVELOPE_KEYS`` / ``_RESERVED_ENVELOPE_PROPS``, IF the intake
+    strip is removed, or IF ``_create_entity`` stops owning the ``type`` it
+    emits."""
     sdk, events = env
     forged = "1999-01-01T00:00:00+00:00"
-    # The record side: all four are `_emit_event` envelope names, so they must
-    # be stripped from EVERY entity-door payload, not only from the one call
-    # this test happens to drive.
-    from tortoise.sdk import _journal_record_payload
-    for name in ("recorded_ts", "type", "point", "payload"):
+    # The record side: every envelope name must be stripped from EVERY
+    # entity-door payload, not only from the one call this test happens to
+    # drive.
+    from tortoise.sdk import _RESERVED_ENVELOPE_PROPS, _journal_record_payload
+    for name in _RESERVED_ENVELOPE_PROPS:
         assert name not in _journal_record_payload(
             {"type": "DocumentCreated", "id": "x", name: forged}), (
             f"{name!r} is an `_emit_event` envelope name and must be stripped "
@@ -212,31 +215,43 @@ def test_a_reserved_envelope_prop_cannot_forge_or_suppress_the_record(env):
     assert "recorded_ts" not in live, (
         "a caller `recorded_ts` prop persisted live while the record strips "
         "it — the #8553 live != replay divergence")
-    # The Source door emits its OWN record (`SourceCreated`) and does not route
-    # through `_journal_entity_event`, so it needs its own drop.
+    # The Source door emits its OWN record (`SourceCreated`), bypasses the
+    # intake strip, and drops the reserved names itself — including the ACTOR
+    # keys, which the sanitizer would otherwise have taken.
     sdk.create_source("https://example.com/rt", "document",
-                      recorded_ts=forged, summary="rt")
+                      recorded_ts=forged, initiated_by="FORGED-ACTOR",
+                      summary="rt")
     src_rec = next(e for e in _journal(events)
                    if e.get("type") == "SourceCreated")
     assert src_rec["ts"] != forged, (
         "a caller `recorded_ts` prop forged the SourceCreated record's ts")
+    assert src_rec.get("initiated_by") == "sdk", (
+        "a caller `initiated_by` prop forged the SourceCreated record's actor")
     # The generic update door splats caller props straight into `_emit_event`,
-    # so before the intake strip each of these bound its own parameter.
+    # so before the intake strip each of these bound its own parameter or
+    # overwrote the built envelope via `event.update(extra)`.
     pt = sdk.create_point("statement", "a point")
     sdk.update_point(pt["id"], recorded_ts=forged, type="PointAdded",
                      point={"id": "forged"}, payload={"forged": True},
+                     ts=forged, event_id="FORGED-EVENT-ID",
+                     projection_version=99, initiated_by="FORGED-ACTOR",
                      summary="rt")
     rev = next(e for e in _journal(events)
                if e.get("type") == "PointRevised")
     assert rev["ts"] != forged, (
-        "a caller `recorded_ts` prop forged the PointRevised record's ts")
+        "a caller `recorded_ts`/`ts` prop forged the record's envelope ts")
     assert rev.get("point") is None and rev.get("payload") is None, (
         "a caller `point`/`payload` prop became the record's snapshot/payload "
         "— the rebuild replays it onto the node")
+    assert (rev.get("event_id") != "FORGED-EVENT-ID"
+            and rev.get("projection_version") == 2
+            and rev.get("initiated_by") == "sdk"), (
+        "a caller prop overwrote a built envelope field via "
+        "`event.update(extra)`")
     pt_live = sdk._get_proj().g.query(
         "MATCH (n:Point {id:$id}) RETURN properties(n)",
         params={"id": pt["id"]}).result_set[0][0]
-    for name in ("recorded_ts", "type", "point", "payload"):
+    for name in _RESERVED_ENVELOPE_PROPS:
         assert name not in pt_live, (
             f"a caller {name!r} prop persisted live on the Point while the "
             "record strips it — the #8553 live != replay divergence")

@@ -2710,28 +2710,36 @@ _JOURNAL_ENVELOPE_KEYS = (
     "event_id", "ts", "recorded_ts", "initiated_by", "projection_version",
 )
 
-#: The `_JOURNAL_ENVELOPE_KEYS` names that must be refused at prop INTAKE, not
-# merely stripped from the record. Two collision mechanisms, neither visible
-# from inside `_emit_event`:
+#: Every `_emit_event` ENVELOPE name a caller prop must not be able to set —
+# that is `_JOURNAL_ENVELOPE_KEYS` minus ``id``, which is deliberately absent
+# because it has its own FAIL-CLOSED contract (`_sanitize_props(reject_id=True)`
+# raises), which a silent strip would weaken. Refused at prop INTAKE, not merely
+# stripped from the record, because the collision is invisible from inside
+# `_emit_event` and each name has a distinct failure:
 #
 # * ``recorded_ts`` / ``point`` / ``payload`` are `_emit_event` PARAMETERS, and
 #   Python binds a ``**props`` key to a named parameter AT THE CALL — so any
 #   door that splats caller props into the call turns the prop into that
-#   parameter. ``recorded_ts`` forges the record's envelope ``ts``;
-#   ``point`` hands the record a CALLER-AUTHORED node snapshot, which the
-#   rebuild then replays (measured on ``update_point``, #2296 review).
+#   parameter. ``recorded_ts`` forges the record's envelope ``ts``; ``point``
+#   hands the record a CALLER-AUTHORED node snapshot, which the rebuild then
+#   replays (measured on ``update_point``); ``payload`` becomes the
+#   ``:GraphEvent`` payload instead of a node property.
 # * ``type`` is the key BOTH the live fold and the journal record dispatch on,
 #   so a prop of that name re-types or silently SUPPRESSES the record
 #   (measured: ``create_document(type="SourceCreated")`` journalled NOTHING,
 #   and ``rebuild_all`` destroyed the node — the #2296 defect itself, reachable
 #   through a caller prop).
+# * ``ts`` / ``event_id`` / ``projection_version`` / ``initiated_by`` land in
+#   ``**extra`` and are applied by ``event.update(extra)`` AFTER the envelope is
+#   built, overwriting it (measured on ``update_point``: a caller ``ts``,
+#   ``event_id`` and ``projection_version`` all reached the record).
 #
-# ``id`` is deliberately absent: it has its own FAIL-CLOSED contract
-# (`_sanitize_props(reject_id=True)` raises), which a silent strip would
-# weaken. ``ts`` / ``event_id`` / ``initiated_by`` / ``projection_version`` are
-# absent too: they collide only through ``event.update(extra)`` precedence (a
-# documented, pre-existing contract) and stay the #8553 live != replay residue.
-_RESERVED_ENVELOPE_PROPS = ("recorded_ts", "type", "point", "payload")
+# The set is spelled out rather than derived so an auditor sees it whole; it
+# must stay equal to `_JOURNAL_ENVELOPE_KEYS` minus ``id``.
+_RESERVED_ENVELOPE_PROPS = (
+    "type", "point", "payload", "event_id", "ts", "recorded_ts",
+    "initiated_by", "projection_version",
+)
 
 #: The canonical record types a live entity door may journal.
 # `DocumentCreated` (#2296) joins the set: the last unjournaled canonical
@@ -2752,10 +2760,11 @@ def _journal_record_payload(event: dict) -> dict:
     fold re-derives ``ingestedAt``/``updatedAt`` at replay. For an envelope name
     a write door does NOT drop from the live event, the caller prop survives
     LIVE while this strips it — the live ≠ replay residue tracked as #8553.
-    ``recorded_ts``, ``type``, ``point`` and ``payload`` are NOT in that
-    residue: they are `_RESERVED_ENVELOPE_PROPS`, stripped at prop INTAKE
-    (``_sanitize_props``) so none of them can reach ``_emit_event`` as a call
-    argument, and dropped by the door that bypasses intake (``create_source``).
+    ``_RESERVED_ENVELOPE_PROPS`` is NOT in that residue: every envelope name
+    except ``id`` (which keeps its own fail-closed contract) is stripped at prop
+    INTAKE (``_sanitize_props``) so none of them can reach ``_emit_event`` as a
+    call argument or as the dispatch key, and the door that bypasses intake
+    (``create_source``) drops them — plus the reserved actor keys — itself.
     """
     return {k: v for k, v in event.items() if k not in _JOURNAL_ENVELOPE_KEYS}
 
@@ -27997,10 +28006,11 @@ class TortoiseSDK:
         # (`_skip_sanitize=True`), so the shared intake strip cannot cover it —
         # and these are the envelope names that are `_emit_event` PARAMETERS
         # (`recorded_ts` binds the record's `ts`; `point`/`payload` bind the
-        # record's snapshot/payload) or the record's dispatch key (`type`).
-        # Envelope-reserved: drop them, as `_create_entity` drops
-        # point/payload on its own route.
-        for _envelope_prop in _RESERVED_ENVELOPE_PROPS:
+        # record's snapshot/payload) or the record's dispatch key (`type`), plus
+        # the reserved ACTOR keys (`initiated_by` and siblings), which the
+        # sanitizer would also have stripped. Envelope-reserved: drop them, as
+        # `_create_entity` drops point/payload on its own route.
+        for _envelope_prop in (*_RESERVED_ENVELOPE_PROPS, *_RESERVED_ACTOR_PROPS):
             ev.pop(_envelope_prop, None)
         if is_episodic is not None:
             # #1488: server-managed quota discriminator — explicit param only
