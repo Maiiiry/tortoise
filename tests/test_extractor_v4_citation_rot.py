@@ -324,7 +324,10 @@ FACT_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
 #:
 #: ⚠️ A pin states a DESIGN FACT, never a delivery state. A pin on "is live" or
 #: "is done" reds the moment the document says the same thing in design
-#: language — punishing the edit it exists to reward.
+#: language — punishing the edit it exists to reward. For the same reason a pin
+#: does not require the AUTHORITY citation (`PR #5127`): the fact is what the
+#: document owes a reader, and the citation was deliberately dropped when the
+#: issue/PR references went to the changelog.
 LANDED_STATEMENTS: dict[str, str] = {
     "§S0 states the D10 code half as landed": "D10 holds in both halves — ontology and code.",
     "§D's D10 row states the label retirement": (
@@ -543,7 +546,7 @@ def test_every_quoted_symbol_citation_resolves_at_head():
 #: are ordinary English — *"a closed vocabulary"*, *"FAIL-CLOSED"*, *"the code is
 #: closed `[vF, vT]`"*, *"a fixed-width row"* — so each needs either a `#NNN` in
 #: the same clause, or a copula directly in front.
-_STATUS_WORDS = r"(?:CLOSED|COMPLETED|LANDED|FILED|FIXED|SHIPPED|RETIRED|BUILT|DONE|IMPLEMENTED)"
+_STATUS_WORDS = r"(?:CLOSED|COMPLETED|LANDED|FILED|FIXED|SHIPPED|RETIRED|BUILT|DONE|IMPLEMENTED|OPEN|PENDING|TODO|OUTSTANDING|UNIMPLEMENTED)"
 #: Only the participles that are unambiguously delivery in these documents.
 #: `closed`, `fixed`, `done` and `built` are ordinary English here — *"a closed
 #: vocabulary"*, *"a fixed-width row"*, *"done in S6"*, *"built to close"* — and
@@ -553,6 +556,30 @@ _STATUS_WORDS = r"(?:CLOSED|COMPLETED|LANDED|FILED|FIXED|SHIPPED|RETIRED|BUILT|D
 #: implemented"*) and including them produced more false positives than true ones.
 #: `landed` and `shipped` are the two that are delivery almost every time.
 _STATUS_LOWER = r"(?:landed|shipped)"
+
+#: Absence of work spoken as absence: *"`#3011` has not run"*, *"THE S0 HALF IS
+#: NOT BUILT"*, *"not yet wired"*. A design document states what the design IS;
+#: what is missing is a tracker's job. Applied to the two architecture documents
+#: only — `ONTOLOGY.md` is OWNER-GATED (the file states its own rule), the same
+#: shape is present there at two lines, and that is recorded for approval rather
+#: than edited. See the class test's docstring.
+_STATUS_ABSENCE = (
+    # The CAPS form is this document set's convention for delivery state, so it
+    # carries no ambiguity.
+    re.compile(r"\bNOT (?:BUILT|RUN|WIRED|IMPLEMENTED|WRITTEN)\b"),
+    # The lowercase form is ordinary English — *"a claim not worth keeping is not
+    # written"*, *"the read path classifies a leg that did not run"* — so it needs
+    # a `#NNN` in the same clause, which is where the absence is being tracked.
+    # Measured: the bare form fired on 7 design sentences and this arm fires on 0.
+    re.compile(
+        r"#[0-9]{3,5}[^.\n]{0,40}?\bnot\s+(?:yet\s+)?(?:run|built|wired|implemented|written)\b"
+        r"|\bnot\s+(?:yet\s+)?(?:run|built|wired|implemented|written)\b[^.\n]{0,40}?#[0-9]{3,5}",
+        re.IGNORECASE,
+    ),
+)
+#: The documents `_STATUS_ABSENCE` governs. `ONTOLOGY.md` is excluded until the
+#: owner approves the two edits; when that lands this becomes `DESIGN_DOCS`.
+STATUS_ABSENCE_DOCS: tuple[Path, ...] = (DOC, STORAGE)
 
 #: Uses that are ordinary English, not a delivery claim. Matched against the
 #: token and its immediate context, and dropped.
@@ -595,16 +622,22 @@ _CHANGE_NARRATION = re.compile(
 )
 
 #: Delivery spoken as delivery. A design document states the fact, not the fact
-#: that it arrived: *"D10 is LANDED"*, *"this reopen is CLOSED"*, *"measured,
-#: and FIXED"*. The trailing window is deliberately short — a sentence further
-#: on is a different claim.
+#: that it arrived: *"D10 is LANDED"*, *"the migration is NOT WIRED"*, *"this
+#: reopen is CLOSED"*. The trailing window is deliberately short — a sentence
+#: further on is a different claim.
 _DELIVERY_STATE = (
     # Only the state words that are NOT ordinary design vocabulary. `RETIRED`,
     # `CLOSED`, `BUILT`, `FIXED` and `DONE` all have legitimate design senses here
     # ("the field is RETIRED", "a CLOSED vocabulary", "the cap was built to close
     # X"), so a bare-word arm for them fires on the design itself. The state claim
     # for those is caught where it actually appears: adjacent to its `#NNN`.
-    re.compile(r"\b(?:LANDED|SHIPPED)\b|\bNOW TRUE\b"),
+    re.compile(r"\b(?:LANDED|SHIPPED)\b|\bNOW TRUE\b"
+              r"|\b(?:is|are|was|were)\s+(?:already\s+)?CLOSED\b"),
+    # *"has already landed"* / *"is shipped"*: delivery in lowercase, and the
+    # only lowercase copula arm that is safe — `landed` and `shipped` have no
+    # ordinary design sense here, unlike `closed` / `built` / `done`.
+    re.compile(r"\b(?:is|are|was|were|has|have)\s+(?:already\s+)?(?:landed|shipped)\b",
+               re.IGNORECASE),
     # A lowercase copula arm was tried and removed: *"the vocabulary is closed"*,
     # *"the code is closed `[vF, vT]`"* and *"not a status report on what is
     # built"* are all design prose, and it produced far more false positives than
@@ -663,9 +696,17 @@ def test_the_design_documents_carry_no_issue_state_or_change_narration():
     `this reopen is CLOSED`, `#5007 shipped`). The last shape is the one the
     first two windows let through: it needs no `#NNN` adjacent and carries no
     date.
+
+    `_STATUS_ABSENCE` (`not built`, `has not run`, `not yet wired`) is applied to
+    `STATUS_ABSENCE_DOCS` rather than to `DESIGN_DOCS`: the same shape is present
+    in `ONTOLOGY.md` at two lines, and that file is OWNER-GATED — it states its
+    own rule that no change lands without the owner approving the exact diff.
+    The two passages are recorded for approval, not edited behind the rule. When
+    they land, point `STATUS_ABSENCE_DOCS` at `DESIGN_DOCS`.
     """
     offenders = []
     for path in DESIGN_DOCS:
+        absence = path in STATUS_ABSENCE_DOCS
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if any(rx.search(line) for rx in _STATUS_ADJACENT):
                 offenders.append(f"{path.name}:{number}: issue-state claim: {line.strip()[:160]}")
@@ -673,6 +714,8 @@ def test_the_design_documents_carry_no_issue_state_or_change_narration():
                 offenders.append(f"{path.name}:{number}: change narration: {line.strip()[:160]}")
             if _delivery_hits(line):
                 offenders.append(f"{path.name}:{number}: delivery state: {line.strip()[:160]}")
+            if absence and any(rx.search(line) for rx in _STATUS_ABSENCE):
+                offenders.append(f"{path.name}:{number}: absent-work claim: {line.strip()[:160]}")
     assert not offenders, (
         "a design document must state the design. An issue's open/closed state, "
         "and the narrative of what changed, belong in the sibling "
@@ -697,6 +740,7 @@ def test_the_class_check_is_neither_dead_nor_noisy():
         return bool(
             _delivery_hits(line)
             or any(rx.search(line) for rx in _STATUS_ADJACENT)
+            or any(rx.search(line) for rx in _STATUS_ABSENCE)
             or _CHANGE_NARRATION.search(line)
         )
 
@@ -704,6 +748,11 @@ def test_the_class_check_is_neither_dead_nor_noisy():
         "The work is tracked as `#4999` **CLOSED `COMPLETED`** for now.",
         "`#5007` shipped the span *schema*.",
         "The migration is LANDED.",
+        "⚠️ **`#3011` has not run: the layer is unmeasured on our stack.**",
+        "**THE S0 HALF IS NOT BUILT.**",
+        "Part of v3 has already landed.",
+        "`#2354` **OPEN, epistemic-team** —",
+        "this reopen is CLOSED",
         "*An earlier draft said* the opposite of this paragraph.",
         "**CORRECTED 2026-09-24** \u2014 this passage was repaired.",
         "**Implementation status.** Both halves are now implemented.",

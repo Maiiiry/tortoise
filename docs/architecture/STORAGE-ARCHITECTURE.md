@@ -264,7 +264,7 @@ derived  =  replay(journal)  ∪  preserved_config
 
 **⚠️ A real gap this document must name:** `rebuild_all` performs an unconditional wipe + journal-only replay — i.e. **the code treats an incomplete log as the authority**. That is the defect `#5089` (*"epic: durability — derived = replay(journal) made true"*) must fix. It is the write-path half of §3's own divergence list below, whose mechanism (1) *"ONE ATOMIC WRITE"* is recorded **absent**.
 
-**⚠️ The durability gate `tests/test_durability_posture.py` does NOT scan `docs/architecture/`** — so colliding wording in an architecture doc passes CI.
+**⚠️ The architecture documents must not re-define durability terms** — the gate `tests/test_durability_posture.py` does not scan `docs/architecture/`, so a divergence here would not be caught.
 
 **Three storage consequences — and the third is what forces the split:**
 
@@ -321,7 +321,7 @@ The general rule:
 4. **Guarded repair** — full wipe + replay only on unambiguous loss.
 5. **Read-your-writes** while a projection lags.
 
-**Measured against the code: (1) absent · (2) absent · (3) count-only (`consistency.py`) · (4) present and guarded · (5) absent.** ⚠️ **The current JSONL cannot do (1)** — `durability-posture.md` records it as *"wall outside the store's transaction … dual-write hazard"*. **This is a further reason the Postgres target matters.**
+**All five mechanisms are required; (3) is count-only (`consistency.py`) and (4) is guarded.** ⚠️ **The current JSONL cannot do (1)** — `durability-posture.md` records it as *"wall outside the store's transaction … dual-write hazard"*. **This is a further reason the Postgres target matters.**
 
 > **Why `recompute(the sources)` is impossible: the extractor is not deterministic.** Re-run it over the same `Source` and you get **different `Point`s**. So the derived tables are **not a function of the sources** — they are a function of the sources **plus the model, prompt, pack and run**.
 >
@@ -438,7 +438,7 @@ The extraction document states no target and no aggregate reduction; the number 
 **⚠️ Two halves — RETAIN and PLACEMENT — and they are decided separately:**
 
 - **Operational values are retained verbatim** — commit `4a690d0be` / PR `#2456` (2026-09-07): `STATE_VALUE_CARVE_OUT` (`extractor_v2.py:145-171`) plus `VALUE_FIDELITY_RULE` (`:230`, rendered into the S2/S4 `{anti_routine}` slot via `_s2s4_rules()`, `:299`); **`_granularity_text()` (`:732-744`) appends `STATE_VALUE_CARVE_OUT` to S1.** **The rule reaches the model.**
-- ⛔ **What is missing is enforcement BY DEFAULT — not the mechanism.** `valueGate` exists in code (`tortoise/value_gate.py`) and ships **OFF**, subordinate to VET.
+- ⛔ **Enforcement BY DEFAULT is required — the mechanism is not the gap.** `valueGate` (`tortoise/value_gate.py`) is off by default and subordinate to VET.
 
 **✅ PLACEMENT (owner, 2026-10-06): a state/numeric value is a STRUCTURAL FIELD ON AN ENTITY, not a `Point`.** The reasoning is the ontology's own: operators connect only epistemic targets, EP confidence propagates over atomic beliefs, and relevance modulation needs beliefs separable (§8) — **a belief can be argued with, an attribute cannot.** The grounded requirement (*"75% of tranche 1 spent → tranche 2 unlocks"*) is a **comparison of an attribute**, so an amount is an entity field: no confidence, **no NAND-ability, and no embedding**. **⚠️ COST — do not overstate the lever; it is skipping the vector, not leaving the graph.** The measured model (§2.1, §12.1b): **on FalkorDB the WHOLE graph is RAM — no spill-to-disk, and no eviction on Cloud *as far as we can establish*; §2.1 names confirming that with the vendor as the single most valuable thing to confirm — so cost is proportional to total data and there is NO cold-data tier.** The three measured classes this cost model turns on, on a ~141 MB graph, are **45 MB of indices + 51.6 MB of embeddings + 16 MB of text — ≈113 MB of the ~141 MB** (a PARTIAL accounting, not the whole graph: the remainder is label matrices, edges and events, and the three do not sum to the total) — ⚠️ **§1's ruling block gives this pair as 143 MB / 46 MB — use those figures.** The vector class is the *biggest single* lever, but **the 45 MB of indices MIXES node- and text-driven fulltext indices with the embedding-driven `Point` HNSW index (§12.1b — exactly ONE vector index in the graph, on `Point`), so node count is an INDEPENDENT lever: reifying each value into its own node adds node- and label-matrix index entries that have nothing to do with embeddings** — and an index on the value itself is RAM rented forever, proportional to how many entities carry it, read or not. **⇒ Skipping the embedding makes a value CHEAPER, not FREE** — a value is cheap only if it is **neither embedded NOR indexed**, and the moment the requirement is *sum the amounts* or *filter by amount* that is an index and recurring RAM. **This is a COST question, separate from the PLACEMENT decision above, which stands on semantics** — and it is why the disk-tier option stays live (§2.2: *"the escape exists in Postgres"*). ⚠️ **A zero `Object` count on any one graph is CONTEXTUAL, not a finding** — other graphs hold `Object`s, so such a count says nothing about the placement, and **no live-graph count is asserted here.** The dated measurements this cost model rests on are §12.1b's and §12.2's, each against the snapshot recorded there — **none of them states or implies that an entity tier is empty or unpopulated.** ⚠️ **A NAMING conflict is open here, and it is NOT evidence about the placement:** this document calls the graph it measures *the live graph*, *the production graph* and *a dogfood instance* interchangeably, and §12.1b's **7,859 `:Object` embeddings** (2026-09-24) cannot be reconciled with a zero count until that naming is settled. **This stays open until it is settled by measurement, not by assuming which graph a figure describes.** ⚠️ **Where a sentence ASSERTS a figure** ("I think we spent 2 million") that assertion is a belief and may be a `Point` — the separate, smaller prose question, not this placement.
 
@@ -541,7 +541,7 @@ FALKORDB — entities · Points (beliefs — "claims" in prose, never a type) ·
 **⚠️ Why `:Document` sits in neither layer.** It was placed in the truth layer and also appeared in the derived layer:
 > *"**Document is an Object** (`objectKind: document`) … **Graph label is `:Document`** … the subclass relationship to Object is expressed via `objectKind: document`, **not via a second graph label. Do not create a separate `:Object` label for Documents.**"* (`ONTOLOGY.md` §4.4)
 
-- **My "Document sits in two graph layers" finding was WRONG** — it has **one** label; the subclass is conceptual, expressed as a property.
+- **`:Document` carries one label, not two** — the subclass is conceptual, expressed as a property.
 - **But the owner's point is the real one:** being a *conceptual* subclass means it is **not a first-class entity** — so it cannot be reasoned about like an Object, and its **content** (raw text) is being stored **in the graph**, which is exactly what D30 says should not happen.
 
 **⇒ `:Document` folds into `:Source`.** Its content leaves the graph — to **raw text in Postgres** (true binaries to the object bucket; §3) — referenced per D30, and the entities extracted from it carry the epistemic weight. **The `:Document` NODE label is retired** (D10): the writer MERGEs `(s:Source {url:$id})`, so no `MERGE (d:Document)` or `MATCH (d:Document)` remains in `tortoise/`; `quota.py` holds no `:Document` match — the **`documents` cap** counts document-bearing `:Source` nodes instead (`#1726`). `ONTOLOGY.md` §4.4 retires the label with it (v3.15).
@@ -740,7 +740,7 @@ The convergence is on **two layers with different jobs**: the **source** carries
 
 **⇒ This is why the version goes on the extraction link and not only on the source** — and it is why the storage cost lands on the edge, not on a document store.
 
-**Research:** `docs/research/2026-09-24-source-versioning/research-brief.md`. **Adoption gate: ADOPT** — no recorded decision contradicted; D7 governs it; the ontology's `§4.7` already declares the Source window; D30 bounds the cost.
+**Research:** `docs/research/2026-09-24-source-versioning/research-brief.md`. **No recorded decision is contradicted:** D7 governs it, the ontology's `§4.7` declares the Source window, and D30 bounds the cost.
 
 #### ⭐ The anchor's operative rules
 
@@ -1008,7 +1008,7 @@ d = 384, M = 16 → 1,830 B ≈ 1.79 KB/vector
 - **What genuinely is lost:** single-query hybrid search. Anything needing *both* a similarity ranking **and** graph state (liveness, EP confidence, an operator) becomes two queries joined by id. **The join is on a top-k result set, so it is cheap — but it is a real change to the retrieval path, not a tuning flag.**
 - **It does NOT change the engine.** §14.2 keeps hosted FalkorDB. This changes **what FalkorDB holds** — and it is the largest cost lever available with **no migration and no rewrite.**
 
-**⭐ Recommendation.** **The measurement now exists (§12.1d) and it supports option 2.** Our whole vector leg is **2.74 ms indexed**; a **full linear scan of 7,859 Object vectors is 9.26 ms**; our network floor is **1.49 ms**. **So the index is worth ~6 ms at our size, and a cross-store hop to Supabase Postgres would land around ~10–15 ms — noise against a model call.** The index becomes worth having at month-6 (~300–500k vectors → a scan would be ~300–500 ms), **which is exactly the case for keeping the index but not renting FalkorDB RAM for it.**
+**⭐ Recommendation.** **The measurement (§12.1d) supports option 2.** Our whole vector leg is **2.74 ms indexed**; a **full linear scan of 7,859 Object vectors is 9.26 ms**; our network floor is **1.49 ms**. **So the index is worth ~6 ms at our size, and a cross-store hop to Supabase Postgres would land around ~10–15 ms — noise against a model call.** The index becomes worth having at month-6 (~300–500k vectors → a scan would be ~300–500 ms), **which is exactly the case for keeping the index but not renting FalkorDB RAM for it.**
 **⚠️ NOT DECIDED — owner's call.** It is an open decision (§14.3 V1), because it changes what the graph holds.
 
 **And it removes the source-vector objection entirely:** if the vectors live in Supabase Postgres, giving a Source a summary vector (§9.4) costs **zero FalkorDB RAM** — it is a row in a table we are already paying for.
@@ -1281,7 +1281,7 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 
 **⚠️ Two more items §17 adds, and they are NOT part of items 3 and 4.** §17.3's **residency router** (*a cache miss → fetch from the truth store*) is a **second, distinct router** from item 3's **sufficiency router** (*short evidence → escalate a tier*), and it is decidable **only** against §17.2's **completeness marker**. **Do not extend item 3's router to cover residency** — the two route on different facts, and collapsing them is the §17.3 defect. See `#7952` (the marker) → `#7953` (the router).
 
-**⚠️ And the discipline that keeps this honest: our own numbers for the cost TIERS still do not exist.** Every tier figure above is **published third-party** and must be re-measured on our data before any lever is committed. ✅ **What IS now measured is our own retrieval latency (§12.1d) and our own memory composition (§12.1) — those are no longer borrowed.** *(⚠️ Do not cite a "95.6 MB" measurement here — §12.1 states the measured composition.)*
+**⚠️ And the discipline that keeps this honest: our own numbers for the cost TIERS still do not exist.** Every tier figure above is **published third-party** and must be re-measured on our data before any lever is committed. **Our own retrieval latency (§12.1d) and our own memory composition (§12.1) are first-party measurements.** *(⚠️ Do not cite a "95.6 MB" measurement here — §12.1 states the measured composition.)*
 
 ## 13. Filed from this document — the open rulings
 
@@ -1311,7 +1311,7 @@ follows is the evidence each ruling rests on, which is design.
   | 10 | `aggregate.py:502` (`collect_anchor_census`) | the aggregative-verdict anchor census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
   | 11 | `coverage_loop.py:238` (`facet_census`) | the rule-based facet census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
 
-  And **36 test files assert the edge at the pin** (41 at HEAD, 2026-10-10).
+  And **36 test files assert the edge at the pin** .
 
   **⇒ The comparable's conclusion does NOT transfer.** Their justification was *"recall never touched them"* — **false here.** Deleting the edge would silently break **four** customer-callable surfaces. ⚠️ **The count is the whole argument — the table must name every customer-callable surface: `recall_subgraph` and `search(order_by="graph")` are two of them**.
 
@@ -1341,7 +1341,7 @@ follows is the evidence each ruling rests on, which is design.
 
 **These are settled and recorded here so no future lane re-opens them.**
 
-| # | the question | ✅ ANSWER (owner, 2026-09-24) | what changed |
+| # | the question | ✅ ANSWER (owner, 2026-09-24) | the consequence |
 |---|---|---|---|
 | **O1** | Is the journal allowed to be the authority? | **Two different questions, and both hold: DURABILITY = the store's backup; REBUILDABILITY = the journal.** The two are scoped, not in conflict: *"the journal is the derived layer's rebuild source; it is not a durability mechanism."* | **⚠️ The sharp edge this exposes: `rebuild_all` performs an unconditional wipe + journal-only replay — i.e. the CODE treats an incomplete log as the authority.** That is a defect. **Embedding in the journal: yes — a re-embed is a re-run, not a replay** (§3). |
 | **O2** | Per-item or per-batch target; what recall floor? | ⛔ **Not a question — the owner rejected its framing.** *"we're not optimising stupidly for a number… this is not a corporate OKR setting exercise. We need to balance multiple things at each step of the pipeline and on each architecture decision."* | **No target belongs in this document.** The objective is **great recall and reasoning at an affordable cost**; the method is **manual step-by-step review** until a calibration set exists. **No volume target, no recall floor, no node count.** ⭐ **What is withdrawn is a TARGET, not a MEASUREMENT (owner, 2026-09-30).** *"Tracking how many facts are useful is good data to have… having that measurement is good"*, with the goals explicitly deferred: *"we can decide what goals we optimise for later."* **⇒ O2 withdraws a number to optimise *toward*; measuring how many durable claims we kept is not such a number and survives it.** §6.1 and §15 match this. ⚠️ **No target, floor value or node count is set by this amendment** — only the measurement is re-affirmed. |
@@ -1378,14 +1378,14 @@ follows is the evidence each ruling rests on, which is design.
 
 **A measurement is only worth listing if a decision turns on it.** ⭐ **Under that rule M6 lists the retention measurement, which a decision turns on (§14.1 O2); the goal it would be compared against stays deferred.**
 
-| id | question | why it matters | status |
-|---|---|---|---|
-| **M1** | **What is OUR query latency, warm?** (`EXPLAIN (ANALYZE)` + timing on the live graph) | **Every latency figure here is someone else's.** A one-liner that retires the entire §12.1 debate. | ✅ **DONE 2026-09-24 — see §12.1d. Answer: 1.5–5 ms; latency is a non-issue.** |
-| **M2** | **What is our real bill?** — the actual FalkorDB invoice against the $9 → $19 budget, at month-6 footprint | the only cost question asked, and §5/§6 are arithmetic on published rates, not our invoice. ⚠️ **§17.4 supplies the two-store arithmetic these lines feed — and it names the two magnitudes it still lacks (`f`, `ρ`); M2 remains OUR INVOICE, which no published rate substitutes for** | needed |
-| **M3** | **How much of the 140 MB is junk?** — re-measure after the extractor work lands | tells us how much of the CACHE's footprint is junk — i.e. cache-tier sizing and whether self-hosting (M4) pays. **It does not re-open the engine choice** (§2.0) | after extractor work |
-| **M4** | **Does self-hosting beat Cloud at the CACHE tier's footprint?** — price a VM holding N tenants at ≤75% RAM | a **cache-tier ops** lever: it moves a cache, it does not move the record | when there are users |
-| **M5** | ⭐ **Where should the vector index live?** — our query latency with the index resident, against a real `GRAPH.MEMORY USAGE` read | **decides V1 (§12.1c) — the first cache-tier question (§14.2)** | **M1 done (§12.1d); `GRAPH.MEMORY USAGE` read (§12.1b). V1 is a decision, not a measurement gap.** |
-| **M6** | ⭐ **How many durable claims did we keep?** — the share of the candidate facts the pipeline saw that survived as claims | **The guard §6.1 requires: without it, a volume objective can be satisfied by writing nothing.** The owner re-affirmed **2026-09-30** that this measurement is wanted (§14.1 **O2**, AMENDED) — **only the goal is deferred.** | **needed — the denominator must be stated first** |
+| id | question | why it matters |
+|---|---|---|
+| **M1** | **What is OUR query latency, warm?** (`EXPLAIN (ANALYZE)` + timing on the live graph) | **Every latency figure here is someone else's.** A one-liner that retires the entire §12.1 debate. |
+| **M2** | **What is our real bill?** — the actual FalkorDB invoice against the $9 → $19 budget, at month-6 footprint | the only cost question asked, and §5/§6 are arithmetic on published rates, not our invoice. ⚠️ **§17.4 supplies the two-store arithmetic these lines feed — and it names the two magnitudes it still lacks (`f`, `ρ`); M2 remains OUR INVOICE, which no published rate substitutes for** |
+| **M3** | **How much of the 140 MB is junk?** — re-measure after the extractor work lands | tells us how much of the CACHE's footprint is junk — i.e. cache-tier sizing and whether self-hosting (M4) pays. **It does not re-open the engine choice** (§2.0) |
+| **M4** | **Does self-hosting beat Cloud at the CACHE tier's footprint?** — price a VM holding N tenants at ≤75% RAM | a **cache-tier ops** lever: it moves a cache, it does not move the record |
+| **M5** | ⭐ **Where should the vector index live?** — our query latency with the index resident, against a real `GRAPH.MEMORY USAGE` read | **decides V1 (§12.1c) — the first cache-tier question (§14.2)** |
+| **M6** | ⭐ **How many durable claims did we keep?** — the share of the candidate facts the pipeline saw that survived as claims | **The guard §6.1 requires: without it, a volume objective can be satisfied by writing nothing.** The owner re-affirmed **2026-09-30** that this measurement is wanted (§14.1 **O2**, AMENDED) — **only the goal is deferred.** |
 
 **Not worth measuring (recorded so they are not re-invented):** the cold-index p95/p99 study (**premise was vendor marketing**), the quantization-recall study (**no engine to apply it to**), the 1,000-partition planning study (**§12.1a answers it: the PARTIAL-index form degrades — 83 ms at T=500 — while declarative `PARTITION BY` is flat to T=500; neither is the decision, which is the size-earned conditional index**), and the narrative-vs-raw A/B (**`#3011` is already pre-registered; do not duplicate it**).
 
@@ -1393,7 +1393,7 @@ follows is the evidence each ruling rests on, which is design.
 
 ## 16. Research outcomes (2026-09-24) — the evidence this design rests on
 
-**This section carries the research outcomes this design rests on** (FalkorDB memory accounting; the idle-vs-active cost model; the latency question) — **including the findings that overturn claims which would otherwise look plausible, so a future lane can see which version is current.**
+**This section carries the research outcomes this design rests on** (FalkorDB memory accounting; the idle-vs-active cost model; the latency question) .
 
 ### 16.1 FalkorDB memory accounting — the cost model, settled
 
@@ -1414,7 +1414,7 @@ follows is the evidence each ruling rests on, which is design.
 
 **The answer: it is not a ceiling, and the numbers were not measurements.**
 
-| what the document said | what is true |
+| the claim | why it does not bind us |
 |---|---|
 | *"20–50× over every published latency budget"* | The budgets are **vendor self-report** — Zep's own marketing (155 ms p95, no methodology) and an **asserted table** in a blog |
 | *"10,500 ms cold"* | A **billion-vector AWS deployment**. Ours is 140 MB. |
@@ -1472,9 +1472,9 @@ For the record, since two members of the design rest on it:
 - **the load-bearing consequence** — with a declaration of **partial** coverage, `hits == 0` **no longer establishes `empty`**: the status is **`degraded`** when the truth fetch could not be made, exactly as §17.3 states. `tortoise/residency.py::apply_residency` is that rule in one place, and the read path routes every annotated result through it.
 - **reconciliation as a NUMBER** — `tortoise/reconciliation.py` compares the two keyed views and reports `checked` / `divergent` / `missing_in_cache` / `extra_in_cache` / `field_mismatches` as **integer counts**, never a boolean. The two directions are counted **apart** because **`extra_in_cache` is the second-writer signature** — the chokepoint violation of §17.1 — while `missing_in_cache` is a projection lag. An unreadable side **refuses** (`ReconciliationUnavailable`) rather than reporting agreement: a check that cannot read its evidence must not report success.
 
-⚠️ **What is deferred rather than absent:** the declaration's **authoritative home** is the control-plane residency metadata named in §2.6; the **production readers** for the two sides are the record reader and the cache reader; and the **residency router** that acts on `not-hot` is §17.3's (`tortoise/residency_router.py`). **With a complete cache the marker CANNOT fire** — which is what §2.0 holds the limit high for.
+⚠️ **What is deferred rather than absent:** the declaration's **authoritative home** is the control-plane residency metadata named in §2.6 of the residency-marker plan (`docs/epics/2026-10-10-7879-postgres-record/05-residency-marker.md`); the **production readers** for the two sides are the record reader and the cache reader; and the **residency router** that acts on `not-hot` is §17.3's (`tortoise/residency_router.py`). **With a complete cache the marker CANNOT fire** — which is what §2.0 holds the limit high for.
 
-**✅ The cache projection (`tortoise/cache_projection.py`, Interface B) projects the record's **STATE** — the layer tables `#7968` built — into FalkorDB, confined to the record's PRIMARY field set, and `FalkorProjection.rebuild_from_record(view, …)` is the **source seam**: `rebuild_all(log_dir)` rebuilds from the *journal*, this rebuilds from the *record*, sharing the destructive-token gate, the disposability guard, the wipe and the index creation. Four properties, each pinned by `tests/test_cache_projection.py` (+ the live H1 in `tests/test_cache_projection_live.py`): the plan is a pure function of the record (**idempotent**, and its field set is exactly the record's — never a superset); **no statement on the path reads the cache to decide what to project** (so the six graph-only `_SNAPSHOT_SECTIONS` classes `rebuild_all` rescues from the cache are **dropped**, not carried — and deliberately not *counted* at runtime, because a count would need the pre-wipe cache read this path forbids (the six are named in `06-cache-projection.md` §0.5) — the issue's own words: *"a field with no PRIMARY claim in the record that exists only here is a defect"*); a DERIVED/VOLATILE name is refused at every door it could arrive through; and the projection **writes the known-hot set after its writes**, `complete` iff every record key was materialized — so a bounded projection declares `partial`, and a read for an unwritten key is **`not-hot`** whose `empty` becomes **`degraded`**, never `empty`. ⚠️ **One finding is reported rather than hidden:** `snake()` is **not injective** over the graph's namespace — `public.source` has four columns and `public.event` one — FIVE across the two tables — that the placement table enumerates in BOTH spellings (`source.session_id`/`sessionId`, `source.event_id`/`eventId`, `source.source_path`/`sourcePath`, `source.document_kind`/`documentKind`, `event.session_id`/`sessionId`) because the document writer emits snake while the session-capture writer mints camel (`projection/entities.py::_SOURCE_NODE_PROPS` says so itself), so the record cannot distinguish them and the projection canonicalizes (camelCase-first, pinned). A record-sourced cache cannot be byte-identical to a journal-sourced one for those five fields until one spelling wins (`#7955`/`#7968`). Design and boundaries: `docs/epics/2026-10-10-7879-postgres-record/06-cache-projection.md`.
+**✅ The cache projection (`tortoise/cache_projection.py`, Interface B) projects the record's STATE** — the record's layer tables — into FalkorDB, confined to the record's PRIMARY field set, and `FalkorProjection.rebuild_from_record(view, …)` is the **source seam**: `rebuild_all(log_dir)` rebuilds from the *journal*, this rebuilds from the *record*, sharing the destructive-token gate, the disposability guard, the wipe and the index creation. Four properties, each pinned by `tests/test_cache_projection.py` (+ the live H1 in `tests/test_cache_projection_live.py`): the plan is a pure function of the record (**idempotent**, and its field set is exactly the record's — never a superset); **no statement on the path reads the cache to decide what to project** (so the six graph-only `_SNAPSHOT_SECTIONS` classes `rebuild_all` rescues from the cache are **dropped**, not carried — and deliberately not *counted* at runtime, because a count would need the pre-wipe cache read this path forbids (the six are named in `06-cache-projection.md` §0.5) — the issue's own words: *"a field with no PRIMARY claim in the record that exists only here is a defect"*); a DERIVED/VOLATILE name is refused at every door it could arrive through; and the projection **writes the known-hot set after its writes**, `complete` iff every record key was materialized — so a bounded projection declares `partial`, and a read for an unwritten key is **`not-hot`** whose `empty` becomes **`degraded`**, never `empty`. ⚠️ **One finding is reported rather than hidden:** `snake()` is **not injective** over the graph's namespace — `public.source` has four columns and `public.event` one — FIVE across the two tables — that the placement table enumerates in BOTH spellings (`source.session_id`/`sessionId`, `source.event_id`/`eventId`, `source.source_path`/`sourcePath`, `source.document_kind`/`documentKind`, `event.session_id`/`sessionId`) because the document writer emits snake while the session-capture writer mints camel (`projection/entities.py::_SOURCE_NODE_PROPS` says so itself), so the record cannot distinguish them and the projection canonicalizes (camelCase-first, pinned). A record-sourced cache cannot be byte-identical to a journal-sourced one for those five fields until one spelling wins (`#7955`/`#7968`). Design and boundaries: `docs/epics/2026-10-10-7879-postgres-record/06-cache-projection.md`.
 
 ### 17.3 Partial-cache semantics — a residency miss is not an insufficiency
 
@@ -1540,7 +1540,7 @@ For the record, since two members of the design rest on it:
 
 ### 17.4 A two-store cost model — the existing tables price ONE store
 
-**§5's cost table and §6's multiplier both model a single store.** The hybrid pays **both**: Postgres compute + disk **and** FalkorDB RAM. §6 conceded that gap in its own words — *"the blended total-cost figure is uncomputed; it needs the compute and IOPS lines, and neither has a measurement yet."*
+**§5's cost table and §6's multiplier both model a single store.** The hybrid pays **both**: Postgres compute + disk **and** FalkorDB RAM. Both tables price **one** store; neither prices the second.
 
 **This matters because the split's whole justification is arithmetic.** The claim is not *"Postgres is cheaper"* but *"bytes that are never read again stop renting RAM."* **That claim must be shown as arithmetic.**
 
@@ -1639,7 +1639,7 @@ For the record, since two members of the design rest on it:
 
 #### 17.4.4 The blended total — closed form, with the two unmeasured inputs visible
 
-**The blended total §6 calls uncomputed has a closed form.** Let `ratio` = the storage-line multiplier = `(rate ÷ 0.75) ÷ $0.125`:
+**The blended total has a closed form.** Let `ratio` = the storage-line multiplier = `(rate ÷ 0.75) ÷ $0.125`:
 
 | provisioning | `ratio` — per tenant (density-adjusted) | pure rate ratio (`rate ÷ $0.125`) |
 |---|---|---|
