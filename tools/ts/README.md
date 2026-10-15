@@ -10,7 +10,7 @@ PR that touches that tree, this directory, or `ci.yml`.
 Everything under `website/` is **staged for public upload**. `deploy-pages.yml`
 builds the upload root with
 
-```
+```bash
 rsync -a --exclude='/apps/' --exclude='/migrations/' --exclude='node_modules/' \
          --exclude='/.wranglerignore' --exclude='*.md' website/ "$STAGE/"
 ```
