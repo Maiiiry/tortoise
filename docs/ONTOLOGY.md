@@ -844,7 +844,7 @@ The `:Subject`/`:Object` operator endpoints are live (`#7902`); the write path a
 >
 > **Structural-edge transfer is journaled + replayable (#2489):** the 2b structural-edge transfer (`extractedFrom` + snapshot-derivable `about*` edges) is journaled as flat `DirectEdgeRepoint` descriptors `{src=old_id, tgt=<replay key>, target_label, edge_type}` emitted **before** the transfer, and replayed by `rebuild_all` pass-2b (delete the pass-2 resurrection at old + create at the final successor). The journaled set is the **snapshot-derivable rel set only** — `extractedFrom`, `aboutSubject`/`aboutObject`/`aboutEvent`/`aboutDocument`/`aboutPoint` (the edges rebuild pass-2 re-creates from a point's immutable `extractedFrom` prop / `aboutEntities` list). `aboutAction` (Action dissolved in Ontology v3.0), `aboutSource`, and `wasDerivedFrom` are never snapshot-recreated → no descriptor (they never resurrect at old; the A10 raw-edge family is out of scope). Keys are label-scoped and resolved via the shared resolver in `projection/edges.py` (`stub_key`/`resolve_structural_target` — Subjects MERGE by `name`, Sources **and `aboutDocument`** by `url`; never `target.id`). **⚠️ A predicate's label and its key are one unit: a retargeted label with a stale key resolves to nothing and silently mis-points the rebuilt edge.** `aboutDocument` targets a `:Source` (§4.4), so it resolves by `url` — the same key a `:Source` resolves by. Full `about*` parity additionally depends on #2501 (create_point never live-wires `aboutEntities` — the only lane where 2b sees live `about*` edges is rebuild→supersede→rebuild). The 2b no-self-edge guard (target node == successor) emits a `delete_only` descriptor instead of a transfer. **Pre-fix journal boundary:** descriptors exist only for supersedes journaled post-deploy — a pre-fix journal rebuilt with this consumer replays with no delete-leg, so old's pass-2 resurrection persists (rebuild does NOT repair pre-existing graphs; a #2500-style backfill is out of scope).
 >
-> **Restatement-vs-correction policy (#2421 — the design is CLOSED `COMPLETED`; the per-edge triage is NOT yet implemented and has no open tracker):** two supersede cases look alike but demand opposite edge handling, so edge disposition is decided **per edge at write time** (never silently bulk-transferred):
+> **Restatement-vs-correction policy:** two supersede cases look alike but demand opposite edge handling, so edge disposition is decided **per edge at write time** (never silently bulk-transferred). ⚠️ **The per-edge triage is NOT implemented** — `supersede_point` still performs the universal transfer. The design is recorded on `#2421`.
 >
 > - **Case 1 — restatement:** the new point says the same thing more precisely (better source, fixed typo, merged duplicate). Every connection still applies; edges and belief transfer — belief-preservation is asserted (eval-spec P6.1/P6.2).
 > - **Case 2 — substantive correction:** the new point exists *because* a refutation landed. The refuting NAND must **not** re-attach to the successor (it motivated the change); belief recomputes structurally with the refutation gone.
@@ -1756,7 +1756,7 @@ and carry confidence as an edge attribute.
   EP and the analyze BFS (#7852 v3.25); the legacy `bidirectional` / `unidirectional` tokens remain
   accepted and readable aliases. The direct-edge and ingest paths still *source* the direction from
   `op_type` rather than `semantics` — a separate gap from this storage vocabulary,
-  tracked as `#7852` (`#7813` is CLOSED `COMPLETED`). See the *Transition state* note.)*
+  tracked as `#7852`. See the *Transition state* note.)*
 - `-` means the connection exists and **no confidence transfers along it**.
 - **Lazy promotion:** a plain edge gains an operator only when mitigation
   becomes needed.
@@ -1944,7 +1944,7 @@ traversal well-defined: `_affected_claims` follows the recorded direction
 code reads the semantics on the operator write path — `create_operator` / `tortoise_create_operator`
 resolve it and record `direction_basis` (#7852 W1), while `create_direct_edge` and the ingest path
 still resolve by `op_type`. See the *Transition state* note — it covers the v3.25
-**storage** transition; the direction-*sourcing* gap is separate and tracked as `#7852` (`#7813` is CLOSED `COMPLETED`).)*
+**storage** transition; the direction-*sourcing* gap is separate and tracked as `#7852`.)*
 
 ---
 

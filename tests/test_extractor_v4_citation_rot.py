@@ -231,12 +231,12 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     (
         ONTOLOGY,
         "ONTOLOGY tracks the direction-sourcing gap as `#7852`",
-        "tracked as `#7852` (`#7813` is CLOSED `COMPLETED`)",
+        "tracked as `#7852`",
     ),
     (
         ONTOLOGY,
-        "ONTOLOGY states `#2421` closed with the triage untracked",
-        "the per-edge triage is NOT yet implemented and has no open tracker",
+        "ONTOLOGY states the per-edge triage as unimplemented",
+        "The per-edge triage is NOT implemented",
     ),
     (
         STORAGE,
