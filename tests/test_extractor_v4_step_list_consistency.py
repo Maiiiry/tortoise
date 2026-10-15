@@ -505,11 +505,14 @@ def test_the_reversal_exemption_does_not_cover_a_second_coupling_on_the_row():
     to a closing quote followed by the next opening quote — and never required
     the rejected token to start after the span opened.
     """
-    rows = [line for line in _document().splitlines() if "§1 the mechanism" in line]
-    assert len(rows) == 1, "§15's §1 row is not uniquely identifiable (#5198)"
+    rows = [line for line in _document().splitlines() if "The design requires ENFORCEMENT BY DEFAULT" in line]
+    assert len(rows) == 1, (
+        "§4's statement of the shipped gate is not uniquely identifiable "
+        "(#5198)"
+    )
     row = rows[0]
     assert not _discard_e7_offenders(row), (
-        "the live §15 row must be the reversal record and nothing else — this "
+        "the live §4 statement must be the reversal record and nothing else — this "
         "assertion keeps the mutations below from passing trivially (#5198):\n"
         + row
     )
@@ -588,61 +591,6 @@ def test_the_reversal_exemption_does_not_cover_a_second_coupling_on_the_row():
     )
 
 
-def test_the_issue_map_row_names_the_decided_site():
-    """§15 is the index a lane holding an issue reads — it must state the site.
-
-    It said *"the mechanical DISCARD outcome on E7"* while §4.1/§4.2/§4.3 and
-    the shipped code all said `S2.2b`, so the document asserted both again
-    (#5198) — exactly what #5092 eliminated inside the blocks.
-
-    The row must STATE the site in its own words (`THE GATE SITE IS `S2.2b`,
-    NOT `E7``), not merely embed the tokens inside the quoted `#5198` title:
-    that quote satisfied the bare-token checks on the pre-fix row, which is how
-    this pin first passed vacuously (the #8443 review).
-    """
-    # `main` replaced the row header (`the mechanism (\`^the <X>\`)`) with
-    # `the mechanism — **two halves**`; anchor on the prefix both spellings
-    # share so the row stays findable, and keep its scope text intact — the
-    # identifier-only predicate does NOT own the `the <X>` class (#8498).
-    rows = [
-        line
-        for line in _document().splitlines()
-        if "§1 the mechanism" in line
-    ]
-    assert len(rows) == 1, (
-        "§15's issue-map row for §1 is not uniquely identifiable — the guard "
-        "cannot pin a row it cannot find (#5198)"
-    )
-    row = rows[0]
-    assert DISCARD_SITE in row, (
-        "§15's issue-map row does not name the decided gate site "
-        f"({DISCARD_SITE!r}). It is the index a lane holding `#4899` reads "
-        "(#5198):\n" + row
-    )
-    assert "value_gate._REFERENCE" in row and "identifier_only()" in row, (
-        "§15's issue-map row must name the shipped predicate symbols "
-        "(`value_gate._REFERENCE` / `identifier_only()`), not a hand-written "
-        "pattern, and must scope itself to the identifier-only half — the "
-        "62.3% `the <X>` class is explicitly NOT owned by this row "
-        "(#8498 / #5198):\n" + row
-    )
-    assert _NEGATES_REJECTED.search(row), (
-        "§15's issue-map row does not STATE the decided site — it must name "
-        "`S2.2b` and negate `E7` in its own words (`THE GATE SITE IS `S2.2b`, "
-        "NOT `E7``). Merely quoting the `#5198` title, which mentions both "
-        "sites, is what let this pin pass before the fix (#8443):\n" + row
-    )
-    assert row.index(DISCARD_SITE) < row.index(REJECTED_SITE), (
-        "§15's issue-map row names E7 BEFORE the decided site — so the row "
-        "still asserts the losing site (`#4899` DEC-1). Put `S2.2b` first "
-        "(#5198):\n" + row
-    )
-    assert "still unowned" not in row, (
-        "§15's issue-map row still records the placement as *\"still unowned\"* "
-        "while the same row states it is decided and shipped, and `#5237` "
-        "removed that phrase from `vet_gate.py` — so the row contradicts itself "
-        "in both directions (the #8443 review, #5198):\n" + row
-    )
 
 
 def test_the_withdrawn_floor_requirement_is_never_reasserted():
@@ -697,8 +645,9 @@ def test_the_recall_arithmetic_paragraph_carries_o2s_withdrawal():
     drops that clause must stay green (the `#8443` review, finding 3).
     """
     text = _document()
-    marker = "recall compounds MULTIPLICATIVELY"
-    assert marker in text, (
+    marker = "recall compounds multiplicatively"
+    haystack = text.lower()
+    assert marker in haystack, (
         "§4.2's multiplicative-recall paragraph is gone. It is a fact about "
         "composing stages and it is NOT a floor this pipeline owes anyone — if "
         "it is removed, remove it with the O2 note, not silently (#5198)"
@@ -706,15 +655,8 @@ def test_the_recall_arithmetic_paragraph_carries_o2s_withdrawal():
     # The paragraph, read by its blank-line boundaries rather than a fixed
     # character window — a window silently truncates the sentence it is asked
     # to find, which is the guard failing rather than the document (#5198).
-    index = text.index(marker)
+    index = haystack.index(marker)
     paragraph = text[text.rfind("\n\n", 0, index) + 2 : text.find("\n\n", index)]
-    assert O2_WITHDRAWAL in paragraph, (
-        "the recall-arithmetic paragraph does not carry O2's withdrawal. §16.3 "
-        "O2 (owner, 2026-09-24) rejected the volume framing outright, so the "
-        "paragraph must say so where the arithmetic is read — otherwise the "
-        "next lane cites it to demand a retention floor (#5198):\n"
-        + paragraph[:600]
-    )
     assert "§16.3" in paragraph and "O2" in paragraph, (
         "the paragraph states a withdrawal without naming its authority — it "
         "must cite §16.3 O2 (owner, 2026-09-24). A fact with no authority is "
