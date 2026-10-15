@@ -2601,6 +2601,18 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
 
 # Event types that write to the :GraphEvent store (#432). Other types
 # (e.g. PointRevised) only write to the JSONL event log (#548).
+#
+# ⚠️ THIS SET IS THE STORE'S **CLAIM-TRANSITION** CONTRACT, AND ITS SHAPE IS A
+# RECORDED DECISION — do not widen it by reflex. `docs/plans/2026-08-08-432-
+# subscriptions-plan.md` §Task 3: "Content edits (`update_point` non-status
+# props) emit NOTHING (plan-review P1) — the emit set is exactly these five
+# hooks; every claim transition maps to exactly one", pinned by
+# `tests/test_event_store.py::test_content_edit_emits_nothing` and restated in
+# `docs/event-catalog.md`. #2353 asks for `PointRevised` in this store, so the
+# addition is drawn as an **opt-in** one at the emit hook below (`_emit_event`)
+# rather than by adding the type here: the default stream stays byte-identical,
+# and the semantic change feed (`tortoise/change_feed.py`) is what consumes the
+# revisions once an operator switches it on.
 _GRAPH_EVENT_TYPES = frozenset({
     "PointAdded",
     "OperatorAdded",
@@ -2614,6 +2626,21 @@ _GRAPH_EVENT_TYPES = frozenset({
     "ObjectSuperseded",  # #1350: Object status fold source (supersession)
     "PointInvalidated",  # #2488: invalidate_point — outdated flag + CORRECTS (no status)
 })
+
+
+def _change_feed_enabled() -> bool:
+    """Is the #2353 semantic change feed (and its PointRevised store half) on?
+
+    One switch for both halves: the revision record is the feed's SOURCE, so a
+    feed without revisions would silently under-report. Default OFF — `enabled()`
+    resolves unset/blank/garbage to False (`tortoise/env_truthy.py`), which is
+    what keeps the store's documented transition-only contract intact unless an
+    operator opts in.
+    """
+    from .change_feed import enabled
+
+    return enabled()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # #7951 — THE JOURNAL ORDERING CONTRACT. Read this before adding a writer.
@@ -5493,6 +5520,14 @@ class TortoiseSDK:
         'cursor expired — replay from tail'); malformed → ValueError('invalid cursor').
         Types are validated against the EventCodec registry (unknown → ValueError).
         Events live in THIS SDK's graph namespace (the org partition).
+
+        #2353: when ``TORTOISE_CHANGE_FEED`` is truthy the response ALSO carries
+        ``changes`` — the same page folded into per-claim semantic deltas with
+        before/after (``tortoise/change_feed.py``), so "what changed for claim X
+        since cursor C" is one call rather than a client-side replay across event
+        types. It is an off-by-default additive response field (the recorded
+        ``response_fields`` carve-out), so with the switch off this response is
+        byte-identical.
         """
         from .event_store import read_after
 
@@ -5526,7 +5561,12 @@ class TortoiseSDK:
                 raise ValueError("cursor expired — replay from tail")
         evs = read_after(proj, after_seq, types=types, limit=limit)
         last = evs[-1]["seq"] if evs else after_seq
-        return {"events": evs, "next_cursor": self._encode_cursor(last)}
+        result: dict = {"events": evs, "next_cursor": self._encode_cursor(last)}
+        if _change_feed_enabled():
+            from .change_feed import aggregate_changes
+
+            result["changes"] = aggregate_changes(evs)
+        return result
 
     _EVENT_PURGE_ATTR = "_tortoise_last_purge"
     _EVENT_PURGE_LAST: float = 0.0  # process-level gate (P1 review fix)
@@ -5580,7 +5620,9 @@ class TortoiseSDK:
         **Graph event store (#432):** written when *type_* is in
         ``_GRAPH_EVENT_TYPES`` (11 registered types — PointAdded,
         OperatorAdded, PointRetracted, PointSuperseded, OperatorAnnotated,
-        PointInvalidated, plus the promote/dedupe/object-supersede types).
+        PointInvalidated, plus the promote/dedupe/object-supersede types) — and,
+        under ``TORTOISE_CHANGE_FEED`` only, ``PointRevised`` too (#2353; see the
+        gate below).
         The payload is taken from *payload* if given, otherwise synthesized
         from ``point["id"]`` or *id* + *extra*.
 
@@ -5623,7 +5665,15 @@ class TortoiseSDK:
         old ``event.update(extra)`` precedence.
         """
         # ── Graph event store (#432) ──────────────────────────────
-        if type_ in _GRAPH_EVENT_TYPES:
+        # #2353: `PointRevised` (content/validity/status revisions) is a
+        # JSONL-only record by default — the store carries claim TRANSITIONS,
+        # see `_GRAPH_EVENT_TYPES` above. It reaches the store only under the
+        # change-feed switch, which is also what makes a poll able to report
+        # before→after for content, validity and status. Off (the default) the
+        # emitted events, and therefore `poll_events`' response, are
+        # byte-identical to before this change.
+        if type_ in _GRAPH_EVENT_TYPES or (
+                type_ == "PointRevised" and _change_feed_enabled()):
             # #2600: copy FIRST — a caller-reused payload dict must never
             # gain an unexpected key from the actor merge below; then merge
             # the ContextVar actor (set by mcp_auth middleware / hosted

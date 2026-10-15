@@ -2013,6 +2013,10 @@ surfaces:
   - test_event_log.py
   - test_event_provenance.py
   - test_event_store.py
+  # #2353: the semantic change feed — the `:GraphEvent` → per-claim-delta fold
+  # (`tortoise/change_feed.py`), the off-by-default `changes` response field on
+  # `poll_events`, and the re-pin of the store's transition-only contract.
+  - test_change_feed_2353.py
   - test_extractor.py
   - test_extractor_doc.py
   - test_extractor_priors.py
@@ -4478,6 +4482,14 @@ durations:
   test_coverage_loop.py: 1.3
   test_ep_quadrature.py: 0.9
   test_event_store.py: 5.9
+  # #2353: hand-measured, NOT a junit re-derivation — a file added by a PR can
+  # never have a CI duration at PR time (`tools/ci_timing.py --refresh-durations`
+  # samples push-to-main runs only), so the >=90% coverage floor (#2876) fails
+  # by construction for any test-adding PR. Reading: pytest session total
+  # 17.0s for 14 tests on the embedded carve-out lane
+  # (`TORTOISE_TEST_CARVE_OUT=1`, HF_HUB_OFFLINE=1), on this host. Replace it in
+  # the next sweep.
+  test_change_feed_2353.py: 17.0
   test_health_ready_nonblocking.py: 3.1
   test_hosted_auth.py: 1.8
   test_ingest_event_endpoint.py: 1.7

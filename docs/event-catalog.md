@@ -23,7 +23,23 @@
 > transition maps to one of the eleven concrete types above; **challenged is a
 > DERIVED condition** (NAND-operator-edge presence on a live point), not a
 > state or event. Content edits via `update_point` (non-status props) emit
-> NOTHING.
+> NOTHING to the `:GraphEvent` store.
+>
+> ⚠️ **`PointRevised` is a JSONL-only record BY DEFAULT, and that is a recorded
+> decision, not an accident** — `docs/plans/2026-08-08-432-subscriptions-plan.md`
+> §Task 3 ("Content edits (`update_point` non-status props) emit NOTHING
+> (plan-review P1) — the emit set is exactly these five hooks"), pinned by
+> `tests/test_event_store.py::test_content_edit_emits_nothing`. The same holds
+> for `EntityMutated` (above), `SourceVersioned`, `EntityLinked`,
+> `SessionRecorded`/`SessionDeleted` and the other journal-carrier records.
+> **#2353 is the one exception and it is OPT-IN:** with `TORTOISE_CHANGE_FEED`
+> truthy (1/true/yes/on; unset or 0 means OFF) `PointRevised` ALSO reaches the
+> `:GraphEvent` store, so `poll_events` can report before→after for content,
+> validity and status via the semantic change feed (`tortoise/change_feed.py`,
+> an off-by-default `changes` response field — see
+> `docs/product/mcp-sdk-surface.md` → *Recorded response fields*). Off, the
+> emitted set above is unchanged. Widening the DEFAULT set would reverse the
+> plan-review ruling; that is an owner decision, not a lane's.
 >
 > The EventAPI/CLI/ingest path emits its own legacy events (`PointAdded`,
 > `PointRetracted`, `PointsMerged`, `IngestStarted`) to the EventLog JSONL —
