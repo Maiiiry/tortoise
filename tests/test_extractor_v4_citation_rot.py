@@ -216,9 +216,14 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
 #: corrected passage silently DELETED, which would otherwise pass by omission.
 #:
 #: Each entry names its OWN document and is checked against THAT document only:
-#: a combined-text check cannot tell a correction from a relocation, so a landed
-#: passage deleted from one sibling would pass on the strength of the other.
-LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
+#: a combined-text check cannot tell a correction from a relocation, so a passage
+#: deleted from one sibling would pass on the strength of the other.
+#:
+#: ⚠️ A pin states a DESIGN FACT, never a delivery state (`landed`, `live`,
+#: `done`, `open`, `closed`). A delivery-state pin reds the moment the document
+#: says the same thing in design language, which punishes the edit it should
+#: reward.
+FACT_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     (
         STORAGE,
         "STORAGE records the vector-trace mechanism",
@@ -241,8 +246,8 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     ),
     (
         STORAGE,
-        "STORAGE separates the `#4997` measurement from the still-live defect",
-        "the unindexed-embeddings defect is LIVE, and its home is the V1/§12.1c decision",
+        "STORAGE separates the `#4997` measurement from the live defect",
+        "the unindexed-embeddings defect is real, and its home is the V1/§12.1c decision",
     ),
     (
         STORAGE,
@@ -286,11 +291,6 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     ),
     (
         STORAGE,
-        "STORAGE separates the open tracker entry from the landed D10 work",
-        "D10 code-half work done: `#5024`, `#5025`, `#5026`",
-    ),
-    (
-        STORAGE,
         "STORAGE states the Q5 keys as non-interchangeable",
         "**A `:Document` key and a `:Source` key are not interchangeable**",
     ),
@@ -312,42 +312,44 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     (
         STORAGE,
         "STORAGE states the `#5422` ownership gap",
-        "its ownership gap is `#5422`; acceptance **A2 of `#5038`** is what remains outstanding",
+        "ownership `#5422`; its acceptance is **A2 of `#5038`**",
     ),
 )
 
-#: The repaired passages must SAY what landed, not merely omit the old claim —
+#: The repaired passages must SAY what the design is, not merely omit the old claim —
 #: an omission-only guard passes over a passage that is silently deleted rather
 #: than corrected. The literals are the documents' CANONICAL wording: each
-#: repaired passage states the fact together with its authority (`#N`, PR,
-#: `file:line`) and does not record how the passage changed — history lives in
-#: git, and a claim about a correction has no artifact to check it against, so
-#: it can only re-stale.
+#: repaired passage states the design fact together with its authority (`#N`, PR,
+#: `file:line`) and does not record how the passage changed.
+#:
+#: ⚠️ A pin states a DESIGN FACT, never a delivery state. A pin on "is live" or
+#: "is done" reds the moment the document says the same thing in design
+#: language — punishing the edit it exists to reward.
 LANDED_STATEMENTS: dict[str, str] = {
     "§S0 states the D10 code half as landed": "D10 holds in both halves — ontology and code.",
     "§D's D10 row states the label retirement": (
-        "PR `#5127` retired the `:Document` NODE label"
+        "the `:Document` NODE label is retired"
     ),
     "§S0's Q3 row says `doc_status` is retired": (
         "RETIRED** (`tortoise/api.py:458`)"
     ),
-    "§S0's Q5 row says the migration is done": (
-        "Fold + change the replay key + migrate (`#5026`/PR `#5127`)"
+    "§S0's Q5 row states the migration": (
+        "There is nothing to migrate"
     ),
     "§S0's T6 finding says the transition is journalled": (
         "journalled as `SourceVersioned`"
     ),
-    "§7 says the operator endpoints are live": (
-        "operator endpoints are live (`#7902`)"
+    "§7 states the operator target set": (
+        "the write path admits all four target types"
     ),
     "§S2.3's row says Jev needs an adapter, not a seam": (
         "Jev requires an adapter, a prompt and a parser"
     ),
-    "§7 names the constant the S1 slot actually appends": (
-        "appends `STATE_VALUE_CARVE_OUT` to S1"
+    "§7 names the constant the S1 slot carries": (
+        "`STATE_VALUE_CARVE_OUT` in `_granularity_text()` is the code anchor"
     ),
-    "§S0 separates the open tracker entry from the three landed ones": (
-        "**`#5038`** (open)"
+    "§S0 names the open question": (
+        "The open question is `#5038`"
     ),
 }
 
@@ -382,21 +384,21 @@ def test_the_sibling_documents_do_not_carry_the_retracted_claims():
     )
 
 
-def test_the_sibling_documents_state_the_landed_facts():
+def test_the_sibling_documents_still_state_the_design_facts():
     missing = [
         f"{doc.name}: {name}"
-        for doc, name, literal in LANDED_STATEMENTS_IN_SIBLINGS
+        for doc, name, literal in FACT_STATEMENTS_IN_SIBLINGS
         if literal not in doc.read_text(encoding="utf-8")
     ]
     assert not missing, (
-        "the corrected sibling passages no longer state the landed fact in their "
+        "the corrected sibling passages no longer state the fact in their "
         "OWN document — a passage was silently deleted rather than corrected, or "
         "moved to a document that does not own the claim:\n  - "
         + "\n  - ".join(missing)
     )
 
 
-def test_the_corrected_passages_state_the_landed_facts():
+def test_the_repaired_passages_still_state_the_design_facts():
     text = _doc_text()
     missing = [name for name, literal in LANDED_STATEMENTS.items() if literal not in text]
     assert not missing, (

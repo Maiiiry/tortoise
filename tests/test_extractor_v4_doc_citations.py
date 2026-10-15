@@ -50,10 +50,10 @@ def _value_gate_row() -> str:
     return text[start : text.index("\n", start)]
 
 
-def test_the_value_gate_statement_names_the_shipped_symbol_not_a_proposed_pattern():
+def test_the_value_gate_statement_names_the_real_symbol_not_a_proposed_pattern():
     row = _value_gate_row()
     assert "value_gate._REFERENCE" in row, (
-        "§4's value-gate statement must name the shipped symbol "
+        "§4's value-gate statement must name the real symbol "
         "(`value_gate._REFERENCE`); a hand-written pattern is what the #8498 "
         "review found wrong in both directions. Row: " + row
     )
@@ -62,10 +62,11 @@ def test_the_value_gate_statement_names_the_shipped_symbol_not_a_proposed_patter
         "the statement must name the gate site (`S2.2b`) and deny `E7` — the "
         "`#5198` defect was the document asserting both sites. Row: " + row
     )
-    assert "the earlier *proposal*, not the shipped rule" in row, (
-        "`^#\\d{3,}$` may appear only as the rejected PROPOSAL: `_REFERENCE` is "
+    assert "anchored pattern is not the rule" in row, (
+        "`^#\\d{3,}$` may appear only as a REJECTED pattern: `_REFERENCE` is "
         "`#\\d{1,6}(?!\\d)` and `identifier_only()` is a whole-residue test. "
-        "Row: " + row
+        "A mention that does not deny the anchored form reads as a second, "
+        "competing definition. Row: " + row
     )
 
 

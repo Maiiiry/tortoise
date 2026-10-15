@@ -248,3 +248,278 @@ revision, which is what this file is for.
 ### 16.3 ✅ ALL SIX DECISIONS CLOSED (owner, 2026-09-24)
 
 - `EXTRACTOR-V4-ARCHITECTURE.md:1390` — | O2 | ⛔ WITHDRAWN — the owner rejected the framing: "we're not optimising stupidly for a number… this is not a corporate OKR setting exercise. We need to balance multiple things at each …
+
+## Removed wording — the design-language pass (2026-10-15, `#8542`)
+
+The copy pass that removed the implementation-state and change-narration
+wrappers from the design document, leaving the design statements. Every
+removed line is recorded here, keyed to the section heading in effect in
+the pre-change file. Emphasis markers are dropped so the record renders,
+and a line longer than ~190 characters is shortened with an ellipsis — the
+moved material above is verbatim; this list is an index to it, not a
+second copy. Section labels are bullets, not headings, so a removed line
+that was itself a heading cannot collide with this file's own outline.
+
+- **Extractor v4 — Architecture**
+  - Status: design. Home: `#4894` (write-path redesign). Predecessor: `#1509` (extractor v3, approved 2026-08-20; ⚠️ the v4 design does not wait on it — no further v3 work is coming. But v3 i…
+  - ⚠️ Code citations — revision pin. Every `file.py:NNNN` reference here is pinned to commit `c79ba1cf2` — except where a passage names a later pin. ⚠️ Every citation added to this document …
+
+- **⛔ USAGE IS DENOMINATED IN TOKENS, AND OVERAGE IS PURCHASED — decision, owner, 2026-09-26 (`#4495`)**
+  - \**✅ Where the measurement is — PRESENT (this paragraph said PLANNED; re-measured 2026-10-11, `#3840`).** The
+  - capture lane **does** record token counters on `main` now: the per-org ledger carries `capture_tokens_in` /
+  - analytics row carries — `#5045` / PR #5697, **merged** (commit `d3a0851a0`). The **ask** lane separately records
+  - "tokens per team per month" is written but not yet readable from code (the `#4493` lesson: a recorded dimension
+
+- **v2 → v3 → v4**
+  - | v3 (approved; ⚠️ the epic is cancelled — but E2 and E4 are live) | did we extract it correctly? (dates, verbatim state values, atomic points, supersession) | ⬆️ increases it — E2 preser…
+  - v3 has no discard, trim or gate anywhere. It is a fidelity workstream. v4 is a selection workstream. ⚠️ No ordering obligation holds against v3 — no further v3 work is coming. But v3 is n…
+  - ⚠️ Part of v3 has already landed. Its E4 (`"S4 merges, not replaces"`) is live — `merge_embed_lists(embed_list, s4)` runs at `extractor_v2.py:4845` and S2 is preserved. v3's premise there…
+
+- **2. Three tiers — and where each one lives**
+  - \**The architecture has three tiers with different cost/quality trade-offs. Earlier drafts conflated the first two, and named the third wrongly.**
+  - ⚠️ Correction (owner, 2026-09-23): the third tier is `Entities`, not "Claims". Calling it "Claims" hid the fact that the graph also holds `Source`, `Object`, `Subject` and `Event` — and t…
+
+- **⚠️ Storage rule for the first two tiers — they are OUTSIDE the graph (owner, 2026-09-23)**
+  - \- It is far cheaper than the graph — the storage research measured ~580× on disk-resident data (⚠️ 580× is the disk-resident leg, not the vector index — do not quote a "~1,000×" figure, w…
+  - ⇒ D1 restated, correctly: the narrative is not a graph node and not graph metadata — it is Postgres-stored text referenced by its `Source` (the owner's "supabase" is the DATABASE, not the…
+
+- **⭐ The experiment already exists — `#3011`, pre-registered and frozen 2026-09-11**
+  - ⚠️ ⛔ The thresholds stand as the frozen document has them. The claim that they were "rendered" wrongly is false: `−5` belongs to H4 as well as H3, and `15` belongs to H1 and to H5's falsi…
+  - ⭐ That correction was itself WRONG, and it deleted three accurate numbers. Verified against the frozen file (`docs/experiments/2026-09-11-abc-context-assembly-experiment.md`, §2 "Hypothes…
+  - \**All three values hold:** `−5` appears in **both** H3 and H4, and `15` appears in H1 **and** H5's falsifier — **"also present elsewhere" is not "not present here"**. **⇒ Restored.**
+  - ⚠️ Still read them from the frozen doc before using them: `docs/experiments/2026-09-11-abc-context-assembly-experiment.md`. The falsifier's ROLE is the claim to keep, and it survives: a r…
+
+- **⛔ What the epistemic subgraph is actually FOR (owner, 2026-09-23) — and it is NOT retrieval**
+  - ⚠️ **`#3011` is OPEN — the experiment has not run.** So the layer is **evidenced externally and unmeasured on our stack.**
+
+- **The mechanism is also already filed — `#2684`**
+  - ⚠️ COORDINATION NOT TO MISS (reviewer B2.23): §2.4 WIDENS `#2684`'s scope — from value-bearing `Point`s to all `Point`s — without recording it. It is a deliberate widening, but `#2684` is…
+
+- **2.4.2 Lifecycle and superseding in the raw-fact layer**
+  - ✅ Adoptable, and it applies to the GRAPH side (Hindsight, no contradiction with any recorded decision): invalidation by RELOCATION rather than a flag. They move superseded rows to a separ…
+
+- **2.4.3 Who carries the span? `Point`s only — measured, not assumed**
+  - \- `extractedFrom` is a `Point`→`Source` edge (`projection/entities.py:655`, `:1864`) — not an `Object`→`Source` edge. (An earlier reading of this document assumed `extractedFrom` hung off…
+  - (An earlier revision of this section reasoned from "the only edge on a `Source`" to "so `Point` is
+  - the only possible carrier" — that does not follow, and the premise was an edge-type over-claim; the
+  - carrier choice rests on the argument above, not on the edge census. #5007 review.)
+
+- **⭐ ✅ THE ENTITY-PROVENANCE DECISION — research returned, and it changes the claim above**
+  - \#### ⭐ ✅ THE ENTITY-PROVENANCE DECISION — research returned, and it changes the claim above
+  - Researched 2026-09-23 because the owner asked; findings in §16. Seven comparables were examined: entity-level provenance is the FIELD NORM — 5 of 7 have it (GraphRAG `Entity.text_unit_ids…
+
+- **2.4.4 ⛔ Redaction and the append-only layer — the G4 reconciliation (`#8496`)**
+  - \**G4 (`§4.3`) is the one gap in this document that is not a missing step: it is two correct rulings made
+  - in different issues, at different times, where neither could see the other's constraint.** `#4911`
+  - (redaction) closed `COMPLETED` on **2026-09-26**; `§2.4.2` (append-only) was ruled **2026-09-23**. §2.4.2
+  - makes the raw-fact layer immutable *by design* — a raw fact that can be rewritten is not evidence — and a
+  - control that removes a credential is, read naively, a rewrite. **`#8496` asks for the reconciliation to be
+  - STATED, not implied. It is stated here, as four decisions.**
+  - \**⚠️ R3 corrects the premise `#8496` was filed on — the partial-scan caveat was DISCHARGED by its own
+  - issue.** `#4911`'s *body* reported a scan of **10,000 of 19,960** turn nodes (FalkorDB's default result
+  - cap), and `#8496` inherited that as an open gap. `#4911`'s own **posted re-scan (2026-09-25)** read
+  - \**21,281 of 21,281** turn nodes to the host's `hasMore=false`, `include_retracted=True`, and found **0**
+  - anchored matches (the *"170 nodes contain `sk-`"* figure is prose — `risk-`/`disk-`/`task-`). **So the
+  - coverage question is not "was the store scanned?" — it was — but "does every future clean claim carry
+  - its denominator?", which is what R3 pins. Two rules follow and they are the mechanism the item asked
+  - for: the scan **must page to `hasMore=false`** (a default-capped read is a partial scan wearing a clean
+  - verdict), and it **must run the same table as the write path** (`redact_secrets` / `CREDENTIAL_KINDS`) — a
+  - parallel pattern list is a second source of truth for what a credential *is*, and the two would drift
+  - \**⚠️ And the layer G4 governs does not exist yet — so R1–R4 bind a design, and R2 is a procedure for a
+  - store that today holds no raw facts.** The raw-fact persistence step is still open (`§4.3` G1 — `#5064`;
+  - The span *schema* exists (`#5007`), so a `Point` can carry `span_start`/`span_end`, but the raw-fact layer
+  - is not written); and `#4911`'s own measurement says there is nothing to erase today. **This subsection
+  - records the design so that the layer is built WITH the control — which is precisely what `#8496` asked
+  - for and what designing them in separate issues, at separate times, could not deliver.**
+  - overridden and no reopen is required. (`#4911` reached the same conclusion for its own scope, and this
+  - line carries it forward so the next lane holding a vendor's append-only page finds the ruling here.)
+
+- **3. Step 0 is not the only source-varying step**
+  - The wrong assumption, corrected (owner, 2026-09-23): "An asana task completed has a very specific format, or a github issue completed… I imagine we need to optimise some of the other step…
+  - ⇒ A source type declares a MAPPING, and that mapping configures steps S0, S1, S2 and S5. The `Source` type vocabulary exists and packs already declare `extraction.sourceTypes` (§8). What …
+  - ⚠️ AND IT IS NOT MERELY UNDECLARED — THE S0 HALF IS NOT BUILT. Confirmed in code: `_edus_from_conversation(conversation)` + `chunk_transcript(edus, target=chunk_size)` are transcript-only…
+
+- **4.0 What each step is FOR — the purpose test**
+  - ⇒ EIGHT steps: S0 · S1 · S2.1 · S2.2 · S2.3 · S3 · S5 · S6. ⚠️ The gap in the numbering is cosmetic and should be closed (S1–S8) once the design settles — but do not renumber yet: `#4894`…
+
+- **4.1 The step list**
+  - Eight steps. No S4 and no S1.5 — both were deleted by the purpose test in §4.0. ⚠️ The count is the TOP-LEVEL steps (S0 · S1 · S2.1 · S2.2 · S2.3 · S3 · S5 · S6): `S0a`/`S0b` are sub-step…
+
+- **⭐ D10 and the version model — what the extractor must respect**
+  - ⇒ D10 holds in both halves — ontology and code. Ontology: `ONTOLOGY.md` v3.15 (PR `#5022`, issue `#5013`). Code: PR `#5127` retired the `:Document` NODE label, and the `:Source` replay ke…
+  - | Q2 | Two classification axes, kept separate: `sourceKind` (what kind of source) + `documentKind` (what genre of document) | This is S2.3's target vocabulary. ⚠️ An intermediate reading …
+  - | Q5 | Fold + change the replay key + migrate (`#5026`/PR `#5127`) | The fold and the `coalesce(title, name)` → `url` rekey cost nothing: zero `:Document` nodes and the commit lane had ne…
+
+- **⭐ The version model — and the one thing S6 must do (owner ruling, 2026-09-24)**
+  - ⚠️ Scope of the anchor — no longer Point-only (resolved 2026-09-25). `sourceVersion` rides on `extractedFrom`, which is declared `Point → Source`. Derived Events and Documents reach their…
+  - ⚠️ Interval-closing is part of the WRITE, not a later repair. An unclosed `validTo` reads as "still true" indefinitely — the field names this as the #1 production bug in temporal knowledg…
+
+- **S1.5 — ⛔ REMOVED (owner review, 2026-09-23)**
+  - \### S1.5 — ⛔ REMOVED (owner review, 2026-09-23)
+  - \**There is no S1.5.** It was two things, and **both have now been removed for different reasons** — the review half as a defect, the lookup half as a **mis-ordering**.
+
+- **(a) The review half — deleted as a defect**
+  - \#### (a) The review half — deleted as a defect
+  - "Was S1 too coarse?" was asked twice (here and as S2.2's question 3), on the wrong artifact (atomicity is a property of the items, not of the prose), and blind to the failure it targeted …
+
+- **(b) The lookup half — deleted as a mis-ordering (owner, 2026-09-23)**
+  - \#### (b) The lookup half — deleted as a mis-ordering (owner, 2026-09-23)
+  - ⇒ The lookup moves into S3, and becomes keyed on candidates. Doing it earlier was looking up words from prose, not entities — a strictly weaker operation that also could not cover S3's ke…
+  - The correctness argument is now in ONE place. The old design split the dedup guarantee between "extraction knew A existed" and "S3 resolved the candidate" — two places that can disagree. …
+
+- **⚠️ This REOPENS D4 — and narrows it along its own reasoning**
+  - \#### ⚠️ This REOPENS D4 — and narrows it along its own reasoning
+  - ✅ STATUS: `DECIDED (narrowed)` — the owner ruled. The narrowing is in force: the lookup sits after extraction, and it is consumed by the salience judgment and by S3 only. Extraction does …
+  - \> **✅ D4 is `DECIDED (narrowed)` (owner).** There is no pending confirmation, and no third phrasing.
+  - \> ✅ Note — the lookup bug `#4511` does not gate this design. It bit when the lookup sat before extraction (`_fts_rows` read `r.get("kind")` while the callee emits `point_kind`, so every p…
+
+- **S2.1 — EXTRACT**
+  - \> ⚠️ Vocabulary — "claim" is NOT a thing (owner, 2026-09-23). `docs/ONTOLOGY.md` v3.14 (`#4369`) declares it: "claim" is the sanctioned user-facing gloss for a belief `Point` — "It is not…
+  - ✅ FINDING (2026-09-23) — the live code ALREADY hands extraction the raw alongside the story. The call is `run_s2(model, story, master, session_date=…, edus=edus, …)` (`extractor_v2.py` :4…
+  - \> ⚠️ What this does to D3. The open question is no longer "may extraction consult the raw?" — it already does. It becomes the much smaller "what does the narrative add that the raw does n…
+
+- **Level 1 — per-candidate (many, cheap, evaluated in parallel)**
+  - \> This is where the pack stops being prose. `packs/dev/manifest.yaml` already declares `memory_granularity` — "Durable: problem-family reasoning … Ephemeral: issue/PR numbers, CI status, …
+
+- **⚠️ Owner question: if the narrative is poor, should we send it back? (2026-09-23)**
+  - Outputs: `KEEP` · `NOOP` · `DISCARD` · `MERGE` (the VERDICT — a flag, §16.4) · `SPLIT` (for a fused item — extraction may then split it from the raw, which it already has) · `RENARRATE` (…
+  - ⚠️ `MERGE-INTO-EXISTING` is deliberately NOT a VET output — and `MERGE` and `MERGE-INTO-EXISTING` are not the same thing. VET may emit the verdict `MERGE` — "fold into another candidate" …
+  - ⚠️ There is no S4 — do not restore one. A previous draft listed a separate "S4 — granularity review" and folded it back in here. It is not a step: its purpose was identical to question 2 …
+  - \> **⛔ DRIFT MARKER — this sentence is about the v4 PROPOSAL, not the shipped code (checked 2026-10-13).**
+  - \> | S4 | *"There is no S4"* | `merge_embed_lists(s2, s4)` def `extractor_v2.py:2673`, **consumed at `:7414`**; `run_s4` called **`:7396`** |
+  - \> | the S4 flag | — | ⚠️ `TORTOISE_S4_DELTA` selects the **delta vs complete-list contract of S4's OUTPUT**, **not** whether S4 runs (`:689-710`) |
+  - \> | stage order | the eight steps above | `run_s1` `:7290` → `run_s2` `:7314` → `S2.2 VET` `:7331` → `S3 search_graph` `:7375` → **`run_s4` `:7396`** → `S5` |
+  - \> ⚠️ `TORTOISE_S4_DELTA=0` does NOT disable S4 — it selects the legacy complete-list contract. There is no S4-specific off switch: S4 is reached whenever the v2 pipeline runs a story, and…
+  - \> **Removing `run_s4` is a v4 migration deliverable, not a cleanup** — it is §4.3 **G5**'s S4 clause,
+  - \> tracked at **`#8500`**. ⚠️ **Not `#5333`**: that issue's own body scopes it to the deletion/relocation
+  - \> half and states it *must not absorb* other work, and it contains no reference to `S4`. **Never delete
+  - \> `run_s4` on the strength of this document alone.**
+  - \> docstring `:10-29`), with `S2.2 VET` present in the production path (`:7331`). **`S0` and `S6` have no code
+  - \> classify pass is `kind_classifier.classify_items` (`kind_classifier.py:189`), wired at
+  - \> `extractor_v2.py:7356-7358` / `:7487`, gated by `TORTOISE_CLASSIFY_LATER` — **unset today = "the LEGACY
+  - \> ⚠️ Currency of these line numbers: the figures above are the numbers at `4c801fb18` — ⚠️ not the tree this marker landed on, so they are not a description of the tree at the commit that…
+  - \> stands: the symbol name is authoritative and the line number is a convenience. ⚠️ For THIS passage that rule is now mechanical, not a promise: `tests/test_extractor_v4_s4_stage_claims.p…
+
+- **S2.3 — CLASSIFY (assign the pack kind — after the gate, on SURVIVORS only)**
+  - \**✅ It exists — and it is already built, already flag-gated, and already positioned after the gate. It is switched OFF.**
+  - \**⇒ So the answer is: we HAVE it, it is `TORTOISE_CLASSIFY_LATER=1`, and it is OFF.** Three things are wrong with its current state, and they are the actual work:
+  - \1. It is OFF, so classification happens INLINE — inside S2.1's big call. When the flag is on, `core_only=classify_later` is passed to S2 (`:4782`) so the extractor only assigns core kinds…
+  - \2. The owner's improvement is real and specific: it must run on SURVIVORS. ⚠️ `_collect_classify_items` collects from `embed_list` — the whole candidate set — and `classify_consolidation`…
+  - ⚠️ **Owner confirmation pending** — *"maybe part of S2.2? or not sure if we already have it"* — **the evidence says: we have it, it should not be a substep, and it belongs after the gate.**
+
+- **⛔ What the code does TODAY — the order is inverted**
+  - \#### ⛔ What the code does TODAY — the order is inverted
+  - Resolved by call graph, not by line number:
+
+- **The five correctness constraints — and ONE of them was FALSE**
+  - \#### The five correctness constraints — and ONE of them was FALSE
+  - | 4 | ✅ CONSTRAINT 4 IS TRUE — AND AN EARLIER "CORRECTION" BROKE IT. "CLASSIFY needs no graph; the LOOKUP needs KINDS → CLASSIFY before RESOLVE" | ⛔ RESTORED 2026-09-24. The 2026-09-23 co…
+  - ⚠️ Constraint 2 is what fixes the near-duplicate stage's SITE — it is not merely compatible with it. Three passages in this document used to disagree: this table put a `MERGE` at `S2.2a-β…
+  - The fusion cannot precede the gate: §S2.2 reserves new-vs-existing to S3, and the against-store leg needs the lookup anyway (constraint 5) — the fusion needs a destination, which only S3 …
+
+- **✅ Jev for classification is cheap — but ⚠️ the seam does NOT yet exist**
+  - \#### ✅ Jev for classification is cheap — but ⚠️ the seam does NOT yet exist
+  - And ⚠️ `llm_tail` is NOT a ready-made Jev seam — that was over-read. It is a BOOLEAN (`kind_classifier.py:93`); the line cited as a seam is `:522`, the offline-eval CLI disabling it. The …
+  - ⚠️ And the "structural enforcement" argument is weaker than it reads. `closed_vocab_rejects` already exists (the closed vocabulary is enforced today), so Jev's `Choice` does not add a new…
+
+- **4.3 ⚠️ What the steps above do NOT yet cover (review-provided, all unaddressed)**
+  - The step list is the SHAPE, not a complete specification. Five gaps were identified by review and are recorded here rather than silently implied by the diagram. These are gaps to close, n…
+  - | G1 → `#5064` (open remainder; the span schema + passthrough exist (PR `#5108`), but `extractor_v2.py` emits no `span_start` (the repo's document extractor does — `docs_miner.py:373`)) ·…
+  - | G2 → `#5008` | No EMBEDDING-DECISION step. `STORAGE-ARCHITECTURE.md` §12.2a decides the `EMBED` gate exists ("a row can be worth KEEPING but not worth EMBEDDING", "the lever is what get…
+  - | G3 → `#8495` ✅ DECLARED | Per-step FAILURE POLICY — ✅ declared in §4.4 (2026-10-14): every step states fail-open or fail-closed, the invariant that survives, and its retry/transaction b…
+  - | G4 → `#8496` | ⛔ `#4911` (no secret redaction) + an append-only immutable raw layer = IMMORTAL SECRETS. ✅ RECONCILED IN `§2.4.4` (R1–R4): redact BEFORE the append; the already-persisted…
+  - Where the five gaps live: G1 `#5064` (the open remainder — PR `#5108` carries the span schema + passthrough; what is still missing is that `extractor_v2.py` emits no `span_start` — the re…
+
+- **S3 — RESOLVE (find what exists · disambiguate · attach)**
+  - \**S3 owns the lookup** — moved here from S1.5 (§4.2). The lookup is keyed on **candidates**, and candidates only exist **after** extraction.
+  - ⚠️ The narrative is an INPUT to this step. The old S3 listed only "candidates + what exists" — leaving the disambiguation context out of the step that needs it most. Owner, 2026-09-23: "w…
+
+- **4.4 Per-step FAILURE POLICY (G3) — ✅ declared 2026-10-14**
+  - \### 4.4 Per-step FAILURE POLICY (G3) — ✅ declared 2026-10-14
+  - Why this section exists. §4.3's G3 recorded that only two of the eight steps named what they do on failure — S2.2 ("fail-open — keep") and S2.3 ("never raises") — and that an unstated def…
+  - `HOLD` is a run-level disposition, not a new VET outcome. It is the set of candidates a run did not commit and did not discard — carried forward for a later run against the same graph. ⚠️…
+  - | S2.2 VET (Jev) | FAIL-OPEN (already declared) — a failed Level-1 question returns `KEEP`; a failed Level-2 verdict triggers no re-narrate and the batch proceeds. | "a wrong keep is nois…
+  - | S2.3 CLASSIFY (Jev + kNN) | FAIL-OPEN, never raises (already declared) — the candidate keeps `unclassified`; the run records it in its census. | A wrong kind is worse than no kind: `_fi…
+  - | S6 COMMIT (mechanical) | FAIL-CLOSED, ATOMIC. One run = one journalled commit; a failure leaves the journal — and the derived graph — unchanged. | I3. A half-applied run is a duplicate/…
+  - \**The re-narrate loop — bounded to once, and now with a deterministic tie-break.**
+  - §S2.2 already bounds the loop ("once, then accept") and names the trigger (a poor batch verdict, e.g. a keep-rate below a threshold). What was unstated is which narrative is kept when the…
+  - ⚠️ State of the shipped code — this section is a SPEC CHANGE, not a description of what runs. The load-bearing instance is S3. The shipped `search_graph` degrades instead of raising (corr…
+
+- **5a. Supersession — we already have it. The gap is DETECTION, not mechanism**
+  - \## 5a. Supersession — we already have it. The gap is DETECTION, not mechanism
+  - \**⚠️ The premise is wrong in a useful way: the system already exists, is fully wired, journaled, and tested.** Measured on the live graph (2026-09-23):
+
+- **⛔ "The more recent fact wins" is REFUSED — contradiction test**
+  - There is a recorded decision on exactly this, and it says no. `#2354` (OPEN, epistemic-team) — "uncertainty verdict layer — close/keep/reject on correction conflicts via quarantine+promot…
+  - \2. It is the wrong mechanism for us, and the reason is knowable. Recency-precedence is what Hindsight uses — `"the fact with the LATEST mentioned_at is authoritative"` — and they use it b…
+
+- **Atomicity is required by the epistemic layer — NOT an optimisation**
+  - Operators connect only epistemic targets (any of `:Point`/`:Subject`/`:Object`/`:Event`; see `ONTOLOGY.md` §8 `OVERRIDES`) — you cannot `NAND` a paragraph. The `:Subject`/`:Object` operat…
+
+- **State values and numeric facts — the carve-out is NARROWER than it looks**
+  - v3's E2 requires state-value facts be preserved verbatim ("personal best 5K time = 27:12, as of <date>") rather than filtered as "counts are noise." `STATE_VALUE_CARVE_OUT` exists in `_gr…
+
+- **✅ The carve-out does NOT cover decision-relevant numbers**
+  - \#### ✅ The carve-out does NOT cover decision-relevant numbers
+  - `#2453` root-caused this: the carve-out is scoped to user-personal state (personal bests, schedules, preferences) and explicitly tells the mapper to DROP process metrics as "mechanics tok…
+  - \**⇒ There are TWO value classes, and the policy must keep BOTH** (commit `4a690d0be`, PR `#2456`) — the table below states which:
+  - | **Operational / decision values** | *"p99 latency 480 ms at 3k rps"* | **RETAINED** (commit `4a690d0be`; PR `#2456`) | retained |
+  - Operational values are DURABLE (the extension is `#2453`). `STATE_VALUE_CARVE_OUT` (`extractor_v2.py:145-171`) with an operational-value paragraph — "a concrete value that is the SUBJECT …
+  - ⇒ The design requires ENFORCEMENT BY DEFAULT — the mechanism is not the gap. The S2.2b identifier-only predicate is the shipped rule in `tortoise/value_gate.py`: `value_gate._REFERENCE` (…
+  - ⚠️ And the mechanical DISCARD (`#4899`, §16 — `value_gate.py`) would otherwise have inherited this bug — had it been defined against the old, stale reading, it would have discarded operat…
+
+- **Where numeric facts should live (owner, 2026-09-23) — structured, so they are never re-processed**
+  - ⚠️ PLACEMENT IS DECIDED (owner, 2026-10-06): a state/numeric value is a STRUCTURAL FIELD ON AN ENTITY, not a `Point` (`STORAGE-ARCHITECTURE.md` §7, whose head reads "RETAIN is decided and…
+
+- **8. Already in the code — do not rebuild**
+  - \## 8. Already in the code — do not rebuild
+  - | **S2/S4 merge** | `merge_embed_lists` (def `extractor_v2.py:2284`; **called at `:4845`** — ⚠️ not `:4838`, which is `try:` (`stage_stats` is `:4837`)) |
+  - | **The narrative prompt slot** — S1's granularity rule is already injected | `_granularity_text()` |
+
+- **10. The narrative-first hypothesis — tested, and the better argument**
+  - \- ⛔ Zero precedents for summarise-then-extract. The one apparent candidate was miscited and corrected — it is the reverse direction (input = raw long document, output = a compressed graph).
+
+- **✅ Update 2026-09-23 — a STATED reason for raw extraction now exists**
+  - \### ✅ Update 2026-09-23 — a STATED reason for raw extraction now exists
+  - \**⇒ Option 4 is no longer merely hedged — it is evidence-backed.** The narrative stays the cheap searchable tier and a *focus*; extraction keeps access to raw as the source.
+
+- **⛔ REFUSED — contradicts a recorded decision ⇒ a REOPEN, not an adoption**
+  - \> ✅ `OVERRIDES:` posted on `#2730` — for this ruling the marker lives on the issue, per the rule below; the issue comment carries the full text. ⚠️ The rule is not yet true file-wide — th…
+  - \> ⚠️ **Two claims, and only one is established — stated so the ruling cannot be overclaimed later.**
+  - The five challenges that were put to the owner, kept for the record:
+
+- **13.6 ⭐⭐ THE FINDING THAT BITES US: they materialised entity edges — then DELETED them**
+  - ⚠️ This does not automatically transfer — their `/graph` endpoint does derive the edges on demand, so the capability is preserved — and the measurement this sentence used to demand as "th…
+
+- **13.8 What this does to our design**
+  - | S5 CONNECT — two sets, within-batch and to-graph (D6, decided) | LLM does within-batch only, max 2, backwards; to-graph is mechanical (ANN + entity join) | ⚠️ A direct challenge to D6. …
+  - | connection fan-out | bounded everywhere, with a timeout that drops an arm | ✅ The cap is adopted — `PER_ENTITY_FANOUT_CAP = 200` (`tortoise/fanout.py`), consumed by `assembly.py` / `sub…
+  - \**⇒ One of the three questions below is still the owner's (question 1). Question 2 is measured, ruled and deferred; question 3 is adopted — `PER_ENTITY_FANOUT_CAP = 200` — see below:**
+  - \2. Should `aboutObject` be a stored edge or a derived join? ✅ MEASURED 2026-09-23 — the answer is split; RULED (owner, 2026-09-23): KEEP the stored edge; DEFERRED to post-launch (not open…
+
+- **14. Not established — do not treat as known**
+  - \- Whether the neighbourhood lookup changes extraction's output is UNMEASURED — and the new ordering makes it moot. The old design put the lookup before extraction so extraction would emit…
+
+- **15. Open questions**
+  - Cross-batch connection — by LLM or mechanically — is open (§13.8). The other two questions this document raises are settled: hard fan-out caps apply (200, `PER_ENTITY_FANOUT_CAP`, §13.8 q…
+
+- **16. Decisions and where their record lives**
+  - Six open decisions were run through the mandated sequence — **contradiction test
+  - first → research (does it actually need a human?) → the required artifact**. The
+  - decisions themselves are §16.3 and §16.4; the record of how they were reached,
+  - and of the two review cycles that followed, is in
+  - \**`EXTRACTOR-V4-ARCHITECTURE-CHANGELOG.md`**.
+  - \**The decisions it produced are below, and they are the design.** §16.3 records
+  - the six answers; §16.4 states what `MERGE` means on near-duplicates.
+
+- **16.3 ✅ ALL SIX DECISIONS CLOSED (owner, 2026-09-24)**
+  - \### 16.3 ✅ ALL SIX DECISIONS CLOSED (owner, 2026-09-24)
+  - \**These were escalated per the AGENTS.md protocol. They are now answered — recorded so no future lane re-opens them.** Full detail: `STORAGE-ARCHITECTURE.md` §14.1.
+  - | O1 | The conflict was mine. `#2826` A2 (the real decision row) recommended the journal be authoritative; `#2881` reversed it by recommendation; the doc recorded the reversal and flagged…
+  - | O2 | ⛔ Not a question — the owner rejected the framing: "we're not optimising stupidly for a number… this is not a corporate OKR setting exercise. We need to balance multiple things at …
+  - | **O3** | ✅ **ADOPTED — emit the DECLARED outcome word (`DISCARD`), matching the engine's existing classifier.** | S2.2's outputs use the declared vocabulary. |
+  - | O4 | ✅ Merge IS authorised — with Jev as arbiter over the claim plus narrative/raw data. ⛔ This supersedes the `OVERRIDES:` ruling on `#4899` ("never merging two claims into one"). | Th…
+  - | O5 | ✅ Neither — draft and iterate: "we draft something (a prompt, a step of the extraction workflow, etc) and run it and see the result then refine and run again, until good." | The wo…
+
+- **16.4 ⭐ O4 applied — what "merge near-duplicates" means here, bounded by the evidence**
+  - \- ⛔ A merge must NEVER happen across a difference in: a number or quantity, a named entity, a language, a negation, a condition, a load-bearing connective whose role changes across the pa…
