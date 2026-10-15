@@ -8,9 +8,17 @@ WHAT THIS PINS
    (`tests/test_event_store.py::test_content_edit_emits_nothing`) is intact.
 2. **PointRevised reaches the store when the feed is on** — the source half of
    indicator (1), drawn as an opt-in so the default stream is untouched.
-3. **`what_changed` is semantic** — one call returns per-claim deltas with
-   before→after for content, validity and status, aggregated from the SAME page
-   `poll_events` already returns, rather than a client-side replay of raw events.
+3. **The semantic feed is per-claim deltas** — one `poll_events` call returns
+   per-claim deltas with before→after for content, validity and status,
+   aggregated from the SAME page `poll_events` already returns, rather than a
+   client-side replay of raw events. The delivered surface is the
+   `changes` key on `poll_events`' reply (`TortoiseSDK.poll_events` /
+   `tortoise_events_poll`), folded by `tortoise/change_feed.py::aggregate_changes`
+   — there is no `what_changed` symbol, and no new SDK verb or MCP tool.
+4. **The type the switch writes is NAMEABLE** (review P2): `PointRevised` is a
+   registered claim type, so `poll_events(types=["PointRevised"])` and a
+   `PointRevised` webhook subscription work instead of raising
+   `ValueError: unknown event type`.
 
 NOTE ON THE E2E FIXTURE. The issue's E2E names "supersede + retract + evidence-add
 on ONE point". That exact triple is UNREACHABLE: retract and supersede are both
@@ -28,6 +36,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -107,6 +117,57 @@ def test_revision_reaches_the_store_when_enabled(monkeypatch, sdk_factory, tmp_p
         assert any(pl.get("new_content") == "v2" for pl in payloads), payloads
     finally:
         sdk.close()
+
+
+# ── 2b. the type the switch writes is NAMEABLE (review P2) ────────────────
+
+def test_revision_type_is_filterable_when_enabled(monkeypatch, sdk_factory, tmp_path):
+    """The store holds `PointRevised` while the switch is on, so the read side
+    must let a caller FILTER for it — a hard `ValueError` would make the very
+    type the feature exists to surface unnameable (#2353 review P2)."""
+    monkeypatch.setenv("TORTOISE_CHANGE_FEED", "1")
+    sdk = sdk_factory(tmp_path)
+    try:
+        p = sdk.create_point("statement", "v1")
+        sdk.update_point(p["id"], content="v2")
+        assert "PointRevised" in [e["type"] for e in sdk.poll_events()["events"]]
+        resp = sdk.poll_events(types=["PointRevised"])
+        assert [e["type"] for e in resp["events"]] == ["PointRevised"]
+        assert resp["events"][0]["payload"]["id"] == p["id"]
+        # the fold reads the SAME (filtered) page — same assembly site
+        assert _kinds(resp["changes"], p["id"]) == ["revised"]
+    finally:
+        sdk.close()
+
+
+def test_revision_type_is_nameable_even_when_off(monkeypatch, sdk_factory, tmp_path):
+    """Registration is NOT conditional even though the emit is: with the switch
+    off the type is accepted and the page is simply empty (no row can exist) —
+    never a `ValueError` that reads like a typo — and the reply stays
+    byte-identical (no `changes` key)."""
+    monkeypatch.delenv("TORTOISE_CHANGE_FEED", raising=False)
+    sdk = sdk_factory(tmp_path)
+    try:
+        sdk.create_point("statement", "v1")
+        resp = sdk.poll_events(types=["PointRevised"])
+        assert set(resp) == {"events", "next_cursor"}, resp
+        assert resp["events"] == []
+    finally:
+        sdk.close()
+
+
+def test_revision_type_is_subscribable():
+    """The OTHER read-side validator: `create_subscription` gates on the same
+    registry (`webhook_delivery._validated_types`), so a revisions subscription
+    must be legal — an unfiltered subscription already delivers these rows."""
+    from tortoise.webhook_delivery import _validated_types
+
+    assert _validated_types(["PointRevised"]) == ["PointRevised"]
+    assert _validated_types(["PointAdded", "PointRevised"]) == [
+        "PointAdded", "PointRevised",
+    ]
+    with pytest.raises(ValueError, match="unknown event type"):
+        _validated_types(["NotAType"])
 
 
 # ── 3. the feed is semantic ────────────────────────────────────────────────

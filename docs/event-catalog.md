@@ -17,13 +17,14 @@
 | `PointPromoted` | 1 | `TortoiseSDK.promote_point` (#785) | `point` (full snapshot) | SDK |
 | `OperatorPromoted` | 1 | `TortoiseSDK.promote_point` R16 (#785) | `point` (full snapshot), `id` | SDK |
 | `OperatorAnnotated` | 1 | `TortoiseSDK.annotate_operator` | `id`, `bias`, `precision`, `consistency`, `directness` | SDK |
+| `PointRevised` | 1 | `TortoiseSDK.update_point(**props)` — the JSONL journal for every content/validity/status revision (#548). **This is the ONE registered type whose emit path is conditional:** it reaches the `:GraphEvent` store only while `TORTOISE_CHANGE_FEED` is truthy (#2353), because that store's default emit set is the claim-TRANSITION contract (`sdk._GRAPH_EVENT_TYPES`, which is NOT widened by this type — see the ⚠️ note below) | payload = the caller's props VERBATIM plus `id` (a store revision carries the same bare domain payload the JSONL line does: `new_content`, `validTo`, `status`, `annotator_*`, caller extras…) | SDK — JSONL always; `:GraphEvent` only under the switch |
 | `ObjectSuperseded` | 1 | hosted commit endpoint (`hosted_api._execute_commit_writes` §6b) + capture (`sdk._extract_session_v2`) + eval (`tools/longmem_eval/ingest_v2`) — entity-level supersession records; ALL THREE emit via the shared `commit_ops.apply_supersessions` (id-style kwargs — #1350/#2164/#2193) | `id`, `name`, `supersedes_by`, `session_id`, `evidence` — id-style kwargs. The GraphEvent payload carries all five for every producer; the JSONL line carries them only when the producing SDK is built with an `event_log_path`. In-tree JSONL exercisers build `event_log_path`-configured SDKs and drive `commit_ops.apply_supersessions` (which routes through `sdk._emit_event`): `tests/test_capture_session.py` (`test_apply_supersessions_legacy_idless_object_reaches_jsonl`) plus the #2194 suite (`test_object_registered_journal.py`) — an in-tree exerciser therefore predates #2194. The other `event_log_path`-configured in-tree SDK — offline mining, `tortoise/mining.py` — never emits `ObjectSuperseded` (no supersession path: Object writes are `ObjectRegistered` via `api.add_object`) | Hosted commit endpoint / SDK capture / eval ingest (all via `commit_ops.apply_supersessions`) |
 
 > ⛔ **`ClaimStateChanged` is NOT an event type** (plan-review P1). Every claim
 > transition maps to one of the eleven concrete types above; **challenged is a
 > DERIVED condition** (NAND-operator-edge presence on a live point), not a
 > state or event. Content edits via `update_point` (non-status props) emit
-> NOTHING to the `:GraphEvent` store.
+> NOTHING to the `:GraphEvent` store **by default**.
 >
 > ⚠️ **`PointRevised` is a JSONL-only record BY DEFAULT, and that is a recorded
 > decision, not an accident** — `docs/plans/2026-08-08-432-subscriptions-plan.md`
@@ -38,8 +39,17 @@
 > validity and status via the semantic change feed (`tortoise/change_feed.py`,
 > an off-by-default `changes` response field — see
 > `docs/product/mcp-sdk-surface.md` → *Recorded response fields*). Off, the
-> emitted set above is unchanged. Widening the DEFAULT set would reverse the
+> emitted set above is unchanged. Widening the DEFAULT emit set would reverse the
 > plan-review ruling; that is an owner decision, not a lane's.
+>
+> Registration is the other half of that exception, and it is NOT conditional:
+> `PointRevised` is the twelfth member of `CLAIM_EVENT_TYPES`, which is the
+> READ-side catalog (`poll_events`' `types=` filter and
+> `webhook_delivery._validated_types` consult it — never `sdk._GRAPH_EVENT_TYPES`).
+> Registration is what makes `types=["PointRevised"]` and a `PointRevised` webhook
+> subscription legal instead of a hard `ValueError`, so the store can never hold a
+> row a caller cannot name (#2353 review P2). The eleven unconditional members are
+> exactly `sdk._GRAPH_EVENT_TYPES`.
 >
 > The EventAPI/CLI/ingest path emits its own legacy events (`PointAdded`,
 > `PointRetracted`, `PointsMerged`, `IngestStarted`) to the EventLog JSONL —
@@ -246,7 +256,7 @@ traversals, EP propagation; see §5 guard).
 |---|---|---|
 | `seq` | int | Per-graph monotonic, atomic in-graph counter (`GraphEventMeta.last_seq`). Indexed. |
 | `ts` | string | ISO8601 UTC (node-level canonical; NOT re-embedded in payload). |
-| `type` | string | One of the eleven registered types above. |
+| `type` | string | One of the eleven `sdk._GRAPH_EVENT_TYPES` members above — plus `PointRevised` while `TORTOISE_CHANGE_FEED` is truthy (the twelfth registered `CLAIM_EVENT_TYPES` member; the emit gate is `sdk.py::_emit_event`). |
 | `payload` | string | JSON of the **bare domain payload** (codec encode/decode wiring deferred to the first upcaster task — node props are canonical for v1). |
 | `event_id` | string | Server-side ULID; **unique** (app-side dedup + unique constraint on production FalkorDB). |
 
