@@ -116,6 +116,27 @@ def test_ci_has_the_job_and_runs_the_project() -> None:
     assert "npm ci" in runs, f"{JOB} must install from the lockfile"
     assert "tsc -p tsconfig.website-functions.json" in runs, f"{JOB} does not run the project: {runs!r}"
 
+    # A `ci.yml`-only change does NOT set `website` (the predicate names
+    # `website/**`, the harness paths and `tools/ts/` — never a workflow file),
+    # so this job never re-runs on a change to its own definition; the README
+    # records that boundary. What DOES run on a workflow change is the full
+    # Python surface, i.e. this file. So pin the step internals a disarming
+    # `ci.yml` edit would reach — otherwise a weakened job lands with the job
+    # never having run (the gap `tools/ts/README.md` names).
+    assert not [s for s in job["steps"] if s.get("continue-on-error")], (
+        f"{JOB} has a continue-on-error step — the gate must fail closed: {job['steps']}"
+    )
+    for step in job["steps"]:
+        run = step.get("run", "")
+        assert "|| true" not in run and "|| :" not in run, (
+            f"{JOB} step {step.get('name')!r} swallows failure: {run!r}"
+        )
+    setup = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/setup-node"))
+    assert setup["with"]["node-version"], "the Node revision is unpinned — the compiler drifts"
+    assert setup["with"]["cache-dependency-path"] == "tools/ts/package-lock.json", (
+        "the npm cache key must follow this project's lockfile, not the repo root's"
+    )
+
 
 def _gate_outputs(changed: list[str], tmp_path: Path) -> dict[str, str]:
     """Execute the `changes` job's REAL gate script for a synthetic changed set.

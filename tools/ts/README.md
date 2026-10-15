@@ -3,7 +3,16 @@
 `tsconfig.website-functions.json` typechecks **only** `website/functions/**` — the
 Cloudflare Pages Functions tree (agent write API, admin gate, cache purge, contact
 form). `website-functions-typecheck` in `.github/workflows/ci.yml` runs it on every
-PR that touches that tree, this directory, or `ci.yml`.
+PR that touches that tree or this directory: both select the shared `website`
+change-gate, and `tools/ts/` was added to that gate's predicate (#4311).
+
+A `ci.yml`-only change does **not** select the `website` gate, so this job is
+skipped on a change to its own definition — deliberately, because that gate is a
+single `run:` scalar within ~90 bytes of GitHub's hard 21000-byte expression cap
+(#6253) and it already has two consumers (see the `welcome-e2e` note in
+`ci.yml`). A workflow change *does* select the full Python surface, so
+`tests/test_website_functions_typecheck.py` still runs and pins this project's
+`include`, `strict`, pinned toolchain and job wiring.
 
 ## Why the config does not live next to the code it checks (#4311)
 

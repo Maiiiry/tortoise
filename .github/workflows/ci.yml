@@ -1564,6 +1564,14 @@ jobs:
     # the examples, so a placeholder id that embeds nothing shipped green. The
     # rationale lives HERE, not inside the gate script: that `run:` scalar is
     # within ~100 bytes of GitHub's 21000-byte expression cap (#6253).
+    # #4311: the same `website` gate also names `tools/ts/` — the strict tsc
+    # project for `website/functions/**`, added there so the
+    # `website-functions-typecheck` job runs on a change to the project or its
+    # pinned toolchain. That entry is shared, so `welcome-e2e` co-fires on a
+    # `tools/ts/**`-only change it cannot be affected by. Accepted as the
+    # over-trigger (never under) direction: a second `changes` output would cost
+    # ~40 more bytes of the same capped scalar, and this job's inputs are cheap
+    # relative to the full Python suite a `ci.yml` change already selects.
     # Mocked welcome-page suite (#541) — secret-free per-PR coverage against
     # the LIVE page (Supabase calls mocked via Playwright routes). The #801
     # live signup smoke self-skips without SUPABASE secrets and runs in

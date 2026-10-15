@@ -28,6 +28,8 @@ Each assertion is falsifiable:
     the requested member — not a constant;
   * ``status="archived"`` → 400 with the ``status must be draft | published``
     error AND NO INSERT (a coercion to ``draft`` would return 201);
+  * ``status=""`` → the same 400: the falsy-value edge #1809 round 3 fixed,
+    which a truthiness test would narrow to the ``draft`` default;
   * ``status=42`` → 400 with ``must be a string`` (the non-string branch);
   * ``status="published"`` with an empty body → 400 ``body required``;
   * ``status="published"`` + ``hold_for_review`` → 400 on ``hold_for_review``.
@@ -99,6 +101,10 @@ CASES: dict[str, dict] = {
     "draft": {"title": "T", "slug": "status-draft", "status": "draft"},
     "published": {"title": "T", "slug": "status-published", "status": "published", "body": "hello"},
     "invalid_string": {"title": "T", "slug": "status-archived", "status": "archived"},
+    # #1809 round 3 fixed `if (status && …)` → `if (status !== null && …)` for
+    # exactly this input: `""` is falsy, so a truthiness test skips the enum
+    # check and narrows it to `draft` (a 201 with a draft INSERT).
+    "empty_string": {"title": "T", "slug": "status-empty-string", "status": ""},
     "non_string": {"title": "T", "slug": "status-number", "status": 42},
     "published_empty_body": {"title": "T", "slug": "status-empty-body", "status": "published", "body": ""},
     "published_hold_for_review": {
@@ -154,10 +160,20 @@ def test_a_valid_status_reaches_the_insert(results, case: str, want: str) -> Non
 
 # ── an invalid status is REFUSED, never coerced ──────────────────────────────
 
-def test_an_unknown_status_string_is_rejected_and_never_inserted(results) -> None:
-    """The pre-#4311 cast would have made this a 201 with status='archived'."""
-    res = results["invalid_string"]
-    assert res["status"] == 400, f"invalid status → {res['status']} (want 400): {res}"
+@pytest.mark.parametrize("case", ["invalid_string", "empty_string"])
+def test_an_unknown_status_string_is_rejected_and_never_inserted(results, case: str) -> None:
+    """A value outside the union is REFUSED, never narrowed to the default.
+
+    Behaviour-preservation pin — the pre-fix handler refused both of these too,
+    so this test does NOT detect the #4311 type fix. What it guards is the
+    regression the #1809 round-3 review already fixed once on this branch: an
+    ``if (status)`` truthiness test instead of an explicit
+    ``!== undefined && !== null`` skips the enum check for ``""`` and narrows it
+    to the ``draft`` default, turning a 400 into a 201 with a draft INSERT.
+    ``"archived"`` and ``42`` cannot catch that — both are truthy.
+    """
+    res = results[case]
+    assert res["status"] == 400, f"{case} → {res['status']} (want 400): {res}"
     assert res["body"]["status"] == "status must be draft | published", res["body"]
     assert res["rows"] == [], f"an invalid status reached the INSERT: {res['rows']}"
 
