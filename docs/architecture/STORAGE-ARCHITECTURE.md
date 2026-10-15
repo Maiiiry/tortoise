@@ -53,7 +53,7 @@ the never-refusal ruling to the node cap; it **removes the unit the question was
 a way to buy more. Keeping those two halves distinct matters: the guarantee comes from the overage path.
 
 **Measured basis (2026-09-25, live graph).** These are the numbers the allowance must be denominated in, and **each
-per-node figure states its base and its denominator**, because that pair is where this document has already erred
+per-node figure states its base and its denominator**, because that pair is where per-node arithmetic goes wrong
 twice:
 
 | quantity | measured | note |
@@ -71,7 +71,7 @@ twice:
 143 **decimal** MB ÷ 89,701. So the ruling's two per-node numbers (`6,003` and `1,594`) differ by **3.77×**, not by
 the **3.59×** the denominators alone imply, precisely because MiB and decimal MB were mixed. **On one base the pair
 is either `6,003 / 1,672` (MiB) or `5,725 / 1,594` (decimal)** — at most two of `{143 MB, 6,003 B, 1,594 B}` can be
-true at once. The *decision* is untouched by this (bytes remain the unit); the *derivation* is corrected here so the
+true at once. The *decision* is untouched by this (bytes remain the unit); the base is stated with every per-node figure so the
 error is not propagated into the allowance.
 
 ⚠️ **Per-node figures carry different denominators, and the figures are not interchangeable.** §2 and §12 state
@@ -264,7 +264,7 @@ derived  =  replay(journal)  ∪  preserved_config
 
 **⚠️ A real gap this document must name:** `rebuild_all` performs an unconditional wipe + journal-only replay — i.e. **the code treats an incomplete log as the authority**. That is the defect `#5089` (*"epic: durability — derived = replay(journal) made true"*) must fix. It is the write-path half of §3's own divergence list below, whose mechanism (1) *"ONE ATOMIC WRITE"* is recorded **absent**.
 
-**⚠️ The architecture documents must not re-define durability terms** — the gate `tests/test_durability_posture.py` does not scan `docs/architecture/`, so a divergence here would not be caught.
+**⚠️ The architecture documents must not re-define durability terms** — durability terminology has one authoritative home.
 
 **Three storage consequences — and the third is what forces the split:**
 
@@ -404,7 +404,7 @@ Supabase database storage **$0.125/GB/month**; object storage **$0.0213/GB/month
 
 **This is the most important limitation of this document.**
 
-⚠️ **This section's multiplier depends on the vector share, and both corrections below move it.** The naive figure is **~15× blended** (580× on non-vector bytes, ~5× on the vector leg). Two things change it:
+⚠️ **This section's multiplier depends on the vector share, and both factors below move it.** The naive figure is **~15× blended** (580× on non-vector bytes, ~5× on the vector leg). Two things change it:
 
 1. **The vector class is roughly half the graph, not ~1/3** (§2/§12.1b) — so weighting the cheap leg less *lowers* the blend.
 2. **The vector leg is not a ~5× RAM win.** The index is **disk-backed like everything else** (§12.1) — so **the ~584× disk-vs-RAM multiplier applies to ALL bytes, including vectors.**
@@ -438,7 +438,7 @@ The extraction document states no target and no aggregate reduction; the number 
 **⚠️ Two halves — RETAIN and PLACEMENT — and they are decided separately:**
 
 - **Operational values are retained verbatim** — commit `4a690d0be` / PR `#2456` (2026-09-07): `STATE_VALUE_CARVE_OUT` (`extractor_v2.py:145-171`) plus `VALUE_FIDELITY_RULE` (`:230`, rendered into the S2/S4 `{anti_routine}` slot via `_s2s4_rules()`, `:299`); **`_granularity_text()` (`:732-744`) appends `STATE_VALUE_CARVE_OUT` to S1.** **The rule reaches the model.**
-- ⛔ **Enforcement BY DEFAULT is required — the mechanism is not the gap.** `valueGate` (`tortoise/value_gate.py`) is off by default and subordinate to VET.
+- ⛔ **Enforcement BY DEFAULT is required — the mechanism is not the gap.** The mechanism exists (`tortoise/value_gate.py`); its call-time toggle is subordinate to VET, so the requirement is that it is ON for the default extractor path.
 
 **✅ PLACEMENT (owner, 2026-10-06): a state/numeric value is a STRUCTURAL FIELD ON AN ENTITY, not a `Point`.** The reasoning is the ontology's own: operators connect only epistemic targets, EP confidence propagates over atomic beliefs, and relevance modulation needs beliefs separable (§8) — **a belief can be argued with, an attribute cannot.** The grounded requirement (*"75% of tranche 1 spent → tranche 2 unlocks"*) is a **comparison of an attribute**, so an amount is an entity field: no confidence, **no NAND-ability, and no embedding**. **⚠️ COST — do not overstate the lever; it is skipping the vector, not leaving the graph.** The measured model (§2.1, §12.1b): **on FalkorDB the WHOLE graph is RAM — no spill-to-disk, and no eviction on Cloud *as far as we can establish*; §2.1 names confirming that with the vendor as the single most valuable thing to confirm — so cost is proportional to total data and there is NO cold-data tier.** The three measured classes this cost model turns on, on a ~141 MB graph, are **45 MB of indices + 51.6 MB of embeddings + 16 MB of text — ≈113 MB of the ~141 MB** (a PARTIAL accounting, not the whole graph: the remainder is label matrices, edges and events, and the three do not sum to the total) — ⚠️ **§1's ruling block gives this pair as 143 MB / 46 MB — use those figures.** The vector class is the *biggest single* lever, but **the 45 MB of indices MIXES node- and text-driven fulltext indices with the embedding-driven `Point` HNSW index (§12.1b — exactly ONE vector index in the graph, on `Point`), so node count is an INDEPENDENT lever: reifying each value into its own node adds node- and label-matrix index entries that have nothing to do with embeddings** — and an index on the value itself is RAM rented forever, proportional to how many entities carry it, read or not. **⇒ Skipping the embedding makes a value CHEAPER, not FREE** — a value is cheap only if it is **neither embedded NOR indexed**, and the moment the requirement is *sum the amounts* or *filter by amount* that is an index and recurring RAM. **This is a COST question, separate from the PLACEMENT decision above, which stands on semantics** — and it is why the disk-tier option stays live (§2.2: *"the escape exists in Postgres"*). ⚠️ **A zero `Object` count on any one graph is CONTEXTUAL, not a finding** — other graphs hold `Object`s, so such a count says nothing about the placement, and **no live-graph count is asserted here.** The dated measurements this cost model rests on are §12.1b's and §12.2's, each against the snapshot recorded there — **none of them states or implies that an entity tier is empty or unpopulated.** ⚠️ **A NAMING conflict is open here, and it is NOT evidence about the placement:** this document calls the graph it measures *the live graph*, *the production graph* and *a dogfood instance* interchangeably, and §12.1b's **7,859 `:Object` embeddings** (2026-09-24) cannot be reconciled with a zero count until that naming is settled. **This stays open until it is settled by measurement, not by assuming which graph a figure describes.** ⚠️ **Where a sentence ASSERTS a figure** ("I think we spent 2 million") that assertion is a belief and may be a `Point` — the separate, smaller prose question, not this placement.
 
@@ -776,7 +776,7 @@ Because `based_on` carries ids that address **different tables**, a "which of th
 
 ### 11.1 Why the connections are not the cost problem — measured
 
-Our `aboutObject` links are **property-free**: the write path emits `MERGE (s)-[:aboutObject]->(t)` and **never a `SET`** (`projection/edges.py`, `create_about_edge` — `:344` at the pinned revision), and a full-repo search for a property-bearing edge finds **none** (`rg -n 'aboutObject \{'` → **0 matches at the 2026-09-23 pin `c79ba1cf2`**; **2** at HEAD on 2026-10-10, both display strings inside a test — `tests/test_commit_endpoint.py:1214`/`:1217`). **An edge that is two ids and nothing else is the cheapest row a store can hold.**
+Our `aboutObject` links are **property-free**: the write path emits `MERGE (s)-[:aboutObject]->(t)` and **never a `SET`** (`projection/edges.py`, `create_about_edge` — `:344` at the pinned revision), and a full-repo search for a property-bearing edge finds **none** (`rg -n 'aboutObject \{'` → **0 matches at the 2026-09-23 pin `c79ba1cf2`**). **An edge that is two ids and nothing else is the cheapest row a store can hold.**
 
 Estimated footprint in Postgres (two 16-byte ids, one B-tree index, standard tuple + index overhead):
 
@@ -928,7 +928,7 @@ FalkorDB requires **the entire graph in RAM** — 140 MB × $73/GB/month ≈ **$
 | **indexes at 2,100** | **2,101** | 2,100 | **7** |
 
 - **(A) degrades with tenant count** (~12× from T=10 to T=500). **(B) is flat to T=500** (6.4 → 1.8 → 6.9 ms). ⚠️ **BOTH branches break non-monotonically at T=2,100 — (A) FALLS to 75.476 ms (below its own T=500 value) and (B) JUMPS to 96.603 ms — and neither outlier is explained.** This is a *planning*-time table over thousands of indexes/partitions, so **do not quote either branch as monotone, or (B) as "flat", at T=2,100.** **`DELETE` succeeded in EVERY branch; no lock exhaustion was observed.**
-- **A column headed *"recall p50"* in the superseded study carries LATENCY, not recall** — the values it holds (154 ms, 184 ms, 2.3 s, ~11 s — **that study's own figures, at its own index counts**) are **milliseconds**. ⚠️ **Its population is NOT this table's: that study counted 51 indexes at T=10, while branch (A) here carries 2,101 at T=2,100 (~11 at T=10) — so the two are not the same quantity.** What this measurement supports is that **a per-tenant partial index remains usable at the counts tested**; it is not a point-for-point correction of the old study at its own counts.
+- **A column headed *"recall p50"* in the earlier (51-index) study carries LATENCY, not recall** — the values it holds (154 ms, 184 ms, 2.3 s, ~11 s — **that study's own figures, at its own index counts**) are **milliseconds**. ⚠️ **Its population is NOT this table's: that study counted 51 indexes at T=10, while branch (A) here carries 2,101 at T=2,100 (~11 at T=10) — so the two are not the same quantity.** What this measurement supports is that **a per-tenant partial index remains usable at the counts tested**; it is not a point-for-point correction of the old study at its own counts.
 
 **⭐ THE DECISION — and it is neither (A) nor (B) wholesale: the SIZE-EARNED CONDITIONAL INDEX (C).** *"The winning property is BOUNDED RELATION COUNT, and the size-earned index achieves it by making the index CONDITIONAL ON VOLUME — a byte-shaped axis, not a tenant-count-shaped one."* **7 indexes at 2,100 tenants; 0.71 ms there (0.54–0.71 ms across T=100–2,100).** This is why (C) wins: it is the only branch whose cost axis matches the thing that actually grows.
 
@@ -1311,11 +1311,11 @@ follows is the evidence each ruling rests on, which is design.
   | 10 | `aggregate.py:502` (`collect_anchor_census`) | the aggregative-verdict anchor census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
   | 11 | `coverage_loop.py:238` (`facet_census`) | the rule-based facet census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
 
-  And **36 test files assert the edge at the pin** .
+  And **36 test files assert the edge at the pin**.
 
   **⇒ The comparable's conclusion does NOT transfer.** Their justification was *"recall never touched them"* — **false here.** Deleting the edge would silently break **four** customer-callable surfaces. ⚠️ **The count is the whole argument — the table must name every customer-callable surface: `recall_subgraph` and `search(order_by="graph")` are two of them**.
 
-  **But the structural door stays open:** **no** `aboutObject` edge carries **any property** — `create_about_edge` (`projection/edges.py:344`) emits `MERGE (s)-[:aboutObject]->(t)` with no `SET`, and the search for a property-bearing edge returns **zero** at the pin (2 at HEAD, both test display strings — `tests/test_commit_endpoint.py:1214`/`:1217`). Unlike Graphiti — whose *fact and validity window live on the edge* — **we lose nothing semantically by deriving later.**
+  **But the structural door stays open:** **no** `aboutObject` edge carries **any property** — `create_about_edge` (`projection/edges.py:344`) emits `MERGE (s)-[:aboutObject]->(t)` with no `SET`, and the search for a property-bearing edge returns **zero** at the pin. Unlike Graphiti — whose *fact and validity window live on the edge* — **we lose nothing semantically by deriving later.**
 
   **⚠️ `#4240` is half-right, and the true half is the sharper argument.** Capture-path edges **are** journaled (`EntityLinked`, `#3664`; replayed by `projection/entities.py:785+`). **Indexer-path edges are NOT** - `_connect_issue_objects` (`sdk.py:20154`) calls `create_about_edge` with no journal write, and `test_index_restore.py:373-403` asserts `count(*) == 0` after rebuild. **So the finding is not "this edge saves no storage" but "this edge class is internally inconsistent about durability"** - a cleanup question, arguably more urgent than stored-vs-derived.
 
@@ -1393,7 +1393,7 @@ follows is the evidence each ruling rests on, which is design.
 
 ## 16. Research outcomes (2026-09-24) — the evidence this design rests on
 
-**This section carries the research outcomes this design rests on** (FalkorDB memory accounting; the idle-vs-active cost model; the latency question) .
+**This section carries the research outcomes this design rests on** (FalkorDB memory accounting; the idle-vs-active cost model; the latency question).
 
 ### 16.1 FalkorDB memory accounting — the cost model, settled
 
@@ -1455,7 +1455,7 @@ For the record, since two members of the design rest on it:
 
 ### 17.2 Cache coherence — and a COMPLETENESS MARKER
 
-**§3 covers ONE divergence surface** — journal ↔ projection, with five mechanisms — *"(1) absent · (2) absent · (3) count-only · (4) present and guarded · (5) absent"*. **The hybrid adds a SECOND: Postgres (truth) ↔ FalkorDB (cache).** **No mechanism for the second surface is designed yet.**
+**§3 covers ONE divergence surface** — journal ↔ projection, with five required mechanisms. **The hybrid adds a SECOND: Postgres (truth) ↔ FalkorDB (cache).** **No mechanism for the second surface is designed yet.**
 
 **The failure mode is specific, and it is why "add a fallback" is not enough:**
 
@@ -1536,7 +1536,7 @@ For the record, since two members of the design rest on it:
 
 **Not a fifth status term, and not the sufficiency router.** The three route names are a *directive about where to look*, deliberately disjoint from `available | empty | degraded | unconfigured` — a test pins the disjointness. The router DECIDES; it never fetches the record and never walks a tier. `#7970` performs the fetch, and §12.4's router owns the depth decision.
 
-**Verified:** `tests/test_residency_router.py` — 30 tests, with the mutation proofs recorded (collapse the two events · route a down cache as no-evidence · report a partial miss as an absence · drop the coordinate at the reader · mint a route as a status term · report an unassessed marker as `resident` · carry an unvalidated marker on the decision type). Design and boundaries: `docs/epics/2026-10-10-7879-postgres-record/07-residency-router.md`.
+**The router must not** (pinned by `tests/test_residency_router.py`): collapse the two events · route a down cache as no-evidence · report a partial miss as an absence · drop the coordinate at the reader · mint a route as a status term · report an unassessed marker as `resident` · carry an unvalidated marker on the decision type). Design and boundaries: `docs/epics/2026-10-10-7879-postgres-record/07-residency-router.md`.
 
 ### 17.4 A two-store cost model — the existing tables price ONE store
 
@@ -1691,7 +1691,7 @@ multiplier = 1 / (f + (1 + rho) / 778.7)      -> 0.99x at f = 1.00, 4.83x at f =
 
 ### 17.5 A field-level placement table — 9 derived/volatile property names on the sampled surface
 
-**§3's per-write test IS the mechanism** — *"if the journal does not carry it, it is not derived — it is PRIMARY, and belongs in a truth-layer table"* — and §7 moves state values onto entity fields. **The enumeration is a FLOOR:** **216 property names** across the seven labels → **185 PRIMARY · 23 DERIVED/VOLATILE · 8 UNRESOLVED** (measured 2026-10-10, `#7955`; **three classes re-measured — `Object.status` is a projection-owned cache, and `Object.embedding`/`Subject.embedding` are recomputed from the carried `name`, so the pass baseline is 182 · 26 · 8**), **resolved to 187 PRIMARY · 29 DERIVED/VOLATILE · 0 UNRESOLVED** by the placement table, which carries the deciding test, the per-layer grouping, and each row's writer + journal carrier: **`docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md`**.
+**§3's per-write test IS the mechanism** — *"if the journal does not carry it, it is not derived — it is PRIMARY, and belongs in a truth-layer table"* — and §7 moves state values onto entity fields. **The enumeration is a FLOOR:** **216 property names** across the seven labels → **185 PRIMARY · 23 DERIVED/VOLATILE · 8 UNRESOLVED** (measured 2026-10-10, `#7955`; **three classes re-measured — `Object.status` is a projection-owned cache, and `Object.embedding`/`Subject.embedding` are recomputed from the carried `name`, so the baseline before those three reclassifications is 182 · 26 · 8**), **resolved to 187 PRIMARY · 29 DERIVED/VOLATILE · 0 UNRESOLVED** by the placement table, which carries the deciding test, the per-layer grouping, and each row's writer + journal carrier: **`docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md`**.
 
 **Measured 2026-10-08** (10,000 `Point`s; **87 distinct property names** on that sample — itself truncated by FalkorDB's silent 10,000-row cap): **9 of those 87 property names are DERIVED or VOLATILE** and must not be in the system of record — `ep_alpha` (4,604 occurrences) · `ep_beta` (4,604) · `ep_dirty` (4,840) · `ep_dirty_at` (4,838) · `confidence` (1,125) · `posterior_alpha`/`posterior_beta` (848) · `baseline_set` (4,230) · `baseline_source` (4,217) — **29,306 occurrences across the 10,000 sampled points.** **⚠️ `baseline_source` (4,217) is only conditionally derived:** an author-set prior (`baseline_source = 'set-by-author'`) is a non-reconstructible input and belongs in the record — **PRIMARY when `set-by-author`** — so the *unconditionally* derived/volatile set is **8 of the 87**. `baseline_set` (4,230) stays DERIVED, but **only as a mirror once the baseline is journaled**. ⚠️ **State it as *"9 of 87 property names on the sample"*. A percentage is NOT quotable here:** the denominator that would make one meaningful — total property occurrences over all points — was not measured, and an occurrence share taken from a 10,000-row-truncated sample would repeat exactly the denominator error §1 warns about. **The EP scalars among these properties are the cache's, not the record's** — and the ontology already says so (§2: confidence *"is derived at read time … **never stored independently**"*).
 

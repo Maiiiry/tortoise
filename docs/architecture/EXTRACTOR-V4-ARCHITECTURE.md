@@ -88,11 +88,11 @@ Production graph: **~25,000 quota nodes in 3–4 active days** (~27 per emitting
 
 | | the question it answers | effect on volume |
 |---|---|---|
-| **v2** (live) | did we extract it? | baseline |
+| **v2** | did we extract it? | baseline |
 | **v3** | did we extract it **correctly**? (dates, verbatim state values, atomic points, supersession) | ⬆️ **increases it** — E2 preserves more, E3 splits into more |
 | **v4** (this document) | should we have extracted it **at all**? | ⬇️ **reduces it** |
 
-**v3 has no discard, trim or gate anywhere.** It is a fidelity workstream. **v4 is a selection workstream.** ⚠️ **v3 is not absent from the tree: E2's carve-out (`STATE_VALUE_CARVE_OUT`, `#1534`) and E4 (`merge_embed_lists`, `:4845`) are load-bearing, and this document depends on them** (see §15's `§1 v2 → v3 → v4` row).
+**v3 has no discard, trim or gate anywhere.** It is a fidelity workstream. **v4 is a selection workstream.** ⚠️ **v3 is not absent from the tree: E2's carve-out (`STATE_VALUE_CARVE_OUT`, `#1534`) and E4 (`merge_embed_lists`, `:4845`) are load-bearing, and this document depends on them** (see §1, "v2 → v3 → v4").
 
 ⚠️ **v3's E4 rule is load-bearing:** `"S4 merges, not replaces"` — `merge_embed_lists(embed_list, s4)` runs at `extractor_v2.py:4845` and S2 is preserved.
 
@@ -545,7 +545,7 @@ Normalises the shape **and applies the declared field→type mapping** (§3). Pa
 **✅ `DECIDED (narrowed)` — the owner ruled:** the lookup sits **after** extraction, and it is consumed by the salience judgment and by S3 only. **Extraction does not consume it.** This follows from D4's own stated reason — the extraction consumer was never covered by it.
 
 >
-> ✅ **Note — the lookup bug `#4511` does not gate this design.** It bit *when the lookup sat before extraction* (`_fts_rows` read `r.get("kind")` while the callee emits `point_kind`, so every prior's type returned **blank**). **The lookup sits in S3 (§4.2), so the bug is not a dependency of this design.** ⚠️ **Still unmeasured (§14):** whether giving extraction the neighbourhood ever reduced what it created .
+> ✅ **Note — the lookup bug `#4511` does not gate this design.** It bit *when the lookup sat before extraction* (`_fts_rows` read `r.get("kind")` while the callee emits `point_kind`, so every prior's type returned **blank**). **The lookup sits in S3 (§4.2), so the bug is not a dependency of this design.** ⚠️ **Still unmeasured (§14):** whether giving extraction the neighbourhood ever reduced what it created.
 
 ### S2.1 — EXTRACT
 
@@ -794,7 +794,7 @@ S6  COMMIT
 
 **⚠️ The "structural enforcement" argument is narrower than it appears.** `closed_vocab_rejects` **already exists** (the closed vocabulary is enforced), so Jev's `Choice` does not add a new guarantee the pipeline lacks — it removes a class of **malformed / off-vocabulary** emission. And a repo-wide search for `entityCues` returns **no READER** — `#1026` made the slot declarable, but nothing consumes it, so it is not an implemented classifier surface.
 
-**⚠️ And a hard constraint this ordering must respect:** ⚠️ **`#4899`'s Phase-1 mechanical DISCARD has known false positives** — *"a bare `#\d{3,}` in a working note is discardable; **a PR number a decision turned on is not**"* ⚠️ **that quoted `#\d{3,}` is `#4899`'s *proposal*, not the predicate in the tree — the real one is `value_gate._REFERENCE = r"#\d{1,6}(?!\d)"` with a whole-residue test (§15's `§1 mechanism` row). ⚠️ It differs in BOTH directions from the quoted pattern: `#12` and `See #12` ARE discarded, while a 7-digit run is NOT. Do not implement from this quotation** — and **only the lookup or a semantic judgment can tell them apart.** Phase 1 runs before the lookup deliberately, which is why `#4899` **gates it behind a flag, records every discard with its rule id, and requires the counterfactual to be recoverable.** **Any reordering that moves the gate earlier must preserve those three.**
+**⚠️ And a hard constraint this ordering must respect:** ⚠️ **`#4899`'s Phase-1 mechanical DISCARD has known false positives** — *"a bare `#\d{3,}` in a working note is discardable; **a PR number a decision turned on is not**"* ⚠️ **that quoted `#\d{3,}` is `#4899`'s *proposal*, not the predicate in the tree — the real one is `value_gate._REFERENCE = r"#\d{1,6}(?!\d)"` with a whole-residue test (§7's "ENFORCEMENT BY DEFAULT" paragraph). ⚠️ It differs in BOTH directions from the quoted pattern: `#12` and `See #12` ARE discarded, while a 7-digit run is NOT. Do not implement from this quotation** — and **only the lookup or a semantic judgment can tell them apart.** Phase 1 runs before the lookup deliberately, which is why `#4899` **gates it behind a flag, records every discard with its rule id, and requires the counterfactual to be recoverable.** **Any reordering that moves the gate earlier must preserve those three.**
 
 ### 4.3 ⚠️ Gaps the step list does not yet cover
 
@@ -848,7 +848,7 @@ New entities + connections + **metadata**. The metadata includes **lifecycle eve
 
 ### 4.4 Per-step FAILURE POLICY (G3)
 
-**Why this section exists.** The failure policy of every step must be stated: **an unstated default is not a neutral default — for S3 it is the exact defect the step exists to prevent.** This section **declares the policy for every step**, as a **specification to implement, not a description of what runs** (see *State of the shipped code*, below).
+**Why this section exists.** The failure policy of every step must be stated: **an unstated default is not a neutral default — for S3 it is the exact defect the step exists to prevent.** This section **declares the policy for every step**, as a **specification to implement, not a description of what runs** (see the note closing this section, below).
 
 **Three invariants survive every failure.** A step's policy is a specialisation of these, and a policy that violates one is wrong whatever it costs:
 
@@ -966,7 +966,7 @@ Points X, Y, Z   ← the reasons. Carry "why".
 
 ### ✅ The owner's second option is what we already have — and it is the right one
 
-**"the fact attached to the right entity / the entity lifecycle" is the built design, not an alternative:** the fact attaches via `aboutObject`, and the **Object's lifecycle** decides live-ness — with `Object.status` as a **fold over appended lifecycle Events**, so the event stream stays the reconstruction source.
+**"the fact attached to the right entity / the entity lifecycle" is the design, not an alternative:** the fact attaches via `aboutObject`, and the **Object's lifecycle** decides live-ness — with `Object.status` as a **fold over appended lifecycle Events**, so the event stream stays the reconstruction source.
 
 **⚠️ One trap to design around, which follows from §5's model:** a fact that **caused** A's death must **not** die with A. **Blind propagation of staleness down `aboutObject` would kill the reasons along with the thing they killed** — and the reasons are exactly what makes the change auditable. **The rule is: the Object's status propagates to *descriptive* facts about it, never to the *epistemic* operators that judged it.**
 
