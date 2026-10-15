@@ -191,7 +191,7 @@ def test_revision_type_is_subscribable(monkeypatch, sdk_factory, tmp_path):
 
 # ── 3. the feed is semantic ────────────────────────────────────────────────
 
-def test_what_changed_returns_per_claim_deltas(monkeypatch, sdk_factory, tmp_path):
+def test_poll_events_changes_returns_per_claim_deltas(monkeypatch, sdk_factory, tmp_path):
     monkeypatch.setenv("TORTOISE_CHANGE_FEED", "1")
     sdk = sdk_factory(tmp_path)
     try:
