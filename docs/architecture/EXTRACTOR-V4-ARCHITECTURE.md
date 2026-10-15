@@ -1055,7 +1055,7 @@ v3's **E2** requires state-value facts be preserved verbatim (*"personal best 5K
 | **Pack enforcement machinery** — `chains` with `enforcement` levels, `nearMisses`, `subclassOf`, `equivalentTo`, `extraction.sourceTypes` | `packs/*/manifest.yaml`; 20+ files reference each |
 | **The narrative prompt slot** — S1's granularity rule is already injected | `_granularity_text()` |
 | **The mechanical DISCARD** — `value_gate._REFERENCE` is `#\d{1,6}(?!\d)` (1–6 digits, unanchored) and `identifier_only()` is a **whole-residue** test, not an anchored match. ⚠️ **Not** an anchored *three-or-more-digit* pattern — that is `#4899`'s **proposal**, and it differs in **both** directions (`#12` IS discarded; a 7-digit run is **not**). **OFF by default**. **THE GATE SITE IS `S2.2b`, NOT `E7`** (`#4899` DEC-1, 2026-09-25; `value_gate` is called from `tortoise/vet_gate.py`, PR `#5237`), and the predicate is **subordinate to VET** (`_value_gate_enabled()` folds into `vet_enabled`). It covers the *identifier* class only — `the <X>` definite descriptions are left to the arbiter. | `tortoise/value_gate.py` |
-| **The `:Document` NODE label is RETIRED** — a document is a **`:Source`**, `objectKind: document`, and the raw narrative is Postgres text referenced by that `Source` (§9 D1). The graph has no `:Document` node. | `ONTOLOGY.md`; PR `#5127` |
+| **The `:Document` NODE label is RETIRED** — a document is a **`:Source`**, `sourceKind: document` (its genre is the separate `documentKind` axis, §4.4), and the raw narrative is Postgres text referenced by that `Source` (§9 D1). The graph has no `:Document` node. | `ONTOLOGY.md`; PR `#5127` |
 
 ---
 

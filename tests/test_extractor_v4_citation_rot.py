@@ -253,6 +253,13 @@ INBOUND_DANGLING_REFERENCES: dict[Path, dict[str, str]] = {
             "thresholds restored; see extractor doc §16.2"
         ),
         "the binding lesson is cited to extractor §16.2": "binding (extractor doc §16.2)",
+        "the B2.10 gap is cited to the removed §15 issue map": "`§2.3`, `§15`",
+        "the B2.14 finding is cited to the removed §15 issue map": "`§2.4`, `§15`",
+        "the B2.15 finding is cited to the removed §15 issue map": "`§1`, `§15`",
+        "the B2.16 finding is cited to the removed §15 issue map": "`§14`, `§15`",
+        "the D6 supersession is cited to the removed §15 issue map": (
+            "which corrected §15's issue map"
+        ),
     },
     ROOT / "tortoise" / "vet_gate.py": {
         "the A4 correction is cited to extractor §16.2": "the A4 correction §16.2 records",
@@ -492,6 +499,38 @@ def test_the_planted_operator_measurement_is_stated():
         "the planted-operator `0/4` measurement was the only fact a removed "
         "issue-map row carried; it must be restated where the layer fix it "
         "measures is described (§4.4, I3), not silently deleted."
+    )
+
+
+#: The §8 row that records the `:Document` retirement must name the CURRENT
+#: field model, not the retired one its own authority disowns. `ONTOLOGY.md:480`
+#: states that the `:Document` label AND `objectKind: document` are retired; a
+#: document Source's kind axis is `sourceKind: document` and its genre is the
+#: separate `documentKind` axis. The row's whole job is to state what is already
+#: in the code, so a retired field name here is the exact defect it prevents.
+DOCUMENT_LABEL_ROW_ANCHOR = "**The `:Document` NODE label is RETIRED**"
+
+
+def _document_label_row() -> str:
+    text = _doc_text()
+    assert DOCUMENT_LABEL_ROW_ANCHOR in text, (
+        f"{DOCUMENT_LABEL_ROW_ANCHOR!r} not found in {DOC.name}"
+    )
+    start = text.index(DOCUMENT_LABEL_ROW_ANCHOR)
+    return text[start : text.index("\n", start)]
+
+
+def test_the_document_label_row_names_the_current_source_kind():
+    row = _document_label_row()
+    assert "objectKind: document" not in row, (
+        "§8's `:Document` retirement row names `objectKind: document`, which "
+        "`ONTOLOGY.md` marks retired — a document Source is `sourceKind: "
+        "document`, with the genre on the separate `documentKind` axis. Row: "
+        + row
+    )
+    assert "sourceKind: document" in row, (
+        "§8's `:Document` retirement row must state the current field model "
+        "(`sourceKind: document`). Row: " + row
     )
 
 
