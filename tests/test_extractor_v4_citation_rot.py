@@ -676,3 +676,48 @@ def test_the_design_documents_carry_no_issue_state_or_change_narration():
         "and the narrative of what changed, belong in the sibling "
         "`*-CHANGELOG.md` (#8542):\n  - " + "\n  - ".join(offenders)
     )
+
+
+def test_the_class_check_is_neither_dead_nor_noisy():
+    """The instrument's own test — a guard with no fixture is unfalsifiable.
+
+    `test_the_design_documents_carry_no_issue_state_or_change_narration` is green
+    on a corpus that currently yields no hits, so on its own its greenness carries
+    no information at all. That is the failure this file pins elsewhere (#8564: a
+    literal that matches nothing passes vacuously), and it reached this guard by
+    the ordinary route — three rounds of widening, each measured against the
+    documents rather than against a fixture.
+
+    So the check is asserted in BOTH directions here, where it can be read: the
+    shapes it must catch, and the ordinary English it must not.
+    """
+    def flagged(line: str) -> bool:
+        return bool(
+            _delivery_hits(line)
+            or any(rx.search(line) for rx in _STATUS_ADJACENT)
+            or _CHANGE_NARRATION.search(line)
+        )
+
+    must_flag = [
+        "The work is tracked as `#4999` **CLOSED `COMPLETED`** for now.",
+        "`#5007` shipped the span *schema*.",
+        "The migration is LANDED.",
+        "*An earlier draft said* the opposite of this paragraph.",
+        "**CORRECTED 2026-09-24** \u2014 this passage was repaired.",
+        "**Implementation status.** Both halves are now implemented.",
+        "**\u26a0\ufe0f Draft 1** claimed the index is RAM-mandatory.",
+        "\u00a716.2's rule is now also a billing rule (see `#5024` CLOSED).",
+    ]
+    must_not_flag = [
+        "The gate is FAIL-CLOSED at the boundary.",
+        "`goalState` is a CLOSED vocabulary.",
+        "A 384-dim float32 embedding is a fixed-width row.",
+        "The code is closed `[vF, vT]`.",
+        "Supersession does not rewrite an earlier one.",
+        "Everything is done in S6.",
+        "`#4999` records the trace mechanism.",
+    ]
+    for line in must_flag:
+        assert flagged(line), "the class check no longer fires on: %r" % line
+    for line in must_not_flag:
+        assert not flagged(line), "the class check is a false positive on: %r" % line

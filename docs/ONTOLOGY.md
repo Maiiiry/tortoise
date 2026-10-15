@@ -384,7 +384,7 @@ About edges: `aboutSubject`, `aboutObject`, `aboutEvent`, `aboutPoint`, `aboutDo
 
 ## §4. Entity Metadata
 
-> Columns: ISO/PROV/DC = standard alignment; Impl = implemented in current code (✅ = yes, ⚠️ = partial, ❌ = spec-only). Only the live field set is listed — legacy JSONL-only fields are dropped from the ontology.
+> Columns: ISO/PROV/DC = standard alignment. Only the live field set is listed — legacy JSONL-only fields are dropped from the ontology. The per-field **build record** is in `ONTOLOGY-CHANGELOG.md`.
 
 ### §4.1 Point
 

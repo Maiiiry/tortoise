@@ -489,7 +489,7 @@ The **superseded placement recommendation** is a **comment** on `#1509` (*"Decis
 
 **Owner, 2026-09-23:** *"The issue of more nodes costing more index space is not great but we need to have the right granularity for Points to be logical. If we have many arguments mixed together, it's not possible to NAND/IMPL nor modulate relevance."*
 
-**This bounds how far volume reduction may go.** The Epistemic layer's operators (`IMPL`, `NAND`) act on **individual claims** — and the mitigation mechanism is the **`mitigated_by` edge on an operator Point**, graded by `mitigation_strength` (`ONTOLOGY.md` §3.9, `#2315`). ⚠️ *`MITIGATES` is **not** a registered predicate — do not implement it as one. A Point containing several fused claims cannot be argued about:
+**This bounds how far volume reduction may go.** The Epistemic layer's operators (`IMPL`, `NAND`) act on **individual claims** — and the mitigation mechanism is the **`mitigated_by` edge on an operator Point**, graded by `mitigation_strength` (`ONTOLOGY.md` §3.9, `#2315`). ⚠️ **`MITIGATES` is NOT a registered predicate** — do not implement it as one. A Point containing several fused claims cannot be argued about:
 
 - Operators connect only epistemic targets (any of `:Point`/`:Subject`/`:Object`/`:Event`) — you cannot `NAND` a paragraph. The `:Subject`/`:Object` operator endpoints are live (`#7902`); the write path admits all four (`ONTOLOGY.md` §3.1/§5).
 - EP confidence propagates over a **factor graph of atomic claims**; a fused claim gives one confidence number to several distinct beliefs.

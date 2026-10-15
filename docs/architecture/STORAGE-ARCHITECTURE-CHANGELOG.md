@@ -63,7 +63,9 @@ states are as they stood on the move date. The table itself is moved verbatim.
 ## Removed wording, by section (moved from the design document, 2026-10-15, #8542)
 
 Every line this pass removed from the design document, keyed to the section it sat
-in. Emphasis markers are dropped from the recorded wording so the record renders.
+in. Emphasis markers are dropped from the recorded wording so the record renders, and a
+line longer than ~190 characters is shortened with an ellipsis — the moved section
+above is verbatim; this list is an index to it, not a second copy.
 The **substance** each carried — a measurement, a rule, an open question, a
 decision — is stated in the design document's rewritten sentence; what is not
 carried anywhere is the delivery state and the account of the passage's own
