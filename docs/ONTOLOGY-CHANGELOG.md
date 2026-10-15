@@ -29,9 +29,18 @@ doc_status: live
 
 ---
 
-> **Changelog v3.28 (2026-10-15 — issue #3998 — the absent-raw `:Source` state is recorded in §4.6, with conditions read live):**
+> **Changelog v3.28 (2026-10-15 — issues #3998 + #2350 — the absent-raw `:Source` state recorded in §4.6, and per-end validity precision + the 3-state window end):**
 >
 > **A record of a decided rule, not a model change.** `tortoise/projection/entities.py` has written `s.rawState` / `s.rawStateAt` since #3998 (`36d3077fd`) and the §4.6 table had no row for either (measured on `origin/main` `c377fea26`: `rg -c rawState docs/ONTOLOGY.md` → 0). §4.6 now carries the row, and it encodes the owner's ruling of **2026-10-14 (Option A, stated on #3998)**: a **deletion is an act**, recorded durably as a marker **bounded by an expiry policy**; **`offline` / `access_revoked` are conditions, observed live, never stored**; and the marker carries the expiry policy. The row states the **read-time observation contract** (`raw_state.resolve_raw_availability`) and the precedence it enforces — a recorded act wins over any observation, so a probe can never un-delete a memory — so the next lane reads the placement axis and the contract instead of re-deriving them. This closes the S7 residual recorded as **#8474**.
+>
+> **An additive field layer on §4.7's window pair — no existing window is re-stamped and no
+> parallel validity field is minted.** `validFromPrecision` / `validToPrecision` declare how
+> precisely each end is known (`year` | `month` | `day`), and the end-only marker
+> `validToPrecision = 'unknown'` closes a window whose end cannot be dated — the **3-state end**
+> (`open` / `closed-at-known-date` / `closed-unknown`). A legacy bare-ISO window reads as `day`
+> with no migration. The vocabulary, the ONE validator, and the shared read projection live in
+> `tortoise/validity.py`; the marker is surfaced on the search/recall, assembly and
+> `get_historical_knowledge` replies (§4.7, "Per-end precision and the 3-state end").
 >
 > **Changelog v3.27 (2026-10-14 — issue #7818 — the §4.7 coverage boundary, stated and left OPEN):**
 >
