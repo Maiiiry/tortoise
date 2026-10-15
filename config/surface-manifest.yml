@@ -2057,7 +2057,7 @@ rows:
   class: agent-reachable
   cluster_canonical: null
 - name: tortoise_events_poll
-  served_from: tortoise/mcp_server.py:7cfbbd4f9c98dc75
+  served_from: tortoise/mcp_server.py:29e2a7af30242b7f
   served_attributes: 324350c5a3a0d9bf
   family: sessions
   family_rank: 4
@@ -2069,8 +2069,10 @@ rows:
   cluster: null
   canonical: null
   job: 'Poll graph/claim events after an opaque cursor (at-least-once). Returns {events, next_cursor}. Event types:
-    11 registered claim types (PointAdded, OperatorAdded, PointRetracted, PointSuperseded, OperatorAnnotated, PointPromoted,
-    OperatorPromoted, DedupeRecorded, DedupeRejected, ObjectSuperseded, PointInvalidated).'
+    12 registered claim types (PointAdded, OperatorAdded, PointRetracted, PointSuperseded, OperatorAnnotated, PointPromoted,
+    OperatorPromoted, DedupeRecorded, DedupeRejected, ObjectSuperseded, PointInvalidated, PointRevised). PointRevised
+    reaches the store, and the response adds `changes` (per-claim before→after deltas), only while TORTOISE_CHANGE_FEED
+    is enabled.'
   dependency: declares TortoiseSDK.poll_events (resolves)
   lifecycle: active
   used_by: never called, tooling, docs

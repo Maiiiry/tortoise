@@ -264,7 +264,7 @@ not recorded here has no approval behind it, and the carve-out does not cover it
 | `tortoise_graph_set_recording` | Set or clear a graph's session-recording override (#2302) — the MCP twin of PATCH /v1/graphs/{graph_id} (recording), sharing the same hosted_api core so the surfaces never drift… | handler-served | agents, tooling, docs | **keep** | in use — called by agents |
 | `tortoise_list_graphs` | List all graph names in the database. Useful for namespace discovery. | list_graphs | agents, tooling, docs | **keep** | in use — called by agents |
 | `tortoise_list_namespaces` | List installed pack namespaces. | list_namespaces | agents, tooling, docs | **keep** | in use — called by agents |
-| `tortoise_events_poll` | Poll graph/claim events after an opaque cursor (at-least-once). Returns {events, next_cursor}. Event types: 11 registered claim types (PointAdded, OperatorAdded, PointRetracted,… | poll_events | never called, tooling, docs | **keep** | never called — not called over MCP, but used by tooling — removing it would break that |
+| `tortoise_events_poll` | Poll graph/claim events after an opaque cursor (at-least-once). Returns {events, next_cursor}. Event types: 12 registered claim types (PointAdded, OperatorAdded, PointRetracted,… | poll_events | never called, tooling, docs | **keep** | never called — not called over MCP, but used by tooling — removing it would break that |
 | `tortoise_session_context` | Return 'what happened last session' — diary entries, recent Points, Events, confidence changes. | session_context | agents, tooling, docs | **keep** | in use — called by agents |
 
 ### admin — 4

@@ -156,18 +156,37 @@ def test_revision_type_is_nameable_even_when_off(monkeypatch, sdk_factory, tmp_p
         sdk.close()
 
 
-def test_revision_type_is_subscribable():
-    """The OTHER read-side validator: `create_subscription` gates on the same
-    registry (`webhook_delivery._validated_types`), so a revisions subscription
-    must be legal — an unfiltered subscription already delivers these rows."""
-    from tortoise.webhook_delivery import _validated_types
+def test_revision_type_is_subscribable(monkeypatch, sdk_factory, tmp_path):
+    """The OTHER read-side validator, driven through the REAL call the review
+    measured: `create_subscription` gates on the same registry
+    (`webhook_delivery._validated_types`), so a revisions subscription must be
+    legal — an unfiltered subscription already delivers these rows."""
+    pytest.importorskip("cryptography")
+    from cryptography.fernet import Fernet
 
-    assert _validated_types(["PointRevised"]) == ["PointRevised"]
-    assert _validated_types(["PointAdded", "PointRevised"]) == [
+    from tortoise import webhook_delivery as wd
+
+    # the validator itself: registered vs unknown
+    assert wd._validated_types(["PointRevised"]) == ["PointRevised"]
+    assert wd._validated_types(["PointAdded", "PointRevised"]) == [
         "PointAdded", "PointRevised",
     ]
     with pytest.raises(ValueError, match="unknown event type"):
-        _validated_types(["NotAType"])
+        wd._validated_types(["NotAType"])
+
+    monkeypatch.setenv("TORTOISE_SECRET_PEPPER", "test-static-pepper")
+    monkeypatch.setenv("TORTOISE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    sdk = sdk_factory(tmp_path)
+    try:
+        sub = wd.create_subscription(
+            sdk._get_proj(),
+            url="https://hooks.example.com/revisions",
+            types=["PointRevised"],
+        )
+        assert sub["types"] == ["PointRevised"]
+        assert sub["secret"].startswith("whsec_")
+    finally:
+        sdk.close()
 
 
 # ── 3. the feed is semantic ────────────────────────────────────────────────
