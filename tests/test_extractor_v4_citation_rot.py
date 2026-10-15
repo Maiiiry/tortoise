@@ -221,13 +221,13 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
 LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     (
         STORAGE,
-        "STORAGE records the vector-trace mechanism as landed",
-        "the trace now records the mechanism (`index` / `scan` / `scan_fallback`)",
+        "STORAGE records the vector-trace mechanism",
+        "The trace records the mechanism (`index` / `scan` / `scan_fallback`)",
     ),
     (
         STORAGE,
         "STORAGE homes the embeddings ruling on the open V1 decision",
-        "the open **V1/§12.1c** decision (measured and filed as `#4997`, now CLOSED `COMPLETED`)",
+        "the open **V1/§12.1c** decision (`#4997`)",
     ),
     (
         ONTOLOGY,
@@ -241,8 +241,8 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     ),
     (
         STORAGE,
-        "STORAGE separates the closed `#4997` measurement from the still-live defect",
-        "the measurement half is CLOSED `COMPLETED`; the unindexed-embeddings defect it measured is still LIVE",
+        "STORAGE separates the `#4997` measurement from the still-live defect",
+        "the unindexed-embeddings defect is LIVE, and its home is the V1/§12.1c decision",
     ),
     (
         STORAGE,
@@ -311,8 +311,8 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     ),
     (
         STORAGE,
-        "STORAGE states the `#5422` ownership gap as closed",
-        "`#5422` (its ownership gap) is CLOSED `COMPLETED`",
+        "STORAGE states the `#5422` ownership gap",
+        "its ownership gap is `#5422`; acceptance **A2 of `#5038`** is what remains outstanding",
     ),
 )
 
@@ -325,8 +325,8 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
 #: it can only re-stale.
 LANDED_STATEMENTS: dict[str, str] = {
     "§S0 states the D10 code half as landed": "D10 is LANDED — both halves.",
-    "§D's provenance row records the retirement": (
-        "✅ **NOW TRUE** — the `:Document` NODE label is **retired**"
+    "§D's D10 row states the label retirement": (
+        "PR `#5127` retired the `:Document` NODE label"
     ),
     "§S0's Q3 row says `doc_status` is retired": (
         "RETIRED** (`tortoise/api.py:458`)"
@@ -547,29 +547,41 @@ _STATUS_ADJACENT = re.compile(
 _CHANGE_NARRATION = re.compile(r"an earlier (?:draft|version)|CORRECTED 20[0-9]{2}-", re.IGNORECASE)
 
 
-def test_the_model_reference_carries_no_issue_state_or_change_narration():
-    """`ONTOLOGY.md` states the model. Status and change history live elsewhere.
+#: The documents that STATE A DESIGN — as opposed to the three changelogs, which
+#: keep the record of how each got there. The same class of pollution reached all
+#: three: `ONTOLOGY.md` carried a 730-line changelog (37% of the file) plus a
+#: per-field `Impl` column; the two architecture documents carried issue-state
+#: assertions, `CORRECTED 20xx-xx-xx` stamps and *"an earlier draft said X"*
+#: narration. Each header already declared the opposite of what the body did.
+DESIGN_DOCS: tuple[Path, ...] = (ONTOLOGY, DOC, STORAGE)
 
-    The document carried the opposite of its own header: a 730-line changelog
-    (37% of the file, all 31 entries appended by `feat`/`fix`/`refactor`/`test`
-    commits), a per-field `Impl` column across five §4 tables, and issue-state
-    assertions in the body — while the header told the reader to consult that
-    apparatus for status. All of it moved to `ONTOLOGY-CHANGELOG.md` (#8542).
+
+def test_the_design_documents_carry_no_issue_state_or_change_narration():
+    """A design document states the design. Status and change history do not.
+
+    The three design documents each carried the opposite of their own header:
+    `ONTOLOGY.md` a 730-line changelog (37% of the file, all 31 entries appended
+    by `feat`/`fix`/`refactor`/`test` commits) and a per-field `Impl` column
+    across five §4 tables; `EXTRACTOR-V4-ARCHITECTURE.md` and
+    `STORAGE-ARCHITECTURE.md` issue-state assertions (`#4999` is CLOSED
+    `COMPLETED`), `CORRECTED 20xx-xx-xx` stamps, and *"an earlier draft said
+    X"* narration. All of it moved to the sibling `*-CHANGELOG.md` (#8542).
 
     This pins the CLASS rather than the strings, so the next lane cannot
     reintroduce it by appending one status claim — which is how the changelog
     accumulated in the first place. A literal pin cannot catch that: it only
-    knows the violations it was written against.
+    knows the violations it was written against, and a literal that matches
+    nothing passes vacuously (#8564).
     """
-    text = ONTOLOGY.read_text(encoding="utf-8")
     offenders = []
-    for number, line in enumerate(text.splitlines(), 1):
-        if _STATUS_ADJACENT.search(line):
-            offenders.append(f"{ONTOLOGY.name}:{number}: issue-state claim: {line.strip()[:160]}")
-        if _CHANGE_NARRATION.search(line):
-            offenders.append(f"{ONTOLOGY.name}:{number}: change narration: {line.strip()[:160]}")
+    for path in DESIGN_DOCS:
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if _STATUS_ADJACENT.search(line):
+                offenders.append(f"{path.name}:{number}: issue-state claim: {line.strip()[:160]}")
+            if _CHANGE_NARRATION.search(line):
+                offenders.append(f"{path.name}:{number}: change narration: {line.strip()[:160]}")
     assert not offenders, (
-        "ONTOLOGY.md is the model reference and must state the model. An issue's "
-        "open/closed state, and the narrative of what changed, belong in "
-        "`ONTOLOGY-CHANGELOG.md` (#8542):\n  - " + "\n  - ".join(offenders)
+        "a design document must state the design. An issue's open/closed state, "
+        "and the narrative of what changed, belong in the sibling "
+        "`*-CHANGELOG.md` (#8542):\n  - " + "\n  - ".join(offenders)
     )

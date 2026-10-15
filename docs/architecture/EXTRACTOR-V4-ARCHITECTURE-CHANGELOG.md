@@ -1,0 +1,108 @@
+---
+title: "Extractor v4 — Architecture Changelog"
+type: engineering
+domain: platform
+doc_status: live
+---
+
+# Extractor v4 — Architecture Changelog
+
+> **What this is.** The record of *how the extractor design got where it is* —
+> the decision-protocol runs, the review cycles and what they found, and the
+> corrections applied to the document. It is process and change history.
+>
+> **What `EXTRACTOR-V4-ARCHITECTURE.md` is.** The design. It states the target
+> architecture and the decisions that fix it; it does not narrate the process
+> that produced them or keep a running status of the work.
+>
+> **Moved out of the design document on 2026-10-15** (issue #8542). The material
+> is moved verbatim; nothing is deleted. The design document keeps a pointer at
+> §16 so its numbering — and the cross-references into §16.3/§16.4 — still
+> resolve.
+
+**The decisions themselves stay in the design document** (§16.3, §16.4). Only
+the record of *running the protocol* and *what each review cycle did* is here.
+
+---
+
+## 16. Decision protocol run (AGENTS.md, 2026-09-23)
+
+Each open decision was run through the mandated sequence: **contradiction test first → research (does it actually need a human?) → the required artifact.**
+
+| decision | contradiction test | needs the owner? | artifact / action |
+|---|---|---|---|
+| **Keep contention + EP confidence** (ruled Option 1) | **No contradiction** — it *is* the recorded decision (`ONTOLOGY.md` §3.1). The field converges **against** it. | ruled | ✅ **`OVERRIDES:` posted on `#2730`** — the field's default is resolve/erase; we hold in tension |
+| **Granularity** | The **merge-ban** was withdrawn (O4, §16.3); **the fuse prohibition was re-affirmed** by the same owner comment. ⚠️ **GraphRAG's consolidation STILL contradicts that position** — §9 REFUSES it (*"Directly destructive of the epistemic layer"*), and §16.4 authorises `MERGE` only *"when nothing distinguishing is lost"* and **never across a negation or a condition**, which is exactly what *"resolve the contradictions and provide a single, coherent summary"* does. | **merge-ban withdrawn**; **fuse re-affirmed** | ⛔ **The `OVERRIDES:` on `#4899` is WITHDRAWN** (comment `2026-09-24T04:33:23Z`); **near-duplicate `MERGE` is authorised** (bounded by §16.4, arbitrated by Jev) — and **`FUSE` REMAINS FORBIDDEN**: the admissible set is `KEEP` / `NOOP` / `DISCARD` / `MERGE` |
+| **D6: LLM proposes to-graph connections** | **Contradiction** — Hindsight's mechanical cross-batch contradicts D6, so **not adoptable**. Route = reopen. | **still open** | reopen in front of the owner (§13.8). **No `OVERRIDES:`** — LLM edge extraction *is* the field default, so D6 is not against the grain |
+| **`aboutObject`: stored edge vs derived join** | No contradiction — no decision mandates materialization | **no** | ✅ **MEASURED + RULED: KEEP the stored edge.** The primary search path **does not** read it, but **four CUSTOMER-CALLABLE sites do** (`belief_timeline`, `topic_summarize`, `recall_subgraph`, `search(order_by="graph")` — §13.8 question 2) plus two default-ON ingestion sites → deriving would silently break four public surfaces. **Owner 2026-09-23: the remaining unknown — *are those tools ever called?* — is unanswerable pre-launch, so the question is DEFERRED, not decided.** Keep for now; optimise with users. |
+| **Fan-out caps** | No contradiction; the field converges (Hindsight caps at **200** *and* carries a timeout that drops the whole arm); ⚠️ **the bound is explicit rather than implicit** | **no** | ✅ **ADOPTED at 200** (owner, 2026-09-23: *"fine on adding the cap"*). **Above our current worst hub (123), so it binds nothing today and cannot lose data now** — a guard rail against runaway fan-out, **not** an optimisation. Refine with real usage. See `STORAGE-ARCHITECTURE.md` §11.5. |
+| **Keep the epistemic + entity connection layer** | No contradiction — it *is* the product. The field's cost-driven default (Hindsight derives instead of storing) points the other way. | ruled | ✅ **KEPT — owner, 2026-09-23.** Cheap because edges are **property-free** and Postgres holds them **on disk** (~3 MB ≈ $0.0004/mo). **`OVERRIDES:` posted on `#4333`** — never cut this layer to save money. See `STORAGE-ARCHITECTURE.md` §11. |
+| **D3: raw vs narrative** | No contradiction (D3 is provisional) | **no** | ✅ The owner already approved the measurement. **The measurement decides** — not a gate |
+
+**Deliberately NOT marked:** our class-based `Source` deviates from PROV (§9.2 of the storage doc), but modelling a source/document as a node is **not** against the industry default — GraphRAG, Graphiti and Hindsight all anchor to a document node. Deviation noted; **no `OVERRIDES:`** because it is not a departure from practice.
+
+**⚠️ The "decision ledger" does not exist in this repo.** `docs/plans/2026-09-22-2814-rebuild-config-durability.md:316` records it: *"the 'decision ledger' earlier drafts named does not exist in this repo (`rg -il 'decision ledger'` matches only this plan)"*. **The `OVERRIDES:` comment on the issue is the marker's only home** — do not cite a ledger that isn't there.
+
+### 16.1 The review cycle — outcome recorded (2026-09-23)
+
+**Two fresh-context reviewers per document, complementary lenses; full consolidation in `REVIEW-CONSOLIDATED-2026-09-23.md` (that review's own summary: 6 P0 · 34 P1 · 18 P2).** This section records **what was done with each category**, so a later lane can tell a correction from an omission.
+
+| category | count | disposition |
+|---|---|---|
+| **P0 — a false load-bearing claim, or two documents that contradict each other** | **6** | **All 6 corrected in place — A4 only after §16.2 caught it** (A1 vector-index model · A2 truth/derived test · A3 `#2453` landed · A4 VET/S3 circular dependency — `MERGE-INTO-EXISTING` removed from VET's outputs, restoring S3 as the sole authority · A5 the 10× cannot reproduce itself · A6 *"an Object is a name"*). **The corrections are marked in place — most with `⚠️ CORRECTED`, some with the error named directly in the row (A1 *"REWRITTEN TWICE"*, A3 *"THIS ROW WAS WRONG"*, A6 *"DO NOT WRITE"*).** |
+| **P1 — code-evidence, citation, or arithmetic defects** | **34** | **All corrected.** Arithmetic recomputed (B1.1 §1, B1.2/B1.3/B1.5/B1.19, §5's table); citations fixed or the claim deleted (B1.16 `#1509 §9`/`E2`, B1.18 `MITIGATES`, B2.9 `llm_tail`, B2.18 `#3011`); **B2.1's constraint 4 kept visible with the evidence that falsifies it**, so it cannot be re-derived. |
+| **P2 — completeness gaps** | **18** | **Recorded, not silently dropped** — this document's §4.3 (G1–G5) + `STORAGE-ARCHITECTURE.md` §5.1/§14/§15. |
+| **Genuinely a decision, not a correction** | **6** | ⛔ **Escalated to the owner — §16.3. These are NOT applied and NOT decided.** |
+
+**⚠️ The rule applied throughout, and it is the one that matters:** where a claim about **process** had no artifact to check it against, it was **DELETED rather than reworded** (the `#3011` thresholds, *"carries most of the retrieval value"*, the `#2453` reading). **Rewording a self-referential claim just generates the next review round; deleting it ends the question.**
+
+### 16.2 ⛔⛔ THE SECOND REVIEW CYCLE FOUND THAT THE *FIRST REVIEW* WAS WRONG — and this is the most important lesson in this document
+
+**Cycle 2 (2026-09-24, four fresh-context reviewers + two gap analysts) checked the *corrections*, not the original text. Five of them were false. Three trace to the same source: `REVIEW-CONSOLIDATED-2026-09-23.md` — the cycle-1 review itself — whose findings were applied verbatim without re-verification.**
+
+| what the doc now said | what the primary source says | where the falsehood came from |
+|---|---|---|
+| *"`#3011`'s thresholds were embellished 3 of 3; REMOVED"* | the frozen doc **carries all three** (`H1 ≥15`, `H2 ≥10`, `H3 −5`) | **cycle-1 B2.18** — conflated *"also in H4 / also in the falsifiers"* with *"not in H1/H3"* |
+| *"the lookup does not need kinds → constraint 4 evaporates"* | `_find_existing_entity` **uses `kind` as its exact-match key** | **cycle-1 B2.1** — read the query builder and called it the lookup |
+| *"there is no `:Document` node and none is created"* | ✅ **NOW TRUE** — the `:Document` NODE label is **retired** (PR `#5127`, D10); the **`documents` cap** counts document-bearing `:Source` nodes (the node cap does not) | not from cycle 1 — a **lane inference** from "D30 puts raw outside the graph" |
+| *"All 6 P0s corrected in place"* | **at the time, A4 was NOT corrected** — `MERGE-INTO-EXISTING` was still in VET's outputs, so the VET/S3 circularity stood | **cycle-1 A4's disposition was claimed, not verified** · **✅ NOW FIXED** — `MERGE-INTO-EXISTING` is removed from VET's outputs (§S2.2) and §16.1 is corrected |
+| *"the narrowing is PROPOSED… ✅ Recorded as such in §9 (D4)"* | §9 D4 says **`DECIDED (narrowed)`** | **cycle-1 B2.20** — the "fix" replaced one two-ways status with another · **✅ NOW FIXED** — the ⚠️ pending line is deleted and §S3 states `DECIDED (narrowed)` |
+
+**⇒ THE MECHANISM, STATED PLAINLY: a review finding is a CLAIM, not a fact.** Applying one is a **change to the artifact**, and it must be verified against the same primary source the finding cites — **otherwise the review becomes a propagation vector for its own errors**, and the `⚠️ CORRECTED` marker makes the wrong text *more* credible than the right text it replaced. **That is exactly what happened here: the doc's markers became evidence for the wrong reading.**
+
+**⇒ THE RULES THIS PRODUCES, and they are binding on future cycles:**
+
+1. **Verify a finding against its cited primary source before applying it.** A line range, a frozen doc, a `gh` output — **open it.**
+2. **A `⚠️ CORRECTED` marker is not evidence.** It says the text was *changed*, not that the change was *right*.
+3. **Correct the review record too.** `REVIEW-CONSOLIDATED-2026-09-23.md` B2.1 and B2.18 are **themselves wrong** and are the propagation vector; a corrected artifact with an uncorrected review leaves the next lane free to re-apply the error.
+4. **"Also present elsewhere" is not "absent here".** Two of these five are that single misreading.
+
+**⚠️ And the honest counter-note, so this does not become an argument against reviewing:** cycle 2 also found the things cycle 1 got **right** and this document now depends on — the `#4997` index drift, the four-layer placement, the four dedup keys, the `c/r` ordering rule and the sequence of the ten `!`-corrections that hold. **The failure was not review; it was unverified application.**
+
+---
+
+## Copy pass — status and change narration removed from `EXTRACTOR-V4-ARCHITECTURE.md` (2026-10-15, #8542)
+
+The design document stated, in places, *how it had changed* rather than what the
+design is — an issue's open/closed state, a figure an earlier draft carried, a
+claim that had been withdrawn, a review cycle's finding. None of that belongs in
+a document that states the target architecture: it is change history, and it
+re-stales. Each entry records the removed wording; the **substance** it carried
+(a measurement, a rule, a trap) is stated in `EXTRACTOR-V4-ARCHITECTURE.md`.
+
+- §16.4 — O2 row *"WITHDRAWN — the owner rejected the framing"* and *"An earlier version of this cell claimed §4.2’s objective was re-stated accordingly"*.
+- §16.5 — *"an earlier draft cited `:4838`, which is `try:`"*. The correct line and the trap are kept.
+- §2 — *"The destination was CORRECTED 2026-10-09 … This document previously said 'Supabase storage', which is the same overload"*. The meaning rule and the misreading warning are kept.
+- §2 — *"destination corrected 2026-10-09"*.
+- §2 — *"not the '~1,000×' an earlier draft stated — that number was unsourced"*. The scope of 580× is kept.
+- §3 — *"An earlier draft of this section flagged the sentence … as colliding with it and OPEN"*. Now states the collision.
+- §3 — *"destination corrected 2026-10-09"*.
+- §3 — heading suffix *"— corrected 2026-09-23"*.
+- §4 — *"An earlier draft of this line said the decision required partitioning and that lever 1's 'pure win' claim depended on it — both wrong"*. The correct attribution is kept.
+- §4 — *"CORRECTED 2026-09-24 (owner): a document is a SOURCE, not a graph node."*
+- §4.1 — *"An earlier version of this line said 'seven' and omitted S2.3 — §4.0 and §4.1 say eight."*
+- §4.2 — *"An earlier version of this line said the narrowing was still proposed and awaiting confirmation … §16.2 records that this two-ways status was itself a defect."*
+- §4.2 — *"An earlier version of this line said the opposite; it was wrong."*
+- §4.2 — *"An earlier version of this marker said S4 could be bypassed only by leaving the v2 pipeline entirely. That was an over-claim."* The correction is kept as a rule.
+- §4.2 — *"An earlier version of this marker said `S2.3` had no code counterpart because the string `S2.3` is absent … An earlier version of this marker claimed `S3` and `S5` were absent from the code as well; that was wrong."* The absence/presence facts are kept.
+- §4.2 — *"Superseded and deleted (reviewer B2.20, then §16.2). This line used to say … a two-ways status the second review cycle flagged."*
