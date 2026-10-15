@@ -24851,9 +24851,18 @@ class TortoiseSDK:
         # a cross-name sha-digest collision (would otherwise fail-closed on a
         # genuinely new registration). A row = canonical re-mention (MERGE by
         # name, ON MATCH — the #1350 clobber guard keeps status; journaling
-        # again would double-register). No row = fresh create OR #1155 stub
-        # adoption (name-stub under a random ulid — the canonical
-        # registration is genuinely new) → journal after apply. Probe failure
+        # again would double-register). The #7936 `_stub` conjunct restates
+        # the precondition honestly: since the event name-stub now carries the
+        # canonical id (#7936), id+name alone can no longer distinguish a
+        # registered node from an unregistered stub — every name-stub would
+        # HIT and the registration would silently stop being journaled.
+        # `_event_plain_merge` marks its stubs `_stub=true` ON CREATE and
+        # `_upsert_object`/`_upsert_subject` REMOVE it (SET NULL) on adoption,
+        # so the probe counts ONLY nodes whose canonical registration was
+        # journaled. No row = fresh create OR #1155/#7936 stub adoption (a
+        # marked name-stub, or a pre-#7936 random-ulid stub the id conjunct
+        # already misses — either way the canonical registration is genuinely
+        # new) → journal after apply. Probe failure
         # → warning + fail-open-to-journal (a duplicate line is replay-safe;
         # a skip would silently re-open the node-loss bug). Accepted
         # divergences (only-on-create mandate): re-mention prop mutations and
@@ -24878,7 +24887,8 @@ class TortoiseSDK:
                 and event.get("name") and event.get("type") == "ObjectRegistered"):
             try:
                 _journal_object_registration = not proj.g.query(
-                    "MATCH (o:Object {id:$cid, name:$name}) RETURN o.id",
+                    "MATCH (o:Object {id:$cid, name:$name}) "
+                    "WHERE coalesce(o._stub, false) = false RETURN o.id",
                     params={"cid": id_val, "name": event["name"]},
                 ).result_set
             except Exception:
@@ -24908,7 +24918,8 @@ class TortoiseSDK:
                 and event.get("name") and event.get("type") == "SubjectAdded"):
             try:
                 _journal_subject_registration = not proj.g.query(
-                    "MATCH (s:Subject {id:$cid, name:$name}) RETURN s.id",
+                    "MATCH (s:Subject {id:$cid, name:$name}) "
+                    "WHERE coalesce(s._stub, false) = false RETURN s.id",
                     params={"cid": id_val, "name": event["name"]},
                 ).result_set
             except Exception:

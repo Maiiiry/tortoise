@@ -1125,6 +1125,11 @@ class _EntityHandlers:
     # Keys explicitly handled by each _upsert_* method.
     _SUBJECT_HANDLED: frozenset = frozenset({
         "id", "name", "subject_kind", "subjectKind", "createdAt", "embedding",
+        # #7936: the event-stub discriminator is projection-owned — an
+        # EventRecorded replay must NOT persist a caller-forged `_stub` via
+        # _persist_extra_props (it would then be read back by the
+        # first-registration probe). Mirrors the Object set below.
+        "_stub",
         "status",  # #1423: status is projection-owned — a SubjectAdded replay
         # must NOT rewrite it via _persist_extra_props (the clobber guard ported
         # from #1350's Object clause: a re-mention of a superseded team/role/
@@ -1132,6 +1137,10 @@ class _EntityHandlers:
     })
     _OBJECT_HANDLED: frozenset = frozenset({
         "id", "name", "object_kind", "objectKind", "createdAt", "title",
+        # #7936: the event-stub discriminator (see _SUBJECT_HANDLED): kept out
+        # of the extra-props persistence lane so a caller prop can never seed
+        # the first-registration probe's exclusion.
+        "_stub",
         "embedding", "status",  # #1350: status is projection-owned — an
         # ObjectRegistered replay must NOT rewrite it via _persist_extra_props
         # (the clobber guard: superseded stays superseded on re-mention).
@@ -3563,6 +3572,13 @@ class _EntityHandlers:
             "            s.status=coalesce($st, 'live'), "
             "            " + _set_emb + " "
             "ON MATCH SET s.id=coalesce($id, s.id), "
+            # #7936: adoption CLEARS the event-stub discriminator the
+            # first-registration probe excludes. `SET ... = NULL` REMOVES the
+            # property (not `false`), so an adopted live node's property set
+            # stays byte-identical to the one replay's ON CREATE builds (which
+            # never writes `_stub`). A legacy random-ulid stub carries no
+            # `_stub`, so this is a no-op there.
+            "            s._stub=NULL, "
             "            s.subjectKind=coalesce($sk, s.subjectKind), "
             # #2295: ON MATCH createdAt ADOPTS only when absent
             # (coalesce(s.createdAt, $ca) — existing value wins): mirrors the
@@ -3641,6 +3657,9 @@ class _EntityHandlers:
             "            o.status=coalesce($st, 'live'), "
             "            " + _set_emb + " "
             "ON MATCH SET o.id=coalesce($id, o.id), "
+            # #7936: adoption CLEARS the event-stub discriminator the
+            # first-registration probe excludes (see _upsert_subject).
+            "            o._stub=NULL, "
             "            o.objectKind=coalesce($ok, o.objectKind), "
             "            o.createdAt=coalesce(o.createdAt, $ca), "
             "            o.title=coalesce($title, o.title), "
@@ -4274,7 +4293,7 @@ class _EntityHandlers:
             stub_id = _entity_name_id("Subject", subj)
             self.g.query(
                 "MERGE (s:Subject {name:$name}) "
-                "ON CREATE SET s.id=$id, s.subjectKind='other'",
+                "ON CREATE SET s.id=$id, s.subjectKind='other', s._stub=true",
                 params={"name": subj, "id": stub_id},
             )
             self.g.query(
@@ -4325,6 +4344,11 @@ class _EntityHandlers:
             # random ulid — a random stub id moved on every replay, so the
             # graph was not a pure function of the journal.
             stub_id = _entity_name_id("Object", obj)
+            # #7936: `_stub=true` is the discriminator the first-registration
+            # probe (sdk._create_entity) excludes — a marked stub is NOT a
+            # registered node, so a later `create_entity` for this name still
+            # journals its ObjectRegistered. Cleared on adoption by
+            # `_upsert_object`'s ON MATCH.
             # #1155-P1: id is written ON CREATE ONLY, and THIS is the clause the
             # ruling protects. A poll/webhook event may arrive before the
             # entity path's ObjectRegistered; if this MERGE also wrote id on
@@ -4337,7 +4361,7 @@ class _EntityHandlers:
             # foreign/connector canonical id.
             self.g.query(
                 "MERGE (o:Object {name:$name}) "
-                "ON CREATE SET o.id=$id, o.objectKind='other'",
+                "ON CREATE SET o.id=$id, o.objectKind='other', o._stub=true",
                 params={"name": obj, "id": stub_id},
             )
             self.g.query(
@@ -4424,9 +4448,13 @@ class _EntityHandlers:
                     # #7936: deterministic canonical id, as for the subject and
                     # `object` stubs above — never a random ulid.
                     stub_id = _entity_name_id("Object", use_name)
+                    # #7936: mark the `uses[]` stub with the same discriminator
+                    # as the subject/object stubs — it too can precede a
+                    # canonical `ObjectRegistered` for the name, and the probe
+                    # must still journal that registration.
                     self.g.query(
                         "MERGE (o:Object {name:$name}) "
-                        "ON CREATE SET o.id=$id, o.objectKind=$kind "
+                        "ON CREATE SET o.id=$id, o.objectKind=$kind, o._stub=true "
                         "ON MATCH SET o.objectKind=$kind",
                         params={"name": use_name, "kind": use_kind, "id": stub_id},
                     )

@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 from tortoise.consistency import _graph_entities
+from tortoise.log import EventLog
 from tortoise.sdk import TortoiseSDK, _entity_name_id
 
 #: A journal whose ONLY record is the event — no `ObjectRegistered` /
@@ -224,3 +225,129 @@ def test_a_late_subject_stub_does_not_clobber_a_foreign_id(tmp_path: Path):
         assert ids[("Subject", "stub-subject")] == foreign, ids
     finally:
         sdk.close()
+
+
+# ── P1 regression: the canonical-id stub must NOT defeat the probe ──────────
+#
+# `TortoiseSDK._create_entity` (`sdk.py`) decides whether to journal the FIRST
+# canonical registration (`ObjectRegistered` / `SubjectAdded`) by asking whether
+# a node with the canonical `(id, name)` already exists. Before #7936 the event
+# name-stub carried a RANDOM ulid, so that probe always MISSED on a stub and the
+# registration was journaled. Once the stub carries the canonical id (#7936)
+# the probe HITS and, without a discriminator, the registration stops being
+# journaled — silently disabling the durability half of #2194/#2295 (live built
+# from a journal that lacks the registration → node loss on rebuild, and a
+# live != replay drift the presence/status comparison cannot see).
+#
+# `_event_plain_merge` marks its stubs `_stub=true` ON CREATE; the probe excludes
+# marked stubs; `_upsert_object`/`_upsert_subject` clear the mark on adoption.
+# These guards are RED before that discriminator exists.
+
+_EVENT_RECORD = {
+    "type": "EventRecorded",
+    "id": "evt-7936-probe",
+    "eventId": "evt-7936-probe",
+    "name": "probe event",
+    "eventKind": "test",
+    "object": "probe-object",
+    "subject": "probe-subject",
+    "startedAt": "2026-01-01T00:00:00Z",
+}
+
+
+def _node_props(sdk: TortoiseSDK, label: str, name: str) -> dict:
+    """Every persisted property of ``(label, name)`` except the embedding."""
+    rows = sdk._get_proj().g.query(
+        f"MATCH (n:{label} {{name:$name}}) RETURN properties(n)",
+        params={"name": name},
+    ).result_set
+    assert rows, f"{label} {name!r} is absent from the graph"
+    return {k: v for k, v in rows[0][0].items() if k != "embedding"}
+
+
+def _regs(events: Path, event_type: str, name: str) -> list:
+    return [e for e in EventLog(str(events / "events.jsonl")).read_all()
+            if e.get("type") == event_type and e.get("name") == name]
+
+
+class TestStubAdoptionDurability:
+    """#7936 P1: a canonical-id stub must still journal its registration."""
+
+    def test_stub_adoption_journals_object_registration(self, tmp_path: Path):
+        """An event-path Object stub, then `create_entity`, must journal
+        `ObjectRegistered` and rebuild byte-identically (live == replay)."""
+        sdk, events = _journal(tmp_path)
+        try:
+            sdk.create_event(
+                "probe event", "test", object="probe-object",
+                subject="probe-subject",
+                startedAt="2026-01-01T00:00:00Z")
+            sdk.create_entity("object", "probe-object",
+                              objectKind="core:task", is_episodic=False)
+            regs = _regs(events, "ObjectRegistered", "probe-object")
+            assert len(regs) == 1, (
+                "the canonical-id event stub defeated the first-registration "
+                "probe — ObjectRegistered was never journaled, so rebuild "
+                f"drops the node: {regs}")
+            assert regs[0]["id"] == _entity_name_id("Object", "probe-object")
+            live = _node_props(sdk, "Object", "probe-object")
+            _rebuild(sdk, events)
+            rebuilt = _node_props(sdk, "Object", "probe-object")
+            assert rebuilt == live, (
+                "live != replay after stub adoption: live="
+                f"{live} rebuilt={rebuilt}")
+            assert rebuilt.get("objectKind") == "core:task", rebuilt
+        finally:
+            sdk.close()
+
+    def test_stub_adoption_journals_subject_registration(self, tmp_path: Path):
+        """The Subject leg of the same probe-gate."""
+        sdk, events = _journal(tmp_path)
+        try:
+            sdk.create_event(
+                "probe event", "test", object="probe-object",
+                subject="probe-subject",
+                startedAt="2026-01-01T00:00:00Z")
+            sdk.create_entity("subject", "probe-subject",
+                              subjectKind="core:person")
+            regs = _regs(events, "SubjectAdded", "probe-subject")
+            assert len(regs) == 1, (
+                "the canonical-id event stub defeated the SubjectAdded "
+                f"probe — the Subject is live-only: {regs}")
+            live = _node_props(sdk, "Subject", "probe-subject")
+            _rebuild(sdk, events)
+            rebuilt = _node_props(sdk, "Subject", "probe-subject")
+            assert rebuilt == live, (
+                f"live != replay after Subject stub adoption: {live} != "
+                f"{rebuilt}")
+            assert rebuilt.get("subjectKind") == "core:person", rebuilt
+        finally:
+            sdk.close()
+
+    def test_stub_registration_survives_rebuild_without_its_event(
+            self, tmp_path: Path):
+        """Node loss: the stub's `EventRecorded` is NOT in the rebuilt
+        journal (a second producer / journal-less writer sharing the graph).
+        The `create_entity` registration must be journaled so the rebuild
+        keeps the node instead of deleting it."""
+        sdk, events = _journal(tmp_path)
+        try:
+            sdk.create_event(
+                "probe event", "test", object="probe-object",
+                subject="probe-subject",
+                startedAt="2026-01-01T00:00:00Z")
+            sdk.create_entity("object", "probe-object",
+                              objectKind="core:task", is_episodic=False)
+            regs = _regs(events, "ObjectRegistered", "probe-object")
+            assert regs, (
+                "no ObjectRegistered line for a stubbed name — the probe "
+                "hit the canonical-id stub and skipped the registration")
+            # Rebuild from a journal holding ONLY the registration line.
+            other = tmp_path / "events_other"
+            other.mkdir()
+            EventLog(str(other / "events.jsonl")).append(regs[0])
+            sdk._get_proj().rebuild_all(str(other), confirm_destructive=True)
+            props = _node_props(sdk, "Object", "probe-object")
+            assert props.get("objectKind") == "core:task", props
+        finally:
+            sdk.close()
