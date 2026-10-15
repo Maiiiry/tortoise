@@ -137,7 +137,8 @@ def _label_pattern() -> re.Pattern[str]:
 #: together, in one reviewed diff).
 
 
-def _client_matchers() -> tuple[re.Pattern[str], ...]:
+def _client_matchers() -> tuple[tuple[re.Pattern[str], ...],
+                                tuple[re.Pattern[str], ...]]:
     """Compile the DECLARED client route into the known call shapes.
 
     The route comes from :data:`PREDICATE`'s ``client_route`` — the same
@@ -148,6 +149,14 @@ def _client_matchers() -> tuple[re.Pattern[str], ...]:
     routes served by different handlers, so a caller of one is not a capture
     client — a bare substring test turns the commit endpoint's ``_post_commit``
     into an undeclared "client".
+
+    Returns ``(call_matchers, line_matchers)``. The first group needs a
+    balanced CALL span (:func:`_call_spans`) or an AST call span, because its
+    route and its POST evidence may sit on different lines. The second is the
+    ``curl`` transport — a shell command with no parens to balance, matched
+    against a backslash-continued LOGICAL line (:func:`_logical_lines`). The
+    two groups must NOT be unioned over a whole line: see
+    :func:`scan_http_clients`.
     """
     route = re.escape(PREDICATE["client_route"]) + r"(?![-/\w])"
     # ``fetch``/``Request`` default to GET, so the route ALONE is not a capture
@@ -171,23 +180,37 @@ def _client_matchers() -> tuple[re.Pattern[str], ...]:
     # ``inventory`` print INVENTORY CLEAN with an undeclared client present
     # (#3554 review).
     gap = r"[\s\S]*?"
-    return (
+    # ``(?i:post)`` on the METHOD evidence, never on the call token: the Fetch
+    # standard normalizes ``method`` to byte-uppercase, so ``method: "post"``
+    # is a working client, and matching only the literal ``POST`` made it
+    # invisible — INVENTORY CLEAN with an undeclared client present, the
+    # fail-open direction this guard exists to close (#3554 review).
+    call = (
         # TS/JS: post(cfg, "/v1/sessions", ...)
         re.compile(rf"""\bpost\s*\({gap}["'`][^"'`]*{route}"""),
-        # fetch(url, {method: "POST", …}) — the method after the route …
+        # fetch(url, {method: "POST"/"post", …}) — the method after the route
         re.compile(rf"""\bfetch\s*\({gap}["'`][^"'`]*{route}{gap}"""
-                   rf"""method\s*:\s*["'`]POST"""),
+                   rf"""method\s*:\s*["'`](?i:post)"""),
         # … and the same call with the method spelled before the route.
-        re.compile(rf"""\bfetch\s*\({gap}method\s*:\s*["'`]POST{gap}"""
+        re.compile(rf"""\bfetch\s*\({gap}method\s*:\s*["'`](?i:post){gap}"""
                    rf"""["'`][^"'`]*{route}"""),
         # Python: requests.post(...) / Request(url, data=… | method="POST")
         re.compile(rf"""\.post\s*\({gap}["'`f][^"'`]*{route}"""),
         re.compile(rf"""Request\s*\({gap}["'`f][^"'`]*{route}{gap}"""
-                   rf"""(?:method\s*=\s*["']POST|data\s*=)"""),
-        # curl with an explicit POST
-        re.compile(rf"""curl\b[^\n]*(-X\s*POST|--request\s+POST)[^\n]*{route}"""),
-        re.compile(rf"""curl\b[^\n]*{route}[^\n]*(-X\s*POST|--request\s+POST)"""),
+                   rf"""(?:method\s*=\s*["'](?i:post)|data\s*=)"""),
     )
+    # ``curl`` is a shell command with no call parens, so it is the ONE group
+    # matched against a LOGICAL line; the call group must never run over a
+    # line, because its widened gap crosses the call's own ``)`` and fuses
+    # unrelated statements (#3554 review).
+    line = (
+        # curl with an explicit POST (the method is case-insensitive too)
+        re.compile(rf"""curl\b[^\n]*(-X\s*(?i:post)"""
+                   rf"""|--request\s+(?i:post))[^\n]*{route}"""),
+        re.compile(rf"""curl\b[^\n]*{route}[^\n]*"""
+                   rf"""(-X\s*(?i:post)|--request\s+(?i:post))"""),
+    )
+    return call, line
 
 
 #: The call tokens the non-Python half scopes its matchers on. A ``fetch`` /
@@ -207,6 +230,18 @@ def _balanced_span(text: str, open_idx: int) -> int:
     ``fetch(url, {body: ")"})`` is one call, not one and a half. Returns
     ``-1`` for an unbalanced tail (a truncated file), which the caller skips
     rather than mis-slicing.
+
+    Comments and apostrophes are skipped. Pre-fix ANY ``'``/``"``/backtick from
+    the call's open paren onward opened a string, so a multi-line call whose
+    span contained an ODD number of those characters inside a comment or a
+    regex literal (``// the server's session endpoint``, ``// don't retry``,
+    ``/don't/``) never balanced: :func:`_call_spans` dropped the call and the
+    per-logical-line net could not rescue it (the route and the POST evidence
+    sit on different physical lines), so ``inventory`` printed INVENTORY CLEAN
+    with an undeclared client present — the fail-open direction this guard
+    exists to close (#3554 review). ``//`` and ``/* */`` are skipped to their
+    end, and a ``'`` between two word characters is an apostrophe, not a
+    string opener.
     """
     depth = 0
     quote = ""
@@ -219,8 +254,23 @@ def _balanced_span(text: str, open_idx: int) -> int:
                 continue
             if ch == quote:
                 quote = ""
-        elif ch in "\"'`":
-            quote = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt == "/":                 # line comment → end of line
+                nl = text.find("\n", i)
+                i = len(text) if nl < 0 else nl + 1
+                continue
+            if nxt == "*":                 # block comment → closing */
+                end = text.find("*/", i + 2)
+                i = len(text) if end < 0 else end + 2
+                continue
+        if ch in "\"'`":
+            before = text[i - 1] if i > open_idx else ""
+            after = text[i + 1] if i + 1 < len(text) else ""
+            if not (ch == "'" and before.isalnum() and after.isalpha()):
+                quote = ch
         elif ch == "(":
             depth += 1
         elif ch == ")":
@@ -440,8 +490,28 @@ def _skipped(rel: str) -> bool:
     return any(part in skip for part in Path(rel).parts)
 
 
+def _git_toplevel(root: Path) -> Path | None:
+    """The work tree toplevel for ``root``, or ``None`` when not a repo.
+
+    The ONE source of the repo-relative base: the declaration's rows are
+    written repo-root-relative, so a scan must key its sites against the
+    toplevel, never against whatever directory it was pointed at (#3554
+    review).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True, check=False)
+    except OSError:                                    # git not on PATH
+        return None
+    if proc.returncode != 0:                           # not a work tree
+        return None
+    out = proc.stdout.decode("utf-8", "surrogateescape").strip()
+    return Path(out) if out else None
+
+
 def _tracked_files(root: Path) -> frozenset[str] | None:
-    """The TRACKED repo-relative paths under ``root``, or ``None`` if not a repo.
+    """The TRACKED REPO-relative paths under ``root``, or ``None`` if not a repo.
 
     The scan corpus is tracked, reviewable scope — not "whatever is on disk".
     A linked worktree under ``.worktrees/<lane>/`` is a full copy of the source
@@ -455,12 +525,21 @@ def _tracked_files(root: Path) -> frozenset[str] | None:
     parallel checkouts and any untracked scratch tree, neither of which can be
     a merged writer (#3554 review).
 
+    ``--full-name`` is load-bearing, not cosmetic: without it ``git ls-files``
+    prints paths relative to the INVOCATION directory, so a scan rooted at a
+    subdirectory (``--root tortoise``) minted ``sdk.py`` where the declaration
+    says ``tortoise/sdk.py``. Every found site then read as undeclared AND
+    every declared row as stale, so a clean subtree printed INVENTORY DRIFT
+    (#3554 review).
+
     ``None`` (``root`` is not a git work tree, e.g. a synthetic test root)
     makes :func:`_iter_source` fall back to the filesystem walk.
     """
+    if _git_toplevel(root) is None:
+        return None
     try:
         proc = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "-z", "--"],
+            ["git", "-C", str(root), "ls-files", "--full-name", "-z", "--"],
             capture_output=True, check=False)
     except OSError:                                    # git not on PATH
         return None
@@ -487,6 +566,12 @@ def _is_declaration_module(path: Path) -> bool:
 def _iter_source(root: Path, extensions: tuple[str, ...]):
     """Walk the TRACKED tree minus what ``PREDICATE`` declares out of scope.
 
+    Yields ``(absolute path, repo-relative key)``. The KEY is what the
+    declaration's rows are written in — repo-root-relative — so a scan rooted
+    at a subdirectory (``--root tortoise``) mints ``tortoise/sdk.py::…``, not
+    ``sdk.py::…``, and its found set is comparable to the declaration; see
+    :func:`_tracked_files` for the pre-fix wrong-base defect (#3554 review).
+
     The scope is the predicate, not a private allow-list: an allow-list let a
     ``:Session`` writer under any unlisted tracked directory stay invisible, so
     ``inventory`` printed INVENTORY CLEAN with an undeclared writer present —
@@ -501,20 +586,23 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
     descends into ``.venv``/``.git``/``node_modules`` and filters afterwards,
     which costs ~25s on this tree; pruning never opens them. A root that is not
     a git work tree (a synthetic test root) falls back to that walk with the
-    same declared pruning.
+    same declared pruning; its keys are root-relative because there is no
+    toplevel to key against.
     """
     tracked = _tracked_files(root)
     if tracked is not None:
+        toplevel = _git_toplevel(root)
+        assert toplevel is not None     # tracked implies a work tree
         for rel in sorted(tracked):
             if (Path(rel).suffix not in extensions or _excluded(rel)
                     or _skipped(rel)):
                 continue
-            path = root / rel
+            path = toplevel / rel
             if _is_declaration_module(path):
                 continue
             if not path.is_file() or path.is_symlink():
                 continue
-            yield path
+            yield path, rel
         return
     skip_parts = _skip_parts()
     for dirpath, dirnames, filenames in os.walk(root):
@@ -532,9 +620,10 @@ def _iter_source(root: Path, extensions: tuple[str, ...]):
                 continue
             if _is_declaration_module(path):
                 continue
-            if _skipped(path.relative_to(root).as_posix()):
+            rel = path.relative_to(root).as_posix()
+            if _skipped(rel):
                 continue
-            yield path
+            yield path, rel
 
 
 def scan_graph_writers(root: Path) -> list[Site]:
@@ -545,7 +634,7 @@ def scan_graph_writers(root: Path) -> list[Site]:
     # accept — an exact-substring test here was the binding stage and made the
     # predicate's own tolerance dead (#3554 review).
     label = _label_pattern()
-    for path in _iter_source(root, PY_EXTENSIONS):
+    for path, rel in _iter_source(root, PY_EXTENSIONS):
         try:
             raw = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
@@ -584,7 +673,7 @@ def scan_graph_writers(root: Path) -> list[Site]:
                 prop for owner_alias, prop in _SESSION_PROP_RE.findall(text)
                 if owner_alias == alias}))
             sites.append(Site(
-                kind="graph-writer", path=str(path.relative_to(root)),
+                kind="graph-writer", path=rel,
                 owner=_owner_of(index.scopes, node.lineno), line=node.lineno,
                 properties=props))
     return sorted(sites, key=lambda s: (s.path, s.owner, s.line))
@@ -608,8 +697,9 @@ def scan_http_clients(root: Path) -> list[Site]:
     (#3554 review).
     """
     sites: list[Site] = []
-    matchers = _client_matchers()
-    for path in _iter_source(root, CLIENT_EXTENSIONS):
+    call_matchers, line_matchers = _client_matchers()
+    all_matchers = call_matchers + line_matchers
+    for path, rel in _iter_source(root, CLIENT_EXTENSIONS):
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
@@ -636,31 +726,66 @@ def scan_http_clients(root: Path) -> list[Site]:
                 if node.end_lineno is None:
                     continue
                 src = "".join(lines[node.lineno - 1:node.end_lineno])
-                if any(rx.search(src) for rx in matchers):
+                if any(rx.search(src) for rx in all_matchers):
                     line = node.lineno
                     comment = _owner_of(index.scopes, node.lineno)
                     break
         else:
-            # CALL-scoped, not line-scoped: the route and its POST evidence
-            # may be on different lines (see :func:`_call_spans`). A shell
-            # transport has no call parens, so backslash-continued logical
-            # lines are scanned too — a wrapped `curl` is one command. The
-            # logical lines are emitted for EVERY non-Python file, not only
-            # `.sh`: they are a strict SUPERSET of the pre-fix per-physical-line
-            # scan, so the call scoping can only ADD sites, never lose one a
-            # `curl`-in-a-`.js`-string would have matched before.
-            spans = _call_spans(text) + _logical_lines(text)
-            for span_line, span in sorted(spans):
-                if any(rx.search(span) for rx in matchers):
-                    line = span_line
-                    comment = span.strip()[:60]
-                    break
+            # CALL-scoped for the parenthesised transports, LOGICAL-line
+            # scoped for `curl` (a shell command with no parens to balance).
+            # The two must NOT be unioned over a line: a call matcher's gap is
+            # ``[\s\S]*?`` (needed for call spans), so over a line span it
+            # crosses the call's own ``)`` and fuses unrelated statements — a
+            # GET of the route followed by an unrelated ``{method: "POST"}``
+            # object on the same physical line then reads as one capture
+            # client, a false INVENTORY DRIFT on a non-site (#3554 review).
+            candidates = [
+                (span_line, span) for span_line, span in _call_spans(text)
+                if any(rx.search(span) for rx in call_matchers)]
+            candidates += [
+                (span_line, span) for span_line, span in _logical_lines(text)
+                if any(rx.search(span) for rx in line_matchers)]
+            for span_line, span in sorted(candidates):
+                line = span_line
+                comment = span.strip()[:60]
+                break
         if not line:
             continue
         sites.append(Site(
-            kind="http-client", path=str(path.relative_to(root)),
+            kind="http-client", path=rel,
             owner=comment, line=line))
     return sorted(sites, key=lambda s: s.path)
+
+
+def _scan_scope(root: Path) -> str | None:
+    """The repo-relative prefix ``root`` selects, or ``None`` when unscoped.
+
+    The declaration is repo-wide, so a scan rooted at a SUBDIRECTORY can only
+    verify the declared rows UNDER that root. Comparing a subtree scan against
+    the full declaration made every row outside it read as STALE — a clean
+    subtree reported INVENTORY DRIFT (#3554 review). ``''`` means the root IS
+    the toplevel (the whole declaration is verifiable); ``'tortoise/'`` means
+    the scan is that subtree; ``None`` means ``root`` is not a git work tree at
+    all (a synthetic test root), where keys are root-relative and the full
+    declaration is compared exactly as before.
+    """
+    toplevel = _git_toplevel(root)
+    if toplevel is None:
+        return None
+    try:
+        rel = Path(os.path.realpath(root)).relative_to(
+            Path(os.path.realpath(toplevel)))
+    except ValueError:                      # a root outside the work tree
+        return None
+    as_posix = rel.as_posix()
+    return "" if as_posix == "." else as_posix + "/"
+
+
+def _in_scan_scope(key: str, scope: str) -> bool:
+    """True when a declared row's repo-relative path sits under ``scope``."""
+    if not scope:
+        return True
+    return key.startswith(scope) or key == scope.rstrip("/")
 
 
 def inventory_report(root: Path, *, writers: list[Site] | None = None,
@@ -670,12 +795,22 @@ def inventory_report(root: Path, *, writers: list[Site] | None = None,
     ``writers``/``clients`` let a caller that already scanned (the test
     module's module-scoped fixture) reuse the sites instead of paying for a
     second full-tree walk. Omitted, each half is scanned here as before.
+
+    The comparison universe is narrowed to the scan's own scope when ``root``
+    is a subdirectory of a work tree, so a subtree scan is judged on the rows
+    it can actually see (see :func:`_scan_scope`).
     """
     writers = scan_graph_writers(root) if writers is None else writers
     clients = scan_http_clients(root) if clients is None else clients
     writers_expected = {w.key for w in SESSION_WRITERS}
     declared_clients_expected = {c.path for c in SESSION_CLIENTS
                                  if c.transport == "http"}
+    scope = _scan_scope(root)
+    if scope is not None:
+        writers_expected = {k for k in writers_expected
+                            if _in_scan_scope(k, scope)}
+        declared_clients_expected = {
+            p for p in declared_clients_expected if _in_scan_scope(p, scope)}
     found_writers = {s.key for s in writers}
     found_clients = {c.path for c in clients}
     return {
@@ -735,9 +870,16 @@ def _cmd_retrofit(args) -> int:
             "refusing to invent a graph: pass --db <path> or --uri "
             "(with TORTOISE_DB_URI set). A zero printed for a graph nobody "
             "read is a lie with a number on it.")
+    proj = sdk._get_proj()
+    # Name the graph that was actually READ. On the ``--uri`` path with no
+    # ``--namespace`` the SDK resolves the graph name from ``TORTOISE_DB_URI``
+    # (``_get_proj`` → ``_derive_graph_name``), so ``args.namespace or
+    # args.db`` was ``None`` and the report's first line read ``graph: None``
+    # — the one field a reader uses to know WHAT was measured (#3554 review).
+    graph_name = (getattr(proj, "graph_name", None)
+                  or args.namespace or args.db)
     try:
-        report = audit_session_retrofit(sdk._get_proj().g,
-                                        graph=args.namespace or args.db)
+        report = audit_session_retrofit(proj.g, graph=graph_name)
     finally:
         sdk.close()
     report["verdicts"] = RETROFIT_VERDICTS

@@ -231,6 +231,51 @@ def test_declaration_module_skip_is_root_independent(tmp_path: Path) -> None:
     assert audit.scan_graph_writers(root) == []
 
 
+def test_subdir_scan_keys_sites_repo_relatively_and_compares_in_scope(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--root <subdir>`` keys sites repo-relatively and verifies only them.
+
+    ``git ls-files`` prints paths relative to the INVOCATION directory, so a
+    scan rooted at ``tortoise/`` pre-fix minted ``sdk.py::…`` where the
+    declaration says ``tortoise/sdk.py::…``: every found site read as
+    undeclared AND every declared row as stale, and ``inventory`` printed
+    INVENTORY DRIFT for a clean tree. The tracked branch is the one under test
+    (the root really is a work tree), matching the neighbouring test. Pre-fix
+    this test fails on the first key assertion.
+    """
+    (tmp_path / "tortoise").mkdir()
+    (tmp_path / "tortoise" / "sdk.py").write_text(
+        'QUERY = "MERGE (s:Session {id:$sid}) SET s.turn_count = 1"\n',
+        encoding="utf-8")
+    (tmp_path / "tortoise" / "capture.py").write_text(
+        'import requests\n'
+        'def post_capture(base):\n'
+        '    return requests.post(f"{base}/v1/sessions", json={})\n',
+        encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    sub = tmp_path / "tortoise"
+    assert audit._tracked_files(sub) is not None       # the tracked branch
+    assert {s.key for s in audit.scan_graph_writers(sub)} == {
+        "tortoise/sdk.py::QUERY"}
+    assert {s.path for s in audit.scan_http_clients(sub)} == {
+        "tortoise/capture.py"}
+    # The comparison is scoped to the scan root: a declared row OUTSIDE the
+    # subtree is not verifiable from it, so it must not read as STALE. The
+    # toplevel scan verifies the full declaration instead.
+    monkeypatch.setattr(audit, "SESSION_WRITERS", (
+        types.SimpleNamespace(key="tortoise/sdk.py::QUERY"),
+        types.SimpleNamespace(key="outside/other.py::WRITER"),
+    ))
+    monkeypatch.setattr(audit, "SESSION_CLIENTS", (
+        types.SimpleNamespace(transport="http", path="tortoise/capture.py"),
+    ))
+    sub_report = audit.inventory_report(sub)
+    assert sub_report["ok"], sub_report
+    assert "outside/other.py::WRITER" not in sub_report["graph_writers_declared"]
+    assert not audit.inventory_report(tmp_path)["ok"]
+
+
 #: The declared writers whose property names the scanner CANNOT read from the
 #: source literal: each builds its ``SET`` clause with an f-string (a shared
 #: helper or a ``for prop in (...)`` loop), so no ``s.<prop> =`` name sits in
@@ -473,6 +518,90 @@ def test_multiline_post_calls_are_still_client_sites(tmp_path: Path) -> None:
         "tortoise/multiline_post.ts", "tortoise/wrapped_curl.sh"}
 
 
+def test_multiline_call_with_an_apostrophe_comment_is_still_a_site(
+        tmp_path: Path) -> None:
+    """An apostrophe in a comment must not unbalance the call span.
+
+    ``_balanced_span`` entered a string on ANY ``'``/``"``/backtick, so a
+    multi-line call carrying an ODD number of those characters inside a
+    comment (``// the server's session endpoint``, ``// don't retry``) never
+    balanced: the call was dropped and the per-logical-line net could not see
+    the POST evidence on its own line. Pre-fix this test fails: no site.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "line_comment.ts").write_text(
+        'const r = fetch("/v1/sessions", {\n'
+        "  // the server's session endpoint — don't retry\n"
+        '  method: "POST",\n'
+        '  body: JSON.stringify(payload),\n'
+        '});\n', encoding="utf-8")
+    (pkg / "block_comment.ts").write_text(
+        'const r = fetch("/v1/sessions", {\n'
+        "  /* the client's capture call */\n"
+        '  method: "POST",\n'
+        '});\n', encoding="utf-8")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/line_comment.ts", "tortoise/block_comment.ts"}
+    # …and the balanced-span fix does not swallow a genuinely unterminated
+    # call: a span with no closing paren stays dropped, so the assertions
+    # above cannot pass by making ``_balanced_span`` unconditional.
+    assert audit._balanced_span('fetch("x", ', 5) == -1
+    assert audit._balanced_span('fetch("x")', 5) == 10
+
+
+def test_lowercase_method_evidence_is_still_a_client_site(
+        tmp_path: Path) -> None:
+    """``method: "post"`` is evidence too — Fetch uppercases the method.
+
+    The POST evidence was matched CASE-SENSITIVELY, so a working
+    ``fetch(url, { method: "post" })`` (the Fetch standard normalizes
+    ``method`` to byte-uppercase) contributed no site and ``inventory``
+    printed INVENTORY CLEAN with an undeclared client present. Pre-fix this
+    test fails: no site is found.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "lower_fetch.ts").write_text(
+        'const r = fetch("/v1/sessions", {\n'
+        '  method: "post",\n'
+        '  body: JSON.stringify(payload),\n'
+        '});\n', encoding="utf-8")
+    (pkg / "lower_request.py").write_text(
+        'import urllib.request as u\n'
+        'def post_sessions(base, payload):\n'
+        '    return u.urlopen(u.Request(f"{base}/v1/sessions", data=payload,\n'
+        '                               method="post"))\n', encoding="utf-8")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/lower_fetch.ts", "tortoise/lower_request.py"}
+
+
+def test_a_get_plus_an_unrelated_post_object_on_one_line_is_not_a_site(
+        tmp_path: Path) -> None:
+    """A line-scoped call matcher fuses two statements into one client.
+
+    The non-Python half unioned the balanced call spans with EVERY logical
+    line. The matchers' gap is ``[\\s\\S]*?`` (needed for call spans), so over
+    a line span it crosses the call's own ``)``: a GET of the route followed by
+    an unrelated ``{method: "POST"}`` object on the same physical line matched
+    as one capture client — a false INVENTORY DRIFT on a non-site. Pre-fix
+    this test fails: ``tortoise/fused.js`` is reported.
+    """
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "fused.js").write_text(
+        'var a=fetch("/v1/sessions"),b={method:"POST",body:x};\n',
+        encoding="utf-8")
+    assert audit.scan_http_clients(tmp_path) == []
+    # …and the real multi-line POST is still a site, so the assertion above
+    # cannot pass by weakening the matchers.
+    (pkg / "fused.js").write_text(
+        'var a=fetch("/v1/sessions",{\n  method:"POST",\n  body:x});\n',
+        encoding="utf-8")
+    assert {s.path for s in audit.scan_http_clients(tmp_path)} == {
+        "tortoise/fused.js"}
+
+
 def test_inventory_cli_reports_clean_and_exits_zero(
         repo_inventory: dict, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     """The CLI's verdict/exit mapping, without a second full scan."""
@@ -539,9 +668,13 @@ class _FakeSDK:
     def __init__(self, *args, **kwargs) -> None:
         self.graph = _FakeGraph()
         self.closed = False
+        # What the real ``TortoiseSDK._get_proj`` resolves from the URI /
+        # namespace. The retrofit verb must read it rather than printing
+        # ``graph: None`` on the ``--uri`` path (#3554 review).
+        self.graph_name: str | None = None
 
     def _get_proj(self) -> types.SimpleNamespace:
-        return types.SimpleNamespace(g=self.graph)
+        return types.SimpleNamespace(g=self.graph, graph_name=self.graph_name)
 
     def close(self) -> None:
         self.closed = True
@@ -575,6 +708,36 @@ def test_retrofit_json_is_valid_json(
     assert payload["short_turn_count"]["all_short"] == 2
     assert payload["entity_links_under_count"]["sessions"] == 1
     assert payload["verdicts"] == session_schema.RETROFIT_VERDICTS
+
+
+def test_retrofit_uri_reports_the_resolved_graph_name(
+        fake_sdk_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch,
+        capsys) -> None:
+    """``--uri`` without ``--namespace`` names the URI's resolved graph.
+
+    The report's ``graph`` field is the artifact a reader uses to know WHAT
+    was measured. On ``--uri`` the SDK resolves the graph name from
+    ``TORTOISE_DB_URI`` (``_get_proj`` → ``_derive_graph_name``), but the verb
+    passed ``args.namespace or args.db`` — both ``None`` — so the first line
+    read ``graph: None``. Pre-fix this test fails.
+    """
+    monkeypatch.setenv("TORTOISE_DB_URI", "docker://localhost:6379/mygraph")
+
+    def factory(*args, **kwargs):
+        sdk = _FakeSDK(*args, **kwargs)
+        sdk.graph_name = "mygraph"      # what the SDK resolves from the URI
+        return sdk
+
+    monkeypatch.setattr(fake_sdk_module, "TortoiseSDK", factory)
+    rc = audit.main(["retrofit", "--uri"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.splitlines()[0] == "graph: mygraph"
+    # …and the machine-readable report carries the same name.
+    rc = audit.main(["retrofit", "--uri", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["graph"] == "mygraph"
 
 
 def test_retrofit_without_a_graph_refuses_instead_of_printing_a_zero(
