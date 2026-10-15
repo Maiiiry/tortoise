@@ -324,8 +324,8 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
 #: it can only re-stale.
 LANDED_STATEMENTS: dict[str, str] = {
     "§S0 states the D10 code half as landed": "D10 is LANDED — both halves.",
-    "§D's provenance row records the retirement": (
-        "✅ **NOW TRUE** — the `:Document` NODE label is **retired**"
+    "§8's code table records the `:Document` label retirement": (
+        "`:Document` NODE label is RETIRED"
     ),
     "§S0's Q3 row says `doc_status` is retired": (
         "RETIRED** (`tortoise/api.py:458`)"

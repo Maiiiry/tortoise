@@ -34,7 +34,7 @@ extraction costs the customer**, and that silence is now filled by a ruling:
 **What this means for this document's own design work.** The tokens are the **extraction** lane's workload — the LLM
 work this architecture specifies — so any change that alters extraction **volume** (batch size, the S1→S2 step count,
 the VET pass, per-item vs per-batch judgment) now moves a **customer-visible meter**, not merely a cost. That is a
-reason to prefer measurable steps over inferred ones: §16.2's rule (a claim must be checkable) is now also a billing
+reason to prefer measurable steps over inferred ones: the rule that a load-bearing claim must be checkable against a named artifact is now also a billing
 surface.
 
 **✅ Where the measurement is — PRESENT (this paragraph said PLANNED; re-measured 2026-10-11, `#3840`).** The
@@ -548,10 +548,8 @@ Normalises the shape **and applies the declared field→type mapping** (§3). Pa
 
 **⇒ D4 is NARROWED, not reversed:** one entity-keyed neighbourhood lookup, **after** extraction, consumed by **the judgment** (salience) **and by S3** (resolution). **Extraction no longer consumes it.**
 
-**✅ STATUS: `DECIDED (narrowed)` — the owner ruled.** The narrowing is in force: the lookup sits **after** extraction, and it is consumed by the salience judgment and by S3 only. **Extraction does not consume it.** *(An earlier version of this line said the narrowing was still proposed and awaiting confirmation; §9's D4 row says `DECIDED (narrowed)`, which is correct — §16.2 records that this two-ways status was itself a defect.)* This follows from D4's own stated reason — the extraction consumer was never covered by it.
+**✅ STATUS: `DECIDED (narrowed)` — the owner ruled.** The narrowing is in force: the lookup sits **after** extraction, and it is consumed by the salience judgment and by S3 only. **Extraction does not consume it.** This follows from D4's own stated reason — the extraction consumer was never covered by it.
 
-> **✅ Superseded and deleted (reviewer B2.20, then §16.2).** This line used to say the narrowing was *"PROPOSED and awaiting the owner's confirmation"* while §9 recorded D4 as `DECIDED (narrowed)` — a two-ways status the second review cycle flagged. **The owner has since ruled: D4 is `DECIDED (narrowed)`.** There is no pending confirmation, and no third phrasing.
->
 > ✅ **Note — `#4511` is CLOSED, and it no longer gates anything.** It was the blocker *when the lookup sat before extraction* (`_fts_rows` read `r.get("kind")` while the callee emits `point_kind`, so every prior's type returned **blank**). **The lookup has since moved into S3 (§4.2), so `#4511` is now simply a fixed bug, not a dependency of this design.** ⚠️ **Still unmeasured (§14):** whether giving extraction the neighbourhood ever reduced what it created — the question that justified the old ordering, and the one the new ordering makes moot.
 
 ### S2.1 — EXTRACT
@@ -1052,6 +1050,8 @@ v3's **E2** requires state-value facts be preserved verbatim (*"personal best 5K
 | **S2/S4 merge** | `merge_embed_lists` (def `extractor_v2.py:2284`; **called at `:4845`** — ⚠️ an earlier draft cited `:4838`, which is `try:` (`stage_stats` is `:4837`)) |
 | **Pack enforcement machinery** — `chains` with `enforcement` levels, `nearMisses`, `subclassOf`, `equivalentTo`, `extraction.sourceTypes` | `packs/*/manifest.yaml`; 20+ files reference each |
 | **The narrative prompt slot** — S1's granularity rule is already injected | `_granularity_text()` |
+| **The mechanical DISCARD** — `value_gate._REFERENCE` is `#\d{1,6}(?!\d)` (1–6 digits, unanchored) and `identifier_only()` is a **whole-residue** test, not an anchored match. ⚠️ **Not** an anchored *three-or-more-digit* pattern — that is `#4899`'s **proposal**, and it differs in **both** directions (`#12` IS discarded; a 7-digit run is **not**). **OFF by default**, and it covers the *identifier* class only — `the <X>` definite descriptions are left to the arbiter. | `tortoise/value_gate.py` |
+| **The `:Document` NODE label is RETIRED** — a document is a **`:Source`**, `objectKind: document`, and the raw narrative is Postgres text referenced by that `Source` (§9 D1). The graph has no `:Document` node. | `ONTOLOGY.md`; PR `#5127` |
 
 ---
 
@@ -1320,59 +1320,15 @@ From migration `e9b2c7d1f3a4_drop_entity_memory_links.py` (2026-05-26):
 
 ---
 
-## 15. Issue map — what this document informs
+## 15. Where the work is tracked
 
-**Purpose:** every section above exists to inform a filed issue. This is the index, so a reader holding an issue finds the reasoning, and a reader holding a section finds the work it drives.
+**This document states the target design. It does not track issue state.** Which issues exist, which are
+open, and which are filed is read from the tracker — never from here. A document that mirrors issue state
+is wrong the day after it is written, and the sections above are unaffected when it goes stale.
 
-| section | issue(s) | what the issue takes from here |
-|---|---|---|
-| §1 the mechanism — **two halves**: the `^the <X>` definite-description class (62.3% of Objects) **and** the `#\d{1,6}(?!\d)` *identifier* DISCARD | **`#4899`** (CLOSED `COMPLETED`) · `#4894` | ⚠️ **`#4899` is the *identifier-only* DISCARD** (`value_gate._REFERENCE` / `identifier_only()`), shipped in `tortoise/value_gate.py` and **OFF by default**. **It deliberately does NOT cover `the <X>` definite descriptions** — `value_gate.py`'s docstring: *"a definite description is left to the arbiter, and is reported, not dropped"* — **so the 62.3% `the <X>` class is not owned by this row.** ⚠️ **Nor by the `§4 S2.2 VET` row below** — that row records Jev's *cost* measurement, not the arbiter. This class is the **arbiter / pre-lookup half of S2.2**, and **the mechanism that would decide it has no production caller**: `tortoise/vet_gate.py` — *"No production caller injects an arbiter yet … the step decides nothing."* ⚠️ **Owned by `#5198`** — *"the mechanical DISCARD gate site is asserted twice (S2.2b pre-lookup vs E7 post-lookup) and the code matches neither"* — which records this placement as *"still unowned"* |
-| §1 v2 → v3 → v4 | `#1509` (epic — ⚠️ **CLOSED `NOT_PLANNED`**, 2026-10-10) · `#4894` | **v3 increases volume; v4 must land with or before v3's E2/E3** — ⚠️ **but that ordering obligation is now VOID: the v3 epic is not planned**, so there is no v3 work left to land before. v3's **E4 has already landed** (`merge_embed_lists`, `extractor_v2.py:4845`), so its premise is stale regardless |
-| §2 three tiers | `#2281` | the **narrative is the ingest-time-distilled layer** with raw-turn fallback |
-| §2 narrative placement (D1) | `#4894` | ⚠️ **the narrative is Postgres text REFERENCED BY its `Source`** (the owner's *"supabase"* = the DATABASE, not the object bucket; destination corrected 2026-10-09) — **the graph keeps the *reference*; the text stays out of the graph** (§9 D1, **amended 2026-09-23**: *"metadata on its `Source`"* was **too loose**). **Not a `Document` node, not graph metadata, not a `Point`** |
-| §3 source-varying steps | `#2714` (⚠️ **CLOSED `COMPLETED`** — this row records the landed design, not open work) · `#1844` | source types declare a **field→type mapping** that configures S0/S1/S2/S5; structured sources are exact and cheap |
-| §4 S0–S6 | `#4894` · `#1509` (⚠️ **CLOSED `NOT_PLANNED`**) | the step architecture itself |
-| §4 S3 RESOLVE (was S1.5) | `#4511` (**CLOSED** — now just a fixed bug, no longer a dependency) · `#2730` | **entity attachment** is the mechanism; the lookup is keyed on candidates and disambiguated by the narrative |
-| §4 S2.2 VET + §6 Jev | **`#1026`** (CLOSED — the `valueGate` slot it declared) · `#4899` (CLOSED — the S2.2b predicate that ships) | Jev as the **decision-only** mechanism; measured **$0.000243/item at 3 questions**, **~4–7× cheaper than frontier, not 40–400×** |
-| §4 S3 MATCH | `#2730` | find **and attach** — Jev as a `Choice` over supplied candidates |
-| §4 S5 CONNECT + §5 lifecycle (D6/D7) | **`#2552`** · **`#4716`** (both CLOSED `COMPLETED`) | the measured **0/4** on the planted-operator corpus — operator edges **were not wired or persisted**, the mint bypassed E7, and endpoint refs were never remapped |
-| §5 lifecycle events | `#4240` (CLOSED `COMPLETED`) | lifecycle is **appended Events + folded status** — which is why the **then-missing** journal was a durability bug |
-| §7 atomicity + §7 state values | **`#2453`** (LANDED) · `#2820` · `#4432` | the `STATE_VALUE_CARVE_OUT` must survive any filter; `'extraction emits statement only'` is contradicted by the live rule extractor. ⚠️ **The former "`#1509` (E2, E3)" citation was wrong — `#1509` has no §9 and no E2**; **E2 is `#1534`'s slot** (CLOSED) |
-| §8 already in code | `#1026` (⚠️ **CLOSED `COMPLETED`**) · `#2714` (⚠️ **CLOSED `COMPLETED`**) | packs already declare `chains`/`nearMisses`/`subclassOf`/`sourceTypes` — **the work is enforcement, not design** |
-| §9 decisions D1–D13 | `#4917` | the handoff record |
-| §10–§12 research | `#2730` · `#4333` | the Hindsight checks |
-| §13 connections & relevance | **`#2730`** · **`#1026`** · `#4240` | cross-batch connection is **mechanical** in the nearest comparable; entity edges were **deleted** at 53% of link rows |
-| §13.6–§13.8 `aboutObject` stored edge vs derived join | **`#7948`** (the filed record: measured SPLIT · ruled **KEEP** · deferred) · `#5010` (the cap, CLOSED) | the measured, classified read-site enumeration — and the finding that the comparable's conclusion does **NOT** transfer |
-| §14 not established | `#4894` | the small-sample-first measurement list |
-| **capture-path issues (same pipeline, not steps)** | `#4897` · `#4911` · `#4714` · `#4614` | ✅ **ALL FOUR CLOSED `COMPLETED`** (2026-10-04 · 2026-09-26 · 2026-09-24 · 2026-09-25) — mid-word truncation at 5,000 chars · no secret redaction (its *v4 raw-layer* consequence is `#8496`, §4.3 G4) · 2 of 4 harnesses 404 · invisible quota refusals. **Listed as the record of a defect CLASS this pipeline produced, not as a live defect list** |
-
-**One of the three questions this document raises** (§13.8) remains the owner's: **cross-batch connection — by LLM or mechanically.** The other two are settled: **hard fan-out caps** are **CLOSED** (`#5010` — adopted at 200, `PER_ENTITY_FANOUT_CAP`, §13.8 question 3), and **`aboutObject` as edge or join** is measured, ruled (**KEEP** the stored edge, 2026-09-23) and deferred — **`#7948`** is the filed record (§13.8 question 2, §16).
-
-**Filed status — revalidated 2026-10-13 against the tracker.**
-
-This block previously read *"Not yet filed from this document (candidates, not decisions)"* and listed
-items that **have since been filed.** It is corrected rather than deleted, because a stale *"not yet
-filed"* claim is what causes duplicate filing — the same failure the §4.3 gap table had.
-
-| item | issue | state |
-|---|---|---|
-| **The raw-vs-narrative measurement** (D3's falsifier, §10) — *"the next real work"*, settles whether Option 4 stays provisional | **`#7947`** | ✅ **FILED** — this block said *not yet filed* |
-| **Fan-out caps** (mirrored in `STORAGE-ARCHITECTURE.md` §13) | **`#5010`** | ✅ **CLOSED** — cap landed query-side (`tortoise/fanout.py`, `PER_ENTITY_FANOUT_CAP = 200`, PR `#5057`) |
-| **`aboutObject` join-vs-edge** | **`#7948`** | ✅ **FILED** — measured SPLIT, owner ruled **KEEP**, deferred. ⚠️ **The *issue* is `OPEN`; what is not open is the §13.8 question 2 / §16 matter — that is settled and deferred** |
-| **G1** — narrative + raw-fact span persistence | **`#5064`** (open remainder; `#5007` CLOSED `COMPLETED` via PR `#5108`) · **`#4894`** (narrative) | ✅ filed |
-| **G2** — the EMBED gate | **`#5008`** | ✅ filed |
-| **G3** — per-step failure policy | **`#8495`** | ✅ **DECLARED — §4.4 (2026-10-14)**; implementation under `#5087` |
-| **G4** — redaction designed with the append-only layer | **`#8496`** | ✅ filed (`#4911` is CLOSED; its design-level consequence was unowned). ✅ **RECONCILED — `§2.4.4` (R1–R4) states the choice and its reason: redact before the append, retention-erasure for the already-persisted case, `(scanned, total)` on every clean claim, Postgres home + existing retention path** |
-| **G5** — migration / backfill / the live S4 | **`#5333`** · **`#5059`** · **`#8500`** (the S4 clause) | ✅ filed |
-
-**⇒ There are no longer any unfiled candidates in this document.** G1–G5 were recorded in §4.3 as gaps to close before
-implementation begins, and **two** of them (`#8495`, `#8496`) had no tracker entry until
-2026-10-13 — those two are among the newly filed ones. **G5's S4 clause** also needed its own home and got one
-the same day, because `#5333` explicitly refuses to absorb it and `#5059` covers a different half: it is
-**`#8500`**. (That is a scope boundary, not a closed-issue reopen — both `#5333` and `#5059` are OPEN. The
-closed-issue reopen rationale belongs to **G4**, where `#4911` is CLOSED `COMPLETED` and its design-level
-consequence is `#8496`.) The owning epic is **`#5087`** (E1) under tracking **`#5086`**, with end-to-end
-acceptance in capstone **`#7949`**.
+Where a section depends on whether something is **built**, it says so via the artifact: the code and its
+`file:line`, or the merged PR that landed it. Those are durable. An issue's open/closed state is not, and
+is not cited as authority anywhere in this document.
 
 ---
 
@@ -1394,41 +1350,10 @@ Each open decision was run through the mandated sequence: **contradiction test f
 
 **⚠️ The "decision ledger" does not exist in this repo.** `docs/plans/2026-09-22-2814-rebuild-config-durability.md:316` records it: *"the 'decision ledger' earlier drafts named does not exist in this repo (`rg -il 'decision ledger'` matches only this plan)"*. **The `OVERRIDES:` comment on the issue is the marker's only home** — do not cite a ledger that isn't there.
 
-### 16.1 The review cycle — outcome recorded (2026-09-23)
-
-**Two fresh-context reviewers per document, complementary lenses; full consolidation in `REVIEW-CONSOLIDATED-2026-09-23.md` (that review's own summary: 6 P0 · 34 P1 · 18 P2).** This section records **what was done with each category**, so a later lane can tell a correction from an omission.
-
-| category | count | disposition |
-|---|---|---|
-| **P0 — a false load-bearing claim, or two documents that contradict each other** | **6** | **All 6 corrected in place — A4 only after §16.2 caught it** (A1 vector-index model · A2 truth/derived test · A3 `#2453` landed · A4 VET/S3 circular dependency — `MERGE-INTO-EXISTING` removed from VET's outputs, restoring S3 as the sole authority · A5 the 10× cannot reproduce itself · A6 *"an Object is a name"*). **The corrections are marked in place — most with `⚠️ CORRECTED`, some with the error named directly in the row (A1 *"REWRITTEN TWICE"*, A3 *"THIS ROW WAS WRONG"*, A6 *"DO NOT WRITE"*).** |
-| **P1 — code-evidence, citation, or arithmetic defects** | **34** | **All corrected.** Arithmetic recomputed (B1.1 §1, B1.2/B1.3/B1.5/B1.19, §5's table); citations fixed or the claim deleted (B1.16 `#1509 §9`/`E2`, B1.18 `MITIGATES`, B2.9 `llm_tail`, B2.18 `#3011`); **B2.1's constraint 4 kept visible with the evidence that falsifies it**, so it cannot be re-derived. |
-| **P2 — completeness gaps** | **18** | **Recorded, not silently dropped** — this document's §4.3 (G1–G5) + `STORAGE-ARCHITECTURE.md` §5.1/§14/§15. |
-| **Genuinely a decision, not a correction** | **6** | ⛔ **Escalated to the owner — §16.3. These are NOT applied and NOT decided.** |
-
-**⚠️ The rule applied throughout, and it is the one that matters:** where a claim about **process** had no artifact to check it against, it was **DELETED rather than reworded** (the `#3011` thresholds, *"carries most of the retrieval value"*, the `#2453` reading). **Rewording a self-referential claim just generates the next review round; deleting it ends the question.**
-
-### 16.2 ⛔⛔ THE SECOND REVIEW CYCLE FOUND THAT THE *FIRST REVIEW* WAS WRONG — and this is the most important lesson in this document
-
-**Cycle 2 (2026-09-24, four fresh-context reviewers + two gap analysts) checked the *corrections*, not the original text. Five of them were false. Three trace to the same source: `REVIEW-CONSOLIDATED-2026-09-23.md` — the cycle-1 review itself — whose findings were applied verbatim without re-verification.**
-
-| what the doc now said | what the primary source says | where the falsehood came from |
-|---|---|---|
-| *"`#3011`'s thresholds were embellished 3 of 3; REMOVED"* | the frozen doc **carries all three** (`H1 ≥15`, `H2 ≥10`, `H3 −5`) | **cycle-1 B2.18** — conflated *"also in H4 / also in the falsifiers"* with *"not in H1/H3"* |
-| *"the lookup does not need kinds → constraint 4 evaporates"* | `_find_existing_entity` **uses `kind` as its exact-match key** | **cycle-1 B2.1** — read the query builder and called it the lookup |
-| *"there is no `:Document` node and none is created"* | ✅ **NOW TRUE** — the `:Document` NODE label is **retired** (PR `#5127`, D10); the **`documents` cap** counts document-bearing `:Source` nodes (the node cap does not) | not from cycle 1 — a **lane inference** from "D30 puts raw outside the graph" |
-| *"All 6 P0s corrected in place"* | **at the time, A4 was NOT corrected** — `MERGE-INTO-EXISTING` was still in VET's outputs, so the VET/S3 circularity stood | **cycle-1 A4's disposition was claimed, not verified** · **✅ NOW FIXED** — `MERGE-INTO-EXISTING` is removed from VET's outputs (§S2.2) and §16.1 is corrected |
-| *"the narrowing is PROPOSED… ✅ Recorded as such in §9 (D4)"* | §9 D4 says **`DECIDED (narrowed)`** | **cycle-1 B2.20** — the "fix" replaced one two-ways status with another · **✅ NOW FIXED** — the ⚠️ pending line is deleted and §S3 states `DECIDED (narrowed)` |
-
-**⇒ THE MECHANISM, STATED PLAINLY: a review finding is a CLAIM, not a fact.** Applying one is a **change to the artifact**, and it must be verified against the same primary source the finding cites — **otherwise the review becomes a propagation vector for its own errors**, and the `⚠️ CORRECTED` marker makes the wrong text *more* credible than the right text it replaced. **That is exactly what happened here: the doc's markers became evidence for the wrong reading.**
-
-**⇒ THE RULES THIS PRODUCES, and they are binding on future cycles:**
-
-1. **Verify a finding against its cited primary source before applying it.** A line range, a frozen doc, a `gh` output — **open it.**
-2. **A `⚠️ CORRECTED` marker is not evidence.** It says the text was *changed*, not that the change was *right*.
-3. **Correct the review record too.** `REVIEW-CONSOLIDATED-2026-09-23.md` B2.1 and B2.18 are **themselves wrong** and are the propagation vector; a corrected artifact with an uncorrected review leaves the next lane free to re-apply the error.
-4. **"Also present elsewhere" is not "absent here".** Two of these five are that single misreading.
-
-**⚠️ And the honest counter-note, so this does not become an argument against reviewing:** cycle 2 also found the things cycle 1 got **right** and this document now depends on — the `#4997` index drift, the four-layer placement, the four dedup keys, the `c/r` ordering rule and the sequence of the ten `!`-corrections that hold. **The failure was not review; it was unverified application.**
+> **Review history is not recorded here.** The cycle-1 / cycle-2 record — including the finding that a
+> review finding is a *claim* to be verified against the primary source it cites, not a fact to apply —
+> lives in `REVIEW-CONSOLIDATED-2026-09-23.md`. What a reader of a design reference needs is the resulting
+> design, which the sections above state; how the text came to say it is not part of the design.
 
 ### 16.3 ✅ ALL SIX DECISIONS CLOSED (owner, 2026-09-24)
 
