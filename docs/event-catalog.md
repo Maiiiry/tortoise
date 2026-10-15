@@ -51,6 +51,21 @@
 > row a caller cannot name (#2353 review P2). The eleven unconditional members are
 > exactly `sdk._GRAPH_EVENT_TYPES`.
 >
+> **Two more notes on what the feed reports, both under the same switch.**
+> (1) `PointRetracted` has TWO producers with different end-states (#3300):
+> `retract_point`'s tombstone (`status='retracted'`, terminal-guarded) and
+> `delete_point` / the capture stale-turn sweep's HARD delete (node destroyed,
+> no guard). Their payloads were identical, so the feed reported the tombstone
+> reading for a destroyed node. While the switch is truthy the hard-delete
+> producer adds `deleted: true` to its payload, and the fold reports that
+> producer as `change: "deleted"` with NO `status` and NO precondition; without
+> the marker the row is the tombstone, the type's remaining producer. Off, the
+> hard-delete payload is the same `id`-only mapping it always was.
+> (2) `PointPromoted`'s reported `precondition` is the UNION both producers
+> enforce — `status` in `[draft, null]` — because capture auto-promotion admits
+> an UNSET status (`status IS NULL OR status = 'draft'`) and emits the same type,
+> so `draft` alone would overstate the capture leg (#2353 review P2).
+>
 > The EventAPI/CLI/ingest path emits its own legacy events (`PointAdded`,
 > `PointRetracted`, `PointsMerged`, `IngestStarted`) to the EventLog JSONL —
 > unchanged. Hosted/SDK tenants read the `:GraphEvent` stream below.

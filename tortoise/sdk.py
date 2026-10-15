@@ -2253,7 +2253,7 @@ def _write_capture_turns(
         # subscriber surface. The JSONL half is the ``EntityMutated``
         # op=delete record the replay folds — NOT ``PointRetracted``, whose
         # fold tombstones (the wrong meaning for a removal).
-        sdk._emit_event("PointRetracted", {"id": tid})
+        sdk._emit_event("PointRetracted", _deleted_point_payload(tid))
         sdk._journal_entity_mutation("Point", tid, "delete")
     for i, _turn in enumerate(windowed):
         turn_id = _capture_turn_id(session_id, i, turn_offset)
@@ -2752,6 +2752,28 @@ def _change_feed_enabled() -> bool:
     from .change_feed import enabled
 
     return enabled()
+
+
+def _deleted_point_payload(id: str) -> dict:
+    """The `PointRetracted` store payload for a HARD delete (#2353, #3300).
+
+    `PointRetracted` has two producers with different end-states: this hard
+    delete (the node is gone) and `retract_point`'s tombstone
+    (`status='retracted'`, node kept). The payloads were byte-identical, so the
+    semantic change feed could not tell them apart and reported the tombstone
+    reading — a fabricated `after` whose `precondition` contradicted its own
+    `before`.
+
+    The `deleted` marker is written ONLY under the change-feed switch, so the
+    default `:GraphEvent` payload (and therefore `poll_events`' reply) stays
+    byte-identical; the consumer that needs the distinction is the same one the
+    switch turns on. A missing marker means `retract_point`, the type's other
+    producer.
+    """
+    payload: dict = {"id": id}
+    if _change_feed_enabled():
+        payload["deleted"] = True
+    return payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -10040,12 +10062,15 @@ class TortoiseSDK:
         # Two stores, one meaning each:
         #   * :GraphEvent ONLY (payload style, `id=` omitted) — the subscriber
         #     surface is UNCHANGED; `tortoise_events_poll` still sees the
-        #     point-delete lifecycle row.
+        #     point-delete lifecycle row. #2353: the payload is MARKED while the
+        #     change feed is on (`_deleted_point_payload`) so the feed can tell
+        #     this hard delete from `retract_point`'s tombstone; off, the payload
+        #     is the same `{"id": id}` it always was.
         #   * JSONL ONLY (`EntityMutated` is not in _GRAPH_EVENT_TYPES) — the
         #     replay journal carries the honest hard-delete record, whose fold is
         #     `_delete_entity_by_id`. No `state`: the recorded shape carries
         #     "nothing for a delete".
-        self._emit_event("PointRetracted", {"id": id})
+        self._emit_event("PointRetracted", _deleted_point_payload(id))
         self._journal_entity_mutation("Point", id, "delete")
         # Tag GC (#485): delete orphaned :Tag nodes (no incoming TAGGED edges).
         # Idempotent — DETACH DELETE leaves count-0 tags behind that would

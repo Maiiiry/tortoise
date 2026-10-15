@@ -4577,10 +4577,10 @@ durations:
   # never have a CI duration at PR time (`tools/ci_timing.py --refresh-durations`
   # samples push-to-main runs only), so the >=90% coverage floor (#2876) fails
   # by construction for any test-adding PR. Reading: pytest session total
-  # 15.0s for 18 tests on the embedded carve-out lane
+  # 27.1s for 26 tests on the embedded carve-out lane
   # (`TORTOISE_TEST_CARVE_OUT=1`, HF_HUB_OFFLINE=1), on this host. Replace it in
   # the next sweep.
-  test_change_feed_2353.py: 15.0
+  test_change_feed_2353.py: 27.1
   test_health_ready_nonblocking.py: 3.1
   test_hosted_auth.py: 1.8
   test_ingest_event_endpoint.py: 1.7

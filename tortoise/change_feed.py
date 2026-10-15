@@ -36,6 +36,19 @@ never of the observation. Keeping the two apart is load-bearing: a consumer must
 be able to tell "we saw the old value" (``before``) from "the write path
 refuses this transition unless the old state held" (``precondition``).
 
+ONE EVENT TYPE, TWO END-STATES
+------------------------------
+``PointRetracted`` has two producers (#3300): ``retract_point``'s tombstone
+(``status='retracted'``, node kept, terminal-guarded) and ``delete_point`` /
+the capture stale-turn sweep's HARD delete (node destroyed, no guard). The two
+payloads were identical, so a fold keyed on the type alone reported the
+tombstone reading for a destroyed node — a fabricated ``after`` whose
+``precondition`` contradicted its own ``before``. The hard-delete producers
+therefore mark their payload ``deleted: true`` while this feature is switched
+on (so the default store stays byte-identical), and the fold reports that
+producer as ``change: "deleted"`` with NO ``status`` and NO precondition. A
+row without the marker is ``retract_point`` — the type's remaining producer.
+
 Shape (``changes`` in the ``poll_events`` response)::
 
     [
@@ -89,7 +102,13 @@ _PRECONDITIONS: dict[str, dict[str, Any]] = {
     "PointSuperseded": {"terminal": False},
     "PointRetracted": {"terminal": False},
     "PointInvalidated": {"terminal": False, "outdated": False},
-    "PointPromoted": {"status": "draft"},
+    # `promote_point` CASes `status='draft'`, but capture auto-promotion admits
+    # an UNSET status too (`n.status IS NULL OR n.status = 'draft'`, sdk.py) and
+    # emits this same type with no distinguishing payload. A precondition is the
+    # predicate the write path refuses WITHOUT, so it must be the UNION every
+    # producer enforces: `draft` alone overstates the capture leg. Admitted
+    # values are listed when there is more than one.
+    "PointPromoted": {"status": ["draft", None]},
     "OperatorPromoted": {"status": "draft"},
 }
 
@@ -137,9 +156,22 @@ def _after(type_: str, payload: dict[str, Any]) -> dict[str, Any]:
         for k, v in payload.items():
             if k in _SUBJECT_KEYS or k in _PLUMBING_KEYS:
                 continue
-            # `new_content` is the journal spelling; `content` is the claim's
-            # canonical field name, so the delta speaks the canonical one.
-            after["content" if k == "new_content" else k] = v
+            if k == "new_content":
+                # `update_point` ALWAYS passes `new_content=props.get("content")`
+                # (sdk.py), so a validity-, status-, tag- or annotation-only
+                # revision reaches the store carrying `new_content: None`.
+                # `None` means "no content edit" — `update_point` pops a
+                # `content=None` rather than clearing (#5240) — so reporting it
+                # would assert a content CLEAR nobody performed, and observing
+                # `content: None` would poison the next delta's `before` (the
+                # fold advances on `after`). Report only a real new value.
+                if v is None:
+                    continue
+                # `new_content` is the journal spelling; `content` is the
+                # claim's canonical field name, so the delta speaks canonical.
+                after["content"] = v
+                continue
+            after[k] = v
     elif type_ == "PointSuperseded":
         after["status"] = "superseded"
         if payload.get("new_id"):
@@ -148,7 +180,12 @@ def _after(type_: str, payload: dict[str, Any]) -> dict[str, Any]:
             if payload.get(src) is not None:
                 after[dst] = payload[src]
     elif type_ == "PointRetracted":
-        after["status"] = "retracted"
+        # Two producers, two end-states (#3300): the tombstone keeps the node
+        # and sets `status='retracted'`; the HARD delete DESTROYS it, so there
+        # is no status to report. The marker (written by the hard-delete emit
+        # only under the switch) is what tells them apart.
+        if not _is_hard_delete(type_, payload):
+            after["status"] = "retracted"
     elif type_ == "PointInvalidated":
         after["outdated"] = True
         if payload.get("corrected_by"):
@@ -166,11 +203,16 @@ def _after(type_: str, payload: dict[str, Any]) -> dict[str, Any]:
         for k in ("bias", "precision", "consistency", "directness"):
             if payload.get(k) is not None:
                 after[k] = payload[k]
-    elif type_ in ("DedupeRecorded", "DedupeRejected"):
-        for k in ("candidate_type", "wired", "deferred_to_promotion",
-                  "target_id", "temporal_target_id"):
-            if payload.get(k) is not None:
-                after[k] = payload[k]
+    # `DedupeRecorded` / `DedupeRejected` deliberately have NO arm. Every
+    # in-tree emit uses the `point=` form (sdk.py), so `_emit_event` stores the
+    # bare `{"id": ...}` — the candidate's outcome fields (`candidate_type`,
+    # `wired`, `deferred_to_promotion`, `target_id`, `temporal_target_id`) are
+    # the CALLER's return value and never reach the `:GraphEvent` payload.
+    # Mapping them here yielded only dead keys and an empty `after`; the honest
+    # delta is "a dedupe event was recorded for this claim" (the `change` name)
+    # with no invented fields. The mitigation-creation `PointAdded` (`point=`
+    # form) is the same shape and is equally not reinterpreted: the fold never
+    # invents a snapshot the store did not carry.
     elif type_ == "ObjectSuperseded":
         after["status"] = "superseded"
         for k in ("supersedes_by", "session_id"):
@@ -194,6 +236,46 @@ _CHANGE_NAME = {
     "DedupeRejected": "dedupe-rejected",
     "ObjectSuperseded": "superseded",
 }
+
+
+def _is_hard_delete(type_: str, payload: dict[str, Any]) -> bool:
+    """Is this `PointRetracted` row a HARD delete rather than a tombstone?
+
+    `PointRetracted` has two producers with one shared payload shape (#3300):
+    `retract_point` keeps the node (`status='retracted'`, terminal-guarded) and
+    `delete_point` / the capture stale-turn sweep DESTROY it (no guard). The
+    hard-delete emit marks its payload `deleted: true` while the change feed is
+    on — written only under the switch, so the default `:GraphEvent` payload is
+    byte-identical — which is what lets the fold report the two end-states
+    apart. A row WITHOUT the marker is the tombstone: `retract_point` is the
+    type's remaining producer, so nothing is invented for it.
+    """
+    return type_ == "PointRetracted" and payload.get("deleted") is True
+
+
+def _change_name(type_: str, payload: dict[str, Any]) -> str | None:
+    """The semantic change name for a row, producer-aware for `PointRetracted`.
+
+    A hard delete is not a retraction — the destroy and the tombstone are
+    different news — so the marker selects the `deleted` name. Every other type
+    maps by name alone.
+    """
+    if _is_hard_delete(type_, payload):
+        return "deleted"
+    return _CHANGE_NAME.get(type_)
+
+
+def _precondition(type_: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The write-path precondition to report for this row, if any.
+
+    `PointRetracted` is special-cased: the hard-delete producer is the one
+    transition with NO guard at all (`delete_point` checks only existence), so
+    attaching the tombstone's `terminal: False` to it would assert a refusal
+    that never happened — contradicting the row's own `before`.
+    """
+    if _is_hard_delete(type_, payload):
+        return None
+    return _PRECONDITIONS.get(type_)
 
 
 def _observed_before(after: dict[str, Any],
@@ -222,12 +304,12 @@ def aggregate_changes(events: list[dict[str, Any]] | None) -> list[dict[str, Any
 
     for ev in sorted(events or [], key=lambda e: e.get("seq") or 0):
         type_ = ev.get("type")
-        name = _CHANGE_NAME.get(type_)
-        if name is None:
-            continue
         payload = ev.get("payload")
         if not isinstance(payload, dict):
             payload = {}
+        name = _change_name(type_, payload)
+        if name is None:
+            continue
         after = _after(type_, payload)
         for subject in _subjects(payload):
             seen = observed.get(subject, {})
@@ -241,8 +323,9 @@ def aggregate_changes(events: list[dict[str, Any]] | None) -> list[dict[str, Any
             before = _observed_before(after, seen)
             if before:
                 delta["before"] = before
-            if _PRECONDITIONS.get(type_):
-                delta["precondition"] = dict(_PRECONDITIONS[type_])
+            precondition = _precondition(type_, payload)
+            if precondition:
+                delta["precondition"] = dict(precondition)
             delta["after"] = after
             group = grouped.get(subject)
             if group is None:

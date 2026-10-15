@@ -19,6 +19,20 @@ WHAT THIS PINS
    registered claim type, so `poll_events(types=["PointRevised"])` and a
    `PointRevised` webhook subscription work instead of raising
    `ValueError: unknown event type`.
+5. **A non-content revision reports no `content`** (review P1): the store carries
+   `new_content: null` for a validity-only edit (`update_point` always passes
+   `new_content=props.get("content")`), and the fold must not turn that into an
+   invented content CLEAR — nor OBSERVE it, which would fabricate the next
+   delta's `before`.
+6. **`PointRetracted`'s two producers are told apart** (review P2): the
+   hard-delete emit marks its payload under the switch, so a `delete_point` is
+   reported as `deleted` with no fabricated `status`/`precondition`, while
+   `retract_point` keeps its tombstone delta. `PointPromoted`'s precondition is
+   the union every producer enforces (`draft` or unset), not the CAS alone.
+7. **No dead enumeration survives** (review P3): the dedupe `after` mapping that
+   could never fire (the store payload is the bare `{"id": ...}` those emits
+   write) is removed rather than left reading as a contract the feed does not
+   honour.
 
 NOTE ON THE E2E FIXTURE. The issue's E2E names "supersede + retract + evidence-add
 on ONE point". That exact triple is UNREACHABLE: retract and supersede are both
@@ -189,6 +203,55 @@ def test_revision_type_is_subscribable(monkeypatch, sdk_factory, tmp_path):
         sdk.close()
 
 
+# ── 2c. a non-content revision invents no `content` (review P1) ─────────────
+
+def test_non_content_revision_reports_no_fabricated_content():
+    """`update_point` always ships `new_content=props.get("content")`, so a
+    validity-only edit reaches the store with `new_content: None`. `None` means
+    "no content edit" (#5240), so the delta must neither report `content: null`
+    (a CLEAR nobody performed) nor observe it (which would fabricate the NEXT
+    delta's `before`). Pure fold — fails on the pre-fix code both ways."""
+    from tortoise.change_feed import aggregate_changes
+
+    events = [
+        {"seq": 1, "ts": "t1", "event_id": "e1", "type": "PointRevised",
+         "payload": {"id": "p", "new_content": "v2"}},
+        {"seq": 2, "ts": "t2", "event_id": "e2", "type": "PointRevised",
+         "payload": {"id": "p", "new_content": None,
+                     "validTo": "2030-01-01T00:00:00+00:00"}},
+        {"seq": 3, "ts": "t3", "event_id": "e3", "type": "PointRevised",
+         "payload": {"id": "p", "new_content": "v3"}},
+    ]
+    deltas = aggregate_changes(events)[0]["changes"]
+    # the validity-only edit: no content claim at all
+    assert deltas[1]["after"] == {"validTo": "2030-01-01T00:00:00+00:00"}
+    assert "content" not in deltas[1]["after"]
+    # and it no longer poisons the next `before` with the fabricated null
+    assert deltas[2]["before"] == {"content": "v2"}
+    assert deltas[2]["after"] == {"content": "v3"}
+
+
+def test_validity_only_revision_reports_no_content(monkeypatch, sdk_factory, tmp_path):
+    """The same contract driven through the REAL write path: a `validTo`-only
+    edit between two content edits must not report a content CLEAR."""
+    monkeypatch.setenv("TORTOISE_CHANGE_FEED", "1")
+    sdk = sdk_factory(tmp_path)
+    try:
+        p = sdk.create_point("statement", "v1")
+        sdk.update_point(p["id"], content="v2")
+        sdk.update_point(p["id"], validTo="2030-01-01T00:00:00+00:00")
+        sdk.update_point(p["id"], content="v3")
+        deltas = _group(sdk.poll_events()["changes"], p["id"])["changes"]
+        assert [d["change"] for d in deltas] == [
+            "created", "revised", "revised", "revised"]
+        assert "content" not in deltas[2]["after"], deltas[2]
+        assert deltas[2]["after"]["validTo"]
+        assert deltas[3]["before"] == {"content": "v2"}, deltas[3]
+        assert deltas[3]["after"] == {"content": "v3"}
+    finally:
+        sdk.close()
+
+
 # ── 3. the feed is semantic ────────────────────────────────────────────────
 
 def test_poll_events_changes_returns_per_claim_deltas(monkeypatch, sdk_factory, tmp_path):
@@ -243,6 +306,69 @@ def test_retraction_reports_its_own_kind(monkeypatch, sdk_factory, tmp_path):
         g = _group(sdk.poll_events()["changes"], p["id"])
         assert [c["change"] for c in g["changes"]] == ["created", "retracted"]
         assert g["changes"][1]["after"] == {"status": "retracted"}
+    finally:
+        sdk.close()
+
+
+def test_hard_delete_is_not_reported_as_a_retraction(monkeypatch, sdk_factory,
+                                                      tmp_path):
+    """`PointRetracted` has two producers (#3300). The hard delete DESTROYS the
+    node, so the delta must not claim `status: retracted` (fabricated) nor the
+    tombstone's `terminal: False` precondition (no guard exists on that path —
+    the delete of an already-retracted point proves it). Reported as `deleted`.
+    """
+    monkeypatch.setenv("TORTOISE_CHANGE_FEED", "1")
+    sdk = sdk_factory(tmp_path)
+    try:
+        p = sdk.create_point("statement", "doomed")
+        sdk.retract_point(p["id"])
+        assert sdk.delete_point(p["id"]) is True
+        deltas = _group(sdk.poll_events()["changes"], p["id"])["changes"]
+        assert [d["change"] for d in deltas] == [
+            "created", "retracted", "deleted"]
+        # the TOMBSTONE keeps its own end-state
+        assert deltas[1]["after"] == {"status": "retracted"}
+        assert deltas[1]["precondition"] == {"terminal": False}
+        # the DELETE states no status and carries no guard it does not have
+        delete = deltas[2]
+        assert delete["after"] == {}
+        assert "precondition" not in delete, delete
+        assert "status" not in delete["after"]
+    finally:
+        sdk.close()
+
+
+def test_hard_delete_of_a_live_point_keeps_the_deleted_kind(monkeypatch,
+                                                            sdk_factory, tmp_path):
+    """The live-point hard delete (the other producer repro): same honest delta."""
+    monkeypatch.setenv("TORTOISE_CHANGE_FEED", "1")
+    sdk = sdk_factory(tmp_path)
+    try:
+        p = sdk.create_point("statement", "live then gone")
+        sdk.delete_point(p["id"])
+        deltas = _group(sdk.poll_events()["changes"], p["id"])["changes"]
+        assert [d["change"] for d in deltas] == ["created", "deleted"]
+        assert deltas[1]["after"] == {}
+        assert "precondition" not in deltas[1]
+    finally:
+        sdk.close()
+
+
+def test_off_switch_keeps_the_hard_delete_payload_byte_identical(
+        monkeypatch, sdk_factory, tmp_path):
+    """The `deleted` marker is opt-in: with the switch off the hard-delete
+    `:GraphEvent` payload is exactly the `{"id": ...}` mapping it always was
+    (the off-contract passes unchanged by construction — that is its purpose)."""
+    monkeypatch.delenv("TORTOISE_CHANGE_FEED", raising=False)
+    sdk = sdk_factory(tmp_path)
+    try:
+        p = sdk.create_point("statement", "gone")
+        assert sdk.delete_point(p["id"]) is True
+        rows = [e for e in _graph_events(sdk._get_proj())
+                if e["type"] == "PointRetracted"]
+        assert len(rows) == 1, rows
+        assert json.loads(rows[0]["payload"]) == {"id": p["id"]}
+        assert "changes" not in sdk.poll_events()
     finally:
         sdk.close()
 
@@ -362,6 +488,69 @@ def test_revision_status_before_after_is_observed_only(monkeypatch):
     assert deltas[1]["before"] == {"status": "draft"}
     assert deltas[1]["after"] == {"status": "live"}
     assert "precondition" not in deltas[1]
+
+
+def test_dedupe_delta_reports_the_event_without_inventing_fields():
+    """Every in-tree dedupe emit uses the `point=` form, so the store payload
+    is the bare `{"id": ...}` — the candidate's outcome fields are the caller's
+    return value and never ride the store. The fold reports the event by name
+    and invents nothing (the pre-fix arm enumerated keys that could not appear).
+    """
+    from tortoise.change_feed import aggregate_changes
+
+    events = [
+        {"seq": 1, "ts": "t1", "event_id": "e1", "type": "DedupeRecorded",
+         "payload": {"id": "cand"}},
+        {"seq": 2, "ts": "t2", "event_id": "e2", "type": "DedupeRejected",
+         "payload": {"id": "cand"}},
+    ]
+    deltas = aggregate_changes(events)[0]["changes"]
+    assert [d["change"] for d in deltas] == ["dedupe-recorded", "dedupe-rejected"]
+    assert deltas[0]["after"] == {}
+    assert deltas[1]["after"] == {}
+
+
+def test_promoted_precondition_admits_an_unset_prior_status():
+    """`PointPromoted` has two producers: `promote_point` CASes `status='draft'`
+    and capture auto-promotion admits an UNSET status too (sdk.py:3990-3995). A
+    precondition is what the write path refuses WITHOUT, so it must be the union
+    — `draft` alone overstates the capture leg. Pure fold: fails pre-fix."""
+    from tortoise.change_feed import aggregate_changes
+    events = [
+        {"seq": 1, "ts": "t1", "event_id": "e1", "type": "PointPromoted",
+         "payload": {"id": "p"}},
+    ]
+    delta = aggregate_changes(events)[0]["changes"][0]
+    assert delta["change"] == "promoted"
+    assert delta["after"] == {"status": "live"}
+    assert delta["precondition"] == {"status": ["draft", None]}
+
+
+def test_capture_auto_promotion_of_an_unset_status_claim_is_reported(
+        monkeypatch, sdk_factory, tmp_path):
+    """The capture leg admits an UNSET prior status (`status IS NULL OR
+    'draft'`) and emits the SAME `PointPromoted` type `promote_point` does, so
+    the reported precondition must be the union both producers enforce — pinned
+    through the REAL capture producer, not only the fold."""
+    from tortoise.sdk import _apply_capture_ingest_ep
+
+    monkeypatch.setenv("TORTOISE_CHANGE_FEED", "1")
+    sdk = sdk_factory(tmp_path)
+    try:
+        p = sdk.create_point("statement", "unset then promoted")
+        proj = sdk._get_proj()
+        # the capture writer mints claims WITHOUT a status on the legacy path
+        proj.g.query("MATCH (n:Point {id:$id}) REMOVE n.status",
+                     params={"id": p["id"]})
+        _apply_capture_ingest_ep(sdk, [p["id"]], promotion_ids=[p["id"]],
+                                 operator_ids=[])
+        promoted = [d for d in _group(sdk.poll_events()["changes"], p["id"])["changes"]
+                    if d["change"] == "promoted"]
+        assert len(promoted) == 1, promoted
+        assert promoted[0]["after"] == {"status": "live"}
+        assert promoted[0]["precondition"] == {"status": ["draft", None]}
+    finally:
+        sdk.close()
 
 
 def test_supersede_is_news_about_the_superseded_claim(monkeypatch, sdk_factory,
