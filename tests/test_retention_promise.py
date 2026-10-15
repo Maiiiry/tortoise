@@ -209,14 +209,19 @@ _NAMED_CONSTANT_MODULES = {
     "tortoise/backup_config.py",
 }
 
-# Large modules that merely USE the constants — exempt ONLY on lines that name
-# a constant or link the canonical doc. A whole-file exemption on a ~24k-line
-# module hid a new independent literal (#4179 review).
+# Large modules (and the canonical ONTOLOGY doc) that merely USE the constants —
+# exempt ONLY on lines that name a constant or link the canonical doc. A
+# whole-file exemption on a ~24k-line module hid a new independent literal
+# (#4179 review). `docs/ONTOLOGY.md` is here rather than in SCATTER_ALLOWLIST so
+# its other window prose stays gated: only the §4.6 row that names
+# `RAW_DELETION_MARKER_TTL` is exempt.
 _NAMED_CONSTANT_USER_FILES = {
     "tortoise/backup_sweep.py",
     "tortoise/hosted_api.py",
     "tortoise/sdk.py",
     "tortoise/supabase_control.py",
+    "tortoise/raw_state.py",
+    "docs/ONTOLOGY.md",
 }
 
 # The canonical constant names. A claim line in a user file is exempt when it
@@ -224,7 +229,8 @@ _NAMED_CONSTANT_USER_FILES = {
 _NAMED_CONSTANT_RE = re.compile(
     r"\b(?:RESTORE_WINDOW_(?:DAYS|HOURS)|_GRAPH_PURGE_GRACE_DAYS"
     r"|_TRASH_GRACE_DAYS|TEAM_DELETE_GRACE_HOURS|USER_ACCOUNT_DELETE_GRACE_HOURS"
-    r"|LOCK_DAYS_MAX|retention_(?:hourly|daily|weekly))\b"
+    r"|LOCK_DAYS_MAX|RAW_DELETION_MARKER_TTL"
+    r"|retention_(?:hourly|daily|weekly))\b"
 )
 
 
@@ -245,6 +251,7 @@ _WINDOW_NOUN = (
 # promise-bearing copy (#4179 review).
 _WINDOW_RE = (
     r"(?:\b7\s*-?\s*d(?:ays?)?\b"
+    r"|\b10\s*-?\s*d(?:ays?)?\b"
     r"|\b168\s*-?\s*h(?:ours?|rs?|r)?\b"
     r"|\b24\s*-?\s*h(?:ours?|rs?|r)?\b"
     r"|\b28\s*-?\s*days?\b"
