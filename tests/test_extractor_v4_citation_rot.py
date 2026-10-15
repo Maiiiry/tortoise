@@ -57,6 +57,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "EXTRACTOR-V4-ARCHITECTURE.md"
 STORAGE = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
 ONTOLOGY = ROOT / "docs" / "ONTOLOGY.md"
+ONTOLOGY_CHANGELOG = ROOT / "docs" / "ONTOLOGY-CHANGELOG.md"
 INGEST = ROOT / "docs" / "INGEST_CONTRACT.md"
 EVAL_SPEC = ROOT / "docs" / "epistemic-layer-eval-spec.md"
 #: The documents that carry the same claims as `DOC`. Several of these claims
@@ -230,13 +231,13 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     ),
     (
         ONTOLOGY,
-        "ONTOLOGY tracks the direction-sourcing gap as `#7852`",
-        "tracked as `#7852` (`#7813` is CLOSED `COMPLETED`)",
+        "ONTOLOGY states the four-value direction vocabulary",
+        "four values: `->`, `<-`, `<->`, `-`",
     ),
     (
         ONTOLOGY,
-        "ONTOLOGY states `#2421` closed with the triage untracked",
-        "the per-edge triage is NOT yet implemented and has no open tracker",
+        "ONTOLOGY states the restatement-vs-correction policy",
+        "**restatement-vs-correction policy**",
     ),
     (
         STORAGE,
@@ -255,13 +256,13 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     ),
     (
         ONTOLOGY,
-        "ONTOLOGY attributes the untracked triage to the closed design, not a tracker",
-        "the design was #2421 (CLOSED `COMPLETED`) and it has no open tracker",
+        "ONTOLOGY states the per-edge triage as the design, not as a tracker",
+        "edge disposition is decided **per edge at write time**",
     ),
     (
         ONTOLOGY,
-        "ONTOLOGY's shared replacement-edge semantics qualify `#2421` as the closed design",
-        "restatement-vs-correction policy** (#2421 — the design is CLOSED `COMPLETED`; the per-edge triage is not implemented and has no open tracker)",
+        "ONTOLOGY's shared replacement-edge semantics name the policy without a tracker",
+        "**restatement-vs-correction policy**. `invalidate_point(id, corrected_by)` =",
     ),
     (
         EVAL_SPEC,
@@ -304,8 +305,8 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
         "operator endpoints are live (`#7902`)",
     ),
     (
-        ONTOLOGY,
-        "ONTOLOGY records `#5126` as landed, not as an open residual",
+        ONTOLOGY_CHANGELOG,
+        "the changelog records `#5126` as landed, not as an open residual",
         "**Landed:** `#5126`",
     ),
     (
@@ -527,4 +528,48 @@ def test_every_quoted_symbol_citation_resolves_at_head():
             f"doc line {line}: `{sym}` -> {where} ({why})"
             for line, sym, where, why in unresolved
         )
+    )
+
+
+#: An issue's open/closed state asserted in the model reference. The ontology
+#: states the model; whether a tracker entry is closed is not a fact about the
+#: model, and is exactly the shape that accumulated a 730-line changelog and a
+#: per-field `Impl` column inside a document whose own header declares it is
+#: *"not a status report on what is built."*
+_STATUS_ADJACENT = re.compile(
+    r"#[0-9]{3,5}[^.\n]{0,40}?\b(?:CLOSED|COMPLETED|LANDED|FILED)\b"
+    r"|\b(?:CLOSED|COMPLETED|LANDED|FILED)\b[^.\n]{0,40}?#[0-9]{3,5}"
+)
+
+#: A change narrated as a change, rather than the rule it settled on. The record
+#: of what changed belongs in `ONTOLOGY-CHANGELOG.md`, which is what a changelog
+#: is for.
+_CHANGE_NARRATION = re.compile(r"an earlier (?:draft|version)|CORRECTED 20[0-9]{2}-", re.IGNORECASE)
+
+
+def test_the_model_reference_carries_no_issue_state_or_change_narration():
+    """`ONTOLOGY.md` states the model. Status and change history live elsewhere.
+
+    The document carried the opposite of its own header: a 730-line changelog
+    (37% of the file, all 31 entries appended by `feat`/`fix`/`refactor`/`test`
+    commits), a per-field `Impl` column across five §4 tables, and issue-state
+    assertions in the body — while the header told the reader to consult that
+    apparatus for status. All of it moved to `ONTOLOGY-CHANGELOG.md` (#8542).
+
+    This pins the CLASS rather than the strings, so the next lane cannot
+    reintroduce it by appending one status claim — which is how the changelog
+    accumulated in the first place. A literal pin cannot catch that: it only
+    knows the violations it was written against.
+    """
+    text = ONTOLOGY.read_text(encoding="utf-8")
+    offenders = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if _STATUS_ADJACENT.search(line):
+            offenders.append(f"{ONTOLOGY.name}:{number}: issue-state claim: {line.strip()[:160]}")
+        if _CHANGE_NARRATION.search(line):
+            offenders.append(f"{ONTOLOGY.name}:{number}: change narration: {line.strip()[:160]}")
+    assert not offenders, (
+        "ONTOLOGY.md is the model reference and must state the model. An issue's "
+        "open/closed state, and the narrative of what changed, belong in "
+        "`ONTOLOGY-CHANGELOG.md` (#8542):\n  - " + "\n  - ".join(offenders)
     )
