@@ -80,8 +80,7 @@ from .live import classify_lifecycle_fanout  # #7822 fan-out-wide lifecycle verd
 from .live import LIFECYCLE_FANOUT_QUERY  # #7822 the shared fan-out statement
 from .live import EPISTEMIC_LABELS  # #7902 epistemic-label write widening (shared with #7853 read widening)
 from .raw_state import (  # #3998: the absent-raw state
-    RAW_ABSENT_STATES,
-    RAW_PRESENT,
+    WRITABLE_RAW_STATES,
     raw_entry,
     validate_raw_state,
 )
@@ -15622,8 +15621,12 @@ class TortoiseSDK:
         chain = {"point": {"id": point_id, "content": (point.get("content") or "")[:200],
                            "authoredBy": author}}
         # #3998 (D30): the raw is OPTIONAL. Attach the source's index entry —
-        # including the absent-raw state — so a memory whose raw was deleted,
-        # went offline, or had access revoked is still readable AND SAYABLE.
+        # including the absent-raw state — so a memory whose raw was deleted is
+        # still readable AND SAYABLE. `offline`/`access_revoked` are conditions
+        # observed live, never stored (Option A ruling, 2026-10-14), so this
+        # reader reports the RECORD it holds; a caller that has actually probed
+        # the raw routes the observation through
+        # `raw_state.resolve_raw_availability`.
         # Additive: emitted only when the point HAS an extractedFrom source,
         # so a sourceless point's response is byte-identical. Set BEFORE the
         # early returns below, so every exit path carries it.
@@ -25261,10 +25264,12 @@ class TortoiseSDK:
                     raise ValueError(
                         f"{_managed!r} is server-managed on a :Source and "
                         f"cannot be set through the generic entity surface "
-                        f"(#3998/D30). Record an absence with "
+                        f"(#3998/D30). Record a DELETION with "
                         f"`create_source(..., raw_state=...)`, which validates "
-                        f"the value (accepted: {sorted(RAW_ABSENT_STATES)} or "
-                        f"{RAW_PRESENT!r})."
+                        f"the value (accepted: {sorted(WRITABLE_RAW_STATES)}). "
+                        f"`offline`/`access_revoked` are CONDITIONS, observed "
+                        f"live and never stored (raw_state's \"Option A\" "
+                        f"ruling, 2026-10-14)."
                     )
                 # ⛔ The retired fields are deliberately OUT of this closed
                 # check: they are left to the #5026/D10 guard below, which owns
@@ -28735,9 +28740,16 @@ class TortoiseSDK:
             `docs/durability-posture.md` → *`:Source` — recorded vs
             recomputable, field by field* (R2) and
             `docs/architecture/STORAGE-ARCHITECTURE.md` §9.6.
-          - ``raw_state=`` (#3998, D30) — the ABSENT-RAW state: one of
-            ``present`` / ``deleted`` / ``offline`` / ``access_revoked``.
-            Validated strictly (an unknown value raises ``ValueError``) and
+          - ``raw_state=`` (#3998, D30) — the ABSENT-RAW state. A DELETION is
+            an ACT and is recorded durably: one of ``present`` / ``deleted``.
+            ``offline`` / ``access_revoked`` are CONDITIONS, observed live and
+            NEVER stored (the owner's #3998 ruling, Option A, 2026-10-14) —
+            passing one is refused with a message saying so, and the read path
+            derives it through ``raw_state.resolve_raw_availability``. The
+            deletion marker is BOUNDED by ``raw_state.RAW_DELETION_MARKER_TTL``
+            (bounded metadata about the link back to the raw — never a
+            retention period on user content, R1). Validated strictly (an
+            unknown value raises ``ValueError``) and
             PRESERVED by a later upsert that carries none, so a re-ingest
             cannot resurrect a raw deleted between the two writes. Pass
             ``raw_state="present"`` to record that a raw came BACK — that is
@@ -29856,7 +29868,10 @@ class TortoiseSDK:
         reference are preferred, so a Point extracted from several sources
         keeps returning a referenced entity whenever one exists.
         #3998 (D30): the raw is OPTIONAL — the chain must stay readable and
-        SAYABLE when the raw was deleted, is offline, or access was revoked.
+        SAYABLE when the raw was deleted. `offline` / `access_revoked` are
+        conditions observed live and never stored (Option A ruling,
+        2026-10-14), so this reader reports the record it holds and never an
+        empty result standing in for an unreachable raw.
         Every item therefore carries ``raw``: the source's index entry
         (identity + version + availability), never a copy of the raw and never
         an exception. A source whose raw is gone still returns HERE — the node
