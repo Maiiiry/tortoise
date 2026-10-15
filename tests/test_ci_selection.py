@@ -115,6 +115,13 @@ def test_docs_scanning_gates_stay_in_tier1():
         "edit never runs it; without this hermetic pin the §4.7 coverage-rule "
         "drift lands green (#4309 class, same as #5142/#2881)"
     )
+    assert "test_8474_ontology_record.py" in tier1, (
+        "#8474 §4.6 rawState/rawStateAt availability doc↔code pin must be in "
+        "tier1 — `docs/` is in NON_PYTHON_PREFIXES, so a docs-only "
+        "`docs/ONTOLOGY.md` edit selects no surface and runs only tier1; "
+        "without this hermetic pin the §4.6 row's ruling/contract drift lands "
+        "green (#4309 class, same as #5142/#7818/#2881)"
+    )
     assert "test_7818_plan_record_5362.py" in tier1, (
         "#7818/#5362 plan-record pin must be in tier1 — the #5362 plan's "
         "RES-1 residual and out-of-scope list are docs the drift arrives on, "

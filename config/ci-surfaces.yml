@@ -1055,6 +1055,14 @@ surfaces:
   # the module itself — the same shape and the same reason as
   # `test_selfhost_rest.py` above.
   - test_3998_raw_absent_state.py
+  # #8474: the §4.6 raw-availability record (the #3998 row) vs the code — the
+  # hermetic doc half, split out of `test_3998_raw_absent_state.py` so it can be
+  # registered in `tier1` too. A `docs/ONTOLOGY.md`-only edit selects no surface
+  # (`docs/` is in NON_PYTHON_PREFIXES) and runs tier1 only, so a pin inside the
+  # docker-lane #3998 file slept on the exact change it guards. Same shape and
+  # same reason as the #5142/#7818 ontology-record pins above — dual-registered
+  # with `core`.
+  - test_8474_ontology_record.py
   # #4030: `supabase/config.toml` is TRACKED and resolves its providers by
   # `env(NAME)`, so every one of those names is required by a file in this
   # repo — and `.env.example` is the contract an operator reads to find it. The
@@ -3619,6 +3627,7 @@ tier1:
 - test_durability_posture.py  # #2881: durability authority + scoped source-of-truth gate
 - test_5142_ontology_record.py  # #5142: docs/ONTOLOGY.md §4.4/§4.6 record vs the code (format/`_SOURCE_HANDLED`, the deferred node collapse + its `OVERRIDES:`, the document `:Source` scoping) — dual-registered with `core`
 - test_7818_ontology_record.py  # #7818: docs/ONTOLOGY.md §4.7 coverage-boundary record vs `_covers` (hermetic doc pin; a docs-only ONTOLOGY edit runs only tier1) — dual-registered with `core`
+- test_8474_ontology_record.py  # #8474: docs/ONTOLOGY.md §4.6 rawState/rawStateAt availability record vs the declared write surface (hermetic doc pin; a docs-only ONTOLOGY edit runs only tier1) — dual-registered with `core`
 - test_7818_plan_record_5362.py  # #7818/#5362: the #5362 plan's RES-1 / out-of-scope read-path record vs the shipped reply contract (hermetic doc pin; a docs-only plan edit runs only tier1) — dual-registered with `core`
 - test_ep_draft_filter.py
 - test_ep_operatorless.py
