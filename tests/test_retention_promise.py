@@ -354,6 +354,8 @@ def test_claim_regex_covers_new_forms_and_rejects_unrelated_numbers():
         "backups are retained for 24 hours",
         "the trash grace is 7d",
         "restore it for 7 days",
+        "the deletion marker is bounded for 10 days",
+        "the trash grace is 10d",
     ):
         assert _CLAIM_RE.search(claim), f"scan misses a real claim: {claim!r}"
     for unrelated in (

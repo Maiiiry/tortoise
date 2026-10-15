@@ -28756,7 +28756,10 @@ class TortoiseSDK:
             cannot resurrect a raw deleted between the two writes. Pass
             ``raw_state="present"`` to record that a raw came BACK — that is
             the only way to move a state off an absence, by design. The state
-            rides the ``SourceCreated`` journal, so it survives ``rebuild_all``.
+            rides the ``SourceCreated`` / ``SourceVersioned`` journal (a state
+            change riding a version transition is journalled as
+            ``SourceVersioned``; see ``docs/ONTOLOGY.md`` §4.6), so it survives
+            ``rebuild_all``.
             ⚠️ This is the write half of the two-store model: the graph keeps
             identity + version + availability and NEVER the bytes, so props
             that would carry raw payload are refused (see ``_SOURCE_EXTRA_PROPS``

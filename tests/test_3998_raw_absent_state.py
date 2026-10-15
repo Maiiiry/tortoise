@@ -372,10 +372,10 @@ def test_a_datetime_max_stamp_is_unfit_to_reason_on_and_never_raises():
     (2) REACHABLE: ``datetime.max`` is a real ISO-8601 stamp; the resolver is
         documented never to raise, and the read path must not either.
     """
-    stamp = datetime.max.replace(tzinfo=UTC).isoformat()
-    marked = {RAW_STATE_PROP: RAW_DELETED, RAW_STATE_AT_PROP: stamp}
+    instant = datetime.max.replace(tzinfo=UTC)
+    marked = {RAW_STATE_PROP: RAW_DELETED, RAW_STATE_AT_PROP: instant.isoformat()}
     assert deletion_marker_expires_at(marked) is None
-    assert is_deletion_marker_expired(marked, now=stamp) is False
+    assert is_deletion_marker_expired(marked, now=instant) is False
 
 
 def test_a_deletion_marker_is_still_honoured_past_its_window():
