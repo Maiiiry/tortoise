@@ -239,6 +239,44 @@ DANGLING_REFERENCES: dict[Path, dict[str, str]] = {
     },
 }
 
+#: The scan above is scoped to the two EDITED documents. #8542's inbound pointers
+#: live outside them — in a production docstring, the consolidated review, the
+#: stage guards and the cost brief — so the in-document scan stays green while a
+#: reader following those lands on the removed §15 issue map, the §16.1–§16.2
+#: review record, or a STORAGE §13 issue-map row. Each literal below was live at
+#: the pre-fix head (this guard reds on it); the #8542 fix re-points every one.
+INBOUND_DANGLING_REFERENCES: dict[Path, dict[str, str]] = {
+    ROOT / "docs" / "architecture" / "REVIEW-CONSOLIDATED-2026-09-23.md": {
+        "the cycle-1 record is cited as extractor §16.1": "extractor doc's §16.1",
+        "the B2.1 revert is cited to extractor §16.2": "reverted; see extractor doc §16.2",
+        "the B2.18 revert is cited to extractor §16.2": (
+            "thresholds restored; see extractor doc §16.2"
+        ),
+        "the binding lesson is cited to extractor §16.2": "binding (extractor doc §16.2)",
+    },
+    ROOT / "tortoise" / "vet_gate.py": {
+        "the A4 correction is cited to extractor §16.2": "the A4 correction §16.2 records",
+    },
+    ROOT / "tests" / "test_vet_gate_5005.py": {
+        "the A4 test comment is cited to extractor §16.2": "A4 (§16.2, corrected)",
+    },
+    ROOT / "tests" / "test_extractor_v4_s4_stage_claims.py": {
+        "the E4 property cites the removed §15 issue-map row": "§15's `§1 v2 → v3 → v4` row",
+    },
+    ROOT / "config" / "ci-surfaces.yml": {
+        "the citation-guard comment cites the removed §15 value-gate row": "— §15's",
+    },
+    ROOT
+    / "docs"
+    / "research"
+    / "2026-09-24-4333-node-volume-storage-cost"
+    / "research-brief.md": {
+        "the cost brief cites the removed STORAGE §13 correction": (
+            "`STORAGE-ARCHITECTURE.md` §13 already corrects this"
+        ),
+    },
+}
+
 #: A measurement whose only home was a removed issue-map row and which was NOT
 #: moved: the `0/4` planted-operator grade. #8542's body claims facts pinned in
 #: the removed maps were "moved rather than deleted"; this one was deleted, so
@@ -431,6 +469,21 @@ def test_the_removed_sections_leave_no_dangling_references():
         "a section was removed and the sections that pointed at it were not "
         "re-pointed, so a reader lands on content that no longer exists:\n  - "
         + "\n  - ".join(hits)
+    )
+
+
+def test_the_removed_sections_leave_no_dangling_inbound_references():
+    hits = [
+        f"{path.name}: {name}"
+        for path, literals in INBOUND_DANGLING_REFERENCES.items()
+        for name, literal in literals.items()
+        if literal in path.read_text(encoding="utf-8")
+    ]
+    assert not hits, (
+        "a section was removed from EXTRACTOR/STORAGE and a file that points at "
+        "it from OUTSIDE the two edited documents was not re-pointed — the "
+        "in-document scan cannot see these, so a reader following them still "
+        "lands on content that no longer exists:\n  - " + "\n  - ".join(hits)
     )
 
 

@@ -2032,7 +2032,7 @@ surfaces:
   # closed here because the doc's subject code (`tortoise/extractor_v2.py`) matches no
   # named surface either, so `core` is already its lane.
   - test_extractor_v4_step_list_consistency.py
-  # #8498 review P2: the sibling citation guard over the SAME document — §15's
+  # #8498 review P2: the sibling citation guard over the SAME document — the §8
   # value-gate row must name the shipped symbol (`value_gate._REFERENCE` /
   # `identifier_only()`), not `#4899`'s *proposed* `^#\d{3,}$` pattern, which the
   # shipped module contradicts in both directions. Dual-registered (`core` +

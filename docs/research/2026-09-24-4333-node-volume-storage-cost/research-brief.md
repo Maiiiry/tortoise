@@ -40,7 +40,7 @@ The issue asks which of **three causes** is operating: **(a) writing the wrong t
 
 **⚠️ Corrections the measurements force, recorded before any verdict:**
 
-- **"5.6 KB per quota node" is denominator-dependent.** 140 MB ÷ 25,000 capped nodes = 5.6 KB, but the numerator includes ~21,214 **quota-free** episodic turn Points plus Events, Sources, scaffolding and the whole index. **140 MB ÷ 51,012 labelled resident nodes ≈ 2.75 KB.** Both are true; they answer different questions. (`STORAGE-ARCHITECTURE.md` §13 already corrects this; the brief keeps both explicitly.)
+- **"5.6 KB per quota node" is denominator-dependent.** 140 MB ÷ 25,000 capped nodes = 5.6 KB, but the numerator includes ~21,214 **quota-free** episodic turn Points plus Events, Sources, scaffolding and the whole index. **140 MB ÷ 51,012 labelled resident nodes ≈ 2.75 KB.** Both are true; they answer different questions. (`STORAGE-ARCHITECTURE.md` §17.4.2's measured-inputs table corrects this; the brief keeps both explicitly.)
 - **`GRAPH.MEMORY USAGE` is a sampling estimate** (`SAMPLES`, default 100) — the 141 MB is a good number, not an exact one.
 
 ---

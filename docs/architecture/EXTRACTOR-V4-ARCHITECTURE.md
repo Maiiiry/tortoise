@@ -899,6 +899,8 @@ New entities + connections + **metadata**. The metadata includes **lifecycle eve
 
 **⚠️ State of the shipped code — this section is a SPEC CHANGE, not a description of what runs.** The load-bearing instance is S3. The shipped `search_graph` degrades instead of raising (correct, `#3679`), but its renderer then tells the model **"no existing items available; assume everything is new"** (`_render_search_results` (`extractor_v2.py:2353` at `7d348d351`)) — **the current code implements the INVERTED policy**, and it is the duplication-manufacturing direction G3 names. The policy above requires the `HOLD` path; until `#5087` (E1) lands it, **a degraded lookup still mints. Do not read this section as landed.**
 
+**⚠️ The capture-path defect class this pipeline produced** — recorded as the class, not a live defect list: mid-word truncation at 5,000 characters; secrets captured with no redaction on the layer (its v4 raw-layer consequence is §4.3 G4); **2 of 4 harnesses 404**; and **quota refusals invisible to the caller**. These are historical capture failures the v4 pipeline must not reproduce, not live defects in the design above.
+
 ---
 
 ## 5. The connection and lifecycle model
@@ -1328,9 +1330,9 @@ From migration `e9b2c7d1f3a4_drop_entity_memory_links.py` (2026-05-26):
 open, and which are filed is read from the tracker — never from here. A document that mirrors issue state
 is wrong the day after it is written, and the sections above are unaffected when it goes stale.
 
-Where a section depends on whether something is **built**, it says so via the artifact: the code and its
-`file:line`, or the merged PR that landed it. Those are durable. An issue's open/closed state is not, and
-is not cited as authority anywhere in this document.
+Where a section depends on whether something is **built**, it cites the durable artifact: the code and its
+`file:line`, or the merged PR that landed it. Those stay true until the code moves; an issue's open/closed
+state does not, so it is not the authority a section should cite.
 
 ---
 

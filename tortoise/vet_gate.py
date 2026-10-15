@@ -85,12 +85,12 @@ This is VET's **selection** axis and is deliberately distinct from
 decisions at different steps and neither module consumes the other's set.
 
 ⚠️ ``MERGE-INTO-EXISTING`` is deliberately **NOT** emitted — and that removal IS
-the A4 correction §16.2 records (*"✅ NOW FIXED — ``MERGE-INTO-EXISTING`` is
-removed from VET's outputs (§S2.2)"*). VET runs before S3 RESOLVE, and S3 is
-what *finds* what exists — so "merge into existing" is circular at this
-position. ⚠️ **The verdict and the action are not the same token** (§S2.2,
-#5092): this gate may record ``MERGE`` for a flagged pair, it never performs the
-fusion. A merge candidate is flagged ``MERGE`` and
+the A4 correction (§S2.2, recorded in
+`docs/architecture/REVIEW-CONSOLIDATED-2026-09-23.md`). VET runs before S3
+RESOLVE, and S3 is what *finds* what exists — so "merge into existing" is
+circular at this position. ⚠️ **The verdict and the action are not the same
+token** (§S2.2, #5092): this gate may record ``MERGE`` for a flagged pair, it
+never performs the fusion. A merge candidate is flagged ``MERGE`` and
 **recorded in the VET evidence surface only — nothing consumes it yet**: no
 code routes a ``MERGE`` verdict to S3, and the merge *itself* is #5006's (it
 needs the union-of-attachments machinery and the high bar).

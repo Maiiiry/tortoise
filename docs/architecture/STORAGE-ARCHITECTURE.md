@@ -1307,9 +1307,9 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 open, and which are filed is read from the tracker — never from here. A document that mirrors issue state
 is wrong the day after it is written, and the sections above are unaffected when it goes stale.
 
-Where a section depends on whether something is **built**, it says so via the artifact: the code and its
-`file:line`, or the merged PR that landed it. Those are durable. An issue's open/closed state is not, and
-is not cited as authority anywhere in this document.
+Where a section depends on whether something is **built**, it cites the durable artifact: the code and its
+`file:line`, or the merged PR that landed it. Those stay true until the code moves; an issue's open/closed
+state does not, so it is not the authority a section should cite.
 
 The findings below are kept because each is a **code or measurement** result, stated so it can be checked
 against the tree without a tracker.

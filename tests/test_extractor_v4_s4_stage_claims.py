@@ -762,7 +762,7 @@ def test_the_e4_union_is_consumed_not_discarded():
     scan = _scan()
     assert scan.merge_call is not None, (
         "`merge_embed_lists` is no longer called — the E4 'merges, not replaces' "
-        "property the design DEPENDS ON (§15's `§1 v2 → v3 → v4` row) is gone."
+        "property the design DEPENDS ON (the §8 `S2/S4 merge` row) is gone."
     )
     assert scan.s4_result and len(scan.merge_call.args) == 2, (
         "`merge_embed_lists` must take the S2 list and the S4 result: "

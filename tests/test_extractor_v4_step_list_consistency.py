@@ -64,7 +64,7 @@ the coupling's OWN `E7` token is the reversal record — negated in place
 a reversal mark, which the `#8443` review showed was a fail-open on §15's
 one-line row (a live re-assertion placed next to the record inherited its
 marks and shipped green);
-(6) §15's issue-map row itself states the decided site — named, `E7` negated,
+(6) §8's value-gate row itself states the decided site — named, `E7` negated,
 and the shipped predicate symbols cited — not merely quoting a title that
 mentions both; (7) the retention-floor obligation appears only inside its own
 withdrawal (**a FORWARD guard**: `main` had already removed the live obligation,
@@ -359,8 +359,8 @@ _COUPLING_WINDOW = 200
 _REVERSAL_PROXIMITY = 24
 
 #: A coupling is exempt ONLY when its own `E7` token is the reversal record —
-#: never because a reversal mark happens to sit within a window around it. §15's
-#: issue-map row is ONE physical line carrying many sentences, so a window- or
+#: never because a reversal mark happens to sit within a window around it. §8's
+#: value-gate row is ONE physical line carrying many sentences, so a window- or
 #: line-scoped exemption let a live re-assertion placed beside the reversal
 #: record inherit its marks and ship green — the fail-open the `#8443` review
 #: reproduced by inserting *"The mechanical `DISCARD` gate runs at `E7`"* right
