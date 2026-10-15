@@ -93,9 +93,15 @@ revision, which is what this file is for.
 ### (front matter)
 
 - `EXTRACTOR-V4-ARCHITECTURE.md:14` — Status: design in progress, 2026-09-23. Home: `#4894` (write-path redesign). Predecessor: `#1509` (extractor v3, approved 2026-08-20; ⚠️ epic CLOSED `NOT_PLANNED` 2026-10-10 — the v4 desi…
+- `EXTRACTOR-V4-ARCHITECTURE.md:17` — Related: `docs/architecture/STORAGE-ARCHITECTURE.md` · `#1026` (pack slots) · `#2281` (ask/answer over distilled knowledge) · `#2730` (entity attachment) · `#4333` (volume/economics) · `#…
+
+### ⛔ USAGE IS DENOMINATED IN TOKENS, AND OVERAGE IS PURCHASED — decision, owner, 2026-09-26 (`#4495`)
+
+- `EXTRACTOR-V4-ARCHITECTURE.md:37` — reason to prefer measurable steps over inferred ones: §16.2's rule (a claim must be checkable) is now also a billing
 
 ### v2 → v3 → v4
 
+- `EXTRACTOR-V4-ARCHITECTURE.md:92` — | v3 (approved; ⚠️ epic CLOSED `NOT_PLANNED` 2026-10-10 — the remainder is cancelled, but E2/E4 LANDED and are live) | did we extract it correctly? (dates, verbatim state values, atomic p…
 - `EXTRACTOR-V4-ARCHITECTURE.md:95` — v3 has no discard, trim or gate anywhere. It is a fidelity workstream. v4 is a selection workstream. ⚠️ The ordering obligation this passage used to state — "it must land with, or before,…
 
 ### ⚠️ Storage rule for the first two tiers — they are OUTSIDE the graph (owner, 2026-09-23)
@@ -104,14 +110,26 @@ revision, which is what this file is for.
 - `EXTRACTOR-V4-ARCHITECTURE.md:128` — - It is far cheaper than the graph — the storage research measured ~580× on disk-resident data (⚠️ not the "~1,000×" an earlier draft stated — that number was unsourced; 580× applies to t…
 - `EXTRACTOR-V4-ARCHITECTURE.md:133` — ⇒ D1 restated, correctly: the narrative is not a graph node and not graph metadata — it is Postgres-stored text referenced by its `Source` (the owner's "supabase" is the DATABASE, not the…
 
+### ⭐ The experiment already exists — `#3011`, pre-registered and frozen 2026-09-11
+
+- `EXTRACTOR-V4-ARCHITECTURE.md:158` — ⚠️ ⛔ THE THRESHOLDS WERE DELETED ON A FALSE PREMISE — RESTORED FROM THE FROZEN DOCUMENT (2026-09-24). This block previously said the earlier draft "rendered" the hypotheses wrongly and th…
+- `EXTRACTOR-V4-ARCHITECTURE.md:170` — The earlier draft was correct about all three. The cycle-1 review's premise was wrong: `−5` appears in both H3 and H4, and `15` appears in H1 and H5's falsifier — "also present elsewhere"…
+
 ### The mechanism is also already filed — `#2684`
 
 - `EXTRACTOR-V4-ARCHITECTURE.md:196` — Related, and not to be duplicated: `#2405` CLOSED (paraphrase-tolerant survival leg — the deformation measurement) · `#2542` family (value-fidelity discipline, cited by `#2684`) · `#2104`…
 - `EXTRACTOR-V4-ARCHITECTURE.md:200` — ⚠️ Storage consequence, harmonised with `STORAGE-ARCHITECTURE.md` §9.1: the raw fact is Postgres text, not a graph node (the owner's "supabase" = the DATABASE, not the object bucket; dest…
 
+### 2.4.4 ⛔ Redaction and the append-only layer — the G4 reconciliation (`#8496`)
+
+- `EXTRACTOR-V4-ARCHITECTURE.md:350` — ✅ R1–R4 request no new mechanism, and it is worth saying why. `#4911` already landed the control at
+- `EXTRACTOR-V4-ARCHITECTURE.md:379` — `#5007` shipped the span schema, so a `Point` can carry `span_start`/`span_end`, but the raw-fact layer
+
 ### ⭐ D10 and the version model — what the extractor must respect
 
 - `EXTRACTOR-V4-ARCHITECTURE.md:467` — ⭐ CORRECTED 2026-09-24 (owner): a document is a SOURCE, not a graph node. "I am suggesting making them sources so our entity layer can be extracted from them… That way our entity layer be…
+- `EXTRACTOR-V4-ARCHITECTURE.md:470` — ⇒ D10 is LANDED — both halves. Ontology: `ONTOLOGY.md` v3.15 (PR `#5022`, issue `#5013`). Code: PR `#5127` retired the `:Document` NODE label, and the `:Source` replay key is `url` (`tort…
+- `EXTRACTOR-V4-ARCHITECTURE.md:480` — | Q5 | Fold + change the replay key + migrate — ✅ DONE 2026-09-25 (`#5026`/PR `#5127`) | The window closed as predicted and the work landed inside it: zero `:Document` nodes and the commi…
 
 ### ⚠️ This REOPENS D4 — and narrows it along its own reasoning
 
@@ -125,15 +143,21 @@ revision, which is what this file is for.
 
 ### ⚠️ Owner question: if the narrative is poor, should we send it back? (2026-09-23)
 
+- `EXTRACTOR-V4-ARCHITECTURE.md:609` — ⚠️ `MERGE-INTO-EXISTING` is deliberately NOT a VET output — and `MERGE` and `MERGE-INTO-EXISTING` are not the same thing. VET may emit the verdict `MERGE` — "fold into another candidate" …
 - `EXTRACTOR-V4-ARCHITECTURE.md:613` — ⚠️ There is no S4 — do not restore one. A previous draft listed a separate "S4 — granularity review" and folded it back in here. It is not a step: its purpose was identical to question 2 …
 - `EXTRACTOR-V4-ARCHITECTURE.md:626` — > ⚠️ `TORTOISE_S4_DELTA=0` does NOT disable S4 — it selects the legacy complete-list contract. There is no S4-specific off switch: S4 is reached whenever the v2 pipeline runs a story, and…
 - `EXTRACTOR-V4-ARCHITECTURE.md:638` — > pipeline". ⚠️ An earlier version of this marker said `S2.3` had no code counterpart because the
 - `EXTRACTOR-V4-ARCHITECTURE.md:639` — > string `S2.3` is absent from `extractor_v2.py`. The string is absent; the mechanism is not. ⚠️ An earlier version of this marker claimed
 - `EXTRACTOR-V4-ARCHITECTURE.md:640` — > `S3` and `S5` were absent from the code as well; that was wrong — `S3` and `S5` appear 51 and 22 times
+- `EXTRACTOR-V4-ARCHITECTURE.md:644` — > stands: the symbol name is authoritative and the line number is a convenience. ⚠️ For THIS passage that rule is now mechanical, not a promise: `tests/test_extractor_v4_s4_stage_claims.p…
 
 ### The five correctness constraints — and ONE of them was FALSE
 
 - `EXTRACTOR-V4-ARCHITECTURE.md:761` — ⚠️ Constraint 4 stands, and it is the basis of the S2.3-before-S3 order. CLASSIFY runs after the gate (so only survivors are classified) and BEFORE S3 — because `_find_existing_entity` (`…
+
+### ✅ Jev for classification is cheap — but ⚠️ the seam does NOT yet exist
+
+- `EXTRACTOR-V4-ARCHITECTURE.md:808` — ⚠️ And a hard constraint this ordering must respect: ⚠️ `#4899`'s Phase-1 mechanical DISCARD has known false positives — "a bare `#\d{3,}` in a working note is discardable; a PR number a …
 
 ### 4.3 ⚠️ What the steps above do NOT yet cover (review-provided, all unaddressed)
 
@@ -146,8 +170,12 @@ revision, which is what this file is for.
 
 ### ✅ The carve-out DID NOT cover decision-relevant numbers — measured, and FIXED (`#2453`, PR `#2456`)
 
+- `EXTRACTOR-V4-ARCHITECTURE.md:1014` — #### ✅ The carve-out DID NOT cover decision-relevant numbers — measured, and FIXED (`#2453`, PR `#2456`)
+- `EXTRACTOR-V4-ARCHITECTURE.md:1016` — `#2453` root-caused this: the carve-out is scoped to user-personal state (personal bests, schedules, preferences) and explicitly tells the mapper to DROP process metrics as "mechanics tok…
+- `EXTRACTOR-V4-ARCHITECTURE.md:1018` — ⇒ There are TWO value classes. ⚠️ At the time of measurement the policy kept one and discarded the other; the table below records that this was FIXED (commit `4a690d0be`, 2026-09-07, PR `…
 - `EXTRACTOR-V4-ARCHITECTURE.md:1022` — | Personal state | "personal best 5K = 27:12" | retained (E2 carve-out — `#1534`, now CLOSED) | retained |
 - `EXTRACTOR-V4-ARCHITECTURE.md:1023` — | Operational / decision values | "p99 latency 480 ms at 3k rps" | ⚠️ RETAINED — THE FIX ALREADY LANDED (commit `4a690d0be`, 2026-09-07, PR `#2456`) | retained |
+- `EXTRACTOR-V4-ARCHITECTURE.md:1025` — Operational values are DURABLE. `#2453` landed and extended `STATE_VALUE_CARVE_OUT` (`extractor_v2.py:145-171`) with an operational-value paragraph — "a concrete value that is the SUBJECT…
 - `EXTRACTOR-V4-ARCHITECTURE.md:1029` — ⚠️ And the mechanical DISCARD (`#4899`, §16 — ✅ LANDED, `value_gate.py`) would previously have inherited this bug — had it been defined against the old, stale reading, it would have disca…
 
 ### Where numeric facts should live (owner, 2026-09-23) — structured, so they are never re-processed
@@ -157,6 +185,11 @@ revision, which is what this file is for.
 ### 8. Already in the code — do not rebuild
 
 - `EXTRACTOR-V4-ARCHITECTURE.md:1052` — | S2/S4 merge | `merge_embed_lists` (def `extractor_v2.py:2284`; called at `:4845` — ⚠️ an earlier draft cited `:4838`, which is `try:` (`stage_stats` is `:4837`)) |
+
+### ⛔ REFUSED — contradicts a recorded decision ⇒ a REOPEN, not an adoption — ✅ **this reopen is CLOSED, 2026-10-06; see the block below**
+
+- `EXTRACTOR-V4-ARCHITECTURE.md:1199` — ### ⛔ REFUSED — contradicts a recorded decision ⇒ a REOPEN, not an adoption — ✅ this reopen is CLOSED, 2026-10-06; see the block below
+- `EXTRACTOR-V4-ARCHITECTURE.md:1205` — > ✅ `OVERRIDES:` posted on `#2730` — for this ruling the marker lives on the issue, per §16's rule (below); the issue comment carries the full text. ⚠️ The rule is not yet true file-wide …
 
 ### 13.8 What this does to our design
 

@@ -26,7 +26,7 @@ doc_status: live
 > gap between this document and the code is a **work item**, never a licence to
 > treat the model as wrong or the code as authoritative — the code is what gets
 > changed. Conversely, do not read a capability here as present-tense fact. The
-> per-field **implementation status** and the record of **what changed and why**
+> per-field **build record** and the history of **what changed and why**
 > live in **`ONTOLOGY-CHANGELOG.md`** — not here. This file is the model.
 >
 > **⭐ If this document and the code disagree, THIS DOCUMENT IS RIGHT and the code
@@ -611,7 +611,7 @@ suppresses operator promotion exactly as a draft Point does.
 
 **`updatedAt` records the last version transition.** It is not a currency flag — currency is computed from `sourceVersion` against `contentHash`.
 
-**Implementation status (`#5024`, 2026-09-24; window half `#3644`, 2026-10-10).** Both halves are now implemented. The *version-anchor* half (#5024): a hash transition journals a `SourceVersioned` record naming `previousContentHash` and the transition instant, a no-op re-fetch journals **nothing** (`STORAGE-ARCHITECTURE.md` §9.6's cost bound), and a `rebuild_all` replay reproduces the current node field for field. The *window* half (#3644): the same record now carries the version window — `validFrom` (the new version's open, written to the node through the same hash-diff gate) and `previousValidTo` (the prior version's close, a record-only fact) — so closing the prior window is a **recorded act**, and a rebuild reproduces the node's window; the prior window is recoverable from the journal alone. **What remains open** (and is deliberately not claimed): the node's `validTo`/`expiredAt`, which need a `:Source` **removal** path — the field's meaning is **#3590** S2's decision; and a caller-asserted valid-time start (a known publication date), which needs the inversion guards the Point window needed (#3980, #4021, #5358, #5360). The per-field recorded/recomputable split lives in `docs/durability-posture.md` → *`:Source` — recorded vs recomputable, field by field* (R2).
+**The version record — both halves** (the anchor half is `#5024`, the window half `#3644`). The *version-anchor* half: a hash transition journals a `SourceVersioned` record naming `previousContentHash` and the transition instant, a no-op re-fetch journals **nothing** (`STORAGE-ARCHITECTURE.md` §9.6's cost bound), and a `rebuild_all` replay reproduces the current node field for field. The *window* half (#3644): the same record now carries the version window — `validFrom` (the new version's open, written to the node through the same hash-diff gate) and `previousValidTo` (the prior version's close, a record-only fact) — so closing the prior window is a **recorded act**, and a rebuild reproduces the node's window; the prior window is recoverable from the journal alone. **What remains open** (and is deliberately not claimed): the node's `validTo`/`expiredAt`, which need a `:Source` **removal** path — the field's meaning is **#3590** S2's decision; and a caller-asserted valid-time start (a known publication date), which needs the inversion guards the Point window needed (#3980, #4021, #5358, #5360). The per-field recorded/recomputable split lives in `docs/durability-posture.md` → *`:Source` — recorded vs recomputable, field by field* (R2).
 
 ### §4.7 Temporal Model (canonical)
 

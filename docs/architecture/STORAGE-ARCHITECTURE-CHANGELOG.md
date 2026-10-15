@@ -69,9 +69,23 @@ decision — is stated in the design document's rewritten sentence; what is not
 carried anywhere is the delivery state and the account of the passage's own
 revision, which is what this file is for.
 
+### (front matter)
+
+- `STORAGE-ARCHITECTURE.md:14` — Status: design — AMENDED 2026-10-08 to the owner's hybrid ruling (§2.0): Postgres is the system of record for every layer; FalkorDB is a derived hot cache. Read §2.0 and §3's table first.…
+- `STORAGE-ARCHITECTURE.md:20` — Related: `#7869` (this amendment — the doc's canonicalisation) · `#5086` (substrate-rebuild tracking) · `#5089` (durability — derived = replay(journal)) · `#5090` (the vector layer) · `#3…
+
+### ⛔ THE STORAGE UNIT IS BYTES — decision, owner, 2026-09-26 (`#4495`)
+
+- `STORAGE-ARCHITECTURE.md:79` — block reads 143 MB / 46 MB, and §13's issue-map row concludes "~3 KB per node (140 MB ÷ ~45k total nodes)" —
+- `STORAGE-ARCHITECTURE.md:82` — §13's row carries the earlier denominator correction (the retracted 5.6 KB claim); this block, not §1, is the
+
 ### 1. The problem
 
 - `STORAGE-ARCHITECTURE.md:119` — > ⚠️ FIGURE CORRECTED 2026-09-23. An earlier draft said "~6 GB ≈ ~$460/month". The $460 implied a 6.3 GB horizon that was never stated and mixed a growth rate with a total. The correct st…
+
+### 2.0 ⭐ DECISION (owner, 2026-10-08): **hybrid now — Postgres is the system of record; FalkorDB is a derived hot cache**
+
+- `STORAGE-ARCHITECTURE.md:141` — ⚠️ SCOPE — this decides a PLACEMENT AND AN AUTHORITY, and it settles what §2 previously deferred. The earlier note here read "this decides a PROVIDER, not a PLACEMENT (owner clarification…
 
 ### 2.1 What FalkorDB actually charges for — measured 2026-09-24
 
@@ -93,6 +107,7 @@ revision, which is what this file is for.
 
 ### 5.1 ⚠️ Corrections to earlier drafts of this section — and the two lines it omitted
 
+- `STORAGE-ARCHITECTURE.md:401` — ### 5.1 ⚠️ Corrections to earlier drafts of this section — and the two lines it omitted
 - `STORAGE-ARCHITECTURE.md:403` — ⚠️ These figures were quoted elsewhere in an earlier draft at amounts up to ~14× higher, and that draft was never reconciled. The numbers in the table above are the ones to use; the ~$460…
 
 ### 6. The split does NOT fix the volume problem
@@ -106,6 +121,7 @@ revision, which is what this file is for.
 - `STORAGE-ARCHITECTURE.md:459` — ✅ PLACEMENT ACCEPTED (owner, 2026-10-06): a state/numeric value is a STRUCTURAL FIELD ON AN ENTITY, not a `Point`. The reasoning is the ontology's own: operators connect only epistemic ta…
 - `STORAGE-ARCHITECTURE.md:465` — ⚠️ CITATION CORRECTED 2026-09-23. An earlier draft cited "`#1509` §9" for the decision that state values are Points, and "`#1509` E2" for verbatim preservation. Neither exists. `#1509` ha…
 - `STORAGE-ARCHITECTURE.md:478` — | Operational / decision values | "p99 latency 480 ms at 3k rps" | ⚠️ RETAINED — the fix LANDED (commit `4a690d0be`, 2026-09-07; PR `#2456`) | retained |
+- `STORAGE-ARCHITECTURE.md:480` — Operational values are DURABLE. `#2453` landed and extended `STATE_VALUE_CARVE_OUT` with an operational-value paragraph — "a concrete value that is the SUBJECT of a decision, observation,…
 - `STORAGE-ARCHITECTURE.md:484` — > ⚠️ Caveat from `#4889` — CORRECTED 2026-10-06 (owner). An earlier version of this caveat asserted that the `aboutSubject` half does not exist in production today and cited 0 `aboutSubje…
 
 ### 8. Constraint carried from the extractor — granularity is NOT negotiable
@@ -120,10 +136,15 @@ revision, which is what this file is for.
 ### 9.3 ⭐ A document is a **SOURCE**, not a graph node — and this is what makes the entity layer an abstraction
 
 - `STORAGE-ARCHITECTURE.md:557` — ⚠️ What this corrects in an earlier draft. The earlier version placed `:Document` in the truth layer and then discovered it also appeared in the derived layer:
+- `STORAGE-ARCHITECTURE.md:563` — ⇒ `:Document` folds into `:Source` — LANDED. Its content leaves the graph — to raw text in Postgres (true binaries to the object bucket; §3) — referenced per D30, and the entities extract…
 
 ### ⭐ Scope of the anchor — a **Point-level** guarantee, extended to derivation links (decided 2026-09-25)
 
 - `STORAGE-ARCHITECTURE.md:706` — - derivation — an `Event` (or `Document`) built from a source's content: the connector path materializes the link at the projection choke point (`projection/entities.py::_materialize_conn…
+
+### ⭐ Why it is affordably cheap HERE and expensive elsewhere
+
+- `STORAGE-ARCHITECTURE.md:751` — Bound it there: windows and hashes only, never content copies. If a version ever starts carrying bytes, this stops being cheap and §13's cost argument changes. The content lives in Postgr…
 
 ### ⭐ Where this stands (2026-09-25) — a status pointer, not a new rule
 
@@ -136,6 +157,10 @@ revision, which is what this file is for.
 
 ### 12.1 The vector index — the class that dominates our bill
 
+- `STORAGE-ARCHITECTURE.md:863` — ⚠️ THIS SECTION WAS REWRITTEN TWICE. Read the version below, not either earlier one.
+- `STORAGE-ARCHITECTURE.md:865` — - Draft 1 claimed the index "is RAM-mandatory and does not follow the disk rule" and inferred an unprovisionable 7 TB of RAM.
+- `STORAGE-ARCHITECTURE.md:866` — - Draft 2 corrected that to "disk-backed and page-cached" — correct for pgvector, but written for the then-deferred Postgres target.
+- `STORAGE-ARCHITECTURE.md:867` — - ✅ Draft 3 (this one) is about the engine we actually run. ⚠️ And the 2026-10-08 ruling (§2.0) makes that Postgres target the RECORD — so Draft 2's mechanism is now live for the record s…
 - `STORAGE-ARCHITECTURE.md:884` — ⚠️ Correcting an earlier draft that said "95.6 MB of 140 MB (~68%)". That figure added the whole index total — but the index total also contains every fulltext index we have (`Point.conte…
 
 ### ⭐ A vector is POINTER-SIZED — 1.5 KB, whatever the text says
@@ -148,10 +173,12 @@ revision, which is what this file is for.
 - `STORAGE-ARCHITECTURE.md:907` — An earlier draft claimed a cold index produced "p90 96ms vs 24ms" and that this was "20–50× over every published latency budget, so it cannot be user-facing." BOTH HALVES WERE WRONG.
 - `STORAGE-ARCHITECTURE.md:909` — Wrong half 1 — the number was not ours. 96ms/24ms came from OpenSearch's designed disk mode — a different engine. And the "10,500ms cold" figure came from a billion-vector AWS deployment.…
 - `STORAGE-ARCHITECTURE.md:911` — Wrong half 2 — the budget is not a requirement. The "50–500ms" figures are vendor self-report:
+- `STORAGE-ARCHITECTURE.md:925` — ⇒ CONCLUSION: latency is not a constraint at our size and is not a reason to change anything. Recorded because the earlier draft would have justified an architecture on it. (Retrieval gen…
 
 ### 12.1a Why "just partition per tenant" is NOT one mechanism — and the two halves have OPPOSITE answers
 
 - `STORAGE-ARCHITECTURE.md:933` — ⚠️ CORRECTED 2026-10-08 by this lane's own first-party measurement. An earlier version of this section withdrew per-tenant partitioning wholesale, on a study whose mechanism does not reac…
+- `STORAGE-ARCHITECTURE.md:940` — §12.1a's cited mechanism — "Postgres takes a shared lock on every index of a table during planning" — can only reach (A). It is a count of indexes per relation, so it cannot reach (B), wh…
 
 ### How big our index is, and why "fewer vectors" is the whole game
 
@@ -159,6 +186,7 @@ revision, which is what this file is for.
 
 ### 12.1b ⚠️ CORRECTED ACCOUNTING — where the vectors actually sit (2026-09-24)
 
+- `STORAGE-ARCHITECTURE.md:974` — ### 12.1b ⚠️ CORRECTED ACCOUNTING — where the vectors actually sit (2026-09-24)
 - `STORAGE-ARCHITECTURE.md:976` — An earlier draft attributed the whole vector class to one index. Reading the code changed the picture; then the live graph changed it again. One finding is a filed defect.
 - `STORAGE-ARCHITECTURE.md:1002` — `:Object` costs 3.4× `:Point` for the same query. Before PR `#5159` the trace could not distinguish an index hit from a table scan — both reported `ok` on the brute-force path, so degrada…
 - `STORAGE-ARCHITECTURE.md:1006` — ⇒ Filed as `#4997` — CLOSED `COMPLETED`. ⚠️ REFRAMED 2026-09-24 (owner): the "stop storing OR index them" framing was a FALSE CHOICE. The third option is better than either: keep the vect…
@@ -230,8 +258,13 @@ revision, which is what this file is for.
 
 - `STORAGE-ARCHITECTURE.md:1394` — | O2 | Per-item or per-batch target; what recall floor? | ⛔ THE QUESTION IS WITHDRAWN — the owner rejected its framing. "we're not optimising stupidly for a number… this is not a corporat…
 
+### 14.2 ⭐ The engine decision — AMENDED 2026-10-08: the engine stays, its ROLE changes
+
+- `STORAGE-ARCHITECTURE.md:1400` — ### 14.2 ⭐ The engine decision — AMENDED 2026-10-08: the engine stays, its ROLE changes
+
 ### 14.3 ⚠️ Open — raised 2026-09-24, NOT decided
 
+- `STORAGE-ARCHITECTURE.md:1417` — ⚠️ AMENDED 2026-10-08 — the hybrid makes V1 more urgent, not less. Under the 2026-09-24 decision the graph was the store, so moving the vector index was an optimisation. Under the hybrid,…
 - `STORAGE-ARCHITECTURE.md:1423` — | V3 | ⚠️ The unindexed-embeddings defect (§12.1b) | MEASURED AND FILED 2026-09-24 → `#4997`. REFRAMED: this and V1 are the SAME decision (owner, 2026-09-24) — "isn't the research pointin…
 - `STORAGE-ARCHITECTURE.md:1424` — | V4 | ✅ The silent `ok` — FIXED. | `#4999` — CLOSED `COMPLETED` (PR `#5159`). `run_vector_query` now records the mechanism (`index` / `scan` / `scan_fallback`), so a full scan is disting…
 
@@ -244,6 +277,18 @@ revision, which is what this file is for.
 
 - `STORAGE-ARCHITECTURE.md:1462` — ### 16.2 The latency question — the claim was withdrawn, not softened
 
+### 17.2 Cache coherence — and a COMPLETENESS MARKER
+
+- `STORAGE-ARCHITECTURE.md:1526` — ⚠️ What is NOT built, and what is deferred rather than absent: the declaration's authoritative home is the control-plane residency metadata named in §2.6 (`#7971`'s cache projection write…
+
+### The marker is NOT a fifth status term
+
+- `STORAGE-ARCHITECTURE.md:1566` — Owner and verification. `#7953` — interface D, part 2; test-design `#7967` surfaces S4 (e2e: a non-resident read returns `not-hot`, never empty) and S5 (unit + integration: a miss is neve…
+
+### 17.4.1 The two rate cards — one per store
+
+- `STORAGE-ARCHITECTURE.md:1619` — ⚠️ `#4614` is cited in this issue — and in §13's issue map, corrected there — as the "published rates" issue, and it is NOT one. It is a quota-cliff capture bug (`402` at 9,998/10,000). T…
+
 ### 17.4.2 The measured inputs — every per-node figure with its base AND its denominator
 
 - `STORAGE-ARCHITECTURE.md:1636` — | ⛔ the withdrawn 5.6 KB | 5,600 B ≈ 5.6 KB | 140 decimal MB ÷ 25,000 (CAPPED) | decimal MB | WITHDRAWN — total RAM ÷ the capped count |
@@ -251,5 +296,6 @@ revision, which is what this file is for.
 
 ### 17.5 A field-level placement table — 9 derived/volatile property names on the sampled surface
 
+- `STORAGE-ARCHITECTURE.md:1745` — §3's per-write test IS the mechanism — "if the journal does not carry it, it is not derived — it is PRIMARY, and belongs in a truth-layer table" — and §7 moves state values onto entity fi…
 - `STORAGE-ARCHITECTURE.md:1751` — ✅ The canonical id contract has LANDED (`#7955`, 2026-10-11). The stable key is fixed per label — `:Point` → `id` (minted by `tortoise/ids.py::ulid()`), `:Event` → `eventId`, `:Subject`/`…
 - `STORAGE-ARCHITECTURE.md:1753` — ✅ THE SCHEMA HAS LANDED (`#7968`, 2026-10-12). The four ontology layers are relational structure under `supabase/migrations/20261012000001`–`0004` (event stream · semantic · epistemic · p…
