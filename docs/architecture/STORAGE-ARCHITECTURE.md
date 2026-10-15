@@ -87,9 +87,10 @@ are at work and must not be conflated: a **denominator** error (a per-node figur
   prices, caps, tiers, refuses or throttles. It is the instrument, not the setting (#5331 is measurement only)"*,
   and *"FAIL-SOFT … never raise"*. Do not describe the **meter** as fail-closed; the fail-closed behaviour belongs to
   the **gate**. The meter's home is `tortoise/graph_storage.py`.
-- **The gate is FAIL-CLOSED.** `_enforce_storage_allowance` (`tortoise/quota.py`) raises `QuotaCheckError` when no
-  reading is supplied, and `tortoise/pricing.py` describes the design as *"FAIL-CLOSED when no reading is supplied"*.
-  The gate also carries the **`max_storage_bytes` allowance key**.
+- **The gate is FAIL-CLOSED.** It raises `QuotaCheckError` when no reading is supplied, and it carries the
+  **`max_storage_bytes` allowance key** — the design the **`#5331`** byte path specifies. (The gate's own
+  branch status is recorded in `STORAGE-ARCHITECTURE-CHANGELOG.md` — the document states the design requirement,
+  not a `tortoise/quota.py` symbol the tree does not yet hold.)
 - **Wiring is a prerequisite for any allowance.** No production caller supplies a `storage_reading`, so an unwired gate
   is inert — and configuring an allowance before the meter is wired would 500 every points-gated write. **The meter
   must be wired into the gate before any allowance is configured.**

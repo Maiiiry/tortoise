@@ -64,22 +64,21 @@ the coupling's OWN `E7` token is the reversal record — negated in place
 a reversal mark, which the `#8443` review showed was a fail-open on §15's
 one-line row (a live re-assertion placed next to the record inherited its
 marks and shipped green);
-(6) §15's issue-map row itself states the decided site — named, `E7` negated,
-and the shipped predicate symbols cited — not merely quoting a title that
-mentions both; (7) the retention-floor obligation appears only inside its own
+(7) the retention-floor obligation appears only inside its own
 withdrawal (**a FORWARD guard**: `main` had already removed the live obligation,
 so this half cannot red on the merge base) and the recall-arithmetic paragraph
-carries O2's withdrawal verbatim **plus the present-tense no-floor fact and O2
-as its authority** (**the regression pin that does** — it is on the FACT, not on
-the change-history phrasing a `#8529`-compliant rewrite drops, which is the
-`#8443` review's finding 3); (8) the
+carries the present-tense no-floor fact **and names O2 / §16.3 as its
+authority** (**the regression pin that does** — it is on the FACT and its
+authority, not on the change-history phrasing a `#8529`-compliant rewrite drops,
+which is the `#8443` review's finding 3; the whole-document verbatim withdrawal
+is checked in the sibling test); (8) the
 review's `D6` carries a disposition naming the decided site, the shipped commit,
 and the symbol of the pass it cites.
 
 NOT promised:
 
 1. This is a STRUCTURAL read of two fenced blocks plus one paragraph, **widened
-   by `#5198` to four PROSE shapes** (see 5–8 above). What it still cannot do is
+   by `#5198` to four PROSE shapes** (see 5, 7 and 8 above). What it still cannot do is
    find a contradiction stated in prose it was not told to look for — it pins
    the claims `#5092` and `#5198` name, not the whole document (nor
    `STORAGE-ARCHITECTURE.md` §8, which the issues track separately). Rules 5–7
@@ -88,9 +87,10 @@ NOT promised:
    floor"` reds only while it is live, and a newly-worded equivalent an editor
    invents does not. Rule (7a) is a FORWARD guard — `main` had already removed
    the live obligation before the merge base, so it cannot red there; rule (7b)
-   — the recall paragraph must state the no-floor FACT together with O2's
-   verbatim withdrawal and name §16.3 O2 as its authority — is the
-   structural half, and the non-vacuous pin, that survives rewording. The
+   — the recall paragraph must state the no-floor FACT and name §16.3 O2 as its
+   authority (the whole-document verbatim withdrawal is checked in the sibling
+   test) — is the structural half, and the non-vacuous pin, that survives
+   rewording. The
    7b pin is deliberately NOT on the withdrawal *phrasing*: a target-state
    rewrite that keeps the fact and the authority but drops the change-history
    clause must stay green (the `#8443` review's finding 3).

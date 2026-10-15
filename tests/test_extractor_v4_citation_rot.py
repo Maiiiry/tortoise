@@ -682,7 +682,9 @@ def test_the_design_documents_carry_no_issue_state_or_change_narration():
     across five §4 tables; `EXTRACTOR-V4-ARCHITECTURE.md` and
     `STORAGE-ARCHITECTURE.md` issue-state assertions (`#4999` is CLOSED
     `COMPLETED`), `CORRECTED 20xx-xx-xx` stamps, and *"an earlier draft said
-    X"* narration. All of it moved to the sibling `*-CHANGELOG.md` (#8542).
+    X"* narration. All of it moved to the sibling `*-CHANGELOG.md` — the two
+    architecture documents' move is #8542; `ONTOLOGY.md`'s is #8745 (owner
+    approval of that exact diff is tracked there).
 
     This pins the CLASS rather than the strings, so the next lane cannot
     reintroduce it by appending one status claim — which is how the changelog
@@ -719,7 +721,8 @@ def test_the_design_documents_carry_no_issue_state_or_change_narration():
     assert not offenders, (
         "a design document must state the design. An issue's open/closed state, "
         "and the narrative of what changed, belong in the sibling "
-        "`*-CHANGELOG.md` (#8542):\n  - " + "\n  - ".join(offenders)
+        "`*-CHANGELOG.md` (#8542 for the architecture docs, #8745 for "
+        "`ONTOLOGY.md`):\n  - " + "\n  - ".join(offenders)
     )
 
 
@@ -769,6 +772,6 @@ def test_the_class_check_is_neither_dead_nor_noisy():
         "`#4999` records the trace mechanism.",
     ]
     for line in must_flag:
-        assert flagged(line), "the class check no longer fires on: %r" % line
+        assert flagged(line), f"the class check no longer fires on: {line!r}"
     for line in must_not_flag:
-        assert not flagged(line), "the class check is a false positive on: %r" % line
+        assert not flagged(line), f"the class check is a false positive on: {line!r}"
