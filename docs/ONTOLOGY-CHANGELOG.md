@@ -17,7 +17,10 @@ doc_status: live
 > be*, this file is where that history lives; the code and its tests are where
 > the current truth lives.
 >
-> **Moved out of `ONTOLOGY.md` on 2026-10-15** (issue #8542). The ontology carried
+> **Moved out of `ONTOLOGY.md` on 2026-10-15.** Owner approval of the exact diff is
+> tracked at **#8745** (`ONTOLOGY.md` carries a CRITICAL RULE: no modification
+> without Daniel Ospina's explicit approval). The two *architecture* documents'
+> parallel move is the one authorised by **#8542**. The ontology carried
 > this block inline — 730 lines, 37% of the file — against its own header, which
 > declares it is *"not a status report on what is built."* The entries are moved
 > verbatim; nothing is deleted.
@@ -26,6 +29,10 @@ doc_status: live
 
 ---
 
+> **Changelog v3.28 (2026-10-15 — issue #3998 — the absent-raw `:Source` state is recorded in §4.6, with conditions read live):**
+>
+> **A record of a decided rule, not a model change.** `tortoise/projection/entities.py` has written `s.rawState` / `s.rawStateAt` since #3998 (`36d3077fd`) and the §4.6 table had no row for either (measured on `origin/main` `c377fea26`: `rg -c rawState docs/ONTOLOGY.md` → 0). §4.6 now carries the row, and it encodes the owner's ruling of **2026-10-14 (Option A, stated on #3998)**: a **deletion is an act**, recorded durably as a marker **bounded by an expiry policy**; **`offline` / `access_revoked` are conditions, observed live, never stored**; and the marker carries the expiry policy. The row states the **read-time observation contract** (`raw_state.resolve_raw_availability`) and the precedence it enforces — a recorded act wins over any observation, so a probe can never un-delete a memory — so the next lane reads the placement axis and the contract instead of re-deriving them. This closes the S7 residual recorded as **#8474**.
+>
 > **Changelog v3.27 (2026-10-14 — issue #7818 — the §4.7 coverage boundary, stated and left OPEN):**
 >
 > **A record of an undocumented rule, not a model change** — no field, marker or
@@ -757,7 +764,7 @@ The `Impl` column that used to sit in `ONTOLOGY.md`'s §4 field tables. It answe
 *"is this field built?"* — a status question, and therefore this file's business
 rather than the model's. Legend: ✅ built · ⚠️ partial · ❌ not built.
 
-**Removed from the field tables on 2026-10-15** (issue #8542). The `Field`,
+**Removed from the field tables on 2026-10-15** (owner approval tracked at #8745). The `Field`,
 `Type`, `Required` and `Meaning` columns are unchanged; only the status column
 moved.
 
@@ -853,6 +860,7 @@ moved.
 | `provenance_spans` | ❌ |
 | `is_episodic` | ❌ |
 | `version` | ✅ |
+| `rawState` / `rawStateAt` | ✅ |
 | `topics` | ✅ |
 | `summary` | ✅ |
 | `sessionId` | ✅ |
@@ -867,7 +875,7 @@ moved.
 
 ---
 
-## Body status-notes removed from `ONTOLOGY.md` (2026-10-15, #8542)
+## Body status-notes removed from `ONTOLOGY.md` (2026-10-15, #8745)
 
 Implementation-status sentences that sat inside the model's body prose. The
 model rule each one qualified is kept in `ONTOLOGY.md`; only the status half

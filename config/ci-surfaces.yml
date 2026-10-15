@@ -1043,6 +1043,18 @@ surfaces:
   # falls through to `core`, so without this entry the declaration's guard
   # never runs on the change that can delete it.
   - test_7856_goal_state.py
+  # #8475 (lane L6): DUAL-REGISTERED with `api` (above) because the guard is a
+  # direct test of `tortoise/raw_state.py`, which matches no SOURCE_PATTERNS
+  # entry and is not a SHARED_MODULE — so a `raw_state.py`-only change falls
+  # through to `core`, and a named-surface match REPLACES that fallback.
+  # Registered only under `api`, a `raw_state.py`-only change ran none of these
+  # vocabulary/read-path/rebuild pins (verified with the repo's own selector:
+  # `--changed-files tortoise/raw_state.py` → surfaces=['core'], this file
+  # absent). `sdk.py` is a SHARED_MODULE, so the `api` registration still
+  # carries the full matrix for the SDK-side surfaces; this arm is what covers
+  # the module itself — the same shape and the same reason as
+  # `test_selfhost_rest.py` above.
+  - test_3998_raw_absent_state.py
   # #4030: `supabase/config.toml` is TRACKED and resolves its providers by
   # `env(NAME)`, so every one of those names is required by a file in this
   # repo — and `.env.example` is the contract an operator reads to find it. The
@@ -2208,6 +2220,12 @@ surfaces:
   - test_ingest_v2_consolidation.py
   - test_ingest_v2_parallel.py
   - test_ingest_validation.py
+  # #8499: the endpoint-kind route contract — a plain IMPL/NAND between plain
+  # `:Point` endpoints is operator-mediated (owner ruling 2026-10-13), an
+  # Object↔Object pair keeps the operator-less direct edge, and the choice is
+  # made from the resolved endpoint KINDS (the route classifier alone cannot
+  # see them). Registered with the ingest family it pins.
+  - test_8499_point_mediated_routing.py
   - test_integration_search.py
   # #4780: the incident-kind registry's generated checks — runbook ⇄ code set
   # equality (both directions), the frozen string set, the emitted flag against a
@@ -3004,6 +3022,7 @@ surfaces:
   - test_7951_write_doors.py
   - test_7951_enforce_atomic_write.py
   - test_7951_create_point_outbox.py
+  - test_8686_selfhost_operational_state.py
   # #3094: DUAL-REGISTERED with `core`/`eval`. The empty-means-unset URI-read
   # census (`test_no_empty_default_tortoise_db_uri_reads`) scans `tests/**`,
   # and `tests/_html_links.py` is an EXACT SOURCE_PATTERNS entry of THIS
@@ -5064,6 +5083,7 @@ durations:
   test_ingest_bundle.py: 8.7  # unmeasured
   test_ingest_mode.py: 4.4  # unmeasured
   test_ingest_validation.py: 1.4  # unmeasured
+  test_8499_point_mediated_routing.py: 1.4  # unmeasured
   test_longmem_runner.py: 26.7
   test_mcp_http.py: 16.5  # unmeasured
   test_mcp_route_challenge.py: 0.8  # unmeasured
