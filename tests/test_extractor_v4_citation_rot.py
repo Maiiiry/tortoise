@@ -208,7 +208,46 @@ RETRACTED_IN_SIBLINGS: dict[str, str] = {
     "the eval spec names `#2421` as the home of the outstanding Case-2 TODO": (
         "**Case-2 TODO (#2421):**"
     ),
+    "ONTOLOGY's direction-sourcing note still asserts `#7813`'s issue state": (
+        "tracked as `#7852` (`#7813` is CLOSED `COMPLETED`)"
+    ),
 }
+
+#: A PR that deletes a section leaves the sections that POINTED at it dangling.
+#: #8542 removed EXTRACTOR §15's issue map and §16.1–§16.2's review record, and
+#: rewrote STORAGE §13, but the inbound pointers were not re-pointed — so a
+#: reader following them lands on content that no longer exists. Each literal
+#: below was live in the pre-fix document (this file is red on it); the #8542
+#: fix re-points or deletes it. Keyed by document so a pointer in one doc is
+#: never satisfied by its twin in another (a relocation is not a fix).
+DANGLING_REFERENCES: dict[Path, dict[str, str]] = {
+    DOC: {
+        "§15's issue-map pointer survives §15's rewrite": "**Full issue map: §15.**",
+        "the v2→v3→v4 row pointer survives the issue map": "§15's `§1 v2 → v3 → v4` row",
+        "the §1 mechanism row pointer survives the issue map": "§15's `§1 mechanism` row",
+        "the `#4911` issue-map narration survives": "Earlier revisions listed `#4911` in §15",
+        "the §16.2 lesson pointer survives the review record": "recorded in §16.2",
+        "the VET/S3 circular-dependency pointer survives": "circular dependency §16.2 identifies",
+        "the §16.2 drift narration survives": "it was wrong. §16.2.",
+    },
+    STORAGE: {
+        "§13's issue-map pointer survives §13's rewrite": "**Full issue map: §13.**",
+        "the §13 issue-map row is still cited": "§13's issue-map row concludes",
+        "the §13 denominator row is still cited": "§13's row carries",
+        "the §13 cost argument is still cited": "§13's cost argument changes",
+        "the §13 issue-map correction is still cited": "and in §13's issue map, corrected there",
+    },
+}
+
+#: A measurement whose only home was a removed issue-map row and which was NOT
+#: moved: the `0/4` planted-operator grade. #8542's body claims facts pinned in
+#: the removed maps were "moved rather than deleted"; this one was deleted, so
+#: §4.4's I3 note must state it (and this guard reds if it is dropped again).
+PLANTED_OPERATOR_FACT = (
+    "on the planted-operator corpus the grade was **`0/4`** — operator edges "
+    "**were not wired or persisted**, the mint bypassed E7, and endpoint refs "
+    "were never remapped"
+)
 
 #: Sibling passages that must POSITIVELY state the landed fact. The retracted-only
 #: scan above catches a stale claim PUT BACK; this catches the opposite — a
@@ -378,6 +417,28 @@ def test_the_sibling_documents_do_not_carry_the_retracted_claims():
         "these claims were retracted across the document set, and a document "
         "still carries them — a repair that fixes one copy and leaves the others "
         "makes the documents contradict each other:\n  - " + "\n  - ".join(hits)
+    )
+
+
+def test_the_removed_sections_leave_no_dangling_references():
+    hits = [
+        f"{doc.name}: {name}"
+        for doc, literals in DANGLING_REFERENCES.items()
+        for name, literal in literals.items()
+        if literal in doc.read_text(encoding="utf-8")
+    ]
+    assert not hits, (
+        "a section was removed and the sections that pointed at it were not "
+        "re-pointed, so a reader lands on content that no longer exists:\n  - "
+        + "\n  - ".join(hits)
+    )
+
+
+def test_the_planted_operator_measurement_is_stated():
+    assert PLANTED_OPERATOR_FACT in _doc_text(), (
+        "the planted-operator `0/4` measurement was the only fact a removed "
+        "issue-map row carried; it must be restated where the layer fix it "
+        "measures is described (§4.4, I3), not silently deleted."
     )
 
 

@@ -17,7 +17,7 @@ aboutObjects: STORAGE-ARCHITECTURE.md, records ledger, vector index, raw storage
 
 **⚠️ Code citations — revision pin.** Every `file.py:NNNN` reference in this document is pinned to commit **`c79ba1cf2`**. Line numbers drift as the code moves; **the symbol name is authoritative and the line number is a convenience.** Verify against the symbol, not the number.
 
-**Related:** **`#7869`** (this amendment — the doc's canonicalisation) · `#5086` (substrate-rebuild tracking) · `#5089` (durability — derived = replay(journal)) · `#5090` (the vector layer) · `#3885` (raw storage modes) · `#3998` (the two-store question) · `#3895` (restore drill) · `#4894` (extractor v4) · `#4240` (edge durability) · `#4333` (the cost investigation — **another lane's**) · `#4614` (quota cliff) · `#4889` (Subject layer) · `#1026` (pack slots) · `#4899` (the gate). **Full issue map: §13.**
+**Related:** **`#7869`** (this amendment — the doc's canonicalisation) · `#5086` (substrate-rebuild tracking) · `#5089` (durability — derived = replay(journal)) · `#5090` (the vector layer) · `#3885` (raw storage modes) · `#3998` (the two-store question) · `#3895` (restore drill) · `#4894` (extractor v4) · `#4240` (edge durability) · `#4333` (the cost investigation — **another lane's**) · `#4614` (quota cliff) · `#4889` (Subject layer) · `#1026` (pack slots) · `#4899` (the gate).
 
 ---
 
@@ -76,10 +76,10 @@ true at once. The *decision* is untouched by this (bytes remain the unit); the *
 error is not propagated into the allowance.
 
 ⚠️ **This block SUPERSEDES the body's older figures.** §2 and §12 read **141 MB** and **45 MB** of indices where this
-block reads **143 MB / 46 MB**, and §13's issue-map row concludes *"~3 KB per node (140 MB ÷ ~45k total nodes)"* —
+block reads **143 MB / 46 MB**, and an earlier estimate concluded *"~3 KB per node (140 MB ÷ ~45k total nodes)"* —
 a **third** denominator (~45k, and a different residency set). The **`~3 KB` estimate is superseded by this block's
 `1,672 B` per resident node**; the figures are not interchangeable and the `~45k` node count is not re-measured here.
-§13's row carries the earlier denominator correction (the retracted 5.6 KB claim); **this block, not §1, is the
+That estimate also carried the earlier denominator correction (the retracted 5.6 KB claim); **this block, not §1, is the
 precedent for the denominator error class** — §1 corrects a *growth-horizon* error, a different mistake.
 
 **⛔ Status of the implementation — read this as FORWARD-LOOKING, not shipped.** Nothing in the byte path is on
@@ -744,7 +744,7 @@ The field's own warning is that **"versioned KGs are resource-intensive"** — t
 
 > **three timestamps and a hash — not a copy of the artifact.**
 
-**Bound it there: windows and hashes only, never content copies.** If a version ever starts carrying bytes, this stops being cheap and §13's cost argument changes. The content lives in **Postgres** (§9.1) once, addressed by `url` + `contentHash`.
+**Bound it there: windows and hashes only, never content copies.** If a version ever starts carrying bytes, this stops being cheap and the cost basis (§11) changes. The content lives in **Postgres** (§9.1) once, addressed by `url` + `contentHash`.
 
 #### ⭐ Why document-level versioning ALONE would not have answered the owner's question
 
@@ -1641,7 +1641,7 @@ For the record, since two members of the design rest on it:
 | **compute ladder** | **Postgres** (record) | **Micro $10 · Small $15 · Medium $60 · Large $110 · XL $210 · 2XL $410 · 4XL $960** / month | provisioned instance | $10/mo credit | Micro = 1 GB RAM shared; 2XL = 32 GB; **the tier the read path needs is unmeasured** |
 | **plan** | account | **$25 / month** (Pro) | per project | first project | fixed, **not** per tenant |
 
-**⚠️ `#4614` is cited in this issue — and in §13's issue map, corrected there — as the "published rates" issue, and it is NOT one.** It is a *quota-cliff capture bug* (`402` at 9,998/10,000). **The rate authority is the vendor pricing pages above** (and `#4333` for the cost basis of the cache). **Recorded so the citation is not reused.**
+**⚠️ `#4614` is cited in this issue as the "published rates" issue, and it is NOT one.** It is a *quota-cliff capture bug* (`402` at 9,998/10,000). **The rate authority is the vendor pricing pages above** (and `#4333` for the cost basis of the cache). **Recorded so the citation is not reused.**
 
 **⚠️ `#4333` remains the authority on volume and true bytes per node, and its own ledger lists `egress + IOPS` as *"❌ not modelled, not measured"*.** §17.4 **prices** those lines; it does **not** measure them, and §17.4.4 says so explicitly.
 
