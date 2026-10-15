@@ -800,9 +800,11 @@ S6  COMMIT
 
 **⚠️ And a hard constraint this ordering must respect:** ⚠️ **`#4899`'s Phase-1 mechanical DISCARD has known false positives** — *"a bare `#\d{3,}` in a working note is discardable; **a PR number a decision turned on is not**"* ⚠️ **that quoted `#\d{3,}` is `#4899`'s *proposal*, not the predicate in the tree — the real one is `value_gate._REFERENCE = r"#\d{1,6}(?!\d)"` with a whole-residue test (§7's "ENFORCEMENT BY DEFAULT" paragraph). ⚠️ It differs in BOTH directions from the quoted pattern: `#12` and `See #12` ARE discarded, while a 7-digit run is NOT. Do not implement from this quotation** — and **only the lookup or a semantic judgment can tell them apart.** Phase 1 runs before the lookup deliberately, which is why `#4899` **gates it behind a flag, records every discard with its rule id, and requires the counterfactual to be recoverable.** **Any reordering that moves the gate earlier must preserve those three.**
 
-### 4.3 ⚠️ Gaps the step list does not yet cover
+### 4.3 Five requirements the step list must place
 
-**The step list is the SHAPE, not a complete specification.** Five gaps are recorded here rather than silently implied by the diagram — **gaps to close, not designs already settled.** Two of them need an owner ruling (G5's deletion/relocation half, and G5's S4 clause — *"Which is authoritative until the migration lands?"*); G4's immutability-vs-redaction reconciliation needed a **stated design choice**, and **that choice is stated in `§2.4.4` (R1–R4)**, so its design is settled. **Closing G5 means obtaining a decision; G1 and G2 are steps to WRITE, not decisions to obtain — G2's decision is already made (`STORAGE-ARCHITECTURE.md` §12.2a) and only its step is missing — and G3's step is declared in §4.4, leaving only its implementation.**
+**The step list is the SHAPE, not a complete specification.** Five requirements of this architecture have no step to carry them. They are stated here so that each is placed deliberately rather than implied by the diagram.
+
+**One carries a settled design:** G4's immutability-versus-redaction reconciliation is `§2.4.4` (R1–R4). **Two need an owner ruling:** G5's deletion/relocation half and its S4 clause — *"Which is authoritative until the migration lands?"*. **Two need a step and nothing else:** G1 and G2 — G2's rule set is settled in `STORAGE-ARCHITECTURE.md` §12.2a, so what is missing is its second enforcement point; G3's step is declared in §4.4.
 
 | # | the gap | why it matters |
 |---|---|---|
