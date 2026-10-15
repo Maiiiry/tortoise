@@ -11,13 +11,13 @@ aboutObjects: STORAGE-ARCHITECTURE.md, records ledger, vector index, raw storage
 
 # Storage Architecture — the physical layout of the record
 
-**Status:** design — **AMENDED 2026-10-08 to the owner's hybrid ruling** (§2.0): **Postgres is the system of record for every layer; FalkorDB is a derived hot cache.** Read §2.0 and §3's table first. **Scope:** where Tortoise's data physically lives, and what that costs. This document is written in the vocabulary of `docs/ONTOLOGY.md` (v3.15) — it does not introduce new layers. **This document states target state** — decisions, issue states and code facts are stated as they are **now**, with their authority (`#N`, PR, or `file:line`), never as a record of how a passage changed; history lives in git and the tracker. **Legacy drift narrative in sections not yet re-read is removed as each is reached (`#8542`).**
+**Status:** design. **The ruling this document is built on (§2.0, owner, 2026-10-08): Postgres is the system of record for every layer; FalkorDB is a derived hot cache.** Read §2.0 and §3's table first. **Scope:** where Tortoise's data physically lives, and what that costs. This document is written in the vocabulary of `docs/ONTOLOGY.md` (v3.15) — it does not introduce new layers. **This document states target state** — decisions, issue states and code facts are stated as they are **now**, with their authority (`#N`, PR, or `file:line`), never as a record of how a passage changed; history lives in git and the tracker. **Legacy drift narrative in sections not yet re-read is removed as each is reached (`#8542`).**
 
 **⚠️ ONE WORD, TWO PRODUCTS — read this before any section mentioning "Supabase".** **Supabase *is* Postgres** (a managed Postgres is its core product). This document uses the single word for **three different things**, and the overload has already caused a real misreading — the owner asked *"why both Postgres and Supabase?"*, when **there is ONE database**: **(1)** the **Postgres vendor** (§14) · **(2)** the **Postgres database itself** (e.g. *"vectors move to Supabase Postgres (`pgvector`)"*, §12.1c — `pgvector` is a Postgres extension) · **(3)** **Supabase Storage**, the **object bucket** (true binaries only). **Every mention means one of these three; nothing here describes two databases.**
 
 **⚠️ Code citations — revision pin.** Every `file.py:NNNN` reference in this document is pinned to commit **`c79ba1cf2`**. Line numbers drift as the code moves; **the symbol name is authoritative and the line number is a convenience.** Verify against the symbol, not the number.
 
-**Related:** **`#7869`** (this amendment — the doc's canonicalisation) · `#5086` (substrate-rebuild tracking) · `#5089` (durability — derived = replay(journal)) · `#5090` (the vector layer) · `#3885` (raw storage modes) · `#3998` (the two-store question) · `#3895` (restore drill) · `#4894` (extractor v4) · `#4240` (edge durability) · `#4333` (the cost investigation — **another lane's**) · `#4614` (quota cliff) · `#4889` (Subject layer) · `#1026` (pack slots) · `#4899` (the gate). **Full issue map: §13.**
+**Related:** **`#7869`** (this amendment — the doc's canonicalisation) · `#5086` (substrate-rebuild tracking) · `#5089` (durability — derived = replay(journal)) · `#5090` (the vector layer) · `#3885` (raw storage modes) · `#3998` (the two-store question) · `#3895` (restore drill) · `#4894` (extractor v4) · `#4240` (edge durability) · `#4333` (the cost investigation — **another lane's**) · `#4614` (quota cliff) · `#4889` (Subject layer) · `#1026` (pack slots) · `#4899` (the gate). **Full issue map: `STORAGE-ARCHITECTURE-CHANGELOG.md`.**
 
 ---
 
@@ -76,10 +76,10 @@ true at once. The *decision* is untouched by this (bytes remain the unit); the *
 error is not propagated into the allowance.
 
 ⚠️ **This block SUPERSEDES the body's older figures.** §2 and §12 read **141 MB** and **45 MB** of indices where this
-block reads **143 MB / 46 MB**, and §13's issue-map row concludes *"~3 KB per node (140 MB ÷ ~45k total nodes)"* —
+block reads **143 MB / 46 MB**, and the issue map's row concludes *"~3 KB per node (140 MB ÷ ~45k total nodes)"* —
 a **third** denominator (~45k, and a different residency set). The **`~3 KB` estimate is superseded by this block's
 `1,672 B` per resident node**; the figures are not interchangeable and the `~45k` node count is not re-measured here.
-§13's row carries the earlier denominator correction (the retracted 5.6 KB claim); **this block, not §1, is the
+The issue map carries the denominator correction (the retracted 5.6 KB claim); **this block, not §1, is the
 precedent for the denominator error class** — §1 corrects a *growth-horizon* error, a different mistake.
 
 **⛔ Status of the implementation — read this as FORWARD-LOOKING, not shipped.** Nothing in the byte path is on
@@ -398,9 +398,9 @@ Supabase database storage **$0.125/GB/month**; object storage **$0.0213/GB/month
 
 ⚠️ Compute tier and max-database size are coupled (a 1 TB database wants the $410 tier) and **effective IOPS is the lower of compute-supported and disk-provisioned** — a small tier caps throughput regardless of disk purchased.
 
-### 5.1 ⚠️ Corrections to earlier drafts of this section — and the two lines it omitted
+### 5.1 The two cost lines the table omits
 
-**The numbers in the table above are the ones to use; **the ~$460 and ~$4,100-adjacent figures earlier in the doc came from a different, superseded arithmetic.**
+**The numbers in the table above are the ones to use; the ~$460 and ~$4,100-adjacent figures earlier in the doc came from a different, superseded arithmetic.**
 
 **Two real cost lines are MISSING from the table, and both grow with the design:**
 
@@ -481,7 +481,7 @@ The **superseded placement recommendation** is a **comment** on `#1509` (*"Decis
 
 **⚠️ Harmonise, do not duplicate.** `#2453` (retain operational values verbatim) · `#2817` (no numeric/locale canonicalisation exists — PT-BR/EN amounts) · `#2782` (money needs amount + currency on entities) · `#2521` (numeric aggregation across sessions) · `#2820` (tracking map — its **"state & value model"** workstream owns all of this). **Read this section together with extractor §7; neither can be built alone.**
 
-> **Caveat (`#4889`).** The live graph is a **DOGFOOD instance**, so an edge count there is not the test: the `aboutSubject` half could not be disproved that way. The code exists and is tested (`tortoise/subject_binding.py`; the `aboutSubject` write paths in `projection/edges.py` and `connectors/github.py`; `tests/test_subject_binding_1370.py`), **What remains open is the end-to-end check against a real workload, which needs a capstone issue (not yet filed).** Note also that `aboutObject` is itself the largest — possibly unnecessary — edge type in the graph (§11's note).
+> **Caveat (`#4889`).** The live graph is a **DOGFOOD instance**, so an edge count there is not the test: the `aboutSubject` half could not be disproved that way. The code exists and is tested (`tortoise/subject_binding.py`; the `aboutSubject` write paths in `projection/edges.py` and `connectors/github.py`; `tests/test_subject_binding_1370.py`). **What remains open is the end-to-end check against a real workload, which needs a capstone issue (not yet filed).** Note also that `aboutObject` is itself the largest — possibly unnecessary — edge type in the graph (§11's note).
 
 ---
 
@@ -748,7 +748,7 @@ The field's own warning is that **"versioned KGs are resource-intensive"** — t
 
 > **three timestamps and a hash — not a copy of the artifact.**
 
-**Bound it there: windows and hashes only, never content copies.** If a version ever starts carrying bytes, this stops being cheap and §13's cost argument changes. The content lives in **Postgres** (§9.1) once, addressed by `url` + `contentHash`.
+**Bound it there: windows and hashes only, never content copies.** If a version ever starts carrying bytes, this stops being cheap and this section's cost argument changes. The content lives in **Postgres** (§9.1) once, addressed by `url` + `contentHash`.
 
 #### ⭐ Why document-level versioning ALONE would not have answered the owner's question
 
@@ -971,7 +971,7 @@ d = 384, M = 16 → 1,830 B ≈ 1.79 KB/vector
 
 ✅ **MEASURED 2026-09-24 — M1 is done. See §12.1d: 1.49 ms network floor, 2.74 ms indexed vector search, 1.55–1.75 ms traversals. Our retrieval layer is single-digit milliseconds and latency is not a constraint.**
 
-### 12.1b ⚠️ CORRECTED ACCOUNTING — where the vectors actually sit (2026-09-24)
+### 12.1b Where the vectors actually sit
 
 **The vector class is not a single index. One finding is a filed defect.**
 
@@ -1305,15 +1305,15 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 
 **⚠️ And the discipline that keeps this honest: our own numbers for the cost TIERS still do not exist.** Every tier figure above is **published third-party** and must be re-measured on our data before any lever is committed. ✅ **What IS now measured is our own retrieval latency (§12.1d) and our own memory composition (§12.1) — those are no longer borrowed.** *(⚠️ Do not cite a "95.6 MB" measurement here — §12.1 states the measured composition.)*
 
-## 13. The open measurements — and the rulings they produced
+## 13. Filed from this document — the open rulings
 
 The issue map that used to open this section — a section→issue index carrying
 each issue's state — is in **`STORAGE-ARCHITECTURE-CHANGELOG.md`**. What
-follows is the measurement evidence and the rulings, which are design.
+follows is the evidence each ruling rests on, which is design.
 
 **Filed from this document:**
 
-- **`aboutObject` as a stored edge vs a derived join** — **`#7948`** — the measurement is DONE (research brief, 2026-09-23) and the answer is SPLIT, which decides it.
+- **`aboutObject` as a stored edge vs a derived join** — **`#7948`** — the measurement is complete (research brief, 2026-09-23) and the answer is SPLIT, which decides it.
 
   **The primary search path does NOT read it.** `rg -n 'aboutObject' tortoise/retrieval.py tortoise/search_engine.py tortoise/session_reinjection.py` → **exit 1, zero matches**, case-insensitive. **Hindsight's premise holds for this path.**
 
@@ -1372,7 +1372,7 @@ follows is the measurement evidence and the rulings, which are design.
 | **O5** | Sample first, or make it deterministic? | ✅ **Neither as an either/or — draft and iterate.** *"we draft something (a prompt, a step of the extraction workflow, etc) and run it and see the result then refine and run again, until good."* | **The method is: draft → run → look → refine → repeat.** Recorded as the working method for every step. |
 | **O6** | Which layer owns `Document`? | ✅ **Resolved: a document is a SOURCE (§9.3).** *"I am suggesting making them sources so our entity layer can be extracted from them…"* | **`:Document` folds into `:Source`; its content leaves the graph for raw text in Postgres (§3, §9.1); liveness is a READ of the entities, not a stored field.** The `:Document` NODE label is **retired** (D10, PR `#5127`; `ONTOLOGY.md` §4.4 retires it with the label — v3.15, PR `#5022`), and the `documents` cap counts document-bearing `:Source` nodes. |
 
-### 14.2 ⭐ The engine decision — AMENDED 2026-10-08: the engine stays, its ROLE changes
+### 14.2 ⭐ The engine decision — the engine stays, its ROLE changes
 
 **Owner, 2026-09-24:** *"for now we can keep FalkorDB hosted and then we figure out further optimisation."*
 **Owner, 2026-10-08 (§2.0):** *"we do hybrid now, data goes to postgres and it's loaded to hot (falkor); for now we keep the limit in falkor high…"*
@@ -1389,7 +1389,7 @@ follows is the measurement evidence and the rulings, which are design.
 
 ### 14.3 ⚠️ Open — raised 2026-09-24, NOT decided
 
-**⚠️ AMENDED 2026-10-08 — the hybrid makes V1 more urgent, not less.** Under the 2026-09-24 decision the graph was the store, so moving the vector index was an optimisation. **Under the hybrid, FalkorDB is a CACHE, so every byte it holds is rent on something Postgres already stores** — which is the definition of the waste the split exists to remove. **V1 is still the owner's call, and it is now the *first* cache-tier question rather than "the month-6 answer".**
+**⚠️ The hybrid makes V1 more urgent, not less.** Where the graph is the store, moving the vector index is an optimisation. **Under the hybrid, FalkorDB is a CACHE, so every byte it holds is rent on something Postgres already stores** — which is the definition of the waste the split exists to remove. **V1 is still the owner's call, and it is now the *first* cache-tier question rather than "the month-6 answer".**
 
 | # | the question | why it is not settled | what turns on it |
 |---|---|---|---|
@@ -1591,7 +1591,7 @@ For the record, since two members of the design rest on it:
 | **compute ladder** | **Postgres** (record) | **Micro $10 · Small $15 · Medium $60 · Large $110 · XL $210 · 2XL $410 · 4XL $960** / month | provisioned instance | $10/mo credit | Micro = 1 GB RAM shared; 2XL = 32 GB; **the tier the read path needs is unmeasured** |
 | **plan** | account | **$25 / month** (Pro) | per project | first project | fixed, **not** per tenant |
 
-**⚠️ `#4614` is cited in this issue — and in §13's issue map, corrected there — as the "published rates" issue, and it is NOT one.** It is a *quota-cliff capture bug* (`402` at 9,998/10,000). **The rate authority is the vendor pricing pages above** (and `#4333` for the cost basis of the cache). **Recorded so the citation is not reused.**
+**⚠️ `#4614` is cited in this issue — and in the issue map, corrected there — as the "published rates" issue, and it is NOT one.** It is a *quota-cliff capture bug* (`402` at 9,998/10,000). **The rate authority is the vendor pricing pages above** (and `#4333` for the cost basis of the cache). **Recorded so the citation is not reused.**
 
 **⚠️ `#4333` remains the authority on volume and true bytes per node, and its own ledger lists `egress + IOPS` as *"❌ not modelled, not measured"*.** §17.4 **prices** those lines; it does **not** measure them, and §17.4.4 says so explicitly.
 

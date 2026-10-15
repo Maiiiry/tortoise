@@ -34,7 +34,7 @@ extraction costs the customer**, and that silence is now filled by a ruling:
 **What this means for this document's own design work.** The tokens are the **extraction** lane's workload — the LLM
 work this architecture specifies — so any change that alters extraction **volume** (batch size, the S1→S2 step count,
 the VET pass, per-item vs per-batch judgment) now moves a **customer-visible meter**, not merely a cost. That is a
-reason to prefer measurable steps over inferred ones: §16.2's rule (a claim must be checkable) is now also a billing
+reason to prefer measurable steps over inferred ones: the checkability rule is now also a billing
 surface.
 
 **✅ Where the measurement is — PRESENT (this paragraph said PLANNED; re-measured 2026-10-11, `#3840`).** The
@@ -167,7 +167,7 @@ Production graph: **~25,000 quota nodes in 3–4 active days** (~27 per emitting
 | **H4** | Subgraph-alone is sufficient *(falsifier)* | `B ≥ A − 5 pts` |
 | **H5** | The renderer/selection path is the binding constraint *(falsifier)* | `B < A − 15 pts` **and** answer-bearing-claim presence ≥ 80% |
 
-**The earlier draft was correct about all three.** The cycle-1 review's premise was wrong: `−5` appears in **both** H3 and H4, and `15` appears in H1 **and** H5's falsifier — **"also present elsewhere" was misread as "not present here"**. **⇒ Restored. The lesson this cost us is recorded in §16.2.**
+**All three values hold:** `−5` appears in **both** H3 and H4, and `15` appears in H1 **and** H5's falsifier — **"also present elsewhere" is not "not present here"**. **⇒ Restored.**
 
 **⚠️ Still read them from the frozen doc before using them:** `docs/experiments/2026-09-11-abc-context-assembly-experiment.md`. **The falsifier's ROLE is the claim to keep, and it survives: a result where verbatim alone beats the union is a statement about which arm to SERVE AT RETRIEVAL, not a verdict on the belief layer.**
 
@@ -467,7 +467,7 @@ Normalises the shape **and applies the declared field→type mapping** (§3). Pa
 **⭐ A document is a SOURCE, not a graph node (owner, 2026-09-24).** *"I am suggesting making them sources so our entity layer can be extracted from them… That way our entity layer becomes a proper abstraction over documents, code, meeting transcripts (all sources) — that's the reasoning/knowledge layer."*
 
 **⇒ S0's input is a source FILE, uniformly, whatever it is.**
-**⇒ D10 is LANDED — both halves.** *Ontology:* `ONTOLOGY.md` v3.15 (PR `#5022`, issue `#5013`). *Code:* PR `#5127` retired the `:Document` NODE label, and the `:Source` replay key is `url` (`tortoise/projection/edges.py:153`). **The consequence for the extractor stands: nothing downstream is document-specific.** A spec, a repo file and a call transcript differ only in their **mapping**, never in their treatment. **Full shape: `STORAGE-ARCHITECTURE.md` §9.3.** **One constraint survives the landing:** rebuild does not repair pre-existing graphs (`#2489`).
+**⇒ D10 holds in both halves — ontology and code.** *Ontology:* `ONTOLOGY.md` v3.15 (PR `#5022`, issue `#5013`). *Code:* PR `#5127` retired the `:Document` NODE label, and the `:Source` replay key is `url` (`tortoise/projection/edges.py:153`). **The consequence for the extractor stands: nothing downstream is document-specific.** A spec, a repo file and a call transcript differ only in their **mapping**, never in their treatment. **Full shape: `STORAGE-ARCHITECTURE.md` §9.3.** **One constraint survives the landing:** rebuild does not repair pre-existing graphs (`#2489`).
 
 **⭐ The five consequences of D10 — ruled 2026-09-24, and the reasons they matter to the EXTRACTOR (full analysis: `STORAGE-ARCHITECTURE.md` §9.5).**
 
@@ -606,7 +606,7 @@ This is v2's S2, with priors in hand. Still proposes only; decides nothing.
 
 **Outputs:** `KEEP` · `NOOP` · `DISCARD` · **`MERGE`** *(the VERDICT — a flag, §16.4)* · `SPLIT` *(for a fused item — extraction may then split it from the raw, which it already has)* · **`RENARRATE`** *(batch-level only)*. ⚠️ **`KEEP`/`NOOP`/`DISCARD`/`MERGE` are the four members §16.4 rules and `tortoise/vet_gate.py` implements (`OUTCOMES`); `SPLIT` is declared here and is NOT in that set — the shipped gate cannot emit it (a disclosed omission, named in `vet_gate.py`), so read `SPLIT` as design intent, not as shipped behaviour.**
 
-⚠️ **`MERGE-INTO-EXISTING` is deliberately NOT a VET output — and `MERGE` and `MERGE-INTO-EXISTING` are not the same thing.** VET **may** emit the **verdict** `MERGE` — *"fold into another candidate"* (`tortoise/vet_gate.py:OUTCOMES`), a **flag** and nothing more. VET may **not** emit the **action** `MERGE-INTO-EXISTING`. VET runs **before** S3 (§4.2), and S3 is **the single authority on whether a candidate is new or an existing node**. A VET stage that *performed* the merge would be deciding new-vs-existing itself — the VET/S3 circular dependency §16.2 identifies. **The FUSION is S3's action, executed after the gate; VET may only keep, discard, split, FLAG one merge candidate, or ask for a re-narration.** ⚠️ **Nothing consumes the flag yet** — no code routes a `MERGE` verdict to S3, and the union-merge itself is `#5006`'s (`vet_gate.py`: the verdict is *"recorded in the VET evidence surface only"*). **This distinction is what makes this paragraph and §4.2's ordering AGREE rather than contradict: `S2.2a-β` detects the pair, `S2.2b VET` records the verdict, `S3` executes the fusion — three sites, one operation each (`#5092`).**
+⚠️ **`MERGE-INTO-EXISTING` is deliberately NOT a VET output — and `MERGE` and `MERGE-INTO-EXISTING` are not the same thing.** VET **may** emit the **verdict** `MERGE` — *"fold into another candidate"* (`tortoise/vet_gate.py:OUTCOMES`), a **flag** and nothing more. VET may **not** emit the **action** `MERGE-INTO-EXISTING`. VET runs **before** S3 (§4.2), and S3 is **the single authority on whether a candidate is new or an existing node**. A VET stage that *performed* the merge would be deciding new-vs-existing itself — the VET/S3 circular dependency. **The FUSION is S3's action, executed after the gate; VET may only keep, discard, split, FLAG one merge candidate, or ask for a re-narration.** ⚠️ **Nothing consumes the flag yet** — no code routes a `MERGE` verdict to S3, and the union-merge itself is `#5006`'s (`vet_gate.py`: the verdict is *"recorded in the VET evidence surface only"*). **This distinction is what makes this paragraph and §4.2's ordering AGREE rather than contradict: `S2.2a-β` detects the pair, `S2.2b VET` records the verdict, `S3` executes the fusion — three sites, one operation each (`#5092`).**
 
 **⚠️ Unmeasured, and it needs the small-sample-first method:** *whether re-narrating actually improves yield*, and *what keep-rate counts as "poor"*. Both are thresholds that must be set by hand on tens of real sessions with the owner correcting the rule — **not chosen in advance.**
 
@@ -1010,11 +1010,11 @@ v3's **E2** requires state-value facts be preserved verbatim (*"personal best 5K
 
 **⇒ Any mechanical filter MUST carry this carve-out, or it will drop the facts users care about most.** See `STORAGE-ARCHITECTURE.md` §7 for the low-cost storage question.
 
-#### ✅ The carve-out DID NOT cover decision-relevant numbers — measured, and FIXED (`#2453`, PR `#2456`)
+#### ✅ The carve-out does NOT cover decision-relevant numbers
 
 `#2453` root-caused this: the carve-out is scoped to **user-personal state** (personal bests, schedules, preferences) and **explicitly tells the mapper to DROP process metrics as "mechanics tokens"** — *"counts/logistics are ephemeral"*. **That policy is right for personalisation memory and starving for engineering-decision memory**: on a number-dense session (latencies, durations, counts) it drops exactly the values the decision turns on. ⚠️ **That was the scope BEFORE the fix — as the table below records, `#2453` landed and `STATE_VALUE_CARVE_OUT` was extended to retain operational values, so the carve-out is no longer as described in this sentence.**
 
-**⇒ There are TWO value classes. ⚠️ At the time of measurement the policy kept one and discarded the other; the table below records that this was FIXED (commit `4a690d0be`, 2026-09-07, PR `#2456`):**
+**⇒ There are TWO value classes, and the policy must keep BOTH** (commit `4a690d0be`, PR `#2456`) — the table below states which:
 
 | class | example | today | must be |
 |---|---|---|---|
@@ -1195,13 +1195,13 @@ At answer time the rule is recency-precedence (*"the fact with the LATEST `menti
 | **Extraction from raw; summaries marked untrusted** | ✅ **confirms D3-Option 4** (§10). |
 | **No event node in provenance** | ✅ **confirms D2's rule** — the anchor is always a document/utterance. |
 
-### ⛔ REFUSED — contradicts a recorded decision ⇒ a REOPEN, not an adoption — ✅ **this reopen is CLOSED, 2026-10-06; see the block below**
+### ⛔ REFUSED — contradicts a recorded decision ⇒ a REOPEN, not an adoption
 
 The contention + confidence model **is a recorded decision** (`ONTOLOGY.md` §3.1 *"evaluations … are Statements (Points) with EP confidence — not edges"*; the operator layer; `#1509` §2.4 ontology-first). **Hindsight's practice contradicts it, so it cannot be adopted.**
 
 > ### ✅ REOPEN CLOSED — the owner ruled on 2026-10-06: we KEEP EP confidence; `proof_count` and `Trend` are NOT adopted
 >
-> ✅ **`OVERRIDES:` posted on `#2730`** — for **this ruling** the marker lives on the **issue**, per §16's rule (below); the issue comment carries the full text. ⚠️ The rule is **not** yet true file-wide — the inline `OVERRIDES:` block near the top of this file (the **postpaid-billing → prepaid-credits** ruling, dated 2026-09-26) is the exception, so this is narrowed to the case at hand rather than stated as a general convention. **Do not re-open this by re-reading the five challenges below — they are kept as history.**
+> ✅ **`OVERRIDES:` posted on `#2730`** — for **this ruling** the marker lives on the **issue**, per the rule below; the issue comment carries the full text. ⚠️ The rule is **not** yet true file-wide — the inline `OVERRIDES:` block near the top of this file (the **postpaid-billing → prepaid-credits** ruling, dated 2026-09-26) is the exception, so this is narrowed to the case at hand rather than stated as a general convention. **Do not re-open this by re-reading the five challenges below — they are kept as history.**
 >
 > ⚠️ **Two claims, and only one is established — stated so the ruling cannot be overclaimed later.**
 >

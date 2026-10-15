@@ -884,5 +884,5 @@ moved here.
 | §8 lazy-promotion note | *"*(today's shipped code reads the semantics on the operator write path … `create_direct_edge` and the ingest path still resolve by `op_type` … the direction-sourcing gap is separate and tracked as `#7852` (`#7813` is CLOSED `COMPLETED`).)*"* |
 
 **Enforced from here on:** `tests/test_extractor_v4_citation_rot.py::
-test_the_model_reference_carries_no_issue_state_or_change_narration` reds if any
+test_the_design_documents_carry_no_issue_state_or_change_narration` reds if any
 of this shape returns to `ONTOLOGY.md`.

@@ -324,7 +324,7 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
 #: git, and a claim about a correction has no artifact to check it against, so
 #: it can only re-stale.
 LANDED_STATEMENTS: dict[str, str] = {
-    "§S0 states the D10 code half as landed": "D10 is LANDED — both halves.",
+    "§S0 states the D10 code half as landed": "D10 holds in both halves — ontology and code.",
     "§D's D10 row states the label retirement": (
         "PR `#5127` retired the `:Document` NODE label"
     ),
@@ -544,7 +544,21 @@ _STATUS_ADJACENT = re.compile(
 #: A change narrated as a change, rather than the rule it settled on. The record
 #: of what changed belongs in `ONTOLOGY-CHANGELOG.md`, which is what a changelog
 #: is for.
-_CHANGE_NARRATION = re.compile(r"an earlier (?:draft|version)|CORRECTED 20[0-9]{2}-", re.IGNORECASE)
+_CHANGE_NARRATION = re.compile(
+    r"an earlier (?:draft|version|note|row|line|passage|recommendation)"
+    r"|Corrections? to (?:an )?earlier"
+    r"|(?:CORRECTED|AMENDED) 20[0-9]{2}-",
+    re.IGNORECASE,
+)
+
+#: Delivery spoken as delivery. A design document states the fact, not the fact
+#: that it arrived: *"D10 is LANDED"*, *"this reopen is CLOSED"*, *"measured,
+#: and FIXED"*. The trailing window is deliberately short — a sentence further
+#: on is a different claim.
+_DELIVERY_STATE = re.compile(
+    r"\b(?:is|are|was|were|has|have) (?:LANDED|SHIPPED|FIXED|DONE|CLOSED|COMPLETED)\b"
+    r"|\bNOW TRUE\b"
+)
 
 
 #: The documents that STATE A DESIGN — as opposed to the three changelogs, which
@@ -572,6 +586,10 @@ def test_the_design_documents_carry_no_issue_state_or_change_narration():
     accumulated in the first place. A literal pin cannot catch that: it only
     knows the violations it was written against, and a literal that matches
     nothing passes vacuously (#8564).
+
+    Three shapes are pinned: an issue-state adjacent to a , the narrative
+    of a change (, , ), and delivery spoken as delivery (, , ). The last shape is the one the first two
+    widened windows let through: it needs no  nearby and carries no date.
     """
     offenders = []
     for path in DESIGN_DOCS:
@@ -580,6 +598,8 @@ def test_the_design_documents_carry_no_issue_state_or_change_narration():
                 offenders.append(f"{path.name}:{number}: issue-state claim: {line.strip()[:160]}")
             if _CHANGE_NARRATION.search(line):
                 offenders.append(f"{path.name}:{number}: change narration: {line.strip()[:160]}")
+            if _DELIVERY_STATE.search(line):
+                offenders.append(f"{path.name}:{number}: delivery state: {line.strip()[:160]}")
     assert not offenders, (
         "a design document must state the design. An issue's open/closed state, "
         "and the narrative of what changed, belong in the sibling "
