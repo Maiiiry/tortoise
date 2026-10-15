@@ -2473,6 +2473,11 @@ surfaces:
   - test_3844_annotation_injection.py  # #3844: reader-evidence annotation prefix cannot be forged by a newline in speaker/session_date OR the validity marker (hermetic, no DB)
   - test_6252_body_fence.py  # #6252: body-side sibling of #3844 — the block BODY is fenced so stored content cannot forge a block-scope line (hermetic, no DB); dual core+sdk because tortoise/retrieval.py is SOURCE_PATTERNS["sdk"]
   - test_review_connections.py
+  # #2354: the uncertainty-verdict layer (`tortoise/review_verdicts.py`) rides
+  # the mining correction-conflict candidate path and the existing review verbs.
+  # `review_verdicts.py` matches no SOURCE_PATTERNS entry, so a change to it
+  # selects the `core` fallback — registered here so the E2E runs on it.
+  - test_review_verdicts_2354.py
   - test_round_trip_parity.py
   - test_run_protocol.py
   - test_sdk_adapter_cap.py
@@ -4476,6 +4481,7 @@ durations:
   test_eval_retrieval_budget.py: 2.0
   test_export_delete.py: 3.2
   test_review_connections.py: 3.7
+  test_review_verdicts_2354.py: 140.3  # #2354: measured here (24 tests, 136.47s wall, embedded lane, 2026-10-15; 140.29s at 23 tests) — a real weight, not the flat 2.0 default; the weekly ci-timing sweep re-derives it from junit
   test_battery_report_writers.py: 2.2
   test_de2e6_temporal.py: 3.0
   test_direct_edge.py: 1.7
