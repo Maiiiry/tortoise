@@ -108,6 +108,54 @@ def test_docs_scanning_gates_stay_in_tier1():
         "#2881 durability gate must stay in tier1 — same docs-only silent-drop "
         "class (#4309)"
     )
+    assert "test_7818_ontology_record.py" in tier1, (
+        "#7818 ONTOLOGY §4.7 doc↔code pin must be in tier1 — the other half of "
+        "the #7818 guard (`test_7818_boundary_ambiguity_contract.py`) is "
+        "`sdk`-registered and docker-lane, so a docs-only `docs/ONTOLOGY.md` "
+        "edit never runs it; without this hermetic pin the §4.7 coverage-rule "
+        "drift lands green (#4309 class, same as #5142/#2881)"
+    )
+    assert "test_7818_plan_record_5362.py" in tier1, (
+        "#7818/#5362 plan-record pin must be in tier1 — the #5362 plan's "
+        "RES-1 residual and out-of-scope list are docs the drift arrives on, "
+        "and a docs-only edit runs only tier1; without this pin a re-staled "
+        "`found`-omission claim merges green (#4309 class)"
+    )
+    assert "test_fly_secret_drift.py" in tier1, (
+        "#8614: the runbook's secret-drift guards read docs/infra-runbook.md "
+        "(`docs/` is in NON_PYTHON_PREFIXES and the runbook matches no "
+        "SOURCE_PATTERNS entry), so a runbook-only diff runs tier1 only — "
+        "without this registration a re-introduced `—` in a `gh-secret:` row "
+        "or a `fly secrets set NAME=$(openssl rand …)` recipe merges green "
+        "(#4309 class)"
+    )
+
+
+def test_fly_secret_drift_gate_runs_on_a_runbook_only_diff():
+    """#8614 review (P2): the runbook's own guards must run on the runbook.
+
+    `tests/test_fly_secret_drift.py` binds prose claims in
+    `docs/infra-runbook.md` (the Secrets Matrix GitHub column, §1/§2 never
+    giving a `gh-secret:` name a value minted on Fly, and §2's account of which
+    `workflow` names the deploy re-stages — the set grows with the file, so this
+    names the binding rather than counting it). `docs/` is in
+    NON_PYTHON_PREFIXES and `docs/infra-runbook.md` matches no SOURCE_PATTERNS
+    entry, so a runbook-only diff filtered to `changed == []` and took the
+    docs-only early return — tier1 ONLY. Registered in `core` but not in
+    `tier1`, the guards were therefore asleep on the only change that can break
+    them: the pre-#8614 state (`—` in the FASTAPI_INTERNAL_KEY /
+    TORTOISE_SECRET_PEPPER rows) would have merged green and only reddened
+    `main` post-merge. Dropping the tier1 entry re-opens that hole (#4309
+    silent-drop class).
+    """
+    r = _sel(["docs/infra-runbook.md"])
+    assert r["full"] is False
+    assert r["surfaces"] == []
+    assert "test_fly_secret_drift.py" in r["test_files"], (
+        "a docs/infra-runbook.md-only diff must select the guards that bind its "
+        "prose (`test_fly_secret_drift.py`) — otherwise a docs-only edit that "
+        "re-breaks a claim it pins merges green (#8614 review, #4309 class)"
+    )
 
 
 def test_public_site_surface_change_selects_onboarding_and_skips_slow():
@@ -1354,6 +1402,85 @@ def test_orchestrator_harness_change_selects_core_not_tier1():
     r = _sel(["operations/orchestrator-harness/merged-not-closed.sh"])
     assert "core" in r["surfaces"], r
     assert "test_orchestrator_harness.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
+def test_queue_dispatch_and_fleet_state_change_select_core_not_tier1():
+    # PR #8594 review P2: tools/agent-infra-queue-dispatch.py owns
+    # tests/test_queue_dispatch_fail_closed.py and tools/fleet_state.py owns
+    # tests/test_fleet_state.py — both `core`-registered. `tools/` is a flat
+    # NON_PYTHON_PREFIXES entry and neither path matches a SOURCE_PATTERNS row,
+    # so each one's own change came back with `changed == []` and took the
+    # docs-only early return — `select()` returned NO surface and the guard never
+    # ran on the file it guards (the #1349/#3332/#3616 silent-drop class).
+    #
+    # CORE_ALSO (not TOOL_CARVEOUTS) is the deliberate choice: both guards are
+    # hermetic and sub-second, so selecting `core` runs them at the lowest CI cost.
+    # Mutation check: removing either CORE_ALSO entry fails its assert below.
+    for path, guard in (
+        ("tools/agent-infra-queue-dispatch.py", "test_queue_dispatch_fail_closed.py"),
+        ("tools/fleet_state.py", "test_fleet_state.py"),
+    ):
+        r = _sel([path])
+        assert r["full"] is False, (path, r)
+        assert "core" in r["surfaces"], (path, r)
+        assert guard in r["test_files"], (path, r)
+        assert set(r["test_files"]) != _tier1(), (path, r)
+
+
+def test_capstone_probe_change_selects_core_not_tier1():
+    # docs/evidence/7950-capstone/probes/e2e_chain_probe.py owns
+    # tests/test_7950_capstone_probe.py (`core`): the DB-free pin asserting the
+    # probe's two reconciliation readers (`record_key_map` / `cache_key_map`)
+    # return the REAL property maps, not `{}` placeholders — two empty mappings
+    # always agree, so the pre-fix shape made `field_mismatches` structurally
+    # zero and the probe's committed log proved key-set agreement only.
+    #
+    # PR #8609 review P1: `docs/` is a flat NON_PYTHON_PREFIXES entry and no
+    # SOURCE_PATTERNS row matches the probe, so a PROBE-ONLY change came back
+    # with `changed == []` and took the docs-only early return — `select()`
+    # returned NO surface and the pin never ran on the very file whose readers
+    # it pins. Reverting the readers to the pre-fix `{}` shape would land with
+    # CI green (the #1349/#3332/#3616 silent-drop class). A SOURCE_PATTERNS
+    # entry alone cannot fix it: `_selection_relevant()` deliberately skips the
+    # `core` surface, and the guard is `core`-registered.
+    #
+    # Measured before the CORE_ALSO entry: `_sel(["docs/evidence/7950-capstone/
+    # probes/e2e_chain_probe.py"])` -> surfaces=[], full=False, test_files 39,
+    # test_7950_capstone_probe.py absent. CORE_ALSO keeps the path and selects
+    # `core`; the directory prefix covers the sibling probes too.
+    # Mutation check: removing the CORE_ALSO entry fails assert 1 below.
+    for path in (
+        "docs/evidence/7950-capstone/probes/e2e_chain_probe.py",
+        "docs/evidence/7950-capstone/probes/s1_census.py",
+    ):
+        r = _sel([path])
+        assert "core" in r["surfaces"], (path, r)
+        assert "test_7950_capstone_probe.py" in r["test_files"], (path, r)
+        assert r["full"] is False, (path, r)
+
+
+def test_supabase_config_change_selects_core_not_tier1():
+    # supabase/config.toml is the committed LOCAL-stack config and resolves its
+    # providers by `env(NAME)` substitution, so each of those names is required
+    # by a tracked file. tests/test_env_contract_covers_supabase_config.py
+    # (`core`) is the guard: every config `env(NAME)` must be declared in
+    # .env.example, the contract an operator reads.
+    #
+    # `supabase/` is a flat NON_PYTHON_PREFIXES entry and the path matches no
+    # SOURCE_PATTERNS row, so before the CORE_ALSO entry a CONFIG-ONLY change
+    # came back with `changed == []` and took the docs-only early return —
+    # `select()` returned NO surface and the guard never ran on the half of the
+    # pair it exists to hold (the #1349/#3332/#3616 silent-drop class). A
+    # SOURCE_PATTERNS entry cannot fix it: `_selection_relevant()` deliberately
+    # skips the `core` surface, and the guard is `core`-registered.
+    #
+    # Measured before the entry: `_sel(["supabase/config.toml"])` ->
+    # surfaces=[], full=False, 40 test files, the guard absent.
+    # Mutation check: removing the CORE_ALSO entry fails the assert below.
+    r = _sel(["supabase/config.toml"])
+    assert "core" in r["surfaces"], r
+    assert "test_env_contract_covers_supabase_config.py" in r["test_files"], r
     assert r["full"] is False, r
 
 
@@ -7051,6 +7178,63 @@ def test_the_lane_has_a_real_runner_and_reads_the_lane_from_config():
     assert on_demand_files.__name__ in wf, (
         "the workflow must resolve the lane through on_demand_files() — "
         "hardcoding a second list here lets the two drift")
+
+
+def test_the_perf_lane_runner_is_off_the_gate_and_reads_the_lane_from_config():
+    # #3992: `on_demand:` gained a SECOND runner — the dedicated perf lane
+    # (`tests/test_perf_lane_volunteer_context.py`, the file the #2080 plan
+    # names). The property the first runner is pinned for holds for the second
+    # one too, and for the same reason: a wall-clock SLO assertion must never
+    # gate a merge (the plan keeps the MECHANISM assertions blocking and the
+    # p95 in the dedicated lane), and a runner that hardcodes its file has a
+    # second list to forget.
+    #
+    # The failure this prevents, named: a future edit adding `pull_request:`
+    # to perf-lane.yml would silently put a shared-runner wall-clock number on
+    # every PR — the flake class the lane exists to separate out.
+    perf = "test_perf_lane_volunteer_context.py"
+    wf = (REPO / ".github/workflows/perf-lane.yml").read_text()
+    import yaml
+    doc = yaml.safe_load(wf)
+    triggers = doc.get("on", doc.get(True))
+    assert "pull_request" not in triggers, (
+        "the dedicated perf lane must never gate a PR — a shared-runner "
+        "wall-clock assertion on the merge path is the exact flake class "
+        "#3992's plan separates out")
+    assert "workflow_dispatch" in triggers, (
+        "the lane's manual invocation is an acceptance criterion (#3992 AC 4)")
+    assert on_demand_files.__name__ in wf, (
+        "the perf-lane workflow must resolve the lane through "
+        "on_demand_files(); a hardcoded path is a second list to forget")
+    assert perf in on_demand_files(load_manifest()), (
+        "the perf lane runs from the on_demand lane — without membership it "
+        "is excluded from the gate and claimed by nothing")
+    # `fast_pool()` returns `.py`-SUFFIXED entries, and the set below strips the
+    # suffix, so the comparison must use the bare name. The pre-fix form
+    # compared `perf` (WITH `.py`) against bare names — a value that can never
+    # be in that set — so it was satisfied by construction and the mutation it
+    # names (the file re-entering `fast_pool`) left this test green.
+    bare = perf[:-3] if perf.endswith(".py") else perf
+    assert bare not in {f[:-3] for f in fast_pool(load_manifest())}, (
+        "the lane must be filtered out of fast_pool, or the wall-clock "
+        "assertion is back on the merge gate")
+    # Non-vacuity control, ASSERTED (the sibling duration test's pattern): move
+    # the file back onto a surface and off the lane, and the assertion above
+    # must go red. This is the discriminator between the fixed form and the
+    # dead one — with `perf` (suffixed) this control passes vacuously too.
+    m = load_manifest()
+    first_surface = next(iter(m["surfaces"]))
+    on_gate = {
+        **m,
+        "on_demand": [f for f in m.get("on_demand") or [] if f != perf],
+        "surfaces": {
+            **m["surfaces"],
+            first_surface: [*m["surfaces"][first_surface], perf],
+        },
+    }
+    assert bare in {f[:-3] for f in fast_pool(on_gate)}, (
+        "control: with the file back on a surface it IS in fast_pool — if this "
+        "fails, the assertion above cannot fail for the regression it names")
 
 
 def test_the_lane_files_duration_key_is_classified_not_drift():
