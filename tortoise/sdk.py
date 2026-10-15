@@ -80,8 +80,7 @@ from .live import classify_lifecycle_fanout  # #7822 fan-out-wide lifecycle verd
 from .live import LIFECYCLE_FANOUT_QUERY  # #7822 the shared fan-out statement
 from .live import EPISTEMIC_LABELS  # #7902 epistemic-label write widening (shared with #7853 read widening)
 from .raw_state import (  # #3998: the absent-raw state
-    RAW_ABSENT_STATES,
-    RAW_PRESENT,
+    WRITABLE_RAW_STATES,
     raw_entry,
     validate_raw_state,
 )
@@ -10021,7 +10020,17 @@ class TortoiseSDK:
         # `(n)<-[:IMPL|NAND]-(op)-[:IMPL|NAND]->(m)` from them, so
         # `_affected_factors` still re-derives the operator's factor.
         neighbor_ids = [cid for cid in neighbor_claims if cid != id]
-        proj.g.query("MATCH (n:Point {id:$id}) DETACH DELETE n", params={"id": id})
+        # #7405: the hard delete rides the bounded write retry. A DETACH DELETE
+        # by an explicit id is idempotent — a re-issue after a non-landing ABORT
+        # re-deletes a node that is (at worst) already gone, a no-op. The abort
+        # MUST be proved not-landed, which is exactly what
+        # `retryable_aborted_write` admits (a bare DELETE never rides
+        # `retryable_transient`).
+        self._graph_write_with_retry(
+            lambda: proj.g.query(
+                "MATCH (n:Point {id:$id}) DETACH DELETE n", params={"id": id}),
+            what="delete_point DETACH DELETE",
+        )
         # #3300 residual: ONE event type must not mean two end-states.
         # `delete_point` hard-deletes; `retract_point` tombstones. The single
         # `PointRetracted` (id=) call emitted BOTH stores, and its fold has
@@ -10042,7 +10051,15 @@ class TortoiseSDK:
         # Idempotent — DETACH DELETE leaves count-0 tags behind that would
         # otherwise accumulate in list_tags.
         if has_tag_edges:
-            proj.g.query("MATCH (t:Tag) WHERE NOT (t)<-[:TAGGED]-() DELETE t")
+            # #7405: the orphan-tag GC is swept through the same retry. The
+            # statement re-derives "orphan" from the graph at issue time and a
+            # DELETE of an already-deleted tag is a no-op, so a re-issue after
+            # a non-landing ABORT cannot double-delete or remove a live tag.
+            self._graph_write_with_retry(
+                lambda: proj.g.query(
+                    "MATCH (t:Tag) WHERE NOT (t)<-[:TAGGED]-() DELETE t"),
+                what="delete_point orphan tag GC",
+            )
         # Dreaming (#85): deletion changes the graph structure around
         # neighbors — mark the pre-captured neighbors dirty (#1916) so the
         # reverse-BFS has surviving edges to traverse (the deleted point's
@@ -11113,11 +11130,19 @@ class TortoiseSDK:
         now = datetime.now(timezone.utc).isoformat()  # noqa: UP017
         # CAS-guarded SET (concurrent promote can't double-fire); reviewed is
         # the DERIVED reviewer flag (plan §3 — no new stored status).
-        r = proj.g.query(
-            "MATCH (n:Point {id:$id}) WHERE n.status = 'draft' "
-            "SET n.status = 'live', n.reviewed = true, n.promotedAt = $now, "
-            "n.updatedAt = $now RETURN n.id",
-            params={"id": point_id, "now": now},
+        # #7405: the CAS promotion rides the bounded write retry. The abort is
+        # a non-landing abort, so a re-issue re-evaluates the SAME
+        # `WHERE n.status = 'draft'` predicate against unchanged state and lands
+        # exactly once; if a concurrent promote won the CAS instead, the empty
+        # result set is the already-existing "raced" branch below, unchanged.
+        r = self._graph_write_with_retry(
+            lambda: proj.g.query(
+                "MATCH (n:Point {id:$id}) WHERE n.status = 'draft' "
+                "SET n.status = 'live', n.reviewed = true, n.promotedAt = $now, "
+                "n.updatedAt = $now RETURN n.id",
+                params={"id": point_id, "now": now},
+            ),
+            what="promote_point CAS SET",
         )
         if not r.result_set:
             # Raced with a concurrent promote — re-read and report the outcome.
@@ -12086,9 +12111,18 @@ class TortoiseSDK:
         extra_props.append("status:$st")
         params["st"] = "live" if promote_source else "draft"
         props_clause = ", " + ", ".join(extra_props) if extra_props else ""
-        proj.g.query(
-            f"CREATE (o:Point {{id:$id, is_operator:true, op_type:$op, direction:$direction{props_clause}}})",
-            params=params,
+        # #7405: a bare CREATE is admissible ONLY on `retryable_aborted_write`,
+        # whose arms BOTH prove the statement did not land (a write-slot refusal
+        # raised before the slot is claimed, or a graph-abort). `pid` is minted
+        # once above the loop, so every re-issue names the same node and a
+        # non-landing abort cannot mint a second operator. It must NEVER ride
+        # `retryable_transient` — a lost reply is not a lost write.
+        self._graph_write_with_retry(
+            lambda: proj.g.query(
+                f"CREATE (o:Point {{id:$id, is_operator:true, op_type:$op, direction:$direction{props_clause}}})",
+                params=params,
+            ),
+            what="create_operator CREATE(:Point)",
         )
         # Ontology v2.1: map part/whole ops to hasPart.
         # A1b (#1272): operator endpoints may be Point OR Event nodes.
@@ -12101,12 +12135,19 @@ class TortoiseSDK:
         # carry identical INPUT edges (fold-parity).
         edge_type = "hasPart" if op_type not in ("IMPL", "NAND") else op_type
         for i, inp_id in enumerate(inputs):
-            proj.g.query(
-                f"MATCH (o:Point {{id:$oid}}), (s) "
-                f"WHERE {epistemic_disjunction('s')} AND s.id = $sid "
-                f"CREATE (o)-[:{edge_type} {{idx:$i}}]->(s) "
-                f"CREATE (s)-[:INPUT {{idx:$i}}]->(o)",
-                params={"oid": pid, "sid": inp_id, "i": i},
+            # #7405: the typed edge and its INPUT mirror are created by ONE
+            # statement; the abort means NEITHER landed, and the endpoints/idx
+            # are fixed parameters, so a re-issue cannot double an edge. Bare
+            # CREATE ⇒ `retryable_aborted_write` only.
+            self._graph_write_with_retry(
+                lambda i=i, inp_id=inp_id: proj.g.query(
+                    f"MATCH (o:Point {{id:$oid}}), (s) "
+                    f"WHERE {epistemic_disjunction('s')} AND s.id = $sid "
+                    f"CREATE (o)-[:{edge_type} {{idx:$i}}]->(s) "
+                    f"CREATE (s)-[:INPUT {{idx:$i}}]->(o)",
+                    params={"oid": pid, "sid": inp_id, "i": i},
+                ),
+                what="create_operator operator edges",
             )
         # #1088: the guarded SET below fills in only a NEVER-SET status with
         # the live default — an explicitly-drafted source is never moved to
@@ -12120,11 +12161,17 @@ class TortoiseSDK:
             # #1088: only a never-set status is filled in with the live
             # default; an explicitly-drafted source is never moved to live
             # by this command.
-            proj.g.query(
-                "MATCH (s:Point {id:$sid}) "
-                "WHERE s.status IS NULL "
-                "SET s.status = 'live'",
-                params={"sid": source_id},
+            # #7405: an absolute SET guarded by the statement's own
+            # `s.status IS NULL` read — a re-issue after a non-landing ABORT
+            # fills in the same never-set status and cannot move a draft.
+            self._graph_write_with_retry(
+                lambda: proj.g.query(
+                    "MATCH (s:Point {id:$sid}) "
+                    "WHERE s.status IS NULL "
+                    "SET s.status = 'live'",
+                    params={"sid": source_id},
+                ),
+                what="create_operator source promote SET",
             )
         # Dreaming (#85): new edges change propagation — mark all inputs dirty.
         self._mark_dirty(inputs)
@@ -12415,16 +12462,28 @@ class TortoiseSDK:
         # guarded. EP weights read this value, so an inexact Decimal here
         # silently corrupts the operator weight. Guard before the write.
         _reject_unrepresentable_number("strength", strength)
-        proj.g.query(
-            "CREATE (m:Point {id:$id, content:$c, pointKind:'statement', "
-            "mitigation_strength:$s, is_operator:false, createdAt:$now, updatedAt:$now})",
-            params={"id": mid, "c": f"[MITIGATION] {reason}", "s": strength, "now": now},
+        # #7405: `mid` is minted once above, every property is a fixed
+        # parameter, and the abort means the statement did not land — so a
+        # re-issue cannot mint a second mitigation Point. Bare CREATE ⇒
+        # `retryable_aborted_write` only.
+        self._graph_write_with_retry(
+            lambda: proj.g.query(
+                "CREATE (m:Point {id:$id, content:$c, pointKind:'statement', "
+                "mitigation_strength:$s, is_operator:false, createdAt:$now, updatedAt:$now})",
+                params={"id": mid, "c": f"[MITIGATION] {reason}", "s": strength, "now": now},
+            ),
+            what="mitigate_operator CREATE(:Point)",
         )
         # Bidirectional link: mitigation Point -[:IMPL]-> operator, operator <-[:mitigated_by]- mitigation
-        proj.g.query(
-            "MATCH (m:Point {id:$mid}), (op:Point {id:$oid}) "
-            "CREATE (m)-[:IMPL]->(op), (op)-[:mitigated_by]->(m)",
-            params={"mid": mid, "oid": id},
+        # #7405: one statement, two fixed endpoints, abort ⇒ neither edge
+        # landed, so a re-issue cannot double the pair.
+        self._graph_write_with_retry(
+            lambda: proj.g.query(
+                "MATCH (m:Point {id:$mid}), (op:Point {id:$oid}) "
+                "CREATE (m)-[:IMPL]->(op), (op)-[:mitigated_by]->(m)",
+                params={"mid": mid, "oid": id},
+            ),
+            what="mitigate_operator mitigation edges",
         )
         # #2199: mitigation reasons are human-authored judgment — give the
         # fresh live point its explicit, provenance-recorded starting belief
@@ -13277,13 +13336,61 @@ class TortoiseSDK:
         """Route classification for a connection item: 'direct' for plain
         IMPL/NAND (operator-less per §8 — the terminal-status guard is
         direct-edge-scoped), 'operator' for mitigation/reify:true/part-whole,
-        'relation' otherwise."""
+        'relation' otherwise.
+
+        ⛔ This reads the CONNECTION ITEM only — it cannot see the endpoints
+        (refs are unresolved at validation time). 'direct' here is therefore a
+        REQUEST, not the final route: the endpoint-kind gate
+        (:meth:`_point_mediated_route`, owner ruling 2026-10-13, #8499) can
+        promote it to 'operator' once the endpoints are known. Callers that
+        need the effective route must apply that gate.
+        """
         if "operator" not in conn:
             return "relation"
         if conn["operator"] in ("IMPL", "NAND") and not conn.get("mitigation") \
                 and not conn.get("reify"):
             return "direct"
         return "operator"
+
+    def _point_mediated_route(self, node_ids: list[str]) -> bool:
+        """True when an operator-less IMPL/NAND between these endpoints is
+        FORBIDDEN by the endpoint-kind contract, so the connection must be
+        reified into an operator instead (owner ruling 2026-10-13, #8499).
+
+        **Point→Point relations are operator-mediated.** An operator-less edge
+        carries no operator node, so it can be neither mitigated nor annotated,
+        and it cannot carry the epistemic weighting a Point's relations claim —
+        those properties are the reason a Point's relations exist at all, so
+        the direct shape is wrong for any pair involving a plain :Point.
+
+        (Durability was the ruling's original third argument: plain direct
+        edges were journaled but never replayed, so ``rebuild_all`` lost them
+        — A10 #1048. #8499 landed the pass-2b ``DirectEdgeCreated`` fold, so an
+        operator-less edge now SURVIVES a rebuild too and the ruling no longer
+        rests on that argument. Do not re-derive the rule from the old loss.)
+
+        ``Object↔Object`` keeps the direct shape (no epistemic weighting is
+        claimed); ``Point↔Object`` is operator-mediated (the ruling's
+        "ideally"). ``Subject``/``Event`` endpoints are not Point-bearing and
+        take the Object path.
+
+        The probe is anchored on ``:Point`` so the per-(label, id) index is
+        kept — the same id-anchored sweep technique ``create_direct_edge``
+        uses, but deliberately narrowed to the ONE label that carries this
+        contract: ``create_direct_edge`` sweeps all four ``EPISTEMIC_LABELS``
+        because a direct edge may connect any of them, whereas only a
+        Point-bearing pair is operator-mediated. Operator endpoints are
+        EXCLUDED for the same reason ``create_direct_edge`` refuses them —
+        silently rerouting a connection TO an operator would hide that misuse
+        rather than report it.
+        """
+        rows = self._get_proj().g.query(
+            "MATCH (p:Point) WHERE p.id IN $ids "
+            "AND coalesce(p.is_operator, false) = false "
+            "RETURN count(p)",
+            params={"ids": list(node_ids)},
+        ).result_set
+        return bool(rows and rows[0][0])
 
     @staticmethod
     def _direction_from_semantics(semantics: str) -> str | None:
@@ -14142,7 +14249,9 @@ class TortoiseSDK:
         created = {"points": 0, "entities": 0, "sources": 0, "connections": 0}
         deduped = {"points": 0, "entities": 0, "sources": 0, "connections": 0}
         results = [] if granularity == "granular" else None
-        # A3 warnings contract (cycle-23): the ELEVEN-key enumeration lives in
+        # A3 warnings contract (cycle-23): the TWELVE-key enumeration lives in
+        # INGEST_CONTRACT §3.2 (extended from eleven by #8499 — the set is
+        # CLOSED, so a new key is a contract amendment, not a drive-by list)
         # E2E-6.2; this accumulator carries the operator-absorb / residue /
         # drift warnings appended during the connection loop.
         warnings: list[str] = []
@@ -14476,7 +14585,35 @@ class TortoiseSDK:
                 # promotion SET fires only on created==True (the promotion-on-
                 # created-only pin, §5.3/CYCLE-24) — the bare-MERGE dedup hit
                 # applies NO promotion.
-                if self._connection_route(conn) == "direct":
+                # ── ENDPOINT-KIND GATE (owner ruling 2026-10-13, #8499) ──
+                # The route selector reads only the connection ITEM; the
+                # endpoint kinds are knowable only HERE, refs resolved. A
+                # Point-involving pair is operator-mediated by contract, so a
+                # caller who wrote the plain spelling gets the operator form
+                # plus a warning naming what happened — never a silent
+                # structure change, and never a silent operator-less edge.
+                #
+                # NOTE (why the 'direct' branch below is retained): ingest's
+                # endpoint contract is POINT-ONLY (_check_connection rejects
+                # any non-Point endpoint, with a carve-out for an Event on the
+                # operator route), so for a plain IMPL/NAND this gate is
+                # ALWAYS true — the branch cannot be reached today. It is kept
+                # because it is what makes a future widening of that contract
+                # (Object↔Object bundles) automatically correct instead of
+                # silently operator-less.
+                _route = self._connection_route(conn)
+                if _route == "direct" and self._point_mediated_route([src, *dsts]):
+                    self._append_warning(
+                        f"point_mediated_route:{src}->{dsts[0]}:{op_type} — a "
+                        f"plain IMPL/NAND connection between :Point endpoints is "
+                        f"operator-mediated (owner ruling 2026-10-13, #8499): an "
+                        f"operator-less edge can be neither mitigated nor "
+                        f"annotated, and cannot carry the epistemic weighting a "
+                        f"Point's relations claim. Reified automatically; pass "
+                        f"`reify: true` to make the intent explicit."
+                    )
+                    _route = "operator"
+                if _route == "direct":
                     edge_res = self.create_direct_edge(
                         op_type, src, dsts[0],
                         label=label,
@@ -14824,12 +14961,12 @@ class TortoiseSDK:
         Completeness across ``rebuild_all``: batch_id on Points is restored
         from the pre-wipe live-graph snapshot (projection pass-1b tail) —
         a rebuild of the SAME store keeps the POINT half of the audit
-        intact; DIRECT EDGES are lost even on same-store rebuilds today
-        (their ``DirectEdgeCreated`` descriptors are journaled but not
-        replayed). The JSONL journal replay of ``BatchIdStamped`` /
-        ``DirectEdgeCreated`` records (a fresh-store rebuild from the
-        journal only) is A10 pass-2b (#1048, gated on A3) — NOT yet
-        landed, so journal-only rebuilds lose batch_id today (recorded
+        intact, and since #8499 the DIRECT-EDGE half survives too: the
+        ``DirectEdgeCreated`` descriptors that used to be journaled-but-never-
+        replayed now have a real pass-2b fold (``direct_edge_created_events``).
+        The remaining A10 pass-2b gap is ``BatchIdStamped`` on the
+        journal-only leg (a fresh-store rebuild from the journal alone) — NOT
+        yet landed, so journal-only rebuilds lose batch_id today (recorded
         deferral).
 
         Returns ``{"batch_id", "points": [{id, pointKind, status,
@@ -14968,7 +15105,10 @@ class TortoiseSDK:
         absent IMPL stays "bidirectional".
 
         Emits the dedicated JSONL edge descriptor for rebuild durability
-        (plan §4.4 — A10's pass-2b consumer) on created==True.
+        (#8499's pass-2b consumer) on EVERY write, NOT only on
+        ``created==True``: a dedup hit re-emits, so the crash window between
+        the MERGE and the emission is recovered by the retry's emission. (The
+        ``promote_source`` pin above is a separate, created-only rule.)
 
         Returns {"direct_edge": op_type, "from": source_id, "to": target_id,
                  "created": bool, "deduped": bool}.
@@ -15591,8 +15731,12 @@ class TortoiseSDK:
         chain = {"point": {"id": point_id, "content": (point.get("content") or "")[:200],
                            "authoredBy": author}}
         # #3998 (D30): the raw is OPTIONAL. Attach the source's index entry —
-        # including the absent-raw state — so a memory whose raw was deleted,
-        # went offline, or had access revoked is still readable AND SAYABLE.
+        # including the absent-raw state — so a memory whose raw was deleted is
+        # still readable AND SAYABLE. `offline`/`access_revoked` are conditions
+        # observed live, never stored (Option A ruling, 2026-10-14), so this
+        # reader reports the RECORD it holds; a caller that has actually probed
+        # the raw routes the observation through
+        # `raw_state.resolve_raw_availability`.
         # Additive: emitted only when the point HAS an extractedFrom source,
         # so a sourceless point's response is byte-identical. Set BEFORE the
         # early returns below, so every exit path carries it.
@@ -16934,19 +17078,28 @@ class TortoiseSDK:
         # exclusion is atomic with the marking.
         persisted: set[str] = set()
         if dirty_ids and not set(dirty_ids) <= _stamped:
-            persisted_rows = proj.g.query(
-                "UNWIND $ids AS pid "
-                "MATCH (n:Point {id: pid}) "
-                "WHERE NOT coalesce(n.status, 'live') IN $terminal "
-                "AND coalesce(n.outdated, false) = false "
-                "AND NOT pid IN $stamped "
-                "SET n.ep_dirty = true, n.ep_dirty_at = $ep "
-                "RETURN pid",
-                params={"ids": dirty_ids,
-                        "terminal": sorted(TERMINAL_EXCLUDED_STATUSES),
-                        "ep": ep_version,
-                        "stamped": sorted(_stamped)},
-            ).result_set
+            # #7405: the dirty-persist SET rides the bounded write retry. It is
+            # an ABSOLUTE SET (fixed literal values) under a WHERE the statement
+            # itself re-reads at write time, so re-issuing it after an engine
+            # ABORT — which means the statement did not land — converges on the
+            # same marking and cannot duplicate; the state-independent and
+            # graph-abort arms of `retryable_aborted_write` both mean that.
+            persisted_rows = self._graph_write_with_retry(
+                lambda: proj.g.query(
+                    "UNWIND $ids AS pid "
+                    "MATCH (n:Point {id: pid}) "
+                    "WHERE NOT coalesce(n.status, 'live') IN $terminal "
+                    "AND coalesce(n.outdated, false) = false "
+                    "AND NOT pid IN $stamped "
+                    "SET n.ep_dirty = true, n.ep_dirty_at = $ep "
+                    "RETURN pid",
+                    params={"ids": dirty_ids,
+                            "terminal": sorted(TERMINAL_EXCLUDED_STATUSES),
+                            "ep": ep_version,
+                            "stamped": sorted(_stamped)},
+                ).result_set,
+                what="_mark_dirty ep_dirty persist SET",
+            )
             persisted = {r[0] for r in persisted_rows} if persisted_rows else set()
         # #2952: a pre-stamped id is persisted by its own CREATE — it is not
         # a terminal/live classification case, it simply needs no SET here.
@@ -16973,10 +17126,17 @@ class TortoiseSDK:
             terminal_ids = non_persisted & existing
             zombies = non_persisted - existing  # delete zombies (#1916)
             if terminal_ids:
-                proj.g.query(
-                    "MATCH (n:Point) WHERE n.id IN $ids AND n.ep_dirty = true "
-                    "SET n.ep_dirty = null, n.ep_dirty_at = null",
-                    params={"ids": list(terminal_ids)},
+                # #7405: same retry, same reasoning as the persist SET above —
+                # an absolute SET guarded by the statement's own `n.ep_dirty =
+                # true` read, so a re-issue after a non-landing ABORT is
+                # idempotent (clearing an already-cleared flag is a no-op).
+                self._graph_write_with_retry(
+                    lambda: proj.g.query(
+                        "MATCH (n:Point) WHERE n.id IN $ids AND n.ep_dirty = true "
+                        "SET n.ep_dirty = null, n.ep_dirty_at = null",
+                        params={"ids": list(terminal_ids)},
+                    ),
+                    what="_mark_dirty terminal ep_dirty clear SET",
                 )
                 self._dirty_roots.difference_update(terminal_ids)
         # #1163: persist the dirty markings (points + reverse-BFS claims) so
@@ -25230,10 +25390,12 @@ class TortoiseSDK:
                     raise ValueError(
                         f"{_managed!r} is server-managed on a :Source and "
                         f"cannot be set through the generic entity surface "
-                        f"(#3998/D30). Record an absence with "
+                        f"(#3998/D30). Record a DELETION with "
                         f"`create_source(..., raw_state=...)`, which validates "
-                        f"the value (accepted: {sorted(RAW_ABSENT_STATES)} or "
-                        f"{RAW_PRESENT!r})."
+                        f"the value (accepted: {sorted(WRITABLE_RAW_STATES)}). "
+                        f"`offline`/`access_revoked` are CONDITIONS, observed "
+                        f"live and never stored (raw_state's \"Option A\" "
+                        f"ruling, 2026-10-14)."
                     )
                 # ⛔ The retired fields are deliberately OUT of this closed
                 # check: they are left to the #5026/D10 guard below, which owns
@@ -25955,8 +26117,18 @@ class TortoiseSDK:
         if _prov_ref and _prov_label:
             _prov_id = node.get("id") or node.get("eventId")
             if _prov_id:
-                self._get_proj()._link_source(
-                    _prov_id, _prov_ref, label=_prov_label)
+                # #7405: `_link_source` is MERGE-based at every step — the
+                # Source stub is MERGE'd on its url and the `extractedFrom`
+                # edge is MERGE'd on the (node, Source) pair with its version
+                # write gated `ON CREATE` — so a re-issue after a non-landing
+                # ABORT converges instead of doubling. This is the same funnel
+                # and the same reasoning `create_point`'s `extractedFrom` leg
+                # already rides.
+                self._graph_write_with_retry(
+                    lambda: self._get_proj()._link_source(
+                        _prov_id, _prov_ref, label=_prov_label),
+                    what="create_entity extractedFrom edges",
+                )
         return {
             "node": node,
             "nudges": self._nudge_candidates(
@@ -28618,7 +28790,13 @@ class TortoiseSDK:
         # → Source via extractedFrom (Ontology v3.3) when the caller passes a
         # source ref. D10: the entity label is Source (a document is a :Source).
         if props.get("extractedFrom"):
-            self._get_proj()._link_source(did, props["extractedFrom"], label="Source")
+            # #7405: parity with `create_entity`'s document leg — same
+            # MERGE-idempotent writer, same bounded retry.
+            self._graph_write_with_retry(
+                lambda: self._get_proj()._link_source(
+                    did, props["extractedFrom"], label="Source"),
+                what="create_document extractedFrom edges",
+            )
         # #8171 (review P2): the ADVISORY must be delivered on this door too.
         # This is the documented alias AND a live MCP tool
         # (`tortoise_create_document`), so a caller using it would otherwise
@@ -28704,9 +28882,16 @@ class TortoiseSDK:
             `docs/durability-posture.md` → *`:Source` — recorded vs
             recomputable, field by field* (R2) and
             `docs/architecture/STORAGE-ARCHITECTURE.md` §9.6.
-          - ``raw_state=`` (#3998, D30) — the ABSENT-RAW state: one of
-            ``present`` / ``deleted`` / ``offline`` / ``access_revoked``.
-            Validated strictly (an unknown value raises ``ValueError``) and
+          - ``raw_state=`` (#3998, D30) — the ABSENT-RAW state. A DELETION is
+            an ACT and is recorded durably: one of ``present`` / ``deleted``.
+            ``offline`` / ``access_revoked`` are CONDITIONS, observed live and
+            NEVER stored (the owner's #3998 ruling, Option A, 2026-10-14) —
+            passing one is refused with a message saying so, and the read path
+            derives it through ``raw_state.resolve_raw_availability``. The
+            deletion marker is BOUNDED by ``raw_state.RAW_DELETION_MARKER_TTL``
+            (bounded metadata about the link back to the raw — never a
+            retention period on user content, R1). Validated strictly (an
+            unknown value raises ``ValueError``) and
             PRESERVED by a later upsert that carries none, so a re-ingest
             cannot resurrect a raw deleted between the two writes. Pass
             ``raw_state="present"`` to record that a raw came BACK — that is
@@ -29825,7 +30010,10 @@ class TortoiseSDK:
         reference are preferred, so a Point extracted from several sources
         keeps returning a referenced entity whenever one exists.
         #3998 (D30): the raw is OPTIONAL — the chain must stay readable and
-        SAYABLE when the raw was deleted, is offline, or access was revoked.
+        SAYABLE when the raw was deleted. `offline` / `access_revoked` are
+        conditions observed live and never stored (Option A ruling,
+        2026-10-14), so this reader reports the record it holds and never an
+        empty result standing in for an unreachable raw.
         Every item therefore carries ``raw``: the source's index entry
         (identity + version + availability), never a copy of the raw and never
         an exception. A source whose raw is gone still returns HERE — the node
