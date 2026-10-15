@@ -53,6 +53,7 @@ from .commit_ops import OBJECT_TERMINAL_STATUSES as _OBJECT_TERMINAL_STATUSES
 # `_update_entity`. Imported so neither surface re-literals the vocabulary.
 from .commit_ops import SUBJECT_STATUS_VALUES as _SUBJECT_STATUS_VALUES
 from .env_truthy import env_flag, is_truthy  # #4097: the declared truthy contract
+from .ids import entity_name_id as _entity_name_id
 from .ids import ulid
 from .vector_write import (  # #4520: the ONE clear-then-set vector seam
     EMBEDDING_PROPERTY,
@@ -4044,19 +4045,6 @@ def _apply_capture_ingest_ep(sdk, claim_ids: list[str], *,
         )
         if warn is not None:
             warn(f"ingest EP pass failed: {type(e).__name__}: {e}")
-
-
-def _entity_name_id(label: str, name: str) -> str:
-    """Deterministic entity id from name — mirrors create_point's content-hash
-    dedup so the projection's MERGE-by-name is IDEMPOTENT: the same name
-    always yields the same id, so a second create_object/create_subject
-    returns the canonical node id (#452) and the #1155-P1
-    ``coalesce($id, o.id)`` ON-MATCH write is a no-op (same id), while a
-    name-stub Object minted with a random ulid by the event path still gets
-    replaced by the canonical id on the first ObjectRegistered write.
-    """
-    digest = hashlib.sha256(f"{label}:{name}".encode("utf-8")).hexdigest()[:26]  # noqa: UP012
-    return f"{label[:3].lower()}-{digest}"
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:  # noqa: F821

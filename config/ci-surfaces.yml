@@ -1164,6 +1164,17 @@ surfaces:
   # (`tools/ci_selection.py`), so a change to it already forces the full
   # matrix and needs no per-test registration.
   - test_7853_confidence_label_propagation.py
+  # #7936: the name-stub id `_event_plain_merge` mints must be a function of
+  # the journal, not of when the graph was built — the measured blocker on the
+  # remaining `(label, id)` re-key (`tortoise/consistency.py`'s digest would
+  # move on every replay of one journal otherwise). DUAL-REGISTERED with `sdk`
+  # (below): `tortoise/projection/entities.py` and `tortoise/consistency.py`
+  # fall through to `core`, but `tortoise/ids.py` — where the canonical
+  # `entity_name_id` lives — is an exact `sdk` SOURCE_PATTERN that REPLACES the
+  # `core` fallback, so an ids.py-only change would silently skip this guard
+  # without the `sdk` arm (#2938 class; `tortoise/sdk.py` itself is a
+  # SHARED_MODULE, so an sdk.py diff selects the full matrix anyway).
+  - test_7936_stable_stub_ids.py
   # #4220: DB-free guards for the blog-residue cleanup script (prefix + created_by
   # guards, dry-run is non-destructive, delete verifies 0 remain) and the suite's
   # write/read marker split. No DB, no network — default `core` surface is correct.
@@ -3262,6 +3273,12 @@ surfaces:
   - test_7951_create_point_outbox.py
   - test_5359_unchecked_window_writers.py
   - test_7108_operator_scope_predicate.py
+  # #7936: DUAL-REGISTERED with `core` (above). `tortoise/ids.py` is an exact
+  # `sdk` SOURCE_PATTERN, so the canonical entity id this guard pins
+  # (`entity_name_id`) is owned HERE: an ids.py-only change selects `sdk` and
+  # REPLACES the `core` fallback, so without this arm the guard would never run
+  # on the exact change that can break it (#2938 class).
+  - test_7936_stable_stub_ids.py
   # #5346: a PAGED read must order by a TOTAL key, or its pages are not
   # adjacent. `paginated_query` — and therefore the MCP
   # `tortoise_query(offset=/page=)` / `tortoise_paginated_query` path — plus
