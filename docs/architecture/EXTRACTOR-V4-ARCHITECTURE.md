@@ -618,8 +618,10 @@ This is v2's S2, with priors in hand. Still proposes only; decides nothing.
 >
 > **⚠️ `TORTOISE_S4_DELTA=0` does NOT disable S4** — it selects the legacy complete-list contract. There is **no S4-specific off switch**: S4 is reached whenever the v2 pipeline runs a story, and on the route that reaches `extract_session_v2` it is skipped only as a **side effect of something else**. ⚠️ **Three such paths on that route, none of them an "S4 switch":** (i) **`TORTOISE_EXTRACTOR=v1`** routes to the legacy `value_extractor.extract_session` path, which has no S4 stage at all (`sdk.py`; `_commit_session_v1`); (ii) **passing `summary=`** takes that same v1 dispatch — `sdk.py` reads `if extractor == "v1" or summary is not None:`; (iii) **an empty conversation** returns before S1 (`if not edus: return {...}`, with `degraded: True`), so S4 is never reached. Other `capture_session` lanes — keyless/no-provider, already-captured replay, and `TORTOISE_SESSION_EXTRACTOR=m2` — never enter the v2 extractor at all, so they are not S4 skips of this route. ⚠️ **S4 is NOT bypassable only by leaving the v2 pipeline** — that would contradict the `if story:` row directly above, and missed paths (ii) and (iii).
 >
-> **Removing `run_s4` is a v4 migration deliverable, not a cleanup** — it is §4.3 **G5**'s S4 clause.
-> **Never delete `run_s4` on the strength of this document alone.**
+> **Removing `run_s4` is a v4 migration deliverable, not a cleanup** — it is §4.3 **G5**'s S4 clause,
+> tracked at **`#8500`**. ⚠️ **Not `#5333`**: that issue's own body scopes it to the deletion/relocation
+> half and states it *must not absorb* other work, and it contains no reference to `S4`. **Never delete
+> `run_s4` on the strength of this document alone.**
 >
 > **On the step *names*:** the code's own stages are **S1–S5** (`[S1] STORY SUMMARY` … `[S5] EMBED`, module
 > docstring), with `S2.2 VET` present in the production path. **`S0` and `S6` have no code
@@ -631,6 +633,8 @@ This is v2's S2, with priors in hand. Still proposes only; decides nothing.
 > in `extractor_v2.py`, including as production stage comments.
 >
 > ⚠️ **No fourth exit (`return`/`raise`) appears between `extract_session_v2`'s entry and the S4 call beyond the enumerated empty-conversation one** — an exit on the `not story` side of the call's own guard is textually after the call and is **not** an S4 bypass, since S4 is already gated off there.
+>
+> ⚠️ **These marker claims are pinned mechanically, not by prose: `tests/test_extractor_v4_s4_stage_claims.py` resolves each enumerated claim above against the tree at HEAD** — a change that falsifies one reds a test instead of being discovered.
 
 **Why Jev fits:** it is a **decision-only** model — it cannot return a value outside the supplied schema, so it cannot invent an entity or a name. Three primitives, **mixable in one call**: *Choice* (pick from a list), *Score*, *Noul* (0–1 probability). Doc: `https://jevtypesafeai.com/docs#apis`. ⚠️ Measured **$0.000243/item at 3 questions** (~$6/month at 25k items) — **~4–7× cheaper than a frontier LLM, not the vendor's claimed 40–400×** (self-tested).
 
