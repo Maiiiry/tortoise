@@ -241,7 +241,7 @@ LANDED_STATEMENTS_IN_SIBLINGS: tuple[tuple[Path, str, str], ...] = (
     (
         STORAGE,
         "STORAGE separates the closed `#4997` measurement from the still-live defect",
-        "the measurement half is CLOSED `COMPLETED`; the unindexed-embeddings defect it measured is still LIVE",
+        "the unindexed-embeddings defect itself is LIVE",
     ),
     (
         STORAGE,

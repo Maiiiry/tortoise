@@ -398,18 +398,14 @@ Supabase database storage **$0.125/GB/month**; object storage **$0.0213/GB/month
 
 ⚠️ Compute tier and max-database size are coupled (a 1 TB database wants the $410 tier) and **effective IOPS is the lower of compute-supported and disk-provisioned** — a small tier caps throughput regardless of disk purchased.
 
-### 5.1 ⚠️ Corrections to earlier drafts of this section — and the two lines it omitted
+### 5.1 ⚠️ Two cost lines are MISSING from the table — and both grow with the design
 
-**⚠️ These figures were quoted elsewhere in an earlier draft at amounts up to ~14× higher, and that draft was never reconciled.** The numbers in the table above are the ones to use; **the ~$460 and ~$4,100-adjacent figures earlier in the doc came from a different, superseded arithmetic.**
-
-**Two real cost lines are MISSING from the table, and both grow with the design:**
-
-| line | why it is missing and why it matters |
+| line | why it matters |
 |---|---|
-| **the journal** | §3 requires the journal to carry the **full derived payload** — creations as snapshots, mutations as deltas. **It grows at or near the rate of the derived layer**, and it is **not in this table at all.** ⚠️ **No measurement of the journal's growth exists yet (§15 lists none).** |
-| **egress + IOPS** | a cold, disk-resident design **reads from disk on every cache miss.** The cost moves from *storage* to *requests* — and egress is the line that punishes a read-heavy pattern. **Not modelled.** ⚠️ **No measurement covers egress or IOPS yet (§15 lists none).** |
+| **the journal** | §3 requires the journal to carry the **full derived payload** — creations as snapshots, mutations as deltas. **It grows at or near the rate of the derived layer**, and it is **not in this table.** ⚠️ **No measurement of the journal's growth exists.** |
+| **egress + IOPS** | a cold, disk-resident design **reads from disk on every cache miss.** The cost moves from *storage* to *requests* — and egress is the line that punishes a read-heavy pattern. |
 
-✅ **One of the two omitted lines — egress + IOPS — is now PRICED and carried as a row of the two-store table (§17.4).** Egress and IOPS are **$0.09/GB** (250 GB included) and **$0.024/IOPS/month** (3,000 included, General Purpose). **The journal is still neither priced nor a row** — its *growth* has **no measurement** and it is the one line §17.4 cannot price.
+✅ **Egress + IOPS is PRICED and carried as a row of the two-store table (§17.4):** **$0.09/GB** (250 GB included) and **$0.024/IOPS/month** (3,000 included, General Purpose). **The journal is still neither priced nor a row** — its *growth* has **no measurement**, and it is the one line §17.4 cannot price.
 
 **⇒ The table answers *"what does the DATA cost?"*. It does not answer *"what does the SYSTEM cost?"* — and §6 is the section that says so. Do not quote this table as a total.**
 
@@ -1305,74 +1301,103 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 
 **⚠️ And the discipline that keeps this honest: our own numbers for the cost TIERS still do not exist.** Every tier figure above is **published third-party** and must be re-measured on our data before any lever is committed. ✅ **What IS now measured is our own retrieval latency (§12.1d) and our own memory composition (§12.1) — those are no longer borrowed.** *(⚠️ The former "our 95.6 MB measurement", cited here, has been **withdrawn as wrong** — §12.1.)*
 
-## 13. Issue map — what this document informs
+## 13. What the work is tracked as
 
-**Purpose:** every section above exists to inform a filed issue. This table is the index, so a reader holding an issue can find the reasoning, and a reader holding a section can find the work it drives.
+**This document states the target design. It does not track issue state.** Which issues exist, which are
+open, and which are filed is read from the tracker — never from here. A document that mirrors issue state
+is wrong the day after it is written, and the sections above are unaffected when it goes stale.
 
-| section | issue(s) | what the issue takes from here |
-|---|---|---|
-| §1 the problem | `#4333` | the measured volume, and the true bytes per quota node. ⚠️ **Corrected 2026-09-23:** the earlier *"5.6 KB vs 1 KB, a 5.6× understatement"* divided **total instance RAM (140 MB)** by the **capped node count (25,000)** — but the numerator includes ~19,944 **quota-FREE** episodic turns, plus Events, Sessions, Documents, scaffolding and the full HNSW index. **`#4333` — the authority this row cites — estimates 2.5–4×.** The honest figure is **~3 KB per node (140 MB ÷ ~45k total nodes) ≈ ~3×**; 5.6 KB must be labelled *"total resident bytes per CAPPED node, including uncapped nodes"* |
-| §2 mechanism | `#4333` | why the RAM/disk difference *is* the economics |
-| §3 architecture | `#4333` | the physical split, **in the ontology's own vocabulary** — not a new layer |
-| §3 what is already in code | **`#4240`** | **the hosted path does not journal unless `TORTOISE_EVENT_LOG_BASE_DIR` is set (`#4240` wired the per-graph journal) → a wiring gap, not a design gap** |
-| §3 why this shape | `#3895` | the derived layer becomes **REBUILDABLE** — ⚠️ **NOT "disposable"**: §3 forbids that reading in bold, and `#3895` is a *restore*. "Disposable" is the label that would license dropping the only copy. It regenerates **from the truth layer**, and only because the journal carries the payload |
-| §4 tenancy | `#3885` | **one project, tenant-scoped rows** — not one project per team |
-| §5 cost | `#4333` · **`#7954`** | published rates; ~10× headroom at 1,000 users. ⚠️ **CORRECTED 2026-10-10: the earlier `#4614` citation was WRONG** — `#4614` is a *quota-cliff capture bug* (`402` at 9,998/10,000), not a rates issue. **This subsection's prices are now vendor-page-verified, and the two-store arithmetic is `#7954`'s (§17.4)** |
-| §6 the split does NOT fix volume | **`#4899`** · `#1026` | **storage ~580× on the STORAGE line × selection ~10× (a target, not a measurement) — neither alone reaches 100×.** This is the section that stops a storage migration being sold as the fix |
-| §7 state values | **`#2453`** (LANDED) · **`#4899`** (enforcement) · `#2820` | the carve-out, plus the DECIDED placement (owner, 2026-10-06): a state/numeric value is a **structural field on an entity**, with the embedding clause conditional on the §7 query-pattern measurement. ⚠️ **The former "`#1509` (E2, §9)" citation was WRONG** — `#1509` has no §9 and no E2; the placement recommendation there is a **comment** on `#1509` — now **SUPERSEDED by the PLACEMENT ACCEPTED decision (§7)** — and **E2 is `#1534`'s slot** (CLOSED). See §7's own corrected note |
-| §7 caveat | **`#4889`** | ⚠️ **CORRECTED (owner, 2026-10-06).** The live graph is a **DOGFOOD instance** — an edge count there was never the right test, and the earlier *"0 edges"* framing is withdrawn. **The code and its tests exist** (`tortoise/subject_binding.py` and the `aboutSubject` write paths exist; `#4889` is CLOSED), and the **end-to-end check needs a capstone issue (not yet filed)**, not a caveat asserting a production count. |
-| §8 granularity | `#1509` (E3) · `#4333` | **volume reduction may not come from fusing claims** — it bounds the whole document |
-| §9.1 narrative placement | `#2281` | the narrative **is** the ingest-time-distilled layer that issue asks for |
-| §9.2 PR / Object / Event | `#1844` | object-only sources; the anchor is a document, **never an event** |
-| §10.1 relocation | `#4240` | the hot table stays the working set — which is the invariant this document rests on |
-| §10.2 allowlist | — | a reusable correctness rule (no issue needed) |
-| §12.1b unindexed embeddings | ⭐ **`#4997`** · **`#4999`** | **only `:Point` has a vector index; `Object`/`Event` full-scan (`leg_trace.reason` remains `ok`; since PR `#5159` the entry also carries the `mechanism` — `#4999` CLOSED `COMPLETED`); 19 MB stored unindexed — and the unindexed-embeddings defect itself is still LIVE, homed on the V1/§12.1c decision** |
-| §12.2c vector vs traversal | ⭐ **`#4997`** · `#2730` | **the entity vector is an ENTRY/RESOLUTION key, never the reasoning mechanism — and our Objects have no description to embed** |
-| §9.4 source summary vector | — | **needs a ruling (V2); `Source` already carries `summary`, `topics`, `url`, `contentHash`** |
-| §9.6 source versioning | — | **the version must be recorded on the extraction link as `sourceVersion`**; a version costs **three timestamps + a hash** (D30 keeps content out of the graph) — **bound it: windows and hashes only, never content copies** |
-| §12.1a index shape | `#5090` · `#5331` | **the decision is the size-earned conditional index (C)** — not per-tenant partitioning, not a shared filtered index. The partition comparison is a measured *alternative*: `PARTITION BY` flat to T=500 (96.6 ms at T=2,100, unexplained), the partial-index form degrading to 83 ms at T=500 |
-| §17.2 the completeness marker | **`#7952`** ✅ **built 2026-10-12** | a read for a node outside the known-hot set returns explicit **`not-hot`** — **never empty** — and coherence is reconciled as a **number**, not a boolean. This is the input §17.3's router reads. Landed: `tortoise/residency.py` (the marker, its own `residency` field, off by default) + `tortoise/reconciliation.py` (divergence as integer counts, **refusing** when a side is unreadable) + the hosted `/v1/search` field. ⚠️ The declaration's authoritative home is §2.6's control-plane metadata (`#7971`); until then the reader takes the graph's `:Meta` marker and defaults to **complete**, under which the marker cannot fire |
-| §17.3 the residency router | **`#7953`** ✅ **built 2026-10-13** | a residency miss is not an insufficiency: **fetch from the truth store**, never escalate a tier, never surface an absence. Decidable only against §17.2's marker (**hard edge**). Landed: `tortoise/residency_router.py` (a pure decision — `serve` / `fetch-record` / `escalate-tier`, with residency outranking sufficiency, a `cache-unreachable` branch, and `route_for_coordinate` for a partial declaration's unwritten key) + the read path's per-key coordinate (`tortoise/sdk.py::tortoise_fts_query(_residency_key=…)`) |
-| §17.4 the two-store cost model | **`#7954`** | price **both** stores (Postgres compute + disk **and** FalkorDB RAM) plus the blended total §5–§6 omit |
-| §17 the five gaps | **`#7951`** (17.1) · **`#7952`** (17.2) · **`#7953`** (17.3) · **`#7954`** (17.4) · **`#7955`** (17.5) · **`#7967`** (the surface map) | what the record/cache split still needs: a write-path chokepoint, cache coherence + a completeness marker, partial-cache semantics, a two-store cost model, and a field-level placement table. **None is a new decision** — each follows from §2.0. ⚠️ **Corrected 2026-10-10 — this row previously read `#5089` (17.1) · `#5090` (17.5), which named the wrong owners:** **the routing half of §17.1 is `#7951`'s** (`#5089` owns the journal half — §17.1 says so itself), and **§17.5's placement ENUMERATION is `#7955`'s** (`#5090` is a *consumer* of the vector layer, not the enumeration). The five gaps are children of **`#7879`**; **`#7950`** is the capstone that verifies them; **`#7968`**/**`#7969`**/**`#7971`** carry the schema, the record projection and the cache projection, and **`#7970`** the read path. The integration-surface map every one of them cites is **`#7967`** → `docs/epics/2026-10-10-7879-postgres-record/01-test-design.md` |
+Where a section depends on whether something is **built**, it says so via the artifact: the code and its
+`file:line`, or the merged PR that landed it. Those are durable. An issue's open/closed state is not, and
+is not cited as authority anywhere in this document.
 
-**Filed from this document — the tracking issue and its current state are named on each bullet:**
+The findings below are kept because each is a **code or measurement** result, stated so it can be checked
+against the tree without a tracker.
 
-- **`aboutObject` as a stored edge vs a derived join** — **`#7948` (OPEN)** — the measurement is DONE (research brief, 2026-09-23) and the answer is SPLIT, which decides it.
+### 13.1 The `aboutObject` edge is load-bearing — eleven read sites, four customer-callable
 
-  **The primary search path does NOT read it.** `rg -n 'aboutObject' tortoise/retrieval.py tortoise/search_engine.py tortoise/session_reinjection.py` → **exit 1, zero matches**, case-insensitive. **Hindsight's premise holds for this path.**
+**The measurement decides whether `aboutObject` may be derived rather than stored, and the answer is
+SPLIT.** The primary search path does **not** read it (`rg -n 'aboutObject' tortoise/retrieval.py
+tortoise/search_engine.py tortoise/session_reinjection.py` → exit 1, case-insensitive). **It IS load-bearing
+everywhere else** (line numbers pinned to `c79ba1cf2`; the symbols are authoritative):
 
-  **It IS load-bearing elsewhere — ELEVEN read sites, and FOUR of them are CUSTOMER-CALLABLE** (all line numbers pinned to `c79ba1cf2`; the symbols are authoritative):
+| # | site | what it reads for | reach |
+|---|---|---|---|
+| 1 | `sdk.py:6411` — SDK **`belief_timeline`** (MCP `tortoise_belief_timeline`, `tool_registry.py:391`) | walks decision → Object named by topic | **customer-callable** |
+| 2 | `topic_summarization.py:174` — SDK **`topic_summarize`** (`sdk.py:7516`; hosted REST `hosted_api.py:6294`) | finds seed claims via Object | **customer-callable** (⚠️ the MCP handler `tortoise_topic_summarize` is registered nowhere and never served — `#7988`) |
+| 3 | `ranking.py:1195`/`:1206` — SDK **`recall_subgraph`** (`ranking.SubgraphExpander._neighbors`) | its default `completeness="full"` walks **every** relationship type (`MATCH (n)-[r]->(m)`) — it reads the edge **without naming it**, so no grep finds it | **customer-callable** |
+| 4 | `ranking.py:461` / `:714` — **`search(order_by="graph")`** (MCP `tortoise_search`) | event and point degree centrality | **customer-callable** |
+| 5 | `extractor_v2.py:1934` (`_enrich_point_priors`) | the classifier's "same entity?" gate | default-ON, write path |
+| 6 | `mining.py:477` (`_temporal_wire`) | finds prior decisions on the same Object, then **mints a NAND** | default-ON, write path, **2-hop** |
+| 7 | `sdk.py:14744` (`_entity_key_expansion_pass`) | the entity-key alias harvest | **OFF by default** (`entity_key_expansion: bool = False`, `sdk.py:13777`) |
+| 8 | `assembly.py:573`/`:789`/`:809` (`alias_objects`, `collect_slices`) | the connected-assembly slices | **OFF by default** (`TORTOISE_ASK_CONNECTED_ASSEMBLY`) |
+| 9 | `subgraph.py:312`/`:319-320` (`build_subgraph`) | the `#3011` epistemic-subgraph engine | **eval harness only** (`tools/longmem_eval/context_assembly_arms.py`) |
+| 10 | `aggregate.py:502` (`collect_anchor_census`) | the aggregative-verdict anchor census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
+| 11 | `coverage_loop.py:238` (`facet_census`) | the rule-based facet census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
 
-  | # | site | what it reads for | reach |
-  |---|---|---|---|
-  | 1 | `sdk.py:6411` — SDK **`belief_timeline`** (MCP `tortoise_belief_timeline`, `tool_registry.py:391`) | walks decision → Object named by topic | **customer-callable** |
-  | 2 | `topic_summarization.py:174` — SDK **`topic_summarize`** (`sdk.py:7516`; hosted REST `hosted_api.py:6294`) | finds seed claims via Object | **customer-callable** (⚠️ the MCP handler `tortoise_topic_summarize` is registered nowhere and never served — `#7988`) |
-  | 3 | `ranking.py:1195`/`:1206` — SDK **`recall_subgraph`** (`ranking.SubgraphExpander._neighbors`) | its default `completeness="full"` walks **every** relationship type (`MATCH (n)-[r]->(m)`) — so it reads the edge **without naming it** and no grep can find it | **customer-callable** |
-  | 4 | `ranking.py:461` / `:714` — **`search(order_by="graph")`** (MCP `tortoise_search`) | event and point degree centrality | **customer-callable** |
-  | 5 | `extractor_v2.py:1934` (`_enrich_point_priors`) | the classifier's "same entity?" gate | default-ON, write path |
-  | 6 | `mining.py:477` (`_temporal_wire`) | finds prior decisions on the same Object, then **mints a NAND** | default-ON, write path, **2-hop** |
-  | 7 | `sdk.py:14744` (`_entity_key_expansion_pass`) | the entity-key alias harvest | **OFF by default** (`entity_key_expansion: bool = False`, `sdk.py:13777`) |
-  | 8 | `assembly.py:573`/`:789`/`:809` (`alias_objects`, `collect_slices`) | the connected-assembly slices | **OFF by default** (`TORTOISE_ASK_CONNECTED_ASSEMBLY`) |
-  | 9 | `subgraph.py:312`/`:319-320` (`build_subgraph`) | the `#3011` epistemic-subgraph engine | **eval harness only** (`tools/longmem_eval/context_assembly_arms.py`) |
-  | 10 | `aggregate.py:502` (`collect_anchor_census`) | the aggregative-verdict anchor census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
-  | 11 | `coverage_loop.py:238` (`facet_census`) | the rule-based facet census | **eval harness only** (`tools/longmem_eval/retrieve.py`) |
+And **36 test files assert the edge at the pin** (41 at HEAD, 2026-10-10).
 
-  And **36 test files assert the edge at the pin** (41 at HEAD, 2026-10-10).
+**⇒ Deriving would silently break FOUR customer-callable surfaces.** The comparable's justification was
+*"recall never touched them"* — **false here.**
 
-  **⇒ The comparable's conclusion does NOT transfer.** Their justification was *"recall never touched them"* — **false here.** Deleting the edge would silently break **four** customer-callable surfaces. ⚠️ **An earlier version of this table named four sites and called TWO of them customer-callable — that undercounts on both axes, and the count is the whole argument: `recall_subgraph` and `search(order_by="graph")` were missing** (review finding B2.7, `REVIEW-CONSOLIDATED-2026-09-23.md`).
+**The structural door stays open:** **no** `aboutObject` edge carries **any property** — `create_about_edge`
+(`projection/edges.py:344`) emits `MERGE (s)-[:aboutObject]->(t)` with no `SET` — so unlike Graphiti, whose
+fact and validity window live on the edge, **we lose nothing semantically by deriving later.**
 
-  **But the structural door stays open:** **no** `aboutObject` edge carries **any property** — `create_about_edge` (`projection/edges.py:344`) emits `MERGE (s)-[:aboutObject]->(t)` with no `SET`, and the search for a property-bearing edge returns **zero** at the pin (2 at HEAD, both test display strings — `tests/test_commit_endpoint.py:1214`/`:1217`). Unlike Graphiti — whose *fact and validity window live on the edge* — **we lose nothing semantically by deriving later.**
+**⚠️ The sharper finding is durability, not storage.** Capture-path edges **are** journaled (`EntityLinked`,
+`#3664`; replayed by `projection/entities.py:785+`). **Indexer-path edges are NOT** — `_connect_issue_objects`
+(`sdk.py:20154`) calls `create_about_edge` with no journal write, and `test_index_restore.py:373-403` asserts
+`count(*) == 0` after rebuild. **This edge class is internally inconsistent about durability.**
 
-  **⚠️ `#4240` is half-right, and the true half is the sharper argument.** Capture-path edges **are** journaled (`EntityLinked`, `#3664`; replayed by `projection/entities.py:785+`). **Indexer-path edges are NOT** - `_connect_issue_objects` (`sdk.py:20154`) calls `create_about_edge` with no journal write, and `test_index_restore.py:373-403` asserts `count(*) == 0` after rebuild. **So the finding is not "this edge saves no storage" but "this edge class is internally inconsistent about durability"** - a cleanup question, arguably more urgent than stored-vs-derived.
+**⚠️ Deriving is what CREATES the fan-out problem.** A join on a 1,200-claim hub yields ~1,200 intermediate
+rows **per anchor**, which is why the comparable carries a `LATERAL LIMIT` (default 200) *and* a timeout that
+drops the entire entity arm. **So the cap is the price of deriving — and also the guard rail for keeping the
+edge.** The cap is implemented (`tortoise/fanout.py`, `PER_ENTITY_FANOUT_CAP = 200`, wired query-side) and at
+200 it **binds nothing today** (worst hub 123).
 
-  **⚠️ The derived design is what CREATES a fan-out problem.** Hindsight's join needed a `LATERAL LIMIT per_entity_limit` (default **200**) *and* a timeout that **drops the entire entity arm**. A join on a 1,200-claim hub yields ~1,200 intermediate rows **per anchor**. **So the cap is the price of deriving — and also the guard rail for keeping the edge.** ⚠️ **CORRECTED 2026-10-10: this sentence used to end *"We have neither today"*, which was true at the pin but is stale — `#5010` has since CLOSED and the cap is implemented** (`tortoise/fanout.py`, `PER_ENTITY_FANOUT_CAP = 200`, wired query-side; PR `#5057`). At 200 it **binds nothing today** (worst hub 123 — the next bullet).
+**What would flip this:** whether `belief_timeline` / `topic_summarize` are **ever called** in production.
+If they are reachable-but-unused, the comparable's premise is restored and deriving becomes correct.
 
-  **What remains UNKNOWN, and would flip the recommendation:** whether `belief_timeline` / `topic_summarize` are **ever actually called** in production. If they are reachable-but-unused, Hindsight's premise is restored and deriving becomes correct.
+**✅ DECIDED (owner, 2026-09-23): KEEP the stored edges; the stored-vs-derived question is DEFERRED to
+post-launch.** *"we haven't launched yet, so unanswerable. keep them for now, we optimise with users."*
+**The deferral costs only storage — ~3 MB (§11.1) — so it buys the option back for nothing.**
 
-  **✅ OWNER RULING 2026-09-23: KEEP the stored edges — and the stored-vs-derived question is DEFERRED to post-launch, not left open.** *"we haven't launched yet, so unanswerable. keep them for now, we optimise with users."* **The unknown above is unanswerable before launch — there is no usage to count.** So: **keep the stored edges; revisit once there are users and real call data.** ⚠️ **The deferral costs only storage — ~3 MB, per §11.1 — so deferring is genuinely cheap, and it is the right call: it buys the option back for the price of nothing.**
-- **Fan-out caps** — **`#5010` (CLOSED `COMPLETED`)** — nothing in our write path bounds how many edges one entity accumulates (`config/ci-surfaces.yml` at **123**, `durations map` at 111, `the admin-merge rail` at 70, `cal-trigger.py` at 64, `the plan doc` at 63). Hindsight caps at **200** and drops the arm under budget pressure. ✅ **ADOPTED — initial value 200** (owner, 2026-09-23). ⚠️ **§11.5 is the specific record;** an earlier draft of this bullet said *"adopted in principle; no value set yet"*, which **contradicted** it. For the record: it is a **guard rail, not an optimisation** — it binds nothing today (worst hub is 123) and is refined with real usage.
-- ⭐ **NEW (2026-09-24) — the unindexed embeddings (V3, §12.1b).** **MEASURED ON THE LIVE GRAPH AND FILED: `#4997` — the measurement half is CLOSED `COMPLETED`; the unindexed-embeddings defect it measured is still LIVE, and its home is the V1/§12.1c decision.** `CALL db.indexes()` confirms **exactly one vector index — `Point.embedding`**; `Object`, `Event`, `Source`, `Subject`, `Document` have **none**. **12,657 stored vectors (`:Object` 7,859 + `:Event` 4,798), ≈19 MB, 13.5% of the graph, are paid for and unindexed** — and they full-scan at **16.96 ms vs 4.97 ms** while `leg_trace.reason` reported **`ok`** at the time (fixed by PR `#5159` — the trace now records the mechanism; `#4999` CLOSED `COMPLETED`). **The mechanism is a drift, not an oversight:** `#172` made the *query* label-generic; `_ensure_indexes()` still hardcodes `'Point'`. **Two readings, one ruling: stop storing them, or make index creation label-generic.** **This is the one candidate that is a *defect* rather than a design question.**
+### 13.2 Fan-out caps — ADOPTED at 200
+
+Nothing in the write path bounded how many edges one entity accumulates (`config/ci-surfaces.yml` at **123**,
+`durations map` at 111, `the admin-merge rail` at 70, `cal-trigger.py` at 64, `the plan doc` at 63). The
+comparable caps at **200** and drops the arm under budget pressure. **ADOPTED — initial value 200 (owner,
+2026-09-23)**; `PER_ENTITY_FANOUT_CAP` (`tortoise/fanout.py`), consumed by `assembly.py` / `subgraph.py`.
+**It is a guard rail, not an optimisation** — it binds nothing today (worst hub 123) and is refined with real
+usage. See §11.5.
+
+### 13.3 The unindexed embeddings — a LIVE defect
+
+`CALL db.indexes()` confirms **exactly one vector index — `Point.embedding`**; `Object`, `Event`, `Source`,
+`Subject` have **none**. **12,657 stored vectors (`:Object` 7,859 + `:Event` 4,798), ≈19 MB, 13.5% of the
+graph, are paid for and unindexed** — they full-scan at **16.96 ms vs 4.97 ms**. **This is a drift, not an
+oversight:** `#172` made the *query* label-generic; `_ensure_indexes()` still hardcodes `'Point'`. **The two
+readings are: stop storing them, or make index creation label-generic** — and this is a *defect*, not a design
+question. **The observability half is fixed** (PR `#5159` — the trace records the `mechanism`, so a full scan
+is distinguishable from an index hit); **the unindexed-embeddings defect itself is LIVE** and shares its home
+with the V1/§12.1c decision. See §12.1b.
+
+### 13.4 What these findings inform
+
+- **§12.2c** — the entity vector is an **entry / resolution key**, never the reasoning mechanism, and our
+  Objects have no description to embed.
+- **§9.4** — a `Source` summary vector needs a ruling (V2); `Source` already carries `summary`, `topics`,
+  `url`, `contentHash`.
+- **§9.6** — the version is recorded on the extraction link as `sourceVersion`; a version costs **three
+  timestamps + a hash** (D30 keeps content out of the graph) — **bound it: windows and hashes only, never
+  content copies**.
+- **§12.1a** — the decision is the **size-earned conditional index**, not per-tenant partitioning and not a
+  shared filtered index. `PARTITION BY` is flat to T=500 (96.6 ms at T=2,100, unexplained); the partial-index
+  form degrades to 83 ms at T=500.
+- **§17.2 / §17.3** — the completeness marker and the residency router are **built**
+  (`tortoise/residency.py`, `tortoise/residency_router.py`, `tortoise/reconciliation.py`) and off by default.
+- **§17.1 / §17.4 / §17.5** — a write-path chokepoint, a two-store cost model, and a field-level placement
+  table; **none is a new decision** — each follows from §2.0.
 
 ---
 
