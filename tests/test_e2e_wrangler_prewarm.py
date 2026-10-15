@@ -66,19 +66,63 @@ def _floating_wranglers(run: str) -> set[str]:
 PREWARM_JOBS = frozenset({"welcome-e2e", "legal-e2e", "dashboard-e2e"})
 
 
+#: The step that actually STARTS the preview server. The pre-warm exists to
+#: warm the tarball THIS step fetches, so parity is measured against it and
+#: nothing else. A union over every step in the job is NOT equivalent:
+#: `welcome-e2e` also runs `npm install -g wrangler@X`, so a union lets the
+#: pre-warm name a version that is installed but never booted. That is not a
+#: hypothetical — a boot step drifted to `4.130.0` while the pre-warm and the
+#: `npm install -g` step stayed on `4.127.0`, and the union comparison passed
+#: (the install step supplied `4.127.0` to the union).
+BOOT_STEP_PREFIX = "Start wrangler pages dev preview"
+
+
 def _jobs() -> dict:
     return yaml.safe_load(CI.read_text())["jobs"]
 
 
-def _steps() -> list[tuple[str, dict]]:
+def _steps_of(jobs: dict) -> list[tuple[str, dict]]:
     return [(job, step)
-            for job, spec in _jobs().items()
+            for job, spec in jobs.items()
             for step in (spec.get("steps") or [])]
 
 
-def _prewarm_steps() -> list[tuple[str, dict]]:
-    return [(job, step) for job, step in _steps()
+def _steps() -> list[tuple[str, dict]]:
+    return _steps_of(_jobs())
+
+
+def _prewarm_steps_of(jobs: dict) -> list[tuple[str, dict]]:
+    return [(job, step) for job, step in _steps_of(jobs)
             if step.get("name") == PREWARM_STEP]
+
+
+def _prewarm_steps() -> list[tuple[str, dict]]:
+    return _prewarm_steps_of(_jobs())
+
+
+def _boot_steps_of(jobs: dict, job: str) -> list[dict]:
+    """The steps in `job` that actually START wrangler — the pre-warm's targets."""
+    return [step for other_job, step in _steps_of(jobs)
+            if other_job == job
+            and str(step.get("name") or "").startswith(BOOT_STEP_PREFIX)]
+
+
+def _parity_mismatches(jobs: dict) -> dict[str, tuple[set[str], set[str]]]:
+    """job → (pre-warm versions, boot-step versions) wherever the two DISAGREE.
+
+    Scoped to the BOOT step(s) deliberately — see `BOOT_STEP_PREFIX`. An empty
+    boot set (no `Start wrangler …` step pins an exact version) is itself a
+    mismatch: the pre-warm pins something, and there is nothing that boots it.
+    """
+    out: dict[str, tuple[set[str], set[str]]] = {}
+    for job, step in _prewarm_steps_of(jobs):
+        warm = _exact_wranglers(step.get("run") or "")
+        boots: set[str] = set()
+        for boot in _boot_steps_of(jobs, job):
+            boots.update(_exact_wranglers(boot.get("run") or ""))
+        if warm != boots:
+            out[job] = (warm, boots)
+    return out
 
 
 def test_the_three_website_e2e_jobs_still_prewarm() -> None:
@@ -107,17 +151,42 @@ def test_every_prewarm_retries_the_registry_fetch() -> None:
 
 
 def test_prewarm_pins_the_same_version_the_job_boots() -> None:
-    """Warming `@4` while booting `@4.127.0` misses the cold fetch entirely."""
-    for job, step in _prewarm_steps():
-        warm = _exact_wranglers(step.get("run") or "")
-        boots: set[str] = set()
-        for other_job, other in _steps():
-            if other_job != job or other.get("name") == PREWARM_STEP:
-                continue
-            boots.update(_exact_wranglers(other.get("run") or ""))
-        assert boots, f"{job}: no other step pins an exact wrangler version to compare against"
-        assert warm <= boots, (
-            f"{job}: pre-warm pins {sorted(warm)} but the job boots {sorted(boots)}")
+    """Warming `@4` while booting `@4.127.0` misses the cold fetch entirely.
+
+    Compared against the step(s) that actually START wrangler, never the union
+    of every exact pin in the job — see `BOOT_STEP_PREFIX`.
+    """
+    mismatches = _parity_mismatches(_jobs())
+    assert not mismatches, "; ".join(
+        f"{job}: pre-warm pins {sorted(warm)} but the boot step(s) start {sorted(boots)}"
+        for job, (warm, boots) in sorted(mismatches.items()))
+
+
+def test_parity_scope_catches_boot_drift_a_job_union_missed() -> None:
+    """The drift that beat the pre-fix union scope, reproduced on the real job.
+
+    `welcome-e2e`'s boot step moves to `4.130.0` while BOTH the pre-warm and the
+    `npm install -g` step stay on `4.127.0`. A union over every other step in
+    the job still contains `4.127.0`, so the pre-fix `warm <= boots` comparison
+    reports no mismatch on a genuinely drifted job. The boot-only scope must.
+    """
+    jobs = _jobs()
+    steps = jobs["welcome-e2e"]["steps"]
+    boot = next(s for s in steps
+                if str(s.get("name") or "").startswith(BOOT_STEP_PREFIX))
+    assert _exact_wranglers(boot["run"]) == {"4.127.0"}, (
+        "ci.yml fixture drifted — update this pin to whatever the boot step now starts")
+    boot["run"] = boot["run"].replace("wrangler@4.127.0", "wrangler@4.130.0")
+
+    # The pre-fix scope: union every other step of the job. It still contains
+    # `4.127.0` (the pre-warm itself and the global install), so it passed.
+    union: set[str] = set()
+    for step in steps:
+        if step.get("name") != PREWARM_STEP:
+            union.update(_exact_wranglers(step.get("run") or ""))
+    assert "4.127.0" in union, "the pre-fix union scope would NOT have passed this drift"
+
+    assert set(_parity_mismatches(jobs)) == {"welcome-e2e"}
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:
