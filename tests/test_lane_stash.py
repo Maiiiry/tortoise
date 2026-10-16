@@ -886,3 +886,124 @@ def test_prune_cannot_lose_a_kept_entry_to_a_concurrent_push(repo, monkeypatch):
     bare = repo.git("stash", "pop", cwd=repo.b, check=False)
     assert bare.returncode == 0, _fail(bare)
     assert "peer-bare" in (repo.b / "f.txt").read_text()
+
+
+def _four_entry_register(repo):
+    """K0(bare) D1(pinned) K2(bare) D3(pinned), newest first: [D3, K2, D1, K0].
+
+    Both pinned entries are doomed and occupy positions 0 and 2, so the prune's
+    high->low loop deletes @{2} first and then finds @{0} shifted by a push.
+    """
+    repo.dirty(repo.b, "f.txt", "base\nk0\n")
+    repo.git("stash", "push", "-q", "-m", "k0", cwd=repo.b)
+    k0 = repo.stash_sha()
+    repo.dirty(repo.a, "f.txt", "base\nd1\n")
+    assert repo.lane(repo.a, "push", "-m", "d1").returncode == 0
+    d1 = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nk2\n")
+    repo.git("stash", "push", "-q", "-m", "k2", cwd=repo.b)
+    k2 = repo.stash_sha()
+    repo.dirty(repo.a, "f.txt", "base\nd3\n")
+    assert repo.lane(repo.a, "push", "-m", "d3").returncode == 0
+    d3 = repo.stash_sha()
+    assert repo.stash_shas() == [d3, k2, d1, k0]
+    return k0, d1, k2, d3
+
+
+def test_prune_restores_a_kept_entry_even_when_the_loop_stops(repo, monkeypatch):
+    """Reconciliation must run on the STOP path too, not just a clean finish.
+
+    A push that lands inside a delete removes a kept entry; the next target's
+    re-verification then fails and the loop STOPS. Returning early there skipped
+    the reconciliation and the `finally` unpinned the guard anyway, destroying
+    the only handle to the removed kept entry (#8773 review P1).
+    """
+    mod = _load_tool()
+    _k0, _d1, k2, _d3 = _four_entry_register(repo)
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    injected = {"done": False}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("reflog", "delete") and not injected["done"]:
+            injected["done"] = True
+            repo.dirty(repo.b, "f.txt", "base\nlate-stop\n")
+            repo.git("stash", "push", "-q", "-m", "late stop", cwd=repo.b)
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    assert mod.main(["prune", "--apply"]) == 0
+    assert injected["done"], "the test never exercised the shift"
+    shas = repo.stash_shas()
+    assert k2 in shas, "a kept entry removed by a shift was lost on the STOP path"
+
+
+def test_prune_retains_the_guard_when_it_cannot_restore(repo, monkeypatch):
+    """A failed re-store must NOT unpin the guard — it is then the last handle.
+
+    The warning says the guard still holds the object; the `finally` must make
+    that true, or the object becomes gc-eligible with no handle left (#8773 P1).
+    """
+    mod = _load_tool()
+    _k0, _d1, k2, _d3 = _four_entry_register(repo)
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    injected = {"pushed": False, "failed": False}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("reflog", "delete") and not injected["pushed"]:
+            injected["pushed"] = True
+            repo.dirty(repo.b, "f.txt", "base\nlate-guard\n")
+            repo.git("stash", "push", "-q", "-m", "late guard", cwd=repo.b)
+        if args[:2] == ("stash", "store") and not injected["failed"]:
+            injected["failed"] = True
+            return subprocess.CompletedProcess(
+                ["git", *args], 1, "", "injected store failure"
+            )
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    assert mod.main(["prune", "--apply"]) == 0
+    assert injected["pushed"] and injected["failed"], "the failure path was not exercised"
+    guards = repo.git(
+        "for-each-ref", "--format=%(objectname)", "refs/pi-lane-prune-guard"
+    ).stdout.split()
+    assert k2 in guards, (
+        "the guard ref was unpinned although the entry was never re-stored — "
+        "the object is now gc-eligible with no handle"
+    )
+    assert repo.git("cat-file", "-e", f"{k2}^{{commit}}", check=False).returncode == 0
+
+
+def test_prune_warns_when_a_concurrent_push_shifts_the_position(repo, monkeypatch, capsys):
+    """A during-prune push removed by a @{0} delete must be REPORTED, not silent.
+
+    The victim was pushed after the prune's snapshot, so it is outside the guard
+    set and cannot be restored (its sha is unknown). The delete must notice that
+    the intended entry is still registered and say so, and it must not count the
+    entry as removed (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    doomed = repo.stash_sha()
+    assert repo.stash_shas() == [doomed]
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    injected = {"done": False}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("reflog", "delete") and not injected["done"]:
+            injected["done"] = True
+            repo.dirty(repo.b, "f.txt", "base\nlate-warn\n")
+            repo.git("stash", "push", "-q", "-m", "late warn", cwd=repo.b)
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    assert injected["done"]
+    out = capsys.readouterr().out
+    assert "WARNING" in out, out
+    assert doomed in repo.stash_shas(), "the intended entry must still be registered"
+    assert "removed 0" in out, out

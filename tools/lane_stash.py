@@ -66,7 +66,8 @@ THE CONTRACT
   re-stores any entry a concurrent push's position shift caused it to remove, so
   every register entry present when the prune started keeps a handle. Run
   ``prune`` when the register is quiet: an entry PUSHED during the prune is
-  outside that guard set, and the prune aborts rather than guessing.
+  outside that guard set, and a shift that removes one is detected and reported
+  (it cannot be restored, because the prune never saw its sha).
 * **``check`` is fail-closed**: exit 0 when a bare ``git stash pop`` in this
   worktree would take THIS lane's own entry; exit 1 when it would take a FOREIGN
   entry — a peer lane's (identified by the ``[<lane-key>]`` marker this tool
@@ -487,7 +488,7 @@ def _clear_applied(key: str, sha: str) -> None:
 GUARD_NS = "refs/pi-lane-prune-guard"
 
 
-def _guard_pin(sha: str) -> str:
+def _guard_pin(key: str, sha: str) -> str | None:
     """Pin ``sha`` for the duration of one prune so a positional race cannot lose it.
 
     ``git reflog delete --updateref refs/stash@{i}`` re-resolves the position at
@@ -496,11 +497,16 @@ def _guard_pin(sha: str) -> str:
     can remove an entry that is NOT in the doomed set — a peer's unpinned entry,
     whose only handle was the reflog. Pinning the object first makes it
     un-gc-able, so the reconciliation in :func:`cmd_prune` can always re-store
-    it (#8773 review P1).
+    it (#8773 review P1). The ref is per-lane (and outside ``refs/lane``), so a
+    concurrent prune in another lane cannot take this lane's guard away.
+
+    Returns the ref on success, or ``None`` when the object could not be pinned
+    (the caller must then refuse to prune — an unprotectable entry must not be
+    put at risk).
     """
-    ref = f"{GUARD_NS}/{sha}"
-    _git("update-ref", ref, sha, check=False)
-    return ref
+    ref = f"{GUARD_NS}/{key}/{sha}"
+    cp = _git("update-ref", ref, sha, check=False)
+    return ref if cp.returncode == 0 else None
 
 
 def _guard_unpin(ref: str, sha: str) -> None:
@@ -859,26 +865,52 @@ def cmd_prune(args: argparse.Namespace) -> int:
     # re-stores anything the shift removed (#8773 review P1).
     guarded: dict[str, tuple[str, str]] = {}
     for r in kept:
-        guarded[r["sha"]] = (_guard_pin(r["sha"]), r["subject"])
+        ref = _guard_pin(key, r["sha"])
+        if ref is None:
+            # Cannot guarantee this entry survives a position shift — refuse to
+            # delete anything rather than prune without the guard in place.
+            for s, (gr, _sub) in guarded.items():
+                _guard_unpin(gr, s)
+            raise LaneStashError(
+                f"could not guard {r['sha'][:12]} under {GUARD_NS}/{key} before pruning — "
+                "refusing to remove anything while a kept entry cannot be protected"
+            )
+        guarded[r["sha"]] = (ref, r["subject"])
+    removed_shas: list[str] = []
     try:
         # Positions are walked HIGH -> LOW so an earlier delete cannot renumber a
         # later specifier. `reflog delete` re-resolves `refs/stash@{i}` at DELETE
         # time, so the sha at that position is re-verified immediately before each
-        # delete; if a peer pushed in between, the verification fails and this prune
-        # stops instead of removing an entry that would not be lossless to remove.
+        # delete; if a peer pushed in between, this prune stops removing and falls
+        # through to the reconciliation instead of trusting a stale position.
         order = sorted(doomed, key=lambda r: int(r["pos"].rsplit("@{", 1)[-1].rstrip("}")))
         removed = 0
-        removed_shas: list[str] = []
         for r in reversed(order):
             spec = r["pos"]
             here = _out("rev-parse", spec, check=False)
             if here != r["sha"]:
                 print(f"STOP: {spec} is now {here or 'gone'} (expected {r['sha']}) — a peer "
                       "pushed during the prune; re-run when the register is quiet")
-                return 0
+                break
             cp = _git("reflog", "delete", "--updateref", spec, check=False)
             if cp.returncode != 0:
                 print(f"could not remove {spec}: {cp.stderr.strip()}")
+                continue
+            # Did that delete actually take the entry we verified? A peer push in
+            # the verify/delete window shifts every position, and the delete then
+            # removes a DIFFERENT entry while leaving the intended one registered.
+            # Checking the intended sha's ABSENCE afterwards detects every such
+            # shift (including a @{0} delete that removed a just-pushed entry the
+            # prune never saw — the one case that cannot be restored because its
+            # sha is unknown; it is reported instead).
+            if r["sha"] in {x["sha"] for x in _shared_register()}:
+                print(f"WARNING: the delete of {spec} did not remove the intended entry "
+                      f"({r['sha'][:12]} is still registered) — a peer push in the "
+                      "verify/delete window shifted the reflog positions, and an entry "
+                      "pushed DURING a prune is outside the guard set, so it may have "
+                      "been the one removed. Re-check `git stash list`; the commit "
+                      "normally survives in the object DB until gc (`git fsck "
+                      "--unreachable` lists it).")
                 continue
             removed_shas.append(r["sha"])
             removed += 1
@@ -893,25 +925,21 @@ def cmd_prune(args: argparse.Namespace) -> int:
             drop_head = _stash_head()
             if drop_head is not None:
                 _reclaim_orphan_refs_stash(drop_head, key=key, apply=True)
-        # Reconciliation: a KEPT sha that is no longer in the register was removed
-        # by a position shift caused by a concurrent push (the verify/delete window
-        # is not atomic and cannot be made so with git's positional reflog delete).
-        # Its object is still held by its guard ref, so re-store it with its
-        # original reflog subject — the prune must not lose a peer's only handle
-        # (#8773 review P1).
+        # Reconciliation — runs on EVERY exit path (the STOP `break` included, and
+        # even after a failed delete). A KEPT sha that is no longer in the register
+        # was removed by a position shift caused by a concurrent push (the
+        # verify/delete window is not atomic and cannot be made so with git's
+        # positional reflog delete). Its object is still held by its guard ref, so
+        # re-store it with its original reflog subject — the prune must not lose a
+        # peer's only handle (#8773 review P1).
         live = {x["sha"] for x in _shared_register()}
         restored: list[str] = []
-        for sha, (ref, subject) in guarded.items():
+        for sha, (_ref, subject) in guarded.items():
             if sha in live:
                 continue
             cp = _git("stash", "store", "-m", subject or f"recovered {sha}", sha, check=False)
             if cp.returncode == 0:
                 restored.append(sha)
-            else:
-                print(f"warning: {sha[:12]} was removed by a concurrent push during this "
-                      f"prune and could not be re-stored; its guard ref {ref} still holds "
-                      "it — restore it with\n"
-                      f"  python tools/lane_stash.py recover {sha}")
         if restored:
             print(f"RESTORED {len(restored)} shared-register entr"
                   f"{'y' if len(restored) == 1 else 'ies'} a concurrent push caused this "
@@ -927,10 +955,23 @@ def cmd_prune(args: argparse.Namespace) -> int:
         for sha in removed_shas:
             if sha in applied and sha not in live:
                 _clear_applied(key, sha)
-        return 0
     finally:
+        # Unpin only guards whose object is back in the register. A guard for a
+        # sha that is NOT in the register is the LAST handle on that object, so it
+        # is deliberately kept (a failed re-store must not make the object
+        # gc-eligible); the printed warning says how to restore it (#8773 P1).
+        try:
+            final = {x["sha"] for x in _shared_register()}
+        except LaneStashError:
+            final = set()
         for sha, (ref, _subject) in guarded.items():
-            _guard_unpin(ref, sha)
+            if sha in final:
+                _guard_unpin(ref, sha)
+            else:
+                print(f"kept   guard ref {ref} for {sha[:12]} — it is not back in the "
+                      "shared register, so this ref is the last handle on it; restore "
+                      f"with\n  python tools/lane_stash.py recover {sha}")
+    return 0
 
 
 def _orphan_is_reclaimable(sha: str, key: str) -> bool:
