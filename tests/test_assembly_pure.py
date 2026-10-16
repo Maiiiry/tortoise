@@ -34,8 +34,9 @@ tests/_assembly_census.json, the committed 133-Q temporal taxonomy):
   other two are gpt4_70e84552_abs, the binary `_abs` twin of an
   ordering/compare row (fired already; now asserted with its class), and
   gpt4_d6585ce8 ("the concerts and musical events I attended"), a
-  CLASS-PLURAL enumeration request that names no subjects — a different
-  feature, correctly never fired here.
+  CLASS-PLURAL enumeration request that names no subjects. #8056 is the
+  feature that owns it — it now fires as ``CLASS_PLURAL``, NOT here (see
+  ``test_census_class_plural_coverage``).
 * #2655 CLASS CORRECTION (measured, same evidence standard as the two
   adjudications): the census's ``relative-date-lookup`` label UNDER-COUNTS
   its own class. Of its 6 rows only 3 name a calendar anchor; 3 further rows
@@ -46,6 +47,14 @@ tests/_assembly_census.json, the committed 133-Q temporal taxonomy):
   as precision loss; the class's 3 anchor-less rows stay in (and stay
   non-firing), and the classification is measured separately by
   ``test_census_relative_date_lookup_coverage``.
+* #8056 CLASS-PLURAL (measured, same evidence standard as the
+  adjudications above): the class-plural family is 6 census rows filed
+  across THREE labels (``nary-ordering`` ×1, ``recency/current-state`` ×4,
+  ``other`` ×1), and 3 of them carry a BOUNDED RELATIVE window — those now
+  fire as ``CLASS_PLURAL`` and leave the negative denominator
+  (``_CLASS_PLURAL_COVERED``). The other 3 stay in and stay non-firing with
+  their reason pinned (``_CLASS_PLURAL_NON_WINDOW``): a CALENDAR-MONTH
+  window, an OPEN-LEFT window, and no window at all.
 
 The adjudications keep the shape router (NOT the census labels) as the
 arbiter — mirrored in the module docstring.
@@ -160,6 +169,32 @@ _RELATIVE_DATE_NON_ANCHOR = {
     "gpt4_4929293b",  # "… a week ago?"            (#2652's ago-relative class)
     "gpt4_4edbafa2",  # "… first BBQ event in June?" (no anchor)
     "gpt4_9a159967",  # "… the most in March and April?" (#2886's class)
+}
+# #8056: the CLASS-PLURAL rows the shape now FIRES — a class of events +
+# a BOUNDED RELATIVE window, pinned by qid. The census filed this one family
+# across three labels.
+_CLASS_PLURAL_FIRES = {
+    "gpt4_d6585ce8",  # cls nary-ordering (the #8056 carve-out's row)
+    "gpt4_e061b84f",  # cls recency/current-state
+    "gpt4_7f6b06db",  # cls recency/current-state
+}
+#: #8056: the subset of ``_CLASS_PLURAL_FIRES`` the census filed under a
+#: NEGATIVE class, so the floor must re-adjudicate them OUT of its denominator
+#: (the two ``recency/current-state`` rows; ``gpt4_d6585ce8`` is
+#: ``nary-ordering``, which left ``_NEG_CLASSES`` under #2653). The coverage
+#: test asserts this relationship against the census rather than narrating it.
+_CLASS_PLURAL_COVERED = {"gpt4_e061b84f", "gpt4_7f6b06db"}
+#: #8056: the class-plural family's rows this shape does NOT own, pinned WITH
+#: the reason — a template widening onto any of them fails here.
+_CLASS_PLURAL_NON_WINDOW = {
+    # CALENDAR-MONTH window: month resolution + as-of YEAR belong to the
+    # calendar-anchor surface (#2655), not to a relative lookback
+    "gpt4_45189cb4",  # "… the sports events I watched in January?"
+    # OPEN-LEFT window ("before today"): no bounded lookback to enumerate
+    "gpt4_f420262c",  # "… airlines I flew with … before today?"
+    # NO window at all — a class-plural ORDERING request, not a TEMPORAL
+    # enumeration (this shape is temporal by definition)
+    "gpt4_7abb270c",  # "… the six museums I visited from earliest to latest?"
 }
 # in-scope rows whose DURATION/COUNT morphology must NOT fire (pinned)
 _IN_SCOPE_NO_FIRE = {
@@ -435,6 +470,13 @@ def test_census_negative_set_precision_floor():
     MORPHOLOGY, asserted to fire as RELATIVE_DATE, and leave the denominator
     — the same rule the #2165 adjudication below uses.
 
+    #8056 removes 2 more: the class-plural rows with a BOUNDED RELATIVE
+    window, filed under ``recency/current-state``, now fire as CLASS_PLURAL
+    (``_CLASS_PLURAL_COVERED``, pinned by
+    ``test_census_class_plural_coverage``). They too are re-read by
+    MORPHOLOGY — the same rule — so they leave the denominator rather than
+    counting as precision loss.
+
     The 1 remaining row #2165 Task 2 adjudicated as LABEL NOISE
     (``_ADJUDICATED_FIRE``) is counted in the denominator and stays the ONLY
     permitted fire: it fires as a DIFFERENT shape than the class the census
@@ -453,15 +495,16 @@ def test_census_negative_set_precision_floor():
     Re-measured against ``tests/_assembly_census.json``. The #2165 figure
     (76/78 rejected) is NOT comparable: 34 of those 78 rows are now
     deliberate positives (78 − 34 − the 5 #2654 state-entry rows − the 4
-    #2653 nary-ordering rows − the 3 #2655 calendar-anchored rows = the 32
-    asserted below).
+    #2653 nary-ordering rows − the 3 #2655 calendar-anchored rows − the 2
+    #8056 class-plural rows = the 30 asserted below).
     """
     rows = [r for r in _CENSUS["rows"]
             if r["cls"] in _NEG_CLASSES
             and r["qid"] not in _PROMOTED_MISFILED
             and r["qid"] not in _DURATION_STATE_COVERED
-            and r["qid"] not in _RELATIVE_DATE_ANCHORED]
-    assert len(rows) == 32
+            and r["qid"] not in _RELATIVE_DATE_ANCHORED
+            and r["qid"] not in _CLASS_PLURAL_COVERED]
+    assert len(rows) == 30
     false_fires = [
         r for r in rows
         if classify_question(r["question"]) is not None]
@@ -487,7 +530,7 @@ def test_census_negative_set_precision_floor():
     # the denominator #2655's re-adjudication leaves (the RATIO is
     # deliberately not asserted — see the docstring)
     denominator = len(rows) - len(reclassified)
-    assert denominator == 29
+    assert denominator == 27
 
 
 def test_census_relative_time_recall():
@@ -512,7 +555,9 @@ def test_census_nary_ordering_remeasured():
     Measured: 2 of the 4 rows are genuine 3+ named-subject ordering
     questions and now FIRE as ORDERING with exactly 3 extracted terms; one
     is the binary `_abs` twin that already fired; one is a class-plural
-    enumeration request that names no subjects and must never fire here.
+    enumeration request that names no subjects and belongs to #8056 — it
+    now fires as ``CLASS_PLURAL`` (pinned by
+    ``test_census_class_plural_coverage``), never as a NAMED-subject shape.
     """
     by_qid = {r["qid"]: r for r in _CENSUS["rows"]}
     nary_rows = [r for r in _CENSUS["rows"] if r["cls"] == "nary-ordering"]
@@ -527,9 +572,13 @@ def test_census_nary_ordering_remeasured():
         assert len(terms) == 3, (qid, terms)
         assert all(t.strip() for t in terms), (qid, terms)
 
-    # the class-plural row names NO subjects -> never a shape (a different
-    # feature: enumerating every event of a class over a window)
-    assert classify_question(by_qid["gpt4_d6585ce8"]["question"]) is None
+    # the class-plural row names NO subjects — never a NAMED-subject shape
+    # (#8056 owns it: it fires as CLASS_PLURAL, the class-enumeration shape,
+    # and is pinned by ``test_census_class_plural_coverage``)
+    assert classify_question(by_qid["gpt4_d6585ce8"]["question"]) \
+        is AssemblyShape.CLASS_PLURAL
+    assert extract_subject_terms(
+        by_qid["gpt4_d6585ce8"]["question"]) == []
 
     # the binary `_abs` twin still fires as the TWO-option form
     twin = by_qid["gpt4_70e84552_abs"]["question"]
@@ -1432,18 +1481,23 @@ def test_narrative_verbs_do_not_trip_the_advice_guard():
         assert classify_question(q) is None, q
 
 
-def test_nary_recency_and_class_plural_never_fire():
-    """Recency ('most recently'), the compound single-subject 'between the
-    two Xs' form, and the CLASS-PLURAL enumeration request (no NAMED
-    subjects) never fire — the N-ary arms need a decomposable option list,
-    and 'the concerts and musical events I attended' is not one."""
+def test_nary_recency_never_fire():
+    """Recency ('most recently' / the ATTRIBUTIVE 'most recent' / bare
+    'latest') and the compound single-subject 'between the two Xs' form
+    never fire — the N-ary arms need a decomposable option list.
+
+    #8056 moved the CLASS-PLURAL enumeration questions OUT of this list:
+    the two with a bounded relative window now FIRE as ``CLASS_PLURAL``
+    (pinned by ``test_census_class_plural_coverage`` and
+    ``test_class_plural_fires``); the window-less one stays here, which is
+    what keeps the R13 recency guard honest for every other surface.
+    """
     for q in [
+        # window-less class-plural ordering: NOT a temporal enumeration, and
+        # the `latest` guard still rejects it (see the OVERRIDES note on the
+        # classifier's class-plural branch)
         "What is the order of the six museums I visited from earliest to "
         "latest?",
-        "What is the order of the concerts and musical events I attended "
-        "in the past two months, starting from the earliest?",
-        "What is the order of the three trips I took in the past three "
-        "months, from earliest to latest?",
         # the SAME ordering instruction spelled with the ATTRIBUTIVE 'most
         # recent' — only the adverbial 'most recently' names a time, so the
         # attributive stays a guard (as on main) and is not promoted
@@ -4342,3 +4396,519 @@ def test_ordering_list_regex_is_linear_and_still_reads_the_colon_form():
         "the colon-list guard backtracked on whitespace again: "
         f"{elapsed:.2f}s on a {len(worst)}-char question that _ask_validate "
         "accepts. Keep the option span's first class disjoint from \\s*.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #8056 — CLASS-PLURAL TEMPORAL ENUMERATION. The shape, its deterministic
+# resolver (window ∩ class), the class filter, the chronological render, and
+# the fired DECISION driven hermetically through `_assemble_connected` (no
+# DB, no model) — the same harness the #2655 day path uses.
+# ══════════════════════════════════════════════════════════════════════════
+
+from tortoise.assembly import (  # noqa: E402
+    ClassWindow,
+    _class_owns_row,
+    _class_tokens,
+    collect_class_slices,
+    resolve_class_window,
+)
+
+_CLASS_PLURAL_Q = ("What is the order of the concerts and musical events I "
+                   "attended in the past two months, starting from the "
+                   "earliest?")
+
+
+def test_census_class_plural_coverage():
+    """#8056 measured target: 3 of the 6 class-plural census family rows fire
+    (was 0/6 at HEAD); the other 3 stay non-firing with their REASON pinned.
+
+    The census filed this ONE family across three labels, which is why the
+    carve-out's single row (``gpt4_d6585ce8``) is not the whole class. The
+    family membership is asserted literally, so a row appearing or leaving
+    the family fails here rather than silently changing the coverage figure.
+    """
+    rows = {r["qid"]: r for r in _CENSUS["rows"]}
+    family = _CLASS_PLURAL_FIRES | _CLASS_PLURAL_NON_WINDOW
+    assert family == {
+        "gpt4_d6585ce8",   # nary-ordering      — the #8056 carve-out row
+        "gpt4_e061b84f",   # recency/current-state
+        "gpt4_7f6b06db",   # recency/current-state
+        "gpt4_45189cb4",   # other              — calendar-month window
+        "gpt4_7abb270c",   # recency/current-state — no window
+        "gpt4_f420262c",   # recency/current-state — open-left window
+    }, "census class-plural family membership drifted"
+
+    fired = {qid for qid, r in rows.items()
+             if classify_question(r["question"])
+             is AssemblyShape.CLASS_PLURAL}
+    assert fired == _CLASS_PLURAL_FIRES, fired
+    # the shape is NOT a named-subject shape: extraction stays []
+    for qid in fired:
+        assert extract_subject_terms(rows[qid]["question"]) == [], qid
+
+    # the family's remaining rows are non-firing, each with a recorded reason
+    for qid in _CLASS_PLURAL_NON_WINDOW:
+        assert classify_question(rows[qid]["question"]) is None, qid
+    assert set(_CLASS_PLURAL_NON_WINDOW).isdisjoint(fired)
+
+    # the floor's denominator only loses the rows the census filed under a
+    # NEGATIVE class — derived from the census, never narrated
+    assert {
+        qid for qid in fired if rows[qid]["cls"] in _NEG_CLASSES
+    } == _CLASS_PLURAL_COVERED
+
+
+@pytest.mark.parametrize("question", [
+    # the 3 fireable census rows, VERBATIM
+    _CLASS_PLURAL_Q,
+    "What is the order of the three sports events I participated in during "
+    "the past month, from earliest to latest?",
+    "What is the order of the three trips I took in the past three months, "
+    "from earliest to latest?",
+    # the count may be a digit, the unit a day/week/year, and the window
+    # introduced by any of the four connectors
+    "What is the order of the concerts I went to in the past 2 weeks?",
+    "What is the order of the festivals I attended over the last five days?",
+    "What is the order of the conferences I went to within the past year?",
+    # the ordering instruction is optional (the head already asks the order)
+    "What is the order of the concerts and musical events I attended in the "
+    "past two months?",
+    # a class LIST may carry a comma (a comma is not an option list without
+    # the colon introducer the N-ary shape requires)
+    "What is the order of the concerts, musicals and events I attended in "
+    "the past two months?",
+])
+def test_class_plural_fires(question):
+    assert classify_question(question) is AssemblyShape.CLASS_PLURAL
+    # a class is not an Object — the fired path branches before extraction
+    assert extract_subject_terms(question) == []
+
+
+@pytest.mark.parametrize("question", [
+    # no window at all: a class-plural ORDERING request, not a TEMPORAL
+    # enumeration (the `latest` guard still rejects it)
+    "What is the order of the six museums I visited from earliest to latest?",
+    "What is the order of the six museums I visited from earliest to most "
+    "recent?",
+    # CALENDAR-MONTH window — a different window family (#2655's surface)
+    "What is the order of the sports events I watched in January?",
+    # OPEN-LEFT window — no bounded lookback to enumerate
+    "What is the order of airlines I flew with from earliest to latest "
+    "before today?",
+    # a PLURAL unit with no count is ambiguous (how many months?) — the
+    # template admits a count-less window only with a SINGULAR unit
+    "What is the order of the concerts I attended in the past months?",
+    # R13 discipline re-applied inside the branch: a promoted OR bare
+    # relative offset co-present kills the question
+    "What is the order of the concerts I attended in the past two months "
+    "two weeks ago?",
+    "What is the order of the concerts I attended in the past two months a "
+    "long time ago?",
+    # ... the calendar-anchor vocabulary (#2655's family)
+    "What is the order of the concerts I attended in the past two months "
+    "last Saturday?",
+    # ... a frequency/count head, an advice frame, an `or` chain (the N-ary
+    # shape's surface)
+    "What is the order of the concerts I attended in the past two months "
+    "and how many times did I go?",
+    "What is the order of the concerts I should have attended in the past "
+    "two months?",
+    "What is the order of the concerts or musicals or events I attended in "
+    "the past two months?",
+    # the head is NOT this shape's (who/what did I …)
+    "What did I attend in the past two months?",
+    "Which concerts did I attend in the past two months?",
+    # ... and the shape never steals a subject-bearing shape
+    "what is the current status of the couch?",
+    "Which event happened first, my cousin's wedding or Michael's "
+    "engagement party?",
+])
+def test_class_plural_does_not_fire(question):
+    assert classify_question(question) is not AssemblyShape.CLASS_PLURAL, \
+        question
+
+
+def test_class_plural_template_is_not_super_linear_on_space_runs():
+    r"""The class-plural head must not backtrack over whitespace runs.
+
+    Its first draft was ``(?P<cls>.+?)\s+`` — ``\s+`` and the lazy ``.+?``
+    BOTH match whitespace, so the engine retried every (class-end, run-split)
+    pair before failing: measured 53 ms at len 1853 and 26 s at len 25853 for
+    ``'the order of the ' + 'a'*100 + ' '*n + 'i'*100 + ' '*n + 'took …'``
+    (quadratic). The fix is the one ``_RE_OR_CHAIN`` already wears: a SINGLE
+    ``\s`` (the lazy ``.+?`` covers every extra separator), plus a GREEDY tail
+    so ``\s*$`` cannot retry over a trailing run either.
+
+    The probe runs BEYOND ``MAX_ASK_QUESTION_CHARS`` (2000) on purpose: inside
+    that bound the pre-fix cost is only tens of milliseconds, so no in-bound
+    probe can tell linear from quadratic — at 20k the two differ by four
+    orders of magnitude (measured 20 s vs 2 ms), which is the only margin that
+    makes this assertion a verdict about the REGEX rather than about machine
+    load (#5049). The bound is correspondingly loose.
+    """
+    import time
+
+    from tortoise.assembly import _RE_CLASS_PLURAL
+
+    # Positive/negative controls: the measured corpus form still fires, and a
+    # near-miss still rejects — at every probe size
+    for n in (2000, 4000, 8000, 16000):
+        pad = " " * n
+        assert _RE_CLASS_PLURAL.match(
+            "What is the order of the concerts" + pad
+            + "I attended in the past two months?") is not None, n
+        assert _RE_CLASS_PLURAL.match(
+            "What is the order of the concerts" + pad
+            + "I attended in the past?") is None, n
+
+    started = time.monotonic()
+    _RE_CLASS_PLURAL.match(
+        "What is the order of the concerts" + " " * 20000
+        + "I attended in the past two months?")
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.0, (
+        "the class-plural head backtracked on whitespace again: "
+        f"{elapsed:.2f}s on a 20000-char probe (linear form: ~2 ms). Keep the "
+        "run before the relative-clause pronoun a single \\s, and the tail "
+        "greedy.")
+
+
+@pytest.mark.parametrize("question", [
+    # the class-plural shapes that must ABSTAIN from the shape: a class that
+    # is not a temporal window is not this shape, and extraction stays empty
+    # for it (no class-plural fire can hand the resolver a fragment)
+    "What is the order of the six museums I visited from earliest to latest?",
+    "What is the order of the sports events I watched in January?",
+    "What is the order of airlines I flew with from earliest to latest "
+    "before today?",
+    "What is the order of the concerts I attended in the past months?",
+])
+def test_class_plural_abstentions_extract_nothing(question):
+    assert classify_question(question) is None, question
+    assert extract_subject_terms(question) == [], question
+
+
+@pytest.mark.parametrize("question,qd,lo,hi,count,unit,tokens,phrase", [
+    (_CLASS_PLURAL_Q, "2026-09-10", "2026-07-10", "2026-09-10", 2, "month",
+     ("concert", "music"), "the concerts and musical events"),
+    # no count ⇒ ONE unit ("during the past month")
+    ("What is the order of the three sports events I participated in during "
+     "the past month, from earliest to latest?", "2026-09-10", "2026-08-10",
+     "2026-09-10", 1, "month", ("sport",), "the three sports events"),
+    ("What is the order of the three trips I took in the past three months, "
+     "from earliest to latest?", "2026-09-10", "2026-06-10", "2026-09-10",
+     3, "month", ("trip",), "the three trips"),
+    # digit count + week/day/year units
+    ("What is the order of the concerts I went to in the past 2 weeks?",
+     "2026-09-10", "2026-08-27", "2026-09-10", 2, "week", ("concert",),
+     "the concerts"),
+    ("What is the order of the concerts I went to in the past five days?",
+     "2026-09-10", "2026-09-05", "2026-09-10", 5, "day", ("concert",),
+     "the concerts"),
+    ("What is the order of the conferences I went to within the past year?",
+     "2026-09-10", "2025-09-10", "2026-09-10", 1, "year", ("conference",),
+     "the conferences"),
+    # calendar month subtraction CLAMPS the day (03-31 − 1 month = 02-28),
+    # never a 30-day approximation
+    ("What is the order of the concerts I went to in the past month?",
+     "2026-03-31", "2026-02-28", "2026-03-31", 1, "month", ("concert",),
+     "the concerts"),
+])
+def test_resolve_class_window_arithmetic(question, qd, lo, hi, count, unit,
+                                         tokens, phrase):
+    window = resolve_class_window(question, qd)
+    assert isinstance(window, ClassWindow)
+    assert window.window_lo.isoformat() == lo
+    assert window.window_hi.isoformat() == hi
+    assert (window.count, window.unit) == (count, unit)
+    assert window.tokens == tokens
+    # the census class asks for the order from the EARLIEST
+    assert window.newest_first is False
+    # the CLASS SPAN is the template's own capture, cut at the relative-clause
+    # pronoun — it carries no verb, which is what makes the token set the
+    # class's own content words (see ``_class_tokens``)
+    assert window.class_phrase == phrase
+
+
+def test_resolve_class_window_abstains_never_raises():
+    """The resolver's contract: None — never a raise — for the absent,
+    garbage, unmeasurable and non-shape inputs. A raise here would escape
+    `_assemble_connected` and surface as AskRetrievalUnavailable, defeating
+    the legacy fall-through this shape's abstention path exists for."""
+    # no question_date / garbage question_date: the resolver NEVER reads a
+    # clock, so an as-of window cannot be invented
+    assert resolve_class_window(_CLASS_PLURAL_Q, None) is None
+    assert resolve_class_window(_CLASS_PLURAL_Q, "not-a-date") is None
+    # an UNREPRESENTABLE offset is an unparseable one
+    assert resolve_class_window(
+        "What is the order of the concerts I went to in the past "
+        "99999999999999999999 days?", "2026-09-10") is None
+    # a class span with no usable token
+    assert resolve_class_window(
+        "What is the order of the I took in the past two months?",
+        "2026-09-10") is None
+    # not this shape (the same gate `resolve_relative_anchor` applies)
+    assert resolve_class_window("what did I do two weeks ago?",
+                               "2026-09-10") is None
+    assert resolve_class_window("", "2026-09-10") is None
+    assert resolve_class_window(None, "2026-09-10") is None  # type: ignore
+
+    # ... and the two entry points can never disagree about ownership
+    for r in _CENSUS["rows"]:
+        if classify_question(r["question"]) is AssemblyShape.CLASS_PLURAL:
+            continue
+        assert resolve_class_window(r["question"], "2026-09-10") is None, \
+            r["qid"]
+
+
+def test_class_tokens_select_the_discriminative_vocabulary():
+    """The class-vocabulary rule: the determiner and the leading count carry
+    no class meaning; the generic head noun is dropped whenever a
+    discriminative token exists (``event`` alone matches almost any narrative
+    row), and kept when EVERY token is generic (a weak filter that selects
+    nothing fails CLOSED downstream)."""
+    assert _class_tokens("the concerts and musical events") == \
+        ("concert", "music")
+    assert _class_tokens("the three sports events") == ("sport",)
+    assert _class_tokens("the three trips") == ("trip",)
+    assert _class_tokens("the activities") == ("activity",)
+    # stems reconcile the plural / adjectival spellings on BOTH sides
+    assert _class_tokens("my musical gigs") == ("music", "gig")
+    assert _class_tokens("") == ()
+
+
+def test_class_owns_row_matches_content_and_search_keys():
+    assert _class_owns_row({"content": "I attended a concert downtown"},
+                           ("concert", "music"))
+    assert _class_owns_row({"content": "went to the music festival"},
+                           ("concert", "music"))
+    # the v2 lane's search_keys are the authored retrieval index — a string,
+    # or a list of keys
+    assert _class_owns_row({"content": "the big night out",
+                            "search_keys": ["concert", "jazz"]},
+                           ("concert",))
+    assert _class_owns_row({"content": "x",
+                            "search_keys": "music festival"}, ("music",))
+    # a row with neither the token nor a usable field never matches
+    assert not _class_owns_row({"content": "bought a grey couch"},
+                               ("concert", "music"))
+    assert not _class_owns_row({"content": "a concert"}, ())
+    # never raises on a hand-built slice
+    assert not _class_owns_row({"content": None}, ("concert",))
+    assert not _class_owns_row({"content": 42, "search_keys": {"music"}},
+                               ("concert",))
+
+
+def test_class_slices_select_the_class_and_keep_the_window_census():
+    """The class walk reuses the #2652 window walk (same R2 ladder, same
+    as-of window, undated rows excluded) and narrows it to the class.
+    `admission` keeps the FETCH census and adds what the filter removed."""
+    window = resolve_class_window(_CLASS_PLURAL_Q, "2026-09-10")
+    port = _DictWindowPort([
+        _day_row("p-concert", created_at="2026-08-14",
+                 content="attended the Jazz Festival concert"),
+        _day_row("p-couch", created_at="2026-08-01",
+                 content="bought a grey couch"),
+        _day_row("p-music", created_at="2026-07-14",
+                 content="went to a music festival"),
+        # outside the window, and dated by the LADDER's second tier (a junk
+        # `when` with a real createdAt is placed, never dropped as undated)
+        _day_row("p-old", when="garbage", created_at="2026-06-01",
+                 content="an old concert"),
+        # undated: cannot satisfy a relative window
+        _day_row("p-undated", content="a concert with no date"),
+    ])
+    slices = collect_class_slices(port, window, per_window_cap=8)
+    assert [r["id"] for r in slices.timeline_rows] == ["p-music", "p-concert"]
+    assert [r["tier"] for r in slices.timeline_rows] == ["created", "created"]
+    # ONE batched fetch, bounded, over the window the resolver computed
+    assert len(port.calls) == 1
+    assert port.calls[0][:2] == (window.window_lo, window.window_hi)
+    assert port.calls[0][2] == 8
+    assert slices.admission["class_filtered_out"] == 1  # p-couch
+    assert slices.admission["rows_admitted"] == 2
+    assert slices.admission["truncated"] is False
+    assert slices.state_rows == ()
+    # the evidence rows are the class's Points
+    assert [r["id"] for r in slices.evidence_rows] == ["p-music", "p-concert"]
+
+
+def test_class_slices_degrade_to_empty():
+    window = resolve_class_window(_CLASS_PLURAL_Q, "2026-09-10")
+    assert collect_class_slices(
+        _DictWindowPort([], raise_on_fetch=True), window).timeline_rows == ()
+
+    class _NoLeg:
+        pass
+
+    assert collect_class_slices(_NoLeg(), window).timeline_rows == ()
+    # a window whose rows carry NO class token selects nothing (the caller's
+    # empty-block guard then falls back to legacy)
+    port = _DictWindowPort([_day_row("p", created_at="2026-08-01",
+                                     content="bought a couch")])
+    assert collect_class_slices(port, window).timeline_rows == ()
+
+
+def test_class_render_header_positions_and_rows():
+    """The fired class block: ONE header naming the class and the window,
+    then the class's dated rows CHRONOLOGICALLY, each preceded by its own
+    position line — the deterministic tier owns the ordering the question
+    asks for, and both window ends are stated so the reader can reconcile the
+    span from the rendered context alone."""
+    window = resolve_class_window(_CLASS_PLURAL_Q, "2026-09-10")
+    slices = collect_class_slices(_DictWindowPort([
+        _day_row("p-concert", created_at="2026-08-14",
+                 content="attended the Jazz Festival concert"),
+        _day_row("p-music", created_at="2026-07-14",
+                 content="went to a music festival"),
+    ]), window)
+    hits = synthesize_hits(slices, shape=AssemblyShape.CLASS_PLURAL,
+                           question_date="2026-09-10", anchor=window)
+    contents = [h["content"] for h in hits]
+    assert contents[0] == (
+        "CLASS ORDER (the concerts and musical events): 2 dated events in "
+        "2026-07-10 -> 2026-09-10 (2 months before 2026-09-10), earliest "
+        "first")
+    assert [h["kind"] for h in hits[:3]] == ["class-window", "class-order",
+                                             "point"]
+    assert "1. 2026-07-14" in contents
+    assert "2. 2026-08-14" in contents
+    assert "went to a music festival" in contents
+    assert "attended the Jazz Festival concert" in contents
+    # the pure-walker derivation keys never leak into the render input
+    for h in hits:
+        assert "date" not in h and "tier" not in h
+
+
+def test_class_render_same_day_rows_share_a_position():
+    """A same-DAY tie is never rendered as a strict order: the tied rows
+    share a position, and the next distinct date resumes the row index (the
+    module's existing tie discipline — the N-ary path's 'both appeared on')."""
+    window = resolve_class_window(_CLASS_PLURAL_Q, "2026-09-10")
+    slices = collect_class_slices(_DictWindowPort([
+        _day_row("p-a", created_at="2026-08-01", content="a concert"),
+        _day_row("p-b", created_at="2026-08-01", content="another concert"),
+        _day_row("p-c", created_at="2026-08-20", content="a third concert"),
+    ]), window)
+    hits = synthesize_hits(slices, shape=AssemblyShape.CLASS_PLURAL,
+                           question_date="2026-09-10", anchor=window)
+    positions = [h["content"] for h in hits
+                 if h["kind"] == "class-order"]
+    assert positions == ["1. 2026-08-01", "1. 2026-08-01",
+                         "3. 2026-08-20"]
+
+
+def test_class_render_header_count_matches_the_rendered_rows():
+    """The header's count is the count it RENDERS: the id dedupe runs
+    BEFORE the header is built, so a hand-built slice carrying a duplicate row
+    id cannot make the block claim one more member than it lists."""
+    window = resolve_class_window(_CLASS_PLURAL_Q, "2026-09-10")
+    dup = {"kind": "point", "id": "p-a", "content": "a concert",
+           "date": _py_date(2026, 8, 1), "tier": "created"}
+    slices = AssemblySlices(timeline_rows=(dup, dict(dup)))
+    hits = synthesize_hits(slices, shape=AssemblyShape.CLASS_PLURAL,
+                           question_date="2026-09-10", anchor=window)
+    assert "1 dated events in" in hits[0]["content"]
+    assert len([h for h in hits if h["kind"] == "class-order"]) == 1
+
+
+def test_class_render_empty_returns_nothing():
+    """A class block with no row renders NOTHING (the caller's empty-block
+    guard then falls back to legacy) — never a content-less header replacing
+    a working pool (#2165 P1-1)."""
+    window = resolve_class_window(_CLASS_PLURAL_Q, "2026-09-10")
+    assert synthesize_hits(AssemblySlices(), shape=AssemblyShape.CLASS_PLURAL,
+                           question_date="2026-09-10", anchor=window) == []
+    slices = collect_class_slices(_DictWindowPort([
+        _day_row("p", created_at="2026-08-01", content="a concert"),
+    ]), window)
+    # no window / no question_date: the renderer invents nothing
+    assert synthesize_hits(slices, shape=AssemblyShape.CLASS_PLURAL,
+                           question_date=None, anchor=window) == []
+    assert synthesize_hits(slices, shape=AssemblyShape.CLASS_PLURAL,
+                           question_date="2026-09-10", anchor=None) == []
+
+
+def _class_port(rows):
+    return _DictWindowPort(rows)
+
+
+def test_connected_fires_on_the_class_window_hermetically(monkeypatch):
+    """The CLASS_PLURAL fired decision through the REAL orchestration
+    (classify -> resolve -> walk -> render -> shared decorate/assemble tail),
+    with the graph seam stubbed: no DB, no model."""
+    port = _class_port([
+        _day_row("p-concert", created_at="2026-08-14",
+                 content="attended the Jazz Festival concert"),
+        _day_row("p-couch", created_at="2026-08-01",
+                 content="bought a grey couch"),
+        _day_row("p-music", created_at="2026-07-14",
+                 content="went to a music festival"),
+        _day_row("p-old", created_at="2026-06-01",
+                 content="an old concert outside the window"),
+    ])
+    block = _drive_connected(monkeypatch, port, _CLASS_PLURAL_Q,
+                             question_date="2026-09-10")
+    assert block.fired is True
+    assert block.shape == "class-plural"
+    # a class is not a subject — nothing rides on the block
+    assert block.subjects == ()
+    rendered = "\n".join(str(h.get("content") or "")
+                         for h in block.post_cap_lines)
+    assert "CLASS ORDER (the concerts and musical events)" in rendered
+    assert "went to a music festival" in rendered
+    assert "attended the Jazz Festival concert" in rendered
+    # the class filter and the as-of window both bite
+    assert "bought a grey couch" not in rendered
+    assert "an old concert outside the window" not in rendered
+    assert block.admission["class_filtered_out"] == 1
+    assert block.admission["rows_admitted"] == 2
+
+
+def test_connected_refuses_when_no_row_carries_the_class(monkeypatch):
+    """The shape's normal miss: the window holds rows, but none of them is
+    the question's class. Firing a bare `CLASS ORDER` header would REPLACE a
+    working legacy pool — so it must NOT fire."""
+    port = _class_port([
+        _day_row("p-couch", created_at="2026-08-01",
+                 content="bought a grey couch"),
+        _day_row("p-run", created_at="2026-08-02", content="went for a run"),
+    ])
+    block = _drive_connected(monkeypatch, port, _CLASS_PLURAL_Q,
+                             question_date="2026-09-10")
+    assert block.fired is False
+    assert block.shape is None
+    assert block.post_cap_lines == []
+
+
+def test_connected_class_refuses_without_a_question_date(monkeypatch):
+    """The resolver never reads a clock: no question_date -> no window -> no
+    fire, even though class rows exist."""
+    port = _class_port([
+        _day_row("p-concert", created_at="2026-08-14",
+                 content="attended the Jazz Festival concert"),
+    ])
+    block = _drive_connected(monkeypatch, port, _CLASS_PLURAL_Q,
+                             question_date=None)
+    assert block.fired is False
+    assert block.shape is None
+
+
+def test_connected_never_consults_the_class_walk_for_another_shape(
+        monkeypatch):
+    """The window leg is untouched for every other question: a SUBJECT shape
+    goes down its own walker seam, and a question NO shape owns returns before
+    any port is consulted."""
+    port = _class_port([_day_row("p", created_at="2026-08-01",
+                                 content="a concert")])
+    subject = _drive_subject_path(
+        monkeypatch, _DictObjectPort([{"id": "obj-couch", "name": "couch"}]),
+        _fixture_walker_port(), "what is the current status of the couch?")
+    assert subject.shape == "current-state"
+    assert port.calls == []
+    block = _drive_connected(
+        monkeypatch, port,
+        "What is the order of the six museums I visited from earliest to "
+        "latest?", question_date="2026-09-10")
+    assert block.fired is False
+    assert port.calls == []
