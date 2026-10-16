@@ -80,18 +80,31 @@ def _commands(run: str) -> str:
     """The executable text of a step's `run` block — comments are not commands.
 
     Shell rules modelled here, each one because an earlier version got it wrong
-    and hid a real `wrangler@` float (or invented one): the scan runs over the
-    WHOLE block so quoting survives a backslash-newline continuation; outside
-    quotes a backslash ESCAPES the next character, so an escaped quote inside a
-    double-quoted string does not end it; and a `#` starts a comment after any
-    word boundary, not only after whitespace.
+    and hid a real `wrangler@` float (or invented one): quoting spans a
+    backslash-newline continuation; a backslash ESCAPES the next character, so
+    an escaped quote does not end a double-quoted string — and an escaped
+    character is a LITERAL, so it cannot end a word either (`\;#` is not a
+    comment, and a `\\`+newline keeps the word open); `$'…'` is its own quoting
+    form, where `\'` escapes; and a `#` opens a comment after any word boundary,
+    not only after whitespace.
+
+    DECLARED RESIDUAL — command substitution is NOT modelled: a `#` inside a
+    backtick substitution reads as command text. That can only OVER-report (the
+    guard refuses a clean check), never hide a pin, because backticks suppress
+    no text. Pinned by the residual arm in
+    `test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range`.
     """
     out: list[str] = []
     quote = ""
+    ansi_c = False
     escaped = False
     at_word_start = True
     commenting = False
-    for ch in run:
+    i, n = 0, len(run)
+    while i < n:
+        ch = run[i]
+        nxt = run[i + 1] if i + 1 < n else ""
+        i += 1
         if commenting:
             if ch == "\n":
                 commenting = False
@@ -100,13 +113,39 @@ def _commands(run: str) -> str:
             continue
         if escaped:
             escaped = False
-        elif ch == "\\" and quote != "'":
-            escaped = True
-        elif quote:
-            if ch == quote:
+            out.append(ch)
+            if ch != "\n":
+                # a backslash-newline is removed and the word continues; any
+                # other escaped character is a literal word character
+                at_word_start = False
+            continue
+        if ansi_c:
+            if ch == "'":
+                ansi_c, quote = False, ""
+            elif ch == "\\":
+                escaped = True
+            out.append(ch)
+            at_word_start = False
+            continue
+        if quote:
+            if ch == "\\" and quote == '"':
+                escaped = True
+            elif ch == quote:
                 quote = ""
-        elif ch in _QUOTE_CHARS:
+            out.append(ch)
+            at_word_start = False
+            continue
+        if ch == "$" and nxt == "'":
+            ansi_c, quote = True, "'"
+            out.append(ch)
+            out.append(nxt)  # the opening quote is part of the construct
+            at_word_start = False
+            i += 1  # consumed `nxt` as well
+            continue
+        if ch in _QUOTE_CHARS:
             quote = ch
+        elif ch == "\\":
+            escaped = True
         elif ch == "#" and at_word_start:
             commenting = True
             continue
@@ -325,6 +364,18 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
     # command invents a pin out of a comment.
     assert _floating_wranglers("echo a;# was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
     assert _floating_wranglers("echo a &&# was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
+    # An ESCAPED metacharacter is a literal, so it does not end the word and the
+    # `#` after it does NOT open a comment (shell echoes the text) — and a
+    # backslash-newline keeps the word open rather than starting a comment.
+    assert _floating_wranglers("echo a\\;# x\nnpx --yes wrangler@4 --version") == {"4"}
+    assert _commands("echo hi\\\n# not a comment") == "echo hi\\\n# not a comment"
+    # `$'…'` is its own quoting form, where `\'` escapes: reading that `'` as a
+    # plain single-quote desyncs the scanner, inventing a pin or hiding one.
+    assert _floating_wranglers("echo $'\\'' # was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
+    assert _floating_wranglers("echo $'\\' # c' && npx --yes wrangler@4 --version") == {"4"}
+    # DECLARED RESIDUAL — a `#` inside a backtick substitution reads as command
+    # text. Over-reporting only (a mention read as a pin); backticks hide no text.
+    assert _floating_wranglers("echo `# was wrangler@4`") == {"4"}
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:

@@ -115,6 +115,13 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
         f"surface is {sorted(WRITABLE_RAW_STATES)}; `offline` / `access_revoked` "
         "are conditions observed live, never recorded"
     )
+    # SCOPE, stated because the assertion above is a substring check: this pin
+    # binds the clause text and the section's single `recordable` CLAIM. A
+    # widening phrased elsewhere in the row, or in another section, without the
+    # word `recordable` ("`offline` is also stored on the record.") is NOT
+    # covered — the read predicate for that is the code half below, and the doc
+    # is owner-gated (#8745), so a model widening arrives through the owner
+    # rather than through a silent edit this pin would have to out-guess.
     assert section.lower().count("recordable") == 1, (
         "§4.6 must make exactly one recordable-vocabulary claim: a second one can "
         "widen the stored vocabulary without touching the clause pinned above"
