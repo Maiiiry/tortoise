@@ -9,11 +9,12 @@ All notable changes to this project will be documented in this file.
 `create_direct_edge('IMPL', <Subject>, <Object>)` wrote the edge while
 `ingest()` refused the same connection with
 `BundleValidationError: ... must be a plain Point — got a Subject endpoint`.
-#7902 had widened both write primitives (`create_operator`, `create_direct_edge`)
-to the four epistemic labels, but ingest carried its own hand-rolled endpoint
-gate and the DIRECT route still demanded plain `:Point`s. Both validation phases
-now read ONE declaration — the four epistemic labels, addressed by the node's
-`id` — which is exactly what the primitives accept.
+Earlier, #7902 had widened both write primitives (`create_operator`,
+`create_direct_edge`) to the four epistemic labels, but ingest carried its own
+hand-rolled endpoint gate and the DIRECT route still demanded plain
+`:Point`s. Both validation phases now read ONE declaration — the four
+epistemic labels, addressed by the node's `id` — which is exactly what the
+primitives accept.
 
 - **What still refuses:** a `:Source` (a document IS a `:Source`), an
   operator-shaped Point, and an endpoint that resolves by something other than

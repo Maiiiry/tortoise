@@ -602,6 +602,85 @@ def test_direct_route_entity_declared_terminal_status_rejected_phase1(sdk):
                        "RETURN count(n)") == 0
 
 
+def test_direct_route_entity_nested_props_declared_terminal_status_rejected_phase1(sdk):
+    """#7925 review P1: the SAME born-terminal shape, spelled the other way.
+    `_coerce_props` flattens a nested `props={...}`, so
+    `props: {"status": "superseded"}` mints a terminal :Subject exactly as
+    the top-level spelling does — but the guard read only `item.get("status")`,
+    saw None, and let the bundle through Phase 1. Measured pre-fix: the
+    predecessor point AND the :Subject committed, then `create_direct_edge`
+    raised (partial mutation). The guard must read the status the WRITER will
+    (nested props included; top-level presence wins)."""
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma",
+                      "props": {"status": "superseded"}},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("declares status 'superseded'" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="declares status 'superseded'"):
+        sdk.ingest(bundle)
+    # ZERO mutation — neither the predecessor point nor the born-terminal Subject
+    assert _count(sdk, "MATCH (n:Point {content:'must-not-commit'}) "
+                       "RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject {name:'Gamma'}) RETURN count(n)") == 0
+
+
+@pytest.mark.parametrize("spelling", ["top", "nested"])
+def test_direct_route_entity_outdated_flag_rejected_phase1(sdk, spelling):
+    """#7925 review P1: the server-managed `outdated` flag is the same
+    partial-mutation class. `_sanitize_props` refuses it on PRESENCE for the
+    entity writer, so a bundle item carrying it (top-level OR the nested
+    `props` spelling `_coerce_props` flattens) raises mid-write AFTER the
+    predecessor point committed (measured). Phase 1 must reject on both
+    spellings, so nothing commits."""
+    item = {"ref": "s", "type": "subject", "name": "Gamma"}
+    if spelling == "top":
+        item["outdated"] = True
+    else:
+        item["props"] = {"outdated": True}
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [item, {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("declares the server-managed 'outdated' flag" in m
+               for m in msgs), msgs
+    with pytest.raises(BundleValidationError, match="outdated"):
+        sdk.ingest(bundle)
+    assert _count(sdk, "MATCH (n:Point {content:'must-not-commit'}) "
+                       "RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject {name:'Gamma'}) RETURN count(n)") == 0
+
+
+def test_direct_route_entity_top_level_status_shadows_nested_props(sdk):
+    """#7925 review P1 precedence pin: `_coerce_props` gives top-level kwargs
+    precedence by PRESENCE, so a top-level `status: "live"` shadows a nested
+    `props={"status": "superseded"}` and the minted :Subject is LIVE — the
+    guard must NOT reject the bundle. (Falling back whenever the top-level
+    value were absent/falsy would consult a status the writer never uses.)"""
+    bundle = {
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma",
+                      "status": "live",
+                      "props": {"status": "superseded"}},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    assert _count(sdk, "MATCH (n:Subject {name:'Gamma', status:'live'}) "
+                       "RETURN count(n)") == 1
+
+
 def test_direct_route_live_entity_not_over_rejected(sdk):
     """#7925 (the guard's OTHER edge): a declared terminal status on an entity
     item whose name is ALREADY held by a LIVE node must NOT reject the bundle.

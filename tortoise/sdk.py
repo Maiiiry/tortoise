@@ -3541,6 +3541,47 @@ def _item_dedup_key(item: dict) -> str | None:
     return val if isinstance(val, str) and val.strip() else None
 
 
+def _item_effective_status(item: dict) -> str | None:
+    """The effective ``status`` of an ingest bundle item — the SAME value
+    ``create_point``/``create_entity`` see after ``_coerce_props`` flattens the
+    item (#7925 review P1).
+
+    ``_coerce_props`` gives explicit top-level kwargs precedence over nested
+    ``props`` on collision, by PRESENCE rather than truthiness: a top-level
+    ``status: None`` SHADOWS ``props["status"]``. Mirrors ``_item_dedup_key``
+    (#6110/#8400) and ``_check_gated_status`` (#1088) so a Phase-1 reader
+    cannot consult a status the writer never uses. The entity terminal guard
+    read the top level ALONE, so a bundle-local
+    ``{"type":"subject", "props":{"status":"superseded"}}`` was born
+    terminal while Phase 1 saw no declaration and let it through — the writer
+    then raised mid-write after earlier bundle items had committed (measured;
+    the #2422/#7925 partial-mutation class).
+    """
+    if "status" in item:
+        return item.get("status")
+    nested = item.get("props")
+    if isinstance(nested, dict):
+        return nested.get("status")
+    return None
+
+
+def _item_declares_outdated(item: dict) -> bool:
+    """True when an ingest bundle item carries the server-managed legacy
+    ``outdated`` flag — top-level OR nested under ``props``, the two spellings
+    ``_coerce_props`` flattens (#7925 review P1).
+
+    ``_sanitize_props`` refuses the flag on PRESENCE (not truthiness) for every
+    Point/entity writer, so a bundle item carrying it is a Phase-2 raise after
+    earlier items committed. Reading BOTH spellings here keeps that
+    partial-mutation surface Phase-1-closed; reading only the top level left
+    the measured nested form to reach the writer.
+    """
+    if "outdated" in item:
+        return True
+    nested = item.get("props")
+    return isinstance(nested, dict) and "outdated" in nested
+
+
 # ── ULID validation (Issue #52) ──
 # Canonical format (from tortoise/ids.py): <timestamp-hex>-<uuid12>
 _ULID_RE = re.compile(r"^[0-9a-f]+-[0-9a-f]{12}$")
@@ -14255,7 +14296,14 @@ class TortoiseSDK:
                     if elabel in ("Subject", "Object") \
                             and isinstance(name, str) and name:
                         exists, hit = self._entity_name_holders(elabel, name)
-                        declared = item.get("status")
+                        # #7925 review P1: resolve the status the WRITER will,
+                        # not a single key. `_coerce_props` flattens a nested
+                        # `props={...}` and top-level presence wins, so
+                        # `item.get("status")` alone missed
+                        # `props: {"status": "superseded"}` — a born-terminal
+                        # :Subject then raised mid-write after earlier bundle
+                        # items committed (measured).
+                        declared = _item_effective_status(item)
                         if hit is not None:
                             violations.append({
                                 "section": "connections", "index": i,
@@ -14263,6 +14311,23 @@ class TortoiseSDK:
                                            f"bundle-local endpoint {v!r} "
                                            f"resolves to terminal {elabel} "
                                            f"{hit!r} (by name) — new direct "
+                                           f"edges to terminal endpoints are "
+                                           f"rejected (#2422/#7925)",
+                            })
+                        elif _item_declares_outdated(item):
+                            # #7925 review P1: `_sanitize_props` refuses the
+                            # server-managed `outdated` flag on presence, for
+                            # every writer — top-level OR nested. Catch it in
+                            # Phase 1 (zero mutation) instead of letting the
+                            # entity write raise after the point items commit.
+                            violations.append({
+                                "section": "connections", "index": i,
+                                "message": f"ingest: connections[{i}] "
+                                           f"bundle-local endpoint {v!r} "
+                                           f"declares the server-managed "
+                                           f"'outdated' flag — the {elabel} "
+                                           f"write would raise after earlier "
+                                           f"items committed, and new direct "
                                            f"edges to terminal endpoints are "
                                            f"rejected (#2422/#7925)",
                             })
