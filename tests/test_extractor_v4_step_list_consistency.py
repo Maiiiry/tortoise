@@ -104,7 +104,7 @@ NOT promised:
    blocks are the pinned artifacts.
 4. Rule (5) exempts a `DISCARD`↔`E7` coupling whose tokens BOTH sit inside one
    quoted span that is MARKED AS HISTORY (`once said`, `formerly`, `reversed`, …)
-   — the shape §15 uses to record the wording it replaced. A wrong site
+   — the shape the reversal record uses to state the wording it replaced. A wrong site
    asserted inside such a marked quotation is therefore not caught; the pin is
    on live prose, not on history. Every other quoted coupling (a bare quotation
    of `#5198`'s title, for one) still reds. Quotes are paired positionally per
@@ -359,8 +359,9 @@ _COUPLING_WINDOW = 200
 _REVERSAL_PROXIMITY = 24
 
 #: A coupling is exempt ONLY when its own `E7` token is the reversal record —
-#: never because a reversal mark happens to sit within a window around it. §15's
-#: issue-map row is ONE physical line carrying many sentences, so a window- or
+#: never because a reversal mark happens to sit within a window around it. The
+#: reversal record (§7's one-line value-gate statement) is ONE physical line
+#: carrying many sentences, so a window- or
 #: line-scoped exemption let a live re-assertion placed beside the reversal
 #: record inherit its marks and ship green — the fail-open the `#8443` review
 #: reproduced by inserting *"The mechanical `DISCARD` gate runs at `E7`"* right
@@ -439,8 +440,8 @@ def _discard_e7_offenders(text: str) -> list[str]:
 
     The exemption is decided per COUPLING, on that coupling's own `E7` token —
     not on a window around the coupling, and not on the physical line. A live
-    re-assertion inserted next to §15's reversal record, or appended to the
-    one-line row, therefore reds even though the line also carries the
+    re-assertion inserted next to the reversal record, or appended to the
+    one-line statement, therefore reds even though the line also carries the
     reversal record.
     """
     offenders: list[str] = []
@@ -493,8 +494,9 @@ def test_no_passage_sites_the_mechanical_discard_on_e7():
 def test_the_reversal_exemption_does_not_cover_a_second_coupling_on_the_row():
     """Rule (5) must judge the COUPLING's own `E7`, not a span of the line.
 
-    §15's issue-map row is the exact location `#5198` was filed about, and it
-    is one physical line ending in the reversal record. A line-scoped (or
+    The reversal record — §7's one-line value-gate statement, formerly §15's
+    issue-map row — is the exact location `#5198` was filed about, and it is one
+    physical line ending in the reversal clause. A line-scoped (or
     window-scoped) exemption therefore let a live re-assertion share the row
     with the reversal record and ship green. The `#8443` review reproduced four
     placements, and all must red: an assertion APPENDED to the row, one
@@ -507,7 +509,7 @@ def test_the_reversal_exemption_does_not_cover_a_second_coupling_on_the_row():
     """
     rows = [line for line in _document().splitlines() if "The design requires ENFORCEMENT BY DEFAULT" in line]
     assert len(rows) == 1, (
-        "§4's statement of the shipped gate is not uniquely identifiable "
+        "§7's statement of the shipped gate is not uniquely identifiable "
         "(#5198)"
     )
     row = rows[0]
@@ -518,7 +520,7 @@ def test_the_reversal_exemption_does_not_cover_a_second_coupling_on_the_row():
     )
     appended = row + " ⚠️ **The mechanical `DISCARD` gate runs at `E7`.**"
     assert _discard_e7_offenders(appended), (
-        "appending a live re-assertion of the E7 site to §15's one-line row "
+        "appending a live re-assertion of the E7 site to the one-line statement "
         "must red rule (5). A line-scoped exemption cannot tell `the row quotes "
         "the losing site in the reversal record` from `the row also asserts "
         "the losing site` — that is the #8443 review's fail-open (#5198)"

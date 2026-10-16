@@ -37,9 +37,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "EXTRACTOR-V4-ARCHITECTURE.md"
 
-#: The §4 statement of the shipped gate. This fact previously lived in the
+#: The §7 statement of the shipped gate. This fact previously lived in the
 #: §15 issue-map row; §15 was removed as out-of-scope status tracking, so the
-#: statement — and this guard — live in §4 where the step is defined.
+#: statement — and this guard — live in §7.
 ROW_ANCHOR = "The design requires ENFORCEMENT BY DEFAULT"
 
 
