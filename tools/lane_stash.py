@@ -193,7 +193,19 @@ def lane_key(root: Path | None = None) -> str:
     — a shared ref namespace would reintroduce the collision this tool removes.
     """
     root = root or repo_root()
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", root.name).strip("-.")[:60] or "worktree"
+    # The slug must be a VALID git ref component, not merely a filesystem-safe
+    # name: git refuses `..` inside a component and a trailing `.lock`
+    # (case-insensitive), and a component may not begin or end with `.`. A
+    # worktree directory such as `a..b` or `lane.lock` is legal on disk, so an
+    # unsanitized basename makes `_pin`'s `update-ref` fail AFTER `git stash
+    # push` already wrote the entry — leaving the lane's work unpinned in the
+    # shared register, the exact un-attributable state this tool exists to
+    # prevent (#8051 review P2).
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", root.name)[:60]
+    slug = slug.replace("..", "-")
+    while slug.lower().endswith(".lock"):
+        slug = slug[: -len(".lock")]
+    slug = slug.strip("-.") or "worktree"
     digest = hashlib.sha1(str(root.resolve()).encode()).hexdigest()[:8]
     return f"{slug}-{digest}"
 
@@ -278,6 +290,27 @@ def _pin(key: str, sha: str) -> dict:
     raise LaneStashError(f"could not allocate a lane ref under {ref_ns(key)}")
 
 
+def _pin_or_report(key: str, sha: str) -> dict:
+    """Pin `sha` to this lane; on failure say the entry EXISTS and how to recover.
+
+    `_pin` runs AFTER the stash commit is already in the shared register
+    (`git stash push` for `push`, `git stash store` for `recover`). Reporting a
+    bare allocation failure would read as "the stash was never created" while
+    the lane's work sits unpinned and a bare `git stash pop` can take it — so
+    the error must name the sha and the recovery recipe (#8051 review P2).
+    """
+    try:
+        return _pin(key, sha)
+    except LaneStashError as exc:
+        sys.stderr.write(
+            f"warning: the stash entry already EXISTS in the shared register as {sha}, "
+            f"but it could not be pinned under {ref_ns(key)} ({exc}). A bare "
+            "`git stash pop` can take it. Pin it to this lane with:\n"
+            f"  python tools/lane_stash.py recover {sha}\n"
+        )
+        raise
+
+
 def _own_sha_by_nonce(nonce: str) -> str | None:
     """Our own stash commit, found by the unique nonce in its message.
 
@@ -311,11 +344,31 @@ def _subject_branch(subject: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _stash_head() -> str | None:
+    """The sha `refs/stash` resolves to, or None when the ref does not exist.
+
+    `git stash list` reads the REFLOG; `refs/stash` can still resolve after the
+    reflog is expired or unreadable while `stash list` returns rc 0 with no
+    rows. `check` must cross-check the two, because "no rows" is NOT the same
+    state as "no entry" (#8051 review P1).
+    """
+    cp = _git("rev-parse", "--verify", "-q", "refs/stash", check=False)
+    return cp.stdout.strip() or None
+
+
 def _shared_register() -> list[dict]:
-    """The shared, repo-global register: position, sha, subject, branch, pinned."""
+    """The shared, repo-global register: position, sha, subject, branch, pinned.
+
+    A non-zero rc is a STATE error, not an empty register: collapsing "cannot
+    read" into "nothing there" is the fail-open path that reports SAFE while a
+    bare `git stash pop` would still take a peer's entry (#8051 review P1).
+    """
     cp = _git("stash", "list", "--format=%gd%x00%H%x00%gs", check=False)
     if cp.returncode != 0:
-        return []
+        raise LaneStashError(
+            "could not read the shared stash register (`git stash list` failed): "
+            f"{(cp.stderr or cp.stdout).strip() or 'no output'}"
+        )
     pinned = _pinned_shas()
     rows = []
     for line in cp.stdout.splitlines():
@@ -378,7 +431,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "in the shared reflog; run `git stash list` before trusting it"
         )
 
-    entry = _pin(key, sha)
+    entry = _pin_or_report(key, sha)
     print(f"pinned lane entry {entry['id']} [{entry['ref']}]")
     print(f"  sha     {sha}")
     print(f"  subject {_out('log', '-1', '--format=%s', sha)}")
@@ -496,6 +549,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     branch = current_branch()
     rows = _shared_register()
     entries = _parse_entries(key)
+    head = _stash_head()
 
     verdict = {
         "lane": key,
@@ -509,6 +563,18 @@ def cmd_check(args: argparse.Namespace) -> int:
         "safe": True,
         "reasons": [],
     }
+
+    # `git stash list` reads the reflog; `refs/stash` can still resolve when the
+    # reflog is expired/unreadable with no rows printed. An empty `rows` is then
+    # NOT "nothing to take": a bare `git stash pop` would apply and drop that
+    # entry. Fail closed rather than answer from the absence of data (#8051 P1).
+    if head is not None and (not rows or rows[0]["sha"] != head):
+        verdict["safe"] = False
+        verdict["reasons"].append(
+            f"refs/stash resolves to {head[:12]} but the shared reflog does not "
+            "enumerate it — the register cannot be read, so a bare `git stash pop` "
+            "here cannot be shown to be safe (it would apply and drop that entry)"
+        )
 
     if rows:
         top = rows[0]
@@ -581,7 +647,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         sys.stderr.write(cp.stderr)
         raise GitFailed(cp.returncode, "git stash store failed")
     key = lane_key()
-    entry = _pin(key, args.sha)
+    entry = _pin_or_report(key, args.sha)
     print(f"restored {args.sha} to the shared register (subject: {subject!r})")
     print(f"pinned lane entry {entry['id']} [{entry['ref']}] for lane {key}")
     return 0

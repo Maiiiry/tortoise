@@ -33,6 +33,16 @@ TOOL = ROOT / "tools" / "lane_stash.py"
 PYTHON = sys.executable
 
 
+def _load_tool():
+    """Import `tools/lane_stash.py` in-process (for the paths no subprocess can force)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("lane_stash_under_test", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _env() -> dict[str, str]:
     """A hermetic git environment.
 
@@ -413,3 +423,114 @@ def test_pop_never_modifies_the_shared_register(repo):
         "can drop a bare-git peer's unpinned entry"
     )
     assert repo.lane_refs() == {}, "the lane's own pin is released"
+
+
+# ── fail-closed detection when the register cannot be read (#8051 review P1) ──
+
+def test_check_fails_closed_when_refs_stash_is_not_in_the_reflog(repo):
+    """`refs/stash` resolving but `git stash list` empty is UNSAFE, not SAFE.
+
+    Reflog expiry is ordinary git maintenance. It can remove every reflog entry
+    while `refs/stash` still points at a real (here: FOREIGN) stash, and then a
+    bare `git stash pop` applies AND drops that entry. The detector must not
+    answer "safe" from the absence of rows (#8051 review P1).
+    """
+    # lane B's entry becomes the shared register's top entry
+    repo.dirty(repo.b, "f.txt", "base\nb-from-B\n")
+    (repo.b / "uB.txt").write_text("B untracked\n")
+    assert repo.lane(repo.b, "push", "-u", "-m", "lane B work").returncode == 0
+    sha_b = repo.stash_sha()
+    assert sha_b
+
+    # routine maintenance: the reflog is gone, but the ref (and B's entry) live
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.stash_shas() == [], "precondition: the reflog must be empty after expiry"
+    assert repo.stash_sha() == sha_b, "precondition: refs/stash must still resolve"
+
+    # from lane A the detector must NOT clear a bare `git stash pop`
+    check = repo.lane(repo.a, "check")
+    assert check.returncode != 0, _fail(check)
+    assert "SAFE" not in check.stdout, check.stdout
+
+    # and the hazard the detector just refused to clear is real: bare pop takes B
+    bare = repo.git("stash", "pop", cwd=repo.a, check=False)
+    assert bare.returncode == 0, _fail(bare)
+    assert (repo.a / "uB.txt").exists(), (
+        "the state must actually be unsafe for the fail-closed assertion to mean anything"
+    )
+    assert repo.stash_sha() is None, "the bare pop dropped B's entry (the incident)"
+
+
+def test_check_read_failure_is_a_state_error(repo, monkeypatch):
+    """An unreadable `git stash list` exits non-zero, never `SAFE` (exit 0)."""
+    mod = _load_tool()
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+
+    def fake_git(*args, check=True):
+        if args[:2] == ("stash", "list"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 1, "", "fatal: cannot read refs/stash"
+            )
+        return real_git(*args, check=check)
+
+    monkeypatch.setattr(mod, "_git", fake_git)
+    rc = mod.main(["check", "--json"])
+    assert rc == 2, f"an unreadable register is a state error (exit 2), got {rc}"
+
+
+# ── a valid lane ref for a git-hostile worktree name (#8051 review P2) ──
+
+def test_lane_key_is_a_valid_git_ref_for_hostile_directory_names(tmp_path):
+    """`lane_key` must emit a git-VALID ref component, not merely a safe filename.
+
+    `..`, a leading/trailing `.`, and a trailing `.lock` are all legal in a
+    directory basename and all rejected by `git check-ref-format`. Left in the
+    slug they make `_pin` fail after the stash already exists (#8051 review P2).
+    """
+    mod = _load_tool()
+    for name in ("a..b", "lane.lock", "x.lock.lock", ".hidden", "trailing.", "weird@{}name"):
+        d = tmp_path / name
+        d.mkdir()
+        key = mod.lane_key(d)
+        ref = f"{mod.REFS_NS}/{key}/stash/1"
+        cp = subprocess.run(["git", "check-ref-format", ref], capture_output=True, text=True)
+        assert cp.returncode == 0, f"{name!r} -> {ref!r} is not a valid ref: {cp.stderr}"
+
+
+def test_push_pins_in_a_hostile_named_worktree(repo, tmp_path):
+    """End to end: a `a..b.lock` worktree can push and its pin is a valid ref."""
+    hostile = tmp_path / "a..b.lock"
+    repo.git("worktree", "add", "-q", "-b", "feat/hostile", str(hostile))
+    repo.dirty(hostile, "f.txt", "base\nhostile-work\n")
+    cp = repo.lane(hostile, "push", "-m", "hostile lane")
+    assert cp.returncode == 0, _fail(cp)
+    refs = repo.lane_refs()
+    assert len(refs) == 1, refs
+    ref = next(iter(refs))
+    assert subprocess.run(["git", "check-ref-format", ref]).returncode == 0, ref
+    # the pin is real: the lane can restore its own work
+    assert repo.lane(hostile, "pop").returncode == 0
+    assert "hostile-work" in (hostile / "f.txt").read_text()
+
+
+def test_push_reports_the_orphan_when_pinning_fails(repo, monkeypatch, capsys):
+    """A `_pin` failure must say the stash EXISTS and how to recover it.
+
+    The stash commit is already in the shared register by the time `_pin` runs;
+    an error that reads like "nothing was created" hides an unpinned entry a
+    bare `git stash pop` can take (#8051 review P2).
+    """
+    mod = _load_tool()
+    monkeypatch.chdir(repo.a)
+    repo.dirty(repo.a, "f.txt", "base\norphan-me\n")
+
+    def boom(key, sha):
+        raise mod.LaneStashError("could not allocate a lane ref under refs/lane/x")
+
+    monkeypatch.setattr(mod, "_pin", boom)
+    rc = mod.main(["push", "-m", "W"])
+    assert rc == 2, rc
+    err = capsys.readouterr().err
+    assert "EXISTS" in err and "recover" in err, err
+    assert repo.stash_sha() is not None, "the entry must actually be in the register"
