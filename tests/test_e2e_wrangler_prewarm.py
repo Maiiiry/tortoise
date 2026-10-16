@@ -23,8 +23,10 @@ to resolve the range. The two versions must agree.
 WHAT THIS PINS (a gate is worth what its wiring is worth — the #4311 convention)
   * every `Pre-warm wrangler toolchain` step pins an EXACT version
     (`wrangler@X.Y.Z`), never a floating `wrangler@4`;
-  * the pinned version matches the version the SAME job's boot step starts, so
-    the warm-up warms the tarball that runs;
+  * the pinned version matches the version EVERY boot step of the SAME job
+    starts, so the warm-up warms the tarball that runs (`legal-e2e` and
+    `dashboard-e2e` each start TWO previews — a union lets a still-pinned
+    sibling mask a drifted one);
   * the step is bounded-retry-protected (`for attempt in 1 2 3`);
   * the three e2e jobs that serve `website/` still HAVE the step — deleting it
     would silently push the cold fetch back onto the boot budget that #2178
@@ -46,10 +48,16 @@ CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 PREWARM_STEP = "Pre-warm wrangler toolchain"
 
-#: Captures the WHOLE version token after `wrangler@` (`4`, `4.127`, `4.127.0`).
+#: Captures a NUMERIC version token after `wrangler@` (`4`, `4.127`, `4.127.0`).
 #: A token is classified by its dot count, never by a lookahead that backtracks
 #: mid-token — a lookahead happily matched `4.12` inside `4.127.0`.
 WRANGLER_REF = re.compile(r"wrangler@(\d+(?:\.\d+)*)")
+
+#: Captures ANY `wrangler@<token>` specifier, numeric or not. The numeric-only
+#: ref above cannot see a dist-tag (`wrangler@latest`/`@next`), so such a step
+#: contributed NOTHING to the float/parity checks and was invisible to them.
+#: This one makes the non-numeric specifier an OFFENDER instead of a non-match.
+WRANGLER_SPEC = re.compile(r"wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
 def _exact_wranglers(run: str) -> set[str]:
@@ -58,8 +66,8 @@ def _exact_wranglers(run: str) -> set[str]:
 
 
 def _floating_wranglers(run: str) -> set[str]:
-    """A range (`4`, `4.127`) — never acceptable in these e2e steps."""
-    return {v for v in WRANGLER_REF.findall(run) if v.count(".") != 2}
+    """A range (`4`, `4.127`) or dist-tag (`latest`) — never acceptable here."""
+    return {v for v in WRANGLER_SPEC.findall(run) if v.count(".") != 2}
 
 #: The e2e jobs that serve this repo's `website/` (marketing + dashboard) and so
 #: share the pre-warm. A rename shows up here as a failure, not as silent loss.
@@ -108,20 +116,28 @@ def _boot_steps_of(jobs: dict, job: str) -> list[dict]:
 
 
 def _parity_mismatches(jobs: dict) -> dict[str, tuple[set[str], set[str]]]:
-    """job → (pre-warm versions, boot-step versions) wherever the two DISAGREE.
+    """job → (pre-warm versions, offending boot-step versions) on any DISAGREE.
 
-    Scoped to the BOOT step(s) deliberately — see `BOOT_STEP_PREFIX`. An empty
-    boot set (no `Start wrangler …` step pins an exact version) is itself a
-    mismatch: the pre-warm pins something, and there is nothing that boots it.
+    Scoped to the BOOT step(s) deliberately — see `BOOT_STEP_PREFIX`. EVERY
+    boot step must pin exactly what the pre-warm pins: a UNION over the job's
+    boot steps lets a still-pinned sibling supply the pre-warm's version and
+    mask a drifted one, and a step that pins nothing (bare `wrangler`, a
+    dist-tag) contributes the empty set to that union. An empty boot set is
+    itself a mismatch: the pre-warm pins something and nothing boots it.
     """
     out: dict[str, tuple[set[str], set[str]]] = {}
     for job, step in _prewarm_steps_of(jobs):
         warm = _exact_wranglers(step.get("run") or "")
-        boots: set[str] = set()
-        for boot in _boot_steps_of(jobs, job):
-            boots.update(_exact_wranglers(boot.get("run") or ""))
-        if warm != boots:
-            out[job] = (warm, boots)
+        boots = _boot_steps_of(jobs, job)
+        offenders: set[str] = set()
+        mismatch = not boots
+        for boot in boots:
+            got = _exact_wranglers(boot.get("run") or "")
+            if got != warm:
+                mismatch = True
+                offenders.update(got)
+        if mismatch:
+            out[job] = (warm, offenders)
     return out
 
 
@@ -187,6 +203,50 @@ def test_parity_scope_catches_boot_drift_a_job_union_missed() -> None:
     assert "4.127.0" in union, "the pre-fix union scope would NOT have passed this drift"
 
     assert set(_parity_mismatches(jobs)) == {"welcome-e2e"}
+
+
+def test_parity_catches_one_of_two_boot_steps_the_union_missed() -> None:
+    """`legal-e2e` / `dashboard-e2e` each start TWO wrangler previews.
+
+    A union over the job's boot steps lets the still-pinned sibling supply the
+    pre-warm's version and mask the drifted one — the same masking hole the
+    `welcome-e2e` pin closed, one level down. Reproduced on `dashboard-e2e`'s
+    second preview step: mutate it to a dist-tag (or drop the pin entirely),
+    and the pre-fix union still equals the pre-warm; the per-step scope does
+    not.
+    """
+    for drifted in ("wrangler@latest", "wrangler"):
+        jobs = _jobs()
+        steps = jobs["dashboard-e2e"]["steps"]
+        boots = [s for s in steps
+                 if str(s.get("name") or "").startswith(BOOT_STEP_PREFIX)]
+        assert len(boots) == 2, (
+            "ci.yml fixture drifted — dashboard-e2e must start two wrangler previews")
+        target = boots[-1]
+        assert _exact_wranglers(target["run"]) == {"4.127.0"}, (
+            "ci.yml fixture drifted — update this pin to whatever the boot step now starts")
+        target["run"] = target["run"].replace("wrangler@4.127.0", drifted)
+
+        # The pre-fix comparison: UNION every boot step of the job. The untouched
+        # sibling still supplies `4.127.0`, so the drifted step vanished.
+        union: set[str] = set()
+        for boot in boots:
+            union.update(_exact_wranglers(boot.get("run") or ""))
+        assert union == {"4.127.0"}, (
+            f"the pre-fix union scope would NOT have caught `{drifted}` drift")
+
+        assert set(_parity_mismatches(jobs)) == {"dashboard-e2e"}, drifted
+
+
+def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None:
+    """`wrangler@latest` is floating too, but the numeric-only token regex could
+    not see it at all — so `test_no_e2e_boot_step_floats…` passed on a dist-tag.
+    """
+    assert _floating_wranglers("npx --yes wrangler@latest pages dev") == {"latest"}
+    assert _floating_wranglers("npx --yes wrangler@next --version") == {"next"}
+    assert _floating_wranglers("npx --yes wrangler@4 --version") == {"4"}
+    assert _floating_wranglers("npx --yes wrangler@4.127 --version") == {"4.127"}
+    assert _floating_wranglers("npx --yes wrangler@4.127.0 --version") == set()
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:
