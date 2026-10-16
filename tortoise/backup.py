@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,20 +139,24 @@ def _destination_rollback(events_path: str, db_path: str | None, *,
     ``NonEmptyDestinationError``), so the fold only ever lands on a fresh
     store. The adjacent `_recover_or_raise` leg of the issue is #7929.
 
-    CONCURRENCY (stated, not fixed): the aside-then-restore protocol assumes
-    exclusive ownership of the destination, and `restore` takes no lock of its
-    own. There is no store-wide WRITER lock to lean on: the flock taken when a
-    projection is constructed is the per-RDB CONSTRUCTION lock
-    (tortoise/embedded_lifecycle.py), held only for the constructor and released
-    when it returns, and the only lifetime lock is the SHARED owner/reaper lock
-    — two restores can hold it together. Two restores into the SAME destination
-    can therefore interleave across the WHOLE restore (staging, copy, replay,
-    and the success-path aside-drop), not merely the staging renames; one
-    rollback can then discard another's committed result. That is outside the
-    supported posture rather than a new contract: an embedded store is a
-    single-writer store (docs/durability-posture.md), so callers must not run
-    two restores against one destination concurrently. Closing it needs a
-    destination-wide lock, tracked by #7935 — deliberately NOT widened here.
+    CONCURRENCY: this protocol assumes exclusive ownership of the destination,
+    and since #7935 it IS owned rather than assumed — the only caller is
+    `_destination_exclusive`, which holds the destination STORE's lock for the
+    whole span below (the staging renames, the copy, the replay, and this
+    function's own success-path aside-drop). Two restores into one destination
+    therefore serialise instead of interleaving: a peer that staged the
+    destination aside while another was in flight used to be able to have its
+    committed result `_discard`ed by that peer's rollback (#7935 — no wider lock
+    existed to lean on: the per-RDB construction flock is released when the
+    constructor returns, and the lifetime owner/reaper lock is SHARED, so two
+    restores hold it together).
+
+    What the lock does NOT cover, stated because an embedded store is a
+    single-writer store (docs/durability-posture.md): a process that already
+    holds the store OPEN — its construction finished, so its lock is released —
+    can still write while a restore runs. The lock excludes peer restores and
+    peer CONSTRUCTIONS of that store; it cannot exclude a live writer that took
+    the store before the restore began.
     """
     token = uuid.uuid4().hex[:12]
     staged: list[tuple[Path, Path]] = []
@@ -231,6 +236,91 @@ def _destination_rollback(events_path: str, db_path: str | None, *,
             _discard(side)
 
 
+def _destination_lock_key(db_path: str | None) -> str | None:
+    """#7935 — the store lock key this destination names, or None when none does.
+
+    Delegated to ``embedded_lifecycle._construction_key`` rather than re-derived
+    here on purpose: the whole point is that a restore shares the ONE key the
+    store's own constructions serialise on, so a second derivation would be a
+    second chance to disagree (#4921's ``_requested_db_filename`` docstring makes
+    the same argument for the two callers it already has). That is also what
+    canonicalises through ``realpath`` — two spellings of one store take one lock
+    — and what resolves the ``:memory:`` sentinel to its relocated sidecar.
+
+    None for a connection URI: ``docker://`` names a SERVER store, not a
+    ``<dbdir>/<dbfilename>`` there is a local lock file for. Stated residual: a
+    URI destination is not serialised by this lock (see
+    `_destination_exclusive`).
+    """
+    if db_path is None or is_db_uri(str(db_path)):
+        return None
+    from tortoise.embedded_lifecycle import _construction_key
+    return _construction_key((str(db_path),), {})
+
+
+@contextmanager
+def _destination_lock(db_path: str | None):
+    """#7935 — hold the destination STORE's exclusive lock for the block.
+
+    The lock is the store's construction lock (``tortoise/embedded_lifecycle.py``):
+    an exclusive ``flock`` on ``<realpath(db)>.tortoise-construct.lock``, the one
+    every ``RedisMixin.__init__`` for that store takes and releases when the
+    constructor returns. Reusing it — rather than a private sidecar — is what
+    makes a restore exclude a peer restore AND a peer construction of the same
+    store, which is the "exclusive ownership of the destination"
+    ``_destination_rollback`` documents, and it cannot litter a second lock file
+    beside the store.
+
+    Reentrant by construction: the restore's own projections are constructed
+    inside this block on the same key, and ``_construction_lock`` is
+    depth-counted per (thread, key), so the nested constructors re-enter instead
+    of self-deadlocking. A lock that cannot be taken at all (a vanished db dir, a
+    planted non-regular file) is reported by ``_open_construct_lock`` and leaves
+    the in-process ``RLock`` in place, exactly as for a construction.
+    """
+    key = _destination_lock_key(db_path)
+    if key is None:
+        yield
+        return
+    from tortoise.embedded_lifecycle import _construction_lock
+    with _construction_lock(key):
+        yield
+
+
+@contextmanager
+def _destination_exclusive(events_path: str, db_path: str | None, *,
+                           replace_db: bool,
+                           pre_flight: Callable[[], None] | None = None):
+    """#7935 — own the destination for the WHOLE restore, then run the asides.
+
+    ``restore`` mutates the destination across its whole span: the #7928
+    non-empty pre-flight read, the staging renames, the journal/snapshot copy,
+    the replay, and the success-path aside-drop. Two restores that interleave
+    anywhere in that span can destroy each other's result — a peer that finds the
+    destination absent (its sibling has it staged aside) records it as
+    ``created``, and the sibling's rollback then ``_discard``s whatever is at
+    that path, including a result committed there in between (#7935).
+
+    So the span is entered under the destination store's lock
+    (`_destination_lock`), and ``pre_flight`` — the #7928 non-empty probe — runs
+    INSIDE that lock and BEFORE any staging. The ordering is load-bearing twice
+    over: the verdict must precede the destructive half (#3316/#7928), and it
+    must be taken under the SAME lock as the fold below, or a peer's committed
+    restore could land between the read and the fold and a snapshot-less restore
+    would fold onto a populated graph without ever taking the refusal.
+
+    Not covered (see `_destination_lock`): a live writer that already holds the
+    store open, and a URI destination, which names a server store with no local
+    lock file — the embedded store remains single-writer
+    (docs/durability-posture.md).
+    """
+    with _destination_lock(db_path):
+        if pre_flight is not None:
+            pre_flight()
+        with _destination_rollback(events_path, db_path, replace_db=replace_db):
+            yield
+
+
 def backup(db_path: str, events_path: str = "events.jsonl",
            target_dir: str | None = None) -> Path:
     """Copy database + event log to a timestamped backup directory.
@@ -306,6 +396,16 @@ def restore(backup_dir: str, db_path: str,
     changes"). The snapshot path is
     exempt: the snapshot is copied OVER the destination, so the replay starts
     from the backup's own DB.
+
+    #7935: the destination is owned for the WHOLE restore — the lock is the
+    destination store's own construction ``flock``, held across the #7928
+    pre-flight, the staging renames, the copy, the replay, and the success-path
+    aside-drop (see `_destination_exclusive`). Two restores into one destination
+    therefore serialise instead of destroying each other's committed result. A
+    process that already holds the store OPEN is not excluded (its construction
+    finished and released that lock): the embedded store stays single-writer
+    (docs/durability-posture.md), and so does a URI destination, which names a
+    server store with no local lock file.
     """
     source = Path(backup_dir)
     if not source.exists():
@@ -388,9 +488,18 @@ def restore(backup_dir: str, db_path: str,
     # the snapshot is copied OVER the destination, so no fold into the
     # caller's graph happens. The probe is the same RDB read the snapshot path
     # uses; a store that cannot be opened raises here, before the fold starts.
-    if (into_falkor and not db_file.exists()
-            and db_path is not None and str(db_path) != ":memory:"
-            and not is_db_uri(str(db_path))):
+    #
+    # #7935: the verdict is taken by `_destination_exclusive`'s `pre_flight` —
+    # INSIDE the destination lock and BEFORE any staging — not in line below.
+    # Taken outside the lock, a peer's committed restore could land between the
+    # read and the fold, and a snapshot-less restore would then fold onto a
+    # populated graph without ever taking the refusal (#7928's hazard, one
+    # interleaving later).
+    def _refuse_non_empty_destination() -> None:
+        if not (into_falkor and not db_file.exists()
+                and db_path is not None and str(db_path) != ":memory:"
+                and not is_db_uri(str(db_path))):
+            return
         _dest_path = Path(db_path)
         # #7928 review (P1): probe on the RDB alone and an AOF-only destination
         # reads as EMPTY. Under `TORTOISE_EMBEDDED_AOF=1` (the #915 durability
@@ -420,9 +529,13 @@ def restore(backup_dir: str, db_path: str,
     # the replay that can REFUSE runs LAST, so a refusal used to land on a
     # store that had already been destroyed, with no rollback. Each
     # destination is renamed aside first and put back verbatim if anything
-    # below raises; see `_destination_rollback`.
-    with _destination_rollback(
-            events_path, db_path, replace_db=db_file.exists()):
+    # below raises; see `_destination_rollback`. #7935: the whole span below is
+    # entered under the destination store's lock, so a peer restore cannot
+    # commit inside it and have its result discarded by this one's rollback;
+    # see `_destination_exclusive`.
+    with _destination_exclusive(
+            events_path, db_path, replace_db=db_file.exists(),
+            pre_flight=_refuse_non_empty_destination):
         # Copy files to target
         shutil.copy2(events_file, events_path)
         if db_file.exists():
