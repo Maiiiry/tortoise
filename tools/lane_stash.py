@@ -401,6 +401,19 @@ def _shared_register() -> list[dict]:
     return rows
 
 
+def _drop_refs_stash(sha: str) -> bool:
+    """CAS-drop ``refs/stash`` when it still points at ``sha``.
+
+    Mirrors ``git stash drop`` of the LAST entry: ``git reflog delete
+    --updateref`` empties the reflog but does NOT drop the ref when it empties
+    (measured), so without this the "removed" entry is still live for bare git
+    and ``check`` fails closed in every worktree (#8051 review P2). The expected
+    sha guards the delete, so a peer push between the read and the delete leaves
+    the ref alone rather than dropping an entry this process never saw.
+    """
+    return _git("update-ref", "-d", "refs/stash", sha, check=False).returncode == 0
+
+
 def _pinned_shas() -> set[str]:
     cp = _git(
         "for-each-ref", "--format=%(objectname)", f"{REFS_NS}/*/stash/*", check=False,
@@ -599,31 +612,51 @@ def cmd_check(args: argparse.Namespace) -> int:
         # `recover` re-pins a peer's dropped entry to THIS lane, and a bare pop
         # here then takes this lane's own (recovered) work.
         if not any(e["sha"] == top["sha"] for e in entries):
-            if top_lane is not None and top_lane != key:
-                # The branch heuristic cannot see this: `lane_key` is
-                # worktree-scoped, and two worktrees can be forced onto one
-                # branch, so a matching branch is NOT evidence of ownership.
-                verdict["safe"] = False
-                verdict["reasons"].append(
-                    f"the top shared entry ({top['sha'][:12]}) was pushed by lane "
-                    f"{top_lane!r} (branch {top['branch']!r}), not this lane {key!r} — "
-                    "two worktrees can be forced onto ONE branch, so a matching branch "
-                    "does not make a bare `git stash pop` HERE safe: it would apply and "
-                    "drop that lane's entry"
-                )
-            elif top_lane is None and not top["branch"]:
+            if top_lane is not None:
+                if top_lane != key:
+                    # The branch heuristic cannot see this: `lane_key` is
+                    # worktree-scoped, and two worktrees can be forced onto one
+                    # branch, so a matching branch is NOT evidence of ownership.
+                    verdict["safe"] = False
+                    verdict["reasons"].append(
+                        f"the top shared entry ({top['sha'][:12]}) was pushed by lane "
+                        f"{top_lane!r} (branch {top['branch']!r}), not this lane {key!r} — "
+                        "two worktrees can be forced onto ONE branch, so a matching branch "
+                        "does not make a bare `git stash pop` HERE safe: it would apply and "
+                        "drop that lane's entry"
+                    )
+                # else: the marker names THIS lane. That is ownership evidence
+                # even when the pin is gone — `pop` deliberately leaves the
+                # shared entry in place after releasing the lane ref, so a bare
+                # pop here would take this lane's own (already-restored) work.
+            elif not top["branch"]:
                 verdict["safe"] = False
                 verdict["reasons"].append(
                     f"the top shared entry ({top['sha'][:12]}) has an unreadable subject "
                     f"({top['subject']!r}) — its origin cannot be established, so a bare "
                     "`git stash pop` cannot be shown to be safe"
                 )
-            elif top_lane is None and top["branch"] != branch:
+            elif top["branch"] != branch:
                 verdict["safe"] = False
                 verdict["reasons"].append(
                     f"the top shared entry ({top['sha'][:12]}) was pushed on branch "
                     f"{top['branch']!r}, not the current branch {branch!r} — a bare "
                     "`git stash pop` HERE would apply and drop another lane's work"
+                )
+            else:
+                # Marker-less entry whose subject names THIS branch. A branch
+                # name identifies a branch, never a lane: two worktrees can be
+                # forced onto one branch, and the register predates this tool,
+                # so its bare-git entries are marker-less by construction. The
+                # old branch-only fallthrough returned SAFE here — the common
+                # case, not an edge (#8051 review P2).
+                verdict["safe"] = False
+                verdict["reasons"].append(
+                    f"the top shared entry ({top['sha'][:12]}) carries no lane marker and "
+                    f"is pinned by no lane ref, and its subject names the current branch "
+                    f"{branch!r} — a branch name identifies a BRANCH, never a lane (two "
+                    "worktrees can be forced onto ONE branch), so a bare `git stash pop` "
+                    "here cannot be shown to take this lane's own entry"
                 )
 
     if args.json:
@@ -689,16 +722,27 @@ def cmd_recover(args: argparse.Namespace) -> int:
 def cmd_prune(args: argparse.Namespace) -> int:
     """Reclaim shared-register entries that a lane ref pins (so deletion is lossless)."""
     rows = _shared_register()
+    head = _stash_head()
     doomed = [r for r in rows if r["pinned"]]
     kept = [r for r in rows if not r["pinned"]]
+    # The state an emptied reflog leaves behind: `refs/stash` resolves while the
+    # register enumerates nothing. Routine maintenance creates it, and a pre-fix
+    # prune created it on its own, after which `check` failed closed everywhere
+    # with no lane_stash command able to clear it (#8051 review P2).
+    orphan = head is not None and not rows
     print(f"shared register: {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}; "
           f"{len(doomed)} pinned by a lane ref (removable), {len(kept)} unpinned (refused)")
     for r in doomed:
         print(f"  remove {r['pos']} {r['sha'][:12]}  {r['subject']}")
     for r in kept:
         print(f"  keep   {r['pos']} {r['sha'][:12]}  {r['subject']}  (no lane ref pins it)")
+    if orphan:
+        print(f"  orphan refs/stash: {head[:12]} resolves while the register enumerates "
+              "nothing — an emptied reflog (bare git can still `git stash pop` it)")
     if not doomed:
-        return 0
+        if not orphan:
+            return 0
+        return _reclaim_orphan_refs_stash(head, apply=args.apply)
     if not args.apply:
         print("dry run — re-run with --apply to remove the pinned entries")
         return 0
@@ -724,6 +768,31 @@ def cmd_prune(args: argparse.Namespace) -> int:
         removed += 1
     print(f"removed {removed} pinned shared-register entr"
           f"{'y' if removed == 1 else 'ies'}; {len(kept)} unpinned left untouched")
+    # `reflog delete --updateref` empties the reflog but git does NOT drop the
+    # ref when it empties (measured). If this prune took the LAST entry the ref
+    # still resolves, so the "removed" entry stays live for bare git and `check`
+    # fails closed with no command able to clear it. Mirror `git stash drop`'s
+    # last-entry behaviour (#8051 review P2; the plan's row 8 said otherwise).
+    if not _shared_register():
+        drop_head = _stash_head()
+        if drop_head is not None:
+            _reclaim_orphan_refs_stash(drop_head, apply=True)
+    return 0
+
+
+def _reclaim_orphan_refs_stash(sha: str, *, apply: bool) -> int:
+    """Drop an emptied-register `refs/stash` (the last-entry cleanup)."""
+    if not apply:
+        print(f"dry run — refs/stash resolves to {sha[:12]} while the register enumerates "
+              "nothing; re-run with --apply to drop it (mirrors `git stash drop` of the "
+              "last entry)")
+        return 0
+    if _drop_refs_stash(sha):
+        print(f"dropped refs/stash ({sha[:12]}) — the register is now empty, as `git stash "
+              "drop` of the last entry leaves it")
+        return 0
+    print(f"warning: the register is empty but refs/stash is no longer {sha[:12]} — a peer "
+          "moved it during the prune; left in place")
     return 0
 
 

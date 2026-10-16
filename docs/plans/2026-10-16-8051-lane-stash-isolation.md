@@ -57,7 +57,7 @@ working tree.
 | `git stash apply <sha>` with the sha not on top | Restores tracked **and** untracked files from the third parent; leaves the shared register and the peer's entry untouched | The safe retrieval primitive. |
 | `git stash drop <sha>` | `error: '<sha>' is not a stash reference` | There is no hash-addressed drop — the issue's own comment. |
 | `git log --walk-reflogs --format='%H %gs' refs/stash` after a peer pushed on top | Still yields **our** commit, found by the unique message nonce | Deterministic way to capture our own sha even under a concurrent peer push (the push does not print it). |
-| `git reflog delete --updateref 'refs/stash@{i}'` | Removes the entry at position `i`, leaves the rest, drops the ref when it empties | Works, but the specifier is resolved **at delete time** — see the rejected alternative below. |
+| `git reflog delete --updateref 'refs/stash@{i}'` | Removes the entry at position `i` and leaves the rest, but does **not** drop `refs/stash` when the reflog empties (measured — the first draft of this row asserted the opposite): the ref still resolves at the removed sha and a bare `git stash pop` applies **and drops** it | Works, but `prune` must drop `refs/stash` itself when it takes the last entry, and the specifier is resolved **at delete time** — see the rejected alternative below. |
 
 ## Rejected alternatives (and when they would have been better)
 
@@ -113,9 +113,12 @@ One primitive, in `tools/lane_stash.py`:
   and which are unpinned debris.
 - **`check`** — the executable detector: exit 1 when a bare `git stash pop` in this worktree would
   take a **foreign** entry — a peer lane's (identified by the `[<lane-key>]` marker the tool writes
-  into every message, so two worktrees forced onto ONE branch are still distinct) or one whose
-  origin cannot be read (an expired/absent `refs/stash` reflog, an unreadable subject); exit 0 when
-  the top entry is this lane's own or the register is empty. Unpinned debris is reported as an
+  into every message, so two worktrees forced onto ONE branch are still distinct), or any entry whose
+  origin cannot be read: an expired/absent `refs/stash` reflog, an unreadable subject, or a
+  marker-less entry whose subject names the current branch (a branch name identifies a BRANCH, never
+  a lane, and the pre-existing register is marker-less bare-git entries by construction); exit 0 when
+  the top entry is this lane's own (its `[<lane-key>]` marker, or one of this lane's pinned shas) or
+  the register is empty. Unpinned debris is reported as an
   ADVISORY note, not a failure: a bare pop takes only the TOP entry, so failing on entries below it
   would refuse states that are genuinely safe. Safe to call from a pre-flight.
 - **`recover <sha>`** — the repair recipe from the incident: `git stash store -m "<original subject>"
@@ -123,7 +126,9 @@ One primitive, in `tools/lane_stash.py`:
 - **`prune`** — explicit reclamation of the shared register: only entries whose object is
   **pinned by a lane ref** (therefore still reachable and retrievable — deletion cannot lose work) are
   removed, positions are walked high→low, and the sha at each position is re-verified immediately
-  before the delete. Unpinned entries are reported and left alone.
+  before the delete. When it takes the LAST entry it also drops `refs/stash` itself (git does not, and
+  a resolving ref over an empty reflog is both live for bare git and a fail-closed wedge for `check`).
+  Unpinned entries are reported and left alone.
 
 Out of scope (reported, not absorbed): the skills text (`using-git-worktrees`, `commit-workflow`) is
 a symlink to agent-infra and belongs to agent-infra #1264; the `main-worktree-guard` extension
@@ -155,7 +160,7 @@ rule is additive.
 | 3 | Lane-scoped refs `refs/lane/<key>/stash/<n>` | State (git ref store) | In/Out | Integration | CAS create; id = path segment; gc-protected | id collision under concurrent push → retry; ref missing after pop |
 | 4 | `git stash apply <sha>` | External process | In (tree mutation) | Integration | restores tracked+staged+untracked; conflict → `UU` + rc≠0 | apply conflict must NOT delete the lane ref (work preserved); foreign sha must be unreachable by construction |
 | 5 | Per-worktree identity (`--git-dir` vs `--git-common-dir`, worktree path) | Config/State | Read | Unit | lane key from the worktree basename + path hash, branch-independent | two worktrees on one branch → distinct keys; a branch switch inside a lane must NOT orphan its pins; detached HEAD → stable key |
-| 6 | `check` exit contract | CLI contract | Out | Integration | 0 = this lane's own top entry or an empty register, 1 = foreign top (peer lane key, else branch) / unreadable origin / unreadable register | must fail CLOSED: unreadable state ⇒ non-zero, never "safe"; unpinned debris is advisory, not a failure |
+| 6 | `check` exit contract | CLI contract | Out | Integration | 0 = this lane's own top entry (a `[<lane-key>]` marker, or a pinned sha) or an empty register, 1 = foreign top (another lane's marker) / an entry only a branch name could attribute / unreadable origin / unreadable register | must fail CLOSED: unreadable state ⇒ non-zero, never "safe"; unpinned debris is advisory, not a failure |
 
 ### Bug Pattern Flags
 
@@ -163,7 +168,8 @@ rule is additive.
   required verification: a test whose two lanes are two real worktrees and whose pushes are real
   sequential `git stash push` calls, asserting the victim's entry survives and is not applied.
 - **Conditional guards:** `check`'s verdict gates; both sides of every branch get a test (safe top,
-  foreign top, same-branch peer lane, unreadable subject, unreadable register).
+  foreign top, same-branch peer lane, marker-less entry naming this branch, unreadable subject,
+  unreadable register, a `refs/stash` left resolving over an emptied reflog).
 - **Silent function skips:** `push` when there is nothing to stash → asserted, so the tool can never
   report a pinned entry it did not create.
 
@@ -212,8 +218,9 @@ rule is additive.
 
 1. The 2-worktree reproduction applies **0** foreign entries and leaves the peer's entry present in
    `git stash list` with an unchanged sha.
-2. `lane_stash check` exits non-zero and names the foreign lane (or, for a bare-git entry, the
-   foreign branch) when the shared top is not this lane's, and exits 0 when it is.
+2. `lane_stash check` exits non-zero and names the foreign lane when the shared top is a peer's, and
+   for a marker-less bare-git entry whose origin only a branch name could attribute — including a
+   branch name that matches the current one — and exits 0 when the top is provably this lane's own.
 3. `pop` never deletes from the shared register; `prune` refuses to remove an entry that is not pinned.
 4. `AGENTS.md` states the hazard and names the safe alternative (issue Target: 1 guidance line).
 5. `python tools/ci_selection.py --integrity` is clean with the new test registered.
@@ -229,6 +236,10 @@ rule is additive.
 - `git reflog delete --updateref 'refs/stash@{i}'` resolves the position at DELETE time, so a
   check-then-delete cannot be made atomic. That single measurement is what turned "pop should drop
   like git does" into an explicit `OVERRIDES` and a conservative `prune`.
+- The same command empties the reflog WITHOUT dropping `refs/stash` (measured; the first draft of the
+  plan asserted the opposite), so `prune` must drop the ref itself when it takes the last entry —
+  otherwise the reclaimed entry is still live for bare git and `check` fails closed forever on a ref
+  no lane_stash command could clear.
 - A first draft of the fail-closed test asserted that `git stash push -m "<no branch prefix>"`
   produces an unattributable subject — it does not: `push -m` always prefixes `On <branch>:`. Only
   `git stash store -m` produces a bare subject (which is how the real register's `RESCUED by …` notes

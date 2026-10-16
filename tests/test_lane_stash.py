@@ -289,6 +289,34 @@ def test_check_is_safe_for_a_recovered_entry_pinned_to_this_lane(repo):
     assert "SAFE" in check.stdout
 
 
+def test_check_fails_closed_on_a_markerless_entry_naming_this_branch(repo, tmp_path):
+    """A bare-git entry on THIS branch is not evidence of ownership.
+
+    The register predates this tool, so it is full of marker-less bare-git
+    entries whose subjects always name a branch, and two worktrees can be forced
+    onto ONE branch. `On feat/a:` names the BRANCH, never the lane, so the
+    branch-only fallthrough reported SAFE while a bare `git stash pop` took the
+    peer's entry (#8051 review P2). Pre-fix this exits 0.
+    """
+    c = tmp_path / "wtC"
+    repo.git("worktree", "add", "-q", "--force", str(c), "feat/a")
+    # a BARE `git stash push` in the peer worktree: no lane marker, no lane pin
+    repo.dirty(c, "f.txt", "base\nmarkerless-peer\n")
+    repo.git("stash", "push", "-q", "-m", "peer unpinned work", cwd=c)
+    assert repo.stash_shas(), "precondition: the peer's entry is in the register"
+    assert repo.lane_refs() == {}, "precondition: neither lane pinned anything"
+    assert "On feat/a:" in repo.git("stash", "list", "--format=%gs").stdout
+
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 1, _fail(check)
+    assert "SAFE" not in check.stdout, check.stdout
+
+    # and the state the detector refused to clear is genuinely unsafe
+    bare = repo.git("stash", "pop", cwd=repo.a, check=False)
+    assert bare.returncode == 0, _fail(bare)
+    assert "markerless-peer" in (repo.a / "f.txt").read_text()
+
+
 def test_check_json_exposes_the_verdict(repo):
     import json
 
@@ -461,6 +489,61 @@ def test_prune_refuses_unpinned_entries_and_removes_pinned_ones(repo):
     assert refs and pinned_sha in set(refs.values())
     assert repo.lane(repo.b, "pop").returncode == 0
     assert "pinned" in (repo.b / "f.txt").read_text()
+
+
+def test_prune_of_the_last_entry_drops_refs_stash_and_unwedges_check(repo):
+    """Reclaiming the LAST entry must drop `refs/stash`, not only its reflog.
+
+    `git reflog delete --updateref` empties the reflog but git does NOT drop the
+    ref when it empties (measured — the plan's row 8 asserted the opposite), so
+    the "removed" entry stays live for bare git (`git stash pop` applies AND
+    drops it) and `check` fails closed in every worktree with no lane_stash
+    command able to clear it (#8051 review P2). Pre-fix: `refs/stash` still
+    resolves and `check` exits 1.
+    """
+    repo.dirty(repo.a, "f.txt", "base\na\n")
+    assert repo.lane(repo.a, "push", "-m", "A").returncode == 0
+    assert repo.stash_sha()
+
+    cp = repo.lane(repo.a, "prune", "--apply")
+    assert cp.returncode == 0, _fail(cp)
+    assert repo.stash_shas() == [], "the reflog must be empty"
+    assert repo.stash_sha() is None, (
+        "refs/stash must be dropped with the last entry, as `git stash drop` does — "
+        "otherwise the reclaimed entry is still live for bare git"
+    )
+
+    # the detector the guidance tells lanes to trust must no longer be wedged
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 0, _fail(check)
+    assert "SAFE" in check.stdout
+
+    bare = repo.git("stash", "pop", cwd=repo.a, check=False)
+    assert bare.returncode != 0, f"the reclaimed entry is still poppable:\n{_fail(bare)}"
+
+
+def test_prune_clears_an_already_orphaned_refs_stash(repo):
+    """A register emptied by an EARLIER prune can still be cleared by prune.
+
+    `reflog delete --updateref` on the last entry leaves `refs/stash` resolving
+    while the register enumerates nothing; before the fix that state made
+    `check` exit 1 in every worktree and no lane_stash command could clear it
+    (the register read returned 0 rows and prune returned early).
+    """
+    repo.dirty(repo.a, "f.txt", "base\na\n")
+    assert repo.lane(repo.a, "push", "-m", "A").returncode == 0
+    # reproduce the wedge the pre-fix prune left behind
+    repo.git("reflog", "delete", "--updateref", "refs/stash@{0}")
+    assert repo.stash_shas() == [] and repo.stash_sha() is not None
+    assert repo.lane(repo.a, "check").returncode == 1
+
+    assert repo.lane(repo.a, "prune").returncode == 0  # dry run, no-op or reported
+    cp = repo.lane(repo.a, "prune", "--apply")
+    assert cp.returncode == 0, _fail(cp)
+    assert repo.stash_sha() is None, "prune must clear the orphaned refs/stash"
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 0, _fail(check)
+    assert "SAFE" in check.stdout
 
 
 def test_pop_never_modifies_the_shared_register(repo):

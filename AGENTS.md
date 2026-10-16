@@ -510,7 +510,8 @@ for three sends to one pane that were recorded as `OK` and never consumed.
   no conflict, no warning, no different exit status. Use `python tools/lane_stash.py push|pop|list`
   instead — it pins every entry to `refs/lane/<lane-key>/stash/<n>` and restores **by sha**, so a
   peer's entry is unreachable in either direction; `python tools/lane_stash.py check` is the
-  executable detector (exit 1 = a bare `git stash pop` here would take foreign work). If a peer's
+  executable detector (exit 1 = a bare `git stash pop` here would take work that is not provably
+  this lane's — a peer lane's marker, or any entry only a branch name could attribute). If a peer's
   entry was already applied or dropped: `git stash store -m "<original subject>" <sha>` restores it
   (the commit survives in the object DB) — `python tools/lane_stash.py recover <sha>` runs that and
   pins the result. `tests/test_lane_stash.py` carries the 2-worktree reproduction. The lane rule
