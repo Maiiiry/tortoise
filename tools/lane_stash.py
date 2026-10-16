@@ -54,9 +54,13 @@ THE CONTRACT
 * **``pop`` never deletes from the shared register.** The deletion would be
   positional (``refs/stash@{i}``, re-resolved at delete time) and the victim of
   a lost race can be a bare-git lane whose entry is pinned nowhere — i.e.
-  exactly the silent loss this tool exists to stop. The entry stays; reclaim it
-  explicitly with ``prune``, which refuses to remove any entry whose object is
-  not pinned by a lane ref (so a delete can never lose work).
+  exactly the silent loss this tool exists to stop. The entry stays, and a
+  SUCCESSFUL apply is recorded durably at ``refs/lane/<key>/applied/<sha>``
+  before the lane pin is released (the message marker is written by ``push``
+  BEFORE ``_pin`` runs, so the marker alone is never evidence that an entry was
+  applied). Reclaim explicitly with ``prune``, which removes an entry only when
+  a lane ref pins it or this lane's applied-record names it — so a delete can
+  never lose work.
 * **``check`` is fail-closed**: exit 0 when a bare ``git stash pop`` in this
   worktree would take THIS lane's own entry; exit 1 when it would take a FOREIGN
   entry — a peer lane's (identified by the ``[<lane-key>]`` marker this tool
@@ -78,7 +82,7 @@ USAGE
     python tools/lane_stash.py list
     python tools/lane_stash.py pop 1              # apply by sha, keep the shared entry
     python tools/lane_stash.py check              # 0 = a bare pop here is safe
-    python tools/lane_stash.py prune --apply      # reclaim pinned shared-register entries
+    python tools/lane_stash.py prune --apply      # reclaim pinned/applied register entries
     python tools/lane_stash.py recover <sha>      # the #2654 repair recipe
 
 Exit codes: 0 ok (including "nothing to stash", matching ``git stash push``);
@@ -143,9 +147,11 @@ def _env() -> dict[str, str]:
     return env
 
 
-def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _git(
+    *args: str, check: bool = True, stdin: str | None = None,
+) -> subprocess.CompletedProcess:
     cp = subprocess.run(
-        ["git", *args], capture_output=True, text=True, env=_env(),
+        ["git", *args], capture_output=True, text=True, env=_env(), input=stdin,
     )
     if check and cp.returncode != 0:
         raise GitFailed(cp.returncode, (cp.stderr or cp.stdout).strip())
@@ -360,15 +366,6 @@ def _subject_lane_key(subject: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _subject_of(sha: str) -> str:
-    """The stored subject of a stash commit, read from the object.
-
-    Works when the reflog cannot enumerate it (an expired reflog is exactly when
-    `prune` needs to decide an orphan `refs/stash` by its own subject).
-    """
-    return _out("log", "-1", "--format=%s", sha, check=False)
-
-
 def _stash_head() -> str | None:
     """The sha `refs/stash` resolves to, or None when the ref does not exist.
 
@@ -432,6 +429,52 @@ def _pinned_shas() -> set[str]:
     return {ln.strip() for ln in cp.stdout.splitlines() if ln.strip()}
 
 
+def _applied_ref(key: str, sha: str) -> str:
+    return f"{REFS_NS}/{key}/applied/{sha}"
+
+
+def _applied_shas(key: str) -> set[str]:
+    """Shas THIS lane has durably recorded as APPLIED (see :func:`_record_applied`).
+
+    The message marker is written by ``push`` BEFORE ``_pin`` runs, so an
+    own-marked entry may never have been applied (a pin failure leaves exactly
+    that state). Application evidence has to be produced by ``pop`` itself, and
+    this namespace is where it lives — a ref, so it is CAS-writable and
+    gc-protected like the pins it sits beside (#8773 review P1).
+    """
+    cp = _git(
+        "for-each-ref", "--format=%(objectname)", f"{REFS_NS}/{key}/applied", check=False,
+    )
+    if cp.returncode != 0:
+        return set()
+    return {ln.strip() for ln in cp.stdout.splitlines() if ln.strip()}
+
+
+def _record_applied(key: str, entry: dict) -> None:
+    """Move the lane pin to a durable APPLIED record — one atomic CAS transaction.
+
+    Called only AFTER a successful ``git stash apply``. ``update`` (not
+    ``create``) on the applied ref makes re-application of the same sha
+    idempotent, while the ``delete`` still CAS-checks the pin's exact sha, so a
+    concurrent ``pop``/``prune`` cannot have the pin yanked from under us.
+    """
+    tx = (
+        f"update {_applied_ref(key, entry['sha'])} {entry['sha']}\n"
+        f"delete {entry['ref']} {entry['sha']}\n"
+    )
+    cp = _git("update-ref", "--stdin", stdin=tx, check=False)
+    if cp.returncode != 0:
+        raise LaneStashError(
+            f"applied {entry['sha'][:12]} but could not record it as applied and "
+            f"release {entry['ref']}: {(cp.stderr or cp.stdout).strip()}"
+        )
+
+
+def _clear_applied(key: str, sha: str) -> None:
+    """Drop an applied record after its shared-register entry is gone (best-effort)."""
+    _git("update-ref", "-d", _applied_ref(key, sha), sha, check=False)
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -439,6 +482,10 @@ def cmd_push(args: argparse.Namespace) -> int:
     key = lane_key(root)
     nonce = uuid.uuid4().hex
     label = args.message or "wip"
+    # The lane marker is written into the message BEFORE `git stash push` runs
+    # (and therefore before `_pin` can fail), so it is an OWNERSHIP hint for
+    # `check` — never evidence that the entry was applied. Application evidence
+    # is the `refs/lane/<key>/applied/<sha>` record `pop` writes (#8773 P1).
     message = f"lane_stash {nonce} [{key}] {label}"
 
     cmd = ["stash", "push", "-m", message]
@@ -532,14 +579,11 @@ def cmd_apply(args: argparse.Namespace, pop: bool) -> int:
         # leaves the pin as the only handle on the work.
         raise GitFailed(cp.returncode, "git stash apply failed (entry kept)")
     if pop:
-        # CAS delete: only OUR entry, only if it is still at the sha we applied.
-        # `refs/stash` is never touched (see the module docstring).
-        cp = _git("update-ref", "-d", entry["ref"], entry["sha"], check=False)
-        if cp.returncode != 0:
-            raise LaneStashError(
-                f"applied {entry['sha'][:12]} but could not unpin {entry['ref']}: "
-                f"{cp.stderr.strip()}"
-            )
+        # CAS-move the pin to a durable APPLIED record: only OUR entry, only if
+        # it is still at the sha we applied, and `refs/stash` is never touched
+        # (see the module docstring). The record — not the message marker — is
+        # what lets a later `prune` prove the work was restored (#8773 P1).
+        _record_applied(key, entry)
         print(f"applied and unpinned lane entry {entry['id']} ({entry['sha'][:12]})")
     else:
         print(f"applied lane entry {entry['id']} ({entry['sha'][:12]}) — pin kept")
@@ -729,19 +773,26 @@ def cmd_recover(args: argparse.Namespace) -> int:
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
-    """Reclaim shared-register entries this lane can lose (deletion is lossless)."""
+    """Reclaim shared-register entries this lane can PROVE were restored (lossless).
+
+    The proof is a lane pin or this lane's durable applied-record — never the
+    message marker, which `push` writes before `_pin` can fail (#8773 P1).
+    """
     key = lane_key()
     rows = _shared_register()
     head = _stash_head()
 
+    applied = _applied_shas(key)
+
     def reclaimable(r: dict) -> bool:
         # A lane ref pins the object, so removing the register entry is lossless.
-        # An UNPINNED entry is removable only when its subject names THIS lane:
-        # `pop` releases the pin only AFTER a successful apply, so such an entry
-        # is this lane's own already-restored work. A marker-less or foreign
-        # unpinned entry is a peer's (or bare git's) ONLY handle — refuse it
-        # (#8051 review P1/P2).
-        return bool(r["pinned"]) or _subject_lane_key(r["subject"]) == key
+        # An UNPINNED entry is removable only when THIS lane left a durable
+        # applied-record for its sha: `pop` writes that record on a successful
+        # apply. The message MARKER is not evidence — `push` writes it BEFORE
+        # `_pin` runs, so a pin-failure entry is own-marked, unpinned and never
+        # applied, and deleting its register entry destroys the only handle to
+        # that work (#8773 review P1).
+        return bool(r["pinned"]) or r["sha"] in applied
 
     doomed = [r for r in rows if reclaimable(r)]
     kept = [r for r in rows if not reclaimable(r)]
@@ -751,8 +802,8 @@ def cmd_prune(args: argparse.Namespace) -> int:
     # with no lane_stash command able to clear it (#8051 review P2).
     orphan = head is not None and not rows
     print(f"shared register: {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}; "
-          f"{len(doomed)} removable (a lane ref pins it, or it is this lane's own), "
-          f"{len(kept)} unpinned (refused)")
+          f"{len(doomed)} removable (a lane ref pins it, or this lane recorded it "
+          f"applied), {len(kept)} unpinned (refused)")
     for r in doomed:
         print(f"  remove {r['pos']} {r['sha'][:12]}  {r['subject']}")
     for r in kept:
@@ -775,6 +826,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     # stops instead of removing an entry that would not be lossless to remove.
     order = sorted(doomed, key=lambda r: int(r["pos"].rsplit("@{", 1)[-1].rstrip("}")))
     removed = 0
+    removed_shas: list[str] = []
     for r in reversed(order):
         spec = r["pos"]
         here = _out("rev-parse", spec, check=False)
@@ -786,6 +838,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
         if cp.returncode != 0:
             print(f"could not remove {spec}: {cp.stderr.strip()}")
             continue
+        removed_shas.append(r["sha"])
         removed += 1
     print(f"removed {removed} pinned shared-register entr"
           f"{'y' if removed == 1 else 'ies'}; {len(kept)} unpinned left untouched")
@@ -798,14 +851,28 @@ def cmd_prune(args: argparse.Namespace) -> int:
         drop_head = _stash_head()
         if drop_head is not None:
             _reclaim_orphan_refs_stash(drop_head, key=key, apply=True)
+    # Applied-records are dropped only NOW, after the orphan handling: the last
+    # entry's record is exactly what proves the emptied `refs/stash` may be
+    # dropped, so clearing it earlier wedges the ref (measured: prune then
+    # refused to drop it and `check` stayed fail-closed). Only entries that were
+    # ACTUALLY removed are cleared: a failed `reflog delete` leaves its entry in
+    # the register, and that entry must stay reclaimable by a later prune.
+    # Best-effort — a leftover record only costs a tiny ref.
+    for sha in removed_shas:
+        if sha in applied:
+            _clear_applied(key, sha)
     return 0
 
 
 def _orphan_is_reclaimable(sha: str, key: str) -> bool:
-    """Whether an emptied-register `refs/stash` may be dropped without losing work."""
-    if sha in _pinned_shas():
-        return True
-    return _subject_lane_key(_subject_of(sha)) == key
+    """Whether an emptied-register `refs/stash` may be dropped without losing work.
+
+    Same evidence rule as :func:`cmd_prune.reclaimable`: a pin, or THIS lane's
+    durable applied-record. The message marker is not evidence — an own-marked
+    entry that never applied (a pin failure) would otherwise be dropped here
+    with no handle left (#8773 review P1).
+    """
+    return sha in _pinned_shas() or sha in _applied_shas(key)
 
 
 def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
@@ -815,13 +882,16 @@ def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
     ref pins. Dropping the ref then destroys the only handle a peer's bare
     `git stash pop` still has (the commit stays in the object DB but becomes
     gc-eligible), so the drop happens only when a lane ref pins `sha` (lossless)
-    or its subject names THIS lane (its work was already restored by `pop`).
-    Otherwise the orphan is reported and left alone (#8051 review P1).
+    or THIS lane's durable applied-record names it (the work was already
+    restored by `pop`). The message marker is NOT application evidence — `push`
+    writes it before `_pin` can fail (#8773 review P1). Otherwise the orphan is
+    reported and left alone.
     """
     if not _orphan_is_reclaimable(sha, key):
         print(f"kept   refs/stash {sha[:12]}  (unpinned orphan: the register enumerates "
-              "nothing, no lane ref pins it, and its subject names no lane — dropping the "
-              "ref would destroy the last handle bare git has on that entry)\n"
+              "nothing, no lane ref pins it, and this lane has no applied-record for "
+              "it — dropping the ref would destroy the last handle bare git has on "
+              "that entry)\n"
               "  this is a HAZARD state — `lane_stash check` stays fail-closed here; if the "
               "work is yours, pin it with:\n"
               f"    python tools/lane_stash.py recover {sha}")
@@ -832,6 +902,8 @@ def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
               "last entry)")
         return 0
     if _drop_refs_stash(sha):
+        if sha in _applied_shas(key):
+            _clear_applied(key, sha)
         print(f"dropped refs/stash ({sha[:12]}) — the register is now empty, as `git stash "
               "drop` of the last entry leaves it")
         return 0

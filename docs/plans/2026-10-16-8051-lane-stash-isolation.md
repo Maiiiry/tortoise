@@ -81,11 +81,13 @@ working tree.
    a peer's push between the verification and the delete removes **a different entry** — possibly an
    entry that a bare-git lane never pinned, i.e. exactly the silent loss this issue is about. The
    tool never deletes from the shared register implicitly; `lane_stash prune` does it explicitly,
-   with the pinning precondition below.
+   with the pin-or-applied precondition below.
 4. **Per-lane JSON registry of entries (in the per-worktree gitdir) as the source of truth.**
    Rejected: a lost update in the registry loses the pointer to live work, and the ref store already
    provides exactly this (gc-protected, name-ordered, CAS-allocatable). The ref *is* the registry;
-   the stash commit's own message carries the human metadata.
+   the stash commit's own message carries the human metadata. This is also why the application
+   record `pop` writes is a **ref** (`refs/lane/<key>/applied/<sha>`) and not a JSON entry: a lost
+   update there would make `prune` refuse (conservative), but a ref keeps it CAS-correct anyway.
 
 ## OVERRIDES (deliberate departures — also relayed as a comment on #8051)
 
@@ -106,7 +108,8 @@ One primitive, in `tools/lane_stash.py`:
   peer's push landing during our push does not mis-identify it — and pins it at
   `refs/lane/<lane-key>/stash/<n>`, allocated with a CAS create (retry on collision).
 - **`apply` / `pop` / `show` / `drop`** resolve the entry from `refs/lane/<lane-key>/stash/<id>` and
-  act on the **sha**: `git stash apply [--index] <sha>`. `pop` = apply + delete *the lane ref only*.
+  act on the **sha**: `git stash apply [--index] <sha>`. `pop` = apply, then one atomic CAS move of
+  *the lane ref only* to `refs/lane/<lane-key>/applied/<sha>` (the durable application record).
   A foreign entry cannot be resolved, so it cannot be applied; a peer's push cannot renumber a lane ref.
 - **`list`** prints this lane's entries (id, sha, message, liveness) and, separately, an advisory
   enumeration of the shared register naming which entries are foreign, which are pinned by a lane ref
@@ -123,12 +126,15 @@ One primitive, in `tools/lane_stash.py`:
   would refuse states that are genuinely safe. Safe to call from a pre-flight.
 - **`recover <sha>`** — the repair recipe from the incident: `git stash store -m "<original subject>"
   <sha>` **and** pin it, so the restored entry is retrievable by this lane.
-- **`prune`** — explicit reclamation of the shared register: only entries whose object is
-  **pinned by a lane ref** (therefore still reachable and retrievable — deletion cannot lose work) are
-  removed, positions are walked high→low, and the sha at each position is re-verified immediately
-  before the delete. When it takes the LAST entry it also drops `refs/stash` itself (git does not, and
-  a resolving ref over an empty reflog is both live for bare git and a fail-closed wedge for `check`).
-  Unpinned entries are reported and left alone.
+- **`prune`** — explicit reclamation of the shared register: an entry is removed only when the
+  delete cannot lose work — its object is **pinned by a lane ref**, or this lane left a durable
+  **applied-record** at `refs/lane/<key>/applied/<sha>` (written atomically by `pop` on a
+  successful apply, because `push` writes the message marker BEFORE `_pin` runs and the marker is
+  therefore not evidence of application); positions are walked high→low, and the sha at each
+  position is re-verified immediately before the delete. When it takes the LAST entry it also drops
+  `refs/stash` itself (git does not, and a resolving ref over an empty reflog is both live for bare
+  git and a fail-closed wedge for `check`). Any other unpinned entry — a peer lane's, bare git's, or
+  this lane's own never-applied pin-failure entry — is reported and left alone.
 
 Out of scope (reported, not absorbed): the skills text (`using-git-worktrees`, `commit-workflow`) is
 a symlink to agent-infra and belongs to agent-infra #1264; the `main-worktree-guard` extension
@@ -203,7 +209,7 @@ rule is additive.
   `pop`s; assert (a) A's tree holds exactly A's diff and **not** B's file, (b) B's entry is still
   present in `git stash list` with its original sha, (c) A's entry is intact for B.
 - Plus: the hazard detector (`check`), untracked fidelity, apply-conflict preservation, foreign-top
-  pop, nothing-to-stash, per-worktree lane keys, `recover`, `prune` pinning precondition.
+  pop, nothing-to-stash, per-worktree lane keys, `recover`, `prune` pin-or-applied precondition.
 
 ### Task 3: registration + guidance
 
@@ -221,7 +227,9 @@ rule is additive.
 2. `lane_stash check` exits non-zero and names the foreign lane when the shared top is a peer's, and
    for a marker-less bare-git entry whose origin only a branch name could attribute — including a
    branch name that matches the current one — and exits 0 when the top is provably this lane's own.
-3. `pop` never deletes from the shared register; `prune` refuses to remove an entry that is not pinned.
+3. `pop` never deletes from the shared register (it records the apply durably and releases only the
+   lane pin); `prune` removes an entry only when a lane ref pins it or this lane's applied-record
+   names it — a never-applied entry (e.g. one whose `_pin` failed) is refused.
 4. `AGENTS.md` states the hazard and names the safe alternative (issue Target: 1 guidance line).
 5. `python tools/ci_selection.py --integrity` is clean with the new test registered.
 

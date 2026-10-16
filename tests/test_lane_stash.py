@@ -115,6 +115,14 @@ class Repo:
             refs[ref] = sha
         return refs
 
+    def stash_pins(self) -> dict[str, str]:
+        """Only the PIN refs (`refs/lane/<key>/stash/<n>`) — not applied records."""
+        return {r: s for r, s in self.lane_refs().items() if "/stash/" in r}
+
+    def applied_refs(self) -> dict[str, str]:
+        """Only the durable APPLIED records (`refs/lane/<key>/applied/<sha>`)."""
+        return {r: s for r, s in self.lane_refs().items() if "/applied/" in r}
+
     def dirty(self, cwd: Path, name: str, text: str, untracked: bool = False) -> None:
         (cwd / name).write_text(text)
         if not untracked:
@@ -414,7 +422,7 @@ def test_pop_that_conflicts_keeps_the_pin_and_the_work(repo):
     retry = repo.lane(repo.a, "pop")
     assert retry.returncode == 0, _fail(retry)
     assert "stashed-A" in (repo.a / "f.txt").read_text()
-    assert repo.lane_refs() == {}
+    assert repo.stash_pins() == {}
 
 
 def test_drop_requires_yes(repo):
@@ -589,12 +597,14 @@ def test_prune_refuses_a_foreign_lanes_unpinned_entry(repo):
     assert repo.lane(repo.b, "push", "-m", "B").returncode == 0
     assert repo.lane(repo.b, "pop").returncode == 0
     sha = repo.stash_sha()
-    assert sha and repo.lane_refs() == {}, "precondition: B's entry is unpinned"
+    assert sha and repo.stash_pins() == {}, "precondition: B's entry is unpinned"
+    assert repo.applied_refs(), "precondition: B left a durable applied-record"
 
     cp = repo.lane(repo.a, "prune", "--apply")
     assert cp.returncode == 0, _fail(cp)
     assert repo.stash_sha() == sha, "prune dropped a peer lane's entry"
     assert repo.stash_shas() == [sha]
+    assert repo.applied_refs(), "A's prune must not touch B's applied-record"
 
 
 def test_prune_reclaims_this_lanes_own_popped_entries(repo):
@@ -610,12 +620,14 @@ def test_prune_reclaims_this_lanes_own_popped_entries(repo):
         assert repo.lane(repo.a, "push", "-m", f"cycle {i}").returncode == 0
         assert repo.lane(repo.a, "pop").returncode == 0
     assert len(repo.stash_shas()) == 3, repo.stash_shas()
-    assert repo.lane_refs() == {}, "precondition: pop released every lane pin"
+    assert repo.stash_pins() == {}, "precondition: pop released every lane pin"
+    assert len(repo.applied_refs()) == 3, repo.applied_refs()
 
     cp = repo.lane(repo.a, "prune", "--apply")
     assert cp.returncode == 0, _fail(cp)
     assert repo.stash_shas() == [], "this lane's own popped entries were not reclaimed"
     assert repo.stash_sha() is None
+    assert repo.applied_refs() == {}, "applied-records are dropped with the entries they named"
     check = repo.lane(repo.a, "check")
     assert check.returncode == 0, _fail(check)
     assert "SAFE" in check.stdout
@@ -632,7 +644,11 @@ def test_pop_never_modifies_the_shared_register(repo):
         "the shared entry must survive `pop`: its positional reflog delete is racy and "
         "can drop a bare-git peer's unpinned entry"
     )
-    assert repo.lane_refs() == {}, "the lane's own pin is released"
+    assert repo.stash_pins() == {}, "the lane's own pin is released"
+    assert repo.applied_refs(), (
+        "pop must leave durable evidence it applied the entry — the message marker is "
+        "written before `_pin`, so it is not evidence of application"
+    )
 
 
 # ── fail-closed detection when the register cannot be read (#8051 review P1) ──
@@ -744,3 +760,45 @@ def test_push_reports_the_orphan_when_pinning_fails(repo, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "EXISTS" in err and "recover" in err, err
     assert repo.stash_sha() is not None, "the entry must actually be in the register"
+
+
+def test_prune_refuses_a_never_applied_pin_failure_entry(repo, monkeypatch):
+    """A pin-failure entry is own-MARKED, unpinned and NEVER APPLIED — prune keeps it.
+
+    `cmd_push` writes the lane marker into the stash message BEFORE `_pin` runs,
+    so the marker is an ownership hint, not proof of application. `prune`'s
+    unpinned branch used `_subject_lane_key(r["subject"]) == key` as a proxy for
+    "already restored" — false for a pin-failure entry, whose ONLY handle is the
+    shared-register entry. Removing it deletes the reflog entry and drops
+    `refs/stash`, destroying that work for good (#8773 review P1). Pre-fix this
+    test fails with the entry gone.
+    """
+    mod = _load_tool()
+    monkeypatch.chdir(repo.a)
+    repo.dirty(repo.a, "f.txt", "base\nnever-applied\n")
+
+    def boom(key, sha):
+        raise mod.LaneStashError("could not allocate a lane ref under refs/lane/x")
+
+    monkeypatch.setattr(mod, "_pin", boom)
+    assert mod.main(["push", "-m", "W"]) == 2
+    assert repo.stash_sha() is not None
+
+    # precondition: own-MARKED, but unpinned and with no applied-record
+    sha = repo.stash_sha()
+    assert repo.lane_refs() == {}, "precondition: the pin failed, so nothing is pinned"
+    assert mod._subject_lane_key(repo.git("log", "-1", "--format=%s", sha).stdout.strip()) \
+        == mod.lane_key(), "precondition: the entry carries THIS lane's marker"
+    assert sha not in mod._applied_shas(mod.lane_key()), "precondition: never applied"
+
+    # the marker must NOT be read as evidence that the work was restored
+    assert mod.main(["prune", "--apply"]) == 0
+    assert repo.stash_sha() == sha, (
+        "prune destroyed the only handle to a never-applied pin-failure entry"
+    )
+    assert repo.stash_shas() == [sha]
+
+    # and the work is still there for the lane that created it
+    bare = repo.git("stash", "pop", cwd=repo.a, check=False)
+    assert bare.returncode == 0, _fail(bare)
+    assert "never-applied" in (repo.a / "f.txt").read_text()
