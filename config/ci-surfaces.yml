@@ -1688,6 +1688,17 @@ surfaces:
   # default; verified green there) — deliberately NOT carve_out-registered.
   - test_source_change_notice_5516.py
   - test_subject_layer_read_surfaces_4889.py  # #4889: the Subject-layer read surfaces fail loud instead of silently empty
+  # #8051: `refs/stash` lives in the COMMON git dir, so a lane's bare
+  # `git stash pop` applies and drops another lane's entry. This guards
+  # `tools/lane_stash.py` (lane-scoped pinning + hash-addressed restore) and
+  # ships the 2-worktree reproduction from the issue. Both paths need the
+  # `CORE_ALSO` entry in `tools/ci_selection.py` — `tools/` is a flat
+  # NON_PYTHON_PREFIXES entry, so a tools-only diff selects NO surface and the
+  # pin would never run on the file it guards (the #1349/#3332/#3616
+  # silent-drop class). Hermetic (real temp git repo + 2 real worktrees; no
+  # network/Docker/FalkorDB), so it is deliberately NOT carve_out-registered:
+  # it is DB-free and runs on any lane, not embedded-only.
+  - test_lane_stash.py
   - test_test_lane_tool.py
   - test_transport_wait_bound.py  # #3834: transport wait bound + cold-half gate wiring (dual: api)
   # #2877: DB-free guards that a dead backup watcher degrades /health (the file
@@ -4490,6 +4501,10 @@ durations:
   test_tenancy_spine.py: 3.0
   test_transport_wait_bound.py: 2.1
   test_collision_preflight.py: 3.6
+  # #8051: new file — no CI junit yet. 12.0 is a LOCAL reading (17 tests, 12.5s
+  # on a loaded host through the subprocess+real-git harness); refresh from the
+  # first post-merge junit artifact. Erring high is correct for sharding.
+  test_lane_stash.py: 12.0
   test_who_is_on.py: 0.9  # #4256: analogue estimate (same subprocess harness as test_collision_preflight.py); refresh from the first post-merge junit artifact
   test_branch_reaper.py: 2.0  # unmeasured — no measurement in the four source runs; flat default
   test_run_reaper.py: 2.0  # unmeasured — new file (#6868); no CI junit yet, flat default
