@@ -66,15 +66,32 @@ WRANGLER_SPEC = re.compile(r"wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)")
 #: YAML block scalars carry their `#` lines as TEXT, so a comment that merely
 #: mentions `wrangler@4` (a historical note, say) read as a floating pin and would
 #: red an otherwise clean required check. These checks are about what a step DOES,
-#: so comments are stripped before matching — whole-line and trailing alike, since a
-#: `#` that starts a word opens a comment in shell. Pinned by the comment arms in
-#: `test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range`.
-_COMMENT = re.compile(r"(?:^|\s)#.*$")
+#: so comments are stripped before matching. The strip is QUOTE-AWARE: a `#` that
+#: starts a word opens a comment only when it is not inside a quoted string, so
+#: `echo "refs #8743" && npx …wrangler@4 …` keeps the float it carries (a plain
+#: `(?:^|\s)#` regex truncated that line at the quote and missed the pin).
+_QUOTE_CHARS = "\"'"
+
+
+def _strip_comment(line: str) -> str:
+    """One line with its shell comment removed — a word-leading `#` outside quotes."""
+    out: list[str] = []
+    quote = ""
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in _QUOTE_CHARS:
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+            break
+        out.append(ch)
+    return "".join(out)
 
 
 def _commands(run: str) -> str:
     """The executable text of a step's `run` block — comments are not commands."""
-    return "\n".join(_COMMENT.sub("", line) for line in run.splitlines())
+    return "\n".join(_strip_comment(line) for line in run.splitlines())
 
 
 def _exact_wranglers(run: str) -> set[str]:
@@ -272,8 +289,10 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
     assert _floating_wranglers("# was: wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
     assert _exact_wranglers("# was: wrangler@4.127.0\nnpx --yes wrangler@latest --version") == set()
     assert _floating_wranglers("npx --yes wrangler@4.127.0 --version  # was wrangler@4") == set()
-    # …and a REAL float on the command line is still an offender, comment or not.
+    # …and a REAL float on the command line is still an offender, comment or not —
+    # including when an earlier quoted string on the line carries a `#`.
     assert _floating_wranglers("npx --yes wrangler@4 --version  # pinned in #8743") == {"4"}
+    assert _floating_wranglers('echo "refs #8743" && npx --yes wrangler@4 --version') == {"4"}
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:
