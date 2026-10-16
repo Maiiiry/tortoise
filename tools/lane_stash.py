@@ -975,15 +975,16 @@ def cmd_prune(args: argparse.Namespace) -> int:
     # A register can DIVERGE from its ref: a bare `git reflog delete` without
     # `--updateref` leaves `refs/stash` on a sha the register no longer
     # enumerates. `reflog delete --updateref` (used below) MOVES the ref to the
-    # reflog's new top, so that head loses its ONLY handle unless it is protected
-    # exactly like a kept entry (#8773 review P1) — a single-threaded, silent
-    # loss of a peer's bare stash, invisible to the register-derived `kept`.
+    # reflog's new top, and that head is named by no other ref — a
+    # single-threaded, silent loss of a peer's bare stash, invisible to the
+    # register-derived sets. It cannot be re-listed either (`stash store` is a
+    # no-op while the ref already equals the sha, and dropping the ref would
+    # delete the whole reflog with it), so a diverged register is REFUSED below
+    # (#8773 reviews P1, P2).
     register_shas = {r["sha"] for r in rows}
     diverged_head = head if head is not None and head not in register_shas else None
     # The state an emptied reflog leaves behind: `refs/stash` resolves while the
-    # register enumerates nothing. Routine maintenance creates it, and a pre-fix
-    # prune created it on its own, after which `check` failed closed everywhere
-    # with no lane_stash command able to clear it (#8051 review P2).
+    # register enumerates nothing (routine maintenance creates it).
     orphan = head is not None and not rows
     print(f"shared register: {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}; "
           f"{len(doomed)} removable (a lane ref pins it, or this lane recorded it "
@@ -996,8 +997,9 @@ def cmd_prune(args: argparse.Namespace) -> int:
         print(f"  orphan refs/stash: {head[:12]} resolves while the register enumerates "
               "nothing — an emptied reflog (bare git can still `git stash pop` it)")
     elif diverged_head is not None:
-        print(f"  guard  refs/stash {diverged_head[:12]}  the ref points at a sha the "
-              "register does not enumerate — it is protected and re-listed, not lost")
+        print(f"  diverged refs/stash: {diverged_head[:12]} is not enumerated by the "
+              "register (a bare `git reflog delete` without --updateref leaves that) — a "
+              "positional delete would move the ref off it, so this prune will REFUSE")
     if not doomed:
         if not orphan:
             return 0
@@ -1005,6 +1007,21 @@ def cmd_prune(args: argparse.Namespace) -> int:
     if not args.apply:
         print("dry run — re-run with --apply to remove the pinned entries")
         return 0
+    # A diverged register cannot be pruned safely: `reflog delete --updateref`
+    # MOVES the ref to the reflog's new top, and that head is named by no other
+    # ref — a single-threaded, silent loss of a peer's bare stash. It cannot be
+    # re-listed either: `stash store` is a silent no-op while the ref already
+    # equals the sha, and repairing that by dropping the ref would delete the
+    # whole reflog with it. So refuse (#8773 reviews P1, P2).
+    if diverged_head is not None:
+        raise LaneStashError(
+            f"refs/stash points at {diverged_head[:12]}, which the shared register does not "
+            "enumerate — the ref and its reflog have DIVERGED. That entry's only handle is "
+            "the ref, and a positional delete would move the ref off it, so this prune "
+            "refuses to remove anything. `check` stays fail-closed on this state; inspect "
+            "it with `lane_stash list`, or reconcile it deliberately with git once you know "
+            "the entry is safe."
+        )
 
     # GC guard for every entry this prune intends to KEEP (see `_guard_pin`).
     # `reflog delete` re-resolves `refs/stash@{i}` at DELETE time, so a peer push
@@ -1013,25 +1030,18 @@ def cmd_prune(args: argparse.Namespace) -> int:
     # reflog. The guard makes that object un-gc-able; the reconciliation below
     # re-stores anything the shift removed (#8773 review P1).
     guarded: dict[str, tuple[str, str]] = {}
-    guard_targets: list[tuple[str, str]] = [(r["sha"], r["subject"]) for r in kept]
-    if diverged_head is not None and not (_refs_pointing_at(diverged_head) - {"refs/stash"}):
-        # Protect the diverged head too; it is un-enumerated, so it would
-        # otherwise be moved off the ref by the first `--updateref` delete.
-        guard_targets.append(
-            (diverged_head, _out("log", "-1", "--format=%s", diverged_head))
-        )
-    for target_sha, target_subject in guard_targets:
-        ref = _guard_pin(key, target_sha)
+    for r in kept:
+        ref = _guard_pin(key, r["sha"])
         if ref is None:
             # Cannot guarantee this entry survives a position shift — refuse to
             # delete anything rather than prune without the guard in place.
             for s, (gr, _sub) in guarded.items():
                 _guard_unpin(gr, s)
             raise LaneStashError(
-                f"could not guard {target_sha[:12]} under {GUARD_NS}/{key} before pruning — "
+                f"could not guard {r['sha'][:12]} under {GUARD_NS}/{key} before pruning — "
                 "refusing to remove anything while a kept entry cannot be protected"
             )
-        guarded[target_sha] = (ref, target_subject)
+        guarded[r["sha"]] = (ref, r["subject"])
     removed_shas: list[str] = []
     try:
         # Positions are walked HIGH -> LOW so an earlier delete cannot renumber a

@@ -1479,15 +1479,15 @@ def test_prune_refuses_when_a_kept_entry_cannot_be_guarded(repo, monkeypatch, ca
     ).stdout.strip() == ""
 
 
-def test_prune_protects_a_diverged_registers_head(repo, monkeypatch, capsys):
-    """`prune` must not drop the un-enumerated `refs/stash` head.
+def test_prune_refuses_a_diverged_registers_head(repo, monkeypatch, capsys):
+    """`prune` must refuse a register diverged from its ref, not drop its head.
 
     A bare `git reflog delete` without `--updateref` leaves `refs/stash` on a sha
-    the register no longer enumerates. That head is invisible to the
-    register-derived guard set, and the first `reflog delete --updateref` MOVES
-    the ref to the reflog's new top — so pruning any other entry silently leaves
-    the head with no handle (single-threaded, no concurrency). It must be
-    guard-pinned and re-listed like a kept entry (#8773 review P1).
+    the register no longer enumerates. That head is named by no other ref, and
+    the first `reflog delete --updateref` would MOVE the ref to the reflog's new
+    top — a single-threaded, silent loss of a peer's entry. It cannot be
+    re-listed either (`stash store` no-ops while the ref already equals the sha),
+    so the prune refuses and leaves everything alone (#8773 reviews P1, P2).
     """
     mod = _load_tool()
     repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
@@ -1507,8 +1507,11 @@ def test_prune_protects_a_diverged_registers_head(repo, monkeypatch, capsys):
     assert repo.stash_sha() == orphan
     monkeypatch.chdir(repo.a)
     capsys.readouterr()
-    assert mod.main(["prune", "--apply"]) == 0
+    assert mod.main(["prune", "--apply"]) != 0
+    assert repo.stash_shas() == [kept, doomed], "nothing may be deleted from a diverged register"
+    assert repo.stash_sha() == orphan, "the diverged head keeps its ref"
     named = repo.git("for-each-ref", "--format=%(objectname)").stdout.split()
-    assert orphan in named, "the diverged head must still be named by a ref"
-    assert orphan in repo.stash_shas(), "and it must be re-listed in the register"
-    assert kept in repo.stash_shas(), "the kept entry stays"
+    assert named.count(orphan) == 1, "and the head still exists"
+    assert repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.strip() == "", "a refused prune must not leave a guard behind"
