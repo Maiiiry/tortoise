@@ -53,6 +53,7 @@ from .commit_ops import OBJECT_TERMINAL_STATUSES as _OBJECT_TERMINAL_STATUSES
 # `_update_entity`. Imported so neither surface re-literals the vocabulary.
 from .commit_ops import SUBJECT_STATUS_VALUES as _SUBJECT_STATUS_VALUES
 from .env_truthy import env_flag, is_truthy  # #4097: the declared truthy contract
+from .ids import entity_name_id as _entity_name_id
 from .ids import ulid
 from .vector_write import (  # #4520: the ONE clear-then-set vector seam
     EMBEDDING_PROPERTY,
@@ -3282,6 +3283,30 @@ def _sanitize_props(props: dict, *, reject_id: bool = False,
             "'baseline_system_default' is a server-managed baseline-provision "
             "marker and cannot be set via props."
         )
+    # #7936 (review P2): `_stub` is the event-name-stub DISCRIMINATOR the
+    # first-registration probe in `_create_entity` excludes — a marked stub is
+    # NOT a registered node, so a later `create_entity` for the name still
+    # journals its `ObjectRegistered`/`SubjectAdded` (the durability half of
+    # #2194/#2295). Its VALUE therefore decides whether a registration line is
+    # written, which makes it server-managed: the projection is the only writer
+    # (`_event_plain_merge` sets it inside ON CREATE, `_upsert_object` /
+    # `_upsert_subject` clear it inside ON MATCH), and neither path re-enters
+    # this intake. Hard-reject (never strip), matching
+    # `baseline_system_default`/`__runId`: there is no legitimate caller intent,
+    # and a silent drop would let an attempted forgery pass unnoticed.
+    # Measured before this reject: `update_entity(<stub id>, _stub=False)` was
+    # ACCEPTED by `_update_entity`'s direct `SET n += $p`, journaled as an
+    # `EntityMutated` (so the forged value SURVIVED `rebuild_all`), and the
+    # following `create_entity` then SKIPPED the registration — re-opening the
+    # node-loss + live != replay class #7936 closes (live `_stub` cleared by
+    # adoption, replay `_stub=false` + `objectKind='other'`). The MCP boundary
+    # (`_SERVER_MANAGED_PROPS`) refuses it BEFORE the write is attempted; this
+    # is the fail-closed backstop for the direct SDK route.
+    if "_stub" in props:
+        raise ValueError(
+            "'_stub' is a server-managed event-stub discriminator and cannot "
+            "be set via props."
+        )
     # #7951 (review round 5): `credibility` is NOT a generic prop — it is the
     # author's declared WORD, a documented input of `create_point` /
     # `mitigate_operator`, which validate it and run the authored-assertion
@@ -4043,19 +4068,6 @@ def _apply_capture_ingest_ep(sdk, claim_ids: list[str], *,
         )
         if warn is not None:
             warn(f"ingest EP pass failed: {type(e).__name__}: {e}")
-
-
-def _entity_name_id(label: str, name: str) -> str:
-    """Deterministic entity id from name — mirrors create_point's content-hash
-    dedup so the projection's MERGE-by-name is IDEMPOTENT: the same name
-    always yields the same id, so a second create_object/create_subject
-    returns the canonical node id (#452) and the #1155-P1
-    ``coalesce($id, o.id)`` ON-MATCH write is a no-op (same id), while a
-    name-stub Object minted with a random ulid by the event path still gets
-    replaced by the canonical id on the first ObjectRegistered write.
-    """
-    digest = hashlib.sha256(f"{label}:{name}".encode("utf-8")).hexdigest()[:26]  # noqa: UP012
-    return f"{label[:3].lower()}-{digest}"
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:  # noqa: F821
@@ -25075,9 +25087,18 @@ class TortoiseSDK:
         # a cross-name sha-digest collision (would otherwise fail-closed on a
         # genuinely new registration). A row = canonical re-mention (MERGE by
         # name, ON MATCH — the #1350 clobber guard keeps status; journaling
-        # again would double-register). No row = fresh create OR #1155 stub
-        # adoption (name-stub under a random ulid — the canonical
-        # registration is genuinely new) → journal after apply. Probe failure
+        # again would double-register). The #7936 `_stub` conjunct restates
+        # the precondition honestly: since the event name-stub now carries the
+        # canonical id (#7936), id+name alone can no longer distinguish a
+        # registered node from an unregistered stub — every name-stub would
+        # HIT and the registration would silently stop being journaled.
+        # `_event_plain_merge` marks its stubs `_stub=true` ON CREATE and
+        # `_upsert_object`/`_upsert_subject` REMOVE it (SET NULL) on adoption,
+        # so the probe counts ONLY nodes whose canonical registration was
+        # journaled. No row = fresh create OR #1155/#7936 stub adoption (a
+        # marked name-stub, or a pre-#7936 random-ulid stub the id conjunct
+        # already misses — either way the canonical registration is genuinely
+        # new) → journal after apply. Probe failure
         # → warning + fail-open-to-journal (a duplicate line is replay-safe;
         # a skip would silently re-open the node-loss bug). Accepted
         # divergences (only-on-create mandate): re-mention prop mutations and
@@ -25102,7 +25123,8 @@ class TortoiseSDK:
                 and event.get("name") and event.get("type") == "ObjectRegistered"):
             try:
                 _journal_object_registration = not proj.g.query(
-                    "MATCH (o:Object {id:$cid, name:$name}) RETURN o.id",
+                    "MATCH (o:Object {id:$cid, name:$name}) "
+                    "WHERE coalesce(o._stub, false) = false RETURN o.id",
                     params={"cid": id_val, "name": event["name"]},
                 ).result_set
             except Exception:
@@ -25132,7 +25154,8 @@ class TortoiseSDK:
                 and event.get("name") and event.get("type") == "SubjectAdded"):
             try:
                 _journal_subject_registration = not proj.g.query(
-                    "MATCH (s:Subject {id:$cid, name:$name}) RETURN s.id",
+                    "MATCH (s:Subject {id:$cid, name:$name}) "
+                    "WHERE coalesce(s._stub, false) = false RETURN s.id",
                     params={"cid": id_val, "name": event["name"]},
                 ).result_set
             except Exception:
