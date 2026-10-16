@@ -1477,3 +1477,38 @@ def test_prune_refuses_when_a_kept_entry_cannot_be_guarded(repo, monkeypatch, ca
     assert repo.git(
         "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
     ).stdout.strip() == ""
+
+
+def test_prune_protects_a_diverged_registers_head(repo, monkeypatch, capsys):
+    """`prune` must not drop the un-enumerated `refs/stash` head.
+
+    A bare `git reflog delete` without `--updateref` leaves `refs/stash` on a sha
+    the register no longer enumerates. That head is invisible to the
+    register-derived guard set, and the first `reflog delete --updateref` MOVES
+    the ref to the reflog's new top — so pruning any other entry silently leaves
+    the head with no handle (single-threaded, no concurrency). It must be
+    guard-pinned and re-listed like a kept entry (#8773 review P1).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    doomed = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", "-m", "kept", cwd=repo.b)
+    kept = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    orphan = repo.stash_sha()
+    assert repo.stash_shas() == [orphan, kept, doomed]
+    # bare git drops the TOP reflog entry without moving the ref: refs/stash
+    # stays on `orphan`, which is no longer enumerated
+    repo.git("reflog", "delete", "refs/stash@{0}")
+    assert repo.stash_shas() == [kept, doomed]
+    assert repo.stash_sha() == orphan
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    named = repo.git("for-each-ref", "--format=%(objectname)").stdout.split()
+    assert orphan in named, "the diverged head must still be named by a ref"
+    assert orphan in repo.stash_shas(), "and it must be re-listed in the register"
+    assert kept in repo.stash_shas(), "the kept entry stays"

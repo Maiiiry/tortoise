@@ -147,7 +147,12 @@ One primitive, in `tools/lane_stash.py`:
   takes the LAST entry it also drops
   `refs/stash` itself (git does not, and a resolving ref over an empty reflog is both live for bare
   git and a fail-closed wedge for `check`). Any other unpinned entry — a peer lane's, bare git's, or
-  this lane's own never-applied pin-failure entry — is reported and left alone.
+  this lane's own never-applied pin-failure entry — is reported and left alone. A register can also
+  DIVERGE from its ref (a bare `git reflog delete` without `--updateref` leaves `refs/stash` on a sha
+  the register no longer enumerates); because `reflog delete --updateref` MOVES the ref to the
+  reflog's new top, that head is guard-pinned and re-listed like a kept entry rather than being
+  silently dropped — it is invisible to the register-derived guard set, and the loss would be
+  single-threaded, not a race.
 - **Restoration is verified, not inferred from an exit code.** `git stash store` returns 0
   *without* creating a reflog entry when `refs/stash` already points at that sha (measured) —
   precisely the state an emptied reflog leaves. `recover` and `prune`'s reconciliation therefore

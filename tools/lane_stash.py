@@ -972,6 +972,14 @@ def cmd_prune(args: argparse.Namespace) -> int:
 
     doomed = [r for r in rows if reclaimable(r)]
     kept = [r for r in rows if not reclaimable(r)]
+    # A register can DIVERGE from its ref: a bare `git reflog delete` without
+    # `--updateref` leaves `refs/stash` on a sha the register no longer
+    # enumerates. `reflog delete --updateref` (used below) MOVES the ref to the
+    # reflog's new top, so that head loses its ONLY handle unless it is protected
+    # exactly like a kept entry (#8773 review P1) — a single-threaded, silent
+    # loss of a peer's bare stash, invisible to the register-derived `kept`.
+    register_shas = {r["sha"] for r in rows}
+    diverged_head = head if head is not None and head not in register_shas else None
     # The state an emptied reflog leaves behind: `refs/stash` resolves while the
     # register enumerates nothing. Routine maintenance creates it, and a pre-fix
     # prune created it on its own, after which `check` failed closed everywhere
@@ -987,6 +995,9 @@ def cmd_prune(args: argparse.Namespace) -> int:
     if orphan:
         print(f"  orphan refs/stash: {head[:12]} resolves while the register enumerates "
               "nothing — an emptied reflog (bare git can still `git stash pop` it)")
+    elif diverged_head is not None:
+        print(f"  guard  refs/stash {diverged_head[:12]}  the ref points at a sha the "
+              "register does not enumerate — it is protected and re-listed, not lost")
     if not doomed:
         if not orphan:
             return 0
@@ -1002,18 +1013,25 @@ def cmd_prune(args: argparse.Namespace) -> int:
     # reflog. The guard makes that object un-gc-able; the reconciliation below
     # re-stores anything the shift removed (#8773 review P1).
     guarded: dict[str, tuple[str, str]] = {}
-    for r in kept:
-        ref = _guard_pin(key, r["sha"])
+    guard_targets: list[tuple[str, str]] = [(r["sha"], r["subject"]) for r in kept]
+    if diverged_head is not None and not (_refs_pointing_at(diverged_head) - {"refs/stash"}):
+        # Protect the diverged head too; it is un-enumerated, so it would
+        # otherwise be moved off the ref by the first `--updateref` delete.
+        guard_targets.append(
+            (diverged_head, _out("log", "-1", "--format=%s", diverged_head))
+        )
+    for target_sha, target_subject in guard_targets:
+        ref = _guard_pin(key, target_sha)
         if ref is None:
             # Cannot guarantee this entry survives a position shift — refuse to
             # delete anything rather than prune without the guard in place.
             for s, (gr, _sub) in guarded.items():
                 _guard_unpin(gr, s)
             raise LaneStashError(
-                f"could not guard {r['sha'][:12]} under {GUARD_NS}/{key} before pruning — "
+                f"could not guard {target_sha[:12]} under {GUARD_NS}/{key} before pruning — "
                 "refusing to remove anything while a kept entry cannot be protected"
             )
-        guarded[r["sha"]] = (ref, r["subject"])
+        guarded[target_sha] = (ref, target_subject)
     removed_shas: list[str] = []
     try:
         # Positions are walked HIGH -> LOW so an earlier delete cannot renumber a
