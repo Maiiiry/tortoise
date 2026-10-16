@@ -546,6 +546,81 @@ def test_prune_clears_an_already_orphaned_refs_stash(repo):
     assert "SAFE" in check.stdout
 
 
+def test_prune_refuses_an_unpinned_refs_stash_orphan(repo):
+    """An emptied reflog over a PEER's bare entry must survive `prune --apply`.
+
+    `git reflog expire` (routine maintenance) leaves `refs/stash` pointing at an
+    entry no lane ref pins. That ref is the peer's ONLY handle — dropping it makes
+    the commit gc-eligible — and the command's own line above it reports the entry
+    as refused. Pre-fix `prune --apply` dropped the ref anyway, destroying a
+    peer's stash with no lane_stash recovery path (#8051 review P1).
+    """
+    # the peer's BARE stash: marker-less, pinned by no lane ref
+    repo.dirty(repo.b, "f.txt", "base\npeer-only\n")
+    repo.git("stash", "push", "-q", "-m", "peer unpinned work", cwd=repo.b)
+    sha = repo.stash_sha()
+    assert sha and repo.lane_refs() == {}, "precondition: unpinned peer entry"
+
+    # routine maintenance empties the reflog; the ref (and the peer's handle) live
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.stash_shas() == [] and repo.stash_sha() == sha
+
+    cp = repo.lane(repo.a, "prune", "--apply")
+    assert cp.returncode == 0, _fail(cp)
+    assert repo.stash_sha() == sha, (
+        "prune destroyed an unpinned peer's last handle — the object is now gc-eligible"
+    )
+    assert "recover" in cp.stdout, cp.stdout
+
+    # the peer can still restore its own work
+    bare = repo.git("stash", "pop", cwd=repo.b, check=False)
+    assert bare.returncode == 0, _fail(bare)
+    assert "peer-only" in (repo.b / "f.txt").read_text()
+
+
+def test_prune_refuses_a_foreign_lanes_unpinned_entry(repo):
+    """Only THIS lane's own marker is reclaimable — a peer's popped entry is kept.
+
+    `pop` leaves the shared entry behind, so another lane's `prune` sees a
+    marker-less-from-its-perspective (foreign) unpinned entry. Reclaiming it would
+    be as lossy as dropping an orphan (#8051 review P1).
+    """
+    repo.dirty(repo.b, "f.txt", "base\nb-work\n")
+    assert repo.lane(repo.b, "push", "-m", "B").returncode == 0
+    assert repo.lane(repo.b, "pop").returncode == 0
+    sha = repo.stash_sha()
+    assert sha and repo.lane_refs() == {}, "precondition: B's entry is unpinned"
+
+    cp = repo.lane(repo.a, "prune", "--apply")
+    assert cp.returncode == 0, _fail(cp)
+    assert repo.stash_sha() == sha, "prune dropped a peer lane's entry"
+    assert repo.stash_shas() == [sha]
+
+
+def test_prune_reclaims_this_lanes_own_popped_entries(repo):
+    """`push` then `pop` leaves an unpinned entry; prune must reclaim this lane's own.
+
+    `pop` deliberately leaves the shared entry in place and releases the lane pin
+    (see the module's OVERRIDES note), so the register grows with every push/pop
+    cycle. Pre-fix `prune` refused all of it as "unpinned", leaving no lane_stash
+    command able to reclaim the tool's own entries (#8051 review P2).
+    """
+    for i in range(3):
+        repo.dirty(repo.a, "f.txt", f"base\na{i}\n")
+        assert repo.lane(repo.a, "push", "-m", f"cycle {i}").returncode == 0
+        assert repo.lane(repo.a, "pop").returncode == 0
+    assert len(repo.stash_shas()) == 3, repo.stash_shas()
+    assert repo.lane_refs() == {}, "precondition: pop released every lane pin"
+
+    cp = repo.lane(repo.a, "prune", "--apply")
+    assert cp.returncode == 0, _fail(cp)
+    assert repo.stash_shas() == [], "this lane's own popped entries were not reclaimed"
+    assert repo.stash_sha() is None
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 0, _fail(check)
+    assert "SAFE" in check.stdout
+
+
 def test_pop_never_modifies_the_shared_register(repo):
     """`pop` is deliberately not `git stash pop` (see the module's OVERRIDES note)."""
     repo.dirty(repo.a, "f.txt", "base\na\n")

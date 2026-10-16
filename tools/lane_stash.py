@@ -360,6 +360,15 @@ def _subject_lane_key(subject: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _subject_of(sha: str) -> str:
+    """The stored subject of a stash commit, read from the object.
+
+    Works when the reflog cannot enumerate it (an expired reflog is exactly when
+    `prune` needs to decide an orphan `refs/stash` by its own subject).
+    """
+    return _out("log", "-1", "--format=%s", sha, check=False)
+
+
 def _stash_head() -> str | None:
     """The sha `refs/stash` resolves to, or None when the ref does not exist.
 
@@ -720,18 +729,30 @@ def cmd_recover(args: argparse.Namespace) -> int:
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
-    """Reclaim shared-register entries that a lane ref pins (so deletion is lossless)."""
+    """Reclaim shared-register entries this lane can lose (deletion is lossless)."""
+    key = lane_key()
     rows = _shared_register()
     head = _stash_head()
-    doomed = [r for r in rows if r["pinned"]]
-    kept = [r for r in rows if not r["pinned"]]
+
+    def reclaimable(r: dict) -> bool:
+        # A lane ref pins the object, so removing the register entry is lossless.
+        # An UNPINNED entry is removable only when its subject names THIS lane:
+        # `pop` releases the pin only AFTER a successful apply, so such an entry
+        # is this lane's own already-restored work. A marker-less or foreign
+        # unpinned entry is a peer's (or bare git's) ONLY handle — refuse it
+        # (#8051 review P1/P2).
+        return bool(r["pinned"]) or _subject_lane_key(r["subject"]) == key
+
+    doomed = [r for r in rows if reclaimable(r)]
+    kept = [r for r in rows if not reclaimable(r)]
     # The state an emptied reflog leaves behind: `refs/stash` resolves while the
     # register enumerates nothing. Routine maintenance creates it, and a pre-fix
     # prune created it on its own, after which `check` failed closed everywhere
     # with no lane_stash command able to clear it (#8051 review P2).
     orphan = head is not None and not rows
     print(f"shared register: {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}; "
-          f"{len(doomed)} pinned by a lane ref (removable), {len(kept)} unpinned (refused)")
+          f"{len(doomed)} removable (a lane ref pins it, or it is this lane's own), "
+          f"{len(kept)} unpinned (refused)")
     for r in doomed:
         print(f"  remove {r['pos']} {r['sha'][:12]}  {r['subject']}")
     for r in kept:
@@ -742,7 +763,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     if not doomed:
         if not orphan:
             return 0
-        return _reclaim_orphan_refs_stash(head, apply=args.apply)
+        return _reclaim_orphan_refs_stash(head, key=key, apply=args.apply)
     if not args.apply:
         print("dry run — re-run with --apply to remove the pinned entries")
         return 0
@@ -776,12 +797,35 @@ def cmd_prune(args: argparse.Namespace) -> int:
     if not _shared_register():
         drop_head = _stash_head()
         if drop_head is not None:
-            _reclaim_orphan_refs_stash(drop_head, apply=True)
+            _reclaim_orphan_refs_stash(drop_head, key=key, apply=True)
     return 0
 
 
-def _reclaim_orphan_refs_stash(sha: str, *, apply: bool) -> int:
-    """Drop an emptied-register `refs/stash` (the last-entry cleanup)."""
+def _orphan_is_reclaimable(sha: str, key: str) -> bool:
+    """Whether an emptied-register `refs/stash` may be dropped without losing work."""
+    if sha in _pinned_shas():
+        return True
+    return _subject_lane_key(_subject_of(sha)) == key
+
+
+def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
+    """Drop an emptied-register `refs/stash` (the last-entry cleanup).
+
+    Gated: an emptied reflog can leave `refs/stash` pointing at an entry NO lane
+    ref pins. Dropping the ref then destroys the only handle a peer's bare
+    `git stash pop` still has (the commit stays in the object DB but becomes
+    gc-eligible), so the drop happens only when a lane ref pins `sha` (lossless)
+    or its subject names THIS lane (its work was already restored by `pop`).
+    Otherwise the orphan is reported and left alone (#8051 review P1).
+    """
+    if not _orphan_is_reclaimable(sha, key):
+        print(f"kept   refs/stash {sha[:12]}  (unpinned orphan: the register enumerates "
+              "nothing, no lane ref pins it, and its subject names no lane — dropping the "
+              "ref would destroy the last handle bare git has on that entry)\n"
+              "  this is a HAZARD state — `lane_stash check` stays fail-closed here; if the "
+              "work is yours, pin it with:\n"
+              f"    python tools/lane_stash.py recover {sha}")
+        return 0
     if not apply:
         print(f"dry run — refs/stash resolves to {sha[:12]} while the register enumerates "
               "nothing; re-run with --apply to drop it (mirrors `git stash drop` of the "
