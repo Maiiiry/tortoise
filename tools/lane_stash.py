@@ -57,10 +57,12 @@ THE CONTRACT
   exactly the silent loss this tool exists to stop. The entry stays; reclaim it
   explicitly with ``prune``, which refuses to remove any entry whose object is
   not pinned by a lane ref (so a delete can never lose work).
-* **``check`` is fail-closed**: exit 0 and a bare ``git stash pop`` in this
-  worktree would take an entry from THIS branch; exit 1 when it would take a
-  FOREIGN entry (or the entry's origin cannot be read); exit 2 on a state error.
-  Safe to call from a lane pre-flight.
+* **``check`` is fail-closed**: exit 0 when a bare ``git stash pop`` in this
+  worktree would take THIS lane's own entry; exit 1 when it would take a FOREIGN
+  entry — a peer lane's (identified by the ``[<lane-key>]`` marker this tool
+  writes, so two worktrees forced onto ONE branch are still told apart) or one
+  whose origin cannot be read; exit 2 on a state error. Safe to call from a lane
+  pre-flight.
 
 THE TARGET IS NOT A PARAMETER
 -----------------------------
@@ -344,6 +346,20 @@ def _subject_branch(subject: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _subject_lane_key(subject: str) -> str | None:
+    """The lane key a tool-created stash message carries, or None.
+
+    `push` writes `lane_stash <uuid4> [<lane-key>] <label>` into the message, so
+    every entry this tool creates is ATTRIBUTABLE to a lane even when two
+    worktrees are forced onto ONE branch — the case the branch heuristic cannot
+    tell apart, because both lanes are on the same branch (#8051 review P2).
+    Anchoring on the 32-hex nonce keeps a user's bracket-containing label from
+    being read as the key.
+    """
+    m = re.search(r"\blane_stash [0-9a-f]{32} \[([^\]]+)\]", subject)
+    return m.group(1) if m else None
+
+
 def _stash_head() -> str | None:
     """The sha `refs/stash` resolves to, or None when the ref does not exist.
 
@@ -578,20 +594,37 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if rows:
         top = rows[0]
-        if not top["branch"]:
-            verdict["safe"] = False
-            verdict["reasons"].append(
-                f"the top shared entry ({top['sha'][:12]}) has an unreadable subject "
-                f"({top['subject']!r}) — its origin cannot be established, so a bare "
-                "`git stash pop` cannot be shown to be safe"
-            )
-        elif top["branch"] != branch:
-            verdict["safe"] = False
-            verdict["reasons"].append(
-                f"the top shared entry ({top['sha'][:12]}) was pushed on branch "
-                f"{top['branch']!r}, not the current branch {branch!r} — a bare "
-                "`git stash pop` HERE would apply and drop another lane's work"
-            )
+        top_lane = _subject_lane_key(top["subject"])
+        # Our own pinned entry is ours whatever its subject says: a cross-lane
+        # `recover` re-pins a peer's dropped entry to THIS lane, and a bare pop
+        # here then takes this lane's own (recovered) work.
+        if not any(e["sha"] == top["sha"] for e in entries):
+            if top_lane is not None and top_lane != key:
+                # The branch heuristic cannot see this: `lane_key` is
+                # worktree-scoped, and two worktrees can be forced onto one
+                # branch, so a matching branch is NOT evidence of ownership.
+                verdict["safe"] = False
+                verdict["reasons"].append(
+                    f"the top shared entry ({top['sha'][:12]}) was pushed by lane "
+                    f"{top_lane!r} (branch {top['branch']!r}), not this lane {key!r} — "
+                    "two worktrees can be forced onto ONE branch, so a matching branch "
+                    "does not make a bare `git stash pop` HERE safe: it would apply and "
+                    "drop that lane's entry"
+                )
+            elif top_lane is None and not top["branch"]:
+                verdict["safe"] = False
+                verdict["reasons"].append(
+                    f"the top shared entry ({top['sha'][:12]}) has an unreadable subject "
+                    f"({top['subject']!r}) — its origin cannot be established, so a bare "
+                    "`git stash pop` cannot be shown to be safe"
+                )
+            elif top_lane is None and top["branch"] != branch:
+                verdict["safe"] = False
+                verdict["reasons"].append(
+                    f"the top shared entry ({top['sha'][:12]}) was pushed on branch "
+                    f"{top['branch']!r}, not the current branch {branch!r} — a bare "
+                    "`git stash pop` HERE would apply and drop another lane's work"
+                )
 
     if args.json:
         print(json.dumps(verdict, indent=2))

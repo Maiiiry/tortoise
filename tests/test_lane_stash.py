@@ -237,6 +237,58 @@ def test_check_fails_closed_on_an_unattributable_top_entry(repo):
     assert "unreadable subject" in check.stdout
 
 
+def test_check_fails_closed_when_a_peer_lane_is_on_the_same_branch(repo, tmp_path):
+    """Two worktrees can be FORCED onto ONE branch — the lane key must decide.
+
+    `lane_key` is worktree-scoped by design, so two worktrees on one branch are
+    two distinct lanes. The branch heuristic cannot tell them apart and reports
+    SAFE while a bare `git stash pop` takes the peer's entry (#8051 review P2).
+    Pre-fix this fails with exit 0.
+    """
+    c = tmp_path / "wtC"
+    repo.git("worktree", "add", "-q", "--force", str(c), "feat/a")
+    for wd in (repo.a, c):
+        assert repo.git("rev-parse", "--abbrev-ref", "HEAD", cwd=wd).stdout.strip() == "feat/a"
+
+    repo.dirty(repo.a, "f.txt", "base\na-A\n")
+    assert repo.lane(repo.a, "push", "-m", "A work").returncode == 0
+    repo.dirty(c, "f.txt", "base\nc-C\n")
+    assert repo.lane(c, "push", "-m", "C work").returncode == 0
+    shas = repo.stash_shas()
+    assert len(shas) == 2 and shas[0] != shas[1]
+    assert len(repo.lane_refs()) == 2, repo.lane_refs()  # distinct lanes, one branch
+
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 1, _fail(check)
+    assert "SAFE" not in check.stdout, check.stdout
+
+    # the hazard the detector refused to clear is real: a bare pop in A takes C's work
+    bare = repo.git("stash", "pop", cwd=repo.a, check=False)
+    assert bare.returncode == 0, _fail(bare)
+    assert "c-C" in (repo.a / "f.txt").read_text(), (
+        "the state must actually be unsafe for the fail-closed assertion to mean anything"
+    )
+
+
+def test_check_is_safe_for_a_recovered_entry_pinned_to_this_lane(repo):
+    """A `recover -m` entry carries no lane marker but the pin makes it ours.
+
+    Without checking the lane's own pinned shas, the unreadable subject would
+    make `check` report a false HAZARD on work this lane explicitly recovered.
+    """
+    repo.dirty(repo.a, "f.txt", "base\nrescued\n")
+    repo.git("stash", "push", "-q", "-m", "On feat/a: note", cwd=repo.a)
+    dropped = repo.stash_sha()
+    repo.git("stash", "drop", cwd=repo.a)
+    cp = repo.lane(repo.a, "recover", "-m", "rescued note", dropped)
+    assert cp.returncode == 0, _fail(cp)
+    assert repo.stash_shas() == [dropped]
+
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 0, _fail(check)
+    assert "SAFE" in check.stdout
+
+
 def test_check_json_exposes_the_verdict(repo):
     import json
 

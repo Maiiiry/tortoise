@@ -112,8 +112,12 @@ One primitive, in `tools/lane_stash.py`:
   enumeration of the shared register naming which entries are foreign, which are pinned by a lane ref
   and which are unpinned debris.
 - **`check`** — the executable detector: exit 1 when a bare `git stash pop` in this worktree would
-  take a **foreign** entry (top entry's branch ≠ current branch) or when unpinned entries exist;
-  exit 0 otherwise. Safe to call from a pre-flight.
+  take a **foreign** entry — a peer lane's (identified by the `[<lane-key>]` marker the tool writes
+  into every message, so two worktrees forced onto ONE branch are still distinct) or one whose
+  origin cannot be read (an expired/absent `refs/stash` reflog, an unreadable subject); exit 0 when
+  the top entry is this lane's own or the register is empty. Unpinned debris is reported as an
+  ADVISORY note, not a failure: a bare pop takes only the TOP entry, so failing on entries below it
+  would refuse states that are genuinely safe. Safe to call from a pre-flight.
 - **`recover <sha>`** — the repair recipe from the incident: `git stash store -m "<original subject>"
   <sha>` **and** pin it, so the restored entry is retrievable by this lane.
 - **`prune`** — explicit reclamation of the shared register: only entries whose object is
@@ -151,7 +155,7 @@ rule is additive.
 | 3 | Lane-scoped refs `refs/lane/<key>/stash/<n>` | State (git ref store) | In/Out | Integration | CAS create; id = path segment; gc-protected | id collision under concurrent push → retry; ref missing after pop |
 | 4 | `git stash apply <sha>` | External process | In (tree mutation) | Integration | restores tracked+staged+untracked; conflict → `UU` + rc≠0 | apply conflict must NOT delete the lane ref (work preserved); foreign sha must be unreachable by construction |
 | 5 | Per-worktree identity (`--git-dir` vs `--git-common-dir`, worktree path) | Config/State | Read | Unit | lane key from the worktree basename + path hash, branch-independent | two worktrees on one branch → distinct keys; a branch switch inside a lane must NOT orphan its pins; detached HEAD → stable key |
-| 6 | `check` exit contract | CLI contract | Out | Integration | 0 = safe, 1 = foreign top / unpinned debris | must fail CLOSED: unreadable state ⇒ non-zero, never "safe" |
+| 6 | `check` exit contract | CLI contract | Out | Integration | 0 = this lane's own top entry or an empty register, 1 = foreign top (peer lane key, else branch) / unreadable origin / unreadable register | must fail CLOSED: unreadable state ⇒ non-zero, never "safe"; unpinned debris is advisory, not a failure |
 
 ### Bug Pattern Flags
 
@@ -159,7 +163,7 @@ rule is additive.
   required verification: a test whose two lanes are two real worktrees and whose pushes are real
   sequential `git stash push` calls, asserting the victim's entry survives and is not applied.
 - **Conditional guards:** `check`'s verdict gates; both sides of every branch get a test (safe top,
-  foreign top, unreadable state).
+  foreign top, same-branch peer lane, unreadable subject, unreadable register).
 - **Silent function skips:** `push` when there is nothing to stash → asserted, so the tool can never
   report a pinned entry it did not create.
 
@@ -208,8 +212,8 @@ rule is additive.
 
 1. The 2-worktree reproduction applies **0** foreign entries and leaves the peer's entry present in
    `git stash list` with an unchanged sha.
-2. `lane_stash check` exits non-zero and names the foreign branch when the shared top is not this
-   lane's, and exits 0 when it is.
+2. `lane_stash check` exits non-zero and names the foreign lane (or, for a bare-git entry, the
+   foreign branch) when the shared top is not this lane's, and exits 0 when it is.
 3. `pop` never deletes from the shared register; `prune` refuses to remove an entry that is not pinned.
 4. `AGENTS.md` states the hazard and names the safe alternative (issue Target: 1 guidance line).
 5. `python tools/ci_selection.py --integrity` is clean with the new test registered.

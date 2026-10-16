@@ -4508,10 +4508,10 @@ durations:
   test_tenancy_spine.py: 3.0
   test_transport_wait_bound.py: 2.1
   test_collision_preflight.py: 3.6
-  # #8051: new file — no CI junit yet. 12.0 is a LOCAL reading (17 tests, 12.5s
-  # on a loaded host through the subprocess+real-git harness); refresh from the
+  # #8051: new file, 25 tests. 45.0 is a LOCAL reading (34.5s here, 49.5s on a
+  # loaded host, both through the subprocess+real-git harness); refresh from the
   # first post-merge junit artifact. Erring high is correct for sharding.
-  test_lane_stash.py: 12.0
+  test_lane_stash.py: 45.0
   test_who_is_on.py: 0.9  # #4256: analogue estimate (same subprocess harness as test_collision_preflight.py); refresh from the first post-merge junit artifact
   test_branch_reaper.py: 2.0  # unmeasured — no measurement in the four source runs; flat default
   test_run_reaper.py: 2.0  # unmeasured — new file (#6868); no CI junit yet, flat default
