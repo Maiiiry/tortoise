@@ -802,3 +802,87 @@ def test_prune_refuses_a_never_applied_pin_failure_entry(repo, monkeypatch):
     bare = repo.git("stash", "pop", cwd=repo.a, check=False)
     assert bare.returncode == 0, _fail(bare)
     assert "never-applied" in (repo.a / "f.txt").read_text()
+
+
+def test_prune_refuses_a_never_applied_pin_failure_orphan(repo, monkeypatch):
+    """The ORPHAN gate must also require the applied-record, not the marker.
+
+    An own-marked, unpinned, never-applied pin-failure entry that is then
+    orphaned by routine reflog expiry (`refs/stash` resolves while the register
+    enumerates nothing) must survive `prune --apply`: its only handle is the
+    ref, and the marker is not proof the work was restored. This pins the
+    `_orphan_is_reclaimable` half of the fix — reverting it to the marker
+    logic leaves the rest of the suite green (#8773 review P2).
+    """
+    mod = _load_tool()
+    monkeypatch.chdir(repo.a)
+    repo.dirty(repo.a, "f.txt", "base\norphaned-never-applied\n")
+
+    def boom(key, sha):
+        raise mod.LaneStashError("could not allocate a lane ref under refs/lane/x")
+
+    monkeypatch.setattr(mod, "_pin", boom)
+    assert mod.main(["push", "-m", "W"]) == 2
+    sha = repo.stash_sha()
+    assert sha
+
+    # routine maintenance empties the reflog; the ref (and the work) live on
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.stash_shas() == [], "precondition: the register enumerates nothing"
+    assert repo.stash_sha() == sha, "precondition: refs/stash still resolves"
+    assert sha not in mod._applied_shas(mod.lane_key()), "precondition: never applied"
+
+    assert mod.main(["prune", "--apply"]) == 0
+    assert repo.stash_sha() == sha, (
+        "prune dropped an orphaned never-applied entry's only handle "
+        "(the marker was read as proof of application)"
+    )
+
+
+def test_prune_cannot_lose_a_kept_entry_to_a_concurrent_push(repo, monkeypatch):
+    """A peer push between prune's verify and its positional delete must not lose work.
+
+    `git reflog delete --updateref refs/stash@{i}` re-resolves the position at
+    DELETE time, so a push landing after the verification shifts every position
+    and the delete removes a KEPT entry — a peer's unpinned one, whose only
+    handle was the reflog. `prune` guard-pins every kept object and re-stores
+    anything the shift removed (#8773 review P1). Pre-fix this loses the peer's
+    entry.
+    """
+    mod = _load_tool()
+    # lane A's PINNED entry (doomed) and a peer's bare, unpinned entry (kept)
+    repo.dirty(repo.a, "f.txt", "base\na-pinned\n")
+    assert repo.lane(repo.a, "push", "-m", "A pinned").returncode == 0
+    pinned = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\npeer-bare\n")
+    repo.git("stash", "push", "-q", "-m", "peer bare work", cwd=repo.b)
+    peer = repo.stash_sha()
+    assert peer and peer != pinned
+    assert repo.stash_shas() == [peer, pinned]
+    # precondition: the peer entry is unpinned, A's is pinned
+    pinned_shas = set(repo.stash_pins().values())
+    assert pinned in pinned_shas and peer not in pinned_shas, (pinned_shas, repo.stash_pins())
+
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    injected = {"done": False}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        # A peer push in the verify -> delete window: the exact race the guard
+        # and reconciliation exist for.
+        if args[:2] == ("reflog", "delete") and not injected["done"]:
+            injected["done"] = True
+            repo.dirty(repo.b, "f.txt", "base\nlate-push\n")
+            repo.git("stash", "push", "-q", "-m", "late peer push", cwd=repo.b)
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    assert mod.main(["prune", "--apply"]) == 0
+    assert injected["done"], "the test never exercised the shift"
+    assert peer in repo.stash_shas(), (
+        "prune lost the peer's only handle to a positional shift — the guard/reconcile failed"
+    )
+    # the peer can still restore its work
+    bare = repo.git("stash", "pop", cwd=repo.b, check=False)
+    assert bare.returncode == 0, _fail(bare)
+    assert "peer-bare" in (repo.b / "f.txt").read_text()

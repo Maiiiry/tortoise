@@ -59,8 +59,14 @@ THE CONTRACT
   before the lane pin is released (the message marker is written by ``push``
   BEFORE ``_pin`` runs, so the marker alone is never evidence that an entry was
   applied). Reclaim explicitly with ``prune``, which removes an entry only when
-  a lane ref pins it or this lane's applied-record names it — so a delete can
-  never lose work.
+  a lane ref pins it or this lane's applied-record names it. Because a
+  positional ``reflog delete`` re-resolves ``refs/stash@{i}`` at delete time and
+  cannot be made atomic with its verification (git's own ``stash drop`` behaves
+  the same), ``prune`` also guard-pins every entry it intends to KEEP and
+  re-stores any entry a concurrent push's position shift caused it to remove, so
+  every register entry present when the prune started keeps a handle. Run
+  ``prune`` when the register is quiet: an entry PUSHED during the prune is
+  outside that guard set, and the prune aborts rather than guessing.
 * **``check`` is fail-closed**: exit 0 when a bare ``git stash pop`` in this
   worktree would take THIS lane's own entry; exit 1 when it would take a FOREIGN
   entry — a peer lane's (identified by the ``[<lane-key>]`` marker this tool
@@ -475,6 +481,32 @@ def _clear_applied(key: str, sha: str) -> None:
     _git("update-ref", "-d", _applied_ref(key, sha), sha, check=False)
 
 
+#: Namespace for the prune's temporary GC guard. Deliberately OUTSIDE
+#: ``refs/lane`` so no reader of lane ownership (`_pinned_shas`, `_applied_shas`,
+#: `_parse_entries`) can ever see it.
+GUARD_NS = "refs/pi-lane-prune-guard"
+
+
+def _guard_pin(sha: str) -> str:
+    """Pin ``sha`` for the duration of one prune so a positional race cannot lose it.
+
+    ``git reflog delete --updateref refs/stash@{i}`` re-resolves the position at
+    DELETE time (git's own ``stash drop`` behaves the same), so a peer push
+    landing between our verification and the delete shifts every position and
+    can remove an entry that is NOT in the doomed set — a peer's unpinned entry,
+    whose only handle was the reflog. Pinning the object first makes it
+    un-gc-able, so the reconciliation in :func:`cmd_prune` can always re-store
+    it (#8773 review P1).
+    """
+    ref = f"{GUARD_NS}/{sha}"
+    _git("update-ref", ref, sha, check=False)
+    return ref
+
+
+def _guard_unpin(ref: str, sha: str) -> None:
+    _git("update-ref", "-d", ref, sha, check=False)
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -819,49 +851,86 @@ def cmd_prune(args: argparse.Namespace) -> int:
         print("dry run — re-run with --apply to remove the pinned entries")
         return 0
 
-    # Positions are walked HIGH -> LOW so an earlier delete cannot renumber a
-    # later specifier. `reflog delete` re-resolves `refs/stash@{i}` at DELETE
-    # time, so the sha at that position is re-verified immediately before each
-    # delete; if a peer pushed in between, the verification fails and this prune
-    # stops instead of removing an entry that would not be lossless to remove.
-    order = sorted(doomed, key=lambda r: int(r["pos"].rsplit("@{", 1)[-1].rstrip("}")))
-    removed = 0
-    removed_shas: list[str] = []
-    for r in reversed(order):
-        spec = r["pos"]
-        here = _out("rev-parse", spec, check=False)
-        if here != r["sha"]:
-            print(f"STOP: {spec} is now {here or 'gone'} (expected {r['sha']}) — a peer "
-                  "pushed during the prune; re-run when the register is quiet")
-            return 0
-        cp = _git("reflog", "delete", "--updateref", spec, check=False)
-        if cp.returncode != 0:
-            print(f"could not remove {spec}: {cp.stderr.strip()}")
-            continue
-        removed_shas.append(r["sha"])
-        removed += 1
-    print(f"removed {removed} pinned shared-register entr"
-          f"{'y' if removed == 1 else 'ies'}; {len(kept)} unpinned left untouched")
-    # `reflog delete --updateref` empties the reflog but git does NOT drop the
-    # ref when it empties (measured). If this prune took the LAST entry the ref
-    # still resolves, so the "removed" entry stays live for bare git and `check`
-    # fails closed with no command able to clear it. Mirror `git stash drop`'s
-    # last-entry behaviour (#8051 review P2; the plan's row 8 said otherwise).
-    if not _shared_register():
-        drop_head = _stash_head()
-        if drop_head is not None:
-            _reclaim_orphan_refs_stash(drop_head, key=key, apply=True)
-    # Applied-records are dropped only NOW, after the orphan handling: the last
-    # entry's record is exactly what proves the emptied `refs/stash` may be
-    # dropped, so clearing it earlier wedges the ref (measured: prune then
-    # refused to drop it and `check` stayed fail-closed). Only entries that were
-    # ACTUALLY removed are cleared: a failed `reflog delete` leaves its entry in
-    # the register, and that entry must stay reclaimable by a later prune.
-    # Best-effort — a leftover record only costs a tiny ref.
-    for sha in removed_shas:
-        if sha in applied:
-            _clear_applied(key, sha)
-    return 0
+    # GC guard for every entry this prune intends to KEEP (see `_guard_pin`).
+    # `reflog delete` re-resolves `refs/stash@{i}` at DELETE time, so a peer push
+    # landing between our verification and the delete shifts every position and
+    # can remove a KEPT entry — a peer's unpinned one, whose only handle was the
+    # reflog. The guard makes that object un-gc-able; the reconciliation below
+    # re-stores anything the shift removed (#8773 review P1).
+    guarded: dict[str, tuple[str, str]] = {}
+    for r in kept:
+        guarded[r["sha"]] = (_guard_pin(r["sha"]), r["subject"])
+    try:
+        # Positions are walked HIGH -> LOW so an earlier delete cannot renumber a
+        # later specifier. `reflog delete` re-resolves `refs/stash@{i}` at DELETE
+        # time, so the sha at that position is re-verified immediately before each
+        # delete; if a peer pushed in between, the verification fails and this prune
+        # stops instead of removing an entry that would not be lossless to remove.
+        order = sorted(doomed, key=lambda r: int(r["pos"].rsplit("@{", 1)[-1].rstrip("}")))
+        removed = 0
+        removed_shas: list[str] = []
+        for r in reversed(order):
+            spec = r["pos"]
+            here = _out("rev-parse", spec, check=False)
+            if here != r["sha"]:
+                print(f"STOP: {spec} is now {here or 'gone'} (expected {r['sha']}) — a peer "
+                      "pushed during the prune; re-run when the register is quiet")
+                return 0
+            cp = _git("reflog", "delete", "--updateref", spec, check=False)
+            if cp.returncode != 0:
+                print(f"could not remove {spec}: {cp.stderr.strip()}")
+                continue
+            removed_shas.append(r["sha"])
+            removed += 1
+        print(f"removed {removed} pinned shared-register entr"
+              f"{'y' if removed == 1 else 'ies'}; {len(kept)} unpinned left untouched")
+        # `reflog delete --updateref` empties the reflog but git does NOT drop the
+        # ref when it empties (measured). If this prune took the LAST entry the ref
+        # still resolves, so the "removed" entry stays live for bare git and `check`
+        # fails closed with no command able to clear it. Mirror `git stash drop`'s
+        # last-entry behaviour (#8051 review P2; the plan's row 8 said otherwise).
+        if not _shared_register():
+            drop_head = _stash_head()
+            if drop_head is not None:
+                _reclaim_orphan_refs_stash(drop_head, key=key, apply=True)
+        # Reconciliation: a KEPT sha that is no longer in the register was removed
+        # by a position shift caused by a concurrent push (the verify/delete window
+        # is not atomic and cannot be made so with git's positional reflog delete).
+        # Its object is still held by its guard ref, so re-store it with its
+        # original reflog subject — the prune must not lose a peer's only handle
+        # (#8773 review P1).
+        live = {x["sha"] for x in _shared_register()}
+        restored: list[str] = []
+        for sha, (ref, subject) in guarded.items():
+            if sha in live:
+                continue
+            cp = _git("stash", "store", "-m", subject or f"recovered {sha}", sha, check=False)
+            if cp.returncode == 0:
+                restored.append(sha)
+            else:
+                print(f"warning: {sha[:12]} was removed by a concurrent push during this "
+                      f"prune and could not be re-stored; its guard ref {ref} still holds "
+                      "it — restore it with\n"
+                      f"  python tools/lane_stash.py recover {sha}")
+        if restored:
+            print(f"RESTORED {len(restored)} shared-register entr"
+                  f"{'y' if len(restored) == 1 else 'ies'} a concurrent push caused this "
+                  "prune to remove in error — re-check the register with `lane_stash list`")
+        # Applied-records are dropped only NOW, after the orphan handling: the last
+        # entry's record is exactly what proves the emptied `refs/stash` may be
+        # dropped, so clearing it earlier wedges the ref (measured: prune then
+        # refused to drop it and `check` stayed fail-closed). Only entries that were
+        # ACTUALLY removed AND are genuinely gone are cleared: a failed or
+        # wrong-position `reflog delete` leaves its entry in the register, and that
+        # entry must stay reclaimable by a later prune. Best-effort — a leftover
+        # record only costs a tiny ref.
+        for sha in removed_shas:
+            if sha in applied and sha not in live:
+                _clear_applied(key, sha)
+        return 0
+    finally:
+        for sha, (ref, _subject) in guarded.items():
+            _guard_unpin(ref, sha)
 
 
 def _orphan_is_reclaimable(sha: str, key: str) -> bool:
