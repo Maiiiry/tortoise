@@ -446,18 +446,31 @@ def _store_into_register(sha: str, subject: str) -> bool:
     the state an emptied reflog leaves behind. Reading rc 0 as success therefore
     reports a restoration that never happened, and the retention message's own
     ``recover <sha>`` repair is a no-op that leaves ``check`` fail-closed
-    (#8773 review P1). When rc is 0 but the register did not gain the entry,
-    drop the stale ref (CAS) and store once more so the reflog entry is really
-    created. Success is the VERIFIED register state, never the exit code.
+    (#8773 review P1).
+
+    The repair — drop the stale ref, then store once more — is taken ONLY in the
+    genuine orphan state, where the enumerated register is EMPTY. A ``refs/stash``
+    that DIVERGED from a non-empty reflog (a bare ``git reflog delete`` WITHOUT
+    ``--updateref`` leaves exactly that) still carries PEER entries, and
+    ``update-ref -d`` deletes the whole reflog with them (#8773 review P1); that
+    state is refused, never repaired destructively. Success is the VERIFIED
+    register state, never the exit code.
     """
     cp = _git("stash", "store", "-m", subject, sha, check=False)
     if cp.returncode != 0:
         return False
     if _register_contains(sha):
         return True
-    if _stash_head() == sha and _drop_refs_stash(sha):
-        cp = _git("stash", "store", "-m", subject, sha, check=False)
-        return cp.returncode == 0 and _register_contains(sha)
+    if _shared_register() or _stash_head() != sha:
+        return False
+    if not _drop_refs_stash(sha):
+        return False
+    cp = _git("stash", "store", "-m", subject, sha, check=False)
+    if cp.returncode == 0 and _register_contains(sha):
+        return True
+    # The re-store failed after the drop: put the handle back rather than leave
+    # the object with neither a ref nor a reflog entry.
+    _git("update-ref", "refs/stash", sha, check=False)
     return False
 
 
@@ -563,6 +576,26 @@ def _guard_refs(key: str) -> list[tuple[str, str]]:
     return [(p[0], p[1]) for ln in cp.stdout.splitlines() if len(p := ln.split()) >= 2]
 
 
+def _guard_release_all(sha: str) -> None:
+    """Drop every prune guard for ``sha``, under ANY lane key.
+
+    A guard is created by whichever lane ran the prune, but the rescued entry may
+    be recovered from a DIFFERENT worktree — and once some ref names the object
+    the guard is redundant wherever it lives. Unpinning only the current lane's
+    guard leaked the other lane's forever (#8773 review P2).
+    """
+    cp = _git("for-each-ref", "--format=%(refname)", f"{GUARD_NS}/*/{sha}", check=False)
+    if cp.returncode != 0:
+        return
+    for ref in cp.stdout.split():
+        _guard_unpin(ref, sha)
+
+
+def _refs_pointing_at(sha: str) -> set[str]:
+    cp = _git("for-each-ref", "--format=%(refname)", f"--points-at={sha}", check=False)
+    return set(cp.stdout.split()) if cp.returncode == 0 else set()
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -643,11 +676,14 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     guards = _guard_refs(key)
     if guards:
-        print(f"prune guards held ({len(guards)} — the object is kept gc-safe because no "
+        print(f"prune guards held ({len(guards)} — each keeps its object gc-safe while no "
               "other ref names it; free one by recovering it, or drop the ref once you "
               "know the work is safe)")
         for ref, sha in guards:
-            print(f"  {sha[:12]}  {ref}")
+            others = _refs_pointing_at(sha) - {ref}
+            note = (f"  (also named by: {', '.join(sorted(others))})" if others
+                    else "  (no other ref names it)")
+            print(f"  {sha[:12]}  {ref}{note}")
     if rows and (rows[0]["branch"] != branch or not rows[0]["branch"]):
         print("\n⚠️  the top shared entry is not this lane's — use `lane_stash pop <id>`, "
               "never a bare `git stash pop` (see `lane_stash check`).")
@@ -865,9 +901,11 @@ def cmd_recover(args: argparse.Namespace) -> int:
         )
     key = lane_key()
     entry = _pin_or_report(key, args.sha)
-    # The object now has a lane pin, so a prune guard for it is redundant — and a
-    # guard left here would keep the object un-gc-able for good (#8773 review P2).
-    _guard_unpin(f"{GUARD_NS}/{key}/{args.sha}", args.sha)
+    # The object now has a lane pin, so a prune guard for it is redundant — under
+    # ANY lane key, because the entry may have been retained by another lane's
+    # prune and a guard left here would keep the object un-gc-able for good
+    # (#8773 review P2).
+    _guard_release_all(args.sha)
     print(f"restored {args.sha} to the shared register (subject: {subject!r})")
     print(f"pinned lane entry {entry['id']} [{entry['ref']}] for lane {key}")
     return 0

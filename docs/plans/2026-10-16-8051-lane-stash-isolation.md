@@ -151,9 +151,12 @@ One primitive, in `tools/lane_stash.py`:
 - **Restoration is verified, not inferred from an exit code.** `git stash store` returns 0
   *without* creating a reflog entry when `refs/stash` already points at that sha (measured) —
   precisely the state an emptied reflog leaves. `recover` and `prune`'s reconciliation therefore
-  check the register after storing, CAS-drop the stale ref and store once more when it was a
-  no-op, and report success only on the verified state. Without this, the retention message's own
-  `recover <sha>` repair does nothing while claiming success.
+  check the register after storing, and only report success on the verified state. The repair —
+  drop the stale ref and store once more — is taken **only when the enumerated register is empty**
+  (the genuine orphan). A `refs/stash` diverged from a NON-empty reflog (a bare `git reflog delete`
+  without `--updateref` leaves exactly that) still holds peer entries, and dropping the ref would
+  delete the whole reflog with them: that state is **refused, never repaired destructively**. A
+  failed re-store puts the ref back rather than leaving the object handle-less.
 - **Residual race (documented, NOT detectable).** `prune` compares the register's whole sha state
   against the expected one after each delete, which catches every interleaving that changes that
   state. It is not a proof. A push landing *inside* the delete and a concurrent remover taking the
@@ -167,9 +170,11 @@ One primitive, in `tools/lane_stash.py`:
   no applied-record names, `prune` retains it; it now guard-pins the object rather than relying on
   `refs/stash`, because the reconciliation's `stash store` can move that ref and would otherwise have
   destroyed the handle the retention message just promised. A retained guard has exactly one
-  lifetime: it is released once `recover` puts the entry back under `refs/lane` (or when a prune's
-  `finally` sees the sha back in the register), and `lane_stash list` prints any still held, so the
-  namespace can be enumerated and cleared rather than silently keeping objects un-gc-able forever.
+  lifetime: it is released once `recover` puts the entry back under `refs/lane` — under **any** lane
+  key, since another worktree may be the one to rescue it — or when a prune's `finally` sees the sha
+  back in the register. `lane_stash list` prints any still held and, per guard, whether another ref
+  names the object, so the namespace can be enumerated and cleared rather than silently keeping
+  objects un-gc-able forever.
 
 Out of scope (reported, not absorbed): the skills text (`using-git-worktrees`, `commit-workflow`) is
 a symlink to agent-infra and belongs to agent-infra #1264; the `main-worktree-guard` extension

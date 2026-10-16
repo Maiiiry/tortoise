@@ -1207,3 +1207,62 @@ def test_prune_handles_duplicate_register_entries(repo, monkeypatch, capsys):
     assert "WARNING" not in out, out
     assert "removed 2" in out, out
     assert repo.stash_shas() == [kept], "both doomed occurrences (and only those) go"
+
+
+def test_recover_refuses_rather_than_drop_a_diverged_register(repo, monkeypatch, capsys):
+    """A ref/reflog divergence must not let `recover` destroy peer entries.
+
+    `git reflog delete refs/stash@{0}` WITHOUT `--updateref` (a bare-git action)
+    leaves `refs/stash` pointing at the deleted entry while the OTHER entries
+    stay in the reflog. `stash store` no-ops in that state, and dropping the ref
+    to force a reflog entry would delete the whole reflog — including the peer
+    entry still enumerated there (#8773 review P1). `recover` must refuse, and
+    leave both the peer entry and the ref alone.
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\npeer\n")
+    repo.git("stash", "push", "-q", "-m", "peer", cwd=repo.b)
+    peer = repo.stash_sha()
+    repo.dirty(repo.a, "f.txt", "base\nown\n")
+    assert repo.lane(repo.a, "push", "-m", "own").returncode == 0
+    own = repo.stash_sha()
+    assert peer is not None and own is not None and repo.stash_shas() == [own, peer]
+    # bare git deletes the TOP reflog entry without moving the ref: refs/stash
+    # still resolves to `own`, which is now absent from the register
+    repo.git("reflog", "delete", "refs/stash@{0}")
+    assert repo.stash_shas() == [peer]
+    assert repo.stash_sha() == own
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["recover", own, "-m", "recover own"]) != 0
+    assert repo.stash_shas() == [peer], "the peer entry must survive the refusal"
+    assert repo.stash_sha() == own, "the diverged ref must be left in place"
+
+
+def test_recover_releases_a_guard_created_by_another_lane(repo, monkeypatch, capsys):
+    """A guard must be released even when another lane does the recovering.
+
+    Lane B's prune retains and guard-pins an orphan; lane A is the one that runs
+    `recover`. Unpinning only the current lane's guard left lane B's ref (and the
+    object it keeps alive) in place forever, and made B's `list` claim no other
+    ref named it (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    orphan = repo.stash_sha()
+    repo.git("reflog", "delete", "--updateref", "refs/stash@{0}")
+    assert repo.stash_shas() == []
+    assert orphan is not None
+    # lane B's prune retains the orphan and guards it
+    assert repo.lane(repo.b, "prune", "--apply").returncode == 0
+    assert repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.split(), "lane B must have guard-pinned the orphan"
+    # lane A recovers it
+    monkeypatch.chdir(repo.a)
+    assert mod.main(["recover", orphan, "-m", "rescued"]) == 0
+    assert repo.stash_shas() == [orphan]
+    assert repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.strip() == "", "another lane's guard must be released too"
