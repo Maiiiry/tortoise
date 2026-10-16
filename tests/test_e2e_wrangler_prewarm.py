@@ -63,14 +63,27 @@ WRANGLER_REF = re.compile(r"wrangler@(\d+(?:\.\d+)*)")
 WRANGLER_SPEC = re.compile(r"wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
+#: YAML block scalars carry their `#` lines as TEXT, so a comment that merely
+#: mentions `wrangler@4` (a historical note, say) read as a floating pin and would
+#: red an otherwise clean required check. These checks are about what a step DOES,
+#: so comments are stripped before matching — pinned by the comment arms in
+#: `test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range`.
+_COMMENT_LINE = re.compile(r"^\s*#")
+
+
+def _commands(run: str) -> str:
+    """The executable lines of a step's `run` block — comments are not commands."""
+    return "\n".join(l for l in run.splitlines() if not _COMMENT_LINE.match(l))
+
+
 def _exact_wranglers(run: str) -> set[str]:
     """An EXACT pin (`4.127.0`) — the version that actually boots."""
-    return {v for v in WRANGLER_REF.findall(run) if v.count(".") == 2}
+    return {v for v in WRANGLER_REF.findall(_commands(run)) if v.count(".") == 2}
 
 
 def _floating_wranglers(run: str) -> set[str]:
     """A range (`4`, `4.127`) or dist-tag (`latest`) — never acceptable here."""
-    return {v for v in WRANGLER_SPEC.findall(run) if v.count(".") != 2}
+    return {v for v in WRANGLER_SPEC.findall(_commands(run)) if v.count(".") != 2}
 
 #: The e2e jobs that serve this repo's `website/` (marketing + dashboard) and so
 #: share the pre-warm. A rename shows up here as a failure, not as silent loss.
@@ -250,6 +263,11 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
     assert _floating_wranglers("npx --yes wrangler@4 --version") == {"4"}
     assert _floating_wranglers("npx --yes wrangler@4.127 --version") == {"4.127"}
     assert _floating_wranglers("npx --yes wrangler@4.127.0 --version") == set()
+    # A COMMENT IS NOT A COMMAND. A historical note naming a floated version must
+    # not read as an offender (it red a clean required check), and a comment
+    # naming an exact pin must not satisfy the parity check for a floating boot.
+    assert _floating_wranglers("# was: wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
+    assert _exact_wranglers("# was: wrangler@4.127.0\nnpx --yes wrangler@latest --version") == set()
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:

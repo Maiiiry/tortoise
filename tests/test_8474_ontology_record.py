@@ -30,7 +30,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tortoise.raw_state import RAW_STATE_AT_PROP, RAW_STATE_PROP
+from tortoise.raw_state import (
+    RAW_DELETED,
+    RAW_PRESENT,
+    RAW_STATE_AT_PROP,
+    RAW_STATE_PROP,
+    WRITABLE_RAW_STATES,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 ONTOLOGY = REPO / "docs" / "ONTOLOGY.md"
@@ -66,14 +72,16 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
         "§4.6 must define `rawStateAt` generally — the writer stamps it on "
         "every state-carrying write, including `rawState='present'` (F5)"
     )
-    # F6: the observation is caller-supplied and has NO shipped reader yet.
+    # F6: the observation is caller-supplied and no reader supplies one today.
     assert "#8740" in section, (
         "§4.6 must name #8740 — the tracked follow-up for wiring the "
-        "`observed=` seam into a shipped reader (F6)"
+        "`observed=` seam into a reader (F6)"
     )
-    assert "no shipped reader supplies one today" in section, (
-        "§4.6 must not imply a read derives the conditions: no shipped reader "
-        "supplies an observation today (F6)"
+    assert "no reader supplies an observation today" in section, (
+        "§4.6 must not imply a read derives the conditions: no reader supplies "
+        "an observation today (F6), and the claim must be worded without a "
+        "delivery participle — the design-document guard refuses issue state "
+        "here (#8745/#8738)"
     )
     # F7: a version transition's state rides `SourceVersioned`, folded back
     # through `_fold_source_versioned` -> `_upsert_source`.
@@ -93,3 +101,8 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
     # row names — so neither half can move alone.
     from tortoise.projection.entities import _SOURCE_NODE_PROP_NAMES
     assert {RAW_STATE_PROP, RAW_STATE_AT_PROP} <= set(_SOURCE_NODE_PROP_NAMES)
+    assert WRITABLE_RAW_STATES == (RAW_PRESENT, RAW_DELETED), (
+        "the vocabulary in the section text must match the declared write "
+        "surface — a doc that adds a recordable value (e.g. `offline`) must "
+        "fail here, not only in the docker-lane file"
+    )
