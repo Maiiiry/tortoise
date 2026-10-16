@@ -70,14 +70,26 @@ WRANGLER_SPEC = re.compile(r"wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)")
 #: WHOLE block: a word-leading `#` opens a comment only outside a quoted string,
 #: and shell quoting spans a backslash-newline continuation, so a per-line scan
 #: would reset `quote`, cut a real command short and hide the float on it.
+#: A `#` opens a comment at a WORD BOUNDARY, which in shell is not only
+#: whitespace — the metacharacters below end a word too (`;#`, `&&#`).
 _QUOTE_CHARS = "\"'"
+_WORD_START = " \t\n;&|()<>"
 
 
 def _commands(run: str) -> str:
-    """The executable text of a step's `run` block — comments are not commands."""
+    """The executable text of a step's `run` block — comments are not commands.
+
+    Shell rules modelled here, each one because an earlier version got it wrong
+    and hid a real `wrangler@` float (or invented one): the scan runs over the
+    WHOLE block so quoting survives a backslash-newline continuation; outside
+    quotes a backslash ESCAPES the next character, so an escaped quote inside a
+    double-quoted string does not end it; and a `#` starts a comment after any
+    word boundary, not only after whitespace.
+    """
     out: list[str] = []
     quote = ""
-    at_word_start = True  # a `#` opens a comment only where a word could begin
+    escaped = False
+    at_word_start = True
     commenting = False
     for ch in run:
         if commenting:
@@ -86,7 +98,11 @@ def _commands(run: str) -> str:
                 out.append(ch)
                 at_word_start = True
             continue
-        if quote:
+        if escaped:
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            escaped = True
+        elif quote:
             if ch == quote:
                 quote = ""
         elif ch in _QUOTE_CHARS:
@@ -95,7 +111,7 @@ def _commands(run: str) -> str:
             commenting = True
             continue
         out.append(ch)
-        at_word_start = ch == "\n" or ch.isspace()
+        at_word_start = ch in _WORD_START
     return "".join(out)
 
 
@@ -302,6 +318,13 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
     # shell removes the backslash-newline inside the quotes, so this is one real
     # command line, and a per-line strip would cut it at the quote and lose the pin.
     assert _floating_wranglers('echo "refs \\\n#8743" && npx --yes wrangler@4 --version') == {"4"}
+    # An ESCAPED quote does not end the string, so that `#` is literal and the
+    # float after it is on the executable line.
+    assert _floating_wranglers('echo "escaped \\" # note" && npx --yes wrangler@4 --version') == {"4"}
+    # A `#` also opens a comment after a metacharacter: reading `;#…` as a
+    # command invents a pin out of a comment.
+    assert _floating_wranglers("echo a;# was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
+    assert _floating_wranglers("echo a &&# was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:

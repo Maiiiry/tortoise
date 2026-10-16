@@ -28,7 +28,6 @@ Class-B test doctrine:
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from tortoise.raw_state import (
@@ -102,26 +101,23 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
     # row names — so neither half can move alone.
     from tortoise.projection.entities import _SOURCE_NODE_PROP_NAMES
     assert {RAW_STATE_PROP, RAW_STATE_AT_PROP} <= set(_SOURCE_NODE_PROP_NAMES)
-    # …and the DOC half of the same binding. The enumeration is compared as a
-    # TOKEN SET inside the recordable clause, NOT as a substring: a substring
-    # survives every append form (`…or `deleted`` stays intact when a value is
-    # added after it), which is exactly how the first version of this anchor
-    # passed the mutation it was written to catch.
-    clause = re.search(
-        r"\*\*recordable\*\* as (?P<values>.+?)\*\*a deletion is an ACT\*\*",
-        section,
-        re.S,
+    # …and the DOC half of the same binding, pinned VERBATIM rather than parsed
+    # for backticked tokens: a token scan misses a value appended UNBACKTICKED
+    # (§4.6's own `sourceKind` row writes its enumeration unbackticked), and a
+    # shorter-substring pin survives an append entirely. A second claim is
+    # refused too, so a value cannot be added in a new sentence beside the
+    # clause this pin reads.
+    assert (
+        "`rawState` is **recordable** as `present` (the documented way back) or "
+        "`deleted` — **a deletion is an ACT**"
+    ) in section, (
+        "§4.6's recordable clause must be exactly this text — the declared write "
+        f"surface is {sorted(WRITABLE_RAW_STATES)}; `offline` / `access_revoked` "
+        "are conditions observed live, never recorded"
     )
-    assert clause, (
-        "§4.6 must state the recordable enumeration — the `**recordable** as … "
-        "**a deletion is an ACT**` clause this pin reads"
-    )
-    recorded = set(re.findall(r"`([^`\n]+)`", clause.group("values")))
-    assert recorded == {RAW_PRESENT, RAW_DELETED}, (
-        "§4.6's recordable vocabulary must be exactly the values the code writes "
-        f"— the row names {sorted(recorded)}, the write surface is "
-        f"{sorted({RAW_PRESENT, RAW_DELETED})}. `offline` / `access_revoked` are "
-        "conditions observed live, never recorded"
+    assert section.lower().count("recordable") == 1, (
+        "§4.6 must make exactly one recordable-vocabulary claim: a second one can "
+        "widen the stored vocabulary without touching the clause pinned above"
     )
     assert WRITABLE_RAW_STATES == (RAW_PRESENT, RAW_DELETED), (
         "the declared write surface must remain exactly `present` / `deleted` — "
