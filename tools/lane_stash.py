@@ -455,16 +455,27 @@ def _store_into_register(sha: str, subject: str, key: str) -> bool:
     ``update-ref -d`` deletes the whole reflog with them (#8773 review P1); that
     state is refused, never repaired destructively.
 
-    Storing MOVES ``refs/stash``, so an unrelated unpinned orphan whose only
-    handle is that ref (register empty, ref pointing elsewhere) must be
-    guard-pinned FIRST — otherwise repairing ``sha`` silently displaces it and
-    leaves it gc-eligible. ``prune`` already protects it; ``recover`` did not
-    (#8773 review P1), and an unpinnable orphan refuses the store (fail-closed).
-    Success is the VERIFIED register state, never the exit code.
+    Storing MOVES ``refs/stash``, so a head that the store would leave without a
+    handle must be guard-pinned FIRST: when ``refs/stash`` points at a sha the
+    register does not enumerate and no other ref names — an unpinned orphan, in
+    the empty register OR in a register still holding other entries — repairing
+    ``sha`` would otherwise displace it and leave it gc-eligible. ``prune`` already
+    protects it; ``recover`` did not (#8773 review P1). A head that another ref
+    already names needs no guard (a guard there would be a redundant ref with no
+    lifetime, #8773 review P2), and an unpinnable orphan refuses the store
+    (fail-closed). Success is the VERIFIED register state, never the exit code.
     """
     head = _stash_head()
-    if (head is not None and head != sha and not _shared_register()
-            and _guard_pin(key, head) is None):
+    if (
+        head is not None
+        and head != sha
+        # the store below moves refs/stash OFF `head`; if the register does not
+        # enumerate it and no other ref names it, it is left with NO handle. This
+        # covers the empty register AND the diverged-with-entries register.
+        and head not in {r["sha"] for r in _shared_register()}
+        and not (_refs_pointing_at(head) - {"refs/stash"})
+        and _guard_pin(key, head) is None
+    ):
         return False
     cp = _git("stash", "store", "-m", subject, sha, check=False)
     if cp.returncode != 0:

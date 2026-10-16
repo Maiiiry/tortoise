@@ -157,9 +157,11 @@ One primitive, in `tools/lane_stash.py`:
   without `--updateref` leaves exactly that) still holds peer entries, and dropping the ref would
   delete the whole reflog with them: that state is **refused, never repaired destructively**. A
   failed re-store puts the ref back rather than leaving the object handle-less. Storing MOVES
-  `refs/stash`, so an unrelated unpinned orphan whose only handle that ref is (register empty, ref
-  pointing elsewhere) is guard-pinned **before** the store — otherwise repairing one entry would
-  silently displace the other (`test_recover_does_not_displace_an_unrelated_orphan`).
+  `refs/stash`, so a head that the store would leave without a handle — the ref points at a sha the
+  register does not enumerate and no other ref names — is guard-pinned **before** the store, in the
+  empty register AND in a register still holding other entries (a diverged ref); a head another ref
+  already names is left alone, so no redundant guard is leaked. An unpinnable head refuses the store
+  (fail-closed).
 - **Residual race (documented, NOT detectable).** `prune` compares the register's whole sha state
   against the expected one after each delete, which catches every interleaving that changes that
   state. It is not a proof. A push landing *inside* the delete and a concurrent remover taking the

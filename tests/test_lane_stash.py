@@ -1370,3 +1370,110 @@ def test_recover_restores_the_ref_when_the_second_store_fails(repo, monkeypatch,
     assert mod.main(["recover", orphan, "-m", "rescue"]) != 0
     assert calls["n"] == 2
     assert repo.stash_sha() == orphan, "the ref must be put back after a failed re-store"
+
+
+def test_recover_protects_a_diverged_registers_head(repo, monkeypatch, capsys):
+    """A non-empty register must not exempt its un-enumerated ref head.
+
+    `git reflog delete refs/stash@{0}` WITHOUT `--updateref` over a register that
+    still holds other entries leaves `refs/stash` on an unpinned, un-enumerated
+    head. Storing a rescued entry moves that ref off it, so the head must be
+    guard-pinned even though the register is NOT empty (#8773 review P1).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\nz\n")
+    repo.git("stash", "push", "-q", "-m", "z", cwd=repo.b)
+    z = repo.stash_sha()
+    repo.git("stash", "drop", "-q", cwd=repo.b)
+    repo.dirty(repo.b, "f.txt", "base\nx\n")
+    repo.git("stash", "push", "-q", "-m", "x", cwd=repo.b)
+    x = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\ny\n")
+    repo.git("stash", "push", "-q", "-m", "y", cwd=repo.b)
+    y = repo.stash_sha()
+    # bare git drops the TOP reflog entry without moving the ref: refs/stash
+    # stays on unpinned `y` while the register still enumerates `x`
+    repo.git("reflog", "delete", "refs/stash@{0}")
+    assert repo.stash_shas() == [x]
+    assert repo.stash_sha() == y
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["recover", z, "-m", "z rescue"]) == 0
+    assert repo.stash_shas() == [z, x]
+    named = repo.git("for-each-ref", "--format=%(objectname)").stdout.split()
+    assert y in named, "the diverged head must still be named by a ref"
+
+
+def test_recover_does_not_guard_an_already_pinned_head(repo, monkeypatch, capsys):
+    """A head another ref already names needs no guard (which would leak).
+
+    `_guard_release_all` only ever frees guards for the recovered sha, so a guard
+    created for a head that was already pinned under `refs/lane` would live
+    forever, contradicting the plan's one-lifetime rule (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\nz\n")
+    repo.git("stash", "push", "-q", "-m", "z", cwd=repo.b)
+    z = repo.stash_sha()
+    repo.git("stash", "drop", "-q", cwd=repo.b)
+    repo.dirty(repo.a, "f.txt", "base\ny\n")
+    assert repo.lane(repo.a, "push", "-m", "y").returncode == 0
+    y = repo.stash_sha()
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.stash_shas() == []
+    assert repo.stash_sha() == y
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["recover", z, "-m", "z rescue"]) == 0
+    guards = repo.git(
+        "for-each-ref", "--format=%(refname) %(objectname)", "refs/pi-lane-prune-guard"
+    ).stdout.split()
+    assert y not in guards, "an already-pinned head must not get a guard ref"
+
+
+def test_recover_refuses_when_the_orphan_cannot_be_pinned(repo, monkeypatch, capsys):
+    """An unpinnable orphan must refuse the store (fail-closed), not displace it.
+
+    The docstring claims this; without a test a fail-open regression passes the
+    suite (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\nz\n")
+    repo.git("stash", "push", "-q", "-m", "z", cwd=repo.b)
+    z = repo.stash_sha()
+    repo.git("stash", "drop", "-q", cwd=repo.b)
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    orphan = repo.stash_sha()
+    repo.git("reflog", "delete", "--updateref", "refs/stash@{0}")
+    assert repo.stash_shas() == []
+    monkeypatch.chdir(repo.a)
+    monkeypatch.setattr(mod, "_guard_pin", lambda *a, **k: None)
+    capsys.readouterr()
+    assert mod.main(["recover", z, "-m", "z rescue"]) != 0
+    assert repo.stash_shas() == [], "the register must be left untouched"
+    assert repo.stash_sha() == orphan, "the orphan must keep its handle"
+
+
+def test_prune_refuses_when_a_kept_entry_cannot_be_guarded(repo, monkeypatch, capsys):
+    """A failed guard must abort the prune before any delete (fail-closed).
+
+    The code refuses to remove anything while a kept entry cannot be protected;
+    without a test a fail-open regression passes the suite (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    doomed = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", "-m", "kept", cwd=repo.b)
+    kept = repo.stash_sha()
+    assert repo.stash_shas() == [kept, doomed]
+    monkeypatch.chdir(repo.a)
+    monkeypatch.setattr(mod, "_guard_pin", lambda *a, **k: None)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) != 0
+    assert repo.stash_shas() == [kept, doomed], "nothing may be deleted without a guard"
+    assert repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.strip() == ""
