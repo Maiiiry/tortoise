@@ -136,7 +136,10 @@ One primitive, in `tools/lane_stash.py`:
   `refs/pi-lane-prune-guard/<key>/<sha>` (outside the `refs/lane` namespace) and re-stores any entry a
   concurrent push's position shift caused it to remove — every entry it intends to keep and that was
   present at the start keeps a handle (an entry bound by a lane pin or this lane's applied-record is
-  collected deliberately, and `_clear_applied` drops that record once the entry is gone). Run it when
+  collected deliberately, and `_clear_applied` drops that record once the entry is gone). The state
+  comparisons are **counter** comparisons: `recover <sha>` of a sha already in the register prepends
+  a duplicate, and a set-style comparison would read a correct delete of one occurrence as a
+  concurrency event. Run it when
   the register is quiet: an entry pushed during the prune is outside the guard set, and because git
   offers no compare-and-delete a shift that removes one cannot be undone — `prune` compares the
   register's whole sha state against the expected one after each delete, so a shift that changes that
@@ -145,6 +148,12 @@ One primitive, in `tools/lane_stash.py`:
   `refs/stash` itself (git does not, and a resolving ref over an empty reflog is both live for bare
   git and a fail-closed wedge for `check`). Any other unpinned entry — a peer lane's, bare git's, or
   this lane's own never-applied pin-failure entry — is reported and left alone.
+- **Restoration is verified, not inferred from an exit code.** `git stash store` returns 0
+  *without* creating a reflog entry when `refs/stash` already points at that sha (measured) —
+  precisely the state an emptied reflog leaves. `recover` and `prune`'s reconciliation therefore
+  check the register after storing, CAS-drop the stale ref and store once more when it was a
+  no-op, and report success only on the verified state. Without this, the retention message's own
+  `recover <sha>` repair does nothing while claiming success.
 - **Residual race (documented, NOT detectable).** `prune` compares the register's whole sha state
   against the expected one after each delete, which catches every interleaving that changes that
   state. It is not a proof. A push landing *inside* the delete and a concurrent remover taking the
@@ -157,7 +166,10 @@ One primitive, in `tools/lane_stash.py`:
 - **Orphan retention.** When an emptied register leaves `refs/stash` pointing at an entry no pin and
   no applied-record names, `prune` retains it; it now guard-pins the object rather than relying on
   `refs/stash`, because the reconciliation's `stash store` can move that ref and would otherwise have
-  destroyed the handle the retention message just promised.
+  destroyed the handle the retention message just promised. A retained guard has exactly one
+  lifetime: it is released once `recover` puts the entry back under `refs/lane` (or when a prune's
+  `finally` sees the sha back in the register), and `lane_stash list` prints any still held, so the
+  namespace can be enumerated and cleared rather than silently keeping objects un-gc-able forever.
 
 Out of scope (reported, not absorbed): the skills text (`using-git-worktrees`, `commit-workflow`) is
 a symlink to agent-infra and belongs to agent-infra #1264; the `main-worktree-guard` extension

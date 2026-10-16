@@ -124,6 +124,7 @@ import os
 import re
 import subprocess
 import uuid
+from collections import Counter
 from pathlib import Path
 
 REFS_NS = "refs/lane"
@@ -433,6 +434,33 @@ def _drop_refs_stash(sha: str) -> bool:
     return _git("update-ref", "-d", "refs/stash", sha, check=False).returncode == 0
 
 
+def _register_contains(sha: str) -> bool:
+    return sha in {r["sha"] for r in _shared_register()}
+
+
+def _store_into_register(sha: str, subject: str) -> bool:
+    """``git stash store`` ``sha`` and VERIFY it is in the shared register.
+
+    ``git stash store`` returns 0 WITHOUT creating a reflog entry when
+    ``refs/stash`` already points at ``sha`` (measured on git 2.50.1) — exactly
+    the state an emptied reflog leaves behind. Reading rc 0 as success therefore
+    reports a restoration that never happened, and the retention message's own
+    ``recover <sha>`` repair is a no-op that leaves ``check`` fail-closed
+    (#8773 review P1). When rc is 0 but the register did not gain the entry,
+    drop the stale ref (CAS) and store once more so the reflog entry is really
+    created. Success is the VERIFIED register state, never the exit code.
+    """
+    cp = _git("stash", "store", "-m", subject, sha, check=False)
+    if cp.returncode != 0:
+        return False
+    if _register_contains(sha):
+        return True
+    if _stash_head() == sha and _drop_refs_stash(sha):
+        cp = _git("stash", "store", "-m", subject, sha, check=False)
+        return cp.returncode == 0 and _register_contains(sha)
+    return False
+
+
 def _pinned_shas() -> set[str]:
     cp = _git(
         "for-each-ref", "--format=%(objectname)", f"{REFS_NS}/*/stash/*", check=False,
@@ -495,7 +523,14 @@ GUARD_NS = "refs/pi-lane-prune-guard"
 
 
 def _guard_pin(key: str, sha: str) -> str | None:
-    """Pin ``sha`` for the duration of one prune so a positional race cannot lose it.
+    """Pin ``sha`` so a positional race cannot lose it.
+
+    Two lifetimes use this ref. For the entries a prune intends to KEEP it lives
+    for the duration of that prune (the ``finally`` unpins it once the sha is
+    back in the register). For a RETAINED ORPHAN — an emptied register whose
+    ``refs/stash`` no pin names — it is the object's only durable handle and is
+    deliberately left in place until ``recover`` puts the entry back under
+    ``refs/lane`` (``cmd_list`` prints any you still hold).
 
     ``git reflog delete --updateref refs/stash@{i}`` re-resolves the position at
     DELETE time (git's own ``stash drop`` behaves the same), so a peer push
@@ -517,6 +552,15 @@ def _guard_pin(key: str, sha: str) -> str | None:
 
 def _guard_unpin(ref: str, sha: str) -> None:
     _git("update-ref", "-d", ref, sha, check=False)
+
+
+def _guard_refs(key: str) -> list[tuple[str, str]]:
+    """This lane's prune guard refs, as ``(ref, sha)`` — the objects they keep alive."""
+    cp = _git("for-each-ref", "--format=%(refname) %(objectname)", f"{GUARD_NS}/{key}",
+              check=False)
+    if cp.returncode != 0:
+        return []
+    return [(p[0], p[1]) for ln in cp.stdout.splitlines() if len(p := ln.split()) >= 2]
 
 
 # ── commands ────────────────────────────────────────────────────────────────
@@ -596,6 +640,14 @@ def cmd_list(args: argparse.Namespace) -> int:
         star = "  <-- a bare `git stash pop` here would take THIS" if r is rows[0] and (
             r["branch"] != branch or not r["branch"]) else ""
         print(f"  {r['pos']:<11} {r['sha'][:12]}  {mark}  {r['subject']}{star}")
+
+    guards = _guard_refs(key)
+    if guards:
+        print(f"prune guards held ({len(guards)} — the object is kept gc-safe because no "
+              "other ref names it; free one by recovering it, or drop the ref once you "
+              "know the work is safe)")
+        for ref, sha in guards:
+            print(f"  {sha[:12]}  {ref}")
     if rows and (rows[0]["branch"] != branch or not rows[0]["branch"]):
         print("\n⚠️  the top shared entry is not this lane's — use `lane_stash pop <id>`, "
               "never a bare `git stash pop` (see `lane_stash check`).")
@@ -805,12 +857,17 @@ def cmd_recover(args: argparse.Namespace) -> int:
             "shown to be a stash entry — pass -m <message> to assert it explicitly"
         )
     subject = args.message or subject or f"recovered {args.sha}"
-    cp = _git("stash", "store", "-m", subject, args.sha, check=False)
-    if cp.returncode != 0:
-        sys.stderr.write(cp.stderr)
-        raise GitFailed(cp.returncode, "git stash store failed")
+    if not _store_into_register(args.sha, subject):
+        raise LaneStashError(
+            f"could not put {args.sha} into the shared register — `git stash store` left "
+            "no reflog entry for it (refs/stash already pointing at it with an empty "
+            "reflog makes `store` a silent no-op)"
+        )
     key = lane_key()
     entry = _pin_or_report(key, args.sha)
+    # The object now has a lane pin, so a prune guard for it is redundant — and a
+    # guard left here would keep the object un-gc-able for good (#8773 review P2).
+    _guard_unpin(f"{GUARD_NS}/{key}/{args.sha}", args.sha)
     print(f"restored {args.sha} to the shared register (subject: {subject!r})")
     print(f"pinned lane entry {entry['id']} [{entry['ref']}] for lane {key}")
     return 0
@@ -890,17 +947,21 @@ def cmd_prune(args: argparse.Namespace) -> int:
         # delete; if a peer pushed in between, this prune stops removing and falls
         # through to the reconciliation instead of trusting a stale position.
         order = sorted(doomed, key=lambda r: int(r["pos"].rsplit("@{", 1)[-1].rstrip("}")))
-        # The full sha state we believe the register holds. Every delete must
-        # leave it exactly one intended sha smaller; anything else means a peer
-        # (or another lane's prune) interleaved. Entries are unique, so the
-        # multiset comparison is exact.
-        expected = [r["sha"] for r in rows]
+        # The full sha state we believe the register holds, as a COUNTER: an
+        # entry must be removable one occurrence at a time. Duplicates are
+        # reachable (`recover <sha>` of a sha already in the register prepends
+        # it), and a list comprehension that drops EVERY occurrence would read
+        # a correct delete of one of them as a concurrency event (#8773 review
+        # P2). Every delete must leave the state exactly one intended sha
+        # smaller; anything else means a peer (or another lane's prune)
+        # interleaved.
+        expected = Counter(r["sha"] for r in rows)
         removed = 0
         for r in reversed(order):
             spec = r["pos"]
             # Re-snapshot: abort before touching anything if a peer has already
             # changed the register since the previous step.
-            if sorted(x["sha"] for x in _shared_register()) != sorted(expected):
+            if Counter(x["sha"] for x in _shared_register()) != expected:
                 print("STOP: the shared register changed during the prune (a peer pushed "
                       "or reclaimed an entry); re-run when it is quiet")
                 break
@@ -928,8 +989,8 @@ def cmd_prune(args: argparse.Namespace) -> int:
             # A bare "is the intended sha gone?" check would be strictly weaker:
             # a concurrent remover alone can take that sha while our delete
             # removes a peer's entry, which the whole-state comparison DOES catch.
-            want = sorted(s for s in expected if s != r["sha"])
-            post = sorted(x["sha"] for x in _shared_register())
+            want = expected - Counter({r["sha"]: 1})
+            post = Counter(x["sha"] for x in _shared_register())
             if post != want:
                 print(f"WARNING: the shared register changed while this prune deleted "
                       f"{spec} — a concurrent push or another prune interleaved, so the "
@@ -965,8 +1026,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
         for sha, (_ref, subject) in guarded.items():
             if sha in live:
                 continue
-            cp = _git("stash", "store", "-m", subject or f"recovered {sha}", sha, check=False)
-            if cp.returncode == 0:
+            if _store_into_register(sha, subject or f"recovered {sha}"):
                 restored.append(sha)
         if restored:
             print(f"RESTORED {len(restored)} shared-register entr"

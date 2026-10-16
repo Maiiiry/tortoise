@@ -1142,3 +1142,68 @@ def test_prune_orphan_survives_a_reconciliation_store(repo, monkeypatch, capsys)
     refs = repo.git("for-each-ref", "--format=%(refname) %(objectname)").stdout.splitlines()
     assert any(p == ln.split()[-1] for ln in refs), refs
     assert kept in repo.stash_shas(), "the kept entry was restored"
+
+
+def test_recover_repairs_a_retained_orphan_and_frees_its_guard(repo, monkeypatch, capsys):
+    """`recover` must actually create a reflog entry, and release the guard.
+
+    `git stash store` is a SILENT no-op when `refs/stash` already equals the sha
+    (the state an emptied reflog leaves), so the retained orphan's own repair
+    instruction used to do nothing while printing success and leaving `check`
+    fail-closed. The store is now verified, and once the entry is pinned under
+    `refs/lane` the prune guard is released (#8773 review P1/P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    orphan = repo.stash_sha()
+    # empty the reflog WITHOUT dropping refs/stash: the hazard state retention
+    # exists to protect (a bare `git stash pop` can still take `orphan`)
+    repo.git("reflog", "delete", "--updateref", "refs/stash@{0}")
+    assert repo.stash_shas() == []
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert orphan is not None and orphan[:12] in out, out
+    assert "recover" in out, out
+    guards = repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.split()
+    assert guards, "the retained orphan must be held by a guard ref"
+
+    # follow the retention message's own instruction
+    assert mod.main(["recover", orphan, "-m", "recovered orphan"]) == 0
+    capsys.readouterr()
+    assert repo.stash_shas() == [orphan], "recover must add a real reflog entry"
+    assert repo.lane(repo.a, "check").returncode == 0, "the repair must leave check SAFE"
+    assert repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.strip() == "", "the lane pin makes the guard redundant"
+
+
+def test_prune_handles_duplicate_register_entries(repo, monkeypatch, capsys):
+    """A duplicate sha must not turn a correct delete into a false warning.
+
+    `recover <sha>` of a sha already in the register prepends it, giving
+    `[E, A, E]`. A set-style comparison drops BOTH occurrences and then reads
+    the correct removal of one as a concurrency event; the state comparison is a
+    Counter so exactly one occurrence is removed per delete (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    doomed = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", "-m", "kept", cwd=repo.b)
+    kept = repo.stash_sha()
+    assert repo.stash_shas() == [kept, doomed]
+    monkeypatch.chdir(repo.a)
+    assert mod.main(["recover", doomed, "-m", "duplicate"]) == 0
+    assert repo.stash_shas() == [doomed, kept, doomed], "recover prepends a duplicate"
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "WARNING" not in out, out
+    assert "removed 2" in out, out
+    assert repo.stash_shas() == [kept], "both doomed occurrences (and only those) go"
