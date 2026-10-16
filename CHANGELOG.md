@@ -32,7 +32,11 @@ primitives accept.
   existing terminal node — or mint one from a declared terminal `status`.
   `create_direct_edge` refuses a terminal endpoint, so both shapes would have
   become a raise after earlier bundle items had already committed. Phase 1 now
-  rejects them, with zero mutation.
+  rejects them, with zero mutation. The guard resolves the declared value the
+  way the WRITER does — a nested `props={"status": …}`/`props={"outdated": …}`
+  spelling counts, not just the top-level key — and covers an append-only
+  `type:"event"` item too, whose `status`/`outdated` would otherwise be stored
+  verbatim and refused only mid-write.
 
 ### A url-keyed `:Source` is a visible neighbour, identified by its url (#8538)
 

@@ -632,6 +632,91 @@ def test_direct_route_entity_nested_props_declared_terminal_status_rejected_phas
 
 
 @pytest.mark.parametrize("spelling", ["top", "nested"])
+def test_direct_route_event_declared_terminal_status_rejected_phase1(sdk, spelling):
+    """#7925 review P1 (Event arm): the widening makes a bundle-local Event ref
+    REACHABLE on the direct route, and `create_event` -> `create_entity(
+    type='event')` stores a declared `status` (top-level OR the nested `props`
+    spelling `_coerce_props` flattens) verbatim on the Event node — while
+    `create_direct_edge` reads `p.status` and refuses a terminal endpoint.
+    The Subject/Object half of the guard had no Event arm, so the bundle passed
+    Phase 1 empty and aborted MID-WRITE after the predecessor point committed
+    (measured). Phase 1 must reject, so nothing commits."""
+    item = {"ref": "evt", "type": "event", "name": "Launch",
+            "eventKind": "sessionCaptured"}
+    if spelling == "top":
+        item["status"] = "superseded"
+    else:
+        item["props"] = {"status": "superseded"}
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [item, {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "evt", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("declares status 'superseded'" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="declares status 'superseded'"):
+        sdk.ingest(bundle)
+    # ZERO mutation — neither the predecessor point nor the born-terminal Event
+    assert _count(sdk, "MATCH (n:Point {content:'must-not-commit'}) "
+                       "RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Event {name:'Launch'}) RETURN count(n)") == 0
+
+
+@pytest.mark.parametrize("spelling", ["top", "nested"])
+def test_direct_route_event_outdated_flag_rejected_phase1(sdk, spelling):
+    """#7925 review P1 (Event arm, `outdated` leg): `_sanitize_props` refuses
+    the server-managed legacy `outdated` flag on presence for the Event writer
+    too (top-level OR nested), so a bundle item carrying it raises mid-write
+    AFTER the predecessor point committed (measured). Phase 1 must reject on
+    both spellings, so nothing commits."""
+    item = {"ref": "evt", "type": "event", "name": "Launch",
+            "eventKind": "sessionCaptured"}
+    if spelling == "top":
+        item["outdated"] = True
+    else:
+        item["props"] = {"outdated": True}
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [item, {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "evt", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("declares the server-managed 'outdated' flag" in m
+               for m in msgs), msgs
+    with pytest.raises(BundleValidationError, match="outdated"):
+        sdk.ingest(bundle)
+    assert _count(sdk, "MATCH (n:Point {content:'must-not-commit'}) "
+                       "RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Event {name:'Launch'}) RETURN count(n)") == 0
+
+
+def test_direct_route_live_event_not_over_rejected(sdk):
+    """#7925 review P1 (Event arm's OTHER edge): only TERMINAL declared values
+    reject. A bundle-local Event declaring `status: 'live'` is not born
+    terminal, so the direct Event<->Object edge is legal and must be written
+    operator-less. Without this pin the Event arm could over-reject every
+    declared status."""
+    bundle = {
+        "entities": [
+            {"ref": "evt", "type": "event", "name": "Launch",
+             "eventKind": "sessionCaptured", "status": "live"},
+            {"ref": "o", "type": "object", "name": "Delta"},
+        ],
+        "connections": [{"from": "evt", "to": "o", "operator": "IMPL"}],
+    }
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    assert _count(sdk, "MATCH (:Event)-[r:IMPL]->(:Object) RETURN count(r)") == 1
+    assert _operator_count(sdk) == 0
+
+
+@pytest.mark.parametrize("spelling", ["top", "nested"])
 def test_direct_route_entity_outdated_flag_rejected_phase1(sdk, spelling):
     """#7925 review P1: the server-managed `outdated` flag is the same
     partial-mutation class. `_sanitize_props` refuses it on PRESENCE for the

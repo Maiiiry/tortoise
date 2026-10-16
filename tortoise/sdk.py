@@ -14288,61 +14288,75 @@ class TortoiseSDK:
                     # that — `_check_endpoint_race` runs AFTER the entity items
                     # are written, which is why this is Phase-1-only. Only
                     # Subject/Object merge by name; an Event entity item is
-                    # append-only (no name merge, no status lifecycle) and a
-                    # document is a `:Source`.
+                    # append-only (no name merge) and a document is a
+                    # `:Source`.
+                    #
+                    # #7925 review P1: Event is NOT exempt. `create_event` ->
+                    # `create_entity(type='event')` still stores a declared
+                    # `status` (top-level OR the nested `props` spelling
+                    # `_coerce_props` flattens) verbatim on the node, and
+                    # `create_direct_edge` reads `p.status` / `p.outdated` and
+                    # refuses a terminal endpoint — so with the widening that
+                    # makes a bundle-local Event ref reachable on the direct
+                    # route, an Event declaring a terminal status is the same
+                    # born-terminal mid-write raise. It has no name holder to
+                    # probe, so only the declared-value legs apply.
                     elabel = entity_labels.get(
                         str(item.get("type") or "").strip().lower())
                     name = item.get("name")
+                    if elabel not in ("Subject", "Object", "Event"):
+                        continue
+                    exists, hit = False, None
                     if elabel in ("Subject", "Object") \
                             and isinstance(name, str) and name:
                         exists, hit = self._entity_name_holders(elabel, name)
-                        # #7925 review P1: resolve the status the WRITER will,
-                        # not a single key. `_coerce_props` flattens a nested
-                        # `props={...}` and top-level presence wins, so
-                        # `item.get("status")` alone missed
-                        # `props: {"status": "superseded"}` — a born-terminal
-                        # :Subject then raised mid-write after earlier bundle
-                        # items committed (measured).
-                        declared = _item_effective_status(item)
-                        if hit is not None:
-                            violations.append({
-                                "section": "connections", "index": i,
-                                "message": f"ingest: connections[{i}] "
-                                           f"bundle-local endpoint {v!r} "
-                                           f"resolves to terminal {elabel} "
-                                           f"{hit!r} (by name) — new direct "
-                                           f"edges to terminal endpoints are "
-                                           f"rejected (#2422/#7925)",
-                            })
-                        elif _item_declares_outdated(item):
-                            # #7925 review P1: `_sanitize_props` refuses the
-                            # server-managed `outdated` flag on presence, for
-                            # every writer — top-level OR nested. Catch it in
-                            # Phase 1 (zero mutation) instead of letting the
-                            # entity write raise after the point items commit.
-                            violations.append({
-                                "section": "connections", "index": i,
-                                "message": f"ingest: connections[{i}] "
-                                           f"bundle-local endpoint {v!r} "
-                                           f"declares the server-managed "
-                                           f"'outdated' flag — the {elabel} "
-                                           f"write would raise after earlier "
-                                           f"items committed, and new direct "
-                                           f"edges to terminal endpoints are "
-                                           f"rejected (#2422/#7925)",
-                            })
-                        elif not exists and declared in \
-                                self._INGEST_TERMINAL_STATUSES:
-                            violations.append({
-                                "section": "connections", "index": i,
-                                "message": f"ingest: connections[{i}] "
-                                           f"bundle-local endpoint {v!r} "
-                                           f"declares status {declared!r} — "
-                                           f"the {elabel} it creates is born "
-                                           f"terminal, and new direct edges "
-                                           f"to terminal endpoints are "
-                                           f"rejected (#2422/#7925)",
-                            })
+                    # #7925 review P1: resolve the status the WRITER will,
+                    # not a single key. `_coerce_props` flattens a nested
+                    # `props={...}` and top-level presence wins, so
+                    # `item.get("status")` alone missed
+                    # `props: {"status": "superseded"}` — a born-terminal
+                    # :Subject then raised mid-write after earlier bundle
+                    # items committed (measured).
+                    declared = _item_effective_status(item)
+                    if hit is not None:
+                        violations.append({
+                            "section": "connections", "index": i,
+                            "message": f"ingest: connections[{i}] "
+                                       f"bundle-local endpoint {v!r} "
+                                       f"resolves to terminal {elabel} "
+                                       f"{hit!r} (by name) — new direct "
+                                       f"edges to terminal endpoints are "
+                                       f"rejected (#2422/#7925)",
+                        })
+                    elif _item_declares_outdated(item):
+                        # #7925 review P1: `_sanitize_props` refuses the
+                        # server-managed `outdated` flag on presence, for
+                        # every writer — top-level OR nested. Catch it in
+                        # Phase 1 (zero mutation) instead of letting the
+                        # entity write raise after the point items commit.
+                        violations.append({
+                            "section": "connections", "index": i,
+                            "message": f"ingest: connections[{i}] "
+                                       f"bundle-local endpoint {v!r} "
+                                       f"declares the server-managed "
+                                       f"'outdated' flag — the {elabel} "
+                                       f"write would raise after earlier "
+                                       f"items committed, and new direct "
+                                       f"edges to terminal endpoints are "
+                                       f"rejected (#2422/#7925)",
+                        })
+                    elif not exists and declared in \
+                            self._INGEST_TERMINAL_STATUSES:
+                        violations.append({
+                            "section": "connections", "index": i,
+                            "message": f"ingest: connections[{i}] "
+                                       f"bundle-local endpoint {v!r} "
+                                       f"declares status {declared!r} — "
+                                       f"the {elabel} it creates is born "
+                                       f"terminal, and new direct edges "
+                                       f"to terminal endpoints are "
+                                       f"rejected (#2422/#7925)",
+                        })
                     continue
                 if section != "points":
                     continue
