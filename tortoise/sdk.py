@@ -29097,8 +29097,10 @@ class TortoiseSDK:
             an ACT and is recorded durably: one of ``present`` / ``deleted``.
             ``offline`` / ``access_revoked`` are CONDITIONS, observed live and
             NEVER stored (the owner's #3998 ruling, Option A, 2026-10-14) —
-            passing one is refused with a message saying so, and the read path
-            derives it through ``raw_state.resolve_raw_availability``. The
+            passing one is refused with a message saying so; the observation is
+            caller-supplied — a caller that has actually probed the raw routes
+            it through ``raw_state.resolve_raw_availability`` (no shipped reader
+            supplies one today, #8740). The
             deletion marker is BOUNDED by ``raw_state.RAW_DELETION_MARKER_TTL``
             (bounded metadata about the link back to the raw — never a
             retention period on user content, R1). Validated strictly (an
@@ -29107,7 +29109,10 @@ class TortoiseSDK:
             cannot resurrect a raw deleted between the two writes. Pass
             ``raw_state="present"`` to record that a raw came BACK — that is
             the only way to move a state off an absence, by design. The state
-            rides the ``SourceCreated`` journal, so it survives ``rebuild_all``.
+            rides the ``SourceCreated`` / ``SourceVersioned`` journal (a state
+            change riding a version transition is journalled as
+            ``SourceVersioned``; see ``docs/ONTOLOGY.md`` §4.6), so it survives
+            ``rebuild_all``.
             ⚠️ This is the write half of the two-store model: the graph keeps
             identity + version + availability and NEVER the bytes, so props
             that would carry raw payload are refused (see ``_SOURCE_EXTRA_PROPS``
