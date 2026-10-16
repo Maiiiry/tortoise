@@ -13333,6 +13333,39 @@ class TortoiseSDK:
         "humanApproval", "observation", "hypothesis",
     ))
 
+    # ── #7925: THE endpoint-label contract for a connection ──────────────
+    #
+    # ONE declaration, read by Phase-1 ``_check_endpoints`` AND Phase-2
+    # ``_check_endpoint_race``, so the two phases — and the two routes —
+    # cannot drift. It is exactly the label set the write primitives this
+    # validation dispatches to accept: #7902 widened BOTH ``create_operator``
+    # (operator route) and ``create_direct_edge`` (direct route) to
+    # ``live.EPISTEMIC_LABELS`` (owner ruling #7813), and ``_find_operator``'s
+    # dedup key already sweeps the same four labels
+    # (``live.epistemic_disjunction``) — so a ``:Subject``/``:Object`` endpoint
+    # dedups and writes exactly as a ``:Point``/``:Event`` one does.
+    #
+    # Before #7925 the DIRECT route was hand-gated on plain ``:Point`` (the
+    # #2062 asymmetry, whose premise was that ``create_direct_edge`` itself
+    # guarded plain Points — the premise #7902 removed), while the primitive
+    # admitted all four. ``create_direct_edge('IMPL', <Subject>, <Object>)``
+    # therefore WROTE the edge and ``ingest()`` refused the same connection
+    # with ``BundleValidationError: ... must be a plain Point — got a Subject
+    # endpoint``. The primitive is the contract; the validator follows it
+    # rather than carrying a second, narrower copy.
+    #
+    # Not admitted, on either route: a ``:Source`` (a document IS a ``:Source``,
+    # D10 #5026), an operator-shaped Point, and any endpoint that resolves by
+    # something OTHER than the node ``id`` — both primitives key on ``id``, so
+    # an Event that resolves only by ``eventId`` would pass validation and then
+    # crash mid-write (partial mutation, #2062). The ``is_operator`` and
+    # id-anchoring halves of that gate are label-independent and live at the
+    # check sites.
+    _INGEST_ENDPOINT_LABELS = frozenset(EPISTEMIC_LABELS)
+    # The same set, spelled the way the violation message names it — derived
+    # from the ONE tuple, so the gate and its message cannot disagree.
+    _INGEST_ENDPOINT_CONTRACT = "/".join(EPISTEMIC_LABELS)
+
     def _check_item_shape(self, section: str, index: int, item: Any,
                           violations: list[dict]) -> None:
         """Check 1 — section item shape (dict-ness + required fields, incl.
@@ -14034,17 +14067,72 @@ class TortoiseSDK:
                 ).result_set
         return rows[0][0] if rows else None
 
+    def _entity_name_holders(self, label: str, name: str) -> tuple[bool, str | None]:
+        """``(exists_by_name, terminal_holder_id)`` for a bundle-local entity
+        ref (#7925) — the entity sibling of :meth:`_find_terminal_dedup_hit`,
+        and it exists for the same reason: the bundle-local terminal guard has
+        to resolve the endpoint the WRITER will use, or the guard fails open
+        and the endpoint becomes a mid-write raise on a partially-mutated
+        graph.
+
+        ``:Subject``/``:Object`` are keyed by NAME — the projection MERGEs by
+        name and ``ids.entity_name_id`` makes the ``(label, name)`` id
+        deterministic so that merge is idempotent — while a Point is keyed by
+        content. Hence a name probe here, a content/dedup probe there.
+
+        ``exists_by_name`` matters because the two halves of the guard answer
+        DIFFERENT questions: an existing node keeps its OWN status (the merge
+        does not overwrite it — measured), so a declared terminal status only
+        terminalizes the node when no holder exists; a terminal HOLDER
+        terminalizes it however the item spells its status. Checking the
+        declared value without the holder test would over-reject a bundle whose
+        entity item re-declares a status the merge will not apply.
+
+        Conservative in the same direction as the Point leg: with several
+        nodes holding one name the writer's own pick carries no ORDER BY, so
+        ANY terminal holder rejects (over-rejecting an ambiguous duplicate is
+        the safe direction). The terminal predicate is the shared
+        ``live._terminal_expression`` Cypher builder (#3142), so this guard and
+        the Point leg cannot disagree about what "terminal" means.
+        """
+        proj = self._get_proj()
+        rows = proj.g.query(
+            f"MATCH (n:{label} {{name:$name}}) "
+            f"WHERE {_terminal_expression('n')} RETURN n.id LIMIT 1",
+            params={"name": name},
+        ).result_set
+        if rows:
+            return True, rows[0][0]
+        # No terminal holder: ask the cheaper question the declared-status leg
+        # needs — does a holder exist at all? (A terminal holder short-circuits
+        # above, so this second query only runs for the live-or-absent case.)
+        exists = bool(proj.g.query(
+            f"MATCH (n:{label} {{name:$name}}) RETURN n.id LIMIT 1",
+            params={"name": name},
+        ).result_set)
+        return exists, None
+
     def _check_endpoints(self, bundle: dict, violations: list[dict]) -> None:
         """Check 3 (endpoint half) — typed endpoints (external + bundle-local,
         cycle-2) and the direct-edge terminal-status guard (cycle-3, refined
-        cycle-17/18). Operator-ROUTED connections (reify:true / mitigation /
-        part-whole → create_operator) accept Point OR Event endpoints (A1b
-        #1272 parity — _find_operator's dedup key collects both); direct-edge
-        connections (plain IMPL/NAND → create_direct_edge, which guards plain
-        Points) require plain-Point endpoints AND additionally reject terminal
-        (superseded/retracted) endpoints (#2062). Bundle-local refs resolving
-        to EXISTING (dedup-hit) terminal points are Phase-1 violations (never
-        a Phase-2 raise)."""
+        cycle-17/18). A connection endpoint must carry one of the four
+        epistemic labels — Point/Subject/Object/Event
+        (``_INGEST_ENDPOINT_LABELS``) — and be addressed BY ITS node id; a
+        ``:Source``, an operator-shaped Point, and an Event that resolves only
+        by ``eventId`` stay violations. Direct-edge connections (plain
+        IMPL/NAND → create_direct_edge) ADDITIONALLY reject terminal
+        (superseded/retracted) endpoints (#2062/#2422). Bundle-local refs
+        resolving to EXISTING (dedup-hit) terminal points are Phase-1
+        violations (never a Phase-2 raise).
+
+        #7925: the label set is the SAME on the operator route
+        (reify/mitigation/part-whole → create_operator) and the direct route,
+        because #7902 widened BOTH write primitives to
+        ``live.EPISTEMIC_LABELS`` (owner ruling #7813). It used to be gated per
+        route by hand — the operator route on Point-or-Event (the #2062
+        carve-out, still id-anchored), the direct route on plain Point — and
+        the direct half was left stricter than the primitive it calls.
+        """
         local: dict[str, tuple[str, dict]] = {}
         for section in ("sources", "points", "entities"):
             for item in bundle.get(section) or []:
@@ -14067,38 +14155,42 @@ class TortoiseSDK:
         entity_labels = {"subject": "Subject", "object": "Object",
                          "event": "Event", "document": "Source"}
         for i, conn, route, vals in conns:  # noqa: B007
-            # #2062: the operator route (reify/mitigation/part-whole →
-            # create_operator) accepts Point OR Event endpoints — the direct
-            # route (plain IMPL/NAND) stays plain-Point only. An Event is
-            # accepted only when the endpoint addresses the node BY ITS id
-            # (the create_operator write key): an Event that resolves only by
+            # #7925: the endpoint-label gate is ROUTE-INDEPENDENT — the four
+            # epistemic labels, addressed by node id. An endpoint is accepted
+            # only when it addresses the node BY ITS id: that is the key both
+            # write primitives use (``create_operator`` / ``create_direct_edge``
+            # probe ``n.id IN $ids``), so an Event that resolves only by
             # eventId (the ingest_corpus DocumentCreated shape) would pass
-            # validation but crash create_operator mid-write — partial
-            # mutation — so it stays a Phase-1 violation.
-            op_route = route == "operator"
+            # validation but crash mid-write — partial mutation — and stays a
+            # Phase-1 violation (#2062).
             for v in vals:
                 if not isinstance(v, str):
                     continue
                 if v in local:
                     section, item = local[v]
+                    # A bundle-local endpoint may be a plain Point item or a
+                    # Subject/Object/Event entity item — the same label set the
+                    # write primitives accept. An entity item typed `document`
+                    # is a `:Source`, so it stays out.
+                    etype = str(item.get("type") or "").strip().lower()
                     plain_point = section == "points" \
                         and not item.get("is_operator")
-                    event_item = op_route and section == "entities" \
-                        and str(item.get("type") or "").strip().lower() == "event"
-                    if not (plain_point or event_item):
+                    epistemic_entity = section == "entities" \
+                        and entity_labels.get(etype) \
+                        in self._INGEST_ENDPOINT_LABELS
+                    if not (plain_point or epistemic_entity):
                         if section == "sources":
                             label = "Source"
                         elif section == "entities":
-                            label = entity_labels.get(
-                                str(item.get("type") or "").strip().lower(),
-                                "entity")
+                            label = entity_labels.get(etype, "entity")
                         else:
                             label = "operator-shaped point item"
                         violations.append({
                             "section": "connections", "index": i,
                             "message": f"ingest: connections[{i}] bundle-local "
-                                       f"endpoint {v!r} must be a plain Point — "
-                                       f"got a {label} item",
+                                       f"endpoint {v!r} must be a "
+                                       f"{self._INGEST_ENDPOINT_CONTRACT} "
+                                       f"endpoint — got a {label} item",
                         })
                 else:
                     info = node_info.get(v)
@@ -14108,16 +14200,17 @@ class TortoiseSDK:
                             "message": f"ingest: connections[{i}] external "
                                        f"endpoint {v!r} does not exist",
                         })
-                    elif info["is_operator"] or (info["label"] != "Point"
-                            and not (op_route and info["label"] == "Event"
-                                     and info.get("id") == v)):
+                    elif info["is_operator"] \
+                            or info["label"] not in self._INGEST_ENDPOINT_LABELS \
+                            or info.get("id") != v:
                         got = ("operator Point" if info["is_operator"]
                                else info["label"] or "unknown node type")
                         violations.append({
                             "section": "connections", "index": i,
                             "message": f"ingest: connections[{i}] endpoint "
-                                       f"{v!r} must be a plain Point — got a "
-                                       f"{got} endpoint",
+                                       f"{v!r} must be a "
+                                       f"{self._INGEST_ENDPOINT_CONTRACT} "
+                                       f"endpoint — got a {got} endpoint",
                         })
                     elif route == "direct" and (
                             info["status"] in self._INGEST_TERMINAL_STATUSES
@@ -14138,6 +14231,54 @@ class TortoiseSDK:
                 if not isinstance(v, str) or v not in local:
                     continue
                 section, item = local[v]
+                if section == "entities":
+                    # #7925: the entity side of the SAME guard, added with the
+                    # endpoint widening that made it reachable. The entity
+                    # write path MERGEs :Subject/:Object by NAME (the
+                    # deterministic `(label, name)` id is what makes the merge
+                    # idempotent), so a bundle-local entity ref lands on
+                    # whichever node already holds the name — and a
+                    # `create_direct_edge` endpoint that is terminal raises
+                    # mid-write, after the bundle's earlier items committed.
+                    # Measured (both shapes leave the predecessor point item
+                    # behind): a ref naming an EXISTING terminal Subject, and
+                    # an item that DECLARES a terminal `status` (the node the
+                    # writer mints is born terminal). Phase 2 cannot prevent
+                    # that — `_check_endpoint_race` runs AFTER the entity items
+                    # are written, which is why this is Phase-1-only. Only
+                    # Subject/Object merge by name; an Event entity item is
+                    # append-only (no name merge, no status lifecycle) and a
+                    # document is a `:Source`.
+                    elabel = entity_labels.get(
+                        str(item.get("type") or "").strip().lower())
+                    name = item.get("name")
+                    if elabel in ("Subject", "Object") \
+                            and isinstance(name, str) and name:
+                        exists, hit = self._entity_name_holders(elabel, name)
+                        declared = item.get("status")
+                        if hit is not None:
+                            violations.append({
+                                "section": "connections", "index": i,
+                                "message": f"ingest: connections[{i}] "
+                                           f"bundle-local endpoint {v!r} "
+                                           f"resolves to terminal {elabel} "
+                                           f"{hit!r} (by name) — new direct "
+                                           f"edges to terminal endpoints are "
+                                           f"rejected (#2422/#7925)",
+                            })
+                        elif not exists and declared in \
+                                self._INGEST_TERMINAL_STATUSES:
+                            violations.append({
+                                "section": "connections", "index": i,
+                                "message": f"ingest: connections[{i}] "
+                                           f"bundle-local endpoint {v!r} "
+                                           f"declares status {declared!r} — "
+                                           f"the {elabel} it creates is born "
+                                           f"terminal, and new direct edges "
+                                           f"to terminal endpoints are "
+                                           f"rejected (#2422/#7925)",
+                            })
+                    continue
                 if section != "points":
                     continue
                 content = item.get("content")
@@ -14172,14 +14313,17 @@ class TortoiseSDK:
         Phase-1 validation and this write is the race class this exists for.
         Reuses the SAME message shapes as Phase 1 on the external-endpoint
         leg (bundle-local refs resolve to external ids in Phase-2; the
-        bundle-local '{label} item' template is Phase-1-only). #2062: the
-        operator route accepts Point OR Event endpoints when the endpoint
-        addresses the node BY ITS id (matching Phase-1 and create_operator's
-        A1b #1272 contract)."""
+        bundle-local '{label} item' template is Phase-1-only). #7925: the
+        accepted endpoint-label set and the id-anchoring guard are
+        ``_INGEST_ENDPOINT_LABELS`` — the SAME declaration Phase 1 reads, so
+        the phases cannot disagree; it is exactly what the write primitives
+        admit (#7902 widened ``create_operator`` and ``create_direct_edge``
+        alike to ``live.EPISTEMIC_LABELS``, owner ruling #7813; the #2062
+        carve-out this replaces admitted Point-or-Event on the operator route
+        only)."""
         if not isinstance(conn, dict) or "operator" not in conn:
             return
         route = self._connection_route(conn)
-        op_route = route == "operator"
         frm = conn.get("from")
         tos = conn.get("to")
         vals = []
@@ -14197,16 +14341,17 @@ class TortoiseSDK:
                     "message": f"ingest: connections[{index}] external "
                                f"endpoint {v!r} does not exist",
                 })
-            elif info_i["is_operator"] or (info_i["label"] != "Point"
-                    and not (op_route and info_i["label"] == "Event"
-                             and info_i.get("id") == v)):
+            elif info_i["is_operator"] \
+                    or info_i["label"] not in self._INGEST_ENDPOINT_LABELS \
+                    or info_i.get("id") != v:
                 got = ("operator Point" if info_i["is_operator"]
                        else info_i["label"] or "unknown node type")
                 violations.append({
                     "section": "connections", "index": index,
                     "message": f"ingest: connections[{index}] endpoint "
-                               f"{v!r} must be a plain Point — got a {got} "
-                               f"endpoint",
+                               f"{v!r} must be a "
+                               f"{self._INGEST_ENDPOINT_CONTRACT} "
+                               f"endpoint — got a {got} endpoint",
                 })
             elif route == "direct" and (
                     info_i["status"] in self._INGEST_TERMINAL_STATUSES
@@ -14398,20 +14543,23 @@ class TortoiseSDK:
           operator-less — routed to a DIRECT edge (no operator node, see
           INGEST_CONTRACT.md §8). A connection carrying ``relation`` stays a
           PLAIN structural edge (structural edges never reify).
-        - Endpoint typing (#2062): operator-ROUTED connections (reify:
-          true/mitigation/part-whole → create_operator) accept Point OR Event
-          endpoints (A1b #1272 parity — the dedup key in _find_operator
-          collects both); bundle-local refs may address point items or
-          ``type:"event"`` entity items. An external Event endpoint must
-          address the node BY ITS id (the create_operator write key — an
-          Event that resolves only by eventId, e.g. the ingest_corpus
-          DocumentCreated shape, is rejected at validation, never a mid-write
-          crash). NOTE: Event entity items are append-only — re-ingesting a
-          FULL bundle mints a new Event occurrence (new id) and thus a new
-          operator; dedup applies to id-stable external Event endpoints (or
-          re-ingesting connection-only against the resolved id). DIRECT-edge
-          connections (plain IMPL/NAND → create_direct_edge, which guards
-          plain Points) require plain-Point endpoints only.
+        - Endpoint typing (#7925, superseding #2062's route split): an operator
+          connection endpoint may carry ANY of the four epistemic labels —
+          Point/Subject/Object/Event — on BOTH the operator route (reify:
+          true/mitigation/part-whole → create_operator) and the DIRECT route
+          (plain IMPL/NAND → create_direct_edge). #7902 widened both write
+          primitives to the same ``live.EPISTEMIC_LABELS``, and
+          ``_find_operator``'s dedup key already collects the four, so the
+          validator now states the same contract the writers enforce instead
+          of a narrower one. An endpoint must address the node BY ITS ``id``
+          (the write key — an Event that resolves only by eventId, e.g. the
+          ingest_corpus DocumentCreated shape, is rejected at validation,
+          never a mid-write crash); a ``:Source`` (a document IS a ``:Source``)
+          and an operator-shaped Point stay violations. NOTE: Event entity
+          items are append-only — re-ingesting a FULL bundle mints a new Event
+          occurrence (new id) and thus a new operator; dedup applies to
+          id-stable external Event endpoints (or re-ingesting connection-only
+          against the resolved id).
         - granularity='bulk' (default): whole bundle in one coherent pass,
           returns aggregated {created, ids, nudges}. granularity='granular':
           additionally returns per-item ``results`` for agent step-by-step
@@ -14855,14 +15003,17 @@ class TortoiseSDK:
                 # plus a warning naming what happened — never a silent
                 # structure change, and never a silent operator-less edge.
                 #
-                # NOTE (why the 'direct' branch below is retained): ingest's
-                # endpoint contract is POINT-ONLY (_check_connection rejects
-                # any non-Point endpoint, with a carve-out for an Event on the
-                # operator route), so for a plain IMPL/NAND this gate is
-                # ALWAYS true — the branch cannot be reached today. It is kept
-                # because it is what makes a future widening of that contract
-                # (Object↔Object bundles) automatically correct instead of
-                # silently operator-less.
+                # NOTE (why the 'direct' branch below is RETAINED and now
+                # REACHABLE): #7925 aligned ingest's endpoint contract with the
+                # write primitives it dispatches to, so a plain IMPL/NAND whose
+                # endpoints carry NO plain :Point — the Object↔Object
+                # carve-out, or any Subject/Object/Event pair — takes this
+                # branch and is written operator-less by
+                # `create_direct_edge`. The gate above is what keeps that
+                # correct: it is False for those pairs (no Point-bearing
+                # endpoint) and True for any Point-bearing one, so the
+                # operator-mediated structure is chosen where the ruling
+                # requires it.
                 _route = self._connection_route(conn)
                 if _route == "direct" and self._point_mediated_route([src, *dsts]):
                     self._append_warning(
@@ -15350,6 +15501,13 @@ class TortoiseSDK:
         the operator-less half of the same epistemic layer the operator path
         bridges, so the label set is identical). The resolved label anchors
         each id-filtered query so the per-(label, id) index is kept.
+
+        #7925: ``ingest()``'s endpoint validation admits the same four labels
+        on this route, so the two write surfaces agree about the same edge —
+        before #7925 this primitive wrote a (Subject)-[:IMPL]->(Object) edge
+        that ``ingest()`` then refused with ``must be a plain Point``.
+        ``ingest()`` adds the terminal-endpoint guard below PLUS the
+        Point-mediated route gate (#8499).
 
         Guards (shared with #901, E2E-11.7):
           - endpoints exist AND are plain epistemic nodes (a Source or an

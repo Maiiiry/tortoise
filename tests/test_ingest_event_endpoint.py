@@ -11,10 +11,14 @@ Point OR Event endpoints, so Event-input operators created via the direct
 API could not be deduped via ingest (the #1919 dedup fix was unreachable on
 the ingest surface).
 
-Scope: the OPERATOR route (reify:true / mitigation / part-whole →
-create_operator) accepts Point OR Event endpoints; the DIRECT-edge route
-(plain IMPL/NAND → create_direct_edge, which guards plain Points) and the
-relation route are unchanged.
+Scope (#2062, widened by #7925): EVERY operator connection — the OPERATOR
+route (reify:true / mitigation / part-whole → create_operator) and the
+DIRECT-edge route (plain IMPL/NAND → create_direct_edge) — accepts endpoints
+carrying any of the four epistemic labels (Point/Subject/Object/Event),
+addressed by the node's ``id``. #7925 closed the #2062 asymmetry: the direct
+route used to require plain Points while ``create_direct_edge`` itself had
+been widened to the four labels by #7902, so the validator was stricter than
+the primitive it calls. The relation route is unchanged.
 
 Runnable with: TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest tests/test_ingest_event_endpoint.py -v
 """
@@ -200,10 +204,11 @@ def test_nand_operator_route_event_endpoint_dedups(sdk):
 
 
 def test_operator_route_rejects_non_event_entity_refs(sdk):
-    """#2062 (narrowness pin): the operator-route relaxation is NARROW — it
-    accepts Event entity items only, never other entity types. A bundle-local
-    `type:"document"` ref on an operator connection is still a violation
-    (guards against future accidental widening of the branch)."""
+    """#2062 (narrowness pin, restated by #7925): the operator-route
+    relaxation admits the EPISTEMIC entity types — subject / object / event —
+    and never a document. A bundle-local `type:"document"` ref on an operator
+    connection is still a violation (guards against widening the branch past
+    `_INGEST_ENDPOINT_LABELS`)."""
     bundle = {
         "entities": [{"ref": "docL", "type": "document",
                        "name": "Report", "documentKind": "report"}],
@@ -217,8 +222,8 @@ def test_operator_route_rejects_non_event_entity_refs(sdk):
     # D10 (#5026): a document is a :Source, so the reported graph item label
     # is "Source" (the bundle still declares type:"document" and is still
     # rejected — the narrowness pin is unchanged).
-    assert any("must be a plain Point — got a Source item" in m
-               for m in msgs), msgs
+    assert any("must be a Point/Subject/Object/Event endpoint — got a Source "
+               "item" in m for m in msgs), msgs
 
 
 def test_operator_route_nonexistent_event_shaped_id_rejected(sdk):
@@ -255,10 +260,12 @@ def test_operator_route_eventid_only_event_rejected_cleanly(sdk):
                    "reify": True}]}
     viols = sdk._validate_bundle(bundle)
     msgs = [v["message"] for v in viols]
-    assert any("must be a plain Point — got a Event endpoint" in m
-               for m in msgs), msgs
-    with pytest.raises(BundleValidationError,
-                       match="must be a plain Point — got a Event endpoint"):
+    assert any("must be a Point/Subject/Object/Event endpoint — got a Event "
+               "endpoint" in m for m in msgs), msgs
+    with pytest.raises(
+            BundleValidationError,
+            match="must be a Point/Subject/Object/Event endpoint — got a "
+                  "Event endpoint"):
         sdk.ingest(bundle)
     # zero partial mutation — the point item never committed
     assert _count(sdk, "MATCH (n:Point {content:'B'}) RETURN count(n)") == 0
@@ -435,27 +442,196 @@ def test_plain_point_operator_route_behavior_unchanged(sdk):
     assert _event_edge_count(sdk) == 0
 
 
-def test_direct_route_event_endpoint_still_rejected(sdk):
-    """#2062 (scope pin): the DIRECT-edge route (plain IMPL/NAND → operator-
-    less create_direct_edge, which guards plain Points) keeps its plain-Point
-    endpoint validation — an Event endpoint on a plain IMPL connection is
-    still a BundleValidationError (Phase-1 violation, Phase-2 raise)."""
+# ═══════════════════════════════════════════════════════════════════════
+# I5: #7925 — the endpoint label set is ROUTE-INDEPENDENT
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_operator_route_subject_object_endpoints_accepted(sdk):
+    """#7925 (companion of the direct-route pin): the OPERATOR route accepts
+    `:Subject`/`:Object` endpoints too. The divergence #7925 closes was never
+    direct-route-only — `create_operator` has admitted the four epistemic
+    labels since #7902 and `_find_operator`'s dedup key sweeps the same four
+    (`live.epistemic_disjunction`), so the primitive wrote this connection
+    while the validator refused it with 'must be a plain Point — got a
+    Subject endpoint'. Re-ingest must exact-hit the operator (no duplicate,
+    no double count in EP) — that is what makes the widening safe rather than
+    just permissive."""
+    sub = sdk.create_subject("Alpha")["id"]
+    obj = sdk.create_object("Beta")["id"]
+    bundle = {"connections": [{"from": sub, "to": obj, "operator": "IMPL",
+                               "reify": True}]}
+
+    assert sdk._validate_bundle(bundle) == []
+    res1 = sdk.ingest(bundle)
+    assert res1["created"]["connections"] == 1
+    assert _operator_count(sdk) == 1
+    # the operator is wired to BOTH inputs (typed edge + reverse INPUT edge)
+    assert _count(sdk, "MATCH (o:Point {is_operator:true})-[r:IMPL]->() "
+                       "RETURN count(r)") == 2
+    assert _count(sdk, "MATCH ()-[r:INPUT]->(o:Point {is_operator:true}) "
+                       "RETURN count(r)") == 2
+
+    res2 = sdk.ingest(bundle)
+    assert res2["created"]["connections"] == 0
+    assert res2["deduped"]["connections"] == 1
+    assert _operator_count(sdk) == 1
+
+
+def test_direct_route_event_endpoint_accepted(sdk):
+    """#7925 (restated #2062 scope pin): the DIRECT-edge ROUTE REQUEST (plain
+    IMPL/NAND) now admits an Event endpoint, exactly as ``create_direct_edge``
+    has since #7902 — pre-#7925 the validator refused it with 'must be a plain
+    Point — got a Event endpoint' while the primitive wrote the same edge.
+    The endpoint-KIND gate (#8499) then decides the STRUCTURE from the resolved
+    endpoints: a plain ``:Point`` is one of these, so the pair is
+    operator-mediated and is reified — with the ``point_mediated_route``
+    warning. The validator's job is only to stop being stricter than the
+    primitives; the structure stays the primitive's call."""
     pa = sdk.create_point("statement", "A")["id"]
     eid = sdk.create_event("Launch party", "sessionCaptured")["eventId"]
     bundle = {"connections": [{"from": pa, "to": eid, "operator": "IMPL"}]}
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    # Point-bearing ⇒ operator-mediated (#8499) — and the gate says so out loud
+    assert _operator_count(sdk) == 1
+    assert any("point_mediated_route" in w for w in res["warnings"]), \
+        res["warnings"]
+
+
+def test_direct_route_event_object_endpoint_is_operatorless(sdk):
+    """#7925 + #8499 end to end: with NO plain ``:Point`` among the endpoints
+    the direct shape is the ruling's own carve-out, so an Event↔Object
+    connection writes an operator-less (Event)-[:IMPL]->(Object) edge. Before
+    #7925 this bundle never reached the write path at all — validation refused
+    both endpoints as 'not a plain Point'."""
+    bundle = {
+        "entities": [
+            {"ref": "evt", "type": "event", "name": "Launch",
+             "eventKind": "sessionCaptured"},
+            {"ref": "obj", "type": "object", "name": "Beta",
+             "objectKind": "product"},
+        ],
+        "connections": [{"from": "evt", "to": "obj", "operator": "IMPL"}],
+    }
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    assert _count(sdk, "MATCH (:Event)-[r:IMPL]->(:Object) "
+                       "RETURN count(r)") == 1
+    assert _operator_count(sdk) == 0
+    assert not [w for w in res["warnings"] if "point_mediated_route" in w], \
+        res["warnings"]
+
+
+def test_direct_route_subject_object_endpoints_accepted(sdk):
+    """#7925 Indicators 1+2 (the reported defect): a `:Subject`/`:Object`
+    direct connection that `create_direct_edge` accepts (#7902) must be
+    accepted by ingest too — the two write surfaces agree on the same edge.
+    Phase 1 reports 0 violations and ingest writes exactly one
+    (Subject)-[:IMPL]->(Object) edge with no raise and no operator."""
+    sub = sdk.create_subject("Alpha")["id"]
+    obj = sdk.create_object("Beta")["id"]
+    bundle = {"connections": [{"from": sub, "to": obj, "operator": "IMPL"}]}
+
+    # Indicator 1 — _validate_bundle reports zero violations
+    assert sdk._validate_bundle(bundle) == []
+
+    # Indicator 2 — exactly one edge, written operator-less
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    assert _count(sdk, f"MATCH (:Subject {{id:'{sub}'}})-[r:IMPL]->"
+                       f"(:Object {{id:'{obj}'}}) RETURN count(r)") == 1
+    assert _operator_count(sdk) == 0
+
+    # the SDK primitive and ingest agree on the SAME edge (idempotent MERGE)
+    assert sdk.create_direct_edge("IMPL", sub, obj)["created"] is False
+
+
+def test_direct_route_terminal_entity_endpoint_rejected_phase1(sdk):
+    """#7925 (the guard the widening requires): a bundle-local `:Subject`/
+    `:Object` ref is merged BY NAME, so it can resolve onto an EXISTING terminal
+    node — and `create_direct_edge` refuses a terminal endpoint, which would be
+    a raise AFTER the bundle's earlier items committed. Measured before this
+    guard landed: the predecessor point item was left behind (partial
+    mutation). Phase 1 must catch it, so zero items commit and the error is a
+    BundleValidationError rather than a Phase2Error."""
+    sub = sdk.create_subject("Alpha")["id"]
+    sdk.create_object("Beta")
+    sdk.update_entity(sub, status="superseded")
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Alpha"},
+                     {"ref": "o", "type": "object", "name": "Beta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
     viols = sdk._validate_bundle(bundle)
-    assert viols, "Phase 1 must flag the direct-route Event endpoint"
-    assert "must be a plain Point" in viols[0]["message"]
-    assert "Event" in viols[0]["message"]
-    with pytest.raises(BundleValidationError,
-                       match="must be a plain Point — got a Event endpoint"):
+    msgs = [v["message"] for v in viols]
+    assert any("resolves to terminal Subject" in m and sub in m
+               for m in msgs), msgs
+    with pytest.raises(BundleValidationError, match="resolves to terminal Subject"):
         sdk.ingest(bundle)
+    # ZERO mutation — the point item never committed (#2062/#2971 class)
+    assert _count(sdk, "MATCH (n:Point {content:'must-not-commit'}) "
+                       "RETURN count(n)") == 0
+    assert _count(sdk, "MATCH ()-[r:IMPL]->(:Object) RETURN count(r)") == 0
+
+
+def test_direct_route_entity_declared_terminal_status_rejected_phase1(sdk):
+    """#7925: the second shape of the same guard — the item DECLARES a terminal
+    `status` and no node holds the name, so the `:Subject` the writer mints is
+    BORN terminal and `create_direct_edge` refuses it. Measured before the
+    guard landed: the Subject node itself was created and left behind. Phase 1
+    must reject, so nothing is minted."""
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma",
+                      "status": "superseded"},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("declares status 'superseded'" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError, match="declares status 'superseded'"):
+        sdk.ingest(bundle)
+    assert _count(sdk, "MATCH (n:Subject {name:'Gamma'}) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Point {content:'must-not-commit'}) "
+                       "RETURN count(n)") == 0
+
+
+def test_direct_route_live_entity_not_over_rejected(sdk):
+    """#7925 (the guard's OTHER edge): a declared terminal status on an entity
+    item whose name is ALREADY held by a LIVE node must NOT reject the bundle.
+    The name merge keeps the existing node's own status (measured — the writer
+    does not apply the re-declared value), so the endpoint stays live and the
+    direct edge is legal. Without the by-name existence test the guard would
+    reject a bundle the writer accepts."""
+    sdk.create_subject("Alpha")
+    sdk.create_object("Beta")
+    bundle = {
+        "entities": [{"ref": "s", "type": "subject", "name": "Alpha",
+                      "status": "superseded"},
+                     {"ref": "o", "type": "object", "name": "Beta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    assert _count(sdk, "MATCH (:Subject {name:'Alpha'})-[r:IMPL]->"
+                       "(:Object {name:'Beta'}) RETURN count(r)") == 1
 
 
 def test_direct_route_non_point_endpoints_still_rejected(sdk):
-    """#2062 (regression, E2E-1 c3/c4/c5 parity): the direct route keeps
-    rejecting Source endpoints, operator-shaped point items, AND bundle-local
-    Event entity refs — the relaxation never widens the direct-edge surface."""
+    """#7925 (restated #2062 regression pin, E2E-1 c3/c4/c5 parity): widening
+    the direct route to the four EPISTEMIC labels never widens it past them —
+    a `:Source` endpoint (external by url AND bundle-local) and an
+    operator-shaped point item are still rejected. The bundle-local Event item
+    that #2062 expected to be refused is now ACCEPTED (it moved to the
+    epistemic side, see test_direct_route_event_endpoint_accepted) — the pin
+    is re-specified, never silently deleted."""
     pa = sdk.create_point("statement", "A")["id"]
     src = sdk.create_source("https://pre.example/s", "report")
     bundle = {
@@ -474,8 +650,14 @@ def test_direct_route_non_point_endpoints_still_rejected(sdk):
     }
     viols = sdk._validate_bundle(bundle)
     msgs = [v["message"] for v in viols]
-    assert sum("must be a plain Point" in m for m in msgs) == 4, msgs
-    # the bundle-local Event cell carries the distinct label message
-    assert any("got a Event item" in m for m in msgs), msgs
+    assert sum("must be a Point/Subject/Object/Event endpoint" in m
+               for m in msgs) == 3, msgs
+    # the two Source cells report the graph item label, the point cell its own
+    assert any("got a Source endpoint" in m for m in msgs), msgs
+    assert any("got a Source item" in m for m in msgs), msgs
+    assert any("got a operator-shaped point item" in m for m in msgs), msgs
+    # the bundle-local Event cell is no longer among them (#7925)
+    assert not any("evtL" in m for m in msgs), msgs
+    # Phase 2 is defense-in-depth: the same bundle raises, never a partial write
     with pytest.raises(BundleValidationError):
         sdk.ingest(bundle)
