@@ -681,8 +681,14 @@ def cmd_list(args: argparse.Namespace) -> int:
               "know the work is safe)")
         for ref, sha in guards:
             others = _refs_pointing_at(sha) - {ref}
-            note = (f"  (also named by: {', '.join(sorted(others))})" if others
-                    else "  (no other ref names it)")
+            durable = sorted(others - {"refs/stash"})
+            if durable:
+                note = f"  (also named durably by: {', '.join(durable)})"
+            elif "refs/stash" in others:
+                note = ("  (refs/stash names it too, but that is NOT durable — a later "
+                        "`stash store` moves it; this guard is the handle)")
+            else:
+                note = "  (no other ref names it)"
             print(f"  {sha[:12]}  {ref}{note}")
     if rows and (rows[0]["branch"] != branch or not rows[0]["branch"]):
         print("\n⚠️  the top shared entry is not this lane's — use `lane_stash pop <id>`, "
@@ -875,6 +881,13 @@ def cmd_recover(args: argparse.Namespace) -> int:
         raise LaneStashError(f"{args.sha} is not an object in this repository")
     if _git("cat-file", "-t", args.sha, check=False).stdout.strip() != "commit":
         raise LaneStashError(f"{args.sha} is not a commit — `git stash store` needs a stash commit")
+    # Normalise to the FULL sha BEFORE any register or guard lookup. The register
+    # enumerates full shas, so exact-string membership over an abbreviated sha can
+    # never match: the store would succeed yet be read as failure, leaving the
+    # entry UNPINNED while telling the user it is absent — and the next bare
+    # `git stash pop` takes it (#8773 review P1). `cat-file -t` above already
+    # proved the name resolves unambiguously.
+    args.sha = _out("rev-parse", args.sha)
     parents = _out("rev-list", "--parents", "-n", "1", args.sha).split()
     subject = _out("log", "-1", "--format=%s", args.sha)
     # A stash commit has 2 parents (HEAD + index) or 3 with `-u`/`-a` (the
@@ -895,9 +908,12 @@ def cmd_recover(args: argparse.Namespace) -> int:
     subject = args.message or subject or f"recovered {args.sha}"
     if not _store_into_register(args.sha, subject):
         raise LaneStashError(
-            f"could not put {args.sha} into the shared register — `git stash store` left "
-            "no reflog entry for it (refs/stash already pointing at it with an empty "
-            "reflog makes `store` a silent no-op)"
+            f"could not put {args.sha} into the shared register. Either `git stash store` "
+            "failed, or `refs/stash` DIVERGED from a non-empty reflog (a bare `git reflog "
+            "delete` without --updateref leaves that) — repairing that would delete the "
+            "whole reflog, including the peer entries `git stash list` still shows, so it "
+            "is refused. Do NOT drop refs/stash to 'fix' it: recover the other entries "
+            "first, or leave it to `check` (which fails closed on it)."
         )
     key = lane_key()
     entry = _pin_or_report(key, args.sha)

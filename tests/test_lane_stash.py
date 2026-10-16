@@ -1266,3 +1266,44 @@ def test_recover_releases_a_guard_created_by_another_lane(repo, monkeypatch, cap
     assert repo.git(
         "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
     ).stdout.strip() == "", "another lane's guard must be released too"
+
+
+def test_recover_accepts_an_abbreviated_sha(repo, monkeypatch, capsys):
+    """`recover` must normalise the sha before the register lookup.
+
+    The register enumerates FULL shas, so an abbreviated sha (the 12-char form the
+    tool itself prints) can never match an exact-string membership check. The store
+    would succeed yet be read as failure: the entry is left UNPINNED while the user
+    is told it is absent, and the next bare `git stash pop` takes it (#8773 review
+    P1).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\nrescued\n")
+    repo.git("stash", "push", "-q", "-m", "rescued", cwd=repo.b)
+    sha = repo.stash_sha()
+    assert sha is not None
+    repo.git("reflog", "delete", "--updateref", "refs/stash@{0}")
+    assert repo.stash_shas() == []
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["recover", sha[:10], "-m", "rescued"]) == 0
+    assert repo.stash_shas() == [sha], "the abbreviated name must resolve to the full entry"
+    assert sha in repo.lane_refs().values(), "the entry must be pinned, not left bare"
+    assert repo.lane(repo.a, "check").returncode == 0
+
+
+def test_list_reports_a_retained_guard_as_the_durable_handle(repo):
+    """`list` must not call refs/stash a durable alternative for a guard.
+
+    refs/stash is exactly what a later `stash store` displaces, so naming it as the
+    other ref that keeps the object alive could steer the user to drop the only
+    durable handle (#8773 review P2).
+    """
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    repo.git("reflog", "delete", "--updateref", "refs/stash@{0}")
+    assert repo.lane(repo.b, "prune", "--apply").returncode == 0
+    listed = repo.lane(repo.b, "list")
+    assert listed.returncode == 0
+    assert "prune guards held" in listed.stdout, listed.stdout
+    assert "NOT durable" in listed.stdout, listed.stdout

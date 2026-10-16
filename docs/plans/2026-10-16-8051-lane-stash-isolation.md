@@ -269,7 +269,10 @@ rule is additive.
    branch name that matches the current one — and exits 0 when the top is provably this lane's own.
 3. `pop` never deletes from the shared register (it records the apply durably and releases only the
    lane pin); `prune` removes an entry only when a lane ref pins it or this lane's applied-record
-   names it — a never-applied entry (e.g. one whose `_pin` failed) is refused.
+   names it — a never-applied entry (e.g. one whose `_pin` failed) is refused. This is the
+   **intent**, not a blanket invariant: `prune`'s delete is positional, so the documented residual
+   (see the `prune` bullet's "Residual race") can remove a during-prune entry while reporting
+   success and must be read with this criterion.
 4. `AGENTS.md` states the hazard and names the safe alternative (issue Target: 1 guidance line).
 5. `python tools/ci_selection.py --integrity` is clean with the new test registered.
 
