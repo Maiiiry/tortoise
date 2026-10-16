@@ -15,10 +15,13 @@ pre-warm never reached. A cold-runner fetch is exactly the thing a bounded retry
 is for, so the step now retries (3 attempts, best-effort: the boot loop is the
 real gate and surfaces wrangler's own log).
 
-The pre-warm also floated `wrangler@4` while every boot step pins `4.127.0`, so
-it warmed a DIFFERENT tarball than the one the boot actually fetched — the
-agent-infra#414 drift class, and it also made npm download the whole packument
-to resolve the range. The two versions must agree.
+The pre-warm also drifted from what the boot fetched, in two shapes. In
+`welcome-e2e` the pre-warm floated `wrangler@4` while the boot step pinned
+`4.127.0`; in `dashboard-e2e` BOTH the pre-warm and its two boot steps floated
+`wrangler@4` (`legal-e2e` pinned `4.127.0` on both sides). Either shape warms a
+DIFFERENT tarball than the one the boot fetches — the agent-infra#414 drift
+class — and a range also made npm download the whole packument to resolve it.
+The two versions must agree.
 
 WHAT THIS PINS (a gate is worth what its wiring is worth — the #4311 convention)
   * every `Pre-warm wrangler toolchain` step pins an EXACT version
@@ -250,8 +253,8 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:
-    """The dashboard boot steps floated `@4` while the pre-warm pinned 4.127.0
-    — the drift class the parity check above exists to catch."""
+    """The dashboard boot steps floated `@4` — as did its pre-warm — the drift
+    class the parity check above exists to catch."""
     for job in sorted(PREWARM_JOBS):
         for other_job, other in _steps():
             if other_job != job:

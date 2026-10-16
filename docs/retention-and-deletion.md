@@ -384,8 +384,9 @@ not a whitelist — a file outside the set above may still link here.
 `tortoise/backup_config.py` are exempt whole-file (every line is the authority);
 `tortoise/{backup_sweep,hosted_api,sdk,supabase_control,raw_state}.py` are exempt
 only on lines that name a canonical constant. `docs/ONTOLOGY.md` is exempt only on
-lines that name a canonical constant too (its §4.6 row states the marker window via
-`RAW_DELETION_MARKER_TTL`, never as a bare number). `website/apps/dashboard/src/graphs.test.js`
+lines that name a canonical constant too (its §4.6 row does carry a bare window
+number, but it names `RAW_DELETION_MARKER_TTL` on that same line — the constant,
+not the absence of a number, is what makes the line traceable). `website/apps/dashboard/src/graphs.test.js`
 is derived: it imports `TRASH_GRACE_DAYS` from `graphs.js` rather than restating
 the number.
 
