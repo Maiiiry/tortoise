@@ -3,6 +3,10 @@ title: "Extractor v4 — Architecture Changelog"
 type: engineering
 domain: platform
 doc_status: live
+created: 2026-10-15
+subjects.team: epistemic-team
+aboutSubjects: Tortoise memory graph
+aboutObjects: EXTRACTOR-V4-ARCHITECTURE.md, extractor pipeline, decision protocol, review cycles
 ---
 
 # Extractor v4 — Architecture Changelog

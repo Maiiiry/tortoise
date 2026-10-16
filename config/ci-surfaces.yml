@@ -1025,6 +1025,12 @@ surfaces:
   # `test_durability_posture.py`), because a docs-only `docs/ONTOLOGY.md`
   # wording edit is what this guard is FOR.
   - test_5142_ontology_record.py
+  # #8738 review P2: the doc-affiliation frontmatter on the three changelog
+  # companions this change adds AND on every `docs/architecture/*.md`. The
+  # external `check-doc-affiliation.cjs` is not wired into CI, so a dropped
+  # `created` / team key could land green; this is a fast, no-DB file scan.
+  # Dual-registered in `tier1` because a docs-only diff runs `tier1` only.
+  - test_doc_affiliation_frontmatter.py
   # #7818: the §4.7 coverage-boundary record vs `_covers` (closed `[vF, vT]`, the
   # one shared instant of a well-formed contiguous chain, and the OPEN
   # closed-vs-half-open decision). The hermetic doc half of the #7818 guard — the
@@ -3639,6 +3645,7 @@ tier1:
 - test_decide.py
 - test_durability_posture.py  # #2881: durability authority + scoped source-of-truth gate
 - test_5142_ontology_record.py  # #5142: docs/ONTOLOGY.md §4.4/§4.6 record vs the code (format/`_SOURCE_HANDLED`, the deferred node collapse + its `OVERRIDES:`, the document `:Source` scoping) — dual-registered with `core`
+- test_doc_affiliation_frontmatter.py  # #8738 review P2: the changelog companions' required doc-affiliation frontmatter — a docs-only diff runs `tier1` only; dual-registered with `core`
 - test_7818_ontology_record.py  # #7818: docs/ONTOLOGY.md §4.7 coverage-boundary record vs `_covers` (hermetic doc pin; a docs-only ONTOLOGY edit runs only tier1) — dual-registered with `core`
 - test_7818_plan_record_5362.py  # #7818/#5362: the #5362 plan's RES-1 / out-of-scope read-path record vs the shipped reply contract (hermetic doc pin; a docs-only plan edit runs only tier1) — dual-registered with `core`
 - test_ep_draft_filter.py
@@ -4728,6 +4735,7 @@ durations:
   test_extractor_v4_failure_policy.py: 0.1  # #8495: §4.4 doc-text scan + two module reads; same no-DB shape as the three guards above
   test_extractor_v4_redaction_reconciliation.py: 0.3  # #8496: one section read + a marker/idempotence check; the `tortoise.sdk` import (~0.12s) is the only cost
   test_entity_attachment_brief_claims.py: 0.1  # #8639 review P1: doc-text scan + three regex block reads; same no-DB shape as the extractor-v4 guards above
+  test_doc_affiliation_frontmatter.py: 0.1  # #8738 review P2: six frontmatter-block reads + one directory glob; same no-DB shape as the doc guards above
   test_file_indexer.py: 0.7
   test_open_kinds.py: 0.3
   test_postmerge_verdict.py: 0.4

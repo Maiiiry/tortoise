@@ -22,7 +22,7 @@ WHAT THIS PINS
 1. **`test_the_retracted_passages_do_not_reappear`** — each stale sentence is
    matched as a literal. This is the NON-VACUITY half: every string below was
    present in the pre-fix document, so this file is red on it.
-2. **`test_the_corrected_passages_state_the_landed_facts`** — the repaired
+2. **`test_the_repaired_passages_still_state_the_design_facts`** — the repaired
    passages must POSITIVELY say what landed. A revert of the wording reds.
 3. **`test_the_code_still_agrees_with_the_corrected_passages`** — the code
    facts behind the repaired passages (D10's retirement, T6's journalled

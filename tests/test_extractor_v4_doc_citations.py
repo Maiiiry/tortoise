@@ -2,7 +2,7 @@
 
 THE DEFECT THIS PINS
 --------------------
-`docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md` §15 describes
+`docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md` §7 describes
 `tortoise/value_gate.py`'s identifier-only DISCARD (`#4899`). The row first
 stated the rule as `^#\\d{3,}$`-style — `#4899`'s *proposed* pattern, not the
 shipped one — and it was wrong in BOTH directions:
@@ -19,7 +19,7 @@ is that "the symbol name is authoritative and the line number is a convenience".
 
 WHAT THIS PINS
 --------------
-1. §15's value-gate row names the shipped symbol (`value_gate._REFERENCE` /
+1. §7's value-gate row names the shipped symbol (`value_gate._REFERENCE` /
    `identifier_only()`) and carries no hand-written `^#\\d{3,}$` pattern.
 2. Those symbols exist and behave as the shipped module does — so the guard
    cannot pass over a rename that would make the citation stale.

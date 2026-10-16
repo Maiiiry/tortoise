@@ -3,6 +3,10 @@ title: "Tortoise — Ontology Changelog"
 type: engineering
 domain: platform
 doc_status: live
+created: 2026-10-15
+subjects.team: epistemic-team
+aboutSubjects: epistemic-team
+aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 ---
 
 # Tortoise — Ontology Changelog

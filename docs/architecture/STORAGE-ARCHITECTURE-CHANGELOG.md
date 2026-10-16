@@ -3,6 +3,10 @@ title: "Storage Architecture — Changelog"
 type: engineering
 domain: platform
 doc_status: live
+created: 2026-10-15
+subjects.team: epistemic-team
+aboutSubjects: Tortoise memory graph
+aboutObjects: STORAGE-ARCHITECTURE.md, issue map, storage design revisions
 ---
 
 # Storage Architecture — Changelog
