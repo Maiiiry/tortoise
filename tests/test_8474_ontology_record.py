@@ -116,7 +116,7 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
         "§4.6 must state the recordable enumeration — the `**recordable** as … "
         "**a deletion is an ACT**` clause this pin reads"
     )
-    recorded = set(re.findall(r"`([a-z_]+)`", clause.group("values")))
+    recorded = set(re.findall(r"`([^`\n]+)`", clause.group("values")))
     assert recorded == {RAW_PRESENT, RAW_DELETED}, (
         "§4.6's recordable vocabulary must be exactly the values the code writes "
         f"— the row names {sorted(recorded)}, the write surface is "

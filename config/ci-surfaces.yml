@@ -1084,7 +1084,7 @@ surfaces:
   # (`docs/` is in NON_PYTHON_PREFIXES) and runs tier1 only, so a pin inside the
   # docker-lane #3998 file slept on the exact change it guards. Same shape and
   # same reason as the #5142/#7818 ontology-record pins above — dual-registered
-  # with `core`.
+  # with `tier1`.
   - test_8474_ontology_record.py
   # #4030: `supabase/config.toml` is TRACKED and resolves its providers by
   # `env(NAME)`, so every one of those names is required by a file in this
