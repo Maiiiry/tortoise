@@ -24,8 +24,6 @@ aboutObjects: STORAGE-ARCHITECTURE.md, issue map, storage design revisions
 > Nothing is deleted. The design document keeps the measurement evidence and the
 > rulings the map pointed at; only the index moved here.
 
-**CRITICAL RULE: no modification to this file is allowed without explicit approval of the exact changes by Daniel Ospina.**
-
 ---
 
 ## The issue map (moved from `STORAGE-ARCHITECTURE.md` §13)

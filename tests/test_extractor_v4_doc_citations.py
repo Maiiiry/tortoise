@@ -19,8 +19,9 @@ is that "the symbol name is authoritative and the line number is a convenience".
 
 WHAT THIS PINS
 --------------
-1. §7's value-gate row names the shipped symbol (`value_gate._REFERENCE` /
-   `identifier_only()`) and carries no hand-written `^#\\d{3,}$` pattern.
+1. §7's value-gate row names the shipped symbols (`value_gate._REFERENCE` /
+   `identifier_only()`) and denies the anchored `^#\\d{3,}$` form as the rule —
+   it may appear only as a REJECTED pattern, never as a competing definition.
 2. Those symbols exist and behave as the shipped module does — so the guard
    cannot pass over a rename that would make the citation stale.
 
@@ -53,7 +54,7 @@ def _value_gate_row() -> str:
 def test_the_value_gate_statement_names_the_real_symbol_not_a_proposed_pattern():
     row = _value_gate_row()
     assert "value_gate._REFERENCE" in row, (
-        "§4's value-gate statement must name the real symbol "
+        "§7's value-gate statement must name the real symbol "
         "(`value_gate._REFERENCE`); a hand-written pattern is what the #8498 "
         "review found wrong in both directions. Row: " + row
     )

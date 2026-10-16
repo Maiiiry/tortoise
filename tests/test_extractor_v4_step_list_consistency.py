@@ -514,7 +514,7 @@ def test_the_reversal_exemption_does_not_cover_a_second_coupling_on_the_row():
     )
     row = rows[0]
     assert not _discard_e7_offenders(row), (
-        "the live §4 statement must be the reversal record and nothing else — this "
+        "the live §7 statement must be the reversal record and nothing else — this "
         "assertion keeps the mutations below from passing trivially (#5198):\n"
         + row
     )
