@@ -70,7 +70,10 @@ THE CONTRACT
   quiet: an entry PUSHED during the prune is outside that guard set, and because
   git exposes no compare-and-delete, a shift that removes one cannot be undone —
   it is detected by comparing the register's whole sha state against the
-  expected one and reported (never silently absorbed).
+  expected one and reported. That comparison is not a proof (a during-prune push
+  and a concurrent remover taking the intended sha can cancel out in the
+  multiset), so the residual case is documented and pinned by a test rather than
+  claimed impossible; see the plan's "Residual race" note.
 * **``check`` is fail-closed**: exit 0 when a bare ``git stash pop`` in this
   worktree would take THIS lane's own entry; exit 1 when it would take a FOREIGN
   entry — a peer lane's (identified by the ``[<lane-key>]`` marker this tool
@@ -913,12 +916,18 @@ def cmd_prune(args: argparse.Namespace) -> int:
             # Did the register end up exactly where a clean delete of `r["sha"]`
             # would leave it? `git reflog delete` re-resolves the position at
             # DELETE time, so a push (or another lane's prune) inside this call
-            # shifts positions; comparing the WHOLE state detects every such
-            # interleaving — including the one case that cannot be restored, a
-            # @{0} delete that removed an entry pushed during the prune and that
-            # this prune therefore never saw (it is reported instead). A bare
-            # "is the intended sha gone?" check is NOT enough: a concurrent
-            # remover can take that sha while our delete removes a peer's entry.
+            # shifts positions; comparing the WHOLE state detects every shift
+            # that changes the sha multiset. It is NOT a proof: a during-prune
+            # push and a concurrent remover taking the intended sha can cancel
+            # out, leaving `post == want` while the unseen during-prune entry was
+            # the one removed. Git exposes no compare-and-delete and the two
+            # histories are observationally identical, so that residual cannot be
+            # detected here — it is documented in the plan ("Residual race") and
+            # pinned by test_prune_cannot_distinguish_a_cancelled_shift. It is
+            # precisely why `prune` must run only when the register is quiet.
+            # A bare "is the intended sha gone?" check would be strictly weaker:
+            # a concurrent remover alone can take that sha while our delete
+            # removes a peer's entry, which the whole-state comparison DOES catch.
             want = sorted(s for s in expected if s != r["sha"])
             post = sorted(x["sha"] for x in _shared_register())
             if post != want:
@@ -1017,12 +1026,22 @@ def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
     reported and left alone.
     """
     if not _orphan_is_reclaimable(sha, key):
+        # `refs/stash` alone is NOT a durable handle: the caller's reconciliation
+        # runs `git stash store` after this, which moves the ref and would destroy
+        # exactly the handle this message promises (#8773 review P2). Pin the
+        # object instead; the guard ref is per-lane and nothing unpins it, so the
+        # orphan survives the store.
+        ref = _guard_pin(key, sha)
+        held = (f"held by {ref}" if ref else
+                "held ONLY by refs/stash (it could NOT be guard-pinned, so a later "
+                "`stash store` may displace it)")
         print(f"kept   refs/stash {sha[:12]}  (unpinned orphan: the register enumerates "
               "nothing, no lane ref pins it, and this lane has no applied-record for "
               "it — dropping the ref would destroy the last handle bare git has on "
               "that entry)\n"
-              "  this is a HAZARD state — `lane_stash check` stays fail-closed here; if the "
-              "work is yours, pin it with:\n"
+              f"  {held} — this is a HAZARD state; a guard ref keeps the object "
+              "reachable even if another `stash store` moves refs/stash; `lane_stash "
+              "check` stays fail-closed here. If the work is yours, recover it with:\n"
               f"    python tools/lane_stash.py recover {sha}")
         return 0
     if not apply:

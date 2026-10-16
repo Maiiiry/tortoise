@@ -1010,12 +1010,15 @@ def test_prune_warns_when_a_concurrent_push_shifts_the_position(repo, monkeypatc
 
 
 def test_prune_reports_a_register_changed_by_a_concurrent_remover(repo, monkeypatch, capsys):
-    """A concurrent remover plus a push must be REPORTED, never read as success.
+    """A concurrent remover plus TWO pushes must be REPORTED, not read as success.
 
     The intended sha's ABSENCE is not proof our delete took it: another lane's
-    `prune --apply` may reclaim the same doomed entry while two peer pushes shift
-    positions, and the positional delete then removes a during-prune push. Only a
-    comparison of the register's WHOLE sha state catches that (#8773 review P1).
+    `prune --apply` can reclaim the same doomed entry while peer pushes shift
+    positions, and the positional delete then removes a during-prune push. When
+    the pushes outnumber the concurrent removals the register's sha multiset
+    still differs from the expected one, and the whole-state comparison catches
+    it (#8773 review P1). The one-push variant cancels out and is the documented
+    residual — see `test_prune_cannot_distinguish_a_cancelled_shift`.
     """
     mod = _load_tool()
     repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
@@ -1048,3 +1051,94 @@ def test_prune_reports_a_register_changed_by_a_concurrent_remover(repo, monkeypa
     assert "WARNING" in out, out
     assert "removed 0" in out, out
     assert kept in repo.stash_shas(), "the kept entry must survive the interleaving"
+
+
+def test_prune_cannot_distinguish_a_cancelled_shift(repo, monkeypatch, capsys):
+    """The documented residual: a cancelled shift is NOT detectable.
+
+    One during-prune push and a concurrent remover reclaiming the intended sha
+    cancel out in the register's sha multiset, so `prune` reports success while
+    the during-prune entry was the one removed. Git exposes no
+    compare-and-delete and the two histories are observationally identical, so
+    this is a limit of the primitive, not an unhandled case — the plan's
+    "Residual race" note and this test keep it from regressing into an
+    overclaim (#8773 review P1).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", "-m", "kept", cwd=repo.b)
+    kept = repo.stash_sha()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    doomed = repo.stash_sha()
+    assert repo.stash_shas() == [doomed, kept]  # doomed sits at refs/stash@{0}
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    injected = {"done": False, "p": None}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("reflog", "delete") and not injected["done"]:
+            injected["done"] = True
+            repo.dirty(repo.b, "f.txt", "base\np\n")
+            repo.git("stash", "push", "-q", "-m", "p", cwd=repo.b)
+            injected["p"] = repo.stash_sha()
+            # a concurrent remover reclaims the shared doomed entry
+            repo.git("reflog", "delete", "--updateref", "refs/stash@{1}")
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    assert injected["done"]
+    out = capsys.readouterr().out
+    # DOCUMENTED RESIDUAL: the register is exactly `expected - {doomed}`, so the
+    # whole-state comparison cannot tell this from a clean delete.
+    assert "WARNING" not in out, out
+    assert "removed 1" in out, out
+    assert injected["p"] not in repo.stash_shas(), "the residual victim is gone"
+    assert kept in repo.stash_shas(), "the kept entry survives"
+
+
+def test_prune_orphan_survives_a_reconciliation_store(repo, monkeypatch, capsys):
+    """A retained orphan must still be named by a ref after the prune.
+
+    When the register empties during a prune and `refs/stash` points at an
+    unpinned orphan, the retention message promises a handle — but `prune`'s
+    reconciliation then runs `git stash store` for a guarded kept entry, which
+    MOVES `refs/stash` onto it and would leave the orphan handle-less. The
+    orphan is guard-pinned instead, and that ref must outlive the store (#8773
+    review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", "-m", "kept", cwd=repo.b)
+    kept = repo.stash_sha()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    doomed = repo.stash_sha()
+    assert repo.stash_shas() == [doomed, kept]
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    injected = {"done": False, "p": None}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("reflog", "delete") and not injected["done"]:
+            injected["done"] = True
+            repo.dirty(repo.b, "f.txt", "base\np\n")
+            repo.git("stash", "push", "-q", "-m", "p", cwd=repo.b)
+            injected["p"] = repo.stash_sha()
+            # concurrent removals empty the register; refs/stash is left on `p`
+            repo.git("reflog", "delete", "--updateref", "refs/stash@{1}")  # doomed
+            repo.git("reflog", "delete", "--updateref", "refs/stash@{1}")  # kept
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    assert injected["done"]
+    out = capsys.readouterr().out
+    assert "RESTORED" in out, out  # reconciliation stored `kept`
+    p = injected["p"]
+    refs = repo.git("for-each-ref", "--format=%(refname) %(objectname)").stdout.splitlines()
+    assert any(p == ln.split()[-1] for ln in refs), refs
+    assert kept in repo.stash_shas(), "the kept entry was restored"

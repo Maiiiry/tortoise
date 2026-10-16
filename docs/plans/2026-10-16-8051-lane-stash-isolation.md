@@ -139,12 +139,25 @@ One primitive, in `tools/lane_stash.py`:
   collected deliberately, and `_clear_applied` drops that record once the entry is gone). Run it when
   the register is quiet: an entry pushed during the prune is outside the guard set, and because git
   offers no compare-and-delete a shift that removes one cannot be undone — `prune` compares the
-  register's whole sha state against the expected one after each delete, so it is **detected and
-  reported, never silently absorbed**. When it
+  register's whole sha state against the expected one after each delete, so a shift that changes that
+  state is **detected and reported, never silently absorbed**. When it
   takes the LAST entry it also drops
   `refs/stash` itself (git does not, and a resolving ref over an empty reflog is both live for bare
   git and a fail-closed wedge for `check`). Any other unpinned entry — a peer lane's, bare git's, or
   this lane's own never-applied pin-failure entry — is reported and left alone.
+- **Residual race (documented, NOT detectable).** `prune` compares the register's whole sha state
+  against the expected one after each delete, which catches every interleaving that changes that
+  state. It is not a proof. A push landing *inside* the delete and a concurrent remover taking the
+  intended sha can cancel out in the multiset: the register ends exactly as a clean delete would
+  leave it, so a during-prune push can be the entry removed and `prune` reports success. Git exposes
+  no compare-and-delete (`reflog delete` only takes positions) and the two histories are
+  observationally identical, so no check can separate them — this is why `prune` is safe to run only
+  when the register is quiet, and why the tool refuses to reclaim anything it cannot *prove* is
+  already restored. `test_prune_cannot_distinguish_a_cancelled_shift` pins this residual.
+- **Orphan retention.** When an emptied register leaves `refs/stash` pointing at an entry no pin and
+  no applied-record names, `prune` retains it; it now guard-pins the object rather than relying on
+  `refs/stash`, because the reconciliation's `stash store` can move that ref and would otherwise have
+  destroyed the handle the retention message just promised.
 
 Out of scope (reported, not absorbed): the skills text (`using-git-worktrees`, `commit-workflow`) is
 a symlink to agent-infra and belongs to agent-infra #1264; the `main-worktree-guard` extension
