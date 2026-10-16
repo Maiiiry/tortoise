@@ -64,10 +64,13 @@ THE CONTRACT
   cannot be made atomic with its verification (git's own ``stash drop`` behaves
   the same), ``prune`` also guard-pins every entry it intends to KEEP and
   re-stores any entry a concurrent push's position shift caused it to remove, so
-  every register entry present when the prune started keeps a handle. Run
-  ``prune`` when the register is quiet: an entry PUSHED during the prune is
-  outside that guard set, and a shift that removes one is detected and reported
-  (it cannot be restored, because the prune never saw its sha).
+  every entry it intends to keep and that was present when the prune started
+  keeps a handle (a reclaimed entry is collected deliberately: a lane ref pinned
+  it or this lane's applied-record names it). Run ``prune`` when the register is
+  quiet: an entry PUSHED during the prune is outside that guard set, and because
+  git exposes no compare-and-delete, a shift that removes one cannot be undone —
+  it is detected by comparing the register's whole sha state against the
+  expected one and reported (never silently absorbed).
 * **``check`` is fail-closed**: exit 0 when a bare ``git stash pop`` in this
   worktree would take THIS lane's own entry; exit 1 when it would take a FOREIGN
   entry — a peer lane's (identified by the ``[<lane-key>]`` marker this tool
@@ -884,9 +887,20 @@ def cmd_prune(args: argparse.Namespace) -> int:
         # delete; if a peer pushed in between, this prune stops removing and falls
         # through to the reconciliation instead of trusting a stale position.
         order = sorted(doomed, key=lambda r: int(r["pos"].rsplit("@{", 1)[-1].rstrip("}")))
+        # The full sha state we believe the register holds. Every delete must
+        # leave it exactly one intended sha smaller; anything else means a peer
+        # (or another lane's prune) interleaved. Entries are unique, so the
+        # multiset comparison is exact.
+        expected = [r["sha"] for r in rows]
         removed = 0
         for r in reversed(order):
             spec = r["pos"]
+            # Re-snapshot: abort before touching anything if a peer has already
+            # changed the register since the previous step.
+            if sorted(x["sha"] for x in _shared_register()) != sorted(expected):
+                print("STOP: the shared register changed during the prune (a peer pushed "
+                      "or reclaimed an entry); re-run when it is quiet")
+                break
             here = _out("rev-parse", spec, check=False)
             if here != r["sha"]:
                 print(f"STOP: {spec} is now {here or 'gone'} (expected {r['sha']}) — a peer "
@@ -896,24 +910,29 @@ def cmd_prune(args: argparse.Namespace) -> int:
             if cp.returncode != 0:
                 print(f"could not remove {spec}: {cp.stderr.strip()}")
                 continue
-            # Did that delete actually take the entry we verified? A peer push in
-            # the verify/delete window shifts every position, and the delete then
-            # removes a DIFFERENT entry while leaving the intended one registered.
-            # Checking the intended sha's ABSENCE afterwards detects every such
-            # shift (including a @{0} delete that removed a just-pushed entry the
-            # prune never saw — the one case that cannot be restored because its
-            # sha is unknown; it is reported instead).
-            if r["sha"] in {x["sha"] for x in _shared_register()}:
-                print(f"WARNING: the delete of {spec} did not remove the intended entry "
-                      f"({r['sha'][:12]} is still registered) — a peer push in the "
-                      "verify/delete window shifted the reflog positions, and an entry "
-                      "pushed DURING a prune is outside the guard set, so it may have "
-                      "been the one removed. Re-check `git stash list`; the commit "
-                      "normally survives in the object DB until gc (`git fsck "
-                      "--unreachable` lists it).")
-                continue
+            # Did the register end up exactly where a clean delete of `r["sha"]`
+            # would leave it? `git reflog delete` re-resolves the position at
+            # DELETE time, so a push (or another lane's prune) inside this call
+            # shifts positions; comparing the WHOLE state detects every such
+            # interleaving — including the one case that cannot be restored, a
+            # @{0} delete that removed an entry pushed during the prune and that
+            # this prune therefore never saw (it is reported instead). A bare
+            # "is the intended sha gone?" check is NOT enough: a concurrent
+            # remover can take that sha while our delete removes a peer's entry.
+            want = sorted(s for s in expected if s != r["sha"])
+            post = sorted(x["sha"] for x in _shared_register())
+            if post != want:
+                print(f"WARNING: the shared register changed while this prune deleted "
+                      f"{spec} — a concurrent push or another prune interleaved, so the "
+                      "entry removed may not be the intended one. An entry pushed DURING "
+                      "a prune is outside the guard set and cannot be restored here; "
+                      "re-check `git stash list` (a removed commit normally survives in "
+                      "the object DB until gc — `git fsck --unreachable` lists it) and "
+                      "re-run the prune when the register is quiet.")
+                break
             removed_shas.append(r["sha"])
             removed += 1
+            expected = want
         print(f"removed {removed} pinned shared-register entr"
               f"{'y' if removed == 1 else 'ies'}; {len(kept)} unpinned left untouched")
         # `reflog delete --updateref` empties the reflog but git does NOT drop the

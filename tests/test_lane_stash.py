@@ -1007,3 +1007,44 @@ def test_prune_warns_when_a_concurrent_push_shifts_the_position(repo, monkeypatc
     assert "WARNING" in out, out
     assert doomed in repo.stash_shas(), "the intended entry must still be registered"
     assert "removed 0" in out, out
+
+
+def test_prune_reports_a_register_changed_by_a_concurrent_remover(repo, monkeypatch, capsys):
+    """A concurrent remover plus a push must be REPORTED, never read as success.
+
+    The intended sha's ABSENCE is not proof our delete took it: another lane's
+    `prune --apply` may reclaim the same doomed entry while two peer pushes shift
+    positions, and the positional delete then removes a during-prune push. Only a
+    comparison of the register's WHOLE sha state catches that (#8773 review P1).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    doomed = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", "-m", "kept", cwd=repo.b)
+    kept = repo.stash_sha()
+    assert repo.stash_shas() == [kept, doomed]  # doomed sits at refs/stash@{1}
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    injected = {"done": False}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("reflog", "delete") and not injected["done"]:
+            injected["done"] = True
+            repo.dirty(repo.b, "f.txt", "base\np1\n")
+            repo.git("stash", "push", "-q", "-m", "p1", cwd=repo.b)
+            repo.dirty(repo.b, "f.txt", "base\np2\n")
+            repo.git("stash", "push", "-q", "-m", "p2", cwd=repo.b)
+            # a concurrent peer prune reclaims the shared doomed entry
+            repo.git("reflog", "delete", "--updateref", "refs/stash@{3}")
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    assert injected["done"]
+    out = capsys.readouterr().out
+    assert "WARNING" in out, out
+    assert "removed 0" in out, out
+    assert kept in repo.stash_shas(), "the kept entry must survive the interleaving"

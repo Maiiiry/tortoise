@@ -4508,7 +4508,7 @@ durations:
   test_tenancy_spine.py: 3.0
   test_transport_wait_bound.py: 2.1
   test_collision_preflight.py: 3.6
-  # #8051: new file, 37 tests. 160.0 is a LOCAL reading (88-169s across runs
+  # #8051: new file, 38 tests. 160.0 is a LOCAL reading (88-169s across runs
   # here on a fleet-loaded host; subprocess+real-git harness); refresh from the
   # first post-merge junit artifact. Erring high is correct for sharding.
   test_lane_stash.py: 160.0

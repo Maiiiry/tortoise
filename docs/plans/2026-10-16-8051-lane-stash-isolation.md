@@ -134,9 +134,13 @@ One primitive, in `tools/lane_stash.py`:
   position is re-verified immediately before the delete. That check-then-delete is not atomic with
   git's positional `reflog delete`, so `prune` also guard-pins every entry it intends to KEEP at
   `refs/pi-lane-prune-guard/<key>/<sha>` (outside the `refs/lane` namespace) and re-stores any entry a
-  concurrent push's position shift caused it to remove — every entry present when the prune starts
-  keeps a handle; run it when the register is quiet, since an entry pushed during the prune is
-  outside the guard set and a shift that removes one is detected and reported, not restored. When it
+  concurrent push's position shift caused it to remove — every entry it intends to keep and that was
+  present at the start keeps a handle (an entry bound by a lane pin or this lane's applied-record is
+  collected deliberately, and `_clear_applied` drops that record once the entry is gone). Run it when
+  the register is quiet: an entry pushed during the prune is outside the guard set, and because git
+  offers no compare-and-delete a shift that removes one cannot be undone — `prune` compares the
+  register's whole sha state against the expected one after each delete, so it is **detected and
+  reported, never silently absorbed**. When it
   takes the LAST entry it also drops
   `refs/stash` itself (git does not, and a resolving ref over an empty reflog is both live for bare
   git and a fail-closed wedge for `check`). Any other unpinned entry — a peer lane's, bare git's, or
