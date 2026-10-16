@@ -1307,3 +1307,66 @@ def test_list_reports_a_retained_guard_as_the_durable_handle(repo):
     assert listed.returncode == 0
     assert "prune guards held" in listed.stdout, listed.stdout
     assert "NOT durable" in listed.stdout, listed.stdout
+
+
+def test_recover_does_not_displace_an_unrelated_orphan(repo, monkeypatch, capsys):
+    """`recover` must not move an unpinned orphan's only handle.
+
+    When the register is empty and `refs/stash` points at a DIFFERENT entry (an
+    unpinned orphan — the state `prune` retains and guard-pins), `git stash store`
+    moves the ref off that orphan. `prune` protects it; `recover` displaced it
+    silently, leaving the orphan gc-eligible (#8773 review P1).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\ny\n")
+    repo.git("stash", "push", "-q", "-m", "y", cwd=repo.b)
+    y = repo.stash_sha()
+    repo.git("stash", "drop", "-q", cwd=repo.b)
+    repo.dirty(repo.b, "f.txt", "base\nx\n")
+    repo.git("stash", "push", "-q", "-m", "x", cwd=repo.b)
+    x = repo.stash_sha()
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.stash_shas() == []
+    assert repo.stash_sha() == x
+    assert y is not None and x is not None and y != x
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["recover", y, "-m", "y rescue"]) == 0
+    assert repo.stash_shas() == [y]
+    named = repo.git("for-each-ref", "--format=%(objectname)").stdout.split()
+    assert x in named, "the unrelated orphan must still be named by a ref"
+
+
+def test_recover_restores_the_ref_when_the_second_store_fails(repo, monkeypatch, capsys):
+    """A failed re-store must leave `refs/stash` pointing at the entry again.
+
+    The plan claims this; without a test, the branch that puts the handle back
+    after a drop+failed-store can regress unnoticed (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    orphan = repo.stash_sha()
+    repo.git("reflog", "delete", "--updateref", "refs/stash@{0}")
+    assert repo.stash_shas() == []
+    assert orphan is not None
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    calls = {"n": 0}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("stash", "store"):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                class _Failed:
+                    returncode = 1
+                    stdout = ""
+                    stderr = "injected store failure"
+                return _Failed()
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    capsys.readouterr()
+    assert mod.main(["recover", orphan, "-m", "rescue"]) != 0
+    assert calls["n"] == 2
+    assert repo.stash_sha() == orphan, "the ref must be put back after a failed re-store"

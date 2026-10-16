@@ -156,7 +156,10 @@ One primitive, in `tools/lane_stash.py`:
   (the genuine orphan). A `refs/stash` diverged from a NON-empty reflog (a bare `git reflog delete`
   without `--updateref` leaves exactly that) still holds peer entries, and dropping the ref would
   delete the whole reflog with them: that state is **refused, never repaired destructively**. A
-  failed re-store puts the ref back rather than leaving the object handle-less.
+  failed re-store puts the ref back rather than leaving the object handle-less. Storing MOVES
+  `refs/stash`, so an unrelated unpinned orphan whose only handle that ref is (register empty, ref
+  pointing elsewhere) is guard-pinned **before** the store — otherwise repairing one entry would
+  silently displace the other (`test_recover_does_not_displace_an_unrelated_orphan`).
 - **Residual race (documented, NOT detectable).** `prune` compares the register's whole sha state
   against the expected one after each delete, which catches every interleaving that changes that
   state. It is not a proof. A push landing *inside* the delete and a concurrent remover taking the

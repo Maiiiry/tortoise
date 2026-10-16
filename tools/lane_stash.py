@@ -438,7 +438,7 @@ def _register_contains(sha: str) -> bool:
     return sha in {r["sha"] for r in _shared_register()}
 
 
-def _store_into_register(sha: str, subject: str) -> bool:
+def _store_into_register(sha: str, subject: str, key: str) -> bool:
     """``git stash store`` ``sha`` and VERIFY it is in the shared register.
 
     ``git stash store`` returns 0 WITHOUT creating a reflog entry when
@@ -453,9 +453,19 @@ def _store_into_register(sha: str, subject: str) -> bool:
     that DIVERGED from a non-empty reflog (a bare ``git reflog delete`` WITHOUT
     ``--updateref`` leaves exactly that) still carries PEER entries, and
     ``update-ref -d`` deletes the whole reflog with them (#8773 review P1); that
-    state is refused, never repaired destructively. Success is the VERIFIED
-    register state, never the exit code.
+    state is refused, never repaired destructively.
+
+    Storing MOVES ``refs/stash``, so an unrelated unpinned orphan whose only
+    handle is that ref (register empty, ref pointing elsewhere) must be
+    guard-pinned FIRST — otherwise repairing ``sha`` silently displaces it and
+    leaves it gc-eligible. ``prune`` already protects it; ``recover`` did not
+    (#8773 review P1), and an unpinnable orphan refuses the store (fail-closed).
+    Success is the VERIFIED register state, never the exit code.
     """
+    head = _stash_head()
+    if (head is not None and head != sha and not _shared_register()
+            and _guard_pin(key, head) is None):
+        return False
     cp = _git("stash", "store", "-m", subject, sha, check=False)
     if cp.returncode != 0:
         return False
@@ -906,7 +916,8 @@ def cmd_recover(args: argparse.Namespace) -> int:
             "shown to be a stash entry — pass -m <message> to assert it explicitly"
         )
     subject = args.message or subject or f"recovered {args.sha}"
-    if not _store_into_register(args.sha, subject):
+    key = lane_key()
+    if not _store_into_register(args.sha, subject, key):
         raise LaneStashError(
             f"could not put {args.sha} into the shared register. Either `git stash store` "
             "failed, or `refs/stash` DIVERGED from a non-empty reflog (a bare `git reflog "
@@ -915,7 +926,6 @@ def cmd_recover(args: argparse.Namespace) -> int:
             "is refused. Do NOT drop refs/stash to 'fix' it: recover the other entries "
             "first, or leave it to `check` (which fails closed on it)."
         )
-    key = lane_key()
     entry = _pin_or_report(key, args.sha)
     # The object now has a lane pin, so a prune guard for it is redundant — under
     # ANY lane key, because the entry may have been retained by another lane's
@@ -1080,7 +1090,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
         for sha, (_ref, subject) in guarded.items():
             if sha in live:
                 continue
-            if _store_into_register(sha, subject or f"recovered {sha}"):
+            if _store_into_register(sha, subject or f"recovered {sha}", key):
                 restored.append(sha)
         if restored:
             print(f"RESTORED {len(restored)} shared-register entr"
