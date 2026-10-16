@@ -77,21 +77,21 @@ _WORD_START = " \t\n;&|()<>"
 
 
 def _commands(run: str) -> str:
-    """The executable text of a step's `run` block — comments are not commands.
+    r"""The executable text of a step's `run` block — comments are not commands.
 
     Shell rules modelled here, each one because an earlier version got it wrong
     and hid a real `wrangler@` float (or invented one): quoting spans a
     backslash-newline continuation; a backslash ESCAPES the next character, so
     an escaped quote does not end a double-quoted string — and an escaped
     character is a LITERAL, so it cannot end a word either (`\;#` is not a
-    comment, and a `\\`+newline keeps the word open); `$'…'` is its own quoting
+    comment, and a `\`+newline keeps the word open); `$'…'` is its own quoting
     form, where `\'` escapes; and a `#` opens a comment after any word boundary,
     not only after whitespace.
 
-    DECLARED RESIDUAL — command substitution is NOT modelled: a `#` inside a
-    backtick substitution reads as command text. That can only OVER-report (the
-    guard refuses a clean check), never hide a pin, because backticks suppress
-    no text. Pinned by the residual arm in
+    DECLARED RESIDUALS — not modelled, and each can only OVER-report (the guard
+    refuses a clean check), never hide a pin, because none of them suppresses
+    text: command substitution (backticks, `$(…)`), here-docs, and process
+    substitution. Pinned by the residual arms in
     `test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range`.
     """
     out: list[str] = []
@@ -373,9 +373,31 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
     # plain single-quote desyncs the scanner, inventing a pin or hiding one.
     assert _floating_wranglers("echo $'\\'' # was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
     assert _floating_wranglers("echo $'\\' # c' && npx --yes wrangler@4 --version") == {"4"}
-    # DECLARED RESIDUAL — a `#` inside a backtick substitution reads as command
-    # text. Over-reporting only (a mention read as a pin); backticks hide no text.
+    # A `#` opens a comment after EVERY word-boundary metacharacter, and after
+    # none of them when the metacharacter is ESCAPED (then it is a literal).
+    for metachar in (";", "&", "|", "(", ")", "<", ">"):
+        assert _floating_wranglers(
+            f"echo a{metachar}# was wrangler@4\nnpx --yes wrangler@4.127.0 --version"
+        ) == set(), f"{metachar}# was not read as a comment"
+        assert _floating_wranglers(
+            f"echo a\\{metachar}# x\nnpx --yes wrangler@4 --version"
+        ) == {"4"}, f"\\{metachar}# was wrongly read as a comment"
+    # An UNBALANCED quote leaves the block unstripped — the fail-closed direction:
+    # the scanner cannot know where the string ends, so a comment mention stays
+    # and is read as a pin (the guard refuses) rather than being guessed away.
+    for unbalanced in ('echo "unterminated\n# was wrangler@4',
+                       "echo 'unterminated\n# was wrangler@4",
+                       "echo $'unterminated\n# was wrangler@4"):
+        assert _commands(unbalanced) == unbalanced
+        assert _floating_wranglers(unbalanced) == {"4"}
+    # DECLARED RESIDUALS — see the helper's docstring. A `#` inside a BACKTICK
+    # substitution reads as command text, so a mention is reported (over-report:
+    # the guard refuses); substitutions suppress no text, so no pin can hide.
+    # `$(…)` needs no modelling here: shell treats a `#` inside it as a comment
+    # too, and so does the scanner (the `(` ends the word).
     assert _floating_wranglers("echo `# was wrangler@4`") == {"4"}
+    assert _floating_wranglers("echo $(# was wrangler@4)") == set()
+    assert _floating_wranglers("echo $(npx --yes wrangler@4 --version)") == {"4"}
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:
