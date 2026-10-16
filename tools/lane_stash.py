@@ -999,7 +999,24 @@ def cmd_prune(args: argparse.Namespace) -> int:
     elif diverged_head is not None:
         print(f"  diverged refs/stash: {diverged_head[:12]} is not enumerated by the "
               "register (a bare `git reflog delete` without --updateref leaves that) — a "
-              "positional delete would move the ref off it, so this prune will REFUSE")
+              "positional delete would move the ref off it, so this prune REFUSES")
+    # A diverged register cannot be pruned safely, whether or not other refs name
+    # the head: `reflog delete --updateref` MOVES the ref to the reflog's new top,
+    # the head then cannot be re-listed (`stash store` no-ops while the ref
+    # already equals the sha, and dropping the ref would delete the whole reflog
+    # with it), and the positional pre-check misreads `stash@{0}` while the ref
+    # diverges. So refuse outright — before the `not doomed` return, which would
+    # otherwise exit 0 on the very state this refuses (#8773 reviews P1, P2).
+    if diverged_head is not None and not orphan:
+        raise LaneStashError(
+            f"refs/stash points at {diverged_head[:12]}, which the shared register does not "
+            "enumerate — the ref and its reflog have DIVERGED (a bare `git reflog delete` "
+            "without --updateref leaves that). A positional delete would MOVE the ref to "
+            "the reflog's new top and that head cannot be re-listed, so this prune refuses "
+            "to touch the register at all. `check` stays fail-closed on this state; inspect "
+            "it with `lane_stash list`, or reconcile the ref deliberately with git once you "
+            "know the entry is safe."
+        )
     if not doomed:
         if not orphan:
             return 0
@@ -1007,22 +1024,6 @@ def cmd_prune(args: argparse.Namespace) -> int:
     if not args.apply:
         print("dry run — re-run with --apply to remove the pinned entries")
         return 0
-    # A diverged register cannot be pruned safely: `reflog delete --updateref`
-    # MOVES the ref to the reflog's new top, and that head is named by no other
-    # ref — a single-threaded, silent loss of a peer's bare stash. It cannot be
-    # re-listed either: `stash store` is a silent no-op while the ref already
-    # equals the sha, and repairing that by dropping the ref would delete the
-    # whole reflog with it. So refuse (#8773 reviews P1, P2).
-    if diverged_head is not None:
-        raise LaneStashError(
-            f"refs/stash points at {diverged_head[:12]}, which the shared register does not "
-            "enumerate — the ref and its reflog have DIVERGED. That entry's only handle is "
-            "the ref, and a positional delete would move the ref off it, so this prune "
-            "refuses to remove anything. `check` stays fail-closed on this state; inspect "
-            "it with `lane_stash list`, or reconcile it deliberately with git once you know "
-            "the entry is safe."
-        )
-
     # GC guard for every entry this prune intends to KEEP (see `_guard_pin`).
     # `reflog delete` re-resolves `refs/stash@{i}` at DELETE time, so a peer push
     # landing between our verification and the delete shifts every position and

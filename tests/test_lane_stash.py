@@ -1515,3 +1515,27 @@ def test_prune_refuses_a_diverged_registers_head(repo, monkeypatch, capsys):
     assert repo.git(
         "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
     ).stdout.strip() == "", "a refused prune must not leave a guard behind"
+
+
+def test_prune_refuses_a_diverged_register_with_nothing_to_reclaim(repo, monkeypatch, capsys):
+    """The refusal must not be skipped by the `not doomed` early return.
+
+    A diverged register whose entries are all unpinned has nothing to reclaim, so
+    the `if not doomed` return would exit 0 while the summary line says the prune
+    REFUSES — breaking both the promise and its exit code (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\ny\n")
+    repo.git("stash", "push", "-q", "-m", "y", cwd=repo.b)
+    y = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nx\n")
+    repo.git("stash", "push", "-q", "-m", "x", cwd=repo.b)
+    x = repo.stash_sha()
+    repo.git("reflog", "delete", "refs/stash@{0}")
+    assert repo.stash_shas() == [y]
+    assert repo.stash_sha() == x
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) != 0
+    assert repo.stash_shas() == [y], "a diverged register is left alone"
+    assert repo.stash_sha() == x

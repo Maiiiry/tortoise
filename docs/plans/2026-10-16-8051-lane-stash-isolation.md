@@ -149,11 +149,12 @@ One primitive, in `tools/lane_stash.py`:
   git and a fail-closed wedge for `check`). Any other unpinned entry — a peer lane's, bare git's, or
   this lane's own never-applied pin-failure entry — is reported and left alone. A register can also
   DIVERGE from its ref (a bare `git reflog delete` without `--updateref` leaves `refs/stash` on a sha
-  the register no longer enumerates). That head is named by no other ref, and `reflog delete
-  --updateref` would MOVE the ref off it — a single-threaded, silent loss — while it cannot be
-  re-listed either (`stash store` no-ops while the ref already equals the sha, and dropping the ref
-  would delete the whole reflog with it). `prune` therefore **refuses** a diverged register rather
-  than delete anything; `check` stays fail-closed on it and the operator reconciles it deliberately.
+  the register no longer enumerates). `prune` **refuses** any diverged register before it builds a
+  guard or deletes anything — whether or not other refs name the head — because `reflog delete
+  --updateref` would MOVE the ref to the reflog's new top, the head cannot be re-listed (`stash
+  store` no-ops while the ref already equals the sha, and dropping the ref would delete the whole
+  reflog with it), and the positional pre-check misreads `stash@{0}` while the ref diverges. `check`
+  stays fail-closed on the state and the operator reconciles the ref deliberately.
 - **Restoration is verified, not inferred from an exit code.** `git stash store` returns 0
   *without* creating a reflog entry when `refs/stash` already points at that sha (measured) —
   precisely the state an emptied reflog leaves. `recover` and `prune`'s reconciliation therefore
