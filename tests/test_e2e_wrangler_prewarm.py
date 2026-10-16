@@ -66,14 +66,15 @@ WRANGLER_SPEC = re.compile(r"wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)")
 #: YAML block scalars carry their `#` lines as TEXT, so a comment that merely
 #: mentions `wrangler@4` (a historical note, say) read as a floating pin and would
 #: red an otherwise clean required check. These checks are about what a step DOES,
-#: so comments are stripped before matching — pinned by the comment arms in
+#: so comments are stripped before matching — whole-line and trailing alike, since a
+#: `#` that starts a word opens a comment in shell. Pinned by the comment arms in
 #: `test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range`.
-_COMMENT_LINE = re.compile(r"^\s*#")
+_COMMENT = re.compile(r"(?:^|\s)#.*$")
 
 
 def _commands(run: str) -> str:
-    """The executable lines of a step's `run` block — comments are not commands."""
-    return "\n".join(l for l in run.splitlines() if not _COMMENT_LINE.match(l))
+    """The executable text of a step's `run` block — comments are not commands."""
+    return "\n".join(_COMMENT.sub("", line) for line in run.splitlines())
 
 
 def _exact_wranglers(run: str) -> set[str]:
@@ -266,8 +267,13 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
     # A COMMENT IS NOT A COMMAND. A historical note naming a floated version must
     # not read as an offender (it red a clean required check), and a comment
     # naming an exact pin must not satisfy the parity check for a floating boot.
+    # Both the whole-line and the trailing form are stripped — the trailing one was
+    # the surviving hole when only whole lines were dropped.
     assert _floating_wranglers("# was: wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
     assert _exact_wranglers("# was: wrangler@4.127.0\nnpx --yes wrangler@latest --version") == set()
+    assert _floating_wranglers("npx --yes wrangler@4.127.0 --version  # was wrangler@4") == set()
+    # …and a REAL float on the command line is still an offender, comment or not.
+    assert _floating_wranglers("npx --yes wrangler@4 --version  # pinned in #8743") == {"4"}
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:

@@ -101,8 +101,17 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
     # row names — so neither half can move alone.
     from tortoise.projection.entities import _SOURCE_NODE_PROP_NAMES
     assert {RAW_STATE_PROP, RAW_STATE_AT_PROP} <= set(_SOURCE_NODE_PROP_NAMES)
+    # …and the DOC half of the same binding: the row's recordable enumeration is
+    # pinned verbatim, so a doc that adds a value (e.g. `offline`) there fails
+    # this pin — otherwise the code assertion below only restates what
+    # tests/test_3998_raw_absent_state.py already checks, in a file that does not
+    # run on a docs-only diff.
+    assert "recordable** as `present` (the documented way back) or `deleted`" in section, (
+        "§4.6's recordable vocabulary must stay the two values the code writes "
+        "(`present` / `deleted`); `offline` / `access_revoked` are observed "
+        "conditions, never recorded"
+    )
     assert WRITABLE_RAW_STATES == (RAW_PRESENT, RAW_DELETED), (
-        "the vocabulary in the section text must match the declared write "
-        "surface — a doc that adds a recordable value (e.g. `offline`) must "
-        "fail here, not only in the docker-lane file"
+        "the declared write surface must remain exactly `present` / `deleted` — "
+        "the code half of the binding the doc anchor above pins from the other side"
     )
