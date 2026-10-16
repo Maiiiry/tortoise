@@ -74,6 +74,20 @@ WRANGLER_SPEC = re.compile(r"wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)")
 #: whitespace — the metacharacters below end a word too (`;#`, `&&#`).
 _QUOTE_CHARS = "\"'"
 _WORD_START = " \t\n;&|()<>"
+#: A here-doc opener: `<<`, an optional `-` (tab-stripping) and the delimiter,
+#: which may be quoted. The lookbehind keeps `<<<` (a here-STRING, whose
+#: following lines are ordinary CODE) from matching its second and third `<`.
+_HEREDOC = re.compile(r"(?<!<)<<(?P<tabs>-?)[ \t]*(?P<q>['\"]?)(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=q)")
+
+
+def _heredoc_delimiter(line: str) -> tuple[str, bool] | None:
+    """The first here-doc delimiter declared on `line`, with its tab flag.
+
+    A false positive is safe by construction: entering here-doc mode only stops
+    the scanner from STRIPPING text, so it can over-report and never hide.
+    """
+    match = _HEREDOC.search(line)
+    return (match.group("name"), match.group("tabs") == "-") if match else None
 
 
 def _commands(run: str) -> str:
@@ -85,13 +99,17 @@ def _commands(run: str) -> str:
     an escaped quote does not end a double-quoted string — and an escaped
     character is a LITERAL, so it cannot end a word either (`\;#` is not a
     comment, and a `\`+newline keeps the word open); `$'…'` is its own quoting
-    form, where `\'` escapes; and a `#` opens a comment after any word boundary,
-    not only after whitespace.
+    form, where `\'` escapes; a `#` opens a comment after any word boundary, not
+    only after whitespace; and a HERE-DOC body is data — it is passed through
+    verbatim, so a quote inside it cannot desync the scanner. Measured on
+    `cat <<'EOF'` / `Don't` / `EOF` followed by
+    `echo 'see #8745' && npx --yes wrangler@4 --version`: before this rule the
+    npx line read as a comment and NO float was reported while shell ran it.
 
-    DECLARED RESIDUALS — not modelled, and each can only OVER-report (the guard
-    refuses a clean check), never hide a pin, because none of them suppresses
-    text: command substitution (backticks, `$(…)`), here-docs, and process
-    substitution. Pinned by the residual arms in
+    DECLARED RESIDUALS — unmodelled, and each can only OVER-report (the guard
+    refuses a clean check), never hide a pin: command substitution (backticks),
+    and a SECOND here-doc delimiter declared on the same line. Pinned by the
+    residual arms in
     `test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range`.
     """
     out: list[str] = []
@@ -99,58 +117,64 @@ def _commands(run: str) -> str:
     ansi_c = False
     escaped = False
     at_word_start = True
-    commenting = False
-    i, n = 0, len(run)
-    while i < n:
-        ch = run[i]
-        nxt = run[i + 1] if i + 1 < n else ""
-        i += 1
-        if commenting:
-            if ch == "\n":
-                commenting = False
+    heredoc: str | None = None
+    strip_tabs = False
+    for line in run.splitlines(keepends=True):
+        if heredoc is not None:
+            # the body and its delimiter line are passed through untouched
+            out.append(line)
+            if line.rstrip("\n").lstrip("\t" if strip_tabs else "") == heredoc:
+                heredoc = None
+            continue
+        declared = _heredoc_delimiter(line)
+        i, n = 0, len(line)
+        while i < n:
+            ch = line[i]
+            nxt = line[i + 1] if i + 1 < n else ""
+            i += 1
+            if escaped:
+                escaped = False
                 out.append(ch)
-                at_word_start = True
-            continue
-        if escaped:
-            escaped = False
-            out.append(ch)
-            if ch != "\n":
-                # a backslash-newline is removed and the word continues; any
-                # other escaped character is a literal word character
+                if ch != "\n":
+                    # a backslash-newline is removed and the word continues; any
+                    # other escaped character is a literal word character
+                    at_word_start = False
+                continue
+            if ansi_c:
+                if ch == "'":
+                    ansi_c, quote = False, ""
+                elif ch == "\\":
+                    escaped = True
+                out.append(ch)
                 at_word_start = False
-            continue
-        if ansi_c:
-            if ch == "'":
-                ansi_c, quote = False, ""
+                continue
+            if quote:
+                if ch == "\\" and quote == '"':
+                    escaped = True
+                elif ch == quote:
+                    quote = ""
+                out.append(ch)
+                at_word_start = False
+                continue
+            if ch == "$" and nxt == "'":
+                ansi_c, quote = True, "'"
+                out.append(ch)
+                out.append(nxt)  # the opening quote is part of the construct
+                at_word_start = False
+                i += 1  # consumed `nxt` as well
+                continue
+            if ch in _QUOTE_CHARS:
+                quote = ch
             elif ch == "\\":
                 escaped = True
+            elif ch == "#" and at_word_start:
+                if line.endswith("\n"):
+                    out.append("\n")
+                break
             out.append(ch)
-            at_word_start = False
-            continue
-        if quote:
-            if ch == "\\" and quote == '"':
-                escaped = True
-            elif ch == quote:
-                quote = ""
-            out.append(ch)
-            at_word_start = False
-            continue
-        if ch == "$" and nxt == "'":
-            ansi_c, quote = True, "'"
-            out.append(ch)
-            out.append(nxt)  # the opening quote is part of the construct
-            at_word_start = False
-            i += 1  # consumed `nxt` as well
-            continue
-        if ch in _QUOTE_CHARS:
-            quote = ch
-        elif ch == "\\":
-            escaped = True
-        elif ch == "#" and at_word_start:
-            commenting = True
-            continue
-        out.append(ch)
-        at_word_start = ch in _WORD_START
+            at_word_start = ch in _WORD_START
+        if declared is not None:
+            heredoc, strip_tabs = declared
     return "".join(out)
 
 
@@ -379,9 +403,25 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
         assert _floating_wranglers(
             f"echo a{metachar}# was wrangler@4\nnpx --yes wrangler@4.127.0 --version"
         ) == set(), f"{metachar}# was not read as a comment"
+        # the float sits on the SAME line, so the arm discriminates: a scanner
+        # that wrongly ends the word at an escaped metacharacter swallows it
         assert _floating_wranglers(
-            f"echo a\\{metachar}# x\nnpx --yes wrangler@4 --version"
+            f"echo a\\{metachar}# x && npx --yes wrangler@4 --version"
         ) == {"4"}, f"\\{metachar}# was wrongly read as a comment"
+    # A HERE-DOC body is data, passed through verbatim: an apostrophe in it must
+    # not desync the scanner, which read the following real float as a comment
+    # before this rule (measured — the guard went green while shell ran the npx).
+    assert _floating_wranglers(
+        "cat <<'EOF'\nDon't\nEOF\necho 'see #8745' && npx --yes wrangler@4 --version"
+    ) == {"4"}
+    # …and the body itself is kept, so a mention inside it is still reported
+    # (a real `bash <<'EOF'` body executes, so silence there would be the danger).
+    assert _floating_wranglers("cat <<'EOF'\nwrangler@4\nEOF\n") == {"4"}
+    assert _floating_wranglers("cat <<-'EOF'\n\twrangler@4\n\tEOF\n") == {"4"}
+    # `<<<` is a here-STRING: the lines after it are CODE and stay comment-stripped
+    assert _floating_wranglers(
+        "cat <<< word\n# was wrangler@4\nnpx --yes wrangler@4.127.0 --version"
+    ) == set()
     # An UNBALANCED quote leaves the block unstripped — the fail-closed direction:
     # the scanner cannot know where the string ends, so a comment mention stays
     # and is read as a pin (the guard refuses) rather than being guessed away.
