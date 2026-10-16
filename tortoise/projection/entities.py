@@ -19,7 +19,13 @@ from datetime import datetime, timezone
 # #2795: cycle-free helper (tortoise/ids.py is stdlib-only). sdk.py imports
 # projection at module top, so the sdk-private `_content_hash` is NOT
 # importable here.
+# #7936: the same leaf supplies the CANONICAL entity id for a `(label, name)` —
+# the name stubs this file mints must carry the identity the entity path
+# registers, or a node's IDENTITY is not a pure function of the journal (a
+# random stub id moved on every replay) and the reference fold cannot model
+# the stub at all.
 from tortoise.ids import content_hash as _content_hash
+from tortoise.ids import entity_name_id as _entity_name_id
 from tortoise.live import (
     decay_clause,  # #2490: rebuild folds decay terminal posteriors
     epistemic_disjunction,  # #5380: the target-position widening
@@ -1119,6 +1125,11 @@ class _EntityHandlers:
     # Keys explicitly handled by each _upsert_* method.
     _SUBJECT_HANDLED: frozenset = frozenset({
         "id", "name", "subject_kind", "subjectKind", "createdAt", "embedding",
+        # #7936: the event-stub discriminator is projection-owned — an
+        # EventRecorded replay must NOT persist a caller-forged `_stub` via
+        # _persist_extra_props (it would then be read back by the
+        # first-registration probe). Mirrors the Object set below.
+        "_stub",
         "status",  # #1423: status is projection-owned — a SubjectAdded replay
         # must NOT rewrite it via _persist_extra_props (the clobber guard ported
         # from #1350's Object clause: a re-mention of a superseded team/role/
@@ -1126,6 +1137,10 @@ class _EntityHandlers:
     })
     _OBJECT_HANDLED: frozenset = frozenset({
         "id", "name", "object_kind", "objectKind", "createdAt", "title",
+        # #7936: the event-stub discriminator (see _SUBJECT_HANDLED): kept out
+        # of the extra-props persistence lane so a caller prop can never seed
+        # the first-registration probe's exclusion.
+        "_stub",
         "embedding", "status",  # #1350: status is projection-owned — an
         # ObjectRegistered replay must NOT rewrite it via _persist_extra_props
         # (the clobber guard: superseded stays superseded on re-mention).
@@ -3542,7 +3557,9 @@ class _EntityHandlers:
         # #1918: canonical id must win on MATCH too — parity with the #1155
         # Object fix (_upsert_object ON MATCH o.id=coalesce($id, o.id)). The
         # webhook name-stub path (_event_plain_merge) can mint a Subject stub
-        # with a RANDOM ulid id before this entity path's SubjectAdded lands;
+        # before this entity path's SubjectAdded lands (since #7936 under the
+        # canonical `sub-<sha256>` id — a no-op here; a pre-fix or foreign
+        # graph may still carry a random ulid);
         # without the ON MATCH id write, the MERGE below adopts the stub by
         # NAME and the canonical id never lands on any node — MATCH
         # (s:Subject {id:$sid}) wiring (participatesIn, aboutSubject) silently
@@ -3580,6 +3597,13 @@ class _EntityHandlers:
             "            s.status=coalesce($st, 'live'), "
             "            " + _set_emb + " "
             "ON MATCH SET s.id=coalesce($id, s.id), "
+            # #7936: adoption CLEARS the event-stub discriminator the
+            # first-registration probe excludes. `SET ... = NULL` REMOVES the
+            # property (not `false`), so an adopted live node's property set
+            # stays byte-identical to the one replay's ON CREATE builds (which
+            # never writes `_stub`). A legacy random-ulid stub carries no
+            # `_stub`, so this is a no-op there.
+            "            s._stub=NULL, "
             "            s.subjectKind=coalesce($sk, s.subjectKind), "
             # #2295: ON MATCH createdAt ADOPTS only when absent
             # (coalesce(s.createdAt, $ca) — existing value wins): mirrors the
@@ -3634,9 +3658,12 @@ class _EntityHandlers:
         except Exception:
             pass
         # #1155-P1: canonical id must win on MATCH too. The produces-edge
-        # wiring in _event_plain_merge can mint a name-stub Object (random
-        # ulid) when a poll/webhook event lands BEFORE this entity path's
-        # first ObjectRegistered. Without the ON MATCH id write, the MERGE
+        # wiring in _event_plain_merge can mint a name-stub Object when a
+        # poll/webhook event lands BEFORE this entity path's first
+        # ObjectRegistered — since #7936 under the canonical `obj-<sha256>` id
+        # (making this clause a no-op for the generic path), while a pre-fix or
+        # foreign graph may still carry a random ulid. Without the ON MATCH id
+        # write, the MERGE
         # below adopts the stub by NAME and the canonical id never lands on
         # any node — aboutSubject wiring (MATCH by o.id) silently matches
         # nothing. `coalesce($id, o.id)` is idempotent: $id is always the
@@ -3655,6 +3682,9 @@ class _EntityHandlers:
             "            o.status=coalesce($st, 'live'), "
             "            " + _set_emb + " "
             "ON MATCH SET o.id=coalesce($id, o.id), "
+            # #7936: adoption CLEARS the event-stub discriminator the
+            # first-registration probe excludes (see _upsert_subject).
+            "            o._stub=NULL, "
             "            o.objectKind=coalesce($ok, o.objectKind), "
             "            o.createdAt=coalesce(o.createdAt, $ca), "
             "            o.title=coalesce($title, o.title), "
@@ -4280,11 +4310,15 @@ class _EntityHandlers:
         if not _writable_id(subj):
             _log_identity_skip("Event subject", subj, "subject (MERGE key)")
         else:
-            from tortoise.ids import ulid
-            stub_id = ulid()
+            # #7936: DETERMINISTIC id (the canonical one for this name), not a
+            # random ulid — the graph must be a pure function of the journal.
+            # ON CREATE ONLY is unchanged (#1155-P1): a late stub still cannot
+            # clobber a canonical id, and a generic registration for the name
+            # is now a no-op (same id) rather than a re-key.
+            stub_id = _entity_name_id("Subject", subj)
             self.g.query(
                 "MERGE (s:Subject {name:$name}) "
-                "ON CREATE SET s.id=$id, s.subjectKind='other'",
+                "ON CREATE SET s.id=$id, s.subjectKind='other', s._stub=true",
                 params={"name": subj, "id": stub_id},
             )
             self.g.query(
@@ -4331,18 +4365,28 @@ class _EntityHandlers:
                 params={"id": obj, "eid": eid},
             )
         else:
-            from tortoise.ids import ulid
-            stub_id = ulid()
-            # #1155-P1: id is written ON CREATE ONLY — the stub id is a
-            # RANDOM ulid, and a poll/webhook event may arrive before the
-            # entity path's ObjectRegistered. If this MERGE also wrote id
-            # on MATCH, a late stub would CLOBBER the canonical id
-            # (github-issue-{repo}-{n}) that _upsert_object set. The
-            # canonical id wins via _upsert_object's ON MATCH
-            # `o.id=coalesce($id, o.id)` — do not add an id write here.
+            # #7936: DETERMINISTIC id (the canonical one for this name), not a
+            # random ulid — a random stub id moved on every replay, so the
+            # graph was not a pure function of the journal.
+            stub_id = _entity_name_id("Object", obj)
+            # #7936: `_stub=true` is the discriminator the first-registration
+            # probe (sdk._create_entity) excludes — a marked stub is NOT a
+            # registered node, so a later `create_entity` for this name still
+            # journals its ObjectRegistered. Cleared on adoption by
+            # `_upsert_object`'s ON MATCH.
+            # #1155-P1: id is written ON CREATE ONLY, and THIS is the clause the
+            # ruling protects. A poll/webhook event may arrive before the
+            # entity path's ObjectRegistered; if this MERGE also wrote id on
+            # MATCH, a late stub would CLOBBER the canonical id
+            # (github-issue-{repo}-{n}) that _upsert_object set. The canonical
+            # id wins via _upsert_object's ON MATCH `o.id=coalesce($id, o.id)`
+            # — do not add an id write here. The ruling is about the CLAUSE, not
+            # about the stub value: a deterministic stub IS the canonical id
+            # for the generic path (a no-op there) and is still replaced by a
+            # foreign/connector canonical id.
             self.g.query(
                 "MERGE (o:Object {name:$name}) "
-                "ON CREATE SET o.id=$id, o.objectKind='other'",
+                "ON CREATE SET o.id=$id, o.objectKind='other', o._stub=true",
                 params={"name": obj, "id": stub_id},
             )
             self.g.query(
@@ -4426,11 +4470,16 @@ class _EntityHandlers:
                     _log_identity_skip(
                         "Event use", use_name, "name (MERGE key)")
                 else:
-                    from tortoise.ids import ulid
-                    stub_id = ulid()
+                    # #7936: deterministic canonical id, as for the subject and
+                    # `object` stubs above — never a random ulid.
+                    stub_id = _entity_name_id("Object", use_name)
+                    # #7936: mark the `uses[]` stub with the same discriminator
+                    # as the subject/object stubs — it too can precede a
+                    # canonical `ObjectRegistered` for the name, and the probe
+                    # must still journal that registration.
                     self.g.query(
                         "MERGE (o:Object {name:$name}) "
-                        "ON CREATE SET o.id=$id, o.objectKind=$kind "
+                        "ON CREATE SET o.id=$id, o.objectKind=$kind, o._stub=true "
                         "ON MATCH SET o.objectKind=$kind",
                         params={"name": use_name, "kind": use_kind, "id": stub_id},
                     )
@@ -4554,8 +4603,8 @@ class _EntityHandlers:
         carries an explicit ``sourceObjectId`` (set exclusively by the github
         entity path). ``event.object`` is NEVER used as an Object key — on
         poll/webhook paths it is the entity TITLE string and
-        ``_event_plain_merge`` already stubs ``Object {name: title}`` with a
-        random ulid; using it would wire references to the wrong stub.
+        ``_event_plain_merge`` already stubs ``Object {name: title}`` under its
+        own name-keyed id; using it would wire references to the wrong stub.
         """
         sk = inner.get("sourceKind")
         source_url = inner.get("sourceUrl")

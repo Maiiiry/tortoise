@@ -1193,6 +1193,17 @@ surfaces:
   # (`tools/ci_selection.py`), so a change to it already forces the full
   # matrix and needs no per-test registration.
   - test_7853_confidence_label_propagation.py
+  # #7936: the name-stub id `_event_plain_merge` mints must be a function of
+  # the journal, not of when the graph was built — the measured blocker on the
+  # remaining `(label, id)` re-key (`tortoise/consistency.py`'s digest would
+  # move on every replay of one journal otherwise). DUAL-REGISTERED with `sdk`
+  # (below): `tortoise/projection/entities.py` and `tortoise/consistency.py`
+  # fall through to `core`, but `tortoise/ids.py` — where the canonical
+  # `entity_name_id` lives — is an exact `sdk` SOURCE_PATTERN that REPLACES the
+  # `core` fallback, so an ids.py-only change would silently skip this guard
+  # without the `sdk` arm (#2938 class; `tortoise/sdk.py` itself is a
+  # SHARED_MODULE, so an sdk.py diff selects the full matrix anyway).
+  - test_7936_stable_stub_ids.py
   # #4220: DB-free guards for the blog-residue cleanup script (prefix + created_by
   # guards, dry-run is non-destructive, delete verifies 0 remain) and the suite's
   # write/read marker split. No DB, no network — default `core` surface is correct.
@@ -3311,6 +3322,12 @@ surfaces:
   - test_7951_create_point_outbox.py
   - test_5359_unchecked_window_writers.py
   - test_7108_operator_scope_predicate.py
+  # #7936: DUAL-REGISTERED with `core` (above). `tortoise/ids.py` is an exact
+  # `sdk` SOURCE_PATTERN, so the canonical entity id this guard pins
+  # (`entity_name_id`) is owned HERE: an ids.py-only change selects `sdk` and
+  # REPLACES the `core` fallback, so without this arm the guard would never run
+  # on the exact change that can break it (#2938 class).
+  - test_7936_stable_stub_ids.py
   # #5346: a PAGED read must order by a TOTAL key, or its pages are not
   # adjacent. `paginated_query` — and therefore the MCP
   # `tortoise_query(offset=/page=)` / `tortoise_paginated_query` path — plus
@@ -5285,6 +5302,7 @@ durations:
   test_audit_fallback_home_isolation.py: 2.4
   test_ci_stall_identify.py: 16.0  # #5035: the 1.8 predated this PR's subprocess-launching tests. A quiet-machine estimate (measured 12.3, 14.8, 16.3 s; 25.9 s under moderate load and 34-40 s at fleet load 67-79 — the file spawns pytest children, so it tracks box load hard). `tools/ci_timing.py --refresh-durations` is the canonical (CI-measured) writer; this line is a local estimate until it next runs.
   test_env_contract_covers_supabase_config.py: 2.0  # #4030: appended by hand so the entry exists at all — main sat only just above the guard's floor (764/848 fast files = 90.09%), and this new fast file tipped `duration_coverage_issues()` below it (764/849 = 89.99%, formatted as the `90.0%` in that error). Local estimate: 3.24 s measured for this file plus its paired pin in test_ci_selection.py, most of it one conftest import. `tools/ci_timing.py --refresh-durations` replaces it with the CI-measured value.
+  test_7936_stable_stub_ids.py: 18.0  # #7936 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). MEASURED this turn: WITHOUT this row `duration_coverage_issues()` red at 777/864 = 89.9% (the file is in the fast pool, so its absence packs it at the flat 2.0s default and drops coverage under the 90% floor) — the same shape as `test_7951_create_point_outbox.py` above, and it is also what reds `tests/test_ci_timing.py`'s four `validate_refreshed_manifest` assertions on the manifest of record. Local embedded-lane reading 16.6–20.4 s (18 tests; three rebuild the graph). Refresh from the first post-merge run that includes it.
 
 # ── ON-DEMAND LANE: runs the pipeline, does not gate the merge ────────────
 # A file here is excluded from EVERY pre-merge leg (fast halves, slow, carve-
