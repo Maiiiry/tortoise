@@ -113,6 +113,21 @@ if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
     echo "gh-stub: HTTP 403: Resource not accessible" >&2
     exit 1
   fi
+  # #3435 review (P1): a 200 with a body that BREAKS the issue-payload contract.
+  # Without this seam the malformed-REST arm is never executed, which is why a
+  # crash on it survived a review cycle: the only other failures here are
+  # transport failures, which never reach the validation.
+  if [ "${GH_STUB_ISSUE_REST_MALFORMED:-0}" = "1" ]; then
+    printf '{"number": 1}\n'
+    exit 0
+  fi
+  # #3435 review (minor): REST says 404 while the GraphQL read was rate-limited.
+  # A REST-only absence seam, because GH_STUB_ISSUE_ABSENT fails the `issue view`
+  # call FIRST (so the fallback is never taken) and would pin the wrong path.
+  if [ "${GH_STUB_ISSUE_REST_ABSENT:-0}" = "1" ]; then
+    echo "gh-stub: HTTP 404: Not Found (https://api.github.com/repos/x/y/issues/1)" >&2
+    exit 1
+  fi
   if [ "${GH_STUB_ISSUE_ABSENT:-0}" = "1" ]; then
     echo "gh-stub: HTTP 404: Not Found" >&2
     exit 1
@@ -2368,6 +2383,47 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertNotIn("VERDICT: CLEAN", out)
         self.assertIn("issue-metadata-unavailable", out)
+
+    def test_a_malformed_rest_payload_is_a_named_incomplete_not_a_collision(self):
+        # ⛔ #3435 review cycle 2, P1. `_require_issue_payload` lives INSIDE the
+        # caller's `except SurfaceError` handler, and `main()` catches only
+        # NotAWorkItem / RuntimeError (`SurfaceError` is a plain Exception). So a
+        # malformed REST body must never RAISE from there: doing so escaped as a
+        # traceback with no VERDICT line and exited 1 — the code this tool
+        # defines as COLLISION, so an operator reads a false collision and waits
+        # for a lane that never appears.
+        #
+        # Pre-fix this test fails twice over: `rescued` was set to None in the
+        # handler and the very next statement called `rescued.get(...)`, giving
+        # `AttributeError` -> exit 1; and the issue surface was never marked
+        # INCOMPLETE, so the reason vanished with it.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+            "GH_STUB_ISSUE_REST_MALFORMED": "1",
+        })
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        # The issue surface is the one that must be NAMED incomplete — the
+        # landed surface's note alone would leave the actual cause unrecorded.
+        self.assertIn("[issue assignee/holder]", out)
+        self.assertIn("non-list 'assignees'", out)
+        self.assertIn("issue-metadata-unavailable", out)
+
+    def test_a_rest_404_during_exhaustion_reads_as_issue_absent(self):
+        # #3435 review (minor): a REST 404 used to be swallowed into `None`, so
+        # the fall-through classified the RATE-LIMIT exception and a genuinely
+        # absent issue reported `gh-unavailable`. Same exit code, wrong reason —
+        # and "the budget is spent" is not why the issue was not found.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+            "GH_STUB_ISSUE_REST_ABSENT": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("issue-absent", out)
+        self.assertNotIn("gh-unavailable", out)
 
     def test_a_truncated_board_still_blocks_a_live_holder(self):
         # The truncation refusal is scoped to ABSENCE: a board that DID attribute a
