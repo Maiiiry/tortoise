@@ -364,6 +364,53 @@ def test_lane_keys_are_worktree_scoped(repo):
     assert "/wtA-" in next(iter(refs)), refs
 
 
+def test_same_basename_worktrees_never_share_a_lane_key(tmp_path):
+    """Two worktrees with the SAME directory basename must not collide.
+
+    The ``sha1(resolved root)[:8]`` digest in :func:`lane_key` is load-bearing
+    for exactly this shape: ``p1/wt`` and ``p2/wt`` sanitize to the same slug
+    ``wt``, so a basename-only key puts both lanes' pins in ONE ref namespace
+    and reintroduces the #8051 collision from the other side — a peer's entry
+    reachable through our ref, and a ``pop`` here taking it.
+
+    This is the only detector for that: replacing the digest with
+    ``sha1(slug)[:8]`` leaves every other test in this file green, so the
+    guarantee was unguarded until this test existed (#8773 review F1).
+    """
+    repo = Repo(tmp_path)
+    p1 = tmp_path / "p1" / "wt"
+    p2 = tmp_path / "p2" / "wt"
+    p1.parent.mkdir()
+    p2.parent.mkdir()
+    repo.git("worktree", "add", "-q", "-b", "feat/p1", str(p1))
+    repo.git("worktree", "add", "-q", "-b", "feat/p2", str(p2))
+    assert p1.name == p2.name == "wt"
+
+    mod = _load_tool()
+    key1, key2 = mod.lane_key(p1), mod.lane_key(p2)
+    assert key1 != key2, f"same-basename worktrees collided on one lane key: {key1}"
+    assert key1.startswith("wt-") and key2.startswith("wt-"), (key1, key2)
+
+    # lane `p1/wt` pins its work — under its OWN ref namespace
+    repo.dirty(p1, "f.txt", "base\nfrom-p1\n")
+    cp = repo.lane(p1, "push", "-m", "p1 work")
+    assert cp.returncode == 0, _fail(cp)
+    pins = repo.stash_pins()
+    assert len(pins) == 1, pins
+    assert f"{mod.REFS_NS}/{key1}/stash/1" in pins, pins
+
+    # lane `p2/wt` sees none of it, and cannot pop it
+    listing = repo.lane(p2, "list")
+    assert "(no pinned entries)" in listing.stdout, listing.stdout
+    popped = repo.lane(p2, "pop")
+    assert popped.returncode != 0, _fail(popped)
+    assert "from-p1" not in (p2 / "f.txt").read_text()
+
+    # and `p1/wt` still restores its own work through its own ref
+    assert repo.lane(p1, "pop").returncode == 0
+    assert "from-p1" in (p1 / "f.txt").read_text()
+
+
 def test_a_branch_switch_does_not_orphan_a_lanes_pins(repo):
     """The key is the WORKTREE, not the branch: a baseline checkout keeps the pins.
 

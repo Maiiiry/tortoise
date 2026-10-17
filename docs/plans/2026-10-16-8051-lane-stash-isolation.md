@@ -212,11 +212,11 @@ extension is also out of this repo.
 | Artifact | What it says | Verdict |
 |---|---|---|
 | `AGENTS.md` (this repo) | no stash instruction at all before this change | the rule added by this PR is the first in-repo guidance |
-| `agent-infra/skills/executing-plans/SKILL.md:191` | `git stash push -m "pre-<branch>-wip"` when changes exist on main | the hazardous primitive, taught by a skill — belongs to agent-infra #1264 (commented with this line as evidence) |
+| `agent-infra/skills/executing-plans/SKILL.md:278`, `:291`, `:819` | an in-hub `git stash push` is **BLOCKED** (the M4 hub-disorder gate sanctions only recovery verbs); the sanctioned route is the dirty-hub salvage path, and inside a worktree there is no "changes on main" to stash | the hazardous primitive is GONE — agent-infra `00d60c51` replaced `git stash push -m "pre-<branch>-wip"` (the text this row originally quoted, then at `:291`) with the block. The original finding stays on agent-infra #1264 |
 | `agent-infra/skills/commit-workflow`, `using-git-worktrees` | no stash instruction | #1264's "name the hazard" half is still open |
-| `eldato/AGENTS.md:133` | "Always `git stash` before `gh pr merge`" | repo-specific instance of the same teaching; recorded on #1264 rather than fixed from this worktree |
+| `eldato/AGENTS.md:155` | "Always `git stash` before `gh pr merge`" | repo-specific instance of the same teaching; recorded on #1264 rather than fixed from this worktree |
 | `docs/plans/2026-09-03-*.md`, `2026-09-06-2249-*.md`, `2026-10-11-2081-*.md` (3 files) | recommend a bare `git stash`/`git stash pop` as a measurement technique | historical plan docs — not edited (they are records); the systemic fix is the `writing-plans` half of #1264 |
-| `extensions/main-worktree-guard/classify-git.mjs:34` | already blocks `git stash pop\|apply\|drop\|clear` — but only in the MAIN checkout ("Worktrees are ISOLATED", by design) | confirms the linked-worktree case is unguarded and out of this repo's tree (#1264) |
+| `extensions/main-worktree-guard/classify-git.mjs:99` (the `stash-pop` rule) | already blocks `git stash pop\|apply\|drop\|clear` — but only in the MAIN checkout ("Worktrees are ISOLATED", by design) | confirms the linked-worktree case is unguarded and out of this repo's tree (#1264) |
 
 Nothing in this repo *invokes* stash in tooling, so no internal caller needed rewiring; the tool +
 rule is additive.
