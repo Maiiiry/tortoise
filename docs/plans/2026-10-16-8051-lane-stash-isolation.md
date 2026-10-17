@@ -119,13 +119,18 @@ One primitive, in `tools/lane_stash.py`:
   into every message, so two worktrees forced onto ONE branch are still distinct), or any entry whose
   origin cannot be read: an expired/absent `refs/stash` reflog, an unreadable subject, or a
   marker-less entry whose subject names the current branch (a branch name identifies a BRANCH, never
-  a lane, and the pre-existing register is marker-less bare-git entries by construction); exit 0 when
-  the top entry is this lane's own (its `[<lane-key>]` marker, or one of this lane's pinned shas) or
-  the register is empty. Unpinned debris is reported as an
+  a lane, and the pre-existing register is marker-less bare-git entries by construction). A FOREIGN
+  lane ref or `[<lane-key>]` marker is decisive and OUTRANKS this lane's own pin: a cross-lane
+  `recover` could otherwise leave one sha claimed by both lanes and `check` would clear a bare pop on
+  a peer's work; exit 0 only when the top entry is this lane's own AND no other lane's ref or marker
+  names it, or the register is empty. Unpinned debris is reported as an
   ADVISORY note, not a failure: a bare pop takes only the TOP entry, so failing on entries below it
   would refuse states that are genuinely safe. Safe to call from a pre-flight.
 - **`recover <sha>`** — the repair recipe from the incident: `git stash store -m "<original subject>"
-  <sha>` **and** pin it, so the restored entry is retrievable by this lane.
+  <sha>` **and** pin it, so the restored entry is retrievable by this lane. It REFUSES an entry that
+  another lane's ref or `[<lane-key>]` marker names: pinning a peer's entry here would leave it
+  claimed by both lanes and `check` would then clear a bare pop on work that is not this lane's.
+  A peer's entry is restored with bare `git stash store`, or by that lane from its own worktree.
 - **`prune`** — explicit reclamation of the shared register: an entry is removed only when the
   delete cannot lose work — its object is **pinned by a lane ref**, or this lane left a durable
   **applied-record** at `refs/lane/<key>/applied/<sha>` (written atomically by `pop` on a

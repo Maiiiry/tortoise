@@ -76,9 +76,11 @@ THE CONTRACT
   claimed impossible; see the plan's "Residual race" note.
 * **``check`` is fail-closed**: exit 0 when a bare ``git stash pop`` in this
   worktree would take THIS lane's own entry; exit 1 when it would take a FOREIGN
-  entry — a peer lane's (identified by the ``[<lane-key>]`` marker this tool
-  writes, so two worktrees forced onto ONE branch are still told apart) or one
-  whose origin cannot be read; exit 2 on a state error. Safe to call from a lane
+  entry — a peer lane's, identified by the ``[<lane-key>]`` marker this tool
+  writes (so two worktrees forced onto ONE branch are still told apart) or by the
+  peer's own ``refs/lane`` pin, which OUTRANKS this lane's pin because a
+  cross-lane ``recover`` can leave one sha claimed by both lanes — or one whose
+  origin cannot be read; exit 2 on a state error. Safe to call from a lane
   pre-flight.
 
 THE TARGET IS NOT A PARAMETER
@@ -87,7 +89,11 @@ Like ``tools/test_lane.py``, there is no ``--lane``/``--ref`` override: a peer's
 lane key is a computable ``sha1(path)[:8]``, so any override would be a way for
 one lane to delete or adopt another lane's pinned entries. ``prune`` and
 ``recover`` are the only commands that touch the shared register, and they are
-explicit by design (`prune` also requires ``--apply``).
+explicit by design (`prune` also requires ``--apply``). ``recover`` additionally
+REFUSES an entry that another lane's ref or ``[<lane-key>]`` marker names: pinning
+it here would leave it claimed by both lanes, and ``check`` would then call a bare
+``git stash pop`` safe on work that is not this lane's (#8773 review P1). A
+peer's entry is restored with bare ``git stash store`` or from its own lane.
 
 USAGE
 -----
@@ -96,7 +102,7 @@ USAGE
     python tools/lane_stash.py pop 1              # apply by sha, keep the shared entry
     python tools/lane_stash.py check              # 0 = a bare pop here is safe
     python tools/lane_stash.py prune --apply      # reclaim pinned/applied register entries
-    python tools/lane_stash.py recover <sha>      # the #2654 repair recipe
+    python tools/lane_stash.py recover <sha>      # the #2654 repair recipe (this lane's own entry)
 
 Exit codes: 0 ok (including "nothing to stash", matching ``git stash push``);
 1 ``check`` found a foreign top entry; 2 environment/state error (including a
@@ -618,6 +624,90 @@ def _refs_pointing_at(sha: str) -> set[str]:
     return set(cp.stdout.split()) if cp.returncode == 0 else set()
 
 
+def _lane_key_of_ref(ref: str) -> str | None:
+    """The lane key a lane-owned ref names, or ``None`` for any other ref.
+
+    Lane refs are ``refs/lane/<key>/stash/<n>`` and
+    ``refs/lane/<key>/applied/<sha>``. ``lane_key`` never contains a ``/`` (its
+    slug is sanitised and its digest is hex), so the key is always component 2. A
+    guard ref (``refs/pi-lane-prune-guard/<key>/<sha>``) is deliberately NOT
+    lane-owned: it keeps an object reachable, it does not claim a lane's
+    ownership of it.
+    """
+    parts = ref.split("/")
+    if len(parts) >= 5 and parts[0] == "refs" and parts[1] == "lane":
+        return parts[2]
+    return None
+
+
+def _foreign_pin_owners(sha: str, key: str) -> list[str]:
+    """Lane keys OTHER than ``key`` whose lane refs name ``sha``.
+
+    A lane ref is written by the lane itself and is branch-independent, so it is
+    stronger ownership evidence than the subject's branch — and it survives even
+    when THIS lane also pins the same sha, which is exactly the double-pin state a
+    cross-lane ``recover`` used to create.
+    """
+    owners = {
+        owner
+        for ref in _refs_pointing_at(sha)
+        if (owner := _lane_key_of_ref(ref)) is not None and owner != key
+    }
+    return sorted(owners)
+
+
+def _foreign_owner(row: dict, key: str) -> tuple[str, str] | None:
+    """``(kind, detail)`` when an entry is provably ANOTHER lane's, else ``None``.
+
+    ``kind`` is ``"ref"`` (another lane's ref names the sha) or ``"marker"`` (the
+    message marker names another lane). This is the ONE ownership oracle shared by
+    ``list``, ``check`` and ``recover``, so the three cannot disagree about who
+    owns an entry.
+    """
+    foreign = _foreign_pin_owners(row["sha"], key)
+    if foreign:
+        return "ref", ", ".join(foreign)
+    marker = _subject_lane_key(row["subject"])
+    if marker is not None and marker != key:
+        return "marker", marker
+    return None
+
+
+def _entry_ownership(row: dict, key: str, own_pins: set[str]) -> tuple[str, str]:
+    """Classify a shared-register entry against ``key``: own / foreign / unknown.
+
+    ONE classifier for ``list`` and ``check``, so the two can never disagree about
+    the same state. The order is fail-closed:
+
+    1. **A foreign lane ref or a foreign message marker is decisive, and it
+       OUTRANKS this lane's own pin.** The #8051 incident re-enters through the
+       repair door: a lane that ``recover``s a peer's entry ends up pinning the
+       same sha, and reading the local pin as ownership made ``check`` print SAFE
+       while a bare ``git stash pop`` took the peer's work (#8773 review P1).
+    2. This lane's own pin, then this lane's own marker, are ownership evidence.
+    3. Otherwise the entry is UNATTRIBUTABLE and ``check`` fails closed.
+    """
+    foreign = _foreign_owner(row, key)
+    if foreign is not None:
+        kind, detail = foreign
+        branch = f" (branch {row['branch']!r})" if row.get("branch") else ""
+        if kind == "ref":
+            return "foreign", (
+                f"the top shared entry ({row['sha'][:12]}) is named by another lane's "
+                f"ref{branch}: {detail} — a lane ref is that lane's own durable handle, "
+                "so a bare `git stash pop` here cannot be shown to take THIS lane's entry"
+            )
+        return "foreign", (
+            f"the top shared entry ({row['sha'][:12]}) was pushed by lane {detail!r} "
+            f"(branch {row['branch']!r}), not this lane {key!r} — two worktrees can be "
+            "forced onto ONE branch, so a matching branch does not make a bare "
+            "`git stash pop` HERE safe: it would apply and drop that lane's entry"
+        )
+    if _subject_lane_key(row["subject"]) == key or row["sha"] in own_pins:
+        return "own", ""
+    return "unknown", ""
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -691,20 +781,19 @@ def cmd_list(args: argparse.Namespace) -> int:
     # a same-branch peer's entry safe (#8773 review P2).
     entries_shas = {e["sha"] for e in entries}
 
-    def _own(r: dict) -> bool:
-        return r["sha"] in entries_shas or _subject_lane_key(r["subject"]) == key
+    def _mark(r: dict) -> str:
+        kind, _reason = _entry_ownership(r, key, entries_shas)
+        base = {"own": "OWN     ", "foreign": "FOREIGN ", "unknown": "FOREIGN?"}[kind]
+        # The pin state is a SUFFIX, never a competing mark: `_pinned_shas()` is
+        # repo-global, so a standalone `pinned` mark labelled a PEER's pinned
+        # entry exactly like this lane's and the lane-key classifier was never
+        # reached (#8773 review P2).
+        return f"{base} (pinned)" if r["pinned"] else base
 
     top = rows[0] if rows else None
-    top_own = _own(top) if top is not None else False
+    top_own = top is not None and _entry_ownership(top, key, entries_shas)[0] == "own"
     for r in rows:
-        if r["pinned"]:
-            mark = "pinned  "
-        elif _own(r):
-            mark = "OWN     "
-        elif _subject_lane_key(r["subject"]) is not None:
-            mark = "FOREIGN "
-        else:
-            mark = "FOREIGN?"  # no marker: origin cannot be established
+        mark = _mark(r)
         star = ("  <-- a bare `git stash pop` here would take THIS"
                 if r is top and not top_own else "")
         print(f"  {r['pos']:<11} {r['sha'][:12]}  {mark}  {r['subject']}{star}")
@@ -843,29 +932,18 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if rows:
         top = rows[0]
-        top_lane = _subject_lane_key(top["subject"])
-        # Our own pinned entry is ours whatever its subject says: a cross-lane
-        # `recover` re-pins a peer's dropped entry to THIS lane, and a bare pop
-        # here then takes this lane's own (recovered) work.
-        if not any(e["sha"] == top["sha"] for e in entries):
-            if top_lane is not None:
-                if top_lane != key:
-                    # The branch heuristic cannot see this: `lane_key` is
-                    # worktree-scoped, and two worktrees can be forced onto one
-                    # branch, so a matching branch is NOT evidence of ownership.
-                    verdict["safe"] = False
-                    verdict["reasons"].append(
-                        f"the top shared entry ({top['sha'][:12]}) was pushed by lane "
-                        f"{top_lane!r} (branch {top['branch']!r}), not this lane {key!r} — "
-                        "two worktrees can be forced onto ONE branch, so a matching branch "
-                        "does not make a bare `git stash pop` HERE safe: it would apply and "
-                        "drop that lane's entry"
-                    )
-                # else: the marker names THIS lane. That is ownership evidence
-                # even when the pin is gone — `pop` deliberately leaves the
-                # shared entry in place after releasing the lane ref, so a bare
-                # pop here would take this lane's own (already-restored) work.
-            elif not top["branch"]:
+        kind, reason = _entry_ownership(top, key, {e["sha"] for e in entries})
+        if kind == "foreign":
+            # A foreign lane ref or marker OUTRANKS this lane's own pin: a
+            # cross-lane `recover` used to leave the same sha pinned by BOTH
+            # lanes, and the local pin was read as ownership — SAFE while a bare
+            # `git stash pop` took the peer's work (#8773 review P1).
+            verdict["safe"] = False
+            verdict["reasons"].append(reason)
+        elif kind == "unknown":
+            # No lane ref and no marker: the subject's branch is the only evidence
+            # left, and a branch name identifies a BRANCH, never a lane.
+            if not top["branch"]:
                 verdict["safe"] = False
                 verdict["reasons"].append(
                     f"the top shared entry ({top['sha'][:12]}) has an unreadable subject "
@@ -894,6 +972,11 @@ def cmd_check(args: argparse.Namespace) -> int:
                     "worktrees can be forced onto ONE branch), so a bare `git stash pop` "
                     "here cannot be shown to take this lane's own entry"
                 )
+        # else: own — this lane's marker names it, or this lane's ref pins it, and
+        # no other lane's ref or marker does. That is ownership evidence even when
+        # the pin is gone: `pop` deliberately leaves the shared entry in place
+        # after releasing the lane ref, so a bare pop here would take this lane's
+        # own (already-restored) work.
 
     if args.json:
         print(json.dumps(verdict, indent=2))
@@ -935,6 +1018,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
     args.sha = _out("rev-parse", args.sha)
     parents = _out("rev-list", "--parents", "-n", "1", args.sha).split()
     subject = _out("log", "-1", "--format=%s", args.sha)
+    commit_subject = subject
     # A stash commit has 2 parents (HEAD + index) or 3 with `-u`/`-a` (the
     # untracked tree). A plain commit has 1; a 2-parent merge has 2 and would
     # pass a parent count alone, so the SUBJECT must also look like a stash
@@ -952,6 +1036,31 @@ def cmd_recover(args: argparse.Namespace) -> int:
         )
     subject = args.message or subject or f"recovered {args.sha}"
     key = lane_key()
+    # `recover` is the ONE command that can put an ARBITRARY sha under this lane's
+    # key, so it is the repair door the #8051 incident can re-enter through. A
+    # lane that recovers a peer's entry ends up pinning a sha the peer's own ref
+    # already names; `check` then read the local pin as ownership, printed SAFE,
+    # and a bare `git stash pop` took the peer's work (#8773 review P1). Refuse
+    # anything provably another lane's — the object's own subject (never the `-m`
+    # override) plus the refs pointing at it.
+    foreign = _foreign_owner(
+        {"sha": args.sha, "subject": commit_subject,
+         "branch": _subject_branch(commit_subject)},
+        key,
+    )
+    if foreign is not None:
+        kind, detail = foreign
+        which = (f"it is named by another lane's ref: {detail}" if kind == "ref"
+                 else f"its message says it was pushed by lane {detail!r}")
+        raise LaneStashError(
+            f"refusing to recover {args.sha[:12]}: {which}. `recover` pins the entry under "
+            f"THIS lane's key ({key!r}), so adopting a peer lane's entry here would leave "
+            "it claimed by both lanes — and `check`, reading this lane's pin as ownership, "
+            "would then report SAFE on a bare `git stash pop` that takes that lane's work. "
+            "Recover the entry from the lane that owns it — its `[<lane-key>]` marker "
+            "matches that lane's key there — or restore it deliberately with bare "
+            "`git stash store`."
+        )
     if not _store_into_register(args.sha, subject, key):
         raise LaneStashError(
             f"could not put {args.sha} into the shared register. Either `git stash store` "

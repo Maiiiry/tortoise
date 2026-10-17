@@ -511,10 +511,14 @@ for three sends to one pane that were recorded as `OK` and never consumed.
   instead — it pins every entry to `refs/lane/<lane-key>/stash/<n>` and restores **by sha**, so a
   peer's entry is unreachable in either direction; `python tools/lane_stash.py check` is the
   executable detector (exit 1 = a bare `git stash pop` here would take work that is not provably
-  this lane's — a peer lane's marker, or any entry only a branch name could attribute). If a peer's
-  entry was already applied or dropped: `git stash store -m "<original subject>" <sha>` restores it
-  (the commit survives in the object DB) — `python tools/lane_stash.py recover <sha>` runs that and
-  pins the result. `tests/test_lane_stash.py` carries the 2-worktree reproduction. The lane rule
+  this lane's — a peer lane's marker or lane ref, or any entry only a branch name could attribute).
+  `python tools/lane_stash.py recover <sha>` is the repair recipe for THIS lane's own dropped entry
+  (it pins what it restores under the current lane), and it **refuses** an entry another lane's ref
+  or `[<lane-key>]` marker names — pinning a peer's entry here would leave it claimed by both lanes,
+  and `check` would then clear a bare pop on work that is not this lane's. To restore a *peer's*
+  dropped entry, use `git stash store -m "<original subject>" <sha>` (the commit survives in the
+  object DB), or let that lane recover it from its own worktree.
+  `tests/test_lane_stash.py` carries the 2-worktree reproduction. The lane rule
   also exists one repo up in agent-infra (skills + guard extension) as agent-infra #1264.
 - Branch naming: `feat/`, `fix/`, `chore/` prefixes
 - PRs auto-merge by default (no staging hold unless `deploy:staging` label)

@@ -1605,3 +1605,115 @@ def test_prune_dry_run_refuses_a_diverged_register(repo, monkeypatch, capsys):
     capsys.readouterr()
     assert mod.main(["prune"]) != 0, "a dry run must refuse a diverged register too"
     assert repo.stash_shas() == [y]
+
+
+# ── the repair door must not re-open the #8051 hole (#8773 review P1) ───────
+
+def test_recover_refuses_a_peer_lanes_pinned_entry(repo):
+    """`recover` must not adopt a peer lane's entry through the repair door.
+
+    `recover` pins its argument under THIS lane's key. Without an ownership check
+    a lane could import a peer's entry, be told by `check` that the entry is its
+    own (the pin it just made), and take the peer's work with a bare
+    `git stash pop` — the incident this tool exists to stop, re-entered through
+    the command whose whole purpose is repair (#8773 review P1).
+    """
+    repo.dirty(repo.a, "f.txt", "base\na-A\n")
+    assert repo.lane(repo.a, "push", "-m", "A work").returncode == 0
+    sha_a = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nb-B\n")
+    (repo.b / "uB.txt").write_text("B untracked\n")
+    assert repo.lane(repo.b, "push", "-u", "-m", "B work").returncode == 0
+    sha_b = repo.stash_sha()
+    assert sha_a and sha_b and sha_a != sha_b
+    before = repo.lane_refs()
+
+    cp = repo.lane(repo.a, "recover", sha_b, "-m", "stolen")
+    assert cp.returncode == 2, _fail(cp)
+    assert "refusing to recover" in cp.stderr, cp.stderr
+    assert repo.lane_refs() == before, "the refusal must not pin a peer's entry"
+    assert repo.stash_shas() == [sha_b, sha_a], "the refusal must not move the register"
+
+    # the entry stays a HAZARD for lane A — the refusal did not launder it
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 1, _fail(check)
+    assert "SAFE" not in check.stdout, check.stdout
+
+    # and the peer can still restore its own work (the entry was untouched)
+    assert repo.lane(repo.b, "pop").returncode == 0
+    assert (repo.b / "uB.txt").exists()
+
+
+def test_recover_refuses_a_peer_marker_after_its_pin_is_released(repo):
+    """The refusal must also work when only the peer's MESSAGE MARKER remains.
+
+    A peer can release its lane ref without applying the entry (`drop --yes`), so
+    the foreign-pin check alone is not enough: the object's own subject still
+    names the peer lane and must refuse an adoption (#8773 review P1).
+    """
+    repo.dirty(repo.b, "f.txt", "base\nb-B\n")
+    assert repo.lane(repo.b, "push", "-m", "B work").returncode == 0
+    sha_b = repo.stash_sha()
+    assert sha_b
+    assert repo.lane(repo.b, "drop", "1", "--yes").returncode == 0
+    assert repo.lane_refs() == {}, "precondition: the peer's pin is gone"
+
+    cp = repo.lane(repo.a, "recover", sha_b, "-m", "stolen")
+    assert cp.returncode == 2, _fail(cp)
+    assert "refusing to recover" in cp.stderr, cp.stderr
+    assert repo.lane_refs() == {}, "the refusal must not pin a peer-marked entry"
+    assert repo.stash_shas() == [sha_b], "the register must be untouched"
+
+
+def test_check_fails_closed_when_a_local_pin_claims_a_peer_marked_entry(repo):
+    """A LOCAL pin must not launder a peer's marker — the double-pin state.
+
+    `check` used to test "is this sha one of my pins" BEFORE it read the marker,
+    so the state a cross-lane `recover` used to create (one sha pinned by both
+    lanes) was reported SAFE while a bare `git stash pop` took the peer's work
+    (#8773 review P1). A foreign lane ref is decisive for the same reason.
+    """
+    repo.dirty(repo.a, "f.txt", "base\na-A\n")
+    assert repo.lane(repo.a, "push", "-m", "A work").returncode == 0
+    a_key = next(iter(repo.stash_pins())).split("/")[2]
+    repo.dirty(repo.b, "f.txt", "base\nb-B\n")
+    assert repo.lane(repo.b, "push", "-m", "B work").returncode == 0
+    sha_b = repo.stash_sha()
+    assert sha_b
+    # the exact state the old `recover` left behind: B's entry ALSO pinned by A
+    repo.git("update-ref", f"refs/lane/{a_key}/stash/99", sha_b)
+    assert sha_b in repo.stash_pins().values()
+
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 1, _fail(check)
+    assert "SAFE" not in check.stdout, check.stdout
+
+    # the hazard the detector refuses to clear is real, not a conservative guess
+    bare = repo.git("stash", "pop", cwd=repo.a, check=False)
+    assert bare.returncode == 0, _fail(bare)
+    assert "b-B" in (repo.a / "f.txt").read_text()
+
+
+def test_list_marks_a_peers_pinned_entry_foreign(repo):
+    """`list` must not label a peer's pinned entry exactly like this lane's own.
+
+    `_pinned_shas()` is repo-global, so the old `pinned` mark came FIRST and the
+    lane-key classifier was never reached: this lane's own pinned row and a
+    peer's came out byte-identical, contradicting the commit's own claim that
+    `list` attributes by lane key (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\na-A\n")
+    assert repo.lane(repo.a, "push", "-m", "A work").returncode == 0
+    repo.dirty(repo.b, "f.txt", "base\nb-B\n")
+    assert repo.lane(repo.b, "push", "-m", "B work").returncode == 0
+
+    listed = repo.lane(repo.a, "list")
+    assert listed.returncode == 0, _fail(listed)
+    assert "OWN" in listed.stdout, listed.stdout
+    assert "FOREIGN" in listed.stdout, listed.stdout
+    # the old mark labelled BOTH rows `pinned  `; no row may carry it now
+    assert "pinned  " not in listed.stdout, listed.stdout
+    # the peer's pinned row is the FOREIGN one
+    foreign_rows = [ln for ln in listed.stdout.splitlines() if "FOREIGN" in ln]
+    assert foreign_rows, listed.stdout
+    assert all("(pinned)" in ln for ln in foreign_rows), foreign_rows
