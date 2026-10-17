@@ -2684,9 +2684,7 @@ def _issue_view_rest(gh_bin: str, slug: str, issue: int, cwd: str,
         "title": raw.get("title"),
         "state": raw.get("state"),
         "stateReason": raw.get("state_reason"),
-        "assignees": [
-            {"login": (a or {}).get("login")} for a in (raw.get("assignees") or [])
-        ],
+        "assignees": raw.get("assignees"),
         "url": raw.get("html_url"),
     }
 
@@ -4479,15 +4477,34 @@ def run_preflight(
             # failure is a genuine "could not read", and rescuing it from a second
             # endpoint would turn a real refusal into a reading — the fail-open
             # direction. Match the phenomenon, not the exception type.
-            _exhausted = "rate limit" in str(exc).lower()
+            # gh renders a non-2xx as `HTTP <code>: <status> (<url>)`, so a 429
+            # arrives as `HTTP 429: Too Many Requests` with NO prose at all — a
+            # bare "rate limit" substring test silently under-triggers on the
+            # canonical exhaust form.
+            _lower = str(exc).lower()
+            _exhausted = (
+                "rate limit" in _lower
+                or "too many requests" in _lower
+                or "http 429" in _lower
+            )
             rescued = (
                 _issue_view_rest(gh_bin, slug, issue, cwd, timeout)
                 if _exhausted else None
             )
             if rescued is not None:
-                _require_issue_payload(
-                    rescued, f"gh api repos/{slug}/issues/{issue}"
-                )
+                # ⛔ VALIDATE INSIDE A GUARD. This call raises SurfaceError for a
+                # malformed payload, and `main()` catches only NotAWorkItem /
+                # RuntimeError — so an unguarded raise here escapes as a traceback
+                # and exits 1, which this tool defines as "another lane is on it"
+                # (COLLISION). A malformed REST body must become a NAMED INCOMPLETE,
+                # never a false collision the operator acts on.
+                try:
+                    _require_issue_payload(
+                        rescued, f"gh api repos/{slug}/issues/{issue}"
+                    )
+                except SurfaceError as bad:
+                    rescued = None
+                    exc = bad
                 issue_data = rescued
                 title = rescued.get("title") or None
             else:

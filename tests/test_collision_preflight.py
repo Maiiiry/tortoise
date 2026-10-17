@@ -106,8 +106,9 @@ fi
 # `gh issue view --json` shape rather than assuming the two agree.
 if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
   # ⛔ MIRROR THE REAL ENDPOINT'S FAILURES, or the fallback becomes a fail-open
-  # TEST HARNESS: a branch that always answers would "rescue" the absent-issue
-  # and unqueryable-repo cases this suite relies on staying INCOMPLETE.
+  # TEST HARNESS. `$repo` is parsed from `--repo`, which this REST form does not
+  # carry, so the slug must be recovered FROM THE PATH — a guard keyed on an empty
+  # `$repo` can never match and is dead code that merely looks like protection.
   if [ "${GH_STUB_ISSUE_REST_FAIL:-0}" = "1" ]; then
     echo "gh-stub: HTTP 403: Resource not accessible" >&2
     exit 1
@@ -116,10 +117,11 @@ if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
     echo "gh-stub: HTTP 404: Not Found" >&2
     exit 1
   fi
-  if [ -f "$d/probe_unqueried.txt" ] && grep -qx "$repo" "$d/probe_unqueried.txt"; then
+  _slug="${2#repos/}"; _slug="${_slug%/issues/*}"
+  if [ -f "$d/probe_unqueried.txt" ] && grep -qx "$_slug" "$d/probe_unqueried.txt"; then
     echo "gh-stub: could not connect to api.github.com" >&2; exit 1
   fi
-  printf '{"number": %s, "title": "florfenicol dosing audit", "state": "open", "state_reason": null, "assignees": [], "html_url": "https://github.com/%s/issues/%s"}\n' "${2##*/}" "$repo" "${2##*/}"
+  printf '{"number": %s, "title": "florfenicol dosing audit", "state": "open", "state_reason": null, "assignees": [], "html_url": "https://github.com/%s/issues/%s"}\n' "${2##*/}" "$_slug" "${2##*/}"
   exit 0
 fi
 
