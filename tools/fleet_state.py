@@ -1734,19 +1734,23 @@ def build_state(
         if arm == "duplicate":
             if row.get("twin_kept"):
                 reason = (
-                    f"registry row for '{row['lane']}' repeats {ws_gone} verbatim — "
-                    "the same (label, workspace) written twice is ONE lane, not two; "
-                    "the duplicate is not a second lane record and NO verdict "
-                    "changes (one lane record remains). This is a de-duplication, "
-                    "not a retirement: it holds even when the cmux list could not "
-                    "be read, because both rows name one workspace. Delete the "
-                    "duplicate roster line"
+                    f"registry row for '{row['lane']}' repeats {ws_gone} — the same "
+                    "(label, workspace) written twice is ONE lane, not two; the "
+                    "duplicate is not a second lane record and NO verdict changes "
+                    "(one lane record remains). This is a de-duplication, not a "
+                    "retirement: it holds even when the cmux list could not be "
+                    "read, because both rows name one workspace. ⛔ The two lines "
+                    "may DIFFER in their `lane:` column, and the board publishes "
+                    "the value on the copy it kept — so do NOT just delete this "
+                    "one: keep whichever of the two carries the `lane:` value "
+                    "shown as this lane's `claim.lane_label`, or the published "
+                    "label silently reverts"
                 )
             else:
                 # The twin was dropped by another arm, so this drop is NOT a plain
                 # de-duplication — say so, and do not claim a record survives.
                 reason = (
-                    f"registry row for '{row['lane']}' repeats {ws_gone} verbatim, "
+                    f"registry row for '{row['lane']}' repeats {ws_gone}, "
                     "and the copy of this row was ALREADY dropped above for its "
                     "own reason — read that entry, which is the one that explains "
                     "why this workspace is no longer a lane record. Delete the "
@@ -2610,10 +2614,15 @@ def cmd_orphans(args: argparse.Namespace) -> int:
 
 def cmd_violations(args: argparse.Namespace) -> int:
     state = _load_or_build(args)
-    # `violations` comes from `resolve_sessions(rows, ...)`, where `rows` is exactly
-    # `load_registry()`'s output: an unreadable registry yields zero rows, hence zero
-    # claimed sessions, hence zero violations — the old code printed `none` on rc=0,
-    # byte-identical to a measured, genuinely-clean roster (PR #8594 review P2).
+    # `violations` comes from `resolve_sessions(rows, ...)`, and `rows` is the rows
+    # that SURVIVED the #8845 filter — NOT `load_registry()`'s output any more.
+    # (It was that before #8845; a comment claiming it still is would tell a reader
+    # that no roster row can be missing, which is false.) The guarantee that survives
+    # is kept ⊆ registry: an unreadable registry yields zero rows, hence zero claimed
+    # sessions, hence zero violations — the old code printed `none` on rc=0,
+    # byte-identical to a measured, genuinely-clean roster (PR #8594 review P2). A
+    # dropped row cannot hide a partition break, because the override and
+    # `disk_by_label` inputs are LABEL-keyed and the surviving row inherits them.
     if not _registry_readable(state, "violations", "cannot detect session-partition breaks"):
         return 2
     print(json.dumps(state["violations"], indent=2) if args.json else "\n".join(

@@ -282,6 +282,13 @@ def test_the_last_duplicate_rows_issue_label_wins(monkeypatch) -> None:
     )
     (lane,) = st["lanes"]
     assert lane["claim"]["lane_label"] == "lane:new"
+    # ⛔ AND THE INSTRUCTION MUST NOT REVERT IT (review of #8849, cycle 5). The two
+    # lines differ in exactly the column the board just used, so a bare "delete the
+    # duplicate roster line" tells the human to delete the copy that CARRIES the
+    # published value — and obeying it silently reverts the label to `lane:old`,
+    # which is the failure the last-wins rule exists to prevent.
+    (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    assert "claim.lane_label" in orphan["reason"], orphan["reason"]
 
 
 def test_a_dropped_rows_lane_label_does_not_overwrite_the_survivors(monkeypatch) -> None:
