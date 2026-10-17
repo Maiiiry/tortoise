@@ -338,10 +338,26 @@ does not itself cap row growth, because anyone can mint a URL. The reachable
 rate is bounded by the **CIMD fetch** limiter above (600/hr aggregate,
 in-process) — **not** by the DCR limiter, which CIMD never touches — and, since
 #3669, also by a process-wide in-flight cap and a per-window wall-clock budget
-(see "Limitations"). Pruning for
-the pre-existing DCR-generated rows remains owned by **#2853 / #1677 (owner
-@daniel-ospina, dated 2026-10-15)**; CIMD adds one row per client
-implementation in normal operation but does add to that backlog under abuse.
+(see "Limitations"). Growth of
+the pre-existing DCR-generated rows is **ACCEPTED, not forgotten**: owner
+@daniel-ospina ruled **option C** on 2026-10-13 (#2853) — no retention window,
+no expiry, no deletion path, and no cap — which discharged that commitment on
+the dated review. The ruling requires the number to be visible, so the count is
+an operator endpoint:
+
+```bash
+curl -sH "Authorization: Bearer $FASTAPI_INTERNAL_KEY" \
+  https://<api-host>/v1/internal/oauth/clients/count
+```
+
+It returns `{"status":"ok","count":N,…}` from the server's own `COUNT`, or
+`{"status":"unavailable","reason":…}` with **no** `count` when the server
+states no total — a missing number is never rendered as `0`, because a
+confident zero would read as "nothing has accumulated" and retire the decision.
+The ruling names its own revisit triggers (the 2026-11-15 measurement, or a move
+off per-connection DCR) and the endpoint returns them, so the acceptance is not
+open-ended. CIMD adds one row per client implementation in normal operation but
+can add to that backlog under abuse.
 
 Idempotency under concurrency rests on the schema's `id text PRIMARY KEY`
 (`supabase/migrations/0016_oauth.sql`): two simultaneous first authorizations of
