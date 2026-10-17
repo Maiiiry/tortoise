@@ -2367,7 +2367,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
             print(
                 f"{args.lane!r} is a STALE REGISTRY ROW, not a lane: {where} "
                 "is absent from the live cmux list and the row "
-                "binds no pane binding, session record or override (#8845) — delete the "
+                "binds no pane binding or session record of its own (#8845) — delete the "
                 "roster row; `fleet-state orphans` lists it",
                 file=sys.stderr,
             )
