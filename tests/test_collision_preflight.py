@@ -157,6 +157,16 @@ if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
   # copy of it inside THIS branch unreachable code that reads as protection —
   # the same defect the `$repo` note above names. The live REST-404 seam is
   # `GH_STUB_ISSUE_REST_ABSENT` above.
+  # The endpoint failing FOR THIS SLUG (an unreachable host, a proxy refusing
+  # the repo) — the REST counterpart of the `$repo`-keyed probe guard further
+  # down. ⛔ IT MUST BE FIRED BY A TEST OR IT DOES NOT EXIST (#3435 review, P2):
+  # the only other writer of `probe_unqueried.txt` is the cross-repo CANDIDATE,
+  # while this branch is reached only for the TARGET slug, so an unwired guard
+  # here is dead code that merely looks like protection — the defect the `$repo`
+  # note above names. `test_a_rest_transport_failure_names_the_transport_not_a_
+  # missing_issue` drives it (a `--repo` run, so the ambiguity probe does not
+  # read the file, plus a rate-limited `issue view`); deleting this guard makes
+  # that case go CLEAN.
   _slug="${2#repos/}"; _slug="${_slug%/issues/*}"
   if [ -f "$d/probe_unqueried.txt" ] && grep -qx "$_slug" "$d/probe_unqueried.txt"; then
     echo "gh-stub: could not connect to api.github.com" >&2; exit 1
@@ -2550,6 +2560,36 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("[issue assignee/holder]", out)
         self.assertIn("non-list 'assignees'", out)
         self.assertIn("issue-metadata-unavailable", out)
+
+    def test_a_rest_transport_failure_names_the_transport_not_a_missing_issue(self):
+        # ⛔ THE STUB'S SLUG GUARD THAT NOTHING COULD FIRE (#3435 review, P2).
+        # `probe_unqueried.txt` had exactly ONE writer — the cross-repo CANDIDATE
+        # (`other-owner/other-repo`) — while the REST branch is reached only for
+        # the TARGET slug, so `grep -qx "$_slug"` could never match: the guard,
+        # and the path-derived `$_slug` it exists for, were dead code that merely
+        # LOOKED like protection. That is the same defect the branch's own `$repo`
+        # note names, left unexamined three lines below it.
+        #
+        # Reachable, and this is the fixture that reaches it: `--repo` is given
+        # (so the ambiguity probe runs no `--json number` read at all and the
+        # target slug in `probe_unqueried.txt` has no other reader) while
+        # `issue view` is rate-limited, so the fallback runs and the endpoint
+        # fails for the target slug specifically.
+        #
+        # WHAT IT PINS, in both directions: the guard must FIRE (deleted or
+        # re-keyed on the empty `$repo`, the valid REST body is read and the run
+        # goes CLEAN at rc 0), and the refusal must be classified as a TRANSPORT
+        # failure — `gh-unavailable`, the pre-existing fail-closed wording — and
+        # not mistaken for `issue-absent`, which would report a live issue as
+        # nonexistent.
+        (self.gh_dir / "probe_unqueried.txt").write_text("test-owner/test-repo\n")
+        rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        self.assertIn("could not connect to api.github.com", out)
+        self.assertIn("gh-unavailable", out)
+        self.assertNotIn("issue-absent", out)
 
     def test_a_rest_404_during_exhaustion_reads_as_issue_absent(self):
         # #3435 review (minor): a REST 404 used to be swallowed into `None`, so
