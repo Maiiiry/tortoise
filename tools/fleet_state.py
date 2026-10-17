@@ -1285,17 +1285,17 @@ def build_state(
     # ---- which registry rows ARE lane records (#8845) ----
     # A registry row can outlive the cmux workspace behind it. When the row's
     # workspace is ABSENT from a MEASURED live list and the row binds no evidence
-    # at all — no pane binding, no live session record, no registry override — then
-    # it says nothing: it cannot answer whether the lane stopped, started or was
-    # never there. Emitting it anyway makes ONE label enumerate TWO lane records,
-    # and the claim gate reads a duplicated label as unreadable by construction
+    # of its own — no pane binding, no live session record — then it says nothing:
+    # it cannot answer whether the lane stopped, started or was never there.
+    # Emitting it anyway makes ONE label enumerate TWO lane records, and the claim
+    # gate reads a duplicated label as unreadable by construction
     # (`collision_preflight._holders_from_board` -> HOLDER_UNMEASURED, which is
     # INCOMPLETE/exit 2 fleet-wide). That is a stale roster row tightening a
     # fail-closed gate over a lane that is in fact perfectly readable.
     #
     # ⛔ So such a row is not a lane record — but only while the SAME label already
-    # has a record that does bind evidence. A row that is its label's ONLY record is
-    # KEPT even when unbound: #7738 publishes exactly that lane as
+    # has a row that DOES bind evidence of its own. A row that is its label's ONLY
+    # record is KEPT even when unbound: #7738 publishes exactly that lane as
     # RECOVERABLE/RETIRED, because a gone workspace says nothing about whether a pi
     # process outlived it. Dropping it would erase the lane #7738 exists to report.
     #
@@ -1303,38 +1303,55 @@ def build_state(
     # nothing about whether the workspace still exists, so it retires NOTHING — the
     # same fail-open posture `workspace_terminal` takes (#7738).
     #
+    # ⛔ `overrides` is deliberately NOT consulted here, and this is the trap the
+    # rule has to avoid: it is keyed by LABEL while this question is per ROW, so
+    # `overrides.get(label)` answers identically for every row sharing that label —
+    # once ANY override existed, the stale row would "bind evidence" too, nothing
+    # would be dropped, and the duplicate (and the exit-2 gate) would come straight
+    # back. The override keeps its own meaning elsewhere: it re-binds a ghost's
+    # session on disk, and a label whose only row is unbound is kept anyway.
+    #
     # Every dropped row is REPORTED through `orphans` below (kind `registry-stale`),
     # never silently erased: deleting the roster line is a human's call, not ours.
-    def binds_evidence(label: str, ws: str) -> bool:
-        """Does this registry row bind ANY evidence about the lane it names?"""
+    def row_binds_evidence(ws: str) -> bool:
+        """Does this registry ROW bind evidence of its own? (ROW-keyed — see above.)"""
         if ws.upper() in workspaces:
             return True                      # the workspace itself is live
         if (bindings.get(ws.upper()) or "").strip():
             return True                      # a pane resume binding exists
-        if live.get(ws.upper()):
-            return True                      # a session record -> a pid reading
-        # A hand-pick for the label outlives a dead workspace on purpose (the
-        # override rule exists to re-bind such a lane), and it is the only thing that
-        # can resolve a ghost's session on disk. Presence alone counts: a DANGLING
-        # override is still a human's statement that this label is a lane.
-        return bool((overrides.get(label) or "").strip())
+        return bool(live.get(ws.upper()))     # a session record -> a pid reading
 
-    bound_labels = {lbl for lbl, ws, _ in registry if binds_evidence(lbl, ws)}
+    bound_rows_by_label: dict[str, int] = {}
+    issue_label_by_label: dict[str, str] = {}
+    for label, ws, issue_label in registry:
+        if row_binds_evidence(ws):
+            bound_rows_by_label[label] = bound_rows_by_label.get(label, 0) + 1
+        # `issue_label` reaches the emitted record as `lane_label` (:1576), so it must
+        # survive the row that happened to carry it (review of #8849, P3).
+        if issue_label and not issue_label_by_label.get(label):
+            issue_label_by_label[label] = issue_label
+
     kept: list[tuple[str, str, str]] = []
     stale_rows: list[dict[str, str]] = []
     for label, ws, issue_label in registry:
         if (
             # Only a MEASURED live list may retire a row (#7738 fail-open posture).
             workspaces_measured
-            # The label IS answered by a row that binds evidence, so dropping this
+            # ANOTHER row for this label binds evidence on its own, so dropping this
             # one cannot erase the lane from the board.
-            and label in bound_labels
-            # ...and this row is the one that binds nothing.
-            and not binds_evidence(label, ws)
+            and bound_rows_by_label.get(label, 0) > 0
+            # ...and THIS row is the one that binds nothing.
+            and not row_binds_evidence(ws)
         ):
             stale_rows.append({"lane": label, "workspace": ws, "issue_label": issue_label})
             continue
         kept.append((label, ws, issue_label))
+    # A dropped row may be the only one carrying the label's `lane:` label; the
+    # surviving row inherits it rather than losing it.
+    kept = [
+        (label, ws, issue_label or issue_label_by_label.get(label, ""))
+        for label, ws, issue_label in kept
+    ]
 
     rows: list[tuple[str, str]] = [(lbl, ws) for lbl, ws, _ in kept]
 

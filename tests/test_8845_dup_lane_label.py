@@ -266,5 +266,66 @@ def test_an_unreadable_workspace_list_drops_nothing(monkeypatch) -> None:
     assert not [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
 
 
+# ---------------------------------------------------------------------------
+# 6. the review's P1: the OVERRIDE arm must not resurrect the duplicate
+# ---------------------------------------------------------------------------
+
+
+def test_a_label_override_does_not_make_the_stale_row_a_lane_record(monkeypatch) -> None:
+    """`overrides` is keyed by LABEL, so it cannot answer a per-ROW question.
+
+    Consulted at row level it answers identically for every row sharing the label:
+    once ANY override existed, the stale row would "bind evidence" too, nothing
+    would be dropped, and the duplicate — with its exit-2 gate — would come back.
+    Mutating `row_binds_evidence` to also consult `overrides.get(label)` reds this.
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_STALE, ""), (LABEL, WS_LIVE, "")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+        # a DANGLING override: it names the stale workspace, and still must not
+        # promote that row to a lane record.
+        overrides={LABEL: WS_STALE},
+    )
+    assert [lane["identity"]["lane"] for lane in st["lanes"]] == [LABEL]
+    assert st["summary"]["lanes"] == 1
+    assert st["lanes"][0]["identity"]["workspace"] == WS_LIVE
+    assert st["summary"]["stale_registry"] == 1
+
+
+def test_a_lone_row_with_an_override_is_still_kept(monkeypatch) -> None:
+    """The override keeps its own meaning (#7738): a lone gone-workspace row stays."""
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_STALE, "")],
+        live={},
+        overrides={LABEL: WS_STALE},
+    )
+    assert [lane["identity"]["lane"] for lane in st["lanes"]] == [LABEL]
+    assert st["summary"]["stale_registry"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 7. the review's P3: a dropped row must not take `lane_label` with it
+# ---------------------------------------------------------------------------
+
+
+def test_a_dropped_rows_issue_label_survives_on_the_surviving_row(monkeypatch) -> None:
+    """`issue_label` reaches the emitted record as `claim.lane_label`.
+
+    Only the stale row carries it here, so dropping that row without inheritance
+    silently blanks the lane's `lane:` label.
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_STALE, "lane:2b-extractor"), (LABEL, WS_LIVE, "")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+    )
+    (lane,) = st["lanes"]
+    assert lane["claim"]["lane_label"] == "lane:2b-extractor"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
