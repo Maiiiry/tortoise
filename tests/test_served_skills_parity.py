@@ -27,10 +27,12 @@ WIRING (target 4). `--check-upstream` must have a runner, or the whole
 upstream half is decoration: a served copy edited in place *plus* a hand-cut pin
 hash used to pass everything. Two runners execute it — the `deploy-dashboard`
 job of `deploy-pages.yml` and the daily `skills-parity.yml` — and the assertions
-below derive that fact from the WORKFLOW CONTENTS rather than from one hardcoded
-filename, so a lane that lands only one of them is forced to be honest about it
-instead of red-ing. `docs/license-notes.md` §7.1 must name whichever runners
-exist, and must name no runner that does not.
+below derive that fact by EXECUTING each step's real `run:` block (recording
+interpreter stubs on `PATH`, #4494's lesson) rather than by reading its text, so
+`echo …`, `… || true`, `…; exit 0` and `continue-on-error:` are not mistaken for
+a gate. A lane that lands only one of the two runners is still forced to be
+honest about it instead of red-ing. `docs/license-notes.md` §7.1 must name
+whichever runners exist, and must name no runner that does not.
 
 The pin itself carries no assertion here: `test_4643_the_pin_covers_exactly_the_
 installed_set` ties it to the installer's `SKILLS=(...)` array, so a fourth
@@ -46,6 +48,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -825,29 +828,181 @@ def test_4643_the_ownership_table_states_the_rule_per_artifact():
     assert len(onboarding) == 1, f"§7.1 needs a row for tortoise-onboarding: {rows}"
     assert "daniel-ospina/tortoise" in onboarding[0][1], onboarding[0][1]
 
+    # 4. The installer's OWN header — the artifact a customer's `curl … | bash`
+    # actually reads, and the one that carried the wrong claim (#4358/#3324).
+    # Review finding (P2), measured: the deleted
+    # `test_4643_the_ownership_statement_names_one_repo_per_artifact` was the
+    # ONLY assertion in the tree tying that header to the MIT repo, and §7.1's
+    # "the rule, now stated in both repos" is a claim about this side too — so
+    # the table alone left the header unguarded.
+    header = INSTALLER.read_text(encoding="utf-8")
+    assert "tortoise-skills-and-integrations" in header, (
+        "the served installer's header must name the MIT repo as the author of "
+        "the skills it installs — it is the statement a contributor reads: "
+        f"{INSTALLER.relative_to(REPO)}")
+    assert "tortoise/onboarding/SKILL.md" in header, (
+        "…and must name the in-repo artifact it does NOT install, so the "
+        "boundary reads as a rule rather than an omission")
 
-def _run_bodies(doc: dict) -> list[str]:
-    return [step["run"]
-            for job in (doc.get("jobs") or {}).values() if isinstance(job, dict)
-            for step in (job.get("steps") or []) if isinstance(step, dict)
-            if isinstance(step.get("run"), str)]
+
+# ── "is the arm WIRED" is decided by EXECUTION, not by reading the YAML ────
+#
+# Review finding (P2), measured: the previous predicate declared a workflow a
+# runner iff a step's `run:` TEXT contained `served_skills_parity` and
+# `--check-upstream`. Every one of these therefore still counted as a wired
+# gate, while the docs row, the workflow header and this file all claimed a
+# fail-closed runner:
+#
+#     run: echo "uv run python tools/served_skills_parity.py --check-upstream"
+#     run: uv run python tools/served_skills_parity.py --check-upstream || true
+#     run: set +e; uv run python tools/… --check-upstream; true
+#     - run: uv run … --check-upstream
+#       continue-on-error: true
+#
+# That is the SAME defect the P1 was ("a gate that reads as a gate and gates
+# nothing"), one level up — and `tests/test_ci_guard_invocation.py` is the
+# repo's settled answer to it (#4494, after thirteen review cycles on this exact
+# class): *a text scanner cannot be completed by more text rules*. So the step
+# is RUN, under `bash -e -o pipefail`, with recording interpreter stubs on
+# PATH, and a runner must satisfy BOTH:
+#
+#   * the recorded argv is the arm itself — `served_skills_parity.py` at the
+#     interpreter's SCRIPT operand, with `--check-upstream` after it (so an
+#     `echo`, a `printf`, a quoted string or a `python -c` lookalike records
+#     nothing and is rejected);
+#   * when the STUBBED ARM exits 1, the STEP exits non-zero (so `|| true`,
+#     `|| :`, a `set +e` with a masking last command, and a `trap`/subshell that
+#     swallows the status — all of which still execute the arm — are rejected on
+#     their status, not on their spelling). Note that a `set -e` step needs no
+#     help: a bare failing line already aborts it, so `; exit 0` is NOT a
+#     disarmament there and is not claimed as one.
+#
+# Step-level `continue-on-error:` and `if:` are judged statically because they
+# are workflow semantics no shell can see; a step whose failure the runner is
+# told to swallow cannot be where a failing-closed gate lives.
+#
+# Declared bounds (what this does NOT decide, and why that is safe): the
+# JOB-level `if:`/`continue-on-error:` of the job that owns the step, and
+# reachability of the workflow itself, are not modelled — the deploy step's
+# placement before `npm run build` and the daily workflow's triggers are
+# asserted separately below.
+
+#: One JSON-free record per interpreter call: argv NUL-separated, then an RS.
+_STUB = """#!/usr/bin/env bash
+printf '%s\\0' "${0##*/}" "$@" >> "$PARITY_STUB_RECORD"
+printf '\\036' >> "$PARITY_STUB_RECORD"
+if [ "${PARITY_STUB_FAIL_ARM:-0}" = "1" ]; then
+  for a in "$@"; do
+    if [ "$a" = "--check-upstream" ]; then exit 1; fi
+  done
+fi
+exit 0
+"""
+
+#: Shadowed so the step's real command shape is what runs, never the real tool.
+_STUBBED = ("uv", "uvx", "python", "python3")
 
 
-def _commented_out(text: str) -> str:
-    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+def _execute_step(body: str, *, fail_arm: bool = False) -> tuple[int, list[list[str]]]:
+    """RUN a step's real `run:` body; return (exit status, recorded argvs).
+
+    Hermetic by construction: the stubs are the only interpreters on PATH, the
+    cwd is a throwaway directory, and the environment is an allowlist — so a
+    body cannot execute a real gate, sync a real project, or reach the network.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        for name in _STUBBED:
+            stub = bin_dir / name
+            stub.write_text(_STUB, encoding="utf-8")
+            stub.chmod(0o755)
+        record = root / "argv.bin"
+        script = root / "step.sh"
+        script.write_text(body, encoding="utf-8")
+        env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "HOME": str(root),
+            "TMPDIR": str(root),
+            "PARITY_STUB_RECORD": str(record),
+            "PARITY_STUB_FAIL_ARM": "1" if fail_arm else "0",
+        }
+        proc = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", str(script)],
+            cwd=root, env=env, capture_output=True, text=True, timeout=60,
+        )
+        calls: list[list[str]] = []
+        if record.exists():
+            for chunk in record.read_bytes().split(b"\x1e"):
+                if chunk:
+                    calls.append([p.decode() for p in chunk.split(b"\0") if p])
+        return proc.returncode, calls
 
 
-def _upstream_runners() -> dict[str, dict]:
-    """Workflows that EXECUTE `--check-upstream`, derived from workflow
-    CONTENTS — the definition of "wired" that survives a rename, and that does
-    not force a lane landing only the deploy-time step to lie about it (review
+def _is_the_arm(args: list[str]) -> bool:
+    """The argv the ARM would receive — script operand AND flag, in that order."""
+    if "--check-upstream" not in args:
+        return False
+    operand = next((i for i, a in enumerate(args)
+                    if a.endswith("served_skills_parity.py")), None)
+    if operand is None:
+        return False
+    # `python -c 'pass' tools/served_skills_parity.py --check-upstream` runs no
+    # gate: the script is an argument to nothing. Same for `-m`.
+    if "-c" in args[:operand] or "-m" in args[:operand]:
+        return False
+    return args.index("--check-upstream") > operand
+
+
+def _can_fail(step: dict) -> bool:
+    """A step the runner will not let fail cannot gate anything."""
+    coe = step.get("continue-on-error")
+    if coe is not None and not (coe is False or str(coe).strip().lower() == "false"):
+        return False
+    if "if" in step:
+        return str(step["if"]).strip() in {"always()", "${{ always() }}"}
+    return True
+
+
+def _is_arm_step(step: object) -> bool:
+    """True iff this step EXECUTES the arm and a failing arm fails the job."""
+    if not isinstance(step, dict):
+        return False
+    body = step.get("run")
+    if not isinstance(body, str) or "served_skills_parity" not in body:
+        # Cheap pre-filter only — the VERDICT is `_execute_step`. Without it
+        # every step of every workflow would be executed to build the runner
+        # set; text alone never decides, so a spelling that hides the command
+        # from the pre-filter is rejected (fail-closed), never accepted.
+        return False
+    if not _can_fail(step):
+        return False
+    rc, calls = _execute_step(body)
+    if rc != 0 or not any(_is_the_arm(a) for a in calls):
+        return False
+    fail_rc, _ = _execute_step(body, fail_arm=True)
+    return fail_rc != 0
+
+
+def _arm_steps(doc: dict) -> list[tuple[str, dict]]:
+    return [(name, step)
+            for name, job in (doc.get("jobs") or {}).items()
+            if isinstance(job, dict)
+            for step in (job.get("steps") or [])
+            if _is_arm_step(step)]
+
+
+def _upstream_runners(workflows: Path | None = None) -> dict[str, dict]:
+    """Workflows that EXECUTE `--check-upstream`, derived by executing their
+    steps — the definition of "wired" that survives a rename, and that does not
+    force a lane landing only the deploy-time step to lie about it (review
     finding, P2)."""
+    root = WORKFLOWS if workflows is None else workflows
     runners: dict[str, dict] = {}
-    for path in sorted({*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")}):
+    for path in sorted({*root.glob("*.yml"), *root.glob("*.yaml")}):
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if any("served_skills_parity" in _commented_out(body)
-               and "--check-upstream" in _commented_out(body)
-               for body in _run_bodies(doc)):
+        if _arm_steps(doc):
             runners[path.name] = doc
     return runners
 
@@ -880,10 +1035,7 @@ def test_4643_the_upstream_arm_has_a_runner_and_the_docs_name_it():
     # arm's step must precede the dashboard build in that job. A moved step is a
     # check that gates nothing that ships.
     steps = deploy_doc["jobs"]["deploy-dashboard"]["steps"]
-    arm = next(i for i, s in enumerate(steps)
-               if isinstance(s.get("run"), str)
-               and "served_skills_parity" in _commented_out(s["run"])
-               and "--check-upstream" in _commented_out(s["run"]))
+    arm = next(i for i, s in enumerate(steps) if _is_arm_step(s))
     build = next(i for i, s in enumerate(steps)
                  if isinstance(s.get("run"), str) and "npm run build" in s["run"])
     assert arm < build, (
@@ -918,3 +1070,89 @@ def test_4643_the_upstream_arm_has_a_runner_and_the_docs_name_it():
         assert (WORKFLOWS / mention).is_file() or (REPO / mention).is_file(), (
             f"§7.1 names {mention!r}, which does not exist — a record that "
             "promises a runner nobody wrote is the same false claim in reverse")
+
+
+# ── the wiring guard cannot be disarmed (mutation-proved) ─────────────────
+
+def _workflows_with_mutation(tmp_path: Path, mutate) -> Path:
+    """The REAL workflows, with `mutate(step)` applied to deploy-pages.yml's arm
+    step — so every assertion below is about an edit someone could actually make
+    to the file that ships, not about a synthetic workflow.
+
+    Only the two workflows that carry the arm are copied: the predicate is read
+    per-step, and the control test below asserts the UNMUTATED file is a runner,
+    so a copy that silently lost the file cannot pass this.
+    """
+    out = tmp_path / "workflows"
+    out.mkdir()
+    for name in ("deploy-pages.yml", "skills-parity.yml"):
+        shutil.copyfile(WORKFLOWS / name, out / name)
+    path = out / "deploy-pages.yml"
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["deploy-dashboard"]["steps"]
+    arm = next(s for s in steps
+               if isinstance(s.get("run"), str)
+               and "served_skills_parity" in s["run"])
+    mutate(arm)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    return out
+
+
+#: Each is a documented way to keep a gate's TEXT and lose its TEETH. The
+#: `continue-on-error` / `\|\| true` spellings are the repo's own named idioms for
+#: turning a failed gate green (`tests/test_ci_selection.py::
+#: test_drift_gate_cannot_skip_the_test_matrix` pins them as exactly that).
+_DISARMAMENTS = [
+    ("status_discarded_or_true", lambda s: s.update(run=s["run"] + " || true")),
+    ("status_discarded_or_colon", lambda s: s.update(run=s["run"] + " || :")),
+    # `set +e` FIRST, then the arm, then a masking last command: the arm really
+    # runs and really fails, and the step still exits 0. (A `set +e` AFTER the
+    # arm is not a disarmament — the runner's `bash -e` has already aborted.)
+    ("set_plus_e_masking_last", lambda s: s.update(run="set +e\n" + s["run"] + "\ntrue")),
+    ("wrapped_in_echo", lambda s: s.update(run='echo "' + s["run"] + '"')),
+    ("python_dash_c_lookalike", lambda s: s.update(
+        run="python3 -c pass " + s["run"].split("python ", 1)[-1])),
+    ("continue_on_error_step", lambda s: s.update(**{"continue-on-error": True})),
+    ("skipped_by_if", lambda s: s.update(**{"if": "false"})),
+]
+
+
+@pytest.mark.parametrize("name,mutate", _DISARMAMENTS, ids=[n for n, _ in _DISARMAMENTS])
+def test_4643_a_runner_that_cannot_fail_is_not_a_runner(tmp_path, name, mutate):
+    """Review finding (P2), measured on the pre-fix code: all of these stayed
+    GREEN through `test_4643_the_upstream_arm_has_a_runner_and_the_docs_name_it`
+    — the predicates read the step's TEXT only, so `echo`, `|| true`,
+    `; exit 0`, `|| :` and `continue-on-error:` kept every surface claiming a
+    fail-closed gate that could no longer fail. `\u00a77.1`'s "two runners, both
+    failing closed", `skills-parity.yml`'s header and this file all still
+    passed, and only a human reading the diff would have noticed."""
+    workflows = _workflows_with_mutation(tmp_path, mutate)
+    assert "deploy-pages.yml" not in _upstream_runners(workflows), (
+        f"{name}: the step still reads as the gate but cannot fail — the "
+        "wiring guard must stop calling it a runner (it is the P1 class: a "
+        "gate that gates nothing, with every surface green)")
+
+
+def test_4643_the_real_deploy_step_is_executed_and_its_failure_propagates(tmp_path):
+    """The control for the mutation table: without it, a predicate that returned
+    False for everything would pass every case above. Both halves are asserted —
+    the recorded argv IS the arm (so `echo` is not enough), and the step's own
+    status carries the stub's failure (so a status swallow is not enough)."""
+    workflows = _workflows_with_mutation(tmp_path, lambda step: None)
+    runners = _upstream_runners(workflows)
+    assert "deploy-pages.yml" in runners, (
+        "the real deploy step must be recognised as a runner — the mutations "
+        "above are only meaningful if the unmutated file passes")
+    assert "skills-parity.yml" in runners, (
+        "…and so must the daily workflow: the predicate is not specific to one "
+        "spelling of the command")
+
+    step = next(s for s in runners["deploy-pages.yml"]["jobs"]["deploy-dashboard"]
+                ["steps"] if _is_arm_step(s))
+    rc, calls = _execute_step(step["run"])
+    assert rc == 0, calls
+    assert any(_is_the_arm(argv) for argv in calls), (
+        f"the step must EXECUTE the arm; recorded calls: {calls}")
+    assert _execute_step(step["run"], fail_arm=True)[0] != 0, (
+        "a failing arm must fail the STEP — that is what 'failing closed' means "
+        "to the runner, and it is the half a text scan cannot see")
