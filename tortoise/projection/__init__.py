@@ -64,6 +64,8 @@ from tortoise.projection.nonfolded import (  # #3585 — R8/R9 fail-closed set
     assert_no_non_folded,
     classify_terminalizer_miss,
     collect_non_folded,
+    identity_absent,
+    record_identity_skip,
     record_non_folded,
 )
 
@@ -4288,15 +4290,18 @@ def _writable_id(val) -> bool:
     return isinstance(val, str) and bool(val) and _annotator_value_ok(val)
 
 
-def _log_identity_skip(what: str, value, label: str = "identity") -> None:
-    """WARN, ONCE, that an unwritable identity made a record be SKIPPED (#7369).
+def _log_identity_skip(what: str, value, label: str = "identity", *,
+                       event_id: str | None = None, where: str = "",
+                       absent_is_ordinary: bool = True,
+                       drops_record: bool = False) -> None:
+    """REPORT and RECORD that an unwritable identity made a record be SKIPPED.
 
-    The boundary change turned what used to be a LOUD abort into a SKIP. The
-    folds run on replay paths whose pass-1a/1b carry no per-event
+    The boundary change (#7369) turned what used to be a LOUD abort into a
+    SKIP. The folds run on replay paths whose pass-1a/1b carry no per-event
     ``try/except``, so before the gate an unwritable identity raised AFTER
     ``_wipe_all_nodes``; now the fold drops the record instead. A drop with no
     log is invisible: an operator cannot tell a deliberate degrade from data
-    loss, which is precisely the risk this change exists to manage.
+    loss, which is precisely the risk that change exists to manage.
 
     This is the ONE place the skip is reported, and it uses the SAME
     ``logger.warning`` mechanism the point-id skips already use
@@ -4305,21 +4310,63 @@ def _log_identity_skip(what: str, value, label: str = "identity") -> None:
     ``label`` the identity's role (MERGE key vs property) so the message says
     WHICH identity was refused.
 
-    An ABSENT identity (``None``/``""``) is NOT logged: the folds default
-    missing identity fields to ``""`` and skip them by design (an event with
-    no subject is ordinary, not a degrade), so logging those would spam the
-    operator with the healthy case and drown the corrupt one. Only a TRUTHY
-    value ``_writable_id`` refuses — the NUL/lone-surrogate-bearing class this
-    gate exists for — is an anomaly worth a warning.
+    ⛔ #8702 — the message must state the TRUE CAUSE. The #7406 guard swap
+    (``isinstance(..., str)`` → ``_writable_id``) left the surrounding
+    sentences saying "missing point id" for an id that is present but cannot
+    ride as a Cypher parameter. That is the same class as #8018 (a report
+    naming a cause that is false for the record it describes): an operator
+    sent to look for a missing field that is right there. The two causes are
+    therefore separated, and the message says which one fired and, when the
+    value is present, what it actually is.
+
+    The skip is also RECORDED (:func:`record_identity_skip`), so a run
+    boundary can COUNT it instead of reading the log — ``recover_from_log``
+    needs that to stop reporting a dropped record as replayed (#8702). The
+    entry, not this line, is the record.
+
+    An ABSENT identity (``None``/``""``) is NOT reported by default: the entity
+    folds default missing identity fields to ``""`` and skip them by design (an
+    event with no subject is ordinary, not a degrade), so logging those would
+    spam the operator with the healthy case and drown the corrupt one. A call
+    site for which an absent identity IS malformed (a Point creation anchor)
+    passes ``absent_is_ordinary=False`` to report — and record — it as its own
+    distinct cause.
+
+    ⛔ ``drops_record`` is the GRANULARITY (#8840 review P1). This function has
+    ~20 call sites and MOST of them are nested inside a record that FOLDS
+    SUCCESSFULLY: ``_upsert`` writes the Point node first and wires its edges
+    after, so a refused ``aboutEntities``/``extractedFrom``/``contains_session``
+    identity loses an edge, not the record. Only the creation anchors — the
+    sites where the fold ``return``/``continue``s and the record is not written
+    at all — pass ``drops_record=True``. ``recover_from_log`` counts a DROPPED
+    RECORD from those entries only; reading *any* entry as a drop made
+    ``applied`` under-count, which flipped ``recovered`` to ``False`` and WIPED
+    a replay that had succeeded — the #7406 harm this work exists to preserve.
     """
-    if not value:
+    if identity_absent(value):
+        if absent_is_ordinary:
+            return
+        entry = record_identity_skip(what, value, label, event_id=event_id,
+                                     where=where, drops_record=drops_record)
+        logger.warning(
+            "%s#8702: skipping %s — %s (event_id=%s), "
+            "so there is no identity to fold; the record is dropped",
+            f"{where}: " if where else "", what, entry.describe(), event_id,
+        )
         return
+    entry = record_identity_skip(what, value, label, event_id=event_id,
+                                 where=where, drops_record=drops_record)
+    # The cause comes from `IdentitySkip.describe()`, NOT a sentence written
+    # here: it names the refused SHAPE (a non-str / a NUL-bearing str / a
+    # lone-surrogate-bearing str), so the "true cause" claim holds for every
+    # value `_writable_id` refuses. Asserting "NUL/lone-surrogate bearing" for
+    # a non-str id was false for a live journal shape (#8840 review P3).
     logger.warning(
-        "#7369: skipping %s — %s %r is not a writable identity (empty, or "
-        "NUL/lone-surrogate bearing); the record is dropped rather than "
-        "reaching FalkorDB and aborting a replay that has already wiped the "
-        "graph",
-        what, label, value,
+        "%s#7369/#8702: skipping %s — %s; the record is dropped rather "
+        "than reaching FalkorDB and aborting a replay that has already wiped "
+        "the graph%s",
+        f"{where}: " if where else "", what, entry.describe(),
+        f" (event_id={event_id})" if event_id else "",
     )
 
 
@@ -7924,10 +7971,20 @@ class FalkorProjection(
             # #331 (review r2): parity with _apply_one — no id → nothing to
             # index by; skip rather than KeyError in _upsert.
             # #331 (review r4): str-only ids (non-str would break Cypher params).
+            # #7369/#8702: `_writable_id` refuses an EMPTY id as well as a
+            # NUL/lone-surrogate-bearing one, and the two causes are reported
+            # as themselves — "missing point id" was FALSE for a present id
+            # once the guard changed, and misdirected the operator (#8702).
+            # #8840 review P1: `drops_record=True` — this `return` IS the drop
+            # (the record is not written at all), which is what the replay
+            # accounting counts. Every other `_log_identity_skip` site reports a
+            # NESTED identity of a record that still folds.
             if not _writable_id(p.get("id")):
-                logger.warning(
-                    "FalkorProjection.apply: skipping %s with missing point "
-                    "id (event_id=%s)", t, ev.get("event_id"))
+                _log_identity_skip(t, p.get("id"), "point id",
+                                   event_id=ev.get("event_id"),
+                                   where="FalkorProjection.apply",
+                                   absent_is_ordinary=False,
+                                   drops_record=True)
                 return
             # Phase 1 stop-writes: strip context from v2+ events (#49)
             if ev.get("projection_version", 0) >= 2:
@@ -8025,7 +8082,16 @@ class FalkorProjection(
             elif isinstance(p, dict):
                 # #7369: a truthy-but-unwritable id is skipped, not MERGEd —
                 # the skip must be observable (see `_log_identity_skip`).
-                _log_identity_skip("PointPromoted", p.get("id"), "id")
+                # #8840 review P3 (Issue 4): `absent_is_ordinary=False` +
+                # `drops_record=True` — this branch DROPS the record, so an
+                # absent id here is the record's death, not an ordinary empty
+                # entity name. Leaving it ordinary meant the replay counted it
+                # as `applied` with no trace at all.
+                _log_identity_skip("PointPromoted", p.get("id"), "id",
+                                   event_id=ev.get("event_id"),
+                                   where="FalkorProjection.apply",
+                                   absent_is_ordinary=False,
+                                   drops_record=True)
         elif t == "OperatorPromoted":
             # #785/R16: restore the operator's live status on replay.
             # (#2256 review P1): promotion emitters journal FLAT get_point
@@ -8620,6 +8686,22 @@ class FalkorProjection(
                     "rebuild: deferred CORRECTS fold failed; %d edge(s) not "
                     "replayed", len(deferred_corrects))
         self.fold_deferred_entity_links(entity_link_events, hard_delete_seqs)
+        # #4125: pre-#4005 basename-url session Sources are re-materialised by
+        # this replay (their `SourceCreated` line, and `_link_source`'s stub
+        # mint from any PointAdded naming the bare basename) while the
+        # canonical `session:<id>` node is recreated beside them. The journal is
+        # APPEND-ONLY, so the migration cannot rewrite those records and no
+        # mapping for them exists in it to fold — but the replayed Points carry
+        # the attribution (`session_id` + the `extractedFrom` edge the passes
+        # above just rebuilt). Re-derive the migrated state here, AFTER every
+        # pass, so a rebuild converges on the same identity a live migration
+        # produces. Never raises (see `reconcile_after_replay`).
+        #
+        # NOTE: this is ``rebuild()``, not ``rebuild_all()`` — the engine label
+        # must match, or a rebuild-failure investigation is misdirected to the
+        # wrong engine (there is no #7951 re-assert in this engine).
+        from tortoise.session_source_migration import reconcile_after_replay
+        reconcile_after_replay(self, engine="rebuild")
         # #4653: re-establish the watermark captured above. DEGRADES, never
         # raises — this runs after the wipe (#2943 "no loss without proof").
         try:
@@ -9876,10 +9958,14 @@ class FalkorProjection(
                 # nothing to index by; skip rather than KeyError in
                 # _upsert_point_props.
                 # #331 (review r4): str-only ids.
+                # #8702: report the TRUE cause (present-but-unwritable is not
+                # "missing") — the guard swap left the old sentence standing.
                 if not _writable_id(p.get("id")):
-                    logger.warning(
-                        "rebuild: skipping %s with missing point id "
-                        "(event_id=%s)", t, ev.get("event_id"))
+                    _log_identity_skip(t, p.get("id"), "point id",
+                                       event_id=ev.get("event_id"),
+                                       where="rebuild",
+                                       absent_is_ordinary=False,
+                                       drops_record=True)
                     continue
                 # #2488/#3299: record the id's LAST hoisted-creation journal
                 # seq — the cross-family survivor anchor (a re-created id's
@@ -10286,8 +10372,15 @@ class FalkorProjection(
                 elif isinstance(p, dict):
                     # #7369: a truthy-but-unwritable id is skipped, not folded
                     # — the skip must be observable (see `_log_identity_skip`).
+                    # #8840 review P3 (Issue 4): the pass-1b sibling of the
+                    # `apply()` anchor — a dropped record, and an absent id here
+                    # is malformed rather than an ordinary empty identity.
                     _log_identity_skip(
-                        "PointPromoted (rebuild)", p.get("id"), "id")
+                        "PointPromoted (rebuild)", p.get("id"), "id",
+                        event_id=ev.get("event_id"),
+                        where="rebuild",
+                        absent_is_ordinary=False,
+                        drops_record=True)
             elif t == "OperatorPromoted":
                 # #785/R16: fold/apply parity with the main handler
                 # (#2256 review P1): UPSERT the snapshot synthesized into
@@ -11861,11 +11954,17 @@ class FalkorProjection(
                 # #331 (review r3): parity with apply()/pass 1a — edge
                 # wiring indexes by p["id"]; skip rather than KeyError.
                 # #331 (review r4): str-only ids.
+                # #8702: report the TRUE cause, and say WHICH pass dropped it —
+                # edge wiring, not the creation fold (pass 1a already skipped
+                # the record, so an operator reading "missing" here looked for
+                # a field that is present).
                 if not _writable_id(p.get("id")):
-                    logger.warning(
-                        "rebuild: skipping edge wiring for event with "
-                        "missing point id (event_id=%s)",
-                        ev.get("event_id"))
+                    _log_identity_skip(ev.get("type"), p.get("id"),
+                                       "point id",
+                                       event_id=ev.get("event_id"),
+                                       where="rebuild edge wiring",
+                                       absent_is_ordinary=False,
+                                       drops_record=True)
                     continue
                 if ev.get("projection_version", 0) >= 2:
                     p.pop("context", None)
@@ -12576,6 +12675,28 @@ class FalkorProjection(
                 remove_session=session_rematerialise_seq.get(_sid, -1) <= _seq,
                 remove_source=source_rematerialise_seq.get(_sid, -1) <= _seq,
             )
+
+        # ── #4125: re-migrate pre-#4005 basename session Sources ──────
+        # AFTER every replay pass. Both re-materialisation paths are done by
+        # here: the legacy node's own `SourceCreated` line (pass 1/1b) and
+        # `_link_source`'s stub mint for any PointAdded naming the bare
+        # basename (pass 2, which re-derives `extractedFrom` from EVERY
+        # PointAdded). So by this point the legacy node exists again and the
+        # canonical `session:<id>` node sits beside it — the duplicate a
+        # graph-only migration would silently leave behind after a wipe.
+        #
+        # The journal is APPEND-ONLY (`tortoise/log.py`: "sealing writes bytes,
+        # it never rewrites"), so the pre-fix lines cannot be corrected and no
+        # mapping for them exists in the journal to fold. What the journal DOES
+        # reproduce is the attribution: the replayed Points carry their
+        # `session_id` and the `extractedFrom` edge rebuilt above still names
+        # the legacy node. Re-deriving the migrated state from that is what
+        # makes the migration rebuild-durable instead of being undone by the
+        # next wipe (#2296's write-surface invariant, satisfied by
+        # re-derivation rather than by a record). Never raises — see
+        # `reconcile_after_replay`.
+        from tortoise.session_source_migration import reconcile_after_replay
+        reconcile_after_replay(self, engine="rebuild_all")
 
         # ── #4653: re-establish the event-log watermark ───────────────
         # AFTER every replay pass (pass 2b above) and BEFORE the sidecar is
@@ -13549,6 +13670,53 @@ class FalkorProjection(
         except Exception:
             return True
 
+    #: The fields the Event FULLTEXT index is SUPPOSED to carry (#244) — the
+    #: SAME list the sweep CREATES it with, so the migration's target cannot
+    #: drift from the schema it migrates to.
+    _EVENT_FTS_TARGET_FIELDS: tuple[str, ...] = tuple(
+        dict(_FULLTEXT_INDEX_LABEL_FIELDS)["Event"])
+
+    def _event_fts_index_is_current(self) -> bool:
+        """Does the EXISTING Event FULLTEXT index already index BOTH fields?
+
+        #5440: the Event legacy branch exists to widen a SUBJECT-ONLY index to
+        ``(subject, name)``, and it was gated on the one-time marker ALONE.
+        The marker is absent on a graph whose index is ALREADY the target
+        shape — the state a freshly built graph is in (the sweep creates the
+        two-field index and mints only the Point marker), and the state a
+        restore/DR graph is in (the dump carries no indexes and skips the
+        markers). Whenever anything else made the schema not-current, the
+        branch then entered and issued ``db.idx.fulltext.drop('Event')``
+        against a healthy, in-use index that needed NO migration: a failure
+        between the drop and the recreate left Event FTS absent for an index
+        that was correct the whole time, and a concurrent boot could drop the
+        index a peer had just created.
+
+        So the destructive half is gated on the SCHEMA half — the same
+        reasoning as ``_point_fts_search_keys_field_missing`` (#5444).
+
+        Requires the field to be indexed AS FULLTEXT (a RANGE index on
+        ``name`` cannot answer ``queryNodes``), read from the kinds map
+        ``_schema_is_current`` reads. A probe that cannot answer returns
+        False — migrate, never assume done.
+        """
+        try:
+            for row in self.g.query("CALL db.indexes()").result_set:
+                if not row or str(row[0]) != "Event":
+                    continue
+                if len(row) < 3 or not isinstance(row[2], dict):
+                    return False
+                for field in self._EVENT_FTS_TARGET_FIELDS:
+                    kinds = row[2].get(field)
+                    if isinstance(kinds, str):
+                        kinds = [kinds]
+                    if "FULLTEXT" not in {str(k).upper() for k in (kinds or ())}:
+                        return False
+                return True
+            return False
+        except Exception:
+            return False
+
     def _array_valued_search_keys_exist(self) -> bool:
         """Does any Point still store ``search_keys`` as an ARRAY?
 
@@ -14130,25 +14298,47 @@ class FalkorProjection(
                                     "MATCH (m:Meta {key:'event_fts_v2'}) RETURN 1"
                                 ).result_set
                                 if not done:
-                                    # #H05: the drop procedure NAME varies by
-                                    # engine (db.idx.fulltext.drop on server
-                                    # builds, dropIndex on older ones) -- the
-                                    # single hardcoded name could never migrate
-                                    # on a build registering only the other.
-                                    for drop_proc in ("db.idx.fulltext.drop",
-                                                      "db.idx.fulltext.dropIndex"):
-                                        try:
-                                            self.g.query(
-                                                f"CALL {drop_proc}('Event')"
-                                            )
-                                            dropped = True
-                                            break
-                                        except Exception:
-                                            continue
-                                    self._create_fulltext_index(
-                                        "Event", ["subject", "name"]
-                                    )
-                                    created = True
+                                    # #5440: the marker is ALSO absent on a
+                                    # graph whose index is ALREADY
+                                    # (subject, name) — a freshly built one
+                                    # mints only the Point marker, and a
+                                    # restore/DR graph carries no indexes.
+                                    # Dropping there is a destructive no-op
+                                    # against a healthy, in-use index, so
+                                    # only a genuinely legacy (subject-only)
+                                    # index is dropped; an already-current one
+                                    # just records the migration. The
+                                    # recreate is what makes a drop
+                                    # necessary at all — you cannot widen a
+                                    # FULLTEXT index in place.
+                                    if self._event_fts_index_is_current():
+                                        # The intended index is in place, so
+                                        # a later failure is only the marker.
+                                        created = True
+                                    else:
+                                        # #H05: the drop procedure NAME
+                                        # varies by engine
+                                        # (db.idx.fulltext.drop on server
+                                        # builds, dropIndex on older ones) --
+                                        # the single hardcoded name could
+                                        # never migrate on a build
+                                        # registering only the other.
+                                        for drop_proc in (
+                                            "db.idx.fulltext.drop",
+                                            "db.idx.fulltext.dropIndex",
+                                        ):
+                                            try:
+                                                self.g.query(
+                                                    f"CALL {drop_proc}('Event')"
+                                                )
+                                                dropped = True
+                                                break
+                                            except Exception:
+                                                continue
+                                        self._create_fulltext_index(
+                                            "Event", list(self._EVENT_FTS_TARGET_FIELDS)
+                                        )
+                                        created = True
                                     self.g.query(
                                         "MERGE (m:Meta {key:'event_fts_v2'}) SET m.v = true"
                                     )

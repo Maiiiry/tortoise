@@ -3365,6 +3365,22 @@ def _sanitize_props(props: dict, *, reject_id: bool = False,
             "'_stub' is a server-managed event-stub discriminator and cannot "
             "be set via props."
         )
+    # Lane L5 (#5097 review P1): the SIBLING discriminator, and the same class
+    # of hole. `_stub_completion` is what `_upsert_source` reads to suppress the
+    # ON CREATE creator-only defaults (`id`/`version`/`externalId`) and to admit
+    # `_SOURCE_CAPTURE_REPLAY_PROPS` to the `:Source` passthrough. A caller that
+    # can set it can therefore forge the capture writer's provenance
+    # (`sessionId`/`capturedAt`/`eventId`) AND strip a node's identity props —
+    # and the key rides the journal, so a rebuild restores the forgery.
+    # `create_source` refuses it in its own `**props` guard (it bypasses this
+    # intake); this is the fail-closed backstop for every other props surface
+    # (`create_point`/`create_entity`/`update_*`). Hard-reject, never strip,
+    # matching `_stub` above: there is no legitimate caller intent.
+    if "_stub_completion" in props:
+        raise ValueError(
+            "'_stub_completion' is a server-managed capture-completion "
+            "discriminator and cannot be set via props."
+        )
     # #7951 (review round 5): `credibility` is NOT a generic prop — it is the
     # author's declared WORD, a documented input of `create_point` /
     # `mitigate_operator`, which validate it and run the authored-assertion
@@ -9842,6 +9858,22 @@ class TortoiseSDK:
             "s.sourceKind=$sk",
             "s.sessionId=$sid",
             "s.capturedAt=$cap",
+            # Lane L5 (#5097): the update instant, GATED EXACTLY AS THE FOLD GATES
+            # IT — and placed BEFORE `s.contentHash` so the CASE can only ever
+            # read the PRE-write hash (`_upsert_source` relies on the same
+            # property for `version`, pinned at `version == 2`).
+            #
+            # A plain `coalesce` here kept the FIRST stamp forever while the
+            # record below always carries THIS call's instant, and
+            # `_upsert_source`'s ON MATCH writes `coalesce($updatedAt, $now)` on
+            # its hash-diff arm. So a second materialization whose transcript (and
+            # therefore hash) CHANGED left live on t1 and a replay on t2 — the
+            # divergence the previous comment claimed away (review P2). The two
+            # halves now move together: same-hash re-capture keeps the first
+            # stamp on both sides, a stub completion / hash change moves both.
+            "s.updatedAt=CASE WHEN s.contentHash IS NULL "
+            "OR s.contentHash <> $ch THEN $now "
+            "ELSE coalesce(s.updatedAt, $now) END",
             "s.contentHash=$ch",
             "s.summary=$sum",
             "s.topics=$topics",
@@ -9852,13 +9884,97 @@ class TortoiseSDK:
             set_clauses.append("s.eventId=$eid")
             params["eid"] = event_id
         proj = self._get_proj()
-        proj.g.query(
-            "MERGE (s:Source {url:$url}) SET " + ", ".join(set_clauses),
+        # `RETURN s.validFrom, s.is_episodic` — the TWO properties this writer
+        # must NOT move but must not DESTROY on replay either (see the carrier
+        # note below). Read back from the node the write just completed, in the
+        # same statement, so the values are the ones it holds.
+        _rows = proj.g.query(
+            "MERGE (s:Source {url:$url}) SET " + ", ".join(set_clauses)
+            + " RETURN s.validFrom, s.is_episodic",
             params=params,
-        )
+        ).result_set
+        prior_valid_from = _rows[0][0] if _rows else None
+        prior_is_episodic = _rows[0][1] if _rows else None
         if event_id:
             # Anchored ON CREATE by the shared derivation writer (#5199).
             proj.link_source_to_event(url, event_id)
+        # ⛔ THE RAW MERGE ABOVE NEEDS A JOURNAL CARRIER (lane L5 #5097, gate
+        # item 2). It is a raw graph SET on the capture path, and the rule for
+        # those is ALREADY recorded on this lane (`_write_capture_turns`'s
+        # `capture_redactions` note a few hundred lines up): a raw SET with no
+        # trailing record makes live and replay diverge, so a rebuild silently
+        # reverts what the write stored. Measured before this record existed
+        # (`capture_session` -> `rebuild()`): the session `:Source` came back
+        # with `summary`, `topics`, `sessionId`, `capturedAt`, `eventId`,
+        # `contentHash` and `_searchText` all GONE — every one of them derived
+        # from the #4911-redacted transcript, i.e. the lane's own sink losing
+        # its own output on the disaster-recovery path.
+        #
+        # `SourceCreated` is the carrier, not a new record type: the graph fold
+        # already replays it through `_upsert_source`, the existing producer
+        # (`create_source`) emits it for exactly this "same hash but new
+        # summary/topics" case (`_source_payload_is_noop`'s non-noop arm), and
+        # #5024 built its emission so the extras survive a rebuild. Emitting it
+        # here — rather than hand-rolling a shape — keeps ONE carrier for a
+        # `:Source` write.
+        #
+        # The payload carries THE VALUES THE WRITE STORED, never the caller's
+        # raw input (the `_journal_entity_mutation` `state` rule, and here it
+        # is also the #4911 rule: the redacted metadata is what must replay).
+        #
+        #   * `title=None` — this writer never sets one. The ON MATCH arm's
+        #     `coalesce($title, s.title)` then keeps whatever the node holds, and
+        #     the ON CREATE arm's `coalesce($title, $url)` reproduces the stub's
+        #     `title=url` instead of erasing it.
+        #   * `_stub_completion=True` — THIS RECORD COMPLETES A STUB, IT DOES NOT
+        #     CREATE A SOURCE (`_upsert_source` reads it as `$stub_completion`).
+        #     It suppresses the ON CREATE arm's three CREATOR-ONLY defaults, which
+        #     the live node never has (the M2 `_link_source` stub created it):
+        #     `id`, `version=1` and `externalId=''`. Without it a `rebuild_all` —
+        #     which folds `SourceCreated` in pass 1b, BEFORE pass 2 mints the stub
+        #     — recovered a session `:Source` carrying a version ordinal this
+        #     writer does not advance (review P1).
+        #   * it also admits this record's own prop spellings
+        #     (`_SOURCE_CAPTURE_REPLAY_PROPS`) to the passthrough WITHOUT widening
+        #     the caller surface a `create_source(**props)` call rides.
+        #   * `validFrom` and `is_episodic` are carried from the NODE
+        #     (`RETURN`ed above), because this writer must neither move nor erase
+        #     them: `_upsert_source`'s hash-diff arm writes `s.validFrom = $vf`,
+        #     and `$vf = null` REMOVES the property — so omitting the key cleared a
+        #     window a prior `create_source` (or the stub's `is_episodic`, the
+        #     #1486 discriminator) had established, i.e. a replay regression on a
+        #     RECORDED field (review P2). Carrying the node's own value makes the
+        #     fold's write a no-op on both arms.
+        #   * `updatedAt` carries the instant the write stamped, so the fold's
+        #     stub-completion arm reproduces it instead of the replay clock.
+        #
+        # ⚠️ `ingestedAt` is emitted too, but it is a KNOWN RESIDUAL and is not
+        # claimed as faithful: the stub this write completes is created by the
+        # M2 `_link_source` projection write, whose `ingestedAt` is minted from
+        # the clock at ITS write, and `_upsert_source`'s ON MATCH arm has no
+        # `ingestedAt` clause at all (only ON CREATE reads the recorded value).
+        # So a rebuilt session Source keeps a replay-clock ingest stamp. That
+        # is the same unjournaled-writer class one writer upstream, not
+        # something this record can fix; the recorded value is emitted anyway so
+        # the ON CREATE path (no stub) is faithful.
+        self._emit_event(
+            "SourceCreated", id=url,
+            url=url,
+            sourceKind="agentSession",
+            contentHash=content_hash,
+            title=None,
+            ingestedAt=now,
+            updatedAt=now,
+            validFrom=prior_valid_from,
+            is_episodic=prior_is_episodic,
+            _stub_completion=True,
+            **{SOURCE_SEARCH_TEXT_FIELD: search_text},
+            sessionId=session_id,
+            capturedAt=now,
+            summary=summary,
+            topics=topics,
+            **(({"eventId": event_id}) if event_id else {}),
+        )
 
     # ── Update / Delete consolidation (epic #888 W2, PR #912) ─────────
     # One update()/delete() for Points AND entities. The legacy methods
@@ -13908,7 +14024,9 @@ class TortoiseSDK:
         rejection on IMPL/NAND; multi-target rejection on plain IMPL/NAND
         (cycle-7); §8 field validity (direction/confidence/weight/mitigation)
         + route-scoped attribute rejection (cycle-13: relation carries
-        direction/confidence/weight; operator route carries confidence/weight).
+        direction/confidence/weight — plus ``mitigation`` since #5244, because
+        a structural edge has no operator bridge to damp; operator route
+        carries confidence/weight).
         """
         if not isinstance(conn, dict):
             return  # dict-ness already reported by check 1
@@ -14080,6 +14198,24 @@ class TortoiseSDK:
                                    f"edges) — it belongs on plain IMPL/NAND "
                                    f"direct edges",
                     })
+            # #5244: `mitigation` is an OPERATOR-route attribute (§2.1 — a
+            # mitigation damps the operator bridge it attacks, #4937). A
+            # structural edge has no operator to damp, so accepting the key
+            # here would be the same accept-and-drop defect the operator route
+            # carried: the value validated, the write succeeded, nothing
+            # stored. Refuse it and name the route that does honor it.
+            if "mitigation" in conn:
+                violations.append({
+                    "section": "connections", "index": index,
+                    "message": f"ingest: connections[{index}] mitigation is "
+                               f"not allowed on relation connections "
+                               f"(structural edges) — a mitigation damps an "
+                               f"operator bridge (ontology §3.9); express the "
+                               f"connection as `operator` + `mitigation`, or "
+                               f"create it and call sdk.mitigate_operator("
+                               f"id=<operator id>, reason=..., "
+                               f"strength=0.10..0.50)",
+                })
 
     def _fetch_endpoint_info(self, values: set[str]) -> dict[str, dict]:
         """ONE batched query resolving external endpoint existence, label
@@ -15063,6 +15199,16 @@ class TortoiseSDK:
           mints a new Event occurrence (new id) and thus a new operator; dedup
           applies to id-stable external Event endpoints (or re-ingesting
           connection-only against the resolved id).
+        - ``mitigation: {reason, strength}`` on an operator connection is
+          APPLIED, not just an anchor (#5244): after the operator is created /
+          deduped / absorbed, the mitigation is written through
+          :meth:`mitigate_operator` — a mitigation Point plus the
+          ``(op)-[:mitigated_by]->(m)`` edge, stamped with the bundle's
+          batch_id. Re-submission updates it IN PLACE (never a duplicate) and
+          warns ``mitigation_strength_change`` when the reason/strength
+          actually changed (INGEST_CONTRACT §3.2 key 6). On a ``relation``
+          connection a mitigation is a Phase-1 violation: a structural edge
+          has no operator bridge to damp.
         - granularity='bulk' (default): whole bundle in one coherent pass,
           returns aggregated {created, ids, nudges}. granularity='granular':
           additionally returns per-item ``results`` for agent step-by-step
@@ -15641,6 +15787,22 @@ class TortoiseSDK:
                 # (g)): a retry's _find_operator dedup hit on a batch-less
                 # operator Point acquires the bundle's batch_id.
                 self._stamp_batch_id(oid, batch_id)
+                # #5244: APPLY the connection's `mitigation` to the operator
+                # this connection resolved to — created, deduped OR absorbed.
+                # Until this call existed the field was read for ROUTING
+                # (`_connection_route`), accepted and validated by
+                # `_check_connection`, and then dropped: the caller got a real
+                # operator, a success status, no mitigation Point, no
+                # `(op:Point {is_operator:true})-[:mitigated_by]->(m:Point)`
+                # edge and no warning. Applied AFTER the operator write (the
+                # target id is only known here) and on EVERY submission, so a
+                # re-submission re-applies too — `mitigate_operator` is
+                # idempotent: it UPDATES the existing mitigation in place,
+                # never duplicates (INGEST_CONTRACT §3.2 key 6). The helper
+                # stamps the mitigation Point with this bundle's batch_id.
+                mitigation = conn.get("mitigation")
+                if isinstance(mitigation, dict):
+                    self._apply_ingest_mitigation(oid, mitigation, batch_id)
                 ids["connections"].append(oid)
             else:
                 rel = conn["relation"]
@@ -16316,6 +16478,64 @@ class TortoiseSDK:
             return {"kind": "decline",
                     "candidates": [r[0] for r in prows]}
         return None
+
+    def _apply_ingest_mitigation(self, operator_id: str, mitigation: dict,
+                                 batch_id: str) -> str:
+        """Apply an ingest connection's `mitigation` to its operator (#5244).
+
+        Phase 1 validates the shape (``_check_connection``: non-empty string
+        ``reason``, numeric ``strength`` in [0, 1]) and Phase 2 must therefore
+        HONOR it — a validated field that is not persisted is the one failure
+        mode a caller cannot detect. The write goes through
+        :meth:`mitigate_operator`, the single sanctioned mitigation writer
+        (ontology §3.9: ``mitigated_by`` can only originate from an
+        ``is_operator:true`` Point — a mitigation damps the operator bridge it
+        attacks, #4937), so the ingest path cannot drift from the direct-call
+        path.
+
+        Re-submission semantics (INGEST_CONTRACT §3.2 key 6):
+        ``mitigate_operator`` is idempotent — it updates the existing
+        mitigation's reason/strength IN PLACE (never a second Point) — and the
+        documented ``mitigation_strength_change`` warning is emitted when that
+        update actually changed something. An unchanged re-submission is
+        silent, as are incident retries (the crash-retry contract, §7).
+
+        The mitigation Point is stamped with the bundle's ``batch_id`` (§16:
+        "every **new** Point the bundle creates — plain points, operator
+        Points, mitigation Points"), carrying the two record fields
+        ``_stamp_batch_id`` reserves for exactly this write, so a
+        ``list_batch`` audit of the bundle includes the dampener the response
+        claimed to commit.
+
+        Returns the mitigation Point id.
+        """
+        reason = mitigation["reason"]
+        strength = mitigation["strength"]
+        # Read the mitigation this operator already carries BEFORE the write,
+        # so the in-place update is observable (§3.2 key 6). One query, only on
+        # a connection that declared a mitigation.
+        prior = self._get_proj().g.query(
+            "MATCH (op:Point {id:$oid})-[:mitigated_by]->(m:Point) "
+            "RETURN m.id, m.content, m.mitigation_strength",
+            params={"oid": operator_id},
+        ).result_set
+        mid = self.mitigate_operator(
+            operator_id, reason=reason, strength=strength)["id"]
+        if prior:
+            _old_id, _old_content, _old_strength = prior[0]
+            _old_reason = (_old_content or "").removeprefix("[MITIGATION] ")
+            try:
+                _same_strength = (_old_strength is not None
+                                  and float(_old_strength) == float(strength))
+            except (TypeError, ValueError):  # unrepresentable legacy value
+                _same_strength = False
+            if _old_reason != reason or not _same_strength:
+                self._append_warning(
+                    f"mitigation_strength_change:{operator_id}:{mid}:"
+                    f"{_old_strength}->{strength}")
+        self._stamp_batch_id(mid, batch_id, mitigates_operator_id=operator_id,
+                             mitigation_strength=strength)
+        return mid
 
     def _append_warning(self, entry: str) -> None:
         """Append to the current ingest's warnings accumulator (A3 cycle-23
@@ -29966,6 +30186,31 @@ class TortoiseSDK:
                     f"props — the merge-run token is minted by the server "
                     f"(#5196)."
                 )
+        # Lane L5 (#5097 review P1): `_stub_completion` is the CAPTURE-
+        # COMPLETION DISCRIMINATOR. `_upsert_source` reads it as a PARAMETER
+        # (`$stub_completion`) and it SELECTS WRITE BEHAVIOUR twice: it
+        # suppresses the ON CREATE arm's creator-only defaults
+        # (`id`/`version`/`externalId`) and it widens the passthrough to
+        # `_SOURCE_CAPTURE_REPLAY_PROPS`. Because this method builds `ev` as
+        # `{..., **props}` and `_skip_sanitize=True`s the projection, an
+        # unlisted key rode straight through — measured on the review head:
+        # `create_source("session:x", "agentSession",
+        # _stub_completion=True, sessionId="forged", capturedAt="…",
+        # eventId="forged")` (a) PERSISTED all three provenance props the
+        # record's own comment says are denied here (#3998), (b) created the
+        # tenant's node with NO `id`/`version`/`externalId` — defeating this
+        # method's own `id` reject — and (c) JOURNALLED the forged key + props,
+        # so every rebuild restored the forgery. Same class as `_stub`
+        # (#7936), `__runId` (#5196) and `contains_session` (#3947): a payload
+        # key that decides replay behaviour is server-managed, not a prop. The
+        # ONE producer is `_materialize_session_source`'s own `_emit_event`
+        # call, which never re-enters this method.
+        if "_stub_completion" in props:
+            raise ValueError(
+                "'_stub_completion' is a server-managed capture-completion "
+                "discriminator and cannot be set via props — it is set only "
+                "by the session-capture writer (#5097)."
+            )
         # #3998 (D30): the LOUD half of the payload guard. The guarantee itself
         # is the CLOSED :Source property surface in `projection/entities.py`
         # (`_SOURCE_EXTRA_PROPS`), which is the only form that can hold — a
