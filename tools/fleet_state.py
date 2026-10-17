@@ -1336,15 +1336,20 @@ def build_state(
     for label, ws, issue_label in registry:
         if row_binds_evidence(ws):
             bound_rows_by_label[label] = bound_rows_by_label.get(label, 0) + 1
-        # `issue_label` reaches the emitted record as `lane_label` (:1576), so it must
-        # survive the row that happened to carry it (review of #8849, P3).
-        if issue_label and not issue_label_by_label.get(label):
+        # `issue_label` is the ONLY column two rows identical under
+        # (label, workspace) can differ in, so it is the one place "last-wins" is
+        # observable. The LAST non-empty value wins: a registrar that appends a
+        # corrected line leaves the correction at the END, and first-wins would
+        # publish the stale label and then tell the human to delete the row that
+        # carries the corrected one (review of #8849, cycle 3).
+        if issue_label:
             issue_label_by_label[label] = issue_label
 
     kept: list[tuple[str, str, str]] = []
     stale_rows: list[dict[str, str]] = []
     unbound_kept: set[str] = set()
     seen_rows: set[tuple[str, str]] = set()
+    kept_keys: set[tuple[str, str]] = set()
     for label, ws, issue_label in registry:
         evidence = row_binds_evidence(ws)
         # (0) THE SAME (label, workspace) TWICE IS ONE LANE WRITTEN TWICE — a
@@ -1361,6 +1366,12 @@ def build_state(
             stale_rows.append({
                 "lane": label, "workspace": ws, "issue_label": issue_label,
                 "arm": "duplicate",
+                # ⛔ THE TWIN MAY ALREADY HAVE BEEN DROPPED by arm (a) — `seen_rows`
+                # is populated before the arm decision, so a ghost row and its
+                # literal copy can take DIFFERENT arms. The sentence therefore must
+                # not assert "one lane record remains" unless one actually does
+                # (review of #8849, cycle 3).
+                "twin_kept": (label, ws.upper()) in kept_keys,
                 "why": "it repeats this label's row for the same workspace",
             })
             continue
@@ -1395,10 +1406,11 @@ def build_state(
                 continue
             unbound_kept.add(label)
         kept.append((label, ws, issue_label))
+        kept_keys.add((label, ws.upper()))
     # A dropped row may be the only one carrying the label's `lane:` label; the
     # surviving row inherits it rather than losing it.
     kept = [
-        (label, ws, issue_label or issue_label_by_label.get(label, ""))
+        (label, ws, issue_label_by_label.get(label) or issue_label)
         for label, ws, issue_label in kept
     ]
 
@@ -1701,14 +1713,26 @@ def build_state(
         # roster line because its workspace was dead while the board showed it alive
         # (review of #8849).
         if arm == "duplicate":
-            reason = (
-                f"registry row for '{row['lane']}' repeats {ws_gone} verbatim — the "
-                "same (label, workspace) written twice is ONE lane, not two; the "
-                "duplicate is not a second lane record and NO verdict changes (one "
-                "lane record remains). This is a de-duplication, not a retirement: "
-                "it holds even when the cmux list could not be read, because both "
-                "rows name one workspace. Delete the duplicate roster line"
-            )
+            if row.get("twin_kept"):
+                reason = (
+                    f"registry row for '{row['lane']}' repeats {ws_gone} verbatim — "
+                    "the same (label, workspace) written twice is ONE lane, not two; "
+                    "the duplicate is not a second lane record and NO verdict "
+                    "changes (one lane record remains). This is a de-duplication, "
+                    "not a retirement: it holds even when the cmux list could not "
+                    "be read, because both rows name one workspace. Delete the "
+                    "duplicate roster line"
+                )
+            else:
+                # The twin was dropped by another arm, so this drop is NOT a plain
+                # de-duplication — say so, and do not claim a record survives.
+                reason = (
+                    f"registry row for '{row['lane']}' repeats {ws_gone} verbatim, "
+                    "and the copy of this row was ALREADY dropped above for its "
+                    "own reason — read that entry, which is the one that explains "
+                    "why this workspace is no longer a lane record. Delete the "
+                    "duplicate roster line"
+                )
         elif arm == "second-unbound":
             reason = (
                 f"registry row for '{row['lane']}' names {ws_gone}, which is NOT in "

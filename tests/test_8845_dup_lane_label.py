@@ -25,9 +25,27 @@ Each fact below fails under a NAMED mutation:
 4. A label whose ONLY row is a gone-workspace row is NOT dropped: #7738 publishes
    exactly that lane as RETIRED/RECOVERABLE, and erasing it would lose the lane.
    Mutation: drop every unbound row unconditionally -> red.
-5. An UNREADABLE cmux list drops nothing (fail open, #7738's posture): a failed read
-   says nothing about whether the workspace still exists.
-   Mutation: ignore ``workspaces_measured`` -> red.
+5. An UNREADABLE cmux list drops nothing that depends on the MEASURED list (fail
+   open, #7738's posture): a failed read says nothing about whether the workspace
+   still exists. Mutation: ignore ``workspaces_measured`` -> red.
+   ⚠️ Scoped to the measured-list arms. A row that literally REPEATS an
+   already-handled (label, workspace) is dropped regardless of whether the list was
+   read, because both rows name one workspace and no verdict moves — that is
+   de-duplication, not retirement (fact 6).
+6. The SAME (label, workspace) twice is ONE lane, not two: a registrar that appends
+   instead of replacing used to make one label enumerate two lane records, which the
+   claim gate reads as HOLDER_UNMEASURED -> exit 2 on a readable lane. The duplicate
+   is reported as a ``registry-stale`` orphan, and two rows for DIFFERENT workspaces
+   still produce two records (that refusal is the point).
+   Mutation: remove the dedupe -> red.
+7. Every orphan reason is built PER ARM: a duplicate's workspace is LIVE, so the
+   "NOT in the live cmux list / binds NO evidence" sentence is false for it, and it
+   must never be printed from a list that was never read.
+   Mutation: collapse the arms back to one template -> red.
+8. Dropping a ghost row does not lose a label-keyed OVERRIDE: ``resolve_sessions``
+   applies ``override_sid_by_label`` over the rows that SURVIVE, so the surviving row
+   inherits it. Pinned rather than asserted (see
+   ``test_the_override_still_reaches_the_row_that_survives``).
 """
 
 from __future__ import annotations
@@ -248,6 +266,24 @@ def test_the_duplicate_rows_reason_does_not_claim_its_workspace_is_gone(monkeypa
     assert "duplicate" in reason.lower(), reason
 
 
+def test_the_last_duplicate_rows_issue_label_wins(monkeypatch) -> None:
+    """Two rows identical under (label, workspace) can still differ in `lane:`.
+
+    That is the ONLY column they can differ in, and it is where a registrar that
+    APPENDS a corrected line puts the correction — at the end. First-wins published
+    the stale label and then told the human to delete the row carrying the
+    corrected one (review of #8849, cycle 3).
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_LIVE, "lane:old"), (LABEL, WS_LIVE, "lane:new")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+    )
+    (lane,) = st["lanes"]
+    assert lane["claim"]["lane_label"] == "lane:new"
+
+
 def test_the_duplicate_reason_does_not_cite_a_list_that_was_never_read(monkeypatch) -> None:
     """...and it must not cite the live list at all when the list was unreadable.
 
@@ -265,6 +301,33 @@ def test_the_duplicate_reason_does_not_cite_a_list_that_was_never_read(monkeypat
     assert st["summary"]["stale_registry"] == 1
     (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
     assert "NOT in the live cmux list" not in orphan["reason"], orphan["reason"]
+
+
+def test_a_duplicate_whose_twin_was_already_dropped_does_not_claim_a_record_remains(
+    monkeypatch,
+) -> None:
+    """`seen_rows` is filled BEFORE the arm decision, so the twin can take another arm.
+
+    Two identical ghost rows plus a live row: the FIRST ghost is dropped by the
+    evidence arm (and its sentence correctly says its workspace is gone), then the
+    SECOND is dropped as a duplicate whose twin is no longer in `lanes`. The plain
+    duplicate sentence — "no verdict changes (one lane record remains)" — would be
+    FALSE there, and two contradicting orphans would be printed about one workspace
+    id (review of #8849, cycle 3).
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_STALE, ""), (LABEL, WS_STALE, ""), (LABEL, WS_LIVE, "")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+    )
+    assert [lane["identity"]["workspace"] for lane in st["lanes"]] == [WS_LIVE]
+    stale = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    assert len(stale) == 2, stale
+    dup = [o for o in stale if "repeats" in o["reason"]]
+    assert len(dup) == 1, [o["reason"] for o in stale]
+    assert "NO verdict changes" not in dup[0]["reason"], dup[0]["reason"]
+    assert "ALREADY dropped" in dup[0]["reason"], dup[0]["reason"]
 
 
 def test_the_override_still_reaches_the_row_that_survives(monkeypatch, tmp_path) -> None:
@@ -493,6 +556,14 @@ def test_a_lone_ghost_row_is_kept_even_with_a_dangling_override(monkeypatch) -> 
     )
     assert [lane["identity"]["lane"] for lane in st["lanes"]] == [LABEL]
     assert st["summary"]["stale_registry"] == 0
+    # ⛔ Pin what only THIS fixture can show. The row is kept by the lone-row rule
+    # either way, so "kept" proves nothing about the override (review of #8849,
+    # cycle 3). What the override DOES do here is fail to bind: no session file
+    # exists for it, so resolution must stay UNKNOWN and SAY it is dangling rather
+    # than silently reporting an unbound lane.
+    session = st["lanes"][0]["session"]
+    assert session["source"] == fs.SOURCE_UNKNOWN, session
+    assert "dangling" in (session.get("evidence") or "").lower(), session
 
 
 # ---------------------------------------------------------------------------

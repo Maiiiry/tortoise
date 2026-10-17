@@ -5682,16 +5682,16 @@ durations:
   test_4932_per_pr_artifact_scope.py: 5.0
   # #8849: unmeasured at PR time — a file ADDED by this PR cannot appear in a
   # junit artifact, so it has no swept duration (the #4348/#2876/#5275 trap).
-  # 6.8 is the local wall reading on this host (14 tests, 6.80s on a private
-  # test lane, at the time this row was added — the file has since grown to 16
-  # tests as part of this PR's review fixes, so refresh the value with the
-  # sweep rather than assuming it). NOT a junit `testcase/@time` sum. Marked
-  # rather than presented as swept, because the map's provenance for every other
-  # row is the sweep.
+  # 6.8 is the local wall reading on this host when the row was added, on a private
+  # test lane. The test count is deliberately NOT stated: a hand-written count here
+  # goes stale the moment a test is added, which is the failure this file exists to
+  # catch. Refresh the value from a sweep rather than trusting 6.8. NOT a junit
+  # `testcase/@time` sum, and marked rather than presented as swept, because the
+  # map's provenance for every other row is the sweep.
   # Refresh from the first post-merge run that includes it. Do NOT drop the row
   # without re-deriving the coverage floor at that head: the floor is a RATIO, so
   # removing it moves 800/888 = 90.09% (pass) back to 799/888 = 89.98% (fail).
-  test_8845_dup_lane_label.py: 6.8  # unmeasured — local wall reading (14 tests at add time), not a junit sweep; refresh from the next sweep
+  test_8845_dup_lane_label.py: 6.8  # unmeasured — local wall reading on a private test lane, not a junit sweep; refresh from the next sweep
   # #8849: unmeasured — no leg of the four source sweeps collected this file, so
   # it was packing at the flat 2.0s default. 4.9 is the local wall reading on
   # this host (5 tests, 4.91s), the same carry-forward shape as #4602/#5275.
