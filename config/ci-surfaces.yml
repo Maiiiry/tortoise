@@ -5680,6 +5680,8 @@ durations:
 #   gate — and before #3992 the lane the plan named did not exist at all, so
 #   the SLO was unverifiable. It runs from .github/workflows/perf-lane.yml.
   test_4932_per_pr_artifact_scope.py: 5.0
+  test_8845_dup_lane_label.py: 6.8
+  test_1890_invite_ghost_sweep_schedule.py: 4.9
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py
