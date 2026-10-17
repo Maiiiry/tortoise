@@ -1728,9 +1728,14 @@ def build_state(
     # lane:b]` publishes `lane:b` while the middle row's orphan said `lane:a` "is what
     # the board publishes" (review of #8849, cycle 8). `kept` is already the
     # post-rebuild list here, so this map IS the answer, for any number of copies.
-    published_by_label: dict[str, str] = {
-        lbl: ilbl for lbl, _ws, ilbl in kept
+    published_by_ws: dict[tuple[str, str], str] = {
+        (lbl, ws.upper()): ilbl for lbl, ws, ilbl in kept
     }
+    # Labels where a SURVIVING row owns a `lane:` value of its own. Inheritance is
+    # OWN-WINS, so a dropped row's value is irrelevant to such a label — warning
+    # about a revert there would tell the human to keep a row the board has already
+    # classified as not a lane record.
+    labels_with_own_label: set[str] = {lbl for lbl, _ws, ilbl in kept if ilbl}
     for row in stale_rows:
         ws_gone = f"workspace {row['workspace'][:8]}…" if row["workspace"] else "its workspace"
         arm = row.get("arm")
@@ -1743,7 +1748,9 @@ def build_state(
         # (review of #8849).
         if arm == "duplicate":
             _carries = row.get("carries") or ""
-            _published = published_by_label.get(row["lane"], "")
+            _published = published_by_ws.get(
+                (row["lane"], (row.get("workspace") or "").upper()), ""
+            )
             if row.get("twin_kept"):
                 # ⛔ BRANCH ON THE FINAL PUBLISHED VALUE, not on the reported row's
                 # value alone (which said "Neither line carries a `lane:` value"
@@ -1796,7 +1803,7 @@ def build_state(
                 # means this row's value is irrelevant and moving it over would
                 # CHANGE the published label — the opposite of the warning's advice
                 # (review of #8849, cycle 8).
-                if _carries and _published == _carries:
+                if _carries and row["lane"] not in labels_with_own_label:
                     reason = (
                         f"registry row for '{row['lane']}' repeats {ws_gone}, "
                         "and the copy of this row was ALREADY dropped above for its "

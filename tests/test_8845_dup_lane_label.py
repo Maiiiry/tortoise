@@ -315,6 +315,39 @@ def test_an_empty_duplicate_is_not_told_neither_line_carries_the_label(monkeypat
     assert "lane:new" in orphan["reason"], orphan["reason"]
 
 
+def test_the_advice_names_this_workspaces_value_when_a_label_has_two_kept_rows(
+    monkeypatch,
+) -> None:
+    """A label can own TWO kept rows (two BOUND workspaces) — pinned elsewhere — and
+    the board publishes a PER-ROW `claim.lane_label`.
+
+    A label-keyed map silently keeps the last kept row, so the advice for an earlier
+    row named a DIFFERENT workspace's value and told the human to delete the line
+    carrying the published one — reverting it on delete (review of #8849, cycle 9).
+    """
+    st = _build(
+        monkeypatch,
+        registry=[
+            (LABEL, WS_LIVE, "lane:a"),
+            (LABEL, WS_LIVE_2, "lane:b"),
+            (LABEL, WS_LIVE, "lane:a2"),
+        ],
+        live={WS_LIVE: {"cwd": WT_1}, WS_LIVE_2: {"cwd": WT_2}},
+        worktrees={
+            WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD},
+            WT_2: {"branch": "refs/heads/fix/8818-sweep", "head": HEAD},
+        },
+    )
+    by_ws = {lane["identity"]["workspace"]: lane for lane in st["lanes"]}
+    assert sorted(by_ws) == sorted([WS_LIVE, WS_LIVE_2])
+    assert by_ws[WS_LIVE]["claim"]["lane_label"] == "lane:a2"
+    assert by_ws[WS_LIVE_2]["claim"]["lane_label"] == "lane:b"
+    (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    reason = orphan["reason"]
+    assert "lane:a2" in reason, reason
+    assert "lane:b" not in reason, reason
+
+
 def test_a_dropped_rows_lane_label_does_not_overwrite_the_survivors(monkeypatch) -> None:
     """The survivor's OWN `lane:` value always wins over one inherited from a drop.
 
