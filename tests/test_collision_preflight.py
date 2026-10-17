@@ -118,15 +118,35 @@ if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
   # crash on it survived a review cycle: the only other failures here are
   # transport failures, which never reach the validation.
   if [ "${GH_STUB_ISSUE_REST_MALFORMED:-0}" = "1" ]; then
-    printf '{"number": 1}\n'
+    printf '{"number": %s}\n' "${2##*/}"
     exit 0
   fi
-  # #3435 review (minor): REST says 404 while the GraphQL read was rate-limited.
+  # #3435 review (P2): REST says 404 while the GraphQL read was rate-limited.
   # A REST-only absence seam, because GH_STUB_ISSUE_ABSENT fails the `issue view`
   # call FIRST (so the fallback is never taken) and would pin the wrong path.
   if [ "${GH_STUB_ISSUE_REST_ABSENT:-0}" = "1" ]; then
     echo "gh-stub: HTTP 404: Not Found (https://api.github.com/repos/x/y/issues/1)" >&2
     exit 1
+  fi
+  # #3435 review (P2): `subprocess.run(text=True)` decodes STRICTLY, so one bad
+  # byte used to raise UnicodeDecodeError — not a SurfaceError — and escaped as a
+  # traceback with no VERDICT line and exit 1 (COLLISION).
+  if [ "${GH_STUB_ISSUE_REST_INVALID_UTF8:-0}" = "1" ]; then
+    printf '\xff\xfe{"number": %s}\n' "${2##*/}"
+    exit 0
+  fi
+  # #3435 review (P2): `/issues/<N>` is the ISSUE-OR-PULL-REQUEST endpoint, and a
+  # PR object carries every key the normaliser reads — so without a guard it was
+  # read as an issue (measured: VERDICT CLEAN, i.e. the fail-open direction).
+  if [ "${GH_STUB_ISSUE_REST_PULL_REQUEST:-0}" = "1" ]; then
+    printf '{"number": %s, "title": "feat: a PR", "state": "open", "state_reason": null, "assignees": [], "html_url": "https://github.com/x/y/pull/%s", "pull_request": {"url": "https://api.github.com/repos/x/y/pulls/%s"}}\n' "${2##*/}" "${2##*/}" "${2##*/}"
+    exit 0
+  fi
+  # #3435 review (P2): a body about a DIFFERENT issue must not be read as this
+  # one's state/assignees (an `OPEN` with no assignees reads free).
+  if [ "${GH_STUB_ISSUE_REST_WRONG_NUMBER:-0}" = "1" ]; then
+    printf '{"number": %s, "title": "some other issue", "state": "open", "state_reason": null, "assignees": [], "html_url": "https://github.com/x/y/issues/%s"}\n' "$(( ${2##*/} + 1 ))" "$(( ${2##*/} + 1 ))"
+    exit 0
   fi
   if [ "${GH_STUB_ISSUE_ABSENT:-0}" = "1" ]; then
     echo "gh-stub: HTTP 404: Not Found" >&2
@@ -148,6 +168,14 @@ case "$1 $2" in
     # GraphQL path, fail loudly exactly as production does.
     if [ "${state:-open}" = "closed" ] && [ "${GH_STUB_CLOSED_PR_LIST_FAILS:-1}" != "0" ]; then
       echo "gh-stub: read tcp 127.0.0.1:1->20.26.156.210:443: read: connection reset by peer" >&2
+      exit 1
+    fi
+    # #3435 review (P2): GitHub's PRIMARY GraphQL budget is ONE shared bucket, so
+    # a genuine exhaustion kills `pr list` too. Without this seam the CLEAN test
+    # models a state production cannot reach and overstates what the fallback
+    # delivers (the OPEN-PR surface stays GraphQL-only by design).
+    if [ "${state:-open}" = "open" ] && [ "${GH_STUB_PR_LIST_RATE_LIMITED:-0}" = "1" ]; then
+      echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
       exit 1
     fi
     # The target repo is sent EXPLICITLY (#4027): record it so a test can
@@ -2355,12 +2383,18 @@ class CollisionPreflightTest(unittest.TestCase):
 
     def test_graphql_exhaustion_falls_back_to_rest_instead_of_incomplete(self):
         # ⛔ THE INSTRUMENT HOLDING THE DATUM AND NOT READING IT (#3435).
-        # `gh issue view` is GraphQL-only. When that bucket empties, the tool
+        # `gh issue view` is GraphQL-only. When THAT CALL is refused, the tool
         # used to report the issue surface INCOMPLETE — and because the landed
-        # surface reads the issue's `state`, it went INCOMPLETE too. Measured
-        # live: EVERY pre-flight in the fleet fails with exit 2 while `gh api`
-        # answers the identical question on REST's separate budget. A refusal
-        # it could have measured is not a refusal, it is a blind spot.
+        # surface reads the issue's `state`, it went INCOMPLETE too — while
+        # `gh api` answers the identical question on REST's separate budget. A
+        # refusal it could have measured is not a refusal, it is a blind spot.
+        #
+        # SCOPE: this fixture models ONE refused GraphQL call (a secondary /
+        # per-query limit), not a spent primary bucket — see
+        # test_shared_graphql_exhaustion_rescues_the_issue_reads_but_not_open_prs
+        # for the shared-bucket shape, which still ends INCOMPLETE on `open PRs`
+        # because that surface is GraphQL-only BY DESIGN (its
+        # `closingIssuesReferences` field has no REST equivalent).
         rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1"})
         self.assertEqual(rc, 0, out)
         self.assertIn("VERDICT: CLEAN", out)
@@ -2371,10 +2405,35 @@ class CollisionPreflightTest(unittest.TestCase):
         # timeline; a case-sensitive compare would silently skip that query.
         self.assertIn("issue state=OPEN", out)
 
+    def test_shared_graphql_exhaustion_rescues_the_issue_reads_but_not_open_prs(self):
+        # ⛔ THE REAL SHAPE OF THE FLEET SYMPTOM (#3435 review, P2). GitHub's
+        # PRIMARY GraphQL budget is ONE shared bucket, so a genuine exhaustion
+        # kills `gh pr list` as well as `gh issue view`. The fallback does NOT
+        # make that run CLEAN — it makes the issue surfaces stop lying about
+        # why: they are READ over REST while `open PRs` (GraphQL-only by design)
+        # stays a fail-closed refusal. Asserting both halves is what keeps the
+        # test from overstating the fix, and the CLEAN issue rows are only
+        # reachable when the fallback ran.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+            "GH_STUB_PR_LIST_RATE_LIMITED": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("[open PRs]", out)
+        # The ISSUE surfaces were rescued: read, not refused, and not blamed on
+        # the budget — which is the whole point of the fallback.
+        self.assertRegex(out, r"(?m)^issue assignee/holder\s+CLEAN")
+        self.assertNotIn("issue-metadata-unavailable", out)
+        self.assertIn("issue state=OPEN", out)
+
     def test_graphql_exhaustion_with_rest_also_down_still_fails_closed(self):
         # The fallback must never become a fail-open. With BOTH budgets gone the
         # tool has genuinely read nothing, so it must still refuse — otherwise
         # "try REST" would convert an unmeasured issue into a CLEAN verdict.
+        # ⛔ AND IT MUST NAME THE REST REFUSAL (#3435 review, P2): without that
+        # assertion this test also passes on a tool with NO fallback at all (the
+        # stub's `issue view` fails first), so it would pin nothing.
         rc, out = self.run_tool(env_extra={
             "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
             "GH_STUB_ISSUE_REST_FAIL": "1",
@@ -2383,6 +2442,58 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertNotIn("VERDICT: CLEAN", out)
         self.assertIn("issue-metadata-unavailable", out)
+        self.assertIn("gh api repos/test-owner/test-repo/issues/3061 failed", out)
+        self.assertIn("Resource not accessible", out)
+
+    def test_a_rest_200_that_is_a_pull_request_is_not_read_as_an_issue(self):
+        # ⛔ THE TRANSPORT MUST NOT DECIDE THE ANSWER (#3435 review, P2).
+        # `/repos/<slug>/issues/<N>` is the ISSUE-OR-PULL-REQUEST endpoint, and a
+        # PR object carries `number/title/state/assignees/html_url` — every key
+        # the normaliser reads — so it satisfied the payload contract and was
+        # read as an ISSUE. Pre-fix this run came back `VERDICT: CLEAN` (the
+        # fail-open direction) while `gh issue view` refuses the same input.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+            "GH_STUB_ISSUE_REST_PULL_REQUEST": "1",
+        })
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        self.assertIn("is a PULL REQUEST, not an issue", out)
+
+    def test_a_rest_body_about_another_issue_is_refused(self):
+        # A misrouted body must not be read as THIS issue's state and assignees:
+        # an `OPEN` with no assignees reads free. Pre-fix the answer was CLEAN.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+            "GH_STUB_ISSUE_REST_WRONG_NUMBER": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        self.assertIn("answered for #3062, not #3061", out)
+
+    def test_a_non_utf8_rest_body_is_a_named_incomplete_not_a_traceback(self):
+        # ⛔ `subprocess.run(text=True)` decodes in STRICT mode (#3435 review,
+        # P2), so one bad byte raised `UnicodeDecodeError` — a ValueError, NOT a
+        # `SurfaceError` — which passed every handler and escaped as a traceback
+        # with no VERDICT line and exit 1 (COLLISION).
+        #
+        # Refusing beats `errors="replace"` HERE: replacement characters would
+        # manufacture a payload no endpoint sent (the same reasoning that makes a
+        # substituted slug a silent wrong answer). The identical hole on the
+        # PRIMARY reads is pre-existing and lives at the `_run` boundary, which a
+        # sibling test pins to "decode STRICTLY, refuse, rc 2" — tortoise#8881.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+            "GH_STUB_ISSUE_REST_INVALID_UTF8": "1",
+        })
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("UnicodeDecodeError", out)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("not decodable as text", out)
 
     def test_a_malformed_rest_payload_is_a_named_incomplete_not_a_collision(self):
         # ⛔ #3435 review cycle 2, P1. `_require_issue_payload` lives INSIDE the

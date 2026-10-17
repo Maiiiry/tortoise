@@ -2684,14 +2684,49 @@ def _issue_view_rest(gh_bin: str, slug: str, issue: int, cwd: str,
     case-insensitively (REST says 'open', GraphQL says 'OPEN'). Every key is
     carried through RAW — including a `null`/absent `assignees` — so the contract
     check sees the body's real shape instead of a pre-digested copy.
+
+    ⛔ IT MUST ANSWER ABOUT THE ISSUE IT WAS ASKED ABOUT (#3435 review, P2).
+    `GET /repos/{slug}/issues/{N}` is the ISSUE-OR-PULL-REQUEST endpoint: for a
+    PR number it returns a PULL REQUEST object, which carries every key this
+    normaliser reads and therefore passes the payload contract — a PR read as an
+    issue, with the transport deciding the answer (`gh issue view` refuses that
+    input). A misrouted or differently-numbered body would likewise be read as
+    this issue's state and assignees, and an `OPEN` with no assignees reads FREE:
+    the fail-open direction. Both are refused here, for the same reason the
+    contract is: the reader must see the datum the question asked for.
     """
     where = f"gh api repos/{slug}/issues/{issue}"
     try:
         raw = _gh_json(gh_bin, ["api", f"repos/{slug}/issues/{issue}"], cwd, timeout)
     except SurfaceError as exc:
         return None, str(exc)
+    except ValueError as exc:
+        # ⛔ `_run` decodes with `text=True`, i.e. STRICT: one non-UTF-8 byte in
+        # the body raises `UnicodeDecodeError`, which is a ValueError — NOT a
+        # SurfaceError — so it passed this handler, the caller's `except
+        # SurfaceError`, and `main()`'s NotAWorkItem/RuntimeError pair, and
+        # escaped as a traceback with no VERDICT line and exit 1 (the code this
+        # module documents as COLLISION). Refusing rather than repairing is
+        # deliberate: replacement characters would compose a slug/payload that
+        # no endpoint sent. (The same hole exists on the pre-existing primary
+        # read; closing it in `_run` changes git-output handling globally and is
+        # tracked separately — tortoise#8881.)
+        return None, (
+            f"{where} returned output that is not decodable as text ({exc}) — "
+            "refusing (NOT clean)"
+        )
     if not isinstance(raw, dict):
         return None, f"{where} returned non-object JSON ({type(raw).__name__})"
+    if "pull_request" in raw:
+        return None, (
+            f"{where} is a PULL REQUEST, not an issue — refusing to read it as a "
+            "work item (NOT clean)"
+        )
+    if raw.get("number") != issue:
+        return None, (
+            f"{where} answered for #{raw.get('number')!r}, not #{issue} — refusing "
+            "a body that is not about the issue that was asked (NOT clean)"
+        )
     payload = {
         "number": raw.get("number"),
         "title": raw.get("title"),
