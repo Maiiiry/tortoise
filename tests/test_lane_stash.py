@@ -1717,3 +1717,34 @@ def test_list_marks_a_peers_pinned_entry_foreign(repo):
     foreign_rows = [ln for ln in listed.stdout.splitlines() if "FOREIGN" in ln]
     assert foreign_rows, listed.stdout
     assert all("(pinned)" in ln for ln in foreign_rows), foreign_rows
+
+
+def test_check_is_safe_for_this_lanes_applied_markerless_entry(repo):
+    """`pop` moves the pin to the applied ref — `check` must still call it ours.
+
+    `pop` releases the lane PIN and records the apply at
+    `refs/lane/<key>/applied/<sha>`; for a marker-less entry this lane recovered
+    (bare-git debris), that applied record is the ONLY ownership evidence left.
+    Reading only `stash` pins made `check` report HAZARD — and `list` FOREIGN? —
+    on the lane's own already-restored work, with a reason that claimed no ref
+    named it while the applied ref did (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\nrescued\n")
+    repo.git("stash", "push", "-q", "-m", "On feat/a: note", cwd=repo.a)
+    dropped = repo.stash_sha()
+    repo.git("stash", "drop", cwd=repo.a)
+    # recover marker-less debris, then apply it: the pin becomes an applied record
+    assert repo.lane(repo.a, "recover", dropped, "-m", "rescued note").returncode == 0
+    assert repo.lane(repo.a, "pop").returncode == 0
+    assert repo.applied_refs(), "precondition: the apply left a durable record"
+    assert repo.stash_pins() == {}, "precondition: the pin was released"
+
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 0, _fail(check)
+    assert "SAFE" in check.stdout, check.stdout
+
+    listed = repo.lane(repo.a, "list")
+    assert listed.returncode == 0, _fail(listed)
+    assert "OWN" in listed.stdout, listed.stdout
+    assert "FOREIGN" not in listed.stdout, listed.stdout
+    assert "not provably this lane's" not in listed.stdout, listed.stdout

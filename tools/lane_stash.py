@@ -673,18 +673,21 @@ def _foreign_owner(row: dict, key: str) -> tuple[str, str] | None:
     return None
 
 
-def _entry_ownership(row: dict, key: str, own_pins: set[str]) -> tuple[str, str]:
+def _entry_ownership(row: dict, key: str, own_shas: set[str]) -> tuple[str, str]:
     """Classify a shared-register entry against ``key``: own / foreign / unknown.
 
     ONE classifier for ``list`` and ``check``, so the two can never disagree about
     the same state. The order is fail-closed:
 
     1. **A foreign lane ref or a foreign message marker is decisive, and it
-       OUTRANKS this lane's own pin.** The #8051 incident re-enters through the
+       OUTRANKS this lane's own refs.** The #8051 incident re-enters through the
        repair door: a lane that ``recover``s a peer's entry ends up pinning the
        same sha, and reading the local pin as ownership made ``check`` print SAFE
        while a bare ``git stash pop`` took the peer's work (#8773 review P1).
-    2. This lane's own pin, then this lane's own marker, are ownership evidence.
+    2. This lane's own refs — a ``stash`` PIN or a durable ``applied`` record
+       (``pop`` moves the pin to the applied ref, so a marker-less entry this lane
+       recovered and then applied is still ITS OWN) — then this lane's own message
+       marker are ownership evidence.
     3. Otherwise the entry is UNATTRIBUTABLE and ``check`` fails closed.
     """
     foreign = _foreign_owner(row, key)
@@ -703,7 +706,7 @@ def _entry_ownership(row: dict, key: str, own_pins: set[str]) -> tuple[str, str]
             "forced onto ONE branch, so a matching branch does not make a bare "
             "`git stash pop` HERE safe: it would apply and drop that lane's entry"
         )
-    if _subject_lane_key(row["subject"]) == key or row["sha"] in own_pins:
+    if _subject_lane_key(row["subject"]) == key or row["sha"] in own_shas:
         return "own", ""
     return "unknown", ""
 
@@ -780,9 +783,15 @@ def cmd_list(args: argparse.Namespace) -> int:
     # state: it calls this lane's own pinned entry foreign after a checkout, and
     # a same-branch peer's entry safe (#8773 review P2).
     entries_shas = {e["sha"] for e in entries}
+    # `pop` MOVES the pin to the durable applied ref, so this lane's own applied
+    # records must count as ownership too — otherwise a marker-less entry this
+    # lane recovered and then applied reads FOREIGN? here and HAZARD in `check`,
+    # with a reason claiming no ref names it while `refs/lane/<key>/applied/<sha>`
+    # does (#8773 review P2).
+    own_shas = entries_shas | _applied_shas(key)
 
     def _mark(r: dict) -> str:
-        kind, _reason = _entry_ownership(r, key, entries_shas)
+        kind, _reason = _entry_ownership(r, key, own_shas)
         base = {"own": "OWN     ", "foreign": "FOREIGN ", "unknown": "FOREIGN?"}[kind]
         # The pin state is a SUFFIX, never a competing mark: `_pinned_shas()` is
         # repo-global, so a standalone `pinned` mark labelled a PEER's pinned
@@ -791,7 +800,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         return f"{base} (pinned)" if r["pinned"] else base
 
     top = rows[0] if rows else None
-    top_own = top is not None and _entry_ownership(top, key, entries_shas)[0] == "own"
+    top_own = top is not None and _entry_ownership(top, key, own_shas)[0] == "own"
     for r in rows:
         mark = _mark(r)
         star = ("  <-- a bare `git stash pop` here would take THIS"
@@ -932,7 +941,10 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if rows:
         top = rows[0]
-        kind, reason = _entry_ownership(top, key, {e["sha"] for e in entries})
+        # `pop` moves a lane pin to the durable applied ref, so THIS lane's applied
+        # records are ownership evidence too (#8773 review P2).
+        own_shas = {e["sha"] for e in entries} | _applied_shas(key)
+        kind, reason = _entry_ownership(top, key, own_shas)
         if kind == "foreign":
             # A foreign lane ref or marker OUTRANKS this lane's own pin: a
             # cross-lane `recover` used to leave the same sha pinned by BOTH
