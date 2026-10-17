@@ -285,13 +285,12 @@ def test_the_last_duplicate_rows_issue_label_wins(monkeypatch) -> None:
     # ⛔ AND THE INSTRUCTION MUST NOT REVERT IT (review of #8849, cycles 5-6). The
     # two lines differ in exactly the column the board just used, so a bare "delete
     # the duplicate roster line" tells the human to delete the copy that CARRIES the
-    # published value — obeying it silently reverts the label. The reason must name
-    # BOTH values, because "keep the copy with the published value" is not
-    # actionable when the message prints neither (and was BACKWARDS: last-wins stores
-    # the reported row's value on the kept tuple).
+    # published value — obeying it silently reverts the label. The reason must NAME
+    # the published value and tell the human which copy to keep; it does not have to
+    # name the value it is discarding (review of #8849, cycles 5-8).
     (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
     assert "`lane:new`" in orphan["reason"], orphan["reason"]
-    assert "`lane:old`" in orphan["reason"], orphan["reason"]
+    assert "IS the value the board publishes" in orphan["reason"], orphan["reason"]
     assert "written twice is ONE lane" in orphan["reason"], orphan["reason"]
 
 

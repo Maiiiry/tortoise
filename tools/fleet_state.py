@@ -1373,18 +1373,12 @@ def build_state(
             # comment in the loop above): adopt this row's non-empty `lane:` label on
             # the copy that was kept, then report the dropped line.
             _pos = kept_pos.get((label, ws.upper()))
-            # ⛔ CAPTURE THE KEPT COPY'S OWN VALUE BEFORE THE ADOPTION. After it, the
-            # kept tuple holds THIS row's value when this row has one, so a message
-            # written from the post-adoption state would point at the wrong physical
-            # line — and the published value survives on the line being reported.
-            _kept_own = kept[_pos][2] if _pos is not None else ""
             if issue_label and _pos is not None:
                 kept[_pos] = (label, ws, issue_label)
             stale_rows.append({
                 "lane": label, "workspace": ws, "issue_label": issue_label,
                 "arm": "duplicate",
                 "carries": issue_label,
-                "kept_own": _kept_own,
                 # ⛔ THE TWIN MAY ALREADY HAVE BEEN DROPPED by arm (a) — `seen_rows`
                 # is populated before the arm decision, so a ghost row and its
                 # literal copy can take DIFFERENT arms. The sentence therefore must
@@ -1727,6 +1721,16 @@ def build_state(
     # already answers, or a second unbound row repeating a label — and it is still
     # VISIBLE here either way: the roster line is stale, and clearing it is a human's
     # call.
+    # ⛔ THE PUBLISHED VALUE MUST COME FROM THE FINAL BOARD, not from the running
+    # tuple. `kept[_pos]` is overwritten by every later duplicate that carries a
+    # value, so a message that names "the published value" from the state at its own
+    # point in the loop is FALSE at three or more copies — measured: `[lane:a, "",
+    # lane:b]` publishes `lane:b` while the middle row's orphan said `lane:a` "is what
+    # the board publishes" (review of #8849, cycle 8). `kept` is already the
+    # post-rebuild list here, so this map IS the answer, for any number of copies.
+    published_by_label: dict[str, str] = {
+        lbl: ilbl for lbl, _ws, ilbl in kept
+    }
     for row in stale_rows:
         ws_gone = f"workspace {row['workspace'][:8]}…" if row["workspace"] else "its workspace"
         arm = row.get("arm")
@@ -1738,50 +1742,36 @@ def build_state(
         # roster line because its workspace was dead while the board showed it alive
         # (review of #8849).
         if arm == "duplicate":
+            _carries = row.get("carries") or ""
+            _published = published_by_label.get(row["lane"], "")
             if row.get("twin_kept"):
-                _carries = row.get("carries") or ""
-                _kept_own = row.get("kept_own") or ""
-                # ⛔ NAME THE ACTUAL VALUES. "Keep the copy that carries the
-                # published value" is not actionable when the message prints
-                # neither value — and it was BACKWARDS besides: last-wins stores
-                # THIS row's value on the kept tuple, so when the two lines differ
-                # the published value lives on the copy being reported here
-                # (review of #8849, cycle 6).
-                # ⛔ BRANCH ON BOTH VALUES. Selecting on `_carries` alone said
-                # "Neither line carries a `lane:` value" when the REPORTED row was
-                # the empty one and the kept line carried the value — and then
-                # permitted deleting either, including the only carrier, which
-                # reverts the published label (review of #8849, cycle 7).
-                if _carries and not _kept_own:
+                # ⛔ BRANCH ON THE FINAL PUBLISHED VALUE, not on the reported row's
+                # value alone (which said "Neither line carries a `lane:` value"
+                # when the KEPT line carried it) and not on the running tuple
+                # (which is stale at 3+ copies). Both faults printed a value the
+                # board does not publish (review of #8849, cycles 7 and 8).
+                if _carries and _published == _carries:
                     _advice = (
-                        f"This line carries `{_carries}` and the copy already "
-                        "handled for this (label, workspace) carries none. The "
-                        f"published `lane:` value is `{_carries}` — i.e. THIS "
-                        "line's. Keep this line (or copy that value onto the "
-                        "other line first)"
-                    )
-                elif _carries and _carries != _kept_own:
-                    _advice = (
-                        f"This line carries `{_carries}`; the copy already handled "
-                        f"for this (label, workspace) carries `{_kept_own}`. The "
-                        f"published `lane:` value is `{_carries}` — i.e. THIS "
-                        "line's. Keep this line (or copy that value onto the "
-                        "other line first)"
+                        f"This line carries `{_carries}`, which IS the value the "
+                        "board publishes. Keep a line carrying that value — this "
+                        "one — and delete the other copy"
                     )
                 elif _carries:
                     _advice = (
-                        f"This line carries `{_carries}` and so does the copy "
-                        "already handled, so either may be deleted"
+                        f"This line carries `{_carries}`, but the board publishes "
+                        f"`{_published}` (from another line for this (label, "
+                        "workspace)). Delete this line — or, if that value is the "
+                        f"intended one, put `{_carries}` on the line you keep"
                     )
-                elif _kept_own:
+                elif _published:
                     _advice = (
-                        "This line carries no `lane:` value; the copy already "
-                        f"handled carries `{_kept_own}`, which is what the board "
-                        "publishes. Delete THIS line"
+                        "This line carries no `lane:` value; the board publishes "
+                        f"`{_published}` from another line for this (label, "
+                        "workspace). Delete THIS line"
                     )
                 else:
                     _advice = (
-                        "Neither this line nor the copy already handled carries a "
+                        "Neither this line nor the one the board uses carries a "
                         "`lane:` value, so either may be deleted"
                     )
                 reason = (
@@ -1799,16 +1789,22 @@ def build_state(
                 # value, which the board publishes via inheritance: a bare "delete
                 # the duplicate roster line" would revert the label, the very
                 # failure the sibling branch is written to prevent (cycle 6).
-                _carries = row.get("carries") or ""
-                if _carries:
+                # ⛔ AND THIS ROW MAY BE THE ONE THE PUBLISHED VALUE COMES FROM.
+                # The gate is `_published == _carries`, NOT "no other row carries
+                # that value": inheritance is OWN-WINS, so it fires only when the
+                # surviving row has none. A surviving row owning a DIFFERENT value
+                # means this row's value is irrelevant and moving it over would
+                # CHANGE the published label — the opposite of the warning's advice
+                # (review of #8849, cycle 8).
+                if _carries and _published == _carries:
                     reason = (
                         f"registry row for '{row['lane']}' repeats {ws_gone}, "
                         "and the copy of this row was ALREADY dropped above for its "
                         "own reason — read that entry, which is the one that explains "
-                        "why this workspace is no longer a lane record. ⛔ This line "
-                        f"carries `{_carries}`; if no surviving row for this label "
-                        "already carries that value, move it onto one BEFORE "
-                        "deleting this line, or the label silently reverts"
+                        "why this workspace is no longer a lane record. ⛔ The board "
+                        f"publishes `{_carries}` only because this dropped line "
+                        "carries it — keep this line, or move that value onto the "
+                        "surviving row BEFORE deleting it, or the label reverts"
                     )
                 else:
                     reason = (
