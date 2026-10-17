@@ -152,6 +152,11 @@ if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
     echo "gh-stub: HTTP 404: Not Found" >&2
     exit 1
   fi
+  # NOTE: no `GH_STUB_ISSUE_ABSENT` guard belongs here. That seam fails the
+  # `issue view` call FIRST (so the fallback is never attempted), which makes a
+  # copy of it inside THIS branch unreachable code that reads as protection —
+  # the same defect the `$repo` note above names. The live REST-404 seam is
+  # `GH_STUB_ISSUE_REST_ABSENT` above.
   _slug="${2#repos/}"; _slug="${_slug%/issues/*}"
   if [ -f "$d/probe_unqueried.txt" ] && grep -qx "$_slug" "$d/probe_unqueried.txt"; then
     echo "gh-stub: could not connect to api.github.com" >&2; exit 1
@@ -250,7 +255,17 @@ case "$1 $2" in
       echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
       exit 1
     fi
-    # Probe form (the cross-repo ambiguity check asks for `--json number` only).
+    # ⛔ THE CANONICAL EXHAUST FORM, and the reason the gate matches three strings
+  # rather than one (#3435 review, P2): `gh` renders a non-2xx as
+  # `HTTP <code>: <status> (<url>)` — so a 429 with NO body prose arrives with
+  # no "rate limit" substring at all, and a bare substring test under-triggers.
+  # Unpinned, deleting the `"too many requests"` / `"http 429"` arms restores that
+  # defect with a green suite.
+  if [ "${GH_STUB_ISSUE_VIEW_HTTP_429:-0}" = "1" ]; then
+    echo "gh-stub: HTTP 429: Too Many Requests (https://api.github.com/graphql)" >&2
+    exit 1
+  fi
+  # Probe form (the cross-repo ambiguity check asks for `--json number` only).
     if [ "$json_args" = "number" ]; then
       if [ -f "$d/probe_unqueried.txt" ] && grep -qx "$repo" "$d/probe_unqueried.txt"; then
         echo "gh-stub: could not connect to api.github.com" >&2; exit 1
@@ -2405,6 +2420,19 @@ class CollisionPreflightTest(unittest.TestCase):
         # timeline; a case-sensitive compare would silently skip that query.
         self.assertIn("issue state=OPEN", out)
 
+    def test_a_bare_http_429_also_triggers_the_rest_fallback(self):
+        # ⛔ THE CANONICAL EXHAUST FORM (#3435 review, P2). `gh` renders a non-2xx
+        # as `HTTP <code>: <status> (<url>)`, so a 429 with no body prose carries
+        # NO "rate limit" substring. A bare substring test therefore under-
+        # triggers on exactly the form the premise calls routine, and deleting
+        # the `"too many requests"` / `"http 429"` arms used to keep the suite
+        # green — so this case pins them.
+        rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_VIEW_HTTP_429": "1"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertIn("issue state=OPEN", out)
+        self.assertNotIn("issue-metadata-unavailable", out)
+
     def test_shared_graphql_exhaustion_rescues_the_issue_reads_but_not_open_prs(self):
         # ⛔ THE REAL SHAPE OF THE FLEET SYMPTOM (#3435 review, P2). GitHub's
         # PRIMARY GraphQL budget is ONE shared bucket, so a genuine exhaustion
@@ -2483,8 +2511,9 @@ class CollisionPreflightTest(unittest.TestCase):
         # Refusing beats `errors="replace"` HERE: replacement characters would
         # manufacture a payload no endpoint sent (the same reasoning that makes a
         # substituted slug a silent wrong answer). The identical hole on the
-        # PRIMARY reads is pre-existing and lives at the `_run` boundary, which a
-        # sibling test pins to "decode STRICTLY, refuse, rc 2" — tortoise#8881.
+        # PRIMARY reads is pre-existing, lives at the `_run` boundary, and is NOT
+        # yet covered by any test — tortoise#8881 needs this case written for the
+        # primary surfaces too.
         rc, out = self.run_tool(env_extra={
             "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
             "GH_STUB_ISSUE_REST_INVALID_UTF8": "1",
