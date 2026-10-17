@@ -770,9 +770,19 @@ def _entity_node_view(props: dict) -> dict:
     this view carries ``status`` on EVERY reference-fold label, so the BASELINE
     sees a ``status`` write on an ``:Event`` too. Covering a field the
     comparison declares undecidable is deliberate on the baseline's side: a
-    field nobody folds is exactly a field a graph-only write can move unnoticed,
-    and ``None`` (in-tree Events carry no ``status``) is a constant that cannot
-    manufacture a false red.
+    field nobody folds is exactly a field a graph-only write can move unnoticed.
+
+    An ``:Event``'s ``status`` cannot manufacture a false red either, but NOT
+    because the value is constant — in-tree Events DO carry it (``status`` is
+    not in ``_EVENT_HANDLED``, so ``_persist_extra_props`` puts a
+    writer-supplied ``status`` on the node, and ``sdk._promote_incident_operators``
+    reads it as a live/draft gate; see the `_EVENT_HANDLED` note in
+    ``projection/entities.py``). The reason is SYMMETRY: live and replay write
+    that prop through the same ``_upsert_event`` → ``_persist_extra_props``
+    path, and a live ``status`` change is journalled as ``EntityMutated``, so a
+    reproduced value cannot move ``db_hash`` and the baseline only moves on a
+    write ``replay(journal)`` cannot reproduce — the #4240 class it exists to
+    catch. Read this as a bound on the WRITERS, not on the value.
 
     ``status`` is always present (``None`` when the node carries none) because
     the entity leg compares it presence-conditionally: a stub minted by
@@ -2068,6 +2078,15 @@ def _fold_journal_entities(events: list[dict]) -> tuple[dict, set, set]:
 #: indexing the old set, leaving a new label's node invisible to the baseline
 #: digest: exactly the #7936 fail-open returning for the new label with every
 #: existing pin green.
+#:
+#: ONE further declaration this depends on, named so it is not discovered by
+#: surprise: the index KEY comes from `_ENTITY_ID_PROP`
+#: (`projection._CANONICAL_ENTITY_ID_PROPS`), and :func:`_graph_view` DROPS a
+#: node whose label has no entry there. A creation row added here but not to
+#: that map would therefore reach the query and be dropped from the index — the
+#: same fail-open one declaration further along. Pinned (not merely stated) by
+#: `tests/test_7936_reference_fold_label_rekey.py`, which asserts this set is a
+#: subset of `_ENTITY_ID_PROP`.
 _GRAPH_VIEW_LABELS: tuple[str, ...] = (
     "Point",) + tuple(sorted(_REFERENCE_FOLD_ENTITY_LABELS))
 

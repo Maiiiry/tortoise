@@ -430,6 +430,12 @@ def test_the_graph_index_is_derived_from_the_one_label_declaration(
 
     assert set(_c._GRAPH_VIEW_LABELS) == ({"Point"}
                                           | set(_c._REFERENCE_FOLD_ENTITY_LABELS))
+    # The index KEY comes from a THIRD declaration: `_graph_view` DROPS a node
+    # whose label has no `_ENTITY_ID_PROP` entry, so a label declared and not
+    # keyed would reach the query and vanish from the index anyway.
+    assert set(_c._GRAPH_VIEW_LABELS) <= set(_c._ENTITY_ID_PROP), (
+        "a label the index queries has no identity property — every one of its "
+        "nodes is silently dropped from the baseline digest (#7936)")
 
     proj, _log, _events = _built(tmp_path)
     try:
