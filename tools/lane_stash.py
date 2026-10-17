@@ -509,11 +509,21 @@ def _store_into_register(sha: str, subject: str, key: str) -> bool:
 
 
 def _pinned_shas() -> set[str]:
+    """Every lane pin's object, repo-global.
+
+    A non-zero rc is a STATE error, NEVER an empty set: this feeds the `pinned`
+    mark, the retention decision and :func:`_orphan_is_reclaimable`, and an empty
+    answer tells the operator an entry "is pinned by no lane ref" when the
+    enumeration simply failed (#8773 review P2).
+    """
     cp = _git(
         "for-each-ref", "--format=%(objectname)", f"{REFS_NS}/*/stash/*", check=False,
     )
     if cp.returncode != 0:
-        return set()
+        raise LaneStashError(
+            "could not read the lane pin refs (`git for-each-ref` failed): "
+            f"{(cp.stderr or cp.stdout).strip() or 'no output'}"
+        )
     return {ln.strip() for ln in cp.stdout.splitlines() if ln.strip()}
 
 
@@ -534,7 +544,14 @@ def _applied_shas(key: str) -> set[str]:
         "for-each-ref", "--format=%(objectname)", f"{REFS_NS}/{key}/applied", check=False,
     )
     if cp.returncode != 0:
-        return set()
+        # Same fail-closed rule as `_pinned_shas`: an unreadable applied list must
+        # not degrade to "this lane applied nothing", which would strip ownership
+        # evidence from its own work and print a false "no lane ref names it"
+        # (#8773 review P2).
+        raise LaneStashError(
+            "could not read this lane's applied records (`git for-each-ref` failed): "
+            f"{(cp.stderr or cp.stdout).strip() or 'no output'}"
+        )
     return {ln.strip() for ln in cp.stdout.splitlines() if ln.strip()}
 
 
@@ -561,6 +578,25 @@ def _record_applied(key: str, entry: dict) -> None:
 def _clear_applied(key: str, sha: str) -> None:
     """Drop an applied record after its shared-register entry is gone (best-effort)."""
     _git("update-ref", "-d", _applied_ref(key, sha), sha, check=False)
+
+
+def _release_stale_applied(key: str, applied: set[str], *, present: set[str]) -> int:
+    """Drop applied records whose shared-register entry is gone by ANY route.
+
+    `pop` writes one applied record per cycle, and `_clear_applied` used to run
+    only for entries THIS prune removed — so an entry that left the register via a
+    peer's `git stash drop`/`clear` or a reflog expiry left its record behind as a
+    permanent, gc-blocking ref in the SHARED git dir that `list` never reported
+    (#8773 review P2). A record still enumerated in ``present`` is live evidence
+    for a later `prune` and is kept.
+    """
+    stale = sorted(sha for sha in applied if sha not in present)
+    for sha in stale:
+        _clear_applied(key, sha)
+    if stale:
+        print(f"released {len(stale)} applied record"
+              f"{'s' if len(stale) != 1 else ''} whose shared-register entry is gone")
+    return len(stale)
 
 
 #: Namespace for the prune's temporary GC guard. Deliberately OUTSIDE
@@ -863,6 +899,13 @@ def cmd_list(args: argparse.Namespace) -> int:
                 note = "  (no other ref names it)"
             foreign = "" if owner == key else f"  [lane {owner} — not this lane]"
             print(f"  {sha[:12]}  {ref}{foreign}{note}")
+
+    applied = _applied_shas(key)
+    if applied:
+        print(f"applied records held ({len(applied)} — durable evidence THIS lane restored "
+              "the entry; `prune --apply` releases one whose register entry is gone)")
+        for sha in sorted(applied):
+            print(f"  {sha[:12]}  {_applied_ref(key, sha)}")
     if top is not None and not top_own:
         print("\n⚠️  the top shared entry is not provably this lane's — use `lane_stash pop <id>`, "
               "never a bare `git stash pop` (see `lane_stash check`).")
@@ -1206,8 +1249,24 @@ def cmd_prune(args: argparse.Namespace) -> int:
         )
     if not doomed:
         if not orphan:
+            # Nothing to reclaim — but an APPLIED record whose register entry left
+            # by another route (a peer's `stash drop`/`clear`, reflog expiry) is
+            # still a live gc-blocking ref in the SHARED git dir, and nothing else
+            # reaps it (#8773 review P2).
+            if args.apply:
+                _release_stale_applied(key, applied, present=register_shas)
             return 0
-        return _reclaim_orphan_refs_stash(head, key=key, apply=args.apply)
+        rc = _reclaim_orphan_refs_stash(head, key=key, apply=args.apply)
+        if args.apply:
+            # The orphan's OWN record is the reclaimability proof just consumed
+            # above, so sweep only AFTER it; any other stale record goes now.
+            try:
+                present = {x["sha"] for x in _shared_register()}
+            except LaneStashError:
+                present = None
+            if present is not None:
+                _release_stale_applied(key, applied, present=present)
+        return rc
     if not args.apply:
         print("dry run — re-run with --apply to remove the pinned entries")
         return 0
@@ -1230,7 +1289,6 @@ def cmd_prune(args: argparse.Namespace) -> int:
                 "refusing to remove anything while a kept entry cannot be protected"
             )
         guarded[r["sha"]] = (ref, r["subject"])
-    removed_shas: list[str] = []
     try:
         # Positions are walked HIGH -> LOW so an earlier delete cannot renumber a
         # later specifier. `reflog delete` re-resolves `refs/stash@{i}` at DELETE
@@ -1291,7 +1349,6 @@ def cmd_prune(args: argparse.Namespace) -> int:
                       "the object DB until gc — `git fsck --unreachable` lists it) and "
                       "re-run the prune when the register is quiet.")
                 break
-            removed_shas.append(r["sha"])
             removed += 1
             expected = want
         print(f"removed {removed} pinned shared-register entr"
@@ -1323,35 +1380,40 @@ def cmd_prune(args: argparse.Namespace) -> int:
             print(f"RESTORED {len(restored)} shared-register entr"
                   f"{'y' if len(restored) == 1 else 'ies'} a concurrent push caused this "
                   "prune to remove in error — re-check the register with `lane_stash list`")
-        # Applied-records are dropped only NOW, after the orphan handling: the last
-        # entry's record is exactly what proves the emptied `refs/stash` may be
-        # dropped, so clearing it earlier wedges the ref (measured: prune then
-        # refused to drop it and `check` stayed fail-closed). Only entries that were
-        # ACTUALLY removed AND are genuinely gone are cleared: a failed or
-        # wrong-position `reflog delete` leaves its entry in the register, and that
-        # entry must stay reclaimable by a later prune. Best-effort — a leftover
-        # record only costs a tiny ref.
-        for sha in removed_shas:
-            if sha in applied and sha not in live:
-                _clear_applied(key, sha)
+        # Applied-records for entries whose register entry is gone by ANY route —
+        # this prune's own removal, a peer's `stash drop`/`clear`, or a reflog
+        # expiry. A record with no register entry is a permanent, gc-blocking ref
+        # in the SHARED git dir and nothing else reports it (#8773 review P2).
+        # `live` is read AFTER the reconciliation, so a re-stored kept entry is
+        # present and its record is kept. The last entry's record was already
+        # consumed by the orphan handling above, which is why this runs there and
+        # not before it.
+        _release_stale_applied(key, applied, present=live)
     finally:
         # Unpin only guards whose object is back in the register. A guard for a
         # sha that is NOT in the register is the LAST handle on that object, so it
         # is deliberately kept (a failed re-store must not make the object
         # gc-eligible); the printed warning says how to restore it (#8773 P1).
+        # `None` means the read FAILED — retain conservatively and say so, never
+        # claim the entry is missing (#8773 review P2).
+        final: set[str] | None
         try:
             final = {x["sha"] for x in _shared_register()}
         except LaneStashError:
-            final = set()
-        for sha, (_ref, _subject) in guarded.items():
-            if sha in final:
+            final = None
+        for sha, (guard_ref, _subject) in guarded.items():
+            if final is not None and sha in final:
                 # Release under ANY lane key: once the sha is back in the register
                 # a guard is redundant wherever it lives, and a guard left by a
                 # PREVIOUS prune (or another, since-removed worktree) would
                 # otherwise block gc forever (#8773 review P2).
                 _guard_release_all(sha)
+            elif final is None:
+                print(f"kept   guard ref {guard_ref} for {sha[:12]} — the shared register "
+                      "could NOT be read, so this guard is retained conservatively; check "
+                      "`lane_stash list` before recovering")
             else:
-                print(f"kept   guard ref {ref} for {sha[:12]} — it is not back in the "
+                print(f"kept   guard ref {guard_ref} for {sha[:12]} — it is not back in the "
                       "shared register, so this ref is the last handle on it; restore "
                       f"with\n  python tools/lane_stash.py recover {sha}")
     return 0

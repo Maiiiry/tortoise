@@ -2004,3 +2004,100 @@ def test_detached_head_push_check_and_pop(repo):
     assert "SAFE" in check.stdout, check.stdout
     assert repo.lane(repo.a, "pop").returncode == 0
     assert "detached" in (repo.a / "f.txt").read_text()
+
+
+# ── round-5 review P2s ──────────────────────────────────────────────────────
+
+def test_prune_retains_each_guard_by_its_own_ref_when_the_register_is_unreadable(
+    repo, monkeypatch, capsys,
+):
+    """A retained guard's message must name ITS ref and must not invent a loss.
+
+    The `finally` printed an unrelated loop variable for `ref`, so with two guarded
+    entries it named the last one's ref for both — and asserted the entry was not
+    in a register that had merely failed to read (#8773 review P2).
+    """
+    mod = _load_tool()
+    _four_entry_register(repo)
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+    real_register = mod._shared_register
+    state = {"fail": False}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        cp = real_git(*args, check=check, stdin=stdin)
+        if args[:2] == ("reflog", "delete") and cp.returncode == 0:
+            state["fail"] = True
+        return cp
+
+    def failing_register():
+        if state["fail"]:
+            raise mod.LaneStashError("injected register read failure")
+        return real_register()
+
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    monkeypatch.setattr(mod, "_shared_register", failing_register)
+    capsys.readouterr()
+    rc = mod.main(["prune", "--apply"])
+    assert rc == 2, rc
+    out = capsys.readouterr().out
+    guard_refs = repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.split()
+    assert len(guard_refs) == 2, guard_refs
+    for ref in guard_refs:
+        assert ref in out, f"the retention message did not name its own guard: {out}"
+    assert "it is not back in the shared register" not in out, (
+        "the register could not be READ; the message must not claim the entry is missing"
+    )
+
+
+def test_an_unreadable_pin_list_is_a_state_error_not_debris(repo, monkeypatch):
+    """A failed pin enumeration must raise, not report "pinned by no lane ref".
+
+    `_pinned_shas`/`_applied_shas` collapsed a non-zero `for-each-ref` into an
+    empty set, so `check` told the operator a pinned entry was bare-git debris
+    (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\na-A\n")
+    assert repo.lane(repo.a, "push", "-m", "A work").returncode == 0
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+
+    def fake_git(*args, check=True, stdin=None):
+        if args[:1] == ("for-each-ref",) and any(a.endswith("/stash/*") for a in args):
+            return subprocess.CompletedProcess(
+                ["git", *args], 128, "", "fatal: cannot read refs"
+            )
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", fake_git)
+    rc = mod.main(["check", "--json"])
+    assert rc == 2, f"an unreadable pin list is a state error (exit 2), got {rc}"
+
+
+def test_prune_releases_an_applied_record_whose_entry_is_already_gone(repo):
+    """An applied record must not outlive its register entry by another route.
+
+    `pop` writes one applied record per cycle; if the register entry then leaves
+    via a peer's `stash drop`/`clear` or a reflog expiry, the record survived
+    forever as a permanent, gc-blocking ref in the SHARED git dir that `list`
+    never reported (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\nrestored\n")
+    assert repo.lane(repo.a, "push", "-m", "restored").returncode == 0
+    assert repo.lane(repo.a, "pop").returncode == 0
+    records = repo.applied_refs()
+    assert len(records) == 1, records
+
+    # `list` must show the record before anything reaps it
+    listed = repo.lane(repo.a, "list")
+    assert "applied records held" in listed.stdout, listed.stdout
+
+    # the register entry leaves by a route that is NOT this prune
+    repo.git("stash", "clear", cwd=repo.a)
+    assert repo.stash_shas() == [] and repo.stash_sha() is None
+
+    assert repo.lane(repo.a, "prune", "--apply").returncode == 0
+    assert repo.applied_refs() == {}, "the applied record outlived its register entry"

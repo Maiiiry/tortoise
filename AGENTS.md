@@ -512,7 +512,8 @@ for three sends to one pane that were recorded as `OK` and never consumed.
   peer's entry is unreachable in either direction; `python tools/lane_stash.py check` is the
   executable detector (exit 1 = a bare `git stash pop` here would take work that is not provably
   this lane's — a peer lane's marker or lane ref, any entry only a branch name could attribute, or a
-  register that cannot be read, including a `refs/stash` that resolves over an emptied reflog).
+  `refs/stash` that resolves over an emptied reflog; a register that cannot be read at all is exit 2,
+  a state error, so treat ANY non-zero as "do not run a bare `git stash pop`").
   `python tools/lane_stash.py recover <sha>` is the repair recipe for THIS lane's own dropped entry
   (it pins what it restores under the current lane), and it **refuses** an entry another lane's ref
   or `[<lane-key>]` marker names — pinning a peer's entry here would leave it claimed by both lanes,
