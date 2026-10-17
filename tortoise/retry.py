@@ -29,6 +29,14 @@ and keeps its own run knobs (``INGEST_WRITE_RETRIES`` etc.) eval-side.
     ``IMPL``/``mitigated_by`` edge pair;
   * ``create_entity``'s document ``extractedFrom`` leg and
     ``create_document``'s ``extractedFrom`` leg (both ``_link_source``);
+  * ``update_point`` — the four property/promote ``SET`` arms (the two
+    ``:Point:Object``/``:Point`` status promote arms carry their guard inside
+    the statement, the two plain arms are absolute ``SET n += $props``), the
+    per-key ``SET`` loop, the derived-embedding clear+set, and the ``TAGGED``
+    edges it shares with ``create_point`` (``_sync_tags``). ``annotate_operator``
+    is covered transitively — it delegates here;
+  * ``invalidate_point`` — the terminal stamp ``SET`` and the ``CORRECTS``
+    ``MERGE``;
   * the capture lane's graph writes, all in ``tortoise/sdk.py`` — the
     ``:Session`` MERGE (``_write_session_and_turns``), the batched
     ``UNWIND $turns`` turn store and the stale-turn ``DETACH DELETE`` sweep
@@ -53,8 +61,8 @@ did not land" guarantee is per-statement and does not extend to the enclosing
 fold. Also unwired: ``supersede_point`` (its statements are individually
 idempotent — ``MERGE`` / DELETE by ``ID(r)`` / ``SET r += $attrs`` — but the
 multi-statement transfer is deliberately left to a separate increment),
-``update_point`` (and therefore ``annotate_operator``, which delegates to it),
-and the remaining direct ``proj.g.query`` write sites across ``tortoise/``.
+``retract_point``/``revert_rows`` and the remaining direct ``proj.g.query``
+write sites across ``tortoise/``.
 ``merge_points`` is not a direct graph write at all: it is an ``EventAPI``
 journal emit (``tortoise/api.py``) whose graph effect is the ``proj.apply``
 fold above. A write abort at any of these still raises (or is downgraded by the

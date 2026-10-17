@@ -10203,6 +10203,22 @@ class TortoiseSDK:
                     id, getattr(proj, "graph_name", None),
                     operation="update_point")
 
+        # #7405: the property writes below ride the bounded write retry —
+        # `update_point` is the SDK's most common mutation door
+        # (`annotate_operator` delegates here), so a rebuild's per-query abort
+        # used to reject the revision outright while reads kept serving: the
+        # finding is revised in the caller's head and lost from the map. Every
+        # statement here is admissible on `retryable_aborted_write` ALONE — its
+        # arms prove the statement did NOT land — and each one is an ABSOLUTE
+        # `SET` computed once above (``_props_param``, ``now``,
+        # ``_embed_params`` are all fixed at the call), so a re-issue converges
+        # on exactly the state a single successful issue would produce and
+        # cannot double-increment. The promote arms carry their guard INSIDE
+        # the statement, so a re-issue re-evaluates the same
+        # `status IS NULL OR status = 'draft'` predicate against the graph — it
+        # cannot promote twice, and a legitimately-refused promote still yields
+        # an empty result set (the caller's
+        # ``_raise_update_point_status_error`` path is unchanged).
         if has_object:
             if 'status' in props:
                 # Promote guard folded INTO the WHERE clause (plan-review P2:
@@ -10216,69 +10232,102 @@ class TortoiseSDK:
                 # graph never had. The sibling no-status arm below already
                 # writes `SET n += $props`, so this makes the two arms agree
                 # and makes live match the durable record (write == read).
-                res = proj.g.query(
-                    "MATCH (n:Point:Object {id:$id}) "
-                    "WHERE (n.status IS NULL OR n.status = 'draft') "
-                    + _embed_clear
-                    + "SET n.status = 'live', n.updatedAt = $now, "
-                    "n.version = coalesce(n.version, 0) + 1, n += $props"
-                    + _embed_set + " "
-                    "RETURN n",
-                    params={"id": id, "props": _props_param, "now": now,
-                            **_embed_params},
+                # #7405: the property writes below ride the bounded write
+                # retry — explained once above the arm split.
+                res = self._graph_write_with_retry(
+                    lambda: proj.g.query(
+                        "MATCH (n:Point:Object {id:$id}) "
+                        "WHERE (n.status IS NULL OR n.status = 'draft') "
+                        + _embed_clear
+                        + "SET n.status = 'live', n.updatedAt = $now, "
+                        "n.version = coalesce(n.version, 0) + 1, n += $props"
+                        + _embed_set + " "
+                        "RETURN n",
+                        params={"id": id, "props": _props_param, "now": now,
+                                **_embed_params},
+                    ),
+                    what="update_point SET (Object promote)",
                 )
                 if not res.result_set:
                     _raise_update_point_status_error(proj, id)
             else:
-                proj.g.query(
-                    "MATCH (n:Point:Object {id:$id}) " + _embed_clear
-                    + "SET n += $props, n.version = coalesce(n.version, 0) + 1, "
-                    "n.updatedAt = $now" + _embed_set,
-                    params={"id": id, "props": _props_param, "now": now,
-                            **_embed_params},
+                self._graph_write_with_retry(
+                    lambda: proj.g.query(
+                        "MATCH (n:Point:Object {id:$id}) " + _embed_clear
+                        + "SET n += $props, "
+                        "n.version = coalesce(n.version, 0) + 1, "
+                        "n.updatedAt = $now" + _embed_set,
+                        params={"id": id, "props": _props_param, "now": now,
+                                **_embed_params},
+                    ),
+                    what="update_point SET (Object)",
                 )
         else:
             if 'status' in props:
                 # Promote guard folded INTO the WHERE clause (plan-review P2).
                 # #2884 A2: see the :Object arm above — the rest of `props`
                 # rides the same statement, so the journaled payload is the
-                # whole truth of this write.
-                res = proj.g.query(
-                    "MATCH (n:Point {id:$id}) "
-                    "WHERE (n.status IS NULL OR n.status = 'draft') "
-                    + _embed_clear
-                    + "SET n.status = 'live', n.updatedAt = $now, n += $props"
-                    + _embed_set + " "
-                    "RETURN n",
-                    params={"id": id, "props": _props_param, "now": now,
-                            **_embed_params},
+                # whole truth of this write. #7405: retried, like its :Object
+                # sibling above.
+                res = self._graph_write_with_retry(
+                    lambda: proj.g.query(
+                        "MATCH (n:Point {id:$id}) "
+                        "WHERE (n.status IS NULL OR n.status = 'draft') "
+                        + _embed_clear
+                        + "SET n.status = 'live', n.updatedAt = $now, "
+                        "n += $props" + _embed_set + " "
+                        "RETURN n",
+                        params={"id": id, "props": _props_param,
+                                "now": now, **_embed_params},
+                    ),
+                    what="update_point SET (promote)",
                 )
                 if not res.result_set:
                     _raise_update_point_status_error(proj, id)
             else:
                 for key, val in _props_param.items():
-                    proj.g.query(
-                        "MATCH (n:Point {id:$id}) SET n += $props",
-                        params={"id": id, "props": {key: val}},
+                    # #7405: one key per statement, each an absolute
+                    # `SET n += $props` — a re-issue writes the same value to
+                    # the same key, so it cannot double-apply or clobber a
+                    # sibling key this loop has not reached yet.
+                    self._graph_write_with_retry(
+                        lambda key=key, val=val: proj.g.query(
+                            "MATCH (n:Point {id:$id}) SET n += $props",
+                            params={"id": id, "props": {key: val}},
+                        ),
+                        what="update_point SET (per-key)",
                     )
                 if _derived_embedding:
                     # The clear and the set are ONE atomic query, so a crash
                     # between them cannot leave the node vectorless. This arm
                     # is already per-key (not one statement), so the added
                     # embedding write introduces no new non-atomicity.
-                    proj.g.query(
-                        "MATCH (n:Point {id:$id}) " + _embed_clear
-                        + "SET " + set_embedding_clause(
-                            "n", preserve_on_null=False),
-                        params={"id": id, **_embed_params},
+                    # #7405: absolute clear+set, converged by a re-issue.
+                    self._graph_write_with_retry(
+                        lambda: proj.g.query(
+                            "MATCH (n:Point {id:$id}) " + _embed_clear
+                            + "SET " + set_embedding_clause(
+                                "n", preserve_on_null=False),
+                            params={"id": id, **_embed_params},
+                        ),
+                        what="update_point SET (embedding)",
                     )
         # Tag sync (#485): keep TAGGED edges consistent with the n.tags
         # property — update_point previously set the property but left edges
         # stale, so query_points_by_tag missed updated points. Falsy tag
         # values (None, "") normalize to [] like create_point, so the
         # "clear tags" idiom removes edges instead of leaving them stale.
+        # #7405: `create_point` already rides the retry for this same helper
+        # (`"create_point TAGGED edges"`); the update door did not, so the
+        # same mutation surface behaved differently depending on which verb
+        # the caller used. `_sync_tags` MERGEs each TAGGED edge and DELETEs the
+        # dropped ones by an explicit id, so a re-issue after a non-landing
+        # abort converges on the caller's tag list.
         if "tags" in props:
-            self._sync_tags(proj, id, props["tags"] or [])
+            self._graph_write_with_retry(
+                lambda: self._sync_tags(proj, id, props["tags"] or []),
+                what="update_point TAGGED edges",
+            )
         # Dreaming (#85): property mutations can affect confidence.
         self._mark_dirty([id])
         result = self.get_point(id)
@@ -10628,19 +10677,34 @@ class TortoiseSDK:
             valid_to_precision=end_precision, expired_at=now,
         )
 
-        proj.g.query(
-            "MATCH (n:Point {id:$id}) SET n.outdated = true, "
-            "n.updatedAt = $now, n.validTo = $valid_to, "
-            "n.validToPrecision = $valid_to_precision, "
-            "n.expiredAt = $now, "
-            f"{decay_clause('n')}",
-            params={"id": id, "now": now, "valid_to": stamp_valid_to,
-                    "valid_to_precision": end_precision},
+        # #7405: both statements are retry-admissible on
+        # `retryable_aborted_write` alone. The terminal stamp is an ABSOLUTE
+        # `SET` whose every value (``now``, ``stamp_valid_to``,
+        # ``end_precision``) was fixed before the first attempt, so a re-issue
+        # writes the same end-state without moving the window end; the
+        # `CORRECTS` edge is a MERGE on its endpoints, so it cannot double.
+        # The abort means the statement did not land, so neither re-issue can
+        # re-apply an effect — which is why this is safe even though the event
+        # above is emitted BEFORE the mutation.
+        self._graph_write_with_retry(
+            lambda: proj.g.query(
+                "MATCH (n:Point {id:$id}) SET n.outdated = true, "
+                "n.updatedAt = $now, n.validTo = $valid_to, "
+                "n.validToPrecision = $valid_to_precision, "
+                "n.expiredAt = $now, "
+                f"{decay_clause('n')}",
+                params={"id": id, "now": now, "valid_to": stamp_valid_to,
+                        "valid_to_precision": end_precision},
+            ),
+            what="invalidate_point terminal stamp SET",
         )
-        proj.g.query(
-            "MATCH (a:Point {id:$new_id}), (b:Point {id:$old_id}) "
-            "MERGE (a)-[:CORRECTS]->(b)",
-            params={"new_id": corrected_by_id, "old_id": id},
+        self._graph_write_with_retry(
+            lambda: proj.g.query(
+                "MATCH (a:Point {id:$new_id}), (b:Point {id:$old_id}) "
+                "MERGE (a)-[:CORRECTS]->(b)",
+                params={"new_id": corrected_by_id, "old_id": id},
+            ),
+            what="invalidate_point CORRECTS edge",
         )
         # Dreaming (#85): invalidation changes the propagation graph.
         # #2422 ORDERING: message drops BEFORE _mark_dirty's epoch bump (see
