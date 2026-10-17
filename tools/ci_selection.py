@@ -1159,6 +1159,32 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # `test_test_lane_tool.py`). Pinned by
              # tests/test_ci_selection.py::test_lane_stash_guard_runs_on_a_tools_only_change.
              "tools/lane_stash.py",
+             # #5612: the journal-growth measurement (`tools/journal_growth.py`)
+             # and its probe
+             # (`docs/evidence/5612-journal-growth/probes/corpus_growth_probe.py`)
+             # own `tests/test_journal_growth.py`, registered `core`. BOTH paths
+             # sit under NON_PYTHON_PREFIXES (`tools/`, `docs/`) and match no
+             # SOURCE_PATTERNS row, so before these entries a tool-only or
+             # probe-only change came back with `changed == []`, took the
+             # docs-only early return, and the accounting pins
+             # (`bytes + other_bytes == file size`, malformed counted not
+             # raised) never ran on the file they guard — the
+             # #1349/#3332/#3616 silent-drop class, the same shape as
+             # `tools/lane_stash.py` above and
+             # `docs/evidence/7950-capstone/probes/` above. Pinned by
+             # tests/test_ci_selection.py::test_journal_growth_guard_runs_on_a_tool_or_probe_change.
+             "tools/journal_growth.py",
+             "docs/evidence/5612-journal-growth/probes/",
+             # #5612: `tests/test_journal_growth.py` hard-codes the CORPUS's
+             # shape (`records == 39`, 29 distinct types), so an edit to the
+             # fixture alone must select `core` too — it sits under
+             # NON_PYTHON_PREFIXES (`supabase/`) and matches no SOURCE_PATTERNS
+             # row, so without this entry a fixture-only diff (e.g. adding a
+             # 30th record type — the reason such a corpus exists) came back
+             # `changed == []`, took the docs-only early return, and the pins
+             # never ran on the bytes they hard-code. Pinned by
+             # tests/test_ci_selection.py::test_journal_growth_guard_runs_on_a_tool_or_probe_change.
+             "supabase/tests/fixtures/record_projection_journal.jsonl",
              # #8491: the meeting→CRM bridge. `integrations/` is a flat
              # NON_PYTHON_PREFIXES entry and bridge.py matches no
              # SOURCE_PATTERNS row, so a bridge.py-only change was filtered out
