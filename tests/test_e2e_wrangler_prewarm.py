@@ -231,10 +231,50 @@ def test_the_three_website_e2e_jobs_install_and_verify() -> None:
         assert '"$WRANGLER_VERSION"' in run, (
             f"{job}: the verify step installs/comares something other than the declared value"
         )
-        assert re.search(r"for attempt in (?:1 )?2(?: 3)?;", run), (
-            f"{job}: the install lost its retry loop — one npm-registry ECONNRESET "
-            "(2026-10-15) reded the required legal-e2e check when the fetch had none"
+        # The retry must be the REAL three-attempt loop, as CODE. An optional-group
+        # regex (`(?:1 )?2(?: 3)?`) also matched a one-attempt `for attempt in 2;`,
+        # a two-attempt `for attempt in 1 2;`, and a commented-out
+        # `# was: for attempt in 1 2 3;` — a guard satisfiable by exactly the
+        # degenerations it exists to reject, so it asserted nothing.
+        code = "\n".join(
+            ln for ln in run.splitlines() if not ln.lstrip().startswith("#")
         )
+        assert "for attempt in 1 2 3;" in code, (
+            f"{job}: the install lost its three-attempt retry loop — one npm-registry "
+            "ECONNRESET (2026-10-15) reded the required legal-e2e check when the "
+            "fetch had none"
+        )
+
+
+def test_the_verify_step_precedes_every_boot_in_the_same_job() -> None:
+    """The boot must run the binary the verify step proved — asserted as an ORDER.
+
+    ``test_the_three_website_e2e_jobs_install_and_verify`` proves a verify step
+    EXISTS in each job, and ``test_boot_steps_carry_no_spec_and_keep_their_retry``
+    proves the boot carries no spec. Neither asserts that the verify runs FIRST:
+    with the order unasserted, moving the verify after the boot leaves the boot
+    running whatever global ``wrangler`` happens to be on PATH, unverified, while
+    every test in this file stays green.
+    """
+    verify_at: dict[str, list[int]] = {}
+    boot_at: dict[str, list[int]] = {}
+    steps = _all_steps(_load(WORKFLOWS / "ci.yml").get("jobs") or {})
+    for idx, (job, step) in enumerate(steps):
+        name = step.get("name") or ""
+        if name == VERIFY_STEP:
+            verify_at.setdefault(job, []).append(idx)
+        elif name.startswith(BOOT_STEP_PREFIX):
+            boot_at.setdefault(job, []).append(idx)
+
+    for job in sorted(PREWARM_JOBS):
+        verifies = verify_at.get(job) or []
+        assert verifies, f"{job}: no {VERIFY_STEP!r} step at all"
+        for boot in boot_at.get(job) or []:
+            assert any(v < boot for v in verifies), (
+                f"{job}: the boot at step {boot} runs BEFORE every verify step "
+                f"{verifies} — the boot would use whatever wrangler is on PATH, "
+                "which nothing asserted"
+            )
 
 
 def test_the_verify_step_is_unconditional() -> None:
@@ -359,9 +399,24 @@ def test_the_manual_deploy_script_pins_the_same_version() -> None:
     code = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
-    assert 'cat "$(dirname "$0")/../../../config/wrangler-version"' in code, (
-        "the manual deploy does not read config/wrangler-version — it would deploy "
-        "an unasserted wrangler"
+    # The read must go through an ABSOLUTE script dir resolved BEFORE any `cd`.
+    # This arm used to pin the literal `cat "$(dirname "$0")/…config/wrangler-version"`,
+    # which pinned the BUG: after `cd "$(dirname "$0")"`, a RELATIVE `$0` makes that
+    # path double-apply the prefix, so the documented
+    # `bash website/apps/dashboard/deploy.sh` aborted with "No such file or
+    # directory" — and no arm could see it, because the arm asserted the broken
+    # text verbatim (#8816 review).
+    assert 'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"' in code, (
+        "the manual deploy does not resolve an ABSOLUTE script dir — a relative `$0` "
+        "re-derived after `cd` points at a path that does not exist"
+    )
+    assert 'cat "$SCRIPT_DIR/../../../config/wrangler-version"' in code, (
+        "the manual deploy does not read config/wrangler-version through SCRIPT_DIR — "
+        "it would deploy an unasserted wrangler"
+    )
+    assert 'cat "$(dirname "$0")/../../../config/wrangler-version"' not in code, (
+        "the relative-`$0` read is back: after `cd`, it double-applies the prefix and "
+        "the documented manual deploy aborts"
     )
     assert "--version" in code, "the manual deploy never asserts what resolved"
     for match in re.finditer(r"wrangler@\S*", code):
