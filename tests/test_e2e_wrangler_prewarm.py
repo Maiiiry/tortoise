@@ -7,16 +7,16 @@ and never looked at `deploy-pages.yml` at all — where `wrangler@4` floated in
 production. Two measurements decided the replacement (bash 5, node 22):
 
   * `wrangler --version` prints the bare resolved version on stdout;
-  * a float declaration can never equal its own resolution — `wrangler@4`
-    resolves to 4.151.1 there. On a warm npm cache `npx wrangler@4 --version`
-    can print the pinned version itself, so the assertion is NOT the float
-    guard: the TEXT arms below are.
+  * a float declaration fails that comparison on a COLD resolution (`wrangler@4`
+    resolved to 4.151.1). It can PASS on a warm npm cache, which may serve the
+    pinned tarball for `@4` — so the assertion is not the float guard: the TEXT
+    arms below are, and the two are complementary rather than redundant.
 
 So the version now lives in ONE file, `config/wrangler-version`, and the lane
-ASSERTS the version it got against it. That is exact for every spelling,
-including the ones no text scan can see, because it compares an observation to a
-declaration. The boot steps then run bare `wrangler`, so there is no spec at the
-call site to float, and the deploy steps assert before they upload.
+ASSERTS the version it got against it — a comparison between an observation and a
+declaration, which is exact whenever the pin differs from what a float resolves
+to. The boot steps then run bare `wrangler`, so there is no spec at the call site
+to float, and the deploy steps assert before they upload.
 
 What is left for THIS file is the shape that keeps those properties true:
 
@@ -52,11 +52,13 @@ text scan over the workflows can see. The spec and invocation arms refuse the
 first in every workflow file, every composite action and the command docs; the
 executed harnesses in `tests/test_pages_bindings.py` prove the deploy step's
 assertion, and the arms below EXECUTE the manual deploy script rather than
-grepping its path. Two spellings remain uncovered, both deliberate and both
-declared here rather than implied closed: a spec split by quoting
-(`wran"g"ler@4` — the invocation scan strips quotes, so it reads `wranler`), and
-the alias/function/wrapper case above. Neither is closable by reading text, which
-is why the enforcement that matters is the assertion on the binary that runs.
+grepping its path. One spelling remains uncovered and is declared here rather than
+implied closed: a version that reaches npm through an alias, a function or a
+wrapper script naming its own version — no text scan over these files can see it,
+which is why the enforcement that matters is the assertion on the binary that
+runs. A spec SPLIT by quoting (`wran"g"ler@4`) is covered: the spec arm retries
+each segment with the quote characters removed, which is exactly the word bash
+runs.
 """
 
 from __future__ import annotations
@@ -130,19 +132,24 @@ def _is_constant_false(gate: object) -> bool:
     return bool(_CONSTANT_FALSE.match(str(gate).strip()))
 
 
-def _fenced_blocks(text: str) -> list[tuple[int, str]]:
-    """Every ``` fence's lines as `(file line number, line)` — the parts a reader
-    would PASTE. The number is the FILE's: joining the fences and numbering the
-    result points a reader at the wrong line of the README (measured: a command
-    on line 263 was reported as line 31)."""
-    out, inside = [], False
+def _fenced_blocks(text: str) -> list[list[tuple[int, str]]]:
+    """Every ``` fence as its lines `(file line number, line)` — the parts a
+    reader would PASTE. Grouped per FENCE (not flattened) so a fence can be
+    judged on its own, and numbered with the FILE's line, because joining the
+    fences and numbering the result points a reader at the wrong line."""
+    blocks, inside, current = [], False, []
     for lineno, line in enumerate(text.splitlines(), 1):
         if line.lstrip().startswith("```"):
+            if inside:
+                blocks.append(current)
+                current = []
             inside = not inside
             continue
         if inside:
-            out.append((lineno, line))
-    return out
+            current.append((lineno, line))
+    if current:
+        blocks.append(current)
+    return blocks
 
 def _workflow_paths() -> list:
     """Every file that can carry a `run:` — workflows AND composite actions.
@@ -267,7 +274,13 @@ def _cut_comment(line: str) -> str:
 #: Matched against ONE command segment, never a whole line: `echo "x"; npx
 #: wrangler@4 …` runs a real invocation after the message, so a line-scoped
 #: exemption hides exactly the spec this arm exists to refuse (measured).
-_DIAGNOSTIC = re.compile(r"^\s*(?:-\s*)?(?:run:\s*)?(?:echo|printf)\b")
+_DIAGNOSTIC = re.compile(
+    r"^[\s{}\(\)]*(?:(?:then|else|do|run:|)\s+)*(?:-\s*)?(?:echo|printf)\b"
+)
+
+#: A pipe into one of these EXECUTES what the left side printed, so a message
+#: segment feeding one of them is a command with extra steps.
+_INTERPRETER = re.compile(r"\|\s*(?:sh|bash|zsh|source|\.)(?![\w-])")
 
 
 def _command_segments(line: str) -> list[str]:
@@ -303,11 +316,17 @@ def _command_segments(line: str) -> list[str]:
     return [seg for seg in segments if seg.strip()]
 
 
-def _is_diagnostic(segment: str) -> bool:
-    """True only for a segment that PRINTS and cannot execute a command."""
+def _is_diagnostic(segment: str, line: str = "") -> bool:
+    """True only for a segment that PRINTS and cannot execute a command.
+
+    `line` is passed so a message feeding an interpreter (`echo '…' | sh`) is not
+    exempt: the printed text IS the command.
+    """
     if "$(" in segment or "`" in segment:
         return False
-    return bool(_DIAGNOSTIC.match(segment))
+    if _INTERPRETER.search(line or segment):
+        return False
+    return bool(_DIAGNOSTIC.match(segment.lstrip().rstrip("};").rstrip()))
 
 def _strip_quoted(line: str) -> str:
     """`line` with quoted SEGMENTS removed — a diagnostic is not a command.
@@ -436,9 +455,12 @@ def test_every_wrangler_spec_is_the_asserted_form() -> None:
                 # A MESSAGE may name the bad spelling (this repo's steps carry
                 # `::error::` diagnostics); only a command may not use it — and
                 # only the segment that IS the message, not a line that has one.
-                if _is_diagnostic(segment):
+                if _is_diagnostic(segment, code):
                     continue
-                for match in re.finditer(r"wrangler@\S*", segment):
+                # A spec SPLIT by quoting (`wran"g"ler@4`) is the word bash runs
+                # once the quotes go; retry each segment dequoted. A legal quoted
+                # spec still matches LEGAL_SPEC after dequoting.
+                for match in re.finditer(r"wrangler@\S*", re.sub(r"[\"']", "", segment)):
                     token = match.group(0)
                     if LEGAL_SPEC.match(token):
                         continue
@@ -914,9 +936,11 @@ def test_no_document_shows_a_floating_wrangler_spec() -> None:
         text = path.read_text(encoding="utf-8")
         # Only FENCED code, not prose: a doc may legitimately name the bad
         # spelling while explaining why it is bad.
-        fenced = [line for _n, line in _fenced_blocks(text)
-                  if not line.lstrip().startswith("#")]
-        code = "\n".join(fenced)
+        blocks = [
+            [(n, line) for n, line in block if not line.lstrip().startswith("#")]
+            for block in _fenced_blocks(text)
+        ]
+        code = "\n".join(line for block in blocks for _n, line in block)
         offenders = [
             token
             for token in re.findall(r"wrangler@[^\s`\"')]+", code)
@@ -929,15 +953,26 @@ def test_no_document_shows_a_floating_wrangler_spec() -> None:
         # Per LINE, so the reported number is the file's.
         bare = [
             f"line {lineno}: {hit.split(': ', 1)[-1]}"
-            for lineno, line in _fenced_blocks(text)
+            for block in _fenced_blocks(text)
+            for lineno, line in block
             for hit in _bare_invocations(line)
         ]
         assert not bare, (
             f"{rel} shows a spec-less wrangler command ({bare}) — a paste of it "
             "runs whatever npm serves, with nothing asserting what that was"
         )
-        if "wrangler@" in code:
-            assert "config/wrangler-version" in text, (
-                f"{rel} shows a wrangler command without pointing at "
+        # Per FENCE, not file-wide: a fence that shows a wrangler spec must also
+        # show where the version comes from, or it teaches a literal (`V=4`) while
+        # another fence satisfies a whole-file substring check.
+        for block in blocks:
+            shown = "\n".join(line for _n, line in block)
+            if "wrangler@" not in shown:
+                continue
+            assert "config/wrangler-version" in shown, (
+                f"{rel}: a fence shows a wrangler spec without reading "
                 "config/wrangler-version — the version has one home"
+            )
+            assert not re.search(r"WRANGLER_VERSION=[\"']?\d", shown), (
+                f"{rel}: a fence assigns WRANGLER_VERSION a literal — it must read "
+                "config/wrangler-version, or a bump drifts here"
             )
