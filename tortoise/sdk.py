@@ -3582,6 +3582,142 @@ def _item_declares_outdated(item: dict) -> bool:
     return isinstance(nested, dict) and "outdated" in nested
 
 
+def _item_effective_is_operator(item: dict) -> tuple[bool, bool]:
+    """``(declares, value)`` for an ingest bundle item's ``is_operator`` —
+    top-level OR nested under ``props``, with ``_coerce_props``' PRESENCE
+    precedence (a top-level ``is_operator: None`` shadows the nested key),
+    mirroring :func:`_item_effective_status` / :func:`_item_declares_outdated`
+    (#7925 review P1).
+
+    Why it matters: ``is_operator`` is in none of the handled-prop sets, so the
+    writer persists it onto the NODE — and an operator node is not a connection
+    endpoint on any route (``create_direct_edge`` and ``_check_endpoint_race``
+    both refuse it). Reading only the top-level key left the nested spelling to
+    reach the writer, which then aborted mid-write after steps 2-3 had
+    committed (measured).
+
+    ``declares`` is separate from ``value`` because a FALSY declaration is
+    meaningful: on a name-merged label the extra-props lane is ``SET n +=
+    $extra`` on the merged node — LAST DECLARATION WINS — so a later
+    ``is_operator: False`` clears the flag the first item (or an existing
+    holder) set. An OR over the items would refuse a bundle the writer accepts
+    (measured, review round 4).
+
+    ``declares`` means THE WRITER WILL WRITE A BOOLEAN — not "the key is
+    present" — or, conservatively, a value that would be operator-shaped if it
+    could be written (see the last paragraph). ``_persist_extra_props`` drops ``None`` and any non-persistable
+    value (a map, bytes), so such an entry performs NO write and cannot clear a
+    flag an earlier item or a holder set; counting it as a declaration made
+    Phase 1 pass a bundle whose step 4 then refused the still-operator-shaped
+    node (measured, review round 5). The reverse case is the documented
+    conservatism: a TRUTHY non-persistable value is refused even though no node
+    would carry it — over-rejecting nonsense input in the fail-closed direction
+    is the right trade.
+    """
+    from .projection.entities import _is_persistable_prop_value
+    if "is_operator" in item:
+        value = item.get("is_operator")
+    else:
+        nested = item.get("props")
+        if not isinstance(nested, dict) or "is_operator" not in nested:
+            return False, False
+        value = nested.get("is_operator")
+    if value is None or _is_persistable_prop_value(value):
+        # A persistable value IS written; ``None`` is dropped by the writer, so
+        # it performs no write and declares nothing.
+        return (value is not None), bool(value)
+    # Not persistable, so no write happens either — but keep the fail-closed
+    # reading for a truthy value (see the docstring).
+    return bool(value), bool(value)
+
+
+def _item_is_operator(item: dict) -> bool:
+    """True when the item itself is operator-SHAPED — the single-item view of
+    :func:`_item_effective_is_operator`. The name-merged arms use the
+    ``(declares, value)`` form instead, because the writer's outcome is the
+    LAST declaration under the name, not any one item."""
+    return _item_effective_is_operator(item)[1]
+
+
+# #7925: entity-item ``type`` → node label, spelled the way step 3's writer
+# ladder spells it (``if etype == "subject" … elif "document"``). ONE
+# declaration for the gate's Phase-1 readers — the endpoint label check and the
+# bundle pre-scan below — so the two cannot disagree about which items share a
+# merged name.
+_ENTITY_ITEM_LABELS = {"subject": "Subject", "object": "Object",
+                       "event": "Event", "document": "Source"}
+
+
+def _bundle_entity_name_outcomes(
+    bundle: dict,
+) -> dict[tuple[str, str], tuple[str | None, bool, bool, bool, str | None]]:
+    """``{(label, name): (born_status, declares_outdated, operator_declared,
+    operator_value, operator_item_ref)}`` for the NAME-MERGED entity items in a
+    bundle — the *simulated* state the Phase-1 endpoint gate has to answer
+    against (#7925 review P1). ``operator_item_ref`` names the item whose
+    declaration decides the operator axis, so a refusal can point at the item to
+    fix.
+
+    Why a whole-bundle pre-scan and not the item in hand: ``ingest`` writes the
+    entity items in step 3 **in bundle order** (connections in step 4), and the
+    name merge applies ``status`` **at mint only** — the projection's
+    ``_upsert_subject`` / ``_upsert_object`` set ``status`` in ``ON CREATE`` and
+    ``ON MATCH`` never touches it. So when no node holds the name yet, the node
+    the writer mints is the one the FIRST item naming it describes, and every
+    later same-name item merges onto that node and keeps its status. The
+    effective terminality of the endpoint is therefore a property of the ordered
+    items PLUS the graph, never of the one item a connection happens to
+    reference — which is exactly the shape a name-merge bundle exists for.
+
+    ``declares_outdated`` is the OTHER axis and is order-independent:
+    ``_sanitize_props`` refuses the server-managed flag on PRESENCE for every
+    entity writer, so an item carrying it raises in step 3 whichever item it is
+    and whether or not a holder exists.
+
+    ``operator_*`` is the third axis and follows the WRITER, which is neither
+    "the item in hand" nor an OR over the name: ``is_operator`` rides the
+    extra-props lane, whose clause is ``SET n += $extra`` on the MERGED node, so
+    the LAST item under the name that declares it decides — a later
+    ``is_operator: False`` clears the flag an earlier item set, and an earlier
+    ``True`` taints the node every ref resolving to that name will see (and can
+    mark a pre-existing holder). Both directions were measured: the OR refused
+    bundles the writer accepts (review round 4), and the item-only read let
+    tainted ones through (round 2).
+
+    Only ``Subject``/``Object`` merge by name. An ``Event`` is append-only (its
+    own declared ``status`` is the whole story, and the guard reads it from the
+    item), and a ``document`` is a ``:Source`` — neither can be addressed here.
+    """
+    outcomes: dict[
+        tuple[str, str], tuple[str | None, bool, bool, bool, str | None]] = {}
+    for item in bundle.get("entities") or []:
+        if not isinstance(item, dict):
+            continue
+        elabel = _ENTITY_ITEM_LABELS.get(
+            str(item.get("type") or "").strip().lower())
+        name = item.get("name")
+        if elabel not in ("Subject", "Object") \
+                or not isinstance(name, str) or not name:
+            continue
+        key = (elabel, name)
+        first = key not in outcomes
+        born, outdated, op_declared, op_value, op_ref = outcomes.get(
+            key, (None, False, False, False, None))
+        if first:
+            # The MINT: what the node carries if no holder exists. A first item
+            # that declares nothing is decisive too — a later item's declared
+            # status is NOT applied by the merge, so it must not become `born`.
+            born = _item_effective_status(item)
+        declares_op, declares_op_value = _item_effective_is_operator(item)
+        if declares_op:
+            # LAST declaration wins (`SET n += $extra` on the merged node).
+            op_declared, op_value = True, declares_op_value
+            op_ref = item.get("ref")
+        outcomes[key] = (born, outdated or _item_declares_outdated(item),
+                         op_declared, op_value, op_ref)
+    return outcomes
+
+
 # ── ULID validation (Issue #52) ──
 # Canonical format (from tortoise/ids.py): <timestamp-hex>-<uuid12>
 _ULID_RE = re.compile(r"^[0-9a-f]+-[0-9a-f]{12}$")
@@ -13950,7 +14086,7 @@ class TortoiseSDK:
             "MATCH (n) WHERE n.id IN $vals OR n.url IN $vals "
             "OR n.eventId IN $vals "
             "RETURN coalesce(n.id, n.url, n.eventId) AS key, "
-            "head(labels(n)) AS label, n.is_operator, n.status, "
+            "head(labels(n)) AS label, n.name, n.is_operator, n.status, "
             "coalesce(n.outdated, false) AS outdated, n.id, n.eventId",
             params={"vals": sorted(values)},
         ).result_set
@@ -13966,8 +14102,8 @@ class TortoiseSDK:
         # key resolve deterministically: an id-owner row (node_id == key)
         # wins over a row matched by another property.
         out: dict[str, dict] = {}
-        for key, label, is_op, status, outdated, node_id, event_id in rows:
-            entry = {"label": label, "is_operator": bool(is_op),
+        for key, label, name, is_op, status, outdated, node_id, event_id in rows:
+            entry = {"label": label, "name": name, "is_operator": bool(is_op),
                      "status": status, "outdated": bool(outdated),
                      "id": node_id}
             if key not in out or node_id == key:
@@ -14108,13 +14244,15 @@ class TortoiseSDK:
                 ).result_set
         return rows[0][0] if rows else None
 
-    def _entity_name_holders(self, label: str, name: str) -> tuple[bool, str | None]:
-        """``(exists_by_name, terminal_holder_id)`` for a bundle-local entity
-        ref (#7925) — the entity sibling of :meth:`_find_terminal_dedup_hit`,
-        and it exists for the same reason: the bundle-local terminal guard has
-        to resolve the endpoint the WRITER will use, or the guard fails open
-        and the endpoint becomes a mid-write raise on a partially-mutated
-        graph.
+    def _entity_name_holders(
+        self, label: str, name: str,
+    ) -> tuple[bool, str | None, str | None]:
+        """``(exists_by_name, terminal_holder_id, operator_holder_id)`` for a
+        bundle-local entity ref (#7925) — the entity sibling of
+        :meth:`_find_terminal_dedup_hit`, and it exists for the same reason:
+        the bundle-local endpoint guard has to resolve the endpoint the WRITER
+        will use, or the guard fails open and the endpoint becomes a mid-write
+        raise on a partially-mutated graph.
 
         ``:Subject``/``:Object`` are keyed by NAME — the projection MERGEs by
         name and ``ids.entity_name_id`` makes the ``(label, name)`` id
@@ -14135,23 +14273,30 @@ class TortoiseSDK:
         the safe direction). The terminal predicate is the shared
         ``live._terminal_expression`` Cypher builder (#3142), so this guard and
         the Point leg cannot disagree about what "terminal" means.
+
+        ``operator_holder_id`` is the same conservatism on the OTHER axis
+        (#7925 review round 3): an operator-shaped holder is not a connection
+        endpoint on any route either, so a ref merging onto it aborts in step 4
+        after step 3 committed. It cannot be folded into the terminal query
+        (that one is status-scoped), so the rows are read once and classified
+        here — the holder set for a name-merged label is one node in practice.
         """
         proj = self._get_proj()
         rows = proj.g.query(
             f"MATCH (n:{label} {{name:$name}}) "
-            f"WHERE {_terminal_expression('n')} RETURN n.id LIMIT 1",
+            f"RETURN n.id, {_terminal_expression('n')} AS term, "
+            f"coalesce(n.is_operator, false) AS op",
             params={"name": name},
         ).result_set
-        if rows:
-            return True, rows[0][0]
-        # No terminal holder: ask the cheaper question the declared-status leg
-        # needs — does a holder exist at all? (A terminal holder short-circuits
-        # above, so this second query only runs for the live-or-absent case.)
-        exists = bool(proj.g.query(
-            f"MATCH (n:{label} {{name:$name}}) RETURN n.id LIMIT 1",
-            params={"name": name},
-        ).result_set)
-        return exists, None
+        if not rows:
+            return False, None, None
+        for holder_id, _term, _op in rows:
+            if _term:
+                return True, holder_id, None
+        for holder_id, _term, _op in rows:
+            if _op:
+                return True, None, holder_id
+        return True, None, None
 
     def _check_endpoints(self, bundle: dict, violations: list[dict]) -> None:
         """Check 3 (endpoint half) — typed endpoints (external + bundle-local,
@@ -14173,6 +14318,27 @@ class TortoiseSDK:
         route by hand — the operator route on Point-or-Event (the #2062
         carve-out, still id-anchored), the direct route on plain Point — and
         the direct half was left stricter than the primitive it calls.
+
+        The widening is what made a bundle-local ENTITY ref reachable on the
+        direct route, so the gate also refuses, in Phase 1 (zero mutation), the
+        states that would only raise in steps 3-4 after earlier items committed:
+
+        - an operator-shaped item, top-level or the ``props`` spelling, for
+          points and entities alike — and, on a name-merged label, an
+          operator-shaped item ANYWHERE under that name (its extra-props write
+          lands on the merged node) or an existing operator-shaped holder,
+          unless a later PERSISTABLE declaration under the name clears the flag
+          (``null`` and non-persistable values are dropped by the writer, so
+          they clear nothing);
+        - the direct-route terminal legs: a terminal name holder, the
+          ``outdated`` flag on any same-name item, and a terminal ``status`` on
+          the FIRST item naming the name (``status`` applies at mint only);
+        - two endpoints that resolve to the SAME name-merged node (two refs, or
+          a ref and the node id) — a self-edge ``create_direct_edge`` refuses.
+
+        ``_bundle_entity_name_outcomes`` is the simulated bundle state those
+        by-name legs resolve against; see its docstring for why the answer is a
+        property of the ordered items plus the graph, never of one item.
         """
         local: dict[str, tuple[str, dict]] = {}
         for section in ("sources", "points", "entities"):
@@ -14193,8 +14359,26 @@ class TortoiseSDK:
                     external.add(v)
             conns.append((i, conn, route, [frm] + to_list))  # noqa: RUF005
         node_info = self._fetch_endpoint_info(external)
-        entity_labels = {"subject": "Subject", "object": "Object",
-                         "event": "Event", "document": "Source"}
+        entity_labels = _ENTITY_ITEM_LABELS
+        # (#7925 review P1) The entity arm resolves a name against the
+        # SIMULATED bundle state, not against one item: step 3 writes the
+        # entity items in bundle order and the name merge applies `status` only
+        # at MINT, so a name's effective terminality is a property of the
+        # ordered items combined with the graph. The LABEL gate reads the same
+        # pre-scan (the `operator_shaped` axis), which is why it is computed
+        # here rather than at the terminal guard. Pure Python, no graph read.
+        name_outcomes = _bundle_entity_name_outcomes(bundle)
+        # Per-name holder probe memo (#7925 review round 3): the label gate and
+        # the terminal guard ask the SAME question about the same name, and the
+        # probe is a graph read — resolve each (label, name) once.
+        holders: dict[tuple[str, str], tuple[bool, str | None, str | None]] = {}
+
+        def _name_holders(elabel: str, name: str) \
+                -> tuple[bool, str | None, str | None]:
+            key = (elabel, name)
+            if key not in holders:
+                holders[key] = self._entity_name_holders(elabel, name)
+            return holders[key]
         for i, conn, route, vals in conns:  # noqa: B007
             # #7925: the endpoint-label gate is ROUTE-INDEPENDENT — the four
             # epistemic labels, addressed by node id. An endpoint is accepted
@@ -14214,37 +14398,136 @@ class TortoiseSDK:
                     # write primitives accept. An entity item typed `document`
                     # is a `:Source`, so it stays out.
                     etype = str(item.get("type") or "").strip().lower()
-                    plain_point = section == "points" \
-                        and not item.get("is_operator")
+                    elabel = entity_labels.get(etype)
+                    # #7925 review P1: an operator-SHAPED item is not an
+                    # endpoint on either route — `is_operator` rides the
+                    # writer's extra-props lane onto the node, and both
+                    # `create_direct_edge` and `_check_endpoint_race` refuse it.
+                    # The point arm always tested this; the entity arm has to
+                    # test it too or a bundle passes Phase 1 and dies in Phase 2
+                    # with steps 2-3 committed (measured).
+                    #
+                    # Two things the one-item read gets wrong, both probed: the
+                    # `props={...}` spelling `_coerce_props` flattens
+                    # (`_item_is_operator`), and — on a name-merged label — an
+                    # operator-shaped item that is NOT the referenced one, whose
+                    # `ON MATCH` extra-props write taints the merged node (and can
+                    # mark a pre-existing live one). Hence the name pre-scan, and
+                    # hence no `exists` guard: the taint applies either way.
+                    #
+                    # review round 3 added the HOLDER axis: an operator-shaped
+                    # node that already holds the name is not an endpoint either,
+                    # and `ingest` itself can mint one — so a later bundle simply
+                    # naming it passed Phase 1 and died in step 4.
+                    is_operator_item = _item_is_operator(item)
+                    operator_shaped = is_operator_item
+                    operator_ref = None
+                    tainted_by_bundle = False
+                    if section == "entities" and elabel in ("Subject", "Object"):
+                        ep_name = item.get("name")
+                        if isinstance(ep_name, str) and ep_name:
+                            _born, _old, _op_decl, _op_val, _op_ref = \
+                                name_outcomes.get(
+                                    (elabel, ep_name),
+                                    (None, False, False, False, None))
+                            # A bundle declaration is what step 3 writes and the
+                            # LAST one wins, so it overrides the holder; with no
+                            # declaration at all the holder's own flag stands.
+                            if _op_decl:
+                                operator_shaped = _op_val
+                                operator_ref = _op_ref if _op_val else None
+                                tainted_by_bundle = _op_val
+                            else:
+                                operator_shaped = _name_holders(
+                                    elabel, ep_name)[2] is not None
+                    plain_point = section == "points" and not operator_shaped
                     epistemic_entity = section == "entities" \
-                        and entity_labels.get(etype) \
-                        in self._INGEST_ENDPOINT_LABELS
+                        and elabel in self._INGEST_ENDPOINT_LABELS \
+                        and not operator_shaped
                     if not (plain_point or epistemic_entity):
                         if section == "sources":
-                            label = "Source"
+                            got = "Source item"
                         elif section == "entities":
-                            label = entity_labels.get(etype, "entity")
+                            if is_operator_item:
+                                got = "operator-shaped entity item"
+                            elif tainted_by_bundle:
+                                got = (f"{elabel} whose bundle item "
+                                       f"{operator_ref!r} is operator-shaped"
+                                       if operator_ref else
+                                       f"{elabel} whose bundle item (no "
+                                       f"ref) is operator-shaped")
+                            else:
+                                got = (f"{elabel} whose existing name "
+                                       f"holder is operator-shaped")
+                            if not operator_shaped:
+                                got = f"{elabel or 'entity'} item"
                         else:
-                            label = "operator-shaped point item"
+                            got = "operator-shaped point item"
                         violations.append({
                             "section": "connections", "index": i,
                             "message": f"ingest: connections[{i}] bundle-local "
                                        f"endpoint {v!r} must be a "
                                        f"{self._INGEST_ENDPOINT_CONTRACT} "
-                                       f"endpoint — got a {label} item",
+                                       f"endpoint — got a {got}",
                         })
                 else:
                     info = node_info.get(v)
+                    _op_declared = bool(
+                        info is not None
+                        and info["label"] in ("Subject", "Object")
+                        and isinstance(info.get("name"), str)
+                        and name_outcomes.get(
+                            (info["label"], info["name"]),
+                            (None, False, False, False, None))[2])
                     if info is None:
                         violations.append({
                             "section": "connections", "index": i,
                             "message": f"ingest: connections[{i}] external "
                                        f"endpoint {v!r} does not exist",
                         })
-                    elif info["is_operator"] \
+                    # #7925 review round 3: step 3 writes EVERY entity item,
+                    # so an operator-shaped item taints its name even when no
+                    # connection references it — and a connection may address
+                    # that same node BY ITS ID. Phase 1 read the graph only and
+                    # let it through to a Phase-2 raise with the point (and the
+                    # tainted node) left behind (measured). Route-independent,
+                    # like the graph-side operator test below.
+                    elif (info["label"] in ("Subject", "Object")
+                          and isinstance(info.get("name"), str)
+                          and name_outcomes.get(
+                              (info["label"], info["name"]),
+                              (None, False, False, False, None))[2]
+                          and name_outcomes[
+                              (info["label"], info["name"])][3]):
+                        # (declared AND true: a later `is_operator: False`
+                        # under the name clears it again — last write wins.)
+                        _op_ref = name_outcomes[
+                            (info["label"], info["name"])][4]
+                        _taint = (f"bundle item {_op_ref!r} is operator-shaped"
+                                  if _op_ref else
+                                  "a bundle item with no ref is "
+                                  "operator-shaped")
+                        violations.append({
+                            "section": "connections", "index": i,
+                            "message": f"ingest: connections[{i}] endpoint "
+                                       f"{v!r} names the {info['label']} "
+                                       f"{info['name']!r}, and {_taint} — "
+                                       f"step 3 writes that onto the merged "
+                                       f"node, so the endpoint is "
+                                       f"operator-shaped",
+                        })
+                    elif (info["is_operator"]
+                          # A bundle declaration under the endpoint's name is a
+                          # real step-3 write (`SET n += $extra`, last wins), so
+                          # a persisted `is_operator: false` CLEARS the flag and
+                          # the node is a legal endpoint again. The graph-side
+                          # test must defer to it, exactly as the bundle-local
+                          # arm does (review round 5).
+                          and not _op_declared) \
                             or info["label"] not in self._INGEST_ENDPOINT_LABELS \
                             or info.get("id") != v:
-                        got = ("operator Point" if info["is_operator"]
+                        got = (f"operator {info['label']}"
+                               if info["is_operator"]
                                else info["label"] or "unknown node type")
                         violations.append({
                             "section": "connections", "index": i,
@@ -14268,6 +14551,46 @@ class TortoiseSDK:
         for i, conn, route, vals in conns:  # noqa: B007
             if route != "direct":
                 continue
+            # #7925 review P1: endpoints that resolve to the same NAME-MERGED
+            # node are ONE node (`ids.entity_name_id` + the name MERGE), so a
+            # direct edge between them is a self-edge that
+            # `create_direct_edge` refuses with a raw ValueError — after steps
+            # 2-3 committed (measured). `_check_connection`'s self-edge test
+            # compares REF STRINGS, so it cannot see this identity. The identity
+            # is (label, name) on BOTH sides of the bundle/external boundary
+            # (review round 3): a bundle-local ref and the same node addressed
+            # by its id share it. Only the direct route is affected — a reified
+            # pair goes through `create_operator`, which tolerates the shared
+            # node (measured).
+            merged: dict[tuple[str, str], str] = {}
+            for v in vals:
+                if not isinstance(v, str):
+                    continue
+                if v in local:
+                    esection, eitem = local[v]
+                    if esection != "entities":
+                        continue
+                    ep_label = entity_labels.get(
+                        str(eitem.get("type") or "").strip().lower())
+                    ep_name = eitem.get("name")
+                else:
+                    info = node_info.get(v) or {}
+                    ep_label = info.get("label")
+                    ep_name = info.get("name")
+                if ep_label not in ("Subject", "Object") \
+                        or not isinstance(ep_name, str) or not ep_name:
+                    continue
+                first_ref = merged.setdefault((ep_label, ep_name), v)
+                if first_ref != v:
+                    violations.append({
+                        "section": "connections", "index": i,
+                        "message": f"ingest: connections[{i}] endpoints "
+                                   f"{first_ref!r} and {v!r} both address "
+                                   f"the {ep_label} {ep_name!r} (merged by "
+                                   f"name) — from and to address the same "
+                                   f"endpoint (EP cavity risk)",
+                    })
+                    break
             for v in vals:
                 if not isinstance(v, str) or v not in local:
                     continue
@@ -14301,15 +14624,26 @@ class TortoiseSDK:
                     # route, an Event declaring a terminal status is the same
                     # born-terminal mid-write raise. It has no name holder to
                     # probe, so only the declared-value legs apply.
+                    #
+                    # #7925 review P1 (bundle-wide): the by-name legs resolved
+                    # ONE item — "does a node hold this name already?" plus
+                    # "does THIS item declare it?" — and were therefore blind
+                    # to the OTHER same-name entity items the writer processes
+                    # FIRST. A bundle whose name is declared twice (exactly the
+                    # shape the name-merge exists for) passed Phase 1 empty and
+                    # then aborted mid-write: a terminal `status`/`outdated` on
+                    # the earlier item minted the terminal node the referenced
+                    # item's `create_direct_edge` (or the earlier item's own
+                    # sanitize) then refused — after the point items had
+                    # committed. `name_outcomes` is the pre-scan of that
+                    # ordered state, so this verdict matches what steps 3 + 4
+                    # actually produce; the single-item case reads identically
+                    # (its own item IS the first item naming the name).
                     elabel = entity_labels.get(
                         str(item.get("type") or "").strip().lower())
                     name = item.get("name")
                     if elabel not in ("Subject", "Object", "Event"):
                         continue
-                    exists, hit = False, None
-                    if elabel in ("Subject", "Object") \
-                            and isinstance(name, str) and name:
-                        exists, hit = self._entity_name_holders(elabel, name)
                     # #7925 review P1: resolve the status the WRITER will,
                     # not a single key. `_coerce_props` flattens a nested
                     # `props={...}` and top-level presence wins, so
@@ -14318,6 +14652,23 @@ class TortoiseSDK:
                     # :Subject then raised mid-write after earlier bundle
                     # items committed (measured).
                     declared = _item_effective_status(item)
+                    declares_outdated = _item_declares_outdated(item)
+                    declares_here = declares_outdated
+                    exists, hit = False, None
+                    if elabel in ("Subject", "Object") \
+                            and isinstance(name, str) and name:
+                        exists, hit, _ = _name_holders(elabel, name)
+                        # The operator axis is settled by the label gate
+                        # above (`tainted_by_bundle`), not re-checked here.
+                        born, name_outdated = name_outcomes.get(
+                            (elabel, name),
+                            (None, False, False, False, None))[:2]
+                        # The bundle's first item naming this name decides the
+                        # status the mint carries; ANY item under the name can
+                        # trip the server-managed flag (it is refused on
+                        # presence by every entity writer).
+                        declared = born
+                        declares_outdated = declares_outdated or name_outdated
                     if hit is not None:
                         violations.append({
                             "section": "connections", "index": i,
@@ -14328,17 +14679,22 @@ class TortoiseSDK:
                                        f"edges to terminal endpoints are "
                                        f"rejected (#2422/#7925)",
                         })
-                    elif _item_declares_outdated(item):
+                    elif declares_outdated:
                         # #7925 review P1: `_sanitize_props` refuses the
                         # server-managed `outdated` flag on presence, for
                         # every writer — top-level OR nested. Catch it in
                         # Phase 1 (zero mutation) instead of letting the
                         # entity write raise after the point items commit.
+                        # The flag may sit on this item OR on a same-name item
+                        # the writer reaches first — both abort step 3.
+                        where = ("declares" if declares_here
+                                 else f"names a {elabel} whose bundle item "
+                                      f"declares")
                         violations.append({
                             "section": "connections", "index": i,
                             "message": f"ingest: connections[{i}] "
                                        f"bundle-local endpoint {v!r} "
-                                       f"declares the server-managed "
+                                       f"{where} the server-managed "
                                        f"'outdated' flag — the {elabel} "
                                        f"write would raise after earlier "
                                        f"items committed, and new direct "
@@ -14347,15 +14703,35 @@ class TortoiseSDK:
                         })
                     elif not exists and declared in \
                             self._INGEST_TERMINAL_STATUSES:
+                        # Deliberately does NOT claim the node gets created
+                        # for a name-merged label: a status that is terminal in
+                        # the guard's vocabulary but outside the label's own
+                        # (``retracted`` on a :Subject) makes the WRITE raise
+                        # instead. Either way the bundle aborts mid-write, so
+                        # Phase 1 rejects it; the sentence states the guard's
+                        # rule only. An Event has NO name merge (append-only),
+                        # so it gets the from-the-item wording — claiming a
+                        # merge there would assert a mechanism that does not
+                        # exist (review round 2).
+                        if elabel in ("Subject", "Object"):
+                            message = (
+                                f"ingest: connections[{i}] bundle-local "
+                                f"endpoint {v!r} resolves into a terminal "
+                                f"status — the first bundle item naming the "
+                                f"{elabel} declares status {declared!r}, and "
+                                f"the name merge applies status at MINT, so "
+                                f"new direct edges to terminal endpoints are "
+                                f"rejected (#2422/#7925)")
+                        else:
+                            message = (
+                                f"ingest: connections[{i}] bundle-local "
+                                f"endpoint {v!r} declares status "
+                                f"{declared!r} — the Event it creates is born "
+                                f"terminal, and new direct edges to terminal "
+                                f"endpoints are rejected (#2422/#7925)")
                         violations.append({
                             "section": "connections", "index": i,
-                            "message": f"ingest: connections[{i}] "
-                                       f"bundle-local endpoint {v!r} "
-                                       f"declares status {declared!r} — "
-                                       f"the {elabel} it creates is born "
-                                       f"terminal, and new direct edges "
-                                       f"to terminal endpoints are "
-                                       f"rejected (#2422/#7925)",
+                            "message": message,
                         })
                     continue
                 if section != "points":
@@ -14423,7 +14799,8 @@ class TortoiseSDK:
             elif info_i["is_operator"] \
                     or info_i["label"] not in self._INGEST_ENDPOINT_LABELS \
                     or info_i.get("id") != v:
-                got = ("operator Point" if info_i["is_operator"]
+                got = (f"operator {info_i['label']}"
+                       if info_i["is_operator"]
                        else info_i["label"] or "unknown node type")
                 violations.append({
                     "section": "connections", "index": index,
@@ -14634,11 +15011,21 @@ class TortoiseSDK:
           (the write key — an Event that resolves only by eventId, e.g. the
           ingest_corpus DocumentCreated shape, is rejected at validation,
           never a mid-write crash); a ``:Source`` (a document IS a ``:Source``)
-          and an operator-shaped Point stay violations. NOTE: Event entity
-          items are append-only — re-ingesting a FULL bundle mints a new Event
-          occurrence (new id) and thus a new operator; dedup applies to
-          id-stable external Event endpoints (or re-ingesting connection-only
-          against the resolved id).
+          and an operator-shaped item (a Point, or a Subject/Object/Event
+          entity item — top-level or ``props`` spelling) stay violations. A
+          bundle-local entity ref is resolved the way step 3 writes it, not as
+          one item: Subject/Object merge BY NAME in bundle order, so a
+          same-name item can carry the terminal ``status`` that mints the node,
+          the server-managed ``outdated`` flag, or an ``is_operator`` the merge
+          writes onto the shared node (a later PERSISTABLE ``is_operator:
+          False`` clears it; ``null`` is dropped by the writer, so it clears
+          nothing); an existing operator-shaped or terminal name holder is
+          refused too. A direct-route connection whose two endpoints
+          resolve to the SAME name-merged node is a self-edge and is rejected.
+          NOTE: Event entity items are append-only — re-ingesting a FULL bundle
+          mints a new Event occurrence (new id) and thus a new operator; dedup
+          applies to id-stable external Event endpoints (or re-ingesting
+          connection-only against the resolved id).
         - granularity='bulk' (default): whole bundle in one coherent pass,
           returns aggregated {created, ids, nudges}. granularity='granular':
           additionally returns per-item ``results`` for agent step-by-step

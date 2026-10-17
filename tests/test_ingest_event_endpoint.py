@@ -656,6 +656,10 @@ def test_direct_route_event_declared_terminal_status_rejected_phase1(sdk, spelli
     viols = sdk._validate_bundle(bundle)
     msgs = [v["message"] for v in viols]
     assert any("declares status 'superseded'" in m for m in msgs), msgs
+    # review round 2: an Event has NO name merge, so the wording must be the
+    # from-the-item one — claiming a merge would assert a mechanism that does
+    # not exist for an append-only node
+    assert any("the Event it creates is born terminal" in m for m in msgs), msgs
     with pytest.raises(BundleValidationError,
                        match="declares status 'superseded'"):
         sdk.ingest(bundle)
@@ -825,3 +829,454 @@ def test_direct_route_non_point_endpoints_still_rejected(sdk):
     # Phase 2 is defense-in-depth: the same bundle raises, never a partial write
     with pytest.raises(BundleValidationError):
         sdk.ingest(bundle)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# #7925 review P1 — the guard consults the BUNDLE, not one item
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_direct_route_same_name_earlier_item_declared_terminal_status(sdk):
+    """#7925 review P1, Shape A: the entity terminal guard resolved the
+    declared `status` from the connection's REFERENCED item alone, so it was
+    blind to a same-name item the writer processes FIRST.
+
+    Every guard test above declares its name in exactly ONE entity item — which
+    is precisely why they all passed while this shape failed open. But the
+    name-merge exists for the multi-item shape: `ingest` writes entities in
+    step 3 IN BUNDLE ORDER and the merge applies `status` at MINT only
+    (`_upsert_subject` sets it in `ON CREATE`; `ON MATCH` never touches it), so
+    `s1` mints Gamma terminal and `s2`'s connection then hits
+    `create_direct_edge`'s terminal refusal. Measured pre-fix at this head:
+    `_validate_bundle` returned [] and `ingest` raised `Phase2Error` with the
+    point AND both entities already committed (point 1, Subject 1, Object 1).
+    Phase 1 must reject it, leaving ZERO nodes — `main`'s behaviour for the same
+    bundle, and the whole point of the guard (#2422/#2971 class).
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        # s1 is NOT referenced by the connection — it only declares the name
+        # that s2 references, and it is written first, so it decides the mint.
+        "entities": [{"ref": "s1", "type": "subject", "name": "Gamma",
+                      "status": "superseded"},
+                     {"ref": "s2", "type": "subject", "name": "Gamma"},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s2", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("resolves into a terminal status" in m
+               and "declares status 'superseded'" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError, match="declares status 'superseded'"):
+        sdk.ingest(bundle)
+    # ZERO mutation — counted on the graph, not inferred from the exception
+    # (the pre-fix failure raised too, it just left the bundle behind)
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+
+
+def test_direct_route_same_name_earlier_item_outdated_flag(sdk):
+    """#7925 review P1, Shape B: the `outdated` leg had the same blind spot —
+    it asked whether the REFERENCED item carried the flag.
+
+    `_sanitize_props` refuses the server-managed flag on PRESENCE for every
+    entity writer, so an earlier same-name item carrying it aborts step 3 after
+    the point items have committed, whether or not a holder exists. As with
+    Shape A, the existing tests declare one item per name, so they could not
+    see it. Measured pre-fix at this head: `_validate_bundle` returned [] and
+    `ingest` raised a raw `ValueError` with the predecessor point already
+    committed (point 1). Phase 1 must reject it, leaving ZERO nodes.
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s1", "type": "subject", "name": "Gamma",
+                      "outdated": True},
+                     {"ref": "s2", "type": "subject", "name": "Gamma"},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s2", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("declares the server-managed 'outdated' flag" in m for m in msgs), \
+        msgs
+    with pytest.raises(BundleValidationError,
+                       match="declares the server-managed 'outdated' flag"):
+        sdk.ingest(bundle)
+    # ZERO mutation — counted on the graph, not inferred from the exception
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+
+
+@pytest.mark.parametrize("spelling", ["top", "nested"])
+def test_direct_route_operator_shaped_entity_item_rejected_phase1(sdk, spelling):
+    """#7925 review P1 (found in review of the bundle-wide fix, and re-found on a
+    second axis in the next round): the label gate's POINT arm always excluded
+    an operator-shaped item; the ENTITY arm added by this PR did not — and a
+    one-item, top-level-only read still missed both remaining spellings.
+
+    `is_operator` is not in `_SUBJECT_HANDLED`/`_OBJECT_HANDLED`, so the entity
+    writer persists it onto the node — and then BOTH `create_direct_edge` and
+    the Phase-2 `_check_endpoint_race` refuse an operator endpoint. Phase 1 was
+    therefore looser than its own Phase-2 twin. `nested` is the `props={...}`
+    spelling `_coerce_props` flattens (measured: it mints the same operator
+    node). Pre-fix, both spellings left Point 1, Subject 1 and Object 1 behind.
+    The widening is what makes the entity arm responsible; the exclusion is
+    route-independent, exactly like the point arm's.
+    """
+    item = {"ref": "s", "type": "subject", "name": "Gamma"}
+    if spelling == "top":
+        item["is_operator"] = True
+    else:
+        item["props"] = {"is_operator": True}
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [item, {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("got a operator-shaped entity item" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="operator-shaped entity item"):
+        sdk.ingest(bundle)
+    # ZERO mutation — counted on the graph, not inferred from the exception
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+
+
+def test_direct_route_operator_shaped_same_name_item_rejected_phase1(sdk):
+    """#7925 review P1 (review round 2 — the third axis): the operator-shaped
+    item need not be the REFERENCED one, and the referenced one need not be the
+    only item under the name.
+
+    `is_operator` rides `_persist_extra_props`, whose `ON MATCH` clause writes it
+    onto the MERGED node — so an operator-shaped same-name item taints the node
+    for every ref that resolves to it, on either side of the referenced item.
+    The worst shape is with a pre-existing holder: measured pre-fix, the bundle
+    marked an EXISTING live Subject `is_operator: true` and then aborted with
+    Point 1 / Object 1 also left behind. The terminal guard's by-name pre-scan
+    already holds this key; the label gate reads the same pre-scan, with no
+    `exists` guard, because the taint applies whether or not the name is already
+    held.
+
+    As with the other guard tests, the earlier pins used ONE entity item per
+    name — which is why the taint shape was missed.
+    """
+    sub = sdk.create_subject("Gamma")["id"]
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s1", "type": "subject", "name": "Gamma"},
+                     {"ref": "s2", "type": "subject", "name": "Gamma",
+                      "is_operator": True},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s1", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("whose bundle item 's2' is operator-shaped" in m
+               for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="whose bundle item 's2' is operator-shaped"):
+        sdk.ingest(bundle)
+    # ZERO mutation beyond the seeded Subject, and the seeded node is untouched
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 1
+    assert _count(sdk, "MATCH (n:Subject {id:$id, is_operator:true}) "
+                       "RETURN count(n)", {"id": sub}) == 0
+
+
+def test_direct_route_name_merged_self_edge_rejected_phase1(sdk):
+    """#7925 review P1 (also found in review of the bundle-wide fix): two
+    DISTINCT bundle-local refs to the same merged name are ONE node.
+
+    `:Subject`/`:Object` are minted on the deterministic `(label, name)` id and
+    MERGE by name, so a direct edge from one ref to the other is a self-edge —
+    and `create_direct_edge` refuses it with a raw `ValueError` after steps 2-3
+    committed (measured: Point 1, Subject 1). `_check_connection`'s self-edge
+    test compares REF STRINGS, so only a bundle-aware check can see it — the
+    same `(label, name)` key the terminal guard already builds. Reachable only
+    BECAUSE of the widening: before it, a Point-bearing pair was reified and a
+    non-Point pair never reached the direct route. The reified route is
+    deliberately not rejected here — `create_operator` tolerates the shared
+    node (measured).
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s1", "type": "subject", "name": "Gamma"},
+                     {"ref": "s2", "type": "subject", "name": "Gamma"}],
+        "connections": [{"from": "s1", "to": "s2", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("'s1' and 's2' both address the Subject 'Gamma'" in m
+               for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="from and to address the same endpoint"):
+        sdk.ingest(bundle)
+    # ZERO mutation — counted on the graph, not inferred from the exception
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+
+
+@pytest.mark.parametrize("reify", [False, True])
+def test_external_endpoint_tainted_by_operator_shaped_name_rejected_phase1(
+        sdk, reify):
+    """#7925 review round 3: step 3 writes EVERY entity item, so an
+    operator-shaped item taints its name even when NO connection references it —
+    and a connection may address that same node BY ITS ID.
+
+    Phase 1 read the graph only for external endpoints, so this bundle passed and
+    then raised in Phase 2 after the point had committed AND a pre-existing live
+    Subject had been marked `is_operator: true` (measured). Both routes refuse it
+    (`_check_endpoint_race` is route-independent), so the Phase-1 check must be
+    too — hence `reify` here.
+    """
+    sub = sdk.create_subject("Gamma")["id"]
+    obj = sdk.create_object("Delta")["id"]
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s2", "type": "subject", "name": "Gamma",
+                      "is_operator": True}],
+        "connections": [{"from": sub, "to": obj, "operator": "IMPL",
+                         "reify": reify}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("names the Subject 'Gamma'" in m
+               and "is operator-shaped" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="so the endpoint is operator-shaped"):
+        sdk.ingest(bundle)
+    # ZERO mutation — no point, and the pre-existing Subject is NOT tainted
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject {id:$id, is_operator:true}) "
+                       "RETURN count(n)", {"id": sub}) == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 1
+
+
+def test_pre_existing_operator_shaped_holder_rejected_phase1(sdk):
+    """#7925 review round 3: the by-name legs read a holder for TERMINALITY only,
+    never for operator-ness — so a bundle that merely NAMES an operator-shaped
+    node passed Phase 1 and died in step 4, with the point committed.
+
+    The state is not exotic: `ingest` itself mints one from an unbounded entity
+    item, which is why the failing run of the test above can poison the graph for
+    the next one. The holder probe now returns the holder's operator-ness from
+    the MATCH it already ran (same query, one more column).
+    """
+    sdk.create_subject("Gamma", is_operator=True)
+    sdk.create_object("Delta")
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma"},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("existing name holder is operator-shaped" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="existing name holder is operator-shaped"):
+        sdk.ingest(bundle)
+    # ZERO mutation — no point committed, no second Subject minted
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 1
+
+
+def test_direct_route_external_id_self_edge_rejected_phase1(sdk):
+    """#7925 review round 3: the merged-name self-edge is not confined to
+    ref-vs-ref — a bundle-local ref and the SAME node addressed by its id share
+    the (label, name) identity, and `create_direct_edge` refuses the pair with a
+    raw ValueError after steps 2-3 committed (measured: point left behind).
+
+    Identity is therefore compared on `(label, name)` for BOTH sides of the
+    bundle/external boundary, not on ref strings.
+    """
+    sub = sdk.create_subject("Gamma")["id"]
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma"}],
+        "connections": [{"from": "s", "to": sub, "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("both address the Subject 'Gamma'" in m for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="from and to address the same endpoint"):
+        sdk.ingest(bundle)
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 1
+
+
+def test_reified_route_merged_name_twins_not_rejected(sdk):
+    """#7925 review round 3 (over-rejection pin): the merged-name self-edge check
+    is DIRECT-route only.
+
+    Two same-name refs on the reified route go through `create_operator`, which
+    tolerates the shared node (measured: ingests cleanly, one Subject plus the
+    operator). Without this pin a later tightening of the identity check could
+    start rejecting a bundle the writer accepts.
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s1", "type": "subject", "name": "Gamma"},
+                     {"ref": "s2", "type": "subject", "name": "Gamma"}],
+        "connections": [{"from": "s1", "to": "s2", "operator": "IMPL",
+                         "reify": True}],
+    }
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 1
+    assert _operator_count(sdk) == 1
+
+
+@pytest.mark.parametrize("spelling", ["top", "nested"])
+@pytest.mark.parametrize("shape", ["heals-holder", "heals-bundle-item"])
+def test_operator_shaped_name_cleared_by_falsy_declaration_accepted(
+        sdk, shape, spelling):
+    """#7925 review round 4 (over-rejection pin): the operator axis is
+    LAST-DECLARATION-WINS, not a monotone taint.
+
+    `is_operator` rides the extra-props lane, whose clause is `SET n += $extra`
+    on the MERGED node, so a later `is_operator: False` under the same name
+    CLEARS the flag an earlier item (or a pre-existing holder) set — and the
+    endpoint is then legal. An OR over the items refused this bundle while the
+    writer accepted it (measured). Both taint SOURCES (an existing holder, an
+    earlier bundle item) and both SPELLINGS (`is_operator` top-level, the
+    `props={...}` form `_coerce_props` flattens) are pinned here, because any of
+    them could regress independently.
+    """
+    if shape == "heals-holder":
+        sdk.create_subject("Gamma", is_operator=True)
+        entities = [{"ref": "s", "type": "subject", "name": "Gamma"}]
+    else:
+        sdk.create_subject("Gamma")
+        entities = [{"ref": "s1", "type": "subject", "name": "Gamma",
+                     "is_operator": True},
+                    {"ref": "s", "type": "subject", "name": "Gamma"}]
+    if spelling == "top":
+        entities[-1]["is_operator"] = False
+    else:
+        entities[-1]["props"] = {"is_operator": False}
+    sdk.create_object("Delta")
+    bundle = {
+        "entities": [*entities,
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    # the writer's outcome: the flag is CLEARED on the merged node
+    assert _count(sdk, "MATCH (n:Subject {name:'Gamma'}) WHERE "
+                       "coalesce(n.is_operator,false) "
+                       "RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject {name:'Gamma'})-[r:IMPL]->"
+                       "(:Object {name:'Delta'}) RETURN count(r)") == 1
+
+
+@pytest.mark.parametrize("spelling", ["top", "nested"])
+def test_operator_null_does_not_clear_operator_shape_rejected_phase1(
+        sdk, spelling):
+    """#7925 review round 5: `is_operator: None` is NOT a clearing declaration.
+
+    `_persist_extra_props` drops `None` (and any non-persistable value) before
+    it builds `SET n += $extra`, so no write happens and an earlier flag — an
+    item's or a holder's — stands. Counting key PRESENCE as a declaration made
+    Phase 1 pass the bundle and step 4 then refuse the still-operator-shaped
+    node, after the point had committed (measured). "Declares" must mean "the
+    writer will write a boolean", the same standard the sibling helpers use.
+    """
+    sub = sdk.create_subject("Gamma", is_operator=True)["id"]
+    item = {"ref": "s", "type": "subject", "name": "Gamma"}
+    if spelling == "top":
+        item["is_operator"] = None
+    else:
+        item["props"] = {"is_operator": None}
+    sdk.create_object("Delta")
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [item, {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("existing name holder is operator-shaped" in m
+               for m in msgs), msgs
+    with pytest.raises(BundleValidationError,
+                       match="existing name holder is operator-shaped"):
+        sdk.ingest(bundle)
+    # ZERO mutation — the point never committed, the holder is unchanged
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject {id:$id, is_operator:true}) "
+                       "RETURN count(n)", {"id": sub}) == 1
+
+
+def test_operator_shaped_taint_without_ref_names_the_bundle_item(sdk):
+    """#7925 review round 4 (message accuracy): a taint that came from the
+    BUNDLE must not be reported as an "existing name holder".
+
+    A ref-less entity item is legitimate (`ref` is optional), and the graph may
+    hold no such node at all — so blaming a holder is a false mechanism, and the
+    caller cannot tell which item to fix. The refusal is the same either way;
+    only the sentence must be true.
+    """
+    bundle = {
+        "entities": [{"type": "subject", "name": "Gamma", "is_operator": True},
+                     {"ref": "s", "type": "subject", "name": "Gamma"},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    msgs = [v["message"] for v in viols]
+    assert any("bundle item (no" in m and "is operator-shaped" in m
+               for m in msgs), msgs
+    assert not any("existing name holder" in m for m in msgs), msgs
+    # and the graph holds NO holder at all — the sentence is the only signal
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    with pytest.raises(BundleValidationError,
+                       match="bundle item \\(no"):
+        sdk.ingest(bundle)
+
+
+def test_external_operator_shaped_endpoint_cleared_by_bundle_declaration(sdk):
+    """#7925 review round 5 (over-rejection surviving one arm over): the
+    external-endpoint arm refused an operator-shaped holder even when the bundle
+    declares `is_operator: False` under its name.
+
+    Step 3 merges onto that holder and `SET n += $extra` writes the flag away,
+    so the writer accepts the bundle and writes the edge — measured directly
+    (`create_subject(..., is_operator=False)` then `create_direct_edge`). The
+    bundle-local arm already deferred to the declaration; both arms must, or one
+    gate holds two verdicts about one node.
+    """
+    sub = sdk.create_subject("Gamma", is_operator=True)["id"]
+    obj = sdk.create_object("Delta")["id"]
+    bundle = {
+        "entities": [{"ref": "sx", "type": "subject", "name": "Gamma",
+                      "is_operator": False}],
+        "connections": [{"from": sub, "to": obj, "operator": "IMPL"}],
+    }
+    assert sdk._validate_bundle(bundle) == []
+    res = sdk.ingest(bundle)
+    assert res["created"]["connections"] == 1
+    assert _count(sdk, "MATCH (n:Subject {name:'Gamma'}) WHERE "
+                       "coalesce(n.is_operator,false) "
+                       "RETURN count(n)") == 0
+    assert _count(sdk, "MATCH ()-[r:IMPL]->(:Object {name:'Delta'}) "
+                       "RETURN count(r)") == 1
