@@ -43,23 +43,24 @@ the spec on the upload line, and one over EVERY step: a bare `wrangler` is legal
 only in the five declared boot steps (which run the binary the verify step
 proved).
 
-The removed machinery is the point, not an accident: with no spec at the call
-site there is no shell word-splitting to model. The residual is stated rather
-than hidden — a NEW step can always be written with `wrangler@4`, and a version
-can reach npm through a spelling that never appears in these files at all (a
-shell alias, a function, or a wrapper script naming its own version), which no
-text scan over the workflows can see. The spec and invocation arms refuse the
-first in every workflow file, every composite action and the command docs; the
-executed harnesses in `tests/test_pages_bindings.py` prove the deploy step's
-assertion, and the arms below EXECUTE the manual deploy script rather than
-grepping its path. The division is: the TEXT arms stop a float spelling being
-written here at all, and the assertion is the runtime check on the binary the lane
-actually runs — neither alone is the guard. A spec split by quoting or by
-backslash (`wran"g"ler@4`, `wran\\gler@4`) is covered, because the spec arm retries
-each segment the way bash builds the word: quotes removed and escapes resolved.
-What no text scan can see is declared rather than implied closed — a version that
-reaches npm through an alias, a function, a wrapper script, or a file written
-first and executed later.
+The removed machinery is the point, not an accident: no install step, no version
+resolution and no reset of a shared prefix remains to get wrong. The division of
+labour is: the TEXT arms stop a float spelling being WRITTEN here, and the
+assertion is the runtime check on the binary the lane actually runs — neither
+alone is the guard.
+
+Where the text arms stop is stated rather than hidden. The spec scan resolves the
+two things bash does to a word that a reader would not see — quote removal and
+backslash escaping — and nothing else. So these are NOT seen, by design: a spec
+that reaches npm through an alias, a function, a wrapper script or a file written
+first and executed later; a spec assembled at run time (`$(printf …)`); and a
+version passed to a third-party ACTION rather than a shell (`uses:
+cloudflare/wrangler-action` with `with: wranglerVersion:`), which no `run:` scan
+reads. A NEW step can always be written with `wrangler@4` — the spec and
+invocation arms refuse that in every workflow file, every composite action and the
+command docs, the executed harnesses in `tests/test_pages_bindings.py` prove the
+deploy step's assertion, and the arms below EXECUTE the manual deploy script
+rather than grepping its path.
 """
 
 from __future__ import annotations
@@ -270,79 +271,6 @@ def _cut_comment(line: str) -> str:
 
 
 
-#: Commands whose arguments are OUTPUT, not an invocation. A diagnostic that
-#: names `wrangler@4` is how a reader learns what went wrong; it cannot deploy.
-#: Matched against ONE command segment, never a whole line: `echo "x"; npx
-#: wrangler@4 …` runs a real invocation after the message, so a line-scoped
-#: exemption hides exactly the spec this arm exists to refuse (measured).
-_DIAGNOSTIC = re.compile(
-    r"^[\s{}\(\)]*(?:(?:then|else|do|run:|)\s+)*(?:-\s*)?(?:echo|printf)\b"
-)
-
-#: A piece of a line that sends the printed text somewhere that may EXECUTE it:
-#: a PIPE (not `||`, which merely separates commands), a redirection to a file
-#: (not `>&1`/`>&2`, which only moves the message to a descriptor), a process
-#: substitution, or an interpreter INVOKED with its input (`xargs … sh`, `eval`). (`| sh`, `| /bin/sh`, `| tee x.sh` then `bash x.sh`,
-#: `| xargs … sh -c {}`, `> x.sh` then `bash x.sh`). Enumerating sinks is a losing
-#: game — a `::error::` annotation is never piped or redirected, so refuse them
-#: all instead.
-_SINKS = re.compile(r"(?<!\|)\|(?!\|)|>>?(?!&)|<\(|>\(|\bxargs\b|\beval\b")
-
-#: A message built into a variable and printed later cannot execute anything.
-_ASSIGNMENT_MESSAGE = re.compile(r'^[A-Za-z_]\w*=(?:"[^"$`]*"|\'[^\']*\')\s*$')
-
-
-def _command_segments(line: str) -> list[str]:
-    """`line` split at top-level `;` `&&` `||` `|` — quote-aware.
-
-    `$( )` and backticks are NOT split, so a substitution stays inside its
-    segment; `_is_diagnostic` refuses any segment that contains one, because
-    `echo "$(npx --yes wrangler@4 …)"` EXECUTES the command it prints.
-    """
-    segments, buf, quote, i = [], [], None, 0
-    while i < len(line):
-        ch = line[i]
-        if quote:
-            buf.append(ch)
-            if ch == "\\" and quote == '"' and i + 1 < len(line):
-                buf.append(line[i + 1])
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-        elif ch in "\"'":
-            quote = ch
-            buf.append(ch)
-        elif ch in ";|&":
-            segments.append("".join(buf))
-            buf = []
-            if i + 1 < len(line) and line[i + 1] == ch:
-                i += 1
-        else:
-            buf.append(ch)
-        i += 1
-    segments.append("".join(buf))
-    return [seg for seg in segments if seg.strip()]
-
-
-def _is_diagnostic(segment: str, line: str = "") -> bool:
-    """True only for a segment that PRINTS and cannot execute a command.
-
-    `line` is passed because a sink can live in a different segment: `echo '…' |
-    sh` prints a command and then RUNS it. A message held in a variable
-    (`MSG="cannot use wrangler@4"`) is exempt too. Not exempt, and not modelled
-    here: a heredoc body or a `bash -c '…'` string — a message written as literal
-    text reds this arm, which is a declared limitation, not a hole.
-    """
-    plain = segment.strip().rstrip("};").strip()
-    if "$(" in segment or "`" in segment:
-        return False
-    if _SINKS.search(line or segment):
-        return False
-    if _ASSIGNMENT_MESSAGE.match(plain):
-        return True
-    return bool(_DIAGNOSTIC.match(plain))
-
 def _strip_quoted(line: str) -> str:
     """`line` with quoted SEGMENTS removed — a diagnostic is not a command.
 
@@ -459,38 +387,74 @@ def test_every_version_mention_is_a_read_or_an_asserted_spec() -> None:
 
 
 def test_every_wrangler_spec_is_the_asserted_form() -> None:
-    offenders = []
+    """Every `wrangler@…` here must be the asserted form.
+
+    The scan is a WORD-LEVEL model, and deliberately bounded: it cuts comments
+    and resolves the two things bash does to a word that a reader would not see —
+    it removes quotes and resolves backslash escapes — then looks for a
+    `wrangler@` spec. Nothing else is modelled. A message that must NAME a bad
+    spelling therefore belongs in a comment (`_cut_comment` removes it before this
+    scan), which is the live style; no step in this repo writes `wrangler@…` into
+    a message, and the earlier attempts to exempt one built a shell parser whose
+    defects cost more than the exemption was worth (measured: with no exemption at
+    all, every arm still passes).
+    """
+    offenders = set()
     for path in _workflow_paths():
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            # `_cut_comment`, not a whole-line strip: a TRAILING comment naming a
-            # spec (`… --version  # was wrangler@4`) is prose too, and reading it
-            # as code makes this arm fail on a correct workflow.
-            code = _cut_comment(line)
-            for segment in _command_segments(code):
-                # A MESSAGE may name the bad spelling (this repo's steps carry
-                # `::error::` diagnostics); only a command may not use it — and
-                # only the segment that IS the message, not a line that has one.
-                if _is_diagnostic(segment, code):
-                    continue
-                # A spec SPLIT by quoting (`wran"g"ler@4`) is the word bash runs
-                # once the quotes go; retry each segment dequoted. A legal quoted
-                # spec still matches LEGAL_SPEC after dequoting.
-                for match in re.finditer(
-                    r"wrangler@\S*", re.sub(r"[\"']|\\(.)", r"\1", segment)
-                ):
-                    token = match.group(0)
-                    if LEGAL_SPEC.match(token):
-                        continue
-                    # A bare `wrangler@` followed by prose punctuation is a
-                    # mention, not a spec — anything shaped like a spec (digit,
-                    # letter, `^`, `~`, `$`, quote, backslash, `{`) is an offender.
-                    if len(token) > len("wrangler@") and token[len("wrangler@")] in "`).,;:":
-                        continue
-                    offenders.append(f"{path.name}:{lineno}: {token}")
+        for where, token in _floating_specs(path.read_text(encoding="utf-8")):
+            offenders.add(f"{path.name}:{where}: {token}")
     assert not offenders, (
         "wrangler spec is not the asserted variable form (a literal spec cannot be "
-        "verified against what resolved):\n" + "\n".join(offenders)
+        "verified against what resolved):\n" + "\n".join(sorted(offenders))
     )
+
+
+def _floating_specs(text: str) -> list[tuple[int, str]]:
+    """`(line, token)` for every `wrangler@…` in CODE that is not the asserted form.
+
+    CODE means: comments removed, then the two things bash does to a word that a
+    reader would not see — quotes removed and backslash escapes resolved. A
+    message is NOT exempt: a step that must name a bad spelling writes it in a
+    comment, which this removes before the scan.
+    """
+    found = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        # `_cut_comment`, not a whole-line strip: a TRAILING comment naming a
+        # spec (`… --version  # was wrangler@4`) is prose too, and reading it as
+        # code makes the arm fail on a correct workflow.
+        code = _cut_comment(line)
+        # The word bash actually runs. A legal quoted spec still matches
+        # LEGAL_SPEC in that form.
+        for variant in (code, re.sub(r"[\"']|\\(.)", r"\1", code)):
+            for match in re.finditer(r"wrangler@\S*", variant):
+                token = match.group(0)
+                if LEGAL_SPEC.match(token):
+                    continue
+                # A bare `wrangler@` followed by prose punctuation is a mention,
+                # not a spec — anything shaped like a spec (digit, letter, `^`,
+                # `~`, `$`, quote, backslash, `{`) is an offender.
+                if len(token) > len("wrangler@") and token[len("wrangler@")] in "`).,;:":
+                    continue
+                found.append((lineno, token))
+    return found
+
+
+def test_a_spec_may_be_named_in_a_comment_but_not_in_a_message() -> None:
+    """The exemption that kept re-staling is replaced by a rule.
+
+    Three review cycles built a shell parser to tell a message from a command, and
+    each one opened a spelling it did not see (`echo …; npx wrangler@4`,
+    `| /bin/sh`, a spec staged in a variable). With no exemption at all every arm
+    still passes on the real tree, so the rule is now unconditional: a step that
+    must name a float writes it in a COMMENT, which the scan removes.
+    """
+    assert _floating_specs("        run: echo \"refusing wrangler@4\""), \
+        "a message naming a float must be refused — the rule is stated, not inferred"
+    assert not _floating_specs("  # was: npx --yes wrangler@4 pages deploy dist"), \
+        "a COMMENT naming a float must pass — that is the sanctioned way to name it"
+    assert not _floating_specs(
+        '  run: npx --yes "wrangler@${WRANGLER_VERSION:?}" pages deploy dist'
+    ), "the asserted form must pass, quoted or not"
 
 
 def test_each_workflow_reads_the_version_at_least_once() -> None:
