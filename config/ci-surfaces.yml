@@ -1523,11 +1523,13 @@ surfaces:
   - test_ci_expected_manifests.py
   - test_ci_guard_invocation.py
   # #8743/#8816: the wrangler pin's shape in `.github/workflows/ci.yml` and
-  # `deploy-pages.yml` — one artefact (`config/wrangler-version`), every spec the
-  # asserted `${WRANGLER_VERSION:?}` form, an install-and-VERIFY step per e2e job
-  # and per deploy step, a spec-free boot, and node 22 wherever wrangler runs.
-  # `core`-like the other CI-wiring guards above — it reads workflows and needs no
-  # DB, so the default surface is where it runs when nothing else matched.
+  # `deploy-pages.yml`, plus `website/apps/dashboard/deploy.sh` (the manual
+  # deploy) — one artefact (`config/wrangler-version`), every spec the asserted
+  # `${WRANGLER_VERSION:?}` form and no spec-LESS invocation on a deploy path, an
+  # install-and-VERIFY step per e2e job that keeps its three-attempt registry
+  # retry, a spec-free boot, and node 22 wherever wrangler runs. `core`-like the
+  # other CI-wiring guards above — it reads workflows and needs no DB, so the
+  # default surface is where it runs when nothing else matched.
   - test_e2e_wrangler_prewarm.py
   # #3470: the pytest-attribution reporter (`.github/scripts/pytest-attribution.sh`,
   # called from python-ci.yml). It reads the workflow, the reporter script and the

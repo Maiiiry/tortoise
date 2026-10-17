@@ -60,6 +60,8 @@ EXACT_VERSION = re.compile(r"\d+\.\d+\.\d+")
 #: so an empty declaration aborts instead of expanding to `wrangler@` (= latest).
 LEGAL_SPEC = re.compile(r"wrangler@\$\{WRANGLER_VERSION:\?")
 
+BARE_INVOCATION = re.compile(r"(?<![\w@$./-])wrangler(?![\w@])")
+
 #: The only legal way the variable may be SET.
 DECLARATION = 'WRANGLER_VERSION="$(cat config/wrangler-version)"'
 
@@ -123,6 +125,110 @@ def _steps_named(name: str) -> list[tuple[str, dict]]:
             if (step.get("name") or "") == name:
                 out.append((job_name, step))
     return out
+
+
+def _deploy_steps() -> list[tuple[str, dict]]:
+    return [
+        (job, step)
+        for job, step in _all_steps(_load(WORKFLOWS / "deploy-pages.yml")["jobs"])
+        if (step.get("name") or "").startswith(DEPLOY_STEP_PREFIX)
+    ]
+
+
+# ------------------------------------------------- shell text, read honestly
+
+
+def _cut_comment(line: str) -> str:
+    """`line` with a COMMENT TAIL cut off — quoting honoured, so `"a#b"` is data.
+
+    A `#` starts a comment only at the start of a word and outside quotes, which
+    is shell's own rule, and a word starts after a blank OR a metacharacter — so a
+    `;#` tail is a comment too. This file's subject is prose ABOUT the code: a
+    comment that NAMES a retry loop on a step that has none must never satisfy the
+    check, and `ci.yml`'s boot steps carry exactly that kind of prose.
+    """
+    quote = ""
+    at_word_start = True
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+        elif quote == '"':
+            if ch == '"':
+                quote = ""
+            elif ch == "\\" and i + 1 < len(line):
+                i += 1
+        elif ch in "'\"":
+            quote = ch
+            at_word_start = False
+        elif ch == "\\" and i + 1 < len(line):
+            at_word_start = False
+            i += 1
+        elif ch == "#" and at_word_start:
+            return line[:i]
+        elif ch in " \t;&|()<>":
+            at_word_start = True
+        else:
+            at_word_start = False
+        i += 1
+    return line
+
+
+def _strip_quoted(line: str) -> str:
+    """`line` with quoted SEGMENTS removed — a diagnostic is not a command.
+
+    `::error::resolved wrangler ${got} != …` NAMES wrangler in a message, and a
+    `npx --yes "wrangler@${WRANGLER_VERSION:?}"` spec is judged by the spec arm
+    (which keeps quotes, or a literal spec inside one would vanish).
+    """
+    out = []
+    quote = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+        elif quote == '"':
+            if ch == '"':
+                quote = ""
+            elif ch == "\\" and i + 1 < len(line):
+                i += 1
+        elif ch in "'\"":
+            quote = ch
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _retry_loop_bodies(run: str, header: str) -> list[str]:
+    """The bodies of each `header` … `done` loop found in comment-stripped CODE."""
+    bodies: list[str] = []
+    current: list[str] | None = None
+    for raw in str(run or "").splitlines():
+        line = _cut_comment(raw)
+        if current is None:
+            if header in line:
+                current = []
+            continue
+        if line.strip() == "done":
+            bodies.append("\n".join(current))
+            current = None
+        else:
+            current.append(line)
+    return bodies
+
+
+def _bare_invocations(code: str) -> list[str]:
+    """Spec-less wrangler invocations — `npx wrangler`, `wrangler pages deploy`."""
+    offences = []
+    for lineno, line in enumerate(str(code or "").splitlines(), 1):
+        if BARE_INVOCATION.search(_strip_quoted(_cut_comment(line))):
+            offences.append(f"line {lineno}: {line.strip()}")
+    return offences
 
 
 # ---------------------------------------------------------------- 1. one artefact
@@ -231,10 +337,32 @@ def test_the_three_website_e2e_jobs_install_and_verify() -> None:
         assert '"$WRANGLER_VERSION"' in run, (
             f"{job}: the verify step installs/comares something other than the declared value"
         )
-        assert re.search(r"for attempt in (?:1 )?2(?: 3)?;", run), (
-            f"{job}: the install lost its retry loop — one npm-registry ECONNRESET "
-            "(2026-10-15) reded the required legal-e2e check when the fetch had none"
+        assert _retry_loop_bodies(run, "for attempt in 1 2 3;"), (
+            f"{job}: the install lost its three-attempt retry loop — one npm-registry "
+            "ECONNRESET (2026-10-15) reded the required legal-e2e check when the fetch "
+            "had none, and the last attempt is HARD now"
         )
+        for body in _retry_loop_bodies(run, "for attempt in 1 2 3;"):
+            assert "npm install -g" in body, (
+                f"{job}: the retry does not wrap the install, so the install itself is "
+                "still a single unprotected fetch"
+            )
+            assert re.search(r"sleep \$\(\(attempt \* 10\)\)", body), (
+                f"{job}: the retry carries no backoff — all three attempts would burn "
+                "inside the same second and fail together"
+            )
+
+
+def test_the_retry_check_ignores_a_commented_out_loop() -> None:
+    """Prose about the loop must not satisfy the check — and a 2-attempt loop is not it."""
+    header = "for attempt in 1 2 3;"
+    assert _retry_loop_bodies(f"{header} do\n  npm install -g x\ndone", header)
+    assert not _retry_loop_bodies(
+        "# old body used `for attempt in 1 2 3;`\nnpm install -g x", header
+    )
+    assert not _retry_loop_bodies("npm install -g x  # for attempt in 1 2 3;", header)
+    assert not _retry_loop_bodies("for attempt in 1 2; do\nnpm install -g x\ndone", header)
+    assert not _retry_loop_bodies("npm install -g x", header)
 
 
 def test_the_verify_step_is_unconditional() -> None:
@@ -250,6 +378,25 @@ def test_the_verify_step_is_unconditional() -> None:
                 f"{job}: job-level `if: {gate!r}` is constant-false — the whole job, "
                 "including the verify, can never run"
             )
+
+
+def test_the_ci_yml_wrangler_wiring_is_exercised_by_an_ungated_job() -> None:
+    """`ci.yml` is in no `changes` gate, so one job must run it on EVERY PR.
+
+    `ci.yml` carries three of the five consumers and every assertion, and it is
+    deliberately absent from the `website`/`dashboard_e2e` gates (a workflow-only
+    change would otherwise run two full e2e suites). What makes that safe is
+    this: an UNGATED job installs, verifies and boots from the same wiring, so
+    the lane is executed on every PR that can change it.
+    """
+    ci_jobs = _load(WORKFLOWS / "ci.yml")["jobs"]
+    verified = {job for job, _step in _steps_named(VERIFY_STEP)} & set(ci_jobs)
+    assert verified, f"no job in ci.yml carries {VERIFY_STEP!r} — the probe is wrong"
+    ungated = {job for job in verified if ci_jobs[job].get("if") is None}
+    assert ungated, (
+        "every job carrying the wrangler wiring is gated by `changes`, and ci.yml is in "
+        f"no gate — a ci.yml-only wiring change would run none of them: gated={sorted(verified)}"
+    )
 
 
 def test_the_version_check_is_an_equality_against_the_declared_value() -> None:
@@ -306,7 +453,47 @@ def test_each_deploy_step_asserts_before_it_uploads() -> None:
         )
 
 
-# ------------------------------------------------------------- 4. node floor, derived
+# ------------------------------------------- 4. no spec-LESS invocation on a deploy path
+
+
+def test_every_deploy_invocation_is_the_declared_spec() -> None:
+    """A spec-LESS invocation ships an UNDECLARED version past the assertion.
+
+    The runtime assertion validates the DECLARED spec, never the spec on the
+    upload line — so a deploy step copied as `npx --yes wrangler pages deploy`
+    would deploy an unverified version while every `wrangler@` arm stayed green
+    (a bare invocation has no `@` to match). Bare `wrangler` is legal only in the
+    boot steps, where the install-and-verify step already proved the binary.
+    """
+    deploys = _deploy_steps()
+    assert len(deploys) == 2, f"expected 2 deploy steps, found {len(deploys)}"
+    offenders = [
+        f"{job}: {hit}" for job, step in deploys for hit in _bare_invocations(_run(step))
+    ]
+    script = REPO_ROOT / "website" / "apps" / "dashboard" / "deploy.sh"
+    offenders += [f"deploy.sh: {hit}" for hit in _bare_invocations(script.read_text())]
+    assert not offenders, (
+        "a deploy path invokes wrangler without the declared spec, so the version it "
+        "uploads with is not the one that was asserted:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_bare_invocation_scan_ignores_messages_and_comments() -> None:
+    for code in (
+        'npx --yes wrangler pages deploy "$STAGE"',
+        "npx wrangler --version",
+        "wrangler pages deploy dist",
+    ):
+        assert _bare_invocations(code), code
+    for code in (
+        'got="$(npx --yes "wrangler@${WRANGLER_VERSION:?}" --version)"',
+        'echo "::error::resolved wrangler ${got} != declared ${WRANGLER_VERSION}"',
+        "# npx --yes wrangler pages deploy (the old float)",
+    ):
+        assert not _bare_invocations(code), code
+
+
+# ------------------------------------------------------------- 5. node floor, derived
 
 
 def test_every_job_that_installs_wrangler_pins_node_22() -> None:
@@ -342,7 +529,7 @@ def test_every_job_that_installs_wrangler_pins_node_22() -> None:
     )
 
 
-# ------------------------------------------------ 5. the manual deploy script
+# ------------------------------------------------ 6. the manual deploy script
 
 
 def test_the_manual_deploy_script_pins_the_same_version() -> None:
