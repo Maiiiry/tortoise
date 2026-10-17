@@ -1372,13 +1372,19 @@ def build_state(
             # LAST-WINS for the one column two duplicate rows can differ in (see the
             # comment in the loop above): adopt this row's non-empty `lane:` label on
             # the copy that was kept, then report the dropped line.
-            if issue_label:
-                _pos = kept_pos.get((label, ws.upper()))
-                if _pos is not None:
-                    kept[_pos] = (label, ws, issue_label)
+            _pos = kept_pos.get((label, ws.upper()))
+            # ⛔ CAPTURE THE KEPT COPY'S OWN VALUE BEFORE THE ADOPTION. After it, the
+            # kept tuple holds THIS row's value when this row has one, so a message
+            # written from the post-adoption state would point at the wrong physical
+            # line — and the published value survives on the line being reported.
+            _kept_own = kept[_pos][2] if _pos is not None else ""
+            if issue_label and _pos is not None:
+                kept[_pos] = (label, ws, issue_label)
             stale_rows.append({
                 "lane": label, "workspace": ws, "issue_label": issue_label,
                 "arm": "duplicate",
+                "carries": issue_label,
+                "kept_own": _kept_own,
                 # ⛔ THE TWIN MAY ALREADY HAVE BEEN DROPPED by arm (a) — `seen_rows`
                 # is populated before the arm decision, so a ghost row and its
                 # literal copy can take DIFFERENT arms. The sentence therefore must
@@ -1733,29 +1739,65 @@ def build_state(
         # (review of #8849).
         if arm == "duplicate":
             if row.get("twin_kept"):
+                _carries = row.get("carries") or ""
+                _kept_own = row.get("kept_own") or ""
+                # ⛔ NAME THE ACTUAL VALUES. "Keep the copy that carries the
+                # published value" is not actionable when the message prints
+                # neither value — and it was BACKWARDS besides: last-wins stores
+                # THIS row's value on the kept tuple, so when the two lines differ
+                # the published value lives on the copy being reported here
+                # (review of #8849, cycle 6).
+                if _carries and _carries != _kept_own:
+                    _advice = (
+                        f"This line carries `{_carries}` and the copy the board "
+                        f"kept carries `{_kept_own or '(none)'}`. The published "
+                        f"`lane:` value is `{_carries}` — i.e. THIS line's. Keep "
+                        "this line and delete the other, or copy "
+                        f"`{_carries}` onto the other line first"
+                    )
+                elif _carries:
+                    _advice = (
+                        f"Both lines carry `{_carries}`, so either may be deleted"
+                    )
+                else:
+                    _advice = (
+                        "Neither line carries a `lane:` value, so either may be "
+                        "deleted"
+                    )
                 reason = (
                     f"registry row for '{row['lane']}' repeats {ws_gone} — the same "
                     "(label, workspace) written twice is ONE lane, not two; the "
                     "duplicate is not a second lane record and NO verdict changes "
                     "(one lane record remains). This is a de-duplication, not a "
                     "retirement: it holds even when the cmux list could not be "
-                    "read, because both rows name one workspace. ⛔ The two lines "
-                    "may DIFFER in their `lane:` column, and the board publishes "
-                    "the value on the copy it kept — so do NOT just delete this "
-                    "one: keep whichever of the two carries the `lane:` value "
-                    "shown as this lane's `claim.lane_label`, or the published "
-                    "label silently reverts"
+                    f"read, because both rows name one workspace. {_advice}"
                 )
             else:
                 # The twin was dropped by another arm, so this drop is NOT a plain
                 # de-duplication — say so, and do not claim a record survives.
-                reason = (
-                    f"registry row for '{row['lane']}' repeats {ws_gone}, "
-                    "and the copy of this row was ALREADY dropped above for its "
-                    "own reason — read that entry, which is the one that explains "
-                    "why this workspace is no longer a lane record. Delete the "
-                    "duplicate roster line"
-                )
+                # ⛔ AND THIS ROW MAY BE THE ONLY CARRIER of the label's `lane:`
+                # value, which the board publishes via inheritance: a bare "delete
+                # the duplicate roster line" would revert the label, the very
+                # failure the sibling branch is written to prevent (cycle 6).
+                _carries = row.get("carries") or ""
+                if _carries:
+                    reason = (
+                        f"registry row for '{row['lane']}' repeats {ws_gone}, "
+                        "and the copy of this row was ALREADY dropped above for its "
+                        "own reason — read that entry, which is the one that explains "
+                        "why this workspace is no longer a lane record. ⛔ This row "
+                        f"is the only one carrying `{_carries}`, which the board "
+                        "publishes — move that value onto the surviving row BEFORE "
+                        "deleting this line, or the label silently reverts"
+                    )
+                else:
+                    reason = (
+                        f"registry row for '{row['lane']}' repeats {ws_gone}, "
+                        "and the copy of this row was ALREADY dropped above for its "
+                        "own reason — read that entry, which is the one that explains "
+                        "why this workspace is no longer a lane record. Delete the "
+                        "duplicate roster line"
+                    )
         elif arm == "second-unbound":
             reason = (
                 f"registry row for '{row['lane']}' names {ws_gone}, which is NOT in "
@@ -2617,12 +2659,17 @@ def cmd_violations(args: argparse.Namespace) -> int:
     # `violations` comes from `resolve_sessions(rows, ...)`, and `rows` is the rows
     # that SURVIVED the #8845 filter — NOT `load_registry()`'s output any more.
     # (It was that before #8845; a comment claiming it still is would tell a reader
-    # that no roster row can be missing, which is false.) The guarantee that survives
-    # is kept ⊆ registry: an unreadable registry yields zero rows, hence zero claimed
-    # sessions, hence zero violations — the old code printed `none` on rc=0,
-    # byte-identical to a measured, genuinely-clean roster (PR #8594 review P2). A
-    # dropped row cannot hide a partition break, because the override and
-    # `disk_by_label` inputs are LABEL-keyed and the surviving row inherits them.
+    # that no roster row can be missing, which is false.) What survives is:
+    # kept ⊆ registry, and EVERY arm leaves at least one row per label, so the label
+    # set that `violations` keys on is preserved. The guarantee is NOT that the other
+    # inputs are label-keyed — they are not: `disk_by_label` is built AFTER the filter
+    # from the surviving rows and is derived per WORKSPACE, `pane_sid_by_ws` is
+    # workspace-keyed too, and only `override_sid_by_label` is label-keyed. Because
+    # `disk_by_label[label]` is a per-row ASSIGNMENT, a trailing stale row used to
+    # ERASE the survivor's candidates, so the filter can only ever reveal more
+    # violations, never fewer. An unreadable registry still yields zero rows, hence
+    # zero claimed sessions, hence zero violations — the old code printed `none` on
+    # rc=0, byte-identical to a measured, genuinely-clean roster (PR #8594 review P2).
     if not _registry_readable(state, "violations", "cannot detect session-partition breaks"):
         return 2
     print(json.dumps(state["violations"], indent=2) if args.json else "\n".join(

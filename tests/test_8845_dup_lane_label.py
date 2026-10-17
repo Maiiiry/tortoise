@@ -282,13 +282,17 @@ def test_the_last_duplicate_rows_issue_label_wins(monkeypatch) -> None:
     )
     (lane,) = st["lanes"]
     assert lane["claim"]["lane_label"] == "lane:new"
-    # ⛔ AND THE INSTRUCTION MUST NOT REVERT IT (review of #8849, cycle 5). The two
-    # lines differ in exactly the column the board just used, so a bare "delete the
-    # duplicate roster line" tells the human to delete the copy that CARRIES the
-    # published value — and obeying it silently reverts the label to `lane:old`,
-    # which is the failure the last-wins rule exists to prevent.
+    # ⛔ AND THE INSTRUCTION MUST NOT REVERT IT (review of #8849, cycles 5-6). The
+    # two lines differ in exactly the column the board just used, so a bare "delete
+    # the duplicate roster line" tells the human to delete the copy that CARRIES the
+    # published value — obeying it silently reverts the label. The reason must name
+    # BOTH values, because "keep the copy with the published value" is not
+    # actionable when the message prints neither (and was BACKWARDS: last-wins stores
+    # the reported row's value on the kept tuple).
     (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
-    assert "claim.lane_label" in orphan["reason"], orphan["reason"]
+    assert "`lane:new`" in orphan["reason"], orphan["reason"]
+    assert "`lane:old`" in orphan["reason"], orphan["reason"]
+    assert "written twice is ONE lane" in orphan["reason"], orphan["reason"]
 
 
 def test_a_dropped_rows_lane_label_does_not_overwrite_the_survivors(monkeypatch) -> None:
