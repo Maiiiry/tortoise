@@ -516,10 +516,12 @@ for three sends to one pane that were recorded as `OK` and never consumed.
   a state error, so treat ANY non-zero as "do not run a bare `git stash pop`").
   `python tools/lane_stash.py recover <sha>` is the repair recipe for THIS lane's own dropped entry
   (it pins what it restores under the current lane), and it **refuses** an entry another lane's ref
-  or `[<lane-key>]` marker names — pinning a peer's entry here would leave it claimed by both lanes,
-  and `check` would then clear a bare pop on work that is not this lane's. To restore a *peer's*
-  dropped entry, use `git stash store -m "<original subject>" <sha>` (the commit survives in the
-  object DB), or let that lane recover it from its own worktree.
+  or `[<lane-key>]` marker names, or one already enumerated by the register that is not provably
+  this lane's (nothing was dropped, so `recover` would only mint ownership; pass `-m` to assert it
+  deliberately) — pinning a peer's entry here would leave it claimed by both lanes, and `check`
+  would then clear a bare pop on work that is not this lane's. To restore a *peer's* dropped entry,
+  use `git stash store -m "<original subject>" <sha>` (the commit survives in the object DB), or let
+  that lane recover it from its own worktree.
   `tests/test_lane_stash.py` carries the 2-worktree reproduction. The lane rule
   also exists one repo up in agent-infra (skills + guard extension) as agent-infra #1264.
 - Branch naming: `feat/`, `fix/`, `chore/` prefixes

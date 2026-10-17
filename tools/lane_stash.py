@@ -92,8 +92,11 @@ one lane to delete or adopt another lane's pinned entries. ``prune`` and
 explicit by design (`prune` also requires ``--apply``). ``recover`` additionally
 REFUSES an entry that another lane's ref or ``[<lane-key>]`` marker names: pinning
 it here would leave it claimed by both lanes, and ``check`` would then call a bare
-``git stash pop`` safe on work that is not this lane's (#8773 review P1). A
-peer's entry is restored with bare ``git stash store`` or from its own lane.
+``git stash pop`` safe on work that is not this lane's (#8773 review P1). It also
+refuses an entry already ENUMERATED by the register that is not provably this
+lane's — nothing was dropped, so `recover` would only mint ownership (pass ``-m``
+to assert the recovery deliberately). A peer's entry is restored with bare
+``git stash store`` or from its own lane.
 
 USAGE
 -----
@@ -178,7 +181,16 @@ def _git(
     *args: str, check: bool = True, stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
     cp = subprocess.run(
-        ["git", *args], capture_output=True, text=True, env=_env(), input=stdin,
+        # `errors="replace"`: git accepts NON-UTF-8 commit/stash messages (it only
+        # warns), and a strict decode made ONE such subject in the repo-global
+        # register raise `UnicodeDecodeError` out of every command that read it —
+        # a traceback, exit 1 (the HAZARD code), and in `push` it landed AFTER
+        # `git stash push`, leaving live UNPINNED work (#8773 review P1). Every
+        # parsed structure (ref names, shas, positions, the 32-hex nonce, the
+        # `On <branch>:` / `lane_stash ... [key]` markers) is ASCII; subjects are
+        # display-only.
+        ["git", *args], capture_output=True, text=True, errors="replace",
+        env=_env(), input=stdin,
     )
     if check and cp.returncode != 0:
         raise GitFailed(cp.returncode, (cp.stderr or cp.stdout).strip())
@@ -1158,6 +1170,31 @@ def cmd_recover(args: argparse.Namespace) -> int:
             "matches that lane's key there — or restore it deliberately with bare "
             "`git stash store`."
         )
+    # An entry that is ALREADY enumerated by the register was never dropped, so
+    # `recover` has nothing to restore — it would only MINT this lane's ownership
+    # of an entry that may be another lane's, and `check` would then clear a bare
+    # `git stash pop` on it. A bare-git push is marker-less and unpinned, i.e.
+    # exactly the #2654/#3539 class, so this closes the last adoption door. An
+    # ENUMERATED OWN entry (a pin-failure repair) and every emptiness/divergence
+    # repair are unaffected: own entries are `own`, and those repairs are not
+    # enumerated. `-m` is the explicit human assertion that overrides it, as it
+    # already is for a subject that does not look like a stash (#8773 P1).
+    if not args.message:
+        own_shas = {e["sha"] for e in _parse_entries(key)} | _applied_shas(key)
+        for row in _shared_register():
+            if row["sha"] != args.sha:
+                continue
+            if _entry_ownership(row, key, own_shas)[0] != "own":
+                raise LaneStashError(
+                    f"refusing to recover {args.sha[:12]}: it is ALREADY in the shared "
+                    f"register (position {row['pos']}) and is not provably this lane's — "
+                    "nothing was dropped, so there is nothing to recover. `recover` would "
+                    "PIN it to this lane, and `check` would then clear a bare `git stash "
+                    "pop` on another lane's work. Restore it with `lane_stash pop <id>` "
+                    "or `git stash apply <sha>`, or pass -m <message> to assert the "
+                    "recovery explicitly."
+                )
+            break
     if not _store_into_register(args.sha, subject, key):
         raise LaneStashError(
             f"could not put {args.sha} into the shared register. Either `git stash store` "

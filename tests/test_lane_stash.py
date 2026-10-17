@@ -90,8 +90,18 @@ class Repo:
         """Invoke tools/lane_stash.py inside `cwd` (a real worktree)."""
         return subprocess.run(
             [PYTHON, str(TOOL), *args], cwd=str(cwd), capture_output=True,
-            text=True, env=_env(),
+            text=True, errors="replace", env=_env(),
         )
+
+    def git_bytes(self, *args: bytes, cwd: Path | None = None, check: bool = True):
+        """Run git with a BYTES argv — for a genuinely non-UTF-8 stash message."""
+        cp = subprocess.run(
+            [b"git", *args], cwd=str(cwd or self.root), capture_output=True,
+            env=_env(),
+        )
+        if check and cp.returncode != 0:
+            raise AssertionError(f"git failed: {cp.stderr!r}")
+        return cp
 
     def status(self, cwd: Path) -> str:
         return self.git("status", "--porcelain", cwd=cwd).stdout
@@ -2101,3 +2111,77 @@ def test_prune_releases_an_applied_record_whose_entry_is_already_gone(repo):
 
     assert repo.lane(repo.a, "prune", "--apply").returncode == 0
     assert repo.applied_refs() == {}, "the applied record outlived its register entry"
+
+
+# ── round-6 review P1s ──────────────────────────────────────────────────────
+
+def test_recover_refuses_an_unpinned_bare_entry_already_in_the_register(repo):
+    """`recover` must not mint ownership of a marker-less bare entry in the register.
+
+    A bare-git entry (marker-less, unpinned) is ALREADY enumerated, so nothing was
+    dropped — but `recover` pinned it to this lane and `check` flipped HAZARD ->
+    SAFE, re-opening the #2654 incident for exactly the class this tool exists to
+    protect (#8773 review P1).
+    """
+    repo.dirty(repo.b, "f.txt", "base\nb-bare\n")
+    repo.git("stash", "push", "-q", "-m", "B bare work", cwd=repo.b)
+    sha_b = repo.stash_sha()
+    assert sha_b and repo.stash_shas() == [sha_b]
+    assert repo.lane(repo.a, "check").returncode == 1
+
+    cp = repo.lane(repo.a, "recover", sha_b)
+    assert cp.returncode == 2, _fail(cp)
+    assert "ALREADY in the shared register" in cp.stderr, cp.stderr
+    assert repo.stash_pins() == {}, "the refusal must not pin a peer's entry"
+    assert repo.lane(repo.a, "check").returncode == 1, "the refusal must not launder HAZARD"
+    assert repo.stash_shas() == [sha_b], "the refusal must not move the register"
+
+    # the explicit assertion escape still works — and is the operator's choice
+    forced = repo.lane(repo.a, "recover", sha_b, "-m", "deliberate rescue")
+    assert forced.returncode == 0, _fail(forced)
+    assert repo.stash_pins(), "an explicit -m recovery must still pin"
+
+
+def test_list_and_check_tolerate_a_non_utf8_stash_message(repo):
+    """A non-UTF-8 stash message must not crash the tool (git accepts them).
+
+    `_git` decoded strictly, so ONE such subject in the repo-global register
+    raised `UnicodeDecodeError` out of every command that read it — a traceback,
+    exit 1 (the HAZARD code), outside the published 0/1/2/3 set (#8773 review P1).
+    """
+    repo.dirty(repo.a, "f.txt", "base\nlatin\n")
+    cp = repo.git_bytes(b"stash", b"push", b"-q", b"-m", b"caf\xe9 work", cwd=repo.a)
+    assert cp.returncode == 0, cp.stderr
+    assert repo.stash_shas(), "precondition: the entry is in the register"
+
+    listed = repo.lane(repo.a, "list")
+    assert listed.returncode == 0, _fail(listed)
+    assert "Traceback" not in listed.stderr, listed.stderr
+    checked = repo.lane(repo.a, "check")
+    assert checked.returncode in (0, 1), _fail(checked)
+    assert "Traceback" not in checked.stderr, checked.stderr
+
+
+def test_push_survives_a_peer_entry_with_a_non_utf8_message(repo):
+    """A peer's non-UTF-8 subject must not crash `push` AFTER it stashed.
+
+    `push` reads the whole global reflog to locate its own entry. A strict decode
+    crashed there with the stash already created and NO lane pin — the unpinned
+    live work `_pin_or_report` exists to prevent (#8773 review P1).
+    """
+    repo.dirty(repo.b, "f.txt", "base\npeer latin\n")
+    cp = repo.git_bytes(b"stash", b"push", b"-q", b"-m", b"caf\xe9 peer", cwd=repo.b)
+    assert cp.returncode == 0, cp.stderr
+    raw = repo.git_bytes(
+        b"log", b"--walk-reflogs", b"--format=%gs", b"-n", b"1", b"refs/stash",
+        cwd=repo.b,
+    )
+    assert b"\xe9" in raw.stdout, (
+        "precondition: git must keep the non-UTF-8 byte, else this test is vacuous"
+    )
+    repo.dirty(repo.a, "f.txt", "base\na\n")
+
+    pushed = repo.lane(repo.a, "push", "-m", "A work")
+    assert pushed.returncode == 0, _fail(pushed)
+    assert "Traceback" not in pushed.stderr, pushed.stderr
+    assert repo.stash_pins(), "push must pin its entry beside a non-UTF-8 peer subject"
