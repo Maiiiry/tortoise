@@ -858,8 +858,9 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
     ``TestRevokeBodySweepCap.sweep_client`` (which keeps
     ``raise_server_exceptions=False`` so its malformed-body 500 pin still
     observes a real response) — so the seam covers every read bound from them:
-    ``POST /v1/agent/token/revoke`` (18), ``POST /v1/agent/recover`` (9) and
-    ``POST /v1/agent/signup`` (3), none of them exempt from the bound. The
+    ``POST /v1/agent/token/revoke`` (17 call sites), ``POST /v1/agent/recover``
+    (8) and ``POST /v1/agent/signup`` (2), plus one parametrised pass over the
+    last two — none of them exempt from the bound. The
     plain-client control is the non-vacuity leg: it is the exact
     ``assert 504 == 200`` shape this conversion removes, and it goes RED if the
     route is ever exempted (the middleware stops refusing, so the control's 504

@@ -1012,9 +1012,9 @@ _CONVERTED_CLIENT_SEAMS: dict[str, tuple[int, frozenset[str]]] = {
         "test_server_owned_capture_keys_are_refused"})),
     # +2: the mount-only MCP parent (`TestMcp._mcp_client` — a local `Starlette`
     # carrying ONLY `OrgResolutionMiddleware`, so no `WaitBoundMiddleware` is on
-    # its path and none of its reads can be a refusal; its reads are 403
-    # JSON-RPC error shapes) and the pin's control. The other twenty-five
-    # constructions (all `TestClient(env["app"])`) are converted.
+    # its path; its `status_code == 200` reads are answered by that local echo
+    # route, never by the hosted app) and the pin's control. The other
+    # twenty-five constructions (all `TestClient(env["app"])`) are converted.
     "tests/test_abuse_integration.py": (2, frozenset({
         "test_alerts_endpoint_session_authed",
         "test_alerts_reachable_while_suspended",
@@ -1046,13 +1046,20 @@ _CONVERTED_CLIENT_SEAMS: dict[str, tuple[int, frozenset[str]]] = {
     "tests/test_onboarding_health_flip.py": (1, frozenset({
         "_registry_client", "supabase_client",
         "test_callback_fails_closed_on_control_plane_outage"})),
-    # +1: the pin's control.
+    # +1: the pin's control. Both constructions are converted (the `client`
+    # fixture and `registry_client`), covering `POST /v1/billing/checkout/new-org`
+    # (10 reads), `POST /v1/organizations` (1) and `POST /webhooks/stripe`
+    # (already `require_answered`-wrapped in `_post_signed`).
     "tests/test_one_free_org_entitlement.py": (1, frozenset({
         "client", "registry_client"})),
-    # +1: the pin's control. The three concurrent-burst `_burst` helpers build
+    # +1: the pin's control. The `client` and `reg_client` fixtures are
+    # converted, as are the three concurrent-burst `_burst` helpers, which build
     # `verdict_async_client(app, base_url="http://test")` in place of their own
     # `httpx.ASGITransport(app=app)` client — same transport, same base_url, so
-    # the burst still runs in ONE event loop over the same app.
+    # the burst still runs in ONE event loop over the same app. Reads: 18
+    # `POST /v1/organizations` + 1 `GET /v1/organizations`, 9
+    # `POST /v1/onboarding/team`, 2 `POST /v1/register`, 1
+    # `PATCH /v1/onboarding/state`.
     "tests/test_free_team_entitlement.py": (1, frozenset({
         "_burst", "client", "reg_client",
         "test_concurrent_create_team_one_minted",

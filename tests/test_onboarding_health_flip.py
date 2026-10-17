@@ -396,9 +396,12 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
     ``test_callback_fails_closed_on_control_plane_outage``'s own client (which
     keeps ``raise_server_exceptions=False`` so its 500 pin still observes a real
     response) — so the seam covers every read bound from them:
-    ``GET /v1/onboarding/state``, ``PATCH /v1/onboarding/state``,
-    ``GET /v1/onboarding/github/callback``, ``GET /health`` and
-    ``GET /health/ready``, none of them exempt from the bound. The plain-client
+    ``GET``/``PATCH /v1/onboarding/state``,
+    ``POST /v1/onboarding/session-recording``,
+    ``POST /v1/onboarding/github/connect``, ``GET /v1/onboarding/github/status``,
+    ``GET /v1/onboarding/github/callback``, ``POST /v1/index/github``,
+    ``GET /health/security`` and ``GET /health/ready``, none of them exempt from
+    the bound. The plain-client
     control is the non-vacuity leg: it is the exact ``assert 504 == 200`` shape
     this conversion removes, and it goes RED if the route is ever exempted (the
     middleware stops refusing, so the control's 504 assertion fails). Note the

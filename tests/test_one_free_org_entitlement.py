@@ -962,10 +962,11 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
 
     No load and no wall-clock wait: the bound is forced to 0 s, so the refusal
     comes from the REAL ``WaitBoundMiddleware``. Both constructions are
-    converted — the ``supabase_client`` fixture and the registry-lane fixture
-    that drives ``POST /v1/billing/checkout/new-org`` — so the seam covers every
-    read bound from them: ``POST /v1/billing/checkout/new-org`` (10) and
-    ``GET /v1/organizations`` (1), neither exempt from the bound. The
+    converted — the ``client`` fixture and ``registry_client`` — so the seam
+    covers every read bound from them: ``POST /v1/billing/checkout/new-org``
+    (10 reads), ``POST /v1/organizations`` (1) and ``POST /webhooks/stripe``
+    (already ``require_answered``-wrapped in ``_post_signed``), none of them
+    exempt from the bound. The
     plain-client control is the non-vacuity leg: it is the exact
     ``assert 504 == 200`` shape this conversion removes, and it goes RED if the
     route is ever exempted (the middleware stops refusing, so the control's 504

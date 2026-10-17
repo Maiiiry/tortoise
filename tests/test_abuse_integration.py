@@ -843,14 +843,15 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
     comes from the REAL ``WaitBoundMiddleware``. Twenty-five of this file's
     twenty-six constructions are converted — every ``TestClient(env["app"])``
     (the ``env`` fixture's hosted app, shared by all REST test classes) — so the
-    seam covers every REST read bound from them, including
-    ``GET /v1/team`` (the route this pin drives), ``POST /v1/context`` (exempt
-    only in its POST form, so the exempt-set assert below is exact) and the
-    session-JWT REST lane. The one construction left PLAIN is
+    seam covers every REST read bound from them: ``GET /v1/team/keys`` (the
+    busiest), ``GET /v1/team`` (the route this pin drives),
+    ``DELETE /v1/team/keys/{kid}``, ``POST /v1/points``, ``POST /v1/session/key``,
+    ``POST /v1/signup/email`` and the session-JWT REST lane — none of them
+    exempt from the bound. The one construction left PLAIN is
     ``TestMcp._mcp_client``: it wraps a local ``Starlette`` carrying ONLY
     ``OrgResolutionMiddleware``, so no ``WaitBoundMiddleware`` is on its path
-    and none of its reads can be a refusal (its reads are 403 JSON-RPC error
-    shapes, not ``status_code == 200``).
+    and none of its reads can be a refusal — its ``status_code == 200`` reads
+    are answered by that local echo route, never by the hosted app.
 
     The plain-client control is the non-vacuity leg: it is the exact
     ``assert 504 == 200`` shape this conversion removes, and it goes RED if the

@@ -921,9 +921,10 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
     and the three concurrent-burst ``_burst`` helpers, which build their own
     ``httpx.ASGITransport(app=app)`` client (``verdict_async_client``, so the
     per-response check runs on the ASGI transport they were already using) — so
-    the seam covers every read bound from them: ``POST /v1/organizations`` (19),
-    ``POST /v1/onboarding/team`` (9), ``POST /v1/register`` (2) and
-    ``GET /v1/onboarding/state`` (1), none of them exempt from the bound. The
+    the seam covers every read bound from them: 18
+    ``POST /v1/organizations`` and 1 ``GET /v1/organizations``, 9
+    ``POST /v1/onboarding/team``, 2 ``POST /v1/register`` and 1
+    ``PATCH /v1/onboarding/state``, none of them exempt from the bound. The
     plain-client control is the non-vacuity leg: it is the exact
     ``assert 504 == 200`` shape this conversion removes, and it goes RED if the
     route is ever exempted (the middleware stops refusing, so the control's 504
