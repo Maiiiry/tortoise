@@ -75,8 +75,23 @@ LEGAL_TOKENS = (
 )
 
 
+
+#: `if:` values that are false by construction: the boolean, the integer 0, and
+#: their `${{ }}` spellings. `str(gate)` alone cannot tell `0` from `"0"`.
+_CONSTANT_FALSE = re.compile(
+    r"^(?:\$\{\{\s*)?(?:false|0(?:\.0*)?)(?:\s*\}\})?$", re.IGNORECASE
+)
+
+
+def _is_constant_false(gate: object) -> bool:
+    if isinstance(gate, bool):
+        return not gate
+    if isinstance(gate, (int, float)):
+        return not gate
+    return bool(_CONSTANT_FALSE.match(str(gate).strip()))
+
 def _workflow_paths() -> list:
-    paths = sorted(WORKFLOWS.glob("*.yml"))
+    paths = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
     assert paths, "no workflows found — the repo root probe is wrong"
     return paths
 
@@ -172,10 +187,16 @@ def test_every_wrangler_spec_is_the_asserted_form() -> None:
     for path in _workflow_paths():
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             code = line.split("#", 1)[0] if line.lstrip().startswith("#") else line
-            for match in re.finditer(r"wrangler@[0-9$\"'{\\]\S*", code):
+            for match in re.finditer(r"wrangler@\S*", code):
                 token = match.group(0)
-                if not LEGAL_SPEC.match(token):
-                    offenders.append(f"{path.name}:{lineno}: {token}")
+                if LEGAL_SPEC.match(token):
+                    continue
+                # A bare `wrangler@` followed by prose punctuation is a mention,
+                # not a spec — anything shaped like a spec (digit, letter, `^`,
+                # `~`, `$`, quote, backslash, `{`) is an offender.
+                if len(token) > len("wrangler@") and token[len("wrangler@")] in "`).,;:":
+                    continue
+                offenders.append(f"{path.name}:{lineno}: {token}")
     assert not offenders, (
         "wrangler spec is not the asserted variable form (a literal spec cannot be "
         "verified against what resolved):\n" + "\n".join(offenders)
@@ -210,6 +231,10 @@ def test_the_three_website_e2e_jobs_install_and_verify() -> None:
         assert '"$WRANGLER_VERSION"' in run, (
             f"{job}: the verify step installs/comares something other than the declared value"
         )
+        assert re.search(r"for attempt in (?:1 )?2(?: 3)?;", run), (
+            f"{job}: the install lost its retry loop — one npm-registry ECONNRESET "
+            "(2026-10-15) reded the required legal-e2e check when the fetch had none"
+        )
 
 
 def test_the_verify_step_is_unconditional() -> None:
@@ -220,10 +245,10 @@ def test_the_verify_step_is_unconditional() -> None:
         )
         job_cfg = _load(WORKFLOWS / "ci.yml")["jobs"][job]
         gate = job_cfg.get("if")
-        if gate:
-            text = str(gate)
-            assert "false" not in text.lower(), (
-                f"{job}: job-level `if: {gate}` can disable the whole verify"
+        if gate is not None:
+            assert not _is_constant_false(gate), (
+                f"{job}: job-level `if: {gate!r}` is constant-false — the whole job, "
+                "including the verify, can never run"
             )
 
 
@@ -304,7 +329,10 @@ def test_every_job_that_installs_wrangler_pins_node_22() -> None:
                 uses = step.get("uses") or ""
                 if uses.startswith("actions/setup-node"):
                     node = str((step.get("with") or {}).get("node-version", ""))
-            if "22" not in node:
+            # No `setup-node` at all is an offender, not a crash: the job would
+            # run whatever node the image ships, and `npm install` only WARNS on
+            # an engines mismatch.
+            if "22" not in (node or ""):
                 offenders.append(f"{path.name}:{job_name} node-version={node!r}")
     assert checked >= 4, f"only {checked} wrangler-installing jobs found — the probe is wrong"
     assert not offenders, (
@@ -312,3 +340,31 @@ def test_every_job_that_installs_wrangler_pins_node_22() -> None:
         "mismatch, so it would 'succeed' and break later in the readiness loop:\n"
         + "\n".join(offenders)
     )
+
+
+# ------------------------------------------------ 5. the manual deploy script
+
+
+def test_the_manual_deploy_script_pins_the_same_version() -> None:
+    """`website/apps/dashboard/deploy.sh` is the documented manual deploy.
+
+    It is outside the workflows, so no other arm reaches it — and a bare
+    `npx wrangler pages deploy` there ships whatever npm serves, with nothing
+    asserting what that was. It reads the same artefact.
+    """
+
+    script = REPO_ROOT / "website" / "apps" / "dashboard" / "deploy.sh"
+    assert script.is_file(), f"{script} is missing"
+    text = script.read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert 'cat "$(dirname "$0")/../../../config/wrangler-version"' in code, (
+        "the manual deploy does not read config/wrangler-version — it would deploy "
+        "an unasserted wrangler"
+    )
+    assert "--version" in code, "the manual deploy never asserts what resolved"
+    for match in re.finditer(r"wrangler@\S*", code):
+        assert LEGAL_SPEC.match(match.group(0)), (
+            f"manual deploy spec {match.group(0)!r} is not the asserted variable form"
+        )

@@ -1862,12 +1862,6 @@ jobs:
             # with > anyway, and deleting after the LAST attempt would remove
             # the only evidence before the final cat (review P1 — a double
             # failure must still surface wrangler's own diagnostics).
-            #
-            # #8744: an npx cache entry left half-written by a failed install
-            # cannot be recovered by REUSING it — the retry relaunched npx,
-            # the shim re-ran, and `sh: 1: wrangler: not found` repeated
-            # identically until the job reddened on a PR that touched no
-            # website file. Clear the npx cache so attempt 2 is a genuinely
             sleep 3
           done
           # Final cleanup: flush the log + free :8788 before surfacing it
