@@ -5457,11 +5457,18 @@ class TortoiseSDK:
         heals in place (``base=2.0``, 3 retries). The window is per CALL, not
         per verb: the whole ``fn`` is re-issued together, so a caller that
         issues several statements inside one ``fn`` (``update_point``'s
-        per-key loop, ``_sync_tags``) shares that one budget, and a verb that
-        wraps twice (``update_point`` with tags: the property write, then the
-        tag sync) is bounded by two of them. The window #7405 measured
-        lasted **over an hour**, and no bounded retry should wait that long — so
-        on exhaustion the original error still surfaces, **unchanged in type**.
+        per-key loop, ``_sync_tags``) shares that one budget. A verb that
+        reaches several wrapped call sites pays one window PER SITE, so its
+        caller-visible bound is one window x the number of sites that branch
+        reaches. ``update_point`` is the widest: one for the property write
+        (the per-key loop counts once), one for the derived-embedding
+        clear+set when ``content`` is given without ``embedding``, and one for
+        the tag sync when ``tags`` is given — up to three (roughly 21-42 s)
+        for ``update_point(content=..., tags=[...])``, two for
+        ``update_point(tags=[...])``, and one for ``annotate_operator``. The
+        window #7405 measured lasted **over an hour**, and no bounded retry
+        should wait that long — so on exhaustion the original error still
+        surfaces, **unchanged in type**.
 
         Residual window, stated honestly. The classification-time probe can be
         stale by the time the retry runs — ``call_with_predicate`` evaluates the
@@ -10229,11 +10236,13 @@ class TortoiseSDK:
         # used to reject the revision outright while reads kept serving: the
         # finding is revised in the caller's head and lost from the map. Every
         # statement here is admissible on `retryable_aborted_write` ALONE — its
-        # arms prove the statement did NOT land — and each one is an ABSOLUTE
-        # `SET` computed once above (``_props_param``, ``now``,
-        # ``_embed_params`` are all fixed at the call), so a re-issue converges
-        # on exactly the state a single successful issue would produce and
-        # cannot double-increment. The promote arms carry their guard INSIDE
+        # arms prove the statement did NOT land — and every value is computed
+        # once above (``_props_param``, ``now``, ``_embed_params`` are all fixed
+        # at the call), so a re-issue converges on exactly the state a single
+        # successful issue would produce. That is also why the one relative
+        # write inside a statement (``n.version = coalesce(n.version, 0) + 1``)
+        # cannot double-bump: it is safe for the did-not-land reason, NOT
+        # because it is an absolute SET. The promote arms carry their guard INSIDE
         # the statement, so a re-issue re-evaluates the same
         # `status IS NULL OR status = 'draft'` predicate against the graph — it
         # cannot promote twice, and a legitimately-refused promote still yields

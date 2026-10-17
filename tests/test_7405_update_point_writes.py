@@ -21,10 +21,12 @@ Why re-issuing each statement is safe (reasoned from the statement's SHAPE, not
 measured here — these tests pin that the aborted statement is re-issued and
 applied exactly once):
 
-1. the plain arms — an ABSOLUTE ``SET n += $props`` / ``SET n.version = ...``
-   whose every value (``_props_param``, ``now``, ``_embed_params``) was fixed
-   before the first attempt, so a re-issue converges on exactly the single-issue
-   state and cannot double-increment;
+1. the plain arms — an absolute ``SET n += $props`` whose every value
+   (``_props_param``, ``now``, ``_embed_params``) was fixed before the first
+   attempt, so a re-issue converges on exactly the single-issue state. The
+   ``:Object`` plain arm also carries a RELATIVE ``n.version = coalesce(n.version,
+   0) + 1``; it cannot double-bump because an abort means the statement did NOT
+   land (the predicate's premise) — NOT because the write is absolute;
 2. the promote arms — the guard lives INSIDE the statement
    (``WHERE n.status IS NULL OR n.status = 'draft'``), so a re-issue re-reads the
    graph, cannot promote twice, and a legitimately-refused promote still returns
@@ -36,6 +38,11 @@ applied exactly once):
 6. ``invalidate_point`` — an absolute terminal stamp whose values were fixed
    before the attempt (so the window END cannot move) and a ``CORRECTS`` MERGE
    on its endpoints.
+
+The caller-visible bound is one 7-14 s window per ``_graph_write_with_retry``
+call site a branch REACHES (never one per verb), which is why the last test here
+pins the call count for each shape rather than leaving it to prose: it is the
+number an operator sizes a timeout against.
 
 ⛔ The retry must NOT mask a deletion. The engine reports the SAME abort for a
 rebuild and for a plain deletion, so the graph-abort family is retried only
@@ -563,8 +570,67 @@ def test_the_per_key_loop_shares_one_retry_budget(tmp_path):
             sdk.close()
 
 
-# ── the loud arm: a DELETED graph is never re-issued into ───────────────
+# ── 13. the documented per-verb bound IS the call count ─────────────────
 
+
+def test_the_documented_per_verb_retry_bound_matches_the_call_sites(
+        tmp_path, monkeypatch):
+    """The stated bound is one window per wrapped CALL SITE a branch reaches.
+
+    ``_graph_write_with_retry``'s docstring states the caller-visible bound as
+    one 7-14 s window per call: one for a plain property update, one for
+    ``annotate_operator``, two for ``update_point(tags=...)`` and THREE for
+    ``update_point(content=..., tags=...)`` (property loop, derived-embedding
+    clear+set, tag sync). #8854 review round 4 found that count stated as "at
+    most two", which understates the door's worst case by a whole window — the
+    number a caller sizes a timeout against, so it is pinned rather than left to
+    prose.
+
+    Discriminating power: pre-fix the wrapper was never called by the door at
+    all (empty list), and folding the embedding write into the per-key loop's
+    ``fn`` would drop the third case to two. Only the ``update_point``-labelled
+    sites are compared: the door also forwards ``_mark_dirty`` / ``_advance_ep_
+    version`` (pre-existing callers, not part of the enumerated bound).
+    """
+    sdk = _sdk(tmp_path, "bound")
+    try:
+        src = _pid(sdk)
+        tgt = _pid(sdk)
+        op = sdk.create_operator("IMPL", src, [tgt])["id"]
+        seen: list[str] = []
+        original = sdk._graph_write_with_retry
+
+        def counting(fn, *, what):
+            if what.startswith("update_point "):
+                seen.append(what)
+            return original(fn, what=what)
+
+        monkeypatch.setattr(sdk, "_graph_write_with_retry", counting)
+
+        sdk.update_point(src, confidence=0.5)
+        assert seen == ["update_point SET (per-key)"], seen
+
+        seen.clear()
+        sdk.update_point(src, tags=["a"])
+        assert seen == ["update_point SET (per-key)",
+                        "update_point TAGGED edges"], seen
+
+        seen.clear()
+        sdk.update_point(src, content="revised claim", tags=["a"])
+        assert seen == ["update_point SET (per-key)",
+                        "update_point SET (embedding)",
+                        "update_point TAGGED edges"], seen
+
+        seen.clear()
+        sdk.annotate_operator(op, bias=0.2, precision=0.8,
+                              consistency=0.7, directness=0.9)
+        assert seen == ["update_point SET (per-key)"], seen
+    finally:
+        with contextlib.suppress(Exception):
+            sdk.close()
+
+
+# ── the loud arm: a DELETED graph is never re-issued into ───────────────
 
 def test_a_deleted_graph_abort_on_the_property_set_stays_loud(tmp_path):
     """The retry must not MASK a deletion — the #7685 guarantee, extended.

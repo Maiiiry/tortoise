@@ -29,12 +29,15 @@ and keeps its own run knobs (``INGEST_WRITE_RETRIES`` etc.) eval-side.
     ``IMPL``/``mitigated_by`` edge pair;
   * ``create_entity``'s document ``extractedFrom`` leg and
     ``create_document``'s ``extractedFrom`` leg (both ``_link_source``);
-  * ``update_point`` — the four property/promote ``SET`` arms (the two
-    ``:Point:Object``/``:Point`` status promote arms carry their guard inside
-    the statement, the two plain arms are absolute ``SET n += $props``), the
-    per-key ``SET`` loop, the derived-embedding clear+set, and the ``TAGGED``
-    edges it shares with ``create_point`` (``_sync_tags``). ``annotate_operator``
-    is covered transitively — it delegates here;
+  * ``update_point`` — the three property/promote ``SET`` arms plus the
+    per-key ``SET`` loop (the two ``:Point:Object``/``:Point`` status promote
+    arms carry their guard inside the statement; the ``:Object`` plain arm
+    carries a relative ``n.version = coalesce(n.version, 0) + 1`` beside the
+    plain ``SET n += $props``, safe because an abort means the statement did
+    NOT land — not because the write is absolute), the derived-embedding
+    clear+set, and the ``TAGGED`` edges it shares with ``create_point``
+    (``_sync_tags``). ``annotate_operator`` is covered transitively — it
+    delegates here;
   * ``invalidate_point`` — the terminal stamp ``SET`` and the ``CORRECTS``
     ``MERGE``;
   * ``retract_point`` — the CAS ``status → retracted`` ``SET`` (its
