@@ -52,13 +52,14 @@ text scan over the workflows can see. The spec and invocation arms refuse the
 first in every workflow file, every composite action and the command docs; the
 executed harnesses in `tests/test_pages_bindings.py` prove the deploy step's
 assertion, and the arms below EXECUTE the manual deploy script rather than
-grepping its path. One spelling remains uncovered and is declared here rather than
-implied closed: a version that reaches npm through an alias, a function or a
-wrapper script naming its own version — no text scan over these files can see it,
-which is why the enforcement that matters is the assertion on the binary that
-runs. A spec SPLIT by quoting (`wran"g"ler@4`) is covered: the spec arm retries
-each segment with the quote characters removed, which is exactly the word bash
-runs.
+grepping its path. The division is: the TEXT arms stop a float spelling being
+written here at all, and the assertion is the runtime check on the binary the lane
+actually runs — neither alone is the guard. A spec split by quoting or by
+backslash (`wran"g"ler@4`, `wran\\gler@4`) is covered, because the spec arm retries
+each segment the way bash builds the word: quotes removed and escapes resolved.
+What no text scan can see is declared rather than implied closed — a version that
+reaches npm through an alias, a function, a wrapper script, or a file written
+first and executed later.
 """
 
 from __future__ import annotations
@@ -278,9 +279,17 @@ _DIAGNOSTIC = re.compile(
     r"^[\s{}\(\)]*(?:(?:then|else|do|run:|)\s+)*(?:-\s*)?(?:echo|printf)\b"
 )
 
-#: A pipe into one of these EXECUTES what the left side printed, so a message
-#: segment feeding one of them is a command with extra steps.
-_INTERPRETER = re.compile(r"\|\s*(?:sh|bash|zsh|source|\.)(?![\w-])")
+#: A piece of a line that sends the printed text somewhere that may EXECUTE it:
+#: a PIPE (not `||`, which merely separates commands), a redirection to a file
+#: (not `>&1`/`>&2`, which only moves the message to a descriptor), a process
+#: substitution, or an interpreter INVOKED with its input (`xargs … sh`, `eval`). (`| sh`, `| /bin/sh`, `| tee x.sh` then `bash x.sh`,
+#: `| xargs … sh -c {}`, `> x.sh` then `bash x.sh`). Enumerating sinks is a losing
+#: game — a `::error::` annotation is never piped or redirected, so refuse them
+#: all instead.
+_SINKS = re.compile(r"(?<!\|)\|(?!\|)|>>?(?!&)|<\(|>\(|\bxargs\b|\beval\b")
+
+#: A message built into a variable and printed later cannot execute anything.
+_ASSIGNMENT_MESSAGE = re.compile(r'^[A-Za-z_]\w*=(?:"[^"$`]*"|\'[^\']*\')\s*$')
 
 
 def _command_segments(line: str) -> list[str]:
@@ -319,14 +328,20 @@ def _command_segments(line: str) -> list[str]:
 def _is_diagnostic(segment: str, line: str = "") -> bool:
     """True only for a segment that PRINTS and cannot execute a command.
 
-    `line` is passed so a message feeding an interpreter (`echo '…' | sh`) is not
-    exempt: the printed text IS the command.
+    `line` is passed because a sink can live in a different segment: `echo '…' |
+    sh` prints a command and then RUNS it. A message held in a variable
+    (`MSG="cannot use wrangler@4"`) is exempt too. Not exempt, and not modelled
+    here: a heredoc body or a `bash -c '…'` string — a message written as literal
+    text reds this arm, which is a declared limitation, not a hole.
     """
+    plain = segment.strip().rstrip("};").strip()
     if "$(" in segment or "`" in segment:
         return False
-    if _INTERPRETER.search(line or segment):
+    if _SINKS.search(line or segment):
         return False
-    return bool(_DIAGNOSTIC.match(segment.lstrip().rstrip("};").rstrip()))
+    if _ASSIGNMENT_MESSAGE.match(plain):
+        return True
+    return bool(_DIAGNOSTIC.match(plain))
 
 def _strip_quoted(line: str) -> str:
     """`line` with quoted SEGMENTS removed — a diagnostic is not a command.
@@ -460,7 +475,9 @@ def test_every_wrangler_spec_is_the_asserted_form() -> None:
                 # A spec SPLIT by quoting (`wran"g"ler@4`) is the word bash runs
                 # once the quotes go; retry each segment dequoted. A legal quoted
                 # spec still matches LEGAL_SPEC after dequoting.
-                for match in re.finditer(r"wrangler@\S*", re.sub(r"[\"']", "", segment)):
+                for match in re.finditer(
+                    r"wrangler@\S*", re.sub(r"[\"']|\\(.)", r"\1", segment)
+                ):
                     token = match.group(0)
                     if LEGAL_SPEC.match(token):
                         continue
@@ -966,13 +983,15 @@ def test_no_document_shows_a_floating_wrangler_spec() -> None:
         # another fence satisfies a whole-file substring check.
         for block in blocks:
             shown = "\n".join(line for _n, line in block)
+            # EVERY fence: a reader copies a literal even from a fence that shows
+            # no spec, and the next command they type uses it.
+            assert not re.search(r"WRANGLER_VERSION=[\"']?\d", shown), (
+                f"{rel}: a fence assigns WRANGLER_VERSION a literal — it must read "
+                "config/wrangler-version, or a bump drifts here"
+            )
             if "wrangler@" not in shown:
                 continue
             assert "config/wrangler-version" in shown, (
                 f"{rel}: a fence shows a wrangler spec without reading "
                 "config/wrangler-version — the version has one home"
-            )
-            assert not re.search(r"WRANGLER_VERSION=[\"']?\d", shown), (
-                f"{rel}: a fence assigns WRANGLER_VERSION a literal — it must read "
-                "config/wrangler-version, or a bump drifts here"
             )
