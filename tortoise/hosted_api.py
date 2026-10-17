@@ -16938,11 +16938,26 @@ async def oauth_clients_count(request: Request):
     # at call time is also what lets a test substitute the seam.
     from tortoise.supabase_control import get_control_plane
 
-    try:
+    def _read_count():
         # `limit=1` keeps the row payload trivial; `count_exact` is what asks
         # the server for the full total the number is supposed to be.
-        _rows, total = get_control_plane().query_with_total(
+        return get_control_plane().query_with_total(
             "oauth_clients", select=["id"], limit=1, count_exact=True,
+        )
+
+    try:
+        # OFF the event loop (the #2988/#3498/#3718 class): `query_with_total`
+        # is a SYNCHRONOUS `httpx.Client.get` with a 5 s per-phase timeout, and
+        # this module runs ONE uvicorn worker (`Dockerfile.hosted`, no
+        # `--workers`) — so an inline call here stalls EVERY concurrent request
+        # for the whole round trip, which is exactly what #2988 measured
+        # ("every route in the process timed out"). `_cp_offload` is this
+        # module's seam for control-plane I/O from an async body (its sibling
+        # `retention_cohort` offloads through `_run_off_loop`); `best_effort`
+        # because this endpoint's contract is the fail-soft `unavailable`
+        # body — a 503 from the seam would gate the operator reading it.
+        read = await _cp_offload(
+            _read_count, op="oauth_clients_count", best_effort=True,
         )
     except Exception as exc:  # fail soft, never a confident 0
         # The HTTP body deliberately carries only the exception TYPE (an operator
@@ -16959,6 +16974,25 @@ async def oauth_clients_count(request: Request):
             "reason": f"control plane read failed: {type(exc).__name__}",
             "revisit_triggers": list(_OAUTH_CLIENTS_COUNT_REVISIT_TRIGGERS),
         }
+    if read is None or read is OFFLOAD_REFUSED:
+        # The offload seam never delivered a read (its wait bound expired, or
+        # the pool REFUSED the submission), so `query_with_total` did not run.
+        # "We could not ask" is not a count: same fail-closed body as a read
+        # that raised, because the ruling's one requirement is a number that
+        # MEANS what it says.
+        _logger.warning(
+            "oauth clients count: control plane read did not run (offload "
+            "unavailable or refused)",
+        )
+        return {
+            "status": "unavailable",
+            "reason": (
+                "control plane read did not run (offload unavailable or "
+                "refused); an unasked count is not a count"
+            ),
+            "revisit_triggers": list(_OAUTH_CLIENTS_COUNT_REVISIT_TRIGGERS),
+        }
+    _rows, total = read
     if total is None:
         return {
             "status": "unavailable",

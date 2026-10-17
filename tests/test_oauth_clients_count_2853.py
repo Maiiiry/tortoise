@@ -22,6 +22,9 @@ The auth arm is here because the count is fleet-wide operator information, and
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -43,11 +46,23 @@ def counts(monkeypatch):
     from at call time) is what reaches it.
     """
     calls: list[dict] = []
-    state: dict = {"rows": [{"id": "c1"}], "total": 4217, "raises": None}
+    state: dict = {"rows": [{"id": "c1"}], "total": 4217, "raises": None,
+                   "on_loop": None, "thread": None}
 
     class _CP:
         def query_with_total(self, table, **kwargs):
             calls.append({"table": table, **kwargs})
+            # WHERE did the read run? `query_with_total` is a synchronous
+            # `httpx.Client.get`, so if it executes on the loop's OWN thread it
+            # holds the loop (the #2988/#3498/#3718 class). `get_running_loop()`
+            # returns a loop only from the loop's thread — a worker thread
+            # raises — which makes this the falsifier for that class.
+            try:
+                asyncio.get_running_loop()
+                state["on_loop"] = True
+            except RuntimeError:
+                state["on_loop"] = False
+            state["thread"] = threading.current_thread().name
             if state["raises"] is not None:
                 raise state["raises"]
             return state["rows"], state["total"]
@@ -95,6 +110,51 @@ def test_it_asks_the_server_for_an_exact_count(client, counts):
         {"table": "oauth_clients", "select": ["id"], "limit": 1,
          "count_exact": True}
     ]
+
+
+# ── where the read runs ──────────────────────────────────────────────────────
+def test_the_read_runs_off_the_event_loop(client, counts):
+    """A synchronous `httpx.Client.get` must not hold the process's single loop.
+
+    `hosted_api` runs ONE uvicorn worker (`Dockerfile.hosted`, no `--workers`),
+    so an inline control-plane round trip stalls EVERY concurrent request for
+    up to the client's 5 s timeout — the shape #2988 measured ("a 1.00 s read
+    produced a 1.00 s loop gap"). Non-vacuity: putting the call back inline in
+    the `async def` body makes the stub observe a running loop and reds this.
+    """
+    r = client.get(_PATH, headers=_HEADERS)
+
+    assert r.status_code == 200
+    assert counts["on_loop"] is False, (
+        "the control-plane read ran ON the event loop "
+        f"(thread={counts['thread']}) — every concurrent request waits for it"
+    )
+
+
+@pytest.mark.parametrize("undelivered", [None, "OFFLOAD_REFUSED"])
+def test_an_offload_that_never_ran_the_read_is_not_a_count(
+        client, counts, monkeypatch, undelivered):
+    """The seam can fail to deliver (wait bound missed / pool refused).
+
+    "We could not ask" is not a number: the body must stay `unavailable` with
+    no `count`, exactly like a read that raised — otherwise a bound miss
+    renders as a confident zero and retires the ruling it exists to inform.
+    """
+    refused = (ha_mod.OFFLOAD_REFUSED if undelivered == "OFFLOAD_REFUSED"
+               else None)
+
+    async def _undelivered(fn, **kwargs):
+        return refused
+
+    monkeypatch.setattr(ha_mod, "_cp_offload", _undelivered)
+
+    r = client.get(_PATH, headers=_HEADERS)
+
+    body = r.json()
+    assert r.status_code == 200
+    assert body["status"] == "unavailable"
+    assert "count" not in body
+    assert counts["calls"] == [], "the read never ran, so there is no number"
 
 
 # ── the absence, which must NOT look like zero ───────────────────────────────
