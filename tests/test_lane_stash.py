@@ -2191,6 +2191,38 @@ def test_prune_releases_an_applied_record_whose_entry_is_already_gone(repo):
 
 # ── round-6 review P1s ──────────────────────────────────────────────────────
 
+def test_recover_refuses_a_bare_orphan_the_ref_still_names(repo):
+    """`recover` must not mint ownership of a peer's entry in the ORPHAN state.
+
+    The emptied-reflog state (`refs/stash` resolves, the register enumerates
+    nothing) is the sibling door to the enumerated one below: nothing was dropped,
+    and a peer's BARE push there carries no `[<lane-key>]` marker and is named by
+    no lane ref, so nothing proves whose it is. `recover` pinned it to this lane
+    and `check` then reported SAFE — the #8051 harm, blessed (#8773 review P1).
+    """
+    repo.dirty(repo.b, "f.txt", "base\nb-orphan\n")
+    repo.git("stash", "push", "-q", "-m", "On feat/b: B bare", cwd=repo.b)
+    sha_b = repo.stash_sha()
+    assert sha_b
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.stash_shas() == [] and repo.stash_sha() == sha_b, "orphan state"
+    assert repo.lane(repo.a, "check").returncode == 1
+
+    cp = repo.lane(repo.a, "recover", sha_b)
+    assert cp.returncode == 2, _fail(cp)
+    assert "refs/stash` still NAMES" in cp.stderr, cp.stderr
+    assert repo.stash_pins() == {}, "the refusal must not pin a peer's entry"
+    assert repo.stash_sha() == sha_b, "the refusal must not move the register"
+    assert repo.lane(repo.a, "check").returncode == 1, (
+        "the refusal must not launder HAZARD into SAFE"
+    )
+
+    # the explicit assertion escape still works — it is the operator's claim
+    forced = repo.lane(repo.a, "recover", sha_b, "-m", "deliberate rescue")
+    assert forced.returncode == 0, _fail(forced)
+    assert repo.stash_pins(), "an explicit -m recovery must still pin"
+
+
 def test_recover_refuses_an_unpinned_bare_entry_already_in_the_register(repo):
     """`recover` must not mint ownership of a marker-less bare entry in the register.
 

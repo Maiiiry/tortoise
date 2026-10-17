@@ -353,7 +353,7 @@ def _pin_or_report(key: str, sha: str) -> dict:
             f"warning: the stash entry already EXISTS in the shared register as {sha}, "
             f"but it could not be pinned under {ref_ns(key)} ({exc}). A bare "
             "`git stash pop` can take it. Pin it to this lane with:\n"
-            f"  python tools/lane_stash.py recover {sha}\n"
+            f"  python tools/lane_stash.py recover {sha} -m \"<why it is yours>\"\n"
         )
         raise
 
@@ -1215,6 +1215,25 @@ def cmd_recover(args: argparse.Namespace) -> int:
                     "explicitly."
                 )
             break
+    # An entry `refs/stash` still NAMES is equally un-dropped: the register
+    # enumerating NOTHING does not mean the work was lost — an emptied reflog
+    # (`git reflog expire --expire=now --all`) leaves the ref on a sha the register
+    # no longer lists, the routine-maintenance state `_reclaim_orphan_refs_stash`
+    # exists for. In that state a peer's bare `git stash push` carries no
+    # `[<lane-key>]` marker and no lane ref names it, so nothing proves whose it
+    # is: `recover` would MINT this lane's ownership and `check` would then clear
+    # a bare `git stash pop` on a peer's work — the same #8051 harm the ENUMERATED
+    # guard above closes, reached through the other door. Recovery there is an
+    # ASSERTION of ownership, so it requires `-m` (#8773 review P1).
+    if not args.message and _stash_head() == args.sha and not _register_contains(args.sha):
+        raise LaneStashError(
+            f"refusing to recover {args.sha[:12]}: `refs/stash` still NAMES it, so nothing "
+            "was dropped — and it carries no lane marker and no lane ref, so it cannot be "
+            "shown to be yours. `recover` would PIN it to this lane, and `check` would then "
+            "clear a bare `git stash pop` on it. Pass -m <why this entry is yours> to "
+            "assert the recovery explicitly, or restore it with `git stash apply <sha>` "
+            "(which works for any sha)."
+        )
     if not _store_into_register(args.sha, subject, key):
         raise LaneStashError(
             f"could not put {args.sha} into the shared register. Either `git stash store` "
@@ -1476,7 +1495,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
             else:
                 print(f"kept   guard ref {guard_ref} for {sha[:12]} — it is not back in the "
                       "shared register, so this ref is the last handle on it; restore "
-                      f"with\n  python tools/lane_stash.py recover {sha}")
+                      f"with\n  python tools/lane_stash.py recover {sha} -m \"<why it is yours>\"")
     return 0
 
 
@@ -1514,7 +1533,7 @@ def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
                   "last handle bare git has on that entry. Re-run with --apply to guard-pin "
                   "the object and keep it (it is never dropped); if the work is yours, "
                   "recover it with\n"
-                  f"  python tools/lane_stash.py recover {sha}")
+                  f"  python tools/lane_stash.py recover {sha} -m \"<why it is yours>\"")
             return 0
         # `refs/stash` alone is NOT a durable handle: the caller's reconciliation
         # runs `git stash store` after this, which moves the ref and would destroy
@@ -1532,7 +1551,7 @@ def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
               f"  {held} — this is a HAZARD state; a guard ref keeps the object "
               "reachable even if another `stash store` moves refs/stash; `lane_stash "
               "check` stays fail-closed here. If the work is yours, recover it with:\n"
-              f"    python tools/lane_stash.py recover {sha}")
+              f"    python tools/lane_stash.py recover {sha} -m \"<why it is yours>\"")
         return 0
     if not apply:
         print(f"dry run — refs/stash resolves to {sha[:12]} while the register enumerates "
