@@ -88,6 +88,7 @@ def _build(
     bindings=None,
     sessions=None,
     overrides=None,
+    session_index=None,
     error="",
 ):
     """`build_state` over a synthesised registry + cmux list; every other source empty."""
@@ -98,7 +99,10 @@ def _build(
     monkeypatch.setattr(fs, "pane_bindings", lambda: dict(bindings or {}))
     monkeypatch.setattr(fs, "live_sessions", lambda: dict(sessions or {}))
     monkeypatch.setattr(fs, "load_overrides", lambda: dict(overrides or {}))
-    monkeypatch.setattr(fs, "session_index", lambda: ({}, {}))
+    monkeypatch.setattr(
+        fs, "session_index",
+        lambda: session_index if session_index is not None else ({}, {}),
+    )
     monkeypatch.setattr(fs, "worktrees", lambda _root: dict(worktrees or {}))
     issue = {"number": ISSUE, "title": "an issue", "state": "open",
              "assignees": [], "labels": [], "url": "https://example.invalid/8818"}
@@ -187,6 +191,70 @@ def test_two_bound_records_sharing_a_label_stay_unmeasured(monkeypatch) -> None:
     for holder in holders:
         assert holder.verdict == cp.HOLDER_UNMEASURED
         assert "MORE THAN ONE lane record" in holder.reason, holder.reason
+
+
+def test_the_same_workspace_twice_is_one_lane_not_two(monkeypatch) -> None:
+    # ⛔ THE EXIT-2 THE PR EXISTS TO REMOVE, BY ITS OTHER ROUTE (#8845 review).
+    # A duplicated roster LINE — a registrar that appended instead of replacing, or
+    # a hand-edit — names the SAME workspace twice. Both copies bind evidence, so
+    # the "another row binds evidence" arm refused to drop either, the label
+    # enumerated two lane records, and the claim gate returned HOLDER_UNMEASURED /
+    # exit 2 on a lane that is in fact perfectly readable. Arm (a)'s justification
+    # ("two BOUND records can disagree about liveness") cannot apply here: the two
+    # rows are identical, so they cannot disagree.
+    cp = collision_preflight()
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_LIVE, ""), (LABEL, WS_LIVE, "")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={
+            WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD},
+        },
+    )
+    assert [lane["identity"]["workspace"] for lane in st["lanes"]] == [WS_LIVE]
+    # Reported, never silently erased — the same rule as every other dropped row.
+    assert st["summary"]["stale_registry"] == 1
+    (stale,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    assert stale["workspace"] == WS_LIVE
+
+    holders = cp._holders_from_board(st, ISSUE)
+    # ONE record now, so the gate can read it instead of refusing on ambiguity.
+    assert not any(
+        h.verdict == cp.HOLDER_UNMEASURED
+        and "MORE THAN ONE lane record" in h.reason
+        for h in holders
+    ), [h.reason for h in holders]
+
+
+def test_the_override_still_reaches_the_row_that_survives(monkeypatch, tmp_path) -> None:
+    # ⛔ THE GAP THE REVIEW NAMED (#8849). Every override test in this file passed
+    # with `overrides={}`, because the LONE-row rule keeps the ghost regardless — so
+    # nothing proved the override's own effect, and the question "does dropping the
+    # ghost lose the override?" was never asked of the code.
+    #
+    # It does not: `resolve_sessions` step 2 applies `override_sid_by_label` per
+    # LABEL, over the rows that SURVIVE, so the override reaches the surviving row
+    # no matter which row was dropped. Pinning that is the difference between the
+    # claim being asserted twice and being checked once.
+    sid = "dddddddd-1111-2222-3333-444444444444"
+    _f = tmp_path / f"{sid}.jsonl"
+    _f.write_text("{}\n")
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_STALE, ""), (LABEL, WS_LIVE, "")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+        overrides={LABEL: sid},
+        session_index=({sid: str(_f)}, {}),
+    )
+    # The ghost was dropped as a lane record...
+    assert [lane["identity"]["workspace"] for lane in st["lanes"]] == [WS_LIVE]
+    assert st["summary"]["stale_registry"] == 1
+    # ...and the override STILL resolves a session for the lane that remains, so
+    # dropping the row did not cost the lane its resume path.
+    assert st["lanes"][0]["session"]["source"] == fs.SOURCE_OVERRIDE
+    assert st["lanes"][0]["session"]["sid"] == sid
+
 
 
 # ---------------------------------------------------------------------------

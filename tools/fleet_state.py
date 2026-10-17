@@ -86,8 +86,13 @@ the list WAS read and the lane's workspace is absent, the lane is **terminal**:
   * ``RETIRED``     — no session file resolves; never nudge, never dispatch,
     never route.
 
-A terminal lane is reported (never silently dropped) and is NOT live, NOT free
-and NOT dispatchable. Polarity is fail-OPEN with provenance: an unreadable
+A terminal lane is reported and is NOT live, NOT free and NOT dispatchable.
+"Reported" means never SILENTLY dropped: a registry row that outlived its
+workspace and binds no evidence of its own is dropped as a lane record (#8845),
+but only when the same label still has a row that does bind evidence, and every
+dropped row is published as an orphan of kind `registry-stale` — deleting the
+roster line is a human's call, not this module's. Polarity is fail-OPEN with
+provenance: an unreadable
 workspace list retires NOTHING, and ``reconciliation.workspaces_measured`` says
 so — a cmux outage must never hide a real lane, and a fail-open path must not be
 silent.
@@ -1334,8 +1339,26 @@ def build_state(
     kept: list[tuple[str, str, str]] = []
     stale_rows: list[dict[str, str]] = []
     unbound_kept: set[str] = set()
+    seen_rows: set[tuple[str, str]] = set()
     for label, ws, issue_label in registry:
         evidence = row_binds_evidence(ws)
+        # (0) THE SAME (label, workspace) TWICE IS ONE LANE WRITTEN TWICE — a
+        # duplicated roster line, or a registrar re-run appending instead of
+        # replacing. Both copies bind identical evidence (they name the same
+        # workspace), so they produce IDENTICAL records: last-wins is lossless and
+        # arm (a)'s justification ("two BOUND records can disagree about
+        # liveness") does not apply, because they cannot disagree. Without this,
+        # arm (a) refuses to dedupe exactly the case it must, the label still
+        # enumerates two lane records, and the claim gate returns
+        # HOLDER_UNMEASURED -> exit 2 on a perfectly readable lane — the failure
+        # #8845 exists to remove (review of #8849).
+        if (label, ws.upper()) in seen_rows:
+            stale_rows.append({
+                "lane": label, "workspace": ws, "issue_label": issue_label,
+                "why": "it repeats this label's row for the same workspace",
+            })
+            continue
+        seen_rows.add((label, ws.upper()))
         if workspaces_measured and not evidence:
             # (a) ANOTHER row for this label binds evidence on its own, so dropping
             # this one cannot erase the lane from the board.
@@ -1446,7 +1469,9 @@ def build_state(
         res = resolutions.get(label, SessionResolution(None, SOURCE_UNKNOWN, None, "not in registry"))
         # #7738: a lane whose cmux workspace no longer exists cannot keep a live
         # verdict. The verdict is terminal — RECOVERABLE (a session survives on
-        # disk) or RETIRED — and is reported, never silently dropped.
+        # disk) or RETIRED — and is reported. A row dropped as a lane record above
+        # (#8845) never reaches this function at all; that is why "reported, never
+        # silently dropped" is a statement about ORPHANS, not about `rows`.
         terminal = workspace_terminal(ws, workspaces, workspaces_measured, res)
 
         # live process: a lane is alive if ANY recorded pi pid for its workspace is
