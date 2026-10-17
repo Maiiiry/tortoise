@@ -315,6 +315,35 @@ def test_an_empty_duplicate_is_not_told_neither_line_carries_the_label(monkeypat
     assert "lane:new" in orphan["reason"], orphan["reason"]
 
 
+def test_a_dropped_duplicate_that_is_the_only_carrier_warns_before_deleting(
+    monkeypatch,
+) -> None:
+    """The revert warning must FIRE when the published value comes only from a drop.
+
+    `[(L, STALE, lane:anc), (L, LIVE, ""), (L, STALE, lane:anc2)]`: the survivor owns
+    no value, so inheritance publishes a dropped line's value; the second STALE row is
+    a duplicate whose twin was already dropped. A bare "delete the duplicate roster
+    line" reverted the label to `lane:anc` (review of #8849, cycle 10) — so this test
+    asserts the warning fires, which no prior test could see because its fixtures used
+    empty `lane:` values.
+    """
+    st = _build(
+        monkeypatch,
+        registry=[
+            (LABEL, WS_STALE, "lane:anc"),
+            (LABEL, WS_LIVE, ""),
+            (LABEL, WS_STALE, "lane:anc2"),
+        ],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+    )
+    stale = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    dup = [o for o in stale if "repeats" in o["reason"]]
+    assert len(dup) == 1, [o["reason"] for o in stale]
+    assert "only because this dropped line carries it" in dup[0]["reason"], dup[0]["reason"]
+    assert st["lanes"][0]["claim"]["lane_label"] == "lane:anc2"
+
+
 def test_the_advice_names_this_workspaces_value_when_a_label_has_two_kept_rows(
     monkeypatch,
 ) -> None:

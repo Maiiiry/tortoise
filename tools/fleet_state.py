@@ -1428,6 +1428,16 @@ def build_state(
     # would author the surviving lane's label and then the orphan would tell the
     # human to delete that very row — following the instruction would silently
     # change the published label (review of #8849, cycle 4).
+    # ⛔ CAPTURE OWNERSHIP BEFORE THE FOLD. After it, a row's `lane:` value may be an
+    # INHERITED one, so a set built from the folded list answers "did this label end up
+    # with any value" — not "does a surviving row OWN one". Building it after the fold
+    # made the revert warning unreachable and brought back a real revert (review of
+    # #8849, cycle 10): with `[(L, STALE, lane:anc), (L, LIVE, ""), (L, STALE,
+    # lane:anc2)]` the board published `lane:anc2` while the orphan said "delete the
+    # duplicate roster line", and deleting it reverted the label to `lane:anc`.
+    labels_owning_own_label: set[str] = {
+        label for label, _ws, issue_label in kept if issue_label
+    }
     kept = [
         (label, ws, issue_label or issue_label_by_label.get(label, ""))
         for label, ws, issue_label in kept
@@ -1731,11 +1741,10 @@ def build_state(
     published_by_ws: dict[tuple[str, str], str] = {
         (lbl, ws.upper()): ilbl for lbl, ws, ilbl in kept
     }
-    # Labels where a SURVIVING row owns a `lane:` value of its own. Inheritance is
-    # OWN-WINS, so a dropped row's value is irrelevant to such a label — warning
-    # about a revert there would tell the human to keep a row the board has already
-    # classified as not a lane record.
-    labels_with_own_label: set[str] = {lbl for lbl, _ws, ilbl in kept if ilbl}
+    # Labels where a SURVIVING row OWNS a `lane:` value — captured BEFORE the
+    # inheritance fold (see there). Inheritance is own-wins, so a dropped row's value
+    # is irrelevant to such a label; warning about a revert there would tell the human
+    # to keep a row the board has already classified as not a lane record.
     for row in stale_rows:
         ws_gone = f"workspace {row['workspace'][:8]}…" if row["workspace"] else "its workspace"
         arm = row.get("arm")
@@ -1796,14 +1805,14 @@ def build_state(
                 # value, which the board publishes via inheritance: a bare "delete
                 # the duplicate roster line" would revert the label, the very
                 # failure the sibling branch is written to prevent (cycle 6).
-                # ⛔ AND THIS ROW MAY BE THE ONE THE PUBLISHED VALUE COMES FROM.
-                # The gate is `_published == _carries`, NOT "no other row carries
-                # that value": inheritance is OWN-WINS, so it fires only when the
-                # surviving row has none. A surviving row owning a DIFFERENT value
-                # means this row's value is irrelevant and moving it over would
-                # CHANGE the published label — the opposite of the warning's advice
-                # (review of #8849, cycle 8).
-                if _carries and row["lane"] not in labels_with_own_label:
+                # ⛔ AND THIS ROW MAY BE THE ONE THE PUBLISHED VALUE COMES FROM. The
+                # gate is OWNERSHIP: if no surviving row owns a `lane:` value, the
+                # published one can only come from a dropped line like this, so
+                # deleting it reverts the label. Testing the published value for
+                # equality is wrong (it is also equal when a survivor OWNS it), and
+                # reading a survivor-set AFTER the inheritance fold is wrong too — it
+                # then contains the inherited value and the gate never fires.
+                if _carries and row["lane"] not in labels_owning_own_label:
                     reason = (
                         f"registry row for '{row['lane']}' repeats {ws_gone}, "
                         "and the copy of this row was ALREADY dropped above for its "
