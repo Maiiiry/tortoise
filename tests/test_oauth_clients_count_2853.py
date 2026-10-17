@@ -141,7 +141,13 @@ def test_a_failed_read_is_logged_with_the_cause(client, counts, caplog):
     hits = [r for r in caplog.records if "oauth clients count" in r.getMessage()]
     assert hits, "the unavailable path must leave a server-side trace"
     assert hits[0].levelname == "WARNING"
-    assert hits[0].exc_info is not None, (
+    info = hits[0].exc_info
+    # NOT `is not None`: `LogRecord.__init__` stores `exc_info` VERBATIM (the
+    # normalisation to a tuple happens later, in `Logger._log`, and only for a
+    # truthy value), so `exc_info=False` stores `False` — and `False is not
+    # None` is True. That form of this assertion passes with the traceback
+    # dropped, which is the one regression it exists to catch.
+    assert isinstance(info, tuple) and info[0] is RuntimeError, (
         "the traceback carries the cause the HTTP body deliberately omits"
     )
 
