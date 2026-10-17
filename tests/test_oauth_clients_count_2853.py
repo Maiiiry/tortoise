@@ -126,6 +126,26 @@ def test_a_failed_read_is_unavailable_and_carries_no_count(client, counts):
     assert "RuntimeError" in body["reason"]
 
 
+def test_a_failed_read_is_logged_with_the_cause(client, counts, caplog):
+    """The body carries only the exception TYPE; the log must carry the detail.
+
+    `query_with_total` raises a RuntimeError whose message holds the real cause
+    (e.g. `HTTP 503`). If the unavailable path logged nothing, an incident would
+    leave the fleet with a surface that says "unavailable" and no trace.
+    """
+    counts["raises"] = RuntimeError("HTTP 503 from PostgREST")
+
+    with caplog.at_level("WARNING", logger="tortoise.hosted_api"):
+        client.get(_PATH, headers=_HEADERS)
+
+    hits = [r for r in caplog.records if "oauth clients count" in r.getMessage()]
+    assert hits, "the unavailable path must leave a server-side trace"
+    assert hits[0].levelname == "WARNING"
+    assert hits[0].exc_info is not None, (
+        "the traceback carries the cause the HTTP body deliberately omits"
+    )
+
+
 # ── the decision travels WITH the number ─────────────────────────────────────
 @pytest.mark.parametrize("unavailable", [False, True])
 def test_the_ruling_and_its_revisit_triggers_ride_along(client, counts,

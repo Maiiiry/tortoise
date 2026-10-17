@@ -16905,14 +16905,18 @@ def _parse_as_of(as_of: str | None) -> date:
 
 @app.get("/v1/internal/oauth/clients/count")
 async def oauth_clients_count(request: Request):
-    """How many DCR registrations are stored — the number #2853's ruling C watches.
+    """How many `oauth_clients` registrations are stored — the number #2853's ruling C watches.
 
-    Operator-only (``_check_internal``), read-only. Ruling C (owner
-    @daniel-ospina, 2026-10-13) accepted that ``oauth_clients`` grows without
-    limit: **no prune, no expiry, no cap**. The ruling makes THIS NUMBER part
-    of the decision rather than an optional extra — "watch it" is empty unless
-    the count is observable, and a decision that cannot be seen degrading is
-    the unrecorded slide the ruling exists to prevent.
+    Operator-only (``_check_internal``), read-only. The count covers the WHOLE
+    table — DCR registrations, CIMD rows, and operator-issued /
+    ``oauth_anthropic_creds`` rows alike — because the ruling's question is how
+    many stored registrations accumulate, not how many came from one producer.
+
+    Ruling C (owner @daniel-ospina, 2026-10-13) accepted that ``oauth_clients``
+    grows without limit: **no prune, no expiry, no cap**. The ruling makes THIS
+    NUMBER part of the decision rather than an optional extra — "watch it" is
+    empty unless the count is observable, and a decision that cannot be seen
+    degrading is the unrecorded slide the ruling exists to prevent.
 
     ``count`` is the SERVER's own COUNT (``count_exact=True``), never
     ``len(rows)``: PostgREST truncates a page at the deployment's ``max_rows``,
@@ -16941,6 +16945,15 @@ async def oauth_clients_count(request: Request):
             "oauth_clients", select=["id"], limit=1, count_exact=True,
         )
     except Exception as exc:  # fail soft, never a confident 0
+        # The HTTP body deliberately carries only the exception TYPE (an operator
+        # needs to know the read failed, not the fleet's internals), but the
+        # server log must carry the detail: `query_with_total` raises a
+        # RuntimeError whose message holds the real cause (e.g. `HTTP 503`), and
+        # without this the unavailable path leaves no trace to diagnose. Mirrors
+        # the retention-cohort endpoint's own unavailable-path warning.
+        _logger.warning(
+            "oauth clients count: control plane read failed", exc_info=True,
+        )
         return {
             "status": "unavailable",
             "reason": f"control plane read failed: {type(exc).__name__}",

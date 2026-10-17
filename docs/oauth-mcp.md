@@ -357,7 +357,7 @@ confident zero would read as "nothing has accumulated" and retire the decision.
 The ruling names its own revisit triggers (the 2026-11-15 measurement, or a move
 off per-connection DCR) and the endpoint returns them, so the acceptance is not
 open-ended. CIMD adds one row per client implementation in normal operation but
-can add to that backlog under abuse.
+can add rows that nothing reclaims under abuse.
 
 Idempotency under concurrency rests on the schema's `id text PRIMARY KEY`
 (`supabase/migrations/0016_oauth.sql`): two simultaneous first authorizations of
@@ -492,10 +492,12 @@ Accepted limitations (see the code comment for the full list):
 
 - The stores are **in-process**, so real capacity is `limit × machines` and
   resets on restart. Out-of-process limiting is #1677.
-- `oauth_clients` row pruning is **not** part of this policy — #2853 owns it
-  (owner @daniel-ospina, review date 2026-10-15); the shared per-IP bucket
-  primitive's key space is bounded by #3124 (reclaim-inactive + reject-new /
-  shared overflow).
+- `oauth_clients` row growth is **ACCEPTED, not pending** — owner ruling C on
+  2026-10-13 (#2853) retired the pruning question: no retention window, no
+  expiry, no deletion path, no cap. The number is visible at
+  `GET /v1/internal/oauth/clients/count` (see the growth-bound table above);
+  the shared per-IP bucket primitive's key space is still bounded by #3124
+  (reclaim-inactive + reject-new / shared overflow).
 - The limiter runs **before body parsing**, so an invalid-JSON or oversized
   POST still consumes budget (charges ≤ 600/hr anonymous + 1200/hr trusted);
   row writes are not bounded by it.
