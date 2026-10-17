@@ -1428,16 +1428,6 @@ def build_state(
     # would author the surviving lane's label and then the orphan would tell the
     # human to delete that very row — following the instruction would silently
     # change the published label (review of #8849, cycle 4).
-    # ⛔ CAPTURE OWNERSHIP BEFORE THE FOLD. After it, a row's `lane:` value may be an
-    # INHERITED one, so a set built from the folded list answers "did this label end up
-    # with any value" — not "does a surviving row OWN one". Building it after the fold
-    # made the revert warning unreachable and brought back a real revert (review of
-    # #8849, cycle 10): with `[(L, STALE, lane:anc), (L, LIVE, ""), (L, STALE,
-    # lane:anc2)]` the board published `lane:anc2` while the orphan said "delete the
-    # duplicate roster line", and deleting it reverted the label to `lane:anc`.
-    labels_owning_own_label: set[str] = {
-        label for label, _ws, issue_label in kept if issue_label
-    }
     kept = [
         (label, ws, issue_label or issue_label_by_label.get(label, ""))
         for label, ws, issue_label in kept
@@ -1731,20 +1721,14 @@ def build_state(
     # already answers, or a second unbound row repeating a label — and it is still
     # VISIBLE here either way: the roster line is stale, and clearing it is a human's
     # call.
-    # ⛔ THE PUBLISHED VALUE MUST COME FROM THE FINAL BOARD, not from the running
-    # tuple. `kept[_pos]` is overwritten by every later duplicate that carries a
-    # value, so a message that names "the published value" from the state at its own
-    # point in the loop is FALSE at three or more copies — measured: `[lane:a, "",
-    # lane:b]` publishes `lane:b` while the middle row's orphan said `lane:a` "is what
-    # the board publishes" (review of #8849, cycle 8). `kept` is already the
-    # post-rebuild list here, so this map IS the answer, for any number of copies.
-    published_by_ws: dict[tuple[str, str], str] = {
-        (lbl, ws.upper()): ilbl for lbl, ws, ilbl in kept
-    }
-    # Labels where a SURVIVING row OWNS a `lane:` value — captured BEFORE the
-    # inheritance fold (see there). Inheritance is own-wins, so a dropped row's value
-    # is irrelevant to such a label; warning about a revert there would tell the human
-    # to keep a row the board has already classified as not a lane record.
+    # ⛔ DO NOT COMPUTE THE PUBLISHED VALUE INTO THIS MESSAGE. Nine review cycles
+    # (#8849, 3-11) each found a shape where a computed value was wrong: the running
+    # tuple is stale at 3+ copies; a per-(label, ws) map is empty in the
+    # `twin_kept=False` path; a per-LABEL map names another workspace's value; and
+    # an ownership set is label-level while inheritance is ROW-level, so a label can
+    # have one owner AND an empty sibling that inherits a dropped value. The board
+    # is the only authority on `claim.lane_label`, and it is one field away in the
+    # record the human is already reading — so name the field, and never a value.
     for row in stale_rows:
         ws_gone = f"workspace {row['workspace'][:8]}…" if row["workspace"] else "its workspace"
         arm = row.get("arm")
@@ -1756,80 +1740,32 @@ def build_state(
         # roster line because its workspace was dead while the board showed it alive
         # (review of #8849).
         if arm == "duplicate":
-            _carries = row.get("carries") or ""
-            _published = published_by_ws.get(
-                (row["lane"], (row.get("workspace") or "").upper()), ""
-            )
             if row.get("twin_kept"):
-                # ⛔ BRANCH ON THE FINAL PUBLISHED VALUE, not on the reported row's
-                # value alone (which said "Neither line carries a `lane:` value"
-                # when the KEPT line carried it) and not on the running tuple
-                # (which is stale at 3+ copies). Both faults printed a value the
-                # board does not publish (review of #8849, cycles 7 and 8).
-                if _carries and _published == _carries:
-                    _advice = (
-                        f"This line carries `{_carries}`, which IS the value the "
-                        "board publishes. Keep a line carrying that value — this "
-                        "one — and delete the other copy"
-                    )
-                elif _carries:
-                    _advice = (
-                        f"This line carries `{_carries}`, but the board publishes "
-                        f"`{_published}` (from another line for this (label, "
-                        "workspace)). Delete this line — or, if that value is the "
-                        f"intended one, put `{_carries}` on the line you keep"
-                    )
-                elif _published:
-                    _advice = (
-                        "This line carries no `lane:` value; the board publishes "
-                        f"`{_published}` from another line for this (label, "
-                        "workspace). Delete THIS line"
-                    )
-                else:
-                    _advice = (
-                        "Neither this line nor the one the board uses carries a "
-                        "`lane:` value, so either may be deleted"
-                    )
                 reason = (
                     f"registry row for '{row['lane']}' repeats {ws_gone} — the same "
                     "(label, workspace) written twice is ONE lane, not two; the "
                     "duplicate is not a second lane record and NO verdict changes "
                     "(one lane record remains). This is a de-duplication, not a "
                     "retirement: it holds even when the cmux list could not be "
-                    f"read, because both rows name one workspace. {_advice}"
+                    "read, because both rows name one workspace. There is still one "
+                    "line for this (label, workspace); the board keeps one `lane:` "
+                    "value per row, so the two lines may differ in that column — "
+                    "check this lane's `claim.lane_label` before deleting either copy"
                 )
             else:
                 # The twin was dropped by another arm, so this drop is NOT a plain
                 # de-duplication — say so, and do not claim a record survives.
-                # ⛔ AND THIS ROW MAY BE THE ONLY CARRIER of the label's `lane:`
-                # value, which the board publishes via inheritance: a bare "delete
-                # the duplicate roster line" would revert the label, the very
-                # failure the sibling branch is written to prevent (cycle 6).
-                # ⛔ AND THIS ROW MAY BE THE ONE THE PUBLISHED VALUE COMES FROM. The
-                # gate is OWNERSHIP: if no surviving row owns a `lane:` value, the
-                # published one can only come from a dropped line like this, so
-                # deleting it reverts the label. Testing the published value for
-                # equality is wrong (it is also equal when a survivor OWNS it), and
-                # reading a survivor-set AFTER the inheritance fold is wrong too — it
-                # then contains the inherited value and the gate never fires.
-                if _carries and row["lane"] not in labels_owning_own_label:
-                    reason = (
-                        f"registry row for '{row['lane']}' repeats {ws_gone}, "
-                        "and the copy of this row was ALREADY dropped above for its "
-                        "own reason — read that entry, which is the one that explains "
-                        "why this workspace is no longer a lane record. ⛔ The board "
-                        f"publishes `{_carries}` only because this dropped line "
-                        "carries it — keep this line, or move that value onto the "
-                        "surviving row BEFORE deleting it, or the label reverts"
-                    )
-                else:
-                    reason = (
-                        f"registry row for '{row['lane']}' repeats {ws_gone}, "
-                        "and the copy of this row was ALREADY dropped above for its "
-                        "own reason — read that entry, which is the one that explains "
-                        "why this workspace is no longer a lane record. Delete the "
-                        "duplicate roster line"
-                    )
+                reason = (
+                    f"registry row for '{row['lane']}' repeats {ws_gone}, "
+                    "and the copy of this row was ALREADY dropped above for its "
+                    "own reason — read that entry, which is the one that explains "
+                    "why this workspace is no longer a lane record. ⛔ Deleting this "
+                    "line may ALSO change the lane's `lane:` value: the board keeps "
+                    "one value per row and fills an empty column from the roster, "
+                    "so check this lane's `claim.lane_label` before deleting — and "
+                    "if this line is its only carrier, move the value onto the "
+                    "surviving line FIRST"
+                )
         elif arm == "second-unbound":
             reason = (
                 f"registry row for '{row['lane']}' names {ws_gone}, which is NOT in "

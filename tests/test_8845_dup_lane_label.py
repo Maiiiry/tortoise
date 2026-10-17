@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -76,6 +77,24 @@ WS_LIVE_2 = "7AF6EB2E-1E4E-48E2-8D2A-AC61306B46DB"
 WT_1 = "/repo/.worktrees/8818-pin-prose"
 WT_2 = "/repo/.worktrees/8818-sweep"
 HEAD = "12e1a17300000000000000000000000000000000"
+
+
+def _assert_names_no_published_value(reason: str) -> None:
+    """A duplicate-arm message must not ASSERT which `lane:` value the board publishes.
+
+    Cycles 3-11 of #8849 each found a registry shape where a computed value in this
+    message was false: the running tuple is stale at 3+ copies, a per-(label, ws) map
+    is blank in the `twin_kept=False` path, a per-LABEL map leaks another workspace's
+    value, and ownership is label-level while inheritance is ROW-level (so a label can
+    have an owner AND an empty sibling that inherits a dropped value). The message is
+    now forbidden from naming a value at all — it points at `claim.lane_label` instead.
+
+    This helper is the pin: `lane:` may appear only as the COLUMN name (`lane:` value,
+    `lane:` column), never as a concrete value like `lane:abc`. A future edit that
+    reintroduces a computed value reddens every test that calls it.
+    """
+    leaked = re.findall(r"`?lane:[^`\s,;)]+", reason)
+    assert not leaked, f"message asserts a published value {leaked}: {reason}"
 
 _CP = None
 
@@ -283,24 +302,24 @@ def test_the_last_duplicate_rows_issue_label_wins(monkeypatch) -> None:
     (lane,) = st["lanes"]
     assert lane["claim"]["lane_label"] == "lane:new"
     # ⛔ AND THE INSTRUCTION MUST NOT REVERT IT (review of #8849, cycles 5-6). The
-    # two lines differ in exactly the column the board just used, so a bare "delete
-    # the duplicate roster line" tells the human to delete the copy that CARRIES the
-    # published value — obeying it silently reverts the label. The reason must NAME
-    # the published value and tell the human which copy to keep; it does not have to
-    # name the value it is discarding (review of #8849, cycles 5-8).
+    # two lines differ in exactly the column the board just used, so a message that
+    # named a value to delete would be able to revert it. The reason therefore names
+    # NO value at all and points at the field that decides (review of #8849, cycle 11:
+    # every computed value was wrong in some shape — the message must not compute).
     (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
-    assert "`lane:new`" in orphan["reason"], orphan["reason"]
-    assert "IS the value the board publishes" in orphan["reason"], orphan["reason"]
-    assert "written twice is ONE lane" in orphan["reason"], orphan["reason"]
+    reason = orphan["reason"]
+    assert "written twice is ONE lane" in reason, reason
+    assert "claim.lane_label" in reason, reason
+    _assert_names_no_published_value(reason)
 
 
 def test_an_empty_duplicate_is_not_told_neither_line_carries_the_label(monkeypatch) -> None:
-    """The advice must branch on BOTH values, not on the reported row alone.
+    """A duplicate whose EMPTY column is reported must not be spoken of as unlabelled.
 
-    For `[lane:new, ""]` the REPORTED (dropped) row is the empty one and the kept
-    line carries `lane:new`. Branching on the reported row alone said "Neither line
-    carries a `lane:` value, so either may be deleted" — and permitted deleting the
-    only carrier, which reverts the published label (review of #8849, cycle 7).
+    For `[lane:new, ""]` the REPORTED (dropped) row is the empty one and the kept line
+    carries `lane:new`. Branching on the reported row alone said "Neither line carries
+    a `lane:` value, so either may be deleted" — permitting deletion of the only
+    carrier, which reverts the published label (review of #8849, cycle 7).
     """
     st = _build(
         monkeypatch,
@@ -311,21 +330,25 @@ def test_an_empty_duplicate_is_not_told_neither_line_carries_the_label(monkeypat
     (lane,) = st["lanes"]
     assert lane["claim"]["lane_label"] == "lane:new"
     (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
-    assert "Neither" not in orphan["reason"], orphan["reason"]
-    assert "lane:new" in orphan["reason"], orphan["reason"]
+    reason = orphan["reason"]
+    assert "Neither" not in reason, reason
+    assert "claim.lane_label" in reason, reason
+    _assert_names_no_published_value(reason)
 
 
 def test_a_dropped_duplicate_that_is_the_only_carrier_warns_before_deleting(
     monkeypatch,
 ) -> None:
-    """The revert warning must FIRE when the published value comes only from a drop.
+    """The warning must FIRE for a drop that is the only carrier of a published value.
 
-    `[(L, STALE, lane:anc), (L, LIVE, ""), (L, STALE, lane:anc2)]`: the survivor owns
-    no value, so inheritance publishes a dropped line's value; the second STALE row is
-    a duplicate whose twin was already dropped. A bare "delete the duplicate roster
-    line" reverted the label to `lane:anc` (review of #8849, cycle 10) — so this test
-    asserts the warning fires, which no prior test could see because its fixtures used
-    empty `lane:` values.
+    `[(L, STALE, lane:anc), (L, LIVE, ""), (L, STALE, lane:anc2)]`: the only live row
+    has an EMPTY `lane:`, so the board publishes a value that exists only on dropped
+    lines; the second STALE row is a duplicate whose twin was already dropped. No
+    prior test could see this branch because its fixtures used empty `lane:` values.
+
+    The message must WARN about the carrier risk without asserting WHICH value the
+    board publishes — cycle 11 measured a shape (three dropped carriers across two
+    workspaces) where the published value came from a line the message did not name.
     """
     st = _build(
         monkeypatch,
@@ -340,19 +363,24 @@ def test_a_dropped_duplicate_that_is_the_only_carrier_warns_before_deleting(
     stale = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
     dup = [o for o in stale if "repeats" in o["reason"]]
     assert len(dup) == 1, [o["reason"] for o in stale]
-    assert "only because this dropped line carries it" in dup[0]["reason"], dup[0]["reason"]
+    reason = dup[0]["reason"]
+    assert "claim.lane_label" in reason, reason
+    assert "ALREADY dropped above" in reason, reason
+    _assert_names_no_published_value(reason)
+    # Precondition that makes the warning non-vacuous: the only live row is unlabelled,
+    # so the published value really does come from a dropped line.
     assert st["lanes"][0]["claim"]["lane_label"] == "lane:anc2"
 
 
 def test_the_advice_names_this_workspaces_value_when_a_label_has_two_kept_rows(
     monkeypatch,
 ) -> None:
-    """A label can own TWO kept rows (two BOUND workspaces) — pinned elsewhere — and
-    the board publishes a PER-ROW `claim.lane_label`.
+    """A label can own TWO kept rows (two BOUND workspaces), each with its own value.
 
-    A label-keyed map silently keeps the last kept row, so the advice for an earlier
-    row named a DIFFERENT workspace's value and told the human to delete the line
-    carrying the published one — reverting it on delete (review of #8849, cycle 9).
+    A per-LABEL map silently keeps the last kept row, so advice written from one
+    named a DIFFERENT workspace's value (review of #8849, cycle 9). The message now
+    names no value, so it cannot be wrong for either workspace — and this registry
+    pins that the two claims stay independent.
     """
     st = _build(
         monkeypatch,
@@ -373,8 +401,8 @@ def test_the_advice_names_this_workspaces_value_when_a_label_has_two_kept_rows(
     assert by_ws[WS_LIVE_2]["claim"]["lane_label"] == "lane:b"
     (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
     reason = orphan["reason"]
-    assert "lane:a2" in reason, reason
-    assert "lane:b" not in reason, reason
+    assert "claim.lane_label" in reason, reason
+    _assert_names_no_published_value(reason)
 
 
 def test_a_dropped_rows_lane_label_does_not_overwrite_the_survivors(monkeypatch) -> None:
