@@ -1350,6 +1350,12 @@ def build_state(
             # ghost row must stay published, #7738) and report the rest. Both rows are
             # empty shells by construction here (not live, no pane binding, no session
             # record), so nothing is lost by keeping one.
+            #
+            # ⚠️ PRECONDITION, the same one arm (a) has: this runs only when the live
+            # list was READ. With an unreadable cmux list nothing is retired, so both
+            # rows survive and the claim gate reports the label as duplicated — which
+            # is the honest reading of a board that could not be built, not a state
+            # this filter is able to improve on.
             if label in unbound_kept:
                 stale_rows.append({
                     "lane": label, "workspace": ws, "issue_label": issue_label,
