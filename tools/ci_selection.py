@@ -659,6 +659,13 @@ SOURCE_PATTERNS = {
     # a future core-registered test reading it would silently stop running on
     # the PR that edits it. Fail-closed is the right default for the file that
     # owns the deploy.
+    #
+    # #8816 makes that dependency sharper: `tests/test_e2e_wrangler_prewarm.py`
+    # is registered as CORE and now reads deploy-pages.yml (the pin and the
+    # verify-before-upload shape). It is safe ONLY because the file stays
+    # unlisted here — an unlisted deploy-pages.yml edit takes the FULL matrix,
+    # which includes core. Listing it would drop that guard's coverage on the
+    # very PR that changes the deploy spec.
     "ep": ("tortoise/dream.py", "tortoise/analyze.py",
            "tortoise/ranking.py"),
     "sdk": ("tortoise/ids.py", "tortoise/models.py", "tortoise/crypto.py",
