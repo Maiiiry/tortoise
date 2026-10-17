@@ -69,6 +69,7 @@ _OBJECT_PROP_SET_NEEDLE = ":Point:Object {id:$id}) SET n += $props"
 _TAGGED_NEEDLE = "MERGE (t:Tag {name:$tag}) "
 _INVALIDATE_STAMP_NEEDLE = "SET n.outdated = true"
 _INVALIDATE_CORRECTS_NEEDLE = "MERGE (a)-[:CORRECTS]->(b)"
+_RETRACT_CAS_NEEDLE = "SET n.status = 'retracted'"
 
 
 class _AbortOnceGraph:
@@ -340,6 +341,38 @@ def test_a_rebuild_abort_on_the_corrects_edge_is_retried(tmp_path):
             "RETURN count(*)",
             params={"new": corrector, "old": pid}).result_set
         assert rows and rows[0][0] == 1
+    finally:
+        with contextlib.suppress(Exception):
+            sdk.close()
+
+
+# ── 8. ``retract_point`` — the terminal CAS ``SET`` ────────────────
+
+
+def test_a_rebuild_abort_on_the_retract_cas_set_is_retried(tmp_path):
+    """The CAS ``status → retracted`` ``SET`` is retried, and retracts once.
+
+    The terminal-transition sibling of ``invalidate_point``: pre-fix the abort
+    raised AFTER ``PointRetracted`` had been appended, so the journal recorded a
+    retraction the live graph never applied — the point stayed live and voting
+    while every replay's fold treated it as terminal. The
+    ``_terminal_excluded`` guard rides inside the statement, so a re-issue
+    cannot re-retract an already-terminal point.
+    """
+    sdk = _sdk(tmp_path, "retract")
+    try:
+        pid = _pid(sdk)
+        proj = sdk._get_proj()
+        proxy = _AbortOnceGraph(proj.g, _RETRACT_CAS_NEEDLE, present=True)
+        proj.g = proxy
+
+        retracted = sdk.retract_point(pid)
+
+        assert proxy.matching >= 2, "the aborted CAS SET was never re-issued"
+        assert proxy.applied == 1, "exactly one application"
+        proj.g = proxy._real
+        assert retracted["status"] == "retracted"
+        assert sdk.get_point(pid)["status"] == "retracted"
     finally:
         with contextlib.suppress(Exception):
             sdk.close()

@@ -11462,12 +11462,23 @@ class TortoiseSDK:
         # shared vocabulary as the guard and the read path — the generic
         # `_terminal_excluded` predicate also rejects the legacy
         # `outdated=true` flag, not just a hardcoded status subset.
-        r = proj.g.query(
-            "MATCH (n:Point {id:$id}) "
-            f"WHERE {_terminal_excluded('n.status')} "
-            "SET n.status = 'retracted', n.updatedAt = $now, "
-            f"{decay_clause('n')} RETURN properties(n)",
-            params={"id": id, "now": _now})
+        # #7405: the CAS SET rides the bounded write retry — the same
+        # terminal-transition shape as `invalidate_point`'s stamp. The
+        # `_terminal_excluded` guard is INSIDE the statement and is re-read on
+        # re-issue, and `_now` is minted once above, so a re-issued abort (which
+        # by definition did not land) converges on the same stamp and cannot
+        # re-retract or move `updatedAt`. An already-terminal point still yields
+        # an empty result set on re-issue, so the `ValueError` contract is
+        # unchanged.
+        r = self._graph_write_with_retry(
+            lambda: proj.g.query(
+                "MATCH (n:Point {id:$id}) "
+                f"WHERE {_terminal_excluded('n.status')} "
+                "SET n.status = 'retracted', n.updatedAt = $now, "
+                f"{decay_clause('n')} RETURN properties(n)",
+                params={"id": id, "now": _now}),
+            what="retract_point CAS SET",
+        )
         if not r.result_set:
             raise ValueError(
                 f"Point {id!r} is already terminal — retraction is terminal")

@@ -37,6 +37,8 @@ and keeps its own run knobs (``INGEST_WRITE_RETRIES`` etc.) eval-side.
     is covered transitively — it delegates here;
   * ``invalidate_point`` — the terminal stamp ``SET`` and the ``CORRECTS``
     ``MERGE``;
+  * ``retract_point`` — the CAS ``status → retracted`` ``SET`` (its
+    ``_terminal_excluded`` guard is inside the statement);
   * the capture lane's graph writes, all in ``tortoise/sdk.py`` — the
     ``:Session`` MERGE (``_write_session_and_turns``), the batched
     ``UNWIND $turns`` turn store and the stale-turn ``DETACH DELETE`` sweep
@@ -61,7 +63,7 @@ did not land" guarantee is per-statement and does not extend to the enclosing
 fold. Also unwired: ``supersede_point`` (its statements are individually
 idempotent — ``MERGE`` / DELETE by ``ID(r)`` / ``SET r += $attrs`` — but the
 multi-statement transfer is deliberately left to a separate increment),
-``retract_point``/``revert_rows`` and the remaining direct ``proj.g.query``
+``revert_rows`` and the remaining direct ``proj.g.query``
 write sites across ``tortoise/``.
 ``merge_points`` is not a direct graph write at all: it is an ``EventAPI``
 journal emit (``tortoise/api.py``) whose graph effect is the ``proj.apply``
