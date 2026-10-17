@@ -1045,6 +1045,21 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # tests/test_ci_selection.py::test_the_session_declaration_guard_runs_on_its_docs_subjects_too.
              "docs/ONTOLOGY.md",
              "docs/plans/2026-08-25-1714-memory-capture-onboarding.md",
+             # #3554 review (P2): the guard's THIRD docs subject —
+             # `docs/ONTOLOGY-CHANGELOG.md`, which
+             # `test_section_4_8_changelog_entry_sits_under_its_own_version_block`
+             # reads — was left out of this tuple while the other two were
+             # admitted, so the same silent drop stayed open for it: a docs-only
+             # edit moving the `§4.8 (added by #3554` bullet back under the wrong
+             # `Changelog vX.Y` header selected NO surface and fell back to
+             # tier-1 smoke, whose 45-file set does not contain the guard. The
+             # sibling changelog readers (test_5142/7818/8474_ontology_record.py)
+             # are covered only because they happen to sit in tier1 — the new
+             # module is not, and a `core` registration alone never helps (a
+             # surface name only runs when that surface is already selected).
+             # Same #1349/#3332/#3616 class; pinned alongside the other two in
+             # tests/test_ci_selection.py::test_the_session_declaration_guard_runs_on_its_docs_subjects_too.
+             "docs/ONTOLOGY-CHANGELOG.md",
              # PR #8594 review P2: the fail-closed dispatcher's review copy
              # (tools/agent-infra-queue-dispatch.py) owns
              # tests/test_queue_dispatch_fail_closed.py, and tools/fleet_state.py

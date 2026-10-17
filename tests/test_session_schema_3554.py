@@ -25,6 +25,7 @@ fake ``tortoise.sdk`` module rather than a real one.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import re
 import subprocess
@@ -276,17 +277,44 @@ def test_subdir_scan_keys_sites_repo_relatively_and_compares_in_scope(
     assert not audit.inventory_report(tmp_path)["ok"]
 
 
-#: The declared writers whose property names the scanner CANNOT read from the
-#: source literal: each builds its ``SET`` clause with an f-string (a shared
-#: helper or a ``for prop in (...)`` loop), so no ``s.<prop> =`` name sits in
-#: the literal. Their property sets are hand-declared. ``rebuild_all`` is
-#: excluded separately — it is the whole-schema writer (``SET s += $props``)
-#: and is declared as such.
+#: The declared writers whose property names the scanner CANNOT read at its site:
+#: each assembles its ``SET`` clause from something other than the one Cypher
+#: literal the scanner reads (an f-string built per property, or — for
+#: ``_write_session_and_turns`` — 11 separate ``merge_sets.append("s.harness=…")``
+#: literals behind a final f-string ``MERGE``), so ``Site.properties`` is empty
+#: and ``test_scanner_properties_match_the_declaration`` cannot compare the row.
+#: Their property sets are hand-declared and verified by a bespoke AST pin named
+#: in ``_ROW_VERIFIERS`` — an exemption here is a claim that a verifier COVERS it,
+#: and ``test_every_exempt_row_has_a_row_verifier`` fails if one does not.
+#: ``rebuild_all`` is excluded separately — it is the whole-schema writer
+#: (``SET s += $props``) and is declared as such.
+#:
+#: ``tortoise/sdk.py::_write_session_and_turns`` was exempted on the reason that
+#: it "builds its ``SET`` clause with an f-string", which is false and made the
+#: exemption read as "nothing to read" for the single largest row in the
+#: declaration — the shared capture primitive both capture lanes funnel through
+#: (#3551). Neither the scanner nor this census could compare it, and no test
+#: did: dropping a property from the row (plus the matching §4.8 cell, which the
+#: doc mirror forces you to make) passed every test in this file. The reason is
+#: now the true one and the row is pinned by
+#: ``test_write_session_and_turns_declares_every_property_it_writes``.
 _FSTRING_WRITERS: frozenset[str] = frozenset({
     "tools/ask_spotcheck.py::merge_capture_session",
     "tortoise/projection/entities.py::_fold_session_recorded",
     "tortoise/sdk.py::_write_session_and_turns",
 })
+
+#: The bespoke row-level verifier for each scanner-unreadable declared writer.
+#: Read by ``test_every_exempt_row_has_a_row_verifier``; each named test asserts
+#: the declared property set equals the names its own function's literals carry.
+_ROW_VERIFIERS: dict[str, str] = {
+    "tools/ask_spotcheck.py::merge_capture_session":
+        "test_merge_capture_session_declares_every_property_it_writes",
+    "tortoise/projection/entities.py::_fold_session_recorded":
+        "test_fold_session_recorded_declares_every_property_it_writes",
+    "tortoise/sdk.py::_write_session_and_turns":
+        "test_write_session_and_turns_declares_every_property_it_writes",
+}
 
 
 def test_scanner_properties_match_the_declaration(repo_sites) -> None:
@@ -869,14 +897,44 @@ def test_section_4_8_changelog_entry_sits_under_its_own_version_block() -> None:
     Pre-fix the bullet was the FIRST item of the ``v3.23 (2026-10-10 —
     issues #7813 + #7853)`` block, making that header's date and issue
     enumeration false and sending a reader looking up "when was §4.8 added"
-    to the wrong version. The document is v3.24 (2026-10-12), so the entry
-    sits under the v3.24 header.
+    to the wrong version.
+
+    The first fix moved it under ``v3.24`` and hardcoded that answer — but a new
+    MODEL SECTION is a model change, so the block must be the release that
+    carries the section, not the release #3554 happened to branch from. At that
+    fix's head the document was v3.28 with v3.25/26/27/28 above v3.24: §4.8 sat
+    four model versions old, the model version was never bumped, and the v3.24
+    header enumerated an issue that could not have landed in it — the same
+    misattribution one block up, now pinned as correct by a hardcoded ``v3.24``.
+
+    So this asserts the RELATION, not the literal: the bullet sits under the
+    NEWEST block, and that block's version is the version the model document
+    itself declares. Pre-fix (both the original ``v3.23`` shape and the
+    ``v3.24`` one) this fails.
     """
-    ontology = ONTOLOGY_CHANGELOG.read_text(encoding="utf-8")
-    bullet = ontology.index("§4.8 (added by #3554")
-    header = ontology.rindex("> **Changelog v3.", 0, bullet)
-    header_line = ontology[header:ontology.index("\n", header)]
-    assert "v3.24" in header_line, header_line
+    changelog = ONTOLOGY_CHANGELOG.read_text(encoding="utf-8")
+    ontology = ONTOLOGY.read_text(encoding="utf-8")
+    bullet = changelog.index("§4.8 (added by #3554")
+    header = changelog.rindex("> **Changelog v3.", 0, bullet)
+    header_line = changelog[header:changelog.index("\n", header)]
+    # The version the model document declares about itself (frontmatter title).
+    declared = re.search(r'^title: "Tortoise — Canonical Ontology v(\d+\.\d+)"',
+                         ontology, re.M)
+    assert declared, "docs/ONTOLOGY.md must declare its model version in frontmatter"
+    assert f"v{declared.group(1)}" in header_line, (
+        f"§4.8 is recorded under {header_line!r} but the model document declares "
+        f"v{declared.group(1)} — a new model section must be recorded in the "
+        "release that carries it, not an older one")
+    newest = changelog.index("> **Changelog v3.")
+    newest_line = changelog[newest:changelog.index("\n", newest)]
+    assert newest == header, (
+        "§4.8 must be recorded in the NEWEST changelog block (this file is "
+        f"newest-first); it sits under {header_line!r} while the newest block "
+        f"is {newest_line!r}")
+    assert "#3554" in header_line, (
+        "the §4.8 block's header must name the issue whose section it records")
+    # …and the header must not enumerate an issue that landed in another block.
+    assert header_line.count("#") >= 1
 
 
 def test_ontology_section_4_8_owner_lists_match_the_declaration() -> None:
@@ -936,20 +994,22 @@ def test_the_set_property_owner_convention_is_stated_in_both_homes() -> None:
         "reader is not told a replay restore owns the Session identity")
 
 
-def test_fold_session_recorded_declares_every_property_it_writes() -> None:
-    """The fold's declared row must name every property its own Cypher writes.
+def _scope_written_properties(src: str, fn_name: str) -> set[str]:
+    """Every ``s.<prop> =`` name a function's own literals write.
 
-    The fold builds ``sets`` with an f-string, so ``tools/session_retrofit_audit.py
-    `` reads no property names at its site (it is one of the declared f-string
-    writers). This reads the function's source instead. Pre-fix the row omitted
-    ``created_at`` and ``capture_lane``, which the fold writes on every
-    journaled rebuild (both coalesce-preserved, like ``actor_user_id``).
+    The scanner reads property names out of the ONE Cypher string literal it
+    finds at a site, so a writer that assembles its ``SET`` clause from several
+    literals (or from a ``for prop in (...)`` loop) reports ``props=()`` and is
+    exempt from ``test_scanner_properties_match_the_declaration``. This is the
+    row-level verifier for those writers: it walks the function's own AST and
+    unions the names from EVERY string constant in scope, including the names a
+    ``for prop in (…):`` loop carries in its tuple instead of in a literal. It
+    is deliberately source-level (a Cypher literal is the only contract a
+    property name has before the query runs) and it does not follow calls — the
+    four call-carrying writers stay a stated, documented gap.
     """
-    src = (REPO_ROOT / "tortoise/projection/entities.py").read_text(
-        encoding="utf-8")
     fn = next(node for node in ast.walk(ast.parse(src))
-              if isinstance(node, ast.FunctionDef)
-              and node.name == "_fold_session_recorded")
+              if isinstance(node, ast.FunctionDef) and node.name == fn_name)
     set_re = re.compile(r"\bs\.([A-Za-z_]\w*)\s*=(?!=)")
     written: set[str] = set()
     for node in ast.walk(fn):
@@ -961,13 +1021,105 @@ def test_fold_session_recorded_declares_every_property_it_writes() -> None:
             for elt in node.iter.elts:
                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                     written.add(elt.value)
+    return written
+
+
+def _assert_declared_row_matches(
+        path: str, fn_name: str, key: str) -> None:
+    """Pin one declared writer row against the literals its function writes."""
+    src = (REPO_ROOT / path).read_text(encoding="utf-8")
+    written = _scope_written_properties(src, fn_name)
     declared = next(
-        w.properties for w in session_schema.SESSION_WRITERS
-        if w.key == "tortoise/projection/entities.py::_fold_session_recorded")
+        w.properties for w in session_schema.SESSION_WRITERS if w.key == key)
     assert written == set(declared), (
-        "declaration disagrees with the fold: "
+        f"declaration disagrees with {key}: "
         f"declared-only={sorted(set(declared) - written)} "
         f"code-only={sorted(written - set(declared))}")
+
+
+def test_merge_capture_session_declares_every_property_it_writes() -> None:
+    """The ask-lane seeder's row must name every property its own Cypher writes.
+
+    ``merge_capture_session`` assembles ``sets`` from plain literals
+    (``s.turn_count=$tc``, ``s.is_episodic=true``, the ``capture_redactions`` and
+    ``created_at`` branches) behind an f-string ``MERGE``, so the scanner reports
+    no property names at its site and the row is exempt from the scanner
+    comparison. This is that exemption's verifier — without it the exemption is a
+    claim no test covers.
+    """
+    _assert_declared_row_matches(
+        "tools/ask_spotcheck.py", "merge_capture_session",
+        "tools/ask_spotcheck.py::merge_capture_session")
+
+
+def test_every_exempt_row_has_a_row_verifier(repo_sites) -> None:
+    """An exemption from the scanner comparison must be COVERED, not asserted.
+
+    ``_FSTRING_WRITERS`` exempts a declared row from
+    ``test_scanner_properties_match_the_declaration``. An exemption that no test
+    compensates for is an unverified row wearing a documented reason — which is
+    what the shared capture primitive's row was (on a reason that was false for
+    it). So the exempt set must equal what the scanner actually cannot read, and
+    every member must name a verifier that exists, runs, and compares that row.
+    """
+    writers, _ = repo_sites
+    scanned: dict[str, set[str]] = {}
+    for site in writers:
+        scanned.setdefault(site.key, set()).update(site.properties)
+    unreadable = {
+        w.key for w in session_schema.SESSION_WRITERS
+        if not w.writes_whole_schema and not scanned.get(w.key)}
+    assert unreadable == _FSTRING_WRITERS, (
+        "the exempt set and the scanner-unreadable set must agree (an exempt row "
+        f"the scanner CAN read is a stale exemption); got {sorted(unreadable)}")
+    assert set(_ROW_VERIFIERS) == _FSTRING_WRITERS, (
+        "every exempt row needs a named verifier and vice versa: "
+        f"unverified={sorted(_FSTRING_WRITERS - set(_ROW_VERIFIERS))} "
+        f"stale={sorted(set(_ROW_VERIFIERS) - _FSTRING_WRITERS)}")
+    for key, verifier in _ROW_VERIFIERS.items():
+        fn = globals().get(verifier)
+        assert callable(fn), (
+            f"{key} is exempt from the scanner comparison but its declared "
+            f"verifier {verifier} does not exist")
+        assert verifier.startswith("test_"), (
+            f"{key}'s verifier {verifier} is not a collected test")
+        params = inspect.signature(fn).parameters
+        assert "repo_sites" not in params, (
+            f"{key}'s verifier {verifier} must read the SOURCE of its own "
+            "writer, not the scanner output the exemption is about")
+
+
+def test_fold_session_recorded_declares_every_property_it_writes() -> None:
+    """The fold's declared row must name every property its own Cypher writes.
+
+    The fold builds ``sets`` with an f-string, so ``tools/session_retrofit_audit.py
+    `` reads no property names at its site (it is one of the declared f-string
+    writers). This reads the function's source instead. Pre-fix the row omitted
+    ``created_at`` and ``capture_lane``, which the fold writes on every
+    journaled rebuild (both coalesce-preserved, like ``actor_user_id``).
+    """
+    _assert_declared_row_matches(
+        "tortoise/projection/entities.py", "_fold_session_recorded",
+        "tortoise/projection/entities.py::_fold_session_recorded")
+
+
+def test_write_session_and_turns_declares_every_property_it_writes() -> None:
+    """The shared capture primitive's 11-property row is verified, not trusted.
+
+    This is the row that owns every capture-shape property and the writer BOTH
+    capture lanes funnel through (#3551), and it was the one row no test
+    compared against the code: ``_FSTRING_WRITERS`` exempted it on the claim
+    that it "builds its ``SET`` clause with an f-string", which is false — only
+    the final ``MERGE`` literal is an f-string, while the SET clause is 11 plain
+    string literals. ``test_scanner_properties_match_the_declaration`` skips any
+    writer whose scanned props are empty, so dropping or adding a property in
+    this row (with the matching §4.8 cell edit, which the doc mirror forces)
+    passed every test in this file. Pre-fix this test fails: the exemption hides
+    the row, and the AST union is what recovers it.
+    """
+    _assert_declared_row_matches(
+        "tortoise/sdk.py", "_write_session_and_turns",
+        "tortoise/sdk.py::_write_session_and_turns")
 
 
 def test_scanner_write_verbs_come_from_the_declared_predicate(

@@ -1297,9 +1297,18 @@ def test_the_session_declaration_guard_runs_on_its_docs_subjects_too():
     consent-bridge records; the `core` registration alone cannot fix it, because
     a name in a surface's test_files only runs when that surface is ALREADY
     selected.
+
+    #3554 review (P2): the THIRD subject — `docs/ONTOLOGY-CHANGELOG.md`, read by
+    `test_section_4_8_changelog_entry_sits_under_its_own_version_block` — was
+    omitted from this list and from `CORE_ALSO`, so a docs-only edit that moved
+    the `§4.8 (added by #3554` bullet back under the wrong `Changelog vX.Y`
+    header (the exact defect that test exists to prevent) selected no surface and
+    ran a 45-file smoke set without the guard. The sibling changelog readers are
+    covered only because they sit in tier1; this module is not.
     """
     root = Path(__file__).resolve().parents[1]
     for changed in ("docs/ONTOLOGY.md",
+                    "docs/ONTOLOGY-CHANGELOG.md",
                     "docs/plans/2026-08-25-1714-memory-capture-onboarding.md"):
         assert (root / changed).exists(), f"guarded doc subject is gone: {changed}"
         r = _sel([changed])
