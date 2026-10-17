@@ -1282,7 +1282,61 @@ def build_state(
         p = by_sid.get(sid)
         return Path(p) if p else None
 
-    rows: list[tuple[str, str]] = [(lbl, ws) for lbl, ws, _ in registry]
+    # ---- which registry rows ARE lane records (#8845) ----
+    # A registry row can outlive the cmux workspace behind it. When the row's
+    # workspace is ABSENT from a MEASURED live list and the row binds no evidence
+    # at all — no pane binding, no live session record, no registry override — then
+    # it says nothing: it cannot answer whether the lane stopped, started or was
+    # never there. Emitting it anyway makes ONE label enumerate TWO lane records,
+    # and the claim gate reads a duplicated label as unreadable by construction
+    # (`collision_preflight._holders_from_board` -> HOLDER_UNMEASURED, which is
+    # INCOMPLETE/exit 2 fleet-wide). That is a stale roster row tightening a
+    # fail-closed gate over a lane that is in fact perfectly readable.
+    #
+    # ⛔ So such a row is not a lane record — but only while the SAME label already
+    # has a record that does bind evidence. A row that is its label's ONLY record is
+    # KEPT even when unbound: #7738 publishes exactly that lane as
+    # RECOVERABLE/RETIRED, because a gone workspace says nothing about whether a pi
+    # process outlived it. Dropping it would erase the lane #7738 exists to report.
+    #
+    # ⛔ And a drop requires a MEASURED live list: an unreadable cmux list says
+    # nothing about whether the workspace still exists, so it retires NOTHING — the
+    # same fail-open posture `workspace_terminal` takes (#7738).
+    #
+    # Every dropped row is REPORTED through `orphans` below (kind `registry-stale`),
+    # never silently erased: deleting the roster line is a human's call, not ours.
+    def binds_evidence(label: str, ws: str) -> bool:
+        """Does this registry row bind ANY evidence about the lane it names?"""
+        if ws.upper() in workspaces:
+            return True                      # the workspace itself is live
+        if (bindings.get(ws.upper()) or "").strip():
+            return True                      # a pane resume binding exists
+        if live.get(ws.upper()):
+            return True                      # a session record -> a pid reading
+        # A hand-pick for the label outlives a dead workspace on purpose (the
+        # override rule exists to re-bind such a lane), and it is the only thing that
+        # can resolve a ghost's session on disk. Presence alone counts: a DANGLING
+        # override is still a human's statement that this label is a lane.
+        return bool((overrides.get(label) or "").strip())
+
+    bound_labels = {lbl for lbl, ws, _ in registry if binds_evidence(lbl, ws)}
+    kept: list[tuple[str, str, str]] = []
+    stale_rows: list[dict[str, str]] = []
+    for label, ws, issue_label in registry:
+        if (
+            # Only a MEASURED live list may retire a row (#7738 fail-open posture).
+            workspaces_measured
+            # The label IS answered by a row that binds evidence, so dropping this
+            # one cannot erase the lane from the board.
+            and label in bound_labels
+            # ...and this row is the one that binds nothing.
+            and not binds_evidence(label, ws)
+        ):
+            stale_rows.append({"lane": label, "workspace": ws, "issue_label": issue_label})
+            continue
+        kept.append((label, ws, issue_label))
+
+    rows: list[tuple[str, str]] = [(lbl, ws) for lbl, ws, _ in kept]
 
     # ---- disk candidates: ONLY for lanes the pane/override rules did not bind.
     # The identity scan reads the first user message of every file in a lane's
@@ -1348,7 +1402,7 @@ def build_state(
     owner_of_pr: dict[int, str | None] = {}
     issue_owner: dict[int, list[str]] = {}
 
-    for label, ws, issue_label in registry:
+    for label, ws, issue_label in kept:
         wsinfo = workspaces.get(ws.upper(), {}) or {}
         cwd = wsinfo.get("cwd") or ""
         wt = wts.get(cwd, {}) or {}
@@ -1563,6 +1617,23 @@ def build_state(
                 "workspace": lane_["identity"]["workspace"],
                 "reason": "live pi session has NO pane resume binding — recovery destroyed attributability (#7750 D2)",
             })
+    # a third orphan class (#8845): a registry row whose workspace is gone and which
+    # binds no evidence, for a label already answered by a record that does. It is not
+    # a lane record (see the filter above), but it is still VISIBLE here — the roster
+    # line is stale, and clearing it is a human's call.
+    for row in stale_rows:
+        orphans.append({
+            "kind": "registry-stale",
+            "lane": row["lane"],
+            "workspace": row["workspace"],
+            "reason": (
+                f"registry row for '{row['lane']}' names workspace "
+                f"{row['workspace'][:8]}… which is NOT in the live cmux list, and the row "
+                "binds NO pane binding, session record or override — it is not a lane "
+                "record (a record with this label does bind evidence); delete the stale "
+                "roster row"
+            ),
+        })
 
     # index for `who`
     index: dict[str, dict[str, Any]] = {"prs": {}, "issues": {}}
@@ -1630,6 +1701,7 @@ def build_state(
             "free_lanes": free_lanes,
             "violations": len(violations),
             "orphans": len(orphans),
+            "stale_registry": len(stale_rows),
             "conflicts": len(conflicts),
             "terminal": len(terminal_lanes),
             "recoverable": sum(1 for t in terminal_lanes if t["state"] == "RECOVERABLE"),
@@ -2226,6 +2298,22 @@ def cmd_conflicts(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stale_registry_match(state: Mapping[str, Any], needle: str) -> dict[str, Any] | None:
+    """The `registry-stale` orphan row matching `needle` (lane label or workspace).
+
+    Tolerates a state written before #8845 (no such rows) and a malformed
+    `orphans` value: an unreadable entry is not a match.
+    """
+    n = needle.lower().strip()
+    orphans = state.get("orphans")
+    for o in orphans if isinstance(orphans, (list, tuple)) else ():
+        if not isinstance(o, dict) or o.get("kind") != "registry-stale":
+            continue
+        if str(o.get("lane") or "").lower() == n or str(o.get("workspace") or "").lower() == n:
+            return o
+    return None
+
+
 def _find_lane(state: Mapping[str, Any], needle: str) -> dict[str, Any] | None:
     n = needle.lower().strip()
     for lane_ in state["lanes"]:
@@ -2249,6 +2337,19 @@ def cmd_lane(args: argparse.Namespace) -> int:
         return 2
     lane = _find_lane(state, args.lane)
     if lane is None:
+        # A stale roster row is NOT a lane (#8845) — say so, rather than manufacturing
+        # the same "no lane matching" answer an unknown name gets. The two are
+        # different facts: one name EXISTS in the roster and has nothing behind it.
+        stale = _stale_registry_match(state, args.lane)
+        if stale:
+            print(
+                f"{args.lane!r} is a STALE REGISTRY ROW, not a lane: workspace "
+                f"{stale['workspace'][:8]}… is absent from the live cmux list and the row "
+                "binds no pane binding, session record or override (#8845) — delete the "
+                "roster row; `fleet-state orphans` lists it",
+                file=sys.stderr,
+            )
+            return 1
         print(f"no lane matching {args.lane!r}", file=sys.stderr)
         return 1
     # `lane`'s identity/session/liveness sections are lane-derived and valid whatever
