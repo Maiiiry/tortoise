@@ -130,16 +130,19 @@ def _is_constant_false(gate: object) -> bool:
     return bool(_CONSTANT_FALSE.match(str(gate).strip()))
 
 
-def _fenced_blocks(text: str) -> str:
-    """The contents of every ``` fence, joined — the parts a reader would PASTE."""
+def _fenced_blocks(text: str) -> list[tuple[int, str]]:
+    """Every ``` fence's lines as `(file line number, line)` — the parts a reader
+    would PASTE. The number is the FILE's: joining the fences and numbering the
+    result points a reader at the wrong line of the README (measured: a command
+    on line 263 was reported as line 31)."""
     out, inside = [], False
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), 1):
         if line.lstrip().startswith("```"):
             inside = not inside
             continue
         if inside:
-            out.append(line)
-    return "\n".join(out)
+            out.append((lineno, line))
+    return out
 
 def _workflow_paths() -> list:
     """Every file that can carry a `run:` — workflows AND composite actions.
@@ -261,12 +264,50 @@ def _cut_comment(line: str) -> str:
 
 #: Commands whose arguments are OUTPUT, not an invocation. A diagnostic that
 #: names `wrangler@4` is how a reader learns what went wrong; it cannot deploy.
-#: The line arrives as a YAML scalar for a step, so a `run:` prefix is normal.
+#: Matched against ONE command segment, never a whole line: `echo "x"; npx
+#: wrangler@4 …` runs a real invocation after the message, so a line-scoped
+#: exemption hides exactly the spec this arm exists to refuse (measured).
 _DIAGNOSTIC = re.compile(r"^\s*(?:-\s*)?(?:run:\s*)?(?:echo|printf)\b")
 
 
-def _is_diagnostic(code: str) -> bool:
-    return bool(_DIAGNOSTIC.match(code))
+def _command_segments(line: str) -> list[str]:
+    """`line` split at top-level `;` `&&` `||` `|` — quote-aware.
+
+    `$( )` and backticks are NOT split, so a substitution stays inside its
+    segment; `_is_diagnostic` refuses any segment that contains one, because
+    `echo "$(npx --yes wrangler@4 …)"` EXECUTES the command it prints.
+    """
+    segments, buf, quote, i = [], [], None, 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(line):
+                buf.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch in ";|&":
+            segments.append("".join(buf))
+            buf = []
+            if i + 1 < len(line) and line[i + 1] == ch:
+                i += 1
+        else:
+            buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [seg for seg in segments if seg.strip()]
+
+
+def _is_diagnostic(segment: str) -> bool:
+    """True only for a segment that PRINTS and cannot execute a command."""
+    if "$(" in segment or "`" in segment:
+        return False
+    return bool(_DIAGNOSTIC.match(segment))
 
 def _strip_quoted(line: str) -> str:
     """`line` with quoted SEGMENTS removed — a diagnostic is not a command.
@@ -391,20 +432,22 @@ def test_every_wrangler_spec_is_the_asserted_form() -> None:
             # spec (`… --version  # was wrangler@4`) is prose too, and reading it
             # as code makes this arm fail on a correct workflow.
             code = _cut_comment(line)
-            for match in re.finditer(r"wrangler@\S*", code):
-                token = match.group(0)
-                if LEGAL_SPEC.match(token):
-                    continue
+            for segment in _command_segments(code):
                 # A MESSAGE may name the bad spelling (this repo's steps carry
-                # `::error::` diagnostics); only a command may not use it.
-                if _is_diagnostic(code):
+                # `::error::` diagnostics); only a command may not use it — and
+                # only the segment that IS the message, not a line that has one.
+                if _is_diagnostic(segment):
                     continue
-                # A bare `wrangler@` followed by prose punctuation is a mention,
-                # not a spec — anything shaped like a spec (digit, letter, `^`,
-                # `~`, `$`, quote, backslash, `{`) is an offender.
-                if len(token) > len("wrangler@") and token[len("wrangler@")] in "`).,;:":
-                    continue
-                offenders.append(f"{path.name}:{lineno}: {token}")
+                for match in re.finditer(r"wrangler@\S*", segment):
+                    token = match.group(0)
+                    if LEGAL_SPEC.match(token):
+                        continue
+                    # A bare `wrangler@` followed by prose punctuation is a
+                    # mention, not a spec — anything shaped like a spec (digit,
+                    # letter, `^`, `~`, `$`, quote, backslash, `{`) is an offender.
+                    if len(token) > len("wrangler@") and token[len("wrangler@")] in "`).,;:":
+                        continue
+                    offenders.append(f"{path.name}:{lineno}: {token}")
     assert not offenders, (
         "wrangler spec is not the asserted variable form (a literal spec cannot be "
         "verified against what resolved):\n" + "\n".join(offenders)
@@ -871,10 +914,9 @@ def test_no_document_shows_a_floating_wrangler_spec() -> None:
         text = path.read_text(encoding="utf-8")
         # Only FENCED code, not prose: a doc may legitimately name the bad
         # spelling while explaining why it is bad.
-        code = "\n".join(
-            line for line in _fenced_blocks(text).splitlines()
-            if not line.lstrip().startswith("#")
-        )
+        fenced = [line for _n, line in _fenced_blocks(text)
+                  if not line.lstrip().startswith("#")]
+        code = "\n".join(fenced)
         offenders = [
             token
             for token in re.findall(r"wrangler@[^\s`\"')]+", code)
@@ -884,7 +926,12 @@ def test_no_document_shows_a_floating_wrangler_spec() -> None:
             f"{rel} still shows a copy-pasteable wrangler spec that is not the "
             f"asserted form ({offenders}) — it would ship whatever npm serves"
         )
-        bare = _bare_invocations(code)
+        # Per LINE, so the reported number is the file's.
+        bare = [
+            f"line {lineno}: {hit.split(': ', 1)[-1]}"
+            for lineno, line in _fenced_blocks(text)
+            for hit in _bare_invocations(line)
+        ]
         assert not bare, (
             f"{rel} shows a spec-less wrangler command ({bare}) — a paste of it "
             "runs whatever npm serves, with nothing asserting what that was"
