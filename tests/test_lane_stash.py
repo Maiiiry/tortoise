@@ -1841,3 +1841,166 @@ def test_prune_dry_run_does_not_create_a_guard_ref(repo):
         "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
     ).stdout.strip() == "", "a dry run must not write a guard ref"
     assert repo.stash_sha() == sha, "a dry run must not change refs/stash"
+
+
+# ── round-4 review P2s ─────────────────────────────────────────���───────────
+
+def test_interpreter_guard_exits_2_not_the_hazard_code(monkeypatch):
+    """The version guard must exit 2 — 1 is `check`'s HAZARD verdict.
+
+    `raise SystemExit(<str>)` always exits 1, so an old interpreter was
+    indistinguishable, by exit code, from a foreign stash entry. The generic
+    entry-point guard test accepts either shape and never asserts the integer, so
+    without this case the collision can silently return (#8773 review P2).
+    """
+    import importlib.util
+
+    monkeypatch.setattr(sys, "version_info", (3, 9, 6))
+    spec = importlib.util.spec_from_file_location("lane_stash_old_python", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    with pytest.raises(SystemExit) as refusal:
+        spec.loader.exec_module(mod)
+    assert refusal.value.code == 2, (
+        f"the guard must exit the documented environment code (2), not "
+        f"{refusal.value.code!r} — 1 is `check`'s HAZARD verdict"
+    )
+
+
+def test_list_reports_a_guard_left_by_another_lane(repo):
+    """A guard must be visible from every lane, including one whose worktree is gone.
+
+    `prune --apply` creates a guard automatically for a retained orphan, and the
+    guard outlives `git worktree remove`. Enumerating only THIS lane's guards left
+    it invisible — a permanent gc-blocking ref in the shared git dir (#8773 P2).
+    """
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    # routine maintenance empties the register while refs/stash keeps resolving
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.lane(repo.b, "prune", "--apply").returncode == 0
+    guards = repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.split()
+    assert guards, "precondition: lane B's prune retained and guarded the orphan"
+    b_key = guards[0].split("/")[2]
+
+    listed = repo.lane(repo.a, "list")
+    assert listed.returncode == 0, _fail(listed)
+    assert guards[0] in listed.stdout, listed.stdout
+    assert f"[lane {b_key} — not this lane]" in listed.stdout, listed.stdout
+
+
+def test_prune_releases_a_guard_left_under_another_lane(repo, monkeypatch, capsys):
+    """A guard is redundant once its sha is back in the register — under ANY key.
+
+    Another lane (or a since-removed worktree) can leave a guard for an entry this
+    prune is about to keep. Releasing only this prune's own guard left that ref
+    blocking gc forever (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\ndoomed\n")
+    assert repo.lane(repo.a, "push", "-m", "doomed").returncode == 0
+    repo.dirty(repo.b, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", "-m", "kept", cwd=repo.b)
+    kept = repo.stash_sha()
+    assert kept
+    ghost = f"refs/pi-lane-prune-guard/ghost-00000000/{kept}"
+    repo.git("update-ref", ghost, kept)
+
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["prune", "--apply"]) == 0
+    remaining = repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.split()
+    assert ghost not in remaining, f"a foreign guard for a live entry leaked: {remaining}"
+
+
+def test_an_unreadable_ref_list_is_a_state_error_not_safe(repo, monkeypatch):
+    """A failed `for-each-ref --points-at` must fail closed, never report SAFE.
+
+    That read decides WHO OWNS an entry; collapsing its failure into "no peer ref
+    names it" is the same fail-open as an unreadable shared register (#8773 P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\na-A\n")
+    assert repo.lane(repo.a, "push", "-m", "A work").returncode == 0
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+
+    def fake_git(*args, check=True, stdin=None):
+        if args[:1] == ("for-each-ref",) and any(
+                a.startswith("--points-at=") for a in args):
+            return subprocess.CompletedProcess(
+                ["git", *args], 1, "", "fatal: cannot read refs"
+            )
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.setattr(mod, "_git", fake_git)
+    rc = mod.main(["check", "--json"])
+    assert rc == 2, f"an unreadable ref list is a state error (exit 2), got {rc}"
+
+
+def test_push_locates_our_entry_across_a_concurrent_peer_push(repo, monkeypatch, capsys):
+    """A peer push between OUR `git stash push` and the locate must not mis-identify it.
+
+    The nonce locate is the load-bearing race claim of the whole creation path and
+    had no test (#8773 review P2).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.a, "f.txt", "base\na-A\n")
+    real_git = mod._git
+    fired = {"done": False}
+
+    def wrapping_git(*args, check=True, stdin=None):
+        if args[:2] == ("log", "--walk-reflogs") and not fired["done"]:
+            fired["done"] = True
+            # a peer push lands AFTER our `git stash push`, BEFORE the locate
+            repo.dirty(repo.b, "f.txt", "base\nb-B\n")
+            repo.git("stash", "push", "-q", "-m", "peer", cwd=repo.b)
+        return real_git(*args, check=check, stdin=stdin)
+
+    monkeypatch.chdir(repo.a)
+    monkeypatch.setattr(mod, "_git", wrapping_git)
+    capsys.readouterr()
+    assert mod.main(["push", "-m", "A work"]) == 0
+    sha_b = repo.stash_sha()
+    pins = repo.stash_pins()
+    assert len(pins) == 1, pins
+    pinned = next(iter(pins.values()))
+    assert pinned != sha_b, "push pinned the peer's entry that landed during its locate"
+    assert repo.lane(repo.a, "pop").returncode == 0
+    assert "a-A" in (repo.a / "f.txt").read_text()
+
+
+def test_a_pin_that_is_not_a_readable_commit_is_refused_and_marked(repo):
+    """A pin whose object is unreadable must refuse, never crash (post-gc case).
+
+    `apply`/`pop`/`show` guard the object and `list` marks MISSING OBJECT. The
+    path had no test, though the plan's checklist claimed it did (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\nx\n")
+    assert repo.lane(repo.a, "push", "-m", "x").returncode == 0
+    a_key = next(iter(repo.stash_pins())).split("/")[2]
+    # a real object that is NOT a commit: the same `_commit_alive` false branch
+    blob = repo.git("hash-object", "-w", "f.txt", cwd=repo.a).stdout.strip()
+    assert blob
+    repo.git("update-ref", f"refs/lane/{a_key}/stash/9", blob)
+
+    listed = repo.lane(repo.a, "list")
+    assert listed.returncode == 0, _fail(listed)
+    assert "MISSING OBJECT" in listed.stdout, listed.stdout
+    assert repo.lane(repo.a, "pop", "9").returncode == 2
+    assert repo.lane(repo.a, "show", "9").returncode == 2
+
+
+def test_detached_head_push_check_and_pop(repo):
+    """A detached HEAD must not break push/locate/check/restore."""
+    repo.git("checkout", "--detach", cwd=repo.a)
+    repo.dirty(repo.a, "f.txt", "base\ndetached\n")
+    assert repo.lane(repo.a, "push", "-m", "detached work").returncode == 0
+    check = repo.lane(repo.a, "check")
+    assert check.returncode == 0, _fail(check)
+    assert "SAFE" in check.stdout, check.stdout
+    assert repo.lane(repo.a, "pop").returncode == 0
+    assert "detached" in (repo.a / "f.txt").read_text()

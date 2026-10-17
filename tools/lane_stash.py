@@ -601,13 +601,31 @@ def _guard_unpin(ref: str, sha: str) -> None:
     _git("update-ref", "-d", ref, sha, check=False)
 
 
-def _guard_refs(key: str) -> list[tuple[str, str]]:
-    """This lane's prune guard refs, as ``(ref, sha)`` — the objects they keep alive."""
-    cp = _git("for-each-ref", "--format=%(refname) %(objectname)", f"{GUARD_NS}/{key}",
+def _guard_refs() -> list[tuple[str, str, str]]:
+    """Every prune guard ref, as ``(ref, sha, lane_key)`` — under ANY lane key.
+
+    Enumerating only THIS lane's guards hid a guard left by another (possibly
+    already-removed) worktree: ``prune --apply`` creates one automatically for a
+    retained orphan, and after ``git worktree remove`` that ref survived with no
+    command able to name it — a permanent, gc-blocking ref in the shared git dir
+    (#8773 review P2).
+    """
+    cp = _git("for-each-ref", "--format=%(refname) %(objectname)", GUARD_NS,
               check=False)
     if cp.returncode != 0:
         return []
-    return [(p[0], p[1]) for ln in cp.stdout.splitlines() if len(p := ln.split()) >= 2]
+    out: list[tuple[str, str, str]] = []
+    for ln in cp.stdout.splitlines():
+        parts = ln.split()
+        if len(parts) < 2:
+            continue
+        ref, sha = parts[0], parts[1]
+        owner = (
+            ref[len(GUARD_NS) + 1:].split("/", 1)[0]
+            if ref.startswith(GUARD_NS + "/") else ""
+        )
+        out.append((ref, sha, owner))
+    return out
 
 
 def _guard_release_all(sha: str) -> None:
@@ -626,8 +644,22 @@ def _guard_release_all(sha: str) -> None:
 
 
 def _refs_pointing_at(sha: str) -> set[str]:
+    """Every ref that names ``sha``.
+
+    A non-zero rc is a STATE error, NEVER an empty set: this feeds the ownership
+    oracle, and collapsing "cannot read" into "no peer ref names it" is the same
+    fail-open the module refuses for `_shared_register` — `check` would report
+    SAFE while a bare `git stash pop` took a peer's entry whose ref it could not
+    read (#8773 review P2).
+    """
     cp = _git("for-each-ref", "--format=%(refname)", f"--points-at={sha}", check=False)
-    return set(cp.stdout.split()) if cp.returncode == 0 else set()
+    if cp.returncode != 0:
+        raise LaneStashError(
+            f"could not enumerate the refs pointing at {sha[:12]} "
+            f"(`git for-each-ref --points-at` failed): "
+            f"{(cp.stderr or cp.stdout).strip() or 'no output'}"
+        )
+    return set(cp.stdout.split())
 
 
 def _lane_key_of_ref(ref: str) -> str | None:
@@ -813,12 +845,13 @@ def cmd_list(args: argparse.Namespace) -> int:
                 if r is top and not top_own else "")
         print(f"  {r['pos']:<11} {r['sha'][:12]}  {mark}  {r['subject']}{star}")
 
-    guards = _guard_refs(key)
+    guards = _guard_refs()
     if guards:
         print(f"prune guards held ({len(guards)} — each keeps its object gc-safe while no "
               "other ref names it; free one by recovering it, or drop the ref once you "
-              "know the work is safe)")
-        for ref, sha in guards:
+              "know the work is safe). A guard outlives the worktree that made it, so "
+              "FOREIGN lanes are listed here too")
+        for ref, sha, owner in guards:
             others = _refs_pointing_at(sha) - {ref}
             durable = sorted(others - {"refs/stash"})
             if durable:
@@ -828,7 +861,8 @@ def cmd_list(args: argparse.Namespace) -> int:
                         "`stash store` moves it; this guard is the handle)")
             else:
                 note = "  (no other ref names it)"
-            print(f"  {sha[:12]}  {ref}{note}")
+            foreign = "" if owner == key else f"  [lane {owner} — not this lane]"
+            print(f"  {sha[:12]}  {ref}{foreign}{note}")
     if top is not None and not top_own:
         print("\n⚠️  the top shared entry is not provably this lane's — use `lane_stash pop <id>`, "
               "never a bare `git stash pop` (see `lane_stash check`).")
@@ -840,9 +874,10 @@ def cmd_apply(args: argparse.Namespace, pop: bool) -> int:
     entry = _entry(key, args.entry)
     if not _commit_alive(entry["sha"]):
         raise LaneStashError(
-            f"entry {entry['id']} ({entry['ref']}) points at {entry['sha']}, which is no "
-            "longer in the object database — the pinned ref was the last handle, and "
-            "nothing here can restore it"
+            f"entry {entry['id']} ({entry['ref']}) points at {entry['sha']}, which is not a "
+            "readable stash commit (it is gone from the object database, or it is not a "
+            "commit object) — the pinned ref was the last handle, and nothing here can "
+            "restore it"
         )
     cmd = ["stash", "apply"]
     if args.index:
@@ -878,8 +913,9 @@ def cmd_show(args: argparse.Namespace) -> int:
     entry = _entry(key, args.entry)
     if not _commit_alive(entry["sha"]):
         raise LaneStashError(
-            f"entry {entry['id']} ({entry['ref']}) points at {entry['sha']}, which is no "
-            "longer in the object database — there is nothing to show"
+            f"entry {entry['id']} ({entry['ref']}) points at {entry['sha']}, which is not a "
+            "readable stash commit (it is gone from the object database, or it is not a "
+            "commit object) — there is nothing to show"
         )
     cmd = ["stash", "show"]
     if args.patch:
@@ -1307,9 +1343,13 @@ def cmd_prune(args: argparse.Namespace) -> int:
             final = {x["sha"] for x in _shared_register()}
         except LaneStashError:
             final = set()
-        for sha, (ref, _subject) in guarded.items():
+        for sha, (_ref, _subject) in guarded.items():
             if sha in final:
-                _guard_unpin(ref, sha)
+                # Release under ANY lane key: once the sha is back in the register
+                # a guard is redundant wherever it lives, and a guard left by a
+                # PREVIOUS prune (or another, since-removed worktree) would
+                # otherwise block gc forever (#8773 review P2).
+                _guard_release_all(sha)
             else:
                 print(f"kept   guard ref {ref} for {sha[:12]} — it is not back in the "
                       "shared register, so this ref is the last handle on it; restore "
