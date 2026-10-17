@@ -118,11 +118,17 @@ import sys
 # traceback instead of this message. The gate that enforces this shape is
 # tests/test_entry_point_python_guard.py, not a style rule.
 if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
-    raise SystemExit(
+    # #5128/#4053: emit the message explicitly and exit 2. `SystemExit(<str>)`
+    # always exits 1, and THIS tool publishes 1 as `check`'s HAZARD verdict — so
+    # an old interpreter reported through it is indistinguishable, by exit code,
+    # from a peer lane's stash entry. 2 is the tool's own environment-error code.
+    print(
         f"tools/lane_stash.py requires Python >= 3.12 (got "
         f"{sys.version_info[0]}.{sys.version_info[1]}) — run it as "
-        f"`uv run python tools/lane_stash.py`"
+        f"`uv run python tools/lane_stash.py`",
+        file=sys.stderr,
     )
+    raise SystemExit(2)
 
 import argparse
 import hashlib
@@ -1335,6 +1341,18 @@ def _reclaim_orphan_refs_stash(sha: str, *, key: str, apply: bool) -> int:
     reported and left alone.
     """
     if not _orphan_is_reclaimable(sha, key):
+        if not apply:
+            # A dry run must MUTATE nothing — creating the guard ref here made an
+            # inspection command write to the ref store, and that guard is then
+            # only clearable by `recover` or a manual `update-ref -d` (#8773 P2).
+            print(f"dry run — refs/stash {sha[:12]} would be KEPT: it is an unpinned orphan "
+                  "(the register enumerates nothing, no lane ref pins it, and this lane "
+                  "has no applied-record for it), and dropping the ref would destroy the "
+                  "last handle bare git has on that entry. Re-run with --apply to guard-pin "
+                  "the object and keep it (it is never dropped); if the work is yours, "
+                  "recover it with\n"
+                  f"  python tools/lane_stash.py recover {sha}")
+            return 0
         # `refs/stash` alone is NOT a durable handle: the caller's reconciliation
         # runs `git stash store` after this, which moves the ref and would destroy
         # exactly the handle this message promises (#8773 review P2). Pin the

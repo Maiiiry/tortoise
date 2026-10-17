@@ -1748,3 +1748,96 @@ def test_check_is_safe_for_this_lanes_applied_markerless_entry(repo):
     assert "OWN" in listed.stdout, listed.stdout
     assert "FOREIGN" not in listed.stdout, listed.stdout
     assert "not provably this lane's" not in listed.stdout, listed.stdout
+
+
+# ── advertised subcommands/flags with no coverage (#8773 review P2) ─────────
+
+def test_apply_keeps_the_pin_and_writes_no_applied_record(repo):
+    """`apply` must KEEP the lane pin and record nothing — only `pop` releases it.
+
+    `apply` is an advertised subcommand ("apply ... keeping the pin") and is the
+    `pop=False` branch of `cmd_apply`, but it had no test at all: a regression that
+    released the pin or wrote the durable APPLIED record on `apply` would leave the
+    whole suite green (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\napplied\n")
+    assert repo.lane(repo.a, "push", "-m", "apply me").returncode == 0
+    sha = repo.stash_sha()
+    assert sha
+    assert repo.lane(repo.a, "apply").returncode == 0
+    assert "applied" in (repo.a / "f.txt").read_text()
+    assert sha in repo.stash_pins().values(), "apply must keep the lane pin"
+    assert repo.applied_refs() == {}, "apply must not record an APPLIED entry"
+    assert repo.stash_shas() == [sha], "apply must not touch the shared register"
+
+    # the pin is still the handle: `pop` releases it and records the apply
+    repo.git("checkout", "--", "f.txt", cwd=repo.a)
+    assert repo.lane(repo.a, "pop").returncode == 0
+    assert repo.stash_pins() == {}
+    assert repo.applied_refs(), "pop must record the apply"
+
+
+def test_pop_index_restores_the_staged_state(repo):
+    """`--index` must restore the INDEX, not just the worktree (untested flag)."""
+    repo.dirty(repo.a, "f.txt", "base\nstaged\n")  # `dirty` stages the change
+    assert repo.lane(repo.a, "push", "-m", "staged work").returncode == 0
+    assert repo.status(repo.a) == ""
+    assert repo.lane(repo.a, "pop", "--index").returncode == 0
+    assert "staged" in (repo.a / "f.txt").read_text()
+    assert "M  f.txt" in repo.status(repo.a), repo.status(repo.a)
+
+
+def test_show_patch_prints_the_lane_entry_diff(repo):
+    """`show -p` must print the patch for a lane entry (untested flag)."""
+    repo.dirty(repo.a, "f.txt", "base\nshown\n")
+    assert repo.lane(repo.a, "push", "-m", "show me").returncode == 0
+    shown = repo.lane(repo.a, "show", "-p")
+    assert shown.returncode == 0, _fail(shown)
+    assert "shown" in shown.stdout, shown.stdout
+
+
+def test_push_with_a_pathspec_pins_only_the_named_path(repo):
+    """`push -- <pathspec>` must stash only that path (untested advertised form)."""
+    repo.dirty(repo.a, "f.txt", "base\npath-one\n")
+    (repo.a / "other.txt").write_text("other\n")
+    repo.git("add", "other.txt", cwd=repo.a)
+    assert repo.lane(repo.a, "push", "-m", "one path", "--", "f.txt").returncode == 0
+    assert "path-one" not in (repo.a / "f.txt").read_text()
+    assert (repo.a / "other.txt").exists(), "the unnamed path must stay in the worktree"
+    assert "A  other.txt" in repo.status(repo.a), repo.status(repo.a)
+    assert repo.lane(repo.a, "pop").returncode == 0
+    assert "path-one" in (repo.a / "f.txt").read_text()
+
+
+def test_push_all_includes_ignored_files(repo):
+    """`push -a` must capture ignored files too (untested advertised flag)."""
+    (repo.a / ".gitignore").write_text("ignored.txt\n")
+    repo.git("add", ".gitignore", cwd=repo.a)
+    repo.git("commit", "-qm", "ignore", cwd=repo.a)
+    (repo.a / "ignored.txt").write_text("ignored work\n")
+    assert repo.lane(repo.a, "push", "-a", "-m", "with ignored").returncode == 0
+    assert not (repo.a / "ignored.txt").exists()
+    assert repo.lane(repo.a, "pop").returncode == 0
+    assert (repo.a / "ignored.txt").exists()
+
+
+def test_prune_dry_run_does_not_create_a_guard_ref(repo):
+    """A dry-run `prune` must not mutate the ref store.
+
+    In the emptied-register unpinned-orphan state the dry run guard-pinned the
+    object BEFORE the `--apply` gate, so an inspection command silently wrote a ref
+    that only `recover` or a manual `update-ref -d` can clear (#8773 review P2).
+    """
+    repo.dirty(repo.b, "f.txt", "base\norphan\n")
+    repo.git("stash", "push", "-q", "-m", "orphan", cwd=repo.b)
+    sha = repo.stash_sha()
+    repo.git("reflog", "expire", "--expire=now", "--all")
+    assert repo.stash_shas() == [] and repo.stash_sha() == sha
+
+    dry = repo.lane(repo.a, "prune")
+    assert dry.returncode == 0, _fail(dry)
+    assert "recover" in dry.stdout, dry.stdout
+    assert repo.git(
+        "for-each-ref", "--format=%(refname)", "refs/pi-lane-prune-guard"
+    ).stdout.strip() == "", "a dry run must not write a guard ref"
+    assert repo.stash_sha() == sha, "a dry run must not change refs/stash"

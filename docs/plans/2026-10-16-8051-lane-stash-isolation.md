@@ -103,7 +103,8 @@ One primitive, in `tools/lane_stash.py`:
   BRANCH-INDEPENDENT: a lane keeps its pins when it checks out another branch to take a baseline
   (the incident that prompted this tool *was* a baseline stash), and the path hash makes two
   worktrees — or two worktrees forced onto one branch — distinct.
-- **`push`** runs `git stash push -m "lane_stash <uuid4> <message>"` (flags `-u`/`-a`/`--paths` pass
+- **`push`** runs `git stash push -m "lane_stash <nonce> [<lane-key>] <label>"` (flags
+  `-u`/`-a`/`--paths` pass
   through), then finds **our own** commit by the nonce in `git log --walk-reflogs refs/stash` — so a
   peer's push landing during our push does not mis-identify it — and pins it at
   `refs/lane/<lane-key>/stash/<n>`, allocated with a CAS create (retry on collision).
@@ -123,7 +124,9 @@ One primitive, in `tools/lane_stash.py`:
   lane ref or `[<lane-key>]` marker is decisive and OUTRANKS this lane's own pin: a cross-lane
   `recover` could otherwise leave one sha claimed by both lanes and `check` would clear a bare pop on
   a peer's work; exit 0 only when the top entry is this lane's own AND no other lane's ref or marker
-  names it, or the register is empty. Unpinned debris is reported as an
+  names it, or the register is empty AND `refs/stash` does not resolve (an emptied reflog over a
+  resolving ref is the emptied-register hazard, and `check` fails closed on it). Unpinned debris is
+  reported as an
   ADVISORY note, not a failure: a bare pop takes only the TOP entry, so failing on entries below it
   would refuse states that are genuinely safe. Safe to call from a pre-flight.
 - **`recover <sha>`** — the repair recipe from the incident: `git stash store -m "<original subject>"
