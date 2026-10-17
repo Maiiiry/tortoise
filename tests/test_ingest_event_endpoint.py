@@ -1056,6 +1056,49 @@ def test_direct_route_unreferenced_event_outdated_flag_rejected_phase1(sdk):
     assert _count(sdk, "MATCH (n:Event) RETURN count(n)") == 0
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# #7925 review P2 (a) — the `points` section has the SAME writer refusal
+# ═══════════════════════════════════════════════════════════════════════
+# `_sanitize_props` refuses `outdated` on PRESENCE for `create_point`
+# (sdk.py, the same line the entity writers hit), and ingest step 2 splats
+# every point item into it. The bundle-wide `outdated` arm above closed the
+# ENTITY writers only, so the points section was the same partial-mutation
+# class left open: right exception, already-mutated graph. Each test pins
+# BOTH halves — the Phase-1 violation AND the zero-point residue.
+
+@pytest.mark.parametrize("spelling", ["top", "nested"])
+def test_points_section_outdated_flag_rejected_phase1(sdk, spelling):
+    """The `outdated` flag on a POINT item — top-level OR the nested `props`
+    spelling `_coerce_props` flattens — is refused by the writer on presence,
+    and step 2 has no Phase-1 leg of its own for it.
+
+    Measured pre-fix at this head: `_validate_bundle({"points":
+    [{"content": "first"}, {"content": "second", "outdated": True}]})`
+    returned `[]` and `ingest` raised the writer's `ValueError` with **Point
+    1** already committed (the nested spelling identically). No connection is
+    involved, so this isolates "per bundle item" from every endpoint-shaped
+    read: Phase 1 must reject it, leaving ZERO points.
+    """
+    item = {"kind": "statement", "content": "must-not-commit"}
+    if spelling == "top":
+        item["outdated"] = True
+    else:
+        item["props"] = {"outdated": True}
+    bundle = {"points": [{"kind": "statement", "content": "first"}, item]}
+    viols = sdk._validate_bundle(bundle)
+    # The flag is the ONLY thing wrong with this bundle, and the message has
+    # to say WHERE — section and index — now that one loop serves both
+    # item sections.
+    assert [(v["section"], v["index"]) for v in viols] == [("points", 1)], viols
+    assert "declares the server-managed 'outdated' flag" in viols[0]["message"]
+    assert "points[1]" in viols[0]["message"], viols[0]["message"]
+    with pytest.raises(BundleValidationError,
+                       match="declares the server-managed 'outdated' flag"):
+        sdk.ingest(bundle)
+    # ZERO mutation — counted on the graph, not inferred from the exception
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+
+
 @pytest.mark.parametrize("spelling", ["top", "nested"])
 def test_direct_route_operator_shaped_entity_item_rejected_phase1(sdk, spelling):
     """#7925 review P1 (found in review of the bundle-wide fix, and re-found on a

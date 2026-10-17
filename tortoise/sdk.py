@@ -3571,14 +3571,14 @@ def _item_declares_outdated(item: dict) -> bool:
     ``_coerce_props`` flattens (#7925 review P1).
 
     ``_sanitize_props`` refuses the flag on PRESENCE (not truthiness) for every
-    Point/entity writer, so an item carrying it raises at write time, after the
-    earlier items committed. ``_check_endpoints`` reads this over EVERY entity
-    item, once, in Phase 1 (route- and reference-independent — see its
-    docstring), which closes that partial-mutation surface for the ENTITY
-    writers; reading both spellings here is what closes the nested form the
-    writer flattens. ⚠️ The POINTS section has the same writer refusal and NO
-    Phase-1 arm yet: that gap is pre-existing and this guard does not claim to
-    close it.
+    Point/entity writer — ``create_point`` (ingest step 2) and the entity
+    writers (step 3) alike — so an item carrying it raises at write time, after
+    the earlier items committed. ``_check_endpoints`` reads this over EVERY
+    point AND entity item, once, in Phase 1 (route- and
+    reference-independent — see its docstring), which closes that
+    partial-mutation surface for BOTH item writers from ONE Phase-1 authority;
+    reading both spellings here is what closes the nested form the writer
+    flattens.
     """
     if "outdated" in item:
         return True
@@ -3678,8 +3678,9 @@ def _bundle_entity_name_outcomes(
     entity writer, so an item carrying it raises in step 3 whichever item it
     is, whether or not a holder exists, and whether or not any connection
     references it — a name simulation therefore adds nothing, and
-    ``_check_endpoints`` refuses the flag bundle-wide, ONCE, over every entity
-    item on every route (#7925 review P1).
+    ``_check_endpoints`` refuses the flag bundle-wide, ONCE, over every point
+    and entity item on every route (#7925 review P1/P2 — one arm, both item
+    sections).
 
     ``operator_*`` is the other axis and follows the WRITER, which is neither
     "the item in hand" nor an OR over the name: ``is_operator`` rides the
@@ -14336,11 +14337,13 @@ class TortoiseSDK:
           unless a later PERSISTABLE declaration under the name clears the flag
           (``null`` and non-persistable values are dropped by the writer, so
           they clear nothing);
-        - the server-managed ``outdated`` flag on ANY entity item — referenced
-          or not, on EITHER route, for every entity type (``:Event``, and the
-          ``:Source`` a ``document`` item mints, included), because
-          ``_sanitize_props`` refuses it on PRESENCE at write time. Refused
-          bundle-wide, once, rather than per connection: see the loop below;
+        - the server-managed ``outdated`` flag on ANY point OR entity item —
+          referenced or not, on EITHER route, for every entity type
+          (``:Event``, and the ``:Source`` a ``document`` item mints,
+          included), because ``_sanitize_props`` refuses it on PRESENCE at
+          write time in BOTH item writers (``create_point`` for step 2, the
+          entity writers for step 3). Refused bundle-wide, once, rather than
+          per connection: see the loop below;
         - the direct-route terminal legs: a terminal name holder and a terminal
           ``status`` on the FIRST item naming the name (``status`` applies at
           mint only);
@@ -14352,8 +14355,9 @@ class TortoiseSDK:
         property of the ordered items plus the graph, never of one item.
         """
         # (#7925 review P1) The `outdated` flag is refused by `_sanitize_props`
-        # on PRESENCE, for EVERY entity item, on EVERY route — so its Phase-1
-        # verdict is a property of the ENTITIES alone, never of a connection.
+        # on PRESENCE, for EVERY item each item-writer takes (points in step 2,
+        # entities in step 3), on EVERY route — so its Phase-1 verdict is a
+        # property of the ITEMS alone, never of a connection.
         # Reading it per connection (direct route only, REFERENCED endpoints
         # only) left four measured shapes to raise mid-write after the point
         # items had committed: the flag on the operator route's referenced item
@@ -14361,16 +14365,37 @@ class TortoiseSDK:
         # no connection references (Point 1 / Subject 1 / Object 1) and on an
         # unreferenced `:Event` (the same 1/1/1). Step 3 writes EVERY entity
         # item in bundle order, so "not referenced" is not "not written".
-        for i, item in enumerate(bundle.get("entities") or []):
-            if isinstance(item, dict) and _item_declares_outdated(item):
+        #
+        # (#7925 review P2) The POINTS section is the SAME writer refusal, with
+        # no connection to hang a leg on at all: step 2 splats each point item
+        # into `create_point`, whose `_sanitize_props` refuses the flag on
+        # presence — while the section's OWN Phase-1 legs (shape, kind, gated
+        # status, dedup-hit terminality) never read it. Measured at this head:
+        # `_validate_bundle({"points": [{"content":"first"},
+        # {"content":"second","outdated":True}]})` returned `[]` and `ingest`
+        # raised the writer's ValueError with **Point 1** already committed (the
+        # nested `props` spelling identically) — the #2422/#7925 class exactly.
+        # ONE loop over both item sections, so ONE Phase-1 authority for the
+        # flag, and the message says which section and index to fix.
+        for section in ("points", "entities"):
+            for i, item in enumerate(bundle.get(section) or []):
+                if not (isinstance(item, dict)
+                        and _item_declares_outdated(item)):
+                    continue
+                if section == "points":
+                    refused = ("the point write refuses it on presence for "
+                               "every point item, so the bundle would raise "
+                               "in step 2 after the earlier items committed")
+                else:
+                    refused = ("the entity write refuses it on presence for "
+                               "every entity item, on every route, so the "
+                               "bundle would raise in step 3 after the "
+                               "earlier items committed")
                 violations.append({
-                    "section": "entities", "index": i,
-                    "message": f"ingest: entities[{i}] declares the "
-                               f"server-managed 'outdated' flag — the entity "
-                               f"write refuses it on presence for every "
-                               f"entity item, on every route, so the bundle "
-                               f"would raise in step 3 after the earlier "
-                               f"items committed (#7925)",
+                    "section": section, "index": i,
+                    "message": f"ingest: {section}[{i}] declares the "
+                               f"server-managed 'outdated' flag — {refused} "
+                               f"(#7925)",
                 })
         local: dict[str, tuple[str, dict]] = {}
         for section in ("sources", "points", "entities"):
@@ -14672,7 +14697,8 @@ class TortoiseSDK:
                     # (its own item IS the first item naming the name). The
                     # `outdated` half of that blind spot is order-independent
                     # and is refused bundle-wide at the TOP of `_check_endpoints`
-                    # (once, for every entity item, on every route) — the graph
+                    # (once, for every point and entity item, on every
+                    # route) — the graph
                     # write refuses it on presence, so a name simulation would
                     # add nothing there.
                     elabel = entity_labels.get(
@@ -15028,9 +15054,9 @@ class TortoiseSDK:
           PERSISTABLE ``is_operator: False`` clears it; ``null`` is dropped by
           the writer, so it clears nothing); an existing operator-shaped or
           terminal name holder is refused too. The server-managed ``outdated``
-          flag is refused bundle-wide instead — on ANY entity item, referenced
-          or not, on either route — because the entity write refuses it on
-          PRESENCE and step 3 writes every entity item. A direct-route
+          flag is refused bundle-wide instead — on ANY point or entity item,
+          referenced or not, on either route — because BOTH item writers
+          refuse it on PRESENCE and steps 2-3 write every item. A direct-route
           connection whose two endpoints resolve to the SAME name-merged node
           is a self-edge and is rejected.
           NOTE: Event entity items are append-only — re-ingesting a FULL bundle
