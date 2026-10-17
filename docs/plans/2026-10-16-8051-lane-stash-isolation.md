@@ -149,11 +149,13 @@ One primitive, in `tools/lane_stash.py`:
   git and a fail-closed wedge for `check`). Any other unpinned entry — a peer lane's, bare git's, or
   this lane's own never-applied pin-failure entry — is reported and left alone. A register can also
   DIVERGE from its ref (a bare `git reflog delete` without `--updateref` leaves `refs/stash` on a sha
-  the register no longer enumerates). `prune` **refuses** any diverged register before it builds a
-  guard or deletes anything — whether or not other refs name the head — because `reflog delete
-  --updateref` would MOVE the ref to the reflog's new top, the head cannot be re-listed (`stash
+  the register no longer enumerates). `prune` **refuses** any non-orphan diverged register before it
+  builds a guard or deletes anything — whether or not other refs name the head — because `reflog
+  delete --updateref` would MOVE the ref to the reflog's new top, the head cannot be re-listed (`stash
   store` no-ops while the ref already equals the sha, and dropping the ref would delete the whole
-  reflog with it), and the positional pre-check misreads `stash@{0}` while the ref diverges. `check`
+  reflog with it), and the positional pre-check misreads `stash@{0}` while the ref diverges. (The
+  EMPTY-register orphan is still handled by `_reclaim_orphan_refs_stash`, which is the one diverged
+  state with a safe exit.) `check`
   stays fail-closed on the state and the operator reconciles the ref deliberately.
 - **Restoration is verified, not inferred from an exit code.** `git stash store` returns 0
   *without* creating a reflog entry when `refs/stash` already points at that sha (measured) —
@@ -218,7 +220,7 @@ rule is additive.
 | 3 | Lane-scoped refs `refs/lane/<key>/stash/<n>` | State (git ref store) | In/Out | Integration | CAS create; id = path segment; gc-protected | id collision under concurrent push → retry; ref missing after pop |
 | 4 | `git stash apply <sha>` | External process | In (tree mutation) | Integration | restores tracked+staged+untracked; conflict → `UU` + rc≠0 | apply conflict must NOT delete the lane ref (work preserved); foreign sha must be unreachable by construction |
 | 5 | Per-worktree identity (`--git-dir` vs `--git-common-dir`, worktree path) | Config/State | Read | Unit | lane key from the worktree basename + path hash, branch-independent | two worktrees on one branch → distinct keys; a branch switch inside a lane must NOT orphan its pins; detached HEAD → stable key |
-| 6 | `check` exit contract | CLI contract | Out | Integration | 0 = this lane's own top entry (a `[<lane-key>]` marker, or a pinned sha) or an empty register, 1 = foreign top (another lane's marker) / an entry only a branch name could attribute / unreadable origin / unreadable register | must fail CLOSED: unreadable state ⇒ non-zero, never "safe"; unpinned debris is advisory, not a failure |
+| 6 | `check` exit contract | CLI contract | Out | Integration | 0 = this lane's own top entry (a `[<lane-key>]` marker, or a pinned sha) or an empty register, 1 = foreign top (another lane's marker) / an entry only a branch name could attribute / unreadable origin, 2 = unreadable register (a state error) | must fail CLOSED: unreadable state ⇒ non-zero, never "safe"; unpinned debris is advisory, not a failure |
 
 ### Bug Pattern Flags
 

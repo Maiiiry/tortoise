@@ -1539,3 +1539,69 @@ def test_prune_refuses_a_diverged_register_with_nothing_to_reclaim(repo, monkeyp
     assert mod.main(["prune", "--apply"]) != 0
     assert repo.stash_shas() == [y], "a diverged register is left alone"
     assert repo.stash_sha() == x
+
+
+def test_show_reports_the_published_exit_codes(repo):
+    """`show` must honour the documented exit-code set, and have coverage.
+
+    It used to return git's raw status (128) and skipped the dangling-pin guard
+    the other retrieval commands have, so a wrapper switching on 0/1/2/3
+    mis-classified it (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\nshow\n")
+    assert repo.lane(repo.a, "push", "-m", "show").returncode == 0
+    shown = repo.lane(repo.a, "show")
+    assert shown.returncode == 0, _fail(shown)
+    # a missing entry is a named state error (2), as for apply/pop
+    assert repo.lane(repo.a, "show", "99").returncode == 2
+    # a ref pointing at a commit that is NOT a stash is a git failure (3), not 128
+    ref = next(r for r in repo.lane_refs() if r.endswith("/stash/1"))
+    prefix = ref.rsplit("/", 1)[0]
+    plain = repo.git("rev-parse", "HEAD", cwd=repo.a).stdout.strip()
+    repo.git("update-ref", f"{prefix}/stash/9", plain)
+    assert repo.lane(repo.a, "show", "9").returncode == 3
+
+
+def test_list_attributes_by_lane_key_not_branch(repo):
+    """`list` must agree with `check`: ownership is the lane key, not the branch.
+
+    A branch name identifies a branch, never a lane, so a branch-only mark called
+    this lane's own pinned entry foreign after a checkout, and a same-branch
+    marker-less peer entry safe (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\nown\n")
+    assert repo.lane(repo.a, "push", "-m", "own").returncode == 0
+    repo.git("checkout", "-q", "-b", "baseline-check", cwd=repo.a)
+    listed = repo.lane(repo.a, "list")
+    assert listed.returncode == 0
+    assert "not provably this lane's" not in listed.stdout, listed.stdout
+
+    # a marker-less bare entry on the SAME branch must not read as safe
+    repo.dirty(repo.a, "f.txt", "base\nbare\n")
+    repo.git("stash", "push", "-q", "-m", "Bare local note", cwd=repo.a)
+    listed = repo.lane(repo.a, "list")
+    assert "FOREIGN?" in listed.stdout, listed.stdout
+    assert "not provably this lane's" in listed.stdout, listed.stdout
+    assert repo.lane(repo.a, "check").returncode == 1
+
+
+def test_prune_dry_run_refuses_a_diverged_register(repo, monkeypatch, capsys):
+    """The diverged-register refusal must not be gated on --apply.
+
+    The refusal is unconditional; a mutation re-restricting it to --apply leaves
+    every other test green (#8773 review P3).
+    """
+    mod = _load_tool()
+    repo.dirty(repo.b, "f.txt", "base\ny\n")
+    repo.git("stash", "push", "-q", "-m", "y", cwd=repo.b)
+    y = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nx\n")
+    repo.git("stash", "push", "-q", "-m", "x", cwd=repo.b)
+    x = repo.stash_sha()
+    repo.git("reflog", "delete", "refs/stash@{0}")
+    assert repo.stash_shas() == [y]
+    assert repo.stash_sha() == x
+    monkeypatch.chdir(repo.a)
+    capsys.readouterr()
+    assert mod.main(["prune"]) != 0, "a dry run must refuse a diverged register too"
+    assert repo.stash_shas() == [y]

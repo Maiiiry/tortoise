@@ -99,8 +99,9 @@ USAGE
     python tools/lane_stash.py recover <sha>      # the #2654 repair recipe
 
 Exit codes: 0 ok (including "nothing to stash", matching ``git stash push``);
-1 ``check`` found a foreign top entry; 2 environment/state error; 3 a git
-operation failed (push failure, apply conflict, missing object).
+1 ``check`` found a foreign top entry; 2 environment/state error (including a
+dangling lane pin or an unreadable register); 3 a git operation failed (push
+failure, apply conflict, show failure).
 """
 from __future__ import annotations
 
@@ -683,16 +684,29 @@ def cmd_list(args: argparse.Namespace) -> int:
           f"{'y' if len(rows) == 1 else 'ies'})")
     if not rows:
         print("  (empty)")
-    branch = current_branch()
+    # Attribute ownership the SAME way `check` does — by lane key, not by branch.
+    # A branch name identifies a branch, never a lane (two worktrees can be forced
+    # onto one branch), so a branch-only mark contradicts `check` on the same
+    # state: it calls this lane's own pinned entry foreign after a checkout, and
+    # a same-branch peer's entry safe (#8773 review P2).
+    entries_shas = {e["sha"] for e in entries}
+
+    def _own(r: dict) -> bool:
+        return r["sha"] in entries_shas or _subject_lane_key(r["subject"]) == key
+
+    top = rows[0] if rows else None
+    top_own = _own(top) if top is not None else False
     for r in rows:
         if r["pinned"]:
             mark = "pinned  "
-        elif r["branch"] == branch:
-            mark = "UNPINNED"
-        else:
+        elif _own(r):
+            mark = "OWN     "
+        elif _subject_lane_key(r["subject"]) is not None:
             mark = "FOREIGN "
-        star = "  <-- a bare `git stash pop` here would take THIS" if r is rows[0] and (
-            r["branch"] != branch or not r["branch"]) else ""
+        else:
+            mark = "FOREIGN?"  # no marker: origin cannot be established
+        star = ("  <-- a bare `git stash pop` here would take THIS"
+                if r is top and not top_own else "")
         print(f"  {r['pos']:<11} {r['sha'][:12]}  {mark}  {r['subject']}{star}")
 
     guards = _guard_refs(key)
@@ -711,8 +725,8 @@ def cmd_list(args: argparse.Namespace) -> int:
             else:
                 note = "  (no other ref names it)"
             print(f"  {sha[:12]}  {ref}{note}")
-    if rows and (rows[0]["branch"] != branch or not rows[0]["branch"]):
-        print("\n⚠️  the top shared entry is not this lane's — use `lane_stash pop <id>`, "
+    if top is not None and not top_own:
+        print("\n⚠️  the top shared entry is not provably this lane's — use `lane_stash pop <id>`, "
               "never a bare `git stash pop` (see `lane_stash check`).")
     return 0
 
@@ -758,6 +772,11 @@ def cmd_pop(args: argparse.Namespace) -> int:
 def cmd_show(args: argparse.Namespace) -> int:
     key = lane_key()
     entry = _entry(key, args.entry)
+    if not _commit_alive(entry["sha"]):
+        raise LaneStashError(
+            f"entry {entry['id']} ({entry['ref']}) points at {entry['sha']}, which is no "
+            "longer in the object database — there is nothing to show"
+        )
     cmd = ["stash", "show"]
     if args.patch:
         cmd.append("-p")
@@ -765,7 +784,12 @@ def cmd_show(args: argparse.Namespace) -> int:
     cp = _git(*cmd, check=False)
     sys.stdout.write(cp.stdout)
     sys.stderr.write(cp.stderr)
-    return cp.returncode
+    if cp.returncode != 0:
+        # Keep the published exit-code set: a git failure is 3, not git's raw
+        # status (128), and a dangling pin is the same named state error as
+        # `apply`/`pop` (#8773 review P2).
+        raise GitFailed(cp.returncode, "git stash show failed")
+    return 0
 
 
 def cmd_drop(args: argparse.Namespace) -> int:
