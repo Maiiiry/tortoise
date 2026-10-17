@@ -58,12 +58,15 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.12'
-          # Pinned to the version that generated uv.lock — a patch bump can flag
-          # the lock as stale under `uv run`'s implicit sync.
           version: '0.12.3'
       - name: The pin is honest, current and complete against the MIT repo (#4643)
+        # `--no-project`: the script's only third-party import is pyyaml, so a
+        # full project sync (numpy/scipy/fastapi/falkordb plus the dev group)
+        # would be paid for nothing — and would bring CI's stale-`.venv` failure
+        # mode (#1917) into a gate that must fail on SKILL BYTES.
         run: |
-          uv run python tools/served_skills_parity.py --check-upstream \
+          uv run --no-project --with pyyaml==6.0.3 python3 \
+            tools/served_skills_parity.py --check-upstream \
             --report skills-parity-report.md
         env:
           # The upstream `skills/` listing is the one GitHub API call in the

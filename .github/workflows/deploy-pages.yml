@@ -699,7 +699,14 @@ jobs:
           python-version: '3.12'
           version: '0.12.3'
       - name: Served-skill mirror is current with the MIT repo that authors it (#4643)
-        run: uv run python tools/served_skills_parity.py --check-upstream
+        # `uv run` NORMALLY means "sync the project env, then run" — with the dev
+        # group that is numpy/scipy/fastapi/falkordb/jax/scikit-learn/playwright on
+        # the critical path of EVERY dashboard deploy (the same 1-3 min cold sync
+        # measured in python-ci.yml), to execute a script whose only third-party
+        # import is pyyaml. `--no-project` also removes CI's stale-`.venv` failure
+        # mode (#1917), where uv refuses a pre-existing directory and the job dies
+        # before any gate logic runs. Same form as deploy-hosted.yml:510.
+        run: uv run --no-project --with pyyaml==6.0.3 python3 tools/served_skills_parity.py --check-upstream
         env:
           # Raises the GitHub API rate limit for the upstream `skills/` listing
           # (60/hour unauthenticated, 5000/hour with a token). The tool uses it
