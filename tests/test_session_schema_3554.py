@@ -830,6 +830,11 @@ def test_undercount_query_aggregates_the_two_legs_separately() -> None:
 # ── the recorded decisions must have a real home ───────────────────────────
 
 ONTOLOGY = REPO_ROOT / "docs/ONTOLOGY.md"
+# The changelog prose moved out of `ONTOLOGY.md` into its sibling (#8745), so a
+# `Changelog vX.Y` header is read from there — the model file no longer carries
+# one, and pinning the header's home to `ONTOLOGY.md` would fail on a document
+# that is correct.
+ONTOLOGY_CHANGELOG = REPO_ROOT / "docs/ONTOLOGY-CHANGELOG.md"
 PLAN = REPO_ROOT / "docs/plans/2026-08-25-1714-memory-capture-onboarding.md"
 
 
@@ -867,7 +872,7 @@ def test_section_4_8_changelog_entry_sits_under_its_own_version_block() -> None:
     to the wrong version. The document is v3.24 (2026-10-12), so the entry
     sits under the v3.24 header.
     """
-    ontology = ONTOLOGY.read_text(encoding="utf-8")
+    ontology = ONTOLOGY_CHANGELOG.read_text(encoding="utf-8")
     bullet = ontology.index("§4.8 (added by #3554")
     header = ontology.rindex("> **Changelog v3.", 0, bullet)
     header_line = ontology[header:ontology.index("\n", header)]

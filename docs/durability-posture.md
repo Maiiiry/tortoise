@@ -120,6 +120,8 @@ build whose read set excludes it refuses on a retired file until it is deleted.
 |---|---|
 | `:PackInstall` | `namespace` |
 | `:PackManifest` | `namespace` |
+| `:Pipeline` | `pipelineKey` |
+| `:PipelineStage` | `stageKey` (composite `pipelineKey\|stageId` — the declared `stageId` is pack-local, so two pipelines may share one) |
 | `:Meta{key:'calibration_milestone'}` | `key` |
 | `:Meta{key:'config_reset'}` | `key` |
 | `:Meta{key:'residency'}` | `key` |
@@ -353,6 +355,10 @@ MATCH (p:PackInstall) RETURN 'PackInstall' AS cls, p.namespace AS ident
 UNION ALL
 MATCH (m:PackManifest) RETURN 'PackManifest' AS cls, m.namespace AS ident
 UNION ALL
+MATCH (p:Pipeline) RETURN 'Pipeline' AS cls, p.pipelineKey AS ident
+UNION ALL
+MATCH (s:PipelineStage) RETURN 'PipelineStage' AS cls, s.stageKey AS ident
+UNION ALL
 MATCH (x:Meta) WHERE x.key IN ['calibration_milestone', 'config_reset', 'residency']
 RETURN 'Meta' AS cls, x.key AS ident
 UNION ALL
@@ -438,8 +444,9 @@ false):
 | `url` | **RECORDED** | The merge key — the node's identity (§9.4: a canonicalised URL, never an embedding). `_upsert_source`/the fold resolve it through the shared `resolve_source_key`, so a variant spelling replays onto the ONE node. |
 | `id` | RECORDED | Identity companion. |
 | `canonicalUrl`, `urlAliases` | **RECOMPUTABLE** | Reproduced from the record sequence by the shared resolver (`normalize_source_url` + the #5012 S0b alias append), so a URL variant replays onto the ONE canonical node with the same alias list. Not *stored* — there is no separate record for them. |
-| **`contentHash`** | **RECORDED** | **The version anchor — and the reason this is not a class-level claim.** A re-fetch *changes* it by definition, so “recompute it” would recompute the thing the record is keyed on. **#3998**, still open, **proposes** raw-absent/erased as a third value on the same record. |
+| **`contentHash`** | **RECORDED** | **The version anchor — and the reason this is not a class-level claim.** A re-fetch *changes* it by definition, so “recompute it” would recompute the thing the record is keyed on. The raw-availability axis (**#3998**, landed) is a third value on the same record. |
 | `version` | RECORDED | The live writer's own ordinal. Counting prior records instead would be a second derivation with its own failure modes. |
+| `rawState`, `rawStateAt` | **RECORDED** | **The raw-availability axis** (§4.6; **#3998**, landed — owner ruling Option A, 2026-10-14). `rawState` is the recorded act (`present` / `deleted`) and `rawStateAt` is the instant it was recorded — minted on every state-carrying write, not only a deletion. Written by `create_source`/`_upsert_source` and replayed from the `SourceCreated` / `SourceVersioned` records. A `deleted` marker is bounded by `raw_state.RAW_DELETION_MARKER_TTL` (10 days; window registered in `docs/retention-and-deletion.md`). |
 | `updatedAt` | **RECORDED** | The instant the transition happened. Minted **once** by the producer and carried on the record; a replay that read `_now_iso()` diverged live vs rebuilt (measured ...57.016262 vs ...57.079810). Legacy records without it `coalesce` to the replay clock. |
 | `ingestedAt` | **RECORDED** | The pipeline-arrival instant (§4.6: the documented proxy for the evidence-age clock). Same divergence, same fix (measured ...56.751580 vs ...57.047168). |
 | `sourceKind`, `title`, `externalId`, `sourcePath` | RECORDED | Caller-asserted. `sourcePath` is the sanctioned `source_path=` route only (§4.1). |

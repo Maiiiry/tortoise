@@ -150,6 +150,10 @@ SESSION_PROPERTIES: tuple[str, ...] = (
     "model",
     "client_captured_at",
     "client_captured_at_source",
+    # #3516 §D: the transcript stem the capture came from — set-if-absent
+    # beside the client-instant pair, because a later store-sync backstop must
+    # never relabel the stem the hook observed (#8798).
+    "source",
     "capture_redactions",
     # ── extraction-attempt outcome ──
     "capture_ok",
@@ -177,7 +181,7 @@ SESSION_WRITERS: tuple[SessionWriter, ...] = (
         properties=frozenset({
             "created_at", "turn_count", "is_episodic", "harness",
             "capture_lane", "actor_user_id", "machine_id", "model",
-            "client_captured_at", "client_captured_at_source",
+            "client_captured_at", "client_captured_at_source", "source",
         }),
         note=(
             "The ONE capture writer (#3551). `created_at`/`capture_lane`/"
@@ -308,7 +312,7 @@ SESSION_WRITERS: tuple[SessionWriter, ...] = (
         properties=frozenset({
             "created_at", "capture_lane", "turn_count", "harness",
             "is_episodic", "actor_user_id",
-            "client_captured_at", "client_captured_at_source",
+            "client_captured_at", "client_captured_at_source", "source",
             "entity_links_attempted", "entity_links_created",
             "capture_ok", "capture_extractor", "capture_redactions",
         }),

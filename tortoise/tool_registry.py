@@ -590,10 +590,13 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
         name="tortoise_events_poll",
         id="surface.events_poll",
         description="Poll graph/claim events after an opaque cursor (at-least-once). "
-                    "Returns {events, next_cursor}. Event types: 11 registered claim "
+                    "Returns {events, next_cursor}. Event types: 12 registered claim "
                     "types (PointAdded, OperatorAdded, PointRetracted, PointSuperseded, "
                     "OperatorAnnotated, PointPromoted, OperatorPromoted, DedupeRecorded, "
-                    "DedupeRejected, ObjectSuperseded, PointInvalidated).",
+                    "DedupeRejected, ObjectSuperseded, PointInvalidated, PointRevised). "
+                    "PointRevised reaches the store, and the response adds `changes` "
+                    "(per-claim before→after deltas), only while TORTOISE_CHANGE_FEED "
+                    "is enabled.",
         annotations=_ro(),
         http_policy=True,
         sdk_method="poll_events",
@@ -1067,8 +1070,13 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
         writes=True,
         description="Create an entity — type: subject|object|event|document. "
                     "Event entities wire about* edges from aboutSubject/aboutObject/"
-                    "aboutPoint/aboutDocument props. Returns {node, nudges} — nudges "
-                    "suggest IMPL/NAND/mitigate connections to related Points (advisory).",
+                    "aboutPoint/aboutDocument props. Returns {node, nudges, "
+                    "advisories?} — nudges suggest IMPL/NAND/mitigate connections "
+                    "to related Points; advisories notes a write that declared no "
+                    "source and no provenance (advisory only, never a block). "
+                    "For type='document', declaring extractedFrom materializes "
+                    "the :Source (#8171); on subject/object/event it is inert "
+                    "and an extracted_from_inert advisory is returned.",
         annotations=_rw(),
         http_policy=True,
         sdk_method="create_entity",
