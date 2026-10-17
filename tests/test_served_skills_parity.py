@@ -15,20 +15,22 @@ Two halves, and the split is deliberate:
   via the `onboarding` + `core` surfaces and `tier1`.
 * **non-vacuity** (the `check_upstream` tests below) — the pin is HONEST (the
   pinned commit really hashes to it) and CURRENT (the bytes at upstream `main`
-  HEAD are still the pinned bytes). A pin-only gate is vacuous — pin any old
-  commit and "byte-identical" becomes true of history — so these tests prove the
-  currency arm is wired to the pin rather than the other way round. They
-  monkeypatch the two network functions.
+  HEAD are still the pinned bytes) and has the right SCOPE (upstream `skills/`
+  is exactly the pin's keys, so an upstream ADDITION/REMOVAL is reported rather
+  than invisible). A pin-only gate is vacuous — pin any old commit and
+  "byte-identical" becomes true of history — so these tests prove the currency
+  arm is wired to the pin rather than the other way round. They monkeypatch the
+  network seams (`remote_head`, `fetch_raw`, `list_upstream_skills`), so the
+  suite stays offline.
 
-⛔ WHAT IS NOT TESTED HERE, BECAUSE IT IS NOT IN THIS TREE. The wiring that would
-RUN `--check-upstream` — a step in `deploy-pages.yml` before the build stages
-`public/`, and a scheduled `skills-parity.yml` that auto-files — is a
-`.github/workflows/*` change this lane's credential cannot push (#8129). So those
-assertions live with that change, and this file asserts the *honest limit*
-instead (`test_4643_the_ownership_statement_names_one_repo_per_artifact`): §7.1
-must name #8129 as the pending blocker rather than describe the arm as running.
-When the wiring lands, that assertion flips to requiring the two workflows — the
-handoff is a red test, not a stale sentence.
+WIRING (target 4). `--check-upstream` must have a runner, or the whole
+upstream half is decoration: a served copy edited in place *plus* a hand-cut pin
+hash used to pass everything. Two runners execute it — the `deploy-dashboard`
+job of `deploy-pages.yml` and the daily `skills-parity.yml` — and the assertions
+below derive that fact from the WORKFLOW CONTENTS rather than from one hardcoded
+filename, so a lane that lands only one of them is forced to be honest about it
+instead of red-ing. `docs/license-notes.md` §7.1 must name whichever runners
+exist, and must name no runner that does not.
 
 The pin itself carries no assertion here: `test_4643_the_pin_covers_exactly_the_
 installed_set` ties it to the installer's `SKILLS=(...)` array, so a fourth
@@ -39,6 +41,7 @@ cannot be dropped from the installer) — the same ratchet shape
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -46,6 +49,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -192,6 +196,8 @@ def _must_change(text: str, needle: str, replacement: str) -> str:
     ("bytes_not_int", "not an integer"),
     ("entry_not_mapping", "skills.tortoise-decide must be a mapping"),
     ("path_not_a_string", "upstream_path must be a non-empty string"),
+    ("out_of_scope_not_a_list", "must be a list"),
+    ("out_of_scope_overlaps_pin", "BOTH pinned and out_of_scope"),
 ])
 def test_4643_an_unreadable_pin_fails_closed(tmp_path, mutation, expect):
     """Every malformed pin RAISES. The failure a lenient parse would produce is
@@ -238,6 +244,12 @@ def test_4643_an_unreadable_pin_fails_closed(tmp_path, mutation, expect):
             text = _must_change(
                 text, f"    upstream_path: {decide['upstream_path']}",
                 f"    upstream_path: [{decide['upstream_path']}]")
+        elif mutation == "out_of_scope_not_a_list":
+            text = text + "out_of_scope: research-domain\n"
+        elif mutation == "out_of_scope_overlaps_pin":
+            # A skill cannot be both served and excluded: that declaration reads
+            # as an exclusion while the pin still fetches and compares it.
+            text = text + "out_of_scope:\n  - tortoise-decide\n"
         path.write_text(text, encoding="utf-8")
 
     with pytest.raises(sp.ParityError, match=re.escape(expect)):
@@ -275,18 +287,32 @@ def test_4643_the_pins_byte_count_is_checked_not_decorative(monkeypatch, tmp_pat
 # ── the currency arm: prove it is not vacuous ──────────────────────────────
 
 def _pin_upstream(monkeypatch, manifest, head: str, payloads: dict[str, bytes],
-                  head_payloads: dict[str, bytes] | None = None):
-    """Patch the two network seams.
+                  head_payloads: dict[str, bytes] | None = None,
+                  pin_listing: list[str] | None = None,
+                  head_listing: list[str] | None = None):
+    """Patch the network seams (`remote_head`, `fetch_raw`, `list_upstream_skills`).
 
     ``payloads`` are the bytes at the PINNED commit; ``head_payloads`` (default:
     the same) are the bytes at ``head``. The currency arm fetches BOTH, so a
     test that only moves the pointer is not exercising a drift.
+
+    ``pin_listing``/``head_listing`` are the upstream `skills/` DIRECTORY names
+    at those commits; the default is the honest answer (exactly the pin's keys),
+    so every byte-arm case below exercises bytes and not scope.
     """
     at_head = payloads if head_payloads is None else head_payloads
+    pinned = manifest["upstream"]["commit"]
+    default_listing = sorted(manifest["skills"])
     monkeypatch.setattr(sp, "remote_head", lambda *a, **k: head)
     monkeypatch.setattr(
         sp, "fetch_raw",
         lambda repo, commit, path, *a, **k: (at_head if commit == head else payloads)[path])
+    monkeypatch.setattr(
+        sp, "list_upstream_skills",
+        lambda repo, commit, *a, **k: (
+            (pin_listing if pin_listing is not None else default_listing)
+            if commit == pinned
+            else (head_listing if head_listing is not None else default_listing)))
 
 
 def test_4643_an_upstream_push_past_the_pin_is_the_stale_mirror(monkeypatch, tmp_path):
@@ -564,46 +590,331 @@ def test_4643_json_is_one_document_on_the_green_path(capsys):
         "stays a single JSON document")
 
 
-# ── the ownership record (target 3) ───────────────────────────────────────
+# ── the pin's SCOPE: an upstream addition/removal is not invisible ────────
+#
+# Both byte arms iterate the PIN's keys, so on their own a new upstream
+# `skills/<name>/SKILL.md` is never fetched, never mirrored and never reported —
+# the pin would describe a smaller set than the repo it claims to mirror.
+
+def _payloads(manifest: dict) -> dict[str, bytes]:
+    return {e["upstream_path"]: (REPO / e["served_path"]).read_bytes()
+            for e in manifest["skills"].values()}
 
 
-def test_4643_the_ownership_statement_names_one_repo_per_artifact():
-    """Target 3. The two channels disagreed about who authors what — the served
-    installer claimed the canonical sources live in `daniel-ospina/tortoise`
-    while the MIT repo claimed itself — and that ambiguity is what produced the
-    duplicate authoring in the first place."""
-    installer = INSTALLER.read_text(encoding="utf-8")
-    assert "tortoise-skills-and-integrations" in installer, (
-        "the served installer's header must name the MIT repo as the authored "
-        "source of the three reusable capabilities (#4643 target 3)")
-    assert "tortoise/onboarding/SKILL.md" in installer, (
-        "…and name this repo for the artifact it DOES author (the onboarding "
-        "instructions), so a contributor knows which repo to edit")
+def test_4643_an_upstream_addition_is_reported_not_invisible(monkeypatch, tmp_path):
+    """Review finding (P2), measured: add an upstream `skills/newcapability/`
+    and NOTHING reds — not the mirror arm (it iterates the pin), not the
+    currency arm (it fetches only the pinned paths), not any test."""
+    manifest = sp.load_manifest(MANIFEST)
+    root = _mirror_root(tmp_path, manifest)
+    payloads = _payloads(manifest)
+    _pin_upstream(monkeypatch, manifest, "f" * 40, payloads, dict(payloads),
+                  head_listing=[*sorted(manifest["skills"]), "newcapability"])
+
+    problems = sp.check_upstream(manifest, root)
+    assert len(problems) == 1, problems
+    assert "upstream added 'skills/newcapability'" in problems[0], problems
+    assert "out of scope" in problems[0], (
+        "the message must name BOTH ways out — pin it, or record it as "
+        "out of scope — or the only legal answer reads as 'mirror it'")
+
+
+def test_4643_an_upstream_removal_is_reported_as_stale_not_as_a_404(
+        monkeypatch, tmp_path):
+    """A pinned skill deleted upstream: without the scope check the byte arm
+    fetches a 404, which the CLI reports as *cannot verify* — a real, actionable
+    drift misclassified as a network problem."""
+    manifest = sp.load_manifest(MANIFEST)
+    root = _mirror_root(tmp_path, manifest)
+    payloads = _payloads(manifest)
+    listing = [n for n in sorted(manifest["skills"]) if n != "tortoise-file-finding"]
+    _pin_upstream(monkeypatch, manifest, "f" * 40, payloads, dict(payloads),
+                  head_listing=listing)
+
+    problems = sp.check_upstream(manifest, root)
+    assert len(problems) == 1, problems
+    # Read the path from the pin rather than spelling it: a bare
+    # `skills/<served-name>` literal is the shape
+    # `tests/test_8066_served_skill_relay_ratchet.py` rejects, because it is
+    # indistinguishable from a read through the machine-local relay (#8066).
+    removed = Path(
+        manifest["skills"]["tortoise-file-finding"]["upstream_path"]).parent.as_posix()
+    assert f"upstream removed '{removed}'" in problems[0], problems
+    assert "STALE" in problems[0], problems
+
+
+def test_4643_a_pin_that_names_a_skill_its_own_commit_lacks_reds(
+        monkeypatch, tmp_path):
+    """The scope is checked at the PINNED commit too: the pin lying about what
+    its own commit contains is a pin defect, not a 404 to be retried."""
+    manifest = sp.load_manifest(MANIFEST)
+    root = _mirror_root(tmp_path, manifest)
+    payloads = _payloads(manifest)
+    listing = [n for n in sorted(manifest["skills"]) if n != "tortoise-decide"]
+    _pin_upstream(monkeypatch, manifest, "f" * 40, payloads, dict(payloads),
+                  pin_listing=listing, head_listing=listing)
+
+    problems = sp.check_upstream(manifest, root)
+    assert len(problems) == 1, problems
+    assert "NAMES a skill its own commit does not contain" in problems[0], problems
+    named = Path(
+        manifest["skills"]["tortoise-decide"]["upstream_path"]).parent.as_posix()
+    assert named in problems[0]
+
+
+def test_4643_out_of_scope_records_a_deliberate_exclusion(monkeypatch, tmp_path):
+    """The escape hatch the message names must WORK, or the only options for a
+    converged-but-unserved upstream skill are a false pin or a permanently red
+    gate."""
+    manifest = sp.load_manifest(MANIFEST)
+    manifest["out_of_scope"] = ["research-domain"]
+    root = _mirror_root(tmp_path, manifest)
+    payloads = _payloads(manifest)
+    listing = [*sorted(manifest["skills"]), "research-domain"]
+    _pin_upstream(monkeypatch, manifest, manifest["upstream"]["commit"], payloads,
+                  pin_listing=listing)
+
+    assert sp.check_upstream(manifest, root) == [], (
+        "a declared out_of_scope upstream skill is not a drift — the declaration "
+        "is the recorded decision the gate is asking for")
+
+
+def test_4643_a_stale_out_of_scope_declaration_reds(monkeypatch, tmp_path):
+    """The converse: `out_of_scope:` naming an upstream skill that no longer
+    exists is a stale declaration — it must be cleaned up, not carried forever
+    as a line that silently widens the expected set."""
+    manifest = sp.load_manifest(MANIFEST)
+    manifest["out_of_scope"] = ["gone-skill"]
+    root = _mirror_root(tmp_path, manifest)
+    payloads = _payloads(manifest)
+    _pin_upstream(monkeypatch, manifest, manifest["upstream"]["commit"], payloads)
+
+    problems = sp.check_upstream(manifest, root)
+    assert len(problems) == 1, problems
+    assert "out_of_scope" in problems[0] and "gone-skill" in problems[0], problems
+
+    # …and at HEAD: a skill once excluded that upstream has since DELETED must
+    # be dropped from the declaration, or `out_of_scope:` widens the expected
+    # set with names nothing can match.
+    _pin_upstream(monkeypatch, manifest, "f" * 40, payloads, dict(payloads),
+                  pin_listing=[*sorted(manifest["skills"]), "gone-skill"])
+    head_problems = sp.check_upstream(manifest, root)
+    assert len(head_problems) == 1, head_problems
+    assert "gone-skill" in head_problems[0] and "HEAD" in head_problems[0]
+
+
+# ── the CLI exit code: the only thing a workflow step reads ───────────────
+
+def test_4643_the_cli_exits_nonzero_on_drift(tmp_path, capsys):
+    """Review finding (P2), measured: changing the problems branch's `return 1`
+    to `return 0` left 31/31 green. A gate whose failing branch returns 0 is a
+    gate that never gates — the runner is `uv run python … --check-upstream`,
+    so the EXIT CODE is the whole verdict."""
+    manifest = sp.load_manifest(MANIFEST)
+    root = _mirror_root(tmp_path, manifest)
+    victim = manifest["skills"]["tortoise-decide"]["served_path"]
+    (root / victim).write_bytes(b"# edited in place, not re-derived\n")
+
+    rc = sp.main(["--check-local", "--root", str(root),
+                  "--manifest", str(MANIFEST), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1, "a drift MUST exit non-zero — that is what reds the step"
+    assert payload["ok"] is False, payload
+    assert payload["problems"], payload
+    assert "DRIFTED" in payload["problems"][0], payload
+    assert payload["cannot_verify"] == [], (
+        "a byte drift is not an unreadable side — the two must not be conflated")
+
+
+def test_4643_the_cli_exits_nonzero_when_it_cannot_verify(monkeypatch, capsys):
+    """A side that cannot be READ must fail the step (never silently pass) and
+    must NOT be reported as drift: a monitor keying on `problems` would
+    auto-file a false 'the served mirror drifted' P2 for a network blip."""
+    def _boom(*a, **k):
+        raise sp.ParityError("upstream unreachable: connection reset (3 attempts)")
+
+    monkeypatch.setattr(sp, "remote_head", _boom)
+    rc = sp.main(["--check-upstream", "--root", str(REPO),
+                  "--manifest", str(MANIFEST), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1, "cannot-verify must FAIL — a gate that passes blind is #3673"
+    assert payload["ok"] is False
+    assert payload["problems"] == [], (
+        "…and it is NOT drift: reporting it as drift auto-files a false alarm "
+        "about bytes nobody compared")
+    assert payload["cannot_verify"] and "unreachable" in payload["cannot_verify"][0]
+
+
+# ── the ownership record (target 3) + the wiring (target 4) ───────────────
+
+WORKFLOWS = REPO / ".github" / "workflows"
+
+
+def _section_71() -> str:
+    """§7.1's body — the ownership RULE, the table a reader acts on, AND the
+    wiring sentence the docs/runner assertions read (so the cut is on the next
+    HEADING, not on the next bold paragraph)."""
     notes = (REPO / "docs" / "license-notes.md").read_text(encoding="utf-8")
-    # ⛔ §7.1, not §7: the ownership RULE this issue adds is §7.1, and §7 alone
-    # matched before this PR — so "## 7." would still pass with §7.1 deleted.
-    assert "### 7.1" in notes and "tortoise-skills-and-integrations" in notes
-    assert "config/served-skills-upstream.yml" in notes, (
-        "the ownership record must name the pin that enforces it")
-    # CLAIM-MISMATCH GUARD (review finding, P1/P2): §7.1 must not describe the
-    # upstream arm as RUNNING while no workflow invokes it. The runner is a
-    # `.github/workflows/*` change this lane cannot push (#8129), so the record
-    # names that blocker — and this assertion makes the pending state
-    # load-bearing instead of prose. ⛔ When the wiring lands, flip this to
-    # require `deploy-pages.yml` + `skills-parity.yml` to exist AND run
-    # `--check`; the red test is the handoff.
-    if not (REPO / ".github" / "workflows" / "skills-parity.yml").is_file():
-        assert "#8129" in notes, (
-            "§7.1 names the upstream arm without a workflow that runs it — until "
-            "the wiring lands it must name #8129 as the pending blocker (docs "
-            "must not promise enforcement nothing runs)")
-        assert "not yet wired" in notes, (
-            "§7.1 must say the arm is not yet wired, in the tense a reader can "
-            "rely on")
-    else:
-        # The wiring IS in the tree (the authorized lane pushed #8129): §7.1 then
-        # owes the present-tense claim, and the runners it names must exist.
-        for runner in ("deploy-pages.yml", "skills-parity.yml"):
-            assert runner in notes, (
-                f"§7.1 must name {runner} as a runner of the gate now that it exists")
-            assert (REPO / ".github" / "workflows" / runner).is_file()
+    start = notes.index("### 7.1")
+    nxt = notes.find("\n### ", start + 1)
+    return notes[start:] if nxt == -1 else notes[start:nxt]
+
+
+def _table_rows(section: str) -> list[list[str]]:
+    """The §7.1 markdown table's data rows, cells stripped."""
+    rows: list[list[str]] = []
+    for line in section.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(set(cell) <= set("-: ") for cell in cells):  # the |---|---| rule
+            continue
+        if cells[0] == "Artifact":  # header
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _artifacts(cell: str) -> set[str]:
+    return set(re.findall(r"`([^`]+)`", cell))
+
+
+def test_4643_the_ownership_table_states_the_rule_per_artifact():
+    """Target 3, and it must be the TABLE — not a sentence that happens to sit
+    near one.
+
+    Review finding (P2), measured: replacing `### 7.1`→EOF with a four-token
+    line still left 31/31 green, because the old assertion grepped two
+    substrings. The rule is a MAPPING (artifact set → authoring repo), so the
+    assertion is over the parsed rows: a deleted or inverted table must red.
+    """
+    section = _section_71()
+    rows = _table_rows(section)
+    assert rows, (
+        "§7.1 must carry the ownership TABLE (`| Artifact | Authored in | "
+        "Enforced by |`) — prose is not a rule a contributor can act on")
+    pinned = set(sp.load_manifest(MANIFEST)["skills"])
+
+    # 1. The three served-and-pinned capabilities are authored in the MIT repo.
+    capabilities = [r for r in rows if _artifacts(r[0]) == pinned]
+    assert len(capabilities) == 1, (
+        f"§7.1 needs exactly ONE row whose artifact set is the pin's {sorted(pinned)}; "
+        f"found {[r[0] for r in rows]}")
+    row = capabilities[0]
+    assert "daniel-ospina/tortoise-skills-and-integrations" in row[1], (
+        "that row's `Authored in` must name the MIT repo — inverted, it is the "
+        "duplicate-authoring defect this rule exists to end: " + row[1])
+    assert "config/served-skills-upstream.yml" in row[2], (
+        "…and its `Enforced by` must name the pin: " + row[2])
+
+    # 2. The installer is authored HERE (#3324 moved its source of truth out of
+    # the MIT repo because that copy went stale) — the mirror image of row 1.
+    installer = [r for r in rows if _artifacts(r[0]) == {"install-tortoise-skills.sh"}]
+    assert len(installer) == 1, (
+        f"§7.1 needs a row for `install-tortoise-skills.sh`; rows: "
+        f"{[r[0] for r in rows]}")
+    assert "daniel-ospina/tortoise" in installer[0][1], (
+        "the installer is authored in daniel-ospina/tortoise: " + installer[0][1])
+    assert "tortoise-skills-and-integrations" not in installer[0][1], (
+        "the installer's `Authored in` must NOT name the MIT repo — that is the "
+        "inversion #3324 corrected")
+
+    # 3. Onboarding: authored here, gated by the byte-identity test + cmp.
+    onboarding = [r for r in rows if _artifacts(r[0]) == {"tortoise-onboarding"}]
+    assert len(onboarding) == 1, f"§7.1 needs a row for tortoise-onboarding: {rows}"
+    assert "daniel-ospina/tortoise" in onboarding[0][1], onboarding[0][1]
+
+
+def _run_bodies(doc: dict) -> list[str]:
+    return [step["run"]
+            for job in (doc.get("jobs") or {}).values() if isinstance(job, dict)
+            for step in (job.get("steps") or []) if isinstance(step, dict)
+            if isinstance(step.get("run"), str)]
+
+
+def _commented_out(text: str) -> str:
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+def _upstream_runners() -> dict[str, dict]:
+    """Workflows that EXECUTE `--check-upstream`, derived from workflow
+    CONTENTS — the definition of "wired" that survives a rename, and that does
+    not force a lane landing only the deploy-time step to lie about it (review
+    finding, P2)."""
+    runners: dict[str, dict] = {}
+    for path in sorted({*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")}):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if any("served_skills_parity" in _commented_out(body)
+               and "--check-upstream" in _commented_out(body)
+               for body in _run_bodies(doc)):
+            runners[path.name] = doc
+    return runners
+
+
+def test_4643_the_upstream_arm_has_a_runner_and_the_docs_name_it():
+    """Target 4 — the P1: the gate never compared against the MIT repo, because
+    NO RUNNER executed `--check-upstream`. Both arms then lived in this repo, so
+    an in-place served edit plus a hand-cut pin hash passed everything.
+
+    Asserted from workflow CONTENTS, in both directions: every runner that
+    exists is named in §7.1, and every workflow §7.1 names exists. A doc that
+    promises a runner nobody wrote, or a runner the doc does not mention, is the
+    same claim-mismatch class."""
+    runners = _upstream_runners()
+    assert runners, (
+        "no workflow step executes `served_skills_parity.py --check-upstream` — "
+        "the upstream half is then decoration: a served copy edited in place "
+        "PLUS a hand-cut pin hash passes every test (#4643, P1)")
+
+    # The deploy-time gate must live in the workflow that BUILDS the dashboard
+    # (a content fact — the `deploy-dashboard` job), which is what places the
+    # check before the build stages `public/`.
+    deploy_doc = next((doc for doc in runners.values()
+                       if "deploy-dashboard" in (doc.get("jobs") or {})), None)
+    assert deploy_doc is not None, (
+        f"the arm must run in the workflow whose `deploy-dashboard` job builds "
+        f"and uploads the dashboard — otherwise a stale mirror deploys green. "
+        f"Runners found: {sorted(runners)}")
+    # …and ORDER matters: the claim is "before the build stages public/", so the
+    # arm's step must precede the dashboard build in that job. A moved step is a
+    # check that gates nothing that ships.
+    steps = deploy_doc["jobs"]["deploy-dashboard"]["steps"]
+    arm = next(i for i, s in enumerate(steps)
+               if isinstance(s.get("run"), str)
+               and "served_skills_parity" in _commented_out(s["run"])
+               and "--check-upstream" in _commented_out(s["run"]))
+    build = next(i for i, s in enumerate(steps)
+                 if isinstance(s.get("run"), str) and "npm run build" in s["run"])
+    assert arm < build, (
+        f"the upstream arm (step {arm}) must run BEFORE the dashboard build "
+        f"(step {build}) stages public/ into dist/ — after it, it gates nothing")
+
+    section = _section_71()
+    for name in runners:
+        assert name in section, (
+            f"§7.1 must name {name} as a runner of the gate — it executes "
+            "`--check-upstream`, and a record that omits it reads as 'nothing "
+            "runs the upstream arm'")
+    # …and the Gate cell's own promise is checked: a workflow §7.1 names THERE
+    # must actually execute the arm. A step whose command was commented out (or
+    # replaced by an `echo`) leaves the file, the step name and the doc all
+    # claiming a gate that no longer runs — the exact class the P1 was.
+    rows = _table_rows(section)
+    pinned = set(sp.load_manifest(MANIFEST)["skills"])
+    gate_cell = next((r[2] for r in rows if _artifacts(r[0]) == pinned), "")
+    promised = {m for m in re.findall(r"[A-Za-z0-9_./-]+\.ya?ml", gate_cell)
+                if (WORKFLOWS / m).is_file()}
+    assert promised, (
+        "§7.1's Gate cell must name the workflow(s) that RUN the gate: " + gate_cell)
+    assert promised <= set(runners), (
+        f"§7.1's Gate cell claims {sorted(promised - set(runners))} run the gate, "
+        "but no step there executes `served_skills_parity.py "
+        "--check-upstream` — the promise and the runner disagree")
+    # The converse: no workflow may be PROMISED that does not exist. Basenames
+    # are resolved against the workflows dir AND against the repo, so a config
+    # path (`config/served-skills-upstream.yml`) is not misread as a workflow.
+    for mention in re.findall(r"[A-Za-z0-9_./-]+\.ya?ml", section):
+        assert (WORKFLOWS / mention).is_file() or (REPO / mention).is_file(), (
+            f"§7.1 names {mention!r}, which does not exist — a record that "
+            "promises a runner nobody wrote is the same false claim in reverse")
