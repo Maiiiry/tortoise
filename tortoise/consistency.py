@@ -759,8 +759,14 @@ def _entity_node_view(props: dict) -> dict:
     """The canonical view of ONE non-Point reference-fold node (#7936).
 
     Exactly the fields the entity leg DECIDES (``_ENTITY_BELIEF_FIELDS`` plus
-    ``status``), so the digest covers what the verdict covers and nothing it
-    declares undecidable. ONE builder, read by both ``_graph_entities`` (the
+    ``status``) — with ONE declared asymmetry, on ``status``: the digest
+    carries it for EVERY reference-fold label, while the COMPARISON bounds it
+    to Object/Subject (``entity_parity_bounds["status_compared"]``; ``Event``
+    carries ``eventStatus`` under a different name and its lifecycle has no such
+    fold). So a graph-only ``status`` write on an ``:Event`` is the BASELINE's
+    to catch, not the comparison's — stated rather than implied, because a
+    reader implementing the next leg against a claim of exact parity would get
+    the boundary wrong. ONE builder, read by both ``_graph_entities`` (the
     comparison) and ``_graph_fingerprint`` (the baseline) — a second hand-copied
     field list is how a widened writer drifts out of the baseline silently.
 
@@ -2043,30 +2049,72 @@ def _fold_journal_entities(events: list[dict]) -> tuple[dict, set, set]:
     return entities, deleted, ambiguous
 
 
+#: The labels the REFERENCE FOLD's graph index covers (#7936): the Point
+#: lifecycle plus every label the entity fold models. DERIVED from
+#: `_REFERENCE_FOLD_ENTITY_LABELS`, not re-listed: `_ENTITY_CREATION` is the
+#: declared single home, so a fourth creation row there widens this set too.
+#: The literal it replaces was a second home for the same three labels, and the
+#: fail-open it created was invisible — `_ENTITY_CREATION` grows, the digest
+#: keeps indexing the old four labels, and a graph-only node of the new label
+#: leaves `db_hash` unmoved with every existing label-set pin still green.
+_GRAPH_VIEW_LABELS: tuple[str, ...] = (
+    "Point", *sorted(_REFERENCE_FOLD_ENTITY_LABELS))
+
+
+def _graph_view_id(label: str, props: dict) -> str | None:
+    """The identity a graph node of ``label`` is indexed under, or ``None``.
+
+    ``_ENTITY_ID_PROP[label]`` is the key the entity WRITERS and the entity
+    comparison address a node by (``id`` for Point/Object/Subject, ``eventId``
+    for Event), and it is tried first so the in-tree shape (an ``:Event`` whose
+    ``id == eventId``) gets exactly ONE key.
+
+    ONE declared fallback, for ``Event`` only: the BELIEF fold does not use
+    ``eventId`` — ``_fold_confidence_changed`` expands
+    ``epistemic_label_queries("MATCH (n:{label} {id:$id})")``, so it matches an
+    ``:Event`` by ``id`` like the other three labels. An ``:Event`` carrying
+    ``id`` but no ``eventId`` (reachable from a raw writer; the in-tree mirror
+    legacy shape is the reverse, ``eventId`` only) therefore has a WRITABLE
+    belief while ``eventId`` yields nothing — and dropping it from the index
+    would leave exactly the residual this file's fix removes, a graph-only
+    belief write on a non-Point node that leaves ``db_hash`` unmoved.
+    """
+    prop = _ENTITY_ID_PROP.get(label)
+    if not prop:
+        return None
+    nid = props.get(prop)
+    if isinstance(nid, str):
+        return nid
+    if label == "Event":
+        alt = props.get("id")
+        if isinstance(alt, str):
+            return alt
+    return None
+
+
 def _graph_view(projection) -> dict:
     """THE ``(label, id)`` graph index the reference fold reads (#7936).
 
-    ``{(label, id): properties(n)}`` over every label the reference fold
-    models — the Point lifecycle (``_apply_one``) plus
-    ``_REFERENCE_FOLD_ENTITY_LABELS``. ONE query and ONE index, because the two
-    consumers that used to read the graph separately (the Point view and the
-    entity view) are answering the same question about the same graph: what
-    does the store actually hold? Two queries is how the reference fold came to
-    index ``:Point`` only while the graph held the belief on an ``:Event``.
+    ``{(label, id): properties(n)}`` over ``_GRAPH_VIEW_LABELS`` — the Point
+    lifecycle (``_apply_one``) plus every label the entity fold models. ONE
+    query and ONE index, because the two consumers that used to read the graph
+    separately (the Point view and the entity view) are answering the same
+    question about the same graph: what does the store actually hold? Two
+    queries is how the reference fold came to index ``:Point`` only while the
+    graph held the belief on an ``:Event``.
 
-    The key is the label's OWN graph MATCH key (``_ENTITY_ID_PROP``: ``id`` for
-    Point/Object/Subject, ``eventId`` for Event) — the same property
-    ``_fold_confidence_changed`` and the entity writers match on — so a key
-    here is exactly a key the graph fold can resolve. A node with no (or a
-    non-string) identity is DROPPED, because a node the writers cannot address
-    is not one replay can reproduce or compare. The id is the LABELED tuple,
-    so a ``:Point`` and an ``:Event`` legitimately sharing an id stay two
-    distinct entries (each is a different node the graph really holds).
+    The key comes from :func:`_graph_view_id` — the label's own graph MATCH key
+    with the ``Event``/``id`` fallback the belief fold's match implies. A node
+    with no (or a non-string) identity is DROPPED, because one no writer and no
+    fold can address is not one replay can reproduce or compare. The id is
+    carried as the LABELED tuple, so a ``:Point`` and an ``:Event``
+    legitimately sharing an id stay two distinct entries (each is a different
+    node the graph really holds).
     """
     view: dict = {}
+    where = " OR ".join(f"n:{label}" for label in _GRAPH_VIEW_LABELS)
     rows = projection.query(
-        "MATCH (n) WHERE n:Point OR n:Object OR n:Subject OR n:Event "
-        "RETURN labels(n), properties(n)"
+        f"MATCH (n) WHERE {where} RETURN labels(n), properties(n)"
     ).result_set or []
     for row in rows:
         if len(row) < 2:
@@ -2075,11 +2123,8 @@ def _graph_view(projection) -> dict:
         if not isinstance(props, dict) or not isinstance(labels, (list, tuple)):
             continue
         for label in labels:
-            prop = _ENTITY_ID_PROP.get(label)
-            if not prop:
-                continue
-            nid = props.get(prop)
-            if isinstance(nid, str):
+            nid = _graph_view_id(label, props)
+            if nid is not None:
                 view[(label, nid)] = props
     return view
 
@@ -2515,7 +2560,10 @@ def check_consistency(log_path: str, projection, *,
                 "(label, id) over Point/Object/Subject/Event: the Point "
                 "content fields plus, per entity, `status` and "
                 "`belief_compared` (graph-only, so a moved entity node moves "
-                "the baseline)"),
+                "the baseline). `status` is covered on EVERY label here, "
+                "including Event, where the COMPARISON bounds it out "
+                "(`status_compared`) — so a graph-only Event `status` write "
+                "is the baseline's to catch, not the comparison's"),
             "baseline_digest_does_not_cover": (
                 "non-Point fields outside `belief_compared`+`status` (e.g. a "
                 "graph-only `name`/`eventKind` edit with no id change), and "
