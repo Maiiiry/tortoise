@@ -226,6 +226,47 @@ def test_the_same_workspace_twice_is_one_lane_not_two(monkeypatch) -> None:
     ), [h.reason for h in holders]
 
 
+def test_the_duplicate_rows_reason_does_not_claim_its_workspace_is_gone(monkeypatch) -> None:
+    """The orphan sentence must match the ARM that dropped the row (#8849 review).
+
+    One template used to tell every arm the same story: "names workspace X, which is
+    NOT in the live cmux list, and the row binds NO pane binding or session record".
+    For a duplicated roster line BOTH clauses are false — that workspace is live, it
+    is the same live row written twice — so a human was told to delete a roster line
+    because its workspace was dead while the board showed it alive.
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_LIVE, ""), (LABEL, WS_LIVE, "")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+    )
+    (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    reason = orphan["reason"]
+    assert "NOT in the live cmux list" not in reason, reason
+    assert "binds NO pane binding" not in reason, reason
+    assert "duplicate" in reason.lower(), reason
+
+
+def test_the_duplicate_reason_does_not_cite_a_list_that_was_never_read(monkeypatch) -> None:
+    """...and it must not cite the live list at all when the list was unreadable.
+
+    The duplicate arm runs before `workspaces_measured`, which is defensible — both
+    rows name one workspace, so no verdict moves — but then the published reason must
+    not claim knowledge from an unread list.
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_LIVE, ""), (LABEL, WS_LIVE, "")],
+        live={},
+        measured=False,
+        error="cmux list-workspaces returned an empty set",
+    )
+    assert st["summary"]["stale_registry"] == 1
+    (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    assert "NOT in the live cmux list" not in orphan["reason"], orphan["reason"]
+
+
 def test_the_override_still_reaches_the_row_that_survives(monkeypatch, tmp_path) -> None:
     # ⛔ THE GAP THE REVIEW NAMED (#8849). Every override test in this file passed
     # with `overrides={}`, because the LONE-row rule keeps the ghost regardless — so
@@ -362,8 +403,15 @@ def test_a_lone_ghost_row_is_still_reported_as_the_lane(monkeypatch) -> None:
     assert not [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
 
 
-def test_a_surviving_session_keeps_the_ghost_as_a_lane(monkeypatch) -> None:
-    """The same guard through the OVERRIDE rule: a re-bindable ghost is a lane."""
+def test_a_live_session_record_keeps_the_ghost_as_a_lane(monkeypatch) -> None:
+    """A ghost row whose WORKSPACE still has a live session record is a lane.
+
+    Named for what it pins. An earlier name claimed this went "through the OVERRIDE
+    rule", but it does not: with `overrides=None` the state is byte-identical,
+    because the row is kept by `row_binds_evidence`'s live-session-record arm
+    (`live.get(ws.upper())`). The override's own effect is pinned separately by
+    `test_the_override_still_reaches_the_row_that_survives` (review of #8849).
+    """
     sid = "c" * 36
     st = _build(
         monkeypatch,
@@ -374,9 +422,9 @@ def test_a_surviving_session_keeps_the_ghost_as_a_lane(monkeypatch) -> None:
         sessions={WS_STALE.upper(): [{"pid": 999999, "agent_lifecycle": "running",
                                      "session_id": sid}]},
     )
-    # An override is a human's statement that the label is a lane, and it is the only
-    # rule that can resolve a ghost's session — so the row is NOT dropped, and the
-    # duplicate stays visible to the gate (fail closed, by design).
+    # A live SESSION RECORD for the ghost's workspace is evidence of its own, so the
+    # row is NOT dropped, and the duplicate stays visible to the gate (fail closed,
+    # by design).
     assert [lane["identity"]["workspace"] for lane in st["lanes"]] == [WS_STALE, WS_LIVE]
     assert st["summary"]["stale_registry"] == 0
 
@@ -428,8 +476,15 @@ def test_a_label_override_does_not_make_the_stale_row_a_lane_record(monkeypatch)
     assert st["summary"]["stale_registry"] == 1
 
 
-def test_a_lone_row_with_an_override_is_still_kept(monkeypatch) -> None:
-    """The override keeps its own meaning (#7738): a lone gone-workspace row stays."""
+def test_a_lone_ghost_row_is_kept_even_with_a_dangling_override(monkeypatch) -> None:
+    """A DANGLING override neither binds the row nor evicts it (#7738).
+
+    This value is a workspace id rather than a session id, so it resolves nothing on
+    disk. The row is still kept — by the LONE-row rule, not by the override — which
+    is the point: an unusable override must not change whether a ghost is published.
+    (The previous version of this test was state-identical with `overrides={}` and
+    duplicated `test_a_lone_ghost_row_is_still_reported_as_the_lane`; review of #8849.)
+    """
     st = _build(
         monkeypatch,
         registry=[(LABEL, WS_STALE, "")],
@@ -483,7 +538,12 @@ def test_two_unbound_rows_for_one_label_are_one_lane(monkeypatch) -> None:
     assert st["summary"]["lanes"] == 1
     assert st["summary"]["stale_registry"] == 1
     (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
-    assert "second unbound row" in orphan["reason"], orphan["reason"]
+    # Assert the MEANING, not one phrasing of it: the reason must say this row is the
+    # repeat and that one lane remains. (The cycle-2 review's point — a test that
+    # pins a string the code happens to emit today reds on any rewording and proves
+    # nothing about behaviour.)
+    assert "two unbound rows for one label are one lane" in orphan["reason"], orphan["reason"]
+    assert "enumerated twice" in orphan["reason"], orphan["reason"]
 
 
 def test_the_stale_reason_does_not_name_override_as_row_evidence(monkeypatch) -> None:

@@ -87,12 +87,17 @@ the list WAS read and the lane's workspace is absent, the lane is **terminal**:
     never route.
 
 A terminal lane is reported and is NOT live, NOT free and NOT dispatchable.
-"Reported" means never SILENTLY dropped: a registry row that outlived its
-workspace and binds no evidence of its own is dropped as a lane record (#8845),
-but only when the same label still has a row that does bind evidence, and every
-dropped row is published as an orphan of kind `registry-stale` — deleting the
-roster line is a human's call, not this module's. Polarity is fail-OPEN with
-provenance: an unreadable
+"Reported" means never SILENTLY dropped, and it is a statement about ORPHANS: a
+registry row that is not a lane record (#8845) leaves `rows`, but every dropped
+row is published as an orphan of kind `registry-stale` saying which arm dropped
+it — deleting the roster line is a human's call, not this module's. Three arms
+drop and they are NOT one rule: a row whose (label, workspace) repeats one
+already kept is a DUPLICATE, de-duplicated even when the cmux list could not be
+read (both rows name one workspace, so no verdict moves); a row whose workspace
+is absent from a MEASURED list while another row for the label binds evidence is
+dropped as stale; and a second UNBOUND row for a label is dropped so the label
+is not enumerated twice, which needs no evidence-binding neighbour at all.
+Polarity is fail-OPEN with provenance: an unreadable
 workspace list retires NOTHING, and ``reconciliation.workspaces_measured`` says
 so — a cmux outage must never hide a real lane, and a fail-open path must not be
 silent.
@@ -1355,6 +1360,7 @@ def build_state(
         if (label, ws.upper()) in seen_rows:
             stale_rows.append({
                 "lane": label, "workspace": ws, "issue_label": issue_label,
+                "arm": "duplicate",
                 "why": "it repeats this label's row for the same workspace",
             })
             continue
@@ -1365,6 +1371,7 @@ def build_state(
             if bound_rows_by_label.get(label, 0) > 0:
                 stale_rows.append({
                     "lane": label, "workspace": ws, "issue_label": issue_label,
+                    "arm": "other-row-binds",
                     "why": "another row for this label does bind evidence",
                 })
                 continue
@@ -1382,6 +1389,7 @@ def build_state(
             if label in unbound_kept:
                 stale_rows.append({
                     "lane": label, "workspace": ws, "issue_label": issue_label,
+                    "arm": "second-unbound",
                     "why": "it is a second unbound row for the same label",
                 })
                 continue
@@ -1684,17 +1692,44 @@ def build_state(
     # call.
     for row in stale_rows:
         ws_gone = f"workspace {row['workspace'][:8]}…" if row["workspace"] else "its workspace"
+        arm = row.get("arm")
+        # ⛔ THE SENTENCE MUST BE BUILT PER ARM. The three arms drop for different
+        # reasons, and one template told all of them the same story: that the
+        # workspace is NOT in the live cmux list and the row binds NO evidence. For
+        # arm `duplicate` both clauses are FALSE — that row's workspace IS live (it
+        # is the same live row, written twice), so a human was told to delete a
+        # roster line because its workspace was dead while the board showed it alive
+        # (review of #8849).
+        if arm == "duplicate":
+            reason = (
+                f"registry row for '{row['lane']}' repeats {ws_gone} verbatim — the "
+                "same (label, workspace) written twice is ONE lane, not two; the "
+                "duplicate is not a second lane record and NO verdict changes (one "
+                "lane record remains). This is a de-duplication, not a retirement: "
+                "it holds even when the cmux list could not be read, because both "
+                "rows name one workspace. Delete the duplicate roster line"
+            )
+        elif arm == "second-unbound":
+            reason = (
+                f"registry row for '{row['lane']}' names {ws_gone}, which is NOT in "
+                "the live cmux list and binds no pane binding or session record, so "
+                "it is not a lane record; it repeats a label that already has one "
+                "such row kept, and two unbound rows for one label are one lane "
+                "enumerated twice. Delete the stale roster row"
+            )
+        else:
+            reason = (
+                f"registry row for '{row['lane']}' names {ws_gone}, which is NOT in "
+                "the live cmux list, and the row binds NO pane binding or session "
+                "record of its own — it is not a lane record "
+                f"({row.get('why') or 'a row for this label does bind evidence'}); "
+                "delete the stale roster row"
+            )
         orphans.append({
             "kind": "registry-stale",
             "lane": row["lane"],
             "workspace": row["workspace"],
-            "reason": (
-                f"registry row for '{row['lane']}' names {ws_gone}, which is NOT in the "
-                "live cmux list, and the row binds NO pane binding or session record of "
-                f"its own — it is not a lane record "
-                f"({row.get('why') or 'a row for this label does bind evidence'}); delete "
-                "the stale roster row"
-            ),
+            "reason": reason,
         })
 
     # index for `who`

@@ -5691,12 +5691,12 @@ durations:
   # Refresh from the first post-merge run that includes it. Do NOT drop the row
   # without re-deriving the coverage floor at that head: the floor is a RATIO, so
   # removing it moves 800/888 = 90.09% (pass) back to 799/888 = 89.98% (fail).
-  test_8845_dup_lane_label.py: 6.8
+  test_8845_dup_lane_label.py: 6.8  # unmeasured — local wall reading (14 tests at add time), not a junit sweep; refresh from the next sweep
   # #8849: unmeasured — no leg of the four source sweeps collected this file, so
   # it was packing at the flat 2.0s default. 4.9 is the local wall reading on
   # this host (5 tests, 4.91s), the same carry-forward shape as #4602/#5275.
   # Refresh from the next sweep that collects it.
-  test_1890_invite_ghost_sweep_schedule.py: 4.9
+  test_1890_invite_ghost_sweep_schedule.py: 4.9  # unmeasured — local wall reading (5 tests), no source leg collected it; refresh from the next sweep
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py
