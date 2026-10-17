@@ -8,7 +8,9 @@ production. Two measurements decided the replacement (bash 5, node 22):
 
   * `wrangler --version` prints the bare resolved version on stdout;
   * a float declaration can never equal its own resolution — `wrangler@4`
-    resolves to 4.151.1, so `[ "$got" = "$WRANGLER_VERSION" ]` fails.
+    resolves to 4.151.1 there. On a warm npm cache `npx wrangler@4 --version`
+    can print the pinned version itself, so the assertion is NOT the float
+    guard: the TEXT arms below are.
 
 So the version now lives in ONE file, `config/wrangler-version`, and the lane
 ASSERTS the version it got against it. That is exact for every spelling,
@@ -47,9 +49,14 @@ than hidden — a NEW step can always be written with `wrangler@4`, and a versio
 can reach npm through a spelling that never appears in these files at all (a
 shell alias, a function, or a wrapper script naming its own version), which no
 text scan over the workflows can see. The spec and invocation arms refuse the
-first in every workflow file, the executed harnesses in
-`tests/test_pages_bindings.py` prove the deploy step's assertion, and the arms
-below EXECUTE the manual deploy script rather than grepping its path.
+first in every workflow file, every composite action and the command docs; the
+executed harnesses in `tests/test_pages_bindings.py` prove the deploy step's
+assertion, and the arms below EXECUTE the manual deploy script rather than
+grepping its path. Two spellings remain uncovered, both deliberate and both
+declared here rather than implied closed: a spec split by quoting
+(`wran"g"ler@4` — the invocation scan strips quotes, so it reads `wranler`), and
+the alias/function/wrapper case above. Neither is closable by reading text, which
+is why the enforcement that matters is the assertion on the binary that runs.
 """
 
 from __future__ import annotations
@@ -80,6 +87,10 @@ EXACT_VERSION = re.compile(r"\d+\.\d+\.\d+")
 LEGAL_SPEC = re.compile(r"wrangler@\$\{WRANGLER_VERSION:\?")
 
 BARE_INVOCATION = re.compile(r"(?<![\w@$./-])wrangler(?![\w@])")
+
+#: Pseudo job name for a step that lives in a composite action, which has no
+#: `jobs:` — arms that read a JOB's config must skip it rather than look it up.
+COMPOSITE = "<composite>"
 
 #: A quoted LONE command word — `npx --yes "wrangler" pages deploy`. bash runs it as
 #: the binary, but ``_strip_quoted`` deletes whole quoted SEGMENTS (so a diagnostic
@@ -141,7 +152,10 @@ def _workflow_paths() -> list:
     paths = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
     actions = REPO_ROOT / ".github" / "actions"
     if actions.is_dir():
-        paths += sorted(actions.glob("*/action.yml")) + sorted(actions.glob("*/action.yaml"))
+        # Recursive: `uses: ./.github/actions/a/b` is legal, so a one-level glob
+        # leaves the nested ones in no population at all (measured: a literal
+        # `wrangler@4` there survived every arm).
+        paths += sorted(p for p in actions.rglob("action.y*ml") if p.is_file())
     assert paths, "no workflows found — the repo root probe is wrong"
     return paths
 
@@ -178,7 +192,7 @@ def _document_steps(doc: dict) -> list[tuple[str, dict]]:
     steps = _all_steps(doc.get("jobs") or {})
     runs = doc.get("runs") or {}
     if isinstance(runs, dict) and runs.get("using") == "composite":
-        steps += [("<composite>", step) for step in (runs.get("steps") or [])]
+        steps += [(COMPOSITE, step) for step in (runs.get("steps") or [])]
     return steps
 
 
@@ -189,7 +203,7 @@ def _run(step: dict) -> str:
 def _steps_named(name: str) -> list[tuple[str, dict]]:
     out = []
     for path in _workflow_paths():
-        for job_name, step in _all_steps(_load(path).get("jobs") or {}):
+        for job_name, step in _document_steps(_load(path)):
             if (step.get("name") or "") == name:
                 out.append((job_name, step))
     return out
@@ -243,6 +257,16 @@ def _cut_comment(line: str) -> str:
         i += 1
     return line
 
+
+
+#: Commands whose arguments are OUTPUT, not an invocation. A diagnostic that
+#: names `wrangler@4` is how a reader learns what went wrong; it cannot deploy.
+#: The line arrives as a YAML scalar for a step, so a `run:` prefix is normal.
+_DIAGNOSTIC = re.compile(r"^\s*(?:-\s*)?(?:run:\s*)?(?:echo|printf)\b")
+
+
+def _is_diagnostic(code: str) -> bool:
+    return bool(_DIAGNOSTIC.match(code))
 
 def _strip_quoted(line: str) -> str:
     """`line` with quoted SEGMENTS removed — a diagnostic is not a command.
@@ -371,6 +395,10 @@ def test_every_wrangler_spec_is_the_asserted_form() -> None:
                 token = match.group(0)
                 if LEGAL_SPEC.match(token):
                     continue
+                # A MESSAGE may name the bad spelling (this repo's steps carry
+                # `::error::` diagnostics); only a command may not use it.
+                if _is_diagnostic(code):
+                    continue
                 # A bare `wrangler@` followed by prose punctuation is a mention,
                 # not a spec — anything shaped like a spec (digit, letter, `^`,
                 # `~`, `$`, quote, backslash, `{`) is an offender.
@@ -483,6 +511,10 @@ def test_the_verify_step_is_unconditional() -> None:
             f"{job}: the install-and-verify step is gated by `if: {step['if']}` — a gate "
             "that skips it leaves the pin unverified while the run is green"
         )
+        if job == COMPOSITE:
+            # Checked above for its own `if:`; a composite action has no job-level
+            # gate to read (`jobs[job]` would KeyError).
+            continue
         job_cfg = _load(WORKFLOWS / "ci.yml")["jobs"][job]
         gate = job_cfg.get("if")
         if gate is not None:
@@ -515,7 +547,10 @@ def test_the_version_check_is_an_equality_against_the_declared_value() -> None:
     """The assertion must compare, not merely print — a print cannot fail a job."""
 
     for job, step in _steps_named(VERIFY_STEP):
-        run = _run(step)
+        # CODE only: a comment naming the comparison satisfied the raw-text
+        # version of this arm (measured) — the same defect the retry arm already
+        # carries a `_cut_comment` fix and a self-test for.
+        run = "\n".join(_cut_comment(line) for line in _run(step).splitlines())
         assert re.search(r'\[ "\$got" = "\$WRANGLER_VERSION" \]', run), (
             f"{job}: no `[ \"$got\" = \"$WRANGLER_VERSION\" ]` comparison — the resolved "
             "version is not asserted"
@@ -848,6 +883,11 @@ def test_no_document_shows_a_floating_wrangler_spec() -> None:
         assert not offenders, (
             f"{rel} still shows a copy-pasteable wrangler spec that is not the "
             f"asserted form ({offenders}) — it would ship whatever npm serves"
+        )
+        bare = _bare_invocations(code)
+        assert not bare, (
+            f"{rel} shows a spec-less wrangler command ({bare}) — a paste of it "
+            "runs whatever npm serves, with nothing asserting what that was"
         )
         if "wrangler@" in code:
             assert "config/wrangler-version" in text, (

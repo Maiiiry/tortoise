@@ -76,8 +76,9 @@ that classification (it is top-level only) — add it to the exclude list **and*
 to the post-deploy 404 assertion step by hand (a nested `*.md` is at least
 covered by the blanket `*.md` exclusion, but that is a coincidence, not a pin).
 
-For local troubleshooting only, `npx wrangler pages deploy <dir>` still works —
-but never point it at `website/` itself.
+For local troubleshooting only, `npx --yes "wrangler@$(cat config/wrangler-version)"
+pages deploy <dir>` still works — but never point it at `website/` itself, and
+never a floating `wrangler@4`: the version has one home (#8816).
 
 ## Waitlist form (#373)
 

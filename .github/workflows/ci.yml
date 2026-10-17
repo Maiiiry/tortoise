@@ -1631,10 +1631,12 @@ jobs:
       - name: Install and verify the wrangler toolchain (#8816)
         run: |
           # ONE source for the version: config/wrangler-version, read here and
-          # nowhere else in this file. The value is ASSERTED against the version
-          # npm actually resolved, so the check is exact for every spelling a
-          # text scan cannot see: a declared "4" resolves to 4.151.1 and fails,
-          # and so does an empty declaration. The boot steps below then run bare
+          # nowhere else in this file. The value is ASSERTED against what npm
+          # actually resolved — a declared "4" fails that comparison on a cold
+          # resolution, and `:?` refuses an empty value before it can float to
+          # latest. On a warm npm cache `npx wrangler@4 --version` can print the
+          # pin itself, so the TEXT arms in the guard, not this assertion, are
+          # what forbid a float spelling. The boot steps below then run bare
           # `wrangler` — no spec at the call site, so nothing can drift.
           #
           # This replaces the best-effort pre-warm (#2178/#8744): an assertion
@@ -1812,10 +1814,12 @@ jobs:
       - name: Install and verify the wrangler toolchain (#8816)
         run: |
           # ONE source for the version: config/wrangler-version, read here and
-          # nowhere else in this file. The value is ASSERTED against the version
-          # npm actually resolved, so the check is exact for every spelling a
-          # text scan cannot see: a declared "4" resolves to 4.151.1 and fails,
-          # and so does an empty declaration. The boot steps below then run bare
+          # nowhere else in this file. The value is ASSERTED against what npm
+          # actually resolved — a declared "4" fails that comparison on a cold
+          # resolution, and `:?` refuses an empty value before it can float to
+          # latest. On a warm npm cache `npx wrangler@4 --version` can print the
+          # pin itself, so the TEXT arms in the guard, not this assertion, are
+          # what forbid a float spelling. The boot steps below then run bare
           # `wrangler` — no spec at the call site, so nothing can drift.
           #
           # This replaces the best-effort pre-warm (#2178/#8744): an assertion
@@ -2006,10 +2010,12 @@ jobs:
       - name: Install and verify the wrangler toolchain (#8816)
         run: |
           # ONE source for the version: config/wrangler-version, read here and
-          # nowhere else in this file. The value is ASSERTED against the version
-          # npm actually resolved, so the check is exact for every spelling a
-          # text scan cannot see: a declared "4" resolves to 4.151.1 and fails,
-          # and so does an empty declaration. The boot steps below then run bare
+          # nowhere else in this file. The value is ASSERTED against what npm
+          # actually resolved — a declared "4" fails that comparison on a cold
+          # resolution, and `:?` refuses an empty value before it can float to
+          # latest. On a warm npm cache `npx wrangler@4 --version` can print the
+          # pin itself, so the TEXT arms in the guard, not this assertion, are
+          # what forbid a float spelling. The boot steps below then run bare
           # `wrangler` — no spec at the call site, so nothing can drift.
           #
           # This replaces the best-effort pre-warm (#2178/#8744): an assertion
