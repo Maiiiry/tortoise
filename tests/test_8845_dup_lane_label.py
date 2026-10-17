@@ -19,7 +19,9 @@ Each fact below fails under a NAMED mutation:
    ``collision_preflight._holders_from_board`` -> the last-wins record answers -> red.
 3. The dropped row is REPORTED (``orphans``, kind ``registry-stale``), never silently
    erased — and ``fleet_state lane <stale-ws-id>`` names the real reason instead of
-   manufacturing "no lane matching".
+   manufacturing "no lane matching". That second half is asserted through the COMMAND
+   (``main([... "lane", <name>])``), not only through the helper, so the user-visible
+   message and its exit code are what reds when they change.
 4. A label whose ONLY row is a gone-workspace row is NOT dropped: #7738 publishes
    exactly that lane as RETIRED/RECOVERABLE, and erasing it would lose the lane.
    Mutation: drop every unbound row unconditionally -> red.
@@ -31,15 +33,22 @@ Each fact below fails under a NAMED mutation:
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools import fleet_state as fs
+
+#: Defined AFTER the imports on purpose: ruff's E402 exemption covers an import that
+#: follows the bare `sys.path.insert(...)` (as `tests/test_fleet_state.py` does), but NOT
+#: one that follows a module-level assignment — so hoisting this above the import reds
+#: `ruff check .` (the required `lint` leg).
+ROOT = Path(__file__).resolve().parents[1]
 
 ISSUE = 8818
 LABEL = "2b Extractor"
@@ -201,6 +210,63 @@ def test_the_dropped_row_is_reported_as_an_orphan(monkeypatch) -> None:
     assert fs._stale_registry_match(st, WS_STALE.lower())["lane"] == LABEL
     assert fs._stale_registry_match(st, "someone else") is None
     assert fs._find_lane(st, WS_STALE) is None
+
+
+def _stamped(state: dict) -> dict:
+    """A state carrying a FRESH ``generated_at`` stamp.
+
+    Without it the reader treats the age as UNKNOWN and REBUILDS (#7957 H1), which
+    would make a command-surface test reach the live fleet instead of the fixture —
+    so the stamp is what keeps the test hermetic.
+    """
+    state["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return state
+
+
+def _write_state(tmp_path: Path, state: dict) -> Path:
+    path = tmp_path / "fleet-state.json"
+    path.write_text(json.dumps(_stamped(state), default=str))
+    return path
+
+
+def test_lane_command_names_a_stale_registry_row(monkeypatch, tmp_path, capsys) -> None:
+    """The COMMAND, not just the helper: `lane <stale-ws-id>` names the real reason.
+
+    Mutation: delete the `_stale_registry_match` arm in `cmd_lane` -> the manufactured
+    "no lane matching" answer comes back and this reds. So does changing the exit
+    code, which callers branch on.
+    """
+    path = _write_state(tmp_path, _duplicate_pair(monkeypatch))
+
+    rc = fs.main(["--state", str(path), "lane", WS_STALE])
+
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "STALE REGISTRY ROW, not a lane" in err, err
+    assert WS_STALE[:8] in err, err
+    assert "no lane matching" not in err, err
+
+
+def test_lane_command_tolerates_a_stale_row_without_a_workspace(tmp_path, capsys) -> None:
+    """`_stale_registry_match` promises tolerance of a malformed entry (#8845 review P3).
+
+    `cmd_lane` is its only consumer, so it must not be the one place that raises on
+    one: a cached state whose `registry-stale` row lost its `workspace` key answers,
+    instead of `KeyError`. Reachable only from a hand-edited/corrupt cache — but the
+    matcher's stated contract and its consumer must agree.
+    """
+    path = _write_state(tmp_path, {
+        "lanes": [],
+        "orphans": [{"kind": "registry-stale", "lane": "ghost lane"}],
+        "reconciliation": {"registry_measured": True},
+    })
+
+    rc = fs.main(["--state", str(path), "lane", "ghost lane"])
+
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "STALE REGISTRY ROW, not a lane" in err, err
+    assert "the workspace it names" in err, err
 
 
 # ---------------------------------------------------------------------------

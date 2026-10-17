@@ -1340,6 +1340,14 @@ surfaces:
   - test_6131_operator_mutation_vocabulary.py
   - test_comove_dispatch_3627.py
   - test_fleet_state.py
+  # #8845: a registry row that outlives its cmux workspace is not a lane record. Same
+  # home and same reason as `test_fleet_state.py` beside it: DB-free and network-free
+  # (every live source monkeypatched, `do_pane=False`, `sample_s=0.0`), and
+  # `tools/fleet_state.py` is in `CORE_ALSO` (`tools/ci_selection.py`), so a fleet_state
+  # change selects `core` and this guard actually runs on it. Without the registration
+  # the file is never selected on ANY diff (the #1349/#3332/#7076 silent-drop class) and
+  # `--integrity` reports it as drift, reding the required `manifest-integrity` job.
+  - test_8845_dup_lane_label.py
   # #7957/#parent-P0: the fail-closed guard for `queue-dispatch.py`'s lane read. DB-free, no
   # network, no cmux, no dispatch -- every live source is a stub under a throwaway HOME, so it
   # belongs on `core` (hermetic, sub-second). NOTE: the registration ALONE does not select the
