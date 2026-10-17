@@ -910,6 +910,152 @@ def test_direct_route_same_name_earlier_item_outdated_flag(sdk):
     assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# #7925 review P1 (round 6) — the `outdated` flag is BUNDLE-wide
+# ═══════════════════════════════════════════════════════════════════════
+# The `outdated` leg lived INSIDE the direct-route terminal guard: it ran
+# per connection, on the direct route, for endpoints the connection
+# referenced (plus the same-name items under that endpoint's name). But
+# `_sanitize_props` refuses the flag on PRESENCE for every entity writer,
+# whatever the route and whether or not a connection mentions the item —
+# and step 3 writes EVERY entity item, in bundle order. So the four shapes
+# below all passed Phase 1 EMPTY and then aborted mid-write. Each test pins
+# BOTH halves: the Phase-1 violation AND the zero-mutation residue (the
+# defect class here is "right exception, wrong residue" — asserting the
+# exception alone would have blessed every one of these).
+
+def test_reify_route_referenced_entity_outdated_flag_rejected_phase1(sdk):
+    """The OPERATOR route had no `outdated` leg at all — the flag legs sat
+    behind `if route != "direct": continue` — yet `create_entity` refuses the
+    flag on presence for a reify-routed bundle's entity items exactly as for a
+    direct-routed one.
+
+    Measured pre-fix at this head: `_validate_bundle` returned [] and `ingest`
+    raised a raw `ValueError` with the predecessor point already committed
+    (Point 1, zero entities). Phase 1 must reject it, leaving ZERO nodes.
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma",
+                      "outdated": True},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        # reify:true routes to create_operator, not create_direct_edge — the
+        # route whose entity write still refuses the flag.
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL",
+                         "reify": True}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    assert any(v["section"] == "entities" and v["index"] == 0
+               and "declares the server-managed 'outdated' flag" in v["message"]
+               for v in viols), viols
+    with pytest.raises(BundleValidationError,
+                       match="declares the server-managed 'outdated' flag"):
+        sdk.ingest(bundle)
+    # ZERO mutation — counted on the graph, not inferred from the exception
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+
+
+def test_reify_route_same_name_earlier_item_outdated_flag_rejected_phase1(sdk):
+    """The same-name blind spot, on the operator route: the flag sits on the
+    EARLIER item naming the endpoint's name, which no connection references.
+
+    Step 3 writes `s1` first and its own write refuses the flag, so the
+    bundle aborts regardless of what `s2`'s connection would do. Measured
+    pre-fix at this head: `_validate_bundle` returned [] and `ingest` raised a
+    raw `ValueError` with the predecessor point committed (Point 1, zero
+    entities). Phase 1 must reject it, leaving ZERO nodes.
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s1", "type": "subject", "name": "Gamma",
+                      "outdated": True},
+                     {"ref": "s2", "type": "subject", "name": "Gamma"},
+                     {"ref": "o", "type": "object", "name": "Delta"}],
+        "connections": [{"from": "s2", "to": "o", "operator": "IMPL",
+                         "reify": True}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    assert any(v["section"] == "entities" and v["index"] == 0
+               and "declares the server-managed 'outdated' flag" in v["message"]
+               for v in viols), viols
+    with pytest.raises(BundleValidationError,
+                       match="declares the server-managed 'outdated' flag"):
+        sdk.ingest(bundle)
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+
+
+def test_direct_route_unreferenced_entity_outdated_flag_rejected_phase1(sdk):
+    """A flag on an item NO connection references, on the direct route — the
+    shape that isolates "per connection" from "per bundle".
+
+    Every guard test above declares the flag on an endpoint (or on a
+    same-name sibling of one). This item is written in step 3 and nothing
+    addresses it, so an endpoint-scoped read cannot see it at all. Measured
+    pre-fix at this head: `_validate_bundle` returned [] and `ingest` raised a
+    raw `ValueError` with residue Point 1 / Subject 1 / Object 1. Phase 1 must
+    reject it, leaving ZERO nodes.
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma"},
+                     {"ref": "o", "type": "object", "name": "Delta"},
+                     # Unreferenced, and a DIFFERENT name — the flag's own
+                     # presence is the whole violation.
+                     {"ref": "z", "type": "subject", "name": "Zeta",
+                      "outdated": True}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    assert any(v["section"] == "entities" and v["index"] == 2
+               and "declares the server-managed 'outdated' flag" in v["message"]
+               for v in viols), viols
+    with pytest.raises(BundleValidationError,
+                       match="declares the server-managed 'outdated' flag"):
+        sdk.ingest(bundle)
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+
+
+def test_direct_route_unreferenced_event_outdated_flag_rejected_phase1(sdk):
+    """The unreferenced shape on an `:Event` — no name merge, no holder to
+    probe, and nothing references it: only a bundle-wide read reaches it.
+
+    The Event writer is `create_entity(type='event')` → `_sanitize_props`, so
+    it refuses the flag on presence exactly like the named labels. Measured
+    pre-fix at this head: `_validate_bundle` returned [] and `ingest` raised a
+    raw `ValueError` with residue Point 1 / Subject 1 / Object 1. Phase 1 must
+    reject it, leaving ZERO nodes (Event 0 included).
+    """
+    bundle = {
+        "points": [{"ref": "pX", "kind": "statement",
+                    "content": "must-not-commit"}],
+        "entities": [{"ref": "s", "type": "subject", "name": "Gamma"},
+                     {"ref": "o", "type": "object", "name": "Delta"},
+                     {"ref": "evt", "type": "event", "name": "Launch",
+                      "eventKind": "sessionCaptured", "outdated": True}],
+        "connections": [{"from": "s", "to": "o", "operator": "IMPL"}],
+    }
+    viols = sdk._validate_bundle(bundle)
+    assert any(v["section"] == "entities" and v["index"] == 2
+               and "declares the server-managed 'outdated' flag" in v["message"]
+               for v in viols), viols
+    with pytest.raises(BundleValidationError,
+                       match="declares the server-managed 'outdated' flag"):
+        sdk.ingest(bundle)
+    assert _count(sdk, "MATCH (n:Point) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Subject) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Object) RETURN count(n)") == 0
+    assert _count(sdk, "MATCH (n:Event) RETURN count(n)") == 0
+
+
 @pytest.mark.parametrize("spelling", ["top", "nested"])
 def test_direct_route_operator_shaped_entity_item_rejected_phase1(sdk, spelling):
     """#7925 review P1 (found in review of the bundle-wide fix, and re-found on a
