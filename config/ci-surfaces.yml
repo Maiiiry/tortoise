@@ -1354,6 +1354,14 @@ surfaces:
   - test_6131_operator_mutation_vocabulary.py
   - test_comove_dispatch_3627.py
   - test_fleet_state.py
+  # #8845: a registry row that outlives its cmux workspace is not a lane record. Same
+  # home and same reason as `test_fleet_state.py` beside it: DB-free and network-free
+  # (every live source monkeypatched, `do_pane=False`, `sample_s=0.0`), and
+  # `tools/fleet_state.py` is in `CORE_ALSO` (`tools/ci_selection.py`), so a fleet_state
+  # change selects `core` and this guard actually runs on it. Without the registration
+  # the file is never selected on ANY diff (the #1349/#3332/#7076 silent-drop class) and
+  # `--integrity` reports it as drift, reding the required `manifest-integrity` job.
+  - test_8845_dup_lane_label.py
   # #7957/#parent-P0: the fail-closed guard for `queue-dispatch.py`'s lane read. DB-free, no
   # network, no cmux, no dispatch -- every live source is a stub under a throwaway HOME, so it
   # belongs on `core` (hermetic, sub-second). NOTE: the registration ALONE does not select the
@@ -5692,6 +5700,25 @@ durations:
 #   gate — and before #3992 the lane the plan named did not exist at all, so
 #   the SLO was unverifiable. It runs from .github/workflows/perf-lane.yml.
   test_4932_per_pr_artifact_scope.py: 5.0
+  # #8849: unmeasured at PR time — a file ADDED by this PR cannot appear in a
+  # junit artifact, so it has no swept duration (the #4348/#2876/#5275 trap).
+  # 6.8 is the local wall reading on this host when the row was added, on a private
+  # test lane. The test count is deliberately NOT stated: a hand-written count here
+  # goes stale the moment a test is added, which is the failure this file exists to
+  # catch. Refresh the value from a sweep rather than trusting 6.8. NOT a junit
+  # `testcase/@time` sum, and marked rather than presented as swept, because the
+  # map's provenance for every other row is the sweep.
+  # Refresh from the first post-merge run that includes it. Do NOT drop the row
+  # without re-deriving the coverage floor at that head: the floor is a RATIO, so
+  # removing it moves 800/888 = 90.09% (pass) back to 799/888 = 89.98% (fail).
+  test_8845_dup_lane_label.py: 6.8  # unmeasured — local wall reading on a private test lane, not a junit sweep; refresh from the next sweep
+  # #8849: unmeasured — no leg of the four source sweeps collected this file, so
+  # it was packing at the flat 2.0s default. 4.9 is the local wall reading on
+  # this host, the same carry-forward shape as #4602/#5275. The test count is
+  # deliberately NOT stated — a hand-written count in this map goes stale the moment
+  # a test is added, which is the failure this file exists to catch.
+  # Refresh from the next sweep that collects it.
+  test_1890_invite_ghost_sweep_schedule.py: 4.9  # unmeasured — local wall reading, no source leg collected it; refresh from the next sweep
   test_5142_ontology_record.py: 3.7
   test_direction_storage_7852.py: 5.4
   test_incident_kinds.py: 4.0
