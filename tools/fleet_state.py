@@ -1747,22 +1747,42 @@ def build_state(
                 # THIS row's value on the kept tuple, so when the two lines differ
                 # the published value lives on the copy being reported here
                 # (review of #8849, cycle 6).
-                if _carries and _carries != _kept_own:
+                # ⛔ BRANCH ON BOTH VALUES. Selecting on `_carries` alone said
+                # "Neither line carries a `lane:` value" when the REPORTED row was
+                # the empty one and the kept line carried the value — and then
+                # permitted deleting either, including the only carrier, which
+                # reverts the published label (review of #8849, cycle 7).
+                if _carries and not _kept_own:
                     _advice = (
-                        f"This line carries `{_carries}` and the copy the board "
-                        f"kept carries `{_kept_own or '(none)'}`. The published "
-                        f"`lane:` value is `{_carries}` — i.e. THIS line's. Keep "
-                        "this line and delete the other, or copy "
-                        f"`{_carries}` onto the other line first"
+                        f"This line carries `{_carries}` and the copy already "
+                        "handled for this (label, workspace) carries none. The "
+                        f"published `lane:` value is `{_carries}` — i.e. THIS "
+                        "line's. Keep this line (or copy that value onto the "
+                        "other line first)"
+                    )
+                elif _carries and _carries != _kept_own:
+                    _advice = (
+                        f"This line carries `{_carries}`; the copy already handled "
+                        f"for this (label, workspace) carries `{_kept_own}`. The "
+                        f"published `lane:` value is `{_carries}` — i.e. THIS "
+                        "line's. Keep this line (or copy that value onto the "
+                        "other line first)"
                     )
                 elif _carries:
                     _advice = (
-                        f"Both lines carry `{_carries}`, so either may be deleted"
+                        f"This line carries `{_carries}` and so does the copy "
+                        "already handled, so either may be deleted"
+                    )
+                elif _kept_own:
+                    _advice = (
+                        "This line carries no `lane:` value; the copy already "
+                        f"handled carries `{_kept_own}`, which is what the board "
+                        "publishes. Delete THIS line"
                     )
                 else:
                     _advice = (
-                        "Neither line carries a `lane:` value, so either may be "
-                        "deleted"
+                        "Neither this line nor the copy already handled carries a "
+                        "`lane:` value, so either may be deleted"
                     )
                 reason = (
                     f"registry row for '{row['lane']}' repeats {ws_gone} — the same "
@@ -1785,9 +1805,9 @@ def build_state(
                         f"registry row for '{row['lane']}' repeats {ws_gone}, "
                         "and the copy of this row was ALREADY dropped above for its "
                         "own reason — read that entry, which is the one that explains "
-                        "why this workspace is no longer a lane record. ⛔ This row "
-                        f"is the only one carrying `{_carries}`, which the board "
-                        "publishes — move that value onto the surviving row BEFORE "
+                        "why this workspace is no longer a lane record. ⛔ This line "
+                        f"carries `{_carries}`; if no surviving row for this label "
+                        "already carries that value, move it onto one BEFORE "
                         "deleting this line, or the label silently reverts"
                     )
                 else:
@@ -2661,15 +2681,18 @@ def cmd_violations(args: argparse.Namespace) -> int:
     # (It was that before #8845; a comment claiming it still is would tell a reader
     # that no roster row can be missing, which is false.) What survives is:
     # kept ⊆ registry, and EVERY arm leaves at least one row per label, so the label
-    # set that `violations` keys on is preserved. The guarantee is NOT that the other
-    # inputs are label-keyed — they are not: `disk_by_label` is built AFTER the filter
-    # from the surviving rows and is derived per WORKSPACE, `pane_sid_by_ws` is
-    # workspace-keyed too, and only `override_sid_by_label` is label-keyed. Because
-    # `disk_by_label[label]` is a per-row ASSIGNMENT, a trailing stale row used to
-    # ERASE the survivor's candidates, so the filter can only ever reveal more
-    # violations, never fewer. An unreadable registry still yields zero rows, hence
-    # zero claimed sessions, hence zero violations — the old code printed `none` on
-    # rc=0, byte-identical to a measured, genuinely-clean roster (PR #8594 review P2).
+    # set that `violations` keys on is preserved. The guarantee is not a
+    # monotonicity claim — the duplicate arm can REMOVE a violation (two identical
+    # rows for one workspace made `resolve_sessions` report a bogus
+    # "one session, many lanes" against the label itself), which is the right
+    # behaviour but is still a reduction, not an increase. What holds is narrower and
+    # is what matters: no arm can HIDE a genuine break. The other inputs are not
+    # label-keyed — `disk_by_label` is built AFTER the filter from the surviving rows
+    # and is derived per WORKSPACE, `pane_sid_by_ws` is workspace-keyed too, and only
+    # `override_sid_by_label` is label-keyed. An unreadable registry still yields zero
+    # rows, hence zero claimed sessions, hence zero violations — the old code printed
+    # `none` on rc=0, byte-identical to a measured, genuinely-clean roster (PR #8594
+    # review P2).
     if not _registry_readable(state, "violations", "cannot detect session-partition breaks"):
         return 2
     print(json.dumps(state["violations"], indent=2) if args.json else "\n".join(

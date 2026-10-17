@@ -295,6 +295,27 @@ def test_the_last_duplicate_rows_issue_label_wins(monkeypatch) -> None:
     assert "written twice is ONE lane" in orphan["reason"], orphan["reason"]
 
 
+def test_an_empty_duplicate_is_not_told_neither_line_carries_the_label(monkeypatch) -> None:
+    """The advice must branch on BOTH values, not on the reported row alone.
+
+    For `[lane:new, ""]` the REPORTED (dropped) row is the empty one and the kept
+    line carries `lane:new`. Branching on the reported row alone said "Neither line
+    carries a `lane:` value, so either may be deleted" — and permitted deleting the
+    only carrier, which reverts the published label (review of #8849, cycle 7).
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_LIVE, "lane:new"), (LABEL, WS_LIVE, "")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+    )
+    (lane,) = st["lanes"]
+    assert lane["claim"]["lane_label"] == "lane:new"
+    (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    assert "Neither" not in orphan["reason"], orphan["reason"]
+    assert "lane:new" in orphan["reason"], orphan["reason"]
+
+
 def test_a_dropped_rows_lane_label_does_not_overwrite_the_survivors(monkeypatch) -> None:
     """The survivor's OWN `lane:` value always wins over one inherited from a drop.
 
