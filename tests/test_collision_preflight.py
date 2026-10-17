@@ -100,6 +100,29 @@ if [ "$1 $2" = "api user" ]; then
   exit 0
 fi
 
+# REST issue metadata (#3435): `gh api repos/<slug>/issues/<N>`, the fallback the
+# tool takes when the GraphQL budget is exhausted. Deliberately emits REST's
+# LOWERCASE `state` and `html_url`, so a test proves the normalisation onto the
+# `gh issue view --json` shape rather than assuming the two agree.
+if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
+  # ⛔ MIRROR THE REAL ENDPOINT'S FAILURES, or the fallback becomes a fail-open
+  # TEST HARNESS: a branch that always answers would "rescue" the absent-issue
+  # and unqueryable-repo cases this suite relies on staying INCOMPLETE.
+  if [ "${GH_STUB_ISSUE_REST_FAIL:-0}" = "1" ]; then
+    echo "gh-stub: HTTP 403: Resource not accessible" >&2
+    exit 1
+  fi
+  if [ "${GH_STUB_ISSUE_ABSENT:-0}" = "1" ]; then
+    echo "gh-stub: HTTP 404: Not Found" >&2
+    exit 1
+  fi
+  if [ -f "$d/probe_unqueried.txt" ] && grep -qx "$repo" "$d/probe_unqueried.txt"; then
+    echo "gh-stub: could not connect to api.github.com" >&2; exit 1
+  fi
+  printf '{"number": %s, "title": "florfenicol dosing audit", "state": "open", "state_reason": null, "assignees": [], "html_url": "https://github.com/%s/issues/%s"}\n' "${2##*/}" "$repo" "${2##*/}"
+  exit 0
+fi
+
 case "$1 $2" in
   "pr list")
     # #3587: the `gh pr list` GraphQL path for CLOSED PRs resets on this host
@@ -173,6 +196,13 @@ case "$1 $2" in
     # A number ABSENT from the target repo is not "no in-flight work" (#4027).
     if [ "${GH_STUB_ISSUE_ABSENT:-0}" = "1" ]; then
       echo "GraphQL: Could not resolve to an issue or pull request with the number of $3. (repository.issue)" >&2
+      exit 1
+    fi
+    # #3435: GraphQL budget exhausted while REST still answers. The exact text
+    # the real CLI prints on this host, which is NOT "the issue could not be
+    # read" — it is "this endpoint is out of budget".
+    if [ "${GH_STUB_ISSUE_VIEW_RATE_LIMITED:-0}" = "1" ]; then
+      echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
       exit 1
     fi
     # Probe form (the cross-repo ambiguity check asks for `--json number` only).
@@ -2305,6 +2335,37 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertNotIn("VERDICT: CLEAN", out)
         self.assertIn("OPEN-ISSUE read hit its cap", out)
+
+    def test_graphql_exhaustion_falls_back_to_rest_instead_of_incomplete(self):
+        # ⛔ THE INSTRUMENT HOLDING THE DATUM AND NOT READING IT (#3435).
+        # `gh issue view` is GraphQL-only. When that bucket empties, the tool
+        # used to report the issue surface INCOMPLETE — and because the landed
+        # surface reads the issue's `state`, it went INCOMPLETE too. Measured
+        # live: EVERY pre-flight in the fleet fails with exit 2 while `gh api`
+        # answers the identical question on REST's separate budget. A refusal
+        # it could have measured is not a refusal, it is a blind spot.
+        rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertNotIn("issue-metadata-unavailable", out)
+        self.assertNotIn("VERDICT: INCOMPLETE", out)
+        # The REST payload says "open" (lowercase) where GraphQL says "OPEN".
+        # The landed surface must still read it as OPEN and consult the
+        # timeline; a case-sensitive compare would silently skip that query.
+        self.assertIn("issue state=OPEN", out)
+
+    def test_graphql_exhaustion_with_rest_also_down_still_fails_closed(self):
+        # The fallback must never become a fail-open. With BOTH budgets gone the
+        # tool has genuinely read nothing, so it must still refuse — otherwise
+        # "try REST" would convert an unmeasured issue into a CLEAN verdict.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+            "GH_STUB_ISSUE_REST_FAIL": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        self.assertIn("issue-metadata-unavailable", out)
 
     def test_a_truncated_board_still_blocks_a_live_holder(self):
         # The truncation refusal is scoped to ABSENCE: a board that DID attribute a

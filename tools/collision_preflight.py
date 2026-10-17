@@ -2653,6 +2653,44 @@ def _gh_json(gh_bin: str, args: list[str], repo: str, timeout: float):
         ) from exc
 
 
+def _issue_view_rest(gh_bin: str, slug: str, issue: int, cwd: str,
+                     timeout: float) -> dict | None:
+    """Read issue metadata over REST when the GraphQL budget is exhausted.
+
+    `gh issue view` is GraphQL-ONLY. When that budget runs out — which happens
+    routinely on this fleet, and is what made this tool report three unqueryable
+    surfaces for #3435 while `gh api` answered the identical question in the very
+    next call — EVERY pre-flight reports INCOMPLETE. That is the instrument
+    holding the datum and refusing to read it: it fails closed on a condition it
+    could have measured, rather than on one it could not.
+
+    REST has a SEPARATE budget, so one fallback turns that false INCOMPLETE back
+    into a real answer. Returns None when REST cannot answer either, so the
+    caller's existing fail-closed classification is unchanged: this can only ever
+    convert a spurious failure into a reading, never a failure into a pass.
+
+    The shape is normalised to what `gh issue view --json` returns, because the
+    downstream code reads exactly those keys and compares `state`
+    case-insensitively (REST says 'open', GraphQL says 'OPEN').
+    """
+    try:
+        raw = _gh_json(gh_bin, ["api", f"repos/{slug}/issues/{issue}"], cwd, timeout)
+    except SurfaceError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "number": raw.get("number"),
+        "title": raw.get("title"),
+        "state": raw.get("state"),
+        "stateReason": raw.get("state_reason"),
+        "assignees": [
+            {"login": (a or {}).get("login")} for a in (raw.get("assignees") or [])
+        ],
+        "url": raw.get("html_url"),
+    }
+
+
 # An RFC-8288 link relation may be QUOTED or UNQUOTED (`rel="last"` / `rel=last`),
 # and a response may carry MORE THAN ONE `Link:` header line. Both forms are
 # matched here, and the caller joins every header line before parsing, because a
@@ -4437,17 +4475,33 @@ def run_preflight(
             else:
                 raise SurfaceError("gh issue view returned non-object JSON")
         except SurfaceError as exc:
-            kind = _classify_issue_error(exc)
-            if kind == "issue-absent":
-                msg = (
-                    f"issue-absent: #{issue} does not exist in {slug} — "
-                    "\"not found here\" is NOT \"no in-flight work\" (fail closed)"
+            # ONLY a budget exhaustion is eligible for the REST fallback. Any other
+            # failure is a genuine "could not read", and rescuing it from a second
+            # endpoint would turn a real refusal into a reading — the fail-open
+            # direction. Match the phenomenon, not the exception type.
+            _exhausted = "rate limit" in str(exc).lower()
+            rescued = (
+                _issue_view_rest(gh_bin, slug, issue, cwd, timeout)
+                if _exhausted else None
+            )
+            if rescued is not None:
+                _require_issue_payload(
+                    rescued, f"gh api repos/{slug}/issues/{issue}"
                 )
-            elif kind == "repo-unresolved":
-                msg = f"repo-unresolved: {slug} could not be resolved"
+                issue_data = rescued
+                title = rescued.get("title") or None
             else:
-                msg = f"gh-unavailable: {exc}"
-            surfaces[SURFACE_ISSUE].incomplete(msg)
+                kind = _classify_issue_error(exc)
+                if kind == "issue-absent":
+                    msg = (
+                        f"issue-absent: #{issue} does not exist in {slug} — "
+                        "\"not found here\" is NOT \"no in-flight work\" (fail closed)"
+                    )
+                elif kind == "repo-unresolved":
+                    msg = f"repo-unresolved: {slug} could not be resolved"
+                else:
+                    msg = f"gh-unavailable: {exc}"
+                surfaces[SURFACE_ISSUE].incomplete(msg)
     # 1.5 THE LANDED ANSWER (#8560) — the authoritative "is #N already done?".
     #     Scanned HERE, right after the issue metadata (whose `state` it reads)
     #     and BEFORE the in-flight surfaces, so its verdict is decided even if
