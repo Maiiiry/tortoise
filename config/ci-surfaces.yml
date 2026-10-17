@@ -1267,6 +1267,19 @@ surfaces:
   # without the `sdk` arm (#2938 class; `tortoise/sdk.py` itself is a
   # SHARED_MODULE, so an sdk.py diff selects the full matrix anyway).
   - test_7936_stable_stub_ids.py
+  # #7936: the REFERENCE FOLD's graph index is `(label, id)`, not `:Point`.
+  # Pins the false-GREEN half of the issue's own root: a graph-only
+  # `:Object`/`:Subject`/`:Event` node — or a belief/`status` write on one with
+  # no journal record — left `db_hash` unmoved (`ok=True, divergence=None`) while
+  # the SAME mutation on a `:Point` was `unrecorded-mutation`. `core` alone: it
+  # drives `tortoise/consistency.py` (no named SOURCE_PATTERN, so a
+  # consistency-only change selects `core`) through `check_consistency`, and the
+  # `format_version` bump it pins lives in that same module. Its journal fixtures
+  # carry no Points, so `tortoise/projection/entities.py` and `tortoise/ids.py`
+  # are reached only for the name-stub half — the `sdk` registration of
+  # `test_7936_stable_stub_ids.py` (above) is the arm that covers an
+  # `ids.py`-only change.
+  - test_7936_reference_fold_label_rekey.py
   # #4220: DB-free guards for the blog-residue cleanup script (prefix + created_by
   # guards, dry-run is non-destructive, delete verifies 0 remain) and the suite's
   # write/read marker split. No DB, no network — default `core` surface is correct.
