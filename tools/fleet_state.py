@@ -92,11 +92,12 @@ registry row that is not a lane record (#8845) leaves `rows`, but every dropped
 row is published as an orphan of kind `registry-stale` saying which arm dropped
 it — deleting the roster line is a human's call, not this module's. Three arms
 drop and they are NOT one rule: a row whose (label, workspace) repeats one
-already kept is a DUPLICATE, de-duplicated even when the cmux list could not be
-read (both rows name one workspace, so no verdict moves); a row whose workspace
-is absent from a MEASURED list while another row for the label binds evidence is
-dropped as stale; and a second UNBOUND row for a label is dropped so the label
-is not enumerated twice, which needs no evidence-binding neighbour at all.
+already SEEN — kept, or already dropped by another arm — is a DUPLICATE,
+de-duplicated even when the cmux list could not be read (both rows name one
+workspace, so no verdict moves); a row whose workspace is absent from a MEASURED
+list while another row for the label binds evidence is dropped as stale; and a
+second UNBOUND row for a label is dropped so the label is not enumerated twice —
+that one also requires a MEASURED list (it is a retirement, not a de-duplication).
 Polarity is fail-OPEN with provenance: an unreadable
 workspace list retires NOTHING, and ``reconciliation.workspaces_measured`` says
 so — a cmux outage must never hide a real lane, and a fail-open path must not be
@@ -1344,12 +1345,17 @@ def build_state(
         # carries the corrected one (review of #8849, cycle 3).
         if issue_label:
             issue_label_by_label[label] = issue_label
+        # Exact duplicates are the ONE place last-wins applies, and it has to be
+        # applied to the KEPT tuple: a registrar that appends a corrected line
+        # leaves the correction at the end, and first-wins would publish the stale
+        # label and then tell the human to delete the row carrying the correction.
 
     kept: list[tuple[str, str, str]] = []
     stale_rows: list[dict[str, str]] = []
     unbound_kept: set[str] = set()
     seen_rows: set[tuple[str, str]] = set()
     kept_keys: set[tuple[str, str]] = set()
+    kept_pos: dict[tuple[str, str], int] = {}
     for label, ws, issue_label in registry:
         evidence = row_binds_evidence(ws)
         # (0) THE SAME (label, workspace) TWICE IS ONE LANE WRITTEN TWICE — a
@@ -1363,6 +1369,13 @@ def build_state(
         # HOLDER_UNMEASURED -> exit 2 on a perfectly readable lane — the failure
         # #8845 exists to remove (review of #8849).
         if (label, ws.upper()) in seen_rows:
+            # LAST-WINS for the one column two duplicate rows can differ in (see the
+            # comment in the loop above): adopt this row's non-empty `lane:` label on
+            # the copy that was kept, then report the dropped line.
+            if issue_label:
+                _pos = kept_pos.get((label, ws.upper()))
+                if _pos is not None:
+                    kept[_pos] = (label, ws, issue_label)
             stale_rows.append({
                 "lane": label, "workspace": ws, "issue_label": issue_label,
                 "arm": "duplicate",
@@ -1407,10 +1420,16 @@ def build_state(
             unbound_kept.add(label)
         kept.append((label, ws, issue_label))
         kept_keys.add((label, ws.upper()))
+        kept_pos[(label, ws.upper())] = len(kept) - 1
     # A dropped row may be the only one carrying the label's `lane:` label; the
-    # surviving row inherits it rather than losing it.
+    # surviving row inherits it rather than losing it — but ONLY when the survivor
+    # has none of its own. The survivor's own value always wins: otherwise a row the
+    # board has just classified as "not a lane record", for a DIFFERENT workspace,
+    # would author the surviving lane's label and then the orphan would tell the
+    # human to delete that very row — following the instruction would silently
+    # change the published label (review of #8849, cycle 4).
     kept = [
-        (label, ws, issue_label_by_label.get(label) or issue_label)
+        (label, ws, issue_label or issue_label_by_label.get(label, ""))
         for label, ws, issue_label in kept
     ]
 
@@ -2472,7 +2491,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 f"{args.lane!r} is a STALE REGISTRY ROW, not a lane: {where} "
                 "is absent from the live cmux list and the row "
                 "binds no pane binding or session record of its own (#8845) — delete the "
-                "roster row; `fleet-state orphans` lists it",
+                "roster row; `python tools/fleet_state.py orphans` lists it",
                 file=sys.stderr,
             )
             return 1

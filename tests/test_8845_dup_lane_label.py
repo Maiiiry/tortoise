@@ -284,6 +284,26 @@ def test_the_last_duplicate_rows_issue_label_wins(monkeypatch) -> None:
     assert lane["claim"]["lane_label"] == "lane:new"
 
 
+def test_a_dropped_rows_lane_label_does_not_overwrite_the_survivors(monkeypatch) -> None:
+    """The survivor's OWN `lane:` value always wins over one inherited from a drop.
+
+    Inheritance exists because a dropped row may be the ONLY one carrying the label.
+    But when the survivor has one of its own, a row the board has just classified as
+    "not a lane record" — for a DIFFERENT workspace — must not author the published
+    label, because the orphan then tells the human to delete that very row: obeying
+    the board would silently change the label (review of #8849, cycle 4).
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_LIVE, "lane:current"), (LABEL, WS_STALE, "lane:ancient")],
+        live={WS_LIVE: {"cwd": WT_1}},
+        worktrees={WT_1: {"branch": "refs/heads/fix/8818-pin-prose", "head": HEAD}},
+    )
+    assert st["summary"]["stale_registry"] == 1
+    (lane,) = st["lanes"]
+    assert lane["claim"]["lane_label"] == "lane:current"
+
+
 def test_the_duplicate_reason_does_not_cite_a_list_that_was_never_read(monkeypatch) -> None:
     """...and it must not cite the live list at all when the list was unreadable.
 

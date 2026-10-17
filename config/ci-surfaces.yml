@@ -5694,9 +5694,11 @@ durations:
   test_8845_dup_lane_label.py: 6.8  # unmeasured — local wall reading on a private test lane, not a junit sweep; refresh from the next sweep
   # #8849: unmeasured — no leg of the four source sweeps collected this file, so
   # it was packing at the flat 2.0s default. 4.9 is the local wall reading on
-  # this host (5 tests, 4.91s), the same carry-forward shape as #4602/#5275.
+  # this host, the same carry-forward shape as #4602/#5275. The test count is
+  # deliberately NOT stated — a hand-written count in this map goes stale the moment
+  # a test is added, which is the failure this file exists to catch.
   # Refresh from the next sweep that collects it.
-  test_1890_invite_ghost_sweep_schedule.py: 4.9  # unmeasured — local wall reading (5 tests), no source leg collected it; refresh from the next sweep
+  test_1890_invite_ghost_sweep_schedule.py: 4.9  # unmeasured — local wall reading, no source leg collected it; refresh from the next sweep
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py
