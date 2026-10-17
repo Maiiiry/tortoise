@@ -4,8 +4,11 @@
 listed ``update_point`` (and therefore ``annotate_operator``, which delegates to
 it) among the UNWIRED surfaces, alongside ``invalidate_point``'s two statements,
 which fell under "the remaining direct ``proj.g.query`` write sites". This file
-pins each of those statements as wired, one test per SURFACE, so the header can
-stay the single source of truth without over-claiming.
+pins every statement group this PR wires — one test per wrapped statement,
+not one per verb — so the header can stay the single source of truth without
+over-claiming. The two arms that a per-verb reading would have left unpinned
+(`:Point:Object` + ``status`` promote, and the derived-embedding clear+set) have
+their own tests, each failing on the pre-fix bare ``proj.g.query``.
 
 ``update_point`` is the SDK's most common mutation door, so the pre-fix
 behaviour is the #7405 asymmetry in its sharpest form: while a rebuild/replace
@@ -66,7 +69,19 @@ _POINT_PROP_SET_NEEDLE = "MATCH (n:Point {id:$id}) SET n += $props"
 _POINT_PROMOTE_NEEDLE = (
     "n.status = 'live', n.updatedAt = $now, n += $props")
 _OBJECT_PROP_SET_NEEDLE = ":Point:Object {id:$id}) SET n += $props"
+# The ``:Point:Object`` promote arm carries the version bump BETWEEN ``$now,``
+# and ``n +=``, which is why the plain promote needle above does NOT match it —
+# the two arms are separate statements and need separate tests (#8854 review).
+_OBJECT_PROMOTE_NEEDLE = (
+    "n.status = 'live', n.updatedAt = $now, "
+    "n.version = coalesce(n.version, 0) + 1, n += $props")
+# The derived-embedding arm is the ONLY writer that in-query CLEARS the stored
+# vector before setting it, so the clear-prefix fragment identifies it alone
+# (the per-key ``SET n += $props`` loop never touches ``n.embedding``).
+_EMBEDDING_NEEDLE = (
+    "REMOVE n.embedding) SET n.embedding = CASE WHEN $embedding IS NOT NULL")
 _TAGGED_NEEDLE = "MERGE (t:Tag {name:$tag}) "
+_TAG_GC_NEEDLE = "WHERE NOT (t)<-[:TAGGED]-() DELETE t"
 _INVALIDATE_STAMP_NEEDLE = "SET n.outdated = true"
 _INVALIDATE_CORRECTS_NEEDLE = "MERGE (a)-[:CORRECTS]->(b)"
 _RETRACT_CAS_NEEDLE = "SET n.status = 'retracted'"
@@ -86,18 +101,24 @@ class _AbortOnceGraph:
     """
 
     def __init__(self, real, needle: str, *, aborts: int = 1,
-                 present: bool = True) -> None:
+                 present: bool = True, skip: int = 0) -> None:
         self._real = real
         self._needle = needle
         self._aborts = aborts
         self._present = present
+        self._skip = skip
         self.matching = 0
         self.applied = 0
 
     def query(self, cypher, params=None, timeout=None):
         if self._needle in cypher:
             self.matching += 1
-            if self.matching <= self._aborts:
+            # ``skip`` lets a test abort a statement that is NOT the first
+            # matching one — the discriminator for "is the whole per-key loop
+            # one retry budget?" (`test_the_per_key_loop_shares_one_retry_budget`):
+            # a single budget re-issues the keys that already landed, a
+            # per-key budget does not.
+            if self._skip < self.matching <= self._skip + self._aborts:
                 raise redis_exc.ResponseError(_DELETED_OR_REPLACED)
             self.applied += 1
         return self._real.query(cypher, params=params, timeout=timeout)
@@ -373,6 +394,170 @@ def test_a_rebuild_abort_on_the_retract_cas_set_is_retried(tmp_path):
         proj.g = proxy._real
         assert retracted["status"] == "retracted"
         assert sdk.get_point(pid)["status"] == "retracted"
+    finally:
+        with contextlib.suppress(Exception):
+            sdk.close()
+
+
+# ── 9. the ``:Point:Object`` PROMOTE arm (``:Object`` label AND ``status``) ──
+
+
+def test_a_rebuild_abort_on_the_object_promote_set_is_retried(tmp_path):
+    """The ``:Object`` promote arm is a THIRD statement, and is retried too.
+
+    #8854 review P2: without this test the object-promote arm was claimed as
+    pinned but nothing reached it — test 2 passes a bare ``:Point``, and test 3
+    adds ``:Object`` without a ``status``. The two promote statements differ by
+    the intervening ``n.version = coalesce(n.version, 0) + 1`` clause, so the
+    plain promote needle cannot match this one (and this needle cannot match
+    that one): the arms are genuinely separate and each needs its own proof.
+    The risk this pins is real — the arm carries a RELATIVE increment inside a
+    RE-ISSUED statement, which is only safe because an abort means the
+    statement did not land.
+    """
+    sdk = _sdk(tmp_path, "objpromote")
+    try:
+        pid = sdk.create_point(
+            "evidence", f"draft object {uuid.uuid4().hex}",
+            status="draft")["id"]
+        proj = sdk._get_proj()
+        proj.g.query(
+            "MATCH (n:Point {id:$id}) SET n:Object", params={"id": pid})
+        proxy = _AbortOnceGraph(proj.g, _OBJECT_PROMOTE_NEEDLE, present=True)
+        proj.g = proxy
+
+        sdk.update_point(pid, status="live")
+
+        assert proxy.matching >= 2, (
+            "the aborted :Object promote SET was never re-issued")
+        assert proxy.applied == 1, "exactly one application"
+        proj.g = proxy._real
+        point = sdk.get_point(pid)
+        assert point["status"] == "live"
+        assert point["version"] == 1, (
+            "one promotion, one version bump — a re-issued relative increment "
+            "must not double")
+    finally:
+        with contextlib.suppress(Exception):
+            sdk.close()
+
+
+# ── 10. the derived-embedding clear+set ────────────────────────────────
+
+
+def test_a_rebuild_abort_on_the_derived_embedding_set_is_retried(tmp_path):
+    """``update_point(content=…)``'s clear+set vector write is retried.
+
+    #8854 review P2: ``_derived_embedding`` is true only when the caller passes
+    ``content`` with no ``embedding``, so no other test in this file reaches
+    this statement at all. It is the crash-sensitive seam (an in-query CLEAR
+    followed by the typed SET), and the only arm whose needle is the
+    ``REMOVE n.embedding`` prefix rather than a ``SET`` fragment — the per-key
+    loop's ``SET n += $props`` writes ``content`` and never touches the vector.
+    """
+    sdk = _sdk(tmp_path, "derivedembed")
+    try:
+        pid = _pid(sdk)
+        revised = f"revised claim {uuid.uuid4().hex}"
+        proj = sdk._get_proj()
+        proxy = _AbortOnceGraph(proj.g, _EMBEDDING_NEEDLE, present=True)
+        proj.g = proxy
+
+        sdk.update_point(pid, content=revised)
+
+        assert proxy.matching >= 2, (
+            "the aborted embedding clear+set was never re-issued")
+        assert proxy.applied == 1, (
+            "exactly one application — a re-issued absolute clear+set "
+            "converges")
+        proj.g = proxy._real
+        assert sdk.get_point(pid)["content"] == revised
+    finally:
+        with contextlib.suppress(Exception):
+            sdk.close()
+
+
+# ── 11. the orphan-``:Tag`` sweep after a retried tag sync ─────────────
+
+
+def test_a_retried_tag_sync_still_sweeps_the_orphaned_tag(tmp_path):
+    """The orphan ``:Tag`` GC must survive a retry that follows a LANDED delete.
+
+    #8854 review P3: ``_sync_tags`` keys its GC off ``removed``, a
+    PER-INVOCATION counter. A first attempt can land the ``DELETE r`` and then
+    be aborted on the GC statement; the retry re-reads ``stale``, finds nothing
+    left to delete, and a counter-gated sweep would be SKIPPED — stranding an
+    orphan ``:Tag`` that ``list_tags`` reports as ``count: 0`` while a rebuilt
+    graph (which replays the reconciler from a clean state) has none. The sweep
+    is therefore forced on the retried update path, so it is a function of the
+    caller's tag list and not of the attempt.
+    """
+    sdk = _sdk(tmp_path, "taggc")
+    try:
+        pid = _pid(sdk)
+        keep = f"7405keep{uuid.uuid4().hex[:8]}"
+        drop = f"7405drop{uuid.uuid4().hex[:8]}"
+        sdk.update_point(pid, tags=[keep, drop])
+        proj = sdk._get_proj()
+        proxy = _AbortOnceGraph(proj.g, _TAG_GC_NEEDLE, present=True)
+        proj.g = proxy
+
+        sdk.update_point(pid, tags=[keep])
+
+        assert proxy.matching >= 2, (
+            "the aborted orphan sweep was never re-issued")
+        assert proxy.applied == 1, "exactly one application"
+        proj.g = proxy._real
+        rows = proj.g.query(
+            "MATCH (t:Tag {name:$name}) RETURN count(t)",
+            params={"name": drop}).result_set
+        assert rows and rows[0][0] == 0, (
+            "the dropped tag's :Tag node must be swept — a retried sync that "
+            "skips it leaves live != replay")
+    finally:
+        with contextlib.suppress(Exception):
+            sdk.close()
+
+
+# ── 12. one retry BUDGET for the whole per-key loop ────────────────────
+
+
+def test_the_per_key_loop_shares_one_retry_budget(tmp_path):
+    """The per-key loop is ONE ``_graph_write_with_retry`` call, not one per key.
+
+    #8854 review P2: the budget is per CALL (``retries=3`` → one 7–14 s
+    window), so wrapping each key separately made ``annotate_operator``'s FOUR
+    properties cost four windows before raising — a caller-visible latency
+    regression on the SDK's most-used mutation door, buying nothing in the
+    multi-minute window #7405 measured. Aborting the FOURTH key's statement and
+    asserting the FIRST key was re-issued distinguishes the two shapes: a single
+    budget re-issues all four (8 matching, 7 applied); a per-key budget issues
+    the first key once (5 matching).
+    """
+    sdk = _sdk(tmp_path, "onebudget")
+    try:
+        src = _pid(sdk)
+        tgt = _pid(sdk)
+        op = sdk.create_operator("IMPL", src, [tgt])["id"]
+        proj = sdk._get_proj()
+        # Abort the 4th per-key statement — i.e. NOT the first one, so only a
+        # whole-loop re-issue makes the 1st key's statement count as twice.
+        proxy = _AbortOnceGraph(
+            proj.g, _POINT_PROP_SET_NEEDLE, present=True, skip=3, aborts=1)
+        proj.g = proxy
+
+        sdk.annotate_operator(op, bias=0.2, precision=0.8,
+                              consistency=0.7, directness=0.9)
+
+        assert proxy.matching == 8, (
+            "the whole per-key loop must be re-issued after one abort — one "
+            "retry budget for the loop, not one per key")
+        assert proxy.applied == 7, (
+            "all four keys land, exactly one re-issue apiece")
+        proj.g = proxy._real
+        point = sdk.get_point(op)
+        assert point["annotator_consistency"] == pytest.approx(0.7)
+        assert point["annotator_directness"] == pytest.approx(0.9)
     finally:
         with contextlib.suppress(Exception):
             sdk.close()

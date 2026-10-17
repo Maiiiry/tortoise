@@ -63,8 +63,10 @@ did not land" guarantee is per-statement and does not extend to the enclosing
 fold. Also unwired: ``supersede_point`` (its statements are individually
 idempotent — ``MERGE`` / DELETE by ``ID(r)`` / ``SET r += $attrs`` — but the
 multi-statement transfer is deliberately left to a separate increment),
-``revert_rows`` and the remaining direct ``proj.g.query``
-write sites across ``tortoise/``.
+``_apply_source_inheritance``'s revert ``REMOVE n.ep_alpha, …`` plus the
+baseline ``SET`` that path inherits through (``set_point_baseline``'s
+``SET n.ep_alpha = $a, …``), and the remaining direct ``proj.g.query`` write
+sites across ``tortoise/``.
 ``merge_points`` is not a direct graph write at all: it is an ``EventAPI``
 journal emit (``tortoise/api.py``) whose graph effect is the ``proj.apply``
 fold above. A write abort at any of these still raises (or is downgraded by the

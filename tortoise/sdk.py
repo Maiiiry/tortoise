@@ -5454,7 +5454,12 @@ class TortoiseSDK:
         also raised, so that is not a regression).
 
         What this buys, stated honestly: a rebuild window of roughly 7-14 s now
-        heals in place (``base=2.0``, 3 retries). The window #7405 measured
+        heals in place (``base=2.0``, 3 retries). The window is per CALL, not
+        per verb: the whole ``fn`` is re-issued together, so a caller that
+        issues several statements inside one ``fn`` (``update_point``'s
+        per-key loop, ``_sync_tags``) shares that one budget, and a verb that
+        wraps twice (``update_point`` with tags: the property write, then the
+        tag sync) is bounded by two of them. The window #7405 measured
         lasted **over an hour**, and no bounded retry should wait that long — so
         on exhaustion the original error still surfaces, **unchanged in type**.
 
@@ -5472,6 +5477,16 @@ class TortoiseSDK:
         ``retryable_aborted_write`` re-raises anything it does not recognise, so
         a deterministic failure (a malformed statement, ``WRONGTYPE``) is never
         retried and never wrapped in the sentinel.
+
+        #8854 review P2: the budget is per CALL, and ``fn`` is the unit of
+        retry — so the bound belongs to the caller's ``fn``, not to the verb.
+        A multi-statement ``fn`` (``update_point``'s per-key ``SET`` loop,
+        ``_sync_tags``' MERGE/read/DELETE sequence) is re-issued as a whole and
+        shares ONE 7-14 s window; a verb that calls this twice
+        (``update_point`` with tags) is bounded by two. Callers must keep the
+        count of calls per verb deliberate rather than assuming a fixed bound
+        per verb — the per-key loop is one call precisely so
+        ``annotate_operator``'s four properties do not multiply it.
 
         Retry budget (#7405 P2-2). This inner loop owns the write refusals
         (graph-replaced / write-lock / MISCONF) with ``retries=3`` (~7-14 s) and
@@ -5734,7 +5749,8 @@ class TortoiseSDK:
 
     # ── Core CRUD ─────────────────────────────────────────────────
 
-    def _sync_tags(self, proj: FalkorProjection, pid: str, tags) -> None:
+    def _sync_tags(self, proj: FalkorProjection, pid: str, tags,
+                   *, sweep_orphans: bool = False) -> None:
         """Reconcile TAGGED edges for a point against a tags value (#485).
 
         DELEGATES to the projection's own `_sync_tags` (#2897): live and
@@ -5743,8 +5759,12 @@ class TortoiseSDK:
         projection is the owner of the write; this method is kept as the SDK
         entry point so the existing call sites (and their
         `_graph_write_with_retry` wrapping) are unchanged.
+
+        `sweep_orphans` is forwarded verbatim: `update_point` sets it because a
+        retried reconciler can skip the orphan-`:Tag` GC otherwise (#8854
+        review P3 — see the projection method's docstring).
         """
-        proj._sync_tags(pid, tags)
+        proj._sync_tags(pid, tags, sweep_orphans=sweep_orphans)
 
     # ── Events: cursor-based poll (Task 5) ────────────────────────────
 
@@ -10285,18 +10305,35 @@ class TortoiseSDK:
                 if not res.result_set:
                     _raise_update_point_status_error(proj, id)
             else:
-                for key, val in _props_param.items():
-                    # #7405: one key per statement, each an absolute
-                    # `SET n += $props` — a re-issue writes the same value to
-                    # the same key, so it cannot double-apply or clobber a
-                    # sibling key this loop has not reached yet.
-                    self._graph_write_with_retry(
-                        lambda key=key, val=val: proj.g.query(
+                # #7405: one key per statement, each an absolute
+                # `SET n += $props` — a re-issue writes the same value to
+                # the same key, so it cannot double-apply or clobber a
+                # sibling key the loop has not reached yet.
+                #
+                # ⛔ ONE retry budget for the WHOLE loop, not one per key
+                # (#8854 review P2). The budget in
+                # `_graph_write_with_retry` is per CALL (`retries=3` → one
+                # 7-14 s window), so wrapping each key separately made the
+                # caller-visible bound scale with the property count:
+                # `annotate_operator` always passes FOUR keys
+                # (`annotator_bias`/`_precision`/`_consistency`/`_directness`)
+                # and would have blocked 4x the documented window before
+                # raising — while buying nothing, because the #7405 window it
+                # cannot outlast refuses EVERY key. Re-issuing the whole loop
+                # is safe for the same reason each key is: an abort means the
+                # statement did not land, and every statement is an absolute
+                # `SET` of a value fixed before the first attempt, so the keys
+                # that DID land in the aborted attempt are rewritten to the
+                # same value rather than re-applied.
+                def _write_props() -> None:
+                    for key, val in _props_param.items():
+                        proj.g.query(
                             "MATCH (n:Point {id:$id}) SET n += $props",
                             params={"id": id, "props": {key: val}},
-                        ),
-                        what="update_point SET (per-key)",
-                    )
+                        )
+
+                self._graph_write_with_retry(
+                    _write_props, what="update_point SET (per-key)")
                 if _derived_embedding:
                     # The clear and the set are ONE atomic query, so a crash
                     # between them cannot leave the node vectorless. This arm
@@ -10324,8 +10361,17 @@ class TortoiseSDK:
         # dropped ones by an explicit id, so a re-issue after a non-landing
         # abort converges on the caller's tag list.
         if "tags" in props:
+            # `sweep_orphans=True`: the orphan-`:Tag` GC inside `_sync_tags`
+            # normally keys off the edges THIS invocation deleted, and a retry
+            # re-invokes the whole helper — after an abort that landed the
+            # `DELETE r` before the GC statement, the re-read finds nothing
+            # stale and the GC would be skipped, leaving an orphan `:Tag` that
+            # a rebuilt graph (which never had one) does not have. Passing it
+            # unconditionally makes the sweep a function of the caller's tag
+            # list, not of a per-invocation counter (#8854 review P3).
             self._graph_write_with_retry(
-                lambda: self._sync_tags(proj, id, props["tags"] or []),
+                lambda: self._sync_tags(
+                    proj, id, props["tags"] or [], sweep_orphans=True),
                 what="update_point TAGGED edges",
             )
         # Dreaming (#85): property mutations can affect confidence.
