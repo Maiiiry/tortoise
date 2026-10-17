@@ -38,12 +38,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from tortoise.consistency import (
     _PROJECTION_STATE_FORMAT,
     _PROJECTION_STATE_FORMAT_HISTORY,
     check_consistency,
     projection_state_path,
+    record_projection_state,
 )
 from tortoise.projection import FalkorProjection
 
@@ -188,7 +190,7 @@ def test_a_graph_only_non_point_status_write_is_an_unrecorded_mutation(tmp_path)
 # The index's LABEL SET — one home (the drift that would reopen the bug)
 # ═══════════════════════════════════════════════════════════════════════
 
-def test_the_graph_view_label_set_has_one_home():
+def test_the_graph_view_label_set_has_one_home(monkeypatch):
     """The index's labels are DERIVED from the entity fold's declaration.
 
     A hand-copied label literal is a fail-open with no pin: a fourth creation
@@ -198,17 +200,99 @@ def test_the_graph_view_label_set_has_one_home():
     new label leaves ``db_hash`` unmoved, which is exactly the bug this file
     exists for, returned for a new label. ``_ENTITY_CREATION`` is the declared
     single home; this pins ``_graph_view``'s set to it.
-    """
-    from tortoise.consistency import _GRAPH_VIEW_LABELS
-    from tortoise.projection import _REFERENCE_FOLD_ENTITY_LABELS
 
+    Pinned on the QUERY, not only on the constant (review): a constant-level
+    pin cannot see a re-inlined literal in ``_graph_view`` — the constant would
+    still be correct while the query emitted the old labels — so the emitted
+    Cypher is read back through a stub projection with the constant
+    monkeypatched to a single label. FAILS IF: the ``WHERE`` clause stops being
+    built from ``_GRAPH_VIEW_LABELS``.
+    """
+    from tortoise import consistency
+    from tortoise.projection import _ENTITY_ID_PROP, _REFERENCE_FOLD_ENTITY_LABELS
+
+    _GRAPH_VIEW_LABELS = consistency._GRAPH_VIEW_LABELS
     assert set(_GRAPH_VIEW_LABELS) == {"Point"} | set(
         _REFERENCE_FOLD_ENTITY_LABELS), _GRAPH_VIEW_LABELS
-    assert _GRAPH_VIEW_LABELS[0] == "Point"
-    assert tuple(sorted(_GRAPH_VIEW_LABELS))
+    # Order, not just set membership: `Point` first (the lifecycle the Point
+    # leg was built around) and the rest sorted, so the emitted predicate is
+    # deterministic. `tuple(sorted(x))` was always truthy — a no-op assertion.
+    assert _GRAPH_VIEW_LABELS == ("Point", *sorted(
+        _REFERENCE_FOLD_ENTITY_LABELS)), _GRAPH_VIEW_LABELS
     # A duplicate would emit a redundant `n:X OR n:X` predicate and hide an
     # accidental subtraction from the tuple.
     assert len(set(_GRAPH_VIEW_LABELS)) == len(_GRAPH_VIEW_LABELS)
+    # A label with no `_ENTITY_ID_PROP` entry is indexed under NOTHING —
+    # `_graph_view_key` returns None for every node of it, which is the same
+    # silent drop the derivation exists to close.
+    assert all(label in _ENTITY_ID_PROP for label in _GRAPH_VIEW_LABELS), (
+        _GRAPH_VIEW_LABELS)
+
+    class _RecordingProjection:
+        def __init__(self):
+            self.cyphers: list[str] = []
+
+        def query(self, cypher, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.cyphers.append(cypher)
+            return SimpleNamespace(result_set=[])
+
+    monkeypatch.setattr(consistency, "_GRAPH_VIEW_LABELS", ("Point",))
+    recorder = _RecordingProjection()
+    assert consistency._graph_view(recorder) == {}
+    assert recorder.cyphers == [
+        "MATCH (n) WHERE n:Point RETURN labels(n), properties(n)"], (
+            recorder.cyphers)
+
+
+def test_a_key_collision_is_resolved_deterministically():
+    """Two nodes claiming ONE ``(label, id)`` key resolve the same way in ANY
+    row order — the digest is a pure function of the graph, not of the store.
+
+    The ``Event``/``id`` fallback means a faithful ``:Event {eventId:'X'}`` and
+    a graph-only ``:Event {id:'X'}`` BOTH key as ``('Event','X')``. ``db_hash``
+    is documented as a pure function of the GRAPH, so the survivor may not be
+    whichever row the store returned LAST: that lets one graph hash two ways,
+    which reads as a false ``unrecorded-mutation``. The label's OWN match key
+    (``eventId``) outranks the fallback, and within one class the canonical
+    rendering decides — both order-independent.
+
+    FAILS IF: the view is last-row-wins (both directions of the collision then
+    disagree). The residual is pinned too (#8879): a collision still keeps ONE
+    entry, so the losing node is not separately visible — stated in
+    ``_graph_view``'s docstring and in ``baseline_digest_does_not_cover``, and
+    filed rather than silently absorbed.
+    """
+    from tortoise.consistency import _graph_view
+
+    faithful = {"eventId": "collide-7936", "id": "collide-7936",
+                "name": "faithful"}
+    graph_only = {"id": "collide-7936", "name": "graph-only"}
+
+    class _StubRows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def query(self, cypher, *args, **kwargs):  # noqa: ANN002, ANN003
+            return SimpleNamespace(result_set=self.rows)
+
+    def _row(props):
+        return [["Event"], props]
+
+    forward = _graph_view(_StubRows([_row(faithful), _row(graph_only)]))
+    reverse = _graph_view(_StubRows([_row(graph_only), _row(faithful)]))
+    assert forward == reverse, (forward, reverse)
+    assert forward == {("Event", "collide-7936"): faithful}, forward
+    # …and the residual, explicitly: ONE entry, so the losing graph-only node
+    # is not in the digest (#8879 — close it and this assertion should flip).
+    assert len(forward) == 1, forward
+
+    # Same class (both keyed by the fallback): the canonical rendering decides,
+    # not row order.
+    left = {"id": "dup-7936", "name": "aaa"}
+    right = {"id": "dup-7936", "name": "bbb"}
+    assert _graph_view(_StubRows([_row(left), _row(right)])) == \
+        _graph_view(_StubRows([_row(right), _row(left)])), (
+            "a same-class collision depends on row order")
 
 
 def test_a_graph_only_id_only_event_is_digest_covered(tmp_path):
@@ -310,6 +394,21 @@ def test_an_unjournalled_node_ADOPTED_by_the_rebuild_is_not_a_mutation(tmp_path)
     guard — so adoption leaves it absent while the reference fold applies the
     ``live`` creation default). Measured identically on ``459f22912`` with the
     re-key absent; filed as #8872 rather than absorbed here.
+
+    That divergence is pinned EXACTLY (``{"content", {("Object",
+    "status")}}``), not as "anything but ``unrecorded-mutation``" (review): an
+    inequality against one class ABSORBS any NEW divergence the widening could
+    introduce on this node, so the old assertion stayed green through exactly
+    the regression this test exists for.
+
+    Because the #8872 divergence makes the first verdict ``ok=False``,
+    ``check_consistency`` cannot record a baseline for this fixture — so the
+    baseline is SEEDED BY HAND before the rebuild. Without that, ``stored``
+    stays ``None``, ``graph_moved`` is ``False`` by construction, and "the
+    BASELINE must not be what complains" is unfalsifiable (it passed on the
+    pre-fix tree too). The test then PROVES the baseline is live rather than
+    inert: one graph-only belief write on the same adopted node must read
+    ``unrecorded-mutation``.
     """
     events = _journal_dir(tmp_path, _STUB_THEN_ADOPT_JOURNAL)
     proj = FalkorProjection(path=str(tmp_path / "adopt.db"),
@@ -325,16 +424,47 @@ def test_an_unjournalled_node_ADOPTED_by_the_rebuild_is_not_a_mutation(tmp_path)
         assert rows and rows[0][0] == _OBJECT_ID, rows
         assert rows[0][1] is None, rows
         first = _verdict(log_path, proj, record_state=True)
-        # The BASELINE must not be what complains. (The separate, pre-existing
-        # `status` false divergence is asserted only as NOT this class.)
-        assert first["divergence"] != "unrecorded-mutation", first
+        assert first["ok"] is False, first
+        assert first["divergence"] == "content", first["divergence"]
+        assert first["state_recorded"] is False, (
+            "the #8872 divergence is expected to keep the baseline UNRECORDED — "
+            f"if it recorded, re-derive this test: {first}")
+        assert {(d["label"], d["field"])
+                for d in first["divergent_entities"]} == {("Object", "status")}, (
+                    "expected ONLY the pre-existing #8872 status divergence, "
+                    f"got {first['divergent_entities']}")
+        # Seed the baseline the #8872 divergence prevents `check_consistency`
+        # from writing, so the SECOND verdict really has one to compare against.
+        assert record_projection_state(
+            log_path, last_applied_seq=len(_STUB_THEN_ADOPT_JOURNAL),
+            content_hash=first["db_hash"]), "could not seed the baseline"
         proj.rebuild_all(str(events), confirm_destructive=True)
         second = _verdict(log_path, proj, record_state=False)
+        # Falsifiability proof for the baseline half: with THAT baseline in
+        # place, one genuinely unjournalled write on the very node the stub
+        # adoption built DOES read `unrecorded-mutation`. So the assertions
+        # above are not passing because the baseline is absent — they are
+        # passing because adoption did not move it.
+        proj.g.query(
+            "MATCH (o:Object {id:$oid}) SET o.confidence=0.42",
+            params={"oid": _OBJECT_ID})
+        third = _verdict(log_path, proj, record_state=False)
     finally:
         proj.close()
+    assert third["divergence"] == "unrecorded-mutation", (
+        "a graph-only belief write on the adopted node did not read "
+        "unrecorded-mutation, so the seeded baseline is inert and the "
+        f"assertions below are vacuous: {third}")
     assert first["db_hash"] == second["db_hash"], (
         "adoption of a name stub moved the baseline digest (#7936)")
+    # Falsifiable now that a baseline EXISTS: a digest that moved under a still
+    # journal is `unrecorded-mutation`, which is the false RED this rules out.
     assert second["divergence"] != "unrecorded-mutation", second
+    assert second["ok"] is False and second["divergence"] == "content", (
+        f"only the pre-existing #8872 divergence may remain, got {second}")
+    assert {(d["label"], d["field"])
+            for d in second["divergent_entities"]} == {("Object", "status")}, (
+                f"got {second['divergent_entities']}")
 
 
 def test_the_fingerprint_ignores_the_stub_discriminator(tmp_path):
@@ -343,6 +473,9 @@ def test_the_fingerprint_ignores_the_stub_discriminator(tmp_path):
     Pinned on the FINGERPRINT VIEW rather than through a rebuild: two builds of
     one journal clear the flag identically, so a rebuild comparison cannot
     discriminate whether ``_stub`` is covered — only the view can.
+    The key the assertion fires on is the SUBJECT stub: nothing in
+    ``_STUB_THEN_ADOPT_JOURNAL`` adopts it (the OBJECT stub is the adopted one,
+    and it is the one whose ``_stub`` this fixture clears).
     FAILS IF: ``_entity_node_view`` starts copying an undeclared prop.
     """
     from tortoise.consistency import _graph_fingerprint, _graph_view

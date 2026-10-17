@@ -2061,8 +2061,9 @@ _GRAPH_VIEW_LABELS: tuple[str, ...] = (
     "Point", *sorted(_REFERENCE_FOLD_ENTITY_LABELS))
 
 
-def _graph_view_id(label: str, props: dict) -> str | None:
-    """The identity a graph node of ``label`` is indexed under, or ``None``.
+def _graph_view_key(label: str, props: dict) -> tuple[str, bool] | None:
+    """``(id, via_fallback)`` — the identity a node of ``label`` is indexed
+    under, and whether that identity came from the declared fallback.
 
     ``_ENTITY_ID_PROP[label]`` is the key the entity WRITERS and the entity
     comparison address a node by (``id`` for Point/Object/Subject, ``eventId``
@@ -2078,18 +2079,28 @@ def _graph_view_id(label: str, props: dict) -> str | None:
     belief while ``eventId`` yields nothing — and dropping it from the index
     would leave exactly the residual this file's fix removes, a graph-only
     belief write on a non-Point node that leaves ``db_hash`` unmoved.
+
+    ``via_fallback`` is returned because the fallback WIDENS an existing
+    key-collision surface (see :func:`_graph_view`): caller-side, a node keyed
+    by its own match key must outrank one keyed only by the fallback, or the
+    digest depends on the order the store happened to return the rows.
     """
     prop = _ENTITY_ID_PROP.get(label)
     if not prop:
         return None
     nid = props.get(prop)
     if isinstance(nid, str):
-        return nid
+        return nid, False
     if label == "Event":
         alt = props.get("id")
         if isinstance(alt, str):
-            return alt
+            return alt, True
     return None
+
+
+def _canonical_props(props: dict) -> str:
+    """A stable rendering of a node's properties, for deterministic ties."""
+    return json.dumps(props, sort_keys=True, default=str)
 
 
 def _graph_view(projection) -> dict:
@@ -2103,15 +2114,37 @@ def _graph_view(projection) -> dict:
     queries is how the reference fold came to index ``:Point`` only while the
     graph held the belief on an ``:Event``.
 
-    The key comes from :func:`_graph_view_id` — the label's own graph MATCH key
-    with the ``Event``/``id`` fallback the belief fold's match implies. A node
-    with no (or a non-string) identity is DROPPED, because one no writer and no
-    fold can address is not one replay can reproduce or compare. The id is
-    carried as the LABELED tuple, so a ``:Point`` and an ``:Event``
+    The key comes from :func:`_graph_view_key` — the label's own graph MATCH
+    key with the ``Event``/``id`` fallback the belief fold's match implies. A
+    node with no (or a non-string) identity is DROPPED, because one no writer
+    and no fold can address is not one replay can reproduce or compare. The id
+    is carried as the LABELED tuple, so a ``:Point`` and an ``:Event``
     legitimately sharing an id stay two distinct entries (each is a different
     node the graph really holds).
+
+    KEY COLLISIONS — resolution and the residual (the review's stated bound).
+    Two DISTINCT nodes of one label can resolve to the same key: a faithful
+    ``:Event {eventId: "X"}`` and a graph-only ``:Event {id: "X"}`` both key as
+    ``("Event", "X")``. ``db_hash`` is documented above as a pure function of
+    the GRAPH, so which node's properties win may NOT be the order the store
+    returned the rows (that would make the same graph hash two ways and read as
+    a false ``unrecorded-mutation``). Resolution is therefore deterministic:
+    the node keyed by the label's OWN match key outranks one keyed by the
+    ``Event``/``id`` fallback, and within a class the winner is the smaller
+    canonical rendering of its properties.
+
+    The RESIDUAL, stated rather than silent: a collision still keeps ONE entry,
+    so the loser is not in the digest — a graph-only ``id``-only ``:Event``
+    whose id also appears as a faithful ``:Event {eventId}`` is invisible to
+    ``db_hash`` (the false-GREEN direction of #7936, now narrowed to two nodes
+    that claim one id). Closing it needs a key that can hold both (a
+    ``(label, id, key-source)`` triple, or reporting the collision on the
+    verdict beside ``uncarried_journal_fields``); filed as #8879, not absorbed
+    here — no in-tree writer mints the shape (``_upsert_event`` always sets
+    ``id == eventId``).
     """
     view: dict = {}
+    primary: dict = {}
     where = " OR ".join(f"n:{label}" for label in _GRAPH_VIEW_LABELS)
     rows = projection.query(
         f"MATCH (n) WHERE {where} RETURN labels(n), properties(n)"
@@ -2123,9 +2156,25 @@ def _graph_view(projection) -> dict:
         if not isinstance(props, dict) or not isinstance(labels, (list, tuple)):
             continue
         for label in labels:
-            nid = _graph_view_id(label, props)
-            if nid is not None:
-                view[(label, nid)] = props
+            resolved = _graph_view_key(label, props)
+            if resolved is None:
+                continue
+            nid, via_fallback = resolved
+            key = (label, nid)
+            held = view.get(key)
+            if held is None:
+                view[key] = props
+                primary[key] = not via_fallback
+                continue
+            # Collision: prefer the node keyed by the label's own match key,
+            # then break the tie canonically so row order cannot decide.
+            if (not via_fallback) != primary.get(key, False):
+                keep_new = not via_fallback
+            else:
+                keep_new = _canonical_props(props) < _canonical_props(held)
+            if keep_new:
+                view[key] = props
+                primary[key] = not via_fallback
     return view
 
 
@@ -2566,9 +2615,13 @@ def check_consistency(log_path: str, projection, *,
                 "is the baseline's to catch, not the comparison's"),
             "baseline_digest_does_not_cover": (
                 "non-Point fields outside `belief_compared`+`status` (e.g. a "
-                "graph-only `name`/`eventKind` edit with no id change), and "
+                "graph-only `name`/`eventKind` edit with no id change), "
                 "the Source/url-keyed labels the reference fold does not "
-                "model"),
+                "model, and — the one `(label, id)` key that can hold TWO "
+                "distinct nodes — a graph-only `id`-only Event whose id is "
+                "also an Event's `eventId`: one node wins the key "
+                "deterministically (the `eventId`-keyed one) and the other is "
+                "not in the digest (#8879)"),
             "point_counts_cover": (
                 "the POINT leg only: `log_points`/`db_points` remain point "
                 "counts (a graph-only non-Point node is caught by the "
