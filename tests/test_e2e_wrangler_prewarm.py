@@ -51,141 +51,63 @@ CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 PREWARM_STEP = "Pre-warm wrangler toolchain"
 
-#: Captures a NUMERIC version token after `wrangler@` (`4`, `4.127`, `4.127.0`).
-#: A token is classified by its dot count, never by a lookahead that backtracks
-#: mid-token — a lookahead happily matched `4.12` inside `4.127.0`.
-WRANGLER_REF = re.compile(r"wrangler@(\d+(?:\.\d+)*)")
-
-#: Captures ANY `wrangler@<token>` specifier, numeric or not. The numeric-only
-#: ref above cannot see a dist-tag (`wrangler@latest`/`@next`), so such a step
-#: contributed NOTHING to the float/parity checks and was invisible to them.
-#: This one makes the non-numeric specifier an OFFENDER instead of a non-match.
-WRANGLER_SPEC = re.compile(r"wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)")
+#: A token is classified by its DOT COUNT, never by a lookahead that backtracks
+#: mid-token (a lookahead happily matched `4.12` inside `4.127.0`): an EXACT pin
+#: is `4.127.0`, and anything else — `4`, `4.127`, `latest`, `next` — is floating.
+#: A dist-tag is an OFFENDER, not a non-match: the numeric-only form of this
+#: check could not see `wrangler@latest` at all, so such a step contributed
+#: nothing to the float/parity checks and was invisible to them.
 
 
-#: YAML block scalars carry their `#` lines as TEXT, so a comment that merely
-#: mentions `wrangler@4` (a historical note, say) read as a floating pin and would
-#: red an otherwise clean required check. These checks are about what a step DOES,
-#: so comments are stripped before matching. The strip is QUOTE-AWARE and scans the
-#: WHOLE block: a word-leading `#` opens a comment only outside a quoted string,
-#: and shell quoting spans a backslash-newline continuation, so a per-line scan
-#: would reset `quote`, cut a real command short and hide the float on it.
-#: A `#` opens a comment at a WORD BOUNDARY, which in shell is not only
-#: whitespace — the metacharacters below end a word too (`;#`, `&&#`).
-_QUOTE_CHARS = "\"'"
-_WORD_START = " \t\n;&|()<>"
-#: A here-doc opener: `<<`, an optional `-` (tab-stripping) and the delimiter,
-#: which may be quoted. The lookbehind keeps `<<<` (a here-STRING, whose
-#: following lines are ordinary CODE) from matching its second and third `<`.
-_HEREDOC = re.compile(r"(?<!<)<<(?P<tabs>-?)[ \t]*(?P<q>['\"]?)(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=q)")
+#: A shell line CONTINUATION removes the backslash AND the newline, so the two
+#: lines are one command line: an invocation split across them is still one
+#: invocation and must be matched as one.
+_CONTINUATION = re.compile(r"\\\n")
+
+#: A whole-line comment is not a command.
+_COMMENT_LINE = re.compile(r"^[ \t]*#")
+
+#: ── The pin is matched as an INVOCATION, never as a bare mention ─────────────
+#: A command word (`npx`/`npm`/`pnpm`/`yarn`/`bunx`), then `wrangler@<spec>` on
+#: the same line — or `wrangler@<spec>` itself at a command position. This
+#: replaced a hand-written shell lexer and removes the entire class of defects
+#: that lexer produced: a comment, a here-doc body (`<<'EOF'`, `<<\EOF`, two on
+#: one line), an ANSI-C string or an escaped quote that merely MENTIONS a version
+#: is not an invocation and cannot be mistaken for a pin. Crucially, NOTHING is
+#: stripped from the text any more: every earlier version stripped comments, so
+#: each shell form it had not modelled (an escaped quote, `$'…'`, `;#`, a
+#: here-doc body, `<<\EOF`, a second here-doc delimiter) could suppress a real
+#: floating invocation from a required check. Matching the invocation shape
+#: cannot suppress anything.
+_INVOCATION = re.compile(
+    r"(?:\b(?:npx|npm|pnpm|yarn|bunx)\b[^\n]*?"
+    r"|^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^ \t\n;&|]*[ \t]+)*"
+    r")wrangler@([A-Za-z0-9][A-Za-z0-9._-]*)",
+    re.M,
+)
+
+#: DECLARED RESIDUAL, unchanged from the lexer this replaced: a version supplied
+#: indirectly — `wrangler@$WRANGLER_VERSION`, `wrangler@"${V}"` — carries no
+#: literal token for a text check to read. Guarding that needs a different
+#: instrument (an install in the lane, asserting the resolved tarball).
 
 
-def _heredoc_delimiter(line: str) -> tuple[str, bool] | None:
-    """The first here-doc delimiter declared on `line`, with its tab flag.
-
-    A false positive is safe by construction: entering here-doc mode only stops
-    the scanner from STRIPPING text, so it can over-report and never hide.
-    """
-    match = _HEREDOC.search(line)
-    return (match.group("name"), match.group("tabs") == "-") if match else None
-
-
-def _commands(run: str) -> str:
-    r"""The executable text of a step's `run` block — comments are not commands.
-
-    Shell rules modelled here, each one because an earlier version got it wrong
-    and hid a real `wrangler@` float (or invented one): quoting spans a
-    backslash-newline continuation; a backslash ESCAPES the next character, so
-    an escaped quote does not end a double-quoted string — and an escaped
-    character is a LITERAL, so it cannot end a word either (`\;#` is not a
-    comment, and a `\`+newline keeps the word open); `$'…'` is its own quoting
-    form, where `\'` escapes; a `#` opens a comment after any word boundary, not
-    only after whitespace; and a HERE-DOC body is data — it is passed through
-    verbatim, so a quote inside it cannot desync the scanner. Measured on
-    `cat <<'EOF'` / `Don't` / `EOF` followed by
-    `echo 'see #8745' && npx --yes wrangler@4 --version`: before this rule the
-    npx line read as a comment and NO float was reported while shell ran it.
-
-    DECLARED RESIDUALS — unmodelled, and each can only OVER-report (the guard
-    refuses a clean check), never hide a pin: command substitution (backticks),
-    and a SECOND here-doc delimiter declared on the same line. Pinned by the
-    residual arms in
-    `test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range`.
-    """
-    out: list[str] = []
-    quote = ""
-    ansi_c = False
-    escaped = False
-    at_word_start = True
-    heredoc: str | None = None
-    strip_tabs = False
-    for line in run.splitlines(keepends=True):
-        if heredoc is not None:
-            # the body and its delimiter line are passed through untouched
-            out.append(line)
-            if line.rstrip("\n").lstrip("\t" if strip_tabs else "") == heredoc:
-                heredoc = None
-            continue
-        declared = _heredoc_delimiter(line)
-        i, n = 0, len(line)
-        while i < n:
-            ch = line[i]
-            nxt = line[i + 1] if i + 1 < n else ""
-            i += 1
-            if escaped:
-                escaped = False
-                out.append(ch)
-                if ch != "\n":
-                    # a backslash-newline is removed and the word continues; any
-                    # other escaped character is a literal word character
-                    at_word_start = False
-                continue
-            if ansi_c:
-                if ch == "'":
-                    ansi_c, quote = False, ""
-                elif ch == "\\":
-                    escaped = True
-                out.append(ch)
-                at_word_start = False
-                continue
-            if quote:
-                if ch == "\\" and quote == '"':
-                    escaped = True
-                elif ch == quote:
-                    quote = ""
-                out.append(ch)
-                at_word_start = False
-                continue
-            if ch == "$" and nxt == "'":
-                ansi_c, quote = True, "'"
-                out.append(ch)
-                out.append(nxt)  # the opening quote is part of the construct
-                at_word_start = False
-                i += 1  # consumed `nxt` as well
-                continue
-            if ch in _QUOTE_CHARS:
-                quote = ch
-            elif ch == "\\":
-                escaped = True
-            elif ch == "#" and at_word_start:
-                if line.endswith("\n"):
-                    out.append("\n")
-                break
-            out.append(ch)
-            at_word_start = ch in _WORD_START
-        if declared is not None:
-            heredoc, strip_tabs = declared
-    return "".join(out)
+def _wrangler_invocations(run: str) -> set[str]:
+    """Every `wrangler@<spec>` a COMMAND LINE in `run` invokes."""
+    logical = _CONTINUATION.sub("", run).splitlines()
+    return set(
+        _INVOCATION.findall("\n".join(line for line in logical if not _COMMENT_LINE.match(line)))
+    )
 
 
 def _exact_wranglers(run: str) -> set[str]:
     """An EXACT pin (`4.127.0`) — the version that actually boots."""
-    return {v for v in WRANGLER_REF.findall(_commands(run)) if v.count(".") == 2}
+    return {v for v in _wrangler_invocations(run) if v.count(".") == 2}
 
 
 def _floating_wranglers(run: str) -> set[str]:
     """A range (`4`, `4.127`) or dist-tag (`latest`) — never acceptable here."""
-    return {v for v in WRANGLER_SPEC.findall(_commands(run)) if v.count(".") != 2}
+    return {v for v in _wrangler_invocations(run) if v.count(".") != 2}
 
 #: The e2e jobs that serve this repo's `website/` (marketing + dashboard) and so
 #: share the pre-warm. A rename shows up here as a failure, not as silent loss.
@@ -365,79 +287,40 @@ def test_floating_detector_catches_a_dist_tag_not_only_a_numeric_range() -> None
     assert _floating_wranglers("npx --yes wrangler@4 --version") == {"4"}
     assert _floating_wranglers("npx --yes wrangler@4.127 --version") == {"4.127"}
     assert _floating_wranglers("npx --yes wrangler@4.127.0 --version") == set()
-    # A COMMENT IS NOT A COMMAND. A historical note naming a floated version must
-    # not read as an offender (it red a clean required check), and a comment
-    # naming an exact pin must not satisfy the parity check for a floating boot.
-    # Both the whole-line and the trailing form are stripped — the trailing one was
-    # the surviving hole when only whole lines were dropped.
+    assert _floating_wranglers("wrangler@4 pages dev") == {"4"}
+
+    # A MENTION is not an INVOCATION. A note naming a floated version must red
+    # nothing, whole-line or trailing — and one naming an EXACT version must not
+    # satisfy a parity check for a floating boot.
     assert _floating_wranglers("# was: wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
     assert _exact_wranglers("# was: wrangler@4.127.0\nnpx --yes wrangler@latest --version") == set()
     assert _floating_wranglers("npx --yes wrangler@4.127.0 --version  # was wrangler@4") == set()
-    # …and a REAL float on the command line is still an offender, comment or not —
-    # including when an earlier quoted string on the line carries a `#`.
-    assert _floating_wranglers("npx --yes wrangler@4 --version  # pinned in #8743") == {"4"}
+    assert _floating_wranglers("echo wrangler@4 --version") == set()
     assert _floating_wranglers('echo "refs #8743" && npx --yes wrangler@4 --version') == {"4"}
-    # …including when the quoted string SPANS a backslash-newline continuation:
-    # shell removes the backslash-newline inside the quotes, so this is one real
-    # command line, and a per-line strip would cut it at the quote and lose the pin.
-    assert _floating_wranglers('echo "refs \\\n#8743" && npx --yes wrangler@4 --version') == {"4"}
-    # An ESCAPED quote does not end the string, so that `#` is literal and the
-    # float after it is on the executable line.
-    assert _floating_wranglers('echo "escaped \\" # note" && npx --yes wrangler@4 --version') == {"4"}
-    # A `#` also opens a comment after a metacharacter: reading `;#…` as a
-    # command invents a pin out of a comment.
-    assert _floating_wranglers("echo a;# was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
-    assert _floating_wranglers("echo a &&# was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
-    # An ESCAPED metacharacter is a literal, so it does not end the word and the
-    # `#` after it does NOT open a comment (shell echoes the text) — and a
-    # backslash-newline keeps the word open rather than starting a comment.
-    assert _floating_wranglers("echo a\\;# x\nnpx --yes wrangler@4 --version") == {"4"}
-    assert _commands("echo hi\\\n# not a comment") == "echo hi\\\n# not a comment"
-    # `$'…'` is its own quoting form, where `\'` escapes: reading that `'` as a
-    # plain single-quote desyncs the scanner, inventing a pin or hiding one.
-    assert _floating_wranglers("echo $'\\'' # was wrangler@4\nnpx --yes wrangler@4.127.0 --version") == set()
-    assert _floating_wranglers("echo $'\\' # c' && npx --yes wrangler@4 --version") == {"4"}
-    # A `#` opens a comment after EVERY word-boundary metacharacter, and after
-    # none of them when the metacharacter is ESCAPED (then it is a literal).
-    for metachar in (";", "&", "|", "(", ")", "<", ">"):
-        assert _floating_wranglers(
-            f"echo a{metachar}# was wrangler@4\nnpx --yes wrangler@4.127.0 --version"
-        ) == set(), f"{metachar}# was not read as a comment"
-        # the float sits on the SAME line, so the arm discriminates: a scanner
-        # that wrongly ends the word at an escaped metacharacter swallows it
-        assert _floating_wranglers(
-            f"echo a\\{metachar}# x && npx --yes wrangler@4 --version"
-        ) == {"4"}, f"\\{metachar}# was wrongly read as a comment"
-    # A HERE-DOC body is data, passed through verbatim: an apostrophe in it must
-    # not desync the scanner, which read the following real float as a comment
-    # before this rule (measured — the guard went green while shell ran the npx).
-    assert _floating_wranglers(
-        "cat <<'EOF'\nDon't\nEOF\necho 'see #8745' && npx --yes wrangler@4 --version"
-    ) == {"4"}
-    # …and the body itself is kept, so a mention inside it is still reported
-    # (a real `bash <<'EOF'` body executes, so silence there would be the danger).
-    assert _floating_wranglers("cat <<'EOF'\nwrangler@4\nEOF\n") == {"4"}
-    assert _floating_wranglers("cat <<-'EOF'\n\twrangler@4\n\tEOF\n") == {"4"}
-    # `<<<` is a here-STRING: the lines after it are CODE and stay comment-stripped
-    assert _floating_wranglers(
-        "cat <<< word\n# was wrangler@4\nnpx --yes wrangler@4.127.0 --version"
-    ) == set()
-    # An UNBALANCED quote leaves the block unstripped — the fail-closed direction:
-    # the scanner cannot know where the string ends, so a comment mention stays
-    # and is read as a pin (the guard refuses) rather than being guessed away.
-    for unbalanced in ('echo "unterminated\n# was wrangler@4',
-                       "echo 'unterminated\n# was wrangler@4",
-                       "echo $'unterminated\n# was wrangler@4"):
-        assert _commands(unbalanced) == unbalanced
-        assert _floating_wranglers(unbalanced) == {"4"}
-    # DECLARED RESIDUALS — see the helper's docstring. A `#` inside a BACKTICK
-    # substitution reads as command text, so a mention is reported (over-report:
-    # the guard refuses); substitutions suppress no text, so no pin can hide.
-    # `$(…)` needs no modelling here: shell treats a `#` inside it as a comment
-    # too, and so does the scanner (the `(` ends the word).
-    assert _floating_wranglers("echo `# was wrangler@4`") == {"4"}
-    assert _floating_wranglers("echo $(# was wrangler@4)") == set()
-    assert _floating_wranglers("echo $(npx --yes wrangler@4 --version)") == {"4"}
+
+    # A shell CONTINUATION makes the two lines one command line.
+    assert _floating_wranglers("npx --yes \\\n  wrangler@4 --version") == {"4"}
+
+    # REGRESSION ARMS — every one of these HID a real float from the shell lexer
+    # this matcher replaced (a quote in a here-doc body or an ANSI-C string left
+    # its quote state open, so the later `npx` line read as a comment while bash
+    # ran it, and the guard passed). They pass now by construction: nothing is
+    # stripped, so no construct can suppress an invocation.
+    for run in (
+        "cat <<'EOF'\nDon't\nEOF\necho 'see #8745' && npx --yes wrangler@4 --version",
+        "cat <<\\EOF\nDon't\nEOF\necho 'see #8745' && npx --yes wrangler@4 --version",
+        "cat <<'A' <<'B'\nA\nDon't\nB\necho 'see #1' && npx --yes wrangler@4 --version",
+        "cat <<'1'\nDon't\n1\nnpx --yes wrangler@4 --version",
+        "echo \"escaped \\\" # note\" && npx --yes wrangler@4 --version",
+        "echo a\\;# x && npx --yes wrangler@4 --version",
+        "cat <<< word\n# was wrangler@4\nnpx --yes wrangler@4 --version",
+        "echo x $(cat <<\\EOF\nDon't\nEOF\n) && npx --yes wrangler@4 --version",
+    ):
+        assert _floating_wranglers(run) == {"4"}, run
+
+    # DECLARED RESIDUAL: a version behind a variable has no literal token to read.
+    assert _floating_wranglers("WRANGLER=latest\nnpx --yes wrangler@$WRANGLER --version") == set()
+    assert _floating_wranglers('npx --yes wrangler@"${WRANGLER}" --version') == set()
 
 
 def test_no_e2e_boot_step_floats_the_wrangler_version() -> None:
