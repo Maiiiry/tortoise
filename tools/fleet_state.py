@@ -2359,9 +2359,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
         # different facts: one name EXISTS in the roster and has nothing behind it.
         stale = _stale_registry_match(state, args.lane)
         if stale:
+            # `workspace` is read through `.get`: `_stale_registry_match` tolerates a
+            # malformed entry (a hand-edited or corrupt cached state), so its only
+            # consumer must not be the one place that raises `KeyError` on one.
+            stale_ws = str(stale.get("workspace") or "")
+            where = f"workspace {stale_ws[:8]}…" if stale_ws else "the workspace it names"
             print(
-                f"{args.lane!r} is a STALE REGISTRY ROW, not a lane: workspace "
-                f"{stale['workspace'][:8]}… is absent from the live cmux list and the row "
+                f"{args.lane!r} is a STALE REGISTRY ROW, not a lane: {where} "
+                "is absent from the live cmux list and the row "
                 "binds no pane binding, session record or override (#8845) — delete the "
                 "roster row; `fleet-state orphans` lists it",
                 file=sys.stderr,
