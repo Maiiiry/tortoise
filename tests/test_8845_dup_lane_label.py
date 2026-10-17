@@ -393,5 +393,37 @@ def test_a_dropped_rows_issue_label_survives_on_the_surviving_row(monkeypatch) -
     assert lane["claim"]["lane_label"] == "lane:2b-extractor"
 
 
+# ---------------------------------------------------------------------------
+# 8. a second route to the same defect: TWO unbound rows, one label
+# ---------------------------------------------------------------------------
+
+
+def test_two_unbound_rows_for_one_label_are_one_lane(monkeypatch) -> None:
+    """A second unbound row repeats the label just as a stale+bound pair does.
+
+    Both rows are empty shells here (not live, no pane binding, no session record),
+    so repeating the label is the whole of the difference — and it is enough to make
+    the claim gate unreadable. The FIRST is kept: a lone ghost row must stay
+    published (#7738).
+    """
+    st = _build(
+        monkeypatch,
+        registry=[(LABEL, WS_STALE, ""), (LABEL, WS_LIVE_2, "")],
+        live={},
+    )
+    assert [lane["identity"]["lane"] for lane in st["lanes"]] == [LABEL]
+    assert st["summary"]["lanes"] == 1
+    assert st["summary"]["stale_registry"] == 1
+    (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    assert "second unbound row" in orphan["reason"], orphan["reason"]
+
+
+def test_the_stale_reason_does_not_name_override_as_row_evidence(monkeypatch) -> None:
+    """`overrides` is label-keyed and is NOT part of the per-row test (P1 fix)."""
+    st = _duplicate_pair(monkeypatch, overrides={LABEL: WS_STALE})
+    (orphan,) = [o for o in st["orphans"] if o.get("kind") == "registry-stale"]
+    assert "override" not in orphan["reason"], orphan["reason"]
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

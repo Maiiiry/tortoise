@@ -1333,18 +1333,30 @@ def build_state(
 
     kept: list[tuple[str, str, str]] = []
     stale_rows: list[dict[str, str]] = []
+    unbound_kept: set[str] = set()
     for label, ws, issue_label in registry:
-        if (
-            # Only a MEASURED live list may retire a row (#7738 fail-open posture).
-            workspaces_measured
-            # ANOTHER row for this label binds evidence on its own, so dropping this
-            # one cannot erase the lane from the board.
-            and bound_rows_by_label.get(label, 0) > 0
-            # ...and THIS row is the one that binds nothing.
-            and not row_binds_evidence(ws)
-        ):
-            stale_rows.append({"lane": label, "workspace": ws, "issue_label": issue_label})
-            continue
+        evidence = row_binds_evidence(ws)
+        if workspaces_measured and not evidence:
+            # (a) ANOTHER row for this label binds evidence on its own, so dropping
+            # this one cannot erase the lane from the board.
+            if bound_rows_by_label.get(label, 0) > 0:
+                stale_rows.append({
+                    "lane": label, "workspace": ws, "issue_label": issue_label,
+                    "why": "another row for this label does bind evidence",
+                })
+                continue
+            # (b) TWO UNBOUND ROWS FOR ONE LABEL ARE ONE LANE ENUMERATED TWICE — the
+            # same duplicated-label defect by a second route. Keep the first (a lone
+            # ghost row must stay published, #7738) and report the rest. Both rows are
+            # empty shells by construction here (not live, no pane binding, no session
+            # record), so nothing is lost by keeping one.
+            if label in unbound_kept:
+                stale_rows.append({
+                    "lane": label, "workspace": ws, "issue_label": issue_label,
+                    "why": "it is a second unbound row for the same label",
+                })
+                continue
+            unbound_kept.add(label)
         kept.append((label, ws, issue_label))
     # A dropped row may be the only one carrying the label's `lane:` label; the
     # surviving row inherits it rather than losing it.
@@ -1634,21 +1646,23 @@ def build_state(
                 "workspace": lane_["identity"]["workspace"],
                 "reason": "live pi session has NO pane resume binding — recovery destroyed attributability (#7750 D2)",
             })
-    # a third orphan class (#8845): a registry row whose workspace is gone and which
-    # binds no evidence, for a label already answered by a record that does. It is not
-    # a lane record (see the filter above), but it is still VISIBLE here — the roster
-    # line is stale, and clearing it is a human's call.
+    # a third orphan class (#8845): a registry row that is NOT a lane record. It can
+    # be one of two things — a row whose workspace is gone for a label another row
+    # already answers, or a second unbound row repeating a label — and it is still
+    # VISIBLE here either way: the roster line is stale, and clearing it is a human's
+    # call.
     for row in stale_rows:
+        ws_gone = f"workspace {row['workspace'][:8]}…" if row["workspace"] else "its workspace"
         orphans.append({
             "kind": "registry-stale",
             "lane": row["lane"],
             "workspace": row["workspace"],
             "reason": (
-                f"registry row for '{row['lane']}' names workspace "
-                f"{row['workspace'][:8]}… which is NOT in the live cmux list, and the row "
-                "binds NO pane binding, session record or override — it is not a lane "
-                "record (a record with this label does bind evidence); delete the stale "
-                "roster row"
+                f"registry row for '{row['lane']}' names {ws_gone}, which is NOT in the "
+                "live cmux list, and the row binds NO pane binding or session record of "
+                f"its own — it is not a lane record "
+                f"({row.get('why') or 'a row for this label does bind evidence'}); delete "
+                "the stale roster row"
             ),
         })
 
