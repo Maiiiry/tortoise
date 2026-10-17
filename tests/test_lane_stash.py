@@ -711,6 +711,31 @@ def test_prune_reclaims_this_lanes_own_popped_entries(repo):
     assert "SAFE" in check.stdout
 
 
+def test_prune_output_names_the_foreign_lane_that_still_holds_the_entry(repo):
+    """Reclaiming a row pinned by a PEER must say where the work still lives.
+
+    `prune` reclaims an entry whose object a lane ref pins — that ref may be
+    ANOTHER lane's, and `lane_stash list` in this lane cannot show it once the
+    register row is gone. The old output said only `remove <pos> <sha> <subject>`
+    and its recovery hint pointed at `lane_stash list`, i.e. at a command that
+    cannot see the pin (#8773 review P2).
+    """
+    repo.dirty(repo.a, "f.txt", "base\na-only\n")
+    assert repo.lane(repo.a, "push", "-m", "A work").returncode == 0
+    key_a = next(iter(repo.lane_refs())).split("/")[2]
+    assert key_a.startswith("wtA-"), key_a
+
+    cp = repo.lane(repo.b, "prune", "--apply")
+    assert cp.returncode == 0, _fail(cp)
+    assert "remove" in cp.stdout, cp.stdout
+    assert f"refs/lane/{key_a}/stash/" in cp.stdout, cp.stdout
+    assert f"lane {key_a}" in cp.stdout, cp.stdout
+    # nothing was lost: A's pin still names the object
+    assert list(repo.stash_pins()) == [f"refs/lane/{key_a}/stash/1"], repo.lane_refs()
+    assert repo.lane(repo.a, "pop").returncode == 0
+    assert "a-only" in (repo.a / "f.txt").read_text()
+
+
 def test_pop_never_modifies_the_shared_register(repo):
     """`pop` is deliberately not `git stash pop` (see the module's OVERRIDES note)."""
     repo.dirty(repo.a, "f.txt", "base\na\n")

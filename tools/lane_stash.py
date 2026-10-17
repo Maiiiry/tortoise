@@ -1296,7 +1296,23 @@ def cmd_prune(args: argparse.Namespace) -> int:
           f"{len(doomed)} removable (a lane ref pins it, or this lane recorded it "
           f"applied), {len(kept)} unpinned (refused)")
     for r in doomed:
-        print(f"  remove {r['pos']} {r['sha'][:12]}  {r['subject']}")
+        # Name the handle that survives. A row reclaimed because ANOTHER lane's ref
+        # pins it is lossless, but the pin is that lane's — invisible to
+        # `lane_stash list` after the register row is gone — so the line that
+        # removes it must point at where the object still lives. Otherwise the
+        # only instruction this output gives (`lane_stash list`) cannot show the
+        # work it just reclaimed (#8773 review P2).
+        foreign = _foreign_pin_owners(r["sha"], key)
+        if foreign:
+            where = ("  (still durable under "
+                     + ", ".join(f"refs/lane/{k}/stash/<n>" for k in foreign)
+                     + f" — lane {', '.join(foreign)}; that lane's `lane_stash pop` "
+                       "restores it, `list` here cannot show it)")
+        elif r["pinned"]:
+            where = "  (still durable under this lane's ref)"
+        else:
+            where = "  (applied by this lane; the applied-record named it)"
+        print(f"  remove {r['pos']} {r['sha'][:12]}  {r['subject']}{where}")
     for r in kept:
         print(f"  keep   {r['pos']} {r['sha'][:12]}  {r['subject']}  (no lane ref pins it)")
     if orphan:
