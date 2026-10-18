@@ -59,6 +59,21 @@ the invariants that were being checked by hand are checked here instead:
    4's unescaped pipe, MD056); the table parser asserts that shape, so a future
    unescaped pipe in Contract/Failure Modes fails loudly instead of moving those
    cells into the wrong fields.
+10. **Every dismissal claim in the row the map cites names its DOOR.** The
+   reviewed head's row 5 said the Settings card "collapses to compact status /
+   dismissible-hide with re-open path when complete" AND "neither card carries a
+   dismissal" — one claim, two opposite answers, in one sentence. The previous
+   guard asserted the absence of one literal phrase, so it passed a row that
+   stated both. Claims are now read per clause and attached to the door named in
+   that clause; a door-less denial that contradicts an affirming door is a
+   failure.
+11. **The superseded mirror claim is reconciled where it survived, not only
+   where it was first noticed.** `03-scope.md` §4 E2E-6 — the AUTHORITY this
+   module's door pin anchors to — still read "mirrored as a dismissible
+   checklist card", as did the same claim in §2's W5 bullet, in
+   `00-align-and-scope.md` (both places) and in `05-ux-decisions.md`'s `Visual
+   affordances` row. Live text states the corrected reading; wording kept as
+   history carries a supersession note beside it.
 
 Every surface is also exercised by at least one high-level E2E row (the E2E-side
 reverse direction) — a surface no scenario touches has no scenario that would
@@ -66,12 +81,15 @@ catch its regression.
 
 NON-VACUITY
 -----------
-Checks 4, 5, 6 and 8 fail on the pre-fix document at `1758bbe59` (each
-docstring names the pre-fix text); checks 1-3 are the standing invariants the
-earlier cycles established, check 9 is a parser-shape guard and check 7 is a
-guard whose detector is proved non-blind — guard rails, not defect pins. The
-pre-fix blobs are replayed by pointing this module's pure functions at them
-(`git show <sha>:<path>`), which is how the non-vacuity claims were measured.
+Checks 4, 5, 6, 8, 10 and 11 fail on the reviewed head's document/text (each
+docstring names the pre-fix text; check 10 additionally replays the exact
+self-contradicting sentence through the guard in-suite). Checks 1-3 are the
+standing invariants the earlier cycles established, check 9 is a parser-shape
+guard and check 7 is a guard whose detector is proved non-blind — guard rails,
+not defect pins. The pre-fix blobs are replayed by pointing this module's pure
+functions at them (`git show <sha>:<path>`), which is how the non-vacuity claims
+were measured; reverting the four docs to `fe06e3a98` fails checks 10 and 11
+(five tests) and nothing else.
 Static: doc-text scans plus one file read per doc. No network, DB or graph.
 """
 
@@ -300,6 +318,66 @@ def _missing_e2e6_doors(
         if door in scope_text
     }
     return (required | contract_doors) - cited
+
+
+# ── dismissal claims: every one of them belongs to a DOOR ──────────────
+#: The two doors `05-ux-decisions.md` row "Affordance: setup card" describes.
+#: The Settings Setup guide owns the recorded dismissible-hide; the Overview
+#: next action owns none.
+_DOOR_WORDS = {"settings": "the settings setup guide", "overview": "the overview"}
+
+#: A denial quantified over BOTH doors ("neither card carries a dismissal",
+#: "no door ..."). This is the shape that swallowed the Settings door's
+#: recorded dismissal while an adjacent clause asserted it.
+_DOORLESS_DENIAL = re.compile(
+    r"\b(?:neither|no)\s+(?:of\s+the\s+)?(?:both\s+)?(?:cards?|doors?)\b", re.I)
+_NEGATION = re.compile(r"\b(?:no|not|never|neither|nor|without)\b", re.I)
+_DISMISSAL = re.compile(r"dismiss", re.I)
+
+
+def _dismissal_claims(text: str) -> dict[str, set[str]]:
+    """Clause-level `door -> {"affirms", "denies"}` for every dismissal claim.
+
+    `;`/`.` split each claim away from its neighbours so it stays attached to the
+    door named in the SAME clause. Averaging the whole row into one boolean is
+    what let "the Settings card collapses / dismissible-hides when complete" and
+    "neither card carries a dismissal" sit in one sentence: two doors, two
+    answers, and a reader tracing either one gets a different claim.
+    """
+    claims: dict[str, set[str]] = {"settings": set(), "overview": set()}
+    for clause in re.split(r"[;.]", text):
+        if not _DISMISSAL.search(clause):
+            continue
+        verdict = "denies" if _NEGATION.search(clause) else "affirms"
+        doors = [d for d, word in _DOOR_WORDS.items() if word in clause.lower()]
+        for door in doors:
+            claims[door].add(verdict)
+        if verdict == "denies" and _DOORLESS_DENIAL.search(clause):
+            claims.setdefault("*", set()).add(verdict)
+    return claims
+
+
+def _dismissal_claim_conflicts(live: str) -> list[str]:
+    """The ways one row can give two answers for one dismissal claim.
+
+    Returns the violations (an empty list = one answer per door).
+    """
+    claims = _dismissal_claims(live)
+    out: list[str] = []
+    if "affirms" in claims["overview"]:
+        out.append("the Overview door carries no dismissal in the shipped "
+                   "dashboard (`OverviewNextActionCard`), but the row affirms one")
+    if "denies" not in claims["overview"]:
+        out.append("the row must state that the Overview door carries NO "
+                   "dismissal — that is the claim the map corrected")
+    if "denies" in claims["settings"]:
+        out.append('the decision recorded for the Settings door IS a '
+                   'dismissible-hide with a re-open path (row "Layout: Setup '
+                   'guide"), but the row denies it')
+    if "denies" in claims.get("*", set()) and "affirms" in claims["settings"]:
+        out.append("a door-LESS denial (\"neither card ...\" / \"no door ...\") "
+                   "contradicts the Settings door's affirmed dismissible-hide")
+    return out
 
 
 def _orphan_close_parens(text: str) -> list[str]:
@@ -555,3 +633,131 @@ def test_the_ux_decision_row_the_map_cites_no_longer_claims_a_dismissible_list()
     assert "dismissible checklist card" not in live, (
         "the shipped Overview next-action element carries no dismissal — the "
         "collapse/dismissible-hide belongs to the Settings Setup guide")
+    conflicts = _dismissal_claim_conflicts(live)
+    assert not conflicts, (
+        "the row gives two answers for the dismissal claim it is cited for:\n- "
+        + "\n- ".join(conflicts) + "\nrow: " + live)
+
+
+def test_the_dismissal_door_guard_rejects_the_one_sentence_contradiction():
+    """Non-vacuity, and the RECEIPT for why the previous guard was too narrow.
+
+    The reviewed head's live row said the Settings card "collapses to compact
+    status / dismissible-hide with re-open path when complete" and then "neither
+    card carries a dismissal" — both claims in one sentence. The literal-only
+    assertion above (`"dismissible checklist card" not in live`) passed it,
+    because the contradiction lives in the two doors, not in one phrase.
+    """
+    prefix_head = (
+        "Dashboard renders the SAME state on both of its doors — the Settings "
+        "Setup guide is the counted checklist card (collapses to compact status "
+        "/ dismissible-hide with re-open path when complete, per row \"Layout: "
+        "Setup guide\"); the Overview next action mirrors that state as ONE next "
+        "step + a CTA into the guide — never a counted checklist of its own, "
+        "and neither card carries a dismissal. ")
+    assert _dismissal_claim_conflicts(prefix_head), (
+        "the guard passes the exact self-contradicting sentence it exists for")
+    assert any("door-LESS" in c for c in _dismissal_claim_conflicts(prefix_head))
+    # a row that never says what the Overview door does is the same defect from
+    # the other side: silence let the next action be read as the checklist.
+    silent = ("the Settings Setup guide is the counted checklist card "
+              "(dismissible-hide with re-open path when complete)")
+    assert _dismissal_claim_conflicts(silent), (
+        "a row that never states the Overview door's answer must not pass")
+    # and the corrected shape must be clean, in both doors' presence
+    good = ("the Settings Setup guide is the counted checklist card, and the "
+            "decision recorded for THAT door is dismissible-hide with a "
+            "re-open path when complete; the Overview next action mirrors that "
+            "state as ONE next step + a CTA and carries no dismissal")
+    assert not _dismissal_claim_conflicts(good), _dismissal_claim_conflicts(good)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 10-12: the superseded mirror claim, reconciled everywhere it survived
+# ═══════════════════════════════════════════════════════════════════════
+
+#: The pre-fix wording. It named no door, so it read as licensing the
+#: "Overview renders the counted dismissible checklist" claim the map dropped.
+_SUPERSEDED_MIRROR = "dismissible checklist card"
+_ALIGN = EPIC / "00-align-and-scope.md"
+
+
+def test_the_scope_e2e6_mirror_claim_is_reconciled_where_it_was_left_stale():
+    """PRE-FIX: `03-scope.md` §4 E2E-6 — the AUTHORITY this module's E2E-6 door
+    pin anchors to, "which the document under test cannot reword" — still read
+    "mirrored as a dismissible checklist card" after the map and
+    `05-ux-decisions.md` row 5 were corrected. The epic then carried two answers
+    for one claim, in the document a reader is told to trust.
+
+    Only the MIRROR claim is reconciled: the `When:` line's door names are what
+    the anchor binds to and they are untouched (asserted by
+    `test_e2e6_cites_every_surface_that_owns_a_reentry_door`)."""
+    section = _scope_section("### E2E-6")
+    live = section.split("Superseded wording")[0].lower()
+    assert "counted checklist" in live, (
+        "the scope's E2E-6 must name the counted checklist card explicitly — "
+        "`dismissible checklist card` alone named no door: " + live)
+    assert "one next step" in live and "cta" in live, (
+        "the scope's E2E-6 must state the Overview mirror's actual shape (one "
+        "next step + a CTA into the guide), not just that a card exists")
+    for line in section.splitlines():
+        if _SUPERSEDED_MIRROR in line:
+            assert "superseded" in line.lower(), (
+                "the pre-fix mirror claim may survive only where it is marked "
+                "as superseded history: " + line)
+
+
+def test_the_historical_align_copy_carries_the_supersession_note():
+    """`00-align-and-scope.md` keeps the pre-fix wording as history (its E2E-6
+    is the record of what was aligned). History is fine; UNMARKED history is
+    the third answer for one claim."""
+    lines = _ALIGN.read_text(encoding="utf-8").splitlines()
+    hits = [i for i, ln in enumerate(lines) if _SUPERSEDED_MIRROR in ln]
+    assert hits, (
+        "the align record no longer carries the wording this pin exists for — if "
+        "it was deleted outright, delete this guard in the same edit")
+    for i in hits:
+        window = " ".join(lines[i : i + 4]).lower()
+        assert "superseded" in window, (
+            "the align record keeps the pre-fix wording, so the supersession "
+            "note must sit beside it: " + lines[i])
+
+
+def test_the_scope_w5_capability_bullet_does_not_assert_the_dismissible_mirror():
+    """The same claim appears a second time in `03-scope.md` §2's **W5** bullet
+    — "dashboard mirror (**dismissible checklist card**)" — which is the
+    capability definition the map's W5 rows are cut from, and
+    `00-align-and-scope.md` carries the same bullet in its alignment record.
+
+    Found by this guard, not by the review: reconciling only the E2E-6 line
+    leaves the scope still stating the superseded mirror in the place a child
+    issue reads its capability from."""
+    for path in (SCOPE, _ALIGN):
+        bullet = next(
+            (ln for ln in path.read_text(encoding="utf-8").splitlines()
+             if ln.startswith("- **W5 — Graph-held")), None)
+        assert bullet, f"{path.name}: the W5 capability bullet is gone"
+        assert _SUPERSEDED_MIRROR not in bullet, (
+            f"{path.name}: the W5 bullet still states the superseded "
+            "\"dashboard mirror (dismissible checklist card)\" — the counted "
+            "checklist is the Settings door's and the Overview mirror is one "
+            "next step + a CTA")
+        assert "counted checklist card" in bullet and "Overview" in bullet, (
+            f"{path.name}: the W5 bullet must name both doors' shapes")
+
+
+def test_the_ux_classification_row_does_not_re_cite_the_superseded_claim():
+    """PRE-FIX: the `Visual affordances` classification row sourced itself to
+    "Epic body (**dismissible card**, ...)" — pointing the reader at the very
+    line that was corrected."""
+    row = next(
+        (ln for ln in UX.read_text(encoding="utf-8").splitlines()
+         if ln.startswith("| 5 | Visual affordances")), None)
+    assert row, "the `Visual affordances` classification row is gone"
+    lowered = row.lower()
+    assert "dismissible card" not in lowered, (
+        "the row still cites the epic body's superseded `dismissible card` "
+        "wording; the affordance is the counted checklist on the Settings door "
+        "and one next step + a CTA on the Overview one")
+    assert "affordance: setup card" in lowered, (
+        "the row must point at the corrected decision row it describes")
