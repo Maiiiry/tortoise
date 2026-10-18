@@ -2245,6 +2245,63 @@ def test_a_process_lane_joins_a_registry_row_that_already_claims_its_cwd() -> No
     assert len(live["WS-A"]) == 1 and live["WS-A"][0]["pid"] == 9200
 
 
+def test_one_worktree_stays_one_lane_when_the_cmux_workspace_map_is_unreadable() -> None:
+    """⛔ THE OWNER JOIN MAY NOT DEPEND ON THE WORKSPACE MAP ALONE (review of #9016).
+
+    ``cmux_workspaces`` degrades to an EMPTY map on every failure path (no single
+    window, unparsable JSON, a timeout) and a cell has no cmux at all — but
+    ``cmux sessions list`` can still answer, so the registry row binds evidence and
+    is KEPT, and its own session record still carries the cwd it ran in. Indexing
+    owners from ``workspaces`` only therefore found NO owner for a worktree a
+    registry row already owned, minted ``proc-<pid>`` beside ``lane-x``, and the
+    board published TWO live holders for one lane — a false COLLISION.
+    """
+    reg_cwd = "/tmp/cell-t3/wt-lane"
+    # Unreadable workspace list — the row's cwd is only in its own live record.
+    workspaces: dict = {}
+    live = {
+        "WS-A": [{"agent": "pi", "workspace_id": "WS-A", "pid": 8100,
+                   "cwd": reg_cwd, "session_id": None,
+                   "agent_lifecycle": "running",
+                   "store": fs.LIVE_STORE_CMUX_SINGULAR}],
+        f"{fs.PROC_WS_PREFIX}9200": [_proc_live(9200, cwd=reg_cwd)],
+    }
+    kept, proc_ws = fs.register_process_lanes(
+        live, workspaces, [("lane-7", "WS-A", "")],
+        {reg_cwd: {"branch": "refs/heads/feat/7-x"}})
+    assert [lbl for lbl, _ws, _i in kept] == ["lane-7"], (
+        "the registry row's own record names the cwd, so the process is that lane")
+    assert proc_ws == set()
+    assert f"{fs.PROC_WS_PREFIX}9200" not in live, (
+        "the synthetic key must not linger as a second lane")
+    assert [r["pid"] for r in live["WS-A"]] == [8100, 9200]
+
+
+def test_worktree_of_prefers_the_deepest_root_by_resolved_length(tmp_path) -> None:
+    """⛔ THE RETURNED ROOT IS RAW, BUT THE DEPTH IS RESOLVED (review of #9016).
+
+    ``worktree_of`` returns the RAW root (the caller keys the worktree map by it),
+    so comparing ``len(rroot) > len(best)`` compared a RESOLVED length against a RAW
+    one. A parent whose raw spelling is longer than its resolved path (a symlinked
+    root) then beat its own CHILD whenever the child's extra segments were shorter
+    than the symlink's excess — collapsing a ``.worktrees/<lane>`` lane onto the hub,
+    whose branch is ``main``, so the issue that lane holds reads "nobody holds it".
+    """
+    short = tmp_path / "p"
+    short.mkdir()
+    child = short / "w"
+    child.mkdir()
+    long_link = tmp_path / "this-is-a-really-long-parent-directory-name"
+    long_link.symlink_to(short)
+    cwd = str(child / "tools")
+    roots = [str(long_link), str(child)]
+    assert len(str(long_link)) > len(str(child)), (
+        "the fixture must keep the raw parent LONGER than the resolved child, "
+        "or it cannot distinguish the two comparisons")
+    assert fs.worktree_of(cwd, roots) == str(child), (
+        "the deepest root wins by RESOLVED length, and it is returned RAW")
+
+
 def test_process_lanes_are_skipped_by_the_session_disk_scan(monkeypatch) -> None:
     """The disk rule reads the first user message of every file in a lane's session
     directory; on the shared checkout that is 1.6 GB of files. A process lane needs

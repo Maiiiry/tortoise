@@ -1636,17 +1636,29 @@ def worktree_of(cwd: str, roots: Collection[str]) -> str:
     ``realpath`` is memoized: a fleet-sized box carries hundreds of worktree records
     (414 measured 2026-10-18) and this runs once per lane, so resolving every root
     for every lane dominated the read.
+
+    ⛔ THE DEPTH IS COMPARED IN ONE SPELLING, AND IT IS THE RESOLVED ONE. The value
+    RETURNED is the raw root (the caller uses it as a key into the worktree map), so
+    ``best`` holds a raw path — but ``len(best)`` is not a depth: the parent's raw
+    spelling can be longer than its resolved one (a symlinked root) while the child's
+    is shorter, and then a deeper root loses to its own parent. The hub here IS the
+    parent of its own worktrees, so losing the deepest match collapses a
+    ``.worktrees/<lane>`` lane onto the hub — whose branch is ``main`` — and the
+    issue that lane really holds then reads "nobody holds it" (review of #9016).
+    The best RESOLVED length is therefore tracked separately from the raw value.
     """
     real = _realpath(cwd)
     if not real:
         return ""
     best = ""
+    best_len = -1
     for root in roots:
         rroot = _realpath(root).rstrip(os.sep)
         if not rroot:
             continue
-        if (real == rroot or real.startswith(rroot + os.sep)) and len(rroot) > len(best):
+        if (real == rroot or real.startswith(rroot + os.sep)) and len(rroot) > best_len:
             best = root
+            best_len = len(rroot)
     return best
 
 
@@ -1743,11 +1755,7 @@ def register_process_lanes(
             continue
         owners: list[str] = []
         for _lbl, row_ws, _ilbl in kept:
-            wcwd = str((workspaces.get(row_ws.upper(), {}) or {}).get("cwd") or "")
-            # ⛔ THE EMPTY GUARD IS LOAD-BEARING: `_realpath("")` is this process's
-            # cwd (``os.path.realpath`` of the empty string), which would match every
-            # lane on the box.
-            if wcwd and (_realpath(wcwd) or wcwd) == key:
+            if key in _row_cwds(row_ws, workspaces, live):
                 owners.append(row_ws)
         if len(owners) == 1:
             # THE LANE ALREADY EXISTS: merge the reading into its workspace and drop
@@ -1769,6 +1777,37 @@ def register_process_lanes(
         proc_ws.add(ws.upper())
         minted[key] = ws.upper()
     return list(kept) + added, proc_ws
+
+
+def _row_cwds(
+    row_ws: str,
+    workspaces: Mapping[str, Any],
+    live: Mapping[str, list[dict[str, Any]]],
+) -> set[str]:
+    """Every REAL-PATH cwd a registry row's own evidence attributes to it.
+
+    ⛔ THE WORKSPACE MAP IS NOT THE ONLY STORE THAT KNOWS A ROW'S CWD. The cmux
+    workspace list degrades to an EMPTY map on every failure path (no single window,
+    unparsable JSON, a timeout — and a cell has no cmux at all), while the registry
+    row's own session records in ``live`` still carry the cwd it ran in. Indexing
+    owners from ``workspaces`` alone therefore took the MINT path for a worktree a
+    registry row already owned, publishing ``lane-x`` AND ``proc-<pid>`` for one
+    lane — two holders, a false COLLISION, on exactly the box this fix unblocks
+    (review of #9016).
+
+    ⛔ THE EMPTY GUARD IS LOAD-BEARING: ``_realpath("")`` is this process's cwd
+    (``os.path.realpath`` of the empty string), which would match every lane on the
+    box.
+    """
+    out: set[str] = set()
+    wcwd = str((workspaces.get(row_ws.upper(), {}) or {}).get("cwd") or "")
+    if wcwd:
+        out.add(_realpath(wcwd) or wcwd)
+    for r in live.get(row_ws.upper(), []) or []:
+        c = str((r or {}).get("cwd") or "")
+        if c:
+            out.add(_realpath(c) or c)
+    return out
 
 
 def build_state(
