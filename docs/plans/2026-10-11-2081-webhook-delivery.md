@@ -124,9 +124,13 @@ not a logic failure. The same file is the documented embedded-lane flake class (
    app-facing (#2081) and graph-lifecycle (#3909) subscriptions. This change builds that one layer,
    so #3909 should reuse it rather than add a second dispatcher; SSE is a second transport on top.
 4. **Pilot app end-to-end** — indicator 4 needs a real third-party integration.
-5. **SSRF residual: DNS rebinding** — a public name that resolves to a private address is accepted at
-   registration and can be re-pointed before dispatch; closing it needs the connected peer's IP
-   checked against the same policy at CONNECT time.
+5. **SSRF residual: DNS rebinding** — ~~a public name that resolves to a private address is accepted
+   at registration and can be re-pointed before dispatch; closing it needs the connected peer's IP
+   checked against the same policy at CONNECT time.~~ **CLOSED by #8103**: the delivery transport now
+   resolves at connect time, judges every answer with the SAME predicate
+   (`security.is_global_address`, shared with the registration gate) and dials the vetted ADDRESS
+   with `Host`/SNI still on the name — a refuse is a `retrying`/`exhausted` receipt, never a silent
+   success. Mixed answers fail CLOSED.
 
 ## 6. Learnings
 

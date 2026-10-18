@@ -45,6 +45,14 @@ THE CONTRACTS THIS MODULE PINS
    creation, and never by a read path; it is stored encrypted via
    ``crypto.encrypt_token`` (Fernet, ``TORTOISE_ENCRYPTION_KEY``), the same
    at-rest treatment as the OAuth tokens on the Org node.
+6. **The destination is judged at CONNECT time, not only at registration.**
+   ``create_subscription`` refuses a non-global IP literal and a local name,
+   but it does not resolve DNS — so the answer DNS gives at DISPATCH is the
+   first real look at the destination. ``_pinned_targets`` resolves, refuses
+   any non-global answer (and any MIXED answer, whole), and dials the vetted
+   ADDRESS with ``Host``/SNI still on the hostname. A refusal is a receipt
+   (``retrying``/``exhausted``), never a silent success — see the transport
+   section (#8103, closing the residual #2081 documented).
 
 STORAGE (graph-native, per-graph = per-org — mirrors ``event_store``: the
 namespace IS the partition, there is no ``org_id`` property):
@@ -65,11 +73,17 @@ import os
 import time
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from urllib.parse import urlsplit
 
 from tortoise.env_truthy import FALSY
 
 from .ids import ulid
-from .security import env_int, redact_error, validate_webhook_url
+from .security import (
+    env_int,
+    redact_error,
+    resolve_webhook_addresses,
+    validate_webhook_url,
+)
 
 logger = logging.getLogger("tortoise.webhook_delivery")
 
@@ -348,6 +362,85 @@ def verify_signature(secret: str, header: str, body: bytes, *,
 
 # ── Transport ─────────────────────────────────────────────────────────────
 
+#: Default port per scheme — used to decide whether the ``Host`` header may
+#: omit the port when the request is re-pointed at a vetted address (#8103).
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+#: How many vetted addresses one delivery may DIAL. Every answer is validated
+#: (a mixed answer is refused whole), but the connect loop needs a bound of its
+#: own: a hostile resolver can answer with a long list and each attempt costs a
+#: ``TIMEOUT_S`` connect. Same cap as ``cimd.MAX_ADDRESSES``, same reason.
+MAX_PINNED_ADDRESSES = 8
+
+
+def _pinned_targets(url: str, *, resolver=None
+                    ) -> tuple[tuple[str, str, str | None], ...]:
+    """Return the CONNECT-TIME pin candidates for ``url``, one per vetted address.
+
+    Each entry is ``(pinned_url, host_header, sni_hostname)``.
+
+    The residual #2081 left documented: the registration predicate
+    (``security.validate_webhook_url``) never resolves, so the name is only
+    judged at DISPATCH — by the resolver, whose answer nothing checked. A name
+    that is public at registration and re-pointed afterwards (DNS rebinding),
+    or one that was private all along, would make this process sign and POST an
+    event payload to an address the tenant never should have reached.
+
+    So the delivery resolves FIRST, judges EVERY answer with the same
+    :func:`security.resolve_webhook_addresses` policy the registration gate
+    uses, and then pins the socket: the returned URL carries the VETTED
+    ADDRESS, while the returned ``host_header`` and ``sni`` keep the HTTP
+    ``Host`` header and the TLS server name on the hostname. Resolve-then-
+    hand-the-name-to-the-client would only NARROW the TOCTOU window (the
+    client resolves again); dialing the address we vetted REMOVES it.
+
+    ``validate_webhook_url`` runs first as a defence-in-depth re-check: the URL
+    being dispatched is a value read back from the graph, not a value that
+    passed through registration in this process, so the full registration
+    policy is re-applied rather than assumed. Both halves therefore share ONE
+    policy home (``security``) instead of growing a second list here.
+
+    ONE CANDIDATE PER VETTED ADDRESS, in resolver order — the caller fails over
+    between them. Pinning to a single address would have quietly dropped the
+    multi-address failover the un-pinned transport inherited from
+    ``socket.create_connection`` (a dual-stack target whose first answer is
+    unreachable on this host would stop delivering); the addresses are all
+    vetted, so trying them in turn keeps that behaviour AND the pin.
+    """
+    validate_webhook_url(url)
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").strip().lower().rstrip(".")
+        port = parts.port
+    except ValueError as e:  # malformed IPv6 literal / bad port
+        raise ValueError(f"webhook url is not parseable: {e}") from e
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _DEFAULT_PORTS:
+        raise ValueError(
+            f"webhook url scheme must be http or https, not {scheme or '(none)'}")
+    if not host:
+        raise ValueError("webhook url has no host")
+    default_port = _DEFAULT_PORTS[scheme]
+    port = port or default_port
+    # Every answer must be global; a mixed answer is refused WHOLE. Only then
+    # are addresses chosen, and they are what gets dialed.
+    addresses = resolve_webhook_addresses(host, port, resolver=resolver)
+    target = parts.path or "/"
+    if parts.query:
+        target = f"{target}?{parts.query}"
+    bracketed = f"[{host}]" if ":" in host else host
+    host_header = bracketed if port == default_port else f"{bracketed}:{port}"
+    # SNI (and therefore certificate verification) stays on the NAME: httpcore
+    # passes ``request.extensions['sni_hostname']`` to ``start_tls`` and httpx
+    # forwards extensions to httpcore.
+    sni = host if scheme == "https" else None
+    candidates: list[tuple[str, str, str | None]] = []
+    for address in addresses[:MAX_PINNED_ADDRESSES]:
+        literal = f"[{address}]" if ":" in address else address
+        candidates.append((f"{scheme}://{literal}:{port}{target}", host_header, sni))
+    return tuple(candidates)
+
+
 class WebhookTransport:
     """The one place an outbound POST happens. Injectable for tests.
 
@@ -356,21 +449,63 @@ class WebhookTransport:
     redirect would let the subscriber move the actual request somewhere the
     predicate never saw. A 3xx is therefore a FAILED delivery (the caller
     sees the status in the receipt).
+
+    The CONNECT-TIME half of that control is :func:`_pinned_targets` (#8103):
+    the target is resolved and judged here, and the request goes to a vetted
+    address — so a rebound name cannot reach what registration refused, while a
+    dual-stack target keeps its multi-address failover. A refusal is returned as
+    ``(None, reason)``, i.e. an ordinary failed delivery that
+    ``dispatch_pending`` records as a ``retrying``/``exhausted`` receipt: never
+    a raise, and never a silent success.
+
+    ``trust_env=False`` is load-bearing, not hygiene: an env-configured proxy
+    would take an absolute-form request and resolve the NAME itself, which
+    silently discards the pin and lets DNS decide the destination again. A
+    direct connection is what makes the check meaningful — the same choice
+    ``cimd``'s fetch makes by driving ``httpcore`` directly.
+
+    ``resolver`` is injectable so the pin is testable without DNS.
     """
 
-    def __init__(self, timeout_s: int = TIMEOUT_S) -> None:
+    def __init__(self, timeout_s: int = TIMEOUT_S, *, resolver=None) -> None:
         self.timeout_s = timeout_s
+        self._resolver = resolver
 
     def post(self, url: str, body: bytes, headers: dict) -> tuple[int | None, str | None]:
         """Return ``(status_code, error)`` — exactly one of the two is ``None``."""
+        try:
+            candidates = _pinned_targets(url, resolver=self._resolver)
+        except ValueError as e:
+            # A refused target is a RECEIPT, never a raise — same contract as a
+            # transport failure, so the retry/backoff/disable path owns it.
+            return None, redact_error(e)
         import httpx
 
-        try:
-            resp = httpx.post(url, content=body, headers=headers,
-                              timeout=self.timeout_s, follow_redirects=False)
-            return resp.status_code, None
-        except Exception as e:
-            return None, redact_error(e)
+        out_headers = dict(headers)
+        # ``Host`` and ``sni_hostname`` are the same for every candidate — the
+        # pin moves the ADDRESS only, never the name the subscriber's vhost and
+        # its certificate are keyed on.
+        host_header, sni = candidates[0][1], candidates[0][2]
+        out_headers["Host"] = host_header
+        extensions = {"sni_hostname": sni} if sni else None
+        # Connect-class failures move on to the NEXT vetted address; any other
+        # error is the answer (a read timeout on address 2 is not fixed by
+        # trying address 1 again).
+        connect_errors = (httpx.ConnectError, httpx.ConnectTimeout)
+        error: str | None = None
+        for pinned_url in (candidate[0] for candidate in candidates):
+            try:
+                with httpx.Client(timeout=self.timeout_s, follow_redirects=False,
+                                  trust_env=False) as client:
+                    resp = client.post(pinned_url, content=body,
+                                       headers=out_headers, extensions=extensions)
+                return resp.status_code, None
+            except connect_errors as e:
+                error = redact_error(e)
+                continue
+            except Exception as e:
+                return None, redact_error(e)
+        return None, error or "no vetted address accepted the connection"
 
 
 def _status_code(value) -> int | None:

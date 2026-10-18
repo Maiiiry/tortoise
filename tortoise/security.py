@@ -5,8 +5,11 @@ these helpers without creating import cycles. This is the single home for the
 genuinely shared security semantics: Cypher identifier validation (filter keys,
 relationship types, entity types), path containment (base-dir confinement),
 error redaction, credential redaction for persisted content
-(``redact_secrets`` / ``CREDENTIAL_KINDS``, #4911), and redaction for PUBLIC
-sinks (``redact_for_publication``, #3293).
+(``redact_secrets`` / ``CREDENTIAL_KINDS``, #4911), the outbound-address
+policy (``is_global_address`` / ``resolve_webhook_addresses`` /
+``validate_webhook_url`` — one home for the webhook SSRF rule, shared by
+registration and connect time, #8103), and redaction for PUBLIC sinks
+(``redact_for_publication``, #3293).
 
 Derivation note (rel-type allowlist): KNOWN_REL_TYPES is derived from the
 codebase edge-type inventory (``grep -rhoE '\\-\\[:[A-Za-z_]+' tortoise/``)
@@ -1279,6 +1282,95 @@ _BLOCKED_WEBHOOK_HOST_SUFFIXES = (
 )
 
 
+#: Deprecated special-purpose ranges that ``ipaddress.is_global`` still reports
+#: as global (#2847 review P2): 6to4 relay anycast (RFC 7526) and IPv6
+#: site-local (RFC 3879). Effectively unroutable, but the predicate claims
+#: "globally routable" so it must not admit them. Moved here with
+#: :func:`is_global_address` from ``cimd`` so the address policy has ONE home.
+_IPV4_6TO4_RELAY = ipaddress.ip_network("192.88.99.0/24")
+
+
+def is_global_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Is ``ip`` a globally routable destination — the ONE address policy?
+
+    Shared by BOTH halves of the webhook SSRF control: the registration-time
+    predicate (:func:`validate_webhook_url`, over an IP literal the tenant
+    typed) and the connect-time pin (``webhook_delivery._pinned_targets``, over
+    the addresses DNS actually answers with — #8103). Reusing the predicate is
+    what keeps the two from drifting into two policies: a re-pointed name is
+    judged by exactly the rule the literal was.
+
+    It is also the predicate ``cimd.is_public_address`` delegates to (the
+    client-id metadata fetcher asked the same question), so an address is
+    non-global in one place or nowhere.
+
+    ``is_global`` alone is not enough: ``224.0.0.1`` (multicast), NAT64's
+    ``64:ff9b::/96`` and the deprecated 6to4-relay / site-local ranges all
+    report ``is_global=True``. An IPv4-mapped IPv6 address is judged by the
+    IPv4 address it embeds, so ``::ffff:127.0.0.1`` cannot smuggle a loopback
+    target past the check.
+    """
+    if ip.version == 6:
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            ip = mapped
+        elif ip.is_site_local:                  # fec0::/10 — RFC 3879
+            return False
+    if ip.version == 4 and ip in _IPV4_6TO4_RELAY:   # RFC 7526
+        return False
+    return bool(ip.is_global
+                and not ip.is_multicast
+                and not ip.is_reserved
+                and not ip.is_unspecified)
+
+
+def resolve_webhook_addresses(host: str, port: int, *, resolver=None) -> tuple[str, ...]:
+    """Resolve ``host`` for a delivery and return its addresses **only if every
+    one passes** :func:`is_global_address` (#8103, the connect-time half).
+
+    The registration predicate never resolves, so the answer DNS gives at
+    DISPATCH is the first thing that sees the real destination. This is where
+    that answer is judged: a name whose A/AAAA record is loopback, private,
+    link-local (the cloud metadata endpoint included), multicast or otherwise
+    non-global is refused — as is a MIXED answer (public v4 beside private v6),
+    which is refused WHOLE rather than filtered, so publishing one allowed
+    record beside a disallowed one buys nothing.
+
+    ``resolver`` is injectable (a ``getaddrinfo``-shaped callable) so the
+    policy is testable without DNS. Returns the vetted addresses in answer
+    order; raises ``ValueError`` with a receipt-readable reason otherwise.
+    Stdlib-only, so this module keeps its no-cycle guarantee.
+    """
+    resolve = resolver or socket.getaddrinfo
+    try:
+        infos = resolve(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as e:
+        raise ValueError(
+            f"webhook target {host!r} could not be resolved at connect time "
+            f"({e.__class__.__name__}) — refusing to deliver") from e
+    addresses: list[str] = []
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except (IndexError, TypeError, ValueError) as e:
+            raise ValueError(
+                f"webhook target {host!r} resolved to an unreadable address "
+                f"({e.__class__.__name__}) — refusing to deliver") from e
+        if not is_global_address(addr):
+            raise ValueError(
+                f"webhook target {host!r} resolves to a non-global address "
+                f"({addr}) — loopback/private/link-local targets are refused "
+                f"at connect time")
+        text = str(addr)
+        if text not in addresses:
+            addresses.append(text)
+    if not addresses:
+        raise ValueError(
+            f"webhook target {host!r} did not resolve at connect time — "
+            f"refusing to deliver")
+    return tuple(addresses)
+
+
 def validate_webhook_url(url: str) -> str:
     """Validate an OUTBOUND webhook target (SSRF guard). Returns the URL.
 
@@ -1301,13 +1393,15 @@ def validate_webhook_url(url: str) -> str:
       IPv6 ULA all fail that predicate);
     * the URL must be at most ``MAX_WEBHOOK_URL_LEN`` characters.
 
-    Known residual — DNS REBINDING, deliberately not closed here: a public
-    name that resolves to a private address is accepted (nothing resolves the
-    name at registration), and the name can be re-pointed between registration
-    and dispatch. Closing it needs the connected peer's IP checked against the
-    same policy at CONNECT time (a custom transport), which is a transport
-    change; this predicate is the honest, bounded half and the dispatch path
-    is documented as carrying the residual.
+    DNS REBINDING is NOT closed HERE, and no longer left open: this is the
+    registration-time HALF. A public name that resolves to a private address is
+    accepted here (nothing resolves the name at registration) and can be
+    re-pointed between registration and dispatch, so the delivery transport
+    resolves at CONNECT time, judges every answer with the SAME predicate
+    (:func:`is_global_address`, via :func:`resolve_webhook_addresses`) and dials
+    the vetted ADDRESS rather than handing the name back to the resolver —
+    see ``webhook_delivery._pinned_targets`` (#8103). A refusal there is a
+    delivery receipt, not a silent success.
 
     Why this is not a second loopback predicate (#1647 P1-3, the
     ``config.LOOPBACK_HOSTS`` single-source rule): it is a DIFFERENT question.
@@ -1381,8 +1475,8 @@ def validate_webhook_url(url: str) -> str:
             addr = ipaddress.ip_address(
                 socket.inet_ntoa(socket.inet_aton(literal)))
         except (OSError, ValueError):
-            addr = None  # genuinely a DNS name — the residual above applies
-    if addr is not None and not addr.is_global:
+            addr = None  # a DNS name: accepted HERE, judged at connect time (#8103)
+    if addr is not None and not is_global_address(addr):
         raise ValueError(
             f"webhook url host {host!r} is not a globally routable address "
             f"(loopback/private/link-local/reserved targets are refused)")

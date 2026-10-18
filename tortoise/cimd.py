@@ -79,6 +79,7 @@ from urllib.parse import unquote, urlparse
 import httpcore
 
 from .env_truthy import env_flag  # #4097: the declared truthy contract
+from .security import is_global_address  # #8103: the ONE address policy
 
 __all__ = [
     "CimdError",
@@ -139,11 +140,9 @@ FETCH_MAX_S = 6.0
 #: so a saturated cap fails fast instead of parking a caller indefinitely.
 IN_FLIGHT_WAIT_S = 2.0
 
-# Deprecated special-purpose ranges that Python's `is_global` still reports as
-# global (#2847 review P2): 6to4 relay anycast (RFC 7526) and IPv6 site-local
-# (RFC 3879). Effectively unroutable, but the predicate claims "globally
-# routable" so it should not admit them.
-_IPV4_6TO4_RELAY = ipaddress.ip_network("192.88.99.0/24")
+# Deprecated special-purpose ranges (6to4 relay anycast, RFC 7526; IPv6
+# site-local, RFC 3879) now live with the shared predicate in ``security``
+# (#8103) — see ``security._IPV4_6TO4_RELAY``.
 
 
 class CimdError(Exception):
@@ -264,19 +263,14 @@ def is_public_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool
     report ``is_global=True``. An IPv4-mapped IPv6 address is judged by the
     IPv4 address it embeds, so ``::ffff:127.0.0.1`` cannot smuggle a loopback
     target past the check.
+
+    #8103: the RULE moved to ``security.is_global_address`` — the webhook
+    transport judges its connect-time answer by the same predicate, and two
+    copies of an SSRF policy drift. This name stays because it is the
+    published surface ``tests/test_cimd_ssrf.py`` pins (and ``__all__``
+    exports); the predicate body has exactly one home.
     """
-    if ip.version == 6:
-        mapped = ip.ipv4_mapped
-        if mapped is not None:
-            ip = mapped
-        elif ip.is_site_local:                  # fec0::/10 — RFC 3879
-            return False
-    if ip.version == 4 and ip in _IPV4_6TO4_RELAY:   # RFC 7526
-        return False
-    return bool(ip.is_global
-                and not ip.is_multicast
-                and not ip.is_reserved
-                and not ip.is_unspecified)
+    return is_global_address(ip)
 
 
 def public_addresses(host: str, port: int) -> list[str]:
