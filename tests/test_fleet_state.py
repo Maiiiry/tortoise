@@ -1833,6 +1833,74 @@ def test_a_process_that_exited_before_its_cwd_was_read_is_not_a_gap(monkeypatch)
     assert list(live) == [f"{fs.PROC_WS_PREFIX}7"]
 
 
+def test_the_same_gap_is_closed_on_the_batched_lsof_reader(monkeypatch) -> None:
+    """THE SAME INVARIANT ON THE MACOS PATH, which is where it was BROKEN.
+
+    ``lsof`` prints NOTHING when every pid it was handed has gone. The reader used
+    to turn that empty answer into a store-level error, so ONE vanished process
+    promoted the whole process store to unreadable — and on a box whose cmux store
+    also fails that is `liveness-unmeasured` for EVERY issue, forever: the permanent
+    red gate #8999 exists to remove. The `/proc` path already judged this per pid
+    (`test_a_process_that_exited_before_its_cwd_was_read_is_not_a_gap`), so the two
+    readers must agree.
+
+    ⛔ AND THE FAIL-CLOSED DIRECTION SURVIVES: the second half of this test is the
+    same empty ``lsof`` answer with the pid still ALIVE, which must stay unmeasured.
+    """
+    import subprocess as sp
+    import unittest.mock as mock
+
+    class _P:
+        returncode = 1          # lsof's "some pids not found" status
+        stdout = ""             # nothing to report: every pid is gone
+        stderr = "lsof: no pwd entry for the given pid\n"
+
+    monkeypatch.setattr(fs, "_proc_cwd_is_readable", lambda: False)
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 8, "ppid": 1}], ""))
+    with mock.patch.object(sp, "run", lambda *a, **k: _P()):
+        cwds, err = fs.process_cwds([8])
+        assert cwds == {} and err == "", (
+            "a `lsof` that RAN and reported no cwd is an answer, not a failure")
+
+        monkeypatch.setattr(fs, "pid_alive", lambda pid: False)
+        live = fs.live_sessions()
+    assert live.measured is True, "the exited pid is not a gap here either"
+    assert dict(live) == {}
+
+    # ⛔ THE CONTRAST: the pid is ALIVE, so the empty answer cannot rule it out.
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 8)
+    live = fs.live_sessions()
+    assert live.measured is False, "a live pid with no cwd is still a gap"
+    assert "8" in live.error
+
+
+def test_a_failed_lsof_invocation_is_still_a_gap(monkeypatch) -> None:
+    """The other side of the same distinction: a command that could not RUN (or
+    exited with a status that means it never did its job) is a real failure, and it
+    must NOT be laundered into a measured "nobody" by the empty-stdout rule."""
+    import subprocess as sp
+    import unittest.mock as mock
+
+    class _Broken:
+        returncode = 2          # did not do its job
+        stdout = ""
+        stderr = "lsof: illegal option\n"
+
+    monkeypatch.setattr(fs, "_proc_cwd_is_readable", lambda: False)
+    with mock.patch.object(sp, "run", lambda *a, **k: _Broken()):
+        cwds, err = fs.process_cwds([9])
+    assert cwds == {} and "illegal option" in err
+
+    # … and a `lsof` that is not installed at all.
+    def _boom(*a, **k):
+        raise FileNotFoundError("lsof")
+
+    with mock.patch.object(sp, "run", _boom):
+        cwds, err = fs.process_cwds([9])
+    assert cwds == {} and "could not be run" in err
+
+
 def test_a_guest_cli_error_object_is_not_a_session_store(monkeypatch) -> None:
     """THE ROOT CAUSE. cmux 0.1.0 (the Cloud guest CLI) answers a grammar it does
     not have with VALID JSON:
@@ -1921,13 +1989,13 @@ def test_lsof_stdout_survives_a_non_zero_exit() -> None:
     away a complete answer because one process exited mid-read — and on a busy
     fleet that is the normal case."""
     import subprocess as sp
+    import unittest.mock as mock
 
     class _P:
         returncode = 1
         stdout = "p7\nfcwd\nn/tmp/wt-a\n"
         stderr = "lsof: no pwd entry for UID 0\n"
 
-    import unittest.mock as mock
     with mock.patch.object(sp, "run", lambda *a, **k: _P()):
         out, err = fs._run_tolerant(["lsof", "-a", "-d", "cwd", "-Fn", "-p", "7"])
     assert err == "" and "/tmp/wt-a" in out
@@ -1966,6 +2034,74 @@ def test_a_process_lane_in_a_subdirectory_belongs_to_that_worktree() -> None:
     kept, _ = fs.register_process_lanes(live, workspaces, [], roots)
     assert [lbl for lbl, _ws, _i in kept] == ["proc-9100"]
     assert workspaces[f"{fs.PROC_WS_PREFIX}9100"]["cwd"] == CELL_CWD
+
+
+def test_two_processes_at_two_depths_of_one_worktree_are_ONE_lane() -> None:
+    """⛔ ONE WORKTREE IS ONE LANE — and the mint is where that has to hold.
+
+    `live_sessions` collapses processes by CWD, and a lane's processes do not all
+    share one cwd: a `pi` that has cd'ed into `<wt>/tools` is a SECOND cwd, so two
+    `PROC:` keys reach `register_process_lanes` for ONE lane. The registry-row join
+    cannot catch it — those rows are the ones handed IN, and a lane this call
+    already minted is not among them — and the same-label guard in
+    `_holders_from_board` cannot either, because the two labels DIFFER
+    (`proc-A`/`proc-B`). Two records for one lane make `attribute_claims` attribute
+    the issue to both and the gate answer TWO live holders: a false COLLISION, on
+    exactly the box this fix exists to unblock.
+    """
+    shallow = _proc_live(9400, cwd=CELL_CWD)
+    deep = _proc_live(9401, cwd=CELL_CWD + "/tools")
+    live = {f"{fs.PROC_WS_PREFIX}9400": [shallow],
+            f"{fs.PROC_WS_PREFIX}9401": [deep]}
+    workspaces: dict = {}
+    kept, proc_ws = fs.register_process_lanes(
+        live, workspaces, [], {CELL_CWD: {"branch": "refs/heads/feat/8999-tm"}})
+    assert [lbl for lbl, _ws, _i in kept] == ["proc-9400"], (
+        "one worktree, one lane — the second depth folds into the lane already minted")
+    assert len(proc_ws) == 1
+    # The pids are not lost: both are on the surviving lane's record, so its
+    # `pi_pids`/`pid_alive` still cover every process measured in the worktree.
+    assert [r["pid"] for r in live[f"{fs.PROC_WS_PREFIX}9400"]] == [9400, 9401]
+    assert f"{fs.PROC_WS_PREFIX}9401" not in workspaces, (
+        "the folded-away workspace key must not linger as a second workspace")
+
+
+def test_a_worktree_spelled_two_ways_is_still_one_lane(tmp_path) -> None:
+    """The same invariant under the other way one worktree doubles: a REAL PATH
+    spelling. cmux records a workspace's cwd as it was given, and a lane's cwd can
+    resolve through a symlink, so a plain string comparison mints a second lane for a
+    worktree that already has one. `worktree_of` already compares real paths for
+    exactly this reason; the owner join has to agree with it."""
+    real = tmp_path / "wt-8999"
+    real.mkdir()
+    link = tmp_path / "link-8999"
+    link.symlink_to(real)
+    row_cwd = str(link)          # what cmux recorded
+    proc_cwd = str(real / "tools")  # where the pi process sits
+    live = {f"{fs.PROC_WS_PREFIX}9500": [_proc_live(9500, cwd=proc_cwd)]}
+    workspaces: dict = {"WS-A": {"cwd": row_cwd}}
+    kept, proc_ws = fs.register_process_lanes(
+        live, workspaces, [("lane-7", "WS-A", "")], {str(real): {"branch": "refs/heads/feat/7-x"}})
+    assert [lbl for lbl, _ws, _i in kept] == ["lane-7"], (
+        "the existing lane is this process — a symlinked spelling does not mint a second")
+    assert proc_ws == set()
+    assert [r["pid"] for r in live["WS-A"]] == [9500]
+
+
+def test_two_depths_of_one_worktree_publish_one_lane_on_the_board(monkeypatch) -> None:
+    """The same defect at the BOARD level, where it becomes a blocking false
+    COLLISION: one attributed label, one lane, one holder."""
+    live = fs.LiveSessions({
+        f"{fs.PROC_WS_PREFIX}9600": [_proc_live(9600, cwd=CELL_CWD)],
+        f"{fs.PROC_WS_PREFIX}9601": [_proc_live(9601, cwd=CELL_CWD + "/tools")],
+    }, measured=True, source=fs.LIVE_STORE_PROCESS)
+    st = _cell_fleet(monkeypatch, live=live)
+    proc = [lane for lane in st["lanes"]
+            if lane["identity"]["workspace"].startswith(fs.PROC_WS_PREFIX)]
+    assert len(proc) == 1, "one worktree is one lane, whatever depth its pids sit at"
+    assert st["index"]["issues"]["8999"]["lanes"] == [proc[0]["identity"]["lane"]]
+    assert st["reconciliation"]["process_lanes"] == [
+        f"{fs.PROC_WS_PREFIX}9600"]
 
 
 def test_a_process_lane_joins_a_registry_row_that_already_claims_its_cwd() -> None:

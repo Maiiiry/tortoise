@@ -1197,16 +1197,30 @@ def _pi_pids_from_ps(text: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _proc_cwd_is_readable() -> bool:
+    """Can the kernel hand us a pid's cwd directly (``/proc``, i.e. Linux)?
+
+    A seam, not a constant: the ``lsof`` fallback is the path macOS runs and the
+    suite does not, so it can only be tested by forcing this answer.
+    """
+    return Path("/proc/self/cwd").exists()
+
+
 def process_cwds(pids: Sequence[int]) -> tuple[dict[int, str], str]:
     """``({pid: cwd}, error)`` — ONE read for every pid, not one per pid.
 
     ``/proc/<pid>/cwd`` where the kernel exposes it (Linux, the cells), otherwise a
     single batched ``lsof`` (macOS: 69 pids in 0.17 s, measured 2026-10-18) so a
     fleet-sized read stays one subprocess.
+
+    ⛔ A PID WITH NO CWD IS NOT AN ERROR — a pid that has EXITED is not a gap.
+    Both readers report only A REAL failure: an unread ``/proc/<pid>/cwd`` is
+    skipped, and a command that could not be run is an ``error``. Which pids that
+    leaves UNRESOLVED is judged per pid (``pid_alive``) in ``live_sessions``.
     """
     if not pids:
         return {}, ""
-    if Path("/proc/self/cwd").exists():
+    if _proc_cwd_is_readable():
         got: dict[int, str] = {}
         for pid in pids:
             try:
@@ -1241,6 +1255,17 @@ def _run_tolerant(cmd: Sequence[str], timeout: int = 60) -> tuple[str, str]:
     degrades a non-zero exit to "", would discard a complete answer because one
     process exited mid-read — and on a busy fleet that is the normal case, not the
     exceptional one.
+
+    ⛔ AND EMPTY STDOUT IS NOT AN ERROR WHEN THE COMMAND RAN. ``lsof`` prints
+    nothing when EVERY pid it was handed has gone — the pids are not running, which
+    is an ANSWER ("nobody"), not an unreadable store. Returning an error here
+    short-circuited the per-pid judgement in ``live_sessions`` and promoted one
+    vanished process to a whole-store failure: on a box whose cmux store also fails
+    that is ``liveness-unmeasured`` for EVERY issue, forever — the permanent-red
+    gate #8999 exists to remove. Such a pid is caught by the ``unresolved`` /
+    ``pid_alive`` filter on the way out, so the fail-closed direction survives: only
+    a genuine "there was nothing to report" reads as empty. An exit status above 1
+    is a command that did not do its job, and stays fatal.
     """
     try:
         p = subprocess.run(
@@ -1249,6 +1274,9 @@ def _run_tolerant(cmd: Sequence[str], timeout: int = 60) -> tuple[str, str]:
     except Exception as exc:  # missing binary, timeout, …
         return "", f"`{cmd[0]}` could not be run: {type(exc).__name__}: {exc}"
     if not p.stdout.strip():
+        if p.returncode <= 1:
+            # RAN, and reported no cwd: the pids are gone. Judged per pid upstream.
+            return "", ""
         detail = (p.stderr or "").strip().splitlines()
         return "", (
             f"`{' '.join(cmd[:3])} …` produced nothing (exit {p.returncode}"
@@ -1602,6 +1630,18 @@ def register_process_lanes(
     """
     added: list[tuple[str, str, str]] = []
     proc_ws: set[str] = set()
+    # ⛔ ONE WORKTREE IS ONE LANE — ENFORCED AT THE MINT, TOO, NOT ONLY AT THE
+    # READER. ``live_sessions`` collapses processes by their CWD, and a lane's
+    # processes do not all sit in the same cwd: a `pi` that has cd'ed into
+    # `<wt>/tools` is a SECOND cwd, so two `PROC:` keys reach this loop for ONE
+    # lane. The lane's identity key is the WORKTREE ROOT (`lane_cwd`), so that is
+    # what is grouped on — and the lane this call already minted for a root is
+    # consulted, because `owners` below only ever sees the registry rows handed IN
+    # (`kept`), never `added`. Grouping anywhere else publishes two records for one
+    # lane: `attribute_claims` attributes the issue to both labels, and
+    # `_holders_from_board` answers TWO live holders for it — a false COLLISION, on
+    # exactly the cell this fix exists to unblock.
+    minted: dict[str, str] = {}  # lane key (real worktree root) -> its workspace key
     scoped = bool(wts)
     for ws, recs in list(live.items()):
         if not is_proc_ws(ws):
@@ -1620,10 +1660,27 @@ def register_process_lanes(
             del live[ws]
             continue
         lane_cwd = root or cwd
-        owners = [
-            row_ws for _lbl, row_ws, _ilbl in kept
-            if str((workspaces.get(row_ws.upper(), {}) or {}).get("cwd") or "") == lane_cwd
-        ]
+        # The COMPARISON key is the real path, because one worktree is reachable
+        # under two spellings (a symlinked `/tmp` vs `/private/tmp`, a bind mount):
+        # `worktree_of` already resolves when it matches a root, and a registry row's
+        # cwd comes from cmux unresolved, so the join has to meet in the middle.
+        key = _realpath(lane_cwd) or lane_cwd
+        already = minted.get(key)
+        if already:
+            # THE LANE WAS MINTED EARLIER IN THIS SAME CALL — same worktree, another
+            # cwd depth. Merge the pids onto that one record; the lane is counted
+            # once.
+            live.setdefault(already, []).extend(recs)
+            del live[ws]
+            continue
+        owners: list[str] = []
+        for _lbl, row_ws, _ilbl in kept:
+            wcwd = str((workspaces.get(row_ws.upper(), {}) or {}).get("cwd") or "")
+            # ⛔ THE EMPTY GUARD IS LOAD-BEARING: `_realpath("")` is this process's
+            # cwd (``os.path.realpath`` of the empty string), which would match every
+            # lane on the box.
+            if wcwd and (_realpath(wcwd) or wcwd) == key:
+                owners.append(row_ws)
         if len(owners) == 1:
             # THE LANE ALREADY EXISTS: merge the reading into its workspace and drop
             # the synthetic key, so the cwd does not read as two workspaces (#9).
@@ -1637,6 +1694,7 @@ def register_process_lanes(
         }
         added.append((f"proc-{pid}", ws, ""))
         proc_ws.add(ws.upper())
+        minted[key] = ws.upper()
     return list(kept) + added, proc_ws
 
 
