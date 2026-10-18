@@ -593,6 +593,16 @@ def step7() -> None:
 
 _FALKORDB_PORT = "16379"
 _FALKORDB_CONTAINER = "falkordb-tortoise"
+# #8083 — PINNED, not `falkordb/falkordb:latest`. That tag tracks the v6 core,
+# where a READ-ONLY aggregate panics the module (`reply.rs:655`,
+# `Option::unwrap()` on `None`) and the server exits 1, losing every graph in
+# this container, whenever `count(*)` is RETURNed alongside a property absent
+# from every matched row (measured 2026-10-18: v6 = exit 1, this pin = row with
+# `null`, still serving). This value is the engine the repo's CI provisions
+# (`.github/actions/falkordb-provision` default) and matches
+# `tools/test_lane.py::PINNED_IMAGE`; `tests/test_8083_falkordb_engine_pin.py`
+# holds the three in lockstep.
+_FALKORDB_IMAGE = "falkordb/falkordb-server:v4.20.6"
 
 
 def _container_status(name: str) -> str:
@@ -655,7 +665,7 @@ def step8() -> None:
         "-p", f"127.0.0.1:{_FALKORDB_PORT}:6379",
         "-v", f"{data_dir}:/var/lib/falkordb/data",
         "-e", "REDIS_ARGS=--appendonly yes --save 60 1000 --maxmemory 512mb --maxmemory-policy noeviction",
-        "falkordb/falkordb:latest",
+        _FALKORDB_IMAGE,
     ])
     ENV_VARS["FALKORDB_PORT"] = _FALKORDB_PORT
 

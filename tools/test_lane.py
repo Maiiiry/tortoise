@@ -82,6 +82,32 @@ query explicitly requests. There is deliberately no env seam for it (unlike
 override is exactly how the private lane stops being a drop-in. Pinned by
 ``tests/test_test_lane_tool.py::test_start_passes_the_canonical_engine_args``.
 
+ENGINE PIN — WHY A LANE IS NOT STARTED FROM A FLOATING TAG (#8083)
+-------------------------------------------------------------------
+The default image is ``falkordb/falkordb-server:v4.20.6`` — the engine the
+repo's CI provisions (``.github/actions/falkordb-provision`` default) — and NOT
+the ``falkordb/falkordb:latest`` this tool used to start.
+
+MEASURED (2026-10-18, ``INFO modules`` on a fresh container per image, one
+``CREATE (:Source {url:'a', sourceKind:'document'})`` first):
+
+  * ``falkordb/falkordb:latest`` (graph ver 60002) and
+    ``falkordb/falkordb:6.0.1`` (60001): ``MATCH (s:Source) RETURN
+    s.sourceKind, s.kind, count(*)`` -> ``Error: Server closed the connection``
+    and Docker reports ``exited exit=1``. A READ-ONLY query killed the server.
+  * ``falkordb/falkordb-server:v4.20.6`` (42006): the same query returns
+    ``s.sourceKind | s.kind | count(*)`` = ``document | (null) | 1`` and the
+    container stays ``running``.
+
+The trigger is the PAIR (an aggregate plus a property absent from EVERY matched
+row); either alone is fine. So a lane on the v6 image can be destroyed by an
+ad-hoc checkpoint query and the crash then reads as a diff regression — this is
+what cost the T11 index smoke (#1037) its first 5,411-file cold run.
+``TORTOISE_TEST_LANE_IMAGE`` still allows an override (CI may pin a digest); a
+FLOATING tag arriving through it is reported on stderr before the container is
+started (``_image_drift_warning``), so drift is attributable rather than silent.
+Pinned by ``tests/test_8083_falkordb_engine_pin.py``.
+
 CONTRACT — THE TARGET IS NOT A PARAMETER
 ----------------------------------------
 The container this tool acts on is ALWAYS ``fdb-lane-<sha1(worktree)[:10]>``,
@@ -157,9 +183,30 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-#: Overridable so CI can pin a digest/version; `latest` matches the existing
-#: in-repo precedent (scripts/restore-smoke.sh also runs falkordb/falkordb:latest).
-IMAGE = os.environ.get("TORTOISE_TEST_LANE_IMAGE", "falkordb/falkordb:latest")
+#: #8083 — the image a lane's container starts from when no override is given.
+#: PINNED to the engine the repo's CI actually tests against
+#: (`.github/actions/falkordb-provision/action.yml` → ``image.default``), which is
+#: also the pin `tests/test_runner_ports_6673.py::FALKORDB_PIN` holds.
+#:
+#: WHY NOT ``falkordb/falkordb:latest`` (what this used to default to): that tag
+#: tracks the **v6 core**, where a READ-ONLY aggregate can kill the server —
+#: ``MATCH (s:Source) RETURN s.sourceKind, s.kind, count(*)`` (an aggregate
+#: RETURNed alongside a property ABSENT from every matched row) panics
+#: ``reply.rs:655`` (``Option::unwrap()`` on ``None``) and the process exits 1,
+#: taking every graph in the container with it. Measured 2026-10-18: the module
+#: ``graph`` ver is 60002 on ``falkordb/falkordb:latest`` and 60001 on
+#: ``falkordb/falkordb:6.0.1`` — both exit 1 on that query — while
+#: ``falkordb/falkordb-server:v4.20.6`` (ver 42006) returns the row with ``null``
+#: and keeps serving. A lane crash then reads as a diff regression, which is how
+#: it cost a full 5,411-file cold index its first run (#1037). The v6
+#: ``falkordb/falkordb`` image has no lane-parity value either: CI tests v4.
+#:
+#: The env seam is KEPT (CI may pin a digest), and a FLOATING tag that arrives
+#: through it is announced on stderr at every `start()` — see
+#: `_image_drift_warning()`, so the seam cannot silently reintroduce the
+#: panicking engine.
+PINNED_IMAGE = "falkordb/falkordb-server:v4.20.6"
+IMAGE = os.environ.get("TORTOISE_TEST_LANE_IMAGE", PINNED_IMAGE)
 #: #8071: the engine args the canonical SHARED docker-lane container runs with
 #: (eldato ``operations/memory/docker-compose.yml`` -> ``FALKORDB_ARGS``). The
 #: private lane REPLACES that instance for a concurrent lane, so it must be
@@ -202,6 +249,40 @@ PROTECTED_NAMES = frozenset({
     "falkordb", "falkordb-16379", "fdb-6599", "w6213-fdb",
 })
 GRAPH_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
+
+
+def _image_drift_warning(image: str | None = None) -> str | None:
+    """A warning when the lane is about to run a FLOATING image tag, else None.
+
+    #8083: the default is pinned to the engine CI tests, but `IMAGE` is
+    env-overridable (`TORTOISE_TEST_LANE_IMAGE`) and a floating tag resolves to
+    whatever Docker Hub published most recently — which is how lanes silently
+    moved onto the v6 core whose ``reply.rs:655`` panic kills the server (and
+    every graph in the container) on a read-only aggregate query. The drift is
+    therefore ANNOUNCED, not prevented: the caller still owns the choice, but a
+    lane crash can no longer be mistaken for a diff regression without the
+    engine having been named on stderr first.
+
+    Deliberately a STRING check, not a container query: this must fire BEFORE
+    the image is pulled/started, and a warning that needs a running container
+    cannot warn about starting one. Pinned by
+    tests/test_8083_falkordb_engine_pin.py.
+    """
+    ref = IMAGE if image is None else image
+    # A tag is the substring after the LAST `/`; a registry host may carry a
+    # port (`host:5000/img`), so only the final path component decides.
+    last = ref.rsplit("/", 1)[-1]
+    tag = last.rsplit(":", 1)[1] if ":" in last else ""
+    if tag not in ("", "latest"):
+        return None
+    return (
+        f"test-lane: WARNING — image {ref!r} is a FLOATING tag ({tag or 'none'}): "
+        f"what it resolves to can change between runs. #8083: the v6 core "
+        f"(``falkordb/falkordb:latest``) panics on a read-only aggregate RETURNed "
+        f"with a property absent from every matched row (``reply.rs:655``) and "
+        f"EXITS the server, losing every graph in the container. The pinned "
+        f"default is {PINNED_IMAGE!r}; unset TORTOISE_TEST_LANE_IMAGE to use it."
+    )
 
 
 def _git_env() -> dict[str, str]:
@@ -580,6 +661,9 @@ def start(port: int | None = None) -> tuple[str, int]:
     # leaves a container that dies at the NEXT start instead of surviving until
     # someone notices. Reported, and never fatal: a sweep that cannot run must
     # not stop a lane from starting.
+    drift = _image_drift_warning()
+    if drift:
+        print(drift, file=sys.stderr)
     if os.environ.get("TORTOISE_TEST_LANE_REAP", "1") == "1":
         for _line in reap_orphans():
             print(_line, file=sys.stderr)

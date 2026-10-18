@@ -4,7 +4,18 @@
 
 services:
   falkordb:
-    image: falkordb/falkordb:latest
+    # #8083 — PINNED, not `falkordb/falkordb:latest`. That tag tracks the v6
+    # core, whose `reply.rs:655` panic EXITS the server (losing every graph in
+    # this container) on a read-only aggregate query that RETURNs `count(*)`
+    # beside a property absent from every matched row. Measured 2026-10-18:
+    # `falkordb/falkordb:latest` (graph ver 60002) exits 1; this pin (42006)
+    # returns the row with `null` and keeps serving. Same engine the repo's CI
+    # provisions (`.github/actions/falkordb-provision` default) and the same
+    # value as `tools/test_lane.py::PINNED_IMAGE`, held in lockstep by
+    # `tests/test_8083_falkordb_engine_pin.py`. The `-server` image is
+    # sufficient here: this app's own UI is the Vite server, not FalkorDB's
+    # browser surface, so only the graph module is needed.
+    image: falkordb/falkordb-server:v4.20.6
     container_name: tortoise-falkordb
     ports:
       # Loopback only (#7637): the server (`python3 server/main.py`) dials

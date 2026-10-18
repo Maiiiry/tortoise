@@ -1937,6 +1937,29 @@ surfaces:
   # measurement that only ran on one lane would stop being checkable.
   - test_journal_growth.py
   - test_test_lane_tool.py
+  # #8083: the FalkorDB ENGINE PIN. `falkordb/falkordb:latest` (graph module ver
+  # 60002) EXITS the server on a read-only aggregate RETURNed with a property
+  # absent from every matched row (`MATCH (s:Source) RETURN s.sourceKind,
+  # s.kind, count(*)` -> `reply.rs:655` panic, `exited 1`), losing every graph in
+  # the container; `falkordb/falkordb-server:v4.20.6` (42006) returns the row with
+  # `null` and keeps serving. Four in-repo defaults sent lanes/tests to the
+  # panicking tag, so this pins them to the engine CI provisions and announces a
+  # floating tag that arrives through `TORTOISE_TEST_LANE_IMAGE`. It reads
+  # `tools/test_lane.py`, `tools/edge_census.py`, `graph-scripts/setup.py`,
+  # `apps/graph-viz/docker-compose.yml` and the CI action's own `image` default
+  # — paths under flat NON_PYTHON_PREFIXES entries that match no SOURCE_PATTERNS
+  # row. Measured which of them needed a `CORE_ALSO` entry in
+  # `tools/ci_selection.py`: only `apps/graph-viz/docker-compose.yml` (swallowed
+  # by the flat `apps/` prefix: `surfaces=[]`, guard absent).
+  # `tools/edge_census.py` fails closed to the FULL matrix and
+  # `graph-scripts/setup.py` falls back to `core`, so both already select this
+  # file and an entry for either would claim coverage it does not add (the
+  # #1349/#3332/#3616 silent-drop class only bites where the guard is ABSENT).
+  # Hermetic on the general
+  # lane (static file reads + a monkeypatched `start()`; the ONE live Docker
+  # test skips when the CLI or the pinned image is absent, and never pulls), so
+  # it is deliberately NOT carve_out-registered.
+  - test_8083_falkordb_engine_pin.py
   - test_transport_wait_bound.py  # #3834: transport wait bound + cold-half gate wiring (dual: api)
   # #2877: DB-free guards that a dead backup watcher degrades /health (the file
   # it guards, tortoise/hosted_api.py, selects the `api` surface, so it is
@@ -5040,6 +5063,16 @@ durations:
   # revalidates a count in a comment, so it re-stales silently. The count is
   # published in the PR body and the evidence README, where it has a method.
   test_journal_growth.py: 12.2
+  # #8083: 6.0 — the HIGHER of two local readings of the whole module at head
+  # ef405bd3e (10.7 s / 11.4 s wall, the first `setup` line charging ~6.2 s of
+  # shared session fixture and the conditional live Docker leg ~2.8 s). Static
+  # file reads + a monkeypatched `start()`, so the cheap half is cheap; the LIVE
+  # reproducer skips (never fails) when the CLI or the pinned image is absent and
+  # never pulls, so on a daemon without the image the file costs less than this
+  # row. Erring HIGH is correct for sharding (same rule as #8051/#5612 above).
+  # REFRESH from the first post-merge junit artifact — this row is an ESTIMATE,
+  # not a junit measurement, and says so rather than claiming a basis it lacks.
+  test_8083_falkordb_engine_pin.py: 6.0  # unmeasured
   test_who_is_on.py: 0.9  # #4256: analogue estimate (same subprocess harness as test_collision_preflight.py); refresh from the first post-merge junit artifact
   test_branch_reaper.py: 2.0  # unmeasured — no measurement in the four source runs; flat default
   test_run_reaper.py: 2.0  # unmeasured — new file (#6868); no CI junit yet, flat default

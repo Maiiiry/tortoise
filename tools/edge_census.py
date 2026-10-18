@@ -516,6 +516,18 @@ _REDIS_ERROR_TOKENS = (
 #: identifiable and reapable instead of accumulating invisibly.
 _PROBE_LABEL = "edge-census-probe=1"
 
+#: #8083 — the engine the probe measures on when no ``--image`` is given.
+#: PINNED to the engine the repo's CI provisions (and to
+#: ``tools/test_lane.py::PINNED_IMAGE``), NOT to ``falkordb/falkordb:latest``:
+#: that tag tracks the v6 core, whose ``reply.rs:655`` panic exits the server on
+#: a read-only aggregate query RETURNing a property absent from every matched
+#: row (measured 2026-10-18: graph ver 60002 exits 1; 42006 returns the row).
+#: A probe is a measurement, so the engine is part of the instrument: leaving the
+#: default floating made the marginals incomparable between runs for a reason the
+#: receipt never recorded (the result DOES carry ``image``, so a run names its
+#: engine and a cross-engine comparison is explicit rather than accidental).
+PROBE_IMAGE = "falkordb/falkordb-server:v4.20.6"
+
 
 #: The staged shapes. Deliberately the SAME shapes the #4333 §3.4 node probe
 #: used for its props-only Point, so the two probes are comparable; the edge
@@ -592,7 +604,7 @@ def derive_marginals(stages: list[Stage], *, n: int,
 def run_probe(
     *,
     n: int = 5000,
-    image: str = "falkordb/falkordb:latest",
+    image: str = PROBE_IMAGE,
     log: Callable[[str], None] = lambda _m: None,
 ) -> dict[str, Any]:
     """Measure marginal RAM per element shape in a disposable container.
@@ -904,7 +916,7 @@ def _build_parser() -> argparse.ArgumentParser:
     probe = sub.add_parser(
         "probe", help="marginal RAM per element shape (disposable container)")
     probe.add_argument("--n", type=int, default=5000, help="node count")
-    probe.add_argument("--image", default="falkordb/falkordb:latest")
+    probe.add_argument("--image", default=PROBE_IMAGE)
     probe.add_argument("--json", action="store_true", help="emit JSON")
     return parser
 

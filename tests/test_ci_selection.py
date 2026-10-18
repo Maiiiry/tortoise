@@ -7993,6 +7993,47 @@ def test_journal_growth_guard_runs_on_a_tool_or_probe_change():
         assert "test_journal_growth.py" in r["test_files"], (changed, r)
 
 
+def test_falkordb_engine_pin_guard_runs_on_any_site_or_the_ci_action():
+    # #8083: `tests/test_8083_falkordb_engine_pin.py` (registered `core`) holds
+    # every in-repo FalkorDB lane/test default on the SAME non-floating engine —
+    # the one CI provisions, NOT the v6 core whose `reply.rs:655` panic exits the
+    # server (losing a lane's graphs) on a read-only aggregate query.
+    # `tools/test_lane.py` already has its own CORE_ALSO entry above; the other
+    # guarded paths are a flat `tools/`/`apps/` NON_PYTHON_PREFIXES entry or
+    # match no SOURCE_PATTERNS row (`graph-scripts/`), so a change to any ONE of
+    # them came back `surfaces=[]` and the pin guard never ran on the file that
+    # had just drifted — the #1349/#3332/#3616 silent-drop class, the same shape
+    # as the `tools/lane_stash.py` arm above.
+    #
+    # The CI ACTION is deliberately NOT asserted here (a change under `.github/`
+    # selects the FULL matrix already, so a CORE_ALSO entry for it would claim
+    # coverage it does not provide), and neither are the two paths that already
+    # selected the guard: `tools/edge_census.py` takes the unknown-path branch to
+    # the FULL matrix (pinned by test_edge_census_tool_change_fails_closed_to_
+    # full, which adding it to CORE_ALSO BROKE by downgrading to `core`), and
+    # `graph-scripts/setup.py` falls back to `core`. Both arms are asserted here
+    # so a future narrowing of either is visible.
+    # Mutation check: removing the `apps/` entry fails that path's asserts.
+    for changed in ("tools/test_lane.py",          # the existing #5084 entry
+                    "apps/graph-viz/docker-compose.yml"):
+        r = _sel([changed])
+        assert r["full"] is False, (changed, r)
+        assert r["surfaces"] == ["core"], (changed, r)
+        assert "test_8083_falkordb_engine_pin.py" in r["test_files"], (changed, r)
+
+    # `tools/edge_census.py`: FAIL CLOSED to the full matrix (so the guard runs),
+    # and it must stay that way — `core`-only would be a coverage loss.
+    r = _sel(["tools/edge_census.py"])
+    assert r["full"] is True, r
+    assert r["test_files"] == "ALL", r
+
+    # `graph-scripts/setup.py`: the unknown-path fallback already carries `core`.
+    r = _sel(["graph-scripts/setup.py"])
+    assert r["full"] is False, r
+    assert r["surfaces"] == ["core"], r
+    assert "test_8083_falkordb_engine_pin.py" in r["test_files"], r
+
+
 def test_dashboard_deploy_script_change_selects_core_not_tier1():
     # PR #8852 review P2: `website/apps/dashboard/deploy.sh` is the documented
     # manual deploy, and the #8816 guard (`tests/test_e2e_wrangler_prewarm.py`,

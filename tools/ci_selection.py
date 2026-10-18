@@ -1286,7 +1286,35 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # Pinned by
              # tests/test_ci_selection.py::test_surface_tools_change_selects_core_not_tier1.
              "tools/surface-guard.py",
-             "tools/surface_manifest.py")
+             "tools/surface_manifest.py",
+             # #8083: the FalkorDB ENGINE PIN. `tests/test_8083_falkordb_engine_
+             # pin.py` (registered `core`) holds `tools/test_lane.py`,
+             # `tools/edge_census.py`, `graph-scripts/setup.py`,
+             # `apps/graph-viz/docker-compose.yml` and the CI provisioning
+             # action's own `image` default in LOCKSTEP on the non-panicking
+             # engine (the v6 core exits the server on a read-only aggregate,
+             # losing a lane's graphs). Measured which paths actually needed
+             # this entry, rather than adding all four:
+             #
+             #   * `tools/test_lane.py` already has its own entry above;
+             #   * `tools/edge_census.py` took the unknown-path branch -> FULL
+             #     matrix (fail closed, test_files == "ALL"), i.e. the guard ran
+             #     there ALREADY — and adding it here would have DOWNGRADED that
+             #     to `core` (it broke
+             #     test_edge_census_tool_change_fails_closed_to_full);
+             #   * `graph-scripts/setup.py` falls back to `core`, which selects
+             #     the guard, so an entry would claim coverage it does not add;
+             #   * `apps/graph-viz/docker-compose.yml` is swallowed by the flat
+             #     `apps/` NON_PYTHON_PREFIXES entry: measured `surfaces=[]`,
+             #     tier-1 smoke only, guard absent — THE silent drop this entry
+             #     fixes (#1349/#3332/#3616 class, same shape as
+             #     `tools/lane_stash.py` above).
+             #
+             # (The CI ACTION is not listed either: a change under `.github/`
+             # already selects the FULL matrix.) Pinned by
+             # tests/test_ci_selection.py::
+             # test_falkordb_engine_pin_guard_runs_on_any_site_or_the_ci_action.
+             "apps/graph-viz/docker-compose.yml")
 NON_PYTHON_PREFIXES = (
     "docs/", "website/", "product/", "legal/", "growth/", "engineering/",
     "finance-accounting/", "menu-bar/", "ux/", "data/", "operations/",
