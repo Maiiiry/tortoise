@@ -1072,10 +1072,13 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert ten_req == pytest.approx(0.0540, abs=2e-3), (
         f"the comment quotes a 0.0540 requirement on the shipped default "
         f"page; this run measures {ten_req:.4f}")
-    assert ten_req * DEFAULT_GRAPH_BOOST_WEIGHT == pytest.approx(0.0189, abs=1e-3), (
+    assert ten_req * DEFAULT_GRAPH_BOOST_WEIGHT == pytest.approx(0.0189, abs=1e-4), (
         f"the comment quotes this page's relevance gap as 0.0189 of final "
         f"score (just above the 0.0175 boost); this run measures "
-        f"{ten_req * DEFAULT_GRAPH_BOOST_WEIGHT:.4f}")
+        f"{ten_req * DEFAULT_GRAPH_BOOST_WEIGHT:.4f}.  The tolerance holds the "
+        f"4th decimal on purpose: 0.0188 and 0.0189 are the SAME measurement "
+        f"rounded two ways, and a band wide enough to admit both cannot "
+        f"settle which one the comment is entitled to quote")
     clears_2102 = DEFAULT_SIMILARITY_WEIGHT * 0.05 / DEFAULT_GRAPH_BOOST_WEIGHT
     assert clears_2102 == pytest.approx(0.0714, abs=1e-3)
     assert ten_req < clears_2102, (
