@@ -122,14 +122,18 @@ async def quiet_boot_sweeps() -> None:
     """#3472: no-op stand-in for the lifespan's one-shot `_run_boot_sweeps`.
 
     Must be `async def`: `_lifespan` arms it with
-    `create_task(_run_boot_sweeps())`, so a sync stub would hand
-    `create_task` a `None` and raise inside the startup half — turning a
-    test-isolation fix into a second, unrelated failure.
+    `create_task(_run_boot_sweeps())`, so a sync stub returns `None` and
+    `create_task(None)` raises. `_lifespan` swallows that (it logs
+    `boot sweeps did NOT run`) rather than failing the app — measured: a sync
+    stub still passes these suites — but it puts a false ERROR line in front of
+    every reader on every `TestClient` entry, which is the last thing a
+    test-isolation helper should add.
     """
 
 
 def quiesce_testclient_background_work(monkeypatch) -> None:
-    """#3472/#3505: make `TestClient(app)` entry safe for this file's tests.
+    """#3472/#3505: make `TestClient(app)` entry safe for the fixtures that call it
+    (``sb_client``, ``reg_client``, ``supabase_client``).
 
     `_lifespan` arms background work for EVERY `TestClient(app)` entry,
     regardless of control-plane mode, and all of it touches the same store
@@ -139,9 +143,9 @@ def quiesce_testclient_background_work(monkeypatch) -> None:
        `app.state._boot_sweep_task`, one-shot) and `_event_retention_loop()`
        (armed by `_lifespan` as `app.state._event_retention_task`,
        re-armed every `event_retention_interval()`) BOTH call
-       `_purge_deleted_teams`. A
+       `_purge_deleted_orgs`. A
        background purge landing between a test's seeding and its own
-       `ha_mod._purge_deleted_teams()` call makes both read the row before
+       `ha_mod._purge_deleted_orgs()` call makes both read the row before
        either deletes it: two `_drop_team_graph` calls and two
        `team_delete_purged` audit rows — `assert ['reg-old', 'reg-old'] ==
        ['reg-old']` on the registry fixture. Worse on Supabase mode, where
@@ -157,21 +161,21 @@ def quiesce_testclient_background_work(monkeypatch) -> None:
 
        #3036 added a THIRD caller to both sites — `_sweep_oauth_retention`
        (a `_run_boot_sweeps` member AND an `_event_retention_loop` call). It
-       is benign for THIS file (it touches only the fake control plane), but
+       is benign for these fixtures (it touches only the fake control plane), but
        the enumeration above is the guard that makes the next lifespan-armed
        caller visible, so keep it complete: a new sweep reachable from either
        entry point belongs in this list.
 
        The CALLEE is deliberately not stubbed: this file's tests call
-       `ha_mod._purge_deleted_teams()` directly and resolve it off the
+       `ha_mod._purge_deleted_orgs()` directly and resolve it off the
        module at call time, so a callee stub would silence the very call
        under test. `_run_boot_sweeps` is stubbed with an `async def` because
        `_lifespan` arms it with `create_task(...)` (see
-       `_quiet_boot_sweeps`). The retention interval is pinned beyond any
+       `quiet_boot_sweeps`). The retention interval is pinned beyond any
        test's lifetime: `_event_retention_loop` invokes BOTH `_sweep_events`
-       and `_purge_deleted_teams` on the same target, so pinning the
+       and `_purge_deleted_orgs` on the same target, so pinning the
        interval quiesces the loop while leaving the directly-called
-       `_purge_deleted_teams` under test.
+       `_purge_deleted_orgs` under test.
 
     2. The app's `_health_probe_loop` (armed by `_lifespan` as
        `app.state._health_probe_task`) is NOT stubbed:
@@ -200,14 +204,14 @@ def quiesce_testclient_background_work(monkeypatch) -> None:
        `tests._embedded.TEST_NO_REDIRECT_STEMS`, which is what selects that
        branch. On that lane the protection this file actually gets is item 1
        — the BOOT-SWEEP quiesce, which removes the second caller of
-       `_purge_deleted_teams` — and NOT the serialization. The lock is live
+       `_purge_deleted_orgs` — and NOT the serialization. The lock is live
        only on the embedded tier-2 / carve-out lane (no URI), where
        constructions stay local-file and real daemons are spawned; it is
        kept for correctness there, not because the docker lane depends on
        it.
     """
     # (1) quiesce both background callers of the purge sweep (the caller, not
-    # the callee — `_purge_deleted_teams` itself stays under test).
+    # the callee — `_purge_deleted_orgs` itself stays under test).
     import tortoise.hosted_api as ha_mod
 
     monkeypatch.setattr(ha_mod, "_run_boot_sweeps", quiet_boot_sweeps)

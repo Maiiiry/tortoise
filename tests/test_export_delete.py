@@ -536,7 +536,7 @@ def _enable_supabase(monkeypatch, cp) -> FakeControlPlane:
 # double-start can occur. `test_export_delete` is NOT in
 # `tests._embedded.TEST_NO_REDIRECT_STEMS`, which is what selects that branch.
 # What protects THIS file on the docker lane is the BOOT-SWEEP quiesce
-# (`_quiesce_testclient_background_work`), not the serialization. The lock is
+# (`quiesce_testclient_background_work`), not the serialization. The lock is
 # live only on the embedded tier-2 / carve-out lane (no URI), where
 # constructions stay local-file and real daemons are spawned; it is kept for
 # correctness there, not because the docker lane depends on it.
@@ -546,7 +546,7 @@ def _enable_supabase(monkeypatch, cp) -> FakeControlPlane:
 def sb_client(monkeypatch):
     """Supabase-mode TestClient with a fake control plane + temp DB.
 
-    #3472/#3505: `_quiesce_testclient_background_work` is applied BEFORE the
+    #3472/#3505: `quiesce_testclient_background_work` is applied BEFORE the
     app is entered — the same lifespan-armed purge callers and health-probe
     constructor run for this fixture too (the arming is mode-independent),
     and on Supabase mode a boot sweep in the seeding window would run the
@@ -585,10 +585,10 @@ def sb_client(monkeypatch):
 def reg_client(monkeypatch):
     """Registry-mode TestClient (TORTOISE_CONTROL_PLANE=registry) + temp DB.
 
-    #3472/#3505: `_quiesce_testclient_background_work` is applied BEFORE the
+    #3472/#3505: `quiesce_testclient_background_work` is applied BEFORE the
     tempdir opens — it neutralizes the lifespan-armed background work that
     would otherwise race this fixture's own seeding: a background
-    `_purge_deleted_teams` landing between the seed and the test's direct
+    `_purge_deleted_orgs` landing between the seed and the test's direct
     call (two `_drop_team_graph` calls, two `team_delete_purged` rows,
     surfacing as `assert ['reg-old', 'reg-old'] == ['reg-old']`), plus the
     health probe's projection construction on the same db file. Neither is
