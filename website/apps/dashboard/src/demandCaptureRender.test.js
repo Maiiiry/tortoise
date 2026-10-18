@@ -151,8 +151,8 @@ test('#3514: both live mounts tell the record WHICH surface it came from', () =>
     'the Settings mount (via the shared prop bundle) records surface=settings')
   assert.ok(src.includes('surface={DEMAND_SURFACE_WIZARD}'),
     'the wizard mount overrides it — the two mounts differ, and `surface` is read')
-  assert.ok(src.includes('surface = DEMAND_SURFACE_SETTINGS'),
-    'the component reads the prop it is handed')
+  assert.ok(src.includes('surface = DEMAND_SURFACE_WIZARD'),
+    'the component reads the prop it is handed (fail-closed WIZARD default, #3513 §2)')
 })
 
 test('#3514: the recorded state is per-tile and survives a second open', () => {

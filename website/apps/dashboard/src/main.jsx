@@ -8312,6 +8312,9 @@ function claimIntentInFlight() {
   const memorySourcesProps = {
     state: onboarding,
     loading: onboardingLoading,
+    // #3513 §2: the SETTINGS default surface (the one mount that carries the
+    // collapsed manual-install disclosure); the wizard mount overrides it.
+    surface: 'settings',
     wizardHarness: null,  // Settings default; the wizard mount overrides it
     github: wizardGithub,
     issuesWantOn,
@@ -11550,18 +11553,34 @@ function MemorySources(props) {
     onConnectGithub, onIndexDocs, onReindexGithub,
     onDocsScopeChange, onIssuesScopeChange, onLoadBranches,
     // #3513: the grid's explicit render order (both mounts pass
-    // DATA_SOURCES_ORDER) — the wizard renders status + the disclosure, and the
+    // DATA_SOURCES_ORDER) — the wizard renders status + the pointer, and the
     // Settings mount renders the SAME grid, so an existing user sees ONE
     // presentation of the source list. The order is a prop, never the array
     // literal's incidental order (a render-order assertion depends on that).
     order = DATA_SOURCES_ORDER,
-    // #3514: the SURFACE this mount records on the demand row ('wizard' |
-    // 'settings') and the request seam the click posts through. A `surface`
-    // prop existed once and was dropped because nothing read it; it is back
-    // because it is now LOAD-BEARING — it is the request body's `surface` field
-    // (`tortoise/demand.py::DEMAND_PROPS`), and it is the one prop the two
-    // mounts genuinely differ on.
-    surface = DEMAND_SURFACE_SETTINGS,
+    // #3513 §2: which SURFACE is rendering this source list. Epic #1714
+    // decision #2 pins the split: the WIZARD mount renders status + the
+    // "your agent installs the recorder" pointer, while the SETTINGS mount
+    // additionally renders the manual-install recipe as a collapsed
+    // disclosure (a Settings-first user never saw the agent prompt, so the
+    // recipe would otherwise be orphaned). The default is the WIZARD surface —
+    // fail-closed: a mount that does not declare a surface must not publish
+    // the manual path. `memorySourcesProps` carries the Settings surface for the
+    // Settings mount and the wizard mount overrides it, exactly as
+    // `wizardHarness` is handled below.
+    //
+    // #3514 makes this ONE prop serve TWO readers, which is why it may not have
+    // a per-issue default: it still gates the install recipe (#3513 §2), and it
+    // is now also the `surface` field of the demand record the click posts
+    // (`tortoise/demand.py::DEMAND_PROPS`). The values are the same two
+    // (`DEMAND_SURFACE_WIZARD` = 'wizard', `DEMAND_SURFACE_SETTINGS` =
+    // 'settings'), and the fail-closed default #3513 §2 chose for the recipe
+    // gate is kept here verbatim — an undeclared mount records a click as a
+    // wizard click, never as a Settings one it never rendered.
+    surface = DEMAND_SURFACE_WIZARD,
+    // #3514: the request seam the click posts through. `null` on a mount with no
+    // seam (the ARCHIVED rollback block) means the tile renders no posting
+    // primary at all, rather than a control that silently does nothing.
     recordDemandClick = null,
   } = props
 
@@ -12047,10 +12066,14 @@ function MemorySources(props) {
           </p>
           {memoryErrors.sessions && <p className="error" role="alert">{memoryErrors.sessions}</p>}
           {/* #4915: the rows live in their own module so the DOM lane can
-              render them. The markup this component produces is the block that
-              used to sit inline here — byte-identical output, one import.
-              See `harnessStatusCard.jsx` for why the extraction exists. */}
-          <HarnessStatusCard state={state} sessionsOn={sessionsOn} wizardHarness={wizardHarness} />
+              render them. The #4915 EXTRACTION was byte-identical to the block
+              that used to sit inline here — one import, nothing a user could
+              see. That is no longer true of the output: #3513 §2 made the card
+              render from `surface` (status + the pointer on every mount, plus
+              the collapsed manual-install disclosure on Settings), which is why
+              the prop is forwarded below. See `harnessStatusCard.jsx` for why
+              the extraction exists and what the two surfaces render. */}
+          <HarnessStatusCard state={state} sessionsOn={sessionsOn} wizardHarness={wizardHarness} surface={surface} />
         </div>
       </div>
 
