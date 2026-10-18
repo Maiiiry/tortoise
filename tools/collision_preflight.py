@@ -3497,7 +3497,8 @@ def _claim_gate_note(
         f"claim gate: {candidates} candidate comment(s) from origin/main's "
         f"_CLAIM_RE pre-filter -> JEV typed decision (CLEAN p<{JEV_CLEAN_MAX:.2f}, "
         f"COLLISION p>={JEV_COLLISION_MIN:.2f}, else COLLISION-uncertain); "
-        f"{cleaned} CLEAN, {confident + uncertain} hit ({uncertain} uncertain)"
+        f"{cleaned} CLEAN, {confident - voids + uncertain} hit "
+        f"({uncertain} uncertain)"
     )
     if voids:
         # #8175: a model-decided ownership claim whose NAMED artifacts are all
@@ -3506,7 +3507,7 @@ def _claim_gate_note(
         # silently folded into the CLEAN side of the ledger.
         note += (
             f"; {voids} stale claim(s) demoted to non-blocking (their named "
-            "branch/worktree is gone or not live — see WEAK SIGNALS)"
+            "worktree is gone or not live — see WEAK SIGNALS)"
         )
     if untrusted:
         if identity_unresolved:
@@ -3560,8 +3561,16 @@ def _claim_gate_note(
 #   a named worktree `_worktree_liveness` reports as dead  -> void (weak)
 #   the claim names NO worktree — a branch-only claim, or a
 #     name that is not a worktree slug (see below)         -> BLOCKS (unchanged)
+#   a named worktree on a TERMINAL/merged branch           -> BLOCKS (unchanged)
+#     (an over-block: the worktree surface calls the same record
+#     non-blocking, but #6108's existence gate wins here)
+#   a token that names a PATH INSIDE a registered worktree -> BLOCKS (fail-closed)
+#     (it is not a worktree; measured as UNAVAILABLE)
 #   verification could not be performed (git failed, no
 #     listing, or an EMPTY listing)                        -> BLOCKS (fail-closed)
+#   the claim names a PR (`PR #N` / `/pull/N`)             -> BLOCKS (fail-closed)
+#     (a PR is not re-measured here; not measuring it must never
+#     free a claim, so it is treated as an INCOMPLETE artifact set)
 #
 # A claim is void ONLY when it named at least one worktree AND EVERY named
 # worktree is gone/non-live; naming two where one is alive BLOCKS.
@@ -3618,9 +3627,19 @@ _CLAIM_FILE_EXT_RE = re.compile(r"[A-Za-z0-9_-]\.[A-Za-z0-9]{1,5}$")
 # BLOCKING, so the cost is an over-block, never a false CLEAN.
 _CLAIM_WORKTREE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CLAIM_BACKTICK_RE = re.compile(r"`([^`\n]+)`")
-# Bound the work: a claim names a handful of artifacts, and each branch check is
-# a subprocess. A body that backticks dozens of tokens cannot buy extra git
-# calls, and the cap is fail-closed (an unexamined token is never a demotion).
+# A PR named by a claim (`PR #4243`, `/pull/4243`) is an artifact this arm does
+# NOT measure. Dropping it would compute the "EVERY named artifact" AND over a
+# SUBSET of what the claim named, so a claim naming an OPEN PR plus a gone
+# worktree could be demoted — a false CLEAN. A PR cannot be cheaply proven dead
+# here, so naming one marks the artifact set INCOMPLETE and the claim keeps
+# BLOCKING (the safe direction). A bare `#N` is deliberately NOT matched: it is
+# indistinguishable from an issue cross-reference and would over-block nearly
+# every claim.
+_CLAIM_PR_REF_RE = re.compile(r"(?i)\bPR\s*#\s*\d+|/pull/\d+")
+# Bound the work: a claim names a handful of artifacts, and an untrusted body
+# must not be able to enlarge the artifact set. A body that backticks dozens of
+# tokens cannot buy extra measurements, and the cap is fail-closed (an
+# unexamined token is never a demotion).
 _CLAIM_ARTIFACT_CAP = 8
 
 
@@ -3702,9 +3721,10 @@ def _looks_like_claim_branch(token: str, issue: int) -> bool:
     # direction: an unextracted token names nothing, and a claim that names
     # nothing keeps blocking — so the cost of a false refusal is an over-block,
     # never a false CLEAN.
-    if _CLAIM_FILE_EXT_RE.search(ref.rsplit("/", 1)[-1]):
-        return False
-    return True
+    # `_looks_like_claim_branch` is RETIRED (see the block above); this branch
+    # is kept only as the record. `is None` (rather than `if …: return False`)
+    # keeps the retired helper lint-clean under SIM103.
+    return _CLAIM_FILE_EXT_RE.search(ref.rsplit("/", 1)[-1]) is None
 
 
 def _artifact_shaped(token: str, issue: int) -> bool:
@@ -3749,19 +3769,20 @@ def _artifact_shaped(token: str, issue: int) -> bool:
 def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str], bool]:
     """(branches, worktrees, unmeasured) a claim-shaped comment names.
 
-    Extraction is SHAPE-based, never existence-based: a GONE branch is exactly
-    what must be recognised, so "does it exist?" cannot be the filter. A token
-    that is not confidently a branch or a worktree is not extracted at all, so a
-    claim that names nothing keeps blocking (fail-closed).
+    The FIRST element is ALWAYS empty: branches are never extracted (see the ⛔
+    paragraph below), and the slot is kept because `_claim_artifact_verifier`
+    still consumes it. Only the WORKTREE list can produce a demotion.
 
-    * a BRANCH is a backticked token that matches the repo's `<type>/<issue#>`
-      convention (see `_looks_like_claim_branch`);
+    Extraction is SHAPE-based, never existence-based: a GONE worktree is exactly
+    what must be recognised, so "does it exist?" cannot be the filter. A token
+    that is not confidently a worktree is not extracted at all, so a claim that
+    names nothing keeps blocking (fail-closed).
+
     * a WORKTREE is a backticked token containing `.worktrees/` and this issue's
       number — matched against the enumerated listing by the caller.
 
-    A `refs/heads/x/3061-y` token IS extracted (the prefix is stripped first);
-    a bare `3061-y` with no slash is NOT, because it names nothing this arm can
-    verify by convention — and a claim that names nothing keeps blocking.
+    A bare `3061-y` with no `.worktrees/` is NOT extracted, because it names
+    nothing this arm can verify — and a claim that names nothing keeps blocking.
 
     ⛔ ONLY A WORKTREE PATH MAY DEMOTE — A BARE BRANCH NAME MAY NOT, and this is
     a deliberate narrowing after four review cycles each found a fresh false
@@ -3788,6 +3809,11 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str], 
     """
     worktrees: list[str] = []
     unmeasured = False
+    if _CLAIM_PR_REF_RE.search(body or ""):
+        # A named PR is not measured here, so the artifact set is INCOMPLETE and
+        # can never justify a demotion (see `_CLAIM_PR_REF_RE`). Returning
+        # `unmeasured=True` makes `_verify` keep the claim BLOCKING.
+        return [], [], True
     for raw in _CLAIM_BACKTICK_RE.findall(body or ""):
         if len(worktrees) >= _CLAIM_ARTIFACT_CAP:
             # A token past the cap is never EXAMINED, and it could name a LIVE
@@ -3816,6 +3842,14 @@ def claim_named_artifacts(body: str, issue: int) -> tuple[list[str], list[str], 
             or not _CLAIM_WORKTREE_NAME_RE.match(name)
             or any(ch.isspace() for ch in tail)
         ):
+            continue
+        # ⛔ This repo's worktree ROOTS are `.worktrees/<name>` or
+        # `.worktrees/<type>/<name>`; a DEEPER tail names a path INSIDE a
+        # worktree (a FILE), never a root. Extracting one would verify "gone"
+        # and demote a claim that named no worktree — the false-CLEAN direction.
+        # A deeper token therefore names nothing, and a claim that names nothing
+        # keeps BLOCKING.
+        if len(tail.split("/")) > 2:
             continue
         # Normalise to the `.worktrees/…` TAIL so `./.worktrees/N-x` and
         # `../elsewhere/.worktrees/N-x` resolve to the same registered worktree as
@@ -3921,6 +3955,20 @@ def _claim_artifact_verifier(
                     path, block.get("locked"), block.get("prunable"),
                 )
                 return ("live" if live else "dead"), basis
+        # ⛔ A token that names a path INSIDE a registered worktree is NOT a
+        # gone worktree. `.worktrees/<live>/docs/<issue>-notes` (no extension)
+        # matches no ROOT above, so it would otherwise verify "gone" and demote
+        # a claim that named no worktree — the false-CLEAN direction this arm
+        # exists to prevent. An ancestor that IS registered makes the
+        # measurement UNAVAILABLE, and `None` keeps the claim BLOCKING.
+        for block in blocks:
+            path = (block.get("path") or "").rstrip("/")
+            idx = path.rfind(".worktrees/")
+            if idx < 0:
+                continue
+            root = path[idx:].rstrip("/")
+            if root and normalized.startswith(root + "/"):
+                return None
         return "gone", "not in the registered worktree list"
 
     def _verify(body: str) -> ClaimArtifactVerdict | None:
@@ -4016,8 +4064,7 @@ def scan_issue_surface(
     false COLLISIONs (#3504 class 3).
 
     `verify_claim` is the #8175 seam: an optional callable `body ->
-    ClaimArtifactVerdict | None` that re-verifies the branch/worktree a claim
-    NAMES. It is threaded in (never inferred) because it needs git state — the
+    ClaimArtifactVerdict | None` that re-verifies the worktree a claim NAMES. It is threaded in (never inferred) because it needs git state — the
     worktree listing and the terminal-test witnesses — that this scan does not
     hold. A `live=False` verdict demotes THAT comment to `weak`, so a stale
     claim is reported by name but cannot force the refusal; `None` (named
