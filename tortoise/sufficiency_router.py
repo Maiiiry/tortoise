@@ -138,7 +138,9 @@ from .residency_router import ROUTE_ESCALATE_TIER, ROUTE_FETCH_RECORD, ROUTE_SER
 
 __all__ = [
     "EVIDENCE_PROVENANCE_KEY",
+    "EVIDENCE_PROVENANCE_WIRE_KEY",
     "INSUFFICIENT",
+    "MEASURES",
     "MEASURE_ANCHOR_COVERAGE",
     "MEASURE_PROVENANCE_COVERAGE",
     "REASONS",
@@ -147,7 +149,6 @@ __all__ = [
     "REASON_BUDGET_EXHAUSTED",
     "REASON_EVIDENCE_EMPTY",
     "REASON_MEASURES_MET",
-    "REASON_NOT_ESTABLISHED",
     "REASON_NO_MEASURE",
     "REASON_PROVENANCE_THIN",
     "REASON_RESIDENT_MISS",
@@ -205,13 +206,11 @@ REASON_NO_MEASURE = "no-measure"
 #: has not established insufficiency at all (§17.3).
 REASON_RESIDENT_MISS = "resident-miss"
 REASON_RESIDENT_UNASSESSED = "resident-unassessed"
-#: Serve reasons: a measured-sufficient answer, a verdict never established, an
-#: insufficiency that has no budget left to repair, and one whose walk is
-#: already behind it. The last two are DISTINCT on purpose: a ``reason`` is a
-#: claim, and claiming an exhausted budget while ``budget_remaining`` is three
-#: is the same class of false record §17.3 refuses (``residency_router``: *"the
-#: reason must name the truth too"*).
-REASON_NOT_ESTABLISHED = "sufficiency-not-established"
+#: Serve reasons: a measured-sufficient answer, an insufficiency that has no
+#: budget left to repair, and one whose walk is already behind it. The last two
+#: are DISTINCT on purpose: a ``reason`` is a claim, and claiming an exhausted
+#: budget while ``budget_remaining`` is three is the same class of false record
+#: §17.3 refuses (``residency_router``: *"the reason must name the truth too"*).
 REASON_BUDGET_EXHAUSTED = "escalation-budget-exhausted"
 REASON_ALREADY_ESCALATED = "already-escalated"
 
@@ -223,10 +222,20 @@ REASONS: tuple[str, ...] = (
     REASON_NO_MEASURE,
     REASON_RESIDENT_MISS,
     REASON_RESIDENT_UNASSESSED,
-    REASON_NOT_ESTABLISHED,
     REASON_BUDGET_EXHAUSTED,
     REASON_ALREADY_ESCALATED,
 )
+
+#: Which reasons a VERDICT may carry. An allow-list, because the route reads
+#: ``verdict.reasons[0]`` and reports it as WHY it fired: an ``insufficient``
+#: verdict justified by ``measures-met`` would escalate on a claim about a
+#: measurement that PASSED. (The two budget reasons live on the ROUTE, not on a
+#: verdict — they describe the caller's policy, not the evidence.)
+_VERDICT_REASONS: dict[str, tuple[str, ...]] = {
+    SUFFICIENT: (REASON_MEASURES_MET,),
+    INSUFFICIENT: (REASON_EVIDENCE_EMPTY, REASON_ANCHORS_UNCOVERED, REASON_PROVENANCE_THIN),
+    UNDETERMINED: (REASON_NO_MEASURE, REASON_RESIDENT_MISS, REASON_RESIDENT_UNASSESSED),
+}
 
 #: Write-back refusals (§12.5 / extractor §2.4.2). A refusal is RECORDED, never
 #: a silent drop: a finding that cannot be written back honestly is not quietly
@@ -258,9 +267,40 @@ EVIDENCE_PROVENANCE_WIRE_KEY = "source"
 #: first. ``snippet`` is the 200-char wire preview; it is read LAST because a
 #: truncated preview is a weaker coverage signal than the full content.
 _TEXT_KEYS = ("content", "summary", "text", "snippet")
+#: The keys a row carries the ENTITIES it names under, OUTSIDE its content text.
+#: Anchor coverage is a measurement of whether the answer references the
+#: question's entities, and a hit that names an entity in its ``subject``
+#: (``{id, name, kind}``) or its ``topics`` (a list) is that evidence — reading
+#: only ``content`` scored it ``0.0`` and escalated a tier for the very row that
+#: answered the question.
+_ENTITY_KEYS = ("subject", "topics")
 #: Top-level (attribute-shape) aliases, then the nested wire path.
 _PROVENANCE_KEYS = (EVIDENCE_PROVENANCE_KEY, "sourceRef")
 _PROVENANCE_WIRE_KEYS = (EVIDENCE_PROVENANCE_WIRE_KEY, EVIDENCE_PROVENANCE_KEY)
+
+
+def _entity_terms(value: Any) -> list[str]:
+    """The READABLE names in a ``subject``/``topics`` value — never its kind.
+
+    ``subject`` is ``{id, name, kind}`` and ``kind`` is a label class
+    (``subjectKind``): reading it would let an anchor like ``point`` match every
+    row. Only names/ids are evidence of *which entity* a row is about.
+    """
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        out: list[str] = []
+        for key in ("name", "label", "id"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                out.append(item)
+        return out
+    if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+        nested: list[str] = []
+        for item in value:
+            nested.extend(_entity_terms(item))
+        return nested
+    return []
 
 
 # ── the evidence, normalised once ──────────────────────────────────────────
@@ -268,7 +308,11 @@ _PROVENANCE_WIRE_KEYS = (EVIDENCE_PROVENANCE_WIRE_KEY, EVIDENCE_PROVENANCE_KEY)
 
 @dataclass(frozen=True)
 class _Evidence:
-    """One assembled evidence row, read as the three things the measures need.
+    """One assembled evidence row, read as the things the measures need.
+
+    ``text`` is the row's assembled content; ``entities`` is the names it
+    carries OUTSIDE that content (``subject``/``topics``) — both are evidence of
+    what the row is about, so anchor coverage reads both.
 
     ``provenance`` is ``None`` when the row does not CARRY the field at all —
     which is a different fact from "the row carries no link". That distinction
@@ -281,6 +325,7 @@ class _Evidence:
     id: str
     text: str
     provenance: Any
+    entities: str = ""
 
 
 def _as_mapping(row: object) -> Mapping[str, Any]:
@@ -310,7 +355,7 @@ def evidence_record(row: object) -> _Evidence:
     if not data and not isinstance(row, Mapping):
         data = {k: getattr(row, k) for k in _TEXT_KEYS if hasattr(row, k)}
         data.setdefault("id", getattr(row, "id", ""))
-        for k in _PROVENANCE_KEYS:
+        for k in _PROVENANCE_KEYS + _ENTITY_KEYS:
             if hasattr(row, k):
                 data[k] = getattr(row, k)
     text = ""
@@ -319,10 +364,13 @@ def evidence_record(row: object) -> _Evidence:
         if isinstance(value, str) and value.strip():
             text = value
             break
+    entities = " ".join(
+        term for key in _ENTITY_KEYS for term in _entity_terms(data.get(key)))
     return _Evidence(
         id=str(data.get("id") or ""),
         text=text,
         provenance=evidence_provenance(data),
+        entities=entities,
     )
 
 
@@ -347,6 +395,15 @@ def evidence_provenance(data: object) -> Any:
         for key in _PROVENANCE_WIRE_KEYS:
             if nested.get(key):
                 return nested[key]
+    # The ATTRIBUTE shape (``evidence_record`` accepts an object as well as its
+    # ``to_dict()``), so the exported helper answers the same question for a row
+    # it was handed directly. Returning ``None`` here would read as "the field
+    # was never fetched" for a row that carries it — the one distinction this
+    # function exists to preserve.
+    if not isinstance(data, Mapping):
+        for key in _PROVENANCE_KEYS:
+            if hasattr(data, key) and getattr(data, key):
+                return getattr(data, key)
     return None
 
 
@@ -373,9 +430,21 @@ class SufficiencyVerdict:
                 f"verdict must be one of {VERDICTS}, got {self.verdict!r} — an "
                 f"unrecognised verdict is refused, not defaulted"
             )
+        if not self.reasons:
+            raise ValueError(
+                f"a {self.verdict!r} verdict must carry its reason(s) — the route "
+                f"reports one as WHY it fired, so a reasonless verdict would make "
+                f"the route assert a cause nothing measured"
+            )
+        allowed = _VERDICT_REASONS[self.verdict]
         for reason in self.reasons:
             if reason not in REASONS:
                 raise ValueError(f"unknown reason {reason!r}; expected one of {REASONS}")
+            if reason not in allowed:
+                raise ValueError(
+                    f"reason {reason!r} does not belong to a {self.verdict!r} "
+                    f"verdict; allowed: {allowed}"
+                )
         for name, value in self.measures:
             if name not in MEASURES:
                 raise ValueError(f"unknown measure {name!r}; expected one of {MEASURES}")
@@ -407,7 +476,7 @@ def _threshold(name: str, value: object) -> float:
 
 
 def _mentions(needle: str, row: _Evidence) -> bool:
-    """Does ``row`` mention ``needle`` as a WORD, not as an infix?
+    """Does ``row`` MENTION ``needle`` as a word, in its text or its entities?
 
     A bare substring test is unbounded, and the whole verdict rests on this one
     relevance check: ``"ai" in "he said the main thing"`` is ``True``, so a
@@ -417,17 +486,25 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     exact, so the weaker signal was the looser one. Word boundaries make this
     the same KIND of test as the id check.
 
-    Whitespace is collapsed before matching (a phrase's internal spacing is not
-    part of its identity, same as ``_normalise_claim``); empty/blank anchors are
-    refused by ``assess_sufficiency`` long before they reach here.
+    BOTH SIDES are whitespace-normalised before matching: a phrase's internal
+    spacing is not part of its identity (same rule as ``_normalise_claim``), and
+    a wrapped ``content``/``summary`` must not make a multi-word entity
+    unmatchable. The row's ``entities`` are read too — a hit that names the
+    entity in its ``subject``/``topics`` IS the evidence for that entity.
+
+    Empty/blank anchors are refused by ``assess_sufficiency`` long before they
+    reach here; the guard remains as defence, since ``"" in …`` is universal.
     """
     folded = " ".join(needle.split()).casefold()
     if not folded:
         return False
     if folded == row.id.casefold():
         return True
-    return re.search(
-        rf"(?<!\w){re.escape(folded)}(?!\w)", row.text.casefold()) is not None
+    pattern = rf"(?<!\w){re.escape(folded)}(?!\w)"
+    return any(
+        re.search(pattern, " ".join(candidate.split()).casefold()) is not None
+        for candidate in (row.text, row.entities) if candidate
+    )
 
 
 def assess_sufficiency(
@@ -572,7 +649,13 @@ class SufficiencyRoute:
             raise ValueError(f"verdict must be one of {VERDICTS}, got {self.verdict!r}")
         if self.reason not in REASONS:
             raise ValueError(f"unknown reason {self.reason!r}; expected one of {REASONS}")
-        if isinstance(self.budget_remaining, bool) or self.budget_remaining < 0:
+        if not isinstance(self.escalated, bool):
+            raise ValueError(f"escalated must be a bool, got {self.escalated!r}")
+        if isinstance(self.budget_remaining, bool) or not isinstance(
+                self.budget_remaining, int):
+            raise ValueError(
+                f"budget_remaining must be a non-negative int, got {self.budget_remaining!r}")
+        if self.budget_remaining < 0:
             raise ValueError(
                 f"budget_remaining must be a non-negative int, got {self.budget_remaining!r}")
 
@@ -614,7 +697,10 @@ def route_sufficiency(
     if verdict.verdict == INSUFFICIENT and not escalated and budget > 0:
         return SufficiencyRoute(
             route=ROUTE_ESCALATE_TIER,
-            reason=verdict.reasons[0] if verdict.reasons else REASON_EVIDENCE_EMPTY,
+            # The verdict GUARANTEES at least one reason and that it names an
+            # insufficiency (``_VERDICT_REASONS``), so this is the cause the
+            # verdict actually stated — never a fabricated fallback.
+            reason=verdict.reasons[0],
             verdict=verdict.verdict,
             escalated=True,
             budget_remaining=budget - 1,
@@ -635,7 +721,7 @@ def route_sufficiency(
         )
     return SufficiencyRoute(
         route=ROUTE_SERVE,
-        reason=verdict.reasons[0] if verdict.reasons else REASON_NOT_ESTABLISHED,
+        reason=verdict.reasons[0],
         verdict=verdict.verdict,
         escalated=escalated,
         budget_remaining=budget,
@@ -729,6 +815,12 @@ class SummaryUnit:
                 f"a summary unit needs a SourceSpan, got {self.span!r} — a unit "
                 f"without an address is an unattributable belief (§12.5)"
             )
+        if not isinstance(self.claim, str) or not self.claim.strip():
+            # ``plan_writeback`` REFUSES `no-claim`; the type must not accept what
+            # the planner refuses, and a non-str claim would otherwise reach
+            # ``_normalise_claim`` and raise AttributeError instead of a refusal.
+            raise ValueError(
+                f"a summary unit needs a non-empty claim, got {self.claim!r}")
         if self.derived is not True:
             raise ValueError(
                 "a summary unit is always derived: it is a finding ABOUT the raw "
