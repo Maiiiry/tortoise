@@ -514,12 +514,14 @@ def _embedded_read_timeout_via_projection() -> tuple[float, int]:
     fake = mock.MagicMock()
     fake.return_value.select_graph.return_value = mock.MagicMock()
     # The ctor REDIRECTS an explicit `path=` to the docker lane when
-    # TORTOISE_DB_URI is set inside a calling test frame (#5084's lane
-    # redirect). Under the docker lane this helper would then measure the
-    # HOST branch and report its bound as if it were the embedded one — a
-    # green assertion about the wrong branch. Clear the redirect for the
-    # duration of the construction (`patch.dict` restores it, so nothing
-    # leaks into another test) so this measures the branch it names.
+    # TORTOISE_DB_URI is set in a test session — Epic #1647 (D-1=A), whose gate
+    # is a calling test frame OR the process-wide test-session flag. Under the
+    # docker lane this helper would then measure the HOST branch and report its
+    # bound as if it were the embedded one — a green assertion about the wrong
+    # branch. Clear the URI for the duration of the construction (`patch.dict`
+    # restores it, so nothing leaks into another test) so this measures the
+    # branch it names; that is the lever the gate's first condition reads, which
+    # is why an exemption keyed on the frame would not be enough.
     with mock.patch.dict(os.environ):
         os.environ.pop("TORTOISE_DB_URI", None)
         with mock.patch("tortoise.FalkorDB", fake):
