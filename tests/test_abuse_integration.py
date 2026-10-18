@@ -721,11 +721,9 @@ class TestOperatorAbuseState:
         monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
 
         class _Broken:
-            def org_flagged_at(self, org_id):
-                return None
-
-            def org_suspended(self, org_id):
-                return False
+            def org_state(self, org_id):
+                return {"found": True, "flagged_at": None,
+                        "suspended": False}
 
             def active_flag_episodes(self, org_id):
                 raise RuntimeError("abuse_events unreachable")
@@ -736,6 +734,71 @@ class TestOperatorAbuseState:
                           headers=_internal_headers()).json()
         assert body["flags"] is None
         assert "abuse_events unreachable" in body["flags_error"]
+
+    def test_unreadable_org_state_is_null_never_active(self, env, monkeypatch):
+        """The org-state half has its own sentinel: when that read fails the
+        status is null, NOT a derived "active" from a half-read org — the
+        operator must see "could not read", never "clean"."""
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+
+        class _HalfBroken:
+            def org_state(self, org_id):
+                raise RuntimeError("organizations unreachable")
+
+            def active_flag_episodes(self, org_id):
+                return []
+
+        monkeypatch.setattr(sc, "get_abuse_store", lambda: _HalfBroken())
+        with verdict_client(env["app"]) as tc:
+            body = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                          headers=_internal_headers()).json()
+        assert body["status"] is None
+        assert body["suspended"] is None
+        assert "organizations unreachable" in body["org_state_error"]
+
+    def test_unknown_org_is_not_a_clean_org(self, env, monkeypatch):
+        """``org_id`` is typed by hand on this route, so a typo is a real
+        case. It must not come back as ``status: "active"`` + ``flags: []`` +
+        no error — that is a confident clean bill of health for an org that
+        does not exist."""
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+        with verdict_client(env["app"]) as tc:
+            body = tc.get("/v1/internal/abuse/state?org_id=no-such-org",
+                          headers=_internal_headers()).json()
+        assert body["org_found"] is False
+        assert body["status"] == "unknown_org"
+        assert body["flags"] == []
+
+    def test_registry_mode_status_comes_from_the_durable_prop(self, env,
+                                                              monkeypatch):
+        """#4874 review P2, at the route: in registry/selfhost mode the
+        store's dicts are per-process, so after a restart a flagged org would
+        read ``active`` while ``/v1/team`` renders ``flagged`` from the durable
+        prop. The route must answer from the prop (the same source) — and
+        report it as found."""
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+        nodes = {TEAM: {"flagged_at": "2026-09-23T08:30:35+00:00",
+                        "suspended_at": "2026-09-23T09:00:00+00:00"}}
+
+        def _read(org_id):
+            node = nodes.get(org_id)
+            if node is None:
+                return {"found": False, "flagged_at": None,
+                        "suspended_at": None}
+            return {"found": True, **node}
+
+        # A fresh store = a restarted selfhost process: no rows, no dicts.
+        monkeypatch.setattr(sc, "get_abuse_store",
+                            lambda: abuse.MemoryAbuseStore(registry_read=_read))
+        with verdict_client(env["app"]) as tc:
+            body = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                          headers=_internal_headers()).json()
+        assert body["org_found"] is True
+        assert body["status"] == "flagged"
+        assert body["flagged_at"] == "2026-09-23T08:30:35+00:00"
+        assert body["suspended"] is True
+        # The episode rows ARE volatile: empty, not invented.
+        assert body["flags"] == []
 
     def test_no_store_at_all_is_null_everywhere_not_active(self, env,
                                                           monkeypatch):

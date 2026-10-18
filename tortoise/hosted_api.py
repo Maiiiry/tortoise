@@ -9627,10 +9627,11 @@ async def internal_abuse_state(request: Request, org_id: str):
 
     ``GET /v1/team`` renders the status from a bare ``flagged_at`` timestamp
     and nothing else. The rule that fired, the count that breached it, the
-    threshold and the staging window ARE recorded — ``AbuseEngine.flag_org``
-    writes them into the ``abuse_events`` row — and before this route the only
-    way to read them back was to query that table by hand. That cost a real
-    investigation an hour on a flagged org nobody could explain.
+    threshold and the staging window ARE recorded — ``AbuseEngine._flag`` →
+    ``AbuseStore.flag_org`` writes them into ``abuse_events.details`` — and
+    before this route the only way to read them back was to query that table
+    by hand. That cost a real investigation an hour on a flagged org nobody
+    could explain.
 
     OPERATOR-ONLY by construction (``_check_internal`` / `FASTAPI_INTERNAL_KEY`;
     an org-scoped ``tt_`` key cannot satisfy it), and that is a DECISION, not an
@@ -9639,6 +9640,16 @@ async def internal_abuse_state(request: Request, org_id: str):
     carries a customer-facing message with no rule token for exactly this
     reason (see ``abuse._alert_dict``). A human operator needs the rule; the
     customer is told what happened. So this does NOT extend ``/v1/team``.
+
+    ``status`` / ``flagged_at`` / ``suspended`` come from the SAME source
+    ``/v1/team`` reads (the ``organizations`` row in Supabase mode, the
+    ``Team`` node props in registry/selfhost mode — ``abuse.org_state``), not
+    from the same expression over a different store: the store's in-process
+    dicts are empty after a restart, and an operator read built on those would
+    answer "active" for an org whose chip says "flagged". ``status`` is
+    therefore one of ``flagged`` / ``active`` — the same ``flagged_at is not
+    None`` derivation — or ``unknown_org`` when the org does not exist, so a
+    mistyped ``org_id`` cannot read as a clean bill of health.
 
     Read-only. A failed read is NEVER rendered as "nothing is flagged": on a
     store error ``flags`` is null with ``flags_error`` set, so the two states an
@@ -9656,7 +9667,7 @@ async def internal_abuse_state(request: Request, org_id: str):
     def _read() -> dict:
         """ONE offloaded hop; each read fails to its OWN sentinel."""
         out: dict = {"org_id": org_id, "status": None, "flagged_at": None,
-                     "suspended": None, "flags": None,
+                     "suspended": None, "org_found": None, "flags": None,
                      "org_state_error": None, "flags_error": None}
         try:
             store = get_abuse_store()
@@ -9668,14 +9679,22 @@ async def internal_abuse_state(request: Request, org_id: str):
             out["flags_error"] = out["org_state_error"]
             return out
         try:
-            flagged_at = store.org_flagged_at(org_id)
-            out["suspended"] = bool(store.org_suspended(org_id))
+            state = store.org_state(org_id)
+            org_found = state.get("found")
+            flagged_at = state.get("flagged_at")
+            out["org_found"] = org_found
+            out["suspended"] = bool(state.get("suspended"))
             out["flagged_at"] = (flagged_at.isoformat()
                                  if flagged_at is not None else None)
             # Mirrors GET /v1/team's derivation EXACTLY (`flagged_at is not
-            # None`) so the two cannot disagree about the chip they describe.
-            out["status"] = ("flagged" if flagged_at is not None
-                             else "active")
+            # None`) over the SAME source, so the two cannot disagree about
+            # the chip they describe. A third value for a nonexistent org: a
+            # typo must not render as a confidently clean "active".
+            if org_found is False:
+                out["status"] = "unknown_org"
+            else:
+                out["status"] = ("flagged" if flagged_at is not None
+                                 else "active")
         except Exception as exc:
             out["org_state_error"] = f"{type(exc).__name__}: {exc}"
         try:

@@ -113,11 +113,21 @@ ALERT_TYPES = (EVENT_FLAG, EVENT_REVIEW, EVENT_SUSPEND, EVENT_AUTH_IP,
                EVENT_RECOVERY_VELOCITY)
 
 #: The rules that can produce a stage-1 FLAG episode (#308 R1/R2). Declared
-#: ONCE because it is read by the code that ENDS an episode (``flag_clear`` /
+#: once because it is read by the code that ENDS an episode (``flag_clear`` /
 #: ``unsuspend_org`` walk it) and by the code that REPORTS one (#4874's
 #: ``active_flag_episodes``): a rule added to ``_evaluate`` without being added
 #: here would flag the org while nothing ever ended its episode, leaving the
 #: org-level chip outliving its reason.
+#:
+#: ⚠️ There is a SECOND copy of this set that Python cannot reach: the durable
+#: un-suspend is the plpgsql function ``abuse_unsuspend``, whose body writes the
+#: ``flag_clear`` rows itself (``supabase/migrations/
+#: 20260915000001_tenancy_team_to_org.sql``). So a rule added HERE must also be
+#: added THERE, or ``SupabaseAbuseStore.unsuspend_org`` leaves that rule's
+#: episode open forever while the memory store ends it — the exact divergence
+#: this tuple exists to prevent. The coupling is guarded by
+#: ``tests/test_abuse.py::test_durable_unsuspend_clears_every_flagging_rule``,
+#: which reads the migration and fails when the two lists drift.
 FLAGGING_RULES = (EVENT_POINT_CREATE, EVENT_KEY_CREATE)
 
 #: How many rows the durable store reads PER flagging rule when folding the
@@ -520,14 +530,24 @@ class MemoryAbuseStore:
     selfhost: ``registry_write(org_id, suspended_at, flagged_at)`` writes
     the Org node props (scoping delta 4). Deploy-reset semantics apply to
     the in-memory rows themselves (documented degradation).
+
+    Optional ``registry_read`` callback is its READ half (#4874 review P2):
+    ``registry_read(org_id) -> {"found", "flagged_at", "suspended_at"}``
+    returns the SAME registry props ``GET /v1/team`` renders, so
+    ``org_state`` / ``org_flagged_at`` / ``org_suspended`` answer with the
+    same values the customer chip does even after a restart. Without it (a
+    bare in-process store) those reads fall back to the in-process dicts and
+    ``org_state`` reports ``found: None`` — it genuinely cannot tell whether
+    an org exists.
     """
 
-    def __init__(self, registry_write=None):
+    def __init__(self, registry_write=None, registry_read=None):
         self.rows: list[dict] = []
         self.flags: dict[str, datetime] = {}
         self.suspended: dict[str, datetime] = {}
         self.org_emails: dict[str, str | None] = {}
         self._registry_write = registry_write
+        self._registry_read = registry_read
         self._lock = threading.Lock()
 
     def _append(self, org_id: str, event_type: str, *, weight: int = 1,
@@ -604,8 +624,31 @@ class MemoryAbuseStore:
                        and after < r["created_at"] <= before
                        for r in self.rows)
 
+    def org_state(self, org_id: str) -> dict:
+        """The org's enforcement state from the DURABLE source (#4874).
+
+        Returns ``{"found": bool | None, "flagged_at": datetime | None,
+        "suspended": bool}``. With a ``registry_read`` wired this is the
+        registry Team node's ``flagged_at`` / ``suspended_at`` — byte for byte
+        the props ``GET /v1/team`` renders (and the 403 suspension refusal
+        keys on), so the operator answer cannot contradict the customer chip
+        even after a restart. Without one, the in-process dicts are the only
+        thing this store has, and ``found`` is ``None``: it cannot say whether
+        the org exists.
+        """
+        if self._registry_read is not None:
+            state = self._registry_read(org_id) or {}
+            return {
+                "found": state.get("found"),
+                "flagged_at": _parse_ts(state.get("flagged_at")),
+                "suspended": _parse_ts(state.get("suspended_at")) is not None,
+            }
+        return {"found": None,
+                "flagged_at": self.flags.get(org_id),
+                "suspended": org_id in self.suspended}
+
     def org_flagged_at(self, org_id: str) -> datetime | None:
-        return self.flags.get(org_id)
+        return self.org_state(org_id)["flagged_at"]
 
     def active_flag_episodes(self, org_id: str) -> list[dict]:
         """The org's ACTIVE per-rule flag episodes (#4874).
@@ -616,10 +659,12 @@ class MemoryAbuseStore:
         a timestamp and nothing else.
 
         Registry/selfhost degradation, stated because it is invisible from the
-        return value: ``rows`` is in-process, so after a restart this reports
-        no episodes while the durable ``flagged_at`` prop (written through
-        ``_registry_write``) still says flagged. The two reads therefore cannot
-        be assumed consistent here — the durable store is authoritative.
+        return value: these EVENT ROWS are in-process, so after a restart this
+        reports no episodes — while ``org_state`` (which reads the durable
+        registry props) still says flagged. ``flags`` and ``status`` therefore
+        degrade differently, and the difference is exactly ``flags_error``:
+        an empty ``flags`` next to ``status: "flagged"`` means "the reason is
+        not readable from here", never "there is no reason".
         """
         with self._lock:
             rows = [dict(r) for r in self.rows if r["org_id"] == org_id]
@@ -658,7 +703,7 @@ class MemoryAbuseStore:
         self._durable(org_id, "flagged_at", None)
 
     def org_suspended(self, org_id: str) -> bool:
-        return org_id in self.suspended
+        return self.org_state(org_id)["suspended"]
 
     def org_email(self, org_id: str) -> str | None:
         return self.org_emails.get(org_id)
@@ -779,8 +824,27 @@ class SupabaseAbuseStore:
                               filters=[("id", "eq", org_id)])
         return rows[0].get(field) if rows else None
 
+    def org_state(self, org_id: str) -> dict:
+        """The org's enforcement state in ONE read (#4874).
+
+        ``{"found", "flagged_at", "suspended"}`` from the ``organizations``
+        row — the same columns ``GET /v1/team`` renders, so the operator read
+        and the customer chip share a source. ``found: False`` means no such
+        org, which a mistyped ``org_id`` must be able to say out loud rather
+        than render as a clean one.
+        """
+        rows = self._cp.query(
+            "organizations", select=["id", "flagged_at", "suspended_at"],
+            filters=[("id", "eq", org_id)])
+        if not rows:
+            return {"found": False, "flagged_at": None, "suspended": False}
+        row = rows[0]
+        return {"found": True,
+                "flagged_at": _parse_ts(row.get("flagged_at")),
+                "suspended": row.get("suspended_at") is not None}
+
     def org_flagged_at(self, org_id: str) -> datetime | None:
-        return _parse_ts(self._org_field(org_id, "flagged_at"))
+        return self.org_state(org_id)["flagged_at"]
 
     def active_flag_episodes(self, org_id: str) -> list[dict]:
         """The org's ACTIVE per-rule flag episodes (#4874) from ``abuse_events``.
@@ -826,7 +890,7 @@ class SupabaseAbuseStore:
         self._cp.rpc("abuse_unsuspend", {"p_org_id": org_id})
 
     def org_suspended(self, org_id: str) -> bool:
-        return self._org_field(org_id, "suspended_at") is not None
+        return self.org_state(org_id)["suspended"]
 
     def org_email(self, org_id: str) -> str | None:
         # #1765 demotion re-point: prefer the owner's USER email (teams.email

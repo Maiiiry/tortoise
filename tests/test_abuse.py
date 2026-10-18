@@ -446,7 +446,9 @@ class TestActiveFlagEpisodes:
         """``flag_clear`` / ``unsuspend_org`` must end EVERY rule's episode:
         a rule that flags but was never cleared keeps the org-level chip on
         forever. Pinned against ``FLAGGING_RULES`` so adding a rule to the
-        tuple is the single place that decides this."""
+        tuple is the single place that decides this — for the MEMORY store.
+        The durable store's un-suspend is SQL and is guarded separately by
+        ``test_durable_unsuspend_clears_every_flagging_rule``."""
         from tortoise.abuse import FLAGGING_RULES
         store = MemoryAbuseStore()
         for rule in FLAGGING_RULES:
@@ -455,6 +457,99 @@ class TestActiveFlagEpisodes:
         store.unsuspend_org("t1", now=T0 + timedelta(minutes=1))
         assert store.active_flag_episodes("t1") == []
         assert store.org_flagged_at("t1") is None
+
+    def test_durable_unsuspend_clears_every_flagging_rule(self):
+        """The SECOND, unavoidable copy of the rule set: the durable
+        un-suspend is the plpgsql function ``abuse_unsuspend``, whose body
+        writes the ``flag_clear`` rows itself — Python cannot inject
+        ``FLAGGING_RULES`` into it.
+
+        So adding a rule to the tuple without adding it to that migration
+        would end the episode for ``MemoryAbuseStore`` (selfhost) and never
+        for ``SupabaseAbuseStore`` (production): the org-level chip outliving
+        its reason, which is the failure the tuple was introduced to prevent.
+        This test reads the migration and fails when the two lists drift.
+        """
+        from tortoise.abuse import FLAGGING_RULES
+        migration = (Path(__file__).resolve().parent.parent / "supabase"
+                     / "migrations"
+                     / "20260915000001_tenancy_team_to_org.sql")
+        assert migration.exists(), (
+            f"{migration} is gone — the durable un-suspend's rule list moved "
+            "and this guard no longer reads it")
+        sql = migration.read_text()
+        body_start = sql.find("FUNCTION public.abuse_unsuspend")
+        assert body_start != -1, ("abuse_unsuspend is not in the migration — "
+                                 "the durable un-suspend path moved")
+        body = sql[body_start:sql.find("$$;", body_start)]
+        cleared = set(re.findall(r"'flag_clear',\s*'([^']+)'", body))
+        assert cleared, ("no 'flag_clear' rows found in abuse_unsuspend — the "
+                         "guard's regex no longer matches the SQL")
+        assert cleared == set(FLAGGING_RULES), (
+            "abuse_unsuspend clears a different rule set than "
+            f"abuse.FLAGGING_RULES (SQL={sorted(cleared)}, "
+            f"Python={sorted(FLAGGING_RULES)}): a rule in one and not the "
+            "other either keeps an episode open forever after an un-suspend "
+            "or clears one that was never opened")
+
+    # ── Registry/selfhost: the durable source, not the in-process dict ──────
+
+    @staticmethod
+    def _registry():
+        """A minimal stand-in for the registry graph: the two props
+        ``GET /v1/team`` renders, plus existence."""
+        nodes: dict[str, dict] = {}
+
+        def write(org_id, field, value):
+            nodes.setdefault(org_id, {"flagged_at": None,
+                                      "suspended_at": None})[field] = value
+
+        def read(org_id):
+            node = nodes.get(org_id)
+            if node is None:
+                return {"found": False, "flagged_at": None,
+                        "suspended_at": None}
+            return {"found": True, **node}
+
+        return nodes, write, read
+
+    def test_restart_reads_the_durable_props_not_the_empty_dicts(self):
+        """#4874 review P2: ``/v1/team`` reads the registry PROPS, and after a
+        restart the in-process dicts are empty. A read built on the dicts
+        answers ``active`` / ``suspended: false`` for an org whose chip says
+        ``flagged`` / suspended — the exact contradiction the endpoint exists
+        to prevent, rendered with no error.
+
+        ``MemoryAbuseStore(registry_read=…)`` therefore answers from the same
+        source ``/v1/team`` reads, and ``found`` makes a typo distinguishable
+        from a clean org."""
+        _nodes, write, read = self._registry()
+        store = MemoryAbuseStore(registry_write=write, registry_read=read)
+        store.flag_org("t1", "point_create", {"count": 6, "threshold": 5},
+                       now=T0)
+        store.suspend_org("t1", now=T0)
+        assert store.org_flagged_at("t1") == T0
+        assert store.org_suspended("t1") is True
+
+        # A FRESH store is a process restart: same registry, no rows/dicts.
+        restarted = MemoryAbuseStore(registry_write=write, registry_read=read)
+        assert restarted.active_flag_episodes("t1") == []  # rows are volatile
+        assert restarted.org_state("t1")["flagged_at"] == T0  # props are not
+        assert restarted.org_state("t1")["suspended"] is True
+        assert restarted.org_flagged_at("t1") == T0
+        # A mistyped id is NOT a clean org.
+        assert restarted.org_state("typo") == {
+            "found": False, "flagged_at": None, "suspended": False}
+
+    def test_no_registry_read_answers_from_the_dicts_and_admits_it(self):
+        """Without a registry seam a bare in-process store still answers from
+        its dicts (unchanged behaviour) but reports ``found: None`` — it
+        genuinely cannot say whether an org exists, so nothing upstream reads
+        a guess as an existence fact."""
+        store = MemoryAbuseStore()
+        store.flag_org("t1", "point_create", {}, now=T0)
+        assert store.org_state("t1") == {
+            "found": None, "flagged_at": T0, "suspended": False}
 
 
 class TestSwitches:
