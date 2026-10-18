@@ -7583,11 +7583,21 @@ class _OffloadRefused:
 OFFLOAD_REFUSED = _OffloadRefused()
 
 #: Rate limit for the ``BILLING_NOTIFY_REFUSED`` ERROR floor (#4456 plan §4).
-#: The shared telemetry pool is reachable by any tenant, so ONE saturation
-#: refuses a notify per billing webhook for EVERY tenant — the repo already
-#: ruled against per-drop alert amplification (``operator_alert._log_shed``),
-#: so the ERROR line is shed-logged too. One line per window is enough to see
-#: the outage; the suppressed count is deliberately not carried.
+#: ONE saturation refuses a notify per billing webhook — and a refusal is a
+#: PERMANENT loss (the marker is already committed, so Stripe's retry sees
+#: ``is_first=False``), so this ERROR floor is the only record when the alert
+#: channel is absent. The repo ruled against per-drop alert amplification
+#: (``operator_alert._log_shed``), so it is shed-logged too: one line per
+#: window is enough to see the outage; the suppressed count is deliberately
+#: not carried.
+#:
+#: #5324 kept this floor even after the notify got its OWN pool: the pool
+#: removes the GENERIC-TELEMETRY driver (a Supabase/PostgREST stall can no
+#: longer refuse a notify), but it is not a proof that refusal is unreachable —
+#: the lane can still refuse ITSELF (both notify workers wedged on a 15 s
+#: Resend/Telegram timeout, 64 queued). The refusal is narrower and now
+#: self-inflicted, which is exactly when an ERROR line is cheap; removing the
+#: detection would trade a one-line log for an invisible loss.
 _BILLING_REFUSED_LOG_INTERVAL_S = 60.0
 #: ``None`` = never logged (NOT ``0.0`` — ``time.monotonic()``'s reference
 #: point is undefined, so a fresh-boot clock would suppress every line).
@@ -7649,9 +7659,12 @@ async def _cp_offload(fn, *, op: str, best_effort: bool = False,
     (default), ``"telemetry"`` for best-effort work, ``"oauth"`` for the
     attacker-reachable OAuth client-resolution lane, ``"graph"`` for the
     DATA-PLANE graph helpers (kept off auth capacity; see
-    ``_graph_offload``, which passes its own ``unavailable`` factory), or
+    ``_graph_offload``, which passes its own ``unavailable`` factory),
     ``"org"`` (#7678) for the org-create lane's sequential gate reads and
-    provision write.
+    provision write, or ``"billing"`` (#5324) for the Stripe billing notify —
+    the one UNRECOVERABLE payload (its ``WebhookEvent`` marker is committed
+    before the notify runs), which must never share capacity with generic
+    best-effort telemetry.
 
     ``unavailable`` (#3669) overrides the fail-closed error FACTORY. The
     auth/REST lane keeps the repo-standard 503 ``control_plane_unavailable``;
@@ -35303,10 +35316,19 @@ async def webhooks_stripe(request: Request):
             # so a black-holed socket would delay uvicorn's shutdown — and a
             # notify would park one of the six workers the /health probe and
             # the abuse hooks also use (#3060; #4468 tracks the same residual
-            # on the capture-cost lane). The telemetry pool is a
+            # on the capture-cost lane). The #3498 named pool this rides is a
             # process-lifetime DAEMON pool with a bounded backlog, so a wedged
             # notify is abandoned at the seam's wait bound instead of
             # delaying shutdown, and it can never occupy an auth slot.
+            #
+            # #3498/#4456/#5324: the pool is the notify's OWN. #4456 put it on
+            # the shared telemetry pool for the #2850/#3060 reasons above; #5324
+            # split it out because that pool also carries ``update_last_used``,
+            # ``analytics_event``, ``github_repos_count`` and
+            # ``data_source_demand_read`` — a generic telemetry stall could
+            # therefore REFUSE this one UNRECOVERABLE payload (see
+            # ``CONTROL_PLANE_BILLING_WORKER_NAME``). The dedicated pool means
+            # only the billing-notify lane can refuse a billing notify.
             #
             # #4456 P1: the wait bound must NOT cancel a QUEUED submission.
             # ``wait_for`` cancels the awaitable, ``asyncio.wrap_future``
@@ -35334,7 +35356,7 @@ async def webhooks_stripe(request: Request):
                     lambda: notify_billing_event(
                         notify_kind, {"org_id": org_id, "tier": tier},
                         {"subscription_status": etype}),
-                    op="billing_notify", best_effort=True,
+                    op="billing_notify", best_effort=True, pool="billing",
                     cancel_on_timeout=False)
                 if result is OFFLOAD_REFUSED:
                     with suppress(Exception):

@@ -8,17 +8,28 @@ the one event loop for up to ~30 s and stalled every concurrent request. Same
 class as #2988 / #3498 / #4015; #4015 covered only ``_track_analytics_event``.
 
 The fix routes the notify through the #3498 offload seam
-(``_cp_offload`` → the dedicated ``telemetry`` daemon pool) rather than the
-issue's proposed ``asyncio.to_thread``, for the #2850 reason: the default
+(``_cp_offload`` → the dedicated ``billing`` daemon pool, #5324) rather than
+the issue's proposed ``asyncio.to_thread``, for the #2850 reason: the default
 executor's workers are non-daemon and joined at shutdown, and they are the
 SHARED pool the /health probe and the abuse hooks use. ``best_effort=True``
 plus a call-site guard keep the never-raise contract at the hand-off, because
 a hand-off is a NEW failure mode the inline call did not have.
 
+#5324 moved the notify OFF the ``telemetry`` pool #4456 gave it and onto a
+pool of its OWN: telemetry also carries ``update_last_used``,
+``analytics_event``, ``github_repos_count`` and ``data_source_demand_read``,
+so a generic telemetry stall could REFUSE this one UNRECOVERABLE payload (the
+``WebhookEvent`` marker is committed before the notify, so a refused notify is
+lost permanently). The pool assertions below now name
+``CONTROL_PLANE_BILLING_WORKER_NAME`` — reverting the ``pool="billing"``
+argument sends the notify back to telemetry and reds them.
+
 These tests are behavioural where it matters:
 
 * the notify's ``threading.current_thread().name`` is NEVER ``MainThread``,
-  and it is the telemetry pool (delete the offload → the falsifier fails);
+  and it is the dedicated ``billing`` pool (delete the offload → the falsifier
+  fails; drop the ``pool="billing"`` argument → it is telemetry again and the
+  falsifier fails);
 * a notifier that BLOCKS does not freeze the loop — the loop keeps ticking AND
   a concurrent ``/health`` request is answered INSIDE the blocking window
   (the same invariant ``tests/test_read_routes_loop_responsiveness.py`` pins
@@ -147,7 +158,7 @@ def _wire_stripe_webhook(monkeypatch, order: list[str]):
 
 def test_stripe_billing_notify_runs_off_the_event_loop(monkeypatch):
     """#4456 falsifier: the notifier's own view of the loop must be a worker
-    thread, and that worker must be the telemetry pool.
+    thread, and that worker must be the dedicated billing pool (#5324).
 
     Without the off-load the notifier runs ON the loop (``MainThread``), which
     is the ~30 s stall this issue is about.
@@ -171,13 +182,14 @@ def test_stripe_billing_notify_runs_off_the_event_loop(monkeypatch):
         f"notification holds every concurrent request for up to ~30 s (#4456)"
     )
     assert all(
-        name.startswith(monitoring.CONTROL_PLANE_TELEMETRY_WORKER_NAME)
+        name.startswith(monitoring.CONTROL_PLANE_BILLING_WORKER_NAME)
         for name in seen
     ), (
-        f"the notify used {seen} — it must use the dedicated telemetry daemon "
-        f"pool ({monitoring.CONTROL_PLANE_TELEMETRY_WORKER_NAME}), never the "
-        "loop's shared default executor (the #2850 non-daemon shutdown join) "
-        "nor an auth slot (#4456)"
+        f"the notify used {seen} — it must use the dedicated billing daemon "
+        f"pool ({monitoring.CONTROL_PLANE_BILLING_WORKER_NAME}, #5324), never "
+        "the loop's shared default executor (the #2850 non-daemon shutdown "
+        "join), an auth slot (#4456), nor the shared telemetry pool whose "
+        "generic telemetry work could refuse this unrecoverable payload"
     )
 
 
@@ -384,11 +396,12 @@ def test_stripe_billing_notify_queued_submission_still_runs(monkeypatch):
     (``is_first=True``), Stripe's retry sees ``is_first=False`` and the
     notification is lost PERMANENTLY.
 
-    This test saturates all ``CONTROL_PLANE_TELEMETRY_WORKERS`` slots with a
-    FRESH pool (so it cannot be perturbed by another test's leftover work),
-    drives the real ``webhooks_stripe`` handler so the notify is submitted
-    while every worker is busy (QUEUED), lets the 0.1 s bound expire, and
-    then releases the blockers. The notification must ACTUALLY RUN.
+    This test saturates all ``CONTROL_PLANE_BILLING_WORKERS`` slots of the
+    notify's OWN pool (#5324) with a FRESH worker (so it cannot be perturbed by
+    another test's leftover work), drives the real ``webhooks_stripe`` handler
+    so the notify is submitted while every worker is busy (QUEUED), lets the
+    0.1 s bound expire, and then releases the blockers. The notification must
+    ACTUALLY RUN.
 
     On the shipped shape this fails: the queued callable is cancelled and
     never executes (``notify_ran`` is never set).
@@ -405,32 +418,37 @@ def test_stripe_billing_notify_queued_submission_still_runs(monkeypatch):
     monkeypatch.setattr(monitoring, "CONTROL_PLANE_OFFLOAD_TIMEOUT_S", 0.1)
 
     # A FRESH pool, so the saturation is deterministic regardless of what the
-    # process-wide telemetry singleton is doing for another test.
+    # process-wide billing singleton is doing for another test.
     fresh = monitoring._SingleSlotWorker(
         "test-4456-queued",
-        workers=monitoring.CONTROL_PLANE_TELEMETRY_WORKERS,
-        max_backlog=monitoring.CONTROL_PLANE_TELEMETRY_BACKLOG)
-    # Saturate ONLY the pool the notify is submitted to: _cp_offload(best_effort=
-    # True) routes to "telemetry". Production keeps auth and telemetry in
-    # SEPARATE workers ("so telemetry can never park the auth slots"), so a
-    # blanket fake handing EVERY pool the saturated worker asserts a shape the
-    # system never has: since #4350 also routes the webhook's own org_tier /
-    # webhook_event_marker reads through _cp_offload(pool="auth"), such a fake
-    # 503s the webhook before the notify under test is ever reached (#4456).
+        workers=monitoring.CONTROL_PLANE_BILLING_WORKERS,
+        max_backlog=monitoring.CONTROL_PLANE_BILLING_BACKLOG)
+    # Saturate ONLY the pool the notify is submitted to: since #5324
+    # ``_cp_offload(best_effort=True, pool="billing")`` routes to the NOTIFY's
+    # own pool. Production keeps every lane in SEPARATE workers ("so telemetry
+    # can never park the auth slots"), so a blanket fake handing EVERY pool the
+    # saturated worker asserts a shape the system never has: the webhook's own
+    # org_tier / webhook_event_marker reads ride ``pool="auth"`` (#4350) and
+    # the analytics emit rides ``pool="telemetry"`` (#4015), so such a fake
+    # would refuse/503 a leg before the notify under test is ever reached
+    # (#4456).
     #
-    # The auth pool gets its own FRESH, UNSATURATED worker rather than the
-    # process-global one: the 0.1 s bound set below is process-wide, so
-    # delegating to the shared pool would make this test's verdict depend on
-    # auth capacity it neither controls nor resets — and a parked auth worker
+    # Both sibling lanes get their own FRESH, UNSATURATED workers rather than
+    # the process-global ones: the 0.1 s bound set below is process-wide, so
+    # delegating to a shared pool would make this test's verdict depend on
+    # capacity it neither controls nor resets — and a parked auth worker
     # reproduces the very 500 this test pins.
     _auth_fresh = monitoring._SingleSlotWorker("test-4456-auth",
                                                workers=1, max_backlog=1)
+    _telemetry_fresh = monitoring._SingleSlotWorker("test-4456-telemetry",
+                                                    workers=1, max_backlog=1)
     monkeypatch.setattr(monitoring, "control_plane_worker",
-                        lambda pool="auth": fresh if pool == "telemetry"
+                        lambda pool="auth": fresh if pool == "billing"
+                        else _telemetry_fresh if pool == "telemetry"
                         else _auth_fresh)
 
     blocker_started = [threading.Event()
-                       for _ in range(monitoring.CONTROL_PLANE_TELEMETRY_WORKERS)]
+                       for _ in range(monitoring.CONTROL_PLANE_BILLING_WORKERS)]
     release = threading.Event()
 
     def _make_blocker(ev: threading.Event):
@@ -578,14 +596,18 @@ def test_stripe_billing_notify_refused_through_the_real_seam(monkeypatch,
 
     fresh = monitoring._SingleSlotWorker("test-4456-real-refusal",
                                          workers=1, max_backlog=1)
-    # Refuse the NOTIFY's own pool only; the webhook's auth-pool reads must
-    # still run, or the refusal under test is never reached (see the queued-
-    # submission test for the full reasoning). Own fresh worker, not the
-    # process-global pool — same reason.
+    # Refuse the NOTIFY's own pool only (#5324: ``pool="billing"``); the
+    # webhook's auth-pool reads and the post-notify telemetry analytics emit
+    # must still run, or the refusal under test is never reached (see the
+    # queued-submission test for the full reasoning). Own fresh workers, not
+    # the process-global pools — same reason.
     _auth_fresh = monitoring._SingleSlotWorker("test-4456-real-refusal-auth",
                                                workers=1, max_backlog=1)
+    _telemetry_fresh = monitoring._SingleSlotWorker(
+        "test-4456-real-refusal-telemetry", workers=1, max_backlog=1)
     monkeypatch.setattr(monitoring, "control_plane_worker",
-                        lambda pool="auth": fresh if pool == "telemetry"
+                        lambda pool="auth": fresh if pool == "billing"
+                        else _telemetry_fresh if pool == "telemetry"
                         else _auth_fresh)
 
     blocker_started = threading.Event()
@@ -640,10 +662,13 @@ def test_billing_notify_refused_error_floor_is_rate_limited(monkeypatch,
                                                             caplog):
     """#4456 plan §4: the ERROR floor is one line per window.
 
-    ONE telemetry-pool saturation refuses a notify per billing webhook for
-    EVERY tenant, so an unthrottled ERROR would make the alert mechanism
-    amplify the outage it reports — the same ruling as
-    ``operator_alert._log_shed``.
+    A refusal is a permanent notification loss, so an unthrottled ERROR would
+    make the alert mechanism amplify the outage it reports — the same ruling as
+    ``operator_alert._log_shed``. Since #5324 the saturation that refuses a
+    notify is the notify's OWN pool (both workers wedged on a 15 s
+    Resend/Telegram timeout with the bounded backlog full) rather than the
+    shared telemetry pool, which narrows the refusal but does not make it
+    unreachable — the floor stays, and stays rate-limited.
     """
     monkeypatch.setattr(ha, "_LAST_BILLING_REFUSED_LOG", None)
     with caplog.at_level(logging.ERROR, logger="tortoise.hosted_api"):
@@ -672,15 +697,18 @@ def test_billing_notify_refused_error_floor_is_rate_limited(monkeypatch,
 def test_webhook_notify_direct_call_is_inside_the_offload_boundary():
     """#4456 (shape): the ONLY direct ``notify_billing_event`` call in
     ``webhooks_stripe`` sits inside the ``_cp_offload`` callable, carrying
-    ``op="billing_notify"``, ``best_effort=True`` and
-    ``cancel_on_timeout=False``.
+    ``op="billing_notify"``, ``best_effort=True``, ``pool="billing"`` (#5324)
+    and ``cancel_on_timeout=False``.
 
     An inline call plus a dummy ``_cp_offload(lambda: None, ...)`` would leave
     the blocking HTTP on the loop, so the call is bound to the callable
     argument rather than merely co-existing with an offload. The
     ``cancel_on_timeout=False`` pin is the P1 shape guard: with the default
     ``True`` a bound miss on a QUEUED submission cancels it and the worker
-    skips the callable, dropping the notification (#4456).
+    skips the callable, dropping the notification (#4456). The ``pool`` pin
+    (#5324) is the isolation guard: dropping the argument silently returns the
+    unrecoverable notify to the shared telemetry pool, where generic telemetry
+    work can refuse it.
     """
     tree = ast.parse(HOSTED_API.read_text())
     handler = next(
@@ -741,4 +769,11 @@ def test_webhook_notify_direct_call_is_inside_the_offload_boundary():
         "the notify offload lost cancel_on_timeout=False — a bound miss on a "
         "QUEUED notify would then CANCEL it and the worker would SKIP the "
         "callable, silently dropping a claimed event's notification (#4456)"
+    )
+    assert (isinstance(kwargs.get("pool"), ast.Constant)
+            and kwargs["pool"].value == "billing"), (
+        "the notify offload lost pool=\"billing\" (#5324) — without it, "
+        "_cp_offload's best_effort routing sends this UNRECOVERABLE payload "
+        "back to the shared telemetry pool, where a generic telemetry stall "
+        "can refuse it"
     )

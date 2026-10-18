@@ -264,6 +264,12 @@ surfaces:
   # monkeypatches — tortoise/monitoring.py (the offload pool) and the
   # tortoise/notify.py notifier — which fall through to `core`.
   - test_notify_offloop_4456.py
+  # #5324: the billing notify's OWN control-plane pool (the one UNRECOVERABLE
+  # payload must not share capacity with generic best-effort telemetry). Same
+  # dual registration as the guard above and for the same reason: the files it
+  # guards are tortoise/hosted_api.py (which selects `api`) and
+  # tortoise/monitoring.py (the pool registry), which falls through to `core`.
+  - test_billing_notify_pool_5324.py
   - test_delivery_tenancy.py  # C6 #2115: delivery-shape tenancy + session_recording per-graph override
   - test_metering_period_window.py
   - test_metering_window_admission.py  # #3981: the seven swallow sites report the dropped increment (caller-level; the coverage is the proof)
@@ -2174,6 +2180,7 @@ surfaces:
   - test_no_tests_imports_in_production.py
   - test_notify.py
   - test_notify_offloop_4456.py  # #4456: billing notify off-loop + never-raise in webhooks_stripe (dual: api)
+  - test_billing_notify_pool_5324.py  # #5324: billing notify's own control-plane pool (dual: api)
   - test_object_registered_journal.py   # #2194 ObjectRegistered journaling (docker lane)
   # #3301: the four search legs must apply the canonical OBJECT vocabulary —
   # per-leg returned-set tests (docker lane).
@@ -4826,6 +4833,7 @@ durations:
   test_merge_throughput.py: 5.8
   test_mergify_config_guard.py: 4.0
   test_notify_offloop_4456.py: 1.1
+  test_billing_notify_pool_5324.py: 3.1
   test_pack_extraction_slots_v31.py: 0.2
   test_pr_lead_time.py: 0.2
   test_pytest_attribution.py: 0.3

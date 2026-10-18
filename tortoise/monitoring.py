@@ -1862,6 +1862,51 @@ CONTROL_PLANE_ORG_WORKER_NAME = "tortoise-org"
 CONTROL_PLANE_ORG_WORKERS = 4
 CONTROL_PLANE_ORG_BACKLOG = 128
 
+#: #5324: a SIXTH pool, for the STRIPE BILLING NOTIFY lane
+#: (``notify_billing_event`` — a blocking Resend email POST plus a blocking
+#: Telegram POST, both off the event loop via ``_cp_offload``).
+#:
+#: This is the ONE payload the code itself calls UNRECOVERABLE: the
+#: ``WebhookEvent`` idempotency marker is committed BEFORE the notify, so a
+#: REFUSED submission (bounded backlog full — the callable never runs) is a
+#: PERMANENT loss, because Stripe's retry then sees ``is_first=False``. #4456
+#: routed it through the shared ``telemetry`` pool, where ``update_last_used``,
+#: ``analytics_event``, ``github_repos_count`` and
+#: ``data_source_demand_read`` compete for the same slots — so a generic
+#: telemetry stall could REFUSE the one payload that cannot be re-sent. A pool
+#: of its OWN removes that cross-tenant driver: the billing notify can now only
+#: be refused by the billing-notify lane itself, i.e. by its own provider being
+#: wedged. It is the #3498 review P1 isolation argument applied to a DELIVERY
+#: guarantee rather than to latency (``telemetry`` #3498, ``oauth`` #3669,
+#: ``graph`` #3773, ``org`` #7678).
+#:
+#: WIDTH = 2. The call is TWO blocking HTTP legs with a 15 s timeout each
+#: (``notify._send_resend``; ``telegram_push.send_message``), so one notify can
+#: occupy a worker for ~30 s while the webhook's own await is abandoned at the
+#: seam's 10 s bound (``cancel_on_timeout=False`` keeps it running). Width 2
+#: means one wedged notify leaves a worker draining — width 1 could not, and an
+#: unrecoverable payload must not have a single point of self-refusal. It is
+#: NOT a regression on ordering: the 4-worker telemetry pool it came from gave
+#: no cross-event ordering either, and each notification is self-describing and
+#: independently delivered, so order is cosmetic here. Two is still HALF the
+#: telemetry pool it replaced, because this lane is O(billing-events), not
+#: O(requests).
+#:
+#: BACKLOG = 64, sized for a Stripe RETRY cluster rather than for telemetry
+#: noise: a control-plane or provider outage makes Stripe re-deliver, and its
+#: exponential backoff spreads retries over days but clusters the events of one
+#: outage. 64 absorbs that cluster while the lane's own provider is degraded,
+#: and is 4x below the 256 the notify inherited from generic telemetry. It
+#: stays BOUNDED, so a genuinely wedged lane still fails fast (and escalates
+#: through ``alert_billing_notify_refused``) instead of buffering without limit.
+#: Deliberately NOT ``_SingleSlotWorker.MAX_BACKLOG`` (32) either: 32 is the
+#: generic probe default, and a value that coincides with it would make the
+#: selector's ``max_backlog=`` pass-through unmeasurable
+#: (``tests/test_billing_notify_pool_5324.py``).
+CONTROL_PLANE_BILLING_WORKER_NAME = "tortoise-billing-notify"
+CONTROL_PLANE_BILLING_WORKERS = 2
+CONTROL_PLANE_BILLING_BACKLOG = 64
+
 
 def graph_offload_timeout_s() -> float:
     """#3773: the DATA-PLANE graph lane's wait bound, resolved at CALL time.
@@ -1983,7 +2028,10 @@ def control_plane_worker(pool: str = "auth") -> _SingleSlotWorker:
     DATA-PLANE pool for the write handlers' graph helpers, kept off auth
     capacity for the same isolation reason; ``pool="org"`` (#7678) keeps the
     org-create lane's SEQUENTIAL gate reads off auth capacity so a create-org
-    request is not the sum of its queue waits behind authentication work. The graph pool's callables SET
+    request is not the sum of its queue waits behind authentication work;
+    ``pool="billing"`` (#5324) is the Stripe billing notify's own pool, so the
+    one UNRECOVERABLE payload (its idempotency marker is already committed) can
+    never be refused by generic telemetry work. The graph pool's callables SET
     ContextVars (the #2600 actor bind), so it must be reached ONLY through the
     hosted ``_graph_offload`` wrapper, which runs them under a copy of the
     caller's context — a bare ``run_control_plane_call(..., pool="graph")``
@@ -2007,6 +2055,10 @@ def control_plane_worker(pool: str = "auth") -> _SingleSlotWorker:
         return daemon_worker(CONTROL_PLANE_OAUTH_WORKER_NAME,
                              workers=CONTROL_PLANE_OAUTH_WORKERS,
                              max_backlog=CONTROL_PLANE_OAUTH_BACKLOG)
+    if pool == "billing":
+        return daemon_worker(CONTROL_PLANE_BILLING_WORKER_NAME,
+                             workers=CONTROL_PLANE_BILLING_WORKERS,
+                             max_backlog=CONTROL_PLANE_BILLING_BACKLOG)
     if pool == "telemetry":
         return daemon_worker(CONTROL_PLANE_TELEMETRY_WORKER_NAME,
                              workers=CONTROL_PLANE_TELEMETRY_WORKERS,
@@ -2126,8 +2178,11 @@ async def run_control_plane_call(fn, *, op: str,
     resolutions, ``"telemetry"`` for best-effort work that must never consume
     auth capacity, ``"oauth"`` (#3669) for the attacker-reachable OAuth
     client-resolution lane, ``"graph"`` (#3773) for the DATA-PLANE graph
-    helpers — a separate pool for the same isolation reason — or ``"org"``
-    (#7678) for the org-create lane's sequential gate reads and provision write.
+    helpers — a separate pool for the same isolation reason — ``"org"``
+    (#7678) for the org-create lane's sequential gate reads and provision write,
+    or ``"billing"`` (#5324) for the Stripe billing notify, whose delivery is
+    UNRECOVERABLE (its idempotency marker is committed before it runs) and so
+    must never share capacity with generic best-effort telemetry.
 
     Fail-closed: a missed bound or a saturated backlog raises
     :class:`ControlPlaneOffloadError`. A builtin ``TimeoutError`` raised by
