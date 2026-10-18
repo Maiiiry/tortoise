@@ -92,6 +92,7 @@ __all__ = [
     "Dimension",
     "allocations",
     "attributed_bindings",
+    "binding_kinds",
     "by_name",
     "coverage",
     "dimensions",
@@ -133,10 +134,31 @@ WRITER = "writer"
 READER = "reader"
 METRIC = "metric"
 
+_BINDING_KINDS = (WRITER, READER, METRIC)
+
 
 def states() -> tuple[str, ...]:
     """The legal ``Dimension.state`` values, in coverage-matrix order."""
     return _STATES
+
+
+def binding_kinds() -> tuple[str, ...]:
+    """The legal ``Binding.kind`` values — the predicate THREE checks filter on.
+
+    ``writers()`` / ``readers()`` / ``metrics()`` are all ``b.kind == <const>``
+    filters, so a kind outside this vocabulary matches NONE of them and the
+    binding silently falls out of the substrate: ``check_bindings`` skipped it
+    (not ``METRIC``, and a real function is callable), ``check_dead_hooks`` fell
+    through ``dim.writers() or dim.readers()`` to the dimension's READER and never
+    evaluated the typo'd writer for a production call site — the #4493 "registered,
+    exported and tested while never incremented" defect the gate exists to catch —
+    and ``unbacked_dimensions()`` saw a non-empty ``bindings`` tuple, so the
+    summary's operator-facing figure stayed ``0``. ``Dimension.state`` and
+    ``Cardinality.lifetime`` both closed the same typo-falls-into-no-bucket hole;
+    this is the vocabulary for the field that decides WHICH dead-hook predicate
+    runs.
+    """
+    return _BINDING_KINDS
 
 
 @dataclass(frozen=True)
@@ -737,7 +759,11 @@ def unbacked_dimensions() -> tuple[str, ...]:
       that an unmeasured dimension is NAMED), or
     * it is measured/allocated but declares no binding at all and no
       ``unscheduled_reason`` (a row claiming coverage with no primitive behind
-      it — the #4493 defect one level up from the dead-hook check).
+      it — the #4493 defect one level up from the dead-hook check), or
+    * one of its bindings declares a ``kind`` outside ``binding_kinds()`` (the row
+      HAS a binding, but the kind is in no bucket, so it backs none of the
+      writer/reader/metric predicates and the row's coverage is unaccounted for —
+      the same typo-falls-into-no-bucket hole as an unknown ``state``).
     """
     unbacked: list[str] = []
     for dim in DIMENSIONS:
@@ -746,7 +772,8 @@ def unbacked_dimensions() -> tuple[str, ...]:
         elif dim.state == OUT_OF_SCOPE:
             if not dim.limits:
                 unbacked.append(dim.name)
-        elif not dim.bindings and not dim.unscheduled_reason:
+        elif any(b.kind not in _BINDING_KINDS for b in dim.bindings) or (
+                not dim.bindings and not dim.unscheduled_reason):
             unbacked.append(dim.name)
     return tuple(unbacked)
 

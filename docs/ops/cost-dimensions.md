@@ -75,7 +75,8 @@ declares the limit instead of inventing one.
    COLUMN`, `DROP COLUMN`, `RENAME TO`, `DROP TABLE`, `CREATE [OR REPLACE] FUNCTION
    public.<name>(`, `ALTER FUNCTION … RENAME TO` and `DROP FUNCTION` all move the end
    state — every command in a multi-command `ALTER TABLE`, not only the first, and
-   **every** table of a multi-target `DROP TABLE a, b` — which is
+   **every** table of a multi-target `DROP TABLE a, b` and **every** function of a
+   multi-target `DROP FUNCTION f(a), g(b)` — which is
    how this repo renames things (`20260915000001_tenancy_team_to_org.sql` appends the
    rename and leaves the earlier files' historical `team` spelling untouched). The
    `COLUMN` keyword is **optional** in all three column verbs (`DROP [COLUMN] c`,
@@ -90,7 +91,8 @@ declares the limit instead of inventing one.
    pass. The comment strip is **quote-aware**, so a `--` inside a string literal
    (`COMMENT ON … IS 'a -- b'`) is data and cannot swallow the DDL that follows it; and an
    input the replay cannot read (unterminated literal, body or block comment, an
-   `ALTER TABLE` command that is neither a column verb nor a known non-column one) is
+   unreadable `DROP TABLE` / `DROP FUNCTION` target, an `ALTER TABLE` command that is
+   neither a column verb nor a known non-column one) is
    reported as drift rather than silently skipped. **Declared delay:** a PR that edits only a migration outside the metering set does
    not select this test (the diff selector does not map `supabase/` to a surface), so such a
    drift is caught by the next `core`/`api` PR rather than by the migration PR itself.

@@ -526,6 +526,83 @@ def test_a_multi_target_drop_table_takes_EVERY_table_with_it(tmp_path):
     assert not any("embed_kept" in f for f in findings), findings
 
 
+def test_a_multi_target_drop_function_drops_EVERY_function_with_it(tmp_path):
+    """MUTATION: ``DROP FUNCTION f(a), g(b)`` drops BOTH — not only the first.
+
+    ``DROP FUNCTION`` takes the same comma-separated target list ``DROP TABLE``
+    does, and Postgres drops every target in one statement. The replay captured a
+    SINGLE identifier, so ``DROP FUNCTION IF EXISTS f(a), g(b)`` discarded only
+    ``f`` and ``g`` kept reading as defined for the rest of the replay — the same
+    stale-declaration fail-open the sibling ``DROP TABLE`` arm above pins, one
+    verb over, and unreported (no ``problems`` entry), so the declaration stayed
+    green on a function the end state no longer has. The surviving function must
+    still be found, so this is not a predicate that simply says no.
+    """
+    root = _migration_root(tmp_path, textwrap.dedent("""
+        CREATE OR REPLACE FUNCTION public.metering_increment_first(p_org text)
+        RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+        CREATE OR REPLACE FUNCTION public.metering_increment_second(p_org text)
+        RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+        CREATE OR REPLACE FUNCTION public.metering_increment_kept(p_org text)
+        RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+        DROP FUNCTION IF EXISTS public.metering_increment_first(text),
+                                public.metering_increment_second(text);
+    """))
+    sql = audit.migration_text(root)
+    assert audit._defines_function(sql, "metering_increment_first") is False
+    assert audit._defines_function(sql, "metering_increment_second") is False
+    assert audit._defines_function(sql, "metering_increment_kept") is True
+    with _declaring(_mutated(
+            "retrieval",
+            columns=(),
+            rpcs=("metering_increment_second", "metering_increment_kept"))):
+        findings = audit.check_ledger(root)
+    assert any("'metering_increment_second'" in f for f in findings), findings
+    assert not any("metering_increment_kept" in f for f in findings), findings
+
+
+def test_a_drop_function_target_the_replay_cannot_read_is_a_problem():
+    """The rule is uniform: an unreadable target is a PROBLEM, never a skip.
+
+    ``_drop_table_targets`` states it for tables ("A target this replay cannot read
+    is a PROBLEM, never a silent half-drop"); the function replay applies the same
+    rule, so a ``DROP FUNCTION`` shape the name-shaped replay cannot parse is
+    reported as drift instead of leaving every function it names green.
+    """
+    targets, problems = audit._drop_function_targets(
+        "public.metering_increment_first(text), "
+        "\"public\".\"weird name\"(text)")
+    assert targets == ["metering_increment_first"]
+    assert len(problems) == 1, problems
+    assert "DROP FUNCTION target" in problems[0]
+
+
+def test_a_multi_target_drop_function_is_applied_by_the_ledger_replay():
+    """The discriminating arm, on the live corpus path: end state, not history.
+
+    A drop-then-recreate pair is the repo's live idiom
+    (``20260813000002_metering_nodes_written.sql``), so the pair form below is the
+    next migration a real ``DROP FUNCTION f(old_sig), g(old_sig)`` would look like:
+    every listed name must be gone when nothing recreates it afterwards, and the
+    signature's commas must not confuse the target split.
+    """
+    schema = audit._effective_schema(textwrap.dedent("""
+        CREATE FUNCTION public.metering_increment_ask(
+          p_org text, p_model text
+        ) RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+        CREATE FUNCTION public.metering_increment_retrieval(
+          p_org text, p_model text
+        ) RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+        CREATE FUNCTION public.metering_increment_kept(p_org text)
+        RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+        DROP FUNCTION IF EXISTS public.metering_increment_ask(text, text),
+                                public.metering_increment_retrieval(text, text)
+                                CASCADE;
+    """))
+    assert sorted(schema.functions) == ["metering_increment_kept"], schema.functions
+    assert schema.problems == ()
+
+
 def test_a_dash_inside_a_string_literal_does_not_swallow_the_ddl_after_it():
     """MUTATION: the comment strip is QUOTE-AWARE, so literals cannot eat DDL.
 
@@ -714,6 +791,50 @@ def test_a_renamed_metric_family_is_drift():
     assert any("emits family" in f for f in findings), findings
     # The declared families are the live ones (the OTHER direction, unmutated):
     assert audit.check_bindings() == []
+
+
+def test_an_undeclared_binding_kind_is_drift():
+    """MUTATION: a typo'd ``Binding.kind`` falls into NONE of the three buckets.
+
+    ``writers()`` / ``readers()`` / ``metrics()`` are all ``b.kind == <const>``
+    filters, so a kind outside the vocabulary matched nothing and the binding
+    silently vanished from the substrate while every gate stayed green:
+    ``check_bindings`` skipped it (not ``METRIC``, and the real function IS
+    callable), ``check_dead_hooks`` fell through ``dim.writers() or
+    dim.readers()`` to the dimension's READER and never evaluated the typo'd
+    writer for a production call site — the #4493 "registered, exported and tested
+    while never incremented in production" defect this gate exists to catch — and
+    ``unbacked_dimensions()`` saw a non-empty ``bindings`` tuple, so the
+    operator-facing ``unmeasured-and-undeclared`` figure could not move.
+
+    ``Dimension.state`` and ``Cardinality.lifetime`` already have this check; this
+    is the field that decides WHICH dead-hook predicate runs.
+    """
+    assert cd.binding_kinds() == (cd.WRITER, cd.READER, cd.METRIC)
+    dim = cd.by_name("egress")
+    # A dimension that declares BOTH a writer and a reader: the typo'd writer is
+    # the one that disappears, and the reader is what the dead-hook check falls
+    # through to.
+    assert dim.writers() and dim.readers(), "mutation needs both arms present"
+    typo = dataclasses.replace(
+        next(b for b in dim.writers() if b.attr == "record_egress"), kind="wrter")
+    others = tuple(b for b in dim.bindings if b.attr != "record_egress")
+    rest = tuple(d for d in cd.DIMENSIONS if d.name != "egress")
+    mutated = dataclasses.replace(dim, bindings=(typo, *others))
+    # The hole, stated: the typo'd kind is in no bucket, so the writer is gone.
+    assert mutated.writers() == (), mutated.writers()
+    assert mutated.readers(), "the dead-hook check would fall through to a reader"
+    with _declaring(mutated, *rest):
+        findings = audit.check_bindings()
+        assert any("undeclared kind 'wrter'" in f for f in findings), findings
+        assert any("record_egress" in f for f in findings), findings
+        # The headline figure moves too, so the operator-facing 0 is not a lie.
+        assert cd.unbacked_dimensions() == ("egress",)
+        assert "unmeasured-and-undeclared: 1" in cd.render_matrix()
+        assert audit.audit(_ROOT)["bindings"], "audit() dropped the kind check"
+    # The declared kinds are the legal ones (the OTHER direction, unmutated).
+    assert audit.check_bindings() == []
+    assert cd.unbacked_dimensions() == ()
 
 
 # ── 3. no dead hook ──────────────────────────────────────────────────────
