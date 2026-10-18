@@ -1854,10 +1854,11 @@ if __name__ == "__main__":
 def live_proj():
     """Live FalkorProjection on a test-prefixed graph (safe via test_guard).
 
-    #8746: the graph is DELETED at teardown, not merely emptied. The old
-    teardown (``MATCH (n) DETACH DELETE n`` + ``close()``) removed the
-    CONTENTS and left the graph object on the server, so every run of this
-    fixture added one graph to the instance's ``CACHE_SIZE`` count — the
+    #8746: the graph is DELETED at teardown, not merely emptied. The PRE-FIX
+    fixture emptied it in SETUP (``MATCH (n) DETACH DELETE n`` before the
+    ``yield``) and its teardown was ``proj.close()`` ALONE — so the graph object
+    was never deleted at all: every run of this fixture added one graph to the
+    instance's ``CACHE_SIZE`` count — the
     documented trigger for ``graph was deleted or replaced while the query was
     running`` (#7357). The session sweep reaped the journaled name at session
     END, so the suite stayed green while the graph count climbed mid-session.

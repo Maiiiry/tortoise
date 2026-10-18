@@ -287,11 +287,13 @@ def drop_test_graph(proj, *, name: str | None = None) -> bool:
     Why this exists
     ---------------
     Per-run graphs minted as ``f"test_x_{os.urandom(4).hex()}"`` used to be
-    torn down with ``MATCH (n) DETACH DELETE n`` + ``close()`` — the CONTENTS
-    were removed and the GRAPH OBJECT survived, still counted by the server's
-    ``CACHE_SIZE``, which is the documented trigger for ``graph was deleted or
-    replaced while the query was running`` (#7357). #8746 measured 481-586 such
-    leftovers on one shared instance (44% of every graph on it).
+    emptied in FIXTURE SETUP (``MATCH (n) DETACH DELETE n`` before the
+    ``yield``) and closed at teardown — ``close()`` was the WHOLE teardown, so
+    the CONTENTS went and the GRAPH OBJECT was never deleted at all, still
+    counted by the server's ``CACHE_SIZE``, which is the documented trigger for
+    ``graph was deleted or replaced while the query was running`` (#7357).
+    #8746 measured 481-586 such leftovers on one shared instance (44% of every
+    graph on it).
 
     The session sweep (``tests/conftest.py::_server_graph_hygiene`` /
     ``tests/_embedded.py::_sweep_drop``) reaps the JOURNALED graphs, and

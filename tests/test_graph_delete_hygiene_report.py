@@ -29,15 +29,42 @@ HERMETIC — no DB, no lane, no fixture.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 from pathlib import Path
 
 from tests import _live_utils
+from tests import _tmpdir_hygiene as _hygiene
 from tests._tmpdir_hygiene import write_tolerated_cleanup_report
 
 REPO = Path(__file__).resolve().parent.parent
 _SECTION = "drop_test_graph_events"
 _ARTIFACT = "tempdir-hygiene-end.json"
+
+
+@contextlib.contextmanager
+def _isolated_tolerated_leaks(seed=None):
+    """Snapshot → clear (→ seed) → restore the SESSION-GLOBAL #7735 record.
+
+    `tests/_tmpdir_hygiene._TOLERATED_CLEANUP_LEAKS` is a session global that
+    nothing resets per test, and `tests/conftest.py` patches
+    `TemporaryDirectory.cleanup` at IMPORT — so an ENOTEMPTY tolerated by ANY
+    earlier test in the same session is still in the list when this file runs,
+    and `write_tolerated_cleanup_report` then returns a path purely because of
+    it. Two tests below assert on a CLEAN record, so without this guard they
+    false-red for a reason with no relation to #8746 (the order-independence
+    `tests/test_tmpdir_hygiene.py::test_write_tolerated_cleanup_report_is_silent_when_nothing_leaked`
+    already pins for the same writer).
+
+    `seed` lets a test SEED a known tolerated leak — so the merge test asserts
+    the tempdir key's real CONTENT, not that an empty list stayed empty.
+    """
+    saved = list(_hygiene._TOLERATED_CLEANUP_LEAKS)
+    _hygiene._TOLERATED_CLEANUP_LEAKS[:] = list(seed or [])
+    try:
+        yield
+    finally:
+        _hygiene._TOLERATED_CLEANUP_LEAKS[:] = saved
 
 
 class _FakeProj:
@@ -75,15 +102,40 @@ def test_a_tolerated_refusal_reaches_the_shared_artifact(tmp_path):
 def test_a_clean_session_writes_no_graph_delete_section(tmp_path):
     """No tolerated event → no section, so a run cannot report a fabricated leak.
 
-    The artifact may still be written for an unrelated tolerated tempdir leak;
-    what must NOT happen is an invented graph-delete entry.
+    Asserted in BOTH shapes the writer has, so the property named is the one
+    exercised and not something stronger that only holds on a pristine process:
+
+    (a) nothing tolerated at all → no artifact, hence no section;
+    (b) an UNRELATED tolerated tempdir leak (#7735's session global) → the
+        artifact IS written for it, and the graph-delete section is still
+        absent. That is the docstring's invariant, and it is the arm the old
+        `is None` assertion could not express: `extra={_SECTION: []}` is
+        filtered to `{}`, so `is None` was really a claim about the OTHER
+        session global being empty (#8746 review r3 P2).
     """
     snapshot = _live_utils.graph_delete_events()
     try:
         _live_utils._restore_graph_delete_events([])
-        assert write_tolerated_cleanup_report(
-            log_dir=str(tmp_path), extra={_SECTION: []}) is None
-        assert not (tmp_path / _ARTIFACT).exists()
+        with _isolated_tolerated_leaks():
+            assert write_tolerated_cleanup_report(
+                log_dir=str(tmp_path), extra={_SECTION: []}) is None
+            assert not (tmp_path / _ARTIFACT).exists()
+
+        leaky = tmp_path / "unrelated-leak"
+        leaky.mkdir()
+        unrelated = "/tmp/tortoise_8746_unrelated_leak"
+        with _isolated_tolerated_leaks([{"path": unrelated, "errno": 39,
+                                         "reason": "Directory not empty"}]):
+            path = write_tolerated_cleanup_report(
+                log_dir=str(leaky), extra={_SECTION: []})
+        assert path is not None, (
+            "an unrelated tolerated leak must still produce the artifact")
+        written = json.loads(Path(path).read_text())
+        assert _SECTION not in written, (
+            f"a clean graph-delete record invented a {_SECTION!r} section: "
+            f"{written.get(_SECTION)!r}")
+        assert [e["path"] for e in written["tolerated_cleanup_leaks"]] == [
+            unrelated], written["tolerated_cleanup_leaks"]
     finally:
         _live_utils._restore_graph_delete_events(snapshot)
 
@@ -100,17 +152,27 @@ def test_the_section_merges_and_cannot_truncate_a_prior_record(tmp_path):
         {"name": "test_peer_owned", "event": "failed", "reason": "peer"},
     ]}))
     snapshot = _live_utils.graph_delete_events()
+    # SEED a known tolerated leak rather than relying on the session global
+    # being empty: the assertion below is about the tempdir key KEEPING its
+    # content while the new section merges in, which an empty list cannot show
+    # (#8746 review r3 P2).
+    tolerated = "/tmp/tortoise_8746_tolerated_probe"
     try:
         _live_utils._restore_graph_delete_events([])
-        _live_utils._record_delete_event("test_this_session", "refused", "probe")
-        write_tolerated_cleanup_report(
-            log_dir=str(tmp_path),
-            extra={_SECTION: _live_utils.graph_delete_events()})
+        with _isolated_tolerated_leaks([{"path": tolerated, "errno": 39,
+                                         "reason": "Directory not empty"}]):
+            _live_utils._record_delete_event(
+                "test_this_session", "refused", "probe")
+            write_tolerated_cleanup_report(
+                log_dir=str(tmp_path),
+                extra={_SECTION: _live_utils.graph_delete_events()})
         written = json.loads(prior.read_text())
         names = {e["name"] for e in written[_SECTION]}
         assert names == {"test_peer_owned", "test_this_session"}, names
-        # The tempdir key is still present and untouched by the new section.
-        assert written["tolerated_cleanup_leaks"] == [], written
+        # The tempdir key kept its own record and was not truncated by the
+        # new section (the #1103 shape this test exists for).
+        assert [e["path"] for e in written["tolerated_cleanup_leaks"]] == [
+            tolerated], written["tolerated_cleanup_leaks"]
     finally:
         _live_utils._restore_graph_delete_events(snapshot)
 
