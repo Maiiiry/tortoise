@@ -35,7 +35,11 @@ from tortoise.hosted_api import app, get_current_org, get_current_user
 
 from tests._http_fixtures import patched_tortoise_sdk
 from tests._verdict import require_answered, verdict_client
-from tests.fake_control_plane import ErrorControlPlane, FakeControlPlane
+from tests.fake_control_plane import (
+    ErrorControlPlane,
+    FakeControlPlane,
+    rpc_call_named as _rpc_call,
+)
 from tests.test_supabase_control import FREE_TEAM, TOKEN, _key_row, _membership_row  # noqa: F401
 from datetime import UTC
 
@@ -62,19 +66,6 @@ TEST_TEAM = {
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
-
-
-def _rpc_call(fake, name):
-    """The test's OWN provision RPC, selected by name — never by index.
-
-    Background boot-sweep RPCs (#4241's ``metering_repair_period_bounds``,
-    armed through ``run_on_daemon_worker``) share this fake and can land at ANY
-    index, before or after the request's own call. ``rpc_calls[0]`` would then
-    read the sweep and fail a test that never touched it. Selecting by name
-    also KEEPS the wrapper-fn pin: a switch to the other provision wrapper
-    matches nothing and raises, rather than silently passing.
-    """
-    return next(c for c in fake.rpc_calls if c[0] == name)
 
 
 class _RegistrySpy:

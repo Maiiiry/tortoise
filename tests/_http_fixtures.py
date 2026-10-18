@@ -116,3 +116,100 @@ def patched_tortoise_sdk(db_path: str) -> Iterator[None]:
         ha_mod.TortoiseSDK.__init__ = _orig_init
         _close_keepalive_anchors(ha_mod)
         ha_mod.app.dependency_overrides.clear()
+
+
+async def quiet_boot_sweeps() -> None:
+    """#3472: no-op stand-in for the lifespan's one-shot `_run_boot_sweeps`.
+
+    Must be `async def`: `_lifespan` arms it with
+    `create_task(_run_boot_sweeps())`, so a sync stub would hand
+    `create_task` a `None` and raise inside the startup half — turning a
+    test-isolation fix into a second, unrelated failure.
+    """
+
+
+def quiesce_testclient_background_work(monkeypatch) -> None:
+    """#3472/#3505: make `TestClient(app)` entry safe for this file's tests.
+
+    `_lifespan` arms background work for EVERY `TestClient(app)` entry,
+    regardless of control-plane mode, and all of it touches the same store
+    the test body is driving:
+
+    1. `_run_boot_sweeps()` (armed by `_lifespan` as
+       `app.state._boot_sweep_task`, one-shot) and `_event_retention_loop()`
+       (armed by `_lifespan` as `app.state._event_retention_task`,
+       re-armed every `event_retention_interval()`) BOTH call
+       `_purge_deleted_teams`. A
+       background purge landing between a test's seeding and its own
+       `ha_mod._purge_deleted_teams()` call makes both read the row before
+       either deletes it: two `_drop_team_graph` calls and two
+       `team_delete_purged` audit rows — `assert ['reg-old', 'reg-old'] ==
+       ['reg-old']` on the registry fixture. Worse on Supabase mode, where
+       the test injects its `_drop_team_graph_strict` fault ONLY AFTER
+       seeding: a boot sweep in that window runs the REAL strict drop for
+       the past-grace teams and deletes the retry-anchor row the test
+       asserts must survive.
+
+       The product behaviour is benign (dropping an already-dropped graph
+       is idempotent) — the defect is test isolation: the assertions assume
+       exclusive ownership of a sweep production also runs. Every caller is
+       therefore quiesced here.
+
+       #3036 added a THIRD caller to both sites — `_sweep_oauth_retention`
+       (a `_run_boot_sweeps` member AND an `_event_retention_loop` call). It
+       is benign for THIS file (it touches only the fake control plane), but
+       the enumeration above is the guard that makes the next lifespan-armed
+       caller visible, so keep it complete: a new sweep reachable from either
+       entry point belongs in this list.
+
+       The CALLEE is deliberately not stubbed: this file's tests call
+       `ha_mod._purge_deleted_teams()` directly and resolve it off the
+       module at call time, so a callee stub would silence the very call
+       under test. `_run_boot_sweeps` is stubbed with an `async def` because
+       `_lifespan` arms it with `create_task(...)` (see
+       `_quiet_boot_sweeps`). The retention interval is pinned beyond any
+       test's lifetime: `_event_retention_loop` invokes BOTH `_sweep_events`
+       and `_purge_deleted_teams` on the same target, so pinning the
+       interval quiesces the loop while leaving the directly-called
+       `_purge_deleted_teams` under test.
+
+    2. The app's `_health_probe_loop` (armed by `_lifespan` as
+       `app.state._health_probe_task`) is NOT stubbed:
+       it runs `_probe_db -> _probe_sdk -> _make_sdk(namespace=None)` and so
+       constructs a projection on the SAME pinned db file, concurrently with
+       the test body's own constructions (the seeder's and
+       `_registry_count`'s SDKs). Quiescing the boot sweeps does NOT remove
+       that constructor, so the embedded double-start race would stay live.
+       Rather than quiesce a third background caller one caller at a time
+       (whack-a-mole — `_lifespan` already grew the probe loop after
+       #2850), the CONSTRUCTION is serialized: the invariant redislite
+       actually needs is that the first construction on a given db_path
+       writes `<db>.settings` before any other opener evaluates the
+       fresh-start branch. #3546 moved that serialization to ONE
+       process-wide lock for the whole session
+       (`tests/_embedded.EMBEDDED_CONSTRUCTION_LOCK`, installed by
+       `tests/conftest._serialize_embedded_construction`) — this file no
+       longer installs its own.
+
+       LANE SCOPE — the serialization is INERT on the lane CI runs this file
+       on. Under a supported `TORTOISE_DB_URI` (the docker lane, this file's
+       default) every construction from this module redirects to that server
+       (`tortoise/projection/__init__.py`, the #1647 D-1=A test redirect:
+       `path` is nulled, so `_is_embedded` is False), so no redislite daemon
+       exists and no double-start is possible. `test_export_delete` is NOT in
+       `tests._embedded.TEST_NO_REDIRECT_STEMS`, which is what selects that
+       branch. On that lane the protection this file actually gets is item 1
+       — the BOOT-SWEEP quiesce, which removes the second caller of
+       `_purge_deleted_teams` — and NOT the serialization. The lock is live
+       only on the embedded tier-2 / carve-out lane (no URI), where
+       constructions stay local-file and real daemons are spawned; it is
+       kept for correctness there, not because the docker lane depends on
+       it.
+    """
+    # (1) quiesce both background callers of the purge sweep (the caller, not
+    # the callee — `_purge_deleted_teams` itself stays under test).
+    import tortoise.hosted_api as ha_mod
+
+    monkeypatch.setattr(ha_mod, "_run_boot_sweeps", quiet_boot_sweeps)
+    monkeypatch.setattr(ha_mod, "event_retention_interval",
+                        lambda *args, **kwargs: 86400.0)
