@@ -1577,7 +1577,11 @@ def test_an_anchor_of_nothing_but_premapped_symbols_is_refused(anchor: str) -> N
     ("㊿ACME", "ACME"),
     ("ACME🄀", "ACME"),
     ("ACME🄊", "ACME"),
-    ("㋀ACME", "ACME"),          # telegraph January -> 1月
+    # The RIGHT adjacency is the discriminating direction here: `㋀ACME` scores
+    # 1.0 even without the range, because the anchor's left neighbour becomes `月`
+    # (CJK, unspaced) — so it cannot prove the range exists.
+    ("ACME㋀", "ACME"),          # telegraph January -> 1月
+    ("ACME㋋", "ACME"),          # telegraph December -> 12月
 ])
 def test_the_circled_and_enclosed_numeral_series_separates(
         text: str, anchor: str) -> None:
