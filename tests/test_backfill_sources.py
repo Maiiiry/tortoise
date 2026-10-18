@@ -265,13 +265,20 @@ def test_e2e8_main_backfill_reconciliation(tmp_path, monkeypatch):
         # DocumentCreated legacy Events byte-identical (frozen, SC4)
         assert _event_props(g, "docA.md") == doc_props_before[0]
         assert _event_props(g, "docB.md") == doc_props_before[1]
-        # CYCLE-10: buckets + sweep never move in this fixture (the forward
-        # run's hash-equal gate skips the stale Event-3 unit)
+        # CYCLE-10: the SESSION buckets + sweep never move in this fixture
+        # (the forward run's hash-equal gate skips the stale Event-3 unit).
+        # #8084: the DOC bucket DOES move — that is the fix, not a regression:
+        # `index_directory` writes the two doc Sources, so the health surface
+        # (now classification-aware) stops calling them `unindexed`. Before
+        # #8084 this assertion pinned the bug: a corpus file the canonical
+        # writer had just indexed was still reported unindexed, and the only
+        # alarm-clearing route minted an orphan AgentSession Event for it.
         health_fwd = sdk.session_index_health(str(c))
-        assert health_fwd["matched"] == 2
+        assert health_fwd["matched"] == 4   # 2 sessions + 2 documents
         assert [Path(x).name for x in health_fwd["stale"]] == ["s3.md"]
-        assert health_fwd["unindexed"] == [str(c / "docA.md"),
-                                           str(c / "docB.md")]
+        assert health_fwd["unindexed"] == []
+        assert health_fwd["by_kind"] == {"agentSession": 3, "document": 2}
+        assert health_fwd["indexed_documents"] == 2
         assert _hash_pair_sweep(g) == 1
     finally:
         sdk.close()

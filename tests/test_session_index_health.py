@@ -468,20 +468,29 @@ def test_empty_session_id_with_alt_key_uses_alt(env, sdk):
     assert h2["up_to_date"], h2
 
 
-def test_empty_session_id_falls_back_to_file_stem(env, sdk):
-    """Review round 3 P2: sessionId: "" must fall back to file_<stem> on BOTH
-    sides (extract_session_id and ingest's or-collapse) — an empty string is
-    absent, not a session id; otherwise health derives session_'' while
-    ingest derives session_file_<stem> and the sweep never converges."""
+def test_empty_session_id_is_a_document_to_the_canonical_writer(env, sdk):
+    """`sessionId: ""` is ABSENT, not an id (#280 review round 3) — and #8084:
+    the pinned §6.2 classifier then declares the file a DOCUMENT (rule 3 does
+    not match, rule 5 applies), so the canonical writer stores it as
+    `doc_<rel>`, NOT as `session_file_<stem>`. This test used to pin the
+    legacy sweep's `file_<stem>` Event as the "indexed" state; that pairing
+    WAS the #8084 bug (health scored the document against AgentSession Events
+    and the sweep minted an orphan one). What still must hold is the original
+    property — health and the writer derive the SAME identity, so the surface
+    converges after ONE write."""
     f = env / "empty-sid.md"
     f.write_text('---\nsessionId: ""\ntitle: T\n---\nUser: hi\n')
-    sdk.ingest_corpus(str(env), eventKind="AgentSession")
+    sdk.index_directory(str(env), extract_metadata=False)
     h = sdk.session_index_health(str(env))
-    assert h["unindexed"] == [], f"empty sessionId not matched: {h}"
+    assert h["unindexed"] == [], f"canonical doc identity not matched: {h}"
+    assert h["by_kind"] == {"document": 1}
+    assert h["indexed_documents"] == 1
+    assert h["indexed_events"] == 0   # never an AgentSession Event
     assert h["duplicates"] == []
-    # Second sweep converges
+    # Second read converges (nothing to do)
     h2 = sdk.session_index_health(str(env))
-    assert h2["up_to_date"], h2
+    assert h2["up_to_date"] == [str(f)]
+    assert h2["unindexed"] == [] and h2["stale"] == []
 
 
 def test_falsy_boolean_session_id_coerces(env, sdk):
@@ -496,7 +505,7 @@ def test_duplicate_session_files_surfaced_and_convergent(env, sdk):
     """Regression (#280 review P2): two corpus files sharing a sessionId used
     to make the sweep permanently non-convergent (MERGE is last-writer-wins;
     the losing copy is forever hash-stale, so every run re-merges both). Now
-    the duplicates are surfaced in a `duplicates` bucket and ingest_corpus
+    the duplicates are surfaced in a `duplicates` bucket and the replay
     dedupes to one primary file per sessionId → the sweep converges."""
     env.joinpath("a.md").write_text(
         "---\nsessionId: dup-sess\ntitle: A\n---\nUser: hi\n")
@@ -513,8 +522,15 @@ def test_duplicate_session_files_surfaced_and_convergent(env, sdk):
     assert len(h["unindexed"]) == 1
 
     rep1 = sdk.reconcile_sessions(str(env))
-    assert rep1["reindex"]["ingested"] == 1   # one primary indexed
-    assert rep1["reindex"]["skipped"] == 1    # non-primary copy deduped
+    # #8084: the replay is the canonical writer, which writes a corpus Source
+    # for BOTH files and elects ONE primary for the Event (`indexed` = the
+    # legacy "ingested" counter). The legacy sweep reported the non-primary as
+    # `skipped` because it wrote no Source at all for it.
+    assert rep1["reindex"]["ingested"] == 2
+    assert rep1["reindex"]["failed"] == 0
+    assert sdk._get_proj().g.query(
+        "MATCH (e:Event {eventKind:'AgentSession'}) RETURN count(e)"
+    ).result_set[0][0] == 1                  # ONE Event for the shared sid
 
     h2 = sdk.session_index_health()
     assert h2["matched"] == 1

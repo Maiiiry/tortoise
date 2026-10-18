@@ -9730,6 +9730,14 @@ def _cmd_index_sessions(args) -> int:
     prints the report. The sweep is the "periodic scan + retry" surface —
     trigger it manually, from cron, or from session-end.sh (align decision:
     no cron infra in-tree).
+
+    #8084: the delta is CLASSIFICATION-AWARE — a corpus file the pinned §6.2
+    classifier calls a `document`/`meeting` (e.g. a legacy `type: conversation`
+    file with no `sessionId`) is reported per kind, and the replay runs the
+    CANONICAL writer (`index_directory`) so each file gets the identity its
+    classifier asked for. Replaying those files through this sweep's legacy
+    AgentSession writer minted an orphan Event and left one file with two
+    identities.
     """
     import sys as _sys
 
@@ -9765,6 +9773,13 @@ def _cmd_index_sessions(args) -> int:
 
     print(f"Session corpus: {report['directory']}")
     print(f"  .md files:          {report['file_count']}")
+    _kinds = report.get("by_kind") or {}
+    if _kinds:
+        # #8084: the corpus is MIXED — a sessionId-less legacy file is a
+        # `document` to the pinned classifier (and to `index_directory`), so
+        # the operator sees the split the delta is computed over.
+        print("  by classifier:      "
+              + ", ".join(f"{k}={v}" for k, v in sorted(_kinds.items())))
     print(f"  AgentSession Events: {report['indexed_events']}")
     print(f"  up-to-date:         {report['matched']}")
     print(f"  unindexed:          {len(report['unindexed'])}")
@@ -9773,6 +9788,14 @@ def _cmd_index_sessions(args) -> int:
         print(f"    - {f}")
     for f in report["stale"]:
         print(f"    ~ {f}")
+    if report.get("document_delta"):
+        # #8084: a sessionId-less legacy file is a `document` to the pinned
+        # classifier, so the replay is the CANONICAL writer's — it checks out
+        # each file's kind before writing (never an AgentSession Event for a
+        # document, which used to leave one file with two identities).
+        print(f"  {report['document_delta']} file(s) in the delta are "
+              f"document/meeting-classified — replayed through the canonical "
+              f"writer (`index_directory`), not as AgentSession Events.")
     if report.get("duplicates"):
         print(f"  duplicate sessionIds: {len(report['duplicates'])}")
         for d in report["duplicates"]:

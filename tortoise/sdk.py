@@ -22582,11 +22582,27 @@ class TortoiseSDK:
         # Canonical boundary regex lives in file_indexer (#280 review round 6):
         # hoisted so extract/health/ingest can never drift apart again (the round-5
         # bug was exactly two copies diverging → permanent sweep non-convergence).
-        from .file_indexer import _FM_RE
+        from .file_indexer import _FM_RE, derive_document_id
         ingested, updated, skipped, failed = 0, 0, 0, 0
         errors: list[dict] = []
         now = datetime.now(timezone.utc).isoformat()  # noqa: UP017
         proj = self._get_proj()
+
+        # #8084: files the CANONICAL path (`index_directory`) already owns are
+        # never re-derived as AgentSession Events here. The pinned §6.2
+        # classifier declares a sessionId-less corpus file a `document`, and
+        # the canonical writer stores it as a D10 document :Source
+        # (`doc_<rel>`, documentKind set) — so deriving this legacy
+        # `session_file_<stem>` Event for it mints a SECOND identity for one
+        # file, with no `Source` referencing it (measured on a 3-file corpus:
+        # 2 orphan AgentSession Events, 1 `references` edge). The owned ids are
+        # read ONCE for the run (not per file): the same corpus-wide set
+        # `session_index_health` reads.
+        canonical_doc_ids: set[str] = set()
+        if eventKind == "AgentSession":
+            canonical_doc_ids = {r[0] for r in proj.g.query(
+                "MATCH (s:Source) WHERE s.documentKind IS NOT NULL "
+                "RETURN s.url").result_set if r[0]}
 
         files = sorted(Path(directory).rglob("*.md"))
 
@@ -22673,6 +22689,23 @@ class TortoiseSDK:
             file_hash = hashlib.sha256(text.encode()).hexdigest()
 
             if eventKind == "AgentSession":
+                # #8084 guard — a file whose canonical document identity
+                # exists is the canonical writer's; deriving the legacy
+                # `session_file_<stem>` Event for it would leave the file with
+                # two identities (see the canonical_doc_ids note above).
+                try:
+                    _doc_id = derive_document_id(filepath, directory)
+                except ValueError:
+                    _doc_id = None  # escape-rejected: not ownable either way
+                if _doc_id is not None and _doc_id in canonical_doc_ids:
+                    skipped += 1
+                    errors.append({
+                        "file": rel_path,
+                        "error": f"canonical document identity '{_doc_id}' "
+                                 f"already owns this file — not re-derived "
+                                 f"as an AgentSession Event (#8084)",
+                        "retryable": False})
+                    continue
                 # AgentSession branch — session indexing with metadata extraction
                 session_id = frontmatter.get("sessionId") or frontmatter.get("session_id") or f"file_{filepath.stem}"
                 # #280 review P2: non-primary copy of a duplicated sessionId —
@@ -32343,38 +32376,74 @@ class TortoiseSDK:
                                   progress_file=progress_file)
 
     def session_index_health(self, directory: str | None = None) -> dict:
-        """Compare session .md files against indexed AgentSession Events.
+        """Compare corpus .md files against the identity each writer created.
 
         #280 item 2 — the ``tortoise doctor`` health surface. Scans the
         canonical corpus (``~/.tortoise/docs/conversations/`` by default,
-        ``TORTOISE_SESSION_CORPUS`` override) and matches each file to its
-        expected Event by session_id + file_hash.
+        ``TORTOISE_SESSION_CORPUS`` override) and matches each file to the
+        node the canonical writer would have made for it, by identity +
+        file_hash.
+
+        #8084 — CLASSIFICATION-AWARE (the SURFACE's semantics were the bug,
+        not the pinned §6.2 classifier). ``index_directory`` is the canonical
+        writer (epic #900 T8), and it asks ``classify_file`` which identity a
+        file gets: an ``agent_session`` file becomes ``Event session_<sid>``,
+        a ``document`` file becomes a D10 document ``:Source``
+        (``doc_<rel>``, ``documentKind`` set) plus its ``corpus://``
+        provenance row, a ``meeting`` file becomes the meeting ``:Event``.
+        This surface used to score EVERY file against AgentSession Events
+        only, so a sessionId-less legacy corpus file — which the classifier
+        deliberately declares a ``document`` (rule 5) — was reported
+        ``unindexed`` FOREVER (measured: 3,040 of 5,411 files, i.e. 56% of a
+        fully indexed corpus), and the only alarm-clearing route was the
+        deprecated sweep, which minted one orphan AgentSession Event per file
+        and left the file with TWO identities. Each file is now asked the
+        same question the writer asked it, and checked against the identity
+        that writer stores.
 
         Returns ``{directory, file_count, indexed_events, matched, unindexed,
-        stale, up_to_date, duplicates}`` — ``stale`` = Event exists but hash
-        differs (re-index needed); ``unindexed`` = no Event at all.
+        stale, up_to_date, duplicates, by_kind, indexed_documents,
+        unindexed_documents, stale_documents}`` — ``stale`` = the identity
+        exists but its recorded hash differs (re-index needed);
+        ``unindexed`` = no identity at all, whatever the file's kind.
+        ``unindexed``/``stale`` are the WHOLE corpus, so ``unindexed == 0``
+        means "every corpus file is in the graph" — the invariant the issue's
+        target states.
 
         ``indexed_events`` is CORPUS-SCOPED (#280 review P3): the count of
-        AgentSession Events whose eventId matches a corpus file — not all
-        AgentSession Events in the graph (other sessions would make the
-        doctor arithmetic misleading). ``duplicates`` surfaces sessionIds
-        claimed by more than one corpus file (rglob copies / duplicated
-        frontmatter): those copies made the sweep permanently non-convergent
-        (MERGE is last-writer-wins) — they are surfaced here and skipped in
-        ingest_corpus, never silently re-indexed (#280 review P2).
+        AgentSession Events whose eventId matches a session-classified corpus
+        file — not all AgentSession Events in the graph (other sessions would
+        make the doctor arithmetic misleading). ``duplicates`` surfaces
+        sessionIds claimed by more than one session-classified corpus file
+        (rglob copies / duplicated frontmatter): those copies made the sweep
+        permanently non-convergent (MERGE is last-writer-wins) — they are
+        surfaced here and skipped in ingest_corpus, never silently re-indexed
+        (#280 review P2).
+
+        ``by_kind`` counts corpus files per classifier. ``indexed_documents``
+        counts the document/meeting files whose canonical identity exists, and
+        ``unindexed_documents``/``stale_documents`` are the subsets of
+        ``unindexed``/``stale`` the SESSION sweep does not own — those are the
+        canonical writer's (``tortoise index directory``), so the remedy can
+        name the right command instead of minting an AgentSession Event for a
+        file the classifier calls a document (#8084).
         """
         from pathlib import Path  # noqa: I001
-        from .file_indexer import compute_file_hash
-        from .session_indexer import (
-            corpus_files, extract_session_id, session_corpus_dir,
+        from .file_indexer import (
+            classify_file, derive_document_id, derive_session_id, hash_text,
+            parse_frontmatter,
         )
+        from .session_indexer import corpus_files, session_corpus_dir
 
         dir_path = Path(directory or session_corpus_dir())
+        empty = {"directory": str(dir_path), "file_count": 0,
+                 "indexed_events": 0, "matched": 0,
+                 "unindexed": [], "stale": [], "up_to_date": [],
+                 "duplicates": [], "by_kind": {},
+                 "indexed_documents": 0,
+                 "unindexed_documents": [], "stale_documents": []}
         if not dir_path.is_dir():
-            return {"directory": str(dir_path), "file_count": 0,
-                    "indexed_events": 0, "matched": 0,
-                    "unindexed": [], "stale": [], "up_to_date": [],
-                    "duplicates": []}
+            return empty
 
         proj = self._get_proj()
         rows = proj.g.query(
@@ -32383,23 +32452,80 @@ class TortoiseSDK:
         ).result_set
         by_event = {r[0]: r[1] for r in rows}
 
+        # ── canonical (non-session) identities, read ONCE each (#8084) ──
+        # A document is a :Source carrying `documentKind` (D10, ONTOLOGY
+        # v3.15 §4.4); its id is the writer-derived `doc_<rel>`, which —
+        # unlike the `corpus://<name>/<rel>` provenance url — does not depend
+        # on the `corpus_name` the operator passed, so the id is the stable
+        # handle this surface can re-derive from the path alone.
+        doc_ids = {r[0] for r in proj.g.query(
+            "MATCH (s:Source) WHERE s.documentKind IS NOT NULL "
+            "RETURN s.url").result_set if r[0]}
+        # The document Source does not carry a hash (the writer's D10 shape);
+        # the provenance row written in the SAME unit does. Key it by the
+        # ABSOLUTE sourcePath the writer stored, realpath-resolved on both
+        # sides: the walk hands us the path as written while the canonical
+        # path stores the resolved one (/var vs /private/var on macOS) — the
+        # #330 "two derivations diverge → never converges" class.
+        by_src_path: dict[str, str | None] = {}
+        for sp, ch in proj.g.query(
+                "MATCH (s:Source) WHERE s.contentHash IS NOT NULL "
+                "RETURN s.sourcePath, s.contentHash").result_set:
+            if sp:
+                by_src_path.setdefault(os.path.realpath(str(sp)), ch)
+        # Meeting identity: the writer stores the REALPATH-RELATIVIZED rel
+        # path on `e.source_file`, so that stored form is the key here.
+        by_meeting: dict[str, str | None] = {}
+        for sf, fh in proj.g.query(
+                "MATCH (e:Event {eventKind:'meeting'}) "
+                "RETURN e.source_file, e.file_hash").result_set:
+            if sf:
+                by_meeting.setdefault(str(sf), fh)
+
         files = corpus_files(dir_path)
-        # Group by session id: two files may share a sessionId (rglob picking
-        # up copies, or duplicated frontmatter). Classify only the PRIMARY
-        # file (first in sorted order) so the delta drives the sweep to
-        # convergence; non-primary copies surface in the `duplicates` bucket.
+        real_root = os.path.realpath(str(dir_path))
+        # Group session-classified files by session id: two files may share a
+        # sessionId (rglob picking up copies, or duplicated frontmatter).
+        # Classify only the PRIMARY file (first in sorted order) so the delta
+        # drives the sweep to convergence; non-primary copies surface in the
+        # `duplicates` bucket. Files the pinned classifier calls a document /
+        # meeting are NOT session candidates at all and are resolved below.
         by_sid: dict[str, list[str]] = {}
+        hashes: dict[str, str | None] = {}
+        others: list[tuple[str, str]] = []
+        unreadable: list[str] = []
+        by_kind: dict[str, int] = {}
         for f in files:
+            key = str(f)
+            try:
+                text = f.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001, RUF100 — degrade, never raise
+                text = None
+            if text is None:
+                # A file the walk cannot read has no identity on either path
+                # (the writer buckets it `failed`) — keep it in the session
+                # delta so the surface still names it, as it always has.
+                unreadable.append(key)
+                hashes[key] = None
+                by_kind["agentSession"] = by_kind.get("agentSession", 0) + 1
+                continue
+            frontmatter = parse_frontmatter(text)
+            hashes[key] = hash_text(text)
+            classifier = classify_file(frontmatter, f)
+            kind_key = "agentSession" if classifier == "agent_session" else \
+                ("meeting" if classifier == "meeting" else "document")
+            by_kind[kind_key] = by_kind.get(kind_key, 0) + 1
+            if classifier != "agent_session":
+                others.append((classifier, key))
+                continue
             # str() coercion keeps the value hashable as a dict key (a YAML
             # list/dict frontmatter sessionId would raise TypeError) while
             # preserving the base event_id derivation (str() == repr() for
             # str/int/float/bool/list/dict), so health stays consistent with
-            # ingest_corpus's frontmatter coercion. Only a read failure
-            # (extract returns None) falls back to the file-stem id.
-            _sid_raw = extract_session_id(str(f))
-            sid = str(_sid_raw) if _sid_raw is not None else f"file_{f.stem}"
-            by_sid.setdefault(sid, []).append(str(f))
-        unindexed: list[str] = []
+            # ingest_corpus's frontmatter coercion.
+            by_sid.setdefault(str(derive_session_id(frontmatter, f.stem)),
+                              []).append(key)
+        unindexed: list[str] = list(unreadable)
         stale: list[str] = []
         up_to_date: list[str] = []
         duplicates: list[dict] = []
@@ -32409,7 +32535,7 @@ class TortoiseSDK:
                 duplicates.append({"session_id": sid, "event_id": event_id,
                                    "files": flist})
             primary = flist[0]
-            file_hash = compute_file_hash(primary)
+            file_hash = hashes.get(primary)
             existing = by_event.get(event_id)
             if existing is None:
                 unindexed.append(primary)
@@ -32417,6 +32543,45 @@ class TortoiseSDK:
                 up_to_date.append(primary)
             else:
                 stale.append(primary)
+
+        # ── non-session files: check the identity the canonical writer made ──
+        doc_up: list[str] = []
+        doc_unindexed: list[str] = []
+        doc_stale: list[str] = []
+        for classifier, key in others:
+            if classifier == "meeting":
+                try:
+                    rel = os.path.relpath(os.path.realpath(key), real_root)
+                except ValueError:  # pragma: no cover — different drives
+                    rel = None
+                if rel is not None and rel in by_meeting:
+                    stored_m = by_meeting[rel]
+                    if stored_m is None or stored_m == hashes.get(key):
+                        doc_up.append(key)
+                    else:
+                        doc_stale.append(key)
+                else:
+                    doc_unindexed.append(key)
+                continue
+            try:
+                doc_id = derive_document_id(key, dir_path)
+            except ValueError:
+                # escape-rejected by the writer too (§6.4) — no identity is
+                # possible from this root, never a silent match.
+                doc_unindexed.append(key)
+                continue
+            if doc_id not in doc_ids:
+                doc_unindexed.append(key)
+                continue
+            stored = by_src_path.get(os.path.realpath(key))
+            if stored is None or stored == hashes.get(key):
+                doc_up.append(key)
+            else:
+                doc_stale.append(key)
+
+        up_to_date.extend(doc_up)
+        unindexed.extend(doc_unindexed)
+        stale.extend(doc_stale)
         corpus_event_ids = {f"session_{sid}" for sid in by_sid}
         return {"directory": str(dir_path),
                 "file_count": len(files),
@@ -32426,7 +32591,11 @@ class TortoiseSDK:
                 "unindexed": unindexed,
                 "stale": stale,
                 "up_to_date": up_to_date,
-                "duplicates": duplicates}
+                "duplicates": duplicates,
+                "by_kind": by_kind,
+                "indexed_documents": len(doc_up),
+                "unindexed_documents": doc_unindexed,
+                "stale_documents": doc_stale}
 
     def reconcile_sessions(self, directory: str | None = None,
                            extract_metadata: bool = False,
@@ -32444,19 +32613,92 @@ class TortoiseSDK:
 
         ``extract_metadata`` defaults to False so sweeps use the cheap
         keyword fallback — never burn LLM tokens on bulk retry.
+
+        #8084 — the replay now runs the CANONICAL writer
+        (``index_directory``, epic #900 T8), not the deprecated AgentSession
+        leg. Replaying the legacy ``ingest_corpus(eventKind="AgentSession")``
+        derived ``session_file_<stem>`` for every sessionId-less corpus file —
+        files the pinned §6.2 classifier declares a ``document`` — and minted an
+        AgentSession Event with no inbound ``references`` edge beside the
+        canonical ``doc_<rel>`` Source (measured: two orphan Events for one
+        3-file corpus, i.e. TWO identities for one file). The canonical writer
+        asks the classifier which identity each file gets, so the sweep now
+        converges the whole corpus instead of corrupting its document half.
+
+        ``session_delta``/``document_delta`` keep the split VISIBLE (the health
+        surface reports it per kind); ``reindex`` keeps the legacy counter
+        names (``ingested`` = the canonical writer's ``indexed``) so existing
+        operators/scripts read the same shape.
+
+        The corpus NAME the operator indexed with is recovered from the graph
+        (see ``_corpus_authority_for_directory``): ``index_directory`` would
+        otherwise default to the directory basename and derive a SECOND
+        ``corpus://`` provenance url for every replayed file — a new source of
+        the two-identities-per-file split this fix exists to remove.
         """
         from pathlib import Path  # noqa: I001
         from .session_indexer import session_corpus_dir
 
         directory = str(Path(directory or session_corpus_dir()).resolve())
         health = self.session_index_health(directory)
+        session_delta = ((len(health["unindexed"])
+                          - len(health["unindexed_documents"]))
+                         + (len(health["stale"])
+                            - len(health["stale_documents"])))
+        document_delta = (len(health["unindexed_documents"])
+                          + len(health["stale_documents"]))
         result: dict = {}
-        if health["unindexed"] or health["stale"]:
-            result = self.ingest_corpus(
-                directory, eventKind="AgentSession",
+        if session_delta or document_delta:
+            run = self.index_directory(
+                directory,
+                corpus_name=self._corpus_authority_for_directory(directory),
                 extract_metadata=extract_metadata, llm_model=llm_model,
             )
-        return {**health, "reindex": result}
+            result = {"ingested": run["indexed"],
+                      "updated": run["updated"],
+                      "skipped": run["skipped"],
+                      "failed": run["failed"],
+                      "errors": run["errors"]}
+        return {**health, "reindex": result,
+                "session_delta": session_delta,
+                "document_delta": document_delta}
+
+    def _corpus_authority_for_directory(self, root: str) -> str | None:
+        """Recover the ``corpus://<name>/`` authority an earlier index run used.
+
+        #8084: the sweep replays through ``index_directory``, whose
+        ``corpus_name`` defaults to the directory BASENAME. An operator who
+        indexed with ``--corpus-name t11_clean`` would get a second
+        ``corpus://<basename>/…`` provenance Source for every replayed file —
+        one file, two corpus urls. The authority is recoverable from the
+        Sources the earlier run already wrote (each carries the absolute
+        ``sourcePath``), most-frequent wins so a corpus with a few stragglers
+        still resolves deterministically. Returns None when the directory has
+        never been indexed (then the basename default is the only answer, and
+        it is the right one).
+        """
+        from collections import Counter
+        from urllib.parse import unquote
+
+        proj = self._get_proj()
+        prefix = os.path.realpath(root).rstrip(os.sep) + os.sep
+        try:
+            rows = proj.g.query(
+                "MATCH (s:Source) WHERE s.sourcePath STARTS WITH $p "
+                "RETURN s.url",
+                params={"p": prefix},
+            ).result_set
+        except Exception:  # noqa: BLE001, RUF100 — never fail the sweep here
+            return None
+        names: Counter[str] = Counter()
+        for (url,) in rows:
+            u = str(url or "")
+            if not u.startswith("corpus://"):
+                continue
+            authority = u[len("corpus://"):].split("/", 1)[0]
+            if authority:
+                names[unquote(authority)] += 1
+        return names.most_common(1)[0][0] if names else None
 
 
     def _connect_issue_objects(self, event_id: str, metadata: dict) -> int:
