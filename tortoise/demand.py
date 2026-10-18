@@ -108,8 +108,16 @@ DEMAND_READ_LIMIT = 2000
 #: Bound on the ping text, so a long surface name cannot grow the message.
 DEMAND_MESSAGE_MAX_CHARS = 512
 
-#: The closed action vocabulary.
-DEMAND_ACTIONS = frozenset({"click", "go_back"})
+#: The action that IS demand. Only this one counts toward the click totals and
+#: the cross-org ranking (``_demand_aggregate`` / ``_demand_click_count``): a
+#: dismissal is a funnel fact, not a click, and counting it would inflate the
+#: distinct-org count that triggers #3541.
+DEMAND_ACTION_CLICK = "click"
+
+#: The closed action vocabulary. ``go_back`` is a dismissal the client MAY
+#: report; the dashboard client does not (it sends clicks only), but any caller
+#: holding a ``tt_`` key can, so the read half guards the count explicitly.
+DEMAND_ACTIONS = frozenset({DEMAND_ACTION_CLICK, "go_back"})
 
 _KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 

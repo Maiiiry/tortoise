@@ -38292,6 +38292,13 @@ def _demand_aggregate(rows: list[dict]) -> tuple[list[dict], bool]:
         key = props.get("integration_key")
         if not key:
             continue  # a row without a key cannot be ranked; never guessed
+        if props.get("action", _demand.DEMAND_ACTION_CLICK) != _demand.DEMAND_ACTION_CLICK:
+            # #3514: `action` is a closed vocabulary, so a dismissal (`go_back`)
+            # is a legitimate row — but it is a FUNNEL fact, not DEMAND. Ranking
+            # it would inflate the distinct-org count that triggers #3541 with
+            # close-buttons. A row with no action prop reads as a click (the
+            # body's own default), so this can never silently zero real demand.
+            continue
         org = row.get("org_id") or ""
         entry = per.get(key)
         if entry is None:
@@ -38447,9 +38454,14 @@ def _demand_click_count(rows: list[dict] | None, integration_key: str) -> int | 
     """
     if rows is None:
         return None
-    return sum(1 for row in rows
-               if (row.get("properties") or {}).get("integration_key")
-               == integration_key)
+
+    def _is_this_click(row: dict) -> bool:
+        props = row.get("properties") or {}
+        return (props.get("integration_key") == integration_key
+                and props.get("action", _demand.DEMAND_ACTION_CLICK)
+                == _demand.DEMAND_ACTION_CLICK)
+
+    return sum(1 for row in rows if _is_this_click(row))
 
 
 @app.get("/v1/data-sources/demand")

@@ -70,6 +70,19 @@ import {
   comingSoonShowMoreLabel, orderedTiles, tileActionLabel, tileAriaLabel, tileByKey, tileMark,
   tileStatus, visibleComingSoon,
 } from './integrationsGrid.js'
+// #3514 (epic #1714 J4): the coming-soon click's client half — the pinned body,
+// the per-(mount, tile) idempotency key, and the idle/sending/recorded/failed
+// states with their copy. Pure, node --test unit-tested
+// (demandCapture.test.js): the states are pinned here so the dialog cannot grow
+// a second, divergent notion of "recorded".
+import {
+  DEMAND_DISMISS_LABEL, DEMAND_FAILED, DEMAND_FAILED_COPY, DEMAND_PRIMARY_LABEL,
+  DEMAND_RECORDED, DEMAND_RECORDED_COPY, DEMAND_RETRY_LABEL, DEMAND_SENDING,
+  DEMAND_SENDING_COPY, DEMAND_SENDING_LABEL, DEMAND_SURFACE_SETTINGS,
+  DEMAND_SURFACE_WIZARD,
+  demandBusy, demandFailed, demandInitialState, demandKeyFor, demandRecorded,
+  demandRecordedDetail, demandSending, recordDemand,
+} from './demandCapture.js'
 // #1894: indexed-state + job-progress derivations — pure, node --test
 // unit-tested (memorySourcesStatus.test.js).
 import { docsIndexedLabel, docsSourceOn, formatRelativeTime, issuesSourceOn, jobStatusLine } from './memorySourcesStatus.js'
@@ -2810,6 +2823,16 @@ function claimIntentInFlight() {
       throw err
     }
     return data || {}
+  }
+
+  // ── #3514: the coming-soon click's request seam ──────────────────────
+  // The click is RECORDED, never delivered (epic #1714 decision #3). The policy
+  // half lives in demandCapture.js; this is only the wiring onto the same-origin
+  // BFF proxy every other call already uses. `recordDemand` never throws and
+  // never reports a failed write as recorded, so the dialog's error state is
+  // driven by the RESULT, not by an exception escaping React.
+  async function recordDemandClick({ integrationKey, surface, idempotencyKey }) {
+    return recordDemand({ integrationKey, surface, idempotencyKey, request: api })
   }
 
   // ── #1765 identity surface: inventory fetch + link/unlink/resend handlers ──
@@ -8314,6 +8337,12 @@ function claimIntentInFlight() {
     onIssuesScopeChange: handleIssuesScopeChange,
     onLoadBranches: loadBranches,
     order: DATA_SOURCES_ORDER,
+    // #3514: the coming-soon click's request seam + the SURFACE it records.
+    // Settings is the default here; the wizard mount overrides the surface (it
+    // is the other mount), and both then thread it into the record so the
+    // operator can tell a wizard click from a Settings click.
+    recordDemandClick,
+    surface: DEMAND_SURFACE_SETTINGS,
   }
 
   if (welcomeMode && authed) {
@@ -9057,6 +9086,7 @@ function claimIntentInFlight() {
                       <MemorySources
                         {...memorySourcesProps}
                         order={DATA_SOURCES_ORDER}
+                        surface={DEMAND_SURFACE_WIZARD}
                         wizardHarness={harnessPickEstablished ? wizardHarness : null}
                       />
                       <div className="wizard-nav">
@@ -11524,10 +11554,15 @@ function MemorySources(props) {
     // Settings mount renders the SAME grid, so an existing user sees ONE
     // presentation of the source list. The order is a prop, never the array
     // literal's incidental order (a render-order assertion depends on that).
-    // (review P2: a `surface` prop used to sit here and was never read by this
-    // component — both mounts render byte-identical output — so it was dropped
-    // rather than left looking load-bearing.)
     order = DATA_SOURCES_ORDER,
+    // #3514: the SURFACE this mount records on the demand row ('wizard' |
+    // 'settings') and the request seam the click posts through. A `surface`
+    // prop existed once and was dropped because nothing read it; it is back
+    // because it is now LOAD-BEARING — it is the request body's `surface` field
+    // (`tortoise/demand.py::DEMAND_PROPS`), and it is the one prop the two
+    // mounts genuinely differ on.
+    surface = DEMAND_SURFACE_SETTINGS,
+    recordDemandClick = null,
   } = props
 
   // #1894: relative-time ticker — keeps "Indexed · 2 min ago" and the job
@@ -11561,6 +11596,41 @@ function MemorySources(props) {
     rememberFocusedTrigger(comingSoonRestoreRef, undefined)
     if (trigger) rememberRestoreTarget(comingSoonRestoreRef, trigger)
     setComingSoonKey(key)
+  }
+
+  // #3514 (epic #1714 J4): the coming-soon click's post-action states.
+  //
+  // `demandStates` is keyed by integration key and lives for the MOUNT, so a
+  // second click on the same tile opens the dialog in its recorded state
+  // instead of promising a second record — the idempotency key minted once per
+  // (mount, tile) makes that a server-side replay as well, not only a UI
+  // opinion. `demandKeysRef` holds those keys; a fresh page load starts a fresh
+  // set, which is the honest reading of R4's one record per click.
+  const [demandStates, setDemandStates] = React.useState({})
+  const demandKeysRef = React.useRef(new Map())
+  const comingSoonDemand = comingSoonKey
+    ? (demandStates[comingSoonKey] || demandInitialState())
+    : demandInitialState()
+  const recordComingSoonClick = async () => {
+    const key = comingSoonKey
+    if (!key) return
+    const idempotencyKey = demandKeyFor(demandKeysRef.current, key)
+    setDemandStates((s) => ({ ...s, [key]: demandSending(s[key] || demandInitialState()) }))
+    // No try/catch: `recordDemand` cannot throw — a transport failure, a 503 from
+    // a sink that refused the write and a 422 all arrive as `ok: false`, so the
+    // failure is SHOWN rather than swallowed (and never reads as recorded).
+    const outcome = typeof recordDemandClick === 'function'
+      ? await recordDemandClick({ integrationKey: key, surface, idempotencyKey })
+      // A mount with no request seam (the archived rollback block renders its own
+      // inline subset) reports the failure instead of offering an inert control:
+      // the action always DOES something and its outcome is always shown.
+      : { ok: false, status: null, reason: 'no request seam' }
+    setDemandStates((s) => ({
+      ...s,
+      [key]: outcome.ok
+        ? demandRecorded(s[key] || demandInitialState(), outcome)
+        : demandFailed(s[key] || demandInitialState(), outcome),
+    }))
   }
 
   if (loading) {
@@ -11970,8 +12040,21 @@ function MemorySources(props) {
           is pinned by the issue: role=dialog, aria-modal, aria-labelledby on the
           "Not available yet" heading, initial focus INTO the dialog, Escape
           closes (returning focus to the invoking tile via dialogFocus.js), and
-          the expansion resets per open. The post-action states are #3514's —
-          this shell carries no posting primary. */}
+          the expansion resets per open.
+
+          #3514: the POSTING PRIMARY and its post-action states. The click is
+          RECORDED, never delivered (epic #1714 R2/R4) — the primary is a label
+          on the intent signal, it creates no delivery obligation and no extra
+          state. States are pinned (no silent black hole):
+            idle     — primary enabled, Copy says nothing yet;
+            sending  — primary DISABLED (a double submit is impossible, and the
+                       request is idempotent at the server regardless);
+            recorded — the recorded state inline, with Dismiss;
+            failed   — "your request was not recorded" + Retry, and the state
+                       never reads as recorded.
+          Focus never lands on <body>: Close keeps the initial focus in the idle
+          state (#3513's pinned assertion), and the recorded/failed controls
+          autoFocus when they mount in place of the primary. */}
       {comingSoonTile && (
         <div
           className="integration-modal-backdrop"
@@ -11990,8 +12073,63 @@ function MemorySources(props) {
               <strong>{comingSoonTile.name}.</strong> {COMING_SOON_DIALOG_BODY}
             </p>
             <p className="dim small">{COMING_SOON_DIALOG_FOOTNOTE}</p>
+            {/* The status region is the ONE place a post-action outcome is
+                announced (aria-live=polite, per the pinned dialog contract). It
+                carries no assertive alert role: that would upgrade the region
+                and contradict the politeness the contract pins. */}
+            <div
+              className="integration-demand-status"
+              aria-live="polite"
+              aria-busy={comingSoonDemand.status === DEMAND_SENDING}
+            >
+              {comingSoonDemand.status === DEMAND_SENDING && (
+                <p className="dim small">{DEMAND_SENDING_COPY}</p>
+              )}
+              {comingSoonDemand.status === DEMAND_RECORDED && (
+                <>
+                  <p className="small">{DEMAND_RECORDED_COPY}</p>
+                  {demandRecordedDetail(comingSoonDemand) && (
+                    <p className="dim small">{demandRecordedDetail(comingSoonDemand)}</p>
+                  )}
+                </>
+              )}
+              {comingSoonDemand.status === DEMAND_FAILED && (
+                <p className="error small">{DEMAND_FAILED_COPY}</p>
+              )}
+            </div>
             <div className="wizard-actions">
-              <button type="button" className="btn-primary" autoFocus onClick={closeComingSoon}>Close</button>
+              {comingSoonDemand.status === DEMAND_RECORDED ? (
+                <button type="button" className="btn-primary" autoFocus onClick={closeComingSoon}>
+                  {DEMAND_DISMISS_LABEL}
+                </button>
+              ) : comingSoonDemand.status === DEMAND_FAILED ? (
+                <>
+                  <button type="button" className="btn-primary" autoFocus onClick={recordComingSoonClick}>
+                    {DEMAND_RETRY_LABEL}
+                  </button>
+                  <button type="button" className="ghost" onClick={closeComingSoon}>Close</button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    disabled={demandBusy(comingSoonDemand)}
+                    onClick={recordComingSoonClick}
+                  >
+                    {demandBusy(comingSoonDemand) ? DEMAND_SENDING_LABEL : DEMAND_PRIMARY_LABEL}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    autoFocus
+                    disabled={demandBusy(comingSoonDemand)}
+                    onClick={closeComingSoon}
+                  >
+                    Close
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>

@@ -608,6 +608,36 @@ def test_demand_read_is_team_scoped_by_the_authenticated_team(client, telegram):
     assert other["demand"] == []
 
 
+def test_a_go_back_row_is_recorded_but_is_not_demand(client, telegram):
+    """A dismissal is a FUNNEL row, never a click.
+
+    `action` is a closed server vocabulary (``click`` | ``go_back``), so any
+    caller holding a ``tt_`` key can post ``go_back`` — it is reachable, not
+    theoretical. The read half ranks DEMAND (clicks), so a dismissal row that
+    were counted would inflate both the per-team count the popup shows and the
+    cross-org count that triggers #3541 (N distinct orgs → scoping issue).
+
+    Both halves are asserted: the dismissal is RECORDED (the funnel keeps it —
+    dropping it would silently discard a real signal) and it adds NO click.
+    """
+    assert _post(client, integration_key=KEY_A).status_code == 200
+    assert _post(client, integration_key=KEY_A, action="go_back").status_code == 200
+
+    rows = client.get("/v1/data-sources/demand").json()["demand"]
+    entry = [d for d in rows if d["integration_key"] == KEY_A][0]
+    assert entry["click_count"] == 1, entry
+    assert entry["org_count"] == 1, entry
+    # The dismissal IS in the store: the funnel event is not thrown away.
+    assert [e["properties"]["action"] for e in _demand_events(client)] == [
+        "click", "go_back"]
+
+    # The click response's own count agrees with the read half (one number, one
+    # meaning) — an unreadable store answers null, never a fabricated number.
+    after = _post(client, integration_key=KEY_A)
+    assert after.status_code == 200, after.text
+    assert after.json()["click_count"] == 2
+
+
 def test_cross_org_demand_query_requires_the_internal_key(client, telegram,
                                                           monkeypatch):
     """The cross-org count is on the OPERATOR plane, and only there."""

@@ -92,6 +92,11 @@ curl -sS "$API/v1/internal/data-sources/demand" \
 `org_count` then `click_count`, and a `distinct_orgs` figure that equals the
 number of distinct teams in the store.
 
+**What counts as demand:** rows whose `action` is `click`. A `go_back` row (a
+dismissal — a value the route accepts) is stored as a funnel fact and is
+EXCLUDED from both `click_count` and `org_count`; counting it would let
+close-buttons advance the N=5 trigger.
+
 **Decision rule (epic #1714 §6):** **N distinct orgs requesting an integration →
 it becomes a scoping issue**, with N = 5 to be fixed at the plan gate. That is
 the trigger for **#3541** (Drive / Slack / Notion), which stays open while the
@@ -104,9 +109,10 @@ same endpoint.
 
 | Check | Status | Why |
 |---|---|---|
-| Automated rows (`tests/test_data_source_capture.py`) | **RUN** — 40 passed | the evidence in this PR |
+| Automated rows (`tests/test_data_source_capture.py`) | **RUN** — 45 passed | the server half: record, ping, dedupe, caps, read half, and the `go_back`-is-not-demand guard |
+| Client half (node + browser) | **RUN** | `demandCapture.test.js` (17, the state machine and the wire body), `demandCaptureRender.test.js` (9, the dialog wiring), and the four `#3514` rows in `tests/e2e/test_dashboard_onboarding.py` (real built bundle, real preview) |
 | `ops-telegram-live-send` | **NOT RUN** | no operator Telegram credentials exist in the lane that produced this PR; a live send cannot be fabricated, and the receipt gate (#3515) refuses a fabricated one |
-| `ops-monthly-demand-review` | **NOT RUN** | requires a deployed instance holding real demand rows; nothing has clicked a tile yet (#3513's grid is not merged) |
+| `ops-monthly-demand-review` | **NOT RUN** | requires a DEPLOYED instance holding real demand rows. The surface now exists end to end (the grid landed in #8327, the click trigger in #3514), so this row is runnable the first time a real user clicks a tile on a deployment — no lane can produce it from a test store without fabricating the receipt |
 
 Both un-run rows are **honest gaps, recorded rather than filled**: they are
 manual operator actions with no runner (§5), and the ping's automated contract is

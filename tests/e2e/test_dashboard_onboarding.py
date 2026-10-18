@@ -139,7 +139,8 @@ def _wire(page: Page, *, seed_objects: list = None,  # noqa: RUF013
           role: str | None = None, key_rows: list | None = None,
           minted_key: str = MINTED_KEY, mint_status: int = 200,
           mint_error_detail: str = "API key cap reached",
-          onboarding_projection: dict | None = None) -> dict:
+          onboarding_projection: dict | None = None,
+          demand_failures: list | None = None) -> dict:
     """Route harness: the API mocks for the wizard journey. Returns the
     capture dict ({objects, points, state_patches, org_create, checkpoint,
     mint}).
@@ -153,12 +154,28 @@ def _wire(page: Page, *, seed_objects: list = None,  # noqa: RUF013
     reachable non-transport mint failure).
     `onboarding_projection` serves `GET /v1/onboarding/state` (default: none —
     the pre-existing 401 fall-through, so `serverHarnessConnected` stays false).
+    `demand_failures` (#3514) is a QUEUE of statuses returned by
+    `POST /v1/data-sources/demand` before the surface starts succeeding — the
+    only way to drive the popup's error->Retry->recorded path, since a static
+    failure could never be recovered from inside one test.
+
+    The popup's TRANSIENT loading state is deliberately NOT asserted here: the
+    sync Playwright handler runs on the test thread, so holding the response open
+    blocks the very thread that would have to read the DOM — the assertion could
+    only ever sample the settled state (measured: it did exactly that, 10/10
+    polls read "Recorded"). That state is pinned instead where it is observable:
+    `demandCapture.test.js` (the state machine) and `demandCaptureRender.test.js`
+    (the disabled binding + the sending label).
     #3428/#2937 (lane B3, review cycle 2 P2-2): the wizard reads `st.onboarding`,
     so this is the runtime seam that makes the Connected screen reachable — it
     turns the capture-tense gating from source-pinned into runtime-proven.
     """
     cap = {"objects": [], "points": [], "state": [], "org_create": [],
-           "checkpoint": [], "mint": [], "capabilities": 0}
+           "checkpoint": [], "mint": [], "capabilities": 0,
+           # #3514: every demand POST, with the body and the idempotency header
+           # it carried — the two facts the record's contract is made of.
+           "demand": []}
+    demand_remaining = list(demand_failures or [])
     seed_objects = seed_objects or [{"id": "obj-1", "name": "Onboarding Test", "objectKind": "project", "status": "in_progress"}]
     rows = key_rows if key_rows is not None else []
 
@@ -243,6 +260,34 @@ def _wire(page: Page, *, seed_objects: list = None,  # noqa: RUF013
                 cap["points"].append(body)
                 route.fulfill(status=200, content_type="application/json",
                               body=json.dumps({"id": "point-1", "content": body.get("content", "")}))
+                return
+            # #3514 (epic #1714 J4): the coming-soon click. The body is
+            # captured so the record's contract (which integration, which
+            # surface, the CLICK action) and the idempotency header are asserted
+            # from what the browser actually sent — never from the client
+            # module's own constants.
+            if path.endswith("/v1/data-sources/demand") and method == "POST":
+                body = json.loads(route.request.post_data or "{}")
+                cap["demand"].append({
+                    "body": body,
+                    "idempotency_key": route.request.headers.get("x-idempotency-key"),
+                })
+                if demand_remaining:
+                    status = demand_remaining.pop(0)
+                    route.fulfill(status=status, content_type="application/json",
+                                  body=json.dumps({"detail": {
+                                      "recorded": False,
+                                      "message": "the click was not recorded — please retry"}}))
+                    return
+                key = body.get("integration_key")
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({
+                                  "ok": True, "integration_key": key,
+                                  "org_key": "a" * 32,
+                                  "replayed": sum(1 for d in cap["demand"]
+                                                  if d["body"].get("integration_key") == key) > 1,
+                                  "click_count": sum(1 for d in cap["demand"]
+                                                     if d["body"].get("integration_key") == key)}))
                 return
             if path.endswith("/v1/onboarding/state") and method == "GET":
                 # #3428/#2937 (lane B3, review cycle 2 P2-2): the runtime seam
@@ -621,6 +666,176 @@ def test_coming_soon_modal_dialog_contract_and_skip_reaches_done(page: Page) -> 
     # Skip reaches done
     page.get_by_role("button", name="Skip", exact=True).click()
     expect(page.locator("div.done")).to_be_visible(timeout=10_000)
+
+
+# ── #3514 (epic #1714 J4): the coming-soon click is RECORDED ───────────
+
+def _open_grid(page: Page) -> None:
+    """Walk to the Data-sources step with the grid rendered (the #3513 prefix)."""
+    _seed_cookie(page, "u-onb")
+    _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
+    _walk_to_connect(page)
+    page.get_by_role("button", name="Skip for now").click()
+    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+
+
+def _open_coming_soon(page: Page, index: int = 0):
+    """Open the Nth coming-soon dialog; returns (dialog, tile key)."""
+    tile = page.locator(".integration-tile.coming-soon").nth(index)
+    key = tile.get_attribute("data-integration-key")
+    tile.focus()
+    page.keyboard.press("Enter")
+    dialog = page.locator("[role='dialog']")
+    expect(dialog).to_be_visible(timeout=5_000)
+    return dialog, key
+
+
+def test_coming_soon_click_is_recorded_with_its_success_state(page: Page) -> None:
+    """#3514: clicking an unbuilt tile RECORDS which integration, by which team.
+
+    The POST body is asserted from what the BROWSER sent — integration_key + the
+    `click` action + the mount's `surface`, and NO client-supplied `org_key` —
+    which is the record's whole contract, and the recorded state is asserted
+    inline in the dialog. The transient loading state cannot be sampled from a
+    sync Playwright handler (see `_wire`); it is pinned by the two JS suites.
+    """
+    _seed_cookie(page, "u-onb")
+    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
+    _walk_to_connect(page)
+    page.get_by_role("button", name="Skip for now").click()
+    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+
+    tile = page.locator(".integration-tile.coming-soon").first
+    key = tile.get_attribute("data-integration-key")
+    # the state-bearing aria-label (#3514's tile contract): name AND state.
+    label = tile.get_attribute("aria-label")
+    assert label and "coming soon" in label.lower(), f"tile aria-label must name its state: {label!r}"
+
+    tile.focus()
+    page.keyboard.press("Enter")
+    expect(page.locator("[role='dialog']")).to_be_visible(timeout=5_000)
+
+    primary = page.get_by_role("button", name="Register interest")
+    expect(primary).to_be_enabled()
+    primary.click()
+
+    # SUCCESS: the recorded state inline (and the live region is the polite one).
+    status = page.locator(".integration-demand-status")
+    expect(status).to_contain_text("Recorded", timeout=10_000)
+    assert status.get_attribute("aria-live") == "polite"
+    expect(status).to_contain_text("1 click from your team.")
+    expect(page.get_by_role("button", name="Dismiss")).to_be_visible()
+
+    assert len(cap["demand"]) == 1, cap["demand"]
+    sent = cap["demand"][0]
+    assert sent["body"] == {"integration_key": key, "action": "click", "surface": "wizard"}, sent
+    assert "org_key" not in sent["body"], "org_key is server-derived — the client must not send one"
+    assert sent["idempotency_key"], "the click must carry an idempotency key (a replay, not a double record)"
+
+
+def test_second_open_of_a_recorded_tile_does_not_record_twice(page: Page) -> None:
+    """#3514: J4's idempotent second click — no second record, no second toast.
+
+    The tile was already recorded on this mount, so re-opening it shows the
+    RECORDED state instead of a fresh primary: the user gets the existing state
+    rather than a duplicate demand row (the server-side replay rides the same
+    per-(mount, tile) idempotency key).
+    """
+    _seed_cookie(page, "u-onb")
+    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
+    _walk_to_connect(page)
+    page.get_by_role("button", name="Skip for now").click()
+    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+
+    tile = page.locator(".integration-tile.coming-soon").first
+    key = tile.get_attribute("data-integration-key")
+    tile.click()
+    page.get_by_role("button", name="Register interest").click()
+    expect(page.locator(".integration-demand-status")).to_contain_text("Recorded", timeout=10_000)
+    page.get_by_role("button", name="Dismiss").click()
+    expect(page.locator("[role='dialog']")).to_have_count(0)
+
+    # Re-open the SAME tile: the recorded state renders immediately.
+    page.locator(f'.integration-tile[data-integration-key="{key}"]').click()
+    dialog = page.locator("[role='dialog']")
+    expect(dialog).to_be_visible(timeout=5_000)
+    expect(page.locator(".integration-demand-status")).to_contain_text("Recorded", timeout=5_000)
+    assert page.get_by_role("button", name="Register interest").count() == 0, \
+        "a recorded tile must not offer a fresh primary — it shows the existing state"
+    expect(page.get_by_role("button", name="Dismiss")).to_be_visible()
+    assert len(cap["demand"]) == 1, f"a second open must not record again: {cap['demand']}"
+
+
+def test_demand_failure_names_itself_and_retry_records(page: Page) -> None:
+    """#3514: the error state is not swallowed, and Retry is the recovery.
+
+    A failed write answers 503 with `recorded: false`; the popup must say the
+    request was NOT recorded (never render the recorded state) and offer Retry.
+    The retry reuses the SAME idempotency key, so a write that did land is a
+    replay rather than a second row.
+    """
+    _seed_cookie(page, "u-onb")
+    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION,
+                demand_failures=[503])
+    _walk_to_connect(page)
+    page.get_by_role("button", name="Skip for now").click()
+    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+
+    tile = page.locator(".integration-tile.coming-soon").first
+    key = tile.get_attribute("data-integration-key")
+    tile.click()
+    page.get_by_role("button", name="Register interest").click()
+
+    status = page.locator(".integration-demand-status")
+    expect(status).to_contain_text("not recorded", timeout=10_000)
+    assert "Recorded —" not in status.inner_text(), \
+        "a failed write must never read as recorded"
+    retry = page.get_by_role("button", name="Retry")
+    expect(retry).to_be_visible()
+
+    retry.click()
+    expect(status).to_contain_text("Recorded", timeout=10_000)
+    expect(page.get_by_role("button", name="Dismiss")).to_be_visible()
+
+    assert len(cap["demand"]) == 2, cap["demand"]
+    assert [d["body"]["integration_key"] for d in cap["demand"]] == [key, key]
+    assert cap["demand"][0]["idempotency_key"] == cap["demand"][1]["idempotency_key"], \
+        "Retry must reuse the idempotency key, so a lost response replays instead of recording twice"
+
+
+def test_every_coming_soon_tile_captures_its_click(page: Page) -> None:
+    """#3514: no coming-soon tile loses its click — including a revealed one.
+
+    The inventory is under the ≤6 bound today, so NOTHING is hidden behind
+    "Show more" (asserted here, so this test cannot silently become a
+    first-paint-only check if the bound is ever hit). Every rendered coming-soon
+    tile is therefore walked: each one opens the dialog and records its OWN key.
+    The bound's reveal path is unit-tested (`visibleComingSoon` in
+    integrationsGrid.test.js) — a 3-tile inventory cannot exercise it in a
+    browser.
+    """
+    _seed_cookie(page, "u-onb")
+    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
+    _walk_to_connect(page)
+    page.get_by_role("button", name="Skip for now").click()
+    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+
+    assert page.get_by_role("button", name=re.compile(r"Show \\d+ more")).count() == 0, \
+        "every coming-soon tile is on first paint today — a reveal control would mean this test skipped one"
+    keys = page.locator(".integration-tile.coming-soon").evaluate_all(
+        "els => els.map(e => e.dataset.integrationKey)")
+    assert len(keys) >= 3, keys
+
+    for key in keys:
+        page.locator(f'.integration-tile[data-integration-key="{key}"]').click()
+        dialog = page.locator("[role='dialog']")
+        expect(dialog).to_be_visible(timeout=5_000)
+        page.get_by_role("button", name="Register interest").click()
+        expect(page.locator(".integration-demand-status")).to_contain_text("Recorded", timeout=10_000)
+        page.get_by_role("button", name="Dismiss").click()
+        expect(dialog).to_have_count(0)
+
+    assert [d["body"]["integration_key"] for d in cap["demand"]] == keys, cap["demand"]
 
 
 def test_owner_connect_step_mints_never_expiring_key_in_flow(page: Page) -> None:

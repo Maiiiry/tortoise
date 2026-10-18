@@ -1068,6 +1068,13 @@ input::placeholder, textarea::placeholder {
 }
 .integration-modal h3 { margin: 0 0 8px; font-size: 16px; }
 .integration-modal p { margin: 0 0 8px; font-size: 13px; line-height: 1.5; }
+/* #3514: the coming-soon dialog's post-action status region. The live region is
+   reserved space so a status appearing cannot shove the buttons out from under
+   a pointer that is already travelling to them (a moving target during a
+   `loading` state is the defect this prevents). */
+.integration-demand-status { margin: 0 0 10px; min-height: 0; }
+.integration-demand-status:empty { display: none; }
+.integration-demand-status p { margin: 0 0 4px; }
 .data-sources { display: flex; flex-direction: column; gap: 12px; }
 .harness-statuses { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
 .harness-status {

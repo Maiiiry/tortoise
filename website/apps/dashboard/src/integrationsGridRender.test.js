@@ -55,9 +55,14 @@ test('#3513: the step renders the grid through the ONE shared component', () => 
   const branch = dataSourcesBranch()
   assert.match(branch, /<MemorySources\s*\{\.\.\.memorySourcesProps\}\s*order=\{DATA_SOURCES_ORDER\}/,
     'the wizard mount must pass the explicit order')
-  // review P2: no `surface` prop — the component never read it, so it was
-  // dropped rather than left looking load-bearing.
-  assert.doesNotMatch(branch, /surface=/, 'the wizard mount must not pass a dead surface prop')
+  // #3514: `surface` is BACK, and this time it is READ — it is the request
+  // body's `surface` field (`tortoise/demand.py::DEMAND_PROPS`), so the wizard
+  // click is distinguishable from a Settings click in the demand record. The
+  // earlier P2 dropped it because nothing read it; the wizard mount now must
+  // pass its own value, and `demandCaptureRender.test.js` pins that the
+  // component consumes it.
+  assert.match(branch, /surface=\{DEMAND_SURFACE_WIZARD\}/,
+    'the wizard mount must record which surface the click came from')
   // review P2: the wizard is the ONE mount that knows the connect-step pick, so
   // it must pass it — null when no pick was established, so the 'claude' default
   // is never presented as a user choice.
@@ -105,8 +110,9 @@ test('#3513: MemorySources renders the tile grid as the single source-list prese
     'the grid is the list presentation')
   assert.match(src, /\{gridTiles\.map\(\(t\) => \{/, 'it maps the ordered tiles')
   // the SAME component is mounted at all three sites (the two live mounts plus
-  // the dead ARCHIVED block); no mount carries a `surface` prop — it was dead
-  // and dropped, so the tests below assert its absence
+  // the dead ARCHIVED block). #3514: the two LIVE mounts carry the surface they
+  // record; the dead block renders its own inline subset and is not a spread
+  // site, so it carries none.
   assert.equal((src.match(/<MemorySources/g) || []).length, 3,
     'Settings + wizard + the dead archived block')
 })
@@ -152,9 +158,13 @@ test('#3513: the grid order is a prop, never the array literal', () => {
   assert.match(src, /order: DATA_SOURCES_ORDER,/, 'the prop bundle declares the order explicitly')
   assert.match(src, /<MemorySources \{\.\.\.memorySourcesProps\} \/>/,
     'Settings spreads the same bundle (same order)')
-  // review P2: the `surface` prop was dead, so neither mount carries it
-  assert.doesNotMatch(src, /<MemorySources[^>]*surface=/,
-    'the dead surface prop must not be re-added to any mount')
+  // #3514: the surface a click came from rides the SAME bundle (Settings is the
+  // default) and the wizard overrides it, so no mount can forget to say where
+  // its click came from — and a third mount cannot appear without one.
+  assert.match(src, /surface: DEMAND_SURFACE_SETTINGS,/,
+    'the shared bundle carries the Settings surface')
+  assert.match(src, /<MemorySources[\s\S]{0,200}?surface=\{DEMAND_SURFACE_WIZARD\}/,
+    'the wizard mount overrides it — the two mounts genuinely differ')
   // the order itself is the pinned ship order, declared once in the module
   assert.deepEqual([...DATA_SOURCES_ORDER], ['agent_sessions', 'github_issues', 'github_documents'])
 })
