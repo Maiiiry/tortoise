@@ -212,8 +212,9 @@ def scan_nodes(
     """Validated node rows, ``{node_key: [dump_id, ...]}``, and any problems.
 
     Fail-closed on STRUCTURAL corruption — a non-integer ``dump_id``, a repeated
-    ``dump_id``, a non-dict prop bag, a non-list label set: these make the
-    measurement meaningless, because two rows would stand for one node.
+    ``dump_id``, a non-dict prop bag, an absent or non-list label set: these make
+    the measurement meaningless, because two rows would stand for one node, or a
+    node's own type was lost and ``RULE_UNTYPED`` would propose dropping it.
 
     Deliberately NOT fail-closed on **ambiguous node keys**. ``node_key`` prefers
     ``id`` / ``eventId`` / ``url`` / ``name``, and a real graph can carry two
@@ -257,7 +258,18 @@ def scan_nodes(
                 f"({type(prop_bag).__name__}: {prop_bag!r}) — that is CORRUPTION"
             )
             continue
-        if node.get("labels") is not None and not isinstance(node.get("labels"), list):
+        if node.get("labels") is None:
+            # ``dump_graph`` always emits ``"labels": [...]`` (possibly empty), so
+            # an absent/``null`` label set is a field the export LOST. Accepting it
+            # as "no labels" makes the node ``untyped``, and ``RULE_UNTYPED`` then
+            # proposes DROPPING it — corruption converted into a drop
+            # recommendation, indistinguishable from a legitimately kind-less row.
+            problems.append(
+                f"node dump_id {dump_id!r} carries no label set (labels is "
+                f"{type(node.get('labels')).__name__}) — that is CORRUPTION"
+            )
+            continue
+        if not isinstance(node.get("labels"), list):
             problems.append(
                 f"node dump_id {dump_id!r} carries a non-list label set "
                 f"({type(node.get('labels')).__name__}) — that is CORRUPTION"
@@ -316,6 +328,20 @@ def _pointer(props: Mapping[str, Any]) -> bool:
     return False
 
 
+def _non_empty_string(props: Mapping[str, Any], prop: str) -> str | None:
+    """The property's value if it is a string with non-whitespace content, else ``None``.
+
+    One normalisation for every "is this field present" question, so two counters
+    over the same field cannot disagree: ``field_presence`` and the provenance
+    ``matrix`` both read a whitespace-only value as ABSENT (a bare truthiness test
+    counted ``"   "`` as an authored node in one and not the other).
+    """
+    raw = props.get(prop)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 def _is_operator(props: Mapping[str, Any]) -> bool:
     """Whether this node is an operator — the SAME test :mod:`tortoise.retype` applies.
 
@@ -372,10 +398,19 @@ _classify = classify_provenance
 
 
 def _edge_rows(dump: Mapping[str, Any]) -> tuple[list[dict], list[str]]:
-    """Validated edge rows plus any problems. Fail-closed, like ``index_dump``."""
+    """Validated edge rows plus any problems. Fail-closed, like ``index_dump``.
+
+    A missing (or JSON ``null``) edge container is REFUSED, exactly as a missing
+    node list is: ``hosted_backup.dump_graph`` always emits ``"edges": [...]`` and
+    ``retype.apply_plan`` refuses the same shape, so its absence means the
+    artifact lost it. Accepting it as "a graph with no edges" is the worst case
+    for this instrument — every node has knowledge degree 0, so the default
+    predicate proposes dropping every claim, while ``knowledge_edges == 0`` makes
+    the topology verdict vacuously ``true`` and silently disables both warnings.
+    """
     raw = dump.get("edges")
     if raw is None:
-        return [], []
+        return [], [f"dump has no edge list ({type(raw).__name__})"]
     if not isinstance(raw, list):
         return [], [f"dump edges is not a list ({type(raw).__name__})"]
     problems: list[str] = []
@@ -535,7 +570,7 @@ def census(
 
         typed = prop != ABSENT and value != ABSENT
         pointer = pointer_edge[dump_id] or _pointer(props)
-        authored = bool(props.get("authoredBy")) if isinstance(props.get("authoredBy"), str) else False
+        authored = _non_empty_string(props, "authoredBy") is not None
         matrix_key = (
             f"typed={int(typed)} pointer={int(pointer)} authored={int(authored)}"
         )
@@ -692,12 +727,17 @@ def census(
             if node_class[dump_id] == "operator" and not kept_by_type_degree.get(dump_id)
         ),
     }
-    # ``retains_topology`` is a PRESERVATION verdict, so it is "no knowledge edge
-    # was severed" — not "some edge survived". `kept > 0` labelled a cut that
-    # severs three of every four knowledge edges the same as one that severs
-    # none, and this field is the verdict column an owner picks a rule from.
-    # ``kept_knowledge_edges`` / ``severed_knowledge_edges`` still carry the counts.
-    told["retains_topology"] = told["severed_knowledge_edges"] == 0
+    # ``retains_topology`` is a PRESERVATION verdict: it is true only when EVERY
+    # knowledge edge survives the cut. `kept > 0` labelled a cut that severs
+    # three of every four knowledge edges the same as one that severs none, and
+    # `severed == 0` stopped one step short — an edge whose BOTH endpoints are
+    # dropped is in neither ``kept`` nor ``severed``, so that form reported
+    # "topology preserved" for a cut that destroyed half the edges. This field is
+    # the verdict column an owner picks a rule from, so it reads
+    # ``kept == knowledge_edges`` (vacuously true for an edge-free graph).
+    # ``kept_knowledge_edges`` / ``severed_knowledge_edges`` /
+    # ``both_endpoints_dropped_edges`` still carry the counts.
+    told["retains_topology"] = told["kept_knowledge_edges"] == told["knowledge_edges"]
     told["kept_knowledge_edge_fraction"] = (
         round(told["kept_knowledge_edges"] / told["knowledge_edges"], 4)
         if told["knowledge_edges"]
@@ -836,11 +876,37 @@ def census(
             f"{told['severed_knowledge_edges']} knowledge edge(s) have an endpoint "
             "the predicate drops — retains_topology is false"
         )
+    if told["both_endpoints_dropped_edges"]:
+        warnings.append(
+            f"{told['both_endpoints_dropped_edges']} knowledge edge(s) lose BOTH "
+            "endpoints to the predicate — neither endpoint is 'severed', so only "
+            "this count reports them; retains_topology is false"
+        )
     if duplicate_key_groups:
         warnings.append(
             f"{len(duplicate_key_groups)} node key(s) are shared by more than one node "
             f"({len(duplicate_key_label_sets)} distinct label sets) — a decisions file "
             "cannot address those nodes unambiguously"
+        )
+    # The truncation signature. ``dump_graph`` refuses a torn read by construction
+    # (``node_count == source_node_count``), so a dump whose own declared counts
+    # disagree with what it carries is a PARTIAL artifact — and a dropped subgraph
+    # leaves no dangling edge, so none of the refusals above can see it. Measured
+    # silently, it produces a report whose counts describe a smaller population
+    # than the re-typing pass will consume.
+    for half, declared, counted in (
+        ("node", declared_nodes, len(rows)),
+        ("edge", declared_edges, len(edges)),
+    ):
+        if declared is ABSENT or declared == counted:
+            continue
+        if isinstance(declared, bool) or not isinstance(declared, int):
+            continue
+        warnings.append(
+            f"the dump declares {declared} {half}(s) but carries {counted} — a "
+            "declared-vs-counted disagreement is the signature of a TRUNCATED "
+            "artifact, so this census measured a population the dump does not "
+            "claim to describe"
         )
     if warnings:
         report["warnings"] = warnings
@@ -857,20 +923,25 @@ def census(
 # ── diff (the plan's own "and then the diff") ───────────────────────────────
 
 
-def flatten_counts(value: Any, prefix: str = "") -> dict[str, int]:
+def flatten_counts(value: Any, prefix: str = "") -> dict[str, int | float]:
     """``{dotted.path: number}`` for every number in a report. Deterministic.
 
     Booleans are NUMBERS here (``0`` / ``1``), not skipped: ``retains_topology``
     is the report's headline verdict, and a diff that dropped it would report
     "nothing moved" when the topology verdict flipped between two graphs — the
     one comparison this instrument's plan exists to make.
+
+    FLOATS are numbers too (``kept_knowledge_edge_fraction``,
+    ``degree.by_class.*.median``). An ``int``-only branch measured the report's
+    two headline magnitudes as absent, so a diff between two graphs whose
+    operator median degree moved 4 → 1 reported "nothing moved".
     """
-    out: dict[str, int] = {}
+    out: dict[str, int | float] = {}
     if isinstance(value, bool):
         if prefix:
             out[prefix] = int(value)
         return out
-    if isinstance(value, int):
+    if isinstance(value, (int, float)):
         out[prefix] = value
         return out
     if isinstance(value, Mapping):
@@ -923,7 +994,7 @@ def diff_census(
     after_report = census(after, rules=rules, fragment_max_chars=fragment_max_chars)
     left = flatten_counts(before_report)
     right = flatten_counts(after_report)
-    moved: dict[str, dict[str, int]] = {}
+    moved: dict[str, dict[str, int | float]] = {}
     for path in sorted(set(left) | set(right)):
         a, b = left.get(path, 0), right.get(path, 0)
         if a != b:

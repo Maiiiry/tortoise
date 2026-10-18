@@ -249,6 +249,32 @@ def test_provenance_field_presence_counts_non_empty_strings_only():
     assert report["provenance"]["distinct_pointer_values"] == 1
 
 
+def test_authored_counter_agrees_with_field_presence_on_whitespace():
+    """Two counters over one field must not disagree.
+
+    ``field_presence`` requires a non-whitespace string, while the provenance
+    ``matrix`` used bare truthiness — so a whitespace-only ``authoredBy`` counted
+    as authored in the matrix and NOT in ``fields``, i.e. one report, two answers
+    about one field.
+    """
+    nodes = [
+        _node(1, ["Point"], id="a", pointKind="statement", authoredBy="pi-agent",
+              provenanceSource="x.md", content="long enough statement for the fragment rule"),
+        _node(2, ["Point"], id="b", pointKind="statement", authoredBy="   ",
+              provenanceSource="x.md", content="long enough statement for the fragment rule"),
+        _node(3, ["Point"], id="c", pointKind="statement",
+              provenanceSource="x.md", content="long enough statement for the fragment rule"),
+    ]
+    report = census(_dump(nodes), rules=[RULE_ISOLATED])
+    assert report["provenance"]["fields"]["authoredBy"] == 1
+    authored = {
+        key: count
+        for key, count in report["provenance"]["matrix"].items()
+        if key.endswith("authored=1")
+    }
+    assert sum(authored.values()) == report["provenance"]["fields"]["authoredBy"]
+
+
 # ── degree ──────────────────────────────────────────────────────────────────
 
 
@@ -274,9 +300,16 @@ def test_provenance_edges_are_not_topology():
 
 
 def test_knowledge_degree_ignores_the_pointer_edge_but_counts_the_rest():
+    """The EXTRACTED node's knowledge degree excludes its ``extractedFrom`` edge.
+
+    Node 3 is the endpoint of one ``IMPL`` AND one ``extractedFrom`` edge, so its
+    knowledge degree is 1 when pointer edges are excluded and 2 when they are
+    counted. ``isolated_by_class == 0`` is false in both worlds and could not tell
+    them apart — the median is the discriminating assertion.
+    """
     report = census(_curated_shaped())
-    # node 3 (extracted) has ONE IMPL edge and ONE extractedFrom edge.
     assert report["edges_by_type"] == {"IMPL": 2, "extractedFrom": 1}
+    assert report["degree"]["by_class"]["extracted"]["median"] == 1
     assert report["degree"]["isolated_by_class"]["extracted"] == 0
 
 
@@ -442,8 +475,61 @@ def test_retains_topology_is_true_only_when_nothing_is_severed():
     report = census(_curated_shaped(), rules=[RULE_ISOLATED])
     topology = report["predicate"]["topology"]
     assert topology["severed_knowledge_edges"] == 0
+    assert topology["kept_knowledge_edges"] == topology["knowledge_edges"]
     assert topology["retains_topology"] is True
     assert topology["kept_knowledge_edge_fraction"] == 1.0
+
+
+def test_retains_topology_is_false_when_both_endpoints_are_dropped():
+    """``severed == 0`` is NOT preservation: an edge can lose BOTH endpoints.
+
+    ``severed`` counts exactly one kept endpoint. An edge whose both endpoints the
+    predicate drops lands in ``both_endpoints_dropped_edges`` only, so the
+    ``severed == 0`` verdict read "topology preserved" for a cut that destroyed
+    the edges entirely — in the same report as
+    ``kept_knowledge_edge_fraction: 0.0``. The verdict is ``kept == knowledge_edges``.
+    """
+    nodes = [
+        _node(1, ["Point"], id="op-1", is_operator=True, op_type="IMPL", content="IMPL(a,c)"),
+        _node(4, ["Point"], id="op-2", is_operator=True, op_type="NAND", content="NAND(b,c)"),
+        _node(2, ["Point"], id="a", pointKind="statement", provenanceSource="x.md",
+              content="a claim extracted from a captured conversation transcript"),
+        _node(3, ["Point"], id="b", pointKind="statement", provenanceSource="x.md",
+              content="another claim extracted from the same captured transcript"),
+    ]
+    edges = [_edge(1, 4, "IMPL"), _edge(1, 2, "IMPL"), _edge(2, 3, "INPUT")]
+    report = census(_dump(nodes, edges), rules=[RULE_EXTRACTED])
+    topology = report["predicate"]["topology"]
+    # 2 and 3 are both dropped: the INPUT edge loses BOTH endpoints, so it is in
+    # neither ``kept`` nor ``severed``. One edge survives, so the "retains NONE"
+    # warning does not fire and the verdict alone has to carry the truth.
+    assert topology["knowledge_edges"] == 3
+    assert topology["kept_knowledge_edges"] == 1
+    assert topology["severed_knowledge_edges"] == 1
+    assert topology["both_endpoints_dropped_edges"] == 1
+    assert topology["retains_topology"] is False
+    assert topology["kept_knowledge_edge_fraction"] == 0.3333
+    assert not any("retains NONE" in w for w in report["warnings"])
+    assert any("BOTH endpoints" in w for w in report["warnings"])
+
+
+def test_a_cut_that_destroys_every_edge_by_both_endpoints_is_not_preserving():
+    """The pure both-dropped case: severed == 0, kept == 0, verdict must be false."""
+    nodes = [
+        _node(1, ["Point"], id="a", pointKind="statement", provenanceSource="x.md",
+              content="a claim extracted from a captured conversation transcript"),
+        _node(2, ["Point"], id="b", pointKind="statement", provenanceSource="x.md",
+              content="another claim extracted from the same captured transcript"),
+    ]
+    report = census(_dump(nodes, [_edge(1, 2, "IMPL")]), rules=[RULE_EXTRACTED])
+    topology = report["predicate"]["topology"]
+    assert topology["severed_knowledge_edges"] == 0  # nothing "severed" …
+    assert topology["both_endpoints_dropped_edges"] == 1  # … both endpoints gone
+    assert topology["kept_knowledge_edges"] == 0
+    assert topology["kept_knowledge_edge_fraction"] == 0.0
+    assert topology["retains_topology"] is False
+    assert any("retains NONE" in w for w in report["warnings"])
+    assert any("BOTH endpoints" in w for w in report["warnings"])
 
 
 def test_a_cut_that_severs_every_edge_is_a_warning_not_a_silent_success():
@@ -588,11 +674,59 @@ def test_non_list_label_set_is_refused():
         census(dump)
 
 
+def test_absent_label_set_is_refused():
+    """A LOST label set is corruption, not "no labels".
+
+    ``dump_graph`` always emits a label list, and ``_labels`` returning ``[]`` for
+    an absent one makes the node ``untyped`` — so ``RULE_UNTYPED`` proposes DROPPING
+    a node whose labels an export merely lost, indistinguishable from a
+    legitimately kind-less ``:Source`` row.
+    """
+    for lost in (None, "absent"):
+        dump = _curated_shaped()
+        if lost == "absent":
+            del dump["nodes"][0]["labels"]
+        else:
+            dump["nodes"][0]["labels"] = None
+        with pytest.raises(CensusError, match="no label set"):
+            census(dump)
+
+
 def test_non_list_edge_container_is_refused():
     dump = _curated_shaped()
     dump["edges"] = {"not": "a list"}
     with pytest.raises(CensusError, match="edges is not a list"):
         census(dump)
+
+
+def test_absent_edge_list_is_refused():
+    """A dump with no ``edges`` key would census as a ZERO-EDGE graph.
+
+    Accepted as empty, every node has knowledge degree 0 — so the default cut
+    proposes dropping every claim — while ``knowledge_edges == 0`` makes
+    ``retains_topology`` vacuously true and disables BOTH warnings. That is the
+    false green this instrument exists to prevent, so the edge half is
+    fail-closed exactly like the node half (``dump_graph`` always emits the key;
+    ``retype.apply_plan`` refuses the same shape).
+    """
+    for lost in (None, "absent"):
+        dump = _curated_shaped()
+        if lost == "absent":
+            del dump["edges"]
+        else:
+            dump["edges"] = None
+        with pytest.raises(CensusError, match="no edge list"):
+            census(dump)
+
+
+def test_an_explicitly_empty_edge_list_is_still_measured():
+    """Refusing a MISSING key must not refuse a dump that really has no edges."""
+    dump = _curated_shaped()
+    dump["edges"] = []
+    dump["edge_count"] = 0
+    report = census(dump)
+    assert report["totals"]["edges"] == 0
+    assert report["predicate"]["topology"]["knowledge_edges"] == 0
 
 
 def test_edge_without_type_is_refused():
@@ -605,6 +739,22 @@ def test_edge_without_type_is_refused():
 def test_missing_node_list_is_refused():
     with pytest.raises(CensusError, match="no node list"):
         census({"format": "tortoise-logical-dump-v1"})
+
+
+def test_declared_vs_counted_disagreement_is_warned():
+    """A truncated dump leaves no dangling edge — only the counts betray it."""
+    dump = _curated_shaped()
+    dump["edges"] = dump["edges"][:1]  # the subgraph's edges are gone with it
+    dump["node_count"] = 6
+    report = census(dump)
+    assert report["snapshot"]["declared_edge_count"] == 3
+    assert report["snapshot"]["counted_edge_count"] == 1
+    assert any(
+        "declares 3 edge(s) but carries 1" in w for w in report["warnings"]
+    )
+    # Reconcile the declaration and the warning goes away.
+    dump["edge_count"] = 1
+    assert not any("declares" in w for w in census(dump).get("warnings", []))
 
 
 # ── diff ────────────────────────────────────────────────────────────────────
@@ -624,6 +774,37 @@ def test_flatten_counts_records_booleans_as_numbers():
     assert flat["predicate.keep"] == report["predicate"]["keep"]
     assert flat["predicate.topology.retains_topology"] in (0, 1)
     assert not any(isinstance(v, bool) for v in flat.values())
+
+
+def test_flatten_counts_records_floats_as_numbers():
+    """The report's two headline MAGNITUDES are floats, so they must be diffable.
+
+    ``kept_knowledge_edge_fraction`` and ``degree.by_class.*.median`` were
+    invisible to an ``int``-only branch: diffing two graphs whose operator median
+    knowledge degree moved 4 → 1 produced ``moved == {}``, i.e. the instrument
+    reported "nothing moved" for a real move.
+    """
+    report = census(_curated_shaped())
+    flat = flatten_counts(report)
+    assert flat["predicate.topology.kept_knowledge_edge_fraction"] == 0.5
+    assert flat["degree.by_class.operator.median"] == 2
+    assert isinstance(flat["predicate.topology.kept_knowledge_edge_fraction"], float)
+
+    # …and a float that MOVES appears in ``moved``.
+    def shaped(edges: list[dict]) -> dict:
+        nodes = [
+            _node(1, ["Point"], id="op", is_operator=True, op_type="IMPL",
+                  content="IMPL(op,claim)"),
+            _node(2, ["Point"], id="claim", pointKind="statement",
+                  content="a statement comfortably longer than the fragment threshold"),
+        ]
+        return _dump(nodes, edges)
+
+    two_edges = shaped([_edge(1, 2, "IMPL"), _edge(2, 1, "NAND")])
+    one_edge = shaped([_edge(1, 2, "IMPL")])
+    diff = diff_census(two_edges, one_edge)
+    assert diff["moved"]["degree.by_class.operator.median"]["before"] == 2
+    assert diff["moved"]["degree.by_class.operator.median"]["after"] == 1
 
 
 def test_diff_reports_only_counts_that_moved():
@@ -816,11 +997,28 @@ def test_cli_refuses_a_corrupt_dump_with_exit_2(tmp_path, capsys):
     assert captured.out == ""
 
 
-def test_cli_refuses_an_unknown_rule_before_reading_the_dump(tmp_path):
+def test_cli_refuses_an_unknown_rule_before_reading_the_dump(tmp_path, capsys):
+    """Usage errors are exit ``1`` and are raised BEFORE the dump is touched.
+
+    The dump path here does not exist, so this case would also raise
+    ``SystemExit`` from ``_load_json`` — hence the stderr assertion AND the second
+    case below, which points at a VALID dump: on an implementation that validated
+    rules only after loading, that one would census and return ``0``/``2``.
+    """
     from tools.graph_census import main
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as missing:
         main(["--dump", str(tmp_path / "missing.json"), "--rules", "nonsense,isolated"])
+    assert missing.value.code == 1
+    assert "unknown id" in capsys.readouterr().err
+
+    valid = _write(tmp_path, _curated_shaped(), "valid.json")
+    out = tmp_path / "census.json"
+    with pytest.raises(SystemExit) as existing:
+        main(["--dump", str(valid), "--rules", "nonsense", "--out", str(out)])
+    assert existing.value.code == 1
+    assert "unknown id" in capsys.readouterr().err
+    assert not out.exists()  # refused before anything was measured or written
 
 
 def test_cli_diff_mode(tmp_path, capsys):
@@ -843,7 +1041,9 @@ def test_cli_usage_errors_exit_1_not_the_refusal_code(tmp_path):
     """``2`` means REFUSED (a dump that cannot be measured); usage is ``1``.
 
     argparse's default is ``2``, so a caller keying on the exit code could not
-    tell a mistyped flag from corruption.
+    tell a mistyped flag from corruption. Every flag-value branch is pinned here,
+    because the documented split used to be contradicted in BOTH directions: an
+    unknown rule id exited 1 while ``--rules ""`` / negative numbers exited 2.
     """
     from tools.graph_census import main
 
@@ -852,14 +1052,27 @@ def test_cli_usage_errors_exit_1_not_the_refusal_code(tmp_path):
     assert no_dump.value.code == 1
 
     dump_path = _write(tmp_path, _curated_shaped())
-    with pytest.raises(SystemExit) as samples_with_diff:
-        main(["--dump", str(dump_path), "--diff", str(dump_path), "--samples", "3"])
-    assert samples_with_diff.value.code == 1
+    usage_cases = (
+        ["--dump", str(dump_path), "--diff", str(dump_path), "--samples", "3"],
+        ["--dump", str(dump_path), "--rules", ""],
+        ["--dump", str(dump_path), "--rules", "isolated,isolated"],
+        ["--dump", str(dump_path), "--samples", "-1"],
+        ["--dump", str(dump_path), "--fragment-max-chars", "-5"],
+    )
+    for argv in usage_cases:
+        with pytest.raises(SystemExit) as usage:
+            main(argv)
+        assert usage.value.code == 1, argv
 
     # …and a genuinely refused dump still exits 2, so the two stay distinct.
     corrupt = _curated_shaped()
     corrupt["edges"].append(_edge(1, 999, "IMPL"))
     assert main(["--dump", str(_write(tmp_path, corrupt, "bad.json"))]) == 2
+
+    # …as does a dump with no edge list (the zero-edge false green).
+    edgeless = _curated_shaped()
+    del edgeless["edges"]
+    assert main(["--dump", str(_write(tmp_path, edgeless, "edgeless.json"))]) == 2
 
 
 def test_cli_requires_a_dump(tmp_path):

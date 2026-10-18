@@ -16,18 +16,22 @@ output is a report of counts per class plus the proposed keep/drop predicate.
     python tools/graph_census.py --dump snapshot.json --fragment-max-chars 60
     python tools/graph_census.py --dump snapshot.json --rules extracted,isolated
 
-Exit codes: ``0`` ok · ``1`` usage/IO (a bad flag combination, a missing or
-non-JSON file) · ``2`` refused (the dump itself is unusable — corruption, a
-dangling edge, an unknown rule id — and the problem list is on stderr).
-Argument errors therefore exit ``1``, not argparse's default ``2``: a caller must
-be able to tell "I passed the wrong flags" from "this dump cannot be measured"
-without parsing stderr.
+Exit codes: ``0`` ok · ``1`` usage/IO (a flag mistake — an unknown or empty
+``--rules``, a negative ``--samples`` / ``--fragment-max-chars``, ``--samples``
+with ``--diff``, a missing or non-JSON file) · ``2`` refused (the dump itself is
+unusable — corruption, a truncated artifact, a dangling edge — and the problem
+list is on stderr). Argument errors therefore exit ``1``, not argparse's default
+``2``: a caller must be able to tell "I passed the wrong flags" from "this dump
+cannot be measured" without parsing stderr. Every flag-value mistake is validated
+by argparse (a ``type=`` callable raising ``ArgumentTypeError``), so it takes the
+tested ``error()`` path and cannot drift into the refusal code.
 
 Why the refusals exist: a census that silently measured a different population
 than the re-typing pass will consume is worse than no census — it would be a
-number an owner decides on. So a malformed dump, an unknown rule id, a dangling
+number an owner decides on. So a malformed dump, a truncated artifact, a dangling
 edge or a duplicate node identity is refused with the full problem list rather
-than reported around.
+than reported around. (An unknown rule id is refused by :func:`census` too; the
+CLI validates ``--rules`` first, as the usage error it is.)
 """
 
 from __future__ import annotations
@@ -78,14 +82,37 @@ def _dump_json(payload: object, path: Path | None, what: str) -> None:
 
 
 def _parse_rules(raw: str) -> list[str]:
+    """Parse ``--rules``, refusing a bad value as a USAGE error (exit ``1``).
+
+    ``ArgumentTypeError`` is what argparse turns into ``error()``; every adjacent
+    branch in here used to raise ``CensusError`` (or a bare ``SystemExit``), which
+    meant a mistyped rule id and a corrupt dump were indistinguishable to a caller
+    keying on the exit code — the exact ambiguity this CLI's split exists to remove.
+    """
     rules = [item.strip() for item in raw.split(",") if item.strip()]
+    if not rules:
+        raise argparse.ArgumentTypeError(
+            f"no rule id selected; known ids are {list(DEFAULT_RULES)!r}"
+        )
     unknown = [rule for rule in rules if rule not in DEFAULT_RULES]
     if unknown:
-        raise SystemExit(
-            f"--rules: unknown id(s) {sorted(unknown)!r}; known ids are "
-            f"{list(DEFAULT_RULES)!r}"
+        raise argparse.ArgumentTypeError(
+            f"unknown id(s) {sorted(unknown)!r}; known ids are {list(DEFAULT_RULES)!r}"
         )
+    if len(set(rules)) != len(rules):
+        raise argparse.ArgumentTypeError(f"repeated id(s) in {rules!r}")
     return rules
+
+
+def _non_negative_int(raw: str) -> int:
+    """An integer flag value, refusing a negative one as a USAGE error (exit ``1``)."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not an integer: {raw!r}") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0 (got {value})")
+    return value
 
 
 class _UsageParser(argparse.ArgumentParser):
@@ -126,14 +153,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--fragment-max-chars",
-        type=int,
+        type=_non_negative_int,
         default=FRAGMENT_MAX_CHARS,
         metavar="N",
         help=f"fragment threshold in characters (default: {FRAGMENT_MAX_CHARS})",
     )
     parser.add_argument(
         "--samples",
-        type=int,
+        type=_non_negative_int,
         default=0,
         metavar="N",
         help="include up to N dropped nodes per rule for human review (default: 0)",
