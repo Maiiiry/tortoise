@@ -87,6 +87,12 @@ the list WAS read and the lane's workspace is absent, the lane is **terminal**:
   * ``RETIRED``     — no session file resolves; never nudge, never dispatch,
     never route.
 
+⛔ The one exemption is a PROCESS lane (#8999, ``PROC:<pid>``): it never WAS a
+cmux workspace — the cell launch path starts a lane as a ``nohup`` child of a
+shell — so its synthetic workspace is registered as present. Otherwise a running
+lane would be retired by the reconciliation whose whole job is to retire lanes
+that are gone.
+
 A terminal lane is reported and is NOT live, NOT free and NOT dispatchable.
 "Reported" means never SILENTLY dropped, and it is a statement about ORPHANS: a
 registry row that is not a lane record (#8845) leaves `rows`, but every dropped
