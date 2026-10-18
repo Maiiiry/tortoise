@@ -2107,6 +2107,67 @@ def test_a_pid_a_cmux_record_already_carries_is_not_emitted_twice(monkeypatch) -
         "an ENDED cmux record must not mask the live process that recycled its pid")
 
 
+def test_a_record_with_a_different_cwd_does_not_mask_a_recycled_pid(monkeypatch) -> None:
+    """⛔ A LIVE PID IS NOT THE SAME PROCESS — only a matching CWD proves it is.
+
+    `cmux sessions list --all` is a durable HISTORY that keeps ENDED sessions for
+    ever, and pids are recycled (macOS wraps at ~99 998), so "the pid is alive" and
+    "the pid was recycled onto an ended record" are the SAME observation: `pid_alive`
+    proves only that SOME process holds the pid, never that the record describes it.
+
+    Masking on the pid alone therefore hid a live `pi` that carries a recycled pid.
+    That process has no cmux workspace of its own — the process table is its only
+    evidence — so its lane vanished while the store still read MEASURED, and the
+    gate answered "nobody holds it" about a running lane: the fail-open #8999
+    exists to close (review of #9016). The record names a cwd and the process runs
+    in one, so the two can be told apart; only the SAME cwd is the same lane.
+    """
+    cmux = [{"agent": "pi", "workspace_id": "WS-1", "pid": 900,
+             "cwd": "/tmp/wt-a"}]
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: (
+        cmux, fs.LIVE_STORE_CMUX_PLURAL, ""))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 900, "ppid": 1}], ""))
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 900)
+
+    # A DIFFERENT cwd: provably a different lane, so the process is published.
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({900: "/tmp/wt-b"}, ""))
+    live = fs.live_sessions()
+    assert sorted(live) == [f"{fs.PROC_WS_PREFIX}900", "WS-1"], (
+        "a record whose cwd is another worktree must not mask the live process")
+    assert live[f"{fs.PROC_WS_PREFIX}900"][0]["cwd"] == "/tmp/wt-b", (
+        "the process's OWN cwd is what attributes its lane")
+    assert live.measured is True
+
+    # THE SAME cwd (spelled differently): one lane measured twice, emitted once.
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({900: "/tmp/wt-a/"}, ""))
+    live = fs.live_sessions()
+    assert list(live) == ["WS-1"], "the same lane must not be enumerated twice"
+    assert live.measured is True
+
+    # AND WHEN THE PROCESS CWD CANNOT BE READ the record is NOT a match: the pid is
+    # not shown to be that record's process, so the store is UNMEASURED (fail-closed)
+    # rather than answering a measured "nobody holds it" from a comparison that did
+    # not happen.
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({}, ""))
+    live = fs.live_sessions()
+    assert live.measured is False
+    assert "900" in live.error
+
+    # SEVERAL RECORDS ON ONE PID: a cwd match on ANY of them is the same lane, so the
+    # verdict cannot depend on the payload's order (a reused workspace accumulates
+    # records). WS-1 names another worktree, WS-2 names the process's own — last-wins
+    # bookkeeping would publish a spurious `PROC:` lane for a lane already measured.
+    both = [cmux[0], {"agent": "pi", "workspace_id": "WS-2", "pid": 900,
+                      "cwd": "/tmp/wt-b"}]
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: (
+        both, fs.LIVE_STORE_CMUX_PLURAL, ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({900: "/tmp/wt-b"}, ""))
+    live = fs.live_sessions()
+    assert sorted(live) == ["WS-1", "WS-2"], (
+        "a cwd match on ANY record for the pid is the same lane")
+    assert live.measured is True
+
+
 def test_a_record_with_no_workspace_does_not_mask_a_live_process(monkeypatch) -> None:
     """⛔ A RECORD THAT MASKS A PID MUST ALSO PUBLISH ONE.
 

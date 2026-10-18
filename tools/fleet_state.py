@@ -1391,7 +1391,9 @@ def live_sessions() -> LiveSessions:
     twice, so it is not emitted a second time — but ONLY while that record is a
     READING: ``--all`` is a durable HISTORY that keeps ended sessions, and pids are
     recycled, so a record whose pid is alive NOW is the only one that can prove a
-    live process was already counted.
+    live process was already counted, AND the record must not be placeable
+    elsewhere: when the record names a cwd and the process runs in a DIFFERENT one,
+    they are two lanes, so the process is still published.
 
     ⛔ ONE CWD IS ONE LANE. Several pi processes share a worktree routinely (a
     ``task`` child runs in its parent's cwd; a respawned lane overlaps its
@@ -1420,7 +1422,12 @@ def live_sessions() -> LiveSessions:
     """
     recs, cmux_source, cmux_error = cmux_session_records()
     result = LiveSessions()
-    cmux_pids: set[int] = set()
+    # The pids a PUBLISHED record claims, and EVERY cwd those records say the pid ran
+    # in (a record without one cannot place itself — see the mask below). A set, not a
+    # single value: the durable store can hold several records for one pid (a reused
+    # workspace), and last-wins would make the mask depend on payload order.
+    claimed: set[int] = set()
+    rec_cwds: dict[int, set[str]] = {}
     for s in recs:
         if s.get("agent") != "pi":
             continue
@@ -1447,14 +1454,56 @@ def live_sessions() -> LiveSessions:
         # store MEASURED, so the gate answers "nobody holds it" about a running
         # lane. This is `row_binds_evidence`'s rule, applied to the join.
         if pid and pid_alive(pid):
-            cmux_pids.add(pid)
+            claimed.add(pid)
+            c = str(s.get("cwd") or "")
+            if c:
+                rec_cwds.setdefault(pid, set()).add(c)
 
     procs, proc_error = pi_processes()
     if not proc_error:
-        candidates = [r for r in procs if r["pid"] not in cmux_pids]
-        cwds, cwd_error = process_cwds([r["pid"] for r in candidates])
+        # ⛔ AND A LIVE PID IS NOT A PROCESS. `pid_alive` proves only that SOME
+        # process holds the pid — `--all` keeps ENDED sessions for ever and pids are
+        # recycled (macOS wraps at ~99 998), so "recycled onto an ended record" and
+        # "a live pid" are the SAME observation. Masking on it therefore drops the
+        # live `pi` that now carries the pid: it has no cmux workspace of its own, so
+        # the process table is its only evidence, and with it gone the store still
+        # reads MEASURED — the gate answers "nobody holds it" about a running lane.
+        # The reader already holds the identity signal: the cwd the record claims and
+        # the cwd the process runs in. A recorded pid is masked only when the record
+        # cannot place itself anywhere else (no cwd) or the two cwds are the SAME
+        # lane; when both are known and differ they are provably different lanes.
+        # The cwds every mask decision depends on are read BEFORE the filter.
+        read_pids = [
+            r["pid"] for r in procs
+            if r["pid"] not in claimed or rec_cwds.get(r["pid"])
+        ]
+        cwds, cwd_error = process_cwds(read_pids)
         if cwd_error:
             proc_error = cwd_error
+
+        def _already_counted(pid: int) -> bool:
+            """Is this live process a lane a PUBLISHED record already speaks for?"""
+            if pid not in claimed:
+                return False
+            recorded = rec_cwds.get(pid) or set()
+            if not recorded:
+                # The record cannot place itself elsewhere, so it is the reading
+                # that proves this process was already counted.
+                return True
+            pc = cwds.get(pid) or ""
+            if not pc:
+                # ⛔ AN UNREAD PROCESS CWD IS NOT A MATCH. It cannot be shown to BE
+                # this process, so the pid stays a candidate with no cwd: it lands
+                # in `unresolved`, and because it is ALIVE the store goes UNMEASURED
+                # (`measured=False`) with the pid named — an INCOMPLETE board, never
+                # a measured "nobody holds it".
+                return False
+            real_pc = _realpath(pc) or pc
+            # ANY recorded cwd that is this one is the same lane; a record that names
+            # only OTHER worktrees is a different lane, so the process is published.
+            return any((_realpath(rc) or rc) == real_pc for rc in recorded)
+
+        candidates = [r for r in procs if not _already_counted(r["pid"])]
         # ⛔ THE LANES THAT *WERE* ATTRIBUTED ARE PUBLISHED EVEN WHEN THE LEG IS
         # INCOMPLETE — including the ones read beside an unresolvable pid. The
         # verdict is withheld (below), but the evidence is not thrown away with it.
