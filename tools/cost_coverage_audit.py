@@ -174,10 +174,23 @@ def check_bindings() -> list[str]:
     invisible too: a ``METRIC`` binding that names no family says nothing about
     the series it claims, so it is drift, not a skip. An incomplete declaration
     must not buy a clean matrix.
+
+    ``Binding.kind`` is checked against the declared vocabulary FIRST, and it is
+    the one field that silently escaped every other check: ``writers()`` /
+    ``readers()`` / ``metrics()`` are ``b.kind == <const>`` filters, so a typo'd
+    kind matched none of them — this check skipped it (not ``METRIC``, and a real
+    function is callable), ``check_dead_hooks`` fell through to the dimension's
+    reader, and ``unbacked_dimensions()`` saw a non-empty tuple so the summary's
+    figure stayed 0. The vocabulary is declared in ``cd.binding_kinds()``.
     """
     findings: list[str] = []
     for dim in cd.dimensions():
         for binding in dim.bindings:
+            if binding.kind not in cd.binding_kinds():
+                findings.append(
+                    f"{dim.name}: binding {binding.dotted} has undeclared kind "
+                    f"{binding.kind!r} (declared: "
+                    f"{', '.join(cd.binding_kinds())})")
             target = _safe_resolve(binding, findings)
             if target is None:
                 continue

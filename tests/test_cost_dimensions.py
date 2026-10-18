@@ -702,6 +702,50 @@ def test_a_renamed_metric_family_is_drift():
     assert audit.check_bindings() == []
 
 
+def test_an_undeclared_binding_kind_is_drift():
+    """MUTATION: a typo'd ``Binding.kind`` falls into NONE of the three buckets.
+
+    ``writers()`` / ``readers()`` / ``metrics()`` are all ``b.kind == <const>``
+    filters, so a kind outside the vocabulary matched nothing and the binding
+    silently vanished from the substrate while every gate stayed green:
+    ``check_bindings`` skipped it (not ``METRIC``, and the real function IS
+    callable), ``check_dead_hooks`` fell through ``dim.writers() or
+    dim.readers()`` to the dimension's READER and never evaluated the typo'd
+    writer for a production call site — the #4493 "registered, exported and tested
+    while never incremented in production" defect this gate exists to catch — and
+    ``unbacked_dimensions()`` saw a non-empty ``bindings`` tuple, so the
+    operator-facing ``unmeasured-and-undeclared`` figure could not move.
+
+    ``Dimension.state`` and ``Cardinality.lifetime`` already have this check; this
+    is the field that decides WHICH dead-hook predicate runs.
+    """
+    assert cd.binding_kinds() == (cd.WRITER, cd.READER, cd.METRIC)
+    dim = cd.by_name("egress")
+    # A dimension that declares BOTH a writer and a reader: the typo'd writer is
+    # the one that disappears, and the reader is what the dead-hook check falls
+    # through to.
+    assert dim.writers() and dim.readers(), "mutation needs both arms present"
+    typo = dataclasses.replace(
+        next(b for b in dim.writers() if b.attr == "record_egress"), kind="wrter")
+    others = tuple(b for b in dim.bindings if b.attr != "record_egress")
+    rest = tuple(d for d in cd.DIMENSIONS if d.name != "egress")
+    mutated = dataclasses.replace(dim, bindings=(typo, *others))
+    # The hole, stated: the typo'd kind is in no bucket, so the writer is gone.
+    assert mutated.writers() == (), mutated.writers()
+    assert mutated.readers(), "the dead-hook check would fall through to a reader"
+    with _declaring(mutated, *rest):
+        findings = audit.check_bindings()
+        assert any("undeclared kind 'wrter'" in f for f in findings), findings
+        assert any("record_egress" in f for f in findings), findings
+        # The headline figure moves too, so the operator-facing 0 is not a lie.
+        assert cd.unbacked_dimensions() == ("egress",)
+        assert "unmeasured-and-undeclared: 1" in cd.render_matrix()
+        assert audit.audit(_ROOT)["bindings"], "audit() dropped the kind check"
+    # The declared kinds are the legal ones (the OTHER direction, unmutated).
+    assert audit.check_bindings() == []
+    assert cd.unbacked_dimensions() == ()
+
+
 # ── 3. no dead hook ──────────────────────────────────────────────────────
 
 
