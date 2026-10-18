@@ -2071,6 +2071,18 @@ def invitation_rescind(cp, invitation_id: str, org_id: str,
     Idempotent for already-revoked invites (mirrors the registry SDK); an
     ACCEPTED (used) invite cannot be rescinded — the membership already
     exists.
+
+    #8089: 'expired' is idempotent too, for the same reason 'revoked' is. Until
+    the clock-expiry sweep existed, nothing ever wrote 'expired' for a clock
+    expiry, so a dead link still read ``pending`` here and the
+    status-conditional PATCH below matched — this call answered
+    ``{"revoked": True}``. Now either half of that fix RETIRES the row (the
+    scheduled sweep, or the mint-path flip for that org+email), and the same
+    admin call fell through to the concurrent-accept 409 — on a row the
+    dashboard's pending list can still show (``pending_invitations`` has no
+    expiry filter). 'expired' is as terminal as 'revoked', and the terminal
+    answer must not depend on WHICH mechanism retired the row, so both are
+    answered idempotently.
     """
     mem = membership_for_user_org(cp, actor_user_id, org_id)
     if not mem or mem["role"] not in ("owner", "admin"):
@@ -2087,7 +2099,11 @@ def invitation_rescind(cp, invitation_id: str, org_id: str,
     if inv.get("status") == "accepted":
         raise InvitationError(
             "Invitation already accepted — cannot rescind", status=409)
-    if inv.get("status") == "revoked":
+    if inv.get("status") in ("revoked", "expired"):
+        # 'expired' joins 'revoked': both are terminal, so both are a no-op
+        # success (#8089). The row's status is deliberately NOT rewritten —
+        # the expiry instant is the truth of when the invite died (only admin
+        # expire-now stamps ``expires_at``).
         return {"revoked": True, "already": True,
                 "invitation_id": invitation_id}
     # Status-conditional PATCH + re-read (code-review P2, PR #864): a

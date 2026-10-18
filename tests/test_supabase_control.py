@@ -1572,6 +1572,37 @@ class TestExpiredInvitationRemint:
                                     user_email="bob@example.com")
         assert ei.value.status == 400
         assert fake.tables["org_memberships"] == []
+
+    def test_rescind_of_a_materialised_expired_row_is_idempotent(self, fake):
+        """The THIRD reader of this status must not 409 on a retired row.
+
+        ``DELETE /v1/invites/{id}`` → ``invitation_rescind`` is the admin
+        surface for exactly the rows the dashboard lists, and
+        ``pending_invitations`` (``GET /v1/invites``) filters ``status`` with no
+        expiry filter — so an admin can act on a row a sweep has just retired.
+        Before #8089 nothing wrote 'expired' for a clock expiry, so the
+        status-conditional PATCH matched and the call answered
+        ``{"revoked": True}``; materialising the terminal state must not turn
+        that same admin call (or a retried one) into a 409.
+        """
+        fake.seed("org_memberships", [{
+            "user_id": _U3, "org_id": "team-1", "role": "owner",
+            "status": "active",
+        }])
+        inv = invitation_mint(fake, "team-1", "bob@example.com", "member",
+                              "owner-1")
+        assert expire_stale_invitations(
+            fake, now=(datetime.now(UTC) + timedelta(days=30)).isoformat()) == 1
+        assert fake.tables["invitations"][0]["status"] == "expired"
+
+        result = invitation_rescind(fake, inv["id"], "team-1", _U3)
+        assert result == {"revoked": True, "already": True,
+                          "invitation_id": inv["id"]}
+        # Terminal means terminal: rescind answers, it does not re-classify —
+        # the expiry instant stays the truth of when the invite died.
+        assert fake.tables["invitations"][0]["status"] == "expired"
+        # Idempotent on the retry too (the dashboard double-click case).
+        assert invitation_rescind(fake, inv["id"], "team-1", _U3)["already"]
 # ── Onboarding / email / GitHub connect (plan Task 6, issue #764) ─────────
 
 class TestOnboardingState:
