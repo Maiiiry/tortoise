@@ -57,7 +57,7 @@ warns when a claude registration would make the reflex fire twice per turn.
 | #2124* | Devin | `UserPromptSubmit` | `.devin/hooks.v1.json` (also `~/.config/devin/config.json` `hooks`) | `hookSpecificOutput.additionalContext` | shipped (`install devin`); primary docs re-fetched 2026-10-11 — file IS the hooks object (no `"hooks"` wrapper), stdin carries `prompt`; `matcher` omitted (tool-events only) |
 | #2119 | Pi (pi-coding-agent) | session lifecycle only (no per-turn prompt hook in the extension API today) | `~/.pi/agent/extensions/` TS extension | n/a — per-turn injection not reachable via extension API | MCP pull + session-start digest (existing) + documented limitation |
 | #2122 | Cursor | `sessionStart` → `additional_context`; per-turn `beforeSubmitPrompt` is observe/block ONLY | `~/.cursor/hooks.json` (flat script entries, absolute command; project `.cursor/hooks.json` is workspace-trust-gated) | `{"additional_context": …}` (snake_case) on `sessionStart` | **shipped** — `tortoise install cursor` registers the `sessionStart` cold-context hook (contract v4) *plus* the `sessionEnd` capture hook; per-turn push stays Cursor-blocked (watch item) |
-| #2120 | OpenClaw | **native plugin** — per-turn hook `before_prompt_build` → `{prependContext}` (in-process; OpenClaw has NO shell-hook surface) | `~/.openclaw/extensions/tortoise/` (plugin dir; `openclaw.plugin.json` + entry `index.mjs`) → `before_prompt_build`; capture via the `llm_output` hook → `$OPENCLAW_STATE_DIR/tortoise/turns/<session>.jsonl` (one file per session) → `tortoise sessions import --harness openclaw <file>` | `PluginHookBeforePromptBuildResult.prependContext` | **shipped** — `tortoise install openclaw` writes the plugin + `plugins.entries.tortoise.enabled`; injection graded by `tortoise/openclaw-plugin/index.test.mjs`, install by `tests/test_openclaw_seam.py` |
+| #2120 | OpenClaw | **native plugin** — per-turn hook `before_prompt_build` → `{prependContext}` (in-process; OpenClaw has NO shell-hook surface) | `~/.openclaw/extensions/tortoise/` (plugin dir; `openclaw.plugin.json` + entry `index.mjs`) → `before_prompt_build`; capture via the `llm_output` hook → `$OPENCLAW_STATE_DIR/tortoise/turns/<session>.jsonl` (one file per session) → `tortoise sessions import --harness openclaw <file>` | `PluginHookBeforePromptBuildResult.prependContext` | **shipped** — `tortoise install openclaw` writes the plugin + `plugins.entries.tortoise.enabled`; injection graded by `tortoise/openclaw-plugin/index.test.mjs`, install by `tests/test_openclaw_seam.py`. Continuity: the plugin hands the reflex `prior_context` = the block it injected last turn (local: `tortoise volunteer`'s JSON contract; hosted: the documented `/v1/context` body), so the reflex's own re-mention suppression runs — see the 2026-10-13 correction below |
 | #2121 | Hermes | `pre_llm_call` (directory plugin: `register(ctx)` + `ctx.register_hook`) | `<dir>/.hermes/plugins/tortoise-volunteer/` (`plugin.yaml` + `__init__.py`, written by `tortoise install hermes`) | the callback RETURNS `{"context": "<block>"}`, injected into the current turn's user message | written by `install hermes`, but **INERT until two opt-ins** (`HERMES_ENABLE_PROJECT_PLUGINS=1` + `hermes plugins enable tortoise-volunteer`) — the installer prints both; ingestion: `tortoise sessions import --harness hermes --file <state.db>` (reads `$HERMES_HOME/state.db` read-only) |
 | #2124* | Gemini CLI / OpenCode / other Claude-hooks-compatibles | `UserPromptSubmit`/equivalent | harness-specific | harness-specific | shared script's default emits the bare block (harmless where unsupported) |
 | #2125 | Frameworks (SDK-level middleware: Google ADK / LangGraph / Semantic Kernel) | ADK `before_model_callback`; LangGraph pre-model node; SK Prompt Render Filter | project code imports `tortoise/framework.py` and registers the returned hook | the reflex `block` appended to the prompt (ADK: request instructions; LangGraph: one appended message; SK: `rendered_prompt` prefix) | shipped, **opt-in** — `tortoise/framework.py` + the `#2125` seam grade |
@@ -152,9 +152,18 @@ corrected here:
 Because Hermes' read seam is a Python plugin rather than a shell command,
 the seam does NOT add a `hermes` arm to `volunteer-turn.sh` (that would be
 dead code) — the plugin invokes the SAME `tortoise volunteer` CLI the shell
-hook does, with the harness `session_id` passed through for the reflex's
-cross-turn re-mention suppression. Ingestion rides `tortoise sessions import`
+hook does. Ingestion rides `tortoise sessions import`
 as the wave-1 note on #2121 prescribes (no hook-driven live capture).
+
+> ⚠️ **Correction (2026-10-13): the continuity input is `prior_context`, not
+> `session_id`.** This paragraph previously said the harness `session_id` was
+> passed "for the reflex's cross-turn re-mention suppression". The reflex
+> validates `session_id` and never consults it for suppression — stage 5 keys
+> on `prior_context` alone (`tortoise/volunteer.py`, "Re-mention suppression
+> runs BEFORE the pointer budget"). So the Hermes plugin's `--session-id`
+> suppresses nothing and it has no other dedupe: its cross-turn dedupe is
+> unimplemented (filed as #8957). Fixed for the OpenClaw seam in the same pass
+> that gave `tortoise volunteer` a `--prior-context` input.
 
 **Activation is TWO opt-ins, and the installer names both (correction
 2026-10-12).** A `tortoise install hermes` write is not by itself a live
@@ -225,6 +234,25 @@ receipts, provenance and REPHRASE dedup in the one existing import pipeline.
   hosted mode (#1708 D1b).
 * W4 user-exposure opt-in: per-turn injection ships behind the `install`
   command — nothing auto-registers.
+
+### Correction log — #2120's injection leg, once it was executed (2026-10-13)
+
+The shipped plugin's two injection paths were graded only for the LOCAL one
+(`runCommand` over a fake `tortoise`), and the local one depended on a
+continuity input the CLI did not have. Two defects, both fixed in the same
+pass:
+
+| Claim | Re-measurement |
+|---|---|
+| The plugin's hosted leg is `POST /v1/context` (`apiKey` config, the ONLY reflex path for a user with no local CLI) | **It never worked.** `runHosted` posted `{prompt}`; `POST /v1/context` requires `window: [{role, content}]` (`VolunteerContextRequest`, `tortoise/hosted_api.py`), so every hosted turn was a 422 — and the fail-open catch turns that into an empty injection with no signal anywhere. Graded now by `tests/test_openclaw_seam.py::test_hosted_body_is_the_contract_the_server_validates`, which executes the plugin under a stubbed `fetch` and validates the emitted body with the SERVER's own model (a hand-copy of the shape would have re-encoded the bug). |
+| "Cross-turn dedupe" = the plugin's block digest | **Incomplete.** The digest only suppresses an IDENTICAL block; a block that changes by one pointer re-surfaces the rest. The reflex has a stage-5 re-mention suppression that reads `prior_context` — and no CLI seam could supply it, because `tortoise volunteer` had no `--prior-context` (only `--session-id`, which the pipeline validates and never consults). The CLI now takes `--prior-context` (and `prior_context` in its JSON contract dict), and the plugin passes the block it injected last turn. Both polarities are pinned: `tests/test_platform_seams.py::test_volunteer_cli_prior_context_suppresses_a_re_mention`. The sibling seams still do not pass it — Hermes' `--session-id` claim is the same false premise (#8957), and the one-shot shell hooks have nowhere to keep a prior block. |
+
+Note on what remains UNGRADED: #2120's scope item "W3 harness seam entry
+(ingest + inject graded)" depends on the harness's graded-reflex bars, which
+are still the NULL reflex pending #8125 (`tests/eval/harness/runner.py`
+logs "graded seam lands with the W4 reflex delivery"). No per-seam matrix row
+can be blessed before that without a `--bless-protocol` change that
+#8125 owns.
 
 ## Frameworks (#2125) — SDK-level middleware, injection only
 
