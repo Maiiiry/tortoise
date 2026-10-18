@@ -966,6 +966,15 @@ surfaces:
   # — they fall through to `core` — so without that arm a webhook_delivery-only
   # change would run no guard at all.
   - test_webhook_delivery.py
+  # #8100 (epic #2080 W4 phase 2): the SSE transport is a SECOND SINK on the
+  # SAME delivery layer. DUAL-REGISTERED with `core` (below) for the same reason
+  # as the webhook arm above: `tortoise/sse_delivery.py` is a NEW file matching
+  # no SOURCE_PATTERN, so a change to it alone selects `core` — while the stream
+  # route it backs lives in `tortoise/hosted_api.py`, an EXACT `api` match that
+  # REPLACES the `core` fallback. Without this arm an hosted_api.py-only edit
+  # (the route) would run no guard; without the `core` arm an
+  # sse_delivery.py-only edit would not either.
+  - test_sse_delivery.py
   # #3520: the per-session EXTRACTION status (`{status, extractor,
   # outcome_known}`) on BOTH hosted session read surfaces, the `last_error`
   # agreement on the 2xx path, and the appended-at-the-END column positions.
@@ -3199,6 +3208,14 @@ surfaces:
   # engine's contract tests on that diff. Dual-registered under `api` (above)
   # for `tortoise/hosted_api.py`, which is an exact `api` match.
   - test_webhook_delivery.py
+  # #8100: the SSE half of the same layer. `tortoise/sse_delivery.py` (the
+  # transport, the broker, the frame builder and the stream generator) matches no
+  # named SOURCE_PATTERN, so it falls through to `core` — this is the
+  # registration that keeps the transport's contract tests on that diff. Dual-
+  # registered under `api` (above) for the `tortoise/hosted_api.py` stream route.
+  # It also carries the ENUMERATION pin (exactly one drain / one retry policy in
+  # `tortoise/**`), which must run whenever ANY delivery module moves.
+  - test_sse_delivery.py
   # #3520: the `core` half of the dual registration documented at the `api`
   # entry — `tortoise/session_projection.py` (the extraction vocabulary and
   # `session_extraction_status`, the ONE derivation every read surface calls)
@@ -5415,6 +5432,12 @@ durations:
   test_security.py: 0.4
   test_session_key.py: 0.1
   test_probe_reset_inflight_4608.py: 36.0
+  # #8100: new file, no CI junit yet — measured LOCALLY on this branch (19 tests:
+  # 54.3 s docker lane, 61.0 s embedded carve-out). Registered because #3400's
+  # coverage floor is exactly 90% and an unmeasured file here tips it under
+  # (818/908 = 90.09% → 818/909 = 89.99%). Replaced by the measured value on the
+  # next `tools/ci_timing.py` refresh.
+  test_sse_delivery.py: 55.0
   test_sparse.py: 0.6
   test_subgraph_pure.py: 0.6
   test_supplementary.py: 0.2

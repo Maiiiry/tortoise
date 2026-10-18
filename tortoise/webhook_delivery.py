@@ -45,13 +45,20 @@ THE CONTRACTS THIS MODULE PINS
    creation, and never by a read path; it is stored encrypted via
    ``crypto.encrypt_token`` (Fernet, ``TORTOISE_ENCRYPTION_KEY``), the same
    at-rest treatment as the OAuth tokens on the Org node.
+6. **ONE delivery layer, MANY sinks (#8100).** ``transport`` on the subscription
+   selects the SINK — ``webhook`` (default: POST to ``url``) or ``sse`` (the
+   event is served on the stream the subscriber's client opens,
+   ``sse_delivery``). The subscription registry, the drain (this module's
+   ``dispatch_pending``), the cursor, the retry/backoff policy and the receipts
+   are SHARED, so a new transport must not bring a second dispatcher:
+   ``tests/test_sse_delivery.py`` pins that by enumerating ``tortoise/**``.
 
 STORAGE (graph-native, per-graph = per-org — mirrors ``event_store``: the
 namespace IS the partition, there is no ``org_id`` property):
 
 * ``:ContextSubscription {sub_id, url, secret, types, description, created_at,
-  created_by, cursor, attempts, next_attempt_at, disabled_at, disabled_reason,
-  delivered, failed, last_error, last_delivery_at}``
+  created_by, transport, cursor, attempts, next_attempt_at, disabled_at,
+  disabled_reason, delivered, failed, last_error, last_delivery_at}``
 * ``:DeliveryReceipt {receipt_id, sub_id, event_id, seq, attempt, status,
   http_status, error, ts, duration_ms}`` — one per ATTEMPT, capped per
   subscription.
@@ -70,6 +77,17 @@ from tortoise.env_truthy import FALSY
 
 from .ids import ulid
 from .security import env_int, redact_error, validate_webhook_url
+
+#: The transports this ONE layer can deliver over (#8100). ``transport`` on the
+#: subscription selects the SINK; the dispatcher, cursor, retry policy and
+#: receipts are shared, so a second name here must NOT bring a second drain
+#: (``tests/test_sse_delivery.py`` pins that by enumeration).
+TRANSPORT_WEBHOOK = "webhook"
+TRANSPORT_SSE = "sse"
+TRANSPORTS = (TRANSPORT_WEBHOOK, TRANSPORT_SSE)
+#: A subscription created before #8100 carries no ``transport`` property; absent
+#: MEANS webhook (not "unknown"), so every existing row keeps working untouched.
+DEFAULT_TRANSPORT = TRANSPORT_WEBHOOK
 
 logger = logging.getLogger("tortoise.webhook_delivery")
 
@@ -102,9 +120,14 @@ _SCHEMA_ATTR = "_tortoise_webhook_schema"
 #: sign a delivery and must never reach a response.
 _PUBLIC_SUB_FIELDS = (
     "sub_id", "url", "types", "description", "created_at", "created_by",
-    "cursor", "attempts", "next_attempt_at", "disabled_at", "disabled_reason",
-    "delivered", "failed", "last_error", "last_delivery_at",
+    "transport", "cursor", "attempts", "next_attempt_at", "disabled_at",
+    "disabled_reason", "delivered", "failed", "last_error",
+    "last_delivery_at",
 )
+
+#: The ONE instance of the webhook sink (stateless; kept module-level so the
+#: resolver below never re-builds it per pass).
+WEBHOOK_TRANSPORT = None  # set after the class definition (see ``transport_for``)
 
 
 def dispatch_enabled() -> bool:
@@ -164,12 +187,32 @@ def ensure_subscription_schema(proj) -> None:
 
 def _public(props: dict) -> dict:
     out = {k: props.get(k) for k in _PUBLIC_SUB_FIELDS}
+    # Absent MEANS webhook (every row created before #8100): a read must not
+    # report ``None`` for a contract field the dispatcher always resolves.
+    out["transport"] = str(props.get("transport") or DEFAULT_TRANSPORT)
     out["secret_set"] = bool(props.get("secret"))
     out["active"] = not props.get("disabled_at")
     out["types"] = list(props.get("types") or [])
     out["cursor"] = int(props.get("cursor") or 0)
     out["attempts"] = int(props.get("attempts") or 0)
     return out
+
+
+def _validated_transport(transport) -> str:
+    """Validate a requested transport against ``TRANSPORTS``.
+
+    Absent/empty means the DEFAULT (webhook) so an older caller keeps working;
+    an unknown name is a loud ``ValueError`` (422 over REST) rather than a silent
+    fallback — a subscriber that asked for a sink we do not have must not be
+    created as a webhook and left to fail every delivery.
+    """
+    if transport is None or (isinstance(transport, str) and not transport.strip()):
+        return DEFAULT_TRANSPORT
+    value = str(transport).strip().lower()
+    if value not in TRANSPORTS:
+        raise ValueError(
+            f"unknown transport: {value} (expected one of {', '.join(TRANSPORTS)})")
+    return value
 
 
 def _validated_types(types) -> list[str]:
@@ -187,22 +230,35 @@ def _validated_types(types) -> list[str]:
     return list(dict.fromkeys(types))
 
 
-def create_subscription(proj, *, url: str, types=None, description: str = "",
+def create_subscription(proj, *, url: str | None = None, types=None,
+                        description: str = "",
                         created_by: str | None = None,
+                        transport: str = DEFAULT_TRANSPORT,
                         now: datetime | None = None) -> dict:
-    """Register a webhook target. Returns the record INCLUDING the one-time ``secret``.
+    """Register a delivery target. Returns the record INCLUDING the one-time ``secret``.
 
-    Raises ``ValueError`` for a rejected url / unknown event type, and
-    ``RuntimeError`` when ``TORTOISE_ENCRYPTION_KEY`` is unset (a webhook
-    secret is a long-lived credential; it is never stored in the clear —
+    ``transport`` selects the SINK (#8100): ``webhook`` (default) POSTs to
+    ``url``; ``sse`` has no target of its own — the subscriber reads the stream
+    its client opens — so its stored ``url`` is empty and NO SSRF validation
+    runs (there is no egress to police).
+
+    Raises ``ValueError`` for a rejected url / unknown event type / unknown
+    transport, and ``RuntimeError`` when ``TORTOISE_ENCRYPTION_KEY`` is unset (a
+    signing secret is a long-lived credential; it is never stored in the clear —
     ``crypto.encrypt_token`` fails loudly rather than silently downgrading).
     """
-    url = validate_webhook_url(url)
+    transport = _validated_transport(transport)
+    # For an SSE subscription the URL is deliberately NOT validated and NOT
+    # stored (#8100): there is no outbound target — the subscriber reads the
+    # stream its client opens — and keeping a caller-supplied URL here would
+    # invite a future reader to POST to it, i.e. the second dispatcher this
+    # issue forbids.
+    url = validate_webhook_url(url) if transport == TRANSPORT_WEBHOOK else ""
     type_list = _validated_types(types)
     ensure_subscription_schema(proj)
     if count_subscriptions(proj, include_disabled=True) >= MAX_SUBSCRIPTIONS:
         raise ValueError(
-            f"this graph already holds {MAX_SUBSCRIPTIONS} webhook "
+            f"this graph already holds {MAX_SUBSCRIPTIONS} delivery "
             f"subscriptions — delete one before adding another")
     from .crypto import encrypt_token
 
@@ -213,12 +269,14 @@ def create_subscription(proj, *, url: str, types=None, description: str = "",
         "CREATE (s:ContextSubscription {"
         "sub_id:$sub_id, url:$url, secret:$secret, types:$types, "
         "description:$description, created_at:$created_at, "
-        "created_by:$created_by, cursor:0, attempts:0, delivered:0, failed:0})",
+        "created_by:$created_by, transport:$transport, "
+        "cursor:0, attempts:0, delivered:0, failed:0})",
         params={
             "sub_id": sub_id, "url": url,
             "secret": encrypt_token(secret), "types": type_list,
             "description": str(description or "")[:500],
             "created_at": _iso(now_dt), "created_by": created_by,
+            "transport": transport,
         },
     )
     record = get_subscription(proj, sub_id) or {}
@@ -272,6 +330,15 @@ def delete_subscription(proj, sub_id: str) -> bool:
         "MATCH (r:DeliveryReceipt {sub_id:$id}) DETACH DELETE r",
         params={"id": sub_id},
     )
+    # The SSE wake state is process-local optimisation only (see sse_delivery);
+    # dropping it is housekeeping, never correctness — a failure here must not
+    # turn a successful delete into an error.
+    try:
+        from .sse_delivery import BROKER
+
+        BROKER.forget(sub_id)
+    except Exception:  # noqa: BLE001, RUF100
+        logger.debug("webhook_delivery: broker forget failed for %s", sub_id)
     return True
 
 
@@ -371,6 +438,33 @@ class WebhookTransport:
             return resp.status_code, None
         except Exception as e:
             return None, redact_error(e)
+
+
+def transport_for(sub: dict):
+    """The SINK for one subscription — the ONE place a transport is chosen.
+
+    ``dispatch_pending(transport=…)`` still injects a single transport for EVERY
+    subscription (the existing test seam); this resolver is what production uses
+    when nothing is injected. An absent ``transport`` property reads as webhook
+    (pre-#8100 rows), and a corrupt/unknown stored value ALSO falls back to
+    webhook rather than raising: a delivery pass must never raise, and a webhook
+    attempt records the failure on a receipt where it is visible.
+    """
+    kind = str(sub.get("transport") or DEFAULT_TRANSPORT).strip().lower()
+    if kind == TRANSPORT_SSE:
+        # Lazy import: sse_delivery imports ``_delivery_body`` from this module
+        # (ONE envelope builder), so a module-level import here would be a cycle.
+        from .sse_delivery import SSE_TRANSPORT
+
+        return SSE_TRANSPORT
+    return _webhook_transport()
+
+
+def _webhook_transport():
+    global WEBHOOK_TRANSPORT
+    if WEBHOOK_TRANSPORT is None:
+        WEBHOOK_TRANSPORT = WebhookTransport()
+    return WEBHOOK_TRANSPORT
 
 
 def _status_code(value) -> int | None:
@@ -481,7 +575,7 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
     if not dispatch_enabled():
         return summary
     summary["enabled"] = True
-    transport = transport or WebhookTransport()
+    injected = transport
     now_dt = now or _now()
     try:
         # The due query runs FIRST, before ``ensure_subscription_schema``: a
@@ -523,6 +617,12 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                          "subscription secret unreadable (encryption key "
                          "rotated or unset)", now_dt, 0)
             continue
+        # The sink is chosen ONCE per subscription (#8100): a webhook POSTs out,
+        # an SSE subscription publishes a wake for the stream that serves this
+        # graph's durable log. NOTHING below knows which one it is talking to —
+        # same cursor, same retry, same receipt — which is the whole point of
+        # the shared layer (#8100 indicator 2: exactly ONE drain).
+        sink = injected or transport_for(sub)
         for event in events:
             started = time.monotonic()
             body = _delivery_body(sub, event)
@@ -536,7 +636,7 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                 "X-Tortoise-Signature": signature_header(secret, ts, body),
             }
             try:
-                http_status, error = transport.post(sub["url"], body, headers)
+                http_status, error = sink.post(sub.get("url") or "", body, headers)
             except Exception as e:  # a transport that RAISES is a failed delivery
                 http_status, error = None, redact_error(e)
             http_status = _status_code(http_status)

@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, date, datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse  # JSONResponse: billing webhook (#310)
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -12399,15 +12399,19 @@ class VolunteerContextRequest(BaseModel):
 
 
 class ContextSubscriptionRequest(BaseModel):
-    """#2081: register a webhook target for the graph-event push stream.
+    """#2081/#8100: register a delivery target for the graph-event push stream.
 
     ``url`` is validated by ``security.validate_webhook_url`` in the handler
     (SSRF gate) — deliberately NOT here, so the refusal is the SAME readable
-    ``ValueError`` text whether it is reached through REST or in-process.
+    ``ValueError`` text whether it is reached through REST or in-process. That
+    validation applies to the ``webhook`` transport ONLY: an ``sse``
+    subscription has no outbound target (the client opens the stream), so a url
+    may be omitted entirely (#8100).
     """
-    url: str = Field(..., max_length=2048)
+    url: str | None = Field(None, max_length=2048)
     types: list[str] | None = Field(None, max_length=32)
     description: str | None = Field(None, max_length=500)
+    transport: str | None = Field(None, max_length=32)
 
 
 # ── Session extraction (LLM-default — issue #822) ──────────────────────────
@@ -26822,10 +26826,15 @@ async def create_context_subscription(
     Contract:
       * auth fail-CLOSED (401/403 as everywhere on /v1): a subscription can
         never be created cross-tenant; ``graphs:write`` scope required.
+      * ``transport`` selects the sink (#8100): ``webhook`` (default) needs a
+        ``url``; ``sse`` needs none — the client opens
+        ``GET /v1/context/subscriptions/{sub_id}/stream`` and frames arrive
+        there. An unknown value is a 422, never a silent fallback.
       * 422 for a rejected target — non-http(s) scheme, credentials in the url,
         a loopback/private/link-local/metadata host (SSRF gate,
-        ``security.validate_webhook_url``), an unknown event type (the same
-        registry ``events_poll`` validates against), or the per-graph cap.
+        ``security.validate_webhook_url``), a missing url for the webhook
+        transport, an unknown event type (the same registry ``events_poll``
+        validates against), or the per-graph cap.
       * 503 when ``TORTOISE_ENCRYPTION_KEY`` is unset — the signing secret is a
         long-lived credential and is never stored in the clear (``crypto``
         fails loudly rather than downgrade).
@@ -26847,6 +26856,7 @@ async def create_context_subscription(
         return _webhook_delivery.create_subscription(
             sdk._get_proj(), url=body.url, types=body.types,
             description=body.description or "",
+            transport=body.transport or _webhook_delivery.DEFAULT_TRANSPORT,
             created_by=org.get("user_id") or org.get("key_id"),
         )
 
@@ -26928,6 +26938,79 @@ async def list_context_deliveries(
     if result["missing"]:
         raise HTTPException(status_code=404, detail="unknown subscription")
     return {"deliveries": result["deliveries"]}
+
+
+@app.get("/v1/context/subscriptions/{sub_id}/stream")
+async def stream_context_subscription(
+    sub_id: str,
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+    org: dict = Depends(get_current_org_gated),  # noqa: B008
+):
+    """#8100: the SSE half of the delivery layer — this subscription's stream.
+
+    The SECOND transport over the SAME subscription registry, dispatcher, retry
+    policy and receipts that #2081 shipped (``webhook_delivery``). An SSE
+    subscription has no target URL; the client opens THIS connection, and every
+    frame carries the SAME envelope a webhook subscriber receives for the same
+    event (``webhook_delivery._delivery_body`` — one builder, not a parallel
+    one).
+
+    Contract:
+      * auth fail-CLOSED (401/403 as everywhere on /v1); ``graphs:read``.
+      * 404 for an unknown subscription — never an empty stream that hides a
+        typo'd id.
+      * 409 when the subscription's transport is ``webhook``: a webhook
+        subscription is pushed OUT and has no stream to serve, so the refusal
+        names the fix (create it with ``transport="sse"`` or list its
+        receipts) instead of silently streaming nothing.
+      * ``Last-Event-ID`` (sent automatically by ``EventSource`` after a
+        reconnect) RESUMES the stream strictly after that seq, out of the
+        durable ``:GraphEvent`` log — no gap, and no duplicate beyond the
+        documented at-least-once class. Without the header the stream starts at
+        the subscription cursor (the tail of what has been dispatched).
+      * The stream is BOUNDED (``TORTOISE_SSE_MAX_STREAM_S``, default 300s) and
+        ends with ``: keepalive`` comments while idle; the client reconnects and
+        resumes. Holding a worker request slot forever buys nothing because the
+        log is durable.
+
+    READ-ONLY: the subscription's ``cursor`` belongs to the dispatcher, so a
+    stream can never make an undelivered event look delivered.
+    """
+    _require_scope(org, "graphs:read", "context subscription stream")
+    from tortoise import sse_delivery as _sse
+    from tortoise import webhook_delivery as _webhook_delivery
+
+    sdk = await _data_sdk_offloaded(org)
+    sub = await asyncio.to_thread(
+        lambda: _webhook_delivery.get_subscription(sdk._get_proj(), sub_id))
+    if sub is None:
+        raise HTTPException(status_code=404, detail="unknown subscription")
+    if sub.get("transport") != _webhook_delivery.TRANSPORT_SSE:
+        raise HTTPException(
+            status_code=409,
+            detail=("this subscription is a webhook subscription — it is pushed "
+                    "to its url and has no stream; create an SSE subscription "
+                    "(transport=\"sse\") to stream, or read its receipts at "
+                    f"/v1/context/subscriptions/{sub_id}/deliveries"),
+        )
+    # A SYNC generator: Starlette iterates it in a worker thread, so the graph
+    # reads below never run on the event loop (the same posture as the write
+    # handlers' ``asyncio.to_thread`` offload).
+    frames = _sse.stream_subscription(
+        sdk._get_proj(), sub, last_event_id=last_event_id)
+    from starlette.responses import StreamingResponse
+
+    return StreamingResponse(
+        frames,
+        media_type=_sse.SSE_MEDIA_TYPE,
+        headers={
+            "Cache-Control": "no-cache",
+            # A proxy that buffers, does not stream: the client would receive
+            # every frame at once at the END of the bound (nginx's default).
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/v1/context")

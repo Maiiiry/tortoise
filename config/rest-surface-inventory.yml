@@ -167,6 +167,10 @@ routes:
   # register/list/delete webhook subscriptions over the durable event stream,
   # plus the per-subscription delivery receipts. Four tenant routes added with
   # the feature, declared here so the third surface grows VISIBLY (#3875).
+  # #8100 adds the FIFTH: the SSE stream a subscription of transport="sse"
+  # serves (same registry, same cursor, same receipts — a second SINK, not a
+  # second delivery layer). Declared for the same reason: the third surface
+  # grows visibly rather than by accident.
   - method: POST
     path: /v1/context/subscriptions
     class: tenant
@@ -178,6 +182,9 @@ routes:
     class: tenant
   - method: GET
     path: /v1/context/subscriptions/{sub_id}/deliveries
+    class: tenant
+  - method: GET
+    path: /v1/context/subscriptions/{sub_id}/stream
     class: tenant
   - method: POST
     path: /v1/demo
