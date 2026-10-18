@@ -134,8 +134,10 @@ from tortoise.sufficiency_router import (
     REASON_MEASURES_MET,
     REASON_NO_MEASURE,
     REASON_PROVENANCE_THIN,
+    REASON_PROVENANCE_UNASSESSED,
     REASON_RESIDENT_MISS,
     REASON_RESIDENT_UNASSESSED,
+    REFUSAL_CLASS_CONFLICT,
     REFUSAL_NO_CLAIM,
     REFUSAL_NO_PROVENANCE,
     REFUSAL_PROMOTION,
@@ -260,7 +262,7 @@ def test_a_short_anchor_does_not_match_inside_an_unrelated_word() -> None:
     ``"ai" in "he said the main thing"`` is ``True``, so a short entity name
     (``AI``, ``PR``, ``Q3``, ``Art``) scored COVERED on text that never mentions
     it — a confident ``sufficient`` on evidence that does not answer the
-    question, which is the §14.1 V4 silent green arriving through the measure's
+    question, which is the §14.3 V4 silent green arriving through the measure's
     front door. The comparison beside it (``row.id``) is exact, so the weaker
     signal was also the looser one.
     """
@@ -338,9 +340,28 @@ def test_an_entity_named_in_subject_or_topics_counts_as_coverage() -> None:
     ).verdict == INSUFFICIENT
 
 
+def _rows_without_link(*contents: str) -> list[dict]:
+    """Rows READ WITH provenance on that carry no LINK (a real wire shape).
+
+    ``SearchResult.to_dict()`` emits the ``provenance`` block whenever
+    ``source_ref``, ``captured_at`` or ``currency`` is present, so a hit with
+    ``captured_at`` alone proves the field WAS fetched while carrying no source.
+    That is evidence with no source — a measured ``0.0`` for the row — and it is
+    a different fact from a row whose provenance was never fetched at all.
+    """
+    return [
+        SearchResult(
+            id=f"q{i}", content=content, point_kind="fact",
+            captured_at="2026-01-01T00:00:00Z",
+        ).to_dict()
+        for i, content in enumerate(contents)
+    ]
+
+
 def test_thin_provenance_is_insufficient() -> None:
-    evidence = _rows("acme corp signed", "filler", provenance=True)
-    evidence[1].pop("provenance", None)  # the second row fetched no link
+    evidence = _rows("acme corp signed", provenance=True)
+    evidence += _rows_without_link("filler")  # fetched, but carries no link
+    assert evidence[1]["provenance"] == {"captured_at": "2026-01-01T00:00:00Z"}
     verdict = assess_sufficiency(
         evidence, required_provenance_coverage=1.0, resident=True)
     assert verdict.verdict == INSUFFICIENT
@@ -377,7 +398,7 @@ def test_a_real_search_result_row_is_assessed_for_provenance() -> None:
 
 
 def test_a_partially_provenanced_real_wire_read_is_measured_not_unassessed() -> None:
-    rows = _rows("acme corp signed", provenance=True) + _rows("filler")
+    rows = _rows("acme corp signed", provenance=True) + _rows_without_link("filler")
     verdict = assess_sufficiency(
         rows, required_provenance_coverage=0.9, resident=True)
     assert verdict.verdict == INSUFFICIENT
@@ -448,12 +469,22 @@ def test_a_provenance_measure_over_unfetched_rows_is_unassessed() -> None:
     verdict = assess_sufficiency(
         evidence, required_provenance_coverage=0.9, resident=True)
     assert verdict.verdict == UNDETERMINED
-    assert verdict.reasons == (REASON_NO_MEASURE,)
+    # A SPECIFIC reason, not `no-measure`: a measure WAS configured and could not
+    # be taken, and the two states are not the same claim.
+    assert verdict.reasons == (REASON_PROVENANCE_UNASSESSED,)
     assert verdict.measures == ()
 
 
-def test_an_unfetched_provenance_field_does_not_mask_an_assessed_measure() -> None:
-    """The assessed measure still decides; the unassessed one neither helps nor hurts."""
+def test_a_configured_provenance_measure_that_could_not_be_taken_never_greens() -> None:
+    """A CONFIGURED measure that was never taken cannot be satisfied by another.
+
+    This test used to assert ``sufficient`` here. That was the fail-open this
+    module exists to kill: the caller demanded 90% sourced evidence, no row had
+    fetched provenance at all, and the verdict reported a green because the
+    ANCHOR measure passed. "Unassessed neither helps nor hurts" is true of a
+    measure the caller did not ask for; it is false of one they configured.
+    Reverting the guard reddens this test.
+    """
     evidence = _rows("acme corp signed", "filler")  # no provenance at all
     verdict = assess_sufficiency(
         evidence,
@@ -462,8 +493,22 @@ def test_an_unfetched_provenance_field_does_not_mask_an_assessed_measure() -> No
         required_provenance_coverage=0.9,
         resident=True,
     )
-    assert verdict.verdict == SUFFICIENT
+    assert verdict.verdict == UNDETERMINED
+    assert verdict.reasons == (REASON_PROVENANCE_UNASSESSED,)
+    assert verdict.sufficient is None
+    # The measure that DID run is still reported — the caller can see it passed.
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+    # Opting out of the provenance measure is the caller's explicit act, and it
+    # restores the green — the point is that omission must be DECLARED.
+    opted_out = assess_sufficiency(
+        evidence,
+        anchors=["acme corp"],
+        required_anchor_coverage=1.0,
+        required_provenance_coverage=None,
+        resident=True,
+    )
+    assert opted_out.verdict == SUFFICIENT
 
 
 def test_there_is_no_default_threshold() -> None:
@@ -551,6 +596,35 @@ def test_the_verdict_feeds_the_residency_router_three_distinctly() -> None:
     ]
     assert seen == [ROUTE_SERVE, ROUTE_ESCALATE_TIER, ROUTE_SERVE]
     assert len({v.sufficient for v in (sufficient, insufficient, undetermined)}) == 3
+
+
+def test_the_bound_is_carried_across_the_seam_by_the_ROUTE() -> None:
+    """A refused walk must not be re-walked one module over.
+
+    ``route_residency`` escalates on ``sufficient is False`` UNCONDITIONALLY, so
+    handing it the raw verdict re-walked a tier ``route_sufficiency`` had just
+    refused (budget gone, or a walk already behind it) — the §12.7 *router
+    overhead* this module claims to bound, reintroduced at the seam. The route
+    carries the BOUNDED value: ``None`` when the walk was refused.
+    """
+    verdict = assess_sufficiency(
+        _rows("filler"), anchors=["acme corp"],
+        required_anchor_coverage=1.0, resident=True)
+    refused = route_sufficiency(verdict, budget=0)
+    walked = route_sufficiency(verdict, budget=1)
+
+    assert verdict.sufficient is False           # what was MEASURED
+    assert refused.sufficient is None            # what will be PAID FOR
+    assert walked.sufficient is False
+    assert refused.escalates_tier is False
+    assert walked.escalates_tier is True
+
+    # The composition the docstrings require, pinned across the real seam.
+    assert route_residency(
+        marker=RESIDENCY_HOT, sufficient=refused.sufficient).route == ROUTE_SERVE
+    assert route_residency(
+        marker=RESIDENCY_HOT, sufficient=walked.sufficient,
+    ).route == ROUTE_ESCALATE_TIER
 
 
 # ── the bounded trigger ───────────────────────────────────────────────────
@@ -686,6 +760,37 @@ def test_a_route_cannot_carry_a_reason_that_contradicts_its_verdict() -> None:
     assert route_sufficiency(_insufficient(), budget=1).route == ROUTE_ESCALATE_TIER
     assert route_sufficiency(
         assess_sufficiency(_rows("x"), resident=True), budget=1).route == ROUTE_SERVE
+
+
+def test_a_route_cannot_contradict_its_own_escalation_or_budget() -> None:
+    """The ``escalated`` axis and the budget's coherence are type-held too.
+
+    The factory gets these right, but the route is what a consumer RECORDS and
+    later REPLAYS (``route_sufficiency(verdict, escalated=route.escalated,
+    budget=route.budget_remaining)``), so a hand-built or deserialised route that
+    contradicts itself defeated the ONE bound that stops a walk loop — the same
+    standard this type already applies to the verdict and the reason.
+    """
+    with pytest.raises(ValueError):
+        # Directs a walk while claiming none happened: replay walks forever.
+        SufficiencyRoute(route=ROUTE_ESCALATE_TIER, reason=REASON_ANCHORS_UNCOVERED,
+                         verdict=INSUFFICIENT, escalated=False, budget_remaining=0)
+    with pytest.raises(ValueError):
+        # Claims a walk is behind it while its own flag says otherwise.
+        SufficiencyRoute(route=ROUTE_SERVE, reason=REASON_ALREADY_ESCALATED,
+                         verdict=INSUFFICIENT, escalated=False, budget_remaining=5)
+    with pytest.raises(ValueError):
+        # Claims the budget is gone while reporting three steps remaining.
+        SufficiencyRoute(route=ROUTE_SERVE, reason=REASON_BUDGET_EXHAUSTED,
+                         verdict=INSUFFICIENT, budget_remaining=3)
+
+    # Every route the factory emits still constructs, in every bound state.
+    verdict = assess_sufficiency(
+        _rows("filler"), anchors=["acme corp"],
+        required_anchor_coverage=1.0, resident=True)
+    for budget, escalated in ((0, False), (1, False), (2, True), (0, True)):
+        assert route_sufficiency(
+            verdict, budget=budget, escalated=escalated).route in ROUTES
 
 
 # ── the route is a directive, not a status, and never the other router ────
@@ -890,6 +995,28 @@ def test_the_same_verified_finding_writes_back_once() -> None:
     assert both.units[0].unit_key == first.units[0].unit_key
 
 
+def test_two_classes_for_one_identity_are_refused_not_settled_by_order() -> None:
+    """The dedupe may not decide a claim's CLASS, and must not decide it silently.
+
+    ``unit_key`` is ``(span, normalised claim)``, so two findings sharing an
+    identity but disagreeing about the class collapsed to ONE unit — whichever
+    arrived first — with no refusal and ``ok`` still True. That is §12.7's
+    incorrect promotion arriving through the dedupe instead of ``promote_to``:
+    an episodic fact and a semantic rule for the same span+claim, decided by
+    iteration order. Neither may be written back.
+    """
+    episodic = _finding(claim="acme corp signed", claim_class="episodic")
+    semantic = _finding(claim="acme corp signed", claim_class="semantic")
+
+    forward = plan_writeback([episodic, semantic])
+    backward = plan_writeback([semantic, episodic])
+
+    for plan in (forward, backward):
+        assert plan.units == ()
+        assert [r.reason for r in plan.refusals] == [REFUSAL_CLASS_CONFLICT]
+        assert plan.ok is False
+
+
 def test_identity_is_the_span_plus_the_claim_not_the_span_alone() -> None:
     other_claim = _finding(claim="acme corp renewed in April")
     plan = plan_writeback([_finding(), other_claim])
@@ -1088,6 +1215,31 @@ def test_a_non_spaced_script_anchor_matches_its_own_text() -> None:
         _rows("我们签署了合同 with ACME"),
         anchors=["AI"], required_anchor_coverage=1.0, resident=True,
     ).verdict == INSUFFICIENT
+
+
+@pytest.mark.parametrize("text", [
+    "我们签署了ACME的合同",          # CJK: the match is wrapped in ideographs
+    "เราเซ็นสัญญากับACME",            # Thai: no word separators either
+    "我们签署了合同 with ACME",       # control: the spaced case already worked
+])
+def test_a_latin_anchor_matches_inside_unspaced_text(text: str) -> None:
+    """The boundary rule must be decided PER SIDE, not only for the anchor.
+
+    The ASCII/CJK split was applied only to the ANCHOR, so a Latin anchor
+    embedded in unspaced CJK/Thai text measured ``0.0`` coverage: the Unicode
+    ``\\w`` lookaround can never hold next to an ideograph, because the ideograph
+    IS a word character — the exact failure the split exists to avoid, one
+    operand over. It bought a tier for the row that literally answers.
+
+    The fallback is deliberately narrow: it fires only AFTER the strict Unicode
+    boundary has failed, i.e. only when the match sits next to a non-ASCII word
+    character. In such a script adjacency is not a word boundary, so the ASCII
+    boundary is the correct test.
+    """
+    verdict = assess_sufficiency(
+        _rows(text), anchors=["ACME"], required_anchor_coverage=1.0, resident=True)
+    assert verdict.verdict == SUFFICIENT
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
 
 
 def test_a_phrase_cannot_be_stitched_across_two_entity_terms() -> None:

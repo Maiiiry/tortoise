@@ -62,13 +62,19 @@ THE THREE-STATE VERDICT — why not a boolean
   caller never fetched) must not score as ``insufficient`` — that would
   escalate on a measurement that was never taken, and re-pay forever;
 * it must not score as ``sufficient`` either — that is the "silent ok" that
-  §14.1 V4 exists to kill.
+  §14.3 V4 exists to kill.
 
 So ``undetermined`` yields ``sufficient=None`` — the exact shape
 ``route_residency`` already accepts — and the router serves, which is the
 design's default answer (§12.3: Tier 1 is the DEFAULT, the deeper tier is
 escalation-only). Same polarity as §17.3's ``marker=None`` → *not assessed*,
 never ``hot``.
+
+⚠️ **Hand the ROUTE's ``sufficient`` to ``route_residency``, not the verdict's.**
+The verdict reports what was MEASURED; the route reports what the bound will PAY
+FOR (``SufficiencyRoute.sufficient``). ``route_residency`` escalates on
+``sufficient is False`` unconditionally, so passing the raw verdict re-walks a
+tier ``route_sufficiency`` just refused to walk.
 
 ⛔ **RESIDENCY OUTRANKS SUFFICIENCY (§17.3), enforced here too.** A read the
 cache could not see makes *"insufficient"* unestablished, so
@@ -156,9 +162,11 @@ __all__ = [
     "REASON_MEASURES_MET",
     "REASON_NO_MEASURE",
     "REASON_PROVENANCE_THIN",
+    "REASON_PROVENANCE_UNASSESSED",
     "REASON_RESIDENT_MISS",
     "REASON_RESIDENT_UNASSESSED",
     "REFUSALS",
+    "REFUSAL_CLASS_CONFLICT",
     "REFUSAL_NO_CLAIM",
     "REFUSAL_NO_PROVENANCE",
     "REFUSAL_PROMOTION",
@@ -205,6 +213,13 @@ MEASURES: tuple[str, ...] = (MEASURE_ANCHOR_COVERAGE, MEASURE_PROVENANCE_COVERAG
 REASON_EVIDENCE_EMPTY = "evidence-empty"
 REASON_ANCHORS_UNCOVERED = "anchors-uncovered"
 REASON_PROVENANCE_THIN = "provenance-thin"
+#: A measure the CALLER CONFIGURED that the assembled rows could not support: a
+#: ``required_provenance_coverage`` was supplied and NO row carries a fetched
+#: provenance field (a flag-off read). The measure was never taken, so the answer
+#: is UNDETERMINED — never ``sufficient``: a requirement that could not be
+#: measured is not a met requirement, and reporting it as one is the silent green
+#: §14.3 V4 exists to kill.
+REASON_PROVENANCE_UNASSESSED = "provenance-unassessed"
 REASON_MEASURES_MET = "measures-met"
 REASON_NO_MEASURE = "no-measure"
 #: The residency branch: a miss is the RECORD's repair, and an unassessed read
@@ -227,6 +242,7 @@ REASONS: tuple[str, ...] = (
     REASON_EVIDENCE_EMPTY,
     REASON_ANCHORS_UNCOVERED,
     REASON_PROVENANCE_THIN,
+    REASON_PROVENANCE_UNASSESSED,
     REASON_MEASURES_MET,
     REASON_NO_MEASURE,
     REASON_RESIDENT_MISS,
@@ -243,7 +259,8 @@ REASONS: tuple[str, ...] = (
 _VERDICT_REASONS: dict[str, tuple[str, ...]] = {
     SUFFICIENT: (REASON_MEASURES_MET,),
     INSUFFICIENT: (REASON_EVIDENCE_EMPTY, REASON_ANCHORS_UNCOVERED, REASON_PROVENANCE_THIN),
-    UNDETERMINED: (REASON_NO_MEASURE, REASON_RESIDENT_MISS, REASON_RESIDENT_UNASSESSED),
+    UNDETERMINED: (REASON_NO_MEASURE, REASON_PROVENANCE_UNASSESSED,
+                   REASON_RESIDENT_MISS, REASON_RESIDENT_UNASSESSED),
 }
 
 #: Write-back refusals (§12.5 / extractor §2.4.2). A refusal is RECORDED, never
@@ -253,12 +270,18 @@ REFUSAL_NO_PROVENANCE = "no-provenance"
 REFUSAL_UNVERIFIED = "unverified"
 REFUSAL_PROMOTION = "promotion"
 REFUSAL_NO_CLAIM = "no-claim"
+#: Two findings share a ``unit_key`` but disagree about the claim's CLASS. The
+#: dedupe may not pick one: whichever arrives second would be dropped silently
+#: and §12.7's "incorrect promotion" would then be settled by input ORDER, with
+#: the plan still reported ``ok``.
+REFUSAL_CLASS_CONFLICT = "class-conflict"
 
 REFUSALS: tuple[str, ...] = (
     REFUSAL_NO_PROVENANCE,
     REFUSAL_UNVERIFIED,
     REFUSAL_PROMOTION,
     REFUSAL_NO_CLAIM,
+    REFUSAL_CLASS_CONFLICT,
 )
 
 #: The ATTRIBUTE an evidence row / ``SearchResult`` carries its provenance
@@ -332,12 +355,20 @@ class _Evidence:
     zero: a caller reading with ``search_provenance_enabled()`` off never
     fetches ``source_ref``, and scoring that as insufficient would punish a
     flag, not the evidence.
+
+    ``provenance_fetched`` carries the OTHER half of that distinction, which
+    ``provenance`` alone could not express. A row read with provenance ON but
+    carrying no LINK (``to_dict()`` emits the block for ``captured_at`` alone)
+    must measure ``0.0`` — it is evidence with no source. Reading only the link
+    made the measure fail OPEN on exactly the worst-provenance answer: a fully
+    unattributed read vanished into "unassessed" and the verdict served.
     """
 
     id: str
     text: str
     provenance: Any
     entities: tuple[str, ...] = ()
+    provenance_fetched: bool = False
 
 
 def _as_mapping(row: object) -> Mapping[str, Any]:
@@ -354,6 +385,31 @@ def _as_mapping(row: object) -> Mapping[str, Any]:
         if isinstance(out, Mapping):
             return out
     return {}
+
+
+def _provenance_fetched(data: object) -> bool:
+    """Did this row FETCH the provenance field at all — link or no link?
+
+    ``evidence_provenance`` answers *"what link does it carry"*, and returns
+    ``None`` both when the field was never fetched and when it was fetched with
+    no link. The provenance MEASURE needs the difference: a flag-off read is
+    unassessed, while a flag-on read with zero links is a measured ``0.0``.
+
+    ``SearchResult.to_dict()`` emits the ``provenance`` block whenever
+    ``source_ref``, ``captured_at`` or ``currency`` is present, so the block's
+    PRESENCE proves the fetch happened even when it carries no ``source``.
+    """
+    mapping = _as_mapping(data) or (data if isinstance(data, Mapping) else {})
+    if mapping.get("provenance"):
+        return True
+    for key in _PROVENANCE_KEYS:
+        if mapping.get(key):
+            return True
+    if not isinstance(data, Mapping):
+        for key in (*_PROVENANCE_KEYS, "provenance"):
+            if getattr(data, key, None):
+                return True
+    return False
 
 
 def evidence_record(row: object) -> _Evidence:
@@ -383,6 +439,7 @@ def evidence_record(row: object) -> _Evidence:
         text=text,
         provenance=evidence_provenance(data),
         entities=entities,
+        provenance_fetched=_provenance_fetched(data),
     )
 
 
@@ -500,7 +557,7 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     relevance check: ``"ai" in "he said the main thing"`` is ``True``, so a
     short entity name (``AI``, ``PR``, ``Q3``, ``Art``) scored COVERED on text
     that never mentions it — a confident ``sufficient`` in the fail-open
-    direction §14.1 V4 exists to kill. The comparison beside it (``row.id``) is
+    direction §14.3 V4 exists to kill. The comparison beside it (``row.id``) is
     exact, so the weaker signal was the looser one. Word boundaries make this
     the same KIND of test as the id check.
 
@@ -528,14 +585,27 @@ def _mentions(needle: str, row: _Evidence) -> bool:
         return True
     bounded = _ASCII_WORD_CHARS.search(folded) is not None
     pattern = None
+    ascii_pattern = None
     if bounded:
-        pattern = re.compile(rf"(?<!\w){re.escape(folded)}(?!\w)")
+        escaped = re.escape(folded)
+        pattern = re.compile(rf"(?<!\w){escaped}(?!\w)")
+        # The same boundary drawn over ASCII word characters only. An anchor from
+        # a spaced script can appear INSIDE unspaced text (`ACME` in
+        # `我们签署了ACME的合同`), where the Unicode `\w` lookarounds can never hold
+        # because the adjacent ideograph is itself a word character — the measure
+        # then reported 0.0 coverage for the row that literally answers. In such
+        # a haystack adjacency is not a word boundary, so the ASCII boundary is
+        # the correct test; it is tried only AFTER the strict one, so spaced
+        # scripts keep today's semantics.
+        ascii_pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.ASCII)
     for candidate in (row.text, *row.entities):
         if not candidate:
             continue
         haystack = " ".join(candidate.split()).casefold()
         if pattern is not None:
             if pattern.search(haystack):
+                return True
+            if ascii_pattern is not None and ascii_pattern.search(haystack):
                 return True
         elif folded in haystack:
             return True
@@ -614,7 +684,7 @@ def assess_sufficiency(
             raise ValueError(
                 "an anchor must name something — an empty/blank anchor matches "
                 "every row, so counting it reports full coverage for an entity "
-                "nobody named (the fail-open direction §14.1 V4 forbids)"
+                "nobody named (the fail-open direction §14.3 V4 forbids)"
             )
     if required_anchor_coverage is not None and not anchors:
         raise ValueError(
@@ -660,16 +730,33 @@ def assess_sufficiency(
     # The provenance measure is assessed ONLY when the rows actually carry the
     # field — see `_Evidence.provenance`. An unfetched field is unassessed, not
     # zero: a flag-off read must not be scored as insufficient evidence.
+    provenance_unassessed = False
     if required_provenance_coverage is not None:
-        assessable = [r for r in rows if r.provenance is not None]
-        if assessable:
-            value = float(len(assessable)) / float(len(rows))
+        # The denominator is the rows whose provenance was actually FETCHED and
+        # the numerator the ones carrying a LINK. A row read with provenance on
+        # but no link measures 0.0 (evidence with no source); only a read that
+        # never fetched the field leaves the measure unassessed, because scoring
+        # that as insufficient would punish a flag rather than the evidence.
+        # ⛔ A CONFIGURED measure that could not be assessed never yields
+        # ``sufficient``: it makes the verdict undetermined instead.
+        fetched = [r for r in rows if r.provenance_fetched]
+        if fetched:
+            linked = sum(1 for r in fetched if r.provenance is not None)
+            value = float(linked) / float(len(fetched))
             measures.append((MEASURE_PROVENANCE_COVERAGE, value))
             if value < required_provenance_coverage:
                 failures.append(REASON_PROVENANCE_THIN)
+        else:
+            provenance_unassessed = True
 
     if failures:
         return SufficiencyVerdict(INSUFFICIENT, tuple(failures), tuple(measures))
+    if provenance_unassessed:
+        # The caller configured a measure the rows could not support. Another
+        # measure passing does not stand in for it — returning ``sufficient``
+        # here asserted a green over a requirement nobody measured.
+        return SufficiencyVerdict(
+            UNDETERMINED, (REASON_PROVENANCE_UNASSESSED,), tuple(measures))
     if not measures:
         return SufficiencyVerdict(UNDETERMINED, (REASON_NO_MEASURE,), ())
     return SufficiencyVerdict(SUFFICIENT, (REASON_MEASURES_MET,), tuple(measures))
@@ -714,6 +801,29 @@ class SufficiencyRoute:
         if self.budget_remaining < 0:
             raise ValueError(
                 f"budget_remaining must be a non-negative int, got {self.budget_remaining!r}")
+        # The `escalated` axis, and the budget's own coherence. The factory always
+        # gets these right, but the route is the artifact a consumer RECORDS and
+        # then replays (`route_sufficiency(verdict, escalated=route.escalated,
+        # budget=route.budget_remaining)`), so a hand-built or deserialised route
+        # that contradicts itself would defeat the ONE bound that stops a walk
+        # loop — the same standard this type already applies to verdict and reason.
+        if self.route == ROUTE_ESCALATE_TIER and self.escalated is not True:
+            raise ValueError(
+                f"route {self.route!r} DIRECTS a walk, so escalated must be True, "
+                f"got {self.escalated!r} — replaying this route would walk the same "
+                f"tier again forever"
+            )
+        if self.reason == REASON_ALREADY_ESCALATED and self.escalated is not True:
+            raise ValueError(
+                f"reason {self.reason!r} claims a walk is already behind this "
+                f"verdict, so escalated must be True, got {self.escalated!r}"
+            )
+        if self.reason == REASON_BUDGET_EXHAUSTED and self.budget_remaining != 0:
+            raise ValueError(
+                f"reason {self.reason!r} claims the budget is gone, so "
+                f"budget_remaining must be 0, got {self.budget_remaining!r} — a "
+                f"reason and a budget that disagree is a false record"
+            )
         # The route is the artifact a consumer RECORDS, so it holds the same
         # coherence the factory guarantees: an `escalate-tier` route is a
         # measured insufficiency (never a green), and the two budget reasons
@@ -744,6 +854,30 @@ class SufficiencyRoute:
             )
 
 
+    @property
+    def escalates_tier(self) -> bool:
+        """Does this route DIRECT a walk? ``False`` for every refused walk."""
+        return self.route == ROUTE_ESCALATE_TIER
+
+    @property
+    def sufficient(self) -> bool | None:
+        """The value to hand ``route_residency(sufficient=...)``.
+
+        Hand THIS, not ``verdict.sufficient``. The verdict says what was
+        MEASURED; this route says what the bound will actually PAY FOR. A verdict
+        that is insufficient while ``route_sufficiency`` REFUSED the walk (the
+        budget is gone, or a walk is already behind it) yields ``None`` here — so
+        the sibling router, whose ``sufficient is False`` branch escalates
+        unconditionally, cannot re-walk the tier this router just declined to
+        walk. Handing it the raw verdict bypassed the only bound there is.
+        """
+        if self.escalates_tier:
+            return False
+        if self.verdict == SUFFICIENT:
+            return True
+        return None
+
+
 def route_sufficiency(
     verdict: SufficiencyVerdict,
     *,
@@ -752,12 +886,20 @@ def route_sufficiency(
 ) -> SufficiencyRoute:
     """The §12.4 trigger, BOUNDED — escalate once, never walk a tier loop.
 
-    ``budget``      remaining escalation steps the caller will pay for. **The
-                    tier count is OPEN per §12.3, so it is NOT hard-coded here —
-                    not even as a default**: a default of ``1`` would settle the
-                    two-tier fold for every caller who omits it, which is the
-                    same class of un-chosen target ``_threshold`` refuses. Every
-                    caller states the policy it is implementing.
+    ``budget``      the caller's escalation PERMIT. **Mandatory, with no
+                    default**: §12.3's tier count is OPEN, so an omitted
+                    argument would answer it by default for every caller — the
+                    same class of un-chosen target ``_threshold`` refuses.
+                    ⚠️ WHAT IT ACTUALLY BUYS: this router spends AT MOST ONE
+                    step, because ``escalated`` — not the budget's SIZE — is
+                    what bounds a chain (a still-insufficient verdict after a
+                    walk is reported, never re-walked). So ``budget > 1``
+                    authorises a LATER chain, not a second walk in this one, and
+                    the value is carried back on ``budget_remaining`` for the
+                    caller's own accounting. A caller wanting a third tier
+                    re-enters with the deeper tier's OWN verdict, and whether
+                    that walk happens is that chain's decision: §12.3's count
+                    stays a product ruling this module does not make.
     ``escalated``   this answer has already been walked deeper once, so a still
                     insufficient verdict is reported, not re-walked. That is the
                     bound on §12.7's *"router overhead"*: an unbounded repair
@@ -997,6 +1139,10 @@ def plan_writeback(
     units: list[SummaryUnit] = []
     refusals: list[WritebackRefusal] = []
     seen: dict[str, SummaryUnit] = {}
+    #: Keys whose findings disagreed about the claim's CLASS. Neither may be
+    #: written back: the dedupe cannot pick one, and picking by input order would
+    #: be §12.7's incorrect promotion decided by iteration order.
+    conflicted: set[str] = set()
 
     for finding in findings:
         claim = finding.claim if isinstance(finding.claim, str) else ""
@@ -1017,7 +1163,15 @@ def plan_writeback(
             continue
         key = unit_key(finding.span, claim)
         if key in seen:
-            # Idempotent: the same verified finding is ONE unit.
+            if seen[key].claim_class != finding.claim_class:
+                # Same identity, different CLASS: refuse the KEY outright rather
+                # than keep whichever arrived first. Order-independent by
+                # construction, and REPORTED — a silent drop here would be the
+                # promotion door closing quietly instead of bolted.
+                conflicted.add(key)
+                refusals.append(
+                    WritebackRefusal(claim=claim, reason=REFUSAL_CLASS_CONFLICT))
+            # Otherwise idempotent: the same verified finding is ONE unit.
             continue
         unit = SummaryUnit(
             unit_key=key,
@@ -1028,4 +1182,6 @@ def plan_writeback(
         seen[key] = unit
         units.append(unit)
 
+    if conflicted:
+        units = [unit for unit in units if unit.unit_key not in conflicted]
     return WritebackPlan(units=tuple(units), refusals=tuple(refusals))
