@@ -28,12 +28,13 @@ Two verbs against ONE declaration (``tortoise/cost_dimensions.py``):
        (every command in a multi-command ``ALTER TABLE`` included, not only the
        first). A column renamed in an appended migration and not in the declaration
        fails here, and so does an RPC renamed by ``ALTER FUNCTION … RENAME TO`` or
-       dropped by ``DROP FUNCTION``, and a multi-target ``DROP TABLE a, b`` takes
-       BOTH tables' columns with it. Nothing is matched as a substring or inside a
+       dropped by ``DROP FUNCTION``, a multi-target ``DROP TABLE a, b`` takes
+       BOTH tables' columns with it and a multi-target ``DROP FUNCTION f(a), g(b)``
+       takes both functions. Nothing is matched as a substring or inside a
        SQL comment — the strip is quote-aware, so a ``--`` inside a string literal
        cannot swallow the DDL after it — and an input the replay cannot lex
-       (unterminated literal / body / block comment, unreadable ``DROP TABLE``
-       target) is reported as a FINDING, never skipped.
+       (unterminated literal / body / block comment, unreadable ``DROP TABLE`` or
+       ``DROP FUNCTION`` target) is reported as a FINDING, never skipped.
     3. **no dead hook** — a dimension's writer (or reader, when the read path is
        the primitive) must have a call site in a tracked NON-TEST, NON-TOOL file,
        or the declaration must carry ``unscheduled_reason``. #4493's defect was a
@@ -414,9 +415,12 @@ _CREATE_FUNCTION = re.compile(
 _ALTER_FUNCTION_RENAME = re.compile(
     rf"^\s*ALTER\s+FUNCTION\s+(?:public\.)?({_IDENT})\s*(?:\([^)]*\))?\s*"
     rf"RENAME\s+TO\s+({_IDENT})", re.IGNORECASE | re.DOTALL)
+#: ``DROP FUNCTION`` takes a TARGET LIST too (``DROP FUNCTION IF EXISTS f(a),
+#: g(b)`` drops both, Postgres' grammar is ``name [, ...] [CASCADE|RESTRICT]``), so
+#: the whole list is captured and split; the single-identifier form dropped only
+#: the first function and left every later one reading as still defined.
 _DROP_FUNCTION = re.compile(
-    rf"^\s*DROP\s+FUNCTION\s+(?:IF\s+EXISTS\s+)?(?:public\.)?({_IDENT})",
-    re.IGNORECASE)
+    r"^\s*DROP\s+FUNCTION\s+(?:IF\s+EXISTS\s+)?(.*)$", re.IGNORECASE | re.DOTALL)
 
 
 @dataclass
@@ -439,12 +443,15 @@ class _Schema:
     Every verb moves the end state, not just the first one in a statement: a
     single ``ALTER TABLE`` may carry several commands, and a ``DROP TABLE`` takes
     the columns it held with it — EVERY table of a multi-target ``DROP TABLE a,
-    b``, not only the first. Missing either left a column that the schema no
-    longer has reading as present — the stale-declaration fail-open.
+    b``, not only the first. ``DROP FUNCTION`` takes a target list too, so every
+    function of ``DROP FUNCTION f(a), g(b)`` is removed, not only the first.
+    Missing any of these left a column or function that the schema no longer has
+    reading as present — the stale-declaration fail-open.
 
     ``problems`` carries what the replay could NOT read (an unlexable corpus, an
-    unreadable ``DROP TABLE`` target). ``check_ledger`` reports each as drift, so a
-    statement the replay skipped is never a statement that passed.
+    unreadable ``DROP TABLE`` or ``DROP FUNCTION`` target). ``check_ledger``
+    reports each as drift, so a statement the replay skipped is never a statement
+    that passed.
     """
 
     columns: dict[str, set[str]]
@@ -479,7 +486,10 @@ def _effective_schema(sql: str) -> _Schema:
             continue
         drop_function = _DROP_FUNCTION.match(statement)
         if drop_function:
-            functions.discard(_table_name(drop_function.group(1)))
+            targets, unreadable = _drop_function_targets(drop_function.group(1))
+            for target in targets:
+                functions.discard(target)
+            problems.extend(unreadable)
             continue
         alter_function = _ALTER_FUNCTION_RENAME.match(statement)
         if alter_function:
@@ -536,6 +546,37 @@ def _drop_table_targets(raw: str) -> tuple[list[str], list[str]]:
             problems.append(
                 f"DROP TABLE target {part.strip()!r} cannot be read — the tables it "
                 "names are not tracked")
+    return targets, problems
+
+
+def _drop_function_targets(raw: str) -> tuple[list[str], list[str]]:
+    """Every function a ``DROP FUNCTION`` names, plus the targets it cannot read.
+
+    ``DROP FUNCTION`` takes a comma-separated target list and Postgres drops all of
+    them in one statement, so discarding only the FIRST left every later function
+    reading as still defined for the rest of the replay — the same
+    stale-declaration fail-open the sibling ``DROP TABLE`` replay closes one verb
+    over (``_drop_table_targets``), where the drop-then-recreate pattern is the
+    repo's live idiom. A target this replay cannot read is a PROBLEM, never a
+    silent half-drop.
+
+    Each target carries its SIGNATURE (``public.f_one(text, integer)``), so the
+    argument list is stripped after the split — ``_split_top_level`` keeps a
+    multi-argument signature in one part, and the replay is name-shaped (see
+    ``_Schema``).
+    """
+    targets: list[str] = []
+    problems: list[str] = []
+    for part in _split_top_level(raw):
+        token = re.sub(r"\b(?:CASCADE|RESTRICT)\s*$", "", part.strip(), flags=re.IGNORECASE)
+        token = re.sub(r"^public\.", "", token.strip(), flags=re.IGNORECASE)
+        named = re.fullmatch(rf"({_IDENT})\s*(?:\(.*\))?", token, flags=re.DOTALL)
+        if named:
+            targets.append(_table_name(named.group(1)))
+        elif token:
+            problems.append(
+                f"DROP FUNCTION target {part.strip()!r} cannot be read — the function "
+                "it names is not tracked")
     return targets, problems
 
 

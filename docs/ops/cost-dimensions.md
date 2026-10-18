@@ -75,7 +75,8 @@ declares the limit instead of inventing one.
    COLUMN`, `DROP COLUMN`, `RENAME TO`, `DROP TABLE`, `CREATE [OR REPLACE] FUNCTION
    public.<name>(`, `ALTER FUNCTION … RENAME TO` and `DROP FUNCTION` all move the end
    state — every command in a multi-command `ALTER TABLE`, not only the first, and
-   **every** table of a multi-target `DROP TABLE a, b` — which is
+   **every** table of a multi-target `DROP TABLE a, b` and **every** function of a
+   multi-target `DROP FUNCTION f(a), g(b)` — which is
    how this repo renames things (`20260915000001_tenancy_team_to_org.sql` appends the
    rename and leaves the earlier files' historical `team` spelling untouched). Nothing is
    matched as a bare substring and nothing inside a SQL comment, so prose that names the
