@@ -25,7 +25,7 @@ This epic's deploy surface is **web dashboard + hosted API + served agent skill*
 
 | # | High-level E2E (scope §4) | Surfaces (verbatim from `04-test-design.md`, the map #1992 declares canonical) | Evidence | Result |
 |---|---|---|---|---|
-| 1 | One-sitting first-run (north star) | 1, 3, 4, 5, 7, 8, 17 | `test_dashboard_onboarding.py` (40 passed) + state/seed suites | ✅ PASS (browser walk, local preview) |
+| 1 | One-sitting first-run (north star) | 1, 3, 4, 5, 7, 8, 17 | `test_dashboard_onboarding.py` (40 passed) + state/seed suites | ⚠️ PASS at the browser walk (40/40); the rows it maps carry legs not fully run — surface 7's seed (53/54, D1) and the hosted-e2e of 7, the walk-through of 8 and the manual leg of 5 |
 | 2 | Overview calm | 9, 16 | browser walk + `website/apps/dashboard/src/overviewSettings.test.js` (8/8) + `test_onboarding_w4_settings.py` (server leg) | ✅ PASS — 3 elements, zero toggles, Settings present in the rendered nav |
 | 3 | Org-name capture | 3, 16 | `test_one_free_org_entitlement.py`, `test_free_team_entitlement.py` + wizard | ✅ PASS |
 | 4 | Ontology-precise seed | 7, 15 | `test_onboarding_seed.py`, `test_onboarding_seed_endpoint.py` | ⚠️ **PARTIAL** — 53 of 54 pass; one test has never passed under load (D1). Its graph-state assertions do hold on a quiet host |
@@ -65,7 +65,7 @@ The evidence behind E2E-2 is split, and the two halves are not interchangeable: 
     shrink variant. Partly covered is not the same state as not executed, so 16 is named separately rather than folded
     in with 5 and 15.
 
-Two things are **outside** the 17's pass tally and are not counted in that number. They overlap in exactly one place,
+Two things sit **outside the 17 surfaces' own gates** — batch F's five e2e modules and the W11 funnel read — and neither is counted as a surface pass. Batch F nonetheless overlaps the surface set in exactly one place,
 stated here so the failure is not counted twice: **`tests/e2e/test_dashboard_identity.py::test_pending_invites_accept_lands_on_team`
 is one of the 40 batch-F failures below AND surface 12's assigned hosted-e2e leg.** It is counted **once** — as surface
 12's not-green (which is why the green count is 15, not 16) — and its cause is D4's deployed-origin redirect, not a
@@ -108,7 +108,7 @@ weakest evidence: an anchor commit, in a shared hub tree whose state at measurem
 | 16 Wizard shrink + copy sweep | hosted-e2e + manual | `test_onboarding_variants.py` + screenshot ("Your Organization is live") | ⚠️ PASS — 1 test in this file (the dist guard, D3) failed at `fbc1d96d5` and passed on re-run at `180fe6fd3`; **proven** a stale-build artifact, not a code defect. Manual leg **partly** covered: the capture shows the copy sweep, not every shrink variant — so surface 16's evidence spans both heads, the suite at `fbc1d96d5` and the capture plus the D3 re-run at `180fe6fd3` |
 | 17 Cross-W full journey | hosted-e2e + walk-through | `test_dashboard_onboarding.py` — **40 passed** | ✅ PASS |
 
-**Totals, stated so the arithmetic can be checked:** **654 in-scope passed** (200 + 121 + 123 + 170 + 40) **plus 22 out-of-scope in batch F = 676** across the batches below (200 + 121 + 123 + 170 + 40 + 22), and **1 skipped**, which is also batch F's. Failures, split so the scope is unambiguous: **3 inside batches A–E** — batch A's 1 (D1) and batch B's 2 (D2, D3), each named and reproduced — plus **batch F's 40 failures** — **39** of them D4 and outside the epic's 17 surfaces, and the 40th (`test_pending_invites_accept_lands_on_team`) **surface 12's assigned hosted-e2e leg, counted once under surface 12** (see the overlap paragraph), so it is **one more in-scope failure, inside batch F**, counted once under surface 12 rather than netted into the A–E tally above. Total failures 3 + 40 = 43. Batch F also contributes the single skip, so it is counted for passes and skips but not folded into the in-scope failure tally.
+**Totals, stated so the arithmetic can be checked:** **654 in-scope passed** (200 + 121 + 123 + 170 + 40) **plus 22 passed in batch F = 676** (their surface attribution was not preserved — at least one of those modules carries an in-scope pin, see D4) across the batches below (200 + 121 + 123 + 170 + 40 + 22), and **1 skipped**, which is also batch F's. Failures, split so the scope is unambiguous: **3 inside batches A–E** — batch A's 1 (D1) and batch B's 2 (D2, D3), each named and reproduced — plus **batch F's 40 failures** — **39** of them D4 and outside the epic's 17 surfaces, and the 40th (`test_pending_invites_accept_lands_on_team`) **surface 12's assigned hosted-e2e leg, counted once under surface 12** (see the overlap paragraph), so it is **one more in-scope failure, inside batch F**, counted once under surface 12 rather than netted into the A–E tally above: **four in-scope failures in total**, the other 39 of batch F's 40 outside the epic's 17. All failures: 3 + 40 = 43. Batch F also contributes the single skip, so it is counted for passes and skips but its failures are attributed individually rather than netted as a block.
 
 ```text
 A  200 passed, 1 failed   state ×6 + seed ×2                      (D1)
