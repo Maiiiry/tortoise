@@ -703,6 +703,74 @@ def test_about_document_title_keyed_resolution(sup):
     assert n == 1, f"aboutDocument should terminate on the document Source: {n}"
 
 
+def test_pre_d10_title_keyed_descriptor_leaves_no_residue(sup):
+    """B5 / #5228: an `aboutDocument` descriptor written by PRE-D10 code is
+    keyed by the document's TITLE (`stub_key` used `title or name`; D10 moved
+    the replay KEY to `url` together with the label, #5026).
+
+    The label-scoped resolver correctly REFUSES that key — it must never mint
+    a phantom :Source — but a refusal must be COMPLETE. Pass-2's snapshot
+    resurrection (`aboutEntities` -> `_create_about_edges`, which matches a
+    document-bearing Source on `url` OR `title`) re-attaches the edge at the
+    OLD point, and the miss `continue`d BEFORE the delete-leg, so the residue
+    survived on the superseded node while the successor held nothing ("on
+    neither node"). The refusal must drop the descriptor fully, not
+    half-drop it.
+
+    The title/url asymmetry is the whole defect and is aboutDocument-only:
+    for every other derivable rel the resolver's predicate IS the
+    resurrection predicate, so a miss genuinely implies nothing to clean.
+    """
+    _, events, sdk = sup
+    doc = sdk.create_document("DocTitleOnly", "report")
+    # create_document does not journal DocumentCreated (#2296 durability
+    # audit) — journal the line the way the #2489 title-keyed test does, so
+    # pass-2 re-creates the document :Source (url = <doc id>, title = name).
+    with open(events / "events.jsonl", "a") as fh:
+        fh.write(json.dumps({
+            "event_id": sdk.ulid(),
+            "ts": datetime.now(UTC).isoformat(),
+            "type": "DocumentCreated", "initiated_by": "sdk",
+            "projection_version": 2, "id": doc["id"],
+            "title": "DocTitleOnly", "document_kind": "report",
+            "objectKind": "document", "status": "draft",
+        }) + "\n")
+    x = sdk.create_point("statement", "X", status="live",
+                         aboutEntities=["DocTitleOnly"])["id"]
+    succ = sdk.create_point("statement", "X'", status="live")["id"]
+    proj = sdk._get_proj()
+    _rebuild(sdk, events)
+    assert _struct_edges(proj, x) == {("aboutDocument", "DocTitleOnly")}, \
+        "precondition: pass-2 resurrection attaches the edge at old"
+    sdk.supersede_point(x, succ)
+    # Rewrite the journaled descriptor to its PRE-D10 spelling: the key the
+    # retired `stub_key` produced for this same transfer (title, not url).
+    log = events / "events.jsonl"
+    lines = [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
+    rekeyed = False
+    for ev in lines:
+        if (ev.get("type") == "DirectEdgeRepoint"
+                and ev.get("edge_type") == "aboutDocument"
+                and ev.get("src") == x):
+            ev["tgt"] = "DocTitleOnly"
+            ev["target_label"] = "Document"  # the retired label
+            ev["id"] = f"{x}->{succ}:aboutDocument:DocTitleOnly"
+            rekeyed = True
+    assert rekeyed, "no aboutDocument descriptor to re-key to the pre-D10 key"
+    log.write_text("".join(json.dumps(e) + "\n" for e in lines))
+    _rebuild(sdk, events)
+    assert not _struct_edges(proj, x), (
+        "the refused pre-D10 descriptor left stale residue on the old node "
+        "(the miss skipped the delete-leg) — #5228")
+    # The refusal is complete: the un-replayable descriptor is never
+    # re-attached to the successor either (no backfill for pre-D10 graphs,
+    # #2489) — it is dropped, not half-dropped.
+    assert ("aboutDocument", "DocTitleOnly") not in _struct_edges(proj, succ)
+    # Cleanup is idempotent: a second replay converges on the same state.
+    _rebuild(sdk, events)
+    assert not _struct_edges(proj, x)
+
+
 # ── Unresolvable-key skips at emission (zero regression) ──
 
 def test_name_less_about_point_target_skipped_at_emission(sup):

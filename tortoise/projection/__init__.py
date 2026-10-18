@@ -11477,6 +11477,7 @@ class FalkorProjection(
             from .edges import (
                 DERIVABLE_STRUCTURAL_RELS,
                 STRUCTURAL_REL_LABELS,
+                delete_refused_structural_target,
                 resolve_structural_target,
             )
             # Successor map old→new; resolve transitively to the final live
@@ -11733,6 +11734,22 @@ class FalkorProjection(
                             # could not have attached a same-rel edge either
                             # (name/url-based match), so nothing to clean or
                             # re-create.
+                            #
+                            # #5228: that equivalence holds for every rel but
+                            # `aboutDocument`, whose replay key (url, D10) is
+                            # NARROWER than its resurrection predicate (url OR
+                            # title). A pre-D10 title-keyed descriptor is
+                            # correctly REFUSED here (never minted/pointed) but
+                            # pass-2 DID resurrect the edge at a terminal old
+                            # point — so the refusal must be COMPLETED by
+                            # dropping that resurrection, or the edge ends on
+                            # neither node with a stale incidence left on the
+                            # old one. Same terminal-src guard as the resolved
+                            # path: a live re-created incarnation (id-reuse)
+                            # owns its edges.
+                            if _src_is_terminal(src):
+                                delete_refused_structural_target(
+                                    self.g, src, etype, tgt)
                             continue
                         # Delete-leg (old-side resurrection cleanup) runs BEFORE
                         # the dedupe skip — a dropped duplicate still cleans its

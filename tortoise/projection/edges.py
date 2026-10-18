@@ -241,6 +241,66 @@ def resolve_structural_target(g, label: str, key: str, rel: str):
     return {"internal": rows[0][0], "logical": rows[0][1]}
 
 
+def delete_refused_structural_target(g, old_id: str, rel: str, key: str) -> int:
+    """Complete a REFUSED structural descriptor: remove the pass-2
+    resurrection the label-scoped resolver could not name (#5228, D10 B5).
+
+    ``resolve_structural_target`` returning ``None`` means "no node at the
+    label-scoped replay KEY". For every derivable rel but ``aboutDocument``
+    that key predicate IS the one pass-2's snapshot resurrection matches on
+    (``_upsert_point_edges`` -> ``_create_about_edges`` -> ``_try_about_edge``),
+    so a miss already implies nothing was resurrected at the old point and
+    there is nothing to clean. D10 (#5026) split the two predicates for
+    ``aboutDocument`` ALONE: the replay key narrowed to ``url`` (the key moved
+    with the label, ``:Document`` -> ``:Source``) while live/replay
+    auto-detect still matches a document-bearing Source on ``url`` OR
+    ``title`` (the retired ``:Document.name`` convention, #211).
+
+    A journal written by PRE-D10 code therefore carries
+    ``tgt = <document title>``: pass-2 re-attaches
+    ``(old)-[:aboutDocument]->(Source)`` at the superseded point while the
+    resolver refuses the key — and without this cleanup the refusal is only
+    HALF-complete. The edge then ends on NEITHER node (the successor never
+    receives it) and the old node keeps a stale structural incidence, the
+    exact residue ``test_about_document_title_keyed_resolution`` claims to
+    cover for the url-keyed case.
+
+    The REFUSAL itself is deliberate and unchanged (re-accepting a title key
+    would re-point the rebuilt edge by a key D10 retired) — this helper only
+    makes it complete: the descriptor is fully dropped, not half-dropped. No
+    backfill for pre-D10 graphs (#2489) — the edge is lost, honestly.
+
+    Deletes ONLY ``rel`` edges out of ``old_id`` whose target is a node the
+    pass-2 resurrection could have matched — the SAME predicate as
+    ``_try_about_edge``'s Source branch, ``documentKind`` guard included,
+    constrained re-query on fresh internal ids (never a graph-wide or
+    rel-agnostic pattern delete, never a mint). The caller keeps the
+    terminal-src guard. Returns the number of edges deleted.
+    """
+    if rel != "aboutDocument" or not isinstance(key, str) or not key:
+        # Only aboutDocument's resurrection predicate is WIDER than its replay
+        # key (see above) — every other rel has nothing unmatched to clean. An
+        # empty/non-string key cannot match any node anyway (parity with
+        # `stub_key`/`_writable_id`).
+        return 0
+    # `rel` is pinned to the literal below by the guard above; `old_id` and
+    # `key` ride as parameters.
+    rows = g.query(
+        "MATCH (old:Point {id:$old})-[r:aboutDocument]->(t:Source) "
+        "WHERE (t.url = $key OR t.title = $key) "
+        "AND t.documentKind IS NOT NULL "
+        "RETURN ID(r), ID(t)",
+        params={"old": old_id, "key": key},
+    ).result_set
+    for rid, tid in rows:
+        g.query(
+            "MATCH (old:Point {id:$old})-[r:aboutDocument]->(t) "
+            "WHERE ID(r) = $rid AND ID(t) = $tid DELETE r",
+            params={"old": old_id, "rid": rid, "tid": tid},
+        )
+    return len(rows)
+
+
 # Canonical structural-edge predicate vocabulary (ONTOLOGY §3.2/§3.3 + #391).
 # Hoisted from create_edge so SDK surfaces (e.g. TortoiseSDK.ingest, epic #888
 # W4) can validate relation names WITHOUT string-duplicating the set.
