@@ -20521,8 +20521,18 @@ async def _membership_role(user_id: str, org_id: str) -> str | None:
     # fresh _make_sdk is GC'd with close-on-GC + SHUTDOWN NOSAVE, killing
     # the shared embedded server and losing un-saved cascade writes; the
     # anchor is process-lifetime and sees them).
-    sdk = _registry_anchor()
+    #
+    # ⛔ The anchor is resolved INSIDE the try (#8098 review, code-review P2):
+    # `_registry_anchor()` binds EAGERLY in URI mode (it returns the cached
+    # `_registry_probe_sdk()`, whose `_get_proj()` IS the connect), so a
+    # registry connect failure now raises from the anchor call itself. Resolved
+    # one line above the `try`, that failure skipped `_raise_503_if_cp_outage`
+    # and reached the global handler as a raw 500 — falsifying this helper's
+    # own #2380 outage contract three lines up. Keeping the resolve inside the
+    # same try is what preserves "outage ⇒ 503, never a raw 500" on the first
+    # registry access of a process.
     try:
+        sdk = _registry_anchor()
         # #2446: this read stays INLINE, and is declared in
         # `tests/test_read_routes_loop_responsiveness.py::_KNOWN_INLINE_HELPER_RESIDUAL`
         # beside `_membership_org`, `_org_node` and `_require_owner_admin` — the

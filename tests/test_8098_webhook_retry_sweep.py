@@ -367,6 +367,46 @@ def test_an_absent_counter_falls_back_and_the_counter_stays_one_node_read(
         f"on a graph that has a counter")
 
 
+@pytest.mark.parametrize("corrupt", [-1, "not-a-number"])
+def test_a_corrupt_counter_cannot_starve_delivery(sdk_factory, corrupt):
+    """#8098 review (ISSUE 1): an UNUSABLE counter must not read as head 0.
+
+    ``event_head_seq`` is not only the sweep's cheap gate: ``dispatch_pending``
+    reads it once and threads it into ``_due_subscriptions``, whose
+    ``s.cursor < $head`` clause decides whether a subscription is returned at
+    all. So a counter that read as 0 while the graph holds events with
+    ``seq > 0`` made every subscription look caught up — the graph stopped being
+    dispatched by the dream cycle AND the sweep, silently, with no log line.
+
+    The safe direction is the ABSENT-counter fallback already in the function
+    (the events' own ``max(:GraphEvent.seq)``): it can only over-admit. Both
+    parametrisations are red pre-fix — ``event_head_seq`` returned 0 and
+    ``dispatch_pending`` delivered nothing.
+    """
+    sdk = sdk_factory(ensure_schema=True)
+    proj = sdk._get_proj()
+    _seed_events(sdk, n=2)
+    assert wd.event_head_seq(proj.g) == 2, "the seeded graph should have a head"
+
+    # Corrupt the counter the writers bump — the #3902 / pre-#5379 shapes.
+    proj.g.query("MATCH (m:GraphEventMeta) SET m.last_seq=$bad",
+                 params={"bad": corrupt})
+
+    now = datetime.now(UTC)
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 now=now)
+    assert sub["cursor"] == 0
+
+    assert wd.event_head_seq(proj.g) >= 2, (
+        f"a corrupt counter ({corrupt!r}) read as the head — every "
+        "subscription then looks caught up and DELIVERY stops with no log line")
+    assert wd.due_subscription_count(proj.g, now) == 1, (
+        "the gate answered 0 for a graph that IS behind its events")
+    assert wd.dispatch_pending(proj, transport=FakeTransport([200, 200]),
+                               now=now)["delivered"] == 2, (
+        "the dispatcher delivered nothing — the corrupt counter starved it")
+
+
 def test_the_gate_refuses_a_subscription_that_is_behind_but_not_yet_due(
         sdk_factory):
     """The OTHER half of the pair: being behind is necessary, not sufficient.

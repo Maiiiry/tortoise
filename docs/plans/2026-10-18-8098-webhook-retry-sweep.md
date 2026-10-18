@@ -90,3 +90,24 @@ table in the same commit.
 * **Per-graph time bound.** A pass is bounded by the executor size and `TIMEOUT_S` per POST, not by
   a wall clock; a graph with 25 healthy-but-slow subscriptions can outlive the interval. The
   in-flight set makes that safe (the next pass skips it) rather than queued.
+
+## 7. Review-fix records (the two defects the last review rounds found)
+
+* **An unusable event counter must not read as head 0.** `event_head_seq()` is not only the
+  sweep's cheap gate: `dispatch_pending` reads the head once and threads it into
+  `_due_subscriptions`, whose `s.cursor < $head` clause decides whether a subscription is
+  returned at all. Returning 0 for a corrupt (non-numeric) or negative `:GraphEventMeta.last_seq`
+  therefore STOPPED DELIVERY on that graph — dream cycle and sweep alike, silently — where the
+  pre-fix code was harmless only because the delivery path never read the counter. A corrupt
+  counter now falls back to the events' own `max(:GraphEvent.seq)` (the absent-counter branch the
+  function already had), which can only over-admit. Pinned by
+  `test_a_corrupt_counter_cannot_starve_delivery` (both the negative and the non-numeric shape).
+* **`_registry_anchor()` binds eagerly in URI mode, so it is resolved INSIDE the outage map.**
+  The anchor returns the cached `_registry_probe_sdk()`, whose `_get_proj()` IS the connect, so
+  the first registry access of a process raises from the anchor call rather than from the first
+  query. Resolved one line above `_membership_role`'s `try`, that failure skipped
+  `_raise_503_if_cp_outage` and reached the global handler as a raw 500, falsifying the #2380
+  contract stated three lines above the code. Pinned by
+  `test_registry_anchor_connect_failure_503` (which raises from the ANCHOR, not from
+  `_get_registry()` — the sibling outage tests all raise from the query and cannot see the
+  placement) plus its non-outage control.

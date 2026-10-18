@@ -558,23 +558,48 @@ def event_head_seq(graph) -> int:
     STARVED by a gate that assumed "no counter ⇒ no events"; the fallback runs
     only on the un-countered graph, so the steady state keeps the one-node read.
 
-    A corrupt (non-numeric or negative) counter reads as 0 rather than raising:
-    this is the sweep's cheap gate, and the caller treats a raise as "skip this
-    graph this pass". A too-LARGE counter is left alone — it over-admits, which
-    costs one SDK open, while clamping it would stall deliveries.
+    ⛔ A corrupt (non-numeric or negative) counter FALLS BACK to the events'
+    own ``max(:GraphEvent.seq)`` — the SAME read the absent-counter branch
+    performs — and never reads as 0 (#8098 review, ISSUE 1). Two reasons, and
+    the second is why this is not a cosmetic preference:
+
+    * 0 is the STALLING direction, not the safe one. The house rule on this
+       path is "over-admit is cheap, stalling is not"; a counter that reads as
+       0 on a graph holding events with ``seq > 0`` makes every subscription
+       look caught up.
+    * ``head`` is NOT only the sweep's cheap gate. ``dispatch_pending`` reads it
+       once and threads it into ``_due_subscriptions``, whose
+       ``s.cursor < $head`` clause decides whether a subscription is returned at
+       all. So on a corrupt-counter graph a 0 would stop DELIVERY (dream cycle
+       and sweep alike) with no log line — the pre-fix behaviour was harmless
+       only because the delivery path never read the counter.
+
+    The fallback runs only on an already-broken graph, so the steady state keeps
+    the one-node read. A too-LARGE counter is still left alone — it over-admits,
+    which costs one SDK open, while clamping it could stall deliveries.
     """
+    def _events_head() -> int:
+        """The events' own max seq — the fallback for an unusable counter."""
+        rows = graph.query(
+            "MATCH (e:GraphEvent) RETURN max(e.seq)").result_set
+        value = rows[0][0] if rows else None
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
     rows = graph.query(
         "MATCH (m:GraphEventMeta) RETURN max(m.last_seq)").result_set
     value = rows[0][0] if rows else None
     if value is None:
-        rows = graph.query(
-            "MATCH (e:GraphEvent) RETURN max(e.seq)").result_set
-        value = rows[0][0] if rows else None
+        return _events_head()
     try:
         head = int(value)
     except (TypeError, ValueError):
-        return 0
-    return max(0, head)
+        return _events_head()
+    if head < 0:
+        return _events_head()
+    return head
 
 
 def due_subscription_count(graph, now: datetime | None = None,
