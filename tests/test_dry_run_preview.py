@@ -678,6 +678,26 @@ class TestBlastRadius:
 
         from tortoise.mcp_server import _preview_supersede
 
+        # The independent read used by assertion 4 below. Defined here so it
+        # can be run BOTH before and after the write: it must report nothing
+        # at the successor before the supersede and exactly one edge after,
+        # which is what makes assertion 4 discriminating rather than vacuous.
+        src, tgt = (new, other) if direction == "out" else (other, new)
+
+        def _landed() -> list:
+            return sdk._get_proj().g.query(
+                "MATCH (a)-[r]->(b) "
+                "WHERE coalesce(a.id, a.eventId, a.name, a.url) = $s "
+                "AND coalesce(b.id, b.eventId, b.name, b.url) = $t "
+                "AND type(r) = $rel "
+                "RETURN count(r), collect(r.label)",
+                params={"s": src, "t": tgt, "rel": rel},
+            ).result_set[0]
+
+        assert _landed() == [0, []], (
+            "the read used to pin the landed edge already matches BEFORE the "
+            "write — it would be a vacuous assertion")
+
         before = _edge_keys_at(sdk, new)
         preview = _preview_supersede(sdk, old, new)
         real = sdk.supersede(old, new)
@@ -701,8 +721,18 @@ class TestBlastRadius:
         # 3. and the old side is booked exactly as the writer books it.
         assert preview["edges_transferred_from_old"] == real["edges_transferred"]
         # 4. the writer really landed the edge on the successor (the preview is
-        #    not "right" because the whole write no-opped).
-        assert _edge_keys_at(sdk, new) - before == net_new
+        #    not "right" because the whole write no-opped). Read the edge back
+        #    INDEPENDENTLY: re-deriving `_edge_keys_at(...) - before` here would
+        #    be a tautology — both sides move together, so it could not tell
+        #    "the write landed it" from "the write no-opped" (the exact
+        #    distinction this assertion is here to make). A no-op write leaves
+        #    zero edges with these endpoints and no transferred `label` attr —
+        #    which `_landed()` reported as `[0, []]` before the write.
+        landed = _landed()
+        assert landed[0] == 1 and landed[1] == ["related-to"], (
+            f"the writer landed {landed[0]} {rel} edge(s) at the successor "
+            f"with attrs {landed[1]!r} — the preview cannot be \"right\" about "
+            "an edge the write never created with the attrs it never copied")
 
     def test_supersede_preview_still_drops_a_non_epistemic_far_endpoint(self, sdk):
         """Complement of the case above: the widened branch must NOT swallow a
