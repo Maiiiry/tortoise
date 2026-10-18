@@ -54,6 +54,30 @@ RED:
   RED.
 * **Silently drop a refusal** — return only ``units`` from ``plan_writeback`` →
   ``test_an_unverified_finding_is_refused_and_reported`` RED.
+* **Read provenance from the attribute key only** — drop the nested
+  ``provenance.source`` path (the shape ``SearchResult.to_dict()`` emits) →
+  ``test_the_provenance_link_is_read_from_the_wire_shape_the_read_path_emits``
+  and ``test_a_real_search_result_row_is_assessed_for_provenance`` RED (the
+  measure then has no producer on the only shape a caller holds).
+* **Match an anchor as an infix** — return to a bare substring test →
+  ``test_a_short_anchor_does_not_match_inside_an_unrelated_word`` RED.
+* **Count a blank anchor as covered** — drop the blank-anchor refusal →
+  ``test_an_empty_anchor_is_refused_not_counted_as_covered`` RED.
+* **Let an empty anchor set disable a supplied threshold** — drop the
+  ``required_anchor_coverage``/``anchors`` mismatch guard →
+  ``test_an_anchor_threshold_with_no_anchors_is_refused_not_silently_unassessed``
+  RED.
+* **Accept any falsy ``resident``** — return to ``resident is None or resident is
+  False`` with no type check →
+  ``test_a_non_bool_resident_is_refused_not_treated_as_established`` RED.
+* **Report an exhausted budget that is not exhausted** — drop the
+  ``already-escalated`` reason →
+  ``test_an_already_escalated_verdict_does_not_claim_an_exhausted_budget`` RED.
+* **Default the budget** — restore ``budget: int = 1`` →
+  ``test_there_is_no_default_budget`` RED (§12.3's tier count is OPEN).
+* **Bypass a ``SummaryUnit`` invariant** — drop any check in its
+  ``__post_init__`` →
+  ``test_a_summary_unit_cannot_be_constructed_without_its_invariants`` RED.
 
 Hermetic: no DB, no graph, no network (runs on the fast ``core`` lane).
 """
@@ -76,10 +100,12 @@ from tortoise.residency_router import (
     ROUTES,
     route_residency,
 )
+from tortoise.search_engine import SearchResult
 from tortoise.sufficiency_router import (
     INSUFFICIENT,
     MEASURE_ANCHOR_COVERAGE,
     MEASURE_PROVENANCE_COVERAGE,
+    REASON_ALREADY_ESCALATED,
     REASON_ANCHORS_UNCOVERED,
     REASON_BUDGET_EXHAUSTED,
     REASON_EVIDENCE_EMPTY,
@@ -112,13 +138,23 @@ MODULE_PATH = Path(__file__).resolve().parent.parent / "tortoise" / "sufficiency
 
 
 def _rows(*contents: str, provenance: bool = False) -> list[dict]:
-    """Assembled evidence rows in the shape the read path emits."""
+    """Assembled evidence rows in the shape the read path emits.
+
+    The provenance-carrying rows are built from a real
+    ``SearchResult(...).to_dict()`` rather than hand-written, because the
+    hand-written version drifted: it invented a TOP-LEVEL ``source_ref`` key,
+    which no producer emits, and so every provenance test was green against a
+    shape that does not exist on the wire while the real one went unread.
+    """
     out = []
     for i, content in enumerate(contents):
-        row: dict = {"id": f"p{i}", "content": content}
         if provenance:
-            row["source_ref"] = {"url": f"https://example.test/{i}"}
-        out.append(row)
+            out.append(SearchResult(
+                id=f"p{i}", content=content, point_kind="fact",
+                source_ref=f"https://example.test/{i}",
+            ).to_dict())
+            continue
+        out.append({"id": f"p{i}", "content": content})
     return out
 
 
@@ -149,7 +185,7 @@ def test_an_unassessed_read_serves_rather_than_escalates() -> None:
     assert verdict.verdict == UNDETERMINED
     assert verdict.reasons == (REASON_NO_MEASURE,)
 
-    route = route_sufficiency(verdict)
+    route = route_sufficiency(verdict, budget=1)
     assert route.route == ROUTE_SERVE
     assert route.reason == REASON_NO_MEASURE
 
@@ -196,9 +232,42 @@ def test_the_anchor_match_is_case_insensitive_and_can_hit_the_row_id() -> None:
     assert verdict.verdict == SUFFICIENT
 
 
+def test_a_short_anchor_does_not_match_inside_an_unrelated_word() -> None:
+    """A substring test over-reports coverage in the fail-open direction.
+
+    ``"ai" in "he said the main thing"`` is ``True``, so a short entity name
+    (``AI``, ``PR``, ``Q3``, ``Art``) scored COVERED on text that never mentions
+    it — a confident ``sufficient`` on evidence that does not answer the
+    question, which is the §14.1 V4 silent green arriving through the measure's
+    front door. The comparison beside it (``row.id``) is exact, so the weaker
+    signal was also the looser one.
+    """
+    verdict = assess_sufficiency(
+        _rows("He said the main thing"),
+        anchors=["AI"], required_anchor_coverage=1.0, resident=True)
+    assert verdict.verdict == INSUFFICIENT
+    assert verdict.reasons == (REASON_ANCHORS_UNCOVERED,)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+    # "Art" must not be covered by "start the process" either.
+    assert assess_sufficiency(
+        _rows("start the process"),
+        anchors=["Art"], required_anchor_coverage=1.0, resident=True,
+    ).verdict == INSUFFICIENT
+
+
+def test_a_short_anchor_still_matches_its_own_word() -> None:
+    """The boundary is a boundary, not a length heuristic."""
+    verdict = assess_sufficiency(
+        _rows("we shipped an AI model in Q3"),
+        anchors=["AI", "q3"], required_anchor_coverage=1.0, resident=True)
+    assert verdict.verdict == SUFFICIENT
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+
 def test_thin_provenance_is_insufficient() -> None:
     evidence = _rows("acme corp signed", "filler", provenance=True)
-    evidence[1].pop("source_ref")
+    evidence[1].pop("provenance", None)  # the second row fetched no link
     verdict = assess_sufficiency(
         evidence, required_provenance_coverage=1.0, resident=True)
     assert verdict.verdict == INSUFFICIENT
@@ -206,7 +275,92 @@ def test_thin_provenance_is_insufficient() -> None:
     assert verdict.measures == ((MEASURE_PROVENANCE_COVERAGE, 0.5),)
 
 
-def test_a_provenance_measure_over_unfetched_rows_is_unassessed() -> None:
+def test_the_provenance_link_is_read_from_the_wire_shape_the_read_path_emits() -> None:
+    """``SearchResult.to_dict()`` nests the link at ``provenance.source``.
+
+    The module read only the top-level ``source_ref`` ATTRIBUTE key, which no
+    producer emits on the wire — so on every real assembled-evidence row
+    (``sdk.search``/``tortoise_fts_query`` return ``[r.to_dict() …]``, and
+    ``ask_lane`` consumes exactly those) the provenance measure was permanently
+    unassessed: a declared measure with no producer, one layer down. Built from
+    a REAL ``SearchResult`` so the fixture cannot drift from the wire again.
+    """
+    row = SearchResult(
+        id="p1", content="acme corp signed", point_kind="fact",
+        source_ref="https://example.test/acme",
+    ).to_dict()
+    assert row["provenance"] == {"source": "https://example.test/acme"}
+    assert evidence_provenance(row) == "https://example.test/acme"
+    assert evidence_record(row).provenance == "https://example.test/acme"
+
+
+def test_a_real_search_result_row_is_assessed_for_provenance() -> None:
+    """The measure has a PRODUCER on the only shape a caller actually holds."""
+    rows = _rows("acme corp signed", "netherlands renewal", provenance=True)
+    verdict = assess_sufficiency(
+        rows, required_provenance_coverage=1.0, resident=True)
+    assert verdict.verdict == SUFFICIENT
+    assert verdict.measures == ((MEASURE_PROVENANCE_COVERAGE, 1.0),)
+
+
+def test_a_partially_provenanced_real_wire_read_is_measured_not_unassessed() -> None:
+    rows = _rows("acme corp signed", provenance=True) + _rows("filler")
+    verdict = assess_sufficiency(
+        rows, required_provenance_coverage=0.9, resident=True)
+    assert verdict.verdict == INSUFFICIENT
+    assert verdict.reasons == (REASON_PROVENANCE_THIN,)
+    assert verdict.measures == ((MEASURE_PROVENANCE_COVERAGE, 0.5),)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_an_empty_anchor_is_refused_not_counted_as_covered(blank: str) -> None:
+    """``"" in "anything"`` is ``True``, so a blank anchor is FULL coverage.
+
+    ``anchors=[""]`` with ``required_anchor_coverage=1.0`` measured ``1.0`` and
+    returned ``sufficient`` — a confident green from an anchor that names no
+    entity at all. Every other input in this module is refused when it is
+    unusable; an anchor element is no different, and an empty element is a
+    realistic residue of anchor resolution (``extract_subject_terms`` returns
+    ``[]`` for shapes with no resolvable subject), not a hypothetical.
+    """
+    with pytest.raises(ValueError):
+        assess_sufficiency(
+            _rows("unrelated filler"), anchors=[blank],
+            required_anchor_coverage=1.0, resident=True)
+
+
+def test_a_blank_anchor_cannot_hide_among_valid_ones() -> None:
+    with pytest.raises(ValueError):
+        assess_sufficiency(
+            _rows("acme corp signed"), anchors=["acme corp", " "],
+            required_anchor_coverage=1.0, resident=True)
+    with pytest.raises(TypeError):
+        assess_sufficiency(
+            _rows("acme corp signed"), anchors=["acme corp", 7],  # type: ignore[list-item]
+            required_anchor_coverage=1.0, resident=True)
+
+
+def test_an_anchor_threshold_with_no_anchors_is_refused_not_silently_unassessed() -> None:
+    """A configured measure cannot be disabled by an empty resolver result.
+
+    ``anchors=()`` with a supplied threshold skipped the measure entirely and
+    reported ``no-measure`` — blaming a configuration that DOES exist, and
+    converting "the caller could not even resolve what the question is about"
+    into an unassessed serve. Disabling the measure is the caller's explicit
+    act (``required_anchor_coverage=None``), not a side effect of an empty list.
+    """
+    with pytest.raises(ValueError):
+        assess_sufficiency(
+            _rows("acme corp signed"), anchors=(),
+            required_anchor_coverage=0.9, resident=True)
+
+    # Opting out explicitly is still legitimate, and still says `no-measure`.
+    opted_out = assess_sufficiency(
+        _rows("acme corp signed"), anchors=(),
+        required_anchor_coverage=None, resident=True)
+    assert opted_out.verdict == UNDETERMINED
+    assert opted_out.reasons == (REASON_NO_MEASURE,)
+
     """A flag-off read must not be scored as insufficient evidence.
 
     ``search_provenance_enabled()`` off means ``source_ref`` is never fetched, so
@@ -261,6 +415,20 @@ def test_an_unusable_threshold_is_refused_not_defaulted(bad: object) -> None:
 # ── §17.3: residency outranks sufficiency ─────────────────────────────────
 
 
+def test_a_non_bool_resident_is_refused_not_treated_as_established() -> None:
+    """§17.3's guard is an ALLOW-LIST, and its input is type-checked.
+
+    ``resident is None or resident is False`` are IDENTITY tests: every falsy
+    non-``False`` value (``0`` from a JSON boolean column, ``""``, ``[]``,
+    ``0.0``) satisfied neither, so the assessment proceeded as if residency had
+    been ESTABLISHED — and a read the cache never saw then walked a tier, the
+    one wrong answer §17.3 says is indistinguishable from a right one.
+    """
+    for bad in (0, 1, 0.0, "", [], {}, object()):
+        with pytest.raises(TypeError):
+            assess_sufficiency(_rows("filler"), resident=bad)  # type: ignore[arg-type]
+
+
 def test_a_residency_miss_is_never_an_insufficiency() -> None:
     """The collapse guard, at the sufficiency end of the seam.
 
@@ -281,7 +449,7 @@ def test_a_residency_miss_routes_to_the_record_before_any_tier_is_walked() -> No
     """The two routers COMPOSE, and the precedence holds across the seam."""
     miss = assess_sufficiency(_rows("filler"), resident=False)
     # The sufficiency router alone would serve; the residency router owns the repair.
-    assert route_sufficiency(miss).route == ROUTE_SERVE
+    assert route_sufficiency(miss, budget=1).route == ROUTE_SERVE
     assert route_residency(
         marker=RESIDENCY_NOT_HOT, sufficient=miss.sufficient).route == ROUTE_FETCH_RECORD
     # And a MEASURED insufficiency on a RESIDENT read still reaches the tier walk.
@@ -347,6 +515,44 @@ def test_a_second_insufficient_verdict_is_reported_not_re_walked() -> None:
     assert second.verdict == INSUFFICIENT
 
 
+def test_an_already_escalated_verdict_does_not_claim_an_exhausted_budget() -> None:
+    """The reason is a CLAIM, and ``budget_remaining`` must not contradict it.
+
+    ``route_sufficiency(insufficient, escalated=True, budget=3)`` reported
+    ``escalation-budget-exhausted`` with ``budget_remaining=3`` — two causes
+    ("already walked" and "nothing left to spend") sharing one reason, so the
+    record asserted an exhaustion that had not happened. ``residency_router.py``
+    states the rule this broke: *"the reason must name the truth too, or a
+    `reason`-keyed consumer reads a claim."*
+    """
+    route = route_sufficiency(_insufficient(), escalated=True, budget=3)
+    assert route.route == ROUTE_SERVE
+    assert route.reason == REASON_ALREADY_ESCALATED
+    assert route.reason != REASON_BUDGET_EXHAUSTED
+    assert route.budget_remaining == 3          # nothing was actually spent
+    assert route.verdict == INSUFFICIENT        # still not a green
+
+    # ... and a genuinely empty budget still says so, with nothing left.
+    spent = route_sufficiency(_insufficient(), escalated=True, budget=0)
+    assert spent.reason == REASON_BUDGET_EXHAUSTED
+    assert spent.budget_remaining == 0
+
+
+def test_there_is_no_default_budget() -> None:
+    """§12.3's tier count is OPEN — so it cannot be settled by an omission.
+
+    ``budget: int = 1`` IS the one-step/two-tier policy, hard-coded as a
+    default for exactly the callers who did not choose it, while the docstring
+    claimed it was not hard-coded here. Same class of un-chosen target
+    ``test_there_is_no_default_threshold`` refuses for the thresholds.
+    """
+    budget = inspect.signature(route_sufficiency).parameters["budget"]
+    assert budget.default is inspect.Parameter.empty
+    assert budget.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        route_sufficiency(_insufficient())  # type: ignore[call-arg]
+
+
 def test_a_zero_budget_never_escalates() -> None:
     route = route_sufficiency(_insufficient(), budget=0)
     assert route.route == ROUTE_SERVE
@@ -356,9 +562,9 @@ def test_a_zero_budget_never_escalates() -> None:
 def test_rescinding_a_sufficiency_verdict_is_refused_not_coerced() -> None:
     """A bare boolean cannot carry WHY, and ``None`` is a real state."""
     with pytest.raises(TypeError):
-        route_sufficiency(False)  # type: ignore[arg-type]
+        route_sufficiency(False, budget=1)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
-        route_sufficiency(None)  # type: ignore[arg-type]
+        route_sufficiency(None, budget=1)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("bad", [-1, True, 1.0, "1"])
@@ -383,7 +589,7 @@ def test_a_sufficiency_route_is_never_the_residency_repair() -> None:
 ])
 def test_route_sufficiency_only_ever_emits_two_of_the_three_routes(
         verdict: SufficiencyVerdict) -> None:
-    emitted = route_sufficiency(verdict).route
+    emitted = route_sufficiency(verdict, budget=1).route
     assert emitted in (ROUTE_SERVE, ROUTE_ESCALATE_TIER)
     assert emitted in ROUTES
 
@@ -443,7 +649,11 @@ def test_the_router_is_pure_no_io_no_model_no_clock() -> None:
                 imported.add(f".{node.module}")
             elif node.module:
                 imported.add(node.module.split(".")[0])
-    allowed_stdlib = {"__future__", "collections", "hashlib", "dataclasses", "typing"}
+    # ``re`` is here because the anchor match must be WORD-bounded: a bare
+    # substring test scores a short entity name (``AI``, ``Art``) as covered by
+    # unrelated text. It is a pure text operation — no I/O, no clock, no model.
+    allowed_stdlib = {"__future__", "collections", "hashlib", "dataclasses",
+                      "typing", "re"}
     # The ONLY in-package import is the route vocabulary's single home.
     allowed_local = {".residency_router"}
     assert imported <= allowed_stdlib | allowed_local, imported - (allowed_stdlib | allowed_local)
@@ -573,6 +783,33 @@ def test_planning_a_write_back_mutates_nothing_it_was_given() -> None:
 def test_an_unaddressable_span_is_refused(kwargs: dict) -> None:
     with pytest.raises(ValueError):
         SourceSpan(**kwargs)
+
+
+def test_a_summary_unit_cannot_be_constructed_without_its_invariants() -> None:
+    """The TYPE holds its own invariants, not only ``plan_writeback``'s output.
+
+    ``SummaryUnit`` is public (``__all__``) and §12.5's persistence seam is the
+    caller's, so a hand-built unit is the realistic route by which an
+    unattributable belief reaches the store. ``span``/``derived``/``unit_key``
+    were type HINTS and defaults only — ``span=None``, ``span="not-a-span"`` and
+    ``derived=False`` all constructed fine, so §12.5's "no unattributable
+    belief" and "always derived" were true of one function, not of the type.
+    """
+    good = dict(unit_key=unit_key(_span(), "acme corp signed the contract in March"),
+                claim="acme corp signed the contract in March",
+                claim_class="semantic", span=_span())
+    assert SummaryUnit(**good).derived is True  # the valid shape still works
+
+    with pytest.raises(TypeError):
+        SummaryUnit(**{**good, "span": None})  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        SummaryUnit(**{**good, "span": "not-a-span"})  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        SummaryUnit(**{**good, "derived": False})
+    with pytest.raises(ValueError):
+        SummaryUnit(**{**good, "unit_key": ""})
+    with pytest.raises(ValueError):
+        SummaryUnit(**{**good, "unit_key": "hand-written-key"})
 
 
 def test_a_unit_key_requires_an_address() -> None:

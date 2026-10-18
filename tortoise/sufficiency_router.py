@@ -74,15 +74,25 @@ never ``hot``.
 cache could not see makes *"insufficient"* unestablished, so
 ``assess_sufficiency`` REFUSES to judge when the caller has not established
 residency (``resident`` is ``None`` or ``False``). A residency miss is repaired
-by fetching the record, never by walking a tier. The guard is the collapse
-guard, and it is pinned by test.
+by fetching the record, never by walking a tier. The guard is an ALLOW-LIST
+(``resident is not True``) and a non-``bool`` ``resident`` is refused outright:
+an identity test against ``False`` lets a JSON column's ``0`` through as if
+residency had been established, which turns the strongest guard here into a
+no-op in the expensive direction. Both are pinned by test.
 
 ⛔ **NO QUERY-CLASS INPUT — pinned structurally.** The router takes no
 ``query``, ``query_type``, ``complexity`` or ``intent`` argument, and a test
 greps the signature so a future lane cannot turn this into the classifier
 §12.4 rejects without reddening. ``anchors`` are **the entities the question
 references**, already resolved — a coverage measurement over the answer, not a
-prediction about the question.
+prediction about the question. Each is matched as a WORD, not an infix: a bare
+substring test scores ``AI`` covered on *"he said the main thing"*, which is a
+confident ``sufficient`` produced by a measure that never measured.
+
+**Provenance is read from the shape the read path emits.** ``SearchResult``
+carries ``source_ref`` as an ATTRIBUTE and nests it as ``provenance.source``
+on the wire (``to_dict()``, the #3837 additive contract) — both are read, so
+the measure has a producer on the one shape every caller actually holds.
 
 THE WRITE-BACK'S PROVENANCE DISCIPLINE (§12.5 · extractor §2.4.2)
 ================================================================
@@ -119,6 +129,7 @@ WHAT THIS MODULE DELIBERATELY IS NOT
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -131,6 +142,7 @@ __all__ = [
     "MEASURE_ANCHOR_COVERAGE",
     "MEASURE_PROVENANCE_COVERAGE",
     "REASONS",
+    "REASON_ALREADY_ESCALATED",
     "REASON_ANCHORS_UNCOVERED",
     "REASON_BUDGET_EXHAUSTED",
     "REASON_EVIDENCE_EMPTY",
@@ -193,10 +205,15 @@ REASON_NO_MEASURE = "no-measure"
 #: has not established insufficiency at all (§17.3).
 REASON_RESIDENT_MISS = "resident-miss"
 REASON_RESIDENT_UNASSESSED = "resident-unassessed"
-#: Serve reasons: a measured-sufficient answer, a verdict never established, and
-#: an insufficiency that has no budget left to repair.
+#: Serve reasons: a measured-sufficient answer, a verdict never established, an
+#: insufficiency that has no budget left to repair, and one whose walk is
+#: already behind it. The last two are DISTINCT on purpose: a ``reason`` is a
+#: claim, and claiming an exhausted budget while ``budget_remaining`` is three
+#: is the same class of false record §17.3 refuses (``residency_router``: *"the
+#: reason must name the truth too"*).
 REASON_NOT_ESTABLISHED = "sufficiency-not-established"
 REASON_BUDGET_EXHAUSTED = "escalation-budget-exhausted"
+REASON_ALREADY_ESCALATED = "already-escalated"
 
 REASONS: tuple[str, ...] = (
     REASON_EVIDENCE_EMPTY,
@@ -208,6 +225,7 @@ REASONS: tuple[str, ...] = (
     REASON_RESIDENT_UNASSESSED,
     REASON_NOT_ESTABLISHED,
     REASON_BUDGET_EXHAUSTED,
+    REASON_ALREADY_ESCALATED,
 )
 
 #: Write-back refusals (§12.5 / extractor §2.4.2). A refusal is RECORDED, never
@@ -225,15 +243,24 @@ REFUSALS: tuple[str, ...] = (
     REFUSAL_NO_CLAIM,
 )
 
-#: The key an evidence row carries its provenance link under (the same
-#: ``source_ref`` the ``SearchResult`` wire uses for ``Point.extractedFrom``).
+#: The ATTRIBUTE an evidence row / ``SearchResult`` carries its provenance
+#: under. On the WIRE it is nested — ``SearchResult.to_dict()`` emits
+#: ``{"provenance": {"source": …}}`` (``search_engine.py``, the #3837 additive
+#: contract, pinned by ``tests/test_search_promoted_fields.py``) — so the key
+#: here alone cannot read the shape the read path actually emits; see
+#: ``EVIDENCE_PROVENANCE_WIRE_KEY``.
 EVIDENCE_PROVENANCE_KEY = "source_ref"
+#: The key the provenance link lives under INSIDE the wire's ``provenance``
+#: block — the shape ``sdk.search`` / ``ask_lane`` hand a caller.
+EVIDENCE_PROVENANCE_WIRE_KEY = "source"
 
 #: The text keys an evidence row may carry its assembled content under, best
 #: first. ``snippet`` is the 200-char wire preview; it is read LAST because a
 #: truncated preview is a weaker coverage signal than the full content.
 _TEXT_KEYS = ("content", "summary", "text", "snippet")
+#: Top-level (attribute-shape) aliases, then the nested wire path.
 _PROVENANCE_KEYS = (EVIDENCE_PROVENANCE_KEY, "sourceRef")
+_PROVENANCE_WIRE_KEYS = (EVIDENCE_PROVENANCE_WIRE_KEY, EVIDENCE_PROVENANCE_KEY)
 
 
 # ── the evidence, normalised once ──────────────────────────────────────────
@@ -310,9 +337,14 @@ def evidence_provenance(data: object) -> Any:
     for key in _PROVENANCE_KEYS:
         if mapping.get(key):
             return mapping[key]
+    # The shape the read path actually emits: ``SearchResult.to_dict()`` nests
+    # the link as ``provenance.source``. Reading only the top-level attribute
+    # key left the provenance measure permanently unassessed on the one shape
+    # every real producer emits — a declared measure with no producer, one layer
+    # down from the defect #5009 exists to kill.
     nested = mapping.get("provenance")
     if isinstance(nested, Mapping):
-        for key in _PROVENANCE_KEYS:
+        for key in _PROVENANCE_WIRE_KEYS:
             if nested.get(key):
                 return nested[key]
     return None
@@ -375,8 +407,27 @@ def _threshold(name: str, value: object) -> float:
 
 
 def _mentions(needle: str, row: _Evidence) -> bool:
-    folded = needle.casefold()
-    return folded in row.text.casefold() or folded == row.id.casefold()
+    """Does ``row`` mention ``needle`` as a WORD, not as an infix?
+
+    A bare substring test is unbounded, and the whole verdict rests on this one
+    relevance check: ``"ai" in "he said the main thing"`` is ``True``, so a
+    short entity name (``AI``, ``PR``, ``Q3``, ``Art``) scored COVERED on text
+    that never mentions it — a confident ``sufficient`` in the fail-open
+    direction §14.1 V4 exists to kill. The comparison beside it (``row.id``) is
+    exact, so the weaker signal was the looser one. Word boundaries make this
+    the same KIND of test as the id check.
+
+    Whitespace is collapsed before matching (a phrase's internal spacing is not
+    part of its identity, same as ``_normalise_claim``); empty/blank anchors are
+    refused by ``assess_sufficiency`` long before they reach here.
+    """
+    folded = " ".join(needle.split()).casefold()
+    if not folded:
+        return False
+    if folded == row.id.casefold():
+        return True
+    return re.search(
+        rf"(?<!\w){re.escape(folded)}(?!\w)", row.text.casefold()) is not None
 
 
 def assess_sufficiency(
@@ -393,15 +444,23 @@ def assess_sufficiency(
                    and costs no extra retrieval (§12.4: one call, one pass).
     ``anchors``    the entities the question references, ALREADY RESOLVED by the
                    caller. Not a query class: the measure is the evidence's
-                   coverage of them, not a prediction about the question.
+                   coverage of them, not a prediction about the question. Each
+                   element must be a non-blank string: an empty anchor matches
+                   everything, so counting it would report ``1.0`` coverage for
+                   an entity nobody named.
     ``required_anchor_coverage`` / ``required_provenance_coverage``
                    caller-supplied thresholds. Omit one and that measure is NOT
                    ASSESSED (see ``REASON_NO_MEASURE``) — it never silently
-                   counts as met.
+                   counts as met. Supplying the anchor threshold while
+                   resolving NO anchors is refused rather than silently
+                   unassessed: the caller configured a measure, and reporting
+                   ``no-measure`` would blame a configuration that exists.
     ``resident``   §17.3's precedence: ``None`` = not established, ``False`` = a
                    residency miss. Either way this function REFUSES to call the
                    evidence insufficient — that is the record's repair, not a
-                   tier's.
+                   tier's. Anything that is not a real ``bool``/``None`` (``0``,
+                   ``""``, an int flag from a JSON payload) is REFUSED: an
+                   allow-list guard is what keeps this from failing open.
 
     FAIL-CLOSED POLARITY: ``sufficient`` requires at least one measure to have
     been ASSESSED and every assessed measure to have met its threshold. A
@@ -415,11 +474,36 @@ def assess_sufficiency(
             "required_provenance_coverage", required_provenance_coverage)
     if isinstance(anchors, (str, bytes)):
         raise TypeError("anchors must be a sequence of strings, not a single string")
+    for anchor in anchors:
+        if not isinstance(anchor, str):
+            raise TypeError(f"each anchor must be a string, got {anchor!r}")
+        if not anchor.strip():
+            raise ValueError(
+                "an anchor must name something — an empty/blank anchor matches "
+                "every row, so counting it reports full coverage for an entity "
+                "nobody named (the fail-open direction §14.1 V4 forbids)"
+            )
+    if required_anchor_coverage is not None and not anchors:
+        raise ValueError(
+            "required_anchor_coverage was supplied but no anchors were resolved — "
+            "an empty anchor set cannot disable a measure the caller configured; "
+            "pass required_anchor_coverage=None to leave it unassessed"
+        )
+    if resident is not None and not isinstance(resident, bool):
+        # An ALLOW-LIST, not a truthiness test: ``resident = row.get("resident")``
+        # from a JSON column is ``0``/``1``, and identity tests against ``False``
+        # let ``0`` through as if residency had been ESTABLISHED — the guard would
+        # then be a no-op in the one direction §17.3 forbids (an unassessed read
+        # walking a tier). Refused loudly so a caller converts deliberately.
+        raise TypeError(
+            f"resident must be True, False or None, got {resident!r} — a "
+            f"non-bool (an int flag, \"\", 0) is not an established residency"
+        )
 
     # §17.3, the collapse guard. Residency outranks sufficiency: a read the
     # store could not see has not ESTABLISHED insufficiency, so an escalation
     # here would walk a tier of a store that never held the node.
-    if resident is None or resident is False:
+    if resident is not True:
         reason = REASON_RESIDENT_MISS if resident is False else REASON_RESIDENT_UNASSESSED
         return SufficiencyVerdict(UNDETERMINED, (reason,), ())
 
@@ -433,7 +517,7 @@ def assess_sufficiency(
     measures: list[tuple[str, float]] = []
     failures: list[str] = []
 
-    if anchors and required_anchor_coverage is not None:
+    if required_anchor_coverage is not None:  # anchors is non-empty: see the guard
         covered = sum(1 for a in anchors if any(_mentions(a, r) for r in rows))
         value = float(covered) / float(len(anchors))
         measures.append((MEASURE_ANCHOR_COVERAGE, value))
@@ -496,21 +580,30 @@ class SufficiencyRoute:
 def route_sufficiency(
     verdict: SufficiencyVerdict,
     *,
+    budget: int,
     escalated: bool = False,
-    budget: int = 1,
 ) -> SufficiencyRoute:
     """The §12.4 trigger, BOUNDED — escalate once, never walk a tier loop.
 
+    ``budget``      remaining escalation steps the caller will pay for. **The
+                    tier count is OPEN per §12.3, so it is NOT hard-coded here —
+                    not even as a default**: a default of ``1`` would settle the
+                    two-tier fold for every caller who omits it, which is the
+                    same class of un-chosen target ``_threshold`` refuses. Every
+                    caller states the policy it is implementing.
     ``escalated``   this answer has already been walked deeper once, so a still
                     insufficient verdict is reported, not re-walked. That is the
                     bound on §12.7's *"router overhead"*: an unbounded repair
                     loop costs more than the retrieval it routes.
-    ``budget``      remaining escalation steps the caller will pay for (the tier
-                    count is OPEN per §12.3, so it is NOT hard-coded here).
 
     The escalation fires ONLY on a measured ``insufficient``. ``undetermined``
     serves: it is not a negative finding, and §12.3's default answer is the
     cheap tier.
+
+    The two bounds report DISTINCTLY — ``escalation-budget-exhausted`` only when
+    the budget is actually gone, ``already-escalated`` when the walk is simply
+    behind this verdict — because ``reason`` is a claim a reason-keyed consumer
+    acts on, and ``budget_remaining`` must not contradict it.
     """
     if not isinstance(verdict, SufficiencyVerdict):
         raise TypeError("route_sufficiency takes a SufficiencyVerdict, not a bool — "
@@ -527,10 +620,15 @@ def route_sufficiency(
             budget_remaining=budget - 1,
         )
     if verdict.verdict == INSUFFICIENT:
-        # Known short, and nothing left to spend: report it rather than loop.
+        # Known short, and either nothing left to spend OR the walk is already
+        # behind this verdict: report it rather than loop. The two are DISTINCT
+        # reasons — the budget one is only true when the budget is actually gone,
+        # and `budget_remaining` below must not contradict what `reason` claims.
+        reason = (REASON_BUDGET_EXHAUSTED if budget == 0
+                  else REASON_ALREADY_ESCALATED)
         return SufficiencyRoute(
             route=ROUTE_SERVE,
-            reason=REASON_BUDGET_EXHAUSTED,
+            reason=reason,
             verdict=verdict.verdict,
             escalated=escalated,
             budget_remaining=budget,
@@ -617,6 +715,35 @@ class SummaryUnit:
     claim_class: str
     span: SourceSpan
     derived: bool = True
+
+    def __post_init__(self) -> None:
+        """The type holds its own invariants, like every sibling in this module.
+
+        ``plan_writeback`` refuses a finding without a span, but the TYPE is
+        public (``__all__``) and §12.5's persistence seam is the caller's — so a
+        hand-built unit is the realistic way an unattributable belief reaches the
+        store. A field-name pin cannot see a value-level bypass; this can.
+        """
+        if not isinstance(self.span, SourceSpan):
+            raise TypeError(
+                f"a summary unit needs a SourceSpan, got {self.span!r} — a unit "
+                f"without an address is an unattributable belief (§12.5)"
+            )
+        if self.derived is not True:
+            raise ValueError(
+                "a summary unit is always derived: it is a finding ABOUT the raw "
+                "log and can never be authoritative (extractor §2.4.2)"
+            )
+        if not isinstance(self.unit_key, str) or not self.unit_key.strip():
+            raise ValueError(
+                f"unit_key must be a non-empty string, got {self.unit_key!r}")
+        expected = unit_key(self.span, self.claim)
+        if self.unit_key != expected:
+            raise ValueError(
+                f"unit_key {self.unit_key!r} is not the identity of (span, claim) "
+                f"— expected {expected!r}; the attribution loop dedupes on this key, "
+                f"so a hand-written one silently mints a duplicate"
+            )
 
 
 @dataclass(frozen=True)

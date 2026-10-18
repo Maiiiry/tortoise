@@ -5682,7 +5682,7 @@ durations:
   test_reader_4107_advice_shape.py: 1.4  # unmeasured
   test_reader_4837_advice_battery.py: 2.6  # #4837: hermetic (no DB, no reader call) — 23 tests, measured 2.6s on this host
   test_fanout_cap.py: 0.2  # unmeasured
-  test_sufficiency_router.py: 6.0  # #5009: hermetic (no DB, no graph, no model call) — 57 tests, measured 5.6-6.8s on this host
+  test_sufficiency_router.py: 7.5  # #5009: hermetic (no DB, no graph, no model call) — 70 tests, measured 7.0-7.7s on this host
   test_never_across_fold_5080.py: 2.0  # unmeasured
   test_operator_alert.py: 2.3
   test_consumed_sdk_binding_3904.py: 2.0  # unmeasured — new in #3904. Without a row this file packs at the flat 2.0s default anyway, but it would count as UNCOVERED, dropping the repo-wide coverage floor (#3400) to 89.9% and redding the manifest-integrity gate. The 2.0 value is the default it would have received; it is a weight, not a measurement.
