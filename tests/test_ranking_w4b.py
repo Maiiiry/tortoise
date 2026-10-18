@@ -667,12 +667,14 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     requirement SATURATES on a 2-row page instead of growing without bound.
     The two consequences a reader needs are measured here, not restated:
 
-    * the requirement FALLS as the page grows — so a modest raise repairs the
-      shipped default page, and "raising the boost does not repair this" was
-      true only of the smallest pages;
-    * on a 2-row page it reaches at least ``1.0`` in graph-boost space, i.e. at
-      or above the ``min(1.0, graph_boost + cb)`` clamp — so no ``cb`` inside
-      the documented [0, 1] invariant can clear it.  Shown directly: raise
+    * the requirement FALLS as the page grows — and the repair that follows is
+      RUN, not inferred: a raise inside the clamp's headroom flips the shipped
+      default page (``ten_req < two_req`` alone would NOT imply that, so the
+      headroom comparison is asserted too), and "raising the boost does not
+      repair this" was true only of the smallest pages;
+    * on a 2-row page it needs MORE than the clamp's headroom
+      ``1.0 - baseline graph_boost`` — so no ``cb`` inside the documented
+      [0, 1] invariant can clear it.  Shown directly: raise
       ``W4_CONTESTED_BOOST`` far past the clamp and the graph term pins at 1.0
       and the ordering still loses.
 
@@ -710,6 +712,31 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         return (gap / DEFAULT_GRAPH_BOOST_WEIGHT, h, c,
                 [r["id"] for r in page])
 
+    def baseline_graph_boost(rows: list[dict]) -> tuple[float, float]:
+        """The twins' PRE-boost ``graph_boost`` on this page: ``(calm, hot)``.
+
+        Read from a query-less rerank — no query means no contested boost at
+        all, so the payload's ``graph_boost`` is exactly the baseline the
+        clamp is applied to."""
+        gr = {r["id"]: r["graph_ranking"] for r in ranker.rerank(rows)}
+        return gr[calm]["graph_boost"], gr[hot]["graph_boost"]
+
+    def derived_cb(h: dict, c: dict, gb_calm: float, gb_hot: float) -> float:
+        """The ``cb`` the comment's formula predicts for this page, from the
+        payloads alone:
+
+            cb_req = (sim_w * Δsim + graph_w * Δgb + rec_w * Δrec) / graph_w
+
+        with Δ = calm − hot.  ``floor``/``ceiling`` drop the ``Δgb`` term, which
+        is legitimate ONLY because the parity NAND makes ``Δgb == 0`` — so the
+        expectation is derived with the term present and the parity is
+        asserted separately, instead of being assumed by the band."""
+        return (
+            DEFAULT_SIMILARITY_WEIGHT * (c["similarity"] - h["similarity"])
+            + DEFAULT_GRAPH_BOOST_WEIGHT * (gb_calm - gb_hot)
+            + DEFAULT_RECENCY_WEIGHT * (c["recency_boost"] - h["recency_boost"])
+        ) / DEFAULT_GRAPH_BOOST_WEIGHT
+
     # ── The shipped default page, retrieved through the fused path ────────
     res = ranked_sdk.tortoise_fts_query(query, limit=10, order_by="graph")
     assert {r.get("match_source") for r in res} == {"rrf"}, (
@@ -720,13 +747,45 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert ({k: by_id[calm]["scores"].get(k) for k in ("fts", "vector")}
             == {k: by_id[hot]["scores"].get(k) for k in ("fts", "vector")})
     two_row = [dict(by_id[hot]), dict(by_id[calm])]
-    ten_req, _th, _tc, _tids = required_cb([dict(r) for r in res])
+    ten_req, ten_hot, ten_calm, _tids = required_cb([dict(r) for r in res])
 
     # ── Worst case: a 2-row page (a page cannot be smaller) ───────────────
     two_req, two_hot, two_calm, two_ids = required_cb(two_row)
+    two_gb_calm, two_gb_hot = baseline_graph_boost(two_row)
     assert len(two_ids) == 2
-    # The whole normalization span is consumed: similarities 0 and 1.
-    assert {two_hot["similarity"], two_calm["similarity"]} == {0.0, 1.0}
+    # The whole normalization span is consumed, the contested twin at the 0
+    # end — the end the boost has to lift.
+    assert (two_calm["similarity"], two_hot["similarity"]) == (1.0, 0.0)
+
+    # ── The PREMISE the quoted 1.4286 rests on, asserted BY NAME ──────────
+    # ``floor``/``ceiling`` below drop the ``graph_w * Δgb`` term, which is the
+    # right bound only when the twins share a baseline graph_boost — the parity
+    # NAND in ``_seed_twin_conflict`` is what makes them.  Nothing used to name
+    # it: drop that NAND and calm falls to degree 0 (gb 0.45, Δgb −0.25, the
+    # 2-row requirement 1.1786), every band assertion here still passes, and
+    # the comment's 1.4286 / "both twins' baseline is 0.7" go stale silently.
+    assert two_gb_calm == two_gb_hot == pytest.approx(0.7), (
+        f"the fixture no longer gives both twins the same 0.7 baseline "
+        f"graph_boost the comment quotes (calm {two_gb_calm}, hot "
+        f"{two_gb_hot}) — the 1.4286 requirement is derived from that parity")
+    assert two_calm["recency_boost"] == two_hot["recency_boost"], (
+        f"the comment's 1.4286 also assumes equal recency: calm "
+        f"{two_calm['recency_boost']} vs hot {two_hot['recency_boost']}")
+
+    # The mechanism, evaluated on THIS page's payloads (all three terms, the
+    # graph delta included), reproduces the measured requirement.
+    assert two_req == pytest.approx(
+        derived_cb(two_hot, two_calm, two_gb_calm, two_gb_hot), abs=5e-3), (
+        f"the measured 2-row requirement {two_req:.4f} is not what the "
+        f"formula predicts from this page's payloads — the derivation in "
+        f"W4_CONTESTED_BOOST's comment is stale")
+    # With Δgb = Δrec = 0 the only term left is the full similarity span, which
+    # is exactly the number the comment quotes: (0.5 * 1) / 0.35 = 1.4286.
+    assert two_req == pytest.approx(
+        DEFAULT_SIMILARITY_WEIGHT / DEFAULT_GRAPH_BOOST_WEIGHT, abs=5e-3), (
+        f"the comment quotes a 2-row requirement of 1.4286; this page measures "
+        f"{two_req:.4f}")
+    # The same payload gives the band the comment states.
     #   cb_req = (sim_w * 1 + rec_w * (r_calm - r_hot)) / graph_w
     # so (sim_w - rec_w)/graph_w <= cb_req <= (sim_w + rec_w)/graph_w.
     floor = (DEFAULT_SIMILARITY_WEIGHT - DEFAULT_RECENCY_WEIGHT) / DEFAULT_GRAPH_BOOST_WEIGHT
@@ -737,8 +796,22 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert two_req <= ceiling + 1e-6, (
         f"the 2-row requirement is {two_req:.4f}, ABOVE its ceiling "
         f"{ceiling:.4f} — then it is not bounded by the page after all")
+    # THE GUARANTEE: what a cb inside [0, 1] can buy is at most the clamp's
+    # headroom 1.0 - baseline, and the requirement exceeds it. (Separately,
+    # ``two_req >= 1.0`` — numerically the floor at these weights — is the
+    # strongest form: even a zero baseline, the most generous headroom there
+    # is, cannot cover this page.)
+    two_headroom = 1.0 - two_gb_hot
+    assert two_headroom == pytest.approx(0.3), (
+        f"the comment quotes 0.3 of clamp headroom (1.0 - a 0.7 baseline); "
+        f"this page gives {two_headroom:.4f}")
+    assert two_req > two_headroom, (
+        f"the 2-row requirement {two_req:.4f} must EXCEED the clamp's headroom "
+        f"{two_headroom:.4f}: that is the 'the CLAMP is the blocker' claim, "
+        f"and it is what a band alone does not say")
     assert two_req >= 1.0, (
-        "a 2-row page must need at least the full clamp's worth of boost")
+        f"a 2-row page must need at least the full [0, 1] graph_boost span "
+        f"({two_req:.4f}) — no cb inside the invariant can clear it")
 
     # The blocker is the CLAMP, not unboundedness: give the boost a value far
     # past the clamp and the ordering still loses, the graph term pinned.
@@ -760,6 +833,52 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"{ten_req:.4f} vs 2-row {two_req:.4f}); a rising requirement is what "
         f"'unbounded' would look like, and it is what the corrected comment "
         f"denies")
+
+    # ── Remedy (2)'s actionable half: the raise is RUN, not inferred ──────
+    # ``ten_req < two_req`` alone does NOT imply that a raise repairs the
+    # default page — a value above ten_req can still exceed the clamp's
+    # headroom (ten_req=0.9, two_req=1.4286 would pass every assertion above
+    # and make the claim false), so the headroom is asserted with it, and the
+    # flip is measured through the shipped read rather than argued.
+    ten_gb_calm, ten_gb_hot = baseline_graph_boost([dict(r) for r in res])
+    assert ten_gb_calm == ten_gb_hot, (
+        f"the default page's twins no longer share a baseline graph_boost "
+        f"(calm {ten_gb_calm}, hot {ten_gb_hot}): the requirement read off "
+        f"this page is then not the comment's")
+    ten_headroom = 1.0 - ten_gb_hot
+    # The comment's two figures, both from this page's payloads: 0.0537 is the
+    # measured requirement at limit=10, and 0.0714 = sim_w * 0.05 / graph_w is
+    # what clearing #2102's own E2E-1 pre-assertion (relevance delta <= 0.05 in
+    # similarity space) takes.
+    assert ten_req == pytest.approx(
+        derived_cb(ten_hot, ten_calm, ten_gb_calm, ten_gb_hot), abs=5e-3)
+    assert ten_req == pytest.approx(0.0537, abs=1e-3), (
+        f"the comment quotes a 0.0537 requirement on the shipped default "
+        f"page; this run measures {ten_req:.4f}")
+    clears_2102 = DEFAULT_SIMILARITY_WEIGHT * 0.05 / DEFAULT_GRAPH_BOOST_WEIGHT
+    assert clears_2102 == pytest.approx(0.0714, abs=1e-3)
+    assert ten_req < clears_2102, (
+        f"the comment says a cb clearing #2102's 0.05 relevance delta "
+        f"({clears_2102:.4f}) also clears the default page's requirement "
+        f"({ten_req:.4f})")
+    modest = 0.08  # > ten_req, > clears_2102, < ten_headroom
+    assert ten_req < modest <= ten_headroom, (
+        f"a modest raise ({modest}) must sit between the default page's "
+        f"requirement ({ten_req:.4f}) and the clamp's headroom "
+        f"({ten_headroom:.4f}) — outside the headroom it could not flip it")
+    with monkeypatch.context() as patched:
+        patched.setattr("tortoise.ranking.W4_CONTESTED_BOOST", modest)
+        flipped = ranked_sdk.tortoise_fts_query(query, limit=10, order_by="graph")
+    fby = {r["id"]: r["graph_ranking"] for r in flipped}
+    assert hot in fby and calm in fby, "FIXTURE NOT REACHED: a twin is off the page"
+    assert fby[hot]["w4_contested_boost"] == modest, "the modest raise did not apply"
+    flipped_ids = [r["id"] for r in flipped]
+    assert flipped_ids.index(hot) < flipped_ids.index(calm), (
+        f"cb={modest} must rank the contested twin FIRST on the shipped "
+        f"default page: it is above that page's measured requirement "
+        f"({ten_req:.4f}) and inside the clamp's headroom "
+        f"({ten_headroom:.4f}). If it does not, the comment's 'a modest "
+        f"raise therefore DOES repair the shipped default read' is false")
 
 
 def test_integration_w4_enrich_false_suppresses_boost_with_flag_on(ranked_sdk, monkeypatch):
