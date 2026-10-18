@@ -87,6 +87,11 @@ def _mutated(name: str, **changes) -> cd.Dimension:
     return dataclasses.replace(cd.by_name(name), **changes)
 
 
+def migration_sql() -> str:
+    """Every tracked migration's SQL, as the ledger check reads it."""
+    return audit.migration_text(_ROOT)
+
+
 # ── 1. completeness ──────────────────────────────────────────────────────
 
 
@@ -132,7 +137,11 @@ def test_a_plain_collections_counter_is_not_mistaken_for_a_metric(tmp_path):
     """The gate must not red on ``collections.Counter`` tally code.
 
     A false positive here would make the check unusable in this repo, which uses
-    ``Counter(...)`` for ordinary tallies in several modules.
+    ``Counter(...)`` for ordinary tallies in several modules. Both arms matter:
+    the non-literal tally AND the string-literal tally — the earlier predicate
+    keyed on "any identifier as the first argument", so ``Counter("abcd")`` (a
+    perfectly ordinary tally of characters) was reported as a foreign prometheus
+    metric. Provenance, not argument shape, decides it.
     """
     module = tmp_path / "tortoise" / "tally.py"
     module.parent.mkdir(parents=True)
@@ -140,8 +149,68 @@ def test_a_plain_collections_counter_is_not_mistaken_for_a_metric(tmp_path):
         from collections import Counter
         def tally(tokens):
             return Counter(tokens)
+        def chars():
+            return Counter("abcd")
+        def named():
+            return Counter("tortoise_like_tally")
     """), encoding="utf-8")
     assert audit.foreign_metric_findings(tmp_path) == []
+
+
+def test_a_keyword_constructed_metric_outside_monitoring_is_flagged(tmp_path):
+    """MUTATION: ``Counter(name=…)`` is still a metric (the gate's fail-open).
+
+    ``prometheus_client.Counter`` takes ``name``/``documentation`` as ordinary
+    positional-or-keyword parameters, so the keyword form is valid code that the
+    positional-only read missed entirely — a metric built outside
+    ``monitoring.py`` that NEITHER half of check 4 could see.
+    """
+    module = tmp_path / "tortoise" / "kwarg_metric.py"
+    module.parent.mkdir(parents=True)
+    module.write_text(textwrap.dedent("""
+        from prometheus_client import Counter
+        NEW_DIMENSION = Counter(
+            name="tortoise_new_dimension_total",
+            documentation="built with keywords",
+            labelnames=["org"],
+        )
+    """), encoding="utf-8")
+    findings = audit.foreign_metric_findings(tmp_path)
+    assert findings, "a keyword-constructed metric outside the declared module was not flagged"
+    assert "kwarg_metric.py" in findings[0]
+
+
+def test_an_aliased_prometheus_constructor_is_still_caught(tmp_path):
+    """MUTATION: `import … as _C` must not be a bypass.
+
+    The check resolves the callee to its IMPORT, so an aliased constructor is a
+    second metric surface like any other. A callee-name match (`name in {Counter,
+    Gauge, Histogram, Summary}`) could not see this spelling at all.
+    """
+    module = tmp_path / "tortoise" / "aliased.py"
+    module.parent.mkdir(parents=True)
+    module.write_text(textwrap.dedent("""
+        from prometheus_client import Counter as _C
+        NEW_DIMENSION = _C("tortoise_aliased_total", "x", ["org"])
+    """), encoding="utf-8")
+    findings = audit.foreign_metric_findings(tmp_path)
+    assert findings, "an aliased prometheus constructor was not flagged"
+    assert "aliased.py" in findings[0]
+
+
+def test_an_unparseable_module_is_reported_not_skipped(tmp_path):
+    """MUTATION: a module the scans cannot parse is a FINDING, never a pass.
+
+    An unparseable file contributes no names and no metric facts, so it silently
+    satisfied both corpus gates: it could reference every declared writer and build
+    a tenth counter, and the audit reported clean. The module docstring's contract
+    is "an unresolvable declaration is reported as drift, never skipped".
+    """
+    module = tmp_path / "tortoise" / "broken.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("def oops(:\n", encoding="utf-8")
+    assert audit.unparseable_corpus_findings(tmp_path), "an unparseable module was not reported"
+    assert any("broken.py" in f for f in audit.foreign_metric_findings(tmp_path))
 
 
 # ── 2. truth of the declaration ──────────────────────────────────────────
@@ -165,6 +234,49 @@ def test_a_renamed_column_is_drift():
     assert any("no_such_column_xyz" in f for f in findings), findings
 
 
+def test_a_column_named_only_in_a_sql_comment_is_not_a_definition():
+    """MUTATION: prose is not DDL — the false green the docstring promises to avoid.
+
+    The migrations quote column names in their own header comments. Before the
+    comment strip + ALTER anchoring, ``_creates_column`` matched
+    ``ADD COLUMN <col>`` ANYWHERE, so a header comment satisfied the ledger check
+    for a column the DDL never creates (measured on
+    ``20260925000002_oauth_redemption_state.sql``, whose comment says "each `ADD
+    COLUMN code_id` takes ACCESS EXCLUSIVE").
+    """
+    prose = textwrap.dedent("""
+        -- rollback note: this migration does ADD COLUMN IF NOT EXISTS embed_calls integer
+        /* and the block comment says ADD COLUMN embed_chars text too */
+        SELECT 1;
+    """)
+    assert audit._creates_column(prose, "embed_calls") is False
+    assert audit._creates_column(prose, "embed_chars") is False
+    # ... and the anchoring must not break the real thing:
+    real = "ALTER TABLE public.metering_records\n    ADD COLUMN IF NOT EXISTS embed_calls bigint;",
+    assert audit._creates_column(real[0], "embed_calls") is True
+    assert audit._creates_column(migration_sql(), "embed_calls") is True
+
+
+def test_an_rpc_named_only_in_a_grant_or_rename_is_not_a_definition():
+    """MUTATION: a mention of a function is not its definition.
+
+    ``GRANT``/``REVOKE``/``COMMENT ON``/``ALTER FUNCTION … RENAME TO`` all name a
+    function without creating it, so the old ``FUNCTION public.<rpc>`` substring
+    matched a RENAMED-away RPC and the declaration went stale green. The twin of
+    the renamed-column mutation above.
+    """
+    sql = textwrap.dedent("""
+        ALTER FUNCTION public.metering_increment_embedding(text) RENAME TO old_name;
+        REVOKE ALL ON FUNCTION public.metering_increment_embedding(text) FROM anon;
+        GRANT EXECUTE ON FUNCTION public.metering_increment_embedding(text) TO s;
+        COMMENT ON FUNCTION public.metering_increment_embedding IS 'gone';
+    """)
+    assert audit._defines_function(sql, "metering_increment_embedding") is False
+    created = "CREATE OR REPLACE FUNCTION public.metering_increment_embedding(\n"
+    assert audit._defines_function(created, "metering_increment_embedding") is True
+    assert audit._defines_function(migration_sql(), "metering_increment_embedding") is True
+
+
 def test_a_renamed_cap_constant_is_drift():
     """MUTATION: a cap attribute that no longer resolves is reported."""
     broken = _mutated(
@@ -178,6 +290,36 @@ def test_a_renamed_cap_constant_is_drift():
     assert any("EGRESS_MAX_ORGS_RENAMED" in f for f in findings), findings
 
 
+def test_both_label_axes_are_declared_and_pinned():
+    """The route axis is a live cap convention too — declared, not assumed.
+
+    The registry used to describe THREE label-cap conventions and declare two: the
+    route axis carries its own caps (``EGRESS_MAX_PATHS``,
+    ``EGRESS_MAX_DERIVED_PATHS``, ``COMPUTE_MAX_PATHS``) and its own
+    ``__unrouted__`` sentinel, and ``check_cardinality`` could not see any of them.
+    An undeclared live cap convention is the drift class this module exists to end.
+    """
+    assert audit.check_cardinality() == []
+    for name in ("egress", "hosted_compute"):
+        card = cd.by_name(name).cardinality
+        assert card is not None and card.path_caps, f"{name} declares no path-axis cap"
+        assert card.path_overflow, f"{name} declares no path-axis overflow sentinel"
+    # Two axes, two sentinels: the path fallback is deliberately NOT `__other__`, so
+    # a client cannot pre-occupy the overflow child by requesting its name.
+    assert monitoring.EGRESS_UNROUTED != monitoring.EGRESS_OVERFLOW
+    broken = _mutated(
+        "egress",
+        cardinality=cd.Cardinality(
+            lifetime=cd.PERSISTENT,
+            cap="tortoise.monitoring.EGRESS_MAX_ORGS",
+            overflow="tortoise.monitoring.EGRESS_OVERFLOW",
+            path_caps=("tortoise.monitoring.EGRESS_MAX_PATHS_RENAMED",),
+            path_overflow="tortoise.monitoring.EGRESS_UNROUTED"))
+    with _declaring(broken, *[d for d in cd.DIMENSIONS if d.name != "egress"]):
+        findings = audit.check_cardinality()
+    assert any("EGRESS_MAX_PATHS_RENAMED" in f for f in findings), findings
+
+
 def test_declared_metric_labels_match_the_live_metric():
     """MUTATION: a declared label set that differs from the live child is drift."""
     dim = cd.by_name("egress")
@@ -189,6 +331,28 @@ def test_declared_metric_labels_match_the_live_metric():
     with _declaring(dataclasses.replace(dim, bindings=(wrong, *others)), *rest):
         findings = audit.check_bindings()
     assert any("carries labels" in f for f in findings), findings
+
+
+def test_a_renamed_metric_family_is_drift():
+    """MUTATION: the emitted family name is a series identity, not a detail.
+
+    ``attributed_bindings()``'s docstring used to say the audit "reads the LIVE
+    child name ``_name``" while nothing read it, so renaming a family (e.g.
+    ``tortoise_egress_bytes`` → ``tortoise_egress_bytes_v2``) changed every series a
+    dashboard selects on and reported "no drift". Now the declared family is
+    compared against the live ``_name``.
+    """
+    dim = cd.by_name("egress")
+    wrong = dataclasses.replace(
+        next(b for b in dim.metrics() if b.attr == "EGRESS_BYTES"),
+        family="tortoise_egress_bytes_v2")
+    others = tuple(b for b in dim.bindings if b.attr != "EGRESS_BYTES")
+    rest = tuple(d for d in cd.DIMENSIONS if d.name != "egress")
+    with _declaring(dataclasses.replace(dim, bindings=(wrong, *others)), *rest):
+        findings = audit.check_bindings()
+    assert any("emits family" in f for f in findings), findings
+    # The declared families are the live ones (the OTHER direction, unmutated):
+    assert audit.check_bindings() == []
 
 
 # ── 3. no dead hook ──────────────────────────────────────────────────────
@@ -223,6 +387,28 @@ def test_a_writer_only_tests_reach_is_a_dead_hook():
     assert any("dead hook" in f for f in findings), findings
 
 
+def test_a_writer_reached_only_from_a_tool_is_a_dead_hook(tmp_path):
+    """MUTATION: a developer INSTRUMENT is not a production call site.
+
+    ``tools/`` used to be scanned as production, so a script that merely mentions
+    the writer satisfied the check and a dimension with no production increment
+    read as measured — the #4493 defect one directory over ("registered, exported
+    and tested while never being incremented in production"). ``battery/`` and
+    ``graph-scripts/`` were already excluded for exactly this reason.
+    """
+    tool = tmp_path / "tools" / "capture_cost_report.py"
+    tool.parent.mkdir(parents=True)
+    tool.write_text(textwrap.dedent("""
+        from tortoise.metering import record_egress
+        print(record_egress)
+    """), encoding="utf-8")
+    sites = audit.production_call_sites(tmp_path)
+    assert sites["record_egress"] == [], (
+        f"a tools/ script was read as a production call site: {sites['record_egress']}")
+    findings = audit.check_dead_hooks(tmp_path)
+    assert any("dead hook" in f and "record_egress" in f for f in findings), findings
+
+
 # ── 4. the coverage query ────────────────────────────────────────────────
 
 
@@ -233,11 +419,49 @@ def test_no_dimension_is_unmeasured_and_undeclared():
         assert dim.state in cd.states(), dim.name
         if dim.state != cd.MEASURED:
             assert dim.limits, f"{dim.name} is {dim.state} with no stated reason"
+    assert cd.unbacked_dimensions() == (), cd.unbacked_dimensions()
     matrix = cd.render_matrix()
     assert "unmeasured-and-undeclared: 0" in matrix
     for dim in cd.out_of_scope():
         assert dim.name in matrix, dim.name
         assert dim.limits[0][:40] in matrix, dim.name
+
+
+def test_the_last_matrix_figure_is_DERIVED_not_a_literal():
+    """MUTATION: the summary's last number must be able to move.
+
+    It used to be the string literal ``unmeasured-and-undeclared: 0`` inside
+    ``render_matrix``'s f-string, so no registry state could change it and the two
+    assertions on it were green by construction — while the PR cited the ``0`` as a
+    measured result. Now: a MEASURED row with no binding and no declared reason
+    counts, an unknown state counts, and the audit's own undeclared-metric findings
+    count.
+    """
+    assert cd.unbacked_dimensions() == ()
+    empty = cd.Dimension(
+        name="ghost_dimension", kind="local_compute", unit="units",
+        attribution="none", state=cd.MEASURED, note="mutation: no primitive")
+    with _declaring(empty):
+        assert cd.unbacked_dimensions() == ("ghost_dimension",)
+        assert "unmeasured-and-undeclared: 1" in cd.render_matrix()
+    # The audit's undeclared-metric count feeds the same figure.
+    assert "unmeasured-and-undeclared: 2" in cd.render_matrix(undeclared_metrics=2)
+
+
+def test_an_unknown_state_is_drift():
+    """MUTATION: a typo'd state falls into none of the three buckets.
+
+    It is counted in neither ``measured``/``allocations`` nor ``out of scope``, so
+    the summary's arithmetic silently stops adding up and ``matrix`` still exited 0
+    (its docstring promises "exit 1 on ANY drift").
+    """
+    typo = _mutated("egress", state="measurd")
+    with _declaring(typo, *[d for d in cd.DIMENSIONS if d.name != "egress"]):
+        findings = audit.check_states()
+        assert any("measurd" in f for f in findings), findings
+        assert cd.unbacked_dimensions() == ("egress",)
+        assert "unmeasured-and-undeclared: 1" in cd.render_matrix()
+        assert audit.audit(_ROOT)["states"], "audit() dropped the state check"
 
 
 def test_the_coverage_matrix_names_its_allocations():
@@ -271,7 +495,9 @@ def test_the_matrix_verb_reports_no_drift_on_this_tree(capsys):
     assert audit.main(["matrix"]) == 0
     out = capsys.readouterr().out
     assert "no drift" in out
-    assert "unmeasured-and-undeclared: 0" in out
+    derived = len(cd.unbacked_dimensions()) + len(audit.undeclared_metric_findings())
+    assert f"unmeasured-and-undeclared: {derived}" in out
+    assert derived == 0, derived
 
 
 def test_the_cli_entrypoint_works_in_a_fresh_interpreter():

@@ -6,9 +6,13 @@ incurs had no primitive at all. Six lanes then closed those gaps one dimension
 at a time (#4488 embedding encode, #4489 retrieval, #4490 hosted-API compute,
 #4491 egress, #4492 Postgres storage + row growth, #4493 the fixed/shared
 allocation), each landing its own writer, its own unit, its own attribution key
-and — by the time they were all in — **three** different per-org label-cap
-conventions. #5045 exists because that is not a substrate: it is six counters
-that happen to live in the same process.
+and — by the time they were all in — **three** different label-cap conventions:
+two on the ORG axis (``persistent`` for egress/compute, ``per_publish`` for the
+allocation — see the warning below) and a third on the non-org ROUTE axis (its
+own caps and its own ``__unrouted__`` sentinel, deliberately NOT the org axis's
+``__other__``). All three are declared below, so none of them is a convention the
+registry cannot see. #5045 exists because that is not a substrate: it is six
+counters that happen to live in the same process.
 
 This module is the substrate's **declaration**, and it is deliberately
 *verifiable rather than trusted* — the same shape ``tortoise/session_schema.py``
@@ -52,7 +56,9 @@ for themselves. ``resolve()`` imports a module only when a binding is actually
 checked.
 
 **⚠️ THE CARDINALITY LIFETIME IS DECLARED, NOT CONVERGED.** Two per-org label
-policies are live and they differ in KIND, not in cosmetics:
+policies are live and they differ in KIND, not in cosmetics (the third live
+convention sits on the non-org ROUTE axis — declared as ``path_caps`` /
+``path_overflow``, a different axis rather than a third per-org policy):
 
 * ``persistent`` — ``monitoring.record_egress`` / ``record_compute`` admit a
   label once and never evict it, so a child is stable for the process lifetime
@@ -94,6 +100,7 @@ __all__ = [
     "render_matrix",
     "resolve",
     "states",
+    "unbacked_dimensions",
 ]
 
 # ── the vocabulary ───────────────────────────────────────────────────────
@@ -139,13 +146,17 @@ class Binding:
     ``module`` is an importable dotted path; ``attr`` a module-level name.
     ``labels`` is the DECLARED label set for a ``metric`` binding — verified
     against the live child, so a metric that quietly loses (or gains) a label is
-    a red test rather than a silent series change.
+    a red test rather than a silent series change. ``family`` is the DECLARED
+    EMITTED family name — the live child's ``_name``, the name a scrape and every
+    dashboard/alert selects on — so a family rename is drift too, even when the
+    attribute name and the labels are untouched.
     """
 
     module: str
     attr: str
     kind: str
     labels: tuple[str, ...] = ()
+    family: str = ""
 
     @property
     def dotted(self) -> str:
@@ -165,6 +176,14 @@ class Cardinality:
     cap: str | None = None
     overflow: str | None = None
     note: str = ""
+    #: The NON-org (route-class) axis of the same metric family: its own caps and
+    #: its own overflow sentinel. Declared because it is a live label-cap
+    #: convention in its own right (``EGRESS_MAX_DERIVED_PATHS`` bounds the
+    #: UNTRUSTED, request-derived labels; the sentinel is ``__unrouted__``, not
+    #: the org axis's ``__other__``, so a client cannot pre-occupy it) — leaving
+    #: it out would be the very drift this module exists to end.
+    path_caps: tuple[str, ...] = ()
+    path_overflow: str | None = None
 
 
 @dataclass(frozen=True)
@@ -313,18 +332,20 @@ DIMENSIONS: tuple[Dimension, ...] = (
             Binding("tortoise.monitoring", "record_compute", WRITER),
             Binding("tortoise.monitoring", "compute_by_org", READER),
             Binding("tortoise.monitoring", "COMPUTE_REQUESTS", METRIC,
-                    ("org", "path")),
+                    ("org", "path"), "tortoise_compute_requests"),
             Binding("tortoise.monitoring", "COMPUTE_WALL_SECONDS", METRIC,
-                    ("org", "path")),
+                    ("org", "path"), "tortoise_compute_wall_seconds"),
             Binding("tortoise.monitoring", "COMPUTE_CPU_SECONDS", METRIC,
-                    ("org", "path")),
+                    ("org", "path"), "tortoise_compute_cpu_seconds"),
             Binding("tortoise.monitoring", "COMPUTE_REQUEST_SECONDS", METRIC,
-                    ("path",)),
+                    ("path",), "tortoise_compute_request_seconds"),
         ),
         cardinality=Cardinality(
             lifetime=PERSISTENT,
             cap="tortoise.monitoring.COMPUTE_MAX_ORGS",
             overflow="tortoise.monitoring.COMPUTE_OVERFLOW",
+            path_caps=("tortoise.monitoring.COMPUTE_MAX_PATHS",),
+            path_overflow="tortoise.monitoring.COMPUTE_UNROUTED",
             note="first-come, never evicted (see the module docstring's warning)",
         ),
         limits=(
@@ -352,14 +373,19 @@ DIMENSIONS: tuple[Dimension, ...] = (
             Binding("tortoise.monitoring", "record_egress", WRITER),
             Binding("tortoise.monitoring", "egress_bytes_by_org", READER),
             Binding("tortoise.monitoring", "EGRESS_BYTES", METRIC,
-                    ("org", "path", "origin")),
+                    ("org", "path", "origin"), "tortoise_egress_bytes"),
             Binding("tortoise.monitoring", "EGRESS_RESPONSE_BYTES", METRIC,
-                    ("path", "origin")),
+                    ("path", "origin"), "tortoise_egress_response_bytes"),
         ),
         cardinality=Cardinality(
             lifetime=PERSISTENT,
             cap="tortoise.monitoring.EGRESS_MAX_ORGS",
             overflow="tortoise.monitoring.EGRESS_OVERFLOW",
+            path_caps=(
+                "tortoise.monitoring.EGRESS_MAX_PATHS",
+                "tortoise.monitoring.EGRESS_MAX_DERIVED_PATHS",
+            ),
+            path_overflow="tortoise.monitoring.EGRESS_UNROUTED",
             note=(
                 "Inbound bytes were the only byte accounting before this "
                 "dimension, and only as a DoS cap — a safety bound, not a cost "
@@ -542,7 +568,8 @@ DIMENSIONS: tuple[Dimension, ...] = (
         bindings=(
             Binding("tortoise.cost_allocation", "refresh_and_publish", WRITER),
             Binding("tortoise.cost_allocation", "allocation_by_org", READER),
-            Binding("tortoise.monitoring", "TEAM_COST", METRIC, ("team",)),
+            Binding("tortoise.monitoring", "TEAM_COST", METRIC, ("team",),
+                    "tortoise_team_cost_cents"),
         ),
         cardinality=Cardinality(
             lifetime=PER_PUBLISH,
@@ -594,7 +621,8 @@ DIMENSIONS: tuple[Dimension, ...] = (
         state=OUT_OF_SCOPE,
         note="Declared so the coverage matrix NAMES it rather than omitting it.",
         bindings=(
-            Binding("tortoise.monitoring", "REQUEST_LATENCY", METRIC, ()),
+            Binding("tortoise.monitoring", "REQUEST_LATENCY", METRIC, (),
+                    "tortoise_request_latency_seconds"),
         ),
         limits=(
             "#4489: ``REQUEST_LATENCY``/``REQUEST_COUNT`` have their SOLE call "
@@ -657,13 +685,15 @@ def out_of_scope() -> tuple[Dimension, ...]:
 
 
 def attributed_bindings() -> dict[str, Dimension]:
-    """Every declared ``metric`` binding, keyed by its module attribute name.
+    """Every declared ``metric`` binding, keyed by its module ATTRIBUTE name.
 
     The drift gate reads this: an org-labelled metric child that is not a key
     here is an undeclared dimension. Resolution is deferred to the caller (the
-    audit resolves each binding, reads the LIVE child name ``_name`` and compares
-    it with the declared label set), because the emitted family name is the
-    authority on what a scrape sees, not the Python attribute name.
+    audit resolves each binding against the live module), because only the live
+    object can say what a scrape sees: the attribute name keys the ENUMERATION,
+    while the emitted family name (``_name``) and the label set are verified
+    against the declared ``family`` / ``labels`` of that binding — so renaming a
+    family, gaining a label or losing one are all drift, not detail.
     """
     return {b.attr: d for d in DIMENSIONS for b in d.metrics()}
 
@@ -693,12 +723,46 @@ def coverage() -> tuple[dict[str, object], ...]:
     )
 
 
-def render_matrix() -> str:
+def unbacked_dimensions() -> tuple[str, ...]:
+    """Declared dimensions the matrix cannot account for — the real ``0``.
+
+    ``render_matrix`` used to print ``unmeasured-and-undeclared: 0`` as a string
+    literal, which no registry state could ever change. This is the number it
+    prints instead: a dimension counts here when
+
+    * its ``state`` is outside the declared vocabulary (it then falls into NONE
+      of measured / allocations / out-of-scope, so the arithmetic on the summary
+      line would not add up), or
+    * it is ``out_of_scope`` with no stated reason (the module's whole point is
+      that an unmeasured dimension is NAMED), or
+    * it is measured/allocated but declares no binding at all and no
+      ``unscheduled_reason`` (a row claiming coverage with no primitive behind
+      it — the #4493 defect one level up from the dead-hook check).
+    """
+    unbacked: list[str] = []
+    for dim in DIMENSIONS:
+        if dim.state not in _STATES:
+            unbacked.append(dim.name)
+        elif dim.state == OUT_OF_SCOPE:
+            if not dim.limits:
+                unbacked.append(dim.name)
+        elif not dim.bindings and not dim.unscheduled_reason:
+            unbacked.append(dim.name)
+    return tuple(unbacked)
+
+
+def render_matrix(*, undeclared_metrics: int = 0) -> str:
     """The coverage matrix as fixed-width text (what ``matrix`` prints).
 
     Deliberately plain: an operator reads this in a terminal, and the declared
     limits are printed under their row rather than folded away, because a
     dimension's holes are the part that gets misread as coverage.
+
+    ``undeclared_metrics`` is the caller's undeclared-metric finding count (the
+    audit owns that check — it needs the live prometheus children, which this
+    dependency-free module deliberately does not import). Every figure on the
+    summary line is DERIVED, so the operator-facing number can move: the last one
+    is ``unbacked_dimensions() + undeclared_metrics``.
     """
     header = (f"{'dimension':<28} {'kind':<26} {'state':<13} "
               f"{'cardinality':<20} unit")
@@ -716,9 +780,10 @@ def render_matrix() -> str:
     measured = len(measured_dimensions())
     alloc = len(allocations())
     oos = len(out_of_scope())
+    unbacked = len(unbacked_dimensions()) + undeclared_metrics
     lines.append("")
     lines.append(
         f"declared: {len(DIMENSIONS)} · measured: {measured} · "
         f"allocations: {alloc} · out of scope: {oos} · "
-        f"unmeasured-and-undeclared: 0")
+        f"unmeasured-and-undeclared: {unbacked}")
     return "\n".join(lines)
