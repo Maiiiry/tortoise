@@ -778,9 +778,15 @@ def test_the_sweep_pool_is_disposed_at_thread_shutdown():
     futures already QUEUED in the pool keep running, and
     ``concurrent.futures.thread._python_exit`` (registered on
     ``threading._register_atexit``) joins every worker behind them. One queued
-    dispatch is up to ``DEFAULT_BATCH`` (50) sequential POSTs at ``TIMEOUT_S``
-    (10 s) each, so without this hook a SIGTERM during a pass holds exit far past
-    fly.toml's ``kill_timeout``. Pre-fix there was no hook at all.
+    dispatch is a WHOLE graph dispatch (``_dispatch_webhooks_sync``:
+    ``MAX_SUBSCRIPTIONS`` 25 x ``DEFAULT_BATCH`` 50 sequential POSTs at
+    ``TIMEOUT_S`` 10 s each), so without this hook a SIGTERM during a pass holds
+    exit far past fly.toml's ``kill_timeout``. Pre-fix there was no hook at all.
+
+    ``cancel_futures`` only reaches QUEUED futures, so the test must make the
+    pool's queue non-empty — which means occupying EVERY worker first: with a
+    free worker the second ``submit`` is picked up immediately and is RUNNING,
+    and a running future cannot be cancelled (#8098 review, ISSUE 1).
     """
     # The hook must be on `threading._register_atexit` — a plain `atexit`
     # handler runs AFTER `threading._shutdown()` already joined the workers, so
@@ -796,8 +802,49 @@ def test_the_sweep_pool_is_disposed_at_thread_shutdown():
     # queued future must be CANCELLED, not merely abandoned to the join.
     import threading
 
-    started = threading.Event()
     release = threading.Event()
+    workers = max(int(getattr(pool, "_max_workers", 1)), 1)
+    started = [threading.Event() for _ in range(workers)]
+
+    def _blocked(idx: int):
+        started[idx].set()
+        release.wait(30)
+        return "ran"
+
+    try:
+        # Occupy EVERY worker, so the submit below is genuinely QUEUED.
+        busy = [pool.submit(_blocked, i) for i in range(workers)]
+        for idx, ev in enumerate(started):
+            assert ev.wait(10), f"the pool never ran worker {idx}"
+        queued = pool.submit(_blocked, 0)
+
+        ha._dispose_webhook_sweep_executor()
+
+        assert ha._WEBHOOK_SWEEP_EXECUTOR is None, "the disposed pool was kept"
+        assert queued.cancelled(), (
+            "a QUEUED dispatch survived disposal — at thread shutdown it runs "
+            "out its POST timeouts instead of being dropped")
+        assert not any(f.cancelled() for f in busy), (
+            "a RUNNING future cannot be cancelled")
+    finally:
+        release.set()
+
+
+def test_the_dispose_assertion_discriminates_on_cancel_futures():
+    """Control for the test above: make sure it is testing something.
+
+    With the same pool shape and the SAME blocked-then-queued futures,
+    ``shutdown(wait=False)`` WITHOUT ``cancel_futures=True`` leaves the queued
+    future pending — so the ``queued.cancelled()`` assertion in
+    ``test_the_sweep_pool_is_disposed_at_thread_shutdown`` fails if the dispose
+    hook ever loses that argument. This is a stdlib-behaviour control (no repo
+    code under test), kept beside the assertion it protects.
+    """
+    import threading
+
+    pool = ha.ThreadPoolExecutor(max_workers=1, thread_name_prefix="8098-control")
+    release = threading.Event()
+    started = threading.Event()
 
     def _blocked():
         started.set()
@@ -806,18 +853,17 @@ def test_the_sweep_pool_is_disposed_at_thread_shutdown():
 
     try:
         busy = pool.submit(_blocked)
-        assert started.wait(10), "the pool never ran"
+        assert started.wait(10), "the control pool never ran"
         queued = pool.submit(_blocked)
-
-        ha._dispose_webhook_sweep_executor()
-
-        assert ha._WEBHOOK_SWEEP_EXECUTOR is None, "the disposed pool was kept"
-        assert queued.cancelled(), (
-            "a QUEUED dispatch survived disposal — at thread shutdown it runs "
-            "out its POST timeouts instead of being dropped")
-        assert not busy.cancelled(), "a RUNNING future cannot be cancelled"
+        pool.shutdown(wait=False)  # NO cancel_futures
+        assert not queued.cancelled(), (
+            "control broken: plain shutdown(wait=False) already cancelled a "
+            "queued future, so the dispose test would pass without "
+            "cancel_futures=True")
+        assert not busy.cancelled()
     finally:
         release.set()
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def test_the_sweep_pool_dispose_hook_is_none_safe(monkeypatch):

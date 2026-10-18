@@ -2936,9 +2936,15 @@ def _webhook_sweep_executor() -> ThreadPoolExecutor:
 # (#3087) and `_dispose_demand_ping_executor`: `shutdown(wait=False,
 # cancel_futures=True)` from `threading._register_atexit`, NOT `atexit
 # .register` (that runs AFTER `threading._shutdown()` already joined). Same
-# LIMITATION too: cancellation drops QUEUED futures only — a worker already
-# inside a POST is not interruptible, and the bound that actually protects
-# exit is `TIMEOUT_S` being well below `kill_timeout`.
+# LIMITATION too, stated at its real granularity: cancellation drops QUEUED
+# futures only — a worker already RUNNING one is not interruptible, and one
+# future is a WHOLE graph dispatch (`_dispatch_webhooks_sync` →
+# `dispatch_pending`: up to `MAX_SUBSCRIPTIONS` (25) × `DEFAULT_BATCH` (50)
+# sequential POSTs at `TIMEOUT_S` (10 s) each), not a single POST. So the thing
+# that actually bounds a SIGTERM landing mid-dispatch is fly.toml's
+# `kill_timeout` SIGKILL, not `TIMEOUT_S`; this hook's job is to make sure the
+# futures still in the QUEUE are dropped instead of being joined by
+# `_python_exit` behind that running one.
 def _dispose_webhook_sweep_executor() -> None:
     """Cancel queued sweep dispatches and release the pool at thread shutdown.
 

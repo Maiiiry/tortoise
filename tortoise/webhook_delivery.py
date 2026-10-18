@@ -514,10 +514,24 @@ _DUE_PREDICATE = (
 #: * a subscription whose unread events were PURGED (retention) while its
 #:   cursor stayed behind — the counter's head then exceeds the store's max seq.
 #:
-#: Both are bounded: the first by the event-type set a tenant subscribes to, the
-#: second by `:GraphEvent` retention versus a retry ladder that disables a
-#: subscription within ``max_attempts`` backoffs (hours), far inside any
-#: retention window.
+#: ⛔ Only the FIRST is bounded by the retry ladder (#8098 review, non-counted).
+#: A ``types``-filtered subscription is quiet for at most as long as no matching
+#: event is emitted, and the ladder disables a subscription only when a delivery
+#: FAILS — so the filter case resolves when the tenant's next matching event
+#: arrives, not on a timer.
+#:
+#: The PURGED-CURSOR case is NOT bounded by the ladder: the unread events are
+#: gone, ``read_after`` returns ``[]``, so nothing is delivered and nothing
+#: FAILS — no attempt accrues, no backoff is written, and nothing ever disables
+#: the subscription inside ``max_attempts``. Its cursor stays below ``$head``
+#: forever, so the graph is admitted (one SDK open, one no-op dispatch) on every
+#: interval, indefinitely. That is cheap but unbounded, and it is stated here
+#: rather than papered over: the real remedy is to advance such a cursor past
+#: ``:GraphEventMeta.first_seq`` when ``read_after`` comes back empty for a
+#: subscription sitting under the purge floor — deliberately NOT done in #8098,
+#: because silently advancing a cursor past events that retention removed is a
+#: delivery-loss decision that belongs with the dispatch state machine, not
+#: smuggled in as a cost optimisation.
 _BEHIND_PREDICATE = "(s.cursor IS NULL OR s.cursor < $head)"
 
 
