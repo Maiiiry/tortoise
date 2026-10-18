@@ -67,7 +67,7 @@ import unicodedata
 import warnings
 import weakref
 from collections import Counter
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import value_gate as _value_gate  # #4899: the S2.2b identifier-only predicate
 from . import vet_gate as _vet_gate  # #5005: S2.2 VET (stdlib-only module)
@@ -3094,7 +3094,11 @@ def _clean_slots(raw, warnings: list[str], ctx: str,
     # (_object_kind_forms — master + pack object/document kinds) — a slot
     # referencing an emitted pack-kind entity (e.g. dev:apiSpec) must keep
     # its kind and resolve, not be repaired to core:other and dropped.
-    entity_forms = _object_kind_forms(master) if master else None
+    # #5202: the gate now also supplies the DECLARED spelling, so a slot kind
+    # matches the entity lane's canonicalised kind exactly (``_bare_kind``
+    # matching already made the two resolve, but the two lanes must not emit
+    # different spellings for the same kind).
+    entity_canon = _object_kind_canonical(master) if master else None
     # FIX M's event-side mirror (#5806): the event lane gates against the
     # SAME widened vocabulary as execute_embed's event gate
     # (_event_kind_forms — master forms plus pack DECLARED eventKinds,
@@ -3141,13 +3145,16 @@ def _clean_slots(raw, warnings: list[str], ctx: str,
                     warnings.append(f"minted slot kind {kind!r} ('{name[:60]}'"
                                     f") → repaired to {_EVENT_FALLBACK['kind']}")
                     kind = _EVENT_FALLBACK["kind"]
-            elif entity_forms and not sentinel and \
-                    kind.lower() not in entity_forms and \
-                    kind.lower().rsplit(":", 1)[-1] not in {
-                        f.lower().rsplit(":", 1)[-1] for f in entity_forms}:
-                warnings.append(f"minted slot kind {kind!r} ('{name[:60]}'"
-                                f") → repaired to {_ENTITY_FALLBACK['kind']}")
-                kind = _ENTITY_FALLBACK["kind"]
+            elif entity_canon is not None and not sentinel:
+                resolved = entity_canon.resolve(kind)
+                if resolved is None:
+                    warnings.append(f"minted slot kind {kind!r} "
+                                    f"('{name[:60]}')"
+                                    f" → repaired to "
+                                    f"{_ENTITY_FALLBACK['kind']}")
+                    kind = _ENTITY_FALLBACK["kind"]
+                else:
+                    kind = resolved
             try:
                 conf = float(r.get("confidence"))
             except (TypeError, ValueError):
@@ -5582,11 +5589,17 @@ def _minted_kind_report(embed_list: dict, master: dict | None = None) -> list[st
     SAME vocabulary as its execute_embed gate: entities → the EXTENDED
     object vocabulary (master + pack object/document kinds — FIX M),
     events → the EXTENDED event vocabulary (FIX A), points → the master's
-    "points" section ONLY (FIX P — pack point kinds are never writable)."""
+    "points" section ONLY (FIX P — pack point kinds are never writable).
+
+    #5202: the entity lane now asks the same ``_object_kind_canonical``
+    resolve the write gate uses, not the looser fold-then-keep membership
+    test — so a spelling the repair pass rewrites (``core:workItem``) and one
+    it now falls back (``dev:tool``, an undeclared namespace) are BOTH
+    reported. The report's contract is "agrees with the write gate"; it
+    would be stale if it kept accepting what the gate no longer emits.
+    """
     master = master or build_master_list()
-    obj_forms = _object_kind_forms(master)
-    full = {k.lower() for k in obj_forms if ":" in k}
-    bare = {k.lower().rsplit(":", 1)[-1] for k in obj_forms}
+    obj_canon = _object_kind_canonical(master)
     point_full = {k.lower() for k in master["points"]}
     point_bare = {k.lower().rsplit(":", 1)[-1] for k in master["points"]}
     minted: list[str] = []
@@ -5602,7 +5615,7 @@ def _minted_kind_report(embed_list: dict, master: dict | None = None) -> list[st
         # object/document kinds — FIX M: a classifier-assigned synthesized
         # object kind is writable at execute_embed, so it is NOT minted;
         # the report must agree with the write gate).
-        if k and k.lower() != UNCLASSIFIED and k.lower() not in full and k.lower() not in bare:
+        if k and k.lower() != UNCLASSIFIED and obj_canon.resolve(k) is None:
             minted.append(f"{k} (entity '{_clip(e.get('name', ''))}')")
     for ev in embed_list.get("events", []) or []:
         if not isinstance(ev, dict):
@@ -5971,11 +5984,15 @@ def _event_kind_forms(master: dict) -> set[str]:
 #: including the kindDefs-less ones: the classifier can assign them via the
 #: kind index's "objects" section (FIX L synthesis), so the entity write
 #: gate must accept them (FIX M candidate/write-gate alignment — the events
-#: lane's FIX A mirror). Full + bare forms, case-folded. Cached per INSTALLED
-#: namespace set, never once per process (see ``_PACK_EVENT_FORMS`` — the
-#: same #5163 review P1: an unkeyed global admitted every pack on every graph).
-#: Bounded + LRU + thread-safe via ``GateMemo`` (``tortoise/_gate_memo.py``).
-_PACK_OBJECT_FORMS = GateMemo()
+#: lane's FIX A mirror). Cached per INSTALLED namespace set, never once per
+#: process (see ``_PACK_EVENT_FORMS`` — the same #5163 review P1: an unkeyed
+#: global admitted every pack on every graph). Bounded + LRU + thread-safe
+#: via ``GateMemo`` (``tortoise/_gate_memo.py``).
+#:
+#: #5202: the memo stores the DECLARED spellings (not the case-folded forms)
+#: so the same compile can serve both the acceptance view and the spelling
+#: resolution.
+_PACK_OBJECT_CANON = GateMemo()
 
 
 def _object_kind_forms(master: dict) -> set[str]:
@@ -5987,12 +6004,83 @@ def _object_kind_forms(master: dict) -> set[str]:
     marketing:keyword) **for the namespaces this graph installs**. Full +
     bare forms, case-folded. The gate must never raise: a pack-registry
     failure degrades to the master-forms-only set (mirrors
-    _event_kind_forms)."""
-    forms = master_kind_forms(master)
+    _event_kind_forms).
+
+    #5202: this is the ACCEPTANCE view, derived from the same
+    ``_object_kind_canonical`` the write path resolves spellings through —
+    one registry walk, so the accepted set and the declared spelling cannot
+    drift. The write path itself now calls the canonical map directly (the
+    forms set is case-folded and could not name the declared spelling); this
+    helper is the test-pinned statement of WHICH kinds are accepted.
+    """
+    forms: set[str] = set()
+    for declared in _object_kind_canonical(master).exact.values():
+        forms.add(declared)
+        forms.add(declared.lower())
+    return forms
+
+
+class _ObjectKindCanon(NamedTuple):
+    """The DECLARED spelling of every accepted entity kind (#5202).
+
+    ``exact`` maps ``casefold(declared form) → declared form`` and covers both
+    the namespaced and the bare spelling (``core:workitem → core:WorkItem``,
+    ``workitem → WorkItem``, ``apispec → apiSpec``).
+    """
+
+    exact: dict[str, str]
+
+    def resolve(self, kind: str) -> str | None:
+        """The declared spelling of ``kind`` in the model's own namespace when
+        that namespace declares it (a case fix and nothing else), else None —
+        the caller repairs to the family fallback.
+
+        ⛔ DELIBERATELY NOT a namespace-repair: a bare-name hit is NOT used to
+        re-namespace an undeclared kind. ``dev:tool`` does NOT become
+        ``core:tool``. Measured cost of the narrower rule: a kind whose
+        namespace simply fails to declare it falls to ``core:other`` (the
+        documented family fallback) rather than keeping its bare name. The
+        measured cost of the WIDER rule is why it is refused:
+        ``tests/test_subject_binding_1370.py::
+        TestCaptureSeam::test_foreign_namespace_kind_never_mints_a_subject``
+        — ``acme:team`` re-namespaced to ``core:team`` PROMOTES a foreign kind
+        into a core Subject kind, which mints a ``:Subject`` node and an
+        ``aboutSubject`` edge through the capture seam (the F2/T2 bypass that
+        suite exists to guard). Repairing a namespace is a semantics change,
+        never a spelling fix; the fallback is the safe direction.
+        """
+        return self.exact.get(kind.casefold())
+
+
+def _object_kind_canonical(master: dict) -> _ObjectKindCanon:
+    """Compile ``_ObjectKindCanon`` over the SAME sources as
+    ``_object_kind_forms`` — the master's five kind sections plus the gated
+    packs' declared object/document kinds — so the DECLARED spellings and the
+    accepted set cannot drift apart.
+
+    Why this exists (#5202): the repair test was a membership test in a
+    case- AND namespace-folded set, but the STORED value was the model's own
+    text — so ``core:workItem`` (a case-fold hit) was accepted un-repaired and
+    written as-is. The production census found exactly that spelling next to
+    its canonical twin. Resolving the case-fold hit to the declared spelling
+    keeps the acceptance semantics and removes the off-vocabulary output.
+    """
+    exact: dict[str, str] = {}
+
+    def _add(form: str) -> None:
+        exact.setdefault(form.casefold(), form)
+
+    for section in ("objects", "subjects", "points", "events",
+                    "pack_kinds"):
+        for key in master.get(section, {}):
+            ns, _, kind = key.rpartition(":")
+            _add(key)          # core:WorkItem / dev:apiSpec / statement
+            if ns:
+                _add(kind)     # WorkItem  — the bare declared spelling
     gate = _installed_pack_ns(master)
-    pack_forms = _PACK_OBJECT_FORMS.get(gate)
+    pack_forms = _PACK_OBJECT_CANON.get(gate)
     if pack_forms is None:
-        pack_forms = set()
+        forms: list[str] = []
         try:
             from tortoise.pack_registry import (
                 PackRegistry,
@@ -6006,13 +6094,15 @@ def _object_kind_forms(master: dict) -> set[str]:
                     continue
                 for k in (pack.object_kinds or []) + \
                         (pack.document_kinds or []):
-                    pack_forms.add(f"{ns}:{k}".lower())
-                    pack_forms.add(k.lower())
-        except Exception:  # noqa: BLE001, RUF100 — never let the write
-            # gate raise (fail-open to the master-forms-only gate)
-            pack_forms = set()
-        pack_forms = _PACK_OBJECT_FORMS.put_if_absent(gate, pack_forms)
-    return forms | pack_forms
+                    forms.append(f"{ns}:{k}")
+                    forms.append(k)
+        except Exception:  # noqa: BLE001, RUF100 — mirror _object_kind_forms:
+            forms = []      # a registry failure must never raise out of the
+            # write gate (the master-forms-only set is the degraded gate).
+        pack_forms = _PACK_OBJECT_CANON.put_if_absent(gate, tuple(forms))
+    for form in pack_forms:
+        _add(form)
+    return _ObjectKindCanon(exact=exact)
 
 
 def _canonicalize_nand_direction(src: str, dst: str, turns: dict) -> \
@@ -6095,7 +6185,16 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
         # EXTENDED object vocabulary (master + pack object/document kinds —
         # the classifier's synthesized object kinds, e.g. dev:apiSpec,
         # pm:kanbanBoard, marketing:keyword, must survive un-repaired).
-        forms = _object_kind_forms(master)
+        #
+        # #5202: the SAME vocabulary now also supplies the canonical SPELLING.
+        # The old test was a membership test in a case- and namespace-folded
+        # set whose hit kept the model's own text, so `core:workItem` (a cased
+        # variant of `core:WorkItem`) and `dev:tool` (bare name `tool`, a
+        # namespace that declares no such kind) were accepted un-repaired and
+        # written verbatim — the census spellings. Acceptance is unchanged;
+        # the accepted spelling is now the DECLARED one, which is what the
+        # Layer-1 object-kind gate (#5202, commit_schema) admits.
+        canon = _object_kind_canonical(master)
         if kind.lower() == UNCLASSIFIED:
             # #1695 Task 5: the classify-later sentinel is NEVER written to
             # the graph — best core kind + warning (the orchestrator's
@@ -6104,12 +6203,24 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
                             f"repaired to {_ENTITY_FALLBACK['kind']} "
                             "(reserved sentinel)")
             kind = _ENTITY_FALLBACK["kind"]
-        elif kind.lower() not in forms and \
-                kind.lower().rsplit(":", 1)[-1] not in {f.lower().rsplit(":", 1)[-1]
-                                                        for f in forms}:
-            warnings.append(f"minted entity kind {kind!r} ('{name[:60]}') "
-                            f"→ repaired to {_ENTITY_FALLBACK['kind']}")
-            kind = _ENTITY_FALLBACK["kind"]
+        else:
+            resolved = canon.resolve(kind)
+            if resolved is None:
+                warnings.append(f"minted entity kind {kind!r} "
+                                f"('{name[:60]}') "
+                                f"→ repaired to {_ENTITY_FALLBACK['kind']}")
+                kind = _ENTITY_FALLBACK["kind"]
+            elif resolved != kind:
+                # A namespace the pack does not declare is a MEANING change
+                # (dev:tool → core:tool), not a spelling fix — surface it.
+                # A pure case fix is silent: it is the same kind.
+                if (resolved.rpartition(":")[0]
+                        != kind.rpartition(":")[0]):
+                    warnings.append(f"entity kind {kind!r} ('{name[:60]}') "
+                                    "names a pack namespace that does not "
+                                    f"declare it → normalized to "
+                                    f"{resolved!r}")
+                kind = resolved
         key = (name, kind)
         if key in seen_entities:
             continue

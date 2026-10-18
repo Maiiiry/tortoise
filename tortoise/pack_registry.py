@@ -80,6 +80,23 @@ CANONICAL_POINT_KINDS = frozenset({
     "target", "observation", "hypothesis",
 })
 
+# Core Subject kinds (ONTOLOGY §1 "Subject" — the participant classes a
+# commitment is about). These are NOT object kinds, but a commit payload's
+# ``entities[]`` legitimately carries them: the extractor's entity gate admits
+# the master's subject section (``extractor_v2.SUBJECTS``) so a session about
+# "the team" writes an Object whose ``objectKind`` is ``core:team``, and the
+# participant-slot lane resolves subject refs against those same entity rows.
+# The write gate (#5202) admits them for exactly that reason — ``_bare_kind``
+# matching is namespace-blind, so a name the payload types by ANY declared
+# kind must stay resolvable.
+#
+# One source of truth: ``extractor_v2.SUBJECTS``'s keys are asserted equal to
+# this set by ``tests/test_entity_kind_write_gate_5202.py`` (the two must not
+# drift — the extractor's gate and the commit gate would then disagree).
+CORE_SUBJECT_KINDS = frozenset({
+    "organization", "team", "role", "legalPerson", "naturalPerson",
+})
+
 CANONICAL_DOCUMENT_KINDS = frozenset({
     "research", "reflectPostmortem", "strategyDoc", "visionDoc",
     "planDoc", "decisionDoc", "meetingNotes", "experimentResults",

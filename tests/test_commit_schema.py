@@ -526,7 +526,14 @@ class TestCommitIdMismatch:
 # ── Participant slots (#1418: object + event-as-content) ─────────────────────
 
 _SLOTS = {
-    "subject": [{"name": "Alpha", "kind": "Team", "confidence": 0.8}],
+    # #5202: `team` (lowercase) is the DECLARED bare spelling of the core
+    # Subject kind `core:team`; `Team` is not in any vocabulary. The fixture
+    # used the undeclared capitalisation while `entities[].kind` went
+    # unchecked — Layer-1 is now closed-vocab on it, so the fixture carries
+    # the declared spelling (the extractor's own gate never admitted `Team`
+    # either: `extractor_v2._object_kind_forms` case-folds to the declared
+    # form).
+    "subject": [{"name": "Alpha", "kind": "team", "confidence": 0.8}],
     "object": [{"name": "Alpha", "kind": "Project", "confidence": 0.9}],
     "event": [{"name": "the Aug 3 meeting", "kind": "meeting",
                 "confidence": 0.7}],
@@ -535,7 +542,7 @@ _SLOTS = {
 # emitted entities the _SLOTS subject/object refs must resolve against
 _SLOT_ENTITIES = [
     {"name": "Alpha", "kind": "Project", "passes_frequency_gate": True},
-    {"name": "Alpha", "kind": "Team", "passes_frequency_gate": True},
+    {"name": "Alpha", "kind": "team", "passes_frequency_gate": True},
 ]
 
 
@@ -581,7 +588,7 @@ class TestParticipantSlots:
         # direction the #1370 re-validation names (typed slots reuse entity
         # names; names must resolve against emitted entities[])
         result, _ = _check(_raw_payload(points=[_point(
-            0, slots={"subject": [{"name": "Ghost", "kind": "Team",
+            0, slots={"subject": [{"name": "Ghost", "kind": "team",
                                     "confidence": 0.8}]})]))
         assert not result.ok
         assert result.errors["points[0].slots.subject"]
@@ -611,7 +618,7 @@ class TestParticipantSlots:
 
     def test_slot_confidence_out_of_range_422(self):
         result, _ = _check(_raw_payload(points=[_point(
-            0, slots={"subject": [{"name": "Alpha", "kind": "Team",
+            0, slots={"subject": [{"name": "Alpha", "kind": "team",
                                     "confidence": 1.5}]})]))
         assert not result.ok
         assert any(k.startswith("points[0].slots") for k in result.errors)
@@ -629,7 +636,7 @@ class TestParticipantSlots:
         # c_cal: it must NOT change the commit id
         a = _raw_payload(points=[_point(0, slots=_SLOTS)])
         b = _raw_payload(points=[_point(0, slots={
-            "subject": [{"name": "Alpha", "kind": "Team",
+            "subject": [{"name": "Alpha", "kind": "team",
                           "confidence": 0.99}],
             "object": [{"name": "Alpha", "kind": "Project",
                           "confidence": 0.99}],
@@ -646,7 +653,7 @@ class TestParticipantSlots:
     def test_slot_name_change_changes_id(self):
         a = _raw_payload(points=[_point(0, slots=_SLOTS)])
         b = _raw_payload(points=[_point(0, slots={
-            "subject": [{"name": "Beta", "kind": "Team",
+            "subject": [{"name": "Beta", "kind": "team",
                           "confidence": 0.8}],
             "object": [{"name": "Alpha", "kind": "Project",
                           "confidence": 0.9}],

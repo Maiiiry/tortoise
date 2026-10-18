@@ -57,7 +57,10 @@ from ._gate_memo import GateMemo
 from .file_indexer import provenance_basename
 from .ids import content_hash
 from .pack_registry import (
+    CANONICAL_EVENT_KINDS,
+    CANONICAL_OBJECT_KINDS,
     CANONICAL_POINT_KINDS,
+    CORE_SUBJECT_KINDS,
     DECISION_POINT_KINDS,
     PackRegistry,
     registered_source_types,
@@ -154,10 +157,20 @@ class Vocab:
     # HARDCODED set, so a mined pack event (e.g. agent-ops:ruleRevised →
     # bare ``ruleRevised`` after the extractor's FIX-A stripping) 422'd.
     event_kinds: frozenset[str] = frozenset(EVENT_KINDS)
+    # #5202: the objectKind vocabulary — the FOURTH kind-bearing section, and
+    # the one Layer-1 never checked. ``entities[].kind`` is persisted verbatim
+    # by the hosted door (``objectKind=er.entity.kind``), so an off-vocabulary
+    # kind reached the graph: the production census found ``core:workItem`` (8),
+    # ``dev:tool`` (8) and bare ``other`` (8) alongside canonical spellings.
+    # Compiled under the SAME installed-namespace gate as point/event/source
+    # kinds (see ``_compile_vocab_uncached``). Defaults empty so a hand-built
+    # ``Vocab()`` stays permissive for the pre-#5202 callers that construct one
+    # field-by-field (the gate is only closed when a real compile fills it).
+    object_kinds: frozenset[str] = frozenset()
 
     def __contains__(self, kind: str) -> bool:  # pragmatic: Vocab ⊇ kind
         return (kind in self.point_kinds or kind in self.source_kinds
-                or kind in self.event_kinds)
+                or kind in self.event_kinds or kind in self.object_kinds)
 
 
 def compile_vocab(packs_dir: Path | str | None = None,
@@ -196,17 +209,22 @@ def compile_vocab(packs_dir: Path | str | None = None,
     per-graph approval on the live commit path. What remains is the
     per-graph pack SELECTION surface (#2728).
 
-    **Scope of that claim — verified by the #5339 security review, do NOT
-    read it as "object kinds are gated":** Layer-1 gates
-    ``points[].pointKind``, ``events[].eventKind`` and
-    ``sources[].sourceKind``. It does **not** gate ``entities[].kind``, which
-    the hosted door persists verbatim (``hosted_api``:
-    ``objectKind=er.entity.kind``) — an off-vocabulary object kind is still
-    written (#5202). Separately, the approval set this gate is handed is
+    **Scope of that claim — verified by the #5339 security review, then
+    CLOSED by #5202:** Layer-1 gates ``points[].pointKind``,
+    ``events[].eventKind``, ``sources[].sourceKind`` AND — since #5202 —
+    ``entities[].kind``, the field the hosted door persists verbatim
+    (``hosted_api``: ``objectKind=er.entity.kind``). Before #5202 the object
+    kinds were the one kind-bearing section with no membership test, so the
+    production census held ``core:workItem`` (a cased variant of canonical
+    ``core:WorkItem``) alongside it; the vocabulary is now the declared
+    object-kind set (core objects/subjects/points/events ∪ the gated packs'
+    objectKinds/documentKinds/pointKinds/eventKinds), in bare and namespaced
+    form — see ``_compile_vocab_uncached`` and ``_entity_kind_vocab``.
+    Separately, the approval set this gate is handed is
     itself writable through the unvalidated ``objectKind`` field on
-    ``POST /v1/objects`` (#5475), so it is not (yet) an authorization
-    boundary. This function gates the vocab it is GIVEN; it does not make the
-    write path's object kinds closed-vocab.
+    ``POST /v1/objects`` (#5475) — that door was constrained to the graph's
+    approved NAMESPACES separately (#8380), and the residual on the SDK/MCP
+    entity doors is tracked there, not here.
 
     Memoized per gate (#5163 review, P1). ``compile_vocab`` runs
     ``PackRegistry.load_all()`` — a filesystem walk + YAML parse of every
@@ -245,6 +263,7 @@ def _compile_vocab_uncached(packs_dir: Path | str | None,
     pack_point: set[str] = set()
     pack_sources: set[str] = set()
     pack_events: set[str] = set()
+    pack_objects: set[str] = set()
     for ns, pack in registry.packs.items():
         if _gate is not None and ns not in _gate:
             continue
@@ -253,10 +272,47 @@ def _compile_vocab_uncached(packs_dir: Path | str | None,
         pack_sources.update(pack.extraction.get("sourceTypes") or [])
         pack_events.update(pack.event_kinds)
         pack_events.update(f"{ns}:{k}" for k in pack.event_kinds)
+        # #5202: the entity (objectKind) leg. It mirrors — deliberately — the
+        # set the extractor's own repair gate admits (``extractor_v2.
+        # _object_kind_forms`` = the master's object/subject/point/event forms
+        # ∪ the gated packs' DECLARED object/document kinds), so the two gates
+        # cannot disagree: a kind the extractor keeps un-repaired must be a
+        # kind Layer-1 admits. Narrowing here (objects only) would 422 our own
+        # captures on a subject entity (``core:team``) or a kindDefs-less pack
+        # object kind (``dev:apiSpec``); widening past the declared
+        # vocabulary would leave the #5202 hole open.
+        for kinds in (pack.object_kinds, pack.document_kinds,
+                      pack.point_kinds, pack.event_kinds):
+            pack_objects.update(kinds)
+            pack_objects.update(f"{ns}:{k}" for k in kinds)
     return Vocab(
         point_kinds=frozenset(CORE_POINT_KINDS | pack_point),
         source_kinds=frozenset(registered_source_types() | pack_sources),
         event_kinds=frozenset(EVENT_KINDS | pack_events),
+        object_kinds=_entity_kind_vocab(pack_objects),
+    )
+
+
+def _entity_kind_vocab(pack_kinds: set[str]) -> frozenset[str]:
+    """The closed ``entities[].kind`` (objectKind) vocabulary (#5202).
+
+    Bare AND ``core:``-namespaced forms of every declared core kind in the
+    four kind-bearing core sections, plus the gated packs' declared kinds in
+    bare and ``ns:kind`` form. Both spellings are admitted because both are
+    legal client spellings today: ``pack_registry.CORE_KINDS`` resolves a bare
+    kind reference without a namespace, and the extractor emits bare forms
+    wherever the model does. Case is NOT folded — canonical spelling is the
+    point of the gate: ``core:workItem`` is the misspelling #5202 exists to
+    reject, and the extractor normalises it to ``core:WorkItem`` before the
+    payload is built (``extractor_v2._normalize_entity_kind``), so the strict
+    comparison costs our own pipeline nothing.
+    """
+    core = (CANONICAL_OBJECT_KINDS | CORE_SUBJECT_KINDS
+            | CANONICAL_POINT_KINDS | CANONICAL_EVENT_KINDS)
+    return frozenset(
+        set(core)
+        | {f"core:{k}" for k in core}
+        | set(pack_kinds)
     )
 
 
@@ -989,13 +1045,14 @@ def validate_layer1(
     """Deterministic Layer-1 semantic validation over a parsed payload.
 
     Checks (plan §4.5 / §6.1 Layer-1 block): per-type payload caps; closed
-    vocab for pointKind + sourceKind (runtime-compiled); referential
-    integrity (operator src/dst ∈ emitted point ids; about_entities ⊆
-    entities; source_ref ∈ {session source} ∪ emitted sources[]); MITIGATES
-    shape (target ∈ emitted IMPL operator keys ∧ strength ∈ [0.10, 0.50]);
-    NAND direction REQUIRED; atomicity shape; client_commit_id recomputed and
-    matched (→ code commit_id_mismatch). Content/quote caps + scalar enums
-    are enforced by the Pydantic models (shape_errors) before this runs.
+    vocab for pointKind + sourceKind + eventKind + entity kind (#5202,
+    runtime-compiled); referential integrity (operator src/dst ∈ emitted point
+    ids; about_entities ⊆ entities; source_ref ∈ {session source} ∪ emitted
+    sources[]); MITIGATES shape (target ∈ emitted IMPL operator keys ∧ strength
+    ∈ [0.10, 0.50]); NAND direction REQUIRED; atomicity shape;
+    client_commit_id recomputed and matched (→ code commit_id_mismatch).
+    Content/quote caps + scalar enums are enforced by the Pydantic models
+    (shape_errors) before this runs.
     """
     vocab = vocab or get_vocab()
     errors: dict[str, list[str]] = {}
@@ -1084,6 +1141,22 @@ def validate_layer1(
             add(f"sources[{i}].sourceKind",
                 f"sourceKind {s.sourceKind!r} not in the ontology §5 "
                 "source-type vocabulary")
+    # ... and the FOURTH kind-bearing section (#5202). ``Entity.kind`` is only
+    # ``Field(min_length=1)``, and the hosted door persists it verbatim as the
+    # Object's ``objectKind`` — so before this check a mis-cased canonical
+    # spelling (``core:workItem``) or a kind no vocabulary declares
+    # (``totally:madeUp``) was written as if the gate had admitted it. The
+    # sibling sections are all closed-vocab; this one now is too. Empty vocab
+    # (a hand-built ``Vocab``) is treated as GATED-ONLY-IF-COMPILED: a compile
+    # always fills it, so ``frozenset()`` here means the caller did not
+    # compile — skip rather than reject everything.
+    if vocab.object_kinds:
+        for i, e in enumerate(payload.entities):
+            if e.kind not in vocab.object_kinds:
+                add(f"entities[{i}].kind",
+                    f"entity kind {e.kind!r} not in the compiled object-kind "
+                    "vocabulary (canonical spelling + the graph's installed "
+                    "packs — refresh the value brief)")
 
     # Referential integrity.
     for i, pt in enumerate(payload.points):
@@ -1153,6 +1226,12 @@ def validate_layer1(
         code = "commit_id_mismatch"
     elif any(k.endswith(".pointKind") or k.endswith(".sourceKind")
              for k in errors):
+        code = "calibration_mismatch"
+    elif any(k.startswith("entities[") and k.endswith(".kind")
+             for k in errors):
+        # #5202: an entity kind outside the vocabulary is the same
+        # stale-brief signature as an unknown pointKind/sourceKind — the
+        # client refreshes its value brief.
         code = "calibration_mismatch"
     return Layer1Result(ok=False, errors=errors, code=code)
 
