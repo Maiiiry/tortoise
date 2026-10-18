@@ -83,22 +83,30 @@ whose contract covers the capability, and that surface's `Test Layer` column is 
 Four rows are worth stating because they are the ones a reader would otherwise have to infer, and each is deliberate:
 
 - **W5 setup card** has no surface of its own — it is a *rendering* of `OnboardingState`, so it lives inside other
-  surfaces' contracts rather than beside them. On 9 it is the next-action element: the same graph-held state, shown as
-  one next step plus a CTA into the guide. On 10 it is the counted checklist itself, with its collapse-when-complete and
-  its re-open path in Settings — the same state, never a second list. Its third surface is 17, whose friction test is
-  what checks the promise it makes (progress is never a mystery). (`05-ux-decisions.md` "Affordance: setup card" +
-  "Layout: Setup guide" — the re-open path is the latter row's claim; `06-plan.md:184`).
-- **W9 trigger/entry** is a property of three surfaces, not one: org-create fires it (3), the state node is what every
-  entry door reads (1), and the Settings Setup guide is one of those doors (10 — its own row names W9 as a consumer, and
-  the scope's W9 includes "Settings Setup guide idempotent re-entry"). A separate surface would have duplicated 3's
-  transaction contract.
+  surfaces' contracts rather than beside them. On surface 9 it is the next-action element: the same graph-held state,
+  shown as one next step plus a CTA into the guide. On surface 10 it is the counted checklist itself, with its
+  collapse-when-complete and its re-open path in Settings — the same state, never a second list. The third is surface 17,
+  whose friction test is what checks the promise it makes (progress is never a mystery). (`05-ux-decisions.md`
+  "Affordance: setup card" + "Layout: Setup guide" — the re-open path is the latter row's claim; `06-plan.md:184`).
+- **W9 trigger/entry** is a property of three surfaces, not one: org-create fires it (surface 3), the state node is what
+  every entry door reads (surface 1), and the Settings Setup guide is one of those doors (surface 10 — its own row names
+  W9 as a consumer, and the scope's W9 includes "Settings Setup guide idempotent re-entry"). A separate surface would
+  have duplicated surface 3's transaction contract.
 - **W7 fusion** shares surface 12 with invite-accept because the two are one flow; what distinguishes it is the OTP guard on
-  both mismatch-override paths, which is 12's privilege-accumulation failure mode.
-- **W2 universal command** covers two surfaces because the capability is both the command (5) and the skill it installs
-  (6); the document's own E2E-5 row exercises `5, 6`, and its verification-checklist row is literally "5-6 install
-  command + skill".
+  both mismatch-override paths, which is surface 12's privilege-accumulation failure mode.
+- **W2 universal command** covers two surfaces because the capability is both the command (surface 5) and the skill it
+  installs (surface 6); the document's own E2E-5 row exercises 5 and 6, and its verification-checklist row is literally
+  "5-6 install command + skill".
 
-**The `Verified at` column is a copy, not a source:** when a surface's `Test Layer` above changes, re-copy that cell — a stale quote here reads as authoritative and is not checked by anything else.
+Each rationale above cites its surfaces in the explicit **`surface N`** form, and
+`tests/test_test_design_1992_traceability.py` fails a row that does not cite every surface its rationale names in that
+form — this paragraph is the contract the guard reads, so keep the citations explicit (a bare `9` or `(10)` is prose,
+not a citation).
+
+**The `Verified at` column is a copy, not a source:** when a surface's `Test Layer` above changes, re-copy that cell — a
+stale quote here reads as authoritative. `tests/test_test_design_1992_traceability.py`
+(`test_every_capability_quotes_its_surfaces_test_layer_verbatim`) fails the row whose quote drifts, so the re-copy is
+enforced rather than trusted: change a `Test Layer` and this table's cell must change in the same edit.
 
 Between the rows above and the surface table, the mapping holds in both directions: every one of the 17 capabilities has
 at least one surface, and every one of the 17 surfaces is reachable from at least one capability — surface 6 via W2 universal command

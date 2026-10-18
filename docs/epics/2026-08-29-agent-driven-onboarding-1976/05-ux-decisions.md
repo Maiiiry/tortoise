@@ -57,7 +57,7 @@ All 6 classes touched except responsive — the epic's embedded decisions cover 
 | 3 | Copy: terminology | "Organization" everywhere user-facing (never team/workspace); API/teams table name stays | Issue "Terminology — Organization (decided)" |
 | 4 | Gating | Fork is NEVER a billing gate; invites may require paid plan but surfaced at invite-time, not fork consequence | Issue "Fork-dependent behavior" |
 | 5 | Affordance: fork | Once per org, after org-create, before agent flow arms | Issue "Fork card (once, per org...)" |
-| 5 | Affordance: setup card | Dashboard renders the SAME state as a dismissible checklist card; disappears when complete | Issue step 8 + W9 |
+| 5 | Affordance: setup card | Dashboard renders the SAME state on both of its doors — the Settings Setup guide is the counted checklist card (collapses to compact status / dismissible-hide with re-open path when complete, per row "Layout: Setup guide"); the Overview next action mirrors that state as ONE next step + a CTA into the guide — never a counted checklist of its own, and neither card carries a dismissal. **Corrected 2026-10 (#9013 review):** this row previously read "the SAME state as a dismissible checklist card" without naming a door, which the shipped `OverviewNextActionCard` does not satisfy; the counted checklist is `SetupGuideCard` on the Settings tab | Issue step 8 + W9 |
 | 5 | Affordance: pending invites | Subtle affordance in team switcher (GitHub-style); admin resend/expire (Slack-style) | Issue invite section |
 | 6 | Responsive | Not applicable — no novel mobile surfaces (dashboard desktop-first) | — |
 
