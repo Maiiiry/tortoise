@@ -25553,6 +25553,16 @@ class TortoiseSDK:
         `:Event` peer reports `""`. `""` therefore means "this peer's layer
         exposes no `status`", and it is now reached by LOOKING at the peer's
         label rather than by never asking.
+
+        A THIRD meaning is `""`: the sweep leg for that peer's label FAILED
+        (a raise is logged and skipped, so the other labels' statuses survive —
+        the per-label isolation below), or that peer's own status row was
+        malformed (skipped per row, so the other rows survive). Neither is
+        distinguishable from "no lifecycle state" in this value; labelling them
+        is R1 on #8996. A peer can therefore be PRESENT in the payload with `""`
+        because its label's status leg died, which is exactly the conflation the
+        widening above was added to end — stated rather than left to be
+        rediscovered.
         """
         from .search_engine import get_relationships
         proj = self._get_proj()
@@ -25562,21 +25572,53 @@ class TortoiseSDK:
         related_ids = [e.get("related_id") for e in entries if e.get("related_id")]
         statuses: dict[str, str] = {}
         if related_ids:
-            try:
-                rows: list = []
-                for _q in epistemic_label_queries(
-                        "MATCH (n:{label}) WHERE n.id IN $ids "
-                        "RETURN n.id, n.status"):
+            rows: list = []
+            for _q in epistemic_label_queries(
+                    "MATCH (n:{label}) WHERE n.id IN $ids "
+                    "RETURN n.id, n.status"):
+                try:
                     rows.extend(proj.g.query(
                         _q,
                         params={"ids": related_ids},
                         timeout=200,
                     ).result_set)
-                statuses = {row[0]: row[1] or "" for row in rows}
-            except Exception:
-                pass
+                except Exception:
+                    # ONE label failing must not blank every peer's status: the
+                    # sweep widens, so a leg that fails can only fail to add.
+                    _logger.warning(
+                        "related_status lookup failed for one epistemic "
+                        "label — the other labels' statuses are kept",
+                        exc_info=True)
+                    continue
+            for row in rows:
+                try:
+                    statuses[row[0]] = row[1] or ""
+                except Exception:
+                    # A malformed status row must not turn an ADVISORY
+                    # annotation into a whole-read failure on this public method
+                    # (D1: a decoration never fails the read). Per ROW, not per
+                    # comprehension: one bad row may cost exactly one peer,
+                    # never every peer — which is what a single dict-comprehension
+                    # under one handler would do (measured: rows
+                    # [("p1", "live"), (["x"], "live")] → {} → p1 loses "live").
+                    _logger.warning(
+                        "related_status row malformed — that peer's status is "
+                        "left blank, the rest are kept", exc_info=True)
+                    continue
         for e in entries:
-            e["related_status"] = statuses.get(e.get("related_id"), "")
+            try:
+                e["related_status"] = statuses.get(e.get("related_id"), "")
+            except TypeError:
+                # A NON-SCALAR `related_id` is unhashable. It is in scope by
+                # design: `get_relationships`' dedupe key is deliberately total,
+                # so a row whose `other.id` came back as a replayed/diagnostic
+                # list is KEPT and reaches here. Blanking that one peer's
+                # annotation is the whole cost — a decoration must never fail the
+                # read (D1), which is what the per-row guard above promises and
+                # what an unguarded lookup here would have broken one line later
+                # (measured: `statuses.get(['bad-id'])` → TypeError, whole read
+                # lost AFTER the sweep had logged that it succeeded).
+                e["related_status"] = ""
         return entries
 
     # ── Point-in-time restore (E6 #1538, D6) ─────────────────────────
