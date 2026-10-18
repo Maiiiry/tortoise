@@ -28,6 +28,7 @@ from tortoise.supabase_control import (
     claim_membership,
     clear_github_credentials,
     count_graph_keys,
+    decline_invitation_by_email,
     delete_graph_row,
     expired_bootstrap_keys,
     expire_stale_invitations,
@@ -1577,13 +1578,17 @@ class TestExpiredInvitationRemint:
         """The THIRD reader of this status must not 409 on a retired row.
 
         ``DELETE /v1/invites/{id}`` → ``invitation_rescind`` is the admin
-        surface for exactly the rows the dashboard lists, and
-        ``pending_invitations`` (``GET /v1/invites``) filters ``status`` with no
-        expiry filter — so an admin can act on a row a sweep has just retired.
-        Before #8089 nothing wrote 'expired' for a clock expiry, so the
-        status-conditional PATCH matched and the call answered
-        ``{"revoked": True}``; materialising the terminal state must not turn
-        that same admin call (or a retried one) into a 409.
+        surface for exactly the rows the dashboard lists. Before #8089 nothing
+        wrote 'expired' for a clock expiry, so the status-conditional PATCH
+        matched and the call answered ``{"revoked": True}``; materialising the
+        terminal state must not turn that same admin call (or a retried one)
+        into a 409.
+
+        The window is a STALE CLIENT SNAPSHOT, not a live listing —
+        ``pending_invitations`` (``GET /v1/invites``) filters
+        ``status='pending'``, so a materialised ``expired`` row DROPS OUT of it.
+        A dashboard that fetched the list before the sweep still holds the row,
+        and a double-click / retry on it reaches this call.
         """
         fake.seed("org_memberships", [{
             "user_id": _U3, "org_id": "team-1", "role": "owner",
@@ -1603,6 +1608,32 @@ class TestExpiredInvitationRemint:
         assert fake.tables["invitations"][0]["status"] == "expired"
         # Idempotent on the retry too (the dashboard double-click case).
         assert invitation_rescind(fake, inv["id"], "team-1", _U3)["already"]
+
+    def test_decline_of_a_materialised_expired_row_does_not_lie(self, fake):
+        """The FOURTH reader of this status must not report a write it did not do.
+
+        ``decline_invitation_by_email`` is the invitee-side counterpart of
+        ``invitation_rescind`` and the one writer #8089 originally missed. Its
+        status-conditional PATCH matches only ``pending``, so on a row the sweep
+        has materialised ``expired`` the PATCH affects NOTHING and the call
+        still returned ``{"revoked": True}`` — a success response for a write
+        that did not happen. Before #8089 that path really did flip the row
+        (a clock-expired invite still read ``pending``), so materialising the
+        terminal state is what turns the lie from a rare race into the routine
+        outcome; it must answer idempotently instead, like its siblings.
+        """
+        inv = invitation_mint(fake, "team-1", "bob@example.com", "member",
+                              "owner-1")
+        assert expire_stale_invitations(
+            fake, now=(datetime.now(UTC) + timedelta(days=30)).isoformat()) == 1
+        assert fake.tables["invitations"][0]["status"] == "expired"
+
+        result = decline_invitation_by_email(fake, inv["id"], "bob@example.com")
+        assert result == {"revoked": True, "already": True,
+                          "invitation_id": inv["id"]}
+        # The row keeps the expiry instant: declining a dead invite does not
+        # re-classify HOW it died, exactly as rescind does not.
+        assert fake.tables["invitations"][0]["status"] == "expired"
 # ── Onboarding / email / GitHub connect (plan Task 6, issue #764) ─────────
 
 class TestOnboardingState:

@@ -1808,7 +1808,12 @@ async def _run_boot_sweeps() -> None:
                       # materialise clock-expired invitations so the partial
                       # unique index stops blocking re-invites. The SAME runner
                       # as the periodic loop, for the same no-drift reason.
-                      ("expired invitation sweep",
+                      # NOTE the label stops at "invitation": `_guarded_step`
+                      # renders `f"boot {label} sweep"`, so carrying "sweep"
+                      # here too logged (and warned) as
+                      # "boot expired invitation sweep sweep" while the pin's
+                      # substring assertion still passed.
+                      ("expired invitation",
                        _sweep_expired_invitations),
                       # #4241: the SAME runner as the periodic loop, so the
                       # boot and periodic paths for the anchor repair cannot

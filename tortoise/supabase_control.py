@@ -1628,9 +1628,15 @@ def expire_stale_invitations(cp, *, now: str | None = None,
     ONE conditional ``UPDATE ... WHERE status='pending' AND expires_at <= now``
     is the whole fix, and it stays safe with the index as the authority:
 
-    * the PATCH's OWN matched rows ARE the return value, so the count is exact
-      and there is no read-then-write window (the same claim posture the
-      accept / rotate / single-use paths already use);
+    * the PATCH's OWN matched rows ARE the return value, so there is no
+      read-then-write window (the same claim posture the accept / rotate /
+      single-use paths already use); the number is how many rows THIS call
+      flipped, and above the deployment's PostgREST ``max_rows`` cap it is a
+      LOWER BOUND on a large backlog (the UPDATE still affects every matched
+      row — only the returned representation is capped; the sibling count in
+      ``oauth._sweep_oauth_retention`` is documented the same way). Correctness
+      is unaffected and a backlog converges over cycles; the mint-path call is
+      scoped to one (org, email), so it can never be truncated;
     * a row a concurrent accept flipped is no longer ``pending`` → not matched,
       and an invite minted concurrently carries a FUTURE ``expires_at`` → not
       matched, so the sweep can never expire a live invite;
@@ -2078,11 +2084,16 @@ def invitation_rescind(cp, invitation_id: str, org_id: str,
     status-conditional PATCH below matched — this call answered
     ``{"revoked": True}``. Now either half of that fix RETIRES the row (the
     scheduled sweep, or the mint-path flip for that org+email), and the same
-    admin call fell through to the concurrent-accept 409 — on a row the
-    dashboard's pending list can still show (``pending_invitations`` has no
-    expiry filter). 'expired' is as terminal as 'revoked', and the terminal
-    answer must not depend on WHICH mechanism retired the row, so both are
-    answered idempotently.
+    admin call fell through to the concurrent-accept 409. 'expired' is as
+    terminal as 'revoked', and the terminal answer must not depend on WHICH
+    mechanism retired the row, so both are answered idempotently.
+
+    The window this covers is a STALE CLIENT SNAPSHOT, not a live listing:
+    ``pending_invitations`` filters ``status='pending'``, so a materialised
+    ``expired`` row drops out of that list rather than remaining on it. What
+    remains is a dashboard or browser that fetched the list BEFORE the sweep
+    ran and then deletes from it — and the double-click/retry case on the same
+    rendered row, which is why the second call is answered idempotently too.
     """
     mem = membership_for_user_org(cp, actor_user_id, org_id)
     if not mem or mem["role"] not in ("owner", "admin"):
@@ -2119,7 +2130,15 @@ def invitation_rescind(cp, invitation_id: str, org_id: str,
     check = cp.query(
         "invitations", select=["status"], filters=[("id", "eq", invitation_id)],
     )
-    if not check or check[0].get("status") != "revoked":
+    # #8089: 'expired' is accepted here for the same reason the pre-read
+    # branch accepts it. This PR introduces the SECOND concurrent writer of
+    # `status` (the clock-expiry sweep), so the sweep can flip the row between
+    # our read (above) and this conditional PATCH: the PATCH then matches
+    # nothing and the re-read sees 'expired'. That is a TERMINAL outcome, not
+    # the concurrent-ACCEPT race this re-read exists to catch — so answering it
+    # with a 409 would reintroduce, in the window this PR created, exactly the
+    # 409 the PR removes.
+    if not check or check[0].get("status") not in ("revoked", "expired"):
         raise InvitationError(
             "Invitation no longer pending — cannot rescind", status=409)
     return {"revoked": True, "invitation_id": invitation_id}
@@ -5094,7 +5113,13 @@ def decline_invitation_by_email(cp, invitation_id: str, email: str) -> dict:
     if inv.get("status") == "accepted":
         raise InvitationError(
             "Invitation already accepted — cannot decline", status=409)
-    if inv.get("status") == "revoked":
+    if inv.get("status") in ("revoked", "expired"):
+        # #8089: 'expired' joins 'revoked' here for the reason the rescind
+        # twin states — both are terminal, and #8089 made 'expired' ROUTINE by
+        # materialising it on a clock. Without this branch the
+        # status-conditional PATCH below matches 0 rows and the caller is told
+        # `{"revoked": True}` anyway: a success response for a write that did
+        # not happen, on the exact status family this change reclassifies.
         return {"revoked": True, "already": True,
                 "invitation_id": invitation_id}
     cp.query(
