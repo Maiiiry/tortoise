@@ -3184,8 +3184,15 @@ class _WriteNotLanded(Exception):
     an attempt that was only reached BECAUSE a previous one aborted raises
     this sentinel instead of returning. It is retryable (nothing applied, so
     re-issuing cannot duplicate), and on budget exhaustion the ORIGINAL abort
-    is re-raised unchanged, so the caller's error type is what it was before
-    the retry existed.
+    is re-raised with its TYPE unchanged, so the caller's ``except`` clause
+    still catches it and ``_classify_db_failure`` still buckets it as ``db``.
+    Its MESSAGE is NOT guaranteed untouched: on exhaustion the graph-swap
+    family gains the #7357 legibility suffix (``retry.explain_graph_abort``)
+    WHICHEVER way the graph-presence probe answers (present / absent /
+    unprobeable), so an assertion on ``str(exc)`` must allow for that suffix. A
+    test that pins the engine's BARE sentence belongs to the deletion arm
+    instead: a deletion the predicate sees at classification time is refused
+    before this arm is reached, so nothing is appended there.
 
     A zero-row FIRST attempt is untouched: it never reaches this class, so
     ``update_point``'s historical ``{}``-for-a-missing-id contract is safe.
@@ -5931,8 +5938,14 @@ class TortoiseSDK:
         from tortoise.exceptions import EmbeddedStoreBusyError
         raise EmbeddedStoreBusyError(db_path, pid)
 
-    def _graph_exists(self, proj) -> bool:
+    def _graph_presence(self, proj) -> bool | None:
         """Whether the graph a wrapped write targets still has its KEY (#7685).
+
+        TRI-STATE, so the two callers can ask two different questions of it:
+        the retry gate needs a boolean (anything but ``True`` is "do not
+        retry"), while the exhaustion message (#7357) must not claim the graph
+        was DELETED when the probe merely could not ANSWER — an unresponsive
+        instance is the measured state of this defect.
 
         The measured discriminator for the graph-abort family: after a rebuild's
         recreate ``EXISTS <name>`` is 1, after a plain deletion it is 0 (measured
@@ -5953,21 +5966,33 @@ class TortoiseSDK:
         to agree with the presence semantics the guard's callers rely on.
 
         Fails LOUD: no projection, no graph name, or a probe that raises all
-        answer False — i.e. "do not retry" — never "assume a rebuild".
+        answer ``None`` — i.e. "do not retry" through ``_graph_exists``, never
+        "assume a rebuild".
         """
         if proj is None:
-            return False
+            return None
         name = getattr(proj, "graph_name", None)
         if not name:
-            return False
+            return None
         try:
             return bool(proj.g.execute_command("EXISTS", str(name)))
         except Exception:  # noqa: BLE001, RUF100 — a failed probe is not a rebuild
             _logger.warning(
-                "graph-existence probe failed for %r; refusing to retry the "
-                "aborted write (a silent success is worse than a loud miss)",
+                "graph-existence probe failed for %r; the write is not "
+                "retried and any #7357 exhaustion message reports the "
+                "graph state as UNKNOWN (a silent success is worse than a "
+                "loud miss)",
                 name, exc_info=True)
-            return False
+            return None
+
+    def _graph_exists(self, proj) -> bool:
+        """The retry gate's boolean view of :meth:`_graph_presence` (#7685).
+
+        Anything but a confirmed presence answers False: this gates a re-issued
+        bare ``CREATE``, so a false positive is a silent success into an empty
+        graph, while a false negative is only a loud miss.
+        """
+        return self._graph_presence(proj) is True
 
     def _graph_write_with_retry(self, fn, *, what: str, witness=None):
         """Issue a DIRECT graph write through the bounded-retry primitive (#7405).
@@ -6033,7 +6058,13 @@ class TortoiseSDK:
         21-84 s, not 21-42 s. The
         window #7405 measured lasted **over an hour**, and no bounded retry
         should wait that long — so on exhaustion the original error still
-        surfaces, **unchanged in type**.
+        surfaces, **unchanged in type**. Its MESSAGE gains one appended
+        diagnosis when it is the graph-swap family (#7357): the same
+        ``ResponseError``, with the engine's sentence kept at position 0 so the
+        anchored predicate still classifies it, followed by `` — what this
+        means: …`` naming the swap rather than implying data loss. A DELETION
+        (key absent) is never told a retry is safe — see
+        ``retry.explain_graph_abort``.
 
         Residual window, stated honestly. The classification-time probe can be
         stale by the time the retry runs — ``call_with_predicate`` evaluates the
@@ -6124,6 +6155,7 @@ class TortoiseSDK:
         from .retry import (
             WriteStageRetriesExhausted,
             call_with_predicate,
+            explain_graph_abort,
             graph_abort_family,
             retryable_aborted_write,
         )
@@ -6230,7 +6262,28 @@ class TortoiseSDK:
             if isinstance(inner, _WriteNotLanded):
                 # A re-issue that never landed: surface the abort that
                 # authorised it, not the internal sentinel.
-                raise inner.original from None
+                inner = inner.original
+            # #7357: the engine's graph-swap sentence reads as CORRUPTION
+            # ("graph was deleted or replaced"), and a caller that treats it as
+            # such goes hunting a rebuild on a healthy graph. A rebuild this
+            # retry could not heal is exactly the case where the graph KEY is
+            # still present — so append a legible diagnosis of the same type,
+            # never a wrapper (see the TYPE note above). Only this family is
+            # rewritten, and only once.
+            # Pay the presence probe ONLY for the family that reads it:
+            # write-slot and MISCONF exhaustion are state-INdependent, so
+            # ``explain_graph_abort`` returns None for them and an eager
+            # ``EXISTS`` round trip (plus the `_graph_presence` warning if it
+            # raises) would be spent on an answer nothing consumes (#8954).
+            legible = None
+            if graph_abort_family(inner):
+                legible = explain_graph_abort(
+                    inner,
+                    graph_present=self._graph_presence(self._proj),
+                    attempts=attempts,
+                )
+            if legible is not None:
+                inner.args = (legible,)
             raise inner from None
 
     def _get_proj(self) -> FalkorProjection:
