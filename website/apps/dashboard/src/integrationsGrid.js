@@ -231,7 +231,9 @@ export function tileMark(tile) {
 // state, so it must be honest BEFORE the POST resolves. The record itself is the
 // dialog's primary (`POST /v1/data-sources/demand`, #3514): its outcome is
 // rendered inline from the pinned post-action states, and only the `recorded`
-// state says the interest is saved (the failure state says the opposite).
+// state says the interest is saved; the failure state says this request was not
+// CONFIRMED and never that nothing was saved (#8975) — the in-flight claim arm
+// answers 503 while a peer's write may be landing.
 export const COMING_SOON_DIALOG_TITLE = 'Not available yet'
 export const COMING_SOON_DIALOG_BODY =
   "This integration isn't built yet. Interest from tiles like this is how we prioritise what to build next — we can't name a date for it."

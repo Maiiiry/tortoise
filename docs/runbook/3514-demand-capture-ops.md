@@ -51,18 +51,22 @@ from the claim marker alone, and never from a click count (a `go_back`-only team
 holds a stored row and zero clicks, so a click-count predicate reads a real
 record as "not recorded" and then duplicates it).
 
-Three arms, and the operator reads them as follows:
+Four arms, and the operator reads them as follows:
 
 | Replay state | Answer | Why |
 |---|---|---|
 | a row carries this claim's fingerprint | `200 replayed: true` | the write landed — whatever its `action` was |
 | store unreadable | `200 replayed: true` | absence is NOT provable, so the honest answer is the replay |
 | no row, claim younger than `DEMAND_INFLIGHT_CLAIM_S` | `503 recorded: false`, claim KEPT | a peer may be mid-write; releasing its reservation is what makes a retry a duplicate |
-| no row, claim older than that bound | `503`/retry RECOVERS: the claim is re-taken and the write happens | the holder is provably gone (its write is bounded), so the retry must be the FIRST record |
+| no row, claim older than that bound | `200 replayed: false` — the retry RECOVERS and IS the first record; `503` only if a peer re-took the claim between the release and this claim, or if the recovered write itself is dropped (the write arm's own `503`) | the holder is provably gone (its write is bounded), so the recovery path re-claims and falls through to the write |
 
 A `503` therefore never means "we wrote nothing" on its own — it means *this
 request wrote nothing*. The client renders it as the failure state and offers
-`Retry`, which is safe in every arm above.
+`Retry`, which is safe in every arm above: the key is reused, so a write that
+DID land replays instead of recording twice. The dialog's copy claims only what
+the client can know — *"Your request was not confirmed — Retry to send it
+again."* — and never "nothing was saved", because the in-flight arm exists
+precisely because a record may be landing right now.
 
 What CI deliberately does NOT do: call the real Telegram API. A live send from CI
 would page the operator on every run and could not be told from a real click.
@@ -142,7 +146,7 @@ same endpoint.
 | Check | Status | Why |
 |---|---|---|
 | Automated rows (`tests/test_data_source_capture.py`) | **RUN** — 51 passed | the server half: record, ping, dedupe, caps, read half, the `go_back`-is-not-demand guard, the `distinct_orgs` breadth/demand split, and the replay rows (`a claim with no row behind it is NOT a replay` — in-flight claims are never released, aged ones are recovered; `an idempotent go_back write replays instead of duplicating`; `a raised write releases its claim so the retry records`) — plus the e2e-docstring claim guard (`_wire` must name `_hold_demand_response`, the mechanism the browser samples) |
-| Client half (node + browser) | **RUN** | `demandCapture.test.js` (17, the state machine and the wire body), `demandCaptureRender.test.js` (12, the dialog wiring, the focus moves, the document-level Escape, and the #8975 duplicate-key pin), and the five `#3514` rows in `tests/e2e/test_dashboard_onboarding.py` (real built bundle, real preview — including the in-flight FOCUS row, which holds the response open from the page so `document.activeElement` and Escape can be sampled during `sending`) |
+| Client half (node + browser) | **RUN** | `demandCapture.test.js` (18, the state machine, the wire body, and the copy pins), `demandCaptureRender.test.js` (12, the dialog wiring, the focus moves, the document-level Escape, and the #8975 duplicate-key pin), and the five `#3514` rows in `tests/e2e/test_dashboard_onboarding.py` (real built bundle, real preview — including the in-flight FOCUS row, which holds the response open from the page so `document.activeElement` and Escape can be sampled during `sending`) |
 | `ops-telegram-live-send` | **NOT RUN** | no operator Telegram credentials exist in the lane that produced this PR; a live send cannot be fabricated, and the receipt gate (#3515) refuses a fabricated one |
 | `ops-monthly-demand-review` | **NOT RUN** | requires a DEPLOYED instance holding real demand rows. The surface now exists end to end (the grid landed in #8327, the click trigger in #3514), so this row is runnable the first time a real user clicks a tile on a deployment — no lane can produce it from a test store without fabricating the receipt |
 

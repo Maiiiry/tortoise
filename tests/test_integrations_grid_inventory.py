@@ -252,7 +252,7 @@ def _js_body_keys(src: str) -> set[str]:
 def test_the_client_posts_the_route_the_app_actually_mounts() -> None:
     """The client's path must be a route the served table answers with POST.
 
-    A drift here is a 404 the UI reports as "your request was not recorded" —
+    A drift here is a 404 the UI reports as "Your request was not confirmed" —
     true, and indistinguishable from a broken sink.
     """
     from tortoise.hosted_api import app

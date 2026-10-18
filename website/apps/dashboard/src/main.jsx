@@ -12178,8 +12178,10 @@ function MemorySources(props) {
                        ghost Close stays ENABLED: it is the only control left
                        that can hold focus;
             recorded — the recorded state inline, with Dismiss;
-            failed   — "your request was not recorded" + Retry, and the state
-                       never reads as recorded.
+            failed   — "your request was not confirmed" + Retry, and the state
+                       never reads as recorded. Deliberately NOT "nothing was
+                       saved": the in-flight `503` arm can only mean THIS
+                       request did not record, so the client claims no more.
           FOCUS stays INSIDE the dialog in every state, and it is MOVED on each
           transition (the focus effect in MemorySources) instead of being left
           to `autoFocus` — React fires that only on MOUNT, so a control a branch

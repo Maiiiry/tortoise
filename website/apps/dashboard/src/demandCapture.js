@@ -65,10 +65,21 @@ export const DEMAND_SENDING_COPY = 'Recording your interest…'
 //: about a date or a notification — there is no delivery obligation (R4).
 export const DEMAND_RECORDED_COPY =
   "Recorded — your team's interest is saved."
-//: The failure state. Names the failure instead of swallowing it: the record was
-//: NOT written, so the UI must not read as recorded.
+//: The failure state. Names the failure instead of swallowing it, and claims
+//: only what the client can actually know: that THIS request was not CONFIRMED.
+//:
+//: It must NOT say "nothing was saved". The client cannot know that: the
+//: in-flight claim arm answers `503` ("this click is still being recorded —
+//: please retry shortly") precisely because a peer's write may be landing right
+//: now, and the earlier the client states absolute absence, the more the dialog
+//: denies a record that may well exist — the same truthfulness defect this
+//: copy replaced, mirrored. `Retry` is safe in EVERY server arm (the key is
+//: reused, so a write that landed replays instead of recording twice), so the
+//: honest instruction is the retry, not a claim about the store. The server's
+//: own distinction is deliberately not rendered here (see `demandFailed`): its
+//: messages are operator-facing, and this dialog owns its copy.
 export const DEMAND_FAILED_COPY =
-  'Your request was not recorded. Nothing was saved — Retry to send it again.'
+  'Your request was not confirmed — Retry to send it again.'
 
 /** The pinned request body. `org_key` is absent BY DESIGN (server-derived). */
 export function demandPayload(integrationKey, { surface = '', action = DEMAND_ACTION_CLICK } = {}) {
@@ -126,7 +137,14 @@ export function demandRecorded(state = demandInitialState(), outcome = {}) {
   return { ...state, status: DEMAND_RECORDED, clickCount: count, replayed: !!outcome.replayed, status_http: null }
 }
 
-/** The failure state: the record was NOT written, and the UI says so. */
+/**
+ * The failure state: this request was NOT confirmed, and the UI says so.
+ *
+ * `status_http` is kept because it is a fact the client has; the server's
+ * `reason` is NOT carried onto the state (the dialog renders `DEMAND_FAILED_COPY`,
+ * never server prose) — what the client must not do is turn "no 2xx" into a
+ * claim of ABSENCE, which the in-flight `503` arm contradicts.
+ */
 export function demandFailed(state = demandInitialState(), outcome = {}) {
   return {
     ...state,

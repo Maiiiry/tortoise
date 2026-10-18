@@ -826,8 +826,11 @@ def test_second_open_of_a_recorded_tile_does_not_record_twice(page: Page) -> Non
 def test_demand_failure_names_itself_and_retry_records(page: Page) -> None:
     """#3514: the error state is not swallowed, and Retry is the recovery.
 
-    A failed write answers 503 with `recorded: false`; the popup must say the
-    request was NOT recorded (never render the recorded state) and offer Retry.
+    A failed write answers 503 with `recorded: false`, and the popup must say
+    the request was NOT CONFIRMED (never render the recorded state) and offer
+    Retry. It must NOT say "nothing was saved": the in-flight claim arm answers
+    503 *while a peer's write may be landing*, so an absolute claim of absence
+    would deny a record that exists (#8975 review P2).
     The retry reuses the SAME idempotency key, so a write that did land is a
     replay rather than a second row.
     """
@@ -837,7 +840,9 @@ def test_demand_failure_names_itself_and_retry_records(page: Page) -> None:
     page.get_by_role("button", name="Register interest").click()
 
     status = page.locator(".integration-demand-status")
-    expect(status).to_contain_text("not recorded", timeout=10_000)
+    expect(status).to_contain_text("not confirmed", timeout=10_000)
+    assert "Nothing was saved" not in status.inner_text(), \
+        "the client cannot know that — the in-flight 503 arm may be recording right now"
     assert "Recorded —" not in status.inner_text(), \
         "a failed write must never read as recorded"
     retry = page.get_by_role("button", name="Retry")

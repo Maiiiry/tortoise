@@ -124,15 +124,26 @@ test('#3514: retry goes back to a disabled-primary sending state with the SAME k
   assert.equal(demandKeyFor(store, 'slack', { random: () => 'different' }), key)
 })
 
-// ── The copy: no delivery promise, and the failure is named ────────────
+// ── The copy: no delivery promise, no claim the client cannot support ──
 test('#3514: the copy names the failure and promises no delivery', () => {
-  assert.match(DEMAND_FAILED_COPY, /not recorded/)
+  assert.match(DEMAND_FAILED_COPY, /not confirmed/)
+  assert.match(DEMAND_FAILED_COPY, /Retry/)
   assert.match(DEMAND_RECORDED_COPY, /interest is saved/)
   // R4 deleted the notify machinery: no label or copy may promise a send.
   const copy = [DEMAND_PRIMARY_LABEL, DEMAND_SENDING_COPY, DEMAND_RECORDED_COPY,
     DEMAND_FAILED_COPY, DEMAND_RETRY_LABEL, DEMAND_DISMISS_LABEL].join(' ')
   assert.doesNotMatch(copy, /we('| wi)ll (email|notify|let you know)/i)
   assert.doesNotMatch(copy, /email you/i)
+})
+
+test('#3514: the failure copy does NOT claim nothing was saved', () => {
+  // The client cannot know this. The in-flight claim arm answers 503 ("this
+  // click is still being recorded") precisely because a peer's write may be
+  // landing right now, so an absolute "nothing was saved" renders that arm as
+  // "not recorded" — the same truthfulness defect this copy replaced, mirrored.
+  // Retry is safe in every arm (the same key replays), so state the retry.
+  assert.doesNotMatch(DEMAND_FAILED_COPY, /nothing was saved/i)
+  assert.doesNotMatch(DEMAND_FAILED_COPY, /was not recorded/i)
 })
 
 // ── recordDemand: never throws, never fakes a record ───────────────────
@@ -161,9 +172,11 @@ test('#3514: a 2xx maps the server count and REPLAYS the idempotency header', as
   })
 })
 
-test('#3514: a rejected write is reported as NOT recorded, with its status', async () => {
+test('#3514: a rejected write is reported as a failure, with its status', async () => {
   // The seam throws on non-2xx (the App's `api` attaches `.status`) — a 503 here
-  // is a sink that refused the record, the exact case the dialog must surface.
+  // means THIS request did not record. The dialog surfaces it as not-confirmed,
+  // never as "nothing was saved": the in-flight claim arm answers 503 while a
+  // peer's write may be landing, so absence is not something the client knows.
   const err = new Error('the click was not recorded — please retry')
   err.status = 503
   const outcome = await recordDemand({
