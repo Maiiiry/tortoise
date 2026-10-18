@@ -513,13 +513,22 @@ def _embedded_read_timeout_via_projection() -> tuple[float, int]:
 
     fake = mock.MagicMock()
     fake.return_value.select_graph.return_value = mock.MagicMock()
-    with mock.patch("tortoise.FalkorDB", fake):
-        proj = FalkorProjection.__new__(FalkorProjection)
-        FalkorProjection.__init__(
-            proj,
-            path=os.path.join(tempfile.mkdtemp(prefix="t4683_"), "embed.db"),
-            graph_name="test_embed_4683",
-            skip_health_check=True)
+    # The ctor REDIRECTS an explicit `path=` to the docker lane when
+    # TORTOISE_DB_URI is set inside a calling test frame (#5084's lane
+    # redirect). Under the docker lane this helper would then measure the
+    # HOST branch and report its bound as if it were the embedded one — a
+    # green assertion about the wrong branch. Clear the redirect for the
+    # duration of the construction (`patch.dict` restores it, so nothing
+    # leaks into another test) so this measures the branch it names.
+    with mock.patch.dict(os.environ):
+        os.environ.pop("TORTOISE_DB_URI", None)
+        with mock.patch("tortoise.FalkorDB", fake):
+            proj = FalkorProjection.__new__(FalkorProjection)
+            FalkorProjection.__init__(
+                proj,
+                path=os.path.join(tempfile.mkdtemp(prefix="t4683_"), "embed.db"),
+                graph_name="test_embed_4683",
+                skip_health_check=True)
     assert fake.call_args.args[0].endswith("embed.db"), "not the embedded branch"
     retry = fake.call_args.kwargs["retry"]
     return fake.call_args.kwargs["socket_timeout"], 1 + retry._retries
