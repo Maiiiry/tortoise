@@ -184,6 +184,13 @@ KIND_ABUSE_ENFORCEMENT_FAULT = "ABUSE_ENFORCEMENT_FAULT"
 KIND_ABUSE_REVIEW_NEEDED = "abuse_review_needed"
 KIND_ABUSE_SUSPENDED = "abuse_suspended"
 KIND_BILLING_NOTIFY_REFUSED = "BILLING_NOTIFY_REFUSED"
+#: #5323: the outbox gave up on a billing notification — the attempt cap was
+#: reached with the row still unsettled. A DIFFERENT condition from
+#: ``BILLING_NOTIFY_REFUSED`` (#3147, one kind = one recovery condition): that
+#: one is the offload seam refusing to SUBMIT an attempt and is recovered by the
+#: outbox retrying it automatically, while this one is the RETRY EXHAUSTED, so
+#: the recovery is a human delivering the notification.
+KIND_BILLING_NOTIFY_UNDELIVERED = "BILLING_NOTIFY_UNDELIVERED"
 KIND_PROVIDER_BILLING_EXHAUSTED = "PROVIDER_BILLING_EXHAUSTED"
 #: #3631: a deferred billing-notification send failed. Given a triage row by
 #: #4780 — the kind was emitted with NO runbook row, so an operator held an
@@ -297,7 +304,13 @@ SPECS: dict[str, KindSpec] = {
         meaning="operator-initiated suspension (no automatic lane since #5425)"),
     KIND_BILLING_NOTIFY_REFUSED: _spec(
         WRITER_UNSPECIFIED, manual_close=True,
-        meaning="the offload seam REFUSED a Stripe billing notification (#4456)"),
+        meaning="the offload seam REFUSED a Stripe billing notification "
+                "(#4456); since #5323 the outbox retries it, so this is a "
+                "DELAY signal unless BILLING_NOTIFY_UNDELIVERED follows"),
+    KIND_BILLING_NOTIFY_UNDELIVERED: _spec(
+        WRITER_UNSPECIFIED, manual_close=True,
+        meaning="the billing-notify outbox exhausted its attempts with the "
+                "notification still unsettled (#5323)"),
     KIND_PROVIDER_BILLING_EXHAUSTED: _spec(
         WRITER_UNSPECIFIED, manual_close=True,
         meaning="a serving provider refused on its own budget/limit (#3873)"),

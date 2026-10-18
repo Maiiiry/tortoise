@@ -44,6 +44,7 @@ from tortoise.incident_kinds import (
     KIND_ABUSE_DECISION_FAULT,
     KIND_ABUSE_ENFORCEMENT_FAULT,
     KIND_BILLING_NOTIFY_REFUSED,
+    KIND_BILLING_NOTIFY_UNDELIVERED,
     KIND_PROVIDER_BILLING_EXHAUSTED,
     KIND_UNMETERED_INCREMENT,
 )
@@ -89,10 +90,16 @@ ABUSE_ENFORCEMENT_FAULT_KIND = KIND_ABUSE_ENFORCEMENT_FAULT
 #: The incident KIND for a Stripe billing notification the #3498 offload seam
 #: REFUSED (#4456). The event is already CLAIMED when the notify is submitted
 #: (the ``WebhookEvent`` marker commits BEFORE it), so a Stripe retry sees
-#: ``is_first=False`` and the notification is **lost permanently** — the org
-#: is never told its plan changed. The seam's public ``refused``
-#: discriminator distinguishes this real drop from a plain bound miss (where
-#: the worker still completes the send), and this is the escalation path.
+#: ``is_first=False`` — the seam's public ``refused`` discriminator
+#: distinguishes this real drop from a plain bound miss (where the worker still
+#: completes the send), and this is the escalation path.
+#:
+#: ⚠️ #5323 CHANGED WHAT A REFUSAL MEANS. The claimed row is now an OUTBOX row,
+#: so a refusal is a DEFERRED delivery that ``billing_notify_outbox.drain``
+#: retries — not the permanent loss this constant's original text described.
+#: The incident is still worth filing (it reports the telemetry-pool saturation
+#: that refused the hand-off, and the notification is late), but the recovery is
+#: now "let the drain retry" unless ``BILLING_NOTIFY_UNDELIVERED`` follows.
 BILLING_NOTIFY_REFUSED_KIND = KIND_BILLING_NOTIFY_REFUSED
 
 #: The incident KIND for a PROVIDER BILLING EXHAUSTION observed on a serving
@@ -278,11 +285,13 @@ def alert_billing_notify_refused(org_id: str | None,
     """Dispatch the ``BILLING_NOTIFY_REFUSED`` incident. Never raises.
 
     Fired by the Stripe webhook when the #3498 offload seam REFUSED the
-    billing notification (#4456): the event is already claimed, so this real
-    drop is unrecoverable and must not be silent. Detail is a fixed,
-    message-free vocabulary (the incident body is durable) — ``op`` names the
-    seam site, ``event_type`` the Stripe event type, ``org_id`` the affected
-    org; no free text.
+    billing notification (#4456). Since #5323 the claimed row is an outbox row,
+    so a refusal is a DEFERRED delivery the drain retries rather than the
+    permanent loss #4456 was written against — the escalation is now a signal
+    about the telemetry-pool saturation that refused the hand-off (and the fact
+    that the notification is late), and its detail is a fixed, message-free
+    vocabulary: ``op`` names the seam site, ``event_type`` the Stripe event
+    type, ``org_id`` the affected org; no free text.
 
     The incident SUBJECT is PLATFORM-SCOPED (``""``) by the #4456 plan: ONE
     Resend account serves every team, so a per-org key would file N issues for
@@ -296,6 +305,37 @@ def alert_billing_notify_refused(org_id: str | None,
         alert_operator(BILLING_NOTIFY_REFUSED_KIND, "",
                        {"op": "billing_notify", "event_type": event_type,
                         "org_id": org_id or "?"})
+
+
+#: The incident KIND for a billing notification the OUTBOX gave up on (#5323).
+#: Distinct from ``BILLING_NOTIFY_REFUSED`` on purpose (#3147): that one is the
+#: seam refusing to submit an attempt, which the outbox now retries
+#: automatically; this one is the RETRY EXHAUSTED with the row still unsettled,
+#: so there is nothing left to retry and a human must deliver the notification.
+BILLING_NOTIFY_UNDELIVERED_KIND = KIND_BILLING_NOTIFY_UNDELIVERED
+
+
+def alert_billing_notify_undelivered(org_id: str | None,
+                                    event_type: str | None = None) -> None:
+    """Dispatch the ``BILLING_NOTIFY_UNDELIVERED`` incident. Never raises.
+
+    Fired by ``billing_notify_outbox`` when a claimed outbox row reaches its
+    attempt cap without the notification being settled (#5323). The notification
+    is NOT recoverable from this record any more than from #4456's: the row tells
+    the operator WHICH Stripe event and org to deliver by hand.
+
+    Platform-scoped subject (``""``), for the #4456 reason: one Resend account
+    serves every team and the failure that exhausts the retries is a SHARED
+    substrate, so a per-org key would file N issues for one outage. The org
+    travels in the ``detail``. Dedup is ``(kind, subject)``.
+
+    ``op`` distinguishes this outbox exhaustion from the seam refusal that reuses
+    the same detail vocabulary — the two kinds share the field, not the meaning.
+    """
+    with contextlib.suppress(Exception):  # the alert must never raise
+        alert_operator(BILLING_NOTIFY_UNDELIVERED_KIND, "",
+                       {"op": "billing_notify_outbox",
+                        "event_type": event_type, "org_id": org_id or "?"})
 
 
 def alert_provider_billing_exhausted(provider: str, error: BaseException, *,

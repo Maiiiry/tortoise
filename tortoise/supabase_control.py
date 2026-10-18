@@ -4155,32 +4155,17 @@ def update_org_billing(cp, org_id: str, updates: dict) -> None:
             f"{org_id!r} — the billing write was dropped (fail-closed)")
 
 
-def webhook_event_marker(cp, event_id: str, etype: str) -> bool:
-    """First-seen marker for a Stripe webhook event (Supabase twin of the
-    registry WebhookEvent node — #771 re-review P1).
-
-    Returns True when the event is NEW (marker created now), False when it
-    was already seen. The apply itself is idempotent (replays converge);
-    only side-effects (notify/audit/analytics) are gated on first-seen.
-    """
-    rows = cp.query(
-        "webhook_events",
-        select=["event_id"],
-        filters=[("event_id", "eq", event_id)],
-    )
-    if rows:
-        return False
-    from datetime import datetime, timezone
-    cp.query(
-        "webhook_events",
-        method="POST",
-        json_body={
-            "event_id": event_id,
-            "first_seen": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
-            "type": etype,
-        },
-    )
-    return True
+# #5323: ``webhook_event_marker`` USED TO LIVE HERE — a standalone
+# read-then-insert over ``webhook_events``. It was SUPERSEDED (and removed)
+# because that shape has no transaction boundary: the marker committed in one
+# PostgREST request and the billing notification was handed to the offload seam
+# in the next, so anything between the two lost the notification for good (the
+# dual-write hazard #5323 describes). The claim is now ONE statement —
+# ``claim_webhook_event`` (migration 20261014000002), reached through
+# ``tortoise.billing_notify_outbox`` — which claims the event AND enqueues the
+# notification atomically. Nothing in production calls the old shape; keeping a
+# second, non-atomic door to the same table would invite exactly the regression
+# this removal prevents.
 
 
 def org_tier(cp, org_id: str) -> str | None:

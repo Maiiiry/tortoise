@@ -167,6 +167,14 @@ TIMESTAMPTZ_COLUMNS: set[tuple[str, str]] = {
     ("user_unlink_permits", "created_at"),
     ("waitlist_subscribers", "consented_at"),
     ("waitlist_subscribers", "created_at"),
+    # #5323 (migration 20261014000002): the billing-notify OUTBOX columns on the
+    # webhook marker row. Registered because the fake must reject a NUMBER write
+    # to a `timestamptz` column exactly as PostgREST does (#4243), and the drain's
+    # `mark_reported` PATCH writes one of these from Python.
+    ("webhook_events", "notified_at"),
+    ("webhook_events", "notify_next_attempt_at"),
+    ("webhook_events", "notify_dead_at"),
+    ("webhook_events", "notify_dead_reported_at"),
     ("webhook_events", "first_seen"),
 }
 
@@ -1529,6 +1537,125 @@ class FakeControlPlane:
                 if t.get("id") != oid
             ]
             return None
+        if fn == "claim_webhook_event":
+            # #5323: the ATOMIC claim + notification enqueue (migration
+            # 20261014000002). One INSERT with ON CONFLICT DO NOTHING, so the
+            # fake must model BOTH halves of that in one call: the claim
+            # (first-seen → True, a replay → False) AND the enqueue (the
+            # notify_kind + org/tier snapshot + the first-attempt grace). A fake
+            # that only flipped a seen-flag would let a caller that enqueues
+            # AFTER the claim pass CI — which is the dual-write hazard the
+            # migration exists to remove. Returns a JSON boolean (the real RPC's
+            # scalar body), so the `rpc_value` transport is what the caller
+            # reads.
+            from datetime import datetime, timedelta, timezone
+            p = body or {}
+            eid = p.get("p_event_id")
+            rows = self.tables.setdefault("webhook_events", [])
+            if any(r.get("event_id") == eid for r in rows):
+                return False
+            kind = p.get("p_notify_kind")
+            grace = p.get("p_first_attempt_grace_seconds")
+            due = None
+            if kind is not None:
+                due = (datetime.now(timezone.utc)  # noqa: UP017
+                       + timedelta(seconds=int(grace or 0))).isoformat()
+            rows.append({
+                "event_id": eid,
+                "first_seen": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
+                "type": p.get("p_type"),
+                "notify_kind": kind,
+                "notify_org_id": p.get("p_notify_org_id"),
+                "notify_tier": p.get("p_notify_tier"),
+                "notified_at": None,
+                "notify_attempts": 0,
+                "notify_next_attempt_at": due,
+                "notify_dead_at": None,
+                "notify_dead_reported_at": None,
+                "notify_last_error": None,
+            })
+            return True
+        if fn == "claim_due_webhook_notifies":
+            # #5323: the drain's LEASED batch claim. Mirrors the SQL's predicate
+            # and its two arms (an attemptable row, and a DEAD row owed a
+            # report) and — the part that makes the fix testable — the LEASE:
+            # the claim pushes notify_next_attempt_at forward, so a second claim
+            # inside the lease returns nothing. That is what stands in for
+            # `FOR UPDATE SKIP LOCKED` in a single-threaded double. Also
+            # honours p_limit, so an unbounded pass is caught.
+            from datetime import datetime, timedelta, timezone
+            p = body or {}
+            now = datetime.now(timezone.utc)  # noqa: UP017
+            lease = now + timedelta(seconds=int(p.get("p_lease_seconds") or 0))
+            cap = int(p.get("p_max_attempts") or 0)
+
+            def _ts(v):
+                if v is None:
+                    return None
+                return v if isinstance(v, datetime) else datetime.fromisoformat(
+                    str(v))
+
+            due_rows = [
+                r for r in self.tables.get("webhook_events", [])
+                if r.get("notify_kind") is not None
+                and r.get("notified_at") is None
+                and r.get("notify_dead_reported_at") is None
+                and _ts(r.get("notify_next_attempt_at")) is not None
+                and _ts(r.get("notify_next_attempt_at")) <= now
+                and (r.get("notify_dead_at") is not None
+                     or int(r.get("notify_attempts") or 0) < cap)
+            ]
+            due_rows.sort(key=lambda r: str(r.get("notify_next_attempt_at")))
+            claimed = due_rows[:int(p.get("p_limit") or 0)]
+            out = []
+            for r in claimed:
+                r["notify_next_attempt_at"] = lease.isoformat()
+                out.append({
+                    "event_id": r.get("event_id"),
+                    "type": r.get("type"),
+                    "notify_kind": r.get("notify_kind"),
+                    "notify_org_id": r.get("notify_org_id"),
+                    "notify_tier": r.get("notify_tier"),
+                    "notify_attempts": int(r.get("notify_attempts") or 0),
+                    "notify_dead_at": r.get("notify_dead_at"),
+                })
+            return out
+        if fn == "resolve_webhook_notify":
+            # #5323: the settle door — delivered stamps notified_at; a failure
+            # increments and either schedules a backoff or flips the row DEAD
+            # (immediately due, so the next claim REPORTS it). The guards match
+            # the SQL's: an already-delivered / already-dead row is a zero-row
+            # no-op reporting 'missing', so a double settle can never re-arm a
+            # row. Returns the outcome string (the real RPC's text body).
+            from datetime import datetime, timedelta, timezone
+            p = body or {}
+            eid = p.get("p_event_id")
+            row = next((r for r in self.tables.get("webhook_events", [])
+                        if r.get("event_id") == eid), None)
+            now = datetime.now(timezone.utc)  # noqa: UP017
+            if row is None:
+                return "missing"
+            if p.get("p_delivered"):
+                if row.get("notified_at") is not None:
+                    return "missing"
+                row["notified_at"] = now.isoformat()
+                row["notify_last_error"] = None
+                row["notify_next_attempt_at"] = None
+                return "delivered"
+            if row.get("notified_at") is not None or row.get("notify_dead_at") is not None:
+                return "missing"
+            attempts = int(row.get("notify_attempts") or 0) + 1
+            row["notify_attempts"] = attempts
+            row["notify_last_error"] = (p.get("p_error") or "")[:500]
+            cap = int(p.get("p_max_attempts") or 0)
+            if attempts >= cap:
+                row["notify_dead_at"] = now.isoformat()
+                row["notify_next_attempt_at"] = now.isoformat()
+                return "dead"
+            row["notify_next_attempt_at"] = (
+                now + timedelta(seconds=int(p.get("p_backoff_seconds") or 0))
+            ).isoformat()
+            return "retry"
         if fn != "provision_team":
             return None
         return self._provision_team_emulation(body or {})

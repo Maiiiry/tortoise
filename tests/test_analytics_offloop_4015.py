@@ -199,7 +199,15 @@ class _Rows:
 class _FakeRegistry:
     """The selfhost lane's registry twin, keyed on the CYPHER the handler
     actually issues — so it records the real call order instead of assuming
-    it. The tier read fails on demand."""
+    it. The tier read fails on demand.
+
+    ⛔ #5323: the CLAIM no longer appears here. It moved into
+    ``RegistryOutbox.claim`` (ONE ``MERGE`` that claims the event AND enqueues
+    the notification), which this double stubs at the store seam — the twin's
+    Cypher and its state machine are exercised against a real embedded graph in
+    ``tests/test_billing_notify_outbox_5323.py``, because a string-matching
+    double cannot tell a correct MERGE from an incorrect one.
+    """
 
     def __init__(self, order: list[str], tier_raises: bool):
         self.order = order
@@ -212,12 +220,6 @@ class _FakeRegistry:
             if self.tier_raises:
                 raise _Boom("registry tier read failed")
             return _Rows([("pro",)])
-        if c.startswith("MATCH (w:WebhookEvent"):
-            self.order.append("claim")
-            return _Rows([])  # never seen → first processing
-        if c.startswith("CREATE (w:WebhookEvent"):
-            self.order.append("claim-create")
-            return _Rows([])
         raise AssertionError(f"unexpected registry cypher: {cypher!r}")
 
 
@@ -256,17 +258,32 @@ def _wire_stripe_webhook(monkeypatch, order: list[str], *,
     monkeypatch.setattr(billing.StripeClient, "verify_webhook_signature",
                         lambda self, payload, sig: event)
 
-    class _Cp:
-        pass
+    # #5323: the first-seen claim moved to the OUTBOX store. Supabase mode uses
+    # the REAL ``claim`` against a real FakeControlPlane (so the atomic
+    # claim+enqueue RPC, the settle and the row's state machine all actually
+    # run), wrapped by a recorder that pins the handler's seam ORDER. Registry
+    # mode stubs the twin's claim at the store seam: its Cypher is exercised
+    # against a real graph in tests/test_billing_notify_outbox_5323.py, because a
+    # string-matching double cannot tell a correct MERGE from an incorrect one.
+    from tests.fake_control_plane import FakeControlPlane
+    from tortoise import billing_notify_outbox as bno
 
-    monkeypatch.setattr(sc, "get_control_plane", lambda: _Cp())
+    cp = FakeControlPlane(tables={"webhook_events": []})
+    real_claim = bno.SupabaseOutbox.claim
+
+    def _recording_claim(self, **kwargs):
+        order.append("claim")
+        return real_claim(self, **kwargs)
+
+    monkeypatch.setattr(sc, "get_control_plane", lambda: cp)
     monkeypatch.setattr(sc, "is_supabase_enabled", lambda: not registry_mode)
+    monkeypatch.setattr(bno.SupabaseOutbox, "claim", _recording_claim)
 
-    def _marker(cp, event_id, etype):
+    def _registry_claim(self, **kwargs):
         order.append("claim")
         return True  # first processing
 
-    monkeypatch.setattr(sc, "webhook_event_marker", _marker)
+    monkeypatch.setattr(bno.RegistryOutbox, "claim", _registry_claim)
 
     def _tier(cp, org_id):
         order.append("tier")

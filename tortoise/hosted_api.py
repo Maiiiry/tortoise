@@ -1506,6 +1506,57 @@ def _sweep_invite_ghosts() -> None:
         _logger.warning("invite ghost sweep failed: %s", exc)
 
 
+def _sweep_billing_notify_outbox() -> None:
+    """#5323: retry every DUE billing-notification outbox row.
+
+    The delivery half's missing caller. The enqueue is written atomically with
+    the webhook's idempotency claim, so a row exists exactly when a
+    notification is owed; without a drain that row is a record nobody reads,
+    which is the #4241 shape (the mechanism was right, the caller was absent).
+
+    Scheduled, not operator-run — the same seam as the other sweeps: armed by
+    ``_run_boot_sweeps`` at boot and by ``_billing_notify_outbox_loop`` on its
+    OWN short interval (``billing_notify_outbox.drain_interval_s``, 60 s by
+    default). The boot pass matters on its own: a restart during a delivery
+    window is one of the two ways a notification used to be lost, and the boot
+    drain is what recovers it.
+
+    The store is chosen by MODE, and the registry SDK is constructed only in
+    registry mode — the same rule the handler's claim branch follows. Building
+    a registry handle in Supabase mode would RESURRECT the deleted registry
+    graph (the #878 P1 the claim branch cites).
+
+    Best-effort by construction (mirrors the other sweeps): ``drain`` itself
+    never raises, and every failure inside it — the batch claim, a settle, the
+    report stamp — is logged and left for the next cycle, because a sweep must
+    never kill the runner that also does retention and the deleted-org purge.
+    """
+    try:
+        from tortoise.billing_notify_outbox import (
+            RegistryOutbox,
+            SupabaseOutbox,
+            drain,
+        )
+        from tortoise.supabase_control import (
+            get_control_plane,
+            is_supabase_enabled,
+        )
+
+        if is_supabase_enabled():
+            store = SupabaseOutbox(get_control_plane())
+        else:
+            store = RegistryOutbox(_make_sdk(namespace="registry"))
+        counts = drain(store)
+        # Log only when the pass had work: a silent hourly "0 claimed" would be
+        # noise, and the COUNTS are the record that distinguishes "ran and found
+        # nothing" from "could not reach the substrate" (the latter already
+        # warned inside ``drain``).
+        if counts["claimed"]:
+            _logger.info("billing notify outbox drained: %s", counts)
+    except Exception as exc:  # a sweep must never crash the runner
+        _logger.warning("billing notify outbox sweep failed: %s", exc)
+
+
 def _reconcile_metering_periods() -> None:
     """#4241: give the period-bound repair a PERIODIC caller.
 
@@ -1702,6 +1753,40 @@ async def _event_retention_loop(interval: float) -> None:
         # _refresh_cost_allocation); the guard is what makes that belt-and-braces
         # rather than the single thing keeping the loop alive.
         await _guarded_step("cost allocation refresh", _refresh_cost_allocation)
+        # #5323: retry the billing-notification outbox. On its own loop (below)
+        # as well, because an hour is most of the value of an operator
+        # notification; the boot pass is what recovers a notification that was
+        # enqueued by a process that then restarted.
+        await _guarded_step(
+            "billing notify outbox drain",
+            functools.partial(run_on_daemon_worker,
+                              _sweep_billing_notify_outbox,
+                              name="tortoise-boot-sweep"))
+
+
+async def _billing_notify_outbox_loop(interval: float) -> None:
+    """#5323: the periodic drain for the billing-notification outbox.
+
+    A loop of its OWN rather than a step in ``_event_retention_loop``: that one
+    is sized for GC (hourly by default), and an hour of extra latency on an
+    operator notification about a billing event is most of the value gone.
+    Splitting it also keeps the failure domains separate — a wedged drain adds
+    no latency to retention, and a slow retention pass cannot delay a billing
+    notification.
+
+    ``interval`` is a parameter (not a closure) so the loop is directly
+    drivable by a test, the same shape ``_event_retention_loop`` takes, and
+    each tick goes through ``_guarded_step`` on a DAEMON worker: the drain is
+    synchronous control-plane I/O, and the shared default executor's workers are
+    joined at shutdown (#2850).
+    """
+    while True:
+        await asyncio.sleep(interval)
+        await _guarded_step(
+            "billing notify outbox drain",
+            functools.partial(run_on_daemon_worker,
+                              _sweep_billing_notify_outbox,
+                              name="tortoise-boot-sweep"))
 
 
 async def _run_boot_sweeps() -> None:
@@ -1740,7 +1825,11 @@ async def _run_boot_sweeps() -> None:
                       # boot and periodic paths for the anchor repair cannot
                       # drift apart — the property _guarded_step exists for.
                       ("metering period reconciliation",
-                       _reconcile_metering_periods)):
+                       _reconcile_metering_periods),
+                      # #5323: the SAME runner as the periodic outbox loop, so
+                      # the boot and periodic paths cannot drift apart.
+                      ("billing notify outbox drain",
+                       _sweep_billing_notify_outbox)):
         # #5381: the same guard the periodic loop uses — one runner, so the
         # boot and periodic paths cannot drift apart.
         await _guarded_step(
@@ -1759,6 +1848,11 @@ _LIVENESS_TASK_ATTRS = (
     "_health_probe_task",
     "_boot_sweep_task",
     "_event_retention_task",
+    # #5323: the billing-notify outbox drain. Its LOSS is a silent one — the
+    # overflow rows it would retry simply sit there — so it belongs with the
+    # tasks a re-entry or shutdown must disarm rather than leave orphaned (or
+    # duplicated across an in-process restart).
+    "_billing_notify_outbox_task",
     "_first_contact_task",
     # #3944: the analytics canary heartbeat. It belongs here because it is a
     # process-lifetime periodic task whose LOSS is the failure it exists to
@@ -2279,6 +2373,25 @@ async def _lifespan(app):
             _logger.error(
                 "event retention loop not started (the one-time boot sweeps "
                 "above WERE scheduled independently): %s", exc, exc_info=True)
+
+        # #5323: the billing-notification outbox drain, on its OWN short
+        # interval. Scheduled AFTER the retention task and in its own try, for
+        # the #2953 reason the boot sweeps are independent: one loop's bad
+        # configuration must not stop the other. A failure to arm it is logged
+        # loudly — a drain that never runs is exactly the "the queued row has no
+        # reader" shape this feature exists to remove — and the boot sweep above
+        # plus the next process restart are the residual.
+        try:
+            from tortoise.billing_notify_outbox import drain_interval_s
+
+            app.state._billing_notify_outbox_task = (
+                asyncio.get_event_loop().create_task(
+                    _billing_notify_outbox_loop(drain_interval_s())))
+        except Exception as exc:
+            _logger.error(
+                "billing notify outbox loop not started (a deferred billing "
+                "notification will only be retried by the BOOT pass and the "
+                "retention loop's cadence): %s", exc, exc_info=True)
 
         # ── #2850: the DB probe refresher — keeps /health's ``db`` field
         # honest without the request path doing any I/O at all.
@@ -7601,10 +7714,18 @@ def _log_billing_notify_refused(org_id: str | None,
 
     Emitted BEFORE the incident escalation, so it survives the two reasons the
     alert channel can be ABSENT (no ``DR_ISSUES_PAT``, or an unbuildable
-    object store — the documented residual): without it, a permanently-lost
-    billing notification reads only as the ``_cp_offload`` best-effort WARNING
-    plus ``alert_operator``'s "no alert channel" WARNING, indistinguishable
-    from routine telemetry noise. Never raises.
+    object store — the documented residual): without it, a billing
+    notification whose FIRST attempt never ran reads only as the
+    ``_cp_offload`` best-effort WARNING plus ``alert_operator``'s "no alert
+    channel" WARNING, indistinguishable from routine telemetry noise.
+
+    ⚠️ #5323 CHANGED THE VERDICT THIS LINE ANNOUNCES, NOT ITS REASON TO EXIST.
+    The row is enqueued by the atomic claim, so a refusal now means the
+    delivery is DEFERRED to ``_sweep_billing_notify_outbox`` — the permanent
+    loss this line was written against is gone. It is still emitted: it is the
+    only signal that the shared telemetry pool REFUSED a hand-off (the
+    saturation #4456 exists to expose), and it is the floor when no alert
+    channel is configured. Never raises.
     """
     global _LAST_BILLING_REFUSED_LOG
     with suppress(Exception):
@@ -7617,9 +7738,10 @@ def _log_billing_notify_refused(org_id: str | None,
             _LAST_BILLING_REFUSED_LOG = now
         _logger.error(
             "webhook: billing notify REFUSED by the control-plane offload "
-            "seam (org=%s event_type=%s) — the WebhookEvent marker is already "
-            "committed, so Stripe's retry sees is_first=False and this "
-            "notification is LOST", org_id, event_type)
+            "seam (org=%s event_type=%s) — the outbox row is already ENQUEUED "
+            "by the atomic claim, so the delivery is DEFERRED to the drain "
+            "(#5323), not lost; the pool saturation is the signal",
+            org_id, event_type)
 
 
 async def _cp_offload(fn, *, op: str, best_effort: bool = False,
@@ -35191,7 +35313,6 @@ async def webhooks_stripe(request: Request):
     race: the SET happens regardless, so a retry can never drop an upgrade).
     """
     from tortoise.billing import BillingConfigError, BillingError, StripeClient, _scrub_secrets
-    from tortoise.notify import notify_billing_event
 
 
     def _safe_log(exc: Exception) -> str:
@@ -35245,11 +35366,26 @@ async def webhooks_stripe(request: Request):
         # seam — the registry WebhookEvent write would RESURRECT the deleted
         # registry graph (re-review P1, PR #878). Registry mode: WebhookEvent
         # node, as before.
+        #
+        # #5323: the claim is now ONE ATOMIC claim+ENQUEUE through the
+        # notification OUTBOX (tortoise/billing_notify_outbox.py, RPC
+        # `claim_webhook_event`). The row IS the outbox:
+        # `notify_kind` + the org/tier snapshot the notification needs are
+        # written by the SAME statement that claims the event, so there is no
+        # window — and no second write — in which the claim exists and the
+        # notification is not owed. Before this, the claim was a standalone
+        # read-then-insert and the notification lived only in the offload that
+        # followed it, so a REFUSED hand-off (a saturated telemetry pool) lost
+        # it forever: Stripe's retry sees `is_first=False`.
+        from tortoise.billing_notify_outbox import (
+            RegistryOutbox,
+            SupabaseOutbox,
+            deliver as deliver_billing_notify,
+        )
         from tortoise.supabase_control import (
             get_control_plane,
             is_supabase_enabled,
             org_tier,
-            webhook_event_marker,
         )
         # #4015: the tier is a READ, so it is taken BEFORE the claim in both
         # branches. The claim is what makes every ``is_first``-gated side
@@ -35257,35 +35393,39 @@ async def webhooks_stripe(request: Request):
         # ``is_first=False`` forever — so an abort between the claim and the
         # notification (a tier-read failure included) drops the notification
         # PERMANENTLY. Read first: a failure leaves the event unclaimed and
-        # Stripe's retry reprocesses it.
+        # Stripe's retry reprocesses it. (#5323 did not move this line: the
+        # snapshot the outbox stores is the tier read HERE, so a drained retry
+        # delivers the same payload the first attempt would have.)
         if is_supabase_enabled():
             cp = get_control_plane()
+            outbox = SupabaseOutbox(cp)
             tier = await _cp_offload(
                 lambda: org_tier(cp, org_id), op="org_tier")
             is_first = await _cp_offload(
-                lambda: webhook_event_marker(cp, event_id, etype),
+                lambda: outbox.claim(
+                    event_id=event_id, etype=etype, notify_kind=notify_kind,
+                    org_id=org_id, tier=tier),
                 op="webhook_event_marker")
         else:
+            outbox = RegistryOutbox(sdk)
             tier_rows = sdk._get_registry().query(
                 "MATCH (t:Team {id:$id}) RETURN t.tier", params={"id": org_id}
             ).result_set
             tier = tier_rows[0][0] if tier_rows else None
-            seen_rows = sdk._get_registry().query(
-                "MATCH (w:WebhookEvent {event_id:$id}) RETURN w.first_seen",
-                params={"id": event_id},
-            ).result_set
-            is_first = not seen_rows
-            if is_first:
-                sdk._get_registry().query(
-                    "CREATE (w:WebhookEvent {event_id:$id, first_seen:$now, type:$type})",
-                    params={"id": event_id, "now": _now_iso(), "type": etype},
-                )
+            # #5323: the registry twin of the same atomic claim (MERGE + the
+            # enqueue in ONE statement) — the pre-fix MATCH-then-CREATE could
+            # not tell "I created it" from "it was already there" and left a
+            # window in which the notification was not yet owed.
+            is_first = outbox.claim(
+                event_id=event_id, etype=etype, notify_kind=notify_kind,
+                org_id=org_id, tier=tier)
         if is_first and notify_kind:
             # #4015: the billing NOTIFICATION is the first side effect after
             # the claim, because it is the unrecoverable one: once claimed, a
             # re-delivery can never re-fire it, and everything downstream of
             # this line is best-effort. ``notify_billing_event`` is documented
-            # never-raise (tortoise/notify.py), so it cannot abort itself; the
+            # never-raise (tortoise/notify.py), so it cannot abort the outbox
+            # delivery itself; the
             # audit and telemetry legs — either of which could otherwise 500
             # the webhook AND strand the notification — follow it. (#4352 had
             # already moved the analytics POST behind ``_cp_offload``; what
@@ -35313,10 +35453,7 @@ async def webhooks_stripe(request: Request):
             # propagates that to the concurrent future, and a queued
             # ``Future.cancel()`` SUCCEEDS — the worker later SKIPS the
             # callable (``set_running_or_notify_cancel()`` is False), so the
-            # notification is DROPPED, not abandoned. Because the
-            # ``WebhookEvent`` marker was committed BEFORE the notify
-            # (``is_first=True``), Stripe's retry sees ``is_first=False`` and
-            # the notification is lost PERMANENTLY. ``cancel_on_timeout=False``
+            # notification would be DROPPED, not abandoned. ``cancel_on_timeout=False``
             # keeps the bound on the AWAIT — the loop is freed and the webhook
             # still returns promptly — while guaranteeing the queued
             # submission still runs.
@@ -35324,16 +35461,27 @@ async def webhooks_stripe(request: Request):
             # ``best_effort=True`` + the guard keep the never-raise contract
             # AT THE HAND-OFF: an offload failure is swallowed by the seam —
             # but a REFUSAL (backlog full: the callable never ran) is a REAL
-            # drop, so the seam returns ``OFFLOAD_REFUSED`` and it is escalated
-            # through the existing operator-alert path instead of being
-            # silently swallowed. Any raise is caught here rather than
+            # drop of THIS ATTEMPT, so the seam returns ``OFFLOAD_REFUSED`` and
+            # it is escalated through the existing operator-alert path instead
+            # of being silently swallowed. Any raise is caught here rather than
             # reaching the handler's ``except Exception`` → 500, which would
             # strand a claimed event and cost the payment's ack.
+            #
+            # #5323 — WHAT CHANGED HERE. The callable is now the OUTBOX's
+            # ``deliver``: it sends the notification AND settles the row it was
+            # claimed with. The offload seam, its pool, its bound and this
+            # guard are all unchanged (the notification must stay off the
+            # single event loop), but a REFUSAL is no longer a LOSS: the row
+            # was ENQUEUED by the atomic claim above, so it stays owed and
+            # ``_sweep_billing_notify_outbox`` retries it. The escalation below
+            # therefore reports a DELAY and a saturated pool, not a lost
+            # notification — the permanent-loss half is closed by the drain.
             try:
                 result = await _cp_offload(
-                    lambda: notify_billing_event(
-                        notify_kind, {"org_id": org_id, "tier": tier},
-                        {"subscription_status": etype}),
+                    lambda: deliver_billing_notify(
+                        outbox,
+                        event_id=event_id, etype=etype,
+                        notify_kind=notify_kind, org_id=org_id, tier=tier),
                     op="billing_notify", best_effort=True,
                     cancel_on_timeout=False)
                 if result is OFFLOAD_REFUSED:

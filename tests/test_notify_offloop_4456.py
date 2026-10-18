@@ -39,6 +39,18 @@ These tests are behavioural where it matters:
 The ``best_effort`` op-set invariant is co-owned by
 ``tests/test_control_plane_offload_3498.py::test_never_raise_offload_sites_pass_best_effort``
 (``billing_notify`` is declared there).
+
+⛔ #5323 SUPERSEDED ONE PREMISE OF THIS FILE, AND THE PINS WERE UPDATED WITH
+IT. The paragraphs below describe the pre-#5323 shape, where a lost hand-off was
+a PERMANENT loss (the claim was committed first, so Stripe's retry saw
+``is_first=False``). That premise is the defect #5323 closed: the claim is now an
+atomic claim+ENQUEUE, the delivery moved into ``tortoise/billing_notify_outbox``
+(so this file's structural pin now checks that the offload callable REACHES the
+outbox delivery, and the direct ``notify_billing_event`` call is pinned in
+``tests/test_billing_notify_outbox_5323.py``), and a refusal is DEFERRED to the
+drain rather than lost. What this file still owns is unchanged and still load-
+bearing: the notify must run OFF the event loop, on the telemetry pool, bounded,
+and never able to fail the webhook.
 """
 
 from __future__ import annotations
@@ -118,13 +130,15 @@ def _wire_stripe_webhook(monkeypatch, order: list[str]):
     monkeypatch.setattr(billing.StripeClient, "verify_webhook_signature",
                         lambda self, payload, sig: event)
 
-    class _Cp:
-        pass
+    # #5323: the claim is the outbox store's atomic claim+enqueue, run for real
+    # against a real FakeControlPlane (so the row's state machine actually
+    # runs).
+    from tests.fake_control_plane import FakeControlPlane
 
-    monkeypatch.setattr(sc, "get_control_plane", lambda: _Cp())
+    cp = FakeControlPlane(tables={"webhook_events": []})
+
+    monkeypatch.setattr(sc, "get_control_plane", lambda: cp)
     monkeypatch.setattr(sc, "is_supabase_enabled", lambda: True)
-    monkeypatch.setattr(sc, "webhook_event_marker",
-                        lambda cp, event_id, etype: True)
     monkeypatch.setattr(sc, "org_tier", lambda cp, org_id: "pro")
 
     monkeypatch.setattr(ha, "_webhook_apply_event",
@@ -545,9 +559,25 @@ def test_stripe_billing_notify_refusal_escalates_to_operator_alert(
              if r.name == "tortoise.hosted_api" and r.levelno >= logging.ERROR]
     assert any("REFUSED" in m and "billing notify" in m for m in heard), (
         "no ERROR line was emitted for the refusal — with no alert channel "
-        "(no DR_ISSUES_PAT, or an unbuildable object store) the permanent "
-        "loss would read only as routine best-effort WARNINGs (#4456 AC3). "
+        "(no DR_ISSUES_PAT, or an unbuildable object store) the deferred "
+        "notification would read only as routine best-effort WARNINGs "
+        "(#4456 AC3). "
         f"ERROR lines seen: {heard!r}"
+    )
+    # #5323: the ERROR line's VERDICT changed with the outbox. The row is
+    # enqueued by the atomic claim, so a refusal is a DEFERRED delivery the drain
+    # retries — a line that still promised a permanent loss would be the old
+    # defect's text surviving the fix, and an operator reading it would chase a
+    # notification that is about to be delivered anyway.
+    assert any("DEFERRED" in m for m in heard), (
+        "the refusal ERROR line does not say the delivery was DEFERRED — the "
+        "outbox retries it, so the #4456 'lost' wording is now false "
+        f"(#5323). ERROR lines seen: {heard!r}"
+    )
+    assert not any("LOST" in m for m in heard), (
+        "the refusal ERROR line still claims the notification is LOST — the "
+        "enqueued outbox row is retried by the drain, so that claim is the "
+        f"#5323 defect inverted (#5323). ERROR lines seen: {heard!r}"
     )
 
 
@@ -634,6 +664,10 @@ def test_stripe_billing_notify_refused_through_the_real_seam(monkeypatch,
     heard = [r.getMessage() for r in caplog.records
              if r.name == "tortoise.hosted_api" and r.levelno >= logging.ERROR]
     assert any("REFUSED" in m for m in heard), heard
+    assert any("DEFERRED" in m for m in heard), (
+        "the real-seam refusal line does not report the DEFERRED delivery "
+        f"(#5323): {heard!r}"
+    )
 
 
 def test_billing_notify_refused_error_floor_is_rate_limited(monkeypatch,
@@ -670,41 +704,39 @@ def test_billing_notify_refused_error_floor_is_rate_limited(monkeypatch,
 
 
 def test_webhook_notify_direct_call_is_inside_the_offload_boundary():
-    """#4456 (shape): the ONLY direct ``notify_billing_event`` call in
-    ``webhooks_stripe`` sits inside the ``_cp_offload`` callable, carrying
-    ``op="billing_notify"``, ``best_effort=True`` and
-    ``cancel_on_timeout=False``.
+    """#4456 (shape): exactly ONE ``_cp_offload`` in ``webhooks_stripe`` carries
+    ``op="billing_notify"``, with ``best_effort=True`` and
+    ``cancel_on_timeout=False``, and its callable is the OUTBOX delivery —
+    which is where the blocking ``notify_billing_event`` call now lives.
 
-    An inline call plus a dummy ``_cp_offload(lambda: None, ...)`` would leave
-    the blocking HTTP on the loop, so the call is bound to the callable
-    argument rather than merely co-existing with an offload. The
-    ``cancel_on_timeout=False`` pin is the P1 shape guard: with the default
-    ``True`` a bound miss on a QUEUED submission cancels it and the worker
-    skips the callable, dropping the notification (#4456).
+    ⛔ #5323 RELOCATED THIS PIN, IT DID NOT RELAX IT. The delivery moved behind
+    the outbox state machine (the callable sends the notification AND settles
+    the row it was claimed with), so the direct ``notify_billing_event`` call is
+    no longer a NAME inside the handler — asserting on it here would pin a shape
+    the fix deliberately removed. What is pinned instead, in two halves:
+
+    * HERE: the handler's offload boundary is unchanged — one billing-notify
+      submission, on the seam, best-effort, and NOT cancellable at the bound. An
+      inline call plus a dummy ``_cp_offload(lambda: None, ...)`` still fails,
+      because the callable must REACH the delivery helper. The
+      ``cancel_on_timeout=False`` half is the #4456 P1 guard: with the default
+      ``True`` a bound miss on a QUEUED submission cancels it and the worker
+      skips the callable.
+    * IN ``test_billing_notify_outbox_5323``: the direct
+      ``notify_billing_event`` call lives in
+      ``billing_notify_outbox.deliver``, whose ONLY callers are this offloaded
+      callable and the drain (which runs on a daemon worker).
     """
     tree = ast.parse(HOSTED_API.read_text())
     handler = next(
         n for n in ast.walk(tree)
         if isinstance(n, ast.AsyncFunctionDef) and n.name == "webhooks_stripe")
 
-    direct = [n for n in ast.walk(handler)
-              if isinstance(n, ast.Call)
-              and isinstance(n.func, ast.Name)
-              and n.func.id == "notify_billing_event"]
-    assert len(direct) == 1, (
-        "webhooks_stripe must make exactly ONE direct notify_billing_event "
-        f"call: {[n.lineno for n in direct]} (#4456)"
-    )
-    site = direct[0]
-
     offloads = [n for n in ast.walk(handler)
                 if isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Name)
                 and n.func.id == "_cp_offload"]
-    # Select the notify's own offload by its ``op`` label instead of requiring
-    # it to be the handler's ONLY offload: since #4350 the webhook also offloads
-    # its control-plane reads (``op="org_tier"``, ``op="webhook_event_marker"``),
-    # so a bare count pins the pre-#4350 shape rather than the notify's.
+
     def _is_billing_notify_offload(node: ast.Call) -> bool:
         return any(
             kw.arg == "op" and isinstance(kw.value, ast.Constant)
@@ -721,10 +753,17 @@ def test_webhook_notify_direct_call_is_inside_the_offload_boundary():
     assert offload.args and isinstance(offload.args[0], ast.Lambda), (
         "the notify _cp_offload argument is not an offloaded callable (#4456)"
     )
-    assert any(node is site for node in ast.walk(offload.args[0])), (
-        "the direct notify_billing_event call is NOT inside the _cp_offload "
-        "callable — an inline notify plus a dummy offload would leave the "
-        "blocking HTTP on the event loop (#4456)"
+    # The callable must actually REACH the outbox delivery. A lambda that merely
+    # co-exists with the offload (or calls something else) leaves the blocking
+    # send on the loop, which is the defect this pin exists for.
+    reached = [n for n in ast.walk(offload.args[0])
+               if isinstance(n, ast.Name)
+               and n.id == "deliver_billing_notify"]
+    assert len(reached) == 1, (
+        "the billing-notify offload callable does not call "
+        f"deliver_billing_notify ({len(reached)} references found) — an inline "
+        "send plus a dummy offload would leave the blocking HTTP on the event "
+        "loop (#4456/#5323)"
     )
     kwargs = {kw.arg: kw.value for kw in offload.keywords}
     assert (isinstance(kwargs.get("op"), ast.Constant)
