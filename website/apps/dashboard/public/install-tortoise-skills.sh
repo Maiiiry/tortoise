@@ -418,20 +418,17 @@ emit_codex_agents_block() {
   local tmpdir block pre post target
   tmpdir="$(mktemp -d)" || return 1
   block="$tmpdir/block"; pre="$tmpdir/pre"; post="$tmpdir/post"
-  local prev_version="" had_block=0
+  # ── PRE-STATE: read BEFORE anything is written (after the write the file
+  # always looks current). `state` is decided with the SAME line-anchored test
+  # the replace uses: an unanchored `grep -qF` matched a marker mid-line or in
+  # prose, chose the replace branch, and the anchored awk split then found no
+  # pair — duplicating the block while reporting success.
+  local state="none" prev_version="" same_bytes=0
+  local ms_re="^${ms}\r?$" me_re="^${me}\r?$"
   # Resolve a symlinked AGENTS.md (monorepos point AGENTS.md at a shared
   # file) — refresh the TARGET, never clobber the link.
   target="$file"
   [ -L "$file" ] && target="$(readlink "$file")"
-  # The version the file carries NOW (empty = markers with no version line,
-  # i.e. provisioned before #3429).
-  if [ -f "$target" ]; then
-    prev_version="$(sed -n 's/.*tortoise:block v\([0-9][0-9]*\) -->.*/\1/p' "$target" | head -1)"
-    # Capture the PRE-write state: after the write the file always has markers.
-    if grep -qF "$ms" "$target" && grep -qF "$me" "$target"; then
-      had_block=1
-    fi
-  fi
   printf '%s\n' \
 "${ms}
 <!-- tortoise:block v${AGENTS_BLOCK_VERSION} -->
@@ -450,43 +447,94 @@ emit_codex_agents_block() {
 - First-time MCP calls may prompt for approval — tortoise_health and the read tools
   are safe to allow.
 ${me}" > "$block"
+
   if [ -f "$target" ]; then
-    if grep -qF "$ms" "$target" && grep -qF "$me" "$target"; then
-      # In-place replace between the markers (idempotent refresh) — never
-      # touches content outside the marked block. Markers must sit on their
-      # own line (tolerating a trailing CR) so content merely mentioning the
-      # marker text is preserved.
-      : > "$pre"; : > "$post"
-      awk -v ms="$ms" -v me="$me" -v pre="$pre" -v post="$post" '
-        BEGIN { inmarker = 0; ended = 0 }
-        $0 ~ ("^" ms "\r?$") { inmarker = 1; next }
-        inmarker && $0 ~ ("^" me "\r?$") { inmarker = 0; ended = 1; next }
-        { if (ended) print > post; else if (!inmarker) print > pre }
-      ' "$target"
-      # cp -p first preserves the file's mode (a 0600 AGENTS.md stays 0600)
-      # and ownership; cat then overwrites content in place.
-      cp -p "$target" "$target.tmp"
-      cat "$pre" "$block" "$post" > "$target.tmp"
-      mv "$target.tmp" "$target"
-    else
+    state="$(awk -v msre="$ms_re" -v mere="$me_re" '
+      $0 ~ msre { starts++; if (!startline) startline = NR }
+      $0 ~ mere { ends++;   if (!endline)   endline   = NR }
+      END {
+        if (!starts && !ends)         { print "none";      exit }
+        if (starts != 1 || ends != 1) { print "malformed"; exit }
+        if (startline > endline)      { print "malformed"; exit }
+        print "paired"
+      }' "$target")"
+  fi
+
+  if [ "$state" = "paired" ]; then
+    # The version is read INSIDE the window (a token in prose elsewhere must not
+    # read as "this block is current"), and the bytes are compared with what we
+    # would write: a version line is evidence of ORDER, never proof that the
+    # text matches, so "already current" is decided by the text itself.
+    prev_version="$(awk -v msre="$ms_re" -v mere="$me_re" '
+      $0 ~ msre { inb = 1; next }
+      $0 ~ mere { inb = 0; next }
+      inb && match($0, /tortoise:block v[0-9]+ -->/) {
+        v = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); print v; exit
+      }' "$target")"
+    : > "$tmpdir/window"
+    awk -v msre="$ms_re" -v mere="$me_re" '
+      $0 ~ msre { inb = 1; print; next }
+      $0 ~ mere { print; inb = 0; next }
+      inb { print }' "$target" > "$tmpdir/window"
+    if cmp -s "$tmpdir/window" "$block"; then same_bytes=1; fi
+  fi
+
+  if [ "$state" = "malformed" ]; then
+    # Markers present but not ONE clean start→end pair: a stray start swallows
+    # everything to EOF, a stray end makes the split drop the tail, and either
+    # way appending leaves the stale block in place. Refuse and say what to fix
+    # — a truthful failure beats a success report over a duplicated block.
+    echo "  ✗ AGENTS.md — the Tortoise block markers are MALFORMED" >&2
+    echo "      found $(grep -cE "$ms_re" "$target" || true) start / $(grep -cE "$me_re" "$target" || true) end marker line(s)" >&2
+    echo "      expected exactly one ${ms} before exactly one ${me}, each on its own line." >&2
+    echo "      NOT rewritten: appending would leave the stale block in place." >&2
+    echo "      Fix the markers by hand (or delete the whole block), then re-run." >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  if [ "$state" = "paired" ] && [ "$same_bytes" -eq 0 ]; then
+    # In-place replace between the markers — never touches content outside them.
+    : > "$pre"; : > "$post"
+    awk -v msre="$ms_re" -v mere="$me_re" -v pre="$pre" -v post="$post" '
+      BEGIN { inmarker = 0; ended = 0 }
+      $0 ~ msre { inmarker = 1; next }
+      inmarker && $0 ~ mere { inmarker = 0; ended = 1; next }
+      { if (ended) print > post; else if (!inmarker) print > pre }
+    ' "$target"
+    # cp -p first preserves the file's mode (a 0600 AGENTS.md stays 0600) and
+    # ownership; cat then overwrites content in place.
+    cp -p "$target" "$target.tmp"
+    cat "$pre" "$block" "$post" > "$target.tmp"
+    mv "$target.tmp" "$target"
+  elif [ "$state" = "none" ]; then
+    if [ -f "$target" ]; then
       printf '\n\n' >> "$target"
       cat "$block" >> "$target"
+    else
+      cat "$block" > "$target"
     fi
-  else
-    cat "$block" > "$target"
   fi
   rm -rf "$tmpdir"
-  # #3429: say WHICH version we leave behind. A re-run is the upgrade path, and
-  # a repo whose block predates the version line (or carries an older one) must
-  # be able to see that it was upgraded rather than silently re-written.
-  if [ -n "$prev_version" ] && [ "$prev_version" = "$AGENTS_BLOCK_VERSION" ]; then
-    echo "  ✓ AGENTS.md — Tortoise block v$AGENTS_BLOCK_VERSION (already current)"
-  elif [ -n "$prev_version" ]; then
-    echo "  ✓ AGENTS.md — Tortoise block upgraded v$prev_version → v$AGENTS_BLOCK_VERSION"
-  elif [ "$had_block" -eq 1 ]; then
-    echo "  ✓ AGENTS.md — Tortoise block upgraded (unversioned → v$AGENTS_BLOCK_VERSION)"
+
+  # ── REPORT: derived from what was WRITTEN and what was there before, never
+  # from the version token alone (that reported "already current" while it was
+  # rewriting the body whenever the text changed without a bump).
+  v="$AGENTS_BLOCK_VERSION"
+  if [ "$state" = "paired" ] && [ "$same_bytes" -eq 1 ]; then
+    echo "  ✓ AGENTS.md — Tortoise block v$v (already current)"
+  elif [ "$state" = "none" ]; then
+    echo "  ✓ AGENTS.md — Tortoise standing instructions created (block v$v)"
+  elif [ -z "$prev_version" ]; then
+    echo "  ✓ AGENTS.md — Tortoise block upgraded (unversioned → v$v)"
+  elif [ "$prev_version" -lt "$v" ]; then
+    echo "  ✓ AGENTS.md — Tortoise block upgraded v$prev_version → v$v"
+  elif [ "$prev_version" -gt "$v" ]; then
+    # A pinned/cached/rolled-back installer must not silently DOWNGRADE a
+    # project's standing instructions, still less call it an upgrade.
+    echo "  ✓ AGENTS.md — Tortoise block written at v$v (the file had v$prev_version: this installer is OLDER than the block it replaced)"
   else
-    echo "  ✓ AGENTS.md — Tortoise standing instructions created (block v$AGENTS_BLOCK_VERSION)"
+    echo "  ✓ AGENTS.md — Tortoise block refreshed (v$v — same version, updated text)"
   fi
 }
 
@@ -577,7 +625,10 @@ if [ ${#missing[@]} -eq 0 ]; then
   # (other harnesses have their own memory mechanisms; a stray AGENTS.md
   # would change every agent's behavior in this project).
   if [ "$HARNESS" = "codex" ]; then
-    emit_codex_agents_block
+    # #3429: a failure here is a REAL failure (malformed markers, nothing
+    # written) — surface it as such instead of letting set -e's abort happen
+    # with no explanation of what remains broken in the project.
+    emit_codex_agents_block || exit 1
   fi
 else
   echo ""

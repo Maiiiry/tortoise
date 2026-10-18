@@ -27,16 +27,25 @@ Every test drives the REAL installer end-to-end — a temporary copy with ONLY
 its ``SKILLS_BASE`` URL substituted for a local ``file://`` fixture — and
 asserts the bytes on disk plus the installer's own stdout, never source text.
 
-Mutations that turn these RED (verified before merge):
-  * delete the version line from the emitted block        -> the version
-    assertions in every test fail (nothing to grep, no upgrade message);
-  * drop the ``prev_version`` read (always empty)         -> the upgrade
-    message becomes "created"/"upgraded (unversioned …)" for an already-current
-    block, failing ``test_reinstall_reports_already_current``;
-  * echo the old ``refreshed/created`` line unconditionally -> both upgrade
-    tests fail on the message they require;
-  * emit the block only on a FRESH file (skip the marker branch) -> the
-    upgrade and idempotence tests fail on duplicate/no-version content.
+Mutations that turn these RED (each verified RED before merge):
+  * delete the version line from the emitted block        -> every version
+    assertion fails (nothing to grep, no upgrade branch);
+  * blank the ``prev_version`` read                       -> the migration and
+    reinstall assertions fail (unversioned/already-current both misreport);
+  * make the "already current" branch unreachable         -> the reinstall test
+    fails (it must be a no-op AND say so);
+  * edit the block's TEXT without bumping the version      -> the prose pin
+    fails, which is the only thing that makes a stale
+    ``AGENTS_BLOCK_VERSION`` visible (cycle 1: the message came from the version
+    alone, so "already current" was printed while the body was rewritten);
+  * decide the pre-state with an unanchored match (the pre-fix ``grep -qF``)
+    -> the malformed-marker tests fail: the anchored split then finds no pair
+    and the block is duplicated while the report claims success.
+
+Cycle 1 also measured two pre-states the first revision got wrong in the OTHER
+direction: a version token in prose outside the block (read as "current"), and an
+older installer overwriting a newer block (reported as an "upgrade"). Both are
+tests here.
 """
 
 from __future__ import annotations
@@ -117,6 +126,14 @@ def _run(installer: Path, home: Path, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
+def _agents_report(stdout: str) -> str:
+    """The AGENTS.md line only — the skills lines print "(already current)" too,
+    which is a different claim about a different artifact."""
+    lines = [ln for ln in stdout.splitlines() if "AGENTS.md" in ln]
+    assert lines, f"installer printed no AGENTS.md line:\n{stdout}"
+    return "\n".join(lines)
+
+
 def _versioned(text: str) -> list[int]:
     return [int(v) for v in re.findall(r"tortoise:block v(\d+)", text)]
 
@@ -139,7 +156,7 @@ def test_fresh_install_writes_a_versioned_block(tmp_path):
     # The version must sit INSIDE the marker window, or the replace below
     # leaves it stale the first time the block is refreshed.
     assert agents.index(START) < agents.index("tortoise:block v") < agents.index(END)
-    assert "created" in done.stdout, (
+    assert "created" in _agents_report(done.stdout), (
         f"a fresh install must say it CREATED the block:\n{done.stdout}")
 
 
@@ -168,7 +185,7 @@ def test_installer_upgrades_a_legacy_block_without_duplicating_or_clobbering(tmp
     # Foreign content is untouched, in order, on both sides.
     assert agents.startswith(FOREIGN_BEFORE), agents[:200]
     assert agents.endswith(FOREIGN_AFTER), agents[-200:]
-    assert "unversioned" in done.stdout, (
+    assert "unversioned" in _agents_report(done.stdout), (
         f"the upgrade must be REPORTED, not silent:\n{done.stdout}")
 
 
@@ -217,6 +234,160 @@ def test_reinstall_reports_already_current_and_changes_nothing(tmp_path):
     after = (project / "AGENTS.md").read_text(encoding="utf-8")
 
     assert after == before, "a second run must not change the block"
-    assert "already current" in second.stdout, (
-        f"a re-run over a current block must say so:\n{second.stdout}")
-    assert "created" not in second.stdout and "upgraded" not in second.stdout
+    report = _agents_report(second.stdout)
+    assert "already current" in report, (
+        f"a re-run over a current block must say so:\n{report}")
+    assert "created" not in report and "upgraded" not in report, report
+
+
+# ── The report must be derived from what was WRITTEN, not from the version ──
+#
+# Cycle 1 found the message came from the version token alone: "already current"
+# was printed while the body was being rewritten (drifted text, same version),
+# and "upgraded"/"created" was printed while a malformed marker pair made the
+# write duplicate the block and keep the stale one. Each test below is a
+# reachable pre-state that produced a false report.
+
+
+def _install(tmp_path: Path, agents: str | None):
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    if agents is not None:
+        (project / "AGENTS.md").write_text(agents, encoding="utf-8")
+    done = _run(installer, home, project)
+    return done, (project / "AGENTS.md").read_text(encoding="utf-8")
+
+
+def _drift_installer(tmp_path: Path) -> Path:
+    """A copy whose block TEXT differs while the VERSION is unchanged — the
+    hand-discipline failure the version line cannot see."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    src = installer.read_text(encoding="utf-8")
+    drifted = src.replace(
+        "- First-time MCP calls may prompt for approval",
+        "- First-time MCP calls may prompt for approval (DRIFTED SENTENCE)",
+        1,
+    )
+    assert drifted != src, "drift anchor not found — update this test"
+    installer.write_text(drifted, encoding="utf-8")
+    return installer
+
+
+def test_same_version_different_text_is_not_already_current(tmp_path):
+    """A version line is evidence of ORDER, not proof the text matches."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert _run(installer, home, project).returncode == 0
+    drifted = _drift_installer(tmp_path)
+    done = _run(drifted, home, project)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    report = _agents_report(done.stdout)
+    assert "already current" not in report, (
+        f"the body WAS rewritten, so 'already current' is false:\n{report}")
+    assert "updated text" in report, (
+        f"a same-version text change must be reported as a refresh:\n{report}")
+    agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+    assert "DRIFTED SENTENCE" in agents
+    assert _versioned(agents) == [2]
+
+
+def test_malformed_markers_are_refused_not_silently_duplicated(tmp_path):
+    """A stray end marker made the anchored awk split swallow the tail: the
+    report said 'upgraded' while user content was deleted and the stale block
+    survived. The installer must refuse and say so."""
+    agents_in = (
+        FOREIGN_BEFORE
+        + END                      # stray end BEFORE any start
+        + "\nTAIL THAT MUST SURVIVE\n"
+        + LEGACY_BLOCK.replace("OLD", "OLD")
+        + FOREIGN_AFTER
+    )
+    done, agents = _install(tmp_path, agents_in)
+
+    assert done.returncode != 0, (
+        f"a malformed marker pair must fail the run, not report success:\n{done.stdout}")
+    assert "MALFORMED" in done.stderr, done.stderr
+    assert agents == agents_in, (
+        f"the file must be left byte-identical when it is refused:\n{agents}")
+    assert "TAIL THAT MUST SURVIVE" in agents
+
+
+def test_start_marker_without_end_is_refused(tmp_path):
+    done, agents = _install(tmp_path, LEGACY_BLOCK.replace(END + "\n", ""))
+
+    assert done.returncode != 0, done.stdout
+    assert "MALFORMED" in done.stderr
+    assert agents.count(START) == 1, f"the block was duplicated:\n{agents}"
+    assert agents == LEGACY_BLOCK.replace(END + "\n", "")
+
+
+def test_version_token_outside_the_window_does_not_mean_current(tmp_path):
+    """A repo that DOCUMENTS the marker in prose would otherwise read as
+    versioned while carrying an unversioned, stale block."""
+    agents_in = "We use a `tortoise:block v2` marker here.\n\n" + LEGACY_BLOCK
+    done, agents = _install(tmp_path, agents_in)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    report = _agents_report(done.stdout)
+    assert "already current" not in report, (
+        f"the token was OUTSIDE the block, so nothing was current:\n{report}")
+    assert "unversioned" in report, report
+    assert "restart the client so the new session reads it, then verify with" not in agents
+
+
+def test_an_older_installer_says_so_instead_of_calling_it_an_upgrade(tmp_path):
+    """v3 block + v2 installer (pinned/cached/rolled-back copy)."""
+    agents_in = LEGACY_BLOCK.replace(START, f"{START}\n<!-- tortoise:block v3 -->")
+    done, agents = _install(tmp_path, agents_in)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    report = _agents_report(done.stdout)
+    assert "upgraded" not in report, (
+        f"writing v2 over v3 is a DOWNGRADE, not an upgrade:\n{report}")
+    assert "OLDER than the block" in report, report
+    assert _versioned(agents) == [2]
+
+
+#: sha256 of the block's PROSE with the version line removed. The version's only
+#: job is ORDER (v1 → v2); the decision compares bytes. But editing the text
+#: without a bump still silently changes what every provisioned repo re-reads in
+#: every future session, and no other test can see it — the installer would
+#: report "refreshed (same version, updated text)" and mean it. So the text is
+#: pinned: edit it → update this pin AND bump AGENTS_BLOCK_VERSION, in one commit.
+#: The version line is excluded so a bump alone does not red this pin.
+BLOCK_PROSE_SHA256 = "de04359e96d4a9e1aca9fa22a57ed4923d457544eea2d29dee10332433565bbd"
+
+
+def _block_prose() -> str:
+    src = INSTALLER.read_text(encoding="utf-8")
+    head = "  printf '%s\\n' \\\n"
+    start = src.index(head) + len(head)
+    body = src[start:src.index('${me}" > "$block"')]
+    assert body.startswith('"${ms}'), body[:80]
+    body = body.split("\n", 1)[1]
+    return "\n".join(
+        line for line in body.splitlines() if "tortoise:block v" not in line)
+
+
+def test_block_text_edit_requires_a_version_bump():
+    import hashlib
+
+    got = hashlib.sha256(_block_prose().encode("utf-8")).hexdigest()
+    assert got == BLOCK_PROSE_SHA256, (
+        "the AGENTS.md block's TEXT changed. That text is re-read by every agent "
+        "in every provisioned repo, so the change needs a VERSION BUMP to be "
+        "reachable there — the installer only upgrades what it can compare.\n"
+        f"  new sha256: {got}\n"
+        "  -> bump AGENTS_BLOCK_VERSION, update BLOCK_PROSE_SHA256, and update "
+        "the version named in docs/quickstart-cloud.md + the served SKILL.")

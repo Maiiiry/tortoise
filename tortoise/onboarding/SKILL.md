@@ -530,25 +530,30 @@ Guide the human through:
 3. The connector exposes the `tortoise_*` MCP tools to claude.ai workflows.
 
 
-### Already installed — refreshing is the same command
-
-An install is not a one-time write. The installer owns two things inside your
-project: the skills directory and, on a Codex project, the marker-delimited
-Tortoise block in `AGENTS.md`. **Re-running the installer is the upgrade path**
-— it replaces what sits between its own `<!-- tortoise:start -->` and
-`<!-- tortoise:end -->` markers, leaves everything you wrote around them alone,
-and does not duplicate the block.
+**Already installed — refreshing is the same command.** An install is not a
+one-time write. The installer owns two things inside your project: the skills
+directory and, on a Codex project, the marker-delimited Tortoise block in
+`AGENTS.md`. Re-running the installer is the upgrade path: it replaces what sits
+between ONE well-formed `<!-- tortoise:start -->` / `<!-- tortoise:end -->` pair
+and leaves everything you wrote around it alone.
 
 ```bash
 curl -fsSL https://app.premiselabs.co/install-tortoise-skills.sh | bash -s -- --harness <harness>
 ```
 
-The block carries a version line (`<!-- tortoise:block vN -->`) and the
-installer says which version you ended up on — `created`, `upgraded v1 → v2`, or
-`already current`. If a repo's `AGENTS.md` has the markers but no version line,
-it was provisioned before versioning existed and its instructions are stale:
-re-run the installer rather than editing the block by hand. Never hand-edit
-inside the markers you did not write; the next refresh discards it.
+The block carries a version line (`<!-- tortoise:block vN -->`) and the installer
+says what it did: `created (block vN)`, `upgraded (unversioned → vN)` — the
+migration case, a repo provisioned before versioning — `upgraded vM → vN`,
+`refreshed (vN — same version, updated text)`, or `already current` — and, if your
+installer is older than the block (a cached or rolled-back copy), `written at vN`
+plus the version it found, so a downgrade is never announced as an upgrade. That last
+one is a statement about the TEXT (the block on disk is byte-identical to the one
+just built), not about the version number, so it is safe to trust.
+
+If the marker lines are not one clean pair (a stray start swallows everything to
+EOF, a stray end drops the tail), the installer REFUSES and says which lines to
+fix rather than duplicating the block. Never hand-edit inside markers you did not
+write; the next refresh discards it.
 
 ## 4. Verify, then checkpoint harness-connected
 

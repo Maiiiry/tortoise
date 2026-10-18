@@ -100,26 +100,42 @@ codex mcp add tortoise --url https://api.premiselabs.co/mcp/ --bearer-token-env-
 
 Restart your client. You should now have Tortoise's tools (create points, query the graph, run evidence propagation, capture sessions).
 
+Rate limit: **100 requests/min per key**.
+
 ### Already installed? Re-run the installer
 
 The installer is idempotent **and it is the upgrade path** — re-running it is how an existing setup picks up a
 newer standing block, a corrected instruction, or new skill text. Nothing else rewrites them: for a Codex
 project the installer owns the `AGENTS.md` block, and a block written by an older version would otherwise be
-re-read in every future session forever.
+re-read in every future session, forever.
 
 ```bash
 curl -fsSL https://app.premiselabs.co/install-tortoise-skills.sh | bash -s -- --harness codex
 ```
 
-It replaces only what sits between its own `<!-- tortoise:start -->` / `<!-- tortoise:end -->` markers, so
-anything you wrote around it is untouched, and it prints which block version you ended up on (`created`,
-`upgraded v1 → v2`, or `already current`). To see what you have without changing anything:
+It replaces only what sits between its own `<!-- tortoise:start -->` / `<!-- tortoise:end -->` markers — **one
+well-formed pair** — so anything you wrote around them is untouched. It prints which block version you ended up
+on, and what it did to get there:
+
+| it prints | it means |
+|---|---|
+| `created (block vN)` | there was no `AGENTS.md` |
+| `upgraded (unversioned → vN)` | provisioned before versions existed — this is the migration |
+| `upgraded vM → vN` | an older block was replaced |
+| `refreshed (vN — same version, updated text)` | the version matched but the text did not |
+| `already current` | the block on disk is byte-identical to the one just built |
+| `written at vN (the file had vM …)` | your installer is OLDER than the block (a cached or rolled-back copy) — it says so instead of calling a downgrade an upgrade |
+| `MALFORMED … NOT rewritten` | the marker lines are not one clean start→end pair; it refuses rather than duplicate the block, and tells you which lines to fix |
+
+`already current` is a statement about the **text**, not the version number, so it is safe to trust. To see what
+you have without changing anything:
 
 ```bash
-grep -o 'tortoise:block v[0-9]*' AGENTS.md      # empty: written before versions existed — re-run to upgrade
+sed -n '/<!-- tortoise:start -->/,/<!-- tortoise:end -->/p' AGENTS.md | grep -o 'tortoise:block v[0-9]*'
 ```
 
-Rate limit: **100 requests/min per key**.
+Empty output with both markers present means the block predates versioning — re-run the installer to upgrade it.
+(A match found elsewhere in the file, outside those markers, means nothing: only the block's own version counts.)
 
 ## 3. Use the CLI (optional, for scripting)
 
