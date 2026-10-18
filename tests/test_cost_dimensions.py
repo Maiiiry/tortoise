@@ -381,6 +381,97 @@ def test_every_command_in_a_multi_command_alter_table_moves_the_end_state():
     assert audit._creates_column(sql, "embed_tokens") is False
 
 
+def test_the_COLUMN_keyword_is_optional_in_every_column_verb(tmp_path):
+    """MUTATION: ``COLUMN`` is optional, so the short spelling must be read too.
+
+    Postgres makes the keyword optional in all three column verbs — ``DROP
+    [COLUMN] c``, ``ADD [COLUMN] c <type>``, ``RENAME [COLUMN] c TO d`` — while
+    the verb scan required it. A valid-but-unmatched command applied NOTHING and
+    reported NOTHING, which is the stale-declaration fail-open the replay exists
+    to close, one grammar rule further in: a dropped or renamed declared column
+    stayed green (pre-fix: ``True``/``True`` below) and a correctly-created one
+    read as drift (pre-fix: ``False``).
+    """
+    root = _migration_root(
+        tmp_path,
+        "ALTER TABLE public.metering_records ADD embed_calls bigint;",
+        "ALTER TABLE public.metering_records ADD embed_tokens bigint;",
+        "ALTER TABLE public.metering_records ADD embed_dropped bigint;",
+        "ALTER TABLE public.metering_records RENAME embed_tokens TO embed_token_count;",
+        "ALTER TABLE public.metering_records DROP embed_dropped;",
+    )
+    sql = audit.migration_text(root)
+    # The short ADD is a real definition (pre-fix: a false red, ``False``).
+    assert audit._creates_column(sql, "embed_calls") is True
+    # The short RENAME moved it away (pre-fix: the old name stayed present).
+    assert audit._creates_column(sql, "embed_token_count") is True
+    assert audit._creates_column(sql, "embed_tokens") is False
+    # The short DROP took it with it (pre-fix: the dropped one stayed present).
+    assert audit._creates_column(sql, "embed_dropped") is False
+    # ... and the replay reports no problem, so this is a READ, not a refusal.
+    assert audit._effective_schema(sql).problems == ()
+    with _declaring(_mutated("egress", columns=("embed_tokens", "embed_calls"))):
+        findings = audit.check_ledger(root)
+    assert any("'embed_tokens'" in f for f in findings), findings
+    assert not any("'embed_calls'" in f for f in findings), findings
+
+
+def test_a_table_constraint_is_never_read_as_a_column():
+    """MUTATION: the optional ``COLUMN`` must not turn a constraint into a column.
+
+    Accepting the short spelling makes ``ADD <ident>`` ambiguous with the table
+    constraints (``ADD PRIMARY KEY (org_id)``, ``ADD CONSTRAINT ck CHECK …``) and
+    ``DROP <ident>`` ambiguous with ``DROP CONSTRAINT c``. The non-column verbs
+    are consumed FIRST, so no phantom column is created — a phantom is worse than
+    a miss here, because it makes a stale declaration read as present (the
+    exact fail-open the sibling arms close, in the opposite direction).
+    """
+    sql = textwrap.dedent("""
+        CREATE TABLE public.metering_records (org_id uuid, embed_calls bigint);
+        ALTER TABLE public.metering_records ADD PRIMARY KEY (org_id);
+        ALTER TABLE public.metering_records
+            ADD CONSTRAINT ck_embed CHECK (embed_calls >= 0);
+        ALTER TABLE public.metering_records DROP CONSTRAINT IF EXISTS ck_embed;
+        ALTER TABLE public.metering_records ALTER COLUMN org_id DROP NOT NULL;
+        ALTER TABLE public.metering_records ALTER COLUMN org_id SET DEFAULT NULL;
+        ALTER TABLE public.metering_records ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.metering_records OWNER TO postgres;
+        -- ...and the mirror hazard: a column whose NAME starts with a constraint
+        -- keyword is still a column (`likes`, `check_x`).
+        ALTER TABLE public.metering_records ADD likes integer;
+    """)
+    for phantom in ("primary", "constraint", "check", "not", "default"):
+        assert audit._creates_column(sql, phantom) is False, phantom
+    # ... the real columns are still read, and nothing was refused:
+    assert audit._creates_column(sql, "org_id") is True
+    assert audit._creates_column(sql, "embed_calls") is True
+    assert audit._creates_column(sql, "likes") is True
+    assert audit._effective_schema(sql).problems == ()
+    # ... and the live corpus is replayed through the same arm: 133 ALTER TABLE
+    # statements, 68 of them non-column verbs, and none of them a problem.
+    assert audit._effective_schema(migration_sql()).problems == ()
+
+
+def test_an_ALTER_TABLE_command_the_replay_cannot_read_is_a_finding(tmp_path):
+    """MUTATION: an unreadable command is DRIFT, never a silent no-op.
+
+    An ``ALTER TABLE`` whose verb scan matched nothing applied no state change and
+    recorded no ``problems`` entry, so the module's stated contract ("an input the
+    replay cannot read is reported as a FINDING, never skipped") was false for
+    every unparsed command. Pre-fix this returns a clean ``[]`` about a statement
+    it never read.
+    """
+    root = _migration_root(tmp_path, textwrap.dedent("""
+        ALTER TABLE public.metering_records ADD COLUMN embed_calls bigint;
+        ALTER TABLE public.metering_records FROBNICATE embed_calls;
+    """))
+    schema = audit._effective_schema(audit.migration_text(root))
+    assert any("FROBNICATE" in p for p in schema.problems), schema.problems
+    with _declaring(_mutated("egress", columns=("embed_calls",))):
+        findings = audit.check_ledger(root)
+    assert any("cannot be replayed" in f for f in findings), findings
+
+
 def test_a_dropped_table_takes_its_columns_with_it(tmp_path):
     """MUTATION: ``DROP TABLE`` removes the columns it held.
 

@@ -26,14 +26,23 @@ Two verbs against ONE declaration (``tortoise/cost_dimensions.py``):
        ``DROP COLUMN``, ``RENAME TO``, ``DROP TABLE``, ``CREATE FUNCTION``,
        ``ALTER FUNCTION … RENAME TO`` and ``DROP FUNCTION`` all move the end state
        (every command in a multi-command ``ALTER TABLE`` included, not only the
-       first). A column renamed in an appended migration and not in the declaration
+       first). The ``COLUMN`` keyword is OPTIONAL in all three column verbs —
+       ``DROP [COLUMN] c``, ``ADD [COLUMN] c <type>``, ``RENAME [COLUMN] c TO d`` —
+       and the short spelling moves the end state too; a command that touches no
+       column (``ADD [CONSTRAINT|PRIMARY KEY|FOREIGN KEY|UNIQUE|CHECK|EXCLUDE|LIKE]``,
+       ``DROP CONSTRAINT``, ``ALTER [COLUMN] c …``, RLS / trigger / rule toggles,
+       ``OWNER TO``, ``SET``/``RESET``, ``CLUSTER ON``, ``REPLICA IDENTITY``,
+       inheritance, partitions) is consumed DELIBERATELY, so a constraint can never
+       be read as a column. A column renamed in an appended migration and not in the
+       declaration
        fails here, and so does an RPC renamed by ``ALTER FUNCTION … RENAME TO`` or
        dropped by ``DROP FUNCTION``, and a multi-target ``DROP TABLE a, b`` takes
        BOTH tables' columns with it. Nothing is matched as a substring or inside a
        SQL comment — the strip is quote-aware, so a ``--`` inside a string literal
        cannot swallow the DDL after it — and an input the replay cannot lex
        (unterminated literal / body / block comment, unreadable ``DROP TABLE``
-       target) is reported as a FINDING, never skipped.
+       target, an ``ALTER TABLE`` command that is neither a column verb nor a known
+       non-column one) is reported as a FINDING, never skipped.
     3. **no dead hook** — a dimension's writer (or reader, when the read path is
        the primitive) must have a call site in a tracked NON-TEST, NON-TOOL file,
        or the declaration must carry ``unscheduled_reason``. #4493's defect was a
@@ -391,18 +400,56 @@ _CREATE_TABLE = re.compile(
 _ALTER_TABLE = re.compile(
     rf"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:public\.)?"
     rf"({_IDENT})\s+(.*)$", re.IGNORECASE | re.DOTALL)
-#: EVERY verb a single ``ALTER TABLE`` statement can carry, matched in source order.
-#: One statement may list several (``DROP COLUMN a, ADD COLUMN b, RENAME COLUMN c
-#: TO d``); applying only the FIRST one left the rest of the statement invisible,
-#: which is the same stale-declaration fail-open the replay exists to close, one
-#: command further in. Alternatives are ordered so ``RENAME COLUMN`` wins over the
-#: shorter ``RENAME TO`` prefix.
+#: EVERY command a single ``ALTER TABLE`` statement can carry that MOVES the column
+#: set, matched against ONE command (``_effective_schema`` splits the statement at
+#: top-level commas first). One statement may list several (``DROP COLUMN a, ADD
+#: COLUMN b, RENAME COLUMN c TO d``); applying only the FIRST one left the rest of
+#: the statement invisible, which is the same stale-declaration fail-open the
+#: replay exists to close, one command further in.
+#:
+#: Postgres makes the ``COLUMN`` keyword OPTIONAL in all three column verbs —
+#: ``DROP [COLUMN] [IF EXISTS] c``, ``ADD [COLUMN] [IF NOT EXISTS] c <type>``,
+#: ``RENAME [COLUMN] c TO d`` — so requiring it matched NO alternative for a
+#: valid spelling and ``_effective_schema`` silently applied nothing: no state
+#: change AND no ``problems`` entry, the one thing this module's contract forbids
+#: ("an input the replay cannot read … is reported as a FINDING, never skipped").
+#: The short form is therefore accepted, and ``_ALTER_TABLE_NOT_COLUMN`` is tried
+#: FIRST so a table constraint can never be read as a column: ``ADD PRIMARY KEY
+#: (org_id)`` creates no column named ``primary``, and ``DROP CONSTRAINT c`` drops
+#: no column named ``c``. Alternatives are ordered so ``RENAME [COLUMN] c TO d``
+#: wins over the shorter ``RENAME TO`` table rename.
 _ALTER_TABLE_VERB = re.compile(
-    rf"\bRENAME\s+COLUMN\s+({_IDENT})\s+TO\s+({_IDENT})"
-    rf"|\bRENAME\s+TO\s+({_IDENT})"
-    rf"|\bDROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?({_IDENT})"
-    rf"|\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})",
+    rf"RENAME\s+(?:COLUMN\s+)?({_IDENT})\s+TO\s+({_IDENT})"
+    rf"|RENAME\s+TO\s+({_IDENT})"
+    rf"|DROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?({_IDENT})"
+    rf"|ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})",
     re.IGNORECASE)
+#: An ``ALTER TABLE`` command the replay reads as leaving the COLUMN SET untouched,
+#: so consuming it is a decision and not a skip: table constraints (named or not),
+#: attribute changes on an EXISTING column, constraint validation, RLS / trigger /
+#: rule toggles, ownership, storage parameters, clustering, replica identity,
+#: inheritance and partitions. Every command that matches NEITHER this nor
+#: ``_ALTER_TABLE_VERB`` is reported in ``_Schema.problems`` — the reason this arm
+#: exists is that 68 of the corpus's 133 ``ALTER TABLE`` statements are this kind,
+#: and a blanket "no column verb ⇒ problem" would have reddened the live gate.
+#: Each constraint keyword ends at a ``\b``, because the short ``ADD <name> <type>``
+#: form makes them prefixes of real column names: ``ADD likes integer`` must stay a
+#: column, not be eaten as ``ADD LIKE``.
+_ALTER_TABLE_NOT_COLUMN = re.compile(
+    r"(?:ADD\s+CONSTRAINT\b"
+    rf"|ADD\s+(?:PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE|CHECK|EXCLUDE|LIKE)\b"
+    r"|DROP\s+CONSTRAINT\b"
+    rf"|ALTER\s+(?:COLUMN\s+)?{_IDENT}"
+    r"|VALIDATE\s+CONSTRAINT\b"
+    r"|(?:ENABLE|DISABLE)\s+(?:(?:REPLICA|ALWAYS)\s+)?"
+    r"(?:ROW\s+LEVEL\s+SECURITY|TRIGGER|RULE)"
+    r"|(?:NO\s+)?FORCE\s+ROW\s+LEVEL\s+SECURITY\b"
+    r"|OWNER\s+TO\b"
+    r"|(?:SET|RESET)\b"
+    r"|CLUSTER\s+ON\b"
+    r"|REPLICA\s+IDENTITY\b"
+    r"|(?:NO\s+)?INHERIT\b"
+    r"|(?:ATTACH|DETACH)\s+PARTITION\b)", re.IGNORECASE)
 #: ``DROP TABLE`` takes a TARGET LIST (``DROP TABLE IF EXISTS a, b`` drops both), so
 #: the whole list is captured and split; the single-identifier form matched only
 #: the first table and left every later table's columns reading as present.
@@ -443,8 +490,11 @@ class _Schema:
     longer has reading as present — the stale-declaration fail-open.
 
     ``problems`` carries what the replay could NOT read (an unlexable corpus, an
-    unreadable ``DROP TABLE`` target). ``check_ledger`` reports each as drift, so a
-    statement the replay skipped is never a statement that passed.
+    unreadable ``DROP TABLE`` target, an ``ALTER TABLE`` command that is neither a
+    column verb nor a known non-column verb). ``check_ledger`` reports each as
+    drift, so a statement the replay skipped is never a statement that passed.
+    "Known non-column" is a DECISION (``_ALTER_TABLE_NOT_COLUMN``), not a fallback:
+    an unrecognised command is a problem, so a future verb cannot go silent.
     """
 
     columns: dict[str, set[str]]
@@ -498,7 +548,25 @@ def _effective_schema(sql: str) -> _Schema:
             continue
         table = _table_name(alter_table.group(1))
         cols = columns.setdefault(table, set())
-        for verb in _ALTER_TABLE_VERB.finditer(alter_table.group(2)):
+        for raw_command in _split_top_level(alter_table.group(2)):
+            command = raw_command.strip()
+            if not command:
+                continue
+            # A command that touches no column is CONSUMED deliberately, before the
+            # optional-``COLUMN`` verb scan can read a table constraint as a column
+            # (``ADD PRIMARY KEY (org_id)`` names no column ``primary``).
+            if _ALTER_TABLE_NOT_COLUMN.match(command):
+                continue
+            verb = _ALTER_TABLE_VERB.match(command)
+            if not verb:
+                # Neither a column verb nor a known non-column one: the replay did
+                # NOT read it, so it is a problem — an ALTER TABLE that matches no
+                # alternative used to apply nothing and report nothing, leaving a
+                # stale declaration green about a column the schema no longer has.
+                problems.append(
+                    f"ALTER TABLE {table}: command {command!r} cannot be read — "
+                    "the columns it changes are not tracked")
+                continue
             renamed_from, renamed_to, new_table, dropped, added = verb.groups()
             if renamed_from:
                 cols.discard(_table_name(renamed_from))

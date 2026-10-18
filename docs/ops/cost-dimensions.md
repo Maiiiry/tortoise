@@ -77,13 +77,21 @@ declares the limit instead of inventing one.
    state — every command in a multi-command `ALTER TABLE`, not only the first, and
    **every** table of a multi-target `DROP TABLE a, b` — which is
    how this repo renames things (`20260915000001_tenancy_team_to_org.sql` appends the
-   rename and leaves the earlier files' historical `team` spelling untouched). Nothing is
+   rename and leaves the earlier files' historical `team` spelling untouched). The
+   `COLUMN` keyword is **optional** in all three column verbs (`DROP [COLUMN] c`,
+   `ADD [COLUMN] c <type>`, `RENAME [COLUMN] c TO d`), so the short spelling moves the
+   end state too; a command that touches no column (`ADD [CONSTRAINT | PRIMARY KEY |
+   FOREIGN KEY | UNIQUE | CHECK | EXCLUDE | LIKE]`, `DROP CONSTRAINT`, `ALTER [COLUMN]
+   c …`, RLS / trigger / rule toggles, `OWNER TO`, `SET`/`RESET`, `CLUSTER ON`,
+   `REPLICA IDENTITY`, inheritance, partitions) is consumed deliberately, so a
+   constraint is never read as a column. Nothing is
    matched as a bare substring and nothing inside a SQL comment, so prose that names the
    old symbol does not
    pass. The comment strip is **quote-aware**, so a `--` inside a string literal
    (`COMMENT ON … IS 'a -- b'`) is data and cannot swallow the DDL that follows it; and an
-   input the replay cannot read (unterminated literal, body or block comment) is reported
-   as drift rather than silently skipped. **Declared delay:** a PR that edits only a migration outside the metering set does
+   input the replay cannot read (unterminated literal, body or block comment, an
+   `ALTER TABLE` command that is neither a column verb nor a known non-column one) is
+   reported as drift rather than silently skipped. **Declared delay:** a PR that edits only a migration outside the metering set does
    not select this test (the diff selector does not map `supabase/` to a surface), so such a
    drift is caught by the next `core`/`api` PR rather than by the migration PR itself.
 3. **no dead hook** — a dimension's writer must be referenced from a tracked **non-test**
