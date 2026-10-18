@@ -416,7 +416,11 @@ emit_codex_agents_block() {
   local ms="<!-- tortoise:start -->"
   local me="<!-- tortoise:end -->"
   local tmpdir block pre post target staged
-  tmpdir="$(mktemp -d)" || return 1
+  tmpdir="$(mktemp -d)" || {
+    echo "  ✗ AGENTS.md — could not create a scratch directory — nothing was changed" >&2
+    echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
+    exit 3
+  }
   block="$tmpdir/block"; pre="$tmpdir/pre"; post="$tmpdir/post"
   # ── PRE-STATE: read BEFORE anything is written (after the write the file
   # always looks current). The decision uses the SAME line-anchored test the
@@ -482,7 +486,7 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
     # documentation and then dumped a duplicate block outside any marker: the
     # state said "paired" while the writers latched onto the FIRST anchored
     # markers in the file, which were the example's.
-    state="$(awk -v ms="$ms" -v me="$me" -v msws="$ms_ws" -v mews="$me_ws" \
+    state="$(LC_ALL=C awk -v ms="$ms" -v me="$me" -v msws="$ms_ws" -v mews="$me_ws" \
                  -v msre="$ms_re" -v mere="$me_re" '
       # NEAR: the marker ALONE on the line once whitespace/BOM is stripped, but
       # not matching the anchored form (indented, trailing space, BOM).
@@ -491,7 +495,10 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         if (p == 0) return 0
         pre = substr(line, 1, p - 1); post = substr(line, p + length(m))
         gsub(/[ \t\r]/, "", pre); gsub(/[ \t\r]/, "", post)
-        gsub(/\357\273\277/, "", pre)
+        # Strip the UTF-8 BOM as BYTES: under a UTF-8 locale `\357` is the
+        # CHARACTER U+00EF, so the escape-based strip silently did nothing and the
+        # documented "BOM-prefixed" cause could never print.
+        if (substr(pre, 1, 3) == sprintf("%c%c%c", 239, 187, 191)) pre = substr(pre, 4)
         return (pre == "" && post == "")
       }
       # MANGLED: a marker with different INTERNAL spacing and nothing else on the
@@ -500,18 +507,22 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
       function classify(line, nr,   sw) {
         if (line ~ msre) { starts++; if (!startline) startline = nr; return }
         if (line ~ mere) { ends++;   if (!endline)   endline   = nr; return }
-        if (near(line, ms)) { nearstart++; if (!nearstartline) nearstartline = nr; return }
-        if (near(line, me)) { nearend++;   if (!nearendline)   nearendline   = nr; return }
+        if (near(line, ms)) { nearstart++; return }
+        if (near(line, me)) { nearend++;   return }
         sw = stripped(line)
-        if (sw != "" && sw == msws) { mangledstart++; if (!mangledstartline) mangledstartline = nr }
-        else if (sw != "" && sw == mews) { mangledend++; if (!mangledendline) mangledendline = nr }
+        if (sw != "" && sw == msws) mangledstart++
+        else if (sw != "" && sw == mews) mangledend++
       }
       BEGIN { starts = ends = nearstart = nearend = mangledstart = mangledend = 0; fence = 0 }
       { lines[NR] = $0 }
       # A FENCED CODE BLOCK is an example, not content: a repo whose AGENTS.md
       # documents the markers must not be refused for it, and its fence must not
-      # be mistaken for the block.
-      /^[ \t]*```/ { fence = !fence; next }
+      # be mistaken for the block. The lines of a CLOSED fence are remembered as
+      # such, because the unclosed-fence fallback below must not reconsider them.
+      /^[ \t]*```/ {
+        if (fence) { for (i = fstart; i < NR; i++) closed[i] = 1 } else { fstart = NR }
+        fence = !fence; next
+      }
       fence { next }
       { classify($0, NR) }
       END {
@@ -519,11 +530,20 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         # markers" means APPEND — one more copy per run. Fall back to the
         # fence-blind pass (the pre-#3429 behaviour, which replaced the real
         # block correctly) instead of treating an unterminated fence as content.
+        # Recount ONLY the lines the fence pass skipped and never revisited: those
+        # inside the fence that is still open. A properly CLOSED fence stays
+        # skipped — recounting the whole file treated a documented example as the
+        # block, replacing it (measured), or hard-refused a file with no duplicate
+        # at all while advising the user to delete their documentation.
         if (fence) {
           starts = ends = nearstart = nearend = mangledstart = mangledend = 0
           startline = endline = 0
-          for (i = 1; i <= NR; i++) classify(lines[i], i)
+          for (i = 1; i <= NR; i++) if (!closed[i]) classify(lines[i], i)
         }
+        # ONE clean pair wins even if OTHER lines carry near/mangled markers: they
+        # are outside its window, so the split preserves them verbatim. Refusing
+        # them treated a 4-space-indented documentation example (CommonMark allows
+        # that as a code block too) as a "duplicate" and its remedy deleted it.
         if (starts == 1 && ends == 1 && startline < endline) {
           printf "paired|1|%d|1|%d|0|0|0|0\n", startline, endline; exit
         }
@@ -615,7 +635,14 @@ EOF
     # In-place replace between the markers — never touches content outside them.
     : > "$pre" || _emit_fail "could not prepare the rewrite — nothing was changed"
     : > "$post" || _emit_fail "could not prepare the rewrite — nothing was changed"
-    awk -v s="$c_startline" -v e="$c_endline" -v pre="$pre" -v post="$post" '
+    # The map was computed from an earlier read. In this fleet AGENTS.md is exactly
+    # the kind of file another process may write, and a stale line number makes the
+    # split delete the wrong lines while every command still succeeds — so the pair
+    # is re-asserted here, in the same pass that cuts the file.
+    awk -v s="$c_startline" -v e="$c_endline" -v pre="$pre" -v post="$post" \
+        -v msre="$ms_re" -v mere="$me_re" '
+      NR == s && $0 !~ msre { print "the start marker moved while it was being rewritten" > "/dev/stderr"; exit 9 }
+      NR == e && $0 !~ mere { print "the end marker moved while it was being rewritten" > "/dev/stderr"; exit 9 }
       NR < s { print > pre }
       NR > e { print > post }' "$target" \
       || _emit_fail "could not split the file around the block — nothing was changed"
@@ -650,6 +677,7 @@ EOF
   # `-lt`/`-gt` on an out-of-range integer ERROR and fall through, which turned a
   # downgrade into "refreshed (same version…)". Anything that is not a plain
   # decimal inside int64 range is reported as not comparable, never as current.
+  local prev_cmp=""
   case "$prev_version" in
     '') prev_cmp="unversioned" ;;
     *[!0-9]*) prev_cmp="not-a-number" ;;

@@ -75,10 +75,29 @@ Mutations that turn these RED (each verified RED before merge, restored byte-exa
     then reads as "no markers" and gets a duplicate block. (Either half alone is
     enough, so the pair is defence in depth — the test pins the pair.)
 
-The marker LINE NUMBERS are the single source for the version read, the window
-extraction and the split. The window read has no independent red — a blind offset
-only makes the comparison input wrong, never the written bytes — so it is kept in
-the same shape as the split deliberately, not on the strength of a mutation.
+Cycle 5 shipped the fence skip in the counter only, and the writers were blind: a
+documented example was deleted and a duplicate block was written outside any
+marker. The fix is one map — the marker LINE NUMBERS — read by the version
+extraction, the window and the split. Cycle 6 then measured the fallback
+recounting the WHOLE file — a CLOSED fence's example was treated as the block,
+replaced, and reported as an upgrade:
+
+  * recount the whole file in the unclosed-fence fallback -> the closed-fence test
+    fails (the example inside the fence is rewritten and reported as an upgrade);
+  * strip the BOM with the locale-dependent escape, under a UTF-8 locale -> the
+    BOM test fails: ``\357`` is the CHARACTER U+00EF there, so the BOM survived
+    and the documented "BOM-prefixed" cause could never print;
+  * refuse when ANY near/mangled line exists beside one clean pair -> the
+    indented-example test fails: CommonMark's other code-block form was called a
+    duplicate and its remedy deleted it;
+  * drop the scratch-dir message                                -> the mktemp test
+    fails: the user got no cause at all;
+  * drop the pair re-assertion in the split                     -> the
+    changes-mid-rewrite test fails: a file that moves between the read and the
+    split is cut at the stale line numbers, silently.
+
+That last one is why the split re-checks itself: the map is computed from an
+earlier read, and AGENTS.md is exactly the file another process may write here.
 
 Cycle 2 also measured a version token in prose outside the block (read as
 "current") and an older installer overwriting a newer block (called an
@@ -887,3 +906,122 @@ def test_a_fenced_verbatim_copy_of_the_block_does_not_mask_a_stale_one(tmp_path)
     assert "follow the onboarding instructions at\n  https://example.invalid" not in text, (
         "the stale block was left in place")
     assert text.rstrip().endswith(END)
+
+
+def test_a_closed_fence_is_not_reconsidered_by_the_unclosed_fence_fallback(tmp_path):
+    """The fallback recounts when a fence never closes — but it must reconsider
+    only THE LINES THAT FENCE PASS SKIPPED. Recounting the whole file treated a
+    CLOSED fence's documented example as the block: it was overwritten inside the
+    fence, reported as an "upgrade" of a block that never existed."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = f"```\n{START}\n...\n{END}\n```\n"
+    agents = project / "AGENTS.md"
+    # A CLOSED example, an UNCLOSED fence far below it, and no install yet.
+    agents.write_text("Add this by hand if you like:\n" + example + "\n```bash\nnpm run build\n",
+                      encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stderr
+    text = agents.read_text(encoding="utf-8")
+    assert example in text, "the closed fenced example was rewritten by the fallback"
+    assert text.count("tortoise:block v") == 1, "expected exactly the block it created"
+
+
+def test_an_indented_example_beside_a_real_block_is_preserved(tmp_path):
+    """A 4-space-indented marker pair is CommonMark's other code block. With ONE
+    clean pair present it is documentation, not a duplicate: refusing it printed
+    "an older installer ran twice" and the remedy deleted the example."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = f"    {START}\n    ...\n    {END}\n"
+    agents = project / "AGENTS.md"
+    agents.write_text("# Docs\n\n" + example + "\n" + LEGACY_BLOCK, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, (
+        f"an indented EXAMPLE beside one clean pair is documentation:\n{done.stderr}")
+    text = agents.read_text(encoding="utf-8")
+    assert example in text, "the indented example was eaten"
+    assert text.rstrip().endswith(END)
+    assert "https://example.invalid" not in text, "the real block was not upgraded"
+
+
+def test_a_bom_prefixed_marker_is_diagnosed_as_such(tmp_path):
+    """`gsub(/\\357\\273\\277/)` is locale-dependent: under UTF-8 those escapes are
+    CHARACTERS, so the BOM survived, near() never matched, and the documented
+    "BOM-prefixed" cause could never print."""
+    bom = b"\xef\xbb\xbf"
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_bytes(bom + START.encode() + b"\nstale\n" + END.encode() + b"\n")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "MALFORMED" in done.stderr, done.stderr
+    assert "BOM-prefixed" in done.stderr, (
+        f"the BOM cause is documented but was not diagnosed:\n{done.stderr}")
+
+
+def test_a_scratch_dir_failure_reports_a_cause(tmp_path):
+    """`tmpdir=$(mktemp -d) || return 1` gave the user no cause at all."""
+    # Fail ONLY for `mktemp -d` (the block writer's scratch dir); the same
+    # command stages the skill payloads, and a blanket failure would test that
+    # path instead of this one.
+    stub = "#!/bin/sh\ncase \"$1\" in -d) exit 1 ;; esac\nexec /usr/bin/mktemp \"$@\"\n"
+    done, _ = _install_with_stub(tmp_path, "mktemp", stub, LEGACY_BLOCK)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "scratch directory" in done.stderr, (
+        f"a failure with no cause is not a diagnosis:\n{done.stderr}")
+
+
+def test_a_file_that_changes_mid_rewrite_is_not_half_written(tmp_path):
+    """The marker line numbers are computed from an earlier read and the file is
+    re-opened three times afterwards. In this fleet AGENTS.md is exactly the kind
+    of file another process writes, and a stale line number makes the split cut
+    the WRONG lines while every command still exits 0. The split re-asserts the
+    pair it is cutting; a `cmp` stub moves the end marker to prove it."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    agents = project / "AGENTS.md"
+    agents.write_text(LEGACY_BLOCK, encoding="utf-8")
+    before = agents.read_text(encoding="utf-8")
+
+    # `cmp` runs BETWEEN the state read and the split. Make it a hostile writer.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "cmp").write_text(
+        "#!/bin/sh\nperl -pi -e 's/tortoise:end/tortoise:ENDED/' AGENTS.md\nexit 1\n", encoding="utf-8")
+    (bindir / "cmp").chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    done = subprocess.run(["bash", str(installer), "--harness", "codex"],
+                          cwd=str(project), env=env, capture_output=True, text=True, timeout=300)
+
+    assert done.returncode == 3, f"a moved marker must fail closed:\n{done.stdout}"
+    assert "moved while it was being rewritten" in done.stderr, done.stderr
+    assert "✓ AGENTS.md" not in done.stdout, done.stdout
+    # The block was NOT replaced: only the stubbed mutation is present.
+    assert "tortoise:block v" not in agents.read_text(encoding="utf-8")
+    assert before.replace("tortoise:end", "tortoise:ENDED") == agents.read_text(encoding="utf-8")

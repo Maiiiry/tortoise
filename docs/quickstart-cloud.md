@@ -114,8 +114,9 @@ curl -fsSL https://app.premiselabs.co/install-tortoise-skills.sh | bash -s -- --
 ```
 
 It replaces only what sits between its own `<!-- tortoise:start -->` / `<!-- tortoise:end -->` markers — **one
-well-formed pair** — so anything you wrote around them is untouched. It prints which block version you ended up
-on, and what it did to get there:
+well-formed pair** — so the text you wrote around them is kept as written (two line-level caveats: a final line
+with no newline gains one, and a CRLF file gets the block's own line endings, so a mixed-ending file stays mixed).
+It prints which block version you ended up on, and what it did to get there:
 
 | it prints | it means |
 |---|---|
