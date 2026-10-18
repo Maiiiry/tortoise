@@ -23824,6 +23824,50 @@ class TortoiseSDK:
         # drop sub-relevance near neighbours.
         _vector_floor = _resolve_vector_min_similarity()
         _floored_legs: set[str] = set()
+        # ── #8488: the in-process Okapi BM25 lexical arm ────────────────────
+        # Gated OFF by default (``TORTOISE_BM25_LEXICAL``, fail-safe — the same
+        # posture as every other lever here) because swapping the lexical
+        # SCORER is a retrieval-behaviour change and #8486 has produced no
+        # baseline to measure it against yet.
+        #
+        # What it swaps. The graph-side lexical leg is scored by the graph's
+        # fulltext scorer, which on the embedded lane gives a rare term exactly
+        # the weight a ubiquitous one gets and ignores document length
+        # (measured: tortoise/bm25.py's module docstring). BM25 supplies idf,
+        # term-frequency saturation and length normalisation. The arm runs in
+        # the LEXICAL SLOT: when it produces rows they REPLACE the shipped
+        # leg's list for this read, so the lexical signal is fused once, never
+        # twice (two lexical legs would outvote the dense leg by construction —
+        # the #7704 shape).
+        #
+        # Bounds. (a) embedded lane only (the lane the measurement covers, and
+        # the only one where a corpus scan is already the design);
+        # (b) entity families the leg can actually serve (BM25_ENTITY_TYPES);
+        # (c) an arm that finds nothing leaves the shipped leg's rows EXACTLY as
+        # they were — never an empty lexical slot (fail-safe, tested);
+        # (d) it stands down when the #4028 relevance floor emptied the vector
+        # leg, because that empty answer is the read's declared result;
+        # (e) its fusion weight goes through ``clamp_lexical_fusion_weight``.
+        #
+        # The shipped leg is NOT suppressed: it runs in the chain as it always
+        # does, in parallel and inside the deadline, so the fallback costs no
+        # extra latency and the lexical slot is metered exactly once.
+        #
+        # Trace shape when the arm runs: the chain's entries keep
+        # ``degradation_chain``'s fixed order (fts, vector, structural), and the
+        # arm appends ONE further entry for the same ``fts`` leg AFTER them —
+        # because that is when it ran. The two entries are not a duplicate
+        # claim: the chain's entry has no ``mechanism`` key (the shipped
+        # scorer's rows), the arm's carries ``mechanism="bm25"``. Only the
+        # arm's rows are fused.
+        _bm25_lexical = False
+        if (query and query.strip() and is_embedded and not is_full_scan
+                and strategies.get("fts")):
+            from tortoise.search_engine import BM25_ENTITY_TYPES
+
+            from .bm25 import bm25_enabled
+            _bm25_lexical = (entity_type in BM25_ENTITY_TYPES
+                             and bm25_enabled())
         raw_results = degradation_chain(
             graph, query, struct_kind, query_vec, strategies,
             entity_type=entity_type, limit=str_limit,
@@ -23850,6 +23894,37 @@ class TortoiseSDK:
                 if leg_trace is not None and query_vec is not None
                 and expanded_kinds else None),
         )
+
+        if _bm25_lexical and "vector" not in _floored_legs:
+            # #8488: re-score the lexical slot in-process. Bounded by
+            # DEFAULT_BM25_CORPUS_CAP (see run_bm25_query), and it returns []
+            # on ANY failure — in which case ``raw_results["fts"]`` keeps the
+            # shipped leg's rows untouched, so enabling the arm can never leave
+            # the read with a lexically weaker pool than it had before.
+            # ``meter=False``: the shipped leg already counted the lexical
+            # slot in the tally; this is the same slot scored differently, not
+            # a second leg.
+            from tortoise.search_engine import run_bm25_query
+            _bm25_hits = run_bm25_query(
+                graph, query, entity_type=entity_type, limit=str_limit,
+                timeout_ms=int(_elevated_timeout_ms or 500),
+                excluded_statuses=() if include_terminal else None,
+                leg_trace=status_trace,
+                keep_numeric=keep_numeric,
+                meter=False,
+            )
+            if _bm25_hits:
+                # Ordering: this replaces the key IN PLACE when the shipped
+                # leg contributed rows (dict assignment to an existing key
+                # keeps its position), and appends it when the shipped leg
+                # contributed nothing (degradation_chain only stores non-empty
+                # legs) — so the #2952 fixed order is preserved in the first
+                # case and is not in the second. Neither matters to the fused
+                # result: ``rrf_fusion`` sums over legs keyed by
+                # ``strategy_names`` built from the same dict, so leg order is
+                # not load-bearing. Kept as a plain assignment for that
+                # reason, not because order is guaranteed.
+                raw_results["fts"] = _bm25_hits
 
         if not raw_results:
             # #4028: the vector leg RAN and the relevance floor removed every
@@ -24047,6 +24122,14 @@ class TortoiseSDK:
                         fusion_weights = _json.loads(_fw)
                     except (ValueError, TypeError):
                         fusion_weights = {"vector": 1.5}
+            if _bm25_lexical:
+                # #8488: the lexical leg's weight is BOUNDED below the dense
+                # leg's (tortoise/bm25.py — #7704 / #1657). A no-op for the
+                # recorded production default; it removes only an unbounded
+                # override, which would let the lexical leg decide a fused
+                # order by itself.
+                from tortoise.search_engine import clamp_lexical_fusion_weight
+                fusion_weights = clamp_lexical_fusion_weight(fusion_weights)
             fused = rrf_fusion(
                 ranked_lists,
                 strategy_names=list(raw_results.keys()),
