@@ -1063,10 +1063,12 @@ def write_tolerated_cleanup_report(
                     by_path[str(entry["path"])] = entry
         except (OSError, ValueError, AttributeError, TypeError):
             pass  # no prior artifact, or an unreadable/garbled one — start fresh
-        payload: dict[str, object] = {
-            "tolerated_cleanup_leaks": [
-                by_path[path] for path in sorted(by_path)],
-        }
+        # #8746 review r6 P3: `tolerated_cleanup_leaks` has ONE writer — the
+        # assignment after the section loop, which folds this session's own
+        # tolerated leaks into `by_path` first. The earlier assignment here
+        # duplicated the key from a `by_path` that the loop had not yet
+        # completed, and was never read (the later write always superseded it).
+        payload: dict[str, object] = {}
         for section, entries in extra.items():
             by_key: dict[str, dict[str, object]] = {}
             for entry in prior.get(section, []) if isinstance(prior, dict) else []:

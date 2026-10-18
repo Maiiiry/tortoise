@@ -1509,9 +1509,11 @@ surfaces:
   # mechanism (its excludes-list is stated in `cypher_guard._guard_numeric_params`).
   # Pure-unit guard: needs no DB or network, exactly like the file above it.
   - test_7174_param_boundary_numeric_guard.py
-  # #8746: the graph-delete refusal artifact — the writer's contract plus the
-  # pin that every suite-session job DUMPS it. Hermetic (YAML read + a fake
-  # projection), exactly like the file below it.
+  # #8746: the graph-delete refusal record's WRITER contract — how its section
+  # merges into `tempdir-hygiene-end.json`, plus the conftest wiring that feeds
+  # it. Hermetic (ast/json only + a fake projection); the pin that every
+  # suite-session job DUMPS the artifact is
+  # tests/test_tmpdir_hygiene.py::test_suite_jobs_surface_the_tolerated_leak.
   - test_graph_delete_hygiene_report.py
   - test_graph_name_ownership.py
   # #5331: the graph byte meter (tortoise/graph_storage.py + the metering/

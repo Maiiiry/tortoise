@@ -2161,8 +2161,12 @@ def test_drop_test_graph_refuses_the_shared_uri_default_graph(monkeypatch):
     sweep owns it. Without the explicit arm, a fixture that resolved the shared
     graph by mistake would delete the job's own graph.
     """
+    # #6673: build the URI through tests/_live_utils — the docker lane's
+    # service port is EPHEMERAL, so a hand-written :6379 would prove the arm
+    # against a dead port. Only the GRAPH PATH is the input here and it is
+    # parsed, never dialled (`_FakeProj.db` records calls; it is not a client).
     monkeypatch.setenv("TORTOISE_DB_URI",
-                       "docker://:falkordb@localhost:6379/tortoise_test_matrix")
+                       _live_utils.docker_uri("tortoise_test_matrix"))
     snapshot = _live_utils.graph_delete_events()
     try:
         proj = _FakeProj("tortoise_test_matrix")
