@@ -83,10 +83,14 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # node.<id> ASC`` tie-break (#3019) hands the lower-ULID twin rank 0.  RRF is
 # rank-based (``1/(k + rank + 1)``), so the post-fusion min-max normalization
 # converts that ONE-rank difference into a relevance gap that grows as the
-# pool shrinks — measured on the shipped hybrid path: 0.0188 of final score on
-# the 4-row E2E-1 fixture (just above the 0.0175 boost, so the contested twin
-# ranks BELOW its twin), 0.4825 on a 3-row pool (there the twins occupy both
-# ends of the normalization span).  The guarantee therefore holds
+# pool shrinks — measured on the shipped hybrid path, as the RELEVANCE gap the
+# boost must clear (so the comparison with the 0.0175 boost effect is
+# like-for-like): 0.0188 of final score on the 4-row E2E-1 fixture (just above
+# the 0.0175 boost, so the contested twin ranks BELOW its twin), 0.5 on a
+# 3-row pool (there the twins occupy both ends of the normalization span; the
+# final-score residual once the shipped boost is applied is 0.5 - 0.0175 =
+# 0.4825, which is the delta a reader sees in the payload).  The guarantee
+# therefore holds
 # on a SINGLE-LEG read (where both twins score identically and the boost is
 # the sole differentiator), and on a fused read only while the fused relevance
 # delta stays under the boost effect.  Sizing the boost, changing the fusion

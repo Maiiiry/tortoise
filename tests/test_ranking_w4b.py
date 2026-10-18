@@ -755,9 +755,21 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     two_req, two_hot, two_calm, two_ids = required_cb(two_row)
     two_gb_calm, two_gb_hot = baseline_graph_boost(two_row)
     assert len(two_ids) == 2
-    # The whole normalization span is consumed, the contested twin at the 0
-    # end — the end the boost has to lift.
-    assert (two_calm["similarity"], two_hot["similarity"]) == (1.0, 0.0)
+    # The whole normalization span is consumed (order-free: that is the bound).
+    assert {two_hot["similarity"], two_calm["similarity"]} == {0.0, 1.0}
+    # …and the CONTESTED twin must be the 0 end — the end the boost has to lift.
+    # That is a FIXTURE premise, not a claim about the ranker: #3019's per-leg
+    # ``ORDER BY score, id ASC`` hands rank 0 to the lower-ULID twin, so the
+    # mint order in ``_seed_twin_conflict`` decides which twin lands at 0.  A
+    # same-millisecond ULID collision can flip it; if this fires, regenerate
+    # the fixture rather than re-deriving the comment's 1.4286.
+    assert two_hot["similarity"] == 0.0, (
+        f"FIXTURE PREMISE BROKEN: the contested twin must sit at the 0 end of "
+        f"the normalization span (it has {two_hot['similarity']}, calm has "
+        f"{two_calm['similarity']}). #3019's tie-break mints the lower-ULID "
+        f"twin at rank 0, so the twins' mint order flipped — the page still "
+        f"spans {{0,1}}, but this fixture no longer measures the comment's "
+        f"1.4286 requirement")
 
     # ── The PREMISE the quoted 1.4286 rests on, asserted BY NAME ──────────
     # ``floor``/``ceiling`` below drop the ``graph_w * Δgb`` term, which is the
@@ -819,12 +831,21 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # past the clamp and the ordering still loses, the graph term pinned.
     with monkeypatch.context() as patched:
         patched.setattr("tortoise.ranking.W4_CONTESTED_BOOST", 2.0)
-        _req, huge_hot, _c, huge_ids = required_cb(two_row)
+        _req, huge_hot, huge_calm, huge_ids = required_cb(two_row)
     assert huge_hot["w4_contested_boost"] == 2.0, "the bigger boost did not apply"
     assert huge_hot["graph_boost"] == 1.0, (
         f"the documented [0,1] clamp must bind: graph_boost="
         f"{huge_hot['graph_boost']} — if it no longer does, a large cb DOES "
         f"reach the smallest pages and the comment's blocker analysis is stale")
+    # The comment quotes this run's two finals (0.5000 vs 0.8950): pin them, so
+    # a shift in the clamp, the recency term or the fixture fails here rather
+    # than leaving the quoted pair unpinned.
+    assert huge_hot["final_score"] == pytest.approx(0.5000, abs=2e-3), (
+        f"the comment quotes the contested twin's 2-row final as 0.5000 when "
+        f"cb=2.0 pins the graph term; this run gives {huge_hot['final_score']}")
+    assert huge_calm["final_score"] == pytest.approx(0.8950, abs=2e-3), (
+        f"the comment quotes the calm twin's 2-row final as 0.8950; this run "
+        f"gives {huge_calm['final_score']}")
     assert huge_ids.index(calm) < huge_ids.index(hot), (
         "cb=2.0 must still leave the contested twin second on a 2-row page: "
         "that loss is the CLAMP, not an unreachable magnitude")
@@ -849,17 +870,27 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         [dict(r) for r in res3])
     assert {hot, calm} <= set(three_ids), (
         f"the 3-row page must hold both twins: {three_ids}")
-    assert (three_calm["similarity"], three_hot["similarity"]) == (1.0, 0.0), (
-        f"the comment says a 3-row page still spans the twins (1.4286); this "
-        f"one gives calm {three_calm['similarity']} / hot "
-        f"{three_hot['similarity']}")
+    assert {three_calm["similarity"], three_hot["similarity"]} == {0.0, 1.0}
+    assert three_hot["similarity"] == 0.0, (
+        f"FIXTURE PREMISE BROKEN (see the 2-row note above): the contested "
+        f"twin must sit at the 0 end of the span; here calm "
+        f"{three_calm['similarity']} / hot {three_hot['similarity']}")
     assert three_req == pytest.approx(1.4286, abs=5e-3), (
         f"the comment quotes 1.4286 at limit=3; this page requires "
         f"{three_req:.4f}")
+    # The comment quotes this pool's gap on the RELEVANCE basis — what the boost
+    # has to clear, like the 0.0188 beside it — and (parenthetically) the
+    # residual a reader sees in the payload once the shipped boost applies.
+    # 0.5 / 0.35 also reconciles with the 1.4286 above; a post-boost figure
+    # quoted alone would not (0.4825 / 0.35 = 1.3786).
+    three_gap = three_req * DEFAULT_GRAPH_BOOST_WEIGHT
+    assert three_gap == pytest.approx(0.5, abs=2e-3), (
+        f"the comment quotes a 0.5 relevance gap on the 3-row pool; this page "
+        f"measures {three_gap:.4f}")
     assert (three_calm["final_score"] - three_hot["final_score"]) == (
-        pytest.approx(0.4825, abs=2e-3)), (
-        f"the comment quotes the 3-row pool's relevance gap as 0.4825 of "
-        f"final score; this page measures "
+        pytest.approx(three_gap - contrib, abs=2e-3)), (
+        f"the 3-row residual must be the gap minus the applied boost "
+        f"({three_gap - contrib:.4f}); this page shows "
         f"{three_calm['final_score'] - three_hot['final_score']:.4f}")
 
     # ── Remedy (2)'s actionable half: the raise is RUN, not inferred ──────
