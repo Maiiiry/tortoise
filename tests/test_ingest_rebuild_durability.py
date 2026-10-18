@@ -266,7 +266,7 @@ def test_a10_object_object_direct_edge_survives_rebuild(a10):
     of :Point/:Subject/:Object/:Event, so the replay must resolve each
     endpoint by an id-anchored per-label sweep — a :Point-hardcoded fold would
     silently drop every Object↔Object edge (the defect the repoint leg's
-    direct branch still carries)."""
+    direct branch carried until #8622 widened it)."""
     _, events, sdk = a10
     oa = sdk.create_object("Widget A", "product")["id"]
     ob = sdk.create_object("Widget B", "product")["id"]

@@ -640,6 +640,92 @@ class TestBlastRadius:
         assert any(t == old for _, t in kept), kept
         assert preview["edges_dropped"], "the successor self-edge must be delete-only"
 
+    @pytest.mark.parametrize("rel,direction,make_endpoint", [
+        # (old)-[:IMPL]->(object) — the PR #8622 headline shape
+        ("IMPL", "out", lambda sdk: sdk.create_object("Widget", "product")["id"]),
+        # (object)-[:NAND]->(old) — the inbound leg, so the descriptor's SRC is
+        # the non-Point endpoint (the direction a src-only widening would miss)
+        ("NAND", "in", lambda sdk: sdk.create_object("Widget", "product")["id"]),
+        # (subject)-[:IMPL]->(old) — the other non-Point carrier
+        ("IMPL", "in", lambda sdk: sdk.create_subject("Acme")["id"]),
+    ], ids=["point-to-object", "object-to-point", "subject-to-point"])
+    def test_supersede_preview_transfers_a_non_point_direct_edge(
+            self, sdk, rel, direction, make_endpoint):
+        """#8622: the writer's 2a-DIRECT transfer is label-agnostic (#7902 /
+        owner ruling #7813), so a direct IMPL/NAND whose far endpoint carries
+        `:Subject`/`:Object`/`:Event` IS repointed at the successor.
+
+        The preview modelled the PRE-fix `:Point`-hardcoded MERGE, so it filed
+        those edges under `edges_dropped` ("the repoint MERGE matches
+        nothing") and omitted them from `edges` / `edges_created_at_new` while
+        the writer created them — the tool whose whole contract is "preview the
+        write" asserted a data loss that does not happen.
+
+        Red before the fix: the pre-fix preview put the edge in
+        `edges_dropped` and reported `edges_created_at_new == 0` for a write
+        that adds exactly one edge at the successor. The count-parity
+        differential above stayed green through the whole defect because
+        `edges_transferred_from_old` counts dropped rows too — which is why this
+        test pins the BLAST RADIUS (`edges_dropped`, `edges_created_at_new`,
+        `edges`) and the graph itself, not just the transferred count.
+        """
+        old, new = _seed_point(sdk, "old"), _seed_point(sdk, "new")
+        other = make_endpoint(sdk)
+        if direction == "out":
+            sdk.create_direct_edge(rel, old, other, label="related-to")
+        else:
+            sdk.create_direct_edge(rel, other, old, label="related-to")
+
+        from tortoise.mcp_server import _preview_supersede
+
+        before = _edge_keys_at(sdk, new)
+        preview = _preview_supersede(sdk, old, new)
+        real = sdk.supersede(old, new)
+        net_new = _edge_keys_at(sdk, new) - before
+
+        # 1. the transfer is NOT a drop — pre-fix this list held the edge.
+        assert preview["edges_dropped"] == [], (
+            "the preview reports a non-Point direct edge as destroyed, but the "
+            f"writer transfers it (#8622): {preview['edges_dropped']}")
+        # 2. the blast radius the preview reports IS the blast radius the write
+        #    has: one net-new edge at the successor, carrying the same attrs.
+        assert len(net_new) == 1, net_new
+        assert preview["edges_created_at_new"] == len(net_new) == 1, (
+            f"preview said {preview['edges_created_at_new']} net-new edges, "
+            f"the graph gained {len(net_new)}")
+        assert preview["edges_already_present_at_new"] == 0, preview
+        expected_edge = ({"type": rel, "from": new, "to": other}
+                         if direction == "out" else
+                         {"type": rel, "from": other, "to": new})
+        assert preview["edges"] == [expected_edge], preview["edges"]
+        # 3. and the old side is booked exactly as the writer books it.
+        assert preview["edges_transferred_from_old"] == real["edges_transferred"]
+        # 4. the writer really landed the edge on the successor (the preview is
+        #    not "right" because the whole write no-opped).
+        assert _edge_keys_at(sdk, new) - before == net_new
+
+    def test_supersede_preview_still_drops_a_non_epistemic_far_endpoint(self, sdk):
+        """Complement of the case above: the widened branch must NOT swallow a
+        far endpoint that carries none of the four epistemic labels. The writer
+        resolves its label, finds none, cannot anchor the repoint MERGE and —
+        unchanged from pre-#8622 — still deletes the old edge, so the preview's
+        `edges_dropped` is the honest report there (and is the one shape the
+        old `\":Point\" not in labels` test still described correctly)."""
+        old, new = _seed_point(sdk, "old"), _seed_point(sdk, "new")
+        sdk._get_proj().g.query(
+            "MATCH (o:Point {id:$o}) "
+            "CREATE (raw:RawFragment {id:'raw-frag-1'}) "
+            "CREATE (o)-[:IMPL]->(raw)",
+            params={"o": old})
+
+        from tortoise.mcp_server import _preview_supersede
+
+        preview = _preview_supersede(sdk, old, new)
+        assert [d["type"] for d in preview["edges_dropped"]] == ["IMPL"], preview
+        assert "none of" in preview["edges_dropped"][0]["reason"], preview
+        assert preview["edges_created_at_new"] == 0, preview
+        assert preview["edges"] == [], preview["edges"]
+
     def test_supersede_preview_is_null_idx_safe_for_a_mitigation(self, sdk):
         """#6180 P1: `mitigate_operator` writes `(op)-[:mitigated_by]->(m)`
         with NO idx, so the writer MERGEs the BARE pattern and the preview must
