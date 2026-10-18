@@ -1272,6 +1272,52 @@ def test_a_latin_anchor_matches_inside_unspaced_text(text: str) -> None:
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
 
 
+@pytest.mark.parametrize("text,anchor", [
+    ("la práctica firmada", "PR"),
+    ("a Itália assinou", "IT"),
+])
+def test_the_unspaced_fallback_does_not_fire_in_a_spaced_script(
+        text: str, anchor: str) -> None:
+    """``á``/``ê`` are Unicode word characters that are NOT ASCII ones.
+
+    An UNGATED ASCII fallback therefore matched ``PR`` inside ``práctica`` and
+    ``IT`` inside ``Itália`` — it dropped the word boundary in a spaced script and
+    inflated coverage, which is the fail-open class this boundary exists to
+    prevent. The fallback is gated on the haystack having no separator, which is
+    what "unspaced script" actually means.
+    """
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.verdict == INSUFFICIENT
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
+def test_a_partially_fetched_assembly_is_measured_over_every_row() -> None:
+    """A row that never fetched provenance is still an UNSOURCED row of the answer.
+
+    Measured over the FETCHED subset instead, a mixed assembly — one sourced Point
+    plus non-Point rows, which carry no ``provenance`` block however the flag is
+    set — reported ``1.0`` on a 25%-sourced answer. That is the same silent green,
+    produced by the measurement rather than removed by it. The denominator is every
+    row; only an assembly where NO row fetched the field is unassessed.
+    """
+    linked = SearchResult(
+        id="p1", content="ACME signed the contract", point_kind="point",
+        source_ref="u://doc-1", captured_at="2026-01-01T00:00:00Z",
+    ).to_dict()
+    unsourced = [
+        {"id": f"d{i}", "content": "ACME renewal notes", "point_kind": "document"}
+        for i in range(3)
+    ]
+    verdict = assess_sufficiency(
+        [linked, *unsourced], anchors=["ACME"],
+        required_anchor_coverage=1.0, required_provenance_coverage=0.9, resident=True)
+    assert verdict.verdict == INSUFFICIENT
+    assert verdict.reasons == (REASON_PROVENANCE_THIN,)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),
+                                (MEASURE_PROVENANCE_COVERAGE, 0.25))
+
+
 def test_a_phrase_cannot_be_stitched_across_two_entity_terms() -> None:
     """Entity names stay separate: a join manufactures mentions nobody made.
 

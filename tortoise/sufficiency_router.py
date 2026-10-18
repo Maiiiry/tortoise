@@ -592,14 +592,19 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     if bounded:
         escaped = re.escape(folded)
         pattern = re.compile(rf"(?<!\w){escaped}(?!\w)")
-        # The same boundary drawn over ASCII word characters only. An anchor from
-        # a spaced script can appear INSIDE unspaced text (`ACME` in
-        # `我们签署了ACME的合同`), where the Unicode `\w` lookarounds can never hold
-        # because the adjacent ideograph is itself a word character — the measure
-        # then reported 0.0 coverage for the row that literally answers. In such
-        # a haystack adjacency is not a word boundary, so the ASCII boundary is
-        # the correct test; it is tried only AFTER the strict one, so spaced
-        # scripts keep today's semantics.
+        # The same boundary drawn over ASCII word characters only, and tried ONLY
+        # for an UNSPACED haystack. An anchor from a spaced script can appear
+        # inside unspaced text (`ACME` in `我们签署了ACME的合同`), where the Unicode
+        # `\w` lookarounds can never hold because the adjacent ideograph is itself
+        # a word character — the measure then reported 0.0 coverage for the row
+        # that literally answers. Gating on the haystack having NO separator is
+        # what keeps the relaxation off spaced scripts: `á`/`ê` are Unicode word
+        # characters that are not ASCII ones, so an ungated fallback matched `PR`
+        # inside `práctica` and `IT` inside `Itália` — inflated coverage, the same
+        # fail-open class the boundary exists to prevent. ⚠️ Residual, stated: a
+        # haystack that is a SINGLE accented token (no separator anywhere) can
+        # still match an ASCII anchor mid-token; distinguishing that from CJK
+        # needs script detection, which is more machinery than the failure earns.
         ascii_pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.ASCII)
     for candidate in (row.text, *row.entities):
         if not candidate:
@@ -608,7 +613,9 @@ def _mentions(needle: str, row: _Evidence) -> bool:
         if pattern is not None:
             if pattern.search(haystack):
                 return True
-            if ascii_pattern is not None and ascii_pattern.search(haystack):
+            # Unspaced only: in a spaced script a letter boundary is real, and
+            # relaxing it there inflates coverage (see the gate's note above).
+            if ascii_pattern is not None and " " not in haystack and ascii_pattern.search(haystack):
                 return True
         elif folded in haystack:
             return True
@@ -735,17 +742,19 @@ def assess_sufficiency(
     # zero: a flag-off read must not be scored as insufficient evidence.
     provenance_unassessed = False
     if required_provenance_coverage is not None:
-        # The denominator is the rows whose provenance was actually FETCHED and
-        # the numerator the ones carrying a LINK. A row read with provenance on
-        # but no link measures 0.0 (evidence with no source); only a read that
-        # never fetched the field leaves the measure unassessed, because scoring
-        # that as insufficient would punish a flag rather than the evidence.
-        # ⛔ A CONFIGURED measure that could not be assessed never yields
-        # ``sufficient``: it makes the verdict undetermined instead.
+        # The NUMERATOR is the rows that carry a LINK; the DENOMINATOR is every
+        # row in the assembly. A row that never fetched provenance is still an
+        # UNSOURCED row of THIS answer, so letting it leave the denominator let a
+        # MIXED assembly (1 sourced Point + 3 non-Point rows, which carry no
+        # provenance block however the flag is set) report 1.0 on a 25%-sourced
+        # answer — the silent green this module exists to kill, produced by the
+        # measurement instead of removed by it. Only an assembly where NO row
+        # fetched the field is unassessed; scoring THAT as zero would punish a
+        # flag rather than the evidence.
         fetched = [r for r in rows if r.provenance_fetched]
         if fetched:
             linked = sum(1 for r in fetched if r.provenance is not None)
-            value = float(linked) / float(len(fetched))
+            value = float(linked) / float(len(rows))
             measures.append((MEASURE_PROVENANCE_COVERAGE, value))
             if value < required_provenance_coverage:
                 failures.append(REASON_PROVENANCE_THIN)

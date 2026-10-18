@@ -5682,7 +5682,7 @@ durations:
   test_reader_4107_advice_shape.py: 1.4  # unmeasured
   test_reader_4837_advice_battery.py: 2.6  # #4837: hermetic (no DB, no reader call) — 23 tests, measured 2.6s on this host
   test_fanout_cap.py: 0.2  # unmeasured
-  test_sufficiency_router.py: 7.5  # #5009: hermetic (no DB, no graph, no model call) — 99 tests, measured 4.5-7.8s on a quiet host and 15.9-17.5s while this box carried a 40-deep CI queue. The WEIGHT stays at the quiet-host reading on purpose: it is a packing weight, and the 17s sample measures fleet load, not the file. Refresh from the first post-merge junit sweep (`--refresh-durations` samples push-to-main runs only, so a file ADDED BY A PR has no measured value at PR time).
+  test_sufficiency_router.py: 7.5  # #5009: hermetic (no DB, no graph, no model call) — 103 tests, measured 4.5-7.8s on a quiet host and 15.9-17.5s while this box carried a 40-deep CI queue. The WEIGHT stays at the quiet-host reading on purpose: it is a packing weight, and the 17s sample measures fleet load, not the file. Refresh from the first post-merge junit sweep (`--refresh-durations` samples push-to-main runs only, so a file ADDED BY A PR has no measured value at PR time).
   test_never_across_fold_5080.py: 2.0  # unmeasured
   test_operator_alert.py: 2.3
   test_consumed_sdk_binding_3904.py: 2.0  # unmeasured — new in #3904. Without a row this file packs at the flat 2.0s default anyway, but it would count as UNCOVERED, dropping the repo-wide coverage floor (#3400) to 89.9% and redding the manifest-integrity gate. The 2.0 value is the default it would have received; it is a weight, not a measurement.
