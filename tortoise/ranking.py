@@ -101,18 +101,47 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # BELOW its twin at limit=4 (delta 0.0157) and at the shipped default limit=10
 # (delta 0.0013), and ABOVE it at limit>=40 (delta -0.0041), the gap shrinking
 # as the page grows.  On the fixture with 40 filler rows (a 44-point graph) it
-# ranks below at every limit 2..40 (+0.0056 at limit=40).  Raising the boost
-# does not repair this: the required magnitude is unbounded as the page shrinks
-# — a 2-row page normalizes the two rows to similarity 0.0 and 1.0, needing a
-# graph-boost increment > 1.43 where ``graph_boost`` is capped at 1.0 (measured
-# delta 0.4825 of final score).
+# ranks below at every limit 2..40 (+0.0056 at limit=40).  The exact page delta is
+# a property of the page's own similarity span, so filler composition moves it (a
+# 404-point variant with different filler rows measures required ``cb`` 0.0483 at
+# limit=10 — the contested twin already first); the MECHANISM is what is stable,
+# not any one fixture's number.
 #
-# Every listed remedy is blocked by a RECORDED decision, which is why this is
-# reported rather than enacted: (1) boost inside fusion = score-based fusion,
-# the open owner ruling on #4210; (2) raise the boost = unbounded (above);
+# WHAT A LARGER BOOST WOULD AND WOULD NOT BUY (#7704, corrected 2026-10-18).
+# The required increment is BOUNDED, not unbounded: ``_min_max_normalize`` maps
+# a page into [0, 1], so the gap the boost must clear is at most
+# ``similarity_weight`` (0.5) plus the ``recency_weight`` swing (0.15), and
+# ``cb > (similarity_weight * d + recency_weight * r) / graph_boost_weight``
+# therefore SATURATES at 1.857 — 1.4286 with equal recency (d = 1, r = 0).  A
+# 2-row page is that worst case because a page cannot hold fewer than the two
+# rows being ordered: it is a maximum, not the first term of a series.  Measured
+# on the bare 4-row E2E-1 fixture (dense leg live): required total ``cb``
+# 1.4286 at limit=2, 0.7257 at limit=3, 0.0537 at limit>=4 — the requirement
+# FALLS as the page grows, and the largest value it ever takes is the 2-row one.
+#   * A modest raise therefore DOES repair the shipped default read: on that
+#     fixture, ``cb`` > 0.0537 flips the limit=10 ordering (measured: cb=0.06
+#     ranks the contested twin first).  Remedy (2) is a real magnitude choice
+#     with a page-dependent, partial effect — not an impossibility.  Clearing
+#     #2102's own E2E-1 pre-assertion (relevance delta <= 0.05 in similarity
+#     space) takes ``cb > 0.5 * 0.05 / 0.35`` = 0.0714.
+#   * What no ``cb`` inside the invariant can buy is the SMALL pages: the clamp
+#     ``min(1.0, graph_boost + cb)`` grants at most ``1.0 - graph_boost`` of
+#     headroom (0.3 on that fixture, where both twins' baseline graph_boost is
+#     0.7) against the 1.4286 requirement.  Measured: cb=2.0 still ranks the
+#     contested twin second on a 2-row page (final 0.5000 vs 0.8950, its graph
+#     term pinned at the 1.0 clamp) — the CLAMP binding, not an unbounded
+#     requirement.  Covering every page with one value therefore needs the
+#     documented [0, 1] graph_boost invariant raised, which is a
+#     retrieval-semantics decision and not a tuning value.
+#
+# Every listed remedy is a PRODUCT decision, which is why this is reported
+# rather than enacted: (1) boost inside fusion = score-based fusion, the open
+# owner ruling on #4210; (2) raise the boost = a magnitude choice that repairs
+# the default page and an invariant change that repairs the small ones (above);
 # (3) tie on the contested signal = reverses #3019's id tie-break, which
 # ``temporal_leg.py`` consumes positionally; (4) restate the promise = the
-# recorded #2102 E2E-1 indicator, also the owner's.
+# recorded #2102 E2E-1 indicator, also the owner's.  Pinned by
+# ``tests/test_ranking_w4b.py::test_integration_boost_requirement_is_bounded_by_the_page``.
 W4_CONTESTED_BOOST = 0.05
 # Significant-token floor: query/counter-claim overlap needs tokens ≥ this
 # many alphanumerics (1-3 char function words and subword noise never count;

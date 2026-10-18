@@ -655,6 +655,113 @@ def test_integration_fused_path_applies_contested_boost(
         W4_CONTESTED_BOOST * 0.35, abs=2e-3)
 
 
+def test_integration_boost_requirement_is_bounded_by_the_page(
+    ranked_sdk, monkeypatch, force_embedder_on,
+):
+    """#7704 remedy (2): the required boost is BOUNDED — the CLAMP is the blocker.
+
+    The rationale comment on ``W4_CONTESTED_BOOST`` used to say the required
+    magnitude "is unbounded as the page shrinks", which is self-contradictory
+    and forecloses a legitimate remedy: ``_min_max_normalize`` maps a PAGE into
+    [0, 1] and a page cannot hold fewer than the two rows being ordered, so the
+    requirement SATURATES on a 2-row page instead of growing without bound.
+    The two consequences a reader needs are measured here, not restated:
+
+    * the requirement FALLS as the page grows — so a modest raise repairs the
+      shipped default page, and "raising the boost does not repair this" was
+      true only of the smallest pages;
+    * on a 2-row page it reaches at least ``1.0`` in graph-boost space, i.e. at
+      or above the ``min(1.0, graph_boost + cb)`` clamp — so no ``cb`` inside
+      the documented [0, 1] invariant can clear it.  Shown directly: raise
+      ``W4_CONTESTED_BOOST`` far past the clamp and the graph term pins at 1.0
+      and the ordering still loses.
+
+    Both pages are the REAL ranker over REAL rows of this fixture.  The default
+    page is the retrieved fused page; the 2-row page is the ``result_ids[:2]``
+    page the SDK hands the ranker when the twins are the whole page — built
+    from the same rows rather than queried, because which rows a 2-row fused
+    page holds is an embedder property, while the page's SIZE is what the bound
+    depends on.  Expectations are DERIVED from the payloads through the
+    ranker's own weights, so this asserts the mechanism and not a constant.
+    """
+    from tortoise.ranking import (
+        DEFAULT_GRAPH_BOOST_WEIGHT,
+        DEFAULT_RECENCY_WEIGHT,
+        DEFAULT_SIMILARITY_WEIGHT,
+    )
+
+    calm, hot, _cc = _seed_twin_conflict(
+        ranked_sdk, "zebra finch flocking behavior is social, not migratory")
+    monkeypatch.setenv("TORTOISE_W4_ENRICHMENT", "1")
+    contrib = W4_CONTESTED_BOOST * DEFAULT_GRAPH_BOOST_WEIGHT
+    query = "zebra finch migration"
+    ranker = GraphRanker(projection=ranked_sdk._get_proj())
+
+    def required_cb(rows: list[dict]) -> tuple[float, dict, dict, list[str]]:
+        """Total ``cb`` that would bring the contested twin level with its
+        twin, read off this page's payloads (strip the applied boost back
+        out — the boost is the only thing separating the twins' structure)."""
+        page = ranker.rerank(rows, query=query)
+        gr = {r["id"]: r["graph_ranking"] for r in page}
+        assert hot in gr and calm in gr, (
+            f"the twins are not both on this page: {sorted(gr)}")
+        h, c = gr[hot], gr[calm]
+        gap = c["final_score"] - (h["final_score"] - contrib)
+        return (gap / DEFAULT_GRAPH_BOOST_WEIGHT, h, c,
+                [r["id"] for r in page])
+
+    # ── The shipped default page, retrieved through the fused path ────────
+    res = ranked_sdk.tortoise_fts_query(query, limit=10, order_by="graph")
+    assert {r.get("match_source") for r in res} == {"rrf"}, (
+        "this test is about the FUSED read; it must not degrade to single-leg")
+    by_id = {r["id"]: r for r in res}
+    assert hot in by_id and calm in by_id, "FIXTURE NOT REACHED: a twin is off the page"
+    # #7704's precondition: the content-identical twins tie on EVERY leg.
+    assert ({k: by_id[calm]["scores"].get(k) for k in ("fts", "vector")}
+            == {k: by_id[hot]["scores"].get(k) for k in ("fts", "vector")})
+    two_row = [dict(by_id[hot]), dict(by_id[calm])]
+    ten_req, _th, _tc, _tids = required_cb([dict(r) for r in res])
+
+    # ── Worst case: a 2-row page (a page cannot be smaller) ───────────────
+    two_req, two_hot, two_calm, two_ids = required_cb(two_row)
+    assert len(two_ids) == 2
+    # The whole normalization span is consumed: similarities 0 and 1.
+    assert {two_hot["similarity"], two_calm["similarity"]} == {0.0, 1.0}
+    #   cb_req = (sim_w * 1 + rec_w * (r_calm - r_hot)) / graph_w
+    # so (sim_w - rec_w)/graph_w <= cb_req <= (sim_w + rec_w)/graph_w.
+    floor = (DEFAULT_SIMILARITY_WEIGHT - DEFAULT_RECENCY_WEIGHT) / DEFAULT_GRAPH_BOOST_WEIGHT
+    ceiling = (DEFAULT_SIMILARITY_WEIGHT + DEFAULT_RECENCY_WEIGHT) / DEFAULT_GRAPH_BOOST_WEIGHT
+    assert two_req >= floor - 1e-6, (
+        f"the 2-row requirement is {two_req:.4f}, below its floor {floor:.4f} "
+        f"— the derivation in W4_CONTESTED_BOOST's comment is stale")
+    assert two_req <= ceiling + 1e-6, (
+        f"the 2-row requirement is {two_req:.4f}, ABOVE its ceiling "
+        f"{ceiling:.4f} — then it is not bounded by the page after all")
+    assert two_req >= 1.0, (
+        "a 2-row page must need at least the full clamp's worth of boost")
+
+    # The blocker is the CLAMP, not unboundedness: give the boost a value far
+    # past the clamp and the ordering still loses, the graph term pinned.
+    with monkeypatch.context() as patched:
+        patched.setattr("tortoise.ranking.W4_CONTESTED_BOOST", 2.0)
+        _req, huge_hot, _c, huge_ids = required_cb(two_row)
+    assert huge_hot["w4_contested_boost"] == 2.0, "the bigger boost did not apply"
+    assert huge_hot["graph_boost"] == 1.0, (
+        f"the documented [0,1] clamp must bind: graph_boost="
+        f"{huge_hot['graph_boost']} — if it no longer does, a large cb DOES "
+        f"reach the smallest pages and the comment's blocker analysis is stale")
+    assert huge_ids.index(calm) < huge_ids.index(hot), (
+        "cb=2.0 must still leave the contested twin second on a 2-row page: "
+        "that loss is the CLAMP, not an unreachable magnitude")
+
+    # ── The requirement FALLS as the page grows (it does not rise) ────────
+    assert ten_req < two_req, (
+        f"the requirement must fall as the page grows (default page "
+        f"{ten_req:.4f} vs 2-row {two_req:.4f}); a rising requirement is what "
+        f"'unbounded' would look like, and it is what the corrected comment "
+        f"denies")
+
+
 def test_integration_w4_enrich_false_suppresses_boost_with_flag_on(ranked_sdk, monkeypatch):
     """P1 (second-model gate): w4_enrich=False must suppress the boost even
     with TORTOISE_W4_ENRICHMENT=1 — order and the why-layer keys must never
