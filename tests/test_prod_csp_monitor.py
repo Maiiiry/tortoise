@@ -311,6 +311,24 @@ def test_recovery_closes_the_ledger_without_reddening_a_healthy_run():
     assert step["continue-on-error"] is True, "bookkeeping must never red a healthy probe"
 
 
+def test_the_close_reason_claims_only_what_a_green_run_measured():
+    """`no-tag` is GREEN, so a green run cannot assert the beacon loaded everywhere.
+
+    Web Analytics switched off at the zone exits 0 (#4706 keep-or-drop is open),
+    and that same run prints `8 of 8 surface(s) carried NO injected beacon tag`.
+    A fixed `--why` asserting "every anonymous production surface loaded the
+    edge-injected beacon" therefore closes the ledger with the opposite of what
+    the run measured — and the close comment is the artifact the next lane reads.
+    """
+    run = _step(lambda s: "auto-file-issue.sh resolve" in str(s.get("run", "")))["run"]
+    assert "loaded the edge-injected beacon" not in run, (
+        "the close reason asserts a load the probe does not measure on a green no-tag run"
+    )
+    assert "no anonymous production surface reported" in run, (
+        "the close reason must state the property a green run DID measure"
+    )
+
+
 def test_both_gh_steps_use_the_actions_token():
     """The substrate REQUIRES the Actions token; a PAT files a duplicate every run.
 
@@ -339,6 +357,12 @@ NO_BEACON_CSP = "default-src 'self'; script-src 'self'; connect-src 'self'"
 PAGE = "https://app.premiselabs.co/team"
 RUM = [("POST", "https://app.premiselabs.co/cdn-cgi/rum?")]
 BEACON_SCRIPT = [("GET", "https://static.cloudflareinsights.com/beacon.min.js/v1")]
+# The console line Chrome prints for a beacon the policy really refused. This is
+# the OBSERVATION that `tag-blocked` keys on — not the policy text.
+BLOCKED_VIOLATION = [
+    "[error] Loading the script 'https://static.cloudflareinsights.com/beacon.min.js/v1' violates "
+    'the following Content Security Policy directive: "script-src \'self\'"'
+]
 
 
 def test_beacon_same_origin_is_the_healthy_verdict():
@@ -398,10 +422,70 @@ def test_no_tag_is_reported_not_failed():
 
 
 def test_a_blocked_beacon_is_not_double_counted_as_a_missing_rum():
-    """The violation scan already fails that surface; a second arm would double-count one cause."""
+    """The violation scan already fails that surface; a second arm would double-count one cause.
+
+    `tag-blocked` requires the OBSERVED refusal (the console line that names the
+    beacon script), not just a policy text that does not admit it — see the
+    fail-open test below.
+    """
+    module = _detector_module()
+    label, findings = module._beacon_verdict(
+        BEACON_SCRIPT, NO_BEACON_CSP, True, PAGE, BLOCKED_VIOLATION
+    )
+    assert (label, findings) == ("tag-blocked", [])
+
+
+def test_a_nonadmitting_policy_alone_cannot_silence_the_missing_rum_arm():
+    """FAIL-OPEN regression: `tag-blocked` must be an OBSERVATION, not a text parse.
+
+    `tag-blocked` is a non-failing label with EMPTY findings, and a beacon that
+    really loaded leaves no CSP violation to fail the surface. So answering
+    "blocked" from the policy TEXT alone turns the arm that exists for "analytics
+    lost with no console error" into a benign `OK … tag-blocked` on a run that
+    exits 0. If the surface saw the tag and the violation scan recorded NO
+    refusal, the beacon is present and unreported: that is `rum-missing`.
+    """
     module = _detector_module()
     label, findings = module._beacon_verdict(BEACON_SCRIPT, NO_BEACON_CSP, True, PAGE)
-    assert (label, findings) == ("tag-blocked", [])
+    assert label == "rum-missing", (
+        "a policy that merely LOOKS non-admitting suppressed the rum-missing arm without any "
+        "observed refusal — the fail-open path"
+    )
+    assert findings and "rum-missing" in findings[0]
+
+
+ADMIT_FORMS = (
+    "script-src 'self' https://*.cloudflareinsights.com",
+    "script-src 'self' *.cloudflareinsights.com",
+    "script-src 'self' //static.cloudflareinsights.com",
+    "script-src 'self' static.cloudflareinsights.com",
+    "script-src 'self' https://static.cloudflareinsights.com:443",
+    "script-src 'self' https://static.cloudflareinsights.com/beacon.min.js",
+    "script-src 'self' https:",
+    "script-src 'self' *",
+)
+
+
+def test_every_csp_form_that_admits_the_beacon_is_recognised():
+    """A wildcard or path-scoped spelling is a NORMAL way to write the same permission.
+
+    The matcher used to enumerate four literals, so any other form answered "not
+    admitted" — which (before the observation gate above) suppressed the
+    `rum-missing` arm on a beacon that loaded. Enumerating spellings is the
+    fail-open direction; a source that names the zone admits it however written.
+    """
+    module = _detector_module()
+    for csp in ADMIT_FORMS:
+        assert module._admits_beacon_script(csp) is True, f"not recognised as admitting: {csp}"
+    # …and the negative direction still holds, or the guard above would be vacuous.
+    for csp in (
+        NO_BEACON_CSP,
+        "script-src 'self' https://notcloudflareinsights.com",
+        "script-src 'self' https://cloudflareinsights.com.evil.example",
+        "script-src 'none'",
+        "script-src 'self' http:",
+    ):
+        assert module._admits_beacon_script(csp) is False, f"wrongly admitted: {csp}"
 
 
 def test_rum_on_another_origin_is_not_accepted_as_same_origin():
@@ -476,16 +560,31 @@ def test_no_label_is_documented_that_the_verdict_cannot_return():
     module = _detector_module()
     doc = (module._beacon_verdict.__doc__ or "")
     returned = set()
-    for requests, csp, tag in (
-        ([], STRICT_CSP, False),
-        ([], STRICT_CSP, True),
-        (BEACON_SCRIPT, NO_BEACON_CSP, True),
-        (BEACON_SCRIPT, STRICT_CSP, True),
-        (BEACON_SCRIPT + RUM, STRICT_CSP, True),
+    for requests, csp, tag, violations in (
+        ([], STRICT_CSP, False, []),
+        ([], STRICT_CSP, True, []),
+        (BEACON_SCRIPT, NO_BEACON_CSP, True, BLOCKED_VIOLATION),
+        (BEACON_SCRIPT, STRICT_CSP, True, []),
+        (BEACON_SCRIPT + RUM, STRICT_CSP, True, []),
     ):
-        returned.add(module._beacon_verdict(requests, csp, tag, PAGE)[0])
+        returned.add(module._beacon_verdict(requests, csp, tag, PAGE, violations)[0])
     assert returned == {"no-tag", "tag-blocked", "rum-missing", "rum-ok"}
     assert "rum-cross-origin" not in doc
+
+
+def test_a_surface_that_never_loaded_is_not_counted_as_no_tag():
+    """A failed navigation is NOT an observed absence of the tag.
+
+    `[goto-failed]` used to set the label `no-tag`, so a 5xx or a timeout inflated the
+    summary line `N of 8 surface(s) carried NO injected beacon tag` — a claim the
+    run never measured, in the tail of the log pasted into the auto-filed issue,
+    where a triager reads it as a changed injection format or a zone setting.
+    """
+    module = _detector_module()
+    assert module._count_labels(["no-tag", "not-measured", "rum-ok", "not-measured"]) == (1, 2)
+    assert module._count_labels(["not-measured"]) == (0, 1), (
+        "a surface that never loaded contributed to the no-tag count"
+    )
 
 
 # ── the script's own safety rails survive the edit ──────────────────────
@@ -545,6 +644,16 @@ def test_registration_covers_the_changes_it_guards():
         )
         data = json.loads(result.stdout)
         assert "core" in data["surfaces"], f"a {changed} change does not select `core`: {data['surfaces']}"
+        # …and the SURFACE is not the FILE. `select()` matches the surface and
+        # then SUBTRACTS `slow_files`, `carve_out` and `uri_requiring` from its
+        # members; only `test_files` is what actually runs. Asserting on
+        # `surfaces` alone stays green if this file is later moved into any of
+        # those sets — the #1349/#2938 silent-drop class this test exists to close.
+        selected = data["test_files"]
+        assert selected == "ALL" or "test_prod_csp_monitor.py" in selected, (
+            f"a {changed} change selects `core` but NOT this guard — it is subtracted before the "
+            f"run (slow/carve-out/uri-requiring): {selected!r}"
+        )
 
 
 def test_same_origin_is_the_landed_origin_not_the_requested_one():
@@ -575,5 +684,9 @@ def test_detector_passes_the_landed_url_to_the_beacon_verdict():
     """
     source = DETECTOR.read_text(encoding="utf-8")
     assert "landed_url = page.url" in source
-    assert "_beacon_verdict(requests, csp, tag_present, landed_url)" in source
-    assert "_beacon_verdict(requests, csp, tag_present, url)" not in source
+    assert "requests, csp, tag_present, landed_url" in source
+    assert "requests, csp, tag_present, url" not in source
+    # …and the verdict must receive the OBSERVED violation scan: `tag-blocked`
+    # keys on it, so dropping the argument would silently turn every blocked
+    # beacon into a second `rum-missing` finding.
+    assert "requests, csp, tag_present, landed_url, blocked" in source

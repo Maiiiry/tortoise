@@ -53,10 +53,12 @@ of our source, so the policy guard cannot see it. Two ways it silently breaks:
 
 So each surface also records its request URLs and its injected-tag presence, and
 this script fails on (a) any request to the bare `cloudflareinsights.com` apex
-host, or (b) a tag that loaded under a policy that ADMITS it, with no same-origin
-`/cdn-cgi/rum` POST observed. `no-tag` (the edge injecting nothing at all) is
-reported, never failed: Web Analytics is a zone setting and #4706's keep-or-drop
-decision is open.
+host, or (b) a tag that was present and was not refused by any OBSERVED CSP
+violation, with no same-origin `/cdn-cgi/rum` POST observed. `no-tag` (the edge
+injecting nothing at all) is reported, never failed: Web Analytics is a zone
+setting and #4706's keep-or-drop decision is open. A surface whose navigation
+FAILED is `not-measured`, never `no-tag`: the run never saw that document, so it
+must not contribute to the "carried NO injected beacon tag" count.
 
 The host match is EXACT. A substring test also matches
 `static.cloudflareinsights.com` — the beacon's own SCRIPT origin, which every
@@ -122,6 +124,55 @@ def _directives(csp: str) -> dict[str, list[str]]:
     return out
 
 
+def _source_admits_beacon(src: str) -> bool:
+    """Does ONE CSP source expression admit ``static.cloudflareinsights.com``?
+
+    The host-source grammar is much wider than the exact spelling the shipped
+    policies happen to use, and every form below really does let the beacon load:
+    the scheme source ``https:``, the bare ``*``, a subdomain wildcard
+    (``https://*.cloudflareinsights.com`` or ``*.cloudflareinsights.com``), a
+    scheme-relative host (``//static.cloudflareinsights.com``), a schemeless host
+    (``static.cloudflareinsights.com``), an explicit port, and a path-scoped
+    source (``https://static.cloudflareinsights.com/beacon.min.js``).
+
+    Enumerating spellings is the FAIL-OPEN direction for the arm that consumes
+    this: "not admitted" suppressed the `rum-missing` report, and a beacon that
+    really did load leaves no CSP violation to fail the surface — so an admit
+    form the matcher did not recognise printed a benign `tag-blocked` on a green
+    run. A source that NAMES the beacon's zone therefore admits it however it is
+    written; only a source that does not mention the zone (``'self'``, another
+    host, ``'none'``, an http-only scheme) refuses.
+    """
+    token = src.strip().lower()
+    if not token:
+        return False
+    # `*` (any host, any network scheme) and the `https:` scheme source admit
+    # every https URL, the beacon's included. `http:` deliberately does NOT: the
+    # beacon is https-only, so an http-only source cannot load it.
+    if token in ("*", "https:", "https://*"):
+        return True
+    host_part = token
+    for prefix in ("https://", "http://", "wss://", "//"):
+        if host_part.startswith(prefix):
+            host_part = host_part[len(prefix):]
+            break
+    # Host-source only: a scheme (`data:`, `blob:`) or a bare keyword (`'self'`,
+    # `'none'`, a nonce/hash) has no host to compare. A path part and an explicit
+    # port are both irrelevant to WHICH host is admitted.
+    host = host_part.split("/", 1)[0]
+    if ":" in host:
+        host = host.rsplit(":", 1)[0]
+    if host == "*":
+        return True
+    # `*.cloudflareinsights.com` → `.cloudflareinsights.com`. CSP's `*.` matches
+    # subdomains but not the apex, and the beacon's host IS a subdomain, so the
+    # label-boundary suffix test is the right predicate (and `notexample.com`
+    # must not match `example.com`).
+    if host.startswith("*."):
+        host = host[1:]
+    return host == MANUAL_RUM_HOST or host.endswith("." + MANUAL_RUM_HOST)
+
+
 def _admits_beacon_script(csp: str) -> bool:
     """Does this policy let the edge-injected beacon SCRIPT load?
 
@@ -130,6 +181,10 @@ def _admits_beacon_script(csp: str) -> bool:
     ``default-src``. Checking all three as a union would answer `True` for a
     policy whose `script-src-elem` explicitly EXCLUDES the host, which is the
     case the beacon report exists to catch.
+
+    A `False` here is only ever a HINT — ``_beacon_verdict`` requires an OBSERVED
+    refusal before it treats the beacon as blocked, because the text parse is a
+    proxy whose miss direction (suppressing `rum-missing`) reads green.
     """
     directives = _directives(csp)
     sources: list[str] | None = None
@@ -139,14 +194,15 @@ def _admits_beacon_script(csp: str) -> bool:
             break
     if sources is None:
         return False
-    for src in sources:
-        if src in ("*", "https:", BEACON_SCRIPT_HOST, f"https://{BEACON_SCRIPT_HOST}"):
-            return True
-    return False
+    return any(_source_admits_beacon(src) for src in sources)
 
 
 def _beacon_verdict(
-    requests: list[tuple[str, str]], csp: str, tag_present: bool, page_url: str
+    requests: list[tuple[str, str]],
+    csp: str,
+    tag_present: bool,
+    page_url: str,
+    violations: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Classify the beacon contract for ONE surface.
 
@@ -164,10 +220,18 @@ def _beacon_verdict(
     so comparing against the requested host reports `rum-missing` on a healthy
     surface (measured: the only false positive this arm produced).
 
+    ``violations`` is the surface's violation scan (what the CONSOLE actually
+    reported). It gates ``tag-blocked``: the policy text alone is a proxy, and a
+    proxy that answers "blocked" for a beacon that in fact LOADED suppresses
+    ``rum-missing`` — the one arm that sees analytics lost with no console error.
+
     Labels: ``no-tag`` (edge injected nothing — reported, not failed),
-    ``tag-blocked`` (a violation; the policy scan owns it), ``rum-missing``,
-    ``rum-ok``. A cross-origin RUM request is not a label of its own: the label
-    reports the same-origin contract, and the cross-origin request arrives as a
+    ``tag-blocked`` (an OBSERVED refusal of the beacon script; the policy scan
+    owns it), ``rum-missing``, ``rum-ok``. ``main`` uses one further label of its
+    own — ``not-measured``, for a surface whose navigation failed — so an
+    unvisited surface is never counted as an observed absence of the tag. A
+    cross-origin RUM request is not a label of its own: the label reports the
+    same-origin contract, and the cross-origin request arrives as a
     ``beacon-cross-origin`` FINDING alongside it (so a surface that reports
     same-origin AND leaks one to the manual endpoint is still a failure).
     """
@@ -201,10 +265,14 @@ def _beacon_verdict(
         # visible; never a failure.
         return "no-tag", findings
 
-    if not _admits_beacon_script(csp):
-        # The script is blocked, so no RUM POST can exist. The violation scan
-        # already fails this surface; a second finding here would double-count
-        # one cause.
+    # BLOCKED IS AN OBSERVATION, NOT A PARSE. Requiring the recorded violation
+    # keeps the policy text as a corroborating hint: an admit form this parser
+    # does not enumerate must not be able to silence `rum-missing` (the beacon
+    # loaded, so no violation exists to fail the surface). When the refusal WAS
+    # observed, the violation scan already fails the surface and a second finding
+    # here would double-count one cause.
+    refused = any(BEACON_SCRIPT_HOST in v.lower() for v in (violations or ()))
+    if refused and not _admits_beacon_script(csp):
         return "tag-blocked", findings
 
     if rum_same_origin:
@@ -216,6 +284,18 @@ def _beacon_verdict(
         "payload reported nowhere (analytics lost with no console error)"
     )
     return "rum-missing", findings
+
+
+def _count_labels(labels: list[str]) -> tuple[int, int]:
+    """``(no_tag, not_measured)`` from the per-surface verdict labels.
+
+    A surface whose navigation failed is ``not-measured``, NOT ``no-tag``: the run
+    never saw that document, so it must not contribute to the summary's
+    "carried NO injected beacon tag" count. That line is the signal for a CHANGED
+    injection format, so it has to stay a measurement — a 5xx or a timeout
+    inflating it sends a triager after a zone setting.
+    """
+    return labels.count("no-tag"), labels.count("not-measured")
 
 
 def _other_errors(console: list[str], failed: list[str]) -> list[str]:
@@ -240,7 +320,7 @@ def main(argv: list[str]) -> int:
 
     dirty = 0
     beacon_dirty = 0
-    no_tag = 0
+    labels: list[str] = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
         for url in urls:
@@ -312,7 +392,9 @@ def main(argv: list[str]) -> int:
             if goto_error is not None:
                 blocked = [f"[goto-failed] {goto_error}"]
                 others = []
-                beacon_label, beacon_findings = "no-tag", []
+                # `not-measured`, NOT `no-tag`: this surface never loaded, so the
+                # run did not observe an absent tag and must not report one.
+                beacon_label, beacon_findings = "not-measured", []
             else:
                 blocked = _violations(console, failed)
                 if close_error is not None:
@@ -325,7 +407,9 @@ def main(argv: list[str]) -> int:
                 others = _other_errors(console, failed)
                 # Read AFTER the page ended, for the same reason the violation
                 # lists are: the RUM POST goes out on `visibilitychange`.
-                beacon_label, beacon_findings = _beacon_verdict(requests, csp, tag_present, landed_url)
+                beacon_label, beacon_findings = _beacon_verdict(
+                    requests, csp, tag_present, landed_url, blocked
+                )
             # Context cleanup only, AFTER the verdict is computed, so a cleanup
             # failure can never suppress a surface's verdict.
             ctx.close()
@@ -338,10 +422,12 @@ def main(argv: list[str]) -> int:
             # Printed separately, never merged into the verdict.
             for o in others:
                 print(f"            (non-CSP error) {o[:200]}")
+            labels.append(beacon_label)
             dirty += 1 if blocked else 0
             beacon_dirty += 1 if beacon_findings else 0
-            no_tag += 1 if beacon_label == "no-tag" else 0
         browser.close()
+
+    no_tag, not_measured = _count_labels(labels)
 
     print(f"\n{dirty} of {len(urls)} surface(s) reported a CSP violation")
     print(
@@ -356,6 +442,13 @@ def main(argv: list[str]) -> int:
         f"{no_tag} of {len(urls)} surface(s) carried NO injected beacon tag "
         "(zone setting, or the edge changed its injection format — #4706/#4762)"
     )
+    if not_measured:
+        # Separate line, NOT a share of the no-tag count: nothing was measured on
+        # these surfaces (they are already red for [goto-failed] above).
+        print(
+            f"{not_measured} of {len(urls)} surface(s) were NOT MEASURED "
+            "(navigation failed — see the [goto-failed] line; not counted as no-tag)"
+        )
     return 1 if (dirty or beacon_dirty) else 0
 
 

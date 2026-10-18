@@ -1649,10 +1649,12 @@ test('no served document or Function narrows the policy with a `<meta>` CSP', ()
 // the regression that shipped; name the third-party RUM host in `connect-src` and
 // this fails too, because automatic injection never uses it (#4706). The
 // edge-observing detector is
-// `tests/e2e/audit_prod_csp.py`, a browser audit of the DEPLOYED surfaces run
-// manually (`ALLOW_PROD=1 .venv/bin/python tests/e2e/audit_prod_csp.py`) —
-// nothing runs it in CI yet (#4762), so a NEW platform-injected origin is still
-// caught only by it, or post-merge by `verify-legal`.
+// `tests/e2e/audit_prod_csp.py`, a browser audit of the DEPLOYED surfaces. Since
+// #4762 it is run by the scheduled `prod-csp-monitor` workflow (daily cron, plus a
+// run ordered AFTER `Deploy Landing Pages` completes, plus `workflow_dispatch`),
+// so a NEW platform-injected origin is observed within a day instead of only by a
+// human running the script or by the post-merge `verify-legal` job. It is still
+// not on the per-PR path by design: it drives production.
 test('every policy allows the platform-injected Cloudflare beacon', () => {
   const dashboard = loadDashboardHeaders()
   const marketing = loadMarketingHeaders()

@@ -183,7 +183,12 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The `--why` text may only assert what a GREEN run MEASURED. `no-tag` is
+        # green (a zone setting; #4706 keep-or-drop is open), so "every surface
+        # loaded the edge-injected beacon" was false on an all-`no-tag` run — the
+        # same run prints `8 of 8 surface(s) carried NO injected beacon tag` — and
+        # the close comment is the artifact the next lane reads.
         run: |
           bash .github/scripts/auto-file-issue.sh resolve \
             --title "$PROD_CSP_MONITOR_TITLE" \
-            --why 'The scheduled deployed-CSP monitor ran green: every anonymous production surface loaded the edge-injected beacon, admitted it under its own policy, and reported its RUM payload same-origin (`POST /cdn-cgi/rum`).'
+            --why 'The scheduled deployed-CSP monitor ran green: no anonymous production surface reported a CSP violation, and no surface reported a beacon finding (the edge-injected RUM must stay same-origin on /cdn-cgi/rum). Surfaces that carried no injected tag, or that failed to load, are counted in the run log and are not failures by themselves (#4706 keep-or-drop is open).'
