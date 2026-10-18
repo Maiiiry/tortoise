@@ -60,14 +60,34 @@ Blindness / grading discipline:
   inconclusive); the m2 lane blesses its own committed m2.json baseline
   (determinism gate) while the llm lane owns main.json + the standing
   leakage quality bar.
-* **Cost (G9, round-3)**: receipts record ``cost_usd`` from capture
-  telemetry ``llm_cost_usd`` when the extractor seam reports it, with an
-  explicit cost-not-tracked / cost-partial note otherwise. Today NO seam
-  reports ``llm_cost_usd`` (the mock never does; the real v2 extractor's
-  telemetry does not yet surface it), so real-LLM-lane runs record 0.0 with
-  the note — HARD_STOP_USD / per-run cost guarding cannot operate until the
-  extractor seam reports cost (fix-wave item for the W5 wave; disclosed,
-  never silently faked).
+* **Cost (G9, round-3; re-wired #5058)**: receipts record ``cost_usd`` from
+  the extractor seam's OWN roll-up — the capture response's
+  ``stats.llm`` block (``tortoise/sdk.py`` → ``_extract_session_v2`` →
+  ``extractor_v2._rollup_llm``), whose ``by_stage`` buckets are the pricing
+  envelope ``tools/longmem_eval/costing.py`` consumes.  The pre-#5058 runner
+  read ``capture["telemetry"]["llm_cost_usd"]`` — a key NO capture response
+  has ever carried — so EVERY run recorded 0.0, and a receipt could not
+  answer the question the key split exists for (what did this run cost, and
+  which key paid).  Pricing precedence mirrors
+  ``costing.cost_per_session_distribution`` (the hosted ``capture_cost``
+  reader), so the eval receipt and the product report cannot disagree about
+  what a session cost:
+
+  1. a COMPLETE provider charge (``calls_without_cost == 0``) wins —
+     OpenRouter publishes ``usage.cost`` (``model_adapters`` #2906);
+  2. else the report-time ``PRICING_MAP`` price of the usage envelope —
+     the deepseek-direct lane publishes no charge, which is precisely the
+     ``calls_without_cost`` case the map repricing exists for (#3359);
+  3. else a LOWER BOUND (0.0) the receipt DISCLOSES.
+
+  The receipt carries a structural ``cost_provenance`` block for the figure
+  (source / calls / disclosure counters / ``lower_bound``), and
+  ``validate_receipt`` refuses a receipt that reports dollars without it —
+  a zero on a billable run can never pass silently again.  A FAILED run
+  carries the same block (a failed extraction that made provider calls has
+  real spend), so ``cost_usd`` no longer resets to 0.0 the moment a run
+  fails.  ``quote_spans_total`` rides the failed report too (it was ``None``
+  on every failed receipt — #5058).
 
 Receipts follow the epic §6.6 contract (run_status / verdict /
 failure_origin / commit / corpus_hash / judge_pin / resolved_config /
@@ -101,6 +121,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import sys
@@ -850,6 +871,350 @@ def _validate_semantic_units(units: object, issues: list[str]) -> None:
             )
 
 
+# ── Cost reading + provenance (#5058) ───────────────────────────────────────
+
+#: How a receipt's ``cost_usd`` was established (``cost_provenance.source``).
+#:
+#: * ``provider``    — every metered call's own charge, complete
+#:                     (``calls_without_cost == 0``), came from the route;
+#: * ``pricing_map`` — no charge was published, so the report-time PRICING_MAP
+#:                     priced the usage envelope;
+#: * ``mixed``       — both, across sessions (a mid-run failover);
+#: * ``unpriced``    — calls happened and none of their spend could be
+#:                     established (a lower bound);
+#: * ``none``        — no extraction calls ran at all (nothing to attribute).
+COST_SOURCE_VALUES = frozenset(
+    {"provider", "pricing_map", "mixed", "unpriced", "none"})
+
+#: The keys ``cost_provenance`` must carry on every receipt.  Named once so
+#: ``_cost_provenance``, ``_receipt_cost_provenance`` and ``validate_receipt``
+#: cannot drift apart.
+COST_PROVENANCE_KEYS = (
+    "source", "cost_usd", "provider_cost_usd", "priced_cost_usd",
+    "pricing_map_version", "calls", "calls_without_cost",
+    "calls_without_usage", "unattributed_calls", "sessions",
+    "sessions_priced", "unpriced_sessions", "lower_bound", "disclosure",
+)
+
+
+def _as_count(value) -> int:
+    """A non-negative int from a telemetry counter (junk reads as absent).
+
+    The seam is in-repo and typed; a mock/foreign adapter is not.  A counter
+    that is not a count must contribute NO number rather than a negative or a
+    boolean that silently shifts the totals.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(float(value)) or float(value) < 0:
+        return 0
+    return int(value)
+
+
+def _as_money(value) -> float | None:
+    """A finite non-negative USD figure, or None when absent/unusable.
+
+    ``None`` (NOT 0.0) is the signal that the route published no charge — the
+    difference between "the provider said $0" (#2906: 0.0 is authoritative)
+    and "the provider said nothing", which is what sends a session down the
+    PRICING_MAP branch.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    amount = float(value)
+    if not math.isfinite(amount) or amount < 0:
+        return None
+    return amount
+
+
+def _session_cost_reading(capture: dict) -> dict:
+    """The cost reading of ONE ``capture_session`` response (#5058).
+
+    Reads the extractor seam's OWN roll-up — ``resp["stats"]["llm"]``, written
+    by ``tortoise/sdk.py`` (``_extract_session_v2`` → ``meta["stats"]``) and
+    ``extractor_v2._rollup_llm`` — plus its ``resp["stats"]["unattributed"]``
+    sibling (#3824: calls the usage sink never accounted for).  The session's
+    ``by_stage`` envelope is already the pricing-envelope shape
+    (``_empty_cost_bucket``), so it is handed to
+    ``costing.price_usage_envelope`` verbatim: this module carries NO pricing
+    table of its own.
+
+    The pre-#5058 runner read ``capture["telemetry"]["llm_cost_usd"]``, a key
+    no capture response has ever carried — so the price was unreachable and
+    every run recorded 0.0.
+    """
+    stats = capture.get("stats")
+    stats = stats if isinstance(stats, dict) else {}
+    llm = stats.get("llm")
+    llm = llm if isinstance(llm, dict) else {}
+    by_stage = llm.get("by_stage")
+    by_stage = by_stage if isinstance(by_stage, dict) else {}
+    from tools.longmem_eval import costing
+
+    map_usd, map_priced, breakdown = costing.price_usage_envelope(
+        {"by_stage": by_stage})
+    # An EMPTY envelope prices "successfully" at 0.0 — nothing was unpriced
+    # because nothing was considered.  That is not a price, so a session with
+    # no priced lane never claims the map established its figure.
+    map_priced = bool(map_priced and by_stage)
+    reported = _as_money(llm.get("cost_usd"))
+    calls = _as_count(llm.get("calls"))
+    unattributed = _as_count(stats.get("unattributed"))
+    calls_without_cost = _as_count(llm.get("calls_without_cost"))
+    reading = {
+        "calls": calls,
+        "unattributed_calls": unattributed,
+        "calls_without_cost": calls_without_cost,
+        "calls_without_usage": _as_count(llm.get("calls_without_usage")),
+        "provider_cost_usd": reported,
+        "map_cost_usd": round(map_usd, 6),
+        "pricing_map_version": (breakdown or {}).get("map_version"),
+        "unpriced_lanes": [
+            {k: lane.get(k) for k in ("stage", "provider", "model", "reason")}
+            for lane in (breakdown or {}).get("unpriced", []) or []
+            if isinstance(lane, dict)
+        ],
+    }
+    # The precedence mirrors ``costing.cost_per_session_distribution`` — the
+    # hosted ``capture_cost`` report's reader — so the eval receipt and the
+    # product report cannot disagree about what one session cost:
+    #   1. a COMPLETE provider charge (``calls_without_cost == 0``) wins;
+    #   2. else the PRICING_MAP price of the usage envelope;
+    #   3. else a lower bound the receipt discloses.
+    if calls > 0 and reported is not None and calls_without_cost == 0:
+        reading.update(
+            usd=round(reported, 6), source="provider",
+            reason=None if unattributed == 0 else "unattributed_calls",
+            lower_bound=unattributed > 0,
+        )
+    elif calls > 0 and map_priced:
+        reading.update(
+            usd=round(map_usd, 6), source="pricing_map",
+            reason=None if unattributed == 0 else "unattributed_calls",
+            lower_bound=unattributed > 0,
+        )
+    elif calls > 0 or unattributed > 0:
+        # Calls ran and their spend is not established — a lower bound, never
+        # a silently-fake measured figure (0.0 is what the provider total holds
+        # when the route published nothing and the map knows no such lane).
+        reading.update(
+            usd=round(reported or 0.0, 6), source="unpriced",
+            reason=(
+                "no_provider_charge_and_no_priced_lane" if calls > 0
+                else "calls_with_no_usage_rollup"
+            ),
+            lower_bound=True,
+        )
+    else:
+        # No extraction calls at all: there is nothing to attribute, and a
+        # ``cost_usd`` of 0.0 is complete rather than a lower bound.
+        reading.update(usd=0.0, source="none", reason=None, lower_bound=False)
+    return reading
+
+
+def _cost_provenance(session_costs: list[dict]) -> dict:
+    """The receipt's ``cost_provenance`` block from the per-session readings.
+
+    The ONE home for the aggregate, so a completed AND a failed report state
+    the same thing about the same figure (#5058: the failed report used to
+    reset ``cost_usd`` to a bare 0.0, discarding the spend the run HAD
+    measured).
+    """
+    priced_sources = {
+        reading["source"] for reading in session_costs
+        if reading["source"] in ("provider", "pricing_map")
+    }
+    calls = sum(reading["calls"] for reading in session_costs)
+    unattributed = sum(
+        reading["unattributed_calls"] for reading in session_costs)
+    if priced_sources == {"provider"}:
+        source = "provider"
+    elif priced_sources == {"pricing_map"}:
+        source = "pricing_map"
+    elif priced_sources:
+        source = "mixed"
+    elif calls or unattributed:
+        source = "unpriced"
+    else:
+        source = "none"
+    unpriced_sessions = [
+        {"session_id": reading["session_id"],
+         "reason": reading.get("reason") or reading["source"]}
+        for reading in session_costs if reading["lower_bound"]
+    ]
+    lower_bound = bool(unpriced_sessions) or unattributed > 0
+    return {
+        "source": source,
+        "cost_usd": round(sum(reading["usd"] for reading in session_costs), 6),
+        "provider_cost_usd": round(sum(
+            reading["provider_cost_usd"] or 0.0
+            for reading in session_costs), 6),
+        "priced_cost_usd": round(sum(
+            reading["map_cost_usd"] for reading in session_costs
+            if reading["source"] == "pricing_map"), 6),
+        "pricing_map_version": next(
+            (reading["pricing_map_version"] for reading in session_costs
+             if reading["source"] == "pricing_map"), None),
+        "calls": calls,
+        "calls_without_cost": sum(
+            reading["calls_without_cost"] for reading in session_costs),
+        "calls_without_usage": sum(
+            reading["calls_without_usage"] for reading in session_costs),
+        "unattributed_calls": unattributed,
+        "sessions": len(session_costs),
+        "sessions_priced": len([
+            reading for reading in session_costs
+            if reading["source"] in ("provider", "pricing_map")]),
+        "unpriced_sessions": unpriced_sessions,
+        "lower_bound": lower_bound,
+        "disclosure": _cost_disclosure(
+            source=source, calls=calls, unattributed=unattributed,
+            calls_without_cost=sum(
+                reading["calls_without_cost"] for reading in session_costs),
+            calls_without_usage=sum(
+                reading["calls_without_usage"] for reading in session_costs),
+            sessions=len(session_costs),
+            unpriced_sessions=unpriced_sessions,
+            lower_bound=lower_bound,
+        ),
+    }
+
+
+def _cost_disclosure(
+    *, source: str, calls: int, unattributed: int, calls_without_cost: int,
+    calls_without_usage: int, sessions: int,
+    unpriced_sessions: list[dict], lower_bound: bool,
+) -> str | None:
+    """The ONE sentence stating what ``cost_usd`` does and does not cover.
+
+    Always present when the figure is a lower bound OR zero, so a ``$0.00``
+    can never pass a reader — or ``validate_receipt`` — unexplained.
+    """
+    if not lower_bound:
+        return (
+            f"{source}: {calls} extraction call(s) across {sessions} "
+            "session(s)"
+            + (" — the route published its own charge for every call"
+               if source == "provider" else "")
+            + (" — priced at report time from the PRICING_MAP"
+               if source in ("pricing_map", "mixed") else "")
+            + ("; no extraction calls ran, so there was no spend to attribute"
+               if source == "none" else "")
+        )
+    parts = []
+    if unpriced_sessions:
+        named = ", ".join(
+            f"{item['session_id']} ({item['reason']})"
+            for item in unpriced_sessions[:3])
+        more = ("" if len(unpriced_sessions) <= 3
+                else f", +{len(unpriced_sessions) - 3} more")
+        parts.append(
+            f"{len(unpriced_sessions)} of {sessions} session(s) unpriceable: "
+            f"{named}{more}")
+    if unattributed:
+        parts.append(
+            f"{unattributed} call(s) made that no usage roll-up accounted for")
+    if calls_without_cost:
+        parts.append(
+            f"{calls_without_cost} call(s) the route served without reporting "
+            "a charge")
+    if calls_without_usage:
+        parts.append(
+            f"{calls_without_usage} call(s) that carried no usage block")
+    return (
+        "cost_usd is a LOWER BOUND: " + "; ".join(parts)
+        if parts else "cost_usd is a LOWER BOUND (no measurable charge)"
+    )
+
+
+def _receipt_cost_provenance(report: dict) -> dict:
+    """The ``cost_provenance`` block for a receipt built from ``report``.
+
+    A report assembled outside ``run_benchmark`` (a synthetic/test report, or
+    a pre-#5058 shape) carries no provenance.  It is never ASSUMED measured:
+    the receipt states, in the same breath as the figure, that nothing
+    established it — so an absent block cannot read as an attributable zero.
+    """
+    provenance = report.get("cost_provenance")
+    if isinstance(provenance, dict) and provenance:
+        return {key: provenance.get(key) for key in COST_PROVENANCE_KEYS}
+    return {
+        "source": "unpriced",
+        "cost_usd": round(float(report.get("cost_usd") or 0.0), 6),
+        "provider_cost_usd": 0.0,
+        "priced_cost_usd": 0.0,
+        "pricing_map_version": None,
+        "calls": 0,
+        "calls_without_cost": 0,
+        "calls_without_usage": 0,
+        "unattributed_calls": 0,
+        "sessions": len(report.get("session_results") or []),
+        "sessions_priced": 0,
+        "unpriced_sessions": [],
+        "lower_bound": True,
+        "disclosure": (
+            "this report carries no cost reading (a pre-#5058 shape, or a "
+            "report assembled outside run_benchmark) — cost_usd is not an "
+            "attribution of spend"
+        ),
+    }
+
+
+def _cost_notes(provenance: dict) -> list[str]:
+    """The human-readable cost note(s) for a report's ``cost_provenance``.
+
+    Three mutually exclusive states, and NO fourth: a priced run says nothing
+    (the figure is the measurement); a map-priced run says the dollars are a
+    report-time price rather than a provider receipt; an unpriced run says so
+    in the same words a reader already looks for ("cost not tracked").  A
+    lower bound is never silent — that is the #5058 rule.
+    """
+    notes: list[str] = []
+    source = provenance.get("source")
+    if source in ("pricing_map", "mixed"):
+        notes.append(
+            "cost priced from the PRICING_MAP "
+            f"({provenance.get('pricing_map_version')}): the route published "
+            "no charge for "
+            f"{provenance.get('calls_without_cost')} of "
+            f"{provenance.get('calls')} call(s), so receipt cost_usd is the "
+            "report-time map price of the usage envelope — NOT a provider "
+            "receipt (repricable from by_stage)"
+        )
+    if provenance.get("sessions_priced"):
+        if provenance.get("lower_bound"):
+            notes.append(
+                f"cost partial: {provenance.get('disclosure')} — receipt "
+                f"cost_usd is the tracked PARTIAL sum "
+                f"({provenance.get('cost_usd')}), understating true cost; "
+                "never read it as a full measured figure"
+            )
+        return notes
+    notes.append(
+        "cost not tracked: the extractor seam reported no priced LLM calls "
+        "in any session (mock/unknown adapter, or every call went "
+        "unaccounted) — receipt cost_usd is "
+        f"{provenance.get('cost_usd')} with this note, never a "
+        "silently-fake measured figure"
+    )
+    return notes
+
+
+def _quote_spans_total(session_results: list[dict] | None) -> int:
+    """The raw double-quoted span count across the graded sessions.
+
+    A FAILED run can still have graded sessions, and its receipt must carry
+    the same number a completed one would (#5058: the field was ``None`` on
+    every failed receipt).  Tolerant of a partial result dict — a missing
+    ``quotes`` block contributes 0 rather than taking the receipt down.
+    """
+    total = 0
+    for result in session_results or []:
+        quotes = result.get("quotes") if isinstance(result, dict) else None
+        total += _as_count((quotes or {}).get("total"))
+    return total
+
+
 def run_benchmark(
     *,
     root: Path = corpus.WRITE_PATH_DIR,
@@ -1004,8 +1369,10 @@ def run_benchmark(
     session_results: list[dict] = []
     runner_errors: list[str] = []
     semantic_block: dict | None = None
-    total_cost: float = 0.0
-    cost_tracked: bool = True  # flipped False if any capture lacks a cost figure
+    # #5058: the per-session cost READINGS (not just a running float), so the
+    # receipt can state where every dollar came from — and a FAILED run can
+    # report the spend it already incurred instead of a bare 0.0.
+    session_costs: list[dict] = []
     quote_spans_total: int = 0
     try:
         workdir = workdir or Path(tempfile.mkdtemp(prefix=f"w2b_{run_id}_"))
@@ -1031,17 +1398,18 @@ def run_benchmark(
                     runner_errors.append(
                         capture_failure_detail(session_id, capture)
                     )
-                # REVIEW-FIX (cost honesty): accumulate the extractor's
-                # reported cost when the capture telemetry carries it; a
-                # None/missing figure (mock seam, unknown adapter) flips
-                # cost_tracked False so the receipt records an explicit
-                # note rather than a silently-fake 0.0.
-                telemetry = capture.get("telemetry") or {}
-                session_cost = telemetry.get("llm_cost_usd")
-                if session_cost is None:
-                    cost_tracked = False
-                else:
-                    total_cost += float(session_cost)
+                # #5058 (cost honesty): read the extractor seam's OWN roll-up
+                # (``stats.llm``) — the pre-#5058 key (``telemetry.
+                # llm_cost_usd``) is not written by any capture response, so
+                # every run recorded 0.0 while claiming to be measured.
+                session_costs.append(
+                    _session_cost_reading(capture).copy()
+                    | {"session_id": session_id})
+                notes.append(
+                    f"{session_id}: cost={session_costs[-1]['usd']} "
+                    f"usd source={session_costs[-1]['source']} "
+                    f"calls={session_costs[-1]['calls']}"
+                )
             except Exception as exc:
                 runner_errors.append(f"{session_id}: capture raised {type(exc).__name__}: {exc}")
                 capture = {}
@@ -1202,10 +1570,18 @@ def run_benchmark(
         runner_errors.append(f"sessions with no graded gold units: {no_gold}")
 
     if runner_errors:
+        cost_provenance = _cost_provenance(session_costs)
+        # The disclosure notes are appended BEFORE the report is assembled, so
+        # a failed receipt carries them (they used to be dropped along with
+        # the cost figure — #5058).
+        notes.extend(_cost_notes(cost_provenance))
         report = summary_failed_report(
             run_id, date, commit, fixtures_hash, resolved_config,
             runner_errors, origin="runner_error", label="runner_errors",
             log=log, session_results=session_results,
+            cost_provenance=cost_provenance,
+            quote_spans_total=_quote_spans_total(session_results),
+            notes=notes,
         )
         report["metrics"] = _safe_metrics(session_results)
         report["judge_pin"] = judge_pin
@@ -1216,7 +1592,7 @@ def run_benchmark(
     # quotes yields a vacuous quote_fidelity 1.0 (floor, not bar). The
     # graded snapshot stays canonical-6; the REPORT carries the raw span
     # count + a note so the committed 1.0 is never misread.
-    quote_spans_total = sum(r["quotes"]["total"] for r in session_results)
+    quote_spans_total = _quote_spans_total(session_results)
     if quote_spans_total == 0:
         notes.append(
             "quote_fidelity 1.0 is VACUOUS: the corpus gold contains no "
@@ -1246,20 +1622,8 @@ def run_benchmark(
             failure_origin = "judge_pin_mismatch"
         elif not (baseline.get("metrics") or {}):
             failure_origin = None  # first-run-pending — nothing to compare yet
-    if not cost_tracked:
-        if total_cost > 0.0:
-            notes.append(
-                "cost partial: some sessions reported llm_cost_usd and others "
-                "did not — receipt cost_usd is the tracked PARTIAL sum "
-                f"({round(total_cost, 6)}), understating true cost; never read "
-                "it as a full measured figure"
-            )
-        else:
-            notes.append(
-                "cost not tracked: the extractor seam reported no llm_cost_usd "
-                "in any session (mock/unknown adapter) — receipt cost_usd is "
-                "0.0 with this note, never a silently-fake measured figure"
-            )
+    cost_provenance = _cost_provenance(session_costs)
+    notes.extend(_cost_notes(cost_provenance))
     return {
         "run_id": run_id,
         "date": date,
@@ -1270,7 +1634,12 @@ def run_benchmark(
         "corpus_hash": fixtures_hash,
         "judge_pin": judge_pin,
         "resolved_config": resolved_config,
-        "cost_usd": round(total_cost, 6),  # partial-sum when mixed; 0.0 + note when untracked
+        # #5058: the best available figure — the route's own charges where it
+        # published them, PRICING_MAP prices where it did not — plus the
+        # structural provenance block that says which, and discloses a lower
+        # bound instead of presenting 0.0 as a measurement.
+        "cost_usd": cost_provenance["cost_usd"],
+        "cost_provenance": cost_provenance,
         "metrics": metrics,
         "quote_spans_total": quote_spans_total,
         "operator_audit": operator_audit,
@@ -1368,9 +1737,23 @@ def _failed_report(
     detail: str,
     log: list[str] | None = None,
     session_results: list[dict] | None = None,
+    cost_provenance: dict | None = None,
+    quote_spans_total: int | None = None,
+    notes: list[str] | None = None,
 ) -> dict:
+    """A ``run_status: "failed"`` report.
+
+    #5058: a failed run is NOT a zero-cost run.  ``cost_usd`` comes from the
+    same ``cost_provenance`` block a completed report carries (a failed
+    extraction that made provider calls has real spend), ``quote_spans_total``
+    is carried instead of being absent, and the caller's ``notes`` are kept
+    rather than dropped — the pre-fix shape reset the cost to a bare 0.0 and
+    emptied the notes, which is exactly the receipt #5058 was filed about.
+    """
     log = log or []
     log.append(f"failed: {detail}")
+    provenance = cost_provenance if isinstance(cost_provenance, dict) \
+        else _cost_provenance([])
     return {
         "run_id": run_id,
         "date": date,
@@ -1381,10 +1764,13 @@ def _failed_report(
         "corpus_hash": fixtures_hash,
         "judge_pin": None,
         "resolved_config": resolved_config,
-        "cost_usd": 0.0,
+        "cost_usd": provenance.get("cost_usd", 0.0),
+        "cost_provenance": provenance,
         "metrics": {},
+        "quote_spans_total": (
+            0 if quote_spans_total is None else quote_spans_total),
         "session_results": session_results or [],
-        "notes": [],
+        "notes": list(notes or []),
         "log": log,
     }
 
@@ -1449,6 +1835,9 @@ def summary_failed_report(
     run_id: str, date: str, commit: str, fixtures_hash: str,
     resolved_config: dict, items: list, *, origin: str, label: str,
     log: list[str] | None = None, session_results: list[dict] | None = None,
+    cost_provenance: dict | None = None,
+    quote_spans_total: int | None = None,
+    notes: list[str] | None = None,
 ) -> dict:
     """A ``_failed_report`` whose log carries ALL ``items``, not just the bound.
 
@@ -1460,6 +1849,9 @@ def summary_failed_report(
         run_id, date, commit, fixtures_hash, resolved_config,
         origin=origin, detail="; ".join(str(i) for i in items[:SUMMARY_BOUND]),
         log=log, session_results=session_results,
+        cost_provenance=cost_provenance,
+        quote_spans_total=quote_spans_total,
+        notes=notes,
     )
     report["log"].extend(summary_overflow_line(items, label=label))
     return report
@@ -1538,6 +1930,11 @@ def build_receipt(report: dict, *, justification: str | None = None) -> dict:
         "judge_pin": report.get("judge_pin"),
         "resolved_config": report.get("resolved_config"),
         "cost_usd": report.get("cost_usd"),
+        # #5058: the figure never travels alone.  ``cost_provenance`` states
+        # HOW it was established (provider charge / PRICING_MAP / a lower
+        # bound) and is REQUIRED by ``validate_receipt`` — a receipt whose
+        # dollars cannot be attributed is not a valid receipt.
+        "cost_provenance": _receipt_cost_provenance(report),
         "metrics": report.get("metrics"),
         "quote_spans_total": report.get("quote_spans_total"),
         "justification": justification,
@@ -1652,11 +2049,106 @@ def validate_receipt(receipt: dict) -> list[str]:
         issues.append("receipt.cost_usd: expected a number")
     elif receipt.get("cost_usd") < 0:
         issues.append(f"receipt.cost_usd: expected ≥ 0, got {receipt.get('cost_usd')!r}")
+    issues.extend(_validate_cost_provenance(receipt))
     # #5085 additive semantic block — validated only when present, so the
     # mechanical-lane receipt's shape contract is unchanged.
     semantic = receipt.get("semantic_judge")
     if semantic is not None:
         issues.extend(_validate_semantic_block(semantic, receipt))
+    return issues
+
+
+def _validate_cost_provenance(receipt: dict) -> list[str]:
+    """Shape + honesty validation of the ``cost_provenance`` block (#5058).
+
+    The load-bearing question the issue asks — "if a field is load-bearing for
+    a gate, a null/zero must fail the receipt validation rather than pass
+    silently" — is answered here:
+
+    * the block is REQUIRED: a dollar figure with no stated origin is exactly
+      the unattributable receipt #5058 was filed about;
+    * it must not DRIFT from ``receipt.cost_usd`` (two homes, one number);
+    * a ``source`` of ``none`` cannot sit beside real calls, and a priced
+      source cannot sit beside zero priced sessions;
+    * a LOWER BOUND must carry a disclosure sentence;
+    * and a ``cost_usd`` of ``0.0`` must ALWAYS carry one — a run that reports
+      $0 has to say why, so a silently-zero billable run can never validate
+      again.
+    """
+    issues: list[str] = []
+    provenance = receipt.get("cost_provenance")
+    if not isinstance(provenance, dict):
+        return [
+            "receipt.cost_provenance: expected an object — the cost figure "
+            "must state how it was established (#5058)",
+        ]
+    source = provenance.get("source")
+    if source not in COST_SOURCE_VALUES:
+        issues.append(
+            "receipt.cost_provenance.source: expected one of "
+            f"{sorted(COST_SOURCE_VALUES)}, got {source!r}"
+        )
+    cost = provenance.get("cost_usd")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+        issues.append(
+            "receipt.cost_provenance.cost_usd: expected a number ≥ 0, got "
+            f"{cost!r}"
+        )
+    elif isinstance(receipt.get("cost_usd"), (int, float)) \
+            and not isinstance(receipt.get("cost_usd"), bool) \
+            and round(float(cost), 6) != round(float(receipt["cost_usd"]), 6):
+        issues.append(
+            "receipt.cost_provenance.cost_usd: disagrees with "
+            f"receipt.cost_usd ({cost!r} vs {receipt['cost_usd']!r})"
+        )
+    counts = {}
+    for key in ("calls", "calls_without_cost", "calls_without_usage",
+                "unattributed_calls", "sessions", "sessions_priced"):
+        value = provenance.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            issues.append(
+                f"receipt.cost_provenance.{key}: expected a non-negative "
+                f"integer, got {value!r}"
+            )
+        else:
+            counts[key] = value
+    if counts.get("sessions_priced", 0) > counts.get("sessions", 0):
+        issues.append(
+            "receipt.cost_provenance.sessions_priced: cannot exceed sessions "
+            f"({counts.get('sessions_priced')} > {counts.get('sessions')})"
+        )
+    if source == "none" and counts.get("calls"):
+        issues.append(
+            "receipt.cost_provenance.source: 'none' beside "
+            f"{counts.get('calls')} call(s) — a run that made calls cannot "
+            "report nothing to attribute"
+        )
+    if source in ("provider", "pricing_map", "mixed") \
+            and not counts.get("sessions_priced"):
+        issues.append(
+            "receipt.cost_provenance.sessions_priced: a priced source "
+            f"({source!r}) requires at least one priced session"
+        )
+    lower_bound = provenance.get("lower_bound")
+    if not isinstance(lower_bound, bool):
+        issues.append(
+            "receipt.cost_provenance.lower_bound: expected a boolean, got "
+            f"{lower_bound!r}"
+        )
+    disclosure = provenance.get("disclosure")
+    if not isinstance(disclosure, str) or not disclosure.strip():
+        if lower_bound is True or cost == 0.0:
+            issues.append(
+                "receipt.cost_provenance.disclosure: a lower bound or a zero "
+                "cost requires a disclosure sentence (#5058) — the figure "
+                "must never pass silently"
+            )
+    if provenance.get("unpriced_sessions"):
+        if not lower_bound:
+            issues.append(
+                "receipt.cost_provenance.lower_bound: false beside "
+                f"{len(provenance['unpriced_sessions'])} unpriced session(s)"
+            )
     return issues
 
 

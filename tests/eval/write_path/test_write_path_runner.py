@@ -140,6 +140,35 @@ def test_run_fails_clean_on_preflight_break(tmp_path):
 # ── Receipt invariants ─────────────────────────────────────────────────────
 
 
+def _cost_provenance_no_calls() -> dict:
+    """A valid ``cost_provenance`` block for a HAND-WRITTEN receipt (#5058).
+
+    ``runner.build_receipt`` derives the block from the report, but these
+    fixtures are written as receipt JSON and handed straight to ``bless`` /
+    ``validate_receipt``.  ``validate_receipt`` requires the block on every
+    receipt, so the fixture states the truth for a corpus with no runs: zero
+    calls, nothing to attribute, no lower bound.
+    """
+    return {
+        "source": "none",
+        "cost_usd": 0.0,
+        "provider_cost_usd": 0.0,
+        "priced_cost_usd": 0.0,
+        "pricing_map_version": None,
+        "calls": 0,
+        "calls_without_cost": 0,
+        "calls_without_usage": 0,
+        "unattributed_calls": 0,
+        "sessions": 0,
+        "sessions_priced": 0,
+        "unpriced_sessions": [],
+        "lower_bound": False,
+        "disclosure": (
+            "none: no extraction calls ran, so there was no spend to attribute"
+        ),
+    }
+
+
 def _completed_report() -> dict:
     return {
         "run_id": "w2b-test-run",
@@ -232,6 +261,7 @@ def _published_receipt(tmp_path) -> tuple[object, object]:
         "judge_pin": JUDGE_PIN_MECHANICAL,
         "resolved_config": dict(corpus.BASELINE_CONFIG),
         "cost_usd": 0.0,
+        "cost_provenance": _cost_provenance_no_calls(),
         "metrics": metrics,
         "session_results": [{
             "session_id": "wp01_quarry_debug", "emitted": True,
@@ -338,7 +368,8 @@ def test_cli_bless_rejects_regression_without_blessing(tmp_path):
            "corpus_hash": pending["fixtures_hash"],
            "judge_pin": JUDGE_PIN_MECHANICAL,
            "resolved_config": dict(corpus.BASELINE_CONFIG),
-           "cost_usd": 0.0, "session_results": [], "notes": [], "log": []},
+           "cost_usd": 0.0, "session_results": [], "notes": [], "log": [],
+           "cost_provenance": _cost_provenance_no_calls()},
         "verdict": schema.VERDICT_INCONCLUSIVE,
         "metrics": run2_metrics,
     }
@@ -472,7 +503,10 @@ def test_run_benchmark_records_the_raw_capture_diagnostic(monkeypatch):
                 "ok": False,
                 "errors": [headline],
                 "diagnostics": [raw],
-                "telemetry": {"llm_cost_usd": 0.0},
+                # The REAL surface (``stats.llm``) — the fixture used to return
+                # ``telemetry.llm_cost_usd``, a key no capture response carries,
+                # which is exactly the fiction #5058 was filed about.
+                "stats": _llm_stats(calls=1, provider_cost_usd=0.001),
             }
 
     # The graph read is not what this test is about; stub the snapshot so the
@@ -603,6 +637,7 @@ def test_cli_corpus_bless_refreshes_published_baseline(tmp_path, capsys):
             "provenance_accuracy": 1.0,
         },
         "session_results": [], "notes": [], "log": [],
+        "cost_provenance": _cost_provenance_no_calls(),
     }))
     # Ordinary bless rejects the drifted hash.
     exit_code = runner._main([
@@ -803,6 +838,7 @@ def test_cli_protocol_bless_repins_judge_bump(tmp_path):
         "corpus_hash": baseline["fixtures_hash"], "judge_pin": "judge-write-path-v2",
         "resolved_config": dict(corpus.BASELINE_CONFIG),
         "cost_usd": 0.0, "metrics": run["metrics"],
+        "cost_provenance": _cost_provenance_no_calls(),
         "session_results": [], "notes": [], "log": [],
     }))
     # Ordinary bless rejects the pin change (protocol change, not comparable).
@@ -992,3 +1028,244 @@ def test_run_carries_operator_edge_audit_dimension(tmp_path, monkeypatch):
             < receipt["operator_audit"]["planted"])
     assert (receipt["operator_audit"]["operators_provenanced"]
             == receipt["operator_audit"]["operators_total"] > 0)
+
+
+# ── Cost attribution (#5058) ───────────────────────────────────────────────
+#
+# The pre-#5058 runner read ``capture["telemetry"]["llm_cost_usd"]`` — a key
+# NO capture response carries — so every run recorded ``cost_usd: 0.0`` and the
+# receipt could not answer the question the eval/production key split exists
+# for: what did this measurement cost, and which key paid.  The real surface is
+# ``resp["stats"]["llm"]`` (``tortoise/sdk.py`` → ``_extract_session_v2``)
+# whose ``by_stage`` buckets are the pricing envelope
+# ``tools/longmem_eval/costing.py`` consumes.
+
+
+def _llm_stats(
+    *, calls: int = 3, provider_cost_usd: float | None = None,
+    prompt_tokens: int = 100_000, completion_tokens: int = 20_000,
+    provider: str = "deepseek-direct", model: str = "deepseek-v4-flash",
+    unattributed: int = 0,
+) -> dict:
+    """A capture response's ``stats`` block in the SDK's REAL shape (#5058).
+
+    ``provider_cost_usd is None`` is the deepseek-direct lane: the route
+    publishes no ``usage.cost`` (``model_adapters`` #2906), so the roll-up
+    counts every call in ``calls_without_cost`` and its ``cost_usd`` stays 0.0
+    — the PRICING_MAP repricing case (#3359), not a measurement.
+    """
+    charged = provider_cost_usd is not None
+    bucket = {
+        "calls": calls, "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cost_usd": provider_cost_usd if charged else 0.0,
+        "calls_without_cost": 0 if charged else calls,
+        "calls_without_usage": 0, "calls_without_tokens": 0,
+        "usage_present": True,
+    }
+    llm = {
+        "calls": calls, "retries": 0, "truncated": 0, "deadline_aborts": 0,
+        "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+        "cost_usd": provider_cost_usd if charged else 0.0,
+        "calls_without_cost": 0 if charged else calls,
+        "calls_without_usage": 0, "calls_without_tokens": 0,
+        "by_stage": {"s1": {provider: {model: bucket}}},
+    }
+    stats: dict = {"llm": llm}
+    if unattributed:
+        stats["unattributed"] = unattributed
+    return stats
+
+
+def _stub_graph_reads(monkeypatch) -> None:
+    """No-DB snapshot stub — the graph read is not what these tests are about."""
+    monkeypatch.setattr(
+        runner, "snapshot_session",
+        lambda sdk, sid: {
+            "points": [], "rephrase_edges": [], "turn_ids": [],
+            "operator_counts": {},
+        },
+    )
+
+
+def test_a_complete_provider_charge_wins():
+    """Precedence 1 (mirrors ``costing.cost_per_session_distribution``)."""
+    reading = runner._session_cost_reading(
+        {"stats": _llm_stats(provider_cost_usd=0.0125)})
+    assert reading["source"] == "provider"
+    assert reading["usd"] == 0.0125
+    assert reading["lower_bound"] is False
+
+
+def test_a_charge_less_route_is_priced_from_the_map():
+    """Precedence 2 — the deepseek-direct lane the #5058 run used."""
+    reading = runner._session_cost_reading({"stats": _llm_stats()})
+    assert reading["source"] == "pricing_map"
+    assert reading["usd"] == reading["map_cost_usd"] > 0.0
+    assert reading["provider_cost_usd"] == 0.0
+    assert reading["lower_bound"] is False
+
+
+def test_an_unpriceable_route_is_a_disclosed_lower_bound():
+    """Precedence 3 — never a silently-fake measured 0.0."""
+    reading = runner._session_cost_reading(
+        {"stats": _llm_stats(provider="acme-cloud", model="mystery-1")})
+    assert reading["source"] == "unpriced"
+    assert reading["usd"] == 0.0
+    assert reading["lower_bound"] is True
+    assert reading["reason"] == "no_provider_charge_and_no_priced_lane"
+
+
+def test_calls_without_a_usage_rollup_are_a_lower_bound():
+    """#3824: calls the sink never accounted for are BILLED spend we cannot
+    see.  A provider-priced session beside them is still a lower bound."""
+    reading = runner._session_cost_reading(
+        {"stats": _llm_stats(provider_cost_usd=0.0125, unattributed=2)})
+    assert reading["source"] == "provider"
+    assert reading["usd"] == 0.0125
+    assert reading["lower_bound"] is True
+    assert reading["unattributed_calls"] == 2
+
+
+def test_the_mock_seam_is_a_named_none_not_an_unpriced_zero():
+    """No calls ran: 0.0 is COMPLETE (nothing to attribute), and the receipt
+    must say that rather than implying a measurement it could not make."""
+    reading = runner._session_cost_reading(
+        {"stats": {}, "extraction_mode": "replayed"})
+    assert reading["source"] == "none"
+    assert reading["usd"] == 0.0
+    assert reading["lower_bound"] is False
+    provenance = runner._cost_provenance(
+        [reading | {"session_id": "wp01"}])
+    assert provenance["source"] == "none"
+    assert "cost not tracked" in "\n".join(runner._cost_notes(provenance))
+
+
+def test_run_benchmark_records_the_real_capture_cost(monkeypatch):
+    """#5058 end to end: a billable LLM run attributes its spend.
+
+    Drives the REAL ``run_benchmark`` loop with a capture response shaped like
+    the SDK's own.  On the pre-fix code this reported ``cost_usd: 0.0`` no
+    matter what the seam said.
+    """
+    class _FakeCaptureSDK:
+        def capture_session(self, conversation, session_id=None, harness=None):
+            return {"ok": True, "extracted": 1, "stats": _llm_stats()}
+
+    _stub_graph_reads(monkeypatch)
+    report = runner.run_benchmark(
+        root=corpus.WRITE_PATH_DIR, session_ids=["wp01_quarry_debug"],
+        sdk=_FakeCaptureSDK(), ep_pass=False, run_id="w2b-5058-e2e",
+    )
+    provenance = report["cost_provenance"]
+    assert provenance["source"] == "pricing_map"
+    assert provenance["calls"] == 3
+    assert provenance["provider_cost_usd"] == 0.0
+    assert report["cost_usd"] == provenance["priced_cost_usd"] > 0.0
+    assert provenance["lower_bound"] is False
+    notes = "\n".join(report["notes"])
+    assert "cost not tracked" not in notes
+    assert "PRICING_MAP" in notes, (
+        "a map-priced figure must say it is not a provider receipt"
+    )
+    receipt = runner.build_receipt(report)
+    assert receipt["cost_provenance"] == provenance
+    assert runner.validate_receipt(receipt) == []
+
+
+def test_a_failed_run_carries_the_spend_it_incurred(monkeypatch):
+    """#5058, the reported receipt: the sealed run made live LLM calls and then
+    failed at runner level — its receipt said ``cost_usd: 0.0``,
+    ``quote_spans_total: None`` and ``notes: []``.
+
+    A failed extraction that made provider calls has REAL spend (#3359), so the
+    failed report carries the same provenance block and the same notes a
+    completed one would.
+    """
+    class _PartialEmissionSDK:
+        def capture_session(self, conversation, session_id=None, harness=None):
+            return {
+                "ok": False,
+                "errors": [
+                    "The final review pass failed and the earlier result was "
+                    "kept as-is. Retry the capture — the retry will re-attempt "
+                    "it."
+                ],
+                "diagnostics": ["S4 failed: HTTPError: 500"],
+                "stats": _llm_stats(),
+            }
+
+    _stub_graph_reads(monkeypatch)
+    report = runner.run_benchmark(
+        root=corpus.WRITE_PATH_DIR, session_ids=["wp01_quarry_debug"],
+        sdk=_PartialEmissionSDK(), ep_pass=False, run_id="w2b-5058-failed",
+    )
+    assert report["run_status"] == "failed"
+    assert report["cost_usd"] > 0.0
+    assert report["cost_provenance"]["source"] == "pricing_map"
+    assert isinstance(report["quote_spans_total"], int), (
+        "quote_spans_total was None on every failed receipt (#5058)"
+    )
+    assert report["notes"], "a failed receipt must keep the run's notes"
+    receipt = runner.build_receipt(report)
+    assert receipt["cost_usd"] > 0.0
+    assert isinstance(receipt["quote_spans_total"], int)
+    assert receipt["notes"]
+    assert runner.validate_receipt(receipt) == []
+
+
+def test_validate_receipt_requires_the_cost_provenance_block():
+    """#5058 (question 3): the figure must state how it was established."""
+    receipt = runner.build_receipt(_completed_report())
+    del receipt["cost_provenance"]
+    issues = runner.validate_receipt(receipt)
+    assert any("cost_provenance" in issue for issue in issues)
+
+
+def test_validate_receipt_refuses_a_zero_cost_without_a_disclosure():
+    """THE #5058 gate: a billable run recorded as $0.00 with no disclosure must
+    FAIL validation, not pass silently."""
+    report = _completed_report()
+    report["cost_usd"] = 0.0
+    report["cost_provenance"] = {
+        "source": "provider", "cost_usd": 0.0,
+        "provider_cost_usd": 0.0, "priced_cost_usd": 0.0,
+        "pricing_map_version": None,
+        "calls": 7, "calls_without_cost": 0, "calls_without_usage": 0,
+        "unattributed_calls": 0, "sessions": 7, "sessions_priced": 7,
+        "unpriced_sessions": [], "lower_bound": False,
+        "disclosure": None,
+    }
+    issues = runner.validate_receipt(runner.build_receipt(report))
+    assert any("disclosure" in issue for issue in issues), issues
+
+
+def test_validate_receipt_rejects_provenance_that_disagrees_with_cost_usd():
+    report = _completed_report()
+    report["cost_usd"] = 0.75
+    report["cost_provenance"] = {
+        "source": "provider", "cost_usd": 0.5,
+        "provider_cost_usd": 0.5, "priced_cost_usd": 0.0,
+        "pricing_map_version": None,
+        "calls": 7, "calls_without_cost": 0, "calls_without_usage": 0,
+        "unattributed_calls": 0, "sessions": 7, "sessions_priced": 7,
+        "unpriced_sessions": [], "lower_bound": False,
+        "disclosure": "provider: 7 extraction call(s) across 7 session(s)",
+    }
+    issues = runner.validate_receipt(runner.build_receipt(report))
+    assert any("disagrees with receipt.cost_usd" in issue for issue in issues)
+
+
+def test_validate_receipt_rejects_a_none_source_beside_real_calls():
+    report = _completed_report()
+    report["cost_provenance"] = {
+        "source": "none", "cost_usd": 0.0,
+        "provider_cost_usd": 0.0, "priced_cost_usd": 0.0,
+        "pricing_map_version": None,
+        "calls": 4, "calls_without_cost": 0, "calls_without_usage": 0,
+        "unattributed_calls": 0, "sessions": 4, "sessions_priced": 0,
+        "unpriced_sessions": [], "lower_bound": False,
+        "disclosure": "none: no extraction calls ran",
+    }
+    issues = runner.validate_receipt(runner.build_receipt(report))
+    assert any("cannot report nothing to attribute" in issue for issue in issues)
