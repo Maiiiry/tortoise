@@ -90,9 +90,17 @@ from typing import Any
 
 from tortoise.retype import KIND_PROP, RETYPE_TARGETS, node_key
 
-#: Report format discriminator. Bumped when a key's MEANING changes, so a diff
-#: between two reports can refuse to compare unlike instruments.
+#: Report format discriminator. Bumped when a key's MEANING changes, so a reader
+#: (or a diff) can tell two reports' schemas apart. ``diff_census`` cannot meet
+#: two CENSUS_FORMATs — both sides are produced by :func:`census` in one call — so
+#: the like-for-like refusal it applies is over the DUMPS' own ``format`` /
+#: ``dump_revision``, which genuinely can differ between two inputs.
 CENSUS_FORMAT = "tortoise-graph-census-v1"
+
+#: Dump-level fields that must MATCH before two dumps are like-for-like. A diff
+#: across dump formats (or across revisions of one format) compares unlike
+#: shapes, and its "moved" rows would attribute a schema change to the data.
+DUMP_IDENTITY_FIELDS: tuple[str, ...] = ("format", "dump_revision")
 
 #: Placeholder for an absent value. Never ``None``: a JSON ``null`` and a
 #: missing key are indistinguishable to a consumer, and both must be countable.
@@ -147,8 +155,10 @@ RULE_REASONS: dict[str, str] = {
         "fragment with no standalone meaning"
     ),
     RULE_DUPLICATE: (
-        "normalised text duplicates a node that is already kept (the survivor "
-        "is the best-connected member, tie-broken by node key)"
+        "its normalised text duplicates another node in the graph — this rule "
+        "fires on the NON-survivor, and the survivor (best knowledge degree, "
+        "then all degree, then node key) is chosen BEFORE the rules run, so an "
+        "earlier rule may drop the survivor too"
     ),
     RULE_ISOLATED: (
         "has no knowledge edge in either direction (IMPL / NAND / INPUT and "
@@ -236,10 +246,15 @@ def scan_nodes(
             problems.append(f"duplicate dump_id {dump_id!r} in the node list")
             continue
         seen.add(dump_id)
-        if not isinstance(node.get("props") or {}, dict):
+        # ``is not None``, NOT ``or {}``: an empty list / ``0`` / ``False`` /
+        # ``""`` is a falsy NON-dict, and normalising it to ``{}`` would accept
+        # corruption as "no props" — which then makes the node ``untyped`` and
+        # has RULE_UNTYPED propose dropping it.
+        prop_bag = node.get("props")
+        if prop_bag is not None and not isinstance(prop_bag, dict):
             problems.append(
                 f"node dump_id {dump_id!r} carries a non-dict prop bag "
-                f"({type(node.get('props')).__name__}) — that is CORRUPTION"
+                f"({type(prop_bag).__name__}: {prop_bag!r}) — that is CORRUPTION"
             )
             continue
         if node.get("labels") is not None and not isinstance(node.get("labels"), list):
@@ -302,7 +317,16 @@ def _pointer(props: Mapping[str, Any]) -> bool:
 
 
 def _is_operator(props: Mapping[str, Any]) -> bool:
-    return props.get("is_operator") is True
+    """Whether this node is an operator — the SAME test :mod:`tortoise.retype` applies.
+
+    ``retype`` decides "operator, never move" with truthiness
+    (``props.get("is_operator")``), so this module must not be stricter: a dump
+    carrying a truthy non-boolean (``1``, ``"true"``) is an operator to the
+    Phase-2 consumer, and a census that called it ``untyped`` would propose
+    DROPPING exactly the topology ``retype`` refuses to move. The two read one
+    dump contract; a divergence here fails open in the direction that loses edges.
+    """
+    return bool(props.get("is_operator"))
 
 
 #: Every provenance class this instrument can assign, in evaluation order.
@@ -316,7 +340,8 @@ def classify_provenance(
 
     Order is stated and deliberate, because each earlier class WINS:
 
-    1. ``operator`` — ``is_operator:true``. Structural, never droppable, and
+    1. ``operator`` — a truthy ``is_operator`` (the template's ``true``), the SAME
+       test :mod:`tortoise.retype` applies. Structural, never droppable, and
        checked FIRST so no provenance rule can swallow the topology.
     2. ``extracted`` — a provenance pointer (property, or an ``extractedFrom``
        edge). A leaf of a capture.
@@ -667,7 +692,17 @@ def census(
             if node_class[dump_id] == "operator" and not kept_by_type_degree.get(dump_id)
         ),
     }
-    told["retains_topology"] = told["kept_knowledge_edges"] > 0
+    # ``retains_topology`` is a PRESERVATION verdict, so it is "no knowledge edge
+    # was severed" — not "some edge survived". `kept > 0` labelled a cut that
+    # severs three of every four knowledge edges the same as one that severs
+    # none, and this field is the verdict column an owner picks a rule from.
+    # ``kept_knowledge_edges`` / ``severed_knowledge_edges`` still carry the counts.
+    told["retains_topology"] = told["severed_knowledge_edges"] == 0
+    told["kept_knowledge_edge_fraction"] = (
+        round(told["kept_knowledge_edges"] / told["knowledge_edges"], 4)
+        if told["knowledge_edges"]
+        else 1.0
+    )
 
     degree_by_class = {
         klass: _stats([knowledge_degree[i] for i in ids])
@@ -790,7 +825,7 @@ def census(
         },
     }
     warnings: list[str] = []
-    if not told["retains_topology"] and told["knowledge_edges"]:
+    if not told["kept_knowledge_edges"] and told["knowledge_edges"]:
         warnings.append(
             f"the proposed keep-set retains NONE of the {told['knowledge_edges']} "
             "knowledge edges — this cut severs every IMPL/NAND/INPUT link, so the "
@@ -799,7 +834,7 @@ def census(
     if told["severed_knowledge_edges"]:
         warnings.append(
             f"{told['severed_knowledge_edges']} knowledge edge(s) have an endpoint "
-            "the predicate drops"
+            "the predicate drops — retains_topology is false"
         )
     if duplicate_key_groups:
         warnings.append(
@@ -823,9 +858,17 @@ def census(
 
 
 def flatten_counts(value: Any, prefix: str = "") -> dict[str, int]:
-    """``{dotted.path: number}`` for every count in a report. Deterministic."""
+    """``{dotted.path: number}`` for every number in a report. Deterministic.
+
+    Booleans are NUMBERS here (``0`` / ``1``), not skipped: ``retains_topology``
+    is the report's headline verdict, and a diff that dropped it would report
+    "nothing moved" when the topology verdict flipped between two graphs — the
+    one comparison this instrument's plan exists to make.
+    """
     out: dict[str, int] = {}
     if isinstance(value, bool):
+        if prefix:
+            out[prefix] = int(value)
         return out
     if isinstance(value, int):
         out[prefix] = value
@@ -854,15 +897,30 @@ def diff_census(
     graph, then the diff" — because a class that exists in one graph and not the
     other is the only mechanical evidence of what a retire would discard.
     """
-    before_report = census(before, rules=rules, fragment_max_chars=fragment_max_chars)
-    after_report = census(after, rules=rules, fragment_max_chars=fragment_max_chars)
-    if before_report["format"] != after_report["format"]:
+    # Like-for-like is a property of the DUMPS, not of the reports: both reports
+    # are stamped by this module's own CENSUS_FORMAT in this very call, so a
+    # report-format comparison can never disagree (it used to look like a guard
+    # and guarded nothing). Format/revision CAN differ between two inputs, and a
+    # diff across them would attribute a schema change to the data.
+    unlike = [
+        field
+        for field in DUMP_IDENTITY_FIELDS
+        if before.get(field) != after.get(field)
+    ]
+    if unlike:
         raise CensusError(
             [
-                f"cannot diff {before_report['format']!r} against "
-                f"{after_report['format']!r} — unlike instruments"
+                "cannot diff two unlike instruments — "
+                + "; ".join(
+                    f"{field}: {before.get(field)!r} vs {after.get(field)!r}"
+                    for field in unlike
+                )
+                + f" (a diff across dump {'/'.join(unlike)} compares different "
+                "shapes and would report the schema change as moved data)"
             ]
         )
+    before_report = census(before, rules=rules, fragment_max_chars=fragment_max_chars)
+    after_report = census(after, rules=rules, fragment_max_chars=fragment_max_chars)
     left = flatten_counts(before_report)
     right = flatten_counts(after_report)
     moved: dict[str, dict[str, int]] = {}
@@ -870,10 +928,23 @@ def diff_census(
         a, b = left.get(path, 0), right.get(path, 0)
         if a != b:
             moved[path] = {"before": a, "after": b, "delta": b - a}
+    # Non-numeric rows that moved: the snapshot's own labels. Reported, not
+    # refused — a local snapshot and a hosted graph legitimately carry different
+    # ``graph_name`` s, and that IS the drift a reader must see.
+    moved_labels: dict[str, dict[str, str]] = {}
+    for field in ("dump_format", "graph_name"):
+        before_value = before_report["snapshot"][field]
+        after_value = after_report["snapshot"][field]
+        if before_value != after_value:
+            moved_labels[f"snapshot.{field}"] = {
+                "before": str(before_value),
+                "after": str(after_value),
+            }
     return {
         "format": f"{CENSUS_FORMAT}+diff",
         "moved": moved,
-        "changed_paths": len(moved),
+        "moved_labels": moved_labels,
+        "changed_paths": len(moved) + len(moved_labels),
         "before_sha256": before_report["census_sha256"],
         "after_sha256": after_report["census_sha256"],
     }

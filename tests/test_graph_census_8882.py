@@ -416,7 +416,13 @@ def test_negative_parameters_are_refused():
 
 
 def test_topology_block_counts_severed_edges():
-    """Dropping an IMPL endpoint severs the edge — the count must say so."""
+    """Dropping an IMPL endpoint severs the edge — the count must say so.
+
+    ``retains_topology`` is a PRESERVATION verdict, so severing even one of two
+    knowledge edges makes it false. ``kept_knowledge_edges > 0`` would have read
+    "yes" here — a cut that severs half the topology reported as preserving it
+    (review finding: the verdict column flattened 16,444/21,636 severed to "yes").
+    """
     dump = _curated_shaped()
     report = census(dump, rules=[RULE_EXTRACTED])
     topology = report["predicate"]["topology"]
@@ -424,9 +430,20 @@ def test_topology_block_counts_severed_edges():
     assert topology["knowledge_edges"] == 2
     assert topology["severed_knowledge_edges"] == 1
     assert topology["dropped_knowledge_endpoints"] == 1
-    assert topology["kept_knowledge_edges"] == 1
-    assert topology["retains_topology"] is True
+    assert topology["kept_knowledge_edges"] == 1  # > 0 …
+    assert topology["retains_topology"] is False  # … and STILL not "retains"
+    assert topology["kept_knowledge_edge_fraction"] == 0.5
+    assert any("retains_topology is false" in w for w in report["warnings"])
     assert report["predicate"]["dropped_by_label"]["Point/statement"] == 1
+
+
+def test_retains_topology_is_true_only_when_nothing_is_severed():
+    """The complementary half: a cut that severs nothing IS topology-preserving."""
+    report = census(_curated_shaped(), rules=[RULE_ISOLATED])
+    topology = report["predicate"]["topology"]
+    assert topology["severed_knowledge_edges"] == 0
+    assert topology["retains_topology"] is True
+    assert topology["kept_knowledge_edge_fraction"] == 1.0
 
 
 def test_a_cut_that_severs_every_edge_is_a_warning_not_a_silent_success():
@@ -469,6 +486,7 @@ def test_untyped_only_cut_keeps_every_edge_in_the_measured_shape():
     topology = report["predicate"]["topology"]
     assert topology["severed_knowledge_edges"] == 0
     assert topology["kept_knowledge_edges"] == topology["knowledge_edges"]
+    assert topology["retains_topology"] is True
 
 
 # ── identities: reported, never refused ─────────────────────────────────────
@@ -540,6 +558,29 @@ def test_non_dict_prop_bag_is_refused():
         census(dump)
 
 
+@pytest.mark.parametrize("prop_bag", [[], 0, False, "", ()])
+def test_falsy_non_dict_prop_bag_is_also_refused(prop_bag):
+    """``or {}`` used to normalise every falsy non-dict to a dict and accept it.
+
+    Accepted-as-empty makes the node ``untyped`` (it has no kind property), and
+    ``RULE_UNTYPED`` then PROPOSES DROPPING it — corruption converted into a drop
+    recommendation by the instrument whose docstring promises a malformed dump is
+    refused with the full problem list.
+    """
+    dump = _curated_shaped()
+    dump["nodes"][0]["props"] = prop_bag
+    with pytest.raises(CensusError, match="non-dict prop bag"):
+        census(dump)
+
+
+def test_absent_prop_bag_is_still_accepted():
+    """The fail-closed check must not fire on a node that simply carries props=None."""
+    dump = _curated_shaped()
+    dump["nodes"][0]["props"] = None
+    report = census(dump)
+    assert report["totals"]["nodes"] == len(dump["nodes"])
+
+
 def test_non_list_label_set_is_refused():
     dump = _curated_shaped()
     dump["nodes"][0]["labels"] = "Point"
@@ -569,12 +610,19 @@ def test_missing_node_list_is_refused():
 # ── diff ────────────────────────────────────────────────────────────────────
 
 
-def test_flatten_counts_is_deterministic_and_skips_booleans():
+def test_flatten_counts_records_booleans_as_numbers():
+    """A bool is 0/1 here, never skipped.
+
+    ``predicate.topology.retains_topology`` is the report's headline verdict; if
+    ``flatten_counts`` skipped bools, a diff could not show it flip — the one
+    comparison the plan's "and then the diff" exists to make.
+    """
     report = census(_curated_shaped())
     flat = flatten_counts(report)
     assert flat == flatten_counts(report)
     assert flat["totals.nodes"] == 6
     assert flat["predicate.keep"] == report["predicate"]["keep"]
+    assert flat["predicate.topology.retains_topology"] in (0, 1)
     assert not any(isinstance(v, bool) for v in flat.values())
 
 
@@ -605,14 +653,125 @@ def test_diff_of_identical_snapshots_moves_nothing():
 
 
 def test_diff_refuses_an_unlike_instrument():
+    """A dump format mismatch is REFUSED — it is not a moved row.
+
+    Both reports are stamped by ``census()`` in the same call, so the old
+    ``report["format"] != report["format"]`` guard was unreachable; the dumps'
+    own ``format`` / ``dump_revision`` genuinely can differ, and a diff across
+    them would report a schema change as drifted data.
+    """
     dump = _curated_shaped()
     other = copy.deepcopy(dump)
     other["format"] = "some-other-dump-v9"
-    # The format is REPORTED, not refused: a snapshot's own label is data. A
-    # like-for-like comparison is still possible, so the diff must succeed and
-    # show the moved snapshot.format row rather than pre-judging it.
+    with pytest.raises(CensusError, match="unlike instruments"):
+        diff_census(dump, other)
+
+    revised = copy.deepcopy(dump)
+    revised["dump_revision"] = 3
+    with pytest.raises(CensusError, match="dump_revision"):
+        diff_census(dump, revised)
+
+
+def test_diff_reports_a_moved_graph_name_instead_of_refusing_it():
+    """The plan's own comparison: local snapshot vs hosted graph.
+
+    Their ``graph_name`` (and ``dumped_at``) legitimately differ, so the difference
+    must be REPORTED — that is the drift a reader is looking for — not refused.
+    """
+    dump = _curated_shaped()
+    other = copy.deepcopy(dump)
+    other["graph_name"] = "tortoise-hosted"
     diff = diff_census(dump, other)
-    assert "snapshot.dump_format" in diff["moved"] or diff["changed_paths"] == 0
+    assert diff["moved_labels"]["snapshot.graph_name"] == {
+        "before": "test",
+        "after": "tortoise-hosted",
+    }
+    assert diff["changed_paths"] == len(diff["moved"]) + 1
+
+
+def test_diff_shows_a_retains_topology_flip():
+    """The headline verdict must be diffable, or the diff is blind to the change.
+
+    Two graphs that differ only in whether the IMPL target is droppable: under
+    ``extracted`` the first severs the edge (retains_topology false) and the
+    second keeps it (true). ``flatten_counts`` used to skip bools, so this flip
+    produced ``moved == {}``.
+    """
+    def shaped(with_pointer: bool) -> dict:
+        claim = _node(
+            2, ["Point"], id="claim", pointKind="statement",
+            content="a statement comfortably longer than the fragment threshold",
+        )
+        if with_pointer:
+            claim["props"]["provenanceSource"] = "x.md"
+        return _dump(
+            [_node(1, ["Point"], id="op", is_operator=True, op_type="IMPL",
+                      content="IMPL(op,claim)"), claim],
+            [_edge(1, 2, "IMPL")],
+        )
+
+    before = shaped(with_pointer=True)
+    after = shaped(with_pointer=False)
+    assert census(before)["predicate"]["topology"]["retains_topology"] is False
+    assert census(after)["predicate"]["topology"]["retains_topology"] is True
+
+    diff = diff_census(before, after, fragment_max_chars=0)
+    assert diff["moved"]["predicate.topology.retains_topology"] == {
+        "before": 0,
+        "after": 1,
+        "delta": 1,
+    }
+
+
+# ── the operator test is the CONSUMER's test ────────────────────────────────
+
+
+@pytest.mark.parametrize("flag", [True, 1, "true", "yes"])
+def test_truthy_non_boolean_is_operator_like_retype_reads_it(flag):
+    """``retype`` decides "operator, never move" by TRUTHINESS (``retype.py``).
+
+    A census stricter than its consumer classified a truthy non-boolean
+    ``is_operator`` as ``untyped`` and proposed dropping it — the exact topology
+    Phase 2 refuses to move. Divergence here fails open toward losing edges.
+    """
+    nodes = [
+        _node(1, ["Point"], id="op", is_operator=flag, op_type="IMPL", content="x"),
+        _node(2, ["Point"], id="claim", pointKind="statement",
+              content="a statement comfortably longer than the fragment threshold"),
+    ]
+    report = census(_dump(nodes, [_edge(1, 2, "IMPL")]))
+    assert report["provenance"]["classes"]["operator"] == 1
+    assert report["predicate"]["droppable"] == 1
+    assert report["predicate"]["operators_kept"] == 1
+    assert classify_provenance(nodes[0]) == "operator"
+
+
+# ── the duplicate reason must be true under the default cut ────────────────
+
+
+def test_duplicate_reason_does_not_claim_the_survivor_is_kept():
+    """Survivors are chosen BEFORE the rules run, so an earlier rule can drop them.
+
+    The published reason said the duplicate's twin is "already kept"; in this dump
+    the better-connected survivor is ``extracted`` and is dropped, while its
+    redundant twin is attributed to ``duplicate``.
+    """
+    from tortoise.graph_census import RULE_REASONS
+
+    assert "already kept" not in RULE_REASONS[RULE_DUPLICATE]
+    nodes = [
+        _node(1, ["Point"], id="op", is_operator=True, op_type="IMPL", content="x"),
+        _node(2, ["Point"], id="survivor", pointKind="statement",
+              provenanceSource="x.md",
+              content="the same long sentence about the graph twice over"),
+        _node(3, ["Point"], id="twin", pointKind="statement",
+              content="The same long sentence about the graph twice over."),
+    ]
+    report = census(_dump(nodes, [_edge(1, 2, "IMPL")]))
+    reasons = report["predicate"]["drop_by_reason"]
+    assert reasons[RULE_EXTRACTED] == 1  # the SURVIVOR, dropped as extracted
+    assert reasons[RULE_DUPLICATE] == 1  # its twin
+    assert report["predicate"]["keep"] == 1  # only the operator
 
 
 # ── the CLI ─────────────────────────────────────────────────────────────────
@@ -678,6 +837,29 @@ def test_cli_diff_mode(tmp_path, capsys):
     assert main(["--dump", str(first), "--diff", str(second)]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["moved"]["totals.nodes"]["delta"] == 1
+
+
+def test_cli_usage_errors_exit_1_not_the_refusal_code(tmp_path):
+    """``2`` means REFUSED (a dump that cannot be measured); usage is ``1``.
+
+    argparse's default is ``2``, so a caller keying on the exit code could not
+    tell a mistyped flag from corruption.
+    """
+    from tools.graph_census import main
+
+    with pytest.raises(SystemExit) as no_dump:
+        main([])
+    assert no_dump.value.code == 1
+
+    dump_path = _write(tmp_path, _curated_shaped())
+    with pytest.raises(SystemExit) as samples_with_diff:
+        main(["--dump", str(dump_path), "--diff", str(dump_path), "--samples", "3"])
+    assert samples_with_diff.value.code == 1
+
+    # …and a genuinely refused dump still exits 2, so the two stay distinct.
+    corrupt = _curated_shaped()
+    corrupt["edges"].append(_edge(1, 999, "IMPL"))
+    assert main(["--dump", str(_write(tmp_path, corrupt, "bad.json"))]) == 2
 
 
 def test_cli_requires_a_dump(tmp_path):

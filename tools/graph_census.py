@@ -16,7 +16,12 @@ output is a report of counts per class plus the proposed keep/drop predicate.
     python tools/graph_census.py --dump snapshot.json --fragment-max-chars 60
     python tools/graph_census.py --dump snapshot.json --rules extracted,isolated
 
-Exit codes: ``0`` ok · ``2`` refused (problems on stderr) · ``1`` usage/IO.
+Exit codes: ``0`` ok · ``1`` usage/IO (a bad flag combination, a missing or
+non-JSON file) · ``2`` refused (the dump itself is unusable — corruption, a
+dangling edge, an unknown rule id — and the problem list is on stderr).
+Argument errors therefore exit ``1``, not argparse's default ``2``: a caller must
+be able to tell "I passed the wrong flags" from "this dump cannot be measured"
+without parsing stderr.
 
 Why the refusals exist: a census that silently measured a different population
 than the re-typing pass will consume is worse than no census — it would be a
@@ -83,8 +88,22 @@ def _parse_rules(raw: str) -> list[str]:
     return rules
 
 
+class _UsageParser(argparse.ArgumentParser):
+    """Usage errors exit ``1`` — ``2`` is reserved for a REFUSED dump.
+
+    argparse's default is ``2``, which would make "you typed ``--samples`` with
+    ``--diff``" indistinguishable from "this dump is corrupt" to any caller
+    keying on the exit code.
+    """
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _UsageParser(
         description="Census a logical graph dump offline (#8882 Phase 1)."
     )
     parser.add_argument(
@@ -122,6 +141,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, help="write the report here (default: stdout)")
     args = parser.parse_args(argv)
 
+    # Refuse a silently-dropped flag: --samples is a per-rule evidence sample
+    # taken from a keep/drop decision, and --diff makes no decision — accepting it
+    # and ignoring it would report a sample set the caller thinks they have.
+    if args.diff and args.samples:
+        parser.error("--samples cannot be combined with --diff (a diff has no drop samples)")
+
     dump = _load_json(args.dump, "dump")
     if not isinstance(dump, dict):
         raise SystemExit(f"dump is not a JSON object: {args.dump}")
@@ -153,7 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     _dump_json(report, args.out, "census")
 
     if args.diff:
-        print(f"changed counts: {report['changed_paths']}", file=sys.stderr)
+        labels = sorted(report["moved_labels"])
+        suffix = f" · moved labels: {', '.join(labels)}" if labels else ""
+        print(f"changed paths: {report['changed_paths']}{suffix}", file=sys.stderr)
         return 0
     predicate = report["predicate"]
     print(
