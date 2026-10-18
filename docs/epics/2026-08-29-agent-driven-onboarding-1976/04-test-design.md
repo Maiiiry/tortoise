@@ -60,35 +60,41 @@ The map's first indicator is that **every in-scope capability maps to at least o
 mapping is written down here rather than left to be inferred from a surface's parenthetical. Each row names the surface
 whose contract covers the capability, and that surface's `Test Layer` column is the layer the capability is verified at.
 
-| Scoped capability (`03-scope.md` §2) | Surface(s) | Verified at |
+| Scoped capability (`03-scope.md` §2) | Surface(s) | Verified at (each surface's own `Test Layer`, verbatim) |
 |---|---|---|
-| W1 wizard shrink | 16 | hosted-e2e + walk-through |
-| W1 org-name step | 3 | integration + hosted-e2e |
-| W2 universal command | 5 | contract + integration + manual (6 harnesses) |
-| W2 fork card | 4 | hosted-e2e + unit |
-| W3 seed | 7 | integration + hosted-e2e + unit |
-| W3 decide nudge | 8 | integration + walk-through |
+| W1 wizard shrink | 16 | hosted-e2e + manual/browser |
+| W1 org-name step | 3 | integration (docker lane) + hosted-e2e |
+| W2 universal command | 5, 6 | 5: contract + integration (config-write dry-run) + manual (all 6) · 6: skill lint + integration (state read/write) |
+| W2 fork card | 4 | hosted-e2e + unit (state key) |
+| W3 seed | 7 | integration (docker lane) + hosted-e2e + unit (ontology) |
+| W3 decide nudge | 8 | integration (existing decide tests) + walk-through |
 | W4 Overview calm | 9 | hosted-e2e + ux-verification |
-| W4 Settings tab | 10 | hosted-e2e + integration |
-| W5 graph-held state | 1, 2, 17 | integration (docker) + regression + hosted-e2e |
-| W5 setup card | 9, 10 | hosted-e2e — the continuation card renders on Overview (9) and its Setup-guide home lives in Settings (10); the journey continuity it promises is 17's "no what-do-I-do-now moment" |
+| W4 Settings tab | 10 | hosted-e2e + integration (toggle persistence) |
+| W5 graph-held state | 1, 2, 17 | 1: integration (docker lane) + unit (idempotency) · 2: integration (docker lane) + regression on `/v1/onboarding/state` · 17: hosted-e2e (full journey) + walk-through |
+| W5 setup card | 9, 10 | 9: hosted-e2e + ux-verification · 10: hosted-e2e + integration (toggle persistence) |
 | W6 capture disclosure | 11 | integration + hosted-e2e |
-| W7 invite-accept | 12 | integration + contract + hosted-e2e |
+| W7 invite-accept | 12 | integration + contract + hosted-e2e (most failure-prone surface) |
 | W7 fusion | 12 | integration + contract + hosted-e2e (the OTP guard is 12's privilege-accumulation failure mode) |
 | W8 builder catalog | 13 | unit + integration + contract |
-| W9 trigger/entry | 1, 3 | integration — the state node is initialized in org-create's statement (3) and read at every entry door (1) |
-| W11 telemetry | 14 | integration + regression |
-| W12 self-hosted | 15 | integration + manual |
+| W9 trigger/entry | 1, 3, 10 | 1: integration (docker lane) + unit (idempotency) · 3: integration (docker lane) + hosted-e2e · 10: hosted-e2e + integration (toggle persistence) |
+| W11 telemetry | 14 | integration + regression (existing `analytics.py` tests) |
+| W12 self-hosted | 15 | integration (self-host lane) + manual |
 
-Two rows are worth stating because they are the ones a reader would otherwise have to infer:
+Three rows are worth stating because they are the ones a reader would otherwise have to infer, and each is deliberate:
 
-- **W5 setup card** is the only capability with no surface of its own — it is a rendering of state that two other
-  surfaces own. It maps to 9 and 10 deliberately, and the *promise* it makes (progress is never a mystery) is what 17's
-  friction test checks.
-- **W9 trigger/entry** is a property of two surfaces, not one: surfacing it as a separate surface would have duplicated
-  3's transaction contract.
+- **W5 setup card** has no surface of its own — it is a *rendering* of state that two other surfaces own. It maps to 9
+  (the continuation card on Overview) and 10 (its Setup-guide home in Settings), and the promise it makes — progress is
+  never a mystery — is what surface 17's friction test checks.
+- **W9 trigger/entry** is a property of three surfaces, not one: org-create fires it (3), the state node is what every
+  entry door reads (1), and the Settings Setup guide is one of those doors (10 — its own row names W9 as a consumer, and
+  the scope's W9 includes "Settings Setup guide idempotent re-entry"). A separate surface would have duplicated 3's
+  transaction contract.
+- **W2 universal command** covers two surfaces because the capability is both the command (5) and the skill it installs
+  (6); the document's own E2E-5 row and its verification checklist both group them as "5-6 install command + skill".
 
-Every capability above has at least one surface, and every surface has a test layer, so neither direction is unassigned.
+Between the rows above and the surface table, the mapping holds in both directions: every one of the 17 capabilities has
+at least one surface, and every one of the 17 surfaces is reachable from at least one capability (6 is the row that is
+easy to miss, which is why it is named).
 
 ## E2E Traceability (scope high-level E2E → surfaces)
 
