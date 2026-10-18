@@ -367,7 +367,7 @@ def test_an_absent_counter_falls_back_and_the_counter_stays_one_node_read(
         f"on a graph that has a counter")
 
 
-@pytest.mark.parametrize("corrupt", [-1, "not-a-number"])
+@pytest.mark.parametrize("corrupt", [-1, "not-a-number", True, 2.9, "1", " 2 "])
 def test_a_corrupt_counter_cannot_starve_delivery(sdk_factory, corrupt):
     """#8098 review (ISSUE 1): an UNUSABLE counter must not read as head 0.
 
@@ -379,25 +379,42 @@ def test_a_corrupt_counter_cannot_starve_delivery(sdk_factory, corrupt):
     dispatched by the dream cycle AND the sweep, silently, with no log line.
 
     The safe direction is the ABSENT-counter fallback already in the function
-    (the events' own ``max(:GraphEvent.seq)``): it can only over-admit. Both
-    parametrisations are red pre-fix — ``event_head_seq`` returned 0 and
-    ``dispatch_pending`` delivered nothing.
+    (the events' own ``max(:GraphEvent.seq)``): it can only over-admit.
+
+    Each parameter is a shape the pre-fix ``max(0, int(value))`` body turns into
+    a head BELOW the real one, in one of three ways: ``'1'``, ``' 2 '``, ``True``
+    and ``2.9`` are PARSED by ``int()`` into 1, 2, 1, 2; ``-1`` is parsed and
+    then clamped to 0; ``'not-a-number'`` is unparseable and takes the
+    ``except`` branch to 0. ``event_store.next_seq`` refuses the non-number and
+    ``bool`` classes outright ("refused, never coerced"), but it does NOT refuse
+    the non-integral float — ``2.9`` is bumped to ``3.9`` there, re-issuing a seq
+    — so no counter in this list becomes trustworthy on its own.
+
+    The subscription is deliberately left one event behind rather than at
+    ``cursor: 0``: ``0 < 1`` is true, so a head of 1 is still ADMITTED at cursor
+    0 and the gate half of the assertion would pass green at a head it must
+    reject.
     """
     sdk = sdk_factory(ensure_schema=True)
     proj = sdk._get_proj()
-    _seed_events(sdk, n=2)
-    assert wd.event_head_seq(proj.g) == 2, "the seeded graph should have a head"
-
-    # Corrupt the counter the writers bump — the #3902 / pre-#5379 shapes.
-    proj.g.query("MATCH (m:GraphEventMeta) SET m.last_seq=$bad",
-                 params={"bad": corrupt})
+    _seed_events(sdk, n=3)
+    assert wd.event_head_seq(proj.g) == 3, "the seeded graph should have a head"
 
     now = datetime.now(UTC)
     sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
                                  now=now)
     assert sub["cursor"] == 0
+    proj.g.query(
+        "MATCH (s:ContextSubscription {sub_id:$id}) SET s.cursor = 1",
+        params={"id": sub["sub_id"]})
+    assert wd.due_subscription_count(proj.g, now) == 1, (
+        "control: a behind subscription on a healthy counter is admitted")
 
-    assert wd.event_head_seq(proj.g) >= 2, (
+    # Corrupt the counter the writers bump — the #3902 / pre-#5379 shapes.
+    proj.g.query("MATCH (m:GraphEventMeta) SET m.last_seq=$bad",
+                 params={"bad": corrupt})
+
+    assert wd.event_head_seq(proj.g) >= 3, (
         f"a corrupt counter ({corrupt!r}) read as the head — every "
         "subscription then looks caught up and DELIVERY stops with no log line")
     assert wd.due_subscription_count(proj.g, now) == 1, (

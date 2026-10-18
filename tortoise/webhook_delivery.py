@@ -555,51 +555,74 @@ def event_head_seq(graph) -> int:
     allocator — a graph that has never emitted. The fallback still asks the
     events themselves, because a store whose events predate the counter (a
     fixture, or a graph written by ``append_event`` directly) must not be
-    STARVED by a gate that assumed "no counter ⇒ no events"; the fallback runs
-    only on the un-countered graph, so the steady state keeps the one-node read.
+    STARVED by a gate that assumed "no counter ⇒ no events". ABSENT is one of
+    TWO cases that reach the fallback (the other is a counter that is not a
+    trustworthy position, below); a healthy counter keeps the steady state at
+    the one-node read.
 
-    ⛔ A corrupt (non-numeric or negative) counter FALLS BACK to the events'
-    own ``max(:GraphEvent.seq)`` — the SAME read the absent-counter branch
-    performs — and never reads as 0 (#8098 review, ISSUE 1). Two reasons, and
-    the second is why this is not a cosmetic preference:
+    A corrupt counter is treated EXACTLY like an absent one, and for the same
+    reason: ``head`` is not the sweep's gate alone. The dispatcher threads it
+    into ``_BEHIND_PREDICATE`` (``s.cursor < $head``), so a head of 0 answers
+    "nothing owed" for every subscription on the graph — ``create_subscription``
+    writes ``cursor: 0``, and ``0 < 0`` is false. Reading a corrupt counter as 0
+    would therefore STARVE the graph's deliveries with no log line at all, which
+    is the opposite of this gate's stated bias.
 
-    * 0 is the STALLING direction, not the safe one. The house rule on this
-       path is "over-admit is cheap, stalling is not"; a counter that reads as
-       0 on a graph holding events with ``seq > 0`` makes every subscription
-       look caught up.
-    * ``head`` is NOT only the sweep's cheap gate. ``dispatch_pending`` reads it
-       once and threads it into ``_due_subscriptions``, whose
-       ``s.cursor < $head`` clause decides whether a subscription is returned at
-       all. So on a corrupt-counter graph a 0 would stop DELIVERY (dream cycle
-       and sweep alike) with no log line — the pre-fix behaviour was harmless
-       only because the delivery path never read the counter.
+    "Corrupt" is the same domain ``event_store.next_seq`` refuses on the write
+    side: anything that is not a real number (a numeric STRING included — the
+    store is explicit that a property of another type is "refused, never
+    coerced", because ``'5' + 1`` cannot be compared), a NEGATIVE value, or a
+    ``bool`` — which is an ``int`` subclass, so ``int(True) == 1`` would
+    otherwise pass as a trustworthy head of 1 while the events run to 5. A
+    non-integral float (``2.9``) is not a position either. All of them take the
+    events fallback, whose head is at or above every deliverable seq: it can only
+    over-admit, never stall.
 
-    The fallback runs only on an already-broken graph, so the steady state keeps
-    the one-node read. A too-LARGE counter is still left alone — it over-admits,
-    which costs one SDK open, while clamping it could stall deliveries.
+    ⚠️ COST, stated rather than implied (an earlier revision of this docstring
+    priced the corrupt path as "one SDK open" — it is not). The fallback is the
+    aggregate over ``:GraphEvent`` the opening paragraph exists to avoid on the
+    steady path, so an UNTRUSTWORTHY graph pays it on every pass, and the counter
+    does not become trustworthy on its own — which is #5379's territory, not this
+    read's:
+
+    * a non-number, a negative or a ``bool`` is REFUSED by ``next_seq`` and left
+      unchanged (re-seeding it could re-issue the seq of an existing event);
+    * a non-integral float is NOT refused there — ``2.9`` is bumped to ``3.9``
+      and a seq is handed out over an existing ``:GraphEvent`` (the #4653
+      collision class), so it stays non-integral and keeps taking this fallback.
+
+    Repair belongs to the event store (#3902/#5379, and the float case is not yet
+    covered by either). Over-admitting a broken graph once per interval is the
+    cheap side of the asymmetry, and it beats silently never dispatching the
+    graph again. A too-LARGE counter is left alone for that same asymmetry — it
+    over-admits too.
     """
-    def _events_head() -> int:
-        """The events' own max seq — the fallback for an unusable counter."""
-        rows = graph.query(
-            "MATCH (e:GraphEvent) RETURN max(e.seq)").result_set
-        value = rows[0][0] if rows else None
-        try:
-            return max(0, int(value))
-        except (TypeError, ValueError):
-            return 0
+
+    def _as_seq(raw) -> int | None:
+        """A usable counter value, or ``None`` when it must not be trusted.
+
+        Strictly numeric: no string coercion (``event_store`` refuses a
+        non-number rather than parsing it), no ``bool`` (an ``int`` subclass),
+        no non-integral float. The LAST of those is this function's addition to
+        ``next_seq``'s guard rather than a copy of it, and a counter at/above
+        ``MAX_SEQ`` is accepted here although ``next_seq`` refuses it — both for
+        the reason the outer docstring gives: over-admitting is the cheap side.
+        """
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        if isinstance(raw, float) and not raw.is_integer():
+            return None
+        seq = int(raw)
+        return seq if seq >= 0 else None
 
     rows = graph.query(
         "MATCH (m:GraphEventMeta) RETURN max(m.last_seq)").result_set
-    value = rows[0][0] if rows else None
-    if value is None:
-        return _events_head()
-    try:
-        head = int(value)
-    except (TypeError, ValueError):
-        return _events_head()
-    if head < 0:
-        return _events_head()
-    return head
+    head = _as_seq(rows[0][0] if rows else None)
+    if head is None:
+        rows = graph.query(
+            "MATCH (e:GraphEvent) RETURN max(e.seq)").result_set
+        head = _as_seq(rows[0][0] if rows else None)
+    return 0 if head is None else head
 
 
 def due_subscription_count(graph, now: datetime | None = None,

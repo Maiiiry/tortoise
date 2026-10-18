@@ -2931,6 +2931,20 @@ async def _dispatch_webhooks(org_id: str, graph_namespace: str | None = None,
 # has never registered a webhook never gets an SDK, a projection, a journal bind
 # or an embedder warm-up from this path at all.
 #
+# ⚠️ ONE CONDITIONAL THIRD READ. A graph whose `:GraphEventMeta.last_seq` is
+# ABSENT or not a trustworthy position (a non-number — including a numeric
+# string, which `event_store.next_seq` refuses to coerce — a negative, a
+# `bool`, or a non-integral float) makes the head fall back to
+# `MATCH (e:GraphEvent) RETURN max(e.seq)` — the label aggregate the steady path
+# deliberately avoids — so a broken graph pays a scan per pass, and it keeps
+# paying it: `next_seq` refuses the non-number/negative/bool classes and leaves
+# them unchanged, and a non-integral float is bumped into another non-integral
+# value (`2.9` -> `3.9`, re-issuing a seq: the #4653 class). Repair is
+# #3902/#5379's, not this read's. The alternative reading of that counter (as 0)
+# made every subscription look caught up, so the graph was never dispatched again
+# — silently. Over-admitting a broken graph is the cheap side of that asymmetry.
+# See `webhook_delivery.event_head_seq`'s docstring.
+#
 # ⛔ THE "answered yes" HALF IS THE WHOLE POINT (#8098 review F1/F3). The gate
 # is TWO clauses — due by TIME *and* behind the stream — because the temporal
 # half alone is true for the entire life of every healthy subscription, which
