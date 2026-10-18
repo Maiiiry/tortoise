@@ -1113,17 +1113,17 @@ def restore_graph_key(
                 # published `error=""`, which a consumer testing `error is not None` (the
                 # test the `str | None` annotation invites) reads as an error on a clean
                 # restore. `as_dict()` publishes this field.
-                (
-                    "; ".join(
-                        part for part in (
-                            f"{type(error).__name__}: {error}",
-                            ("witness fault: " + ", ".join(instrument_failures)
-                             if instrument_failures else None),
-                        ) if part
-                    ) or None
-                    if error is not None
-                    else unmeasured_reason
-                )
+                # UP034: the conditional expression already delimits this value —
+                # its own parentheses were extraneous (ruff 0.16.4, pinned).
+                "; ".join(
+                    part for part in (
+                        f"{type(error).__name__}: {error}",
+                        ("witness fault: " + ", ".join(instrument_failures)
+                         if instrument_failures else None),
+                    ) if part
+                ) or None
+                if error is not None
+                else unmeasured_reason
             ),
         )
         logger.info("graph-key restore finished: %s", observation.sentence())
