@@ -2958,6 +2958,32 @@ async def _dispatch_webhooks(org_id: str, graph_namespace: str | None = None,
 # `enumerate_org_graphs` call: `_sweep_graph_list` SYNTHESIZES the default graph
 # from the authoritative name seam, so pre-#2083 orgs (which have no `Graph`
 # nodes at all) are swept instead of silently skipped.
+#
+# ⛔ CONTROL-PLANE COST — the term the per-graph table above does NOT cover, and
+# the one that scales with the fleet's LARGEST dimension (#8098 review, P2).
+# The enumeration walks EVERY org, SERIALLY, on the one daemon worker: one
+# control-plane query for `enumerate_orgs`, then per org `_sweep_graph_list` =
+# `org_graph_name` (ONE query) + `enumerate_org_graphs` -> `graph_metadata` (on
+# the Supabase lane: the `organizations` row, then the kind='default' `graphs`
+# row, then the active custom rows — ~3 more). So ~4 PostgREST round trips PER
+# ORG PER PASS at the 60 s default: ~4N/min against the SAME control plane the
+# auth path uses. Two things a reader must not have to infer:
+#
+#   * the identical walk already runs HOURLY (`.github/scripts/registry-cron.sh`
+#     -> POST /v1/internal/backups/sweep). This sweep is that walk at 60x the
+#     cadence, and it is bounded by nothing but the fleet size.
+#   * because the walk is SERIAL, once ~4N round trips exceed the interval the
+#     knob's liveness bound degrades silently: "a retry resumes within <= one
+#     interval of `next_attempt_at`" becomes "within <= one pass duration". The
+#     loop still cannot overlap itself (it awaits the pass), so the failure mode
+#     is latency, not storming.
+#
+# Reusing/caching the org->graph walk across passes (TTL, or every K intervals)
+# is the obvious follow-up and is deliberately NOT done here: the cache's
+# invalidation contract belongs with #2081's backup operator, and a stale graph
+# list in a RETRY trigger would silently drop a newly created graph's deliveries.
+# The registry lane pays the same shape once, not per org: the anchor is cached
+# per process (`_registry_anchor` -> `_registry_probe_sdk`).
 
 #: Graphs whose dispatch pass is IN FLIGHT in this process. A SET, not a lock:
 #: an in-flight graph is simply skipped this pass (the next one retries it), and

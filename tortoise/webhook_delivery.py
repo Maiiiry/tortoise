@@ -506,33 +506,40 @@ _DUE_PREDICATE = (
 #: a higher ``seq`` EXISTS, i.e. ``read_after`` can return something (a delivery
 #: that caught up has ``cursor == head`` and is a guaranteed no-op).
 #:
-#: Two admission cases survive on purpose, and both are cheap no-ops the gate
+#: THREE admission cases survive on purpose, and all are cheap no-ops the gate
 #: cannot see without reading the stream itself:
 #:
 #: * a ``types``-filtered subscription whose pending events are all of a type it
 #:   does not want (the filter is applied app-side in ``read_after``);
 #: * a subscription whose unread events were PURGED (retention) while its
-#:   cursor stayed behind — the counter's head then exceeds the store's max seq.
+#:   cursor stayed behind — the counter's head then exceeds the store's max seq;
+#: * a MISSED seq: ``next_seq`` handed a number out but nothing was appended
+#:   under it (``sdk._emit_event`` calls ``next_seq`` then ``append_event`` in
+#:   one ``try/except`` that logs and continues, and ``append_event`` also skips
+#:   a duplicate ``event_id``). The counter then sits ABOVE
+#:   ``max(:GraphEvent.seq)`` — the same SHAPE the purge produces, and the more
+#:   common source of it, because it needs no retention window at all.
 #:
-#: ⛔ NEITHER case is bounded by the retry ladder (#8098 review, non-counted):
-#: the ladder disables a subscription only when a delivery FAILS, and neither of
-#: these ever fails a delivery. The FIRST is bounded by the TENANT (a
+#: ⛔ NONE of these is bounded by the retry ladder (#8098 review, non-counted):
+#: the ladder disables a subscription only when a delivery FAILS, and none of
+#: them ever fails a delivery. The FIRST is bounded by the TENANT (a
 #: ``types``-filtered subscription is quiet for at most as long as no matching
 #: event is emitted, so it resolves when the tenant's next matching event
 #: arrives — not on a timer).
 #:
-#: The PURGED-CURSOR case has NO bound at all: the unread events are
-#: gone, ``read_after`` returns ``[]``, so nothing is delivered and nothing
+#: The PURGED-CURSOR and MISSED-SEQ cases have NO bound at all: ``read_after``
+#: returns ``[]``, so nothing is delivered and nothing
 #: FAILS — no attempt accrues, no backoff is written, and nothing ever disables
-#: the subscription inside ``max_attempts``. Its cursor stays below ``$head``
-#: forever, so the graph is admitted (one SDK open, one no-op dispatch) on every
-#: interval, indefinitely. That is cheap but unbounded, and it is stated here
-#: rather than papered over: the real remedy is to advance such a cursor past
-#: ``:GraphEventMeta.first_seq`` when ``read_after`` comes back empty for a
-#: subscription sitting under the purge floor — deliberately NOT done in #8098,
-#: because silently advancing a cursor past events that retention removed is a
-#: delivery-loss decision that belongs with the dispatch state machine, not
-#: smuggled in as a cost optimisation.
+#: the subscription inside ``max_attempts``. Their cursor stays below ``$head``
+#: forever — the missed-seq graph heals only on that tenant's next SUCCESSFUL
+#: emit, which for an idle tenant never comes — so the graph is admitted (one SDK
+#: open, one no-op dispatch) on every interval, indefinitely. That is cheap but
+#: unbounded, and it is stated here rather than papered over: the real remedy is
+#: to advance such a cursor past ``:GraphEventMeta.first_seq`` (purge) or to the
+#: store's max seq (missed) when ``read_after`` comes back empty — deliberately
+#: NOT done in #8098, because silently advancing a cursor past events that
+#: retention removed is a delivery-loss decision that belongs with the dispatch
+#: state machine, not smuggled in as a cost optimisation.
 _BEHIND_PREDICATE = "(s.cursor IS NULL OR s.cursor < $head)"
 
 
