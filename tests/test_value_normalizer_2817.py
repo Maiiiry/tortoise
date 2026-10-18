@@ -265,9 +265,27 @@ def test_every_unicode_punctuation_or_space_separator_abstains():
     "USD 5 K",
     "EUR 800 m",
     "BRL 3 bn",
+    # the cycle-6 P2 forms: the magnitude word sits one NUMERAL/separator token
+    # away, not one word away (`nxt[0]`-only scanning typed a truncated prefix)
+    "EUR 2½ million",
+    "EUR 800 - million",
 ])
 def test_magnitude_forms_never_type(source):
     dropped(source, "magnitude_word")
+
+
+@pytest.mark.parametrize("source", [
+    # ⛔ the other direction of the same guard (cycle-6 P2): a magnitude word
+    # that belongs to a DIFFERENT quantity must not abstain on an exact amount.
+    # Widening the scan to three words did exactly that.
+    "EUR 800 for 2 million users",
+    "EUR 800 across 3 million",
+    "EUR 800 bought 2 million units",
+])
+def test_a_neighbours_magnitude_word_does_not_abstain(source):
+    result = normalize_money(source)
+    assert result.typed, f"{source!r} abstained ({result.drop_reason})"
+    assert result.props["amountMinor"] == 80000, result.props
 
 
 # ── mode 3: percent vs multiplier — not money, no valueKind ────────────────
@@ -351,6 +369,48 @@ def test_a_value_without_any_anchor_is_not_typed():
 
 
 # ── mode 5: ranges and qualifiers — prose only ─────────────────────────────
+#: Every bound/threshold phrase the module knows, asserted in BOTH positions.
+#: ⛔ Two hand-kept lists are how this family survived four cycles: the PRE
+#: vocabulary carried `up to` while the POST vocabulary did not carry `or
+#: above`, so ``EUR 800 or above`` typed the bound as an exact amount. One
+#: table, both positions — a phrase added on one side cannot be missing on the
+#: other, which is the seam rather than another instance.
+_BOUND_PHRASE_CASES = [
+    "under", "over", "about", "around", "approximately", "roughly",
+    "nearly", "almost", "estimated", "circa", "exactly", "between",
+    "up to", "at least", "at most", "more than", "less than",
+    "no more than", "no less than", "give or take", "in excess of",
+    "north of", "upwards of", "max", "min", "maximum", "minimum",
+    "or less", "or more", "or so", "or above", "or higher",
+    "or greater", "and up", "and above", "and more", "and higher",
+    "and greater", "post-money", "pre-money", "plus", "ish",
+    # a word BROKEN ACROSS A LINE is how an extract delivers it — the tuple's
+    # wrap-tolerant spelling must be pinned, or a transcription can drop it and
+    # type the bound as exact (cycle 6 P1: `roug hly EUR 800` → 800.00)
+    "roug hly",
+]
+
+
+@pytest.mark.parametrize("phrase", _BOUND_PHRASE_CASES, ids=lambda p: p.replace(" ", "_"))
+def test_bound_phrase_abstains_in_both_positions(phrase):
+    """Cycle-5 P1: a bound is a bound on either side of the amount.
+
+    The PRE branch already knew `up to`; the POST branch did not know `or
+    above`/`and more`/`or higher`/`or greater`, so ``EUR 800 or above`` — the
+    same sentence as ``up to EUR 800`` with the phrase moved — typed the bound
+    as an exact amount, the cycle-3 false type reached through a synonym.
+    """
+    before_text = f"{phrase} EUR 800"
+    before = normalize_money(before_text)
+    assert not before.typed, f"{before_text!r} typed {before.props}"
+    assert before.drop_reason == "range_or_qualifier", before.drop_reason
+
+    after_text = f"EUR 800 {phrase}"
+    after = normalize_money(after_text)
+    assert not after.typed, f"{after_text!r} typed {after.props}"
+    assert after.drop_reason == "range_or_qualifier", after.drop_reason
+
+
 @pytest.mark.parametrize("source", [
     "EUR 5-10",
     "EUR 800 to 900",
@@ -372,6 +432,20 @@ def test_a_value_without_any_anchor_is_not_typed():
     "EUR 800 minimum",
     "EUR 800-ish",
     "EUR 800 or so",
+    # the cycle-5 P1 forms: the POST family's missing synonyms, and `up to` /
+    # `through` / `until` as CONNECTORS rather than qualifiers
+    "EUR 800 or above",
+    "EUR 800 and more",
+    "EUR 800 or higher",
+    "EUR 800 or greater",
+    "EUR 800 up to 900",
+    "EUR 800 through 900",
+    "EUR 800 until 900",
+    "from EUR 800",
+    "starting at EUR 800",
+    "in excess of EUR 800",
+    "north of EUR 800",
+    "upwards of EUR 800",
     # the cycle-2 P1 forms: a range whose connector is not a hyphen
     "between EUR 800 and 900",
     "EUR 800 or 900",
