@@ -160,6 +160,23 @@ surfaces:
   # demand.py-only change selects `core`). Triple-registered deliberately: no
   # single arm covers both modules this feature spans.
   - test_data_source_capture.py
+  # #3514 (epic #1714 J4) — the CLIENT↔SERVER half of the same feature, and the
+  # #1349/#4446/#3524 class this file's own neighbour above is triple-registered
+  # for. This file reads `tortoise/hosted_api.py` directly: the mounted route
+  # table (`test_the_client_posts_the_route_the_app_actually_mounts`) and
+  # `_ALLOWED_ANALYTICS_PROPS` (`test_the_client_body_keys_are_the_registered_props`),
+  # so a rename of the route or a drop of `action` from the allowlist is exactly
+  # the diff that breaks the client.
+  #
+  # MEASURED, so the next reader does not re-derive it: a
+  # `tortoise/hosted_api.py`-only diff ALREADY ran this file, via `onboarding`
+  # (that surface lists `tortoise/hosted_api.py` in its patterns as well). This
+  # arm is not a rescue of a sleeping guard; it is the registration that makes
+  # the guard run under the surface that OWNS the module, so it does not depend
+  # on `onboarding`'s pattern list continuing to carry a backend path for a
+  # client-side reason. Triple-registered with `core` (the manifest fallback)
+  # and `onboarding` (the JS grid direction).
+  - test_integrations_grid_inventory.py
   # #3516 §B: the client-timestamp floor's inputs (`client_captured_at` + its `_source`).
   # DUAL-REGISTERED with `core` for the same reason as the lane entry above: the touched
   # files span BOTH surfaces — `hosted_api.py` / `sdk.py` / `__main__.py` select `api`,
@@ -986,6 +1003,15 @@ surfaces:
   # — they fall through to `core` — so without that arm a webhook_delivery-only
   # change would run no guard at all.
   - test_webhook_delivery.py
+  # #8098: the scheduled retry sweep — the TRIGGER the delivery layer lacked
+  # (an idle tenant's backoff had nothing to notice it elapsed). The sweep's
+  # arm site, its task registration and the never-raise/off-loop dispatch
+  # wrapper all live in `tortoise/hosted_api.py` (an exact `api`
+  # SOURCE_PATTERN), so this arm runs the lifecycle pins on a hosted change.
+  # DUAL-REGISTERED with `core` (below) for the same reason as #2081 above:
+  # the due predicate and its cost gate live in `tortoise/webhook_delivery.py`,
+  # which matches no named surface and falls through to `core`.
+  - test_8098_webhook_retry_sweep.py
   # #3520: the per-session EXTRACTION status (`{status, extractor,
   # outcome_known}`) on BOTH hosted session read surfaces, the `last_error`
   # agreement on the 2xx path, and the appended-at-the-END column positions.
@@ -1579,6 +1605,12 @@ surfaces:
   # mechanism (its excludes-list is stated in `cypher_guard._guard_numeric_params`).
   # Pure-unit guard: needs no DB or network, exactly like the file above it.
   - test_7174_param_boundary_numeric_guard.py
+  # #8746: the graph-delete refusal record's WRITER contract — how its section
+  # merges into `tempdir-hygiene-end.json`, plus the conftest wiring that feeds
+  # it. Hermetic (ast/json only + a fake projection); the pin that every
+  # suite-session job DUMPS the artifact is
+  # tests/test_tmpdir_hygiene.py::test_suite_jobs_surface_the_tolerated_leak.
+  - test_graph_delete_hygiene_report.py
   - test_graph_name_ownership.py
   # #5331: the graph byte meter (tortoise/graph_storage.py + the metering/
   # supabase graph-storage lane). Dual-registered with `api`: a change to the new
@@ -3292,6 +3324,12 @@ surfaces:
   # engine's contract tests on that diff. Dual-registered under `api` (above)
   # for `tortoise/hosted_api.py`, which is an exact `api` match.
   - test_webhook_delivery.py
+  # #8098: the sweep's cheap gate (`webhook_delivery.due_subscription_count`)
+  # is the ONE predicate the dispatcher also reads, so it must ride a
+  # `webhook_delivery.py`-only diff: that file matches no named SOURCE_PATTERN
+  # and selects `core`. Dual-registered under `api` (above) for the hosted
+  # lifecycle half (the arm site, the task tuple, the dispatch wrapper).
+  - test_8098_webhook_retry_sweep.py
   # #3520: the `core` half of the dual registration documented at the `api`
   # entry — `tortoise/session_projection.py` (the extraction vocabulary and
   # `session_extraction_status`, the ONE derivation every read surface calls)
@@ -4958,6 +4996,7 @@ durations:
   test_7405_update_point_writes.py: 2.0  # #7405/#8737: same #3400 flat default as the row above and for the same reason — a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). Required for the durations half as well as the surface half (#4348 trap): the surface entry alone does not cover it. Refresh from the first post-merge run that includes it.
   test_5509_name_keyed_identity_reads.py: 138.6  # #5509 (#3400 trap): a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so it is hand-added here — and WITHOUT this row the durations map drops to 89.98% coverage (799/888), below the 90% floor, which is how #8874's merge of main 46185aba9 first surfaced it. MEASURED on this host 2026-10-17 in the #8874 worktree on a private tools/test_lane.py docker container reached via TORTOISE_DB_URI: pytest session total, 16 tests, "16 passed in 138.63s". WHAT THE NUMBER IS: the session total, NOT what the refresher computes (it sums the textual `--durations=15` block from a CI log, a LOWER bound). Refresh from the first post-merge push run that includes it.
   test_8864_shared_name_merge_key.py: 2.0  # #8864: a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so it takes the #3400 flat 2.0s default. Required for the durations half as well as the surface half (#4348 trap): the surface entry alone does not cover it. Local reading on this host (embedded carve-out lane, 8 tests): "8 passed in 5.82s" — the session total, which is conftest/DB setup the #3400 method attributes to no file; NOT substituted for a CI weight. Refresh from the first post-merge run that includes it.
+  test_8098_webhook_retry_sweep.py: 8.8  # #8098 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only), so this is the branch's LOCAL reading under the `# unmeasured` convention, not a CI measurement. MEASURED on this host 2026-10-18 at the PR head AFTER the LAST review fixes (embedded carve-out lane, **56 tests**, `--junitxml`): sum of testcase/@time ranged **7.25s** on a quiet host to **24.65s** with the fleet loading this box, max single test 1.65-6.90s (`test_every_test_the_plan_cites_exists`, which rglobs `tests/`). The reading is re-derived with the COUNT at every revision, never carried forward (the neighbouring #3429 row states the same convention): earlier revisions of this row read 39, 48, 49, 51, 53 and 55 tests as the file grew. The 8.8 WEIGHT is deliberately left alone: it is the shard packer's input, and keeping the higher of the readings means a file whose per-test sum is dominated by one cold-lane test is never under-weighted, so do not "correct" it down without a CI junit measurement. Required for the durations half as well as the surface half (#4348 trap): MEASURED this turn, WITHOUT this row `tools/ci_selection.py --integrity` reds the durations coverage floor (the file is in the fast pool, so an absent row also packs it at the flat 2.0s default). Refresh from the first post-merge run that includes it; do NOT drop the row without re-deriving the floor at that head.
   test_installer_preserves_foreign_skill_content.py: 0.6
   test_installer_agents_block_3429.py: 12.8  # #3429 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only), so this is the branch's LOCAL reading under the `# unmeasured` convention. MEASURED on this host 2026-10-18 on a private tools/test_lane.py container, TWO consecutive runs, sum of testcase/@time over ALL 42 tests: 11.95s and 13.58s — the reading is re-derived with the count at every revision, never carried forward (earlier rows here said 4.53s/4, 5.8s/10, 7.2s/15, 9.0s/20, 14.4s/25, 20.4s/30, 20.9s/35 and 18.6s/40 as the review added cases; the count and the sum move together, and this spread shows the host load, not the tests). The file drives the REAL installer in a temp HOME/project, so it is subprocess-bound, not DB-bound. NOTE: the sum is per-test durations; WALL-CLOCK under a loaded fleet has measured 2.8x this. Refresh from the first post-merge push run that includes it; do NOT drop the row without re-deriving the floor at that head.
   test_backup_watcher_health.py: 0.2
@@ -6045,10 +6084,13 @@ durations:
   # CALL times summed to ~1.7 s locally (0.70 + 0.53 + 0.14 + 0.04). The
   # per-test `setup` bodies are the embedded lane's shared cold-start (measured
   # 0.2-22 s across runs and mostly one-time), which the packer's per-file
-  # weight must not double-count. Both halves are load-bearing: the surface
-  # entry alone leaves `durations` coverage under the floor and
-  # `tools/ci_selection.py --integrity` reds (#4348 trap), and a durations entry
-  # with no surface registration leaves the file unclassified. Refresh from the
+  # weight must not double-count. Registration and weight are different guards,
+  # and only one is enforced: `tools/ci_selection.py --integrity` reports a
+  # `durations` key with no surface entry as unclassified, while fast-pool
+  # coverage is checked against a 0.90 floor (#3400), so one omitted weight can
+  # still pass. Measured at the #8746 head: 824/914 = 90.15%, and dropping this
+  # entry leaves 823/914 = 90.04% with `duration_coverage_issues` still empty.
+  # Refresh from the
   # first post-merge run that includes it.
   test_connector_oauth_flow.py: 2.5
   test_cypher_regex_guard_3595.py: 0.2
@@ -6057,6 +6099,25 @@ durations:
   test_egress_bytes.py: 1.1
   test_entry_point_python_guard.py: 4.6
   test_extractor_embed_coerce_5060.py: 0.6
+  # #8746: 5 tests, local wall 1.8 s (measured at the #8746 review head,
+  # 2026-10-18). A NEW file has no CI junit measurement (a file that never ran
+  # cannot appear in an artifact), so this is the pre-merge estimate; refresh it
+  # from the first post-merge run that includes the file. Hermetic — no DB, no
+  # network: the writer tests use tmp_path and the wiring pin parses
+  # `tests/conftest.py` with `ast`. (The pin that every suite-session job DUMPS
+  # the artifact is a DIFFERENT file —
+  # tests/test_tmpdir_hygiene.py::test_suite_jobs_surface_the_tolerated_leak,
+  # which is the one that reads the two workflows; nothing here reads YAML.)
+  # So this estimate does not move with
+  # box load. Registration and weight are different guards, and only one is
+  # enforced: `--integrity` reports a `durations` key with no surface entry as
+  # unclassified, while fast-pool coverage is checked against a 0.90 floor
+  # (#3400), so one omitted weight can still pass. Measured at this head the
+  # pool is 824/914 = 90.15%, and dropping THIS entry leaves 823/914 = 90.04%
+  # with `duration_coverage_issues` still empty — one unmeasured file of margin
+  # (822/914 = 89.93% would red). Add a weight for every new fast file rather
+  # than trusting it to red.
+  test_graph_delete_hygiene_report.py: 1.8
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
   # #4492: added by a PR, so no CI reading exists yet (`--refresh-durations`
