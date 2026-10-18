@@ -531,8 +531,10 @@ def test_integration_conflict_relevant_query_outranks_twin(
     (``len(raw_results) > 1``, ``match_source="rrf"``); both legs tie,
     each leg's own ``ORDER BY score, id ASC`` tie-break ranks the lower-ULID
     twin first, and that one-rank RRF difference is worth MORE than the
-    boost — so the ordering claim is false, not flaky (#7704, measured:
-    fused similarity gap 0.0188 > boost contribution 0.0175).
+    boost — so the ordering claim is false, not flaky (#7704, measured on the
+    relevance/final-score basis the boost effect is on: fused gap 0.0188 of
+    final score — the 0.0377 similarity gap x the 0.5 similarity weight —
+    > boost contribution 0.0175).
 
     The `match_source` assertion below makes the path the test actually
     measured part of the contract: revert the pin and the fused read FAILS
@@ -911,11 +913,36 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # to be applied, so stripping the CLAMPED increment (1.0 - 0.7 = 0.3, not
     # the requested 2.0) must return the same 2-row requirement as the shipped
     # run.  A helper that stripped the requested or the shipped magnitude would
-    # report 1.095 / 1.1786 here — numbers that are not level conditions.
+    # report 3.1286 / 1.1786 here — requirements, NOT level conditions.  (The
+    # raw final-score gaps those strips leave are 1.095 / 0.4125, i.e. the same
+    # two numbers before the division by the 0.35 graph weight: quoting 1.095
+    # beside 1.1786 would compare a raw gap with a requirement.  ``1.1786`` is
+    # also the number ``tortoise/ranking.py`` quotes for the unrelated
+    # "no parity NAND" counterfactual; it is coincidence, not the same
+    # measurement.)
     assert huge_req == pytest.approx(two_req, abs=5e-3), (
         f"reading the requirement back off the cb=2.0 run must reproduce the "
         f"page's own requirement ({two_req:.4f}); got {huge_req:.4f} — the "
         f"strip in ``required_cb`` is no longer the increment that applied")
+    # The two illustrative numbers above, pinned on ONE basis (requirements —
+    # after the division by the graph weight) and read off THIS run's payload,
+    # so the comment's arithmetic fails here rather than going stale if the
+    # clamp, the recency term or the fixture moves.
+    huge_gap_strip_requested = huge_calm["final_score"] - (
+        huge_hot["final_score"] - 2.0 * DEFAULT_GRAPH_BOOST_WEIGHT)
+    huge_gap_strip_shipped = huge_calm["final_score"] - (
+        huge_hot["final_score"]
+        - W4_CONTESTED_BOOST * DEFAULT_GRAPH_BOOST_WEIGHT)
+    assert huge_gap_strip_requested / DEFAULT_GRAPH_BOOST_WEIGHT == (
+        pytest.approx(3.1286, abs=5e-3)), (
+        f"``required_cb``'s docstring says stripping the REQUESTED 2.0 would "
+        f"report 3.1286 (raw gap 1.095 / 0.35); this run gives "
+        f"{huge_gap_strip_requested / DEFAULT_GRAPH_BOOST_WEIGHT:.4f}")
+    assert huge_gap_strip_shipped / DEFAULT_GRAPH_BOOST_WEIGHT == (
+        pytest.approx(1.1786, abs=5e-3)), (
+        f"``required_cb``'s docstring says stripping the SHIPPED 0.05 would "
+        f"report 1.1786 (raw gap 0.4125 / 0.35); this run gives "
+        f"{huge_gap_strip_shipped / DEFAULT_GRAPH_BOOST_WEIGHT:.4f}")
     assert huge_hot["graph_boost"] == 1.0, (
         f"the documented [0,1] clamp must bind: graph_boost="
         f"{huge_hot['graph_boost']} — if it no longer does, a large cb DOES "
@@ -998,10 +1025,22 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"the comment quotes the 3-row pool's post-boost residual as 0.4825 "
         f"(0.5 - 0.0175); this page measures {three_residual:.4f}")
     three_gap = three_residual + three_applied
-    assert three_gap == pytest.approx(0.5, abs=2e-3), (
+    # The 0.5 gap on a CROSS-BASIS check rather than a restatement of the
+    # 0.4825 pin beside it: with the parity making ``d_gb == 0`` and the twins'
+    # recency equal, the pre-boost gap must be the SIMILARITY term alone —
+    # ``sim_w * (similarity_calm - similarity_hot)`` — so the payload's
+    # final-score residual and the payload's similarity span have to reconcile.
+    # (``three_residual ≈ 0.4825`` plus a pinned 0.0175 boost already forces
+    # ``three_gap ≈ 0.5``, so re-asserting that constant would guard nothing.)
+    assert three_gap == pytest.approx(
+        DEFAULT_SIMILARITY_WEIGHT
+        * (three_calm["similarity"] - three_hot["similarity"]), abs=2e-3), (
         f"the comment quotes a 0.5 pre-boost relevance gap on the 3-row pool; "
-        f"this page measures {three_gap:.4f} (residual {three_residual:.4f} "
-        f"plus the {three_applied:.4f} the payload shows was applied)")
+        f"the payloads give {three_gap:.4f} (residual {three_residual:.4f} "
+        f"plus the {three_applied:.4f} the payload shows was applied), which "
+        f"must be the similarity term alone — "
+        f"sim_w * d_sim = {DEFAULT_SIMILARITY_WEIGHT * (three_calm['similarity'] - three_hot['similarity']):.4f} "
+        f"— because the twins' parity zeroes d_gb")
 
     # ── Remedy (2)'s actionable half: the raise is RUN, not inferred ──────
     # ``ten_req < two_req`` alone does NOT imply that a raise repairs the
