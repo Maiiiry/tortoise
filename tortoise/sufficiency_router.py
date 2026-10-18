@@ -584,6 +584,56 @@ def _script(ch: str) -> str:
     return unicodedata.name(ch, "").split(" ", 1)[0]
 
 
+#: Symbols whose NFKC decomposition contains LETTERS OR DIGITS. NFKC is a
+#: COMPATIBILITY folding, so it rewrites ``™`` to ``TM``, ``№`` to ``No`` and
+#: ``Ⅰ`` to ``I`` — turning a SEPARATOR into characters that are word characters,
+#: which then GLUE onto the anchor: ``ACME™契約`` and ``Tortoise™`` measured 0.0
+#: after the fold (they were 1.0 before it). The same mechanism runs the other
+#: way for ``½`` -> ``1⁄2``, where a single-digit anchor ``1`` was CREDITED by a
+#: fraction. A symbol keeps separating, so it is folded to a space BEFORE NFKC.
+_FOLD_AS_SEPARATOR = frozenset().union(*(
+    frozenset(chr(cp) for cp in range(lo, hi + 1))
+    for lo, hi in (
+        # Latin-1 block FIRST: the vulgar fractions live here, not in the
+        # Number Forms block, and they fold to a DIGIT RUN with U+2044 between
+        # (`½` -> `1⁄2`) — which credited a single-digit anchor `1`. The
+        # superscripts (`²³¹`) are deliberately ABSENT: they attach to a token
+        # (`AI²`) rather than terminate a word, so they stay glued.
+        (0x00AA, 0x00AA),   # ª             -> a   (1º/1ª ordinal markers)
+        (0x00B5, 0x00B5),   # µ             -> Greek mu
+        (0x00BA, 0x00BA),   # º             -> o
+        (0x00BC, 0x00BE),   # ¼ ½ ¾         -> 1⁄4, 1⁄2, 3⁄4
+        (0x2105, 0x2106),   # ℅ ℆           -> c/o, c/u
+        (0x2116, 0x2116),   # №             -> No
+        (0x2120, 0x2122),   # ℠ ℡ ™         -> SM, TEL, TM
+        (0x213B, 0x213B),   # ℻             -> FAX
+        (0x2150, 0x217F),   # fractions + Roman numerals
+        (0x2189, 0x2189),   # ↉             -> 0/3
+        # CIRCLED/PARENTHESIZED DIGITS only (0x249C onwards are Latin LETTERS —
+        # `Ⓐ` is a decorated A, so it must keep gluing: `aiⒶ` stays 0.0).
+        (0x2460, 0x249B),   # ① … ⑳, ⑴ … ⒇, ⒈ … ⒛
+        (0x24EA, 0x24FF),   # ⓪ ⓫ … ⓴
+        (0x3250, 0x33FF),   # squared CJK abbreviations
+        (0x1F100, 0x1F2FF), # enclosed alphanumeric supplement
+        (0xFE33, 0xFE34),   # presentation-form underscores
+        (0xFE4D, 0xFE4F),   # dashed underscores
+        (0xFF3F, 0xFF3F),   # ＿             -> _
+    )
+))
+
+
+def _fold(text: str) -> str:
+    """Whitespace-collapse, symbol-separate, NFKC, casefold — the match form.
+
+    Order matters: the symbol pre-map runs BEFORE NFKC so a symbol can never
+    become a word character, and NFKC runs before casefold so the two operands
+    share one form (see ``_mentions`` for why NFKC and not NFC).
+    """
+    spaced = "".join(
+        " " if ch in _FOLD_AS_SEPARATOR else ch for ch in " ".join(text.split()))
+    return unicodedata.normalize("NFKC", spaced).casefold()
+
+
 #: Korean attaches case particles to the noun with NO space — `삼성전자는`,
 #: `한국의`, `ACME의` are the canonical forms, not the exception. Hangul is still a
 #: SPACED script (it separates WORDS with spaces), so without this a Hangul
@@ -595,14 +645,36 @@ def _script(ch: str) -> str:
 #: run must be a particle, or two STACKED particles, covering the WHOLE run. So
 #: `한국의` matches while `한국어` (`어` is not a particle) and `한국도시`
 #: (`도` + `시`, where `시` is not) do not.
-_KO_PARTICLES = frozenset({
-    "은", "는", "이", "가", "을", "를", "의", "에", "에게", "께", "께서", "도",
-    "만", "과", "와", "로", "으로", "부터", "까지", "보다", "처럼", "하고",
-    "이다", "입니다", "이란", "이라고", "라는", "라고", "이라는", "이며",
-    "이지만", "이라", "란", "야", "이야", "에서", "서는", "에는", "에도",
-    "에만", "으로는", "으로도", "으로부터", "에서는",
+_KO_CASE = frozenset({
+    "은", "는", "이", "가", "을", "를", "의", "에", "에서", "에게", "께",
+    "께서", "과", "와", "로", "으로", "부터", "까지", "보다", "처럼", "로서",
+    "으로서", "이랑", "랑", "나", "이나", "라도", "이면", "면", "므로",
+    "이므로", "니까", "이니까", "지만", "이지만", "고", "이고", "며", "이며",
+    "라고", "이라고", "라는", "이라는", "란", "이란",
 })
 
+#: AUXILIARY particles, which may follow a case particle (`에서` + `도` = `에서도`).
+#: The STACK ORDER is what separates a legal stack from a compound word: real
+#: Korean words decompose into case+case or aux+case (`도로` road = 도+로,
+#: `의의` significance = 의+의, `가을` autumn = 가+을, `이의` objection), and an
+#: unrestricted two-member split accepted every one of them.
+_KO_AUX = frozenset({"도", "만", "는", "은", "부터", "까지"})
+
+_KO_PARTICLES = _KO_CASE | _KO_AUX | frozenset({
+    "에게", "께서", "으로", "부터", "까지", "보다", "처럼", "하고", "이다",
+    "입니다", "이야", "야", "에서", "에는", "에도", "에만", "으로는", "으로도",
+    "에서는", "으로부터", "서는", "마다", "밖에", "조차", "든지", "이든지",
+    "커녕", "보다는", "하고서", "이며",
+})
+
+#: Korean BOUND NOUNS and COUNTERS attach exactly like particles — `2026년 3월`,
+#: `서울시 정책`, `5명 참석`, `100원` — so without them the natural written form of
+#: a Korean date, place or quantity scored 0.0 even after the particle rule.
+_KO_BOUND_NOUNS = frozenset({
+    "년", "월", "일", "시", "분", "초", "개", "명", "원", "위", "회", "차",
+    "호", "층", "대", "마리", "권", "장", "병", "잔", "그루", "살", "번",
+    "가지", "곳", "개월", "년도", "대로", "등", "및", "약", "쪽", "편",
+})
 
 def _hangul_run(text: str, start: int) -> str:
     """The maximal run of Hangul SYLLABLES beginning at ``start`` (capped at 6)."""
@@ -613,14 +685,20 @@ def _hangul_run(text: str, start: int) -> str:
 
 
 def _particle_follows(text: str, start: int) -> bool:
-    """Does a Korean case particle begin at ``start`` and account for the whole run?"""
+    """Does a Korean particle or bound noun begin at ``start`` and cover the run?
+
+    The WHOLE run must be accounted for, which is what keeps `한국어` (`어` is
+    neither), `한국도시` and `한국도로공사` out. A stack is accepted only in the
+    grammatical order — a CASE particle then an AUXILIARY one (`에서`+`도`) — so
+    `도로`, `의의`, `가을`, `도의` and `만만` are not read as noun+particle.
+    """
     run = _hangul_run(text, start)
     if not run:
         return False
-    if run in _KO_PARTICLES:
+    if run in _KO_PARTICLES or run in _KO_BOUND_NOUNS:
         return True
     return any(
-        run[:i] in _KO_PARTICLES and run[i:] in _KO_PARTICLES
+        run[:i] in _KO_CASE and run[i:] in _KO_AUX
         for i in range(1, min(len(run), 5))
     )
 
@@ -735,18 +813,19 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     Empty/blank anchors are refused by ``assess_sufficiency`` long before they
     reach here; the guard remains as defence, since ``"" in …`` is universal.
     """
-    # NFKC — COMPATIBILITY, not merely canonical, on both sides: NFKC folds the
-    # width variants (`ＡＩ` -> `AI`, `２０２６` -> `2026`, half-width kana ->
-    # full-width) as well as the composition forms. NFC alone left a full-width
+    # `_fold` — compatibility folding, not merely canonical, on BOTH sides: NFKC
+    # folds the width variants (`ＡＩ` -> `AI`, `２０２６` -> `2026`, half-width kana
+    # -> full-width) as well as the composition forms. NFC alone left a full-width
     # spelling unmatchable in both directions and made half-width kana a spaced
-    # word character (`ｼ`'s first name word is `HALFWIDTH`), so
-    # `当社のＡＩ技術` and `ｼｽﾃﾑACMEｼｽﾃﾑ` scored 0.0. Folding also REPLACES the
-    # operands' form-dependence: the extractor and canonical stores emit NFC while
-    # filesystem/OCR text and caller anchors may be NFD/NFKC.
-    folded = unicodedata.normalize("NFKC", " ".join(needle.split())).casefold()
+    # word character (`ｼ`'s first name word is `HALFWIDTH`), so `当社のＡＩ技術`
+    # and `ｼｽﾃﾑACMEｼｽﾃﾑ` scored 0.0. It also removes the operands' form-dependence:
+    # the extractor and canonical stores emit NFC while filesystem/OCR text and
+    # caller anchors may be NFD/NFKC. `_fold` pre-maps the symbols NFKC would turn
+    # into LETTERS to a space first, so the fold cannot glue `ACME™契約` together.
+    folded = _fold(needle)
     if not folded:
         return False
-    if folded == unicodedata.normalize("NFKC", row.id).casefold():
+    if folded == _fold(row.id):
         return True
     # Does the ANCHOR itself come from a spaced script? Only then is a word
     # boundary meaningful in its OWN script; an unspaced-script anchor has none.
@@ -760,8 +839,7 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     for candidate in (row.text, *row.entities):
         if not candidate:
             continue
-        haystack = unicodedata.normalize(
-            "NFKC", " ".join(candidate.split())).casefold()
+        haystack = _fold(candidate)
         if _occurs_as_word(folded, haystack) if bounded else folded in haystack:
             return True
     return False

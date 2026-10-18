@@ -1465,6 +1465,92 @@ def test_unnamed_code_points_are_split_by_range(
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, expected),)
 
 
+@pytest.mark.parametrize("text,anchor", [
+    # Symbols whose NFKC decomposition is LETTERS OR DIGITS. NFKC is a
+    # COMPATIBILITY folding, so without a pre-map `™` becomes `TM` and glues onto
+    # the anchor (`ACME™契約` measured 0.0), and `½` becomes `1⁄2`, which CREDITED
+    # a single-digit anchor `1`. A symbol keeps separating.
+    ("ACME™契約", "ACME"),
+    ("Tortoise™", "Tortoise"),
+    ("ACME℠", "ACME"),
+    ("№1234", "1234"),
+    ("文書№1234", "1234"),
+    ("PhaseⅠ", "Phase"),
+    ("ACME㎏", "ACME"),
+    ("1º andar", "1"),               # ordinal marker after a digit
+    ("2ª via", "2"),
+])
+def test_a_symbol_that_folds_to_letters_still_separates(
+        text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+
+@pytest.mark.parametrize("text,anchor", [
+    # A FRACTION is not the integer its decomposition starts with.
+    ("½", "1"),
+    ("½", "2"),
+    ("¼", "4"),
+    ("no ½ done", "1"),
+    # A circled LETTER is a decorated letter, not a separator, and a circled DIGIT
+    # is not the plain digit either.
+    ("aiⒶ", "AI"),
+    ("①の条項", "1"),
+])
+def test_a_compatibility_decomposition_does_not_credit_a_digit(
+        text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
+@pytest.mark.parametrize("text,anchor", [
+    # Korean BOUND NOUNS and COUNTERS attach exactly like particles, so the
+    # natural written form of a date, a place or a quantity scored 0.0.
+    ("2026년 3월 매출", "2026"),
+    ("２０２６년 3월", "2026"),      # the full-width form NFKC exists for
+    ("서울시 정책", "서울"),
+    ("5명 참석", "5"),
+    ("3개월", "3"),
+    ("100원", "100"),
+    ("1위", "1"),
+    # ...and so do the CONNECTIVE particles, which are not case particles.
+    ("AI나 로봇", "AI"),
+    ("AI라도", "AI"),
+    ("AI이면", "AI"),
+    ("AI이므로", "AI"),
+    ("AI로서", "AI"),
+    ("AI랑", "AI"),
+    ("AI마다", "AI"),
+    ("AI밖에", "AI"),
+    ("AI조차", "AI"),
+])
+def test_a_korean_bound_noun_or_connective_is_also_a_boundary(
+        text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+
+@pytest.mark.parametrize("text,anchor", [
+    # Real Korean WORDS decompose into two set members, so the stack is accepted
+    # only in the grammatical order — CASE particle then AUXILIARY. `도로` is
+    # aux+case, `가을` and `의의` are case+case; none is a noun plus particle.
+    ("한국도로, 3만km", "한국"),
+    ("한국의의", "한국"),
+    ("한국가을 축제", "한국"),
+    ("한국도의 논쟁", "한국"),
+    ("한국만만", "한국"),
+    ("한국이의 제기", "한국"),
+])
+def test_a_two_member_stack_is_only_legal_in_case_then_aux_order(
+        text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
 class _AttrRow:
     """A row in the ATTRIBUTE shape ``evidence_record`` documents as accepted."""
 
