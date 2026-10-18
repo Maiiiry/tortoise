@@ -88,7 +88,10 @@ def test_the_drop_vocabulary_is_closed():
 
 
 # ── the unambiguous forms: what the design DOES commit to typing ────────────
-@pytest.mark.parametrize("source,amount,currency,exponent", [
+#: ONE typed corpus, shared by the typing table below and by the prose-shadow
+#: invariant further down — so the field-set claim is asserted over what the
+#: derivation really emits, not over two module-level literals.
+_TYPED_CASES = [
     ("EUR 800", 80_000, "EUR", 2),
     ("800 EUR", 80_000, "EUR", 2),
     ("800EUR", 80_000, "EUR", 2),
@@ -101,7 +104,10 @@ def test_the_drop_vocabulary_is_closed():
     ("A$ 800", 80_000, "AUD", 2),
     ("AU$ 800", 80_000, "AUD", 2),
     ("MX$ 800", 80_000, "MXN", 2),
-])
+]
+
+
+@pytest.mark.parametrize("source,amount,currency,exponent", _TYPED_CASES)
 def test_an_anchored_plain_integer_types(source, amount, currency, exponent):
     props = typed(source)
     assert props[AMOUNT_MINOR] == amount
@@ -314,6 +320,40 @@ def test_a_bare_currency_symbol_is_not_a_currency(source):
 
 def test_an_unknown_alpha3_token_is_refused_not_silently_unanchored():
     dropped("800 XYZ", "not_an_iso4217_code")
+
+
+@pytest.mark.parametrize("source", [
+    "EUR/USD 800",
+    "USD/EUR 800",
+    "800 EUR/USD",
+    "800 USD / EUR",
+    "the 800 EUR/USD rate",
+    "800EUR/USD",
+])
+def test_a_currency_pair_leg_is_not_the_amounts_currency(source):
+    """Review finding (P2): a PAIR leg typed as the amount's currency.
+
+    ``EUR/USD 800`` typed 800.00 USD and ``800 EUR/USD`` typed 800.00 EUR —
+    each half of the pair is an ISO 4217 code, so the anchor rule accepted it,
+    but the amount belongs to the PAIR and names no single currency. A false
+    type is the one outcome this module must never produce, so both orders
+    abstain. Mutation pin: resolving the anchor without the pair guard types
+    the leg (``EUR/USD 800`` → 800.00 USD) and reds every row here.
+    """
+    dropped(source, "ambiguous_currency_symbol")
+
+
+@pytest.mark.parametrize("source", [
+    "In EUR/USD terms, 800 EUR was committed",
+    "the EUR/USD pair moved and EUR 800 was committed",
+    "EUR 800 while EUR/USD rallied",
+])
+def test_a_pair_elsewhere_in_the_sentence_does_not_abstain(source):
+    """The pair guard is scoped to the anchor's NEIGHBOURHOOD, so a sentence
+    that merely mentions a pair still types its own anchored amount — the
+    abstention must not widen into `EUR 800` being dropped for a pair three
+    words away."""
+    assert typed(source)[AMOUNT_MINOR] == 80_000, source
 
 
 @pytest.mark.parametrize("source", [
@@ -583,7 +623,9 @@ def test_the_exponent_is_the_pinned_iso4217_one(source, amount, currency,
 
 
 @pytest.mark.parametrize("source", [
-    "the 2026 EUR/USD forecast",      # a year, not 2026 euros
+    "the 2026 EUR/USD forecast",      # a year, not 2026 euros (the year check
+                                     # runs before the pair check, so the
+                                     # reason stays the more specific one)
     "In the 2026 EUR budget we spend it.",
     "the 2026 USD forecast",
     "JPY 2026",
@@ -751,25 +793,39 @@ def test_as_of_accepts_exactly_what_point_when_accepts(value):
         f"accepts={money_accepts} — the two Layer-1 contracts have drifted")
 
 
-@pytest.mark.parametrize("bad", [
-    {AMOUNT_MINOR: 800.0, CURRENCY: "EUR", MINOR_UNIT_EXPONENT: 2},   # float
-    {AMOUNT_MINOR: True, CURRENCY: "EUR", MINOR_UNIT_EXPONENT: 2},    # bool
-    {AMOUNT_MINOR: 800, CURRENCY: "eur", MINOR_UNIT_EXPONENT: 2},     # case
-    {AMOUNT_MINOR: 800, CURRENCY: "XYZ", MINOR_UNIT_EXPONENT: 2},     # not ISO
-    {AMOUNT_MINOR: 800, CURRENCY: "JPY", MINOR_UNIT_EXPONENT: 2},     # 100x
-    {AMOUNT_MINOR: 800, CURRENCY: "USD", MINOR_UNIT_EXPONENT: 3},
+@pytest.mark.parametrize("source,field,value", [
+    ("EUR 800", AMOUNT_MINOR, 800.0),      # a float is never minor units
+    ("EUR 800", AMOUNT_MINOR, True),       # bool is an ``int`` in Python
+    ("EUR 800", CURRENCY, "eur"),          # case is not folded
+    ("EUR 800", CURRENCY, "XYZ"),          # not in the pinned ISO table
+    ("JPY 800", MINOR_UNIT_EXPONENT, 2),   # JPY pins 0 — a 100× mis-scale
+    ("USD 800", MINOR_UNIT_EXPONENT, 3),   # USD pins 2 — a 10× mis-scale
 ])
-def test_a_malformed_typed_value_is_refused_at_layer1(bad):
-    """The Layer-1 gate is ``tortoise/money.py`` (``money_props`` /
-    ``read_money_value``), which the write path shares with this derivation —
-    exactly the posture ``_iso_date_prefix`` gives ``when``. Mutation pin: a
-    normalizer that emitted a float amount (or skipped the table check) reds
-    this test, because its props are then refused at the boundary."""
+def test_a_poisoned_derived_value_is_refused_at_layer1(source, field, value):
+    """The Layer-1 gate (``tortoise/money.py``) refuses a malformed pair, and
+    the dict under test is the DERIVATION's own output.
+
+    ⛔ This test rides on ``normalize_money``, not on a hand-built dict (review
+    finding: it used to assert over its own parametrized literals, which no
+    change inside ``value_normalizer.py`` could red — the mutation pin it
+    claimed was false). The base comes from :func:`typed`, the POSITIVE
+    CONTROL asserts that un-poisoned output is Layer-1 valid (so a normalizer
+    that emitted a float amount, a lowercased currency or a wrong exponent
+    reds HERE), and each row then poisons exactly one field to prove the
+    boundary refuses it. The derivation-side float pin also lives in
+    ``test_every_derived_value_round_trips_through_layer1``.
+    """
+    props = dict(typed(source))
+    assert read_money_value(props) == (
+        props[CURRENCY], props[AMOUNT_MINOR], props[MINOR_UNIT_EXPONENT]), (
+            f"the derivation's own output for {source!r} is not Layer-1 valid: "
+            f"{props}")
+    props[field] = value
     with pytest.raises(MoneyValueError):
-        read_money_value(bad)
+        read_money_value(props)
     with pytest.raises(MoneyValueError):
-        money_props(bad[AMOUNT_MINOR], bad[CURRENCY],
-                    minor_unit_exponent=bad[MINOR_UNIT_EXPONENT])
+        money_props(props[AMOUNT_MINOR], props[CURRENCY],
+                    minor_unit_exponent=props[MINOR_UNIT_EXPONENT])
 
 
 def test_every_derived_value_round_trips_through_layer1():
@@ -782,8 +838,23 @@ def test_every_derived_value_round_trips_through_layer1():
 
 # ── dual-write: the derivation is additive, prose is untouched ─────────────
 def test_no_money_field_can_shadow_a_prose_field():
+    """The derivation emits MONEY fields only — never one of the prose fields
+    a Point already carries (a ``content``/``quote``/``when`` key would move
+    prose out of the record, the §4 "Prose is load-bearing" violation).
+
+    The claim is asserted over the derivation's ACTUAL output for the typed
+    corpus (review finding: the row used to compare two module-level literals,
+    so a derivation that emitted ``content`` left it green). The two
+    cross-module assertions stay as the field-vocabulary drift pin — they are
+    falsifiable (a money field named ``content`` reds the first).
+    """
     assert not (set(MONEY_VALUE_FIELDS) & PROSE_FIELDS)
     assert set(PROSE_FIELDS) == {"content", "quote", "when"}
+    for source, *_ in _TYPED_CASES:
+        props = typed(source)
+        assert set(props) <= set(MONEY_VALUE_FIELDS), (source, sorted(props))
+        assert not (set(props) & PROSE_FIELDS), (
+            source, sorted(set(props) & PROSE_FIELDS))
 
 
 def test_merging_the_value_leaves_prose_byte_identical():

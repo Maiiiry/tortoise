@@ -57,6 +57,12 @@ The owner selected that Option (on ``#2817``, 2026-10-07; folded into design
    connector and the second bound, so ``EUR 800 and USD 900`` stays two values
    rather than becoming a range.
 
+   The same posture refuses a currency **PAIR**: ``EUR/USD 800`` / ``800
+   EUR/USD`` name no single currency for the amount, so neither leg is an
+   anchor (both orders abstain as ``ambiguous_currency_symbol``). The guard is
+   scoped to the anchor's neighbourhood, so ``800 EUR was committed while
+   EUR/USD rallied`` still types.
+
    ⚠️ **Recorded residual — an anchor can collide with prose, and a curated list
    cannot close that class.** Uppercase acronyms that are also active ISO 4217
    codes are refused as ``ambiguous_currency_symbol`` when they are listed
@@ -129,7 +135,8 @@ DROP_REASONS: frozenset[str] = frozenset({
     # nothing to read
     "no_candidate",           # no number in the text at all
     "no_currency_anchor",      # a number, but no explicit currency anchor
-    "ambiguous_currency_symbol",  # bare $ / ¥ / € / £ — never a graph default
+    "ambiguous_currency_symbol",  # bare $ / ¥ / € / £ — never a graph
+                               # default; a currency PAIR's leg lands here too
     "not_an_iso4217_code",     # e.g. "800 XYZ" — looks like money, is not ISO
     # the number itself cannot be read without the excluded locale rule
     "ambiguous_separator",     # 1.234 / 1,234 / 1.234,56 / 800.00 / 1 234
@@ -261,6 +268,16 @@ _RANGE_BEFORE_TAIL = re.compile(
 #: How far back a connector may sit before an amount (chars). The pattern is
 #: end-anchored, so this only bounds a pathological scan.
 _RANGE_LOOKBEHIND = 48
+
+#: A currency PAIR — two ISO legs joined by a slash (``EUR/USD``, ``US$/BRL``).
+#: Each half is a valid anchor on its own, but an amount written beside a pair
+#: belongs to the PAIR and names no single currency: ``EUR/USD 800`` typed
+#: 800.00 USD and ``800 EUR/USD`` typed 800.00 EUR before this guard (review
+#: finding, P2). Refused in BOTH orders as ``ambiguous_currency_symbol`` — a
+#: false type is the one outcome this module may never produce.
+_PAIR_LEG = rf"(?:{_SYM_BEFORE}|[A-Z]{{3}})"
+_PAIR_TAIL = re.compile(rf"{_GAP}/{_GAP}{_PAIR_LEG}(?![A-Z])")
+_PAIR_HEAD = re.compile(rf"(?<![A-Z]){_PAIR_LEG}{_GAP}/{_GAP}\Z")
 
 _DATE_SPAN = re.compile(r"\d{4}-\d{2}-\d{2}")
 #: Anything that LOOKS like a date is masked before the range check: a
@@ -418,6 +435,25 @@ def _has_magnitude_word_after(text: str, end: int) -> bool:
     return False
 
 
+def _is_currency_pair_leg(text: str, cand: _Candidate) -> bool:
+    """Whether this candidate's ANCHOR is one leg of a currency pair.
+
+    Both sides of the anchor are checked because either leg can be the one the
+    anchor↔number adjacency resolved: ``EUR/USD 800`` resolves ``USD`` (the
+    pair is BEHIND the anchor), while ``800 EUR/USD`` resolves ``EUR`` (the
+    pair is AHEAD of it). A pair names no single currency, so neither leg is
+    the amount's currency.
+    """
+    if cand.anchor_first:
+        anchor_start = cand.span_start
+        anchor_end = cand.span_start + len(cand.anchor)
+    else:
+        anchor_start = cand.span_end - len(cand.anchor)
+        anchor_end = cand.span_end
+    return bool(_PAIR_TAIL.match(text, anchor_end)
+                or _PAIR_HEAD.match(text[:anchor_start]))
+
+
 def _has_range(text: str, candidates: list[_Candidate]) -> bool:
     """Whether an amount RANGE touches one of the anchored forms.
 
@@ -573,6 +609,14 @@ def normalize_money(text: str) -> Normalization:
             return classified
         if _YEAR_SHAPED.match(cand.token):
             return _drop("year_shaped_amount", cand.token)
+        if _is_currency_pair_leg(text, cand):
+            # ``EUR/USD 800`` — the amount belongs to the PAIR, which names no
+            # single currency, so neither leg is the amount's currency (review
+            # finding, P2: this typed 800.00 USD / 800.00 EUR). Checked AFTER
+            # the year test so a year-shaped token keeps its more specific
+            # reason and the ordering change cannot reopen that class.
+            return _drop("ambiguous_currency_symbol",
+                         text[cand.span_start:cand.span_end].strip())
         token = cand.token.strip().rstrip(_TRAILING_PUNCT)
         verbatim = text[cand.start:cand.start + len(token)]
         try:
