@@ -1206,6 +1206,33 @@ def _proc_cwd_is_readable() -> bool:
     return Path("/proc/self/cwd").exists()
 
 
+# `lsof` reporting a cwd it could not follow, and the kernel's removed-directory
+# marker: `n/proc/8/cwd (readlink: Permission denied)`, `/wt (deleted)`.
+_CWD_PLACEHOLDER_RE = re.compile(r" \(.*\)$")
+
+
+def _usable_cwd(value: str) -> str:
+    """``value`` when it is a path a lane can be attributed by, else ``""``.
+
+    ⛔ AN UNUSABLE STRING IS NOT A MEASUREMENT. Neither reader fails when it cannot
+    follow a pid's cwd: ``lsof`` prints a PLACEHOLDER in the ``n`` field
+    (``/proc/8/cwd (readlink: Permission denied)`` — a live pid in a container whose
+    ``/proc`` entry this user cannot read), and the kernel appends `` (deleted)`` to
+    the cwd of a process whose directory was removed. Accepted as a path, such a
+    value matches no worktree, so ``register_process_lanes`` drops the pid as
+    "another repo's lane" while ``live_sessions`` still reports the store MEASURED —
+    the gate may then answer "nobody holds it" about a live ``pi`` the store did see,
+    the exact fail-open #8999 forbids. Reported as UNRESOLVED instead, the existing
+    per-pid judgement applies: a live pid keeps the store unmeasured, an exited one
+    is not a gap.
+    """
+    if not value.startswith("/"):
+        return ""
+    if _CWD_PLACEHOLDER_RE.search(value):
+        return ""
+    return value
+
+
 def process_cwds(pids: Sequence[int]) -> tuple[dict[int, str], str]:
     """``({pid: cwd}, error)`` — ONE read for every pid, not one per pid.
 
@@ -1217,6 +1244,13 @@ def process_cwds(pids: Sequence[int]) -> tuple[dict[int, str], str]:
     Both readers report only A REAL failure: an unread ``/proc/<pid>/cwd`` is
     skipped, and a command that could not be run is an ``error``. Which pids that
     leaves UNRESOLVED is judged per pid (``pid_alive``) in ``live_sessions``.
+
+    ⛔ AND A PLACEHOLDER IS NOT A CWD — see ``_usable_cwd``. Both readers can
+    return a STRING that is not a path (``lsof``'s ``(readlink: Permission
+    denied)`` form, the kernel's `` (deleted)`` suffix); taken as a cwd it is
+    attributed to no worktree, so the pid would contribute no lane while the store
+    still read MEASURED. It is reported as unresolved instead, and the per-pid
+    ``pid_alive`` judgement above decides.
     """
     if not pids:
         return {}, ""
@@ -1224,9 +1258,11 @@ def process_cwds(pids: Sequence[int]) -> tuple[dict[int, str], str]:
         got: dict[int, str] = {}
         for pid in pids:
             try:
-                got[pid] = os.readlink(f"/proc/{pid}/cwd")
+                cwd = _usable_cwd(os.readlink(f"/proc/{pid}/cwd"))
             except OSError:
                 continue
+            if cwd:
+                got[pid] = cwd
         return got, ""
     out, err = _run_tolerant(
         ["lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(str(p) for p in pids)],
@@ -1243,7 +1279,9 @@ def process_cwds(pids: Sequence[int]) -> tuple[dict[int, str], str]:
             except ValueError:
                 cur = None
         elif line.startswith("n") and cur is not None:
-            got[cur] = line[1:]
+            cwd = _usable_cwd(line[1:])
+            if cwd:
+                got[cur] = cwd
     return got, ""
 
 

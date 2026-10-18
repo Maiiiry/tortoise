@@ -1672,7 +1672,7 @@ def _proc_live(pid: int, cwd: str = CELL_CWD, **extra) -> dict:
 
 
 def _cell_fleet(monkeypatch, *, live, registry=(), wts=None, issues=(8999,),
-                prs=(), workspaces=None):
+                prs=(), workspaces=None, session_index=({}, {})):
     """A cell-shaped board: no cmux workspace list, no registry, one worktree."""
     monkeypatch.setattr(fs, "load_registry", lambda: list(registry))
     monkeypatch.setattr(fs, "cmux_workspaces", lambda: (
@@ -1682,7 +1682,7 @@ def _cell_fleet(monkeypatch, *, live, registry=(), wts=None, issues=(8999,),
     monkeypatch.setattr(fs, "pane_bindings", lambda: {})
     monkeypatch.setattr(fs, "live_sessions", lambda: live)
     monkeypatch.setattr(fs, "load_overrides", lambda: {})
-    monkeypatch.setattr(fs, "session_index", lambda: ({}, {}))
+    monkeypatch.setattr(fs, "session_index", lambda: session_index)
     # The fixture's pids are not real processes on the machine running the suite; the
     # pid READ is what `ps` measured, so it is an input here, never an `os.kill` probe.
     alive = {r.get("pid") for recs in live.values() for r in recs if r.get("pid")}
@@ -1858,6 +1858,12 @@ def test_the_same_gap_is_closed_on_the_batched_lsof_reader(monkeypatch) -> None:
     monkeypatch.setattr(fs, "_proc_cwd_is_readable", lambda: False)
     monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
     monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 8, "ppid": 1}], ""))
+    # ⛔ THE MOCK MUST COVER *BOTH* HALVES. It used to close before the second
+    # `live_sessions()`, which therefore reached the HOST's real ``lsof`` and
+    # asserted against the host's process table — it failed on any box where pid 8
+    # exists and lsof answers for it (measured, 2026-10-19: a Cloud cell printed
+    # `n/proc/8/cwd (readlink: Permission denied)`). Hermetic means every read in
+    # the test is a pure input.
     with mock.patch.object(sp, "run", lambda *a, **k: _P()):
         cwds, err = fs.process_cwds([8])
         assert cwds == {} and err == "", (
@@ -1865,12 +1871,12 @@ def test_the_same_gap_is_closed_on_the_batched_lsof_reader(monkeypatch) -> None:
 
         monkeypatch.setattr(fs, "pid_alive", lambda pid: False)
         live = fs.live_sessions()
-    assert live.measured is True, "the exited pid is not a gap here either"
-    assert dict(live) == {}
+        assert live.measured is True, "the exited pid is not a gap here either"
+        assert dict(live) == {}
 
-    # ⛔ THE CONTRAST: the pid is ALIVE, so the empty answer cannot rule it out.
-    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 8)
-    live = fs.live_sessions()
+        # ⛔ THE CONTRAST: the pid is ALIVE, so the empty answer cannot rule it out.
+        monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 8)
+        live = fs.live_sessions()
     assert live.measured is False, "a live pid with no cwd is still a gap"
     assert "8" in live.error
 
@@ -1899,6 +1905,58 @@ def test_a_failed_lsof_invocation_is_still_a_gap(monkeypatch) -> None:
     with mock.patch.object(sp, "run", _boom):
         cwds, err = fs.process_cwds([9])
     assert cwds == {} and "could not be run" in err
+
+
+def test_a_placeholder_cwd_is_unresolved_not_a_lane(monkeypatch) -> None:
+    """⛔ `lsof` DOES NOT FAIL WHEN IT CANNOT FOLLOW A PID'S CWD — it prints a
+    PLACEHOLDER, and the kernel appends `` (deleted)`` to a removed directory.
+
+    Both strings are not paths. Accepted as a cwd they match no worktree, so
+    `register_process_lanes` drops the pid as another repo's lane while the store
+    still reads MEASURED — the gate may then answer "nobody holds it" about a live
+    `pi` the process table DID see. Measured on a Cloud cell (2026-10-19):
+
+        $ lsof -a -d cwd -Fn -p 8     ->  n/proc/8/cwd (readlink: Permission denied)
+
+    So an unusable string is UNRESOLVED, and the per-pid judgement decides: live
+    keeps the store unmeasured, exited is not a gap.
+    """
+    import subprocess as sp
+    import unittest.mock as mock
+
+    placeholder = "/proc/8/cwd (readlink: Permission denied)"
+
+    class _Placeholder:
+        returncode = 0
+        stdout = f"p8\nn{placeholder}\n"
+        stderr = ""
+
+    monkeypatch.setattr(fs, "_proc_cwd_is_readable", lambda: False)
+    with mock.patch.object(sp, "run", lambda *a, **k: _Placeholder()):
+        cwds, err = fs.process_cwds([8])
+    assert cwds == {} and err == "", (
+        "lsof's placeholder is not a path — it must read as UNRESOLVED")
+
+    # The same rule on the `/proc` reader: a removed directory.
+    monkeypatch.setattr(fs, "_proc_cwd_is_readable", lambda: True)
+    with mock.patch.object(fs.os, "readlink", lambda _p: "/wt/8999 (deleted)"):
+        cwds, err = fs.process_cwds([8])
+    assert cwds == {} and err == "", "` (deleted)` is an unresolved cwd too"
+
+    # … and it reaches the store's polarity, which is the point: the pid is never
+    # published as a lane under a path that attributes to nothing.
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 8, "ppid": 1}], ""))
+    with mock.patch.object(fs.os, "readlink", lambda _p: placeholder):
+        monkeypatch.setattr(fs, "pid_alive", lambda pid: True)
+        live = fs.live_sessions()
+        assert live.measured is False, "a live pid with no usable cwd is still a gap"
+        assert dict(live) == {}, "no lane is minted from a placeholder"
+        assert "8" in live.error
+
+        monkeypatch.setattr(fs, "pid_alive", lambda pid: False)
+        live = fs.live_sessions()
+    assert live.measured is True and dict(live) == {}, "an exited pid is not a gap"
 
 
 def test_a_guest_cli_error_object_is_not_a_session_store(monkeypatch) -> None:
@@ -2124,15 +2182,37 @@ def test_process_lanes_are_skipped_by_the_session_disk_scan(monkeypatch) -> None
     """The disk rule reads the first user message of every file in a lane's session
     directory; on the shared checkout that is 1.6 GB of files. A process lane needs
     no guess — its pid IS the measurement — so the scan must not run for it, or a
-    cell board re-reads the whole store once per lane."""
+    cell board re-reads the whole store once per lane.
+
+    ⛔ WITH A CONTROL ARM: the same board carries a NON-process lane whose session
+    directory also has files, so `seen` proves the scan RUNS for a lane it should
+    scan and does not run for the process lane. Without that arm the assertion is
+    vacuous — `session_index` was stubbed empty, so `first_user_message` was never
+    called for ANY lane, and deleting the skip left the test green (review of
+    #9016)."""
     seen: list[str] = []
     monkeypatch.setattr(fs, "first_user_message",
                         lambda p: seen.append(str(p)) or "x")
+    other_wt = "/tmp/cell-t3/wt-other-lane"
+    scanned = f"/sessions/{fs.mangled(other_wt)}/2026-01-01T00-00-00-000Z_abc.jsonl"
+    # The PROCESS lane's own directory is populated too, so "not in `seen`" is a
+    # real skip and not an empty directory.
+    proc_file = f"/sessions/{fs.mangled(CELL_CWD)}/2026-01-01T00-00-00-000Z_def.jsonl"
     live = fs.LiveSessions(
         {f"{fs.PROC_WS_PREFIX}9300": [_proc_live(9300)]},
         measured=True, source=fs.LIVE_STORE_PROCESS)
-    _cell_fleet(monkeypatch, live=live)
-    assert seen == []
+    _cell_fleet(
+        monkeypatch, live=live,
+        registry=[("lane-other", "WS-B", "")],
+        workspaces=fs.WorkspaceMap(
+            {"WS-B": {"cwd": other_wt}}, measured=True),
+        session_index=({}, {
+            fs.mangled(other_wt): [scanned],
+            fs.mangled(CELL_CWD): [proc_file],
+        }),
+    )
+    assert scanned in seen, "the control lane's directory IS scanned"
+    assert proc_file not in seen, "a process lane's directory is NOT scanned"
 
 
 def test_the_board_reports_which_store_answered(monkeypatch) -> None:
