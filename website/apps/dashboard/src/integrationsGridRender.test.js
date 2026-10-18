@@ -141,7 +141,18 @@ test('#3513: the coming-soon dialog carries the pinned modal contract', () => {
   assert.match(src, /aria-labelledby="integration-modal-title"/, 'labelled by the heading')
   assert.match(src, /onKeyDown=\{\(e\) => \{ if \(e\.key === 'Escape'\) closeComingSoon\(\) \}\}/,
     'Escape closes')
-  assert.match(src, /autoFocus onClick=\{closeComingSoon\}/, 'initial focus moves into the dialog')
+  assert.match(src, /autoFocus\s*\n\s*ref=\{comingSoonCloseRef\}/,
+    'initial focus moves into the dialog (Close autoFocuses, #3513)')
+  // #3514 review P2: the recorded/failed controls do NOT get focus from
+  // `autoFocus` — React fires that only on MOUNT, and the failed branch
+  // reconciles the primary in place, so the prop never fired there. The
+  // transition MOVES focus, and the runtime property (document.activeElement
+  // while the POST is in flight) is asserted in the browser lane
+  // (tests/e2e/test_dashboard_onboarding.py).
+  assert.match(src, /comingSoonStatus === DEMAND_RECORDED\) comingSoonDismissRef\.current\?\.focus\(\)/,
+    'the recorded transition moves focus to Dismiss')
+  assert.match(src, /comingSoonStatus === DEMAND_FAILED\) comingSoonRetryRef\.current\?\.focus\(\)/,
+    'the failed transition moves focus to Retry')
   assert.match(src, /requestAnimationFrame\(\(\) => restoreFocus\(comingSoonRestoreRef\)\)/,
     'closing returns focus to the invoking tile (dialogFocus.js)')
 })

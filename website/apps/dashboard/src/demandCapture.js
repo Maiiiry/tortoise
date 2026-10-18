@@ -98,7 +98,15 @@ export function demandKeyFor(store, integrationKey, { random } = {}) {
   return key
 }
 
-/** The idle state, or the recorded one when this tile was already recorded here. */
+/**
+ * The state a tile's FIRST open starts from.
+ *
+ * Deliberately takes NO argument and knows nothing about what happened before:
+ * a tile that was already recorded (or is mid-request, or failed) on this mount
+ * is looked up from the per-tile map by the caller (`demandStates[key]` in
+ * main.jsx), which is the only place that map lives. Reading "already recorded"
+ * into this function would give the state machine a second, divergent memory.
+ */
 export function demandInitialState() {
   return { status: DEMAND_IDLE, clickCount: null, replayed: false, status_http: null }
 }
@@ -136,7 +144,16 @@ export function demandRecordedDetail(state) {
   return n === 1 ? '1 click from your team.' : `${n} clicks from your team.`
 }
 
-/** Whether the dialog may be dismissed/sent — the primary is disabled mid-POST. */
+/**
+ * Whether this tile's POST is in flight.
+ *
+ * Gates the PRIMARY only — never the dialog's dismissal. A browser blurs the
+ * control that becomes `disabled`, so disabling the ghost Close as well would
+ * leave the modal with no focusable node: focus would fall to `<body>` for the
+ * whole round trip, where the dialog's own keydown (Escape) cannot see it. The
+ * primary's own `disabled` is already a complete double-submit guard, and the
+ * request is server-idempotent (`X-Idempotency-Key`) regardless.
+ */
 export function demandBusy(state) {
   return !!state && state.status === DEMAND_SENDING
 }

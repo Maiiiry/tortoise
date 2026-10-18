@@ -495,6 +495,74 @@ def test_replayed_request_writes_no_second_record(client, telegram):
     assert _wait_for(lambda: True)
 
 
+def test_a_claim_with_no_row_behind_it_is_not_a_replay(client, telegram):
+    """#3514 review P2: `replayed: true` must never be answered on the marker alone.
+
+    A claim can outlive the attempt that took it, so a replay verified only by
+    the marker can report a record that does not exist. `recordDemand` maps
+    `ok: true` to the RECORDED state, i.e. the user is shown "your team's
+    interest is saved" over an empty store — the one thing the failure state
+    exists to prevent.
+
+    Pre-fix: the FIRST request below answered `200 {ok: true, replayed: true}`
+    with zero rows in the store. Post-fix: 503 + `recorded: false` (the same
+    shape an unwritten record uses), the phantom claim is released, and the
+    client's retry is the FIRST record rather than a replay of a phantom.
+    """
+    headers = {"X-Idempotency-Key": "click-phantom"}
+    org_key = demand.derive_org_key(TEAM["org_id"])
+    claim_key = f"{org_key}:{KEY_A}:click-phantom"
+    assert demand.DEMAND_MARKERS.claim(
+        demand.MARK_RECORD, claim_key, demand.DEMAND_IDEMPOTENCY_WINDOW_S), \
+        "the claim the write path takes — taken here WITHOUT any write behind it"
+
+    phantom = _post(client, headers=headers)
+    assert phantom.status_code == 503, phantom.text
+    assert phantom.json()["detail"]["recorded"] is False
+    assert _demand_events(client) == [], "no row was ever written for that claim"
+
+    # The claim was released, so the retry RECORDS instead of replaying.
+    retried = _post(client, headers=headers)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["replayed"] is False, \
+        "the retry is the first record, not a replay of a write that never landed"
+    assert len(_demand_events(client)) == 1
+
+
+def test_a_raised_write_releases_its_claim_so_the_retry_records(
+        client, telegram, monkeypatch):
+    """#3514 review P2: the ROOT CAUSE of the phantom replay above.
+
+    `_demand_record_write` deliberately RE-RAISES `UnregisteredTelemetryKey`
+    (#3821), and the claim taken before that write used to stay held for the
+    whole idempotency window. The client's Retry — same key — was then answered
+    `ok: true, replayed: true` for a click that was never stored, so the dialog
+    showed the success state over an empty store.
+
+    Pre-fix: the retry below reported `replayed: true` and wrote nothing.
+    Post-fix: every escaping path releases the claim, so the retry is a real
+    write and the store holds exactly one row.
+    """
+    headers = {"X-Idempotency-Key": "click-raised"}
+
+    def _flaky(*_args, **_kwargs):
+        raise hosted_api.UnregisteredTelemetryKey(
+            "demand_record", "test-team-3514", {"demand.surface"})
+
+    real_write_event = hosted_api._track_analytics_event
+    monkeypatch.setattr(hosted_api, "_track_analytics_event", _flaky)
+    with pytest.raises(hosted_api.UnregisteredTelemetryKey):
+        _post(client, headers=headers)
+    assert _demand_events(client) == [], "the raised write stored nothing"
+
+    monkeypatch.setattr(hosted_api, "_track_analytics_event", real_write_event)
+    retried = _post(client, headers=headers)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["replayed"] is False, \
+        "a retry after a FAILED attempt must record, not replay a phantom"
+    assert len(_demand_events(client)) == 1
+
+
 def test_unkeyed_second_click_is_a_second_record(client, telegram):
     """Without a client key, a click is a click (R4's one-record-per-click)."""
     assert _post(client).status_code == 200
@@ -624,7 +692,7 @@ def test_a_go_back_row_is_recorded_but_is_not_demand(client, telegram):
     assert _post(client, integration_key=KEY_A, action="go_back").status_code == 200
 
     rows = client.get("/v1/data-sources/demand").json()["demand"]
-    entry = [d for d in rows if d["integration_key"] == KEY_A][0]
+    entry = next(d for d in rows if d["integration_key"] == KEY_A)
     assert entry["click_count"] == 1, entry
     assert entry["org_count"] == 1, entry
     # The dismissal IS in the store: the funnel event is not thrown away.

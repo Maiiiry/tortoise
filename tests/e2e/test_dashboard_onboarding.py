@@ -670,24 +670,77 @@ def test_coming_soon_modal_dialog_contract_and_skip_reaches_done(page: Page) -> 
 
 # ── #3514 (epic #1714 J4): the coming-soon click is RECORDED ───────────
 
-def _open_grid(page: Page) -> None:
-    """Walk to the Data-sources step with the grid rendered (the #3513 prefix)."""
+#: The reveal control's accessible name. `comingSoonShowMoreLabel`
+#: (integrationsGrid.js) builds it as ``Show ${hidden} more`` — i.e. `Show 3
+#: more`, never a backslash. ONE compiled pattern, and the guard that uses it
+#: self-checks its liveness (#3514 review P2): the pre-fix form was the RAW
+#: string ``r"Show \\d+ more"``, whose pattern is `Show \\d+ more` — a LITERAL
+#: backslash followed by `d+` — so `count() == 0` was true in EVERY code state
+#: and the anti-rot guard the docstring promises did not exist.
+_SHOW_MORE = re.compile(r"Show \d+ more")
+
+
+def _open_grid(page: Page, **wire_kwargs) -> dict:
+    """Walk to the Data-sources step with the grid rendered (the #3513 prefix).
+
+    `wire_kwargs` go straight to `_wire` (`demand_failures=[503]` drives the
+    failure path). Returns the capture dict so a spec can assert what the
+    BROWSER sent rather than what the client module believes it sends.
+    """
     _seed_cookie(page, "u-onb")
-    _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
+    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION,
+                **wire_kwargs)
     _walk_to_connect(page)
     page.get_by_role("button", name="Skip for now").click()
     expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+    return cap
 
 
-def _open_coming_soon(page: Page, index: int = 0):
-    """Open the Nth coming-soon dialog; returns (dialog, tile key)."""
-    tile = page.locator(".integration-tile.coming-soon").nth(index)
-    key = tile.get_attribute("data-integration-key")
+def _open_coming_soon(page: Page, key: str | None = None, index: int = 0):
+    """Open a coming-soon dialog BY TILE KEY (or position); returns (dialog, key).
+
+    Keyboard activation — `focus` + Enter — because the tile is a real tab stop
+    and Enter opening the dialog is #3513's pinned contract, so every spec that
+    comes through here keeps that path exercised (the alternative, four
+    hand-inlined copies of this walk, is what #8975's review P3 flagged: two of
+    them were dead code).
+    """
+    tile = (page.locator(f'.integration-tile[data-integration-key="{key}"]') if key
+            else page.locator(".integration-tile.coming-soon").nth(index))
+    tile_key = key or tile.get_attribute("data-integration-key")
     tile.focus()
     page.keyboard.press("Enter")
     dialog = page.locator("[role='dialog']")
     expect(dialog).to_be_visible(timeout=5_000)
-    return dialog, key
+    return dialog, tile_key
+
+
+def _hold_demand_response(page: Page, delay_ms: int = 900) -> None:
+    """Delay the demand POST *inside the page*, so `sending` can be sampled.
+
+    `_wire` records why a route handler cannot serve this: a sync Playwright
+    handler runs on the test thread, so holding the response open blocks the very
+    thread that would have to read the DOM (measured: 10/10 polls read the
+    settled state). Patching the page's own `fetch` moves the delay into the
+    BROWSER — the request is still really made, React is really in `sending` for
+    the whole hold, and the test thread stays free to sample
+    `document.activeElement` while it is true.
+
+    Must be called BEFORE the navigation (`_open_grid` walks and navigates), so
+    the script is installed ahead of the app's module code.
+    """
+    page.add_init_script("""
+    (() => {
+      const realFetch = window.fetch.bind(window)
+      window.fetch = (input, init) => {
+        const url = (typeof input === 'string') ? input : ((input && input.url) || '')
+        if (!url.includes('/v1/data-sources/demand')) return realFetch(input, init)
+        return new Promise((resolve, reject) => {
+          setTimeout(() => realFetch(input, init).then(resolve, reject), __DELAY_MS__)
+        })
+      }
+    })()
+    """.replace("__DELAY_MS__", str(int(delay_ms))))
 
 
 def test_coming_soon_click_is_recorded_with_its_success_state(page: Page) -> None:
@@ -696,14 +749,13 @@ def test_coming_soon_click_is_recorded_with_its_success_state(page: Page) -> Non
     The POST body is asserted from what the BROWSER sent — integration_key + the
     `click` action + the mount's `surface`, and NO client-supplied `org_key` —
     which is the record's whole contract, and the recorded state is asserted
-    inline in the dialog. The transient loading state cannot be sampled from a
-    sync Playwright handler (see `_wire`); it is pinned by the two JS suites.
+    inline in the dialog. The transient loading state cannot be sampled here (see
+    `_wire`); it is pinned by the two JS suites, and its FOCUS contract is
+    sampled in the browser by
+    `test_focus_stays_in_the_dialog_while_the_post_is_in_flight` (which holds the
+    response open with `_hold_demand_response`).
     """
-    _seed_cookie(page, "u-onb")
-    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
-    _walk_to_connect(page)
-    page.get_by_role("button", name="Skip for now").click()
-    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+    cap = _open_grid(page)
 
     tile = page.locator(".integration-tile.coming-soon").first
     key = tile.get_attribute("data-integration-key")
@@ -711,9 +763,8 @@ def test_coming_soon_click_is_recorded_with_its_success_state(page: Page) -> Non
     label = tile.get_attribute("aria-label")
     assert label and "coming soon" in label.lower(), f"tile aria-label must name its state: {label!r}"
 
-    tile.focus()
-    page.keyboard.press("Enter")
-    expect(page.locator("[role='dialog']")).to_be_visible(timeout=5_000)
+    _dialog, opened_key = _open_coming_soon(page)
+    assert opened_key == key, (opened_key, key)
 
     primary = page.get_by_role("button", name="Register interest")
     expect(primary).to_be_enabled()
@@ -741,24 +792,19 @@ def test_second_open_of_a_recorded_tile_does_not_record_twice(page: Page) -> Non
     rather than a duplicate demand row (the server-side replay rides the same
     per-(mount, tile) idempotency key).
     """
-    _seed_cookie(page, "u-onb")
-    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
-    _walk_to_connect(page)
-    page.get_by_role("button", name="Skip for now").click()
-    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+    cap = _open_grid(page)
 
     tile = page.locator(".integration-tile.coming-soon").first
     key = tile.get_attribute("data-integration-key")
-    tile.click()
+    _open_coming_soon(page)
     page.get_by_role("button", name="Register interest").click()
     expect(page.locator(".integration-demand-status")).to_contain_text("Recorded", timeout=10_000)
     page.get_by_role("button", name="Dismiss").click()
     expect(page.locator("[role='dialog']")).to_have_count(0)
 
     # Re-open the SAME tile: the recorded state renders immediately.
-    page.locator(f'.integration-tile[data-integration-key="{key}"]').click()
-    dialog = page.locator("[role='dialog']")
-    expect(dialog).to_be_visible(timeout=5_000)
+    _dialog, reopened_key = _open_coming_soon(page, key=key)
+    assert reopened_key == key
     expect(page.locator(".integration-demand-status")).to_contain_text("Recorded", timeout=5_000)
     assert page.get_by_role("button", name="Register interest").count() == 0, \
         "a recorded tile must not offer a fresh primary — it shows the existing state"
@@ -774,16 +820,9 @@ def test_demand_failure_names_itself_and_retry_records(page: Page) -> None:
     The retry reuses the SAME idempotency key, so a write that did land is a
     replay rather than a second row.
     """
-    _seed_cookie(page, "u-onb")
-    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION,
-                demand_failures=[503])
-    _walk_to_connect(page)
-    page.get_by_role("button", name="Skip for now").click()
-    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+    cap = _open_grid(page, demand_failures=[503])
 
-    tile = page.locator(".integration-tile.coming-soon").first
-    key = tile.get_attribute("data-integration-key")
-    tile.click()
+    _dialog, key = _open_coming_soon(page)
     page.get_by_role("button", name="Register interest").click()
 
     status = page.locator(".integration-demand-status")
@@ -814,28 +853,84 @@ def test_every_coming_soon_tile_captures_its_click(page: Page) -> None:
     integrationsGrid.test.js) — a 3-tile inventory cannot exercise it in a
     browser.
     """
-    _seed_cookie(page, "u-onb")
-    cap = _wire(page, key_rows=[DURABLE_ROW], onboarding_projection=GRID_PROJECTION)
-    _walk_to_connect(page)
-    page.get_by_role("button", name="Skip for now").click()
-    expect(page.locator(".integrations-grid")).to_be_visible(timeout=10_000)
+    cap = _open_grid(page)
 
-    assert page.get_by_role("button", name=re.compile(r"Show \\d+ more")).count() == 0, \
+    # The matcher must be able to MATCH the real control before its absence
+    # means anything: a doubled escape compiles fine and matches nothing, which
+    # is exactly how this guard was vacuous before the review.
+    assert _SHOW_MORE.search("Show 3 more"), \
+        "the reveal matcher must be LIVE against the label comingSoonShowMoreLabel builds"
+    assert page.get_by_role("button", name=_SHOW_MORE).count() == 0, \
         "every coming-soon tile is on first paint today — a reveal control would mean this test skipped one"
     keys = page.locator(".integration-tile.coming-soon").evaluate_all(
         "els => els.map(e => e.dataset.integrationKey)")
     assert len(keys) >= 3, keys
 
     for key in keys:
-        page.locator(f'.integration-tile[data-integration-key="{key}"]').click()
-        dialog = page.locator("[role='dialog']")
-        expect(dialog).to_be_visible(timeout=5_000)
+        dialog, opened_key = _open_coming_soon(page, key=key)
+        assert opened_key == key
         page.get_by_role("button", name="Register interest").click()
         expect(page.locator(".integration-demand-status")).to_contain_text("Recorded", timeout=10_000)
         page.get_by_role("button", name="Dismiss").click()
         expect(dialog).to_have_count(0)
 
     assert [d["body"]["integration_key"] for d in cap["demand"]] == keys, cap["demand"]
+
+
+def test_focus_stays_in_the_dialog_while_the_post_is_in_flight(page: Page) -> None:
+    """#3514 review P2: the `sending` state must not park focus on `<body>`.
+
+    THE DEFECT THIS PINS. The primary that was just activated becomes
+    `disabled`, and a browser moves focus to `<body>` when the focused control
+    becomes disabled. The dialog's Escape handler is `onKeyDown` on the modal
+    element, and a keydown whose target is `<body>` never traverses it — so
+    during the whole round trip Escape stopped closing the dialog, and Tab
+    restarted from the top of the document. The old JS "focus is never dropped"
+    test could not see any of it: it greps the source for `autoFocus`, which
+    React honours only on MOUNT (the failed branch reconciles the primary in
+    place, so its `autoFocus` never fired).
+
+    Both halves are asserted against the RUNTIME, with the response held open by
+    `_hold_demand_response` so the in-flight window lasts long enough to sample:
+    focus stays INSIDE the dialog while `aria-busy="true"`, and Escape still
+    closes it mid-request.
+    """
+    _hold_demand_response(page)  # BEFORE the navigation _open_grid performs
+    _open_grid(page)
+    dialog, _key = _open_coming_soon(page)
+    page.get_by_role("button", name="Register interest").click()
+
+    # Sample the REAL focus, in the browser, while the POST is in flight.
+    samples = []
+    deadline = time.time() + 5
+    while time.time() < deadline and len(samples) < 3:
+        sample = page.evaluate(
+            "() => {"
+            "  const status = document.querySelector('.integration-demand-status');"
+            "  const active = document.activeElement;"
+            "  return {"
+            "    busy: !!(status && status.getAttribute('aria-busy') === 'true'),"
+            "    tag: active ? active.tagName : null,"
+            "    inDialog: !!(active && active.closest && active.closest(\"[role='dialog']\")),"
+            "    text: active ? (active.textContent || '').trim().slice(0, 16) : null,"
+            "  }"
+            "}")
+        if sample["busy"]:
+            samples.append(sample)
+        elif samples:
+            break
+
+    assert samples, (
+        "the in-flight state was never observed, so this probe proves nothing — "
+        "the page-side hold (or the aria-busy binding) is broken, not the focus")
+    assert all(s["inDialog"] for s in samples), (
+        f"focus must stay INSIDE the dialog while the POST is in flight: {samples}")
+    assert {s["tag"] for s in samples} == {"BUTTON"}, (
+        f"a focusable CONTROL must hold focus mid-request, never <body>: {samples}")
+
+    # ... and Escape still closes it, mid-request (the document-level handler).
+    page.keyboard.press("Escape")
+    expect(dialog).to_have_count(0, timeout=3_000)
 
 
 def test_owner_connect_step_mints_never_expiring_key_in_flow(page: Page) -> None:

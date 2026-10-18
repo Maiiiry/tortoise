@@ -11587,6 +11587,14 @@ function MemorySources(props) {
   // and close it on Escape. The expanded coming-soon state resets on close
   // (per-open, never persisted).
   const comingSoonRestoreRef = React.useRef(null)
+  // #3514 review P2: the dialog's focus TARGETS. Each state transition moves
+  // focus deliberately (the effect below) instead of relying on `autoFocus`,
+  // which React honours only on MOUNT — and the failed state RECONCILES the
+  // primary in place (same element type, same slot), so its `autoFocus` never
+  // fired where it was needed.
+  const comingSoonCloseRef = React.useRef(null)
+  const comingSoonDismissRef = React.useRef(null)
+  const comingSoonRetryRef = React.useRef(null)
   const closeComingSoon = () => {
     setComingSoonKey(null)
     setComingSoonExpanded(false)
@@ -11614,6 +11622,13 @@ function MemorySources(props) {
   const recordComingSoonClick = async () => {
     const key = comingSoonKey
     if (!key) return
+    // #3514 review P2: one submit in flight per tile. The primary is already
+    // `disabled` while busy; this guard is the second half (the Retry control
+    // and a re-opened dialog both reach this function) and it is what makes the
+    // state machine's `sending` arm authoritative rather than decorative. The
+    // request is server-idempotent regardless, so a guard that misses costs a
+    // replay, never a second record.
+    if (demandBusy(demandStates[key])) return
     const idempotencyKey = demandKeyFor(demandKeysRef.current, key)
     setDemandStates((s) => ({ ...s, [key]: demandSending(s[key] || demandInitialState()) }))
     // No try/catch: `recordDemand` cannot throw — a transport failure, a 503 from
@@ -11632,6 +11647,45 @@ function MemorySources(props) {
         : demandFailed(s[key] || demandInitialState(), outcome),
     }))
   }
+
+  // #3514 review P2 — FOCUS, and why Escape is bound TWICE.
+  //
+  // Escape is handled on the DOCUMENT while the dialog is open, in addition to
+  // the dialog's own `onKeyDown` (#3513's pinned handler, kept verbatim below).
+  // A keydown only reaches an element when the event's target is inside it, and
+  // a browser moves focus to <body> the moment the focused control becomes
+  // `disabled` — which is exactly what the sending transition does to the
+  // primary the user just pressed. With the modal-only handler, Escape stopped
+  // closing the dialog for the whole in-flight window. Both handlers are
+  // idempotent (close sets the key to null), so the double delivery of one
+  // Escape press costs a second no-op.
+  //
+  // The deps list is deliberately `[comingSoonKey]`: `closeComingSoon` is
+  // re-created on every render, and a deps array is evaluated EAGERLY during
+  // render (the #2709 white-screen shape), so naming it would only re-register
+  // the listener each render for no behaviour change.
+  React.useEffect(() => {
+    if (!comingSoonKey) return undefined
+    function onKeyDown(e) {
+      if (e.key === 'Escape') closeComingSoon()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [comingSoonKey])
+
+  // #3514 review P2: move focus on the transitions that change the controls, so
+  // it never rests on <body>:
+  //   sending  → Close, the control that is STILL ENABLED (the primary just
+  //              became disabled under the user's focus and a browser blurs it);
+  //   recorded → Dismiss (the only control), failed → Retry (the next action).
+  // The idle state keeps #3513's pinned initial focus on Close via `autoFocus`.
+  const comingSoonStatus = comingSoonDemand.status
+  React.useEffect(() => {
+    if (!comingSoonKey) return
+    if (comingSoonStatus === DEMAND_SENDING) comingSoonCloseRef.current?.focus()
+    else if (comingSoonStatus === DEMAND_FAILED) comingSoonRetryRef.current?.focus()
+    else if (comingSoonStatus === DEMAND_RECORDED) comingSoonDismissRef.current?.focus()
+  }, [comingSoonKey, comingSoonStatus])
 
   if (loading) {
     return <div className="memory-sources"><p className="dim">Loading memory sources…</p></div>
@@ -12048,13 +12102,20 @@ function MemorySources(props) {
           state. States are pinned (no silent black hole):
             idle     — primary enabled, Copy says nothing yet;
             sending  — primary DISABLED (a double submit is impossible, and the
-                       request is idempotent at the server regardless);
+                       request is idempotent at the server regardless), and the
+                       ghost Close stays ENABLED: it is the only control left
+                       that can hold focus;
             recorded — the recorded state inline, with Dismiss;
             failed   — "your request was not recorded" + Retry, and the state
                        never reads as recorded.
-          Focus never lands on <body>: Close keeps the initial focus in the idle
-          state (#3513's pinned assertion), and the recorded/failed controls
-          autoFocus when they mount in place of the primary. */}
+          FOCUS stays INSIDE the dialog in every state, and it is MOVED on each
+          transition (the focus effect in MemorySources) instead of being left
+          to `autoFocus` — React fires that only on MOUNT, so a control a branch
+          RECONCILES in place (the failed state's Retry sits in the primary's
+          slot) never took it. This is not cosmetic: a browser blurs a control
+          that becomes `disabled` (focus falls to <body>), and a keydown whose
+          target is <body> never traverses this dialog — which is why Escape is
+          also bound on the document (see the effect in MemorySources). */}
       {comingSoonTile && (
         <div
           className="integration-modal-backdrop"
@@ -12099,12 +12160,14 @@ function MemorySources(props) {
             </div>
             <div className="wizard-actions">
               {comingSoonDemand.status === DEMAND_RECORDED ? (
-                <button type="button" className="btn-primary" autoFocus onClick={closeComingSoon}>
+                <button type="button" className="btn-primary" ref={comingSoonDismissRef}
+                  onClick={closeComingSoon}>
                   {DEMAND_DISMISS_LABEL}
                 </button>
               ) : comingSoonDemand.status === DEMAND_FAILED ? (
                 <>
-                  <button type="button" className="btn-primary" autoFocus onClick={recordComingSoonClick}>
+                  <button type="button" className="btn-primary" ref={comingSoonRetryRef}
+                    onClick={recordComingSoonClick}>
                     {DEMAND_RETRY_LABEL}
                   </button>
                   <button type="button" className="ghost" onClick={closeComingSoon}>Close</button>
@@ -12119,11 +12182,18 @@ function MemorySources(props) {
                   >
                     {demandBusy(comingSoonDemand) ? DEMAND_SENDING_LABEL : DEMAND_PRIMARY_LABEL}
                   </button>
+                  {/* #3514 review P2: Close is NOT disabled while the POST is
+                      in flight. Disabling the primary already makes a double
+                      submit impossible, and the request is idempotent at the
+                      server — while disabling Close too left the dialog with NO
+                      focusable control for the whole round trip: the browser
+                      parks focus on <body> (a disabled control cannot hold it),
+                      which is the state the Escape handler cannot reach. */}
                   <button
                     type="button"
                     className="ghost"
                     autoFocus
-                    disabled={demandBusy(comingSoonDemand)}
+                    ref={comingSoonCloseRef}
                     onClick={closeComingSoon}
                   >
                     Close

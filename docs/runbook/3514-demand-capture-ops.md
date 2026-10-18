@@ -109,8 +109,8 @@ same endpoint.
 
 | Check | Status | Why |
 |---|---|---|
-| Automated rows (`tests/test_data_source_capture.py`) | **RUN** — 45 passed | the server half: record, ping, dedupe, caps, read half, and the `go_back`-is-not-demand guard |
-| Client half (node + browser) | **RUN** | `demandCapture.test.js` (17, the state machine and the wire body), `demandCaptureRender.test.js` (9, the dialog wiring), and the four `#3514` rows in `tests/e2e/test_dashboard_onboarding.py` (real built bundle, real preview) |
+| Automated rows (`tests/test_data_source_capture.py`) | **RUN** — 47 passed | the server half: record, ping, dedupe, caps, read half, the `go_back`-is-not-demand guard, and the two replay rows (`a claim with no row behind it is NOT a replay`, `a raised write releases its claim so the retry records`) |
+| Client half (node + browser) | **RUN** | `demandCapture.test.js` (17, the state machine and the wire body), `demandCaptureRender.test.js` (11, the dialog wiring, the focus moves and the document-level Escape), and the five `#3514` rows in `tests/e2e/test_dashboard_onboarding.py` (real built bundle, real preview — including the in-flight FOCUS row, which holds the response open from the page so `document.activeElement` and Escape can be sampled during `sending`) |
 | `ops-telegram-live-send` | **NOT RUN** | no operator Telegram credentials exist in the lane that produced this PR; a live send cannot be fabricated, and the receipt gate (#3515) refuses a fabricated one |
 | `ops-monthly-demand-review` | **NOT RUN** | requires a DEPLOYED instance holding real demand rows. The surface now exists end to end (the grid landed in #8327, the click trigger in #3514), so this row is runnable the first time a real user clicks a tile on a deployment — no lane can produce it from a test store without fabricating the receipt |
 

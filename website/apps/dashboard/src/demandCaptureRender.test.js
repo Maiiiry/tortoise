@@ -70,26 +70,67 @@ test('#3514: the status region is aria-live=polite and never upgrades itself', (
     'role=alert would make the pinned polite region assertive — the contract says polite')
 })
 
-test('#3514: all four states render, driven by the module\'s constants', () => {
+test('#3514: all four states render, idle included, driven by the module\'s constants', () => {
   const block = dialogBlock()
   for (const name of [DEMAND_SENDING, DEMAND_RECORDED, DEMAND_FAILED]) {
     assert.ok(block.includes(`comingSoonDemand.status === ${name}`)
       || block.includes(`comingSoonDemand.status === DEMAND_${name.toUpperCase()}`),
     `the ${name} state must be rendered`)
   }
+  // IDLE is the arm the other three fall through to — asserted directly rather
+  // than left implicit, so "all four states render" is four, not three.
+  assert.ok(block.includes('{demandBusy(comingSoonDemand) ? DEMAND_SENDING_LABEL : DEMAND_PRIMARY_LABEL}'),
+    'idle renders the enabled primary (the ternary\'s else arm), sending the in-flight label')
+  assert.match(block, /disabled=\{demandBusy\(comingSoonDemand\)\}/,
+    'idle and sending differ by the primary\'s disabled binding alone')
   assert.ok(block.includes('{DEMAND_FAILED_COPY}'), 'the failure names itself')
   assert.ok(block.includes('{DEMAND_RECORDED_COPY}'), 'the recorded state is shown inline')
   assert.ok(block.includes('demandRecordedDetail(comingSoonDemand)'))
 })
 
-test('#3514: focus is never dropped to <body> as the states swap the controls', () => {
+// #3514 review P2: this test used to be named "focus is never dropped to <body>"
+// while it only grepped for `autoFocus` in the source. That is a different
+// claim, and it could not see the real defect: React fires `autoFocus` only on
+// MOUNT, and the in-flight state RECONCILES the primary in place, so the focus
+// fell to <body> — where the dialog's own Escape handler cannot reach it. What
+// this file CAN settle is which control each state renders and that the focus
+// is moved on the transitions; the runtime property (document.activeElement)
+// is asserted in the browser lane
+// (tests/e2e/test_dashboard_onboarding.py, `test_focus_stays_in_the_dialog_while_the_post_is_in_flight`).
+test('#3514: every state renders a control that can hold focus', () => {
   const block = dialogBlock()
-  assert.match(block, /className="ghost"\s*\n?\s*autoFocus/,
-    'the idle state keeps the pinned initial focus on Close')
-  assert.match(block, /className="btn-primary" autoFocus onClick=\{closeComingSoon\}\)?[\s\S]{0,40}\{DEMAND_DISMISS_LABEL\}/,
-    'Dismiss takes focus when it mounts in place of the primary')
-  assert.match(block, /className="btn-primary" autoFocus onClick=\{recordComingSoonClick\}/,
-    'Retry takes focus in the failure state')
+  assert.match(block, /className="ghost"\s*\n\s*autoFocus\s*\n\s*ref=\{comingSoonCloseRef\}/,
+    'the idle state keeps the pinned initial focus on Close (#3513)')
+  assert.match(block, /ref=\{comingSoonDismissRef\}/, 'the recorded state has a focus target')
+  assert.match(block, /ref=\{comingSoonRetryRef\}/, 'the failure state has a focus target')
+})
+
+test('#3514: the ghost Close is NOT disabled while the POST is in flight', () => {
+  const block = dialogBlock()
+  // The idle/sending arm's Close: the ONLY control in the dialog that stays
+  // focusable once the primary is disabled. Its `disabled` binding was the
+  // defect — a browser blurs a disabled control, so focus fell to <body> for the
+  // whole round trip and the modal's Escape handler stopped receiving the key.
+  const close = block.match(
+    /<button\s*\n\s*type="button"\s*\n\s*className="ghost"\s*\n\s*autoFocus\s*\n\s*ref=\{comingSoonCloseRef\}\s*\n\s*onClick=\{closeComingSoon\}\s*\n\s*>/)
+  assert.ok(close, 'the idle/sending Close must be present, autofocused and ref-held')
+  assert.doesNotMatch(close[0], /disabled=/, 'Close must stay enabled and focusable mid-POST')
+  assert.match(block, /disabled=\{demandBusy\(comingSoonDemand\)\}/,
+    'the primary is still the one control that a double submit cannot race')
+})
+
+test('#3514: focus is MOVED on the sending/outcome transitions, and Escape is document-bound', () => {
+  const body = memorySourcesBlock()
+  assert.match(body, /comingSoonStatus === DEMAND_SENDING\) comingSoonCloseRef\.current\?\.focus\(\)/,
+    'the sending transition moves focus to the control that is still enabled')
+  assert.match(body, /comingSoonStatus === DEMAND_FAILED\) comingSoonRetryRef\.current\?\.focus\(\)/,
+    'the failure transition focuses Retry — a reconciled node never honoured autoFocus')
+  assert.match(body, /comingSoonStatus === DEMAND_RECORDED\) comingSoonDismissRef\.current\?\.focus\(\)/,
+    'the recorded transition focuses Dismiss')
+  assert.match(body, /document\.addEventListener\('keydown', onKeyDown\)/,
+    'Escape must survive focus leaving the dialog: it is bound on the document too')
+  assert.match(body, /if \(demandBusy\(demandStates\[key\]\)\) return/,
+    'one submit in flight per tile — the guard, not the disabled attribute alone')
 })
 
 test('#3514: the click posts through the session seam with its idempotency key', () => {

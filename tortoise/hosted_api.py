@@ -38413,14 +38413,45 @@ async def record_data_source_demand(
     if idem_key and not _demand.DEMAND_MARKERS.claim(
             _demand.MARK_RECORD, idem_key, _demand.DEMAND_IDEMPOTENCY_WINDOW_S):
         rows, source = await _demand_store_rows_off_loop(org_id)
+        click_count = _demand_click_count(rows, integration_key)
+        if click_count == 0:
+            # #3514 review P2 — the claim alone is NOT evidence of a record.
+            # A claim can outlive the attempt that took it (pre-fix, an
+            # `UnregisteredTelemetryKey` re-raise exited 500 with the claim
+            # held for the whole window), and answering `replayed: True` on the
+            # marker alone then tells the client a write happened that did not:
+            # `recordDemand` maps `ok: true` to the RECORDED state, so the user
+            # is shown "Recorded — your team's interest is saved" for a click
+            # that was never stored — the one thing the failure state exists to
+            # prevent. `0` is unambiguous (the store was READABLE and holds no
+            # click for this key); `None` means the store could not be read and
+            # is NOT evidence of absence, so that case keeps the replay answer.
+            # Release the phantom claim and answer like a failed write, so the
+            # client's Retry RECORDS instead of replaying a phantom.
+            _demand.DEMAND_MARKERS.release(_demand.MARK_RECORD, idem_key)
+            raise HTTPException(
+                status_code=503,
+                detail={"recorded": False,
+                        "message": "the click was not recorded — please retry"})
         return {"ok": True, "integration_key": integration_key,
                 "replayed": True, "org_key": org_key,
-                "click_count": _demand_click_count(rows, integration_key),
+                "click_count": click_count,
                 "source": source}
 
-    outcome = await _demand_record_write(
-        org_id, integration_key=integration_key, action=body.action,
-        surface=surface, org_key=org_key)
+    try:
+        outcome = await _demand_record_write(
+            org_id, integration_key=integration_key, action=body.action,
+            surface=surface, org_key=org_key)
+    except BaseException:
+        # #3514 review P2 — the ROOT CAUSE of the phantom replay above. A claim
+        # that outlives a FAILED attempt makes the client's retry a no-op for a
+        # write that never landed, so every escaping path must release it.
+        # `dropped` is the handled failure (below); this covers the raise path —
+        # `_demand_record_write` deliberately re-raises `UnregisteredTelemetryKey`
+        # (#3821) — and cancellation, which must not strand a claim either.
+        if idem_key:
+            _demand.DEMAND_MARKERS.release(_demand.MARK_RECORD, idem_key)
+        raise
     if outcome == "dropped":
         if idem_key:
             # The record is not on the sink, so the claim must not make the
