@@ -1205,6 +1205,16 @@ surfaces:
   - test_5361_inverted_window_read_path.py
   - test_ask_eval_only.py
   - test_backfill_ghost_members_guard.py
+  # #5233: DUAL-REGISTERED with `api` (see the entry there). The `api` entry
+  # alone left this guard asleep exactly when the file it guards moved:
+  # `graph-scripts/` is a fallback tree, so a
+  # `graph-scripts/clear_max_sessions_4010.py`-only diff selects `core` and NOT
+  # `api` — verified with
+  # `tools/ci_selection.py --changed-files graph-scripts/clear_max_sessions_4010.py`
+  # (surfaces ['core'], file ABSENT from the run set). The #5233 guard ORDERING
+  # pin lives in this file, so without the `core` arm the fix would ship with
+  # its own regression guard unselected (#1349/#2938/#3154 class).
+  - test_issue_4010_sessions_unlimited.py
   - test_backup_ledger_5062.py
   # #4282: dual-registered with `api` because `api` is keyed on SOURCE PATTERNS, and
   # the files this guard protects are not api-owned: `tools/bridge_table.py`, the

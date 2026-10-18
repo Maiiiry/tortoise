@@ -36,7 +36,11 @@ Usage:
 Defaults to TORTOISE_DB_URI env var (or docker://:falkordb@localhost:6379/tortoise).
 Test safety: the guard runs on the graph the sweep ACTUALLY writes (the
 SDK-resolved `registry_control_plane`), never on the URI path — so a real write
-always needs `--yes`.
+always needs `--yes`. #5233: the guard runs on the SDK's NAME-ONLY derivation
+(`_registry_graph_name()`), BEFORE the graph is opened — so a REFUSED run
+creates nothing. Opening first (`_get_registry()`) materialized both
+`registry_tortoise` and `registry_control_plane` via index DDL that FalkorDB
+auto-creates on, before the guard could refuse.
 """
 from __future__ import annotations
 
@@ -189,11 +193,25 @@ def main() -> int:
 
     sdk = TortoiseSDK(namespace="registry")
     try:
-        reg = sdk._get_registry()
-        target = reg.name
+        # #5233: the guard runs on the NAME-ONLY derivation, BEFORE anything is
+        # opened. `_get_registry()` cannot serve that order — it materializes
+        # BOTH `registry_tortoise` (via `_get_proj` →
+        # `FalkorProjection.__init__._ensure_indexes`) and
+        # `registry_control_plane` (via `_ensure_registry_indexes`), and a
+        # FalkorDB query/index DDL AUTO-CREATES a missing graph
+        # (docs/ops/669-post-flip-verification.md, #669). Gating after that call
+        # made "the guard refused" and "nothing happened" different statements.
+        target = sdk._registry_graph_name()
         # The URI path never names this graph — `TortoiseSDK(namespace="registry")`
         # derives the registry name from the NAMESPACE, not from the URI path.
         test_guard(target, args.yes)
+        reg = sdk._get_registry()
+        if reg.name != target:
+            # The operator consented to `target`; the SDK opened another graph.
+            # Never sweep a graph the guard did not approve (#5188's contract).
+            print(f"⛔ refusing to sweep: the guard approved '{target}' but the "
+                  f"SDK resolved '{reg.name}'.")
+            return 1
         print(f"Registry graph (SDK-resolved): {target}")
         report = clear_stored_max_sessions(reg, dry_run=args.dry_run)
     finally:

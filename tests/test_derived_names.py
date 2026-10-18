@@ -198,6 +198,60 @@ def test_already_compliant_registry_name_is_not_double_prefixed(tmp_path):
     assert not name.startswith("test_test_hosted_")
 
 
+# ── #5233: the NAME-ONLY registry derivation (guard before materialization) ──
+
+def test_registry_graph_name_is_derived_without_opening(tmp_path, monkeypatch):
+    """#5233: `_registry_graph_name()` must answer WITHOUT opening anything.
+
+    `_get_registry()` materializes the graph it names — `_get_proj` draws
+    `registry_tortoise` (`FalkorProjection.__init__` runs `_ensure_indexes`) and
+    `_ensure_registry_indexes` then draws `registry_control_plane`, and FalkorDB
+    AUTO-CREATES a missing graph on any query/index DDL
+    (`docs/ops/669-post-flip-verification.md`). A destructive-op CLI that gated
+    on the OPENED name therefore created the graph before its guard could
+    refuse, making "the guard refused" and "nothing happened" different
+    statements.
+
+    The construction is the CLI shape the graph-scripts use — `namespace=
+    "registry"` with NO explicit `path=` — so the TEST redirect cannot apply
+    (it requires an explicit path) and this stays lane-independent.
+    """
+    from tortoise.sdk import TortoiseSDK
+
+    monkeypatch.setenv("TORTOISE_DB_URI", "docker://localhost:6379/tortoise")
+    sdk = TortoiseSDK(namespace="registry")
+    try:
+        def _boom(*_a, **_k):
+            raise AssertionError(
+                "_get_proj() was called — the name path is not name-only")
+        monkeypatch.setattr(sdk, "_get_proj", _boom)
+        assert sdk._registry_graph_name() == "registry_control_plane"
+        assert sdk._resolved_graph_name() == "registry_tortoise"
+    finally:
+        sdk.close()
+
+
+def test_registry_graph_name_matches_the_opened_graph(tmp_path, monkeypatch):
+    """The names agree on every shape where the redirect cannot intervene.
+
+    `TORTOISE_DB_URI` is absent here on purpose: the redirect fires only when an
+    explicit `path=` AND a URI are both present, so dropping the URI makes this
+    an honest end-to-end equality pin (the real `_get_proj`/`_get_registry`, no
+    fakes) rather than a lane-dependent one. Before #5233 the two names were the
+    same expression; the fix splits the derivation in two, and this pins that
+    the split did not change the target.
+    """
+    from tortoise.sdk import TortoiseSDK
+
+    monkeypatch.delenv("TORTOISE_DB_URI", raising=False)
+    for ns in ("registry", "test-hosted", "test_foo", None):
+        sdk = TortoiseSDK(str(tmp_path / f"eq5233_{ns}.db"), namespace=ns)
+        try:
+            assert sdk._registry_graph_name() == sdk._get_registry()._name, ns
+        finally:
+            sdk.close()
+
+
 def test_shared_registry_name_is_never_prefixed(tmp_path):
     """AC2's fail-closed direction. `namespace="registry"` makes `_get_proj`'s
     `namespace == "registry"` branch force graph_name="registry_tortoise"

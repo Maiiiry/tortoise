@@ -4365,6 +4365,59 @@ def _derive_graph_name(*, namespace: str | None,
     return uri_graph or "tortoise"
 
 
+def _derive_registry_graph_name(*, namespace: str | None,
+                                graph_name: str | None) -> str:
+    """The SDK's ONE ``(namespace, main-graph-name)`` → registry-graph-name
+    derivation.
+
+    Extracted from ``TortoiseSDK._get_registry`` (#5233) so a caller that must
+    know the registry graph's NAME *without opening it* derives it identically
+    instead of re-implementing the branches — the same single-source argument
+    ``_derive_graph_name`` carries for the main graph, and the reason #3634
+    forbids a second copy at the call sites.
+
+    Why a name-only path has to exist at all: ``_get_registry()`` materializes
+    the graph it names. In FalkorDB a ``CREATE INDEX`` (and any ``GRAPH.QUERY``)
+    AUTO-CREATES a missing graph (``docs/ops/669-post-flip-verification.md``
+    §"GRAPH.QUERY auto-creates a missing graph"; ``hosted_api.py`` records the
+    same finding for a registry-namespaced probe), and ``_get_registry()``
+    issues one per label via ``_ensure_registry_indexes``. So a destructive-op
+    CLI that gated on ``_get_registry().name`` had already created the graph
+    before its guard could refuse — making "the guard refused" and "nothing
+    happened" different statements, which is the property such a guard exists
+    to provide.
+
+    Branches (unchanged from ``_get_registry``, which now calls this):
+
+    * a TEST-DERIVED main graph (``tortoise_test_*``/``test_*``) emits
+      ``{ns}_{graph_name}_control_plane`` — prefixed with ``test_`` only when
+      it does not already comply, so a derived name ALWAYS matches an
+      ownership set instead of leaking one server graph per mint (#3634).
+      ``test-hosted`` ⇒ ``test_hosted_test_hosted_tortoise_control_plane``,
+      never ``test_test_hosted_...``.
+    * a namespaced non-test graph emits ``{ns}_control_plane`` (shared — never
+      prefixed; for a ``team_``/``org_`` namespace it matches
+      ``_SWEEP_OWNED_PREFIXES``).
+    * no namespace emits ``control_plane``.
+
+    The hyphenated ``test-*`` namespace family is normalized here (not by the
+    caller) so every caller gets the SAME ``ns`` — the normalization
+    ``_get_proj`` applies for the main graph.
+    """
+    ns = namespace or ""
+    if ns.startswith("test-"):
+        ns = ns.replace("-", "_")
+    if graph_name and graph_name.startswith(("tortoise_test_", "test_")):
+        registry_name = (f"{ns}_{graph_name}_control_plane" if ns
+                         else f"{graph_name}_control_plane")
+        if not registry_name.startswith(("test_", "tortoise_test_")):
+            registry_name = f"test_{registry_name}"
+        return registry_name
+    if ns:
+        return f"{ns}_control_plane"
+    return "control_plane"
+
+
 class InvertedSupersedeWindow(ValueError):
     """#5363 — a supersede refused because its successor's window start
     precedes the predecessor's ``validFrom`` (#4021's inverted-window guard).
@@ -5097,19 +5150,54 @@ class TortoiseSDK:
             # wrapper type would silently misbucket every exhausted write.
             raise (exc.__cause__ or exc) from None
 
+    def _resolved_graph_name(self) -> str:
+        """The MAIN graph name this SDK resolves to — purely, without connecting.
+
+        Extracted from ``_get_proj`` (#5233) so both the projection and the
+        name-only registry derivation read ONE resolution. ``_get_proj``
+        materializes the graph (``FalkorProjection.__init__`` runs
+        ``_ensure_indexes``, whose DDL auto-creates a missing graph), so a
+        caller that needs the name BEFORE committing to an open cannot ask the
+        projection for it.
+        """
+        # Resolve the URI's own graph name first (used as the fallback
+        # when no namespace is set — preserves the conftest per-session
+        # test graph, #221).
+        uri_graph: str | None = None
+        if self._db_uri is not None:
+            from urllib.parse import urlparse
+            uri_graph = urlparse(self._db_uri).path.lstrip('/') or "tortoise"
+        return _derive_graph_name(
+            namespace=self._namespace, graph_name=self._graph_name,
+            uri_graph=uri_graph)
+
+    def _registry_graph_name(self) -> str:
+        """The registry control-plane graph NAME, without opening anything.
+
+        #5233: the destructive-op graph-scripts must run their consent guard
+        BEFORE they touch the registry namespace. ``_get_registry()`` cannot
+        serve that ordering — it materializes ``registry_tortoise`` (via
+        ``_get_proj``) AND ``registry_control_plane`` (via
+        ``_ensure_registry_indexes``) — so a refused run would still have
+        created both graphs. This derives the SAME name through the SAME
+        single-source functions (``_derive_graph_name`` +
+        ``_derive_registry_graph_name``) with no connection, no index DDL and
+        no journal append, so the guard can refuse before any side effect.
+
+        Equality with ``_get_registry().name`` is the contract, and it holds
+        on the CLI path by construction: ``_get_registry`` reads
+        ``proj.graph_name``, which equals ``_resolved_graph_name()`` unless the
+        projection's TEST redirect fired — and that needs an explicit
+        ``path=``, which ``TortoiseSDK(namespace="registry")`` never passes.
+        ``tests/test_derived_names.py`` pins the equality.
+        """
+        return _derive_registry_graph_name(
+            namespace=self._namespace,
+            graph_name=self._resolved_graph_name())
+
     def _get_proj(self) -> FalkorProjection:
         if self._proj is None:
-            # Resolve the URI's own graph name first (used as the fallback
-            # when no namespace is set — preserves the conftest per-session
-            # test graph, #221).
-            uri_graph: str | None = None
-            if self._db_uri is not None:
-                from urllib.parse import urlparse
-                uri_graph = urlparse(self._db_uri).path.lstrip('/') or "tortoise"
-
-            graph_name = _derive_graph_name(
-                namespace=self._namespace, graph_name=self._graph_name,
-                uri_graph=uri_graph)
+            graph_name = self._resolved_graph_name()
             if self._db_uri is not None:
                 # Multi-tenant isolation (#7886): pass the namespaced graph
                 # name so tenants never share the URI's default graph.
@@ -5201,38 +5289,16 @@ class TortoiseSDK:
         if self._registry_g is None:
             proj = self._get_proj()
             graph_name = getattr(proj, "graph_name", None)
-            ns = self._namespace or ""
-            # Epic #1647 (T7): the hyphenated test-* namespace family is
-            # normalized in _get_proj (test-tiers → test_tiers_tortoise); the
-            # control-plane path normalizes identically so it derives its name
-            # from the SAME `ns` string. For a test graph the emitted name is
-            # `{ns}_{test_graph}_control_plane`, prefixed with `test_` only when
-            # it does not already start with `test_`/`tortoise_test_` (below).
-            # So `test-hosted` emits
-            # `test_hosted_test_hosted_tortoise_control_plane`, never
-            # `test_test_hosted_...` — and that name therefore ALWAYS matches
-            # `_SERVER_WIPE_PREFIXES`: `wipe_server` owns it by prefix. The
-            # journal append below is the ADDITIONAL ownership record, read by
-            # the journal sweep (`_SWEEP_OWNED_PREFIXES`). The shared-name
-            # branch emits `{ns}_control_plane` / `control_plane`, never
-            # prefixed — for `registry` and the no-namespace path those match
-            # NEITHER set, but a `team_`/`org_` namespace DOES match
-            # `_SWEEP_OWNED_PREFIXES` (never `_SERVER_WIPE_PREFIXES`).
-            if ns.startswith("test-"):
-                ns = ns.replace("-", "_")
-            if graph_name and graph_name.startswith(("tortoise_test_", "test_")):
-                registry_name = f"{ns}_{graph_name}_control_plane" if ns else f"{graph_name}_control_plane"
-                # #3634 / epic CI-3 half 2: WITHOUT this the derived name matches
-                # NEITHER ownership set, so every mint leaks one server graph
-                # (E2E-7). Prepend only when absent — `test-hosted` derivatives
-                # already comply, and double-prefixing breaks
-                # tests/test_derived_names.py.
-                if not registry_name.startswith(("test_", "tortoise_test_")):
-                    registry_name = f"test_{registry_name}"
-            elif ns:
-                registry_name = f"{ns}_control_plane"      # shared — NEVER prefixed
-            else:
-                registry_name = "control_plane"            # shared — NEVER prefixed
+            # #5233: the branch logic is now the single-source
+            # `_derive_registry_graph_name` (shared with the name-only
+            # `_registry_graph_name`), so the guard's name and the opened
+            # name cannot drift. It reads `proj.graph_name` (NOT
+            # `_resolved_graph_name`) deliberately: the TEST redirect can
+            # mutate the projection's name, and the
+            # `test_already_compliant_registry_name_is_not_double_prefixed`
+            # case in tests/test_derived_names.py pins that honour.
+            registry_name = _derive_registry_graph_name(
+                namespace=self._namespace, graph_name=graph_name)
             registry_graph = proj.db.select_graph(registry_name)
             # Epic #1647 (CI P2): the registry name derived from a TEST graph
             # must ALSO be journaled — the redirect only journals the main

@@ -50,11 +50,14 @@ either the cap constant returns or a stored value starts being honoured.
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
 import uuid
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -251,6 +254,65 @@ class TestSweepSafetyGuards:
             sweep.test_guard("registry_control_plane", yes=False)
         sweep.test_guard("registry_control_plane", yes=True)  # explicit consent
         sweep.test_guard("tortoise_test_4010")  # test-scoped, no consent
+
+    def test_guard_runs_before_the_materializing_call(self, monkeypatch):
+        """#5233: a REFUSED run must not reach `_get_registry()` — that is the
+        call that materializes BOTH `registry_tortoise` (via `_get_proj` →
+        `FalkorProjection.__init__._ensure_indexes`) and `registry_control_plane`
+        (via `_ensure_registry_indexes`), and FalkorDB auto-creates a missing
+        graph on any query/index DDL. Gating AFTER that call made "the guard
+        refused" and "nothing happened" different statements."""
+        order: list[str] = []
+
+        class _FakeSDK:
+            def __init__(self, *a, **k):
+                order.append("ctor")
+
+            def _registry_graph_name(self):
+                order.append("name_only")
+                return "registry_control_plane"
+
+            def _get_registry(self):
+                order.append("get_registry")
+                return SimpleNamespace(name="registry_control_plane")
+
+            def close(self):
+                order.append("close")
+
+        monkeypatch.setattr("tortoise.sdk.TortoiseSDK", _FakeSDK)
+        monkeypatch.setattr(sweep, "_supabase_lane_refusal", lambda: None)
+        monkeypatch.setattr(sys, "argv", ["clear_max_sessions_4010", "--dry-run"])
+        with pytest.raises(SystemExit) as e:
+            sweep.main()
+        assert e.value.code == 1
+        assert order == ["ctor", "name_only", "close"], order
+
+    def test_guard_approved_name_must_match_the_opened_graph(self, monkeypatch):
+        """#5233: the guard approves a NAME; the SDK opens a graph. If they
+        differ, refuse — never sweep a graph the operator did not consent to
+        (#5188's contract)."""
+        class _FakeSDK:
+            def __init__(self, *a, **k):
+                pass
+
+            def _registry_graph_name(self):
+                return "test_4010_scratch"       # would auto-approve
+
+            def _get_registry(self):
+                return SimpleNamespace(name="registry_control_plane")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("tortoise.sdk.TortoiseSDK", _FakeSDK)
+        monkeypatch.setattr(sweep, "_supabase_lane_refusal", lambda: None)
+        monkeypatch.setattr(sys, "argv", ["clear_max_sessions_4010", "--dry-run"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = sweep.main()
+        assert rc == 1, out.getvalue()
+        assert "the guard approved 'test_4010_scratch'" in out.getvalue()
+        assert "but the SDK resolved 'registry_control_plane'" in out.getvalue()
 
 
 # ── DATA half: clearing the stored rows, idempotently ───────────────────────

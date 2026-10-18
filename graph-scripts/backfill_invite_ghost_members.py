@@ -14,7 +14,10 @@ is TERMINAL:
   - revoked    (status='revoked')
   - orphaned   (no Invitation node exists)
 Rows backing a still-pending, unexpired invite are KEPT (the legit
-'invited' placeholder). Supabase path untouched (fake rows are registry-only).
+'invited' placeholder). Supabase mode REFUSES (exit 0) and opens nothing: the
+fake rows are registry-only so there is nothing to sweep there, and OPENING the
+registry namespace would auto-create `registry_control_plane` — the graph the
+#669 flip deliberately deleted (see `_supabase_lane_refusal`).
 
 Idempotent — re-running finds nothing. `--dry-run` reports without writing.
 
@@ -25,7 +28,10 @@ Defaults to TORTOISE_DB_URI env var (or docker://:falkordb@localhost:6379/tortoi
 Test safety: the guard runs on the graph the sweep ACTUALLY writes (the
 SDK-resolved registry graph), never on the URI path — so a test-prefixed
 `--uri` never auto-approves a write to the shared registry graph, and `--yes`
-is required for a real run (#5188).
+is required for a real run (#5188). #5233: the guard runs on the SDK's
+NAME-ONLY derivation (`_registry_graph_name()`) BEFORE the graph is opened, so
+a REFUSED run creates nothing — opening first materialized both
+`registry_tortoise` and `registry_control_plane` before the guard could refuse.
 """
 from __future__ import annotations
 
@@ -48,6 +54,42 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
 DEFAULT_URI = "docker://:falkordb@localhost:6379/tortoise"
+
+
+def _supabase_lane_refusal() -> str | None:
+    """The #669 resurrection guard — mirror of the one in
+    `graph-scripts/clear_max_sessions_4010.py`.
+
+    #5233: this script and the #4010 sweep are the two registry-touching
+    graph-scripts that carry a destructive `--yes` guard. #4010 grew this
+    refusal with its own change and the backfill did not; the asymmetry was NOT
+    deliberate (the backfill only recorded the belief that "fake rows are
+    registry-only", which is true and yet irrelevant — the harm is the OPEN,
+    not the rows). Applied here so both scripts fail the same way.
+
+    A Supabase-mode control plane keeps its registry in Postgres: the
+    `registry_control_plane` graph is the one the #669 flip DELETED, and
+    opening it here would auto-create it, sweep the empty graph it just
+    created, and report a meaningless "0 ghosts — graph is clean" about it.
+    FalkorDB auto-creates a missing graph on any query
+    (docs/ops/669-post-flip-verification.md), and this script's sweep queries
+    the registry namespace unconditionally.
+    """
+    try:
+        from tortoise.supabase_control import is_supabase_enabled
+    except Exception as exc:  # pragma: no cover - exercised via monkeypatch
+        # FAIL CLOSED — same reasoning as the #4010 twin: "could not determine
+        # the mode" must never mean "not Supabase", or a broken import lets the
+        # sweep open (and so auto-create) the graph the flip deleted.
+        return ("control plane mode could not be determined "
+                f"({type(exc).__name__}: {exc}) — refusing to open the "
+                "registry graph. Re-run once tortoise.supabase_control "
+                "imports.")
+    if is_supabase_enabled():
+        return ("control plane is Supabase — the registry graph does not exist "
+                "(the fake invite rows are registry-only anyway). Refusing to "
+                "open it; nothing to sweep.")
+    return None
 
 
 def test_guard(graph_name: str, yes: bool = False) -> None:
@@ -85,6 +127,15 @@ def main() -> int:
     ap.add_argument("--uri", default=os.environ.get("TORTOISE_DB_URI", DEFAULT_URI))
     args = ap.parse_args()
 
+    # The #669 resurrection guard runs BEFORE any connection (#5233: mirrored
+    # from clear_max_sessions_4010.py — the asymmetry was an oversight, not a
+    # decision): opening the registry namespace in Supabase mode would create
+    # the graph the flip deleted.
+    refusal = _supabase_lane_refusal()
+    if refusal is not None:
+        print(f"⛔ {refusal}")
+        return 0
+
     # Connect through the SDK (registry namespace) so the sweep shares the
     # exact registry graph + namespace logic as the invite endpoints — and so
     # the printed registry name comes from that SAME derivation. #3634: do
@@ -94,13 +145,23 @@ def main() -> int:
 
     sdk = TortoiseSDK(namespace="registry")
     try:
-        reg = sdk._get_registry()
-        target = reg.name
+        # #5233: guard on the NAME-ONLY derivation, BEFORE opening. `_get_registry()`
+        # materializes `registry_tortoise` and `registry_control_plane` (index DDL
+        # auto-creates a missing graph), so gating after it made "the guard
+        # refused" and "nothing happened" different statements.
+        target = sdk._registry_graph_name()
         # The URI path never names this graph — `TortoiseSDK(namespace="registry")`
         # derives the registry name from the NAMESPACE, not from the URI path.
         # #5188: gate on the RESOLVED name, never the URI path — a test-prefixed
         # `--uri` used to auto-approve a sweep of the shared registry graph.
         test_guard(target, args.yes)
+        reg = sdk._get_registry()
+        if reg.name != target:
+            # The operator consented to `target`; the SDK opened another graph.
+            # Never sweep a graph the guard did not approve (#5188's contract).
+            print(f"⛔ refusing to sweep: the guard approved '{target}' but the "
+                  f"SDK resolved '{reg.name}'.")
+            return 1
         print(f"Registry graph (SDK-resolved): {target}")
         result = sdk.sweep_invite_ghost_memberships(dry_run=args.dry_run)
     finally:
