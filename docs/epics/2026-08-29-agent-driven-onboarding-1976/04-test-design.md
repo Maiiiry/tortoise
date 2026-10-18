@@ -54,6 +54,42 @@ aboutObjects: tortoise
 - **Test layer notes (repo reality):** docker lane (`TORTOISE_DB_URI='docker://:falkordb@localhost:6379/tortoise_test_matrix'`) for graph surfaces; hosted-e2e (tests/e2e/hosted, pytest-playwright) for dashboard surfaces; contract tests where an API shape must be pinned; manual/browser for 6-harness install + walk-through.
 - **Failure modes needing explicit test cases:** two simultaneous org-creates (surface 3); two simultaneous invite-accepts same token (surface 12); delete session during capture (surface 11); fork re-ask after completion (surface 4).
 
+## Capability Traceability (scope Customer Value Map → surfaces)
+
+The map's first indicator is that **every in-scope capability maps to at least one surface, with a test layer** — so the
+mapping is written down here rather than left to be inferred from a surface's parenthetical. Each row names the surface
+whose contract covers the capability, and that surface's `Test Layer` column is the layer the capability is verified at.
+
+| Scoped capability (`03-scope.md` §2) | Surface(s) | Verified at |
+|---|---|---|
+| W1 wizard shrink | 16 | hosted-e2e + walk-through |
+| W1 org-name step | 3 | integration + hosted-e2e |
+| W2 universal command | 5 | contract + integration + manual (6 harnesses) |
+| W2 fork card | 4 | hosted-e2e + unit |
+| W3 seed | 7 | integration + hosted-e2e + unit |
+| W3 decide nudge | 8 | integration + walk-through |
+| W4 Overview calm | 9 | hosted-e2e + ux-verification |
+| W4 Settings tab | 10 | hosted-e2e + integration |
+| W5 graph-held state | 1, 2, 17 | integration (docker) + regression + hosted-e2e |
+| W5 setup card | 9, 10 | hosted-e2e — the continuation card renders on Overview (9) and its Setup-guide home lives in Settings (10); the journey continuity it promises is 17's "no what-do-I-do-now moment" |
+| W6 capture disclosure | 11 | integration + hosted-e2e |
+| W7 invite-accept | 12 | integration + contract + hosted-e2e |
+| W7 fusion | 12 | integration + contract + hosted-e2e (the OTP guard is 12's privilege-accumulation failure mode) |
+| W8 builder catalog | 13 | unit + integration + contract |
+| W9 trigger/entry | 1, 3 | integration — the state node is initialized in org-create's statement (3) and read at every entry door (1) |
+| W11 telemetry | 14 | integration + regression |
+| W12 self-hosted | 15 | integration + manual |
+
+Two rows are worth stating because they are the ones a reader would otherwise have to infer:
+
+- **W5 setup card** is the only capability with no surface of its own — it is a rendering of state that two other
+  surfaces own. It maps to 9 and 10 deliberately, and the *promise* it makes (progress is never a mystery) is what 17's
+  friction test checks.
+- **W9 trigger/entry** is a property of two surfaces, not one: surfacing it as a separate surface would have duplicated
+  3's transaction contract.
+
+Every capability above has at least one surface, and every surface has a test layer, so neither direction is unassigned.
+
 ## E2E Traceability (scope high-level E2E → surfaces)
 
 | Scope E2E | Surfaces exercised |
