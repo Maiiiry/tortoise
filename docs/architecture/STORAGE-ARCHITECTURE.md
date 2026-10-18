@@ -1285,7 +1285,7 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 - **The premise measurement.** `#5009`'s own evidence discipline: *whether our queries are actually answered badly by a cheap tier* **precedes** the wiring. That measurement needs this verdict to have a definition first — which is why the decision layer is the correct first slice, and why the read path is not wired.
 - **The registry row is unchanged: `not-implemented`** (`config/v4-mechanisms.yml`). Nothing escalates yet, so a reader must keep meeting an absence, not an assumption.
 
-**Verification:** `tests/test_sufficiency_router.py` (hermetic, `core` lane) — 77 tests, each mutation-proved against the edit it exists to catch (the collapse guard, the flattened third state, the unbounded trigger, the missing span, the promoted class, the dropped dedupe, the payload field, the provenance wire path, the infix anchor match, the blank anchor, the entity fields, the unauthorised `SummaryUnit`, the reason allow-list).
+**Verification:** `tests/test_sufficiency_router.py` (hermetic, `core` lane) — 93 tests. The guard families below are each mutation-proved by a recorded revert — the collapse guard, the flattened third state, the unbounded trigger, the missing span, the promoted class, the dropped dedupe, the payload field, the provenance wire path, the infix anchor match, the blank anchor, the entity fields, the unauthorised `SummaryUnit`, the reason allow-list, and the single-row-as-evidence guard.
 
 ### 12.6 The published architecture — `TierMem` (arXiv 2602.17913, 20 Feb 2026)
 

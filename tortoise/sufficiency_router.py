@@ -75,10 +75,11 @@ cache could not see makes *"insufficient"* unestablished, so
 ``assess_sufficiency`` REFUSES to judge when the caller has not established
 residency (``resident`` is ``None`` or ``False``). A residency miss is repaired
 by fetching the record, never by walking a tier. The guard is an ALLOW-LIST
-(``resident is not True``) and a non-``bool`` ``resident`` is refused outright:
-an identity test against ``False`` lets a JSON column's ``0`` through as if
-residency had been established, which turns the strongest guard here into a
-no-op in the expensive direction. Both are pinned by test.
+(``resident is not True``) with a type check in front of it — the check is the
+load-bearing half (an identity test against ``False`` lets a JSON column's ``0``
+through as if residency had been established, which turns the strongest guard
+here into a no-op in the expensive direction), and the allow-list is the
+defence behind it.
 
 ⛔ **NO QUERY-CLASS INPUT — pinned structurally.** The router takes no
 ``query``, ``query_type``, ``complexity`` or ``intent`` argument, and a test
@@ -87,7 +88,11 @@ greps the signature so a future lane cannot turn this into the classifier
 references**, already resolved — a coverage measurement over the answer, not a
 prediction about the question. Each is matched as a WORD, not an infix: a bare
 substring test scores ``AI`` covered on *"he said the main thing"*, which is a
-confident ``sufficient`` produced by a measure that never measured.
+confident ``sufficient`` produced by a measure that never measured. The word
+boundary applies to anchors whose characters are ASCII word characters; an
+anchor in a script with no word separators (CJK, Thai) is matched as a
+substring, because there adjacency is not a boundary and ``(?<!\\w)`` could never
+hold — that would report zero coverage for every such entity.
 
 **Provenance is read from the shape the read path emits.** ``SearchResult``
 carries ``source_ref`` as an ATTRIBUTE and nests it as ``provenance.source``
@@ -214,6 +219,10 @@ REASON_RESIDENT_UNASSESSED = "resident-unassessed"
 REASON_BUDGET_EXHAUSTED = "escalation-budget-exhausted"
 REASON_ALREADY_ESCALATED = "already-escalated"
 
+#: The two reasons that describe the CALLER'S POLICY rather than the evidence.
+#: They live on the route (never on a verdict), and both imply an insufficiency.
+_BUDGET_REASONS: tuple[str, ...] = (REASON_BUDGET_EXHAUSTED, REASON_ALREADY_ESCALATED)
+
 REASONS: tuple[str, ...] = (
     REASON_EVIDENCE_EMPTY,
     REASON_ANCHORS_UNCOVERED,
@@ -310,9 +319,12 @@ def _entity_terms(value: Any) -> list[str]:
 class _Evidence:
     """One assembled evidence row, read as the things the measures need.
 
-    ``text`` is the row's assembled content; ``entities`` is the names it
+    ``text`` is the row's assembled content; ``entities`` is the NAMES it
     carries OUTSIDE that content (``subject``/``topics``) — both are evidence of
-    what the row is about, so anchor coverage reads both.
+    what the row is about, so anchor coverage reads both. The entity names stay
+    a TUPLE rather than one joined string: a joined haystack lets a phrase stitch
+    the tail of one entity to the head of the next (``"ACME Corp"`` + ``"contracts"``
+    would "contain" the anchor ``Corp contracts``).
 
     ``provenance`` is ``None`` when the row does not CARRY the field at all —
     which is a different fact from "the row carries no link". That distinction
@@ -325,7 +337,7 @@ class _Evidence:
     id: str
     text: str
     provenance: Any
-    entities: str = ""
+    entities: tuple[str, ...] = ()
 
 
 def _as_mapping(row: object) -> Mapping[str, Any]:
@@ -364,7 +376,7 @@ def evidence_record(row: object) -> _Evidence:
         if isinstance(value, str) and value.strip():
             text = value
             break
-    entities = " ".join(
+    entities = tuple(
         term for key in _ENTITY_KEYS for term in _entity_terms(data.get(key)))
     return _Evidence(
         id=str(data.get("id") or ""),
@@ -475,6 +487,12 @@ def _threshold(name: str, value: object) -> float:
     return out
 
 
+#: An ASCII word character, i.e. a character of a script that separates words
+#: with spaces. Only an anchor drawn from such a script can be matched on a word
+#: boundary; see ``_mentions``.
+_ASCII_WORD_CHARS = re.compile(r"[A-Za-z0-9_]")
+
+
 def _mentions(needle: str, row: _Evidence) -> bool:
     """Does ``row`` MENTION ``needle`` as a word, in its text or its entities?
 
@@ -489,8 +507,16 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     BOTH SIDES are whitespace-normalised before matching: a phrase's internal
     spacing is not part of its identity (same rule as ``_normalise_claim``), and
     a wrapped ``content``/``summary`` must not make a multi-word entity
-    unmatchable. The row's ``entities`` are read too — a hit that names the
-    entity in its ``subject``/``topics`` IS the evidence for that entity.
+    unmatchable.
+
+    The row's entity NAMES are read too, one at a time (a join would let a phrase
+    span two entities), and the boundary rule is applied only where it is
+    meaningful: ``\\w`` is Unicode-aware, so ``(?<!\\w)`` can never hold inside a
+    run of CJK/Thai characters — an ideographic anchor would be unmatchable in
+    its own text, reporting zero coverage for every such entity. For an anchor
+    with no ASCII word character the adjacency is not a boundary, so the
+    substring test IS the correct semantics; for one that has (``AI``, ``Q3``)
+    the boundary keeps it out of longer words.
 
     Empty/blank anchors are refused by ``assess_sufficiency`` long before they
     reach here; the guard remains as defence, since ``"" in …`` is universal.
@@ -500,11 +526,20 @@ def _mentions(needle: str, row: _Evidence) -> bool:
         return False
     if folded == row.id.casefold():
         return True
-    pattern = rf"(?<!\w){re.escape(folded)}(?!\w)"
-    return any(
-        re.search(pattern, " ".join(candidate.split()).casefold()) is not None
-        for candidate in (row.text, row.entities) if candidate
-    )
+    bounded = _ASCII_WORD_CHARS.search(folded) is not None
+    pattern = None
+    if bounded:
+        pattern = re.compile(rf"(?<!\w){re.escape(folded)}(?!\w)")
+    for candidate in (row.text, *row.entities):
+        if not candidate:
+            continue
+        haystack = " ".join(candidate.split()).casefold()
+        if pattern is not None:
+            if pattern.search(haystack):
+                return True
+        elif folded in haystack:
+            return True
+    return False
 
 
 def assess_sufficiency(
@@ -519,6 +554,13 @@ def assess_sufficiency(
 
     ``evidence``   the assembled rows, already in hand — the check runs on them
                    and costs no extra retrieval (§12.4: one call, one pass).
+                   A SEQUENCE of rows: one row is passed as ``[row]``. A bare
+                   ``str``/``bytes``/``Mapping`` is REFUSED, because it is a
+                   single row — not an iterable of them — and iterating it
+                   would shred it into one row per CHARACTER (a ``str``) or per
+                   KEY (a ``Mapping``). Those synthetic rows contain text no
+                   producer emitted, so a measure built on them reports a
+                   confident verdict about evidence that does not exist.
     ``anchors``    the entities the question references, ALREADY RESOLVED by the
                    caller. Not a query class: the measure is the evidence's
                    coverage of them, not a prediction about the question. Each
@@ -549,6 +591,20 @@ def assess_sufficiency(
     if required_provenance_coverage is not None:
         required_provenance_coverage = _threshold(
             "required_provenance_coverage", required_provenance_coverage)
+    if isinstance(evidence, (str, bytes, bytearray, Mapping)):
+        # ONE row is not an iterable OF rows: a ``str`` iterates its characters
+        # and a ``Mapping`` iterates its keys, so either silently mints rows
+        # carrying text nobody assembled (``{"content": "acme"}`` becomes the
+        # rows ``"id"``, ``"content"``). That is the fail-open direction — a
+        # measure over invented rows reports a confident ``sufficient`` on the
+        # answer it was supposed to test. Refused loudly, mirroring the
+        # ``anchors`` guard below: the caller wraps the row (``[row]``).
+        raise TypeError(
+            f"evidence must be a sequence of rows, not a single "
+            f"{type(evidence).__name__} — a single row is passed as ``[row]``; "
+            f"iterating this shape would measure its "
+            f"{'characters' if isinstance(evidence, (str, bytes, bytearray)) else 'keys'}"
+        )
     if isinstance(anchors, (str, bytes)):
         raise TypeError("anchors must be a sequence of strings, not a single string")
     for anchor in anchors:
@@ -658,6 +714,34 @@ class SufficiencyRoute:
         if self.budget_remaining < 0:
             raise ValueError(
                 f"budget_remaining must be a non-negative int, got {self.budget_remaining!r}")
+        # The route is the artifact a consumer RECORDS, so it holds the same
+        # coherence the factory guarantees: an `escalate-tier` route is a
+        # measured insufficiency (never a green), and the two budget reasons
+        # describe an insufficiency too. Without this the verdict-level
+        # allow-list is defeated one layer up by a hand-built/deserialised route.
+        if self.route == ROUTE_ESCALATE_TIER:
+            if self.verdict != INSUFFICIENT:
+                raise ValueError(
+                    f"route {self.route!r} means a MEASURED insufficiency, so the "
+                    f"verdict must be {INSUFFICIENT!r}, got {self.verdict!r}"
+                )
+            if self.reason not in _VERDICT_REASONS[INSUFFICIENT]:
+                raise ValueError(
+                    f"route {self.route!r} escalated on reason {self.reason!r}, which "
+                    f"is not an insufficiency of the evidence; expected one of "
+                    f"{_VERDICT_REASONS[INSUFFICIENT]}"
+                )
+        elif self.reason in _BUDGET_REASONS:
+            if self.verdict != INSUFFICIENT:
+                raise ValueError(
+                    f"reason {self.reason!r} describes a bounded insufficiency, so the "
+                    f"verdict must be {INSUFFICIENT!r}, got {self.verdict!r}"
+                )
+        elif self.reason not in _VERDICT_REASONS[self.verdict]:
+            raise ValueError(
+                f"reason {self.reason!r} does not belong to a {self.verdict!r} "
+                f"verdict; allowed: {_VERDICT_REASONS[self.verdict]}"
+            )
 
 
 def route_sufficiency(
@@ -691,6 +775,14 @@ def route_sufficiency(
     if not isinstance(verdict, SufficiencyVerdict):
         raise TypeError("route_sufficiency takes a SufficiencyVerdict, not a bool — "
                         "a bare False cannot say WHY, and `None` is a real state")
+    if not isinstance(escalated, bool):
+        # The one parameter whose job is to stop a SECOND walk. A falsy non-bool
+        # (``0`` from a JSON column, ``""``, ``[]``) was read as "not escalated"
+        # and silently bought a tier — the same type gap ``resident`` closed.
+        raise TypeError(
+            f"escalated must be True or False, got {escalated!r} — a non-bool is "
+            f"not a statement about whether this answer was already walked"
+        )
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
         raise ValueError(f"budget must be a non-negative int, got {budget!r}")
 

@@ -70,6 +70,11 @@ RED:
 * **Accept any falsy ``resident``** — return to ``resident is None or resident is
   False`` with no type check →
   ``test_a_non_bool_resident_is_refused_not_treated_as_established`` RED.
+* **Iterate a single row as if it were the row list** — drop the
+  ``str``/``bytes``/``Mapping`` refusal on ``evidence`` →
+  ``test_a_single_row_cannot_be_passed_where_a_sequence_of_rows_goes`` RED (a
+  bare mapping measures its KEYS and a bare string its CHARACTERS, so the
+  verdict is a confident one about evidence nobody assembled).
 * **Report an exhausted budget that is not exhausted** — drop the
   ``already-escalated`` reason →
   ``test_an_already_escalated_verdict_does_not_claim_an_exhausted_budget`` RED.
@@ -643,6 +648,46 @@ def test_an_unusable_budget_is_refused(bad: object) -> None:
         route_sufficiency(_insufficient(), budget=bad)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("bad", [0, 0.0, "", [], {}, None, 1, "yes"])
+def test_the_factory_refuses_a_non_bool_escalated(bad: object) -> None:
+    """``escalated`` is the parameter whose job is to STOP a second walk.
+
+    It was never type-checked, so a falsy non-bool (``0`` from a JSON column,
+    ``""``, ``[]``) read as "not escalated" and silently bought a second tier —
+    the same type gap the ``resident`` guard closed, on the other input that
+    bounds cost. A truthy non-bool was refused only one layer down, by the route
+    type, so the guard was asymmetric.
+    """
+    with pytest.raises(TypeError):
+        route_sufficiency(_insufficient(), budget=3, escalated=bad)  # type: ignore[arg-type]
+
+
+def test_a_route_cannot_carry_a_reason_that_contradicts_its_verdict() -> None:
+    """The ROUTE is the artifact a consumer records, so it holds the invariants.
+
+    ``_VERDICT_REASONS`` refused an incoherent pairing on the verdict and not on
+    the route — which is where a reason-keyed consumer actually reads it, and the
+    type is public. An ``escalate-tier`` route on a sufficient verdict, or an
+    escalation justified by ``measures-met``, was constructible.
+    """
+    with pytest.raises(ValueError):
+        SufficiencyRoute(route=ROUTE_ESCALATE_TIER, reason=REASON_MEASURES_MET,
+                         verdict=SUFFICIENT)
+    with pytest.raises(ValueError):
+        SufficiencyRoute(route=ROUTE_SERVE, reason=REASON_RESIDENT_MISS,
+                         verdict=SUFFICIENT)
+    with pytest.raises(ValueError):
+        # A budget reason implies an insufficiency — never a green.
+        SufficiencyRoute(route=ROUTE_SERVE, reason=REASON_BUDGET_EXHAUSTED,
+                         verdict=SUFFICIENT, budget_remaining=0)
+
+    # Every route the factory emits still constructs.
+    assert route_sufficiency(_insufficient(), budget=0).reason == REASON_BUDGET_EXHAUSTED
+    assert route_sufficiency(_insufficient(), budget=1).route == ROUTE_ESCALATE_TIER
+    assert route_sufficiency(
+        assess_sufficiency(_rows("x"), resident=True), budget=1).route == ROUTE_SERVE
+
+
 # ── the route is a directive, not a status, and never the other router ────
 
 
@@ -1023,6 +1068,46 @@ def test_the_vocabulary_a_consumer_needs_is_exported() -> None:
     assert not [n for n in module.__all__ if n.startswith("_")]
 
 
+def test_a_non_spaced_script_anchor_matches_its_own_text() -> None:
+    """``\\w`` is Unicode-aware, so a word boundary can never hold inside CJK text.
+
+    ``(?<!\\w)合同(?!\\w)`` is incapable of matching ``我们签署了合同``, so an
+    ideographic anchor was unmatchable in its own evidence — silent zero coverage
+    for every such entity, and a tier bought for a row that answered. For an
+    anchor with no ASCII word character, adjacency is not a boundary and the
+    substring test IS the correct semantics.
+    """
+    verdict = assess_sufficiency(
+        _rows("我们签署了合同 with ACME"),
+        anchors=["合同"], required_anchor_coverage=1.0, resident=True)
+    assert verdict.verdict == SUFFICIENT
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+    # ... while an ASCII anchor keeps its boundary rule in the same text.
+    assert assess_sufficiency(
+        _rows("我们签署了合同 with ACME"),
+        anchors=["AI"], required_anchor_coverage=1.0, resident=True,
+    ).verdict == INSUFFICIENT
+
+
+def test_a_phrase_cannot_be_stitched_across_two_entity_terms() -> None:
+    """Entity names stay separate: a join manufactures mentions nobody made.
+
+    Concatenating ``subject`` + ``topics`` into one haystack let the tail of one
+    entity meet the head of the next, so the anchor ``Corp subject`` measured
+    ``1.0`` — coverage for a phrase that appears nowhere.
+    """
+    row = SearchResult(
+        id="p1", content="signed the contract", point_kind="fact",
+        subject={"id": "subject:acme", "name": "ACME Corp", "kind": "org"},
+        topics=["ACME Corp", "contracts"],
+    ).to_dict()
+    verdict = assess_sufficiency(
+        [row], anchors=["Corp contracts"], required_anchor_coverage=1.0, resident=True)
+    assert verdict.verdict == INSUFFICIENT
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
 def test_the_snippet_is_read_last_so_a_truncated_preview_never_wins() -> None:
     row = evidence_record({"id": "p1", "content": "full text here", "snippet": "full"})
     assert row.text == "full text here"
@@ -1032,3 +1117,44 @@ def test_the_snippet_is_read_last_so_a_truncated_preview_never_wins() -> None:
 def test_anchors_cannot_be_a_bare_string() -> None:
     with pytest.raises(TypeError):
         assess_sufficiency(_rows("x"), anchors="acme", resident=True)
+
+
+@pytest.mark.parametrize("row", [
+    "acme corp signed",
+    b"acme corp signed",
+    bytearray(b"acme corp signed"),
+    {"id": "p1", "content": "acme corp signed"},
+])
+def test_a_single_row_cannot_be_passed_where_a_sequence_of_rows_goes(
+    row: object,
+) -> None:
+    """ONE row is not an iterable OF rows, and iterating it invents evidence.
+
+    Both shapes are ``Iterable``, so neither was refused: a bare ``str`` iterated
+    its CHARACTERS (nine one-character rows) and a bare ``Mapping`` iterated its
+    KEYS (the rows ``"id"``, ``"content"``) — synthetic rows carrying text no
+    producer assembled. The anchor ``content`` then word-boundary-matched the row
+    whose text IS ``"id"``/``"content"`` and the measure reported ``1.0``: a
+    confident verdict about evidence that does not exist, in the direction that
+    serves rather than escalates. ``evidence_record`` legitimately accepts a bare
+    string as one row, so the ambiguity is real rather than obviously wrong — the
+    caller wraps the row (``[row]``).
+    """
+    with pytest.raises(TypeError, match="sequence of rows"):
+        assess_sufficiency(
+            row, anchors=["acme corp"], required_anchor_coverage=1.0,  # type: ignore[arg-type]
+            resident=True,
+        )
+
+
+def test_the_refusal_is_about_the_container_not_the_row() -> None:
+    """The two row shapes refused as a container are legitimate INSIDE one.
+
+    ``evidence_record`` accepts a bare string and a ``Mapping`` as ONE row, so the
+    guard must not turn that support into a refusal — wrapping the row is the
+    supported call, and it measures the row's real content.
+    """
+    for row in ("acme corp signed", {"id": "p1", "content": "acme corp signed"}):
+        assert assess_sufficiency(
+            [row], anchors=["acme corp"], required_anchor_coverage=1.0, resident=True,
+        ).measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
