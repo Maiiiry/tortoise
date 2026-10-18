@@ -40,6 +40,30 @@ stubbed transport:
 - the debounce marker is retained **only on a 2xx send** (a failed send is
   re-attempted).
 
+### Idempotency, and what a replay is allowed to claim
+
+The client mints one `X-Idempotency-Key` per `(mount, tile)`, and the record row
+carries the SERVER-computed hash of the claim in its
+`idempotency_fingerprint` prop (`tortoise/demand.py::idempotency_fingerprint`;
+registered in `_ALLOWED_ANALYTICS_PROPS`). A replayed request is answered from
+**that row** — the write behind the claim either left one or did not — and never
+from the claim marker alone, and never from a click count (a `go_back`-only team
+holds a stored row and zero clicks, so a click-count predicate reads a real
+record as "not recorded" and then duplicates it).
+
+Three arms, and the operator reads them as follows:
+
+| Replay state | Answer | Why |
+|---|---|---|
+| a row carries this claim's fingerprint | `200 replayed: true` | the write landed — whatever its `action` was |
+| store unreadable | `200 replayed: true` | absence is NOT provable, so the honest answer is the replay |
+| no row, claim younger than `DEMAND_INFLIGHT_CLAIM_S` | `503 recorded: false`, claim KEPT | a peer may be mid-write; releasing its reservation is what makes a retry a duplicate |
+| no row, claim older than that bound | `503`/retry RECOVERS: the claim is re-taken and the write happens | the holder is provably gone (its write is bounded), so the retry must be the FIRST record |
+
+A `503` therefore never means "we wrote nothing" on its own — it means *this
+request wrote nothing*. The client renders it as the failure state and offers
+`Retry`, which is safe in every arm above.
+
 What CI deliberately does NOT do: call the real Telegram API. A live send from CI
 would page the operator on every run and could not be told from a real click.
 
@@ -97,6 +121,14 @@ dismissal — a value the route accepts) is stored as a funnel fact and is
 EXCLUDED from both `click_count` and `org_count`; counting it would let
 close-buttons advance the N=5 trigger.
 
+**`distinct_orgs` is deliberately ACTION-AGNOSTIC** (review P3, and pinned by
+`test_a_dismissal_only_team_is_store_breadth_not_demand`): it is *store breadth*
+— how many teams hold a demand row at all — so a team whose ONLY row is a
+dismissal IS counted there and appears in no ranked row. The N=5 trigger reads
+the per-integration `org_count`, never this figure. Do not "fix" the asymmetry:
+filtering it to clicks would silently redefine a number this review already
+reads, and would hide the dismissal rows the funnel keeps on purpose.
+
 **Decision rule (epic #1714 §6):** **N distinct orgs requesting an integration →
 it becomes a scoping issue**, with N = 5 to be fixed at the plan gate. That is
 the trigger for **#3541** (Drive / Slack / Notion), which stays open while the
@@ -109,7 +141,7 @@ same endpoint.
 
 | Check | Status | Why |
 |---|---|---|
-| Automated rows (`tests/test_data_source_capture.py`) | **RUN** — 47 passed | the server half: record, ping, dedupe, caps, read half, the `go_back`-is-not-demand guard, and the two replay rows (`a claim with no row behind it is NOT a replay`, `a raised write releases its claim so the retry records`) |
+| Automated rows (`tests/test_data_source_capture.py`) | **RUN** — 50 passed | the server half: record, ping, dedupe, caps, read half, the `go_back`-is-not-demand guard, the `distinct_orgs` breadth/demand split, and the replay rows (`a claim with no row behind it is NOT a replay` — in-flight claims are never released, aged ones are recovered; `an idempotent go_back write replays instead of duplicating`; `a raised write releases its claim so the retry records`) |
 | Client half (node + browser) | **RUN** | `demandCapture.test.js` (17, the state machine and the wire body), `demandCaptureRender.test.js` (11, the dialog wiring, the focus moves and the document-level Escape), and the five `#3514` rows in `tests/e2e/test_dashboard_onboarding.py` (real built bundle, real preview — including the in-flight FOCUS row, which holds the response open from the page so `document.activeElement` and Escape can be sampled during `sending`) |
 | `ops-telegram-live-send` | **NOT RUN** | no operator Telegram credentials exist in the lane that produced this PR; a live send cannot be fabricated, and the receipt gate (#3515) refuses a fabricated one |
 | `ops-monthly-demand-review` | **NOT RUN** | requires a DEPLOYED instance holding real demand rows. The surface now exists end to end (the grid landed in #8327, the click trigger in #3514), so this row is runnable the first time a real user clicks a tile on a deployment — no lane can produce it from a test store without fabricating the receipt |

@@ -194,7 +194,12 @@ def test_click_record_lands_in_canonical_store_with_server_derived_org_key(
     assert row["org_id"] == TEAM["org_id"]
     assert row["properties"] == {
         "integration_key": KEY_A, "action": "click", "surface": "grid",
-        "org_key": demand.derive_org_key(TEAM["org_id"])}
+        "org_key": demand.derive_org_key(TEAM["org_id"]),
+        # #3514 review P2: the record carries its OWN idempotency identity, so a
+        # replay can ask the STORE whether the write landed instead of inferring
+        # it from a click aggregate. Empty here: this POST sent no key, and an
+        # unkeyed request is never replayed.
+        "idempotency_fingerprint": ""}
     payload = resp.json()
     assert payload["ok"] is True
     assert payload["integration_key"] == KEY_A
@@ -495,7 +500,8 @@ def test_replayed_request_writes_no_second_record(client, telegram):
     assert _wait_for(lambda: True)
 
 
-def test_a_claim_with_no_row_behind_it_is_not_a_replay(client, telegram):
+def test_a_claim_with_no_row_behind_it_is_not_a_replay(client, telegram,
+                                                      monkeypatch):
     """#3514 review P2: `replayed: true` must never be answered on the marker alone.
 
     A claim can outlive the attempt that took it, so a replay verified only by
@@ -504,11 +510,22 @@ def test_a_claim_with_no_row_behind_it_is_not_a_replay(client, telegram):
     interest is saved" over an empty store — the one thing the failure state
     exists to prevent.
 
-    Pre-fix: the FIRST request below answered `200 {ok: true, replayed: true}`
-    with zero rows in the store. Post-fix: 503 + `recorded: false` (the same
-    shape an unwritten record uses), the phantom claim is released, and the
-    client's retry is the FIRST record rather than a replay of a phantom.
+    THE TENURE MATTERS, in both directions (review P2, second half):
+
+    * a claim younger than `DEMAND_INFLIGHT_CLAIM_S` may belong to a LIVE
+      attempt still awaiting its write, so the replay answers 503 "still being
+      recorded" and **keeps** the reservation — releasing another request's
+      claim is what lets a third request record a SECOND row for one click;
+    * past that bound the holder is gone (its write is bounded, and a landed
+      write leaves `idempotency_fingerprint` on the row), so the replay
+      RECOVERS: it takes the claim itself and records, instead of failing a
+      write that never happened.
+
+    Pre-fix: the FIRST request answered `200 {ok: true, replayed: true}` with
+    zero rows in the store.
     """
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(demand.DEMAND_MARKERS, "_clock", lambda: clock["now"])
     headers = {"X-Idempotency-Key": "click-phantom"}
     org_key = demand.derive_org_key(TEAM["org_id"])
     claim_key = f"{org_key}:{KEY_A}:click-phantom"
@@ -519,14 +536,57 @@ def test_a_claim_with_no_row_behind_it_is_not_a_replay(client, telegram):
     phantom = _post(client, headers=headers)
     assert phantom.status_code == 503, phantom.text
     assert phantom.json()["detail"]["recorded"] is False
+    assert "still being recorded" in phantom.json()["detail"]["message"], \
+        "a claim inside its in-flight window is NOT provably dead"
     assert _demand_events(client) == [], "no row was ever written for that claim"
+    assert demand.DEMAND_MARKERS.marked(
+        demand.MARK_RECORD, claim_key, demand.DEMAND_IDEMPOTENCY_WINDOW_S), (
+        "a replay must NOT release a reservation it did not take (that release "
+        "is how a retry becomes a duplicate row)")
 
-    # The claim was released, so the retry RECORDS instead of replaying.
+    # The abandoned attempt is now provably gone: the claim outlived the in-flight
+    # window with no row behind it. The retry RECOVERS the claim and records.
+    clock["now"] += demand.DEMAND_INFLIGHT_CLAIM_S + 1.0
     retried = _post(client, headers=headers)
     assert retried.status_code == 200, retried.text
     assert retried.json()["replayed"] is False, \
         "the retry is the first record, not a replay of a write that never landed"
     assert len(_demand_events(client)) == 1
+
+
+def test_an_idempotent_go_back_write_replays_instead_of_duplicating(
+        client, telegram):
+    """#3514 review P2: replay evidence is about the CLAIM, not about clicks.
+
+    `go_back` is a validated, STORED action, so a team can hold a dismissal row
+    and no click row at all. A replay verified with `_demand_click_count` reads
+    `0` for that team — "nothing was recorded" — answers 503, releases the
+    claim, and the retry then writes a SECOND dismissal row for one request:
+    the duplicate the idempotency key exists to prevent, and a false "your click
+    was not recorded" for a row that IS in the store.
+
+    Pre-fix: the second POST below answered 503 `recorded: false` and a third
+    identical POST wrote a second row. Post-fix: the row's own
+    `idempotency_fingerprint` is the evidence, so the replay is a replay
+    whatever the action was.
+    """
+    headers = {"X-Idempotency-Key": "go-back-1"}
+    first = _post(client, action="go_back", headers=headers)
+    assert first.status_code == 200, first.text
+    assert first.json()["replayed"] is False
+
+    replay = _post(client, action="go_back", headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True, \
+        "a stored go_back row IS a record — the replay must not read as 'not recorded'"
+    assert len(_demand_events(client)) == 1, \
+        "one idempotency key, one dismissal row — never two"
+
+    # …and the duplicate the pre-fix release made possible cannot happen either.
+    assert _post(client, action="go_back", headers=headers).status_code == 200
+    assert len(_demand_events(client)) == 1
+    # The click figure still counts CLICKS only: the dismissal is not demand.
+    assert replay.json()["click_count"] == 0, replay.json()
 
 
 def test_a_raised_write_releases_its_claim_so_the_retry_records(
@@ -756,6 +816,54 @@ def test_cross_org_count_dedupes_per_org_not_per_click(tmp_path, monkeypatch):
     row = body["demand"][0]
     assert row["click_count"] == 4
     assert row["org_count"] == 2, "org_count must dedupe per team"
+
+
+def test_a_dismissal_only_team_is_store_breadth_not_demand(
+        tmp_path, monkeypatch):
+    """#3514 review P3: `distinct_orgs` is ACTION-AGNOSTIC on purpose.
+
+    The runbook states it and the operator route's comment now states it too, so
+    this pins the behaviour those words describe: a team whose ONLY row is a
+    dismissal is counted in `distinct_orgs` (store breadth — how many teams have
+    a demand row at all) and appears in NO ranked row (demand — the N=5
+    trigger's `org_count`, clicks only).
+
+    Without this arm, "deliberately action-agnostic" is a comment a future
+    reader can only trust; with it, flipping either half reds here.
+    """
+    monkeypatch.setattr(hosted_api, "_ANALYTICS_FALLBACK_PATH",
+                        str(tmp_path / "analytics_fallback.jsonl"))
+    for name in (*_ENV_KEYS, "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FASTAPI_INTERNAL_KEY", "internal-secret")
+    demand.DEMAND_MARKERS.reset()
+    app.dependency_overrides[hosted_api.get_current_org_session_ungated] = (
+        lambda: TEAM)
+    try:
+        with verdict_client(app) as c:
+            assert _post(c, integration_key=KEY_A).status_code == 200
+            # A second team whose only row is a DISMISSAL.
+            app.dependency_overrides[
+                hosted_api.get_current_org_session_ungated] = (
+                    lambda: OTHER_TEAM)
+            assert _post(c, integration_key=KEY_A,
+                         action="go_back").status_code == 200
+            body = c.get("/v1/internal/data-sources/demand",
+                         headers={"Authorization": "Bearer internal-secret"}
+                         ).json()
+    finally:
+        app.dependency_overrides.pop(
+            hosted_api.get_current_org_session_ungated, None)
+        demand.DEMAND_MARKERS.reset()
+
+    assert body["distinct_orgs"] == 2, (
+        "store breadth counts the dismissal-only team — the documented reading")
+    row = body["demand"][0]
+    assert row["integration_key"] == KEY_A
+    assert row["click_count"] == 1, "the dismissal adds no click"
+    assert row["org_count"] == 1, (
+        "the N=5 trigger's unit counts CLICKING teams only — a dismissal cannot "
+        "advance it")
 
 
 # ── The read half runs OFF the event loop (#3514 review P2) ────────────

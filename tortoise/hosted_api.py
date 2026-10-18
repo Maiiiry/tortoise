@@ -29863,6 +29863,14 @@ _ALLOWED_ANALYTICS_PROPS = {
     # `action` and `surface` are deliberately NOT reused names: nothing else in
     # the flat allowlist emits them, so a drift cannot be masked by a sibling.
     "integration_key", "action", "surface", "org_key",
+    # #3514 review P2: the record's OWN idempotency identity. The replay branch
+    # asks the STORE whether the write behind a claim landed, and this prop is
+    # the answer — without it registered, the fingerprint is stripped here in
+    # silence and every replay falls back to "no row carries this claim", i.e.
+    # the phantom-replay guard would misread a landed write as a phantom. It is
+    # a server-computed hash (never the client's header value) and is `""` for
+    # an unkeyed request.
+    "idempotency_fingerprint",
     # #3834: the transport-level wait bound's breach event. `method` and
     # `latency_ms` are already registered above; `path` is the one new key.
     # Without it the refusal would be counted but the ROUTE would be stripped
@@ -38192,7 +38200,7 @@ def _demand_dispatch_ping(text: str, *, org_key: str,
 
 async def _demand_record_write(org_id: str, *, integration_key: str,
                                action: str, surface: str,
-                               org_key: str) -> str:
+                               org_key: str, idem_fp: str = "") -> str:
     """Write the demand record and RETURN the sink outcome (#3514).
 
     ``_emit_analytics_off_loop`` is the wrong seam here: it is ``best_effort``
@@ -38200,6 +38208,12 @@ async def _demand_record_write(org_id: str, *, integration_key: str,
     caller. R2 requires the opposite — the write's response is CHECKED and its
     failure SURFACES — so the record rides the same off-loop path with the
     result returned.
+
+    ``idem_fp`` is the caller's idempotency fingerprint
+    (``demand.idempotency_fingerprint``; ``""`` for an unkeyed request). It is
+    stored ON the row so a replay can ask "did the write behind THIS claim
+    land?" of the record itself, instead of inferring it from an aggregate that
+    is blind to every action but ``click`` (#3514 review P2).
 
     The props dict is written as a LITERAL at the emit site (rather than built
     by the caller and forwarded) so `tests/test_telemetry_registration.py`'s
@@ -38218,7 +38232,8 @@ async def _demand_record_write(org_id: str, *, integration_key: str,
             lambda: _track_analytics_event(
                 org_id, _demand.DEMAND_EVENT_NAME,
                 {"integration_key": integration_key, "action": action,
-                 "surface": surface, "org_key": org_key},
+                 "surface": surface, "org_key": org_key,
+                 "idempotency_fingerprint": idem_fp},
                 local_fallback=not intended),
             op="demand_record", pool="telemetry")
     except UnregisteredTelemetryKey:
@@ -38470,45 +38485,71 @@ async def record_data_source_demand(
     # at ONE RECORD PER CLICK — so an unkeyed request always records.
     idem = (request.headers.get("X-Idempotency-Key") or "").strip()
     idem_key = f"{org_key}:{integration_key}:{idem}" if idem else ""
+    idem_fp = _demand.idempotency_fingerprint(idem_key)
     if idem_key and not _demand.DEMAND_MARKERS.claim(
             _demand.MARK_RECORD, idem_key, _demand.DEMAND_IDEMPOTENCY_WINDOW_S):
         rows, source = await _demand_store_rows_off_loop(org_id)
-        click_count = _demand_click_count(rows, integration_key)
-        if click_count == 0:
-            # #3514 review P2 — the claim alone is NOT evidence of a record.
-            # A claim can outlive the attempt that took it (pre-fix, an
-            # `UnregisteredTelemetryKey` re-raise exited 500 with the claim
-            # held for the whole window), and answering `replayed: True` on the
-            # marker alone then tells the client a write happened that did not:
-            # `recordDemand` maps `ok: true` to the RECORDED state, so the user
-            # is shown "Recorded — your team's interest is saved" for a click
-            # that was never stored — the one thing the failure state exists to
-            # prevent. `0` is unambiguous (the store was READABLE and holds no
-            # click for this key); `None` means the store could not be read and
-            # is NOT evidence of absence, so that case keeps the replay answer.
-            # Release the phantom claim and answer like a failed write, so the
-            # client's Retry RECORDS instead of replaying a phantom.
-            _demand.DEMAND_MARKERS.release(_demand.MARK_RECORD, idem_key)
+        recorded = _demand_row_for_idempotency(rows, integration_key, idem_fp)
+        if recorded is None or recorded:
+            # #3514 review P2 — `recorded is None` means the store could not be
+            # read, which is NOT evidence of absence, so the replay answer stands
+            # (answering 503 would fail a write that may well have landed).
+            # `recorded is True` is the record's OWN evidence: a row carries this
+            # claim's fingerprint, so the write landed whatever its action was.
+            return {"ok": True, "integration_key": integration_key,
+                    "replayed": True, "org_key": org_key,
+                    "click_count": _demand_click_count(rows, integration_key),
+                    "source": source}
+        # No row carries this claim's fingerprint. That is two different
+        # situations, and the response must not confuse them:
+        age = _demand.DEMAND_MARKERS.claim_age(_demand.MARK_RECORD, idem_key)
+        if age is not None and age < _demand.DEMAND_INFLIGHT_CLAIM_S:
+            # (a) the holder is still INSIDE its write window: a peer is very
+            # possibly writing right now. Do NOT release its reservation — this
+            # request never took it, and dropping it lets a third request claim
+            # afresh and record a SECOND row for one click (the duplicate the
+            # idempotency key exists to prevent). Fail closed, keep the claim.
+            raise HTTPException(
+                status_code=503,
+                detail={"recorded": False,
+                        "message": ("this click is still being recorded — "
+                                    "please retry shortly")})
+        # (b) the holder is GONE: its write was bounded, and a write that landed
+        # would have left its fingerprint behind. So the claim outlived an
+        # attempt that recorded nothing — the phantom this guard exists for.
+        # RECOVER rather than fail closed: take the claim ourselves and let the
+        # write below be THE record, so the client's retry records instead of
+        # replaying a phantom (or being told, wrongly, that nothing was written).
+        _demand.DEMAND_MARKERS.release(_demand.MARK_RECORD, idem_key)
+        if not _demand.DEMAND_MARKERS.claim(
+                _demand.MARK_RECORD, idem_key,
+                _demand.DEMAND_IDEMPOTENCY_WINDOW_S):
+            # A peer retook it between the release and this claim: it is the
+            # writer now, so stay fail-closed and write nothing.
             raise HTTPException(
                 status_code=503,
                 detail={"recorded": False,
                         "message": "the click was not recorded — please retry"})
-        return {"ok": True, "integration_key": integration_key,
-                "replayed": True, "org_key": org_key,
-                "click_count": click_count,
-                "source": source}
 
     try:
         outcome = await _demand_record_write(
             org_id, integration_key=integration_key, action=body.action,
-            surface=surface, org_key=org_key)
-    except BaseException:
+            surface=surface, org_key=org_key, idem_fp=idem_fp)
+    except UnregisteredTelemetryKey:
         # #3514 review P2 — the ROOT CAUSE of the phantom replay above. A claim
         # that outlives a FAILED attempt makes the client's retry a no-op for a
-        # write that never landed, so every escaping path must release it.
-        # `dropped` is the handled failure (below); this covers the raise path —
+        # write that never landed, so this escaping path releases it.
+        # `dropped` is the handled failure (below); this is the raise path —
         # `_demand_record_write` deliberately re-raises `UnregisteredTelemetryKey`
-        # (#3821) — and cancellation, which must not strand a claim either.
+        # (#3821).
+        #
+        # DELIBERATELY NOT `except BaseException`: on CANCELLATION the write is
+        # NOT cancelled (`_cp_offload` abandons the await, never the worker
+        # thread — CPython #87185), so it can land AFTER this handler returns.
+        # Releasing here would let the client's retry claim afresh and write a
+        # SECOND row for the same click. The claim age + the row fingerprint are
+        # what make retention safe instead: a landed write replays, and a claim
+        # that outlived a dead attempt is recovered on age.
         if idem_key:
             _demand.DEMAND_MARKERS.release(_demand.MARK_RECORD, idem_key)
         raise
@@ -38535,6 +38576,33 @@ async def record_data_source_demand(
             "replayed": False, "org_key": org_key,
             "click_count": _demand_click_count(rows, integration_key),
             "source": source}
+
+
+def _demand_row_for_idempotency(
+        rows: list[dict] | None, integration_key: str,
+        idem_fp: str) -> bool | None:
+    """Whether a stored row IS the write behind this idempotency claim.
+
+    ``True`` / ``False``, and ``None`` when the store could not be read (which
+    is not evidence of absence — the caller must not treat it as one).
+
+    ACTION-AGNOSTIC ON PURPOSE. The question is not "how much demand is there"
+    (that is ``_demand_click_count``, and it counts clicks only) but "did the
+    write behind THIS claim land" — and ``go_back`` is a stored, validated
+    action, so a click-only predicate answers "not recorded" for a row that IS
+    in the store, releases the claim, and lets the retry duplicate it (#3514
+    review P2). The row's own fingerprint answers the real question.
+    """
+    if rows is None:
+        return None
+    if not idem_fp:
+        return False
+    for row in rows:
+        props = row.get("properties") or {}
+        if (props.get("integration_key") == integration_key
+                and props.get(_demand.DEMAND_PROP_IDEM) == idem_fp):
+            return True
+    return False
 
 
 def _demand_click_count(rows: list[dict] | None, integration_key: str) -> int | None:
@@ -38598,6 +38666,15 @@ async def operator_data_source_demand(request: Request):
                     "message": "the demand store could not be read"})
     demand, truncated = _demand_aggregate(rows)
     return {"ok": True, "source": source, "truncated": truncated,
+            # DELIBERATELY ACTION-AGNOSTIC (#3514 review P3). This figure is
+            # STORE BREADTH — "how many teams have a demand row at all" — and it
+            # is NOT the N=5 trigger's unit: that is the per-integration
+            # `org_count` in `demand` below, which ranks clicks only. So a team
+            # whose only row is a dismissal appears HERE and in no ranked row,
+            # which is the honest reading of a funnel figure rather than a
+            # demand one. Filtering it to clicks would silently redefine a
+            # number the monthly review already reads, and would make the
+            # dismissal (a stored funnel fact) invisible to the operator.
             "distinct_orgs": len({row.get("org_id") for row in rows
                                   if row.get("org_id")}),
             "demand": demand}
