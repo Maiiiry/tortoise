@@ -53,6 +53,17 @@ def _workflow() -> dict:
     return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
 
 
+def _triggers() -> dict:
+    """The `on:` block.
+
+    `on:` is parsed as the boolean True by YAML 1.1, so the raw document is
+    rewritten before parsing — the key must be quoted for the block to be
+    readable at all.
+    """
+    raw = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8").replace("\non:\n", "\n'on':\n"))
+    return raw["on"]
+
+
 def _job() -> dict:
     jobs = _workflow()["jobs"]
     assert len(jobs) == 1, f"expected exactly one job, got {sorted(jobs)}"
@@ -87,11 +98,73 @@ def test_workflow_is_scheduled_and_dispatchable():
     ``workflow_dispatch`` is what lets a human re-run it against production after
     a zone or policy change without waiting a day.
     """
-    # `on:` is parsed as the boolean True by YAML 1.1 — read the raw document.
-    raw = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8").replace("\non:\n", "\n'on':\n"))
-    triggers = raw["on"]
+    # `on:` is parsed as the boolean True by YAML 1.1 — read the quoted form.
+    triggers = _triggers()
     assert [t["cron"] for t in triggers["schedule"]], "a live monitor with no cron is a manual script"
     assert "workflow_dispatch" in triggers
+
+
+# ── the probe must be ORDERED AFTER the deployment it audits ────────────
+def test_a_policy_change_is_probed_after_the_deploy_not_racing_it():
+    """The `push`-trigger defect: a probe that starts with the deploy reads the OLD artifact.
+
+    `Deploy Landing Pages` fires on the same event (`push` → main → `website/**`)
+    and is what publishes the new policy. A `push:` trigger here starts
+    concurrently, spends ~2-3 min on `pip install` + `playwright install` against
+    the deploy's build + wrangler deploy + probes, and normally WINS — so a policy
+    that blocks the beacon reported GREEN (truthfully describing the previous
+    deployment) and was only observed by the next daily cron, up to ~24h later:
+    exactly the window #4762 exists to close, on its highest-risk event.
+
+    Nothing else in the file establishes that ordering — no `needs`, no wait, no
+    retry — so the trigger itself must be the ordering construct.
+    """
+    triggers = _triggers()
+    deploy_completion = triggers.get("workflow_run")
+    assert deploy_completion, (
+        "no `workflow_run` trigger: a push-triggered probe races the deployment it audits "
+        "and reports on the PREVIOUS one, so a policy change that breaks the beacon reads GREEN"
+    )
+    assert "Deploy Landing Pages" in deploy_completion["workflows"], (
+        "the ordered trigger must name the workflow that PUBLISHES the policy; got "
+        f"{deploy_completion['workflows']}"
+    )
+    assert "completed" in deploy_completion["types"], "`workflow_run` must wait for the run to COMPLETE"
+    assert deploy_completion["branches"] == ["main"], (
+        "ordering is keyed on the triggering run's branch; without `main` a deploy from any "
+        "branch would fire the prod probe"
+    )
+    # The `workflows:` entry is matched against the deploy workflow's `name:`, so a
+    # RENAME there silently disables this trigger — no error, no run, and the monitor
+    # falls back to the daily cron only. Pin the literal to the file it names.
+    deploy_doc = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "deploy-pages.yml").read_text(encoding="utf-8")
+    )
+    assert deploy_doc["name"] in deploy_completion["workflows"], (
+        f"the ordered trigger names {deploy_completion['workflows']}, but the deploy workflow's "
+        f"`name:` is {deploy_doc['name']!r} — `workflow_run` matches on that string, so this "
+        "would never fire"
+    )
+    # …and the race cannot be reintroduced through the push arm: the deployment's
+    # own input must not trigger the probe directly.
+    push_paths = triggers["push"]["paths"]
+    assert "website/**" not in push_paths, (
+        "`website/**` is the DEPLOYMENT's input — a push-triggered probe of it races the "
+        "deploy and reads the previous deployment (use the `workflow_run` trigger)"
+    )
+
+
+def test_a_probe_code_change_still_gets_an_immediate_live_run():
+    """The other side of the same filter: the probe's own files DO trigger a run.
+
+    Neither file changes the deployed artifact, so there is nothing to wait for —
+    dropping them too would mean a detector change was only exercised by the next
+    cron, and the assertion above would then be satisfied by deleting the trigger
+    entirely (the vacuous direction).
+    """
+    push_paths = _triggers()["push"]["paths"]
+    assert "tests/e2e/audit_prod_csp.py" in push_paths
+    assert ".github/workflows/prod-csp-monitor.yml" in push_paths
 
 
 def test_workflow_runs_the_detector_script_that_exists():
@@ -109,7 +182,6 @@ def test_audit_step_supplies_allow_prod_ungated():
     step = _audit_step()
     assert step.get("env", {}).get("ALLOW_PROD") == "1", "the audit would exit 2 without probing"
     assert "if" not in step, "a conditional audit step can silently skip the probe"
-    assert "ALLOW_PROD" not in str(step.get("if", ""))
 
 
 # ── the load-bearing one: a failing detector cannot read green ──────────
@@ -356,6 +428,25 @@ def test_rum_path_match_is_exact_not_a_prefix():
     assert label == "rum-missing"
 
 
+def test_rum_path_match_is_the_zone_root_endpoint_not_any_suffix():
+    """PATH-EXACT: `/x/cdn-cgi/rum` is not the endpoint the beacon reports to.
+
+    A `endswith` test accepted any path ending in the RUM path, so a POST to a
+    deeper path read as the healthy same-origin report — the docstring called it
+    an exact match while the predicate was a suffix test, and a reviewer could not
+    tell which was intended. The predicate is exact now.
+    """
+    module = _detector_module()
+    label, findings = module._beacon_verdict(
+        [*BEACON_SCRIPT, ("POST", "https://app.premiselabs.co/x/cdn-cgi/rum")],
+        STRICT_CSP,
+        True,
+        PAGE,
+    )
+    assert label == "rum-missing"
+    assert findings
+
+
 def test_script_src_elem_precedence_is_respected():
     """`script-src-elem` overrides `script-src`: a union of all three would answer True."""
     module = _detector_module()
@@ -372,6 +463,29 @@ def test_default_src_is_the_last_resort():
     module = _detector_module()
     assert module._admits_beacon_script("default-src 'self' https://static.cloudflareinsights.com") is True
     assert module._admits_beacon_script("default-src 'self'") is False
+
+
+def test_no_label_is_documented_that_the_verdict_cannot_return():
+    """The label list is the contract a maintainer reads; every label must exist.
+
+    The docstring listed `rum-cross-origin`, which was never returned — the
+    cross-origin case returns `rum-ok` PLUS a `beacon-cross-origin` finding
+    (pinned above). A documented-but-impossible label reads as coverage and sends
+    the next reader looking for a branch that is not there.
+    """
+    module = _detector_module()
+    doc = (module._beacon_verdict.__doc__ or "")
+    returned = set()
+    for requests, csp, tag in (
+        ([], STRICT_CSP, False),
+        ([], STRICT_CSP, True),
+        (BEACON_SCRIPT, NO_BEACON_CSP, True),
+        (BEACON_SCRIPT, STRICT_CSP, True),
+        (BEACON_SCRIPT + RUM, STRICT_CSP, True),
+    ):
+        returned.add(module._beacon_verdict(requests, csp, tag, PAGE)[0])
+    assert returned == {"no-tag", "tag-blocked", "rum-missing", "rum-ok"}
+    assert "rum-cross-origin" not in doc
 
 
 # ── the script's own safety rails survive the edit ──────────────────────

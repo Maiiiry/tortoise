@@ -165,8 +165,11 @@ def _beacon_verdict(
     surface (measured: the only false positive this arm produced).
 
     Labels: ``no-tag`` (edge injected nothing — reported, not failed),
-    ``tag-blocked`` (a violation; the policy scan owns it), ``rum-cross-origin``,
-    ``rum-missing``, ``rum-ok``.
+    ``tag-blocked`` (a violation; the policy scan owns it), ``rum-missing``,
+    ``rum-ok``. A cross-origin RUM request is not a label of its own: the label
+    reports the same-origin contract, and the cross-origin request arrives as a
+    ``beacon-cross-origin`` FINDING alongside it (so a surface that reports
+    same-origin AND leaks one to the manual endpoint is still a failure).
     """
     findings: list[str] = []
     rum_same_origin = False
@@ -184,7 +187,10 @@ def _beacon_verdict(
             )
         elif (
             method.upper() == "POST"
-            and parts.path.rstrip("/").endswith(BEACON_RUM_PATH)
+            # PATH-EXACT, not a suffix test: the RUM endpoint is `/cdn-cgi/rum` on
+            # the zone root, so `/x/cdn-cgi/rum` is a DIFFERENT endpoint and a
+            # `endswith` would count it as the same-origin one.
+            and parts.path.rstrip("/") == BEACON_RUM_PATH
             and host == page_host
         ):
             rum_same_origin = True

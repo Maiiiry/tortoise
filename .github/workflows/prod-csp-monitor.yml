@@ -20,9 +20,10 @@
 #   This probe drives PRODUCTION in a real browser. On the per-PR path it would
 #   make every PR depend on production being reachable and non-flaky, and it
 #   would compete with real traffic for prod rate buckets. A scheduled run +
-#   `workflow_dispatch` + a path-filtered push to main is the shape that observes
-#   edge-only behaviour without that cost. The auto-filed issue (below) IS the
-#   monitor's signal; a red cron run never blocks a merge.
+#   `workflow_dispatch` + a run ordered after the DEPLOY (never a run racing it,
+#   see the `workflow_run` block) is the shape that observes edge-only behaviour
+#   without that cost. The auto-filed issue (below) IS the monitor's signal; a
+#   red cron run never blocks a merge.
 #
 # SCOPE — the ANONYMOUS surfaces only, by design. `/admin` needs an authenticated
 # session and is covered statically by `website/apps/dashboard/src/securityHeaders.test.js`.
@@ -33,16 +34,41 @@ name: prod-csp-monitor
 on:
   schedule:
     # Daily. The beacon contract moves only with a zone setting or a policy
-    # change, so daily is the useful resolution; the path filter below covers
-    # the "we just changed a policy" case within minutes.
+    # change, so daily is the useful resolution; the deploy trigger below covers
+    # the "we just changed a policy" case within minutes of the change being LIVE.
     - cron: '23 6 * * *'
-  # A policy change is the one event that can break a deployed surface and is
-  # also the one a human just made — check it on main immediately, without
-  # putting the probe anywhere near a PR. Non-policy merges do not run it.
+  # ⛔ ORDERED AFTER THE DEPLOYMENT — NEVER RACING IT.
+  # A policy change is the one event that can break a deployed surface and the
+  # one a human just made, so it must be checked on main immediately — but it
+  # must be checked against the deployment that CONTAINS it. `Deploy Landing
+  # Pages` fires on the same event a `push:` trigger here would (`push` → main →
+  # `website/**`) and is what actually publishes the new policy: a 2-project
+  # build + wrangler deploy + post-deploy probes, ~2-3 min. A `push:` trigger
+  # starts CONCURRENTLY with it, spends its own ~2-3 min on `pip install` +
+  # `playwright install`, and usually wins that race — probing the PREVIOUS
+  # deployment. A policy that blocks the beacon then reported GREEN (correctly
+  # describing the OLD artifact, so even a red is not trustworthy) and was only
+  # observed by the next daily cron, up to ~24h later: precisely the window
+  # #4762 exists to close, for its highest-risk event. `concurrency` does not
+  # help — it serialises this workflow against itself, not against the deploy.
+  # `workflow_run` is the only trigger ordered after the artifact it audits.
+  # It fires for ANY completed deploy on main, including a FAILED one; the probe
+  # then describes the last PUBLISHED deployment, which is what actually serves
+  # traffic, so the reading stays true. `branches` keys on the TRIGGERING run's
+  # branch. (It also only takes effect from the default branch, since that is the
+  # copy GitHub executes for a `workflow_run` trigger.)
+  workflow_run:
+    workflows: ['Deploy Landing Pages']
+    types: [completed]
+    branches: [main]
+  # A change to the PROBE ITSELF still gets an immediate live run: neither file
+  # below changes the deployed artifact, so there is nothing to wait for and the
+  # reading is of the current deployment either way. `website/**` is deliberately
+  # NOT in this filter — it is the DEPLOYMENT's input, and a push-triggered probe
+  # of it is the coin-flip described above.
   push:
     branches: [main]
     paths:
-      - 'website/**'
       - 'tests/e2e/audit_prod_csp.py'
       - '.github/workflows/prod-csp-monitor.yml'
   workflow_dispatch:
