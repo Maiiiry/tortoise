@@ -774,14 +774,33 @@ def test_a_route_cannot_carry_a_reason_that_contradicts_its_verdict() -> None:
     the route — which is where a reason-keyed consumer actually reads it, and the
     type is public. An ``escalate-tier`` route on a sufficient verdict, or an
     escalation justified by ``measures-met``, was constructible.
+
+    Every ``escalate-tier`` case names the MESSAGE of the check it pins, not just
+    that *some* ``ValueError`` fired: with ``escalated`` left at its ``False``
+    default the ``escalate-tier ⇒ escalated`` axis raises FIRST, so both
+    coherence checks in that block were reachable by no test and could be
+    deleted with this function still green (#5009 review). The factory only ever
+    emits ``escalate-tier`` for a measured insufficiency whose reason is one of
+    ``_VERDICT_REASONS[INSUFFICIENT]``, so the refuse-only inputs below are the
+    hand-built/replayed shapes.
     """
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="MEASURED insufficiency"):
+        # Directs a walk on a GREEN — the one thing an escalation cannot mean.
+        SufficiencyRoute(route=ROUTE_ESCALATE_TIER, reason=REASON_ANCHORS_UNCOVERED,
+                         verdict=SUFFICIENT, escalated=True)
+    with pytest.raises(ValueError, match="not an insufficiency of the evidence"):
+        # ... and the reason it escalates ON must be an insufficiency too, so a
+        # policy-shaped reason (the budget pair, or a green's ``measures-met``)
+        # cannot be replayed as the cause of a walk.
         SufficiencyRoute(route=ROUTE_ESCALATE_TIER, reason=REASON_MEASURES_MET,
-                         verdict=SUFFICIENT)
-    with pytest.raises(ValueError):
+                         verdict=INSUFFICIENT, escalated=True)
+    with pytest.raises(ValueError, match="not an insufficiency of the evidence"):
+        SufficiencyRoute(route=ROUTE_ESCALATE_TIER, reason=REASON_BUDGET_EXHAUSTED,
+                         verdict=INSUFFICIENT, escalated=True, budget_remaining=0)
+    with pytest.raises(ValueError, match="does not belong to a"):
         SufficiencyRoute(route=ROUTE_SERVE, reason=REASON_RESIDENT_MISS,
                          verdict=SUFFICIENT)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="bounded insufficiency"):
         # A budget reason implies an insufficiency — never a green.
         SufficiencyRoute(route=ROUTE_SERVE, reason=REASON_BUDGET_EXHAUSTED,
                          verdict=SUFFICIENT, budget_remaining=0)
