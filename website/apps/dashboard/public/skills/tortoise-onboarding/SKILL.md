@@ -557,14 +557,19 @@ safe to trust.
 
 If the marker lines are not one clean pair — two copies, a stray marker, or one
 with different internal spacing or an invisible character — the installer prints
-`✗ AGENTS.md — the Tortoise block markers are MALFORMED` with
-`start markers: N (first at line L), end markers: M …` and the usual cause,
-A marker inside a fenced code block is an EXAMPLE, not a block: fences are
-skipped for every count, so a project that documents the markers keeps its
-documentation and still gets its block created or refreshed.
-REFUSES rather than duplicating the block, and exits 3 (the skills ARE installed
-by then; only the block is not upgraded). Never hand-edit inside markers you did not
-write; the next refresh discards it.
+`✗ AGENTS.md — the Tortoise block markers are MALFORMED` with per-marker counts
+(`start markers: N (first at line L), end markers: M (first at line …)`) and the
+cause it actually found, REFUSES rather than duplicating the block, and exits 3
+(the skills ARE installed by then; only the block is not upgraded).
+
+A marker inside a fenced code block is an EXAMPLE, not a block. Fences are
+skipped for every count AND for the version read, the comparison and the
+rewrite, so a project that documents the markers keeps its documentation exactly
+as written and still gets its block created or refreshed. An UNCLOSED fence is
+the one ambiguity: the installer falls back to reading every line and rewrites
+the block it finds rather than appending a second one.
+
+Never hand-edit inside markers you did not write; the next refresh discards it.
 
 ## 4. Verify, then checkpoint harness-connected
 

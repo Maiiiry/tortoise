@@ -60,7 +60,25 @@ Mutations that turn these RED (each verified RED before merge, restored byte-exa
     fails: nothing is written and the run claims ``upgraded`` at exit 0;
   * stage the block through a predictable ``$target.tmp``  -> the planted-symlink
     test fails (the write follows the link, clobbers an unrelated file, and turns
-    ``AGENTS.md`` into a symlink to it — #4327's threat model).
+    ``AGENTS.md`` into a symlink to it — #4327's threat model);
+  * locate the block with a FENCE-BLIND scan in the split -> the column-zero-fence
+    test fails: the fenced EXAMPLE is overwritten and the real block's markers are
+    deleted, while the report says "refreshed" (cycle 4 shipped the fence skip in
+    the counter only, so the decision said "paired" and the writers edited the
+    example);
+  * accept only a bare fence (no indent, no language tag) -> the ```md test fails;
+  * drop the unclosed-fence fallback                      -> the unclosed-fence test
+    fails: ``state=none`` means APPEND, so one more copy is added per run, forever;
+  * neutralise BOTH the ``tr`` guard and the non-empty check -> the failing-``tr``
+    test fails: ``tr`` dying empties both stripped markers, which silently disables
+    the mangled detector, and a file whose two markers are BOTH spacing-mangled
+    then reads as "no markers" and gets a duplicate block. (Either half alone is
+    enough, so the pair is defence in depth — the test pins the pair.)
+
+The marker LINE NUMBERS are the single source for the version read, the window
+extraction and the split. The window read has no independent red — a blind offset
+only makes the comparison input wrong, never the written bytes — so it is kept in
+the same shape as the split deliberately, not on the strength of a mutation.
 
 Cycle 2 also measured a version token in prose outside the block (read as
 "current") and an older installer overwriting a newer block (called an
@@ -337,7 +355,7 @@ def test_malformed_markers_are_refused_not_silently_duplicated(tmp_path):
         + LEGACY_BLOCK.replace("OLD", "OLD")
         + FOREIGN_AFTER
     )
-    done, _ = _install(tmp_path, agents_in)
+    done, agents = _install(tmp_path, agents_in)
 
     assert done.returncode != 0, (
         f"a malformed marker pair must fail the run, not report success:\n{done.stdout}")
@@ -743,3 +761,129 @@ def test_a_planted_staging_symlink_cannot_redirect_the_write(tmp_path):
         "the write followed a planted symlink and clobbered an unrelated file")
     assert not (project / "AGENTS.md").is_symlink(), "AGENTS.md became a symlink"
     assert (project / "AGENTS.md").read_text(encoding="utf-8").count(START) == 1
+
+
+def test_a_column_zero_fenced_example_is_not_the_block(tmp_path):
+    """The canonical form (```` ``` ```` at column 0) is the one that used to be
+    MISTAKEN for the block: the state counted with fences while the version read,
+    window extraction and split were fence-blind, so a documented example was
+    deleted and a duplicate block was written OUTSIDE any marker."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = f"```\n{START}\n...\n{END}\n```\n"
+    body = "# House rules\n\n" + example
+    agents = project / "AGENTS.md"
+    agents.write_text(body, encoding="utf-8")
+    assert _run(installer, home, project).returncode == 0
+    installed = agents.read_text(encoding="utf-8")
+    assert example in installed, "the documented example was deleted"
+
+    # Now perturb the block's TEXT so a rewrite (not "already current") happens,
+    # and re-run: the example must still be exactly where it was.
+    drifted = installed.replace("safe to allow.", "safe to allow (drifted).")
+    agents.write_text(drifted, encoding="utf-8")
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stderr
+    text = agents.read_text(encoding="utf-8")
+    assert text.count(START) == 2, f"expected the example + one block:\n{text}"
+    assert text.count(END) == 2
+    assert example in text, "the rewrite ate the documented example"
+    assert "safe to allow (drifted)." not in text, "the stale text survived the rewrite"
+    assert "already current" not in _agents_report(done.stdout), "a rewrite happened"
+    # The LAST pair is the real one: everything after the closing marker is intact.
+    assert text.rstrip().endswith(END)
+
+
+def test_a_language_tagged_fence_example_is_not_the_block(tmp_path):
+    """```` ```md ```` is the form quickstart uses — the toggle must accept a
+    language tag, not only a bare fence."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = f"```md\n{START}\n...\n{END}\n```\n"
+    agents = project / "AGENTS.md"
+    agents.write_text(example, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, f"a language-tagged EXAMPLE was treated as a block:\n{done.stderr}"
+    text = agents.read_text(encoding="utf-8")
+    assert text.count(START) == 2, text
+    assert example in text, "the example was eaten"
+
+
+def test_an_unclosed_fence_does_not_append_a_second_block(tmp_path):
+    """An unterminated fence hides every later marker; "no markers" means
+    APPEND, which added one more copy per run forever. The fallback is the
+    fence-blind pass — the pre-#3429 behaviour, which replaced the real block."""
+    agents_in = "# House\n\n```bash\nnpm run build\n" + LEGACY_BLOCK
+    done, text = _install(tmp_path, agents_in)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert text.count(START) == 1, f"a second block was appended:\n{text}"
+    assert text.count(END) == 1
+    assert "npm run build" in text, "content outside the markers was lost"
+
+    # And it must stay at one copy on the next run.
+    installer = _patched_installer(tmp_path, _fixture_tree(tmp_path))
+    again = _run(installer, tmp_path / "home", tmp_path / "project")
+    assert again.returncode == 0, again.stderr
+    assert (tmp_path / "project" / "AGENTS.md").read_text(encoding="utf-8").count(START) == 1
+
+
+def test_a_failing_tr_fails_closed(tmp_path):
+    """`tr` failing empties both whitespace-stripped markers, which silently
+    disables the mangled detector and reverts the duplicate-block path. The guard
+    was `command not found` because it ran BEFORE `_emit_fail` was defined."""
+    mangled = ("<!--  tortoise:start  -->\nstale body\n"
+               + END.replace("<!-- ", "<!--  ").replace(" -->", "  -->") + "\n")
+    done, agents = _install_with_stub(tmp_path, "tr", "#!/bin/sh\nexit 1\n", mangled)
+
+    assert done.returncode != 0, f"a broken tr must fail closed:\n{done.stdout}"
+    assert "✓ AGENTS.md" not in done.stdout, done.stdout
+    assert "_emit_fail: command not found" not in done.stderr, (
+        "the guard called a function that was not defined yet")
+    if agents.exists():
+        assert agents.read_text(encoding="utf-8") == mangled
+
+
+def test_a_fenced_verbatim_copy_of_the_block_does_not_mask_a_stale_one(tmp_path):
+    """If the window is located fence-blind, a repo that pastes the CURRENT block
+    into a documentation fence is told "already current" while its real block
+    stays stale: the comparison input is a proxy, not the artifact."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    agents = project / "AGENTS.md"
+    assert _run(installer, home, project).returncode == 0
+    current = agents.read_text(encoding="utf-8")
+    example = f"```\n{current}```\n"
+
+    # A STALE (unversioned, old-text) block, plus a fence holding a byte-identical
+    # copy of the CURRENT one.
+    agents.write_text("# Docs\n\n" + example + "\n" + LEGACY_BLOCK, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stderr
+    text = agents.read_text(encoding="utf-8")
+    assert "already current" not in _agents_report(done.stdout), (
+        "a fenced copy is documentation — it must not satisfy the comparison")
+    assert example in text, "the fenced copy was rewritten"
+    assert text.count("<!-- tortoise:block v") == 2, "expected the fenced copy + the real block"
+    assert "setuptortoise.invalid" not in text  # sanity: fixture text is gone
+    # The STALE text is uniquely the old sentence; the new block does not contain it.
+    assert "follow the onboarding instructions at\n  https://example.invalid" not in text, (
+        "the stale block was left in place")
+    assert text.rstrip().endswith(END)

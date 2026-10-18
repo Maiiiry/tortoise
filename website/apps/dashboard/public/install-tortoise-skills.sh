@@ -431,7 +431,18 @@ emit_codex_agents_block() {
   # unchecked `awk`/`cat` failure used to end in a SUCCESS report over an
   # untouched file, which is the harm this whole change exists to end.
   local state="" prev_version="" same_bytes=0
-  local state_kind="" c_start c_startline c_end c_endline c_near c_mangled
+  local state_kind="" c_start c_startline c_end c_endline
+  local c_near_s c_near_e c_mangled_s c_mangled_e
+  _emit_fail() {
+    # ONE place that cleans up and fails. It EXITS rather than returning: a
+    # `cmd || helper` list is itself an errexit-exempt context, so a helper that
+    # merely returns 1 lets the next statement run — which is how an internal
+    # read failure ended in a SUCCESS report over an untouched file.
+    echo "  ✗ AGENTS.md — $1" >&2
+    echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
+    rm -rf "$tmpdir"
+    exit 3
+  }
   local ms_re="^${ms}\r?$" me_re="^${me}\r?$"
   local ms_ws me_ws
   # NB: `tr` failing here silently disables the mangled-marker detector (both
@@ -445,16 +456,6 @@ emit_codex_agents_block() {
   target="$file"
   [ -L "$file" ] && target="$(readlink "$file")"
 
-  _emit_fail() {
-    # ONE place that cleans up and fails. It EXITS rather than returning: a
-    # `cmd || helper` list is itself an errexit-exempt context, so a helper that
-    # merely returns 1 lets the next statement run — which is how an internal
-    # read failure ended in a SUCCESS report over an untouched file.
-    echo "  ✗ AGENTS.md — $1" >&2
-    echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
-    rm -rf "$tmpdir"
-    exit 3
-  }
   printf '%s\n' \
 "${ms}
 <!-- tortoise:block v${AGENTS_BLOCK_VERSION} -->
@@ -472,12 +473,17 @@ emit_codex_agents_block() {
   Onboarding is delivered as INSTRUCTIONS, not as an installed skill.
 - First-time MCP calls may prompt for approval — tortoise_health and the read tools
   are safe to allow.
-${me}" > "$block" 2>/dev/null || _emit_fail "could not build the new block text — nothing was changed"
+${me}" > "$block" || _emit_fail "could not build the new block text — nothing was changed"
 
   if [ -f "$target" ]; then
+    # ONE pass decides WHERE the block is, and every reader/writer below obeys
+    # its line numbers. Counting with fences but then locating the window with a
+    # fence-blind scan is how the fenced-example feature deleted a user's
+    # documentation and then dumped a duplicate block outside any marker: the
+    # state said "paired" while the writers latched onto the FIRST anchored
+    # markers in the file, which were the example's.
     state="$(awk -v ms="$ms" -v me="$me" -v msws="$ms_ws" -v mews="$me_ws" \
                  -v msre="$ms_re" -v mere="$me_re" '
-      BEGIN { starts = ends = nearstart = nearend = mangledstart = mangledend = 0; fence = 0 }
       # NEAR: the marker ALONE on the line once whitespace/BOM is stripped, but
       # not matching the anchored form (indented, trailing space, BOM).
       function near(line, m,   p, pre, post) {
@@ -491,21 +497,39 @@ ${me}" > "$block" 2>/dev/null || _emit_fail "could not build the new block text 
       # MANGLED: a marker with different INTERNAL spacing and nothing else on the
       # line — a broken marker, not prose about one.
       function stripped(line,   x) { x = line; gsub(/[ \t\r]/, "", x); return x }
+      function classify(line, nr,   sw) {
+        if (line ~ msre) { starts++; if (!startline) startline = nr; return }
+        if (line ~ mere) { ends++;   if (!endline)   endline   = nr; return }
+        if (near(line, ms)) { nearstart++; if (!nearstartline) nearstartline = nr; return }
+        if (near(line, me)) { nearend++;   if (!nearendline)   nearendline   = nr; return }
+        sw = stripped(line)
+        if (sw != "" && sw == msws) { mangledstart++; if (!mangledstartline) mangledstartline = nr }
+        else if (sw != "" && sw == mews) { mangledend++; if (!mangledendline) mangledendline = nr }
+      }
+      BEGIN { starts = ends = nearstart = nearend = mangledstart = mangledend = 0; fence = 0 }
+      { lines[NR] = $0 }
       # A FENCED CODE BLOCK is an example, not content: a repo whose AGENTS.md
-      # documents the markers in a fence must not be refused for it. Fences are
-      # skipped for EVERY count, so the only markers seen are real ones.
+      # documents the markers must not be refused for it, and its fence must not
+      # be mistaken for the block.
       /^[ \t]*```/ { fence = !fence; next }
       fence { next }
-      $0 ~ msre { starts++; if (!startline) startline = NR; next }
-      $0 ~ mere { ends++;   if (!endline)   endline   = NR; next }
-      near($0, ms) { nearstart++; if (!nearstartline) nearstartline = NR; next }
-      near($0, me) { nearend++;   if (!nearendline)   nearendline   = NR; next }
-      { sw = stripped($0)
-        if (sw != "" && sw == msws) { mangledstart++; if (!mangledstartline) mangledstartline = NR }
-        else if (sw != "" && sw == mews) { mangledend++; if (!mangledendline) mangledendline = NR } }
+      { classify($0, NR) }
       END {
-        if (starts == 1 && ends == 1 && startline < endline) { print "paired|||||||||"; exit }
-        if (starts + ends + nearstart + nearend + mangledstart + mangledend == 0) { print "none|||||||||"; exit }
+        # An UNCLOSED fence would hide every real marker below it, and "no
+        # markers" means APPEND — one more copy per run. Fall back to the
+        # fence-blind pass (the pre-#3429 behaviour, which replaced the real
+        # block correctly) instead of treating an unterminated fence as content.
+        if (fence) {
+          starts = ends = nearstart = nearend = mangledstart = mangledend = 0
+          startline = endline = 0
+          for (i = 1; i <= NR; i++) classify(lines[i], i)
+        }
+        if (starts == 1 && ends == 1 && startline < endline) {
+          printf "paired|1|%d|1|%d|0|0|0|0\n", startline, endline; exit
+        }
+        if (starts + ends + nearstart + nearend + mangledstart + mangledend == 0) {
+          print "none|0|-|0|-|0|0|0|0"; exit
+        }
         # Per-marker counts, so the message and the remedy agree with each other:
         # `c_end` (anchored only) used to say "there is no end line" while the
         # line it was printed under reported a mangled one.
@@ -559,18 +583,13 @@ EOF
     # digits) so a mangled version is reported as mangled instead of as
     # "unversioned". The byte comparison decides "already current": a version
     # line is evidence of ORDER, never proof that the text matches.
-    prev_version="$(awk -v msre="$ms_re" -v mere="$me_re" '
-      $0 ~ msre { inb = 1; next }
-      $0 ~ mere { inb = 0; next }
-      inb && match($0, /tortoise:block v[^ ]* -->/) {
+    prev_version="$(awk -v s="$c_startline" -v e="$c_endline" '
+      NR >= s && NR <= e && match($0, /tortoise:block v[^ ]* -->/) {
         v = substr($0, RSTART, RLENGTH)
         sub(/^tortoise:block v/, "", v); sub(/ -->$/, "", v); print v; exit
       }' "$target")" || _emit_fail "could not read the block's version — nothing was changed"
 
-    awk -v msre="$ms_re" -v mere="$me_re" '
-      $0 ~ msre { inb = 1; print; next }
-      $0 ~ mere { print; inb = 0; next }
-      inb { print }' "$target" > "$tmpdir/window" \
+    awk -v s="$c_startline" -v e="$c_endline" 'NR >= s && NR <= e' "$target" > "$tmpdir/window" \
       || _emit_fail "could not extract the existing block — nothing was changed"
     # Line-ending-insensitive: a file whose markers match and whose only
     # difference is CRLF is not a TEXT change (and rewriting it while saying
@@ -588,9 +607,6 @@ EOF
         || _emit_fail "could not normalise the existing block — nothing was changed"
       sed "s/\r\$//" "$block" > "$tmpdir/block.lf" \
         || _emit_fail "could not normalise the new block — nothing was changed"
-      if [ ! -s "$tmpdir/window.lf" ] || [ ! -s "$tmpdir/block.lf" ]; then
-        _emit_fail "normalising the block produced an empty file — nothing was changed"
-      fi
       if cmp -s "$tmpdir/window.lf" "$tmpdir/block.lf"; then same_bytes=1; fi
     fi
   fi
@@ -599,12 +615,10 @@ EOF
     # In-place replace between the markers — never touches content outside them.
     : > "$pre" || _emit_fail "could not prepare the rewrite — nothing was changed"
     : > "$post" || _emit_fail "could not prepare the rewrite — nothing was changed"
-    awk -v msre="$ms_re" -v mere="$me_re" -v pre="$pre" -v post="$post" '
-      BEGIN { inmarker = 0; ended = 0 }
-      $0 ~ msre { inmarker = 1; next }
-      inmarker && $0 ~ mere { inmarker = 0; ended = 1; next }
-      { if (ended) print > post; else if (!inmarker) print > pre }
-    ' "$target" || _emit_fail "could not split the file around the block — nothing was changed"
+    awk -v s="$c_startline" -v e="$c_endline" -v pre="$pre" -v post="$post" '
+      NR < s { print > pre }
+      NR > e { print > post }' "$target" \
+      || _emit_fail "could not split the file around the block — nothing was changed"
     # Stage through an UNPREDICTABLE name in the SAME directory (so the write is
     # same-filesystem and the `mv` stays atomic). A predictable `$target.tmp` is
     # the #4327 threat model this script already applies to the skill payloads: a
@@ -632,7 +646,7 @@ EOF
 
   # ── REPORT: derived from what was WRITTEN and what was there before, never
   # from the version token alone.
-  v="$AGENTS_BLOCK_VERSION"
+  local v="$AGENTS_BLOCK_VERSION"
   # `-lt`/`-gt` on an out-of-range integer ERROR and fall through, which turned a
   # downgrade into "refreshed (same version…)". Anything that is not a plain
   # decimal inside int64 range is reported as not comparable, never as current.
