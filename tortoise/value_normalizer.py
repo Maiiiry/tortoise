@@ -227,7 +227,13 @@ _MAGNITUDE_WORD = re.compile(
 #: word-bounded — a distance window (the previous ±6 characters) missed
 #: ``EUR 800 or roughly 900`` and typed the lower bound (review cycle 3), while
 #: a sentence-wide search dropped ``EUR 800 covers 3-4 hires`` (cycle 1).
-_RANGE_CONNECTOR = r"(?:-|–|—|/|\bto\b|\band\b|\bor\b)"
+#: ``up to`` / ``through`` / ``vs`` are connectors in the same register: a
+#: comparison between two bounds is not a point value either, and ``up to``
+#: was already the vocabulary's own word (``_RANGE_FILLER``,
+#: ``_QUALIFIER_BEFORE``) — leaving it out of this set typed ``EUR 800 up to
+#: 900`` as 800.00 (the same false type as the ±6-character-window finding).
+_RANGE_CONNECTOR = (r"(?:-|–|—|/|\bto\b|\band\b|\bor\b|\bup\s+to\b|"
+                    r"\bthr(?:ough|u)\b|\bvs\.?\b|\bversus\b)")
 
 #: The only words a range connector may carry before its second bound
 #: ("or **roughly** 900", "to **about** 900"). Deliberately an allowlist of
@@ -379,11 +385,20 @@ def _has_range(text: str, candidates: list[_Candidate]) -> bool:
     roughly 900`` is a range (the previous ±6-character window missed it and
     typed 800), while an unrelated hyphenated pair elsewhere in the sentence
     (``EUR 800 covers 3-4 hires``) is not one, because no connector sits
-    between the amount and a bound.
+    between the amount and a bound. The scan is anchored at the end of the
+    whole form, so an amount whose anchor FOLLOWS it (``800 EUR to 900``) is
+    covered too.
     """
     masked = _mask_dates(text)
     for cand in candidates:
-        if _RANGE_AFTER.match(masked, cand.end):
+        # ⛔ The connector sits after the whole anchored FORM, not after the
+        # number: ``800 EUR to 900`` (the anchor FOLLOWS the amount) ended the
+        # scan at the number, saw " EUR to 900", and typed the lower bound as
+        # a point value — the very false type the word-bounded rule exists to
+        # prevent. ``span_end == end`` for an anchor-first form, so testing
+        # both covers either order and costs nothing.
+        if _RANGE_AFTER.match(masked, cand.end) \
+                or _RANGE_AFTER.match(masked, cand.span_end):
             return True
         before = masked[max(0, cand.start - _RANGE_LOOKBEHIND):cand.start]
         if _RANGE_BEFORE_TAIL.search(before):

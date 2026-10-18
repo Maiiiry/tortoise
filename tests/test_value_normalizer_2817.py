@@ -398,8 +398,50 @@ def test_a_value_without_any_anchor_is_not_typed():
     "approx., EUR 800",
     "est. EUR 800",
     "about, say, EUR 800",
+    # the cycle-5 P1 forms: the amount's ANCHOR follows it, so a connector
+    # after the whole form (not after the number) was never scanned — the
+    # lower bound typed as a point value again, which is the same false type
+    # the ±6-character-window finding named
+    "800 EUR to 900",
+    "800 EUR and 900",
+    "800 EUR or roughly 900",
+    "800 EUR, or about 900",
+    "the range is 800 EUR to 900",
+    # ... and the connectors the vocabulary was missing while ``up to`` sat in
+    # its own filler/qualifier lists
+    "EUR 800 up to 900",
+    "EUR 800 through 900",
+    "EUR 800 vs 900",
+    "EUR 800 versus 900",
 ])
 def test_ranges_and_qualifiers_never_type(source):
+    dropped(source, "range_or_qualifier")
+
+
+#: Every connector spelling the vocabulary recognises, so the CLASS is pinned
+#: rather than one instance of it (a connector added to the vocabulary without
+#: reaching :func:`_has_range` reds this, and so does a direction it forgot).
+_RANGE_CONNECTORS = [
+    "-", "\u2013", "\u2014", "/", "to", "and", "or", "up to", "through",
+    "thru", "vs", "versus",
+]
+
+
+@pytest.mark.parametrize("connector", _RANGE_CONNECTORS, ids=repr)
+@pytest.mark.parametrize("order", ["anchor-first", "anchor-last"])
+@pytest.mark.parametrize("filler", ["", "roughly ", "about "])
+def test_a_range_connector_is_found_after_the_amount_in_either_order(
+        connector, order, filler):
+    """The connector search is anchored on the whole anchored FORM, so the
+    direction the anchor sits in cannot matter. Mutation pin: scanning only
+    from ``cand.end`` (the number) instead of ``cand.span_end`` (the form)
+    types the lower bound for every ``anchor-last`` row here — ``800 EUR to
+    900`` → 800.00 — and dropping any connector from
+    :data:`_RANGE_CONNECTOR` types it for that connector."""
+    if order == "anchor-first":
+        source = f"EUR 800 {connector} {filler}900"
+    else:
+        source = f"800 EUR {connector} {filler}900"
     dropped(source, "range_or_qualifier")
 
 
@@ -704,7 +746,9 @@ def test_a_long_input_is_not_quadratic():
     result = normalize_money(source)
     elapsed = time.monotonic() - started
     assert not result.typed
-    assert elapsed < 3.0, f"40 KB took {elapsed:.1f}s — the per-candidate rescan is back"
+    assert elapsed < 3.0, (
+        f"{len(source) // 1024} KB took {elapsed:.1f}s — the per-candidate "
+        f"rescan is back")
 
 
 # ── determinism (design §6/T8) ─────────────────────────────────────────────
