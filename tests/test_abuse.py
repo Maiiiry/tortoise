@@ -335,6 +335,128 @@ class TestEpisodeLifecycle:
         assert len(ip_events) == 10  # cap-before-record
 
 
+class TestActiveFlagEpisodes:
+    """#4874 — the reason behind an org's ``flagged`` chip is readable.
+
+    The chip is derived from a bare ``flagged_at``; the rule/count/threshold/
+    window live only in ``abuse_events``. These pin the read that surfaces
+    them, and — the part that keeps it honest — that it agrees with the
+    ENFORCEMENT path's ``latest_flag_at`` about what "active" means.
+    """
+
+    def test_flag_reports_rule_count_threshold_window(self, notified):
+        store = MemoryAbuseStore()
+        eng = AbuseEngine(store)
+        assert eng.record_point_create("t1", 501, now=T0) == "flag"
+        episodes = store.active_flag_episodes("t1")
+        assert len(episodes) == 1
+        ep = episodes[0]
+        assert ep["rule"] == "point_create"
+        assert ep["count"] == 501
+        assert ep["threshold"] == 500
+        assert ep["window_s"] == 3600
+        assert ep["since"] == T0.isoformat()
+
+    def test_clear_ends_the_episode(self, notified):
+        store = MemoryAbuseStore()
+        eng = AbuseEngine(store)
+        assert eng.record_point_create("t1", 501, now=T0) == "flag"
+        assert store.active_flag_episodes("t1")
+        # window goes clean → flag_clear row, episode gone from the read too
+        assert eng.record_point_create(
+            "t1", 1, now=T0 + timedelta(hours=3)) is None
+        assert store.active_flag_episodes("t1") == []
+
+    def test_rule_scoped_and_newest_first(self, notified):
+        store = MemoryAbuseStore()
+        eng = AbuseEngine(store)
+        assert eng.record_point_create("t1", 501, now=T0) == "flag"
+        later = T0 + timedelta(hours=2)
+        for i in range(11):
+            store.record_event("t1", "key_create", key_id=f"k{i}",
+                               created_at=later)
+        assert eng.evaluate_key_creates("t1", now=later) == "flag"
+        episodes = store.active_flag_episodes("t1")
+        assert [e["rule"] for e in episodes] == ["key_create", "point_create"]
+        assert episodes[0]["threshold"] == 10  # R2's own ceiling, not R1's
+
+    def test_clear_in_the_same_instant_ends_the_episode(self):
+        """Tie rule = ``>=``, the same one ``latest_flag_at`` applies: a clear
+        written at the flag's own instant ends the episode. Pinned because a
+        ``>`` here would resurrect a cleared episode in the operator read while
+        the engine considered it over."""
+        store = MemoryAbuseStore()
+        store.flag_org("t1", "point_create", {}, now=T0)
+        store.flag_clear("t1", "point_create", now=T0)
+        assert store.latest_flag_at("t1", "point_create") is None
+        assert store.active_flag_episodes("t1") == []
+
+    def test_flag_row_without_details_reports_null_not_a_guess(self):
+        store = MemoryAbuseStore()
+        store.record_event("t1", "flag", rule="point_create",
+                           created_at=T0)  # pre-details row
+        [ep] = store.active_flag_episodes("t1")
+        assert ep["count"] is None
+        assert ep["threshold"] is None
+        assert ep["window_s"] is None
+        assert ep["since"] == T0.isoformat()  # the one fact it does carry
+
+    def test_rows_without_a_rule_are_ignored(self):
+        """Breach traffic and the trigger's ``key_create`` rows carry no rule;
+        they must never be folded into an episode (they are not one)."""
+        store = MemoryAbuseStore()
+        store.record_event("t1", "point_create", weight=900, created_at=T0)
+        store.record_event("t1", "key_create", key_id="k", created_at=T0)
+        store.record_event("t1", "auth_ip", country="US", created_at=T0)
+        assert store.active_flag_episodes("t1") == []
+
+    def test_unknown_org_is_empty_not_an_error(self):
+        assert MemoryAbuseStore().active_flag_episodes("nobody") == []
+
+    @pytest.mark.parametrize("sequence", [
+        (),
+        (("flag", 0),),
+        (("flag", 0), ("clear", 60)),
+        (("flag", 0), ("clear", 60), ("flag", 120)),
+        (("flag", 0), ("flag", 10), ("clear", 20)),
+        (("flag", 0), ("flag", 10), ("clear", 10)),
+        (("clear", 0),),
+        (("clear", 0), ("flag", 30)),
+        (("flag", 0), ("clear", 60), ("clear", 90)),
+    ])
+    def test_fold_agrees_with_latest_flag_at(self, sequence):
+        """The read and the DECISION path must not disagree about whether an
+        episode is active — a divergence would have the operator read say
+        "no reason" for an org the engine is actively staging, or invent one
+        it has already cleared. Both are checked per flagging rule."""
+        store = MemoryAbuseStore()
+        for kind, minutes in sequence:
+            when = T0 + timedelta(minutes=minutes)
+            if kind == "flag":
+                store.flag_org("t1", "point_create", {}, now=when)
+            else:
+                store.flag_clear("t1", "point_create", now=when)
+        reported = {e["rule"] for e in store.active_flag_episodes("t1")}
+        from tortoise.abuse import FLAGGING_RULES
+        expected = {r for r in FLAGGING_RULES
+                    if store.latest_flag_at("t1", r) is not None}
+        assert reported == expected
+
+    def test_every_episode_ending_site_walks_every_flagging_rule(self):
+        """``flag_clear`` / ``unsuspend_org`` must end EVERY rule's episode:
+        a rule that flags but was never cleared keeps the org-level chip on
+        forever. Pinned against ``FLAGGING_RULES`` so adding a rule to the
+        tuple is the single place that decides this."""
+        from tortoise.abuse import FLAGGING_RULES
+        store = MemoryAbuseStore()
+        for rule in FLAGGING_RULES:
+            store.flag_org("t1", rule, {}, now=T0)
+        assert len(store.active_flag_episodes("t1")) == len(FLAGGING_RULES)
+        store.unsuspend_org("t1", now=T0 + timedelta(minutes=1))
+        assert store.active_flag_episodes("t1") == []
+        assert store.org_flagged_at("t1") is None
+
+
 class TestSwitches:
     def test_kill_switch(self, monkeypatch, notified):
         monkeypatch.setenv("TORTOISE_ABUSE_DISABLED", "1")

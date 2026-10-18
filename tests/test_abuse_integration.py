@@ -649,6 +649,135 @@ class TestMintGateAndAlerts:
         assert r.json()["status"] == "flagged"
 
 
+# ── Operator reason read (#4874) ────────────────────────────────────────────
+
+_INTERNAL_KEY = "internal-test-key-4874"
+
+
+def _internal_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_INTERNAL_KEY}"}
+
+
+class TestOperatorAbuseState:
+    """#4874: ``status: flagged`` exposes no reason on any customer surface.
+
+    The reason (rule + count + threshold + window) is recorded in
+    ``abuse_events`` and is readable over the OPERATOR route only — the rule
+    names are deliberately absent from ``/v1/team/alerts`` (see
+    ``abuse._alert_dict``), which is why this does not ride ``/v1/team``.
+    """
+
+    def test_requires_the_internal_key(self, env, monkeypatch):
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+        with verdict_client(env["app"]) as tc:
+            bare = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}")
+            org_key = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                             headers=_auth())
+            ok = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                        headers=_internal_headers())
+        assert bare.status_code == 401
+        # An org-scoped tt_ key is NOT an operator credential.
+        assert org_key.status_code == 401
+        assert ok.status_code == 200
+
+    def test_unconfigured_internal_key_is_503_not_open(self, env, monkeypatch):
+        monkeypatch.delenv("FASTAPI_INTERNAL_KEY", raising=False)
+        with verdict_client(env["app"]) as tc:
+            r = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                       headers={"Authorization": "Bearer anything"})
+        assert r.status_code == 503
+
+    def test_reports_the_rule_behind_the_flag(self, env, monkeypatch):
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+        SupabaseAbuseStore(env["fake"]).flag_org(
+            TEAM, "point_create",
+            {"count": 6, "threshold": 5, "window_s": 3600})
+        with verdict_client(env["app"]) as tc:
+            r = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                       headers=_internal_headers())
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "flagged"
+        assert body["flagged_at"] is not None
+        assert body["flags_error"] is None
+        [ep] = body["flags"]
+        assert ep["rule"] == "point_create"
+        assert (ep["count"], ep["threshold"], ep["window_s"]) == (6, 5, 3600)
+        assert ep["since"] is not None
+
+    def test_active_org_reports_no_episode(self, env, monkeypatch):
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+        with verdict_client(env["app"]) as tc:
+            body = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                          headers=_internal_headers()).json()
+        assert body["status"] == "active"
+        assert body["flags"] == []  # readable, and genuinely none
+
+    def test_unreadable_store_is_not_reported_as_no_flags(self, env,
+                                                         monkeypatch):
+        """The two states an operator must never confuse: "no active
+        episode" and "could not read". A failure reports ``flags: null``
+        plus ``flags_error`` — never an empty list."""
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+
+        class _Broken:
+            def org_flagged_at(self, org_id):
+                return None
+
+            def org_suspended(self, org_id):
+                return False
+
+            def active_flag_episodes(self, org_id):
+                raise RuntimeError("abuse_events unreachable")
+
+        monkeypatch.setattr(sc, "get_abuse_store", lambda: _Broken())
+        with verdict_client(env["app"]) as tc:
+            body = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                          headers=_internal_headers()).json()
+        assert body["flags"] is None
+        assert "abuse_events unreachable" in body["flags_error"]
+
+    def test_no_store_at_all_is_null_everywhere_not_active(self, env,
+                                                          monkeypatch):
+        """A store that cannot even be BUILT (broken control-plane config)
+        must not read as a clean org: both answers are null, not "active" /
+        "no flags"."""
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+
+        def _boom():
+            raise RuntimeError("no control plane")
+
+        monkeypatch.setattr(sc, "get_abuse_store", _boom)
+        with verdict_client(env["app"]) as tc:
+            body = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                          headers=_internal_headers()).json()
+        assert body["status"] is None
+        assert body["flags"] is None
+        assert "no control plane" in body["org_state_error"]
+        assert "no control plane" in body["flags_error"]
+
+    def test_cleared_episode_stops_being_reported(self, env, monkeypatch):
+        monkeypatch.setenv("FASTAPI_INTERNAL_KEY", _INTERNAL_KEY)
+        store = SupabaseAbuseStore(env["fake"])
+        store.flag_org(TEAM, "point_create", {"count": 6, "threshold": 5})
+        store.flag_clear(TEAM, "point_create")
+        with verdict_client(env["app"]) as tc:
+            body = tc.get(f"/v1/internal/abuse/state?org_id={TEAM}",
+                          headers=_internal_headers()).json()
+        assert body["flags"] == []
+        assert body["flagged_at"] is None
+        assert body["status"] == "active"
+
+    def test_durable_read_agrees_with_latest_flag_at(self, env):
+        """The operator read folds the SAME rows the enforcement path reads;
+        on the durable store too, both must call the episode active."""
+        store = SupabaseAbuseStore(env["fake"])
+        store.flag_org(TEAM, "point_create", {"count": 6, "threshold": 5})
+        reported = {e["rule"] for e in store.active_flag_episodes(TEAM)}
+        assert reported == {"point_create"}
+        assert store.latest_flag_at(TEAM, "point_create") is not None
+
+
 # ── Turnstile on the signup endpoint ────────────────────────────────────────
 
 class TestTurnstileSignup:

@@ -9620,6 +9620,72 @@ async def org_alerts(org_id: str, user: dict = Depends(get_current_user)):  # no
     return {"org_id": org_id, "alerts": alerts}
 
 
+@app.get("/v1/internal/abuse/state")
+async def internal_abuse_state(request: Request, org_id: str):
+    """Operator-only: WHY an org reads ``status: "flagged"`` (#4874).
+
+    ``GET /v1/team`` renders the status from a bare ``flagged_at`` timestamp
+    and nothing else. The rule that fired, the count that breached it, the
+    threshold and the staging window ARE recorded — ``AbuseEngine.flag_org``
+    writes them into the ``abuse_events`` row — and before this route the only
+    way to read them back was to query that table by hand. That cost a real
+    investigation an hour on a flagged org nobody could explain.
+
+    OPERATOR-ONLY by construction (``_check_internal`` / `FASTAPI_INTERNAL_KEY`;
+    an org-scoped ``tt_`` key cannot satisfy it), and that is a DECISION, not an
+    oversight: ``point_create`` / ``key_create`` are our internal vocabulary and
+    are deliberately absent from every customer surface — ``/v1/team/alerts``
+    carries a customer-facing message with no rule token for exactly this
+    reason (see ``abuse._alert_dict``). A human operator needs the rule; the
+    customer is told what happened. So this does NOT extend ``/v1/team``.
+
+    Read-only. A failed read is NEVER rendered as "nothing is flagged": on a
+    store error ``flags`` is null with ``flags_error`` set, so the two states an
+    operator must never confuse — "there is no active episode" and "I could not
+    read the episodes" — stay distinguishable. ``status`` is null when the org
+    state itself could not be read, for the same reason.
+
+    ``flags`` lists the ACTIVE episodes (newest-first), each with the count /
+    threshold / window recorded at flag time; a flag row written before those
+    fields existed reports ``null`` for them rather than a recomputed guess.
+    """
+    _check_internal(request)
+    from tortoise.supabase_control import get_abuse_store
+
+    def _read() -> dict:
+        """ONE offloaded hop; each read fails to its OWN sentinel."""
+        out: dict = {"org_id": org_id, "status": None, "flagged_at": None,
+                     "suspended": None, "flags": None,
+                     "org_state_error": None, "flags_error": None}
+        try:
+            store = get_abuse_store()
+        except Exception as exc:
+            # No store at all: BOTH answers are unknown, and saying so is the
+            # only honest option — reporting either one as empty/false would
+            # read as "this org is clean".
+            out["org_state_error"] = f"{type(exc).__name__}: {exc}"
+            out["flags_error"] = out["org_state_error"]
+            return out
+        try:
+            flagged_at = store.org_flagged_at(org_id)
+            out["suspended"] = bool(store.org_suspended(org_id))
+            out["flagged_at"] = (flagged_at.isoformat()
+                                 if flagged_at is not None else None)
+            # Mirrors GET /v1/team's derivation EXACTLY (`flagged_at is not
+            # None`) so the two cannot disagree about the chip they describe.
+            out["status"] = ("flagged" if flagged_at is not None
+                             else "active")
+        except Exception as exc:
+            out["org_state_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            out["flags"] = store.active_flag_episodes(org_id)
+        except Exception as exc:
+            out["flags_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    return await asyncio.to_thread(_read)
+
+
 # ── Onboarding: Self-Service Registration (#498) ──────────────────
 
 @app.post("/v1/register", response_model=RegisterResponse)
