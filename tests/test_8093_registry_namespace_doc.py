@@ -22,10 +22,11 @@ Class-B test doctrine:
       doc cell AND from the live derivation functions, so the assertion is
       doc-against-code, never the doc against itself.
 
-Hermetic: two doc reads plus three pure derivations — no fixture, no DB. That is
-why it is registered in ``tier1`` as well as ``core``: a ``docs/``-only diff
-selects no Python surface, so a docs-only edit is exactly the change class this
-pin exists for.
+Hermetic: four file reads (the two docs, plus ``backup_sweep.py`` and
+``mcp_server.py`` for the "still recognised" anchor) and two pure derivations —
+no fixture, no DB. ``tier1`` is the load-bearing registration, not ``core``: a
+``docs/``-only diff takes ``select()``'s early return and runs ``tier1`` alone,
+so a docs-only edit is exactly the change class this pin exists for.
 """
 from __future__ import annotations
 
@@ -43,6 +44,14 @@ _LINE_CITATION = re.compile(r"[\w/]+\.py:\d+")
 CUSTOM_SHAPE = "org_{org_id}_{gid}"   # a custom graph: _graph_namespace / _graph_create
 DEFAULT_SHAPES = ("org_{org_id}", "org_{name}")  # the org namespace (the default graph)
 
+# The default-graph CLAUSE of the cell: the stored-name lead-in (what the ns IS)
+# up to the customs clause. A whole-cell substring test cannot discriminate here
+# — `org_{org_id}` is a substring of `org_{org_id}_{gid}`, stated in the SAME
+# cell for customs, so it stays satisfied by the customs clause alone even after
+# the hosted default-graph clause is deleted. Pinning the clause is what bites.
+_DEFAULT_CLAUSE_START = "the stored `Team.graph_name`:"
+_DEFAULT_CLAUSE_END = "Customs ="
+
 
 def _namespace_cell() -> str:
     """The committed `:Graph` namespace cell — from its key to the next key."""
@@ -50,6 +59,14 @@ def _namespace_cell() -> str:
     start = doc.index("  namespace: string,")
     end = doc.index("  status: string,", start)
     return doc[start:end]
+
+
+def _default_graph_clause() -> str:
+    """The default-graph clause of the cell — from the stored-name lead-in to `Customs`."""
+    cell = _namespace_cell()
+    start = cell.index(_DEFAULT_CLAUSE_START) + len(_DEFAULT_CLAUSE_START)
+    end = cell.index(_DEFAULT_CLAUSE_END, start)
+    return cell[start:end]
 
 
 def _default_graph_bullet() -> str:
@@ -67,9 +84,10 @@ def test_custom_namespace_cell_matches_the_acl_and_provisioning_derivation():
 
     (1) *What value makes this test fail?*  The pre-fix ``team_<org_id>_<gid>``
         restated as the custom shape, or the cell losing the derived shape.
-    (2) *Does the test reach it?*  Yes — the expected string is built from
-        `acl_graph_users._graph_namespace` on a sample (org, gid), so a code
-        change to the derivation reds the doc pin too.
+    (2) *Does the test reach it?*  Yes — the committed cell is compared to a
+        FIXED literal that `acl_graph_users._graph_namespace` is asserted to
+        derive on a sample (org, gid), so a code change to the derivation reds
+        the doc pin too (the literal is the pin's target, not its source).
     """
     from tortoise.acl_graph_users import _graph_namespace
 
@@ -92,10 +110,14 @@ def test_default_graph_namespace_cell_names_the_org_namespace_not_legacy_team():
 
     (1) *What value makes this test fail?*  Re-stating ``team_<name>`` as the
         default graph's namespace (the pre-fix cell), or dropping either
-        hosted/registry variant.
-    (2) *Does the test reach it?*  Yes — `hosted_api._org_graph_name` is the
+        hosted/registry variant from the DEFAULT-GRAPH CLAUSE.
+    (2) *Does the test reach it?*  Yes — the two shapes are asserted against
+        `_default_graph_clause()`, the slice that actually states the default
+        graph's namespace, so deleting the hosted `org_{org_id}` clause reds
+        even though `org_{org_id}` survives as a substring of the custom shape
+        stated later in the same cell. And `hosted_api._org_graph_name` is the
         shared seam the export/open paths use; its no-stored-name fallback is
-        asserted to be `org_{org_id}`, which is what the cell must say.
+        asserted to be `org_{org_id}`, which is what the clause must say.
     """
     from tortoise.hosted_api import _org_graph_name
 
@@ -105,12 +127,17 @@ def test_default_graph_namespace_cell_names_the_org_namespace_not_legacy_team():
         "a stored graph_name wins verbatim — the default graph's namespace "
         "IS that stored name")
 
-    cell = _namespace_cell()
+    clause = _default_graph_clause()
     for shape in DEFAULT_SHAPES:
-        assert shape in cell, (
-            f"§Graph must state {shape!r} as the default graph's namespace")
-    assert "team_<name>" not in cell, (
+        assert shape in clause, (
+            f"§Graph must state {shape!r} in the DEFAULT-graph clause — a bare "
+            "whole-cell substring test cannot see this: `org_{org_id}` is also "
+            f"a substring of the custom shape `{CUSTOM_SHAPE}` stated later in "
+            "the same cell, so the hosted clause can vanish green")
+    assert "team_<name>" not in clause, (
         "the pre-#3543 `team_<name>` is not the default graph's namespace")
+    assert "team_<name>" not in _namespace_cell(), (
+        "the pre-#3543 `team_<name>` must not appear anywhere in the cell")
 
     bullet = _default_graph_bullet()
     assert "graph_name" in bullet and "org_" in bullet, (
@@ -171,6 +198,15 @@ def test_legacy_prefix_is_still_recognised_where_the_doc_says_it_is():
 
 # ── 3. the pin itself cannot rot the way the cell did ──────────────────────
 
+def _coarse_isolation_row() -> str:
+    """The §2.1 coarse-isolation row — the second place this fact is stated."""
+    authz = AUTHZ_DOC.read_text(encoding="utf-8")
+    return next(
+        line for line in authz.splitlines()
+        if line.startswith("| **Coarse isolation**")
+    )
+
+
 def test_namespace_citations_are_by_symbol_never_by_line():
     """Both docs cite this fact by symbol — a `file.py:NNN` here rots silently.
 
@@ -187,14 +223,54 @@ def test_namespace_citations_are_by_symbol_never_by_line():
     assert _LINE_CITATION.findall(_namespace_cell()) == [], (
         "the namespace cell cites code by line number; cite the symbol instead")
 
-    authz = AUTHZ_DOC.read_text(encoding="utf-8")
-    row = next(
-        line for line in authz.splitlines()
-        if line.startswith("| **Coarse isolation**")
-    )
+    row = _coarse_isolation_row()
     assert _LINE_CITATION.findall(row) == [], (
         "the coarse-isolation row cites code by line number; cite the symbol "
         "(`_graph_create`, `_provision_graph`, `_graph_namespace`) instead")
+
+
+def test_coarse_isolation_row_cites_live_migration_anchors():
+    """The row's migration citations resolve, and the legacy origin is stated.
+
+    The coarse-isolation row cites migration files as evidence, and the `graphs`
+    DDL comment in ``20260901000001_graphs_and_key_scopes.sql`` still spells the
+    namespace ``team_{team_id}_{gid}`` — the pre-#3543 shape. Those migration
+    comments cannot be corrected: ``.github/scripts/check-migration-append-only``
+    rejects a CONTENT edit of a migration present in the PR base tree (only a
+    provably-unapplied pure-prefix rename is exempt), which is exactly why
+    #3543 shipped as one new timestamp file that leaves the historical spelling
+    untouched. So the row must also cite the file that says the spelling is
+    HISTORICAL — otherwise a reader who follows the row's own citation lands on
+    the stale shape with nothing marking it.
+
+    (1) *What value makes this test fail?*  Dropping the tenancy-migration anchor
+        from the row (leaving the DDL comment to imply the legacy shape is
+        current), or citing a migration path that does not exist.
+    (2) *Does the test reach it?*  Yes — every cited `supabase/migrations/*.sql`
+        path is resolved on disk, and the tenancy migration's own text is
+        asserted to state that earlier migrations keep the historical spelling.
+    """
+    row = _coarse_isolation_row()
+    cited = re.findall(r"supabase/migrations/[\w.\-]+\.sql", row)
+    assert cited, (
+        "the coarse-isolation row must keep citing the `graphs` table's own "
+        "migration as evidence — do not drop it without a live replacement")
+    for path in cited:
+        assert (REPO / path).is_file(), (
+            f"the coarse-isolation row cites {path!r}, which does not exist — "
+            "a dead citation is the #8093 rot class")
+
+    tenancy = "supabase/migrations/20260915000001_tenancy_team_to_org.sql"
+    assert tenancy in cited, (
+        "the row must cite the #3543 tenancy migration: it is the live anchor "
+        "that says the `team_` spelling in earlier migrations is historical "
+        "(their DDL comments still read `team_{team_id}_{gid}` and cannot be "
+        "edited — check-migration-append-only rejects a content edit)")
+    text = (REPO / tenancy).read_text(encoding="utf-8")
+    assert "historical `team` spelling" in text, (
+        "the cited migration must itself state that earlier migrations keep "
+        "their historical `team` spelling — otherwise the citation does not "
+        "disambiguate the stale DDL comments it is cited for")
 
 
 def test_authz_doc_records_the_finding_as_fixed():

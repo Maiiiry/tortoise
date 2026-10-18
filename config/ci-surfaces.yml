@@ -1086,13 +1086,22 @@ surfaces:
   # `sdk._graph_create`, `hosted_api._provision_graph` / `_org_graph_name`).
   # The cell is the input another lane derives an ACL key pattern from
   # (`docs/authorization-architecture.md` §2.1), and it had gone stale on BOTH
-  # shapes after the #3543 `team_` → `org_` rename. `core` is the classification
-  # home: the derivation spans `tortoise/sdk.py` + `tortoise/hosted_api.py` +
-  # `tortoise/acl_graph_users.py`, none of which is a named surface, so a code
-  # diff that re-derives the shape falls through to `core`. Dual-registered in
-  # `tier1` for the docs-only reason: `docs/` is in NON_PYTHON_PREFIXES, so a
-  # doc-only diff takes `select()`'s early return and runs `tier1` only — which
-  # is exactly the change class that re-stales the cell.
+  # shapes after the #3543 `team_` → `org_` rename.
+  #
+  # `tier1` (below) is the LOAD-BEARING registration; this one is secondary, the
+  # same dual-registration idiom as the `test_7818_ontology_record.py` /
+  # `test_8474_ontology_record.py` doc pins. `tier1` is in EVERY PR selection
+  # (`files = set(tier1)` on the match path, the whole selection on the
+  # docs-only early return, `"ALL"` on full), so the pin runs on a docs-only
+  # diff — the exact change class that re-stales the cell — and on a code diff.
+  #
+  # Do NOT re-read this entry as "`core` covers the code-side diffs": it does
+  # not. `tortoise/hosted_api.py` and `tortoise/acl_graph_users.py` are BOTH
+  # exact `api` SOURCE_PATTERNS matches, so an either-file-only diff selects
+  # `api` and REPLACES the `core` fallback (`core` is added only in the
+  # `if not found:` branch), and `tortoise/sdk.py` is a SHARED_MODULE → full
+  # matrix. Those diffs reach this pin through `tier1`, never through `core`.
+  # The rule is stated the same way ~900 lines above, in the #2969 entry.
   - test_8093_registry_namespace_doc.py
   # #5612: concurrent journal appends are serialised and the recovery read
   # salvages a damaged mid-file line. `tortoise/log.py` matches no
