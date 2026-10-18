@@ -237,14 +237,14 @@ def mask_embedder():
 
 # ── #8746: DELETE a per-run test graph, do not merely empty it ─────────────
 #
-# The families a test-owned per-run graph can legitimately carry. Fail-closed:
-# a name outside these is NEVER deleted by this helper, so a fixture that
-# resolved a shared/product graph by mistake cannot destroy it. Same two
-# prefixes as `_SERVER_WIPE_PREFIXES` (tests/_embedded.py) — the GRAPH.LIST
-# families, which is exactly this helper's input shape (a NAME, no journal
-# attribution): `team_`/`org_` are real tenant graphs and are deliberately
-# absent. CITE SYMBOLS, never line numbers: a line pointer re-stales.
-_TEST_GRAPH_PREFIXES = ("test_", "tortoise_test")
+# The prefix gate is the CANONICAL fail-closed set, `_SERVER_WIPE_PREFIXES` in
+# `tests/_embedded.py` — IMPORTED, never restated (see `drop_test_graph`).
+# Fail-closed: a name outside it is never deleted by this helper, so a fixture
+# that resolved a shared/product graph by mistake cannot destroy it. That set
+# is the GRAPH.LIST family, which is exactly this helper's input shape (a NAME,
+# no journal attribution): `team_`/`org_` are real tenant graphs and are
+# deliberately absent. CITE SYMBOLS, never line numbers: a line pointer
+# re-stales.
 
 
 def drop_test_graph(proj, *, name: str | None = None) -> bool:
@@ -283,13 +283,27 @@ def drop_test_graph(proj, *, name: str | None = None) -> bool:
     already absent or the name was refused. Never raises: a failed teardown
     must not red a suite, and the session sweep remains the backstop (this is
     the same log-and-continue policy as ``_sweep_drop``).
+
+    The prefix gate imports the canonical ``_SERVER_WIPE_PREFIXES`` rather than
+    restating it. A NAMED local copy would sit outside every ``#3634`` drift
+    guard (``tests/_embedded.py``'s ONE declaration + ``_DIVERGENCE_REGISTER``,
+    ``tests/test_graph_name_ownership.py``'s object-identity tie and its
+    named-constant scanner), so if the canonical set were ever NARROWED (as it
+    deliberately was in ``#7795``) this helper would keep ``GRAPH.DELETE``-ing a
+    family the canonical GRAPH.LIST set no longer authorises — fail-OPEN on an
+    irreversible delete. Function-local because this module is deliberately
+    light (no ``pytest`` / ``tortoise.projection`` at module scope); the import
+    resolves the LIVE module attribute on every call, so it is the canonical
+    set of the moment that the gate consults.
     """
+    from tests._embedded import _SERVER_WIPE_PREFIXES
+
     gname = name if name is not None else getattr(proj, "graph_name", None)
-    if not isinstance(gname, str) or not gname.startswith(_TEST_GRAPH_PREFIXES):
+    if not isinstance(gname, str) or not gname.startswith(_SERVER_WIPE_PREFIXES):
         logger.warning(
             "[#8746] refusing to GRAPH.DELETE %r — not a test-owned graph "
             "name (prefix gate: %s); left untouched", gname,
-            _TEST_GRAPH_PREFIXES)
+            _SERVER_WIPE_PREFIXES)
         return False
     try:
         from tortoise.graph_delete_guard import safe_graph_delete
