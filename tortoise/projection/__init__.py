@@ -3690,6 +3690,14 @@ _ENTITY_CREATION_EVENT_LABEL: dict[str, str] = {
 #: so a new creation row there cannot drift from this literal silently.
 _REFERENCE_FOLD_ENTITY_LABELS: frozenset[str] = frozenset(
     _ENTITY_CREATION_EVENT_LABEL.values())
+#: The epistemic labels whose graph node is MERGEd BY NAME (`_upsert_object` /
+#: `_upsert_subject`), so a later registration of ONE name under a fresh id
+#: RE-IDS the node (`ON MATCH SET o.id=$id`) and the earlier id stops matching
+#: `MATCH (n:$label {id:$rid})`. An id-keyed label (`Event` under `eventId`,
+#: `Point`/`Operator` under `id`) never collapses. Declared in this LOWER module
+#: so the belief exemption here and the state-op guard in `consistency` read ONE
+#: home (``consistency`` already imports from this module).
+_NAME_MERGE_LABELS: frozenset[str] = frozenset({"Object", "Subject"})
 _CANONICAL_ENTITY_SECONDARY_BY_LABEL: dict[str, tuple[str, ...]] = {
     label: tuple(prop for lbl, prop in _CANONICAL_ENTITY_SECONDARY_ID_PROPS
                  if lbl == label)
@@ -4201,6 +4209,171 @@ def journal_epistemic_existence(events) -> dict:
             for key in set(creates) | set(deletes)}
 
 
+def journal_name_merge_carriers(events) -> dict:
+    """The seq intervals during which a name-MERGE id owns a graph node.
+
+    ``{(label, id): ((start, end), ...)}`` — half-open ``[start, end)`` ranges
+    in journal-seq space. ``_upsert_object`` / ``_upsert_subject`` MERGE the
+    node BY NAME and re-id it (``ON MATCH SET o.id=$id``), so a later
+    registration of ONE name under a fresh id makes the earlier id match 0
+    rows in the replay's ``MATCH (n:{label} {id:$rid})``. The belief exemption
+    reads this so it does not call such a target EXISTING and mask a genuine
+    ``point-belief-miss`` (#7936 review P1) — the tail of the
+    ``create → re-register-same-name → belief`` shape.
+
+    The walk mirrors ``consistency._fold_journal_entities``'s carrier index
+    (``merge_key_by_id`` / ``carriers_by_name``) so the reference and graph
+    folds reach ONE verdict: a creation moves its id onto its name's carrier
+    set (dropping any previous name), a hard delete removes it, and a state-op
+    rename moves the id to the new name WITHOUT re-iding (a rename never
+    merges, so a shared name keeps both carriers). ``Event`` is id-keyed and
+    ``Point``/``Operator`` are ``id``-keyed, so neither is tracked. An id whose
+    creation had no writable merge key owns no node (``no_node_ids``).
+
+    ``None`` for the whole map is the one-record LIVE path (no journal): the
+    caller cannot decide and stays fail-OPEN. An id the walk NEVER created has
+    no interval — the callers only reach this predicate for an id the ordered
+    boundary already reports ``EXISTS``, which for a name-MERGE label means the
+    walk saw its creation, so an absent interval is a genuine dead node.
+    """
+    merge_key_by_id: dict[tuple[str, str], str] = {}
+    carriers_by_name: dict[tuple[str, str], set] = {}
+    no_node_ids: set[tuple[str, str]] = set()
+    intervals: dict[tuple[str, str], list] = {}
+    live_start: dict[tuple[str, str], int] = {}
+
+    def _open(key: tuple[str, str], seq: int) -> None:
+        live_start.setdefault(key, seq)
+
+    def _close(key: tuple[str, str], seq: int) -> None:
+        start = live_start.pop(key, None)
+        if start is not None:
+            intervals.setdefault(key, []).append((start, seq))
+
+    def _drop(label: str, eid: str, seq: int) -> None:
+        old = merge_key_by_id.pop((label, eid), None)
+        if old is not None:
+            carriers = carriers_by_name.get((label, old))
+            if carriers is not None:
+                carriers.discard(eid)
+        no_node_ids.discard((label, eid))
+        _close((label, eid), seq)
+
+    for seq, raw in enumerate(events):
+        ev = _norm(raw) if isinstance(raw, dict) else {}
+        t = ev.get("type")
+        if t in _ENTITY_CREATION_EVENT_LABEL:
+            label = _ENTITY_CREATION_EVENT_LABEL[t]
+            if label not in _NAME_MERGE_LABELS:
+                continue
+            eid = _creation_entity_id_from_record(t, ev)
+            if not (isinstance(eid, str) and eid):
+                continue
+            name = ev.get("name")
+            old = merge_key_by_id.pop((label, eid), None)
+            if old is not None:
+                carriers = carriers_by_name.get((label, old))
+                if carriers is not None:
+                    carriers.discard(eid)
+            if _writable_id(name):
+                merge_key_by_id[(label, eid)] = name
+                no_node_ids.discard((label, eid))
+                _open((label, eid), seq)
+                live = carriers_by_name.setdefault((label, name), set())
+                if len(live) > 1:
+                    # A rename collision already left >1 carrier: the MERGE
+                    # re-ids exactly one and the journal does not say which,
+                    # so keep them all (fail-OPEN, exactly the state-op
+                    # guard's choice).
+                    live.add(eid)
+                else:
+                    for other in live:
+                        if other != eid:
+                            _close((label, other), seq)
+                    live.clear()
+                    live.add(eid)
+            elif old is None:
+                # No writable MERGE key and no existing key → the graph
+                # writes NO node for this id (``_upsert_object`` returns
+                # early). It is a 0-row miss for the belief fold.
+                no_node_ids.add((label, eid))
+            # else: an UNUSABLE name on an id that ALREADY has a key is a
+            # graph NO-OP — `MERGE` on the unchanged key keeps the node and
+            # its id, so the existing key and liveness are PRESERVED.
+        elif t == "EntityMutated":
+            eid = ev.get("id")
+            if not isinstance(eid, str):
+                continue
+            op = ev.get("op")
+            label = ev.get("label")
+            if op == "delete":
+                if (isinstance(label, str)
+                        and label in _CANONICAL_ENTITY_LABELS):
+                    if label in _NAME_MERGE_LABELS:
+                        _drop(label, eid, seq)
+                else:
+                    # Legacy id-wide delete: `_delete_entity_by_id` falls back
+                    # to removing the id across every label.
+                    for lbl in _NAME_MERGE_LABELS:
+                        _drop(lbl, eid, seq)
+            elif (op in _ENTITY_MUTATION_STATE_OPS
+                  and isinstance(label, str)
+                  and label in _NAME_MERGE_LABELS):
+                state = ev.get("state")
+                if not isinstance(state, dict) or "name" not in state:
+                    continue
+                # The SAME gate the state-op guard applies: a rename folds
+                # only when the id is a live carrier of its own name —
+                # otherwise the graph's `MATCH (n:$label {id:$rid})` is a
+                # 0-row no-op and the id stays dead.
+                if (label, eid) in no_node_ids:
+                    continue
+                carrier_name = merge_key_by_id.get((label, eid))
+                if carrier_name is not None:
+                    live = carriers_by_name.get((label, carrier_name))
+                    if live is not None and eid not in live:
+                        continue
+                newname = state.get("name")
+                old = merge_key_by_id.pop((label, eid), None)
+                if old is not None:
+                    carriers = carriers_by_name.get((label, old))
+                    if carriers is not None:
+                        carriers.discard(eid)
+                if isinstance(newname, str) and newname:
+                    merge_key_by_id[(label, eid)] = newname
+                    carriers_by_name.setdefault(
+                        (label, newname), set()).add(eid)
+                    _open((label, eid), seq)
+                elif old is not None:
+                    # A rename to an unusable key leaves the graph node's
+                    # identity undefined for this fold — fail-OPEN (keep the
+                    # id live) so an unmodelled shape never becomes a false
+                    # refusal.
+                    _open((label, eid), seq)
+    for key, start in live_start.items():
+        intervals.setdefault(key, []).append((start, len(events)))
+    return {key: tuple(spans) for key, spans in intervals.items()}
+
+
+def _carrier_live_at(carriers, label: str, rid: str, seq) -> bool:
+    """True when ``(label, rid)`` owns a graph node at ``seq``.
+
+    Reads :func:`journal_name_merge_carriers`. ``None`` for the map is the
+    one-record LIVE path — cannot decide, so fail-OPEN (True) and let the
+    existing existence verdict stand. For a name-MERGE label the walk models
+    EVERY creation, so an id with no covering interval is a genuine dead node
+    (collapsed away by a later same-name registration, or created with an
+    unwritable MERGE key) — NOT exempt. A non-name-merge caller never reaches
+    here.
+    """
+    if carriers is None:
+        return True
+    spans = carriers.get((label, rid))
+    if not spans:
+        return False
+    return any(start <= seq < end for start, end in spans)
+
+
 def _existence_state(creates, deletes, seq) -> str:
     """Did ``(label, id)`` EXIST at ``seq``? One of the four states above.
 
@@ -4261,7 +4434,8 @@ def _epistemic_forward_reference(existence, rid, seq) -> bool:
     return future
 
 
-def _reference_fold_non_point_target(existence, rid, journal_seq) -> bool:
+def _reference_fold_non_point_target(existence, rid, journal_seq,
+                                     carriers=None) -> bool:
     """True when the journal materializes ``rid`` as a REFERENCE-FOLD entity
     (``:Subject`` / ``:Object`` / ``:Event``) that EXISTS at ``journal_seq``.
 
@@ -4298,8 +4472,18 @@ def _reference_fold_non_point_target(existence, rid, journal_seq) -> bool:
         return False
     for label in _REFERENCE_FOLD_ENTITY_LABELS:
         creates, deletes = existence.get((label, rid), ((), ()))
-        if _existence_state(creates, deletes, journal_seq) == _EXISTENCE_EXISTS:
-            return True
+        if _existence_state(creates, deletes, journal_seq) != _EXISTENCE_EXISTS:
+            continue
+        if (label in _NAME_MERGE_LABELS
+                and not _carrier_live_at(carriers, label, rid, journal_seq)):
+            # #7936 review P1: the id EXISTS in the journal boundary but its
+            # graph NODE was re-id'd away by a later same-name registration
+            # (`_upsert_object` / `_upsert_subject` MERGE by NAME), so the
+            # replay's `MATCH (n:{label} {id:$rid})` is a 0-row miss. Do NOT
+            # exempt — the write must be refused here too, or the diagnostic
+            # calls HEALTHY a graph `rebuild_all` refuses.
+            continue
+        return True
     return False
 
 
@@ -4417,7 +4601,8 @@ def _apply_one(points: dict[str, dict], ev: dict,
                journal_first_materialized: dict[tuple[str, str], int]
                | None = None,
                journal_seq: int | None = None,
-               journal_existence: dict | None = None) -> None:
+               journal_existence: dict | None = None,
+               journal_carriers: dict | None = None) -> None:
     """Fold ONE normalized journal record into the pure point index.
 
     ``journal_first_materialized`` / ``journal_seq`` are the whole-journal
@@ -4433,7 +4618,14 @@ def _apply_one(points: dict[str, dict], ev: dict,
     :func:`_reference_fold_non_point_target`) — a last-delete-wins membership
     map cannot express re-creation or a delete on either side of the write.
 
-    All three default to ``None`` for a bare ``_apply_one(points, ev)`` (no
+    ``journal_carriers`` is the name-MERGE carrier index
+    (:func:`journal_name_merge_carriers`). The confidence arm ALSO consults it
+    so an id whose node was re-id'd away by a later same-name Object/Subject
+    registration is NOT exempted (the replay's id MATCH is a 0-row miss there —
+    #7936 review P1). ``None`` on the one-record LIVE path cannot decide, so the
+    exemption stays fail-OPEN.
+
+    All four default to ``None`` for a bare ``_apply_one(points, ev)`` (no
     journal to consult), which preserves the pre-existing behaviour.
     """
     ev = _norm(ev)
@@ -4699,7 +4891,7 @@ def _apply_one(points: dict[str, dict], ev: dict,
                 p[key] = value
         elif (_writable_id(rid) and _has_prop
                 and _reference_fold_non_point_target(
-                    journal_existence, rid, journal_seq)):
+                    journal_existence, rid, journal_seq, journal_carriers)):
             # #7936 interim: the id IS materialized by the journal — as a
             # `:Subject`/`:Object`/`:Event`. `points` cannot represent it, so
             # this point-only fold DROPS the belief (the graph fold does not).
@@ -4786,11 +4978,18 @@ def fold(events: list[dict]) -> dict[str, dict]:
     # deletes on either side of the write), and rebuilding it per record is the
     # O(N²) class this module already fixed.
     existence = journal_epistemic_existence(events)
+    # #7936 review: the name-MERGE carrier index, hoisted ONCE beside the
+    # existence boundary. The non-Point belief exemption asks whether the
+    # Object/Subject target still OWNS its node at this record; a later
+    # same-name registration re-ids it away and the graph fold's id MATCH is a
+    # 0-row miss, so the exemption must not suppress that refusal.
+    carriers = journal_name_merge_carriers(events)
     for seq, ev in enumerate(events):
         _apply_one(points, ev,
                    journal_first_materialized=first_materialized,
                    journal_seq=seq,
-                   journal_existence=existence)
+                   journal_existence=existence,
+                   journal_carriers=carriers)
     return points
 
 

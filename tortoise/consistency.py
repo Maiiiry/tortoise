@@ -58,6 +58,7 @@ from .projection import (
     _CANONICAL_ENTITY_LABELS,
     _ENTITY_ID_PROP,
     _ENTITY_MUTATION_STATE_OPS,
+    _NAME_MERGE_LABELS,
     _REFERENCE_FOLD_ENTITY_LABELS,
     _annotator_value_ok,
     _apply_one,
@@ -73,6 +74,7 @@ from .projection import (
     journal_epistemic_existence,
     journal_first_materialization,
     journal_hard_delete_seqs,
+    journal_name_merge_carriers,
     journal_object_surviving_keys,
     plan_point_restamp_folds,
     prewipe_snapshot_path,
@@ -936,6 +938,11 @@ def _fold_journal(events: list[dict]) -> dict:
     # side of the write, so the reference verdict would disagree with
     # `rebuild_all`.
     _epistemic_existence = journal_epistemic_existence(events)
+    # #7936 review P1: the name-MERGE carrier index, so the non-Point belief
+    # exemption does not call an id EXISTING when a later same-name Object /
+    # Subject registration re-id'd its graph node away (the graph fold's id
+    # MATCH is then a 0-row miss). Same reader as the pure `fold()`.
+    _epistemic_carriers = journal_name_merge_carriers(events)
     by_id: dict = {}
     for seq, ev in enumerate(events):
         # Same normalisation the writer applies (`_apply_one`/`apply`): the
@@ -1082,7 +1089,8 @@ def _fold_journal(events: list[dict]) -> dict:
         _apply_one(by_id, ev,
                    journal_first_materialized=_first_materialized,
                    journal_seq=seq,
-                   journal_existence=_epistemic_existence)
+                   journal_existence=_epistemic_existence,
+                   journal_carriers=_epistemic_carriers)
         # #4208: a content EDIT re-derives the vector. The live `update_point`
         # and the replay's `_revise_point` both re-encode from the new content,
         # so the journal states no vector for the edited point — yet the entry
@@ -1214,7 +1222,11 @@ _ENTITY_CREATION_LABELS: frozenset[str] = _REFERENCE_FOLD_ENTITY_LABELS
 #: `journal_object_surviving_keys` is deliberately Object-only (it models
 #: `_upsert_object` alone) and `_graph_entities` indexes EVERY label, so
 #: neither can share this constant without changing what it means.
-_NAME_MERGE_LABELS: frozenset[str] = frozenset({"Object", "Subject"})
+#: The name-MERGE labels (``Object`` / ``Subject``). Defined ONCE in the
+#: projection (the lower module `consistency` already imports from) so the
+#: belief exemption there and this state-op guard cannot drift. See
+#: `projection._NAME_MERGE_LABELS`.
+_NAME_MERGE_LABELS: frozenset[str] = _NAME_MERGE_LABELS
 
 
 def _creation_entity_id(t: str, ev: dict) -> object:

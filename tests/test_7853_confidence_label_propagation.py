@@ -775,8 +775,8 @@ def test_dream_writeback_persists_full_precision_for_non_point(sdk):
 _MATRIX_ID = "n-7936-matrix"
 
 
-def _m_object(nid: str = _MATRIX_ID) -> dict:
-    return {"type": "ObjectRegistered", "id": nid, "name": "matrix-obj"}
+def _m_object(nid: str = _MATRIX_ID, name: str = "matrix-obj") -> dict:
+    return {"type": "ObjectRegistered", "id": nid, "name": name}
 
 
 def _m_delete(label=None, nid: str = _MATRIX_ID) -> dict:
@@ -825,6 +825,20 @@ _BOUNDARY_MATRIX = [
     # the P2-2 shape: the write PRECEDES its own materialization.
     ("belief-forward-references-its-materialization",
      [_m_belief(), _m_object()], False),
+    # #7936 review P1: the name-MERGE collapse. Object/Subject MERGE by NAME
+    # and re-id the node, so the SECOND registration of one name collapses
+    # the first id and the replay's `MATCH (n:Object {id:$rid})` is a 0-row
+    # miss. When the re-registration came FIRST, the belief is a genuine
+    # miss; when it came AFTER, the chronological apply folded the write onto
+    # the then-live node and the target is exempt.
+    ("name-collapse-reid-away-before-belief",
+     [_m_object(), _m_object("n-7936-other"), _m_belief()], True),
+    ("name-collapse-reid-away-after-belief",
+     [_m_object(), _m_belief(), _m_object("n-7936-other")], False),
+    # An unwritable MERGE key writes NO node (`_upsert_object` early-returns),
+    # so the belief is a 0-row miss on the graph and must be refused here too.
+    ("unwritable-merge-key",
+     [_m_object(name=""), _m_belief()], True),
 ]
 
 
@@ -919,6 +933,86 @@ def test_boundary_matrix_non_point_labels_all_agree():
             fold(buried)
         assert any("x" in str(e) for e in refused_events(entries)), (
             label, [str(e) for e in entries])
+
+
+def test_journal_name_merge_carriers_intervals():
+    """The carrier walk: a second same-name id evicts the first, ending the
+    evicted id's live interval at the eviction seq; a re-creation reopens it.
+
+    This is the substrate of the belief exemption — the reference fold reads
+    these intervals to decide whether an Object/Subject id still OWNS its
+    graph node at a record. Pinned directly so a change to the walk cannot
+    silently re-open the fail-OPEN the boundary matrix closes.
+    """
+    from tortoise.projection import journal_name_merge_carriers
+
+    x, y = "cx", "cy"
+
+    def obj(nid):
+        return {"type": "ObjectRegistered", "id": nid, "name": "n"}
+
+    cars = journal_name_merge_carriers([obj(x), obj(y)])
+    assert cars[("Object", x)] == ((0, 1),), cars
+    assert cars[("Object", y)] == ((1, 2),), cars
+
+    # re-registration of x AFTER y: x owns [0,1) then [2,3), y owns [1,2)
+    cars = journal_name_merge_carriers([obj(x), obj(y), obj(x)])
+    assert cars[("Object", x)] == ((0, 1), (2, 3)), cars
+    assert cars[("Object", y)] == ((1, 2),), cars
+
+    # Event is id-keyed (`eventId`): never tracked, so it never collapses
+    cars = journal_name_merge_carriers(
+        [{"type": "EventRecorded", "id": x, "name": "n"},
+         {"type": "EventRecorded", "id": y, "name": "n"}])
+    assert cars == {}, cars
+
+
+def test_reference_fold_refuses_a_belief_on_a_name_collapsed_non_point():
+    """#7936 review P1 — the name-MERGE collapse is NOT an exemption.
+
+    `_upsert_object` / `_upsert_subject` MERGE the node BY NAME and re-id it
+    (`ON MATCH SET o.id=$id`), so when the SECOND registration of one name
+    lands BEFORE the belief write, the first id matches 0 rows in the replay's
+    `MATCH (n:{label} {id:$rid})`. The exemption must record a
+    `point-belief-miss` there, or `check_consistency` calls HEALTHY a graph
+    `rebuild_all` refuses. The mirror ordering (re-registration AFTER the
+    write) folds chronologically onto the then-live node and must stay exempt.
+
+    Pure reference fold — the graph side is pinned by the `name-collapse-*`
+    rows of `test_boundary_matrix_reference_and_graph_agree`.
+    """
+    from tortoise.projection import fold
+    from tortoise.projection.nonfolded import collect_non_folded, refused_events
+
+    x, y = "collapse-x", "collapse-y"
+    belief = {"type": "ConfidenceChanged", "id": x, "confidence": 0.7}
+
+    def check(events):
+        with collect_non_folded() as entries:
+            fold(list(events))
+        return any(x in str(e) for e in refused_events(entries)), [
+            str(e) for e in entries]
+
+    # re-registration FIRST → the first id is collapsed away before the write
+    refused, entries = check([
+        {"type": "ObjectRegistered", "id": x, "name": "collapse-name"},
+        {"type": "ObjectRegistered", "id": y, "name": "collapse-name"},
+        belief])
+    assert refused, ("collapsed-away Object id must be refused", entries)
+
+    # re-registration AFTER → the write folded onto the then-live node
+    refused, entries = check([
+        {"type": "ObjectRegistered", "id": x, "name": "collapse-name"},
+        belief,
+        {"type": "ObjectRegistered", "id": y, "name": "collapse-name"}])
+    assert not refused, ("a write before the collapse must stay exempt", entries)
+
+    # the mirror for Subject (same name-MERGE rule)
+    refused, entries = check([
+        {"type": "SubjectAdded", "id": x, "name": "collapse-name"},
+        {"type": "SubjectAdded", "id": y, "name": "collapse-name"},
+        belief])
+    assert refused, ("collapsed-away Subject id must be refused", entries)
 
 
 def test_content_comparison_known_gap_non_point_belief_is_invisible(tmp_path):
