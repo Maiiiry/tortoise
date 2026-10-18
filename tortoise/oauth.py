@@ -705,17 +705,22 @@ def _canonical_redirect_target(registered: str, presented: str) -> str:
     The registered URI's scheme, authority, path, query and fragment, with the
     presented port applied. Only the port comes from the request: that is the
     component RFC 8252 §7.3 requires the AS to ignore, so it is the only one
-    that may legitimately differ, and copying its TEXT (never re-rendering it
-    from a parsed int) keeps the emitted string free of the presented
-    authority's bytes.
+    that may legitimately differ. ⚠️ The port IS still a component of the
+    authority (RFC 3986 §3.2), so its digits are the ONE thing in the emitted
+    string the request controls — and they are copied as TEXT, never re-rendered
+    from a parsed int (which would substitute digits the request did not send),
+    and admitted only when they are ASCII `*DIGIT` inside 0–65535. Everything
+    else — scheme, host, userinfo, path, query, fragment — is the registered
+    side's.
 
     For every pair the current matcher accepts, the result is byte-identical to
     the PRESENTED string except (a) where only the case of the scheme or the
     host differs — `_redirect_uri_matches` compares those case-insensitively,
-    and the authority is re-emitted from the registered side — and (b) a
-    presented port no URI may carry, where the registered authority stands. So
-    this changes nothing where the current code works and nothing where it does
-    not.
+    and the authority is re-emitted from the registered side — (b) a presented
+    port no URI may carry, where the registered authority stands, and (c) an
+    EMPTY presented port (`http://host:/cb`), which names the scheme default and
+    is emitted without its colon. So this changes nothing where the current code
+    works and nothing where it does not.
 
     Total (never raises) and idempotent: rebuilding from a rebuilt target
     returns it unchanged.

@@ -1166,9 +1166,9 @@ class TestCanonicalRedirectTarget:
     parsers can disagree about, revisited three times in review. #3443 removes
     the class: `_canonical_redirect_target` re-emits the REGISTERED URI's scheme,
     authority, path and query and copies only the presented PORT (RFC 8252 §7.3
-    — the one component allowed to vary), so no byte of the presented authority
-    reaches the browser and the two parsers cannot move the host BY
-    CONSTRUCTION. The byte gate is kept as defence in depth (it is still
+    — the one component allowed to vary), so the port's ASCII digits are the
+    only request bytes that can reach the browser and the two parsers cannot
+    move the host BY CONSTRUCTION. The byte gate is kept as defence in depth (it is still
     load-bearing on the registered side — the rebuild trusts that value).
 
     Four legs, each with the control that makes it discriminating:
