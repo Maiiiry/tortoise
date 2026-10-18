@@ -642,7 +642,7 @@ Dedup once per org (analytics.py pattern); dashboard + server records; no thresh
 
 **Setup:** (a) org where agent connected but no decide (incomplete, NEW flow); (b) legacy org with jsonb onboarding_state pre-seeded (for backfill assertions).
 **Steps:** re-enter via the Settings Setup guide or the Continue-setup card; run backfill on (b).
-**Assert:** resumes at "first decision" (never restarts); state read from OnboardingState node (not jsonb) for FLOW keys; the Settings Setup guide renders the same graph-held state as the Overview next action — ONE next step + a CTA into the guide, never a counted checklist of its own; the Overview card carries no dismissal; **legacy backfill: (b)'s jsonb → node is a no-op on re-run; grandfathered orgs keep onboarding_complete; operational keys (github_*, session_recording) still read from jsonb and work** (P1 fix — backfill now actually tested).
+**Assert:** resumes at "first decision" (never restarts); state read from OnboardingState node (not jsonb) for FLOW keys; the Settings Setup guide is the counted checklist card and renders the same graph-held state (its recorded decision: collapse to compact status or dismissible-hide with a re-open path when complete); the Overview next action is ONE next step + a CTA into that guide, never a counted checklist of its own, and carries no dismissal; **legacy backfill: (b)'s jsonb → node is a no-op on re-run; grandfathered orgs keep onboarding_complete; operational keys (github_*, session_recording) still read from jsonb and work** (P1 fix — backfill now actually tested).
 
 ### DE2E-7 — Invite fusion [12] — E2E-7 (most failure-prone)
 
