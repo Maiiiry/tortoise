@@ -78,8 +78,8 @@ the absent-graph test; dropping the predicate from the gate query reds the parit
   dream-cycle pass and a sweep pass for the same graph can overlap. The contract already covers it
   (at-least-once + a stable `X-Tortoise-Delivery` id ⇒ the consumer must be idempotent), and the
   in-flight set removes the sweep-vs-sweep overlap. A monotone `cursor` write (`CASE WHEN s.cursor
-  < $cursor`) would close the dream-vs-sweep duplicate window too — filed as a follow-up rather
-  than smuggled into a trigger PR, because it changes the delivery engine's write, not its schedule.
+  < $cursor`) would close the dream-vs-sweep duplicate window too — filed as **#9032** rather than
+  smuggled into a trigger PR, because it changes the delivery engine's write, not its schedule.
 * **Per-graph time bound.** A pass is bounded by the executor size and `TIMEOUT_S` per POST, not by
   a wall clock; a graph with 25 healthy-but-slow subscriptions can outlive the interval. The
   in-flight set makes that safe (the next pass skips it) rather than queued.
