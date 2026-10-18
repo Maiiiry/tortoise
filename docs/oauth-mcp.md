@@ -86,9 +86,11 @@ needs no client_id paste.
    — the single component RFC 8252 §7.3 permits to vary — and that is the value
    the page navigates (embedded as `redirect_target`, returned alongside the
    code by `POST /oauth/consent`) and the value echoed into the `error=`
-   redirect on the pre-consent failure path. No byte of the presented authority
-   reaches the browser, so a parser differential cannot move the host whatever
-   the two parsers disagree about, and the byte gate becomes defence in depth
+   redirect on the pre-consent failure path. Nothing the request sends reaches
+   the browser except the **port's digits** — no presented scheme, host,
+   userinfo, path, query or fragment does — so a parser differential cannot move
+   the host whatever the
+   two parsers disagree about, and the byte gate becomes defence in depth
    rather than the boundary. It is **not** retired: the rebuild trusts the
    registered URI, so those bytes must still be refused at registration (a
    differential string in a client row would be navigated with the server's own

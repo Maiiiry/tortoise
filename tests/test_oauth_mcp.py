@@ -1277,6 +1277,20 @@ class TestCanonicalRedirectTarget:
         from tortoise.oauth import _canonical_redirect_target as build
         assert build("http://localhost/cb", "http://[::1/cb") == "http://localhost/cb"
         assert build("http://[::1/cb", "http://localhost/cb") == "http://[::1/cb"
+        # A port text long enough that `int()` raises (CPython's
+        # sys.get_int_max_str_digits(), 4300) must be REFUSED, not converted:
+        # `GET /oauth/authorize` is unauthenticated, so a raise here answered
+        # 500 for plain client input where the contract is a 400. The registered
+        # authority stands, exactly as for `:abc`.
+        long_port = "9" * 4301
+        assert build("http://localhost/cb", f"http://localhost:{long_port}/cb") \
+            == "http://localhost/cb"
+        # …and leading zeros are still NETLOC TEXT the browser parses: the
+        # builder copies the presented port's text rather than re-rendering it
+        # from an int, so the zeros survive (and the value resolves to 3118).
+        assert build("http://localhost:8787/cb",
+                     "http://localhost:000003118/cb") \
+            == "http://localhost:000003118/cb"
         # idempotent: re-targeting a rebuilt value yields that value
         for registered, presented in (("http://localhost/cb", "http://localhost:3118/cb"),
                                       ("http://localhost:8787/cb", "http://localhost:abc/cb")):

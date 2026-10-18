@@ -635,8 +635,9 @@ def _redirect_uri_matches(registered: str | None,
 #
 # Rebuilding the target from the REGISTERED URI's components with only the
 # presented PORT applied (RFC 8252 §7.3 — the one component permitted to vary)
-# removes the requirement instead of enumerating its cases: no byte of the
-# presented authority ever reaches the browser, so a differential cannot move
+# removes the requirement instead of enumerating its cases: nothing the request
+# sends can reach the browser EXCEPT the port's digits — no presented scheme,
+# host, userinfo, path, query or fragment does — so a differential cannot move
 # the host whatever the two parsers disagree about. The rebuild deliberately
 # takes the authority from the REGISTERED side — rebuilding it from the
 # PRESENTED components would re-emit the presented authority verbatim and keep
@@ -682,9 +683,20 @@ def _navigable_port(port_text: str) -> bool:
     ``\u0663`` and ``int()`` accepts them, but the WHATWG port parser does not —
     an ASCII-only grammar is what keeps this a rebuild of the registered URI
     rather than a re-introduction of the request's bytes.
+
+    ⚠️ The LENGTH bound is load-bearing, not tidiness: ``int()`` on a digit
+    string longer than ``sys.get_int_max_str_digits()`` (4300) RAISES
+    ``ValueError``, so converting first would make a 4301-digit port text an
+    unhandled error on the unauthenticated ``/oauth/authorize`` path — the
+    caller's last-resort handler then answers 500 for plain client input, where
+    the contract is a 400. ``lstrip("0")`` first, so a port spelled with
+    leading zeros (`:000008080`) still compares as the number it denotes.
     """
-    return (port_text.isascii() and port_text.isdigit()
-            and int(port_text) <= _PORT_TEXT_MAX)
+    if not (port_text.isascii() and port_text.isdigit()):
+        return False
+    significant = port_text.lstrip("0") or "0"
+    return (len(significant) <= len(str(_PORT_TEXT_MAX))
+            and int(significant) <= _PORT_TEXT_MAX)
 
 
 def _canonical_redirect_target(registered: str, presented: str) -> str:

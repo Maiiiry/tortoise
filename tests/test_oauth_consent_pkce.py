@@ -848,11 +848,19 @@ def test_3443_navigation_uses_the_server_built_target_with_a_raw_guard_control()
         "the deny path reached /oauth/consent — this arm no longer pins the "
         f"no-round-trip source: {deny['minted']}"
     )
-    # (b) the mint response carries the target; the page prefers it
+    # (b) the mint response carries the target, and the page PREFERS it over the
+    # page-scoped one. The two values are made to DIFFER here, because passing
+    # the same string in both places cannot distinguish "read
+    # `payload.redirect_target`" from "read `PARAMS.redirect_target`" — the
+    # assertion would stay green with the response value dropped or mis-wired.
+    minted_target = "https://client.example/cb-from-the-mint"
     minted = _run("consent_code", page=page, previewOk=True, consentOk=True,
-                  consentTarget=target)
+                  consentTarget=minted_target)
     assert minted["minted"] == 1, f"the mint POST never happened: {minted}"
-    assert minted["assign"] == target + "?code=code-1&state=st-1", minted
+    assert minted["assign"] == minted_target + "?code=code-1&state=st-1", (
+        f"the page did not prefer the mint response's redirect_target over the "
+        f"page-scoped one: {minted['assign']}"
+    )
     # (c) version skew: an API that does not return the field yet falls back to
     # the page's target — never to the raw string
     skew = _run("consent_code", page=page, previewOk=True, consentOk=True)
