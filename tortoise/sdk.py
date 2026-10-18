@@ -6930,6 +6930,18 @@ class TortoiseSDK:
         word is persisted as the ``credibility`` Point property. Real sources
         attached later can carry the claim above the word through ordinary
         inheritance.
+
+        PROVENANCE ADVISORY (#8171): a fresh claim written with NO source and
+        NO provenance returns ``advisories: [{code: 'no_source', node_id,
+        message, advisory: true}]`` — a transient key on the write RESULT (never
+        a node property, never journaled), absent whenever the write is
+        sourced. It is ADVISORY ONLY: the Point has already landed, nothing is
+        refused, and stored state is unchanged. A claim is sourced here when it
+        carries a declared or ``session_id``-inferred ``extractedFrom`` (this
+        door materializes the ``:Source`` and the edge) or an authored
+        ``credibility`` word (which #398 rules IS a source). The message names
+        the cheap fix — ``extractedFrom='session:<id>'`` for an assertion the
+        writer itself originates.
         """
         self._validate_kind(kind)
         _coerce_props(props)
@@ -7802,13 +7814,59 @@ class TortoiseSDK:
             from .exceptions import WriteNotLandedError
             raise WriteNotLandedError(pid, getattr(proj, "graph_name", None),
                                       record_committed=bool(_record_committed))
-        if _source_change_notices:
-            # #5516: the notice is TRANSIENT — it rides the write result the
+        # ── #8171: the write-time provenance advisory, CLAIM door ────────
+        # The ruling: an agent asserting something without research is a WEAK
+        # source, and the source is the agent-session transcript. `audit`'s
+        # `missing_sourceKind` check is the SAME predicate, evaluated POST HOC
+        # (it can never change what the writer does next), and #8171 wired it
+        # at write time on the entity doors — but the door that actually
+        # creates CLAIMS (Points) reported nothing, so "a claim created with
+        # no source and no provenance" was never told to its writer. MEASURED
+        # before this: `create_point('statement', text)` returned the plain
+        # snapshot with no `advisories` key at all.
+        #
+        # ADVISORY ONLY — it rides the write result on a COPY, exactly like the
+        # #5516 `source_change_notices` below: the journaled snapshot and every
+        # later `get_point` stay free of it, the write has already LANDED, and
+        # nothing here raises, refuses or changes what was stored.
+        #
+        # What counts as SOURCED, and why each silence is justified:
+        #   - `extractedFrom` (declared, or inferred from `session_id` by the
+        #     #3263 path above) — materialized by THIS door into a `:Source`
+        #     and an `extractedFrom` edge. That is the remedy the advisory
+        #     names, so it must silence the note.
+        #   - an authored WORD (`credibility=`) — #398 rules the author's word
+        #     IS a source (the weak evidence body `_stamp_authored_word`
+        #     records). Advising a writer who declared their basis would be
+        #     wrong, not merely noisy.
+        # A bare point-level `sourceKind` does NOT silence it: it is a legacy
+        # annotation with no link behind it (the same measured finding that
+        # removed the `sourceKind` bypass from `_provenance_advisory` —
+        # `extracted_from_inert` exists because a declared-but-unwired ref is
+        # worse than none), and `audit`'s own check treats "no sourceKind AND
+        # no extractedFrom edge" as the gap, so neither field is provenance on
+        # its own.
+        _provenance_notes: dict = {}
+        if not props.get("extractedFrom") and credibility is None:
+            # A `session_id` that could not name a Source is the one case where
+            # the plain message would be misleading: say why it did not help.
+            _point_sid_hint = (
+                " (A `session_id` was supplied but is not a non-empty string, "
+                "so no source could be derived from it — pass a string "
+                "`session_id`, or `extractedFrom='session:<session_id>'`.)"
+                if _session_id is not None else ""
+            )
+            _provenance_notes = self._no_source_advisory(
+                pid, hint=_point_sid_hint)
+        if _source_change_notices or _provenance_notes:
+            # #5516 / #8171: both are TRANSIENT — they ride the write result the
             # writer sees, on a COPY, so the journaled snapshot above and every
-            # later `get_point` stay free of it. Present only when a Source
-            # actually changed: an unchanged-source write's result is byte-
-            # identical to before this feature.
-            return {**_snapshot, "source_change_notices": _source_change_notices}
+            # later `get_point` stay free of them. A write that carries neither
+            # notice returns byte-identical to before these features.
+            _extra = dict(_provenance_notes)
+            if _source_change_notices:
+                _extra["source_change_notices"] = _source_change_notices
+            return {**_snapshot, **_extra}
         return _snapshot
 
     def create_or_update_point(self, kind: str, content: str, **props) -> dict:
@@ -12124,13 +12182,35 @@ class TortoiseSDK:
         # emitted BEFORE the transfer (EMIT-BEFORE-TRANSFER, §4.4) so a
         # transfer×emission crash cannot leave the stale descriptor in the
         # JSONL while the live edge moves.
+        # #8622: the OTHER endpoint may carry ANY of the four epistemic
+        # labels (#7902 / owner ruling #7813 — a direct IMPL/NAND is explicitly
+        # allowed to connect any two of :Point/:Subject/:Object/:Event). The
+        # transfer legs therefore anchor each endpoint on the label that
+        # actually resolved it; a hardcoded ``:Point`` on the far endpoint
+        # matched NOTHING, so the MERGE was a constrained no-op and the
+        # delete-leg below removed the ORIGINAL edge — the transfer silently
+        # DESTROYED the edge live, and the replay (which received the same
+        # endpoint contract) dropped it too. ``labels(t)`` rides the same
+        # traversal, so no extra round trip is spent resolving the far node.
+        def _epistemic_label(node_id: str) -> str | None:
+            """Resolve one id's epistemic label, Point-first (#7853 sweep)."""
+            for _label in EPISTEMIC_LABELS:
+                found_row = proj.g.query(
+                    f"MATCH (n:{_label} {{id:$id}}) RETURN ID(n) LIMIT 1",
+                    params={"id": node_id},
+                ).result_set
+                if found_row:
+                    return _label
+            return None
+
+        new_label = _epistemic_label(new_id) if new_id else None
         for direction in ("out", "in"):
             if direction == "out":
                 dq = ("MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t) "
-                      "RETURN type(r), r, t.id, ID(r)")
+                      "RETURN type(r), r, t.id, ID(r), labels(t)")
             else:
                 dq = ("MATCH (t)-[r:IMPL|NAND]->(old:Point {id:$old_id}) "
-                      "RETURN type(r), r, t.id, ID(r)")
+                      "RETURN type(r), r, t.id, ID(r), labels(t)")
             rows = proj.g.query(dq, params={"old_id": old_id}).result_set
             # Filter: exclude edges whose OTHER endpoint is an operator Point
             # (REVIEW-FIX P2 — a mitigation-style (m)-[:IMPL]->(op) edge has
@@ -12151,6 +12231,14 @@ class TortoiseSDK:
             rows = plain
             for row in rows:
                 rtype, r, tid, rid = row[0], row[1], row[2], row[3]
+                # #8622: the label that ACTUALLY carries the far endpoint, in
+                # EPISTEMIC_LABELS order (Point-first) — the same first-wins
+                # order ``create_direct_edge``'s probe uses, so the write and
+                # the transfer can never disagree about a multi-labelled node.
+                _row_labels = set(row[4] or ()) if len(row) > 4 else set()
+                tid_label = next(
+                    (lbl for lbl in EPISTEMIC_LABELS if lbl in _row_labels),
+                    None)
                 # FalkorDB returns an Edge object — read its properties.
                 rdict = dict(r.properties) if hasattr(r, "properties") else {}
                 if tid == new_id:
@@ -12198,25 +12286,36 @@ class TortoiseSDK:
                 # Two-step MERGE (FalkorDB quirk — same as create_direct_edge):
                 # MATCH the existing nodes, then MERGE the edge between them
                 # (never creates duplicate nodes; collapses to one edge).
-                if direction == "out":
-                    mq = (f"MATCH (new:Point {{id:$new_id}}), "
-                          f"(t:Point {{id:$tid}}) "
-                          f"MERGE (new)-[nr:{rtype}]->(t)")
-                else:
-                    mq = (f"MATCH (t:Point {{id:$tid}}), "
-                          f"(new:Point {{id:$new_id}}) "
-                          f"MERGE (t)-[nr:{rtype}]->(new)")
-                proj.g.query(mq, params={"new_id": new_id, "tid": tid})
-                _keep = {k: v for k, v in rdict.items()
-                         if k in ("direction", "confidence", "weight",
-                                  "label", "batch_id")}
-                proj.g.query(
-                    f"MATCH (a:Point {{id:$a}})-[r:{rtype}]->"
-                    f"(b:Point {{id:$b}}) SET r += $attrs",
-                    params={"a": (tid if direction == "in" else new_id),
-                            "b": (new_id if direction == "in" else tid),
-                            "attrs": _keep},
-                )
+                # #8622: anchor BOTH endpoints on their resolved labels. An
+                # unresolvable label means the endpoint is not an epistemic
+                # node (a raw/legacy edge the write path itself refuses), so
+                # the transfer cannot be performed — the delete-leg below still
+                # runs, mirroring the pre-#7902 "no such endpoint" outcome
+                # WITHOUT the silent hope that a :Point match existed.
+                if new_label is not None and tid_label is not None:
+                    if direction == "out":
+                        mq = (f"MATCH (new:{new_label} {{id:$new_id}}), "
+                              f"(t:{tid_label} {{id:$tid}}) "
+                              f"MERGE (new)-[nr:{rtype}]->(t)")
+                    else:
+                        mq = (f"MATCH (t:{tid_label} {{id:$tid}}), "
+                              f"(new:{new_label} {{id:$new_id}}) "
+                              f"MERGE (t)-[nr:{rtype}]->(new)")
+                    proj.g.query(mq, params={"new_id": new_id, "tid": tid})
+                    _keep = {k: v for k, v in rdict.items()
+                             if k in ("direction", "confidence", "weight",
+                                      "label", "batch_id")}
+                    if direction == "out":
+                        _a_label, _b_label = new_label, tid_label
+                    else:
+                        _a_label, _b_label = tid_label, new_label
+                    proj.g.query(
+                        f"MATCH (a:{_a_label} {{id:$a}})-[r:{rtype}]->"
+                        f"(b:{_b_label} {{id:$b}}) SET r += $attrs",
+                        params={"a": (tid if direction == "in" else new_id),
+                                "b": (new_id if direction == "in" else tid),
+                                "attrs": _keep},
+                    )
                 # Delete the OLD edge by its internal id (precision),
                 # constrained to the old point's incident edges (REVIEW-FIX
                 # P2: never graph-wide — internal ids may be reused).
@@ -29364,6 +29463,29 @@ class TortoiseSDK:
     # `session:<id>` ref for what the writer itself asserts).
     _ENTITY_SOURCE_LABELS: ClassVar[dict[str, str]] = {"document": "Source"}
 
+    #: The ONE `no_source` sentence — one home, so the entity doors and the
+    #: claim door cannot drift into advising different fixes (#8171).
+    _NO_SOURCE_MESSAGE: ClassVar[str] = (
+        "No source and no provenance on this write. If it is something YOU "
+        "are asserting, source it from the session that produced it with "
+        "extractedFrom='session:<session_id>' (registered as "
+        "sourceKind=agentSession) — an unsourced assertion carries whatever "
+        "credibility its wording implies."
+    )
+
+    def _no_source_advisory(self, node_id: str | None, *, hint: str = "") -> dict:
+        """The `no_source` advisory payload, with an optional door-specific hint.
+
+        ADVISORY ONLY — the caller adds it to a write RESULT; nothing here
+        raises, refuses or changes what was stored (#8171).
+        """
+        return {"advisories": [{
+            "code": "no_source",
+            "node_id": node_id,
+            "message": self._NO_SOURCE_MESSAGE + hint,
+            "advisory": True,
+        }]}
+
     def _provenance_advisory(self, node: dict, props: dict,
                              *, entity_type: str | None = None) -> dict:
         """Advisory for a provenance gap this door can report.
@@ -29477,19 +29599,7 @@ class TortoiseSDK:
         # unprovenanced write. There is now no branch here: only a materialized
         # `extractedFrom` counts.
         node_id = node.get("id") or node.get("eventId")
-        return {"advisories": [{
-            "code": "no_source",
-            "node_id": node_id,
-            "message": (
-                "No source and no provenance on this write. If it is "
-                "something YOU are asserting, source it from the session "
-                "that produced it with extractedFrom='session:<session_id>' "
-                "(registered as sourceKind=agentSession) — an unsourced "
-                "assertion carries whatever credibility its wording implies."
-                + _sid_hint
-            ),
-            "advisory": True,
-        }]}
+        return self._no_source_advisory(node_id, hint=_sid_hint)
 
     # ── Write nudges (epic #888 W2 — nudge, don't enforce) ───────────
 
