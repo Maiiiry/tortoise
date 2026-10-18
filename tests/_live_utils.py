@@ -8,7 +8,10 @@ test_event_store.py and test_embedded_concurrency.py.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 # #3339: the ONE live-URI skip reason. tools/skip-guard.py keys the
 # intentional URI-gate family on this reason's PREFIX, and since #3592 the
@@ -230,3 +233,70 @@ def mask_embedder():
     finally:
         _emb.compute_embedding = _saved_compute
         _cls.get = _saved_get
+
+
+# ── #8746: DELETE a per-run test graph, do not merely empty it ─────────────
+#
+# The families a test-owned per-run graph can legitimately carry. Fail-closed:
+# a name outside these is NEVER deleted by this helper, so a fixture that
+# resolved a shared/product graph by mistake cannot destroy it. Same two
+# prefixes as `_SERVER_WIPE_PREFIXES` (tests/_embedded.py) — the GRAPH.LIST
+# families, which is exactly this helper's input shape (a NAME, no journal
+# attribution): `team_`/`org_` are real tenant graphs and are deliberately
+# absent. CITE SYMBOLS, never line numbers: a line pointer re-stales.
+_TEST_GRAPH_PREFIXES = ("test_", "tortoise_test")
+
+
+def drop_test_graph(proj, *, name: str | None = None) -> bool:
+    """DETACH-free ``GRAPH.DELETE`` of a per-run test graph (#8746).
+
+    Why this exists
+    ---------------
+    Per-run graphs minted as ``f"test_x_{os.urandom(4).hex()}"`` used to be
+    torn down with ``MATCH (n) DETACH DELETE n`` + ``close()`` — the CONTENTS
+    were removed and the GRAPH OBJECT survived, still counted by the server's
+    ``CACHE_SIZE``, which is the documented trigger for ``graph was deleted or
+    replaced while the query was running`` (#7357). #8746 measured 481-586 such
+    leftovers on one shared instance (44% of every graph on it).
+
+    The session sweep (``tests/conftest.py::_server_graph_hygiene`` /
+    ``tests/_embedded.py::_sweep_drop``) reaps the JOURNALED graphs, and
+    ``FalkorProjection.from_uri`` journals in a test frame — so the graphs no
+    longer LEAK past a session. But the sweep only runs at session END, so a
+    session that uses a per-run fixture hundreds of times still holds hundreds
+    of empty graphs for its whole lifetime: the same cache-churn pressure, just
+    bounded by the session. Deleting at teardown removes it at the source and
+    makes the leak impossible even when the journal is unavailable.
+
+    Why ``detach=False``
+    -------------------
+    ``GRAPH.DELETE`` removes the graph wholesale — the DETACH is redundant, and
+    on a graph that exists with no replayable record it is the *materialising*
+    half of the AOF-poisoning sequence in ``tortoise/graph_delete_guard.py``
+    (#2961): an implicit create emits no ``GRAPH.EFFECT``, so a later
+    ``GRAPH.DELETE`` replays against a key that was never created and the
+    server never reaches a serving state again. The presence gate inside
+    :func:`~tortoise.graph_delete_guard.safe_graph_delete` is what makes the
+    remaining case safe: an ABSENT graph transmits nothing at all.
+
+    Returns True when the graph was present and was deleted, False when it was
+    already absent or the name was refused. Never raises: a failed teardown
+    must not red a suite, and the session sweep remains the backstop (this is
+    the same log-and-continue policy as ``_sweep_drop``).
+    """
+    gname = name if name is not None else getattr(proj, "graph_name", None)
+    if not isinstance(gname, str) or not gname.startswith(_TEST_GRAPH_PREFIXES):
+        logger.warning(
+            "[#8746] refusing to GRAPH.DELETE %r — not a test-owned graph "
+            "name (prefix gate: %s); left untouched", gname,
+            _TEST_GRAPH_PREFIXES)
+        return False
+    try:
+        from tortoise.graph_delete_guard import safe_graph_delete
+
+        return bool(safe_graph_delete(proj.db, gname, detach=False, drop=True))
+    except Exception as exc:  # hygiene never fails the suite
+        logger.warning(
+            "[#8746] GRAPH.DELETE of %r failed (%r) — left for the session "
+            "sweep, which owns every journaled graph", gname, exc)
+        return False

@@ -7,6 +7,7 @@ Runnable without pytest:  .venv/bin/python tests/test_projection.py
 """
 from __future__ import annotations  # noqa: I001
 
+import contextlib
 import json
 import math
 import os
@@ -1851,7 +1852,16 @@ if __name__ == "__main__":
 
 @pytest.fixture
 def live_proj():
-    """Live FalkorProjection on a test-prefixed graph (safe via test_guard)."""
+    """Live FalkorProjection on a test-prefixed graph (safe via test_guard).
+
+    #8746: the graph is DELETED at teardown, not merely emptied. The old
+    teardown (``MATCH (n) DETACH DELETE n`` + ``close()``) removed the
+    CONTENTS and left the graph object on the server, so every run of this
+    fixture added one graph to the instance's ``CACHE_SIZE`` count — the
+    documented trigger for ``graph was deleted or replaced while the query was
+    running`` (#7357). The session sweep reaped the journaled name at session
+    END, so the suite stayed green while the graph count climbed mid-session.
+    """
     if not _docker_falkor_reachable():
         pytest.skip(f"live FalkorDB ({_live_utils.service_host()}:{_live_utils.legacy_port()}) not reachable")
     # #1553: the CI tier-2 env exports TORTOISE_DB_URI as an EMPTY string
@@ -1864,10 +1874,100 @@ def live_proj():
     # path — bulk-DETACHing it clobbers concurrent sessions; per-test graph.
     proj = FalkorProjection.from_uri(
         uri, graph_name=f"test_proj125_{os.urandom(4).hex()}")
-    # Clean the test graph (test-prefixed — test_guard permits; production blocked)
-    proj.g.query("MATCH (n) DETACH DELETE n")
-    yield proj
-    proj.close()
+    # #8746: NO setup `DETACH DELETE`. The name is freshly random (4 hex bytes =
+    # 32 bits per run), so there is nothing to clean, and a DETACH against a
+    # graph that has no writes is the phantom-creating half of the #2961
+    # AOF-poisoning sequence (an implicit create emits no GRAPH.EFFECT, so a
+    # later GRAPH.DELETE has nothing to replay). The graph is now materialised
+    # only by the test's OWN writes, which are recorded — so the teardown
+    # delete below is always deleting a graph the AOF can replay.
+    try:
+        yield proj
+    finally:
+        try:
+            _live_utils.drop_test_graph(proj)  # #8746: GRAPH.DELETE, not DETACH
+        finally:
+            proj.close()
+
+
+# ── #8746: the per-run graph must be DELETED, not emptied ──────────────
+
+
+def _graph_names(conn) -> set[str]:
+    """GRAPH.LIST over a raw connection — the only evidence a graph is gone.
+
+    Deliberately NOT the journal and NOT a fixture: #8746's second defect was
+    that the leak stayed invisible because the only evidence consulted was
+    the suite's own bookkeeping.
+    """
+    return {str(g) for g in (conn.execute_command("GRAPH.LIST") or [])}
+
+
+def test_live_proj_teardown_deletes_the_graph_not_just_its_contents():
+    """#8746: the per-run graph is GONE from GRAPH.LIST after teardown.
+
+    Pins the FIXTURE's wiring, not just the helper: it drives the fixture's
+    own generator, so the teardown runs inside the test. The defect this pins
+    is invisible to a green suite — the session-end sweep reaps the journaled
+    name, so the leak only ever showed as mid-session accumulation and a graph
+    count that grew +1 per run on a shared instance (481 measured 2026-10-15).
+    """
+    if not _docker_falkor_reachable():
+        pytest.skip(
+            f"live FalkorDB ({_live_utils.service_host()}:{_live_utils.legacy_port()}) not reachable")
+
+    gen = live_proj.__wrapped__()
+    proj = next(gen)
+    name = proj.graph_name
+    conn = proj.db.connection  # raw redis handle (survives proj.close())
+    try:
+        assert name.startswith("test_proj125_"), name
+        # The test's own write is what materialises the graph — the fixture no
+        # longer pre-DETACHes it (see the fixture docstring).
+        proj.g.query("CREATE (n:Point {id:'teardown-8746'})")
+        assert name in _graph_names(conn), "fixture handed the test no live graph"
+        with contextlib.suppress(StopIteration):
+            next(gen)  # run the fixture's own teardown
+        assert name not in _graph_names(conn), (
+            f"{name} survived the live_proj teardown — emptied, not deleted "
+            f"(#8746: it stays in the server's CACHE_SIZE until the session "
+            f"sweep runs, which is the #7357 eviction churn)")
+    finally:
+        with contextlib.suppress(Exception):
+            proj.close()
+
+
+class _RecordingDb:
+    """Records every command; a refused name must reach NONE of them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def list_graphs(self):
+        self.calls.append(("list_graphs",))
+        return ["tortoise"]
+
+    def select_graph(self, name):
+        self.calls.append(("select_graph", name))
+        raise AssertionError(
+            f"a refused graph name reached select_graph({name!r}) (#8746)")
+
+
+class _FakeProj:
+    def __init__(self, name) -> None:
+        self.graph_name = name
+        self.db = _RecordingDb()
+
+
+def test_drop_test_graph_refuses_a_non_test_owned_name():
+    """#8746: fail-closed. The delete gate is the NAME — GRAPH.LIST carries no
+    ownership attribution, so only the two ``_SERVER_WIPE_PREFIXES`` families
+    may be deleted. A fixture that resolved a product/tenant graph by mistake
+    must not be able to destroy it."""
+    for name in ("tortoise", "org_acme", "team_x", "proj125_x", None, 42):
+        proj = _FakeProj(name)
+        assert _live_utils.drop_test_graph(proj) is False, name
+        assert proj.db.calls == [], (name, proj.db.calls)
 
 
 def test_upsert_document_capture_fields(live_proj):
@@ -2122,13 +2222,16 @@ def test_add_document_journals_the_anchor_and_replays_identically(live_proj):
     replay = FalkorProjection.from_uri(
         uri, graph_name=f"test_proj125_5422_{os.urandom(4).hex()}")
     try:
-        replay.g.query("MATCH (n) DETACH DELETE n")
         for ev in log.read_all():
             replay.apply(ev)
         assert _doc_anchor(replay, "doc-h6") == live, (
             "replay diverged on the document anchor")
     finally:
-        replay.close()
+        # #8746: DELETE the per-run replay graph (was: DETACH its contents)
+        try:
+            _live_utils.drop_test_graph(replay)
+        finally:
+            replay.close()
 
 
 def test_document_version_does_not_double_bump_across_the_two_folds(live_proj):
