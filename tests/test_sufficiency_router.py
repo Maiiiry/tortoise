@@ -142,6 +142,7 @@ from tortoise.sufficiency_router import (
     REFUSAL_NO_PROVENANCE,
     REFUSAL_PROMOTION,
     REFUSAL_UNVERIFIED,
+    SPAN_OFFSET_MAX,
     SUFFICIENT,
     UNDETERMINED,
     VERDICTS,
@@ -528,8 +529,37 @@ def test_there_is_no_default_threshold() -> None:
 
 @pytest.mark.parametrize("bad", [-0.1, 1.1, "0.9", True, object()])
 def test_an_unusable_threshold_is_refused_not_defaulted(bad: object) -> None:
+    # ``anchors`` is NON-EMPTY on purpose: with none supplied the earlier "a
+    # configured measure needs something to measure" guard raises first, and this
+    # test would then pass with the threshold validation DELETED — a guard with no
+    # failure behind it.
     with pytest.raises(ValueError):
-        assess_sufficiency(_rows("x"), required_anchor_coverage=bad)  # type: ignore[arg-type]
+        assess_sufficiency(
+            _rows("acme corp"), anchors=["acme corp"],
+            required_anchor_coverage=bad, resident=True)  # type: ignore[arg-type]
+
+
+def test_the_span_ceiling_is_the_one_home_and_cannot_drift() -> None:
+    """``commit_schema`` owns the span-address rule, and it CLAMPS past the ceiling.
+
+    E4 / ``#5007``: an offset past ``SPAN_OFFSET_MAX`` is silently clamped on
+    write, so the committed address and the stored address diverge — the unit
+    would then claim a span it does not have. ``SourceSpan`` refuses it. The
+    constant is repeated rather than imported because this module keeps its
+    imports pure (``commit_schema`` pulls pydantic and yaml at import), so THIS
+    assertion is what makes the repetition safe: the two cannot drift.
+    """
+    from tortoise.commit_schema import SPAN_OFFSET_MAX as ONE_HOME
+
+    assert SPAN_OFFSET_MAX == ONE_HOME
+
+    # At the ceiling is still a real address.
+    assert SourceSpan(source_id="s", start=0, end=ONE_HOME).end == ONE_HOME
+
+    with pytest.raises(ValueError):
+        SourceSpan(source_id="s", start=0, end=ONE_HOME + 1)
+    with pytest.raises(ValueError):
+        SourceSpan(source_id="s", turn=ONE_HOME + 1)
 
 
 # ── §17.3: residency outranks sufficiency ─────────────────────────────────

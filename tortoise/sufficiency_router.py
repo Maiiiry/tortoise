@@ -115,10 +115,12 @@ A summary unit written back to the cheap tier:
   name a superseded/replaced source and no field that carries the raw payload:
   the unit holds an ADDRESS, and a test refuses a future field named like a
   payload or a supersession. The raw log stays immutable.
-* **never promotes a class** — §12.7's *"incorrect promotion: an episodic fact
+* **never promotes a class** — §12.4's *"incorrect promotion: an episodic fact
   promoted into a semantic rule"* is refused by construction, because the unit's
   class is the finding's class and ``promote_to`` must either be ``None`` or
-  equal to it.
+  equal to it. (§12.7's entry of the same NAME is the ROUTING failure — *"the
+  router learning to fetch from the wrong tier"* — a different defect; the
+  class sense is §12.4's.)
 * **dedupes by identity** — the key is content-addressed over (span, normalised
   claim), so the SAME verified finding written back twice is ONE unit. That is
   what makes the escalation an investment rather than a repeating tax; its
@@ -172,6 +174,7 @@ __all__ = [
     "REFUSAL_PROMOTION",
     "REFUSAL_UNVERIFIED",
     "ROUTES",
+    "SPAN_OFFSET_MAX",
     "SUFFICIENT",
     "UNDETERMINED",
     "VERDICTS",
@@ -272,7 +275,7 @@ REFUSAL_PROMOTION = "promotion"
 REFUSAL_NO_CLAIM = "no-claim"
 #: Two findings share a ``unit_key`` but disagree about the claim's CLASS. The
 #: dedupe may not pick one: whichever arrives second would be dropped silently
-#: and §12.7's "incorrect promotion" would then be settled by input ORDER, with
+#: and §12.4's "incorrect promotion" would then be settled by input ORDER, with
 #: the plan still reported ``ok``.
 REFUSAL_CLASS_CONFLICT = "class-conflict"
 
@@ -965,6 +968,18 @@ def route_sufficiency(
 # ── §12.5 the escalation write-back ───────────────────────────────────────
 
 
+#: The ceiling on a span offset, and the reason it is repeated here rather than
+#: imported. ``tortoise/commit_schema.py`` is THE ONE HOME for the span-address
+#: rule (``SPAN_OFFSET_MAX``, E4 / ``#5007``): **an offset past this is silently
+#: CLAMPED on write**, so the committed address and the stored address diverge —
+#: a unit would then claim a span it does not have. This module keeps its imports
+#: pure (``commit_schema`` pulls pydantic and yaml at import, ~240 ms, and this
+#: decision layer sits on the read path), so the VALUE is copied, not re-derived;
+#: ``tests/test_sufficiency_router.py`` pins it to the one home, so the two
+#: cannot drift apart unnoticed.
+SPAN_OFFSET_MAX = 2**63 - 1
+
+
 @dataclass(frozen=True)
 class SourceSpan:
     """An ADDRESS into the immutable raw log (extractor §2.4.2).
@@ -991,6 +1006,15 @@ class SourceSpan:
                 continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"span {name} must be a non-negative int, got {value!r}")
+            if value > SPAN_OFFSET_MAX:
+                # NOT a stylistic bound: the store clamps past it (E4 / #5007), so
+                # such an address is stored as a DIFFERENT address and the unit's
+                # span stops being the thing it points at.
+                raise ValueError(
+                    f"span {name} must be <= {SPAN_OFFSET_MAX} — an offset past the "
+                    f"ceiling `commit_schema` clamps on write, so this address "
+                    f"would be stored as a different one; got {value!r}"
+                )
         if self.start is not None and self.end is not None and self.end <= self.start:
             raise ValueError(
                 f"span end ({self.end}) must be greater than span start ({self.start})")
@@ -1009,7 +1033,8 @@ class VerifiedFinding:
 
     ``claim_class`` is the class the finding HAS. Nothing on this type lets a
     caller ask for a different one; ``plan_writeback(promote_to=...)`` is the
-    only door, and it refuses anything but the same class (§12.7).
+    only door, and it refuses anything but the same class (§12.4 — §12.7's entry
+    of the same name is the routing failure, not this one).
     """
 
     claim: str
@@ -1132,7 +1157,7 @@ def plan_writeback(
     other finding is REFUSED with a named reason and reported — never silently
     dropped, and never rewritten into a shape that passes.
 
-    ``promote_to`` is the §12.7 *"incorrect promotion"* door, and it is bolted
+    ``promote_to`` is the §12.4 *"incorrect promotion"* door, and it is bolted
     shut: it may be ``None`` or the finding's own class, never a different one
     (an episodic fact must not become a semantic rule by being written back).
     """
@@ -1141,7 +1166,7 @@ def plan_writeback(
     seen: dict[str, SummaryUnit] = {}
     #: Keys whose findings disagreed about the claim's CLASS. Neither may be
     #: written back: the dedupe cannot pick one, and picking by input order would
-    #: be §12.7's incorrect promotion decided by iteration order.
+    #: be §12.4's incorrect promotion decided by iteration order.
     conflicted: set[str] = set()
 
     for finding in findings:
