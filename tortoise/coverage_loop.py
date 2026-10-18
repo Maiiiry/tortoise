@@ -34,12 +34,26 @@ hermetic product primitives (the product-cohesion rule — the loop lands in
    window, so a same-session flood (points were never session-capped)
    cannot crowd the cross-session recovery evidence out of the window the
    official binary grades.
+5. **ROUTE** (C3-3 #2569) — :func:`route_coverage_signal` + 
+   :func:`detector_coverage_gap` + :func:`combine_missing_facets`: the CHECK
+   is routed through the #2521 aggregative-intent detector
+   (``tortoise/aggregate.py``) for entity-scoped aggregation/spread
+   questions, which name the facet AXIS to count (``session`` /``kind`` /
+   ``date_month``) and — unlike the proxy — fire at ``k = 0`` (the
+   never-reached miss class). The routed check is UNIONED with the proxy's
+   (never a swap): non-aggregative questions keep the interim untouched and
+   the proxy's facets keep the expansion tail's slots, so the routed path
+   can only ADD a fire opportunity — never regress the interim. The
+   temporal facet rides the same R5 time seam
+   (:func:`facet_window_bounds`).
 
 Every graph step is bounded and fail-open (any fetch/query failure keeps
 the ORIGINAL pool — byte-identical, the A4/C2 posture); the loop is OFF by
 default (the #1745 fail-safe decision) and the eval arms it via
 ``--coverage-loop`` / ``TORTOISE_LME_COVERAGE_LOOP`` (2×2 covariate with the
-#2518 entity-key expansion arm).
+#2518 entity-key expansion arm) and the routing via the #2521 detector arm
+``--aggregative-flag`` / ``TORTOISE_LME_AGGREGATIVE_FLAG`` (loop-ON +
+aggregative-OFF is the rule-proxy interim).
 
 Stage ownership: this module owns the product rules + graph passes. The
 harness's ``retrieve_for_question`` (tools/longmem_eval/retrieve.py) composes
@@ -93,6 +107,12 @@ _UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
 #: question dates; kept for product-side determinism).
 _DEFAULT_YEAR = 2026
 
+#: C3-3 (#2569) routing authorities — which check owns the coverage decision
+#: for one query. The detector authority is the #2521 per-facet check; the
+#: rule-proxy authority is C3-1's session-span census (the interim).
+ROUTE_AUTHORITY_DETECTOR = "detector"
+ROUTE_AUTHORITY_PROXY = "rule-proxy"
+
 
 @dataclass(frozen=True)
 class LoopFacet:
@@ -112,6 +132,29 @@ class LoopFacet:
     name: str
     span: frozenset[str]
     aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CoverageRoute:
+    """The C3-3 (#2569) facet-router decision for one query.
+
+    ``authority`` — who owns the coverage check: ``"detector"`` (the #2521
+    per-facet check) or ``"rule-proxy"`` (C3-1's session-span census, the
+    interim). ``dimension`` — the facet axis the check enumerates
+    (``session``/``kind``/``date_month``; the proxy's is always
+    ``session``). ``routed`` — True iff the detector owns the check.
+    ``quantifier``/``scope`` — the detector's own classification
+    (audit/marker vocabulary, never re-derived here). ``reason`` — why the
+    route fell where it did (``routed``/``not_aggregative``/``open_ended``/
+    ``unscoped``), so a per-outcome marker can name the non-fire cause.
+    """
+    authority: str
+    dimension: str
+    routed: bool
+    is_aggregative: bool
+    quantifier: str | None = None
+    scope: str | None = None
+    reason: str = "not_aggregative"
 
 
 def facet_date_constraint(text: str) -> tuple[str | None, str | None, str | None]:
@@ -134,6 +177,43 @@ def facet_date_constraint(text: str) -> tuple[str | None, str | None, str | None
     return None, None, None
 
 
+def facet_window_bounds(kind: str | None, start: str | None,
+                        end: str | None,
+                        session_dates: dict[str, str] | None,
+                        ) -> tuple[str | None, str | None]:
+    """Resolve the R5-shaped date constraint into an INCLUSIVE ISO
+    ``[lo, hi]`` window (pure). ``(None, None)`` when no bound applies.
+
+    interval: the explicit ISO bounds. recency: ``[qdate − N_days, qdate]``
+    where the question date is the max session date available (the eval's
+    haystack dates; the graph has no global clock).
+
+    The recency bound is resolved through ``date.fromisoformat`` — the
+    session dates the caller passes ARE ISO strings (the eval's
+    ``haystack_dates``), and a raw ``str − timedelta`` raises ``TypeError``
+    (#8710: the pre-fix ``_span_in_window`` recency branch raised on every
+    recency-bounded query, so the loop's temporal facet was dead for the
+    whole "last N …" class and the eval's fail-open swallowed it). An
+    unparseable latest date degrades to no bound (never a hard filter that
+    could starve the pool).
+    """
+    if kind == "interval":
+        return (start, end) if start and end else (None, None)
+    if kind == "recency":
+        dates = [str(v).strip() for v in (session_dates or {}).values() if v]
+        if not dates:
+            return None, None
+        qdate = max(dates)
+        from datetime import date, timedelta
+        try:
+            qd = date.fromisoformat(qdate[:10])
+            n_days = int(start or 0)
+        except ValueError:
+            return None, None
+        return (qd - timedelta(days=n_days)).isoformat(), qdate
+    return None, None
+
+
 def _span_in_window(span: frozenset[str],
                     session_dates: dict[str, str] | None,
                     kind: str | None, start: str | None,
@@ -145,29 +225,39 @@ def _span_in_window(span: frozenset[str],
     Unknown dates are kept when no bound applies; when a bound applies an
     undated session cannot be proven in-window and is dropped (the span
     stays honest — a facet whose whole span filters out is dropped by the
-    caller)."""
+    caller).
+    """
     if kind is None or not session_dates:
         return span
-    if kind == "interval":
-        if not start or not end:
-            return span
-        return frozenset(
-            s for s in span
-            if (session_dates.get(s) or "") and start <= session_dates[s] <= end)
-    if kind == "recency":
-        try:
-            n_days = int(start or 0)
-            qdate = max(v for v in session_dates.values() if v)
-        except ValueError:
-            return span
-        if not qdate:
-            return span
-        from datetime import timedelta
-        lo = (qdate - timedelta(days=n_days)).isoformat()
-        return frozenset(
-            s for s in span
-            if (session_dates.get(s) or "") and lo <= session_dates[s] <= qdate)
-    return span
+    lo, hi = facet_window_bounds(kind, start, end, session_dates)
+    if lo is None or hi is None:
+        return span
+    return frozenset(
+        s for s in span
+        if (session_dates.get(s) or "") and lo <= session_dates[s] <= hi)
+
+
+def points_in_window(points: list[dict],
+                     session_dates: dict[str, str] | None,
+                     kind: str | None, start: str | None,
+                     end: str | None) -> list[dict]:
+    """Date-qualify a CENSUS POINT list with the SAME R5 seam
+    (:func:`facet_window_bounds`) the span qualification uses (pure) — the
+    routed detection path's temporal facet (C3-3 #2569). A point whose
+    ``session_date`` cannot be proven in-window is dropped when a bound
+    applies, exactly as :func:`_span_in_window` drops an undated session.
+    """
+    if kind is None:
+        return points
+    lo, hi = facet_window_bounds(kind, start, end, session_dates)
+    if lo is None or hi is None:
+        return points
+    out: list[dict] = []
+    for p in points:
+        d = str(p.get("session_date") or "").strip()
+        if d and lo <= d[:10] <= hi:
+            out.append(p)
+    return out
 
 
 def _token_overlap(query: str, name: str, *, keep_numeric: bool = False) -> bool:
@@ -375,6 +465,298 @@ def _aliases_add_recall(query: str, aliases: tuple[str, ...],
     for alias in aliases:
         new_toks.update(tokenize_sparse_query(alias, keep_numeric=True))
     return bool(new_toks - orig)
+
+
+# ── C3-3 (#2569): the detector-owned coverage-signal routing ───────────────
+#
+# The #2521 detector (``tortoise/aggregate.py``) owns the facet vocabulary:
+# ``detect_aggregative_intent`` classifies the query + names the aggregation
+# axis, ``collect_anchor_census`` enumerates the entity spine's linked
+# points, ``compute_facet_coverage`` is the pure k-of-N per-facet math and
+# ``facet_key_for_point`` the facet-key extraction. This section is WIRING
+# ONLY: it routes the C3-1 loop's CHECK through those primitives when the
+# detector is armed, and leaves the rule proxy exactly where it was
+# otherwise. Nothing here re-derives a facet, a key or a coverage verdict.
+#
+# Two properties the routing must preserve (they are the reason it is a
+# UNION and not a swap):
+#
+#   * **no regression on the rule-proxy interim** — a non-aggregative (or
+#     open-ended, or un-anchored) query keeps the proxy's check untouched, so
+#     the routed path can only ever ADD a fire opportunity for an
+#     aggregation question, never remove one. That matters because the proxy
+#     carries the E3 ``search_keys`` expansion vocabulary, which the routed
+#     census does not harvest;
+#   * **one bounded pass either way** — the union feeds the SAME single
+#     ``loop_expansion_pass`` (the hard ``LOOP_MAX_EXTRA_PASSES`` = 1 bound),
+#     so routing cannot raise the iteration census (§7 cost-creep guard).
+
+
+def route_coverage_signal(query: str | None) -> CoverageRoute:
+    """The facet router (C3-3 #2569, pure): decide which check owns the
+    coverage decision for this query.
+
+    The #2521 detector owns it for an **entity-scoped aggregation/spread**
+    surface ("how many/how much/how often/total/count/every") — the measured
+    MSR miss shape — and names the axis it aggregates on
+    (``session``/``kind``/``date_month``). Everything else (not aggregative,
+    open-ended corpus-self-reference, no quantifier) routes back to C3-1's
+    rule proxy, so the interim is never dropped.
+
+    Surface-only and hermetic: the AUTHORITATIVE entity-scope gate stays the
+    detector's anchor RESOLUTION (see :func:`detector_coverage_gap`) — an
+    entity-scoped surface that resolves no Object anchor emits no signal
+    (fail-open, never a false flag).
+    """
+    from tortoise.aggregate import (
+        DEFAULT_FACET_DIMENSION,
+        FACET_DIMENSIONS,
+        detect_aggregative_intent,
+    )
+    intent = detect_aggregative_intent(query)
+    if not intent.is_aggregative:
+        return CoverageRoute(
+            authority=ROUTE_AUTHORITY_PROXY,
+            dimension=DEFAULT_FACET_DIMENSION,
+            routed=False,
+            is_aggregative=False,
+            quantifier=intent.quantifier,
+            scope=intent.scope,
+            reason="not_aggregative",
+        )
+    if intent.scope != "entity-scoped":
+        # the never-flag rule's text gate (open-ended corpus self-reference)
+        return CoverageRoute(
+            authority=ROUTE_AUTHORITY_PROXY,
+            dimension=DEFAULT_FACET_DIMENSION,
+            routed=False,
+            is_aggregative=True,
+            quantifier=intent.quantifier,
+            scope=intent.scope,
+            reason=("open_ended" if intent.scope == "open-ended"
+                    else "unscoped"),
+        )
+    # the detector's dimension hint IS the coverage facet vocabulary
+    # (FACET_DIMENSIONS); an unknown/absent hint falls back to the wired
+    # default (defense-in-depth — the router must never raise).
+    dimension = intent.facet_dimension or DEFAULT_FACET_DIMENSION
+    if dimension not in FACET_DIMENSIONS:
+        dimension = DEFAULT_FACET_DIMENSION
+    return CoverageRoute(
+        authority=ROUTE_AUTHORITY_DETECTOR,
+        dimension=dimension,
+        routed=True,
+        is_aggregative=True,
+        quantifier=intent.quantifier,
+        scope=intent.scope,
+        reason="routed",
+    )
+
+
+def _routed_aliases(query: str, dimension: str,
+                    anchors: tuple[str, ...],
+                    missing_facets: tuple[str, ...],
+                    anchor_aliases: dict[str, tuple[str, ...]] | None = None,
+                    ) -> tuple[str, ...]:
+    """The routed facets' expansion vocabulary (pure).
+
+    The vocabulary is the ALREADY-HARVESTED anchor-spine vocabulary: the
+    C3-1 census (``facet_census``) enumerates the SAME Object spine the
+    detector's census does and harvests each anchor's E3 ``search_keys`` —
+    including the keys of the starved sessions' own points — so
+    ``anchor_aliases`` (``{anchor name: aliases}``) hands the routed facet
+    the exact vocabulary the proxy would have used had it fired. This is the
+    half the routing must NOT duplicate: no second E3 harvest, no second
+    graph round-trip.
+
+    Fallbacks, in order: the anchor-alias map; else the anchor NAME, gated by
+    the SAME ``_token_overlap`` quality rule the proxy census applies (an
+    Object that scored on the FTS index without sharing a query token is
+    index noise, and its name cannot add sparse recall either). The TEMPORAL
+    facet additionally contributes its own month key (the R5 time seam: a
+    missing ``2026-09`` facet re-queries with its date tokens), because a
+    month key is query-relevant content vocabulary. Session ids and
+    point-KIND names never contribute (neither is content vocabulary — a
+    kind name is schema, not evidence).
+    """
+    out: list[str] = []
+
+    def _add(term: str) -> None:
+        term = str(term or "").strip()
+        if term and term not in out:
+            out.append(term)
+
+    for name in anchors:
+        n = str(name or "").strip()
+        if not n:
+            continue
+        vocab = (anchor_aliases or {}).get(n)
+        if vocab:
+            for a in vocab:
+                _add(a)
+        elif _token_overlap(query, n):
+            _add(n)
+    if dimension == "date_month":
+        for key in missing_facets:
+            _add(key)
+    return tuple(out)
+
+
+def detector_coverage_gap(proj: Any, query: str, pool: list[dict], *,
+                          window: int = DEFAULT_LOOP_GUARD_WINDOW,
+                          route: CoverageRoute | None = None,
+                          session_dates: dict[str, str] | None = None,
+                          anchor_aliases: dict[str, tuple[str, ...]]
+                          | None = None,
+                          session_key: Callable[[dict], str] | None = None,
+                          ) -> tuple[list[LoopFacet], dict]:
+    """The detector-owned per-facet coverage check (C3-3 #2569) — the
+    counting-facet census + the k-of-N check, composed from #2521's
+    primitives.
+
+    For a ROUTED query: resolve the entity anchors through the Object-name
+    spine (``collect_anchor_census``), date-qualify the census to the query's
+    own R5 bound (``points_in_window`` — the temporal facet), count the
+    facets under the routed dimension and emit a :class:`LoopFacet` per
+    MISSING facet (``compute_facet_coverage``). The facet's ``span`` is the
+    set of census sessions carrying it; its ``aliases`` are the
+    already-harvested anchor-spine vocabulary (``anchor_aliases`` from
+    ``facet_census``, with a token-overlap-gated anchor-name fallback) — see
+    :func:`_routed_aliases`.
+
+    Unlike the proxy's ``coverage_gap``, the detector's check has NO
+    "seeded" precondition: ``k == 0`` (the anchor's evidence never reached
+    the window at all) is the **never-reached** miss class and MUST fire (the
+    #2513 §1 13% class — this is the +official-metric link #2521 carries).
+
+    Returns ``(missing_facets, report)``. ``report`` is the per-outcome
+    marker dict (§8): ``authority``/``dimension``/``routed``/``signal``/
+    ``n_facets``/``retrieved_facets``/``missing_facets``/``anchors``/
+    ``capped``/``reason`` — the same vocabulary the #2521 measurement arm
+    emits, so the routing's signal-to-flag mapping stays auditable.
+
+    Fail-open (the A4/C2 posture, never raises): a non-routed query, an
+    unresolvable anchor, a truncated census, an out-of-window census or any
+    graph failure yields ``([], report)`` and the caller keeps the ORIGINAL
+    pool byte-identical.
+    """
+    from tortoise.aggregate import (
+        collect_anchor_census,
+        compute_facet_coverage,
+        facet_key_for_point,
+    )
+    if route is None:
+        route = route_coverage_signal(query)
+    report: dict = {
+        "authority": route.authority,
+        "dimension": route.dimension,
+        "routed": route.routed,
+        "quantifier": route.quantifier,
+        "scope": route.scope,
+        "signal": "none",
+        "n_facets": None,
+        "retrieved_facets": None,
+        "missing_facets": [],
+        "anchors": [],
+        "capped": False,
+        "reason": route.reason,
+        "window": max(1, min(window, len(pool))) if pool else 0,
+    }
+    if not route.routed:
+        return [], report
+    try:
+        census = collect_anchor_census(proj, query)
+    except Exception:  # noqa: BLE001, RUF100
+        # collect_anchor_census is contractually fail-open; this is the
+        # never-raises belt to its braces (the routing must not be the one
+        # place that turns a graph hiccup into a broken lane).
+        logger.warning("C3-3 anchor census failed — loop no-ops",
+                       exc_info=True)
+        report["reason"] = "census_failed"
+        return [], report
+    if census is None:
+        report["reason"] = "no_anchor"
+        return [], report
+    anchors, points, truncated = census
+    report["anchors"] = [str(a.get("name") or "") for a in anchors]
+    if truncated or not points:
+        report["reason"] = "truncated" if truncated else "no_linked_points"
+        report["capped"] = bool(truncated)
+        return [], report
+    # the R5 time seam, on the point grain: the query's own interval/recency
+    # bound qualifies which census evidence counts (the same rule the proxy's
+    # ``_span_in_window`` applies to session spans).
+    date_kind, date_start, date_end = facet_date_constraint(query)
+    qualified = points_in_window(points, session_dates, date_kind,
+                                 date_start, date_end)
+    if not qualified:
+        report["reason"] = "out_of_window"
+        return [], report
+    retrieved = pool[:report["window"]] if report["window"] else []
+    verdict = compute_facet_coverage(
+        census_points=qualified,
+        retrieved_points=retrieved,
+        dimension=route.dimension,
+        anchors=[str(a.get("name") or "") for a in anchors],
+    )
+    report.update({
+        "signal": verdict.signal,
+        "n_facets": verdict.n_facets,
+        "retrieved_facets": verdict.retrieved_facets,
+        "missing_facets": list(verdict.missing_facets),
+        "capped": bool(verdict.capped),
+        "reason": "measured",
+    })
+    if verdict.signal != "partial":
+        return [], report
+    missing_keys = tuple(verdict.missing_facets)
+    # the counting-facet census, inverted: which census SESSION carries each
+    # missing facet (the loop's expand target + the marker's frozen identity).
+    sessions_by_key: dict[str, set[str]] = {}
+    for p in qualified:
+        key = facet_key_for_point(p, route.dimension)
+        if key is None or key not in missing_keys:
+            continue
+        s = str(p.get("session_id") or "").strip()
+        if s:
+            sessions_by_key.setdefault(key, set()).add(s)
+    aliases = _routed_aliases(query, route.dimension, tuple(report["anchors"]),
+                              missing_keys, anchor_aliases)
+    facets = [
+        LoopFacet(
+            kind=f"facet:{route.dimension}",
+            key=f"{route.dimension}:{key}",
+            name=str(key),
+            span=frozenset(sessions_by_key.get(key, set())),
+            aliases=aliases,
+        )
+        for key in missing_keys
+    ]
+    return facets, report
+
+
+def combine_missing_facets(proxy_missing: list[LoopFacet],
+                           routed_missing: list[LoopFacet]) -> list[LoopFacet]:
+    """The additive union of the two checks (pure, C3-3 #2569).
+
+    Order is the contract, not a detail: the PROXY's facets come first, so
+    the proxy's E3 ``search_keys`` keep their slots in the single bounded
+    expansion tail (``loop_expansion_pass`` fills it in facet order) and the
+    routed facets can only ever ADD vocabulary — ``loop_fired_facet`` and
+    the proxy's fire behaviour stay byte-stable, which is what "no
+    regression on the rule-proxy interim" means operationally. Dedupes by
+    facet key (the two checks name disjoint key namespaces —
+    ``entity:<name>`` vs ``<dimension>:<facet>`` — so a collision here would
+    itself be a defect worth dropping rather than expanding twice).
+    """
+    out: list[LoopFacet] = []
+    seen: set[str] = set()
+    for facet in [*proxy_missing, *routed_missing]:
+        if facet.key in seen:
+            continue
+        seen.add(facet.key)
+        out.append(facet)
+    return out
 
 
 def loop_expansion_pass(proj: Any, query: str, facets: list[LoopFacet], *,

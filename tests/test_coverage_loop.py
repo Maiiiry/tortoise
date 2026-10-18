@@ -503,3 +503,285 @@ def test_loop_fail_open_keeps_original_result(seeded_sdk, monkeypatch):
     assert on["coverage_loop_stats"]["loop_iterations"] == 0
     assert on["coverage_loop_stats"]["loop_fired_facet"] is None
     assert on["coverage_loop_stats"]["loop_merged_added"] == 0
+
+
+# ══ C3-3 (#2569): coverage-signal routing through the #2521 detector ════════
+#
+# The routed check fires where the proxy cannot: an entity-scoped AGGREGATION
+# question whose anchor is NOT seeded in the guard window (k = 0 — the §1
+# "never reached" 13% miss class). The proxy deliberately skips that shape
+# (an anchor the pool never touches is index noise to a SESSION-span census);
+# the #2521 detector's per-facet check has no seeded precondition, so routing
+# turns that miss class into a fire. The routed facets are UNIONED with the
+# proxy's (never swapped), so the interim cannot regress.
+
+#: the starved-anchor fixture (the never-reached class): the anchor's ONLY
+#: linked point sits in a session absent from the one-shot pool — its content
+#: shares NO query token, so only its E3 search_keys can join it back.
+STARVED_ID = "p2569starved"
+STARVED_SESSION = "sessC2569"
+STARVED_KEYS = "extra charge for wheels saturday service fee"
+STARVED_BODY = ("on saturday morning the weather was sunny so i went for a "
+                "long walk instead")
+
+
+def _starved_question(question: str = QUESTION) -> dict:
+    return _question(question,
+                     answer_sessions=[STARVED_SESSION],
+                     haystack_dates=["2026-09-01", "2026-09-05"])
+
+
+@pytest.fixture
+def seeded_starved_sdk(monkeypatch):
+    """The C3-3 starved-anchor fixture: ONE Object anchor linked to ONE point
+    whose session the one-shot pool never reaches, plus the same 12
+    zero-overlap statement distractors (so the pool is non-empty and the
+    guard window is filled by sessions that carry no census facet)."""
+    monkeypatch.setenv("TORTOISE_DB_URI", _fresh_uri())
+    sdk = TortoiseSDK()
+    try:
+        proj = sdk._get_proj()
+        sdk.create_entity("object", ENTITY_ANCHOR, objectKind="core:other",
+                          is_episodic=True)
+        sdk.create_point("event", STARVED_BODY, id=STARVED_ID,
+                         session_id=STARVED_SESSION, lme_session_index=1,
+                         search_keys=STARVED_KEYS, status="draft")
+        for i in range(12):
+            sdk.create_point(
+                "statement",
+                f"{DISTRACTOR_TOPIC} number {i}",
+                id=f"p2569dist{i}", session_id=f"dist2569{i}",
+                status="draft")
+        proj.g.query(
+            "MATCH (p:Point {id:$id}), (o:Object {name:$name}) "
+            "MERGE (p)-[:aboutObject]->(o)",
+            params={"id": STARVED_ID, "name": ENTITY_ANCHOR})
+        yield sdk
+    finally:
+        sdk.close()
+
+
+def test_routed_check_fires_where_the_proxy_is_silent(seeded_starved_sdk):
+    """The acceptance differential (§5, MSR session_recall@5): the starved
+    session is absent from the one-shot pool AND from the guard window, so
+    the rule proxy does NOT fire (loop-ON/detector-OFF == baseline). Routing
+    the check through the #2521 detector fires it (k = 0 is a miss, not
+    noise), the anchor spine's E3 vocabulary recovers the point, and the
+    official window moves 0 → 1. The detector arm ALONE stays
+    measurement-only (the #2521 contract)."""
+    from tools.longmem_eval.retrieve import retrieve_for_question
+    q = _starved_question()
+
+    base = retrieve_for_question(seeded_starved_sdk, q, ks=(5,), top_k=10,
+                                 pool_size=60)
+    assert STARVED_ID not in [h["id"] for h in base["hits"]]
+    assert base["session_recall@k"]["5"] == 0.0
+
+    # the rule-proxy interim: armed loop, detector OFF — no fire, no change
+    interim = retrieve_for_question(seeded_starved_sdk, q, ks=(5,), top_k=10,
+                                    pool_size=60, coverage_loop=True)
+    assert [h["id"] for h in interim["hits"]] == \
+        [h["id"] for h in base["hits"]], "the interim must not regress"
+    st = interim["coverage_loop_stats"]
+    assert st["loop_proxy_missing"] == 0, "the proxy cannot see k = 0"
+    assert st["loop_iterations"] == 0
+    assert st["loop_check_authority"] == "rule-proxy"
+    assert st["loop_detector_signal"] == "none"
+
+    # the #2521 detector arm ALONE is measurement-only (no retrieval change)
+    det_only = retrieve_for_question(seeded_starved_sdk, q, ks=(5,), top_k=10,
+                                     pool_size=60, aggregative_flag=True)
+    assert [h["id"] for h in det_only["hits"]] == \
+        [h["id"] for h in base["hits"]]
+
+    # loop ON + detector arm ON ⇒ the routed check fires and recovers
+    routed = retrieve_for_question(seeded_starved_sdk, q, ks=(5,), top_k=10,
+                                   pool_size=60, coverage_loop=True,
+                                   aggregative_flag=True)
+    ids = [h["id"] for h in routed["hits"]]
+    assert STARVED_ID in ids[:5], (
+        "the routed check must surface the never-reached session's evidence "
+        "inside the guard window")
+    assert routed["session_recall@k"]["5"] == 1.0
+    st = routed["coverage_loop_stats"]
+    assert st["loop_check_authority"] == "detector"
+    assert st["loop_routed_dimension"] == "session"
+    assert st["loop_detector_signal"] == "partial"
+    assert st["loop_detector_missing"] == 1
+    assert st["loop_proxy_missing"] == 0
+    assert st["loop_iterations"] == 1
+    assert st["loop_fired_facet"] == f"session:{STARVED_SESSION}"
+    assert st["loop_merged_added"] >= 1
+
+
+def test_routed_union_keeps_the_proxy_interim_byte_stable(seeded_sdk):
+    """No-regression, structurally: on the C3-1 fixture BOTH checks fire on
+    the same anchor, the proxy's facet keeps its slot (``loop_fired_facet``
+    is still the proxy's ``entity:`` key), and the routed facet contributes
+    no new vocabulary (it reuses the same harvested anchor aliases), so the
+    expanded pool is IDENTICAL to the interim's — the routed check adds
+    reach, never a reordering."""
+    from tools.longmem_eval.retrieve import retrieve_for_question
+    q = _question()
+    interim = retrieve_for_question(seeded_sdk, q, ks=(5,), top_k=10,
+                                    pool_size=60, coverage_loop=True)
+    routed = retrieve_for_question(seeded_sdk, q, ks=(5,), top_k=10,
+                                   pool_size=60, coverage_loop=True,
+                                   aggregative_flag=True)
+    assert interim["coverage_loop_stats"]["loop_proxy_missing"] == 1
+    assert routed["coverage_loop_stats"]["loop_proxy_missing"] == 1
+    assert routed["coverage_loop_stats"]["loop_check_authority"] == "detector"
+    assert routed["coverage_loop_stats"]["loop_detector_missing"] == 1
+    assert routed["coverage_loop_stats"]["loop_fired_facet"] == \
+        interim["coverage_loop_stats"]["loop_fired_facet"] == \
+        f"entity:{ENTITY_ANCHOR}"
+    assert [h["id"] for h in routed["hits"]] == \
+        [h["id"] for h in interim["hits"]]
+
+
+def test_routed_check_parity_with_the_detector_one_call_seam(seeded_sdk):
+    """Single-source pin: the routing composes the #2521 primitives
+    (``collect_anchor_census`` + ``compute_facet_coverage``), so its verdict
+    must agree with the detector's own one-call seam (``aggregative_verdict``)
+    on the same pool window — a drift here means the routing re-derived a
+    facet, a key or a coverage number of its own."""
+    from tools.longmem_eval.retrieve import retrieve_for_question
+    from tortoise.aggregate import aggregative_verdict
+    from tortoise.coverage_loop import detector_coverage_gap, facet_census
+
+    q = _question()
+    out = retrieve_for_question(seeded_sdk, q, ks=(5,), top_k=10,
+                                pool_size=60)
+    pool = list(out["hits"])
+    missing, report = detector_coverage_gap(
+        seeded_sdk._get_proj(), QUESTION, pool, window=5)
+    verdict = aggregative_verdict(
+        query=QUESTION, proj=seeded_sdk._get_proj(),
+        retrieved_points=pool[:5])
+    assert report["signal"] == verdict["signal"] == "partial"
+    assert report["n_facets"] == verdict["n_facets"] == 2
+    assert report["retrieved_facets"] == verdict["retrieved_facets"] == 1
+    assert report["missing_facets"] == verdict["missing_facets"]
+    assert report["anchors"] == verdict["anchors"]
+    # the routed facet names the missing session
+    assert [f.key for f in missing] == [
+        f"session:{s}" for s in verdict["missing_facets"]]
+    assert missing[0].span == frozenset({JOIN_SESSION})
+    # the vocabulary is the ALREADY-HARVESTED anchor spine: with the driver's
+    # ``anchor_aliases`` the routed facet carries EXACTLY the proxy census
+    # facet's aliases (one harvest — the routing never re-fetches E3 keys);
+    # without it, the token-overlap-gated anchor-name fallback.
+    proxy_facet = next(
+        f for f in facet_census(seeded_sdk._get_proj(), QUESTION)
+        if f.name == ENTITY_ANCHOR)
+    assert missing[0].aliases == (ENTITY_ANCHOR,)
+    enriched, _ = detector_coverage_gap(
+        seeded_sdk._get_proj(), QUESTION, pool, window=5,
+        anchor_aliases={proxy_facet.name: proxy_facet.aliases})
+    assert enriched[0].aliases == proxy_facet.aliases
+    assert enriched[0].aliases[0] == ENTITY_ANCHOR
+
+
+def test_routed_temporal_facet_counts_the_month_axis(seeded_sdk):
+    """The temporal facet at v1 depth: a date-cued aggregation ("per month")
+    routes to the detector's ``date_month`` axis, whose facets are CALENDAR
+    MONTHS rather than sessions — the census months come from the graph's
+    ``session_date`` prop, the retrieved months from the annotated pool. A
+    month known to the census but absent from the window is the fired
+    facet."""
+    from tools.longmem_eval.retrieve import retrieve_for_question
+    from tortoise.coverage_loop import detector_coverage_gap
+    proj = seeded_sdk._get_proj()
+    # a SECOND anchor whose linked points live in two different months
+    seeded_sdk.create_entity("object", "studio rent",
+                             objectKind="core:other", is_episodic=True)
+    seeded_sdk.create_point(
+        "event", "the studio rent payment went through on time",
+        id="p2569rentSep", session_id="sessSep2569",
+        search_keys="studio rent payment september", status="draft")
+    seeded_sdk.create_point(
+        "event", "another month another desk plant",
+        id="p2569rentOct", session_id="sessOct2569",
+        search_keys="studio rent payment october", status="draft")
+    proj.g.query(
+        "MATCH (p:Point), (o:Object {name:'studio rent'}) "
+        "WHERE p.id IN $ids MERGE (p)-[:aboutObject]->(o)",
+        params={"ids": ["p2569rentSep", "p2569rentOct"]})
+    proj.g.query(
+        "MATCH (p:Point) WHERE p.id IN $ids "
+        "SET p.session_date = CASE p.id "
+        "  WHEN 'p2569rentSep' THEN '2026-09-03' ELSE '2026-10-07' END",
+        params={"ids": ["p2569rentSep", "p2569rentOct"]})
+    q = {
+        "question_id": "q2569month",
+        "question": "how much did the studio rent cost me per month",
+        "question_type": "multi-session-reasoning",
+        "answer_session_ids": ["sessSep2569", "sessOct2569"],
+        "haystack_session_ids": ["sessSep2569", "sessOct2569"],
+        "haystack_dates": ["2026-09-03", "2026-10-07"],
+        "haystack_sessions": [],
+        "answer": "",
+    }
+    out = retrieve_for_question(seeded_sdk, q, ks=(5,), top_k=10,
+                                pool_size=60, coverage_loop=True,
+                                aggregative_flag=True)
+    st = out["coverage_loop_stats"]
+    assert st["loop_check_authority"] == "detector"
+    assert st["loop_routed_dimension"] == "date_month"
+    assert st["loop_detector_signal"] == "partial"
+    assert st["loop_detector_missing"] == 1
+    # the MONTH axis is the routed check's: the census knows two calendar
+    # months, the pool window holds one — the missing month is the detector's
+    # missing facet (the proxy's own entity facet fires first in the union by
+    # design, so the axis claim is asserted on the product seam).
+    missing, report = detector_coverage_gap(
+        seeded_sdk._get_proj(), q["question"], list(out["hits"]), window=5)
+    assert report["dimension"] == "date_month"
+    assert report["n_facets"] == 2
+    assert report["retrieved_facets"] == 1
+    assert report["missing_facets"] == ["2026-10"]
+    assert [f.key for f in missing] == ["date_month:2026-10"]
+    # the temporal facet's vocabulary = harvested anchor keys + the month key
+    assert "2026-10" in missing[0].aliases
+
+
+def test_routed_recency_window_filters_the_census(seeded_sdk):
+    """#8710, end-to-end: a recency-bounded aggregation question no longer
+    raises through the R5 seam — the census is date-qualified on the point
+    grain, so the out-of-window session can never be named as a missing
+    facet (and the loop does not fail open)."""
+    from tools.longmem_eval.retrieve import retrieve_for_question
+    from tortoise.coverage_loop import detector_coverage_gap
+    proj = seeded_sdk._get_proj()
+    proj.g.query(
+        "MATCH (p:Point) WHERE p.id IN $ids "
+        "SET p.session_date = CASE p.id "
+        "  WHEN $seed THEN '2026-09-01' ELSE '2025-01-01' END",
+        params={"ids": [SEED_ID, JOIN_ID], "seed": SEED_ID})
+    q = {
+        "question_id": "q2569recency",
+        "question": ("how much did the road bike repairs cost me in the "
+                     "last 7 days"),
+        "question_type": "multi-session-reasoning",
+        "answer_session_ids": [SEED_SESSION],
+        "haystack_session_ids": [SEED_SESSION, JOIN_SESSION],
+        "haystack_dates": ["2026-09-01", "2025-01-01"],
+        "haystack_sessions": [],
+        "answer": "",
+    }
+    out = retrieve_for_question(seeded_sdk, q, ks=(5,), top_k=10,
+                                pool_size=60, coverage_loop=True,
+                                aggregative_flag=True)
+    st = out["coverage_loop_stats"]
+    assert st["loop_detector_signal"] == "complete", (
+        "the out-of-window census session must not be a missing facet")
+    assert st["loop_iterations"] == 0
+    # and the product seam itself reports the measurement (never a fail-open
+    # reason): the R5 qualification ran instead of raising
+    missing, report = detector_coverage_gap(
+        proj, q["question"], list(out["hits"]), window=5,
+        session_dates={SEED_SESSION: "2026-09-01",
+                       JOIN_SESSION: "2025-01-01"})
+    assert report["reason"] == "measured"
+    assert report["n_facets"] == 1
+    assert missing == []

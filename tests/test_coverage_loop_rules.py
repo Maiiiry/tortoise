@@ -19,7 +19,10 @@ from, so a rule regression fails fast and hermetically:
     never drops an item — additive by construction),
   * the sparse reserved-slot contract the second pass composes with:
     original query tokens keep their OR slots; an alias pool fills only
-    the bounded expansion tail.
+    the bounded expansion tail,
+  * C3-3 (#2569): the facet router + the R5 temporal window (`facet_window_bounds`,
+    incl. the #8710 recency-on-ISO-dates regression) + the additive
+    proxy-first union that keeps the interim un-regressed.
 """
 from __future__ import annotations
 
@@ -35,9 +38,16 @@ from tortoise.coverage_loop import (
     LOOP_MAX_EXTRA_PASSES,
     LoopFacet,
     _aliases_add_recall,
+    _routed_aliases,
+    _span_in_window,
+    combine_missing_facets,
     coverage_gap,
+    detector_coverage_gap,
     facet_date_constraint,
+    facet_window_bounds,
     merge_expansion_order,
+    points_in_window,
+    route_coverage_signal,
     session_diverse_order,
 )
 from tortoise.sparse import DEFAULT_MAX_EXPANSION_TERMS, build_or_query
@@ -229,3 +239,169 @@ def test_expansion_terms_never_displace_original_tokens():
     assert set(original_tokens) <= set(expanded_tokens)
     assert expanded_tokens[:len(original_tokens)] == original_tokens
     assert len(expanded_tokens) <= 12 + DEFAULT_MAX_EXPANSION_TERMS
+
+
+# ── C3-3 (#2569): the R5 temporal window (facet_window_bounds) ─────────────
+
+def test_recency_window_resolves_iso_string_session_dates():
+    """#8710 regression: the recency branch used to do ``str − timedelta``
+    (TypeError) on the ISO strings BOTH callers pass, so the temporal facet
+    was dead for the whole "last N …" class (the eval's fail-open swallowed
+    it). The window now resolves against the newest date through
+    ``date.fromisoformat``."""
+    lo, hi = facet_window_bounds("recency", "7", None,
+                                 {"s1": "2026-09-01", "s2": "2026-09-09"})
+    assert (lo, hi) == ("2026-09-02", "2026-09-09")
+    # the span qualification no longer raises and keeps the in-window session
+    span = _span_in_window(frozenset({"s1", "s2"}), 
+                           {"s1": "2026-09-01", "s2": "2026-09-09"},
+                           "recency", "7", None)
+    assert span == frozenset({"s2"})
+
+
+def test_window_bounds_degrades_without_a_parseable_date():
+    """An unparseable / absent latest date degrades to NO bound (never a
+    hard filter that could starve the evidence out of the window — the R5
+    degradation rule), and the interval branch keeps the explicit bounds."""
+    assert facet_window_bounds("recency", "7", None, {"s1": "not-a-date"}) \
+        == (None, None)
+    assert facet_window_bounds("recency", "7", None, None) == (None, None)
+    assert facet_window_bounds("interval", "2026-09-01", "2026-09-05",
+                               None) == ("2026-09-01", "2026-09-05")
+    assert facet_window_bounds("interval", None, None, None) == (None, None)
+    assert facet_window_bounds(None, None, None, {"s1": "2026-09-01"}) \
+        == (None, None)
+
+
+def test_points_in_window_qualifies_the_census_on_the_point_grain():
+    """The routed temporal facet uses the SAME seam on census POINTS: an
+    in-window point is kept, an out-of-window or undated one is dropped when
+    a bound applies (and nothing is dropped without a bound)."""
+    points = [
+        {"id": "p1", "session_date": "2026-09-01"},
+        {"id": "p2", "session_date": "2026-09-09"},
+        {"id": "p3", "session_date": ""},
+        {"id": "p4", "session_date": "2025-01-01"},
+    ]
+    dates = {"s1": "2026-09-01", "s2": "2026-09-09"}
+    assert [p["id"] for p in points_in_window(
+        points, dates, "recency", "7", None)] == ["p2"]
+    assert [p["id"] for p in points_in_window(
+        points, dates, "interval", "2026-09-01", "2026-09-05")] == ["p1"]
+    assert points_in_window(points, dates, None, None, None) == points
+
+
+# ── C3-3 (#2569): the facet router ────────────────────────────────────────
+
+def test_router_routes_entity_scoped_aggregation_to_the_detector():
+    """An entity-scoped aggregation/spread surface routes to the #2521
+    detector, on the axis the detector names (the default session axis; a
+    date cue → date_month; a kind cue → kind)."""
+    for query, dimension in (
+        (QUESTION, "session"),
+        ("how much do i spend on coffee per month", "date_month"),
+        ("how many kinds of tea do i drink", "kind"),
+    ):
+        route = route_coverage_signal(query)
+        assert route.routed is True, query
+        assert route.authority == "detector", query
+        assert route.dimension == dimension, query
+        assert route.reason == "routed", query
+
+
+def test_router_keeps_the_rule_proxy_for_everything_else():
+    """The interim is never dropped: a non-aggregative question, an
+    open-ended corpus-self-reference aggregation, and an R5 elapsed-time
+    date-arithmetic question all keep C3-1's rule proxy."""
+    for query in (
+        "what did i eat for dinner",
+        "how many memories do i have",
+        "how many days ago did i run",
+        "how much time has passed since the migration",
+        "",
+        None,
+    ):
+        route = route_coverage_signal(query)
+        assert route.routed is False, query
+        assert route.authority == "rule-proxy", query
+        assert route.dimension == "session", query
+    assert route_coverage_signal("how many memories do i have").reason == \
+        "open_ended"
+    assert route_coverage_signal("what did i eat for dinner").reason == \
+        "not_aggregative"
+
+
+def test_routed_aliases_gate_anchors_and_add_only_temporal_keys():
+    """The routed expansion vocabulary is the detector's own: anchor names
+    that pass the SHARED token-overlap quality gate. A session id and a
+    point-KIND name never join (neither is content vocabulary); the temporal
+    facet's month key does (the R5 seam's re-query term)."""
+    assert _routed_aliases(QUESTION, "session", (ANCHOR, "cooking pasta"),
+                           ("sessA",)) == (ANCHOR,)
+    assert _routed_aliases(QUESTION, "kind", (ANCHOR,), ("statement",)) == \
+        (ANCHOR,)
+    assert _routed_aliases(QUESTION, "date_month", (ANCHOR,),
+                           ("2026-09", "2026-10")) == \
+        (ANCHOR, "2026-09", "2026-10")
+    # no anchor overlap → no vocabulary at all (index noise cannot add recall)
+    assert _routed_aliases(QUESTION, "session", ("cooking pasta",), ("s",)) == ()
+
+
+# ── C3-3 (#2569): the additive union (never a swap) ───────────────────────
+
+def test_combine_missing_facets_is_proxy_first_and_deduped():
+    """Proxy facets keep their slots (order is the contract: the proxy's E3
+    vocabulary fills the expansion tail first and ``loop_fired_facet`` stays
+    byte-stable); routed facets are appended; a repeated key dedupes."""
+    proxy = [_facet("A", "B")]
+    routed = [
+        LoopFacet(kind="facet:session", key="session:B", name="B",
+                  span=frozenset({"B"}), aliases=(ANCHOR,)),
+        LoopFacet(kind="facet:date_month", key="date_month:2026-09",
+                  name="2026-09", span=frozenset({"B"}),
+                  aliases=(ANCHOR, "2026-09")),
+    ]
+    combined = combine_missing_facets(proxy, routed)
+    assert [f.key for f in combined] == [
+        f"entity:{ANCHOR}", "session:B", "date_month:2026-09"]
+    # dedupe by key, proxy wins
+    dup = LoopFacet(kind="facet:session", key=f"entity:{ANCHOR}",
+                    name="dup", span=frozenset(), aliases=("dup",))
+    assert [f.key for f in combine_missing_facets(proxy, [dup])] == \
+        [f"entity:{ANCHOR}"]
+    assert combine_missing_facets([], routed) == routed
+    assert combine_missing_facets(proxy, []) == proxy
+
+
+# ── C3-3 (#2569): the routed check's fail-open gates (no graph needed) ────
+
+class _BrokenGraph:
+    def query(self, *a, **kw):
+        raise RuntimeError("graph is down")
+
+
+class _BrokenProj:
+    g = _BrokenGraph()
+
+
+def test_detector_gap_is_empty_and_inert_when_not_routed():
+    """A non-routed query never touches the graph: the report names the
+    rule-proxy authority and the caller keeps the ORIGINAL pool."""
+    missing, report = detector_coverage_gap(None, "what did i eat for dinner",
+                                            [{"id": "x", "session_id": "A"}])
+    assert missing == []
+    assert report["authority"] == "rule-proxy"
+    assert report["routed"] is False
+    assert report["reason"] == "not_aggregative"
+
+
+def test_detector_gap_fails_open_on_a_broken_graph():
+    """Fail-open (the A4/C2 posture): a routed query against a graph that
+    raises yields no facets and a no-anchor reason — never an exception, and
+    never a false partial that would fire the loop."""
+    missing, report = detector_coverage_gap(_BrokenProj(), QUESTION,
+                                            [{"id": "x", "session_id": "A"}])
+    assert missing == []
+    assert report["routed"] is True
+    assert report["reason"] == "no_anchor"
+    assert report["signal"] == "none"

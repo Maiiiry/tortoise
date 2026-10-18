@@ -1263,7 +1263,13 @@ def retrieve_for_question(
     # session-diverse rank discipline keeps a same-session flood from
     # crowding the guard window. The A/B switch for #2519's all-or-nothing
     # lever (2×2 covariate with the #2518 entity-key expansion arm):
-    # identical questions, loop ON vs OFF, deltas on recall_all@5.
+    # identical questions, loop ON vs OFF, deltas on recall_all@5. C3-3
+    # (#2569): when the #2521 detector arm (``aggregative_flag``) is ALSO ON,
+    # the loop's CHECK is routed through the detector's per-facet census for
+    # entity-scoped aggregation/spread questions and UNIONED with the
+    # proxy's (never swapped, so the interim cannot regress); the routed
+    # markers ride ``coverage_loop_stats`` (``loop_check_authority`` /
+    # ``loop_routed_dimension`` / ``loop_detector_signal``).
     coverage_loop: bool | None = None,
     # C4 (#2517/#2568, #2513): source-session re-injection — tri-state
     # (True/False explicit, None = env
@@ -1806,6 +1812,15 @@ def retrieve_for_question(
     loop_iterations = 0
     loop_merged_added = 0
     loop_latency_ms = 0.0
+    # C3-3 (#2569): the coverage-signal routing markers — which check owned
+    # the decision, the routed facet axis, and the two checks' missing-facet
+    # counts (so a flip is attributable to the routed check, not to the
+    # proxy, and the interim stays reconstructable per outcome).
+    loop_check_authority = "rule-proxy"
+    loop_routed_dimension = "session"
+    loop_detector_signal = "none"
+    loop_detector_missing = 0
+    loop_proxy_missing = 0
     if coverage_loop_on and not is_tr and pool:
         from tortoise import coverage_loop as _cl
         _t_loop = time.monotonic()
@@ -1822,6 +1837,38 @@ def retrieve_for_question(
                 session_dates=_session_dates)
             _missing_facets = _cl.coverage_gap(
                 _facets, pool, window=_LOOP_WINDOW)
+            loop_proxy_missing = len(_missing_facets)
+            # ── C3-3 (#2569): route the CHECK through the #2521 detector ──
+            # The detector owns the coverage decision for entity-scoped
+            # aggregation/spread questions (it names the aggregation axis —
+            # session/kind/date_month — and counts the facets under it). The
+            # proxy's session-span check stays in force everywhere.
+            # UNION, never a swap: the detector's check has no "seeded"
+            # precondition, so k = 0 fires — the never-reached class the
+            # proxy deliberately skips as index noise — which means routing
+            # can only ADD a fire opportunity, never remove one. At k = 0 the
+            # proxy's own census facet is present but not in its missing
+            # list, so its harvested anchor-spine vocabulary (the starved
+            # sessions' E3 keys included) is what the routed facet expands
+            # with — ONE harvest, one graph census, no duplicated E3 fetch.
+            # The block is armed only when BOTH the loop arm and the #2521
+            # detector arm are ON: the detector arm alone stays
+            # measurement-only (the #2521 contract), and loop-ON +
+            # detector-OFF is exactly the rule-proxy interim the routing must
+            # not regress.
+            _route = _cl.route_coverage_signal(question["question"])
+            if aggregative_flag_on and _route.routed:
+                _det_missing, _det_report = _cl.detector_coverage_gap(
+                    sdk._get_proj(), question["question"], pool,
+                    window=_LOOP_WINDOW, route=_route,
+                    session_dates=_session_dates,
+                    anchor_aliases={f.name: f.aliases for f in _facets})
+                loop_check_authority = _det_report["authority"]
+                loop_routed_dimension = _det_report["dimension"]
+                loop_detector_signal = _det_report["signal"]
+                loop_detector_missing = len(_det_missing)
+                _missing_facets = _cl.combine_missing_facets(
+                    _missing_facets, _det_missing)
             if _missing_facets:
                 loop_fired_facet = _missing_facets[0].key
                 _exp = _cl.loop_expansion_pass(
@@ -1886,6 +1933,11 @@ def retrieve_for_question(
             loop_fired_facet = None
             loop_iterations = 0
             loop_merged_added = 0
+            loop_check_authority = "rule-proxy"
+            loop_routed_dimension = "session"
+            loop_detector_signal = "none"
+            loop_detector_missing = 0
+            loop_proxy_missing = 0
         loop_latency_ms = (time.monotonic() - _t_loop) * 1000.0
     coverage_loop_stats = {
         "on": coverage_loop_on,
@@ -1895,6 +1947,15 @@ def retrieve_for_question(
         "loop_window": _LOOP_WINDOW,
         "loop_latency_ms": round(loop_latency_ms, 2),
         "tr_excluded": bool(is_tr),
+        # C3-3 (#2569): the routing census — the check authority, the routed
+        # facet axis, the detector's signal, and each check's missing count.
+        # All-zero/rule-proxy without the loop OR without the #2521 detector
+        # arm, so the interim is reconstructable per outcome.
+        "loop_check_authority": loop_check_authority,
+        "loop_routed_dimension": loop_routed_dimension,
+        "loop_detector_signal": loop_detector_signal,
+        "loop_detector_missing": loop_detector_missing,
+        "loop_proxy_missing": loop_proxy_missing,
     }
 
     # ── C4 (#2517/#2568, #2513): source-session re-injection — from the
