@@ -43,8 +43,9 @@ The owner selected that Option (on ``#2817``, 2026-10-07; folded into design
 
 4. **Ambiguity is refused by CLASS, never by a list of known-bad characters.**
    A separator *of any kind* between digit groups abstains: the guard looks at
-   what follows the token and drops when the next thing is punctuation and then
-   a digit (``[^\\w\\s]+\\s?\\d``), so a middle dot, a hyphenation point, a bullet
+   what follows the token — through anything that is not a letter or digit —
+   and drops when the next alphanumeric is a digit
+   (``[^A-Za-z0-9]*\\d``), so a middle dot, a hyphenation point, a bullet
    operator, an Arabic decimal separator — or a separator Unicode has not
    defined yet — lands on ``ambiguous_separator`` instead of ending the number
    at its first digit group. Extending a charset one character at a time is how
@@ -89,11 +90,16 @@ this module is additive and never moves a number out of ``content``/``quote``.
   never an occurrence time: extracting a date from the sentence into
   ``Point.when``'s meaning would conflate the two (design §3/OD3, mode 8).
 
-Wiring this into ``execute_embed`` is **not** done here: the field's
-declaration on the Point property lane is #2782's (PR #8976), and design §7.2
-puts declaration (step 2) before derivation (step 3). Writing undeclared props
-first would set off the projection's "not declared" drift warning on every
-rebuild (design §7.1).
+Wiring this into ``execute_embed`` is **not done here**, but the reason is no
+longer the dependency it once was: the field's declaration on the Point
+property lane **LANDED** (``ef405bd3e``, #2782 / PR #8976 — the projection's
+Point property list now takes its money keys from ``MONEY_VALUE_FIELDS``), so
+design §7.2 step 2 is satisfied and the ``pt_entry`` write is **unblocked**.
+It is left to a follow-up because this PR's scope is the derivation alone: the
+write path is a behaviour change on the live extraction lane and needs its own
+review, not a rider on this one. (The older blocking reason — writing
+undeclared props would set off the projection's "not declared" drift warning
+on every rebuild, design §7.1 — no longer applies.)
 """
 from __future__ import annotations
 
@@ -295,7 +301,17 @@ _CONTINUES_AS_GROUP = re.compile(
 #: end at the token — so the token is a truncated first group, not an amount.
 #: A charset of known separators is what let U+00B7/U+2027/U+2219/U+2010/U+066B
 #: (and the next one Unicode adds) silently type ``1.234`` as ``1``.
-_SEPARATOR_THEN_NUMBER = re.compile(r"[^\w\s]+\s?\d")
+#: Whitespace is NOT an escape hatch (review cycle 4, P1): the guard skips ANY
+#: non-alphanumeric — whitespace, punctuation, underscore — before the digits,
+#: because the old adjacency-anchored form typed ``EUR 1 .234``, ``EUR 1 _234``
+#: and a number broken across a newline as ``1.00`` — the same truncated-prefix
+#: class, reached through one stray space (a line-broken number is how that
+#: arrives from a real extract). Stated as "skip everything that is not a
+#: letter or digit, then a digit must not follow", the rule is a CLASS with no
+#: character to add next: the cost is a deliberate over-abstention (a
+#: sentence-final period followed by a spaced digit, ``EUR 800. 3 hires``,
+#: abstains too), which is the safe direction this design always takes.
+_SEPARATOR_THEN_NUMBER = re.compile(r"[^A-Za-z0-9]*\d")
 
 
 def _drop(reason: str, detail: str = "") -> Normalization:
@@ -510,7 +526,15 @@ def normalize_money(text: str) -> Normalization:
             props.append(money_props(
                 amount_minor, currency, minor_unit_exponent=exponent,
                 verbatim=verbatim, as_of=as_of))
-        except MoneyValueError as exc:      # Layer 1 refuses → we abstain
+        except MoneyValueError as exc:
+            # Unreachable by construction TODAY — every refusal money_props can
+            # raise is pre-empted above (the anchor is a table member, the
+            # exponent IS the table's, ``no_minor_unit`` returns early, the
+            # amount is an int, ``verbatim`` is non-empty by ``_NUM``'s grammar,
+            # ``asOf`` comes from the asserted-date shape). Kept explicit, like
+            # the int() guard below, because ``money.py`` is a LIVE contract that
+            # tightened once already (#8976): a Layer-1 refusal must land on an
+            # abstention, never on an unhandled exception.
             return _drop("refused_by_layer1", str(exc))
 
     if not props:

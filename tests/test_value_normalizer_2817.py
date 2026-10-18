@@ -194,6 +194,33 @@ def test_any_separator_family_abstains(sep):
     assert result.drop_reason == "ambiguous_separator", result.drop_reason
 
 
+@pytest.mark.parametrize("sep", _SEPARATOR_CHARS, ids=lambda c: f"U+{ord(c):04X}")
+@pytest.mark.parametrize("gap", [" ", "  ", "\n", "\u00a0"], ids=repr)
+def test_any_separator_family_abstains_through_whitespace(sep, gap):
+    """Cycle-4 P1: the class was closed only for an ADJACENT separator, so a
+    stray space reopened it — ``EUR 1 .234`` and ``R$ 1\n.234,56`` (a number
+    broken across a line, which is how a real extract delivers it) both typed
+    ``1.00``, the same truncated prefix the class names. Whitespace is not an
+    escape hatch: the guard skips it on both sides of the punctuation, so the
+    invariant holds for every separator × every gap that can precede it."""
+    result = normalize_money(f"EUR 1{gap}{sep}234")
+    assert not result.typed, f"{gap!r}{sep!r} typed {result.props}"
+    assert result.drop_reason == "ambiguous_separator", result.drop_reason
+
+
+@pytest.mark.parametrize("text", [
+    "EUR 1 .234", "R$ 1 .234,56", "EUR 800 ,00", "R$ 1\n.234,56",
+    "EUR 1 . 234",
+])
+def test_whitespace_never_reopens_the_separator_class(text):
+    """The named regression, verbatim: each of these typed a value before
+    cycle 4. A false TYPE is the one outcome this module must never produce,
+    and ``1.00`` from ``1.234`` is exactly it."""
+    result = normalize_money(text)
+    assert not result.typed, f"{text!r} typed {result.props}"
+    assert result.drop_reason == "ambiguous_separator", result.drop_reason
+
+
 def test_every_ascii_punctuation_separator_abstains():
     """The same invariant over the whole ASCII punctuation class (the reason
     may differ — ``-`` and ``/`` are range connectors — but no value appears)."""
