@@ -209,12 +209,17 @@ Points' payloads (#7951).
 predates #3585, rebuilding a journal written by a newer one, warns that the
 record type is unrecognized and skips it, and silently drops unknown
 `PointRevised` extras. A binary carrying #3585 or later instead fails the
-replay loudly (R8) on the graph-backed rebuild/recover engines: the type is
-recorded as a non-folded event and the run refuses rather than returning an
-incomplete graph. The three documented `EXEMPT_SHAPES` are the only non-folded
-records that are recorded WITHOUT refusing the run. The in-memory index alone
-opens no run boundary and warns
-without refusing. The
+replay loudly (R8) on **every engine that opens a run boundary** — the
+graph-backed `rebuild_all` / `rebuild` / `recover_from_log` replay engines, the
+`backup.restore` replay, and `check_consistency`'s reference fold (the
+`check-consistency` CLI): the type is recorded as a non-folded event and the run
+refuses rather than returning an incomplete graph. `rebuild_all`, `rebuild` and
+`backup.restore` raise `NonFoldedEventsError`; `recover_from_log` and
+`check_consistency` return a failed verdict instead (`recovered=False` /
+`ok=False` with `divergence="non-folded"`). The three documented `EXEMPT_SHAPES`
+are the only non-folded records that are recorded WITHOUT refusing the run. The
+in-memory index **alone** opens no run boundary and warns without refusing —
+`check_consistency` is the in-memory path that refuses. The
 rebuild path has no pre-wipe allowlist analogous to
 `_assert_episodic_points_recreatable`; forward-only evolution of the JSONL
 record vocabulary is a known limitation, not a supported downgrade path.

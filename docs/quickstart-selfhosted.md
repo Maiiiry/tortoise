@@ -418,13 +418,19 @@ predates #3585, replaying a journal written by a newer one, cannot fold the new
 record kinds: it warns that the type is unrecognized and skips it, and the
 rebuilt graph is silently incomplete. (It also reintroduces wipe-before-parse,
 turning one torn line into total loss.) Conversely, a binary carrying #3585 or
-later **fails the replay loudly** (R8) on the graph-backed rebuild and recover
-engines: the run names the first few of the REFUSED records together with their
-total count, and refuses — so you get a refusal rather than a silently incomplete
-graph. (Exempt records are unfolded too, but they are neither counted nor
-refused: see `EXEMPT_SHAPES`.) (The
-in-memory index opens no run boundary, so it warns only.) Either way the restore
-path is a pre-release backup per the drill above, not a downgrade.
+later **fails the replay loudly** (R8) on **every engine that opens a run
+boundary**: the graph-backed `rebuild_all` / `rebuild` / `recover_from_log`
+replay engines, the `backup.restore` replay, and `check_consistency`'s
+reference fold (the `check-consistency` CLI). The run names the first few of the
+REFUSED records together with their total count, and refuses — so you get a
+refusal rather than a silently incomplete graph. `rebuild_all`, `rebuild` and
+`backup.restore` raise `NonFoldedEventsError`; `recover_from_log` and
+`check_consistency` return a failed verdict instead (`recovered=False` /
+`ok=False` with `divergence="non-folded"`). Exempt records are unfolded too, but
+they are neither counted nor refused: see `EXEMPT_SHAPES`. The in-memory index
+**on its own** opens no run boundary, so it warns only — `check_consistency` is
+what puts that same fold inside one. Either way the restore path is a
+pre-release backup per the drill above, not a downgrade.
 
 ## 8. Expansion packs (optional)
 
