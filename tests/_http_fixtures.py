@@ -136,7 +136,7 @@ def quiesce_testclient_background_work(monkeypatch) -> None:
     (``sb_client``, ``reg_client``, ``supabase_client``).
 
     `_lifespan` arms background work for EVERY `TestClient(app)` entry,
-    regardless of control-plane mode, and all of it touches the same store
+    regardless of control-plane mode, and part of it touches the same store
     the test body is driving:
 
     1. `_run_boot_sweeps()` (armed by `_lifespan` as
@@ -159,15 +159,25 @@ def quiesce_testclient_background_work(monkeypatch) -> None:
        exclusive ownership of a sweep production also runs. Every caller is
        therefore quiesced here.
 
-       #3036 added a THIRD caller to both sites — `_sweep_oauth_retention`
-       (a `_run_boot_sweeps` member AND an `_event_retention_loop` call). It
-       is benign for these fixtures (it touches only the fake control plane), but
-       the enumeration above is the guard that makes the next lifespan-armed
-       caller visible, so keep it complete: a new sweep reachable from either
-       entry point belongs in this list.
+       The COMPLETE membership is the two tuples in `hosted_api.py` —
+       `_run_boot_sweeps` (six steps) and `_event_retention_loop` (those six
+       plus `_refresh_cost_allocation`) — and this list exists so the next
+       addition is visible, not to be re-derived here. It was INCOMPLETE until
+       #4816: it named three of the six and omitted
+       `_reconcile_metering_periods` (#4241), the only one that calls an
+       **RPC** on the control plane (`metering_repair_period_bounds`) and
+       therefore the one that could land in `FakeControlPlane.rpc_calls` ahead
+       of a test's own call. That omission is exactly the flake this seam now
+       prevents.
 
-       The CALLEE is deliberately not stubbed: this file's tests call
-       `ha_mod._purge_deleted_orgs()` directly and resolve it off the
+       Enumerated for reference: `_sweep_events`, `_purge_deleted_orgs`,
+       `_purge_deleted_accounts`, `_sweep_oauth_retention`,
+       `_sweep_invite_ghosts`, `_reconcile_metering_periods` (boot + loop), and
+       `_refresh_cost_allocation` (loop only). A new sweep reachable from
+       either entry point belongs here.
+
+       The CALLEE is deliberately not stubbed: `tests/test_export_delete.py`
+       calls `ha_mod._purge_deleted_orgs()` directly and resolve it off the
        module at call time, so a callee stub would silence the very call
        under test. `_run_boot_sweeps` is stubbed with an `async def` because
        `_lifespan` arms it with `create_task(...)` (see
@@ -192,17 +202,18 @@ def quiesce_testclient_background_work(monkeypatch) -> None:
        fresh-start branch. #3546 moved that serialization to ONE
        process-wide lock for the whole session
        (`tests/_embedded.EMBEDDED_CONSTRUCTION_LOCK`, installed by
-       `tests/conftest._serialize_embedded_construction`) — this file no
-       longer installs its own.
+       `tests/conftest._serialize_embedded_construction`) — the callers no
+       longer install their own,
 
-       LANE SCOPE — the serialization is INERT on the lane CI runs this file
-       on. Under a supported `TORTOISE_DB_URI` (the docker lane, this file's
-       default) every construction from this module redirects to that server
+       LANE SCOPE — the serialization is INERT on the lane CI runs these
+       suites on. Under a supported `TORTOISE_DB_URI` (the docker lane, both
+       suites' default) every construction from this module redirects to that server
        (`tortoise/projection/__init__.py`, the #1647 D-1=A test redirect:
        `path` is nulled, so `_is_embedded` is False), so no redislite daemon
-       exists and no double-start is possible. `test_export_delete` is NOT in
+       exists and no double-start is possible. NONE of the callers
+       (`test_export_delete`, `test_pack_state`) is in
        `tests._embedded.TEST_NO_REDIRECT_STEMS`, which is what selects that
-       branch. On that lane the protection this file actually gets is item 1
+       branch. On that lane the protection the callers actually get is item 1
        — the BOOT-SWEEP quiesce, which removes the second caller of
        `_purge_deleted_orgs` — and NOT the serialization. The lock is live
        only on the embedded tier-2 / carve-out lane (no URI), where

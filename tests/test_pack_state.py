@@ -457,9 +457,9 @@ def supabase_client(monkeypatch):
     })
     # #4816: `TestClient(app)` entry arms `_run_boot_sweeps` — mode-independent —
     # and its metering step calls `get_control_plane().rpc(...)`, which under
-    # this fixture IS the FakeControlPlane below. A sweep landing before the
-    # request made `fake.rpc_calls[0]` read the sweep, which is the 1-in-4
-    # failure this issue reported. Quiesce the lifespan-armed work (the seam
+    # this fixture IS the `FakeControlPlane` built above. A sweep landing before
+    # the request is what made `fake.rpc_calls[0]` read the sweep — the failure
+    # this issue reports. Quiesce the lifespan-armed work (the seam
     # #3472/#3505 already established) instead of tolerating the noise in
     # every assertion.
     quiesce_testclient_background_work(monkeypatch)
@@ -541,11 +541,12 @@ class TestProvisioningHooks:
         assert r.status_code == 200, r.text
         org_id = r.json()["org_id"]
         if not sweep_noise:
-            # The fixture quiesces the lifespan-armed work, so the sweep must
-            # record nothing at all. Without this, a regression in the quiesce
-            # would only reappear as a 1-in-N flake somewhere else.
-            assert not [c for c in fake.rpc_calls
-                        if c[0] == "metering_repair_period_bounds"], (
+            # The fixture quiesces the lifespan-armed work, so the request's own
+            # call must be the ONLY one recorded. Naming one sweep would go
+            # green the moment a different (or renamed) sweep started landing —
+            # which is precisely how this flake got in. Exact order, so any
+            # polluter fails here instead of as a 1-in-N flake elsewhere.
+            assert [c[0] for c in fake.rpc_calls] == ["provision_team"], (
                 "the boot sweep must be quiesced in supabase_client (#4816)")
         provision = rpc_call_named(fake, "provision_team")
         assert provision[0] == "provision_team"
