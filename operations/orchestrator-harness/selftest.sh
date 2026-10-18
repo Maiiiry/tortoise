@@ -237,6 +237,34 @@ grep -q 'CONFLICTING -> fixer attempt' "$LOOP" && rc=0 || rc=1
 ck "the conflict fixer is logged and capped like other fix loops" $rc
 grep -q 'resolving the conflict IS the task' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer prompt treats a conflict as the task" $rc
+# A Mac reboot lands in an indexing storm; piling 6 reviewers onto it makes the spike worse.
+# Drive the shipped gate (a text-presence check passes even if the gate is neutered to `true` —
+# that was reproduced against this very file before the checks below replaced it).
+grep -m1 '^can_spawn() {' "$LOOP" > "$TMP/canspawn.sh"
+if need "$TMP/canspawn.sh" "can_spawn() is extracted from the shipped loop"; then
+  MAX_LOAD=16
+  # shellcheck disable=SC1090
+  . "$TMP/canspawn.sh"
+  L=0;  can_spawn && rc=0 || rc=1;  ck "shipped can_spawn(): load 0 < 16 -> spawn allowed" $rc
+  L=15; can_spawn && rc=0 || rc=1;  ck "shipped can_spawn(): load 15 < 16 -> spawn allowed" $rc
+  L=16; can_spawn && rc=1 || rc=0;  ck "shipped can_spawn(): load 16 -> spawn held back" $rc
+  L=221; can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 221 (post-boot storm) -> held back" $rc
+  L="";  can_spawn && rc=0 || rc=1;  ck "shipped can_spawn(): unset/empty load defaults to 0 (documented fail-open)" $rc
+fi
+# Each of the four spawn sites must carry the gate. Assert the SPECIFIC conditions, not a count:
+# a count is satisfied by decoy comment lines, which is exactly how the previous version of this
+# check passed against a build with every gate removed.
+fixer_sites=$(grep -F "grep -c '^fix-')" "$LOOP" | grep -cF can_spawn)
+merge_site=$(grep -F "grep -c '^merge-')" "$LOOP" | grep -cF can_spawn)
+review_site=$(grep -cF '&& can_spawn \' "$LOOP")
+[ "$fixer_sites" = "2" ] && rc=0 || rc=1
+ck "both fixer spawn sites (conflict + CI-red) carry the gate" $rc
+[ "$merge_site" = "1" ] && rc=0 || rc=1
+ck "the merge re-review spawn carries the gate" $rc
+[ "$review_site" = "1" ] && rc=0 || rc=1
+ck "the review-fix spawn carries the gate" $rc
+grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
+ck "the cheap merge path stays ungated" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
 sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"
@@ -374,6 +402,14 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   ck "shipped claim_live(): the stale claim file is removed" $rc
 fi
 
+grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=0 || rc=1
+ck "a non-review required check failure is routed to the fixer" $rc
+grep -q 'CI-red (.*fixer attempt' "$LOOP" && rc=0 || rc=1
+ck "the CI-red fixer is logged and capped like other fix loops" $rc
+grep -q 'FAILING_CHECKS=' "$HERE/fix-one.sh" && rc=0 || rc=1
+ck "the fixer is given the failing check" $rc
+grep -q 'failing.txt' "$HERE/fix-one.sh" && rc=0 || rc=1
+ck "the fixer is given the failing CI log" $rc
 # ── 15) a hung worker cannot hold a concurrency slot forever ────────────────────
 # `pi -p` has no internal timeout. A hung reviewer occupied a merge slot for 9 hours on
 # 2026-10-12 while the caps (which count SESSIONS) reported the slot as busy.
@@ -395,6 +431,12 @@ if need "$TMP/reapw.sh" "reap_stale_workers() is extracted from the shipped loop
   ck "shipped reaper kills a session whose log has gone stale" $rc
   grep -q 'reap-worker' "$LOG" && rc=0 || rc=1
   ck "the reaper logs what it killed" $rc
+  # Exact-match targets: a prefix match would let the reaper kill a DIFFERENT, healthy session
+  # if the stale one exited between the snapshot and the kill.
+  grep -q 'kill-session -t "=\$s"' "$LOOP" && rc=0 || rc=1
+  ck "the reaper uses exact session targets (=name), not prefix matches" $rc
+  grep -q 'list-panes -t "=\$s"' "$LOOP" && rc=0 || rc=1
+  ck "the reaper resolves the pane pid with an exact target" $rc
   unset -f tmux kill
 fi
 # the agent invocation is wall-clock bounded, portably (macOS has no timeout/gtimeout)

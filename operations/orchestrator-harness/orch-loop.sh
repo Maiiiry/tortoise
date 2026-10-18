@@ -77,9 +77,13 @@ reap_stale_workers() {
     [ -f "$f" ] || continue
     age=$(( $(date +%s) - $(stat -f '%m' "$f" 2>/dev/null || echo "$(date +%s)") ))
     [ "$age" -gt $((STALE_MIN * 60)) ] || continue
-    pid="$(tmux list-panes -t "$s" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    pid="$(tmux list-panes -t "=$s" -F '#{pane_pid}' 2>/dev/null | head -1)"
     echo "[reap-worker] $s silent ${age}s -> killing session (pane_pid=${pid:-?})" >> "$LOG"
-    tmux kill-session -t "$s" 2>/dev/null
+    # `=name` forces an EXACT session match. Without it tmux prefix-matches, so if this session
+    # exited between the `tmux ls` snapshot above and here, `-t merge-82` would resolve to the
+    # healthy `merge-821` and kill an in-flight worker (verified: `-t zzproof-10` killed
+    # `zzproof-101`, while `-t =zzproof-10` errors instead).
+    tmux kill-session -t "=$s" 2>/dev/null
     # tmux HUPs the pane's process group; a child that ignored it (e.g. a stuck find) is killed here.
     if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null; fi
   done
@@ -90,6 +94,11 @@ load1() { sysctl -n vm.loadavg 2>/dev/null | awk '{print int($2)}'; }
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
+# Spawning an agent during a load spike makes the spike worse. A Mac reboot lands in an indexing
+# storm (Spotlight, PerfPowerServices, duetexpertd) that the LANE dispatch gate already respects
+# while the merge sweep did not — so a fresh boot got 6 reviewers piled onto it. The cheap actions
+# (gh pr merge / ready / run rerun) stay ungated; only new agent sessions are held back.
+can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }
 
 # Merge priority: a merge backlog means the box's scarce capacity belongs to review+merge, not to
 # opening more PRs. These two functions hold the rule so it is directly testable (and so a
@@ -177,7 +186,7 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
           elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
-          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ]; then
+          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
               echo $((NFC + 1)) > "$CF"
@@ -206,6 +215,7 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
+               && can_spawn \
                && [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ]; then
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
               # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
@@ -225,10 +235,31 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
               echo "${HEAD_N:-}" > "$O/state/parked-$PR"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
-            elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ]; then
+            elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
+            fi
+          fi
+        elif echo "$V" | grep -qE 'docs|test-isolation|license-surface|legal-e2e|pricing-artifact'; then
+          # A required check OTHER than the review gate or python CI is red — docs lint, a committed
+          # conflict marker, legal-e2e, test isolation. Nothing re-recorded or reran those, so such a
+          # PR sat red forever with no worker at all (observed: #8278 had conflict markers committed,
+          # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
+          # which now also receives the failing CI log, capped like every other fix loop.
+          NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
+          case "$NFC2" in ''|*[!0-9]*) NFC2=0 ;; esac
+          if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
+            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
+          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+            : # a worker is already on it
+          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+              echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
+              echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
+            else
+              echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
             fi
           fi
         fi
