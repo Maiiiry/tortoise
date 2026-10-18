@@ -66,7 +66,12 @@ the invariants that were being checked by hand are checked here instead:
    guard asserted the absence of one literal phrase, so it passed a row that
    stated both. Claims are now read per clause and attached to the door named in
    that clause; a door-less denial that contradicts an affirming door is a
-   failure.
+   failure. Polarity is bound to a negation that GOVERNS "dismiss", never to any
+   negation in the clause: the clause-wide scan the first version used read
+   `never a counted checklist of its own, and it is dismissible once complete` as
+   a DENIAL (so a regressed row affirming an Overview dismissal passed), and read
+   the correct row's `implements no hide` as a denial of the Settings door's
+   recorded dismissible-hide. Both counterexamples are in-suite rejection cases.
 11. **The superseded mirror claim is reconciled where it survived, not only
    where it was first noticed.** `03-scope.md` §4 E2E-6 — the AUTHORITY this
    module's door pin anchors to — still read "mirrored as a dismissible
@@ -74,16 +79,28 @@ the invariants that were being checked by hand are checked here instead:
    `00-align-and-scope.md` (both places) and in `05-ux-decisions.md`'s `Visual
    affordances` row. Live text states the corrected reading; wording kept as
    history carries a supersession note beside it.
+12. **The PLAN is a third copy of the E2E → surface map, and it is checked.**
+   `06-plan.md`'s `### DE2E-6 … [1,2,10]` heading still gave the pre-fix answer
+   after the map, the capstone and the scope were corrected — and no guard read
+   the plan, so the drift was invisible. Two copies drift; a third drifts
+   unguarded. Every `DE2E-N` heading must cite the surface set the map's `E2E-N`
+   row cites.
 
 Every surface is also exercised by at least one high-level E2E row (the E2E-side
 reverse direction) — a surface no scenario touches has no scenario that would
-catch its regression.
+catch its regression. The whole-journey catch-all row (`E2E-12` = `1-17 (all)`)
+is EXCLUDED from that union: including it makes the union equal the surface set
+for every state of the document, which is the vacuity the check replaced. The one
+surface exercised only there (14, W11 telemetry — asserted by E2E-12's dedupe
+clause and by no specific scenario) is baselined by name, so a second one fails.
 
 NON-VACUITY
 -----------
-Checks 4, 5, 6, 8, 10 and 11 fail on the reviewed head's document/text (each
+Checks 4, 5, 6, 8, 10, 11 and 12 fail on the reviewed head's document/text (each
 docstring names the pre-fix text; check 10 additionally replays the exact
-self-contradicting sentence through the guard in-suite). Checks 1-3 are the
+self-contradicting sentence AND the two counterexamples above through the guard
+in-suite, and the E2E-coverage check drives a mutated row set to prove it
+fails). Checks 1-3 are the
 standing invariants the earlier cycles established, check 9 is a parser-shape
 guard and check 7 is a guard whose detector is proved non-blind — guard rails,
 not defect pins. The pre-fix blobs are replayed by pointing this module's pure
@@ -104,6 +121,7 @@ EPIC = ROOT / "docs" / "epics" / "2026-08-29-agent-driven-onboarding-1976"
 DOC = EPIC / "04-test-design.md"
 SCOPE = EPIC / "03-scope.md"
 UX = EPIC / "05-ux-decisions.md"
+PLAN = EPIC / "06-plan.md"
 
 # `03-scope.md` §4 E2E-6 is the AUTHORITY for which re-entry doors exist:
 # "**When:** they re-enter via the Settings Setup guide or the Continue-setup
@@ -323,15 +341,37 @@ def _missing_e2e6_doors(
 # ── dismissal claims: every one of them belongs to a DOOR ──────────────
 #: The two doors `05-ux-decisions.md` row "Affordance: setup card" describes.
 #: The Settings Setup guide owns the recorded dismissible-hide; the Overview
-#: next action owns none.
-_DOOR_WORDS = {"settings": "the settings setup guide", "overview": "the overview"}
+#: next action owns none. Matched as PATTERNS, not literal phrases: the first
+#: version keyed the Settings door on the exact string "the settings setup
+#: guide", so a row affirming it as "the Settings card is dismissible" named no
+#: door at all and its claim was invisible — demonstrated in
+#: `test_the_dismissal_door_guard_rejects_the_one_sentence_contradiction`.
+_DOOR_RES = {
+    "settings": re.compile(
+        r"\bsettings\b[^.;]{0,40}?\b(?:set\s*up\s+guide|guide|card)\b", re.I),
+    "overview": re.compile(
+        r"\boverview\b|\bcontinue[\s-]*setup\s+card\b", re.I),
+}
 
 #: A denial quantified over BOTH doors ("neither card carries a dismissal",
 #: "no door ..."). This is the shape that swallowed the Settings door's
 #: recorded dismissal while an adjacent clause asserted it.
 _DOORLESS_DENIAL = re.compile(
     r"\b(?:neither|no)\s+(?:of\s+the\s+)?(?:both\s+)?(?:cards?|doors?)\b", re.I)
-_NEGATION = re.compile(r"\b(?:no|not|never|neither|nor|without)\b", re.I)
+#: A negation that GOVERNS "dismiss" — not any negation word in the clause.
+#: The clause-wide scan this replaces was wrong in BOTH directions, measured on
+#: the live row: (a) FAIL-OPEN — `never a counted checklist of its own, and it is
+#: dismissible once complete` read as a DENIAL because of "never", so a regressed
+#: Overview row (one that affirms a dismissal) passed the guard whose entire
+#: purpose is that claim; (b) FALSE POSITIVE — the correct row's parenthetical
+#: `implements no hide` read as a denial of the Settings door's dismissible-hide.
+#: Polarity is now bound to the dismissal token itself, and proximity is bounded
+#: to 24 chars so an unrelated negation cannot reach across the clause.
+_DISMISSAL_DENIAL = re.compile(
+    r"\b(?:no|not|never|neither|nor|without|zero)\b[^.;]{0,24}?\bdismiss"
+    r"|\bdismiss\w*\b[^.;]{0,24}?\b(?:is|are|was|were)\s+not\b",
+    re.I,
+)
 _DISMISSAL = re.compile(r"dismiss", re.I)
 
 
@@ -348,8 +388,9 @@ def _dismissal_claims(text: str) -> dict[str, set[str]]:
     for clause in re.split(r"[;.]", text):
         if not _DISMISSAL.search(clause):
             continue
-        verdict = "denies" if _NEGATION.search(clause) else "affirms"
-        doors = [d for d, word in _DOOR_WORDS.items() if word in clause.lower()]
+        # Bound to the dismissal token, never to the clause: see _DISMISSAL_DENIAL.
+        verdict = "denies" if _DISMISSAL_DENIAL.search(clause) else "affirms"
+        doors = [d for d, rx in _DOOR_RES.items() if rx.search(clause)]
         for door in doors:
             claims[door].add(verdict)
         if verdict == "denies" and _DOORLESS_DENIAL.search(clause):
@@ -430,6 +471,30 @@ def test_every_surface_is_reachable_from_a_capability():
         f"surfaces cited by no capability: {sorted(set(_surfaces()) - cited)}")
 
 
+def _uncovered_surfaces(rows: dict[str, set[int]]) -> set[int]:
+    """Surfaces no SPECIFIC E2E row walks.
+
+    The whole-journey catch-all row (`E2E-12` = `1-17 (all)`) is EXCLUDED. Unioning
+    over every row — the previous form — made `exercised` equal to the surface set
+    by construction whenever a 1-17 catch-all exists, so the assertion could never
+    fail for the reason it documents: a surface no concrete scenario walks (no
+    scenario that would catch its regression) was reported as covered.
+    """
+    all_surfaces = set(_surfaces())
+    specific = [s for s in rows.values() if s != all_surfaces]
+    return all_surfaces - (set().union(*specific) if specific else set())
+
+
+#: Surfaces exercised ONLY through the whole-journey catch-all row. Baselined,
+#: not ignored: the check fails if a SECOND surface joins this set, which is the
+#: drift that matters. Surface 14 (onboarding telemetry, W11) is asserted by
+#: `03-scope.md` §4 E2E-12 — "W11 fires seed_complete + decide_complete once per
+#: org (deduped)" — and by no SPECIFIC scenario; its own `Test Layer` is
+#: "Integration + regression (analytics.py existing tests)", so no journey row
+#: owns it. Recorded here rather than silently absorbed by the catch-all.
+_CATCH_ALL_ONLY_SURFACES = {14}
+
+
 def test_every_surface_is_exercised_by_at_least_one_e2e_row():
     """The E2E-side reverse direction: a surface no high-level scenario walks has
     no scenario that would catch its regression.
@@ -437,10 +502,76 @@ def test_every_surface_is_exercised_by_at_least_one_e2e_row():
     This replaces an assertion that was implied by the capability-direction check
     above (`{n for c in ...} <= set(_surfaces())` holds whenever the union equals
     the surface set) and could never fail independently while reading as a second
-    direction."""
-    exercised = set().union(*_e2e_rows().values())
-    assert exercised == set(_surfaces()), (
-        f"surfaces no E2E row exercises: {sorted(set(_surfaces()) - exercised)}")
+    direction. It is written against `_uncovered_surfaces`, which excludes the
+    whole-journey catch-all: including it re-introduced the same vacuity, because
+    `E2E-12` is `1-17 (all)` and the union then equals the surface set for EVERY
+    state of the document. The one surface that genuinely survives only in the
+    catch-all is baselined (`_CATCH_ALL_ONLY_SURFACES`), so a SECOND one fails.
+    """
+    rows = _e2e_rows()
+    assert set(_surfaces()) in rows.values(), (
+        "the whole-journey catch-all E2E row is gone — this check assumes one "
+        "row cites the full surface set")
+    uncovered = _uncovered_surfaces(rows)
+    assert uncovered == _CATCH_ALL_ONLY_SURFACES, (
+        f"surfaces no specific E2E row exercises: {sorted(uncovered)} — expected "
+        f"only the baselined catch-all-only set {sorted(_CATCH_ALL_ONLY_SURFACES)}. "
+        "A new surface here has no scenario of its own to catch its regression")
+    # Non-vacuity: the check must FAIL when a surface survives only in the
+    # catch-all. Drop surfaces 15/16 from every specific row of a mutated copy.
+    mutated = {n: (s - {15, 16}) for n, s in rows.items()}
+    assert _uncovered_surfaces(mutated) - _CATCH_ALL_ONLY_SURFACES == {15, 16}, (
+        "the E2E-coverage check passes a document where two surfaces survive "
+        "only in the catch-all row")
+
+
+@lru_cache(maxsize=1)
+def _plan_de2e_rows() -> dict[str, set[int]]:
+    """`E2E-N` → the surfaces `06-plan.md`'s `DE2E-N` heading cites.
+
+    The plan is the THIRD copy of the same mapping: its `### DE2E-6 … [1,2,10]`
+    heading still gave the pre-fix answer after `04-test-design.md`,
+    `capstone-report.md` and `03-scope.md` were corrected — the exact defect
+    class this module exists for, one document further out. `DE2E-N` and
+    `E2E-N` are the same numbered scenario (DE2E-5 and DE2E-8 already agree
+    with the map), so the numbers are comparable directly.
+    """
+    out: dict[str, set[int]] = {}
+    for line in PLAN.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^###\s+(DE2E-\d+)\b.*?\[(?:surfaces\s+)?([^\]]+)\]", line)
+        if not m:
+            continue
+        numbers: set[int] = set()
+        for chunk in re.findall(r"\d+\s*-\s*\d+|\d+", m.group(2)):
+            if "-" in chunk:
+                lo, hi = (int(p) for p in chunk.split("-"))
+                numbers.update(range(lo, hi + 1))
+            else:
+                numbers.add(int(chunk))
+        out["E2E-" + m.group(1).split("-")[1]] = numbers
+    return out
+
+
+def test_the_plan_cites_the_same_surfaces_for_every_e2e_row():
+    """The plan is a third copy of the E2E → surface map, and it had drifted.
+
+    PRE-FIX: `06-plan.md` read `### DE2E-6 — Graph-held resumption [1,2,10]`
+    while the map said `1, 2, 9, 10` — and none of the guards read the plan, so
+    the drift was invisible. Two copies drift; a third copy drifts unguarded.
+    The map is the source here (this PR's whole point), and the comparison is
+    set-based so ordering and spacing cannot mask a difference.
+    """
+    plan = _plan_de2e_rows()
+    mapped = _e2e_rows()
+    assert plan, "could not parse any `### DE2E-N … [surfaces]` heading in 06-plan.md"
+    assert set(plan) == set(mapped), (
+        "the plan's DE2E rows drifted from the map's E2E rows: "
+        f"plan-only {sorted(set(plan) - set(mapped))}, "
+        f"map-only {sorted(set(mapped) - set(plan))}")
+    drift = {k: (sorted(plan[k]), sorted(mapped[k])) for k in plan if plan[k] != mapped[k]}
+    assert not drift, (
+        "06-plan.md gives a different surface set than 04-test-design.md for: "
+        + "; ".join(f"{k} plan={p} map={m}" for k, (p, m) in sorted(drift.items())))
 
 
 def test_capability_rows_are_the_scopes_rows_in_order():
@@ -670,6 +801,31 @@ def test_the_dismissal_door_guard_rejects_the_one_sentence_contradiction():
             "re-open path when complete; the Overview next action mirrors that "
             "state as ONE next step + a CTA and carries no dismissal")
     assert not _dismissal_claim_conflicts(good), _dismissal_claim_conflicts(good)
+
+    # The two counterexamples the round-4 review MEASURED on the pre-fix guard,
+    # which read polarity from ANY negation anywhere in the clause. They are kept
+    # as in-suite rejection cases so the rule cannot silently regress to it.
+    # (a) FAIL-OPEN: the row's own "never a counted checklist" supplied the
+    #     negation, so a row AFFIRMING a dismissible Overview passed the guard.
+    regressed = (
+        "the Settings Setup guide is the counted checklist card and the decision "
+        "recorded for THAT door is dismissible-hide with a re-open path; the "
+        "Overview next action mirrors that state as ONE next step + a CTA into the "
+        "guide — never a counted checklist of its own — and the Overview door is "
+        "dismissible once complete")
+    assert _dismissal_claim_conflicts(regressed), (
+        "the guard passes a row that AFFIRMS a dismissible Overview door: a "
+        "negation elsewhere in the clause must not deny the door's own claim")
+    # (b) FALSE POSITIVE: a correct row whose Settings clause mentions "no hide"
+    #     was rejected as denying the Settings door's recorded dismissible-hide.
+    correct_with_no_hide = (
+        "the Settings Setup guide is the counted checklist card — its recorded "
+        "decision is dismissible-hide with a re-open path, though the shipped card "
+        "implements no hide; the Overview next action carries no dismissal")
+    assert not _dismissal_claim_conflicts(correct_with_no_hide), (
+        "the guard rejects a correct row because 'implements no hide' reads as a "
+        "denial of the Settings door: "
+        + str(_dismissal_claim_conflicts(correct_with_no_hide)))
 
 
 # ═══════════════════════════════════════════════════════════════════════
