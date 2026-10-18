@@ -121,7 +121,8 @@ DEFAULT_LEXICAL_WEIGHT = 1.0
 #: mutation that reds ``test_lexical_weight_is_bounded_below_the_dense_leg``:
 #: with an unbounded weight the lexical leg alone decides the order and the
 #: dense leg's best hit — the read's actual answer — falls below a lexical
-#: also-ran.
+#: also-ran. A DISABLED dense leg (weight <= 0) is not the strongest leg, so
+#: it does not lower this bound — see :func:`resolve_lexical_weight`.
 LEXICAL_WEIGHT_MAX = 1.0
 
 
@@ -273,6 +274,18 @@ def resolve_lexical_weight(
     ``TORTOISE_FUSION_WEIGHTS`` (``json.loads`` accepts any float) and a kwarg
     caller, so there is one place a reviewer has to check.
 
+    A NON-POSITIVE dense weight means the bound does NOT apply, not that the
+    lexical weight is zero. ``TORTOISE_FUSION_WEIGHTS='{"vector": 0}'`` is the
+    natural spelling of "the dense leg does not contribute", and it makes the
+    lexical leg the strongest leg it is fused with — so the faithful cap is
+    :data:`LEXICAL_WEIGHT_MAX`. Returning ``0.0`` there would zero BOTH legs
+    (``rrf_fusion`` scores every candidate ``weight * 1/(k+rank)``), which
+    silently collapses the whole fused read to a constant: every hit ties at
+    0.0, the order degrades to id order, and a ``threshold > 0`` caller gets no
+    rows at all (#8488 review P2). Pre-clamp, the same knob left the lexical
+    leg at ``rrf_fusion``'s implicit 1.0 and produced a correct lexical-only
+    ranking — so a zero cap would also be a REGRESSION, not a tightening.
+
     Degenerate inputs degrade to :data:`DEFAULT_LEXICAL_WEIGHT` rather than
     raising: a fusion weight is a tuning knob, and a read must never fail
     because a knob was misspelled. NaN/±inf are the #3019 class — they destroy
@@ -280,7 +293,7 @@ def resolve_lexical_weight(
     exactly like ``rrf_fusion``'s own guard does.
     """
     dense = _finite_or(dense_weight, 1.0)
-    cap = min(LEXICAL_WEIGHT_MAX, dense) if dense > 0 else 0.0
+    cap = LEXICAL_WEIGHT_MAX if dense <= 0.0 else min(LEXICAL_WEIGHT_MAX, dense)
     w = _finite_or(weight, DEFAULT_LEXICAL_WEIGHT)
     if w < 0.0:
         return 0.0

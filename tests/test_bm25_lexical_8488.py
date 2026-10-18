@@ -267,6 +267,31 @@ class TestLexicalWeightBound:
         assert resolve_lexical_weight(-3.0, 1.5) == 0.0
         assert resolve_lexical_weight("garbage", 1.5) == 1.0
 
+    def test_a_disabled_dense_leg_does_not_zero_the_lexical_leg(self):
+        """A dense weight of 0 DISABLES the dense leg; it does not unbind fts.
+
+        ``TORTOISE_FUSION_WEIGHTS='{"vector": 0}'`` is the natural spelling of
+        "the dense leg does not contribute". Capping the lexical weight at the
+        dense weight then makes it 0.0 too, and ``rrf_fusion`` scores EVERY
+        candidate ``weight * 1/(k+rank)`` — so both legs zero, every hit ties
+        at 0.0, the fused order silently degrades to id order, and a caller
+        with ``threshold > 0`` gets NO rows at all. The bound's own rule is
+        "never more than the strongest leg it is fused WITH"; a disabled leg
+        is not the strongest, so the faithful cap is ``LEXICAL_WEIGHT_MAX``.
+
+        Mutation: ``cap = 0.0`` when ``dense <= 0`` (the pre-fix expression
+        ``min(LEXICAL_WEIGHT_MAX, dense) if dense > 0 else 0.0``) → both
+        assertions below read 0.0 and this reds.
+        """
+        assert clamp_lexical_fusion_weight({"vector": 0}) == {
+            "vector": 0, "fts": LEXICAL_WEIGHT_MAX}
+        assert clamp_lexical_fusion_weight({"vector": -2.0}) == {
+            "vector": -2.0, "fts": LEXICAL_WEIGHT_MAX}
+        assert resolve_lexical_weight(1.0, 0.0) == LEXICAL_WEIGHT_MAX
+        # ... and a LOWER explicit lexical weight is still honoured: the
+        # unbinding is a ceiling, not a floor.
+        assert resolve_lexical_weight(0.5, 0.0) == 0.5
+
     def test_unbounded_weight_lets_a_lexical_also_ran_beat_the_dense_answer(self):
         """The fused-boundary arithmetic, on the REAL ``rrf_fusion``.
 
@@ -298,7 +323,7 @@ class TestLexicalWeightBound:
 
 # ── the read path ─────────────────────────────────────────────────────────
 class TestReadPath:
-    def test_arm_is_off_by_default(self, lexicon_embedder):
+    def test_arm_is_off_by_default(self, monkeypatch, lexicon_embedder):
         """No gate ⇒ the lexical rows are the SHIPPED scorer's, not BM25's.
 
         Not a tautology: the read runs, and each hit's ``scores["fts"]`` must
@@ -306,6 +331,9 @@ class TestReadPath:
         produce on this fixture (1.674 vs the shipped 3.0). Mutation: make
         ``bm25_enabled()`` return True → the scores change and this reds.
         """
+        # Explicit, not ambient: this assertion is about the UNSET gate, so it
+        # must not depend on the process env a sibling test happened to leave.
+        monkeypatch.delenv("TORTOISE_BM25_LEXICAL", raising=False)
         sdk, target = _e2e_sdk()
         graph = sdk._get_proj().g
         from tortoise.search_engine import run_fts_query
@@ -490,9 +518,21 @@ class TestReadPath:
         monkeypatch.delenv("TORTOISE_BM25_LEXICAL", raising=False)
         off = sdk.tortoise_fts_query(query, limit=5)
         monkeypatch.setenv("TORTOISE_BM25_LEXICAL", "1")
-        on = sdk.tortoise_fts_query(query, limit=5)
+        on_trace: list[dict] = []
+        on = sdk.tortoise_fts_query(query, limit=5, leg_trace=on_trace)
 
         assert off, "guard: the dense leg answers this query on this fixture"
+        # The arm must actually be WIRED for this test to say anything: an
+        # unwired arm would also leave the fused set alone. It ran (mechanism
+        # written) and matched nothing (count 0) — which is the shape the
+        # no-op claim is about.
+        arm_entries = [e for e in on_trace
+                       if e.get("mechanism") == LEXICAL_MECHANISM_BM25]
+        assert arm_entries, (
+            f"the arm must have run for this read; trace={on_trace}")
+        assert all(not e.get("count") for e in arm_entries), (
+            f"fixture invariant: nothing in this corpus matches the query, so "
+            f"the arm must match nothing; trace={on_trace}")
         assert [(h["id"], h["similarity"]) for h in on] == [
             (h["id"], h["similarity"]) for h in off]
 
@@ -522,6 +562,102 @@ class TestReadPath:
         assert unbounded == clamped, (
             "an over-cap lexical weight must be clamped to the same value as "
             "the cap, so the fused order is identical")
+
+    def test_zero_dense_weight_keeps_a_lexical_ranking_at_the_read_path(
+            self, monkeypatch, lexicon_embedder):
+        """``{"vector": 0}`` must not take the WHOLE read down with it.
+
+        The pure-function test above pins the cap; this one pins what the cap
+        is FOR — the read still ranks. With the dense leg's weight at 0 the
+        lexical leg is the only contributor, so the fused order must be the
+        lexical order and every fused score must be positive. Pre-fix (cap =
+        0.0) every candidate scored ``0.0``: the order became id order and
+        every ``similarity`` was 0.0 — the assertions below red on both.
+
+        Fixture note: the target is created LAST here, so it holds the HIGHEST
+        id. On this graph id order and the lexical order disagree, which is
+        what makes ``hits[0] == target`` discriminating rather than a
+        coincidence of creation order.
+        """
+        sdk = TortoiseSDK(
+            os.path.join(tempfile.mkdtemp(prefix="bm25_8488_zd_"), "t.db"),
+            namespace=f"bm25_zd_{os.urandom(6).hex()}")
+        _SDKS.append(sdk)
+        for content in TOPIC_DOCS_END_TO_END:
+            sdk.create_point("statement", content)
+        target = sdk.create_point("statement", TARGET_DOC)["id"]
+        monkeypatch.setenv("TORTOISE_BM25_LEXICAL", "1")
+        monkeypatch.setenv("TORTOISE_FUSION_WEIGHTS", '{"vector": 0}')
+
+        trace: list[dict] = []
+        hits = sdk.tortoise_fts_query(QUERY, limit=10, leg_trace=trace)
+        assert hits, "guard: the read must return rows to compare"
+        assert hits[0]["id"] != min(h["id"] for h in hits), (
+            "guard: the target must not be the lowest id, or id order would "
+            f"satisfy the ranking assertion; got {[h['id'] for h in hits]}")
+        assert any(e.get("mechanism") == LEXICAL_MECHANISM_BM25
+                   for e in trace), (
+            f"guard: the arm must have run for this read; trace={trace}")
+        assert hits[0]["id"] == target, (
+            "with the dense leg disabled the fused order must be the lexical "
+            f"order (rare-token record first); got {[h['id'] for h in hits]}")
+        assert all(h["similarity"] > 0.0 for h in hits), (
+            "a zeroed lexical weight zeroes EVERY fused score — the ranking "
+            f"then survives only as id order; got {hits}")
+
+    def test_expansion_passes_stand_the_arm_down(
+            self, monkeypatch, lexicon_embedder):
+        """A4/C2 replace the lexical slot AFTER the arm — so the arm stands down.
+
+        ``_search_keys_prf_expansion`` (A4, ``search_keys_prf``) and
+        ``_entity_key_expansion_pass`` (C2, ``entity_key_expansion``) each
+        RE-RUN the shipped scorer and overwrite ``raw_results["fts"]``. An arm
+        that ran before them has its rows discarded while its trace entry still
+        claims ``mechanism="bm25"`` — a measurement (starting with #8486)
+        would then baseline a read whose lexical order is the SHIPPED scorer's
+        while reading a trace that says BM25 produced it.
+
+        Control first: with the same graph and query and NO expansion flag, the
+        arm does run — otherwise the stand-down assertion below would pass for
+        the wrong reason. Mutation: drop the ``_prf_supersedes_the_arm`` term
+        from the gate → the flagged reads carry a ``mechanism="bm25"`` entry
+        again and this reds.
+        """
+        sdk, _target = _e2e_sdk()
+        monkeypatch.delenv("TORTOISE_BM25_LEXICAL", raising=False)
+
+        control_trace: list[dict] = []
+        control = sdk.tortoise_fts_query(QUERY, limit=10,
+                                         leg_trace=control_trace)
+        assert not [e for e in control_trace
+                    if e.get("mechanism") == LEXICAL_MECHANISM_BM25], (
+            "guard: gate OFF must never claim a BM25 lexical entry")
+
+        monkeypatch.setenv("TORTOISE_BM25_LEXICAL", "1")
+        arm_trace: list[dict] = []
+        sdk.tortoise_fts_query(QUERY, limit=10, leg_trace=arm_trace)
+        assert any(e.get("mechanism") == LEXICAL_MECHANISM_BM25
+                   and e.get("count") for e in arm_trace), (
+            "guard (control): without an expansion flag the arm DOES run on "
+            f"this fixture; trace={arm_trace}")
+
+        for lever in ({"search_keys_prf": True},
+                      {"entity_key_expansion": True}):
+            monkeypatch.delenv("TORTOISE_BM25_LEXICAL", raising=False)
+            off = [(h["id"], h["similarity"])
+                   for h in sdk.tortoise_fts_query(QUERY, limit=10, **lever)]
+            monkeypatch.setenv("TORTOISE_BM25_LEXICAL", "1")
+            on_trace: list[dict] = []
+            on = [(h["id"], h["similarity"])
+                  for h in sdk.tortoise_fts_query(
+                      QUERY, limit=10, leg_trace=on_trace, **lever)]
+            assert not [e for e in on_trace
+                        if e.get("mechanism") == LEXICAL_MECHANISM_BM25], (
+                "the arm must not claim the lexical slot when a later pass "
+                f"replaces it ({lever}); trace={on_trace}")
+            assert on == off, (
+                "a stood-down arm leaves the read exactly as the gate-off "
+                f"read ({lever}); off={off}, on={on}")
 
     def test_numeric_token_policy_is_threaded_not_decided(
             self, monkeypatch, force_sparse_tfidf):
@@ -555,10 +691,15 @@ class TestReadPath:
         opted = sdk.tortoise_fts_query("4032", limit=5, keep_numeric=True,
                                        leg_trace=opted_trace)
         assert opted, "guard: the opt-in read must return rows"
+        # ``count`` is the load-bearing half: ``_record`` writes the mechanism
+        # key whenever the leg RAN, so ``mechanism == "bm25"`` alone is
+        # satisfied by an arm that ran and matched NOTHING (count=0) — i.e. by
+        # the very regression this test exists to catch (the arm call ignoring
+        # the caller's policy). Only a MATCH proves the policy reached it.
         assert any(e.get("mechanism") == LEXICAL_MECHANISM_BM25
-                   for e in opted_trace), (
-            "the caller's keep_numeric=True must reach the BM25 arm; "
-            f"trace={opted_trace}")
+                   and e.get("count") for e in opted_trace), (
+            "the caller's keep_numeric=True must reach the BM25 arm (it must "
+            f"MATCH, not merely run); trace={opted_trace}")
 
 
 class TestCorpusCap:
@@ -578,17 +719,90 @@ class TestCorpusCap:
 
     def test_at_or_over_the_cap_the_leg_declares_itself_degraded(
             self, force_sparse_tfidf):
-        graph, _ids = _graph_with_corpus()
+        graph, ids = _graph_with_corpus()
         # Seven fixture points: cap=7 is "at the cap" (the leg cannot tell
-        # "exactly cap" from "more than cap"), cap=1 is plainly over it.
-        for cap in (7, 1):
+        # "exactly cap" from "more than cap") and the WHOLE corpus fits, so
+        # the ranking is complete and the reason is the honest "ok" — the
+        # degraded flag is a truncation claim, not a "found nothing" one.
+        trace: list[dict] = []
+        rows = run_bm25_query(graph, QUERY, entity_type="point", limit=20,
+                              corpus_cap=7, leg_trace=trace)
+        assert trace and trace[-1]["degraded"] is True, trace
+        assert trace[-1]["reason"] == "ok", trace
+        assert rows and rows[0][0] == ids["target"], (
+            f"a truncated-at-the-cap corpus must still rank; got {rows}")
+        # cap=1 is plainly over it, and the ONE row it keeps is a fixture
+        # artifact (id-ascending first row), NOT a property of the cap — so
+        # assert the flag (the subject of this test) and the reason VOCABULARY,
+        # never that the window happens to hold the query's term.
+        trace = []
+        rows = run_bm25_query(graph, QUERY, entity_type="point", limit=20,
+                              corpus_cap=1, leg_trace=trace)
+        assert trace and trace[-1]["degraded"] is True, trace
+        assert trace[-1]["reason"] in ("ok", "empty_results"), trace
+        assert isinstance(rows, list)
+
+
+class TestServableFamilies:
+    """Which families the leg serves is ONE decision, and it is the early return.
+
+    ``run_bm25_query`` scores ``index_text(coalesce(content, _searchText),
+    search_keys)``. That is a declared FTS field on ``Point`` (content +
+    search_keys) and on ``:Source``/``:Document`` (_searchText) — and it is on
+    NEITHER ``:Event`` (declared FTS fields: subject, name) nor ``:Subject``
+    (name). The canonical writers put neither ``content`` nor ``_searchText``
+    on those labels, so every row would tokenise to ``[]``, the leg would exit
+    ``empty_results`` (the R3 D4 term for "ran and found nothing"), and the read
+    would have paid a full-label scan — up to ``DEFAULT_BM25_CORPUS_CAP`` rows —
+    for a guaranteed nothing.
+    """
+
+    def test_refused_families_are_not_scanned(self, force_sparse_tfidf):
+        """A refused family must not reach the graph AT ALL.
+
+        Pre-fix, ``event``/``subject`` were in ``BM25_ENTITY_TYPES``: the leg
+        issued ``MATCH (n:Event) …`` (a full-label scan) and reported
+        ``ran=True, empty_results`` — a trace that claims the leg looked and
+        found nothing when it could never match. Mutation (pre-fix state): add
+        ``event`` (or ``subject``) back to ``BM25_ENTITY_TYPES`` → the query
+        counter below is non-empty and this reds.
+        """
+        graph, _ids = _graph_with_corpus()
+
+        class _Counting:
+            def __init__(self, inner):
+                self.inner = inner
+                self.queries: list[str] = []
+
+            def query(self, cypher, params=None, timeout=None):
+                self.queries.append(cypher)
+                return self.inner.query(cypher, params=params, timeout=timeout)
+
+        for family in ("event", "subject", "operator", "object"):
+            spy = _Counting(graph)
             trace: list[dict] = []
-            rows = run_bm25_query(graph, QUERY, entity_type="point", limit=20,
-                                  corpus_cap=cap, leg_trace=trace)
-            assert trace and trace[-1]["degraded"] is True, (cap, trace)
-            assert trace[-1]["reason"] == "ok", (cap, trace)
-        # ... and the truncated ranking is still a ranking.
-        assert rows, "a truncated corpus must still produce a lexical ranking"
+            rows = run_bm25_query(spy, QUERY, entity_type=family,
+                                  limit=20, leg_trace=trace)
+            assert rows == [], (family, rows)
+            assert spy.queries == [], (
+                f"the {family!r} family is not servable by this leg, so it "
+                "must be refused BEFORE the corpus scan — the leg cannot "
+                f"score it; scanned: {spy.queries}")
+            assert trace and trace[-1]["reason"] == "empty_results", trace
+            assert trace[-1]["ran"] is True, trace
+
+    def test_the_served_families_are_the_ones_with_a_declared_fts_field(self):
+        """The tuple and the text projection must agree — no third option.
+
+        Pins the SET (so re-widening it is a deliberate, reviewed edit) and
+        that each member is a family whose text this leg actually reads.
+        """
+        from tortoise.search_engine import BM25_ENTITY_TYPES
+
+        assert BM25_ENTITY_TYPES == ("point", "document", "source"), (
+            f"served families changed: {BM25_ENTITY_TYPES} — a family whose "
+            "text lives on fields this leg does not read (event/subject) must "
+            "bring a per-family text projection AND its parity test with it")
 
 
 def _e2e_sdk() -> tuple[TortoiseSDK, str]:
@@ -600,3 +814,35 @@ def _e2e_sdk() -> tuple[TortoiseSDK, str]:
     for content in TOPIC_DOCS_END_TO_END:
         sdk.create_point("statement", content)
     return sdk, target
+
+
+class TestOperatorContract:
+    """The arm's only operator lever must be discoverable where operators look."""
+
+    def test_env_example_declares_the_bm25_arm_switch(self):
+        """``.env.example`` IS this repo's env contract (``AGENTS.md``).
+
+        #8487 pinned the same thing for its kill switch
+        (``test_time_aware_2520.py::test_env_example_declares_the_valid_time_kill_switch``),
+        and the comparable read-path knobs (``TORTOISE_POOL_FLOOR``,
+        ``TORTOISE_FUSION_WEIGHTS``) are declared there. The arm ships OFF
+        *so that it can be measured before adoption* (#8486) — the switch is
+        therefore the deliverable's only entry point, and pre-fix it was
+        reachable only by reading source.
+        """
+        from pathlib import Path
+
+        from tortoise.bm25 import BM25_ENV
+
+        root = Path(__file__).resolve().parent.parent
+        env = (root / ".env.example").read_text()
+        assert BM25_ENV in env, (
+            f"{BM25_ENV} (the #8488 lexical-arm gate) is an operator-visible "
+            "lever that is not declared in .env.example")
+        declared = [
+            line for line in env.splitlines()
+            if line.strip().startswith(f"# {BM25_ENV}=")
+            or line.strip().startswith(f"{BM25_ENV}=")]
+        assert declared, (
+            f"{BM25_ENV} must be shown as a commented assignment (the example "
+            "form an operator copies), not just named in prose")

@@ -1377,12 +1377,38 @@ def clamp_lexical_fusion_weight(weights: dict[str, float] | None) -> dict[str, f
     return out
 
 
-#: Entity families this leg CAN serve (#8488). A ``:Object`` is merged by
-#: ``name`` and minted id-less (the #3019 note above), so the id-keyed corpus
-#: read would return nothing for it; an ``:Operator`` carries no ``content``
-#: and its own FTS leg matches on ``label CONTAINS``, a different axis. Both
-#: are refused rather than silently scanned for nothing.
-BM25_ENTITY_TYPES = ("point", "event", "subject", "document", "source")
+#: Entity families this leg CAN serve (#8488) — and the ONLY ones it may
+#: attempt. Its corpus text is ``index_text(coalesce(content, _searchText),
+#: search_keys)``, i.e. fields that actually exist on the label:
+#:
+#: * ``point``    → ``content`` ∪ ``search_keys`` — the ``Point`` fulltext
+#:   index's declared fields, byte-for-byte;
+#: * ``document`` / ``source`` → ``_searchText`` (a ``:Source`` stores no raw
+#:   bytes, D10 — the text lives on ``_searchText``, the field its own FTS
+#:   index is declared on).
+#:
+#: The three refused families are refused for the SAME reason — the leg could
+#: not score them, so attempting them would be a full-label scan that returns
+#: nothing while the trace claimed it "ran and found nothing":
+#:
+#: * ``object``  — merged by ``name`` and minted id-less (the #3019 note
+#:   above), so an id-keyed corpus read returns nothing;
+#: * ``operator`` — carries no ``content``; its own FTS leg matches on
+#:   ``label CONTAINS``, a different axis entirely;
+#: * ``event`` / ``subject`` — their declared FTS fields are ``subject``/
+#:   ``name`` and ``name`` respectively, and NEITHER ``content`` nor
+#:   ``_searchText`` is written on those labels by the canonical writers
+#:   (``_EVENT_HANDLED`` / ``_SUBJECT_HANDLED`` in ``projection/entities.py``),
+#:   so every row would tokenise to ``[]``. Serving them would mean a
+#:   per-family text projection, which breaks this leg's parity claim ("the
+#:   SAME index text the FTS index builds") and has no measured demand — the
+#:   reopen, if one is ever needed, should add that projection WITH its
+#:   parity test rather than resurrect this arm.
+#:
+#: Refused rather than silently scanned for nothing: the refusal is the early
+#: return in :func:`run_bm25_query`, so this tuple is the ONE place that
+#: decides which families the leg serves.
+BM25_ENTITY_TYPES = ("point", "document", "source")
 
 
 def run_bm25_query(
@@ -1401,10 +1427,12 @@ def run_bm25_query(
     only a ubiquitous one earns, and a 30x repetition scores the same as a
     single occurrence.
 
-    The indexed text is ``index_text(content, search_keys)`` — content ∪ the
-    E3 aliases — the SAME index text the FTS index and both TF-IDF fallbacks
-    build (``tortoise.sparse``), so the lexical stacks cannot disagree about
-    what a document says.
+    The indexed text is ``index_text(coalesce(content, _searchText),
+    search_keys)`` — the SAME fields each served label's own FTS index is
+    declared on (``tortoise.sparse``; see ``BM25_ENTITY_TYPES`` for the
+    per-family mapping), so the lexical stacks cannot disagree about what a
+    document says. A family outside ``BM25_ENTITY_TYPES`` is REFUSED at entry
+    rather than scanned for nothing — see that constant.
 
     Returns ``[(id, score)]`` ranked descending, ties broken by id (#3019: RRF
     is rank-based, so an unstable tie would make the fused order a function of
@@ -1416,7 +1444,13 @@ def run_bm25_query(
     (``ok`` / ``empty_results`` / ``query_failed`` / ``breaker_open``); a query
     whose tokens all get dropped by the caller's numeric policy is
     ``empty_results`` (the leg ran, nothing matched), never a new term the
-    declaration layer does not know.
+    declaration layer does not know. The same term covers a REFUSED family
+    (``BM25_ENTITY_TYPES``): the refusal records ``ran=True`` (so
+    ``mechanism`` is written and a consumer can tell it from a breaker skip),
+    and what it must NOT be read as is "the leg searched this family and found
+    nothing" — the leg cannot search it at all. ``degraded`` is recorded only
+    where the leg's OWN result is incomplete (corpus at the cap, a failed
+    read, an open breaker), never on a clean empty result.
 
     ``keep_numeric`` is threaded, never decided: the search lane's
     byte-identical control is a RECORDED decision and its reopen belongs to the
@@ -1459,8 +1493,12 @@ def run_bm25_query(
         _record(ran=True, degraded=False, reason="empty_results", count=0)
         return []
     if entity_type not in BM25_ENTITY_TYPES:
-        # See BM25_ENTITY_TYPES: an id-less :Object or a content-less
-        # :Operator would scan the whole label and score nothing.
+        # See BM25_ENTITY_TYPES: an id-less :Object, a content-less :Operator
+        # and the two families whose text lives on fields this leg does not
+        # read (:Event/:Subject) would each scan the whole label and score
+        # nothing — refused here rather than reported as a clean "ran, found
+        # nothing" (there is no second, per-family implementation of "how
+        # operators/events are served"; this early return IS the refusal).
         _record(ran=True, degraded=False, reason="empty_results", count=0)
         return []
 
@@ -1473,8 +1511,6 @@ def run_bm25_query(
     label = entity_label(entity_type)
     if entity_type in ("source", "document"):
         id_field = "url"
-    elif entity_type == "event":
-        id_field = "eventId"
     else:
         id_field = "id"
 
@@ -1489,8 +1525,6 @@ def run_bm25_query(
         where.append("n.documentKind IS NOT NULL")
     elif entity_type == "source":
         where.append("n.documentKind IS NULL")
-    if entity_type == "operator":
-        where.append("n.is_operator = true")
 
     try:
         start = time.monotonic()

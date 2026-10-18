@@ -24283,16 +24283,44 @@ class TortoiseSDK:
         # arm appends ONE further entry for the same ``fts`` leg AFTER them —
         # because that is when it ran. The two entries are not a duplicate
         # claim: the chain's entry has no ``mechanism`` key (the shipped
-        # scorer's rows), the arm's carries ``mechanism="bm25"``. Only the
-        # arm's rows are fused.
+        # scorer's rows), the arm's carries ``mechanism="bm25"``.
+        #
+        # (f) the arm does NOT run when a later lexical pass will REPLACE the
+        # slot it writes. ``_search_keys_prf_expansion`` (A4) and
+        # ``_entity_key_expansion_pass`` (C2) each RE-RUN the shipped scorer
+        # and overwrite ``raw_results["fts"]``, so an arm that ran before them
+        # would leave its rows discarded while its trace entry still claimed
+        # ``mechanism="bm25"`` — a measurement (starting with #8486) would
+        # baseline a read whose lexical order is the shipped scorer's while
+        # reading a trace that says BM25 produced it. Standing down is the
+        # honest composition: same shape as the ``#4028`` floor stand-down
+        # below (no arm, no arm trace entry, the shipped rows stand), and it
+        # costs nothing because composing the two levers was never measured.
+        # Reopening it means feeding the expansion's alias tokens INTO the arm
+        # so the arm is the last writer — not running it earlier.
         _bm25_lexical = False
+        _prf_supersedes_the_arm = bool(
+            search_keys_prf
+            or (entity_key_expansion and entity_type == "point"))
         if (query and query.strip() and is_embedded and not is_full_scan
                 and strategies.get("fts")):
             from tortoise.search_engine import BM25_ENTITY_TYPES
 
             from .bm25 import bm25_enabled
+            _bm25_enabled = bm25_enabled()
             _bm25_lexical = (entity_type in BM25_ENTITY_TYPES
-                             and bm25_enabled())
+                             and _bm25_enabled and not _prf_supersedes_the_arm)
+            if _bm25_enabled and _prf_supersedes_the_arm:
+                # Visible, not silent: the operator asked for the arm AND for an
+                # expansion pass that would overwrite it. The read is CORRECT
+                # (shipped rows, shipped scorer), but the lever they set is not
+                # in effect — say so rather than let a measurement discover it.
+                _logger.warning(
+                    "#8488: BM25 lexical arm standing down — %s replaces the "
+                    "lexical slot after the arm would have written it; the "
+                    "shipped lexical scorer's rows are used",
+                    "search_keys_prf" if search_keys_prf
+                    else "entity_key_expansion")
         raw_results = degradation_chain(
             graph, query, struct_kind, query_vec, strategies,
             entity_type=entity_type, limit=str_limit,

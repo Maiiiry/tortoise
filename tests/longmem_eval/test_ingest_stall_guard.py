@@ -507,19 +507,38 @@ def _embedded_read_timeout_via_projection() -> tuple[float, int]:
     (mocked, no daemon spawned) rather than re-derived from an expression in
     the banner — a private re-derivation is exactly what let the old
     ``n/a (embedded lane)`` clause survive #3350.
+
+    The construction is EXEMPTED from the epic #1647 (D-2) URI-aware test
+    redirect for the duration of the probe. Under a supported
+    ``TORTOISE_DB_URI`` (the docker shards) the redirect rewrites this
+    ``path=`` construction into a server graph — the host branch then imports
+    ``falkordb.FalkorDB`` directly, ``tortoise.FalkorDB`` is never called, and
+    the probe read ``None.args`` instead of the embedded branch (a main-red on
+    every URI-set lane). ``TORTOISE_TEST_NO_REDIRECT`` is the redirect's own
+    documented exemption (the carve-out files use it); naming THIS module in it
+    for the probe keeps the assertion below meaningful in BOTH lanes instead of
+    skipping the only test that pins the embedded read bound.
     """
     import tempfile
     from unittest import mock
 
     fake = mock.MagicMock()
     fake.return_value.select_graph.return_value = mock.MagicMock()
-    with mock.patch("tortoise.FalkorDB", fake):
+    _stem = Path(__file__).stem
+    _exempt = {s.strip() for s in
+               os.environ.get("TORTOISE_TEST_NO_REDIRECT", "").split(",")
+               if s.strip()} | {_stem}
+    with mock.patch("tortoise.FalkorDB", fake), mock.patch.dict(
+            os.environ, {"TORTOISE_TEST_NO_REDIRECT": ",".join(sorted(_exempt))}):
         proj = FalkorProjection.__new__(FalkorProjection)
         FalkorProjection.__init__(
             proj,
             path=os.path.join(tempfile.mkdtemp(prefix="t4683_"), "embed.db"),
             graph_name="test_embed_4683",
             skip_health_check=True)
+    assert fake.call_args is not None, (
+        "the embedded branch must build tortoise.FalkorDB — it did not run at "
+        f"all (redirect not exempted for {_stem!r}?)")
     assert fake.call_args.args[0].endswith("embed.db"), "not the embedded branch"
     retry = fake.call_args.kwargs["retry"]
     return fake.call_args.kwargs["socket_timeout"], 1 + retry._retries
