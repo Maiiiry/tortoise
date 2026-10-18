@@ -14,13 +14,21 @@ governingAgreement: "#2817"
 
 # WS-C — Numeric values as structural fields on an entity
 
-**Parent:** #2820 (WS-C — state & value model) · **Issue:** #2817 · **Status:** design v2 — **approved by the owner and merged** (`6e947045b` via #2950; §7.1 corrected by #7611). This is the **v3 correction** from the #2817 scoping run, with the **owner's 2026-10-07 decision (Option (a))** folded into §2.3.
+**Parent:** #2820 (WS-C — state & value model) · **Issue:** #2817 · **Status:** design v2 — **approved by the owner and merged** (`6e947045b` via #2950; §7.1 corrected by #7611). This is the **v3 correction** from the #2817 scoping run, with the **owner's 2026-10-07 decision (Option (a))** folded into §2.3. **v4 (2026-10-18): citation re-verification at `cdf30ed8e` + §7.2 step 3's derive half recorded as landed — see the v4 note below.**
 **Feeds:** #2782 (money representation) · **Related:** #2813, #2795, #2818, #2730, #2725, #2687, #2453, #2747, #3011
 
 > #2820's gate requires owner approval of a written design before implementation. This is that design.
-> **Nothing here is implemented.** In §7.1, **S1/S2 need declaration, not approval**. **S3** (the HTTP
-> validator) needs **no change either**, under the owner's 2026-10-07 decision: the field is
-> **server-written**, and never through the `Point` model, so that model is untouched (§2.3, §3/OD5).
+> In §7.1, **S1/S2 need declaration, not approval**. **S3** (the HTTP validator) needs **no change
+> either**, under the owner's 2026-10-07 decision: the field is **server-written**, and never through
+> the `Point` model, so that model is untouched (§2.3, §3/OD5).
+> **Update (v4):** two of §7.2's steps have landed, and nothing else has. **Step 5** (the consume half —
+> sum and ratio) is `tortoise/money.py` (#2782, PR #8641) together with the five declared fields on the
+> Point lane (PR #8976, open). **Step 3's DERIVE half** is `tortoise/value_normalizer.py` (#2817): an
+> abstention-first, money-only prose→value derivation that emits step 5's five fields and **implements
+> §4's exclusions as executable policy** (no separator ladder, no magnitude table, no bare-symbol
+> currency). Its WRITE wiring is still gated on step 2's declaration, and **step 3 is not a licence to
+> re-open §4** — the parser-first reading of #2817's original title is foreclosed by the Option (a)
+> ruling recorded in §2.3.
 
 **Revision note (v2, 2026-10-06).** v1 was written parser-first: it made a locale-aware numeric parser the
 foundation and reified each value as a tagged union of five `valueKind`s. **That foundation is withdrawn.**
@@ -66,8 +74,8 @@ compare, sum or threshold them **as stored values**. The engine can tell that tw
 nothing compares either against the source turn.
 
 The only structured-value precedent is the **date gate**: `_valid_iso_date`
-(`tortoise/extractor_v2.py:969`), mirrored by `Point._iso_date_prefix`
-(`tortoise/commit_schema.py:547`). It is the never-guess posture this design adopts.
+(`tortoise/extractor_v2.py:1161`), mirrored by `Point._iso_date_prefix`
+(`tortoise/commit_schema.py:552`). It is the never-guess posture this design adopts.
 
 **The grounded requirement (#2782, verbatim):** *"tranche released / 75% of tranche 1 spent → tranche 2
 unlocks"* — a **sum and a ratio against a threshold**.
@@ -420,7 +428,22 @@ The work cannot begin at the derivation. The dependency order is:
 2. **Declare the field** on the accepted schema: the Point property list. (The HTTP `Point` model is
    **untouched** — the field is server-written, §7.1/S3.) No behaviour change.
 3. **Derive and validate** — the value is computed from the raw text and kept **traceable** to the words
-   it came from; an ambiguous form produces **no typed value** (§2.3, §6/T3). ⚠️ *(v3: this step
+   it came from; an ambiguous form produces **no typed value** (§2.3, §6/T3).
+   ✅ **Landed (money) — `tortoise/value_normalizer.py` (#2817).** `normalize_money()` returns
+   `money_props(...)` (so the value is already Layer-1 valid) or one reason from the closed
+   `DROP_REASONS` set; `normalize_money_props(text, warnings=…)` is the S5 call pattern (drop ⇒ a
+   warning, never silence). The abstraction it deliberately does **not** have is §4's: any separator
+   (`1.234`, `1,234`, `1.234,56`, `800.00`, `1 234`) drops as `ambiguous_separator`, magnitude words
+   drop as `magnitude_word`, a bare `$`/`¥`/`€`/`£` (or a word-shaped ISO code such as `ALL`/`PEN`/
+   `TOP`) is `ambiguous_currency_symbol`, an adjacent sign is `signed_amount` (no sign convention is
+   defined in §3), and percent / multiplier / range / qualifier forms carry their own reason — i.e.
+   **"not representable → prose only"** is the shipped answer for the four failure modes that are pure
+   reading problems — 1 (separator), 2 (magnitude), 3 (percent/multiple), 5 (range/qualifier). Mode 4
+   (symbol collision) is **disambiguated rather than dropped**: an explicit ISO code or a
+   disambiguated prefix (`R$`→BRL, `US$`→USD) types, while a bare symbol *and* a word-shaped code
+   (`ALL`/`PEN`/`AMD`/`PHP`) drop as ambiguous. Modes 6 (exponent), 7 (verbatim) and 8 (`asOf`) are the
+   ones it TYPES, each pinned by its own test. Its write wiring (adding the props to `pt_entry`) is NOT done: it waits for step 2's
+   declaration, exactly as the ordering above requires. ⚠️ *(v3: this step
    previously read "…and checked against the words it came from (§2.3)". That check is not proposed by
    this design — the owner decided so on 2026-10-07 (§2.3). Detecting a misread already in `content` is
    #2684's property, not this step's.)*
@@ -458,13 +481,26 @@ files. The two `~/.swarm/research/…` entries below are machine-local, outside 
 - `docs/ONTOLOGY.md` §11 (v3.2, #398) — derived-value cache doctrine (`Derived values may be CACHED, never
   authoritative … the derivation is the truth, the cache is a performance artifact`, `:1515`); §4.1
   Point (`:844`).
-- `tortoise/extractor_v2.py` — `VALUE_FIDELITY_RULE:324`, `_s2s4_rules:393`, `_granularity_text:914`,
-  `_render_master:719`, `_valid_iso_date:969`, `run_s1:980`, `OUTPUT_CONTRACT:1201`,
-  `_verbatim_match:2552`, `_fact_value_contradiction:2743`, `_resolve_source_turn:5592`,
-  `execute_embed:5804`, supersession record `:6134-6140`, `pt_entry:6160`.
-- `tortoise/extractor_v2.py` — the **existing value-identity engine** the corrected §1 names:
-  `_num_word_value:3176`, `_value_signature:3202`, `_UNIT_WORDS:3853`, `_value_bindings:3859`,
-  `distinguishing_difference:4974`, and its live call sites `:4959`, `:4965`, `:5075-5076`.
+- ⚠️ **v4 — the citations in THIS list were re-verified at `cdf30ed8e` (2026-10-18), and the previous
+  numbers are kept in parentheses so the drift is auditable.** `extractor_v2.py` grew from ~6.2k to
+  9,605 lines since v3, so this list — not the inline references in §1–§7 — is the authority for
+  `extractor_v2.py` / `commit_schema.py` line numbers. Those inline references are v3-era except the two
+  this document's own argument turns on (`_valid_iso_date`, `Point._iso_date_prefix`), which are
+  corrected in place; the §7.1 surface citations (`mcp_server.py`, `sdk.py`,
+  `projection/entities.py`, `tool_registry.py`, `hosted_api.py`) were **not** re-verified in this lane
+  (#2817 owns the value layer), so treat those as v3-era until a lane owns them.
+- `tortoise/extractor_v2.py` — `VALUE_FIDELITY_RULE:408` (was `:324`), `_s2s4_rules:477` (was `:393`),
+  `_granularity_text:1102` (was `:914`), `_render_master:907` (was `:719`), `_valid_iso_date:1161`
+  (was `:969`), `run_s1:1172` (was `:980`), `OUTPUT_CONTRACT:1393` (was `:1201`), `_verbatim_match:2968`
+  (was `:2552`), `_fact_value_contradiction:3159` (was `:2743`), `_resolve_source_turn:6169`
+  (was `:5592`), `execute_embed:6381` (was `:5804`), supersession records `:6425`, `:6518`
+  (was `:6134-6140`), `pt_entry:6737` / `:6947` (was `:6160`).
+- `tortoise/extractor_v2.py` — the **existing value-identity engine** the corrected §1 names
+  (v4: re-verified at `cdf30ed8e`): `_num_word_value:3717` (was `:3176`), `_value_signature:3743`
+  (was `:3202`), `_UNIT_WORDS:4394` (was `:3853`), `_value_bindings:4400` (was `:3859`),
+  `distinguishing_difference:5515` (was `:4974`), and its live call sites `:4388` (was `:3898` —
+  `_value_signature`), `:5500` / `:5616-5617` (was `:4959` / `:5075-5076`), `:5506` (was `:4965` —
+  `_value_bindings`).
 - `docs/epics/2026-08-20-1509-extractor-v3/00-scope.md:28` (owner decision) — *"never create a parallel
   layer doing the same thing with redundant machinery (debugging nightmare)"*, applied as precedent by
   `tortoise/vet_gate.py:31-32`. Any check built on this design **reuses** `distinguishing_difference`; a
@@ -472,9 +508,10 @@ files. The two `~/.swarm/research/…` entries below are machine-local, outside 
 - `tests/eval/write_path/` — the sealed-gold number-word fixture (`fixtures/wp01_quarry_debug.json:68`,
   `generate_corpus.py:216,240`, `gold/wp01_quarry_debug.gold.json:176,318`), used to measure the
   `_resolve_source_turn` anti-correlation recorded on #2684.
-- `tortoise/commit_schema.py` — `class Point:500` (`extra="forbid"` `:503`), `_iso_date_prefix:547`,
-  `_point_canonical:1322`, `canonical_payload:1366`, `compute_client_commit_id:1431`,
-  `point_content_id:1452`.
+- `tortoise/commit_schema.py` (v4: re-verified at `cdf30ed8e`) — `class Point:505` (was `:500`,
+  `extra="forbid"` `:508`, was `:503`), `_iso_date_prefix:552` (was `:547`), `_point_canonical:1331`
+  (was `:1322`), `canonical_payload:1375` (was `:1366`), `compute_client_commit_id:1440` (was `:1431`),
+  `point_content_id:1461` (was `:1452`).
 - `tortoise/sdk.py` — `_sanitize_props:2596`, FalkorDB primitives note `:2768-2777`, `TortoiseSDK.create_point:4937`,
   props CREATE-map write `:5397-5399`, `_extract_session_v2:6956` (create_point call `:7257`).
 - `tortoise/projection/entities.py` — `_persist_extra_props:758`, `_upsert_point_props:801`, Point prop list
