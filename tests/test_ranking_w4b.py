@@ -764,10 +764,11 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
 
             cb_req = (sim_w * Δsim + graph_w * Δgb + rec_w * Δrec) / graph_w
 
-        with Δ = calm − hot.  ``floor``/``ceiling`` drop the ``Δgb`` term, which
-        is legitimate ONLY because the parity NAND makes ``Δgb == 0`` — so the
-        expectation is derived with the term present and the parity is
-        asserted separately, instead of being assumed by the band."""
+        with Δ = calm − hot.  The ``ceiling`` bound in the caller assumes the
+        ``graph_w * Δgb`` term vanishes, which is legitimate ONLY because the
+        parity NAND makes ``Δgb == 0`` — so the expectation here is derived with
+        the term PRESENT and the parity is asserted separately, instead of being
+        assumed by the band."""
         return (
             DEFAULT_SIMILARITY_WEIGHT * (c["similarity"] - h["similarity"])
             + DEFAULT_GRAPH_BOOST_WEIGHT * (gb_calm - gb_hot)
