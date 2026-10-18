@@ -219,8 +219,8 @@ ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
     # so seed and read must be the SAME graph, the same `prod-coupled` class as
     # test_cross_tenant_read_isolation / test_pack_selection_by_graph. A
     # `test_*` rename would point the seed at a graph the endpoint never reads:
-    # the API-key auth would 401 and `assert sorted(statuses) == [200, 409]`
-    # would go RED (#8979).
+    # the API-key auth would 401 and `statuses = sorted(...)` /
+    # `assert statuses == [200, 409]` would go RED (#8979).
     "test_rotate_key.py": {"registry": "prod-coupled"},
     "test_sdk_legacy_coverage.py": {"team-beta": "assertion"},
     "test_writer_inventory.py": {"registry": "prod-coupled"},

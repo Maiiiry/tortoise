@@ -108,9 +108,9 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # as the page grows.  On the fixture with 40 filler rows (a 44-point graph) it
 # ranks below at every limit 2..40 (+0.0056 at limit=40).  The exact page delta is
 # a property of the page's own similarity span, so filler composition moves it (a
-# 404-point variant with different filler rows measures required ``cb`` 0.0483 at
-# limit=10 — the contested twin already first); the MECHANISM is what is stable,
-# not any one fixture's number.
+# 404-point variant with different filler rows measures a SMALLER requirement at
+# limit=10, small enough that the contested twin is already first there); the
+# MECHANISM is what is stable, not any one fixture's number.
 #
 # WHAT A LARGER BOOST WOULD AND WOULD NOT BUY (#7704, corrected 2026-10-18).
 # The required increment is BOUNDED, not unbounded: ``_min_max_normalize`` maps
@@ -158,14 +158,15 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # requirement FALLS as the page grows and the largest value it ever takes is
 # the 2-row one.
 #   * A modest raise therefore DOES repair the shipped default read: on that
-#     fixture the limit=10 ordering flips at ``cb`` >= 0.0542 — the requirement
-#     itself is 0.0540153, but ``graph_boost`` is rounded to 4 dp BEFORE it is
-#     weighted (``round(min(1.0, graph_boost + cb), 4)``) and ``final_score``
-#     is rounded again, so the smallest increment that actually reorders the
-#     payload sits one grid step above the requirement and 0.0541 still ranks
-#     the contested twin second (measured: cb=0.06 ranks it first).  Remedy
-#     (2) is a real magnitude choice with a page-dependent, partial effect —
-#     not an impossibility.  Clearing #2102's own E2E-1 pre-assertion
+#     fixture the limit=10 ordering flips at ``cb`` >= 0.05415 — on the 1e-4
+#     grid the shipped boost uses that is ``cb`` >= 0.0542 (0.0541 still ties).
+#     The requirement itself is 0.0540153, so the flip sits TWO ``graph_boost``
+#     grid steps above it, not one: ``graph_boost`` is rounded to 4 dp BEFORE it
+#     is weighted (``round(min(1.0, graph_boost + cb), 4)``), so the requirement
+#     lands on cell 0.7540, the next cell 0.7541 still ties once ``final_score``
+#     is rounded again, and the flip starts at cell 0.7542.  Remedy (2) is a real
+#     magnitude choice with a page-dependent, partial effect — not an
+#     impossibility.  Clearing #2102's own E2E-1 pre-assertion
 #     (relevance delta <= 0.05 in similarity space) takes
 #     ``cb > 0.5 * 0.05 / 0.35`` = 0.0714.
 #   * What no ``cb`` inside the invariant can buy is the SMALL pages: the clamp

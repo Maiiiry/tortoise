@@ -816,7 +816,7 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"1.4286 requirement")
 
     # ── The PREMISE the quoted 1.4286 rests on, asserted BY NAME ──────────
-    # ``floor``/``ceiling`` below drop the ``graph_w * Δgb`` term, which is the
+    # ``ceiling`` below bounds the ``graph_w * Δgb`` term, which is the
     # right bound only when the twins share a baseline graph_boost — the parity
     # NAND in ``_seed_twin_conflict`` is what makes them.  Nothing used to name
     # it: drop that NAND and calm falls to degree 0 (gb 0.45, Δgb −0.25, the
@@ -843,23 +843,26 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         DEFAULT_SIMILARITY_WEIGHT / DEFAULT_GRAPH_BOOST_WEIGHT, abs=5e-3), (
         f"the comment quotes a 2-row requirement of 1.4286; this page measures "
         f"{two_req:.4f}")
-    # The same payload gives the band the comment states, carrying the graph
-    # term its formula has:
+    # The CEILING carries the graph term the comment's formula has:
     #   cb_req = (sim_w*d_sim + graph_w*d_gb + rec_w*d_rec) / graph_w
     #          <= (sim_w + graph_w*|d_gb| + rec_w) / graph_w   (page in [0, 1])
     # |d_gb| is read off THIS page, so the band tracks the page instead of
     # restating two weights: 0 here (the parity premise asserted above), which
     # is the comment's 1.857; 2.857 at |d_gb| = 1, the general ceiling the
     # comment now names.
-    floor = (DEFAULT_SIMILARITY_WEIGHT - DEFAULT_RECENCY_WEIGHT) / DEFAULT_GRAPH_BOOST_WEIGHT
+    #
+    # There is deliberately NO matching ``floor`` assertion.  Δsim == 1 and
+    # Δgb == 0 are BOTH asserted above, so the formula reduces to
+    # ``1.4286 + 0.4286*Δrec`` and ``two_req >= (sim_w - rec_w)/graph_w == 1.0``
+    # follows from Δrec >= -1 — a check that cannot fail, whose stale-comment
+    # message would then fire only when the real cause was a broken premise.
+    # The bound that is genuinely NOT entailed by those premises is the clamp's
+    # headroom, and that is asserted as the guarantee further down.
     ceiling = (
         DEFAULT_SIMILARITY_WEIGHT
         + DEFAULT_GRAPH_BOOST_WEIGHT * abs(two_gb_calm - two_gb_hot)
         + DEFAULT_RECENCY_WEIGHT
     ) / DEFAULT_GRAPH_BOOST_WEIGHT
-    assert two_req >= floor - 1e-6, (
-        f"the 2-row requirement is {two_req:.4f}, below its floor {floor:.4f} "
-        f"— the derivation in W4_CONTESTED_BOOST's comment is stale")
     assert two_req <= ceiling + 1e-6, (
         f"the 2-row requirement is {two_req:.4f}, ABOVE its ceiling "
         f"{ceiling:.4f} — then it is not bounded by the page after all")
@@ -897,11 +900,6 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"the 2-row requirement {two_req:.4f} must EXCEED the clamp's headroom "
         f"{two_headroom:.4f}: that is the 'the CLAMP is the blocker' claim, "
         f"and it is what a band alone does not say")
-    assert two_req >= 1.0, (
-        f"on THIS fixture's parity page the requirement ({two_req:.4f}) is above "
-        f"the full [0, 1] span's worth of boost — no cb inside the invariant can "
-        f"clear it. A fixture value, not a 2-row bound: the general floor is the "
-        f"headroom {two_headroom:.4f} asserted above")
 
     # The blocker is the CLAMP, not unboundedness: give the boost a value far
     # past the clamp and the ordering still loses, the graph term pinned.
@@ -1072,13 +1070,13 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert ten_req == pytest.approx(0.0540, abs=2e-3), (
         f"the comment quotes a 0.0540 requirement on the shipped default "
         f"page; this run measures {ten_req:.4f}")
-    assert ten_req * DEFAULT_GRAPH_BOOST_WEIGHT == pytest.approx(0.0189, abs=1e-4), (
+    assert ten_req * DEFAULT_GRAPH_BOOST_WEIGHT == pytest.approx(0.0189, abs=1e-5), (
         f"the comment quotes this page's relevance gap as 0.0189 of final "
         f"score (just above the 0.0175 boost); this run measures "
-        f"{ten_req * DEFAULT_GRAPH_BOOST_WEIGHT:.4f}.  The tolerance holds the "
-        f"4th decimal on purpose: 0.0188 and 0.0189 are the SAME measurement "
-        f"rounded two ways, and a band wide enough to admit both cannot "
-        f"settle which one the comment is entitled to quote")
+        f"{ten_req * DEFAULT_GRAPH_BOOST_WEIGHT:.6f}.  The tolerance is 1e-5 on "
+        f"purpose: at 1e-4 the band still ADMITS 0.0188, so it could not "
+        f"settle which of the two roundings the comment is entitled to quote — "
+        f"the question this whole correction exists to answer")
     clears_2102 = DEFAULT_SIMILARITY_WEIGHT * 0.05 / DEFAULT_GRAPH_BOOST_WEIGHT
     assert clears_2102 == pytest.approx(0.0714, abs=1e-3)
     assert ten_req < clears_2102, (
@@ -1116,13 +1114,13 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # ── The threshold is the ROUND-TRIPPED one, not the requirement ─────────
     # ``graph_boost`` is rounded to 4 dp BEFORE it is weighted
     # (``round(min(1.0, graph_boost + cb), 4)``) and ``final_score`` is rounded
-    # again, so the smallest increment that actually reorders the payload sits
-    # ABOVE the unrounded requirement: 0.0541 still ties and 0.0542 flips. The
-    # comment therefore quotes ``cb >= 0.0542``, and this pins both sides of
-    # that claim through the shipped read — at the requirement itself the
-    # ordering does NOT move. Without this the 0.0542 sentence is untested
-    # (the ``modest = 0.06`` arm below is far from the boundary and would pass
-    # for any threshold under 0.06).
+    # again, so the flip sits ABOVE the unrounded requirement: the requirement
+    # lands on graph_boost cell 0.7540, 0.0541 (cell 0.7541) still ties, and the
+    # flip starts at cell 0.7542 — ``cb`` >= 0.0542 on the 1e-4 grid, 0.05415
+    # continuous.  The comment quotes exactly that, so each of those three
+    # points is probed through the shipped read rather than argued: an
+    # assertion that only checked the requirement and 0.0542 would stay green
+    # if the boundary moved a whole grid step down to 0.05405.
     def _flips_at(value: float) -> bool:
         with monkeypatch.context() as patched:
             patched.setattr("tortoise.ranking.W4_CONTESTED_BOOST", value)
@@ -1133,15 +1131,19 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         return ids.index(hot) < ids.index(calm)
 
     assert not _flips_at(ten_req), (
-        f"the comment puts the flip at cb >= 0.0542, ABOVE the unrounded "
+        f"the comment puts the flip at cb >= 0.05415, ABOVE the unrounded "
         f"requirement ({ten_req:.7f}) — so cb == the requirement must NOT "
         f"reorder the payload. It did: the round-trip (graph_boost and "
         f"final_score both rounded to 4 dp before/after weighting) is no "
         f"longer what the comment says it is")
+    assert not _flips_at(0.0541), (
+        "the comment quotes 0.0541 as still tying (the requirement lands on "
+        "graph_boost cell 0.7540, and cell 0.7541 is not enough); this run "
+        "flips there — re-measure the round-trip rather than re-describing it")
     assert _flips_at(0.0542), (
-        "the comment quotes 0.0542 as the smallest increment that flips the "
-        "shipped default page; this run does not flip there — re-measure the "
-        "round-trip threshold rather than re-describing it")
+        "the comment quotes 0.0542 as the smallest increment on the 1e-4 grid "
+        "that flips the shipped default page (graph_boost cell 0.7542); this "
+        "run does not flip there — re-measure the round-trip threshold")
 
     # ── The bound is CONDITIONAL: the ``Δgb`` term is not free ─────────────
     # ``cb_req = (sim_w*Δsim + graph_w*Δgb + rec_w*Δrec) / graph_w``.  1.857 is the
