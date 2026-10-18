@@ -3184,8 +3184,15 @@ class _WriteNotLanded(Exception):
     an attempt that was only reached BECAUSE a previous one aborted raises
     this sentinel instead of returning. It is retryable (nothing applied, so
     re-issuing cannot duplicate), and on budget exhaustion the ORIGINAL abort
-    is re-raised unchanged, so the caller's error type is what it was before
-    the retry existed.
+    is re-raised with its TYPE unchanged, so the caller's ``except`` clause
+    still catches it and ``_classify_db_failure`` still buckets it as ``db``.
+    Its MESSAGE is NOT guaranteed untouched: on exhaustion the graph-swap
+    family gains the #7357 legibility suffix (``retry.explain_graph_abort``)
+    WHICHEVER way the graph-presence probe answers (present / absent /
+    unprobeable), so an assertion on ``str(exc)`` must allow for that suffix. A
+    test that pins the engine's BARE sentence belongs to the deletion arm
+    instead: a deletion the predicate sees at classification time is refused
+    before this arm is reached, so nothing is appended there.
 
     A zero-row FIRST attempt is untouched: it never reaches this class, so
     ``update_point``'s historical ``{}``-for-a-missing-id contract is safe.
@@ -5252,6 +5259,31 @@ class InvertedSupersedeWindow(ValueError):
         self.predecessor_valid_from = predecessor_valid_from
 
 
+class UnapprovedKindNamespace(ValueError):
+    """#5475 — a kind write refused because it names a pack the graph lacks.
+
+    Subclasses ``ValueError`` because that is the contract every SDK write door
+    publishes (callers and tests catch ``ValueError``), but it is a NAMED type
+    so a transport boundary can tell this DETERMINISTIC payload refusal from a
+    transient graph failure WITHOUT parsing the message — which the MCP layer
+    rewrites (``_scrub_error``) and which the hosted commit door would
+    otherwise turn into a retry-advising 500 for a payload that will refuse
+    identically on every retry (the #5363 precedent, one class over).
+
+    The facts ride as attributes (the offending ``prop``/``kind``/``namespace``
+    and the graph's ``installed`` set) so a boundary that renders a
+    client-facing error does not have to re-derive them from the prose.
+    """
+
+    def __init__(self, message, *, prop: str, kind: str, namespace: str,
+                 installed: frozenset[str] | None):
+        super().__init__(message)
+        self.prop = prop
+        self.kind = kind
+        self.namespace = namespace
+        self.installed = installed
+
+
 def _refuse_inverted_point_window(g, props: dict, *,
                                   point_id: str | None = None) -> None:
     """#5359: refuse an INVERTED validity window at a Point write boundary.
@@ -5906,8 +5938,14 @@ class TortoiseSDK:
         from tortoise.exceptions import EmbeddedStoreBusyError
         raise EmbeddedStoreBusyError(db_path, pid)
 
-    def _graph_exists(self, proj) -> bool:
+    def _graph_presence(self, proj) -> bool | None:
         """Whether the graph a wrapped write targets still has its KEY (#7685).
+
+        TRI-STATE, so the two callers can ask two different questions of it:
+        the retry gate needs a boolean (anything but ``True`` is "do not
+        retry"), while the exhaustion message (#7357) must not claim the graph
+        was DELETED when the probe merely could not ANSWER — an unresponsive
+        instance is the measured state of this defect.
 
         The measured discriminator for the graph-abort family: after a rebuild's
         recreate ``EXISTS <name>`` is 1, after a plain deletion it is 0 (measured
@@ -5928,21 +5966,33 @@ class TortoiseSDK:
         to agree with the presence semantics the guard's callers rely on.
 
         Fails LOUD: no projection, no graph name, or a probe that raises all
-        answer False — i.e. "do not retry" — never "assume a rebuild".
+        answer ``None`` — i.e. "do not retry" through ``_graph_exists``, never
+        "assume a rebuild".
         """
         if proj is None:
-            return False
+            return None
         name = getattr(proj, "graph_name", None)
         if not name:
-            return False
+            return None
         try:
             return bool(proj.g.execute_command("EXISTS", str(name)))
         except Exception:  # noqa: BLE001, RUF100 — a failed probe is not a rebuild
             _logger.warning(
-                "graph-existence probe failed for %r; refusing to retry the "
-                "aborted write (a silent success is worse than a loud miss)",
+                "graph-existence probe failed for %r; the write is not "
+                "retried and any #7357 exhaustion message reports the "
+                "graph state as UNKNOWN (a silent success is worse than a "
+                "loud miss)",
                 name, exc_info=True)
-            return False
+            return None
+
+    def _graph_exists(self, proj) -> bool:
+        """The retry gate's boolean view of :meth:`_graph_presence` (#7685).
+
+        Anything but a confirmed presence answers False: this gates a re-issued
+        bare ``CREATE``, so a false positive is a silent success into an empty
+        graph, while a false negative is only a loud miss.
+        """
+        return self._graph_presence(proj) is True
 
     def _graph_write_with_retry(self, fn, *, what: str, witness=None):
         """Issue a DIRECT graph write through the bounded-retry primitive (#7405).
@@ -6008,7 +6058,13 @@ class TortoiseSDK:
         21-84 s, not 21-42 s. The
         window #7405 measured lasted **over an hour**, and no bounded retry
         should wait that long — so on exhaustion the original error still
-        surfaces, **unchanged in type**.
+        surfaces, **unchanged in type**. Its MESSAGE gains one appended
+        diagnosis when it is the graph-swap family (#7357): the same
+        ``ResponseError``, with the engine's sentence kept at position 0 so the
+        anchored predicate still classifies it, followed by `` — what this
+        means: …`` naming the swap rather than implying data loss. A DELETION
+        (key absent) is never told a retry is safe — see
+        ``retry.explain_graph_abort``.
 
         Residual window, stated honestly. The classification-time probe can be
         stale by the time the retry runs — ``call_with_predicate`` evaluates the
@@ -6099,6 +6155,7 @@ class TortoiseSDK:
         from .retry import (
             WriteStageRetriesExhausted,
             call_with_predicate,
+            explain_graph_abort,
             graph_abort_family,
             retryable_aborted_write,
         )
@@ -6205,7 +6262,28 @@ class TortoiseSDK:
             if isinstance(inner, _WriteNotLanded):
                 # A re-issue that never landed: surface the abort that
                 # authorised it, not the internal sentinel.
-                raise inner.original from None
+                inner = inner.original
+            # #7357: the engine's graph-swap sentence reads as CORRUPTION
+            # ("graph was deleted or replaced"), and a caller that treats it as
+            # such goes hunting a rebuild on a healthy graph. A rebuild this
+            # retry could not heal is exactly the case where the graph KEY is
+            # still present — so append a legible diagnosis of the same type,
+            # never a wrapper (see the TYPE note above). Only this family is
+            # rewritten, and only once.
+            # Pay the presence probe ONLY for the family that reads it:
+            # write-slot and MISCONF exhaustion are state-INdependent, so
+            # ``explain_graph_abort`` returns None for them and an eager
+            # ``EXISTS`` round trip (plus the `_graph_presence` warning if it
+            # raises) would be spent on an answer nothing consumes (#8954).
+            legible = None
+            if graph_abort_family(inner):
+                legible = explain_graph_abort(
+                    inner,
+                    graph_present=self._graph_presence(self._proj),
+                    attempts=attempts,
+                )
+            if legible is not None:
+                inner.args = (legible,)
             raise inner from None
 
     def _get_proj(self) -> FalkorProjection:
@@ -6901,7 +6979,10 @@ class TortoiseSDK:
         LIVE is the default (#1088): a point created WITHOUT an explicit
         ``status`` is live — not draft — whatever its kind. Draft is opt-in:
         pass ``status="draft"`` and it is honoured (no promotion clause,
-        ingest fold, or operator edge will move it to live).
+        ingest fold, or operator edge will move it to live; the ONE scoped
+        exception is a point the capture pass MINTS — it promotes the drafts
+        it created itself, keyed on ``promotion_ids``, and never one it merely
+        folded onto).
 
         Decision parts (#2199) — pointKind in {decision, option, criterion,
         evidence} created WITHOUT an explicit status — land LIVE (not draft)
@@ -6944,7 +7025,22 @@ class TortoiseSDK:
         writer itself originates.
         """
         self._validate_kind(kind)
+        # #5475: `pointKind` is one of the properties
+        # `pack_state.graph_kind_namespaces` mines the approval set from, so the
+        # point door widened it exactly as the entity doors did — measured at
+        # HEAD: `create_point("totally:madeUpKind", ...)` on a `dev`-only graph
+        # left `['dev', 'totally']` behind. `_validate_kind` above only WARNS,
+        # so it is not a gate. Same rule, same ONE home, same refusal message
+        # as the entity funnel (`_refuse_unapproved_kind`).
+        self._refuse_unapproved_kind("pointKind", kind)
         _coerce_props(props)
+        # The props passthrough accepts the OTHER mined key names too
+        # (`objectKind`, `eventKind`, ...), and each of those is persisted on
+        # the Point and mined back into the approval set — measured:
+        # `create_point("statement", "x", objectKind="marketing:campaign")`
+        # widened a `dev`-only graph. Gate the whole mined key set, exactly as
+        # the entity funnel does.
+        self._refuse_unapproved_kinds_in_props(props)
         # #329: server-managed fields rejected on the props passthrough
         # (the explicit-id path via props.pop("id") below is preserved for operators)
         props = _sanitize_props(props)
@@ -7077,14 +7173,28 @@ class TortoiseSDK:
         explicit_id = props.pop("id", None)
         # Idempotency guard: dedup by content hash when requested
         dedup = props.pop("dedup", False)
-        # #1088: LIVE is the default for everything added to the graph; an
-        # agent that deliberately asks for draft gets draft, and it is
-        # honoured. "Was status given?" is decided BEFORE the pop so an
+        # #1088 / #6107: LIVE is the default for everything added to the
+        # graph; an agent that deliberately asks for draft gets draft, and it
+        # is honoured. "Was status given?" is decided BEFORE the pop so an
         # explicit status (the capture/extraction paths pass status="draft" +
         # extractedFrom, or an agent staging a draft deliberately) is explicit
-        # BY CONSTRUCTION, keeps full manual control, and preserves the
-        # #344/#1212 fail-closed posture. Precedent: #2199 did exactly this
-        # for the decide-part kinds.
+        # BY CONSTRUCTION and keeps full manual control — with ONE scoped
+        # exception: a point the command itself MINTS. The capture pass
+        # promotes the drafts IT created (``promotion_ids``), never a folded
+        # or pre-existing draft (#1088), so "explicit draft is never moved
+        # live" is true of a point this write did NOT mint, not of a capture's
+        # own extracted claims. Precedent: #2199 did exactly this for the
+        # decide-part kinds.
+        #
+        # OVERRIDES: the fail-closed create posture of #344/#1212 (a
+        # non-decide kind defaulted to status='draft', so a plainly-created
+        # point was born EP-inert) — `live` is the default for everything
+        # added to the graph, and `draft` is the deliberate caller-chosen
+        # exception instead. Owner ruling 2026-10-09, recorded with its
+        # OVERRIDES marker on #6107. Reason: the fail-closed protection and
+        # the invisibility were the SAME mechanism — a goal created plainly
+        # and wired only as an operator TARGET was never promoted, so EP
+        # discarded the whole arm while the run still reported converged=True.
         explicit_status = "status" in props
         # Status is popped+validated BEFORE the dedup branch (#1905): a dedup
         # hit must never forward the caller's status into update_point (which
@@ -7400,8 +7510,8 @@ class TortoiseSDK:
         # self-consistent injected encoder is stored instead of silently NULLed.
         embedding = None
         try:
-            from .embeddings import encode_for_store
-            embedding = encode_for_store(
+            from .embeddings import encode_for_row
+            embedding = encode_for_row(
                 content, self._get_proj().required_embedding_dim)
         except Exception:
             pass  # Graceful — embedding is optional
@@ -10749,9 +10859,9 @@ class TortoiseSDK:
             # — a `None` new_content is "no content edit" there, so it must not
             # derive (or wipe) a vector either.
             try:
-                from .embeddings import encode_for_store
+                from .embeddings import encode_for_row
                 props["embedding"] = (
-                    encode_for_store(_new_content, proj.required_embedding_dim)
+                    encode_for_row(_new_content, proj.required_embedding_dim)
                     if _new_content else None)
             except Exception:
                 props["embedding"] = None
@@ -11298,8 +11408,10 @@ class TortoiseSDK:
         returning when the §17.1 outbox refuses the destruction: either the
         `EntityMutated` op=delete record could not be CONFIRMED (the `DETACH
         DELETE` was then NOT issued — the record may still have landed, since a
-        buffered append can write and then raise, so the refusal reports the
-        record as unconfirmed, never as absent), or the record WAS committed and
+        journal append can write and then raise (a partial `write(2)` stopped by
+        ENOSPC/EIO, or a write whose close failed; #5612 removed the buffered
+        flush), so the refusal reports the record as unconfirmed, never as
+        absent), or the record WAS committed and
         the cache delete failed (``record_committed=True`` — treat the delete as
         COMMITTED and do not re-issue it blindly, a replay heals the cache). A
         no-op id still returns ``False``; ``True`` still means the node was
@@ -20411,6 +20523,11 @@ class TortoiseSDK:
             # #3139 (review P2): no beliefs written by THIS pass — see the
             # note in _dream_noop; a stale count would misdescribe the pass.
             self._dream_metrics["last_belief_write_count"] = 0
+            # #6211: same hazard for the selection report — no pass ran, so a
+            # report left over from an EARLIER pass must not describe this
+            # one (a stale ``truncated: True`` would tell a caller to distrust
+            # a topology nothing capped).
+            dreamer._last_selection_stats = {}
             return {"mode": "local", "iterations": 0, "converged": True,
                     "affected_claims": [], "budget_used": 0, "coverage": 0.0}
         result = dreamer.dream(
@@ -20447,6 +20564,15 @@ class TortoiseSDK:
         result["coverage"] = coverage
         result["budget_used"] = getattr(
             dreamer, "_last_operator_count", 0) or 0
+        # #6211: the pass's operator selection can be CAPPED (the 200 default),
+        # and ``budget_used`` alone cannot say so — it is the post-cap size.
+        # The selector's own report therefore travels on the DREAMER
+        # (``_last_selection_stats``, filled by ``_bfs_select_operators`` in
+        # dream.py), NOT as extra keys on this result: the I1 local key-set is
+        # pinned exact — ``tests/test_epic903_modes.py`` asserts the set — and
+        # a cap report is not worth loosening a documented I1 contract over.
+        # The one consumer that needs it, ``compute_confidence``'s no-arg
+        # dirty-root path, reads the attribute off the same cached Dreamer.
         result["mode"] = "local"
         self._record_dream_metrics(result, "local")
         return result
@@ -20778,7 +20904,9 @@ class TortoiseSDK:
     def _select_subgraph(self, anchors: list[str], max_hops: int = 1,
                          rel_filter: str = "IMPL|NAND",
                          direction: str = "both",
-                         include_draft: bool = False) -> tuple[list[str], set[tuple[str, str, str]]]:
+                         include_draft: bool = False,
+                         stats: dict | None = None
+                         ) -> tuple[list[str], set[tuple[str, str, str]]]:
         """BFS subgraph selection from anchor Points — A9 return contract.
 
         Delegates to the shared _bfs_select_operators in tortoise.analyze.
@@ -20789,12 +20917,19 @@ class TortoiseSDK:
         selection; the ≥2-live-endpoints derived-liveness predicate applies
         to operator nodes, GATE-2 Q3). With include_draft=False (default,
         #780) draft anchors, operators and frontier points are excluded.
+
+        ``stats`` (#6211): OPTIONAL out-parameter, filled by the selector with
+        ``truncated`` / ``operators_seen`` / ``operators_used`` / ``op_cap``.
+        The return tuple is unchanged, so every existing caller (the dreamer,
+        the calibration scope probe) is unaffected; only a caller that does not
+        own the operator cap passes it — ``compute_confidence`` — which needs
+        the cap in its RESULT, not on stderr.
         """
         from .analyze import _bfs_select_operators
         proj = self._get_proj()
-        ops, anchors_out = _bfs_select_operators(proj, anchors, max_hops=max_hops,
-                                                 rel_filter=rel_filter, direction=direction,
-                                                 include_draft=include_draft)
+        ops, anchors_out = _bfs_select_operators(
+            proj, anchors, max_hops=max_hops, rel_filter=rel_filter,
+            direction=direction, include_draft=include_draft, stats=stats)
         return list(ops), anchors_out
 
     def compute_confidence(self, factors=None, evidence=None,
@@ -20806,11 +20941,58 @@ class TortoiseSDK:
                            recency_decay: float | None = None) -> dict:
         """Compute confidence via EP belief propagation. Returns {iterations, converged, confidences}.
 
+        FACTOR-SELECTION REPORT (#6211) — on every result THIS method builds:
+        ``truncated``, ``operators_seen``, ``operators_used``.
+
+          * ``truncated`` — True when this result was computed over a REDUCED
+            topology: the BFS operator selection hit its cap (``operators_used``
+            < ``operators_seen``) OR the affected-claim expansion was cut short
+            by the #395 degeneration guard (the same condition that sets
+            ``diagnostic: "truncated"``). False means neither bound bit — the
+            selection was NOT capped. It is not a claim that every wired factor
+            voted: ``skipped_factors`` is the SEPARATE, additive record of
+            factors EP dropped before consuming them (#6105).
+            A caller that must not rank on a partial topology reads THIS, not
+            ``converged``: before #6211 a capped pass returned ``converged:
+            true`` and nothing in the result said a cap had been hit, so a
+            confident number computed over a truncated factor set was
+            indistinguishable from a full-graph ranking.
+          * ``operators_seen`` — operators the BFS selection COLLECTED. On the
+            explicit-``factors`` path no selection runs at all, so it equals
+            the caller's factor count (see below).
+          * ``operators_used`` — operators the BFS selection RETURNED (what
+            ``truncated`` is computed from). It is NOT the size of the run's
+            seed set: the anchors path additionally seeds the direct-edge
+            factor-anchor endpoints, which are CLAIMS, not operators, so the
+            run can be seeded with ids this count excludes. And it is not the
+            number of factors that voted — ``skipped_factors`` (#6105) records
+            the factors EP dropped before consuming them.
+
+        ``operators_seen > operators_used`` names the operator cap specifically
+        (the default cap is 200 — the value is not re-stated here because a
+        caller that owns a budget passes its own). The explicit-``factors``
+        path runs NO BFS selection, so the cap cannot bind there:
+        ``operators_seen == operators_used == len(factors)`` and ``truncated``
+        is False. Only the early returns (nothing to run) report 0 / 0 — they
+        are the paths with no factor set to count. The NO-ARG dirty-root path
+        does NOT select operators itself —
+        it runs ``ep.run`` over the roots — but its fail-safe ``dream`` pass
+        does, over the same 200 default, and that pass's posteriors become this
+        result's priors; the three fields therefore carry the DREAM's selection
+        there, and ``truncated`` is true when the dream's selection was capped.
+        Before #6211's review round 3 that path reported ``False`` while a
+        capped 200-of-260 selection had shaped the answer.
+
+        The report is on every RESULT this method builds. One transport sibling
+        builds its own dict and is therefore NOT covered: the MCP handler's
+        HTTP no-dirty-state short-circuit (``mcp_server``), which returns
+        ``diagnostic: "no_dirty_state_http"`` without the three keys — a caller
+        on the hosted surface must read that diagnostic first.
+
         Two diagnostics can accompany the result, both ABSENT when they do not
-        apply (so the key-set above is the ordinary shape): ``diagnostic`` —
-        one of ``truncated`` (#395 degeneration guard), ``no_factors`` /
-        ``no_dirty_roots`` (nothing to run), ``factors_skipped``; and
-        ``skipped_factors`` — one structured record per factor EP DROPPED
+        apply: ``diagnostic`` — one of ``truncated`` (#395 degeneration guard),
+        ``no_factors`` / ``no_dirty_roots`` (nothing to run), ``factors_skipped``;
+        and ``skipped_factors`` — one structured record per factor EP DROPPED
         before it could be consumed (#6105: a draft/terminal endpoint stripped
         the operator below 2 participating inputs, or a directional operator
         lost its idx-0 source). ``converged`` speaks only for the factors the
@@ -20849,6 +21031,22 @@ class TortoiseSDK:
         """
         proj = self._get_proj()
         ep = self._get_ep()
+        # #6211: the FACTOR-SELECTION REPORT this call returns. `truncated` is
+        # True when the result was computed over a reduced topology — the BFS
+        # operator selection hit its cap, or the #395 affected-claim guard cut
+        # the expansion short. Both are reported because both make the same
+        # number untrustworthy, and a caller that must not rank on a partial
+        # topology should not have to know which one happened to fire.
+        selection: dict = {"operators_seen": 0, "operators_used": 0,
+                           "truncated": False}
+
+        def _report(result: dict, *, guard_truncated: bool = False) -> dict:
+            """Attach the #6211 factor-selection report to a result dict."""
+            result["truncated"] = bool(selection["truncated"] or guard_truncated)
+            result["operators_seen"] = selection["operators_seen"]
+            result["operators_used"] = selection["operators_used"]
+            return result
+
         # Hydrate evidence from graph-persisted baselines (survives SDK restarts)
         self._hydrate_evidence()
         # Apply source-based credibility inheritance (with recency modulation #122)
@@ -20871,7 +21069,13 @@ class TortoiseSDK:
         if factors is not None:
             operator_ids = [f if isinstance(f, str) else f[0] for f in factors]
             if not operator_ids:
-                return {"iterations": 0, "converged": True, "confidences": {}, "diagnostic": "no_factors"}
+                return _report({"iterations": 0, "converged": True,
+                                "confidences": {}, "diagnostic": "no_factors"})
+            # No BFS selection ran: the caller supplied the factor set, so the
+            # 200-operator cap does not apply to it. seen == used, truncated
+            # False — reported rather than omitted so the shape is uniform.
+            selection["operators_seen"] = len(operator_ids)
+            selection["operators_used"] = len(operator_ids)
             if require_calibration:
                 self._ensure_calibrated(
                     "compute_confidence",
@@ -20888,14 +21092,14 @@ class TortoiseSDK:
             # through BOTH the selector and ep.run.
             operator_ids, _factor_anchors = self._select_subgraph(
                 anchors, max_hops=max_hops, rel_filter=rel_filter,
-                direction=direction)
+                direction=direction, stats=selection)
             for (src, tgt, _t) in _factor_anchors:
                 operator_ids.append(src)
                 operator_ids.append(tgt)
             operator_ids = list(dict.fromkeys(operator_ids))
             if not operator_ids:
-                return {"iterations": 0, "converged": True, "confidences": {},
-                        "diagnostic": "no_factors"}
+                return _report({"iterations": 0, "converged": True,
+                                "confidences": {}, "diagnostic": "no_factors"})
             if require_calibration:
                 # #7739: scope = the run's consumed set for the selection just
                 # computed. Anchors the run consumes are already in it (they
@@ -20927,8 +21131,8 @@ class TortoiseSDK:
             self._hydrate_dirty_roots()
             roots = list(self._dirty_roots)
             if not roots:
-                return {"iterations": 0, "converged": True, "confidences": {},
-                        "diagnostic": "no_dirty_roots"}
+                return _report({"iterations": 0, "converged": True,
+                                "confidences": {}, "diagnostic": "no_dirty_roots"})
             # Bounded fail-safe pass (dream, max_hops=2) FIRST — preserves the
             # dirty-clear/retry lifecycle (#85); then the exact local pass
             # (max_hops=None). Roots are captured BEFORE the dream so the
@@ -20945,14 +21149,43 @@ class TortoiseSDK:
             # #1315/#1314: propagate the caller's calibration posture — the
             # epic903 refactor re-added an unpropagated dream here (same
             # class as the #1315 fix; line 7050/7202 already propagate).
+            # #6211: the Dreamer is bound BEFORE the call, so the selection
+            # report read after it is provably the instance that ran THIS pass
+            # (``self._dreamer`` is non-None from here on, so a second caller
+            # cannot hand us a fresh, still-empty one).
+            dreamer = self._get_dreamer()
+            # The RESULT of this pass is deliberately not used here: the
+            # deterministic pass below owns the answer, and the dream's only
+            # contribution to it is its selection report, which lands on the
+            # bound ``dreamer``.
             self.dream(dirty_only=True, stamp_dreamed_at=False,
                        warm_start=False,
                        require_calibration=require_calibration)
+            # #6211: the fail-safe dream runs its OWN operator selection (the
+            # same 200 default) and flushes its posteriors, which the exact
+            # pass below loads as priors — so a capped dream shapes THIS
+            # result. Folding its report in is what keeps `truncated` from
+            # certifying a capped derivation as complete on the very path the
+            # issue measured (the no-arg dirty-root pass). Read from the
+            # DREAMER's own report (``_last_selection_stats``), not from keys
+            # on the dream result: the I1 local key-set is pinned exact and
+            # does not carry them (#6211 — see ``_dream_local``).
+            _dream_stats = getattr(
+                dreamer, "_last_selection_stats", None) or {}
+            if _dream_stats.get("truncated"):
+                selection["truncated"] = True
+            selection["operators_seen"] = max(
+                selection["operators_seen"],
+                int(_dream_stats.get("operators_seen") or 0))
+            selection["operators_used"] = max(
+                selection["operators_used"],
+                int(_dream_stats.get("operators_used") or 0))
             iterations, converged = ep.run(roots, max_hops=None,
                                            evidence=run_evidence)
             if not ep._last_affected and not ep._last_truncated:
-                return {"iterations": iterations, "converged": converged,
-                        "confidences": {}, "diagnostic": "no_factors"}
+                return _report({"iterations": iterations, "converged": converged,
+                                "confidences": {}, "diagnostic": "no_factors"},
+                               guard_truncated=ep._last_truncated)
         confidences = {}
         proj = self._get_proj()
         # #395 (delta C): the write-back set == the run set — consume
@@ -20999,8 +21232,9 @@ class TortoiseSDK:
                         self._emit_event(
                             "ConfidenceChanged", id=cid,
                             confidence=confidences[cid]["mean"])
-        result = {"iterations": iterations, "converged": converged,
-                  "confidences": confidences}
+        result = _report({"iterations": iterations, "converged": converged,
+                          "confidences": confidences},
+                         guard_truncated=ep._last_truncated)
         # #395: the degeneration guard never aborts the interactive path — it
         # proceeds with the capped set and reports the diagnostic.
         if ep._last_truncated:
@@ -25480,6 +25714,32 @@ class TortoiseSDK:
         on demand. Each entry gains `related_status` (the neighbor's point
         status — live/superseded/retracted/draft) so the full-fidelity view is
         not blind to terminal state (#689/#898 posture).
+
+        A neighbour is an epistemic node, so the status lookup sweeps all four
+        labels (#6976): with `MATCH (n:Point)` a peer that the #8882 re-typing
+        migration moved to `:Object`/`:Subject`/`:Event` came back with
+        `related_status: ""` — an advisory field that cannot tell "this peer has
+        no lifecycle state" from "this read never looked at its label".
+
+        The value is the PEER LAYER's own lifecycle status, so what it can carry
+        is layer-bound: `:Point` carries `status` (live / superseded /
+        retracted / draft / outdated / archived), `:Object` and `:Subject`
+        carry their own `status` families (which include `deprecated`), and an
+        `:Event` carries NO `status` at all — its lifecycle is `eventStatus`,
+        a different vocabulary this field deliberately does not mix in, so an
+        `:Event` peer reports `""`. `""` therefore means "this peer's layer
+        exposes no `status`", and it is now reached by LOOKING at the peer's
+        label rather than by never asking.
+
+        A THIRD meaning is `""`: the sweep leg for that peer's label FAILED
+        (a raise is logged and skipped, so the other labels' statuses survive —
+        the per-label isolation below), or that peer's own status row was
+        malformed (skipped per row, so the other rows survive). Neither is
+        distinguishable from "no lifecycle state" in this value; labelling them
+        is R1 on #8996. A peer can therefore be PRESENT in the payload with `""`
+        because its label's status leg died, which is exactly the conflation the
+        widening above was added to end — stated rather than left to be
+        rediscovered.
         """
         from .search_engine import get_relationships
         proj = self._get_proj()
@@ -25489,17 +25749,53 @@ class TortoiseSDK:
         related_ids = [e.get("related_id") for e in entries if e.get("related_id")]
         statuses: dict[str, str] = {}
         if related_ids:
-            try:
-                rows = proj.g.query(
-                    "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id, n.status",
-                    params={"ids": related_ids},
-                    timeout=200,
-                ).result_set
-                statuses = {row[0]: row[1] or "" for row in rows}
-            except Exception:
-                pass
+            rows: list = []
+            for _q in epistemic_label_queries(
+                    "MATCH (n:{label}) WHERE n.id IN $ids "
+                    "RETURN n.id, n.status"):
+                try:
+                    rows.extend(proj.g.query(
+                        _q,
+                        params={"ids": related_ids},
+                        timeout=200,
+                    ).result_set)
+                except Exception:
+                    # ONE label failing must not blank every peer's status: the
+                    # sweep widens, so a leg that fails can only fail to add.
+                    _logger.warning(
+                        "related_status lookup failed for one epistemic "
+                        "label — the other labels' statuses are kept",
+                        exc_info=True)
+                    continue
+            for row in rows:
+                try:
+                    statuses[row[0]] = row[1] or ""
+                except Exception:
+                    # A malformed status row must not turn an ADVISORY
+                    # annotation into a whole-read failure on this public method
+                    # (D1: a decoration never fails the read). Per ROW, not per
+                    # comprehension: one bad row may cost exactly one peer,
+                    # never every peer — which is what a single dict-comprehension
+                    # under one handler would do (measured: rows
+                    # [("p1", "live"), (["x"], "live")] → {} → p1 loses "live").
+                    _logger.warning(
+                        "related_status row malformed — that peer's status is "
+                        "left blank, the rest are kept", exc_info=True)
+                    continue
         for e in entries:
-            e["related_status"] = statuses.get(e.get("related_id"), "")
+            try:
+                e["related_status"] = statuses.get(e.get("related_id"), "")
+            except TypeError:
+                # A NON-SCALAR `related_id` is unhashable. It is in scope by
+                # design: `get_relationships`' dedupe key is deliberately total,
+                # so a row whose `other.id` came back as a replayed/diagnostic
+                # list is KEPT and reaches here. Blanking that one peer's
+                # annotation is the whole cost — a decoration must never fail the
+                # read (D1), which is what the per-row guard above promises and
+                # what an unguarded lookup here would have broken one line later
+                # (measured: `statuses.get(['bad-id'])` → TypeError, whole read
+                # lost AFTER the sweep had logged that it succeeded).
+                e["related_status"] = ""
         return entries
 
     # ── Point-in-time restore (E6 #1538, D6) ─────────────────────────
@@ -28112,6 +28408,199 @@ class TortoiseSDK:
                 kind, sorted(known_kinds("pointKind")), kind,
             )
 
+    #: #5475: the general kind a writer can always fall back to, per kind
+    #: property — all CORE spellings, i.e. the anti-paralysis half of the
+    #: owner's 2026-10-17 ruling ("an 'other' or more general kind … so we
+    #: don't completely block the writer in paralyzing bureaucracy").
+    #: ``objectKind``/``subjectKind`` = ``other`` (the SDK/REST default and a
+    #: declared canonical object kind); ``eventKind`` = ``occurrence`` and
+    #: ``pointKind`` = ``statement`` (the extractor's own fallbacks);
+    #: ``documentKind`` has no declared general kind, so it names none rather
+    #: than inventing one.
+    _KIND_GENERAL_FALLBACKS: ClassVar[dict[str, str]] = {
+        "objectKind": "other",
+        "subjectKind": "other",
+        "eventKind": "occurrence",
+        "pointKind": "statement",
+    }
+
+    def _refuse_unapproved_kind(self, prop: str, kind) -> None:
+        """#5475: the INPUT constraint — a write may not name an unapproved pack.
+
+        ``pack_state.graph_kind_namespaces`` MINES the graph's data for
+        ``ns:kind`` values and folds those namespaces into the graph's
+        APPROVAL set, so a write door that persisted an unvalidated kind value
+        WIDENED the very set that is supposed to gate it: on a ``dev``-only
+        graph, ``create_object(objectKind='marketing:contentBrief')`` made the
+        whole ``marketing`` pack writable (measured at HEAD on all four SDK
+        entity doors — object / subject / event / entity — plus the point
+        door). The graph then asserts that a pack nobody approved is
+        installed, which is a durable record that is WRONG, not merely a
+        permissive write.
+
+        This is called from the ONE funnel every entity write passes through
+        (``_create_entity``) and from the point door (``create_point``), not
+        per public method: ``create_object``/``create_subject``/``create_event``
+        relay to ``create_entity``, ``create_document`` and ``create_source``
+        reach ``_create_entity`` directly, and the hosted commit door
+        (``hosted_api._execute_commit_writes``) calls ``create_entity`` — so
+        the chokepoint is where the four mandated doors and every sibling door
+        MEET. A per-door check would leave the next door open (that was the
+        shape of the defect: the REST doors were gated and the SDK ones were
+        not).
+
+        REJECT, never silently normalise (#5475 owner ruling, Option A): a
+        rewrite would store a kind the caller did not write and the write
+        would be metered and audited under it. The message therefore states
+        what happened, why, and what to do — including the approved spellings
+        the graph WOULD accept and the general core kind, so the writer is
+        never paralysed (the ruling's other half).
+
+        A bare kind, an empty namespace, a ``core:`` spelling and a graph with
+        no ``:PackInstall`` records are all admitted by
+        ``pack_state.kind_named_packs``/``unapproved_kind_pack`` — this is not
+        a blanket ban on writes. The ``eventKind`` spelling is additionally
+        checked through the #5184 bare-kind attribution, because a BARE event
+        kind that one catalog pack declares is mined back into that pack's
+        namespace (comment 2026-10-13: a fix here must constrain BOTH
+        spellings).
+
+        ⚠️ COST — the gate read is a WHOLE-GRAPH scan
+        (``graph_installed_namespaces``: 8 property scans, ~6 ms at 300 nodes,
+        O(nodes)) and it runs ONCE PER WRITE that names a pack — NOT once per
+        capture: a capture that stores N pack-kinded entities pays N scans
+        (measured ~8–27 ms per call at 5k nodes), which is the price of a
+        correct closure at the write door. It is skipped entirely for a
+        spelling that names none (bare / empty / ``core:``), which is the
+        overwhelming majority of writes (every core kind, and every
+        ``core:Project``-spelled extraction result), so a capture pays nothing
+        for its core kinds. A batch-scoped cache of the resolved set (a
+        data-version signal feeding the plan, the optimization
+        ``pack_state.graph_kind_namespaces`` already names) is a follow-up, not
+        a property this gate may drop: a stale set can only over-refuse.
+        """
+        from .pack_state import _ATTRIBUTABLE_BARE_KIND_KEYS, kind_named_packs
+        if not kind_named_packs(
+                kind, attribute_bare=prop in _ATTRIBUTABLE_BARE_KIND_KEYS):
+            # Cheap pre-check FIRST: a spelling that names no pack cannot widen
+            # the approval set, so the whole-graph read is not paid for it. The
+            # attribution leg is a MEMOIZED catalog read, never a graph read.
+            return
+        exc = self._unapproved_kind_refusal(
+            prop, kind, _installed_namespaces_for_gate(self))
+        if exc is not None:
+            raise exc
+
+    def _unapproved_kind_refusal(self, prop: str, kind, approved):
+        """The ``UnapprovedKindNamespace`` covering this write, or ``None``.
+
+        Split out of ``_refuse_unapproved_kind`` so a caller that has ALREADY
+        read the approval set can reuse the decision AND its Option-A message
+        without paying a second whole-graph scan — the hosted commit door
+        resolves the set for Layer-1 before its write phase, and pre-validates
+        the payload's entity kinds with it (#5475 review: a refusal raised
+        mid-write leaves the commit `partial`, so it must be decided before the
+        first write).
+
+        Pure with respect to the graph: it decides from ``approved`` only.
+        """
+        from .pack_state import (
+            _ATTRIBUTABLE_BARE_KIND_KEYS,
+            approved_kind_alternatives,
+            unapproved_kind_pack,
+        )
+        # The attribution flag is DERIVED from pack_state's own declaration of
+        # which keys attribute a BARE value back to a pack (today:
+        # ``eventKind``), never re-spelled here: a second copy would stop
+        # constraining a key the mining leg starts attributing — the same
+        # widening under a new name.
+        pack_ns = unapproved_kind_pack(
+            kind, approved, attribute_bare=prop in _ATTRIBUTABLE_BARE_KIND_KEYS)
+        if pack_ns is None:
+            return None
+        approved_ns = ", ".join(sorted(approved or ())) or "none"
+        alternatives = approved_kind_alternatives(kind, approved, prop=prop)
+        # The remedy is a LIST of what the caller can do (the owner ruling's
+        # third element), so the punctuation cannot drift as clauses are added.
+        # ⛔ The wording ALSO has to survive the MCP layer's error scrubber
+        # (``mcp_server._scrub_error``): its rule is ``(host=|at |to )[\w.-]+``,
+        # which -- because the alternation has no word boundary -- bites any
+        # ``at ``/``to `` SUBSTRING, i.e. "Wh**at **next" and "th**at **pack".
+        # This message crosses that boundary on every MCP tool call, and a
+        # scrubbed remedy is the one half of Option A a writer acts on. Hence
+        # "Next steps:"/"install the pack"/"for this graph", never
+        # "What next"/"that pack"/"to this graph"/"What to do". The rule is
+        # mechanical, so it is PINNED: the door tests assert the raw message is
+        # a fixed point of ``_scrub_error``.
+        remedies = [
+            "write a kind from the core vocabulary, or from a pack this graph "
+            f"HAS approved ({approved_ns})",
+        ]
+        if alternatives:
+            more = "".join(f" (or {alt!r})" for alt in alternatives[1:])
+            remedies.append(
+                "the same kind IS declared by an approved pack — write "
+                f"{alternatives[0]!r}{more}")
+        remedies.append(
+            f"with user approval, add the {pack_ns!r} ontology pack for this "
+            "graph (PUT /v1/graphs/{graph_id}/packs)")
+        what_next = "; ".join(remedies)
+        general = self._KIND_GENERAL_FALLBACKS.get(prop)
+        fallback = (
+            f" A kind you cannot classify is never blocked: the bare general "
+            f"kind {general!r} names no pack and always writes."
+            if general else
+            " A kind you cannot classify is never blocked: a bare "
+            "(un-namespaced) kind names no pack and always writes.")
+        return UnapprovedKindNamespace(
+            f"refused {prop}={kind!r}: it names the ontology pack namespace "
+            f"{pack_ns!r}, which this graph has not approved — the write was "
+            "NOT stored. Why: kinds are namespaced by ontology pack, and this "
+            "graph's approved set is mined from the kind values it already "
+            "holds, so a write naming an unapproved namespace would install "
+            "the pack by writing it — any caller could grant itself any "
+            "pack, and the namespace/kind vocabulary would balloon until it "
+            f"no longer names anything. Next steps: pick one — {what_next}. "
+            f"{fallback.strip()}",
+            prop=prop, kind=kind if isinstance(kind, str) else str(kind),
+            namespace=pack_ns, installed=approved)
+
+    def _refuse_unapproved_kinds_in_props(self, props: dict) -> None:
+        """Run the #5475 gate over EVERY kind property a write is carrying.
+
+        The five public doors do not hand their kind in one shape: the entity
+        aliases use ``objectKind``/``subjectKind``/``eventKind``, the document
+        door ``documentKind``, ``create_source`` ``sourceKind``, ``create_point``
+        its positional ``kind`` PLUS a free-form props passthrough that accepts
+        any of the other mined key names. Every one of those values is persisted
+        on the node and mined back into the approval set by
+        ``pack_state.graph_kind_namespaces``, so the gate reads the same key set
+        it mines (``_KIND_PROP_KEYS``) rather than a per-door list — a door that
+        let one through would re-open the widening under a name the check did
+        not know.
+
+        ``uses[]`` is checked here too: the Event fold (``projection._upsert_event``)
+        MERGEs an ``:Object`` stub per use item with ``objectKind = item['kind']``
+        — a kind property written by a door that never names it as one (measured:
+        ``create_event(..., uses=[{'name': 'x', 'kind': 'marketing:campaign'}])``
+        widened a ``dev``-only graph before this check existed).
+        """
+        from .pack_state import _KIND_PROP_KEYS as _gated_kind_props
+        for kind_prop in _gated_kind_props:
+            if kind_prop in props:
+                self._refuse_unapproved_kind(kind_prop, props.get(kind_prop))
+        uses = props.get("uses")
+        if isinstance(uses, dict):
+            uses = [uses]
+        elif isinstance(uses, str):
+            uses = []  # a legacy bare-string use writes objectKind='other'
+        if isinstance(uses, (list, tuple)):
+            for item in uses:
+                if isinstance(item, dict):
+                    # The fold's own default is 'other' (a bare core kind), so
+                    # an absent 'kind' is the same write it will perform.
+                    self._refuse_unapproved_kind("objectKind", item.get("kind"))
+
 
     # ── Entity CRUD (ONTOLOGY v2.5 §3, all 7 types) ──────────────────
 
@@ -28148,6 +28637,17 @@ class TortoiseSDK:
         interleave — could swap each other's captured pre-write state and lose
         a real version transition.
         """
+        # ── #5475: the approved-pack gate — ONE site for every ENTITY write ──
+        # `create_entity` (subject/object/event/document) relays here,
+        # `create_document` and `create_source` reach this funnel directly, and
+        # the hosted commit door calls `create_entity` — so this is where all
+        # of them MEET. The check runs on exactly the properties
+        # `pack_state.graph_kind_namespaces` MINES the approval set from
+        # (`_KIND_PROP_KEYS`) plus the Event fold's `uses[].kind` leg, because
+        # a gate that skipped one of them would leave the widening leg it
+        # closes open under another name; and it runs BEFORE any write, so a
+        # refusal leaves the graph untouched.
+        self._refuse_unapproved_kinds_in_props(props)
         # #329: id + sourcePath/source_path are server-managed — reject.
         # is_episodic is ALSO server-managed (#1486, quota discriminator) —
         # NEVER popped here: the sanitizer's unconditional reject is the
