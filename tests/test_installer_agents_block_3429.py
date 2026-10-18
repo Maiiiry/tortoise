@@ -118,6 +118,16 @@ backticks, which is not CommonMark's rule:
     (pinned at the source: unimplementable on this host's BSD awk, and gawk under
     a UTF-8 locale is where it bites).
 
+Cycle 8 measured the CLOSING predicate and the silent path:
+
+  * let a closing fence carry trailing text                -> the language-tagged
+    test fails: a three-tick fence containing a three-tick language-tagged line
+    closed early, so the rest of a documentation example was counted and a false
+    "ran twice" was printed — whose remedy deletes the real block AND the docs;
+  * make the still-open fence silent for paired/none       -> the not-silent test
+    fails: the block is written INSIDE the open fence, where it renders as code
+    and is never read, with no warning at all.
+
 Cycle 2 also measured a version token in prose outside the block (read as
 "current") and an older installer overwriting a newer block (called an
 "upgrade"); both are tests here. Cycle 3 measured the false-success path
@@ -1144,3 +1154,41 @@ def test_the_classifier_runs_under_the_C_locale():
     text = INSTALLER.read_text(encoding="utf-8")
     assert 'state="$(LC_ALL=C awk' in text, (
         "the state classifier must run under the C locale for the byte BOM strip")
+
+
+def test_a_language_tagged_line_inside_a_fence_does_not_close_it(tmp_path):
+    """A closing fence may carry nothing but spaces/tabs after the run; trailing
+    text is legal only on the OPENING fence. Treating a ```` ```bash ```` line
+    INSIDE a fence as a close ended the example early, counted the rest of it, and
+    produced a false "ran twice" whose remedy deletes the real block AND the docs."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    # A THREE-tick fence containing a THREE-tick language-tagged line: only the
+    # trailing-text rule keeps the fence open here.
+    example = ("```markdown\n```bash\n" + START + "\nnpm run build\n" + END + "\n```\n")
+    agents = project / "AGENTS.md"
+    agents.write_text(example, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, (
+        f"a language-tagged line inside a fence closed the fence:\n{done.stderr}")
+    assert "ran twice" not in done.stderr, done.stderr
+    text = agents.read_text(encoding="utf-8")
+    assert example in text, "the documentation example was modified"
+    assert text.count(START) == 2, "expected the example plus the created block"
+
+
+def test_a_block_written_inside_an_unterminated_fence_is_not_silent(tmp_path):
+    """The write matches the pre-#3429 installer, so it is not refused — but a
+    block inside an open fence renders as code and is never read, so it must warn."""
+    done, text = _install(tmp_path, "# House\n\n```bash\nnpm run build\n")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "UNTERMINATED code fence" in done.stderr, (
+        f"a block written inside an open fence must not be silent:\n{done.stderr}")
+    assert text.count(START) == 1, "the block IS written (unchanged behaviour)"

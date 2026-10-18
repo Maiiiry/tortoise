@@ -526,6 +526,17 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         sub(/^ +/, "", m)
         return m
       }
+      # A CLOSING fence carries nothing after the run but spaces/tabs. Trailing
+      # text is legal only on the OPENING fence, so a language-tagged line INSIDE a
+      # fence is content — treating it as a close ended the fence early, counted the
+      # rest of the example, and produced a false "ran twice" whose remedy deletes
+      # the real block plus the documentation.
+      function fence_close(line,   m) {
+        if (!match(line, /^ {0,3}(`{3,}|~{3,})[ \t\r]*$/)) return ""
+        m = substr(line, RSTART, RLENGTH)
+        gsub(/[ \t\r]/, "", m)
+        return m
+      }
       { lines[NR] = $0 }
       { fr = fence_run($0)
         if (fence == "") {
@@ -533,7 +544,7 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         } else {
           # Inside a fence nothing is content — including a shorter run of the same
           # character and a run of the OTHER character (a nested example).
-          if (fr != "" && substr(fr, 1, 1) == fence && length(fr) >= flen) {
+          if (fr != "" && fence_close($0) != "" && substr(fr, 1, 1) == fence && length(fr) >= flen) {
             for (i = fstart; i < NR; i++) closed[i] = 1
             fence = ""
           }
@@ -562,10 +573,10 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         # them treated a 4-space-indented documentation example (CommonMark allows
         # that as a code block too) as a "duplicate" and its remedy deleted it.
         if (starts == 1 && ends == 1 && startline < endline) {
-          printf "paired|1|%d|1|%d|0|0|0|0|0\n", startline, endline; exit
+          printf "paired|1|%d|1|%d|0|0|0|0|%d\n", startline, endline, fenceopen; exit
         }
         if (starts + ends + nearstart + nearend + mangledstart + mangledend == 0) {
-          print "none|0|-|0|-|0|0|0|0|0"; exit
+          printf "none|0|-|0|-|0|0|0|0|%d\n", fenceopen; exit
         }
         # Per-marker counts, so the message and the remedy agree with each other:
         # `c_end` (anchored only) used to say "there is no end line" while the
@@ -622,6 +633,14 @@ EOF
       ;;
   esac
 
+
+  # A block written INSIDE an unterminated fence renders as code and is never read
+  # by the agent it was written for. The write is what the pre-#3429 installer did,
+  # so it is not refused — but it must not be silent.
+  if [ "${c_fence_open:-0}" = "1" ] && [ "$state_kind" != "malformed" ]; then
+    echo "  ⚠ AGENTS.md has an UNTERMINATED code fence — the Tortoise block will be written" >&2
+    echo "    inside it and read as code, not as instructions. Close the fence and re-run." >&2
+  fi
 
   if [ "$state_kind" = "paired" ]; then
     # The version is read INSIDE the window, and any token is captured (not just
