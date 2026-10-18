@@ -1244,6 +1244,18 @@ class TestCanonicalRedirectTarget:
             ("cursor://anysphere.cursor-mcp/oauth/callback",
              "cursor://anysphere.cursor-mcp/oauth/callback",
              "cursor://anysphere.cursor-mcp/oauth/callback"),
+            # a `]` in USERINFO is not an IPv6 terminator: the host is stripped of
+            # userinfo before the bracket rule applies, so the presented port is
+            # still applied (reading that `]` as the host's end dropped it, and a
+            # registrable `_valid_redirect_uri` row can carry one)
+            ("http://a]@[::1]/cb", "http://a]@[::1]:3118/cb",
+             "http://a]@[::1]:3118/cb"),
+            # a registration with NO authority is returned VERBATIM. There is no
+            # port to vary, and `urlunsplit` would otherwise promote the
+            # `//`-leading path into a netloc — emitting a host the registration
+            # never carried (`cursor:////h/cb` -> `cursor://h/cb`)
+            ("cursor:////evil.example/cb", "cursor:////evil.example/cb",
+             "cursor:////evil.example/cb"),
         ]
         from tortoise.oauth import _redirect_uri_matches as m
         for registered, presented, expected in rows:

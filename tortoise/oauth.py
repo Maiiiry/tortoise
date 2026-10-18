@@ -636,12 +636,10 @@ def _redirect_uri_matches(registered: str | None,
 # Rebuilding the target from the REGISTERED URI's components with only the
 # presented PORT applied (RFC 8252 §7.3 — the one component permitted to vary)
 # removes the requirement instead of enumerating its cases: nothing the request
-# sends can reach the browser EXCEPT the port's digits — no presented scheme,
-# host, userinfo, path, query or fragment does — so a differential cannot move
-# the host whatever the two parsers disagree about. The rebuild deliberately
-# takes the authority from the REGISTERED side — rebuilding it from the
-# PRESENTED components would re-emit the presented authority verbatim and keep
-# the differential (`urlsplit` reads the host after the last `@`, so
+# sends can reach the browser EXCEPT the port's digits, so a differential cannot
+# move the host whatever the two parsers disagree about. The authority comes from
+# the REGISTERED side verbatim: rebuilding it from the PRESENTED components would
+# re-emit them (`urlsplit` reads the host after the last `@`, so
 # `http://evil.example\@localhost/cb` parses to host `localhost` with the whole
 # `evil.example\@localhost` still in its netloc).
 
@@ -661,16 +659,16 @@ def _authority_parts(netloc: str) -> tuple[str, str]:
     browser refuses to navigate such a URI at all.
 
     RFC 3986 §3.2: the port is the last ``:``-delimited component of the
-    authority. ``@`` cannot follow the host, and a bracketed IPv6 literal is
-    self-delimiting, so the host ends at the first ``]``, or at the first ``:``
-    after the last ``@``, whichever form applies.
+    authority. USERINFO IS STRIPPED FIRST — a ``]`` in userinfo is not the IPv6
+    terminator, and reading it as one drops the presented port for a
+    registrable, matching pair — then a bracketed host ends at its ``]``.
     """
-    bracket = netloc.find("]")
-    if bracket >= 0:
-        port_at = netloc.find(":", bracket)
-    else:
-        at = netloc.rfind("@")
-        port_at = netloc.find(":", at + 1 if at >= 0 else 0)
+    # Strip userinfo FIRST: a `]` in it is not the IPv6 terminator (reading it
+    # as one dropped the presented port for a registrable, matching pair), and
+    # `@` cannot follow the host, so everything after the LAST `@` is the host.
+    host_at = netloc.rfind("@") + 1
+    end = netloc.find("]", host_at)
+    port_at = netloc.find(":", end if end >= 0 else host_at)
     if port_at < 0:
         return netloc, ""
     return netloc[:port_at], netloc[port_at + 1:]
@@ -714,13 +712,13 @@ def _canonical_redirect_target(registered: str, presented: str) -> str:
     side's.
 
     For every pair the current matcher accepts, the result is byte-identical to
-    the PRESENTED string except (a) where only the case of the scheme or the
-    host differs — `_redirect_uri_matches` compares those case-insensitively,
-    and the authority is re-emitted from the registered side — (b) a presented
-    port no URI may carry, where the registered authority stands, and (c) an
-    EMPTY presented port (`http://host:/cb`), which names the scheme default and
-    is emitted without its colon. So this changes nothing where the current code
-    works and nothing where it does not.
+    the PRESENTED string except (a) where only the case of the scheme or host
+    differs (`_redirect_uri_matches` compares those case-insensitively, and the
+    authority comes from the registered side), (b) a presented port no URI may
+    carry, (c) an EMPTY presented port (`http://host:/cb`), which names the
+    scheme default and is emitted without its colon, (d) a registered URI with
+    NO authority, returned verbatim (no port to vary, and `urlunsplit` would
+    promote a `//`-leading path into a netloc), and (e) a trailing empty `?`.
 
     Total (never raises) and idempotent: rebuilding from a rebuilt target
     returns it unchanged.
@@ -737,6 +735,8 @@ def _canonical_redirect_target(registered: str, presented: str) -> str:
         # reached (it catches the same ValueError), so this branch is a
         # totality guard, not a live path: the REGISTERED string is the trusted,
         # validated side, and returning it is what keeps the function total.
+        return registered
+    if not reg.netloc:
         return registered
     reg_authority, _ = _authority_parts(reg.netloc)
     _, presented_port = _authority_parts(pre.netloc)
