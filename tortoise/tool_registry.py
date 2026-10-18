@@ -51,9 +51,17 @@ class ToolDefinition:
     handler_override: Optional[Callable] = None  # For raw-Cypher REST ops  # noqa: UP045
     rest_spec: Optional[RestSpec] = None         # For SDK-backed REST ops  # noqa: UP045
     group: str = "memory"        # Curation group (#523): memory|reasoning|graph|sessions|sources|journal|admin|onboarding
-    hosted_only: bool = False    # #1935: register ONLY on the hosted surface
-                                 # (deployment-gated — e.g. tortoise_pack_install;
-                                 # self-host uses filesystem packs dir + CLI)
+    # There is deliberately NO `hosted_only` field here. #4114 deleted it: it was
+    # declared and set on one entry but read by NOTHING, so its comment ("register
+    # ONLY on the hosted surface") asserted a registration behaviour that no code
+    # implemented — a safety flag that read as enforced and was not. Deployment
+    # gating for a tool belongs at the HANDLER that can still act, not in a
+    # declaration no surface consults: `tortoise_pack_install` is gated in
+    # `mcp_server.py`, whose self-host arm returns an actionable stub, and that
+    # behaviour is pinned by `tests/test_pack_manifest_store.py`
+    # (``TestDeploymentGateAndView``) and by
+    # `tests/test_surface_resolution.py::test_deployment_gated_entry_stub_reaches_the_live_surface`.
+    # Re-adding a declaration-only gate re-creates exactly this bug — see #4114.
     writes: bool = False         # declared write permission — a caller needs graphs:write
     retired_use_instead: Optional[str] = None  # noqa: UP045  # #3883: non-None ONLY
                                  # on a retired entry — the call that replaces this name.
@@ -255,7 +263,14 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (calls pack_manifest_store.upsert_tenant_manifest)
         group="admin",
-        hosted_only=True,
+        # DEPLOYMENT-GATED (#1935 R10) — but NOT here. The gate is the HANDLER
+        # (`tortoise/mcp_server.py::tortoise_pack_install`): when
+        # `tortoise.hosted_api` is not imported (self-host), it returns an
+        # actionable stub instead of installing. The entry stays REGISTERED on
+        # both surfaces by design — absence would leave a self-hoster with no
+        # pointer to the filesystem-packs-dir + `tortoise pack` CLI path.
+        # #4114 deleted the `hosted_only=True` marker that used to sit here
+        # because nothing read it; do not re-add a declaration-only gate.
     ),
     # ── Tags (#215) ───────────────────────────────────────────────
     ToolDefinition(

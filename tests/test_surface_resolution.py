@@ -94,21 +94,38 @@ accepted — an unrecorded residual is how a guard silently stops guarding:
    ``test_live_mcp_tools_are_callable`` proves the served tool has a callable
    ``fn``.
 
-2. ``hosted_only`` DECLARED BUT UNWIRED — ACCEPTED (owner: the #1935 wiring
-   change). ``ToolDefinition.hosted_only`` is declared (``tool_registry.py``) and
-   set on ``tortoise_pack_install``; NOTHING reads it, so every registry entry is
-   registered on every surface and the both-direction equality in
-   ``test_live_mcp_surface_registers_every_entry`` is the correct assertion
-   TODAY. The moment #1935 wires the flag, a self-host run legitimately serves
-   one fewer entry and that equality would red a CORRECT deployment, so the
-   wiring change must carry the one-directional form — the missing set contained
-   in ``{e.name for e in TOOL_REGISTRY if e.hosted_only}`` while the extra set
-   stays empty — and must not reach for a hide-by-transform implementation:
+2. ``hosted_only`` — CLOSED (#4114): the field was DELETED, and the deployment
+   gate it claimed lives at the HANDLER. ``ToolDefinition.hosted_only`` was
+   declared (``tool_registry.py``) and set on ``tortoise_pack_install`` while
+   NOTHING read it, so its comment ("register ONLY on the hosted surface")
+   asserted a registration behaviour no code implemented — the field could not
+   fail closed, because no surface consulted it. #4114 deleted the field rather
+   than wiring it, and the reason is that the guarantee it claimed is REAL but
+   BELONGS ELSEWHERE: ``mcp_server.tortoise_pack_install`` returns an actionable
+   self-host stub when ``tortoise.hosted_api`` is not imported, the entry stays
+   REGISTERED on both surfaces BY DESIGN (absence would leave a self-hoster with
+   no pointer to the filesystem-packs-dir + ``tortoise pack`` CLI path), and so
+   the both-direction equality in ``test_live_mcp_surface_registers_every_entry``
+   is the correct assertion — permanently, not "until the #1935 wiring lands".
+   (That residual named a wiring change owned by #1935, which CLOSED on
+   2026-09-25 without it: the provenance was stale, not a pending decision.) The
+   behaviour is pinned in its handler form by ``TestDeploymentGateAndView``
+   (``tests/test_pack_manifest_store.py``) and in its through-the-live-surface
+   form by ``test_deployment_gated_entry_stub_reaches_the_live_surface`` below —
+   so deleting the flag cannot quietly delete the gate with it. Wiring a
+   REGISTRATION gate on this entry would additionally have changed the self-host
+   MCP tool surface without owner approval and would have to be undone by #4663
+   (owner ruling 2026-09-22: ``pack_install`` is SDK/REST, post-beta, off the
+   agent-facing MCP). The general rule survives: if a future entry genuinely
+   needs to be ABSENT from a surface, it must not be a declaration no surface
+   consults — the both-direction equality then carries the one-directional form
+   (the missing set contained in the declared gated names while the extra set
+   stays empty) and must not reach for a hide-by-transform implementation:
    ``_HTTPToolFilter`` is the precedent for exactly that, and it drops the 7
    ``http_policy=False`` entries (measured, see residual 3), which ARE on the
-   stdio MCP surface. Weakening the equality NOW to pre-empt the wiring would
-   instead buy a permanent false GREEN on every hosted_only entry while the flag
-   is inert — the wrong trade, and why this is recorded rather than pre-applied.
+   stdio MCP surface. Weakening the equality NOW would instead buy a permanent
+   false GREEN on every gated entry while nothing reads the declaration — the
+   wrong trade, and why the flag is gone rather than pre-applied.
 
 3. PRIVATE fastmcp API — ACCEPTED: the public swap was TESTED AND REJECTED. The
    preference was to read the PUBLIC ``mcp.list_tools()``; it is not adoptable on
@@ -147,6 +164,7 @@ accepted — an unrecorded residual is how a guard silently stops guarding:
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import pytest
 
@@ -470,6 +488,86 @@ def test_live_mcp_tools_are_callable():
     assert tools, "live MCP surface is empty (fail-closed)"
     not_callable = [t.name for t in tools if not callable(getattr(t, "fn", None))]
     assert not not_callable, f"live MCP tools with no callable entrypoint: {not_callable}"
+
+
+# --- the deployment gate that deleting the dead flag must NOT delete ---------
+# #4114 removed ``ToolDefinition.hosted_only`` because nothing read it. What that
+# flag *claimed* — "tortoise_pack_install must not install on self-host" — is a
+# real guarantee, but it is a HANDLER guarantee (``mcp_server.tortoise_pack_install``
+# returns the self-host stub when ``tortoise.hosted_api`` is not imported), not a
+# registration one. The case below pins that guarantee so the deletion cannot
+# quietly take the gate with it, and it deliberately goes through the LIVE
+# registered entrypoint rather than calling the module function: the other form of
+# this assertion (``tests/test_pack_manifest_store.py::TestDeploymentGateAndView``)
+# proves the handler refuses, and only this one proves the refusal is what an
+# agent calling the REGISTERED surface actually gets. The two are not redundant.
+#
+#: The one deployment-gated entry (#1935 R10). Named, not derived: the field that
+#: used to derive it is exactly what #4114 deleted, and it must not be re-added just
+#: to make a guard tidy. The name coupling is deliberate — a rename must re-point
+#: this case (the failure message says so) — because a bare ``TOOL_REGISTRY`` scan
+#: for "some gated entry" would silently guard nothing the moment the name moves,
+#: the vacuous-guard failure mode of #4113.
+_DEPLOYMENT_GATED_ENTRY = "tortoise_pack_install"
+
+#: Content is NOT what this case is about — the gate refuses before the manifest is
+#: parsed, so any string reaches it. Should the gate ever be removed, the call falls
+#: through to ``upsert_tenant_manifest`` and this case errors instead of passing.
+_UNPARSED_MANIFEST = "namespace: probe\nname: probe\nversion: 0.0.1\n"
+
+
+def test_deployment_gated_entry_stub_reaches_the_live_surface(monkeypatch):
+    """The deployment gate is on the REGISTERED entrypoint, and it fails closed (#4114).
+
+    Mutation that REDs this assertion: delete the ``tortoise.hosted_api``
+    self-host arm (``mcp_server.tortoise_pack_install``, the ``if _sys.modules.get(
+    "tortoise.hosted_api") is None`` branch) — the call then proceeds to
+    ``upsert_tenant_manifest`` and this case does not see the stub. Mutating the
+    registration instead (making ``FastMCPAdapter.register_all`` skip the entry)
+    REDs the first half, and that matters: an entry absent from the surface
+    cannot deliver an actionable stub, which is the whole reason #4114 chose
+    DELETION of the flag over wiring a registration gate.
+
+    ``monkeypatch.setitem`` is the self-host simulation the handler's own gate
+    reads (``sys.modules.get("tortoise.hosted_api") is None``), so it is undone
+    after the case and cannot leak a self-host shape into the live-surface
+    assertions above.
+
+    On a red here read WHICH half failed first: if ``tortoise_pack_install`` is
+    gone from the live surface, the entry was retired by #4663's owner-approved
+    curation (SDK/REST only, post-beta) — retire this case WITH it, and do NOT
+    reintroduce a declaration-only gate to keep the case alive.
+    """
+    live = {t.name: t for t in asyncio.run(mcp_server.mcp._list_tools())}
+    assert _DEPLOYMENT_GATED_ENTRY in live, (
+        f"the deployment-gated entry {_DEPLOYMENT_GATED_ENTRY!r} is not on the live MCP "
+        f"surface — present: {len(live)} entries. Either the registration seam stopped "
+        f"registering it, or #4663 retired it (owner ruling 2026-09-22: SDK/REST only, "
+        f"post-beta) — in which case delete this case with the entry instead of "
+        f"re-adding a declaration-only gate."
+    )
+    fn = getattr(live[_DEPLOYMENT_GATED_ENTRY], "fn", None)
+    assert callable(fn), (
+        f"{_DEPLOYMENT_GATED_ENTRY} is registered with entrypoint {fn!r}, so its "
+        f"deployment gate is unreachable from the surface an agent calls"
+    )
+
+    monkeypatch.setitem(sys.modules, "tortoise.hosted_api", None)  # simulate self-host
+    out = fn(manifest_yaml=_UNPARSED_MANIFEST)
+    assert isinstance(out, dict), (
+        f"{_DEPLOYMENT_GATED_ENTRY} on self-host returned {type(out).__name__} instead of "
+        f"the actionable stub dict — a bare exception is not an actionable refusal"
+    )
+    assert out.get("installed") is False, (
+        f"{_DEPLOYMENT_GATED_ENTRY} did NOT refuse on self-host: {out!r}. The hosted-only "
+        f"guarantee #4114 preserved is gone from the registered surface."
+    )
+    assert "HOSTED-only" in (out.get("error") or ""), (
+        f"{_DEPLOYMENT_GATED_ENTRY} refused on self-host without the actionable "
+        f"HOSTED-only pointer to the filesystem packs dir + `tortoise pack` CLI: {out!r}. "
+        f"A refusal that does not name the working path is the silent capability gap "
+        f"that a registration gate would have produced."
+    )
 
 
 # --- dependency coupling: the private ``_list_tools()`` (residual 3, #3905) ---
