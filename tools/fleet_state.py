@@ -1315,18 +1315,23 @@ def live_sessions() -> LiveSessions:
                         by_cwd.setdefault(cwd, []).append(r["pid"])
                 for cwd, pids in by_cwd.items():
                     pids.sort()
+                    # ONE record PER PID under the one workspace key, which is the
+                    # shape the lane join already handles for a reused cmux
+                    # workspace: the lane's `pi_pids`, its CPU tree and its
+                    # `pid_alive` then cover EVERY process measured in that cwd,
+                    # while the LANE is counted once (`register_process_lanes`).
                     ws = f"{PROC_WS_PREFIX}{pids[-1]}"
-                    result.setdefault(ws, []).append({
-                        "agent": "pi",
-                        "workspace_id": ws,
-                        "pid": pids[-1],
-                        "pids": pids,
-                        "cwd": cwd,
-                        "session_id": None,
-                        # every pid here is running RIGHT NOW, measured by `ps`
-                        "agent_lifecycle": "running",
-                        "store": LIVE_STORE_PROCESS,
-                    })
+                    for pid in pids:
+                        result.setdefault(ws, []).append({
+                            "agent": "pi",
+                            "workspace_id": ws,
+                            "pid": pid,
+                            "cwd": cwd,
+                            "session_id": None,
+                            # running RIGHT NOW, measured by `ps`
+                            "agent_lifecycle": "running",
+                            "store": LIVE_STORE_PROCESS,
+                        })
 
     sources = [s for s in (cmux_source, "" if proc_error else LIVE_STORE_PROCESS) if s]
     result.measured = bool(sources)

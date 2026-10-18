@@ -1662,7 +1662,6 @@ def _proc_live(pid: int, cwd: str = CELL_CWD, **extra) -> dict:
         "agent": "pi",
         "workspace_id": f"{fs.PROC_WS_PREFIX}{pid}",
         "pid": pid,
-        "pids": [pid],
         "cwd": cwd,
         "session_id": None,
         "agent_lifecycle": "running",
@@ -1766,10 +1765,9 @@ def test_one_worktree_is_one_lane_even_with_several_pi_processes(monkeypatch) ->
     overlaps its predecessor. Emitting one lane per PID would attribute one lane's
     issue TWICE, and `_holders_from_board` reads two recorded lanes for one label as
     unreadable — turning a readable lane into exit 2."""
-    rec = _proc_live(4242)
-    rec["pids"] = [4242, 4243]
     live = fs.LiveSessions(
-        {f"{fs.PROC_WS_PREFIX}4243": [rec]}, measured=True, source=fs.LIVE_STORE_PROCESS)
+        {f"{fs.PROC_WS_PREFIX}4243": [_proc_live(4242), _proc_live(4243)]},
+        measured=True, source=fs.LIVE_STORE_PROCESS)
     kept, proc_ws = fs.register_process_lanes(
         live, {}, [], {CELL_CWD: {"branch": "refs/heads/feat/8999-tm"}})
     assert len(kept) == 1
@@ -1777,7 +1775,8 @@ def test_one_worktree_is_one_lane_even_with_several_pi_processes(monkeypatch) ->
 
 
 def test_live_sessions_collapses_processes_by_cwd(monkeypatch) -> None:
-    """The collapse rule, at the reader: two pids in one cwd are ONE record."""
+    """The collapse rule, at the reader: two pids in one cwd are ONE lane record set
+    (one workspace key), so the lane join sees every pid but counts one lane."""
     monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
     monkeypatch.setattr(fs, "pi_processes", lambda: (
         [{"pid": 10, "ppid": 1}, {"pid": 11, "ppid": 10}], ""))
@@ -1786,7 +1785,7 @@ def test_live_sessions_collapses_processes_by_cwd(monkeypatch) -> None:
     live = fs.live_sessions()
     assert live.measured is True
     assert list(live) == [f"{fs.PROC_WS_PREFIX}11"], "the newest pid names the lane"
-    assert live[f"{fs.PROC_WS_PREFIX}11"][0]["pids"] == [10, 11]
+    assert [r["pid"] for r in live[f"{fs.PROC_WS_PREFIX}11"]] == [10, 11]
 
 
 def test_an_unreadable_everything_stays_unmeasured(monkeypatch) -> None:
