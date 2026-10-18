@@ -43,6 +43,7 @@ import contextlib
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("TORTOISE_SECRET_PEPPER", "test-static-pepper")
@@ -909,3 +910,55 @@ def test_the_sweep_is_armed_as_a_background_task_not_awaited_at_boot():
         and node.value.func.id == "_webhook_retry_sweep_loop"
     ]
     assert not awaited, "the sweep loop is awaited on the startup path"
+
+
+# ── the plan's own evidence table (a citation that rots is not evidence) ───
+
+PLAN_8098 = (Path(__file__).resolve().parent.parent / "docs" / "plans"
+             / "2026-10-18-8098-webhook-retry-sweep.md")
+
+
+def test_every_test_the_plan_cites_exists():
+    """#8098 review (P3): the plan's §5 verification table cited a test that did
+    not exist at the PR head.
+
+    §5 is the issue's own checklist, so it is the record a later lane trusts when
+    it wants to know which case pins which half of the design. A row pointing at
+    a name nothing defines reads exactly like a covered row, and the coverage it
+    claims cannot be executed — the defect is invisible to every other gate (no
+    lint, no CI check reads plan prose).
+
+    (1) *What value makes this test fail?*  The pre-fix plan: its "the gate is
+        NOT always due" row cites `test_a_caught_up_subscription_costs_the_gate_nothing`,
+        which no file under `tests/` defines (verified: `grep -rn` over the head
+        tree returned only that plan line).
+    (2) *Does the test reach it?*  Yes — the committed plan is read, every
+        backticked `test_…` name in it is collected, and each one is resolved
+        against the names this module defines and then against `tests/**` for
+        anything not defined here. Nothing about the assertion depends on the
+        rest of the table's prose.
+    """
+    import re
+
+    text = PLAN_8098.read_text(encoding="utf-8")
+    cited = set(re.findall(r"`(test_[A-Za-z0-9_]+)`", text))
+    assert len(cited) >= 10, (
+        f"the plan's verification table cites only {len(cited)} test(s) — a table "
+        "that names nothing pins nothing")
+
+    defined_here = {name for name in globals() if name.startswith("test_")}
+    unresolved = sorted(cited - defined_here)
+    elsewhere: set[str] = set()
+    if unresolved:  # cheap path: almost every citation lives in this module
+        here = Path(__file__).resolve()
+        for path in here.parent.rglob("test_*.py"):
+            if path.resolve() == here:
+                continue
+            elsewhere |= set(re.findall(
+                r"^\s*(?:async\s+)?def (test_[A-Za-z0-9_]+)",
+                path.read_text(encoding="utf-8", errors="replace"), re.M))
+
+    missing = sorted(name for name in unresolved if name not in elsewhere)
+    assert not missing, (
+        f"the #8098 plan cites {missing}, which neither this module nor any "
+        "file under tests/ defines — §5 would claim coverage that cannot run")

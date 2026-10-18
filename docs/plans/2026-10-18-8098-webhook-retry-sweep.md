@@ -66,13 +66,18 @@ one body, so a future change to the SDK-open rules lands once.
 |---|---|---|
 | sweep trigger | integration | `test_an_idle_tenant_is_retried_by_the_sweep_and_its_cursor_advances` — fail a delivery at `now-2h`, write NOTHING to the tenant graph, run one pass, read the cursor back from the store (asserts it advanced, attempts reset, and the `:GraphEvent` count is unchanged). |
 | cost | unit | `test_the_gate_reads_only_and_creates_no_index` + `test_a_graph_with_a_caught_up_subscription_stays_byte_identical` + `test_a_graph_that_does_not_exist_is_never_selected_or_read` (diffs nodes and `CALL db.indexes()`). |
-| the gate is NOT always due | unit | `test_a_caught_up_subscription_costs_the_gate_nothing` — deliver everything, then require `due_subscription_count == 0` while `_due_subscriptions` is empty too (the state every subscription spends its life in; pre-fix the gate returned 1 forever). |
+| the gate is NOT always due | unit | `test_a_declared_and_caught_up_tenant_is_not_a_sweep_target` + `test_the_gate_counts_exactly_what_the_dispatcher_would_dispatch` (its DECLARED-AND-CAUGHT-UP row) — deliver everything, so the cursor reaches the head and `next_attempt_at` is NULL again, then require `due_subscription_count == 0`, `_due_subscriptions` empty, and the real gate's target list empty (the state every subscription spends its life in; pre-fix the gate returned 1 forever). |
 | shutdown | unit | `test_the_sweep_task_is_in_the_shared_liveness_tuple_and_shutdown_cancels_it` + `test_the_sweep_is_armed_as_a_background_task_not_awaited_at_boot` + `test_the_sweep_pool_is_disposed_at_thread_shutdown`. |
 | the trigger is actually ARMED | unit | `test_the_periodic_loop_arms_the_sweep` (drives the real loop — the #1890/#4241 shape: a definition-only test is green for the life of the bug) and `test_a_raising_pass_cannot_end_the_loop` (#5381). |
 
 **Mutation-checked** (a test that cannot fail is not evidence): removing the existence gate reds
 the absent-graph test; dropping either predicate clause from the gate query reds the parity test
 (the temporal clause by the fresh-while-not-behind row, the cursor clause by the caught-up row).
+
+**This table is machine-checked** (#8098 review, P3): an earlier revision of it cited a test that
+did not exist at head, so `test_every_test_the_plan_cites_exists` resolves every `test_…` name this
+plan names against the test tree and reds on a stale citation. Renaming a test means updating this
+table in the same commit.
 
 ## 6. Deliberately NOT in scope
 

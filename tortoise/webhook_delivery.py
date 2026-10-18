@@ -514,13 +514,14 @@ _DUE_PREDICATE = (
 #: * a subscription whose unread events were PURGED (retention) while its
 #:   cursor stayed behind — the counter's head then exceeds the store's max seq.
 #:
-#: ⛔ Only the FIRST is bounded by the retry ladder (#8098 review, non-counted).
-#: A ``types``-filtered subscription is quiet for at most as long as no matching
-#: event is emitted, and the ladder disables a subscription only when a delivery
-#: FAILS — so the filter case resolves when the tenant's next matching event
-#: arrives, not on a timer.
+#: ⛔ NEITHER case is bounded by the retry ladder (#8098 review, non-counted):
+#: the ladder disables a subscription only when a delivery FAILS, and neither of
+#: these ever fails a delivery. The FIRST is bounded by the TENANT (a
+#: ``types``-filtered subscription is quiet for at most as long as no matching
+#: event is emitted, so it resolves when the tenant's next matching event
+#: arrives — not on a timer).
 #:
-#: The PURGED-CURSOR case is NOT bounded by the ladder: the unread events are
+#: The PURGED-CURSOR case has NO bound at all: the unread events are
 #: gone, ``read_after`` returns ``[]``, so nothing is delivered and nothing
 #: FAILS — no attempt accrues, no backoff is written, and nothing ever disables
 #: the subscription inside ``max_attempts``. Its cursor stays below ``$head``
