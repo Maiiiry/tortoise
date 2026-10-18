@@ -1875,12 +1875,22 @@ def live_proj():
     proj = FalkorProjection.from_uri(
         uri, graph_name=f"test_proj125_{os.urandom(4).hex()}")
     # #8746: NO setup `DETACH DELETE`. The name is freshly random (4 hex bytes =
-    # 32 bits per run), so there is nothing to clean, and a DETACH against a
-    # graph that has no writes is the phantom-creating half of the #2961
-    # AOF-poisoning sequence (an implicit create emits no GRAPH.EFFECT, so a
-    # later GRAPH.DELETE has nothing to replay). The graph is now materialised
-    # only by the test's OWN writes, which are recorded — so the teardown
-    # delete below is always deleting a graph the AOF can replay.
+    # 32 bits per run), so there is nothing to clean, and a DETACH is the
+    # phantom-creating half of the #2961 AOF-poisoning sequence (an implicit
+    # create emits no GRAPH.EFFECT, so a later GRAPH.DELETE would have nothing
+    # to replay).
+    #
+    # The graph key IS created before this fixture yields — by CONSTRUCTION, not
+    # by the test: `FalkorProjection.from_uri` → `_ensure_indexes()` issues
+    # `CREATE INDEX …`. (This comment previously claimed the graph was
+    # "materialised only by the test's OWN writes"; that is false, corrected in
+    # #8746's review round 2.) The teardown delete is safe anyway, and NOT for
+    # the reason that claim implied: index creation is AOF-replay-safe in its own
+    # right (`_ensure_indexes`' note — "CREATE INDEX survives AOF replay"), and
+    # `tests/_embedded.py::_sweep_proj` ships the identical shape (construct,
+    # then `safe_graph_delete(detach=False, drop=True)`). What this teardown
+    # needs is not "no writes before the test" but "no unreplayable DETACH" —
+    # hence the removed setup DETACH and the guard-routed delete below.
     try:
         yield proj
     finally:
@@ -1922,8 +1932,10 @@ def test_live_proj_teardown_deletes_the_graph_not_just_its_contents():
     conn = proj.db.connection  # raw redis handle (survives proj.close())
     try:
         assert name.startswith("test_proj125_"), name
-        # The test's own write is what materialises the graph — the fixture no
-        # longer pre-DETACHes it (see the fixture docstring).
+        # The fixture no longer pre-DETACHes the graph. The graph KEY comes from
+        # `_ensure_indexes()` at construction (replay-safe on its own — see the
+        # fixture docstring); this write is what makes the CONTENTS real, so the
+        # assertion below is about a graph the test itself populated.
         proj.g.query("CREATE (n:Point {id:'teardown-8746'})")
         assert name in _graph_names(conn), "fixture handed the test no live graph"
         with contextlib.suppress(StopIteration):
@@ -1964,10 +1976,77 @@ def test_drop_test_graph_refuses_a_non_test_owned_name():
     ownership attribution, so only the two ``_SERVER_WIPE_PREFIXES`` families
     may be deleted. A fixture that resolved a product/tenant graph by mistake
     must not be able to destroy it."""
-    for name in ("tortoise", "org_acme", "team_x", "proj125_x", None, 42):
-        proj = _FakeProj(name)
-        assert _live_utils.drop_test_graph(proj) is False, name
-        assert proj.db.calls == [], (name, proj.db.calls)
+    snapshot = _live_utils.graph_delete_events()
+    try:
+        for name in ("tortoise", "org_acme", "team_x", "proj125_x", None, 42):
+            proj = _FakeProj(name)
+            assert _live_utils.drop_test_graph(proj) is False, name
+            assert proj.db.calls == [], (name, proj.db.calls)
+    finally:
+        # Keep the session-end artifact honest: these are the test's own probes,
+        # not a real teardown refusal (the #7735 `_discard_tolerated_leaks`
+        # precedent).
+        _live_utils._restore_graph_delete_events(snapshot)
+
+
+def test_drop_test_graph_refuses_the_shared_uri_default_graph(monkeypatch):
+    """#8746 review r2 P3: the prefix family WIDE-OPEN arm is not enough.
+
+    The shared URI-default graph (here ``tortoise_test_matrix``, the docker
+    job's ``TORTOISE_DB_URI`` path) starts with ``tortoise_test``, so the
+    canonical prefix gate ADMITS it — yet it belongs to the whole job, and every
+    other targeted delete path in this tree excludes it explicitly
+    (``tests/_embedded.py::_wipe_or``'s ``scope.discard(default)``,
+    ``wipe_server``'s per-test ``g == default_graph`` arm); only the session-end
+    sweep owns it. Without the explicit arm, a fixture that resolved the shared
+    graph by mistake would delete the job's own graph.
+    """
+    monkeypatch.setenv("TORTOISE_DB_URI",
+                       "docker://:falkordb@localhost:6379/tortoise_test_matrix")
+    snapshot = _live_utils.graph_delete_events()
+    try:
+        proj = _FakeProj("tortoise_test_matrix")
+        assert _live_utils.drop_test_graph(proj) is False
+        assert proj.db.calls == [], proj.db.calls
+        # NARROWING CONTROL: one character away from the refused name is a
+        # per-run name again — so the refusal above is the DEFAULT-graph arm
+        # firing, not the prefix arm refusing the whole family.
+        per_run = _FakeProj("tortoise_test_matrix_7f3a")
+        assert _live_utils.drop_test_graph(per_run) is False
+        assert per_run.db.calls == [("list_graphs",)], per_run.db.calls
+    finally:
+        _live_utils._restore_graph_delete_events(snapshot)
+
+
+def test_drop_test_graph_tolerated_failures_reach_the_session_artifact(tmp_path):
+    """#8746 review r2 P3: a tolerated refusal must leave SESSION-END evidence.
+
+    `drop_test_graph` is log-and-continue by policy (a teardown must not red a
+    suite), but a PASSING test's `logger.warning` is discarded by pytest capture
+    (#7735 / #1103 — measured 0 occurrences under the CI flags). Relying on the
+    log alone would make a systematic refusal invisible, and the per-run graph
+    leak #8746 removes would return unobserved. So the refusal is accumulated and
+    written to `graph-delete-hygiene-end.json` by
+    `tests/conftest.py::_server_graph_hygiene`.
+    """
+    snapshot = _live_utils.graph_delete_events()
+    try:
+        probe = "team_review_probe_8746"
+        _live_utils.drop_test_graph(_FakeProj(probe))
+        recorded = [e for e in _live_utils.graph_delete_events()
+                    if e["name"] == probe]
+        assert recorded and recorded[-1]["event"] == "refused", recorded
+        path = _live_utils.write_graph_delete_report(log_dir=str(tmp_path))
+        assert path is not None, "no artifact written for a tolerated refusal"
+        with open(path) as fh:
+            written = json.load(fh)
+        entries = written["drop_test_graph_events"]
+        assert any(e["name"] == probe and e["event"] == "refused"
+                   for e in entries), entries
+    finally:
+        # The probe must not fork into the real session artifact (the #7735
+        # `_discard_tolerated_leaks` precedent); the tmp file needs no cleanup.
+        _live_utils._restore_graph_delete_events(snapshot)
 
 
 def test_upsert_document_capture_fields(live_proj):

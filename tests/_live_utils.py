@@ -8,8 +8,10 @@ test_event_store.py and test_embedded_concurrency.py.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -240,11 +242,77 @@ def mask_embedder():
 # The prefix gate is the CANONICAL fail-closed set, `_SERVER_WIPE_PREFIXES` in
 # `tests/_embedded.py` — IMPORTED, never restated (see `drop_test_graph`).
 # Fail-closed: a name outside it is never deleted by this helper, so a fixture
-# that resolved a shared/product graph by mistake cannot destroy it. That set
-# is the GRAPH.LIST family, which is exactly this helper's input shape (a NAME,
-# no journal attribution): `team_`/`org_` are real tenant graphs and are
-# deliberately absent. CITE SYMBOLS, never line numbers: a line pointer
-# re-stales.
+# that resolved a PRODUCT/TENANT (`team_`/`org_`) graph by mistake cannot
+# destroy it. That set is the GRAPH.LIST family, which is exactly this helper's
+# input shape (a NAME, no journal attribution). The second arm excludes the
+# SHARED URI-default graph, which is INSIDE that family but belongs to the whole
+# job. CITE SYMBOLS, never line numbers: a line pointer re-stales.
+#
+# #8746 review round 2 (P3): the tolerated refusals/failures are ACCUMULATED, not
+# only logged. `drop_test_graph` is log-and-continue by policy (a teardown must
+# not red a suite), but a `logger.warning` from the TEARDOWN OF A PASSING TEST is
+# DISCARDED by pytest capture (#7735 / #1103, measured 0 occurrences under the CI
+# flags), so a systematic refusal would be invisible — and the per-run leak this
+# helper removes would come back unobserved, which is the very defect #8746's own
+# test docstring names. `tests/conftest.py::_server_graph_hygiene` writes this
+# record to `graph-delete-hygiene-end.json` at session end (the #1103/#7735
+# artifact shape, one file over).
+GRAPH_DELETE_EVENTS: list[dict[str, object]] = []
+
+
+def graph_delete_events() -> list[dict[str, object]]:
+    """The tolerated ``drop_test_graph`` refusals/failures so far this session."""
+    return [dict(entry) for entry in GRAPH_DELETE_EVENTS]
+
+
+def _restore_graph_delete_events(snapshot: list[dict[str, object]]) -> None:
+    """Reset the record to ``snapshot`` — so a test that drives a refusal can
+    keep the session artifact honest (the #7735 ``_discard_tolerated_leaks``
+    precedent: without it, a synthetic name forks into every CI run's record)."""
+    GRAPH_DELETE_EVENTS[:] = [dict(entry) for entry in snapshot]
+
+
+def _record_delete_event(name: object, event: str, reason: str) -> None:
+    GRAPH_DELETE_EVENTS.append({"name": str(name), "event": event,
+                                "reason": reason})
+
+
+def write_graph_delete_report(log_dir: str | None = None) -> str | None:
+    """Mirror the tolerated ``drop_test_graph`` events to a JSON artifact.
+
+    Same reasoning and shape as ``tests/_tmpdir_hygiene.py``'s
+    ``write_tolerated_cleanup_report`` (#1103 / #7735): a passing test's log
+    record is discarded by pytest capture, so a tolerated teardown failure is
+    only OBSERVABLE if it reaches a file the workflow dumps.
+
+    Best-effort — writing never fails the suite. Written ONLY when at least one
+    event was tolerated, so a clean session writes nothing (and a second session
+    in the same directory cannot blank a peer's record). The write MERGES with
+    whatever is already there, keyed by name, rather than truncating.
+    """
+    if not GRAPH_DELETE_EVENTS:
+        return None
+    try:
+        if log_dir is None:
+            log_dir = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
+        log_path = os.path.join(log_dir, "graph-delete-hygiene-end.json")
+        by_name: dict[str, dict[str, object]] = {}
+        try:
+            with open(log_path) as fh:
+                prior = json.load(fh)
+            for entry in prior.get("drop_test_graph_events", []):
+                if isinstance(entry, dict) and "name" in entry:
+                    by_name[str(entry["name"])] = entry
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        for entry in GRAPH_DELETE_EVENTS:
+            by_name[str(entry["name"])] = dict(entry)
+        with open(log_path, "w") as fh:
+            json.dump({"drop_test_graph_events": list(by_name.values()),
+                       "count": len(by_name)}, fh, indent=2)
+        return log_path
+    except Exception:  # hygiene reporting never fails the suite
+        return None
 
 
 def drop_test_graph(proj, *, name: str | None = None) -> bool:
@@ -295,15 +363,33 @@ def drop_test_graph(proj, *, name: str | None = None) -> bool:
     light (no ``pytest`` / ``tortoise.projection`` at module scope); the import
     resolves the LIVE module attribute on every call, so it is the canonical
     set of the moment that the gate consults.
+
+    Two arms, both fail-closed (#8746 review round 2 P3). The prefix arm alone
+    is not enough on the axis that matters: the shared URI-default graph (e.g.
+    ``tortoise_test_matrix``) is INSIDE the family but belongs to the whole job,
+    so it is refused explicitly — exactly as every other TARGETED delete path in
+    this tree does (``tests/_embedded.py::_wipe_or``'s ``scope.discard(default)``,
+    ``wipe_server``'s per-test ``g == default_graph`` arm); only the session-end
+    sweep owns it. Residual, stated honestly: the family also contains fixed
+    FIXTURE-DEFAULT spellings (``tortoise_test_proj125`` in this module) that a
+    shape test cannot tell from a per-run name; every caller of this helper mints
+    ``f"test_…_{os.urandom(4).hex()}"`` and passes that name.
     """
-    from tests._embedded import _SERVER_WIPE_PREFIXES
+    from tests._embedded import _SERVER_WIPE_PREFIXES, _uri_default_graph_name
 
     gname = name if name is not None else getattr(proj, "graph_name", None)
+    reason = None
     if not isinstance(gname, str) or not gname.startswith(_SERVER_WIPE_PREFIXES):
+        reason = (f"not a test-owned graph name (prefix gate: "
+                  f"{_SERVER_WIPE_PREFIXES})")
+    elif gname == _uri_default_graph_name():
+        reason = ("the SHARED URI-default graph — the whole job writes to it; "
+                  "only the session-end sweep may drop it")
+    if reason is not None:
         logger.warning(
-            "[#8746] refusing to GRAPH.DELETE %r — not a test-owned graph "
-            "name (prefix gate: %s); left untouched", gname,
-            _SERVER_WIPE_PREFIXES)
+            "[#8746] refusing to GRAPH.DELETE %r — %s; left untouched",
+            gname, reason)
+        _record_delete_event(gname, "refused", reason)
         return False
     try:
         from tortoise.graph_delete_guard import safe_graph_delete
@@ -313,4 +399,5 @@ def drop_test_graph(proj, *, name: str | None = None) -> bool:
         logger.warning(
             "[#8746] GRAPH.DELETE of %r failed (%r) — left for the session "
             "sweep, which owns every journaled graph", gname, exc)
+        _record_delete_event(gname, "failed", repr(exc))
         return False

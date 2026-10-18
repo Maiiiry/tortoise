@@ -1208,6 +1208,18 @@ def _server_graph_hygiene(_redislite_hygiene):
             os.remove(marker_path)
         except OSError:
             pass
+    # #8746 review round 2 (P3): `drop_test_graph` is log-and-continue by policy,
+    # and the log record of a PASSING test's teardown is DISCARDED by pytest
+    # capture (#1103 / #7735). Mirror its tolerated refusals/failures to their
+    # own artifact for the same reason the tolerated tempdir leaks get one —
+    # otherwise a systematic refusal silently restores the per-run graph leak
+    # #8746 removes. Best-effort and silent when nothing was tolerated.
+    try:
+        from tests._live_utils import write_graph_delete_report
+
+        write_graph_delete_report()
+    except Exception:  # hygiene reporting never fails the suite
+        pass
     # E2E-7 bound (cycle-8 P2-11): while last suite standing, post-sweep
     # GRAPH.LIST must be < journal_size + constant — the sweep's GRAPH.DELETE
     # leaves only pre-existing/foreign graphs. SOFTENED from a hard assert
