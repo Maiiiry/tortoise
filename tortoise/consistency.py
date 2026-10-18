@@ -2086,7 +2086,11 @@ def recover_from_log(events_dir: str, projection) -> dict:
     its own #2943 sidecar, so the graph is then the last copy of the graph-only
     nodes. A rollback there is REFUSED (with the reason naming it) rather than
     performed, and the partial graph is left for an explicit
-    `tortoise rebuild --dir`. A rollback that could not run for any other
+    `tortoise rebuild --dir`. The sidecar counts as a live source ONLY while
+    `_load_prewipe_snapshot` still returns a mergeable payload: retirement
+    rewrites the file entry-less before it unlinks, so a failed unlink leaves
+    an artifact that exists on disk but holds nothing, and file existence is
+    not proof of durability. A rollback that could not run for any other
     reason (no `_wipe_all_nodes`, or a backend that died) appends a named
     WARNING to `reason` instead and leaves the partial state visible.
 
@@ -2104,7 +2108,7 @@ def recover_from_log(events_dir: str, projection) -> dict:
             return None
 
     def _roll_back_declined_replay(result: dict, after: int | None, *,
-                                   source_durable: bool = True) -> dict:
+                                   source_durable: bool = False) -> dict:
         """Restore the EMPTY pre-call state for a refusal found AFTER the
         replay landed, and return `result` (#7929).
 
@@ -2134,7 +2138,15 @@ def recover_from_log(events_dir: str, projection) -> dict:
             destroy data rather than undo a derivation. The rollback is
             therefore REFUSED for that shape, and the partial graph is kept
             for an explicit `tortoise rebuild --dir` (the #2943 "no loss
-            without proof" posture) with the reason naming why.
+            without proof" posture) with the reason naming why. "Durable"
+            here means the LOADER (`_load_prewipe_snapshot`) still returns a
+            mergeable payload — never bare file existence: the retirement
+            write happens BEFORE the unlink, so a failed unlink leaves an
+            entry-less artifact (`_clear_prewipe_snapshot`'s documented
+            "harmless" case) that exists but carries nothing. The caller is
+            responsible for that verdict; this function DEFAULTS to
+            `source_durable=False` so a forgotten argument refuses the
+            destructive wipe rather than assuming safety.
 
         WITHOUT the rollback the store is left PARTIALLY populated by a
         recovery the caller is about to refuse. The next open then reads
@@ -2267,21 +2279,37 @@ def recover_from_log(events_dir: str, projection) -> dict:
         except Exception as e:
             # #7929: `rebuild_all` wipes before it can raise, so this refusal
             # can land on a partially replayed graph. Roll it back ONLY while
-            # the sidecar still exists — a post-replay `NonFoldedEventsError`
-            # (the `@_fail_closed` decorator, which runs after `rebuild_all`'s
-            # body) has ALREADY retired it, and the graph is then the last copy
-            # of the graph-only nodes: wiping there would lose data, so the
-            # rollback is refused and named instead. `db_points` reports the
-            # MEASURED count, not a hard-coded 0 — the store is not empty on
-            # the refused shape, and saying otherwise is the same lie about the
-            # store this change removes.
+            # the sidecar is still a MERGEABLE source — a post-replay
+            # `NonFoldedEventsError` (the `@_fail_closed` decorator, which runs
+            # after `rebuild_all`'s body) has ALREADY retired it, and the graph
+            # is then the last copy of the graph-only nodes: wiping there would
+            # lose data, so the rollback is refused and named instead.
+            #
+            # The "still durable" verdict is the LOADER's, NEVER bare file
+            # existence. `_clear_prewipe_snapshot` rewrites the sidecar
+            # entry-less BEFORE it unlinks, so a failed unlink leaves an
+            # entry-less artifact on disk (its own comment calls that
+            # "harmless ... the file left behind is the entry-less retirement
+            # payload"). `os.path.exists` reads that residue as a live source
+            # and wipes the graph-only nodes it was supposed to keep;
+            # `_load_prewipe_snapshot` returns None for it. A raise
+            # (unreadable/untrustworthy) is likewise NOT durable proof — the
+            # loader raises precisely because the file may be the only record.
+            # `db_points` reports the MEASURED count, not a hard-coded 0 — the
+            # store is not empty on the refused shape, and saying otherwise is
+            # the same lie about the store this change removes.
             after = _node_count()
+            try:
+                source_durable = (
+                    _load_prewipe_snapshot(snapshot_path) is not None)
+            except Exception:
+                source_durable = False
             return _roll_back_declined_replay(
                 {"recovered": False, "log_points": 0,
                  "db_points": after if after is not None else 0,
                  "reason": ("rebuild from the pending pre-wipe snapshot "
                             f"failed: {e}")}, after,
-                source_durable=os.path.exists(snapshot_path))
+                source_durable=source_durable)
         # rebuild_all RAISES on failure, so reaching here IS a completed
         # recovery — not `nodes > 0`: a snapshot can legitimately carry only
         # the #990 half (a quarantined :Batch with no Points), and reporting
@@ -2572,7 +2600,7 @@ def recover_from_log(events_dir: str, projection) -> dict:
             # count, so the cap cannot make a large refusal look small.
             "non_folded_events": [
                 str(e) for e in _nf_entries[:_MAX_DIVERGENT_POINTS]],
-        }, after)
+        }, after, source_durable=True)
     ok = applied > 0 and after is not None and after > 0
     if refused:
         logger.warning(
@@ -2593,4 +2621,7 @@ def recover_from_log(events_dir: str, projection) -> dict:
     # #7929: `ok is False` is the other late verdict this replay can reach —
     # nothing applied yet the graph is non-empty (a deferred CORRECTS/link fold
     # landed) — and it must not leave that partial population behind either.
-    return result if ok else _roll_back_declined_replay(result, after)
+    # The JSONL source is never written by this function, so it is always
+    # durable here and the rollback is always safe.
+    return result if ok else _roll_back_declined_replay(
+        result, after, source_durable=True)

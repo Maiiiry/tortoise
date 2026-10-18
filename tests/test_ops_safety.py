@@ -1464,3 +1464,89 @@ def test_the_pending_route_rolls_back_when_its_source_survives(monkeypatch):
         assert os.path.exists(sidecar), "an intact source must be left alone"
     finally:
         proj.close()
+
+
+def test_the_pending_route_refuses_rollback_over_a_retired_sidecar_artifact(
+        monkeypatch):
+    """#7929 (P1): the pending route's `source_durable` is the LOADER's
+    verdict, not bare file existence. `rebuild_all` retires its #2943 sidecar
+    (`_clear_prewipe_snapshot`) before the post-replay `@_fail_closed` raise.
+    That retirement REWRITES the file entry-less and only THEN unlinks it, and
+    its own comment documents the failed-unlink shape: "the file left behind is
+    the entry-less retirement payload". An entry-less artifact still passes
+    `os.path.exists`, but the loader reports it ABSENT — so the graph is the
+    last copy of the graph-only nodes and the destructive rollback MUST be
+    refused.
+
+    FAILS IF: `source_durable` is read from the filesystem, so a retired
+    (entry-less) sidecar is mistaken for durable and the rollback wipes the
+    only surviving copy of the graph-only nodes.
+    """
+    tmp = _mk_tmp()
+    db_path = os.path.join(tmp, "retired-sidecar.db")
+    from tortoise import projection as projection_mod
+    from tortoise.projection import (
+        _PREWIPE_SNAPSHOT_VERSION,
+        _SNAPSHOT_SECTIONS,
+        _write_prewipe_snapshot,
+        prewipe_snapshot_path,
+    )
+
+    proj = _lost_store(db_path)
+    log = EventLog(os.path.join(tmp, "events.jsonl"))
+    for i in range(3):
+        log.append(_point_event(i))
+    # Same post-replay refusal as `test_the_pending_route_refuses_a_lossy_rollback`:
+    # a belief write no record creates, so rebuild_all hoists every creation,
+    # finds no Point, and raises AFTER its own wipe + replay.
+    log.append({"type": "ConfidenceChanged", "id": "p-never-created",
+                "confidence": 0.9, "event_id": "e-7929-belief"})
+    sidecar = prewipe_snapshot_path(tmp)
+    _write_prewipe_snapshot(sidecar, {
+        "version": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+        "synthetic_events": [{
+            "type": "PointAdded",
+            "projection_version": 2,
+            "point": {"id": "sidecar-only-1", "content": "[user] hi",
+                      "pointKind": "event", "speaker": "user",
+                      "is_episodic": True, "status": "draft"},
+        }],
+        "batch_snapshot": [],
+        "batch_point_links": [],
+        "session_snapshot": [],
+        "session_point_links": [],
+    })
+
+    def _retire_but_leave_the_artifact(path):
+        # Mirror `_clear_prewipe_snapshot`: the entry-less retirement payload is
+        # written (os.replace, atomic), and the unlink is the step that failed.
+        _write_prewipe_snapshot(path, {
+            "version": _PREWIPE_SNAPSHOT_VERSION,
+            "created_at": "2026-01-01T00:00:00Z",
+            "completed": True,
+            **{section: [] for section in _SNAPSHOT_SECTIONS},
+        })
+
+    monkeypatch.setattr(projection_mod, "_clear_prewipe_snapshot",
+                        _retire_but_leave_the_artifact)
+    try:
+        assert _node_total(proj) == 0
+        r = recover_from_log(tmp, proj)
+        assert r["recovered"] is False, r
+        assert os.path.exists(sidecar), (
+            "the retirement artifact is deliberately left on disk (the "
+            "failed-unlink shape `_clear_prewipe_snapshot` documents)")
+        assert "rollback is REFUSED" in r["reason"], r["reason"]
+        assert "replay_rolled_back" not in r, (
+            "a refused rollback must not claim it rolled anything back")
+        assert r["db_points"] > 0, (
+            "the refusal must report the store it actually left behind, not 0")
+        kept = proj.g.query(
+            "MATCH (n:Point {id:'sidecar-only-1'}) RETURN count(n)"
+        ).result_set[0][0]
+        assert kept == 1, (
+            "the graph-only Point's sidecar is retired, so the graph is its "
+            "last copy — a filesystem-presence test wiped it")
+    finally:
+        proj.close()
