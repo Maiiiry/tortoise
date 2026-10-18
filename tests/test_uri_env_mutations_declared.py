@@ -433,18 +433,23 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # no lane flip can leak. DELIBERATE_URI.
     "test_engine_probe.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
                               r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
-    # #8746: the SHARED-URI-DEFAULT refusal arm. `drop_test_graph` derives the
-    # default graph name from `tests/_embedded._uri_default_graph_name()`, which
-    # reads TORTOISE_DB_URI from the environment with NO injection seam — so the
-    # env control IS the test input, and the URI's PATH (`/tortoise_test_matrix`)
-    # is the whole assertion: the name is inside the canonical `tortoise_test`
-    # family (so the prefix gate admits it) yet must still be refused, and the
-    # narrowing control one character away proves the refusal came from this arm
-    # and not the prefix. Both probes drive `_FakeProj`, whose `db` only RECORDS
-    # calls, so no server is contacted; the function-scoped `monkeypatch`
-    # restores the URI at teardown, so no lane can leak into a later module.
-    # DELIBERATE_URI.
-    "test_projection.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
+    # #8746: the SHARED-URI-DEFAULT refusal arm, on BOTH lanes. `drop_test_graph`
+    # derives the default graph name from `tests/_embedded._uri_default_graph_name()`,
+    # which reads TORTOISE_DB_URI from the environment with NO injection seam —
+    # so the env control IS the test input, and the URI's PATH
+    # (`/tortoise_test_matrix`) is the whole assertion: the name is inside the
+    # canonical `tortoise_test` family (so the prefix gate admits it) yet must
+    # still be refused, and the narrowing control one character away proves the
+    # refusal came from this arm and not the prefix. The `delenv` case is the
+    # URI-LESS lane (live_proj runs there too, since it skips on a TCP probe):
+    # with no URI the default-graph arm cannot fire at all, so the same test
+    # pins the MINT-SHAPE arm that closes the class — a shared fixed name is
+    # refused, a per-run one still reaches the guard. Every probe drives
+    # `_FakeProj`, whose `db` only RECORDS calls, so no server is contacted; the
+    # function-scoped `monkeypatch` restores the URI at teardown, so no lane can
+    # leak into a later module. DELIBERATE_URI.
+    "test_projection.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
+                           r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
 }
 
 # Carve-out TEST-MODULE stems (Task 5 wires these into TEST_NO_REDIRECT_STEMS;

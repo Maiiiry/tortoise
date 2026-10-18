@@ -218,10 +218,10 @@ def test_the_routed_delete_helper_consults_the_live_canonical_set(monkeypatch):
             calls.append(("list_graphs",))
             return []
 
-    proj = SimpleNamespace(graph_name="test_review_p2_canonical", db=_Db())
+    proj = SimpleNamespace(graph_name="test_review_p2_canonical_ab12cd34", db=_Db())
     # Snapshot/restore the session record: this test DRIVES a refusal, and a
     # synthetic refusal must not fork into a real run's
-    # `graph-delete-hygiene-end.json` (#7735 `_discard_tolerated_leaks`
+    # `tempdir-hygiene-end.json` section (#7735 `_discard_tolerated_leaks`
     # precedent; #8746 review r3 P3).
     snapshot = _live_utils.graph_delete_events()
     # PRECONDITION — the canonical set admits this name, so the gate OPENS and
