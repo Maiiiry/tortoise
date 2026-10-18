@@ -59,20 +59,32 @@ def _reclaim_search_trees():
 
 def _new_sdk():
     db_path = os.path.join(tempfile.mkdtemp(prefix="tortoise_search_test_"), "test.db")
-    # A fresh `db_path` alone does NOT isolate this SDK on the embedded lane.
-    # With no TORTOISE_DB_URI every embedded store keeps the SDK's DEFAULT
-    # graph name ("tortoise"), and the degraded-fallback corpus cache
+    # A fresh `db_path` alone does NOT isolate this SDK on every lane. With no
+    # TORTOISE_DB_URI every embedded store keeps the SDK's DEFAULT graph name
+    # ("tortoise"), and the degraded-fallback corpus cache
     # (tortoise/fallback_snapshot.py::_store) is a PROCESS-GLOBAL dict keyed by
-    # `(graph_name, namespace)` — so a snapshot built from one test's embedded
-    # DB is served to the next one. `test_sdk_fts_query_empty` then asserts "no
-    # earlier file in this shard wrote a point" instead of "a fresh graph has
-    # no points", which is why the file passed alone and failed as a function
-    # of shard composition. `namespace` is the SDK's ONE per-graph name
-    # derivation (`sdk.py::_derive_graph_name`) and the second element of that
-    # cache key, so a unique namespace partitions the embedded lane and the
-    # shared docker-lane graph alike — the declared mechanism, reused, rather
-    # than a parallel isolation seam. Same idiom as
-    # `tests/conftest.py::sdk_factory` and `tests/test_commit_schema.py`.
+    # `(graph_name, backend_identity, namespace)` — so a snapshot built from one
+    # test's corpus must not be servable to the next one.
+    #
+    # `backend_identity` is the STORE's identity: the resolved `db_path`
+    # (`realpath`) for an embedded file, `None` for a server/URI graph
+    # (#7760 — before it, the key was `(graph_name, namespace)` and every
+    # embedded DB collided on graph_name='tortoise', which is why
+    # `test_sdk_fts_query_empty` asserted "no earlier file in this shard wrote a
+    # point" instead of "a fresh graph has no points"). So on the EMBEDDED lane
+    # a fresh `db_path` now isolates on its own.
+    #
+    # `namespace` is retained for the URI (docker) lane, where the SDK opens a
+    # SERVER graph named from the URI (`sdk.py::_derive_graph_name` falls back
+    # to `uri_graph`), the projection carries no `db_path` identity at all, and
+    # every SDK on that URI therefore shares ONE graph — the shared graph this
+    # whole selection points at. Neither db_path nor file identity separates two
+    # SDKs' corpora there, so the namespace is the ONLY partition on that lane.
+    # It is the SDK's ONE per-graph name derivation (`_derive_graph_name`: a
+    # `test_*` namespace opens `{ns}_tortoise`), so a unique namespace partitions
+    # both lanes alike — the declared mechanism, reused, rather than a parallel
+    # isolation seam. Same idiom as `tests/conftest.py::sdk_factory` and
+    # `tests/test_commit_schema.py`.
     # (hex = 12 chars / 48 bits, matching the suite's other nonce widths.)
     sdk = TortoiseSDK(db_path, namespace=f"test_search_{os.urandom(6).hex()}")
     _NEW_SDKS.append(sdk)

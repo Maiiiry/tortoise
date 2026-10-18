@@ -6109,8 +6109,9 @@ def test_fallback_entry_all_early_returns(tmp_path, monkeypatch):
         sdk.close()
     # (b) legacy path — build_snapshot → None forces fallback_tfidf
     # (distinct graph dir: _fresh_sdk reuses one path, and the snapshot
-    # store is keyed by graph_name — a re-ingested same-path graph would
-    # serve part (a)'s cached snapshot instead of rebuilding)
+    # store is keyed by (graph_name, backend_identity, namespace) — a
+    # re-ingested same-path graph would share part (a)'s key and serve its
+    # cached snapshot instead of rebuilding)
     monkeypatch.setattr(fb_snap, "build_snapshot", lambda proj: None)
     sdk = _fresh_sdk(tmp_path / "b")
     try:

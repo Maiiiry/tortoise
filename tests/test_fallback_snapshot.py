@@ -2,8 +2,8 @@
 
 Covers: cached-vs-legacy result parity (the #399 sklearn contract), write
 invalidation (create/operator/delete via the _mark_dirty hook), the lazy TTL
-backstop, the size cap, and the include_terminal/kind/exclude_status
-semantics.
+backstop, the size cap and the store's entry+byte bounds, and the
+include_terminal/kind/exclude_status semantics.
 """
 from __future__ import annotations
 
@@ -552,5 +552,140 @@ def test_snapshot_store_is_bounded_and_lru(monkeypatch):
             "a recently-read entry must survive the cap (LRU, not FIFO)")
         assert fs._store.get(("g1", None, None)) is None, (
             "the least-recently-used entry is evicted")
+    finally:
+        fs._store.clear()
+
+
+# ── #7773: the store bound must measure BYTES, not just entries ──────
+
+def _payload_snap(*, points: int = 0, content_len: int = 0,
+                  vec_elems: int = 0):
+    """A snapshot whose resident size is dominated by KNOWN terms."""
+    import numpy as np
+    snap = _snap()
+    snap["points"] = [
+        {"id": f"pt{i}", "content": "x" * content_len,
+         "pointKind": "statement", "status": "active", "outdated": False,
+         "search_keys": "", "has_answer": False}
+        for i in range(points)
+    ]
+    if vec_elems:
+        snap["doc_vecs"] = np.zeros((points, vec_elems), dtype=np.float64)
+    return snap
+
+
+def test_snapshot_bytes_counts_the_point_payload_and_the_doc_vectors():
+    """#7773: the estimator must see the terms that make an entry large —
+    the point payloads AND the dense doc-vector matrix (~150 MB at 384 dims),
+    which together are the ~1.2 GB worst case MAX_SNAPSHOT_ENTRIES alone
+    allowed.
+
+    This is the estimator the byte budget is enforced against, so a regression
+    that stops counting either term would silently un-bound the store while the
+    eviction tests still passed.
+    """
+    assert isinstance(fs._snapshot_bytes(_snap()), int)
+    small = fs._snapshot_bytes(_payload_snap(points=2, content_len=10))
+    big = fs._snapshot_bytes(_payload_snap(points=2, content_len=10_000))
+    assert big - small >= 2 * 9_990, (
+        "the point payload (content/search_keys strings) must be counted")
+    lean = fs._snapshot_bytes(_payload_snap(points=4, content_len=10))
+    dense = fs._snapshot_bytes(
+        _payload_snap(points=4, content_len=10, vec_elems=1_000))
+    assert dense - lean >= 4 * 1_000 * 8, (
+        "the dense float64 doc-vector matrix must be counted — it is the "
+        "~150 MB term the byte bound exists for")
+    # The sklearn path stores a scipy CSR, which exposes NO ``nbytes`` — its
+    # three buffers must be summed or that path would be bounded as if it held
+    # no vectors at all.
+    from scipy import sparse as sp
+    csr = sp.csr_matrix(np.eye(4))
+    csr_bytes = csr.data.nbytes + csr.indices.nbytes + csr.indptr.nbytes
+    sparse_snap = _payload_snap(points=4, content_len=10)
+    sparse_snap["doc_vecs"] = csr
+    assert fs._snapshot_bytes(sparse_snap) - lean == csr_bytes, (
+        "the scipy sparse buffers must be counted (the no-embedder path)")
+
+
+def test_snapshot_store_is_bounded_in_bytes_and_evicts_lru(monkeypatch, caplog):
+    """#7773: with per-backend keys the store must bound the resource actually
+    at risk, not just the entry count.
+
+    MAX_SNAPSHOT_ENTRIES=8 permits 8 entries of ANY size, and one entry can be
+    a full corpus plus a ~150 MB doc-vector matrix. Here the ENTRY cap is left
+    at its default and the BYTE budget alone must force eviction, LRU-style so
+    the newest snapshot survives.
+    """
+    per_entry = fs._snapshot_bytes(_payload_snap(points=20, content_len=500))
+    monkeypatch.setattr(fs, "MAX_SNAPSHOT_ENTRIES", 8)
+    monkeypatch.setattr(fs, "MAX_SNAPSHOT_BYTES", per_entry * 3)
+    fs._store.clear()
+    try:
+        with caplog.at_level(logging.INFO, logger="tortoise.fallback_snapshot"):
+            for i in range(6):
+                fs._store.put((f"g{i}", None, None),
+                              _payload_snap(points=20, content_len=500))
+        assert len(fs._store._store) == 3, (
+            "the byte budget must evict even though MAX_SNAPSHOT_ENTRIES is 8")
+        assert fs._store._total_bytes() <= per_entry * 3, (
+            "the store must be back under the byte budget")
+        assert fs._store.get(("g5", None, None)) is not None, (
+            "the newest snapshot must survive (LRU exempt)")
+        assert fs._store.get(("g0", None, None)) is None, (
+            "the oldest entry is evicted")
+        assert any("evicted" in r.getMessage() for r in caplog.records), (
+            "capacity eviction must be logged, like the TTL/dirty paths")
+    finally:
+        fs._store.clear()
+
+
+def test_snapshot_store_keeps_an_entry_that_exceeds_the_budget_alone(
+        monkeypatch, caplog):
+    """#7773: the byte budget must not destroy cacheability.
+
+    Evicting the snapshot just built would re-fetch the corpus and re-fit
+    TF-IDF on EVERY degraded read — the #1375 cost this store exists to avoid
+    — so a corpus larger than the budget on its own is retained and reported
+    loudly instead of being dropped silently. The store is then bounded to one
+    such corpus; the OLDER over-budget entry is still evicted.
+    """
+    per_entry = fs._snapshot_bytes(_payload_snap(points=50, content_len=1_000))
+    monkeypatch.setattr(fs, "MAX_SNAPSHOT_BYTES", per_entry // 4)
+    fs._store.clear()
+    try:
+        with caplog.at_level(logging.WARNING,
+                             logger="tortoise.fallback_snapshot"):
+            fs._store.put(("g0", None, None),
+                          _payload_snap(points=50, content_len=1_000))
+            assert fs._store.get(("g0", None, None)) is not None, (
+                "an over-budget entry must stay cacheable — otherwise every "
+                "degraded read re-fetches and re-fits the corpus")
+            fs._store.put(("g1", None, None),
+                          _payload_snap(points=50, content_len=1_000))
+        assert fs._store.get(("g1", None, None)) is not None
+        assert fs._store.get(("g0", None, None)) is None, (
+            "the OLDER over-budget entry is evicted; only the newest is exempt")
+        assert any(r.levelno == logging.WARNING for r in caplog.records), (
+            "an un-honourable byte budget must be reported, not silent")
+    finally:
+        fs._store.clear()
+
+
+def test_snapshot_store_size_record_follows_a_rebuild():
+    """A rebuilt entry must replace its recorded size.
+
+    A stale LARGE record would evict hot entries long after the entry shrank,
+    and a stale SMALL one would let the store drift over the budget — so the
+    size record is re-derived on every ``put``.
+    """
+    fs._store.clear()
+    try:
+        fs._store.put(("g0", None, None),
+                      _payload_snap(points=50, content_len=1_000))
+        before = fs._store._sizes[("g0", None, None)]
+        lean = _payload_snap(points=1, content_len=10)
+        fs._store.put(("g0", None, None), lean)
+        assert fs._store._sizes[("g0", None, None)] == fs._snapshot_bytes(lean)
+        assert fs._store._sizes[("g0", None, None)] < before
     finally:
         fs._store.clear()

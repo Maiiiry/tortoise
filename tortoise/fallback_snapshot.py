@@ -24,12 +24,16 @@ unless ``include_terminal`` (the #1391 contract); ``kind`` and
 ``exclude_status`` compose on top.
 
 Size cap: above MAX_CORPUS_POINTS the snapshot is skipped (hosted OOM
-protection) and the legacy path runs unchanged.
+protection) and the legacy path runs unchanged. The cached snapshots themselves
+are bounded by BOTH an entry count and an estimated resident-byte budget
+(MAX_SNAPSHOT_ENTRIES / MAX_SNAPSHOT_BYTES, LRU-evicted) — an entry count alone
+does not measure the resource at risk (#7773).
 """
 from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 
@@ -46,6 +50,23 @@ SNAPSHOT_TTL_SECONDS = 60.0
 # must keep its one graph's snapshot across requests.
 MAX_SNAPSHOT_ENTRIES = 8
 
+# ... and the ENTRY count is not the resource at risk (#7773). One entry can
+# hold MAX_CORPUS_POINTS points AND, when an embedder is present, a dense
+# float64 doc-vector matrix (~150 MB at 384 dims) — 8 such entries is ~1.2 GB,
+# while this store exists to protect a hosted process from OOM. So the store is
+# ALSO bounded by estimated resident bytes (``_snapshot_bytes``), evicted LRU
+# while either cap is exceeded. 256 MiB admits one full-size dense corpus (the
+# hottest, ~165 MB worst case) and caps the store far below the 1.2 GB the
+# entry cap alone allowed.
+#
+# NOT a hard ceiling for a SINGLE entry: the snapshot just built is never
+# evicted for exceeding the budget on its own (evicting it would re-fetch the
+# corpus and re-fit TF-IDF on every degraded read — the #1375 cost this store
+# exists to avoid — and would make an oversized store unusable rather than
+# merely oversized). Worst case is therefore ONE oversized corpus, and that
+# infeasibility is logged at WARNING rather than silently accepted.
+MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
+
 # Holds ALL non-operator points (incl. terminal statuses + outdated flag);
 # the serve-time exclusion in search_snapshot mirrors self.query's two-mode
 # semantics (#1391: terminal statuses + outdated excluded unless include_terminal).
@@ -58,21 +79,84 @@ _SNAPSHOT_QUERY = (
 )
 
 
+def _buffer_bytes(obj) -> int:
+    """Resident bytes of a vector buffer: numpy dense, scipy sparse, else 0.
+
+    ``nbytes`` covers an ``ndarray`` (the dense-embedder case, the ~150 MB term
+    this bound exists for). A scipy sparse matrix carries its three buffers as
+    separate arrays instead, so they are summed. Anything else (``None``, a
+    duck-typed stand-in) contributes nothing — this is an estimate of the
+    dominant terms, not a proof of the process's RSS.
+    """
+    nbytes = getattr(obj, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+    total = 0
+    for attr in ("data", "indices", "indptr"):
+        arr = getattr(obj, attr, None)
+        n = getattr(arr, "nbytes", None)
+        if isinstance(n, int):
+            total += n
+    return total
+
+
+def _snapshot_bytes(snap: dict) -> int:
+    """Estimated resident bytes of ONE cache entry (#7773).
+
+    Counts the lean point rows (each row's dict allocation plus the allocation
+    of every leaf value: its id/content/search_keys strings), the doc-vector
+    buffer, and — on the sklearn path — the vectorizer's vocabulary table and
+    ``idf_`` array. Those are the terms that can exhaust a hosted process; the
+    estimate is deliberately conservative-high rather than tight, because the
+    budget it feeds is an OOM guard.
+
+    Measured only on ``put`` (once per rebuild, itself a 350 ms-2 s corpus
+    re-fetch), so the walk over at most ``MAX_CORPUS_POINTS`` rows never runs
+    on the steady-state read path.
+    """
+    points = snap.get("points") or ()
+    total = sys.getsizeof(points)
+    for row in points:
+        total += sys.getsizeof(row)
+        for value in row.values():
+            if isinstance(value, (str, bytes, int, float, bool)):
+                total += sys.getsizeof(value)
+    total += _buffer_bytes(snap.get("doc_vecs"))
+    vectorizer = snap.get("vectorizer")
+    if vectorizer is not None:
+        vocab = getattr(vectorizer, "vocabulary_", None)
+        if isinstance(vocab, dict):
+            total += sys.getsizeof(vocab)
+            for term, index in vocab.items():
+                total += sys.getsizeof(term) + sys.getsizeof(index)
+        total += _buffer_bytes(getattr(vectorizer, "idf_", None))
+    return total
+
+
 class FallbackSnapshotStore:
     """Thread-safe LRU snapshot store keyed by ``snapshot_key``.
 
-    Bounded by ``MAX_SNAPSHOT_ENTRIES`` — the per-backend key is not bounded by
-    the (graph_name, namespace) pair count the way the old key was (#7760
-    review).
+    Bounded by BOTH ``MAX_SNAPSHOT_ENTRIES`` and ``MAX_SNAPSHOT_BYTES``. The
+    per-backend key is not bounded by the (graph_name, namespace) pair count
+    the way the old key was (#7760 review), and an ENTRY count does not measure
+    the resource at risk: one entry can hold ``MAX_CORPUS_POINTS`` points plus
+    a ~150 MB dense doc-vector matrix, so 8 entries is ~1.2 GB while a hosted
+    process may have less (#7773). ``_sizes`` mirrors ``_store`` with each
+    entry's estimated bytes, so eviction never re-measures the corpus and a
+    rebuilt entry replaces its own size record.
     """
 
     def __init__(self) -> None:
         self._store: dict[tuple, dict] = {}
+        # Estimated resident bytes per key, mirroring ``_store`` exactly. Kept
+        # in the store rather than on the snapshot so the cached payload stays
+        # exactly the shape ``build_snapshot`` returns.
+        self._sizes: dict[tuple, int] = {}
         self._lock = threading.RLock()
 
     def invalidate(self, key: tuple) -> None:
         with self._lock:
-            self._store.pop(key, None)
+            self._forget(key)
 
     def get(self, key: tuple) -> dict | None:
         """Fresh snapshot or None (missing / dirty / TTL-expired)."""
@@ -82,14 +166,14 @@ class FallbackSnapshotStore:
             if snap is None:
                 return None
             if snap.get("dirty"):
-                del self._store[key]
+                self._forget(key)
                 return None
             if now - snap["built_at"] > SNAPSHOT_TTL_SECONDS:
                 logger.warning(
                     "Fallback snapshot %r TTL-fired while clean — a write may "
                     "have bypassed the normal write surfaces", key,
                 )
-                del self._store[key]
+                self._forget(key)
                 return None
             self._store.pop(key, None)  # LRU bump — keep a hot store
             self._store[key] = snap
@@ -99,12 +183,61 @@ class FallbackSnapshotStore:
         with self._lock:
             self._store.pop(key, None)  # re-insert so order is by recency
             self._store[key] = snap
-            while len(self._store) > MAX_SNAPSHOT_ENTRIES:
-                self._store.pop(next(iter(self._store)), None)
+            self._sizes[key] = _snapshot_bytes(snap)
+            self._evict_over_capacity(newest=key)
+
+    def _forget(self, key: tuple) -> None:
+        """Drop ``key`` from both maps together — they must never desync.
+
+        Caller holds ``self._lock``.
+        """
+        self._store.pop(key, None)
+        self._sizes.pop(key, None)
+
+    def _total_bytes(self) -> int:
+        """Caller holds ``self._lock``."""
+        return sum(self._sizes.values())
+
+    def _evict_over_capacity(self, *, newest: tuple) -> None:
+        """LRU-evict while EITHER cap is exceeded; never evict ``newest``.
+
+        ``newest`` is exempt because dropping the snapshot just built would
+        re-fetch the corpus and re-fit TF-IDF on every degraded read (the
+        #1375 cost this store exists to avoid), and would make a store whose
+        single corpus exceeds the byte budget useless rather than merely
+        oversized. The byte budget is therefore a best-effort cap above ONE
+        corpus; an entry that cannot be accommodated on its own is kept and
+        reported at WARNING instead of being dropped silently.
+
+        Caller holds ``self._lock``.
+        """
+        while len(self._store) > 1 and (
+                len(self._store) > MAX_SNAPSHOT_ENTRIES
+                or self._total_bytes() > MAX_SNAPSHOT_BYTES):
+            # ``_store`` is insertion-ordered and ``newest`` was inserted last,
+            # so the first key that is not ``newest`` is the LRU entry.
+            victim = next(k for k in self._store if k != newest)
+            freed = self._sizes.get(victim, 0)
+            self._forget(victim)
+            logger.info(
+                "Fallback snapshot evicted %r (%d bytes) — over capacity: "
+                "%d/%d entries, %d/%d bytes",
+                victim, freed, len(self._store), MAX_SNAPSHOT_ENTRIES,
+                self._total_bytes(), MAX_SNAPSHOT_BYTES,
+            )
+        if self._total_bytes() > MAX_SNAPSHOT_BYTES:
+            logger.warning(
+                "Fallback snapshot %r is ~%d bytes, over the %d-byte store "
+                "budget on its own — retained (evicting it would re-fetch the "
+                "corpus on every degraded read), so the store is bounded to "
+                "one such corpus",
+                newest, self._sizes.get(newest, 0), MAX_SNAPSHOT_BYTES,
+            )
 
     def clear(self) -> None:
         with self._lock:
             self._store.clear()
+            self._sizes.clear()
 
 
 _store = FallbackSnapshotStore()
