@@ -44,6 +44,7 @@ from typing import Any
 
 from tortoise.embeddings import EMBEDDING_MODEL
 
+from . import measurement_posture
 from .costing import PRICING_MAP_VERSION
 from .dataset_audit import is_trusted
 
@@ -889,6 +890,14 @@ def build_report(
     judge_model: str,
     extraction_approach: str,
     ingest_mode: str = "deterministic",
+    # #8486: the run's MEASUREMENT POSTURE — the ingest mode + whether the
+    # belief layer was activated. A LongMemEval number is only readable with
+    # both stated (an un-activated v2 graph is EP-INERT: every claim reads a
+    # Beta(1,1) 0.50 that was never measured, #2598). The runner passes the
+    # resolved block; an OMITTED block records the UNKNOWN posture (no
+    # decision reached this run) — never an assumed "off" (`w7_publish.
+    # validate_receipt` refuses a completed receipt that carries UNKNOWN).
+    measurement_posture_block: dict[str, Any] | None = None,
     ks: tuple[int, ...],
     top_k: int,
     extra: dict[str, Any] | None = None,
@@ -2503,6 +2512,15 @@ def build_report(
             "reader_type_fragments": reader_type_fragments or {},
             "judge_model": judge_model,
             "ingest_mode": ingest_mode,
+            # #8486: ingest mode + belief-layer activation ALWAYS ride the
+            # methodology — the disclosure every surface a number appears on
+            # is required to carry. Derived in ONE place
+            # (``measurement_posture.build``) so the runner, this report and
+            # the published receipt cannot disagree.
+            "measurement_posture": (
+                measurement_posture_block
+                if isinstance(measurement_posture_block, dict)
+                else measurement_posture.build(ingest_mode=ingest_mode)),
             "judge_rule": "official LongMemEval get_anscheck_prompt; "
                           "label = 'yes' in response.lower()",
             "judge_call_shape": "official evaluate_qa.py: messages=[user], "
