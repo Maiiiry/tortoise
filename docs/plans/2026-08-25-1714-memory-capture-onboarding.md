@@ -408,7 +408,7 @@ set **includes the research brief**), which owns the gate, with a **seeded-viola
 403 wording must fail it)
 
 **J4 — Coming-soon click capture.**
-`tile click → popup ("Not available yet" + a POSTING primary `Register interest`) → the primary writes the record →
+`tile click → popup ("Not available yet" + a POSTING primary "Register interest") → the primary writes the record →
 inline loading/recorded/failed states → record queryable per team, deduped → operator Telegram pinged → done`
 → Queryable per team; the record cannot be retracted by dismissal; the ping is bounded (N clicks ⇒ one send, pinned literals); the modal shell +
 dialog contract are **#3513**'s, the post-action states **#3514**'s; a transport failure cannot fail the request. **No delivery,
