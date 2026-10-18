@@ -1624,3 +1624,199 @@ class TestSdkKindLegsTheDoorsDoNotName5475:
         """
         from tortoise.sdk import UnapprovedKindNamespace
         assert issubclass(UnapprovedKindNamespace, ValueError)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# G. #8968 — the #5475 residual: the UPDATE doors are write doors too
+# ══════════════════════════════════════════════════════════════════════════
+#
+# #5475's closure property is "a write may not WIDEN the graph's approved pack
+# set". The create-side doors are gated at their funnels (`_create_entity`,
+# `create_point`); the UPDATE doors were not, and a persisted kind value is what
+# `pack_state.graph_kind_namespaces` mines back into the set — so the same
+# defect was reachable one door over:
+#
+#     update_point   ['dev'] -> ACCEPTED -> ['dev', 'marketing']   WIDENED
+#     update_entity  ['dev'] -> ACCEPTED -> ['dev', 'marketing']   WIDENED
+#
+# The gate is the SAME one (`TortoiseSDK._refuse_unapproved_kinds_in_props`),
+# reached at `update_point` and at `_update_entity` (the funnel `update_entity`
+# and `update`'s entity arm share), so the two halves cannot drift.
+
+#: The (door → node it writes to) map. `update` is the consolidated verb
+#: (epic #888 W2) and must not be a way around its two arms.
+UPDATE_DOORS = {
+    "update_point": "point",
+    "update_entity_object": "object",
+    "update_entity_subject": "subject",
+    "update_entity_event": "event",
+    "update_consolidated": "point",
+}
+
+#: Which `UNAPPROVED` entry each update door's kind comes from.
+UPDATE_KIND = {
+    "update_point": "point",
+    "update_entity_object": "object",
+    "update_entity_subject": "subject",
+    "update_entity_event": "event",
+    "update_consolidated": "point",
+}
+
+
+def _seed_node(sdk, target: str) -> str:
+    """Create the node an update door writes to; return its id."""
+    if target == "point":
+        return sdk.create_point("statement", "claim to re-type")["id"]
+    if target == "subject":
+        return sdk.create_subject(f"probe subject {uuid.uuid4().hex[:6]}")["id"]
+    if target == "event":
+        return sdk.create_event(f"probe event {uuid.uuid4().hex[:6]}",
+                                "occurrence")["id"]
+    return sdk.create_object(f"probe object {uuid.uuid4().hex[:6]}")["id"]
+
+
+def _drive_update(sdk, door: str, node_id: str, prop: str, value: str) -> dict:
+    """Drive ONE update door with ``prop=value`` against an existing node."""
+    if door == "update_point":
+        return sdk.update_point(node_id, **{prop: value})
+    if door == "update_consolidated":
+        return sdk.update(node_id, **{prop: value})
+    return sdk.update_entity(node_id, **{prop: value})
+
+
+def _stored_kind(sdk, node_id: str, prop: str):
+    rows = sdk._get_proj().g.query(
+        "MATCH (n {id:$id}) RETURN n[$prop]",
+        params={"id": node_id, "prop": prop}).result_set
+    return rows[0][0] if rows else None
+
+
+class TestSdkUpdateDoorsRefuseUnapprovedPacks8968:
+    """#8968 (the #5475 residual): no UPDATE door may name an unapproved pack.
+
+    Every test answers the doctrine's two questions inline: *what fails it*
+    (``FAIL-ON``) and *is that value reachable in this fixture* (``REACHABLE``).
+    """
+
+    @pytest.mark.parametrize("door", sorted(UPDATE_DOORS))
+    def test_update_door_refuses_an_unapproved_namespace(self, sdk, door):
+        """The update doors, measured one at a time.
+
+        FAIL-ON (pre-fix, measured at HEAD `31e1c6559`): the write is ACCEPTED
+        and ``graph_installed_namespaces`` goes ``['dev']`` →
+        ``['dev', <pack>]`` — the update installs the pack the create doors
+        refuse.
+        REACHABLE: the fixture seeds ONE ``dev`` ``:PackInstall`` record (and
+        the node is created BEFORE the set is read, so the measurement is not
+        polluted by the fixture's own write), and the kind is a real catalog
+        spelling from another pack.
+        """
+        _seed_install(sdk, DEV)
+        prop, kind, pack_ns = UNAPPROVED[UPDATE_KIND[door]]
+        node_id = _seed_node(sdk, UPDATE_DOORS[door])
+        kind_before = _stored_kind(sdk, node_id, prop)
+        before = graph_installed_namespaces(sdk)
+        assert before == frozenset({DEV}), "fixture: a dev-only graph"
+
+        with pytest.raises(ValueError) as excinfo:
+            _drive_update(sdk, door, node_id, prop, kind)
+
+        message = str(excinfo.value)
+        # Option A (the owner ruling, 2026-10-17): WHAT happened…
+        assert kind in message and pack_ns in message, message
+        assert "NOT stored" in message, message
+        # …WHY…
+        assert "balloon" in message, message
+        # …and WHAT TO DO, including the pack the graph HAS approved.
+        assert "Next steps:" in message, message
+        assert "HAS approved (dev)" in message, message
+        assert "always writes" in message, message
+
+        # The durable half: no row for the data leg to mine back, and the node
+        # itself untouched (the refusal precedes the write).
+        assert graph_installed_namespaces(sdk) == before, (
+            "a refused update must not widen the approval set")
+        assert _stored_kind(sdk, node_id, prop) == kind_before, (
+            "a refused update must not persist the kind it refused")
+
+    @pytest.mark.parametrize("door", sorted(UPDATE_DOORS))
+    def test_update_door_still_writes_an_approved_namespace(self, sdk, door):
+        """A guard that always refuses is worthless — the legitimate case passes.
+
+        FAIL-ON: a fix that refuses by NAMESPACE PREFIX (or "any namespaced
+        kind") instead of by membership in the approval set, or one that gates
+        updates out of existence.
+        REACHABLE: ``dev`` is a seeded record, so the kind is genuinely
+        namespaced AND genuinely approved. PASSES pre-fix by design: the
+        non-vacuity control.
+        """
+        _seed_install(sdk, DEV)
+        prop, kind, pack_ns = APPROVED[UPDATE_KIND[door]]
+        assert ":" in kind and pack_ns == DEV
+        node_id = _seed_node(sdk, UPDATE_DOORS[door])
+        _drive_update(sdk, door, node_id, prop, kind)
+        assert _stored_kind(sdk, node_id, prop) == kind
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+    @pytest.mark.parametrize("door", sorted(UPDATE_DOORS))
+    def test_update_door_still_writes_the_general_kind(self, sdk, door):
+        """The anti-paralysis half of the ruling: a re-classification is never stuck.
+
+        An update is exactly where a writer re-classifies ("I could not classify
+        this, use the general kind"), so a gate that refused the general kind
+        here would block the escape hatch at the moment it is needed.
+
+        FAIL-ON: a fix that refuses EVERY kind write on a graph with pack
+        records. REACHABLE: the graph is genuinely gated (one ``dev`` record),
+        so a blanket refusal would red here. PASSES pre-fix by design.
+        """
+        _seed_install(sdk, DEV)
+        prop, kind = GENERAL[UPDATE_KIND[door]]
+        node_id = _seed_node(sdk, UPDATE_DOORS[door])
+        _drive_update(sdk, door, node_id, prop, kind)
+        assert _stored_kind(sdk, node_id, prop) == kind
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+    def test_update_to_a_namespace_the_data_already_carries(self, sdk):
+        """#2714 indicator 2: the gate is MEMBERSHIP, not a ban on re-typing.
+
+        A namespace the graph's own data already carries is IN the resolved set,
+        so re-typing a node into it must keep working — that is what keeps
+        historical rows updatable once a pack is removed.
+
+        FAIL-ON: the gate reads the ``:PackInstall`` records only, so an update
+        into a data-carried namespace is refused.
+        REACHABLE: the marketing row is a real node in the same graph the
+        resolver scans (asserted), and the seeded record is ``dev`` only.
+        """
+        _seed_install(sdk, DEV)
+        node_id = _seed_node(sdk, "point")
+        sdk._get_proj().g.query(
+            "MERGE (n:Object {id: 'l7-update-historical'}) "
+            "SET n.objectKind = 'marketing:campaign'")
+        assert graph_installed_namespaces(sdk) == frozenset({DEV, MARKETING})
+        _drive_update(sdk, "update_point", node_id, "pointKind",
+                      MARKETING_POINT)
+        assert _stored_kind(sdk, node_id, "pointKind") == MARKETING_POINT
+
+    def test_a_uses_prop_on_an_update_is_not_gated(self, sdk):
+        """The ``uses[]`` leg is a CREATE-only fold, so an update must not pay it.
+
+        ``_upsert_event`` MERGEs an ``:Object`` stub per use item with
+        ``objectKind = item['kind']``; no update branch mints one — the store
+        cannot even hold the value (measured: FalkorDB degrades ``props.uses`` to
+        null, ``#7369``). Gating it here would refuse a write that cannot widen,
+        which is over-refusal on the update path the internal flows use.
+
+        FAIL-ON: the shared helper's ``uses`` arm runs on updates too.
+        REACHABLE: the graph IS gated (one ``dev`` record) and the kind named in
+        the uses item is a real, unapproved catalog spelling.
+        """
+        _seed_install(sdk, DEV)
+        node_id = _seed_node(sdk, "point")
+        before = graph_installed_namespaces(sdk)
+        sdk.update_point(node_id, uses=[{"name": "campaignX",
+                                         "kind": MARKETING_OBJECT}])
+        assert graph_installed_namespaces(sdk) == before, (
+            "a `uses` property on an update widened the approval set — the "
+            "create-only fold assumption behind `uses_fold=False` is wrong")

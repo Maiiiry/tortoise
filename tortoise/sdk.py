@@ -10657,6 +10657,22 @@ class TortoiseSDK:
         # #329: id mutation + server-managed fields rejected
         props = _sanitize_props(props, reject_id=True,
                                 reject_belief_props=True)
+        # ── #8968 (the #5475 residual): an UPDATE is a write door too ──
+        # The persisted value of a mined kind property is what
+        # `pack_state.graph_kind_namespaces` reads back, so an ungated
+        # `update_point(pointKind="marketing:contentPerformance")` widened a
+        # `dev`-only graph's approval set exactly as `create_point` did before
+        # #5475's create-side gate (measured: `['dev']` -> `['dev',
+        # 'marketing']`). Same rule, same ONE home, same Option-A refusal — the
+        # update doors are the last SDK live-write path that could ADD a
+        # namespace, so leaving them open would leave the set advisory.
+        #
+        # `uses_fold=False`: the `uses[].kind` leg is the Event FOLD's
+        # create-only Object stub (`projection._upsert_event`); an update
+        # persists a `uses` property on the node and mints no stub, and `uses`
+        # is not one of `_KIND_PROP_KEYS`, so gating it here would refuse a
+        # write that cannot widen.
+        self._refuse_unapproved_kinds_in_props(props, uses_fold=False)
         # R2 (#1541) D3: search_keys is stored flat (see _flatten_search_keys_prop).
         _flatten_search_keys_prop(props)
         # E4 (#5007): same rule as `create_point` / the `Point` model — an
@@ -28329,7 +28345,8 @@ class TortoiseSDK:
             prop=prop, kind=kind if isinstance(kind, str) else str(kind),
             namespace=pack_ns, installed=approved)
 
-    def _refuse_unapproved_kinds_in_props(self, props: dict) -> None:
+    def _refuse_unapproved_kinds_in_props(self, props: dict, *,
+                                          uses_fold: bool = True) -> None:
         """Run the #5475 gate over EVERY kind property a write is carrying.
 
         The five public doors do not hand their kind in one shape: the entity
@@ -28348,11 +28365,20 @@ class TortoiseSDK:
         — a kind property written by a door that never names it as one (measured:
         ``create_event(..., uses=[{'name': 'x', 'kind': 'marketing:campaign'}])``
         widened a ``dev``-only graph before this check existed).
+
+        ``uses_fold=False`` is for the UPDATE doors (#8968). It drops the
+        ``uses[]`` arm only: an update stores a ``uses`` property on the node
+        and mints no ``:Object`` stub, and ``uses`` is not one of
+        ``_KIND_PROP_KEYS``, so no update can widen the approval set through it.
+        The MINED keys are checked identically on both paths — that is the
+        point of sharing this helper rather than writing a second list.
         """
         from .pack_state import _KIND_PROP_KEYS as _gated_kind_props
         for kind_prop in _gated_kind_props:
             if kind_prop in props:
                 self._refuse_unapproved_kind(kind_prop, props.get(kind_prop))
+        if not uses_fold:
+            return
         uses = props.get("uses")
         if isinstance(uses, dict):
             uses = [uses]
@@ -28964,6 +28990,21 @@ class TortoiseSDK:
         # #329: id + sourcePath/source_path are server-managed — reject
         props = _sanitize_props(props, reject_id=True,
                                 reject_belief_props=True)
+        # ── #8968 (the #5475 residual): the UPDATE door ──
+        # This is the funnel `update_entity` (and `update`'s entity arm) reaches,
+        # and its per-label branches below write caller props with a live
+        # `SET n += $p` — so a kind property set here is mined back into the
+        # graph's approved pack set by `pack_state.graph_kind_namespaces` and
+        # SELF-WIDENED the set the create doors are gated by (measured:
+        # `update_entity(id, objectKind='marketing:campaign')` took a `dev`-only
+        # graph to `['dev', 'marketing']`). Refused BEFORE any write, so a
+        # refusal leaves the node untouched.
+        #
+        # `uses_fold=False`: the `uses[].kind` leg is the Event FOLD's
+        # create-only Object stub; no update branch mints one (it stores a
+        # `uses` property, which `_KIND_PROP_KEYS` does not mine), so gating it
+        # here would refuse a write that cannot widen.
+        self._refuse_unapproved_kinds_in_props(props, uses_fold=False)
         # #3998 (D30): the generic entity surface reaches `:Source` TOO, and its
         # per-label branch below writes caller props with a live `SET n += $p`.
         # Without this the closed :Source surface declared in
