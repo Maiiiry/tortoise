@@ -1030,8 +1030,12 @@ def write_tolerated_cleanup_report(
     is not an observability channel, and adding a dump step is a workflow
     change payload. Each section's entries are merged by their own ``name`` key
     (or ``path``, if that is what they carry) so a peer session cannot truncate
-    them. The report is written when the leak list OR any extra section is
-    non-empty.
+    them. The merge is TWO-WAY: a section already in the artifact but NOT
+    re-supplied by this call (because this session recorded no such event) is
+    carried over verbatim instead of being dropped — otherwise a session whose
+    own section is empty would erase a peer's record, which is the same
+    invisibility this channel exists to remove (#8746 review r6 P2). The report
+    is written when the leak list OR any extra section is non-empty.
 
     Best-effort: writing the report never fails the suite. Written ONLY when
     something WAS tolerated, so a clean xdist worker never overwrites a
@@ -1046,7 +1050,10 @@ def write_tolerated_cleanup_report(
     write in the same instant; the artifact then still names the defect, so the
     leak stays observable.)
     """
-    extra = {k: v for k, v in (extra or {}).items() if v}
+    # Empty sections are dropped (nothing to say), and the leak list's own key
+    # is RESERVED: it is owned by the session global below, never by `extra`.
+    extra = {k: v for k, v in (extra or {}).items()
+             if v and k != "tolerated_cleanup_leaks"}
     if not _TOLERATED_CLEANUP_LEAKS and not extra:
         return None
     try:
@@ -1063,25 +1070,33 @@ def write_tolerated_cleanup_report(
                     by_path[str(entry["path"])] = entry
         except (OSError, ValueError, AttributeError, TypeError):
             pass  # no prior artifact, or an unreadable/garbled one — start fresh
+        for entry in tolerated_cleanup_leaks():
+            entry.setdefault("pid", os.getpid())
+            by_path[str(entry["path"])] = entry
         payload: dict[str, object] = {
             "tolerated_cleanup_leaks": [
                 by_path[path] for path in sorted(by_path)],
         }
-        for section, entries in extra.items():
+        # Emit the UNION of the prior artifact's sections and this call's
+        # `extra` keys — the prior keys are what stops an empty current
+        # section from ERASING a peer's record (only re-supplied keys used to
+        # be emitted, so any section this session had no events for vanished).
+        prior_sections = [
+            key for key in (prior if isinstance(prior, dict) else ())
+            if key != "tolerated_cleanup_leaks"]
+        for section in prior_sections + [
+                key for key in extra if key not in prior_sections]:
             by_key: dict[str, dict[str, object]] = {}
-            for entry in prior.get(section, []) if isinstance(prior, dict) else []:
+            carried = prior.get(section) if isinstance(prior, dict) else None
+            for entry in carried if isinstance(carried, list) else []:
                 if isinstance(entry, dict):
                     key = entry.get("name", entry.get("path"))
                     if key is not None:
                         by_key[str(key)] = entry
-            for entry in entries:
+            for entry in extra.get(section, []):
                 by_key[str(entry.get("name", entry.get("path")))] = dict(entry)
-            payload[section] = list(by_key.values())
-        for entry in tolerated_cleanup_leaks():
-            entry.setdefault("pid", os.getpid())
-            by_path[str(entry["path"])] = entry
-        payload["tolerated_cleanup_leaks"] = [
-            by_path[path] for path in sorted(by_path)]
+            if by_key:
+                payload[section] = list(by_key.values())
         with open(log_path, "w") as fh:
             json.dump(payload, fh, indent=2)
     except OSError:

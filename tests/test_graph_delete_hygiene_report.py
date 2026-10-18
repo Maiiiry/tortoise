@@ -177,6 +177,46 @@ def test_the_section_merges_and_cannot_truncate_a_prior_record(tmp_path):
         _live_utils._restore_graph_delete_events(snapshot)
 
 
+def test_a_session_with_no_events_cannot_erase_a_prior_section(tmp_path):
+    """The merge is TWO-WAY: an EMPTY current section must not delete a peer's.
+
+    `extra={_SECTION: []}` is filtered to `{}` (nothing to say this session),
+    and `extra` used to be the ONLY source of emitted section keys — so a
+    session that recorded zero graph-delete events rewrote the artifact
+    WITHOUT the section a peer had written, silently erasing a real refusal
+    record. The forward direction (this session's events merge into a peer's)
+    is `test_the_section_merges_and_cannot_truncate_a_prior_record`; this pins
+    the reverse, which nothing red'ed on before (#8746 review r6 P2).
+    """
+    artifact = tmp_path / _ARTIFACT
+    peer = {_SECTION: [
+        {"name": "test_peer_owned", "event": "failed", "reason": "peer"},
+    ]}
+    artifact.write_text(json.dumps(peer))
+    unrelated = "/tmp/tortoise_8746_peer_erase_probe"
+    with _isolated_tolerated_leaks([{"path": unrelated, "errno": 39,
+                                     "reason": "Directory not empty"}]):
+        # (a) the finalizer's own shape on a clean session: the section is
+        #     supplied but EMPTY, so it is filtered out before the merge.
+        write_tolerated_cleanup_report(
+            log_dir=str(tmp_path), extra={_SECTION: []})
+        written = json.loads(artifact.read_text())
+    assert [e["name"] for e in written.get(_SECTION, [])] == ["test_peer_owned"], (
+        "a session with no graph-delete events ERASED the prior section: "
+        f"{written!r}")
+    assert [e["path"] for e in written["tolerated_cleanup_leaks"]] == [
+        unrelated], written["tolerated_cleanup_leaks"]
+
+    # (b) `extra=None` (no section kwarg at all) must carry the peer section
+    #     over too, not drop it.
+    with _isolated_tolerated_leaks([{"path": unrelated, "errno": 39,
+                                     "reason": "Directory not empty"}]):
+        write_tolerated_cleanup_report(log_dir=str(tmp_path))
+        written = json.loads(artifact.read_text())
+    assert [e["name"] for e in written.get(_SECTION, [])] == ["test_peer_owned"], (
+        f"extra=None dropped the prior section: {written!r}")
+
+
 def test_the_session_finalizer_feeds_the_section_into_the_artifact():
     """The WIRING is pinned, because an unwired writer is the r3 P2 defect.
 
