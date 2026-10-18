@@ -883,16 +883,19 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert absolute == pytest.approx(2.857, abs=1e-3), (
         f"the comment quotes 2.857 as the saturation at maximal |d_gb| "
         f"(sim_w + graph_w + rec_w) / graph_w; this is {absolute:.4f}")
-    # THE GUARANTEE: what a cb inside [0, 1] can buy is at most the clamp's
-    # headroom 1.0 - baseline, and the requirement exceeds it — that inequality
-    # is the invariant, true of EVERY 2-row page.  The floor it comes from is
-    # ``cb_req >= (sim_w - graph_w*gb_hot - rec_w)/graph_w = 1 - gb_hot`` (put
-    # ``gb_calm >= 0``, ``gb_hot <= 1`` and ``d_rec >= -1`` into the formula),
-    # i.e. the headroom of the page's HIGHER row, which is BELOW 1.0 whenever
-    # that row has any baseline at all.  So ``1.0`` is not a 2-row bound and is
-    # not asserted as one: the value pinned just below is THIS fixture's
-    # requirement (1.4286, from the parity), not "a 2-row page must need the
-    # full span".
+    # THE GUARANTEE — the ONE claim here about pages rather than this fixture:
+    # ``cb`` is confined to the graph term, so the most it can add is the
+    # clamp's headroom ``1.0 - baseline``.  On a page whose contested row is the
+    # MORE similar one (``d_sim == +1``, the placement asserted above and the
+    # case this boost exists for) with equal recency, the requirement is
+    # ``1.4286 + d_gb`` >= ``1.4286 - gb_hot``, which EXCEEDS that headroom — so
+    # no ``cb`` inside the invariant clears it.  Scope it exactly: a page whose
+    # contested row sits at the BOTTOM of the span needs less, because
+    # ``d_sim`` is then negative and the similarity term runs the other way —
+    # which is why the placement is asserted as a PREMISE above rather than
+    # assumed by the band.  ``1.0`` is not a 2-row bound and is not asserted as
+    # one: the value pinned just below is THIS fixture's requirement (1.4286,
+    # from the parity), not "a 2-row page must need the full span".
     two_headroom = 1.0 - two_gb_hot
     assert two_headroom == pytest.approx(0.3), (
         f"the comment quotes 0.3 of clamp headroom (1.0 - a 0.7 baseline); "
