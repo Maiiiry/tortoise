@@ -532,8 +532,8 @@ def test_integration_conflict_relevant_query_outranks_twin(
     each leg's own ``ORDER BY score, id ASC`` tie-break ranks the lower-ULID
     twin first, and that one-rank RRF difference is worth MORE than the
     boost — so the ordering claim is false, not flaky (#7704, measured on the
-    relevance/final-score basis the boost effect is on: fused gap 0.0188 of
-    final score — the 0.0377 similarity gap x the 0.5 similarity weight —
+    relevance/final-score basis the boost effect is on: fused gap 0.0189 of
+    final score — the 0.0378 similarity gap x the 0.5 similarity weight —
     > boost contribution 0.0175).
 
     The `match_source` assertion below makes the path the test actually
@@ -628,7 +628,7 @@ def test_integration_fused_path_applies_contested_boost(
     rank 0, and RRF (rank-based, ``1/(k+rank+1)``) converts that one-rank
     difference into a post-fusion min-max similarity gap that can EXCEED the
     boost's final-score contribution.  Measured on this fixture: similarity
-    gap 0.0377 => 0.0188 of final score, vs the boost's 0.0175 — so the
+    gap 0.0378 => 0.0189 of final score, vs the boost's 0.0175 — so the
     contested twin ranks BELOW its twin on this path and the outcome is
     decided by the id tie-break, not the contested signal (#7704).  That gap
     is a product decision (boost magnitude / fusion tie semantics) and is
@@ -1109,6 +1109,36 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"({ten_req:.4f}) and inside the clamp's headroom "
         f"({ten_headroom:.4f}). If it does not, the comment's 'a modest "
         f"raise therefore DOES repair the shipped default read' is false")
+
+    # ── The threshold is the ROUND-TRIPPED one, not the requirement ─────────
+    # ``graph_boost`` is rounded to 4 dp BEFORE it is weighted
+    # (``round(min(1.0, graph_boost + cb), 4)``) and ``final_score`` is rounded
+    # again, so the smallest increment that actually reorders the payload sits
+    # ABOVE the unrounded requirement: 0.0541 still ties and 0.0542 flips. The
+    # comment therefore quotes ``cb >= 0.0542``, and this pins both sides of
+    # that claim through the shipped read — at the requirement itself the
+    # ordering does NOT move. Without this the 0.0542 sentence is untested
+    # (the ``modest = 0.06`` arm below is far from the boundary and would pass
+    # for any threshold under 0.06).
+    def _flips_at(value: float) -> bool:
+        with monkeypatch.context() as patched:
+            patched.setattr("tortoise.ranking.W4_CONTESTED_BOOST", value)
+            got = ranked_sdk.tortoise_fts_query(query, limit=10, order_by="graph")
+        ids = [r["id"] for r in got]
+        assert hot in ids and calm in ids, (
+            f"FIXTURE NOT REACHED at cb={value}: a twin is off the page")
+        return ids.index(hot) < ids.index(calm)
+
+    assert not _flips_at(ten_req), (
+        f"the comment puts the flip at cb >= 0.0542, ABOVE the unrounded "
+        f"requirement ({ten_req:.7f}) — so cb == the requirement must NOT "
+        f"reorder the payload. It did: the round-trip (graph_boost and "
+        f"final_score both rounded to 4 dp before/after weighting) is no "
+        f"longer what the comment says it is")
+    assert _flips_at(0.0542), (
+        "the comment quotes 0.0542 as the smallest increment that flips the "
+        "shipped default page; this run does not flip there — re-measure the "
+        "round-trip threshold rather than re-describing it")
 
     # ── The bound is CONDITIONAL: the ``Δgb`` term is not free ─────────────
     # ``cb_req = (sim_w*Δsim + graph_w*Δgb + rec_w*Δrec) / graph_w``.  1.857 is the

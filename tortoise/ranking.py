@@ -142,9 +142,11 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # parity NAND onto the calm twin to zero it, and without that calm falls to
 # degree 0, ``d_gb`` = -0.25, and the 2-row requirement drops to 1.1786.  So
 # 1.857 is the CEILING at ``d_gb == 0`` and 1.4286 is the requirement at that
-# parity; neither is a floor for ``d_gb`` > 0, and only 2.857 is a universal
-# ceiling.  The conclusion below is unaffected: a larger ``d_gb`` only moves
-# the requirement UP, never down.
+# parity; 1.857 is never a floor (a negative ``d_gb`` gives a larger ceiling),
+# while 1.4286 is one only while ``d_gb`` >= 0 — ``1.4286 + d_gb`` exceeds it
+# for every positive ``d_gb`` — and only 2.857 bounds every page.  The
+# conclusion below is unaffected: a larger ``d_gb`` only moves the requirement
+# UP, never down.
 # A 2-row page is the worst PAGE because a page cannot hold fewer than the two
 # rows being ordered: it is a maximum, not the first term of a series.  Measured
 # on the bare 4-row E2E-1 fixture (dense leg live, re-measured 2026-10-18):
@@ -156,11 +158,16 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # requirement FALLS as the page grows and the largest value it ever takes is
 # the 2-row one.
 #   * A modest raise therefore DOES repair the shipped default read: on that
-#     fixture, ``cb`` > 0.0540 flips the limit=10 ordering (measured: cb=0.06
-#     ranks the contested twin first).  Remedy (2) is a real magnitude choice
-#     with a page-dependent, partial effect — not an impossibility.  Clearing
-#     #2102's own E2E-1 pre-assertion (relevance delta <= 0.05 in similarity
-#     space) takes ``cb > 0.5 * 0.05 / 0.35`` = 0.0714.
+#     fixture the limit=10 ordering flips at ``cb`` >= 0.0542 — the requirement
+#     itself is 0.0540153, but ``graph_boost`` is rounded to 4 dp BEFORE it is
+#     weighted (``round(min(1.0, graph_boost + cb), 4)``) and ``final_score``
+#     is rounded again, so the smallest increment that actually reorders the
+#     payload sits one grid step above the requirement and 0.0541 still ranks
+#     the contested twin second (measured: cb=0.06 ranks it first).  Remedy
+#     (2) is a real magnitude choice with a page-dependent, partial effect —
+#     not an impossibility.  Clearing #2102's own E2E-1 pre-assertion
+#     (relevance delta <= 0.05 in similarity space) takes
+#     ``cb > 0.5 * 0.05 / 0.35`` = 0.0714.
 #   * What no ``cb`` inside the invariant can buy is the SMALL pages: the clamp
 #     ``min(1.0, graph_boost + cb)`` grants at most ``1.0 - graph_boost`` of
 #     headroom (0.3 on that fixture, where both twins' baseline graph_boost is
