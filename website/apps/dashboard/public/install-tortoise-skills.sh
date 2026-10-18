@@ -436,7 +436,7 @@ emit_codex_agents_block() {
   # untouched file, which is the harm this whole change exists to end.
   local state="" prev_version="" same_bytes=0
   local state_kind="" c_start c_startline c_end c_endline
-  local c_near_s c_near_e c_mangled_s c_mangled_e
+  local c_near_s c_near_e c_mangled_s c_mangled_e c_fence_open
   _emit_fail() {
     # ONE place that cleans up and fails. It EXITS rather than returning: a
     # `cmd || helper` list is itself an errexit-exempt context, so a helper that
@@ -513,17 +513,32 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         if (sw != "" && sw == msws) mangledstart++
         else if (sw != "" && sw == mews) mangledend++
       }
-      BEGIN { starts = ends = nearstart = nearend = mangledstart = mangledend = 0; fence = 0 }
-      { lines[NR] = $0 }
-      # A FENCED CODE BLOCK is an example, not content: a repo whose AGENTS.md
-      # documents the markers must not be refused for it, and its fence must not
-      # be mistaken for the block. The lines of a CLOSED fence are remembered as
-      # such, because the unclosed-fence fallback below must not reconsider them.
-      /^[ \t]*```/ {
-        if (fence) { for (i = fstart; i < NR; i++) closed[i] = 1 } else { fstart = NR }
-        fence = !fence; next
+      BEGIN { starts = ends = nearstart = nearend = mangledstart = mangledend = 0; fence = ""; flen = 0 }
+      # The FENCE RUN on this line, or "": CommonMark opens a fence with three or
+      # more backticks OR tildes (indented at most 3 spaces) and closes it only
+      # with a run of the SAME character at least as long. A parity toggle on
+      # "three backticks" is not this: `~~~` was not a fence at all (so an example
+      # in one was DELETED and reported as an upgrade), and a 4-backtick fence
+      # around a 3-backtick example closed at the wrong line.
+      function fence_run(line,   m) {
+        if (!match(line, /^ {0,3}(`{3,}|~{3,})/)) return ""
+        m = substr(line, RSTART, RLENGTH)
+        sub(/^ +/, "", m)
+        return m
       }
-      fence { next }
+      { lines[NR] = $0 }
+      { fr = fence_run($0)
+        if (fence == "") {
+          if (fr != "") { fence = substr(fr, 1, 1); flen = length(fr); fstart = NR; next }
+        } else {
+          # Inside a fence nothing is content — including a shorter run of the same
+          # character and a run of the OTHER character (a nested example).
+          if (fr != "" && substr(fr, 1, 1) == fence && length(fr) >= flen) {
+            for (i = fstart; i < NR; i++) closed[i] = 1
+            fence = ""
+          }
+          next
+        } }
       { classify($0, NR) }
       END {
         # An UNCLOSED fence would hide every real marker below it, and "no
@@ -535,7 +550,9 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         # skipped — recounting the whole file treated a documented example as the
         # block, replacing it (measured), or hard-refused a file with no duplicate
         # at all while advising the user to delete their documentation.
-        if (fence) {
+        fenceopen = 0
+        if (fence != "") {
+          fenceopen = 1
           starts = ends = nearstart = nearend = mangledstart = mangledend = 0
           startline = endline = 0
           for (i = 1; i <= NR; i++) if (!closed[i]) classify(lines[i], i)
@@ -545,17 +562,18 @@ ${me}" > "$block" || _emit_fail "could not build the new block text — nothing 
         # them treated a 4-space-indented documentation example (CommonMark allows
         # that as a code block too) as a "duplicate" and its remedy deleted it.
         if (starts == 1 && ends == 1 && startline < endline) {
-          printf "paired|1|%d|1|%d|0|0|0|0\n", startline, endline; exit
+          printf "paired|1|%d|1|%d|0|0|0|0|0\n", startline, endline; exit
         }
         if (starts + ends + nearstart + nearend + mangledstart + mangledend == 0) {
-          print "none|0|-|0|-|0|0|0|0"; exit
+          print "none|0|-|0|-|0|0|0|0|0"; exit
         }
         # Per-marker counts, so the message and the remedy agree with each other:
         # `c_end` (anchored only) used to say "there is no end line" while the
         # line it was printed under reported a mangled one.
-        printf "malformed|%d|%s|%d|%s|%d|%d|%d|%d\n", starts, (startline ? startline : "-"), ends, (endline ? endline : "-"), nearstart, nearend, mangledstart, mangledend
+        printf "malformed|%d|%s|%d|%s|%d|%d|%d|%d|%d\n", starts, (startline ? startline : "-"), ends, (endline ? endline : "-"), nearstart, nearend, mangledstart, mangledend, fenceopen
       }' "$target")" || _emit_fail "could not read $target (unreadable, or not a regular file) — nothing was changed"
-    IFS='|' read -r state_kind c_start c_startline c_end c_endline c_near_s c_near_e c_mangled_s c_mangled_e <<EOF
+    IFS='|' read -r state_kind c_start c_startline c_end c_endline \
+      c_near_s c_near_e c_mangled_s c_mangled_e c_fence_open <<EOF
 $state
 EOF
   else
@@ -576,7 +594,14 @@ EOF
       echo "      expected exactly ONE ${ms} before exactly ONE ${me}, each alone on its line." >&2
       echo "      NOT rewritten: appending would leave the stale block in place, and a replace" >&2
       echo "      would have to guess which copy is yours." >&2
-      if [ "$s_side" -ge 2 ] && [ "$e_side" -ge 1 ]; then
+      if [ "${c_fence_open:-0}" = "1" ]; then
+        echo "      An UNTERMINATED code fence is hiding part of this file, so the markers" >&2
+        echo "      cannot be told apart from an example. Close the fence (or delete the" >&2
+        echo "      fence line) and re-run; nothing was written." >&2
+        rm -rf "$tmpdir"
+        echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
+        exit 3
+      elif [ "$s_side" -ge 2 ] && [ "$e_side" -ge 1 ]; then
         echo "      Usual cause: an older installer ran twice. Delete from the FIRST start marker" >&2
         echo "      through the LAST end marker (all copies), then re-run." >&2
       elif [ "$s_side" -ge 1 ] && [ "$e_side" -eq 0 ]; then

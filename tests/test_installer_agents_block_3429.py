@@ -99,6 +99,25 @@ replaced, and reported as an upgrade:
 That last one is why the split re-checks itself: the map is computed from an
 earlier read, and AGENTS.md is exactly the file another process may write here.
 
+Cycle 7 measured the FENCE MODEL itself. It was a parity toggle on three
+backticks, which is not CommonMark's rule:
+
+  * treat only backticks as a fence                        -> the tilde test fails:
+    an example in a `~~~` fence was DELETED and the run reported "upgraded" over a
+    block that never existed;
+  * toggle on parity instead of matching the opening run     -> the nested-fence
+    test fails: a 4-backtick fence around a 3-backtick example closed at the wrong
+    line, so one marker was counted and the other skipped — a false MALFORMED with
+    a remedy about a file that has no block;
+  * drop the up-to-3-space indent tolerance                -> the indented-fence
+    test fails;
+  * report a fence-hidden ambiguity as "an older installer ran twice" -> the
+    unterminated-fence test fails, because that remedy ("delete from the FIRST
+    start marker through the LAST end marker") deletes the user's REAL block;
+  * drop `LC_ALL=C` from the state pass                    -> the locale test fails
+    (pinned at the source: unimplementable on this host's BSD awk, and gawk under
+    a UTF-8 locale is where it bites).
+
 Cycle 2 also measured a version token in prose outside the block (read as
 "current") and an older installer overwriting a newer block (called an
 "upgrade"); both are tests here. Cycle 3 measured the false-success path
@@ -1025,3 +1044,103 @@ def test_a_file_that_changes_mid_rewrite_is_not_half_written(tmp_path):
     # The block was NOT replaced: only the stubbed mutation is present.
     assert "tortoise:block v" not in agents.read_text(encoding="utf-8")
     assert before.replace("tortoise:end", "tortoise:ENDED") == agents.read_text(encoding="utf-8")
+
+
+def test_a_tilde_fence_example_is_an_example(tmp_path):
+    """`~~~` is a CommonMark code fence. A three-backtick parity toggle did not
+    know that, so an example in a tilde fence was DELETED and reported as an
+    "upgrade" of a block that never existed."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = f"~~~markdown\n{START}\nan EXAMPLE the user wrote\n{END}\n~~~\n"
+    agents = project / "AGENTS.md"
+    agents.write_text(example, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stderr
+    text = agents.read_text(encoding="utf-8")
+    assert "an EXAMPLE the user wrote" in text, "the user's example was deleted"
+    assert example in text, "the tilde-fenced example was modified"
+    assert "upgraded" not in _agents_report(done.stdout), "there was no block to upgrade"
+
+
+def test_a_nested_fence_example_is_an_example(tmp_path):
+    """A 4-backtick fence wrapping a 3-backtick example: parity closed at the
+    wrong line, so one marker was counted and the other skipped — a false
+    MALFORMED refusal, with a remedy about a file that has no block."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = f"````markdown\n{START}\n```\n{END}\n```\n````\n"
+    agents = project / "AGENTS.md"
+    agents.write_text(example, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, f"a nested fence example was refused:\n{done.stderr}"
+    text = agents.read_text(encoding="utf-8")
+    assert example in text, "the nested example was modified"
+    assert text.count(START) == 2, "expected the example plus the created block"
+
+
+def test_an_indented_fence_example_is_an_example(tmp_path):
+    """CommonMark allows up to 3 spaces before the fence; the toggle's `[ \\t]*`
+    is what makes that work, and only the language tag half was pinned."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = f"   ```md\n{START}\n   ...\n{END}\n   ```\n"
+    agents = project / "AGENTS.md"
+    agents.write_text(example, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, f"an indented fence was not a fence:\n{done.stderr}"
+    text = agents.read_text(encoding="utf-8")
+    assert example in text, "the indented-fence example was modified"
+
+
+def test_an_unterminated_fence_is_diagnosed_as_a_fence(tmp_path):
+    """The fallback produced these counts, so "an older installer ran twice" is
+    not what happened — and its remedy ("delete from the FIRST start marker
+    through the LAST end marker") deletes the user's REAL block."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    agents = project / "AGENTS.md"
+    second = f"```md\n{START}\nan example\n{END}\n"
+    agents.write_text(LEGACY_BLOCK + "\n" + second, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "UNTERMINATED" in done.stderr, done.stderr
+    assert "ran twice" not in done.stderr, "the cause is a fence, not a double run"
+    assert "Delete from the FIRST start marker" not in done.stderr, (
+        "that remedy deletes the user's real block")
+    assert agents.read_text(encoding="utf-8") == LEGACY_BLOCK + "\n" + second, (
+        "a refusal must leave the file byte-identical")
+
+
+def test_the_classifier_runs_under_the_C_locale():
+    """`LC_ALL=C` is what makes the byte-level BOM strip work on gawk under a
+    UTF-8 locale (`sprintf("%c", 239)` there yields the 2-byte encoding of
+    U+00EF). Not reproducible on this host's BSD awk, which is why the guard is
+    pinned at the source rather than through behaviour."""
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert 'state="$(LC_ALL=C awk' in text, (
+        "the state classifier must run under the C locale for the byte BOM strip")

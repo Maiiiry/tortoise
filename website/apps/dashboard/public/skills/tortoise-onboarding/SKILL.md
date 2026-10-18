@@ -562,12 +562,17 @@ with different internal spacing or an invisible character — the installer prin
 cause it actually found, REFUSES rather than duplicating the block, and exits 3
 (the skills ARE installed by then; only the block is not upgraded).
 
-A marker inside a fenced code block is an EXAMPLE, not a block. Fences are
-skipped for every count AND for the version read, the comparison and the
-rewrite, so a project that documents the markers keeps its documentation exactly
-as written and still gets its block created or refreshed. An UNCLOSED fence is
-the one ambiguity: the installer falls back to reading every line and rewrites
-the block it finds rather than appending a second one.
+A marker inside a fenced code block is an EXAMPLE, not a block. Every fence
+CommonMark recognises is skipped — backticks or tildes, three or more, indented
+up to three spaces, and a longer fence may contain a shorter one — for the count
+AND for the version read, the comparison and the rewrite, so a project that
+documents the markers keeps its documentation exactly as written and still gets
+its block created or refreshed.
+
+An UNCLOSED fence is the one ambiguity, and it is refused: the installer says
+`An UNTERMINATED code fence is hiding part of this file` and exits 3 without
+writing, because the markers below it cannot be told apart from an example.
+Close the fence and re-run.
 
 Never hand-edit inside markers you did not write; the next refresh discards it.
 
