@@ -1551,6 +1551,52 @@ def test_a_two_member_stack_is_only_legal_in_case_then_aux_order(
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
 
 
+@pytest.mark.parametrize("anchor", ["™", "Ⅳ", "①", "µ", "ª", "½", "№"])
+def test_an_anchor_of_nothing_but_symbols_is_refused(anchor: str) -> None:
+    """A symbol-only anchor folds BLANK, and a blank anchor covers everything.
+
+    The pre-map that keeps `™` from gluing onto its anchor also erases an anchor
+    that is nothing but symbols. Collapsing whitespace BEFORE the pre-map left
+    `_fold("™") == " "` — truthy — so the blank guard passed and `" " in haystack`
+    reported FULL coverage for an anchor nobody named on every multi-word row.
+    """
+    verdict = assess_sufficiency(
+        _rows("quarterly hiring fell across every region"),
+        anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.verdict == INSUFFICIENT
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
+@pytest.mark.parametrize("text", [
+    # The copula and its connectives attach to a consonant-final token. Narrowing
+    # the two-member stack to CASE+AUX silently dropped `이라` from the closed set
+    # and took these with it (1.0 -> 0.0): Korean writes `AI이라도`, not `AI라도`,
+    # after a consonant. The set is documented as additive, so this pins it.
+    "AI이라",
+    "AI이라도",
+    "AI이라야",
+    "AI이라 불리는 기술",
+])
+def test_the_copula_forms_are_kept(text: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=["AI"], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+
+@pytest.mark.parametrize("text", [
+    # DECORATED LETTERS glue, in every block. The enclosed-Latin supplement and
+    # the circled Hangul/Katakana sub-ranges must NOT be pre-mapped: they are
+    # letters, and the `NAME contains LATIN` branch is what catches them.
+    "ai🅐", "ai🅰", "ai㉠", "aiⒶ",
+    # ...and a decorated underscore behaves like `_`, a word character.
+    "ai＿", "ai︳",
+])
+def test_a_decorated_letter_or_underscore_still_glues(text: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=["AI"], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
 class _AttrRow:
     """A row in the ATTRIBUTE shape ``evidence_record`` documents as accepted."""
 

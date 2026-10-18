@@ -609,29 +609,36 @@ _FOLD_AS_SEPARATOR = frozenset().union(*(
         (0x213B, 0x213B),   # ℻             -> FAX
         (0x2150, 0x217F),   # fractions + Roman numerals
         (0x2189, 0x2189),   # ↉             -> 0/3
-        # CIRCLED/PARENTHESIZED DIGITS only (0x249C onwards are Latin LETTERS —
-        # `Ⓐ` is a decorated A, so it must keep gluing: `aiⒶ` stays 0.0).
+        # CIRCLED/PARENTHESIZED DIGITS only. From 0x249C on are Latin LETTERS:
+        # ① … ⑳, ⑴ … ⒇, ⒈ … ⒛ and ⓪ ⓫ … ⓴ are numerals, so they separate; `Ⓐ`
+        # and `🅐` are DECORATED LETTERS and must keep gluing (`aiⒶ`, `ai🅐` stay
+        # 0.0). For the same reason the enclosed-Latin block U+1F100–U+1F2FF is
+        # NOT pre-mapped: it is letters, and the `NAME contains LATIN` branch is
+        # what catches them. The underscore family (U+FF3F, U+FE33/FE34,
+        # U+FE4D–FE4F) is likewise absent, so a decorated `_` behaves like `_`.
         (0x2460, 0x249B),   # ① … ⑳, ⑴ … ⒇, ⒈ … ⒛
         (0x24EA, 0x24FF),   # ⓪ ⓫ … ⓴
-        (0x3250, 0x33FF),   # squared CJK abbreviations
-        (0x1F100, 0x1F2FF), # enclosed alphanumeric supplement
-        (0xFE33, 0xFE34),   # presentation-form underscores
-        (0xFE4D, 0xFE4F),   # dashed underscores
-        (0xFF3F, 0xFF3F),   # ＿             -> _
+        (0x3250, 0x325F),   # ㉐, ㉑ … ㊿ (circled 21–50)
+        (0x3300, 0x33FF),   # SQUARED CJK abbreviations
     )
 ))
 
 
 def _fold(text: str) -> str:
-    """Whitespace-collapse, symbol-separate, NFKC, casefold — the match form.
+    """Symbol-separate, whitespace-collapse, NFKC, casefold — the match form.
 
-    Order matters: the symbol pre-map runs BEFORE NFKC so a symbol can never
-    become a word character, and NFKC runs before casefold so the two operands
-    share one form (see ``_mentions`` for why NFKC and not NFC).
+    Order matters twice over. The pre-map runs BEFORE NFKC so a symbol can never
+    become a word character, and it runs before the whitespace collision so a
+    symbol-only string folds to ``""`` and is caught by the blank guard. NFKC
+    runs before casefold so the two operands share one form (see ``_mentions``
+    for why NFKC rather than NFC).
     """
-    spaced = "".join(
-        " " if ch in _FOLD_AS_SEPARATOR else ch for ch in " ".join(text.split()))
-    return unicodedata.normalize("NFKC", spaced).casefold()
+    spaced = "".join(" " if ch in _FOLD_AS_SEPARATOR else ch for ch in text)
+    # Collapse AFTER the pre-map: pre-mapping first turns a symbol-only string
+    # into blanks, and collapsing first let `_fold("™")` be `" "` — truthy, so the
+    # blank guard passed and `" " in haystack` reported FULL coverage for an
+    # anchor nobody named on every multi-word row.
+    return unicodedata.normalize("NFKC", " ".join(spaced.split())).casefold()
 
 
 #: Korean attaches case particles to the noun with NO space — `삼성전자는`,
@@ -650,7 +657,7 @@ _KO_CASE = frozenset({
     "께서", "과", "와", "로", "으로", "부터", "까지", "보다", "처럼", "로서",
     "으로서", "이랑", "랑", "나", "이나", "라도", "이면", "면", "므로",
     "이므로", "니까", "이니까", "지만", "이지만", "고", "이고", "며", "이며",
-    "라고", "이라고", "라는", "이라는", "란", "이란",
+    "라고", "이라고", "라는", "이라는", "란", "이란", "이라", "이라면", "이라야",
 })
 
 #: AUXILIARY particles, which may follow a case particle (`에서` + `도` = `에서도`).
