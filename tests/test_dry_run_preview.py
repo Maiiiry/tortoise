@@ -679,9 +679,11 @@ class TestBlastRadius:
         from tortoise.mcp_server import _preview_supersede
 
         # The independent read used by assertion 4 below. Defined here so it
-        # can be run BOTH before and after the write: it must report nothing
-        # at the successor before the supersede and exactly one edge after,
-        # which is what makes assertion 4 discriminating rather than vacuous.
+        # can be run BOTH before and after the write: it must match NOTHING
+        # before the supersede and exactly one edge after (the successor is one
+        # endpoint of the read in both directions — the source when the edge
+        # pointed away from `old`, the target when it pointed at `old`), which
+        # is what makes assertion 4 discriminating rather than vacuous.
         src, tgt = (new, other) if direction == "out" else (other, new)
 
         def _landed() -> list:
