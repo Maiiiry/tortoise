@@ -27,25 +27,32 @@ Every test drives the REAL installer end-to-end — a temporary copy with ONLY
 its ``SKILLS_BASE`` URL substituted for a local ``file://`` fixture — and
 asserts the bytes on disk plus the installer's own stdout, never source text.
 
-Mutations that turn these RED (each verified RED before merge):
-  * delete the version line from the emitted block        -> every version
-    assertion fails (nothing to grep, no upgrade branch);
+Mutations that turn these RED (each verified RED before merge, restored byte-exact):
+  * delete the version line from the emitted block        -> every version assertion
+    fails (nothing to grep, no upgrade branch);
   * blank the ``prev_version`` read                       -> the migration and
-    reinstall assertions fail (unversioned/already-current both misreport);
-  * make the "already current" branch unreachable         -> the reinstall test
-    fails (it must be a no-op AND say so);
-  * edit the block's TEXT without bumping the version      -> the prose pin
-    fails, which is the only thing that makes a stale
-    ``AGENTS_BLOCK_VERSION`` visible (cycle 1: the message came from the version
-    alone, so "already current" was printed while the body was rewritten);
-  * decide the pre-state with an unanchored match (the pre-fix ``grep -qF``)
-    -> the malformed-marker tests fail: the anchored split then finds no pair
-    and the block is duplicated while the report claims success.
+    reinstall assertions fail (unversioned / already-current both misreport);
+  * make the "already current" branch unreachable         -> the reinstall test fails;
+  * edit the block's TEXT without bumping the version      -> the prose pin fails
+    (the only thing that makes a stale ``AGENTS_BLOCK_VERSION`` visible);
+  * decide the pre-state with an unanchored match          -> the malformed tests
+    fail: the anchored split finds no pair and the block is duplicated;
+  * make ``near()`` return 1 for any mention               -> the prose test fails
+    (precision: quoting the marker is documentation, not a block);
+  * make ``_emit_fail`` RETURN instead of exit             -> the unreadable-file
+    test fails: ``cmd || helper`` is an errexit-exempt list, so a returning
+    helper lets the next statement run and the run reports SUCCESS at exit 0
+    over an untouched file;
+  * drop the mangled-marker detection                      -> the internal-spacing
+    test fails (that marker appended a second block);
+  * strip ALL CRs when comparing (instead of CRLF only)    -> the CR-inside-a-line
+    test fails (a real content change read as "already current").
 
-Cycle 1 also measured two pre-states the first revision got wrong in the OTHER
-direction: a version token in prose outside the block (read as "current"), and an
-older installer overwriting a newer block (reported as an "upgrade"). Both are
-tests here.
+Cycle 2 also measured a version token in prose outside the block (read as
+"current") and an older installer overwriting a newer block (called an
+"upgrade"); both are tests here. Cycle 3 measured the false-success path
+end-to-end: an unreadable ``AGENTS.md`` returned 0 and printed an "upgrade" the
+pre-PR installer would have failed closed on.
 """
 
 from __future__ import annotations
@@ -478,4 +485,102 @@ def test_a_numeric_version_that_does_not_compare_never_reads_as_current(tmp_path
     assert "already current" not in report, report
     assert "refreshed (v" not in report and "updated text" not in report, (
         f"a downgrade must never be reported as a text refresh:\n{report}")
-    assert "unreadable" in report, report
+    assert ("too large to compare" in report or "unreadable" in report), report
+
+
+# ── Cycle 3: fail-closed under a `||` wrapper, near() precision, mangled markers
+
+
+def test_an_unreadable_agents_file_fails_instead_of_reporting_success(tmp_path):
+    """`emit … || { exit 3; }` means bash does NOT apply errexit inside the
+    function, so an internal read failure used to be reported as a SUCCESSFUL
+    upgrade over an untouched file — the #3429 harm, at exit 0."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    agents = project / "AGENTS.md"
+    agents.write_text(LEGACY_BLOCK, encoding="utf-8")
+    agents.chmod(0o000)
+
+    try:
+        done = _run(installer, home, project)
+    finally:
+        agents.chmod(0o600)
+
+    if done.returncode == 0:
+        # Running as root makes the file readable anyway; nothing to assert.
+        import os as _os
+        if _os.geteuid() == 0:
+            return
+    assert done.returncode != 0, (
+        f"an unreadable AGENTS.md must fail, not report success:\n{done.stdout}")
+    assert "AGENTS.md" in (done.stderr + done.stdout)
+    # No success line at all: the failure is reported on stderr.
+    assert "✓ AGENTS.md" not in done.stdout, done.stdout
+
+
+def test_prose_mentioning_the_marker_is_not_a_marker(tmp_path):
+    """near() must be PRECISE: quoting the marker in prose is documentation, not
+    a block, and must neither refuse nor be treated as the block."""
+    agents_in = (
+        "- Our block delimiters are <!-- tortoise:start --> and <!-- tortoise:end -->.\n"
+        "- Foreign rule that must survive.\n"
+    )
+    done, agents = _install(tmp_path, agents_in)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert agents.startswith(agents_in), agents[:200]
+    # The prose keeps its mentions; what must appear exactly once is the block,
+    # i.e. markers on their OWN line.
+    own_line = [ln for ln in agents.splitlines() if ln in (START, END)]
+    assert own_line == [START, END], agents
+    assert "created" in _agents_report(done.stdout)
+
+
+def test_a_marker_with_different_internal_spacing_is_refused(tmp_path):
+    """`<!--  tortoise:start  -->` is a BROKEN marker, not prose: left as
+    `none` it appends and leaves the stale block first."""
+    legacy = LEGACY_BLOCK.replace(START, "<!--  tortoise:start  -->")
+    done, agents = _install(tmp_path, FOREIGN_BEFORE + legacy)
+
+    assert done.returncode == 3, f"must refuse, not append:\n{done.stdout}"
+    assert "MALFORMED" in done.stderr, done.stderr
+    assert "internal spacing" in done.stderr, done.stderr
+    assert agents.count("tortoise:start") == 1, agents
+
+
+def test_the_refusal_names_the_marker_counts(tmp_path):
+    """The docs say it prints how many and which markers — pin the shape."""
+    done, _agents = _install(tmp_path, LEGACY_BLOCK + "\n" + LEGACY_BLOCK)
+
+    assert done.returncode == 3
+    assert "start markers: 2" in done.stderr, done.stderr
+    assert "end markers: 2" in done.stderr, done.stderr
+    assert "ran twice" in done.stderr, done.stderr
+
+
+def test_a_cr_inside_a_line_is_a_real_difference(tmp_path):
+    """Only a CR immediately before the newline is an EOL difference. A CR in the
+    MIDDLE of a line is content, so the block must not read as current."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    assert _run(installer, home, project).returncode == 0
+
+    agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+    altered = agents.replace("agent memory", "agent\r memory", 1)
+    assert altered != agents
+    (project / "AGENTS.md").write_text(altered, encoding="utf-8")
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    report = _agents_report(done.stdout)
+    assert "already current" not in report, (
+        f"a CR inside a line is content, not an EOL difference:\n{report}")
+    assert "updated text" in report, report

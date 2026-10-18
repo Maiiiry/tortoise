@@ -548,17 +548,19 @@ migration case, a repo provisioned before versioning — `upgraded vM → vN`,
 installer is older than the block (a cached or rolled-back copy), the literal line
 `written at vN (the file had vM: this installer is OLDER than the block it
 replaced)`, so a downgrade is never announced as an upgrade. A version line that
-is not a number this shell can compare gets `… the file's version "vM" is
-unreadable …` instead of any claim about which is newer.
+is not a number (`v2-rc1`), or has more than 18 digits, gets
+`… "vM" is not a number this installer can compare …` / `… too large to compare
+safely …` instead of any claim about which is newer.
 `already current` is a statement about the TEXT — the block on disk is
 byte-identical to the one just built — not about the version number, so it is
 safe to trust.
 
 If the marker lines are not one clean pair — two copies, a stray marker, or one
-that is indented or has a trailing space — the installer prints
-`✗ AGENTS.md — the Tortoise block markers are MALFORMED`, names the marker lines
-it found, REFUSES rather than duplicating the block, and exits 3 (the skills ARE
-installed by then; only the block is not upgraded). Never hand-edit inside markers you did not
+that is indented, trailing-spaced, or carries different internal spacing — the
+installer prints `✗ AGENTS.md — the Tortoise block markers are MALFORMED` with
+`start markers: N (first at line L), end markers: M …` and the usual cause,
+REFUSES rather than duplicating the block, and exits 3 (the skills ARE installed
+by then; only the block is not upgraded). Never hand-edit inside markers you did not
 write; the next refresh discards it.
 
 ## 4. Verify, then checkpoint harness-connected

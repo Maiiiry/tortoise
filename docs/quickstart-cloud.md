@@ -123,10 +123,11 @@ on, and what it did to get there:
 | `upgraded (unversioned → vN)` | provisioned before versions existed — this is the migration |
 | `upgraded vM → vN` | an older block was replaced |
 | `refreshed (vN — same version, updated text)` | the version matched but the text did not |
-| `already current` | the block on disk is byte-identical to the one just built |
+| `already current` | the block on disk is byte-identical to the one just built, ignoring line endings (CRLF vs LF) |
 | `written at vN (the file had vM …)` | your installer is OLDER than the block (a cached or rolled-back copy) — it says so instead of calling a downgrade an upgrade |
-| `written at vN (the file's version "vM" is unreadable …)` | the version line was malformed (not a number this shell can compare); nothing is claimed about which is newer |
-| `MALFORMED … NOT rewritten` | the marker lines are not one clean start→end pair (two copies, a stray marker, or an indented/trailing-space one); it refuses rather than duplicate the block, prints how many and which markers it found, and exits 3 — the SKILLS are installed at that point, only the block is not |
+| `written at vN (the file's version "vM" is not a number this installer can compare …)` | the version line was malformed (e.g. `v2-rc1`); nothing is claimed about which is newer |
+| `written at vN (… "vM" is too large to compare safely)` | the version has more than 18 digits |
+| `MALFORMED … NOT rewritten` | the marker lines are not one clean start→end pair — two copies, a stray marker, one that is indented / trailing-spaced / BOM-prefixed, or one with different internal spacing; it refuses rather than duplicate the block, prints `start markers: N (first at line L), end markers: M …` plus the usual cause, and exits 3 — the SKILLS are installed at that point, only the block is not |
 
 `already current` is a statement about the **text**, not the version number, so it is safe to trust. To see what
 you have without changing anything:
