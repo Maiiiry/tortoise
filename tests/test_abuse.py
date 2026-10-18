@@ -335,6 +335,54 @@ class TestEpisodeLifecycle:
         assert len(ip_events) == 10  # cap-before-record
 
 
+# ── The durable un-suspend's rule list, read from the LIVE definition ──────
+# ``abuse_unsuspend`` is defined more than once (0015 for teams →
+# 20260915000001 for orgs) and supabase applies migrations in FILENAME ORDER,
+# so the definition production runs is the LAST ``CREATE [OR REPLACE]
+# FUNCTION public.abuse_unsuspend`` in ``sorted(migrations.glob("*.sql"))``.
+# Same idiom as tests/test_4242_metering_period_end_refresh.py's
+# ``_newest_definition`` and tests/test_embed_metering.py's every-migration
+# walk — a guard pinned to ONE named file is green in the wrong direction after
+# the next forward migration (#4874 review P2).
+_MIGRATIONS = (Path(__file__).resolve().parent.parent / "supabase"
+               / "migrations")
+
+_CREATE_UNSUSPEND_RE = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+public\.abuse_unsuspend\s*\(")
+
+
+def _newest_abuse_unsuspend_definition(
+        migrations: Path = _MIGRATIONS) -> tuple[Path, str]:
+    """The newest migration defining ``public.abuse_unsuspend`` and the body
+    of its LAST declaration, from the ``CREATE`` to the ``$$;`` that closes it.
+
+    Raises ``AssertionError`` when nothing in the tree defines it, so the
+    caller cannot pass vacuously.
+    """
+    hits: list[tuple[Path, str]] = []
+    for path in sorted(migrations.glob("*.sql")):
+        text = path.read_text()
+        if _CREATE_UNSUSPEND_RE.search(text):
+            hits.append((path, text))
+    assert hits, (f"no migration in {migrations} defines public.abuse_unsuspend "
+                  "— the durable un-suspend path moved and this guard reads "
+                  "nothing (it must fail loudly, never silently)")
+    path, sql = hits[-1]
+    start = 0
+    for match in _CREATE_UNSUSPEND_RE.finditer(sql):
+        start = match.start()
+    tail = sql[start:]
+    end = tail.find("$$;")
+    assert end != -1, (f"unterminated $$ body for public.abuse_unsuspend in "
+                       f"{path.name}")
+    return path, tail[:end]
+
+
+def _flag_clear_rules(body: str) -> set[str]:
+    """The rules a plpgsql ``abuse_unsuspend`` body writes ``flag_clear`` for."""
+    return set(re.findall(r"'flag_clear',\s*'([^']+)'", body))
+
+
 class TestActiveFlagEpisodes:
     """#4874 — the reason behind an org's ``flagged`` chip is readable.
 
@@ -464,33 +512,98 @@ class TestActiveFlagEpisodes:
         writes the ``flag_clear`` rows itself — Python cannot inject
         ``FLAGGING_RULES`` into it.
 
-        So adding a rule to the tuple without adding it to that migration
-        would end the episode for ``MemoryAbuseStore`` (selfhost) and never
-        for ``SupabaseAbuseStore`` (production): the org-level chip outliving
-        its reason, which is the failure the tuple was introduced to prevent.
-        This test reads the migration and fails when the two lists drift.
+        So adding a rule to the tuple without adding it to the LIVE definition
+        would end the episode for ``MemoryAbuseStore`` (selfhost) and never for
+        ``SupabaseAbuseStore`` (production): the org-level chip outliving its
+        reason, which is the failure the tuple was introduced to prevent.
+
+        The LIVE definition is the LAST ``CREATE ... FUNCTION
+        public.abuse_unsuspend`` in filename order — supabase applies every
+        migration in order and a later ``CREATE OR REPLACE`` replaces an
+        earlier one. This function is already re-established once (``0015``
+        for teams → ``20260915000001`` for orgs), so reading one hand-picked
+        file would be wrong in BOTH directions (#4874 review P2): a forward
+        migration that redefines it and drops a rule would stay green, and a
+        correctly-updated forward migration would stay red while the failure
+        message pointed at a SHIPPED file the append-only gate forbids editing.
         """
         from tortoise.abuse import FLAGGING_RULES
-        migration = (Path(__file__).resolve().parent.parent / "supabase"
-                     / "migrations"
-                     / "20260915000001_tenancy_team_to_org.sql")
-        assert migration.exists(), (
-            f"{migration} is gone — the durable un-suspend's rule list moved "
-            "and this guard no longer reads it")
-        sql = migration.read_text()
-        body_start = sql.find("FUNCTION public.abuse_unsuspend")
-        assert body_start != -1, ("abuse_unsuspend is not in the migration — "
-                                 "the durable un-suspend path moved")
-        body = sql[body_start:sql.find("$$;", body_start)]
-        cleared = set(re.findall(r"'flag_clear',\s*'([^']+)'", body))
-        assert cleared, ("no 'flag_clear' rows found in abuse_unsuspend — the "
-                         "guard's regex no longer matches the SQL")
+        path, body = _newest_abuse_unsuspend_definition(_MIGRATIONS)
+        cleared = _flag_clear_rules(body)
+        assert cleared, (f"no 'flag_clear' rows found in abuse_unsuspend in "
+                         f"{path.name} — the guard's regex no longer matches "
+                         "the SQL, so it could pass vacuously")
         assert cleared == set(FLAGGING_RULES), (
             "abuse_unsuspend clears a different rule set than "
-            f"abuse.FLAGGING_RULES (SQL={sorted(cleared)}, "
+            f"abuse.FLAGGING_RULES (SQL={sorted(cleared)} in {path.name} — the "
+            f"NEWEST definition, which is what production runs; "
             f"Python={sorted(FLAGGING_RULES)}): a rule in one and not the "
             "other either keeps an episode open forever after an un-suspend "
-            "or clears one that was never opened")
+            "or clears one that was never opened. Fix it with a FORWARD "
+            "migration that redefines abuse_unsuspend — never by editing a "
+            "migration already on main (the append-only gate rejects that)")
+
+    def test_the_newest_definition_is_the_one_guarded(self, tmp_path):
+        """#4874 review P2 (non-vacuity + both directions): the guard must
+        read the NEWEST ``abuse_unsuspend`` definition, not one chosen file.
+
+        A guard pinned to a single named migration is green in the wrong
+        direction — a forward migration that redefines ``abuse_unsuspend`` and
+        drops a rule leaves it passing while production drifts — and red in
+        the wrong direction too, since the file it names is on ``main`` and the
+        append-only gate forbids editing it.
+        """
+        old = tmp_path / "0015_abuse_events.sql"
+        new = tmp_path / "20260915000001_tenancy_team_to_org.sql"
+        old.write_text(
+            "CREATE OR REPLACE FUNCTION public.abuse_unsuspend(p_team_id text)\n"
+            "AS $$\nBEGIN\n"
+            "    INSERT INTO public.abuse_events (team_id, event_type, rule)\n"
+            "    VALUES (p_team_id, 'flag_clear', 'point_create'),\n"
+            "           (p_team_id, 'flag_clear', 'key_create');\n"
+            "END;\n$$;\n")
+        new.write_text(
+            "CREATE OR REPLACE FUNCTION public.abuse_unsuspend(p_org_id text)\n"
+            "AS $$\nBEGIN\n"
+            "    INSERT INTO public.abuse_events (org_id, event_type, rule)\n"
+            "    VALUES (p_org_id, 'flag_clear', 'point_create');\n"
+            "END;\n$$;\n")
+        path, body = _newest_abuse_unsuspend_definition(tmp_path)
+        assert path.name == new.name, (
+            "the guard must read the definition production runs (the newest "
+            f"migration), not an earlier one — got {path.name}")
+        # Direction 1: a forward migration that DROPS a rule is caught. This is
+        # the assertion a hardcoded-path guard cannot make: it would still see
+        # both rules in the old file and stay green.
+        cleared = _flag_clear_rules(body)
+        assert cleared == {"point_create"}, cleared
+        assert cleared != {"point_create", "key_create"}, (
+            "a superseded definition's rule set must not satisfy the guard — "
+            "that is the drift it exists to catch")
+        # Direction 2: the reverse (forward migration adds the rule the old
+        # file lacks) resolves green instead of red against a shipped file.
+        new.write_text(
+            "CREATE OR REPLACE FUNCTION public.abuse_unsuspend(p_org_id text)\n"
+            "AS $$\nBEGIN\n"
+            "    INSERT INTO public.abuse_events (org_id, event_type, rule)\n"
+            "    VALUES (p_org_id, 'flag_clear', 'point_create'),\n"
+            "           (p_org_id, 'flag_clear', 'key_create'),\n"
+            "           (p_org_id, 'flag_clear', 'r3_new_rule');\n"
+            "END;\n$$;\n")
+        _path, body = _newest_abuse_unsuspend_definition(tmp_path)
+        assert _flag_clear_rules(body) == {"point_create", "key_create",
+                                           "r3_new_rule"}
+
+    def test_a_migrations_dir_without_abuse_unsuspend_is_loud(self, tmp_path):
+        """The guard must not pass vacuously if the function disappears from
+        the migration tree (renamed, moved into a non-``.sql`` file, or the
+        directory read wrong)."""
+        (tmp_path / "0015_unrelated.sql").write_text(
+            "CREATE OR REPLACE FUNCTION public.something_else()\n"
+            "AS $$ BEGIN END; $$;\n")
+        with pytest.raises(AssertionError,
+                           match=r"defines public\.abuse_unsuspend"):
+            _newest_abuse_unsuspend_definition(tmp_path)
 
     # ── Registry/selfhost: the durable source, not the in-process dict ──────
 

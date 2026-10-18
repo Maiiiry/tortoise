@@ -105,5 +105,11 @@ MCP `-32006`). A flag is: the stage-1 clock the stage-2 review alert anchors
 against, the `status` chip, and one operator alert. It is cleared by a clean
 window (`flag_clear`) or an un-suspend — nothing else, and for the durable
 store that last path is the `abuse_unsuspend` SQL function, so
-`abuse.FLAGGING_RULES` and that function's rule list must be kept in step
-(guarded by `tests/test_abuse.py::test_durable_unsuspend_clears_every_flagging_rule`).
+`abuse.FLAGGING_RULES` and that function's rule list must be kept in step.
+The function is defined more than once (supabase applies migrations in
+filename order, so the LAST `CREATE OR REPLACE` is what runs): add the rule to
+a FORWARD migration that redefines `abuse_unsuspend`, never by editing one
+already on `main`. Guarded, in both directions, by
+`tests/test_abuse.py::test_durable_unsuspend_clears_every_flagging_rule`
+(which reads the newest definition) and
+`::test_the_newest_definition_is_the_one_guarded`.

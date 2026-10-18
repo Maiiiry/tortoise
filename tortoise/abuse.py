@@ -121,13 +121,23 @@ ALERT_TYPES = (EVENT_FLAG, EVENT_REVIEW, EVENT_SUSPEND, EVENT_AUTH_IP,
 #:
 #: ⚠️ There is a SECOND copy of this set that Python cannot reach: the durable
 #: un-suspend is the plpgsql function ``abuse_unsuspend``, whose body writes the
-#: ``flag_clear`` rows itself (``supabase/migrations/
-#: 20260915000001_tenancy_team_to_org.sql``). So a rule added HERE must also be
-#: added THERE, or ``SupabaseAbuseStore.unsuspend_org`` leaves that rule's
-#: episode open forever while the memory store ends it — the exact divergence
-#: this tuple exists to prevent. The coupling is guarded by
+#: ``flag_clear`` rows itself. So a rule added HERE must also be added THERE, or
+#: ``SupabaseAbuseStore.unsuspend_org`` leaves that rule's episode open forever
+#: while the memory store ends it — the exact divergence this tuple exists to
+#: prevent.
+#:
+#: THERE is the NEWEST migration defining ``abuse_unsuspend``, not one named
+#: file: the function is already re-established once (``0015_abuse_events.sql``
+#: for teams → ``20260915000001_tenancy_team_to_org.sql`` for orgs) and supabase
+#: applies migrations in filename order, so a later ``CREATE OR REPLACE``
+#: replaces an earlier one. Add a FORWARD migration that redefines it — never
+#: edit a migration already on ``main`` (the append-only gate rejects that, and
+#: a guard pinned to a shipped file would then red while pointing at an
+#: un-editable artifact). The coupling is guarded by
 #: ``tests/test_abuse.py::test_durable_unsuspend_clears_every_flagging_rule``,
-#: which reads the migration and fails when the two lists drift.
+#: which resolves the newest definition and fails when the two lists drift in
+#: either direction (a rule added to this tuple, or one dropped by a forward
+#: migration).
 FLAGGING_RULES = (EVENT_POINT_CREATE, EVENT_KEY_CREATE)
 
 #: How many rows the durable store reads PER flagging rule when folding the
