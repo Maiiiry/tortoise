@@ -23,11 +23,13 @@ Two verbs against ONE declaration (``tortoise/cost_dimensions.py``):
     2. **ledger** — every declared column and SQL RPC exists in the EFFECTIVE schema
        the migrations leave behind: the corpus is replayed in order, so
        ``CREATE TABLE`` bodies, ``ALTER TABLE … ADD COLUMN``, ``RENAME COLUMN``,
-       ``DROP COLUMN``, ``CREATE FUNCTION``, ``ALTER FUNCTION … RENAME TO`` and
-       ``DROP FUNCTION`` all move the end state. A column renamed in an appended
-       migration and not in the declaration fails here, and so does an RPC renamed
-       by ``ALTER FUNCTION … RENAME TO`` or dropped by ``DROP FUNCTION``. Nothing
-       is matched as a substring or inside a SQL comment.
+       ``DROP COLUMN``, ``RENAME TO``, ``DROP TABLE``, ``CREATE FUNCTION``,
+       ``ALTER FUNCTION … RENAME TO`` and ``DROP FUNCTION`` all move the end state
+       (every command in a multi-command ``ALTER TABLE`` included, not only the
+       first). A column renamed in an appended migration and not in the declaration
+       fails here, and so does an RPC renamed by ``ALTER FUNCTION … RENAME TO`` or
+       dropped by ``DROP FUNCTION``. Nothing is matched as a substring or inside a
+       SQL comment.
     3. **no dead hook** — a dimension's writer (or reader, when the read path is
        the primitive) must have a call site in a tracked NON-TEST, NON-TOOL file,
        or the declaration must carry ``unscheduled_reason``. #4493's defect was a
@@ -280,14 +282,21 @@ _CREATE_TABLE = re.compile(
 _ALTER_TABLE = re.compile(
     rf"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:public\.)?"
     rf"({_IDENT})\s+(.*)$", re.IGNORECASE | re.DOTALL)
-_ADD_COLUMN = re.compile(
-    rf"\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})", re.IGNORECASE)
-_RENAME_COLUMN = re.compile(
-    rf"^\s*RENAME\s+COLUMN\s+({_IDENT})\s+TO\s+({_IDENT})", re.IGNORECASE)
-_DROP_COLUMN = re.compile(
-    rf"^\s*DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?({_IDENT})", re.IGNORECASE)
-_RENAME_TABLE = re.compile(
-    rf"^\s*RENAME\s+TO\s+({_IDENT})", re.IGNORECASE)
+#: EVERY verb a single ``ALTER TABLE`` statement can carry, matched in source order.
+#: One statement may list several (``DROP COLUMN a, ADD COLUMN b, RENAME COLUMN c
+#: TO d``); applying only the FIRST one left the rest of the statement invisible,
+#: which is the same stale-declaration fail-open the replay exists to close, one
+#: command further in. Alternatives are ordered so ``RENAME COLUMN`` wins over the
+#: shorter ``RENAME TO`` prefix.
+_ALTER_TABLE_VERB = re.compile(
+    rf"\bRENAME\s+COLUMN\s+({_IDENT})\s+TO\s+({_IDENT})"
+    rf"|\bRENAME\s+TO\s+({_IDENT})"
+    rf"|\bDROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?({_IDENT})"
+    rf"|\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})",
+    re.IGNORECASE)
+_DROP_TABLE = re.compile(
+    rf"^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:public\.)?({_IDENT})",
+    re.IGNORECASE)
 _CREATE_FUNCTION = re.compile(
     rf"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:public\.)?({_IDENT})\s*\(",
     re.IGNORECASE)
@@ -315,6 +324,11 @@ class _Schema:
     so a name dropped and later re-created is present (the order in the corpus is
     drop-then-create); a name dropped LAST is drift, which is the answer the
     ledger needs.
+
+    Every verb moves the end state, not just the first one in a statement: a
+    single ``ALTER TABLE`` may carry several commands, and a ``DROP TABLE`` takes
+    the columns it held with it. Missing either left a column that the schema no
+    longer has reading as present — the stale-declaration fail-open.
     """
 
     columns: dict[str, set[str]]
@@ -353,28 +367,29 @@ def _effective_schema(sql: str) -> _Schema:
             functions.discard(_table_name(alter_function.group(1)))
             functions.add(_table_name(alter_function.group(2)))
             continue
+        drop_table = _DROP_TABLE.match(statement)
+        if drop_table:
+            columns.pop(_table_name(drop_table.group(1)), None)
+            continue
         alter_table = _ALTER_TABLE.match(statement)
         if not alter_table:
             continue
         table = _table_name(alter_table.group(1))
-        rest = alter_table.group(2)
         cols = columns.setdefault(table, set())
-        rename_column = _RENAME_COLUMN.match(rest)
-        if rename_column:
-            cols.discard(_table_name(rename_column.group(1)))
-            cols.add(_table_name(rename_column.group(2)))
-            continue
-        drop_column = _DROP_COLUMN.match(rest)
-        if drop_column:
-            cols.discard(_table_name(drop_column.group(1)))
-            continue
-        rename_table = _RENAME_TABLE.match(rest)
-        if rename_table:
-            moved = columns.pop(table, set())
-            columns.setdefault(_table_name(rename_table.group(1)), set()).update(moved)
-            continue
-        for add in _ADD_COLUMN.finditer(rest):
-            cols.add(_table_name(add.group(1)))
+        for verb in _ALTER_TABLE_VERB.finditer(alter_table.group(2)):
+            renamed_from, renamed_to, new_table, dropped, added = verb.groups()
+            if renamed_from:
+                cols.discard(_table_name(renamed_from))
+                cols.add(_table_name(renamed_to))
+            elif new_table:
+                moved = columns.pop(table, set())
+                table = _table_name(new_table)
+                cols = columns.setdefault(table, set())
+                cols.update(moved)
+            elif dropped:
+                cols.discard(_table_name(dropped))
+            else:
+                cols.add(_table_name(added))
     return _Schema(columns, functions)
 
 

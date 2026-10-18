@@ -72,11 +72,13 @@ declares the limit instead of inventing one.
 2. **ledger** — every declared column and SQL function exists in the **effective end
    state** of the migrations, not merely somewhere in their history. The corpus is replayed
    in filename order, so `CREATE TABLE` bodies, `ALTER TABLE … ADD COLUMN`, `RENAME
-   COLUMN`, `DROP COLUMN`, `CREATE [OR REPLACE] FUNCTION public.<name>(`, `ALTER FUNCTION
-   … RENAME TO` and `DROP FUNCTION` all move the end state — which is how this repo
-   renames things (`20260915000001_tenancy_team_to_org.sql` appends the rename and leaves
-   the earlier files' historical `team` spelling untouched). Nothing is matched as a bare
-   substring and nothing inside a SQL comment, so prose that names the old symbol does not
+   COLUMN`, `DROP COLUMN`, `RENAME TO`, `DROP TABLE`, `CREATE [OR REPLACE] FUNCTION
+   public.<name>(`, `ALTER FUNCTION … RENAME TO` and `DROP FUNCTION` all move the end
+   state — every command in a multi-command `ALTER TABLE`, not only the first — which is
+   how this repo renames things (`20260915000001_tenancy_team_to_org.sql` appends the
+   rename and leaves the earlier files' historical `team` spelling untouched). Nothing is
+   matched as a bare substring and nothing inside a SQL comment, so prose that names the
+   old symbol does not
    pass. **Declared delay:** a PR that edits only a migration outside the metering set does
    not select this test (the diff selector does not map `supabase/` to a surface), so such a
    drift is caught by the next `core`/`api` PR rather than by the migration PR itself.

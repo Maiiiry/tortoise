@@ -357,6 +357,57 @@ def test_a_column_renamed_by_an_APPENDED_migration_is_drift(tmp_path):
     assert not any("embed_call_count" in f for f in findings), findings
 
 
+def test_every_command_in_a_multi_command_alter_table_moves_the_end_state():
+    """MUTATION: a single ``ALTER TABLE`` may carry several verbs.
+
+    Postgres allows ``DROP COLUMN a, ADD COLUMN b, RENAME COLUMN c TO d`` in ONE
+    statement. Applying only the FIRST command left the rest invisible: the added
+    column read as absent and the renamed-away one as present — a stale
+    declaration stays green in both directions, which is the same fail-open the
+    replay closes for append-only migrations, one command further in.
+    """
+    sql = textwrap.dedent("""
+        ALTER TABLE public.metering_records
+            ADD COLUMN embed_calls bigint,
+            ADD COLUMN embed_tokens bigint,
+            ADD COLUMN embed_dropped bigint;
+        ALTER TABLE public.metering_records
+            DROP COLUMN embed_dropped,
+            RENAME COLUMN embed_tokens TO embed_token_count;
+    """)
+    assert audit._creates_column(sql, "embed_calls") is True
+    assert audit._creates_column(sql, "embed_token_count") is True
+    assert audit._creates_column(sql, "embed_dropped") is False
+    assert audit._creates_column(sql, "embed_tokens") is False
+
+
+def test_a_dropped_table_takes_its_columns_with_it(tmp_path):
+    """MUTATION: ``DROP TABLE`` removes the columns it held.
+
+    The replay tracked columns per table but never dropped a table, so a column
+    created only on a table the corpus later drops stayed "present" for good —
+    a declaration about a table that no longer exists stayed green. The live
+    column on the surviving table must still be found, so this is not a predicate
+    that simply says no.
+    """
+    root = _migration_root(tmp_path, textwrap.dedent("""
+        CREATE TABLE public.metering_retired (
+          embed_dropped bigint
+        );
+        CREATE TABLE public.metering_live (
+          embed_calls bigint
+        );
+        DROP TABLE IF EXISTS public.metering_retired;
+    """))
+    sql = audit.migration_text(root)
+    assert audit._creates_column(sql, "embed_dropped") is False
+    assert audit._creates_column(sql, "embed_calls") is True
+    with _declaring(_mutated("egress", columns=("embed_dropped", "embed_calls"))):
+        findings = audit.check_ledger(root)
+    assert any("'embed_dropped'" in f for f in findings), findings
+    assert not any("'embed_calls'" in f for f in findings), findings
+
+
 def test_an_rpc_renamed_or_dropped_by_an_APPENDED_migration_is_drift(tmp_path):
     """MUTATION: the RPC twin — the end state, not the historical ``CREATE``.
 
