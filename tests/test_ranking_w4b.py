@@ -871,12 +871,14 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert two_req <= ceiling + 1e-6, (
         f"the 2-row requirement is {two_req:.4f}, ABOVE its ceiling "
         f"{ceiling:.4f} — then it is not bounded by the page after all")
-    # A WEIGHTS pin rather than a payload read (|d_gb| = 0 on this page, which
-    # the parity assertion above already guarantees): it fails if the ranker's
-    # weights move, or if the twins stop sharing a baseline — the parity
-    # assertion above catches the latter first, with a message that names it.
-    # It is here so the 1.857 the comment quotes cannot drift away from the
-    # band this test enforces.
+    # A RATIO pin rather than a payload read.  The pinned quantity is
+    # ``(sim_w + rec_w)/graph_w`` with ``|d_gb| = 0`` (which the parity
+    # assertion above guarantees), so it catches any weight move that changes
+    # that ratio — a sum-preserving redistribution that keeps it fixed slips
+    # through HERE and is caught by the ``required_cb`` pins further down — and
+    # it also fails if the twins stop sharing a baseline, which the parity
+    # assertion above catches first, with a message that names it.  It is here
+    # so the 1.857 the comment quotes cannot drift away from this band.
     assert ceiling == pytest.approx(1.857, abs=1e-3), (
         f"the comment quotes 1.857 as the ceiling at |d_gb| = 0; this page's "
         f"|d_gb| = {abs(two_gb_calm - two_gb_hot):.4f} puts it at "
