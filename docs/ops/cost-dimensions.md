@@ -67,15 +67,19 @@ declares the limit instead of inventing one.
 
 1. **bindings** — every declared writer/reader resolves and is callable; every declared
    metric emits *exactly* its declared family name and label set (a label gained or lost,
-   or a family renamed, is a series change).
-2. **ledger** — every declared column is created by a tracked migration and every declared
-   SQL function is defined by one, both in DDL position (`ALTER TABLE … ADD COLUMN`,
-   `CREATE [OR REPLACE] FUNCTION public.<name>(`) — never a bare substring and never
-   inside a SQL comment, so an `ALTER FUNCTION … RENAME TO` or a header comment that names
-   the old symbol does not pass. **Declared delay:** a PR that edits only a migration
-   outside the metering set does not select this test (the diff selector does not map
-   `supabase/` to a surface), so such a drift is caught by the next `core`/`api` PR rather
-   than by the migration PR itself.
+   or a family renamed, is a series change). A `metric` binding that declares **no** family
+   is drift, not a skip: an incomplete declaration says nothing about the series it names.
+2. **ledger** — every declared column and SQL function exists in the **effective end
+   state** of the migrations, not merely somewhere in their history. The corpus is replayed
+   in filename order, so `CREATE TABLE` bodies, `ALTER TABLE … ADD COLUMN`, `RENAME
+   COLUMN`, `DROP COLUMN`, `CREATE [OR REPLACE] FUNCTION public.<name>(`, `ALTER FUNCTION
+   … RENAME TO` and `DROP FUNCTION` all move the end state — which is how this repo
+   renames things (`20260915000001_tenancy_team_to_org.sql` appends the rename and leaves
+   the earlier files' historical `team` spelling untouched). Nothing is matched as a bare
+   substring and nothing inside a SQL comment, so prose that names the old symbol does not
+   pass. **Declared delay:** a PR that edits only a migration outside the metering set does
+   not select this test (the diff selector does not map `supabase/` to a surface), so such a
+   drift is caught by the next `core`/`api` PR rather than by the migration PR itself.
 3. **no dead hook** — a dimension's writer must be referenced from a tracked **non-test**
    file *that is not a developer instrument* (`tools/`, `battery/`, `graph-scripts/` are
    excluded), or the declaration must state why it has no schedule. #4493's defect was a

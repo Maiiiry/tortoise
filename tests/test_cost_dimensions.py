@@ -92,6 +92,19 @@ def migration_sql() -> str:
     return audit.migration_text(_ROOT)
 
 
+def _migration_root(root: Path, *migrations: str) -> Path:
+    """A throwaway repo root whose ``supabase/migrations`` holds *migrations*.
+
+    Files are numbered so they replay in the order given, which is what an
+    APPENDED rename/drop depends on (the corpus is ordered, not a set).
+    """
+    migdir = root / "supabase" / "migrations"
+    migdir.mkdir(parents=True, exist_ok=True)
+    for i, sql in enumerate(migrations, start=1):
+        (migdir / f"{i:04d}_corpus.sql").write_text(sql, encoding="utf-8")
+    return root
+
+
 # ── 1. completeness ──────────────────────────────────────────────────────
 
 
@@ -277,6 +290,106 @@ def test_an_rpc_named_only_in_a_grant_or_rename_is_not_a_definition():
     assert audit._defines_function(migration_sql(), "metering_increment_embedding") is True
 
 
+def test_a_bare_name_type_line_outside_a_create_table_is_not_a_definition():
+    """MUTATION: only a real ``CREATE TABLE`` body defines a column.
+
+    The second arm used to be ``^\\s*<name>\\s+<type>`` under ``re.MULTILINE`` over
+    the WHOLE concatenated corpus, so ``^`` was any line start with no
+    ``CREATE TABLE`` context at all — while three documents promised a definition
+    inside a ``CREATE TABLE`` body. Two shapes this repo writes satisfy the old
+    arm and create nothing: a plpgsql ``DECLARE`` variable
+    (``0014_metering_records.sql``, ``0010_provisioning_rpcs.sql``) and a
+    ``RETURNS TABLE (`` output column
+    (``20260927000001_metering_unmetered_increments.sql``). Latent rather than live
+    only because every declared column is matched by an ``ADD COLUMN`` today.
+    """
+    declare = textwrap.dedent("""
+        DECLARE
+          nodes_written integer;
+        BEGIN
+        END;
+    """)
+    returns_table = textwrap.dedent("""
+        RETURNS TABLE (
+          nodes_written bigint
+        )
+    """)
+    assert audit._creates_column(declare, "nodes_written") is False
+    assert audit._creates_column(returns_table, "nodes_written") is False
+    # ... and the anchoring must not break the real thing, constraints included:
+    create = textwrap.dedent("""
+        CREATE TABLE IF NOT EXISTS public.metering_nodes (
+          org_id uuid NOT NULL,
+          nodes_written bigint NOT NULL DEFAULT 0,
+          tags jsonb,
+          PRIMARY KEY (org_id)
+        );
+    """)
+    assert audit._creates_column(create, "nodes_written") is True
+    assert audit._creates_column(create, "org_id") is True
+    assert audit._creates_column(create, "PRIMARY") is False
+
+
+def test_a_column_renamed_by_an_APPENDED_migration_is_drift(tmp_path):
+    """MUTATION: the corpus is REPLAYED, so an append-only RENAME is drift.
+
+    This repo expresses a rename as a NEW migration appended after the one that
+    created the column (``20260915000001_tenancy_team_to_org.sql``: "Earlier
+    migrations keep their historical `team` spelling and are untouched: they run
+    first, this migration renames the end state"). A history-only predicate keeps
+    matching the earlier file's ``ADD COLUMN`` FOREVER, so the stale declaration
+    stayed green on a column the schema no longer has.
+    """
+    root = _migration_root(
+        tmp_path,
+        "ALTER TABLE public.metering_records\n    ADD COLUMN embed_calls bigint;",
+        "ALTER TABLE public.metering_records\n    RENAME COLUMN embed_calls TO embed_call_count;",
+        "ALTER TABLE public.metering_records\n    ADD COLUMN embed_dropped bigint;",
+        "ALTER TABLE public.metering_records\n    DROP COLUMN embed_dropped;",
+    )
+    sql = audit.migration_text(root)
+    assert audit._creates_column(sql, "embed_calls") is False
+    assert audit._creates_column(sql, "embed_call_count") is True
+    assert audit._creates_column(sql, "embed_dropped") is False
+    with _declaring(_mutated("egress", columns=("embed_calls", "embed_call_count"))):
+        findings = audit.check_ledger(root)
+    assert any("'embed_calls'" in f for f in findings), findings
+    assert not any("embed_call_count" in f for f in findings), findings
+
+
+def test_an_rpc_renamed_or_dropped_by_an_APPENDED_migration_is_drift(tmp_path):
+    """MUTATION: the RPC twin — the end state, not the historical ``CREATE``.
+
+    ``DROP FUNCTION IF EXISTS public.metering_increment(text, text, integer)``
+    followed by a NEW ``CREATE`` is the repo's live pattern
+    (``20260813000002_metering_nodes_written.sql``), and
+    ``20260915000001`` drops the pre-org signature outright. A rename is a
+    rename whichever verb writes it.
+    """
+    root = _migration_root(
+        tmp_path,
+        "CREATE OR REPLACE FUNCTION public.metering_increment_embedding(\n"
+        "  p_org text\n) RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;",
+        "CREATE OR REPLACE FUNCTION public.metering_increment_retrieval(\n"
+        "  p_org text\n) RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;",
+        "ALTER FUNCTION public.metering_increment_embedding(text)\n"
+        "    RENAME TO metering_increment_embedding_v2;",
+        "DROP FUNCTION IF EXISTS public.metering_increment_retrieval(text);",
+    )
+    sql = audit.migration_text(root)
+    assert audit._defines_function(sql, "metering_increment_embedding") is False
+    assert audit._defines_function(sql, "metering_increment_embedding_v2") is True
+    assert audit._defines_function(sql, "metering_increment_retrieval") is False
+    with _declaring(_mutated(
+            "retrieval",
+            columns=(),
+            rpcs=("metering_increment_retrieval",
+                  "metering_increment_embedding_v2"))):
+        findings = audit.check_ledger(root)
+    assert any("'metering_increment_retrieval'" in f for f in findings), findings
+    assert not any("metering_increment_embedding_v2" in f for f in findings), findings
+
+
 def test_a_renamed_cap_constant_is_drift():
     """MUTATION: a cap attribute that no longer resolves is reported."""
     broken = _mutated(
@@ -331,6 +444,28 @@ def test_declared_metric_labels_match_the_live_metric():
     with _declaring(dataclasses.replace(dim, bindings=(wrong, *others)), *rest):
         findings = audit.check_bindings()
     assert any("carries labels" in f for f in findings), findings
+
+
+def test_a_metric_binding_without_a_declared_family_is_drift():
+    """MUTATION: an UNDECLARED family is drift, not a skip.
+
+    ``Binding.family`` defaults to ``""`` and nothing required a ``METRIC`` binding
+    to declare one, so the family half of the check was guarded behind ``if
+    binding.family and family != binding.family``: a new dimension that named a
+    metric without ``family=`` got a clean ``matrix`` with its family UNVERIFIED —
+    and a renamed family (every dashboard's selector) read as "no drift". The
+    label half was never optional, and neither may this one be.
+    """
+    dim = cd.by_name("egress")
+    no_family = dataclasses.replace(
+        next(b for b in dim.metrics() if b.attr == "EGRESS_BYTES"), family="")
+    others = tuple(b for b in dim.bindings if b.attr != "EGRESS_BYTES")
+    rest = tuple(d for d in cd.DIMENSIONS if d.name != "egress")
+    with _declaring(dataclasses.replace(dim, bindings=(no_family, *others)), *rest):
+        findings = audit.check_bindings()
+    assert any("declares no family" in f for f in findings), findings
+    # Every declared metric binding DOES declare its family (the other direction):
+    assert audit.check_bindings() == []
 
 
 def test_a_renamed_metric_family_is_drift():

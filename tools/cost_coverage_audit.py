@@ -20,12 +20,14 @@ Two verbs against ONE declaration (``tortoise/cost_dimensions.py``):
        name and label set are EXACTLY the declared ones (a metric that gained or
        lost a label, or was renamed, is a series change, so it is drift, not
        detail).
-    2. **ledger** — every declared column is created by a tracked migration and
-       every declared SQL RPC is defined by one — both in DDL position (a
-       ``CREATE [OR REPLACE] FUNCTION``, an ``ALTER TABLE … ADD COLUMN``), never as
-       a substring and never inside a SQL comment. A column renamed in SQL and not
-       in the declaration fails here, and so does an RPC renamed by ``ALTER
-       FUNCTION … RENAME TO``.
+    2. **ledger** — every declared column and SQL RPC exists in the EFFECTIVE schema
+       the migrations leave behind: the corpus is replayed in order, so
+       ``CREATE TABLE`` bodies, ``ALTER TABLE … ADD COLUMN``, ``RENAME COLUMN``,
+       ``DROP COLUMN``, ``CREATE FUNCTION``, ``ALTER FUNCTION … RENAME TO`` and
+       ``DROP FUNCTION`` all move the end state. A column renamed in an appended
+       migration and not in the declaration fails here, and so does an RPC renamed
+       by ``ALTER FUNCTION … RENAME TO`` or dropped by ``DROP FUNCTION``. Nothing
+       is matched as a substring or inside a SQL comment.
     3. **no dead hook** — a dimension's writer (or reader, when the read path is
        the primitive) must have a call site in a tracked NON-TEST, NON-TOOL file,
        or the declaration must carry ``unscheduled_reason``. #4493's defect was a
@@ -160,7 +162,11 @@ def check_bindings() -> list[str]:
     A series is identified by its emitted family name plus its label set, so both
     halves are compared against the LIVE child: ``_name`` (what a scrape and every
     dashboard/alert selects on) and ``_labelnames``. Comparing only the labels
-    left a family rename — the same series change in the other axis — invisible.
+    left a family rename — the same series change in the other axis — invisible,
+    and gating the family half on ``if binding.family`` made an UNDECLARED family
+    invisible too: a ``METRIC`` binding that names no family says nothing about
+    the series it claims, so it is drift, not a skip. An incomplete declaration
+    must not buy a clean matrix.
     """
     findings: list[str] = []
     for dim in cd.dimensions():
@@ -170,7 +176,12 @@ def check_bindings() -> list[str]:
                 continue
             if binding.kind == cd.METRIC:
                 family = getattr(target, "_name", None)
-                if binding.family and family != binding.family:
+                if not binding.family:
+                    findings.append(
+                        f"{dim.name}: metric {binding.dotted} declares no family — "
+                        "a series is identified by its emitted family name plus its "
+                        f"labels, and this one emits {family!r}; declare family=")
+                elif family != binding.family:
                     findings.append(
                         f"{dim.name}: metric {binding.dotted} emits family "
                         f"{family!r}, declared {binding.family!r}")
@@ -197,30 +208,37 @@ def _safe_resolve(binding: cd.Binding, findings: list[str]):
 
 
 def check_ledger(root: Path) -> list[str]:
-    """Every declared column and SQL RPC is CREATED by a tracked migration.
+    """Every declared column and SQL RPC exists in the migrations' END STATE.
 
-    Both halves are matched only in DDL position — an ``ALTER TABLE … ADD COLUMN``
-    or a definition line inside ``CREATE TABLE`` for a column, a
-    ``CREATE [OR REPLACE] FUNCTION public.<name>(`` for an RPC — never as a bare
-    substring, and never inside a SQL comment: the migrations in this repo quote
-    column names and function names in their own header comments, and an
-    ``ALTER FUNCTION … RENAME TO`` / ``GRANT`` / ``REVOKE`` / ``COMMENT ON`` line
-    names a function WITHOUT defining it. A substring match would pass on prose
-    that creates nothing, which is the false green this whole instrument exists to
-    avoid.
+    Both halves are read off the EFFECTIVE schema (``_effective_schema``): the
+    corpus is replayed in order and every definition is applied as DDL —
+    ``CREATE TABLE`` bodies, ``ALTER TABLE … ADD COLUMN``, ``RENAME COLUMN``,
+    ``DROP COLUMN``, ``CREATE FUNCTION``, ``ALTER FUNCTION … RENAME TO``,
+    ``DROP FUNCTION`` — so the answer is *"does this symbol exist when the
+    migrations finish"*, not *"was this word ever written in DDL position"*.
+
+    The distinction is the whole check: this repo expresses a rename as a NEW,
+    APPENDED migration (``20260915000001_tenancy_team_to_org.sql``: "Earlier
+    migrations keep their historical `team` spelling … this migration renames the
+    end state"), so a history-only predicate stays green forever on the stale
+    spelling. Nothing is matched as a bare substring, nothing inside a SQL comment
+    (the migrations quote column and function names in their own header
+    comments), and a ``GRANT`` / ``REVOKE`` / ``COMMENT ON`` line names a symbol
+    without defining it — prose that creates nothing is never a definition.
     """
     sql = migration_text(root)
     if not sql:
         return [f"no migrations found under {_MIGRATIONS}/ — cannot verify the ledger"]
+    schema = _effective_schema(sql)
     findings: list[str] = []
     for dim in cd.dimensions():
         for column in dim.columns:
-            if not _creates_column(sql, column):
+            if not schema.has_column(column):
                 findings.append(
                     f"{dim.name}: declared column {column!r} is not created by any "
                     "migration (DDL position)")
         for rpc in dim.rpcs:
-            if not _defines_function(sql, rpc):
+            if not schema.has_function(rpc):
                 findings.append(
                     f"{dim.name}: declared SQL function {rpc!r} is not defined by "
                     "any migration (no CREATE FUNCTION)")
@@ -246,46 +264,244 @@ def _strip_sql_comments(sql: str) -> str:
     return re.sub(r"/\*.*?\*/", "", without_line, flags=re.DOTALL)
 
 
-#: A column DEFINITION, not a mention: ``ADD COLUMN [IF NOT EXISTS] <name>`` or a
-#: definition line inside a ``CREATE TABLE`` body.
+#: A column DEFINITION, not a mention: a name/type pair at the head of a
+#: ``CREATE TABLE`` body line, or ``ADD COLUMN [IF NOT EXISTS] <name>``.
 _COLUMN_TYPES = (
     "text", "bigint", "integer", "int", "smallint", "real", "numeric",
     "double precision", "boolean", "timestamptz", "timestamp", "date", "uuid",
     "jsonb", "json",
 )
 
+_IDENT = r"[A-Za-z_][A-Za-z0-9_$]*"
+
+_CREATE_TABLE = re.compile(
+    rf"^\s*CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    rf"(?:public\.)?({_IDENT})\s*\(", re.IGNORECASE)
+_ALTER_TABLE = re.compile(
+    rf"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:public\.)?"
+    rf"({_IDENT})\s+(.*)$", re.IGNORECASE | re.DOTALL)
+_ADD_COLUMN = re.compile(
+    rf"\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})", re.IGNORECASE)
+_RENAME_COLUMN = re.compile(
+    rf"^\s*RENAME\s+COLUMN\s+({_IDENT})\s+TO\s+({_IDENT})", re.IGNORECASE)
+_DROP_COLUMN = re.compile(
+    rf"^\s*DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?({_IDENT})", re.IGNORECASE)
+_RENAME_TABLE = re.compile(
+    rf"^\s*RENAME\s+TO\s+({_IDENT})", re.IGNORECASE)
+_CREATE_FUNCTION = re.compile(
+    rf"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:public\.)?({_IDENT})\s*\(",
+    re.IGNORECASE)
+_ALTER_FUNCTION_RENAME = re.compile(
+    rf"^\s*ALTER\s+FUNCTION\s+(?:public\.)?({_IDENT})\s*(?:\([^)]*\))?\s*"
+    rf"RENAME\s+TO\s+({_IDENT})", re.IGNORECASE | re.DOTALL)
+_DROP_FUNCTION = re.compile(
+    rf"^\s*DROP\s+FUNCTION\s+(?:IF\s+EXISTS\s+)?(?:public\.)?({_IDENT})",
+    re.IGNORECASE)
+
+
+@dataclass
+class _Schema:
+    """The schema the migration corpus LEAVES BEHIND (the effective end state).
+
+    ``columns`` maps a table to the column names it ends with; ``functions`` is
+    the end-state set of ``public`` function names. Both are built by replaying
+    the corpus in order, so a symbol renamed or dropped by a LATER, APPENDED
+    migration is gone — which is exactly how this repo expresses a rename.
+
+    Declarations name a column without its table and a function without its
+    signature, so the lookups are name-shaped too: a column exists when ANY table
+    ends with it, a function when its name survives to the end. A ``DROP
+    FUNCTION`` is signature-specific in Postgres while this replay is name-shaped,
+    so a name dropped and later re-created is present (the order in the corpus is
+    drop-then-create); a name dropped LAST is drift, which is the answer the
+    ledger needs.
+    """
+
+    columns: dict[str, set[str]]
+    functions: set[str]
+
+    def has_column(self, column: str) -> bool:
+        wanted = column.strip('"').lower()
+        return any(wanted in cols for cols in self.columns.values())
+
+    def has_function(self, rpc: str) -> bool:
+        return rpc.strip('"').lower() in self.functions
+
+
+@cache
+def _effective_schema(sql: str) -> _Schema:
+    """Replay *sql* statement by statement into its end state (see ``_Schema``)."""
+    columns: dict[str, set[str]] = {}
+    functions: set[str] = set()
+    for statement in _statements(_strip_sql_comments(sql)):
+        create_table = _CREATE_TABLE.match(statement)
+        if create_table:
+            table = _table_name(create_table.group(1))
+            cols = columns.setdefault(table, set())
+            cols.update(_create_table_columns(statement, create_table.end() - 1))
+            continue
+        create_function = _CREATE_FUNCTION.match(statement)
+        if create_function:
+            functions.add(_table_name(create_function.group(1)))
+            continue
+        drop_function = _DROP_FUNCTION.match(statement)
+        if drop_function:
+            functions.discard(_table_name(drop_function.group(1)))
+            continue
+        alter_function = _ALTER_FUNCTION_RENAME.match(statement)
+        if alter_function:
+            functions.discard(_table_name(alter_function.group(1)))
+            functions.add(_table_name(alter_function.group(2)))
+            continue
+        alter_table = _ALTER_TABLE.match(statement)
+        if not alter_table:
+            continue
+        table = _table_name(alter_table.group(1))
+        rest = alter_table.group(2)
+        cols = columns.setdefault(table, set())
+        rename_column = _RENAME_COLUMN.match(rest)
+        if rename_column:
+            cols.discard(_table_name(rename_column.group(1)))
+            cols.add(_table_name(rename_column.group(2)))
+            continue
+        drop_column = _DROP_COLUMN.match(rest)
+        if drop_column:
+            cols.discard(_table_name(drop_column.group(1)))
+            continue
+        rename_table = _RENAME_TABLE.match(rest)
+        if rename_table:
+            moved = columns.pop(table, set())
+            columns.setdefault(_table_name(rename_table.group(1)), set()).update(moved)
+            continue
+        for add in _ADD_COLUMN.finditer(rest):
+            cols.add(_table_name(add.group(1)))
+    return _Schema(columns, functions)
+
+
+def _table_name(identifier: str) -> str:
+    return identifier.strip('"').lower()
+
+
+def _statements(sql: str) -> list[str]:
+    """Split *sql* on statement terminators, respecting quotes and dollar bodies.
+
+    A naive ``split(';')`` cuts a plpgsql body at its own internal semicolons and
+    loses the ``CREATE FUNCTION`` header from the rest of its statement, and a
+    single-quoted literal (``COMMENT ON … IS 'a;b'``) splits a statement in half.
+    Dollar-quoted bodies are replaced by their tag pair — the definition header has
+    already been read by the time the body starts, and the body is procedural code,
+    not schema.
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if sql[j + 1:j + 2] == "'":  # doubled quote inside the literal
+                        j += 2
+                        continue
+                    break
+                j += 1
+            buf.append(sql[i:j + 1])
+            i = j + 1
+            continue
+        if ch == "$":
+            tag = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$", sql[i:])
+            if tag:
+                opener = tag.group(0)
+                end = sql.find(opener, i + len(opener))
+                buf.append(opener)
+                i = n if end == -1 else end + len(opener)
+                continue
+        if ch == ";":
+            statements.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    statements.append("".join(buf))
+    return [s for s in (statement.strip() for statement in statements) if s]
+
+
+def _create_table_columns(statement: str, open_paren: int) -> set[str]:
+    """The column names DEFINED in the ``CREATE TABLE`` body at *open_paren*.
+
+    Only a real ``CREATE TABLE … ( … )`` body is parsed, so a bare ``<name>
+    <type>`` line that is really a ``RETURNS TABLE (`` output column or a plpgsql
+    ``DECLARE`` variable is NOT a column definition — the anchoring the previous
+    ``^\\s*<name>\\s+<type>`` line-scan lacked (it matched either shape anywhere in
+    the corpus). Table constraints (``PRIMARY KEY``, ``UNIQUE``, ``CONSTRAINT``,
+    ``FOREIGN KEY``, ``CHECK``, ``EXCLUDE``, ``LIKE``) are rejected because the type
+    token must be one of ``_COLUMN_TYPES``.
+    """
+    body = _parenthesised(statement, open_paren)
+    found: set[str] = set()
+    definition = re.compile(rf"\s*({_IDENT})\s+(?:{'|'.join(_COLUMN_TYPES)})\b",
+                            re.IGNORECASE)
+    for part in _split_top_level(body):
+        match = definition.match(part)
+        if match:
+            found.add(_table_name(match.group(1)))
+    return found
+
+
+def _parenthesised(sql: str, open_paren: int) -> str:
+    """The text inside the parenthesis opening at *open_paren* (``""`` if unbalanced)."""
+    depth = 0
+    for i in range(open_paren, len(sql)):
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return sql[open_paren + 1:i]
+    return ""
+
+
+def _split_top_level(body: str) -> list[str]:
+    """Split *body* on commas that are not inside a nested parenthesis."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
 
 def _creates_column(sql: str, column: str) -> bool:
-    """True when *column* is CREATED — never merely named in a comment.
+    """True when *column* exists in the schema *sql* leaves behind.
 
-    Two accepted positions, both statement-anchored: an ``ALTER TABLE … ADD
-    COLUMN`` (the whole statement, so the ``ADD COLUMN`` must belong to an ALTER
-    and not to prose) or a definition line inside a ``CREATE TABLE`` body.
+    Not "was it created at some point": the corpus is replayed, so a column that a
+    later migration RENAMEs or DROPs is absent (see ``_effective_schema``). Two
+    accepted definitions, both DDL-anchored: an ``ALTER TABLE … ADD COLUMN`` (so
+    the ``ADD COLUMN`` must belong to an ALTER, not to prose) or a name/type pair
+    inside a parsed ``CREATE TABLE`` body.
     """
-    ddl = _strip_sql_comments(sql)
-    alter = (
-        rf"ALTER\s+TABLE\b[^;]*?\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-        rf"{re.escape(column)}\b")
-    if re.search(alter, ddl, re.IGNORECASE | re.DOTALL):
-        return True
-    definition = (
-        rf"^\s*{re.escape(column)}\s+(?:{'|'.join(_COLUMN_TYPES)})\b")
-    return bool(re.search(definition, ddl, re.IGNORECASE | re.MULTILINE))
+    return _effective_schema(sql).has_column(column)
 
 
 def _defines_function(sql: str, rpc: str) -> bool:
-    """True when *rpc* is DEFINED (`CREATE [OR REPLACE] FUNCTION public.<rpc>(`).
+    """True when *rpc* exists in the function set *sql* leaves behind.
 
-    A ``GRANT``/``REVOKE``/``COMMENT ON``/``ALTER FUNCTION`` line names a function
-    without creating it, so an RPC renamed by ``ALTER FUNCTION … RENAME TO`` keeps
-    matching the loose ``FUNCTION public.<name>`` predicate while the declaration
-    goes stale. Anchoring on the CREATE makes the rename visible.
+    A ``GRANT``/``REVOKE``/``COMMENT ON`` line names a function without creating
+    it, and an ``ALTER FUNCTION … RENAME TO`` renames it AWAY — the replay applies
+    both, so a stale declaration does not stay green on the historical ``CREATE``.
     """
-    pattern = (
-        rf"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+public\."
-        rf"{re.escape(rpc)}\s*\(")
-    return bool(re.search(pattern, _strip_sql_comments(sql),
-                          re.IGNORECASE | re.MULTILINE))
+    return _effective_schema(sql).has_function(rpc)
 
 
 # ── 3. no dead hook ──────────────────────────────────────────────────────
