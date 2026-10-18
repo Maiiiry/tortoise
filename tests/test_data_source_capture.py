@@ -39,11 +39,13 @@ reset per test. No network, no store, no docker lane.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
 import threading
 import time
+from pathlib import Path
 
 os.environ.setdefault("TORTOISE_SECRET_PEPPER", "test-static-pepper")
 
@@ -1004,3 +1006,88 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
     message = str(excinfo.value)
     assert "INCONCLUSIVE [#5049]" in message
     assert "GET /v1/data-sources/demand answered" in message
+
+
+# ── The e2e harness's own claims (#8975 review P3) ─────────────────────
+# The dashboard e2e file is the one place the `sending` state is asserted
+# RUNTIME-side (`aria-busy` sampled in the browser while the POST is held by
+# `_hold_demand_response`). Its `_wire` docstring used to say the opposite — that
+# the loading state is "deliberately NOT asserted here" and is "pinned instead"
+# in the two JS suites — which tells the next reader the mechanism is absent and
+# invites deleting the browser sampling as dead weight. The repo pins
+# docstring-claim accuracy on purpose (tests/test_7846_restore_doc_and_bounds.py
+# carries that same docstring-vs-evidence guard), so the paragraph is pinned here
+# rather than trusted.
+_E2E_ONBOARDING = Path(__file__).resolve().parent / "e2e" / "test_dashboard_onboarding.py"
+
+
+def _e2e_function(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """The `ast` node for `name` in the e2e file, read WITHOUT importing it.
+
+    Importing that module raises the module-level
+    `pytest.skip(..., allow_module_level=True)` that guards `RUN_DASHBOARD_E2E`,
+    and pytest turns what it raises into a green-looking SKIP — a guard that
+    imported would stop guarding without ever failing. A doc-text claim needs no
+    runtime, so this parses the text: each lookup is one `ast.parse` + walk, and
+    a caller bounds a spec's body with its own `lineno`/`end_lineno` rather than
+    a hand-maintained line number.
+    """
+    tree = ast.parse(_E2E_ONBOARDING.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {_E2E_ONBOARDING}")
+
+
+def test_the_e2e_harness_docstring_agrees_with_the_browser_hold() -> None:
+    """#8975 review P3: `_wire` must name the mechanism the file actually uses.
+
+    Pre-fix: the paragraph claimed the transient loading state is "deliberately
+    NOT asserted here" and "pinned instead" in `demandCapture.test.js` /
+    `demandCaptureRender.test.js`, while
+    `test_focus_stays_in_the_dialog_while_the_post_is_in_flight` in the SAME
+    file samples `aria-busy="true"` in the browser via `_hold_demand_response`.
+    """
+    doc = ast.get_docstring(_e2e_function("_wire")) or ""
+    focus_name = "test_focus_stays_in_the_dialog_while_the_post_is_in_flight"
+    # BOTH claim-bearing paragraphs, because they made the SAME false statement
+    # and only one of them was corrected first (cycle-3 P3): a guard that reads
+    # `_wire` alone leaves the sibling free to drift back out of agreement.
+    for name in ("_wire", "test_coming_soon_click_is_recorded_with_its_success_state"):
+        claim = ast.get_docstring(_e2e_function(name)) or ""
+        assert claim, f"{name} must carry the docstring this guard reads"
+        assert "deliberately NOT asserted" not in claim, (
+            f"{name}: the in-flight (loading) state IS asserted in this file — "
+            "through the page-side hold, not a sync route handler")
+        assert "_hold_demand_response" in claim, (
+            f"{name}: the paragraph must name the browser mechanism that drives "
+            "the state (patching the page's own fetch), or the next reader "
+            "cannot find it")
+        assert focus_name in claim, (
+            f"{name}: it must name the spec that samples the state, or the claim "
+            "is unanchored")
+        # The NEGATION matters more than the naming: the pre-fix sibling carried
+        # both names AND the false claim around them, so only refusing the claim
+        # itself catches a full reversion (cycle-4 P2). Whitespace-normalised,
+        # because the sentences re-wrap and a re-wrap must not hide it.
+        flat = " ".join(claim.split())
+        for false_claim in ("pinned by the two JS suites", "cannot be sampled here"):
+            assert false_claim not in flat, (
+                f"{name}: '{false_claim}' is the pre-fix FALSE claim — the state "
+                "IS sampled in this file via the page-side hold (#8975 cycle-3 P3)")
+    # The route-handler limitation is the TRUE half of the old sentence and the
+    # evidence for the mechanism above — it must survive the fix.
+    assert "10/10 polls read" in doc, (
+        "the measurement that justifies the page-side hold must stay")
+    # Non-vacuity, BOUND to the spec's OWN lines: the docstring naming the
+    # mechanism buys nothing if the spec stopped using it, and the paragraph
+    # itself mentions `aria-busy`, so a file-wide search would be satisfied by
+    # the claim rather than by the code it describes.
+    src = _E2E_ONBOARDING.read_text(encoding="utf-8")
+    focus = _e2e_function(focus_name)
+    segment = "\n".join(src.splitlines()[focus.lineno - 1:focus.end_lineno])
+    assert "_hold_demand_response(page)" in segment, (
+        "the spec must install the page-side hold before it navigates")
+    assert "getAttribute('aria-busy')" in segment, (
+        "the spec must SAMPLE the in-flight state in the browser — the "
+        "expression, not merely the word, which its own docstring also carries")

@@ -159,13 +159,20 @@ def _wire(page: Page, *, seed_objects: list = None,  # noqa: RUF013
     only way to drive the popup's error->Retry->recorded path, since a static
     failure could never be recovered from inside one test.
 
-    The popup's TRANSIENT loading state is deliberately NOT asserted here: the
-    sync Playwright handler runs on the test thread, so holding the response open
-    blocks the very thread that would have to read the DOM — the assertion could
-    only ever sample the settled state (measured: it did exactly that, 10/10
-    polls read "Recorded"). That state is pinned instead where it is observable:
-    `demandCapture.test.js` (the state machine) and `demandCaptureRender.test.js`
-    (the disabled binding + the sending label).
+    The popup's TRANSIENT loading state cannot be sampled through a SYNC ROUTE
+    HANDLER (what this harness builds): the handler runs on the test thread, so
+    holding the response open blocks the very thread that would have to read the
+    DOM — the assertion could only ever sample the settled state (measured: it
+    did exactly that, 10/10 polls read "Recorded"). It is therefore driven from
+    the PAGE instead, by `_hold_demand_response` (which patches the page's own
+    `fetch`, so the request is still really made and React is really in `sending`
+    for the whole hold), and sampled in the browser by
+    `test_focus_stays_in_the_dialog_while_the_post_is_in_flight` (it asserts
+    `aria-busy="true"` AND that focus stays inside the dialog while it is true).
+    What the two JS suites still own is the half they settle more cheaply and
+    deterministically than a browser run: the state machine
+    (`demandCapture.test.js`, a node unit suite) and the disabled binding + the
+    sending label (`demandCaptureRender.test.js`, a static source pin).
     #3428/#2937 (lane B3, review cycle 2 P2-2): the wizard reads `st.onboarding`,
     so this is the runtime seam that makes the Connected screen reachable — it
     turns the capture-tense gating from source-pinned into runtime-proven.
@@ -749,11 +756,15 @@ def test_coming_soon_click_is_recorded_with_its_success_state(page: Page) -> Non
     The POST body is asserted from what the BROWSER sent — integration_key + the
     `click` action + the mount's `surface`, and NO client-supplied `org_key` —
     which is the record's whole contract, and the recorded state is asserted
-    inline in the dialog. The transient loading state cannot be sampled here (see
-    `_wire`); it is pinned by the two JS suites, and its FOCUS contract is
+    inline in the dialog. This test does not sample the transient loading state
+    (it drives one click and asserts the settled record); the state itself IS
     sampled in the browser by
     `test_focus_stays_in_the_dialog_while_the_post_is_in_flight` (which holds the
-    response open with `_hold_demand_response`).
+    response open with `_hold_demand_response`), and the two JS suites own the
+    half they settle more cheaply and deterministically than a browser run —
+    the state machine (`demandCapture.test.js`, a node unit suite) and the
+    disabled binding + sending label (`demandCaptureRender.test.js`, a static
+    source pin).
     """
     cap = _open_grid(page)
 
