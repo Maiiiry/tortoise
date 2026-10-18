@@ -8359,9 +8359,6 @@ function claimIntentInFlight() {
   const memorySourcesProps = {
     state: onboarding,
     loading: onboardingLoading,
-    // #3513 §2: the SETTINGS default surface (the one mount that carries the
-    // collapsed manual-install disclosure); the wizard mount overrides it.
-    surface: 'settings',
     wizardHarness: null,  // Settings default; the wizard mount overrides it
     github: wizardGithub,
     issuesWantOn,
@@ -8387,11 +8384,16 @@ function claimIntentInFlight() {
     onIssuesScopeChange: handleIssuesScopeChange,
     onLoadBranches: loadBranches,
     order: DATA_SOURCES_ORDER,
-    // #3514: the coming-soon click's request seam + the SURFACE it records.
-    // Settings is the default here; the wizard mount overrides the surface (it
-    // is the other mount), and both then thread it into the record so the
-    // operator can tell a wizard click from a Settings click.
+    // #3514: the coming-soon click's request seam.
     recordDemandClick,
+    // #3513 §2 + #3514: the SETTINGS surface default. The shared bundle IS the
+    // Settings mount (the one that carries the collapsed manual-install
+    // disclosure); the wizard mount overrides it with `DEMAND_SURFACE_WIZARD`
+    // — the one mount that must never carry the recipe. ONE prop, TWO readers:
+    // the manual-install recipe gate AND the coming-soon request body's
+    // `surface` field, so a click is attributed to the screen it came from.
+    // Declared ONCE here — a second `surface` key in this literal would win
+    // silently and make this line dead (#8975 review).
     surface: DEMAND_SURFACE_SETTINGS,
   }
 

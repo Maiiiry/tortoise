@@ -155,6 +155,34 @@ test('#3514: both live mounts tell the record WHICH surface it came from', () =>
     'the component reads the prop it is handed (fail-closed WIZARD default, #3513 §2)')
 })
 
+test('#8975: the shared prop bundle declares every key ONCE', () => {
+  // WHY THIS ONE EXISTS. #8974 (main) and #3514 (this branch) each added a
+  // `surface` key to `memorySourcesProps` while the branch was diverged, and
+  // the merge left BOTH declarations in the literal. JavaScript takes the LAST
+  // one, so the behaviour was (accidentally) right and EVERY pin above stayed
+  // green: the `#3513 §2` line was simply dead. The dashboard eslint config
+  // deliberately enables only `no-use-before-define` + `no-undef`, so
+  // `no-dupe-keys` is not there to catch it. A duplicate key in this literal is
+  // exactly the silent-drift shape the source pins exist to refuse, so the pin
+  // is the ABSENCE of a duplicate rather than any particular line surviving.
+  const start = src.indexOf('const memorySourcesProps = {')
+  assert.ok(start > -1, 'the shared prop bundle must exist')
+  const end = src.indexOf('\n  }\n', start)
+  assert.ok(end > start, 'refusing an unbounded slice to EOF')
+  const literal = src.slice(start, end)
+  // Top-level keys only: bundle members sit at 4-space indentation, one per
+  // line, either as `key: value` or shorthand `key,`. Comments start with `//`
+  // and so cannot match.
+  const keys = [...literal.matchAll(/^ {4}([A-Za-z_$][\w$]*)\s*[:,]/gm)].map((m) => m[1])
+  assert.ok(keys.length > 20,
+    `the bundle key scan found ${keys.length} keys — refusing a scan that stopped reading the literal`)
+  assert.ok(keys.includes('surface') && keys.includes('recordDemandClick'),
+    'the scan must see the keys this PR added, or it is not reading the right literal')
+  const dupes = [...new Set(keys.filter((k, i) => keys.indexOf(k) !== i))]
+  assert.deepEqual(dupes, [],
+    `duplicate key(s) in memorySourcesProps: ${dupes.join(', ')} — the last one wins silently, so the earlier declaration is dead`)
+})
+
 test('#3514: the recorded state is per-tile and survives a second open', () => {
   const body = memorySourcesBlock()
   assert.match(body, /demandStates\[comingSoonKey\]/,
