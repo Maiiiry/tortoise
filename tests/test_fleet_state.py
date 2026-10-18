@@ -1959,6 +1959,38 @@ def test_a_placeholder_cwd_is_unresolved_not_a_lane(monkeypatch) -> None:
     assert live.measured is True and dict(live) == {}, "an exited pid is not a gap"
 
 
+def test_a_path_with_a_parenthesised_suffix_is_a_cwd_not_a_placeholder(
+        monkeypatch) -> None:
+    """⛔ A DIRECTORY NAMED ``wt-3051 (2)`` IS A PATH, NOT lsof's PLACEHOLDER.
+
+    ``_CWD_PLACEHOLDER_RE`` matched ANY path whose last segment ends in a
+    parenthesised suffix, so a duplicate-checkout spelling (``wt-3051 (2)``) read
+    as UNRESOLVED. That is fail-CLOSED but permanent-red: the pid is alive, so
+    `proc_error` is set, `measured` goes False, `build_state` publishes the
+    `liveness-unmeasured` orphan and EVERY pre-flight on the box answers INCOMPLETE
+    for as long as that lane runs — the gate #8999 exists to remove (review of
+    #9016). The two forms the reader must still reject are named exactly.
+    """
+    # The legitimate spelling survives …
+    assert fs._usable_cwd("/tmp/wt-3051 (2)") == "/tmp/wt-3051 (2)"
+    # … and the two documented placeholders do not.
+    assert fs._usable_cwd("/proc/8/cwd (readlink: Permission denied)") == ""
+    assert fs._usable_cwd("/wt/8999 (deleted)") == ""
+
+    # The polarity that matters, end to end: such a cwd is a LANE, and the store
+    # stays MEASURED (no orphan, no permanently-red gate).
+    real = "/tmp/wt-3051 (2)"
+    monkeypatch.setattr(fs, "_proc_cwd_is_readable", lambda: True)
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 8, "ppid": 1}], ""))
+    monkeypatch.setattr(fs.os, "readlink", lambda _p: real)
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: True)
+    live = fs.live_sessions()
+    assert live.measured is True, (
+        "a real path with a parenthesised suffix is a measurement")
+    assert list(live) == [f"{fs.PROC_WS_PREFIX}8"], "and it attributes a lane"
+
+
 def test_a_guest_cli_error_object_is_not_a_session_store(monkeypatch) -> None:
     """THE ROOT CAUSE. cmux 0.1.0 (the Cloud guest CLI) answers a grammar it does
     not have with VALID JSON:
@@ -2022,6 +2054,30 @@ def test_a_pid_a_cmux_record_already_carries_is_not_emitted_twice(monkeypatch) -
     live = fs.live_sessions()
     assert list(live) == ["WS-1", f"{fs.PROC_WS_PREFIX}900"], (
         "an ENDED cmux record must not mask the live process that recycled its pid")
+
+
+def test_a_record_with_no_workspace_does_not_mask_a_live_process(monkeypatch) -> None:
+    """⛔ A RECORD THAT MASKS A PID MUST ALSO PUBLISH ONE.
+
+    `cmux sessions list` can answer a `pi` record carrying a LIVE pid and NO
+    `workspace_id` (a degraded/malformed payload). The mask used to be applied
+    before the workspace test, so the pid went into `cmux_pids` while the record
+    itself had no key to be published under: the `PROC:` leg skipped the process as
+    already counted and the record stayed unpublished, leaving a running `pi` in
+    NEITHER store while `measured` stayed True — no lane, no orphan, and the gate
+    answering "nobody holds it" about a live lane (review of #9016). An
+    unpublished record masks nothing, so the process table still speaks for it.
+    """
+    cmux = [{"agent": "pi", "pid": 900}]           # live pid, NO workspace_id
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: (
+        cmux, fs.LIVE_STORE_CMUX_PLURAL, ""))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 900, "ppid": 1}], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({900: "/tmp/wt-a"}, ""))
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 900)
+    live = fs.live_sessions()
+    assert list(live) == [f"{fs.PROC_WS_PREFIX}900"], (
+        "a record that cannot be published must not suppress the process lane")
+    assert live.measured is True
 
 
 def test_a_healthy_cmux_store_does_not_cover_for_an_unreadable_process_store(

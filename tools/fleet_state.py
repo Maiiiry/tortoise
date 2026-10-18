@@ -1209,7 +1209,15 @@ def _proc_cwd_is_readable() -> bool:
 
 # `lsof` reporting a cwd it could not follow, and the kernel's removed-directory
 # marker: `n/proc/8/cwd (readlink: Permission denied)`, `/wt (deleted)`.
-_CWD_PLACEHOLDER_RE = re.compile(r" \(.*\)$")
+#
+# ⛔ THE PATTERN NAMES THOSE TWO FORMS, IT DOES NOT MATCH ANY PARENTHETICAL. A
+# blanket `r" \(.*\)$"` also rejects a perfectly ordinary directory whose last
+# segment ends in a parenthesised suffix (`wt-3051 (2)`, a duplicate-checkout
+# spelling), and because an unusable cwd poisons `measured`, one such lane would
+# publish `liveness-unmeasured` and answer INCOMPLETE on EVERY issue, for as long
+# as it ran — the permanent-red gate #8999 exists to remove (review of #9016).
+# lsof's other placeholder, `(unknown)`, is already rejected by the leading `/`.
+_CWD_PLACEHOLDER_RE = re.compile(r" \((?:deleted|unlinked|readlink:[^)]*)\)$")
 
 
 def _usable_cwd(value: str) -> str:
@@ -1377,6 +1385,18 @@ def live_sessions() -> LiveSessions:
             pid = int(s.get("pid") or 0)
         except (TypeError, ValueError):
             pid = 0
+        ws = str(s.get("workspace_id") or "").upper()
+        if not ws:
+            # ⛔ A RECORD THAT MASKS A PID MUST ALSO PUBLISH ONE. A `pi` record with
+            # a live pid but NO `workspace_id` has no key to be published under, so
+            # masking its pid would drop the process from BOTH stores: the `PROC:`
+            # leg skips it as already counted while the record itself stays
+            # unpublished — a MEASURED board with no lane and no
+            # `liveness-unmeasured` orphan, i.e. the gate answering "nobody holds
+            # it" about a running lane. Unpublished, it masks nothing, so the
+            # process table still speaks for it (review of #9016).
+            continue
+        result.setdefault(ws, []).append(s)
         # ⛔ A RECORD'S EXISTENCE IS NOT A READING. Only a record whose pid is alive
         # NOW can prove this process is the SAME lane measured twice; a pid recycled
         # onto an ENDED record (`--all` keeps them for ever) must not mask a live
@@ -1385,9 +1405,6 @@ def live_sessions() -> LiveSessions:
         # lane. This is `row_binds_evidence`'s rule, applied to the join.
         if pid and pid_alive(pid):
             cmux_pids.add(pid)
-        ws = str(s.get("workspace_id") or "").upper()
-        if ws:
-            result.setdefault(ws, []).append(s)
 
     procs, proc_error = pi_processes()
     if not proc_error:
