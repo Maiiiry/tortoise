@@ -1,29 +1,49 @@
-"""The document-source GOLD fixture — and the proof the `documents` cap is not vacuous.
+"""The document-source GOLD fixture — D10's per-document topology and identity facts.
 
 Why this test exists
 --------------------
-Production holds **zero** `:Source` rows with `sourceKind='document'` (all 2,208
-live rows are `agentSession`). Every candidate predicate therefore measures 0
-there and passes **vacuously** — the gate cannot be shown to work against live
-data, only against a constructed fixture.
+The fixture declares the shapes a document-bearing `:Source` takes under D10
+(*a document is a SOURCE, not a graph node*), plus the version/idempotency and
+replay invariants epic **#5088** must honour. Production cannot supply that
+population: the live graph was measured **all `agentSession`** (2,208 rows,
+2026-09-24). A constructed fixture is therefore the only way to *measure* the
+declared facts against a real graph instead of merely declaring them.
 
-This test does two jobs:
+This test does three jobs:
 
-1. **Fixture integrity** — the gold file is well-formed and its per-case
-   `predicate_matrix` is internally consistent.
+1. **Fixture integrity** — the gold file is well-formed and every declaration
+   it makes is one it can be held to.
 2. **Non-vacuity, on a real graph** — the fixture sources are written to an
-   embedded FalkorDB and the three candidate predicates are run as REAL Cypher.
-   The test asserts the choice is *consequential*: the candidates must DISAGREE
-   on at least two cases (if they agreed everywhere, the predicate choice would
-   not matter and the "leak" finding would be unfounded).
+   embedded FalkorDB and the declared topology/identity facts are read back as
+   REAL Cypher. Each source row resolves to exactly ONE node by `url`, with the
+   declared label, source kind and genre.
+3. **The retirement is EXECUTABLE** — the fixture must not re-assert the retired
+   `documents`-cap model (`test_the_retired_documents_cap_model_cannot_return`).
 
-The ruling under test (Q-S2 protocol, #5013): the `documents` cap predicate must
-be **`sourceKind = 'document'`**. The form
-`documentKind IS NOT NULL AND documentKind <> 'transcript'` is REJECTED because
-it leaks a frontmatter-less document (NULL genre → unmetered → /v1/index/docs
-free for it → #1726 reopens). The form
-`COALESCE(documentKind,'') <> 'transcript'` is REJECTED because it meters every
-session source (measured: 2,208).
+⚠️ **The `documents`-cap predicate ruling (Q-S2) is SUPERSEDED — this file no
+longer carries it.** The owner's cost-model direction (2026-09-25, recorded on
+`#5013`) makes **a document not a cost unit**: cost is the bytes stored
+(Postgres MB/GB + graph MB) and the extraction triggered (LLM usage), with
+volume sold as overage rather than gated as a count. So the question *"which
+`:Source` record does the `documents` meter count?"* **dissolves rather than
+resolves — neither, because nothing counts documents.** `/v1/index/docs` stays
+gated, by the storage + extraction allowance instead of a document count.
+
+This was corrected by **#5332**. What it replaced, and why the removal is a
+deliberate act rather than a tidy-up: the file previously asserted a
+`sourceKind='document'` predicate as *"the ruling under test"* and named the
+form `quota.py` implements (`documentKind IS NOT NULL AND …`) **`REJECTED`** —
+so a merged, green artifact asserted a model that no longer existed, and the
+next lane to read it could reimpose the cap. The **per-document topology and
+identity facts are kept** (they are real, and nothing else pins them); the
+predicate table, the per-row cap verdicts and the `REJECTED_*` candidates are
+gone.
+
+**Boundary, stated so it is not misread:** nothing here EXERCISES the writer.
+The graph half loads the fixture rows directly as `:Source` nodes and reads the
+declared facts back. Driving the real writer (`_upsert_document` /
+`_upsert_source`) is the **integration** layer the epic's test design assigns to
+#5088's implementation — this file is a gold *target*, not that test.
 """
 from __future__ import annotations
 
@@ -34,18 +54,37 @@ import pytest
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "document_source_gold.jsonl"
 
-# The three candidates. `CYPHER` maps each candidate's LABEL (the key used in
-# the fixture's predicate_matrix) to the Cypher predicate over a node bound as
-# `src`. These are the EXACT strings under decision — kept as a table so a
-# reviewer can see the whole choice at once.
-CANON = "sourceKind='document'"
-REJECTED_LEAK = "documentKind IS NOT NULL AND documentKind <> 'transcript'"
-REJECTED_OVERCOUNT = "COALESCE(documentKind,'') <> 'transcript'"
-CYPHER = {
-    CANON: "src.sourceKind = 'document'",
-    REJECTED_LEAK: "src.documentKind IS NOT NULL AND src.documentKind <> 'transcript'",
-    REJECTED_OVERCOUNT: "COALESCE(src.documentKind,'') <> 'transcript'",
+#: The keys of the RETIRED `documents`-cap model. Named here so the retirement
+#: is executable: a row carrying any of them reds the suite (see
+#: `test_the_retired_documents_cap_model_cannot_return`).
+RETIRED_CAP_KEYS = ("predicate_matrix", "metered_by_documents_cap",
+                    "metered_by_sessions_cap")
+#: The cap bands, likewise retired. A row rejoining one reds.
+RETIRED_CAP_BANDS = ("document-must-count", "session-must-not-count")
+
+#: The rows that describe a DISTINCT `:Source` node to be loaded and read back.
+#: Pinned BY NAME: a row silently dropping out of the graph check is the
+#: mutation this guard exists to catch.
+SOURCE_CASES = frozenset({
+    "doc-with-genre", "doc-without-genre", "session-source", "transcript-source",
+})
+
+#: Every case's band, pinned BY NAME. A SWAP between two rows leaves the band
+#: SET unchanged, so set-equality cannot see it.
+BAND_BY_CASE = {
+    "doc-with-genre": "document-source",
+    "doc-without-genre": "document-source",
+    "session-source": "session-source",
+    "transcript-source": "session-source",
+    "doc-reingest-unchanged": "idempotency",
+    "doc-reingest-changed": "versioning",
+    "doc-aboutDocument-roundtrip": "replay-identity",
 }
+
+#: The band each SOURCE row must sit in, keyed off its declared `sourceKind`.
+#: A set-equality check cannot see a document filed under `session-source`.
+BAND_BY_SOURCE_KIND = {"document": "document-source",
+                       "agentSession": "session-source"}
 
 
 def _load() -> tuple[dict, list[dict]]:
@@ -56,7 +95,7 @@ def _load() -> tuple[dict, list[dict]]:
 
 
 def _source_rows(rows: list[dict]) -> list[dict]:
-    """The cases that describe a DISTINCT :Source node to be loaded and metered.
+    """The cases that describe a DISTINCT :Source node to be loaded and read.
 
     Two exclusions, both deliberate:
 
@@ -70,272 +109,85 @@ def _source_rows(rows: list[dict]) -> list[dict]:
     round-trip) are NOT exercised by any test here — the behaviour belongs to
     epic #5088's implementation. What this file does assert about them is that
     their declared invariants are internally consistent and complete
-    (``test_behavioural_cases_declare_their_invariants``), so each row is a
+    (``test_declared_expected_values_are_all_asserted``), so each row is a
     usable gold target rather than prose.
 
-    The discriminator is therefore ``metered_by_documents_cap`` being declared:
-    a case either states a cap verdict or it is not a cap case.
+    The discriminator is therefore ``node_label`` being declared: a case either
+    states the topology of a node it describes, or it is not a source row.
     """
     return [
         r for r in rows
-        if r.get("input", {}).get("url")
-        and "metered_by_documents_cap" in r.get("expected", {})
+        if r.get("input", {}).get("url") and "node_label" in r.get("expected", {})
     ]
 
 
-# ── Job 1: fixture integrity ────────────────────────────────────────────────
+# ── Job 1 + 3: fixture integrity, and the retirement is executable ───────────
 
 def test_fixture_is_well_formed() -> None:
     head, rows = _load()
     assert head["__dataset__"] == "document-source-gold"
-    assert head["__round__"] == 2
+    assert head["__round__"] == 3, (
+        "round 3 is the reduction that retired the documents-cap model (#5332) — "
+        "a revert to round 2 would restore the predicate table"
+    )
     assert "SYNTHETIC" in head["__provenance__"], (
         "the fixture must declare that it is constructed, not sampled — the "
-        "whole reason it exists is that production has no instances"
+        "whole reason it exists is that production cannot supply the contrast set"
     )
     assert rows, "no cases"
     for r in rows:
-        for key in ("case", "band", "input", "expected", "predicate_matrix",
+        for key in ("case", "band", "input", "expected",
                     "why_this_case", "label", "reason", "source"):
             assert key in r, f"{r.get('case')}: missing {key}"
         assert r["why_this_case"].strip(), f"{r['case']}: empty rationale"
-        # a row's matrix is EITHER the full candidate set OR exactly {"n/a": …}
-        # — never a mix — AND the n/a form is reserved to ONE named row. Pinning
-        # the row BY NAME is what removes the opt-out: without it, any row could
-        # replace its three declared verdicts with `{"n/a": …}` and escape every
-        # check (a review pass demonstrated exactly that, 10/10 green).
-        m = r["predicate_matrix"]
-        if r["case"] == NON_CAP_CASE:
-            assert set(m) == {"n/a"}, (
-                f"{r['case']} is the declared non-cap row: it must carry exactly 'n/a', "
-                f"got {sorted(m)}"
-            )
-            assert isinstance(m["n/a"], str) and m["n/a"].strip(), (
-                f"{r['case']}: the 'n/a' marker must carry a non-empty explanation"
-            )
-        else:
-            assert set(m) == set(CYPHER), (
-                f"{r['case']}: a cap row must declare all {len(CYPHER)} candidates, "
-                f"got {sorted(m)} — 'n/a' is reserved to {NON_CAP_CASE!r}"
-            )
+        assert r["expected"], f"{r['case']}: empty expected block is unassertable"
 
 
-def _py_predicates(inp: dict) -> dict:
-    """The three candidates evaluated in pure Python, from a row's own `input`.
+def test_the_retired_documents_cap_model_cannot_return() -> None:
+    """#5332 — the fixture must not re-assert the retired `documents`-cap model.
 
-    Pure Python rather than Cypher on purpose: these rows are excluded by
-    `_source_rows()`, and loading them as nodes would collide with
-    `doc-with-genre`'s url.
+    A merged artifact that asserts a retired model is worse than a missing one:
+    the next lane to read it reimposes the cap. The earlier file did exactly
+    that — a per-row `predicate_matrix` over three candidate predicates, a
+    `metered_by_documents_cap` verdict per document, and two `REJECTED_*`
+    constants naming the form the shipped code implements. Removing the text
+    without removing the capability would leave the same trap one edit away, so
+    the absence is asserted here: any row that regains a cap key or a cap band
+    reds the suite, and the fixture's own rule line must keep naming the
+    supersession.
     """
-    sk, dk = inp.get("sourceKind"), inp.get("documentKind")
-    return {
-        CANON: sk == "document",
-        REJECTED_LEAK: dk is not None and dk != "transcript",
-        REJECTED_OVERCOUNT: (dk or "") != "transcript",
-    }
-
-
-#: The ONE row that is not a cap predicate, pinned BY NAME. Reserving `n/a` to
-#: a named row is what stops any other row from opting out of its declared
-#: verdicts by relabelling them `n/a`.
-NON_CAP_CASE = "doc-aboutDocument-roundtrip"
-
-
-#: The band each NON-cap case must sit in, pinned BY NAME. The cap rows are
-#: mapped from their `sourceKind` instead; these three cannot be. A SWAP between
-#: two non-cap rows leaves the band SET unchanged, so set-equality cannot see it.
-NON_CAP_BAND = {
-    "doc-reingest-unchanged": "idempotency",
-    "doc-reingest-changed": "versioning",
-    "doc-aboutDocument-roundtrip": "replay-identity",
-}
-
-
-def test_rows_outside_source_rows_are_still_pinned() -> None:
-    """The rows `_source_rows()` EXCLUDES must still have their declared values pinned.
-
-    `_source_rows()` requires `input.url` AND `metered_by_documents_cap`, so the
-    two re-ingest rows and the round-trip row sit outside every graph check. A
-    review pass demonstrated that flipping their `predicate_matrix` verdicts to
-    wrong values left the suite fully green. Their verdicts are still DECLARED
-    values, so they are checked here — in pure Python, from each row's own input.
-    """
-    _, rows = _load()
-    checked = 0
+    head, rows = _load()
+    offenders = []
     for r in rows:
-        m = r["predicate_matrix"]
-        if r["case"] == NON_CAP_CASE:
-            # the n/a marker's PRESENCE is pinned here, so it cannot be swapped
-            # for a set of three verdicts (which `_py_predicates` would derive
-            # from the top-level input and wrongly accept)
-            assert set(m) == {"n/a"}, (
-                f"{NON_CAP_CASE} must carry exactly 'n/a', got {sorted(m)}"
-            )
-            assert isinstance(m["n/a"], str) and m["n/a"].strip()
-            continue
-        derived = _py_predicates(r["input"])
-        assert m == derived, (
-            f"{r['case']}: declared matrix disagrees with the matrix derivable "
-            f"from its own input\n  declared: {m}\n  derived:  {derived}"
+        for key in RETIRED_CAP_KEYS:
+            if key in r or key in r.get("expected", {}):
+                offenders.append(f"{r['case']}: carries {key}")
+        if r["band"] in RETIRED_CAP_BANDS:
+            offenders.append(f"{r['case']}: carries retired band {r['band']!r}")
+    assert not offenders, (
+        "the retired `documents`-cap model is back:\n  - " + "\n  - ".join(offenders)
+    )
+
+    # and the header must keep recording WHY there is no predicate to rule on —
+    # an omission-only guard passes over a silently emptied rule line
+    for text, what in ((head["__rule__"], "__rule__"),
+                       (head["__provenance__"], "__provenance__")):
+        assert "SUPERSEDED" in text or "retired" in text, (
+            f"the fixture's {what} no longer records that the documents-cap model "
+            f"is superseded (#5332) — it reads as though the model were still live"
         )
-        checked += 1
-    assert checked > 0, "vacuous: no row had a real matrix to check"
-
-    # the non-cap rows' bands are pinned BY NAME — a swap between two of them
-    # leaves the band set unchanged and would otherwise survive
-    seen = 0
-    for r in rows:
-        if r["case"] in NON_CAP_BAND:
-            assert r["band"] == NON_CAP_BAND[r["case"]], (
-                f"{r['case']}: band must be {NON_CAP_BAND[r['case']]!r}, got {r['band']!r}"
-            )
-            seen += 1
-    assert seen == len(NON_CAP_BAND), (
-        f"non-cap band pin incomplete: saw {seen} of {len(NON_CAP_BAND)}"
-    )
 
 
-def test_the_candidates_actually_disagree() -> None:
-    """If the candidates agreed everywhere, the token choice would not matter.
+def test_declared_expected_values_are_all_asserted() -> None:
+    """Every declared value is one the file can be held to — and the set is COMPLETE.
 
-    This is the assertion that makes the 'leak' and 'over-count' findings
-    falsifiable: at least two cases must split the candidates.
-    """
-    _, rows = _load()
-    splits = []
-    for r in _source_rows(rows):
-        m = r["predicate_matrix"]
-        verdicts = {m[p] for p in CYPHER}
-        if len(verdicts) > 1:
-            splits.append(r["case"])
-    assert len(splits) >= 2, (
-        f"candidates disagree on only {splits} — expected >= 2 cases "
-        f"(the frontmatter-less doc and the session source)"
-    )
-
-
-def test_canonical_predicate_matches_every_declared_verdict() -> None:
-    _, rows = _load()
-    srcs = _source_rows(rows)
-    assert srcs, "vacuous guard: no source rows to check"
-    for r in srcs:
-        want = r["expected"]["metered_by_documents_cap"]
-        got = r["predicate_matrix"][CANON]
-        assert got is want, f"{r['case']}: canonical predicate says {got}, expected {want}"
-
-
-# ── Job 2: non-vacuity on a REAL graph ──────────────────────────────────────
-
-@pytest.fixture
-def gold_graph(shared_embedded_db):
-    """Write the fixture's :Source rows into an embedded FalkorDB."""
-    from tortoise.sdk import TortoiseSDK
-
-    sdk = TortoiseSDK(shared_embedded_db, namespace="gold")
-    g = sdk._get_proj().g
-    _, rows = _load()
-    g.query("MATCH (n) DETACH DELETE n")
-    for r in _source_rows(rows):
-        inp = r["input"]
-        g.query(
-            "CREATE (s:Source {url: $url, sourceKind: $sk, documentKind: $dk, "
-            "               contentHash: $h, version: $v, title: $t})",
-            {"url": inp["url"], "sk": inp.get("sourceKind"),
-             "dk": inp.get("documentKind"), "h": inp.get("contentHash"),
-             "v": inp.get("version"), "t": inp.get("title")},
-        )
-    return sdk, g, rows
-
-
-def _count(g, predicate: str) -> int:
-    return int(g.query(f"MATCH (src:Source) WHERE {predicate} RETURN count(src)").result_set[0][0])
-
-
-def test_predicates_on_a_real_graph_are_non_vacuous(gold_graph) -> None:
-    """The proof this fixture exists for.
-
-    On the REAL live graph every candidate returns 0 (no documents exist), so a
-    green gate there proves nothing. Here the fixture guarantees a non-zero
-    population, so the predicates are actually exercised.
-    """
-    _, g, rows = gold_graph
-    srcs = _source_rows(rows)
-    total = _count(g, "true")
-    assert total == len(srcs) > 0, "fixture did not load"
-
-    canon = _count(g, CYPHER[CANON])
-    leak = _count(g, CYPHER[REJECTED_LEAK])
-    over = _count(g, CYPHER[REJECTED_OVERCOUNT])
-
-    # The canonical predicate must count EXACTLY the rows whose expected verdict
-    # is True — no more (over-count) and no fewer (leak).
-    expected_true = sum(1 for r in srcs if r["expected"]["metered_by_documents_cap"])
-    assert canon == expected_true, (
-        f"sourceKind='document' counted {canon}, expected {expected_true}"
-    )
-
-    # The two rejected forms must be WRONG, each in its own way, on this
-    # population — otherwise the whole Q-S2 finding is unfounded.
-    assert over > canon, (
-        f"the COALESCE form counted {over} vs canonical {canon} — expected it to "
-        f"over-count by metering session sources"
-    )
-    assert leak < canon, (
-        f"the documentKind IS NOT NULL form counted {leak} vs canonical {canon} — "
-        f"expected it to under-count by missing a frontmatter-less document"
-    )
-
-
-def test_the_leak_case_is_real(gold_graph) -> None:
-    """The single most consequential row: a document with a NULL genre.
-
-    The epic's proposed predicate drops it; the canonical one keeps it. If this
-    ever stops being true the Q-S2 correction is no longer needed.
-    """
-    _, g, rows = gold_graph
-    leak_case = next(r for r in _source_rows(rows) if r["case"] == "doc-without-genre")
-    assert leak_case["input"]["documentKind"] is None
-    url = leak_case["input"]["url"]
-    assert _count(g, f"{CYPHER[CANON]} AND src.url = '{url}'") == 1, (
-        "canonical predicate must meter the frontmatter-less document"
-    )
-    assert _count(g, f"{CYPHER[REJECTED_LEAK]} AND src.url = '{url}'") == 0, (
-        "the rejected form must miss it — that is the leak"
-    )
-
-
-def test_every_declared_matrix_cell_matches_the_graph(gold_graph) -> None:
-    """Verify EVERY declared cell, not just the canonical column.
-
-    ``test_predicates_on_a_real_graph_are_non_vacuous`` proves the choice is
-    consequential via aggregate inequalities (``leak < canon``, ``over >
-    canon``). That would NOT catch a single wrong cell in a rejected column.
-    This asserts each candidate's verdict per case against the real graph, so
-    the fixture's whole matrix is measured rather than asserted.
-    """
-    _, g, rows = gold_graph
-    checked = 0
-    for r in _source_rows(rows):
-        url = r["input"]["url"]
-        for label, cypher in CYPHER.items():
-            want = r["predicate_matrix"][label]
-            got = _count(g, f"{cypher} AND src.url = '{url}'") == 1
-            assert got is want, (
-                f"{r['case']}: declared {label!r}={want}, but the graph says {got}"
-            )
-            checked += 1
-    assert checked > 0, "vacuous: no cells were checked"
-
-
-def test_behavioural_cases_declare_their_invariants() -> None:
-    """The non-metering rows export the invariants epic #5088 must honour.
-
-    Nothing here EXERCISES the behaviour — that is the epic's to implement.
-    What this asserts is that every declaration the fixture makes is one it can
-    be held to, and that the set of asserted keys EQUALS the set of declared
-    keys. The completeness guard at the end is the load-bearing part: without
-    it, a newly added `expected` key is silently unasserted and a mutated value
+    The completeness guard at the end is the load-bearing part: without it, a
+    newly added `expected` key is silently unasserted and a mutated value
     survives green (which is exactly what a prior review pass caught here).
+    Scope, stated precisely: it compares (case_name, key) pairs drawn from
+    `expected` blocks. It cannot see a duplicate case name, an empty `expected`,
+    or any field OUTSIDE `expected` — those are pinned separately by
+    `test_row_identities_and_the_band_taxonomy_are_complete`.
     """
     _, rows = _load()
     by_case = {r["case"]: r for r in rows}
@@ -347,6 +199,16 @@ def test_behavioural_cases_declare_their_invariants() -> None:
         assert key in exp, f"{case}: declared expected key {key!r} is missing"
         checked.add((case, key))
         return exp[key]
+
+    # ── the SOURCE cases' D10 topology and identity ───────────────────────
+    for r in _source_rows(rows):
+        case = r["case"]
+        assert declared(case, "node_label") == "Source", "D10: a document is a :Source"
+        assert declared(case, "identity_key") == "url", "D10: identity is the url"
+        assert declared(case, "key_value") == r["input"]["url"], (
+            "the resolved key must BE the source's url"
+        )
+        assert declared(case, "replay_key_resolves") is True
 
     # ── re-ingest unchanged: a no-op ──────────────────────────────────────
     unc_in = by_case["doc-reingest-unchanged"]["input"]
@@ -409,31 +271,7 @@ def test_behavioural_cases_declare_their_invariants() -> None:
         "the round-trip exists BECAUSE production has no edges to test against"
     )
 
-    # ── the SOURCE cases' declarations ────────────────────────────────────
-    # These carry the D10 model itself (label, identity key, resolution). They
-    # are asserted here for the same reason as the behavioural block: an
-    # unasserted declaration is prose, and a prior pass found 11 of 14 mutations
-    # here surviving green.
-    for r in _source_rows(rows):
-        case = r["case"]
-        assert declared(case, "node_label") == "Source", "D10: a document is a :Source"
-        assert declared(case, "identity_key") == "url", "D10: identity is the url"
-        assert declared(case, "key_value") == r["input"]["url"], (
-            "the resolved key must BE the source's url"
-        )
-        assert declared(case, "replay_key_resolves") is True
-        # already cross-checked against the graph, restated here so the
-        # completeness guard covers it
-        assert declared(case, "metered_by_documents_cap") == r["predicate_matrix"][CANON]
-        assert declared(case, "metered_by_sessions_cap") == (
-            r["input"].get("sourceKind") == "agentSession"
-        ), "the sessions meter owns exactly the agentSession rows"
-
     # ── the completeness guard — over every row's declared `expected` ─────
-    # Scope, stated precisely: this compares (case_name, key) pairs drawn from
-    # `expected` blocks. It cannot see a duplicate case name, an empty
-    # `expected`, or any field OUTSIDE `expected` — those are pinned separately
-    # by `test_row_identities_and_the_band_taxonomy_are_complete`.
     declared_keys = {(r["case"], k) for r in rows for k in r["expected"]}
     unasserted = declared_keys - checked
     assert not unasserted, (
@@ -446,9 +284,10 @@ def test_row_identities_and_the_band_taxonomy_are_complete() -> None:
     """Guard the fixture's STRUCTURE, which the (case,key) completeness guard misses.
 
     The `declared()` guard compares `(case_name, key)` pairs, so it cannot see a
-    duplicate case name, an empty `expected` block, or any field outside
-    `expected`. A prior pass demonstrated all three surviving green. This pins
-    them.
+    duplicate case name, or any field outside `expected`. A prior pass
+    demonstrated that surviving green. This pins the structure, the band
+    taxonomy, and the two classification AXES (Q2 — `sourceKind` is *what kind
+    of source*, `documentKind` is *what genre*; they are not interchangeable).
     """
     head, rows = _load()
     cases = [r["case"] for r in rows]
@@ -460,62 +299,173 @@ def test_row_identities_and_the_band_taxonomy_are_complete() -> None:
     # but NOT a deletion — and a deleted row takes its assertions with it,
     # leaving the suite green over a smaller fixture. A review pass demonstrated
     # both `transcript-source` and `doc-with-genre` deleted with 9/9 green.
-    assert set(cases) == {
-        "doc-with-genre", "doc-without-genre", "session-source", "transcript-source",
-        "doc-reingest-unchanged", "doc-reingest-changed", "doc-aboutDocument-roundtrip",
-    }, f"case inventory changed: {sorted(set(cases))}"
+    assert set(cases) == set(BAND_BY_CASE), (
+        f"case inventory changed: {sorted(set(cases))}"
+    )
 
-    # every row declares SOMETHING to be held to
+    # every row sits in the band pinned to it BY NAME — a swap between two rows
+    # leaves the band SET unchanged
     for r in rows:
-        assert r["expected"], f"{r['case']}: empty expected block is unassertable"
+        assert r["band"] == BAND_BY_CASE[r["case"]], (
+            f"{r['case']}: band must be {BAND_BY_CASE[r['case']]!r}, got {r['band']!r}"
+        )
 
     # the band taxonomy is closed, and every band is populated
     bands = {r["band"] for r in rows}
-    known = {"document-must-count", "session-must-not-count", "idempotency",
+    known = {"document-source", "session-source", "idempotency",
              "versioning", "replay-identity"}
     assert bands <= known, f"unknown band(s): {sorted(bands - known)}"
     assert bands == known, f"band(s) with no case: {sorted(known - bands)}"
 
-    # a row in a CAP band must declare a cap verdict — this is what stops a
-    # source row from silently opting out of the metering assertions
-    for r in rows:
-        if r["band"] in ("document-must-count", "session-must-not-count"):
-            assert "metered_by_documents_cap" in r["expected"], (
-                f"{r['case']}: a cap-band row must declare metered_by_documents_cap"
-            )
-
-    # and the band must MATCH the row's sourceKind — otherwise the band set can
-    # still be "complete" while a row is mislabelled (a document filed under
-    # session-must-not-count). A set-equality check cannot see that.
-    expected_band = {"document": "document-must-count",
-                     "agentSession": "session-must-not-count"}
-    for r in _source_rows(rows):
+    # the SOURCE rows are pinned by name, and each band must MATCH the row's
+    # sourceKind — otherwise a document could be filed under `session-source`
+    srcs = _source_rows(rows)
+    assert {r["case"] for r in srcs} == SOURCE_CASES, (
+        f"the source-row set changed: {sorted(r['case'] for r in srcs)} — a row that "
+        f"leaves it escapes every graph-backed check"
+    )
+    for r in srcs:
         sk = r["input"]["sourceKind"]
-        if sk in expected_band:
-            assert r["band"] == expected_band[sk], (
-                f"{r['case']}: sourceKind={sk!r} must sit in band "
-                f"{expected_band[sk]!r}, not {r['band']!r}"
-            )
-
-    # the header schema literal is pinned, and the declared vocabulary actually
-    # covers the genre values the rows use
-    assert head["__schema__"] == (
-        "case/band/input/expected/predicate_matrix/why_this_case/label/reason/source"
-    )
-    used = {r["input"].get("documentKind") for r in rows} - {None}
-    declared_kinds = set(head["__vocabulary_grounds__"]["documentKind"])
-    assert used <= declared_kinds, (
-        f"rows use documentKind(s) absent from the declared vocabulary: {sorted(used - declared_kinds)}"
-    )
-
-
-def test_session_sources_are_not_double_metered(gold_graph) -> None:
-    """Sessions already have their own meter; the docs cap must not count them."""
-    _, g, rows = gold_graph
-    session_rows = [r for r in _source_rows(rows) if r["expected"]["metered_by_sessions_cap"]]
-    assert session_rows, "vacuous guard: no row declares metered_by_sessions_cap=true"
-    for r in session_rows:
-        url = r["input"]["url"]
-        assert _count(g, f"{CYPHER[CANON]} AND src.url = '{url}'") == 0, (
-            f"{r['case']} must NOT be metered by the documents cap"
+        assert sk in BAND_BY_SOURCE_KIND, f"{r['case']}: unexpected sourceKind {sk!r}"
+        assert r["band"] == BAND_BY_SOURCE_KIND[sk], (
+            f"{r['case']}: sourceKind={sk!r} must sit in band "
+            f"{BAND_BY_SOURCE_KIND[sk]!r}, not {r['band']!r}"
         )
+
+    # ── Q2: the two axes are DISJOINT vocabularies ────────────────────────
+    # `sourceKind` answers *what kind of source* and `documentKind` answers
+    # *what genre*; the ontology's whole point is that they are different
+    # questions. A value moving between them is the category error Q2 refuses,
+    # and it would be invisible to every count-based guard above.
+    used_kinds = {r["input"]["sourceKind"] for r in rows if r["input"].get("sourceKind")}
+    declared_source_kinds = set(head["__vocabulary_grounds__"]["sourceKind_seen_in_production"]) \
+        | set(head["__vocabulary_grounds__"]["sourceKind_declared_but_unused"])
+    declared_genres = set(head["__vocabulary_grounds__"]["documentKind"])
+    assert used_kinds <= declared_source_kinds, (
+        f"rows use sourceKind(s) absent from the declared vocabulary: "
+        f"{sorted(used_kinds - declared_source_kinds)}"
+    )
+    overlap = declared_source_kinds & declared_genres
+    assert not overlap, (
+        f"{sorted(overlap)} is declared on BOTH axes — sourceKind (what kind of "
+        f"source) and documentKind (what genre) are different questions (Q2, "
+        f"#5013) and a value must not answer both"
+    )
+    used_genres = {r["input"].get("documentKind") for r in rows} - {None}
+    assert used_genres <= declared_genres, (
+        f"rows use documentKind(s) absent from the declared vocabulary: "
+        f"{sorted(used_genres - declared_genres)}"
+    )
+
+    # the header schema literal is pinned
+    assert head["__schema__"] == (
+        "case/band/input/expected/why_this_case/label/reason/source"
+    )
+
+
+# ── Job 2: the declared facts, measured on a REAL graph ─────────────────────
+
+@pytest.fixture
+def gold_graph(shared_embedded_db):
+    """Write the fixture's :Source rows into an embedded FalkorDB."""
+    from tortoise.sdk import TortoiseSDK
+
+    sdk = TortoiseSDK(shared_embedded_db, namespace="gold")
+    g = sdk._get_proj().g
+    _, rows = _load()
+    g.query("MATCH (n) DETACH DELETE n")
+    for r in _source_rows(rows):
+        inp = r["input"]
+        g.query(
+            "CREATE (s:Source {url: $url, sourceKind: $sk, documentKind: $dk, "
+            "               contentHash: $h, version: $v, title: $t})",
+            {"url": inp["url"], "sk": inp.get("sourceKind"),
+             "dk": inp.get("documentKind"), "h": inp.get("contentHash"),
+             "v": inp.get("version"), "t": inp.get("title")},
+        )
+    return sdk, g, rows
+
+
+def _one(g, url: str) -> dict:
+    """The single node for `url`, with the fields the fixture declares about it."""
+    rows = g.query(
+        "MATCH (src:Source {url: $url}) "
+        "RETURN src.url, src.sourceKind, src.documentKind",
+        {"url": url},
+    ).result_set
+    assert len(rows) == 1, f"{url}: expected exactly one :Source node, got {len(rows)}"
+    return {"url": rows[0][0], "sourceKind": rows[0][1], "documentKind": rows[0][2]}
+
+
+def test_the_graph_half_measures_every_declared_source_fact(gold_graph) -> None:
+    """The proof this fixture exists for.
+
+    Production cannot supply this population (measured all-`agentSession`), so a
+    green gate there proves nothing about documents. Here the fixture
+    guarantees a non-zero, CONTRASTED population — a document with and without
+    a genre, a session with and without one — and every fact the fixture
+    declares about a node is read back off the real graph.
+    """
+    _, g, rows = gold_graph
+    srcs = _source_rows(rows)
+    assert {r["case"] for r in srcs} == SOURCE_CASES, "fixture selection drifted"
+
+    total = int(g.query("MATCH (src:Source) RETURN count(src)").result_set[0][0])
+    assert total == len(srcs) > 0, (
+        f"fixture did not load: {total} nodes for {len(srcs)} declared sources"
+    )
+
+    for r in srcs:
+        inp, exp = r["input"], r["expected"]
+        node = _one(g, inp["url"])
+
+        # identity — the replay key is `url`, and it resolves (Trap 1: a
+        # retargeted label with a stale key resolves to NOTHING, in silence)
+        assert exp["identity_key"] == "url"
+        assert node["url"] == exp["key_value"] == inp["url"], (
+            f"{r['case']}: the declared key value is not the url the node carries"
+        )
+        assert exp["replay_key_resolves"] is True
+
+        # the two axes survive the write, independently
+        assert node["sourceKind"] == inp.get("sourceKind"), (
+            f"{r['case']}: sourceKind {node['sourceKind']!r} != declared "
+            f"{inp.get('sourceKind')!r} — the axis is not a genre"
+        )
+        assert node["documentKind"] == inp.get("documentKind"), (
+            f"{r['case']}: documentKind {node['documentKind']!r} != declared "
+            f"{inp.get('documentKind')!r} — NULL genre is a VALID document shape, "
+            f"not a missing field"
+        )
+
+    # the contrast pairs really contrast: a genre-absent document and a
+    # genre-carrying session both exist in the population
+    genres = {(r["input"].get("sourceKind"), r["input"].get("documentKind"))
+              for r in srcs}
+    assert ("document", None) in genres and ("document", "brief") in genres, (
+        f"the document genre contrast is gone: {sorted(genres)}"
+    )
+    assert ("agentSession", None) in genres and ("agentSession", "transcript") in genres, (
+        f"the session genre contrast is gone: {sorted(genres)}"
+    )
+
+
+def test_no_document_label_is_written_by_the_fixture(gold_graph) -> None:
+    """D10: the `:Document` label is RETIRED, and the fixture must not revive it.
+
+    The fixture is a gold target for the D10 topology; if it ever declares or
+    loads a `:Document` node it would be re-asserting the model D10 retired
+    (PR #5127) — and a lane copying it would write the label back into the
+    extractor.
+    """
+    _, g, rows = gold_graph
+    docs = int(g.query("MATCH (d:Document) RETURN count(d)").result_set[0][0])
+    assert docs == 0, "the fixture wrote a :Document node — D10 retired that label"
+
+    for r in rows:
+        exp = r.get("expected", {})
+        for key in ("node_label", "resolved_target_label"):
+            if key in exp:
+                assert exp[key] == "Source", (
+                    f"{r['case']}: {key} is {exp[key]!r} — D10 makes a document a :Source"
+                )

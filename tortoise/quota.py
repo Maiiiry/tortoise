@@ -169,6 +169,16 @@ MAX_OPERATORS = 500
 # Rationale for 10×: docs are content nodes WITHOUT claim extraction or EP
 # churn (Sources only, #1726 slice 1) — an order of magnitude cheaper than
 # points; the gate still bounds runaway corpus growth.
+# ⛔ RETIRED MODEL, LIVE CODE (#5332). The owner's cost-model direction
+# (2026-09-25, recorded in full on #5013) supersedes this cap: a document is
+# NOT a cost unit, and the count meters are replaced by measured bytes
+# (Postgres MB/GB + graph MB) plus extraction ops, with volume sold as
+# overage instead of gated as a count. The resource below is therefore the
+# RETIRED model in live code — kept because removing it is the
+# replacement-meters lane (#4495, #5045), tracked separately, not a cleanup
+# to take here. Do NOT read this block as the current cost model, and do NOT
+# extend it; `/v1/index/docs` stays gated by the storage + extraction
+# allowance. Full record: docs/architecture/STORAGE-ARCHITECTURE.md §9.5 Q4.
 _DOCUMENTS_FROM_POINTS_FACTOR = 10
 
 _RESOURCE_LIMIT_KEYS = {

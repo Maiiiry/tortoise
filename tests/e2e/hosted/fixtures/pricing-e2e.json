@@ -18,7 +18,8 @@
     "cost_basis": {
       "falkordb_per_gb": 73.0,
       "bytes_per_node": 1024,
-      "dedup": "content_hash"
+      "dedup": "content_hash",
+      "_comment": "RETIRED BASIS (#5332): `bytes_per_node` is the retired NODE-COUNT proxy. The owner's cost-model direction of 2026-09-25 (recorded in full on #5013) retired the count meters as cost units: a document is not a cost unit, and by extension the node-count `points` cap is not the graph-cost unit. Cost is now the bytes stored (Postgres MB/GB + graph MB) plus the extraction triggered (LLM usage), with volume sold as OVERAGE rather than gated as a count. Graph storage is MEASURED MB/GB (tortoise/graph_storage.py, #5331), so `max_graph_nodes x bytes_per_node` is the retired model and MUST NOT be wired to a cap. Mirrors product/pricing.json - see there for the full note."
     }
   },
   "tiers": {
