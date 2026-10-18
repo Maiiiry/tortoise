@@ -408,6 +408,90 @@ def test_a_dropped_table_takes_its_columns_with_it(tmp_path):
     assert not any("'embed_calls'" in f for f in findings), findings
 
 
+def test_a_multi_target_drop_table_takes_EVERY_table_with_it(tmp_path):
+    """MUTATION: ``DROP TABLE a, b`` drops both — not only the first.
+
+    ``DROP TABLE`` takes a comma-separated target list and Postgres drops all of
+    them atomically. The replay captured a SINGLE identifier, so ``DROP TABLE IF
+    EXISTS a, b`` popped only ``a`` and ``b``'s columns kept reading as present
+    for the rest of the replay — the stale-declaration fail-open the replay exists
+    to close, one target further in (and the twin of the multi-verb ``ALTER
+    TABLE`` arm above). The surviving table's column must still be found, so this
+    is not a predicate that simply says no.
+    """
+    root = _migration_root(tmp_path, textwrap.dedent("""
+        CREATE TABLE public.metering_first (embed_first bigint);
+        CREATE TABLE public.metering_second (embed_second bigint);
+        CREATE TABLE public.metering_kept (embed_kept bigint);
+        DROP TABLE IF EXISTS public.metering_first, public.metering_second;
+    """))
+    sql = audit.migration_text(root)
+    assert audit._creates_column(sql, "embed_first") is False
+    assert audit._creates_column(sql, "embed_second") is False
+    assert audit._creates_column(sql, "embed_kept") is True
+    with _declaring(_mutated("egress", columns=("embed_second", "embed_kept"))):
+        findings = audit.check_ledger(root)
+    assert any("'embed_second'" in f for f in findings), findings
+    assert not any("embed_kept" in f for f in findings), findings
+
+
+def test_a_dash_inside_a_string_literal_does_not_swallow_the_ddl_after_it():
+    """MUTATION: the comment strip is QUOTE-AWARE, so literals cannot eat DDL.
+
+    ``_strip_sql_comments`` used ``re.sub(r"--[^\n]*")``, which is quote-unaware:
+    a ``--`` inside a single-quoted literal deleted the literal's closing quote
+    too, leaving an unterminated quote that made ``_statements`` run to the NEXT
+    quote and emit one statement matching no DDL regex. Everything after it —
+    ``DROP FUNCTION``, ``RENAME COLUMN`` — went invisible, in BOTH directions:
+    a dropped/renamed symbol read as still present, and a symbol that IS created
+    read as drift when the literal came first. Each assertion below is that
+    inversion.
+    """
+    dropped = textwrap.dedent("""
+        CREATE FUNCTION public.metering_kept(text) RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+        COMMENT ON TABLE public.metering_records IS 'a -- b';
+        DROP FUNCTION IF EXISTS public.metering_kept(text);
+    """)
+    assert audit._defines_function(dropped, "metering_kept") is False
+    renamed = textwrap.dedent("""
+        ALTER TABLE public.metering_records ADD COLUMN embed_calls bigint;
+        COMMENT ON TABLE public.metering_records IS 'a -- b';
+        ALTER TABLE public.metering_records RENAME COLUMN embed_calls TO embed_call_count;
+    """)
+    assert audit._creates_column(renamed, "embed_calls") is False
+    assert audit._creates_column(renamed, "embed_call_count") is True
+    # ... and the mirror failure: a literal BEFORE real DDL must not report the
+    # column the DDL really creates as drift (a false red on a correct change).
+    created = textwrap.dedent("""
+        COMMENT ON TABLE public.metering_records IS 'a -- b';
+        ALTER TABLE public.metering_records ADD COLUMN IF NOT EXISTS embed_calls bigint;
+    """)
+    assert audit._creates_column(created, "embed_calls") is True
+    # ... and the real corpus is still read through the same lexer:
+    assert audit._creates_column(migration_sql(), "embed_calls") is True
+
+
+def test_an_unlexable_corpus_is_a_finding_not_a_silent_pass(tmp_path):
+    """MUTATION: an input the replay cannot read is drift, never a skip.
+
+    The module's rule is "an unresolvable declaration is reported as drift, never
+    skipped with a warning". A corpus containing an unterminated literal leaves
+    every following statement unread, and the pre-fix replay returned a clean
+    ``[]`` — the gate reporting "verified" about statements it never saw.
+    """
+    root = _migration_root(tmp_path, textwrap.dedent("""
+        -- the literal below is never closed
+        COMMENT ON TABLE public.metering_records IS 'a -- b;
+        ALTER TABLE public.metering_records ADD COLUMN embed_calls bigint;
+    """))
+    # The ledger must SAY it could not read the corpus (pre-fix: a clean ``[]``),
+    # and the lexer must name the problem rather than truncate silently.
+    with _declaring(_mutated("egress", columns=("embed_calls",))):
+        findings = audit.check_ledger(root)
+    assert any("cannot be replayed" in f for f in findings), findings
+    assert audit._lex_sql(audit.migration_text(root)).problems
+
+
 def test_an_rpc_renamed_or_dropped_by_an_APPENDED_migration_is_drift(tmp_path):
     """MUTATION: the RPC twin — the end state, not the historical ``CREATE``.
 

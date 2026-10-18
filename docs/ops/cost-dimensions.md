@@ -74,12 +74,16 @@ declares the limit instead of inventing one.
    in filename order, so `CREATE TABLE` bodies, `ALTER TABLE … ADD COLUMN`, `RENAME
    COLUMN`, `DROP COLUMN`, `RENAME TO`, `DROP TABLE`, `CREATE [OR REPLACE] FUNCTION
    public.<name>(`, `ALTER FUNCTION … RENAME TO` and `DROP FUNCTION` all move the end
-   state — every command in a multi-command `ALTER TABLE`, not only the first — which is
+   state — every command in a multi-command `ALTER TABLE`, not only the first, and
+   **every** table of a multi-target `DROP TABLE a, b` — which is
    how this repo renames things (`20260915000001_tenancy_team_to_org.sql` appends the
    rename and leaves the earlier files' historical `team` spelling untouched). Nothing is
    matched as a bare substring and nothing inside a SQL comment, so prose that names the
    old symbol does not
-   pass. **Declared delay:** a PR that edits only a migration outside the metering set does
+   pass. The comment strip is **quote-aware**, so a `--` inside a string literal
+   (`COMMENT ON … IS 'a -- b'`) is data and cannot swallow the DDL that follows it; and an
+   input the replay cannot read (unterminated literal, body or block comment) is reported
+   as drift rather than silently skipped. **Declared delay:** a PR that edits only a migration outside the metering set does
    not select this test (the diff selector does not map `supabase/` to a surface), so such a
    drift is caught by the next `core`/`api` PR rather than by the migration PR itself.
 3. **no dead hook** — a dimension's writer must be referenced from a tracked **non-test**

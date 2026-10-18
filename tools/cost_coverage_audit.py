@@ -28,8 +28,12 @@ Two verbs against ONE declaration (``tortoise/cost_dimensions.py``):
        (every command in a multi-command ``ALTER TABLE`` included, not only the
        first). A column renamed in an appended migration and not in the declaration
        fails here, and so does an RPC renamed by ``ALTER FUNCTION … RENAME TO`` or
-       dropped by ``DROP FUNCTION``. Nothing is matched as a substring or inside a
-       SQL comment.
+       dropped by ``DROP FUNCTION``, and a multi-target ``DROP TABLE a, b`` takes
+       BOTH tables' columns with it. Nothing is matched as a substring or inside a
+       SQL comment — the strip is quote-aware, so a ``--`` inside a string literal
+       cannot swallow the DDL after it — and an input the replay cannot lex
+       (unterminated literal / body / block comment, unreadable ``DROP TABLE``
+       target) is reported as a FINDING, never skipped.
     3. **no dead hook** — a dimension's writer (or reader, when the read path is
        the primitive) must have a call site in a tracked NON-TEST, NON-TOOL file,
        or the declaration must carry ``unscheduled_reason``. #4493's defect was a
@@ -232,7 +236,10 @@ def check_ledger(root: Path) -> list[str]:
     if not sql:
         return [f"no migrations found under {_MIGRATIONS}/ — cannot verify the ledger"]
     schema = _effective_schema(sql)
-    findings: list[str] = []
+    # An input the replay could not read is DRIFT, not a pass: a corpus the lexer
+    # gave up on is a corpus whose statements were never checked.
+    findings: list[str] = [f"migrations cannot be replayed: {problem}"
+                           for problem in schema.problems]
     for dim in cd.dimensions():
         for column in dim.columns:
             if not schema.has_column(column):
@@ -247,8 +254,17 @@ def check_ledger(root: Path) -> list[str]:
     return findings
 
 
-def _strip_sql_comments(sql: str) -> str:
-    """*sql* with ``--`` line and ``/* */`` block comments removed.
+@dataclass(frozen=True)
+class _Lexed:
+    """*sql* reduced to CODE (comments gone, literals kept) plus its PROBLEMS."""
+
+    code: str
+    problems: tuple[str, ...] = ()
+
+
+@cache
+def _lex_sql(sql: str) -> _Lexed:
+    """Split *sql* into code plus literals, removing SQL comments only in CODE.
 
     The predicates below match DDL, and the migrations carry long header comments
     that quote the very statements they describe (measured:
@@ -257,13 +273,106 @@ def _strip_sql_comments(sql: str) -> str:
     comment as a definition; stripping first is what makes the "DDL position"
     claim true.
 
-    ORDER MATTERS: line comments go FIRST. A ``--`` note that happens to contain
-    an unmatched ``/*`` would otherwise make the DOTALL block-comment sweep run to
-    the next ``*/`` far away and delete real DDL — measured while fixing this
+    The strip is QUOTE-AWARE, because a regex is not: ``--`` inside a
+    single-quoted literal (``COMMENT ON TABLE public.x IS 'a -- b'``) is DATA. A
+    ``re.sub(r"--[^\n]*")`` deleted the literal's closing quote along with the
+    rest of the line, leaving an unterminated quote that made ``_statements`` run
+    to the NEXT quote and emit one statement matching no DDL regex — measured: a
+    ``DROP FUNCTION`` after such a literal read as still defined, and a ``RENAME
+    COLUMN`` after one read as never applied (fail-OPEN in both directions), and
+    a column that IS created read as drift when the literal came first (false
+    RED). Dollar-quoted bodies and double-quoted identifiers are opaque for the
+    same reason, and Postgres NESTS ``/* */``, so the block sweep counts depth —
+    the old DOTALL sweep ran to the first ``*/`` far away and deleted real DDL
     (``graph_storage_mb``'s ``ALTER TABLE … ADD COLUMN`` vanished).
+
+    Input that cannot be lexed (unterminated literal, identifier, dollar body or
+    block comment) comes back as a PROBLEM, never as a silent truncation: this
+    module's rule is that an unresolvable input is drift, never skipped.
     """
-    without_line = re.sub(r"--[^\n]*", "", sql)
-    return re.sub(r"/\*.*?\*/", "", without_line, flags=re.DOTALL)
+    out: list[str] = []
+    problems: list[str] = []
+    i, n = 0, len(sql)
+
+    def line_of(index: int) -> int:
+        return sql.count("\n", 0, index) + 1
+
+    while i < n:
+        ch = sql[i]
+        if ch == "'":  # single-quoted literal — data, never comment
+            j, closed = i + 1, False
+            while j < n:
+                if sql[j] == "'":
+                    if sql[j + 1:j + 2] == "'":  # doubled quote inside the literal
+                        j += 2
+                        continue
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                problems.append(
+                    f"unterminated single-quoted literal at line {line_of(i)}")
+                out.append(sql[i:])
+                i = n
+                break
+            out.append(sql[i:j + 1])
+            i = j + 1
+            continue
+        if ch == '"':  # quoted identifier — a name, not a comment
+            j = sql.find('"', i + 1)
+            if j == -1:
+                problems.append(f"unterminated quoted identifier at line {line_of(i)}")
+                out.append(sql[i:])
+                i = n
+                break
+            out.append(sql[i:j + 1])
+            i = j + 1
+            continue
+        if ch == "$":  # dollar-quoted body — procedural code, not schema
+            tag = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$", sql[i:])
+            if tag:
+                opener = tag.group(0)
+                end = sql.find(opener, i + len(opener))
+                if end == -1:
+                    problems.append(
+                        f"unterminated dollar-quoted body at line {line_of(i)}")
+                    out.append(sql[i:])
+                    i = n
+                    break
+                out.append(sql[i:end + len(opener)])
+                i = end + len(opener)
+                continue
+        if sql.startswith("--", i):  # line comment
+            end = sql.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        if sql.startswith("/*", i):  # block comment (Postgres nests them)
+            depth, j = 0, i
+            while j < n:
+                if sql.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                    continue
+                if sql.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                    if depth == 0:
+                        break
+                    continue
+                j += 1
+            if depth != 0:
+                problems.append(f"unterminated block comment at line {line_of(i)}")
+                i = n
+                break
+            out.append(" ")  # keep adjacent tokens apart
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return _Lexed("".join(out), tuple(problems))
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """*sql* with comments removed and literals preserved (see ``_lex_sql``)."""
+    return _lex_sql(sql).code
 
 
 #: A column DEFINITION, not a mention: a name/type pair at the head of a
@@ -294,9 +403,11 @@ _ALTER_TABLE_VERB = re.compile(
     rf"|\bDROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?({_IDENT})"
     rf"|\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})",
     re.IGNORECASE)
+#: ``DROP TABLE`` takes a TARGET LIST (``DROP TABLE IF EXISTS a, b`` drops both), so
+#: the whole list is captured and split; the single-identifier form matched only
+#: the first table and left every later table's columns reading as present.
 _DROP_TABLE = re.compile(
-    rf"^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:public\.)?({_IDENT})",
-    re.IGNORECASE)
+    r"^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(.*)$", re.IGNORECASE | re.DOTALL)
 _CREATE_FUNCTION = re.compile(
     rf"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:public\.)?({_IDENT})\s*\(",
     re.IGNORECASE)
@@ -327,12 +438,18 @@ class _Schema:
 
     Every verb moves the end state, not just the first one in a statement: a
     single ``ALTER TABLE`` may carry several commands, and a ``DROP TABLE`` takes
-    the columns it held with it. Missing either left a column that the schema no
+    the columns it held with it — EVERY table of a multi-target ``DROP TABLE a,
+    b``, not only the first. Missing either left a column that the schema no
     longer has reading as present — the stale-declaration fail-open.
+
+    ``problems`` carries what the replay could NOT read (an unlexable corpus, an
+    unreadable ``DROP TABLE`` target). ``check_ledger`` reports each as drift, so a
+    statement the replay skipped is never a statement that passed.
     """
 
     columns: dict[str, set[str]]
     functions: set[str]
+    problems: tuple[str, ...] = ()
 
     def has_column(self, column: str) -> bool:
         wanted = column.strip('"').lower()
@@ -347,7 +464,9 @@ def _effective_schema(sql: str) -> _Schema:
     """Replay *sql* statement by statement into its end state (see ``_Schema``)."""
     columns: dict[str, set[str]] = {}
     functions: set[str] = set()
-    for statement in _statements(_strip_sql_comments(sql)):
+    lexed = _lex_sql(sql)
+    problems: list[str] = list(lexed.problems)
+    for statement in _statements(lexed.code):
         create_table = _CREATE_TABLE.match(statement)
         if create_table:
             table = _table_name(create_table.group(1))
@@ -369,7 +488,10 @@ def _effective_schema(sql: str) -> _Schema:
             continue
         drop_table = _DROP_TABLE.match(statement)
         if drop_table:
-            columns.pop(_table_name(drop_table.group(1)), None)
+            targets, unreadable = _drop_table_targets(drop_table.group(1))
+            for target in targets:
+                columns.pop(target, None)
+            problems.extend(unreadable)
             continue
         alter_table = _ALTER_TABLE.match(statement)
         if not alter_table:
@@ -390,7 +512,31 @@ def _effective_schema(sql: str) -> _Schema:
                 cols.discard(_table_name(dropped))
             else:
                 cols.add(_table_name(added))
-    return _Schema(columns, functions)
+    return _Schema(columns, functions, tuple(dict.fromkeys(problems)))
+
+
+def _drop_table_targets(raw: str) -> tuple[list[str], list[str]]:
+    """Every table a ``DROP TABLE`` names, plus the targets the replay cannot read.
+
+    ``DROP TABLE`` takes a comma-separated target list and Postgres drops all of
+    them in one statement, so popping only the FIRST left every later table's
+    columns reading as present for the rest of the replay — the same
+    stale-declaration fail-open the replay closes for append-only migrations, one
+    target further in. A target this replay cannot read is a PROBLEM, never a
+    silent half-drop.
+    """
+    targets: list[str] = []
+    problems: list[str] = []
+    for part in _split_top_level(raw):
+        token = re.sub(r"\b(?:CASCADE|RESTRICT)\s*$", "", part.strip(), flags=re.IGNORECASE)
+        token = re.sub(r"^public\.", "", token.strip(), flags=re.IGNORECASE)
+        if re.fullmatch(_IDENT, token):
+            targets.append(_table_name(token))
+        elif token:
+            problems.append(
+                f"DROP TABLE target {part.strip()!r} cannot be read — the tables it "
+                "names are not tracked")
+    return targets, problems
 
 
 def _table_name(identifier: str) -> str:
