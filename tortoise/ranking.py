@@ -85,7 +85,7 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # converts that ONE-rank difference into a relevance gap that grows as the
 # pool shrinks — measured on the shipped hybrid path, as the RELEVANCE gap the
 # boost must clear (so the comparison with the 0.0175 boost effect is
-# like-for-like): 0.0188 of final score on the 4-row E2E-1 fixture (just above
+# like-for-like): 0.0189 of final score on the 4-row E2E-1 fixture (just above
 # the 0.0175 boost, so the contested twin ranks BELOW its twin), 0.5 on a
 # 3-row pool (there the twins occupy both ends of the normalization span; the
 # final-score residual once the shipped boost is applied is 0.5 - 0.0175 =
@@ -127,8 +127,16 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # equal-recency case with ``d_gb == 0`` — the case the measured pages here
 # exhibit, because the E2E-1 twins share a baseline ``graph_boost`` (identical
 # operator connectivity).  That premise is what makes the flat 1.4286 figures
-# below legitimate, so the test pins it by name rather than assuming it.  A
-# 2-row page is the worst PAGE because a page cannot hold fewer than the two
+# below legitimate, so the test pins it by name rather than assuming it.
+# A wider CONFIDENCE gap moves ``d_gb``, and a contested twin is normally held
+# with LOWER confidence than its twin — so ``d_gb`` >= 0 and the real
+# requirement sits at or ABOVE 1.857 (measured end-to-end: a maximal gap, calm
+# 1.0 / contested 0.0, gives ``d_gb`` = 0.5 and puts the 2-row requirement at
+# 1.4286 + 0.5 = 1.9286, above that band).  Hence 1.857 is the PARITY case and
+# not a universal ceiling; the conclusion below is unaffected in direction — a
+# larger ``d_gb`` only takes the requirement further above the clamp's 0.3 of
+# headroom, never below it.
+# A 2-row page is the worst PAGE because a page cannot hold fewer than the two
 # rows being ordered: it is a maximum, not the first term of a series.  Measured
 # on the bare 4-row E2E-1 fixture (dense leg live, re-measured 2026-10-18):
 # required total ``cb`` 1.4286 on a 2-row page (built from the fused rows — the

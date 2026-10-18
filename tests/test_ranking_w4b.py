@@ -749,6 +749,15 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert ({k: by_id[calm]["scores"].get(k) for k in ("fts", "vector")}
             == {k: by_id[hot]["scores"].get(k) for k in ("fts", "vector")})
     two_row = [dict(by_id[hot]), dict(by_id[calm])]
+    # The comment JUSTIFIES building the 2-row page from the fused rows by
+    # saying the SDK's own limit=2 read does not hold both twins.  Assert the
+    # premise: if it ever does, the constructed page is no longer the honest
+    # stand-in for a 2-row read.
+    res2 = ranked_sdk.tortoise_fts_query(query, limit=2, order_by="graph")
+    assert not {hot, calm} <= {r["id"] for r in res2}, (
+        f"the comment says the SDK's own limit=2 read does not hold both "
+        f"twins; it now does ({[r['id'] for r in res2]}) — re-derive the "
+        f"paragraph instead of re-describing it")
     ten_req, ten_hot, ten_calm, _tids = required_cb([dict(r) for r in res])
 
     # ── Worst case: a 2-row page (a page cannot be smaller) ───────────────
@@ -827,6 +836,14 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"the comment quotes 1.857 as the ceiling at |d_gb| = 0; this page's "
         f"|d_gb| = {abs(two_gb_calm - two_gb_hot):.4f} puts it at "
         f"{ceiling:.4f}")
+    # …and the general ceiling the comment now names, with ``|d_gb|`` at its
+    # maximum: pure arithmetic on the three weights, labelled as such.
+    absolute = (
+        DEFAULT_SIMILARITY_WEIGHT + DEFAULT_GRAPH_BOOST_WEIGHT + DEFAULT_RECENCY_WEIGHT
+    ) / DEFAULT_GRAPH_BOOST_WEIGHT
+    assert absolute == pytest.approx(2.857, abs=1e-3), (
+        f"the comment quotes 2.857 as the saturation at maximal |d_gb| "
+        f"(sim_w + graph_w + rec_w) / graph_w; this is {absolute:.4f}")
     # THE GUARANTEE: what a cb inside [0, 1] can buy is at most the clamp's
     # headroom 1.0 - baseline, and the requirement exceeds it. (Separately,
     # ``two_req >= 1.0`` — numerically the floor at these weights — is the
@@ -940,6 +957,10 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert ten_req == pytest.approx(0.0540, abs=2e-3), (
         f"the comment quotes a 0.0540 requirement on the shipped default "
         f"page; this run measures {ten_req:.4f}")
+    assert ten_req * DEFAULT_GRAPH_BOOST_WEIGHT == pytest.approx(0.0189, abs=1e-3), (
+        f"the comment quotes this page's relevance gap as 0.0189 of final "
+        f"score (just above the 0.0175 boost); this run measures "
+        f"{ten_req * DEFAULT_GRAPH_BOOST_WEIGHT:.4f}")
     clears_2102 = DEFAULT_SIMILARITY_WEIGHT * 0.05 / DEFAULT_GRAPH_BOOST_WEIGHT
     assert clears_2102 == pytest.approx(0.0714, abs=1e-3)
     assert ten_req < clears_2102, (
@@ -973,6 +994,36 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"({ten_req:.4f}) and inside the clamp's headroom "
         f"({ten_headroom:.4f}). If it does not, the comment's 'a modest "
         f"raise therefore DOES repair the shipped default read' is false")
+
+    # ── The bound is CONDITIONAL: the ``Δgb`` term is not free ─────────────
+    # ``cb_req = (sim_w*Δsim + graph_w*Δgb + rec_w*Δrec) / graph_w``.  1.857 (and
+    # the 1.4286 above) is the ``Δgb == 0`` case; a CONTESTED twin normally holds
+    # LOWER confidence, so ``Δgb`` >= 0 and the real requirement sits at or above
+    # it.  Measured end-to-end through the real ranker: give the twins a maximal
+    # confidence gap and the 2-row requirement rises by exactly ``Δgb``, past the
+    # parity ceiling — which is why the comment must not quote 1.857 as the
+    # general bound.
+    proj = ranked_sdk._get_proj()
+    for pid, conf in ((calm, 1.0), (hot, 0.0)):
+        proj.g.query(
+            "MATCH (n:Point {id:$id}) SET n.confidence = $c",
+            params={"id": pid, "c": conf},
+        )
+    wide_req, _wh, _wc, _wid = required_cb(two_row)
+    wide_gb_calm, wide_gb_hot = baseline_graph_boost(two_row)
+    wide_dgb = wide_gb_calm - wide_gb_hot
+    assert wide_dgb == pytest.approx(0.5, abs=5e-3), (
+        f"a 1.0/0.0 confidence gap must move Δgb by 0.5 (graph_boost is "
+        f"0.5 * confidence + 0.5 * connectivity); got {wide_dgb:.4f}")
+    assert wide_req == pytest.approx(two_req + wide_dgb, abs=5e-3), (
+        f"the requirement must rise by exactly Δgb ({wide_dgb:.4f}) when the "
+        f"twins' baselines diverge: {wide_req:.4f} vs {two_req:.4f}")
+    assert wide_req > ceiling, (
+        f"with Δgb > 0 the requirement ({wide_req:.4f}) exceeds the parity "
+        f"ceiling {ceiling:.4f} — so W4_CONTESTED_BOOST's comment must state "
+        f"1.857 as the PARITY case, not as the general bound")
+    assert wide_req <= absolute, (
+        f"and it must still be bounded: {wide_req:.4f} <= {absolute:.4f}")
 
 
 def test_integration_w4_enrich_false_suppresses_boost_with_flag_on(ranked_sdk, monkeypatch):
