@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 
 import pytest
 
@@ -450,9 +451,31 @@ def _seed_twin_conflict(sdk, counter_content: str) -> tuple[str, str, str]:
 
     The calm twin receives a PARITY NAND from an unrelated point so both
     twins have identical operator-connectivity: the only difference that
-    can separate them is EP variance (and the W4-b boost under it)."""
+    can separate them is EP variance (and the W4-b boost under it).
+
+    TWO premises come out of the mint order, and both are asserted here
+    rather than assumed downstream (a ranking assertion must not rest on a
+    silent fixture accident):
+
+    * ``ulid()`` is ``<ms-hex>-<random>``, so the twins' id order — and with
+      it which twin #3019's ``ORDER BY score DESC, node.<id> ASC`` tie-break
+      hands rank 0 — is decided by the millisecond each was minted in.  The
+      mint below steps across a millisecond boundary (2 ms) so a same-ms
+      collision cannot hand the tie-break to 48 bits of randomness.
+    * the STAND-IN embedder's vectors are hash-seeded
+      (``force_embedder_on``: "assertions must never depend on the vectors'
+      VALUES"), so WHICH filler row lands between the twins on a small fused
+      page is a property of this fixture's texts, not of the mechanism.  A
+      test that quotes a number depending on that span names it as a premise.
+    """
     calm = sdk.create_point("statement", _TWIN_CONTENT)
+    time.sleep(0.002)  # cross an ulid() millisecond boundary — see docstring
     hot = sdk.create_point("statement", _TWIN_CONTENT)
+    assert calm["id"] < hot["id"], (
+        f"the calm twin must hold the LOWER ULID (#3019's id tie-break is "
+        f"what hands it rank 0, and every span assertion reads that way "
+        f"round): calm {calm['id']} vs hot {hot['id']} — regenerate the "
+        f"fixture rather than re-deriving the numbers")
     cc = sdk.create_point("statement", counter_content)
     cc_parity = sdk.create_point(
         "statement", "regional weather fronts shift whole bird populations")
@@ -697,20 +720,30 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     calm, hot, _cc = _seed_twin_conflict(
         ranked_sdk, "zebra finch flocking behavior is social, not migratory")
     monkeypatch.setenv("TORTOISE_W4_ENRICHMENT", "1")
-    contrib = W4_CONTESTED_BOOST * DEFAULT_GRAPH_BOOST_WEIGHT
     query = "zebra finch migration"
     ranker = GraphRanker(projection=ranked_sdk._get_proj())
 
     def required_cb(rows: list[dict]) -> tuple[float, dict, dict, list[str]]:
         """Total ``cb`` that would bring the contested twin level with its
-        twin, read off this page's payloads (strip the applied boost back
-        out — the boost is the only thing separating the twins' structure)."""
+        twin, read off this page's payloads: strip the boost that was ACTUALLY
+        applied back out — the boost is the only thing separating the twins'
+        structure — and divide what is left by the graph weight.
+
+        The applied increment is read OFF THE PAYLOAD (the contested row's
+        post-boost ``graph_boost`` minus its own query-less baseline), never
+        from ``W4_CONTESTED_BOOST``: inside the ``cb=2.0`` block the clamp
+        delivers only ``1.0 - 0.7 = 0.3`` of the request, so a helper that
+        stripped the requested magnitude (2.0) or the shipped one (0.05) would
+        return ``(gap + 0.7)/0.35`` instead of the level condition.
+        """
         page = ranker.rerank(rows, query=query)
         gr = {r["id"]: r["graph_ranking"] for r in page}
         assert hot in gr and calm in gr, (
             f"the twins are not both on this page: {sorted(gr)}")
         h, c = gr[hot], gr[calm]
-        gap = c["final_score"] - (h["final_score"] - contrib)
+        applied = h["graph_boost"] - baseline_graph_boost(rows)[1]
+        gap = c["final_score"] - (
+            h["final_score"] - applied * DEFAULT_GRAPH_BOOST_WEIGHT)
         return (gap / DEFAULT_GRAPH_BOOST_WEIGHT, h, c,
                 [r["id"] for r in page])
 
@@ -865,8 +898,17 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # past the clamp and the ordering still loses, the graph term pinned.
     with monkeypatch.context() as patched:
         patched.setattr("tortoise.ranking.W4_CONTESTED_BOOST", 2.0)
-        _req, huge_hot, huge_calm, huge_ids = required_cb(two_row)
+        huge_req, huge_hot, huge_calm, huge_ids = required_cb(two_row)
     assert huge_hot["w4_contested_boost"] == 2.0, "the bigger boost did not apply"
+    # The requirement is a property of the PAGE, not of the boost that happened
+    # to be applied, so stripping the CLAMPED increment (1.0 - 0.7 = 0.3, not
+    # the requested 2.0) must return the same 2-row requirement as the shipped
+    # run.  A helper that stripped the requested or the shipped magnitude would
+    # report 1.095 / 1.1786 here — numbers that are not level conditions.
+    assert huge_req == pytest.approx(two_req, abs=5e-3), (
+        f"reading the requirement back off the cb=2.0 run must reproduce the "
+        f"page's own requirement ({two_req:.4f}); got {huge_req:.4f} — the "
+        f"strip in ``required_cb`` is no longer the increment that applied")
     assert huge_hot["graph_boost"] == 1.0, (
         f"the documented [0,1] clamp must bind: graph_boost="
         f"{huge_hot['graph_boost']} — if it no longer does, a large cb DOES "
@@ -895,8 +937,7 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # The comment's middle row.  A 3-row fused page STILL holds the twins at
     # both ends of the span (the third row lands in the middle), so it buys
     # nothing over the 2-row page — which is why the requirement is flat to
-    # 1.4286 and only falls at limit>=4.  Both quoted figures are pinned here:
-    # the requirement, and the 0.4825 final-score delta on that pool.
+    # 1.4286 and only falls at limit>=4.
     res3 = ranked_sdk.tortoise_fts_query(query, limit=3, order_by="graph")
     assert {r.get("match_source") for r in res3} == {"rrf"}, (
         "the limit=3 row of the comment is a FUSED-read measurement")
@@ -904,7 +945,26 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         [dict(r) for r in res3])
     assert {hot, calm} <= set(three_ids), (
         f"the 3-row page must hold both twins: {three_ids}")
-    assert {three_calm["similarity"], three_hot["similarity"]} == {0.0, 1.0}
+    # The DRAW-INDEPENDENT half of the comment's claim: the requirement is
+    # non-increasing in page size (``_min_max_normalize``'s span can only grow,
+    # and the twins' own numerator is fixed by their ranks), so a 3-row page can
+    # never need more than the 2-row worst case.  This holds whichever row the
+    # page puts between the twins.
+    assert three_req <= two_req + 5e-3, (
+        f"the 3-row requirement ({three_req:.4f}) must not EXCEED the 2-row "
+        f"one ({two_req:.4f}): the requirement falls as the page grows")
+    # The exact 1.4286 additionally needs the twins to consume the whole span
+    # (a third row strictly between them).  WHICH row that is belongs to the
+    # fixture's texts through the stand-in embedder's hash-seeded vectors, so
+    # the premise is named, here and in ``_seed_twin_conflict``.
+    assert {three_calm["similarity"], three_hot["similarity"]} == {0.0, 1.0}, (
+        f"EMBEDDER/FIXTURE PREMISE: the comment's flat 1.4286 at limit=3 "
+        f"assumes a third row lands BETWEEN the twins, so they still hold both "
+        f"ends of the span; this page gives calm "
+        f"{three_calm['similarity']} / hot {three_hot['similarity']} "
+        f"({three_ids}). Which row lands where is set by the stand-in "
+        f"embedder's hash-seeded vectors and the twins' mint order — a text "
+        f"edit to the fixture can move it without any ranker change")
     assert three_hot["similarity"] == 0.0, (
         f"FIXTURE PREMISE BROKEN (see the 2-row note above): the contested "
         f"twin must sit at the 0 end of the span; here calm "
@@ -912,28 +972,29 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert three_req == pytest.approx(1.4286, abs=5e-3), (
         f"the comment quotes 1.4286 at limit=3; this page requires "
         f"{three_req:.4f}")
-    # The comment quotes this pool's gap on the RELEVANCE basis — what the boost
-    # has to clear, like the 0.0188 beside it — and (parenthetically) the
-    # residual a reader sees in the payload once the shipped boost applies.
-    # 0.5 / 0.35 also reconciles with the 1.4286 above; a post-boost figure
-    # quoted alone would not (0.4825 / 0.35 = 1.3786).  Both are MEASURED from
-    # the payload (the residual plus the applied boost), not restated from
-    # ``three_req`` — otherwise the 0.5 would assert nothing the 1.4286 above
-    # does not already say.
+    # Both figures the comment quotes for this pool, each pinned to the CONSTANT
+    # it quotes rather than to a rearrangement of the others (an assertion built
+    # from the payload it is meant to check — ``residual == (residual + boost) -
+    # boost`` — can never fail and guards nothing):
+    #   * 0.5    — the pre-boost relevance gap the boost must clear (the basis
+    #              the 0.0189 beside it is on; 1.4286 * 0.35),
+    #   * 0.4825 — the final-score residual a reader sees in the payload once the
+    #              shipped boost applies (0.5 - 0.0175).
+    # The boost separating them is read off the payload, so a silent change to
+    # the applied magnitude shows up as a 0.5 that no longer reconciles.
+    assert three_hot["w4_contested_boost"] == W4_CONTESTED_BOOST, (
+        f"the 3-row page must carry the SHIPPED boost (payload says "
+        f"{three_hot['w4_contested_boost']}); both quoted figures assume it")
+    three_applied = three_hot["w4_contested_boost"] * DEFAULT_GRAPH_BOOST_WEIGHT
     three_residual = three_calm["final_score"] - three_hot["final_score"]
-    three_gap = three_residual + contrib
+    assert three_residual == pytest.approx(0.4825, abs=2e-3), (
+        f"the comment quotes the 3-row pool's post-boost residual as 0.4825 "
+        f"(0.5 - 0.0175); this page measures {three_residual:.4f}")
+    three_gap = three_residual + three_applied
     assert three_gap == pytest.approx(0.5, abs=2e-3), (
-        f"the comment quotes a 0.5 relevance gap on the 3-row pool; this page "
-        f"measures {three_gap:.4f} (residual {three_residual:.4f} plus the "
-        f"{contrib:.4f} boost)")
-    assert three_residual == pytest.approx(three_gap - contrib, abs=1e-3), (
-        f"the 3-row residual must be the gap minus the applied boost "
-        f"({three_gap - contrib:.4f}); this page shows {three_residual:.4f}")
-    assert three_gap == pytest.approx(
-        three_req * DEFAULT_GRAPH_BOOST_WEIGHT, abs=2e-3), (
-        f"the quoted 3-row figures must reconcile: the measured gap "
-        f"({three_gap:.4f}) is not what the quoted requirement implies "
-        f"({three_req * DEFAULT_GRAPH_BOOST_WEIGHT:.4f})")
+        f"the comment quotes a 0.5 pre-boost relevance gap on the 3-row pool; "
+        f"this page measures {three_gap:.4f} (residual {three_residual:.4f} "
+        f"plus the {three_applied:.4f} the payload shows was applied)")
 
     # ── Remedy (2)'s actionable half: the raise is RUN, not inferred ──────
     # ``ten_req < two_req`` alone does NOT imply that a raise repairs the
@@ -954,6 +1015,14 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # space), so it is checked as arithmetic and then against the requirement.
     assert ten_req == pytest.approx(
         derived_cb(ten_hot, ten_calm, ten_gb_calm, ten_gb_hot), abs=5e-3)
+    # The 0.0540 is measured on THIS fixture's 4-row page, whose similarity
+    # span is set by those four rows through the stand-in embedder — name the
+    # coupling so a fixture edit is not mistaken for a ranker change.
+    assert len(res) == 4, (
+        f"the comment's 0.0540 is measured on this fixture's 4-row page (the "
+        f"whole graph: twins, counter-claim, parity row); this read returned "
+        f"{len(res)} rows, so the requirement's similarity span is a "
+        f"different one — re-measure it rather than re-describing it")
     assert ten_req == pytest.approx(0.0540, abs=2e-3), (
         f"the comment quotes a 0.0540 requirement on the shipped default "
         f"page; this run measures {ten_req:.4f}")
