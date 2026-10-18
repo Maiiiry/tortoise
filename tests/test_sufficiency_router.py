@@ -942,11 +942,13 @@ def test_the_router_is_pure_no_io_no_model_no_clock() -> None:
                 imported.add(f".{node.module}")
             elif node.module:
                 imported.add(node.module.split(".")[0])
-    # ``re`` is here because the anchor match must be WORD-bounded: a bare
-    # substring test scores a short entity name (``AI``, ``Art``) as covered by
-    # unrelated text. It is a pure text operation — no I/O, no clock, no model.
+    # ``unicodedata`` is here because the anchor boundary is decided from the
+    # MATCH's neighbours: a bare substring test scores a short entity name
+    # (``AI``, ``Art``) as covered by unrelated text, while a Unicode ``\\w``
+    # lookaround can never hold next to an ideograph. It is a pure table lookup —
+    # no I/O, no clock, no model.
     allowed_stdlib = {"__future__", "collections", "hashlib", "dataclasses",
-                      "typing", "re"}
+                      "typing", "unicodedata"}
     # The ONLY in-package import is the route vocabulary's single home.
     allowed_local = {".residency_router"}
     assert imported <= allowed_stdlib | allowed_local, imported - (allowed_stdlib | allowed_local)
@@ -1251,20 +1253,27 @@ def test_a_non_spaced_script_anchor_matches_its_own_text() -> None:
     "我们签署了ACME的合同",          # CJK: the match is wrapped in ideographs
     "เราเซ็นสัญญากับACME",            # Thai: no word separators either
     "我们签署了合同 with ACME",       # control: the spaced case already worked
+    # A mixed CJK/Latin sentence CONTAINING SEPARATORS. A haystack-level
+    # ``" " not in haystack`` gate switched the relaxation off here and scored the
+    # row that literally answers at 0.0 — so the boundary is decided at the MATCH.
+    "我们与ACME的合同已于 2026 年 3 月 签署",
+    "我们签署了ACME的合同，详见附录 A",
+    "ACME的合同 有效",
 ])
 def test_a_latin_anchor_matches_inside_unspaced_text(text: str) -> None:
-    """The boundary rule must be decided PER SIDE, not only for the anchor.
+    """The boundary is decided at the MATCH, not for the haystack as a whole.
 
-    The ASCII/CJK split was applied only to the ANCHOR, so a Latin anchor
-    embedded in unspaced CJK/Thai text measured ``0.0`` coverage: the Unicode
-    ``\\w`` lookaround can never hold next to an ideograph, because the ideograph
-    IS a word character — the exact failure the split exists to avoid, one
-    operand over. It bought a tier for the row that literally answers.
+    A word boundary is a property of the anchor's own script: ``\\w`` is
+    Unicode-aware, so a Latin anchor buried in CJK/Thai text can never satisfy
+    ``(?<!\\w) … (?!\\w)`` — the ideograph next to it IS a word character. Scoring
+    that ``0.0`` bought a tier for the row that answered.
 
-    The fallback is deliberately narrow: it fires only AFTER the strict Unicode
-    boundary has failed, i.e. only when the match sits next to a non-ASCII word
-    character. In such a script adjacency is not a word boundary, so the ASCII
-    boundary is the correct test.
+    The rule is therefore adjacency-based: reject an occurrence only when a
+    neighbour is a word character of a SPACED script (``a``, ``á``, ``7``,
+    ``_``), accept it when the neighbours are unspaced-script letters or
+    non-word characters. A haystack-level test ("does this contain a space?") is
+    a proxy that breaks on the very common "Chinese sentence containing a year"
+    case above, which is why it is not used.
     """
     verdict = assess_sufficiency(
         _rows(text), anchors=["ACME"], required_anchor_coverage=1.0, resident=True)
@@ -1273,18 +1282,24 @@ def test_a_latin_anchor_matches_inside_unspaced_text(text: str) -> None:
 
 
 @pytest.mark.parametrize("text,anchor", [
-    ("la práctica firmada", "PR"),
+    ("la práctica firmada", "PR"),   # á is a Unicode word char, not an ASCII one
     ("a Itália assinou", "IT"),
+    ("naïve", "NA"),                 # single-token residual: now CLOSED
+    ("Práctica", "PR"),
+    ("mainthing", "AI"),             # plain infix, no accents involved
+    ("he said the main thing", "AI"),
+    ("start the process", "ART"),
 ])
-def test_the_unspaced_fallback_does_not_fire_in_a_spaced_script(
+def test_the_boundary_holds_inside_a_spaced_script(
         text: str, anchor: str) -> None:
-    """``á``/``ê`` are Unicode word characters that are NOT ASCII ones.
+    """Adjacency to a Latin letter IS a boundary, so these are not mentions.
 
-    An UNGATED ASCII fallback therefore matched ``PR`` inside ``práctica`` and
-    ``IT`` inside ``Itália`` — it dropped the word boundary in a spaced script and
-    inflated coverage, which is the fail-open class this boundary exists to
-    prevent. The fallback is gated on the haystack having no separator, which is
-    what "unspaced script" actually means.
+    ``á``/``ê``/``ï`` are Unicode word characters that are not ASCII ones, so an
+    ASCII-only relaxation matched ``PR`` inside ``práctica``, ``IT`` inside
+    ``Itália`` and ``NA`` inside ``naïve`` — dropping the word boundary in a
+    spaced script and INFLATING coverage, the fail-open class the boundary exists
+    to prevent. Deciding at the match rejects all of them, including the
+    single-token case a haystack-level gate could not see.
     """
     verdict = assess_sufficiency(
         _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
@@ -1316,6 +1331,41 @@ def test_a_partially_fetched_assembly_is_measured_over_every_row() -> None:
     assert verdict.reasons == (REASON_PROVENANCE_THIN,)
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),
                                 (MEASURE_PROVENANCE_COVERAGE, 0.25))
+
+
+class _AttrRow:
+    """A row in the ATTRIBUTE shape ``evidence_record`` documents as accepted."""
+
+    def __init__(self, **kw: object) -> None:
+        self.__dict__.update(kw)
+
+
+def test_the_attribute_row_shape_agrees_with_the_wire_shape() -> None:
+    """Both documented input shapes must measure provenance the SAME way.
+
+    ``evidence_record`` rebuilds a dict from a fixed key set for an object row,
+    which dropped ``provenance``/``captured_at`` — so an object that LITERALLY
+    carries a link measured as *unassessed* while the identical facts on the wire
+    measured ``1.0``. That is the fail-open the fetched/linked split exists to
+    close, surviving on the other shape these functions accept.
+    """
+    linked = _AttrRow(id="a1", content="ACME signed", provenance={"source": "u://1"})
+    no_link = _AttrRow(id="a2", content="ACME signed", captured_at="2026-01-01")
+
+    assert evidence_record(linked).provenance == "u://1"
+    assert assess_sufficiency(
+        [linked], anchors=["ACME"], required_anchor_coverage=1.0,
+        required_provenance_coverage=0.9, resident=True,
+    ).measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),
+                   (MEASURE_PROVENANCE_COVERAGE, 1.0))
+
+    # Fetched with no link is a measured 0.0, not "unassessed".
+    assert evidence_record(no_link).provenance is None
+    assert evidence_record(no_link).provenance_fetched is True
+    assert assess_sufficiency(
+        [no_link], anchors=["ACME"], required_anchor_coverage=1.0,
+        required_provenance_coverage=0.9, resident=True,
+    ).verdict == INSUFFICIENT
 
 
 def test_a_phrase_cannot_be_stitched_across_two_entity_terms() -> None:

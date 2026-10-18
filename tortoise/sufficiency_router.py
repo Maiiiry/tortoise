@@ -142,7 +142,7 @@ WHAT THIS MODULE DELIBERATELY IS NOT
 from __future__ import annotations
 
 import hashlib
-import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -409,7 +409,9 @@ def _provenance_fetched(data: object) -> bool:
         if mapping.get(key):
             return True
     if not isinstance(data, Mapping):
-        for key in (*_PROVENANCE_KEYS, "provenance"):
+        # ``captured_at``/``currency`` are part of the block ``to_dict()`` emits,
+        # so an object holding either has FETCHED provenance even with no link.
+        for key in (*_PROVENANCE_KEYS, "provenance", "captured_at", "currency"):
             if getattr(data, key, None):
                 return True
     return False
@@ -437,12 +439,18 @@ def evidence_record(row: object) -> _Evidence:
             break
     entities = tuple(
         term for key in _ENTITY_KEYS for term in _entity_terms(data.get(key)))
+    # Read provenance from the ORIGINAL row, never from the rebuilt ``data``: the
+    # rebuild covers a fixed key set and therefore drops an object's
+    # ``provenance`` block and ``captured_at``/``currency`` attributes — a row
+    # that LITERALLY carries a link then measured as *unassessed*, which is the
+    # fail-open direction the fetched/linked split exists to close, surviving on
+    # the other input shape these functions document as accepted.
     return _Evidence(
         id=str(data.get("id") or ""),
         text=text,
-        provenance=evidence_provenance(data),
+        provenance=evidence_provenance(row),
         entities=entities,
-        provenance_fetched=_provenance_fetched(data),
+        provenance_fetched=_provenance_fetched(row),
     )
 
 
@@ -473,6 +481,14 @@ def evidence_provenance(data: object) -> Any:
     # was never fetched" for a row that carries it — the one distinction this
     # function exists to preserve.
     if not isinstance(data, Mapping):
+        # The ATTRIBUTE shape can carry the SAME nested block the wire does
+        # (``row.provenance == {"source": …}``), so it is read before the flat
+        # aliases; otherwise an object holding a real link measured unassessed.
+        nested_attr = getattr(data, "provenance", None)
+        if isinstance(nested_attr, Mapping):
+            for key in _PROVENANCE_WIRE_KEYS:
+                if nested_attr.get(key):
+                    return nested_attr[key]
         for key in _PROVENANCE_KEYS:
             if hasattr(data, key) and getattr(data, key):
                 return getattr(data, key)
@@ -547,10 +563,50 @@ def _threshold(name: str, value: object) -> float:
     return out
 
 
-#: An ASCII word character, i.e. a character of a script that separates words
-#: with spaces. Only an anchor drawn from such a script can be matched on a word
-#: boundary; see ``_mentions``.
-_ASCII_WORD_CHARS = re.compile(r"[A-Za-z0-9_]")
+#: A word character OF A SPACED SCRIPT — the kind for which adjacency to an
+#: anchor is a real word boundary. ASCII digits and ``_`` count too: ``PR2`` and
+#: ``PR_x`` are single tokens in every script.
+def _spaced_word_char(ch: str) -> bool:
+    if not ch:
+        return False
+    if ch == "_" or ch.isdigit():
+        return True
+    if not ch.isalpha():
+        return False
+    return unicodedata.name(ch, "").startswith("LATIN")
+
+
+def _occurs_as_word(needle: str, haystack: str) -> bool:
+    """Is ``needle`` a WORD of ``haystack`` — including inside unspaced scripts?
+
+    The boundary is decided AT THE MATCH, never for the haystack as a whole. A
+    haystack-level proxy (``" " not in haystack``) is wrong in both directions: a
+    Chinese sentence containing a year — ``我们与ACME的合同已于 2026 年 3 月 签署``
+    — is overwhelmingly unspaced text, yet it contains separators, so the
+    relaxation was switched OFF for it and the row that literally answers scored
+    0.0.
+
+    So an occurrence is accepted when neither neighbour is a word character of a
+    SPACED script (``a``/``á``/``ê``/``7``/``_``), which is exactly "the anchor is
+    not buried inside a word of a language that separates words". ``AI`` stays
+    out of ``main`` and ``naïve``; ``PR`` stays out of ``práctica``; ``ACME``
+    still matches inside CJK and Thai text, with or without a number later in the
+    sentence.
+
+    ⚠️ Residual, stated: a neighbour in a NON-Latin spaced script (Cyrillic,
+    Greek) is treated as unspaced adjacency. That can only make a mixed-script
+    token match, which is the direction a reader would accept; separating them
+    properly needs script data the stdlib does not expose.
+    """
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        left = haystack[start - 1] if start else ""
+        right = haystack[end] if end < len(haystack) else ""
+        if not _spaced_word_char(left) and not _spaced_word_char(right):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
 
 
 def _mentions(needle: str, row: _Evidence) -> bool:
@@ -570,13 +626,10 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     unmatchable.
 
     The row's entity NAMES are read too, one at a time (a join would let a phrase
-    span two entities), and the boundary rule is applied only where it is
-    meaningful: ``\\w`` is Unicode-aware, so ``(?<!\\w)`` can never hold inside a
-    run of CJK/Thai characters — an ideographic anchor would be unmatchable in
-    its own text, reporting zero coverage for every such entity. For an anchor
-    with no ASCII word character the adjacency is not a boundary, so the
-    substring test IS the correct semantics; for one that has (``AI``, ``Q3``)
-    the boundary keeps it out of longer words.
+    span two entities). The boundary rule applies to anchors drawn from a SPACED
+    script; an ideographic/Thai anchor has no word separators to respect in its
+    own script, so adjacency is not a boundary for it and the substring test IS
+    the correct semantics (``合同`` must match inside ``我们签署了合同``).
 
     Empty/blank anchors are refused by ``assess_sufficiency`` long before they
     reach here; the guard remains as defence, since ``"" in …`` is universal.
@@ -586,38 +639,14 @@ def _mentions(needle: str, row: _Evidence) -> bool:
         return False
     if folded == row.id.casefold():
         return True
-    bounded = _ASCII_WORD_CHARS.search(folded) is not None
-    pattern = None
-    ascii_pattern = None
-    if bounded:
-        escaped = re.escape(folded)
-        pattern = re.compile(rf"(?<!\w){escaped}(?!\w)")
-        # The same boundary drawn over ASCII word characters only, and tried ONLY
-        # for an UNSPACED haystack. An anchor from a spaced script can appear
-        # inside unspaced text (`ACME` in `我们签署了ACME的合同`), where the Unicode
-        # `\w` lookarounds can never hold because the adjacent ideograph is itself
-        # a word character — the measure then reported 0.0 coverage for the row
-        # that literally answers. Gating on the haystack having NO separator is
-        # what keeps the relaxation off spaced scripts: `á`/`ê` are Unicode word
-        # characters that are not ASCII ones, so an ungated fallback matched `PR`
-        # inside `práctica` and `IT` inside `Itália` — inflated coverage, the same
-        # fail-open class the boundary exists to prevent. ⚠️ Residual, stated: a
-        # haystack that is a SINGLE accented token (no separator anywhere) can
-        # still match an ASCII anchor mid-token; distinguishing that from CJK
-        # needs script detection, which is more machinery than the failure earns.
-        ascii_pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.ASCII)
+    # Does the ANCHOR itself come from a spaced script? Only then is a word
+    # boundary meaningful in its OWN script; an ideographic anchor has none.
+    bounded = any(ch.isascii() and (ch.isalnum() or ch == "_") for ch in folded)
     for candidate in (row.text, *row.entities):
         if not candidate:
             continue
         haystack = " ".join(candidate.split()).casefold()
-        if pattern is not None:
-            if pattern.search(haystack):
-                return True
-            # Unspaced only: in a spaced script a letter boundary is real, and
-            # relaxing it there inflates coverage (see the gate's note above).
-            if ascii_pattern is not None and " " not in haystack and ascii_pattern.search(haystack):
-                return True
-        elif folded in haystack:
+        if _occurs_as_word(folded, haystack) if bounded else folded in haystack:
             return True
     return False
 
