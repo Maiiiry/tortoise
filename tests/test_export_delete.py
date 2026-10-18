@@ -528,18 +528,11 @@ def _enable_supabase(monkeypatch, cp) -> FakeControlPlane:
 # one in `tests/test_import_endpoint.py` or cover any other file, which is the
 # defect #3546 names. Do NOT re-add a per-file copy.
 #
-# LANE SCOPE — the serialization is INERT on the lane CI runs this file on.
-# Under a supported `TORTOISE_DB_URI` (the docker lane, this file's default)
-# every construction from this module REDIRECTS to that server
-# (`tortoise/projection/__init__.py`, the #1647 D-1=A test redirect: `path` is
-# nulled, so `_is_embedded` is False), no redislite daemon is started, and no
-# double-start can occur. `test_export_delete` is NOT in
-# `tests._embedded.TEST_NO_REDIRECT_STEMS`, which is what selects that branch.
-# What protects THIS file on the docker lane is the BOOT-SWEEP quiesce
-# (`quiesce_testclient_background_work`), not the serialization. The lock is
-# live only on the embedded tier-2 / carve-out lane (no URI), where
-# constructions stay local-file and real daemons are spawned; it is kept for
-# correctness there, not because the docker lane depends on it.
+# LANE SCOPE and the #3546 lock's rationale are documented ONCE, on
+# `tests/_http_fixtures.quiesce_testclient_background_work` — that seam is what
+# protects this file on the docker lane (the serialization is inert there).
+# Do not restate them here: a second copy goes stale the first time either
+# changes, which is the defect that moved the seam out of this file.
 
 
 @pytest.fixture

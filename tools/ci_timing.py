@@ -409,7 +409,7 @@ COUNT_KEYS = ("passed", "failed", "error", "skipped", "xfailed", "xpassed")
 def _tests_relative_path(node_path: str) -> str:
     """A pytest nodeid's file path as a tests/-relative key.
 
-    The durations block prints rootdir-relative nodeids (`tests/sub/x.py::t`),
+    The durations block prints rootdir-relative nodeids (`tests/sub/x.py::t`),  # pointer-ok: illustrative nodeid format
     while the manifest keys on the tests/-relative path (`sub/x.py`). Stripping
     the `tests/` prefix makes the two comparable. A path without that prefix
     (a log written from a different rootdir) is returned unchanged, so it fails

@@ -61,7 +61,7 @@ Three guarded reason families (all fail-closed):
      CONSTRUCTION and must not trip; a whole-module abort is a vacancy.
 
 Matches BOTH pytest output formats:
-  -v progress:  "tests/test_ep_directional.py::TestX::test_y SKIPPED (Live FalkorDB (Docker) not available)"
+  -v progress:  "tests/test_ep_directional.py::TestX::test_y SKIPPED (Live FalkorDB (Docker) not available)"  # pointer-ok: illustrative output format, not a record
   -rs summary:  "SKIPPED [14] tests/test_ep_directional.py:35: Live FalkorDB (Docker) not available"
 
 NOTE on -v truncation: pytest truncates -v skip reasons to the terminal width

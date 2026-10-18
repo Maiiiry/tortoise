@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 from tests.fake_control_plane import (  # noqa: E402
     TIMESTAMPTZ_COLUMNS,
     FakeControlPlane,
+    rpc_call_named,
 )
 
 
@@ -726,10 +727,6 @@ def test_rpc_call_named_selects_by_name_and_fails_loudly() -> None:
     """#4816: the helper must select the REQUEST's call, not index 0, and it must
     RAISE when the named call is absent — otherwise a stub returning a plausible
     tuple would satisfy the pins silently."""
-    import pytest
-
-    from tests.fake_control_plane import FakeControlPlane, rpc_call_named
-
     fake = FakeControlPlane({})
     fake.rpc_calls.append(("metering_repair_period_bounds", {}))
     fake.rpc_calls.append(("provision_team", {"p_org_name": "acme"}))

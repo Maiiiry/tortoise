@@ -13,6 +13,13 @@ Replaces ~24 per-file local copies of the churn-shaped fixture pattern
 ``TORTOISE_DB_PATH`` pin and WITHOUT deterministic anchor close at restore) —
 the latent class that produced the #2090 403s (empty respawn after redislite
 daemon death) and the #2049-b dead-socket sibling.
+
+It also holds the ``TestClient`` background-work seam —
+``quiet_boot_sweeps`` and ``quiesce_testclient_background_work`` (#3472/#3505,
+moved here from ``tests/test_export_delete.py`` by #8920). Same reason: a
+harness that every fixture opening ``TestClient(app)`` needs must live in ONE
+place, because a per-file copy is not updated when ``_lifespan`` grows a new
+background caller.
 """
 from __future__ import annotations
 
@@ -159,7 +166,7 @@ def quiesce_testclient_background_work(monkeypatch) -> None:
        exclusive ownership of a sweep production also runs. Every caller is
        therefore quiesced here.
 
-       The COMPLETE membership is the two tuples in `hosted_api.py` —
+       The COMPLETE membership is the two sequences in `hosted_api.py` —
        `_run_boot_sweeps` (six steps) and `_event_retention_loop` (those six
        plus `_refresh_cost_allocation`) — and this list exists so the next
        addition is visible, not to be re-derived here. It was INCOMPLETE until

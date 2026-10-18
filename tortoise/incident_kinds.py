@@ -5,9 +5,9 @@ Before this module the vocabulary was re-derived in five places: per-module
 ``AlertStore.KIND_OWNERS`` resolution map, the bash driver's mirror of it, and
 the runbook's hand-maintained parallel table. Adding one kind meant editing
 three sites per kind (a constant, a runbook row, a tuple in the pinning test),
-kept in step by hand — the drift class
-``tests/test_operator_alert.py::test_kind_constants_match_the_runbook`` was
-written to catch for the kinds it happened to list.
+kept in step by hand — the drift class a hand-listed test (since deleted, its
+job taken over by the set-equality checks in ``tests/test_incident_kinds.py``)
+was written to catch for the kinds it happened to list.
 
 Here, ONE entry per kind carries everything the other sites used to restate:
 who may resolve it, whether it has a writer at all, whether it needs the manual
