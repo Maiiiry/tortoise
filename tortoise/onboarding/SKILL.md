@@ -545,14 +545,20 @@ The block carries a version line (`<!-- tortoise:block vN -->`) and the installe
 says what it did: `created (block vN)`, `upgraded (unversioned → vN)` — the
 migration case, a repo provisioned before versioning — `upgraded vM → vN`,
 `refreshed (vN — same version, updated text)`, or `already current` — and, if your
-installer is older than the block (a cached or rolled-back copy), `written at vN`
-plus the version it found, so a downgrade is never announced as an upgrade. That last
-one is a statement about the TEXT (the block on disk is byte-identical to the one
-just built), not about the version number, so it is safe to trust.
+installer is older than the block (a cached or rolled-back copy), the literal line
+`written at vN (the file had vM: this installer is OLDER than the block it
+replaced)`, so a downgrade is never announced as an upgrade. A version line that
+is not a number this shell can compare gets `… the file's version "vM" is
+unreadable …` instead of any claim about which is newer.
+`already current` is a statement about the TEXT — the block on disk is
+byte-identical to the one just built — not about the version number, so it is
+safe to trust.
 
-If the marker lines are not one clean pair (a stray start swallows everything to
-EOF, a stray end drops the tail), the installer REFUSES and says which lines to
-fix rather than duplicating the block. Never hand-edit inside markers you did not
+If the marker lines are not one clean pair — two copies, a stray marker, or one
+that is indented or has a trailing space — the installer prints
+`✗ AGENTS.md — the Tortoise block markers are MALFORMED`, names the marker lines
+it found, REFUSES rather than duplicating the block, and exits 3 (the skills ARE
+installed by then; only the block is not upgraded). Never hand-edit inside markers you did not
 write; the next refresh discards it.
 
 ## 4. Verify, then checkpoint harness-connected

@@ -119,13 +119,14 @@ on, and what it did to get there:
 
 | it prints | it means |
 |---|---|
-| `created (block vN)` | there was no `AGENTS.md` |
+| `created (block vN)` | there was no Tortoise block to upgrade — no `AGENTS.md`, or one without markers |
 | `upgraded (unversioned → vN)` | provisioned before versions existed — this is the migration |
 | `upgraded vM → vN` | an older block was replaced |
 | `refreshed (vN — same version, updated text)` | the version matched but the text did not |
 | `already current` | the block on disk is byte-identical to the one just built |
 | `written at vN (the file had vM …)` | your installer is OLDER than the block (a cached or rolled-back copy) — it says so instead of calling a downgrade an upgrade |
-| `MALFORMED … NOT rewritten` | the marker lines are not one clean start→end pair; it refuses rather than duplicate the block, and tells you which lines to fix |
+| `written at vN (the file's version "vM" is unreadable …)` | the version line was malformed (not a number this shell can compare); nothing is claimed about which is newer |
+| `MALFORMED … NOT rewritten` | the marker lines are not one clean start→end pair (two copies, a stray marker, or an indented/trailing-space one); it refuses rather than duplicate the block, prints how many and which markers it found, and exits 3 — the SKILLS are installed at that point, only the block is not |
 
 `already current` is a statement about the **text**, not the version number, so it is safe to trust. To see what
 you have without changing anything:

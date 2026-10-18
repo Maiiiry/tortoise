@@ -449,18 +449,42 @@ emit_codex_agents_block() {
 ${me}" > "$block"
 
   if [ -f "$target" ]; then
-    state="$(awk -v msre="$ms_re" -v mere="$me_re" '
-      $0 ~ msre { starts++; if (!startline) startline = NR }
-      $0 ~ mere { ends++;   if (!endline)   endline   = NR }
+    state="$(awk -v ms="$ms" -v me="$me" -v msre="$ms_re" -v mere="$me_re" '
+      # A marker line that is the marker ALONE once whitespace/BOM is stripped,
+      # but does not match the anchored form (indented, trailing space, BOM) is
+      # NEAR. Treating it as ABSENT made the state `none`, which APPENDS: the
+      # block got duplicated, the stale copy stayed first, and every later run
+      # then compared the freshly appended pair against itself and reported
+      # "already current" — the exact harm #3429 exists to end.
+      function near(line, m,   p, pre, post) {
+        p = index(line, m)
+        if (p == 0) return 0
+        pre = substr(line, 1, p - 1); post = substr(line, p + length(m))
+        gsub(/[ \t\r]/, "", pre); gsub(/[ \t\r]/, "", post)
+        gsub(/\357\273\277/, "", pre)      # UTF-8 BOM
+        return (pre == "" && post == "")
+      }
+      $0 ~ msre { starts++; if (!startline) startline = NR; next }
+      $0 ~ mere { ends++;   if (!endline)   endline   = NR; next }
+      near($0, ms) { nearstart++; if (!nearstartline) nearstartline = NR; next }
+      near($0, me) { nearend++;   if (!nearendline)   nearendline   = NR; next }
       END {
+        # Any near-anchor occurrence is a MALFORMED marker: it is plainly an
+        # attempt at the marker, so neither "replace" nor "append" is safe.
+        if (nearstart || nearend) {
+          printf "malformed %d %d %s %s\n", nearstart, nearend, nearstartline, nearendline
+          exit
+        }
         if (!starts && !ends)         { print "none";      exit }
-        if (starts != 1 || ends != 1) { print "malformed"; exit }
-        if (startline > endline)      { print "malformed"; exit }
+        if (starts != 1 || ends != 1) { print "malformed " starts " " ends " " startline " " endline; exit }
+        if (startline > endline)      { print "malformed " starts " " ends " " startline " " endline; exit }
         print "paired"
       }' "$target")"
   fi
+  local state_kind="${state%% *}" state_info="${state#* }"
+  [ "$state_kind" = "$state" ] && state_info=""
 
-  if [ "$state" = "paired" ]; then
+  if [ "$state_kind" = "paired" ]; then
     # The version is read INSIDE the window (a token in prose elsewhere must not
     # read as "this block is current"), and the bytes are compared with what we
     # would write: a version line is evidence of ORDER, never proof that the
@@ -476,24 +500,29 @@ ${me}" > "$block"
       $0 ~ msre { inb = 1; print; next }
       $0 ~ mere { print; inb = 0; next }
       inb { print }' "$target" > "$tmpdir/window"
-    if cmp -s "$tmpdir/window" "$block"; then same_bytes=1; fi
+    # CRLF-insensitive: a file whose markers match but whose line endings differ
+    # is not a TEXT change, and rewriting it (mixed EOLs) while saying "updated
+    # text" is the false statement this whole revision is about.
+    if cmp -s <(tr -d '\r' < "$tmpdir/window") <(tr -d '\r' < "$block"); then same_bytes=1; fi
   fi
 
-  if [ "$state" = "malformed" ]; then
+  if [ "$state_kind" = "malformed" ]; then
     # Markers present but not ONE clean start→end pair: a stray start swallows
     # everything to EOF, a stray end makes the split drop the tail, and either
     # way appending leaves the stale block in place. Refuse and say what to fix
     # — a truthful failure beats a success report over a duplicated block.
     echo "  ✗ AGENTS.md — the Tortoise block markers are MALFORMED" >&2
-    echo "      found $(grep -cE "$ms_re" "$target" || true) start / $(grep -cE "$me_re" "$target" || true) end marker line(s)" >&2
-    echo "      expected exactly one ${ms} before exactly one ${me}, each on its own line." >&2
-    echo "      NOT rewritten: appending would leave the stale block in place." >&2
-    echo "      Fix the markers by hand (or delete the whole block), then re-run." >&2
+    echo "      marker lines found: ${state_info:-none}" >&2
+    echo "      expected exactly ONE ${ms} before exactly ONE ${me}, each alone on its line." >&2
+    echo "      NOT rewritten: appending would leave the stale block in place, and a" >&2
+    echo "      replace would guess which copy is yours." >&2
+    echo "      A file installed twice by an older installer is the usual cause: delete" >&2
+    echo "      BOTH copies (from ${ms} through AND including the LAST ${me}), then re-run." >&2
     rm -rf "$tmpdir"
     return 1
   fi
 
-  if [ "$state" = "paired" ] && [ "$same_bytes" -eq 0 ]; then
+  if [ "$state_kind" = "paired" ] && [ "$same_bytes" -eq 0 ]; then
     # In-place replace between the markers — never touches content outside them.
     : > "$pre"; : > "$post"
     awk -v msre="$ms_re" -v mere="$me_re" -v pre="$pre" -v post="$post" '
@@ -507,7 +536,7 @@ ${me}" > "$block"
     cp -p "$target" "$target.tmp"
     cat "$pre" "$block" "$post" > "$target.tmp"
     mv "$target.tmp" "$target"
-  elif [ "$state" = "none" ]; then
+  elif [ "$state_kind" = "none" ]; then
     if [ -f "$target" ]; then
       printf '\n\n' >> "$target"
       cat "$block" >> "$target"
@@ -521,15 +550,26 @@ ${me}" > "$block"
   # from the version token alone (that reported "already current" while it was
   # rewriting the body whenever the text changed without a bump).
   v="$AGENTS_BLOCK_VERSION"
-  if [ "$state" = "paired" ] && [ "$same_bytes" -eq 1 ]; then
+  # `-lt`/`-gt` on an out-of-range integer ERROR and fall through, which turned a
+  # downgrade into "refreshed (same version…)". Anything unparseable is treated
+  # as unknown, never as current.
+  case "$prev_version" in
+    ''|*[!0-9]*) prev_cmp="" ;;
+    *) if [ "${#prev_version}" -le 9 ]; then prev_cmp="$prev_version"; else prev_cmp=""; fi ;;
+  esac
+  if [ "$state_kind" = "paired" ] && [ "$same_bytes" -eq 1 ]; then
     echo "  ✓ AGENTS.md — Tortoise block v$v (already current)"
-  elif [ "$state" = "none" ]; then
+  elif [ "$state_kind" = "none" ]; then
     echo "  ✓ AGENTS.md — Tortoise standing instructions created (block v$v)"
-  elif [ -z "$prev_version" ]; then
-    echo "  ✓ AGENTS.md — Tortoise block upgraded (unversioned → v$v)"
-  elif [ "$prev_version" -lt "$v" ]; then
+  elif [ -z "$prev_cmp" ]; then
+    if [ -n "$prev_version" ]; then
+      echo "  ✓ AGENTS.md — Tortoise block written at v$v (the file's version \"v$prev_version\" is unreadable — this installer overwrote it)"
+    else
+      echo "  ✓ AGENTS.md — Tortoise block upgraded (unversioned → v$v)"
+    fi
+  elif [ "$prev_cmp" -lt "$v" ]; then
     echo "  ✓ AGENTS.md — Tortoise block upgraded v$prev_version → v$v"
-  elif [ "$prev_version" -gt "$v" ]; then
+  elif [ "$prev_cmp" -gt "$v" ]; then
     # A pinned/cached/rolled-back installer must not silently DOWNGRADE a
     # project's standing instructions, still less call it an upgrade.
     echo "  ✓ AGENTS.md — Tortoise block written at v$v (the file had v$prev_version: this installer is OLDER than the block it replaced)"
@@ -625,10 +665,13 @@ if [ ${#missing[@]} -eq 0 ]; then
   # (other harnesses have their own memory mechanisms; a stray AGENTS.md
   # would change every agent's behavior in this project).
   if [ "$HARNESS" = "codex" ]; then
-    # #3429: a failure here is a REAL failure (malformed markers, nothing
-    # written) — surface it as such instead of letting set -e's abort happen
-    # with no explanation of what remains broken in the project.
-    emit_codex_agents_block || exit 1
+    # #3429: a refusal is a REAL failure, but the SKILLS are already installed
+    # and their banner has printed. Exit 3 separates "AGENTS.md was not upgraded"
+    # from "the install broke", and the line below says which.
+    emit_codex_agents_block || {
+      echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
+      exit 3
+    }
   fi
 else
   echo ""

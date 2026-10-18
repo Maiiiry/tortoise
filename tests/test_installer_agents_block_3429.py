@@ -299,7 +299,7 @@ def test_same_version_different_text_is_not_already_current(tmp_path):
         f"a same-version text change must be reported as a refresh:\n{report}")
     agents = (project / "AGENTS.md").read_text(encoding="utf-8")
     assert "DRIFTED SENTENCE" in agents
-    assert _versioned(agents) == [2]
+    assert _versioned(agents) == [_current_version()]
 
 
 def test_malformed_markers_are_refused_not_silently_duplicated(tmp_path):
@@ -326,7 +326,7 @@ def test_malformed_markers_are_refused_not_silently_duplicated(tmp_path):
 def test_start_marker_without_end_is_refused(tmp_path):
     done, agents = _install(tmp_path, LEGACY_BLOCK.replace(END + "\n", ""))
 
-    assert done.returncode != 0, done.stdout
+    assert done.returncode == 3, done.stdout
     assert "MALFORMED" in done.stderr
     assert agents.count(START) == 1, f"the block was duplicated:\n{agents}"
     assert agents == LEGACY_BLOCK.replace(END + "\n", "")
@@ -348,7 +348,8 @@ def test_version_token_outside_the_window_does_not_mean_current(tmp_path):
 
 def test_an_older_installer_says_so_instead_of_calling_it_an_upgrade(tmp_path):
     """v3 block + v2 installer (pinned/cached/rolled-back copy)."""
-    agents_in = LEGACY_BLOCK.replace(START, f"{START}\n<!-- tortoise:block v3 -->")
+    newer = _current_version() + 1
+    agents_in = LEGACY_BLOCK.replace(START, f"{START}\n<!-- tortoise:block v{newer} -->")
     done, agents = _install(tmp_path, agents_in)
 
     assert done.returncode == 0, done.stdout + done.stderr
@@ -356,7 +357,7 @@ def test_an_older_installer_says_so_instead_of_calling_it_an_upgrade(tmp_path):
     assert "upgraded" not in report, (
         f"writing v2 over v3 is a DOWNGRADE, not an upgrade:\n{report}")
     assert "OLDER than the block" in report, report
-    assert _versioned(agents) == [2]
+    assert _versioned(agents) == [_current_version()]
 
 
 #: sha256 of the block's PROSE with the version line removed. The version's only
@@ -366,7 +367,16 @@ def test_an_older_installer_says_so_instead_of_calling_it_an_upgrade(tmp_path):
 #: report "refreshed (same version, updated text)" and mean it. So the text is
 #: pinned: edit it → update this pin AND bump AGENTS_BLOCK_VERSION, in one commit.
 #: The version line is excluded so a bump alone does not red this pin.
-BLOCK_PROSE_SHA256 = "de04359e96d4a9e1aca9fa22a57ed4923d457544eea2d29dee10332433565bbd"
+BLOCK_PROSE_SHA256 = "d32104d5819bed5a77e6925379d27e05533c952bf0ecde6370fe9730c6067eea"
+
+
+def _current_version() -> int:
+    """Read AGENTS_BLOCK_VERSION from the installer — a legitimate bump must not
+    red this suite for the wrong reason (cycle 2: the downgrade fixture was
+    hard-coded to v3, so bumping to v3 made it a v3-onto-v3 "downgrade")."""
+    m = re.search(r'^AGENTS_BLOCK_VERSION="(\d+)"', INSTALLER.read_text(encoding="utf-8"), re.M)
+    assert m, "AGENTS_BLOCK_VERSION anchor not found — update this test"
+    return int(m.group(1))
 
 
 def _block_prose() -> str:
@@ -375,9 +385,13 @@ def _block_prose() -> str:
     start = src.index(head) + len(head)
     body = src[start:src.index('${me}" > "$block"')]
     assert body.startswith('"${ms}'), body[:80]
-    body = body.split("\n", 1)[1]
-    return "\n".join(
-        line for line in body.splitlines() if "tortoise:block v" not in line)
+    lines = body.split("\n")[1:]          # drop the `"${ms}` line
+    # Drop the VERSION line by POSITION — a substring filter also dropped any
+    # later line that merely mentioned the marker, so adding such a line shipped
+    # a text change past the pin with no bump (cycle 2, mutation d2).
+    # In the SOURCE the line still holds the shell expansion, so match the shape.
+    assert lines[0].startswith("<!-- tortoise:block v") and lines[0].endswith(" -->"), lines[:2]
+    return "\n".join(lines[1:])
 
 
 def test_block_text_edit_requires_a_version_bump():
@@ -389,5 +403,79 @@ def test_block_text_edit_requires_a_version_bump():
         "in every provisioned repo, so the change needs a VERSION BUMP to be "
         "reachable there — the installer only upgrades what it can compare.\n"
         f"  new sha256: {got}\n"
-        "  -> bump AGENTS_BLOCK_VERSION, update BLOCK_PROSE_SHA256, and update "
-        "the version named in docs/quickstart-cloud.md + the served SKILL.")
+        "  -> bump AGENTS_BLOCK_VERSION, update BLOCK_PROSE_SHA256, and check the "
+        "message examples in docs/quickstart-cloud.md + both served SKILL copies.")
+
+
+# ── Pre-states that had no test, and were wrong because of it ────────────────
+
+
+def test_indented_markers_are_refused_not_duplicated(tmp_path):
+    """The mildest edit — a formatter indenting the marker lines — made the
+    anchored detector see NO marker, so `none` APPENDED a second block: the stale
+    copy stayed first and every later run compared the appended pair to itself
+    and said "already current". A near-anchor marker is a MALFORMED marker."""
+    legacy = LEGACY_BLOCK.replace(START, "  " + START).replace(END, "  " + END)
+    done, agents = _install(tmp_path, FOREIGN_BEFORE + legacy)
+
+    assert done.returncode == 3, (
+        f"a refusal exits 3 (skills installed, block not upgraded), got {done.returncode}:\n{done.stdout}")
+    assert "MALFORMED" in done.stderr, done.stderr
+    assert agents.count("tortoise:start") == 1, f"the block was duplicated:\n{agents}"
+
+
+def test_trailing_space_markers_are_refused_not_duplicated(tmp_path):
+    legacy = LEGACY_BLOCK.replace(START, START + " ").replace(END, END + " ")
+    done, agents = _install(tmp_path, legacy)
+
+    assert done.returncode == 3, (
+        f"a refusal exits 3 (skills installed, block not upgraded), got {done.returncode}:\n{done.stdout}")
+    assert "MALFORMED" in done.stderr, done.stderr
+    assert agents.count("tortoise:start") == 1, f"the block was duplicated:\n{agents}"
+
+
+def test_an_existing_agents_file_without_markers_is_appended_once(tmp_path):
+    """The common case: the project already HAS an AGENTS.md with its own rules."""
+    done, agents = _install(tmp_path, FOREIGN_BEFORE)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert agents.startswith(FOREIGN_BEFORE)
+    assert agents.count(START) == 1 and agents.count(END) == 1
+    assert "created" in _agents_report(done.stdout)
+
+
+def test_a_pure_line_ending_difference_does_not_claim_a_text_change(tmp_path):
+    """CRLF file: a pure EOL difference must not be reported as an updated text
+    (and must not be rewritten into mixed endings)."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    assert _run(installer, home, project).returncode == 0
+
+    agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+    (project / "AGENTS.md").write_bytes(agents.replace("\n", "\r\n").encode())
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    report = _agents_report(done.stdout)
+    assert "updated text" not in report, (
+        f"only the line endings differed, nothing was rewritten:\n{report}")
+    assert "already current" in report, report
+
+
+def test_a_numeric_version_that_does_not_compare_never_reads_as_current(tmp_path):
+    """An out-of-range version made `-lt`/`-gt` error and fall through to the
+    refresh branch: a DOWNGRADE announced as a same-version text update."""
+    huge = "9" * 25
+    agents_in = LEGACY_BLOCK.replace(START, f"{START}\n<!-- tortoise:block v{huge} -->")
+    done, _agents = _install(tmp_path, agents_in)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    report = _agents_report(done.stdout)
+    assert "already current" not in report, report
+    assert "refreshed (v" not in report and "updated text" not in report, (
+        f"a downgrade must never be reported as a text refresh:\n{report}")
+    assert "unreadable" in report, report
