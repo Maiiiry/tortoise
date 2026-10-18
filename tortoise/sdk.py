@@ -16729,12 +16729,21 @@ class TortoiseSDK:
         a concurrent process re-marked it dirty mid-run and its marking
         must survive. ``run_ep=None`` (single-process callers without a
         snapshot) clears unconditionally.
+
+        #7505: the swept set is the affected CLAIMS plus the non-claim
+        dirty ROOTS the pass CONSUMED as seeds — see
+        :meth:`_consumed_seed_roots`. Subtracting ``affected`` alone left
+        every root ``_mark_dirty`` had flagged in its own right (an
+        operator, a mitigation Point) permanently dirty, because
+        ``_affected_claims`` admits a factor's INPUTS and neither of those
+        is one.
         """
-        self._dirty_roots -= affected
-        self._reset_retry_state(affected)
-        if not affected:
+        swept = affected | self._consumed_seed_roots(affected)
+        self._dirty_roots -= swept
+        self._reset_retry_state(swept)
+        if not swept:
             return
-        ids = list(affected)
+        ids = list(swept)
         if run_ep is None:
             self._get_proj().g.query(
                 "MATCH (n:Point) WHERE n.id IN $ids AND n.ep_dirty = true "
@@ -16748,6 +16757,77 @@ class TortoiseSDK:
                 "SET n.ep_dirty = null, n.ep_dirty_at = null",
                 params={"ids": ids, "run_ep": run_ep},
             )
+
+    def _consumed_seed_roots(self, affected: set[str]) -> set[str]:
+        """#7505: the non-claim dirty roots a converged pass CONSUMED.
+
+        ``_mark_dirty`` persists a flag on every id it is handed — the
+        mutated points THEMSELVES (an operator, or a mitigation Point: a
+        mitigation is the SOURCE of ``(m)-[:IMPL]->(op)``) as well as the
+        reverse-BFS claims. The claims are swept because they are factor
+        participants; a mutated operator/mitigation is not, so
+        ``_sweep_dirty_roots`` never cleared it: it sat in ``_dirty_roots``
+        and in the graph forever, pinning ``_auto_dream_mode`` to 'local'
+        and keeping ``stale_backlog`` permanently non-zero. Measured on the
+        #6599 regression: one ``mitigate_operator`` write left BOTH the
+        mitigation and the operator flagged after a converged
+        ``compute_confidence()``, and ``dream(full=True)`` did not clear
+        them. ``delete_point`` had worked around the same class by
+        narrowing which ids become roots (#2422); this is the sweep-side
+        repair, so no write path has to avoid a root it legitimately needs.
+
+        A root was CONSUMED when every factor it feeds was recomputed by
+        this pass. ``affected`` is the run's recomputed claim set, so:
+
+        * the pass's OPERATOR SET is exactly the predicate
+          ``TortoiseEP._affected_factors`` Batch 1 extracts its factors
+          with — an operator with a target in the recomputed set. Every
+          live input of such an operator is admitted to ``affected``
+          together (the #5566 factor-participant contract), so ONE admitted
+          target proves the factor ran. An operator root in that set was a
+          seed and is consumed.
+        * a non-factor root (a mitigation, a nested operator) is consumed
+          only when EVERY operator it feeds is in that set.
+
+        CONSERVATION is deliberate — a root whose factor the pass did NOT
+        cover stays dirty: the #6211 selector cap drops operators, a
+        budget-bounded stale-first window covers only its slice, an
+        EP-inert operator has no factor to run at all, and a draft/terminal
+        participant is excluded from ``affected`` by design. A root with no
+        outgoing ``IMPL|NAND`` edge to an operator (an orphaned mitigation,
+        a direct-edge endpoint, a draft-only claim) feeds nothing this pass
+        could have recomputed and is retained too. An unswept stale region
+        is a wrong posterior — a worse defect than a flag that outlives the
+        pass.
+        """
+        candidates = self._dirty_roots - affected
+        if not candidates:
+            return set()
+        proj = self._get_proj()
+        ids = sorted(candidates)
+        # Operator-side predicate mirrors `_affected_factors` Batch 1 (the
+        # `op_type` legacy operator form included); `c` is deliberately
+        # label-free, as there (the EP surface spans the epistemic labels,
+        # #7853/#7902).
+        covered_ops = {r[0] for r in proj.g.query(
+            "MATCH (o:Point)-[:IMPL|NAND]->(c) "
+            "WHERE c.id IN $ids "
+            "AND (o.is_operator = true OR o.op_type IS NOT NULL) "
+            "RETURN DISTINCT o.id",
+            params={"ids": sorted(affected)}).result_set}
+        consumed = {c for c in candidates if c in covered_ops}
+        feeders: dict[str, set[str]] = {}
+        for pid, oid in proj.g.query(
+                "MATCH (p:Point)-[:IMPL|NAND]->(o:Point) "
+                "WHERE p.id IN $ids "
+                "AND (o.is_operator = true OR o.op_type IS NOT NULL) "
+                "RETURN DISTINCT p.id, o.id",
+                params={"ids": ids}).result_set:
+            feeders.setdefault(pid, set()).add(oid)
+        for pid, ops in feeders.items():
+            if ops <= covered_ops:
+                consumed.add(pid)
+        return consumed
 
     def _reverse_bfs_neighbors(self, proj, point_ids: list[str]
                                ) -> tuple[list[str], list[str]]:

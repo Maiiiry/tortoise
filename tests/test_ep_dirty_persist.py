@@ -273,3 +273,166 @@ def test_http_noarg_gate_allows_persisted_dirty_state(monkeypatch):
                 "HTTP no-arg must run local EP over persisted dirty state"
         finally:
             sdk.close()
+
+
+# ── #7505: a mutated non-claim ROOT must be swept too ─────────────
+
+
+def _chain_with_mitigation(sdk: TortoiseSDK, tag: str = "") -> dict:
+    """src → clm under one IMPL operator, with a mitigation on the operator.
+
+    Returns the id map by role. `_mark_dirty([mid, id])` flags the mutation
+    pair AND the operator's inputs; the mask of creation-time marking is
+    cleared so only the mitigation write's own roots are under test.
+    """
+    src = sdk.create_point("statement", f"src{tag}", dedup=False,
+                           status="live")["id"]
+    clm = sdk.create_point("statement", f"clm{tag}", dedup=False,
+                           status="live")["id"]
+    sdk.set_point_baseline(src, 10, 1)
+    sdk.set_point_baseline(clm, 1, 1)
+    op = sdk.create_operator("IMPL", src, [clm],
+                             direction="bidirectional")["id"]
+    # Clear the creation-time marking (the graph flags AND the in-memory
+    # mirror, i.e. what a rebuilt/replayed process starts from), so only the
+    # mitigation write's own roots are under test.
+    sdk._get_proj().g.query(
+        "MATCH (n:Point) WHERE n.ep_dirty = true "
+        "SET n.ep_dirty = null, n.ep_dirty_at = null")
+    sdk._dirty_roots.clear()
+    assert not sdk._dirty_roots and not _ep_dirty_ids(sdk), \
+        "fixture must start from a clean EP state"
+    mit = sdk.mitigate_operator(op, f"caveat{tag}", strength=0.2)["id"]
+    return {"src": src, "clm": clm, "op": op, "mit": mit}
+
+
+def test_mitigation_write_consumes_both_of_its_roots():
+    """#7505 regression — a mitigation write must not strand its roots.
+
+    `_mark_dirty([mid, id])` persists `ep_dirty` on the mitigation AND the
+    operator; `_sweep_dirty_roots` subtracted only `affected`, and
+    `_affected_claims` admits a factor's INPUTS — so after #6599 (which
+    correctly stopped admitting the mitigation to `affected`) BOTH
+    non-input roots were unreachable by every sweep, forever. Measured at
+    head: after a converged `compute_confidence()` the graph still carried
+    `{mit, op}` and `_dirty_roots` matched, pinning `_auto_dream_mode` to
+    'local' and keeping `stale_backlog` non-zero with no pass able to drain
+    it. Both the CREATE and the idempotent-UPDATE branch of
+    `mitigate_operator` are covered here: the update branch is reached by
+    the second call.
+    """
+    with _db() as db:
+        sdk = _open(db)
+        try:
+            ids = _chain_with_mitigation(sdk)
+            # The write flagged the mutation PAIR (issue measurement, head):
+            # both non-input roots must be present, or the assertions below
+            # are vacuous.
+            assert {ids["mit"], ids["op"]} <= sdk._dirty_roots, (
+                f"a mitigation write must flag the mitigation and its "
+                f"operator: {sorted(sdk._dirty_roots)}")
+            assert {ids["mit"], ids["op"]} <= _ep_dirty_ids(sdk)
+
+            result = sdk.compute_confidence()
+            assert result["converged"], result
+            assert {ids["src"], ids["clm"]} <= set(result["confidences"]), (
+                "the pass must actually recompute the operator's inputs — "
+                f"confidences={sorted(result['confidences'])}")
+            assert not _ep_dirty_ids(sdk), (
+                "a converged pass must clear EVERY root it consumed, "
+                f"including the mitigation and the operator: "
+                f"{sorted(_ep_dirty_ids(sdk))}")
+            assert not sdk._dirty_roots, (
+                f"in-memory mirror must match: {sorted(sdk._dirty_roots)}")
+            # The two symptoms the stranding produced, asserted directly.
+            assert sdk.dream_health_check()["stale_backlog"] == 0, \
+                "stale_backlog must drain"
+            assert sdk.compute_confidence()["diagnostic"] == "no_dirty_roots", \
+                "_auto_dream_mode must not be pinned to 'local' by a root " \
+                "no pass can ever clear"
+
+            # The idempotent-UPDATE branch (`update_point` on the existing
+            # mitigation + `_mark_dirty([mid, id])`) strands the same pair.
+            sdk.mitigate_operator(ids["op"], "revised", strength=0.45)
+            assert {ids["mit"], ids["op"]} & sdk._dirty_roots, \
+                "the update branch must flag a root"
+            assert sdk.compute_confidence()["converged"]
+            assert not _ep_dirty_ids(sdk) and not sdk._dirty_roots, (
+                "the idempotent-update branch strands the same pair: "
+                f"flags={sorted(_ep_dirty_ids(sdk))}, "
+                f"roots={sorted(sdk._dirty_roots)}")
+        finally:
+            sdk.close()
+
+
+def test_full_pass_consumes_a_mitigations_roots():
+    """#7505 — the same roots must drain under a converged FULL pass.
+
+    Every non-operator Point is an anchor in full mode, so the whole graph
+    (hence both roots) is covered — the pre-fix measurement kept `{mit, op}`
+    after `dream(full=True)`.
+    """
+    with _db() as db:
+        sdk = _open(db)
+        try:
+            ids = _chain_with_mitigation(sdk)
+            assert {ids["mit"], ids["op"]} <= sdk._dirty_roots
+            result = sdk.dream(full=True, require_calibration=False)
+            assert result["converged_all"], result
+            assert not sdk._dirty_roots, sorted(sdk._dirty_roots)
+            assert not _ep_dirty_ids(sdk), sorted(_ep_dirty_ids(sdk))
+        finally:
+            sdk.close()
+
+
+def test_capped_pass_retains_the_roots_it_did_not_cover():
+    """#7505 conservation — an UNCOVERED root must stay dirty.
+
+    The sweep's new set is coverage-derived, not "every root the pass was
+    seeded with": the #6211 selector cap (here an explicit
+    ``budget=1``) leaves operators unselected, and clearing their roots
+    would trade a stuck flag for a stale posterior — the worse defect. Two
+    independent mitigated chains: the budget-1 pass covers exactly one, and
+    the other's four roots (including its operator and mitigation) survive
+    for the next pass to drain.
+    """
+    with _db() as db:
+        sdk = _open(db)
+        try:
+            a = _chain_with_mitigation(sdk, "A")
+            b = _chain_with_mitigation(sdk, "B")
+            # The fixture's second setup CLEARS the graph to isolate its own
+            # roots, so re-mark chain A — both chains must be dirty for this
+            # pass to have something to leave uncovered.
+            sdk.mitigate_operator(a["op"], "revised A", strength=0.3)
+            roots = set(a.values()) | set(b.values())
+            assert roots <= sdk._dirty_roots, (
+                f"both chains must be dirty: {sorted(roots - sdk._dirty_roots)}")
+
+            capped = sdk.dream(mode="local", budget=1,
+                               require_calibration=False)
+            assert capped["converged"], capped
+            assert capped["budget_used"] == 1, capped
+            uncovered = set(sdk._dirty_roots)
+            assert uncovered, \
+                "a budget-capped pass must retain the roots it did not cover"
+            # The pass covers EXACTLY ONE operator's factor (op_cap=1), so
+            # one chain is swept whole and the other is retained whole — the
+            # table is not "everything seeded" but "what the run computed".
+            kept = a if (set(a.values()) & uncovered) else b
+            swept = b if kept is a else a
+            assert not (set(swept.values()) & uncovered), (
+                f"the covered chain must be swept: {sorted(uncovered)}")
+            assert set(kept.values()) <= uncovered, (
+                "the uncovered chain's roots were swept without their "
+                f"factor running: {sorted(set(kept.values()) - uncovered)}")
+            assert kept["op"] in uncovered and kept["mit"] in uncovered, (
+                "the uncovered chain's operator/mitigation roots must "
+                f"survive: remaining={sorted(uncovered)}")
+
+            drained = sdk.dream(mode="local", require_calibration=False)
+            assert drained["converged"], drained
+            assert not sdk._dirty_roots, sorted(sdk._dirty_roots)
+            assert not _ep_dirty_ids(sdk), sorted(_ep_dirty_ids(sdk))
+        finally:
+            sdk.close()
