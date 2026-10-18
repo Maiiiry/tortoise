@@ -584,6 +584,47 @@ def _script(ch: str) -> str:
     return unicodedata.name(ch, "").split(" ", 1)[0]
 
 
+#: Korean attaches case particles to the noun with NO space — `삼성전자는`,
+#: `한국의`, `ACME의` are the canonical forms, not the exception. Hangul is still a
+#: SPACED script (it separates WORDS with spaces), so without this a Hangul
+#: neighbour always read as a word continuation and `삼성전자는 반도체를 만든다`
+#: scored 0.0 — as did `ACME의 계약` and `AI를 도입했다`, which is how a Latin
+#: anchor in Korean text became unmatchable.
+#:
+#: The accepted set is CLOSED and the check is deliberately reject-biased: the
+#: run must be a particle, or two STACKED particles, covering the WHOLE run. So
+#: `한국의` matches while `한국어` (`어` is not a particle) and `한국도시`
+#: (`도` + `시`, where `시` is not) do not.
+_KO_PARTICLES = frozenset({
+    "은", "는", "이", "가", "을", "를", "의", "에", "에게", "께", "께서", "도",
+    "만", "과", "와", "로", "으로", "부터", "까지", "보다", "처럼", "하고",
+    "이다", "입니다", "이란", "이라고", "라는", "라고", "이라는", "이며",
+    "이지만", "이라", "란", "야", "이야", "에서", "서는", "에는", "에도",
+    "에만", "으로는", "으로도", "으로부터", "에서는",
+})
+
+
+def _hangul_run(text: str, start: int) -> str:
+    """The maximal run of Hangul SYLLABLES beginning at ``start`` (capped at 6)."""
+    end = start
+    while end < len(text) and end - start < 6 and 0xAC00 <= ord(text[end]) <= 0xD7A3:
+        end += 1
+    return text[start:end]
+
+
+def _particle_follows(text: str, start: int) -> bool:
+    """Does a Korean case particle begin at ``start`` and account for the whole run?"""
+    run = _hangul_run(text, start)
+    if not run:
+        return False
+    if run in _KO_PARTICLES:
+        return True
+    return any(
+        run[:i] in _KO_PARTICLES and run[i:] in _KO_PARTICLES
+        for i in range(1, min(len(run), 5))
+    )
+
+
 def _spaced_word_char(ch: str) -> bool:
     """Is ``ch`` a word character of a script that separates words with spaces?
 
@@ -611,18 +652,25 @@ def _spaced_word_char(ch: str) -> bool:
     if not ch.isalpha():
         if unicodedata.category(ch).startswith("M"):
             return True
+        if 0xE000 <= ord(ch) <= 0xF8FF:
+            # BMP PRIVATE USE is icon-font territory in extracted text — a Word
+            # Symbol-font bullet is ``U+F0B7`` — and it sits BETWEEN tokens, so it
+            # is a SEPARATOR: ``ACME\uf0b7契約を締結`` must match. Assigned
+            # CJK-compatibility private use lives in the supplementary planes,
+            # which still block.
+            return False
         name = unicodedata.name(ch, "")
         if not name:
-            # UNNAMED code points (private use, unassigned, surrogates) offer no
-            # script to consult, and reading them as separators fails OPEN: ``AI``
-            # matched ``ai\ue000`` and ``合同`` matched ``合同\ue000有效``. They
-            # block instead — the fail-closed side, and the same direction as an
-            # unrecognised script.
+            # UNNAMED and not BMP private use (unassigned, surrogates,
+            # supplementary PUA) offers no script to consult, and reading it as a
+            # separator fails OPEN — ``AI`` matched ``ai\u0378``. It blocks
+            # instead: the fail-closed side, like an unrecognised script.
             return True
-        # DECORATED letters (``Ⓐ`` circled, ``Ａ`` fullwidth, ``𝐀`` mathematical) are
-        # letters that ``isalpha()`` does not report — circled/squared forms are
-        # ``So``. Their NAME is what says so, and without this they read as
-        # separators, so ``AI`` matched ``aiⒶ``.
+        # CIRCLED/SQUARED Latin (``Ⓐ``, ``ⓐ``) is ``So`` — a letter ``isalpha()``
+        # really does not report — so its NAME is what catches it. (``Ａ`` and
+        # ``𝐀`` ARE ``isalpha()`` letters; what makes them separators is the
+        # inverted polarity below, since their name's first word is ``FULLWIDTH``
+        # / ``MATHEMATICAL`` rather than ``LATIN``.)
         return "LATIN" in name
     return _script(ch) not in _UNSPACED_SCRIPTS
 
@@ -648,7 +696,15 @@ def _occurs_as_word(needle: str, haystack: str) -> bool:
         end = start + len(needle)
         left = haystack[start - 1] if start else ""
         right = haystack[end] if end < len(haystack) else ""
-        if not _spaced_word_char(left) and not _spaced_word_char(right):
+        if _spaced_word_char(left):
+            blocked = True
+        elif not _spaced_word_char(right):
+            blocked = False
+        else:
+            # A Hangul neighbour is a word character of a SPACED script, but an
+            # attached Korean particle is a boundary, not a continuation.
+            blocked = not _particle_follows(haystack, end)
+        if not blocked:
             return True
         start = haystack.find(needle, start + 1)
     return False
@@ -679,14 +735,18 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     Empty/blank anchors are refused by ``assess_sufficiency`` long before they
     reach here; the guard remains as defence, since ``"" in …`` is universal.
     """
-    # NFC BOTH sides before folding: the two operands come from different
-    # pipelines (the extractor and canonical stores emit NFC; filesystem/OCR
-    # text and caller-supplied anchors may be NFD), and without it the boundary
-    # verdict — and cross-form matching — depended on the normalisation form.
-    folded = unicodedata.normalize("NFC", " ".join(needle.split())).casefold()
+    # NFKC — COMPATIBILITY, not merely canonical, on both sides: NFKC folds the
+    # width variants (`ＡＩ` -> `AI`, `２０２６` -> `2026`, half-width kana ->
+    # full-width) as well as the composition forms. NFC alone left a full-width
+    # spelling unmatchable in both directions and made half-width kana a spaced
+    # word character (`ｼ`'s first name word is `HALFWIDTH`), so
+    # `当社のＡＩ技術` and `ｼｽﾃﾑACMEｼｽﾃﾑ` scored 0.0. Folding also REPLACES the
+    # operands' form-dependence: the extractor and canonical stores emit NFC while
+    # filesystem/OCR text and caller anchors may be NFD/NFKC.
+    folded = unicodedata.normalize("NFKC", " ".join(needle.split())).casefold()
     if not folded:
         return False
-    if folded == unicodedata.normalize("NFC", row.id).casefold():
+    if folded == unicodedata.normalize("NFKC", row.id).casefold():
         return True
     # Does the ANCHOR itself come from a spaced script? Only then is a word
     # boundary meaningful in its OWN script; an unspaced-script anchor has none.
@@ -701,7 +761,7 @@ def _mentions(needle: str, row: _Evidence) -> bool:
         if not candidate:
             continue
         haystack = unicodedata.normalize(
-            "NFC", " ".join(candidate.split())).casefold()
+            "NFKC", " ".join(candidate.split())).casefold()
         if _occurs_as_word(folded, haystack) if bounded else folded in haystack:
             return True
     return False

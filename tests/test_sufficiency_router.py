@@ -1299,16 +1299,19 @@ def test_a_latin_anchor_matches_inside_unspaced_text(text: str) -> None:
     ("משלם", "של"),
     ("المؤمنون", "من"),
     ("Über", "Ü"),                   # Latin, but with no ASCII letter in the anchor
-    # DECORATED Latin neighbours: `Ⓐ`/`Ａ`/`𝐀` are letters `isalpha()` does not
-    # report, so an allow-list of the SPACED side read them as separators.
+    # DECORATED Latin neighbours. `Ａ` and `𝐀` ARE `isalpha()` letters — what
+    # catches them is the INVERTED polarity (their name's first word is
+    # `FULLWIDTH`/`MATHEMATICAL`, not `LATIN`); the `NAME contains LATIN` branch
+    # is needed only for the `So` circled/squared forms like `Ⓐ`.
     ("Ａai", "AI"),
     ("aiＡ", "AI"),
     ("𝐀ai", "AI"),
     ("aiⒶ", "AI"),
-    # UNNAMED code points (private use, unassigned) have no script to consult.
-    # Reading them as separators fails OPEN — `AI` matched `ai\ue000` — so they
-    # block, the same fail-closed direction as an unrecognised script.
-    ("ai\ue000", "AI"),
+    # UNNAMED code points split by RANGE, because they are not one thing: an
+    # unassigned/surrogate code point has no script and blocks (fail-closed, since
+    # reading it as a separator let `AI` match `ai\u0378`), while BMP private use
+    # is icon-font territory — a Word Symbol-font bullet is `U+F0B7` — and sits
+    # BETWEEN tokens. See the two dedicated tests below.
     ("ai\u0378", "AI"),
 ])
 def test_the_boundary_holds_inside_a_spaced_script(
@@ -1370,6 +1373,77 @@ def test_the_boundary_is_normalisation_form_independent(
     verdict = assess_sufficiency(
         _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0 if match else 0.0),)
+
+
+@pytest.mark.parametrize("text,anchor", [
+    # KOREAN. Hangul separates WORDS with spaces but attaches case PARTICLES with
+    # none, so a Hangul neighbour read as a word continuation made the canonical
+    # form of nearly every Korean sentence unmatchable: `삼성전자는 반도체를 만든다`
+    # and `ACME의 계약` both scored 0.0. The particle set is closed, and `어`/`시`/
+    # `인` are not in it, so the derived forms below stay out.
+    ("삼성전자는 반도체를 만든다", "삼성전자"),
+    ("삼성전자가 발표했다", "삼성전자"),
+    ("삼성전자를 인수했다", "삼성전자"),
+    ("삼성전자의 실적", "삼성전자"),
+    ("삼성전자와 계약했다", "삼성전자"),
+    ("한국의 수도는 서울이다", "한국"),
+    ("서울에는 사람이 많다", "서울"),
+    ("한국에서는 인기가 높다", "한국"),
+    ("ACME의 계약", "ACME"),          # a LATIN anchor in Korean text
+    ("AI를 도입했다", "AI"),
+    ("OpenAI의 모델", "OpenAI"),
+])
+def test_a_korean_particle_is_a_boundary_not_a_continuation(
+        text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+
+@pytest.mark.parametrize("text,anchor", [
+    ("한국어를 배운다", "한국"),   # 어 is not a particle
+    ("한국도시 계획", "한국"),     # 도 + 시, and 시 is not
+    ("한국인이 많다", "한국"),     # 인 is not
+])
+def test_a_korean_derived_form_is_still_not_a_mention(text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
+@pytest.mark.parametrize("text,anchor", [
+    # COMPATIBILITY WIDTH. Full-width Latin and digits are standard in Japanese and
+    # Chinese formal/legal/OCR text, and half-width kana is standard in the same
+    # corpora — all four of these scored 0.0 under canonical (NFC) folding only.
+    ("当社のＡＩ技術は進化する", "AI"),
+    ("当社のAI技術", "ＡＩ"),
+    ("２０２６年に署名した", "2026"),
+    ("ｱｸﾒｼｽﾃﾑ", "ｱｸﾒ"),
+    ("ｼｽﾃﾑACMEｼｽﾃﾑ", "ACME"),   # half-width kana neighbour, not full-width katakana
+])
+def test_a_compatibility_width_spelling_is_the_same_entity(
+        text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
+
+
+@pytest.mark.parametrize("text,anchor,expected", [
+    # BMP private use is icon-font territory: a Word Symbol-font bullet (U+F0B7)
+    # sits BETWEEN tokens, so it separates rather than blocks.
+    ("ACME\uf0b7契約を締結", "ACME", 1.0),
+    ("ACME\uf0b7contract signed", "ACME", 1.0),
+    ("\uf0b7ACME", "ACME", 1.0),
+    # Unnamed code points OUTSIDE BMP private use have no script to consult and
+    # BLOCK — the fail-closed side.
+    ("ai\u0378", "AI", 0.0),
+    ("ai\U000F0000", "AI", 0.0),
+])
+def test_unnamed_code_points_are_split_by_range(
+        text: str, anchor: str, expected: float) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, expected),)
 
 
 class _AttrRow:
