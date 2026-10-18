@@ -6071,6 +6071,55 @@ class HolderGateTests(unittest.TestCase):
         self.assertEqual(holder.verdict, self.cp.HOLDER_LIVE)
         self.assertIn("proc-", holder.lane)
 
+    def test_a_partially_read_process_store_makes_the_board_unanswerable(self):
+        # ⛔ THE MIXED CASE, THROUGH THE GATE. `liveness_measured` used to be "at
+        # least one store answered", so a cmux store that answered EMPTY outranked a
+        # process store that had failed: the process lanes were dropped, no
+        # `liveness-unmeasured` orphan was published, and this gate answered
+        # "nobody holds it" — authorising a dispatch into a live checkout.
+        #
+        # Here `ps` saw two pids, one cwd was read, the other is still ALIVE and
+        # unattributable. That lane may hold ISSUE, so no lane is a measured holder.
+        fs = self.cp.fleet_state
+        cell_cwd = "/tmp/cell-t3/wt-3051"
+        for name, fn in {
+            "cmux_session_records": lambda: (
+                [], fs.LIVE_STORE_CMUX_PLURAL, ""),   # answered, and empty
+            "pi_processes": lambda: (
+                [{"pid": 4242, "ppid": 1}, {"pid": 4243, "ppid": 1}], ""),
+            "process_cwds": lambda pids: ({4242: cell_cwd}, ""),
+            "pid_alive": lambda pid: pid == 4243,
+            "load_registry": lambda: [],
+            "cmux_workspaces": lambda: fs.WorkspaceMap(error="cmux: command not found"),
+            "pane_bindings": lambda: {},
+            "load_overrides": lambda: {},
+            "session_index": lambda: ({}, {}),
+            "worktrees": lambda _root: {
+                cell_cwd: {"branch": "refs/heads/fix/3061-cell-lane", "head": "a" * 40}},
+            "open_prs": lambda _repo, limit=400: fs.GitHubRows([], measured=True),
+            "open_issues": lambda _repo, limit=fs.OPEN_ISSUES_LIMIT: fs.GitHubRows(
+                [{"number": ISSUE}], measured=True),
+        }.items():
+            patcher = mock.patch.object(fs, name, fn)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        state = fs.build_state(repo=SLUG, repo_root="/tmp", orch_ws="",
+                               sample_s=0.0, do_pane=False)
+        rec = state["reconciliation"]
+        self.assertEqual(rec["liveness_measured"], False)
+        self.assertEqual(rec["liveness_source"], fs.LIVE_STORE_CMUX_PLURAL)
+        self.assertIn("4243", rec["liveness_error"])
+        self.assertTrue([o for o in state["orphans"]
+                         if o.get("kind") == "liveness-unmeasured"])
+        # The lane that WAS attributed is still evidence on the board …
+        self.assertTrue([lane for lane in state["lanes"]
+                         if str(lane["identity"]["workspace"]).startswith(
+                             fs.PROC_WS_PREFIX)])
+        # … and the gate refuses: an incomplete measurement is not a "nobody".
+        why = self.cp._board_can_answer(state)
+        self.assertIn("live-session store", why)
+        self.assertIn("4243", why)
+
     def test_a_board_level_orphan_reaches_the_surface_as_unmeasured(self):
         # board that cannot answer is REBUILT by design, so a subprocess test for
         # this shape would run the board's own bare `gh`/`cmux` — a real, ~12 s,

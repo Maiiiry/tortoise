@@ -1997,16 +1997,83 @@ def test_the_plural_grammar_is_preferred_and_a_later_one_can_answer(monkeypatch)
 def test_a_pid_a_cmux_record_already_carries_is_not_emitted_twice(monkeypatch) -> None:
     """On a Mac every lane's pi is in the cmux store. Emitting it a second time as a
     process lane would enumerate one lane twice — the duplicate-label shape that
-    makes the claim gate exit 2 on a perfectly readable board."""
+    makes the claim gate exit 2 on a perfectly readable board.
+
+    ⛔ AND THE MASK REQUIRES A *READING*, NOT A ROW. `--all` is a durable history
+    that keeps ENDED sessions, and pids are recycled, so a record whose pid is dead
+    proves nothing about the live process that now carries that pid. Masking on mere
+    existence dropped the only evidence a cell lane has (it has no cmux workspace at
+    all) while the store still read MEASURED — the gate could then answer "nobody
+    holds it" about a running lane.
+    """
     cmux = [{"agent": "pi", "workspace_id": "WS-1", "pid": 900}]
     monkeypatch.setattr(fs, "cmux_session_records", lambda: (
         cmux, fs.LIVE_STORE_CMUX_PLURAL, ""))
     monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 900, "ppid": 1}], ""))
     monkeypatch.setattr(fs, "process_cwds", lambda pids: ({900: "/tmp/wt-a"}, ""))
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 900)
     live = fs.live_sessions()
     assert list(live) == ["WS-1"]
     assert live.measured is True
     assert live.source == f"{fs.LIVE_STORE_CMUX_PLURAL}+{fs.LIVE_STORE_PROCESS}"
+
+    # THE SAME ROW WITH A DEAD PID IS NOT A READING: the live process is published.
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: False)
+    live = fs.live_sessions()
+    assert list(live) == ["WS-1", f"{fs.PROC_WS_PREFIX}900"], (
+        "an ENDED cmux record must not mask the live process that recycled its pid")
+
+
+def test_a_healthy_cmux_store_does_not_cover_for_an_unreadable_process_store(
+        monkeypatch) -> None:
+    """⛔ THE MIXED CASE — the fail-open this reader must not have (#8999).
+
+    `measured` used to mean "at least one store answered", so a cmux store that
+    answered EMPTY outranked a process store that had just failed: every process
+    lane was dropped, no `liveness-unmeasured` orphan was published, and the gate
+    answered "nobody holds it" from a measurement the reader knew was incomplete —
+    about a box whose only lanes are the ones cmux cannot see at all.
+
+    The gap here is the narrow one: `ps` saw two pids, one cwd was read, and the
+    other pid is STILL ALIVE with no readable cwd. That lane may hold the issue, so
+    the fleet is unmeasured — while the lane that WAS attributed is still published
+    as evidence.
+    """
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: (
+        [], fs.LIVE_STORE_CMUX_PLURAL, ""))          # answered, and empty
+    monkeypatch.setattr(fs, "pi_processes", lambda: (
+        [{"pid": 5, "ppid": 1}, {"pid": 6, "ppid": 1}], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({5: CELL_CWD}, ""))
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 6)
+    live = fs.live_sessions()
+    assert live.measured is False, (
+        "a store that answered does not cover for one that could not be read")
+    assert live.source == fs.LIVE_STORE_CMUX_PLURAL, "the cmux store DID answer"
+    assert "6" in live.error, "and the gap names the pid it could not attribute"
+    assert list(live) == [f"{fs.PROC_WS_PREFIX}5"], (
+        "the lane that WAS attributed is still published as evidence")
+
+    # The same shape when the whole process leg is a failed COMMAND (not a pid):
+    # `ps`, or the cwd read, could not run at all. (Before the board, which stubs
+    # `live_sessions` itself.)
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([], "`ps` produced nothing"))
+    failed = fs.live_sessions()
+    assert failed.measured is False
+    assert failed.source == fs.LIVE_STORE_CMUX_PLURAL
+    assert "produced nothing" in failed.error
+
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 5, "ppid": 1}], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({}, "`lsof` could not be run"))
+    failed = fs.live_sessions()
+    assert failed.measured is False
+    assert "lsof" in failed.error
+
+    # … and it reaches the BOARD and the GATE: no lane is a measured holder.
+    st = _cell_fleet(monkeypatch, live=live)
+    assert st["reconciliation"]["liveness_measured"] is False
+    assert [o["kind"] for o in st["orphans"]
+            if o["kind"] == "liveness-unmeasured"], (
+        "the board must publish the orphan, or the gate reads a measured never")
 
 
 def test_a_measured_empty_process_table_is_an_answer_not_an_unmeasured_one(
