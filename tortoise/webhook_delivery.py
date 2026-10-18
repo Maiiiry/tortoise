@@ -422,18 +422,37 @@ def _pinned_targets(url: str, *, resolver=None
         raise ValueError("webhook url has no host")
     default_port = _DEFAULT_PORTS[scheme]
     port = port or default_port
+    # The name must be ASCII before it is used ANYWHERE: ``Host`` is a header
+    # value and ``sni_hostname`` a TLS server name, and httpx encodes neither
+    # with a utf-8 fallback — so handing it the raw IDN form raises
+    # ``UnicodeEncodeError`` on EVERY attempt. That is not a ``ConnectError``,
+    # so it lands in ``post``'s catch-all, the delivery is recorded as failed,
+    # and ``MAX_ATTEMPTS_DEFAULT`` then DISABLES the subscription: an IDN
+    # callback host that delivers today would go silently to zero deliveries.
+    # Pre-pin delivery worked because httpx's own urlparse IDNA-encoded the name
+    # before dialing — so normalise ONCE, here (``bücher.example.com`` →
+    # ``xn--bcher-kva.example.com``), and use the punycode form for the resolver,
+    # the ``Host`` header and SNI alike. It is also the form libc resolves and
+    # the form the subscriber's vhost and certificate are keyed on. IPv6
+    # literals are already ASCII and pass through unchanged.
+    try:
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError as e:
+        raise ValueError(
+            f"webhook url host {host!r} is not a valid IDNA name ({e}) — "
+            f"refusing to deliver") from e
     # Every answer must be global; a mixed answer is refused WHOLE. Only then
     # are addresses chosen, and they are what gets dialed.
-    addresses = resolve_webhook_addresses(host, port, resolver=resolver)
+    addresses = resolve_webhook_addresses(ascii_host, port, resolver=resolver)
     target = parts.path or "/"
     if parts.query:
         target = f"{target}?{parts.query}"
-    bracketed = f"[{host}]" if ":" in host else host
+    bracketed = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
     host_header = bracketed if port == default_port else f"{bracketed}:{port}"
     # SNI (and therefore certificate verification) stays on the NAME: httpcore
     # passes ``request.extensions['sni_hostname']`` to ``start_tls`` and httpx
     # forwards extensions to httpcore.
-    sni = host if scheme == "https" else None
+    sni = ascii_host if scheme == "https" else None
     candidates: list[tuple[str, str, str | None]] = []
     for address in addresses[:MAX_PINNED_ADDRESSES]:
         literal = f"[{address}]" if ":" in address else address
@@ -472,7 +491,12 @@ class WebhookTransport:
         self._resolver = resolver
 
     def post(self, url: str, body: bytes, headers: dict) -> tuple[int | None, str | None]:
-        """Return ``(status_code, error)`` — exactly one of the two is ``None``."""
+        """Return ``(status_code, error)`` — exactly one of the two is ``None``.
+
+        The candidate addresses share ONE ``timeout_s`` budget, so a hostile
+        resolver cannot turn one delivery into ``MAX_PINNED_ADDRESSES`` connect
+        timeouts: the worst case is ``timeout_s`` regardless of the answer.
+        """
         try:
             candidates = _pinned_targets(url, resolver=self._resolver)
         except ValueError as e:
@@ -493,9 +517,26 @@ class WebhookTransport:
         # trying address 1 again).
         connect_errors = (httpx.ConnectError, httpx.ConnectTimeout)
         error: str | None = None
+        # The ADDRESS CAP bounds the loop by count, not by TIME: eight
+        # blackholed answers at the 10 s default is ~80 s of wall clock for ONE
+        # event, against ~10 s before the pin — exactly the amplification the
+        # docstring's "a hostile resolver cannot spend a connect timeout per
+        # invented answer" claims to have closed. So one overall budget spans
+        # the candidates: each attempt gets what is left of it, and the loop
+        # stops when it is gone (a fresh full ``TIMEOUT_S`` per address is what
+        # multiplied).
+        deadline = time.monotonic() + self.timeout_s
         for pinned_url in (candidate[0] for candidate in candidates):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                error = (
+                    f"connect budget of {self.timeout_s}s exhausted before any "
+                    f"vetted address answered"
+                    + (f" (last error: {error})" if error else ""))
+                break
+            attempt_timeout = min(float(self.timeout_s), remaining)
             try:
-                with httpx.Client(timeout=self.timeout_s, follow_redirects=False,
+                with httpx.Client(timeout=attempt_timeout, follow_redirects=False,
                                   trust_env=False) as client:
                     resp = client.post(pinned_url, content=body,
                                        headers=out_headers, extensions=extensions)

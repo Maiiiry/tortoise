@@ -140,3 +140,15 @@ not a logic failure. The same file is the documented embedded-lane flake class (
 - A new test file that creates a real Point pays the **embedding-model load** (~80–150s on a cold
   host). Seeding `:GraphEvent` rows through `event_store.append_event` directly is both faster and a
   better fit for a delivery test (emission is already pinned by `tests/test_event_store.py`).
+- **A pin that moves the socket must keep the name ASCII.** `Host` is a header value and
+  `sni_hostname` a TLS server name, and httpx encodes neither with a utf-8 fallback — handing it the
+  raw IDN form raises `UnicodeEncodeError` on every attempt, which is not a `ConnectError`, so the
+  attempt ceiling DISABLES the subscription. `httpx`'s own urlparse used to IDNA-encode the name, so
+  the punycode form (`bücher.example.com` → `xn--bcher-kva.example.com`) is what must go to the
+  resolver, the `Host` header and SNI alike.
+- **A count cap is not a time bound.** `MAX_PINNED_ADDRESSES` × `TIMEOUT_S` is the amplification a
+  hostile resolver can buy (8 × 10 s for ONE event); the candidates share one `timeout_s` budget.
+- **`raise AssertionError` inside a `_no_dial` sentinel is defanged by the production catch-all**
+  (`except Exception` → `(None, "AssertionError: …")`), so "some error at all" passes even when the
+  refused target WAS dialed. The sentinel must be a `BaseException` subclass, and the test must
+  assert the per-URL refusal text.

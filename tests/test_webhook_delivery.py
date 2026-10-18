@@ -471,19 +471,148 @@ def test_dream_hook_is_best_effort_and_kill_switched(monkeypatch):
 # dialed at the VETTED address with Host/SNI on the name, and no refusal ever
 # produces a request.
 
-def _resolver(*addresses: str):
-    """A ``getaddrinfo``-shaped fake answering ``addresses`` for every query."""
-    return lambda *a, **k: [(2, 1, 6, "", (addr, 443)) for addr in addresses]
+def _resolver(*addresses: str, seen: list | None = None):
+    """A ``getaddrinfo``-shaped fake answering ``addresses`` for every query.
+
+    Passing ``seen`` records the host each query asked for — the pin must send
+    the SAME (ASCII/punycode) name libc would have been given.
+    """
+
+    def _resolve(host, *a, **k):
+        if seen is not None:
+            seen.append(host)
+        return [(2, 1, 6, "", (addr, 443)) for addr in addresses]
+
+    return _resolve
+
+
+class _Dialed(BaseException):
+    """Sentinel raised when a REFUSED target still reached the wire.
+
+    A ``BaseException`` subclass on purpose (P2, #9034 review): ``post`` ends its
+    per-candidate block with ``except Exception`` so that a transport failure
+    stays a receipt — an ``AssertionError`` sentinel is an ``Exception`` and is
+    therefore laundered into ``(None, "AssertionError: ...")``, which ANY
+    assertion on ``error`` accepts. A refusal that WAS dialed would then pass.
+    """
 
 
 def _no_dial(monkeypatch):
-    """Fail loudly if a refusal still reaches the wire."""
+    """Fail LOUDLY (and unswallowably) if a refusal still reaches the wire.
+
+    Returns the list of URLs the transport tried to dial, so a test can assert
+    none happened even if some future code learns to catch ``BaseException``.
+    """
     import httpx
 
+    dialed: list[str] = []
+
     def _boom(*a, **k):
-        raise AssertionError("refused target was dialed")
+        dialed.append(f"args={a!r} kwargs={k!r}")
+        raise _Dialed("refused target was dialed")
 
     monkeypatch.setattr(httpx, "Client", _boom)
+    return dialed
+
+
+@pytest.mark.parametrize("url, reason", [
+    # A non-global IP LITERAL, never resolved: refused by the registration
+    # predicate re-applied to the graph-written URL (it does not resolve, so
+    # only that re-check can refuse it — the connect-time one answers global).
+    ("http://127.0.0.1/cb", "is not a globally routable address"),
+    # A blocked NAME — again refused before any resolution happens.
+    ("http://localhost/cb", "is a local/private name"),
+    # Scheme and credential rules come from the same predicate.
+    ("ftp://hooks.example.com/cb", "scheme must be http or https"),
+    ("https://user:pw@hooks.example.com/cb", "must not carry credentials"),
+])
+def test_connect_reapplies_the_registration_policy_to_graph_written_urls(
+        monkeypatch, url, reason):
+    """The URL being dispatched is graph DATA, not a value this process just
+    validated — so the connect path re-applies the registration predicate
+    instead of assuming it ran (defence in depth for a hand-written row).
+
+    The refusal REASON is asserted per URL, and the no-dial sentinel is a
+    ``BaseException``: the injected resolver answers a GLOBAL address for every
+    host, so if the re-check were dropped these URLs would be dialed — a
+    "some error at all" assertion would then accept the swallowed
+    ``AssertionError`` and pass (that was the vacuity this replaces).
+    """
+    dialed = _no_dial(monkeypatch)
+    status, error = wd.WebhookTransport(
+        resolver=_resolver("93.184.216.34")).post(url, b"{}", {})
+    assert status is None, url
+    assert reason in (error or ""), (url, error)
+    assert dialed == [], f"a refused target was dialed: {dialed}"
+
+
+def test_connect_idna_encodes_an_idn_host_for_resolution_host_and_sni(
+        monkeypatch):
+    """An IDN (non-ASCII) callback host keeps delivering (#9034 review P1).
+
+    ``Host`` is a header value and ``sni_hostname`` a TLS server name; httpx
+    encodes neither with a utf-8 fallback, so handing it the raw
+    ``bücher.example.com`` raises ``UnicodeEncodeError`` on EVERY attempt. That is
+    not a ``ConnectError``, so the delivery is recorded as failed and after
+    ``MAX_ATTEMPTS_DEFAULT`` the subscription is DISABLED — an integration that
+    delivers today (``httpx`` used to IDNA-encode the name itself) would go
+    silently to zero deliveries. So the punycode form must be used for the
+    resolver, the ``Host`` header and SNI alike.
+    """
+    import httpx
+
+    seen: dict = {}
+    resolved: list = []
+
+    class _Resp:
+        status_code = 204
+
+    class _Client:
+        def __init__(self, **kwargs):
+            seen["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, **kwargs):
+            seen["url"] = url
+            seen.update(kwargs)
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+    status, error = wd.WebhookTransport(
+        resolver=_resolver("93.184.216.34", seen=resolved)).post(
+            "https://bücher.example.com/cb", b"{}", {})
+    assert (status, error) == (204, None)
+    # The dialed URL carries the VETTED address; the name lives in Host/SNI.
+    assert seen["url"] == "https://93.184.216.34:443/cb", seen["url"]
+    assert seen["headers"]["Host"] == "xn--bcher-kva.example.com", seen["headers"]
+    assert seen["extensions"] == {"sni_hostname": "xn--bcher-kva.example.com"}, \
+        seen["extensions"]
+    # libc does not do IDNA either: resolution must ask for the same ASCII form
+    # the pre-pin path handed it.
+    assert resolved == ["xn--bcher-kva.example.com"], resolved
+
+
+@pytest.mark.parametrize("url, reason", [
+    ("http://127.0.0.1/cb", "is not a globally routable address"),
+    ("https://bad..host/cb", "is not a valid IDNA name"),
+])
+def test_connect_refuses_an_unencodable_or_non_global_literal(monkeypatch, url, reason):
+    """A malformed IDN name is a RECEIPT, never an uncaught ``UnicodeError``.
+
+    ``host.encode('idna')`` raises for an empty label, which would otherwise
+    escape ``_pinned_targets`` as something ``post`` does not map to a refusal.
+    """
+    dialed = _no_dial(monkeypatch)
+    status, error = wd.WebhookTransport(
+        resolver=_resolver("93.184.216.34")).post(url, b"{}", {})
+    assert status is None, url
+    assert reason in (error or ""), (url, error)
+    assert dialed == [], dialed
 
 
 @pytest.mark.parametrize("answer, label", [
@@ -625,21 +754,6 @@ def test_connect_fails_over_between_vetted_addresses(monkeypatch):
     assert len(candidates) == wd.MAX_PINNED_ADDRESSES
 
 
-def test_connect_reapplies_the_registration_policy_to_graph_written_urls(
-        monkeypatch):
-    """The URL being dispatched is graph DATA, not a value this process just
-    validated — so the connect path re-applies the registration predicate
-    instead of assuming it ran (defence in depth for a hand-written row)."""
-    _no_dial(monkeypatch)
-    for url in ("http://127.0.0.1/cb",           # non-global literal, never resolved
-                "http://localhost/cb",           # blocked name
-                "ftp://hooks.example.com/cb",    # wrong scheme
-                "https://user:pw@hooks.example.com/cb"):
-        status, error = wd.WebhookTransport(
-            resolver=_resolver("93.184.216.34")).post(url, b"{}", {})
-        assert status is None and error, url
-
-
 def test_the_pinned_request_reaches_the_vetted_peer_on_the_wire(monkeypatch):
     """The pin is not string surgery: a REAL socket proves the request lands on
     the vetted address while the server reads the original ``Host``.
@@ -685,6 +799,155 @@ def test_the_pinned_request_reaches_the_vetted_peer_on_the_wire(monkeypatch):
     assert got["host"] == f"hooks.example.com:{port}", got
     assert got["path"] == "/cb?x=1"
     assert got["body"] == b'{"k":1}'
+
+
+def test_the_pinned_request_verifies_tls_against_the_name_not_the_pinned_ip(
+        monkeypatch, tmp_path):
+    """The HTTPS half, end to end over a REAL TLS socket (#9034 review Note A).
+
+    Every real subscription uses https, and the pin dials an IP literal while
+    keeping the name for SNI. If ``extensions={'sni_hostname': ...}`` did not
+    reach ``start_tls``, certificate verification would run against the DIALED
+    ADDRESS and every HTTPS delivery would fail. So: a TLS server holding a
+    self-signed certificate issued for ``hooks.example.com``, reached at
+    127.0.0.1 — a 200 proves verification used the NAME (an IP certificate
+    check against this cert could not succeed), and the server's own SNI
+    callback proves the name was sent.
+    """
+    import ssl
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    import httpx
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    import tortoise.security as sec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hooks.example.com")])
+    import datetime as _dt
+
+    now = _dt.datetime.now(_dt.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _dt.timedelta(minutes=5))
+        .not_valid_after(now + _dt.timedelta(hours=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("hooks.example.com")]),
+            critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "cert.pem"
+    key_path = tmp_path / "key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()))
+
+    got: dict = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            got["host"] = self.headers.get("Host")
+            got["path"] = self.path
+            got["body"] = self.rfile.read(length)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+
+    def _sni(sslobj, server_name, sslctx):
+        got["sni"] = server_name
+        return None
+
+    ctx.sni_callback = _sni
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    # Trust ONLY the throwaway CA: a verification that ran against the pinned IP
+    # (or against the default store) cannot produce a 200 here.
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx, "Client",
+        lambda **kwargs: real_client(
+            verify=ssl.create_default_context(cafile=str(cert_path)),
+            **kwargs))
+    monkeypatch.setattr(sec, "is_global_address", lambda addr: True)
+    try:
+        status, error = wd.WebhookTransport(
+            resolver=_resolver("127.0.0.1")).post(
+                f"https://hooks.example.com:{port}/cb?x=1", b'{"k":1}', {})
+        thread.join(timeout=10)
+    finally:
+        server.server_close()
+    assert (status, error) == (200, None), (status, error, got)
+    assert got["sni"] == "hooks.example.com", got
+    assert got["host"] == f"hooks.example.com:{port}", got
+    assert got["path"] == "/cb?x=1"
+    assert got["body"] == b'{"k":1}'
+
+
+def test_the_connect_loop_spends_one_budget_across_all_vetted_addresses(
+        monkeypatch):
+    """The worst case for ONE delivery is ``timeout_s``, not N × ``timeout_s``
+    (#9034 review Note C).
+
+    The address cap bounds the loop by COUNT. Without a shared deadline a
+    hostile resolver answering eight blackholed global addresses turns one event
+    into ~80 s at the 10 s default (vs ~10 s before the pin), and
+    ``dispatch_pending`` stops that subscription's batch on the first failure.
+    The clock is faked so the assertion is about the BUDGET, not about waiting.
+    """
+    import types
+
+    import httpx
+
+    attempts: list[float] = []
+    clock = {"now": 0.0}
+    # Each connect attempt burns 4 s of (fake) wall clock and then fails.
+    monkeypatch.setattr(wd, "time", types.SimpleNamespace(
+        monotonic=lambda: clock["now"],
+        sleep=lambda s: None))
+
+    class _Client:
+        def __init__(self, **kwargs):
+            attempts.append(kwargs["timeout"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, **kwargs):
+            clock["now"] += 4.0
+            raise httpx.ConnectTimeout("blackholed")
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+    many = tuple(f"93.184.216.{i}" for i in range(1, 21))
+    status, error = wd.WebhookTransport(
+        timeout_s=10, resolver=_resolver(*many)).post(
+            "https://hooks.example.com/cb", b"{}", {})
+    assert status is None
+    assert "budget" in error, error
+    # 10s budget, 4s per attempt: 10 → 6 → 2, then exhausted (the 4th candidate
+    # never gets a client). Pre-fix this was 8 attempts of a fresh 10 s each.
+    assert attempts == [10.0, 6.0, 2.0], attempts
 
 
 def test_a_rebound_subscription_is_refused_and_recorded_as_a_receipt(sdk_factory):
@@ -739,6 +1002,26 @@ def test_the_address_policy_has_exactly_one_home():
     for text in addresses:
         addr = ipaddress.ip_address(text)
         assert cimd.is_public_address(addr) == is_global_address(addr), text
+    # ...but a BEHAVIOURAL comparison of two copies cannot detect the drift this
+    # pins: if the algorithm were re-inlined into ``cimd``, both copies would
+    # agree on every address above and the assertion would still pass (#9034
+    # review Note B). So pin the SOURCE: ``cimd.is_public_address`` must be a
+    # pure delegation — one ``return`` of a call to ``is_global_address`` and no
+    # classification of its own.
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cimd.is_public_address)))
+    fn = tree.body[0]
+    body = fn.body[1:] if ast.get_docstring(fn) else fn.body
+    assert len(body) == 1 and isinstance(body[0], ast.Return), ast.dump(fn)
+    call = body[0].value
+    assert isinstance(call, ast.Call), ast.dump(call)
+    callee = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(
+        call.func, "id", "")
+    assert callee == "is_global_address", ast.dump(call)
+
     # And the two non-global classes ``is_global`` alone lets through are
     # refused by the shared predicate (multicast, 6to4 relay anycast).
     assert not is_global_address(ipaddress.ip_address("224.0.0.1"))
