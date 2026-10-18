@@ -529,7 +529,6 @@ Guide the human through:
    Anthropic — your key, their cloud).
 3. The connector exposes the `tortoise_*` MCP tools to claude.ai workflows.
 
-
 **Already installed — refreshing is the same command.** An install is not a
 one-time write. The installer owns two things inside your project: the skills
 directory and, on a Codex project, the marker-delimited Tortoise block in
