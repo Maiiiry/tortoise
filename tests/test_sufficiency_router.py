@@ -1305,6 +1305,11 @@ def test_a_latin_anchor_matches_inside_unspaced_text(text: str) -> None:
     ("aiＡ", "AI"),
     ("𝐀ai", "AI"),
     ("aiⒶ", "AI"),
+    # UNNAMED code points (private use, unassigned) have no script to consult.
+    # Reading them as separators fails OPEN — `AI` matched `ai\ue000` — so they
+    # block, the same fail-closed direction as an unrecognised script.
+    ("ai\ue000", "AI"),
+    ("ai\u0378", "AI"),
 ])
 def test_the_boundary_holds_inside_a_spaced_script(
         text: str, anchor: str) -> None:

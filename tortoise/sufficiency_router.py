@@ -603,14 +603,27 @@ def _spaced_word_char(ch: str) -> bool:
         return False
     if ch == "_" or ch.isdigit():
         return True
+    if ch.isspace():
+        # Separators stay separators. Both operands are whitespace-collapsed
+        # before matching, so this is belt-and-braces — and it is needed, because
+        # ``\n``/``\t`` also have an EMPTY name and would otherwise block.
+        return False
     if not ch.isalpha():
         if unicodedata.category(ch).startswith("M"):
+            return True
+        name = unicodedata.name(ch, "")
+        if not name:
+            # UNNAMED code points (private use, unassigned, surrogates) offer no
+            # script to consult, and reading them as separators fails OPEN: ``AI``
+            # matched ``ai\ue000`` and ``合同`` matched ``合同\ue000有效``. They
+            # block instead — the fail-closed side, and the same direction as an
+            # unrecognised script.
             return True
         # DECORATED letters (``Ⓐ`` circled, ``Ａ`` fullwidth, ``𝐀`` mathematical) are
         # letters that ``isalpha()`` does not report — circled/squared forms are
         # ``So``. Their NAME is what says so, and without this they read as
         # separators, so ``AI`` matched ``aiⒶ``.
-        return "LATIN" in unicodedata.name(ch, "")
+        return "LATIN" in name
     return _script(ch) not in _UNSPACED_SCRIPTS
 
 
