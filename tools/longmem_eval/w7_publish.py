@@ -76,6 +76,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .window_reconciliation import reconciliation_variant_rows
+
 #: Receipt schema keys mandated by plan §6.6 (same vocabulary as the
 #: W2/W3 harness receipts).
 RUN_STATUS_VALUES = ("completed", "failed", "skipped")
@@ -207,6 +209,13 @@ def variant_rows(outcomes: list[dict], k: int | str = 5) -> dict[str, Any]:
                      "role=='user' turn corpus); read from the report",
             "value": None,  # filled from the report's retrieval block
         },
+        # C3-4 (#2570, #2519 P3): the stratified window-reconciliation
+        # labeled variant — the paired census of the failing class re-run
+        # on a raised reader window. NEVER merged into any official row
+        # above (the official recall_all@k derives from the one-shot
+        # ``session_recall@k`` alone; the re-run does not mutate it), and
+        # absent (a row of zeros/None) on an arm-OFF run.
+        "window_reconciliation": reconciliation_variant_rows(outcomes, k=k),
     }
 
 

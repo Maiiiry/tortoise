@@ -2436,6 +2436,7 @@ surfaces:
   - test_retired_tools.py  # #3883: a retired MCP name resolves and WARNS (16 names retired, #3863)
   - test_coverage_loop.py  # #2567: evidence-completeness loop E2E (C3-1, docker-lane)
   - test_coverage_loop_rules.py  # #2567: evidence-completeness loop hermetic rules
+  - test_window_reconciliation_rules.py  # #2570: stratified window reconciliation (C3-4/P3) hermetic rules + labeled-variant invariance
   - test_session_reinjection_rules.py  # #2517: source-session re-injection hermetic rules (C4)
   - test_build_cohorts_2517.py  # #2517: cohort-builder selectors + digest refusal + provenance sidecar (hermetic)
   - test_guard_measured_revision.py  # #2517: measured-revision guard — one test per declared bypass class (hermetic)
@@ -3381,6 +3382,7 @@ surfaces:
   - test_reader_4837_advice_battery.py  # #4837: hermetic pre-registration + decision-rule pin for the advice battery (`tortoise/reader.py` selects sdk)
   - test_coverage_loop.py  # #2567 (docker-lane leg, mirrors test_retrieval.py)
   - test_coverage_loop_rules.py  # #2567 (hermetic rules leg)
+  - test_window_reconciliation_rules.py  # #2570 (hermetic rules leg: the P3 failing-class predicate + cap + labeled-variant block guard `tools/longmem_eval/window_reconciliation.py` and its `run.py` wiring; imports `tortoise/reader.py`'s abstract phrase vocabulary, so an sdk reader-vocabulary change must run it too)
   - test_session_reinjection_rules.py  # #2517 (hermetic rules leg, mirrors test_retrieval.py)
   - test_build_cohorts_2517.py  # #2517 (hermetic cohort-builder leg, mirrors test_retrieval.py)
   - test_guard_measured_revision.py  # #2517 (hermetic guard leg: the declared bypass surface on synthetic fixtures, mirrors the eval lane)
@@ -3520,6 +3522,7 @@ surfaces:
   - longmem_eval/test_measure_temporal.py  # #2578 Task 2: measurement scaffold — census 133->55 pin, prereg writer, refusal classifier (embedded-safe)
   - longmem_eval/test_freq_count_disposition.py  # #2886: guards tools/longmem_eval/freq_count_disposition.py (the census frequency/count disposition tool) — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so an eval-tool change alone selects it
   - test_temporal_aggregate_arm.py  # #2886: guards tools/longmem_eval/retrieve.py's `temporal_aggregate_verdict` adapter — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so a retrieve.py-only change selects it (dual-registered with `core` for the core's verdict semantics)
+  - test_window_reconciliation_rules.py  # #2570 (C3-4/P3): guards `tools/longmem_eval/window_reconciliation.py` + the `run.py` arm wiring + the `w7_publish.variant_rows` labeled block — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so an eval-tool change alone selects it (also under `core`/`sdk`)
   - longmem_eval/test_temporal_admission_trace.py  # #2976: temporal admission trace — pool-membership vs reader-window-cut receipts + TR-machinery-inert mechanism pin (hermetic, no DB)
   - longmem_eval/test_probe_v2.py  # #2578 Task 5: v2-lane structural probe — wave guard, saturation stop rule, substrate measurement (embedded-safe)
   - longmem_eval/test_context_assembly_arms.py  # #3011: 4-arm (A/B/C/D) context-assembly runner — arm source selection, metrics 5/8/9, report shape (hermetic)
@@ -4888,6 +4891,7 @@ durations:
   test_version_vector.py: 0.2
   test_volunteer_contract.py: 0.3
   test_w7_publish.py: 0.1
+  test_window_reconciliation_rules.py: 2.0  # #2570: measured locally (34 tests, 1.97s)
   test_waitlist_form.py: 0.2
   test_website_static.py: 0.4
   test_weights.py: 0.1
