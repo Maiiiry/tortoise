@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import ast
 import os
+import string
 import sys
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -138,6 +140,16 @@ def test_an_iso_code_is_matched_in_uppercase_only():
     "USD 1\u2019000\u2019000",
     "EUR 1_000",              # underscore grouping
     "EUR 1\u00a0234",        # NBSP grouping
+    # the cycle-3 P1 forms: separators OUTSIDE the charset the tokenizer knew —
+    # each typed the truncated prefix (EUR 1.00 → 100 minor) before the guard
+    # was inverted to "any punctuation, then a digit"
+    "EUR 1\u00b7234",        # middle dot U+00B7
+    "EUR 1\u2027234",        # hyphenation point U+2027
+    "EUR 1\u2219234",        # bullet operator U+2219
+    "EUR 1\u2010234",        # hyphen U+2010
+    "EUR 1\u066b234",        # Arabic decimal separator U+066B
+    "EUR 1:234",
+    "EUR 1|234",
 ])
 def test_separator_forms_never_type_never_guess(source):
     """⛔ THE decision (mode 1). Mutation pin: adding a separator rung — e.g.
@@ -155,6 +167,58 @@ def test_the_named_regression_is_neither_read_as_en_nor_as_ptbr():
     result = normalize_money("R$ 1.234,56")
     assert result.props is None, "no reading may be produced at all"
     assert result.drop_reason == "ambiguous_separator"
+
+
+#: Separator characters by family — none may END the number at its first digit
+#: group. Deliberately a set of CLASSES (ASCII, apostrophes, spaces, dots,
+#: dashes-as-separators), not a list of "known bad" characters: the class is
+#: what is under test, so a separator nobody thought of must abstain too.
+_SEPARATOR_CHARS = [
+    ".", ",", "'", "\u2018", "\u2019", "_", " ", "\u00a0", "\u202f",
+    "\u00b7",        # middle dot
+    "\u2027",        # hyphenation point
+    "\u2219",        # bullet operator
+    "\u2010",        # hyphen (not the range dash)
+    "\u066b",        # Arabic decimal separator
+]
+
+
+@pytest.mark.parametrize("sep", _SEPARATOR_CHARS, ids=lambda c: f"U+{ord(c):04X}")
+def test_any_separator_family_abstains(sep):
+    """Cycle-3 P1: the separator rule was an ALLOWLIST, so any grouping
+    separator outside it truncated the number and typed the prefix (``EUR
+    1·234`` → ``1.00``, the named 1000× class). The guard is inverted — the
+    token ends before punctuation-then-digit — so the CLASS abstains."""
+    result = normalize_money(f"EUR 1{sep}234")
+    assert not result.typed, f"{sep!r} typed {result.props}"
+    assert result.drop_reason == "ambiguous_separator", result.drop_reason
+
+
+def test_every_ascii_punctuation_separator_abstains():
+    """The same invariant over the whole ASCII punctuation class (the reason
+    may differ — ``-`` and ``/`` are range connectors — but no value appears)."""
+    for ch in sorted(set(string.punctuation)):
+        result = normalize_money(f"EUR 1{ch}234")
+        assert not result.typed, f"{ch!r} typed {result.props}"
+
+
+def test_every_unicode_punctuation_or_space_separator_abstains():
+    """... and over the Unicode punctuation/space space between U+00A0 and
+    U+206F, which is where the separators the allowlist kept missing live.
+
+    A property, not another instance: it fails for ANY character in the class
+    that lets the number end at its first group, including ones added by a
+    future Unicode version."""
+    checked = 0
+    for cp in range(0x00A0, 0x2070):
+        ch = chr(cp)
+        if unicodedata.category(ch)[0] not in "PSZC":
+            continue
+        checked += 1
+        result = normalize_money(f"EUR 1{ch}234")
+        assert not result.typed, (
+            f"U+{cp:04X} {unicodedata.name(ch, '?')} typed {result.props}")
+    assert checked > 100, "the sweep stopped covering the class"
 
 
 # ── mode 2: magnitude words — no table, so no value ────────────────────────
@@ -223,6 +287,32 @@ def test_a_ticker_shaped_code_is_an_ambiguous_currency(source):
     dropped(source, "ambiguous_currency_symbol")
 
 
+@pytest.mark.parametrize("source", [
+    "the IRR 800 target",            # internal rate of return
+    "the SAR 800 delegates",        # Special Administrative Region
+    "AED 800 units were deployed",  # automated external defibrillator
+    "800 SAR",
+])
+def test_a_high_collision_acronym_is_an_ambiguous_currency(source):
+    """Cycle-3 P2 (design gap): ``_WORD_CODES`` closed the collision only for
+    word-shaped codes, so an uppercase ACRONYM that is also an active ISO 4217
+    code typed a foreign currency out of prose (``the IRR 800 target`` → 800.00
+    IRR). The abstain-on-ambiguous-anchor posture (§3/OD5, §6/T4) covers this
+    register too, so the collision is refused rather than guessed."""
+    dropped(source, "ambiguous_currency_symbol")
+
+
+def test_the_anchor_collision_residual_is_stated_not_implied_closed():
+    """The acronym list is CURATED and cannot close the class (an unnamed
+    acronym still types a foreign currency). The module says so explicitly —
+    pinning the statement keeps it from being tidied away, which would let the
+    posture read as fully closed when it is only as wide as the list."""
+    from tortoise import value_normalizer
+    doc = " ".join((value_normalizer.__doc__ or "").split())
+    assert "Recorded residual" in doc
+    assert "a curated list cannot close that class" in doc
+
+
 def test_an_amount_is_not_fabricated_across_a_line_break():
     """Cycle-2 P2: the anchor↔number gap must not cross a newline."""
     dropped("budget in EUR\n800 people were hired", "no_currency_anchor")
@@ -265,6 +355,22 @@ def test_a_value_without_any_anchor_is_not_typed():
     "almost EUR 800",
     "an estimated EUR 800",
     "circa EUR 800",
+    # the cycle-3 P1 forms: the connector is separated from the lower bound by
+    # an approximation word, which the previous ±6-character window could not
+    # see — the lower bound was typed as a point value
+    "EUR 800 or roughly 900",
+    "EUR 800 and about 900",
+    "EUR 800 to roughly 900",
+    "EUR 800 or approximately 900",
+    "EUR 800 and nearly 900",
+    # the mirror: the AMOUNT is the upper bound, the connector sits before it
+    "800 or roughly 900 EUR",
+    "800 to about 900 EUR",
+    # the cycle-3 P2 forms: the pre-position abbreviation carried its dot
+    "approx. EUR 800",
+    "approx., EUR 800",
+    "est. EUR 800",
+    "about, say, EUR 800",
 ])
 def test_ranges_and_qualifiers_never_type(source):
     dropped(source, "range_or_qualifier")

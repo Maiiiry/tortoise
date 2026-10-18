@@ -41,6 +41,32 @@ The owner selected that Option (on ``#2817``, 2026-10-07; folded into design
    is likewise refused; currency is never a graph default (design §3/OD5,
    §6/T4).
 
+4. **Ambiguity is refused by CLASS, never by a list of known-bad characters.**
+   A separator *of any kind* between digit groups abstains: the guard looks at
+   what follows the token and drops when the next thing is punctuation and then
+   a digit (``[^\\w\\s]+\\s?\\d``), so a middle dot, a hyphenation point, a bullet
+   operator, an Arabic decimal separator — or a separator Unicode has not
+   defined yet — lands on ``ambiguous_separator`` instead of ending the number
+   at its first digit group. Extending a charset one character at a time is how
+   the named 1000× class kept re-opening (review cycles 1–3). The same posture
+   governs a RANGE: the connector is matched **word-bounded**, not by a ±6
+   character window, so ``EUR 800 or roughly 900`` is a range rather than a
+   typed lower bound; and only approximation words may stand between the
+   connector and the second bound, so ``EUR 800 and USD 900`` stays two values
+   rather than becoming a range.
+
+   ⚠️ **Recorded residual — an anchor can collide with prose, and a curated list
+   cannot close that class.** Uppercase acronyms that are also active ISO 4217
+   codes are refused as ``ambiguous_currency_symbol`` when they are listed
+   (``IRR`` = internal rate of return, ``SAR`` = Special Administrative Region,
+   ``AED`` = automated external defibrillator, beside the word-shaped
+   ``ALL``/``PEN``/``TOP``/…). An acronym the list does not name still types a
+   foreign currency (``the BHD 800 target``). Closing the class needs a context
+   signal this module does not have — a bare amount is not one, and inventing
+   one is the locale/context reasoning the decision above excludes. This is
+   stated rather than implied closed; the abstain-on-ambiguous-anchor posture
+   (§3/OD5, §6/T4) is only as wide as the list.
+
 The values that survive are the unambiguous ones the design commits to: an
 integer with **no separator and no magnitude word**, attached to an explicit
 currency. Everything else stays prose — which is a *decision*, not a gap: the
@@ -151,6 +177,17 @@ _WORD_CODES = frozenset({
     "RON", "SOS", "TOP", "TRY",
 })
 
+#: Active ISO 4217 codes that are also everyday uppercase acronyms in business
+#: prose — the same collision as ``_WORD_CODES``, one register up: ``the IRR 800
+#: target`` is internal rate of return, ``the SAR 800 delegates`` is a Special
+#: Administrative Region, ``AED 800 units`` is an automated external
+#: defibrillator. Refused rather than guessed (mode 4's posture). ⚠️ This list
+#: is CURATED and cannot close the class — the residual is stated in the module
+#: docstring ("Recorded residual — an anchor can collide with prose").
+_ACRONYM_CODES = frozenset({
+    "AED", "IRR", "SAR",
+})
+
 #: Symbols that never become a currency on their own (mode 4 / design §6/T4).
 _BARE_SYMBOLS = ("$", "¥", "€", "£")
 
@@ -165,7 +202,9 @@ _ANCHOR = rf"(?P<a>{_SYM_BEFORE}|{_CODE})"
 
 #: A numeric token: digits, then only characters that can belong to one
 #: (separators, and a short trailing word so ``8M``/``12x``/``800ms`` are
-#: *seen* rather than silently split).
+#: *seen* rather than silently split). ⚠️ This charset is only a *first* look:
+#: the token does not have to END here, and :data:`_SEPARATOR_THEN_NUMBER`
+#: refuses a token whose continuation is any other separator + digit.
 _NUM = (r"[\u2212+\-]?\d(?:[\d.,'\u00a0\u202f]{0,34}\d)?"
         r"[A-Za-z%]{0,8}")
 
@@ -178,8 +217,37 @@ _MAGNITUDE_WORD = re.compile(
     r"(?i)^(?:thousand|million|billion|trillion|mil|milhao|milhão|milhoes|"
     r"milhões|bilhao|bilhão|bilhoes|bilhões|bn|mm|tn|trn|[kmb])$")
 
-_RANGE = re.compile(
-    r"\d[\d.,'\u202f]*\s*(?:-|–|—|\bto\b|\band\b|\bor\b|/)\s*\d")
+#: A range CONNECTOR: a dash, a slash, or the word connectors. Matched
+#: word-bounded — a distance window (the previous ±6 characters) missed
+#: ``EUR 800 or roughly 900`` and typed the lower bound (review cycle 3), while
+#: a sentence-wide search dropped ``EUR 800 covers 3-4 hires`` (cycle 1).
+_RANGE_CONNECTOR = r"(?:-|–|—|/|\bto\b|\band\b|\bor\b)"
+
+#: The only words a range connector may carry before its second bound
+#: ("or **roughly** 900", "to **about** 900"). Deliberately an allowlist of
+#: approximation words, not ``[A-Za-z]+``: ``EUR 800 and USD 900`` is TWO
+#: values (``multiple_candidates``), not a range — a currency anchor is not
+#: filler.
+_RANGE_FILLER = (
+    r"(?:roughly|about|approximately|approx\.?|around|circa|nearly|almost|"
+    r"maybe|perhaps|some|estimated|an?\s+estimated|exactly|just|only|"
+    r"up\s+to|at\s+(?:least|most))")
+
+#: A connector, then (optionally) one approximation word, then the other bound.
+_RANGE_AFTER = re.compile(
+    rf"(?i)[\s,;:]*{_RANGE_CONNECTOR}\s*,?\s*"
+    rf"(?:{_RANGE_FILLER}\s*,?\s*)?\d")
+
+#: The mirror: a bound, a connector, (optionally) an approximation word, then
+#: the amount under test (``800 to 900 EUR`` — the upper bound is a candidate).
+_RANGE_BEFORE_TAIL = re.compile(
+    rf"(?i)\d[\d.,'\u00a0\u202f]*\s*,?\s*{_RANGE_CONNECTOR}\s*,?\s*"
+    rf"(?:{_RANGE_FILLER}\s*,?\s*)?$")
+
+#: How far back a connector may sit before an amount (chars). The pattern is
+#: end-anchored, so this only bounds a pathological scan.
+_RANGE_LOOKBEHIND = 48
+
 _DATE_SPAN = re.compile(r"\d{4}-\d{2}-\d{2}")
 #: Anything that LOOKS like a date is masked before the range check: a
 #: malformed date ("2026-6-30") must not make its sentence's amount look like
@@ -188,10 +256,15 @@ _DATE_LIKE = re.compile(r"\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}")
 
 _QUALIFIER_BEFORE = re.compile(
     r"(?i)(?:\b(?:under|over|about|around|approximately|approx|roug\s*"
-    r"hly|roughly|nearly|almost|estimated|est\.?|circa|between|up\s+to|"
+    r"hly|roughly|nearly|almost|estimated|est|circa|between|up\s+to|"
     r"at\s+least|at\s+most|more\s+than|less\s+than|no\s+more\s+than|"
-    r"no\s+less\s+than|give\s+or\s+take|min|max|exactly)\b|[~≈≤≥<>+±])"
-    r"\s*$")
+    r"no\s+less\s+than|give\s+or\s+take|min|max|exactly)\b\.?"
+    # "approx." / "est." carry their dot in the PRE position too — the
+    # asymmetry with the post-position form (which accepted "approx.") is
+    # what let the common abbreviation type as exact (review cycle 3).
+    r"(?:\s*,\s*(?:say|again))?"     # "about, say, EUR 800"
+    r"[\s,]*$"
+    r"|[~≈≤≥<>+±]\s*$)")
 
 _QUALIFIER_AFTER = re.compile(
     r"(?i)^[\s,;:(\[\u2014\u2013-]*(?:post-money|pre-money|postmoney|"
@@ -216,6 +289,13 @@ _SIGN_BEFORE = re.compile(r"[-\u2212+(]\s*$")
 #: ``1.234`` (never guess which grouping convention is meant).
 _CONTINUES_AS_GROUP = re.compile(
     r"(?:[\s\u00a0\u202f]+|[.,'\u2018\u2019_]\s*)\d")
+
+#: ⛔ THE decision, inverted: ANY punctuation (an underscore is handled by
+#: :data:`_CONTINUES_AS_GROUP`) followed by a digit means the number does not
+#: end at the token — so the token is a truncated first group, not an amount.
+#: A charset of known separators is what let U+00B7/U+2027/U+2219/U+2010/U+066B
+#: (and the next one Unicode adds) silently type ``1.234`` as ``1``.
+_SEPARATOR_THEN_NUMBER = re.compile(r"[^\w\s]+\s?\d")
 
 
 def _drop(reason: str, detail: str = "") -> Normalization:
@@ -274,24 +354,23 @@ def _has_magnitude_word_after(text: str, end: int) -> bool:
     return bool(nxt) and bool(_MAGNITUDE_WORD.match(nxt[0].strip(".,;:")))
 
 
-#: How far from the amount a range marker still belongs to it: ``EUR 5-10`` /
-#: ``EUR 5 to 10`` are ~4 chars, while "EUR 800 covers 3-4 hires" is 15+.
-_RANGE_WINDOW_BEFORE = 6
-_RANGE_WINDOW_AFTER = 6
-
-
 def _has_range(text: str, candidates: list[_Candidate]) -> bool:
     """Whether an amount RANGE touches one of the anchored forms.
 
-    Scoped to the neighbourhood on purpose: an amount is not disqualified by an
-    unrelated hyphenated pair elsewhere in the sentence ("the budget of EUR 800
-    covers 3-4 hires"), which a sentence-wide check would wrongly drop.
+    Word-bounded, not distance-bounded: a connector (``-``/``to``/``and``/
+    ``or``/``/``) counts when it sits between the amount and the other bound,
+    optionally with ONE approximation word in between — so ``EUR 800 or
+    roughly 900`` is a range (the previous ±6-character window missed it and
+    typed 800), while an unrelated hyphenated pair elsewhere in the sentence
+    (``EUR 800 covers 3-4 hires``) is not one, because no connector sits
+    between the amount and a bound.
     """
     masked = _mask_dates(text)
     for cand in candidates:
-        window = masked[max(0, cand.start - _RANGE_WINDOW_BEFORE):
-                        cand.end + _RANGE_WINDOW_AFTER]
-        if _RANGE.search(window):
+        if _RANGE_AFTER.match(masked, cand.end):
+            return True
+        before = masked[max(0, cand.start - _RANGE_LOOKBEHIND):cand.start]
+        if _RANGE_BEFORE_TAIL.search(before):
             return True
     return False
 
@@ -325,8 +404,10 @@ def _classify_token(token: str, *, text: str, end: int,
         # 19+ digits is not a plausible amount, and Python 3.12 refuses
         # int("9"*4300) outright — abstain instead of raising.
         return _drop("unsupported_token", detail)
-    if _CONTINUES_AS_GROUP.match(text[end:]):
-        # "BRL 1 234" — the number does not end at the token (mode 1).
+    if _CONTINUES_AS_GROUP.match(text[end:]) \
+            or _SEPARATOR_THEN_NUMBER.match(text[end:]):
+        # "BRL 1 234" / "EUR 1·234" — the number does not end at the token
+        # (mode 1). Any separator at all, not just the known ones.
         return _drop("ambiguous_separator", text[end - 8:end + 12].strip())
     return None
 
@@ -401,7 +482,7 @@ def normalize_money(text: str) -> Normalization:
         if signed:
             return _drop("signed_amount",
                          text[max(0, cand.span_start - 2):cand.span_end])
-        if cand.anchor in _WORD_CODES:
+        if cand.anchor in _WORD_CODES or cand.anchor in _ACRONYM_CODES:
             return _drop("ambiguous_currency_symbol", cand.anchor)
         currency = _currency_for(cand.anchor)
         if currency is None:
