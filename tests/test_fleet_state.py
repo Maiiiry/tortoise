@@ -1646,3 +1646,367 @@ def test_an_open_issue_read_below_the_cap_is_not_truncated(monkeypatch) -> None:
         "the limit must clear this repo's open-issue count, or every board is "
         "truncated and every absent issue refuses"
     )
+
+
+# ---------------------------------------------------------------------------
+# #8999 — the live-session reader: two cmux grammars, and the lane no cmux
+#          store can see at all (the cell launch path)
+# ---------------------------------------------------------------------------
+
+CELL_CWD = "/tmp/cell-t3/wt-8999"
+
+
+def _proc_live(pid: int, cwd: str = CELL_CWD, **extra) -> dict:
+    """A process-store record exactly as ``live_sessions`` emits one."""
+    rec = {
+        "agent": "pi",
+        "workspace_id": f"{fs.PROC_WS_PREFIX}{pid}",
+        "pid": pid,
+        "pids": [pid],
+        "cwd": cwd,
+        "session_id": None,
+        "agent_lifecycle": "running",
+        "store": fs.LIVE_STORE_PROCESS,
+    }
+    rec.update(extra)
+    return rec
+
+
+def _cell_fleet(monkeypatch, *, live, registry=(), wts=None, issues=(8999,),
+                prs=(), workspaces=None):
+    """A cell-shaped board: no cmux workspace list, no registry, one worktree."""
+    monkeypatch.setattr(fs, "load_registry", lambda: list(registry))
+    monkeypatch.setattr(fs, "cmux_workspaces", lambda: (
+        fs.WorkspaceMap(error="cmux: command not found")
+        if workspaces is None else workspaces
+    ))
+    monkeypatch.setattr(fs, "pane_bindings", lambda: {})
+    monkeypatch.setattr(fs, "live_sessions", lambda: live)
+    monkeypatch.setattr(fs, "load_overrides", lambda: {})
+    monkeypatch.setattr(fs, "session_index", lambda: ({}, {}))
+    # The fixture's pids are not real processes on the machine running the suite; the
+    # pid READ is what `ps` measured, so it is an input here, never an `os.kill` probe.
+    alive = {r.get("pid") for recs in live.values() for r in recs if r.get("pid")}
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(fs, "worktrees", lambda _root: (
+        {CELL_CWD: {"branch": "refs/heads/feat/8999-tm", "head": "a" * 40}}
+        if wts is None else wts
+    ))
+    monkeypatch.setattr(fs, "open_prs", lambda _repo, limit=400: fs.GitHubRows(
+        list(prs), measured=True))
+    monkeypatch.setattr(
+        fs, "open_issues",
+        lambda _repo, limit=fs.OPEN_ISSUES_LIMIT: fs.GitHubRows(
+            [{"number": n} for n in issues], measured=True))
+    return fs.build_state(repo="o/r", repo_root="/tmp", orch_ws="",
+                          sample_s=0.0, do_pane=False)
+
+
+def test_a_cell_lane_started_by_nohup_is_a_lane_the_board_can_answer_for(
+        monkeypatch) -> None:
+    """THE #8999 DEFECT, end to end. The cell launch path starts a lane as a
+    ``nohup`` child of a shell, so no cmux store lists it and no registry row names
+    it. Before this change the board enumerated zero lanes, published a
+    `liveness-unmeasured` orphan, and `collision_preflight` answered INCOMPLETE
+    (exit 2) for EVERY issue on the box — a gate that can never authorise anything.
+
+    The process record must become a LANE (not just a liveness reading), or the gate
+    moves from "unmeasured" to a false "nobody holds it": the fail-open the
+    `_board_can_answer` docstring exists to prevent.
+    """
+    live = fs.LiveSessions(
+        {f"{fs.PROC_WS_PREFIX}4242": [_proc_live(4242)]},
+        measured=True, source=fs.LIVE_STORE_PROCESS,
+    )
+    st = _cell_fleet(monkeypatch, live=live)
+    proc = [lane_ for lane_ in st["lanes"]
+            if lane_["identity"]["workspace"].startswith(fs.PROC_WS_PREFIX)]
+    assert len(proc) == 1, "the process must be enumerated as a lane, not only as a pid"
+    lane = proc[0]
+    assert lane["session"]["pid_alive"] is True
+    assert lane["liveness"]["liveness_measured"] is True
+    assert lane["identity"]["branch"] == "feat/8999-tm"
+    # … and the issue the worktree names is attributed to it, so the claim gate has
+    # an answer to read instead of an absence.
+    assert st["index"]["issues"]["8999"]["lanes"] == [lane["identity"]["lane"]]
+    assert not [o for o in st["orphans"] if o.get("kind") == "liveness-unmeasured"]
+    rec = st["reconciliation"]
+    assert rec["liveness_measured"] is True
+    assert rec["liveness_source"] == fs.LIVE_STORE_PROCESS
+    assert rec["process_lanes"] == [f"{fs.PROC_WS_PREFIX}4242"]
+
+
+def test_a_process_lane_never_reads_terminal_and_never_asks_cmux_for_a_pane(
+        monkeypatch) -> None:
+    """A synthetic workspace is not a CMUX workspace, and two things must not treat
+    it as one: the workspace-existence reconciliation (which would RETIRE a lane
+    that is running right now) and the pane reader (which would ask cmux about a
+    workspace it never created, and report the resulting empty read as a quiet
+    pane)."""
+    asked: list[str] = []
+    monkeypatch.setattr(fs, "pane_screen", lambda ws: asked.append(ws) or "")
+    assert fs.pane_state(f"{fs.PROC_WS_PREFIX}7") == {}
+    assert asked == [], "cmux must not be asked about a synthetic workspace"
+    live = fs.LiveSessions(
+        {f"{fs.PROC_WS_PREFIX}4242": [_proc_live(4242)]},
+        measured=True, source=fs.LIVE_STORE_PROCESS,
+    )
+    # A MEASURED workspace list that cannot contain the synthetic id must still not
+    # retire the lane: the synthetic workspace is registered as present.
+    st = _cell_fleet(monkeypatch, live=live, workspaces=fs.WorkspaceMap(
+        {"WS-A": {"cwd": "/tmp/other"}}, measured=True))
+    lane = next(lane_ for lane_ in st["lanes"]
+                if lane_["identity"]["workspace"].startswith(fs.PROC_WS_PREFIX))
+    assert lane["terminal"]["state"] == "", "a live process lane is not a ghost"
+    assert lane["terminal"]["workspace_present"] is True
+
+
+def test_one_worktree_is_one_lane_even_with_several_pi_processes(monkeypatch) -> None:
+    """A ``task`` child is itself a ``pi`` in its parent's cwd, and a respawned lane
+    overlaps its predecessor. Emitting one lane per PID would attribute one lane's
+    issue TWICE, and `_holders_from_board` reads two recorded lanes for one label as
+    unreadable — turning a readable lane into exit 2."""
+    rec = _proc_live(4242)
+    rec["pids"] = [4242, 4243]
+    live = fs.LiveSessions(
+        {f"{fs.PROC_WS_PREFIX}4243": [rec]}, measured=True, source=fs.LIVE_STORE_PROCESS)
+    kept, proc_ws = fs.register_process_lanes(
+        live, {}, [], {CELL_CWD: {"branch": "refs/heads/feat/8999-tm"}})
+    assert len(kept) == 1
+    assert len(proc_ws) == 1
+
+
+def test_live_sessions_collapses_processes_by_cwd(monkeypatch) -> None:
+    """The collapse rule, at the reader: two pids in one cwd are ONE record."""
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: (
+        [{"pid": 10, "ppid": 1}, {"pid": 11, "ppid": 10}], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: (
+        {10: "/tmp/wt-a", 11: "/tmp/wt-a"}, ""))
+    live = fs.live_sessions()
+    assert live.measured is True
+    assert list(live) == [f"{fs.PROC_WS_PREFIX}11"], "the newest pid names the lane"
+    assert live[f"{fs.PROC_WS_PREFIX}11"][0]["pids"] == [10, 11]
+
+
+def test_an_unreadable_everything_stays_unmeasured(monkeypatch) -> None:
+    """THE FAIL-CLOSED POLARITY (#8999 item 2). When no store can be read the board
+    must still publish `liveness-unmeasured` and the gate must still refuse — an
+    unmeasured pid is never a dead owner, and "nobody holds it" may never come from
+    a read that did not happen."""
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: (
+        [], "", "`cmux sessions list --json --all` produced nothing"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: (
+        [], "`ps -axo pid=,ppid=,uid=,command=` produced nothing"))
+    live = fs.live_sessions()
+    assert live.measured is False
+    assert live.source == ""
+    assert "produced nothing" in live.error
+    st = _cell_fleet(monkeypatch, live=live)
+    assert [o["kind"] for o in st["orphans"] if o["kind"] == "liveness-unmeasured"]
+    assert st["reconciliation"]["liveness_measured"] is False
+
+
+def test_a_live_pi_whose_cwd_cannot_be_read_is_unmeasured_not_dropped(
+        monkeypatch) -> None:
+    """The cwd IS the attribution (worktree -> branch -> issue), so a live process
+    with no readable cwd cannot rule OUT a holder. Dropping it silently would let the
+    gate answer "nobody holds it" while that very process may hold the issue."""
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 5, "ppid": 1}], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({}, "`lsof` could not be run"))
+    live = fs.live_sessions()
+    assert live.measured is False
+    assert "lsof" in live.error
+
+
+def test_a_process_that_exited_before_its_cwd_was_read_is_not_a_gap(monkeypatch) -> None:
+    """A pid can vanish between ``ps`` and the cwd read. That is not a measurement
+    gap — it is not running — so it must not hold the whole store unmeasured
+    (which on a busy fleet would be red forever)."""
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: (
+        [{"pid": 6, "ppid": 1}, {"pid": 7, "ppid": 1}], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({7: "/tmp/wt-a"}, ""))
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 7)
+    live = fs.live_sessions()
+    assert live.measured is True, "the exited pid is not a gap"
+    assert list(live) == [f"{fs.PROC_WS_PREFIX}7"]
+
+
+def test_a_guest_cli_error_object_is_not_a_session_store(monkeypatch) -> None:
+    """THE ROOT CAUSE. cmux 0.1.0 (the Cloud guest CLI) answers a grammar it does
+    not have with VALID JSON:
+
+        {"code":"usage.invalid","message":"--all needs a value"}
+
+    Reading that as "no sessions" is a measured "nothing is running" while the box
+    runs lanes. The payload's SHAPE is what separates an answer from a refusal.
+    """
+    monkeypatch.setattr(fs, "_run", lambda cmd, timeout=60: json.dumps(
+        {"code": "usage.invalid", "message": "--all needs a value"}))
+    recs, source, err = fs.cmux_session_records()
+    assert recs == [] and source == ""
+    assert "usage.invalid" in err and "--all needs a value" in err
+
+
+def test_the_plural_grammar_is_preferred_and_a_later_one_can_answer(monkeypatch) -> None:
+    """Version-awareness, both directions: the Mac's plural grammar answers, and if a
+    future cmux only has the singular one the reader still reads a SESSION STORE."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, timeout=60):
+        calls.append(list(cmd))
+        if cmd[1] == "sessions":
+            return ""  # this cmux has no plural resource
+        return json.dumps({"sessions": [
+            {"agent": "pi", "workspace_id": "ws-1", "pid": 1}]})
+
+    monkeypatch.setattr(fs, "_run", fake_run)
+    recs, source, err = fs.cmux_session_records()
+    assert err == "" and source == fs.LIVE_STORE_CMUX_SINGULAR
+    assert recs and recs[0]["workspace_id"] == "ws-1"
+    assert calls[0][1] == "sessions", "the Mac grammar is tried first"
+
+
+def test_a_pid_a_cmux_record_already_carries_is_not_emitted_twice(monkeypatch) -> None:
+    """On a Mac every lane's pi is in the cmux store. Emitting it a second time as a
+    process lane would enumerate one lane twice — the duplicate-label shape that
+    makes the claim gate exit 2 on a perfectly readable board."""
+    cmux = [{"agent": "pi", "workspace_id": "WS-1", "pid": 900}]
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: (
+        cmux, fs.LIVE_STORE_CMUX_PLURAL, ""))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 900, "ppid": 1}], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: ({900: "/tmp/wt-a"}, ""))
+    live = fs.live_sessions()
+    assert list(live) == ["WS-1"]
+    assert live.measured is True
+    assert live.source == f"{fs.LIVE_STORE_CMUX_PLURAL}+{fs.LIVE_STORE_PROCESS}"
+
+
+def test_a_measured_empty_process_table_is_an_answer_not_an_unmeasured_one(
+        monkeypatch) -> None:
+    """A box with no lane running must read MEASURED-EMPTY: that is what lets the
+    gate say "nobody holds it" honestly. The opposite mistake — treating an empty
+    answer as an unread store — is why every cell pre-flight was INCOMPLETE."""
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: ([], ""))
+    live = fs.live_sessions()
+    assert live.measured is True
+    assert dict(live) == {}
+    assert live.error
+
+
+def test_pi_is_matched_on_the_executable_not_on_a_command_line_that_mentions_it() -> None:
+    """The cell launcher is ``/bin/bash -c 'cd … && nohup pi …'`` — a process whose
+    COMMAND LINE contains "pi" and which is not a lane. Matching on the command line
+    would make every launcher a lane (measured 2026-10-18: 9 such shells on one
+    box). Another user's ``pi`` is not this fleet's lane either, and its cwd is
+    unreadable, so counting it would hold the whole store unmeasured forever."""
+    me = os.getuid()
+    other = me + 1
+    ps = "".join(f"{pid:>5} {ppid:>5} {uid:>5} {cmd}\n" for pid, ppid, uid, cmd in (
+        (100, 1, me, "/bin/bash -c cd /tmp/wt && nohup pi --model m -p brief"),
+        (101, 1, me, "pi"),
+        (102, 101, me, "pi --model m -p brief"),
+        (103, 1, me, "/usr/sbin/pi-hole"),
+        (104, 1, me, "node /opt/pi-coding-agent/dist/index.js"),
+        (105, 1, other, "pi --model m -p someone-elses"),
+    ))
+    assert fs._pi_pids_from_ps(ps) == [{"pid": 101, "ppid": 1}, {"pid": 102, "ppid": 101}]
+
+
+def test_lsof_stdout_survives_a_non_zero_exit() -> None:
+    """``lsof`` exits 1 when it cannot stat SOME of the pids it was handed while
+    still printing the cwd of every one it could. Degrading that to "" would throw
+    away a complete answer because one process exited mid-read — and on a busy
+    fleet that is the normal case."""
+    import subprocess as sp
+
+    class _P:
+        returncode = 1
+        stdout = "p7\nfcwd\nn/tmp/wt-a\n"
+        stderr = "lsof: no pwd entry for UID 0\n"
+
+    import unittest.mock as mock
+    with mock.patch.object(sp, "run", lambda *a, **k: _P()):
+        out, err = fs._run_tolerant(["lsof", "-a", "-d", "cwd", "-Fn", "-p", "7"])
+    assert err == "" and "/tmp/wt-a" in out
+
+
+def test_a_process_lane_is_scoped_to_this_repos_worktrees(monkeypatch) -> None:
+    """A branch slug names a number in EVERY repo, so another repo's ``feat/8999-x``
+    would falsely attribute THIS repo's #8999. A process lane is this board's lane
+    only when its cwd is one of this repo's worktrees — and when the worktree list
+    cannot be read the population is NOT narrowed, because a false COLLISION blocks
+    an honest dispatch while a false "nobody" authorises one."""
+    outside = _proc_live(9001, cwd="/tmp/other-repo/.worktrees/8999-lane")
+    inside = _proc_live(9002)
+    live = fs.LiveSessions(
+        {f"{fs.PROC_WS_PREFIX}9001": [outside], f"{fs.PROC_WS_PREFIX}9002": [inside]},
+        measured=True, source=fs.LIVE_STORE_PROCESS)
+
+    scoped = dict(live)
+    kept, _ = fs.register_process_lanes(
+        scoped, {}, [], {CELL_CWD: {"branch": "refs/heads/feat/8999-tm"}})
+    assert [lbl for lbl, _ws, _i in kept] == ["proc-9002"]
+
+    unscoped = dict(live)
+    kept, _ = fs.register_process_lanes(unscoped, {}, [], {})
+    assert sorted(lbl for lbl, _ws, _i in kept) == ["proc-9001", "proc-9002"]
+
+
+def test_a_process_lane_in_a_subdirectory_belongs_to_that_worktree() -> None:
+    """A lane that cd'ed into a subdirectory is still its worktree's lane — and it
+    must attribute from the worktree ROOT, or its branch (and therefore its issue)
+    is lost."""
+    deep = _proc_live(9100, cwd=CELL_CWD + "/tools")
+    live = {f"{fs.PROC_WS_PREFIX}9100": [deep]}
+    roots = {CELL_CWD: {"branch": "refs/heads/feat/8999-tm"}}
+    workspaces: dict = {}
+    kept, _ = fs.register_process_lanes(live, workspaces, [], roots)
+    assert [lbl for lbl, _ws, _i in kept] == ["proc-9100"]
+    assert workspaces[f"{fs.PROC_WS_PREFIX}9100"]["cwd"] == CELL_CWD
+
+
+def test_a_process_lane_joins_a_registry_row_that_already_claims_its_cwd() -> None:
+    """One lane, one record: when exactly one registry row's workspace already
+    claims the process's cwd, the pid is that lane's measured liveness — minting a
+    second lane would make one lane read as a collision between two."""
+    reg_cwd = "/tmp/cell-t3/wt-lane"
+    deep = _proc_live(9200, cwd=reg_cwd)
+    live = {f"{fs.PROC_WS_PREFIX}9200": [deep]}
+    workspaces: dict = {"WS-A": {"cwd": reg_cwd}}
+    kept, proc_ws = fs.register_process_lanes(
+        live, workspaces, [("lane-7", "WS-A", "")],
+        {reg_cwd: {"branch": "refs/heads/feat/7-x"}})
+    assert [lbl for lbl, _ws, _i in kept] == ["lane-7"], "no second lane is minted"
+    assert proc_ws == set()
+    assert len(live["WS-A"]) == 1 and live["WS-A"][0]["pid"] == 9200
+
+
+def test_process_lanes_are_skipped_by_the_session_disk_scan(monkeypatch) -> None:
+    """The disk rule reads the first user message of every file in a lane's session
+    directory; on the shared checkout that is 1.6 GB of files. A process lane needs
+    no guess — its pid IS the measurement — so the scan must not run for it, or a
+    cell board re-reads the whole store once per lane."""
+    seen: list[str] = []
+    monkeypatch.setattr(fs, "first_user_message",
+                        lambda p: seen.append(str(p)) or "x")
+    live = fs.LiveSessions(
+        {f"{fs.PROC_WS_PREFIX}9300": [_proc_live(9300)]},
+        measured=True, source=fs.LIVE_STORE_PROCESS)
+    _cell_fleet(monkeypatch, live=live)
+    assert seen == []
+
+
+def test_the_board_reports_which_store_answered(monkeypatch) -> None:
+    """`reconciliation` carries the liveness store's provenance, so an INCOMPLETE
+    verdict can name the cause instead of asserting an unreadable one."""
+    live = fs.LiveSessions(
+        {f"{fs.PROC_WS_PREFIX}4242": [_proc_live(4242)]},
+        measured=True, source=fs.LIVE_STORE_PROCESS, error="no cmux on this box")
+    rec = _cell_fleet(monkeypatch, live=live)["reconciliation"]
+    assert rec["liveness_source"] == fs.LIVE_STORE_PROCESS
+    assert rec["liveness_error"] == "no cmux on this box"
+    assert rec["liveness_measured"] is True

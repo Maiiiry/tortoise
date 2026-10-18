@@ -5995,6 +5995,40 @@ class HolderGateTests(unittest.TestCase):
         # ... and a healthy board is unaffected.
         self.assertEqual(self.cp._board_can_answer(_fleet_board_state()), "")
 
+    def test_the_refusal_names_which_live_session_store_failed(self):
+        # #8999: the reader tries the plural cmux grammar, the guest/singular one and
+        # the process table. When none answered, the refusal carries their causes, so
+        # an operator is not left guessing which verb this cmux does not have.
+        state = _fleet_board_state(liveness_unmeasured=True)
+        state["reconciliation"]["liveness_error"] = (
+            "`cmux sessions list --json --all` produced nothing; "
+            "`ps -axo pid=,ppid=,command=` produced nothing")
+        why = self.cp._board_can_answer(state)
+        self.assertIn("live-session store", why)
+        self.assertIn("cmux sessions list", why)
+        self.assertIn("ps -axo", why)
+        # An older board has no such field and must keep the bare sentence.
+        self.assertNotIn("tried:", self.cp._board_can_answer(
+            _fleet_board_state(liveness_unmeasured=True)))
+
+    def test_a_cell_lane_started_outside_cmux_is_a_live_holder(self):
+        # ⛔ THE #8999 ACCEPTANCE CRITERION. On a cell every lane is started by the
+        # `nohup` launch path, so the board has no cmux workspace for it; the fix
+        # publishes a PROCESS lane (`PROC:<pid>`) with its measured pid. The gate
+        # must read that lane as a LIVE holder — not as an unreadable board — or the
+        # whole gate can never authorise anything on a cell.
+        state = _fleet_board_state(
+            issues={ISSUE: [("proc-4242", "named in the lane's branch/worktree slug")]},
+            lanes=[{"label": "proc-4242", "live": True, "pid_alive": True,
+                    "pi_pid": 4242, "liveness_measured": True,
+                    "workspace": "PROC:4242"}],
+        )
+        state["reconciliation"]["liveness_measured"] = True
+        state["reconciliation"]["liveness_source"] = "process-table"
+        self.assertEqual(self.cp._board_can_answer(state), "")
+        (holder,) = self.cp._holders_from_board(state, ISSUE)
+        self.assertEqual(holder.verdict, self.cp.HOLDER_LIVE)
+
     def test_a_board_level_orphan_reaches_the_surface_as_unmeasured(self):
         # board that cannot answer is REBUILT by design, so a subprocess test for
         # this shape would run the board's own bare `gh`/`cmux` — a real, ~12 s,
