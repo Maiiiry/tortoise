@@ -37,10 +37,15 @@ THE CONTRACTS THIS MODULE PINS
    cadence for NEW events (a write enqueues the dream that pushes it), but it
    is a WRITE-triggered cadence: for an idle tenant no dream runs, so a retry
    whose ``next_attempt_at`` elapses would wait for that tenant's next write.
-   The sweep is the second trigger, and both it and the dispatcher read the
-   predicate from the ONE ``_DUE_PREDICATE`` string below — the sweep's cheap
-   gate may never admit a graph the dispatcher would no-op on, and a change to
-   one can never leave the other behind.
+   The sweep is the second trigger, and both it and the dispatcher build their
+   query from the SAME two module-level clauses below — ``_DUE_PREDICATE``
+   (is it due by TIME) and ``_BEHIND_PREDICATE`` (is it actually BEHIND the
+   stream) — so a change to one can never leave the other behind. The gate
+   admits a graph only when the answer to both is yes, which is the condition
+   that makes "one SDK open only for the graphs that answered yes" true: see
+   the ``#8098 review F3`` notes on those constants for what the temporal half
+   alone was admitting (every tenant that had ever registered a webhook,
+   forever).
 4. **Retry is bounded, then the subscription is DISABLED.** Exponential
    backoff (``BASE_BACKOFF_S * 2**(attempt-1)``, capped at
    ``MAX_BACKOFF_S``); after ``max_attempts`` consecutive failures the
@@ -479,16 +484,86 @@ def _delivery_body(sub: dict, event: dict) -> bytes:
 #: The ONE due predicate (#8098). The dispatcher reads it as a MATCH+RETURN
 #: of the rows; the sweep reads it as a bare COUNT over a RAW graph handle (no
 #: SDK, no index, no node — see ``due_subscription_count``). Two copies of this
-#: string is the drift this constant exists to prevent: a gate that admitted a
-#: graph the dispatcher no-ops on would pay an SDK open for nothing, and a gate
-#: NARROWER than the dispatcher would silently starve a retry.
+#: string is the drift this constant exists to prevent.
+#:
+#: ⛔ TWO clauses, and BOTH are needed (#8098 review F3/P1). The temporal half
+#: alone is TRUE for any subscription in its healthy steady state:
+#: ``create_subscription`` writes no ``next_attempt_at`` and ``_mark_delivered``
+#: resets it to NULL on every success, so "due by time" describes a subscription
+#: for its entire life, not only while it owes something. Gating on it alone
+#: therefore paid a full per-graph SDK open (plus the three
+#: ``ensure_subscription_schema`` index statements) every interval for every
+#: tenant that had EVER registered a webhook, whether or not a single event was
+#: pending — the exact fleet-wide cost the sweep exists to bound.
 _DUE_PREDICATE = (
     "s.disabled_at IS NULL "
     "AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= $now)"
 )
 
+#: The WORK half of the predicate, kept beside the temporal half so the two can
+#: never drift (#8098 review F3). A subscription is only worth an SDK open when
+#: it is behind the stream — ``s.cursor < $head`` means at least one event with
+#: a higher ``seq`` EXISTS, i.e. ``read_after`` can return something (a delivery
+#: that caught up has ``cursor == head`` and is a guaranteed no-op).
+#:
+#: Two admission cases survive on purpose, and both are cheap no-ops the gate
+#: cannot see without reading the stream itself:
+#:
+#: * a ``types``-filtered subscription whose pending events are all of a type it
+#:   does not want (the filter is applied app-side in ``read_after``);
+#: * a subscription whose unread events were PURGED (retention) while its
+#:   cursor stayed behind — the counter's head then exceeds the store's max seq.
+#:
+#: Both are bounded: the first by the event-type set a tenant subscribes to, the
+#: second by `:GraphEvent` retention versus a retry ladder that disables a
+#: subscription within ``max_attempts`` backoffs (hours), far inside any
+#: retention window.
+_BEHIND_PREDICATE = "(s.cursor IS NULL OR s.cursor < $head)"
 
-def due_subscription_count(graph, now: datetime | None = None) -> int:
+
+def event_head_seq(graph) -> int:
+    """#8098: the highest ``:GraphEvent`` seq this graph has HANDED OUT (0 if none).
+
+    The ``$head`` half of ``_BEHIND_PREDICATE``, and the reason the gate can
+    answer "nothing owed" for a caught-up subscription. Takes a RAW graph handle
+    (``proj.g`` or ``db.select_graph(name)``) for the same reason
+    ``due_subscription_count`` does: the sweep must not open an SDK to ask.
+
+    ONE node read, not a scan: every writer allocates through
+    ``event_store.next_seq``, which MERGEs a single ``:GraphEventMeta`` node per
+    graph and bumps ``last_seq`` there — so the head is a property of one node
+    rather than an aggregate over the (unbounded, purged, millisecond-indexed)
+    ``:GraphEvent`` label. That matters: the gate runs once per tenant graph per
+    interval, so its cost has to stay flat.
+
+    ``:GraphEventMeta`` ABSENT means nothing was ever allocated through the
+    allocator — a graph that has never emitted. The fallback still asks the
+    events themselves, because a store whose events predate the counter (a
+    fixture, or a graph written by ``append_event`` directly) must not be
+    STARVED by a gate that assumed "no counter ⇒ no events"; the fallback runs
+    only on the un-countered graph, so the steady state keeps the one-node read.
+
+    A corrupt (non-numeric or negative) counter reads as 0 rather than raising:
+    this is the sweep's cheap gate, and the caller treats a raise as "skip this
+    graph this pass". A too-LARGE counter is left alone — it over-admits, which
+    costs one SDK open, while clamping it would stall deliveries.
+    """
+    rows = graph.query(
+        "MATCH (m:GraphEventMeta) RETURN max(m.last_seq)").result_set
+    value = rows[0][0] if rows else None
+    if value is None:
+        rows = graph.query(
+            "MATCH (e:GraphEvent) RETURN max(e.seq)").result_set
+        value = rows[0][0] if rows else None
+    try:
+        head = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, head)
+
+
+def due_subscription_count(graph, now: datetime | None = None,
+                          head: int | None = None) -> int:
     """#8098: how many subscriptions this graph owes a delivery RIGHT NOW.
 
     THE SWEEP'S GATE, and the reason the sweep is affordable. It takes a RAW
@@ -499,36 +574,73 @@ def due_subscription_count(graph, now: datetime | None = None) -> int:
     subscription (i.e. almost all of them).
 
     Cost, MEASURED (embedded FalkorDB via a redislite server, 300 calls after
-    warm-up, p50 / p95 ms): an EMPTY graph 1.6 / 31.7; the same graph plus 2000
-    unrelated ``:Filler`` nodes 1.8 / 32.7; 25 subscriptions (the per-graph cap,
-    index present) 2.1 / 29.6. Two things that measurement is here to record:
-    the cost is FLAT in graph SIZE (a label scan reads the label's node set, not
-    the graph — which is also why the ``MAX_SUBSCRIPTIONS`` cap bounds it) and it
-    creates NOTHING (no index, no node — the p95 tail is the embedded store's own
-    jitter, the same on all three rows, not a function of the read).
+    warm-up, p50 / p95 ms): the COUNT read — which was the whole pre-fix gate —
+    is 0.5/2.1 on an empty graph, 0.5–1.4/1.4–4.3 with 2000 unrelated
+    ``:Filler`` nodes, 0.5–0.7/3.9–5.7 with 25 subscriptions (the per-graph cap,
+    index present). The HEAD read (``event_head_seq``) is 0.6–1.9/3.7–9.8, and
+    the FULL gate (both clauses, both reads) is 1.4–3.5/10.5–17.4. Two things
+    that measurement is here to record: the cost is FLAT in graph SIZE (a label
+    scan reads the label's node set, not the graph — which is also why the
+    ``MAX_SUBSCRIPTIONS`` cap bounds it; the head is a property of ONE node) and
+    it creates NOTHING (no index, no node — the p95 tail is the embedded store's
+    own jitter, the same on every row, not a function of the read).
+
+    FOR SCALE, the term the second clause REMOVES (same box, same script): one
+    ``TortoiseSDK`` + ``_get_proj()`` + ``dispatch_pending`` on a graph whose
+    subscription is caught up — the per-graph, per-interval cost the pre-fix
+    always-true gate paid for every subscriber tenant, forever — measures
+    **20.7 / 76.9 ms**. So the extra head read is ~1–2 ms spent to avoid a
+    ~20 ms (p50) to ~77 ms (p95) SDK open that delivered nothing, and the
+    ratio only grows with the journal bind and the embedder warm-up, neither of
+    which the embedded measurement pays in full.
 
     The ``:ContextSubscription`` label has no index unless a subscription was
     created (``ensure_subscription_schema`` is the only place one is minted), so
     this read is the label scan it must be on a graph that has never held a
     subscription; a graph that HAS one carries the index.
 
+    WHAT IT ANSWERS (#8098 review F3/P1): "does this graph owe a delivery right
+    now" — a subscription that is due by TIME (``_DUE_PREDICATE``) **and** behind
+    the stream (``_BEHIND_PREDICATE``). The second half is not an optimization:
+    without it the gate is TRUE for the whole life of every healthy subscription
+    (``_mark_delivered`` resets ``next_attempt_at`` to NULL), so every pass paid
+    a full ``_make_sdk(graph_name=…)`` + ``_get_proj()`` (journal bind, embedder
+    warm-up) for a dispatcher that then delivered nothing. ``head`` is read once
+    per graph (``event_head_seq``) and may be passed in by a caller that already
+    read it (``dispatch_pending`` does, so the two see ONE head).
+
     Never raises for a *state* problem — an unheld label reads as 0. A transport
     failure DOES propagate, and the caller treats that graph as "unknown, skip
     this pass" rather than "not due" (a failed read must not be read as "no").
     """
+    if head is None:
+        head = event_head_seq(graph)
     rows = graph.query(
-        f"MATCH (s:ContextSubscription) WHERE {_DUE_PREDICATE} RETURN count(s)",
-        params={"now": _iso(now or _now())},
+        f"MATCH (s:ContextSubscription) WHERE {_DUE_PREDICATE} "
+        f"AND {_BEHIND_PREDICATE} RETURN count(s)",
+        params={"now": _iso(now or _now()), "head": int(head)},
     ).result_set
     return int(rows[0][0]) if rows and rows[0][0] is not None else 0
 
 
-def _due_subscriptions(proj, now: datetime) -> list[dict]:
+def _due_subscriptions(proj, now: datetime,
+                       head: int | None = None) -> list[dict]:
+    """The dispatcher's half of the ONE predicate — same two clauses as the gate.
+
+    The cursor clause is what makes the gate and the dispatcher answer the SAME
+    question (#8098 review F3): a caught-up subscription is not returned here at
+    all, so ``dispatch_pending`` no longer reads the stream once per caught-up
+    subscription, and a graph whose subscriptions are all caught up returns
+    BEFORE ``ensure_subscription_schema`` (three ``CREATE INDEX`` statements)
+    like a graph with no subscriptions at all.
+    """
+    if head is None:
+        head = event_head_seq(proj.g)
     rows = proj.g.query(
         "MATCH (s:ContextSubscription) "
-        f"WHERE {_DUE_PREDICATE} "
+        f"WHERE {_DUE_PREDICATE} AND {_BEHIND_PREDICATE} "
         "RETURN properties(s) ORDER BY s.created_at ASC",
-        params={"now": _iso(now)},
+        params={"now": _iso(now), "head": int(head)},
     ).result_set
     return [r[0] for r in rows]
 
@@ -611,7 +723,11 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
         # every test that drives a dream) must take this path WITHOUT creating
         # an index. Index creation is a graph WRITE, and a delivery pass that
         # has nothing to deliver should leave the graph byte-identical.
-        subs = _due_subscriptions(proj, now_dt)
+        # "Nothing to deliver" includes "every subscription is caught up" —
+        # `_due_subscriptions` carries the ``cursor < head`` clause, so the
+        # head is read ONCE here and threaded into the query (#8098 review F3).
+        head = event_head_seq(proj.g)
+        subs = _due_subscriptions(proj, now_dt, head=head)
     except Exception as e:
         logger.warning("webhook_delivery: subscription read failed: %s",
                        redact_error(e))

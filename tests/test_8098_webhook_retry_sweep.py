@@ -24,9 +24,17 @@ What these tests pin, and why each one is shaped the way it is:
 * **shutdown/handover.** The task is in the shared ``_LIVENESS_TASK_ATTRS``
   tuple (so a re-entry or shutdown disarms it) and ``_stop_liveness`` actually
   cancels it.
-* **the gate cannot drift from the dispatcher.** Both read ONE predicate; the
-  parity test drives a matrix of subscription states through both and requires
-  the same yes/no.
+* **the gate cannot drift from the dispatcher.** Both read ONE pair of clauses
+  (due-by-TIME and BEHIND-the-stream); the parity test drives a matrix of
+  subscription states through both and requires the same yes/no — including the
+  fourth state, DECLARED-AND-CAUGHT-UP, which is where every subscription spends
+  ~100% of its life and which the first 3-state matrix omitted (#8098 review
+  F3/P1: the temporal clause alone is true forever, so the gate admitted every
+  tenant that had ever registered a webhook on every pass).
+* **the pool is disposed at thread shutdown.** Its workers are non-daemon and
+  `concurrent.futures.thread` JOINS them at exit, so cancelling the sweep task
+  alone leaves queued dispatches to run out their POST timeouts (#8098 review
+  F2).
 """
 from __future__ import annotations
 
@@ -95,14 +103,23 @@ class _FakeSDK:
 
 
 class _Graph:
-    """A raw graph handle whose ``query`` returns a scripted count."""
+    """A raw graph handle whose ``query`` answers the gate's TWO reads.
 
-    def __init__(self, rows, log):
+    `due_subscription_count` reads the event head first (``:GraphEventMeta``)
+    and the due count second, so the fake answers by QUERY SHAPE — a scripted
+    single result set would let the head masquerade as the count (or the reverse)
+    and a broken gate would still look green.
+    """
+
+    def __init__(self, rows, log, head: int = 0):
         self._rows = rows
         self._log = log
+        self._head = head
 
     def query(self, cypher, params=None):
         self._log.append(cypher)
+        if "GraphEventMeta" in cypher or "GraphEvent" in cypher:
+            return SimpleNamespace(result_set=[[self._head]])
         return SimpleNamespace(result_set=self._rows)
 
 
@@ -110,9 +127,14 @@ class _Db:
     """A data-plane handle: named graphs whose due count is scripted."""
 
     def __init__(self, graphs: set[str], counts: dict[str, int] | None = None,
-                 raise_on_list: bool = False, raise_on_select=()):
+                 raise_on_list: bool = False, raise_on_select=(),
+                 heads: dict[str, int] | None = None):
         self._graphs = graphs
         self._counts = counts or {}
+        #: The event head each graph reports; high by default so a scripted
+        #: count reads as "due" (a 0 head would make the cursor clause refuse
+        #: every scripted subscription and turn the fixtures vacuous).
+        self._heads = heads or {}
         self._raise_on_list = raise_on_list
         self._raise_on_select = set(raise_on_select)
         self.selected: list[str] = []
@@ -127,7 +149,8 @@ class _Db:
         self.selected.append(name)
         if name in self._raise_on_select:
             raise RuntimeError(f"graph {name} unreachable")
-        return _Graph([[self._counts.get(name, 0)]], self.queries)
+        return _Graph([[self._counts.get(name, 0)]], self.queries,
+                      head=self._heads.get(name, 100))
 
 
 def _patch_enumeration(monkeypatch, db, orgs=("t1",), graphs_by_org=None):
@@ -189,14 +212,22 @@ def test_the_gate_counts_exactly_what_the_dispatcher_would_dispatch(sdk_factory)
 
     Behavioural, not source-level: an AST pin on ``_DUE_PREDICATE`` would pass
     while the two queries built it into different Cypher.
+
+    FOUR states, not three (#8098 review F3/P1). The three time-based ones
+    (fresh / backing-off / disabled) are the states the predicate's FIRST clause
+    governs; they are blind to the state every subscription spends ~100% of its
+    life in — DECLARED AND CAUGHT UP, where ``next_attempt_at`` is NULL and the
+    cursor is at the head. Pre-fix the gate answered 1 there forever.
     """
     sdk = sdk_factory(ensure_schema=True)
     proj = sdk._get_proj()
     now = datetime.now(UTC)
 
-    # due: never attempted
+    # due: never attempted — and (crucially) BEHIND the stream, so the cursor
+    # clause must not hide it. Pre-fix and post-fix both answer 1 here.
+    _seed_events(sdk, n=1)
     fresh = wd.create_subscription(proj, url="https://hooks.example.com/fresh",
-                                   now=now)
+                                   types=["PointAdded"], now=now)
     # not due: a backed-off retry in the FUTURE
     backing_off = wd.create_subscription(
         proj, url="https://hooks.example.com/wait", now=now)
@@ -225,8 +256,142 @@ def test_the_gate_counts_exactly_what_the_dispatcher_would_dispatch(sdk_factory)
     assert due_ids == {fresh["sub_id"], backing_off["sub_id"]}, due_ids
     assert wd.due_subscription_count(proj.g, later) == len(due_ids) == 2
 
+    # ── the FOURTH state: declared and CAUGHT UP ──────────────────────────
+    # Deliver everything the graph holds, so every enabled subscription's cursor
+    # reaches the head with `next_attempt_at` reset to NULL — the healthy steady
+    # state of a real subscriber. The gate must answer 0: there is nothing to
+    # read, so the sweep must not open an SDK for it.
+    wd.dispatch_pending(proj, transport=FakeTransport([200]), now=later)
+    caught_up = wd.get_subscription(proj, fresh["sub_id"])
+    assert caught_up["cursor"] == wd.event_head_seq(proj.g) > 0, caught_up
+    assert caught_up["next_attempt_at"] is None
+    assert wd._due_subscriptions(proj, later) == [], (
+        "a caught-up subscription is still returned by the dispatcher's due "
+        "query — it will read the stream to discover there is nothing there")
+    assert wd.due_subscription_count(proj.g, later) == 0, (
+        "the gate is true for a subscription that owes NOTHING — the sweep "
+        "then pays a full SDK open per tenant per interval forever ("
+        "#8098 review F3/P1)")
 
-def test_the_gate_is_one_read_that_writes_nothing_and_creates_no_index(sdk_factory):
+
+def test_a_declared_and_caught_up_tenant_is_not_a_sweep_target(sdk_factory,
+                                                              monkeypatch):
+    """End-to-end over the REAL gate: dispatch everything, then sweep.
+
+    The unit parity above pins the predicate; this pins the thing the predicate
+    exists to buy — a caught-up tenant costs the pass NO SDK open, no journal
+    bind, no index statement. Pre-fix the gate answered 1 here and the pass
+    built the full dispatch stack for a graph with nothing to deliver.
+    """
+    sdk = sdk_factory(ensure_schema=True)
+    proj = sdk._get_proj()
+    _seed_events(sdk, n=2)
+    now = datetime.now(UTC)
+    wd.create_subscription(proj, url="https://hooks.example.com/cb", now=now)
+    assert wd.dispatch_pending(proj, transport=FakeTransport([200, 200]),
+                               now=now)["delivered"] == 2
+
+    db = _Db({"g_default"}, {"g_default": 0})
+    _patch_enumeration(monkeypatch, db)
+    # The REAL db handle shape, so the REAL gate runs against the REAL graph.
+    monkeypatch.setattr(ha, "_data_plane_db", lambda: (
+        SimpleNamespace(close=lambda: None), db))
+    monkeypatch.setattr(db, "select_graph", lambda _name: proj.g)
+
+    assert ha._webhook_retry_targets() == [], (
+        "a tenant with nothing owed was still a sweep target — every pass pays "
+        "its SDK open for nothing (#8098 review F3/P1)")
+
+
+def test_a_tenant_that_is_behind_is_still_a_sweep_target(sdk_factory,
+                                                        monkeypatch):
+    """The anti-starvation control for the test above: SAME wiring, one new
+    event, and the graph must be a target again."""
+    sdk = sdk_factory(ensure_schema=True)
+    proj = sdk._get_proj()
+    _seed_events(sdk, n=1)
+    now = datetime.now(UTC)
+    wd.create_subscription(proj, url="https://hooks.example.com/cb", now=now)
+    wd.dispatch_pending(proj, transport=FakeTransport([200]), now=now)
+
+    db = _Db({"g_default"}, {"g_default": 0})
+    _patch_enumeration(monkeypatch, db)
+    monkeypatch.setattr(ha, "_data_plane_db", lambda: (
+        SimpleNamespace(close=lambda: None), db))
+    monkeypatch.setattr(db, "select_graph", lambda _name: proj.g)
+    assert ha._webhook_retry_targets() == []
+
+    _seed_events(sdk, n=1)  # one new event → the cursor is behind again
+    assert ha._webhook_retry_targets() == [
+        {"org_id": "t1", "graph_name": "g_default"}]
+
+
+def test_the_head_read_does_not_starve_a_graph_written_without_the_counter(
+        sdk_factory):
+    """``event_head_seq`` must read 0 only when there is genuinely nothing.
+
+    Every production writer allocates through ``event_store.next_seq`` (which
+    MERGEs the ``:GraphEventMeta`` counter), but a store whose events predate the
+    counter — a fixture, or a migrated graph — must not be STARVED by a gate
+    that equated "no counter" with "no events".
+    """
+    from tortoise import event_store
+
+    sdk = sdk_factory(ensure_schema=True)
+    proj = sdk._get_proj()
+    assert wd.event_head_seq(proj.g) == 0, "an empty graph has no head"
+
+    # Bypass the allocator entirely: events exist, the counter does not.
+    event_store.append_event(proj, 7, "PointAdded", {"id": "pt_x"}, "evt-x")
+    assert wd.event_head_seq(proj.g) == 7
+
+
+def test_an_absent_counter_falls_back_and_the_counter_stays_one_node_read(
+        sdk_factory):
+    """The counter is the head, not ``max(:GraphEvent.seq)``, in the steady
+    state — the whole reason the gate's extra read is affordable."""
+    sdk = sdk_factory(ensure_schema=True)
+    proj = sdk._get_proj()
+    _seed_events(sdk, n=3)
+    queries: list[str] = []
+
+    class _Spy:
+        def query(self, cypher, params=None):
+            queries.append(cypher)
+            return proj.g.query(cypher, params=params)
+
+    assert wd.event_head_seq(_Spy()) == 3
+    assert len(queries) == 1 and "GraphEventMeta" in queries[0], (
+        f"the head read scanned {queries} — the gate must stay a one-node read "
+        f"on a graph that has a counter")
+
+
+def test_the_gate_refuses_a_subscription_that_is_behind_but_not_yet_due(
+        sdk_factory):
+    """The OTHER half of the pair: being behind is necessary, not sufficient.
+
+    Mutation control for the cursor clause — a gate that dropped the temporal
+    clause in favour of the cursor one would admit every backed-off retry.
+    """
+    sdk = sdk_factory(ensure_schema=True)
+    proj = sdk._get_proj()
+    _seed_events(sdk, n=2)
+    now = datetime.now(UTC)
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 now=now)
+    proj.g.query(
+        "MATCH (s:ContextSubscription {sub_id:$id}) SET s.next_attempt_at=$next",
+        params={"id": sub["sub_id"],
+                "next": (now + timedelta(seconds=60)).isoformat()},
+    )
+    assert wd.event_head_seq(proj.g) == 2
+    assert wd.due_subscription_count(proj.g, now) == 0, (
+        "a subscription whose backoff has not elapsed was reported due")
+    assert wd.due_subscription_count(
+        proj.g, now + timedelta(seconds=120)) == 1
+
+
+def test_the_gate_reads_only_and_creates_no_index(sdk_factory):
     """Cost indicator: an empty graph answers ``0`` and stays byte-identical.
 
     ``ensure_subscription_schema`` mints three indexes on a graph's FIRST
@@ -242,6 +407,31 @@ def test_the_gate_is_one_read_that_writes_nothing_and_creates_no_index(sdk_facto
 
     assert _count(proj) == before_nodes, "the gate created a node"
     assert _indexes(proj) == before_indexes, "the gate created an index"
+
+
+def test_a_graph_with_a_caught_up_subscription_stays_byte_identical(sdk_factory):
+    """The caught-up case is the one that USED to pay: the gate read returned 1,
+    so the sweep built a projection (journal bind) and the dispatcher then ran
+    ``ensure_subscription_schema`` → three ``CREATE INDEX`` statements against a
+    graph with nothing to deliver (#8098 review F3/P1).
+
+    Pinned by DIFFING the graph and the index list, not by reading the code.
+    """
+    sdk = sdk_factory(ensure_schema=True)
+    proj = sdk._get_proj()
+    _seed_events(sdk, n=1)
+    now = datetime.now(UTC)
+    wd.create_subscription(proj, url="https://hooks.example.com/cb", now=now)
+    wd.dispatch_pending(proj, transport=FakeTransport([200]), now=now)
+
+    before_nodes = _count(proj)
+    before_indexes = _indexes(proj)
+    assert wd.due_subscription_count(proj.g) == 0
+    assert wd.dispatch_pending(proj, transport=FakeTransport([200]), now=now)[
+        "subscriptions"] == 0, "a caught-up subscription was still dispatched"
+
+    assert _count(proj) == before_nodes, "the caught-up pass created a node"
+    assert _indexes(proj) == before_indexes, "the caught-up pass created an index"
 
 
 # ── the enumeration: existence-gated, per-graph, fail-closed ───────────────
@@ -564,6 +754,80 @@ def test_the_sweep_task_is_in_the_shared_liveness_tuple_and_shutdown_cancels_it(
 
     asyncio.run(_shutdown())
     assert cancelled == [1]
+
+
+# ── the dispatch pool is disposed at THREAD shutdown (#8098 review F2) ────
+
+def _thread_atexit_targets() -> list:
+    """The functions registered on ``threading._register_atexit``.
+
+    That helper stores ``functools.partial(func)`` (CPython 3.12
+    ``threading._register_atexit`` always wraps), so identity has to be read
+    off the partial, not off the list entry.
+    """
+    import threading
+
+    return [getattr(entry, "func", entry)
+            for entry in getattr(threading, "_threading_atexits", ())]
+
+
+def test_the_sweep_pool_is_disposed_at_thread_shutdown():
+    """The pool's workers are NON-daemon and are JOINED at interpreter exit.
+
+    ``_stop_liveness`` cancels the sweep TASK, which stops the ``await`` — the
+    futures already QUEUED in the pool keep running, and
+    ``concurrent.futures.thread._python_exit`` (registered on
+    ``threading._register_atexit``) joins every worker behind them. One queued
+    dispatch is up to ``DEFAULT_BATCH`` (50) sequential POSTs at ``TIMEOUT_S``
+    (10 s) each, so without this hook a SIGTERM during a pass holds exit far past
+    fly.toml's ``kill_timeout``. Pre-fix there was no hook at all.
+    """
+    # The hook must be on `threading._register_atexit` — a plain `atexit`
+    # handler runs AFTER `threading._shutdown()` already joined the workers, so
+    # it can cancel nothing (the #3087 note, same class).
+    assert ha._dispose_webhook_sweep_executor in _thread_atexit_targets(), (
+        "the sweep pool has no thread-shutdown dispose hook — its queued "
+        "dispatches are joined at exit and a SIGTERM waits them out")
+
+    pool = ha._webhook_sweep_executor()
+    assert ha._WEBHOOK_SWEEP_EXECUTOR is pool
+
+    # Queue work that would block forever if it ever ran, then dispose: the
+    # queued future must be CANCELLED, not merely abandoned to the join.
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocked():
+        started.set()
+        release.wait(30)
+        return "ran"
+
+    try:
+        busy = pool.submit(_blocked)
+        assert started.wait(10), "the pool never ran"
+        queued = pool.submit(_blocked)
+
+        ha._dispose_webhook_sweep_executor()
+
+        assert ha._WEBHOOK_SWEEP_EXECUTOR is None, "the disposed pool was kept"
+        assert queued.cancelled(), (
+            "a QUEUED dispatch survived disposal — at thread shutdown it runs "
+            "out its POST timeouts instead of being dropped")
+        assert not busy.cancelled(), "a RUNNING future cannot be cancelled"
+    finally:
+        release.set()
+
+
+def test_the_sweep_pool_dispose_hook_is_none_safe(monkeypatch):
+    """The pool is built LAZILY, so a process that never swept reaches the hook
+    with nothing to dispose — and the hook runs during shutdown, where a raise
+    is unhelpful and unreportable."""
+    monkeypatch.setattr(ha, "_WEBHOOK_SWEEP_EXECUTOR", None)
+    ha._dispose_webhook_sweep_executor()  # must not raise
+    assert ha._WEBHOOK_SWEEP_EXECUTOR is None
+    assert ha._dispose_webhook_sweep_executor in _thread_atexit_targets()
 
 
 def test_the_sweep_is_armed_as_a_background_task_not_awaited_at_boot():

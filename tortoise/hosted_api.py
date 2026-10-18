@@ -873,9 +873,37 @@ def _registry_anchor() -> TortoiseSDK:
     URI mode: honors TORTOISE_DB_URI exactly like _make_sdk (the registry
     control plane + real FalkorDB config) — host-mode finalizers are no-ops,
     so there is no GC/NOSAVE concern there and the anchor is just the
-    cached handle."""
+    cached handle.
+
+    ⛔ "CACHED" IS LOAD-BEARING IN URI MODE TOO (#8098 review F1). This branch
+    used to ``return TortoiseSDK(namespace="registry")`` — a FRESH, uncached,
+    never-closed handle per call — which meant the docstring's own claim was
+    false on the lane that ships: `entrypoint.sh` derives ``TORTOISE_DB_URI`` on
+    Fly, so production IS this branch. Every call then built a new handle AND
+    paid ``_get_registry()``'s ``_ensure_registry_indexes`` (9 ``CREATE INDEX``
+    statements against the fleet-shared ``registry_control_plane``) again, once
+    per caller. The per-INTERVAL caller (``_control_plane_source_on_worker``,
+    the #8098 webhook retry sweep) made that a per-minute cost.
+
+    So URI mode delegates to ``_registry_probe_sdk()`` — the #4661 cache that
+    already exists for exactly this shape: one handle per process, keyed by the
+    ``TORTOISE_DB_URI`` STRING (a reconfigured URI closes the stale handle and
+    rebuilds, so a test's private lane or a process reconfiguration can never be
+    served the old server), built under ``_KEEPALIVE_LOCK`` so two threads
+    cannot both build one, and closed by ``_reset_registry_probe_sdk()`` (the
+    suite's isolation hook). Sharing it with the probe is deliberate: both want
+    "the one registry connection this process holds", and a second cache would
+    be the drift ``_control_plane_source``'s docstring warns about (#2823/#2340).
+
+    ONE behaviour difference that follows, stated so it is not a surprise: URI
+    mode now binds EAGERLY (that `_get_proj()` is what makes the handle worth
+    caching), so the first caller's connect failure raises from HERE instead of
+    lazily from the first query. The failure is not cached, so the next call
+    retries — and the request-scoped lane keeps `_registry_sdk()`'s explicit
+    one-retry (#1579) where a blip must not become a 500.
+    """
     if os.environ.get("TORTOISE_DB_URI"):
-        return TortoiseSDK(namespace="registry")
+        return _registry_probe_sdk()
     db_path = _resolve_embedded_db_path()
     anchor = _FALLBACK_KEEPALIVE.get("registry")
     if anchor is None or not _anchor_usable(anchor, db_path):
@@ -2830,13 +2858,22 @@ async def _dispatch_webhooks(org_id: str, graph_namespace: str | None = None,
 # owes a delivery right now, and dispatch only the graphs that do.
 #
 # COST (the indicator this had to be measured against). Per pass: ONE
-# `list_graphs()` + ONE `MATCH (s:ContextSubscription) WHERE <due> RETURN
-# count(s)` per EXISTING tenant graph, plus one SDK open ONLY for the graphs
-# that answered yes. A no-subscription graph therefore costs a single label scan
-# that creates NO node and NO index (`webhook_delivery.due_subscription_count`
-# takes a raw graph handle for exactly this reason — see its docstring), and a
-# tenant that has never registered a webhook never gets an SDK, a projection, a
-# journal bind or an embedder warm-up from this path at all.
+# `list_graphs()` + ONE `MATCH (m:GraphEventMeta) RETURN max(m.last_seq)` + ONE
+# `MATCH (s:ContextSubscription) WHERE <due> AND <behind> RETURN count(s)` per
+# EXISTING tenant graph, plus one SDK open ONLY for the graphs that answered
+# yes. A no-subscription graph therefore costs two node/label reads that create
+# NO node and NO index (`webhook_delivery.due_subscription_count` takes a raw
+# graph handle for exactly this reason — see its docstring), and a tenant that
+# has never registered a webhook never gets an SDK, a projection, a journal bind
+# or an embedder warm-up from this path at all.
+#
+# ⛔ THE "answered yes" HALF IS THE WHOLE POINT (#8098 review F1/F3). The gate
+# is TWO clauses — due by TIME *and* behind the stream — because the temporal
+# half alone is true for the entire life of every healthy subscription, which
+# meant every tenant that had EVER registered a webhook paid the SDK open above
+# on every pass, forever, to run a dispatcher that delivered nothing. The head
+# read is the cheap half of that condition; see `webhook_delivery
+# ._BEHIND_PREDICATE` and `event_head_seq`.
 #
 # The enumerator is the per-graph one the backup sweep already uses
 # (`backup_sweep.enumerate_orgs` + `_sweep_graph_list`) rather than a raw
@@ -2844,13 +2881,21 @@ async def _dispatch_webhooks(org_id: str, graph_namespace: str | None = None,
 # from the authoritative name seam, so pre-#2083 orgs (which have no `Graph`
 # nodes at all) are swept instead of silently skipped.
 
-#: Graphs whose dispatch pass is IN FLIGHT in this process. A pass holds a graph
-#: for as long as one HTTP round trip per due subscription takes, so an interval
-#: shorter than that pass would otherwise RE-ENTER the same graph and deliver
-#: the same events twice. A SET, not a lock: the sweep is a single task, an
-#: in-flight graph is simply skipped this pass (the next one retries it), and
-#: nothing ever waits on it. Cleared in a `finally` so a cancelled pass cannot
+#: Graphs whose dispatch pass is IN FLIGHT in this process. A SET, not a lock:
+#: an in-flight graph is simply skipped this pass (the next one retries it), and
+#: nothing ever waits on it. Cleared in a ``finally`` so a cancelled pass cannot
 #: wedge a graph out of every later pass.
+#:
+#: SCOPE, stated plainly because the guard is otherwise read as proof of
+#: something it does not prove (#8098 review, non-counted): TODAY it cannot
+#: fire. ``_webhook_retry_sweep_loop`` ``await``s each pass and
+#: ``_start_liveness`` cancels a prior sweep task before re-arming, so two
+#: passes never overlap inside a process — a pass longer than the interval
+#: DELAYS the next pass, it does not re-enter one. So this is defence against a
+#: FUTURE concurrent-pass shape (a second pass armed from the request path, or
+#: dispatch moved off ``asyncio.gather``), not against a pass that outruns its
+#: interval; the invariant it protects is "one in-flight dispatch per graph"
+#: and it is cheap enough to hold unconditionally.
 _WEBHOOK_SWEEP_INFLIGHT: set[str] = set()
 
 #: The sweep's dispatch pool (`_run_off_loop`) — its OWN bounded executor, never
@@ -2873,6 +2918,51 @@ def _webhook_sweep_executor() -> ThreadPoolExecutor:
                 max_workers=_webhook_delivery.sweep_concurrency(),
                 thread_name_prefix="webhook-sweep-dispatch")
         return _WEBHOOK_SWEEP_EXECUTOR
+
+
+# ── #8098 review F2: dispose the sweep pool during THREADING shutdown ──────
+# The pool above is a plain ``ThreadPoolExecutor``: CPython 3.9+ (bpo-39812)
+# made its workers NON-daemon and `concurrent.futures.thread` registers
+# `_python_exit` — which puts a sentinel on the queue and JOINS every worker —
+# via `threading._register_atexit`. So `_stop_liveness` cancelling the sweep
+# TASK does not abandon an in-flight dispatch: it stops the `await`, and the
+# queued futures still run to completion while `_python_exit` waits for them in
+# FIFO order. One pass queues one future per due graph, and one graph's dispatch
+# is up to `DEFAULT_BATCH` (50) sequential POSTs at `TIMEOUT_S` (10 s) each — a
+# SIGTERM landing during a pass could hold interpreter exit far past fly.toml's
+# `kill_timeout`.
+#
+# This is the same class and the same fix as `_dispose_capture_executor`
+# (#3087) and `_dispose_demand_ping_executor`: `shutdown(wait=False,
+# cancel_futures=True)` from `threading._register_atexit`, NOT `atexit
+# .register` (that runs AFTER `threading._shutdown()` already joined). Same
+# LIMITATION too: cancellation drops QUEUED futures only — a worker already
+# inside a POST is not interruptible, and the bound that actually protects
+# exit is `TIMEOUT_S` being well below `kill_timeout`.
+def _dispose_webhook_sweep_executor() -> None:
+    """Cancel queued sweep dispatches and release the pool at thread shutdown.
+
+    None-safe BY CONSTRUCTION: the pool is built lazily on the first pass, so a
+    process that never swept reaches this hook with `_WEBHOOK_SWEEP_EXECUTOR is
+    None` and must not raise (the hook runs during shutdown, where a raise is
+    unhelpful and unreportable).
+    """
+    global _WEBHOOK_SWEEP_EXECUTOR
+    with _WEBHOOK_SWEEP_EXECUTOR_LOCK:
+        pool, _WEBHOOK_SWEEP_EXECUTOR = _WEBHOOK_SWEEP_EXECUTOR, None
+    if pool is None:
+        return
+    with contextlib.suppress(Exception):
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+# `threading._register_atexit` orders against the executor's own hook (the whole
+# point); fall back to `atexit` where it is unavailable, which is strictly worse
+# (too late to cancel anything) but never crashes on import.
+if hasattr(threading, "_register_atexit"):
+    threading._register_atexit(_dispose_webhook_sweep_executor)  # the hook the stdlib itself uses
+else:  # pragma: no cover — Python < 3.9
+    atexit.register(_dispose_webhook_sweep_executor)
 
 
 def _webhook_retry_targets() -> list[dict[str, str]]:
@@ -2910,7 +3000,9 @@ def _webhook_retry_targets() -> list[dict[str, str]]:
         # per-org graph list (the #2823 seam the backup operators share), so a
         # Supabase-lane sweep never constructs the registry (#669). The
         # WORKER-THREAD lifetime shape is deliberate: this pass runs every
-        # interval, and a per-pass fresh registry handle would leak one a minute.
+        # interval, and a per-pass fresh registry handle would leak one a minute
+        # (registry lane) plus re-run `_get_registry()`'s 9 CREATE INDEX
+        # statements against the shared control-plane graph (#8098 review F1).
         source = _control_plane_source_on_worker()
         try:
             org_ids = enumerate_orgs(source)
@@ -2956,10 +3048,14 @@ async def _webhook_retry_sweep_pass() -> dict:
     keeps): a dead subscriber endpoint, an unreadable graph, or a failed
     enumeration costs this pass, never the loop.
 
-    Cancellation DOES propagate — shutdown cancels the loop task and every
-    in-flight dispatch is abandoned (the daemon executor's threads are not
-    joined), so the pass must not swallow ``CancelledError`` to keep its
-    ``_WEBHOOK_SWEEP_INFLIGHT`` cleanup honest.
+    Cancellation DOES propagate — shutdown cancels the loop task, so the pass
+    must not swallow ``CancelledError`` to keep its ``_WEBHOOK_SWEEP_INFLIGHT``
+    cleanup honest. What happens to the dispatch ALREADY queued in the pool is
+    the pool's contract, not this pass's: its workers are non-daemon and are
+    JOINED at interpreter exit, so ``_dispose_webhook_sweep_executor``
+    (registered on ``threading._register_atexit``) is what cancels the queued
+    futures — without it a SIGTERM during a pass waits out every queued
+    dispatch's POSTs (#8098 review F2).
     """
     import logging
 
@@ -34483,7 +34579,15 @@ def _control_plane_source_on_worker():
     different: `_control_plane_source`'s callers are request-scoped operators
     and boot/hourly sweeps, while this exists for a PER-INTERVAL pass (the #8098
     webhook retry sweep, 60s by default). At that cadence a fresh registry SDK
-    per pass would build (and leave to the GC) one handle a minute.
+    per pass would build (and leave to the GC) one handle a minute — and, worse,
+    re-run ``_get_registry()``'s 9 ``CREATE INDEX`` statements against the
+    fleet-shared ``registry_control_plane`` once a minute.
+
+    That lifetime is real on BOTH lanes (#8098 review F1): the embedded anchor
+    caches ``_registry_g`` in ``_FALLBACK_KEEPALIVE``, and URI mode now
+    delegates to the #4661 URI-keyed ``_registry_probe_sdk()`` cache instead of
+    constructing a fresh handle — see ``_registry_anchor``'s docstring for why
+    the old URI branch made this paragraph false on the lane that ships.
 
     `_iter_registered_orgs` already carries the rule this follows — "If a
     to_thread/threadpool shape is ever introduced here, route through
