@@ -30,8 +30,17 @@ THE CONTRACTS THIS MODULE PINS
 3. **Best-effort, never a caller's failure.** ``dispatch_pending`` never
    raises: a subscriber's dead endpoint, a TLS failure, or a graph hiccup
    becomes a receipt and a backoff, never an exception on the capture path.
-   Delivery runs at the END of a tenant's dream cycle (``hosted_api``
-   ``_dream_worker``) and on demand; it is never awaited by a mutation.
+   Delivery never runs inside a mutation: it runs at the END of a tenant's
+   dream cycle (``hosted_api`` ``_dream_worker``), from the SCHEDULED RETRY
+   SWEEP (#8098 — ``hosted_api._webhook_retry_sweep_pass``), and on demand.
+3b. **Two triggers, one due predicate (#8098).** The dream cycle is the
+   cadence for NEW events (a write enqueues the dream that pushes it), but it
+   is a WRITE-triggered cadence: for an idle tenant no dream runs, so a retry
+   whose ``next_attempt_at`` elapses would wait for that tenant's next write.
+   The sweep is the second trigger, and both it and the dispatcher read the
+   predicate from the ONE ``_DUE_PREDICATE`` string below — the sweep's cheap
+   gate may never admit a graph the dispatcher would no-op on, and a change to
+   one can never leave the other behind.
 4. **Retry is bounded, then the subscription is DISABLED.** Exponential
    backoff (``BASE_BACKOFF_S * 2**(attempt-1)``, capped at
    ``MAX_BACKOFF_S``); after ``max_attempts`` consecutive failures the
@@ -66,7 +75,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
-from tortoise.env_truthy import FALSY
+from tortoise.env_truthy import FALSY, env_flag
 
 from .ids import ulid
 from .security import env_int, redact_error, validate_webhook_url
@@ -78,6 +87,26 @@ logger = logging.getLogger("tortoise.webhook_delivery")
 #: is a no-op; registration still works so a tenant can stage a subscription
 #: before ops flips egress on.
 KILL_SWITCH_ENV = "TORTOISE_WEBHOOK_DISPATCH"
+
+#: #8098: the scheduled retry sweep. Interval BETWEEN passes, in seconds. The
+#: retry-resume target is "within ≤ one interval of ``next_attempt_at``", so
+#: this is the knob that bounds retry latency for an IDLE tenant; the first
+#: retry backoff is ``BASE_BACKOFF_S`` (30s), hence the 60s default (≤30s of
+#: overshoot on the shortest backoff).
+SWEEP_INTERVAL_ENV = "TORTOISE_WEBHOOK_SWEEP_INTERVAL"
+SWEEP_INTERVAL_DEFAULT_S = 60
+#: Enable knob for the SWEEP alone (tristate, default ON). Separate from the
+#: ``TORTOISE_WEBHOOK_DISPATCH`` kill switch so an operator can stop the
+#: always-on fleet sweep without disabling the write-triggered dream-cycle push
+#: (and vice versa: the kill switch stops BOTH — it is honoured by the sweep too).
+SWEEP_ENABLED_ENV = "TORTOISE_WEBHOOK_SWEEP"
+#: Graph-dispatch concurrency within ONE pass. Each graph is an independent
+#: connect + read (+ HTTP when due), so a pass over N idle tenants is N serial
+#: round trips at 1; bounded because every graph is a real connection and the
+#: pass must not become a fleet-wide connection stampede.
+SWEEP_CONCURRENCY_ENV = "TORTOISE_WEBHOOK_SWEEP_CONCURRENCY"
+SWEEP_CONCURRENCY_DEFAULT = 4
+SWEEP_CONCURRENCY_MAX = 16
 
 #: Consecutive failures before a subscription is disabled (no further dispatch).
 MAX_ATTEMPTS_DEFAULT = 8
@@ -132,6 +161,50 @@ def backoff_seconds(attempt: int) -> int:
 
 def max_attempts() -> int:
     return env_int("TORTOISE_WEBHOOK_MAX_ATTEMPTS", MAX_ATTEMPTS_DEFAULT)
+
+
+def sweep_enabled() -> bool:
+    """Is the SCHEDULED retry sweep armed? (tristate, default ON).
+
+    ``env_flag`` semantics, deliberately: unset/blank/garbage resolve to the
+    default, so a typo can never silently disarm the one trigger that retries an
+    idle tenant. A deployment that wants it off says so explicitly (``0``).
+    """
+    return env_flag(SWEEP_ENABLED_ENV, True)
+
+
+def sweep_interval_s() -> int:
+    """Validate ``TORTOISE_WEBHOOK_SWEEP_INTERVAL`` to a positive int.
+
+    Same contract as ``monitoring.event_retention_interval``: anything that is
+    not a positive whole number of seconds falls back to the default with a
+    warning. ``0``/negative is REFUSED rather than accepted because
+    ``asyncio.sleep(0)`` returns immediately — an accepted zero would turn the
+    sweep into a busy loop against every tenant graph in the fleet.
+    """
+    raw = os.environ.get(SWEEP_INTERVAL_ENV)
+    if raw is None or not str(raw).strip():
+        return SWEEP_INTERVAL_DEFAULT_S
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a whole number of seconds — using %ds",
+            SWEEP_INTERVAL_ENV, raw, SWEEP_INTERVAL_DEFAULT_S)
+        return SWEEP_INTERVAL_DEFAULT_S
+    if value < 1:
+        logger.warning(
+            "%s=%r is not a positive number of seconds — using %ds (a "
+            "zero/negative interval would sweep the fleet in a busy loop)",
+            SWEEP_INTERVAL_ENV, raw, SWEEP_INTERVAL_DEFAULT_S)
+        return SWEEP_INTERVAL_DEFAULT_S
+    return value
+
+
+def sweep_concurrency() -> int:
+    """Clamp ``TORTOISE_WEBHOOK_SWEEP_CONCURRENCY`` to ``[1, MAX]``."""
+    value = env_int(SWEEP_CONCURRENCY_ENV, SWEEP_CONCURRENCY_DEFAULT)
+    return max(1, min(int(value), SWEEP_CONCURRENCY_MAX))
 
 
 def _iso(dt: datetime) -> str:
@@ -403,11 +476,57 @@ def _delivery_body(sub: dict, event: dict) -> bytes:
 
 # ── Dispatcher ────────────────────────────────────────────────────────────
 
+#: The ONE due predicate (#8098). The dispatcher reads it as a MATCH+RETURN
+#: of the rows; the sweep reads it as a bare COUNT over a RAW graph handle (no
+#: SDK, no index, no node — see ``due_subscription_count``). Two copies of this
+#: string is the drift this constant exists to prevent: a gate that admitted a
+#: graph the dispatcher no-ops on would pay an SDK open for nothing, and a gate
+#: NARROWER than the dispatcher would silently starve a retry.
+_DUE_PREDICATE = (
+    "s.disabled_at IS NULL "
+    "AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= $now)"
+)
+
+
+def due_subscription_count(graph, now: datetime | None = None) -> int:
+    """#8098: how many subscriptions this graph owes a delivery RIGHT NOW.
+
+    THE SWEEP'S GATE, and the reason the sweep is affordable. It takes a RAW
+    graph handle (``proj.g``, or ``db.select_graph(name)`` from the data-plane
+    handle) rather than a projection, so the caller does not have to open an SDK
+    — let alone a projection with its journal bind and embedder warm-up — to ask
+    a question whose answer is "no" for every tenant that has never registered a
+    subscription (i.e. almost all of them).
+
+    Cost, MEASURED (embedded FalkorDB via a redislite server, 300 calls after
+    warm-up, p50 / p95 ms): an EMPTY graph 1.6 / 31.7; the same graph plus 2000
+    unrelated ``:Filler`` nodes 1.8 / 32.7; 25 subscriptions (the per-graph cap,
+    index present) 2.1 / 29.6. Two things that measurement is here to record:
+    the cost is FLAT in graph SIZE (a label scan reads the label's node set, not
+    the graph — which is also why the ``MAX_SUBSCRIPTIONS`` cap bounds it) and it
+    creates NOTHING (no index, no node — the p95 tail is the embedded store's own
+    jitter, the same on all three rows, not a function of the read).
+
+    The ``:ContextSubscription`` label has no index unless a subscription was
+    created (``ensure_subscription_schema`` is the only place one is minted), so
+    this read is the label scan it must be on a graph that has never held a
+    subscription; a graph that HAS one carries the index.
+
+    Never raises for a *state* problem — an unheld label reads as 0. A transport
+    failure DOES propagate, and the caller treats that graph as "unknown, skip
+    this pass" rather than "not due" (a failed read must not be read as "no").
+    """
+    rows = graph.query(
+        f"MATCH (s:ContextSubscription) WHERE {_DUE_PREDICATE} RETURN count(s)",
+        params={"now": _iso(now or _now())},
+    ).result_set
+    return int(rows[0][0]) if rows and rows[0][0] is not None else 0
+
+
 def _due_subscriptions(proj, now: datetime) -> list[dict]:
     rows = proj.g.query(
         "MATCH (s:ContextSubscription) "
-        "WHERE s.disabled_at IS NULL "
-        "AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= $now) "
+        f"WHERE {_DUE_PREDICATE} "
         "RETURN properties(s) ORDER BY s.created_at ASC",
         params={"now": _iso(now)},
     ).result_set
@@ -468,8 +587,11 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                      batch: int = DEFAULT_BATCH) -> dict:
     """Push pending events to every due subscription. NEVER raises.
 
-    Runs at the end of a tenant's dream cycle (``hosted_api._dream_worker``)
-    and on demand. Each subscription is drained IN ORDER from its cursor; the
+    Three triggers, one predicate (#8098): the end of a tenant's dream cycle
+    (``hosted_api._dream_worker`` — the cadence for NEW events), the SCHEDULED
+    RETRY SWEEP (``hosted_api._webhook_retry_sweep_pass`` — the trigger for a
+    retry whose backoff elapsed while the tenant stayed idle), and on demand.
+    Each subscription is drained IN ORDER from its cursor; the
     first failure stops that subscription's batch (head-of-line ordering is
     what makes the at-least-once contract re-deliverable) and schedules the
     retry. Returns a summary dict for logging/tests:
