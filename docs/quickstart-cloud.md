@@ -127,7 +127,7 @@ on, and what it did to get there:
 | `written at vN (the file had vM …)` | your installer is OLDER than the block (a cached or rolled-back copy) — it says so instead of calling a downgrade an upgrade |
 | `written at vN (the file's version "vM" is not a number this installer can compare …)` | the version line was malformed (e.g. `v2-rc1`); nothing is claimed about which is newer |
 | `written at vN (… "vM" is too large to compare safely)` | the version has more than 18 digits |
-| `MALFORMED … NOT rewritten` | the marker lines are not one clean start→end pair — two copies, a stray marker, one that is indented / trailing-spaced / BOM-prefixed, or one with different internal spacing; it refuses rather than duplicate the block, prints `start markers: N (first at line L), end markers: M …` plus the usual cause, and exits 3 — the SKILLS are installed at that point, only the block is not |
+| `MALFORMED … NOT rewritten` | the marker lines are not one clean start→end pair — two copies, a stray marker, or one with different internal spacing or an invisible character; it refuses rather than duplicate the block, prints per-marker counts (`start markers: N (first at line L), end markers: M (first at line …)`, plus how many are only indented / trailing-spaced / BOM-prefixed and how many are spacing-mangled), names the cause it actually found, and exits 3 — the SKILLS are installed at that point, only the block is not. A marker inside a fenced code block is an EXAMPLE: fences are skipped for every count, so documenting the markers does not block the install |
 
 `already current` is a statement about the **text**, not the version number, so it is safe to trust. To see what
 you have without changing anything:

@@ -415,7 +415,7 @@ emit_codex_agents_block() {
   local file="AGENTS.md"
   local ms="<!-- tortoise:start -->"
   local me="<!-- tortoise:end -->"
-  local tmpdir block pre post target
+  local tmpdir block pre post target staged
   tmpdir="$(mktemp -d)" || return 1
   block="$tmpdir/block"; pre="$tmpdir/pre"; post="$tmpdir/post"
   # ── PRE-STATE: read BEFORE anything is written (after the write the file
@@ -434,8 +434,12 @@ emit_codex_agents_block() {
   local state_kind="" c_start c_startline c_end c_endline c_near c_mangled
   local ms_re="^${ms}\r?$" me_re="^${me}\r?$"
   local ms_ws me_ws
-  ms_ws="$(printf '%s' "$ms" | tr -d '[:space:]')"
-  me_ws="$(printf '%s' "$me" | tr -d '[:space:]')"
+  # NB: `tr` failing here silently disables the mangled-marker detector (both
+  # whitespace-stripped markers become ""), which reverts the duplicate-block
+  # path — so it is checked like everything else, not assumed.
+  ms_ws="$(printf '%s' "$ms" | tr -d '[:space:]')" || _emit_fail "could not prepare marker matching — nothing was changed"
+  me_ws="$(printf '%s' "$me" | tr -d '[:space:]')" || _emit_fail "could not prepare marker matching — nothing was changed"
+  [ -n "$ms_ws" ] && [ -n "$me_ws" ] || _emit_fail "could not prepare marker matching — nothing was changed"
   # Resolve a symlinked AGENTS.md (monorepos point AGENTS.md at a shared
   # file) — refresh the TARGET, never clobber the link.
   target="$file"
@@ -468,12 +472,12 @@ emit_codex_agents_block() {
   Onboarding is delivered as INSTRUCTIONS, not as an installed skill.
 - First-time MCP calls may prompt for approval — tortoise_health and the read tools
   are safe to allow.
-${me}" > "$block"
+${me}" > "$block" 2>/dev/null || _emit_fail "could not build the new block text — nothing was changed"
 
   if [ -f "$target" ]; then
     state="$(awk -v ms="$ms" -v me="$me" -v msws="$ms_ws" -v mews="$me_ws" \
                  -v msre="$ms_re" -v mere="$me_re" '
-      BEGIN { starts = ends = nearstart = nearend = mangled = 0 }
+      BEGIN { starts = ends = nearstart = nearend = mangledstart = mangledend = 0; fence = 0 }
       # NEAR: the marker ALONE on the line once whitespace/BOM is stripped, but
       # not matching the anchored form (indented, trailing space, BOM).
       function near(line, m,   p, pre, post) {
@@ -485,28 +489,29 @@ ${me}" > "$block"
         return (pre == "" && post == "")
       }
       # MANGLED: a marker with different INTERNAL spacing and nothing else on the
-      # line. Not prose about the marker — a broken marker. Left as `none`, it
-      # would APPEND and duplicate the block, which is the harm this change ends.
+      # line — a broken marker, not prose about one.
       function stripped(line,   x) { x = line; gsub(/[ \t\r]/, "", x); return x }
+      # A FENCED CODE BLOCK is an example, not content: a repo whose AGENTS.md
+      # documents the markers in a fence must not be refused for it. Fences are
+      # skipped for EVERY count, so the only markers seen are real ones.
+      /^[ \t]*```/ { fence = !fence; next }
+      fence { next }
       $0 ~ msre { starts++; if (!startline) startline = NR; next }
       $0 ~ mere { ends++;   if (!endline)   endline   = NR; next }
       near($0, ms) { nearstart++; if (!nearstartline) nearstartline = NR; next }
       near($0, me) { nearend++;   if (!nearendline)   nearendline   = NR; next }
       { sw = stripped($0)
-        if (sw != "" && (sw == msws || sw == mews)) { mangled++; if (!mangledline) mangledline = NR } }
+        if (sw != "" && sw == msws) { mangledstart++; if (!mangledstartline) mangledstartline = NR }
+        else if (sw != "" && sw == mews) { mangledend++; if (!mangledendline) mangledendline = NR } }
       END {
-        if (nearstart || nearend || mangled) {
-          printf "malformed|%d|%s|%d|%s|%d|%d\n", starts, (startline ? startline : "-"), ends, (endline ? endline : "-"), nearstart + nearend, mangled
-          exit
-        }
-        if (!starts && !ends) { print "none|||||"; exit }
-        if (starts != 1 || ends != 1 || startline > endline) {
-          printf "malformed|%d|%s|%d|%s|0|0\n", starts, (startline ? startline : "-"), ends, (endline ? endline : "-")
-          exit
-        }
-        print "paired|||||"
+        if (starts == 1 && ends == 1 && startline < endline) { print "paired|||||||||"; exit }
+        if (starts + ends + nearstart + nearend + mangledstart + mangledend == 0) { print "none|||||||||"; exit }
+        # Per-marker counts, so the message and the remedy agree with each other:
+        # `c_end` (anchored only) used to say "there is no end line" while the
+        # line it was printed under reported a mangled one.
+        printf "malformed|%d|%s|%d|%s|%d|%d|%d|%d\n", starts, (startline ? startline : "-"), ends, (endline ? endline : "-"), nearstart, nearend, mangledstart, mangledend
       }' "$target")" || _emit_fail "could not read $target (unreadable, or not a regular file) — nothing was changed"
-    IFS='|' read -r state_kind c_start c_startline c_end c_endline c_near c_mangled <<EOF
+    IFS='|' read -r state_kind c_start c_startline c_end c_endline c_near_s c_near_e c_mangled_s c_mangled_e <<EOF
 $state
 EOF
   else
@@ -516,18 +521,26 @@ EOF
   case "$state_kind" in
     paired|none) : ;;
     malformed)
+      local s_side=$(( ${c_start:-0} + ${c_near_s:-0} + ${c_mangled_s:-0} ))
+      local e_side=$(( ${c_end:-0} + ${c_near_e:-0} + ${c_mangled_e:-0} ))
       echo "  ✗ AGENTS.md — the Tortoise block markers are MALFORMED" >&2
       echo "      start markers: ${c_start:-0} (first at line ${c_startline:--}), end markers: ${c_end:-0} (first at line ${c_endline:--})" >&2
-      [ "${c_near:-0}" -gt 0 ] && echo "      ${c_near} marker line(s) are the marker ALONE but indented, trailing-spaced, or BOM-prefixed." >&2
-      [ "${c_mangled:-0}" -gt 0 ] && echo "      ${c_mangled} line(s) carry a marker with different internal spacing." >&2
+      [ $(( ${c_near_s:-0} + ${c_near_e:-0} )) -gt 0 ] && \
+        echo "      ${c_near_s:-0} start / ${c_near_e:-0} end marker line(s) are the marker ALONE but indented, trailing-spaced, or BOM-prefixed." >&2
+      [ $(( ${c_mangled_s:-0} + ${c_mangled_e:-0} )) -gt 0 ] && \
+        echo "      ${c_mangled_s:-0} start / ${c_mangled_e:-0} end line(s) carry a marker that is not exactly the expected text (internal spacing, or an invisible character)." >&2
       echo "      expected exactly ONE ${ms} before exactly ONE ${me}, each alone on its line." >&2
       echo "      NOT rewritten: appending would leave the stale block in place, and a replace" >&2
       echo "      would have to guess which copy is yours." >&2
-      if [ "${c_start:-0}" -ge 2 ] || [ "${c_end:-0}" -ge 2 ]; then
-        echo "      Usual cause: an older installer ran twice. Delete from the FIRST ${ms}" >&2
-        echo "      through the LAST ${me} (all copies), then re-run." >&2
-      elif [ "${c_end:-0}" = "0" ]; then
-        echo "      There is no ${me} line. Add it after the block (or delete the ${ms} line), then re-run." >&2
+      if [ "$s_side" -ge 2 ] && [ "$e_side" -ge 1 ]; then
+        echo "      Usual cause: an older installer ran twice. Delete from the FIRST start marker" >&2
+        echo "      through the LAST end marker (all copies), then re-run." >&2
+      elif [ "$s_side" -ge 1 ] && [ "$e_side" -eq 0 ]; then
+        echo "      No end marker was found (in any form). Add the ${me} line after the block," >&2
+        echo "      or delete the start marker, then re-run." >&2
+      elif [ "$e_side" -ge 1 ] && [ "$s_side" -eq 0 ]; then
+        echo "      No start marker was found (in any form). Add the ${ms} line before the block," >&2
+        echo "      or delete the end marker, then re-run." >&2
       else
         echo "      Fix the marker lines so exactly one clean pair remains, then re-run." >&2
       fi
@@ -563,9 +576,22 @@ EOF
     # difference is CRLF is not a TEXT change (and rewriting it while saying
     # "updated text" would be a false report). Only a CR immediately before the
     # newline is ignored — a CR inside a line is real content, so it still counts.
-    if cmp -s "$tmpdir/window" "$block" \
-       || cmp -s <(sed "s/\r\$//" "$tmpdir/window") <(sed "s/\r\$//" "$block"); then
+    #
+    # Normalise into REAL FILES and check each step: a failing process
+    # substitution yields two EMPTY streams, `cmp` then reports them EQUAL, and
+    # the block would be left stale while reporting "already current" — the one
+    # place where an error read as the strongest success claim in the function.
+    if cmp -s "$tmpdir/window" "$block"; then
       same_bytes=1
+    else
+      sed "s/\r\$//" "$tmpdir/window" > "$tmpdir/window.lf" \
+        || _emit_fail "could not normalise the existing block — nothing was changed"
+      sed "s/\r\$//" "$block" > "$tmpdir/block.lf" \
+        || _emit_fail "could not normalise the new block — nothing was changed"
+      if [ ! -s "$tmpdir/window.lf" ] || [ ! -s "$tmpdir/block.lf" ]; then
+        _emit_fail "normalising the block produced an empty file — nothing was changed"
+      fi
+      if cmp -s "$tmpdir/window.lf" "$tmpdir/block.lf"; then same_bytes=1; fi
     fi
   fi
 
@@ -579,14 +605,21 @@ EOF
       inmarker && $0 ~ mere { inmarker = 0; ended = 1; next }
       { if (ended) print > post; else if (!inmarker) print > pre }
     ' "$target" || _emit_fail "could not split the file around the block — nothing was changed"
+    # Stage through an UNPREDICTABLE name in the SAME directory (so the write is
+    # same-filesystem and the `mv` stays atomic). A predictable `$target.tmp` is
+    # the #4327 threat model this script already applies to the skill payloads: a
+    # planted symlink at that name made `cp` follow it and clobber an arbitrary
+    # file, then `mv` turned AGENTS.md into a link to it.
+    staged="$(mktemp "$(dirname "$target")/.tortoise-agents.XXXXXX")" \
+      || _emit_fail "could not stage a temp file next to $target — nothing was changed"
     # cp -p first preserves the file's mode (a 0600 AGENTS.md stays 0600) and
     # ownership; cat then overwrites content in place.
-    cp -p "$target" "$target.tmp" || _emit_fail "could not stage $target.tmp — nothing was changed"
-    if ! cat "$pre" "$block" "$post" > "$target.tmp"; then
-      rm -f "$target.tmp"
-      _emit_fail "could not write $target.tmp — the original is untouched"
+    cp -p "$target" "$staged" || { rm -f "$staged"; _emit_fail "could not copy $target — nothing was changed"; }
+    if ! cat "$pre" "$block" "$post" > "$staged"; then
+      rm -f "$staged"
+      _emit_fail "could not write the staged file — the original is untouched"
     fi
-    mv "$target.tmp" "$target" || { rm -f "$target.tmp"; _emit_fail "could not replace $target — the original is untouched"; }
+    mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
   elif [ "$state_kind" = "none" ]; then
     if [ -f "$target" ]; then
       printf '\n\n' >> "$target" || _emit_fail "could not append to $target"

@@ -46,13 +46,30 @@ Mutations that turn these RED (each verified RED before merge, restored byte-exa
   * drop the mangled-marker detection                      -> the internal-spacing
     test fails (that marker appended a second block);
   * strip ALL CRs when comparing (instead of CRLF only)    -> the CR-inside-a-line
-    test fails (a real content change read as "already current").
+    test fails (a real content change read as "already current");
+  * restore the process-substitution comparison            -> the failing-``sed``
+    test fails: two failed substitutions yield two EMPTY streams, ``cmp`` calls
+    them EQUAL, and a stale block is reported "already current" at exit 0;
+  * count markers inside a fenced code block               -> the fenced-example
+    test fails (a project that DOCUMENTS the markers was refused, exit 3, and the
+    pre-PR installer handled that very file);
+  * make the non-numeric version fall through to ``unversioned`` -> that test
+    fails, and the shell then prints ``integer expression expected`` and reports
+    "same version, updated text";
+  * make the unparsed-state arm a no-op                    -> the awk-crash test
+    fails: nothing is written and the run claims ``upgraded`` at exit 0;
+  * stage the block through a predictable ``$target.tmp``  -> the planted-symlink
+    test fails (the write follows the link, clobbers an unrelated file, and turns
+    ``AGENTS.md`` into a symlink to it — #4327's threat model).
 
 Cycle 2 also measured a version token in prose outside the block (read as
 "current") and an older installer overwriting a newer block (called an
 "upgrade"); both are tests here. Cycle 3 measured the false-success path
 end-to-end: an unreadable ``AGENTS.md`` returned 0 and printed an "upgrade" the
-pre-PR installer would have failed closed on.
+pre-PR installer would have failed closed on. Cycle 4 measured three more: the
+line-ending comparison failing OPEN on a broken ``sed``, a fenced EXAMPLE of the
+markers hard-refusing the install (a regression against the pre-PR installer),
+and a documented ``not a number`` report branch with no test behind it.
 """
 
 from __future__ import annotations
@@ -320,7 +337,7 @@ def test_malformed_markers_are_refused_not_silently_duplicated(tmp_path):
         + LEGACY_BLOCK.replace("OLD", "OLD")
         + FOREIGN_AFTER
     )
-    done, agents = _install(tmp_path, agents_in)
+    done, _ = _install(tmp_path, agents_in)
 
     assert done.returncode != 0, (
         f"a malformed marker pair must fail the run, not report success:\n{done.stdout}")
@@ -584,3 +601,145 @@ def test_a_cr_inside_a_line_is_a_real_difference(tmp_path):
     assert "already current" not in report, (
         f"a CR inside a line is content, not an EOL difference:\n{report}")
     assert "updated text" in report, report
+
+
+# ── Cycle 4: fail-open comparison, fenced doc examples, non-numeric versions,
+#    an unparsed state, and a planted staging symlink
+
+
+def _install_with_stub(tmp_path: Path, stub: str, body: str, agents: str | None):
+    """Run the REAL installer with one stubbed command first on PATH."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / stub).write_text(body, encoding="utf-8")
+    (bindir / stub).chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    if agents is not None:
+        (project / "AGENTS.md").write_text(agents, encoding="utf-8")
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    done = subprocess.run(
+        ["bash", str(installer), "--harness", "codex"],
+        cwd=str(project), env=env, capture_output=True, text=True, timeout=300)
+    return done, (project / "AGENTS.md")
+
+
+def test_a_failing_sed_cannot_read_as_already_current(tmp_path):
+    """Process substitution that fails yields two EMPTY streams, so `cmp` says
+    "equal" and a stale block is reported as current. The normalisation is done
+    into real files and each step is checked."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    assert _run(installer, home, project).returncode == 0
+    target = project / "AGENTS.md"
+    # Drifted text AND CRLF, so the exact `cmp` misses and the normalisation path
+    # is the only thing that can decide — which is what the stub breaks.
+    target.write_bytes(
+        target.read_text(encoding="utf-8")
+        .replace("agent memory", "agent  memory").replace("\n", "\r\n").encode())
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "sed").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (bindir / "sed").chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    done = subprocess.run(["bash", str(installer), "--harness", "codex"],
+                          cwd=str(project), env=env, capture_output=True, text=True, timeout=300)
+
+    assert done.returncode != 0, f"a failed normalisation must not report success:\n{done.stdout}"
+    # Scope to the AGENTS line: the SKILLS lines legitimately say "(already current)".
+    assert "✓ AGENTS.md" not in done.stdout, done.stdout
+
+
+def test_a_fenced_documentation_example_does_not_refuse_the_install(tmp_path):
+    """A FENCE is an example, not content. Refused before: a repo that documents
+    the markers in a fence was told its markers were malformed — and the remedy
+    said to delete the example. A file with ONLY a fenced example has no block
+    at all, so it must be created, not refused."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    example = "## How this file is structured\n\n```\n  " + START + "\n  ...\n  " + END + "\n```\n"
+    agents = project / "AGENTS.md"
+    agents.write_text("# House rules\n\n" + example, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, (
+        f"a fenced EXAMPLE of the markers is documentation, not a broken block:\n{done.stderr}")
+    text = agents.read_text(encoding="utf-8")
+    assert text.count(START) == 2, "expected the example plus one real block"
+    assert text.count(END) == 2, "the created block must be closed exactly once"
+    assert example in text, "the example was eaten"
+    assert "✓ AGENTS.md" in done.stdout, done.stdout
+
+    # Second run: current, and the example is still not a second block.
+    again = _run(installer, home, project)
+    assert again.returncode == 0, again.stderr
+    assert "already current" in _agents_report(again.stdout), again.stdout
+    assert agents.read_text(encoding="utf-8") == text
+
+
+def test_a_non_numeric_version_is_reported_as_such(tmp_path):
+    """`v2-rc1` used to fall through to `unversioned` — a false statement about
+    the file — and with the guard removed both comparisons ERROR and fall
+    through to `refreshed (same version, updated text)`."""
+    agents_in = LEGACY_BLOCK.replace(START, f"{START}\n<!-- tortoise:block v2-rc1 -->")
+    done, agents = _install(tmp_path, agents_in)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    report = _agents_report(done.stdout)
+    assert "not a number this installer can compare" in report, report
+    assert "unversioned" not in report, report
+    assert "updated text" not in report, report
+    assert "integer expression expected" not in (done.stdout + done.stderr), (
+        "a shell comparison must not be fed a non-number")
+
+
+def test_an_unparsed_state_fails_instead_of_claiming_an_upgrade(tmp_path):
+    """If the state awk prints nothing (crash), nothing must be written and no
+    claim may be made — the earlier failure mode was `upgraded` at exit 0."""
+    done, agents = _install_with_stub(tmp_path, "awk", "#!/bin/sh\nexit 0\n", LEGACY_BLOCK)
+
+    assert done.returncode != 0, f"an unparsed state must fail:\n{done.stdout}"
+    assert "✓ AGENTS.md" not in done.stdout, done.stdout
+    if agents.exists():
+        assert agents.read_text(encoding="utf-8") == LEGACY_BLOCK
+
+
+def test_a_planted_staging_symlink_cannot_redirect_the_write(tmp_path):
+    """#4327's threat model, applied to the block writer: a predictable
+    `AGENTS.md.tmp` allowed a planted symlink to clobber an arbitrary file."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    victim = project / "victim.txt"
+    victim.write_text("ORIGINAL — must not change\n", encoding="utf-8")
+    (project / "AGENTS.md").write_text(LEGACY_BLOCK, encoding="utf-8")
+    (project / "AGENTS.md.tmp").symlink_to(victim)
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert victim.read_text(encoding="utf-8") == "ORIGINAL — must not change\n", (
+        "the write followed a planted symlink and clobbered an unrelated file")
+    assert not (project / "AGENTS.md").is_symlink(), "AGENTS.md became a symlink"
+    assert (project / "AGENTS.md").read_text(encoding="utf-8").count(START) == 1

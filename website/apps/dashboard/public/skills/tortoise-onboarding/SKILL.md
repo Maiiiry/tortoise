@@ -556,9 +556,12 @@ byte-identical to the one just built — not about the version number, so it is
 safe to trust.
 
 If the marker lines are not one clean pair — two copies, a stray marker, or one
-that is indented, trailing-spaced, or carries different internal spacing — the
-installer prints `✗ AGENTS.md — the Tortoise block markers are MALFORMED` with
+with different internal spacing or an invisible character — the installer prints
+`✗ AGENTS.md — the Tortoise block markers are MALFORMED` with
 `start markers: N (first at line L), end markers: M …` and the usual cause,
+A marker inside a fenced code block is an EXAMPLE, not a block: fences are
+skipped for every count, so a project that documents the markers keeps its
+documentation and still gets its block created or refreshed.
 REFUSES rather than duplicating the block, and exits 3 (the skills ARE installed
 by then; only the block is not upgraded). Never hand-edit inside markers you did not
 write; the next refresh discards it.
