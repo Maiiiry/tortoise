@@ -123,26 +123,36 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # ``(similarity_weight + graph_boost_weight * |d_gb| + recency_weight)
 # / graph_boost_weight`` — 2.857 in the worst case, where the twins' baseline
 # ``graph_boost`` differs maximally (each row's is in [0, 1]).  The 1.857 the
-# page-bound band pins is that ceiling with ``d_gb <= 0``, and 1.4286 is the
-# equal-recency case with ``d_gb == 0`` — the case the measured pages here
-# exhibit, because the E2E-1 twins share a baseline ``graph_boost`` (identical
-# operator connectivity).  That premise is what makes the flat 1.4286 figures
-# below legitimate, so the test pins it by name rather than assuming it.
-# A wider CONFIDENCE gap moves ``d_gb``, and a contested twin is normally held
-# with LOWER confidence than its twin — so ``d_gb`` >= 0 and the real
-# requirement sits at or ABOVE 1.857 (measured end-to-end: a maximal gap, calm
-# 1.0 / contested 0.0, gives ``d_gb`` = 0.5 and puts the 2-row requirement at
-# 1.4286 + 0.5 = 1.9286, above that band).  Hence 1.857 is the PARITY case and
-# not a universal ceiling; the conclusion below is unaffected in direction — a
-# larger ``d_gb`` only takes the requirement further above the clamp's 0.3 of
-# headroom, never below it.
+# page-bound band pins is that saturation at ``d_gb == 0`` — the ceiling is
+# monotone in ``|d_gb|``, so a NEGATIVE ``d_gb`` gives a LARGER one, not that
+# one — and 1.4286 is the equal-recency case with ``d_gb == 0``: the case the
+# measured pages here exhibit, because the E2E-1 twins share a baseline
+# ``graph_boost`` (identical operator connectivity).  That premise is what
+# makes the flat 1.4286 figures below legitimate, so the test pins it by name
+# rather than assuming it.
+# A wider CONFIDENCE gap moves ``d_gb``, and the requirement moves WITH it.  On
+# the 2-row page (``d_sim`` = 1, equal recency) the formula above is
+# ``cb_req = 1.4286 + d_gb``, so ``d_gb`` >= 0 puts the requirement at or above
+# 1.4286 — NOT 1.857, which it only passes once ``d_gb`` >= 0.4286 (a 0.857
+# confidence gap at equal connectivity).  Measured end-to-end: a maximal gap,
+# calm 1.0 / contested 0.0, gives ``d_gb`` = 0.5 and puts the 2-row requirement
+# at 1.4286 + 0.5 = 1.9286.  Nor is the sign guaranteed: the contested twin is
+# the one carrying the counter-claim edge, i.e. the one with the HIGHER
+# connectivity, which pushes ``d_gb`` the other way — the fixture has to mint a
+# parity NAND onto the calm twin to zero it, and without that calm falls to
+# degree 0, ``d_gb`` = -0.25, and the 2-row requirement drops to 1.1786.  So
+# 1.857 is the CEILING at ``d_gb == 0`` and 1.4286 is the requirement at that
+# parity; neither is a floor for ``d_gb`` > 0, and only 2.857 is a universal
+# ceiling.  The conclusion below is unaffected: a larger ``d_gb`` only moves
+# the requirement UP, never down.
 # A 2-row page is the worst PAGE because a page cannot hold fewer than the two
 # rows being ordered: it is a maximum, not the first term of a series.  Measured
 # on the bare 4-row E2E-1 fixture (dense leg live, re-measured 2026-10-18):
 # required total ``cb`` 1.4286 on a 2-row page (built from the fused rows — the
 # SDK's own ``limit=2`` read does not hold both twins), still 1.4286 at
 # ``limit=3`` (the twins occupy both ends of the span, so a third row buys
-# nothing), and 0.0540 at ``limit>=4`` — the shipped default 10 included.  The
+# nothing), and 0.0540 at ``limit>=4`` on that 4-row fixture (where every page
+# size at or above 4 is its whole page) — the shipped default 10 included.  The
 # requirement FALLS as the page grows and the largest value it ever takes is
 # the 2-row one.
 #   * A modest raise therefore DOES repair the shipped default read: on that

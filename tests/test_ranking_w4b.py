@@ -878,10 +878,15 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"the comment quotes 2.857 as the saturation at maximal |d_gb| "
         f"(sim_w + graph_w + rec_w) / graph_w; this is {absolute:.4f}")
     # THE GUARANTEE: what a cb inside [0, 1] can buy is at most the clamp's
-    # headroom 1.0 - baseline, and the requirement exceeds it. (Separately,
-    # ``two_req >= 1.0`` — numerically the floor at these weights — is the
-    # strongest form: even a zero baseline, the most generous headroom there
-    # is, cannot cover this page.)
+    # headroom 1.0 - baseline, and the requirement exceeds it — that inequality
+    # is the invariant, true of EVERY 2-row page.  The floor it comes from is
+    # ``cb_req >= (sim_w - graph_w*gb_hot - rec_w)/graph_w = 1 - gb_hot`` (put
+    # ``gb_calm >= 0``, ``gb_hot <= 1`` and ``d_rec >= -1`` into the formula),
+    # i.e. the headroom of the page's HIGHER row, which is BELOW 1.0 whenever
+    # that row has any baseline at all.  So ``1.0`` is not a 2-row bound and is
+    # not asserted as one: the value pinned just below is THIS fixture's
+    # requirement (1.4286, from the parity), not "a 2-row page must need the
+    # full span".
     two_headroom = 1.0 - two_gb_hot
     assert two_headroom == pytest.approx(0.3), (
         f"the comment quotes 0.3 of clamp headroom (1.0 - a 0.7 baseline); "
@@ -891,8 +896,10 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"{two_headroom:.4f}: that is the 'the CLAMP is the blocker' claim, "
         f"and it is what a band alone does not say")
     assert two_req >= 1.0, (
-        f"a 2-row page must need at least the full [0, 1] graph_boost span "
-        f"({two_req:.4f}) — no cb inside the invariant can clear it")
+        f"on THIS fixture's parity page the requirement ({two_req:.4f}) is above "
+        f"the full [0, 1] span's worth of boost — no cb inside the invariant can "
+        f"clear it. A fixture value, not a 2-row bound: the general floor is the "
+        f"headroom {two_headroom:.4f} asserted above")
 
     # The blocker is the CLAMP, not unboundedness: give the boost a value far
     # past the clamp and the ordering still loses, the graph term pinned.
@@ -1065,13 +1072,15 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"raise therefore DOES repair the shipped default read' is false")
 
     # ── The bound is CONDITIONAL: the ``Δgb`` term is not free ─────────────
-    # ``cb_req = (sim_w*Δsim + graph_w*Δgb + rec_w*Δrec) / graph_w``.  1.857 (and
-    # the 1.4286 above) is the ``Δgb == 0`` case; a CONTESTED twin normally holds
-    # LOWER confidence, so ``Δgb`` >= 0 and the real requirement sits at or above
-    # it.  Measured end-to-end through the real ranker: give the twins a maximal
-    # confidence gap and the 2-row requirement rises by exactly ``Δgb``, past the
-    # parity ceiling — which is why the comment must not quote 1.857 as the
-    # general bound.
+    # ``cb_req = (sim_w*Δsim + graph_w*Δgb + rec_w*Δrec) / graph_w``.  1.857 is the
+    # saturation at ``Δgb == 0`` (the parity case); the requirement MOVES with
+    # ``Δgb`` — ``1.4286 + Δgb`` on this 2-row page — so it only passes 1.857
+    # once ``Δgb`` >= 0.4286, and the sign is not guaranteed either (the
+    # contested twin carries the counter-claim edge, i.e. the HIGHER
+    # connectivity, which pushes ``Δgb`` negative).  Measured end-to-end through
+    # the real ranker: give the twins a maximal confidence gap and the 2-row
+    # requirement rises by exactly ``Δgb``, past the parity ceiling — which is
+    # why the comment must not quote 1.857 as the general bound, nor as a floor.
     proj = ranked_sdk._get_proj()
     for pid, conf in ((calm, 1.0), (hot, 0.0)):
         proj.g.query(
@@ -1081,6 +1090,17 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     wide_req, _wh, _wc, _wid = required_cb(two_row)
     wide_gb_calm, wide_gb_hot = baseline_graph_boost(two_row)
     wide_dgb = wide_gb_calm - wide_gb_hot
+    # The comment's other corrected half: the requirement passes the 1.857
+    # saturation only once ``Δgb >= 0.4286`` (``ceiling - two_req``), so
+    # ``Δgb`` >= 0 does NOT put it at or above 1.857.  Arithmetic on the two
+    # measured quantities, pinned here so the sentence cannot re-flip.
+    crossing = ceiling - two_req
+    assert crossing == pytest.approx(0.4286, abs=5e-3), (
+        f"the requirement passes the 1.857 saturation only once "
+        f"Δgb >= {crossing:.4f}; at these weights that is 0.4286")
+    assert wide_dgb > crossing, (
+        f"the measured Δgb ({wide_dgb:.4f}) must sit above the crossing "
+        f"({crossing:.4f}) for this page to exceed the parity ceiling")
     assert wide_dgb == pytest.approx(0.5, abs=5e-3), (
         f"a 1.0/0.0 confidence gap must move Δgb by 0.5 (graph_boost is "
         f"0.5 * confidence + 0.5 * connectivity); got {wide_dgb:.4f}")
@@ -1090,7 +1110,7 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     assert wide_req > ceiling, (
         f"with Δgb > 0 the requirement ({wide_req:.4f}) exceeds the parity "
         f"ceiling {ceiling:.4f} — so W4_CONTESTED_BOOST's comment must state "
-        f"1.857 as the PARITY case, not as the general bound")
+        f"1.857 as the Δgb == 0 saturation, neither the general bound nor a floor")
     assert wide_req <= absolute, (
         f"and it must still be bounded: {wide_req:.4f} <= {absolute:.4f}")
 
