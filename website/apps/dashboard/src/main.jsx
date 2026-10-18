@@ -6356,14 +6356,26 @@ function claimIntentInFlight() {
         if (res.status === 402) {
           // #1875: render the API's detail (upgrade vs at-capacity)
           // #4639: carry the structured 402 for the banner's nudge gate.
-          // #5425: the server's string detail carries the contact route, but
-          // THIS fallback did not — a non-string or absent detail (proxied /
-          // empty body) left the customer at a tier ceiling with no way to talk
-          // to us. The server's own copies of this sentence are routed, so this
-          // one was the only silent copy (round 6).
-          setError({ message: typeof b.detail === 'string'
-            ? b.detail
-            : withLimitContact('Invites require the Builder or Team tier — upgrade to invite members.'), status: res.status })
+          // #5208: BOTH invite 402s now answer with a structured detail —
+          // `{code: 'tier_required', message, feature}` for the tier gate and
+          // `{code: 'quota_exceeded', resource: 'users', used, limit,
+          // message}` for the seat cap. Reading only the STRING form silently
+          // replaced a member-cap refusal with the tier-gate copy below, so an
+          // at-capacity Pro team was told to buy the tier it is already on —
+          // the exact conflation #5208 exists to end. Read the payload's own
+          // sentence first (the `detail.message` mapping the shared `api()`
+          // seam has used since #2789) and carry `code` so `upsellGate`'s nudge
+          // gate can see the category (#4639).
+          // #5425: the server's detail carries the contact route, but THIS
+          // fallback must keep carrying it for a non-string, message-less or
+          // absent detail (proxied / empty body) — otherwise the customer is
+          // left at a ceiling with no way to talk to us.
+          const d = b.detail
+          const detailMessage = typeof d === 'string' ? d
+            : (d && typeof d.message === 'string') ? d.message
+            : withLimitContact('Invites require the Builder or Team tier — upgrade to invite members.')
+          setError({ message: detailMessage, status: res.status,
+            code: (d && typeof d.code === 'string') ? d.code : undefined })
           setBusy(false)
           return
         }

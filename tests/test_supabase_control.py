@@ -1242,7 +1242,39 @@ class TestInvitationSeam:
         with pytest.raises(InvitationError) as ei:
             invitation_accept(fake, inv["token"], _U2)
         assert ei.value.status == 402
+        # #5208: the seat cap is a MACHINE-READABLE refusal — the `users`
+        # quota resource, not prose. `str(e)` is still the human sentence (the
+        # payload answers `__str__`), so the pre-#5208 reader is unaffected.
+        detail = ei.value.http_detail()
+        assert detail["code"] == "quota_exceeded", detail
+        assert detail["resource"] == "users", detail
+        assert detail["used"] == 1 and detail["limit"] == 1, detail
+        assert detail["message"] == str(ei.value), detail
         # invite still pending — the gate fires BEFORE consumption
+        assert fake.tables["invitations"][0]["status"] == "pending"
+
+    def test_accept_402_when_join_side_free_cap(self, fake):
+        """#5208: the join-side free-team gate is a TIER entitlement refusal.
+
+        It must NOT answer with the quota code: its relief is an upgrade, and
+        reading it as an exhausted allowance would offer "free a seat" for a
+        plan the org was never on.
+        """
+        self._owner(fake)          # U3 owns team-1 (free, max_users 100)
+        # the INVITEE already holds an active membership in a FREE org
+        fake.seed("org_memberships", [{
+            "user_id": _U2, "org_id": "team-free-001",
+            "role": "member", "status": "active"}])
+        inv = invitation_mint(fake, "team-1", "bob@example.com", "member",
+                              "owner-1")
+        with pytest.raises(InvitationError) as ei:
+            invitation_accept(fake, inv["token"], _U2)
+        assert ei.value.status == 402
+        detail = ei.value.http_detail()
+        assert detail["code"] == "tier_required", detail
+        assert detail["code"] != "quota_exceeded", detail
+        assert detail["feature"] == "team_join", detail
+        # non-consuming — the gate fires before the single-use PATCH
         assert fake.tables["invitations"][0]["status"] == "pending"
 
     def test_accept_compensates_invite_when_membership_write_fails(self, fake):
@@ -3280,6 +3312,12 @@ class TestInviteFusionV2Seam:
                               user_email="alice@example.com",
                               mismatch_override="fuse", otp_code="123456")
         assert ei.value.status == 402
+        # #5208: the refusal stays machine-readable on the fusion path too —
+        # the seat cap answers with the `users` quota category, never prose.
+        _cap = ei.value.http_detail()
+        assert _cap["code"] == "quota_exceeded", _cap
+        assert _cap["resource"] == "users", _cap
+        assert _cap["used"] == 1 and _cap["limit"] == 1, _cap
         row = fake.tables["invitations"][0]
         assert row.get("accepted_at") is None  # invite NOT consumed
         assert row["otp_hash"] is not None     # code NOT burned

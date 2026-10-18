@@ -139,7 +139,11 @@ from tortoise.projection import (
     is_missing_graph_error,  # #2163: absent-graph GRAPH.DELETE family == success
     journal_mint_write_ahead,  # #3390: journal the intended name BEFORE the CREATE
 )
-from tortoise.quota import with_limit_contact  # #5425 refusal seam
+from tortoise.quota import (  # #5208: the 402 refusal-payload builders
+    entitlement_refusal_payload,
+    member_limit_refusal_payload,
+    with_limit_contact,  # #5425 refusal seam
+)
 from tortoise.retention import RESTORE_WINDOW_HOURS as _RESTORE_WINDOW_HOURS  # #4179
 from tortoise.retrieval_metering import (  # #4489: pure-ASGI retrieval-work flusher
     RetrievalMeteringMiddleware as _RetrievalMeteringMiddleware,
@@ -17735,7 +17739,12 @@ async def _provision_preflight(org: dict) -> None:
     if org.get("tier", "free") in _GRAPH_TIER_BLOCKED:
         raise HTTPException(
             status_code=402,
-            detail=with_limit_contact("Custom graphs require the Builder plan. Upgrade to create " "multiple graphs."),
+            # #5208: the entitlement refusal is a machine-readable CATEGORY, not
+            # prose. `feature` names WHICH entitlement was missing; the
+            # `X-Upgrade-CTA` header stays as the legacy pointer it always was.
+            detail=entitlement_refusal_payload(
+                with_limit_contact("Custom graphs require the Builder plan. Upgrade to create " "multiple graphs."),
+                feature="custom_graphs"),
             headers={"X-Upgrade-CTA": "pro"},
         )
 
@@ -19335,7 +19344,9 @@ async def invite_to_org(body: dict, user: dict = Depends(get_current_user)):  # 
             tier = org.get("tier") or "free"
             if tier in ("free", "solo"):
                 raise HTTPException(status_code=402,
-                                    detail=with_limit_contact("Invites require the Builder or Team tier — upgrade to invite members"))
+                                    detail=entitlement_refusal_payload(
+                                        with_limit_contact("Invites require the Builder or Team tier — upgrade to invite members"),
+                                        feature="invites"))
             # #1965: per-org lock around the capacity check + mint — two
             # concurrent invites must not both read active+pending < 2 and
             # both mint past max_users. Serialized per org_id; the count
@@ -19357,7 +19368,9 @@ async def invite_to_org(body: dict, user: dict = Depends(get_current_user)):  # 
                                if not i.get("expires_at") or i["expires_at"] > now]
                     if len(active) + len(pending) >= 2:  # Pro max_users=2
                         raise HTTPException(status_code=402,
-                                            detail=with_limit_contact("Member limit reached — upgrade to invite more"))
+                                            detail=member_limit_refusal_payload(
+                                                with_limit_contact("Member limit reached — upgrade to invite more"),
+                                                used=len(active) + len(pending), limit=2))
                 inv = await _cp_offload(
                     lambda: invitation_mint(
                         get_control_plane(), org_id, email, role,
@@ -19379,7 +19392,7 @@ async def invite_to_org(body: dict, user: dict = Depends(get_current_user)):  # 
                     "token": inv["token"], "expires_at": inv["expires_at"],
                     "role": role}
         except InvitationError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))  # noqa: B904
+            raise HTTPException(status_code=e.status, detail=e.http_detail())  # noqa: B904
         except HTTPException:
             raise
         except Exception:
@@ -19416,7 +19429,9 @@ async def invite_to_org(body: dict, user: dict = Depends(get_current_user)):  # 
         # active-only under-counted pending seats).
         if tier in ("free", "solo"):
             raise HTTPException(status_code=402,
-                                detail=with_limit_contact("Invites require the Builder or Team tier — upgrade to invite members"))
+                                detail=entitlement_refusal_payload(
+                                    with_limit_contact("Invites require the Builder or Team tier — upgrade to invite members"),
+                                    feature="invites"))
         if tier == "pro":
             from datetime import datetime as _pdt
             active = reg.query(
@@ -19432,7 +19447,9 @@ async def invite_to_org(body: dict, user: dict = Depends(get_current_user)):  # 
             ).result_set[0][0]
             if active + pending >= 2:  # Pro max_users=2
                 raise HTTPException(status_code=402,
-                                    detail=with_limit_contact("Member limit reached — upgrade to invite more"))
+                                    detail=member_limit_refusal_payload(
+                                        with_limit_contact("Member limit reached — upgrade to invite more"),
+                                        used=active + pending, limit=2))
 
         # Invitation node via SDK (token returned once); roles admin/member allowed here
         import uuid as _uuid
@@ -19743,7 +19760,7 @@ async def accept_invite(body: dict, request: Request,
             _forget_invite_accept(request, token)
             return res
         except InvitationError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))  # noqa: B904
+            raise HTTPException(status_code=e.status, detail=e.http_detail())  # noqa: B904
         except HTTPException:
             raise
         except Exception:
@@ -19809,7 +19826,9 @@ async def accept_invite(body: dict, request: Request,
         if _org_tier == "free" and await _count_active_free_memberships(user["user_id"]) >= 1:
             raise HTTPException(
                 status_code=402,
-                detail=with_limit_contact("You already have a free team — this team requires a paid plan" " to join"))
+                detail=entitlement_refusal_payload(
+                    with_limit_contact("You already have a free team — this team requires a paid plan" " to join"),
+                    feature="team_join"))
 
     # #1965: per-org lock around the capacity pre-check + consume. The
     # capacity pre-check runs INSIDE the lock BEFORE the accepted_at write
@@ -19835,7 +19854,9 @@ async def accept_invite(body: dict, request: Request,
             if _cap_active >= int(_cap_max):
                 raise HTTPException(
                     status_code=402,
-                    detail=with_limit_contact("Member limit reached — upgrade to invite more"))
+                    detail=member_limit_refusal_payload(
+                        with_limit_contact("Member limit reached — upgrade to invite more"),
+                        used=_cap_active, limit=int(_cap_max)))
 
         # Token single-use: CONDITIONAL claim — the SET's own matched-row
         # count is authoritative (P2-1 concurrency review, cross-lane half):
@@ -20269,7 +20290,9 @@ async def _registry_mismatch_accept_v2(sdk, invite: dict, user: dict,
         if _org_tier == "free" and await _count_active_free_memberships(user["user_id"]) >= 1:
             raise HTTPException(
                 status_code=402,
-                detail=with_limit_contact("You already have a free team — this team requires a paid plan" " to join"))
+                detail=entitlement_refusal_payload(
+                    with_limit_contact("You already have a free team — this team requires a paid plan" " to join"),
+                    feature="team_join"))
     async with _invite_org_lock(org_id):
         _cap_row = reg.query(
             "MATCH (t:Team {id:$id}) RETURN properties(t)",
@@ -20284,7 +20307,9 @@ async def _registry_mismatch_accept_v2(sdk, invite: dict, user: dict,
             if _cap_active >= int(_cap_max):
                 raise HTTPException(
                     status_code=402,
-                    detail=with_limit_contact("Member limit reached — upgrade to invite more"))
+                    detail=member_limit_refusal_payload(
+                        with_limit_contact("Member limit reached — upgrade to invite more"),
+                        used=_cap_active, limit=int(_cap_max)))
         # Token single-use + OTP single-use: CONDITIONAL write (still-pending
         # guard) + the write's OWN matched-row count IS the authoritative
         # single-use claim — a concurrent accept (email-match invitee racing
@@ -20545,7 +20570,7 @@ async def resend_invite(invitation_id: str, org_id: str, request: Request,
                     actor_user_id=user["user_id"]),
                 op="invitation_resend")
         except InvitationError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))  # noqa: B904
+            raise HTTPException(status_code=e.status, detail=e.http_detail())  # noqa: B904
         try:
             from tortoise.email_notify import send_invite_email
             send_invite_email(org_id, res["email"], res["role"],
@@ -20639,7 +20664,7 @@ async def expire_invite(invitation_id: str, org_id: str,
                     actor_user_id=user["user_id"]),
                 op="invitation_expire")
         except InvitationError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))  # noqa: B904
+            raise HTTPException(status_code=e.status, detail=e.http_detail())  # noqa: B904
     sdk = _make_sdk(namespace="registry")
     reg = sdk._get_registry()
     rows = reg.query(
@@ -20802,7 +20827,9 @@ async def _registry_accept_by_id(sdk, invitation_id: str, user: dict) -> dict:
         if org_tier == "free" and await _count_active_free_memberships(user["user_id"]) >= 1:
             raise HTTPException(
                 status_code=402,
-                detail=with_limit_contact("You already have a free team — this team requires a paid plan" " to join"))
+                detail=entitlement_refusal_payload(
+                    with_limit_contact("You already have a free team — this team requires a paid plan" " to join"),
+                    feature="team_join"))
 
     # #1965: same per-org lock + capacity pre-check as the TOKEN accept
     # branch — the max_users pre-check runs INSIDE the lock BEFORE the
@@ -20823,7 +20850,9 @@ async def _registry_accept_by_id(sdk, invitation_id: str, user: dict) -> dict:
             if _cap_active >= int(_cap_max):
                 raise HTTPException(
                     status_code=402,
-                    detail=with_limit_contact("Member limit reached — upgrade to invite more"))
+                    detail=member_limit_refusal_payload(
+                        with_limit_contact("Member limit reached — upgrade to invite more"),
+                        used=_cap_active, limit=int(_cap_max)))
         # Single-use: CONDITIONAL claim — the SET's own matched-row count is
         # authoritative (P2-1 cross-lane half, by-id twin): a concurrent v2
         # OTP-mismatch winner on the SAME invitation row (or a same-user
@@ -20875,7 +20904,7 @@ async def accept_invite_by_id(invitation_id: str,
                         user.get("email")),
                     op="invitation_accept_by_id")
         except InvitationError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))  # noqa: B904
+            raise HTTPException(status_code=e.status, detail=e.http_detail())  # noqa: B904
         # #2003 (W7): arm the invitee's member slot (fail-soft).
         _arm_invitee_member_progress(res.get("org_id") or "",
                                       user["user_id"])
@@ -20907,7 +20936,7 @@ async def decline_invite(invitation_id: str,
                     get_control_plane(), invitation_id, email),
                 op="decline_invitation_by_email")
         except InvitationError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))  # noqa: B904
+            raise HTTPException(status_code=e.status, detail=e.http_detail())  # noqa: B904
     sdk = _make_sdk(namespace="registry")
     reg = sdk._get_registry()
     rows = reg.query(
@@ -20971,7 +21000,7 @@ async def rescind_invite(invitation_id: str, org_id: str,
                     get_control_plane(), invitation_id, org_id, user["user_id"]),
                 op="invitation_rescind")
         except InvitationError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))  # noqa: B904
+            raise HTTPException(status_code=e.status, detail=e.http_detail())  # noqa: B904
         except HTTPException:
             raise
         except Exception:
@@ -32175,7 +32204,12 @@ def _require_backup_tier(org: dict) -> None:
     if not hourly_backups_enabled(tier):
         raise HTTPException(
             status_code=402,
-            detail=with_limit_contact("Backups are a Builder feature — upgrade to enable hourly backups"),
+            # #5208: the entitlement refusal is a machine-readable CATEGORY, not
+            # prose. `feature` is the pricing.json key the gate itself reads,
+            # so a caller can map the refusal back to the canonical flag.
+            detail=entitlement_refusal_payload(
+                with_limit_contact("Backups are a Builder feature — upgrade to enable hourly backups"),
+                feature="hourly_backups"),
         )
 
 

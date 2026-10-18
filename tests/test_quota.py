@@ -10,10 +10,13 @@ import pytest
 from tortoise.quota import (
     LIMIT_CONTACT,  #5425 shared contact path
     QUOTA_REFUSAL_CODE,
+    TIER_REQUIRED_CODE,
     QuotaCheckError,
     QuotaExceededError,
     count_org_usage,
     enforce_org_limit,
+    entitlement_refusal_payload,
+    member_limit_refusal_payload,
     quota_refusal_payload,
     resolve_org_limits,
 )
@@ -1216,4 +1219,106 @@ class TestStructuredRefusal:
             "limit": 1,
             "message": "Team points limit reached (1). Upgrade your plan "
                        "to increase it.",
+        }
+
+
+class TestNonQuota402Categories:
+    """#5208 — the non-`quota_exceeded` 402 doors are distinguishable too.
+
+    #4614 gave a QUOTA refusal a category. The remaining doors answered with
+    bare prose, so a caller branching on ``detail.code`` could not tell a
+    MEMBER CAP (a real quota — relief: free a seat or upgrade) from a TIER
+    ENTITLEMENT (relief: upgrade), and those have opposite remedies — which
+    made the missing code the mechanism that decided what the UI offered.
+    """
+
+    def test_a_seat_cap_is_the_users_quota_resource(self):
+        """The member cap answers with #4614's payload, on `users`.
+
+        It is NOT given a second, entitlement-shaped code: ``_RESOURCE_LIMIT_KEYS``
+        has mapped ``"users" -> "max_users"`` since #329, and the invite lanes
+        only hand-counted because they count PENDING invitations as occupied
+        seats (#1875 cycle-2 P2), which the shared gate does not. Same
+        category, one contract.
+        """
+        payload = member_limit_refusal_payload(
+            "Member limit reached — upgrade to invite more.",
+            used=3, limit=2)
+        assert payload["code"] == QUOTA_REFUSAL_CODE == "quota_exceeded"
+        assert payload["code"] != TIER_REQUIRED_CODE
+        assert payload["resource"] == "users"
+        assert payload["used"] == 3 and payload["limit"] == 2
+        assert payload["message"] == (
+            "Member limit reached — upgrade to invite more.")
+
+    def test_an_entitlement_refusal_has_its_own_category_and_a_feature(self):
+        """ONE code for the whole entitlement class, plus WHICH feature.
+
+        The code is the value a caller branches on to pick a remedy, and every
+        entitlement refusal shares ONE remedy (upgrade) — so a per-feature code
+        would force a caller to enumerate the features to learn "this needs an
+        upgrade", which is prose-matching one layer up. `feature` answers the
+        which-feature question, exactly as `resource` does for a quota.
+        """
+        payload = entitlement_refusal_payload(
+            "Invites require the Builder or Team tier — upgrade to invite "
+            "members.",
+            feature="invites")
+        assert payload["code"] == TIER_REQUIRED_CODE == "tier_required"
+        assert payload["code"] != QUOTA_REFUSAL_CODE
+        assert payload["feature"] == "invites"
+        # A quota field must never leak into an entitlement payload (and vice
+        # versa): emitting a fabricated `limit` here would invite a caller to
+        # read a plan gate as an exhausted allowance.
+        assert "resource" not in payload and "limit" not in payload
+        assert "used" not in payload
+
+    def test_the_two_categories_cannot_be_confused_either_way(self):
+        """The guard the issue exists for: an upgrade-only refusal and a
+        seat-cap refusal must never share a `code`, in EITHER direction."""
+        seat = member_limit_refusal_payload("Member limit reached.", used=2,
+                                            limit=2)
+        tier = entitlement_refusal_payload("Backups are a Builder feature.",
+                                           feature="hourly_backups")
+        assert seat["code"] != tier["code"]
+        assert set(seat) - {"message"} != set(tier) - {"message"}
+
+    def test_an_entitlement_payload_omits_a_feature_it_was_not_given(self):
+        """Absent beats fabricated — the same rule as `used`/`limit`.
+
+        No ``required_tier`` field is emitted either: the invites gate admits
+        EITHER of two paid tiers, and ``hourly_backups`` is ``false`` or the
+        string ``"planned"`` for every tier today, so a single required tier
+        would be a made-up value.
+        """
+        payload = entitlement_refusal_payload("Team join requires a paid plan.")
+        assert payload == {
+            "code": TIER_REQUIRED_CODE,
+            "message": "Team join requires a paid plan.",
+        }
+        assert "required_tier" not in payload
+
+    def test_the_entitlement_payload_stringifies_to_the_message(self):
+        """The same `str(detail)` contract as #4614's payload.
+
+        `InvitationError` carries this payload as its MESSAGE (a dict subclass
+        whose `__str__` is the sentence), so every pre-#5208 `detail=str(e)`
+        reader and the MCP twin keep printing prose — while `json.dumps` (and
+        therefore FastAPI) still emits the object.
+        """
+        import json
+
+        payload = entitlement_refusal_payload(
+            "Backups are a Builder feature — upgrade to enable hourly "
+            "backups.",
+            feature="hourly_backups")
+        assert isinstance(payload, dict)
+        assert str(payload) == (
+            "Backups are a Builder feature — upgrade to enable hourly "
+            "backups.")
+        assert json.loads(json.dumps(payload)) == {
+            "code": TIER_REQUIRED_CODE,
+            "message": "Backups are a Builder feature — upgrade to enable "
+                       "hourly backups.",
+            "feature": "hourly_backups",
         }

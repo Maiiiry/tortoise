@@ -189,6 +189,26 @@ _RESOURCE_LIMIT_KEYS = {
 QUOTA_REFUSAL_CODE = "quota_exceeded"
 
 
+# #5208: the machine-readable CATEGORY of a TIER/ENTITLEMENT refusal — the
+# sibling of ``QUOTA_REFUSAL_CODE`` for the 402 doors whose remedy is an
+# UPGRADE rather than "free a resource". The two must never collapse into one
+# code: a caller that reads an entitlement refusal as a quota would offer
+# "remove a member" for a plan the org was never on, and vice versa.
+#
+# ONE code for the whole entitlement class, deliberately — NOT one per gated
+# feature. The code is the value a caller branches on to pick a REMEDY, and
+# every entitlement refusal shares ONE remedy (upgrade to a paid tier). A
+# per-feature code (`invites_tier_required`, `backups_tier_required`, …) would
+# force a caller to enumerate the feature list to learn "this needs an
+# upgrade" — the same prose-matching problem one layer up, now on codes. The
+# WHICH-feature question is answered by the payload's ``feature`` field, the
+# exact analogue of ``quota_exceeded``'s ``resource``. (Convergent with the
+# external field, which reports mature APIs reuse one broad entitlement code
+# plus a discriminator — Stripe's ``capability_not_active`` +
+# ``capabilities[]``, Azure's ``SkuNotAvailable`` + the target SKU.)
+TIER_REQUIRED_CODE = "tier_required"
+
+
 #: #5425 owner ruling (2026-10-08): "we should just have rate-limits and if they
 #: want more they need to speak with us". The route for a customer at a ceiling
 #: is a CONVERSATION, so every refusal that tells them about a limit must also
@@ -307,6 +327,61 @@ def quota_refusal_payload(exc: QuotaExceededError) -> dict:
         value = getattr(exc, key, None)
         if value is not None:
             payload[key] = value
+    return payload
+
+
+def member_limit_refusal_payload(message: str, *, used: int,
+                                limit: int) -> dict:
+    """The structured 402 ``detail`` for a seat/member-cap refusal (#5208).
+
+    A member cap IS a quota on the ``users`` resource — the resource
+    ``_RESOURCE_LIMIT_KEYS`` has mapped to ``max_users`` since #329, and the
+    reason ``_check_org_limit(org, "users")`` exists at all. The invite lanes
+    could not route through that gate (they count PENDING invitations as
+    occupied seats, which the shared gate does not — #1875 cycle-2 P2), so
+    they hand-counted and emitted bare prose instead. This builder restores the
+    SAME category those lanes would have got from the shared gate, so a caller
+    sees ONE ``quota_exceeded`` contract with ``resource == "users"`` whether
+    the seat refusal came from the gate or from an invite lane.
+
+    Modelled as a quota, NOT as a tier entitlement, and that is a recorded
+    decision rather than a preference: #5208 names a member cap "a real quota"
+    whose relief includes removing a member, and #4614's scoping doc pins the
+    same split. External guidance that a seat cap is an entitlement therefore
+    contradicts a decision and is not adoptable here — reopen the decision if
+    the classification itself is wrong, never quietly re-code this door.
+    """
+    return quota_refusal_payload(
+        QuotaExceededError(message, resource="users", used=used, limit=limit))
+
+
+def entitlement_refusal_payload(message: str, *, feature: str | None = None) -> dict:
+    """The structured 402 ``detail`` for a TIER/ENTITLEMENT refusal (#5208).
+
+    The surviving half of the class #4614 opened: on those doors the refusal
+    exists only as prose, so a caller branching on ``detail.code`` could not
+    tell a tier entitlement (relief = upgrade) from a quota (relief = free a
+    resource) — and the two call for OPPOSITE remedies, which makes the
+    missing code the mechanism that decides what the UI offers.
+
+    ``feature`` names WHICH entitlement was missing, in the pricing/domain
+    vocabulary of the door that refused (``"invites"`` and
+    ``"hourly_backups"`` are literally ``product/pricing.json`` feature keys).
+    It is optional and omitted rather than guessed.
+
+    NO ``required_tier`` field is emitted: the raise sites cannot supply one
+    honestly. The invites gate admits EITHER of two paid tiers
+    (``tier in ("free", "solo")`` → pro or team), and ``hourly_backups`` is
+    ``false`` or the string ``"planned"`` for EVERY tier today, so a single
+    required tier would be a fabricated value — the same rule as
+    ``quota_refusal_payload``'s absent ``used``/``limit``.
+    """
+    payload: dict = RefusalPayload({
+        "code": TIER_REQUIRED_CODE,
+        "message": message,
+    })
+    if feature:
+        payload["feature"] = feature
     return payload
 
 

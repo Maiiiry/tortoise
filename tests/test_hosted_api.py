@@ -4578,8 +4578,18 @@ class TestBackupEndpoints:
         """Free tier cannot create/restore backups (402 upgrade prompt)."""
         r = client.post("/backups")
         assert r.status_code == 402
+        # #5208: the backups entitlement refusal is machine-readable, and its
+        # discriminator is the pricing.json key the gate itself reads — so a
+        # caller can map the refusal back to the canonical flag.
+        _d = r.json()["detail"]
+        assert _d["code"] == "tier_required", _d
+        assert _d["code"] != "quota_exceeded", _d
+        assert _d["feature"] == "hourly_backups", _d
+        assert "Builder feature" in _d["message"], _d
         r = client.post("/backups/restore", json={"backup_key": "x", "confirm": True})
         assert r.status_code == 402
+        # the restore door is the SAME entitlement — one shape, not two.
+        assert r.json()["detail"]["code"] == "tier_required"
 
     def test_backup_solo_tier_402(self, client):
         """Solo tier cannot create backups (hourly_backups:false in pricing.json).
@@ -7045,7 +7055,17 @@ class TestProvisioningService:
             r = tc.post(f"/v1/organizations/{tid}/graphs", json={"name": "x"},
                         headers={"Authorization": f"Bearer {key['api_key']}"})
             assert r.status_code == 402, r.text
-            assert "Upgrade" in r.json()["detail"]
+            # #5208: the entitlement refusal is a machine-readable CATEGORY —
+            # `tier_required` for the whole class plus WHICH entitlement was
+            # missing. The detail used to be prose only, so a caller could not
+            # tell this from a quota refusal, and those call for opposite
+            # remedies (upgrade vs free a resource). The prose survives as
+            # `message`.
+            _d = r.json()["detail"]
+            assert _d["code"] == "tier_required", _d
+            assert _d["code"] != "quota_exceeded", _d
+            assert _d["feature"] == "custom_graphs", _d
+            assert "Upgrade" in _d["message"], _d
             assert r.headers.get("X-Upgrade-CTA") == "pro"
         finally:
             gen.close()

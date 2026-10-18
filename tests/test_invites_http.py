@@ -53,6 +53,49 @@ _U_CAROL = "9f2c1a40-0000-4a00-8000-000000000010"
 _U_GHOST = "9f2c1a40-0000-4a00-8000-0000000000ab"
 
 
+# ── #5208: the non-`quota_exceeded` 402 refusal payloads ─────────────────────
+#
+# Both invite 402s used to answer with a bare prose string, so a caller
+# branching on `detail.code` could not tell a MEMBER CAP (a real quota — relief:
+# free a seat or upgrade) from the TIER ENTITLEMENT gate (relief: upgrade), and
+# those call for opposite remedies. These helpers assert the category AND keep
+# the prose assertion, which now reads the payload's own `message`.
+
+
+def _refusal_detail(detail):
+    """The STRUCTURED 402 `detail` of a refusal (#5208)."""
+    assert isinstance(detail, dict), (
+        f"402 detail is not a structured payload: {detail!r} — a prose-only "
+        "refusal forces every caller onto matching the message text")
+    return detail
+
+
+def _refusal(r):
+    return _refusal_detail(r.json()["detail"])
+
+
+def _users_quota_refusal(r, *, used, limit):
+    """A seat-cap refusal is the `users` QUOTA resource (#5208)."""
+    detail = _refusal(r)
+    assert detail["code"] == "quota_exceeded", detail
+    assert detail["resource"] == "users", detail
+    assert detail["used"] == used, detail
+    assert detail["limit"] == limit, detail
+    # Every refusal that names a ceiling also names the human path (#5425).
+    assert "support@premiselabs.co" in detail["message"], detail
+    return detail["message"]
+
+
+def _tier_refusal(r, *, feature):
+    """An entitlement refusal has its OWN category — never the quota one."""
+    detail = _refusal(r)
+    assert detail["code"] == "tier_required", detail
+    assert detail["code"] != "quota_exceeded", detail
+    assert detail["feature"] == feature, detail
+    assert "support@premiselabs.co" in detail["message"], detail
+    return detail["message"]
+
+
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
@@ -173,7 +216,7 @@ class TestInviteCreate:
         r = client.post("/v1/invites",
                         json={"org_id": "team-free", "email": "bob@example.com"})
         assert r.status_code == 402
-        assert "Builder or Team tier" in r.json()["detail"]
+        assert "Builder or Team tier" in _tier_refusal(r, feature="invites")
 
     def test_solo_tier_402(self, client, reg):
         """#1875: Solo (1 user) is also upgrade-gated."""
@@ -181,7 +224,7 @@ class TestInviteCreate:
         r = client.post("/v1/invites",
                         json={"org_id": "team-solo", "email": "bob@example.com"})
         assert r.status_code == 402
-        assert "Builder or Team tier" in r.json()["detail"]
+        assert "Builder or Team tier" in _tier_refusal(r, feature="invites")
 
     def test_pro_tier_one_invite_allowed_then_capacity(self, client, reg):
         """#1875: Pro (max 2 users) — the owner + 1 invite fit; a second
@@ -193,7 +236,9 @@ class TestInviteCreate:
         r2 = client.post("/v1/invites",
                          json={"org_id": "team-pro", "email": "carol@example.com"})
         assert r2.status_code == 402
-        assert "member limit" in r2.json()["detail"].lower()
+        # #5208: owner(1) + the one pending invite = 2 of the Pro cap of 2.
+        assert "member limit" in _users_quota_refusal(
+            r2, used=2, limit=2).lower()
 
     def test_pro_capacity_consumed_invite_frees_seat(self, client, reg):
         """#1875 regression: capacity counts PENDING invitations — an
@@ -251,7 +296,13 @@ class TestInviteCreate:
         codes = sorted(r.status_code for r in results)
         assert codes == [200, 402, 402], [r.text for r in results]
         body = next(r for r in results if r.status_code == 402).json()
-        assert "member limit" in body["detail"].lower()
+        # #5208: the losing racer's `used` depends on how many of the burst it
+        # observed, so pin the CATEGORY and the cap, not the count.
+        loser = _refusal_detail(body["detail"])
+        assert loser["code"] == "quota_exceeded"
+        assert loser["resource"] == "users"
+        assert loser["limit"] == 2 and loser["used"] >= 2
+        assert "member limit" in loser["message"].lower()
         # exactly one Invitation node was minted — pending + active == 2
         # (owner + 1 invite), never 3.
         rows = reg.query(
@@ -1055,7 +1106,7 @@ class TestPendingInvites:
         _as_user(_U_BOB, "bob@example.com")
         r2 = client.post("/v1/invites/accept", json={"token": token})
         assert r2.status_code == 402
-        assert "free team" in r2.json()["detail"]
+        assert "free team" in _tier_refusal(r2, feature="team_join")
 
     def test_decline_idempotent(self, client, reg):
         inv = self._invite(client, reg, org_id="team-t", email="bob@example.com")
@@ -1084,7 +1135,7 @@ class TestAcceptFreeCap:
         _as_user(_U_BOB, "bob@example.com")
         r = client.post(f"/v1/invites/pending/{iid}/accept")
         assert r.status_code == 402
-        assert "free team" in r.json()["detail"]
+        assert "free team" in _tier_refusal(r, feature="team_join")
 
     def test_free_capped_invitee_paid_team_ok(self, client, reg):
         """#1875/#1877: joining a SUBSCRIBED team is always allowed."""

@@ -1586,9 +1586,26 @@ class InvitationError(Exception):
     → 500) is untouched.
     """
 
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str | dict, status: int = 400):
         super().__init__(message)
         self.status = status
+        # #5208: a machine-readable ceiling (the quota / tier refusal payload)
+        # rides `detail`, so the ONE place that turns this into an HTTP body
+        # can answer with the structured object instead of prose. It is set
+        # from the message when the raise site passed a payload — the payload
+        # is a `RefusalPayload`, whose ``__str__`` is the human sentence, so
+        # ``str(self)`` and every pre-#5208 ``detail=str(e)`` reader is
+        # unaffected.
+        self.detail = message if isinstance(message, dict) else None
+
+    def http_detail(self) -> dict | str:
+        """The ``detail`` an HTTP layer should answer with.
+
+        #5208: the structured refusal payload for a machine-readable ceiling,
+        else the human message. One method, so the seven `except
+        InvitationError` seams in ``hosted_api`` cannot drift into two shapes.
+        """
+        return self.detail if self.detail is not None else str(self)
 
 
 def invitation_mint(cp, org_id: str, email: str, role: str,
@@ -1793,11 +1810,16 @@ def invitation_accept(cp, token: str, user_id: str,
     # org via the email link. Non-consuming (before the single-use PATCH).
     if org.get("subscription_status") not in _BILLING_ACTIVE_STATUSES \
             and count_active_free_memberships(cp, user_id) >= 1:
-        from tortoise.quota import with_limit_contact
+        from tortoise.quota import entitlement_refusal_payload, with_limit_contact
+        # #5208: the entitlement refusal is a machine-readable CATEGORY
+        # (`tier_required` + `feature`), never prose-only — a caller could not
+        # tell it from a QUOTA refusal, and the two have opposite remedies.
         raise InvitationError(
-            with_limit_contact(
-                "You already have a free team — this team "
-                "requires a paid plan to join"),
+            entitlement_refusal_payload(
+                with_limit_contact(
+                    "You already have a free team — this team "
+                    "requires a paid plan to join"),
+                feature="team_join"),
             status=402)
     from tortoise.pricing import tier_limits
     tier = org.get("tier") or "free"
@@ -1813,9 +1835,16 @@ def invitation_accept(cp, token: str, user_id: str,
                      ("status", "eq", "active")],
         )
         if len(member_count) >= int(max_users):
-            from tortoise.quota import with_limit_contact
+            from tortoise.quota import member_limit_refusal_payload, with_limit_contact
+            # #5208: a seat cap is the `users` QUOTA resource (the key
+            # `_RESOURCE_LIMIT_KEYS` maps to `max_users`), so it answers with
+            # the #4614 quota payload rather than a second, incompatible
+            # category.
             raise InvitationError(
-                with_limit_contact("Member limit reached"), status=402)
+                member_limit_refusal_payload(
+                    with_limit_contact("Member limit reached"),
+                    used=len(member_count), limit=int(max_users)),
+                status=402)
 
     # Single-use: conditional PATCH (status='pending' filter) then verify.
     accept_body: dict = {"status": "accepted", "accepted_at": now.isoformat()}
@@ -4828,9 +4857,13 @@ def invitation_accept_by_id(cp, invitation_id: str, user_id: str,
                      ("status", "eq", "active")],
         )
         if len(member_count) >= int(max_users):
-            from tortoise.quota import with_limit_contact
+            from tortoise.quota import member_limit_refusal_payload, with_limit_contact
+            # #5208: same `users`-quota category as the token lane above.
             raise InvitationError(
-                with_limit_contact("Member limit reached"), status=402)
+                member_limit_refusal_payload(
+                    with_limit_contact("Member limit reached"),
+                    used=len(member_count), limit=int(max_users)),
+                status=402)
 
     # #1877 free-org entitlement (join side): the target org has no
     # active paid subscription AND the invitee already holds a free org →
@@ -4838,11 +4871,15 @@ def invitation_accept_by_id(cp, invitation_id: str, user_id: str,
     from tortoise.supabase_control import _BILLING_ACTIVE_STATUSES
     if org.get("subscription_status") not in _BILLING_ACTIVE_STATUSES \
             and count_active_free_memberships(cp, user_id) >= 1:
-        from tortoise.quota import with_limit_contact
+        from tortoise.quota import entitlement_refusal_payload, with_limit_contact
+        # #5208: the entitlement refusal is a machine-readable CATEGORY
+        # (`tier_required` + `feature`) — same contract as the token lane.
         raise InvitationError(
-            with_limit_contact(
-                "You already have a free team — this team "
-                "requires a paid plan to join"),
+            entitlement_refusal_payload(
+                with_limit_contact(
+                    "You already have a free team — this team "
+                    "requires a paid plan to join"),
+                feature="team_join"),
             status=402)
 
     # Single-use: conditional PATCH (status='pending' filter) — the PATCH's
