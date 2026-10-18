@@ -11,7 +11,7 @@ aboutObjects: tortoise
 
 # Capstone verification report — epic #1976 (agent-driven onboarding)
 
-**Status: PASS for the epic's own surfaces, with every *capstone* indicator graded partial rather than rounded up, the proud-test story review graded partial, and six findings (D1 a load-bound endpoint, filed as #9001, D2 a flake, D3 a proven environment artifact, D4 five e2e modules, 39 of whose 40 failures are outside the epic's 17 surfaces (the 40th is surface 12's hosted-e2e leg) with three different causes — 3 CI-stale, 1 CI-wired/un-derived, 1 unrenderable from this Pages root — D5 an observation, D6 a filed coverage gap #8998)** · **Commit verified on:** `180fe6fd3` (batches A and B ran at the anchor `fbc1d96d5` — see lane conditions) · **Date:** 2026-10-18 · **Capstone:** #2008 · **Epic:** #1976 · **Surface map:** #1992
+**Status: NOT VERIFIED AS A WHOLE — 15 of the 17 surfaces are green, 2 are not (7 and 12), and 6 carry an assigned leg not fully passed or executed; with every *capstone* indicator graded partial rather than rounded up, the proud-test story review graded partial, and six findings (D1 a load-bound endpoint, filed as #9001, D2 a flake, D3 a proven environment artifact, D4 five e2e modules, 39 of whose 40 failures are outside the epic's 17 surfaces (the 40th is surface 12's hosted-e2e leg) with three different causes — 3 CI-stale, 1 CI-wired/un-derived, 1 unrenderable from this Pages root — D5 an observation, D6 a filed coverage gap #8998)** · **Commit verified on:** `180fe6fd3` (batches A and B ran at the anchor `fbc1d96d5` — see lane conditions) · **Date:** 2026-10-18 · **Capstone:** #2008 · **Epic:** #1976 · **Surface map:** #1992
 
 **Mode:** docker lane on a throwaway private FalkorDB (`tools/test_lane.py`, #5084) per batch, plus a **real browser walk** of the dashboard (Playwright/chromium against a local Pages preview built from the same commit, with the bound D1 database). No mocks were substituted for the layer under test: the integration layer talks to a real graph, and the browser layer runs the shipped wizard in a real Chromium against the shipped `dist`.
 
@@ -101,7 +101,7 @@ weakest evidence: an anchor commit, in a shared hub tree whose state at measurem
 | 9 Overview calm | hosted-e2e + ux-verification | `website/apps/dashboard/src/overviewSettings.test.js` (8/8) + screenshot | ✅ PASS |
 | 10 Settings tab (owner) | hosted-e2e + integration | `website/apps/dashboard/src/overviewSettings.test.js` (the Settings nav button and its handler; the SettingsTab's four homes) + `test_onboarding_w4_settings.py` (server leg) + screenshot | ✅ PASS — Settings is the **6th of 6 rendered nav buttons** (`main.jsx:9602-9613`: Overview · API Keys · Graphs · Members · Billing · Settings); the routable-tab list `KNOWN_TABS` has **7** entries because `profile` is a tab (`main.jsx:1045`) reached from the account menu (`:9785`) and by deep link, **not** from the nav row. The source comment's "7th tab (R2-11)" is a design ordinal, not the rendered count |
 | 11 Capture disclosure | Integration + hosted-e2e | `test_onboarding_w6_capture_disclosure.py`, `test_capture_disclosure_template.py` | ⚠️ 1 flake, passes alone (D2) |
-| 12 Invite-accept fusion | Integration + contract + **hosted-e2e** | `test_invite_fusion_http.py`, `test_invites_http.py`, `test_invites_email_http.py`; hosted leg = `test_dashboard_identity.py::test_pending_invites_accept_lands_on_team` | ✅ integration + contract green (batch C, 123 tests; that batch also covers surface 13 and the dist guard) · ⚠️ **hosted-e2e leg exists and FAILS**: `1 failed in 59.97 s`, blocked on `/auth` navigation (D4's mechanism) |
+| 12 Invite-accept fusion | Integration + contract + **hosted-e2e** | `test_invite_fusion_http.py`, `test_invites_http.py`, `test_invites_email_http.py`; hosted leg = `test_dashboard_identity.py::test_pending_invites_accept_lands_on_team` | ✅ integration + contract green (batch C, 123 tests; that batch also covers surface 13) · ⚠️ **hosted-e2e leg exists and FAILS**: `1 failed in 59.97 s`, blocked on `/auth` navigation (D4's mechanism) |
 | 13 Builder catalog | Unit + integration + contract | `test_capabilities_endpoint.py`, `test_capability_catalog.py` | ✅ PASS |
 | 14 Onboarding telemetry | Integration + regression | `test_onboarding_telemetry_w11.py` | ✅ PASS |
 | 15 Self-hosted onboarding | Integration + **manual** | `test_onboarding_selfhost_w12.py` | ✅ integration PASS · ⚠️ **manual leg not executed** (a real self-hosted install was not driven by hand this run) |
@@ -115,7 +115,7 @@ A  200 passed, 1 failed   state ×6 + seed ×2                      (D1)
 B  121 passed, 2 failed   w4_settings, variants, w6_capture,
                           capture_disclosure_template, w11,
                           selfhost_w12                            (D2, D3)
-C  123 passed             invites ×3, capabilities, catalog, dist-guard
+C  123 passed             invites ×3, capabilities, catalog
 D  170 passed             entitlements, decide, installer ×2, served skills ×2
 E   40 passed             dashboard onboarding e2e (browser)
 F   22 passed, 40 failed, 1 skipped   welcome / ship-test / gate / identity / login  (D4)
@@ -318,7 +318,7 @@ proud test is therefore **not claimed as passed**, which is why this report does
 
 ## Verdict
 
-**PASS for the epic's own surfaces, with the coverage stated exactly.** 17 of 17 surfaces were exercised at their
+**NOT VERIFIED AS A WHOLE, with the coverage stated exactly.** 17 of 17 surfaces were exercised at their
 assigned **automated** layer and **15 are green**; the two that are not are **surface 7**, the seed endpoint, which has never
 passed under load (D1), and **surface 12**, whose hosted-e2e leg was attempted and fails for D4's reason — recorded as a
 failing leg, not as a claim that the surface is defective. **Six** surfaces have an assigned leg this run did not fully pass or execute — surface 7's **hosted-e2e** leg (never run), surface 12's **hosted-e2e** leg (not green — see above), surface 8's **walk-through** (not run), and the **manual** legs of 5 and 15 (not executed) and 16 (partly covered) — and
