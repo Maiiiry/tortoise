@@ -129,6 +129,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # while `_LOCK_PATH` stays in the sweep domain (the private root).
 # The scan guard is installed unconditionally: any test that discovers files by
 # walking the shared temp dir fails loudly, naming itself.
+# #8746: the graph-delete refusal/failure record. Imported under a private alias
+# so the call site in `_redislite_hygiene` reads as the sibling of
+# `write_tolerated_cleanup_report` while staying off the module's public names.
+from tests._live_utils import graph_delete_events as _graph_delete_events  # noqa: E402
 from tests._tmpdir_hygiene import (  # noqa: E402
     install_scan_guard,
     install_session_tmpdir,
@@ -1056,7 +1060,17 @@ def _redislite_hygiene(_reclaim_session_tmpdirs):
     # flags), so the tolerated ENOTEMPTY leaks are mirrored to their own
     # artifact, which the workflow dumps. Best-effort; writes nothing when no
     # leak was tolerated.
-    write_tolerated_cleanup_report()
+    #
+    # #8746 review r2/r3 P3: `drop_test_graph`'s tolerated refusals/failures have
+    # the SAME capture problem (a passing test's teardown warning is discarded),
+    # so they ride THIS artifact as an extra section — the one file the
+    # suite-session jobs already dump. Written HERE, not in
+    # `_server_graph_hygiene`, because that fixture is URI-gated while
+    # `live_proj` skips on a TCP probe and also runs URI-less: this finalizer is
+    # the lane-INDEPENDENT one and tears down AFTER the server sweep (reverse
+    # setup order), so it sees every event either way.
+    write_tolerated_cleanup_report(
+        extra={"drop_test_graph_events": _graph_delete_events()})
 
 
 # ── Epic #1647 Task 2 Step 7 (P2-14/P0-3/P1-8/P1-9/P2-3/P2-4) ─────────────
@@ -1208,18 +1222,6 @@ def _server_graph_hygiene(_redislite_hygiene):
             os.remove(marker_path)
         except OSError:
             pass
-    # #8746 review round 2 (P3): `drop_test_graph` is log-and-continue by policy,
-    # and the log record of a PASSING test's teardown is DISCARDED by pytest
-    # capture (#1103 / #7735). Mirror its tolerated refusals/failures to their
-    # own artifact for the same reason the tolerated tempdir leaks get one —
-    # otherwise a systematic refusal silently restores the per-run graph leak
-    # #8746 removes. Best-effort and silent when nothing was tolerated.
-    try:
-        from tests._live_utils import write_graph_delete_report
-
-        write_graph_delete_report()
-    except Exception:  # hygiene reporting never fails the suite
-        pass
     # E2E-7 bound (cycle-8 P2-11): while last suite standing, post-sweep
     # GRAPH.LIST must be < journal_size + constant — the sweep's GRAPH.DELETE
     # leaves only pre-existing/foreign graphs. SOFTENED from a hard assert

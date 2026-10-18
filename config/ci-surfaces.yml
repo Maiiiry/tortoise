@@ -1492,6 +1492,10 @@ surfaces:
   # mechanism (its excludes-list is stated in `cypher_guard._guard_numeric_params`).
   # Pure-unit guard: needs no DB or network, exactly like the file above it.
   - test_7174_param_boundary_numeric_guard.py
+  # #8746: the graph-delete refusal artifact — the writer's contract plus the
+  # pin that every suite-session job DUMPS it. Hermetic (YAML read + a fake
+  # projection), exactly like the file below it.
+  - test_graph_delete_hygiene_report.py
   - test_graph_name_ownership.py
   # #5331: the graph byte meter (tortoise/graph_storage.py + the metering/
   # supabase graph-storage lane). Dual-registered with `api`: a change to the new
@@ -5747,6 +5751,16 @@ durations:
   test_egress_bytes.py: 1.1
   test_entry_point_python_guard.py: 4.6
   test_extractor_embed_coerce_5060.py: 0.6
+  # #8746: 4 tests, local wall 1.8 s (measured at the #8746 review head,
+  # 2026-10-18). A NEW file has no CI junit measurement (a file that never ran
+  # cannot appear in an artifact), so this is the pre-merge estimate; refresh it
+  # from the first post-merge run that includes the file. Hermetic — the YAML pin
+  # reads two workflows, the writer tests use tmp_path — so it does not move with
+  # box load. Both halves are load-bearing: the surface entry alone leaves
+  # durations coverage under the floor and `tools/ci_selection.py --integrity`
+  # reds (#4348 trap), and a durations entry with no surface registration leaves
+  # the file unclassified.
+  test_graph_delete_hygiene_report.py: 1.8
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
   # #4492: added by a PR, so no CI reading exists yet (`--refresh-durations`

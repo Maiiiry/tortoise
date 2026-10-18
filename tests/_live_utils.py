@@ -8,10 +8,8 @@ test_event_store.py and test_embedded_concurrency.py.
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import os
-import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -254,9 +252,15 @@ def mask_embedder():
 # DISCARDED by pytest capture (#7735 / #1103, measured 0 occurrences under the CI
 # flags), so a systematic refusal would be invisible — and the per-run leak this
 # helper removes would come back unobserved, which is the very defect #8746's own
-# test docstring names. `tests/conftest.py::_server_graph_hygiene` writes this
-# record to `graph-delete-hygiene-end.json` at session end (the #1103/#7735
-# artifact shape, one file over).
+# test docstring names. `tests/conftest.py::_redislite_hygiene` — the
+# lane-INDEPENDENT finalizer, since `_server_graph_hygiene` is URI-gated while
+# `live_proj` skips on a TCP probe and therefore also runs URI-less — hands this
+# record to `tests/_tmpdir_hygiene.py::write_tolerated_cleanup_report` as an
+# EXTRA SECTION, so it rides the `tempdir-hygiene-end.json` artifact that every
+# suite-session job ALREADY dumps (pinned by
+# `tests/test_tmpdir_hygiene.py::test_suite_jobs_surface_the_tolerated_leak`).
+# A second artifact file nothing reads is not an observability channel, and
+# adding a dump step is a workflow change (#8746 review r3 P2).
 GRAPH_DELETE_EVENTS: list[dict[str, object]] = []
 
 
@@ -275,44 +279,6 @@ def _restore_graph_delete_events(snapshot: list[dict[str, object]]) -> None:
 def _record_delete_event(name: object, event: str, reason: str) -> None:
     GRAPH_DELETE_EVENTS.append({"name": str(name), "event": event,
                                 "reason": reason})
-
-
-def write_graph_delete_report(log_dir: str | None = None) -> str | None:
-    """Mirror the tolerated ``drop_test_graph`` events to a JSON artifact.
-
-    Same reasoning and shape as ``tests/_tmpdir_hygiene.py``'s
-    ``write_tolerated_cleanup_report`` (#1103 / #7735): a passing test's log
-    record is discarded by pytest capture, so a tolerated teardown failure is
-    only OBSERVABLE if it reaches a file the workflow dumps.
-
-    Best-effort — writing never fails the suite. Written ONLY when at least one
-    event was tolerated, so a clean session writes nothing (and a second session
-    in the same directory cannot blank a peer's record). The write MERGES with
-    whatever is already there, keyed by name, rather than truncating.
-    """
-    if not GRAPH_DELETE_EVENTS:
-        return None
-    try:
-        if log_dir is None:
-            log_dir = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
-        log_path = os.path.join(log_dir, "graph-delete-hygiene-end.json")
-        by_name: dict[str, dict[str, object]] = {}
-        try:
-            with open(log_path) as fh:
-                prior = json.load(fh)
-            for entry in prior.get("drop_test_graph_events", []):
-                if isinstance(entry, dict) and "name" in entry:
-                    by_name[str(entry["name"])] = entry
-        except (OSError, ValueError, AttributeError, TypeError):
-            pass
-        for entry in GRAPH_DELETE_EVENTS:
-            by_name[str(entry["name"])] = dict(entry)
-        with open(log_path, "w") as fh:
-            json.dump({"drop_test_graph_events": list(by_name.values()),
-                       "count": len(by_name)}, fh, indent=2)
-        return log_path
-    except Exception:  # hygiene reporting never fails the suite
-        return None
 
 
 def drop_test_graph(proj, *, name: str | None = None) -> bool:
@@ -392,9 +358,26 @@ def drop_test_graph(proj, *, name: str | None = None) -> bool:
         _record_delete_event(gname, "refused", reason)
         return False
     try:
-        from tortoise.graph_delete_guard import safe_graph_delete
+        from tortoise.graph_delete_guard import graph_exists, safe_graph_delete
 
-        return bool(safe_graph_delete(proj.db, gname, detach=False, drop=True))
+        if safe_graph_delete(proj.db, gname, detach=False, drop=True):
+            return True
+        # A False return is AMBIGUOUS by the guard's OWN contract — "already
+        # absent" or "a lock refusal, nothing transmitted" — and the caller is
+        # the one that must re-check presence (`tests/_embedded.py`'s
+        # `_drop_one_graph` and `_sweep_proj` are the precedents). Without the
+        # re-check a lock refusal is a SILENT leak, and it is the LIKELIEST
+        # refusal on a shared instance (a peer holds
+        # `tortoise:graph-delete-lock`): one empty graph per run left in
+        # `CACHE_SIZE` until the session sweep, i.e. exactly the #7357 churn
+        # this helper exists to remove. Cost is one GRAPH.LIST on a path that
+        # already did one (#8746 review r3 P3).
+        if graph_exists(proj.db, gname):
+            _record_delete_event(
+                gname, "refused",
+                "the guard refused (cross-process delete lock unavailable) and "
+                "the graph is still present")
+        return False
     except Exception as exc:  # hygiene never fails the suite
         logger.warning(
             "[#8746] GRAPH.DELETE of %r failed (%r) — left for the session "

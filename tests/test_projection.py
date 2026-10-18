@@ -2013,39 +2013,66 @@ def test_drop_test_graph_refuses_the_shared_uri_default_graph(monkeypatch):
         # firing, not the prefix arm refusing the whole family.
         per_run = _FakeProj("tortoise_test_matrix_7f3a")
         assert _live_utils.drop_test_graph(per_run) is False
-        assert per_run.db.calls == [("list_graphs",)], per_run.db.calls
+        assert per_run.db.calls, (
+            "the narrowing control never reached the guard — the refusal above "
+            "cannot be attributed to the default-graph arm")
+        assert ("select_graph", "tortoise_test_matrix_7f3a") not in per_run.db.calls
     finally:
         _live_utils._restore_graph_delete_events(snapshot)
 
 
-def test_drop_test_graph_tolerated_failures_reach_the_session_artifact(tmp_path):
-    """#8746 review r2 P3: a tolerated refusal must leave SESSION-END evidence.
+class _LockRefusingConn:
+    """A raw connection whose lock command fails — the guard then REFUSES."""
 
-    `drop_test_graph` is log-and-continue by policy (a teardown must not red a
-    suite), but a PASSING test's `logger.warning` is discarded by pytest capture
-    (#7735 / #1103 — measured 0 occurrences under the CI flags). Relying on the
-    log alone would make a systematic refusal invisible, and the per-run graph
-    leak #8746 removes would return unobserved. So the refusal is accumulated and
-    written to `graph-delete-hygiene-end.json` by
-    `tests/conftest.py::_server_graph_hygiene`.
+    def execute_command(self, *args, **kwargs):
+        raise RuntimeError("lock unavailable (simulated peer hold)")
+
+
+class _PresentDb:
+    """The graph IS present but the cross-process lock cannot be taken."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls: list[tuple] = []
+        self.connection = _LockRefusingConn()
+
+    def list_graphs(self):
+        self.calls.append(("list_graphs",))
+        return [self.name]
+
+    def select_graph(self, name):
+        self.calls.append(("select_graph", name))
+        raise AssertionError(
+            f"deleted {name!r} WITHOUT the cross-process lock (#2961)")
+
+
+def test_drop_test_graph_records_a_guard_refusal_as_a_leak():
+    """#8746 review r3 P3: a LOCK refusal is recorded, not just returned.
+
+    `safe_graph_delete` returns False for two indistinguishable cases — "already
+    absent" and "the lock is unavailable, nothing transmitted" — and its own
+    docstring makes the CALLER re-check presence (`tests/_embedded.py`'s
+    `_drop_one_graph` and `_sweep_proj` do). A lock refusal is the LIKELIEST one
+    on a shared instance (a peer holds `tortoise:graph-delete-lock`) and its
+    consequence is one empty graph per run left in `CACHE_SIZE` until the
+    session sweep — the exact #7357 churn this PR removes. Returning False
+    silently would make that invisible, so the helper re-checks presence and
+    records the tolerated leak.
     """
+    name = "test_lock_refused_8746"
     snapshot = _live_utils.graph_delete_events()
     try:
-        probe = "team_review_probe_8746"
-        _live_utils.drop_test_graph(_FakeProj(probe))
-        recorded = [e for e in _live_utils.graph_delete_events()
-                    if e["name"] == probe]
-        assert recorded and recorded[-1]["event"] == "refused", recorded
-        path = _live_utils.write_graph_delete_report(log_dir=str(tmp_path))
-        assert path is not None, "no artifact written for a tolerated refusal"
-        with open(path) as fh:
-            written = json.load(fh)
-        entries = written["drop_test_graph_events"]
-        assert any(e["name"] == probe and e["event"] == "refused"
-                   for e in entries), entries
+        proj = _FakeProj(name)
+        proj.db = _PresentDb(name)
+        assert _live_utils.drop_test_graph(proj) is False
+        # The guard never reached the delete (it refused), and the caller
+        # re-checked presence so the leak is RECORDED rather than silent.
+        assert ("select_graph", name) not in proj.db.calls, proj.db.calls
+        events = [e for e in _live_utils.graph_delete_events()
+                  if e["name"] == name]
+        assert events and events[-1]["event"] == "refused", events
+        assert "lock" in str(events[-1]["reason"]), events
     finally:
-        # The probe must not fork into the real session artifact (the #7735
-        # `_discard_tolerated_leaks` precedent); the tmp file needs no cleanup.
         _live_utils._restore_graph_delete_events(snapshot)
 
 

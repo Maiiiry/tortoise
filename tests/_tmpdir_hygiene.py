@@ -1008,7 +1008,9 @@ def _discard_tolerated_leaks(paths: list[str]) -> None:
         e for e in _TOLERATED_CLEANUP_LEAKS if e["path"] not in drop]
 
 
-def write_tolerated_cleanup_report(log_dir: str | None = None) -> str | None:
+def write_tolerated_cleanup_report(
+        log_dir: str | None = None, *,
+        extra: dict[str, list[dict[str, object]]] | None = None) -> str | None:
     """Mirror the #7735 tolerated-leak record to a JSON artifact (#1103 shape).
 
     WHY A FILE, NOT JUST THE LOG RECORD (measured). A ``logger.warning`` from a
@@ -1021,8 +1023,18 @@ def write_tolerated_cleanup_report(log_dir: str | None = None) -> str | None:
     like the #1103 redislite end-sweep decision — the record is accumulated and
     written to a file the workflow dumps.
 
-    Best-effort: writing the report never fails the suite. Written ONLY when at
-    least one leak was tolerated, so a clean xdist worker never overwrites a
+    ``extra`` (#8746): additional tolerated-cleanup SECTIONS, keyed by their
+    JSON key, for a caller that accumulates its own records (the graph-delete
+    refusals of ``tests/_live_utils.py``). They ride THIS artifact because it is
+    the one the suite-session jobs already dump — a second file nothing reads
+    is not an observability channel, and adding a dump step is a workflow
+    change payload. Each section's entries are merged by their own ``name`` key
+    (or ``path``, if that is what they carry) so a peer session cannot truncate
+    them. The report is written when the leak list OR any extra section is
+    non-empty.
+
+    Best-effort: writing the report never fails the suite. Written ONLY when
+    something WAS tolerated, so a clean xdist worker never overwrites a
     peer worker's record with an empty one. The write MERGES with whatever is
     already there keyed by path instead of truncating, so IF xdist is
     re-admitted, every worker's OWN session teardown against this one artifact
@@ -1034,29 +1046,44 @@ def write_tolerated_cleanup_report(log_dir: str | None = None) -> str | None:
     write in the same instant; the artifact then still names the defect, so the
     leak stays observable.)
     """
-    if not _TOLERATED_CLEANUP_LEAKS:
+    extra = {k: v for k, v in (extra or {}).items() if v}
+    if not _TOLERATED_CLEANUP_LEAKS and not extra:
         return None
     try:
         if log_dir is None:
             log_dir = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
         log_path = os.path.join(log_dir, "tempdir-hygiene-end.json")
         by_path: dict[str, dict[str, object]] = {}
+        prior: dict[str, object] = {}
         try:
             with open(log_path) as fh:
-                prior = json.load(fh)
+                prior = json.load(fh) or {}
             for entry in prior.get("tolerated_cleanup_leaks", []):
                 if isinstance(entry, dict) and "path" in entry:
                     by_path[str(entry["path"])] = entry
         except (OSError, ValueError, AttributeError, TypeError):
             pass  # no prior artifact, or an unreadable/garbled one — start fresh
+        payload: dict[str, object] = {
+            "tolerated_cleanup_leaks": [
+                by_path[path] for path in sorted(by_path)],
+        }
+        for section, entries in extra.items():
+            by_key: dict[str, dict[str, object]] = {}
+            for entry in prior.get(section, []) if isinstance(prior, dict) else []:
+                if isinstance(entry, dict):
+                    key = entry.get("name", entry.get("path"))
+                    if key is not None:
+                        by_key[str(key)] = entry
+            for entry in entries:
+                by_key[str(entry.get("name", entry.get("path")))] = dict(entry)
+            payload[section] = list(by_key.values())
         for entry in tolerated_cleanup_leaks():
             entry.setdefault("pid", os.getpid())
             by_path[str(entry["path"])] = entry
+        payload["tolerated_cleanup_leaks"] = [
+            by_path[path] for path in sorted(by_path)]
         with open(log_path, "w") as fh:
-            json.dump({
-                "tolerated_cleanup_leaks": [
-                    by_path[path] for path in sorted(by_path)],
-            }, fh, indent=2)
+            json.dump(payload, fh, indent=2)
     except OSError:
         return None
     return log_path

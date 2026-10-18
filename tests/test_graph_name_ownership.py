@@ -219,21 +219,30 @@ def test_the_routed_delete_helper_consults_the_live_canonical_set(monkeypatch):
             return []
 
     proj = SimpleNamespace(graph_name="test_review_p2_canonical", db=_Db())
+    # Snapshot/restore the session record: this test DRIVES a refusal, and a
+    # synthetic refusal must not fork into a real run's
+    # `graph-delete-hygiene-end.json` (#7735 `_discard_tolerated_leaks`
+    # precedent; #8746 review r3 P3).
+    snapshot = _live_utils.graph_delete_events()
     # PRECONDITION — the canonical set admits this name, so the gate OPENS and
     # the guard's presence read is what answers (the graph is absent → False).
     # Without this the refusal below could pass for the wrong reason.
     assert _live_utils.drop_test_graph(proj) is False
-    assert calls == [("list_graphs",)], (
+    assert calls and all(c == ("list_graphs",) for c in calls), (
         "the gate refused a name the canonical set authorises — the "
         "precondition of this test is broken, so it would pass vacuously")
     calls.clear()
+    assert _live_utils.graph_delete_events() == snapshot  # absent → not recorded
     monkeypatch.setattr(embedded, "_SERVER_WIPE_PREFIXES", ("tortoise_test",))
-    assert _live_utils.drop_test_graph(proj) is False
-    assert calls == [], (
-        "drop_test_graph reached the delete path for a name the canonical "
-        "_SERVER_WIPE_PREFIXES no longer authorises — its prefix gate is a "
-        "COPY of the vocabulary, which is fail-OPEN on an irreversible "
-        "GRAPH.DELETE (#8746 review P2)")
+    try:
+        assert _live_utils.drop_test_graph(proj) is False
+        assert calls == [], (
+            "drop_test_graph reached the delete path for a name the canonical "
+            "_SERVER_WIPE_PREFIXES no longer authorises — its prefix gate is a "
+            "COPY of the vocabulary, which is fail-OPEN on an irreversible "
+            "GRAPH.DELETE (#8746 review P2)")
+    finally:
+        _live_utils._restore_graph_delete_events(snapshot)
 
 
 # ── AC3 AST pin (Task 1 establishes the helper; Task 3 wires it up) ────────
