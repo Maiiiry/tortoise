@@ -1097,6 +1097,25 @@ def _capture_gate_window(windowed: list[dict]) -> list[dict]:
     text is unaffected because the module writes its marker with nothing after
     it, and dropping trailing whitespace from a blankness signal cannot turn a
     non-blank conversation blank.
+
+    ⛔ AND THE TOLERATED SET IS ``_CAPTURE_BLANK_CHARS``, NOT WHATEVER
+    ``str.rstrip()`` CALLS WHITESPACE (#7229). Round 13 stripped with the bare
+    builtin, whose set is Python's ``str.isspace()``, while this module's
+    blankness contract is ``_CAPTURE_BLANK_CHARS`` — the union the clipper
+    adopted in round 15 precisely BECAUSE the builtin and JS ``trim()`` disagree
+    on five code points. The two sets differ by exactly ONE code point, U+FEFF
+    (measured: the builtin strips nothing outside the union, and U+FEFF is the
+    only member of the union it misses), and one is enough — a caller-supplied
+    ``marker + "\ufeff"`` was not right-stripped, so
+    :func:`_split_truncation_marker` did not see the marker as the tail and the
+    gate ADMITTED a turn whose whole content is this module's own marker
+    (measured: transcript length 47 where ``marker + " "`` yields 0). Stripping
+    the explicit set closes it for every code point the blank contract names —
+    not only the ones the builtin happens to cover — so the gate and the clipper
+    it guards cannot disagree about the same input. Same direction as round 13,
+    fail-closed only: the union holds no character outside the blank contract,
+    so real text is never touched, and the gate's body is a blankness SIGNAL that
+    is never stored.
     """
     out: list[dict] = []
     for turn in windowed:
@@ -1104,7 +1123,8 @@ def _capture_gate_window(windowed: list[dict]) -> list[dict]:
         if not isinstance(content, str):
             out.append(turn)
             continue
-        body, _marker = _split_truncation_marker(content.rstrip())
+        body, _marker = _split_truncation_marker(
+            content.rstrip(_CAPTURE_BLANK_CHARS))
         out.append({**turn, "content": body} if body != content else turn)
     return out
 
@@ -1571,7 +1591,6 @@ def _redact_turn_contents(
                 out.append({**turn, "role": scrubbed_role})
             else:
                 out.append(turn)
-            continue
             continue
         scrubbed, counts = redact_secrets(body)
         if role_counts:

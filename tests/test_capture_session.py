@@ -4014,13 +4014,25 @@ def test_capture_session_blank_conversation_fails_closed(sdk):
     gate must judge the marker-free body. Before the fix, `" " * 5001` was
     admitted and stored as a marker-only turn, where main had refused it.
 
-    ⛔ The FINAL THREE rows exist because round 14's "a turn with no content
-    yields no claims" rule (in `_session_llm_transcript`) refuses the blank and
-    lookalike rows on its own, which left this test GREEN when the gate was
-    reverted. They clip to a body with no >=3-char sentence, which the skip does
-    NOT cover, so they pin `_capture_gate_window` again.
+    ⛔ The `X`/single-dots/``marker + " "`` rows exist because round 14's "a turn
+    with no content yields no claims" rule (in `_session_llm_transcript`) refuses
+    the blank and lookalike rows on its own, which left this test GREEN when the
+    gate was reverted. They clip to a body with no >=3-char sentence, which the
+    skip does NOT cover, so they pin `_capture_gate_window` again.
+
+    ⛔ AND THE TOLERATED SET IS THE BLANK CONTRACT, NOT ``str.rstrip()`` (#7229).
+    The round-13 ``marker + " "`` row pinned ONE character of a much wider
+    claim: the gate right-stripped with the builtin, whose set is Python's
+    ``str.isspace()``, while the clipper it guards uses ``_CAPTURE_BLANK_CHARS``
+    (round 15's union). U+FEFF is the single code point the builtin misses, so
+    ``marker + "\ufeff"`` walked past the strip and was ADMITTED — a blank turn
+    reaching storage. The rows below are GENERATED over
+    ``_CAPTURE_BLANK_CHARS`` rather than hand-listed, so every code point the
+    blank contract names — including any added later — is pinned against the
+    gate, not just the one that happened to escape. Deleting the explicit set
+    from the gate REDs this test on U+FEFF.
     """
-    from tortoise.sdk import _capture_truncation_marker
+    from tortoise.sdk import _CAPTURE_BLANK_CHARS, _capture_truncation_marker
     blank_convos = (
         [{"role": "user", "content": "ok"}],
         [{"role": "user", "content": " "}],
@@ -4052,6 +4064,10 @@ def test_capture_session_blank_conversation_fails_closed(sdk):
         [{"role": "user", "content": "X" + " " * 6000}],   # clipped body "X": 1 char
         [{"role": "user", "content": "  .  " * 2000}],     # clipped body of single dots
         [{"role": "user", "content": _capture_truncation_marker(5001) + " "}],
+        # Every code point the blank contract names, appended AFTER the marker —
+        # the shape that walked past a builtin right-strip (#7229).
+        *[[{"role": "user", "content": _capture_truncation_marker(5001) + cp}]
+          for cp in _CAPTURE_BLANK_CHARS],
     )
     for conv in blank_convos:
         res = sdk.capture_session(conv)
