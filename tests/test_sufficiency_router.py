@@ -1552,7 +1552,7 @@ def test_a_two_member_stack_is_only_legal_in_case_then_aux_order(
 
 
 @pytest.mark.parametrize("anchor", ["™", "Ⅳ", "①", "µ", "ª", "½", "№"])
-def test_an_anchor_of_nothing_but_symbols_is_refused(anchor: str) -> None:
+def test_an_anchor_of_nothing_but_premapped_symbols_is_refused(anchor: str) -> None:
     """A symbol-only anchor folds BLANK, and a blank anchor covers everything.
 
     The pre-map that keeps `™` from gluing onto its anchor also erases an anchor
@@ -1565,6 +1565,25 @@ def test_an_anchor_of_nothing_but_symbols_is_refused(anchor: str) -> None:
         anchors=[anchor], required_anchor_coverage=1.0, resident=True)
     assert verdict.verdict == INSUFFICIENT
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 0.0),)
+
+
+@pytest.mark.parametrize("text,anchor", [
+    # The circled-numeral series is CONTINUOUS (①–⑳, ㉑–㉟, ㊱–㊿) and the
+    # enclosed digits sit at the head of a block whose LETTERS must keep gluing.
+    # Splitting the block by range arithmetic dropped 36–50 into the excluded
+    # section, so `㊱ACME` and `ACME㊿` fell to 0.0 while `㉑ACME` stayed 1.0.
+    ("㊱ACME", "ACME"),
+    ("ACME㊿", "ACME"),
+    ("㊿ACME", "ACME"),
+    ("ACME🄀", "ACME"),
+    ("ACME🄊", "ACME"),
+    ("㋀ACME", "ACME"),          # telegraph January -> 1月
+])
+def test_the_circled_and_enclosed_numeral_series_separates(
+        text: str, anchor: str) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),)
 
 
 @pytest.mark.parametrize("text", [

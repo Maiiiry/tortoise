@@ -609,16 +609,23 @@ _FOLD_AS_SEPARATOR = frozenset().union(*(
         (0x213B, 0x213B),   # ℻             -> FAX
         (0x2150, 0x217F),   # fractions + Roman numerals
         (0x2189, 0x2189),   # ↉             -> 0/3
-        # CIRCLED/PARENTHESIZED DIGITS only. From 0x249C on are Latin LETTERS:
-        # ① … ⑳, ⑴ … ⒇, ⒈ … ⒛ and ⓪ ⓫ … ⓴ are numerals, so they separate; `Ⓐ`
-        # and `🅐` are DECORATED LETTERS and must keep gluing (`aiⒶ`, `ai🅐` stay
-        # 0.0). For the same reason the enclosed-Latin block U+1F100–U+1F2FF is
-        # NOT pre-mapped: it is letters, and the `NAME contains LATIN` branch is
-        # what catches them. The underscore family (U+FF3F, U+FE33/FE34,
-        # U+FE4D–FE4F) is likewise absent, so a decorated `_` behaves like `_`.
+        # NUMERALS AND SYMBOLS only. From 0x249C on the circled block is Latin
+        # LETTERS: `Ⓐ` and `🅐` are DECORATED LETTERS and must keep gluing
+        # (`aiⒶ`, `ai🅐` stay 0.0), which is why the enclosed-alphanumeric
+        # supplement is not pre-mapped wholesale — only its eleven leading DIGIT
+        # forms are, because `🄀` folds to `0.` and those are numerals. `🅊`
+        # (U+1F14A) is the counter-example in the other direction: NFKC already
+        # folds it to `HV`, so it glues through the letter path and never reaches
+        # the name branch. The underscore family (U+FF3F, U+FE33/FE34,
+        # U+FE4D–U+FE4F) is likewise absent, so a decorated `_` behaves like `_`.
+        (0x1F100, 0x1F10A), # 🄀 … 🄊       -> 0., … 9,   (digits, at the head of
+        #                     the enclosed block whose LETTERS must keep gluing)
         (0x2460, 0x249B),   # ① … ⑳, ⑴ … ⒇, ⒈ … ⒛
         (0x24EA, 0x24FF),   # ⓪ ⓫ … ⓴
-        (0x3250, 0x325F),   # ㉐, ㉑ … ㊿ (circled 21–50)
+        (0x3250, 0x325F),   # ㉑ … ㉟ (circled 21–35)
+        (0x32B1, 0x32BF),   # ㊱ … ㊿ (circled 36–50) — the series is CONTINUOUS, so
+        #                     splitting the block at 0x3260 dropped these
+        (0x32C0, 0x32CB),   # ㋀ … ㋋ (telegraph January…December -> `1月` … `12月`)
         (0x3300, 0x33FF),   # SQUARED CJK abbreviations
     )
 ))
