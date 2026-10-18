@@ -600,15 +600,15 @@ def audit_graph(proj, point_kinds: list[str] | None = None) -> AuditResult:
         # the suffix) and an ``eventId`` is not an ``id`` the call can resolve.
         "RETURN src.id, tgt.id, "
         "coalesce(tgt.content, tgt.name, tgt.title, ''), "
-        "id(src), id(tgt) "
+        "id(src), id(tgt), src.eventId "
         f"LIMIT {CHECK5_FETCH_LIMIT}",
         params=params,
     )
     patterns5 = [re.compile(rf"\b{re.escape(kw)}\b") for kw in CONTRADICTION_KEYWORDS]
     issues5: list[AuditIssue] = []
-    seen5: set[tuple[str, str]] = set()
+    seen5: set[tuple] = set()
     count5 = 0
-    for src_id, tgt_id, tgt_content, src_nid, tgt_nid in rows5:
+    for src_id, tgt_id, tgt_content, src_nid, tgt_nid, src_eid in rows5:
         low = (tgt_content or "").lower()
         hit = next(
             (kw for kw, pat in zip(CONTRADICTION_KEYWORDS, patterns5) if pat.search(low)),  # noqa: B905
@@ -638,12 +638,20 @@ def audit_graph(proj, point_kinds: list[str] | None = None) -> AuditResult:
                     "Verify semantic contradiction BEFORE converting — if "
                     f"confirmed: tortoise_create_operator('NAND', {_quoted(src_id)}, "
                     f"[{_quoted(tgt_id)}])"), ""
+            # ``node_id`` is the handle a caller follows BACK to the node, so it
+            # has to be the key the node ACTUALLY carries. ``str(src_id)``
+            # rendered ``'None'`` for a source with no ``id`` — a handle naming
+            # no node at all, and the one the review of round 8 reported next to
+            # the unaddressable statement (#7927 review round 9). ``src.eventId``
+            # is the real key of a legacy / out-of-tree ``:Event``.
+            src_handle = src_id if src_id is not None else src_eid
             issues5.append(AuditIssue(
                 issue_type="impl_instead_of_nand",
                 severity="low",
-                node_id=str(src_id),
-                detail=(f"IMPL edge {src_id} → '{str(tgt_content)[:80]}' "
-                        f"(keyword: '{hit}') — verify whether NAND applies{suffix}"),
+                node_id=str(src_handle) if src_handle is not None else None,
+                detail=(f"IMPL edge {src_handle if src_handle is not None else '<?>'} "
+                        f"→ '{str(tgt_content)[:80]}' (keyword: '{hit}') — verify "
+                        f"whether NAND applies{suffix}"),
                 fix=fix,
             ))
     # conf 58: count5 is an UPPER-BOUNDED fetch sample (LIMIT

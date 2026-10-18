@@ -346,9 +346,14 @@ def test_contested_claims_does_not_flood_the_report_with_unmeasured_entities(sdk
     ``:Point`` — but an entity has no persisted prior unless EP measured it
     (``create_entity`` rejects belief props), and Beta(1,1) sits at the MAXIMUM
     variance 1/12. Listing those would put every Subject/Object/Event on the
-    graph permanently at the top of a report that exists to discriminate, and
-    nothing would ever measure them. So a MEASURED entity lists, an unmeasured
-    one does not — while an unmeasured Point still does."""
+    graph permanently at the top of a report that exists to discriminate.
+
+    The gate is therefore "wired into at least one factor" vs "structurally
+    orphaned", NOT "nothing will ever measure it": since #7902 a non-Point
+    endpoint of a factor IS measured (and ``_affected_claims`` resolves a
+    non-Point seed), so a MEASURED entity lists and an unmeasured one does not
+    — while an unmeasured Point still does. ``tortoise/ep.py``'s #7927 block
+    states the same distinction; this docstring used to overclaim the opposite."""
     sdk._get_proj().g.query("CREATE (p:Point {id:'unmeasured-point', status:'live', content:'unmeasured claim'})")
     for label in NON_POINT_LABELS:
         _node(sdk, label, f"unmeasured-{label.lower()}")
@@ -660,6 +665,42 @@ def test_contested_relevance_reads_non_point_nand_input_source(sdk):
     assert boosts == {target: W4_CONTESTED_BOOST}
 
 
+def test_contested_relevance_reads_a_keyless_event_nander(sdk):
+    """The NANDer's row must survive when its key is ``eventId`` only.
+
+    ``session_indexer`` mints ``(e:Event {eventId:\u2026})`` with no ``id`` at all,
+    and a non-Point is a legal direct-edge endpoint since #7902 — so a keyless
+    ``:Event`` CAN be the node that NANDs a belief. A VALUE-keyed comparison
+    (``c.id <> n.id``) evaluates NULL for it and DROPS the row, and the
+    coalesced form is no better (it is not unique across nodes, so a twin
+    silently equates). Either way the W4 boost silently never fires for that
+    counter-claim — the silent-absence class this widening exists to remove.
+
+    Every other W4 fixture builds its NANDer with ``_node``, which stamps an
+    ``id``, so only this shape distinguishes the node-keyed comparison
+    (``id(c) <> id(n)``) from a value-keyed one. Measured on ``c.id <> n.id``:
+    ``boosts == {}``.
+    """
+    target = _node(sdk, "Subject", "w4-keyless-target")
+    proj = sdk._get_proj()
+    # :Event keyed on eventId only — no ``id`` property at all.
+    proj.g.query(
+        "CREATE (e:Event {eventId:'w4-keyless-nander', "
+        "eventKind:'test', startedAt:'2026-01-01T00:00:00Z', "
+        "name:'the cache rollback is the safer default'})"
+    )
+    proj.g.query(
+        "MATCH (e:Event {eventId:'w4-keyless-nander'}), (t {id:$t}) "
+        "MERGE (e)-[r:NAND]->(t) SET r.idx = 1",
+        params={"t": target},
+    )
+
+    boosts = resolve_contested_relevance(proj, [target], "cache rollback")
+    assert boosts == {target: W4_CONTESTED_BOOST}, (
+        "a keyless-:Event counter-claim is invisible to the W4 boost — the "
+        "row was dropped by a value-keyed comparison instead of a node one")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 5. Audit — deliberately SPLIT: counts/provenance :Point-only, wiring
 #    checks widened (#7927 decision)
@@ -733,6 +774,68 @@ def test_svbp_extractor_includes_non_point_operator_input(sdk, label):
     inputs = factors[0][2]
     assert n in inputs, f":{label} belief missing from the factor inputs: {inputs}"
     assert p in inputs
+
+
+def test_svbp_extractor_never_counts_a_phantom_keyless_event_input(sdk):
+    """A factor input is consumed as an ``id``, so an identity-less endpoint
+    must not become a ``None`` input (the #8538 lesson: an ``eventId`` value is
+    not an ``id``, so coalescing it here would re-anchor on the wrong key).
+
+    Decision pinned by ``AND c.id IS NOT NULL`` on this read: the population is
+    held to what the pre-widening label predicate admitted, and the alternative
+    (a ``None`` appended to ``op_inputs[op_id]``) is refused because it counts
+    toward ``len(input_ids) >= 2`` — a PHANTOM input that can turn a genuinely
+    degenerate operator into a live EP factor.
+
+    Measured pre-fix (before the ``c.id IS NOT NULL`` conjunct): the factor
+    carried ``[<point>, None]`` and was emitted.
+    """
+    p = _point(sdk, "phantom-input sibling")
+    q = _point(sdk, "phantom-input second sibling")
+    proj = sdk._get_proj()
+    proj.g.query(
+        "CREATE (op:Point {id:'svbp-phantom-op', is_operator:true, "
+        "op_type:'IMPL', label:'impl', status:'live'})"
+    )
+    proj.g.query(
+        "CREATE (e:Event {eventId:'svbp-phantom-event', eventKind:'test', "
+        "startedAt:'2026-01-01T00:00:00Z', name:'a keyless event input'})"
+    )
+    proj.g.query(
+        "MATCH (op:Point {id:'svbp-phantom-op'}), (e:Event "
+        "{eventId:'svbp-phantom-event'}) MERGE (op)-[:IMPL]->(e)"
+    )
+    # Exactly ONE addressable input — below the >= 2 threshold, so the factor
+    # is degenerate UNLESS the phantom None is (wrongly) counted.
+    proj.g.query(
+        "MATCH (op:Point {id:'svbp-phantom-op'}), (s {id:$s}) "
+        "MERGE (op)-[:IMPL]->(s)",
+        params={"s": p},
+    )
+
+    factors, _evidence = proj.extract_svbp_factors()
+    emitted = {op_id: (op_type, tuple(inputs))
+               for op_id, op_type, inputs, _w in factors}
+    assert "svbp-phantom-op" not in emitted, (
+        "an operator with one real input and one unaddressable one was "
+        f"emitted as a live factor: {emitted.get('svbp-phantom-op')} — the "
+        "keyless :Event became a phantom input id")
+
+    # Control: with a SECOND real input the same operator IS emitted, so the
+    # assertion above cannot pass for the wrong reason (a broken fixture or an
+    # operator that never reaches the threshold at all).
+    proj.g.query(
+        "MATCH (op:Point {id:'svbp-phantom-op'}), (s {id:$s}) "
+        "MERGE (op)-[:IMPL]->(s)",
+        params={"s": q},
+    )
+    factors, _evidence = proj.extract_svbp_factors()
+    emitted = {op_id: tuple(inputs) for op_id, _t, inputs, _w in factors}
+    assert "svbp-phantom-op" in emitted, (
+        "control failed: the operator never became a factor, so the "
+        "phantom-input assertion above proves nothing")
+    assert None not in emitted["svbp-phantom-op"], (
+        f"the factor carries an unaddressable input: {emitted['svbp-phantom-op']}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1143,3 +1246,57 @@ def test_superseded_repair_never_names_a_nonexistent_identity(sdk):
     for issue in issues:
         assert "None" not in issue.fix, (
             f"the repair names a phantom identity: {issue.fix!r}")
+
+
+def test_impl_issue_names_the_key_the_source_actually_carries(sdk):
+    """``node_id`` is the handle a caller follows BACK to the node, so it must be
+    the key the node carries — never the string ``"None"``.
+
+    The repair is (correctly) refused for a source with no ``id``, but
+    ``node_id=str(src_id)`` still rendered ``'None'`` for it: a handle naming no
+    node, and one a caller cannot resolve. ``src.eventId`` is the real key of a
+    legacy / out-of-tree ``:Event`` (the shape ``session_indexer`` mints), and a
+    node carrying NEITHER key must report no handle at all — ``None`` — rather
+    than a fabricated one (#7927 review round 9).
+    """
+    proj = sdk._get_proj()
+    # (a) keyed on eventId only: the issue names the eventId, not "None".
+    proj.g.query("CREATE (t:Subject {id:'c5-handle-target', "
+                 "name:'this cannot be the default', subjectKind:'concept', "
+                 "status:'live'})")
+    proj.g.query("CREATE (e:Event {eventId:'c5-keyless-src', "
+                 "eventKind:'test', name:'a keyless source claim'})")
+    proj.g.query(
+        "MATCH (e:Event {eventId:'c5-keyless-src'}), "
+        "(t:Subject {id:'c5-handle-target'}) MERGE (e)-[:IMPL]->(t)")
+
+    by_event = [i for i in audit_graph(proj).issues
+                if i.issue_type == "impl_instead_of_nand"]
+    assert by_event, "fixture broken: the keyless-source IMPL pair was not reported"
+    for issue in by_event:
+        assert issue.node_id == "c5-keyless-src", (
+            f"the issue's handle is not the key the node carries: {issue.node_id!r}")
+        assert "None" not in issue.detail, (
+            f"the message renders a missing key as 'None': {issue.detail!r}")
+
+    # (b) a source with NEITHER key has no handle to report.
+    proj.g.query("CREATE (e:Event {eventKind:'test', "
+                 "name:'a counter-claim with no key'})")
+    proj.g.query("CREATE (t:Subject {id:'c5-target-2', "
+                 "name:'this cannot hold under load', subjectKind:'concept', "
+                 "status:'live'})")
+    proj.g.query(
+        "MATCH (e:Event), (t:Subject {id:'c5-target-2'}) "
+        "WHERE e.name = 'a counter-claim with no key' MERGE (e)-[:IMPL]->(t)")
+
+    unkeyed = [i for i in audit_graph(proj).issues
+               if i.issue_type == "impl_instead_of_nand"
+               and "this cannot hold under load" in i.detail]
+    assert unkeyed, "fixture broken: the identity-less source pair was not reported"
+    for issue in unkeyed:
+        assert issue.node_id is None, (
+            f"node_id fabricates a handle for a node with no key: {issue.node_id!r}")
+        assert issue.fix == "", (
+            f"an id-keyed repair was emitted without an id: {issue.fix!r}")
+        assert "no `id`" in issue.detail, (
+            f"the refusal is not explained in the message: {issue.detail!r}")
