@@ -18,20 +18,30 @@ output is a report of counts per class plus the proposed keep/drop predicate.
 
 Exit codes: ``0`` ok · ``1`` usage/IO (a flag mistake — an unknown or empty
 ``--rules``, a negative ``--samples`` / ``--fragment-max-chars``, ``--samples``
-with ``--diff``, a missing or non-JSON file) · ``2`` refused (the dump itself is
-unusable — corruption, a truncated artifact, a dangling edge — and the problem
-list is on stderr). Argument errors therefore exit ``1``, not argparse's default
-``2``: a caller must be able to tell "I passed the wrong flags" from "this dump
-cannot be measured" without parsing stderr. Every flag-value mistake is validated
-by argparse (a ``type=`` callable raising ``ArgumentTypeError``), so it takes the
+with ``--diff``, a missing or non-JSON file, an unwritable ``--out``) · ``2``
+refused (the dump itself is unusable — STRUCTURAL corruption: a non-integer or
+repeated ``dump_id``, an absent or non-dict prop bag, a lost/non-list label set,
+a lost edge list, a dangling edge, an unusable edge row — and the problem list is
+on stderr). Argument errors therefore exit ``1``, not argparse's default ``2``: a
+caller must be able to tell "I passed the wrong flags" from "this dump cannot be
+measured" without parsing stderr. Every flag-value mistake is validated by
+argparse (a ``type=`` callable raising ``ArgumentTypeError``), so it takes the
 tested ``error()`` path and cannot drift into the refusal code.
+
+⚠️ A declared-vs-counted mismatch (a truncated artifact) is a WARNING, not a
+refusal: the dump is measurable, it is just smaller than it claims, and the
+counts are reported with the discrepancy named. Ambiguous identities (two nodes
+sharing one key) are likewise REPORTED under ``identities``, not refused —
+ambiguity is a measurement, while structural corruption is not. Only the
+structural list above exits ``2``; an operator reading exit ``0`` as "the dump
+reconciled" would be wrong, and the warnings are therefore printed.
 
 Why the refusals exist: a census that silently measured a different population
 than the re-typing pass will consume is worse than no census — it would be a
-number an owner decides on. So a malformed dump, a truncated artifact, a dangling
-edge or a duplicate node identity is refused with the full problem list rather
-than reported around. (An unknown rule id is refused by :func:`census` too; the
-CLI validates ``--rules`` first, as the usage error it is.)
+number an owner decides on. So a structurally malformed dump or a dangling edge
+is refused with the full problem list rather than reported around. (An unknown
+rule id is refused by :func:`census` too; the CLI validates ``--rules`` first, as
+the usage error it is.)
 """
 
 from __future__ import annotations
@@ -77,7 +87,12 @@ def _dump_json(payload: object, path: Path | None, what: str) -> None:
     if path is None:
         sys.stdout.write(text)
         return
-    path.write_text(text, encoding="utf-8")
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        # Same shape as every other IO failure in this file: a one-line refusal,
+        # not a traceback. The exit stays 1 (usage/IO).
+        raise SystemExit(f"cannot write {what} to {path}: {exc}") from exc
     print(f"wrote {what}: {path}", file=sys.stderr)
 
 
@@ -97,7 +112,7 @@ def _parse_rules(raw: str) -> list[str]:
     unknown = [rule for rule in rules if rule not in DEFAULT_RULES]
     if unknown:
         raise argparse.ArgumentTypeError(
-            f"unknown id(s) {sorted(unknown)!r}; known ids are {list(DEFAULT_RULES)!r}"
+            f"unknown id(s) {sorted(unknown, key=str)!r}; known ids are {list(DEFAULT_RULES)!r}"
         )
     if len(set(rules)) != len(rules):
         raise argparse.ArgumentTypeError(f"repeated id(s) in {rules!r}")
@@ -216,6 +231,12 @@ def main(argv: list[str] | None = None) -> int:
         f"(droppable {predicate['droppable']})",
         file=sys.stderr,
     )
+    # The report's warnings are the FINDINGS, and the summary line is what an
+    # operator reads. Leaving them only inside the JSON made a truncated dump
+    # print a confident count on the channel a human actually looks at.
+    warnings = report.get("warnings") or []
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 

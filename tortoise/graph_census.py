@@ -52,11 +52,23 @@ own edge list. Nothing is inferred from prose. Consequences worth stating:
   good extraction from a curated document would be hit by this rule too. The
   rule says *"this node is a leaf of a capture, not an assertion an agent made"*,
   which is exactly the population the drop predicate is about.
-* **``isolated`` counts KNOWLEDGE edges only.** A provenance pointer edge is not
-  topology: a claim whose only edge is ``extractedFrom`` participates in nothing
-  — it is a leaf of a document, and no query walks to it from a neighbouring
-  claim. Counting pointer edges as degree would report every extracted leaf as
-  "referenced" and hide the whole class.
+* **``isolated`` counts KNOWLEDGE edges only, and KNOWLEDGE is a POSITIVE set**
+  (``IMPL`` / ``NAND`` / ``MITIGATES`` / ``INPUT``). A provenance pointer edge is
+  not topology: a claim whose only edge is ``extractedFrom`` participates in
+  nothing — it is a leaf of a document, and no query walks to it from a
+  neighbouring claim. Counting pointer edges as degree would report every
+  extracted leaf as "referenced" and hide the whole class. The set is positive
+  rather than "everything except ``extractedFrom``" because the structural
+  families (``CONTAINS``, ``TAGGED``, ``references``, ``uses``, ``about*``,
+  ``related`` — ontology §3.9) carry no epistemic weight by decision, and a
+  negative list of one silently scored a transcript fragment as degree 2.
+* **Provenance edges are priced, but SEPARATELY.** ``retains_knowledge_topology``
+  scopes its verdict to knowledge edges by name, because the ``isolated`` cut
+  drops every ``:Source``/``:Document`` and thereby severs every provenance
+  pointer while leaving every operator wired. That loss is real, so
+  ``kept_provenance_edges`` / ``severed_provenance_edges`` carry it and a warning
+  names the count — a cut that reads "topology preserved" is never reported as
+  free.
 * **``duplicate`` is a normalisation, not a semantic judgement.** It compares
   lower-cased, whitespace-collapsed text with trailing punctuation removed.
   Two paraphrases are two nodes to this rule; two copies of one sentence are
@@ -108,11 +120,14 @@ ABSENT = "<none>"
 
 #: Properties a node may carry a provenance claim in.
 PROVENANCE_POINTER_PROPS: tuple[str, ...] = ("provenanceSource", "extractedFrom")
+#: Every provenance field this module counts. Each name must have a PRODUCER in
+#: this repo, or a 0 in the report is indistinguishable from "this graph lacks
+#: the field" — the ambiguity `_non_empty_string` exists to remove. Two names
+#: that used to sit here (`origin`, `sourceId`) had no producer and no ontology
+#: row, so they were removed rather than reported as measured zeros.
 PROVENANCE_PROPS: tuple[str, ...] = (
     *PROVENANCE_POINTER_PROPS,
     "authoredBy",
-    "origin",
-    "sourceId",
     "quote",
     "content_hash",
 )
@@ -120,6 +135,18 @@ PROVENANCE_PROPS: tuple[str, ...] = (
 #: Edge types that record WHERE a node came from. Excluded from knowledge
 #: degree — see the module docstring.
 PROVENANCE_EDGE_TYPES: frozenset[str] = frozenset({"extractedFrom"})
+
+#: Edge types that carry EPISTEMIC weight — the edges belief propagation walks.
+#: Defined POSITIVELY on purpose. The complement was a negative list of one
+#: (`!= extractedFrom`), so EVERY other relationship counted as knowledge: the
+#: structural families the ontology classifies as non-epistemic (`CONTAINS`,
+#: `TAGGED`, `references`, `uses`, `about*`, `related` — ontology §3.9) inflated a
+#: transcript fragment's degree and made the `isolated` rule keep it. An unknown
+#: type is now neither knowledge nor provenance; `edges_by_type` still reports it,
+#: so a new edge family is visible rather than silently miscounted.
+KNOWLEDGE_EDGE_TYPES: frozenset[str] = frozenset(
+    {"IMPL", "NAND", "MITIGATES", "INPUT"}
+)
 
 #: Rule ids. Order is the canonical evaluation order (first hit wins) and is
 #: also the order they are reported in.
@@ -161,8 +188,8 @@ RULE_REASONS: dict[str, str] = {
         "earlier rule may drop the survivor too"
     ),
     RULE_ISOLATED: (
-        "has no knowledge edge in either direction (IMPL / NAND / INPUT and "
-        "every non-provenance type) — nothing walks to it from another claim"
+        "has no knowledge edge in either direction (IMPL / NAND / MITIGATES / "
+        "INPUT) — nothing walks to it from another claim"
     ),
 }
 
@@ -251,11 +278,18 @@ def scan_nodes(
         # ``""`` is a falsy NON-dict, and normalising it to ``{}`` would accept
         # corruption as "no props" — which then makes the node ``untyped`` and
         # has RULE_UNTYPED propose dropping it.
+        # ``_dump_node`` always emits ``"props": dict(props or {})``, so an
+        # absent or ``null`` bag is a field the export LOST — the SAME defect
+        # class as the lost label set below. Accepting it as "no props" makes
+        # the node ``untyped``, and ``RULE_UNTYPED`` then proposes DROPPING it:
+        # corruption converted into a drop recommendation.
         prop_bag = node.get("props")
-        if prop_bag is not None and not isinstance(prop_bag, dict):
+        if not isinstance(prop_bag, dict):
+            lost = "an absent (or null)" if prop_bag is None else "a non-dict"
             problems.append(
-                f"node dump_id {dump_id!r} carries a non-dict prop bag "
-                f"({type(prop_bag).__name__}: {prop_bag!r}) — that is CORRUPTION"
+                f"node dump_id {dump_id!r} carries {lost} prop bag "
+                f"({type(prop_bag).__name__}: {prop_bag!r}) — that is CORRUPTION; "
+                "a node with no properties must carry {}"
             )
             continue
         if node.get("labels") is None:
@@ -298,8 +332,15 @@ def normalize_text(text: str) -> str:
 
 
 def kind_prop_for(labels: Iterable[str]) -> str | None:
-    """The kind property an epistemic label set carries, or ``None``."""
-    for label in labels:
+    """The kind property an epistemic label set carries, or ``None``.
+
+    Iterates the labels in SORTED order, not the dump's array order: the label
+    array is not a stable contract (it is whatever `labels(n)` returned), and a
+    node carrying two epistemic labels would otherwise land in a different
+    ``kinds`` bucket — and possibly a different class — when that order changed,
+    which would put array order into ``census_sha256``.
+    """
+    for label in sorted(labels):
         prop = KIND_PROP.get(label)
         if prop is not None:
             return prop
@@ -442,7 +483,7 @@ def _validate_rules(rules: Sequence[str]) -> tuple[str, ...]:
     if unknown:
         raise CensusError(
             [
-                f"unknown rule id(s) {sorted(unknown)!r}; known ids are {list(DEFAULT_RULES)!r} "
+                f"unknown rule id(s) {sorted(unknown, key=str)!r}; known ids are {list(DEFAULT_RULES)!r} "
                 "— an id this instrument does not implement would silently select nothing"
             ]
         )
@@ -522,7 +563,7 @@ def census(
             all_degree[endpoint] += 1
         if etype in PROVENANCE_EDGE_TYPES:
             pointer_edge[edge["src"]] = True
-        else:
+        elif etype in KNOWLEDGE_EDGE_TYPES:
             for endpoint in (edge["src"], edge["dst"]):
                 knowledge_degree[endpoint] += 1
     # ── per-node facts ─────────────────────────────────────────────────────
@@ -687,14 +728,13 @@ def census(
     # severs every IMPL/NAND/INPUT link read as a clean 77% reduction.
     kept_by_type_degree: dict[str, int] = {}
     for edge in edges:
-        if edge["type"] in PROVENANCE_EDGE_TYPES:
+        if edge["type"] not in KNOWLEDGE_EDGE_TYPES:
             continue
         if edge["src"] in kept_set and edge["dst"] in kept_set:
             kept_by_type_degree[edge["src"]] = kept_by_type_degree.get(edge["src"], 0) + 1
             kept_by_type_degree[edge["dst"]] = kept_by_type_degree.get(edge["dst"], 0) + 1
-    knowledge_edges = [
-        edge for edge in edges if edge["type"] not in PROVENANCE_EDGE_TYPES
-    ]
+    knowledge_edges = [edge for edge in edges if edge["type"] in KNOWLEDGE_EDGE_TYPES]
+    provenance_edges = [edge for edge in edges if edge["type"] in PROVENANCE_EDGE_TYPES]
     severed = [
         edge
         for edge in knowledge_edges
@@ -705,13 +745,35 @@ def census(
         for edge in knowledge_edges
         if edge["src"] not in kept_set and edge["dst"] not in kept_set
     ]
+    # Provenance edges are priced SEPARATELY, never folded into the knowledge
+    # verdict. The `isolated` rule drops every `:Source`/`:Document` — nodes that
+    # carry no knowledge edge — and so severs every `extractedFrom` pointer while
+    # a knowledge-only verdict reads "retains topology". That is real loss (a
+    # claim cut from its source loses its provenance chain), and the report must
+    # say so on the channel an operator reads.
+    severed_provenance = [
+        edge
+        for edge in provenance_edges
+        if (edge["src"] in kept_set) != (edge["dst"] in kept_set)
+    ]
+    both_dropped_provenance = [
+        edge
+        for edge in provenance_edges
+        if edge["src"] not in kept_set and edge["dst"] not in kept_set
+    ]
     told = {
         "knowledge_edges": len(knowledge_edges),
         "kept_knowledge_edges": sum(
-            count for t, count in kept_edges_by_type.items() if t not in PROVENANCE_EDGE_TYPES
+            count for t, count in kept_edges_by_type.items() if t in KNOWLEDGE_EDGE_TYPES
         ),
         "severed_knowledge_edges": len(severed),
         "both_endpoints_dropped_edges": len(both_dropped),
+        "provenance_edges": len(provenance_edges),
+        "kept_provenance_edges": sum(
+            count for t, count in kept_edges_by_type.items() if t in PROVENANCE_EDGE_TYPES
+        ),
+        "severed_provenance_edges": len(severed_provenance),
+        "both_endpoints_dropped_provenance_edges": len(both_dropped_provenance),
         "dropped_knowledge_endpoints": len(
             {
                 endpoint
@@ -727,17 +789,21 @@ def census(
             if node_class[dump_id] == "operator" and not kept_by_type_degree.get(dump_id)
         ),
     }
-    # ``retains_topology`` is a PRESERVATION verdict: it is true only when EVERY
-    # knowledge edge survives the cut. `kept > 0` labelled a cut that severs
-    # three of every four knowledge edges the same as one that severs none, and
-    # `severed == 0` stopped one step short — an edge whose BOTH endpoints are
-    # dropped is in neither ``kept`` nor ``severed``, so that form reported
-    # "topology preserved" for a cut that destroyed half the edges. This field is
-    # the verdict column an owner picks a rule from, so it reads
-    # ``kept == knowledge_edges`` (vacuously true for an edge-free graph).
-    # ``kept_knowledge_edges`` / ``severed_knowledge_edges`` /
-    # ``both_endpoints_dropped_edges`` still carry the counts.
-    told["retains_topology"] = told["kept_knowledge_edges"] == told["knowledge_edges"]
+    # ``retains_knowledge_topology`` is a PRESERVATION verdict, and its NAME
+    # states its SCOPE: it is true only when EVERY knowledge edge survives the
+    # cut. `kept > 0` labelled a cut that severs three of every four knowledge
+    # edges the same as one that severs none, and `severed == 0` stopped one step
+    # short — an edge whose BOTH endpoints are dropped is in neither ``kept`` nor
+    # ``severed``, so that form reported "topology preserved" for a cut that
+    # destroyed half the edges. This field is the verdict column an owner picks a
+    # rule from, so it reads ``kept == knowledge_edges`` (vacuously true for a
+    # graph with no knowledge edges). It is NOT a whole-report verdict: provenance
+    # edges are priced by ``kept_provenance_edges`` /
+    # ``severed_provenance_edges`` and raise their own warning, because the
+    # `isolated` cut severs them all while this boolean stays true.
+    told["retains_knowledge_topology"] = (
+        told["kept_knowledge_edges"] == told["knowledge_edges"]
+    )
     told["kept_knowledge_edge_fraction"] = (
         round(told["kept_knowledge_edges"] / told["knowledge_edges"], 4)
         if told["knowledge_edges"]
@@ -764,6 +830,7 @@ def census(
             )[:samples]
             sample_block[rule] = [
                 {
+                    "dump_id": dump_id,
                     "key": node_key(by_id[dump_id]),
                     "class": node_class[dump_id],
                     "labels": sorted(_labels(by_id[dump_id])),
@@ -874,13 +941,27 @@ def census(
     if told["severed_knowledge_edges"]:
         warnings.append(
             f"{told['severed_knowledge_edges']} knowledge edge(s) have an endpoint "
-            "the predicate drops — retains_topology is false"
+            "the predicate drops — retains_knowledge_topology is false"
         )
     if told["both_endpoints_dropped_edges"]:
         warnings.append(
             f"{told['both_endpoints_dropped_edges']} knowledge edge(s) lose BOTH "
             "endpoints to the predicate — neither endpoint is 'severed', so only "
-            "this count reports them; retains_topology is false"
+            "this count reports them; retains_knowledge_topology is false"
+        )
+    lost_provenance = (
+        told["severed_provenance_edges"]
+        + told["both_endpoints_dropped_provenance_edges"]
+    )
+    if lost_provenance:
+        # SEPARATE from the knowledge verdict: `isolated` keeps every operator and
+        # severs every `extractedFrom`, so it reads `retains_knowledge_topology:
+        # true` while cutting every claim from its source. Without this line that
+        # cut is reported as free.
+        warnings.append(
+            f"the cut severs {lost_provenance} of {told['provenance_edges']} "
+            "provenance edge(s) — retains_knowledge_topology does NOT price these: "
+            "a claim cut from its :Source/:Document loses its provenance chain"
         )
     if duplicate_key_groups:
         warnings.append(
@@ -926,7 +1007,7 @@ def census(
 def flatten_counts(value: Any, prefix: str = "") -> dict[str, int | float]:
     """``{dotted.path: number}`` for every number in a report. Deterministic.
 
-    Booleans are NUMBERS here (``0`` / ``1``), not skipped: ``retains_topology``
+    Booleans are NUMBERS here (``0`` / ``1``), not skipped: ``retains_knowledge_topology``
     is the report's headline verdict, and a diff that dropped it would report
     "nothing moved" when the topology verdict flipped between two graphs — the
     one comparison this instrument's plan exists to make.

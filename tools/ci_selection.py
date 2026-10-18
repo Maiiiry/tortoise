@@ -1012,12 +1012,18 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # so a CLI-only change selected NO surface, took the docs-only early
              # return and fell back to tier-1 smoke: the file's own CLI-contract
              # cases (--out/--samples, the exit-code split 0/1/2, --diff) would
-             # never run on the PR editing the CLI. `tools/edge_census.py` and
-             # `tools/retype_snapshot.py` above carry the same lesson: an
-             # instrument that makes an uncounted class visible must not be
-             # invisible to CI selection itself. `tortoise/graph_census.py` needs
-             # no entry (it matches no SOURCE_PATTERN, so a module-only change
-             # already falls through to `core`). Pinned by
+             # never run on the PR editing the CLI. `tools/retype_snapshot.py`
+             # directly above is the actual precedent (a hermetic instrument's
+             # guard lives in `core`); `tools/edge_census.py` deliberately took
+             # the OPPOSITE branch — it is registered under TOOL_CARVEOUTS
+             # (~line 1534), which lands in the unknown-path fallback (FULL matrix,
+             # fail closed) — so it is named here as the contrast, not as the
+             # precedent. The rule: an instrument that makes an uncounted class
+             # visible must not be invisible to CI selection itself, and it should
+             # carry the CHEAPEST leg that actually runs its guard.
+             # `tortoise/graph_census.py` needs no entry (it matches no
+             # SOURCE_PATTERN, so a module-only change already falls through to
+             # `core`). Pinned by
              # tests/test_ci_selection.py::test_graph_census_tool_change_selects_core_not_tier1.
              "tools/graph_census.py",
              # #3036: oauth.py is pinned by BOTH api-registered tests

@@ -197,6 +197,7 @@ def test_samples_do_not_change_the_measured_digest():
         assert rule in DEFAULT_RULES
         for row in rows:
             assert set(row) == {
+                "dump_id",
                 "key",
                 "class",
                 "labels",
@@ -376,9 +377,12 @@ def test_fragment_threshold_is_a_reported_parameter():
 
 def test_duplicate_survivor_is_the_best_connected_member():
     text = "Retrieval is hybrid:  keyword plus dense."
+    # The members carry DIFFERENT kinds so the assertion can name the survivor.
+    # With three identical kinds every asserted number is identity-blind and an
+    # inverted sort key ("worst-connected wins") passes the test unchanged.
     nodes = [
-        _node(1, ["Point"], id="a", pointKind="statement", content=text.upper()),
-        _node(2, ["Point"], id="b", pointKind="statement", content=text),
+        _node(1, ["Point"], id="a", pointKind="goal", content=text.upper()),
+        _node(2, ["Point"], id="b", pointKind="goal", content=text),
         _node(3, ["Point"], id="c", pointKind="statement", content=f"  {text}  "),
         _node(9, ["Point"], id="op", is_operator=True, content="IMPL(a,b)"),
     ]
@@ -390,8 +394,44 @@ def test_duplicate_survivor_is_the_best_connected_member():
     assert duplicates["largest_group"] == 3
     predicate = report["predicate"]
     assert predicate["drop_by_reason"][RULE_DUPLICATE] == 2
-    # The survivor is the best-connected member, so node 3 stays.
+    # The survivor is the best-connected member, so node 3 (the statement) stays
+    # and both goals are dropped — named by kind, so a wrong survivor shows up.
     assert predicate["keep"] == 2  # operator + survivor
+    assert predicate["kept_by_label"]["Point/statement"] == 1
+    assert predicate["dropped_by_label"] == {"Point/goal": 2}
+
+
+def test_isolated_cut_prices_the_provenance_edges_it_severs():
+    """``isolated`` keeps every operator and severs every ``extractedFrom``.
+
+    The knowledge verdict is correctly true (its NAME scopes it), so the loss has
+    to be carried by its own counts and a warning — otherwise a cut that strips
+    every ``:Source``/``:Document`` reads as free.
+    """
+    report = census(_curated_shaped(), rules=[RULE_ISOLATED])
+    topology = report["predicate"]["topology"]
+    assert topology["retains_knowledge_topology"] is True
+    assert topology["provenance_edges"] > 0
+    assert topology["kept_provenance_edges"] == 0
+    assert topology["severed_provenance_edges"] > 0
+    assert any("provenance edge(s)" in w for w in report["warnings"])
+
+
+def test_structural_edges_are_not_knowledge_degree():
+    """``CONTAINS``/``TAGGED`` carry no epistemic weight, so they are not degree.
+
+    With the old negative list ("every type except extractedFrom") these made a
+    transcript fragment look referenced and the ``isolated`` rule kept it.
+    """
+    nodes = [
+        _node(1, ["Point"], pointKind="statement", content="Hello, can you help me?"),
+        _node(2, ["Session"], name="s1"),
+        _node(3, ["Tag"], name="t1"),
+    ]
+    edges = [_edge(1, 2, "CONTAINS"), _edge(1, 3, "TAGGED")]
+    report = census(_dump(nodes, edges), rules=[RULE_ISOLATED])
+    assert report["predicate"]["topology"]["knowledge_edges"] == 0
+    assert report["predicate"]["drop_by_reason"][RULE_ISOLATED] == 3
 
 
 def test_normalize_text_under_counts_never_over_counts():
@@ -451,7 +491,7 @@ def test_negative_parameters_are_refused():
 def test_topology_block_counts_severed_edges():
     """Dropping an IMPL endpoint severs the edge — the count must say so.
 
-    ``retains_topology`` is a PRESERVATION verdict, so severing even one of two
+    ``retains_knowledge_topology`` is a PRESERVATION verdict, so severing even one of two
     knowledge edges makes it false. ``kept_knowledge_edges > 0`` would have read
     "yes" here — a cut that severs half the topology reported as preserving it
     (review finding: the verdict column flattened 16,444/21,636 severed to "yes").
@@ -464,9 +504,9 @@ def test_topology_block_counts_severed_edges():
     assert topology["severed_knowledge_edges"] == 1
     assert topology["dropped_knowledge_endpoints"] == 1
     assert topology["kept_knowledge_edges"] == 1  # > 0 …
-    assert topology["retains_topology"] is False  # … and STILL not "retains"
+    assert topology["retains_knowledge_topology"] is False  # … and STILL not "retains"
     assert topology["kept_knowledge_edge_fraction"] == 0.5
-    assert any("retains_topology is false" in w for w in report["warnings"])
+    assert any("retains_knowledge_topology is false" in w for w in report["warnings"])
     assert report["predicate"]["dropped_by_label"]["Point/statement"] == 1
 
 
@@ -476,7 +516,7 @@ def test_retains_topology_is_true_only_when_nothing_is_severed():
     topology = report["predicate"]["topology"]
     assert topology["severed_knowledge_edges"] == 0
     assert topology["kept_knowledge_edges"] == topology["knowledge_edges"]
-    assert topology["retains_topology"] is True
+    assert topology["retains_knowledge_topology"] is True
     assert topology["kept_knowledge_edge_fraction"] == 1.0
 
 
@@ -507,7 +547,7 @@ def test_retains_topology_is_false_when_both_endpoints_are_dropped():
     assert topology["kept_knowledge_edges"] == 1
     assert topology["severed_knowledge_edges"] == 1
     assert topology["both_endpoints_dropped_edges"] == 1
-    assert topology["retains_topology"] is False
+    assert topology["retains_knowledge_topology"] is False
     assert topology["kept_knowledge_edge_fraction"] == 0.3333
     assert not any("retains NONE" in w for w in report["warnings"])
     assert any("BOTH endpoints" in w for w in report["warnings"])
@@ -527,7 +567,7 @@ def test_a_cut_that_destroys_every_edge_by_both_endpoints_is_not_preserving():
     assert topology["both_endpoints_dropped_edges"] == 1  # … both endpoints gone
     assert topology["kept_knowledge_edges"] == 0
     assert topology["kept_knowledge_edge_fraction"] == 0.0
-    assert topology["retains_topology"] is False
+    assert topology["retains_knowledge_topology"] is False
     assert any("retains NONE" in w for w in report["warnings"])
     assert any("BOTH endpoints" in w for w in report["warnings"])
 
@@ -537,7 +577,7 @@ def test_a_cut_that_severs_every_edge_is_a_warning_not_a_silent_success():
 
     A graph whose knowledge edges all run operator→extracted-claim: dropping the
     claims leaves the operators with no edges at all. Node counts alone would
-    report a clean reduction, so ``retains_topology`` must be false and a
+    report a clean reduction, so ``retains_knowledge_topology`` must be false and a
     warning must say why.
     """
     nodes = [
@@ -553,7 +593,7 @@ def test_a_cut_that_severs_every_edge_is_a_warning_not_a_silent_success():
     topology = everything["predicate"]["topology"]
     assert topology["kept_knowledge_edges"] == 0
     assert topology["severed_knowledge_edges"] == 2
-    assert topology["retains_topology"] is False
+    assert topology["retains_knowledge_topology"] is False
     assert topology["kept_operators_isolated_by_the_cut"] == 1
     assert any("retains NONE" in w for w in everything["warnings"])
 
@@ -563,7 +603,7 @@ def test_a_cut_that_severs_every_edge_is_a_warning_not_a_silent_success():
     # count of nodes it removes.
     isolated_only = census(dump, rules=[RULE_ISOLATED])
     assert isolated_only["predicate"]["topology"]["kept_knowledge_edges"] == 2
-    assert isolated_only["predicate"]["topology"]["retains_topology"] is True
+    assert isolated_only["predicate"]["topology"]["retains_knowledge_topology"] is True
 
 
 def test_untyped_only_cut_keeps_every_edge_in_the_measured_shape():
@@ -572,7 +612,7 @@ def test_untyped_only_cut_keeps_every_edge_in_the_measured_shape():
     topology = report["predicate"]["topology"]
     assert topology["severed_knowledge_edges"] == 0
     assert topology["kept_knowledge_edges"] == topology["knowledge_edges"]
-    assert topology["retains_topology"] is True
+    assert topology["retains_knowledge_topology"] is True
 
 
 # ── identities: reported, never refused ─────────────────────────────────────
@@ -659,12 +699,24 @@ def test_falsy_non_dict_prop_bag_is_also_refused(prop_bag):
         census(dump)
 
 
-def test_absent_prop_bag_is_still_accepted():
-    """The fail-closed check must not fire on a node that simply carries props=None."""
-    dump = _curated_shaped()
-    dump["nodes"][0]["props"] = None
-    report = census(dump)
-    assert report["totals"]["nodes"] == len(dump["nodes"])
+def test_absent_prop_bag_is_refused_like_a_lost_label_set():
+    """``_dump_node`` always emits ``props``, so ``None``/absent is a LOST field.
+
+    Accepting it as "no props" makes the node ``untyped``, and ``RULE_UNTYPED``
+    then proposes DROPPING it — the same corruption-converted-into-a-drop-
+    recommendation that a lost label set is refused for. The sibling non-dict
+    cases (``[]`` / ``0`` / ``False`` / ``""``) were already refused.
+    """
+    mutations = (
+        lambda node: node.__setitem__("props", None),
+        lambda node: node.pop("props"),
+    )
+    for mutate in mutations:
+        dump = _curated_shaped()
+        mutate(dump["nodes"][0])
+        with pytest.raises(CensusError) as excinfo:
+            census(dump)
+        assert any("CORRUPTION" in problem for problem in excinfo.value.problems)
 
 
 def test_non_list_label_set_is_refused():
@@ -704,7 +756,7 @@ def test_absent_edge_list_is_refused():
 
     Accepted as empty, every node has knowledge degree 0 — so the default cut
     proposes dropping every claim — while ``knowledge_edges == 0`` makes
-    ``retains_topology`` vacuously true and disables BOTH warnings. That is the
+    ``retains_knowledge_topology`` vacuously true and disables BOTH warnings. That is the
     false green this instrument exists to prevent, so the edge half is
     fail-closed exactly like the node half (``dump_graph`` always emits the key;
     ``retype.apply_plan`` refuses the same shape).
@@ -763,7 +815,7 @@ def test_declared_vs_counted_disagreement_is_warned():
 def test_flatten_counts_records_booleans_as_numbers():
     """A bool is 0/1 here, never skipped.
 
-    ``predicate.topology.retains_topology`` is the report's headline verdict; if
+    ``predicate.topology.retains_knowledge_topology`` is the report's headline verdict; if
     ``flatten_counts`` skipped bools, a diff could not show it flip — the one
     comparison the plan's "and then the diff" exists to make.
     """
@@ -772,7 +824,7 @@ def test_flatten_counts_records_booleans_as_numbers():
     assert flat == flatten_counts(report)
     assert flat["totals.nodes"] == 6
     assert flat["predicate.keep"] == report["predicate"]["keep"]
-    assert flat["predicate.topology.retains_topology"] in (0, 1)
+    assert flat["predicate.topology.retains_knowledge_topology"] in (0, 1)
     assert not any(isinstance(v, bool) for v in flat.values())
 
 
@@ -874,7 +926,7 @@ def test_diff_shows_a_retains_topology_flip():
     """The headline verdict must be diffable, or the diff is blind to the change.
 
     Two graphs that differ only in whether the IMPL target is droppable: under
-    ``extracted`` the first severs the edge (retains_topology false) and the
+    ``extracted`` the first severs the edge (retains_knowledge_topology false) and the
     second keeps it (true). ``flatten_counts`` used to skip bools, so this flip
     produced ``moved == {}``.
     """
@@ -893,11 +945,11 @@ def test_diff_shows_a_retains_topology_flip():
 
     before = shaped(with_pointer=True)
     after = shaped(with_pointer=False)
-    assert census(before)["predicate"]["topology"]["retains_topology"] is False
-    assert census(after)["predicate"]["topology"]["retains_topology"] is True
+    assert census(before)["predicate"]["topology"]["retains_knowledge_topology"] is False
+    assert census(after)["predicate"]["topology"]["retains_knowledge_topology"] is True
 
     diff = diff_census(before, after, fragment_max_chars=0)
-    assert diff["moved"]["predicate.topology.retains_topology"] == {
+    assert diff["moved"]["predicate.topology.retains_knowledge_topology"] == {
         "before": 0,
         "after": 1,
         "delta": 1,
