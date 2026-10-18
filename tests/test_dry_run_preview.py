@@ -1057,6 +1057,43 @@ class TestBlastRadius:
         assert (m.SUPERSEDE_STRUCTURAL_RELS
                 is sdk_mod.SUPERSEDE_STRUCTURAL_RELS)
 
+    def test_supersede_preview_uses_the_writers_epistemic_labels(
+            self, sdk, monkeypatch):
+        """#8622: the preview's 2a-DIRECT reclassification resolves the far
+        endpoint against the writer's `EPISTEMIC_LABELS` (imported from
+        `tortoise.live`), never a re-listed copy — the same import-never-relist
+        rule the structural-rel pin above enforces. Two arms, because identity
+        alone would not stop a LOCAL copy being used beside it:
+
+        1. identity — the attribute the preview holds IS the writer's constant;
+        2. behaviour — narrowing the module attribute propagates into the
+           classification, so the branch really reads it at call time. A
+           hardcoded tuple in `_preview_supersede` would ignore the narrowing
+           and keep reporting the Object-ended edge as transferred.
+        """
+        import tortoise.mcp_server as m
+        from tortoise import live as live_mod
+
+        assert m.EPISTEMIC_LABELS is live_mod.EPISTEMIC_LABELS
+
+        from tortoise.mcp_server import _preview_supersede
+
+        old, new = _seed_point(sdk, "old"), _seed_point(sdk, "new")
+        obj = sdk.create_object("Widget", "product")["id"]
+        sdk.create_direct_edge("IMPL", old, obj, label="related-to")
+
+        # Prelude: with the writer's real four-label vocabulary the edge is a
+        # transfer — so the narrowing below is what changes the verdict, not a
+        # pre-existing defect in the preview.
+        assert _preview_supersede(sdk, old, new)["edges_dropped"] == []
+
+        monkeypatch.setattr(m, "EPISTEMIC_LABELS", ("Point",))
+        narrowed = _preview_supersede(sdk, old, new)
+        assert [d["type"] for d in narrowed["edges_dropped"]] == ["IMPL"], (
+            "the preview ignored the narrowed EPISTEMIC_LABELS — it is not "
+            f"reading the writer's constant at call time: {narrowed}")
+        assert narrowed["edges"] == [], narrowed["edges"]
+
 
 # ── D. the guards fire identically in dry-run ───────────────────────
 
