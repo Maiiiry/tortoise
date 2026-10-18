@@ -443,6 +443,18 @@ class GitHubIndexer:
         indexed by the run that minted the cursor, and counting them toward
         the cap again is what let a >2×cap backlog oscillate between two
         boundary seconds forever, its tail never indexed (P1-4, PR #1792).
+
+        #8090 (the DIFF→DRAIN residual of #1990): DRAIN ALSO skips items
+        strictly OLDER than the boundary second — but ONLY when the cursor
+        carries the ``older_indexed`` claim, i.e. when some run's walk
+        enumerated the WHOLE stream and completed clean, so every item below
+        the boundary is provably indexed. Without the claim DRAIN treats the
+        older region as deferred backlog and spends its cap re-projecting it
+        (the verified 5-poll cycle when the NEWEST second's block exceeds the
+        cap: `{S,2025} → {S1,500,t} → {S,1000,t} → {S,1500,t} → {S,2000,t} →
+        {S,2025} → …`). The claim is FAIL-CLOSED: absent unless a full walk
+        proved it, so an un-proven cursor keeps the pre-#8090 behaviour and
+        can never skip un-indexed items (the #1895 loss class).
         """
         if not cursor:
             return False
@@ -469,6 +481,12 @@ class GitHubIndexer:
         # oscillation).
         if drain and n["updated_at"] > cur_updated:
             return True
+        # #8090: the mirror skip on the OLDER side — only with the explicit
+        # `older_indexed` claim (a full clean walk established it). Absent the
+        # claim, older items stay processable: DRAIN keeps draining them.
+        if (drain and cursor.get("older_indexed")
+                and n["updated_at"] < cur_updated):
+            return True
         # #1990: in DIFF mode the cursor's boundary second is a LOWER BOUND
         # of the readable region — every item strictly older than it is
         # already indexed (the DIFF boundary invariant: a clean cursor is
@@ -490,6 +508,74 @@ class GitHubIndexer:
             return False
         return (n["updated_at"] == cur_updated
                 and n["number"] <= cur_number)
+
+    @staticmethod
+    def _sane_boundary(cursor: dict | None) -> dict | None:
+        """The cursor's own composite boundary, or None when it is unusable.
+
+        #8090: the persisted cursor is UNTRUSTED (#3552 made it server-owned,
+        but a legacy/hand-patched row is still an arbitrary dict), so a mint
+        that PRESERVES the input boundary — or claims everything below it is
+        indexed — must fail closed on a missing/malformed ``updated_at`` or
+        ``number`` rather than propagate it. Returning None means "no usable
+        input claim": the caller mints from this run's own evidence only.
+        """
+        if not cursor:
+            return None
+        cur_updated = cursor.get("updated_at") or ""
+        try:
+            cur_number = int(cursor.get("number") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not cur_updated or not (0 < cur_number <= _SANE_ISSUE_NUMBER_MAX):
+            return None
+        return {"updated_at": cur_updated, "number": cur_number}
+
+    @staticmethod
+    def _max_boundary(newest: dict, cursor: dict | None) -> dict:
+        """#8090: mint at ``max(newest_processed, input boundary)``.
+
+        A clean mint used to be taken at the NEWEST **processed** item, which
+        in a drain chain is an OLDER second than the input cursor's boundary —
+        so the claim the input cursor already carried ("everything newer than
+        me is indexed") was discarded and the next DIFF re-probed the whole
+        newer window. The input claim is valid on its own terms (``> U`` by its
+        minting run, ``== U and number <= N`` by the #1895 ASC-prefix
+        invariant), so the boundary never has to regress. Pure win: fewer
+        probes, same exact-once set.
+        """
+        base = GitHubIndexer._sane_boundary(cursor)
+        if base is None:
+            return newest
+        try:
+            new_number = int(newest.get("number") or 0)
+        except (TypeError, ValueError):
+            return base
+        if (base["updated_at"], base["number"]) > (
+                newest.get("updated_at") or "", new_number):
+            return base
+        return newest
+
+    @staticmethod
+    def _boundary_at_least(minted: dict, cursor: dict | None) -> bool:
+        """#8090: True when ``minted``'s boundary is at/above ``cursor``'s.
+
+        The input cursor's claims cover (a) everything ABOVE its boundary
+        second (the minting run processed it) and (b) the boundary second up
+        to its ``number`` (#1895 ASC prefix). A mint at/above that boundary
+        therefore never re-opens a region the input cursor already claimed,
+        which is what makes it safe to carry the ``older_indexed`` claim onto
+        a TRUNCATED mint. An unusable input boundary fails closed (False).
+        """
+        base = GitHubIndexer._sane_boundary(cursor)
+        if base is None:
+            return False
+        try:
+            minted_number = int(minted.get("number") or 0)
+        except (TypeError, ValueError):
+            return False
+        return (minted.get("updated_at") or "", minted_number) >= (
+            base["updated_at"], base["number"])
 
     async def _fetch_items(self, client: httpx.AsyncClient, repo: str,
                            cursor: dict | None,
@@ -529,6 +615,10 @@ class GitHubIndexer:
           refetches from the top so the deferred backlog (updated before the
           cursor) keeps draining up to ``cap`` per run. The boundary skip
           keeps it exact-once; idempotent probes make overlap harmless.
+          #8090: when the cursor carries the ``older_indexed`` claim, the
+          older-than-boundary region is skipped too (it is provably indexed),
+          so the cap is spent on real backlog and the walk reaches the stream
+          end instead of churning the same older block every poll.
 
         #1895 (second-buffered ASC flush): GitHub's stream
         (``sort=updated&direction=desc``) delivers each exact ``updated_at``
@@ -575,6 +665,24 @@ class GitHubIndexer:
         conservative cursor case included, where the pre-#1990 code
         re-stamped ``truncated`` and ping-ponged DIFF/DRAIN forever on a
         non-dense repo.
+
+        #8090 (the DIFF→DRAIN residual of #1990): "truncated" being a
+        property of the READABLE REGION was not enough when the NEWEST
+        second's block itself holds more items than ``cap`` — the cursor
+        still ping-ponged DIFF → DRAIN forever, because a composite cursor
+        carried no claim that items OLDER than its boundary second are
+        indexed, so every DRAIN run re-walked and re-projected the whole
+        older backlog (verified cycle: ``{S,2025} → {S1,500,t} → {S,1000,t}
+        → {S,1500,t} → {S,2000,t} → {S,2025} → {S1,500,t} → …``, ~2,025
+        already-indexed items re-projected per cycle). The fix carries that
+        claim on the cursor as ``older_indexed`` (set only by a run whose
+        walk applied no ``since`` and completed clean — see the mint in
+        ``_project_items``), lets DRAIN skip the older region when the claim
+        is present, and stops the clean mint regressing the boundary below
+        the input cursor's own. The unconditional fold-in (skipping older
+        items in DRAIN without the claim) remains UNSAFE and must not be
+        reintroduced: on the ``test_drain_mode`` fixture it skips the
+        deferred backlog entirely (#1895 empirical rejection).
         """
         items: list[dict] = []
         total_estimate: int | None = None
@@ -1291,6 +1399,18 @@ class GitHubIndexer:
         # idempotently on the next DIFF). Capped/quota-cut runs still mint
         # from ``last`` (the cut boundary is exact-once).
         newest: dict | None = None
+        # #8090: the "older-than-boundary indexed" claim the mint may carry.
+        #
+        # ``input_marker``: the input cursor already carries it (and has a
+        # boundary for it to be about).
+        # ``full_walk``: this run's walk started at the TOP of the stream with
+        # no `since` — a DRAIN run (``since_cursor`` is None) or the very
+        # first run (no cursor) — so completing it clean ENUMERATES the whole
+        # stream and proves the claim for the cursor it mints (see the mint
+        # below).
+        input_marker = bool(cursor and cursor.get("older_indexed")
+                            and cursor.get("updated_at"))
+        full_walk = cursor is None or bool(cursor.get("truncated"))
         for item in items:
             if quota_check is not None:
                 try:
@@ -1360,11 +1480,20 @@ class GitHubIndexer:
             # since-bounded DIFF whose window misses the un-fetched older
             # backlog → permanent silent loss (same invariant as the
             # 0-processed clear guard below).
-            if cap_hit or stats["quota_hit"] or not walk_complete:
+            truncated_mint = cap_hit or stats["quota_hit"] or not walk_complete
+            if truncated_mint:
                 new_cursor: dict[str, Any] = {
                     "updated_at": last["updated_at"], "number": last["number"]}
             else:
-                src = newest or last
+                # #8090: mint at max(newest_processed, input boundary) — the
+                # input cursor's own claim (`> U` indexed by its minting run;
+                # `== U and number <= N` by the #1895 prefix invariant) is
+                # valid independently of the marker, so discarding it at a
+                # drain completion REGRESSED the boundary to an older second
+                # and cost every subsequent DIFF a full re-probe of the newer
+                # window. Preserving it removes that poll of churn (and, on
+                # the #8090 shape, a whole DRAIN chain).
+                src = self._max_boundary(newest or last, cursor)
                 new_cursor = {"updated_at": src["updated_at"],
                               "number": src["number"]}
             # Cap-truncated runs, quota-interrupted runs, AND premature-end
@@ -1373,8 +1502,51 @@ class GitHubIndexer:
             # break must not silently drop the unprocessed tail; a
             # premature end must not silently skip the un-fetched backlog,
             # #1989 review round 3).
-            if cap_hit or stats["quota_hit"] or not walk_complete:
+            if truncated_mint:
                 new_cursor["truncated"] = True
+            # #8090: carry the "every item strictly OLDER than this boundary
+            # is already indexed" claim — the ONLY licence DRAIN has to skip
+            # the older backlog (`_inside_cursor`). FAIL CLOSED: the claim is
+            # written only when it is provably true, so every uncertain path
+            # merely costs one extra DRAIN walk (the pre-#8090 behaviour)
+            # instead of skipping an un-indexed item (the #1895 loss class).
+            #
+            #  • A CLEAN mint establishes it when the run's walk started at
+            #    the TOP of the stream with no `since` (a DRAIN run, or the
+            #    very first run): such a walk ENUMERATES the whole stream, so
+            #    completing it clean proves every item below the mint is
+            #    indexed. Otherwise (a since-bounded DIFF run) it only rides
+            #    the input cursor's existing claim: a DIFF walk is bounded at
+            #    the old boundary and never fetches below it.
+            #  • A TRUNCATED mint rides the input cursor's claim only when the
+            #    minted boundary is at/above the input boundary. Then every
+            #    item between the two was FETCHED (the walk descends the
+            #    stream contiguously from the top or from the DIFF window, so
+            #    nothing above the cut can be missing) and processed, and
+            #    everything below the input boundary is the input cursor's
+            #    own claim — so the claim is true for the mint as well.
+            #    A cut landing BELOW the input boundary can never ride it
+            #    (that region was not fetched by this run, and its own
+            #    boundary-second prefix is now below the cut) — it fails
+            #    closed, exactly as #1990's predecessor did.
+            #
+            # NOTE (deviation from the issue's literal wording, deliberate):
+            # #8090's body says to CLEAR the claim on "a DIFF-mode cap cut".
+            # Clearing it there re-creates the very cycle this issue exists
+            # to kill: the initial DIFF from a claimed cursor ALWAYS cap-cuts
+            # on the >cap newest block (`{S,2025} → {S1,500,t}`), so a
+            # cleared claim sends the next DRAIN back through the whole older
+            # backlog — {S,1000,t} → {S,1500,t} → {S,2000,t} → {S,2025} →
+            # {S1,500,t} → … — and the acceptance criterion ("the cycle is
+            # gone") becomes unreachable. Inheritance is PROVEN, not hopeful:
+            # see the boundary argument above and
+            # test_newest_block_over_cap_reaches_steady_state.
+            if not truncated_mint:
+                if input_marker or full_walk:
+                    new_cursor["older_indexed"] = True
+            elif (input_marker
+                    and self._boundary_at_least(new_cursor, cursor)):
+                new_cursor["older_indexed"] = True
             stats["cursor"] = new_cursor
         elif (cursor is not None and cursor.get("truncated")
                 and cursor.get("updated_at")
