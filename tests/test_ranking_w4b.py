@@ -699,8 +699,10 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
       would NOT imply that, so the headroom comparison is asserted too), and
       "raising the boost does not repair this" was true only of the smallest
       pages;
-    * on a 2-row page it needs MORE than the clamp's headroom
-      ``1.0 - baseline graph_boost`` — so no ``cb`` inside the documented
+    * on a 2-row page whose contested row is the LESS similar one — the bottom
+      of the span, ``d_sim == +1``, the placement asserted below and the case
+      this boost exists for — it needs MORE than the clamp's headroom
+      ``1.0 - baseline graph_boost``, so no ``cb`` inside the documented
       [0, 1] invariant can clear it.  Shown directly: raise
       ``W4_CONTESTED_BOOST`` far past the clamp and the graph term pins at 1.0
       and the ordering still loses.
@@ -764,11 +766,11 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
 
             cb_req = (sim_w * Δsim + graph_w * Δgb + rec_w * Δrec) / graph_w
 
-        with Δ = calm − hot.  The ``ceiling`` bound in the caller assumes the
-        ``graph_w * Δgb`` term vanishes, which is legitimate ONLY because the
-        parity NAND makes ``Δgb == 0`` — so the expectation here is derived with
-        the term PRESENT and the parity is asserted separately, instead of being
-        assumed by the band."""
+        with Δ = calm − hot.  The ``ceiling`` in the caller bounds the
+        ``graph_w * Δgb`` term with ``|Δgb|`` and is valid for any ``Δgb``; what
+        assumes ``Δgb == 0`` is the 1.857 it is pinned to.  So the expectation
+        here is derived with the term PRESENT and the parity is asserted
+        separately, instead of being assumed by the band."""
         return (
             DEFAULT_SIMILARITY_WEIGHT * (c["similarity"] - h["similarity"])
             + DEFAULT_GRAPH_BOOST_WEIGHT * (gb_calm - gb_hot)
@@ -817,12 +819,14 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"1.4286 requirement")
 
     # ── The PREMISE the quoted 1.4286 rests on, asserted BY NAME ──────────
-    # ``ceiling`` below bounds the ``graph_w * Δgb`` term, which is the
-    # right bound only when the twins share a baseline graph_boost — the parity
-    # NAND in ``_seed_twin_conflict`` is what makes them.  Nothing used to name
-    # it: drop that NAND and calm falls to degree 0 (gb 0.45, Δgb −0.25, the
-    # 2-row requirement 1.1786), every band assertion here still passes, and
-    # the comment's 1.4286 / "both twins' baseline is 0.7" go stale silently.
+    # ``ceiling`` below bounds the ``graph_w * Δgb`` term with ``|Δgb|``, which
+    # tracks this page's own placement; the 1.857 it is pinned to is legitimate
+    # only because the twins share a baseline graph_boost — the parity NAND in
+    # ``_seed_twin_conflict`` is what makes them.  The parity is asserted here
+    # BY NAME so a break reports its cause: dropping that NAND takes calm to
+    # degree 0 (gb 0.45, Δgb −0.25, the 2-row requirement 1.1786), which the
+    # band assertions below also fail — but their messages point at the comment
+    # rather than at the fixture this assertion names.
     assert two_gb_calm == two_gb_hot == pytest.approx(0.7), (
         f"the fixture no longer gives both twins the same 0.7 baseline "
         f"graph_boost the comment quotes (calm {two_gb_calm}, hot "
@@ -868,9 +872,11 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"the 2-row requirement is {two_req:.4f}, ABOVE its ceiling "
         f"{ceiling:.4f} — then it is not bounded by the page after all")
     # A WEIGHTS pin rather than a payload read (|d_gb| = 0 on this page, which
-    # the parity assertion above already guarantees): it fails only if the
-    # ranker's weights move, and it is here so the 1.857 the comment quotes
-    # cannot drift away from the band this test enforces.
+    # the parity assertion above already guarantees): it fails if the ranker's
+    # weights move, or if the twins stop sharing a baseline — the parity
+    # assertion above catches the latter first, with a message that names it.
+    # It is here so the 1.857 the comment quotes cannot drift away from the
+    # band this test enforces.
     assert ceiling == pytest.approx(1.857, abs=1e-3), (
         f"the comment quotes 1.857 as the ceiling at |d_gb| = 0; this page's "
         f"|d_gb| = {abs(two_gb_calm - two_gb_hot):.4f} puts it at "
@@ -885,17 +891,19 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"(sim_w + graph_w + rec_w) / graph_w; this is {absolute:.4f}")
     # THE GUARANTEE — the ONE claim here about pages rather than this fixture:
     # ``cb`` is confined to the graph term, so the most it can add is the
-    # clamp's headroom ``1.0 - baseline``.  On a page whose contested row is the
-    # MORE similar one (``d_sim == +1``, the placement asserted above and the
-    # case this boost exists for) with equal recency, the requirement is
-    # ``1.4286 + d_gb`` >= ``1.4286 - gb_hot``, which EXCEEDS that headroom — so
-    # no ``cb`` inside the invariant clears it.  Scope it exactly: a page whose
-    # contested row sits at the BOTTOM of the span needs less, because
-    # ``d_sim`` is then negative and the similarity term runs the other way —
-    # which is why the placement is asserted as a PREMISE above rather than
-    # assumed by the band.  ``1.0`` is not a 2-row bound and is not asserted as
-    # one: the value pinned just below is THIS fixture's requirement (1.4286,
-    # from the parity), not "a 2-row page must need the full span".
+    # clamp's headroom ``1.0 - baseline``.  On a page whose CONTESTED row is the
+    # LESS similar one — ``d_sim == +1`` (``d = calm − hot``), i.e. the bottom
+    # of the span, the placement asserted above and the case this boost exists
+    # for — with equal recency, the requirement is ``1.4286 + d_gb`` >=
+    # ``1.4286 - gb_hot``, which EXCEEDS that headroom, so no ``cb`` inside the
+    # invariant clears it.  Scope it exactly: on a page whose contested row is
+    # the MORE similar one (the top of the span) ``d_sim`` is negative, the
+    # requirement is ``-1.4286 + d_gb`` and DROPS below the headroom, so the
+    # clamp CAN deliver it — which is why the placement is asserted as a
+    # PREMISE above rather than assumed by the band.  ``1.0`` is not a 2-row
+    # bound and is not asserted as one: the value pinned just below is THIS
+    # fixture's requirement (1.4286, from the parity), not "a 2-row page must
+    # need the full span".
     two_headroom = 1.0 - two_gb_hot
     assert two_headroom == pytest.approx(0.3), (
         f"the comment quotes 0.3 of clamp headroom (1.0 - a 0.7 baseline); "
@@ -981,11 +989,13 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         [dict(r) for r in res3])
     assert {hot, calm} <= set(three_ids), (
         f"the 3-row page must hold both twins: {three_ids}")
-    # The DRAW-INDEPENDENT half of the comment's claim: the requirement is
-    # non-increasing in page size (``_min_max_normalize``'s span can only grow,
-    # and the twins' own numerator is fixed by their ranks), so a 3-row page can
-    # never need more than the 2-row worst case.  This holds whichever row the
-    # page puts between the twins.
+    # The DRAW-INDEPENDENT half of the comment's claim: for a page whose
+    # contested row is the less similar one (``d_sim > 0``, the placement
+    # asserted above), the requirement is non-increasing in page size
+    # (``_min_max_normalize``'s span can only grow, and the twins' own numerator
+    # is fixed by their ranks), so a 3-row page can never need more than the
+    # 2-row worst case.  Which of those rows the page puts between the twins
+    # does not matter; the span DIRECTION does, which is why it is named.
     assert three_req <= two_req + 5e-3, (
         f"the 3-row requirement ({three_req:.4f}) must not EXCEED the 2-row "
         f"one ({two_req:.4f}): the requirement falls as the page grows")

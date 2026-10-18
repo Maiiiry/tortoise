@@ -166,7 +166,9 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 #     lands on cell 0.7540, the next cell 0.7541 still ties once ``final_score``
 #     is rounded again, and the flip starts at cell 0.7542.  Remedy (2) is a real
 #     magnitude choice with a page-dependent, partial effect — not an
-#     impossibility.  Clearing #2102's own E2E-1 pre-assertion
+#     impossibility.  Measured: ``cb`` = 0.06 (> 0.0542) ranks the contested twin
+#     FIRST on the shipped default page, where the shipped 0.05 leaves it
+#     second.  Clearing #2102's own E2E-1 pre-assertion
 #     (relevance delta <= 0.05 in similarity space) takes
 #     ``cb > 0.5 * 0.05 / 0.35`` = 0.0714.
 #   * What no ``cb`` inside the invariant can buy is the SMALL pages: the clamp
