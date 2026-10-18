@@ -799,17 +799,34 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         DEFAULT_SIMILARITY_WEIGHT / DEFAULT_GRAPH_BOOST_WEIGHT, abs=5e-3), (
         f"the comment quotes a 2-row requirement of 1.4286; this page measures "
         f"{two_req:.4f}")
-    # The same payload gives the band the comment states.
-    #   cb_req = (sim_w * 1 + rec_w * (r_calm - r_hot)) / graph_w
-    # so (sim_w - rec_w)/graph_w <= cb_req <= (sim_w + rec_w)/graph_w.
+    # The same payload gives the band the comment states, carrying the graph
+    # term its formula has:
+    #   cb_req = (sim_w*d_sim + graph_w*d_gb + rec_w*d_rec) / graph_w
+    #          <= (sim_w + graph_w*|d_gb| + rec_w) / graph_w   (page in [0, 1])
+    # |d_gb| is read off THIS page, so the band tracks the page instead of
+    # restating two weights: 0 here (the parity premise asserted above), which
+    # is the comment's 1.857; 2.857 at |d_gb| = 1, the general ceiling the
+    # comment now names.
     floor = (DEFAULT_SIMILARITY_WEIGHT - DEFAULT_RECENCY_WEIGHT) / DEFAULT_GRAPH_BOOST_WEIGHT
-    ceiling = (DEFAULT_SIMILARITY_WEIGHT + DEFAULT_RECENCY_WEIGHT) / DEFAULT_GRAPH_BOOST_WEIGHT
+    ceiling = (
+        DEFAULT_SIMILARITY_WEIGHT
+        + DEFAULT_GRAPH_BOOST_WEIGHT * abs(two_gb_calm - two_gb_hot)
+        + DEFAULT_RECENCY_WEIGHT
+    ) / DEFAULT_GRAPH_BOOST_WEIGHT
     assert two_req >= floor - 1e-6, (
         f"the 2-row requirement is {two_req:.4f}, below its floor {floor:.4f} "
         f"— the derivation in W4_CONTESTED_BOOST's comment is stale")
     assert two_req <= ceiling + 1e-6, (
         f"the 2-row requirement is {two_req:.4f}, ABOVE its ceiling "
         f"{ceiling:.4f} — then it is not bounded by the page after all")
+    # A WEIGHTS pin rather than a payload read (|d_gb| = 0 on this page, which
+    # the parity assertion above already guarantees): it fails only if the
+    # ranker's weights move, and it is here so the 1.857 the comment quotes
+    # cannot drift away from the band this test enforces.
+    assert ceiling == pytest.approx(1.857, abs=1e-3), (
+        f"the comment quotes 1.857 as the ceiling at |d_gb| = 0; this page's "
+        f"|d_gb| = {abs(two_gb_calm - two_gb_hot):.4f} puts it at "
+        f"{ceiling:.4f}")
     # THE GUARANTEE: what a cb inside [0, 1] can buy is at most the clamp's
     # headroom 1.0 - baseline, and the requirement exceeds it. (Separately,
     # ``two_req >= 1.0`` — numerically the floor at these weights — is the
@@ -882,16 +899,24 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # has to clear, like the 0.0188 beside it — and (parenthetically) the
     # residual a reader sees in the payload once the shipped boost applies.
     # 0.5 / 0.35 also reconciles with the 1.4286 above; a post-boost figure
-    # quoted alone would not (0.4825 / 0.35 = 1.3786).
-    three_gap = three_req * DEFAULT_GRAPH_BOOST_WEIGHT
+    # quoted alone would not (0.4825 / 0.35 = 1.3786).  Both are MEASURED from
+    # the payload (the residual plus the applied boost), not restated from
+    # ``three_req`` — otherwise the 0.5 would assert nothing the 1.4286 above
+    # does not already say.
+    three_residual = three_calm["final_score"] - three_hot["final_score"]
+    three_gap = three_residual + contrib
     assert three_gap == pytest.approx(0.5, abs=2e-3), (
         f"the comment quotes a 0.5 relevance gap on the 3-row pool; this page "
-        f"measures {three_gap:.4f}")
-    assert (three_calm["final_score"] - three_hot["final_score"]) == (
-        pytest.approx(three_gap - contrib, abs=2e-3)), (
+        f"measures {three_gap:.4f} (residual {three_residual:.4f} plus the "
+        f"{contrib:.4f} boost)")
+    assert three_residual == pytest.approx(three_gap - contrib, abs=1e-3), (
         f"the 3-row residual must be the gap minus the applied boost "
-        f"({three_gap - contrib:.4f}); this page shows "
-        f"{three_calm['final_score'] - three_hot['final_score']:.4f}")
+        f"({three_gap - contrib:.4f}); this page shows {three_residual:.4f}")
+    assert three_gap == pytest.approx(
+        three_req * DEFAULT_GRAPH_BOOST_WEIGHT, abs=2e-3), (
+        f"the quoted 3-row figures must reconcile: the measured gap "
+        f"({three_gap:.4f}) is not what the quoted requirement implies "
+        f"({three_req * DEFAULT_GRAPH_BOOST_WEIGHT:.4f})")
 
     # ── Remedy (2)'s actionable half: the raise is RUN, not inferred ──────
     # ``ten_req < two_req`` alone does NOT imply that a raise repairs the

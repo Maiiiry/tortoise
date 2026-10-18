@@ -114,11 +114,21 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 #
 # WHAT A LARGER BOOST WOULD AND WOULD NOT BUY (#7704, corrected 2026-10-18).
 # The required increment is BOUNDED, not unbounded: ``_min_max_normalize`` maps
-# a page into [0, 1], so the gap the boost must clear is at most
-# ``similarity_weight`` (0.5) plus the ``recency_weight`` swing (0.15), and
-# ``cb > (similarity_weight * d + recency_weight * r) / graph_boost_weight``
-# therefore SATURATES at 1.857 — 1.4286 with equal recency (d = 1, r = 0).  A
-# 2-row page is that worst case because a page cannot hold fewer than the two
+# a page into [0, 1], so every term of the level condition between the twins
+#
+#   cb_req = (similarity_weight * d_sim + graph_boost_weight * d_gb
+#             + recency_weight * d_rec) / graph_boost_weight    (d = calm - hot)
+#
+# is bounded by its own weight, and ``cb_req`` SATURATES at
+# ``(similarity_weight + graph_boost_weight * |d_gb| + recency_weight)
+# / graph_boost_weight`` — 2.857 in the worst case, where the twins' baseline
+# ``graph_boost`` differs maximally (each row's is in [0, 1]).  The 1.857 the
+# page-bound band pins is that ceiling with ``d_gb <= 0``, and 1.4286 is the
+# equal-recency case with ``d_gb == 0`` — the case the measured pages here
+# exhibit, because the E2E-1 twins share a baseline ``graph_boost`` (identical
+# operator connectivity).  That premise is what makes the flat 1.4286 figures
+# below legitimate, so the test pins it by name rather than assuming it.  A
+# 2-row page is the worst PAGE because a page cannot hold fewer than the two
 # rows being ordered: it is a maximum, not the first term of a series.  Measured
 # on the bare 4-row E2E-1 fixture (dense leg live, re-measured 2026-10-18):
 # required total ``cb`` 1.4286 on a 2-row page (built from the fused rows — the
