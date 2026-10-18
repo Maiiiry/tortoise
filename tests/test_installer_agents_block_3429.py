@@ -773,6 +773,9 @@ def test_a_non_numeric_version_is_reported_as_such(tmp_path):
     assert "not a number this installer can compare" in report, report
     assert "unversioned" not in report, report
     assert "updated text" not in report, report
+    # The report says so AND the file was really upgraded (not just claimed).
+    assert "<!-- tortoise:block v2-rc1 -->" not in agents
+    assert "<!-- tortoise:block v2 -->" in agents
     assert "integer expression expected" not in (done.stdout + done.stderr), (
         "a shell comparison must not be fed a non-number")
 
