@@ -63,6 +63,8 @@ from .live import (
     _terminal_excluded,
     _terminal_expression,
     _alive_flag,
+    epistemic_disjunction,  # #6976: the traversal-position widening
+    epistemic_label_queries,  # #6976: the id-anchored per-label sweep
     is_terminal_status,
 )
 
@@ -2746,33 +2748,92 @@ def annotate_ep_batch(graph, point_ids: list[str]) -> dict[str, EpBreakdown]:
 def get_relationships(graph, point_ids: list[str]) -> dict[str, list[dict]]:
     """Fetch operator-edge relationships for a batch of Point IDs.
 
-    Single Cypher query — NOT N+1. Returns dict mapping point_id → list of
-    relationship dicts with {predicate, mechanism, related_id, related_kind,
-    related_content, direction, operator_id}.
+    One id-anchored query per epistemic label (NOT N+1 — the batch rides
+    ``$ids``). Returns dict mapping point_id → list of relationship dicts with
+    {predicate, mechanism, related_id, related_kind, related_content,
+    direction, operator_id}.
 
     Points with no operator edges get an empty list.
+
+    **Every endpoint is an epistemic node, not necessarily a ``:Point``
+    (#6976).** ONTOLOGY §5 / the #7813 owner ruling let a claim's endpoints
+    carry any of the four labels (``:Point`` / ``:Subject`` / ``:Object`` /
+    ``:Event``) — only an OPERATOR stays ``:Point`` — and the #8882 re-typing
+    migration moves exactly those nodes onto their own layer. This read used to
+    hard-code ``:Point`` on the anchor AND on the peer, so a hub whose edges run
+    to re-typed nodes matched nothing, the seeds below were never filled, and
+    ``sdk.expand_relationships`` returned the empty seed verbatim: a dense node
+    read as isolated. The three predicates are therefore the sanctioned
+    widening, not a loosening of WHAT is counted:
+
+    * the ANCHOR is swept per label (``live.epistemic_label_queries``) rather
+      than filtered in a WHERE, because the anchor is id-anchored and each
+      label keeps its own ``(label, id)`` range index (#7853);
+    * the PEER is widened by traversal (``live.epistemic_disjunction``) — it is
+      reached from the operator, so no index applies — and its non-operator
+      test admits an ABSENT ``is_operator`` (a ``:Object``/``:Event`` carries
+      no such property; the ``= false`` spelling excluded every one of them);
+    * the OPERATOR keeps its ``:Point`` label (ONTOLOGY §5 — a re-typing plan
+      that moves an operator is refused) but is identified by
+      ``is_operator = true OR op_type IS NOT NULL``, the #943 parity every other
+      operator read uses, so an operator written without the flag is not
+      invisible here alone.
+
+    A node's own layer kind and text live under that layer's property
+    (``pointKind``/``content`` for a Point, ``objectKind``/``name`` for an
+    Object, …), so ``related_kind`` and ``related_content`` coalesce the four —
+    otherwise the peers this widening admits come back with an empty kind and
+    empty content, which is the same defect one layer down.
     """
     if not point_ids:
         return {}
 
     rels: dict[str, list[dict]] = {pid: [] for pid in point_ids}
 
+    # #6976: `WITH n` is LOAD-BEARING, not style. On FalkorDB 6.x a `WHERE` on
+    # `n.id IN $ids` followed by a plain MATCH that re-binds `n` (or carries a
+    # relationship pattern) is planned as a WHOLE-GRAPH read — the rows come
+    # back for FOREIGN points or with a NULL `n`, every one of them is dropped
+    # by the `if pid in rels` guard below, and the caller reads a densely
+    # connected node as isolated. Same barrier as the other id-anchored readers
+    # in this tree (`tests/test_id_predicate_barrier_6976.py`, #7162).
+    #
+    # The operator predicate rides the SECOND WHERE (after both MATCHes) so no
+    # WHERE here is followed by a MATCH that re-binds what it constrains — the
+    # `WITH n` is the only barrier this shape needs.
+    template = (
+        "MATCH (n:{label}) WHERE n.id IN $ids "
+        "WITH n "
+        "MATCH (n)-[r:IMPL|NAND|hasPart]-(op:Point) "
+        "MATCH (op)-[r2:IMPL|NAND|hasPart]-(other) "
+        "WHERE (op.is_operator = true OR op.op_type IS NOT NULL) "
+        f"  AND {epistemic_disjunction('other')} "
+        "  AND other.id <> n.id "
+        "  AND (other.is_operator IS NULL OR other.is_operator = false) "
+        "RETURN n.id, op.op_type AS mechanism, "
+        "  coalesce(op.label, '') AS predicate, "
+        "  op.id AS operator_id, other.id AS related_id, "
+        "  coalesce(other.pointKind, other.objectKind, other.subjectKind, "
+        "           other.eventKind) AS related_kind, "
+        "  coalesce(other.content, other.name) AS related_content, "
+        "  r.idx AS n_idx, r2.idx AS other_idx"
+    )
+
     try:
-        cypher = (
-            "MATCH (n:Point) WHERE n.id IN $ids "
-            "WITH n "
-            "MATCH (n)-[r:IMPL|NAND|hasPart]-(op:Point {is_operator:true}) "
-            "MATCH (op)-[r2:IMPL|NAND|hasPart]-(other:Point) "
-            "WHERE other.id <> n.id "
-            "  AND other.is_operator = false "
-            "RETURN n.id, op.op_type AS mechanism, "
-            "  coalesce(op.label, '') AS predicate, "
-            "  op.id AS operator_id, other.id AS related_id, "
-            "  other.pointKind AS related_kind, "
-            "  other.content AS related_content, "
-            "  r.idx AS n_idx, r2.idx AS other_idx"
-        )
-        rows = graph.query(cypher, params={"ids": point_ids}).result_set
+        rows: list = []
+        # A node carries exactly ONE of the four labels (re-typing refuses a
+        # multi-label node), so a row cannot legitimately arrive twice; the
+        # `seen` set only keeps a graph/mock that answers every per-label query
+        # identically from multiplying the payload.
+        seen: set[tuple] = set()
+        for cypher in epistemic_label_queries(template):
+            for row in graph.query(
+                    cypher, params={"ids": point_ids}).result_set:
+                key = tuple(row)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
 
         for row in rows:
             pid = row[0]

@@ -25227,6 +25227,14 @@ class TortoiseSDK:
         on demand. Each entry gains `related_status` (the neighbor's point
         status — live/superseded/retracted/draft) so the full-fidelity view is
         not blind to terminal state (#689/#898 posture).
+
+        A neighbour is an epistemic node, so the status lookup sweeps all four
+        labels (#6976): with `MATCH (n:Point)` a peer that the #8882 re-typing
+        migration moved to `:Object`/`:Subject`/`:Event` came back with
+        `related_status: ""` — an advisory field that cannot tell "this peer has
+        no lifecycle state" from "this read never looked at its label". A
+        neighbour on another layer may genuinely carry no `status` (the retype
+        drop list); that still reports "" for exactly that reason.
         """
         from .search_engine import get_relationships
         proj = self._get_proj()
@@ -25237,11 +25245,15 @@ class TortoiseSDK:
         statuses: dict[str, str] = {}
         if related_ids:
             try:
-                rows = proj.g.query(
-                    "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id, n.status",
-                    params={"ids": related_ids},
-                    timeout=200,
-                ).result_set
+                rows: list = []
+                for _q in epistemic_label_queries(
+                        "MATCH (n:{label}) WHERE n.id IN $ids "
+                        "RETURN n.id, n.status"):
+                    rows.extend(proj.g.query(
+                        _q,
+                        params={"ids": related_ids},
+                        timeout=200,
+                    ).result_set)
                 statuses = {row[0]: row[1] or "" for row in rows}
             except Exception:
                 pass
