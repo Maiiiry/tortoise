@@ -667,11 +667,13 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     requirement SATURATES on a 2-row page instead of growing without bound.
     The two consequences a reader needs are measured here, not restated:
 
-    * the requirement FALLS as the page grows — and the repair that follows is
-      RUN, not inferred: a raise inside the clamp's headroom flips the shipped
-      default page (``ten_req < two_req`` alone would NOT imply that, so the
-      headroom comparison is asserted too), and "raising the boost does not
-      repair this" was true only of the smallest pages;
+    * the requirement FALLS as the page grows (flat while the page still
+      spans the twins, then down to the default page's 0.0540) — and the
+      repair that follows is RUN, not inferred: a raise inside the clamp's
+      headroom flips the shipped default page (``ten_req < two_req`` alone
+      would NOT imply that, so the headroom comparison is asserted too), and
+      "raising the boost does not repair this" was true only of the smallest
+      pages;
     * on a 2-row page it needs MORE than the clamp's headroom
       ``1.0 - baseline graph_boost`` — so no ``cb`` inside the documented
       [0, 1] invariant can clear it.  Shown directly: raise
@@ -834,6 +836,32 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"'unbounded' would look like, and it is what the corrected comment "
         f"denies")
 
+    # ── The intermediate page a reader may quote: limit=3 ────────────────
+    # The comment's middle row.  A 3-row fused page STILL holds the twins at
+    # both ends of the span (the third row lands in the middle), so it buys
+    # nothing over the 2-row page — which is why the requirement is flat to
+    # 1.4286 and only falls at limit>=4.  Both quoted figures are pinned here:
+    # the requirement, and the 0.4825 final-score delta on that pool.
+    res3 = ranked_sdk.tortoise_fts_query(query, limit=3, order_by="graph")
+    assert {r.get("match_source") for r in res3} == {"rrf"}, (
+        "the limit=3 row of the comment is a FUSED-read measurement")
+    three_req, three_hot, three_calm, three_ids = required_cb(
+        [dict(r) for r in res3])
+    assert {hot, calm} <= set(three_ids), (
+        f"the 3-row page must hold both twins: {three_ids}")
+    assert (three_calm["similarity"], three_hot["similarity"]) == (1.0, 0.0), (
+        f"the comment says a 3-row page still spans the twins (1.4286); this "
+        f"one gives calm {three_calm['similarity']} / hot "
+        f"{three_hot['similarity']}")
+    assert three_req == pytest.approx(1.4286, abs=5e-3), (
+        f"the comment quotes 1.4286 at limit=3; this page requires "
+        f"{three_req:.4f}")
+    assert (three_calm["final_score"] - three_hot["final_score"]) == (
+        pytest.approx(0.4825, abs=2e-3)), (
+        f"the comment quotes the 3-row pool's relevance gap as 0.4825 of "
+        f"final score; this page measures "
+        f"{three_calm['final_score'] - three_hot['final_score']:.4f}")
+
     # ── Remedy (2)'s actionable half: the raise is RUN, not inferred ──────
     # ``ten_req < two_req`` alone does NOT imply that a raise repairs the
     # default page — a value above ten_req can still exceed the clamp's
@@ -846,14 +874,15 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"(calm {ten_gb_calm}, hot {ten_gb_hot}): the requirement read off "
         f"this page is then not the comment's")
     ten_headroom = 1.0 - ten_gb_hot
-    # The comment's two figures, both from this page's payloads: 0.0537 is the
-    # measured requirement at limit=10, and 0.0714 = sim_w * 0.05 / graph_w is
-    # what clearing #2102's own E2E-1 pre-assertion (relevance delta <= 0.05 in
-    # similarity space) takes.
+    # The two figures the comment quotes for this page.  0.0540 is the measured
+    # requirement (asserted against the payloads through the formula); 0.0714
+    # is NOT a payload read — it is arithmetic on the ranker's own weights for
+    # #2102's E2E-1 pre-assertion (relevance delta <= 0.05 in similarity
+    # space), so it is checked as arithmetic and then against the requirement.
     assert ten_req == pytest.approx(
         derived_cb(ten_hot, ten_calm, ten_gb_calm, ten_gb_hot), abs=5e-3)
-    assert ten_req == pytest.approx(0.0537, abs=1e-3), (
-        f"the comment quotes a 0.0537 requirement on the shipped default "
+    assert ten_req == pytest.approx(0.0540, abs=2e-3), (
+        f"the comment quotes a 0.0540 requirement on the shipped default "
         f"page; this run measures {ten_req:.4f}")
     clears_2102 = DEFAULT_SIMILARITY_WEIGHT * 0.05 / DEFAULT_GRAPH_BOOST_WEIGHT
     assert clears_2102 == pytest.approx(0.0714, abs=1e-3)
@@ -861,7 +890,16 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"the comment says a cb clearing #2102's 0.05 relevance delta "
         f"({clears_2102:.4f}) also clears the default page's requirement "
         f"({ten_req:.4f})")
-    modest = 0.08  # > ten_req, > clears_2102, < ten_headroom
+    # The claim is two-sided on THIS page: at the shipped boost the contested
+    # twin is SECOND (the failure #7704 reports), and at the comment's own
+    # 0.06 it is FIRST.  The lower bound is the headroom, so the inference
+    # from ``ten_req < two_req`` alone is not what is being relied on.
+    shipped_ids = [r["id"] for r in res]
+    assert shipped_ids.index(hot) > shipped_ids.index(calm), (
+        f"at the shipped cb the contested twin must rank BELOW its twin on "
+        f"the default page — that loss is the defect #7704 reports (got "
+        f"{shipped_ids})")
+    modest = 0.06  # the comment's measured value: > ten_req, < ten_headroom
     assert ten_req < modest <= ten_headroom, (
         f"a modest raise ({modest}) must sit between the default page's "
         f"requirement ({ten_req:.4f}) and the clamp's headroom "

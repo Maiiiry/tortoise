@@ -85,7 +85,8 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # converts that ONE-rank difference into a relevance gap that grows as the
 # pool shrinks — measured on the shipped hybrid path: 0.0188 of final score on
 # the 4-row E2E-1 fixture (just above the 0.0175 boost, so the contested twin
-# ranks BELOW its twin), 0.254 on a 3-row pool.  The guarantee therefore holds
+# ranks BELOW its twin), 0.4825 on a 3-row pool (there the twins occupy both
+# ends of the normalization span).  The guarantee therefore holds
 # on a SINGLE-LEG read (where both twins score identically and the boost is
 # the sole differentiator), and on a fused read only while the fused relevance
 # delta stays under the boost effect.  Sizing the boost, changing the fusion
@@ -115,11 +116,15 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # therefore SATURATES at 1.857 — 1.4286 with equal recency (d = 1, r = 0).  A
 # 2-row page is that worst case because a page cannot hold fewer than the two
 # rows being ordered: it is a maximum, not the first term of a series.  Measured
-# on the bare 4-row E2E-1 fixture (dense leg live): required total ``cb``
-# 1.4286 at limit=2, 0.7257 at limit=3, 0.0537 at limit>=4 — the requirement
-# FALLS as the page grows, and the largest value it ever takes is the 2-row one.
+# on the bare 4-row E2E-1 fixture (dense leg live, re-measured 2026-10-18):
+# required total ``cb`` 1.4286 on a 2-row page (built from the fused rows — the
+# SDK's own ``limit=2`` read does not hold both twins), still 1.4286 at
+# ``limit=3`` (the twins occupy both ends of the span, so a third row buys
+# nothing), and 0.0540 at ``limit>=4`` — the shipped default 10 included.  The
+# requirement FALLS as the page grows and the largest value it ever takes is
+# the 2-row one.
 #   * A modest raise therefore DOES repair the shipped default read: on that
-#     fixture, ``cb`` > 0.0537 flips the limit=10 ordering (measured: cb=0.06
+#     fixture, ``cb`` > 0.0540 flips the limit=10 ordering (measured: cb=0.06
 #     ranks the contested twin first).  Remedy (2) is a real magnitude choice
 #     with a page-dependent, partial effect — not an impossibility.  Clearing
 #     #2102's own E2E-1 pre-assertion (relevance delta <= 0.05 in similarity
