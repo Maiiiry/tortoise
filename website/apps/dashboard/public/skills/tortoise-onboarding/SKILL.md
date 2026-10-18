@@ -529,6 +529,27 @@ Guide the human through:
    Anthropic — your key, their cloud).
 3. The connector exposes the `tortoise_*` MCP tools to claude.ai workflows.
 
+
+### Already installed — refreshing is the same command
+
+An install is not a one-time write. The installer owns two things inside your
+project: the skills directory and, on a Codex project, the marker-delimited
+Tortoise block in `AGENTS.md`. **Re-running the installer is the upgrade path**
+— it replaces what sits between its own `<!-- tortoise:start -->` and
+`<!-- tortoise:end -->` markers, leaves everything you wrote around them alone,
+and does not duplicate the block.
+
+```bash
+curl -fsSL https://app.premiselabs.co/install-tortoise-skills.sh | bash -s -- --harness <harness>
+```
+
+The block carries a version line (`<!-- tortoise:block vN -->`) and the
+installer says which version you ended up on — `created`, `upgraded v1 → v2`, or
+`already current`. If a repo's `AGENTS.md` has the markers but no version line,
+it was provisioned before versioning existed and its instructions are stale:
+re-run the installer rather than editing the block by hand. Never hand-edit
+inside the markers you did not write; the next refresh discards it.
+
 ## 4. Verify, then checkpoint harness-connected
 
 1. Call `tortoise_health` (MCP tool, all 6 harnesses once connected). It

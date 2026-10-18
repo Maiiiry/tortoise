@@ -100,6 +100,25 @@ codex mcp add tortoise --url https://api.premiselabs.co/mcp/ --bearer-token-env-
 
 Restart your client. You should now have Tortoise's tools (create points, query the graph, run evidence propagation, capture sessions).
 
+### Already installed? Re-run the installer
+
+The installer is idempotent **and it is the upgrade path** — re-running it is how an existing setup picks up a
+newer standing block, a corrected instruction, or new skill text. Nothing else rewrites them: for a Codex
+project the installer owns the `AGENTS.md` block, and a block written by an older version would otherwise be
+re-read in every future session forever.
+
+```bash
+curl -fsSL https://app.premiselabs.co/install-tortoise-skills.sh | bash -s -- --harness codex
+```
+
+It replaces only what sits between its own `<!-- tortoise:start -->` / `<!-- tortoise:end -->` markers, so
+anything you wrote around it is untouched, and it prints which block version you ended up on (`created`,
+`upgraded v1 → v2`, or `already current`). To see what you have without changing anything:
+
+```bash
+grep -o 'tortoise:block v[0-9]*' AGENTS.md      # empty: written before versions existed — re-run to upgrade
+```
+
 Rate limit: **100 requests/min per key**.
 
 ## 3. Use the CLI (optional, for scripting)

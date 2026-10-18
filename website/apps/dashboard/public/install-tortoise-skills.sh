@@ -401,6 +401,16 @@ done
 # instructions (it auto-loads per session; there is NO skills-declaration
 # syntax in AGENTS.md). Emit a Tortoise block so every session knows when and
 # how to use the graph — idempotent (marker-delimited replace).
+#
+# #3429: the block is VERSIONED. The markers make a re-run idempotent, but
+# nothing made a STALE block DETECTABLE — and a repo provisioned before the
+# text changed keeps re-reading the old block forever, because the file is
+# someone else's and the installer is the only thing that rewrites it. The
+# version line is inside the marker window, so the replace below refreshes it
+# too. BUMP `AGENTS_BLOCK_VERSION` whenever the block's text changes; the
+# upgrade path needs nothing else.
+AGENTS_BLOCK_VERSION="2"
+
 emit_codex_agents_block() {
   local file="AGENTS.md"
   local ms="<!-- tortoise:start -->"
@@ -408,12 +418,23 @@ emit_codex_agents_block() {
   local tmpdir block pre post target
   tmpdir="$(mktemp -d)" || return 1
   block="$tmpdir/block"; pre="$tmpdir/pre"; post="$tmpdir/post"
+  local prev_version="" had_block=0
   # Resolve a symlinked AGENTS.md (monorepos point AGENTS.md at a shared
   # file) — refresh the TARGET, never clobber the link.
   target="$file"
   [ -L "$file" ] && target="$(readlink "$file")"
+  # The version the file carries NOW (empty = markers with no version line,
+  # i.e. provisioned before #3429).
+  if [ -f "$target" ]; then
+    prev_version="$(sed -n 's/.*tortoise:block v\([0-9][0-9]*\) -->.*/\1/p' "$target" | head -1)"
+    # Capture the PRE-write state: after the write the file always has markers.
+    if grep -qF "$ms" "$target" && grep -qF "$me" "$target"; then
+      had_block=1
+    fi
+  fi
   printf '%s\n' \
 "${ms}
+<!-- tortoise:block v${AGENTS_BLOCK_VERSION} -->
 # Tortoise — agent memory (this project is connected to Tortoise Cloud)
 - If the Tortoise MCP tools are available in this session (search/query/health +
   graph-write tools) and these skills (how-to-use-tortoise, tortoise-decide,
@@ -421,10 +442,11 @@ emit_codex_agents_block() {
   being asked to: after a decision or a research finding, file it; search the graph
   before answering from memory; say plainly when nothing relevant is stored.
 - When the user says \"Set up Tortoise\", follow the onboarding instructions at
-  $SKILLS_BASE/tortoise-onboarding/SKILL.md. Write the MCP config, restart the
-  client so the new session reads it, then verify with tortoise_health before
-  reporting done. Onboarding is delivered as INSTRUCTIONS, not as an installed
-  skill.
+  $SKILLS_BASE/tortoise-onboarding/SKILL.md. Write the MCP config FIRST, then
+  restart the client so the new session reads it — the server is loaded at
+  session start, so the rest of THIS session cannot see it. Only in that NEW
+  session run the verify with tortoise_health, and report done from there.
+  Onboarding is delivered as INSTRUCTIONS, not as an installed skill.
 - First-time MCP calls may prompt for approval — tortoise_health and the read tools
   are safe to allow.
 ${me}" > "$block"
@@ -454,7 +476,18 @@ ${me}" > "$block"
     cat "$block" > "$target"
   fi
   rm -rf "$tmpdir"
-  echo "  ✓ AGENTS.md — Tortoise standing instructions refreshed/created"
+  # #3429: say WHICH version we leave behind. A re-run is the upgrade path, and
+  # a repo whose block predates the version line (or carries an older one) must
+  # be able to see that it was upgraded rather than silently re-written.
+  if [ -n "$prev_version" ] && [ "$prev_version" = "$AGENTS_BLOCK_VERSION" ]; then
+    echo "  ✓ AGENTS.md — Tortoise block v$AGENTS_BLOCK_VERSION (already current)"
+  elif [ -n "$prev_version" ]; then
+    echo "  ✓ AGENTS.md — Tortoise block upgraded v$prev_version → v$AGENTS_BLOCK_VERSION"
+  elif [ "$had_block" -eq 1 ]; then
+    echo "  ✓ AGENTS.md — Tortoise block upgraded (unversioned → v$AGENTS_BLOCK_VERSION)"
+  else
+    echo "  ✓ AGENTS.md — Tortoise standing instructions created (block v$AGENTS_BLOCK_VERSION)"
+  fi
 }
 
 # Verify the target dir — we KNOW where we wrote, so this is a local check.
