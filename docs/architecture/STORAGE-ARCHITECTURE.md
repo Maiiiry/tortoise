@@ -1258,6 +1258,31 @@ Every system above embeds **name + description/summary**. Our `:Object` carries 
 
 **⚠️ This is the mechanism we do not have, and it is the difference between a tiering scheme that gets cheaper over time and one that does not.** The published failure list names its absence directly as **"no attribution loop."** **⛔ The write-back must respect extractor §2.4.2: a finding written back to Tier 1 carries the SPAN, and the raw fact behind it stays immutable.** Anything else turns the summary tier into a system that quietly overwrites its own evidence.
 
+### 12.5a ✅ The decision layer — what landed, and what it deliberately does not do
+
+**`tortoise/sufficiency_router.py` is §12.4's and §12.5's ONE home** (`#5009`). It is a **pure decision** — no I/O, no clock, no model, no graph handle — and it is the artifact `tortoise/residency_router.py` has been consuming without a producer: `route_residency(sufficient=…)` now has a real `bool | None` to read.
+
+| | |
+|---|---|
+| **the verdict** | `assess_sufficiency()` answers *"does the evidence I already have actually answer this?"* from the assembled rows — anchor coverage and provenance coverage, each a **measured fraction of the answer**, never a predicted property of the question. |
+| **the trigger** | `route_sufficiency()` emits **one** route (`serve` / `escalate-tier` — the same words the residency router already uses) and is **bounded**: `escalated` + a caller-supplied `budget`. A still-insufficient second verdict is REPORTED, never re-walked. |
+| **the write-back** | `plan_writeback()` turns **verified** findings into derived summary units that carry their own `SourceSpan`, cannot change a claim's class, carry no raw payload and no supersession field, and dedupe by content-addressed `unit_key` over `(span, normalised claim)`. |
+
+**Three states, never two.** `undetermined` is a first-class verdict: an **unassessed** measure (no threshold supplied, or a provenance field the read path never fetched — `search_provenance_enabled()` off) must not score as `insufficient` (that escalates on a measurement never taken) and must not score as `sufficient` (that is §14.1 V4's silent `ok`). It yields `sufficient=None`, and the router serves — §12.3's default answer. Same polarity as §17.3's `marker=None` → *not assessed*.
+
+**⛔ Residency outranks sufficiency here too.** `assess_sufficiency(resident=False|None)` REFUSES to judge: a read the cache could not see has not established insufficiency, so it may never escalate a tier (§17.3 rule 2). The two routers compose — residency first, then sufficiency — and a test pins the three states across the seam.
+
+**⛔ No query class, and it is pinned structurally.** The router takes no `query`/`query_type`/`complexity`/`intent` argument, and no `time`/`socket`/`subprocess`/`os`/model import — so §12.4's rejected classifier and §12.7's *router overhead* cannot be reintroduced without reddening a test. `anchors` is the one query-derived input, and it is the set of **referenced entities** (coverage over the answer), not a question type.
+
+**⚠️ Deliberately NOT built, each with a named reason:**
+
+- **The tier walk and the Tier-1 store.** §12.3's TWO-tier count is a fold the DESIGN made, **not an owner ruling** — `#5009` carries it as open. The module therefore names the §12.4 repair and takes the budget as a parameter; it never names "Tier 2". §12.5's persistence seam is the caller's, and this module cannot become a second writer.
+- **The thresholds.** Every measure takes its threshold from the caller and **there are no defaults** — §14.1 O5's draft→run→refine method with hand-set numbers, and §14.1 O2 forbids a target nobody chose.
+- **The premise measurement.** `#5009`'s own evidence discipline: *whether our queries are actually answered badly by a cheap tier* **precedes** the wiring. That measurement needs this verdict to have a definition first — which is why the decision layer is the correct first slice, and why the read path is not wired.
+- **The registry row is unchanged: `not-implemented`** (`config/v4-mechanisms.yml`). Nothing escalates yet, so a reader must keep meeting an absence, not an assumption.
+
+**Verification:** `tests/test_sufficiency_router.py` (hermetic, `core` lane) — 57 tests, each mutation-proved against the edit it exists to catch (the collapse guard, the flattened third state, the unbounded trigger, the missing span, the promoted class, the dropped dedupe, the payload field).
+
 ### 12.6 The published architecture — `TierMem` (arXiv 2602.17913, 20 Feb 2026)
 
 **`TierMem` is published with measured results, so we adopt its specifics rather than invent them.**
