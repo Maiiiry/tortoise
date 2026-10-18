@@ -2,38 +2,36 @@
 
 `sdk.expand_relationships` is the Tortoise graph brief's mandated READ recipe
 (§3, and §8 rule 8 mandates it over ``traverse``). It delegates to
-``search_engine.get_relationships``, which selected its rows with ``:Point``
-hard-coded on BOTH endpoints of the operator expansion:
+``search_engine.get_relationships``, whose selection had two blind spots:
 
-    MATCH (n:Point) WHERE n.id IN $ids
-    ...
-    MATCH (op)-[r2:IMPL|NAND|hasPart]-(other:Point)
-    WHERE other.is_operator = false
+1. **Operator-less direct edges were invisible.** ``sdk.create_direct_edge`` is
+the shape ONTOLOGY v3.5 §8 calls canonical for a plain IMPL/NAND connection
+("plain IMPL/NAND connections are direct edges … NO operator node"), and it is
+what ``tortoise_list_batch`` reports as a ``direct_edge``. The reader required
+an operator hop, so a graph written that way read as having NO relationships —
+from both endpoints. Recorded repro: an ``IMPL`` + ``NAND`` pair →
+``expand_relationships`` returned ``[]`` on the source and on both targets
+while raw Cypher showed the edges.
 
-ONTOLOGY §5 (owner ruling #7813) allows a claim's endpoints to carry any of the
-four epistemic labels — ``:Point`` / ``:Subject`` / ``:Object`` / ``:Event``;
-only an OPERATOR stays ``:Point`` — and the #8882 re-typing migration moves
-exactly those nodes onto their own layer. On such a graph the anchor matched
-nothing (a hub that IS an ``:Event``) or the peer matched nothing (an
-``:Object`` endpoint), the seeds ``{pid: []}`` were never filled, and
-``expand_relationships`` returned that empty seed verbatim: a node with a dozen
-relationships reported ``[]``.
+2. **Both endpoints were narrowed to ``:Point``.** ONTOLOGY §5 (owner ruling
+#7813) allows a claim's endpoints to carry any of the four epistemic labels —
+``:Point`` / ``:Subject`` / ``:Object`` / ``:Event``; only an OPERATOR stays
+``:Point`` — and the #8882 re-typing migration moves exactly those nodes onto
+their own layer. ``other.is_operator = false`` compounded it: a non-Point layer
+carries no such property, and ``NULL = false`` is NULL. Measured at the base of
+the fixing lane, same graph / same run (embedded): a hub that IS an ``:Event``
+with 10 edges read as ``[]``; a ``:Point`` hub whose IMPL/hasPart peers were
+``:Object`` read as 1 of its 5 relationships.
 
-Measured at the base of the fixing lane, same graph / same run (embedded):
-
-    :Event hub, 10 edges   raw Cypher → expand_relationships == []      (BROKEN)
-    :Point hub, :Object peers, 8 edges   expand → 1 of 5 relationships
-    :Point hub, isolated           expand → []
-
-The tests below are the acceptance gate for the fix. Each is discriminating:
+The tests below are the acceptance gate. Each is discriminating:
 
 * restoring the label-restricted predicate (``(n:Point)`` + ``(other:Point)``)
-  reds the hub tests — expand goes back to ``[]`` / loses every non-``:Point``
-  peer;
-* restoring ``other.is_operator = false`` reds the Object/Subject/Event peer
-  assertions (a non-Point node carries no ``is_operator`` property, so the
-  ``= false`` spelling excludes it on the NULL, not on the value);
-* returning a placeholder for an isolated node reds the isolated test.
+  reds the hub tests — the ``:Event`` anchor matches nothing;
+* restoring ``other.is_operator = false`` reds them for the non-Point peers
+  (excluded on the NULL, not on the value) once the labels are widened;
+* dropping the direct-edge leg reds `test_direct_edge_hub_is_not_isolated`;
+* restoring ``op.is_operator:true`` reds the flagless-operator test;
+* returning a placeholder for an isolated node reds the isolated tests.
 
 The ``related_status`` contract (live/superseded/retracted/draft, #689/#898) and
 the empty case are pinned alongside, because a widening that bought the peers
@@ -91,10 +89,11 @@ def _event(sdk, name):
 def _raw_relationships(graph, node_id):
     """The SAME relation `get_relationships` promises, written raw.
 
-    One row per (mechanism, co-endpoint) — the operator-mediated view, with no
-    label narrowing on the anchor, the operator or the peer. This is the ground
-    truth the method must reproduce; it deliberately does not call into the
-    reader under test.
+    Two legs, mirroring the two blind spots this module pins: the
+    operator-mediated view (with no label narrowing on the anchor, the operator
+    or the peer) and the operator-less direct edges. This is the ground truth
+    the method must reproduce; it deliberately does not call into the reader
+    under test.
     """
     rows = graph.query(
         "MATCH (n)-[r:IMPL|NAND|hasPart]-(op:Point)-[r2:IMPL|NAND|hasPart]-(other) "
@@ -103,7 +102,15 @@ def _raw_relationships(graph, node_id):
         "  AND other.id <> n.id "
         "  AND (other.is_operator IS NULL OR other.is_operator = false) "
         "  AND (other:Point OR other:Subject OR other:Object OR other:Event) "
-        "RETURN op.op_type, other.id",
+        "RETURN op.op_type AS mechanism, other.id AS related "
+        "UNION ALL "
+        "MATCH (n)-[d:IMPL|NAND]-(other) "
+        "WHERE n.id = $id "
+        "  AND other.id <> n.id "
+        "  AND (other.is_operator IS NULL OR other.is_operator = false) "
+        "  AND other.op_type IS NULL "
+        "  AND (other:Point OR other:Subject OR other:Object OR other:Event) "
+        "RETURN type(d) AS mechanism, other.id AS related",
         params={"id": node_id},
     ).result_set
     return [(row[0], row[1]) for row in rows]
@@ -166,6 +173,91 @@ def test_hub_matches_raw_cypher(sdk):
     related = {e["related_id"] for e in entries}
     assert set(peers.values()) <= related, (
         f"peers dropped from the expand payload: {set(peers.values()) - related}"
+    )
+    # INDEPENDENT cross-check, anchored at the OTHER end: every claimed
+    # (operator, related) pair must be an edge the operator really has. This
+    # cannot pass by construction from either query above — it asks the
+    # operator side, not the anchor side.
+    op_rows = graph.query(
+        "MATCH (op:Point)-[r:IMPL|NAND|hasPart]-(other) "
+        "WHERE op.id IN $ops AND other.id IN $related "
+        "RETURN DISTINCT op.id, other.id",
+        params={"ops": [e["operator_id"] for e in entries if e["operator_id"]],
+                "related": sorted(related)},
+    ).result_set
+    real_pairs = {(row[0], row[1]) for row in op_rows}
+    for entry in entries:
+        assert (entry["operator_id"], entry["related_id"]) in real_pairs, (
+            f"entry is not backed by an edge the operator really has: {entry!r}"
+        )
+
+
+# ── The other half of the defect: operator-less direct edges ────────────
+
+def test_direct_edge_hub_is_not_isolated(sdk):
+    """``create_direct_edge`` — ONTOLOGY v3.5 §8's canonical plain connection.
+
+    The reader required an operator hop, so a hub wired with direct IMPL/NAND
+    edges read as having NO relationships — from BOTH endpoints. This is the
+    issue's recorded repro. Here the payload's (type, related_id) set must equal
+    raw Cypher's, because a direct edge IS the relationship (one hop).
+    """
+    hub = _point(sdk, "INCIDENT-51 known directly to three claims")
+    supported = _point(sdk, "the claim this incident supports")
+    refuted = _point(sdk, "the claim this incident refutes")
+    inbound = _point(sdk, "the claim asserting this incident")
+    sdk.create_direct_edge("IMPL", hub, supported, label="supports")
+    sdk.create_direct_edge("NAND", hub, refuted, label="refutes")
+    sdk.create_direct_edge("IMPL", inbound, hub, label="supports")
+
+    graph = _graph(sdk)
+    raw_edges = graph.query(
+        "MATCH (n)-[r:IMPL|NAND]-(other) WHERE n.id = $id "
+        "RETURN type(r), other.id",
+        params={"id": hub},
+    ).result_set
+
+    entries = sdk.expand_relationships(hub)
+    assert len(entries) == len(raw_edges), (
+        f"a direct-edge hub read as {len(entries)} relationships, raw Cypher "
+        f"reports {len(raw_edges)}: {entries!r}"
+    )
+    assert _expand_set(entries) == {(r[0], r[1]) for r in raw_edges}
+
+    # direction is derived from the edge's own orientation, not guessed
+    direction = {(e["mechanism"], e["related_id"]): e["direction"] for e in entries}
+    assert direction[("IMPL", supported)] == "outgoing"
+    assert direction[("NAND", refuted)] == "outgoing"
+    assert direction[("IMPL", inbound)] == "incoming"
+    # the edge's own label rides the predicate, and there is no operator to name
+    assert all(e["operator_id"] == "" for e in entries)
+    assert {e["predicate"] for e in entries} == {"supports", "refutes"}
+
+
+def test_direct_edge_target_is_not_isolated(sdk):
+    """The same edge from the TARGET side — the repro's other two nodes."""
+    source = _point(sdk, "claim D: the deploy caused the outage")
+    target = _point(sdk, "claim E: the deploy was clean")
+    sdk.create_direct_edge("NAND", source, target)
+
+    entries = sdk.expand_relationships(target)
+    assert _expand_set(entries) == {("NAND", source)}, (
+        f"the target of a direct edge read as isolated: {entries!r}"
+    )
+    assert entries[0]["direction"] == "incoming"
+
+
+def test_direct_and_operator_edges_coexist(sdk):
+    """A hub wired both ways reports both, each once."""
+    hub = _point(sdk, "INCIDENT-52 mixed wiring")
+    via_op = _point(sdk, "peer reached through an operator")
+    direct = _point(sdk, "peer reached by a direct edge")
+    sdk.create_operator("IMPL", hub, [via_op])
+    sdk.create_direct_edge("NAND", hub, direct)
+
+    entries = sdk.expand_relationships(hub)
+    assert _expand_set(entries) == {("IMPL", via_op), ("NAND", direct)}, (
+        f"mixed wiring mis-reported: {entries!r}"
     )
 
 
@@ -232,24 +324,38 @@ def test_isolated_non_point_still_returns_empty(sdk):
 
 
 def test_related_status_survives_the_widening(sdk):
-    """#689/#898: the expand payload is not blind to a peer's terminal state."""
+    """#689/#898: the expand payload is not blind to a peer's terminal state.
+
+    The value is the PEER LAYER's own lifecycle status. ``:Point``,
+    ``:Object`` and ``:Subject`` all carry ``status``; ``:Event`` carries
+    ``eventStatus`` instead and therefore reports ``""`` — pinned here so the
+    field's meaning is explicit rather than silently layer-dependent.
+    """
     hub = _event(sdk, "INCIDENT-45 the superseded-cause outage")
     live_peer = _point(sdk, "the current explanation of incident 45")
     stale_peer = _point(sdk, "the retracted explanation of incident 45")
     obj_peer = _object(sdk, "svc-c the affected service")
+    subj_peer = _subject(sdk, "the on-call team for incident 45")
+    event_peer = _event(sdk, "the follow-up incident 46")
     _graph(sdk).query(
         "MATCH (n:Point) WHERE n.id = $id SET n.status = 'superseded'",
         params={"id": stale_peer},
     )
     sdk.create_operator("IMPL", hub, [live_peer, stale_peer, obj_peer])
+    sdk.create_direct_edge("NAND", hub, subj_peer)
+    sdk.create_direct_edge("IMPL", hub, event_peer)
 
     statuses = {e["related_id"]: e["related_status"]
                 for e in sdk.expand_relationships(hub)}
     assert statuses[live_peer] == "live"
     assert statuses[stale_peer] == "superseded"
-    # an :Object carries its own lifecycle status — the lookup must find it
-    # under whichever of the four labels the peer actually holds
+    # :Object / :Subject carry a `status` — the lookup must find it under
+    # whichever of the four labels the peer actually holds
     assert statuses[obj_peer] == "live"
+    assert statuses[subj_peer] == "live"
+    # :Event has no `status` (its lifecycle is `eventStatus`): "" is the honest
+    # answer, and it is now reached by looking rather than by never asking
+    assert statuses[event_peer] == ""
 
 
 # ── The shape of the emitted Cypher (the #6976 barrier class) ───────────
@@ -294,3 +400,36 @@ def test_emitted_query_keeps_the_id_predicate_and_the_widening(sdk):
         # ... and the non-operator test admits an ABSENT flag (a :Object /
         # :Subject / :Event carries no is_operator property at all)
         assert "(other.is_operator IS NULL OR other.is_operator = false)" in cypher
+        # both limbs are one statement, so the barrier analysis is done once
+        assert "UNION ALL" in cypher
+        assert "(n)-[d:IMPL|NAND]-(other)" in cypher, (
+            "the operator-less direct-edge leg is missing — a graph written the "
+            "way ONTOLOGY §8 says plain connections are reads as isolated"
+        )
+
+
+def test_unhashable_peer_text_does_not_empty_the_batch(sdk):
+    """A malformed peer property must not turn the whole read into `[]`.
+
+    The per-label rows are deduplicated; keying that on the WHOLE row makes a
+    list-valued `content`/`name` raise TypeError, which the enclosing handler
+    converts into the untouched empty seed for every point in the batch — the
+    failure-reads-as-emptiness class this very reader had to be fixed for
+    (#6971/#6976).
+    """
+    hub = _point(sdk, "INCIDENT-53 with one malformed peer")
+    good = _point(sdk, "a well-formed peer of incident 53")
+    odd = _point(sdk, "a peer whose text is a list")
+    sdk.create_operator("IMPL", hub, [good, odd])
+    _graph(sdk).query(
+        "MATCH (n:Point) WHERE n.id = $id SET n.content = ['a', 'b']",
+        params={"id": odd},
+    )
+
+    entries = sdk.expand_relationships(hub)
+    related = {e["related_id"] for e in entries}
+    assert good in related, (
+        "a list-valued peer text emptied the whole relationship read — "
+        f"got {entries!r}"
+    )
+    assert odd in related

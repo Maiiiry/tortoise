@@ -2746,22 +2746,35 @@ def annotate_ep_batch(graph, point_ids: list[str]) -> dict[str, EpBreakdown]:
 
 
 def get_relationships(graph, point_ids: list[str]) -> dict[str, list[dict]]:
-    """Fetch operator-edge relationships for a batch of Point IDs.
+    """Fetch the epistemic relationships of a batch of Point IDs.
 
-    One id-anchored query per epistemic label (NOT N+1 — the batch rides
+    One id-anchored statement per epistemic label (NOT N+1 — the batch rides
     ``$ids``). Returns dict mapping point_id → list of relationship dicts with
     {predicate, mechanism, related_id, related_kind, related_content,
     direction, operator_id}.
 
-    Points with no operator edges get an empty list.
+    Points with no epistemic relationship get an empty list.
 
-    **Every endpoint is an epistemic node, not necessarily a ``:Point``
-    (#6976).** ONTOLOGY §5 / the #7813 owner ruling let a claim's endpoints
-    carry any of the four labels (``:Point`` / ``:Subject`` / ``:Object`` /
-    ``:Event``) — only an OPERATOR stays ``:Point`` — and the #8882 re-typing
-    migration moves exactly those nodes onto their own layer. This read used to
-    hard-code ``:Point`` on the anchor AND on the peer, so a hub whose edges run
-    to re-typed nodes matched nothing, the seeds below were never filled, and
+    Two LIMBS, and #6976 is the story of each being invisible in turn:
+
+    * **operator-less DIRECT edges** (``sdk.create_direct_edge`` — ONTOLOGY
+      v3.5 §8 calls plain IMPL/NAND connections direct edges, "NO operator
+      node", and ``tortoise_list_batch`` reports them as ``direct_edge``). The
+      read used to require an operator hop, so a graph written the way the
+      ontology says plain connections ARE read as having no relationships at
+      all — from BOTH endpoints. Leg 2 below is that half; a direct edge's own
+      ``label`` becomes ``predicate`` and there is no operator to name
+      (``operator_id`` is ``""``).
+    * **operator-MEDIATED** relationships (the ``OperatorAdded`` shape): the
+      point and its co-endpoints, reached through an operator node.
+
+    **Every endpoint is an epistemic node, not necessarily a ``:Point``.**
+    ONTOLOGY §5 / the #7813 owner ruling let a claim's endpoints carry any of
+    the four labels (``:Point`` / ``:Subject`` / ``:Object`` / ``:Event``) —
+    only an OPERATOR stays ``:Point`` — and the #8882 re-typing migration moves
+    exactly those nodes onto their own layer. This read used to hard-code
+    ``:Point`` on the anchor AND on the peer, so a hub whose edges run to
+    re-typed nodes matched nothing, the seeds below were never filled, and
     ``sdk.expand_relationships`` returned the empty seed verbatim: a dense node
     read as isolated. The three predicates are therefore the sanctioned
     widening, not a loosening of WHAT is counted:
@@ -2800,7 +2813,28 @@ def get_relationships(graph, point_ids: list[str]) -> dict[str, list[dict]]:
     #
     # The operator predicate rides the SECOND WHERE (after both MATCHes) so no
     # WHERE here is followed by a MATCH that re-binds what it constrains — the
-    # `WITH n` is the only barrier this shape needs.
+    # `WITH n` is the only barrier this shape needs (each UNION branch carries
+    # its own `WITH n`, and a UNION boundary ends the scope anyway).
+    #
+    # #6976 has TWO limbs, and they are two legs of one statement:
+    #
+    #   leg 1 — OPERATOR-MEDIATED (the ``OperatorAdded`` shape): the point and
+    #           its co-endpoints, reached through an operator node;
+    #   leg 2 — OPERATOR-LESS DIRECT (``sdk.create_direct_edge``, ONTOLOGY v3.5
+    #           §8: "plain IMPL/NAND connections are direct edges … NO operator
+    #           node"). Leg 1 structurally requires an operator hop, so a graph
+    #           written the way the ontology says plain connections ARE — the
+    #           shape ``tortoise_list_batch`` reports as ``direct_edge`` — read
+    #           as having NO relationships at all, from both endpoints.
+    #
+    # Leg 2's `other` test is the direct-edge "is a claim" predicate the rest of
+    # this tree uses (`_window_closure`, `_reachable_claim_count`): an operator
+    # is not a peer, and an operator's own typed edge `(op)-[:IMPL]->(claim)`
+    # would otherwise be reported as a direct edge of the claim.
+    _related_kind = (
+        "coalesce(other.pointKind, other.objectKind, other.subjectKind, "
+        "         other.eventKind)"
+    )
     template = (
         "MATCH (n:{label}) WHERE n.id IN $ids "
         "WITH n "
@@ -2813,10 +2847,24 @@ def get_relationships(graph, point_ids: list[str]) -> dict[str, list[dict]]:
         "RETURN n.id, op.op_type AS mechanism, "
         "  coalesce(op.label, '') AS predicate, "
         "  op.id AS operator_id, other.id AS related_id, "
-        "  coalesce(other.pointKind, other.objectKind, other.subjectKind, "
-        "           other.eventKind) AS related_kind, "
+        f"  {_related_kind} AS related_kind, "
         "  coalesce(other.content, other.name) AS related_content, "
-        "  r.idx AS n_idx, r2.idx AS other_idx"
+        "  r.idx AS n_idx, r2.idx AS other_idx "
+        "UNION ALL "
+        "MATCH (n:{label}) WHERE n.id IN $ids "
+        "WITH n "
+        "MATCH (n)-[d:IMPL|NAND]-(other) "
+        f"WHERE {epistemic_disjunction('other')} "
+        "  AND other.id <> n.id "
+        "  AND (other.is_operator IS NULL OR other.is_operator = false) "
+        "  AND other.op_type IS NULL "
+        "RETURN n.id, type(d) AS mechanism, "
+        "  coalesce(d.label, '') AS predicate, "
+        "  '' AS operator_id, other.id AS related_id, "
+        f"  {_related_kind} AS related_kind, "
+        "  coalesce(other.content, other.name) AS related_content, "
+        "  CASE WHEN startNode(d).id = n.id THEN 0 ELSE 1 END AS n_idx, "
+        "  0 AS other_idx"
     )
 
     try:
@@ -2824,12 +2872,18 @@ def get_relationships(graph, point_ids: list[str]) -> dict[str, list[dict]]:
         # A node carries exactly ONE of the four labels (re-typing refuses a
         # multi-label node), so a row cannot legitimately arrive twice; the
         # `seen` set only keeps a graph/mock that answers every per-label query
-        # identically from multiplying the payload.
+        # identically from multiplying the payload. It is keyed on the SCALAR
+        # identity columns — never on the whole row — because a list-valued
+        # `content`/`name` is unhashable, and a TypeError here would land in the
+        # `except` below and turn a whole batch into the empty seed (#6971: the
+        # failure-that-reads-as-emptiness class).
         seen: set[tuple] = set()
         for cypher in epistemic_label_queries(template):
             for row in graph.query(
                     cypher, params={"ids": point_ids}).result_set:
-                key = tuple(row)
+                key = (row[0], row[1], row[2], row[3], row[4],
+                       row[7] if len(row) > 7 else None,
+                       row[8] if len(row) > 8 else None)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -2956,8 +3010,13 @@ def get_relationships_bounded(
     `_beta_variance`/TortoiseEP), so contested is cap-exempt with no sampling.
     NAND, terminal-status, mitigated and CORRECTS classes are always complete.
 
-    get_relationships() is intentionally UNTOUCHED (D12) — topic_summarization
-    needs full NAND completeness for disputed-pair detection.
+    get_relationships() keeps the D12 intent below — it is UNBOUNDED (no
+    per-point cap, no global budget, no `expand_top_k`), because
+    topic_summarization needs full NAND completeness for disputed-pair
+    detection. #6976 widened its SELECTION (epistemic-label endpoints and
+    operator-less direct edges, see its own docstring) without bounding it — so
+    the D12 property holds, and now over more of the graph than it did: a direct
+    `NAND` edge is a disputed pair whatever writes it.
 
     Returns a ``RelationshipDecoration`` mapping (requested id → entries).
     #6971: when the query body raises, the mapping is RESET to the all-empty
