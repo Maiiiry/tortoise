@@ -563,17 +563,55 @@ def _threshold(name: str, value: object) -> float:
     return out
 
 
-#: A word character OF A SPACED SCRIPT — the kind for which adjacency to an
-#: anchor is a real word boundary. ASCII digits and ``_`` count too: ``PR2`` and
-#: ``PR_x`` are single tokens in every script.
+#: The scripts that do NOT put spaces between words. This is the UNSPACED
+#: allow-list, and the polarity matters: a script NOT named here is treated as
+#: spaced, so an unrecognised script fails CLOSED (its adjacency is a word
+#: boundary) instead of matching everywhere. The unspaced side is a closed, small
+#: set; the spaced side is open. Hangul and Yi are deliberately absent — Korean
+#: and Nuosu Yi DO separate words with spaces.
+_UNSPACED_SCRIPTS = frozenset({
+    "CJK", "HIRAGANA", "KATAKANA", "THAI", "LAO", "KHMER", "MYANMAR", "TIBETAN",
+})
+
+
+def _script(ch: str) -> str:
+    """The first word of a character's Unicode NAME — its script, for our purpose.
+
+    ``unicodedata.name('的')`` is ``CJK UNIFIED IDEOGRAPH-7684``; ``name('a')`` is
+    ``LATIN SMALL LETTER A``. That prefix is enough to answer the only question
+    asked here, and it is the stdlib's own data rather than a hand-rolled table.
+    """
+    return unicodedata.name(ch, "").split(" ", 1)[0]
+
+
 def _spaced_word_char(ch: str) -> bool:
+    """Is ``ch`` a word character of a script that separates words with spaces?
+
+    TRUE unless the character's script is on the known-UNSPACED allow-list. Digits
+    and ``_`` are word characters in every script (``PR2``, ``PR_x`` are single
+    tokens), and a combining mark CONTINUES the letter it attaches to — treating
+    one as a separator would carve a letter in two.
+
+    ⚠️ The polarity is load-bearing. An allow-list of the SPACED side (``LATIN``
+    only, as an earlier version had) answers "not a word character" for full-width
+    and mathematical Latin — ``Ａ`` (``FULLWIDTH LATIN CAPITAL LETTER A``) and
+    ``𝐀`` (``MATHEMATICAL BOLD CAPITAL A``) are Latin word characters of a spaced
+    script — so ``AI`` matched ``Ａai``. Naming the unspaced side instead makes
+    every one of those fail closed.
+    """
     if not ch:
         return False
     if ch == "_" or ch.isdigit():
         return True
     if not ch.isalpha():
-        return False
-    return unicodedata.name(ch, "").startswith("LATIN")
+        if unicodedata.category(ch).startswith("M"):
+            return True
+        # DECORATED letters (``Ⓐ`` circled, ``Ａ`` fullwidth, ``𝐀`` mathematical) are
+        # letters that ``isalpha()`` does not report — circled/squared forms are
+        # ``So``. Their NAME is what says so, and without this they read as
+        # separators, so ``AI`` matched ``aiⒶ``.
+        return "LATIN" in unicodedata.name(ch, "")
+    return _script(ch) not in _UNSPACED_SCRIPTS
 
 
 def _occurs_as_word(needle: str, haystack: str) -> bool:
@@ -586,17 +624,11 @@ def _occurs_as_word(needle: str, haystack: str) -> bool:
     relaxation was switched OFF for it and the row that literally answers scored
     0.0.
 
-    So an occurrence is accepted when neither neighbour is a word character of a
-    SPACED script (``a``/``á``/``ê``/``7``/``_``), which is exactly "the anchor is
-    not buried inside a word of a language that separates words". ``AI`` stays
-    out of ``main`` and ``naïve``; ``PR`` stays out of ``práctica``; ``ACME``
-    still matches inside CJK and Thai text, with or without a number later in the
-    sentence.
-
-    ⚠️ Residual, stated: a neighbour in a NON-Latin spaced script (Cyrillic,
-    Greek) is treated as unspaced adjacency. That can only make a mixed-script
-    token match, which is the direction a reader would accept; separating them
-    properly needs script data the stdlib does not expose.
+    So an occurrence is accepted when NEITHER neighbour is a word character of a
+    spaced script: ``AI`` stays out of ``main``, ``naïve``, ``Ａai``; ``PR`` out of
+    ``práctica``; ``ИИ`` out of ``России``; ``ΑΙ`` out of ``ΜΑΙΟΣ``. ``ACME``
+    still matches inside CJK and Thai text, with or without a number or a
+    full-width character later in the sentence.
     """
     start = haystack.find(needle)
     while start != -1:
@@ -634,18 +666,29 @@ def _mentions(needle: str, row: _Evidence) -> bool:
     Empty/blank anchors are refused by ``assess_sufficiency`` long before they
     reach here; the guard remains as defence, since ``"" in …`` is universal.
     """
-    folded = " ".join(needle.split()).casefold()
+    # NFC BOTH sides before folding: the two operands come from different
+    # pipelines (the extractor and canonical stores emit NFC; filesystem/OCR
+    # text and caller-supplied anchors may be NFD), and without it the boundary
+    # verdict — and cross-form matching — depended on the normalisation form.
+    folded = unicodedata.normalize("NFC", " ".join(needle.split())).casefold()
     if not folded:
         return False
-    if folded == row.id.casefold():
+    if folded == unicodedata.normalize("NFC", row.id).casefold():
         return True
     # Does the ANCHOR itself come from a spaced script? Only then is a word
-    # boundary meaningful in its OWN script; an ideographic anchor has none.
-    bounded = any(ch.isascii() and (ch.isalnum() or ch == "_") for ch in folded)
+    # boundary meaningful in its OWN script; an unspaced-script anchor has none.
+    # The test is the SCRIPT, not `isascii()`: the ASCII proxy granted the rule to
+    # Latin text only, so a Cyrillic/Greek/Hebrew/Arabic anchor was infix-matched
+    # (`ИИ` covered `России`) — the same fail-open class, one operand over.
+    bounded = any(
+        _script(ch) not in _UNSPACED_SCRIPTS
+        for ch in folded if ch.isalnum() or ch == "_"
+    )
     for candidate in (row.text, *row.entities):
         if not candidate:
             continue
-        haystack = " ".join(candidate.split()).casefold()
+        haystack = unicodedata.normalize(
+            "NFC", " ".join(candidate.split())).casefold()
         if _occurs_as_word(folded, haystack) if bounded else folded in haystack:
             return True
     return False

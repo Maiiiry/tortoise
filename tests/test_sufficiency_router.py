@@ -108,6 +108,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import inspect
+import unicodedata
 from pathlib import Path
 from typing import ClassVar
 
@@ -1232,9 +1233,10 @@ def test_a_non_spaced_script_anchor_matches_its_own_text() -> None:
 
     ``(?<!\\w)合同(?!\\w)`` is incapable of matching ``我们签署了合同``, so an
     ideographic anchor was unmatchable in its own evidence — silent zero coverage
-    for every such entity, and a tier bought for a row that answered. For an
-    anchor with no ASCII word character, adjacency is not a boundary and the
-    substring test IS the correct semantics.
+    for every such entity, and a tier bought for a row that answered. The word
+    rule follows the ANCHOR's script: an anchor drawn from an UNSPACED script has
+    no word separators to respect in its own script, so the substring test IS the
+    correct semantics for it.
     """
     verdict = assess_sufficiency(
         _rows("我们签署了合同 with ACME"),
@@ -1289,6 +1291,20 @@ def test_a_latin_anchor_matches_inside_unspaced_text(text: str) -> None:
     ("mainthing", "AI"),             # plain infix, no accents involved
     ("he said the main thing", "AI"),
     ("start the process", "ART"),
+    # ANCHOR-SIDE script. `isascii()` granted the word rule to Latin anchors only,
+    # so a Cyrillic/Greek/Hebrew/Arabic anchor was infix-matched — the same
+    # fail-open class, one operand over.
+    ("экономика России", "ИИ"),
+    ("ΜΑΙΟΣ", "ΑΙ"),
+    ("משלם", "של"),
+    ("المؤمنون", "من"),
+    ("Über", "Ü"),                   # Latin, but with no ASCII letter in the anchor
+    # DECORATED Latin neighbours: `Ⓐ`/`Ａ`/`𝐀` are letters `isalpha()` does not
+    # report, so an allow-list of the SPACED side read them as separators.
+    ("Ａai", "AI"),
+    ("aiＡ", "AI"),
+    ("𝐀ai", "AI"),
+    ("aiⒶ", "AI"),
 ])
 def test_the_boundary_holds_inside_a_spaced_script(
         text: str, anchor: str) -> None:
@@ -1331,6 +1347,24 @@ def test_a_partially_fetched_assembly_is_measured_over_every_row() -> None:
     assert verdict.reasons == (REASON_PROVENANCE_THIN,)
     assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0),
                                 (MEASURE_PROVENANCE_COVERAGE, 0.25))
+
+
+@pytest.mark.parametrize("text,anchor,match", [
+    # The two operands come from different pipelines: the extractor and canonical
+    # stores emit NFC, while filesystem/OCR text and caller anchors may be NFD.
+    # Without normalisation the verdict depended on the FORM, and cross-form
+    # pairs never matched at all — 0.0 for the row that answers.
+    ("cafe\u0301 ma\u0301s", "CAFÉ", True),
+    (unicodedata.normalize("NFC", "café más"),
+     unicodedata.normalize("NFD", "CAFÉ"), True),
+    (unicodedata.normalize("NFC", "café más"), "CAFE", False),
+    ("ma\u0301s", "MA", False),
+])
+def test_the_boundary_is_normalisation_form_independent(
+        text: str, anchor: str, match: bool) -> None:
+    verdict = assess_sufficiency(
+        _rows(text), anchors=[anchor], required_anchor_coverage=1.0, resident=True)
+    assert verdict.measures == ((MEASURE_ANCHOR_COVERAGE, 1.0 if match else 0.0),)
 
 
 class _AttrRow:
