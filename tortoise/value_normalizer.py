@@ -43,9 +43,10 @@ The owner selected that Option (on ``#2817``, 2026-10-07; folded into design
 
 4. **Ambiguity is refused by CLASS, never by a list of known-bad characters.**
    A separator *of any kind* between digit groups abstains: the guard looks at
-   what follows the token — through anything that is not a letter or digit —
-   and drops when the next alphanumeric is a digit
-   (``[^A-Za-z0-9]*\\d``), so a middle dot, a hyphenation point, a bullet
+   what follows the token — through anything that is not alphanumeric — and
+   drops when what follows is NUMERIC (``str.isnumeric``, i.e. the ``Nd``,
+   ``Nl`` and ``No`` categories alike), so a middle dot, a hyphenation point, a
+   bullet
    operator, an Arabic decimal separator — or a separator Unicode has not
    defined yet — lands on ``ambiguous_separator`` instead of ending the number
    at its first digit group. Extending a charset one character at a time is how
@@ -209,10 +210,10 @@ _ANCHOR = rf"(?P<a>{_SYM_BEFORE}|{_CODE})"
 #: A numeric token: digits, then only characters that can belong to one
 #: (separators, and a short trailing word so ``8M``/``12x``/``800ms`` are
 #: *seen* rather than silently split). ⚠️ This charset is only a *first* look:
-#: the token does not have to END here, and :data:`_SEPARATOR_THEN_NUMBER`
-#: refuses a token whose continuation is any other separator + digit.
+#: the token does not have to END here, and :func:`_continues_as_number`
+#: refuses a token whose continuation is any separator + numeral.
 _NUM = (r"[\u2212+\-]?\d(?:[\d.,'\u00a0\u202f]{0,34}\d)?"
-        r"[A-Za-z%]{0,8}")
+        r"[A-Za-z%\u2030]{0,8}")
 
 _GAP = r"[ \t\u00a0\u202f]*"      # never a newline: see _GAP's note below
 _ANCHOR_THEN_NUM = re.compile(rf"{_ANCHOR}{_GAP}(?P<n>{_NUM})")
@@ -226,14 +227,15 @@ _MAGNITUDE_WORD = re.compile(
 #: A range CONNECTOR: a dash, a slash, or the word connectors. Matched
 #: word-bounded — a distance window (the previous ±6 characters) missed
 #: ``EUR 800 or roughly 900`` and typed the lower bound (review cycle 3), while
-#: a sentence-wide search dropped ``EUR 800 covers 3-4 hires`` (cycle 1).
-#: ``up to`` / ``through`` / ``vs`` are connectors in the same register: a
-#: comparison between two bounds is not a point value either, and ``up to``
-#: was already the vocabulary's own word (``_RANGE_FILLER``,
-#: ``_QUALIFIER_BEFORE``) — leaving it out of this set typed ``EUR 800 up to
-#: 900`` as 800.00 (the same false type as the ±6-character-window finding).
-_RANGE_CONNECTOR = (r"(?:-|–|—|/|\bto\b|\band\b|\bor\b|\bup\s+to\b|"
-                    r"\bthr(?:ough|u)\b|\bvs\.?\b|\bversus\b)")
+#: A sentence-wide search dropped ``EUR 800 covers 3-4 hires`` (cycle 1).
+#: ``up to``/``through``/``until`` are connectors, not qualifiers (cycle 5: they
+#: sat only in the PRE vocabulary, so ``EUR 800 up to 900`` typed the lower
+#: bound as an exact amount). Longer alternatives precede their own prefixes
+#: (``up\s+to`` before ``\bto\b``). ``vs``/``versus`` compare two bounds the
+#: same way: a comparison is not a point value either, so they are connectors.
+_RANGE_CONNECTOR = (
+    r"(?:-|–|—|/|\bup\s+to\b|\bthrough\b|\bthru\b|\buntil\b|\bto\b|"
+    r"\band\b|\bor\b|\bvs\.?|\bversus\b)")
 
 #: The only words a range connector may carry before its second bound
 #: ("or **roughly** 900", "to **about** 900"). Deliberately an allowlist of
@@ -266,11 +268,43 @@ _DATE_SPAN = re.compile(r"\d{4}-\d{2}-\d{2}")
 #: a range, and a date range is not an amount range.
 _DATE_LIKE = re.compile(r"\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}")
 
+#: Bound / threshold phrases. ⛔ ONE vocabulary for BOTH positions (review
+#: cycle 5): a phrase that qualifies an amount in front of it must qualify it
+#: behind it too, or the class re-opens one instance at a time — ``up to EUR
+#: 800`` abstained while ``EUR 800 or above`` typed the bound as an exact
+#: amount, and ``EUR 800 up to 900`` typed the lower bound. Both regexes below
+#: are built from this tuple, so a phrase cannot be added to one side only, and
+#: every phrase only ever abstains MORE — the list cannot create a false type.
+#: ⛔ This tuple is the UNION of the two former hand-kept lists. A transcription
+#: that drops an entry is a NARROWING that types a bound as an exact amount, and
+#: it has already happened once (cycle 6: `roug\s*hly` survived only in one list,
+#: so ``roug hly EUR 800`` — the word wrapped across a line — typed 800.00).
+#: Keep the wrap-tolerant spellings (`\s` where the source can break a word).
+_BOUND_PHRASES: tuple[str, ...] = (
+    r"under", r"over", r"about", r"around", r"approximately", r"approx\.?",
+    r"roughly", r"roug\s*hly", r"nearly", r"almost", r"estimated", r"est\.?",
+    r"circa",
+    r"exactly", r"between", r"up\s+to", r"at\s+least", r"at\s+most",
+    r"more\s+than", r"less\s+than", r"no\s+more\s+than", r"no\s+less\s+than",
+    r"give\s+or\s+take", r"in\s+excess\s+of", r"north\s+of", r"upwards\s+of",
+    r"min", r"max", r"minimum", r"maximum", r"or\s+less", r"or\s+more",
+    r"or\s+so", r"or\s+above", r"or\s+higher", r"or\s+greater", r"and\s+up",
+    r"and\s+above", r"and\s+more", r"and\s+higher", r"and\s+greater",
+    r"post-money", r"pre-money", r"postmoney", r"premoney", r"plus",
+    r"-?ish",
+)
+
+#: Phrases that qualify only when they PRECEDE the amount: they read as a bound
+#: in front (``from EUR 800``, ``starting at EUR 800``) but are ordinary prose
+#: behind it (``EUR 800 from the fund``), so putting them on BOTH sides would
+#: abstain on an exact amount.
+_PRE_ONLY_PHRASES: tuple[str, ...] = (r"from", r"starting\s+at")
+
+_BOUND_ALT = "|".join(_BOUND_PHRASES)
+_PRE_ALT = "|".join(_PRE_ONLY_PHRASES)
+
 _QUALIFIER_BEFORE = re.compile(
-    r"(?i)(?:\b(?:under|over|about|around|approximately|approx|roug\s*"
-    r"hly|roughly|nearly|almost|estimated|est|circa|between|up\s+to|"
-    r"at\s+least|at\s+most|more\s+than|less\s+than|no\s+more\s+than|"
-    r"no\s+less\s+than|give\s+or\s+take|min|max|exactly)\b\.?"
+    rf"(?i)(?:\b(?:{_BOUND_ALT}|{_PRE_ALT})\b\.?"
     # "approx." / "est." carry their dot in the PRE position too — the
     # asymmetry with the post-position form (which accepted "approx.") is
     # what let the common abbreviation type as exact (review cycle 3).
@@ -279,11 +313,7 @@ _QUALIFIER_BEFORE = re.compile(
     r"|[~≈≤≥<>+±]\s*$)")
 
 _QUALIFIER_AFTER = re.compile(
-    r"(?i)^[\s,;:(\[\u2014\u2013-]*(?:post-money|pre-money|postmoney|"
-    r"premoney|or\s+less|or\s+more|or\s+so|approx|approximately|roughly|"
-    r"about|ish|max|min|maximum|minimum|at\s+most|at\s+least|and\s+up|"
-    r"and\s+above|plus|almost|estimated|est\.?|circa|give\s+or\s+take|"
-    r"±|-?ish|\+)")
+    rf"(?i)^[\s,;:(\[\u2014\u2013-]*(?:{_BOUND_ALT}|±|\+)")
 
 _YEAR_SHAPED = re.compile(r"(?:19|20|21)\d{2}")
 
@@ -296,28 +326,26 @@ _TRAILING_PUNCT = ".,;:!?)]}\"'"
 #: A minus/plus/bracket immediately before a LEADING number, optionally spaced.
 _SIGN_BEFORE = re.compile(r"[-\u2212+(]\s*$")
 
-#: A number whose digit groups are split by whitespace ("1 234", "1\u00a0234")
-#: is a separator form, not ``1`` — dropping it is the same decision as
-#: ``1.234`` (never guess which grouping convention is meant).
-_CONTINUES_AS_GROUP = re.compile(
-    r"(?:[\s\u00a0\u202f]+|[.,'\u2018\u2019_]\s*)\d")
-
-#: ⛔ THE decision, inverted: ANY punctuation (an underscore is handled by
-#: :data:`_CONTINUES_AS_GROUP`) followed by a digit means the number does not
-#: end at the token — so the token is a truncated first group, not an amount.
+#: ⛔ THE decision, inverted, as a CATEGORY predicate: skip everything after the
+#: token that is not alphanumeric, and if what follows is NUMERIC the number did
+#: not end at the token — so the token is a truncated first group, not an amount.
 #: A charset of known separators is what let U+00B7/U+2027/U+2219/U+2010/U+066B
-#: (and the next one Unicode adds) silently type ``1.234`` as ``1``.
-#: Whitespace is NOT an escape hatch (review cycle 4, P1): the guard skips ANY
-#: non-alphanumeric — whitespace, punctuation, underscore — before the digits,
-#: because the old adjacency-anchored form typed ``EUR 1 .234``, ``EUR 1 _234``
-#: and a number broken across a newline as ``1.00`` — the same truncated-prefix
-#: class, reached through one stray space (a line-broken number is how that
-#: arrives from a real extract). Stated as "skip everything that is not a
-#: letter or digit, then a digit must not follow", the rule is a CLASS with no
-#: character to add next: the cost is a deliberate over-abstention (a
-#: sentence-final period followed by a spaced digit, ``EUR 800. 3 hires``,
-#: abstains too), which is the safe direction this design always takes.
-_SEPARATOR_THEN_NUMBER = re.compile(r"[^A-Za-z0-9]*\d")
+#: (and the next one Unicode adds) silently type ``1.234`` as ``1``; whitespace
+#: was an escape hatch for the same class (``EUR 1 .234``, ``EUR 1 _234``, a
+#: number broken across a newline all typed ``1.00`` — review cycle 4); and a
+#: ``\\d``-only terminator still left it open for the NON-DECIMAL numerals in
+#: Unicode categories ``Nl``/``No`` (``EUR 2½ million`` → ``2.00``, ``EUR 1¼`` →
+#: ``1.00`` — review cycle 5), because ``\\d`` is ``Nd`` only. ``str.isnumeric``
+#: covers all three, so the predicate cannot be reopened by a new numeral.
+#: The cost is a deliberate over-abstention (a sentence-final period followed by
+#: a spaced digit, ``EUR 800. 3 hires``, abstains too), which is the safe
+#: direction this design always takes.
+def _continues_as_number(rest: str) -> bool:
+    """Whether a number RESUMES after ``rest``'s leading non-alphanumerics."""
+    i = 0
+    while i < len(rest) and not rest[i].isalnum():
+        i += 1
+    return i < len(rest) and rest[i].isnumeric()
 
 
 def _drop(reason: str, detail: str = "") -> Normalization:
@@ -372,8 +400,22 @@ def _currency_for(anchor: str) -> str | None:
 
 
 def _has_magnitude_word_after(text: str, end: int) -> bool:
-    nxt = text[end:end + 24].split()
-    return bool(nxt) and bool(_MAGNITUDE_WORD.match(nxt[0].strip(".,;:")))
+    """A magnitude word attached to THIS amount (not a neighbouring one).
+
+    Scanning just ``nxt[0]`` hid the word behind one numeral/separator token
+    (``EUR 2½ million``, ``EUR 800 - million``), so this walks forward — but only
+    across words with no alphabetic content, because a word with letters opens a
+    DIFFERENT quantity's phrase: ``EUR 800 for 2 million users`` is an exact
+    amount and must keep typing (review cycle 6, P2: widening the scan without
+    this stop turned that clear sentence into ``magnitude_word``).
+    """
+    for word in text[end:end + 40].split():
+        w = word.strip(".,;:")
+        if _MAGNITUDE_WORD.match(w):
+            return True
+        if any(ch.isalpha() for ch in w):
+            return False
+    return False
 
 
 def _has_range(text: str, candidates: list[_Candidate]) -> bool:
@@ -422,7 +464,7 @@ def _classify_token(token: str, *, text: str, end: int,
             or _has_magnitude_word_after(text, end):
         # No magnitude table (design §3: bare M is "dropped, not open").
         return _drop("magnitude_word", detail)
-    if "%" in t:
+    if "%" in t or "\u2030" in t:
         return _drop("not_money_percent", detail)   # §4: no valueKinds
     if re.search(r"(?i)x$", t):
         return _drop("not_money_multiplier", detail)
@@ -435,10 +477,10 @@ def _classify_token(token: str, *, text: str, end: int,
         # 19+ digits is not a plausible amount, and Python 3.12 refuses
         # int("9"*4300) outright — abstain instead of raising.
         return _drop("unsupported_token", detail)
-    if _CONTINUES_AS_GROUP.match(text[end:]) \
-            or _SEPARATOR_THEN_NUMBER.match(text[end:]):
-        # "BRL 1 234" / "EUR 1·234" — the number does not end at the token
-        # (mode 1). Any separator at all, not just the known ones.
+    if _continues_as_number(text[end:]):
+        # "BRL 1 234" / "EUR 1·234" / "EUR 2½" — the number does not end at the
+        # token (mode 1). Any separator at all, not just the known ones, and any
+        # numeral category, not just ``Nd``.
         return _drop("ambiguous_separator", text[end - 8:end + 12].strip())
     return None
 
