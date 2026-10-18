@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +264,15 @@ def mask_embedder():
 # adding a dump step is a workflow change (#8746 review r3 P2).
 GRAPH_DELETE_EVENTS: list[dict[str, object]] = []
 
+# The MINT SHAPE this tree actually produces: a per-run graph is
+# ``f"test_…_{os.urandom(4).hex()}"``, so the name ends in ``_<8 lowercase
+# hex>``. The prefix family is NOT sufficient on its own — it also contains
+# SHARED, fixed-name fixture graphs (``tortoise_test_integration_search``,
+# ``tortoise_test_fts125``, ``tortoise_test_3301``, ``tortoise_test_proj125``),
+# and those belong to the whole job or to another suite. See the third arm in
+# `drop_test_graph`.
+_PER_RUN_GRAPH_NAME_RE = re.compile(r"^[a-z0-9_]*_[0-9a-f]{8}$")
+
 
 def graph_delete_events() -> list[dict[str, object]]:
     """The tolerated ``drop_test_graph`` refusals/failures so far this session."""
@@ -332,16 +342,35 @@ def drop_test_graph(proj, *, name: str | None = None) -> bool:
     resolves the LIVE module attribute on every call, so it is the canonical
     set of the moment that the gate consults.
 
-    Two arms, both fail-closed (#8746 review round 2 P3). The prefix arm alone
-    is not enough on the axis that matters: the shared URI-default graph (e.g.
-    ``tortoise_test_matrix``) is INSIDE the family but belongs to the whole job,
-    so it is refused explicitly — exactly as every other TARGETED delete path in
-    this tree does (``tests/_embedded.py::_wipe_or``'s ``scope.discard(default)``,
-    ``wipe_server``'s per-test ``g == default_graph`` arm); only the session-end
-    sweep owns it. Residual, stated honestly: the family also contains fixed
-    FIXTURE-DEFAULT spellings (``tortoise_test_proj125`` in this module) that a
-    shape test cannot tell from a per-run name; every caller of this helper mints
-    ``f"test_…_{os.urandom(4).hex()}"`` and passes that name.
+    Three arms, all fail-closed (#8746 review round 2 P3, round 5 P2). The
+    prefix arm alone is not enough on the axis that matters:
+
+    1. the canonical PREFIX family;
+    2. the shared URI-default graph (e.g. ``tortoise_test_matrix``), which is
+       INSIDE the family but belongs to the whole job — exactly as every other
+       TARGETED delete path in this tree refuses it
+       (``tests/_embedded.py::_wipe_or``'s ``scope.discard(default)``,
+       ``wipe_server``'s per-test ``g == default_graph`` arm); only the
+       session-end sweep owns it;
+    3. the per-run MINT SHAPE (``_PER_RUN_GRAPH_NAME_RE``). Arm 2 alone was
+       inert on the URI-less lane — ``_uri_default_graph_name()`` returns
+       ``None`` when ``TORTOISE_DB_URI`` is unset, and ``live_proj`` runs there
+       too (it skips on a TCP probe, not on the URI) — while the family also
+       holds SHARED fixed-name graphs on the connected server
+       (``tortoise_test_integration_search``, ``tortoise_test_fts125``,
+       ``tortoise_test_3301``, …), none of them per-run. A fixed/shared name is
+       now REFUSED AND RECORDED rather than deleted; the cost is an observable
+       non-delete, the alternative is an irreversible delete of another suite's
+       graph.
+
+    Residual, stated honestly: the shape arm has no PROVENANCE. It admits any
+    family name ending in ``_<8 lowercase hex>``, so it cannot tell this run's
+    mint from another run's — it only excludes the fixed/shared spellings. The
+    real callers are what make it exact: every one in this tree mints
+    ``f"test_…_{os.urandom(4).hex()}"`` and passes THAT name (see
+    ``tests/test_projection.py::live_proj`` — ``test_proj125_<8 hex>`` is a
+    minted per-run name, not a shared one — and
+    ``test_add_document_journals_the_anchor_and_replays_identically``).
     """
     from tests._embedded import _SERVER_WIPE_PREFIXES, _uri_default_graph_name
 
@@ -353,6 +382,10 @@ def drop_test_graph(proj, *, name: str | None = None) -> bool:
     elif gname == _uri_default_graph_name():
         reason = ("the SHARED URI-default graph — the whole job writes to it; "
                   "only the session-end sweep may drop it")
+    elif not _PER_RUN_GRAPH_NAME_RE.match(gname):
+        reason = ("not a per-run mint shape (_<8 hex>) — the family also holds "
+                  "SHARED fixed-name fixture graphs, and this helper may delete "
+                  "only the graph its own run minted")
     if reason is not None:
         logger.warning(
             "[#8746] refusing to GRAPH.DELETE %r — %s; left untouched",

@@ -1073,14 +1073,19 @@ def write_tolerated_cleanup_report(
         for entry in tolerated_cleanup_leaks():
             entry.setdefault("pid", os.getpid())
             by_path[str(entry["path"])] = entry
+        # #8746 review r6 P3: `tolerated_cleanup_leaks` has ONE writer — this
+        # assignment, which folds this session's own tolerated leaks into
+        # `by_path` first (the earlier duplicate was never read, because the
+        # later write always superseded it).
         payload: dict[str, object] = {
             "tolerated_cleanup_leaks": [
                 by_path[path] for path in sorted(by_path)],
         }
-        # Emit the UNION of the prior artifact's sections and this call's
-        # `extra` keys — the prior keys are what stops an empty current
-        # section from ERASING a peer's record (only re-supplied keys used to
-        # be emitted, so any section this session had no events for vanished).
+        # #8746 review r6 P2: emit the UNION of the prior artifact's sections
+        # and this call's `extra` keys. `extra` alone was the only source of
+        # emitted keys, so a session that recorded no events of its own
+        # rewrote the artifact WITHOUT a peer's section — erasing a real
+        # record in the very direction the docstring promises cannot happen.
         prior_sections = [
             key for key in (prior if isinstance(prior, dict) else ())
             if key != "tolerated_cleanup_leaks"]

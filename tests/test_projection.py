@@ -2150,7 +2150,7 @@ def test_drop_test_graph_refuses_a_non_test_owned_name():
 
 
 def test_drop_test_graph_refuses_the_shared_uri_default_graph(monkeypatch):
-    """#8746 review r2 P3: the prefix family WIDE-OPEN arm is not enough.
+    """#8746 review r2 P3 + r5 P2: the shared-graph refusal holds on BOTH lanes.
 
     The shared URI-default graph (here ``tortoise_test_matrix``, the docker
     job's ``TORTOISE_DB_URI`` path) starts with ``tortoise_test``, so the
@@ -2160,9 +2160,19 @@ def test_drop_test_graph_refuses_the_shared_uri_default_graph(monkeypatch):
     ``wipe_server``'s per-test ``g == default_graph`` arm); only the session-end
     sweep owns it. Without the explicit arm, a fixture that resolved the shared
     graph by mistake would delete the job's own graph.
+
+    The URI-DEFAULT arm is lane-gated by construction (``_uri_default_graph_name()``
+    answers ``None`` with no URI set), and ``live_proj`` runs on the URI-LESS
+    lane too — it skips on a TCP probe, not on the URI. So the class is closed
+    by the MINT-SHAPE arm instead: a family name that is not ``…_<8 hex>`` is
+    refused whether or not a URI is set. The last block asserts that directly.
     """
+    # #6673: build the URI through tests/_live_utils — the docker lane's
+    # service port is EPHEMERAL, so a hand-written :6379 would prove the arm
+    # against a dead port. Only the GRAPH PATH is the input here and it is
+    # parsed, never dialled (`_FakeProj.db` records calls; it is not a client).
     monkeypatch.setenv("TORTOISE_DB_URI",
-                       "docker://:falkordb@localhost:6379/tortoise_test_matrix")
+                       _live_utils.docker_uri("tortoise_test_matrix"))
     snapshot = _live_utils.graph_delete_events()
     try:
         proj = _FakeProj("tortoise_test_matrix")
@@ -2171,12 +2181,26 @@ def test_drop_test_graph_refuses_the_shared_uri_default_graph(monkeypatch):
         # NARROWING CONTROL: one character away from the refused name is a
         # per-run name again — so the refusal above is the DEFAULT-graph arm
         # firing, not the prefix arm refusing the whole family.
-        per_run = _FakeProj("tortoise_test_matrix_7f3a")
+        per_run = _FakeProj("tortoise_test_matrix_7f3a9c21")
         assert _live_utils.drop_test_graph(per_run) is False
         assert per_run.db.calls, (
             "the narrowing control never reached the guard — the refusal above "
             "cannot be attributed to the default-graph arm")
-        assert ("select_graph", "tortoise_test_matrix_7f3a") not in per_run.db.calls
+        assert ("select_graph", "tortoise_test_matrix_7f3a9c21") not in per_run.db.calls
+
+        # URI-LESS LANE (review r5 P2): with no TORTOISE_DB_URI the default-graph
+        # arm cannot fire at all, so the class must be closed by the MINT SHAPE.
+        # A shared FIXED fixture name in the family is refused; a per-run one
+        # still reaches the guard (the precondition that keeps this honest).
+        monkeypatch.delenv("TORTOISE_DB_URI", raising=False)
+        shared = _FakeProj("tortoise_test_integration_search")
+        assert _live_utils.drop_test_graph(shared) is False
+        assert shared.db.calls == [], shared.db.calls
+        fresh = _FakeProj("test_uri_less_probe_0badc0de")
+        assert _live_utils.drop_test_graph(fresh) is False
+        assert fresh.db.calls, (
+            "a per-run name was refused on the URI-less lane too — the shape "
+            "arm is over-broad and the shared-graph refusal above is vacuous")
     finally:
         _live_utils._restore_graph_delete_events(snapshot)
 
@@ -2219,7 +2243,7 @@ def test_drop_test_graph_records_a_guard_refusal_as_a_leak():
     silently would make that invisible, so the helper re-checks presence and
     records the tolerated leak.
     """
-    name = "test_lock_refused_8746"
+    name = "test_lock_refused_8746ab12"
     snapshot = _live_utils.graph_delete_events()
     try:
         proj = _FakeProj(name)
