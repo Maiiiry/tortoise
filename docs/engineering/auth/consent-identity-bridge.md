@@ -199,7 +199,7 @@ The mint requires the browser to reach the session origin even though the consen
 
 `authorization_server_metadata(base)` (`oauth.py:2083-2102`) emits `"authorization_endpoint": base +
 "/oauth/authorize"`, where `base = _oauth_base(request) = str(request.base_url).rstrip("/")`
-(`hosted_api.py:34675-34678`), served at both `/.well-known/oauth-authorization-server` and
+(`hosted_api.py:37942-37945`), served at both `/.well-known/oauth-authorization-server` and
 `/.well-known/oauth-authorization-server/mcp` (`hosted_api.py:34748-34749`).
 
 - **Same-origin:** the endpoint is built from the *serving* origin, so it is never cross-origin to the
@@ -254,10 +254,10 @@ bridge plus the page rewrite. Deleted by this issue when the bridge lands (not b
 
 | Item | Where |
 |---|---|
-| the inline `cookieStorage` adapter + the aux-store probe chain | `oauth.py:2321-2497` |
+| the inline `cookieStorage` adapter + the aux-store probe chain | `oauth.py:2268-2497` |
 | `COOKIE_NAME`/`COOKIE_DOMAIN`/`COOKIE_PATH`/`SIZE_GUARD`/`SIZE_CAP` and both `document.cookie` writers | `oauth.py:2225-2248` (`:2225`, `:2240`, `:2241`, `:2242`, `:2248`), `:2403`, `:2413` |
 | the supabase-js CDN `<script>` + `createClient` + `flowType: "pkce"` + `detectSessionInUrl` | `oauth.py:2199-2201`, `:2420-2430` |
-| `pkceIncapable`/`CAPABILITY`/`renderCapability`, the provider + email sign-in handlers, `showTerminalFallback`, `sanitiseUrl`, `loadParams`/`LOAD_TRANSIENT` | `oauth.py:2644-3049` |
+| `pkceIncapable`/`CAPABILITY`/`renderCapability`, the provider + email sign-in handlers, `showTerminalFallback`, `sanitiseUrl`, `loadParams`/`LOAD_TRANSIENT` | `oauth.py:2699-3049` |
 | `onAuthStateChange` (property 4's anchor) | `oauth.py:3040` |
 
 **`SCOPE.md` §10 item:** `oauth.py:2241` hardcodes `COOKIE_DOMAIN = ".premiselabs.co"`, and Gate 4 required
@@ -302,7 +302,7 @@ bearer path untouched); step 4 is where the flow changes.
 | **Signing** | HMAC-SHA256, dedicated `CONSENT_TOKEN_SECRET`, `kid`-scoped rotation. Never the service-role key; never the anon key (public: the page embeds it). |
 | **TTL / replay** | `exp = iat + 120 s` (leeway ≤30 s) **and** a single-use `jti`; neither substitutes for the `bind` set. |
 | **Redemption** | `POST /oauth/consent` (`hosted_api.py:34888`) — currently `verify_session_jwt` only, `session_auth.py:588`. |
-| **Endpoint stability** | `authorization_server_metadata` (`oauth.py:2083`); `_oauth_base(request)` (`hosted_api.py:34675`). Guarded. |
+| **Endpoint stability** | `authorization_server_metadata` (`oauth.py:2083`); `_oauth_base(request)` (`hosted_api.py:37942`). Guarded. |
 | **CORS** | new, exact-origin to the AS origin, on the mint route only. The BFF carries none today; `/oauth/token` must never become reachable through it (`SCOPE.md` §9 class 3). |
 | **Bindings to declare** | `CONSENT_TOKEN_SECRET` (`config/required-bindings.yml`, `tortoise-dashboard`), checked pre-deploy by `tools/check_pages_bindings.py` (the #3616 gate). |
 | **Verified by execution** | `tests/test_oauth_consent_bridge.py` (RFC 8414 stability + the allowlist record). |
