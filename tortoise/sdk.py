@@ -11922,25 +11922,48 @@ class TortoiseSDK:
         surface) rather than a success — and a probe that could not answer at all
         answers ``None`` (unverified). Neither issues a read, so nothing is
         re-created, and neither claims a destroy.
+
+        ⛔ The STATE-INDEPENDENT arm (write-slot / MISCONF) is answered WITHOUT
+        a probe and WITHOUT a read, because on that arm ``landed`` is ``False``
+        by construction: `tortoise/retry.py` records that the write-slot refusal
+        is raised from `execute_query_write` *before the slot is claimed* and
+        that ``MISCONF`` is a pre-execution command rejection — nothing was
+        applied. A read there can only ADD a wrong answer, never information: it
+        is the read that AUTO-CREATES an absent key, and `#7405`'s retry loop
+        re-issues this arm without consulting `graph_exists` (only the
+        graph-abort family is state-gated), so a rebuild that deletes the key
+        during the 2–8 s backoff is not excluded. Reading then would answer
+        `count(n)=0` and be taken as a landed destroy over a graph that no
+        longer exists — the same silent success the presence gate exists to
+        prevent. Skipping both also keeps `#7405`'s
+        `test_a_write_slot_exhaustion_pays_no_graph_presence_probe` free of the
+        ``EXISTS`` round trip.
         """
         from .retry import _ARM_STATE_INDEPENDENT, _abort_arm
 
-        # The presence probe is paid on EVERY family except the state-independent
-        # one. Keying it on the graph-abort family alone was too narrow: the read
-        # below is the read that AUTO-CREATES an absent key, and a non-family raise
-        # (a transport error, a non-retryable `ResponseError`) does not prove the
-        # key is still there — `retry.py` states that doctrine for the retry
-        # predicate itself ("a raise does not prove the statement did not land").
-        # So only the arms whose failure is BY CONSTRUCTION unrelated to the graph
-        # (write slot / MISCONF) skip the probe, which is what keeps #7405's
-        # contract (`test_a_write_slot_exhaustion_pays_no_graph_presence_probe`).
-        if exc is not None and _abort_arm(exc) != _ARM_STATE_INDEPENDENT:
-            presence = self._graph_presence(proj)
-            if presence is False:
-                return False   # key ABSENT: the caller re-raises the loud #7685 error
-            if presence is None:
-                return None    # probe could not answer: claim nothing
-            # Confirmed present: the read-back is safe to issue.
+        # The state-independent arm is the ONE arm that needs neither half of
+        # the gate: `retry.py` records that its refusal is raised BEFORE the slot
+        # is claimed (write slot) or before execution (MISCONF), so nothing was
+        # applied and the answer is a clean ``False`` with no probe and no read.
+        # Probing here would spend #7405's ``EXISTS`` round trip for nothing, and
+        # READING here is worse than useless — that read AUTO-CREATES an absent
+        # key, and this arm is re-issued without any `graph_exists` check, so a
+        # rebuild that dropped the key during the backoff would make it answer
+        # `count(n)=0` and the door would record a destroy the engine refused.
+        if exc is not None and _abort_arm(exc) == _ARM_STATE_INDEPENDENT:
+            return False   # not landed by construction: no probe, no read, no record
+        # Every other family pays the presence probe. Keying it on the
+        # graph-abort family alone was too narrow: the read below is the read
+        # that AUTO-CREATES an absent key, and a non-family raise (a transport
+        # error, a non-retryable `ResponseError`) does not prove the key is still
+        # there — `retry.py` states that doctrine for the retry predicate itself
+        # ("a raise does not prove the statement did not land").
+        presence = self._graph_presence(proj)
+        if presence is False:
+            return False   # key ABSENT: the caller re-raises the loud #7685 error
+        if presence is None:
+            return None    # probe could not answer: claim nothing
+        # Confirmed present: the read-back is safe to issue.
         try:
             rows = proj.g.query(
                 "MATCH (n:Point {id:$id}) RETURN count(n)",

@@ -62,7 +62,10 @@ are not equally harmful:
   AUTO-CREATES it and answers `count(n)=0`, so the read-back is gated on
   CONFIRMED presence and issues no read at all (T3e); the same gate is paid on the
   TRANSPORT family, where the abort classifier returns no arm at all and the
-  first cut skipped the probe (T3f);
+  first cut skipped the probe (T3f); the one arm that pays NEITHER probe nor
+  read is the STATE-INDEPENDENT one (write slot / MISCONF), where nothing was
+  applied by construction — reading there would auto-create an absent key and be
+  taken as a landed destroy (T3g);
 * the message names THIS door's record (`EntityMutated op=delete`, derived from
   the door, never `PointAdded`) and attaches the graph to the CACHE clause, not
   the record's (T10).
@@ -510,9 +513,15 @@ def test_an_unreadable_after_state_writes_no_record_and_claims_nothing(
     # `missing_in_cache` (the record holds the Point, the cache does not), i.e.
     # the cache is BEHIND the TRUTH, not ahead of it.
     present_branch = msg.split("PRESENT")[-1].split("ABSENT")[0]
-    assert "behind the TRUTH" not in msg, (
+    # SCOPED to `present_branch` and CASED to the ARM under test: the ABSENT
+    # branch is SUPPOSED to say `the cache is BEHIND the TRUTH` (uppercase, in
+    # `tortoise/exceptions.py`), so an assertion over the whole `msg` would be
+    # green on an inverted PRESENT branch that merely agrees in case with the
+    # ABSENT one — and a lowercase needle would never match the uppercase
+    # spelling the inverted wording would carry either.
+    assert "behind the truth" not in present_branch.lower(), (
         "the first cut of this clause called a present node 'behind a TRUTH "
-        f"that no longer records a destruction for it': {msg!r}")
+        f"that no longer records a destruction for it': {present_branch!r}")
     assert "re-issue" in present_branch.lower() or "RE-ISSUE" in present_branch, (
         f"the PRESENT branch must send the caller to a re-issue: {present_branch!r}")
     assert "rebuild_all" not in present_branch, (
@@ -683,6 +692,90 @@ def test_a_transport_failure_pays_the_presence_probe_too(env, monkeypatch):
         "no destruction record may be written for a destroy nobody verified")
     assert _live(proj, pid) is True, (
         "premise: the injected transport failure never reached the engine")
+
+
+# ── T3g: the STATE-INDEPENDENT arm pays neither probe nor read ────────────
+
+def test_a_state_independent_refusal_is_never_read_as_a_landed_destroy(
+        env, monkeypatch):
+    """The write-slot / MISCONF arm needs NO read-back, and must not read (#9207).
+
+    `tortoise/retry.py` records what this arm means: the write-slot refusal is
+    raised from `execute_query_write` *before the slot is claimed*, and
+    ``MISCONF`` is a pre-execution command rejection. Nothing was applied, by
+    construction — so `landed` cannot legitimately be ``True`` here and a read
+    can only ADD a wrong answer, never information: the read is the statement
+    that AUTO-CREATES an absent key, and `#7405`'s retry loop re-issues this arm
+    WITHOUT consulting `graph_exists` (only the graph-abort family is
+    state-gated), so a rebuild that drops the key during the 2–8 s backoff is
+    not excluded. The read then answers `count(n)=0` and the door writes an
+    `EntityMutated op=delete` record and returns True for a statement the engine
+    REFUSED — the silent success the presence gate exists to prevent, left open
+    on the one arm with no probe.
+
+    MUTATION: fall through to the presence/read-back block on this arm (the
+    pre-fix shape, `if _abort_arm(exc) != _ARM_STATE_INDEPENDENT: …probe…` then
+    an unconditional read). The read-back runs against this fixture's
+    swapped-graph answer `count(n)=0`, so the door RETURNS True with a written
+    record instead of raising, and `readbacks` is non-empty — both assertions
+    redden.
+    """
+    import types
+
+    import redis.exceptions as redis_exc
+
+    # The retry loop sleeps 2 s + 4 s on its way to exhaustion; the assertion is
+    # about what the error path does, not how long it waits.
+    monkeypatch.setattr("tortoise.retry.time",
+                        types.SimpleNamespace(sleep=lambda _s: None))
+
+    sdk, events = env
+    proj = sdk._get_proj()
+    pid = sdk.create_point("observation", "write slot contention")["id"]
+
+    real_query = type(proj.g).query
+    real_exec = type(proj.g).execute_command
+    readbacks: list[str] = []
+    exists_calls: list[object] = []
+
+    def slot_abort_then_zero(_self, cypher, *args, **kwargs):
+        stmt = cypher or ""
+        if _DELETE_CYPHER in stmt:
+            raise redis_exc.ResponseError(
+                "another write is in progress, retry the query")
+        if "RETURN count(n)" in stmt and "> 0" not in stmt:
+            # A rebuild that dropped the key during the backoff: the read would
+            # answer 0 (and on this engine, re-create the key doing it).
+            readbacks.append(stmt)
+            return types.SimpleNamespace(result_set=[[0]])
+        return real_query(_self, cypher, *args, **kwargs)
+
+    def count_exists(_self, *args, **kwargs):
+        if args and args[0] == "EXISTS":
+            exists_calls.append(args)
+        return real_exec(_self, *args, **kwargs)
+
+    monkeypatch.setattr(type(proj.g), "query", slot_abort_then_zero)
+    monkeypatch.setattr(type(proj.g), "execute_command", count_exists)
+    try:
+        with pytest.raises(redis_exc.ResponseError) as ei:
+            sdk.delete_point(pid)
+    finally:
+        monkeypatch.setattr(type(proj.g), "query", real_query)
+        monkeypatch.setattr(type(proj.g), "execute_command", real_exec)
+
+    assert str(ei.value).startswith("another write is in progress"), (
+        "a state-independent refusal is returned to the caller as the engine's "
+        f"own error — not swallowed as a success: {ei.value!r}")
+    assert readbacks == [], (
+        "the read-back ran on an arm where nothing was applied by "
+        f"construction: {readbacks!r}")
+    assert exists_calls == [], (
+        "#7405's contract: a state-independent exhaustion pays no EXISTS probe")
+    assert _mutations(events, pid) == [], (
+        "a statement the engine REFUSED must never produce a destruction record")
+    assert _live(proj, pid) is True, (
+        "premise: the injected slot abort never reached the engine")
 
 
 # ── T4: nothing is journaled for a delete that cannot happen ──────────────
