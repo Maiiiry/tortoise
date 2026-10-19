@@ -16,11 +16,16 @@ the SAME scripted candidate set (the corpus) feeding every arm:
 ============================  ==========  ==========================================
 arm                           scored?     what it is
 ============================  ==========  ==========================================
-``before``                    baseline    VET and the value gate OFF — the shipped
-                                          DEFAULT arm (both flags default off).
-``after-vet-shipped``         **YES**     ``TORTOISE_VET=1`` + ``TORTOISE_VALUE_GATE=1``,
-                                          ``arbiter=None`` — exactly what production
-                                          wires today.
+``before``                    baseline    VET and the value gate OFF — the arm the
+                                          DEPLOYED config runs today (both flags
+                                          default off; ``fly.toml`` sets neither).
+``after-vet-shipped``         **YES**     the SAME shipped code with both flags
+                                          FORCED ON (``TORTOISE_VET=1`` +
+                                          ``TORTOISE_VALUE_GATE=1``,
+                                          ``arbiter=None``). NOT what production
+                                          runs today: the deploy leaves both OFF,
+                                          so this arm is what the gate WOULD do
+                                          once it is switched on.
 ``after-vet-arbiter``         no          the same, plus an INJECTED arbiter answering
                                           S2.2's *"is this an entity or a reference?"*
                                           with the in-repo predicate
@@ -37,9 +42,21 @@ arm                           scored?     what it is
                                           the reference goes).
 ============================  ==========  ==========================================
 
-Only ``after-vet-shipped`` is scored, because it is the only arm that is the
-product. The two counterfactual arms are reported as **estimates of what a
-mechanism that does not exist would buy** — never as green. ``tools
+**The scored arm is a WHAT-IF, not production — read it as one.** The deployed
+config leaves ``TORTOISE_VET`` and ``TORTOISE_VALUE_GATE`` unset:
+``extractor_v2._vet_enabled`` / ``_value_gate_enabled`` are
+``is_truthy(os.environ.get(...))`` and default OFF, and ``fly.toml``'s ``[env]``
+sets neither variable, so **production runs the ``before`` arm**. What is scored
+here is the SAME shipped code with both flags FORCED ON — the behaviour of the
+gate once it is switched on. That distinction is the open question #7949 carries:
+if the gate is not armed in production, E1 does not move there because nothing is
+armed, and the next step is to enable the flag and re-measure; if it is armed and
+the discards are undone by referential integrity, the next step is to change
+``apply_vet``'s Rule 2. Only ``after-vet-shipped`` is scored, because it is the
+only arm that puts the shipped gate mechanism on-path at all (``before`` measures
+the pipeline with no gate, so it cannot show what the gate does). The two
+counterfactual arms are reported as **estimates of what a mechanism that does not
+exist would buy** — never as green. ``tools
 /e1_e2_census_check.py`` fails if a counterfactual arm is ever the scored one.
 
 ⚠️ **The four arms cannot tell a GATE property from a CORPUS property, so the run

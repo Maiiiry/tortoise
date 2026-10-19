@@ -34,17 +34,35 @@ is a finding rather than a smaller measurement — every other rule reconciles o
 the lines it is given, and an absent line reconciled against nothing used to pass
 (#9110 review P2, measured as three separate deletions).
 
-Usage:
-    python tools/e1_e2_census_check.py docs/evidence/7949-capstone/e1-e2.log
-    python tools/e1_e2_census_check.py <log> --require-green   # exit 1 unless GREEN
+Usage (``uv run`` — a bare ``python``/``python3`` may be <3.12, and the
+interpreter guard above refuses it with exit 2):
+    uv run python tools/e1_e2_census_check.py docs/evidence/7949-capstone/e1-e2.log
+    uv run python tools/e1_e2_census_check.py <log> --require-green   # exit 1 unless GREEN
 """
 from __future__ import annotations
+
+import sys
+
+# #5128 shape: refuse a <3.12 interpreter before the imports below — a module-level
+# 3.12+-only construct would otherwise fail first, and it would fail with a
+# traceback instead of this message. The gate that enforces this shape is
+# tests/test_entry_point_python_guard.py, not a style rule.
+if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
+    # 2 is this tool's own "environment/usage error" code (`main` returns 1 only
+    # for FINDINGS, 3 for an unreadable log), so an old interpreter stays legible
+    # in a runner that keys on the exit code alone.
+    print(
+        f"tools/e1_e2_census_check.py requires Python >= 3.12 (got "
+        f"{sys.version_info[0]}.{sys.version_info[1]}) — run it as "
+        f"`uv run python tools/e1_e2_census_check.py`",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 import argparse
 import json
 import math
 import re
-import sys
 from pathlib import Path
 
 ARM_LINE = re.compile(r"^arm=(?P<arm>[a-z0-9-]+)\s+(?P<rest>.*)$")

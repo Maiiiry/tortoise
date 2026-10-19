@@ -1195,3 +1195,170 @@ def test_a_run_restores_the_logging_state_it_found():
         f"{logging.root.manager.disable} != {previous}")
     assert logging.getLogger("e1e2.pin.after").isEnabledFor(logging.WARNING), (
         "a WARNING emitted after the run is no longer even created")
+
+
+# ── 8. the scored arm is described as a WHAT-IF, never as production ──────
+#
+# #9110 review P2 (claim precision). The arm table called ``before`` "the shipped
+# DEFAULT arm" AND ``after-vet-shipped`` "exactly what production wires today" —
+# two arms cannot both be the deploy. The tree says ``before``:
+# ``_vet_enabled()`` / ``_value_gate_enabled()`` are
+# ``is_truthy(os.environ.get(...))`` and neither deploy surface sets the variables.
+#
+# It is worth pinning rather than leaving as prose because the sentence decides the
+# INFERENCE, not the number: "E1 does not move" is true of both arms (60.0% either
+# way), but the cause a reader takes away differs — an armed gate defeated by
+# referential integrity (flags-ON) versus nothing armed at all (deployed). Those
+# point #7949 at opposite next steps, so the audit trail must not claim the second
+# while describing the first.
+
+_EVIDENCE_DIR = _REPO_ROOT / "docs" / "evidence" / "7949-capstone"
+
+
+def _argmax_row(doc: str, arm: str) -> str:
+    """The arm's row from the docstring table, joined and whitespace-normalised."""
+    rows, current = [], None
+    for line in doc.splitlines():
+        if line.startswith("``"):
+            current = [line]
+            rows.append(current)
+        elif current is not None and line.startswith(" "):
+            current.append(line)
+        else:
+            current = None
+    for row in rows:
+        if row[0].startswith(f"``{arm}``"):
+            return " ".join(" ".join(row).split())
+    raise AssertionError(f"no `{arm}` row in the arm table; rows={[r[0][:28] for r in rows]}")
+
+
+def test_the_two_flags_are_unset_on_every_deploy_surface():
+    """The FACT the wording rests on, measured from the tree instead of asserted.
+
+    If a deploy surface ever starts setting these, the deployed arm BECOMES the
+    flags-ON arm: this test fails and points at the two documents that must then
+    change (and at the log, which becomes a production measurement worth re-taking).
+    """
+    for rel in ("fly.toml", ".github/scripts/fly-managed-secrets.txt"):
+        text = (_REPO_ROOT / rel).read_text(encoding="utf-8")
+        for flag in ("TORTOISE_VET", "TORTOISE_VALUE_GATE"):
+            assert flag not in text, (
+                f"{rel} now sets {flag}: the deployed configuration is the flags-ON "
+                "arm, so the probe's arm table and E1-E2.md's note must stop saying "
+                "production leaves both OFF")
+
+
+def test_the_flags_are_off_when_unset(monkeypatch):
+    """Unset ⇒ off-path, which is why ``before`` is the deploy — measured, not asserted."""
+    from tortoise import extractor_v2
+
+    monkeypatch.delenv("TORTOISE_VET", raising=False)
+    monkeypatch.delenv("TORTOISE_VALUE_GATE", raising=False)
+    assert extractor_v2._vet_enabled() is False
+    assert extractor_v2._value_gate_enabled() is False
+    monkeypatch.setenv("TORTOISE_VET", "1")
+    monkeypatch.setenv("TORTOISE_VALUE_GATE", "1")
+    assert extractor_v2._vet_enabled() is True, (
+        "the flag seam is no longer the declared truthy contract — the arm table's "
+        "`TORTOISE_VET=1` / `TORTOISE_VALUE_GATE=1` would stop meaning \"forced on\"")
+    assert extractor_v2._value_gate_enabled() is True
+
+
+def test_the_scored_arm_does_not_claim_to_be_what_production_runs():
+    """The pre-fix sentence, verbatim, must not come back."""
+    doc = probe.__doc__
+    assert "exactly what production wires today" not in doc, (
+        "the scored arm claims to be what production runs, while the `before` arm is "
+        "also called the shipped default — the deployed config sets neither flag")
+    row = _argmax_row(doc, "after-vet-shipped")
+    assert "forced on" in row.lower(), (
+        "the scored arm must say the two flags are FORCED ON (its `TORTOISE_VET=1` "
+        f"is an override of a default-OFF flag): {row}")
+    assert "not what production" in row.lower(), (
+        f"the scored arm must say what it is NOT — production runs with both OFF: {row}")
+    before = _argmax_row(doc, "before")
+    assert "DEPLOYED config runs today" in before, (
+        f"the `before` arm must be named as the deployed configuration: {before}")
+
+
+def test_the_bundle_doc_carries_the_same_reconciliation():
+    """One arm cannot be production in the probe and a what-if in the bundle."""
+    text = (_EVIDENCE_DIR / "E1-E2.md").read_text(encoding="utf-8")
+    assert "exactly what production wires today" not in text
+    note = " ".join(text.split())
+    assert "**forced ON**" in note, (
+        "E1-E2.md must say the scored arm has both flags forced ON")
+    for citation in ("fly.toml", ".github/scripts/fly-managed-secrets.txt"):
+        assert citation in note, (
+            f"E1-E2.md must cite {citation} as the evidence that the deploy leaves "
+            "both flags OFF")
+    assert "`before` arm is what the" in note, (
+        "E1-E2.md must name the `before` arm as the deployed configuration")
+    assert "REQUIRED_ARMS" in note, (
+        "E1-E2.md must record WHY the arm keeps its misleading name instead of "
+        "silently renaming the scored arm")
+
+
+def test_the_scored_arm_name_is_still_the_contract_name():
+    """The wording fix must not rename the arm: the log names it, V1 requires it."""
+    assert "after-vet-shipped" in check.REQUIRED_ARMS
+    assert _argmax_row(probe.__doc__, "after-vet-shipped")
+
+
+# ── 9. the bundle is REGISTERED in the docs index (#9110 review P2) ───────
+#
+# AGENTS.md's Documentation Filing Protocol step 3 requires a new `docs/` file to
+# be registered in `docs/00_index.md`, and 9 of the 10 committed evidence bundles
+# are listed in §5's table — this one was not. Nothing in the tree enforced it, so
+# the omission was invisible: a reader routing by `docs/00_index.md` (the
+# documented entry point) could not find the bundle at all, which is the state a
+# "point-in-time capstone evidence" row exists to prevent.
+#
+# The row also publishes FIGURES, so the pin is two-sided: the path must be there
+# (the filing rule) AND the figures it states must be the ones the log carries
+# (the drift rule). A row that cites a stale 62.3% or a superseded arm name is
+# worse than no row — it is an index entry a reader trusts.
+
+_INDEX = _REPO_ROOT / "docs" / "00_index.md"
+
+
+def _index_row(cell: str) -> str:
+    """The one `docs/00_index.md` table row whose path cell names ``cell``."""
+    rows = [line for line in _INDEX.read_text(encoding="utf-8").splitlines()
+            if line.startswith("|") and cell in line]
+    assert len(rows) == 1, (
+        f"expected exactly one docs/00_index.md row naming {cell}, found {len(rows)} "
+        "— a missing row is the #9110-review-P2 omission; two rows is an index "
+        "that names the same artifact twice")
+    return rows[0]
+
+
+def test_the_bundle_is_registered_in_the_docs_index():
+    """The filing rule, measured. Pre-fix this asserted on an absent row."""
+    row = _index_row("docs/evidence/7949-capstone/E1-E2.md")
+    # The other artifacts a reader needs from the index entry, per the bundle.
+    for cited in ("probes/e1_e2_probe.py", "e1-e2.log", "e1e2_corpus.json",
+                  "tools/e1_e2_census_check.py", "tests/test_e1_e2_measurement.py"):
+        assert cited in row, f"the docs/00_index.md row does not cite {cited}"
+
+
+def test_the_docs_index_row_publishes_the_measured_figures():
+    """The index row's numbers are the log's numbers, not a story about them.
+
+    Pins the DIRECTION of the finding too: an index that says "E1 improved" or
+    quotes the counterfactual's 37.5% as the result is the misreading the bundle's
+    whole limits section exists to refuse.
+    """
+    row = _index_row("docs/evidence/7949-capstone/E1-E2.md")
+    assert "60.0% (15/25) → 60.0%, 0.0 pp" in row, (
+        "the index row must publish the measured 0.0 pp, not a paraphrase")
+    assert "UNPREREGISTERED" in row, (
+        "the index row must carry the verdict (no threshold is frozen — #9075), "
+        "because a row that reads as a pass is exactly what the gate refuses")
+    assert "9/9" not in row or "counterfactual" in row, (
+        "the 9 removals belong to the discriminating control, not to the scored arm")
+    # The counterfactual figure, wherever it appears, must be named as one.
+    if "37.5%" in row:
+        assert "counterfactual" in row.lower(), (
+            "37.5% is the counterfactual/mint-skip figure — publishing it without "
+            "that qualifier reads as the shipped arm's result")
