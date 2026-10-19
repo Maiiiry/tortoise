@@ -670,10 +670,13 @@ def read_queue_health(repo: str):
             # The tool is invoked as `python3 tools/ci_check_repair.py`, so the
             # script's own directory (not the repo root) is sys.path[0].
             sys.path.insert(0, root)
-        from tools import ci_queue_health  # noqa: PLC0415 — optional dependency
+        # An inline suppression for BLE001/PLC0415 here would match NO enabled
+        # rule (the baseline selects `B`, not `BLE`/`PLC`), so ruff reports it as
+        # an unused directive (RUF100) and the `lint` check goes red.
+        from tools import ci_queue_health
 
         return ci_queue_health.read_health(repo)
-    except Exception:  # noqa: BLE001 — a queue read must never fail the repair pass
+    except Exception:
         return None
 
 
