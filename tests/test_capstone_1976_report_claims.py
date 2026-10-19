@@ -65,6 +65,19 @@ WHAT THIS PINS
    exactly `{5, 7, 8, 12, 15, 16}`. A count that does not reconcile with its own list is this
    artefact's recurring defect, and it reached the pull-request description too ("five",
    where the document says six).
+9. The report's `Surfaces` column — labelled "verbatim from `04-test-design.md`" —
+   is the map's cell, compared as whitespace-normalised TEXT. A number-SET
+   comparison (the first version) passed `10, 9, 2, 1` against `1, 2, 9, 10`,
+   which is a different cell, so the "verbatim" label stayed false while the
+   guard was green. Non-vacuity is in-suite: the comparison is driven with a
+   drifted, a REORDERED and a spacing-only pair.
+10. This file's own contract stays one entry per check: the `WHAT THIS PINS` list numbers
+    1..N once each, in order, every `# N —` section header carries an unused number, is
+    ruled and separated from the code above, and claims nothing the list does not name.
+    The defect this pins: integrating #9013 left a duplicated docstring fragment, **two**
+    items numbered `7.`, and a `# 7 —` header under this branch's `# 7-8 —` with its
+    opening rule dropped — a merged guard whose contract no longer said what it pins,
+    while every assertion in it stayed green.
 
 Claims are read as **paragraphs**, not physical lines (`_claim_block`, `_leg_gap_sentence`):
 markdown wrapping is free, so reflowing a sentence must not fail a guard that is about what
@@ -76,16 +89,7 @@ indicator-2 row had no anchor caveat); check 5's extractor surfaces the dangling
 synthetic doc text and the resolver rejects it; check 6 fails on "8 files, 201 tests";
 checks 7–8 fail on it too (its per-surface table's only not-green row is 7, so the derived
 set is `{7}` against a stated `16 green`; it carries no "seven legs" claim at all, and its
-rows 7, 8 and 12 carry none of their leg clauses).
-
-
-synthetic doc text and the resolver rejects it; check 6 fails on "8 files, 201 tests".
-7. The report's `Surfaces` column — labelled "verbatim from `04-test-design.md`" —
-   is the map's cell, compared as whitespace-normalised TEXT. A number-SET
-   comparison (the first version) passed `10, 9, 2, 1` against `1, 2, 9, 10`,
-   which is a different cell, so the "verbatim" label stayed false while the
-   guard was green. Non-vacuity is in-suite: the comparison is driven with a
-   drifted, a REORDERED and a spacing-only pair.
+rows 7, 8 and 12 carry none of their leg clauses). Checks 9 and 10 are non-vacuous in-suite.
 
 Static: doc-text scans plus file reads. No network, DB or graph.
 """
@@ -1150,7 +1154,10 @@ def test_each_leg_gap_is_recorded_on_its_own_surface_row():
             f"surface {surface}'s row must record {description} (`{clause}`) in its "
             "Result cell: " + rows[surface]
         )
-# 7 — the report's `Surfaces` column really IS the map's (the "verbatim" label)
+
+
+# --------------------------------------------------------------------------- #
+# 9 — the report's `Surfaces` column really IS the map's (the "verbatim" label)
 # --------------------------------------------------------------------------- #
 
 #: The map `capstone-report.md` declares canonical — its `Surfaces` column is
@@ -1282,3 +1289,152 @@ def test_the_surfaces_cross_check_rejects_a_misquoted_row():
     assert {1, 2, 10} != _surface_numbers(_map_e2e_surfaces()["E2E-6"]), (
         "E2E-6 is back to `1, 2, 10` — the surface-9 door this pin exists for "
         "was dropped again")
+
+
+# --------------------------------------------------------------------------- #
+# 10 — the guard's own contract: one numbered entry per check, and one ruled
+#      section per number
+# --------------------------------------------------------------------------- #
+
+# The module docstring is this file's only contract ("THE DEFECTS THIS PINS") and the
+# `# N — title` section comments are how each check is located, so a merge can leave both
+# wrong while every assertion above stays green. It did: integrating #9013 produced a
+# duplicated docstring fragment, two items numbered `7.`, and a section header labelled
+# `# 7 —` sitting under this branch's `# 7-8 —`, with its opening rule dropped. Nothing
+# here is about the report — this reads the guard's own source.
+
+_GUARD_SOURCE = Path(__file__).resolve()
+
+_SECTION_TITLE = re.compile(r"^# (\d+)(?:-(\d+))? — ")
+_SECTION_RULE = re.compile(r"^# -{20,} #$")
+_CONTRACT_ITEM = re.compile(r"^(\d+)\. ", re.MULTILINE)
+
+
+def _contract_list(source: str) -> tuple[list[int], list[str]]:
+    """The `WHAT THIS PINS` item numbers, and the docstring lines that follow the list."""
+    docstring = source.split('"""')[1]
+    if "WHAT THIS PINS" not in docstring:
+        return [], []
+    lines = docstring.split("WHAT THIS PINS", 1)[1].splitlines()
+    items: list[int] = []
+    for index, line in enumerate(lines):
+        item = _CONTRACT_ITEM.match(line)
+        if item:
+            items.append(int(item.group(1)))
+        elif (
+            items
+            and not line.strip()
+            # the list ends at the first blank line that no further item follows
+            and (index + 1 == len(lines) or not _CONTRACT_ITEM.match(lines[index + 1]))
+        ):
+            return items, lines[index + 1 :]
+    return items, []
+
+
+def _contract_items(source: str) -> list[int]:
+    """The `WHAT THIS PINS` list's item numbers, in the order they are written."""
+    return _contract_list(source)[0]
+
+
+def _section_checks(source: str) -> list[int]:
+    """The check number each ruled section header starts at, in file order."""
+    return [
+        int(m.group(1))
+        for line in source.splitlines()
+        if (m := _SECTION_TITLE.match(line))
+    ]
+
+
+def _contract_violations(source: str) -> list[str]:
+    """Every way `source` breaks the one-entry-per-check contract (empty when clean)."""
+    out: list[str] = []
+    documented = _contract_items(source)
+    if documented != list(range(1, len(documented) + 1)):
+        out.append(
+            "the `WHAT THIS PINS` list must number 1..N once each, in order — a repeated "
+            f"or skipped number is merge residue: {documented}"
+        )
+    sections = _section_checks(source)
+    if len(sections) < 2:
+        out.append(f"could not read the guard's section headers: {sections}")
+    trailing = [ln for ln in _contract_list(source)[1] if _CONTRACT_ITEM.match(ln)]
+    if trailing:
+        out.append(
+            "a `WHAT THIS PINS` item appears after the list ended — merge residue drops "
+            f"one into the middle of the prose: {trailing[0]!r}"
+        )
+    if sections != sorted(set(sections)):
+        out.append(
+            "each section must carry its own check number — two sections claiming one "
+            f"number is merge residue: {sections}"
+        )
+    if not set(sections) <= set(documented):
+        out.append(
+            "a section header claims a check the docstring does not list: "
+            f"{sorted(set(sections) - set(documented))}"
+        )
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if not _SECTION_TITLE.match(line):
+            continue
+        if index < 3:
+            out.append(f"section header at line {index + 1} has no room for its rule")
+            continue
+        if not _SECTION_RULE.match(lines[index - 1]):
+            out.append(
+                f"the section header at line {index + 1} lost its opening rule: {line}"
+            )
+        if lines[index - 2] != "" or lines[index - 3] != "":
+            out.append(
+                f"the section header at line {index + 1} is glued to the code above it "
+                "— a top-level block needs two blank lines"
+            )
+        cursor = index + 1
+        while (
+            cursor < len(lines)
+            and lines[cursor].startswith("#")
+            and not _SECTION_RULE.match(lines[cursor])
+        ):
+            cursor += 1
+        if cursor == len(lines) or not _SECTION_RULE.match(lines[cursor]):
+            out.append(
+                f"the section header at line {index + 1} has no closing rule: {line}"
+            )
+    return out
+
+
+def test_the_guards_own_contract_numbers_each_check_once():
+    """Every check is one entry in the docstring and one ruled section, numbered the
+    same. PRE-FIX (the #9013 merge residue this PR fixes): two sections both started at
+    7, the second with no opening rule and glued to the code above, and a stray `7.`
+    item sat after the list had ended."""
+    violations = _contract_violations(_GUARD_SOURCE.read_text(encoding="utf-8"))
+    assert not violations, "the guard's own contract is inconsistent:\n" + "\n".join(
+        violations
+    )
+
+
+def test_the_contract_check_rejects_merge_residue():
+    """Non-vacuity: driven with the three shapes the #9013 merge actually produced."""
+    source = _GUARD_SOURCE.read_text(encoding="utf-8")
+    # (a) a second item numbered 7 — the residue: `... 8. ... 7. The report's Surfaces ...`
+    renumbered = source.replace(
+        "9. The report's `Surfaces` column", "7. The report's `Surfaces` column", 1
+    )
+    assert "repeated or skipped number" in " ".join(_contract_violations(renumbered))
+    # (b) a section header reusing a number already taken by `# 7-8`
+    duplicate = source.replace(
+        "# 9 — the report's `Surfaces` column", "# 7 — the report's `Surfaces` column", 1
+    )
+    assert "two sections claiming one number" in " ".join(_contract_violations(duplicate))
+    # (c) the dropped opening rule and the glued block — the residue's other half
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if _SECTION_TITLE.match(line) and line.startswith("# 9 —"):
+            del lines[index - 1]  # the opener
+            del lines[index - 3]  # one of the two blank lines
+            break
+    glued = "\n".join(lines) + "\n"
+    reported = " ".join(_contract_violations(glued))
+    assert "lost its opening rule" in reported
+    assert "glued to the code above" in reported
