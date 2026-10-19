@@ -604,6 +604,19 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
             "empty dump for a graph that gained content mid-read (a torn read "
             "must never look green)."
         )
+    if source_node_count == 0 and nodes:
+        # The store counts ZERO content nodes and the node read returned one: on
+        # v6 (60002) that is the phantom `(0, [], {})` a page read fabricates for
+        # a graph deleted between the existence probe and the page (measured). A
+        # real label-less node IS content (``_CONTENT_NODE_PREDICATE`` accepts
+        # it), so a store count of 0 cannot account for any collected row —
+        # refuse rather than export a node that `restore_graph` would materialise.
+        raise ValueError(
+            f"dump_graph({graph_name}): the store counts 0 content nodes but the "
+            f"node read returned {len(nodes)} — the graph was deleted or emptied "
+            "mid-read (on the v6 core the page then fabricates a phantom node). "
+            "Refusing to write a dump that exports one."
+        )
     if len(nodes) < source_node_count:
         raise ValueError(
             f"dump_graph({graph_name}): exported {len(nodes)} data nodes but the "

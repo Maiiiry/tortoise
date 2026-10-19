@@ -40,10 +40,11 @@ a v6 defect, and each rule it applies below is a measurement, not a guess:
   measured unaffected, so the fake must not pretend otherwise)
 * ``ORDER BY``/``LIMIT``  -> applied (so paging boundaries are exercised)
 
-Consequence when the old form returns: the first node page is empty, `dump_graph`
-exports 0 data nodes for a populated graph, and `hosted_backup`'s fail-closed
-guard refuses with a TRUNCATION message — the wrong cause for a whole-engine
-outage (#9226).
+Consequence when the old form returns: every node that is not an edge endpoint
+vanishes from the export, so a graph holding an ISOLATED node cannot be dumped —
+the #3895 reconcile recovers edge endpoints, which is why a fully-connected graph
+still dumped even pre-fix (measured on 60002) — and the refusal blames a
+truncation, the wrong cause for a whole-engine difference (#9226).
 """
 from __future__ import annotations
 
@@ -184,8 +185,8 @@ class _AbsentGraphV6:
     MEASURED on 60002, 2026-10-19: ``MATCH (n) WHERE id(n) >= 0`` answers with
     the phantom row ``(0, [], {})`` although ``MATCH (n)`` and both aggregate
     counts answer 0; on v4 (42006) every one of them answers 0. `dump_graph`
-    must therefore NOT page a graph whose independent count is 0 — otherwise the
-    phantom is exported as a node, and `restore_graph` materialises it.
+    must therefore NOT page a graph the existence probe finds empty — otherwise
+    the phantom is exported as a node, and `restore_graph` materialises it.
     """
 
     def __init__(self, calls):
@@ -197,8 +198,72 @@ class _AbsentGraphV6:
         if "count(" in cypher:
             return _Result([[0]])
         if "id(n) >=" in cypher:
-            return _Result([[0, [], {}]])  # the phantom
+            return _Result([[0, [], {}]])  # the phantom — the read that must not run
+        return _Result([])  # the `MATCH (n)` probe answers nothing
+
+
+class _VanishingGraphV6:
+    """A graph present at the probe and DELETED before the node page.
+
+    MEASURED on 60002: the probe sees the node, the page then answers with the
+    phantom `(0, [], {})`, and both aggregate counts are 0 — the window the
+    probe-then-page sequence leaves open.
+    """
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def query(self, cypher, params=None, timeout=None):
+        params = params or {}
+        self.calls.append((cypher, dict(params)))
+        if "count(" in cypher:
+            return _Result([[0]])
+        if "LIMIT 1" in cypher:
+            return _Result([[0]])  # the probe: the graph still had a node
+        if "id(n) >=" in cypher:
+            return _Result([[0, [], {}]])  # …deleted; the page fabricates one
         return _Result([])
+
+
+def test_a_graph_deleted_mid_read_does_not_export_the_phantom():
+    """MEASURED v6 sequence: the graph is present at the existence probe and gone
+    by the page read, where `id(n) >= 0` answers with the phantom `(0, [], {})`
+    and the store counts 0 content nodes. `min(start, end)` resolves the count to
+    0, so the one-sided truncation guard cannot see it — the dump must REFUSE."""
+    from tortoise.hosted_backup import dump_graph
+
+    calls = []
+    with pytest.raises(ValueError, match="counts 0 content nodes"):
+        dump_graph(_VanishingGraphV6(calls), "deleted_mid_read")
+
+
+class _GainingGraphV6:
+    """The other side of the race: empty at the probe, populated by the end."""
+
+    def __init__(self, calls):
+        self.calls = calls
+        self.node_counts = 0
+
+    def query(self, cypher, params=None, timeout=None):
+        params = params or {}
+        self.calls.append((cypher, dict(params)))
+        if "count(" in cypher and "count(r)" not in cypher:
+            self.node_counts += 1
+            return _Result([[0 if self.node_counts == 1 else 1]])
+        if "count(" in cypher:
+            return _Result([[0]])
+        return _Result([])  # the probe (and any page) sees nothing
+
+
+def test_a_graph_that_gains_its_first_node_mid_read_is_refused():
+    """An empty graph that gains a node after the probe would otherwise dump as
+    EMPTY with `min(start, end)` resolving the mismatch to 0 — a silently empty
+    artifact every guard passes."""
+    from tortoise.hosted_backup import dump_graph
+
+    calls = []
+    with pytest.raises(ValueError, match="gained content mid-read"):
+        dump_graph(_GainingGraphV6(calls), "gained_a_node")
 
 
 def test_an_absent_graph_dumps_as_empty_and_never_pages_the_phantom():
@@ -239,6 +304,7 @@ def _live_target() -> str | None:
     this helper re-implementing it.
     """
     import os
+    import uuid
 
     from tests import _live_utils
     from tests._canonical_store_guard import canonical_store_refusal
@@ -247,20 +313,31 @@ def _live_target() -> str | None:
                 _live_utils.docker_uri("tortoise_test_9226_paging")):
         if not uri or canonical_store_refusal(uri) is not None:
             continue
+        # ⛔ The probe must not MINT a graph on the target: `from_uri(uri)` with no
+        # graph name creates the graph the URI names (and the projection's
+        # bookmark marker with it), and that name is a FIXED one (`…_paging`),
+        # which the suite's journaled reaper refuses to reap — the #7357
+        # cache-churn class this helper's own docstring warns about. Probe with a
+        # per-run name and delete it in the same breath.
+        probe_name = f"test_9226_probe_{uuid.uuid4().hex[:8]}"
         try:
             from tortoise.projection import FalkorProjection
 
-            proj = FalkorProjection.from_uri(uri)
+            proj = FalkorProjection.from_uri(uri, graph_name=probe_name)
         except Exception:
             # an unreachable/refusing target is not a failure of this probe
             continue
         try:
             proj.g.query("RETURN 1")
         except Exception:
+            dropped = False
+        else:
+            dropped = True
+        finally:
+            _live_utils.drop_test_graph(proj, name=probe_name)
             proj.close()
-            continue
-        proj.close()
-        return uri
+        if dropped:
+            return uri
     return None
 
 
