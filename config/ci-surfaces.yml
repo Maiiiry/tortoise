@@ -146,6 +146,12 @@ surfaces:
   - test_abuse_integration.py
   - test_acl_graph_users.py   # C4 #2113: per-graph FalkorDB ACL layer (docker-lane; skipif no URI)
   - test_analytics_write_path_resolution.py
+  # #8151: `fetch_rows` now walks via `supabase_control.query_all` (#4038), the
+  # same seam `test_5388_org_enumeration_completeness.py` guards on this
+  # surface. A supabase_control.py-only change is exactly where the walk's
+  # end-of-page rule could regress under this caller, so this arm runs the
+  # caller's guard. Dual-registered with `eval`, where the tool's own file lives.
+  - test_8151_capture_cost_walk_completeness.py
   # #3820: the analytics sink's OUTCOME contract + degraded-sink incident. Load-bearing
   # here: the file it guards most (tortoise/hosted_api.py) selects the `api` surface.
   - test_analytics_fallback_alert.py
@@ -4281,6 +4287,15 @@ surfaces:
   - test_5321_embedder_accessor_liveness.py  # #5321: dual with `core` — the invariant under test lives in `tortoise/embeddings.py` (an `eval` SOURCE_PATTERN: `get()` returns the loaded inner encoder, so the `show_progress_bar` call sites bind), while the core-fallback callers it drives are not selected by this surface. Dropping this arm would leave the accessor unguarded on an embeddings.py-only diff.
   - test_capture_cost_measurement.py  # #3359: the report reprices from the eval-owned PRICING_MAP (tools/longmem_eval/costing.py), so a pricing-map change must run it — dual-registered with `api`/`core`
   - test_analytics_write_path_resolution.py  # #3677: tools/capture_cost_report.py is an eval-surfaced source (the eval half of the cost measurement), so a read-path change there must run the guard that pins its resolved destination — dual-registered with `api`/`core`
+  # #8151: the live pull's WALK. Same eval-surfaced subject as the #3677 file
+  # above (`tools/capture_cost_report.py` IS an eval SOURCE_PATTERN match, so an
+  # eval-only diff REPLACES the `core` fallback), which is why this arm is
+  # load-bearing: the defect was that a page-boundary end-of-walk signal
+  # truncated the window, and the only test that can see it is one driving the
+  # tool against a CAPPED transport. Dual-registered with `api` because the
+  # walk is now `supabase_control.query_all` (#4038), the same seam
+  # test_5388_org_enumeration_completeness.py guards there.
+  - test_8151_capture_cost_walk_completeness.py
   - test_analytics_fallback_alert.py  # #3820: triple-registered with `api`/`core` for the same reason as the #3677 file above — the outcome counter it pins lives in `tortoise/monitoring.py`, which the eval lane's cost measurement also reads
   - test_data_source_capture.py  # #3514: the demand path's policy half is `tortoise/demand.py`, which matches NO named surface — so a demand.py-only change selects this `core` fallback, and without this arm the file that owns the pinned literals and the marker semantics would have no guard at all. Triple-registered with `api` (hosted_api.py) and `onboarding` (the grid path).
   - eval/retrieval/test_1348.py
