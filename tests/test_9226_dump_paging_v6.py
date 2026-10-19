@@ -1,31 +1,44 @@
-"""#9226 — `dump_graph`'s keyset paging must not compare `id()` to a NEGATIVE
-value: on the FalkorDB v6 Rust core nothing matches, so every dump exported 0
-nodes and no backup could be taken on that engine.
+"""#9226 — `dump_graph`'s keyset paging must not compare a NODE `id()` to a
+NEGATIVE value: on the FalkorDB v6 Rust core nothing matches, so every dump
+started with an empty node page, exported 0 nodes and refused — no backup could
+be taken on that engine.
 
-Measured 2026-10-19 against a live v6 server (`MODULE LIST` `graph` ver
-**60001**) holding 3 nodes:
+Measured 2026-10-19 against live servers holding 3 nodes, the pinned v4 core
+(**42006**) and a v6 server (**60002** — `falkordb/falkordb:latest`; `60001` is
+`falkordb:6.0.1`, per `docs/evidence/7846-indexed-graph-restore/README.md`):
 
 ```
-literal  id(n) > -1  -> 0 rows      <-- the form `_paged_rows` used
-literal  id(n) >= 0  -> 3 rows
-literal  id(n) > 0   -> 2 rows
-param    {cursor: -1} with `id(n) > $cursor` -> 0 rows
+nodes:                            v4 (42006)   v6 (60002)
+id(n) > -1  <-- the form used        3 rows      0 rows
+id(n) >= 0                           3 rows      3 rows
+id(n) > 0                            2 rows      2 rows
+id(n) > -2                           0 rows      0 rows
+id(n) >= -1                          0 rows      0 rows
+
+edges (measured on the same two servers):
+id(r) > -1                           2 rows      2 rows
+id(r) > -2                           2 rows      2 rows
+id(r) >= -1                          2 rows      2 rows
 ```
 
-The v4 cores answer all of them correctly (`42004` = the app-image family,
-`42006` = the engine CI pins), which is why eight releases of green CI never saw
-it: the defect is engine-specific and CI only runs v4.
+So the two cores disagree at exactly ONE point — `> -1` on a NODE id, the value
+the old code sent — and that is the whole defect. Everything below `-1` answers
+0 node rows on both cores, and relationship ids are unaffected on either. The
+v4 cores answer the `-1` form correctly, which is why eight releases of green CI
+never saw it: CI only runs v4.
 
-THE REGRESSION TEST THEREFORE ENCODES THE v6 RULE. A fake handle is not a
-convenience here — it is the only way a v4-only CI can pin a v6 defect, and each
-rule it applies below is a measurement, not a guess:
+THE REGRESSION TEST THEREFORE ENCODES THE MEASURED v6 SEMANTICS FOR NODES. A
+fake handle is not a convenience here — it is the only way a v4-only CI can pin
+a v6 defect, and each rule it applies below is a measurement, not a guess:
 
-* ``id(x) > <negative>``  -> NO rows   (the coercion that broke the dump)
-* ``id(x) >= <n>=0``      -> rows with ``id >= n``
-* ``id(x) > <n>=0``       -> rows with ``id > n``
+* ``id(n) > <negative>``  -> NO rows   (the node-id coercion that broke the dump)
+* ``id(n) >= <n>=0``      -> rows with ``id >= n``
+* ``id(n) > <n>=0``       -> rows with ``id > n``
+* ``id(r) > <any>``/``>=``-> normal comparison, NEGATIVES INCLUDED (edges are
+  measured unaffected, so the fake must not pretend otherwise)
 * ``ORDER BY``/``LIMIT``  -> applied (so paging boundaries are exercised)
 
-Consequence when the old form returns: the first page is empty, `dump_graph`
+Consequence when the old form returns: the first node page is empty, `dump_graph`
 exports 0 data nodes for a populated graph, and `hosted_backup`'s fail-closed
 guard refuses with a TRUNCATION message — the wrong cause for a whole-engine
 outage (#9226).
@@ -56,7 +69,12 @@ class _Result:
 
 
 class _V6Graph:
-    """A FalkorDB v6 handle, reduced to the paging semantics we measured."""
+    """A FalkorDB v6 handle carrying the paging semantics MEASURED on it.
+
+    The negative-operand rule is NODE-only: on v6 (60002, and on v4) every
+    ``id(r) > <negative>`` returns the edges, so the edge branches below apply a
+    plain comparison and the fake never invents a defect the engine does not have.
+    """
 
     def __init__(self, calls):
         self.calls = calls  # the (query, params) pairs, for the shape assertions
@@ -70,7 +88,7 @@ class _V6Graph:
             rows = [n for n in _NODES if n[0] >= cursor]
             key = 0
         elif "id(n) > $" in cypher:
-            # THE MEASURED v6 RULE, and the reason this class exists.
+            # THE MEASURED v6 NODE RULE, and the reason this class exists.
             if cursor < 0:
                 return _Result([])
             rows = [n for n in _NODES if n[0] > cursor]
@@ -80,8 +98,8 @@ class _V6Graph:
                     if i >= cursor]
             key = 4
         elif "id(r) > $" in cypher:
-            if cursor < 0:
-                return _Result([])
+            # MEASURED: relationship ids are NOT subject to the negative-operand
+            # rule — v6 answers `id(r) > -1` with every edge, exactly like v4.
             rows = [(s, d, t, p, i) for i, (s, d, t, p) in enumerate(_EDGES)
                     if i > cursor]
             key = 4
@@ -105,8 +123,8 @@ def test_the_page_predicate_never_uses_a_negative_comparison(query):
     """
     assert ">= $cursor" in query, query
     assert not re.search(r"id\(\w\)\s*>\s*\$cursor", query), (
-        f"a strict `>` on the cursor came back — v6 answers it with 0 rows when "
-        f"the cursor is negative (#9226): {query}")
+        f"a strict `>` on the cursor came back — v6 answers it with 0 rows for a "
+        f"NEGATIVE cursor on node ids (#9226): {query}")
 
 
 # ── the paging behaviour ─────────────────────────────────────────────────
@@ -140,6 +158,13 @@ def test_paging_neither_duplicates_nor_skips_rows():
 
 
 def test_the_edge_read_pages_the_same_way_on_v6():
+    """Edges page identically — and are MEASURED unaffected by the node defect.
+
+    ``id(r) > -1`` returns every edge on v6 (and on v4), so this test guards the
+    edge read's page arithmetic and its non-negative first cursor. It is NOT a
+    regression test for #9226: the defect was node-only, and asserting otherwise
+    would be pinning behaviour the engine does not have.
+    """
     calls = []
     rows = list(_paged_rows(_V6Graph(calls), _DUMP_EDGE_PAGE_QUERY, 4, batch=2))
 

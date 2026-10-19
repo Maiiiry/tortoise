@@ -287,13 +287,14 @@ _DUMP_PAGE_SIZE = 1000
 #: ``>=`` against a cursor the caller has ALREADY advanced past the last row it
 #: saw — never ``>`` against a negative start (see ``_paged_rows``).
 #:
-#: ⛔ This was ``id(n) > $cursor`` with ``cursor = -1``, which is silently WRONG
-#: on FalkorDB's Rust core (``MODULE LIST`` ``graph`` ver **60001**, the engine
-#: behind ``falkordb/falkordb:latest`` and ``falkordb-server:6.0.1``). Measured
-#: 2026-10-19 against live servers holding 3 nodes — the pinned v4 core
-#: (``42006``) and a v6 server:
+#: ⛔ This was ``id(n) > $cursor`` with ``cursor = -1``, and that form is silently
+#: WRONG for NODE ids on FalkorDB's Rust core (``MODULE LIST`` ``graph`` ver
+#: **60002** on ``falkordb/falkordb:latest``, **60001** on ``falkordb:6.0.1`` —
+#: ``docs/evidence/7846-indexed-graph-restore/README.md`` maps both). Measured
+#: 2026-10-19 against live servers holding 3 nodes, the pinned v4 core
+#: (``42006``) and a v6 server (``60002``):
 #:
-#:     query                            v4 (42006)   v6 (60001)
+#:     nodes:                           v4 (42006)   v6 (60002)
 #:     id(n) > -1    (the old form)        3 rows      0 rows   (!!)
 #:     id(n) >= 0    (the shipped form)    3 rows      3 rows
 #:     id(n) > 0                           2 rows      2 rows
@@ -302,16 +303,19 @@ _DUMP_PAGE_SIZE = 1000
 #:     id(n) > -9223372036854775808        0 rows      0 rows
 #:     id(n) >= -1  (the tempting fix)     0 rows      0 rows
 #:
-#: So the two cores disagree at exactly ONE point — the boundary ``> -1``, which
-#: is the value the old code sent — and that is the whole defect. Every operand
-#: below ``-1`` answers 0 rows on BOTH cores, so the ``-4294967296`` and
-#: ``-9223372036854775808`` probes are NOT evidence of a 32-bit wrap: a negative
-#: operand is outside the id domain on either core, and only ``-1`` happens to
-#: fall on v4's boundary. That is also why ``>= -1`` is not a fix — it returns 0
-#: rows on v4 as well. Consequence of the old form was concrete: the FIRST page
-#: was empty on every v6 server, so ``dump_graph`` exported 0 nodes for a
-#: populated graph and the fail-closed guard below refused — **no backup could be
-#: taken on v6**, with a message that blamed a truncated read (#9226).
+#: The two cores disagree at exactly one point — ``> -1`` on a NODE id, the value
+#: the old code sent — and that is the whole defect. Every operand below ``-1``
+#: answers 0 rows on BOTH cores, and v4 does not answer monotonically (``> -1``
+#: yields rows, ``> -2`` does not), so the mechanism is not established by these
+#: measurements and is deliberately not guessed at here. Nor does it generalise
+#: to relationship ids: on both cores ``id(r) > -1``, ``id(r) > -2`` and
+#: ``id(r) >= -1`` all return every edge. ``>= -1`` is not a fix either — it
+#: returns 0 node rows on v4 as well.
+#:
+#: Consequence of the old form was concrete: the FIRST node page was empty on
+#: every v6 server, so ``dump_graph`` exported 0 nodes for a populated graph and
+#: the fail-closed guard below refused — **no backup could be taken on v6**, with
+#: a message that blamed a truncated read (#9226).
 #: Offsetting the cursor instead of negating it is engine-independent: an
 #: integer `id` is non-negative, so ``id >= 0`` is the true first page on both
 #: cores and ``id >= last + 1`` is exactly the old ``id > last``.
@@ -338,8 +342,9 @@ def _paged_rows(g, query: str, key_index: int, *, batch: int = _DUMP_PAGE_SIZE):
     The page predicate is ``id(...) >= $cursor`` and the cursor is advanced to
     ``last + 1`` — so the first call sends ``0``, the inclusive lower bound of the
     id space, and never a negative value. That is not cosmetic: a NEGATIVE
-    comparison against ``id()`` matches nothing on the v6 Rust core, which made every first page
-    empty and made ``dump_graph`` unusable on that engine (#9226 — see
+    comparison against a NODE ``id()`` answers 0 rows on the v6 Rust core (it does
+    not for relationship ids — measured), which made every first node page empty
+    and made ``dump_graph`` unusable on that engine (#9226 — see
     ``_DUMP_NODE_PAGE_QUERY``). Advancing past the last row keeps the paging
     identical on both cores because ids are non-negative integers, so
     ``>= last + 1`` is exactly the old ``> last``.
