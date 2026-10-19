@@ -219,17 +219,6 @@ ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
         "mcp-team": "team-identity", "t-bf-1": "team-identity",
     },
     "test_quota.py": {"registry": "prod-coupled"},
-    # #4721/#8979: the `reg` fixture resolves the registry graph through
-    # `TortoiseSDK(namespace="registry")`, and `_get_registry()` derives the
-    # graph name FROM that SDK namespace. The endpoint under test resolves the
-    # same canonical namespace, and `_auth` / the claim primitive MATCH the
-    # `:APIKey` rows on it while `_reg_seed_org` seeds the `:Team` row there —
-    # so seed and read must be the SAME graph, the same `prod-coupled` class as
-    # test_cross_tenant_read_isolation / test_pack_selection_by_graph. A
-    # `test_*` rename would point the seed at a graph the endpoint never reads:
-    # the API-key auth would 401 and `statuses = sorted(...)` /
-    # `assert statuses == [200, 409]` would go RED (#8979).
-    "test_rotate_key.py": {"registry": "prod-coupled"},
     "test_sdk_legacy_coverage.py": {"team-beta": "assertion"},
     "test_writer_inventory.py": {"registry": "prod-coupled"},
     "test_ask_sdk.py": {

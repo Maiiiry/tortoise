@@ -142,11 +142,11 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 # parity NAND onto the calm twin to zero it, and without that calm falls to
 # degree 0, ``d_gb`` = -0.25, and the 2-row requirement drops to 1.1786.  So
 # 1.857 is the CEILING at ``d_gb == 0`` and 1.4286 is the requirement at that
-# parity; 1.857 is never a floor (a negative ``d_gb`` gives a larger ceiling),
-# while 1.4286 is one only while ``d_gb`` >= 0 — ``1.4286 + d_gb`` exceeds it
-# for every positive ``d_gb`` — and only 2.857 bounds every page.  The
-# conclusion below is unaffected: a larger ``d_gb`` only moves the requirement
-# UP, never down.
+# parity; 1.857 is never a floor (at ``d_gb == 0`` the requirement is 1.4286,
+# and it passes 1.857 only once ``d_gb`` >= 0.4286), while 1.4286 is one only
+# while ``d_gb`` >= 0 — ``1.4286 + d_gb`` exceeds it for every positive
+# ``d_gb`` — and only 2.857 bounds every page.  The conclusion below is
+# unaffected: a larger ``d_gb`` only moves the requirement UP, never down.
 # A 2-row page is the worst PAGE because a page cannot hold fewer than the two
 # rows being ordered: it is a maximum, not the first term of a series.  Measured
 # on the bare 4-row E2E-1 fixture (dense leg live, re-measured 2026-10-18):

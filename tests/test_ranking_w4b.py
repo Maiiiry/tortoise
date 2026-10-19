@@ -719,6 +719,8 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         DEFAULT_GRAPH_BOOST_WEIGHT,
         DEFAULT_RECENCY_WEIGHT,
         DEFAULT_SIMILARITY_WEIGHT,
+        _min_max_normalize,
+        _similarity_of,
     )
 
     calm, hot, _cc = _seed_twin_conflict(
@@ -776,6 +778,30 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
             + DEFAULT_GRAPH_BOOST_WEIGHT * (gb_calm - gb_hot)
             + DEFAULT_RECENCY_WEIGHT * (c["recency_boost"] - h["recency_boost"])
         ) / DEFAULT_GRAPH_BOOST_WEIGHT
+
+    def unrounded_preboost_gap(rows: list[dict]) -> float:
+        """The twins' PRE-boost relevance gap, in FINAL-SCORE units, recomputed
+        from the UNROUNDED input ``rerank`` consumes rather than from the 4-dp
+        payload it reports.
+
+        ``rerank`` rounds every field it publishes (``similarity``,
+        ``graph_boost``, ``recency_boost``, ``final_score``) to 4 dp, so a gap
+        read as a difference of two reported finals carries ~1.4e-4 — wider
+        than the 1e-4 that separates the comment's 0.0189 from the 0.0188 an
+        earlier wording quoted.  A payload-basis read therefore CANNOT settle
+        which of the two the comment is entitled to quote, however tight its
+        band is made; the raw ``scores.rrf`` values in these row dicts are not
+        rounded, so the min-max span is recomputed here exactly as ``rerank``
+        computed it.
+
+        ``sim_w * d_sim`` IS the whole level condition once ``d_gb`` and
+        ``d_rec`` are zero, and the caller asserts both by name on the page it
+        applies this to — so this is the level condition on that page, not a
+        subset of it.
+        """
+        norm = _min_max_normalize([_similarity_of(r) for r in rows])
+        ns = {r["id"]: value for r, value in zip(rows, norm, strict=True)}
+        return DEFAULT_SIMILARITY_WEIGHT * (ns[calm] - ns[hot])
 
     # ── The shipped default page, retrieved through the fused path ────────
     res = ranked_sdk.tortoise_fts_query(query, limit=10, order_by="graph")
@@ -1083,16 +1109,43 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
         f"whole graph: twins, counter-claim, parity row); this read returned "
         f"{len(res)} rows, so the requirement's similarity span is a "
         f"different one — re-measure it rather than re-describing it")
-    assert ten_req == pytest.approx(0.0540, abs=2e-3), (
+    # The level condition the comment quotes on this page assumes the twins'
+    # recency term cancels (equal ``createdAt``); name that premise, because
+    # ``unrounded_preboost_gap`` below leans on it to reduce to the similarity
+    # term alone.
+    assert ten_calm["recency_boost"] == ten_hot["recency_boost"], (
+        f"the comment's default-page requirement assumes the twins' recency "
+        f"cancels; calm {ten_calm['recency_boost']} vs hot "
+        f"{ten_hot['recency_boost']}")
+    # The requirement and the 0.0189 gap are pinned on an UNROUNDED basis.
+    # ``ten_req`` above is reconstructed from the 4-dp payload, and that
+    # reconstruction carries ~4e-4 — so it cannot say whether the comment is
+    # entitled to 0.0189 or to the 0.0188 the earlier wording quoted, and a
+    # tight band on IT would be false precision.  ``scores.rrf`` is the exact
+    # input ``rerank`` normalized, so the gap is recomputed from it here and
+    # the payload reconstruction is then checked against that exact value,
+    # each with the band its own basis supports.
+    ten_gap_unrounded = unrounded_preboost_gap([dict(r) for r in res])
+    ten_req_unrounded = ten_gap_unrounded / DEFAULT_GRAPH_BOOST_WEIGHT
+    assert ten_req == pytest.approx(ten_req_unrounded, abs=5e-4), (
+        f"the payload-derived requirement ({ten_req:.7f}) and the one "
+        f"recomputed from the unrounded ``scores.rrf`` span "
+        f"({ten_req_unrounded:.7f}) must agree to the payload's own 4-dp "
+        f"budget: a wider split means ``required_cb``'s strip is no longer "
+        f"reproducing ``rerank``'s level condition")
+    assert ten_req_unrounded == pytest.approx(0.0540, abs=1e-4), (
         f"the comment quotes a 0.0540 requirement on the shipped default "
-        f"page; this run measures {ten_req:.4f}")
-    assert ten_req * DEFAULT_GRAPH_BOOST_WEIGHT == pytest.approx(0.0189, abs=1e-5), (
+        f"page; the unrounded derivation measures {ten_req_unrounded:.7f}")
+    assert ten_gap_unrounded == pytest.approx(0.0189, abs=1e-5), (
         f"the comment quotes this page's relevance gap as 0.0189 of final "
-        f"score (just above the 0.0175 boost); this run measures "
-        f"{ten_req * DEFAULT_GRAPH_BOOST_WEIGHT:.6f}.  The tolerance is 1e-5 on "
-        f"purpose: at 1e-4 the band still ADMITS 0.0188, so it could not "
-        f"settle which of the two roundings the comment is entitled to quote — "
-        f"the question this whole correction exists to answer")
+        f"score (just above the 0.0175 boost); the unrounded derivation "
+        f"measures {ten_gap_unrounded:.7f}.  The 1e-5 band is only honest on "
+        f"THIS basis: the similarity term is recomputed from the unrounded "
+        f"``scores.rrf`` span and the other two terms are zero by the parity "
+        f"and recency assertions above, so no 4-dp rounding enters.  Read off "
+        f"the payload instead, the same gap carries ~1.4e-4 and the band "
+        f"could not separate 0.0189 from 0.0188 — which is the whole question "
+        f"this correction exists to answer")
     clears_2102 = DEFAULT_SIMILARITY_WEIGHT * 0.05 / DEFAULT_GRAPH_BOOST_WEIGHT
     assert clears_2102 == pytest.approx(0.0714, abs=1e-3)
     assert ten_req < clears_2102, (
@@ -1133,10 +1186,17 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
     # again, so the flip sits ABOVE the unrounded requirement: the requirement
     # lands on graph_boost cell 0.7540, 0.0541 (cell 0.7541) still ties, and the
     # flip starts at cell 0.7542 — ``cb`` >= 0.0542 on the 1e-4 grid, 0.05415
-    # continuous.  The comment quotes exactly that, so each of those three
-    # points is probed through the shipped read rather than argued: an
-    # assertion that only checked the requirement and 0.0542 would stay green
-    # if the boundary moved a whole grid step down to 0.05405.
+    # continuous.
+    #
+    # The CELLS are asserted as arithmetic on THIS page's baseline, and the
+    # ORDERING is probed where it is not a rounding boundary.  Probing 0.0541 /
+    # 0.0542 through the ranker would make a 5e-5 margin the criterion — 1.75e-5
+    # of final-score gap against a 1e-4 grid, i.e. decided by which way two
+    # independently rounded finals land — while the requirement those boundaries
+    # belong to is only pinned to the payload's honest 4-dp budget.  A test that
+    # PERMITS the requirement to drift and REQUIRES its boundary to hold to 5e-5
+    # contradicts itself; the boundary is arithmetic, the behaviour is probed a
+    # whole grid cell clear of it on each side.
     def _flips_at(value: float) -> bool:
         with monkeypatch.context() as patched:
             patched.setattr("tortoise.ranking.W4_CONTESTED_BOOST", value)
@@ -1146,20 +1206,38 @@ def test_integration_boost_requirement_is_bounded_by_the_page(
             f"FIXTURE NOT REACHED at cb={value}: a twin is off the page")
         return ids.index(hot) < ids.index(calm)
 
-    assert not _flips_at(ten_req), (
+    assert round(ten_gb_hot + ten_req_unrounded, 4) == pytest.approx(0.7540), (
+        f"the comment says the requirement lands on the graph_boost cell "
+        f"0.7540 (baseline {ten_gb_hot} + the unrounded requirement "
+        f"{ten_req_unrounded:.7f}); the round-trip puts it at "
+        f"{round(ten_gb_hot + ten_req_unrounded, 4)} — re-measure the grid "
+        f"rather than re-describing it")
+    assert round(ten_gb_hot + 0.0541, 4) == pytest.approx(0.7541), (
+        f"the comment quotes 0.0541 as landing on graph_boost cell 0.7541 — "
+        f"one cell above the requirement's 0.7540, and still a tie, which is "
+        f"why it is not yet enough.  On this page's baseline "
+        f"{ten_gb_hot} the round-trip gives "
+        f"{round(ten_gb_hot + 0.0541, 4)}")
+    assert round(ten_gb_hot + 0.0542, 4) == pytest.approx(0.7542), (
+        f"the comment quotes 0.0542 as the smallest increment on the 1e-4 "
+        f"grid that flips the shipped default page (graph_boost cell 0.7542); "
+        f"on this page's baseline {ten_gb_hot} the round-trip gives "
+        f"{round(ten_gb_hot + 0.0542, 4)}")
+    # The ordering, probed where a 1e-4 grid cannot decide it: at the exact
+    # (unrounded) requirement the contested twin must NOT take the lead, and a
+    # full four cells above it — four times the width of the boundary cell —
+    # it must.  Four cells also swallows the payload's rounding slack, so this
+    # does not depend on ``ten_req`` landing on a particular 4-dp value.
+    assert not _flips_at(ten_req_unrounded), (
         f"the comment puts the flip at cb >= 0.05415, ABOVE the unrounded "
-        f"requirement ({ten_req:.7f}) — so cb == the requirement must NOT "
-        f"reorder the payload. It did: the round-trip (graph_boost and "
-        f"final_score both rounded to 4 dp before/after weighting) is no "
+        f"requirement ({ten_req_unrounded:.7f}) — so cb == the requirement "
+        f"must NOT reorder the payload. It did: the round-trip (graph_boost "
+        f"and final_score both rounded to 4 dp before/after weighting) is no "
         f"longer what the comment says it is")
-    assert not _flips_at(0.0541), (
-        "the comment quotes 0.0541 as still tying (the requirement lands on "
-        "graph_boost cell 0.7540, and cell 0.7541 is not enough); this run "
-        "flips there — re-measure the round-trip rather than re-describing it")
-    assert _flips_at(0.0542), (
-        "the comment quotes 0.0542 as the smallest increment on the 1e-4 grid "
-        "that flips the shipped default page (graph_boost cell 0.7542); this "
-        "run does not flip there — re-measure the round-trip threshold")
+    assert _flips_at(ten_req_unrounded + 4 * 1e-4), (
+        f"cb immediately above the requirement must flip the shipped default "
+        f"page; {ten_req_unrounded + 4 * 1e-4:.7f} does not — re-measure the "
+        f"round-trip threshold rather than re-describing it")
 
     # ── The bound is CONDITIONAL: the ``Δgb`` term is not free ─────────────
     # ``cb_req = (sim_w*Δsim + graph_w*Δgb + rec_w*Δrec) / graph_w``.  1.857 is the
