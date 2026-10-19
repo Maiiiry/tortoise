@@ -7424,6 +7424,21 @@ function claimIntentInFlight() {
     return outcomes[orgId] || null
   }
 
+  // #8255: the ONE clearer for a retained ambiguous-failure notice — used by both
+  // supersede hooks in `regenerateKey` (a fresh attempt on the team, and the
+  // same-team path that has just produced the richer row-truth message). It only
+  // clears THAT team's `ambiguous` field: the record is also the reveal's home
+  // and the partial-state notice's, and another team's record is not ours to
+  // touch. Returning `prev` unchanged when there is nothing to clear is a React
+  // bail-out — no re-render, no state write.
+  function clearRotateAmbiguity(orgId) {
+    setRotateOutcomes((prev) => {
+      const cur = prev && prev[orgId]
+      if (!cur || !cur.ambiguous) return prev
+      return { ...prev, [orgId]: { ...cur, ambiguous: '' } }
+    })
+  }
+
   const rotateOutcome = rotateOutcomeFor(rotateOutcomes, currentOrgId)
 
   // #4342: the rotate replacement's key, derived ONCE for the same reason as
@@ -7448,6 +7463,16 @@ function claimIntentInFlight() {
   // not describe.
   const rotateRefusalText = (rotateOutcome && rotateOutcome.refusal) || ''
 
+  // #8255: the FOURTH disclosure on the same record — the ambiguous-failure
+  // notice ("the rotate request failed and its outcome could not be confirmed").
+  // It exists because `regenerateKey`'s catch used to return at the team
+  // identity guard before it could say anything at all, so a switch across the
+  // rotate RTT left the user with no notice that a destructive one-shot call had
+  // an unknown outcome. The notice is latched on the team that owns the row and
+  // read through the same team-scoped reader as its three siblings, so it can
+  // never surface under a header whose rows it does not describe.
+  const rotateAmbiguousText = (rotateOutcome && rotateOutcome.ambiguous) || ''
+
   // #8249 (review P2): the error banner's ONE composed message. The retained
   // refusal OUTRANKS the transient `error` slot: the plaintext-less path
   // latches the refusal and then runs `await loadAll('')`, which writes its OWN
@@ -7470,10 +7495,18 @@ function claimIntentInFlight() {
   // answer different questions, so both render: the retained destruction
   // record FIRST (never dropped, the #8249 precedence), the fresh detail after
   // it. An empty side keeps the other authoritative, as before.
-  function errorBannerText(error, refusalText) {
+  //
+  // #8255: the ambiguous-failure notice is the second RETAINED disclosure and
+  // takes the same precedence class as the refusal — both are records the
+  // transient, un-keyed `error` slot cannot hold (they must outlive a switch),
+  // and both render ahead of a fresh transient detail rather than replacing it.
+  // The two are mutually superseding rather than coexisting by design: the
+  // same-team path clears the fallback once it has the richer row-truth message.
+  function errorBannerText(error, refusalText, ambiguousText) {
     const transient = errorMessage(error)
-    if (refusalText && transient) return `${refusalText} ${transient}`
-    return refusalText || transient
+    const retained = [refusalText, ambiguousText].filter(Boolean).join(' ')
+    if (retained && transient) return `${retained} ${transient}`
+    return retained || transient
   }
 
   // #4370: the GRAPH reveal's key (the create-graph envelope + the per-graph
@@ -7588,6 +7621,12 @@ function claimIntentInFlight() {
     // there. Declared OUTSIDE the try so the catch's stale-response guard
     // reads the same value.
     const _teamAtCall = currentOrgId
+    // #8255: a retained ambiguous-failure notice for THIS team is superseded by
+    // a fresh attempt — the notice's own remedy ("refresh the key list before
+    // relying on this key") is exactly what this attempt performs, so leaving it
+    // latched would pair a stale "could not be confirmed" with the new attempt's
+    // outcome (a definite 4xx detail renders in the same banner).
+    clearRotateAmbiguity(_teamAtCall)
     try {
       // #2229/#4355: label carry-over — the row may leave the closure list
       // mid-flight (switch/refresh) — degrade to an unlabeled rotate. The
@@ -7731,16 +7770,68 @@ function claimIntentInFlight() {
       // latched above, BEFORE the identity guard — see the comment there.
       await loadAll('')
     } catch (e) {
+      // #8255: the AMBIGUOUS-failure disclosure is latched BEFORE the identity
+      // guard, on the team that owns the row — the #8249 pattern applied to this
+      // branch. #8249 fixed the plaintext-less 2xx; the guard's OTHER casualty is
+      // here, where it was the catch's first statement: a switch across the
+      // rotate RTT returned before the re-read, so the client never learned
+      // whether the destructive one-shot rotate completed and the user was told
+      // nothing. `POST /v1/team/keys/{id}/rotate` revokes the displaced row and
+      // delivers the replacement's secret once, so a dropped or timed-out reply
+      // is exactly the #4355 "lost response" state this branch exists to
+      // disclose (the #4355/#4429/#4342/#4356 rotate family).
+      //
+      // The guard keeps its job for everything else — it scopes every CROSS-TEAM
+      // write (the cap notice, the server's 4xx detail, the refresh ordering,
+      // the row-truth re-read) — but it may not decide WHETHER the user is told:
+      // the same guard that scoped where an outcome renders was never allowed to
+      // suppress the outcome (#8249's ruling, applied here).
+      //
+      // The content is the WEAKER honest form, deliberately. No row truth has
+      // been read at latch time, and after a switch it can no longer be read for
+      // this team at all: `loadAll` pins `orgIdRef.current` at ITS call time, so
+      // calling it after the switch would refresh the NEW team's key list. The
+      // stronger "now shows as revoked … a replacement key exists" claim is
+      // therefore unreachable here, and a notice that made it would be a lie in
+      // the page (the #4721 truthfulness standard). The row-truth upgrade stays
+      // on the same-team path below, which SUPERSEDES this retained fallback
+      // rather than rendering beside it.
+      //
+      // The latch MERGES (#8249 review P1): the record is also the reveal's only
+      // home, so it must never blank a live, not-yet-copied replacement minted
+      // by an earlier rotate on this same team.
+      const _status = e && e.status
+      // #4721's split, read ONCE. A reply in hand carrying a 4xx status is a
+      // DEFINITE refusal — the deterministic 409s roll the replacement back or
+      // mint nothing, so there is no ambiguity to disclose — and 402 is the
+      // over-cap case. Anything else (no status at all: fetch never produced a
+      // response; or a 5xx) may be a LOST RESPONSE. `_definiteRefusal` is the
+      // single expression both the latch and the branch dispatch read, so the
+      // two can never drift apart.
+      const _definiteRefusal = typeof _status === 'number' && _status >= 400 && _status < 500
+      if (!_definiteRefusal) {
+        const why = errorMessage(e)
+        setRotateOutcomes((prev) => {
+          const prior = (prev && prev[_teamAtCall]) || {}
+          return {
+            ...prev,
+            [_teamAtCall]: {
+              ...prior,
+              ambiguous: `The rotate request failed${why ? ` (${why})` : ''}, and its outcome could not be confirmed — refresh the key list before relying on ${rowName}.`,
+            },
+          }
+        })
+      }
       if (orgIdRef.current !== _teamAtCall) return // stale switch — not our state, not our error
       // #4355: a rotate 402 means the org is OVER its limit (a 1-for-1
       // rotation is admitted BY construction, so the notice's copy describes
       // the over-cap state, not the old mint-then-revoke mechanism).
       // #4335: the "or upgrade" tail is only truthful when an upgrade path
       // exists, so the notice takes the same hasUpgrade flag as the create path.
-      if (e.status === 402) {
+      if (_status === 402) {
         setCapNotice(rotateCapNoticeFrom(e.message, team, teamHasUpgrade(team)))
         setError('')
-      } else if (typeof e.status === 'number' && e.status >= 400 && e.status < 500) {
+      } else if (_definiteRefusal) {
         // #4721: a DEFINITE 4xx refusal is not a lost response — the reply is
         // in hand, and it is the server's OWN account of what happened to this
         // request. Both rotate 409s are known, deterministic outcomes: the
@@ -7804,6 +7895,15 @@ function claimIntentInFlight() {
           // the outcome is genuinely unknown and a replacement may still exist.
           setError(`The rotate request failed (${e.message}), and its outcome could not be confirmed — ${rowName} is still listed as active, but a replacement may have been created. Refresh the key list before relying on this key.`)
         }
+        // #8255: the team is still ours, so the transient slot now carries a
+        // STRICTLY RICHER message than the retained fallback — it names the row
+        // truth this branch just re-read ("now shows as revoked" /
+        // "still listed as active"), which the fallback cannot know. Dropping
+        // the fallback keeps ONE disclosure on screen instead of two variants of
+        // the same notice. A switch during THIS refresh still returns at the
+        // guard above, leaving the fallback latched for the owning team — that is
+        // the case it exists for.
+        clearRotateAmbiguity(_teamAtCall)
       }
     } finally {
       setBusy(false)
@@ -10515,9 +10615,9 @@ function claimIntentInFlight() {
             follow-up `loadAll('')` writes into that slot, so a compound
             failure must not replace the destroyed-key message (see
             `errorBannerText`). */}
-        {(error || rotateRefusalText) && (
+        {(error || rotateRefusalText || rotateAmbiguousText) && (
           <div className="error banner">
-            {errorBannerText(error, rotateRefusalText)}
+            {errorBannerText(error, rotateRefusalText, rotateAmbiguousText)}
             {/* #4639: a genuine limit refusal offers the route that WORKS for
                 this team — checkout for a free/anon buyer, the portal for an
                 existing Stripe customer (checkout 409s on an active

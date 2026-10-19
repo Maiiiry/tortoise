@@ -24,6 +24,16 @@
 // `replaced_revoked` / `warning` partial-state disclosure, and the single
 // pinned URL/body shape.
 //
+// #8255 completes the retention for the catch's OTHER branch. #8249 fixed the
+// plaintext-less 2xx by latching its disclosure on the per-team record BEFORE
+// the team-identity guard; `regenerateKey`'s catch still began with that guard,
+// so a switch across the RTT of a FAILED (non-402) rotate returned before the
+// re-read and the user was told nothing — the same silent-destruction outcome on
+// the branch that exists to disclose a lost response. The catch now latches the
+// WEAKER honest form (no row truth is readable for a team you have left) on the
+// record and renders it through the same team-scoped reader; the same-team path
+// supersedes it with the richer row-truth message.
+//
 // #4429 supersedes the STORAGE shape of the outcome, not the guard. Because the
 // rotate is destructive server-side, its response is the only delivery of the
 // replacement's plaintext, so the outcome is now kept PER TEAM and latched
@@ -157,6 +167,21 @@ function refusalOf(calls, orgId = 'org-A') {
   return recordOf(calls, orgId).refusal || ''
 }
 
+// #8255: the fourth disclosure — the ambiguous-failure notice — read the same
+// way the banner reads it: through the active team's record only.
+function ambiguousOf(calls, orgId = 'org-A') {
+  return recordOf(calls, orgId).ambiguous || ''
+}
+
+// #8255: the FIRST latch of the ambiguous notice — what a team switch would
+// have retained. On the same-team path the fallback is latched and then
+// superseded by the richer row-truth message, so `recordOf` (the last state)
+// is legitimately empty there; this reads the state the switch would have seen.
+function latchedAmbiguityOf(calls, orgId = 'org-A') {
+  const first = calls.rotateOutcomes.at(0) || {}
+  return (_rotateOutcomeFor(first, orgId) || {}).ambiguous || ''
+}
+
 // The reveal the app would render for `orgId` (the real derivation, over the
 // real predicate) — a refusal record must always resolve to ''.
 function derivedReveal(calls, orgId = 'org-A') {
@@ -204,6 +229,10 @@ function rotateEnv({ response, reject, loadAll, orgIdRef, apiImpl, lifetimeDays 
     // "real helper, not a copy" standard).
     revealablePlaintext,
     revealableMintPlaintext,
+    // #8255: the ambiguous-failure latch composes its notice through the real
+    // message normaliser (the same one `errorBannerText` uses), so a thrown
+    // string / statusless object is worded exactly as the app words it.
+    errorMessage,
     // Pure helpers — irrelevant to the plaintext guard; stubs keep the file
     // free of their own dependencies.
     lifetimeDaysFromRow: () => (lifetimeDays === undefined ? null : lifetimeDays),
@@ -233,13 +262,19 @@ function rotateEnv({ response, reject, loadAll, orgIdRef, apiImpl, lifetimeDays 
     setRotatedKey: (v) => calls.legacyRotatedKey.push(v),
     setRotateNotice: (v) => calls.legacyRotateNotice.push(v),
     setRotateOutcomes: (v) => {
-      outcomesState = typeof v === 'function' ? v(outcomesState) : v
+      const next = typeof v === 'function' ? v(outcomesState) : v
+      // #8255: React BAILS OUT of a state update when the updater returns the
+      // same reference — no re-render, no new state. The stub mirrors that, so a
+      // guarded clear that finds nothing to clear (the `#8255` supersede hooks)
+      // is not recorded as a write, exactly as it is not one in the app.
+      if (next === outcomesState) return
+      outcomesState = next
       calls.rotateOutcomes.push(outcomesState)
     },
     setWelcomeKey: (v) => calls.welcomeKeys.push(v),
     setWizardDurableKey: (v) => calls.wizardKeys.push(v),
   }
-  return { deps, calls, regenerateKey: build(deps, ['function revealRefusalFor', 'async function regenerateKey']).regenerateKey }
+  return { deps, calls, regenerateKey: build(deps, ['function revealRefusalFor', 'function clearRotateAmbiguity', 'async function regenerateKey']).regenerateKey }
 }
 
 test('#4342/#8249: a plaintext-less rotate 2xx latches NO reveal and states the old key is revoked', async () => {
@@ -364,7 +399,7 @@ test('#8249 (review P2): the composed banner shows the refusal, not the refresh 
     'an absent refusal leaves the error slot authoritative — the three-branch banner is unchanged')
   assert.equal(errorBannerText(null, 'only a refusal'), 'only a refusal',
     'and a refusal with no error renders alone')
-  assert.match(mainJsxCode, /\{errorBannerText\(error, rotateRefusalText\)\}/,
+  assert.match(mainJsxCode, /\{errorBannerText\(error, rotateRefusalText, rotateAmbiguousText\)\}/,
     'the JSX banner must render the composed message, not `error ? errorMessage(error) : rotateRefusalText`')
 })
 
@@ -592,7 +627,18 @@ test('#4355: a lost non-402 rotate response re-reads state and discloses a COMPL
   await regenerateKey('k-old')
   assert.equal(calls.loadAll, 1,
     'the true state must be re-read BEFORE the message is chosen')
-  assert.deepEqual(calls.rotateOutcomes, [],
+  // #8255: the switch-safe fallback is latched BEFORE the identity guard and
+  // the re-read, with the weaker honest form (no row truth is known yet); the
+  // same-team path then SUPERSEDES it with the richer row-truth message in the
+  // transient slot, so exactly one disclosure reaches the screen.
+  const fallback = calls.rotateOutcomes[0]['org-A']
+  assert.match(fallback.ambiguous || '', /could not be confirmed/,
+    '#8255: the ambiguous outcome is latched before the re-read')
+  assert.match(fallback.ambiguous || '', /Network request failed/,
+    'and the underlying failure is named in the retained fallback too')
+  assert.doesNotMatch(fallback.ambiguous || '', /shows as revoked/,
+    '#8255: the fallback may not claim a row truth it has not read')
+  assert.equal(derivedReveal(calls), '',
     'a lost response can never latch a reveal — it carried no plaintext')
   const msg = calls.error.filter(Boolean).at(-1) || ''
   assert.match(msg, /may have completed/,
@@ -640,20 +686,187 @@ test('#4355: a refresh that cannot report state still discloses the ambiguity', 
   assert.doesNotMatch(msg, /shows as revoked/)
 })
 
-test('#4355: a team switch during the ambiguous-failure refresh suppresses the disclosure', async () => {
-  // Same stale-response rule as the plaintext-less branch: the disclosure names
-  // THIS team's row, so it must not land under the new team's header.
+test('#8255: a team switch during the ambiguous-failure RTT RETAINS the disclosure for the owning team', async () => {
+  // THE DEFECT this case was re-pointed at. #4355's catch ran the team-identity
+  // guard as its FIRST statement, so a switch landing on the RTT returned before
+  // the re-read and the user was told NOTHING: `rotate` revokes the displaced row
+  // server-side and delivers the replacement once, so an unanswered call is
+  // exactly the lost-response state the branch exists to disclose. #8249 fixed
+  // the sibling (the plaintext-less 2xx) by latching the disclosure on the team
+  // that owns the row, BEFORE the guard, and reading it through the team-scoped
+  // reader — this applies the same pattern to the catch.
+  //
+  // The pre-#8255 assertion of this test pinned the DROP (`calls.error` empty,
+  // `calls.rotateOutcomes` empty) as intended behaviour, on the rationale #8249
+  // superseded: "the disclosure names THIS team's row, so it must not land under
+  // the new team's header". Team scoping is the RECORD KEY's job, not the
+  // guard's — the guard may not decide WHETHER the user is told.
+  //
+  // Non-vacuity: restoring `if (orgIdRef.current !== _teamAtCall) return` as the
+  // catch's first statement reddens the `ambiguousOf(calls, 'org-A')` assertion.
   const orgIdRef = { current: 'org-A' }
   const { calls, regenerateKey } = rotateEnv({
     orgIdRef,
-    reject: Object.assign(new Error('Network request failed'), { status: 0 }),
-    loadAll: async () => { orgIdRef.current = 'org-B' },
+    // The switch lands at the RTT itself, before the rejection reaches the catch.
+    apiImpl: async () => {
+      orgIdRef.current = 'org-B'
+      throw Object.assign(new Error('Network request failed'), { status: 0 })
+    },
   })
   await regenerateKey('k-old')
-  assert.equal(calls.loadAll, 1, 'the state is still re-read')
+  const notice = ambiguousOf(calls, 'org-A')
+  assert.match(notice, /could not be confirmed/,
+    '#8255: the ambiguity must SURVIVE the switch \u2014 it is the only notice that a destructive rotate has an unknown outcome')
+  assert.match(notice, /Network request failed/, 'and the failure that produced it is still named')
+  assert.match(notice, /residue row/, 'as is the row the user has to re-check')
+  assert.match(notice, /refresh the key list before relying on/, 'with a remedy the user can act on')
+  assert.doesNotMatch(notice, /shows as revoked/,
+    'the WEAKER honest form only \u2014 the row truth is unreadable for this team once the team has switched')
+  assert.doesNotMatch(notice, /still listed as active/, 'never a row claim of either polarity')
+  // AC2 \u2014 attribution: the retained notice belongs to org-A and is not
+  // retrievable through any other team's record.
+  assert.equal(ambiguousOf(calls, 'org-B'), '', 'team B must NEVER render team A\u2019s notice')
+  assert.equal(ambiguousOf(calls, 'org-C'), '')
+  assert.equal(ambiguousOf(calls, null), '', 'and no team selected renders nothing')
+  assert.equal(calls.loadAll, 0,
+    'a stale response must not refresh anyone\u2019s key list \u2014 `loadAll` pins `orgIdRef.current` at ITS call time, so after the switch it would read team B\u2019s rows')
   assert.deepEqual(calls.error.filter(Boolean), [],
-    'a disclosure whose team changed mid-refresh must not be surfaced')
-  assert.deepEqual(calls.rotateOutcomes, [])
+    'and the notice must not ride the shared, un-keyed `error` slot')
+  assert.equal(derivedReveal(calls, 'org-A'), '', 'no plaintext was ever delivered beyond the lost response')
+
+  // Same defect, one step later: the switch lands DURING the re-read instead of
+  // at the RTT. The notice must still be retained (it was latched BEFORE the
+  // refresh), and the post-refresh guard must still stop every cross-team write.
+  const ref2 = { current: 'org-A' }
+  const env2 = rotateEnv({
+    orgIdRef: ref2,
+    reject: Object.assign(new Error('Gateway timeout'), { status: 504 }),
+    loadAll: async () => {
+      ref2.current = 'org-B'
+      return [{ id: 'k-old', key_id: 'k-old', revoked_at: '2026-09-21T00:00:00.000Z' }]
+    },
+  })
+  await env2.regenerateKey('k-old')
+  assert.equal(env2.calls.loadAll, 1, 'the state is still re-read')
+  assert.match(ambiguousOf(env2.calls, 'org-A'), /could not be confirmed/,
+    '#8255: a switch across the REFRESH keeps the retained notice too')
+  assert.doesNotMatch(ambiguousOf(env2.calls, 'org-A'), /shows as revoked/,
+    'and the re-read row truth it can no longer attribute is NOT claimed')
+  assert.deepEqual(env2.calls.error.filter(Boolean), [],
+    'the reloaded row truth does not ride the shared, un-keyed slot under the new team\u2019s header')
+})
+
+// ── #8255: the ambiguous-failure disclosure across a team switch ──────────
+//
+// The catch's ambiguous branch is the rotate family's fourth disclosure and the
+// last one with no retained home (#8249 gave the plaintext-less 2xx one). The
+// cases below pin the retention, its team scoping, its merge semantics, and the
+// supersede rule that keeps the same-team surface to ONE message.
+
+test('#8255: the ambiguous latch MERGES — a live unread replacement survives it', async () => {
+  // The record is also the reveal's only home, so a lost response must not blank
+  // a live, not-yet-copied replacement minted by an earlier rotate on this same
+  // team (the #8249 review-P1 rule, applied to the fourth disclosure). The
+  // server is hash-only — a blanked plaintext is unrecoverable data loss.
+  const orgIdRef = { current: 'org-A' }
+  const env = rotateEnv({
+    orgIdRef,
+    apiImpl: async () => {
+      orgIdRef.current = 'org-B'
+      throw Object.assign(new Error('Network request failed'), { status: 0 })
+    },
+  })
+  env.deps.setRotateOutcomes({
+    'org-A': { plaintext: 'tt_live_prior', expiresAt: '2026-10-20T00:00:00+00:00', warning: 'both keys are live' },
+  })
+  await env.regenerateKey('k-old')
+  const rec = recordOf(env.calls, 'org-A')
+  assert.equal(rec.plaintext, 'tt_live_prior',
+    'the earlier live replacement must SURVIVE the ambiguous latch')
+  assert.equal(rec.expiresAt, '2026-10-20T00:00:00+00:00', 'and its expiry echo with it')
+  assert.equal(rec.warning, 'both keys are live', 'and the prior partial-state notice')
+  assert.match(rec.ambiguous || '', /could not be confirmed/,
+    'while the NEW notice is added beside the retained outcome, not instead of it')
+  assert.equal(derivedReveal(env.calls, 'org-A'), 'tt_live_prior',
+    'so the reveal the user still has not copied is not destroyed by a failed rotate')
+})
+
+test('#8255: a same-team ambiguity renders ONE message — the retained fallback is superseded', async () => {
+  // The fallback exists for the switch case. While the team is still ours the
+  // re-read produces a strictly RICHER message (it names the row truth), so the
+  // fallback must be dropped — otherwise the banner renders two variants of the
+  // same notice and the user cannot tell whether one key or two are in doubt.
+  const { calls, regenerateKey } = rotateEnv({
+    reject: Object.assign(new Error('Network request failed'), { status: 0 }),
+    loadAll: revokedReload,
+  })
+  await regenerateKey('k-old')
+  assert.match(latchedAmbiguityOf(calls), /could not be confirmed/,
+    'the fallback was latched before the re-read (so a switch there would keep it)')
+  assert.equal(recordOf(calls, 'org-A').ambiguous, '',
+    'and it is cleared once the row truth is in hand')
+  const surfaced = calls.error.filter(Boolean).at(-1) || ''
+  assert.match(surfaced, /shows as revoked/, 'the transient slot carries the STRONGER, row-truth form')
+  const { errorBannerText } = build({ errorMessage }, ['function errorBannerText'])
+  assert.equal(errorBannerText(surfaced, refusalOf(calls), recordOf(calls, 'org-A').ambiguous), surfaced,
+    'the banner renders exactly that one message — no appended fallback variant')
+})
+
+test('#8255: a fresh rotate attempt supersedes a retained notice — for its own team only', async () => {
+  // The retained notice's own remedy is "refresh the key list before relying on
+  // this key". A new attempt performs exactly that, so leaving the old notice
+  // latched would pair a stale "could not be confirmed" with the new outcome.
+  // Two shapes, because the stale notice pairs differently with each:
+  //  - a DEFINITE 4xx writes only the transient `error` slot, so nothing would
+  //    drop a retained notice — the banner would show a stale ambiguity beside
+  //    the server's precise detail;
+  //  - a success rewrites the record (which carries no `ambiguous` field), so
+  //    the notice goes with it.
+  // Retention is per team: another team's notice is not this attempt's to
+  // discard.
+  const stale = { plaintext: '', expiresAt: null, warning: '', ambiguous: 'outcome could not be confirmed' }
+  const heldC = { plaintext: 'tt_held_c', expiresAt: null, warning: '', ambiguous: 'C team notice' }
+
+  const refused = rotateEnv({ reject: Object.assign(new Error(ROTATE_409_NOT_OCCUPYING), { status: 409 }) })
+  refused.deps.setRotateOutcomes({ 'org-A': stale, 'org-C': heldC })
+  await refused.regenerateKey('k-old')
+  assert.equal(ambiguousOf(refused.calls, 'org-A'), '',
+    'the retry supersedes its own team\u2019s stale notice')
+  assert.equal(refused.calls.error.filter(Boolean).at(-1), ROTATE_409_NOT_OCCUPYING,
+    'so the fresh definite-4xx detail is the banner\u2019s only rotate message')
+  assert.equal(ambiguousOf(refused.calls, 'org-C'), 'C team notice',
+    'another team\u2019s retained notice is untouched')
+  assert.equal(recordOf(refused.calls, 'org-C').plaintext, 'tt_held_c')
+
+  const ok = rotateEnv({ response: { key: 'tt_ok', replaced_revoked: true } })
+  ok.deps.setRotateOutcomes({ 'org-A': stale })
+  await ok.regenerateKey('k-old')
+  assert.equal(ambiguousOf(ok.calls, 'org-A'), '', 'a successful retry clears it too')
+  assert.equal(recordOf(ok.calls, 'org-A').plaintext, 'tt_ok')
+  assert.equal(derivedReveal(ok.calls, 'org-A'), 'tt_ok',
+    'and the cleared notice does not cost the new replacement')
+})
+
+test('#8255: only a genuinely ambiguous failure latches — a definite 4xx / 402 does not', async () => {
+  // #4721 split the branches by STATUS; #8255 must read the SAME split, or the
+  // two would drift (a 409 latching an "outcome could not be confirmed" notice
+  // is the #4721 lie, now retained across a switch).
+  for (const status of [402, 400, 403, 409, 422]) {
+    const { calls, regenerateKey } = rotateEnv({
+      reject: Object.assign(new Error(`refused ${status}`), { status }),
+    })
+    await regenerateKey('k-old')
+    assert.deepEqual(calls.rotateOutcomes.filter((m) => m['org-A'] && m['org-A'].ambiguous), [],
+      `a ${status} reply is in hand — the server said what happened, so nothing is latched`)
+  }
+  for (const status of [0, 500, 503, undefined]) {
+    const { calls, regenerateKey } = rotateEnv({
+      reject: Object.assign(new Error(`lost ${status}`), { status }),
+    })
+    await regenerateKey('k-old')
+    assert.match(latchedAmbiguityOf(calls), /could not be confirmed/,
+      `a ${status} (no reply, or a server fault) may be a LOST RESPONSE — it must be retained`)
+  }
 })
 
 test('#4355: a rotate 402 is the OVER-cap case and uses the over-cap copy', async () => {
@@ -806,7 +1019,7 @@ test('#4355: rotating a row whose prefix we hold clears the held plaintext (row 
   const env = rotateEnv({ response: { key: 'tt_ok', replaced_revoked: true } })
   env.deps.welcomeKey = 'tt_live_re_abc'
   env.deps.wizardDurableKey = 'tt_other'
-  const fn = build(env.deps, ['function revealRefusalFor', 'async function regenerateKey']).regenerateKey
+  const fn = build(env.deps, ['function revealRefusalFor', 'function clearRotateAmbiguity', 'async function regenerateKey']).regenerateKey
   await fn('k-old')
   assert.deepEqual(env.calls.welcomeKeys, [''],
     'the welcome plaintext belonging to the rotated row is cleared')
@@ -931,6 +1144,22 @@ test('#4429: the two outcome readers never surface another team\u2019s record', 
     'team B must NEVER render team A\u2019s refusal (AC2: attributed to the team whose row it names)')
   assert.equal(refusedRevealOf('org-A'), '',
     'a refusal record renders NO reveal on its own team either — there is no secret')
+  // #8255: the FOURTH reader — the ambiguous-failure notice. Same scoping rule:
+  // it belongs to the team whose row it names, so a retained notice for team A
+  // can never render under team B\u2019s header.
+  const ambiguousRecord = {
+    'org-A': { plaintext: '', expiresAt: null, warning: '', ambiguous: 'outcome could not be confirmed' },
+  }
+  const ambiguityOf2 = (orgId) => {
+    const o = rotateOutcomeFor(ambiguousRecord, orgId)
+    return (o && o.ambiguous) || ''
+  }
+  assert.equal(ambiguityOf2('org-A'), 'outcome could not be confirmed',
+    'the owning team retrieves the retained ambiguous-failure notice')
+  assert.equal(ambiguityOf2('org-B'), '',
+    'team B must NEVER render team A\u2019s ambiguous-failure notice (AC2: attributed to the team whose row it names)')
+  assert.equal(ambiguityOf2('org-Z'), '')
+  assert.equal(ambiguityOf2(null), '', 'no team selected → nothing to render')
 })
 
 // ── copyRotatedKey ──────────────────────────────────────────────────────────
@@ -1061,8 +1290,13 @@ test('#4342/#4429/#8249: the rotate reveal is gated on a derived non-empty strin
   assert.match(mainJsxCode,
     /const rotateRefusalText = \(rotateOutcome && rotateOutcome\.refusal\) \|\| ''/,
     '#8249: the refusal must be derived from the active team\u2019s record, like the other two disclosures')
-  assert.match(mainJsxCode, /\{\(error \|\| rotateRefusalText\) && \(/,
-    '#8249: the refusal must render through the banner element, sourced from the record')
+  // #8255: and the fourth — the ambiguous-failure notice — through the same
+  // reader, so it can only ever surface on the team that owns the record.
+  assert.match(mainJsxCode,
+    /const rotateAmbiguousText = \(rotateOutcome && rotateOutcome\.ambiguous\) \|\| ''/,
+    '#8255: the ambiguous-failure notice must be derived from the active team\u2019s record too')
+  assert.match(mainJsxCode, /\{\(error \|\| rotateRefusalText \|\| rotateAmbiguousText\) && \(/,
+    '#8249/#8255: the retained disclosures must render through the banner element, sourced from the record')
   assert.equal((mainJsxCode.match(/setError\(`The server did not return the replacement key/g) || []).length, 0,
     '#8249: the refusal must not be written to the un-keyed, transient `error` slot')
 })
