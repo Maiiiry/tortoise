@@ -10883,14 +10883,17 @@ class FalkorProjection(
         # inline stamp with the older journaled invalidate ts.
         max_inline_seq: dict[str, int] = {}
         # #2423: DirectEdgeRepoint descriptors (supersede's 2a-DIRECT transfer
-        # journal) — replayed in pass-2b AFTER operator edges exist.
-        direct_repoint_events: list = []
+        # journal) — replayed in pass-2b AFTER operator edges exist. Carried
+        # WITH the journal seq (#8722): the two direct-edge legs are replayed
+        # INTERLEAVED in journal order, so each entry is `(seq, ev)`.
+        direct_repoint_events: list[tuple[int, dict]] = []
         # #8499 / A10 #1048: `DirectEdgeCreated` descriptors — the plain
         # operator-less direct-edge BASE creation, journaled by
-        # `create_direct_edge` on every write. Deferred to the pass-2b sweep
-        # (before the repoint leg above, which is load-bearing — see the fold):
+        # `create_direct_edge` on every write. Deferred to the pass-2b sweep:
         # it needs the endpoints to exist, which only holds after pass 1-2.
-        direct_edge_created_events: list = []
+        # Carried WITH the journal seq for the SAME reason as the repoint
+        # descriptors above (#8722).
+        direct_edge_created_events: list[tuple[int, dict]] = []
         # #7951: `SessionDeleted` records, re-applied AFTER every replay pass.
         # Pass 2 re-derives edges from EVERY `PointAdded` and its `_link_source`
         # / `_link_session` side effects MERGE the `:Source` / `:Session` back —
@@ -11534,9 +11537,9 @@ class FalkorProjection(
                     point_re_stamp_folds.append((seq, ev))
             elif t == "DirectEdgeCreated":
                 # #8499 / A10 #1048: the plain direct-edge BASE creation —
-                # deferred to the pass-2b sweep (see its declaration and the
-                # fold there for why it must precede the repoint leg).
-                direct_edge_created_events.append(ev)
+                # deferred to the pass-2b sweep, carrying its journal seq so
+                # the fold interleaves with the repoint leg (#8722).
+                direct_edge_created_events.append((seq, ev))
             elif t == "DirectEdgeRepoint":
                 # #2423: supersede's 2a-DIRECT transfer emits a flat
                 # DirectEdgeRepoint descriptor {src, tgt, edge_type, attrs}
@@ -11547,8 +11550,10 @@ class FalkorProjection(
                 # snapshots, and an operator-less direct edge has no PointAdded
                 # snapshot to carry it). Deferred to pass-2b (after all operator
                 # edges exist) — descriptor replay is a MERGE of the flat
-                # endpoints, order-independent by construction.
-                direct_repoint_events.append(ev)
+                # endpoints. Carried WITH its journal seq (#8722): a creation
+                # that FOLLOWS its own transfer must replay AFTER it, so the
+                # two legs interleave by seq rather than by block.
+                direct_repoint_events.append((seq, ev))
             elif t == "DocumentCreated":
                 self._upsert_document(ev)
             elif t == "EntityLinked":
@@ -12774,131 +12779,79 @@ class FalkorProjection(
                     point_id = succ[point_id]
                 return point_id
 
-            # ── #8499 / A10 #1048: fold ``DirectEdgeCreated`` ─────────────
-            # The plain operator-less direct-edge BASE creation, journaled by
-            # ``create_direct_edge`` on EVERY write (sdk.py — emitted
-            # unconditionally, not on created-only, so the crash window between
-            # the MERGE and the emission is recovered by the retry's emission).
-            # Recognized-but-never-replayed until now: a direct edge was LOST by
-            # every rebuild. That was the pre-existing gap the A10 #1048
-            # deferral NAMED and whose tracker chain (#2895 → #5048) closed
-            # without landing it; the edge-message fold's
-            # ``SHAPE_EDGE_MESSAGE_MISS`` exemption was justified BY this gap, so
-            # this fold retires that premise (see nonfolded.EXEMPT_SHAPES).
+            # ── #8499 / A10 #1048 + #8722: replay the DIRECT-edge legs ─────
+            # INTERLEAVED, in JOURNAL SEQ order
+            # ──────────────────────────────────────────────────────────────
+            # Two journal records describe a direct edge's life:
+            #  * ``DirectEdgeCreated`` (``create_direct_edge``, emitted on
+            #    EVERY write, not created-only — the crash window between the
+            #    MERGE and the emission is recovered by the retry's emission),
+            #    journaled by #8499 / A10 #1048. Recognized-but-never-replayed
+            #    before that: a direct edge was LOST by every rebuild. That was
+            #    the pre-existing gap the A10 #1048 deferral NAMED and whose
+            #    tracker chain (#2895 → #5048) closed without landing it; the
+            #    edge-message fold's ``SHAPE_EDGE_MESSAGE_MISS`` exemption was
+            #    justified BY this gap, so this fold retires that premise (see
+            #    nonfolded.EXEMPT_SHAPES).
+            #  * ``DirectEdgeRepoint`` (supersede's 2a-DIRECT transfer journal):
+            #    records where the edge NOW is (``src`` is new_id), not where it
+            #    was.
             #
-            # TWO ordering properties, both load-bearing:
-            #  1. FLAT endpoints, and a SUPERSEDED endpoint SKIPS the record
-            #     entirely (the ``succ`` guard in the loop). A supersede
-            #     transfer is journaled SEPARATELY as ``DirectEdgeRepoint``,
-            #     which records the NEW endpoint rather than the old — so
-            #     replaying the creation at ``_final()``-resolved endpoints
-            #     would apply the transfer twice AND resurrect the dead-source
-            #     phantom.
-            #  2. This block MUST precede the repoint leg below, which MERGEs
-            #     the edge at the SUCCESSOR (``src_f = _final(src)``). A
-            #     created-fold running after it would add the old-endpoint
-            #     edge on top; running before, the ``succ`` guard has already
-            #     skipped the record, so for the ONE-creation-then-transfer
-            #     sequence the two legs never both fire for one edge.
+            # #8722 — WHY THEY INTERLEAVE BY SEQ AND NOT BY BLOCK. Both records
+            # carry a journal seq, and LIVE applies them in journal order, so a
+            # creation that FOLLOWS its own transfer is the LATER writer. Block
+            # ordering (created-fold wholesale, then the repoint leg wholesale)
+            # applied it before the transfer and let the transfer overwrite it:
+            # measured (``create_direct_edge`` A→B; ``supersede`` A→A';
+            # ``create_direct_edge`` A'→B) the rebuild landed the PRE-transfer
+            # attrs where live held the post-transfer ones. Only ATTRS diverged
+            # — the edge survived — which is what made it silent: a plausible
+            # rebuilt graph with different weights, and EP consumes those
+            # weights. One seq-ordered stream removes the whole class of
+            # block-vs-journal inversions rather than this one instance.
+            # ``test_a10_post_transfer_recreation_attrs_match_live`` pins it.
             #
-            # ⚠️ KNOWN BOUND on block ordering (recorded, not overlooked): the
-            # two legs are ordered by BLOCK, not by journal seq, so a creation
-            # that FOLLOWS its own transfer is applied BEFORE the transfer and
-            # then overwritten by it. Measured (``create_direct_edge`` A→B;
-            # ``supersede`` A→A'; ``create_direct_edge`` A'→B): replay lands the
-            # PRE-transfer attrs where live has the post-transfer ones. Only
-            # ATTRS diverge — the edge itself survives — and #8499 does not
-            # introduce it (the later creation was never replayed at all before
-            # this fold), but it is a silent wrong-state on the disaster-
-            # recovery path (#8722). Closing it means interleaving the two legs
-            # by journal seq rather than by block;
-            # ``test_a10_post_transfer_recreation_attr_divergence_known_bound``
-            # pins the current behaviour so it cannot drift unnoticed.
-            #
-            # ⚠️ KNOWN BOUND on the ``succ`` guard (recorded, not overlooked):
-            # ``succ`` is built from the #2488 SURVIVOR-filtered supersede set,
-            # so a supersede whose id is later RE-CREATED is dropped from it
-            # while its ``DirectEdgeRepoint`` descriptor is not gated on the
-            # same fold_seq — so for an id-REUSING producer this fold and the
-            # repoint leg could both fire and leave two edges where live has
-            # one. It is not closed here because no public API can construct
-            # the trigger (nothing in ``create_point``/``ingest`` accepts a
-            # caller-chosen id), and the full id-reuse/supersede suite passes
-            # against it (458 tests, incl.
-            # ``test_id_reuse_double_supersede_no_parallel_edges``). Closing it
-            # properly means plumbing the RAW supersede id set (pre-survivor)
-            # into this block; a producer that can re-create a chosen id must
-            # do that first.
-            #
-            # Label-agnostic endpoints (#7902): a direct IMPL/NAND may connect
-            # ANY two of :Point/:Subject/:Object/:Event (owner ruling #7813), so
-            # each endpoint is resolved by an id-anchored per-label sweep and
-            # the edge query is anchored on the label that resolved it — a
-            # hardcoded :Point match would silently drop every Object↔Object
-            # direct edge — the SAME defect the repoint leg's direct branch
-            # carried until #8622 widened it with this identical sweep.
-            for ev in direct_edge_created_events:
-                etype = ev.get("edge_type")
-                src, tgt = ev.get("src"), ev.get("tgt")
-                if (not isinstance(src, str) or not isinstance(tgt, str)
-                        or not isinstance(etype, str)):
-                    logger.warning(
-                        "rebuild: malformed DirectEdgeCreated event skipped "
-                        "(event_id=%s)", ev.get("event_id"))
-                    continue
-                validate_rel_type(etype)
-                if src == tgt:
-                    # Phantom self-edge: never re-create (E2E-11.6 no-self
-                    # contract — the same guard the repoint leg applies).
-                    continue
-                if src in succ or tgt in succ:
-                    # A SUPERSEDED endpoint. Supersede already transferred (or
-                    # collapsed) this edge LIVE, and journaled its own
-                    # ``DirectEdgeRepoint`` descriptor for the NEW endpoint
-                    # (that descriptor's ``src`` is new_id — it records where
-                    # the edge NOW is, not where it was). Re-creating the edge
-                    # here would leave a phantom at the DEAD source that no
-                    # later leg cleans: the repoint leg's delete-leg is
-                    # STRUCTURAL-only, and its direct branch MERGEs at the
-                    # successor. So the repoint descriptor owns the edge's
-                    # post-transfer form — and in the collapse-to-self-edge
-                    # lane (which deliberately emits NO descriptor) this skip
-                    # is what makes the edge disappear, matching live.
-                    continue
-                labels: dict[str, str] = {}
-                for _label in EPISTEMIC_LABELS:
-                    rows = self.g.query(
-                        f"MATCH (p:{_label}) WHERE p.id IN $ids RETURN p.id",
-                        params={"ids": [src, tgt]},
-                    ).result_set
-                    for r in rows:
-                        labels.setdefault(r[0], _label)
-                if src not in labels or tgt not in labels:
-                    # Endpoint absent at replay (hard-deleted live, or an
-                    # unjournaled producer). SKIP — this fold mirrors a live
-                    # write and never mints an endpoint node (unlike the
-                    # structural stub path): inventing one would fabricate a
-                    # node the live graph does not have.
-                    continue
-                # Two-step MERGE (never duplicate nodes), mirroring
-                # create_direct_edge byte-for-byte on the edge shape.
-                self.g.query(
-                    f"MATCH (a:{labels[src]} {{id:$a}}), "
-                    f"(b:{labels[tgt]} {{id:$b}}) "
-                    f"MERGE (a)-[:{etype}]->(b)",
-                    params={"a": src, "b": tgt},
-                )
-                # Last-writer-wins attr SET — the final attrs post-rebuild
-                # (REVIEW-FIX P1 cycle-26 on the emission site).
-                attrs = {k: ev[k] for k in
-                         ("direction", "confidence", "weight", "label",
-                          "batch_id") if k in ev}
-                if attrs:
-                    self.g.query(
-                        f"MATCH (a:{labels[src]} {{id:$a}})-[r:{etype}]->"
-                        f"(b:{labels[tgt]} {{id:$b}}) SET r += $attrs",
-                        params={"a": src, "b": tgt, "attrs": attrs},
-                    )
+            # The stream is BUILT here and CONSUMED after the operator legs
+            # below (which never create or delete a direct edge — they re-point
+            # operator-mediated edges and their INPUT mirrors on superseded
+            # ids). ``_kind`` is the tiebreak only: two records never share a
+            # seq, and the created-fold sorts first if a future producer ever
+            # emits both at one seq.
+            direct_edge_replay: list[tuple[int, int, dict]] = sorted(
+                [(seq, 0, _ev) for seq, _ev in direct_edge_created_events]
+                + [(seq, 1, _ev) for seq, _ev in direct_repoint_events],
+                key=lambda _item: (_item[0], _item[1]),
+            )
+
+            # #2489: per-rebuild seen-set for STRUCTURAL descriptor dedupe
+            # (in the repoint branch below) — keyed on (src, edge_type,
+            # RESOLVED target node identity), mirroring the operator leg's
+            # (op, type, idx, final). NOT descriptor id (the emission id base
+            # f"{old}->{new}:{rel}" duplicates across multi-target same-rel;
+            # id-keyed dedupe would collapse 2 distinct same-rel targets =
+            # the exact bug class) and NOT the resolved key alone (two legit
+            # transfers to a SHARED node in one journal — X1→S, X2→S — must
+            # not collapse). Objects/Events/Documents are id-keyed entities:
+            # two distinct same-name targets must not collapse.
+            structural_seen: set[tuple] = set()
+
+            def _src_is_terminal(sid: str) -> bool:
+                """#2489 (code-review P1): the delete-leg must ONLY clean
+                the pass-2 resurrection at a DEAD (terminal) old point.
+                Under id-reuse (#2488 survivor filter drops a pre-recreation
+                supersede fold), src is a re-created LIVE incarnation whose
+                edges are legitimately its own — deleting them clobbers a
+                live point. Terminal src = the superseded/retracted/outdated
+                incarnation whose transferred edges pass-2 resurrected."""
+                rows = self.g.query(
+                    f"MATCH (x:Point {{id:$sid}}) "
+                    f"WHERE {_terminal_excluded('x.status')} RETURN 1 LIMIT 1",
+                    params={"sid": sid}).result_set
+                # _terminal_excluded is the NOT-terminal predicate: empty
+                # rows → the node is terminal (or absent). Absent src =
+                # nothing to clean — treat as terminal (delete is a no-op).
+                return not rows
+
             if supersede_last:
                 # Collect per-fold operator-edge rows + validate rel types
                 # BEFORE any mutation (#329 collect-then-mutate pattern).
@@ -13027,36 +12980,17 @@ class FalkorProjection(
                         params={"oid": oid, "op_id": op_id, "rid": rid},
                     )
 
-            if direct_repoint_events:
-                # #2489: per-rebuild seen-set for STRUCTURAL descriptor dedupe
-                # (below) — keyed on (src, edge_type, RESOLVED target node
-                # identity), mirroring the operator leg's (op, type, idx,
-                # final). NOT descriptor id (the emission id base
-                # f"{old}->{new}:{rel}" duplicates across multi-target same-rel;
-                # id-keyed dedupe would collapse 2 distinct same-rel targets =
-                # the exact bug class) and NOT the resolved key alone (two
-                # legit transfers to a SHARED node in one journal — X1→S, X2→S
-                # — must not collapse). Objects/Events/Documents are id-keyed
-                # entities: two distinct same-name targets must not collapse.
-                structural_seen: set[tuple] = set()
-
-                def _src_is_terminal(sid: str) -> bool:
-                    """#2489 (code-review P1): the delete-leg must ONLY clean
-                    the pass-2 resurrection at a DEAD (terminal) old point.
-                    Under id-reuse (#2488 survivor filter drops a pre-recreation
-                    supersede fold), src is a re-created LIVE incarnation whose
-                    edges are legitimately its own — deleting them clobbers a
-                    live point. Terminal src = the superseded/retracted/outdated
-                    incarnation whose transferred edges pass-2 resurrected."""
-                    rows = self.g.query(
-                        f"MATCH (x:Point {{id:$sid}}) "
-                        f"WHERE {_terminal_excluded('x.status')} RETURN 1 LIMIT 1",
-                        params={"sid": sid}).result_set
-                    # _terminal_excluded is the NOT-terminal predicate: empty
-                    # rows → the node is terminal (or absent). Absent src =
-                    # nothing to clean — treat as terminal (delete is a no-op).
-                    return not rows
-                for ev in direct_repoint_events:
+            # ── the interleaved direct-edge replay (#8722) ────────────────
+            # ONE seq-ordered pass over BOTH record kinds (the stream is built
+            # above, before the operator legs). ``_kind == 1`` is the
+            # ``DirectEdgeRepoint`` leg and ``_kind == 0`` the
+            # ``DirectEdgeCreated`` fold; the branches are mutually exclusive,
+            # so which one is written first in the source carries NO semantics
+            # — the stream's seq order is the order, which is what makes a
+            # creation that follows its own transfer land LAST (live's
+            # ordering) instead of being overwritten by the transfer.
+            for _seq, _kind, ev in direct_edge_replay:
+                if _kind == 1:
                     etype = ev.get("edge_type")
                     src, tgt = ev.get("src"), ev.get("tgt")
 
@@ -13246,6 +13180,111 @@ class FalkorProjection(
                             f"MATCH (a:{epi_labels[src_f]} {{id:$a}})-[r:{etype}]->"
                             f"(b:{epi_labels[tgt_f]} {{id:$b}}) SET r += $attrs",
                             params={"a": src_f, "b": tgt_f, "attrs": attrs},
+                        )
+                else:
+                    # ── #8499 / A10 #1048: ``DirectEdgeCreated`` fold ──────
+                    # The plain operator-less direct-edge BASE creation.
+                    # TWO properties, both load-bearing:
+                    #  1. FLAT endpoints, and a SUPERSEDED endpoint SKIPS the
+                    #     record entirely (the ``succ`` guard below). A
+                    #     supersede transfer is journaled SEPARATELY as
+                    #     ``DirectEdgeRepoint``, which records the NEW endpoint
+                    #     rather than the old — so replaying the creation at
+                    #     ``_final()``-resolved endpoints would apply the
+                    #     transfer twice AND resurrect the dead-source phantom.
+                    #  2. It runs at its OWN journal seq (#8722), so for the
+                    #     ONE-creation-then-transfer sequence the ``succ`` guard
+                    #     skips the record and the transfer's descriptor owns
+                    #     the edge — the two branches never both fire for one
+                    #     edge — while for the TRANSFER-then-recreation sequence
+                    #     the creation is the later writer, as it is live.
+                    #
+                    # ⚠️ KNOWN BOUND on the ``succ`` guard (recorded, not
+                    # overlooked): ``succ`` is built from the #2488 SURVIVOR-
+                    # filtered supersede set, so a supersede whose id is later
+                    # RE-CREATED is dropped from it while its
+                    # ``DirectEdgeRepoint`` descriptor is not gated on the same
+                    # fold_seq — so for an id-REUSING producer this fold and
+                    # the repoint branch could both fire and leave two edges
+                    # where live has one. It is not closed here because no
+                    # public API can construct the trigger (nothing in
+                    # ``create_point``/``ingest`` accepts a caller-chosen id),
+                    # and the full id-reuse/supersede suite passes against it
+                    # (458 tests, incl.
+                    # ``test_id_reuse_double_supersede_no_parallel_edges``).
+                    # Closing it properly means plumbing the RAW supersede id set
+                    # (pre-survivor) into this block; a producer that can
+                    # re-create a chosen id must do that first.
+                    #
+                    # Label-agnostic endpoints (#7902): a direct IMPL/NAND may
+                    # connect ANY two of :Point/:Subject/:Object/:Event (owner
+                    # ruling #7813), so each endpoint is resolved by an
+                    # id-anchored per-label sweep and the edge query is anchored
+                    # on the label that resolved it — a hardcoded :Point match
+                    # would silently drop every Object↔Object direct edge — the
+                    # SAME defect the repoint branch's direct leg carried until
+                    # #8622 widened it with this identical sweep.
+                    etype = ev.get("edge_type")
+                    src, tgt = ev.get("src"), ev.get("tgt")
+                    if (not isinstance(src, str) or not isinstance(tgt, str)
+                            or not isinstance(etype, str)):
+                        logger.warning(
+                            "rebuild: malformed DirectEdgeCreated event "
+                            "skipped (event_id=%s)", ev.get("event_id"))
+                        continue
+                    validate_rel_type(etype)
+                    if src == tgt:
+                        # Phantom self-edge: never re-create (E2E-11.6 no-self
+                        # contract — the same guard the repoint leg applies).
+                        continue
+                    if src in succ or tgt in succ:
+                        # A SUPERSEDED endpoint. Supersede already transferred
+                        # (or collapsed) this edge LIVE, and journaled its own
+                        # ``DirectEdgeRepoint`` descriptor for the NEW endpoint
+                        # (that descriptor's ``src`` is new_id — it records
+                        # where the edge NOW is, not where it was). Re-creating
+                        # the edge here would leave a phantom at the DEAD source
+                        # that no later leg cleans: the repoint leg's delete-leg
+                        # is STRUCTURAL-only, and its direct branch MERGEs at
+                        # the successor. So the repoint descriptor owns the
+                        # edge's post-transfer form — and in the
+                        # collapse-to-self-edge lane (which deliberately emits
+                        # NO descriptor) this skip is what makes the edge
+                        # disappear, matching live.
+                        continue
+                    labels: dict[str, str] = {}
+                    for _label in EPISTEMIC_LABELS:
+                        rows = self.g.query(
+                            f"MATCH (p:{_label}) WHERE p.id IN $ids RETURN p.id",
+                            params={"ids": [src, tgt]},
+                        ).result_set
+                        for r in rows:
+                            labels.setdefault(r[0], _label)
+                    if src not in labels or tgt not in labels:
+                        # Endpoint absent at replay (hard-deleted live, or an
+                        # unjournaled producer). SKIP — this fold mirrors a
+                        # live write and never mints an endpoint node (unlike
+                        # the structural stub path): inventing one would
+                        # fabricate a node the live graph does not have.
+                        continue
+                    # Two-step MERGE (never duplicate nodes), mirroring
+                    # create_direct_edge byte-for-byte on the edge shape.
+                    self.g.query(
+                        f"MATCH (a:{labels[src]} {{id:$a}}), "
+                        f"(b:{labels[tgt]} {{id:$b}}) "
+                        f"MERGE (a)-[:{etype}]->(b)",
+                        params={"a": src, "b": tgt},
+                    )
+                    # Last-writer-wins attr SET — the final attrs post-rebuild
+                    # (REVIEW-FIX P1 cycle-26 on the emission site).
+                    attrs = {k: ev[k] for k in
+                             ("direction", "confidence", "weight", "label",
+                              "batch_id") if k in ev}
+                    if attrs:
+                        self.g.query(
+                            f"MATCH (a:{labels[src]} {{id:$a}})-[r:{etype}]->"
+                            f"(b:{labels[tgt]} {{id:$b}}) SET r += $attrs",
+                            params={"a": src, "b": tgt, "attrs": attrs},
                         )
 
         # ── #5380: replay the EP edge-message write-backs ─────────────

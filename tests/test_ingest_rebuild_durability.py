@@ -448,20 +448,25 @@ def test_a10_created_then_superseded_does_not_double_the_edge(a10):
     )
 
 
-def test_a10_post_transfer_recreation_attr_divergence_known_bound(a10):
-    """⚠️ KNOWN BOUND (#8722), pinned ON PURPOSE — this is the divergent
-    state, not the desired one.
+def test_a10_post_transfer_recreation_attrs_match_live(a10):
+    """#8722: a creation that FOLLOWS its own supersede-transfer replays at its
+    OWN journal seq, so the rebuild lands the POST-transfer attrs live holds.
 
-    A creation that FOLLOWS its own supersede-transfer replays BEFORE the
-    transfer and is then overwritten by it, because the created-fold and the
-    repoint leg are ordered by BLOCK, not by journal seq (see the ⚠️ KNOWN
-    BOUND comment on the fold in `projection/__init__.py`). The edge itself
-    survives — only the ATTRS differ, which is what makes it silent: rebuild
-    yields a plausible graph with different weights, and EP consumes them.
+    Rewritten from `test_a10_post_transfer_recreation_attr_divergence_known_bound`
+    — the pin whose docstring said that once #8722 was fixed it "MUST be
+    rewritten to assert `after == before`; it must not be deleted, and it must
+    not start passing for the wrong reason". The coverage is preserved, not
+    dropped: same journal shape, same endpoints, now the desired state.
 
-    Pinning it is the point. When #8722 is fixed this test MUST be rewritten
-    to assert `after == before`; it must not be deleted, and it must not start
-    passing for the wrong reason.
+    The defect it pinned: the created-fold and the repoint leg were ordered by
+    BLOCK, not by journal seq, so the later `create_direct_edge` was applied
+    BEFORE the transfer and then overwritten by it — a silent wrong-state on
+    the disaster-recovery path, because the edge survived and only its WEIGHTS
+    diverged (a plausible rebuilt graph that EP then consumes).
+
+    It must not pass for the wrong reason: the full 5-attribute tuple is
+    compared, and the edge COUNT is pinned to 1 (a duplicate edged pair would
+    multiply EP weight, the failure the sibling test guards).
     """
     _, events, sdk = a10
     a = sdk.create_point("statement", "A implies B.")["id"]
@@ -482,11 +487,90 @@ def test_a10_post_transfer_recreation_attr_divergence_known_bound(a10):
 
     after = _direct_edge(sdk, successor, b)
     assert _direct_edge_count(sdk, successor, b) == 1, (
-        "the transferred-then-re-created edge must not be duplicated"
+        "the transferred-then-re-created edge must not be duplicated — two "
+        "edges between one pair multiply EP weight (the parallel-direct-edges "
+        "contract)"
     )
-    assert after is not None and after[3] == "old", (
-        "#8722 may now be FIXED — the replay reproduces the later "
-        "create_direct_edge's attrs. Rewrite this test to assert "
-        f"`after == before` and close #8722 (got {after}, wanted the "
-        "pre-transfer attrs)"
+    assert after == before, (
+        "#8722 regressed: the replay landed the PRE-transfer attrs where live "
+        "holds the post-transfer ones. The two direct-edge legs are no longer "
+        "interleaved by journal seq — check `direct_edge_replay` in "
+        f"`projection/__init__.py` (got {after}, wanted {before})"
+    )
+
+
+def test_a10_repeated_creation_after_transfer_last_writer_wins(a10):
+    """#8722 seq-interleaving, the multi-write case: TWO creations after the
+    transfer plus one before it.
+
+    Block ordering could only ever reproduce the LAST creation's attrs by
+    accident of the created-fold running after the transfer when the transfer
+    never re-SET them; the seq stream must reproduce live's last-writer-wins
+    for the edge regardless of how many creations follow the transfer. The
+    pre-transfer creation must still be owned by the transfer descriptor (not
+    applied on top of it), so the count stays 1.
+    """
+    _, events, sdk = a10
+    a = sdk.create_point("statement", "A implies B.")["id"]
+    b = sdk.create_point("statement", "B.")["id"]
+    sdk.create_direct_edge("IMPL", a, b, confidence=0.1, weight=0.1,
+                           label="pre-transfer")
+    successor = sdk.create_point("statement", "A, restated.")["id"]
+    sdk.supersede_point(a, successor)
+    sdk.create_direct_edge("IMPL", successor, b, confidence=0.5, weight=0.5,
+                           label="first-post")
+    sdk.create_direct_edge("IMPL", successor, b, confidence=0.9, weight=0.9,
+                           label="second-post")
+
+    before = _direct_edge(sdk, successor, b)
+    assert before is not None and before[3] == "second-post", (
+        f"precondition: live holds the LAST writer's attrs, got {before}"
+    )
+
+    _rebuild(sdk, events)
+
+    after = _direct_edge(sdk, successor, b)
+    assert _direct_edge_count(sdk, successor, b) == 1, (
+        "the re-created edges must collapse onto ONE edge, not accumulate"
+    )
+    assert after == before, (
+        "the rebuild did not end on the last writer's attrs — the interleaved "
+        f"replay is not applying journal order (got {after}, wanted {before})"
+    )
+
+
+def test_a10_post_transfer_recreation_object_endpoint_attrs_match_live(a10):
+    """#8722 seq-interleaving on the LABEL-AGNOSTIC endpoint path (#7902/#8622):
+    the transfer and the later recreation both end on an :Object, so the
+    created-fold's per-label sweep (not the :Point-hardcoded path) must resolve
+    the endpoints — AND the seq order must still end on the last writer.
+
+    The two halves failed independently before: the label sweep (#8622) and the
+    ordering (#8722), so a fix for one must not silently reintroduce the other.
+    """
+    _, events, sdk = a10
+    a = sdk.create_point("statement", "The widget ships.")["id"]
+    obj = sdk.create_object("Widget", "product")["id"]
+    sdk.create_direct_edge("IMPL", a, obj, confidence=0.1, weight=0.1,
+                           label="old")
+    successor = sdk.create_point("statement", "The widget ships (v2).")["id"]
+    sdk.supersede_point(a, successor)
+    sdk.create_direct_edge("IMPL", successor, obj, confidence=0.9, weight=0.9,
+                           label="new")
+
+    before = _direct_edge(sdk, successor, obj)
+    assert before is not None and before[3] == "new", (
+        f"precondition: live holds the POST-transfer attrs, got {before}"
+    )
+
+    _rebuild(sdk, events)
+
+    after = _direct_edge(sdk, successor, obj)
+    assert _direct_edge_count(sdk, successor, obj) == 1, (
+        "the Object-ended re-created edge must not be duplicated"
+    )
+    assert after == before, (
+        "the Object-ended re-created edge did not land on live's attrs — the "
+        "interleaved fold or its per-label endpoint sweep regressed (got "
+        f"{after}, wanted {before})"
     )
