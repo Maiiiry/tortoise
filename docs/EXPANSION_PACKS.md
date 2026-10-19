@@ -528,6 +528,7 @@ legitimate pipeline edits).
 | `migrate_kinds.py` (raw Cypher over a live graph) | An **operator act**: a deliberate re-typing of the graph's own historical rows, with every target spelling a reviewed literal in the file. It is the sanctioned way a pack namespace enters data written *before* the pack existed, so widening the mined set is the point of the run — a gate would refuse the very row the migration exists to rewrite. |
 | `retype.py` / `tools/retype_snapshot.py` | Offline: they transform a dump and never touch a live graph. They enforce the target kind against the **declared vocabulary** instead (`RetypeError`). |
 | `_emit_event` (post-mutation payload append) | The pre-write doors are gated instead. The mutations it describes (`PointPromoted`, `Dedupe*`, `create_operator`) have already written their node, so a refusal at the append could only split the journal from the cache. |
+| `pipeline.py`'s `SET p.kind = <pipeline_key>` | The value is a real namespaced **pipeline key** (`venture:deal`), not a pack kind — gating the writer would start refusing legitimate pipeline edits. What had to change was the READER: the mining leg no longer treats a bare `kind` on `:Pipeline`/`:Graph` as an ontology kind (#9068, above), so this write stays ungated and no longer widens the approved set. |
 
 A re-typing that DOES need a namespace the graph has not approved is an
 operator decision: run the migration, or add the pack
