@@ -292,6 +292,15 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # subdirectory twin is not authorized).
     "e2e/test_billing_upgrade.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
     # ── DELIBERATE_URI: fixtures/tests that force the docker lane directly ──
+    # #9197 (declared here by #9209's CI round): `_run_indexer` records the
+    # CURRENT value through monkeypatch BEFORE calling `session_indexer.main()`,
+    # which assigns `os.environ['TORTOISE_DB_URI']` directly from its `--db`
+    # flag. The setenv is a CAPTURE-FOR-RESTORE, not a lane switch: it is what
+    # makes the teardown put the live lane back instead of leaking the indexer's
+    # dead endpoint into every test collected after this module. DELIBERATE_URI
+    # (the lane under test is whatever the session opened; the mutation exists
+    # so the var is restored, and the fixture-param monkeypatch auto-undoes it).
+    "test_9079_event_writers_journal.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     "test_consolidation_4way.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     "test_doctor.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     # #3065 (bounded-socket resolver): the indexer case FORCES the docker lane
