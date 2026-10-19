@@ -57,6 +57,10 @@ are not equally harmful:
   record is applied by the next replay (T8);
 * the evidence probe's own class-attribute patch is restored to the CLASS
   FUNCTION, so each section measures its OWN graph (T9);
+* a `graph was deleted or replaced` abort whose graph KEY is gone is NOT read
+  back as a landed destroy — on this engine a Cypher read against a missing key
+  AUTO-CREATES it and answers `count(n)=0`, so the read-back is gated on
+  CONFIRMED presence and issues no read at all (T3e);
 * the message names THIS door's record (`EntityMutated op=delete`, derived from
   the door, never `PointAdded`) and attaches the graph to the CACHE clause, not
   the record's (T10).
@@ -66,8 +70,11 @@ handle (`proj.g.query`) is closed, and it does not claim the remaining
 apply-first doors are converted (`_delete_entity`, `_session_event_write`,
 `_update_entity`, `create_operator` are named in `tortoise/sdk.py`'s module-top
 KNOWN DEVIATIONS and in plan §7 increment 4). It pins the ORDERING on
-`delete_point` and the replay-healability of a committed delete record whose
-cache write did not land.
+`delete_point` and the replay-healability of a destroy whose record did not
+confirm or was lost. It deliberately does NOT claim the mirror state any more:
+since #9207 the append FOLLOWS the destroy, so a record whose cache write did
+not land can no longer be produced by this door (a failed destroy records
+nothing — T2).
 
 Plan of record: `docs/plans/2026-10-18-7951-delete-point-outbox.md`.
 """

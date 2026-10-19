@@ -11805,6 +11805,14 @@ class TortoiseSDK:
         # The destroy LANDED (or the Point was already absent). Only now may
         # the journal say so.
         if self._journal_entity_mutation("Point", id, "delete") is False:
+            # ⚠️ RESIDUAL, declared not absorbed: this raise exits BEFORE
+            # `_mark_dirty(neighbor_ids)` and `invalidate_messages()` below, so
+            # the 1-hop neighbours of a destroy that DID land keep their
+            # pre-delete stored confidences until something else dirties those
+            # roots. Bounded, not silent: the caller is told the destroy landed
+            # and that only a DESTRUCTIVE `rebuild_all` repairs the record, and
+            # that rebuild recomputes every root. Named in the plan's §6 so a
+            # later lane does not read this as full bookkeeping.
             from .exceptions import WriteNotLandedError
             raise WriteNotLandedError(
                 id, getattr(proj, "graph_name", None),
@@ -11888,8 +11896,11 @@ class TortoiseSDK:
         destruction record must be written. One read settles it.
 
         ``True`` — the Point is gone, so the write applied and the record must
-        follow it; ``False`` — the Point is still there, so nothing was
-        destroyed and the refusal is clean; ``None`` — the read failed too, so
+        follow it; ``False`` — nothing was destroyed and the refusal is clean,
+        which covers BOTH shapes callers must not conflate: the Point is still
+        there, or the graph KEY is ABSENT (the read was never issued, because
+        issuing it would re-create the key — the caller re-raises the engine's
+        own loud error, never a success); ``None`` — the read failed too, so
         the caller must not claim either state.
 
         Reading through the guarded handle is deliberate: the §17.1 gate covers
