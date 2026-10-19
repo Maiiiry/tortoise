@@ -48,11 +48,35 @@ WHAT THIS PINS
    sum of the batch table's own A and B rows. The defect this pins: the artefact called
    A/B "the same 8 files, 201 tests" while its table shows 14 files / 324 executions, so the
    remedy sentence scoped the one measurement that would remove the limit to batch A alone.
+7. The surface counts follow from the report's **own per-surface table**, never from a
+   restated number: the not-green set `{7, 12}` and the derived `15 green` are recomputed
+   from the table's rows and then required in all four places the report states them (status
+   line, "Surfaces:" paragraph, Verdict, indicator 2), and every green count a site states is
+   read — so a site that keeps its true sentence and gains a stale one fails. Each leg is
+   also recorded on its own surface row. The defect this pins: the headline numbers are the
+   artefact's whole deliverable and were hand-maintained, so they drifted from the table
+   three times ("three stated, five listed"; "16 green" beside a table whose surface 12
+   already carried a failed leg; the leg set said to be five while the table carried six).
+8. The leg-gap set is derived and stated **identically** wherever it appears: the surface
+   set, the leg total and the per-kind breakdown (automated attempted-and-failing / automated
+   never run / walk-through / manual) are all counted off the rows and required in the status
+   line, the "Surfaces:" paragraph, the leg-gap bullet (whose buckets and whose automated
+   sub-breakdown must both sum to the derived numbers) and the Verdict, which must name
+   exactly `{5, 7, 8, 12, 15, 16}`. A count that does not reconcile with its own list is this
+   artefact's recurring defect, and it reached the pull-request description too ("five",
+   where the document says six).
+
+Claims are read as **paragraphs**, not physical lines (`_claim_block`, `_leg_gap_sentence`):
+markdown wrapping is free, so reflowing a sentence must not fail a guard that is about what
+the report says. Table rows are still read line-wise — a wrapped row is a broken table.
 
 Non-vacuity: on the pre-fix document, checks 1–3 fail (it said "which is what licenses
 the cross-head comparison — checked per file", carried no tree-state line, and its
 indicator-2 row had no anchor caveat); check 5's extractor surfaces the dangling name from
-synthetic doc text and the resolver rejects it; check 6 fails on "8 files, 201 tests".
+synthetic doc text and the resolver rejects it; check 6 fails on "8 files, 201 tests";
+checks 7–8 fail on it too (its per-surface table's only not-green row is 7, so the derived
+set is `{7}` against a stated `16 green`; it carries no "seven legs" claim at all, and its
+rows 7, 8 and 12 carry none of their leg clauses).
 
 Static: doc-text scans plus file reads. No network, DB or graph.
 """
@@ -76,25 +100,92 @@ ANCHOR_SHA = "fbc1d96d5"
 VERIFIED_SHA = "180fe6fd3"
 
 
-def _doc_text() -> str:
-    return DOC.read_text(encoding="utf-8")
+def _doc_text(text: str | None = None) -> str:
+    return DOC.read_text(encoding="utf-8") if text is None else text
 
 
-def _section(heading: str) -> str:
-    """The body of a `## heading` section, up to the next `## `."""
-    text = _doc_text()
-    start = text.index(heading)
-    end = text.index("\n## ", start + len(heading))
-    return text[start:end]
+def _section(heading: str, text: str | None = None) -> str:
+    """The body of an exact `## heading` section, up to the next `## `.
+
+    The heading must match to end-of-line: `## Verdict` also prefixes
+    `## Verdict summary`, and returning that table instead of the Verdict is how a
+    count check silently passes over the wrong region.
+    """
+    text = _doc_text(text)
+    needle = heading + "\n"
+    assert needle in text, f"heading {heading!r} not found in {DOC.name}"
+    start = text.index(needle)
+    end = text.find("\n## ", start + len(needle))
+    return text[start:] if end == -1 else text[start:end]
 
 
-def _bullet(marker: str) -> str:
+def _bullet(marker: str, text: str | None = None) -> str:
     """The single `- **Which sha:**`-style bullet, up to the next top-level bullet."""
-    text = _doc_text()
+    text = _doc_text(text)
     assert marker in text, f"{marker!r} not found in {DOC.name}"
     start = text.index(marker)
     end = text.find("\n- ", start + len(marker))
     return text[start:] if end == -1 else text[start:end]
+
+
+def _single_line(prefix: str, text: str | None = None) -> str:
+    """The single line starting with `prefix` — a duplicate prefix is a hard error, not a guess."""
+    lines = [line for line in _doc_text(text).splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1, (
+        f"expected exactly one line starting {prefix!r}, found {len(lines)}"
+    )
+    return lines[0]
+
+
+def _fold(text: str) -> str:
+    """Markdown-equivalent text: inner newlines collapsed, so re-wrapping a paragraph is
+    not a change of claim."""
+    return re.sub(r"\s*\n\s*", " ", text).strip()
+
+
+def _claim_block(prefix: str, text: str | None = None) -> str:
+    """The single markdown *paragraph* starting with `prefix`, folded.
+
+    A claim is a paragraph, not a layout: this report wraps most of its prose, so reading a
+    claim off one physical line would fail the guard on a faithful reflow. Table rows are
+    read with `_single_line` instead — a wrapped row is a broken table, not a rewording.
+    """
+    blocks = [
+        block
+        for block in re.split(r"\n[ \t]*\n", _doc_text(text))
+        if _fold(block).startswith(prefix)
+    ]
+    assert len(blocks) == 1, (
+        f"expected exactly one paragraph starting {prefix!r}, found {len(blocks)}"
+    )
+    return _fold(blocks[0])
+
+
+def _leg_gap_sentence(text: str | None = None) -> str:
+    """The Verdict's leg-gap sentence, read from the folded section so it is wrap-safe.
+
+    The sentence ends at its own full stop. A missing stop is a hard error rather than a
+    silent overrun into the next sentence (whose numerals would then read as surfaces);
+    an inline abbreviation inside the sentence is not expected and would truncate it, so
+    the assertion below names the sentence when that happens.
+    """
+    verdict = _fold(_section("## Verdict", text))
+    match = re.search(
+        r"\*\*(" + _WORD_ALTERNATION + r")\*\* surfaces have an assigned leg",
+        verdict,
+        re.IGNORECASE,
+    )
+    assert match, (
+        "the Verdict no longer states its leg gap as '<count> surfaces have an assigned "
+        "leg ...': " + verdict
+    )
+    end = verdict.find(". ", match.end())
+    assert end != -1, (
+        "the Verdict's leg-gap sentence has no terminating full stop, so its boundary "
+        "cannot be read (an overrun would read the next sentence's numerals as surfaces): "
+        + verdict[match.start() :]
+    )
+    return verdict[match.start() : end + 1]
 
 
 # --------------------------------------------------------------------------- #
@@ -162,14 +253,7 @@ def test_lane_conditions_records_that_the_hub_tree_state_was_not_measured():
 
 
 def test_indicator_two_is_graded_on_the_anchor_measurement():
-    text = _doc_text()
-    row = [
-        line
-        for line in text.splitlines()
-        if line.startswith("| 2 — every integration surface through its assigned layer")
-    ]
-    assert row, "indicator 2's row not found"
-    row_text = row[0]
+    row_text = _single_line("| 2 — every integration surface through its assigned layer")
     assert f"anchor `{ANCHOR_SHA}`" in row_text, (
         "indicator 2 must state that eight of its rows are anchor-measured. Row: "
         + row_text
@@ -468,3 +552,592 @@ def test_the_resolver_rejects_the_dangling_name_an_earlier_revision_cited():
         "written for; if it has been added, pick another known-absent name so the "
         "resolver keeps a non-vacuity case."
     )
+
+
+# --------------------------------------------------------------------------- #
+# 7-8 — the headline counts follow from the per-surface table, and the leg-gap
+#       set is stated identically everywhere it appears
+# --------------------------------------------------------------------------- #
+
+# The classifiers below decide the report's headline numbers, so all of them read the rows'
+# **Result** cells and none of them restates a number from the prose. Their vocabulary is
+# listed here because a re-worded cell is a re-derivation event, not a silent
+# re-classification:
+#
+#   not green            — ⚠️ in the Result cell AND "N passed, M failed" (M > 0) or
+#                          "leg exists and FAILS"
+#   a leg never run      — ⚠️ + "leg never run"
+#   a walk-through gap   — ⚠️ + "walk-through not executed"
+#   a manual gap         — ⚠️ + "leg not executed" / "leg **partly** covered"
+#
+# Every leg classifier is ⚠️-gated, because a green row may legitimately *quote* a failure
+# count in prose ("N passed, M failed") without that leg being its own — surface 1's cell
+# names the walk-through of surface 8, and D4's ratios are quoted all over the artefact. A
+# row that failed and then passed on a re-run is written as prose ("failed at `x` and
+# passed on re-run at `y`"), so it matches none of these — surface 16 is green. `0 failed`
+# matches nothing either.
+#
+# Failing closed: `_assert_warnings_and_failures_are_classified` requires every ⚠️ row and
+# every hard-failure marker (❌ ✗ FAIL ERROR) to be one of these classifiers or one of the
+# two warned-but-green phrasings, so a row whose result really changed cannot slip past the
+# pins as an unknown spelling.
+_FAILED_RUN_RESULT = re.compile(r"\b\d+ passed, [1-9]\d* failed\b")
+_FAILED_LEG_CLAUSE = re.compile(r"\bleg exists and FAILS\b")
+_NOT_GREEN_RESULT = re.compile(
+    _FAILED_RUN_RESULT.pattern + "|" + _FAILED_LEG_CLAUSE.pattern
+)
+_NEVER_RUN_LEG = re.compile(r"\bleg never run\b")
+_WALK_THROUGH_GAP = re.compile(r"\bwalk-through not executed\b")
+_MANUAL_GAP = re.compile(r"\bleg not executed\b|\bleg \*\*partly\*\* covered\b")
+_HARD_FAILURE = re.compile(r"❌|✗|\bFAIL|\bERROR")
+
+# ⚠️ rows that are nevertheless green, in the report's own two phrasings: a flake that
+# passes alone (D2, surface 11) and a failure proven an environment artifact on re-run
+# (D3, surface 16). Anything else carrying ⚠️ must be a leg classifier's business.
+_WARNED_BUT_GREEN = (
+    re.compile(r"\bflake\b[^.]*\bpasses alone\b"),
+    re.compile(r"\bfailed at\b[^.]*\bpassed on re-run\b"),
+)
+
+# The leg KINDS a row can record, in the order the report's bullet states them, each with
+# the classifier that derives its count.
+_LEG_KIND_PATTERNS = {
+    "automated_failed": _NOT_GREEN_RESULT,
+    "automated_never_run": _NEVER_RUN_LEG,
+    "walk_through": _WALK_THROUGH_GAP,
+    "manual": _MANUAL_GAP,
+}
+
+# The surfaces the map assigns a leg this run did not fully pass or execute — a golden set
+# asserted against the rows, so either side moving is loud.
+_LEG_GAP_SURFACES = {5, 7, 8, 12, 15, 16}
+
+_NUMBER_WORDS = {
+    word: value
+    for value, word in enumerate(
+        [
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+            "twenty",
+        ]
+    )
+}
+_NUMBER_NAMES = {value: word for word, value in _NUMBER_WORDS.items()}
+_WORD_ALTERNATION = "|".join(_NUMBER_WORDS)
+_NUMERAL_ALTERNATION = "|".join(_NUMBER_WORDS) + r"|\d+"
+
+# Every way this report states a green count — digits and spelled-out numbers, in the
+# orders it uses them. Reading *all* of them, rather than banning one stale spelling, is
+# what catches a site that keeps its true sentence and gains a contradictory one.
+_GREEN_READINGS = (
+    re.compile(
+        r"(?<![\w.])(\d+)\s+of the 17 (?:surfaces are|are)\s+green", re.IGNORECASE
+    ),
+    re.compile(r"(?<![\w.])(\d+)\s+are\s+green\b", re.IGNORECASE),
+    re.compile(r"(?<![\w.])(\d+)\s+green\b", re.IGNORECASE),
+    re.compile(
+        r"(?<![\w.])(" + _WORD_ALTERNATION + r")\s+of the 17 (?:surfaces are|are)\s+green",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?<!of the )(?<![\w.])(\d+)\s+surfaces are green\b", re.IGNORECASE),
+    re.compile(r"(?<![\w.])(\d+)\s+of 17 green\b", re.IGNORECASE),
+    re.compile(r"green count is (\d+)", re.IGNORECASE),
+    re.compile(r"(?<![\w.])(\d+)\s*/\s*17\s*(?:surfaces\s*)?green", re.IGNORECASE),
+)
+
+# The forms this report states a leg TOTAL in (`**seven legs**`, `(seven legs`, `all
+# seven legs`); reading all of them means a stale total in any of the three is caught.
+_LEG_TOTAL_PATTERNS = (
+    re.compile(r"\*\*(" + _NUMERAL_ALTERNATION + r") legs\*\*", re.IGNORECASE),
+    re.compile(r"\((" + _NUMERAL_ALTERNATION + r") legs", re.IGNORECASE),
+    re.compile(
+        r"\b(?:(?:all|the)\s+)?(" + _NUMERAL_ALTERNATION + r") legs\b", re.IGNORECASE
+    ),
+)
+
+
+def _numeral(token: str) -> int:
+    """`"3"` -> 3, `"seven"` -> 7."""
+    return int(token) if token.isdigit() else _NUMBER_WORDS[token.lower()]
+
+
+def _surface_rows(text: str | None = None) -> dict[int, str]:
+    """surface number -> its full row, from the report's own `## Per-surface evidence` table."""
+    section = _section("## Per-surface evidence", text)
+    matched = [
+        (int(match.group(1)), line)
+        for line in section.splitlines()
+        if (match := re.match(r"\|\s*(\d+)\s+[^|]*\|", line))
+    ]
+    # Physical row count AND key set: `len(dict)` collapses a duplicated surface row, and
+    # the key set alone would not notice a duplicate of a row that already exists.
+    assert len(matched) == 17, (
+        f"the per-surface table has {len(matched)} surface rows, not 17 "
+        f"({[number for number, _ in matched]}) — re-derive the report's counts before "
+        "trusting this guard"
+    )
+    rows = dict(matched)
+    assert sorted(rows) == list(range(1, 18)), (
+        f"the per-surface table no longer has exactly surfaces 1–17 ({sorted(rows)})"
+    )
+    return rows
+
+
+def _result_cell(row: str) -> str:
+    """The row's Result cell — the Assigned-layer column also says "manual", so it cannot be
+    the thing that satisfies a claim about the manual leg."""
+    return row.strip().strip("|").split("|")[-1].strip()
+
+
+def _assert_warnings_and_failures_are_classified(rows: dict[int, str]) -> None:
+    """Every ⚠️ row and every hard-failure marker must be one the classifiers understand.
+
+    Without this, a row that really did change from green to failed — or into a ⚠️ state
+    phrased in a way no classifier matches — would match no pattern and every derived count
+    would simply not move: the table would contradict the prose in silence, which is the
+    defect this whole guard exists to prevent.
+    """
+    understood = (*_LEG_KIND_PATTERNS.values(), *_WARNED_BUT_GREEN)
+
+    def unclassified(rows_to_check):
+        return [
+            (surface, cell)
+            for surface, row in rows_to_check.items()
+            if (cell := _result_cell(row))
+            and ("⚠️" in cell or _HARD_FAILURE.search(cell))
+            and not any(pattern.search(cell) for pattern in understood)
+        ]
+
+    unknown = unclassified(rows)
+    assert not unknown, (
+        "these rows are marked ⚠️ or carry a failure marker in a phrasing no classifier "
+        "understands, so the derived counts cannot see them — extend the vocabulary above "
+        "with the new phrasing: " + repr(unknown)
+    )
+
+
+def _surfaces_where(pattern: re.Pattern[str], text: str | None = None) -> set[int]:
+    """⚠️ rows whose Result cell matches `pattern` — every leg classifier is gated this way."""
+    return {
+        surface
+        for surface, row in _surface_rows(text).items()
+        if "⚠️" in _result_cell(row) and pattern.search(_result_cell(row))
+    }
+
+
+def _not_green_surfaces(text: str | None = None) -> set[int]:
+    """Derived from the table alone: ⚠️ rows recording an automated leg that did not pass."""
+    _assert_warnings_and_failures_are_classified(_surface_rows(text))
+    return _surfaces_where(_NOT_GREEN_RESULT, text)
+
+
+def _legs_per_surface(text: str | None = None) -> dict[int, dict[str, int]]:
+    """Leg counts per surface and kind, derived from the rows.
+
+    A surface can carry more than one leg (surface 7's integration leg fails under load and
+    its hosted-e2e leg never ran), which is why the leg total exceeds the surface count.
+    """
+    per_surface = {}
+    for surface, row in _surface_rows(text).items():
+        cell = _result_cell(row)
+        counts = {
+            kind: len(pattern.findall(cell)) if "⚠️" in cell else 0
+            for kind, pattern in _LEG_KIND_PATTERNS.items()
+        }
+        per_surface[surface] = counts
+    return per_surface
+
+
+def _leg_kinds(text: str | None = None) -> dict[str, int]:
+    """Leg totals per kind, summed from `_legs_per_surface`."""
+    totals = dict.fromkeys(_LEG_KIND_PATTERNS, 0)
+    for counts in _legs_per_surface(text).values():
+        for kind, count in counts.items():
+            totals[kind] += count
+    return totals
+
+
+def _leg_gap_surfaces(text: str | None = None) -> set[int]:
+    """Derived from the table alone: rows recording an assigned leg not fully passed/executed."""
+    return {
+        surface
+        for surface, counts in _legs_per_surface(text).items()
+        if sum(counts.values())
+    }
+
+
+def _enumerated(numbers: list[int]) -> str:
+    """`[5, 15, 16]` -> `"5, 15 and 16"`, the form the report enumerates surfaces in."""
+    ordered = sorted(numbers)
+    assert len(ordered) >= 2, f"not an enumeration: {ordered}"
+    return ", ".join(str(n) for n in ordered[:-1]) + f" and {ordered[-1]}"
+
+
+def _stated_leg_totals(site: str) -> set[int]:
+    """Every leg total a site states (`**seven legs**`, `(seven legs`, `**7 legs**`)."""
+    found: set[int] = set()
+    for pattern in _LEG_TOTAL_PATTERNS:
+        found |= {_numeral(token) for token in pattern.findall(site)}
+    return found
+
+
+_NOT_GREEN_READINGS = (
+    re.compile(r"(?<![\w.])(\d+)\s+not green\b", re.IGNORECASE),
+    re.compile(
+        r"(?<![\w.])(" + _WORD_ALTERNATION + r")\s+not green\b", re.IGNORECASE
+    ),
+)
+
+
+def _not_green_readings(site: str) -> set[int]:
+    """Every not-green count a site states — a count that disagrees with its list fails."""
+    found: set[int] = set()
+    for pattern in _NOT_GREEN_READINGS:
+        found |= {_numeral(token) for token in pattern.findall(site)}
+    return found
+
+
+def _green_readings(site: str) -> set[int]:
+    """Every green count a site states — a site that says two different things says both."""
+    found: set[int] = set()
+    for pattern in _GREEN_READINGS:
+        found |= {_numeral(token) for token in pattern.findall(site)}
+    return found
+
+
+def _surfaces_named_in(site: str, phrase: str) -> set[int]:
+    """The surface numbers a site names in the clause that starts with `phrase`.
+
+    Set-based, so an enumeration reordered or spelled differently still reads the same; the
+    clause stops before the next claim ("N with/carry an assigned leg"), which names the
+    leg-gap surfaces rather than the not-green ones.
+    """
+    match = re.search(phrase + r"[^.]*", site)
+    assert match, f"{phrase!r} not found in this site: {site}"
+    clause = re.split(r"\d+\s+(?:with|carry) an assigned leg", match.group(0))[0]
+    return {int(n) for n in re.findall(r"(?<![A-Za-z0-9])(\d+)(?![A-Za-z0-9])", clause)}
+
+
+def _enumeration_pattern(numbers: list[int]) -> str:
+    """A regex for an enumeration of these numbers, accepting `,` / `and` / `, and`."""
+    separator = r"(?:\s*(?:,|and)\s*)*"
+    return separator.join(str(n) for n in sorted(numbers))
+
+
+def _manual_surfaces_in(sentence: str) -> set[int]:
+    """The surfaces the sentence's `legs of ...` bucket enumerates.
+
+    Read as an enumeration, not as "any numeral after `legs of`": parenthetical annotations
+    are discarded (they can carry ratios like "1 of 4 variants"), the numeral run is read,
+    and the first non-enumerating word ends it — so a trailing clause cannot contribute a
+    bogus surface.
+    """
+    start = sentence.index("legs of ") + len("legs of ")
+    tail = re.sub(r"\([^)]*\)", ", ", sentence[start:])
+    surfaces: set[int] = set()
+    for token in re.finditer(r"(\d+)|and\b|,|[A-Za-z]+|\S", tail):
+        if token.group(1):
+            surfaces.add(int(token.group(1)))
+        elif token.group(0) in ("and", ","):
+            continue
+        else:
+            break
+    return surfaces
+
+
+def test_the_not_green_set_and_the_green_count_follow_from_the_per_surface_table():
+    """The stated `15 green` / `2 not green (7, 12)` must be what the table's own rows say.
+
+    Pre-fix the table's only not-green row was 7 (surface 12's cell read "123-test batch
+    green"), so the derived set was `{7}` and the derived green count 16 — exactly what the
+    prose stated. Reading the counts off the rows is what stops the statement drifting
+    silently: change a row and this fails.
+    """
+    not_green = _not_green_surfaces()
+    assert not_green == {7, 12}, (
+        "the per-surface table no longer shows exactly surfaces 7 and 12 as not green "
+        f"(derived: {sorted(not_green)}). If a cell was re-worded, check it against the "
+        "classifier's documented vocabulary above; if a result really changed, the "
+        "report's counts must change with it."
+    )
+    green = len(_surface_rows()) - len(not_green)
+
+    sites = {
+        "status line": _claim_block("**Status:"),
+        "\"Surfaces:\" paragraph": _claim_block("**Surfaces:"),
+        "Verdict": _fold(_section("## Verdict")),
+        "indicator 2": _single_line("| 2 — every integration surface through its assigned layer"),
+    }
+    for name, site in sites.items():
+        assert _green_readings(site) == {green}, (
+            f"the {name} must state exactly the green count the table derives ({green}); "
+            f"it reads {sorted(_green_readings(site)) or 'none'}. Site: {site}"
+        )
+    for name in ("\"Surfaces:\" paragraph", "status line"):
+        assert _not_green_readings(sites[name]) in (set(), {len(not_green)}), (
+            f"the {name} states a not-green count that disagrees with the table's "
+            f"{sorted(not_green)}: it reads {sorted(_not_green_readings(sites[name]))}. "
+            "Site: " + sites[name]
+        )
+
+    # The Deviations paragraph that restates the green count must carry the derived one too.
+    overlap = [
+        _fold(block)
+        for block in re.split(r"\n[ \t]*\n", _doc_text())
+        if "green count is" in _fold(block)
+    ]
+    assert len(overlap) == 1, (
+        f"expected exactly one paragraph restating the green count, found {len(overlap)}"
+    )
+    assert _green_readings(overlap[0]) == {green}, (
+        "the paragraph that restates the green count must state the derived count "
+        f"({green}); it reads {sorted(_green_readings(overlap[0])) or 'none'}. Paragraph: "
+        + overlap[0]
+    )
+
+    # The not-green surfaces are pinned wherever the report names them — not only count.
+    assert _surfaces_named_in(sites["status line"], r"are not") == not_green, (
+        "the status line must name exactly the not-green surfaces the table derives "
+        f"({sorted(not_green)}): " + sites["status line"]
+    )
+    assert _surfaces_named_in(sites["\"Surfaces:\" paragraph"], r"not green") == not_green, (
+        "the \"Surfaces:\" paragraph must name exactly the not-green surfaces the table "
+        f"derives ({sorted(not_green)}): " + sites["\"Surfaces:\" paragraph"]
+    )
+    for surface in sorted(not_green):
+        assert f"**surface {surface}**" in sites["Verdict"], (
+            f"the Verdict must name surface {surface} as not green, by name: "
+            + sites["Verdict"]
+        )
+
+
+def test_the_leg_gap_set_is_six_surfaces_and_seven_legs_wherever_it_is_stated():
+    """Six surfaces / seven legs, stated identically in the status, summary, bullet and Verdict.
+
+    Every number here is derived from the table — the surface set, the leg total and the
+    per-kind breakdown — so a row that grows a leg breaks the prose pins instead of passing
+    them. Two failures this pins, both shipped: a set stated as one number and listed as
+    another ("three stated, five listed"), and a leg set the document states as six while
+    the change description says five.
+    """
+    per_surface = _legs_per_surface()
+    derived = _leg_gap_surfaces()
+    assert derived == _LEG_GAP_SURFACES, (
+        "the per-surface table's leg gaps no longer match the set the prose states: "
+        f"derived {sorted(derived)}, expected {sorted(_LEG_GAP_SURFACES)}. If a cell was "
+        "re-worded, check the classifier's documented vocabulary above; if a result "
+        "really changed, the counts must change with it."
+    )
+    kinds = _leg_kinds()
+    automated = kinds["automated_failed"] + kinds["automated_never_run"]
+    legs = sum(kinds.values())
+    assert legs > len(_LEG_GAP_SURFACES), (
+        "a leg total equal to the surface count would mean no surface carries two legs, "
+        f"contradicting surface 7's two: legs={legs}, surfaces={len(_LEG_GAP_SURFACES)}"
+    )
+    multi = sorted(surface for surface, counts in per_surface.items() if sum(counts.values()) > 1)
+    assert multi == [7], (
+        "exactly one surface carries two legs (7's integration failure plus its un-run "
+        f"hosted-e2e leg); the rows show {multi}. Kinds: {kinds}"
+    )
+    surfaces_stated = str(len(_LEG_GAP_SURFACES))
+
+    status = _claim_block("**Status:")
+    assert f"{surfaces_stated} carry an assigned leg not fully passed or executed" in status, (
+        "the status line must state every surface with a leg gap: " + status
+    )
+    assert _stated_leg_totals(status) == {legs}, (
+        f"the status line must state {legs} legs, once: {status}"
+    )
+
+    summary = _claim_block("**Surfaces:")
+    assert f"{surfaces_stated} with an assigned leg not fully passed or executed" in summary, (
+        "the \"Surfaces:\" paragraph must state every surface with a leg gap: " + summary
+    )
+    assert _stated_leg_totals(summary) == {legs}, (
+        f"the \"Surfaces:\" paragraph must state {legs} legs, once: " + summary
+    )
+
+    layer_bullet = _bullet("- **Which layer was not fully reached")
+    assert f"**{_NUMBER_NAMES[len(_LEG_GAP_SURFACES)]}** surfaces have an assigned leg" in (
+        layer_bullet
+    ), "the leg-gap bullet must state every surface with a leg gap: " + layer_bullet
+    assert _stated_leg_totals(layer_bullet) == {legs}, (
+        f"the leg-gap bullet must state {legs} legs, once: " + layer_bullet
+    )
+
+    # The breakdown's buckets must BE the table's per-kind counts, each kind stated exactly
+    # once (a corrected-then-restated count is a contradiction, not a rewording), and their
+    # sum must be the stated total.
+    stated_pairs = [
+        (kind, _numeral(word))
+        for word, kind in re.findall(
+            r"\*\*(" + _NUMERAL_ALTERNATION + r") (automated|walk-through|manual)\*\*",
+            layer_bullet,
+            re.IGNORECASE,
+        )
+    ]
+    assert len(stated_pairs) == 3, (
+        "the leg-gap bullet must state its automated / walk-through / manual buckets once "
+        f"each; it states {stated_pairs}. Bullet: " + layer_bullet
+    )
+    assert len({kind for kind, _ in stated_pairs}) == 3, (
+        f"a leg-gap bucket is stated twice, which is a contradiction: {stated_pairs}"
+    )
+    stated_buckets = dict(stated_pairs)
+    assert stated_buckets == {
+        "automated": automated,
+        "walk-through": kinds["walk_through"],
+        "manual": kinds["manual"],
+    }, (
+        "the leg-gap bullet's per-kind counts must equal the table's: stated "
+        f"{stated_buckets}, derived {{'automated': {automated}, 'walk-through': "
+        f"{kinds['walk_through']}, 'manual': {kinds['manual']}}}. Bullet: {layer_bullet}"
+    )
+    assert sum(stated_buckets.values()) == legs, (
+        f"the stated breakdown {stated_buckets} does not sum to the {legs} legs the table "
+        "derives. Bullet: " + layer_bullet
+    )
+
+    # And the automated bucket's own sub-breakdown must add up, each state tied to its own
+    # count — the order the two are named in carries no meaning.
+    automated_clause = re.search(
+        r"\*\*" + re.escape(_NUMBER_NAMES[automated]) + r" automated\*\* \(([^)]*)\)",
+        layer_bullet,
+        re.IGNORECASE,
+    )
+    assert automated_clause, (
+        "the leg-gap bullet must break the automated legs down: " + layer_bullet
+    )
+    for state, kind in (
+        ("attempted and failing", "automated_failed"),
+        ("never run", "automated_never_run"),
+    ):
+        stated = re.search(
+            r"(" + _NUMERAL_ALTERNATION + r") " + re.escape(state),
+            automated_clause.group(1),
+            re.IGNORECASE,
+        )
+        assert stated and _numeral(stated.group(1)) == kinds[kind], (
+            f"the automated sub-breakdown must state {kinds[kind]} {state}; clause: "
+            + automated_clause.group(1)
+        )
+
+    # The E2E-12 row inherits every leg, so its total must be the same total.
+    e2e_12 = _single_line("| 12 | Cross-W journey")
+    assert _stated_leg_totals(e2e_12) == {legs}, (
+        f"the E2E-12 row must inherit all {legs} legs, stated as one total: " + e2e_12
+    )
+
+    # The Verdict's leg sentence must name exactly the six surfaces. Only *surface*
+    # numerals and the `legs of ...` enumeration are read — a `#9001` citation or a
+    # `2 of 54` ratio in the same sentence is not a seventh surface — and the sentence is
+    # read from the folded paragraph, so re-wrapping the markdown cannot fail it.
+    verdict_sentence = _leg_gap_sentence()
+    assert f"**{_NUMBER_NAMES[len(_LEG_GAP_SURFACES)].capitalize()}** surfaces" in (
+        verdict_sentence
+    ), "the Verdict must state every surface with a leg gap: " + verdict_sentence
+    assert _stated_leg_totals(verdict_sentence) == {legs}, (
+        f"the Verdict must state {legs} legs, once: " + verdict_sentence
+    )
+    # Each surface's leg is named with the state the table records — the whole point of the
+    # leg bullet is that "attempted and failed" is not "never run".
+    assert re.search(
+        r"surface 7['’]s[^.]*never passes under load[^.]*hosted-e2e[^.]*never run",
+        verdict_sentence,
+    ), "the Verdict must state surface 7's two legs and their states: " + verdict_sentence
+    assert re.search(
+        r"surface 12['’]s[^.]*hosted-e2e[^.]*(?:fails|not green)", verdict_sentence
+    ), "the Verdict must state surface 12's failing hosted-e2e leg: " + verdict_sentence
+    assert re.search(
+        r"surface 8['’]s[^.]*walk-through[^.]*not run", verdict_sentence
+    ), "the Verdict must state surface 8's un-run walk-through: " + verdict_sentence
+    named = {int(n) for n in re.findall(r"surface[s]?\s+(\d+)", verdict_sentence)}
+    if "legs of " in verdict_sentence:
+        named |= _manual_surfaces_in(verdict_sentence)
+    assert named == _LEG_GAP_SURFACES, (
+        "the Verdict's leg sentence must name exactly surfaces "
+        f"{sorted(_LEG_GAP_SURFACES)} (surface 7 supplies two legs, which is why the leg "
+        f"count exceeds the surface count); it names {sorted(named)}. Sentence: "
+        + verdict_sentence
+    )
+
+    # Indicator 2 carries the same set, surface by surface — each automated leg named with
+    # its own state, and the manual legs enumerated. Read per surface and per state (not as
+    # one long literal), so a faithful rewording is not a failure.
+    indicator_two = _single_line("| 2 — every integration surface through its assigned layer")
+    for surface, states in (
+        (7, ("never passed under load", "hosted-e2e", "never ran")),
+        (12, ("hosted-e2e", "fails")),
+        (8, ("walk-through", "not run")),
+    ):
+        for state in states:
+            assert re.search(
+                rf"surface[s]? .{{0,40}}\b{surface}\b[^.]*{re.escape(state)}", indicator_two
+            ), (
+                f"indicator 2 must name surface {surface}'s leg and its state "
+                f"({state!r}): " + indicator_two
+            )
+    manual_clause = re.search(
+        r"surfaces "
+        + _enumeration_pattern(sorted(_LEG_GAP_SURFACES - {7, 8, 12}))
+        + r"[^.]*",
+        indicator_two,
+    )
+    assert manual_clause, (
+        "indicator 2 must enumerate the manual legs of surfaces "
+        f"{sorted(_LEG_GAP_SURFACES - {7, 8, 12})}: " + indicator_two
+    )
+    assert "manual" in manual_clause.group(0), (
+        "the enumerated clause must name the manual leg: " + manual_clause.group(0)
+    )
+    assert ("not executed" in manual_clause.group(0)) or (
+        "partly" in manual_clause.group(0)
+    ), (
+        "the enumerated clause must state the manual leg's state: " + manual_clause.group(0)
+    )
+
+
+def test_each_leg_gap_is_recorded_on_its_own_surface_row():
+    """The table is where the set is checkable, so every leg must be on its row.
+
+    Pre-fix, rows 7, 8 and 12 carried none of these clauses — a reader who checked the set
+    against the table would have concluded the document contradicted itself (the defect an
+    earlier round fixed for surface 7's row alone).
+    """
+    rows = _surface_rows()
+    expected = {
+        7: ("hosted-e2e leg never run", "its un-run hosted-e2e leg"),
+        8: ("walk-through not executed", "its un-run walk-through"),
+        12: ("hosted-e2e leg exists and FAILS", "its failing hosted-e2e leg"),
+        5: ("manual 6-harness leg not executed", "its unexecuted manual leg"),
+        15: ("manual leg not executed", "its unexecuted manual leg"),
+        16: ("Manual leg **partly** covered", "its partly-covered manual leg"),
+    }
+    assert set(expected) == _leg_gap_surfaces(), (
+        "this row-by-row check must cover exactly the surfaces the table derives: "
+        f"derived {sorted(_leg_gap_surfaces())}, covered {sorted(expected)}"
+    )
+    for surface, (clause, description) in sorted(expected.items()):
+        assert clause in _result_cell(rows[surface]), (
+            f"surface {surface}'s row must record {description} (`{clause}`) in its "
+            "Result cell: " + rows[surface]
+        )
