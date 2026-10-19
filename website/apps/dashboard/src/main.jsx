@@ -1589,16 +1589,10 @@ function App() {
   // handed down as a ref prop.
   const githubDisconnectDialogRef = React.useRef(null)
   const githubDisconnectInertRef = React.useRef(null)
-  React.useEffect(() => {
-    if (!githubDisconnect.open || typeof document === 'undefined') return undefined
-    const el = githubDisconnectDialogRef.current
-    if (!el) return undefined
-    const release = applyBackgroundInert(el, document)
-    githubDisconnectInertRef.current = release
-    if (typeof el.focus === 'function'
-      && !(el.contains && el.contains(document.activeElement))) el.focus()
-    return () => { githubDisconnectInertRef.current = null; release() }
-  }, [githubDisconnect.open])
+  // #8670 (a11y): the inert effect itself is declared BELOW, next to the other
+  // derived containment flags (`githubDisconnectArmed` / `deleteAccountArmed`) —
+  // it must be keyed on a flag that also carries the dialog's render gate, and
+  // that flag can only be declared after `tab` / `team` / `authMode`.
   // #4029 (a11y) applied to #4946: while the disconnect request is in flight
   // BOTH dialog buttons are disabled, which drops focus to <body>. Reclaim it
   // for the dialog container (tabIndex -1), guarded on activeElement === body so
@@ -1622,16 +1616,8 @@ function App() {
   // hook-free so its plain-function guard keeps working).
   const deleteAccountDialogRef = React.useRef(null)
   const deleteAccountInertRef = React.useRef(null)
-  React.useEffect(() => {
-    if (!deleteAccountOpen || typeof document === 'undefined') return undefined
-    const el = deleteAccountDialogRef.current
-    if (!el) return undefined
-    const release = applyBackgroundInert(el, document)
-    deleteAccountInertRef.current = release
-    if (typeof el.focus === 'function'
-      && !(el.contains && el.contains(document.activeElement))) el.focus()
-    return () => { deleteAccountInertRef.current = null; release() }
-  }, [deleteAccountOpen])
+  // #8670 (a11y): the inert effect is declared BELOW with the other derived
+  // containment flags, for the reason recorded on `githubDisconnectArmed`.
   // #4029 (a11y): while the DELETE is in flight BOTH dialog buttons are
   // disabled, which drops focus to <body>. Reclaim it for the dialog container
   // (tabIndex -1) — guarded on activeElement === body, mirroring the account
@@ -2684,6 +2670,58 @@ function claimIntentInFlight() {
     }
   }, [])
   const [authMode, setAuthMode] = React.useState('session') // 'session' | 'apikey'
+  // #8670 review P1: the two MODULE dialogs' inert effects are keyed on DERIVED
+  // flags that model their card's WHOLE render gate — the same failure class the
+  // inline flags (`sessionDeleteArmed`, `graphDeleteArmed`) carry, and here it
+  // bites HARDER because neither card is rendered by this component's own JSX at
+  // the point the effect lives:
+  //
+  //   • `GithubDisconnectControl` renders inside `<SettingsTab>`, which App
+  //     mounts only under `tab === 'settings' && team`;
+  //   • `DeleteAccountSection` renders only under `tab === 'profile' &&
+  //     authMode === 'session' && identityInv && !identityInv.unsupported`.
+  //
+  // Every one of those conditions can flip while the dialog is OPEN with
+  // `githubDisconnect.open` / `deleteAccountOpen` untouched, and the effect's
+  // owner (this component) stays mounted either way — so keyed on the open-bit
+  // alone the effect neither re-runs nor cleans up and the page outside the card
+  // keeps `inert` with no dialog left to release it (the page-wide keyboard
+  // lockout the pair of effects exists to prevent). Measured triggers, none of
+  // them exotic: `tab` moves on browser Back / an address-bar hash edit (#2509's
+  // popstate+hashchange handler calls `setTab` with no regard for an open
+  // dialog, and `inert` does not disable browser chrome); `team` nulls on an org
+  // transition; and `fetchIdentity()` — re-run on window focus — fails CLOSED to
+  // `setIdentityInv(null)`, so alt-tabbing away from an open Delete-account
+  // dialog and back during an identity-read blip unmounts the section with no
+  // navigation at all.
+  //
+  // Declared HERE, below `tab` (2563), `team` (1735) and `authMode` themselves:
+  // an expression is evaluated eagerly during render, so a flag that reads a
+  // later `const` is the #2709 TDZ class `tdzDepsTripwire.test.js` guards.
+  const githubDisconnectArmed = tab === 'settings' && !!team
+    && githubDisconnect.open
+  const deleteAccountArmed = tab === 'profile' && authMode === 'session'
+    && !!identityInv && !identityInv.unsupported && deleteAccountOpen
+  React.useEffect(() => {
+    if (!githubDisconnectArmed || typeof document === 'undefined') return undefined
+    const el = githubDisconnectDialogRef.current
+    if (!el) return undefined
+    const release = applyBackgroundInert(el, document)
+    githubDisconnectInertRef.current = release
+    if (typeof el.focus === 'function'
+      && !(el.contains && el.contains(document.activeElement))) el.focus()
+    return () => { githubDisconnectInertRef.current = null; release() }
+  }, [githubDisconnectArmed])
+  React.useEffect(() => {
+    if (!deleteAccountArmed || typeof document === 'undefined') return undefined
+    const el = deleteAccountDialogRef.current
+    if (!el) return undefined
+    const release = applyBackgroundInert(el, document)
+    deleteAccountInertRef.current = release
+    if (typeof el.focus === 'function'
+      && !(el.contains && el.contains(document.activeElement))) el.focus()
+    return () => { deleteAccountInertRef.current = null; release() }
+  }, [deleteAccountArmed])
   const [checking, setChecking] = React.useState(true)
   // #3890: move focus to the deep-linked section heading once its tab has
   // rendered (WCAG 2.4.3 Focus Order / 2.4.11 Focus Not Obscured). The tab
@@ -7005,6 +7043,14 @@ function claimIntentInFlight() {
         throw new Error(b.detail || `HTTP ${res.status}`)
       }
       if (orgIdRef.current !== _teamAtCall) return
+      // #8670 review P3 (recorded, not changed): a SUCCESS deliberately does NOT
+      // route through `graphDeleteClose()`. The opener is this row's own 🗑, which
+      // `loadGraphs` below removes — restoring focus synchronously here would aim
+      // it at a node that is about to unmount (focus falls to <body> anyway) and
+      // the deferred pattern is only needed on paths where the opener SURVIVES.
+      // The user-dismissal paths (Cancel / backdrop / Escape) do restore, via
+      // `graphDeleteClose`. What matters for `inert` — the release — happens
+      // either way: the flag flips, so the effect cleanup runs it.
       setConfirmDeleteId(null)
       setDeleteConfirmTyped('')
       if (panelGraphId === graphId) closeGraphPanel()
@@ -11276,7 +11322,12 @@ function claimIntentInFlight() {
         {/* #4029: personal-account deletion lives on the Profile tab and only
             for a real SESSION account — a key-login has no auth account to
             delete (the server answers `unsupported` in registry mode). */}
-        {tab === 'profile' && authMode === 'session' && identityInv && !identityInv.unsupported && (
+        {/* #8670 review P1: the card renders from the SAME derived flag its
+            inert effect is keyed on (`deleteAccountArmed`), so a flip of ANY
+            condition in the gate — the tab, the auth mode, or an identity read
+            landing null — cleans the effect up instead of stranding `inert` on
+            the page with no dialog to release it. */}
+        {deleteAccountArmed && (
           <DeleteAccountSection
             open={deleteAccountOpen}
             busy={deleteAccountBusy}

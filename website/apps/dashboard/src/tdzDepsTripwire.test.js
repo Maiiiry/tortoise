@@ -376,12 +376,10 @@ test('#3726: the analyzer sees EXACTLY these hook deps arrays in main.jsx', () =
   "sessionDeleteArmed",
   "text",
   "text, onCopied",
-  // #8670: the GitHub-disconnect containment effect (the card lives in the
-  // hook-free githubDisconnect.js module, so the effect is here).
-  "githubDisconnect.open",
+  // #8670: the GitHub-disconnect busy-focus reclaim (the inert effect moved
+  // below, onto the derived `githubDisconnectArmed` flag).
   "githubDisconnect.open, githubDisconnect.busy",
-  // #8670: the account-deletion containment effect, same split as above.
-  "deleteAccountOpen",
+  // #8670: the account-deletion busy-focus reclaim, same split as above.
   "deleteAccountOpen, deleteAccountBusy",
   "apiKey",
   "keysLoaded, keysLoadNonce",
@@ -397,6 +395,14 @@ test('#3726: the analyzer sees EXACTLY these hook deps arrays in main.jsx', () =
   "",
   "tab",
   "",
+  // #8670: the two MODULE dialogs' containment effects. Their cards live in the
+  // hook-free githubDisconnect.js / accountDeletion.js modules, so the effects are
+  // here — keyed on DERIVED flags that model each card's WHOLE render gate (the
+  // Settings/Profile tab, `team`, `authMode`, `identityInv`), because those gates
+  // unmount the card without touching the open-bit and this component stays
+  // mounted, so a bare-open key would never clean up.
+  "githubDisconnectArmed",
+  "deleteAccountArmed",
   "tab, team, checking, authed, welcomeMode, deepLinkTick",
   "reposLoaded, onboarding, reposList, currentOrgId, reposLoadFailed",
   "accountMenuOpen",

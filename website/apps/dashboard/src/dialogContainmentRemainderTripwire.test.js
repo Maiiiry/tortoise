@@ -103,9 +103,6 @@ function evalFlag(expr, names, args) {
 
 // Both spellings the dashboard uses: JSX `aria-modal="true"` and the
 // createElement modules' `'aria-modal': 'true'`. Deliberately NOT the bare word —
-// `dialogFocus.js` and this change's own comments discuss aria-modal in prose.
-// Both spellings the dashboard uses: JSX `aria-modal="true"` and the
-// createElement modules' `'aria-modal': 'true'`. Deliberately NOT the bare word —
 // `dialogFocus.js` and this change's own comments discuss aria-modal in prose
 // (one even writes `aria-modal=true` unquoted). A FRESH regex per use: a shared
 // /g regex carries `lastIndex` between `test()` calls, which would make the
@@ -201,10 +198,13 @@ test('#8670: each of the six dialogs makes the background inert while open', () 
   }
   // The two extracted modules stay hook-free (their guards call them as plain
   // functions — a hook there throws "Invalid hook call"), so the parent owns the
-  // ref + effect and hands the node down.
+  // ref + effect and hands the node down. The key is a DERIVED `…Armed` flag,
+  // not the bare open-bit: each card also sits behind a tab-conditional gate in
+  // this parent's JSX, which unmounts the card without touching the open-bit
+  // (see the page-lockout guard below).
   for (const [name, src, state, ref] of [
-    ['GitHub disconnect', githubJs, 'githubDisconnect.open', 'githubDisconnectDialogRef'],
-    ['account deletion', accountJs, 'deleteAccountOpen', 'deleteAccountDialogRef'],
+    ['GitHub disconnect', githubJs, 'githubDisconnectArmed', 'githubDisconnectDialogRef'],
+    ['account deletion', accountJs, 'deleteAccountArmed', 'deleteAccountDialogRef'],
   ]) {
     assert.match(src, /ref: dialogRef/, `${name}: the module must accept the parent's dialog ref`)
     const effect = windowFrom(mainJsx, `if (!${state} || typeof document === 'undefined')`, 500)
@@ -300,6 +300,58 @@ test('#8670: the inert effect cannot outlive its dialog (page-lockout guard)', (
   assert.equal(graphArmed({ confirmDeleteId: null }), false, 'no id, no dialog')
   assert.equal(graphArmed({ graphs: [{ graph_id: 'g2' }] }), false,
     'a row that leaves the live list unmounts the card')
+
+  // ── the two MODULE dialogs: their gate lives in this parent's JSX ──
+  // Same class, one step worse: neither card is rendered at the effect's own site
+  // — `GithubDisconnectControl` is inside `<SettingsTab>` (mounted only under
+  // `tab === 'settings' && team`) and `DeleteAccountSection` under
+  // `tab === 'profile' && authMode === 'session' && identityInv &&
+  // !identityInv.unsupported`. The effect's OWNER (this component) stays mounted
+  // through every one of those flips, so a bare open-bit key leaks `inert`.
+  assert.match(mainJsx, /\{deleteAccountArmed && \(/,
+    'the account-deletion card must RENDER from the same flag its inert effect is keyed on')
+  assert.match(mainJsx, /\{tab === 'settings' && team && \(/,
+    'GithubDisconnectControl renders under the Settings tab gate — that gate belongs to its flag')
+  const githubFlag = constExpr(mainJsx, 'githubDisconnectArmed')
+  const githubArmed = (over = {}) => evalFlag(
+    githubFlag,
+    ['tab', 'team', 'githubDisconnect'],
+    Object.entries({
+      tab: 'settings',
+      team: { org_id: 'team_e2e' },
+      githubDisconnect: { open: true, busy: false, error: '', result: null },
+      ...over,
+    }).map(([, v]) => v))
+  assert.equal(githubArmed(), true, 'the literal: an open disconnect dialog on the Settings tab')
+  assert.equal(githubArmed({ tab: 'overview' }), false,
+    'leaving the Settings tab unmounts the card — the flag must clear (page-lockout guard)')
+  assert.equal(githubArmed({ team: null }), false,
+    'an org transition unmounts SettingsTab — the flag must clear (page-lockout guard)')
+  assert.equal(githubArmed({ githubDisconnect: { open: false } }), false, 'closed dialog')
+
+  const accountFlag = constExpr(mainJsx, 'deleteAccountArmed')
+  const accountArmed = (over = {}) => evalFlag(
+    accountFlag,
+    ['tab', 'authMode', 'identityInv', 'deleteAccountOpen'],
+    Object.entries({
+      tab: 'profile',
+      authMode: 'session',
+      identityInv: { login_methods: 1, unsupported: false },
+      deleteAccountOpen: true,
+      ...over,
+    }).map(([, v]) => v))
+  assert.equal(accountArmed(), true, 'the literal: an open Delete-account dialog on Profile')
+  assert.equal(accountArmed({ tab: 'overview' }), false,
+    'leaving the Profile tab unmounts the card — the flag must clear (page-lockout guard)')
+  // The MEASURED one: `fetchIdentity()` re-runs on window focus and fails CLOSED
+  // to `setIdentityInv(null)` — no navigation, no click, dialog gone.
+  assert.equal(accountArmed({ identityInv: null }), false,
+    'an identity read landing null unmounts the card — the flag must clear (page-lockout guard)')
+  assert.equal(accountArmed({ identityInv: { unsupported: true } }), false,
+    'the unsupported-identity arm does not render the card')
+  assert.equal(accountArmed({ authMode: 'apikey' }), false,
+    'the API-key auth mode does not render the card')
+  assert.equal(accountArmed({ deleteAccountOpen: false }), false, 'closed dialog')
 
   // The predicates the flags are built from must be the LIVE ones: a flag that
   // re-implemented the role test locally would pass the scenarios above while
