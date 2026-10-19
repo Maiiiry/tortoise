@@ -109,9 +109,9 @@ class SlackConnector:
         # ``_enrich_source_urls`` spends one ``chat.getPermalink`` call per
         # message, and on a refused batch every one of those calls was spent on
         # records that are then dropped wholesale. Gate first, enrich second.
-        self._enrich_source_urls(events)
         from tortoise.connectors import _gate_kinds
-        _gate_kinds(proj, events, writer="the Slack connector")
+        _gate_kinds(proj, events)
+        self._enrich_source_urls(events)
         count = 0
         for ev in events:
             proj.apply(ev)
@@ -175,7 +175,7 @@ class SlackConnector:
         proj = self.api.get_proj() if self.api else None
         if proj is not None:
             from tortoise.connectors import _gate_kinds
-            _gate_kinds(proj, [ev], writer="the Slack webhook fold")
+            _gate_kinds(proj, [ev])
         if on_event:
             on_event(ev)
         if proj is not None:

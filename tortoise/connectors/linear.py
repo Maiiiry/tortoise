@@ -167,7 +167,7 @@ class LinearConnector:
         """
         events = self.poll()
         from tortoise.connectors import _gate_kinds
-        _gate_kinds(proj, events, writer="the Linear connector")
+        _gate_kinds(proj, events)
         count = 0
         for ev in events:
             proj.apply(ev)

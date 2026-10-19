@@ -310,11 +310,12 @@ class GitHubConnector:
 
         # #9068: the gate — before any write, one approval-set read, both
         # batches. `_gate_kinds` returns the set it decided against so the
-        # second call does not read the graph again.
+        # second call does not read the graph again (and returns the
+        # "not read" sentinel when a batch names no pack, so a bare batch
+        # never pays a whole-graph scan).
         from tortoise.connectors import _gate_kinds
-        writer = "the GitHub connector"
-        approved = _gate_kinds(proj, chain_records, writer=writer)
-        _gate_kinds(proj, poll_events, writer=writer, approved=approved)
+        approved = _gate_kinds(proj, chain_records)
+        _gate_kinds(proj, poll_events, approved=approved)
 
         for entities in chains:
             # Apply Object (ObjectRegistered → FalkorDB)
@@ -396,7 +397,7 @@ class GitHubConnector:
         proj = self.api.get_proj() if self.api else None
         if proj is not None:
             from tortoise.connectors import _gate_kinds
-            _gate_kinds(proj, [ev], writer="the GitHub webhook fold")
+            _gate_kinds(proj, [ev])
         if on_event:
             on_event(ev)
         if proj is not None:
@@ -462,7 +463,7 @@ class GitHubConnector:
                     # and ``hosted_api`` answers it 422 for the same reason —
                     # answer it the same way here.
                     from tortoise.sdk import UnapprovedKindNamespace
-                    if False:
+                    if isinstance(exc, UnapprovedKindNamespace):
                         out = str(exc).encode()
                         logger.warning(
                             "GitHub webhook refused (event=%s): %s",

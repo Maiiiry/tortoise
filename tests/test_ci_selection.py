@@ -262,6 +262,47 @@ def test_the_capacity_guards_derived_source_selects_the_guard():
     )
 
 
+def test_the_engine_pin_guards_are_selected_on_the_files_they_pin():
+    """#9085 review P1: a revert of the engine pin must run the guard that pins it.
+
+    `tests/test_runner_ports_6673.py` is registered `core` and carries BOTH #8124
+    guards that read these two files — the compose sweep (whose `COMPOSE_GLOBS`
+    includes `apps/*/docker-compose*.yml`) and the quickstart hand-out
+    (`test_the_selfhost_quickstart_hands_out_the_compose_pin_not_latest`).
+
+    Neither path was kept by the selector, so a one-line revert of either pin
+    merged green and reddened `main` on the post-merge push (the
+    #1349/#3332/#3616 silent-drop class):
+
+    * `apps/` is in `NON_PYTHON_PREFIXES` and matches no `SOURCE_PATTERNS` row,
+      so the diff filtered to `changed == []` and took the docs-only early
+      return — tier-1 smoke only (measured before the `CORE_ALSO` entries:
+      `surfaces=[]`, the guard absent).
+    * `docs/quickstart-selfhosted.md` matched the `#3329` `docs/` pattern that
+      carries `test_capacity_page.py` (`onboarding`), not `core` (measured:
+      `surfaces=['onboarding']`, the guard absent).
+
+    Asserted on the SURFACE and on the guard FILE, not on non-emptiness: a bare
+    "surfaces is non-empty" check passes on the pre-entry tree for the quickstart
+    (`onboarding` is selected without the guard), which is a gate that can only
+    ever pass. Watched RED before the two `CORE_ALSO` entries, GREEN after.
+    """
+    guard = "test_runner_ports_6673.py"
+    for changed in ("apps/graph-viz/docker-compose.yml",
+                    "docs/quickstart-selfhosted.md"):
+        assert (REPO / changed).exists(), f"pinned file is gone: {changed}"
+        r = _sel([changed])
+        assert "core" in r["surfaces"], (
+            f"{changed} selects {r['surfaces']} — the #8124 engine pin it carries "
+            f"is guarded by a `core`-registered test, so a revert of that pin "
+            f"merges green and reds main after the merge"
+        )
+        assert guard in r["test_files"], (
+            f"{changed} does not select {guard} — nothing checks the engine pin "
+            f"on the one diff that can revert it (selected: {r['test_files']})"
+        )
+
+
 def test_the_onboarding_copy_gate_is_wired_not_left_to_the_tier1_fallback():
     """#3673 indicator (2): the parity gate runs on every PR touching either copy.
 
@@ -1748,6 +1789,62 @@ def test_graph_census_tool_change_selects_core_not_tier1():
     assert r["full"] is False, r
 
 
+def test_write_op_reachability_tool_change_selects_core_not_tier1():
+    # #4495 review P2: tools/write_op_reachability.py is the CLI that reports the
+    # write-op allowance's stock/flow conversion, and its guard
+    # (tests/test_write_op_reachability.py) is `core`+`api` registered.
+    #
+    # `tools/` is a flat NON_PYTHON_PREFIXES entry and no SOURCE_PATTERNS row
+    # matches the tool, so a CLI-only diff came back with `changed == []` and
+    # took the docs-only early return: `select()` returned NO surface, so the
+    # exit-code contract (0 stated-yield / 1 unreachable / 2 not-measurable /
+    # 3 measured-uncertified), the UNCERTIFIED rule and the absence rule would
+    # never run on the PR editing the CLI. Registering the test under `core` does
+    # not help — a name in a surface's test_files only runs when that surface is
+    # already selected. Same #1349/#3332/#3616 silent-drop class as the
+    # tools/graph_census.py case above: an instrument that makes an uncounted
+    # class visible must not be invisible to CI selection itself.
+    #
+    # Measured before the CORE_ALSO entry: `_sel(["tools/write_op_reachability.py"])`
+    # -> surfaces=[], full=False, test_write_op_reachability.py absent.
+    # CORE_ALSO (not TOOL_CARVEOUTS) is the deliberate choice: the guard is
+    # hermetic (synthetic books, a fake SDK) and `core` is where its core arm
+    # lives.
+    # Mutation check: removing the CORE_ALSO entry fails assert 2 below.
+    r = _sel(["tools/write_op_reachability.py"])
+    assert "core" in r["surfaces"], r
+    assert "test_write_op_reachability.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
+def test_write_op_reachability_guard_runs_on_every_surface_it_pins():
+    # #4495 review P1: tests/test_write_op_reachability.py pins THREE modules and
+    # they do not all select the same surface — so a single registration arm is
+    # inert for part of the file:
+    #
+    #   tortoise/pricing.py            -> core  (no SOURCE_PATTERNS row)
+    #   tortoise/metering.py           -> api   (exact SOURCE_PATTERNS["api"])
+    #   tortoise/supabase_control.py   -> api   (exact SOURCE_PATTERNS["api"])
+    #
+    # A named-surface match REPLACES the `core` fallback, so with a `core`-only
+    # registration a metering.py-only PR (the `get_write_op_yield` attribution
+    # rule) or a supabase_control.py-only PR (the counters reader) selected `api`
+    # and never ran this guard — the #2938/#3154/#4367 silent-drop class, and the
+    # same lesson test_supabase_control_change_selects_the_org_purge_rpc_guard
+    # records. Hence DUAL registration.
+    # Mutation check: deleting the `api` arm fails the loop below; deleting the
+    # `core` arm fails the pricing.py assert.
+    for api_source in ("tortoise/metering.py", "tortoise/supabase_control.py"):
+        r = _sel([api_source])
+        assert r["full"] is False, (api_source, r)
+        assert "api" in r["surfaces"], (api_source, r)
+        assert "test_write_op_reachability.py" in r["test_files"], (api_source, r)
+    r = _sel(["tortoise/pricing.py"])
+    assert r["full"] is False, r
+    assert "core" in r["surfaces"], r
+    assert "test_write_op_reachability.py" in r["test_files"], r
+
+
 def test_orchestrator_harness_change_selects_core_not_tier1():
     # operations/orchestrator-harness/*.sh own tests/test_orchestrator_harness.py
     # (`core`): the shipped-block pins for lane.sh's heredoc, merged-not-closed.sh's
@@ -1915,6 +2012,64 @@ def test_source_currency_tool_change_selects_core_not_tier1():
     assert "core" in r["surfaces"], r
     assert "test_source_currency_5581.py" in r["test_files"], r
     assert set(r["test_files"]) != _tier1()
+
+
+def test_cost_coverage_audit_tool_change_selects_core_not_tier1():
+    # #5045 review P1: tools/cost_coverage_audit.py IS the instrument the
+    # cost-dimension registry rests on, and tests/test_cost_dimensions.py is the
+    # only thing that pins it (`core` + `api` registered). Without the CORE_ALSO
+    # entry the flat "tools/" NON_PYTHON_PREFIXES entry swallowed the path, so a
+    # tool-only change selected NO surface and fell back to tier-1 smoke — whose
+    # 46-file set does not contain the pin. Measured before the entry:
+    # `select(["tools/cost_coverage_audit.py"])` -> surfaces=[], full=False,
+    # test_cost_dimensions.py absent, so DELETING a check from `audit()` (or
+    # narrowing `_NOT_PRODUCTION`, or restoring a predicate the module argues
+    # against) merged green: the registry quietly stopped being verified on the
+    # one PR class that can weaken it. Same #1349/#3332/#3616 silent-drop class
+    # as tools/drift-guard.py and tools/test_lane.py above.
+    # Mutation check: removing the CORE_ALSO entry fails the asserts below.
+    r = _sel(["tools/cost_coverage_audit.py"])
+    assert r["full"] is False, r
+    assert "core" in r["surfaces"], r
+    assert "test_cost_dimensions.py" in r["test_files"], r
+    assert set(r["test_files"]) != _tier1()
+
+
+def test_cost_dimension_ledger_migrations_select_core():
+    # #5045 review P1 (the ledger half): `check_ledger` verifies the declared
+    # columns and SQL functions against the migration TEXT, and `supabase/` is a
+    # flat NON_PYTHON_PREFIXES entry — so a migration-only change that renames a
+    # metering column or an RPC selected NO surface and the ledger check never ran
+    # on the file carrying the DDL it verifies (the #8744 shape). The doc that
+    # states what the audit enforces is the same kind of subject: a docs-only edit
+    # of it selected nothing, so its claims could drift from the audit's code with
+    # every pin green.
+    #
+    # Mutation check: removing any of these CORE_ALSO entries fails its arm.
+    root = Path(__file__).resolve().parents[1]
+    for changed in (
+        "supabase/migrations/0014_metering_records.sql",
+        "supabase/migrations/20260813000002_metering_nodes_written.sql",
+        "supabase/migrations/20260829000001_metering_ask_columns.sql",
+        "supabase/migrations/20260915000001_tenancy_team_to_org.sql",
+        "supabase/migrations/20260917000001_metering_capture_cost.sql",
+        "supabase/migrations/20260918000001_metering_period_window.sql",
+        "supabase/migrations/20260927000001_metering_unmetered_increments.sql",
+        "supabase/migrations/20261001000001_metering_capture_tokens.sql",
+        "supabase/migrations/20261001000004_metering_embedding_columns.sql",
+        "supabase/migrations/20261001000005_metering_graph_storage.sql",
+        "supabase/migrations/20261010000001_metering_period_end_refresh.sql",
+        "supabase/migrations/20261013000001_metering_retrieval_columns.sql",
+        "docs/ops/cost-dimensions.md",
+    ):
+        assert (root / changed).exists(), f"guarded ledger subject is gone: {changed}"
+        r = _sel([changed])
+        assert r["full"] is False, (changed, r)
+        assert "core" in r["surfaces"], (changed, r)
+        assert "test_cost_dimensions.py" in r["test_files"], (
+            f"a change to {changed} does not run tests/test_cost_dimensions.py, so "
+            "the ledger gate cannot fire on the DDL it verifies (#5045 review)"
+        )
 
 
 def test_test_lane_tool_change_selects_core_not_tier1():

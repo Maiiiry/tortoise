@@ -44,14 +44,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tortoise import migrate_kinds, pipeline as P  # noqa: I001
 from tortoise.pack_state import (
-    _KIND_PROP_ALIASES,
+    _KIND_PROP_SPELLINGS,
     _LABEL_SCOPED_KIND_KEYS,
     _ONTOLOGY_LABELS,
     graph_installed_namespaces,
     graph_kind_namespaces,
-    record_names_a_pack,
-    refuse_unapproved_kinds_in_records,
-    unapproved_kinds_in_record,
+    payload_names_pack,
+    refuse_unapproved_kinds_in_payload,
+    unapproved_kind_refusal,
 )
 from tortoise.sdk import TortoiseSDK, UnapprovedKindNamespace
 
@@ -193,6 +193,22 @@ class TestGenericKindIsNotAnOntologyKind:
             "treated as ontology carriers")
 
 
+def _unapproved(record: dict, approved):
+    """The refusals ``record`` would raise, one per offending spelling.
+
+    A thin TEST-SIDE view over ``pack_state``'s own gate — ``payload_names_pack``
+    (the walk + cheap pre-check) and ``unapproved_kind_refusal`` (the decision
+    and its message) — so these assertions read the SHIPPED predicate rather
+    than re-deriving one.
+    """
+    out = []
+    for prop, kind in payload_names_pack(record):
+        exc = unapproved_kind_refusal(prop, kind, approved)
+        if exc is not None:
+            out.append(exc)
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 2. The record predicate — what a fold would write, by canonical prop
 # ══════════════════════════════════════════════════════════════════════════
@@ -205,22 +221,23 @@ class TestUnapprovedKindsInRecord:
         ``objectKind`` — the property the mining leg then reads. A gate that
         screened only camel spellings would let this through.
 
-        FAIL-ON: ``_KIND_PROP_ALIASES`` stops being consulted, so the record
-        reads clean while its fold widens the set.
+        FAIL-ON: the snake spellings stop being consulted
+        (``_KIND_PROP_SPELLINGS``), so the record reads clean while its fold
+        widens the set.
         REACHABLE: the camel twin is asserted too, so the alias case is
         distinguished from a blanket "everything is caught".
         """
         approved = frozenset({DEV})
-        via_alias = unapproved_kinds_in_record(
+        via_alias = _unapproved(
             {"type": "ObjectRegistered", "object_kind": f"{MARKETING}:campaign"},
             approved)
         assert [(o.prop, o.kind, o.namespace) for o in via_alias] == [
             ("objectKind", f"{MARKETING}:campaign", MARKETING)], (
             "the alias must be reported under the prop the fold will persist")
-        via_camel = unapproved_kinds_in_record(
+        via_camel = _unapproved(
             {"objectKind": f"{MARKETING}:campaign"}, approved)
         assert [o.prop for o in via_camel] == ["objectKind"]
-        assert set(_KIND_PROP_ALIASES) >= {
+        assert set(_KIND_PROP_SPELLINGS) >= {
             "object_kind", "subject_kind", "document_kind"}
 
     def test_bare_core_and_uses_legs(self):
@@ -234,11 +251,11 @@ class TestUnapprovedKindsInRecord:
         value, so both directions are observed on one call.
         """
         approved = frozenset({DEV})
-        assert unapproved_kinds_in_record(
+        assert _unapproved(
             {"objectKind": "other", "eventKind": "deployment"}, approved) == []
-        assert unapproved_kinds_in_record(
+        assert _unapproved(
             {"objectKind": f"{DEV}:epic"}, approved) == []
-        offenders = unapproved_kinds_in_record(
+        offenders = _unapproved(
             {"uses": [{"name": "x", "kind": f"{MARKETING}:campaign"}]}, approved)
         assert [(o.prop, o.namespace) for o in offenders] == [(
             "objectKind", MARKETING)]
@@ -254,8 +271,12 @@ class TestUnapprovedKindsInRecord:
         empty result comes from the ``None`` arm and not from a clean record.
         """
         record = {"objectKind": f"{MARKETING}:campaign"}
-        assert unapproved_kinds_in_record(record, None) == []
-        assert unapproved_kinds_in_record(record, frozenset({DEV})), (
+        assert _unapproved(record, None) == []
+        # The SHIPPED door agrees: `approved=None` admits, a real set refuses.
+        refuse_unapproved_kinds_in_payload(record, None)
+        with pytest.raises(UnapprovedKindNamespace):
+            refuse_unapproved_kinds_in_payload(record, frozenset({DEV}))
+        assert _unapproved(record, frozenset({DEV})), (
             "control: the same record must be refused against a set")
 
     def test_the_pre_check_spends_no_graph_read(self):
@@ -273,23 +294,32 @@ class TestUnapprovedKindsInRecord:
         REACHABLE: the SAME handle IS reached for a namespaced record, so the
         absence of a read above is the pre-check and not a broken fake.
         """
-        class _Exploding:
-            def query(self, *args, **kwargs):
-                raise AssertionError(
-                    "the approval set was read for a record naming no pack")
 
-        assert record_names_a_pack({"objectKind": "other",
-                                    "eventKind": "deployment"}) is False
-        accept = refuse_unapproved_kinds_in_records  # the door's own entry
-        accept(_Exploding(), [{"objectKind": "other",
-                               "eventKind": "deployment"}], writer="test")
+        assert payload_names_pack({"objectKind": "other",
+                                   "eventKind": "deployment"}) == ()
+        # The batch door's own entry, on the SAME exploding handle: a batch
+        # naming no pack must clear the pre-check (and so never read the set).
+        from tortoise.connectors import _READ_THE_SET, _gate_kinds
+        assert _gate_kinds(_ExplodingProj(), [{"objectKind": "other",
+                                               "eventKind": "deployment"}]
+                           ) is _READ_THE_SET
 
-        assert record_names_a_pack({"object_kind": f"{MARKETING}:x"}) is True
-        assert record_names_a_pack(
-            {"uses": [{"name": "x", "kind": f"{MARKETING}:x"}]}) is True
+        assert payload_names_pack({"object_kind": f"{MARKETING}:x"}) == (
+            ("objectKind", f"{MARKETING}:x"),)
+        assert payload_names_pack(
+            {"uses": [{"name": "x", "kind": f"{MARKETING}:x"}]}) == (
+            ("objectKind", f"{MARKETING}:x"),)
         with pytest.raises(AssertionError):
-            accept(_Exploding(), [{"object_kind": f"{MARKETING}:x"}],
-                   writer="test")
+            _gate_kinds(_ExplodingProj(), [{"object_kind": f"{MARKETING}:x"}])
+
+
+class _ExplodingProj:
+    """A projection whose graph READ raises — pins "no read" as an absence."""
+
+    @property
+    def g(self):
+        raise AssertionError(
+            "the approval set was read for a batch naming no pack")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -636,7 +666,7 @@ class TestPropsDoorsScreenTheFoldAliases:
         ``pm`` installed by a write, from the SDK's own public door.
 
         FAIL-ON: ``_refuse_unapproved_kinds_in_props`` drops its
-        ``_KIND_PROP_ALIASES`` leg, so the snake spelling folds and widens.
+        ``_KIND_PROP_SPELLINGS`` leg, so the snake spelling folds and widens.
         REACHABLE: an Object node really lands through the same door for a
         bare alias right after (CONTROL), so the refusal is the gate and not a
         broken funnel; and the alias value is the production spelling the fold
@@ -885,20 +915,44 @@ class TestGateCostOnTheHotPaths:
         """
         from tortoise.connectors import _READ_THE_SET, _gate_kinds
 
-        class _ExplodingProj:
-            @property
-            def g(self):
-                raise AssertionError(
-                    "the approval set was read for a batch naming no pack")
-
         bare = [{"type": "EventRecorded", "eventKind": "github.issue.opened",
                  "sourceKind": "github_issue", "objectKind": "other"}]
-        assert _gate_kinds(_ExplodingProj(), bare, writer="test") is _READ_THE_SET, (
+        assert _gate_kinds(_ExplodingProj(), bare) is _READ_THE_SET, (
             "the sentinel must pass through unchanged: a batch that read "
             "nothing may not hand the next batch a resolved set")
         with pytest.raises(AssertionError):
-            _gate_kinds(_ExplodingProj(),
-                        [{"object_kind": f"{MARKETING}:x"}], writer="test")
+            _gate_kinds(_ExplodingProj(), [{"object_kind": f"{MARKETING}:x"}])
+
+    def test_one_record_handed_as_a_dict_is_gated_not_read_as_keys(
+            self, tmp_path):
+        """Review P2: the batch form must not fail OPEN on the singular shape.
+
+        ``_gate_kinds`` filters ``isinstance(r, dict)``, so a bare DICT passed
+        where a LIST is expected iterates its STRING KEYS, every one filtered
+        out — the gate then refuses nothing and silently admits the whole
+        record. That is the shape the singular ``kind_spellings_in_payload``
+        invites, on a security door.
+
+        FAIL-ON: the dict is iterated as a sequence, so ``_gate_kinds`` returns
+        the sentinel and the namespaced ``sourceKind`` is never screened.
+        REACHABLE: an EMPTY batch still short-circuits below (so the fix is the
+        dict shape, not an always-on graph read), and the live arm resolves
+        against a real ``{dev}`` graph rather than a fake.
+        """
+        from tortoise.connectors import _READ_THE_SET, _gate_kinds
+
+        record = {"type": "EventRecorded", "eventId": "sl-9068b",
+                  "eventKind": "slack.message",
+                  "sourceKind": f"{MARKETING}:slack_message"}
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        proj = sdk._get_proj()
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            _gate_kinds(proj, dict(record))
+        assert MARKETING in str(excinfo.value)
+        assert _gate_kinds(proj, []) is _READ_THE_SET, (
+            "an EMPTY batch stays a no-op — the fix is the dict shape, not an "
+            "always-on graph read")
 
     def test_slack_ingest_gates_before_the_network_enrichment(
             self, tmp_path, force_embedder_on):
@@ -960,3 +1014,40 @@ class TestUngatedReTypingIsStated:
             "the statement must say WHAT makes it acceptable (an operator act)")
         assert "deliberate" in module_src.lower()
         assert "raw Cypher" in module_src
+
+    def test_retype_states_that_it_is_offline_and_validates_by_vocabulary(self):
+        """The OTHER deliberately-ungated re-typing writer, pinned as stated.
+
+        ``migrate_kinds`` is the live half; ``tortoise/retype.py`` is the
+        offline half (``tools/retype_snapshot.py`` is its CLI). Nothing here
+        gates it because it never touches a live graph — so the *reason* is the
+        whole guarantee, and it has to survive review rather than live in a PR
+        description. Until this test the file's doctrine ("the statement is
+        pinned here as well as written in the modules") covered only
+        ``migrate_kinds``: deleting retype's reason left the file green.
+
+        FAIL-ON: the offline/vocabulary contract is dropped from the module —
+        a reader then sees a re-typing writer with no graph and no gate and has
+        nothing telling them why that is safe (or whether it is).
+        REACHABLE: it reads the REAL source of the module that performs the
+        rewrite and requires the two properties that make it safe: it is
+        offline (no graph connection, no writes) and it REFUSES an
+        off-vocabulary kind (``RetypeError``), which is the validation that
+        stands in for a gate here.
+        """
+        from tortoise import retype
+
+        module_src = inspect.getsource(retype)
+        assert "Offline re-typing" in module_src
+        assert "no graph connection, no writes" in module_src, (
+            "the reason this writer needs no gate is that it holds no graph")
+        assert "Kind legality" in module_src, (
+            "the vocabulary check is what replaces the gate — it must be "
+            "stated, not implied")
+        assert "RetypeError" in module_src
+        # The CLI wrapper is where an operator would accidentally point it at a
+        # live graph, so the offline promise must be stated THERE too.
+        cli_src = (Path(__file__).resolve().parent.parent
+                   / "tools" / "retype_snapshot.py").read_text()
+        assert "offline" in cli_src.lower(), (
+            "the CLI's own help must say it works on a dump, offline")

@@ -6918,18 +6918,18 @@ class TortoiseSDK:
         append failed. Folding anyway would put the DERIVED store ahead of the
         journal on a failed append — window (a) of the contract, the one a
         replay cannot undo.
-
-        #9068: the #5475 INPUT CONSTRAINT runs here too, on the record itself
-        (``_refuse_unapproved_kinds_in_record``), BEFORE the append. This door
-        is the GitHub indexer's write path
-        (``indexer/github_indexer.py`` → ``issue_to_object`` carries
-        ``object_kind='pm:issue'``), so leaving it ungated let the polling
-        entry point most callers actually use install ``pm`` on a ``dev``-only
-        graph — the same defect #9068 closed for the connectors, one file
-        over. Gating at the CHOKEPOINT (not at each caller) also covers the
-        ``-created`` Event the indexer mints from the same record family.
         """
-        self._refuse_unapproved_kinds_in_record(proj, event)
+        # ── #5475 (residual): the record door is a WRITE door ──
+        # This is where a caller holding a PRE-BUILT record persists it, and the
+        # record carries its kind in its own spelling (``eventKind`` /
+        # ``object_kind``). It bypasses the create funnels by construction — the
+        # GitHub indexer's provenance writes are its callers — so without this
+        # it was one more way to install a pack (measured on the same class:
+        # ``['dev']`` → ``['dev','marketing']`` via one ``object_kind`` record).
+        # Before the append, so a refusal leaves the journal untouched and the
+        # replay cannot resurrect it. Gated against `proj`'s graph — the write
+        # TARGET — not this SDK's bound graph (see the reader's docstring).
+        self._refuse_unapproved_kinds_in_record(event, getattr(proj, "g", None))
         if journal:
             # (#7951 P1-b) Mirror `_create_entity`'s `createdAt` synthesis on
             # the journaling path, BEFORE the append (so the record and the
@@ -10735,15 +10735,18 @@ class TortoiseSDK:
         """
         proj = self._get_proj()
         _coerce_props(props)  # accept MCP-style nested props= dict (#218)
+        # ── #5475 (residual): an UPDATE is a WRITE, and it widened the set ──
+        # The create-side gate is at the funnels every CREATE meets, but
+        # ``pointKind`` is one of the properties ``graph_kind_namespaces``
+        # MINES, so an update that persists an unvalidated value installs the
+        # pack just as a create did — measured at HEAD: a graph recorded as
+        # ``['dev']`` became ``['dev','marketing']`` through this door alone.
+        # Gating creates and not updates left the closure property one verb
+        # away from true, which is the defect #5475 is about.
+        self._refuse_unapproved_kinds_in_props(props)
         # #329: id mutation + server-managed fields rejected
         props = _sanitize_props(props, reject_id=True,
                                 reject_belief_props=True)
-        # #9068: the props this update is about to `SET n +=` go through the
-        # SAME #5475 input constraint as creation — `_sanitize_props` rejects
-        # only reserved envelope/actor/belief names, so
-        # `update_point(id, pointKind='marketing:x')` used to reach the SET and
-        # widen the graph's approved set (a mined property is a mined property
-        # on the update path too).
         # R2 (#1541) D3: search_keys is stored flat (see _flatten_search_keys_prop).
         _flatten_search_keys_prop(props)
         # E4 (#5007): same rule as `create_point` / the `Point` model — an
@@ -18434,12 +18437,14 @@ class TortoiseSDK:
         for pid in point_ids:
             p = self.get_point(pid)
             before[pid] = p.get("confidence", 0.5) if p else 0.5
-        # #344: conscious opt-out from the fail-closed gate — the gate is
-        # graph-wide (no anchors/factors are passed, so it would audit every
-        # evidence point); this run's epistemic content is fully carried by
-        # the Beta(10,1) evidence prior on the decision Point; the approval
-        # path deliberately opts out (never a silent swallow; the gate stays
-        # on for every explicit compute_confidence()).
+        # #344: conscious opt-out from the fail-closed gate. #7739 scoped the
+        # no-arg gate to the dirty roots and their closure (it is no longer
+        # graph-wide), and this call still passes no anchors/factors — but the
+        # opt-out stands on its own reason, not on the old scope: this run's
+        # epistemic content is fully carried by the Beta(10,1) evidence prior
+        # on the decision Point, so there is no uncalibrated evidence input to
+        # demand. Deliberate, never a silent swallow, and it does not relax the
+        # gate for any other caller: each one opts out explicitly or not at all.
         self.compute_confidence(evidence={decision_id: (10, 1)},
                                 require_calibration=False)
         deltas = {}
@@ -19324,6 +19329,15 @@ class TortoiseSDK:
         # ``ep_prior_only_cypher`` so a #2199 baseline cannot read contested
         # there either; only the genuinely UNMEASURED (no persisted prior)
         # listing remains get_contested_claims' deliberate divergence.
+        # #7927: a SECOND divergence now exists, and it is also deliberate —
+        # get_contested_claims sweeps the four epistemic labels (#7813) and
+        # lists a MEASURED :Subject/:Object/:Event belief, while this scan is
+        # ``MATCH (n:Point)`` and therefore cannot. Do not "harmonize" that
+        # either without deciding which surface the entity belongs on: this
+        # scan feeds the PR prune (Point rewiring), not the belief report.
+        # The claim leg below keeps its own pre-#7927 ``n.is_operator = false``
+        # — the same bare form the widened scans replaced — so it is
+        # unchanged by that widening.
         contested: dict[str, dict] = {}
         rows = proj.g.query(
             "MATCH (n:Point) "
@@ -20194,13 +20208,18 @@ class TortoiseSDK:
                   mode="full" ONLY when ``mode`` is None (I1 rule 2).
             max_hops: EP subgraph expansion (keep ≥2 — contract with
                       _mark_dirty).
-            require_calibration: gate the EP run on calibration state —
-                  raises CalibrationError when evidence-kind points are
-                  uncalibrated (#1157). None (default) resolves to the shared
-                  posture, TORTOISE_EP_REQUIRE_CALIBRATION (default True —
-                  fail-closed, post-#344; set it to "0" to opt out). Dream
-                  WRITES n.confidence,
-                  so it must never silently run uncalibrated EP (#7478).
+            require_calibration: gate the EP run on calibration state.
+                  ``mode="local"`` scopes the gate to the seeds the pass hands
+                  ``ep.run`` plus the dirty roots (#7739) — an unrelated point
+                  elsewhere in the graph does not refuse the drain.
+                  ``full`` stays whole-graph by contract and ``stale-first``
+                  keeps the whole-graph posture (its window is chosen inside
+                  the pass), so those two still refuse a foreign point.
+                  None (default) resolves to the shared posture,
+                  TORTOISE_EP_REQUIRE_CALIBRATION (default True — fail-closed,
+                  post-#344; set it to "0" to opt out). Dream WRITES
+                  n.confidence, so it must never silently run uncalibrated EP
+                  (#7478).
             stamp_dreamed_at: when False, the pass never writes
                   lastDreamedAt (epic 903-C2) — the read-triggered
                   lazy-consistency paths (get_confidence /
@@ -20272,22 +20291,38 @@ class TortoiseSDK:
         # (persists n.confidence); same posture as compute_confidence.
         if require_calibration is None:
             require_calibration = _ep_require_calibration_default()
-        if require_calibration:
-            self._ensure_calibrated("dream")
         # #1163 (multi-process EP): merge graph-persisted dirty roots into
         # the in-memory set so a fresh SDK (HTTP request scope, hosted dream
         # worker) runs the same local EP the writing process would (the W1
         # write-context rule below then resolves to local). Best-effort and
         # skipped when the in-memory set already covers the state.
+        #
+        # #7739: hydration now runs BEFORE the gate, because the gate's scope
+        # depends on the roots the resolved mode will seed (and the mode's
+        # own auto-selection depends on them). Still fail-closed BEFORE any
+        # EP work below.
         self._hydrate_dirty_roots()
         resolved = self._resolve_dream_mode(mode, full)
+        if require_calibration and resolved != "local":
+            # #7739 boundary, deliberate: ``full`` is whole-graph by contract,
+            # and a ``stale-first`` window is selected INSIDE the pass
+            # (Dreamer.dream_window), so deriving its scope here would be a
+            # second copy of the scheduler's derivation — exactly the
+            # gate/run drift #7739 removes. Both keep the pre-#7739 posture.
+            #
+            # ``local`` is gated INSIDE ``_dream_local`` instead: its scope is
+            # the SEED SET the pass hands to ``ep.run``, known only after the
+            # pass selects operators (``ep.run`` re-expands ``max_hops`` from
+            # them — see ``Dreamer.dream(before_run=…)``).
+            self._ensure_calibrated("dream")
         if budget is not None and budget <= 0:
             # I1: budget=0 → no-op result, not an error. No EP, no stamps.
             return self._dream_noop(resolved)
         dreamer = self._get_dreamer()
         if resolved == "local":
             return self._dream_local(dreamer, max_hops, stamp_dreamed_at,
-                                     budget, warm_start)
+                                     budget, warm_start,
+                                     require_calibration=require_calibration)
         if resolved == "stale-first":
             return self._dream_stale_first(dreamer, max_hops, budget,
                                            warm_start)
@@ -20523,8 +20558,19 @@ class TortoiseSDK:
         self._dream_metrics["last_pass_no_op_reason"] = "no_ep_factors"
 
     def _dream_local(self, dreamer, max_hops: int, stamp_dreamed_at: bool,
-                     budget: int | None, warm_start: bool = True) -> dict:
+                     budget: int | None, warm_start: bool = True, *,
+                     require_calibration: bool) -> dict:
         """Local mode (W1): EP over the dirty roots. I1 local key-set.
+
+        ``require_calibration`` (#7739) installs the shared calibration gate as
+        the pass's own ``before_run`` hook: it is evaluated on the SEED IDS the
+        selector chose for ``ep.run`` — not on the roots' own closure, which is
+        NARROWER than the run (``ep.run`` re-expands ``max_hops`` from those
+        seeds; measured one extra hop at ``max_hops=3``). The roots are added to
+        the scope explicitly because a root is a point this pass was asked to
+        recompute and ``_affected_claims``'s factor-participant rule (#5566)
+        would otherwise drop a root that forms no factor. The gate fires before
+        any EP work, so a raise leaves the graph untouched.
 
         Dirty-root clearing keeps the #395-era retention semantics (roots in
         the affected set are cleared; roots OUTSIDE the dreamed subgraph
@@ -20547,11 +20593,23 @@ class TortoiseSDK:
             dreamer._last_selection_stats = {}
             return {"mode": "local", "iterations": 0, "converged": True,
                     "affected_claims": [], "budget_used": 0, "coverage": 0.0}
+
+        def _gate(seed_ids: list[str]) -> None:
+            # #7739: scope = every point this pass can consume — the seeds
+            # ``ep.run`` receives plus everything reachable from them at
+            # ``max_hops``, unioned with the roots (which the run seeds and
+            # ``_affected_claims`` may not admit, #5566).
+            self._ensure_calibrated(
+                "dream",
+                scope=lambda: set(anchors)
+                | self._ep_run_scope(seed_ids, max_hops))
+
         result = dreamer.dream(
             anchors, max_hops=max_hops,
             stamp_dreamed_at=stamp_dreamed_at,
             op_cap=budget if budget is not None else 200,
             warm_start=warm_start,
+            before_run=_gate if require_calibration else None,
         )
         affected = set(result.get("affected_claims", []))
         # #3139: fail closed BEFORE any dirty-root mutation — a silent no-op
@@ -20924,7 +20982,7 @@ class TortoiseSDK:
                          include_draft: bool = False,
                          stats: dict | None = None
                          ) -> tuple[list[str], set[tuple[str, str, str]]]:
-        """BFS subgraph selection from anchor Points — A9 return contract.
+        """BFS subgraph selection from anchor epistemic nodes — A9 return contract.
 
         Delegates to the shared _bfs_select_operators in tortoise.analyze.
         Returns ``(operator_ids, factor_anchors)`` — the operator Point IDs
@@ -20935,12 +20993,20 @@ class TortoiseSDK:
         to operator nodes, GATE-2 Q3). With include_draft=False (default,
         #780) draft anchors, operators and frontier points are excluded.
 
+
         ``stats`` (#6211): OPTIONAL out-parameter, filled by the selector with
         ``truncated`` / ``operators_seen`` / ``operators_used`` / ``op_cap``.
         The return tuple is unchanged, so every existing caller (the dreamer,
         the calibration scope probe) is unaffected; only a caller that does not
         own the operator cap passes it — ``compute_confidence`` — which needs
         the cap in its RESULT, not on stderr.
+
+
+        #7927: an anchor may be any of ``live.EPISTEMIC_LABELS``
+        (:Point/:Subject/:Object/:Event, owner ruling #7813) — the widening
+        lives in the shared selector, so this surface inherits it rather than
+        re-spelling a label predicate (pinned by
+        ``tests/test_7927_epistemic_read_surfaces.py``).
         """
         from .analyze import _bfs_select_operators
         proj = self._get_proj()
@@ -21036,7 +21102,10 @@ class TortoiseSDK:
             rel_filter: edge types for BFS — "IMPL", "NAND", or "IMPL|NAND" (default).
             direction: IMPL edge traversal direction — "incoming", "outgoing", or "both" (default).
             require_calibration: fail-closed gate — raises CalibrationError
-                when evidence points are uncalibrated. None (default) resolves
+                when an uncalibrated evidence point the SELECTION can consume
+                is found (anchors/factors: the run's consumed set; no-arg: the
+                dirty roots and their closure, #7739) — not for an unrelated
+                point elsewhere in the graph. None (default) resolves
                 to the shared TORTOISE_EP_REQUIRE_CALIBRATION posture
                 (default "1" → True fail-closed, post-#344). Pass False
                 explicitly to opt out and run EP on topology alone (the #7478
@@ -21081,8 +21150,8 @@ class TortoiseSDK:
             require_calibration = _ep_require_calibration_default()
         # #7739: the gate runs AFTER the selection (below), against the SAME
         # selection the run consumes — but still fail-closed BEFORE ep.run().
-        # The no-arg (dirty-roots) branch below keeps the whole-graph scope:
-        # it has no selection to derive and its behaviour is unchanged here.
+        # The no-arg (dirty-roots) branch below is scoped the same way, to the
+        # dirty roots and their closure.
         if factors is not None:
             operator_ids = [f if isinstance(f, str) else f[0] for f in factors]
             if not operator_ids:
@@ -21129,27 +21198,38 @@ class TortoiseSDK:
             iterations, converged = ep.run(
                 operator_ids, max_hops=max_hops, evidence=run_evidence)
         else:
-            # #7739: this path has no computed selection (the run set is the
-            # dirty roots), so the gate keeps its pre-#7739 WHOLE-GRAPH scope.
-            # Unchanged here, and gated before _hydrate_dirty_roots so the
-            # raise fires before the no-dirty-roots early return, exactly as
-            # the pre-#7739 gate did.
+            # #7739: the no-arg path's selection is the dirty roots and their
+            # closure, so the gate is scoped to exactly that — a foreign
+            # uncalibrated point (another lane's) no longer freezes a caller
+            # whose own run reaches nothing that is uncalibrated. Roots are
+            # captured BEFORE the gate so the scope and the run below seed the
+            # SAME set; they are also included in the scope explicitly because
+            # a root is a point this run was asked to recompute, and
+            # ``_affected_claims``'s factor-participant rule (#5566) drops a
+            # root that forms no factor.
+            #
+            # Ordering (unchanged in effect): hydration runs first because it
+            # supplies the roots; a graph with no dirty roots still returns
+            # ``no_dirty_roots`` without gating — a run that consumes nothing
+            # cannot be frozen by calibration. #1163 (multi-process EP): the
+            # hydration is what lets a fresh request-scoped SDK run the same
+            # local EP the writing process would (the HTTP no-arg acceptance).
+            self._hydrate_dirty_roots()
+            roots = list(self._dirty_roots)
+            if not roots:
+                return _report({"iterations": 0, "converged": True,
+                                "confidences": {}, "diagnostic": "no_dirty_roots"})
             if require_calibration:
-                self._ensure_calibrated("compute_confidence")
+                self._ensure_calibrated(
+                    "compute_confidence",
+                    scope=lambda: set(roots)
+                    | self._ep_run_scope(roots, None))
             # ── No-arg (#395 AC8 + delta C): LOCAL EP over the affected
             # subgraph — dirty roots seed a max_hops=None run over the exact
             # affected closure; NO global extract_svbp_factors() scan (AC2 —
             # the epic-903 refactor regressed this no-arg path to a
             # whole-graph extract+run; restored to the #395 local contract,
             # #1162). Clean graph → 'no_dirty_roots' (AC8).
-            # #1163 (multi-process EP): hydrate graph-persisted dirty roots
-            # first — a fresh request-scoped SDK must run the same local EP
-            # the writing process would (the HTTP no-arg acceptance).
-            self._hydrate_dirty_roots()
-            roots = list(self._dirty_roots)
-            if not roots:
-                return _report({"iterations": 0, "converged": True,
-                                "confidences": {}, "diagnostic": "no_dirty_roots"})
             # Bounded fail-safe pass (dream, max_hops=2) FIRST — preserves the
             # dirty-clear/retry lifecycle (#85); then the exact local pass
             # (max_hops=None). Roots are captured BEFORE the dream so the
@@ -21521,7 +21601,10 @@ class TortoiseSDK:
         Calibration posture (#1157): the lazy dream path WRITES n.confidence
         and the read returns belief numbers — both must be gated on
         calibration like compute_confidence. require_calibration=True raises
-        CalibrationError when evidence-kind points are uncalibrated; None
+        CalibrationError when THIS CLAIM is uncalibrated (the read puts only
+        this claim in a natural parameter, #7739) and, when the claim is a
+        dirty root, when the lazy dream consumes an uncalibrated point — never
+        for an unrelated point elsewhere in the graph. None
         (default) resolves to the shared TORTOISE_EP_REQUIRE_CALIBRATION
         posture (default True — fail-closed, post-#344; set
         TORTOISE_EP_REQUIRE_CALIBRATION to "0" to opt out).
@@ -21529,7 +21612,16 @@ class TortoiseSDK:
         if require_calibration is None:
             require_calibration = _ep_require_calibration_default()
         if require_calibration:
-            self._ensure_calibrated("get_confidence")
+            # #7739: the read itself consumes exactly ONE claim —
+            # ``ep.compute_confidence`` just reads that node's params — so the
+            # gate is scoped to the claim. Scoping it to the claim's NEIGHBOUR
+            # HOOD would over-block: a connected point the read never puts in
+            # a natural parameter would freeze a per-claim read. When the claim
+            # is a dirty root, the lazy dream below runs EP over the dirty
+            # roots and gates ITSELF on the seeds it will consume (fail-closed
+            # where it matters). An uncalibrated CLAIM still raises: narrowing
+            # the scope never excuses the thing asked for.
+            self._ensure_calibrated("get_confidence", scope={claim_id})
         if claim_id in self._dirty_roots:
             self.dream(dirty_only=True,
                        require_calibration=require_calibration,
@@ -22257,8 +22349,14 @@ class TortoiseSDK:
                 only when the graph already has at least one uncalibrated
                 evidence point — so a fully calibrated graph (the common
                 case) pays NOTHING for scoping. ``None`` (default) keeps the
-                whole-graph posture for callers without a computed selection
-                (dream, get_confidence, the no-arg compute_confidence path).
+                whole-graph posture where that is the honest answer: a
+                ``full`` dream consumes the whole graph by contract, and a
+                ``stale-first`` window is chosen INSIDE the pass, so a
+                gate-side copy of its selection would be a second derivation
+                of the same window (the gate/run drift #7739 removes).
+                Every other EP surface passes a scope — anchored/factor
+                ``compute_confidence``, the no-arg dirty-roots path,
+                ``dream(mode="local")``, and ``get_confidence``.
                 An EMPTY set is a real scope (nothing reachable → nothing to
                 gate) and is never treated as ``None``.
         """
@@ -22759,6 +22857,15 @@ class TortoiseSDK:
         branches) while the new path short-circuits the embedding to None —
         the SAME flag, different Event semantics on two live paths.
         """
+        # ── #5475 (residual): ``eventKind`` is CALLER-SUPPLIED here ──
+        # This FROZEN legacy branch writes it with a raw ``MERGE … SET e +=
+        # $props`` further down, bypassing every gated seam — so the approval
+        # gate is applied HERE, before the walk. Measured by the review of the
+        # #5475 change: ``ingest_corpus(dir, eventKind='marketing:meeting')`` on
+        # a ``dev``-only graph left ``['dev','marketing']``. Behaviour is
+        # otherwise unchanged (SC4): a bare / ``core:`` / approved spelling
+        # still writes, and the default ``DocumentCreated`` names no pack.
+        self._refuse_unapproved_kind("eventKind", eventKind)
         import os as _os  # noqa: I001
         import json as _json
         from pathlib import Path
@@ -24443,6 +24550,78 @@ class TortoiseSDK:
         # drop sub-relevance near neighbours.
         _vector_floor = _resolve_vector_min_similarity()
         _floored_legs: set[str] = set()
+        # ── #8488: the in-process Okapi BM25 lexical arm ────────────────────
+        # Gated OFF by default (``TORTOISE_BM25_LEXICAL``, fail-safe — the same
+        # posture as every other lever here) because swapping the lexical
+        # SCORER is a retrieval-behaviour change and #8486 has produced no
+        # baseline to measure it against yet.
+        #
+        # What it swaps. The graph-side lexical leg is scored by the graph's
+        # fulltext scorer, which on the embedded lane gives a rare term exactly
+        # the weight a ubiquitous one gets and ignores document length
+        # (measured: tortoise/bm25.py's module docstring). BM25 supplies idf,
+        # term-frequency saturation and length normalisation. The arm runs in
+        # the LEXICAL SLOT: when it produces rows they REPLACE the shipped
+        # leg's list for this read, so the lexical signal is fused once, never
+        # twice (two lexical legs would outvote the dense leg by construction —
+        # the #7704 shape).
+        #
+        # Bounds. (a) embedded lane only (the lane the measurement covers, and
+        # the only one where a corpus scan is already the design);
+        # (b) entity families the leg can actually serve (BM25_ENTITY_TYPES);
+        # (c) an arm that finds nothing leaves the shipped leg's rows EXACTLY as
+        # they were — never an empty lexical slot (fail-safe, tested);
+        # (d) it stands down when the #4028 relevance floor emptied the vector
+        # leg, because that empty answer is the read's declared result;
+        # (e) its fusion weight goes through ``clamp_lexical_fusion_weight``.
+        #
+        # The shipped leg is NOT suppressed: it runs in the chain as it always
+        # does, in parallel and inside the deadline, so the fallback costs no
+        # extra latency and the lexical slot is metered exactly once.
+        #
+        # Trace shape when the arm runs: the chain's entries keep
+        # ``degradation_chain``'s fixed order (fts, vector, structural), and the
+        # arm appends ONE further entry for the same ``fts`` leg AFTER them —
+        # because that is when it ran. The two entries are not a duplicate
+        # claim: the chain's entry has no ``mechanism`` key (the shipped
+        # scorer's rows), the arm's carries ``mechanism="bm25"``.
+        #
+        # (f) the arm does NOT run when a later lexical pass will REPLACE the
+        # slot it writes. ``_search_keys_prf_expansion`` (A4) and
+        # ``_entity_key_expansion_pass`` (C2) each RE-RUN the shipped scorer
+        # and overwrite ``raw_results["fts"]``, so an arm that ran before them
+        # would leave its rows discarded while its trace entry still claimed
+        # ``mechanism="bm25"`` — a measurement (starting with #8486) would
+        # baseline a read whose lexical order is the shipped scorer's while
+        # reading a trace that says BM25 produced it. Standing down is the
+        # honest composition: same shape as the ``#4028`` floor stand-down
+        # below (no arm, no arm trace entry, the shipped rows stand), and it
+        # costs nothing because composing the two levers was never measured.
+        # Reopening it means feeding the expansion's alias tokens INTO the arm
+        # so the arm is the last writer — not running it earlier.
+        _bm25_lexical = False
+        _prf_supersedes_the_arm = bool(
+            search_keys_prf
+            or (entity_key_expansion and entity_type == "point"))
+        if (query and query.strip() and is_embedded and not is_full_scan
+                and strategies.get("fts")):
+            from tortoise.search_engine import BM25_ENTITY_TYPES
+
+            from .bm25 import bm25_enabled
+            _bm25_enabled = bm25_enabled()
+            _bm25_lexical = (entity_type in BM25_ENTITY_TYPES
+                             and _bm25_enabled and not _prf_supersedes_the_arm)
+            if _bm25_enabled and _prf_supersedes_the_arm:
+                # Visible, not silent: the operator asked for the arm AND for an
+                # expansion pass that would overwrite it. The read is CORRECT
+                # (shipped rows, shipped scorer), but the lever they set is not
+                # in effect — say so rather than let a measurement discover it.
+                _logger.warning(
+                    "#8488: BM25 lexical arm standing down — %s replaces the "
+                    "lexical slot after the arm would have written it; the "
+                    "shipped lexical scorer's rows are used",
+                    "search_keys_prf" if search_keys_prf
+                    else "entity_key_expansion")
         raw_results = degradation_chain(
             graph, query, struct_kind, query_vec, strategies,
             entity_type=entity_type, limit=str_limit,
@@ -24469,6 +24648,41 @@ class TortoiseSDK:
                 if leg_trace is not None and query_vec is not None
                 and expanded_kinds else None),
         )
+
+        if _bm25_lexical and "vector" not in _floored_legs:
+            # #8488: re-score the lexical slot in-process. Bounded by
+            # DEFAULT_BM25_CORPUS_CAP (see run_bm25_query), and it returns []
+            # on ANY failure — in which case ``raw_results["fts"]`` keeps the
+            # shipped leg's rows untouched, so enabling the arm can never leave
+            # the read with a lexically weaker pool than it had before. The
+            # same holds when the corpus is WIDER than the cap: the leg
+            # declines its windowed ranking and returns [], because the shipped
+            # leg answered over the whole label and a first-N-ids window can
+            # only lose matches (the leg records ``degraded=True`` + a warning).
+            # ``meter=False``: the shipped leg already counted the lexical
+            # slot in the tally; this is the same slot scored differently, not
+            # a second leg.
+            from tortoise.search_engine import run_bm25_query
+            _bm25_hits = run_bm25_query(
+                graph, query, entity_type=entity_type, limit=str_limit,
+                timeout_ms=int(_elevated_timeout_ms or 500),
+                excluded_statuses=() if include_terminal else None,
+                leg_trace=status_trace,
+                keep_numeric=keep_numeric,
+                meter=False,
+            )
+            if _bm25_hits:
+                # Ordering: this replaces the key IN PLACE when the shipped
+                # leg contributed rows (dict assignment to an existing key
+                # keeps its position), and appends it when the shipped leg
+                # contributed nothing (degradation_chain only stores non-empty
+                # legs) — so the #2952 fixed order is preserved in the first
+                # case and is not in the second. Neither matters to the fused
+                # result: ``rrf_fusion`` sums over legs keyed by
+                # ``strategy_names`` built from the same dict, so leg order is
+                # not load-bearing. Kept as a plain assignment for that
+                # reason, not because order is guaranteed.
+                raw_results["fts"] = _bm25_hits
 
         if not raw_results:
             # #4028: the vector leg RAN and the relevance floor removed every
@@ -24666,6 +24880,14 @@ class TortoiseSDK:
                         fusion_weights = _json.loads(_fw)
                     except (ValueError, TypeError):
                         fusion_weights = {"vector": 1.5}
+            if _bm25_lexical:
+                # #8488: the lexical leg's weight is BOUNDED below the dense
+                # leg's (tortoise/bm25.py — #7704 / #1657). A no-op for the
+                # recorded production default; it removes only an unbounded
+                # override, which would let the lexical leg decide a fused
+                # order by itself.
+                from tortoise.search_engine import clamp_lexical_fusion_weight
+                fusion_weights = clamp_lexical_fusion_weight(fusion_weights)
             fused = rrf_fusion(
                 ranked_lists,
                 strategy_names=list(raw_results.keys()),
@@ -28425,21 +28647,13 @@ class TortoiseSDK:
                 kind, sorted(known_kinds("pointKind")), kind,
             )
 
-    #: #5475: the general kind a writer can always fall back to, per kind
-    #: property — all CORE spellings, i.e. the anti-paralysis half of the
-    #: owner's 2026-10-17 ruling ("an 'other' or more general kind … so we
-    #: don't completely block the writer in paralyzing bureaucracy").
-    #: ``objectKind``/``subjectKind`` = ``other`` (the SDK/REST default and a
-    #: declared canonical object kind); ``eventKind`` = ``occurrence`` and
-    #: ``pointKind`` = ``statement`` (the extractor's own fallbacks);
-    #: ``documentKind`` has no declared general kind, so it names none rather
-    #: than inventing one.
-    _KIND_GENERAL_FALLBACKS: ClassVar[dict[str, str]] = {
-        "objectKind": "other",
-        "subjectKind": "other",
-        "eventKind": "occurrence",
-        "pointKind": "statement",
-    }
+    #: #5475: the general kind a writer can always fall back to now lives in
+    #: ``pack_state._KIND_GENERAL_FALLBACKS`` with the rest of the rule: the
+    #: refusal text is built there (#5475 residual — ``api.EventAPI`` is a
+    #: second gated seam, and two message builders would be two rules with one
+    #: name). Nothing in this class reads it, so it is not re-exported; a
+    #: module-level ``from .pack_state import`` here would be the import cycle
+    #: this module's lazy ``.pack_state`` imports exist to avoid.
 
     def _refuse_unapproved_kind(self, prop: str, kind) -> None:
         """#5475: the INPUT constraint — a write may not name an unapproved pack.
@@ -28520,67 +28734,68 @@ class TortoiseSDK:
         first write).
 
         Pure with respect to the graph: it decides from ``approved`` only.
+
+        The DECISION and the MESSAGE live in ``pack_state.unapproved_kind_refusal``
+        (#5475 residual): ``api.EventAPI`` is a second gated write seam that
+        holds no SDK, and a seam that built its own refusal would be a second
+        rule wearing the same name. This method stays because the SDK's own
+        callers (and the hosted commit door) reach it here.
+        """
+        from .pack_state import unapproved_kind_refusal
+        return unapproved_kind_refusal(prop, kind, approved)
+
+    def _refuse_unapproved_kinds_in_record(self, record: dict, graph=None) -> None:
+        """#5475: gate a RECORD a live door built itself, before it is persisted.
+
+        ``_refuse_unapproved_kinds_in_props`` covers the doors that hand their
+        kind as a flat keyword (``create_*`` / ``update_*``). The doors that
+        BUILD a journal record and fold it — ``_apply_and_journal`` (the live
+        door for a pre-built Object/Subject/Event record) and ``_doc_write``
+        (frontmatter → ``DocumentCreated``) — pass it in the RECORD's own
+        spelling, which is often snake_case (``object_kind``,
+        ``document_kind``), so they need the payload-shaped reader. Both spellings
+        land on the SAME node property, so a gate keyed on one is bypassable by
+        the other.
+
+        Every one of these doors appends FIRST and folds second (the journal
+        ordering contract), so a refusal raised here — before the append —
+        leaves neither store touched. Gating at the append instead
+        (``_emit_event``) is NOT equivalent: several emitters run after their
+        mutation (``PointPromoted`` / ``Dedupe*`` / ``create_operator``), where
+        a refusal could only arrive after the node was already written and
+        would split the journal from the cache.
+
+        ⛔ THE MIRROR SHAPE, stated because ``graph=`` can name a graph other
+        than this SDK's: the TARGET's set decides admission, but ``_emit_event``
+        journals through ``self``. A caller that hands over a FOREIGN
+        projection — no production caller does (``github_indexer`` passes
+        ``sdk._get_proj()``, the internal call passes its own) — can therefore
+        journal a record the JOURNAL OWNER's graph does not approve, which the
+        next ``rebuild_all`` of that graph folds (replay is ungated by design).
+        That was the pre-fix behaviour, so this is not a regression, but gating
+        the write target must not be read as closing the journal side.
         """
         from .pack_state import (
-            _ATTRIBUTABLE_BARE_KIND_KEYS,
-            approved_kind_alternatives,
-            unapproved_kind_pack,
+            payload_names_pack,
+            refuse_unapproved_kinds_in_payload,
         )
-        # The attribution flag is DERIVED from pack_state's own declaration of
-        # which keys attribute a BARE value back to a pack (today:
-        # ``eventKind``), never re-spelled here: a second copy would stop
-        # constraining a key the mining leg starts attributing — the same
-        # widening under a new name.
-        pack_ns = unapproved_kind_pack(
-            kind, approved, attribute_bare=prop in _ATTRIBUTABLE_BARE_KIND_KEYS)
-        if pack_ns is None:
-            return None
-        approved_ns = ", ".join(sorted(approved or ())) or "none"
-        alternatives = approved_kind_alternatives(kind, approved, prop=prop)
-        # The remedy is a LIST of what the caller can do (the owner ruling's
-        # third element), so the punctuation cannot drift as clauses are added.
-        # ⛔ The wording ALSO has to survive the MCP layer's error scrubber
-        # (``mcp_server._scrub_error``): its rule is ``(host=|at |to )[\w.-]+``,
-        # which -- because the alternation has no word boundary -- bites any
-        # ``at ``/``to `` SUBSTRING, i.e. "Wh**at **next" and "th**at **pack".
-        # This message crosses that boundary on every MCP tool call, and a
-        # scrubbed remedy is the one half of Option A a writer acts on. Hence
-        # "Next steps:"/"install the pack"/"for this graph", never
-        # "What next"/"that pack"/"to this graph"/"What to do". The rule is
-        # mechanical, so it is PINNED: the door tests assert the raw message is
-        # a fixed point of ``_scrub_error``.
-        remedies = [
-            "write a kind from the core vocabulary, or from a pack this graph "
-            f"HAS approved ({approved_ns})",
-        ]
-        if alternatives:
-            more = "".join(f" (or {alt!r})" for alt in alternatives[1:])
-            remedies.append(
-                "the same kind IS declared by an approved pack — write "
-                f"{alternatives[0]!r}{more}")
-        remedies.append(
-            f"with user approval, add the {pack_ns!r} ontology pack for this "
-            "graph (PUT /v1/graphs/{graph_id}/packs)")
-        what_next = "; ".join(remedies)
-        general = self._KIND_GENERAL_FALLBACKS.get(prop)
-        fallback = (
-            f" A kind you cannot classify is never blocked: the bare general "
-            f"kind {general!r} names no pack and always writes."
-            if general else
-            " A kind you cannot classify is never blocked: a bare "
-            "(un-namespaced) kind names no pack and always writes.")
-        return UnapprovedKindNamespace(
-            f"refused {prop}={kind!r}: it names the ontology pack namespace "
-            f"{pack_ns!r}, which this graph has not approved — the write was "
-            "NOT stored. Why: kinds are namespaced by ontology pack, and this "
-            "graph's approved set is mined from the kind values it already "
-            "holds, so a write naming an unapproved namespace would install "
-            "the pack by writing it — any caller could grant itself any "
-            "pack, and the namespace/kind vocabulary would balloon until it "
-            f"no longer names anything. Next steps: pick one — {what_next}. "
-            f"{fallback.strip()}",
-            prop=prop, kind=kind if isinstance(kind, str) else str(kind),
-            namespace=pack_ns, installed=approved)
+        if not (spells := payload_names_pack(record)):
+            return
+        if graph is not None:
+            # The WRITE TARGET's approval set, not this SDK's (#5475 review): a
+            # door that takes a ``proj`` argument persists into THAT graph, so
+            # reading ``self``'s set would admit an unapproved namespace into a
+            # graph that never approved it (and refuse a legitimate write the
+            # other way round). Latent today — every caller passes its own
+            # projection — which is exactly why it is fixed at the seam.
+            from tortoise.pack_state import graph_approval_namespaces
+            approved = graph_approval_namespaces(graph)
+        else:
+            # `_installed_namespaces_for_gate` is this module's SDK-aware reader
+            # (it is the one that knows a bare-``__new__`` SDK has no graph and a
+            # bound-but-unreachable graph RAISES rather than reading as no-packs).
+            approved = _installed_namespaces_for_gate(self)
+        refuse_unapproved_kinds_in_payload(record, approved, spells=spells)
 
     def _refuse_unapproved_kinds_in_props(self, props: dict) -> None:
         """Run the #5475 gate over EVERY kind property a write is carrying.
@@ -28602,23 +28817,27 @@ class TortoiseSDK:
         ``create_event(..., uses=[{'name': 'x', 'kind': 'marketing:campaign'}])``
         widened a ``dev``-only graph before this check existed).
 
-        The fold's SNAKE aliases are screened too (#9068 review P1). The
+        The fold's SNAKE spellings are screened too (#9068 review P1). The
         ``create_*`` doors forward caller ``props`` with ``**props``, and the
         fold reads ``ev.get("object_kind")`` / ``subject_kind`` /
-        ``document_kind`` — so ``create_object("x",
-        props={"object_kind": "pm:issue"})`` survived a camel-only screen and
-        was folded onto the MINED ``objectKind``. That is the exact vector
-        ``pack_state._KIND_PROP_ALIASES`` closes for the record predicate, so
-        the props door reads the same declaration instead of re-spelling it.
+        ``document_kind`` — so ``create_object("x", props={"object_kind":
+        "pm:issue"})`` survived a camel-only screen and was folded onto the
+        MINED ``objectKind``: the same widening under a spelling the gate did
+        not know. Both spellings come from ``pack_state``'s ONE declaration
+        (``_KIND_PROP_SPELLINGS``, the map the payload-shaped gates use), never
+        re-spelled here.
         """
-        from .pack_state import _KIND_PROP_ALIASES as _kind_aliases
         from .pack_state import _KIND_PROP_KEYS as _gated_kind_props
+        from .pack_state import _KIND_PROP_SPELLINGS as _kind_spellings
         for kind_prop in _gated_kind_props:
             if kind_prop in props:
                 self._refuse_unapproved_kind(kind_prop, props.get(kind_prop))
-        # The canonical prop name is reported (never the alias): the refusal
-        # message tells the caller which PROPERTY it must change, and the alias
-        # would name a spelling the stored node does not carry.
+        # Canonical spelling in the refusal (never the alias): the message tells
+        # the caller which PROPERTY to change, and the alias is not the property
+        # the node ends up carrying.
+        for spelling, kind_prop in _kind_spellings.items():
+            if spelling != kind_prop and spelling in props:
+                self._refuse_unapproved_kind(kind_prop, props.get(spelling))
         uses = props.get("uses")
         if isinstance(uses, dict):
             uses = [uses]
@@ -28630,40 +28849,6 @@ class TortoiseSDK:
                     # The fold's own default is 'other' (a bare core kind), so
                     # an absent 'kind' is the same write it will perform.
                     self._refuse_unapproved_kind("objectKind", item.get("kind"))
-
-    def _refuse_unapproved_kinds_in_record(self, proj, record: dict) -> None:
-        """#9068: the #5475 gate for a PRE-BUILT record, not a props dict.
-
-        ``_refuse_unapproved_kinds_in_props`` serves the ``create_*`` funnels,
-        whose caller props are camel-spelled keyed kwargs. The doors below
-        instead forward a WHOLE record the fold will consume verbatim
-        (``_apply_and_journal``, ``_doc_write``) or a props dict landing in a
-        ``SET n +=`` (``update_point``/``_update_entity``), and those carry the
-        fold's SNAKE aliases (``object_kind``/``subject_kind``/
-        ``document_kind``) — which the props gate does not screen. The record
-        predicate (``pack_state.unapproved_kinds_in_record``) screens the same
-        three spellings the mining leg reads, so this door and the connector
-        folds cannot disagree about what a record would install.
-
-        Why it is P1 and not bookkeeping: ``_apply_and_journal`` is the
-        GHITHUB INDEXER's write door (``indexer/github_indexer.py``), and the
-        Object it hands over carries ``object_kind='pm:issue'`` — so the
-        polling entry point most callers actually use widened a ``dev``-only
-        graph's approved set with ``pm``, the identical defect #9068 closes for
-        the connectors two files away.
-
-        PROJECTION WITH NO GRAPH HANDLE: nothing to read, so nothing is
-        refused here. That is the same fail-open shape
-        ``_installed_namespaces_for_gate`` takes for an SDK that was never
-        ``__init__``-ed (a test seam, not a tenant surface) — every live
-        projection a tenant write reaches carries ``.g``.
-        """
-        g = getattr(proj, "g", None)
-        if g is None:
-            return
-        from .pack_state import refuse_unapproved_kinds_in_records
-        refuse_unapproved_kinds_in_records(
-            g, [record], writer="the SDK live-write door (_apply_and_journal)")
 
 
     # ── Entity CRUD (ONTOLOGY v2.5 §3, all 7 types) ──────────────────
@@ -29264,10 +29449,15 @@ class TortoiseSDK:
         # #329: id + sourcePath/source_path are server-managed — reject
         props = _sanitize_props(props, reject_id=True,
                                 reject_belief_props=True)
-        # #9068: the same input constraint as `update_point` — the per-label
-        # branches below write caller props with a live `SET n += $p`, and the
-        # kind properties among them are MINED back into the approval set.
-        self._refuse_unapproved_kinds_in_record(self._get_proj(), props)
+        # ── #5475 (residual): the UPDATE door onto every label ──
+        # ``update_entity`` is the documented tenant route onto Object /
+        # Subject / Event / Document / Source nodes, and each of those carries
+        # a kind property ``graph_kind_namespaces`` mines back into the
+        # approval set. Measured at HEAD: ``update_entity(id,
+        # objectKind='marketing:campaign')`` on a ``dev``-only graph left it
+        # ``['dev','marketing']``. Same rule, same funnel, same refusal as the
+        # create doors because it is the SAME helper.
+        self._refuse_unapproved_kinds_in_props(props)
         # #3998 (D30): the generic entity surface reaches `:Source` TOO, and its
         # per-label branch below writes caller props with a live `SET n += $p`.
         # Without this the closed :Source surface declared in
@@ -31993,6 +32183,12 @@ class TortoiseSDK:
         }
         if frontmatter.get("domain") is not None:
             ev["domain"] = str(frontmatter["domain"])
+        # ── #5475 (residual): ``document_kind`` comes from FRONTMATTER ──
+        # It is one of the properties ``graph_kind_namespaces`` mines, so an
+        # indexed file whose frontmatter says ``type: marketing:brief`` would
+        # install that pack by being indexed. Gated before ``_emit_event`` (the
+        # commit point) so a refusal leaves both stores untouched.
+        self._refuse_unapproved_kinds_in_record(ev)
         # #7951 — THE JOURNAL ORDERING CONTRACT (module top): **journal first,
         # then project.** `ev` is fully built above, so this record qualifies
         # for NEITHER contract exception (it is not a replay, and its payload
@@ -32002,14 +32198,6 @@ class TortoiseSDK:
         # skipped, so the DERIVED store can never lead the TRUTH. Before this
         # fix the fold ran first and the record was journalled after it — the
         # window no replay can undo (contract window (a)).
-        # #9068: the #5475 input constraint on the record this door folds. ``ev``
-        # carries ``document_kind`` (the FOLD's snake alias, which
-        # ``_refuse_unapproved_kinds_in_props`` does not screen) and it is
-        # persisted as ``documentKind`` — a property
-        # ``pack_state.graph_kind_namespaces`` mines back into the approval set,
-        # so an ungated fold here would install a pack by writing it. Before the
-        # append, so a refusal leaves the journal AND the graph untouched.
-        self._refuse_unapproved_kinds_in_record(proj, ev)
         p = {k: v for k, v in ev.items() if k not in ("type", "id")}
         _failures_before = self._journal_write_failures
         self._emit_event("DocumentCreated", id=doc_id, **p)
@@ -34324,10 +34512,17 @@ class TortoiseSDK:
                 (Action was dissolved in Ontology v3.0).
         """
         proj = self._get_proj()
-        # #9068: `source_kind` lands on the auto-created ``:Source`` as
-        # ``sourceKind`` — a mined kind property — so it takes the same #5475
-        # input constraint as `create_source`. The cheap pre-check inside the
-        # gate means a core/bare spelling pays no graph read.
+        # ── #5475 (residual): the SECOND writer of ``sourceKind`` ──
+        # ``create_source`` is gated at the entity funnel, but this public method
+        # auto-creates the ``:Source`` itself (``MERGE … ON CREATE SET
+        # s.sourceKind=$sk``, ``projection/edges.py``), so it was a second, ungated
+        # writer of one of the properties ``graph_kind_namespaces`` mines — a
+        # caller-chosen namespace, reachable from a public SDK method. Measured on
+        # a ``dev``-only graph: ``link_source_to_entity(url, id, 'Object',
+        # source_kind='marketing:campaign')`` left ``['dev','marketing']``.
+        # Refused BEFORE the call, not conditionally on the node's existence: a
+        # read-then-write decision here would be a race, and the value is only
+        # honoured ON CREATE, so existence is not ours to predict.
         self._refuse_unapproved_kind("sourceKind", source_kind)
         proj.link_source_to_entity(source_url, entity_id, entity_label, source_kind)
 

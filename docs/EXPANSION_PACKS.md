@@ -474,20 +474,24 @@ kind the caller did not write.
 
 Every one of those doors reads the SAME predicate: a pre-built record (the
 SDK's live-write doors and the connector folds) goes through
-`pack_state.unapproved_kinds_in_record` — which screens the mined key set, the
-fold's snake aliases (`object_kind` / `subject_kind` / `document_kind`) and
-`uses[].kind` — and the `create_*`-style doors screen their props with the same
-key set **and the same alias leg** (`create_object(props={"object_kind":
-"pm:issue"})` was a live bypass of the camel-only props screen until #9068: the
-fold reads the snake spelling and writes the mined camel property). A per-door
-list is how the widening survived the first closure, so a door that gates
-individually is a bug, not a variation.
+`pack_state.kind_spellings_in_payload` →
+`pack_state.refuse_unapproved_kinds_in_payload` — which screens the mined key
+set in BOTH spellings (the fold's snake aliases `object_kind` / `subject_kind` /
+`document_kind`, and `uses[].kind`) — and the `create_*`-style doors screen
+their props with the same key set **and the same spelling leg**
+(`create_object(props={"object_kind": "pm:issue"})` was a live bypass of the
+camel-only props screen until #9068: the fold reads the snake spelling and
+writes the mined camel property; the props door now reads
+`pack_state._KIND_PROP_SPELLINGS`, the same declaration). A per-door list is how
+the widening survived the first closure, so a door that gates individually is a
+bug, not a variation.
 Doors on a hot path (`_apply_and_journal`, `_emit`, the connector batches, the
-`update_*` props) run a cheap pre-check first
-(`pack_state.record_names_a_pack`, `connectors._gate_kinds`): a record whose
-kinds name no pack pays **no graph read at all**, so the common case (core
-kinds, bare spellings) costs the same as before the gate — which matters most
-on the webhook arms, where the "batch" is one delivered message.
+`update_*` props) run a cheap pre-check first (`pack_state.payload_names_pack`,
+`connectors._gate_kinds`): a record whose kinds name no pack pays **no graph
+read at all**, so the common case (core kinds, bare spellings) costs the same
+as before the gate — which matters most on the webhook arms, where the "batch"
+is one delivered message (the pre-check walks the record once and hands the
+pairs to the gate, so it is never walked twice).
 
 **Gated — the connector folds (#9068).** `github` / `linear` / `slack` fold
 records with a bare `proj.apply(...)` and never meet an SDK door.

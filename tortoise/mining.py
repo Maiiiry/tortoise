@@ -912,19 +912,20 @@ class ConversationMiner:
             "event": event,
             "createdAt": _now(),
         }
-        # #9068: the #5475 input constraint, on the INNER ``event`` (its
-        # ``eventKind`` is a MINED property — and the one key whose BARE
-        # spelling is attributable back to a declaring pack, #5184), before the
-        # append: the append is the COMMIT POINT, so a refusal after it would
-        # leave a journal record whose fold refused. The values here are the
-        # module's own literals, so this pays no graph read unless one of them
-        # names (or is attributable to) a pack the graph has not approved —
-        # in which case the fold really would have installed it.
-        _g = getattr(api.projection, "g", None)
-        if _g is not None:
-            from tortoise.pack_state import refuse_unapproved_kinds_in_records
-            refuse_unapproved_kinds_in_records(
-                _g, [event], writer="the conversation miner's emitter")
+        # #5475 (residual): this emitter builds its OWN envelope (the nested
+        # ``event`` shape, not ``_emit``'s flat one), so it bypassed the gate at
+        # ``EventAPI._emit`` — one more live seam that could install a pack by
+        # writing a kind. Nested on purpose: ``eventKind`` sits inside
+        # ``record["event"]``, which is exactly the shape
+        # ``kind_spellings_in_payload`` walks. Before the append (the commit
+        # point) so a refusal leaves the journal and the fold untouched.
+        # ``EventAPI._refuse_unapproved_kinds(api, ...)`` is called UNBOUND, not
+        # ``api._refuse_unapproved_kinds(...)``: this staticmethod is exercised
+        # by duck-typed API doubles (the #7951 ordering test's bare ``_API``),
+        # and the rule that decides whether there is anything to gate lives with
+        # the class. A double whose ``projection`` carries no graph handle
+        # abstains, exactly as a projection-less lane does.
+        EventAPI._refuse_unapproved_kinds(api, record)
         api.log.append(record)
         if api.projection is not None:
             # #7951 §17.1: journal-first door (its own envelope) — the append

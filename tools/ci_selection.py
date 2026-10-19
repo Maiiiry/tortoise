@@ -1020,6 +1020,23 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # already falls through to `core`). Pinned by
              # tests/test_ci_selection.py::test_graph_census_tool_change_selects_core_not_tier1.
              "tools/graph_census.py",
+             # #4495 review P2: tools/write_op_reachability.py is the CLI that
+             # reports the write-op allowance's stock/flow conversion, and its
+             # guard (tests/test_write_op_reachability.py) is `core`+`api`
+             # registered — but `tools/` is swallowed by NON_PYTHON_PREFIXES and
+             # no SOURCE_PATTERNS entry matches the tool, so a CLI-only change
+             # selected NO surface, took the docs-only early return and fell back
+             # to tier-1 smoke: the exit-code contract (0 stated-yield / 1
+             # unreachable / 2 not-measurable / 3 measured-uncertified), the
+             # UNCERTIFIED rule and the absence rule would never run on the PR
+             # editing the CLI — the instrument that makes an uncounted class
+             # visible must not be invisible to CI selection itself. Same
+             # #1349/#3332/#3616 silent-drop class as tools/graph_census.py
+             # above. CORE_ALSO (not TOOL_CARVEOUTS) because the guard is
+             # hermetic (synthetic books, a fake SDK) and `core` is where its
+             # `core` arm lives. Pinned by
+             # tests/test_ci_selection.py::test_write_op_reachability_tool_change_selects_core_not_tier1.
+             "tools/write_op_reachability.py",
              # #3036: oauth.py is pinned by BOTH api-registered tests
              # (test_oauth_mcp.py, test_oauth_token_fault.py, ...) and core
              # (test_control_plane_offload_3498.py), so the SOURCE_PATTERNS
@@ -1262,6 +1279,54 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # tests/test_8491_cal_attendee_grounding.py::
              # test_bridge_change_selects_core_so_this_guard_runs.
              "integrations/crm/twenty/bridge.py",
+             # #5045 review P1: `tools/cost_coverage_audit.py` is the INSTRUMENT the
+             # whole cost-dimension registry rests on, and its guard
+             # (tests/test_cost_dimensions.py, `core`+`api` registered) is the only
+             # thing that pins it — but `tools/` is a flat NON_PYTHON_PREFIXES entry
+             # and no SOURCE_PATTERNS row matches the tool, so a TOOL-ONLY change was
+             # filtered out BEFORE the "not matched -> core" fallback and took the
+             # docs-only early return. Measured before this entry:
+             # `select(["tools/cost_coverage_audit.py"])` -> surfaces=[], full=False,
+             # 46 tier-1 files, test_cost_dimensions.py ABSENT — so deleting a check
+             # from `audit()`, widening `_NOT_PRODUCTION` back over `tools/`, or
+             # restoring a predicate the module argues against merged green, and the
+             # registry quietly stopped being verified (the #1349/#3332/#3616
+             # silent-drop class, same shape as tools/drift-guard.py above). Pinned
+             # by tests/test_ci_selection.py::
+             # test_cost_coverage_audit_tool_change_selects_core_not_tier1.
+             "tools/cost_coverage_audit.py",
+             # #5045 review P1 (the ledger half): `check_ledger` verifies the
+             # registry's declared columns and SQL functions against the migration
+             # TEXT, and `supabase/` is a flat NON_PYTHON_PREFIXES entry too — so a
+             # MIGRATION-ONLY change that renames a metering column or an RPC
+             # selected NO surface and the ledger check never ran on the file
+             # carrying the DDL it verifies (same shape as the #8744
+             # postgres-storage entries above). These are the tracked migrations that
+             # CREATE a declared cost column or DEFINE a declared RPC. A migration
+             # edited elsewhere is still caught by the next `core`/`api` PR — an
+             # accepted delay, stated in docs/ops/cost-dimensions.md §"What the audit
+             # enforces". Pinned by tests/test_ci_selection.py::
+             # test_cost_dimension_ledger_migrations_select_core.
+             "supabase/migrations/0014_metering_records.sql",
+             "supabase/migrations/20260813000002_metering_nodes_written.sql",
+             "supabase/migrations/20260829000001_metering_ask_columns.sql",
+             "supabase/migrations/20260915000001_tenancy_team_to_org.sql",
+             "supabase/migrations/20260917000001_metering_capture_cost.sql",
+             "supabase/migrations/20260918000001_metering_period_window.sql",
+             "supabase/migrations/20260927000001_metering_unmetered_increments.sql",
+             "supabase/migrations/20261001000001_metering_capture_tokens.sql",
+             "supabase/migrations/20261001000004_metering_embedding_columns.sql",
+             "supabase/migrations/20261001000005_metering_graph_storage.sql",
+             "supabase/migrations/20261010000001_metering_period_end_refresh.sql",
+             "supabase/migrations/20261013000001_metering_retrieval_columns.sql",
+             # #5045 review P1 (the doc half): `docs/ops/cost-dimensions.md` is one of
+             # the registry's own subjects — it states what the audit enforces, and a
+             # docs-only edit of it selected NO surface, so the audit's claims could
+             # drift from the audit's code with every pin green (the same
+             # `docs/ops/postgres-storage-measurement.md` shape above). Pinned by
+             # tests/test_ci_selection.py::
+             # test_cost_dimension_ledger_migrations_select_core.
+             "docs/ops/cost-dimensions.md",
              # PR #8986 review (P1/P2, four independent reviews): the two
              # served-identity DRIVERS are the files whose one-copy edit
              # `tests/test_surface_manifest.py` exists to catch. That suite is
@@ -1286,7 +1351,32 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # Pinned by
              # tests/test_ci_selection.py::test_surface_tools_change_selects_core_not_tier1.
              "tools/surface-guard.py",
-             "tools/surface_manifest.py")
+             "tools/surface_manifest.py",
+             # #9085 review P1: `tests/test_runner_ports_6673.py` (registered
+             # `core`) carries the two #8124 guards that pin the ENGINE, and both
+             # read a file the selector did not keep:
+             #   * `apps/graph-viz/docker-compose.yml` — scanned by the compose
+             #     sweep (`COMPOSE_GLOBS` includes `apps/*/docker-compose*.yml`),
+             #     but `apps/` is in NON_PYTHON_PREFIXES and matches no
+             #     SOURCE_PATTERNS row, so a revert of that pin filtered to
+             #     `changed == []`, took the docs-only early return, and ran
+             #     tier-1 smoke only (measured: surfaces=[]).
+             #   * `docs/quickstart-selfhosted.md` — Option B's bare-container
+             #     hand-out, pinned by
+             #     test_the_selfhost_quickstart_hands_out_the_compose_pin_not_latest.
+             #     It matched the `#3329` `docs/` SOURCE_PATTERN that carries
+             #     `test_capacity_page.py` (onboarding), NOT `core`, so the
+             #     quickstart's engine pin was unguarded on the one docs diff that
+             #     can break it (measured: surfaces=['onboarding'], the guard
+             #     absent).
+             # Either way a one-line revert merged green and reddened `main` on
+             # the post-merge push — the #1349/#3332/#3616 silent-drop class, on
+             # the exact files this PR pins. Named individually because
+             # `select()` matches with `startswith`. Pinned by
+             # tests/test_ci_selection.py::
+             # test_the_engine_pin_guards_are_selected_on_the_files_they_pin.
+             "apps/graph-viz/docker-compose.yml",
+             "docs/quickstart-selfhosted.md")
 NON_PYTHON_PREFIXES = (
     "docs/", "website/", "product/", "legal/", "growth/", "engineering/",
     "finance-accounting/", "menu-bar/", "ux/", "data/", "operations/",
