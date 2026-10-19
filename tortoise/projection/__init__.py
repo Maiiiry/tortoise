@@ -15060,13 +15060,36 @@ class FalkorProjection(
         creation sites are ``try/except``-logged, so the graph would simply end
         up with no fulltext indexes and every fulltext query would answer an
         empty result set. The declaration is scoped to this ONE function on
-        purpose: it authorizes the schema, not a data write. A ``CREATE`` of a
-        node added here would inherit the declaration, which is why the sweep's
-        body is kept to DDL, the two ``:Meta`` index-version markers it MERGEs,
-        and catalogue reads — see
-        ``tests/test_9079_handle_write_authority.py``,
-        ``test_schema_ddl_survives_the_armed_guard``, whose companion assertion
-        would go red on exactly that substitution.
+        purpose: it authorizes the schema, not a general data lane.
+
+        ⛔ THE LANE CARRIES TWO OBLIGATIONS, AND THE SECOND ONE IS NOT SCHEMA.
+        Measured, not assumed: the sweep's body is DDL, the two ``:Meta``
+        index-version markers it MERGEs, catalogue reads — **and exactly ONE
+        corpus data write**, the ``SET n.search_keys`` flatten inside
+        ``_fix_point_search_keys``, which two ``except`` branches of the sweep
+        reach (the fresh-create branch and the legacy ``already indexed``
+        branch). It is stated here rather than denied, because a lane documented
+        as "schema only" that silently also authorizes a ``:Point`` property
+        write is precisely the widening #9124's review caught. It is not hoisted
+        out because ``_fix_point_search_keys`` is ONE unit — the flatten, the
+        drop→recreate and the ``point_fts_v2`` marker — and splitting it is how
+        the two create branches stop flattening identically (a RESTORE/DR graph
+        reaches the fresh branch with arrays and no index).
+
+        The flatten is admitted under THIS lane's own obligations rather than by
+        accident: it rewrites ``search_keys`` from an array into the space-joined
+        string the SDK write path already stores, so it invents nothing, and a
+        replay of the owning ``PointAdded`` recreates the flat value — a rebuild
+        absorbs its loss (obligation 1) and no comparison reconciles over its
+        VALUE (obligation 2). A write the record could describe but a replay
+        would NOT repair — a node ``CREATE``, a property the write path does not
+        derive — is NOT admitted: that belongs on a live lane, and this one is not
+        a licence for it. The pin is
+        ``tests/test_9079_handle_write_authority.py``:
+        ``test_schema_ddl_survives_the_armed_guard`` (the DDL survives the ARMED
+        guard) plus
+        ``test_the_schema_lane_also_authorizes_the_documented_corpus_fixup``
+        (the flatten is authorized, and the lane ends when the sweep returns).
         """
         with _graph_metadata_write_scope("schema-ddl"):
             self._ensure_indexes_declared()

@@ -38,7 +38,9 @@ the classifier's own polarity is "anything not provably read-only is a write".
 That OVER-report polarity is what `_text` implements — every unresolved part of
 an f-string or a `+` skeleton returns `None` rather than a placeholder, because
 a placeholder lets `f"MATCH (n:Point {{id:$id}}) {action}"` read as a non-write
-and drop the whole function out of the census. `_UNRESOLVED` for that reason, not because they are believed to write.
+and drop the whole function out of the census.
+Those functions are listed in `_UNRESOLVED` for THAT reason — the census cannot
+PROVE their statements read-only — and never because they are believed to write.
 
 WHICH EXPRESSION IS THE HANDLE. `proj.g`, `self._get_proj().g` (any attribute
 chain whose LAST attribute is `g`), `getattr(x, "g")`, and any name bound from
@@ -461,22 +463,47 @@ def _module_consts(tree):
 def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
     """Map each innermost function to what it does at the write handle.
 
-    Returns ``{function name: {lineno, writes, reads, appends, scopes, aliases,
-    params}}`` for every function holding at least one mutating call. Both call
-    lists carry the CONTROL-FLOW DEPTH as their last element — `writes` entries
-    are ``(line, verb, statement-prefix, depth)`` and `appends` entries are
-    ``(line, depth)`` — because an append only guarantees the record precedes a
-    write when it is no deeper in the branch tree than that write. Nested
-    functions are attributed to THEMSELVES, never to their enclosing function (a
-    helper's write is not its caller's).
+    Returns ``{scope-qualified name: {lineno, writes, reads, appends, scopes,
+    aliases, params}}`` for every function holding at least one mutating call.
+    Both call lists carry the CONTROL-FLOW DEPTH as their last element —
+    `writes` entries are ``(line, verb, statement-prefix, depth)`` and `appends`
+    entries are ``(line, depth)`` — because an append only guarantees the record
+    precedes a write when it is no deeper in the branch tree than that write.
+    Nested functions are attributed to THEMSELVES, never to their enclosing
+    function (a helper's write is not its caller's).
+
+    ⛔ THE KEY IS SCOPE-QUALIFIED — `Door.a_door`, `FalkorProjection.rebuild_all`,
+    `Outer.inner` — NOT the bare function name (#9124 review, round 2). Keying
+    on the bare name collapsed a class method and a module helper of the same
+    name into ONE fact, and every inventory lookup was name-only, so a single
+    `_APPLY_FIRST_DOORS` entry could account for a SECOND, undeclared writer of
+    that name: their writes, appends and scopes merged, and the merged fact read
+    `declared` (or `journal-first`) because one of the two declared. That is the
+    fail-open direction the census exists to prevent, and it is unreachable now
+    because two functions in different scopes cannot share a key. A redefinition
+    in the SAME scope is kept separate too (``@<lineno>``), so no two `def`s can
+    ever merge.
+
+    `tests/test_9124_declared_live_doors.py`'s inventories are still written as
+    bare names (they name SDK doors), so `_inventory_of` resolves a qualified key
+    to its LAST component — safe only because
+    `test_no_two_census_entries_share_a_bare_function_name` fails the moment two
+    censused functions would share one.
     """
     tree = ast.parse(source, filename=filename)
     consts = _module_consts(tree)
     facts: dict[str, dict] = {}
 
-    def visit(node, current, local, cond=0):
+    def visit(node, current, local, cond=0, scope=()):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = (*scope, node.name)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            current = node.name
+            current = ".".join(scope)
+            if current in facts:
+                # Two `def`s of the same name in the SAME scope (shadowing).
+                # Kept apart rather than merged — merging is the collision this
+                # enumerator must not have.
+                current = f"{current}@{node.lineno}"
             fact = facts.setdefault(current, {
                 "lineno": node.lineno, "writes": [], "reads": 0, "appends": [],
                 "scopes": [], "aliases": set(), "params": set(),
@@ -498,7 +525,7 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
                         facts[current]["scopes"].append((decorator.lineno, opener))
         if current is None:
             for child in ast.iter_child_nodes(node):
-                visit(child, current, local, cond)
+                visit(child, current, local, cond, scope)
             return
 
         fact = facts[current]
@@ -542,9 +569,9 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
             if isinstance(child, list):
                 for item in child:
                     if isinstance(item, ast.AST):
-                        visit(item, current, local, nested)
+                        visit(item, current, local, nested, scope)
             elif isinstance(child, ast.AST):
-                visit(child, current, local, nested)
+                visit(child, current, local, nested, scope)
 
     visit(tree, None, {})
     for fact in facts.values():
@@ -589,9 +616,29 @@ def _kind(fact) -> str:
     return "apply-first" if _journal_first_violation(fact) else "journal-first"
 
 
+def _bare_name(key: str) -> str:
+    """The BARE function name of a scope-qualified census key.
+
+    `TortoiseSDK.delete_point` -> `delete_point`. The `@<lineno>` suffix that
+    keeps two same-scope `def`s apart is stripped too, so that suffix cannot be
+    used to hide a name collision from
+    `test_no_two_census_entries_share_a_bare_function_name`.
+    """
+    return re.sub(r"@\d+$", "", key.rsplit(".", 1)[-1])
+
+
 def _inventory_of(name: str):
+    """The inventory a censused function belongs to, by its BARE name.
+
+    `name` is the scope-qualified key (`TortoiseSDK.delete_point`); the
+    inventories are written as bare names because that is how an SDK door is
+    named. Resolving to the last component is only safe while no two censused
+    functions share one — `test_no_two_census_entries_share_a_bare_function_name`
+    is the gate that keeps that true.
+    """
+    bare = _bare_name(name)
     for reason, members in _INVENTORY.items():
-        if name in members:
+        if bare in members:
             return reason
     return None
 
@@ -652,11 +699,46 @@ def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
 def test_the_inventories_hold_no_stale_entry():
     """The inventories can only shrink: a renamed/declared/deleted name fails."""
     surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
-    stale = sorted(_all_inventoried() - set(surface))
+    stale = sorted(_all_inventoried() - {_bare_name(n) for n in surface})
     assert not stale, (
         "these inventory entries no longer name a function with a mutating "
         "handle call (renamed, deleted, or the call was removed) — delete the "
         f"entries so the census stays a census: {stale}")
+
+
+def test_no_two_census_entries_share_a_bare_function_name():
+    """One inventory entry must not be able to cover TWO writers (#9124 r2).
+
+    The inventories are written as BARE names (`delete_point`, not
+    `TortoiseSDK.delete_point`), so `_inventory_of` resolves a scope-qualified
+    key to its last component. That is sound only while no two CENSUSED
+    functions share one: with `Foo.apply_first` and `Bar.apply_first` both
+    reaching the handle, both would carry the single `_APPLY_FIRST_DOORS` entry
+    and the undeclared one would pass its own gate. The FACTS cannot merge any
+    more (the keys are scope-qualified), so this is the gate that keeps the
+    INVENTORY LOOKUP honest — and it names both keys, so the next reader
+    qualifies the entry instead of guessing which scope it meant.
+    """
+    offenders = []
+    scanned = 0
+    for path in (SDK_PY, EVENT_STORE_PY):
+        surface = enumerate_handle_surface(path.read_text(), str(path))
+        scanned += len(surface)
+        by_bare: dict[str, list[str]] = {}
+        for key in surface:
+            by_bare.setdefault(_bare_name(key), []).append(key)
+        for bare, keys in sorted(by_bare.items()):
+            if len(keys) > 1 and _inventory_of(keys[0]) is not None:
+                offenders.append(f"{path.name}: {bare!r} -> {sorted(keys)}")
+    assert scanned > 50, (
+        "the scan found almost nothing — an enumerator that returns an empty "
+        f"surface would pass this gate vacuously (scanned={scanned})")
+    assert not offenders, (
+        "two censused functions share a bare name AND their shared name is in "
+        "an inventory, so that ONE entry accounts for both — the undeclared "
+        "one is covered by the other's inventory row. Qualify the inventory "
+        "entry (or split it) and reuse the same qualification in "
+        "`_inventory_of`:\n  " + "\n  ".join(offenders))
 
 
 def test_every_live_declared_door_is_journal_first():
@@ -689,7 +771,7 @@ def test_every_live_declared_door_is_journal_first():
         "a live-lane declaration covers a write that precedes its record:\n  "
         + "\n  ".join(offenders))
     assert {"delete_point", "invalidate_point", "retract_point",
-            "supersede_point"} <= set(checked), (
+            "supersede_point"} <= {_bare_name(name) for name in checked}, (
         "the four journal-first doors #9124 part 1 declared are not all being "
         f"checked ({sorted(checked)}) — the ordering pin would be vacuous for "
         "them")
@@ -745,7 +827,7 @@ class Door:
         proj.g.query("CREATE (n:Point {id:$id})", params={"id": pid})
 '''
     surface = enumerate_handle_surface(undeclared_src, "<synthetic-undeclared>")
-    fact = surface["a_door"]
+    fact = surface["Door.a_door"]  # scope-qualified key (#9124 review, r2)
     assert _kind(fact) == "journal-first", fact
     assert fact["appends"] and fact["writes"], fact
     assert not fact["scopes"]
@@ -758,7 +840,8 @@ class Door:
         "        self._emit_event(\"PointAdded\", {\"id\": pid})\n"
         "        with _live_write_scope(\"a_door\"):\n"
         "            proj.g.query")
-    fact = enumerate_handle_surface(declared_src, "<synthetic-declared>")["a_door"]
+    fact = enumerate_handle_surface(declared_src, "<synthetic-declared>")[
+        "Door.a_door"]
     assert _kind(fact) == "declared", fact
     assert fact["scopes"] and fact["scopes"][0][1] == "_live_write_scope"
 
@@ -820,11 +903,12 @@ class Door:
             h.query("CREATE (n:Point)")
 '''
     surface = enumerate_handle_surface(src, "<synthetic-shapes>")
+    # Keys are SCOPE-QUALIFIED (`Door.<name>`), so the expectation says so.
     missing = sorted({
         "interpolated_write", "module_const_write", "getattr_alias_write",
         "tuple_alias_write", "chained_write", "parameter_write",
         "walrus_write", "with_write", "for_write", "ifexp_write",
-    } - set(surface))
+    } - {_bare_name(name) for name in surface})
     assert not missing, (
         "the enumerator lost these shapes — each one is a mutating statement "
         f"through the write handle, so the census would under-report: {missing}")
@@ -852,7 +936,7 @@ class Door:
         proj.g.query("CREATE (n:B)")
 '''
     fact = enumerate_handle_surface(src, "<synthetic-half-conditional>")[
-        "half_conditional"]
+        "Door.half_conditional"]
     assert min(w[3] for w in fact["writes"]) == 0, fact
     assert _journal_first_violation(fact), fact
     assert _kind(fact) == "apply-first", fact
@@ -875,8 +959,45 @@ class Door:
         proj.g.query("MERGE (a)-[r:IMPL]->(b)")
         self._emit_event("DirectEdgeCreated", id="a->b")
 '''
-    fact = enumerate_handle_surface(src, "<synthetic-apply-first>")["apply_first"]
+    fact = enumerate_handle_surface(src, "<synthetic-apply-first>")[
+        "Door.apply_first"]
     assert _kind(fact) == "apply-first", fact
+
+
+def test_the_census_does_not_collapse_two_same_named_writers():
+    """The bare-name collision, pinned as a synthetic RED (#9124 review, r2).
+
+    Two classes, one method name: `Foo.door` declares a lane, `Bar.door` does
+    not. Under the pre-fix bare-name keying both facts merged into ONE, and the
+    merged `scopes` came from `Foo.door` — so `Bar.door` read `declared` and an
+    UNDECLARED writer passed the census. The keys are scope-qualified now, so
+    each is classified on its own and the undeclared twin is visible.
+    """
+    src = '''
+def _emit_event(*a, **k):
+    return True
+
+
+class Foo:
+    def door(self, proj, pid):
+        self._emit_event("PointAdded", {"id": pid})
+        with _live_write_scope("foo"):
+            proj.g.query("CREATE (n:Point {id:$id})", params={"id": pid})
+
+
+class Bar:
+    def door(self, proj, pid):
+        self._emit_event("PointAdded", {"id": pid})
+        proj.g.query("CREATE (n:Point {id:$id})", params={"id": pid})
+'''
+    surface = enumerate_handle_surface(src, "<synthetic-collision>")
+    assert {"Foo.door", "Bar.door"} == set(surface), sorted(surface)
+    assert _kind(surface["Foo.door"]) == "declared", surface["Foo.door"]
+    assert _kind(surface["Bar.door"]) == "journal-first", surface["Bar.door"]
+    assert not surface["Bar.door"]["scopes"], (
+        "the undeclared twin inherited a scope from its same-named sibling — "
+        "that is the collapse the scope-qualified key removes")
+    assert surface["Bar.door"]["writes"], surface["Bar.door"]
 
 
 # ── the flip gate: arming requires a fully declared surface ───────────────
@@ -887,9 +1008,14 @@ class Door:
 #: `_ensure_indexes_declared` in `_graph_metadata_write_scope`. They are listed
 #: here rather than left in the flip gate's remainder, where part 2 would read
 #: "declare a lane below" and add exactly that redundant scope.
+#:
+#: ⛔ PAIRS ARE `(module, SCOPE-QUALIFIED function)` (#9124 review, round 2). A
+#: bare name would exempt EVERY same-named function in that module — the
+#: collision `enumerate_handle_surface` now keys away — and both functions here
+#: are methods of `FalkorProjection`.
 _CALLER_DECLARED = {
-    ("tortoise/projection/__init__.py", "_rebuild_all_replay"),
-    ("tortoise/projection/__init__.py", "_ensure_indexes_declared"),
+    ("tortoise/projection/__init__.py", "FalkorProjection._rebuild_all_replay"),
+    ("tortoise/projection/__init__.py", "FalkorProjection._ensure_indexes_declared"),
 }
 
 
@@ -991,7 +1117,7 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
     # Part 1's state: measuring, and the census must be able to see the remainder
     # it is measuring — a scanner that silently returns nothing would make the
     # check above vacuous on the day someone flips the switch.
-    sdk_seen = {name.split(":")[0]
+    sdk_seen = {_bare_name(name.split(":")[0])
                 for bucket in (provable, unproven)
                 for name in bucket.get("tortoise/sdk.py", [])}
     assert _all_inventoried() <= sdk_seen, (
@@ -1012,6 +1138,7 @@ def test_the_caller_declared_exemptions_are_still_caller_declared():
     for rel, callee in sorted(_CALLER_DECLARED):
         path = ROOT / rel
         tree = ast.parse(path.read_text(errors="replace"))
+        bare = _bare_name(callee)
         callers = []
         for func in [n for n in ast.walk(tree)
                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
@@ -1019,7 +1146,7 @@ def test_the_caller_declared_exemptions_are_still_caller_declared():
                 if isinstance(call, ast.Call):
                     target = getattr(call.func, "id", None) or getattr(
                         call.func, "attr", None)
-                    if target == callee:
+                    if target == bare:
                         callers.append(func)
         if not callers:
             offenders.append(f"{rel}::{callee} has no call site at all")

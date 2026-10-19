@@ -422,10 +422,12 @@ def test_the_landed_mode_measures_and_does_not_refuse(armed_sdk, measure_only):
     own write doors (measured: 16 failed / 4 errors across the four §17.1
     suites named in this module's docstring), so part 1 ships the detection and
     defers the refusal. This pin is what makes that sequencing explicit rather
-    than an oversight: it fails the day someone flips the switch without the
-    declarations — and `tests/test_9124_declared_live_doors.py`
-    (`test_arming_the_guard_requires_a_fully_declared_surface`) fails with the
-    list of what is still undeclared.
+    than an oversight — but it does NOT enforce the sequencing itself: the
+    `measure_only` fixture monkeypatches the constant to `False` before
+    asserting it is `False`, so this test cannot fail on a flip (the docstring
+    used to claim it did). `tests/test_9124_declared_live_doors.py`
+    (`test_arming_the_guard_requires_a_fully_declared_surface`) is the gate that
+    carries that duty and fails with the list of what is still undeclared.
     """
     proj = armed_sdk._get_proj()
     assert proj._journal_backed
@@ -501,7 +503,7 @@ def test_a_declared_door_writes_through_the_handle_with_no_declaration_of_its_ow
 
 # ── the schema-DDL decision (#9124's own, per the issue thread) ───────────
 
-def test_schema_ddl_survives_the_armed_guard(armed_sdk):
+def test_schema_ddl_survives_the_armed_guard(armed_sdk, enforced):
     """Schema DDL is INSIDE the guard's surface, and it declares itself.
 
     The issue thread measured the trap: `_ensure_indexes` runs the DDL sweep
@@ -514,10 +516,39 @@ def test_schema_ddl_survives_the_armed_guard(armed_sdk):
     So this asserts the OUTCOME (the indexes exist), not the absence of a log
     line: a guard that turned the §17.1 suites green while degrading retrieval
     must fail here.
+
+    ⛔ THE `enforced` FIXTURE IS THE TEST (#9124 review, round 2). Without it the
+    sweep ran in MEASURE mode, where `_refuse_unauthorized_cache_write` records
+    and returns — so deleting the `with _graph_metadata_write_scope("schema-ddl")`
+    wrapper changed nothing observable and this test passed on the pre-fix tree.
+
+    ⛔ AND SO IS THE DROP. The fixture's SDK CONSTRUCTS the projection, which runs
+    the sweep once in the (unarmed) default mode and leaves every index in the
+    catalogue; asserting that they exist afterwards therefore passes whether or
+    not the armed sweep created anything — measured: with `enforced` added and
+    the declaration deleted, this test still passed, because the indexes were
+    inherited from construction. So the two indexes the sweep owes are DROPPED
+    first (through the inner handle, escape (2) of the three the module's SCOPE
+    block names) and the test requires the ARMED sweep to put them back. Armed +
+    undeclared, the creation sites' `except Exception` swallow the refusal and
+    both assertions below red.
     """
     sdk = armed_sdk
     proj = sdk._get_proj()
     assert proj._journal_backed
+
+    # Remove the two indexes this test is about, so their presence afterwards is
+    # the armed sweep's work and nothing else.
+    proj.g._g.query("DROP INDEX ON :Point(pointKind)")
+    proj.g._g.query("CALL db.idx.fulltext.drop('Point')")
+    before = {str(cell) for row in proj.g.ro_query("CALL db.indexes()").result_set
+              for cell in row}
+    assert not any("pointKind" in c for c in before), (
+        "the fixture could not drop the Point range index, so the assertion "
+        f"below would pass vacuously; catalogue={sorted(before)}")
+    assert not any("content" in c and "search_keys" in c for c in before), (
+        "the fixture could not drop the Point fulltext index, so the assertion "
+        f"below would pass vacuously; catalogue={sorted(before)}")
 
     # Force the full sweep on the ARMED projection (the fast path would skip
     # it), which is the state in which the guard meets the DDL.
@@ -537,14 +568,76 @@ def test_schema_ddl_survives_the_armed_guard(armed_sdk):
 
 
 def test_the_schema_declaration_does_not_authorize_a_data_write(armed_sdk, enforced):
-    """The declaration covers the SCHEMA, not data.
+    """The declaration covers the SCHEMA, not data — OUTSIDE the sweep.
 
     `_ensure_indexes` opens the graph-metadata lane around the sweep. That must
     not become a general permission: a node write issued from ordinary code
     immediately after the sweep is still refused.
+
+    ⛔ WHAT THIS TEST DOES *NOT* SAY (#9124 review, round 2, restated because the
+    old source docstring claimed it did): it pins the boundary at the END of the
+    lane, not the sweep's contents. A `CREATE` added INSIDE
+    `_ensure_indexes_declared` sits inside the scope and IS authorized — the one
+    such write the sweep really makes (the `search_keys` flatten) is stated as
+    the lane's second obligation and pinned by
+    `test_the_schema_lane_also_authorizes_the_documented_corpus_fixup`.
     """
     proj = armed_sdk._get_proj()
     proj._schema_is_current = lambda: False
     proj._ensure_indexes()
     with pytest.raises(DirectCacheWriteRefused):
         proj.g.query("CREATE (n:Point {id:'handle-after-sweep'})")
+
+
+def test_the_schema_lane_also_authorizes_the_documented_corpus_fixup(
+        armed_sdk, enforced):
+    """The lane's SECOND obligation, executable (#9124 review, round 2).
+
+    `_ensure_indexes`' docstring says the graph-metadata lane also authorizes
+    exactly ONE corpus write: the `search_keys` array→string flatten inside
+    `_fix_point_search_keys`, which two `except` branches of the sweep reach.
+    That claim is only worth the test behind it, so this seeds the owed state
+    (a Point whose `search_keys` is still the pre-R2 ARRAY), runs the sweep with
+    the guard ARMED, and requires BOTH halves:
+
+      * the flatten LANDED — so the lane really does cover the corpus write. Drop
+        the `with _graph_metadata_write_scope("schema-ddl")` wrapper and the
+        `SET` is refused, `_fix_point_search_keys`' own `except Exception`
+        swallows it, `search_keys` stays an array and this assertion reddens;
+      * the lane is NOT a general permission — a `CREATE` issued after the sweep
+        returns is still refused (`DirectCacheWriteRefused`), which is the
+        boundary the companion test above pins from the other side.
+
+    The seed goes through the INNER handle (`proj.g._g`, escape (2) of the three
+    the module's SCOPE block names) on purpose: it is a test-only fixture write,
+    and the guarded handle would rightly refuse it under `enforced`.
+    """
+    sdk = armed_sdk
+    proj = sdk._get_proj()
+    assert proj._journal_backed
+
+    proj.g._g.query(
+        "CREATE (n:Point {id:'search-keys-owed', content:'owed search keys', "
+        "search_keys:['alpha','beta']})"
+    )
+    assert proj._array_valued_search_keys_exist(), (
+        "the fixture did not create the owed fixup state — without an array "
+        "`search_keys` the sweep never reaches `_fix_point_search_keys` and "
+        "this test would pass vacuously"
+    )
+
+    proj._schema_is_current = lambda: False
+    proj._ensure_indexes()  # must NOT raise: the lane authorizes the flatten
+
+    flat = proj.g.ro_query(
+        "MATCH (n:Point {id:'search-keys-owed'}) RETURN n.search_keys"
+    ).result_set[0][0]
+    assert flat == "alpha beta", (
+        "the schema lane's documented corpus fixup did not land — with the "
+        "guard ARMED an undeclared `SET n.search_keys` is refused and this "
+        "helper's own `except Exception` swallows it; "
+        f"search_keys={flat!r}"
+    )
+
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.query("CREATE (n:Point {id:'handle-after-fixup'})")
