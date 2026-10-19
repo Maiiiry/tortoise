@@ -2685,11 +2685,14 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 #        gate); L2 was kept because removing it would refuse strictly less
 #        than before.
 #        SCOPE OF L2, stated exactly because the difference is a live hole:
-#        the ``_is_bulk_wipe`` classifier runs in ``_GuardedGraph.query`` and
-#        ``FalkorProjection.query`` ONLY. The wrapper's other query verbs
-#        (``ro_query``, ``_query``, ``profile``, ``explain``,
-#        ``execute_command``) are overridden and carry the #3595 ``=~``
-#        operator guard, but NOT the bulk-wipe check — see KNOWN GAPS. (The
+#        the ``_is_bulk_wipe`` classifier runs in ``_GuardedGraph.query``,
+#        ``_GuardedGraph.call_procedure`` and ``FalkorProjection.query`` ONLY.
+#        (``call_procedure`` qualifies because the vendor pastes a
+#        caller-controlled ``procedure`` string into CYPHER position — #9209
+#        round 3.) The wrapper's other query verbs (``ro_query``, ``_query``,
+#        ``profile``, ``explain``, ``execute_command``) are overridden and carry
+#        the #3595 ``=~`` operator guard, but NOT the bulk-wipe check — see
+#        KNOWN GAPS. (The
 #        name check itself is not confined to a ``query`` verb: the L1 lane
 #        calls ``_assert_test_graph`` directly from ``rebuild_all`` and
 #        ``_wipe_all_nodes``, which is why the token, not L2, is the gate
@@ -2720,10 +2723,13 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 #     confirmation/authorization (e.g. ``team_delete`` requires the team name
 #     to match).
 #   * ``_GuardedGraph`` is a "guarded QUERY" wrapper, not a guarded handle, and
-#     only its ``query`` verb applies the bulk-wipe check. It EXPLICITLY
-#     defines ``query``, ``ro_query``, ``_query``, ``profile``, ``explain``
-#     and ``execute_command``; ``__getattr__`` forwards only the remaining,
-#     non-Cypher attributes (``name``, ``schema``, ...). So
+#     only its ``query`` and ``call_procedure`` verbs apply the bulk-wipe check
+#     (``call_procedure`` since #9209 round 3, because the vendor pastes a
+#     caller-controlled ``procedure`` string into CYPHER position). It
+#     EXPLICITLY defines ``query``, ``ro_query``, ``_query``, ``profile``,
+#     ``explain``, ``execute_command``, ``delete`` and ``call_procedure``;
+#     ``__getattr__`` forwards only the remaining, non-Cypher attributes
+#     (``name``, ``schema``, ``copy``, ...). So
 #     ``proj.g._query("MATCH (n) DETACH DELETE n")``, ``proj.g.profile(...)``
 #     (PROFILE executes) and ``proj.g.execute_command("GRAPH.QUERY", <graph>,
 #     "MATCH (n) DETACH DELETE n")`` each reach a whole-graph wipe on a
@@ -3364,13 +3370,21 @@ class DirectCacheWriteRefused(RuntimeError):
     """§17.1: a write reached the derived cache without authorization.
 
     Raised when a fold (`FalkorProjection.apply`), a mutating statement on the
-    public raw-query lane (`FalkorProjection.query`), or a whole-graph
-    destruction through the write handle's non-Cypher verbs (`GRAPH.DELETE` via
-    `proj.g.delete()` / `proj.g.execute_command`, or the server-wide
-    `FLUSHALL` / `FLUSHDB`, #9209) is issued against a **journal-backed**
-    projection outside a sanctioned scope. The projection is the derived cache
-    of a journal; a write — or a wipe — it did not receive through its journal
-    is the second writer §17.1 forbids.
+    public raw-query lane (`FalkorProjection.query`), a whole-graph destruction
+    through the write handle's non-Cypher verbs (`GRAPH.DELETE` via
+    `proj.g.delete()` / `proj.g.execute_command`, #9209), or a server-wide
+    `FLUSHALL` / `FLUSHDB` is attempted against a **journal-backed**
+    projection. The projection is the derived cache of a journal; a write — or a
+    wipe — it did not receive through its journal is the second writer §17.1
+    forbids.
+
+    ⛔ THE THREE CLASSES DO NOT SHARE ONE AUTHORIZATION RULE, and this docstring
+    is where a caller looks before writing a `with` block, so stated apart: the
+    fold, the raw-query lane and `GRAPH.DELETE` are refused OUTSIDE a sanctioned
+    scope (so declaring one authorizes them); `FLUSHALL` / `FLUSHDB` are refused
+    on any journal-backed projection, scope or NOT — a declaration says "this
+    write is a projection of the journal", and no declaration can say that about
+    graphs this journal never wrote and no replay can restore.
     """
 
 
@@ -3616,9 +3630,12 @@ class _GuardedGraph:
     guard every query entry point against the #3595 ``=~`` operator. For
     defence in depth this wrapper also overrides every query entry point itself
     (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``,
-    ``execute_command``), so it does not depend on the inner handle's class to
-    refuse the ``=~`` operator. NOTE the override is NOT uniform: only
-    ``query`` applies the bulk-wipe check (L2) as well. The five query verbs
+    ``execute_command``, ``delete``, ``call_procedure``), so it does not depend
+    on the inner handle's class to refuse the ``=~`` operator. NOTE the override
+    is NOT uniform: only ``query`` and ``call_procedure`` apply the bulk-wipe
+    check (L2) as well — ``call_procedure`` since #9209 round 3, because the
+    vendor builds ``CALL <procedure>($paramN…)`` from a caller-controlled
+    string. The five query verbs
     (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``) carry ALL
     THREE pre-dispatch refusals — the #3595 operator guard, the #7174
     numeric-domain guard on their ``params``, and (since #8479) that same domain
@@ -14237,13 +14254,14 @@ class FalkorProjection(
         # on purpose — this method is the readable contract; the guarded
         # handle is the last line of defence for every other caller that goes
         # through it. Callers on ``proj.db``, on the wrapper's OTHER query
-        # verbs (``proj.g._query`` / ``profile`` / ``execute_command`` — only
-        # ``query`` applies the bulk-wipe check) bypass BOTH layers, as do the
-        # Cypher-bearing raw commands (``execute_command("GRAPH.QUERY", <g>,
-        # "MATCH (n) DETACH DELETE n")``). The non-Cypher ``GRAPH.DELETE``
-        # (``proj.g.delete()``) no longer does: since #9209 it is refused on a
-        # journal-backed projection outside a declared scope, and L2 is applied
-        # inside one — see the KNOWN GAPS note in the module comment.
+        # verbs (``proj.g._query`` / ``profile`` / ``execute_command`` — of the
+        # wrapper's verbs only ``query`` and ``call_procedure`` apply the
+        # bulk-wipe check) bypass BOTH layers, as do the Cypher-bearing raw
+        # commands (``execute_command("GRAPH.QUERY", <g>, "MATCH (n) DETACH
+        # DELETE n")``). The non-Cypher ``GRAPH.DELETE`` (``proj.g.delete()``)
+        # no longer does: since #9209 it is refused on a journal-backed
+        # projection outside a declared scope, and L2 is applied inside one —
+        # see the KNOWN GAPS note in the module comment.
         self._assert_test_graph(
             f"REFUSING to run bulk DETACH DELETE on non-test graph "
             f"({operation})"

@@ -223,7 +223,7 @@ def test_a_server_wide_flush_is_refused_even_inside_a_declared_scope():
     `_refuse_unauthorized_graph_wipe` and this fails — the in-scope flush is
     dispatched instead of raising.
     """
-    proj = _armed_projection(graph_name="test_9209", embedded=True)
+    proj = _armed_projection(graph_name="test_9209", embedded=False)
     guarded = _GuardedGraph(proj.g, proj)
 
     with _replay_write_scope(), pytest.raises(
@@ -498,7 +498,7 @@ def test_delete_judges_the_handles_own_graph_not_the_projections():
     projection) and the foreign-handle half of this test fails — the in-scope
     delete reaches the vendor handle.
     """
-    proj = _armed_projection(graph_name="test_9209", embedded=True)
+    proj = _armed_projection(graph_name="test_9209", embedded=False)
 
     foreign = _NamedRecordingGraph("team_other")
     with _replay_write_scope(), pytest.raises(
@@ -519,16 +519,24 @@ def test_delete_judges_the_handles_own_graph_not_the_projections():
 def test_a_declared_scope_reaches_a_disposable_graph():
     """The declared lane is not dead — otherwise the guard would be a wall.
 
-    Embedded is L2's declared exemption (the same one the Cypher verbs get), so
-    this proves the refusal is scoped to `_journal_backed and no scope`, not to
-    "delete is always refused".
+    This proves the refusal is scoped to `_journal_backed and no scope`, not to
+    "delete is always refused". It deliberately uses an `embedded=False`
+    projection with a `test_`-named graph, so L2's NAME branch actually runs:
+    the embedded exemption returns from `_assert_test_graph` early and would
+    keep this case green even if that branch were inverted.
     """
-    proj = _armed_projection(graph_name="test_9209", embedded=True)
+    proj = _armed_projection(graph_name="test_9209", embedded=False)
     guarded = _GuardedGraph(proj.g, proj)
 
     with _replay_write_scope():
         assert guarded.delete() == "OK"
     assert ("delete", (), {}) in proj.g.calls
+    assert proj._graph_name.startswith("test_"), (
+        "this case must exercise L2's NAME branch (embedded=False), so the "
+        "permitted path is proven with the disposability check actually "
+        "reading a name — an embedded projection returns from L2 early and "
+        "would keep the suite green if that branch inverted"
+    )
 
 
 def test_an_unarmed_projection_passes_through_unchanged():
