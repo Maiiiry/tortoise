@@ -1321,7 +1321,7 @@ def _modules_reaching_the_handle():
     return out
 
 
-#: Package-wide `(module, function)` pairs whose statement the static census cannot
+#: Package-wide `(module, SCOPE-QUALIFIED key)` pairs whose statement the census cannot
 #: resolve but a human has PROVEN read-only (it is a `MATCH … RETURN` whose
 #: interpolated fragment carries no write clause). Empty in part 1, and the flip
 #: is blocked without it. Bucketing is PER FUNCTION, so of the 308 unresolved
@@ -1331,7 +1331,31 @@ def _modules_reaching_the_handle():
 #: unproven — the per-function granularity is the limit of a source-order
 #: census). Filling one in is a reviewed act — and it is never the right remedy
 #: to wrap a read in a write lane.
+#:
+#: ⛔ THE KEY IS WHAT `enumerate_handle_surface` EMITS — scope-qualified, e.g.
+#: `("tortoise/sdk.py", "TortoiseSDK.delete_point")`, NOT `"delete_point"`. A
+#: bare-name entry is a SILENT NO-OP: accepted into the set, it changes nothing,
+#: and the gate keeps blocking the statement while its author believes it was
+#: proven read-only. `test_every_proven_read_names_a_real_census_entry` pins it.
 _PROVEN_READS: set[tuple[str, str]] = set()
+
+
+def test_every_proven_read_names_a_real_census_entry():
+    """A `_PROVEN_READS` entry must be a key the census actually emits.
+
+    Both consumers index the register with the SCOPE-QUALIFIED key, so an entry
+    in any other form would sit in the set and change nothing — the "stale flag
+    that is never revalidated" failure this suite exists to prevent. Empty today;
+    a part-2 entry must still prove its key.
+    """
+    surfaces = dict(_modules_reaching_the_handle())
+    offenders = [f"{rel}::{key}" for rel, key in sorted(_PROVEN_READS)
+                 if key not in surfaces.get(rel, {})]
+    assert not offenders, (
+        "these `_PROVEN_READS` entries name no census entry (wrong key form? the "
+        "census key is scope-qualified — `TortoiseSDK.delete_point`, not "
+        "`delete_point`) — the pin would be a silent no-op:\n  "
+        + "\n  ".join(offenders))
 
 
 def _is_unresolved_only(fact) -> bool:
@@ -1438,7 +1462,7 @@ def _call_is_inside_a_scope(func, callee) -> bool:
                 decorator.func, "attr", None)
             if opener in _LIVE_LANE_NAMES:
                 return True
-    for node in ast.walk(func):
+    for node in _own_body_nodes(func):
         if not isinstance(node, (ast.With, ast.AsyncWith)):
             continue
         if not any(isinstance(item.context_expr, ast.Call)
@@ -1450,6 +1474,23 @@ def _call_is_inside_a_scope(func, callee) -> bool:
             if _calls_within(body_node, callee):
                 return True
     return False
+
+
+def _own_body_nodes(func):
+    """This function's own statements, NOT crossing into a nested def/lambda.
+
+    A `with` opened inside a NESTED function is that function's lane, not the
+    caller's: walking the whole body would credit `def outer: def inner: with
+    scope: callee()` to `outer`, which holds no lane at all, and an exemption
+    whose callee runs outside any scope would then pass.
+    """
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
 
 
 def _calls_within(node, callee) -> bool:
