@@ -15,6 +15,7 @@ from __future__ import annotations  # noqa: I001
 
 import bisect
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -3244,6 +3245,16 @@ def _journal_safe_params(params, cypher=None):
 #     today — its `CREATE` still runs on the raw guarded handle, so the scope
 #     authorizes nothing yet; it becomes load-bearing when increment 3 replaces
 #     the `CREATE` with the fold.
+#     `TortoiseSDK.delete_point`, `invalidate_point`, `retract_point`,
+#     `supersede_point` and `create_direct_edge` declare the same lane through
+#     `_declares_live_write_lane` (#9206): each validates, appends its record,
+#     and only then writes, so the declaration is measured rather than
+#     asserted — `tests/test_9206_declared_write_lanes.py` fails on a declared
+#     door whose first mutating handle statement precedes its first append. On
+#     the raw handle these are RESERVED markers too (the handle is not armed on
+#     this tree); they are what §17.1's third door (#9124) will recognise when
+#     it arms, and until then they authorize only a fold, of which these doors
+#     issue none.
 #     The append is the COMMIT POINT (the ordering contract at the top of
 #     `tortoise/sdk.py`); the scope is opened immediately AFTER it, around the
 #     fold that follows — so the journal write is never inside the scope that
@@ -3357,6 +3368,51 @@ def _live_write_scope(reason: str = "live-door"):
 def _replay_write_scope():
     """The replay engines' scope: the record came FROM the journal."""
     return _cache_write_authorized("replay")
+
+
+def _declares_live_write_lane(reason: str):
+    """Declare a whole SDK write door as a journal-first live lane (#9206).
+
+    The equivalent of opening ``with _live_write_scope(reason):`` around the
+    door's body, for the doors whose write region IS the body. `delete_point`,
+    `invalidate_point`, `retract_point`, `supersede_point` and
+    `create_direct_edge` each validate, append their record, and then write —
+    hundreds of lines with `try`/`except` and retry blocks in between — so a
+    hand-placed ``with`` would reindent the whole region and bury the semantic
+    change (the declaration) inside a mechanical one. The decorator states the
+    same fact in one line.
+
+    ⛔ IT IS ONLY HONEST FOR A JOURNAL-FIRST DOOR. Wrapping the whole body also
+    authorizes anything issued BEFORE the append, so a declaration on an
+    apply-first door would bless a cache write with no committed record — the
+    #9068 defect, and the opposite of what §17.1 requires. That is not a
+    comment, it is CHECKED: `tests/test_9206_declared_write_lanes.py` pins, for
+    every declared door, that its first mutating handle statement is TEXTUALLY
+    after its first journal append, so a later edit that adds a write above the
+    append reddens there instead of silently widening the lane.
+
+    ⛔ IT ALSO AUTHORIZES EVERY NESTED CALL, which is a STATED residual rather
+    than an oversight: each of these doors calls `_mark_dirty`, and
+    `_mark_dirty` writes through the handle while appending no record (the
+    `:EpMeta`-adjacent dirty-flag flatten). Those writes are covered by the
+    door's lane, and a per-FUNCTION census cannot see the call edge. The set is
+    NAMED rather than assumed blessed, and a new no-journal write reached from a
+    declared door must be reviewed instead of inheriting the lane silently.
+
+    A per-call ContextVar scope, exactly like the inline form: nothing here is
+    an instance attribute, constructor argument or env switch, and it is
+    released in a ``finally`` (the ``with``), so a raising door cannot leak its
+    authorization into the caller's next write.
+    """
+    def _declare(fn):
+        @functools.wraps(fn)
+        def _declared(*args, **kwargs):
+            with _live_write_scope(reason):
+                return fn(*args, **kwargs)
+
+        return _declared
+
+    return _declare
 
 
 def _graph_metadata_write_scope(reason: str = "graph-metadata"):

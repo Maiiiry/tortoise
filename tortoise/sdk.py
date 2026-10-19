@@ -108,6 +108,9 @@ from . import file_indexer  # noqa: F401 — binds the classifier/identity modul
 from .projection import FalkorProjection
 # #7951 §17.1: the single-writer scope the live doors open around their fold.
 from .projection import _live_write_scope
+# #9206 §17.1: the same declaration for a door whose write region IS its body —
+# validate, append the record, then write, with the append strictly first.
+from .projection import _declares_live_write_lane
 # #9123 §17.1: the GRAPH-METADATA lane — a write with no journal record that
 # describes it, and whose loss a rebuild absorbs.
 from .projection import _graph_metadata_write_scope
@@ -12031,6 +12034,7 @@ class TortoiseSDK:
                     f"call retract_point({point_id!r}) instead."
                 ) from None
 
+    @_declares_live_write_lane("invalidate_point")
     def invalidate_point(self, id: str, corrected_by_id: str,
                          *, valid_to_precision: str | None = None) -> dict:
         """Mark a Point outdated, linked to its replacement via CORRECTS edge.
@@ -12196,6 +12200,7 @@ class TortoiseSDK:
             return self.supersede_point(old_id, new_id)
         return self.invalidate_point(old_id, new_id)
 
+    @_declares_live_write_lane("supersede_point")
     def supersede_point(self, old_id: str, new_id: str,
                         *, valid_from: str | None = None,
                         valid_to_precision: str | None = None) -> dict:
@@ -12916,6 +12921,7 @@ class TortoiseSDK:
             "edges_transferred": transferred,
         }
 
+    @_declares_live_write_lane("retract_point")
     def retract_point(self, id: str) -> dict:
         """Tombstone-retract a Point: status='retracted' (point stays in graph).
 
@@ -18224,6 +18230,7 @@ class TortoiseSDK:
                    reverse=True)
         return items[:limit]
 
+    @_declares_live_write_lane("create_direct_edge")
     def create_direct_edge(self, op_type: str, source_id: str, target_id: str, *,
                            direction: str | None = None,
                            confidence: float | None = None,
@@ -18364,6 +18371,44 @@ class TortoiseSDK:
         label_src = found[source_id][0]
         label_tgt = found[target_id][0]
 
+        # ── #9206 §17.1 — THE RECORD PRECEDES THE CACHE WRITE ON THIS DOOR ──
+        # The JSONL edge descriptor (plan §4.4) is emitted on EVERY write (the
+        # MERGE-keyed replay is idempotent, so dedup-hit emissions are
+        # harmless). It used to be emitted AFTER the MERGE, which is the
+        # apply-first shape §17.1's third door (#9124) refuses and the shape
+        # #7951 exists to remove: a crash — or a refused statement — between
+        # the MERGE and the emission left the CACHE AHEAD OF THE JOURNAL with
+        # no repair path, because no record describes the edge the replay
+        # would have to reconstruct. The payload is a function of the CALLER'S
+        # INTENT only (`src`/`tgt`/`edge_type`/`direction`/`confidence`/
+        # `weight`/`label`/`batch_id`), never of a post-write read-back, so it
+        # can be built before the first statement runs — the property
+        # `create_point`'s outbox form also rests on.
+        #
+        # ⛔ THE APPEND IS THE COMMIT POINT: if it could not be confirmed the
+        # cache is NOT written and the caller is told, exactly as
+        # `create_point`/`update_point` do. Writing anyway would put the cache
+        # in the lead again, one attempted append further along.
+        # REVIEW-FIX P1 (cycle-26): last-writer-wins attr updates must replay
+        # the FINAL attrs post-rebuild — unchanged by the reorder, because the
+        # attrs are the caller's.
+        _record_committed = self._emit_event(
+            "DirectEdgeCreated",
+            id=f"{source_id}->{target_id}:{op_type}",
+            src=source_id, tgt=target_id, edge_type=op_type,
+            direction=direction,
+            **({"confidence": float(confidence)} if confidence is not None else {}),
+            **({"weight": float(weight)} if weight is not None else {}),
+            **({"label": label} if label is not None else {}),
+            **({"batch_id": batch_id} if batch_id is not None else {}),
+        )
+        if _record_committed is False:
+            from .exceptions import WriteNotLandedError
+            raise WriteNotLandedError(
+                f"{source_id}->{target_id}:{op_type}",
+                getattr(proj, "graph_name", None),
+                operation="create_direct_edge")
+
         # BARE-pattern MERGE + attribute SET (last-writer-wins; exactly one
         # edge per (src,tgt,type)). `created` is detected by a pre-count
         # BEFORE the MERGE (the MERGE's stats aren't reliably surfaced, and a
@@ -18416,24 +18461,6 @@ class TortoiseSDK:
                 params={"id": source_id,
                         "now": _now_iso()},
             )
-
-        # JSONL edge descriptor (plan §4.4) — emitted on EVERY write (the
-        # MERGE-keyed replay is idempotent, so dedup-hit emissions are
-        # harmless, and the crash window closes: a crash between the MERGE
-        # and the emission on attempt 1 is recovered by attempt 2's emission —
-        # a created-only gate would lose the edge from the log forever on
-        # crash-retry). REVIEW-FIX P1 (cycle-26): last-writer-wins attr
-        # updates must replay the FINAL attrs post-rebuild.
-        self._emit_event(
-            "DirectEdgeCreated",
-            id=f"{source_id}->{target_id}:{op_type}",
-            src=source_id, tgt=target_id, edge_type=op_type,
-            direction=direction,
-            **({"confidence": float(confidence)} if confidence is not None else {}),
-            **({"weight": float(weight)} if weight is not None else {}),
-            **({"label": label} if label is not None else {}),
-            **({"batch_id": batch_id} if batch_id is not None else {}),
-        )
 
         self._mark_dirty([source_id, target_id])
         # Epic 903-C4 (#1242): a new direct edge changes the factor graph —
