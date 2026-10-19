@@ -7424,18 +7424,30 @@ function claimIntentInFlight() {
     return outcomes[orgId] || null
   }
 
-  // #8255: the ONE clearer for a retained ambiguous-failure notice — used by both
-  // supersede hooks in `regenerateKey` (a fresh attempt on the team, and the
-  // same-team path that has just produced the richer row-truth message). It only
-  // clears THAT team's `ambiguous` field: the record is also the reveal's home
-  // and the partial-state notice's, and another team's record is not ours to
-  // touch. Returning `prev` unchanged when there is nothing to clear is a React
+  // #8255: the ONE clearer for a retained ambiguous-failure notice — used by the
+  // two RESOLUTION hooks in `regenerateKey` (the same-team path that has just
+  // produced the richer row-truth message, and the definite-4xx branch that just
+  // completed the fresh read the notice asks for). It only clears THAT team's
+  // `ambiguous` field: the record is also the reveal's home and the
+  // partial-state notice's, and another team's record is not ours to touch.
+  // Returning `prev` unchanged when there is nothing to clear is a React
   // bail-out — no re-render, no state write.
-  function clearRotateAmbiguity(orgId) {
+  //
+  // #8255 (review P2): the clear is ROW-SCOPED and must name the key it is
+  // clearing. The notice is row-scoped copy (`… refresh the key list before
+  // relying on <row>`) and it is the only record that a destructive call has an
+  // UNKNOWN outcome, so dropping it for a different row — or for an attempt that
+  // resolved nothing — silently retires a disclosure nothing re-establishes.
+  // `ambiguousKeyId` is written by the latch beside `ambiguous`, so a caller that
+  // names a different key (or names none) leaves the record untouched, which is
+  // the fail-conservative direction: a true notice retained is a nuisance, a
+  // true notice dropped is the defect this whole disclosure exists to close.
+  function clearRotateAmbiguity(orgId, keyId) {
     setRotateOutcomes((prev) => {
       const cur = prev && prev[orgId]
       if (!cur || !cur.ambiguous) return prev
-      return { ...prev, [orgId]: { ...cur, ambiguous: '' } }
+      if (!keyId || cur.ambiguousKeyId !== keyId) return prev
+      return { ...prev, [orgId]: { ...cur, ambiguous: '', ambiguousKeyId: '' } }
     })
   }
 
@@ -7500,8 +7512,14 @@ function claimIntentInFlight() {
   // takes the same precedence class as the refusal — both are records the
   // transient, un-keyed `error` slot cannot hold (they must outlive a switch),
   // and both render ahead of a fresh transient detail rather than replacing it.
-  // The two are mutually superseding rather than coexisting by design: the
-  // same-team path clears the fallback once it has the richer row-truth message.
+  // They are NOT mutually exclusive, and this function deliberately does not
+  // assume it: the latch MERGES into the record, so a plaintext-less rotate's
+  // `refusal` and a later ambiguous failure's `ambiguous` can sit on the same
+  // team's record at once (and a switch across the second attempt then retains
+  // both). Coexisting is honest — the two answers are about different rows and
+  // each names its own — so they are composed rather than one being suppressed.
+  // The one supersede rule is ROW-scoped and lives in `clearRotateAmbiguity`:
+  // a notice is dropped only when something resolved THAT row's ambiguity.
   function errorBannerText(error, refusalText, ambiguousText) {
     const transient = errorMessage(error)
     const retained = [refusalText, ambiguousText].filter(Boolean).join(' ')
@@ -7621,12 +7639,16 @@ function claimIntentInFlight() {
     // there. Declared OUTSIDE the try so the catch's stale-response guard
     // reads the same value.
     const _teamAtCall = currentOrgId
-    // #8255: a retained ambiguous-failure notice for THIS team is superseded by
-    // a fresh attempt — the notice's own remedy ("refresh the key list before
-    // relying on this key") is exactly what this attempt performs, so leaving it
-    // latched would pair a stale "could not be confirmed" with the new attempt's
-    // outcome (a definite 4xx detail renders in the same banner).
-    clearRotateAmbiguity(_teamAtCall)
+    // #8255 (review P2): there is deliberately NO clear here. An earlier version
+    // cleared the team's retained ambiguity at attempt start, on the rationale
+    // that "the notice's remedy is exactly what this attempt performs" — but at
+    // attempt start NOTHING is known yet, and two outcomes of this attempt
+    // resolve nothing (a 402 sets the cap notice and performs no refresh; a
+    // definite 4xx that loses the team at its identity guard returns before the
+    // refresh too), so the disclosure was discarded and never re-established.
+    // The clear now lives at the two points that actually RESOLVE a notice: the
+    // same-team row-truth message below, and the definite-4xx branch AFTER its
+    // refresh has landed.
     try {
       // #2229/#4355: label carry-over — the row may leave the closure list
       // mid-flight (switch/refresh) — degrade to an unlabeled rotate. The
@@ -7818,6 +7840,10 @@ function claimIntentInFlight() {
             [_teamAtCall]: {
               ...prior,
               ambiguous: `The rotate request failed${why ? ` (${why})` : ''}, and its outcome could not be confirmed — refresh the key list before relying on ${rowName}.`,
+              // #8255 (review P2): the notice's SUBJECT, so the clearer can tell
+              // a later attempt on this row (which resolves it) from an attempt
+              // on a different row (which says nothing about this one).
+              ambiguousKeyId: keyId,
             },
           }
         })
@@ -7863,6 +7889,15 @@ function claimIntentInFlight() {
           await loadAll('')
         } catch { /* keep the server detail last — see above */ }
         if (orgIdRef.current !== _teamAtCall) return
+        // #8255 (review P2): THIS is where a definite refusal resolves a
+        // retained ambiguity — not at attempt start. The attempt has just
+        // completed the notice's own remedy (the key list was re-read, so the
+        // row the notice told the user to re-check is now on screen), which is
+        // the one thing that makes dropping it honest. Placed AFTER the
+        // identity guard on purpose: a switch across this refresh returns above
+        // and the notice stays latched for its owner, exactly as it does for a
+        // 402 (no refresh) or a switch at the RTT.
+        clearRotateAmbiguity(_teamAtCall, keyId)
         setError(e.message)
       } else {
         // #4355: any other failure may be a LOST RESPONSE, not a lost
@@ -7902,8 +7937,10 @@ function claimIntentInFlight() {
         // the fallback keeps ONE disclosure on screen instead of two variants of
         // the same notice. A switch during THIS refresh still returns at the
         // guard above, leaving the fallback latched for the owning team — that is
-        // the case it exists for.
-        clearRotateAmbiguity(_teamAtCall)
+        // the case it exists for. Row-scoped (review P2): `after` was located by
+        // THIS attempt's `keyId`, so the row truth that supersedes the notice is
+        // this row's and the clearer is given the same subject.
+        clearRotateAmbiguity(_teamAtCall, keyId)
       }
     } finally {
       setBusy(false)

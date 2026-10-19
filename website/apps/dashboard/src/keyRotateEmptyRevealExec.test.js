@@ -193,7 +193,7 @@ function derivedReveal(calls, orgId = 'org-A') {
 // harness stubs `api` instead of `mintKey`+`revokeKey`. `response` is the
 // rotate 2xx body; `reject` is the error object `api` throws (its `.status`
 // drives the 402 branch).
-function rotateEnv({ response, reject, loadAll, orgIdRef, apiImpl, lifetimeDays } = {}) {
+function rotateEnv({ response, reject, loadAll, orgIdRef, apiImpl, lifetimeDays, keys } = {}) {
   const calls = {
     rotateOutcomes: [], error: [], capNotice: [], loadAll: 0,
     api: [], order: [], welcomeKeys: [], wizardKeys: [],
@@ -204,7 +204,7 @@ function rotateEnv({ response, reject, loadAll, orgIdRef, apiImpl, lifetimeDays 
     // rather than for a missing identifier. The tests assert they stay unused.
     legacyRotatedKey: [], legacyRotateNotice: [],
   }
-  const rows = [
+  const rows = keys || [
     { id: 'k-old', key_id: 'k-old', name: 'residue row', key_prefix: 'tt_live_re',
       created_at: '2026-08-01T00:00:00.000Z' },
   ]
@@ -819,13 +819,16 @@ test('#8255: a fresh rotate attempt supersedes a retained notice — for its own
   // Two shapes, because the stale notice pairs differently with each:
   //  - a DEFINITE 4xx writes only the transient `error` slot, so nothing would
   //    drop a retained notice — the banner would show a stale ambiguity beside
-  //    the server's precise detail;
+  //    the server's precise detail (the clear runs AFTER that branch's refresh,
+  //    which is the remedy the notice asked for — see the #8255 review-P2 cases
+  //    below for the outcomes that resolve nothing and must NOT clear);
   //  - a success rewrites the record (which carries no `ambiguous` field), so
   //    the notice goes with it.
   // Retention is per team: another team's notice is not this attempt's to
-  // discard.
-  const stale = { plaintext: '', expiresAt: null, warning: '', ambiguous: 'outcome could not be confirmed' }
-  const heldC = { plaintext: 'tt_held_c', expiresAt: null, warning: '', ambiguous: 'C team notice' }
+  // discard. The seeded records carry their SUBJECT (`ambiguousKeyId`, written by
+  // the latch) because the clear is row-scoped since the #8255 review P2.
+  const stale = { plaintext: '', expiresAt: null, warning: '', ambiguous: 'outcome could not be confirmed', ambiguousKeyId: 'k-old' }
+  const heldC = { plaintext: 'tt_held_c', expiresAt: null, warning: '', ambiguous: 'C team notice', ambiguousKeyId: 'k-c' }
 
   const refused = rotateEnv({ reject: Object.assign(new Error(ROTATE_409_NOT_OCCUPYING), { status: 409 }) })
   refused.deps.setRotateOutcomes({ 'org-A': stale, 'org-C': heldC })
@@ -845,6 +848,84 @@ test('#8255: a fresh rotate attempt supersedes a retained notice — for its own
   assert.equal(recordOf(ok.calls, 'org-A').plaintext, 'tt_ok')
   assert.equal(derivedReveal(ok.calls, 'org-A'), 'tt_ok',
     'and the cleared notice does not cost the new replacement')
+})
+
+// ── #8255 (review P2): the supersede hook may not retire a notice it does not
+// resolve ──────────────────────────────────────────────────────────────────
+//
+// The first cut of the supersede hook cleared the team's retained ambiguity at
+// ATTEMPT START — before the request, before any outcome was known. The notice
+// is ROW-scoped copy (`… refresh the key list before relying on <row>`) and it
+// is the only record that a destructive call has an UNKNOWN outcome, so two
+// attempt shapes discarded a disclosure nothing re-established:
+//   - a 402 sets the cap notice and performs NO refresh;
+//   - a definite 4xx that loses the team at its identity guard returns before
+//     that branch's refresh too.
+// And the team-scoped clear took the notice for key A the moment the user
+// rotated key B. The three cases below are the pins; each reds on the pre-fix
+// shape because the attempt-start clear fired unconditionally.
+
+test('#8255 P2: a 402 retry does NOT retire a retained ambiguity — it resolves nothing', async () => {
+  const stale = {
+    plaintext: '', expiresAt: null, warning: '',
+    ambiguous: 'The rotate request failed, and its outcome could not be confirmed — refresh the key list before relying on residue row.',
+    ambiguousKeyId: 'k-old',
+  }
+  const env = rotateEnv({
+    reject: Object.assign(new Error('Team api_keys limit reached (2).'), { status: 402 }),
+  })
+  env.deps.setRotateOutcomes({ 'org-A': stale })
+  await env.regenerateKey('k-old')
+  const { calls } = env
+  assert.equal(calls.loadAll, 0, 'a 402 performs no refresh — the notice\u2019s remedy did NOT run')
+  assert.match(ambiguousOf(calls, 'org-A'), /could not be confirmed/,
+    'so the earlier unknown outcome must still be disclosed: dropping it would silence a rotate whose result was never confirmed')
+  assert.match(calls.capNotice.at(-1) || '', /rotate cap: /, 'and the over-cap notice still renders beside it')
+})
+
+test('#8255 P2: a definite 4xx retry on ANOTHER row does not retire this row\u2019s notice', async () => {
+  const stale = {
+    plaintext: '', expiresAt: null, warning: '',
+    ambiguous: 'The rotate request failed, and its outcome could not be confirmed — refresh the key list before relying on residue row.',
+    ambiguousKeyId: 'k-old',
+  }
+  const rows = [
+    { id: 'k-old', key_id: 'k-old', name: 'residue row', key_prefix: 'tt_live_re', created_at: '2026-08-01T00:00:00.000Z' },
+    { id: 'k-other', key_id: 'k-other', name: 'agent key', key_prefix: 'tt_agent', created_at: '2026-08-02T00:00:00.000Z' },
+  ]
+  const env = rotateEnv({
+    keys: rows,
+    reject: Object.assign(new Error(ROTATE_409_NOT_OCCUPYING), { status: 409 }),
+  })
+  env.deps.setRotateOutcomes({ 'org-A': stale })
+  await env.regenerateKey('k-other')
+  assert.equal(env.calls.loadAll, 1, 'the 4xx branch did refresh the list')
+  assert.match(ambiguousOf(env.calls, 'org-A'), /residue row/,
+    'but the notice names residue row, and this attempt was about agent key \u2014 a refresh of the list is not a resolution of THAT row\u2019s unknown outcome')
+  assert.equal(env.calls.error.filter(Boolean).at(-1), ROTATE_409_NOT_OCCUPYING,
+    'the fresh refusal detail still renders beside it \u2014 the banner composes both (they answer different rows)')
+})
+
+test('#8255 P2: a definite 4xx whose team switch lands at the RTT keeps the notice', async () => {
+  const stale = {
+    plaintext: '', expiresAt: null, warning: '',
+    ambiguous: 'The rotate request failed, and its outcome could not be confirmed — refresh the key list before relying on residue row.',
+    ambiguousKeyId: 'k-old',
+  }
+  const orgIdRef = { current: 'org-A' }
+  const env = rotateEnv({
+    orgIdRef,
+    apiImpl: async () => {
+      orgIdRef.current = 'org-B'
+      throw Object.assign(new Error(ROTATE_409_NOT_OCCUPYING), { status: 409 })
+    },
+  })
+  env.deps.setRotateOutcomes({ 'org-A': stale })
+  await env.regenerateKey('k-old')
+  assert.equal(env.calls.loadAll, 0,
+    'the identity guard returns before the 4xx branch\u2019s refresh, so that branch resolves nothing')
+  assert.match(ambiguousOf(env.calls, 'org-A'), /could not be confirmed/,
+    'the notice therefore stays latched for its owning team \u2014 the attempt neither confirmed nor superseded it')
 })
 
 test('#8255: only a genuinely ambiguous failure latches — a definite 4xx / 402 does not', async () => {

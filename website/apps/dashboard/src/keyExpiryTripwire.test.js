@@ -145,7 +145,7 @@ test('#2426: the show-once key card states the expiry (server echo / never)', ()
   //
   // The pins below are anchored on the CONTENT each latch writes rather than on
   // a bare `setRotateOutcomes((prev) =>` (regenerateKey now has several,
-  // including the #8255 supersede hooks), and "precedes the guard" is asserted
+  // including the #8255 clear hooks), and "precedes the guard" is asserted
   // against the 2xx path's own guard — the FIRST one in the function — so a
   // latch that drifts back below it reddens.
   const firstGuard = rotBody.indexOf('if (orgIdRef.current !== _teamAtCall) return')
@@ -194,6 +194,19 @@ test('#2426: the show-once key card states the expiry (server echo / never)', ()
     '#8255: the retained form is the WEAKER honest one — no row truth is readable for a team the user has left')
   assert.doesNotMatch(rotBody, /ambiguous: `[^`]*shows as revoked/,
     '#8255: the retained notice must never claim a row state it cannot read')
+  // #8255 (review P2): the clearer is ROW-scoped. The notice names one row, so a
+  // clear that cannot name that same key (or names none) must leave it latched —
+  // an attempt-start, team-wide clear retired the notice for key A when the user
+  // rotated key B, and for outcomes that resolve nothing at all (a 402, or a
+  // definite 4xx that loses the team at its guard). The behaviour pins for all
+  // three cases live in keyRotateEmptyRevealExec.test.js; these are the cheap
+  // shape backstops.
+  assert.match(mainJsx, /if \(!keyId \|\| cur\.ambiguousKeyId !== keyId\) return prev/,
+    'the ambiguity clearer must be scoped to the key the notice names (#8255 review P2)')
+  assert.match(rotBody, /ambiguousKeyId: keyId/,
+    'and the latch must write that subject beside the notice')
+  assert.doesNotMatch(rotBody, /clearRotateAmbiguity\(_teamAtCall\)/,
+    'no team-wide clear may run at attempt start — nothing is resolved at that point (#8255 review P2)')
   assert.match(rotBody, /has already been revoked/, 'the refusal must state the OLD key is already revoked')
   assert.match(rotBody, /\[_teamAtCall\]: \{ plaintext, expiresAt: \(mk && mk\.expires_at\) \|\| null, warning \}/,
     'rotate captures the server expiry echo + the partial-state warning into the per-team outcome')
