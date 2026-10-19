@@ -117,7 +117,9 @@ transaction stays open and unrolled-back on failure.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
+import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -126,20 +128,51 @@ from typing import Any
 
 from . import record_projection, status_vocabulary
 
+_logger = logging.getLogger(__name__)
+
 __all__ = [
+    "POSITION_ROW_DEFERRED_ON",
     "RECORD_DSN_ENV",
+    "RECORD_GRAPH_ENV",
+    "RECORD_ORG_ENV",
     "RecordWrite",
     "RecordWriteError",
     "RecordWriteOutcome",
     "RecordWriter",
+    "current_record_tenant",
     "record_dsn",
+    "record_tenant",
+    "use_record_tenant",
+    "write_live_record",
     "write_records",
 ]
+
+#: The record's position row (`public.journal_event`) is NOT written by the live
+#: path yet: a position is a fact only a bounded replay can derive, and the live
+#: chokepoint has no ordinal (`EventLog.append` reports nothing; there is no
+#: count accessor). Writing one anyway would collide on `(org_id, graph_id,
+#: seq)` with a later full replay's numbering — in silence. #9190 owns the
+#: ordinal; the live write passes `position=False` until it lands, and the FOUR
+#: ontology layers are unaffected (the position row is bookkeeping ABOUT them,
+#: not one of them).
+POSITION_ROW_DEFERRED_ON = "#9190"
 
 #: The arming key. Present ⇒ armed; unset/blank ⇒ ``NOT_ARMED``. See the module
 #: docstring, decision 2 — and note it is a DSN, not a boolean, so a second
 #: "enabled" flag would be a second thing to get out of step.
 RECORD_DSN_ENV = "TORTOISE_RECORD_DSN"
+
+#: The SINGLE-TENANT arming pair (#9078 scope decision 3). A deployment that
+#: serves exactly one graph may name it here instead of wrapping every write in
+#: :func:`use_record_tenant`. Both must be set or neither counts: a half pair is
+#: a misconfiguration and is refused like an unnamed tenant, never completed by
+#: guesswork.
+#:
+#: ⚠️ A MULTI-TENANT process must NOT arm this way — env is process-global, so
+#: every tenant's rows would be filed under one graph (#9192). Such a process
+#: sets :func:`use_record_tenant` per request, and that always wins.
+RECORD_ORG_ENV = "TORTOISE_RECORD_ORG_ID"
+RECORD_GRAPH_ENV = "TORTOISE_RECORD_GRAPH_ID"
 
 #: The DSN schemes a DB-API Postgres driver accepts. A value outside this set is
 #: a *misconfiguration*, never an unarmed state.
@@ -267,6 +300,74 @@ def record_dsn(explicit: str | None = None) -> str | None:
     return dsn
 
 
+#: The TENANT a live write is filed under, per call, resolved by the caller's
+#: own scope (`use_record_tenant`). #9192's hazard is a process-global tenant: a
+#: hosted process serves many tenant graphs, so a module-level or
+#: environment-supplied org/graph files tenant A's rows under tenant B with no
+#: error (the row is well-formed and the FK only checks that the graph exists).
+#: So this is a ContextVar the REQUEST sets, never an env fallback — env is
+#: process-global too, i.e. the same single value for every tenant the process
+#: serves. Unset ⇒ an armed write is REFUSED and counted (`no_tenant`), never
+#: guessed.
+_RECORD_TENANT: contextvars.ContextVar[tuple[str, str] | None] = (
+    contextvars.ContextVar("tortoise_record_tenant", default=None)
+)
+
+
+@contextlib.contextmanager
+def use_record_tenant(org_id: str, graph_id: str):
+    """File every record write in this scope under ``(org_id, graph_id)``.
+
+    The one way a live write learns its tenant. A hosted request wraps its write
+    path in this; a single-tenant process wraps its writes (or its whole serving
+    loop). It is a ContextVar, so two concurrent requests in one process cannot
+    see each other's tenant, and it nests.
+    """
+    if not (isinstance(org_id, str) and org_id
+            and isinstance(graph_id, str) and graph_id):
+        raise ValueError(
+            "use_record_tenant needs a non-empty org_id and graph_id — an "
+            "unnamed tenant is how a row lands under the wrong graph "
+            f"(got {org_id!r}, {graph_id!r})"
+        )
+    token = _RECORD_TENANT.set((org_id, graph_id))
+    try:
+        yield (org_id, graph_id)
+    finally:
+        _RECORD_TENANT.reset(token)
+
+
+def current_record_tenant() -> tuple[str, str] | None:
+    """The tenant this scope's record writes are filed under, or ``None``.
+
+    ``None`` is a REFUSAL for an armed write, not a default: the caller must say
+    whose data this is (see :func:`use_record_tenant`).
+    """
+    return _RECORD_TENANT.get()
+
+
+def record_tenant() -> tuple[str, str] | None:
+    """The tenant a LIVE write is filed under: the scope's, else the env pair.
+
+    Precedence is the point. A request-scoped tenant
+    (:func:`use_record_tenant`) is the only correct answer in a process that
+    serves more than one graph, so it always wins. The
+    :data:`RECORD_ORG_ENV`/:data:`RECORD_GRAPH_ENV` pair is the SINGLE-TENANT
+    deployment's arming surface (#9078 scope decision 3) — without it, arming
+    the record would require a code change at every call site, which is how a
+    capability ends up with no production caller again. A HALF-configured pair
+    is not a tenant: it is refused, not completed.
+    """
+    scoped = _RECORD_TENANT.get()
+    if scoped is not None:
+        return scoped
+    org_id = (os.environ.get(RECORD_ORG_ENV) or "").strip()
+    graph_id = (os.environ.get(RECORD_GRAPH_ENV) or "").strip()
+    if org_id and graph_id:
+        return (org_id, graph_id)
+    return None
+
+
 def _default_connect(dsn: str) -> Any:
     """Open the record's connection. The ONE place a driver choice lives.
 
@@ -314,6 +415,7 @@ class RecordWriter:
         graph_id: str,
         first_seq: int = 1,
         conn: Any | None = None,
+        position: bool = True,
     ) -> RecordWrite:
         """Apply `records` to the record, on a transaction the CALLER owns.
 
@@ -327,6 +429,12 @@ class RecordWriter:
         :param conn: an already-open connection to write on. Inject it to span
             the journal append and this projection in ONE transaction; the seam
             then neither opens nor closes nor commits it.
+        :param position: write the per-record ``journal_event`` position row
+            (default ``True``). The LIVE path passes ``False``: it has no
+            ordinal to record (
+            :data:`POSITION_ROW_DEFERRED_ON`, #9190), and a guessed one would
+            collide with a later replay's numbering in silence. The four
+            ontology layers are written either way.
 
         :raises RecordWriteError: the record was ARMED and the write did not
             happen (malformed DSN, unreachable record, totality refusal, or a
@@ -374,7 +482,7 @@ class RecordWriter:
         try:
             report = record_projection.replay(
                 records, target, org_id=org_id, graph_id=graph_id,
-                start_seq=first_seq,
+                start_seq=first_seq, position=position,
             )
         except Exception as exc:
             # Totality (an undeclared/refused record type raises before the
@@ -416,6 +524,7 @@ def write_records(
     graph_id: str,
     first_seq: int = 1,
     conn: Any | None = None,
+    position: bool = True,
     writer: RecordWriter | None = None,
 ) -> RecordWrite:
     """One-call form of :meth:`RecordWriter.write` — the chokepoint's entry point.
@@ -427,5 +536,81 @@ def write_records(
     have to invent one.
     """
     return (writer or RecordWriter()).write(
-        records, org_id=org_id, graph_id=graph_id, first_seq=first_seq, conn=conn,
+        records, org_id=org_id, graph_id=graph_id, first_seq=first_seq,
+        conn=conn, position=position,
     )
+
+
+def write_live_record(record: Mapping[str, Any]) -> RecordWrite | None:
+    """The LIVE door: one journal record that has ALREADY been appended.
+
+    Called at each of the three places the journal is appended on a live write
+    — `TortoiseSDK._emit_event`, `EventAPI._emit`, `ConversationMiner.
+    _emit_event` — so every producer's record reaches the record, not just the
+    SDK's. §17.1: the append is the commit point, so this runs after it and
+    before any cache fold.
+
+    Returns ``None`` when the record is not armed (no DSN): nothing was
+    attempted, no connection, no plan — the unarmed deployment is
+    byte-identical to the pre-record one (§2.0's sequence). Otherwise it
+    returns the write, and a FAILURE never raises: it is counted
+    (``monitoring.metrics()["record_write_failures"]``) and logged, because the
+    journal already holds the record and a question about the derived record
+    must not fail a write that persisted. ``replay`` heals the gap.
+
+    The transaction is THIS write's own (the journal append was a file append,
+    so there is nothing to span): the seam opens the connection, this commits
+    it, and it is closed on every path.
+
+    Cost, measured at #9188's head: an armed record costs ~one connection +
+    commit and ~4 ms of plan materialization (the fold re-reads the record
+    migrations to build its column map — `table_columns()` is deliberately
+    uncached, so a migration edit can never be read stale). That is a
+    DELIBERATE residual: one record, one transaction, no batching, because a
+    batch seam's ordering across three independent doors is a throughput
+    question with no measurement behind it yet.
+    """
+    from . import monitoring
+
+    try:
+        armed = record_dsn() is not None
+    except RecordWriteError as exc:
+        monitoring.record_record_write_failure("malformed_dsn")
+        _logger.warning("the record write did not happen (malformed_dsn): %s", exc)
+        return None
+    if not armed:
+        return None
+    tenant = record_tenant()
+    if tenant is None:
+        monitoring.record_record_write_failure("no_tenant")
+        _logger.warning(
+            "the record write did not happen (no_tenant) — the record is armed "
+            "but no tenant is in scope: wrap the write in "
+            "record_writer.use_record_tenant(org_id, graph_id) or set "
+            "%s/%s for a single-tenant deployment", RECORD_ORG_ENV,
+            RECORD_GRAPH_ENV,
+        )
+        return None
+    org_id, graph_id = tenant
+    connection: Any | None = None
+    try:
+        write = write_records([record], org_id=org_id, graph_id=graph_id,
+                              position=False)  # #9190: never invent a position
+        connection = write.connection
+        if connection is not None:
+            connection.commit()
+        return write
+    except Exception as exc:
+        monitoring.record_record_write_failure("write_failed")
+        _logger.warning(
+            "the record write did not happen (write_failed) — the journal has "
+            "the record and a replay heals the record: %s", exc,
+        )
+        return None
+    finally:
+        if connection is not None:
+            # Close AFTER the commit so an armed deployment does not leak one
+            # backend slot per journal record; a close failure must not mask a
+            # write failure that is already being reported above.
+            with contextlib.suppress(Exception):
+                connection.close()

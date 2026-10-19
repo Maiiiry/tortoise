@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+from . import record_writer
 from .idempotency import IngestKey, IngestResult
 from .ids import now_iso, ulid
 
@@ -153,6 +154,14 @@ class EventAPI:
         # before the append rather than after.
         self._refuse_unapproved_kinds(event)
         self.log.append(event)
+        # #9188: the Postgres record, AFTER the append (the commit point, §17.1)
+        # and before the fold. This door is a LIVE journal writer — the v1
+        # extractor, `ingest`, `docs_miner`, `mining` and the CLI all append
+        # through it — so without this call every one of their records would
+        # reach the journal and never the record. Best-effort by construction
+        # (`write_live_record` counts and logs, never raises): the append above
+        # already committed.
+        record_writer.write_live_record(event)
         if self.projection is not None:
             # #7951 §17.1: journal-first door — the append above is the COMMIT
             # POINT, so the fold runs inside the live-write scope.

@@ -671,6 +671,20 @@ AUDIT_FALLBACK_DROP_COUNT = Counter(
     "Audit events that reached no durable sink (#7924 review)",
     ["reason"],
 )
+# #9188 (epic #7879): an ARMED record write that did not happen — the Postgres
+# record is the truth under §2.0, but the live write is deliberately fail-soft
+# on the CAPTURE (the journal append already committed; a capture that raised
+# here would hand the caller a failure for a write that persisted, and would
+# kill the derived cache too). So a lost record row must be OBSERVABLE rather
+# than a log line nothing watches — the same "signal with no channel" class as
+# the journal counter above. ``reason`` is ``malformed_dsn`` · ``no_tenant`` ·
+# ``write_failed``, so the three fixes are distinguishable in one read.
+# Single writer: ``record_record_write_failure`` (the #501/#3677 house shape).
+RECORD_WRITE_FAILURE_COUNT = Counter(
+    "tortoise_record_write_failures_total",
+    "Armed record writes that did not happen (#9188)",
+    ["reason"],
+)
 # #4095: an allowlist-dropped telemetry key — the same loss class as the audit
 # drop above, and the exact defect #3821 fixed half-way. #3821's choke point
 # (``hosted_api._report_unregistered``) counts, warns once per site and never
@@ -1236,6 +1250,24 @@ def record_ingest() -> None:
 
 def record_error() -> None:
     ERROR_COUNT.inc()
+
+
+def record_record_write_failure(reason: str) -> None:
+    """Count one ARMED record write that did not happen (#9188).
+
+    ``reason`` is ``malformed_dsn`` (the DSN is configured but unusable),
+    ``no_tenant`` (armed with no tenant in scope — the write is refused rather
+    than filed under a guessed tenant, #9192) or ``write_failed`` (the record
+    was unreachable or the projection refused). Called from
+    ``TortoiseSDK._emit_event``'s record hook, whose swallow is deliberate for
+    the same reason the journal append's is: the capture already committed.
+    """
+    RECORD_WRITE_FAILURE_COUNT.labels(reason=reason).inc()
+
+
+def record_write_failure_counts() -> dict[str, int]:
+    """In-process snapshot of ``RECORD_WRITE_FAILURE_COUNT``, by reason (#9188)."""
+    return _collect_by_label(RECORD_WRITE_FAILURE_COUNT, "reason")
 
 
 def record_journal_write_failure() -> None:
@@ -4383,6 +4415,10 @@ def metrics(sdk=None, setup_timeout=None) -> dict:
         # real degradation (the derived graph becomes live-only), so it rides
         # the health/metrics surface rather than a log line nothing watches.
         "journal_write_failures": _counter_val(JOURNAL_WRITE_FAILURE_COUNT),
+        # #9188: the same channel for the record's write path — a layer row that
+        # never reached Postgres is exactly the class #4240 above made
+        # observable for the journal.
+        "record_write_failures": record_write_failure_counts(),
         # #7924 review P2: an audit event that reached no durable sink is
         # the same class of failure as a journal write, so it rides THIS
         # payload alongside ``journal_write_failures`` rather than a log line

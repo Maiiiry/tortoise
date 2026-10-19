@@ -1247,6 +1247,15 @@ surfaces:
   # SOURCE_PATTERN, so a change to it falls through to `core` — registering the
   # guard HERE is what makes the file selected for the code it holds.
   - test_5612_journal_append_serialization.py
+  # #9188 (epic #7879, #9078's wiring child): the record's FIRST production call
+  # site. `core` because every input it reads is `core`-selected — the three
+  # journal-append doors (`tortoise/sdk.py`, `tortoise/api.py`,
+  # `tortoise/mining.py`), `tortoise/record_writer.py`,
+  # `tortoise/record_projection.py`, `tortoise/monitoring.py` (all the `core`
+  # fallback) and `tools/record_wiring_check.py` (no SOURCE_PATTERN). DB-free
+  # except its last leg, which SKIPS unless `TEST_RECORD_DB_URI` names a
+  # Postgres carrying the record migrations — the `TEST_AUDIT_DB_URI` pattern.
+  - test_9078_record_written_by_production_path.py
   - test_kind_vocabulary_consistency.py
   # #9123 (§17.1's THIRD lane): the `:EpMeta` epoch declaration. BOTH its
   # subjects — `tortoise/projection/__init__.py` (the new
