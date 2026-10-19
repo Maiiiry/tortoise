@@ -105,6 +105,20 @@ class _RecordingGraph:
         raise AssertionError("no query may run in these cases")
 
 
+class _NamedRecordingGraph(_RecordingGraph):
+    """A recording handle that carries the vendor's ``name`` attribute.
+
+    `delete()` passes the handle's OWN graph name as the target, because the
+    wrapper is also built in-tree over a graph that is not the projection's
+    (`tortoise/hosted_api.py`), so "the projection's name" is not always "the
+    graph this verb removes".
+    """
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.name = name
+
+
 def _armed_projection(*, graph_name: str, embedded: bool):
     """An ARMED projection with no DB — the guard must fire before any I/O.
 
@@ -164,7 +178,7 @@ def test_GRAPH_DELETE_on_the_command_channel_is_refused_on_an_armed_projection(
 @pytest.mark.parametrize(
     "args",
     [("FLUSHALL",), ("flushall",), (b"FLUSHALL",), ("FLUSHALL", "ASYNC"),
-     ("FLUSHDB",), ("flushdb", "ASYNC")],
+     ("FLUSHALL ASYNC",), (b"flushall async",), ("FLUSHDB",), ("flushdb", "ASYNC")],
 )
 def test_a_server_wide_flush_is_refused_on_an_armed_projection(
     sdk_with_journal, args
@@ -176,6 +190,11 @@ def test_a_server_wide_flush_is_refused_on_an_armed_projection(
     same class as #9209 one level up (it takes EVERY graph on the server, not
     just this one). The module's own maxmemory message already told operators
     "do NOT FLUSHALL"; this is that advice enforced at the handle.
+
+    The joined-string spellings are included because the client SPLITS the
+    first argument at pack time (`redis.connection.*Serializer.pack`), so
+    ``"FLUSHALL ASYNC"`` is the same command as ``("FLUSHALL", "ASYNC")`` — a
+    classifier that reads one token would close the pair spelling only.
 
     MUTATION: drop ``FLUSHALL``/``FLUSHDB`` from
     ``_DESTRUCTIVE_HANDLE_COMMANDS`` and this fails with DID NOT RAISE and the
@@ -189,6 +208,70 @@ def test_a_server_wide_flush_is_refused_on_an_armed_projection(
         proj.g.execute_command(*args)
 
     assert _count(proj) == before, "the flush reached the server despite the refusal"
+
+
+def test_a_server_wide_flush_is_refused_even_inside_a_declared_scope():
+    """A declaration says "this WRITE is a projection of the journal".
+
+    It cannot say that about a flush: ``FLUSHALL`` also removes graphs this
+    journal never wrote and no replay can restore — and L2 (the disposability
+    check) reads THIS projection's name, so it can speak for exactly one graph
+    while the command takes all of them. Review round 2 measured that gap: with
+    a ``test_*``-named (or embedded) armed projection, an in-scope flush passed.
+
+    MUTATION: delete the ``_SERVER_WIDE_COMMANDS`` branch from
+    `_refuse_unauthorized_graph_wipe` and this fails — the in-scope flush is
+    dispatched instead of raising.
+    """
+    proj = _armed_projection(graph_name="test_9209", embedded=True)
+    guarded = _GuardedGraph(proj.g, proj)
+
+    with _replay_write_scope(), pytest.raises(
+        DirectCacheWriteRefused, match="EVERY graph"
+    ):
+        guarded.execute_command("FLUSHALL")
+    with _replay_write_scope(), pytest.raises(
+        DirectCacheWriteRefused, match="EVERY graph"
+    ):
+        guarded.execute_command("FLUSHDB", "ASYNC")
+
+    assert proj.g.calls == [], (
+        f"a server-wide flush reached the vendor handle; calls={proj.g.calls!r}"
+    )
+
+
+# ── the client splits the first argument: the joined spelling ─────────────
+
+
+@pytest.mark.parametrize("sep", [" ", "  ", "\t"])
+def test_a_joined_graph_delete_is_refused_like_the_two_argument_form(
+    sdk_with_journal, sep
+):
+    """Review finding, now a pin: the CLIENT splits the first argument.
+
+    Both serializers in the pinned ``redis`` do ``args[0].encode().split()``
+    before packing (their own comment: a caller may put "1 or more literal
+    arguments in the command name, e.g. 'CONFIG GET'"), so
+    ``execute_command("GRAPH.DELETE <graph>")`` and
+    ``execute_command("GRAPH.DELETE", "<graph>")`` arrive byte-identical. A
+    classifier that reads ``args[0]`` as ONE TOKEN therefore closes one spelling
+    and leaves the other open — the same spelling-shaped coverage defect #9209
+    exists to end. Whitespace variants are included because the splitter is
+    ``str.split()``, not a space-only split.
+
+    MUTATION: take the verb from ``args[0]`` verbatim instead of from
+    ``_handle_command_words`` and this fails with DID NOT RAISE, cache at 0.
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+    assert before > 0
+
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(f"GRAPH.DELETE{sep}{proj._graph_name}")
+
+    assert _count(proj) == before, (
+        "the joined-spelling wipe reached the server despite the refusal"
+    )
 
 
 # ── the forwarded attribute: proj.g.delete() ──────────────────────────────
@@ -329,6 +412,37 @@ def test_a_destructive_command_naming_another_graph_is_refused():
     )
 
 
+def test_delete_judges_the_handles_own_graph_not_the_projections():
+    """Review finding, now a pin: `delete()` must name the graph it REMOVES.
+
+    The wrapper is built in-tree over a graph that is not the projection's own
+    — `tortoise/hosted_api.py` does `_GuardedGraph(proj.db.select_graph(name),
+    proj)` — so judging a `delete()` by `_proj._graph_name` would authorize it
+    against a name it does not delete, the same defect round 1 fixed for the
+    command channel, one spelling over.
+
+    MUTATION: pass `target=None` from `delete()` (i.e. judge only the
+    projection) and the foreign-handle half of this test fails — the in-scope
+    delete reaches the vendor handle.
+    """
+    proj = _armed_projection(graph_name="test_9209", embedded=True)
+
+    foreign = _NamedRecordingGraph("team_other")
+    with _replay_write_scope(), pytest.raises(
+        DirectCacheWriteRefused, match="not 'team_other'"
+    ):
+        _GuardedGraph(foreign, proj).delete()
+    assert foreign.calls == [], f"a foreign delete dispatched: {foreign.calls!r}"
+
+    own = _NamedRecordingGraph("test_9209")
+    with _replay_write_scope():
+        assert _GuardedGraph(own, proj).delete() == "OK"
+    assert [c[0] for c in own.calls] == ["delete"], (
+        "the declared lane must still reach a disposable graph named like the "
+        "projection's"
+    )
+
+
 def test_a_declared_scope_reaches_a_disposable_graph():
     """The declared lane is not dead — otherwise the guard would be a wall.
 
@@ -369,11 +483,12 @@ def test_an_unarmed_projection_passes_through_unchanged():
 #: is the whole point: the #9209 hole was a verb nobody had enumerated.
 #:
 #: ⛔ `name`, `client` and `schema` are deliberately ABSENT: they are not verbs
-#: (`name` is a str, `client`/`schema` are handles), so the enumeration below
-#: does not see them. That is not an oversight being papered over — `client` is
-#: escape (3) of the module's SCOPE block by another door
-#: (`proj.g.client.execute_command(...)` reaches the same guarded CLIENT, which
-#: carries the #3595 operator guard and not §17.1's), and it is named there.
+#: (`name` is a str, `schema` is the client-side schema cache, `client` is a
+#: handle), so the enumeration below does not see them. That is not an oversight
+#: being papered over — `client` is escape (3) of the module's SCOPE block by
+#: another door (`proj.g.client.execute_command(...)` reaches the same guarded
+#: CLIENT, which carries the #3595 operator guard and not §17.1's), and it is
+#: named there.
 _NON_DESTRUCTIVE_FORWARDED = {
     "copy": "writes this cache INTO another graph; removes nothing here",
     "slowlog": "reads the server's slowlog",
@@ -419,9 +534,11 @@ def test_every_handle_verb_is_classified(sdk_with_journal):
     class-level verbs (``dir(type(handle))``) UNION per-instance bindings
     (``vars(handle)``), because the pinned vendor binds
     ``self.execute_command = client.execute_command`` in ``Graph.__init__`` and a
-    class-only enumeration cannot see it. Non-callable attributes (``name``,
-    ``client``, ``schema``) are handles or data, not verbs, and are classified
-    in the module's SCOPE block instead.
+    class-only enumeration cannot see it. Non-callable attributes are handles
+    or data, not verbs: ``name`` is a string, ``schema`` is the client-side
+    schema cache (``GraphSchema.clear`` only empties that object, ``refresh``
+    reads), and ``client`` is escape (3) of the module's SCOPE block by another
+    door. None of the three issues a destructive command.
 
     WHAT IT CANNOT SEE: a verb reached through a returned object
     (``handle.copy(x).delete()``), a dunder, or ``getattr`` by computed name.
