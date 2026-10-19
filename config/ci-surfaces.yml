@@ -6554,6 +6554,21 @@ durations:
   # restated figure re-staled for three review rounds. If you need the number, run
   # `ci_selection.duration_coverage_issues()` at YOUR head; do not quote this file.
   test_8093_registry_namespace_doc.py: 2.0
+  # `test_9079_onboarding_declared_lane.py` was added by a PR (#9153), and the
+  # refresher samples push-to-main runs only — so it joined the fast pool with
+  # NO row, which took the pool's durations coverage from 837/930 (exactly at the
+  # 90% floor) to 839/933 = 89.9% and redded `--integrity` on main and on every
+  # PR. This is the local reading under the `# unmeasured` convention (the same
+  # one the `test_mcp_safe_error_telemetry_8135.py` row above uses), NOT a CI
+  # junit value: embedded lane, 14 tests, sum of `testcase/@time` = 9.13s, wall
+  # 9.49s on 2026-10-19. Refresh from the first post-merge run that includes it.
+  test_9079_onboarding_declared_lane.py: 9.1
+  # Added by this PR (#9109), so it has no CI junit row for the same reason: the
+  # refresher samples push-to-main runs only. Local reading under the
+  # `# unmeasured` convention — embedded lane, 8 tests, sum of `testcase/@time`
+  # = 11.85s, wall 12.32s on 2026-10-19 (the eight pins each spawn the selector
+  # as a subprocess). Refresh from the first post-merge run that includes it.
+  test_ci_selection_changed_files_9109.py: 11.9
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py
