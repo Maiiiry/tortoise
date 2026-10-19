@@ -4547,6 +4547,13 @@ def _cmd_session(args) -> int:
         # it just created — refusing it for want of a hosted key would make the
         # one surface that exists to be accurate silent exactly there.
         return _cmd_session_disclosure(args)
+    if args.session_cmd == "health":
+        # #2100: likewise BEFORE the credential gate. It is answered from the
+        # LOCAL spool (counts + the durable refusal record), and the box that
+        # most needs to report `BLOCKED (n queued, 402)` is exactly the box whose
+        # captures are being refused — a health check that refused to run there
+        # would hide the state it exists to show.
+        return _cmd_session_health()
 
     # Transmitting-identity resolver (#2369 D1.2, #3660): this resolver runs
     # BEFORE dispatch, so the uploaders (`capture`) and the read-only
@@ -5226,6 +5233,55 @@ def _cmd_session_drain_best_effort(args) -> int:
     except Exception as e:
         print(f"spool drain: nothing filed — {e}", file=_sys.stderr)
         return 0
+    finally:
+        # #2100: EVERY drain exit reports the box's capture health, including
+        # the no-credential early return above. A box whose spool is blocked
+        # must say so on the lane's own log — otherwise "idle" is the only
+        # observable and it reads as "no idle lane".
+        _print_capture_health()
+
+
+def _print_capture_health() -> None:
+    """Print the per-box capture health line when it needs explaining (#2100).
+
+    Best-effort by construction: a health read must never break the exit-0
+    contract of the drain, and an `OK` line on every SessionStart would be
+    noise. Only a queue that is BLOCKED or BACKLOGGED is worth a lane's log.
+    """
+    import sys as _sys
+
+    try:
+        from tortoise.capture_spool import capture_health_line, spool_dir
+        line = capture_health_line(spool_dir())
+    except Exception:
+        return
+    # BLOCKED only: a BACKLOG on a normal SessionStart is usually the live
+    # session held back for its own final flush, and a line about it on every
+    # start is noise. `tortoise session health` reports the full picture.
+    if "BLOCKED" in line:
+        print(line, file=_sys.stderr)
+
+
+def _cmd_session_health() -> int:
+    """Print the per-box capture health line (#2100). Always exits 0.
+
+    Answered from the LOCAL spool — the queued captures and the durable refusal
+    record both legs write — so it needs no credential and no network. That is
+    the point: the box that most needs to report `capture: BLOCKED (n queued,
+    402)` is the box whose captures are being refused.
+
+    Real failures (an unreadable spool root) are REPORTED, never laundered into
+    a healthy reading: a health check that says `OK` when it could not look is
+    the false-PASS this line exists to prevent.
+    """
+    import sys as _sys
+
+    try:
+        from tortoise.capture_spool import capture_health_line, spool_dir
+        print(capture_health_line(spool_dir()))
+    except Exception as exc:
+        print(f"capture: UNKNOWN (health read failed: {exc})", file=_sys.stderr)
+    return 0
 
 
 def _record_drain_deferrals(root, summary) -> None:
@@ -9676,6 +9732,23 @@ def _cmd_doctor(args):
         results.append(("Capture hooks", "⚠️",
                         f"check unavailable: {str(e)[:60]}"))
 
+    # #2100: the capture SPOOL is a per-box health surface in its own right — a
+    # box whose graph quota is exhausted refuses every capture, and an operator
+    # who reads only "hooks installed" would call the box idle when it is
+    # blocked. `❌` only for BLOCKED: a backlog (a flaky network, entries in
+    # their backoff) clears by itself, so it warns rather than failing.
+    try:
+        from tortoise.capture_spool import capture_health_line, spool_dir
+        _capture_line = capture_health_line(spool_dir())
+        _capture_icon = "❌" if "BLOCKED" in _capture_line else (
+            "⚠️" if "BACKLOG" in _capture_line else "✅")
+        results.append(("Capture spool", _capture_icon, _capture_line))
+    except MemoryError:
+        raise
+    except Exception as e:
+        results.append(("Capture spool", "⚠️",
+                        f"check unavailable: {str(e)[:60]}"))
+
     # Print results
     for check, icon, detail in results:
         print(f"  {icon} {check}: {detail}")
@@ -11057,6 +11130,13 @@ def main(argv: list[str] | None = None) -> int:
     session_spool.add_argument(
         "--model", default=None, help="Model label to record with the session")
     session_list = session_sp.add_parser("list", help="List all sessions")  # noqa: F841
+    # #2100: the per-box capture health line — `capture: BLOCKED (320 queued,
+    # 402)`. Local-only (the spool + its durable refusal record), so it is
+    # readable on an idle box with no credential: "no idle lane" must never be
+    # the only explanation an operator can get.
+    session_sp.add_parser(
+        "health",
+        help="Report the per-box capture health line (spool state, refusals)")
     session_view = session_sp.add_parser("view", help="View a specific session")
     session_view.add_argument("id", help="Session ID")
     # #3517: the capture disclosure, rendered from runtime structured data. The

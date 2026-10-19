@@ -1453,3 +1453,63 @@ class TestDoctorPiSeamFreshness:
         assert "bytes differ" in row, (
             "the path merely LOOKS like a command; the detail names none, so "
             "it must survive: " + row)
+
+
+class TestCaptureSpoolHealthRow:
+    """#2100 — a quota-blocked box must be visible in the ONE health report an
+    operator already runs.
+
+    The measured failure: a cloud cell's capture spool held 320+ queued uploads,
+    every one `waiting on backoff` against an exhausted graph quota (402). The
+    box could not run a lane at all, and nothing in `doctor` said why — "Capture
+    hooks ✅" is true on a box that refuses every capture.
+    """
+
+    def test_a_blocked_spool_is_reported_with_its_count_and_status(
+            self, monkeypatch, clear_db_env, tmp_path, capsys):
+        """MUTATION THAT REDS THIS: drop the `Capture spool` row → doctor
+        reports the installed seam and says nothing about the refusal."""
+        import os
+
+        from tortoise import capture_spool as sp
+        from tortoise import config as _config
+
+        monkeypatch.setattr(
+            _config, "DEFAULT_DB_PATH",
+            os.path.join(str(tmp_path), ".tortoise", "tortoise.db"))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        root = sp.spool_dir()
+        for i in range(5):
+            sp.write_spool_entry(root, sp.Snapshot(
+                session_id=f"doctor-{i}",
+                turns=[{"role": "user", "content": "hi"}],
+                source="s.jsonl", machine_id="m" * 64, harness="claude"))
+        sp.flush_spool(
+            root,
+            lambda payload: sp.PostOutcome(ok=False, status=402, detail="quota"),
+            now=1000.0)
+
+        _run_doctor([])
+        out = capsys.readouterr().out
+        assert "Capture spool" in out, out
+        assert "capture: BLOCKED (5 queued, 402)" in out, out
+
+    def test_an_ordinary_spool_is_not_reported_as_blocked(
+            self, monkeypatch, clear_db_env, tmp_path, capsys):
+        """Positive control: the row must not cry BLOCKED on a healthy box, or
+        an operator learns to ignore it."""
+        import os
+
+        from tortoise import config as _config
+
+        monkeypatch.setattr(
+            _config, "DEFAULT_DB_PATH",
+            os.path.join(str(tmp_path), ".tortoise", "tortoise.db"))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        _run_doctor([])
+        out = capsys.readouterr().out
+        assert "Capture spool" in out, out
+        assert "capture: OK (0 queued)" in out, out
+        assert "BLOCKED" not in out, out

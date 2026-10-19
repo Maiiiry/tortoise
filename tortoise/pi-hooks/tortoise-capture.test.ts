@@ -28,6 +28,7 @@ import { join, dirname } from "node:path";
 import {
   CAPTURE_LANES,
   DISCARD_HTTP_REJECTED,
+  FLUSH_BUDGET_MS,
   HARNESS,
   MAX_ATTEMPTS,
   MAX_TURNS,
@@ -41,6 +42,7 @@ import {
   buildCapturePayload,
   captureKey,
   carriedWindow,
+  captureHealthLine,
   clampAttempts,
   clampWindow,
   classifyFailure,
@@ -57,6 +59,7 @@ import {
   postInstallProbe,
   pruneSpool,
   quarantineEntry,
+  readCaptureHealth,
   readDiscards,
   readSpoolEntry,
   readSpoolTurns,
@@ -2502,4 +2505,305 @@ test("#8531: an empty role is not a turn (the writers' contract on both legs)", 
   // the reader is not a role-VALUE filter. Only EMPTINESS is refused.
   writeFileSync(log, '{"role":"system","content":"policy"}\n');
   assert.deepEqual(readSpoolTurns(spool, sid), [{ role: "system", content: "policy" }]);
+});
+
+// ── (22) #2100 — a capture spool must never block a lane turn ──────────────
+//
+// The measured failure: a cloud cell's spool held 320+ queued uploads, every
+// one `waiting on backoff` because the hosted graph quota answered 402. The
+// lane log was 259–262 B — an `agent_end` with no assistant text and no tool
+// call — because the capture flush ran on the turn's own stack. One box's
+// observability feature made the box's capacity unusable while two sibling
+// boxes ran lanes normally.
+//
+// The four contracts pinned below are the issue's acceptance criteria:
+//   (1) the flush is ASYNC and hard time-bounded, and its failure is one line;
+//   (2) a quota/402 refusal is a NAMED state carrying the count;
+//   (3) the spool is CAPPED in items and bytes, drop-oldest;
+//   (4) a per-box health line reads `capture: BLOCKED (<n> queued, 402)`.
+
+/** Put a spooled entry INSIDE its backoff window — the cell's shape. */
+function armBackoff(spool: string, sessionId: string, untilMs = Date.now() + RETRY_MAX_MS): void {
+  const path = join(spool, "entries", `${entryKey(sessionId)}.meta.json`);
+  const meta = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  meta.attempts = 4;
+  meta.next_attempt_at_ms = untilMs;
+  writeFileSync(path, JSON.stringify(meta));
+  // Keep the age ordering deterministic ("backlog-0" is oldest) — the tiebreak
+  // is session_id, so callers must pad their ids.
+}
+
+/** A fetch that hangs until its AbortSignal fires (a real `fetch` on a
+ *  blackholed / quota-throttled endpoint), then rejects as AbortError. */
+function abortableFetch(): (url: string, init?: Record<string, unknown>) => Promise<never> {
+  return (_url, init) =>
+    new Promise<never>((_resolve, reject) => {
+      const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
+      signal?.addEventListener("abort", () => {
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        reject(err);
+      });
+    });
+}
+
+test("#2100: a backlogged spool never runs on the turn path (the turn completes)", async () => {
+  // REPRODUCTION. 60 queued captures, every one inside its backoff window —
+  // exactly the cell that could not run a lane. The turn must complete: the
+  // handlers return before ANY spool work starts, so the backlog cannot spend
+  // the startup budget.
+  //
+  // MUTATION THAT REDS THIS: run `flushSpool` inline in the handler (delete the
+  // `defer` scheduling) → the whole spool is scanned/attempted on the turn's
+  // own stack and `deferred.length` is 0.
+  const spool = tmpSpool();
+  for (let i = 0; i < 60; i += 1) {
+    const sid = `backlog-${String(i).padStart(3, "0")}`;
+    writeSpoolEntry(spool, snapshot(sid));
+    armBackoff(spool, sid);
+  }
+  const deferred: Array<() => void> = [];
+  const { fetchImpl, calls } = mockFetch([{ ok: true }]);
+  const pi = mockPi();
+  tortoiseCapture(pi as never, {
+    ...hermeticDeps(fetchImpl, spool),
+    defer: (fn: () => void) => { deferred.push(fn); },
+  });
+
+  const ctx = mockCtx({ entries: [], sessionId: "live" }) as never;
+  const started = Date.now();
+  await pi.handlers.session_start(undefined, ctx);
+  const logged: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    await pi.handlers.turn_end({}, mockCtx({ entries: PI_ENTRIES, sessionId: "live" }) as never);
+    await pi.handlers.agent_end({}, mockCtx({ entries: PI_ENTRIES, sessionId: "live" }) as never);
+  } finally {
+    console.log = original;
+  }
+  assert.ok(Date.now() - started < 2_000, "a turn must not spend its budget on the backlog");
+  assert.ok(deferred.length >= 1,
+    "the flush must be SCHEDULED off the turn path — running it inline is the block");
+  assert.equal(calls.filter((c) => /\/v1\/sessions$/.test(c.url)).length, 0,
+    "no spool upload may be attempted synchronously inside the turn");
+
+  // The scheduled flush still runs, and it NAMES the backlog with its count
+  // (a silent skip is the "growing silent backlog" the issue rejects).
+  console.log = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    for (const fn of deferred) fn();
+    await settle();
+  } finally {
+    console.log = original;
+  }
+  const line = logged.find((l) => l.includes("waiting on backoff"));
+  assert.ok(line, `the backlog must be reported: ${logged.join("\n")}`);
+  assert.match(line!, /skipped 60 \(60 waiting on backoff\)/);
+});
+
+test("#2100: the flush is HARD time-bounded even when every upload hangs", async () => {
+  // The endpoint is blackholed / throttled: each POST hangs until its own
+  // AbortSignal. 60 entries × the 10s per-request budget is a 10-minute flush.
+  // The flush must abandon the remainder at the wall-clock budget and SAY so.
+  //
+  // MUTATION THAT REDS THIS: drop the deadline (or give the request the full
+  // per-request timeout instead of `min(remaining, …)`) → this never settles.
+  const spool = tmpSpool();
+  for (let i = 0; i < 60; i += 1) {
+    writeSpoolEntry(spool, snapshot(`hang-${String(i).padStart(3, "0")}`));
+  }
+  assert.ok(FLUSH_BUDGET_MS > 0 && FLUSH_BUDGET_MS <= 15_000,
+    "a background flush needs a finite wall-clock budget, not a per-request one");
+  const started = Date.now();
+  const outcome = await Promise.race([
+    flushSpool(TEST_CFG, {
+      dir: spool,
+      fetchImpl: abortableFetch() as never,
+      budgetMs: 200,
+    }).then((s) => ({ summary: s })),
+    new Promise<{ summary?: never }>((resolve) => setTimeout(() => resolve({}), 4_000)),
+  ]);
+  const elapsed = Date.now() - started;
+  assert.ok(outcome.summary, `the flush must settle within its budget (took ${elapsed}ms)`);
+  assert.ok(elapsed < 3_000, `budget 200ms, took ${elapsed}ms`);
+  assert.equal(outcome.summary!.budgetExhausted, true,
+    "the abandoned remainder must be REPORTED, not silent");
+  assert.ok(outcome.summary!.attempted < 60,
+    "the budget must stop the loop, not merely shorten each request");
+  assert.ok(outcome.summary!.deferred >= 1, "the aborted upload is a deferral, not a loss");
+});
+
+test("#2100: a quota refusal is a NAMED state with the count (and clears on success)", async () => {
+  // ACCEPTANCE (2): a 402 must not be a growing silent backlog. It is recorded
+  // as `blocked` with the refusal status and the number still queued, so the
+  // operator (and the per-box health line) can say WHY the box is stuck.
+  //
+  // MUTATION THAT REDS THIS: keep counting only `deferred` (no quota bucket, no
+  // health record) → the state is unrecoverable from any surface.
+  const spool = tmpSpool();
+  for (let i = 0; i < 60; i += 1) {
+    writeSpoolEntry(spool, snapshot(`quota-${String(i).padStart(3, "0")}`));
+  }
+  const refused = await flushSpool(TEST_CFG, {
+    dir: spool,
+    fetchImpl: statusFetch(402, JSON.stringify({ code: "quota_exceeded" })).fetchImpl,
+    budgetMs: 30_000,
+  });
+  assert.equal(refused.quotaRefusals, 60, "every refusal must be counted as quota");
+
+  const health = readCaptureHealth(spool);
+  assert.ok(health, "the refusal must be durably recorded, not only logged");
+  assert.equal(health!.state, "blocked");
+  assert.equal(health!.status, 402);
+  assert.equal(health!.queued, 60, "the count must be the QUEUED captures");
+  assert.equal(captureHealthLine(spool), "capture: BLOCKED (60 queued, 402)");
+
+  // The quota frees up: the SAME captures file, and the blocked state is
+  // cleared — a stale BLOCKED would send an operator chasing a fixed problem.
+  const { fetchImpl } = mockFetch([{ ok: true }]);
+  const filed = await flushSpool(TEST_CFG, {
+    dir: spool,
+    fetchImpl,
+    budgetMs: 30_000,
+    now: Date.now() + RETRY_MAX_MS + 1, // step past the window the 402 armed
+  });
+  assert.equal(filed.filed, 60);
+  assert.equal(readCaptureHealth(spool)!.state, "ok");
+  assert.equal(captureHealthLine(spool), "capture: OK (0 queued)");
+});
+
+test("#2100: the extension prints the BLOCKED health line (an operator needs no command)", async () => {
+  // ACCEPTANCE (4) on the lane's OWN surface: the box's log must carry the
+  // health line, so "no idle lane" is never the only explanation available.
+  //
+  // MUTATION THAT REDS THIS: report only filed/deferred counts → a quota-blocked
+  // box's log never names the blocking status or the queued count.
+  const spool = tmpSpool();
+  for (let i = 0; i < 12; i += 1) {
+    writeSpoolEntry(spool, snapshot(`line-${String(i).padStart(3, "0")}`));
+  }
+  const deferred: Array<() => void> = [];
+  const pi = mockPi();
+  tortoiseCapture(pi as never, {
+    ...hermeticDeps(statusFetch(402, "quota exceeded").fetchImpl, spool),
+    defer: (fn: () => void) => { deferred.push(fn); },
+  });
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await pi.handlers.session_start(undefined, mockCtx({ entries: [], sessionId: "live" }) as never);
+    for (const fn of deferred) fn();
+    await settle();
+  } finally {
+    console.log = original;
+  }
+  assert.ok(
+    lines.some((l) => l.includes("capture: BLOCKED (12 queued, 402)")),
+    `the lane log must carry the per-box health line: ${lines.join("\n")}`,
+  );
+});
+
+test("#2100: a failing background flush is ONE line, never a blocked or crashed turn", async () => {
+  // A capture failure is an observation about the box, not a turn the user
+  // loses. The flush reports ONCE, and a fault inside it cannot escape the
+  // deferred callback as an unhandled exception on Pi's event loop.
+  //
+  // MUTATION THAT REDS THIS: drop the try/catch around the deferred callback →
+  // the fault propagates out of `setImmediate` as an uncaught exception.
+  const spool = tmpSpool();
+  for (let i = 0; i < 3; i += 1) {
+    writeSpoolEntry(spool, snapshot(`broken-${i}`));
+  }
+  const deferred: Array<() => void> = [];
+  const pi = mockPi();
+  const { fetchImpl } = mockFetch([{ ok: true }]);
+  tortoiseCapture(pi as never, {
+    ...hermeticDeps(fetchImpl, spool),
+    // A clock that fails models ANY fault in the flush's own setup: the point
+    // is what the extension does with it, not which throw it is.
+    now: () => { throw new Error("clock unavailable"); },
+    defer: (fn: () => void) => { deferred.push(fn); },
+  });
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await pi.handlers.session_start(undefined, mockCtx({ entries: [], sessionId: "live" }) as never);
+    for (const fn of deferred) fn();  // must NOT throw out of the callback
+    await settle();
+  } finally {
+    console.warn = original;
+  }
+  const errors = lines.filter((l) => l.includes("spool flush error"));
+  assert.equal(errors.length, 1,
+    `one line per FLUSH: ${lines.join("\n")}`);
+  assert.match(errors[0], /clock unavailable/);
+});
+
+test("#2100: the spool is CAPPED in items and bytes, dropping the OLDEST", () => {
+  // ACCEPTANCE (3). The bound already existed but was never pinned as a pair —
+  // and a bound that is not pinned is a bound that drifts. Drop-oldest (never
+  // newest) is what keeps the most recent captures through a long outage.
+  //
+  // MUTATION THAT REDS THIS: drop either ceiling condition from `pruneSpool`,
+  // or sort newest-first → the OLDEST capture survives and the newest is lost.
+  const itemCapped = tmpSpool();
+  const itemBounds = {
+    maxEntries: 5,
+    maxTotalBytes: 64 * 1024 * 1024,
+    maxEntryBytes: 16 * 1024 * 1024,
+  };
+  for (let i = 0; i < 8; i += 1) {
+    writeSpoolEntry(itemCapped, {
+      ...snapshot(`cap-${String(i).padStart(3, "0")}`),
+      turns: [{ role: "user", content: `turn ${i}` }],
+    });
+  }
+  // writeSpoolEntry prunes with the DEFAULT bounds, so re-apply the test bounds
+  // by writing one more entry through an explicit prune.
+  pruneSpool(itemCapped, undefined, itemBounds);
+  const survivors = readdirSync(join(itemCapped, "entries"))
+    .filter((n) => n.endsWith(".meta.json"))
+    .map((n) => n.replace(/\.meta\.json$/, ""))
+    .sort();
+  assert.equal(survivors.length, itemBounds.maxEntries,
+    `count ceiling not enforced: ${survivors.join(",")}`);
+  assert.ok(
+    survivors.includes(entryKey("cap-007")),
+    "the NEWEST capture must survive a count eviction",
+  );
+  assert.ok(
+    !survivors.includes(entryKey("cap-000")),
+    "the OLDEST capture must be the one evicted",
+  );
+  assert.ok(
+    readDiscards(itemCapped).some((d) => d.reason === "spool_count_exceeded"),
+    "an eviction is a loss and must be recorded",
+  );
+
+  const byteCapped = tmpSpool();
+  const byteBounds = {
+    maxEntries: 1000,
+    maxTotalBytes: 6_000,
+    maxEntryBytes: 16 * 1024 * 1024,
+  };
+  for (let i = 0; i < 4; i += 1) {
+    writeSpoolEntry(byteCapped, {
+      ...snapshot(`big-${String(i).padStart(3, "0")}`),
+      turns: [{ role: "user", content: "y".repeat(4_000) }],
+    });
+  }
+  pruneSpool(byteCapped, undefined, byteBounds);
+  const kept = readdirSync(join(byteCapped, "entries")).filter((n) => n.endsWith(".meta.json"));
+  assert.ok(kept.length < 4, `byte ceiling not enforced: ${kept.length} entries`);
+  assert.ok(
+    !kept.some((n) => n.startsWith(entryKey("big-000"))),
+    "the oldest capture must be evicted first under the byte ceiling",
+  );
+  assert.ok(
+    readDiscards(byteCapped).some((d) => d.reason === "spool_total_bytes_exceeded"),
+    "a byte eviction must be recorded",
+  );
 });

@@ -3120,3 +3120,185 @@ def test_an_empty_role_is_not_a_turn_on_either_leg(tmp_path):
         fh.write('{"role": "system", "content": "policy"}\n')
     assert [t["role"] for t in read_spool_turns(tmp_path, sid)] == \
         ["user", "assistant", "system"]
+
+
+# ── (22) #2100 — a capture spool must never block a lane turn ──────────────
+#
+# The measured failure: a cloud cell's spool held 320+ queued uploads, every
+# one `waiting on backoff` because the hosted graph quota answered 402. A
+# capture feature — pure observability — made that box's capacity unusable: the
+# lane log was 259–262 B, an `agent_end` with no assistant text and no tool
+# call, while two sibling boxes ran lanes normally.
+#
+# The Pi leg's half of that fix (a SCHEDULED, hard time-bounded flush) lives in
+# `tortoise/pi-hooks/tortoise-capture.ts` and its `node --test` suite. This half
+# pins the two surfaces BOTH legs share, because both write the same spool:
+#   (2) a quota/402 refusal is a NAMED state carrying the count;
+#   (4) the per-box health line `capture: BLOCKED (<n> queued, 402)`.
+
+
+def test_a_quota_refusal_is_recorded_as_a_named_blocked_state_with_the_count(tmp_path):
+    """ACCEPTANCE (2). 320 captures "waiting on backoff" was unrecoverable from
+    every surface: `session drain` printed counts and never said WHY. A 402 is
+    the org's graph quota — a state retrying cannot clear — so it is recorded
+    durably with the number still queued.
+
+    MUTATION THAT REDS THIS: count a 402 only in `deferred` (no quota bucket, no
+    health record) → nothing on the box names the blocking status.
+    """
+    from tortoise.capture_spool import capture_health_line, read_capture_health
+
+    root = tmp_path / "spool"
+    for i in range(50):
+        write_spool_entry(root, _snapshot(f"quota-{i:03d}"))
+
+    summary = flush_spool(
+        root,
+        _Server(PostOutcome(ok=False, status=402, detail="quota_exceeded")).post,
+        now=1000.0,
+    )
+    assert summary.quota_refusals == 50, "every refusal must be counted as quota"
+
+    health = read_capture_health(root)
+    assert health is not None, "the refusal must be DURABLE, not only a console line"
+    assert health["state"] == "blocked"
+    assert health["status"] == 402
+    assert health["queued"] == 50
+    assert capture_health_line(root) == "capture: BLOCKED (50 queued, 402)"
+
+
+def test_a_quota_block_survives_a_flush_that_attempts_nothing(tmp_path):
+    """The next drain finds every entry inside the window the 402 armed, so it
+    attempts NOTHING. Reading that as "no refusal" would flip the box to a
+    generic backlog and lose the only evidence of the quota block.
+
+    MUTATION THAT REDS THIS: drop the carry-forward branch of
+    `_record_capture_health` → the second flush records `backlog` and the health
+    line stops naming the 402.
+    """
+    from tortoise.capture_spool import capture_health_line, read_capture_health
+
+    root = tmp_path / "spool"
+    write_spool_entry(root, _snapshot("q-carry"))
+    flush_spool(root, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
+                now=1000.0)
+    assert read_capture_health(root)["state"] == "blocked"
+
+    # Inside the backoff window: nothing is attempted.
+    again = flush_spool(root, _Server().post, now=1000.0 + 1)
+    assert again.attempted == 0 and again.quota_refusals == 0
+    health = read_capture_health(root)
+    assert health["state"] == "blocked", "a block was forgotten by a no-op flush"
+    assert health["status"] == 402
+    assert capture_health_line(root) == "capture: BLOCKED (1 queued, 402)"
+
+
+def test_the_blocked_state_clears_once_the_captures_file(tmp_path):
+    """A stale BLOCKED sends an operator chasing a problem that is fixed.
+
+    MUTATION THAT REDS THIS: never rewrite the record on success → the line keeps
+    reporting a quota refusal after every capture landed.
+    """
+    from tortoise.capture_spool import (
+        RETRY_MAX_SECONDS,
+        capture_health_line,
+        read_capture_health,
+    )
+
+    root = tmp_path / "spool"
+    for i in range(3):
+        write_spool_entry(root, _snapshot(f"unblock-{i}"))
+    flush_spool(root, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
+                now=1000.0)
+    assert read_capture_health(root)["state"] == "blocked"
+
+    server = _Server()
+    filed = flush_spool(root, server.post,
+                        now=1000.0 + (RETRY_MAX_SECONDS + 60) * 1000)
+    assert filed.filed == 3
+    assert read_capture_health(root)["state"] == "ok"
+    assert capture_health_line(root) == "capture: OK (0 queued)"
+
+
+def test_a_network_backlog_is_not_reported_as_blocked(tmp_path):
+    """`BLOCKED` must mean "a refusal the client cannot fix". A flaky network is
+    a BACKLOG: it clears by itself, and reporting it as a quota block would send
+    an operator to raise a tier that was never the problem.
+
+    MUTATION THAT REDS THIS: report `blocked` for any queued entry → the two
+    causes become indistinguishable on the per-box line.
+    """
+    from tortoise.capture_spool import capture_health_line, read_capture_health
+
+    root = tmp_path / "spool"
+    write_spool_entry(root, _snapshot("net"))
+    flush_spool(root, _Server(PostOutcome(ok=False, detail="connection reset")).post,
+                now=1000.0)
+    health = read_capture_health(root)
+    assert health["state"] == "backlog"
+    assert "status" not in health, "a network failure has no HTTP refusal to name"
+    assert capture_health_line(root) == "capture: BACKLOG (1 queued)"
+
+
+def test_session_health_prints_the_line_and_always_exits_0(tmp_path, monkeypatch,
+                                                           capsys):
+    """ACCEPTANCE (4) on the CLI. A health check must be readable on an idle box
+    with no credential configured — it is answered from the SPOOL, not the
+    network, so it is dispatched before the api-key gate (the same rule
+    `session spool` / `session disclosure` follow).
+
+    MUTATION THAT REDS THIS: return 1 without an api key, or print a bare count
+    → the one surface an operator runs cannot say `BLOCKED (n queued, 402)`.
+    """
+    from tortoise import __main__ as cli
+    from tortoise.capture_spool import flush_spool
+
+    root = tmp_path / "spool"
+    for i in range(7):
+        write_spool_entry(root, _snapshot(f"cli-{i}"))
+    flush_spool(root, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
+                now=1000.0)
+
+    monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda: root)
+    monkeypatch.setattr(cli, "_resolve_config_path",
+                        lambda *a, **k: (None, {}, None, None))
+    assert cli.main(["session", "health"]) == 0
+    out = capsys.readouterr().out
+    assert "capture: BLOCKED (7 queued, 402)" in out, out
+
+
+def test_the_health_line_is_the_SAME_STRING_on_both_legs(tmp_path):
+    """The two legs share one spool directory, so a checker could run either.
+    A per-leg spelling (`BLOCKED (7 queued, HTTP 402)`) would make the fleet's
+    grep work on one box and silently fail on the next.
+
+    Runtime parity, not a source scan: Python writes and reads its own record,
+    then the REAL Pi function is asked about the SAME directory.
+
+    MUTATION THAT REDS THIS: change either leg's wording/punctuation → the two
+    strings differ.
+    """
+    from tortoise.capture_spool import capture_health_line
+
+    node = _node_that_can_strip_ts()
+    root = tmp_path / "spool"
+    for i in range(4):
+        write_spool_entry(root, _snapshot(f"parity-{i}"))
+    flush_spool(root, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
+                now=1000.0)
+    python_line = capture_health_line(root)
+    assert python_line == "capture: BLOCKED (4 queued, 402)"
+
+    ext = (REPO / "tortoise" / "pi-hooks" / "tortoise-capture.ts").as_uri()
+    driver = tmp_path / "health-parity.mjs"
+    driver.write_text(
+        f'import {{ captureHealthLine }} from "{ext}";\n'
+        f'console.log(captureHealthLine({json.dumps(str(root))}));\n',
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [node, "--experimental-strip-types", str(driver)],
+        capture_output=True, text=True, timeout=60, cwd=str(REPO),
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert proc.stdout.strip().splitlines()[-1] == python_line

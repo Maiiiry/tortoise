@@ -286,3 +286,34 @@ The Claude Code leg implements the same contract in `tortoise/capture_spool.py`,
 wired through `tortoise session capture` (write-before-upload) and
 `tortoise session drain` (run by `session-start.sh`). See
 `docs/plans/2026-09-17-3963-capture-spool.md`.
+
+### A backlogged spool never blocks a turn (#2100)
+
+A cloud cell once became unusable because of this spool: 320+ queued captures,
+every one `waiting on backoff` against an exhausted graph quota (402). The
+flush ran on the turn's own stack, so `session_start` consumed the whole turn —
+the lane log was 259–262 B, `agent_end` arrived with no assistant text and no
+tool call. Capture is observability; it must never be able to do that.
+
+Four properties are pinned by tests on both legs:
+
+- **Scheduled, never inline.** The extension hands the flush to `setImmediate`,
+  so neither the spool scan nor a request runs inside a handler Pi awaits.
+- **Hard time budget.** One flush gets `FLUSH_BUDGET_MS` (5 s) of wall clock,
+  shared across entries; a single upload gets `min(remaining budget, request
+  timeout)`. The remainder stays spooled and is reported
+  (`budgetExhausted`), never silently dropped.
+- **A refusal is a named state.** 402 / `quota_exceeded` is counted as
+  `quotaRefusals` and written durably to `health.json` in the spool as
+  `{"state":"blocked","status":402,"queued":N}`. It clears after captures
+  file; it is never a per-leg log line an operator has to decode.
+- **A per-box health line.** `tortoise session health` prints exactly
+  `capture: BLOCKED (<n> queued, 402)` (or `OK` / `BACKLOG`), answered from the
+  local spool with no credential and no network — so an idle box is never read
+  as "no idle lane". `tortoise doctor` carries the same line, and the
+  extension prints it on its own log whenever a flush is refused or a budget is
+  reached.
+
+The spool's ceilings are also part of the contract: **200 entries / 64 MiB**,
+oldest-first eviction with a recorded reason. A bound that only bites past the
+point where the spool has already made a box unusable is not a bound.

@@ -3415,7 +3415,10 @@ def test_every_capture_artifact_ships_in_the_wheel():
 # also flags the missing script/entry on its own, so the bump is what carries
 # the change to an install whose bytes are frozen at generation 3.
 _EXPECTED_INSTALL_CONTRACT = {"claude": 11, "codex": 3, "cursor": 4,
-                             "pi": 4}
+                             # 5: #2100 — the flush is scheduled + time-bounded,
+                             # a quota refusal is a named state. A generation-4
+                             # copy still runs the flush on the turn's stack.
+                             "pi": 5}
 
 
 @pytest.mark.parametrize("harness", sorted(_EXPECTED_INSTALL_CONTRACT))
@@ -3505,12 +3508,12 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
     siblings, so a stale installed copy is comparable rather than
     unmeasurable (#4680).
 
-    Mutation: delete ``// tortoise-hook-version: 4`` from
+    Mutation: delete ``// tortoise-hook-version: 5`` from
     ``tortoise/pi-hooks/tortoise-capture.ts`` — ``read_hook_version`` returns
     ``None``, ``contract_version_for('pi')`` returns ``None``, and both this
     test and the generation pin RED.
     """
-    assert hook_install.read_hook_version(_PI_SRC) == 4
+    assert hook_install.read_hook_version(_PI_SRC) == 5
     assert hook_install.count_canonical_markers(_PI_SRC) == 1, (
         "the Pi seam must carry exactly ONE column-0 marker (a second one is a "
         "site marker that would be mistaken for the contract)")
@@ -3526,7 +3529,7 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
 #: SHIPPED bytes and so compares equal by construction.  Edit the artifact, move
 #: the generation, update this pair — all three in one commit.
 _PINNED_PI_SEAM_INSTALL_CONTRACT = (
-    4, "cc8e496c03449d28f229cb1474e68c789f81d4d473c3f3a25156e1981ddaf498")
+    5, "60d1e8b69a880bdbbaf2b1a19f7c8b779e60a8b806bc5147d18b0835f1d532f2")
 
 #: One digest per generation from generation 3 forward, so "bytes changed,
 #: generation left alone" cannot be certified by editing the pair above by itself:
@@ -3537,6 +3540,10 @@ _PINNED_PI_SEAM_INSTALL_CONTRACT = (
 _GENERATION_DIGESTS = {
     3: "1f653d9b93775149c93838e6c9fbf70b44702341ac94e12f67ddb6480a8f0580",
     4: "cc8e496c03449d28f229cb1474e68c789f81d4d473c3f3a25156e1981ddaf498",
+    # 5 (#2100): the flush is scheduled + time-bounded, a quota refusal is a
+    # named `blocked` state with its queued count, and the capture health line
+    # exists. Generation 4 still runs the flush inline on the turn's stack.
+    5: "60d1e8b69a880bdbbaf2b1a19f7c8b779e60a8b806bc5147d18b0835f1d532f2",
 }
 
 
