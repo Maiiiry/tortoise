@@ -519,6 +519,18 @@ class WriteNotLandedError(RuntimeError):
             "EntityMutated op=delete" if operation == "delete_point"
             else "PointRevised" if operation == "update_point"
             else "PointAdded")
+        if record_committed and destroy_verified:
+            # `record_committed=True` says the record PRECEDED the cache write;
+            # `destroy_verified=True` says a read-back PROVED the destroy landed
+            # before the record was written. No door can be in both, and
+            # rendering the pair produced a message asserting "the Point was
+            # DESTROYED in the record and not in the cache … no read-back is
+            # involved on this arm" — a self-refuting refusal, which is the one
+            # thing this class exists to prevent (#7951, #9207).
+            raise ValueError(
+                "WriteNotLandedError: record_committed=True contradicts "
+                "destroy_verified=True — a committed record cannot precede the "
+                "destroy it describes; pass at most one of them")
         self.detail = detail
         self.record_committed = record_committed
         # `delete_point` ONLY. `record_committed=False` has two sub-cases on
@@ -612,7 +624,8 @@ class WriteNotLandedError(RuntimeError):
                 "cache is BEHIND the TRUTH (`missing_in_cache`: the journal still "
                 "holds the Point, the cache does not) — and the repair is a "
                 "DESTRUCTIVE `rebuild_all`, which re-creates the Point from the "
-                "journal"
+                "journal; the delete must then be RE-ISSUED, or the Point the "
+                "rebuild just restored stays live"
             )
         elif operation == "delete_point":
             # The DELETE door's unconfirmed arm, REWRITTEN FOR #9207's ORDER.

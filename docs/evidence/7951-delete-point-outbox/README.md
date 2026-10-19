@@ -21,8 +21,8 @@ mirror window that opened in exchange — a `DETACH DELETE` that does not land (
 engine/transport failure, the node still present) raised with the destruction record ALREADY
 committed, so `get_point` still served the Point while the journal claimed it was gone, and only a
 destructive `rebuild_all` could resolve it. ⛔ It is NOT a systematic pre-write refusal: §17.1's write
-door (#9124) gates the FOLD lanes, not the raw `proj.g.query` lane this door writes through — section 1
-of the probe below prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the guard armed, which is
+door (#9124) gates the FOLD lanes, not the raw `proj.g.query` lane this door writes through — section 4
+of the probe below (the residuals) prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the guard armed, which is
 why the failure in the test is INJECTED.
 The destroy is now issued FIRST (`MATCH … DETACH DELETE n`, with NO `RETURN` clause and no row-count
 gate) and the record follows only once that statement has RETURNED. Because a raise does not prove
@@ -32,9 +32,11 @@ present ⇒ the clean refusal, nothing recorded; unreadable ⇒ a third arm that
 states only that the destroy is UNVERIFIED (`destroy_verified=False`).
 
 **What this proves, and what it does not.** It proves the §17.1 **ordering** on the hard-delete door:
-no record can exist for a destroy the cache did not perform (a cache write that RAISES appends
-nothing — a zero-row write IS recorded, because the node is absent either way and the record is
-therefore true of the cache), and every residual window is reported rather than silent: a landed
+no record can exist for a destroy the cache did not perform — the record follows the VERIFIED cache
+state, so a cache write that raises appends nothing UNLESS the read-back proves the destroy landed (a
+lost reply over an applied write IS recorded: the cache is what the record describes), and a zero-row
+write IS recorded, because the node is absent either way. Every residual window is reported rather
+than silent: a landed
 destroy whose append failed is `record_committed=False`, a lost reply over an APPLIED destroy is
 recorded and logged, and an unreadable after-state raises an arm that asserts neither store. A
 completed delete stays durable across replay. It does
@@ -94,7 +96,7 @@ only (the worktree and the `mkdtemp` names are per-run); every measured line is 
 ```console
 $ TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
     tests/test_7951_delete_point_outbox.py -q
-14 passed
+15 passed
 ```
 
 `tests/test_7951_delete_point_outbox.py` carries the threat rows this door declares: T1 the ordering
@@ -106,7 +108,8 @@ whose append failed (reported, and repaired only by a destructive rebuild), T3b 
 prove "nothing was destroyed" (the door reads the cache back, so a lost reply over an APPLIED write is
 still recorded), T3d the landed-destroy arm's OWN reason (a lost reply over an APPLIED destroy whose append then
 fails must not be told "the `DETACH DELETE` did not report a failure of its own", which that path
-falsifies), T3c the unreadable state (`destroy_verified=False`: no record, and the message is
+falsifies), T3f the presence gate paid on the TRANSPORT family too (a dropped connection over a gone
+key: no read, no record, and the arm that claims nothing), T3c the unreadable state (`destroy_verified=False`: no record, and the message is
 asserted NOT to claim a store state it did not establish — it neither says the `DETACH DELETE` "did
 not report a failure of its own" (that raise is how the arm is reached), nor that "the cache no longer
 holds this Point", nor that a present node is "behind the TRUTH"; its PRESENT branch must send the
@@ -114,10 +117,11 @@ caller to a re-issue and must NOT send them to `rebuild_all`, which is the ABSEN
 all three clauses were false in the first cut of the shared prose), T4 no record for a no-op delete, T5 the
 record's declared shape, T6 the `:GraphEvent` subscriber row, T7 the journal-less (`None`) arm, T9 the
 evidence probe's own instrumentation, T10 the delete door's own record in the refusal and the graph on
-the cache clause. **T1/T2/T3/T3e/T8/T3b/T3c/T3d/T10 were measured RED against #9207's predecessor** (the
-record-first order: with the CURRENT 14-test file, `9 failed / 5 passed` at `origin/main` — T10
-reddens on its `update_point`
-record-noun assertion, which the predecessor answered with `PointAdded`), and the reason differs by row
+the cache clause. **T1/T2/T3/T3e/T3f/T8/T3b/T3c/T3d/T10 were measured RED against #9207's predecessor** (the
+record-first order: with the CURRENT 15-test file, `10 failed / 5 passed` at `origin/main` — T10
+reddens on its `update_point` record-noun assertion, which the predecessor answered with
+`PointAdded`, and T3f on the transport-family probe that gate has no analogue for), and the reason
+differs by row
 because the old order got each case wrong in its own direction: T1 read `['journal', 'cache']` (the record first); T2/T3c/T8
 read a committed `EntityMutated` op=delete over a cache that never performed the destroy; **T3** is
 different in kind — it reddens on its PREMISE, not on a lie: at `b77d24084` the door appended first,

@@ -1034,6 +1034,14 @@ def test_the_message_names_the_doors_own_record_and_graph():
     assert "EntityMutated op=delete" in unconfirmed_msg
     assert "PointAdded" not in unconfirmed_msg
 
+    # The two flags describe opposite histories (a record that PRECEDED the
+    # write vs a read-back that PROVED the write landed first), so the pair must
+    # never render: the message it produced asserted "DESTROYED in the record …
+    # no read-back is involved on this arm" — self-refuting.
+    with pytest.raises(ValueError, match="contradicts"):
+        WriteNotLandedError("p_1", "cache_graph", record_committed=True,
+                            operation="delete_point", destroy_verified=True)
+
     # The same defect, one door over: `update_point` writes `PointRevised`
     # (#7951 increment 2), so a caller that omits `record` must not be told a
     # `PointAdded` record is involved. No producer passes `record_committed=`

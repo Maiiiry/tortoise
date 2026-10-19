@@ -17,7 +17,8 @@ It demonstrates, against the shipped modules:
      Pre-#9207 the journal already held the destruction at that point — the
      divergence #9207 measured. ⛔ That trigger is NOT the §17.1 write door
      (#9124), which gates the FOLD lanes and not this door's raw `proj.g.query`
-     handle — section 1 below prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED`
+     handle — section 4 below (the residuals) prints
+     `RAW HANDLE LANE (proj.g.query): SUCCEEDED`
      with the guard armed. It is a generic engine/transport failure with the node
      still present: RARE, and why the ordering is argued from the DIRECTION of
      the divergence rather than its frequency. (A ZERO-ROW write is different,
