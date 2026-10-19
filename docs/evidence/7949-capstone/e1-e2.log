@@ -1,5 +1,5 @@
 E1E2-PROBE 1
-sha=3515c7585beaa65f589ba9dbdeecdf4344da5078
+sha=c2544f54f143e53ff5489b137ce1e9a52d3ed370
 corpus=e1e2_corpus.json corpus_sha256=e78d306ccb4bce73459c5c22b61122140ba860b1108d3eba2ebecb661cbdfe6b objects=25 points=115
 preg_embed_sha=1da0eb14a940faaeab921244cc95e4d842368ade233671a866e2f67563fb18f8 mint_skip_embed_sha=bd615d83d35b8d5559783a03e4878e45a06e83b2b777d1cc6abb1fefbf3f075c
 prereg=UNPREREGISTERED artifact=docs/evidence/7949-capstone/preregistration.json
@@ -115,6 +115,6 @@ e2-atomic before=114 after=114 fused_after=1 verdict=UNPREREGISTERED
 e2-atomic fused content='TortoiseSDK.ask and TortoiseSDK.ask_assembled do not exist; they were removed by #3849 / P' units=2 cause=SPLIT-not-implemented
 counterfactual arm=after-vet-arbiter reduction=0.000000 real_facts=90 state_values=42 note=NOT SCORED (mechanism absent from production)
 counterfactual arm=counterfactual-mint-skip reduction=0.225000 real_facts=90 state_values=42 note=NOT SCORED (mechanism absent from production)
-control variant=unreferenced-definite-descriptions arm=after-vet-arbiter stripped_objects=9 stripped_references=9 objects=16 the_prefix=6 share=0.375000 real_facts=90 removed=9 note=the same Objects the referenced corpus keeps are REMOVED when nothing references them, so the 0.0 pp is a corpus property (every Object wired to its statement), not a property of S2.2
+control variant=unreferenced-definite-descriptions arm=after-vet-arbiter stripped_objects=9 stripped_references=9 objects=16 the_prefix=6 share=0.375000 real_facts=90 removed=9 removed_names=["the timeout command", "the staging-only constraint", "the lane ownership rule", "the parity harness", "the vocabulary-pinned test", "the local route store gap", "the agent-infra workflow-lock issue", "the five previously ungrouped methods", "the declared adversarial acceptance criterion"] note=the same Objects the referenced corpus keeps are REMOVED when nothing references them, so the 0.0 pp is a corpus property (every Object wired to its statement), not a property of S2.2
 result=UNPREREGISTERED
 exit=3
