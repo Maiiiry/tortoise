@@ -2881,11 +2881,18 @@ async def _dispatch_webhooks(org_id: str, graph_namespace: str | None = None,
     (``_webhook_retry_sweep_pass``, #8098). Nothing on the write path ever
     awaits this: a capture must stay 2xx regardless of a subscriber's endpoint.
 
-    Best-effort by construction. ``dispatch_pending`` itself never raises; this
-    wrapper additionally catches the SDK/edge failures around it (an
-    unreachable graph, a build failure) and logs — a delivery problem must
-    never surface as a dream failure, and it must never abort the worker (the
-    roots are already drained; a raise here would be read as a dream bug).
+    Best-effort by construction. ``dispatch_pending`` raises nothing for a
+    delivery/graph problem; this wrapper additionally catches the SDK/edge
+    failures around it (an unreachable graph, a build failure) and logs — a
+    delivery problem must never surface as a dream failure, and it must never
+    abort the worker (the roots are already drained; a raise here would be read
+    as a dream bug).
+
+    The ONE thing ``dispatch_pending`` may raise is a §17.1 REFUSAL of its own
+    write (``DirectCacheWriteRefused``, a ``RuntimeError``). The ``except
+    Exception`` below is what contains it — one tenant's pass, not the worker —
+    so it is load-bearing, NOT dead code left over from an absolute never-raise
+    contract (#9233 review P2).
 
     Returns the dispatcher summary (``None`` when it could not run) so a caller
     can aggregate/assert on what actually happened.
@@ -3182,8 +3189,15 @@ async def _webhook_retry_sweep_pass() -> dict:
 
     Never raises for a delivery/graph problem (``_guarded_step`` still wraps it,
     but the contract here is the same best-effort one ``dispatch_pending``
-    keeps): a dead subscriber endpoint, an unreadable graph, or a failed
+    keeps) — a dead subscriber endpoint, an unreadable graph, or a failed
     enumeration costs this pass, never the loop.
+
+    Its ONE exception is inherited with the contract: a §17.1 refusal of the
+    delivery store's own write propagates out of ``dispatch_pending``, and the
+    per-graph ``_one`` step below is what contains it — so it costs this pass one
+    tenant's dispatch rather than the loop. Unlike a delivery problem, a refusal
+    is worth seeing in the pass's per-graph failure count, which is why it is not
+    swallowed there.
 
     Cancellation DOES propagate — shutdown cancels the loop task, so the pass
     must not swallow ``CancelledError`` to keep its ``_WEBHOOK_SWEEP_INFLIGHT``
@@ -27720,6 +27734,7 @@ async def create_context_subscription(
     """
     _require_scope(org, "graphs:write", "context subscription create")
     from tortoise import webhook_delivery as _webhook_delivery
+    from tortoise.projection import DirectCacheWriteRefused
 
     sdk = await _data_sdk_offloaded(org)
 
@@ -27734,6 +27749,18 @@ async def create_context_subscription(
         return await asyncio.to_thread(_create)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    except DirectCacheWriteRefused as e:
+        # §17.1: the subscription row never landed, so this is NOT a missing
+        # encryption key and must not be reported as one. `RuntimeError` below
+        # would otherwise answer 503 "webhook secrets are unavailable" for a
+        # refusal — a confidently wrong diagnosis of an internal write door,
+        # and a retryable-looking answer for something a retry cannot fix
+        # (#9233 review P2).
+        raise HTTPException(
+            status_code=500,
+            detail="the subscription store refused the write (§17.1) — the "
+                   "subscription was not created",
+        ) from e
     except RuntimeError as e:
         # TORTOISE_ENCRYPTION_KEY unset/malformed (crypto fail-loud contract).
         raise HTTPException(

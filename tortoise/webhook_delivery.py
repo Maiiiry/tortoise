@@ -208,13 +208,21 @@ def _run(proj, cypher: str, params: dict | None = None):
     `hosted_api`, which imports the projection, and a module-level import here
     would make the dependency direction circular.
 
-    ⛔ A REFUSAL MUST NOT BE SWALLOWED ANYWHERE ON THIS PATH. The two handlers
-    that exist for ordinary failures (the index DDL's "already exists", and the
-    dispatcher's cursor/receipt writes) re-raise `DirectCacheWriteRefused`
-    explicitly. A refusal means the statement never reached the store, so
-    treating it as success is the silent-loss shape §17.1 exists to prevent
-    (#9233 review P1 — measured: a refused cursor write reported `delivered=1`
-    with `cursor == 0`, re-POSTing the same event on every pass forever).
+    ⛔ A REFUSAL MUST NOT BE SWALLOWED ANYWHERE ON THIS PATH. Every broad handler
+    that wraps handle-touching work re-raises `DirectCacheWriteRefused`
+    explicitly first — the index DDL's "already exists"
+    (``ensure_subscription_schema``), the delivery pass's due/gate read
+    (``dispatch_pending``, defensive: that statement is provably read-only), its
+    cursor write, its failure write, and the receipt write and retention prune
+    (``_write_receipt``).
+
+    A refusal means the statement never reached the store, so treating it as
+    success is the silent-loss shape §17.1 exists to prevent (#9233 review P1 —
+    measured: a refused cursor write reported `delivered=1` with `cursor == 0`,
+    re-POSTing the same event on every pass forever). The PRUNE is the site the
+    first sweep missed (#9233 review P2): a refused prune stops `MAX_RECEIPTS`
+    retention permanently, behind a DEBUG line, and nothing but an explicit
+    re-raise makes it loud.
     """
     from tortoise.projection import _cache_write_authorized, _statement_writes
 
@@ -473,6 +481,8 @@ def read_receipts(proj, sub_id: str, limit: int = 50) -> list[dict]:
 def _write_receipt(proj, *, sub_id: str, event: dict, attempt: int, status: str,
                    http_status: int | None, error: str | None,
                    now: datetime, duration_ms: int) -> None:
+    from tortoise.projection import DirectCacheWriteRefused
+
     ensure_subscription_schema(proj)
     _run(proj,
         "CREATE (r:DeliveryReceipt {receipt_id:$rid, sub_id:$sid, "
@@ -493,6 +503,14 @@ def _write_receipt(proj, *, sub_id: str, event: dict, attempt: int, status: str,
             "DETACH DELETE r",
             params={"sid": sub_id, "keep": MAX_RECEIPTS},
         )
+    except DirectCacheWriteRefused:
+        # NOT an ordinary prune failure: the statement was REFUSED, so the
+        # retention bound never ran and `:DeliveryReceipt` growth is unbounded
+        # until someone sees it. Swallowing this behind a DEBUG line is the
+        # silent shape this module's declaration exists to prevent (#9233
+        # review P2) — the prune is a write of a label this lane declares, so a
+        # refusal is an asymmetric guard failure, not a graph hiccup.
+        raise
     except Exception:  # noqa: BLE001, RUF100
         logger.debug("webhook_delivery: receipt prune failed for %s", sub_id)
 
@@ -744,9 +762,11 @@ class WebhookTransport:
 def _status_code(value) -> int | None:
     """Coerce a transport's status to an int, or ``None`` when unusable.
 
-    Defensive on purpose: ``dispatch_pending`` promises never to raise, and a
-    transport (or a subclass) that returns a non-numeric status would otherwise
-    raise INSIDE the dispatch loop and escape to the dream worker as a failure.
+    Defensive on purpose: ``dispatch_pending`` promises never to raise FOR A
+    DELIVERY PROBLEM, and a transport (or a subclass) that returns a non-numeric
+    status would otherwise raise INSIDE the dispatch loop and escape to the
+    dream worker as one. (The one exception it DOES honour is a §17.1 refusal of
+    this module's own write — see ``dispatch_pending``.)
     """
     try:
         return int(value)
@@ -1064,8 +1084,22 @@ def _due_subscriptions(proj, now: datetime,
     return [r[0] for r in rows]
 
 
-def _mark_delivered(proj, sub: dict, event: dict, http_status: int | None,
-                    now: datetime, duration_ms: int) -> None:
+def _mark_delivered(proj, sub: dict, event: dict, now: datetime) -> None:
+    """The DELIVERY FACT: a 2xx landed, so the cursor moves (contract 1).
+
+    This is deliberately the cursor write ALONE. The receipt that records the
+    attempt is a separate write with a separate meaning (``_write_delivered``),
+    because the two can fail independently: once the cursor has moved the event
+    IS delivered and will not be re-POSTed, so a receipt failure after it is
+    bookkeeping loss — not a failed delivery, and not a reason to stop the batch
+    (#9233 review P2, measured: the composite call reported a DELIVERED event as
+    `failed` whenever the receipt half raised).
+
+    `_mark_failed` is the counterpart for a cursor write that did NOT land: the
+    at-least-once contract says re-deliver, and the failure must enter the
+    bounded-retry ladder — otherwise the same event is re-POSTed on every pass
+    with no backoff and `max_attempts` can never disable the subscription.
+    """
     _run(proj,
         "MATCH (s:ContextSubscription {sub_id:$id}) SET s.cursor=$cursor, "
         "s.attempts=0, s.next_attempt_at=NULL, s.delivered=s.delivered+1, "
@@ -1073,6 +1107,11 @@ def _mark_delivered(proj, sub: dict, event: dict, http_status: int | None,
         params={"id": sub["sub_id"], "cursor": int(event.get("seq") or 0),
                 "ts": _iso(now)},
     )
+
+
+def _write_delivered(proj, sub: dict, event: dict, http_status: int | None,
+                     now: datetime, duration_ms: int) -> None:
+    """The RECEIPT for a landed delivery — bookkeeping on top of the cursor."""
     _write_receipt(proj, sub_id=sub["sub_id"], event=event,
                    attempt=int(sub.get("attempts") or 0) + 1, status="delivered",
                    http_status=http_status, error=None, now=now,
@@ -1116,7 +1155,16 @@ def _mark_failed(proj, sub: dict, event: dict, http_status: int | None,
 
 def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                      batch: int = DEFAULT_BATCH) -> dict:
-    """Push pending events to every due subscription. NEVER raises.
+    """Push pending events to every due subscription.
+
+    Raises NOTHING for a delivery problem (contract 3) — with ONE exception: a
+    §17.1 REFUSAL of this module's own write (``DirectCacheWriteRefused``)
+    propagates, because it means the statement never landed and counting it as a
+    delivery is a cursor that never advances (#9233 review P1). A caller that
+    must keep running across a refusal catches ``Exception`` — both callers on
+    the delivery path (``hosted_api._dispatch_webhooks``, the retry sweep's
+    per-graph step) do exactly that, per graph, so a refusal costs one tenant's
+    pass rather than the loop.
 
     Three triggers, one predicate (#8098): the end of a tenant's dream cycle
     (``hosted_api._dream_worker`` — the cadence for NEW events), the SCHEDULED
@@ -1149,6 +1197,13 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
         # head is read ONCE here and threaded into the query (#8098 review F3).
         head = event_head_seq(proj.g)
         subs = _due_subscriptions(proj, now_dt, head=head)
+    except DirectCacheWriteRefused:
+        # Defensive, not hypothetical-code: `_due_subscriptions`' statement is
+        # provably READ-ONLY under the shared classifier, so today no refusal
+        # can reach here. Stating it in code rather than relying on the
+        # classifier means a future edit that makes the due query mutate cannot
+        # turn this handler into the silent swallow `_run` forbids.
+        raise
     except Exception as e:
         logger.warning("webhook_delivery: subscription read failed: %s",
                        redact_error(e))
@@ -1204,7 +1259,7 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
             duration_ms = int((time.monotonic() - started) * 1000)
             if error is None and 200 <= http_status < 300:
                 try:
-                    _mark_delivered(proj, sub, event, http_status, now_dt, duration_ms)
+                    _mark_delivered(proj, sub, event, now_dt)
                 except DirectCacheWriteRefused:
                     # A §17.1 refusal is not a subscriber failure: it means this
                     # module's own write never landed, so it must be loud rather
@@ -1214,13 +1269,41 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                     # The POST landed but the CURSOR did not. At-least-once says
                     # re-deliver, so the event must not be counted as delivered:
                     # reporting `delivered` while the cursor is unmoved is the
-                    # infinite re-POST this counter exists to make visible, and
-                    # `max_attempts` can never trip because the success path
-                    # never calls `_mark_failed`.
-                    logger.warning("webhook_delivery: cursor write failed for %s: %s",
-                                   sub.get("sub_id"), redact_error(e))
+                    # infinite re-POST this counter exists to make visible. It
+                    # must ALSO enter the bounded-retry ladder — counting it
+                    # without `_mark_failed` leaves the subscription due with no
+                    # backoff, so the SAME event is re-POSTed on every pass and
+                    # `max_attempts` can never disable it (#9233 review P2).
+                    cursor_error = "delivery cursor write failed: " + redact_error(e)
+                    logger.warning("webhook_delivery: %s for %s",
+                                   cursor_error, sub.get("sub_id"))
                     summary["failed"] += 1
-                    break
+                    try:
+                        if _mark_failed(proj, sub, event, http_status,
+                                        cursor_error, now_dt, duration_ms):
+                            summary["disabled"] += 1
+                    except DirectCacheWriteRefused:
+                        raise
+                    except Exception as e2:
+                        logger.warning(
+                            "webhook_delivery: failure write failed for %s: %s",
+                            sub.get("sub_id"), redact_error(e2))
+                    break  # head-of-line: retry THIS event first on the next pass
+                # The cursor MOVED: the event is delivered and will not be
+                # re-POSTed (contract 1). The receipt is bookkeeping on top of
+                # that fact, so its ordinary failure is logged and the delivery
+                # still counts — a receipt-loss must not be reported as a failed
+                # delivery, and it must not stop the rest of the batch
+                # (#9233 review P2).
+                try:
+                    _write_delivered(proj, sub, event, http_status, now_dt,
+                                     duration_ms)
+                except DirectCacheWriteRefused:
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "webhook_delivery: delivered receipt write failed for "
+                        "%s: %s", sub.get("sub_id"), redact_error(e))
                 summary["delivered"] += 1
                 continue
             summary["failed"] += 1

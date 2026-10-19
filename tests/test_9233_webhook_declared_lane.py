@@ -20,14 +20,15 @@ and this issue's contract is executable now instead of blocked on a sibling.
 `test_the_instrument_refuses_an_undeclared_write` is the control: without it every
 "declared" assertion below would also pass on a guard that refuses nothing.
 
-⛔ THE DECLARATION MUST NOT HIDE A REFUSAL. `_run` opens the lane, but two
+⛔ THE DECLARATION MUST NOT HIDE A REFUSAL. `_run` opens the lane, but three
 handlers on the delivery path exist for ORDINARY failures (the index DDL's
-"already exists", the dispatcher's cursor/receipt writes) and a broad `except
-Exception` there would count a refused statement as a completed write: measured
-before the fix, a refused cursor write returned `{'delivered': 1, …}` with
-`cursor == 0`, re-POSTing the same event on every pass forever (and
-`max_attempts` can never trip, because the success path never calls
-`_mark_failed`). Both are pinned below.
+"already exists", the dispatcher's cursor/receipt writes, and the receipt
+RETENTION PRUNE) and a broad `except Exception` there would count a refused
+statement as a completed write: measured before the fix, a refused cursor write
+returned `{'delivered': 1, …}` with `cursor == 0`, re-POSTing the same event on
+every pass forever (and `max_attempts` can never trip, because the success path
+never calls `_mark_failed`). All three are pinned below — the prune included,
+which the first sweep of this change missed (#9233 review P2).
 
 ⛔ THE DECLARATION IS NOT A DURABILITY UPGRADE, and this suite says so rather
 than implying it: `test_a_rebuild_does_not_restore_the_store` runs a REAL
@@ -75,9 +76,9 @@ _EXERCISED_READERS = frozenset({
     "read_receipts",
 })
 _STATED_OTHERS = {
-    "_write_receipt": "reached from _mark_delivered/_mark_failed, both exercised",
-    "_mark_delivered": "reached from dispatch_pending, exercised on a 200",
-    "_mark_failed": "reached from dispatch_pending, exercised on a 500",
+    "_write_receipt": "reached from _write_delivered/_mark_failed, both exercised",
+    "_mark_delivered": "the CURSOR write; reached from dispatch_pending on a 200",
+    "_mark_failed": "reached from dispatch_pending on a 500",
     "_due_subscriptions": "reached from dispatch_pending before every delivery",
 }
 
@@ -207,7 +208,8 @@ def _walk_the_write_set(proj) -> str:
     sub = wd.create_subscription(
         proj, url="https://hooks.example.com/cb", types=["PointAdded"],
         description="9233")
-    # a successful delivery: _mark_delivered + _write_receipt(CREATE) + the prune
+    # a successful delivery: _mark_delivered (cursor) + _write_delivered receipt
+    # (CREATE) + the retention prune
     wd.dispatch_pending(proj, transport=_ScriptedTransport([200]), batch=1)
     # a failed delivery: _mark_failed + _write_receipt(retrying)
     wd.dispatch_pending(proj, transport=_ScriptedTransport([500]), batch=1)
@@ -388,13 +390,19 @@ def test_a_cursor_failure_is_reported_as_failed_not_delivered(
     refusal). At-least-once says re-deliver, so the pass must not report the
     event as delivered: the summary is what a caller logs, and `delivered` with
     the cursor unmoved is the infinite re-POST of #9233 review P1 with a
-    non-refusal cause."""
+    non-refusal cause.
+
+    It must ALSO enter the bounded-retry ladder. Counting the failure without
+    calling `_mark_failed` leaves the subscription due with no backoff, so the
+    SAME event is re-POSTed on every pass forever and `max_attempts` can never
+    disable it — the identical harm, one branch over (#9233 review P2).
+    """
     from tortoise import webhook_delivery as wd
 
     proj = sdk_with_journal._get_proj()
     _seed_stream(proj, 2)
-    wd.create_subscription(proj, url="https://hooks.example.com/cb",
-                           types=["PointAdded"], description="9233 hiccup")
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 types=["PointAdded"], description="9233 hiccup")
 
     def _boom(*_a, **_kw):
         raise RuntimeError("graph hiccup on the cursor write")
@@ -407,6 +415,108 @@ def test_a_cursor_failure_is_reported_as_failed_not_delivered(
         f"log says the event landed when it will be re-POSTed: {summary}"
     )
     assert summary["failed"] >= 1, f"the failure is not counted at all: {summary}"
+
+    after = wd.get_subscription(proj, sub["sub_id"])
+    assert after["cursor"] == 0, f"the cursor moved, so this is not a cursor failure: {after}"
+    assert int(after["attempts"] or 0) >= 1, (
+        "the cursor failure did not enter the bounded-retry ladder (`attempts` "
+        "stayed 0), so the subscription stays due with no backoff and the same "
+        f"event is re-POSTed on every pass: {after}"
+    )
+    assert after["next_attempt_at"], (
+        f"no backoff was scheduled for the failed cursor write: {after}"
+    )
+
+
+def test_a_cursor_failure_can_disable_the_subscription(
+        sdk_with_journal, monkeypatch):
+    """`max_attempts` must be reachable from a cursor failure, not only from a
+    failed POST — otherwise the one path that re-POSTs the same event forever is
+    the one path the ceiling cannot stop (#9233 review P2)."""
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 2)
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 types=["PointAdded"], description="9233 ceiling")
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("graph hiccup on the cursor write")
+
+    monkeypatch.setattr(wd, "_mark_delivered", _boom)
+    monkeypatch.setenv("TORTOISE_WEBHOOK_MAX_ATTEMPTS", "1")
+    summary = wd.dispatch_pending(proj, transport=_ScriptedTransport([200]))
+
+    assert summary["disabled"] == 1, f"the attempt ceiling did not trip: {summary}"
+    assert wd.get_subscription(proj, sub["sub_id"])["disabled_at"], (
+        "a subscription whose cursor write keeps failing was left ENABLED, so "
+        "it is re-dispatched on every pass forever"
+    )
+
+
+def test_a_receipt_failure_after_the_cursor_moved_is_still_delivered(
+        sdk_with_journal, monkeypatch):
+    """The receipt is bookkeeping ON TOP of the delivery fact.
+
+    Measured before the fix: the guard wrapped the COMPOSITE `_mark_delivered`
+    (cursor SET + receipt CREATE + prune), so an ordinary failure in the receipt
+    half reported `failed` for an event whose cursor HAD advanced — a delivered
+    event the caller logs as failed, and a `break` that skipped the rest of the
+    batch on a receipt error rather than a cursor error (#9233 review P2).
+    """
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    seqs = _seed_stream(proj, 2)
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 types=["PointAdded"], description="9233 receipt")
+
+    def _receipt_boom(*_a, **_kw):
+        raise RuntimeError("receipt store hiccup")
+
+    monkeypatch.setattr(wd, "_write_receipt", _receipt_boom)
+    transport = _ScriptedTransport([200, 200])
+    summary = wd.dispatch_pending(proj, transport=transport)
+
+    assert summary["delivered"] == 2, (
+        "a receipt failure was counted as a FAILED DELIVERY (or stopped the "
+        f"batch) although the cursor moved for both events: {summary}"
+    )
+    assert summary["failed"] == 0, (
+        f"a delivered event was reported as failed: {summary}"
+    )
+    assert wd.get_subscription(proj, sub["sub_id"])["cursor"] == max(seqs), (
+        "the cursor did not advance past the delivered batch"
+    )
+
+
+def test_a_refused_prune_is_not_swallowed(sdk_with_journal, monkeypatch):
+    """The receipt RETENTION PRUNE is a write of a label this lane declares, and
+    it was the one mutating statement still wrapped in a bare `except
+    Exception` — so a §17.1 refusal there was logged at DEBUG and read as
+    success.
+
+    Reachable consequence: the prune is the ONLY bound on `:DeliveryReceipt`
+    growth, so a refused prune means unbounded node growth recorded behind a
+    DEBUG line. RED before the fix: the refusal was swallowed and
+    `dispatch_pending` returned normally (#9233 review P2).
+    """
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 2)
+    wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                           types=["PointAdded"], description="9233 prune")
+
+    seen = _instrument(monkeypatch, refuse="SKIP $keep")
+    with pytest.raises(DirectCacheWriteRefused):
+        wd.dispatch_pending(proj, transport=_ScriptedTransport([200]))
+
+    refused = [c for c, _r, _w in seen if "SKIP $keep" in c]
+    assert refused, (
+        "the fixture refused no statement — the prune never ran, so this test "
+        "proves nothing about it"
+    )
 
 
 def test_a_refused_index_ddl_does_not_cache_the_schema_flag(
@@ -507,18 +617,155 @@ def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
     return owner
 
 
-def _root_name(node: ast.AST) -> str | None:
-    """The ROOT identifier of an attribute/call chain (`proj.g.query(…)` -> proj)."""
+#: The graph verbs a FalkorDB handle exposes. A chain that crosses `g`/`db` is a
+#: handle call whatever the verb; a call on the PROJECTION itself
+#: (`proj.query(…)` — the public raw lane) is a handle call only for one of
+#: these, so `proj.rebuild_all()` is not mistaken for one.
+_GRAPH_VERBS = frozenset({
+    "query", "_query", "ro_query", "uquery", "execute_command",
+    "call_procedure", "create_node", "create_nodes", "create_edge",
+    "create_edges", "create_path", "create_paths", "delete", "merge",
+})
+
+_HANDLE_ROOTS = frozenset({"proj", "graph"})
+
+
+def _resolve(node: ast.AST, alias: dict[str, tuple[str, bool]]) -> tuple[str, bool] | None:
+    """``(root identifier, crossed_a_handle_attribute)`` for an attribute/call
+    chain, resolving local ALIASES (`g = proj.g` → ``("proj", True)``)."""
+    crossed = False
     while True:
         if isinstance(node, ast.Call):
             node = node.func
             continue
         if isinstance(node, ast.Attribute):
+            crossed = crossed or node.attr in {"g", "db"}
             node = node.value
             continue
         if isinstance(node, ast.Name):
-            return node.id
+            known = alias.get(node.id)
+            if known is not None:
+                return known[0], crossed or known[1]
+            return node.id, crossed
         return None
+
+
+def _alias_map(tree: ast.AST) -> dict[str, tuple[str, bool]]:
+    """``name -> (root, crossed)`` for every local binding rooted at a handle.
+
+    ⛔ WHY THIS EXISTS (#9233 review P2). The census used to match only chains
+    rooted at the LITERAL identifiers `proj`/`graph`, so a write reached through
+    an alias — `g = proj.g; g.query("CREATE …")` in `_run`, `_due_subscriptions`
+    or `dispatch_pending` — was invisible to the verb census, the reference pin
+    AND the raw-handle census. `proj.query(…)` (the public raw lane) was skipped
+    for the same class of reason: its chain contains no `g`/`db`. A refactor
+    could then satisfy "no new `_run` caller" and "no new handle reference"
+    while adding an undeclared writer.
+
+    Bindings are resolved transitively (`h = g` after `g = proj.g`), so one
+    further hop does not reopen the hole.
+    """
+    alias: dict[str, tuple[str, bool]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if (len(targets) != 1 or not isinstance(targets[0], ast.Name)
+                    or value is None):
+                continue
+            resolved = _resolve(value, alias)
+            if resolved is None or resolved[0] not in _HANDLE_ROOTS:
+                continue
+            if alias.get(targets[0].id) != resolved:
+                alias[targets[0].id] = resolved
+                changed = True
+    return alias
+
+
+def _root_name(node: ast.AST) -> str | None:
+    """The ROOT identifier of an attribute/call chain (`proj.g.query(…)` -> proj)."""
+    resolved = _resolve(node, {})
+    return resolved[0] if resolved else None
+
+
+def _handle_verb_sites(tree: ast.AST) -> dict[str, set[str]]:
+    """Every `(verb -> enclosing functions)` a handle-rooted call is issued from.
+
+    Alias- and public-lane-aware (`g = proj.g; g.query(…)`, `proj.query(…)`), so
+    the pin cannot be satisfied by renaming the receiver.
+    """
+    owner = _enclosing_functions(tree)
+    alias = _alias_map(tree)
+    verbs: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        resolved = _resolve(node.func, alias)
+        if resolved is None or resolved[0] != "proj":
+            continue
+        _root, crossed = resolved
+        chain = []
+        cur: ast.AST = node.func
+        while isinstance(cur, ast.Attribute):
+            chain.append(cur.attr)
+            cur = cur.value
+        # a handle-rooted chain (`…g.verb(` / `…db.verb(`), an alias OF one, or a
+        # graph verb on the projection itself (`proj.query` — the raw lane).
+        # `proj.rebuild_all()` is the projection's own API, not the handle.
+        if not (crossed or {"g", "db"} & set(chain)
+                or node.func.attr in _GRAPH_VERBS):
+            continue
+        verbs.setdefault(node.func.attr, set()).add(owner.get(id(node), "<module>"))
+    return verbs
+
+
+def _handle_reference_sites(tree: ast.AST) -> set[str]:
+    """Every function that references `proj.g` / `proj.db` — through an alias too."""
+    owner = _enclosing_functions(tree)
+    alias = _alias_map(tree)
+    sites: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or node.attr not in {"g", "db"}:
+            continue
+        resolved = _resolve(node.value, alias)
+        if resolved is not None and resolved[0] == "proj":
+            sites.add(owner.get(id(node), "<module>"))
+    return sites
+
+
+def _raw_handle_sites(tree: ast.AST) -> tuple[set[str], list[str], list[str]]:
+    """``(functions, unrendered, statements)`` for every RAW-handle graph verb."""
+    owner = _enclosing_functions(tree)
+    alias = _alias_map(tree)
+    sites: set[str] = set()
+    unrendered: list[str] = []
+    statements: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if (not isinstance(node.func, ast.Attribute)
+                or node.func.attr not in _GRAPH_VERBS):
+            continue
+        resolved = _resolve(node.func, alias)
+        if resolved is None or resolved[0] != "graph":
+            continue
+        fn = owner.get(id(node), "<module>")
+        sites.add(fn)
+        literal = node.args[0] if node.args else None
+        rendered = (literal.value if isinstance(literal, ast.Constant)
+                    and isinstance(literal.value, str)
+                    else _render_fstring(literal) if literal is not None else None)
+        if rendered is None:
+            unrendered.append(fn)
+        else:
+            statements.append(rendered)
+    return sites, unrendered, statements
 
 
 def test_every_handle_call_is_the_pinned_verb_set():
@@ -530,26 +777,12 @@ def test_every_handle_call_is_the_pinned_verb_set():
     matched only `.query` would go blind exactly when the module was rewritten to
     use a different verb (#9233 review P2). The verb set is pinned instead: today
     this module only ever calls `query`, at two call sites, both inside `_run`.
-    """
-    tree = _module_tree()
-    owner = _enclosing_functions(tree)
 
-    verbs: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if _root_name(node.func) not in {"proj", "graph"}:
-            continue
-        chain = []
-        cur: ast.AST = node.func
-        while isinstance(cur, ast.Attribute):
-            chain.append(cur.attr)
-            cur = cur.value
-        # only handle-rooted chains (`…g.verb(` / `…db.verb(`); `proj.rebuild_all()`
-        # is the projection's own API, not the handle
-        if not ({"g", "db"} & set(chain)):
-            continue
-        verbs.setdefault(node.func.attr, set()).add(owner.get(id(node), "<module>"))
+    The sites are resolved through ALIASES and include the projection's own raw
+    lane (`proj.query`), so `g = proj.g; g.query("CREATE …")` cannot slip past
+    (see `test_the_census_sees_an_alias_and_the_projection_raw_lane`).
+    """
+    verbs = _handle_verb_sites(_module_tree())
 
     assert verbs == {"query": {"_run"}}, (
         "the handle is no longer reached only through `_run` with `query`: "
@@ -563,19 +796,76 @@ def test_every_handle_reference_is_pinned():
     """`proj.g` / `proj.db` can also travel as an ARGUMENT (`event_head_seq(proj.g)`),
     where the writing happens inside the callee and no receiver scan can see it.
     Pin every enclosing function that touches the handle at all."""
-    tree = _module_tree()
-    owner = _enclosing_functions(tree)
-
-    sites = set()
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Attribute) and node.attr in {"g", "db"}
-                and isinstance(node.value, ast.Name) and node.value.id == "proj"):
-            sites.add(owner.get(id(node), "<module>"))
+    sites = _handle_reference_sites(_module_tree())
 
     assert sites == set(_HANDLE_TOUCHING_FUNCTIONS), (
         "the set of functions that touch the projection's handle changed: "
         f"{sorted(sites)} — `_HANDLE_TOUCHING_FUNCTIONS` is the pin; a new one "
         "must be routed through `_run` (or stated, if it only READS)"
+    )
+
+
+#: A synthetic module the census must SEE. It is the refactor that beat the old
+#: census: a write through an alias, a write on an aliased projection, a write on
+#: the projection's raw `query` lane, and a write on an aliased RAW handle.
+_ALIAS_FIXTURE = '''
+def _run(proj, cypher, params=None):
+    return proj.g.query(cypher, params=params)
+
+
+def aliased_handle(proj):
+    g = proj.g
+    return g.query("CREATE (x:Alias9233 {id: 'x'})")
+
+
+def aliased_projection(proj):
+    p = proj
+    return p.g.query("CREATE (x:Alias9233 {id: 'x'})")
+
+
+def projection_raw_lane(proj):
+    return proj.query("CREATE (x:Alias9233 {id: 'x'})")
+
+
+def aliased_raw_handle(graph):
+    h = graph
+    return h.query("CREATE (x:Alias9233 {id: 'x'})")
+
+
+def harmless(proj):
+    return proj.rebuild_all("/tmp", confirm_destructive=True)
+'''
+
+
+def test_the_census_sees_an_alias_and_the_projection_raw_lane():
+    """Non-vacuity for the census ITSELF (#9233 review P2).
+
+    RED against the pre-fix census, which matched only chains rooted at the
+    literal `proj`/`graph`: `aliased_handle`, `aliased_projection` and
+    `projection_raw_lane` were invisible to the verb pin, and
+    `aliased_raw_handle` to the raw-handle pin. A pin that cannot see the write
+    it forbids is not a pin, and the declaration's stated counterweight is
+    exactly this census.
+    """
+    tree = ast.parse(_ALIAS_FIXTURE)
+
+    verbs = _handle_verb_sites(tree)
+    assert verbs.get("query") == {
+        "_run", "aliased_handle", "aliased_projection", "projection_raw_lane"
+    }, (
+        "the verb census missed a handle write reached through an alias or "
+        f"through `proj.query` (the raw lane): { {v: sorted(f) for v, f in verbs.items()} }"
+    )
+    assert "harmless" not in verbs.get("rebuild_all", set()), (
+        "`proj.rebuild_all()` is the projection's own API, not the graph "
+        "handle — counting it as a handle call makes the pin reject a legal "
+        "call and get weakened"
+    )
+    assert _handle_reference_sites(tree) == {
+        "_run", "aliased_handle", "aliased_projection"
+    }, f"the reference pin missed an alias: {sorted(_handle_reference_sites(tree))}"
+    assert "aliased_raw_handle" in _raw_handle_sites(tree)[0], (
+        "the raw-handle census missed a write reached through an alias"
     )
 
 
@@ -603,30 +893,11 @@ def test_raw_handle_queries_are_the_pinned_read_only_set():
     decision rather than a silent bypass.
 
     Every site's statement is classified, INCLUDING the f-string one: a site that
-    cannot be rendered fails here rather than being skipped."""
+    cannot be rendered fails here rather than being skipped. Sites resolve through
+    ALIASES (`h = graph; h.query(…)`), so a rename cannot bypass the pin."""
     tree = _module_tree()
-    owner = _enclosing_functions(tree)
 
-    sites: set[str] = set()
-    unrendered: list[str] = []
-    statements: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if not isinstance(node.func, ast.Attribute) or node.func.attr != "query":
-            continue
-        if _root_name(node.func) != "graph":
-            continue
-        fn = owner.get(id(node), "<module>")
-        sites.add(fn)
-        literal = node.args[0] if node.args else None
-        rendered = (literal.value if isinstance(literal, ast.Constant)
-                    and isinstance(literal.value, str)
-                    else _render_fstring(literal) if literal is not None else None)
-        if rendered is None:
-            unrendered.append(fn)
-        else:
-            statements.append(rendered)
+    sites, unrendered, statements = _raw_handle_sites(tree)
 
     assert not unrendered, (
         "a raw-handle site's statement could not be rendered, so its read-only "

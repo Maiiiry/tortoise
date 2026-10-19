@@ -1219,3 +1219,38 @@ def test_rest_requires_auth(client):
         assert tc.delete("/v1/context/subscriptions/sub_x").status_code == 401
         assert tc.get("/v1/context/subscriptions/sub_x/deliveries").status_code == 401
     assert ha_mod  # imported for the harness parity above
+
+
+def test_rest_refusal_is_not_reported_as_a_missing_encryption_key(
+        client, monkeypatch):
+    """A §17.1 refusal of the subscription row is NOT a crypto problem.
+
+    ``DirectCacheWriteRefused`` is a ``RuntimeError``, and the create endpoint's
+    ``except RuntimeError`` answers 503 "webhook secrets are unavailable on this
+    deployment (server-side encryption key not configured)" — a confidently
+    wrong, retryable-looking diagnosis for a refusal that no retry can fix.
+    #9233 made that refusal reachable at this door (the delivery store's writes
+    are declared now, so an asymmetric guard failure propagates here), so the
+    handler order is part of this lane's contract (#9233 review P2).
+
+    RED before the fix: the refusal produced the encryption-key 503.
+    """
+    from tortoise import webhook_delivery as wd
+    from tortoise.projection import DirectCacheWriteRefused
+
+    def _refused(*_a, **_kw):
+        raise DirectCacheWriteRefused("§17.1: undeclared write refused")
+
+    monkeypatch.setattr(wd, "create_subscription", _refused)
+    r = client.post("/v1/context/subscriptions",
+                    json={"url": "https://hooks.example.com/cb"})
+    text = json.dumps(r.json())
+    assert "encryption key" not in text, (
+        "a §17.1 refusal was reported as a missing encryption key — the "
+        f"operator is sent to the wrong subsystem: {r.status_code} {text}"
+    )
+    assert r.status_code == 500, (
+        f"a refusal is not a retryable 503; it is an internal write-door "
+        f"failure: {r.status_code} {text}"
+    )
+    assert "refused the write" in text, f"the refusal was masked: {text}"
