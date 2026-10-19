@@ -270,6 +270,13 @@ class GitHubConnector:
         Entity chains are applied BEFORE the poll path so the produces edge
         always lands on the real pm:issue Object (id = entity_id) — never a
         name-stub with a random id.
+
+        #9068: EVERY payload is built first and gated as ONE batch before the
+        first ``apply``. The connector folds straight into the projection
+        (no SDK door in front of it), so a record naming an unapproved pack
+        namespace would install that pack by writing it. Validating first
+        means a refusal leaves the graph untouched instead of half-imported,
+        and the two batches share ONE approval-set read.
         """
         # Entity extraction for issues (ONTOLOGY_v2.5 §1.1, PM domain extension)
         try:
@@ -279,12 +286,37 @@ class GitHubConnector:
 
         count = 0
         covered: set[int] = set()
+        chains: list[dict] = []
+        chain_records: list[dict] = []
         for issue in raw_issues:
             entities = self._issue_to_entities(issue)
             if not entities:
                 continue
             covered.add(issue.get("number"))
+            chains.append(entities)
+            if entities.get("object"):
+                chain_records.append(entities["object"])
+            if entities.get("event"):
+                chain_records.append(entities["event"])
+            chain_records.extend(entities.get("subjects") or ())
 
+        # Poll path — PRs always (entity path doesn't cover PRs); issue
+        # events only when the entity path did not cover them (#1155 dedup).
+        covered_event_ids = {
+            f"github-issue-{self.repo}-{n}-created" for n in covered if n
+        }
+        poll_events = [ev for ev in self.poll()
+                       if ev.get("eventId") not in covered_event_ids]
+
+        # #9068: the gate — before any write, one approval-set read, both
+        # batches. `_gate_kinds` returns the set it decided against so the
+        # second call does not read the graph again.
+        from tortoise.connectors import _gate_kinds
+        writer = "the GitHub connector"
+        approved = _gate_kinds(proj, chain_records, writer=writer)
+        _gate_kinds(proj, poll_events, writer=writer, approved=approved)
+
+        for entities in chains:
             # Apply Object (ObjectRegistered → FalkorDB)
             if entities.get("object"):
                 proj.apply(entities["object"])
@@ -336,14 +368,7 @@ class GitHubConnector:
 
             count += 1
 
-        # Poll path — PRs always (entity path doesn't cover PRs); issue
-        # events only when the entity path did not cover them (#1155 dedup).
-        covered_event_ids = {
-            f"github-issue-{self.repo}-{n}-created" for n in covered if n
-        }
-        for ev in self.poll():
-            if ev.get("eventId") in covered_event_ids:
-                continue  # absorbed by the entity path (one Event per issue)
+        for ev in poll_events:
             proj.apply(ev)
             count += 1
         return count
@@ -402,7 +427,16 @@ class GitHubConnector:
                         if on_event:
                             on_event(ev)
                         if connector.api:
-                            connector.api.get_proj().apply(ev)
+                            # #9068: the fold has no SDK door in front of it —
+                            # gate it like the poll path (one record, one
+                            # batch). A refusal is answered 500 below, exactly
+                            # like any other processing failure, so GitHub
+                            # retries instead of the write vanishing.
+                            from tortoise.connectors import _gate_kinds
+                            proj = connector.api.get_proj()
+                            _gate_kinds(proj, [ev],
+                                        writer="the GitHub webhook fold")
+                            proj.apply(ev)
                 except Exception:
                     # #331: processing failures must be visible and answered
                     # with HTTP 500 — a silently dropped connection makes

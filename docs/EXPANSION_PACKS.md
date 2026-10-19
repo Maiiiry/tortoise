@@ -451,6 +451,59 @@ not be read"* — never as the claim that everything is already on the graph.
 > (2 active packs · 1 off)" — the count describes the rows the payload carries,
 > never a bare number a reader could mistake for the enforced set.
 
+### The write-gate closure — which writes are gated, and which are not (#5475/#9068)
+
+#5475's closure property is **no write may widen a graph's approved pack set**.
+That property is worth reading precisely, because the surfaces it does *not*
+cover are deliberate and a reader who takes "the write path is closed" literally
+will either trust a guarantee that is broader than the code, or try to "fix" one
+of the exceptions and break it.
+
+**Gated — every live door that persists a `pack_state._KIND_PROP_KEYS`
+property:** the SDK entity funnel (`_create_entity`), the point door
+(`create_point`), `update_point` / `update_entity`, `EventAPI._emit`,
+`sdk._apply_and_journal`, `sdk._doc_write`, `mining`'s emitter,
+`link_source_to_entity`, and the REST object/subject/commit doors. The refusal
+is an **input constraint**: a *namespaced* kind may only use a namespace the
+resolved set already holds, and an unapproved spelling is REJECTED (422 /
+`UnapprovedKindNamespace`), never silently normalised — a rewrite would store a
+kind the caller did not write.
+
+**Gated — the connector folds (#9068).** `github` / `linear` / `slack` fold
+records with a bare `proj.apply(...)` and never meet an SDK door.
+`FalkorProjection.apply` refuses a direct fold only on a **journal-backed**
+projection (§17.1's single-writer guard), and there the cache is a *derived
+image* of the journal. On a journal-less projection the cache **is** the store,
+so the fold is a real write: each connector `ingest` (and both webhook paths)
+now pre-validates its whole batch against ONE approval-set read before the
+first `apply`, so a refusal leaves the graph untouched rather than
+half-imported. Before that gate, github's `object_kind='pm:issue'` put `pm`
+into a `dev`-only graph's approved set.
+
+**The mining leg reads a generic `kind` only off ontology labels (#9068).**
+Seven of the eight kind properties are spelled in the ontology's own vocabulary
+(`objectKind`, `pointKind`, …), so a value under one of them is an ontology kind
+wherever it is found. The bare `kind` slot is not: `:Pipeline` stores its
+namespaced **pipeline key** there (`venture:deal`) and `:Graph` stores its own
+`kind`. Reading those as ontology kinds made materialising a pipeline override
+grant the `venture` pack; the fix is in the reader, not in the pipeline writer
+(the key is a real pipeline name, so gating that writer would start refusing
+legitimate pipeline edits).
+
+**Deliberately NOT gated — and why:**
+
+| Writer | Why it is not gated |
+|---|---|
+| `rebuild_all` / `recover_from_log` (replay) | The record came FROM the journal. Refusing at replay would make a committed record unfoldable — strictly worse than the widening. |
+| `migrate_kinds.py` (raw Cypher over a live graph) | An **operator act**: a deliberate re-typing of the graph's own historical rows, with every target spelling a reviewed literal in the file. It is the sanctioned way a pack namespace enters data written *before* the pack existed, so widening the mined set is the point of the run — a gate would refuse the very row the migration exists to rewrite. |
+| `retype.py` / `tools/retype_snapshot.py` | Offline: they transform a dump and never touch a live graph. They enforce the target kind against the **declared vocabulary** instead (`RetypeError`). |
+| `_emit_event` (post-mutation payload append) | The pre-write doors are gated instead. The mutations it describes (`PointPromoted`, `Dedupe*`, `create_operator`) have already written their node, so a refusal at the append could only split the journal from the cache. |
+
+A re-typing that DOES need a namespace the graph has not approved is an
+operator decision: run the migration, or add the pack
+(`PUT /v1/graphs/{graph_id}/packs`). Nothing on a tenant surface can widen the
+set by writing.
+
 ## Chains
 
 A chain is an ordered kind path the extractor respects when connecting `about_entities`. Example: the agent-ops `ruleLifecycle` chain `[rule, rationale, ruleRevised]` — a rule must be grounded in its rationale. The chain enforcer rewires reverse-order pairs deterministically (never invents, never drops) and warns on violations. Steps resolve to your pack's kinds, core kinds, or exactly-one other pack's kinds (ambiguous bare names are validation errors — use `ns:kind`).

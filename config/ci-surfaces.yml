@@ -3213,6 +3213,14 @@ surfaces:
   - test_write_verb.py
   - test_write_consolidation.py
   - test_writer_inventory.py
+  # #9068: the residual of #5475 — writes that never meet a gated door. Guards
+  # `tortoise/pack_state.py` (the ``kind`` leg's label scope, the record
+  # predicate, the batch refusal), `tortoise/connectors/` (the fold gate on
+  # github/linear/slack ``ingest`` + both webhook paths) and
+  # `tortoise/migrate_kinds.py` (the STATED ungated re-typing). `core` is the
+  # surface those three source files select today, so this is where the guard
+  # must run on a change to any of them.
+  - test_write_doors_9068.py
   # #2280 (CI drift repair): see the api-surface note — these files also
   # landed in #2283 unregistered. Contract (hermetic) + capture Phase-D
   # dedup are fast-lane core; the canonical pipeline needs live FalkorDB.
@@ -5236,6 +5244,14 @@ durations:
   test_pointsuperseded_rebuild.py: 8.7
   test_session_key_http.py: 5.5
   test_write_consolidation.py: 5.3
+  # #9068 (#3400 trap): a file ADDED BY A PR has no CI junit measurement — the
+  # durations refresher samples push-to-main runs only — and an absent row packs
+  # it at the flat 2.0s default, dropping `duration_coverage_issues()` under the
+  # 90% floor. Locally measured 3.5s for 12 tests on the embedded lane
+  # (2026-10-18); the two tests that let a fold LAND request the suite's
+  # `force_embedder_on` stub, which is what keeps this out of the cold
+  # HF-model-load cost class. Refresh from the first post-merge run.
+  test_write_doors_9068.py: 3.5
   test_value_extractor.py: 39.0
   test_venture_pack.py: 2.0  # unmeasured — new in #3419; no sweep has collected it, so it carries the flat default exactly as an absent key would, which is main's own weight for it. Do NOT substitute a local timing here: a measured-on-this-box 67.2 was recorded first, and it is a SHARD-LAYOUT input, so it moved tests/test_tortoise_search.py into the same shard as tests/test_subject_layer_read_surfaces_4889.py and exposed a pre-existing embedded-lane isolation leak (#3750 family) that main's grouping keeps apart. A weight that does not model CI must not be used to decide what runs together.
   # #2729: same rule as the entry directly above — unmeasured, carries the flat

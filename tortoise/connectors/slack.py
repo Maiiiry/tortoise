@@ -97,12 +97,20 @@ class SlackConnector:
         return events
 
     def ingest(self, proj) -> int:
-        """Poll + apply to projection. Returns count of applied events."""
+        """Poll + apply to projection. Returns count of applied events.
+
+        #9068: the batch is gated BEFORE the first ``apply`` — the connector
+        folds straight into the projection with no SDK door in front of it, so
+        a record naming an unapproved pack namespace would install that pack by
+        writing it (see ``connectors._gate_kinds``).
+        """
         events = self.poll()
         # #388: ingestion-scoped per-message permalink enrichment (see
         # _enrich_source_urls) — poll() stays API-call-free for standalone
         # JSONL/preview use; the pure mapper never makes network calls.
         self._enrich_source_urls(events)
+        from tortoise.connectors import _gate_kinds
+        _gate_kinds(proj, events, writer="the Slack connector")
         count = 0
         for ev in events:
             proj.apply(ev)
@@ -217,7 +225,16 @@ class SlackConnector:
                             if on_event:
                                 on_event(ev)
                             if connector.api:
-                                connector.api.get_proj().apply(ev)
+                                # #9068: the fold has no SDK door in front of
+                                # it — gate it like the poll path. A refusal is
+                                # answered 500 below, exactly like any other
+                                # processing failure, so Slack retries instead
+                                # of the write vanishing.
+                                from tortoise.connectors import _gate_kinds
+                                proj = connector.api.get_proj()
+                                _gate_kinds(proj, [ev],
+                                            writer="the Slack webhook fold")
+                                proj.apply(ev)
                 except Exception:
                     # #331: processing failures must be visible and answered
                     # with HTTP 500 — a silently dropped connection makes

@@ -51,6 +51,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock
+from typing import NamedTuple
 
 from tortoise._gate_memo import GateMemo
 from tortoise.domain_loader import (
@@ -585,6 +586,68 @@ _KIND_PROP_KEYS: tuple[str, ...] = (
 #:   test on those keys (#5202) in place first.
 _ATTRIBUTABLE_BARE_KIND_KEYS: tuple[str, ...] = ("eventKind",)
 
+#: The labels that may carry an ONTOLOGY kind (#9068).
+#:
+#: Six of the eight keys in ``_KIND_PROP_KEYS`` need no such guard: they are
+#: SPELLED in the ontology's own vocabulary (``objectKind``, ``pointKind``,
+#: ``eventKind``, ``sourceKind``, ``documentKind``, ``subjectKind``,
+#: ``actionKind``), so a value under one of them can only have been written as
+#: an ontology kind. The bare ``kind`` key is different: ``kind`` is a generic
+#: classification slot that OTHER models in the same graph own for their own
+#: identity, and two of them write a NAMESPACED string into it —
+#: ``:Pipeline`` (``pipeline._write_pipeline`` stores the pipeline KEY, and
+#: pipeline keys are namespaced by convention: ``venture:deal``) and
+#: ``:Graph`` (``kind='default'``).
+#:
+#: Reading ``kind`` off those labels CONFLATED a pipeline key with an ontology
+#: kind: materialising a graph override for ``venture:deal`` put ``venture``
+#: into the graph's approved pack set (measured, #9068) — an ungated live write
+#: widening the very set that is supposed to gate it. The conflation is the
+#: defect, not the pipeline write: gating ``pipeline.py`` instead would start
+#: refusing legitimate pipeline edits (the key IS a real namespaced pipeline
+#: name, not a pack kind), so the mining leg is what stops guessing.
+#:
+#: ``Document`` is the retired D10 label (a document is a ``:Source`` now); it
+#: is listed because a dump restored from a pre-v3.15 export can still hold
+#: ``:Document`` nodes whose legacy ``kind`` values belong to the union.
+_ONTOLOGY_LABELS: tuple[str, ...] = (
+    "Object", "Point", "Event", "Subject", "Source", "Document",
+)
+
+#: Of ``_KIND_PROP_KEYS``, the keys read ONLY off ``_ONTOLOGY_LABELS`` (#9068).
+#: Exactly one — see ``_ONTOLOGY_LABELS`` for why the other seven need no
+#: scope. Adding a GENERIC-spelling key here is a widening guard, never a
+#: compatibility break: a value it stops seeing on a foreign label was never
+#: an ontology kind (the direction is narrowing, the same direction every
+#: other leg of the union fails in).
+_LABEL_SCOPED_KIND_KEYS: tuple[str, ...] = ("kind",)
+
+#: "the caller did not pass ``approved``" — see
+#: ``refuse_unapproved_kinds_in_records``. A private sentinel, NOT ``None``:
+#: ``None`` is the RESOLVED answer "this graph has no ``:PackInstall`` records"
+#: (the catalog union, i.e. no gate), and a default that doubled as both would
+#: either skip the gate on every call or read the set twice.
+_APPROVED_NOT_GIVEN: object = object()
+
+#: The kind properties the FOLD accepts in their snake spelling, mapped to the
+#: camel key the fold then PERSISTS (``projection/entities.py``: ``_upsert_*``
+#: reads ``object_kind``/``subject_kind``/``document_kind`` and writes the
+#: camel property — the ``_create_entity`` normalization supplies the alias on
+#: the SDK path, and the connector payloads carry it directly).
+#:
+#: A gate that screens only the camel spelling lets the alias through while the
+#: MINING leg still sees the camel property it was folded into, i.e. the write
+#: widens the approval set under a name the gate did not know — the exact shape
+#: #5475 exists to close, reached sideways (#9068 measured it on
+#: ``connectors/github.py``: ``object_kind='pm:issue'`` widened a ``dev``-only
+#: graph).
+_KIND_PROP_ALIASES: dict[str, str] = {
+    "object_kind": "objectKind",
+    "subject_kind": "subjectKind",
+    "document_kind": "documentKind",
+}
+
+
 def bare_event_kind_owners(packs_dir: str | os.PathLike | None = None
                            ) -> dict[str, frozenset[str]]:
     """``{bare event kind: the namespaces declaring it}``, from the catalog.
@@ -684,6 +747,28 @@ def graph_kind_namespaces(g) -> frozenset[str]:
     of the write gate admits names no pack, and a bare value no pack declares
     names nothing at all.
 
+    The bare ``kind`` property is read only off the ONTOLOGY labels
+    (``_ONTOLOGY_LABELS`` / ``_LABEL_SCOPED_KIND_KEYS``, #9068): ``kind`` is a
+    generic slot that ``:Pipeline`` (the pipeline key) and ``:Graph``
+    (``kind='default'``) also own, so reading it label-agnostically turned a
+    pipeline key into a pack namespace — an ungated live write widening the
+    approval set. The seven qualified keys stay label-agnostic: their SPELLING
+    is the ontology's.
+
+    Writers this function deliberately does not gate, stated so a reader does
+    not take "the write path is closed" literally (#9068):
+
+    * ``rebuild_all`` / ``recover_from_log`` fold a record that came FROM the
+      journal — refusing at replay would make a committed record unfoldable,
+      strictly worse than the widening;
+    * ``retype.py`` / ``tools/retype_snapshot.py`` transform an OFFLINE dump
+      and never touch a live graph (they validate the target kind against the
+      declared vocabulary instead — ``RetypeError``);
+    * ``migrate_kinds.py`` is a deliberate, operator-run re-typing of the
+      graph's own historical rows: it is the SANCTIONED way to introduce a
+      pack namespace into data written before the pack existed, so its
+      ``SET n.<kindProp>`` is a widening BY DESIGN (see its docstring).
+
     ⚠️ COST: one property scan per key (8) — a whole-graph read. The
     caller's memo does NOT shelter it: ``tenant_view`` folds the approval set
     into its cache key, so the scan runs on every call (measured ~6 ms at
@@ -712,10 +797,19 @@ def graph_kind_namespaces(g) -> frozenset[str]:
     """
     out: set[str] = set()
     bare_attributable: set[str] = set()
+    # #9068: the label scope is a CONSTANT predicate built once, not a per-key
+    # f-string branch — it is the same six labels for every scoped key, and a
+    # predicate assembled per call could drift between keys.
+    ontology_scope = "(" + " OR ".join(
+        f"n:{label}" for label in _ONTOLOGY_LABELS) + ")"
     for key in _KIND_PROP_KEYS:
+        # #9068: a GENERIC-spelled key is read only off ontology labels; the
+        # ontology-spelled ones are read everywhere (see _ONTOLOGY_LABELS).
+        scope = (f"{ontology_scope} AND "
+                 if key in _LABEL_SCOPED_KIND_KEYS else "")
         try:
             rows = g.query(
-                f"MATCH (n) WHERE n.{key} IS NOT NULL "
+                f"MATCH (n) WHERE {scope}n.{key} IS NOT NULL "
                 f"RETURN DISTINCT n.{key}",
             ).result_set
         except Exception as e:  # noqa: BLE001, RUF100
@@ -892,8 +986,24 @@ def resolved_pack_set(sdk: TortoiseSDK, *,
     indistinguishable from "the starter set installed" and destroy the union
     fallback (#2714's own note). Graph-unreachable RAISES — an outage must
     never read as "this graph has no packs".
+
+    ``sdk`` is only the GRAPH RESOLVER (``_target_graph``); all of the reading
+    is ``resolved_pack_set_from_graph``, so a caller that holds a graph handle
+    and no SDK (the connector fold gate, #9068) reads the SAME core instead of
+    re-deriving "this graph's pack set" a second way.
     """
-    g = _target_graph(sdk, graph_name)
+    return resolved_pack_set_from_graph(_target_graph(sdk, graph_name))
+
+
+def resolved_pack_set_from_graph(g) -> ResolvedPackSet:
+    """``resolved_pack_set`` over a GRAPH HANDLE — the ONE read core (#9068).
+
+    Split out so a caller whose only hold on the graph is the projection's
+    ``.g`` (``connectors._gate``) can read the approval set without
+    fabricating an SDK. The contract, the marker precedence and the
+    no-self-heal rule are stated once, on ``resolved_pack_set`` above; this is
+    the same function with the resolver removed, not a second reading.
+    """
     rows = _read_installs(g)
     selection = _read_selection(g)
     if not rows and selection is None:
@@ -1231,6 +1341,151 @@ def unapproved_kind_pack(kind: str,
         if ns not in approved:
             return ns
     return None
+
+
+class UnapprovedKind(NamedTuple):
+    """One kind value a RECORD is carrying that names an unapproved pack.
+
+    ``prop`` is the CANONICAL (camel) kind property — the name the fold will
+    persist and the mining leg will read back — never the snake alias the
+    record happened to spell (see ``_KIND_PROP_ALIASES``).
+    """
+
+    prop: str
+    kind: str
+    namespace: str
+
+
+def unapproved_kinds_in_record(record: dict,
+                              approved: frozenset[str] | None
+                              ) -> list[UnapprovedKind]:
+    """#9068: every UNAPPROVED pack namespace a record would WRITE, by prop.
+
+    The record-level form of the #5475 input constraint, for a writer that
+    folds a whole event dict instead of going through ``create_entity``'s props
+    (the connectors' ``proj.apply`` lane). It reads the key set the MINING leg
+    reads (``_KIND_PROP_KEYS``) plus the fold's snake aliases
+    (``_KIND_PROP_ALIASES``) plus ``uses[].kind`` — the same three spellings
+    ``TortoiseSDK._refuse_unapproved_kinds_in_props`` screens, because a gate
+    that skipped one would leave the widening it closes open under another
+    name.
+
+    Pure with respect to the graph (it decides from ``approved`` only), so a
+    caller that has already read the approval set pays no second scan — and a
+    caller that gates a BATCH pays ONE read for the whole batch.
+
+    ``approved is None`` (no ``:PackInstall`` records ⇒ the catalog union,
+    #2714 indicator 3) and a spelling that names no pack are both empty
+    results: this is an input constraint on pack namespaces, NOT a blanket ban
+    on writes. The return is a LIST, not the first hit, so a refusal can name
+    every offending value in one pass — a re-run that surfaced them one at a
+    time is how an import becomes a guessing game.
+    """
+    if approved is None or not isinstance(record, dict):
+        return []
+    out: list[UnapprovedKind] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _check(prop: str, value) -> None:
+        if not isinstance(value, str):
+            return
+        if (prop, value) in seen:
+            return
+        seen.add((prop, value))
+        # The attribution flag is DERIVED from pack_state's own declaration of
+        # which keys attribute a BARE value back to a pack — never re-spelled
+        # here (a second copy would stop constraining a key the mining leg
+        # starts attributing).
+        ns = unapproved_kind_pack(
+            value, approved,
+            attribute_bare=prop in _ATTRIBUTABLE_BARE_KIND_KEYS)
+        if ns is not None:
+            out.append(UnapprovedKind(prop=prop, kind=value, namespace=ns))
+
+    for prop in _KIND_PROP_KEYS:
+        if prop in record:
+            _check(prop, record.get(prop))
+    for alias, prop in _KIND_PROP_ALIASES.items():
+        if alias in record:
+            _check(prop, record.get(alias))
+    uses = record.get("uses")
+    if isinstance(uses, dict):
+        uses = [uses]
+    elif isinstance(uses, str):
+        uses = []  # a legacy bare-string use writes objectKind='other'
+    if isinstance(uses, (list, tuple)):
+        for item in uses:
+            if isinstance(item, dict):
+                # The fold's own default is 'other' (a bare core kind), so an
+                # absent 'kind' is the same write it will perform.
+                _check("objectKind", item.get("kind"))
+    return out
+
+
+def refuse_unapproved_kinds_in_records(g, records, *, writer: str,
+                                      approved=_APPROVED_NOT_GIVEN
+                                      ) -> None:
+    """#9068: refuse a BATCH of records that would install an unapproved pack.
+
+    The gate for the live writers that fold straight into a journal-less
+    projection — ``FalkorProjection.apply`` is the STORE there, not a derived
+    cache (§17.1's single-writer guard only arms when a journal is bound), so
+    the connector folds were the one live lane that persisted a mined kind with
+    no door in front of it: measured, ``github``'s ``object_kind='pm:issue'``
+    put ``pm`` into a ``dev``-only graph's approved set.
+
+    ⚠️ CALL IT BEFORE THE FIRST ``apply``. It validates the WHOLE batch against
+    ONE approval-set read, so a refusal leaves the graph untouched — a gate
+    that ran per record would leave a half-imported graph behind the refusal
+    (and would pay a whole-graph read per record for the privilege).
+
+    ``approved`` lets a caller that already read the set pass it in (the same
+    seam ``TortoiseSDK._unapproved_kind_refusal`` accepts). OMITTED means
+    not-yet-read, so the graph is read once — distinct from an explicit
+    ``None``, which is the RESOLVED answer "this graph has no
+    ``:PackInstall`` records" ⇒ the catalog union ⇒ no gate (#2714 indicator
+    3). Collapsing the two would either skip the gate on every call or pay the
+    read twice; both are the kind of quiet difference a sentinel prevents.
+    That common case costs two label scans, never the eight-key kind scan.
+
+    Raises ``UnapprovedKindNamespace`` (the SAME exception type the SDK doors
+    raise, so a caller's handling does not fork on which door refused).
+    """
+    records = [r for r in records if isinstance(r, dict)]
+    if not records:
+        return
+    if approved is _APPROVED_NOT_GIVEN:
+        approved = resolved_pack_set_from_graph(g).namespaces
+    if approved is None:
+        return  # no records ⇒ the catalog union ⇒ nothing is a widening
+    offenders: list[UnapprovedKind] = []
+    for record in records:
+        offenders.extend(unapproved_kinds_in_record(record, approved))
+    if not offenders:
+        return
+    from tortoise.sdk import UnapprovedKindNamespace
+
+    first = offenders[0]
+    namespaces = sorted({o.namespace for o in offenders})
+    spellings = sorted({f"{o.prop}={o.kind!r}" for o in offenders})
+    approved_ns = ", ".join(sorted(approved)) or "none"
+    alternatives = approved_kind_alternatives(
+        first.kind, approved, prop=first.prop)
+    remedy = (
+        f"the same kind IS declared by an approved pack — write "
+        f"{alternatives[0]!r}" if alternatives else
+        "write a kind from the core vocabulary, or from a pack this graph "
+        f"HAS approved ({approved_ns})")
+    raise UnapprovedKindNamespace(
+        f"refused {writer}: it would write {', '.join(spellings)}, which name "
+        f"the ontology pack namespace(s) {', '.join(namespaces)} this graph "
+        "has not approved — NOTHING was stored. Why: kinds are namespaced by "
+        "ontology pack, and a graph's approved set is mined from the kind "
+        "values it already holds, so persisting one would install the pack by "
+        "writing it. Next steps: pick one — add the pack for this graph "
+        f"(PUT /v1/graphs/{{graph_id}}/packs); or {remedy}.",
+        prop=first.prop, kind=first.kind,
+        namespace=first.namespace, installed=approved)
 
 
 def approved_kind_alternatives(kind: str,
