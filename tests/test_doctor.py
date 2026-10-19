@@ -1456,7 +1456,7 @@ class TestDoctorPiSeamFreshness:
 
 
 class TestCaptureSpoolHealthRow:
-    """#2100 — a quota-blocked box must be visible in the ONE health report an
+    """agent-infra#2100 — a quota-blocked box must be visible in the ONE health report an
     operator already runs.
 
     The measured failure: a cloud cell's capture spool held 320+ queued uploads,
@@ -1495,10 +1495,44 @@ class TestCaptureSpoolHealthRow:
         assert "Capture spool" in out, out
         assert "capture: BLOCKED (5 queued, 402)" in out, out
 
+    def test_an_UNREADABLE_spool_warns_and_is_not_counted_as_a_pass(
+            self, monkeypatch, clear_db_env, tmp_path, capsys):
+        """A check that could not RUN is not a passing check. The severity chain
+        ended in `else "✅"`, so the new `UNKNOWN (spool unreadable)` state
+        rendered GREEN — the same "cannot read → healthy" false PASS the state
+        exists to prevent, one level up in the one report an operator runs.
+
+        MUTATION THAT REDS THIS: restore `else "✅"` (or test only for BLOCKED)
+        → an unreadable spool reports a passing check.
+        """
+        import os
+
+        from tortoise import capture_spool as sp
+        from tortoise import config as _config
+
+        monkeypatch.setattr(
+            _config, "DEFAULT_DB_PATH",
+            os.path.join(str(tmp_path), ".tortoise", "tortoise.db"))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        root = sp.spool_dir()
+        (root / "entries").mkdir(parents=True, exist_ok=True)
+        (root / "entries" / "junk.meta.json").write_text("{", encoding="utf-8")
+
+        _run_doctor([])
+        out = capsys.readouterr().out
+        assert "capture: UNKNOWN (spool unreadable)" in out, out
+        assert "✅ Capture spool" not in out, out
+        assert "⚠️ Capture spool" in out, out
+
     def test_an_ordinary_spool_is_not_reported_as_blocked(
             self, monkeypatch, clear_db_env, tmp_path, capsys):
         """Positive control: the row must not cry BLOCKED on a healthy box, or
-        an operator learns to ignore it."""
+        an operator learns to ignore it.
+
+        MUTATION THAT REDS THIS: make the row unconditional (always BLOCKED, or
+        severity ❌ regardless of the line) → the report becomes noise and a real
+        block stops standing out."""
         import os
 
         from tortoise import config as _config

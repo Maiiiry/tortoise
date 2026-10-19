@@ -287,7 +287,7 @@ wired through `tortoise session capture` (write-before-upload) and
 `tortoise session drain` (run by `session-start.sh`). See
 `docs/plans/2026-09-17-3963-capture-spool.md`.
 
-### A backlogged spool never blocks a turn (#2100)
+### A backlogged spool never blocks a turn (agent-infra#2100)
 
 A cloud cell once became unusable because of this spool: 320+ queued captures,
 every one `waiting on backoff` against an exhausted graph quota (402). The
@@ -295,25 +295,52 @@ flush ran on the turn's own stack, so `session_start` consumed the whole turn �
 the lane log was 259–262 B, `agent_end` arrived with no assistant text and no
 tool call. Capture is observability; it must never be able to do that.
 
-Four properties are pinned by tests on both legs:
+What is pinned by tests, and where:
 
-- **Scheduled, never inline.** The extension hands the flush to `setImmediate`,
-  so neither the spool scan nor a request runs inside a handler Pi awaits.
-- **Hard time budget.** One flush gets `FLUSH_BUDGET_MS` (5 s) of wall clock,
-  shared across entries; a single upload gets `min(remaining budget, request
-  timeout)`. The remainder stays spooled and is reported
-  (`budgetExhausted`), never silently dropped.
-- **A refusal is a named state.** 402 / `quota_exceeded` is counted as
-  `quotaRefusals` and written durably to `health.json` in the spool as
-  `{"state":"blocked","status":402,"queued":N}`. It clears after captures
-  file; it is never a per-leg log line an operator has to decode.
-- **A per-box health line.** `tortoise session health` prints exactly
-  `capture: BLOCKED (<n> queued, 402)` (or `OK` / `BACKLOG`), answered from the
-  local spool with no credential and no network — so an idle box is never read
-  as "no idle lane". `tortoise doctor` carries the same line, and the
-  extension prints it on its own log whenever a flush is refused or a budget is
-  reached.
+- **Scheduled, never inline — Pi leg only** (`tortoise-capture.ts`, its
+  `node --test` suite). The extension hands the flush to `setImmediate`, so
+  neither the spool scan nor a request runs inside a handler Pi awaits. The
+  Claude leg's drain was ALREADY backgrounded by `claude-hooks/session-start.sh`
+  (`nohup … >/dev/null 2>&1 &`), which is why it never had this defect — and why
+  it carries no budget: nothing on its turn path waits for it.
+- **Hard time budget — Pi leg only.** One flush gets `FLUSH_BUDGET_MS` (5 s) of
+  wall clock, shared across entries; a single upload gets `min(remaining budget,
+  request timeout)`. The remainder stays spooled and is reported
+  (`budgetExhausted`), never silently dropped. A fault inside the flush is one
+  `spool flush error` line, never an exception on Pi's event loop.
+- **A refusal is a named state — both legs** (`health.json` in the spool,
+  written by either leg, read by either). A 402 is counted as `quotaRefusals`
+  and recorded as `{"state":"blocked","status":402,"queued":N}`. The status is
+  the contract: the clients do **not** prose-match the message — #4614 made the
+  402 carry a machine-readable category for exactly that reason.
+- **A per-box health line — both legs, byte-identical**
+  (`captureHealthLine` / `capture_health_line`, parity-tested by running the real
+  TypeScript against Python's directory). Four distinct answers, because four
+  distinct situations must never read alike:
 
-The spool's ceilings are also part of the contract: **200 entries / 64 MiB**,
-oldest-first eviction with a recorded reason. A bound that only bites past the
-point where the spool has already made a box unusable is not a bound.
+  | line | meaning |
+  |---|---|
+  | `capture: OK (0 queued)` | nothing to file |
+  | `capture: BACKLOG (<n> queued[, <k> rejected])` | waiting, no refusal (a network blip clears itself) |
+  | `capture: BLOCKED (<n> queued, <status>[, <k> rejected])` | a refusal retrying cannot fix |
+  | `capture: UNKNOWN (spool unreadable)` | the spool could not be READ — never folded into `OK` |
+
+  `tortoise session health` prints it and always exits 0; `tortoise doctor`
+  carries it as a row; the Pi extension prints it on its own lane log when a
+  flush is refused or its budget is reached. The drain prints it to stderr, but
+  the SessionStart hook discards that stream — so it is an operator's line for a
+  drain run by hand, not a fleet surface.
+
+The `, <k> rejected` suffix appears on BOTH shapes — queued and rejected captures
+coexist on a box that lost a key mid-outage, and the line must not hide either.
+
+`rejected` exists because a terminal entry is never retried: a box whose every
+capture is refused (a rotated key answers 401) has `queued == 0`, and the count
+alone would call a dead capture pipeline healthy.
+
+The spool stays **capped** — 1000 entries / 256 MiB, oldest-first eviction with a
+recorded reason, both numbers pinned equal on both legs. The cap is what bounds
+the per-turn prune; it is deliberately not lowered to the size of the measured
+incident, because a blocked box's captures are the user's data and evicting them
+to make a number look better is the loss the retry policy exists to prevent. The
+defect was the inline flush, not the ceiling.

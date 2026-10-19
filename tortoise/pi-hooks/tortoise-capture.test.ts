@@ -35,6 +35,8 @@ import {
   PROBE_TIMEOUT_MS,
   REQUEST_TIMEOUT_MS,
   RETRY_MAX_MS,
+  SPOOL_MAX_ENTRIES,
+  SPOOL_MAX_TOTAL_BYTES,
   TRUNCATION_SENTINEL,
   TURN_MAX_CHARS,
   _CREDENTIAL_MODE_WARNED,
@@ -43,6 +45,7 @@ import {
   captureKey,
   carriedWindow,
   captureHealthLine,
+  captureSpoolCounts,
   clampAttempts,
   clampWindow,
   classifyFailure,
@@ -2507,7 +2510,7 @@ test("#8531: an empty role is not a turn (the writers' contract on both legs)", 
   assert.deepEqual(readSpoolTurns(spool, sid), [{ role: "system", content: "policy" }]);
 });
 
-// ── (22) #2100 — a capture spool must never block a lane turn ──────────────
+// ── (22) agent-infra#2100 — a capture spool must never block a lane turn ──────────────
 //
 // The measured failure: a cloud cell's spool held 320+ queued uploads, every
 // one `waiting on backoff` because the hosted graph quota answered 402. The
@@ -2547,7 +2550,7 @@ function abortableFetch(): (url: string, init?: Record<string, unknown>) => Prom
     });
 }
 
-test("#2100: a backlogged spool never runs on the turn path (the turn completes)", async () => {
+test("agent-infra#2100: a backlogged spool never runs on the turn path (the turn completes)", async () => {
   // REPRODUCTION. 60 queued captures, every one inside its backoff window —
   // exactly the cell that could not run a lane. The turn must complete: the
   // handlers return before ANY spool work starts, so the backlog cannot spend
@@ -2602,7 +2605,7 @@ test("#2100: a backlogged spool never runs on the turn path (the turn completes)
   assert.match(line!, /skipped 60 \(60 waiting on backoff\)/);
 });
 
-test("#2100: the flush is HARD time-bounded even when every upload hangs", async () => {
+test("agent-infra#2100: the flush is HARD time-bounded even when every upload hangs", async () => {
   // The endpoint is blackholed / throttled: each POST hangs until its own
   // AbortSignal. 60 entries × the 10s per-request budget is a 10-minute flush.
   // The flush must abandon the remainder at the wall-clock budget and SAY so.
@@ -2634,7 +2637,7 @@ test("#2100: the flush is HARD time-bounded even when every upload hangs", async
   assert.ok(outcome.summary!.deferred >= 1, "the aborted upload is a deferral, not a loss");
 });
 
-test("#2100: a quota refusal is a NAMED state with the count (and clears on success)", async () => {
+test("agent-infra#2100: a quota refusal is a NAMED state with the count (and clears on success)", async () => {
   // ACCEPTANCE (2): a 402 must not be a growing silent backlog. It is recorded
   // as `blocked` with the refusal status and the number still queued, so the
   // operator (and the per-box health line) can say WHY the box is stuck.
@@ -2673,7 +2676,7 @@ test("#2100: a quota refusal is a NAMED state with the count (and clears on succ
   assert.equal(captureHealthLine(spool), "capture: OK (0 queued)");
 });
 
-test("#2100: the extension prints the BLOCKED health line (an operator needs no command)", async () => {
+test("agent-infra#2100: the extension prints the BLOCKED health line (an operator needs no command)", async () => {
   // ACCEPTANCE (4) on the lane's OWN surface: the box's log must carry the
   // health line, so "no idle lane" is never the only explanation available.
   //
@@ -2705,7 +2708,7 @@ test("#2100: the extension prints the BLOCKED health line (an operator needs no 
   );
 });
 
-test("#2100: a failing background flush is ONE line, never a blocked or crashed turn", async () => {
+test("agent-infra#2100: a failing background flush is ONE line, never a blocked or crashed turn", async () => {
   // A capture failure is an observation about the box, not a turn the user
   // loses. The flush reports ONCE, and a fault inside it cannot escape the
   // deferred callback as an unhandled exception on Pi's event loop.
@@ -2742,7 +2745,7 @@ test("#2100: a failing background flush is ONE line, never a blocked or crashed 
   assert.match(errors[0], /clock unavailable/);
 });
 
-test("#2100: the spool is CAPPED in items and bytes, dropping the OLDEST", () => {
+test("agent-infra#2100: the spool is CAPPED in items and bytes, dropping the OLDEST", () => {
   // ACCEPTANCE (3). The bound already existed but was never pinned as a pair —
   // and a bound that is not pinned is a bound that drifts. Drop-oldest (never
   // newest) is what keeps the most recent captures through a long outage.
@@ -2761,8 +2764,8 @@ test("#2100: the spool is CAPPED in items and bytes, dropping the OLDEST", () =>
       turns: [{ role: "user", content: `turn ${i}` }],
     });
   }
-  // writeSpoolEntry prunes with the DEFAULT bounds, so re-apply the test bounds
-  // by writing one more entry through an explicit prune.
+  // The MECHANISM is what this test pins (the shipped defaults are pinned in
+  // the next test), so the pair is supplied explicitly.
   pruneSpool(itemCapped, undefined, itemBounds);
   const survivors = readdirSync(join(itemCapped, "entries"))
     .filter((n) => n.endsWith(".meta.json"))
@@ -2806,4 +2809,110 @@ test("#2100: the spool is CAPPED in items and bytes, dropping the OLDEST", () =>
     readDiscards(byteCapped).some((d) => d.reason === "spool_total_bytes_exceeded"),
     "a byte eviction must be recorded",
   );
+});
+
+test("agent-infra#2100: the SHIPPED ceilings are finite and identical on both legs", () => {
+  // ACCEPTANCE (3), the half the mechanism test cannot reach: it supplies its
+  // own bounds, so both shipped constants could be reverted to Infinity and
+  // every suite would stay green. A bound nothing pins is a bound that drifts.
+  //
+  // MUTATION THAT REDS THIS: raise either constant without a matching PR (or
+  // let one leg's pair diverge from the other's, which would evict different
+  // captures depending on which harness wrote last).
+  assert.equal(SPOOL_MAX_ENTRIES, 1000, "the item ceiling must stay a real number");
+  assert.equal(SPOOL_MAX_TOTAL_BYTES, 256 * 1024 * 1024, "the byte ceiling too");
+  const counts = captureSpoolCounts(tmpSpool());
+  assert.deepEqual(counts, { queued: 0, rejected: 0 },
+    "an absent spool is an EMPTY spool, not an unreadable one");
+});
+
+test("agent-infra#2100: an UNREADABLE spool reports UNKNOWN, never OK", async () => {
+  // The false PASS: `queuedEntryCount` swallowed every readdir/parse failure as
+  // 0, and the line short-circuited `queued === 0 → OK`. A box that can file
+  // nothing reported `capture: OK`, which is the one answer a health check must
+  // not give when it could not look.
+  //
+  // MUTATION THAT REDS THIS: fold the readdir error back into `0 queued`.
+  if (process.getuid?.() === 0) return; // root ignores mode bits
+  const spool = tmpSpool();
+  writeSpoolEntry(spool, snapshot("hidden-001"));
+  chmodSync(join(spool, "entries"), 0o000);
+  try {
+    assert.equal(captureSpoolCounts(spool), undefined,
+      "an unreadable spool must be distinguishable from an empty one");
+    assert.equal(captureHealthLine(spool), "capture: UNKNOWN (spool unreadable)");
+  } finally {
+    chmodSync(join(spool, "entries"), 0o700);
+  }
+
+  // A corrupt meta is the same class: a capture we cannot account for.
+  const corrupt = tmpSpool();
+  writeSpoolEntry(corrupt, snapshot("corrupt-001"));
+  writeFileSync(join(corrupt, "entries", "junk.meta.json"), "{not json");
+  assert.equal(captureHealthLine(corrupt), "capture: UNKNOWN (spool unreadable)");
+});
+
+test("agent-infra#2100: a spool whose captures are ALL permanently refused is BLOCKED, not OK", async () => {
+  // The other false PASS: a terminal entry is never retried, so `queued` is 0 —
+  // and reading the count alone reported a box with a dead capture pipeline (a
+  // rotated key answers 401 for every upload) as healthy.
+  //
+  // MUTATION THAT REDS THIS: skip terminal entries without counting them.
+  const spool = tmpSpool();
+  for (let i = 0; i < 2; i += 1) {
+    writeSpoolEntry(spool, snapshot(`deadkey-${i}`));
+  }
+  const summary = await flushSpool(TEST_CFG, {
+    dir: spool,
+    fetchImpl: statusFetch(401, "invalid api key").fetchImpl,
+    budgetMs: 30_000,
+  });
+  assert.equal(summary.filed, 0);
+  const counts = captureSpoolCounts(spool);
+  assert.ok(counts, "the spool is readable");
+  assert.equal(counts!.queued, 0, "a terminal capture is never retried");
+  assert.equal(counts!.rejected, 2, "…but it is still ON THE BOX and must be counted");
+  assert.equal(captureHealthLine(spool), "capture: BLOCKED (0 queued, 401, 2 rejected)");
+  assert.equal(readCaptureHealth(spool)!.reason, "rejected");
+});
+
+test("#2100: quota is classified by STATUS, never by the response's prose", async () => {
+  // #4614 (recorded decision, `hosted_api.py`): the 402 carries a
+  // machine-readable category precisely because capture clients are FORBIDDEN
+  // from prose-matching the message. So:
+  //   - a 402 whose body says nothing about quota IS a quota refusal;
+  //   - the endpoint's real fail-closed 500 body (`Quota check failed: …`, from
+  //     hosted_api.py) is NOT — that is a database failure, and reporting it as
+  //     a quota block sends an operator to raise a tier over an outage.
+  //
+  // MUTATION THAT REDS THIS: classify on /quota/i over `detail` again → both
+  // assertions invert (the 402 without the word stops counting, the 500 with it
+  // starts), which is exactly the pair of false readings the rule forbids.
+  const quiet402 = tmpSpool();
+  for (let i = 0; i < 3; i += 1) {
+    writeSpoolEntry(quiet402, snapshot(`quiet-402-${i}`));
+  }
+  const refused = await flushSpool(TEST_CFG, {
+    dir: quiet402,
+    fetchImpl: statusFetch(402, "payment required").fetchImpl,
+    budgetMs: 30_000,
+  });
+  assert.equal(refused.quotaRefusals, 3, "a 402 is a quota refusal whatever it says");
+  assert.equal(readCaptureHealth(quiet402)!.state, "blocked");
+  assert.equal(readCaptureHealth(quiet402)!.status, 402);
+
+  const loud500 = tmpSpool();
+  for (let i = 0; i < 3; i += 1) {
+    writeSpoolEntry(loud500, snapshot(`loud-500-${i}`));
+  }
+  const failed = await flushSpool(TEST_CFG, {
+    dir: loud500,
+    fetchImpl: statusFetch(500, "Quota check failed: connection refused").fetchImpl,
+    budgetMs: 30_000,
+  });
+  assert.equal(failed.quotaRefusals, 0,
+    "prose mentioning quota must NOT be read as a quota refusal");
+  const health = readCaptureHealth(loud500);
+  assert.equal(health!.state, "backlog", "a 5xx is a transient failure, not a block");
+  assert.notEqual(health!.reason, "quota_exceeded");
 });

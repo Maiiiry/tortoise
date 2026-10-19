@@ -1,5 +1,9 @@
 // tortoise-hook-version: 5
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
+// `#2100` below is the capture-spool issue filed in daniel-ospina/agent-infra
+// (NOT tortoise#2100): a spool backlog must never block a lane turn. Kept in a
+// `//` comment on purpose — that repo's name must not appear in this artifact's
+// code or prose, or the no-dependency gate reads the seam as depending on it.
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
 // for this seam (see tortoise/hook_install.py): column-0, one per file, bumped
@@ -679,15 +683,17 @@ export const SPOOL_DIR = join(homedir(), ".tortoise", "capture-spool");
  * Spool ceilings. Count AND bytes (the issue's contract). These are NOT a TTL —
  * see the #3870 note above.
  *
- * The ceiling is a CAP, not a suggestion (#2100): a quota-blocked box kept
- * 320+ queued captures (3.3 MB) because these numbers only ever bit at 1000
- * entries / 256 MB — far past the point where the spool was already a problem.
- * 200 sessions is several days of a normal lane, and 64 MiB bounds a spool on a
- * disk-constrained cell. Both legs share the directory, so `capture_spool.py`
- * carries the SAME numbers.
+ * The cap is what bounds the turn's own synchronous work: `writeSpoolEntry`
+ * prunes on every turn, so the entries it stats are bounded by these numbers
+ * (#2100). They are deliberately NOT lowered to the size of the measured
+ * incident's spool: a blocked box's captures are the user's data, and evicting
+ * 120 of 320 to make a number look better would destroy exactly the captures
+ * the retry policy exists to keep. The unbounded-work defect was the INLINE
+ * flush, not the ceiling. Both legs share the directory, so `capture_spool.py`
+ * carries the SAME numbers, and a parity test pins them equal.
  */
-export const SPOOL_MAX_ENTRIES = 200;
-export const SPOOL_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+export const SPOOL_MAX_ENTRIES = 1000;
+export const SPOOL_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 /**
  * Per-ENTRY ceiling. `SPOOL_MAX_ENTRY_BYTES` must exceed the SERVER's own legal
  * maximum, or a legal capture is discarded as oversized: the handler accepts
@@ -861,8 +867,10 @@ export interface FlushSummary {
    * of a silent growing queue.
    */
   quotaRefusals: number;
-  /** #2100: the flush stopped at `FLUSH_BUDGET_MS` with entries still to try. */
+  /** #2100: the flush stopped at its budget with entries still to try. */
   budgetExhausted: boolean;
+  /** #2100: the budget this flush actually ran under (default FLUSH_BUDGET_MS). */
+  budgetMs: number;
   /** #2100: the last non-2xx status seen in this flush (for the health record). */
   lastFailureStatus?: number;
   discarded: DiscardRecord[];
@@ -873,15 +881,17 @@ export interface FlushSummary {
  *
  * `blocked` means the remote REFUSED the capture for a reason the client cannot
  * fix (today: the org's graph quota, 402) while captures remain queued. It is
- * durable so a checker that never observed the failing POST — `pr-doctor`, an
- * operator, a fleet sweep — can still say WHY a box is idle instead of
- * concluding "no idle lane". `backlog` is the same queue with no refusal to
+ * durable so a reader that never observed the failing POST — an operator, a
+ * fleet sweep, `tortoise session health` — can still say WHY a box is idle
+ * instead of concluding "no idle lane". `backlog` is the same queue with no refusal to
  * name (network down, entries waiting their backoff).
  */
 export interface CaptureHealth {
   state: "ok" | "backlog" | "blocked";
   /** The number of captures still queued (unfiled, non-terminal). */
   queued: number;
+  /** Captures PERMANENTLY refused and kept on disk (never retried). */
+  rejected: number;
   /** The HTTP status of the refusal that set `blocked` (402 for quota). */
   status?: number;
   /** Machine-readable refusal category (`quota_exceeded`, `transient`, …). */
@@ -1772,6 +1782,7 @@ export async function flushSpool(
     terminal: 0,
     quotaRefusals: 0,
     budgetExhausted: false,
+    budgetMs,
     discarded: [],
   };
 
@@ -1878,6 +1889,9 @@ export async function flushSpool(
       // timeout is `min(the caller's, what is left)`, or one blackholed POST
       // would spend 10 s inside a 200 ms budget (#2100).
       const requestTimeout = Math.min(opts.timeoutMs ?? REQUEST_TIMEOUT_MS, remaining);
+      // Which bound actually applied: the flush's budget, or the (possibly
+      // shorter) per-request timeout. Only the former ends the flush.
+      const boundedByBudget = budgetMs > 0 && remaining <= (opts.timeoutMs ?? REQUEST_TIMEOUT_MS);
       const res = await withDeadline(
         postCapture(cfg, payload, doFetch, requestTimeout),
         // Belt-and-braces for a fetch implementation that ignores its abort
@@ -1885,16 +1899,22 @@ export async function flushSpool(
         remaining,
       );
       if (res === undefined) {
-        // The upload did not answer inside the budget. UNKNOWN is not FAILED:
-        // the entry stays spooled and unfiled, and replaying a capture that
-        // actually landed is a no-op (the server upserts on `session_id`).
+        // The upload did not answer in time. UNKNOWN is not FAILED: the entry
+        // stays spooled and unfiled, and replaying a capture that actually
+        // landed is a no-op (the server upserts on `session_id`).
         const pending = readSpoolEntry(dir, meta.session_id) ?? meta;
         pending.attempts = clampAttempts(meta.attempts) + 1;
         pending.next_attempt_at_ms = nowMs + backoffDelay(pending.attempts);
         writeMeta(dir, pending);
         summary.deferred += 1;
-        summary.budgetExhausted = true;
-        break;
+        // Only when the FLUSH's budget (not a shorter caller-supplied request
+        // timeout) was the bound: otherwise the loop may continue and entries
+        // the budget still allowed must not be abandoned.
+        if (boundedByBudget) {
+          summary.budgetExhausted = true;
+          break;
+        }
+        continue;
       }
       if (res.ok) {
         // COMPARE-AND-SWAP, on the POSTED CONTENT **AND LANE**. A `turn_end` can
@@ -1988,7 +2008,12 @@ export async function flushSpool(
       // flaky network and a box that will refuse every capture until a human
       // acts. Both the status and the machine-readable category are read.
       summary.lastFailureStatus = res.status ?? summary.lastFailureStatus;
-      if (res.status === 402 || /quota/i.test(res.detail ?? "")) {
+      // #4614 is a RECORDED DECISION: the 402 carries a machine-readable
+      // category (`detail.code === "quota_exceeded"`) precisely because capture
+      // clients are forbidden from prose-matching the message (`hosted_api.py`).
+      // The STATUS is the contract here — it is what both legs classify — so a
+      // 402 is a quota refusal and a 5xx whose body mentions "quota" is not.
+      if (res.status === 402) {
         summary.quotaRefusals += 1;
       }
       // Re-read before the backoff write-back for the same reason as the CAS
@@ -2014,8 +2039,8 @@ export async function flushSpool(
     }
   }
   // #2100: record the box's state durably, AFTER the loop, so every reader
-  // (the lane log, `tortoise session health`, `pr-doctor`) sees the same answer
-  // whether or not it observed the failing POST itself.
+  // (the lane log, `tortoise session health`, `tortoise doctor`) sees the same
+  // answer whether or not it observed the failing POST itself.
   recordCaptureHealth(dir, summary);
   return summary;
 }
@@ -2024,29 +2049,46 @@ export async function flushSpool(
  * Persist the per-box health state (#2100).
  *
  * The decision is made from THIS flush's evidence first (a quota refusal is
- * direct proof), then carried from the previous record only when this flush
- * attempted nothing — an entry inside its backoff window has not been retried, so
- * its earlier 402 is still the last thing known about it. Clearing on the wrong
- * evidence would send an operator chasing a fixed problem; keeping a stale
- * `blocked` after a successful flush would hide the recovery.
+ * direct proof), then the SPOOL, then the previous record — which is carried
+ * only when this flush attempted nothing, because an entry inside its backoff
+ * window was not retried and its earlier 402 is still the last thing known
+ * about it. Clearing on the wrong evidence sends an operator chasing a fixed
+ * problem; keeping a stale `blocked` after a successful flush hides the
+ * recovery.
+ *
+ * An UNREADABLE spool writes nothing: replacing a good record with a guess is
+ * worse than leaving it, and the line already says `UNKNOWN`.
  */
 function recordCaptureHealth(dir: string, summary: FlushSummary): void {
-  const queued = queuedEntryCount(dir);
+  const counts = captureSpoolCounts(dir);
+  if (!counts) return;
+  const { queued, rejected } = counts;
   const previous = readCaptureHealth(dir);
   let state: CaptureHealth["state"];
   let status = summary.lastFailureStatus;
   let reason: string | undefined;
+  const observedFailure =
+    summary.deferred > 0 || summary.lastFailureStatus !== undefined || summary.budgetExhausted;
   if (summary.quotaRefusals > 0) {
     state = "blocked";
     status = 402;
     reason = "quota_exceeded";
-  } else if (queued === 0) {
+  } else if (rejected > 0 && queued === 0) {
+    // EVERY capture on the box has been permanently refused. `queued` is 0
+    // because a terminal entry is never retried — which is exactly why reading
+    // the count alone would report a dead capture pipeline as healthy.
+    state = "blocked";
+    status = summary.lastFailureStatus ?? previous?.status;
+    reason = "rejected";
+  } else if (queued === 0 && rejected === 0) {
     state = "ok";
   } else if (summary.attempted > 0) {
-    // Attempts ran and did not all succeed: the queue is live (transient
-    // failures, budget exhaustion) and this flush knows why.
     state = "backlog";
-    reason = summary.budgetExhausted ? "budget_exhausted" : "transient";
+    // Only name a cause when this flush OBSERVED one: an entry that merely
+    // arrived during the flush was not refused by anything.
+    if (observedFailure) {
+      reason = summary.budgetExhausted ? "budget_exhausted" : "transient";
+    }
   } else if (previous?.state === "blocked" && (previous.queued ?? 0) > 0) {
     // Nothing was attempted (every entry is inside the window a refusal
     // armed), so the refusal is CARRIED — not invented, and not forgotten.
@@ -2055,11 +2097,11 @@ function recordCaptureHealth(dir: string, summary: FlushSummary): void {
     reason = previous.reason;
   } else {
     state = "backlog";
-    reason = "waiting";
   }
   writeCaptureHealth(dir, {
     state,
     queued,
+    rejected,
     ...(status === undefined ? {} : { status }),
     ...(reason === undefined ? {} : { reason }),
     updated_at: new Date().toISOString(),
@@ -2159,51 +2201,80 @@ export function writeCaptureHealth(dir: string, health: CaptureHealth): void {
   }
 }
 
-/** Captures still queued: present, not filed, not terminal. Reads the spool,
- *  not the last flush's memory, so a checker that never ran a flush still
- *  answers correctly. A corrupt meta is NOT recorded here — this is a READ
- *  surface (the drain owns the ledger). */
-export function queuedEntryCount(dir: string = SPOOL_DIR): number {
+/**
+ * What the spool holds, for the health surface (#2100).
+ *
+ * `queued` = present, not filed, not terminal (what a drain would still try).
+ * `rejected` = permanently refused entries the drain KEEPS on disk but never
+ * retries: a box whose every capture is refused (a rotated key is the common
+ * one) has `queued === 0` and must still not read as healthy.
+ *
+ * `undefined` means the spool could NOT BE READ — `EACCES`, `ENOTDIR`, a meta
+ * that will not parse. That is deliberately NOT the same answer as an absent
+ * spool: folding both into `0 queued` is how a box that can file nothing came
+ * to report `capture: OK`, which is the false PASS #2100 exists to remove (the
+ * drain's own `DISCARD_SPOOL_UNREADABLE` refuses to make the same mistake).
+ */
+export interface SpoolCounts {
+  queued: number;
+  rejected: number;
+}
+
+export function captureSpoolCounts(dir: string = SPOOL_DIR): SpoolCounts | undefined {
   let names: string[];
   try {
     names = readdirSync(entriesDir(dir));
-  } catch {
-    return 0;
+  } catch (err) {
+    // ENOENT is a fresh install — absent is not a failure.
+    if ((err as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+      return { queued: 0, rejected: 0 };
+    }
+    return undefined;
   }
-  let queued = 0;
+  const counts: SpoolCounts = { queued: 0, rejected: 0 };
   for (const name of names) {
     if (!name.endsWith(".meta.json")) continue;
     let meta: SpoolMeta | undefined;
     try {
       meta = JSON.parse(readFileSync(join(entriesDir(dir), name), "utf8")) as SpoolMeta;
     } catch {
+      // A meta we cannot read is a capture we cannot account for: report the
+      // spool as unreadable rather than under-counting it as healthy.
+      return undefined;
+    }
+    if (!meta || typeof meta.session_id !== "string") return undefined;
+    if (terminalMarker(meta) !== undefined) {
+      counts.rejected += 1;
       continue;
     }
-    if (!meta || typeof meta.session_id !== "string") continue;
-    if (entryIsFiled(meta) || terminalMarker(meta) !== undefined) continue;
-    queued += 1;
+    if (entryIsFiled(meta)) continue;
+    counts.queued += 1;
   }
-  return queued;
+  return counts;
 }
 
 /**
- * The per-box health LINE (#2100), in the exact shape an operator or
- * `pr-doctor` greps for: `capture: BLOCKED (320 queued, 402)`.
+ * The per-box health LINE (#2100), in the exact shape an operator greps for:
+ * `capture: BLOCKED (320 queued, 402)`.
  *
  * It is derived from the SPOOL and the durable record, never from this
- * process's memory, so an idle box that has not flushed since the refusal
- * still reports why. `OK` with an empty spool and `BACKLOG` when captures are
- * waiting for a reason other than a refusal are distinct answers: "no captures
- * to file" and "captures refused" must never read alike.
+ * process's memory, so an idle box that has not flushed since the refusal still
+ * reports why. `OK`, `BACKLOG`, `BLOCKED` and `UNKNOWN` are four DIFFERENT
+ * answers on purpose: "nothing to file", "waiting", "refused", and "could not
+ * look" must never read alike — a health check that answers OK when it could
+ * not read the spool is the false PASS this line exists to prevent.
  */
 export function captureHealthLine(dir: string = SPOOL_DIR): string {
-  const queued = queuedEntryCount(dir);
+  const counts = captureSpoolCounts(dir);
+  if (!counts) return "capture: UNKNOWN (spool unreadable)";
+  const { queued, rejected } = counts;
   const health = readCaptureHealth(dir);
-  if (queued === 0) return "capture: OK (0 queued)";
+  const rejection = rejected > 0 ? `, ${rejected} rejected` : "";
   if (health?.state === "blocked") {
-    return `capture: BLOCKED (${queued} queued, ${health.status ?? "unknown"})`;
+    return `capture: BLOCKED (${queued} queued, ${health.status ?? "unknown"}${rejection})`;
   }
-  return `capture: BACKLOG (${queued} queued)`;
+  if (queued === 0 && rejected === 0) return "capture: OK (0 queued)";
+  return `capture: BACKLOG (${queued} queued${rejection})`;
 }
 
 // ── Extension wiring ──────────────────────────────────────────────────────
@@ -2289,7 +2360,7 @@ function reportFlush(summary: FlushSummary, where: string, dir: string): void {
     }
     if (summary.budgetExhausted) {
       log(
-        `capture: flush budget (${FLUSH_BUDGET_MS / 1000}s) reached — remaining ` +
+        `capture: flush budget (${summary.budgetMs / 1000}s) reached — remaining ` +
           `captures stay spooled and file at the next opportunity`,
       );
     }

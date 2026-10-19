@@ -3415,7 +3415,7 @@ def test_every_capture_artifact_ships_in_the_wheel():
 # also flags the missing script/entry on its own, so the bump is what carries
 # the change to an install whose bytes are frozen at generation 3.
 _EXPECTED_INSTALL_CONTRACT = {"claude": 11, "codex": 3, "cursor": 4,
-                             # 5: #2100 — the flush is scheduled + time-bounded,
+                             # 5: agent-infra#2100 — the flush is scheduled + time-bounded,
                              # a quota refusal is a named state. A generation-4
                              # copy still runs the flush on the turn's stack.
                              "pi": 5}
@@ -3529,7 +3529,7 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
 #: SHIPPED bytes and so compares equal by construction.  Edit the artifact, move
 #: the generation, update this pair — all three in one commit.
 _PINNED_PI_SEAM_INSTALL_CONTRACT = (
-    5, "60d1e8b69a880bdbbaf2b1a19f7c8b779e60a8b806bc5147d18b0835f1d532f2")
+    5, "9b72b9f5db0a2ba34b48a69a1d486c69022ef1b27bb76a9de04253d2b28117cc")
 
 #: One digest per generation from generation 3 forward, so "bytes changed,
 #: generation left alone" cannot be certified by editing the pair above by itself:
@@ -3540,10 +3540,11 @@ _PINNED_PI_SEAM_INSTALL_CONTRACT = (
 _GENERATION_DIGESTS = {
     3: "1f653d9b93775149c93838e6c9fbf70b44702341ac94e12f67ddb6480a8f0580",
     4: "cc8e496c03449d28f229cb1474e68c789f81d4d473c3f3a25156e1981ddaf498",
-    # 5 (#2100): the flush is scheduled + time-bounded, a quota refusal is a
+    # 5 (agent-infra#2100): the flush is scheduled + time-bounded, a quota refusal is a
     # named `blocked` state with its queued count, and the capture health line
-    # exists. Generation 4 still runs the flush inline on the turn's stack.
-    5: "60d1e8b69a880bdbbaf2b1a19f7c8b779e60a8b806bc5147d18b0835f1d532f2",
+    # exists (OK / BACKLOG / BLOCKED-with-rejected / UNKNOWN-unreadable).
+    # Generation 4 still runs the flush inline on the turn's stack.
+    5: "9b72b9f5db0a2ba34b48a69a1d486c69022ef1b27bb76a9de04253d2b28117cc",
 }
 
 

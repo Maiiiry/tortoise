@@ -4548,7 +4548,7 @@ def _cmd_session(args) -> int:
         # one surface that exists to be accurate silent exactly there.
         return _cmd_session_disclosure(args)
     if args.session_cmd == "health":
-        # #2100: likewise BEFORE the credential gate. It is answered from the
+        # agent-infra#2100: likewise BEFORE the credential gate. It is answered from the
         # LOCAL spool (counts + the durable refusal record), and the box that
         # most needs to report `BLOCKED (n queued, 402)` is exactly the box whose
         # captures are being refused — a health check that refused to run there
@@ -5234,19 +5234,27 @@ def _cmd_session_drain_best_effort(args) -> int:
         print(f"spool drain: nothing filed — {e}", file=_sys.stderr)
         return 0
     finally:
-        # #2100: EVERY drain exit reports the box's capture health, including
-        # the no-credential early return above. A box whose spool is blocked
-        # must say so on the lane's own log — otherwise "idle" is the only
-        # observable and it reads as "no idle lane".
+        # agent-infra#2100: EVERY drain exit reports the box's capture health, including
+        # the no-credential early return above — so a drain run BY HAND explains
+        # the spool it just could not file. (The SessionStart hook backgrounds
+        # this with `>/dev/null 2>&1`, so on that path the line is deliberately
+        # discarded: the durable surfaces are `tortoise session health`,
+        # `tortoise doctor`, and the Pi extension's own lane log.)
         _print_capture_health()
 
 
 def _print_capture_health() -> None:
-    """Print the per-box capture health line when it needs explaining (#2100).
+    """Print the per-box capture health line when it needs explaining (agent-infra#2100).
 
     Best-effort by construction: a health read must never break the exit-0
-    contract of the drain, and an `OK` line on every SessionStart would be
-    noise. Only a queue that is BLOCKED or BACKLOGGED is worth a lane's log.
+    contract of the drain, and an `OK` line on every drain would be noise. Only
+    a BLOCKED spool is worth printing.
+
+    NOTE the surface: this writes to the DRAIN's stderr, which the SessionStart
+    hook redirects to /dev/null. It is therefore an operator's line for a drain
+    run by hand — NOT the fleet's health surface. The durable answers are
+    `tortoise session health` (explicit, one line), the `tortoise doctor` row,
+    and the Pi extension's `capture:` lane-log lines.
     """
     import sys as _sys
 
@@ -5255,15 +5263,18 @@ def _print_capture_health() -> None:
         line = capture_health_line(spool_dir())
     except Exception:
         return
-    # BLOCKED only: a BACKLOG on a normal SessionStart is usually the live
-    # session held back for its own final flush, and a line about it on every
-    # start is noise. `tortoise session health` reports the full picture.
-    if "BLOCKED" in line:
+    # BLOCKED and UNKNOWN only: a BACKLOG on a normal SessionStart is usually
+    # the live session held back for its own final flush, and a line about it on
+    # every start is noise. `tortoise session health` reports the full picture.
+    # UNKNOWN is printed because a drain that could not READ the spool is the
+    # one case where printing nothing would leave the operator with the silent
+    # empty backlog this issue removed.
+    if "BLOCKED" in line or "UNKNOWN" in line:
         print(line, file=_sys.stderr)
 
 
 def _cmd_session_health() -> int:
-    """Print the per-box capture health line (#2100). Always exits 0.
+    """Print the per-box capture health line (agent-infra#2100). Always exits 0.
 
     Answered from the LOCAL spool — the queued captures and the durable refusal
     record both legs write — so it needs no credential and no network. That is
@@ -9732,16 +9743,28 @@ def _cmd_doctor(args):
         results.append(("Capture hooks", "⚠️",
                         f"check unavailable: {str(e)[:60]}"))
 
-    # #2100: the capture SPOOL is a per-box health surface in its own right — a
+    # agent-infra#2100: the capture SPOOL is a per-box health surface in its own right — a
     # box whose graph quota is exhausted refuses every capture, and an operator
     # who reads only "hooks installed" would call the box idle when it is
     # blocked. `❌` only for BLOCKED: a backlog (a flaky network, entries in
     # their backoff) clears by itself, so it warns rather than failing.
+    #
+    # The severity is decided by the LINE'S STATE, never by "not BLOCKED": an
+    # `UNKNOWN` (the spool could not be READ) is a check that did not run, and
+    # an `else ✅` arm laundered it into a pass — the same "cannot read →
+    # healthy" false PASS the line's own UNKNOWN state exists to prevent, one
+    # level up. Every state is named here so a new one cannot fall through.
     try:
         from tortoise.capture_spool import capture_health_line, spool_dir
         _capture_line = capture_health_line(spool_dir())
-        _capture_icon = "❌" if "BLOCKED" in _capture_line else (
-            "⚠️" if "BACKLOG" in _capture_line else "✅")
+        if "BLOCKED" in _capture_line:
+            _capture_icon = "❌"
+        elif "BACKLOG" in _capture_line or "UNKNOWN" in _capture_line:
+            _capture_icon = "⚠️"
+        elif "OK" in _capture_line:
+            _capture_icon = "✅"
+        else:  # a line whose shape we do not know is not a pass
+            _capture_icon = "⚠️"
         results.append(("Capture spool", _capture_icon, _capture_line))
     except MemoryError:
         raise
@@ -11130,7 +11153,7 @@ def main(argv: list[str] | None = None) -> int:
     session_spool.add_argument(
         "--model", default=None, help="Model label to record with the session")
     session_list = session_sp.add_parser("list", help="List all sessions")  # noqa: F841
-    # #2100: the per-box capture health line — `capture: BLOCKED (320 queued,
+    # agent-infra#2100: the per-box capture health line — `capture: BLOCKED (320 queued,
     # 402)`. Local-only (the spool + its durable refusal record), so it is
     # readable on an idle box with no credential: "no idle lane" must never be
     # the only explanation an operator can get.
