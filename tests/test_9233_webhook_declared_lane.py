@@ -1068,7 +1068,51 @@ _NEVER_RAISES_CONTRACT_SITES = (
 
 
 def _module_path(name: str) -> Path:
-    return MODULE if name == "webhook_delivery" else HOSTED_API
+    return {"webhook_delivery": MODULE, "hosted_api": HOSTED_API}[name]
+
+
+#: Vocabulary a reword plausibly reaches for when it states the same contract.
+#: A lexical gate this narrow is a FALSE-RED generator: the cheapest way out of
+#: it is to wedge a literal phrase back into the prose instead of writing the
+#: clearest sentence (#9233 review round 6, ISSUE 2).
+_CONTRACT_PHRASES = (
+    "never raise", "never propagate", "never propagates", "does not raise",
+    "doesn't raise", "cannot raise", "cannot escape", "non-raising",
+    "best-effort",
+)
+
+#: The carve-out tokens: the lane, and the exception's own name.
+_CARVE_OUT_TOKENS = ("§17.1", "DirectCacheWriteRefused")
+
+
+def _paragraphs(doc: str) -> list[str]:
+    return [p for p in re.split(r"\n\s*\n", doc) if p.strip()]
+
+
+def _is_contract_paragraph(paragraph: str) -> bool:
+    lowered = paragraph.lower().replace("\u2019", "'")
+    return any(phrase in lowered for phrase in _CONTRACT_PHRASES)
+
+
+def _states_carve_out(paragraph: str) -> bool:
+    return any(token in paragraph for token in _CARVE_OUT_TOKENS)
+
+
+def _missing_carve_out(doc: str) -> bool:
+    """True when `doc` states a best-effort contract whose own PARAGRAPH never
+    names the §17.1 refusal.
+
+    Paragraph-scoped on purpose: a document-wide search passes the exact shape
+    this pin exists to catch — an unconditional "never raises" sentence whose
+    carve-out sits in some OTHER paragraph (measured: "See the module header
+    for the §17.1 write-lane declaration" beside it went green). The carve-out
+    must be in the sentence the reader who adds a call site is reading
+    (#9233 review round 6, ISSUE 1).
+    """
+    contract_paragraphs = [p for p in _paragraphs(doc) if _is_contract_paragraph(p)]
+    if not contract_paragraphs:
+        return False        # nothing stated here — the census asserts it IS stated
+    return not any(_states_carve_out(p) for p in contract_paragraphs)
 
 
 def _function_docstring(tree: ast.Module, name: str) -> str | None:
@@ -1076,6 +1120,29 @@ def _function_docstring(tree: ast.Module, name: str) -> str | None:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name:
             return ast.get_docstring(node)
     return None
+
+
+def test_the_contract_pin_reads_paragraphs_not_the_whole_docstring():
+    """The checker this census rests on, pinned in BOTH directions.
+
+    A document-wide search for the carve-out passes the pre-fix shape — an
+    unconditional contract sentence with the §17.1 caveat parked in a different
+    paragraph — and a hard-coded phrase list reds a correct reword. Those were
+    the two failure modes of the first cut of this pin (#9233 review round 6).
+    """
+    # the pre-fix SHAPE: contract stated, carve-out only in a NEIGHBOUR
+    assert _missing_carve_out(
+        "Push pending events. NEVER raises.\n\n"
+        "See the module header for the §17.1 write-lane declaration.\n"
+    ), "a carve-out in a neighbouring paragraph must not satisfy the pin"
+    # a reword that keeps the carve-out where it belongs
+    assert not _missing_carve_out(
+        "This pass contains every delivery and graph failure per graph,\n"
+        "including a §17.1 ``DirectCacheWriteRefused`` from the dispatch, so it\n"
+        "cannot end the sweep.\n"
+    ), "a correct reword that names the refusal in the same paragraph must pass"
+    # a docstring that states no contract at all is not this pin's business
+    assert not _missing_carve_out("Coerce a value.\n")
 
 
 def test_every_never_raises_contract_statement_names_the_refusal_carve_out():
@@ -1086,8 +1153,11 @@ def test_every_never_raises_contract_statement_names_the_refusal_carve_out():
     containment with "the same best-effort one ``dispatch_pending`` keeps" — a
     contract `dispatch_pending` no longer keeps — so the one sentence a future
     call site author reads asserted the wrong invariant. The census is DERIVED
-    from a stated list rather than grepped, and it refuses to pass on a
-    docstring that states no contract at all (an emptied docstring is not a fix).
+    from a stated list rather than grepped, it refuses to pass on a docstring
+    that states no contract at all (an emptied docstring is not a fix), and it
+    requires the carve-out in the CONTRACT'S OWN paragraph —
+    `test_the_contract_pin_reads_paragraphs_not_the_whole_docstring` is what
+    proves the checker really is paragraph-scoped.
     """
     trees = {name: ast.parse(_module_path(name).read_text())
              for name in {m for m, _ in _NEVER_RAISES_CONTRACT_SITES}}
@@ -1095,16 +1165,11 @@ def test_every_never_raises_contract_statement_names_the_refusal_carve_out():
     for module, fn in _NEVER_RAISES_CONTRACT_SITES:
         doc = _function_docstring(trees[module], fn)
         assert doc, f"{module}.{fn} lost its docstring — the contract is unstated"
-        lowered = doc.lower().replace("\u2019", "'")
-        states_contract = any(
-            phrase in lowered
-            for phrase in ("never raise", "does not raise", "doesn't raise"))
-        assert states_contract, (
+        assert [p for p in _paragraphs(doc) if _is_contract_paragraph(p)], (
             f"{module}.{fn} no longer states a best-effort contract; if the "
             "contract moved, update _NEVER_RAISES_CONTRACT_SITES rather than "
             "leaving a stale sentence behind")
-        names_carve_out = ("§17.1" in doc) or ("DirectCacheWriteRefused" in doc)
-        if not names_carve_out:
+        if _missing_carve_out(doc):
             offenders.append(f"{module}.{fn}")
 
     assert not offenders, (
