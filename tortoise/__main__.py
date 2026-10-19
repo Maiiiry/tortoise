@@ -614,7 +614,15 @@ def _cmd_record_reconcile(args):
     Exit codes, because a scheduler's only signal is the code:
       ``0`` clean · ``3`` divergence OBSERVED · ``2`` the comparison could not
       be made (no DSN, psycopg2 absent, an unreadable side, nothing compared).
-      ``1`` usage.
+
+    ⚠️ ``2`` ALSO covers a USAGE error, and ``1`` is never returned here:
+    argparse's own ``error()`` exits ``2`` for a missing required argument
+    (``--db``/``--org``/``--graph``) or an unknown flag, and ``main()``
+    re-raises that ``SystemExit`` rather than translating it. The two are not
+    separated on purpose — a verb-specific remap in the shared dispatcher is
+    machinery nothing reads — but a scheduler must not read ``2`` as "your cron
+    line is malformed": it means only *no verdict was produced*. ``0`` and
+    ``3`` are the answers this verb promises.
     """
     import json as _json
     import os

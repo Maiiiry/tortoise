@@ -306,3 +306,55 @@ def test_the_readme_no_longer_asserts_the_field_half_is_an_open_s2_blocker():
         "the README's verbatim caveat no longer describes the log (it carries a "
         "provenance header block)"
     )
+
+
+# --------------------------------------------------------------------------
+# #9189 review (finding 1): the census is S2's DECIDING ARTIFACT, and the PR
+# that gave `read_record_view` its first production caller left it asserting
+# "0 production call sites" for that function. A lane reading the README then
+# re-derives wiring that has already landed — the stale-flag class the fleet
+# rules name. These two pins keep the log and the prose it feeds together.
+# --------------------------------------------------------------------------
+
+_S2_CENSUS_LOG = _REPO_ROOT / "docs" / "evidence" / "7950-capstone" / "s2-wiring-census.log"
+
+
+def _census_headline_lines() -> list[str]:
+    """The `== <target>: N production call site(s) ==` lines from the log."""
+    return [ln for ln in _S2_CENSUS_LOG.read_text(encoding="utf-8").splitlines()
+            if ln.startswith("== ")]
+
+
+def test_the_s2_census_records_the_callers_that_now_exist():
+    """`0` for `read_record_view` was true before `#9189`, and false after it.
+
+    Pre-fix the committed log (and the S2 row quoting it) reported **0** for
+    `cache_projection.read_record_view` while `tortoise/__main__.py`'s
+    `record-reconcile` verb already called it, so the evidence artifact
+    contradicted the merged code it is the evidence for.
+    """
+    log = _S2_CENSUS_LOG.read_text(encoding="utf-8")
+    assert "== cache_projection.read_record_view: 1 production call site(s) ==" in log, (
+        "the census no longer records the production caller #9189 added — "
+        "re-run docs/evidence/7950-capstone/probes/s2_wiring_census.py")
+    verdict = next(ln for ln in _readme_text().splitlines()
+                   if ln.startswith("| **S2** |") and "divergence is OBSERVED" in ln)
+    assert "all have **0 production call sites**" not in verdict, (
+        "the S2 verdict row still claims every module is unwired: " + verdict)
+
+
+def test_the_s2_census_quote_matches_the_log():
+    """Every headline the README quotes is the log's own, byte for byte.
+
+    The README presents the block as the probe's output; a re-cut log that does
+    not drag the quote with it is a false claim about its own evidence (the
+    #8615 finding, one artifact over).
+    """
+    headlines = _census_headline_lines()
+    assert len(headlines) == 4, f"expected four census headlines, got {headlines}"
+    readme = _readme_text()
+    missing = [ln for ln in headlines if ln not in readme]
+    assert not missing, (
+        "docs/evidence/7950-capstone/README.md quotes census numbers that are "
+        "not in s2-wiring-census.log — re-quote the block after re-measuring:\n"
+        + "\n".join(missing))

@@ -5091,6 +5091,16 @@ carve_out:
 - test_projection_lifecycle.py
 - test_reaper.py
 - test_reaper_orphan.py
+# #9189 (§17.2): the record↔cache observer's journal-backed arm is embedded-only
+# — `test_the_guarded_lanes_refuse_the_same_write_while_the_handle_takes_it`
+# binds a real journal to a fresh embedded projection (that arm does not exist
+# on the server lane), so without this row the file was collected-and-SKIPPED by
+# every full selection: a permanently green, permanently unexecuted gate, which
+# is the #4047 shape this list exists to close. Also in `api` + `core` above —
+# `core` is what makes `carve_out_run` true for a `record_reconcile.py`-only
+# diff, and `api` for the `__main__.py` verb that REPLACES the core fallback.
+# Mirrored in tests/_embedded.TEST_NO_REDIRECT_STEMS.
+- test_record_reconcile_trigger.py
 # #2814: authoritative-config durability across rebuild_all (the embedded
 # carve-out is load-bearing — the pins exercise the real unconditional wipe,
 # which the server-side bulk-wipe guard refuses on a non-test graph).

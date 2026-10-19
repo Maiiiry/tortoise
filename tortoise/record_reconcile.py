@@ -156,12 +156,20 @@ def read_cache_view(g: Any, *, labels: Iterable[str] | None = None,
     applies and then cannot report.
 
     ⛔ **Every failure is a REFUSAL.** A query that raises, a row that is not a
-    property mapping, and a node with no contract key all raise
-    :class:`ReconciliationUnavailable`. Silence in any of those cases would
-    read as *"the cache agrees with the record"* while the comparison had in
-    fact not happened — and a node the reader skipped is exactly the
-    ``extra_in_cache`` a second writer produces (the #1382 class §17.2 puts
-    first).
+    property mapping, a node with no contract key, and **two nodes claiming one
+    coordinate** all raise :class:`ReconciliationUnavailable`. Silence in any of
+    those cases would read as *"the cache agrees with the record"* while the
+    comparison had in fact not happened — and a node the reader skipped is
+    exactly the ``extra_in_cache`` a second writer produces (the #1382 class
+    §17.2 puts first).
+
+    ⛔ **Duplicates are refused, not collapsed.** The writer ``MERGE``s on the
+    key and the graph declares no uniqueness constraint, so a second writer's
+    ``CREATE`` can leave TWO nodes at one ``(label, key)``. Collapsing them
+    (last wins) leaves the two key SETS equal, so the run would report
+    ``extra_in_cache == 0`` over a cache holding a node the record does not —
+    the same undercount the key-less branch refuses, one step weaker. The
+    comparison is therefore UNKNOWN, not clean.
     """
     known = frozenset(NODE_TABLES)
     wanted = tuple(NODE_TABLES) if labels is None else tuple(labels)
@@ -198,7 +206,14 @@ def read_cache_view(g: Any, *, labels: Iterable[str] | None = None,
                     f"a cache {label!r} node carries no contract key "
                     f"{key_property!r} — it cannot be addressed, and skipping "
                     f"it would undercount `extra_in_cache` (a second writer)")
-            out[declared_key(label, str(key), scope=scope)] = props
+            declared = declared_key(label, str(key), scope=scope)
+            if declared in out:
+                raise ReconciliationUnavailable(
+                    f"the cache holds more than one {label!r} node at "
+                    f"{declared!r} — collapsing them would leave the key sets "
+                    f"equal and report `extra_in_cache=0` over a node the "
+                    f"record does not have; divergence is UNKNOWN, not zero")
+            out[declared] = props
     return out
 
 

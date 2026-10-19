@@ -16,20 +16,31 @@ Five things are pinned here, and each is a way the observer could be worthless:
    graph-handle write that appends nothing to any journal, raises
    ``extra_in_cache > 0``. The count is not a mock's arithmetic (#9189
    indicator 2); it is read back out of the cache.
-3. **The guarded lanes REFUSE the same write** — which is why the guard alone
-   cannot be the answer and an observer is needed. ⚠️ Stated as it is: the
-   §17.1 gate closes ``FalkorProjection.apply`` and
+3. **The guarded lanes REFUSE the same write, and the raw handle does not** —
+   which is why the guard alone cannot be the answer and an observer is needed.
+   ⚠️ Stated as it is: the §17.1 gate closes ``FalkorProjection.apply`` and
    ``FalkorProjection.query``, and the raw graph handle (``proj.g.query``)
-   survives — the surviving second-writer seam this count exists to see.
+   survives — the surviving second-writer seam this count exists to see. Both
+   halves are asserted on ONE **journal-backed** projection, and the write the
+   handle accepts is then COUNTED by the shipped read path, because a change
+   that closed ``proj.g.query`` too would otherwise keep this file green while
+   ``python -m tortoise record-reconcile`` reported exit 2 forever.
 4. **An unreadable side is a REFUSAL, and nothing compared is NOT clean** — an
-   unreadable cache, a node with no contract key, and a pair of placeholder
-   property maps all refuse; an empty pair verdicts ``unanswerable`` (exit 2),
-   never ``clean``.
+   unreadable cache, a node with no contract key, two nodes at one coordinate,
+   and a pair of placeholder property maps all refuse; an empty pair verdicts
+   ``unanswerable`` (exit 2), never ``clean``.
 5. **A PARTIAL declaration's unwritten keys are RESIDENCY, not divergence**
    (§17.3) — counted as ``not_hot``, never as ``missing_in_cache`` — while a
    ``complete`` declaration's missing key still counts as divergence.
 6. **The trigger exists in production** — an AST import-graph pin, so the
-   observer cannot drift back to being reachable only from tests and probes.
+   observer cannot drift back to being reachable only from tests and probes —
+   and its documented exit-code contract, including the usage case argparse
+   answers with ``2``, is pinned rather than narrated.
+
+⚠️ This file lives in BOTH the `api`/`core` surfaces and `carve_out:`: item 3
+is embedded-only (§17.1's journal arm exists only on the embedded lane), and a
+carve-out-less registration would leave it collected-and-SKIPPED on every full
+selection — a permanently green, permanently unexecuted gate (#4047).
 
 ⚠️ The trigger is a SWEEP (the CLI verb), not a call inside the capture turn:
 detection latency is the sweep interval, and divergence created AND repaired
@@ -187,17 +198,15 @@ def test_the_cache_reader_returns_the_real_property_maps(cache_graph):
 # ── 2. the observer is not vacuous ────────────────────────────────────────
 
 
-def test_a_second_writer_raises_extra_in_cache(cache_graph, tmp_path):
+def test_a_second_writer_raises_extra_in_cache(cache_graph):
     """A REAL unjournalled write through the graph handle, read back as a count."""
     view = _record_view()
     _project(view, cache_graph)
-    journal = tmp_path / "events.jsonl"
 
     # The raw graph handle: the surviving second-writer seam. It takes no
-    # journal, so this write bypasses the record entirely — no event is
-    # appended (the file does not even exist) and no projection statement ran.
+    # journal, so this write bypasses the record entirely — no projection
+    # statement ran, and the record view knows nothing about it.
     cache_graph.query("CREATE (:Point {id:'p-9189-direct'})")
-    assert not journal.exists()
 
     result = _run(view, cache_graph)
 
@@ -208,26 +217,51 @@ def test_a_second_writer_raises_extra_in_cache(cache_graph, tmp_path):
     assert rr.exit_code_for(result) == rr.EXIT_DIVERGENT
 
 
-def test_the_guarded_lanes_refuse_the_same_write(shared_proj, tmp_path):
+@pytest.mark.embedded_only
+def test_the_guarded_lanes_refuse_the_same_write_while_the_handle_takes_it(tmp_path):
     """§17.1's gate closes the fold and raw-projection lanes, not the handle.
 
     Stated precisely, because the difference is the reason this observer
-    exists: ``FalkorProjection.apply``/``.query`` refuse on a journal-backed
-    projection, and ``proj.g.query`` does not — so the CACHE can still hold a
-    node the record never had, and only a count can reveal it.
+    exists: on a **journal-backed** projection ``FalkorProjection.apply`` and
+    ``FalkorProjection.query`` refuse, while ``proj.g.query`` still writes the
+    cache — so the cache can hold a node the record never had, and only a count
+    can reveal it.
+
+    Both halves run on ONE journal-backed projection, and the write the handle
+    accepts is read back through the shipped reader the CLI uses
+    (``read_cache_view(proj.g)``) and then COUNTED. Asserting them on two
+    different objects would let a change that closed ``proj.g.query`` as well
+    keep this file green while the verb reported exit 2 forever.
     """
-    if shared_proj is None:
-        pytest.skip("no graph engine available on this lane")
-    if not getattr(shared_proj, "_is_embedded", False):
-        pytest.skip("arms the session projection; embedded lane only")
-    shared_proj._bind_journal(str(tmp_path / "events.jsonl"))
-    try:
-        with pytest.raises(DirectCacheWriteRefused):
-            shared_proj.apply({"type": "PointAdded", "id": "p-9189-fold"})
-        with pytest.raises(DirectCacheWriteRefused):
-            shared_proj.query("CREATE (:Point {id:'p-9189-lane'})")
-    finally:
-        shared_proj._bind_journal(None)
+    from tests._embedded import fresh_embedded_proj
+
+    view = _record_view()
+    with fresh_embedded_proj(tmp_path) as proj:
+        proj._bind_journal(str(tmp_path / "events.jsonl"))
+        try:
+            with pytest.raises(DirectCacheWriteRefused):
+                proj.apply({"type": "PointAdded", "id": "p-9189-fold"})
+            with pytest.raises(DirectCacheWriteRefused):
+                proj.query("CREATE (:Point {id:'p-9189-lane'})")
+
+            # The READ lane the CLI drives is not what the gate closes: the
+            # shipped reader walks the same guarded handle.
+            _project(view, proj.g)
+            assert rr.read_cache_view(proj.g)["Point:p-9189-1"]["content"] == "alpha"
+
+            # ...and the raw handle STILL accepts an unjournalled write.
+            proj.g.query("CREATE (:Point {id:'p-9189-direct'})")
+
+            result = rr.reconcile_record_and_cache(
+                rr.record_key_map(view),
+                rr.read_cache_view(proj.g),
+                declaration=read_declaration(proj.g),
+            )
+        finally:
+            proj._bind_journal(None)
+
+    assert result.report.extra_in_cache == 1, result.report.render()
+    assert result.verdict() == rr.VERDICT_DIVERGENT
 
 
 # ── 3. residency is not divergence (§17.3) ────────────────────────────────
@@ -308,6 +342,27 @@ def test_a_cache_node_with_no_contract_key_refuses():
 def test_a_label_outside_the_record_placement_is_refused(cache_graph):
     with pytest.raises(ValueError):
         rr.read_cache_view(cache_graph, labels=("Point", ") DETACH DELETE n //"))
+
+
+def test_two_cache_nodes_at_one_coordinate_refuse(cache_graph):
+    """Collapsing a duplicate would report `extra_in_cache=0` over a real node.
+
+    The writer ``MERGE``s on the key and the graph has no uniqueness
+    constraint, so a second writer's ``CREATE`` at an EXISTING id is reachable
+    — and it is the one shape that leaves the two key SETS equal. Pre-fix the
+    reader kept the last node and the run read clean; a new id (the test above)
+    cannot discriminate this case.
+    """
+    view = _record_view()
+    _project(view, cache_graph)
+    cache_graph.query("CREATE (:Point {id:'p-9189-1', content:'impostor'})")
+
+    with pytest.raises(ReconciliationUnavailable) as excinfo:
+        rr.read_cache_view(cache_graph, labels=("Point",))
+
+    message = str(excinfo.value)
+    assert "Point:p-9189-1" in message
+    assert "UNKNOWN, not zero" in message
 
 
 def test_a_vacuous_comparison_refuses():
@@ -463,3 +518,23 @@ def test_the_cli_verb_refuses_without_a_record_dsn(monkeypatch, capsys):
 
     assert rc == rr.EXIT_UNAVAILABLE
     assert "UNKNOWN, not zero" in capsys.readouterr().err
+
+
+def test_a_usage_error_exits_2_not_1(capsys):
+    """The verb's documented exit contract, pinned where argparse decides it.
+
+    ``--graph`` is required, so argparse's own ``error()`` answers ``2`` — the
+    SAME code as ``EXIT_UNAVAILABLE`` — and ``main()`` re-raises that
+    ``SystemExit``. The docstring used to promise ``1`` for usage, which no
+    path returns; a scheduler keying on the documented code would read a
+    malformed cron line as "the record is unreachable".
+    """
+    from tortoise import __main__ as cli
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["record-reconcile", "--db", "docker://:x@localhost:6379/g",
+                  "--org", "o"])
+
+    assert excinfo.value.code == 2
+    _cmd = cli._cmd_record_reconcile
+    assert "``1`` is never returned" in (_cmd.__doc__ or "")
