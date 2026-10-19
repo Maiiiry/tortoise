@@ -524,6 +524,13 @@ for three sends to one pane that were recorded as `OK` and never consumed.
   clear a bare pop on work that is not this lane's. To restore a *peer's* dropped entry,
   use `git stash store -m "<original subject>" <sha>` (the commit survives in the object DB), or let
   that lane recover it from its own worktree.
+  `python tools/lane_stash.py discover` is the **finding** half of the repair: `recover <sha>`
+  needs a sha, and the state that needs it is the one where the sha is invisible (the register row
+  is gone, so `git stash list` shows nothing). It lists the unreachable stash commits that no lane
+  ref pins and the register no longer enumerates — with their branch, their files and the exact
+  `recover` invocation — replacing the hand-rolled `git fsck --unreachable --no-reflogs | grep
+  commit` plus eyeballing `WIP on <branch>` subjects that was the only way back in #3147 (#8423).
+  It is read-only, and it prints a recipe only for an entry this lane can prove is its own.
   `tests/test_lane_stash.py` carries the 2-worktree reproduction. The lane rule
   also exists one repo up in agent-infra (skills + guard extension) as agent-infra #1264.
 - Branch naming: `feat/`, `fix/`, `chore/` prefixes

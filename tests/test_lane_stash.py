@@ -2828,3 +2828,340 @@ def test_push_survives_a_peer_entry_with_a_non_utf8_message(repo):
     assert pushed.returncode == 0, _fail(pushed)
     assert "Traceback" not in pushed.stderr, pushed.stderr
     assert repo.stash_pins(), "push must pin its entry beside a non-UTF-8 peer subject"
+
+
+# ── `discover`: the recovery path's missing half (#8423) ─────────────────────
+#
+# #8423's three indicators, and where each one landed:
+#   1. a pop/apply that would take another lane's entry is refused or names the
+#      entry it applies  -> `check` + hash-addressed `pop` (#8051);
+#   2. the workaround that actually SAVED #3147's ~150 lines of edits is ONE
+#      command  -> was a hand-rolled
+#      `git fsck --unreachable --no-reflogs | grep commit` + eyeballing
+#      `WIP on <branch>` subjects, and it was in no skill, doc or flag;
+#   3. AGENTS.md names the hazard next to the #729 commit-message-path race
+#      -> done with the lane rule (#8051).
+#
+# Indicator 2 was the open gap: `recover <sha>` restores a lost entry but needs the
+# sha, and the state that needs it is precisely the one where the sha is invisible
+# (the register row is gone). These tests cover the discovery half, driven mostly
+# with BARE git on purpose — the #3147 harm happens to lanes that never touch this
+# tool, so `discover` has to be their way back.
+
+def test_discover_finds_the_entry_a_peers_pop_consumed(repo):
+    """THE #3147 SCENARIO: A's bare pop takes B's entry — B can still find it.
+
+    Asserts both halves: B's lost entry IS listed with its branch, its file and the
+    `recover` recipe, and A's own entry — still LIVE in the register — is NOT
+    (listing a live peer entry is the #8051 adoption door re-opened by a listing
+    command).
+    """
+    # lane A stashes its work with bare git (the incident's first step) ...
+    repo.dirty(repo.a, "f.txt", "base\na-from-A\n")
+    repo.git("stash", "push", "-q", cwd=repo.a)
+    sha_a = repo.stash_sha()
+    # ... lane B stashes its own, so B's entry is on top ...
+    repo.dirty(repo.b, "f.txt", "base\nb-from-B\n")
+    repo.git("stash", "push", "-q", cwd=repo.b)
+    sha_b = repo.stash_sha()
+    assert sha_b and sha_b != sha_a
+    # ... and A's pop applies AND drops B's entry.
+    repo.git("stash", "pop", "-q", cwd=repo.a)
+    assert "b-from-B" in (repo.a / "f.txt").read_text()
+    assert repo.stash_shas() == [sha_a], "premise: B's entry left the register"
+
+    found = repo.lane(repo.b, "discover")
+    assert found.returncode == 0, _fail(found)
+    assert sha_b[:12] in found.stdout, found.stdout
+    assert "feat/b" in found.stdout, f"the entry's branch must be named:\n{found.stdout}"
+    assert "f.txt" in found.stdout, f"the entry's files must be listed:\n{found.stdout}"
+    assert f"recover {sha_b}" in found.stdout, found.stdout
+    assert sha_a[:12] not in found.stdout, (
+        f"a LIVE register entry must never be offered as lost:\n{found.stdout}"
+    )
+
+    # the printed recipe is the whole repair, and the work comes back
+    recovered = repo.lane(repo.b, "recover", sha_b, "-m", "my baseline")
+    assert recovered.returncode == 0, _fail(recovered)
+    assert sha_b in repo.stash_pins().values(), repo.stash_pins()
+    popped = repo.lane(repo.b, "pop")
+    assert popped.returncode == 0, _fail(popped)
+    assert "b-from-B" in (repo.b / "f.txt").read_text()
+
+
+def test_discover_never_offers_a_LIVE_register_entry(repo):
+    """A register row BELOW `@{0}` is "unreachable" to `--no-reflogs` — and still LIVE.
+
+    `--no-reflogs` stops reflogs from being roots, so `git fsck` reports every entry
+    under the register's top as unreachable while `git stash list` shows it as live.
+    Listing one would hand a lane a `recover <sha>` for a peer's live entry, which is
+    the #8051 adoption door reached through a DISCOVERY command. The register
+    subtraction is what closes it, so it is asserted directly.
+    """
+    repo.dirty(repo.a, "f.txt", "base\na\n")
+    repo.git("stash", "push", "-q", cwd=repo.a)
+    sha_a = repo.stash_sha()
+    repo.dirty(repo.b, "f.txt", "base\nb\n")
+    repo.git("stash", "push", "-q", cwd=repo.b)
+    sha_b = repo.stash_sha()
+    assert repo.stash_shas() == [sha_b, sha_a]
+
+    # precondition: ssck really does call @{1} unreachable without reflog roots
+    fsck = repo.git("fsck", "--unreachable", "--no-reflogs", "--no-progress", check=False)
+    assert sha_a in fsck.stdout, (
+        f"precondition: git must report the sub-top register entry as unreachable:\n"
+        f"{fsck.stdout}"
+    )
+
+    for cwd in (repo.a, repo.b):
+        found = repo.lane(cwd, "discover")
+        assert found.returncode == 0, _fail(found)
+        assert sha_a[:12] not in found.stdout, found.stdout
+        assert sha_b[:12] not in found.stdout, found.stdout
+        assert "no lost stash entries" in found.stdout, found.stdout
+
+
+def test_discover_ignores_unreachable_non_stash_commits(repo):
+    """An amend + reset leaves orphaned COMMITS; they are not stash entries.
+
+    The shape oracle is the stash commit's 2-3 parents AND an `index on ...` second
+    parent; a rebase/amend orphan has 1 parent, so it must not be listed as a lost
+    stash.
+    """
+    repo.dirty(repo.a, "f.txt", "base\namended\n")
+    repo.git("commit", "-qm", "will be amended", cwd=repo.a)
+    repo.git("commit", "-q", "--amend", "-m", "amended", cwd=repo.a)
+    repo.git("reset", "-q", "--hard", "HEAD~1", cwd=repo.a)
+
+    fsck = repo.git("fsck", "--unreachable", "--no-reflogs", "--no-progress", check=False)
+    assert " commit " in fsck.stdout, f"precondition: an orphan commit exists:\n{fsck.stdout}"
+
+    found = repo.lane(repo.a, "discover")
+    assert found.returncode == 0, _fail(found)
+    assert "no lost stash entries" in found.stdout, found.stdout
+
+
+def test_discover_marks_this_lanes_own_entry_and_the_recipe_needs_no_dash_m(repo):
+    """An own `[<lane-key>]` marker makes `recover` provable, so `-m` is not asked for.
+
+    `push` writes the lane marker into the message before it can fail, so a tool
+    entry that loses BOTH handles (pin and register row) is still attributable — and
+    the printed recipe must be the one that actually works, without `-m`.
+    """
+    repo.dirty(repo.a, "f.txt", "base\nmine\n")
+    assert repo.lane(repo.a, "push", "-m", "own work").returncode == 0
+    sha = repo.stash_sha()
+    assert repo.lane(repo.a, "drop", "1", "--yes").returncode == 0
+    repo.git("stash", "drop", "-q")
+    assert repo.stash_shas() == [] and repo.stash_pins() == {}
+
+    found = repo.lane(repo.a, "discover")
+    assert found.returncode == 0, _fail(found)
+    assert sha[:12] in found.stdout, found.stdout
+    assert "THIS lane" in found.stdout, found.stdout
+    restore = next(
+        ln.strip() for ln in found.stdout.splitlines() if ln.strip().startswith("restore:")
+    )
+    assert restore == f"restore: python tools/lane_stash.py recover {sha}", restore
+
+    # the printed command works as printed: `recover` sees an own marker
+    recovered = repo.lane(repo.a, "recover", sha)
+    assert recovered.returncode == 0, _fail(recovered)
+    assert sha in repo.stash_pins().values()
+
+
+def test_discover_attributes_a_peer_lanes_lost_entry_and_offers_NO_recipe(repo):
+    """A lost entry carrying ANOTHER lane's marker must not be advertised here.
+
+    `recover` refuses a foreign-marked entry by design; printing the recipe anyway
+    would send the lane into that refusal, and a lane that then forced it with `-m`
+    would re-open the #8051 adoption door.
+    """
+    repo.dirty(repo.b, "f.txt", "base\npeer work\n")
+    assert repo.lane(repo.b, "push", "-m", "peer work").returncode == 0
+    sha = repo.stash_sha()
+    assert repo.lane(repo.b, "drop", "1", "--yes").returncode == 0
+    repo.git("stash", "drop", "-q")
+
+    found = repo.lane(repo.a, "discover")
+    assert found.returncode == 0, _fail(found)
+    assert sha[:12] in found.stdout, found.stdout
+    assert "NOT this lane" in found.stdout, found.stdout
+    assert "refused here by design" in found.stdout, found.stdout
+    assert f"recover {sha}" not in found.stdout, (
+        f"no recovery recipe may be offered for a peer lane's entry:\n{found.stdout}"
+    )
+
+
+def test_discover_limit_truncates_and_zero_means_no_limit(repo):
+    """`--limit` bounds the output (repos accumulate hundreds of lost entries)."""
+    shas = []
+    for i in range(3):
+        repo.dirty(repo.a, "f.txt", f"base\nw{i}\n")
+        repo.git("stash", "push", "-q", cwd=repo.a)
+        shas.append(repo.stash_sha())
+        repo.git("stash", "drop", "-q", cwd=repo.a)
+
+    one = repo.lane(repo.a, "discover", "--limit", "1")
+    assert one.returncode == 0, _fail(one)
+    assert one.stdout.count("restore:") == 1, one.stdout
+    assert "2 more not shown" in one.stdout, one.stdout
+
+    every = repo.lane(repo.a, "discover", "--limit", "0")
+    assert every.returncode == 0, _fail(every)
+    assert every.stdout.count("restore:") == 3, every.stdout
+    for sha in shas:
+        assert sha[:12] in every.stdout, every.stdout
+
+
+def test_discover_is_read_only(repo):
+    """`discover` must not write a ref, touch the register, or change a worktree.
+
+    A peer can be live while a lane runs this (that is WHEN it runs), so a listing
+    that pinned, stored or applied anything would be a new way to take a peer's work.
+    """
+    repo.dirty(repo.b, "f.txt", "base\npeer\n")
+    repo.git("stash", "push", "-q", cwd=repo.b)
+    repo.dirty(repo.a, "f.txt", "base\na\n")
+    repo.git("stash", "push", "-q", cwd=repo.a)
+
+    register_before = repo.stash_shas()
+    refs_before = repo.git(
+        "for-each-ref", "--format=%(refname) %(objectname)"
+    ).stdout
+    status_before = repo.status(repo.a) + repo.status(repo.b)
+
+    found = repo.lane(repo.a, "discover")
+    assert found.returncode == 0, _fail(found)
+
+    assert repo.stash_shas() == register_before, "discover must not touch the register"
+    assert repo.git(
+        "for-each-ref", "--format=%(refname) %(objectname)"
+    ).stdout == refs_before, "discover must not write any ref"
+    assert repo.status(repo.a) + repo.status(repo.b) == status_before
+
+
+def test_discover_recall_first_accepts_a_stash_subject_without_an_index_parent(repo):
+    """The oracle is recall-first: a stash SUBJECT on a 2-parent merge is listed.
+
+    The `index on <branch>: ...` second parent is the primary signal, but the subject
+    is an ADDITIONAL accept path so an object git can still describe cannot be hidden
+    from a lane that lost it. `recover` remains the precision gate (it re-checks the
+    shape and refuses a non-stash), so an extra listing costs one line.
+    """
+    base = repo.git("rev-parse", "HEAD").stdout.strip()
+    tree = repo.git("rev-parse", "HEAD^{tree}").stdout.strip()
+
+    def commit_tree(*parents: str, message: str) -> str:
+        args = ["git", "commit-tree", tree]
+        for parent in parents:
+            args += ["-p", parent]
+        made = subprocess.run(
+            [*args, "-m", message], cwd=str(repo.root), capture_output=True,
+            text=True, env=_env(),
+        )
+        assert made.returncode == 0, made.stderr
+        return made.stdout.strip()
+
+    # A DISTINCT second parent: `git commit-tree -p X -p X` silently drops the
+    # duplicate and yields a 1-parent commit (measured), which the parent-count
+    # test rejects before the subject path is ever consulted.
+    second = commit_tree(base, message="fetched upstream, not an index commit")
+    sha = commit_tree(base, second, message="WIP on feat/x: deadbeef lost work")
+
+    found = repo.lane(repo.a, "discover")
+    assert found.returncode == 0, _fail(found)
+    assert sha[:12] in found.stdout, found.stdout
+    assert "feat/x" in found.stdout, found.stdout
+
+
+def test_discover_orders_by_commit_time_not_by_the_iso_string(repo):
+    """Newest FIRST must hold across UTC offsets — `%cI` text order does not.
+
+    ``2026-10-19T23:00:00+09:00`` (14:00Z) sorts AFTER ``2026-10-19T15:00:00+00:00``
+    (15:00Z) as text while being the OLDER commit. A lane looks for the entry it lost
+    a minute ago at the TOP of `discover`, so the sort key is the epoch, and this
+    pins it: the bug is invisible whenever every host shares one UTC offset.
+    """
+    def bare_stash(cwd: Path, text: str, when: str) -> str:
+        (cwd / "f.txt").write_text(text)
+        subprocess.run(
+            ["git", "add", "f.txt"], cwd=str(cwd), capture_output=True,
+            env=_env(), check=True,
+        )
+        cp = subprocess.run(
+            ["git", "stash", "push", "-q"], cwd=str(cwd), capture_output=True,
+            text=True, env={**_env(), "GIT_COMMITTER_DATE": when,
+                            "GIT_AUTHOR_DATE": when},
+        )
+        assert cp.returncode == 0, cp.stderr
+        sha = repo.git("rev-parse", "refs/stash").stdout.strip()
+        repo.git("stash", "drop", "-q", cwd=cwd)
+        return sha
+
+    # older instant, lexicographically LATER string
+    old = bare_stash(repo.a, "base\nold\n", "2026-10-19T23:00:00+09:00")
+    # newer instant, lexicographically EARLIER string
+    new = bare_stash(repo.a, "base\nnew\n", "2026-10-19T15:00:00+00:00")
+
+    found = repo.lane(repo.a, "discover", "--limit", "0")
+    assert found.returncode == 0, _fail(found)
+    assert found.stdout.index(new[:12]) < found.stdout.index(old[:12]), (
+        f"the newer entry must be listed first:\n{found.stdout}"
+    )
+
+
+def test_discover_survives_an_object_vanishing_between_fsck_and_the_read(repo, monkeypatch):
+    """The batch read is ALL-OR-NOTHING, so a vanished object must be dropped.
+
+    `git log --no-walk <batch>` exits 128 for ONE missing sha (measured), which would
+    turn a concurrent `gc` — routine in this fleet — into a hard failure of the very
+    command a lane runs after losing work. `_filter_existing_commits` is that repair
+    path; it is unit-tested here because no hermetic subprocess can make an object
+    vanish at that exact instant. (The in-process module reads git from the CWD, so
+    the chdir is part of the fixture, not a behaviour override.)
+    """
+    tool = _load_tool()
+    monkeypatch.chdir(repo.a)
+    repo.dirty(repo.a, "f.txt", "base\nkept\n")
+    repo.git("stash", "push", "-q", cwd=repo.a)
+    live = repo.stash_sha()
+    vanished = "0123456789" * 4
+
+    # precondition: the batch it guards really does fail outright
+    assert repo.git(
+        "log", "--no-walk", "--format=%H", live, vanished, check=False
+    ).returncode != 0
+
+    kept = tool._filter_existing_commits([live, vanished])
+    assert kept == [live], kept
+
+
+def test_discover_read_failure_is_a_state_error(repo, monkeypatch):
+    """An unreadable register must exit 2 — never "no lost stash entries".
+
+    Without the register there is no way to tell a LIVE entry from a lost one, and
+    the line printed for a lost entry is a `recover` recipe. Answering "nothing is
+    lost" from a failed read is the same fail-open `check` refuses (#8051 review P1).
+    (A precondition entry is required: with NO unreachable stash commit there is
+    genuinely nothing to report, and `discover` returns before it ever needs the
+    register — that early exit is sound, not a fail-open.)
+    """
+    repo.dirty(repo.a, "f.txt", "base\nlost\n")
+    repo.git("stash", "push", "-q", cwd=repo.a)
+    repo.git("stash", "drop", "-q", cwd=repo.a)
+
+    mod = _load_tool()
+    monkeypatch.chdir(repo.a)
+    real_git = mod._git
+
+    def fake_git(*args, check=True, **kwargs):
+        if args[:2] == ("stash", "list"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 1, "", "fatal: cannot read refs/stash"
+            )
+        return real_git(*args, check=check, **kwargs)
+
+    monkeypatch.setattr(mod, "_git", fake_git)
+    rc = mod.main(["discover"])
+    assert rc == 2, f"an unreadable register is a state error (exit 2), got {rc}"
