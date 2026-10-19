@@ -3685,3 +3685,56 @@ def test_cli_returns_2_when_a_manifest_leg_list_is_not_a_list(tmp_path, key: str
     assert proc.returncode == 2, f"{key}: rc={proc.returncode} stderr={proc.stderr[-400:]}"
     assert "Traceback" not in proc.stderr
     assert f"`{key}:`" in proc.stderr, "the refusal must name the offending key"
+
+
+def test_the_committed_artifact_agrees_with_its_own_failure_detail() -> None:
+    """The SHIPPED artifact must satisfy the rules its own generator enforces.
+
+    The artifact committed before this pin read ``counts.failed: 5`` beside SIX
+    ``failed_tests`` entries. The cause is the one ``aggregate_logs`` was fixed
+    for: a leg whose log carries no pytest SUMMARY line reports 0 of everything
+    while its progress lines still name the testcase that failed, so the count
+    (summed from summaries) and the list (unioned from progress lines) diverged.
+    The generator was corrected — but nothing re-rendered the committed artifact
+    and no test ever read it, so the shipped JSON kept contradicting the code
+    that produces it. A rule that is only tested on synthetic logs cannot notice
+    that the artifact in the tree was rendered before the rule existed.
+
+    The same read catches the second way a re-render goes wrong: prepending the
+    freshly measured run leaves the copy already in ``history`` in place, which
+    ships two rows for one ``run_id`` with contradictory counts (measured while
+    re-rendering this artifact: 5 entries, 4 distinct run ids).
+
+    Skips while the artifact is still the #1483 stub, because then nothing has
+    been rendered to contradict.
+    """
+    artifact = json.loads((REPO_ROOT / "docs" / "ci-timing.json").read_text())
+    history = artifact.get("history", [])
+    if not history:
+        pytest.skip("docs/ci-timing.json is still the #1483 stub — nothing rendered")
+
+    disagreements = [
+        (entry.get("run_id"), entry["counts"]["failed"], len(entry.get("failed_tests", [])))
+        for entry in history
+        if "failed_tests" in entry
+        and entry.get("counts", {}).get("failed") != len(entry["failed_tests"])
+    ]
+    assert not disagreements, (
+        "history entry(s) report a failure COUNT that disagrees with their own "
+        f"failed_tests list (run_id, count, listed): {disagreements}"
+    )
+
+    run_ids = [entry.get("run_id") for entry in history]
+    duplicates = sorted({r for r in run_ids if run_ids.count(r) > 1})
+    assert not duplicates, (
+        "one run is sampled twice — a re-render prepended a corrected row without "
+        f"replacing the stale one: {duplicates}"
+    )
+
+    outcome = artifact.get("outcome", {})
+    if "failed" in outcome:
+        listed = len(artifact.get("failed_tests", []))
+        assert outcome["failed"] == listed, (
+            f"outcome.failed={outcome['failed']} but {listed} test(s) are named in "
+            "the artifact's own failed_tests"
+        )
