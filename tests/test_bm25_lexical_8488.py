@@ -659,6 +659,183 @@ class TestReadPath:
                 "a stood-down arm leaves the read exactly as the gate-off "
                 f"read ({lever}); off={off}, on={on}")
 
+    def test_relevance_floor_stands_the_arm_down(
+            self, monkeypatch, lexicon_embedder):
+        """The #4028 floor stand-down, pinned — and it is load-bearing.
+
+        On a floored read the vector leg's answer is "nothing relevant", and
+        the arm must not speak for that read: with ``raw_results`` otherwise
+        empty the read returns ``_with_read_status([])`` as its DECLARED
+        answer, and an arm that ran first would put ``raw_results["fts"]``
+        back, so ``if not raw_results:`` would stop firing and a read whose
+        answer is "nothing relevant" would start returning BM25 rows. On THIS
+        fixture the shipped lexical leg still answers, so the observable pin is
+        the other half of the same defect: the arm must not re-score the
+        lexical slot at all, i.e. the floored read is byte-identical to the
+        gate-OFF floored read and carries no ``mechanism="bm25"`` entry.
+
+        Control first (same graph, same query, no floor): the arm DOES run —
+        otherwise the stand-down assertion would pass for the wrong reason.
+        Mutation: drop ``and "vector" not in _floored_legs`` from the arm gate
+        → the floored read carries a ``mechanism="bm25"`` entry and its rows
+        move, and this reds.
+        """
+        sdk, _target = _e2e_sdk()
+        monkeypatch.setenv("TORTOISE_BM25_LEXICAL", "1")
+
+        control_trace: list[dict] = []
+        control = sdk.tortoise_fts_query(QUERY, limit=10,
+                                         leg_trace=control_trace)
+        assert control, "guard: the un-floored read answers on this fixture"
+        assert any(e.get("mechanism") == LEXICAL_MECHANISM_BM25
+                   and e.get("count") for e in control_trace), (
+            "guard (control): with no floor the arm runs and matches on this "
+            f"fixture; trace={control_trace}")
+
+        # Above every similarity this fixture produces (topic docs ~0.95, the
+        # rare-token record ~0.41), so the vector leg is emptied.
+        monkeypatch.setenv("TORTOISE_VECTOR_MIN_SIMILARITY", "0.999")
+        floored_trace: list[dict] = []
+        floored = [(h["id"], h["similarity"])
+                   for h in sdk.tortoise_fts_query(
+                       QUERY, limit=10, leg_trace=floored_trace)]
+        assert any(e.get("reason") == "below_relevance_floor"
+                   for e in floored_trace), (
+            "guard: the relevance floor must actually have emptied the "
+            f"vector leg; trace={floored_trace}")
+        assert not [e for e in floored_trace
+                    if e.get("mechanism") == LEXICAL_MECHANISM_BM25], (
+            "the arm must not run on a floored read — it would turn a "
+            f"\"nothing relevant\" answer into rows; trace={floored_trace}")
+
+        # The same floor with the gate OFF is the reference read: a stood-down
+        # arm changes nothing about it (not the ids, not the fused scores).
+        monkeypatch.delenv("TORTOISE_BM25_LEXICAL", raising=False)
+        off_floored = [(h["id"], h["similarity"])
+                       for h in sdk.tortoise_fts_query(QUERY, limit=10)]
+        assert floored and floored == off_floored, (
+            "a floored read must be exactly the gate-off floored read; "
+            f"off={off_floored}, on={floored}")
+
+    def test_a_server_lane_read_never_runs_the_arm(
+            self, monkeypatch, lexicon_embedder):
+        """The arm is EMBEDDED-only, and that bound is pinned.
+
+        On the server lane ``run_vector_query`` is index-backed precisely so a
+        read need not scan, and this leg has no measured baseline there
+        (#8486). Removing ``is_embedded`` from the gate leaves every other test
+        green while a production read starts pulling up to
+        ``DEFAULT_BM25_CORPUS_CAP`` rows of ``content`` into Python per call.
+
+        The projection here is embedded; only its ``_is_embedded`` report is
+        flipped, which is exactly the value the gate reads
+        (``getattr(proj, "_is_embedded", True)``). Control first: the same
+        graph with the report untouched DOES run the arm. Mutation: drop
+        ``is_embedded and`` from the gate → the flipped read carries a
+        ``mechanism="bm25"`` entry and this reds.
+        """
+        sdk, _target = _e2e_sdk()
+        monkeypatch.setenv("TORTOISE_BM25_LEXICAL", "1")
+
+        control_trace: list[dict] = []
+        sdk.tortoise_fts_query(QUERY, limit=10, leg_trace=control_trace)
+        assert any(e.get("mechanism") == LEXICAL_MECHANISM_BM25
+                   for e in control_trace), (
+            "guard (control): on the embedded lane the arm runs; "
+            f"trace={control_trace}")
+
+        proj = sdk._get_proj()
+        monkeypatch.setattr(proj, "_is_embedded", False, raising=False)
+        server_trace: list[dict] = []
+        server = sdk.tortoise_fts_query(QUERY, limit=10,
+                                        leg_trace=server_trace)
+        assert server, ("guard: the shipped legs still answer when the lane is "
+                        "reported as the server lane")
+        assert not [e for e in server_trace
+                    if e.get("mechanism") == LEXICAL_MECHANISM_BM25], (
+            "the in-process corpus scan is embedded-only; it must not run on "
+            f"the server lane; trace={server_trace}")
+
+    def test_a_windowed_corpus_read_never_replaces_the_shipped_rows(
+            self, monkeypatch, lexicon_embedder):
+        """A corpus WIDER than the cap declines — the whole-label rows survive.
+
+        The shipped leg answers over the WHOLE label (index-backed); the arm's
+        window is the first ``cap`` ids in id order — oldest-first on ULID ids,
+        so the newest documents are invisible to it. Replacing the shipped
+        rows with that window makes the read lexically weaker than the leg it
+        replaced, silently, and #8486 would baseline it as the arm's answer.
+        So the leg returns ``[]`` and records ``degraded`` (the same fail-safe
+        an empty arm gets).
+
+        The cap is driven through the REAL sdk wiring by wrapping
+        ``run_bm25_query`` (the sdk imports it at call time), so the assertion
+        is about the composition, not about a helper called by the test. The
+        target is created LAST, so it holds the highest id and is outside a
+        one-row window. Control first: the same wiring with a cap the corpus
+        fits in DOES change the read — otherwise "unchanged" below could be
+        explained by the arm not being wired at all.
+
+        Mutation: return ``ranked`` instead of ``[]`` when over the cap → the
+        arm's windowed rows enter the read and ``on == off`` reds.
+        """
+        import tortoise.search_engine as search_engine
+
+        sdk = TortoiseSDK(
+            os.path.join(tempfile.mkdtemp(prefix="bm25_8488_cap_"), "t.db"),
+            namespace=f"bm25_cap_{os.urandom(6).hex()}")
+        _SDKS.append(sdk)
+        for content in TOPIC_DOCS_END_TO_END:
+            sdk.create_point("statement", content)
+        target = sdk.create_point("statement", TARGET_DOC)["id"]
+
+        monkeypatch.delenv("TORTOISE_BM25_LEXICAL", raising=False)
+        off = [(h["id"], h["similarity"])
+               for h in sdk.tortoise_fts_query(QUERY, limit=10)]
+        assert off and off[0][0] != target, (
+            f"guard: the shipped read ranks the record down; got {off}")
+
+        real = search_engine.run_bm25_query
+
+        def _capped(cap, *args, **kwargs):
+            kwargs["corpus_cap"] = cap
+            return real(*args, **kwargs)
+
+        monkeypatch.setenv("TORTOISE_BM25_LEXICAL", "1")
+
+        control_trace: list[dict] = []
+        monkeypatch.setattr(search_engine, "run_bm25_query",
+                            lambda *a, **kw: _capped(1000, *a, **kw))
+        control = [(h["id"], h["similarity"])
+                   for h in sdk.tortoise_fts_query(
+                       QUERY, limit=10, leg_trace=control_trace)]
+        assert any(e.get("mechanism") == LEXICAL_MECHANISM_BM25
+                   and e.get("count") for e in control_trace), (
+            "guard (control): a corpus that fits the cap must produce BM25 "
+            f"rows; trace={control_trace}")
+        assert control != off, (
+            "guard (control): the arm must be WIRED — a roomy cap changes the "
+            f"read; off={off}, control={control}")
+
+        tight_trace: list[dict] = []
+        monkeypatch.setattr(search_engine, "run_bm25_query",
+                            lambda *a, **kw: _capped(1, *a, **kw))
+        tight = [(h["id"], h["similarity"])
+                 for h in sdk.tortoise_fts_query(
+                     QUERY, limit=10, leg_trace=tight_trace)]
+        declined = [e for e in tight_trace
+                    if e.get("mechanism") == LEXICAL_MECHANISM_BM25]
+        assert declined, (
+            "the arm must have RUN (and declined) for this read to say "
+            f"anything; trace={tight_trace}")
+        assert declined and all(e.get("degraded") for e in declined), (
+            f"a windowed corpus read records itself degraded; trace={tight_trace}")
+        assert not [e for e in declined if e.get("count")], (
+            f"a declined read contributes NO rows; trace={tight_trace}")
+        assert tight == off, (
+            "a corpus wider than the cap must leave the shipped whole-label "
+            f"rows exactly as they were; off={off}, tight={tight}")
+
     def test_numeric_token_policy_is_threaded_not_decided(
             self, monkeypatch, force_sparse_tfidf):
         """#8933 is the OWNER's reopen — the arm must not decide it.
@@ -703,12 +880,37 @@ class TestReadPath:
 
 
 class TestCorpusCap:
-    """The cap is LOUD: a truncated ranking is declared, never claimed clean.
+    """The cap is LOUD and DECLINED: a window never replaces a whole-label read.
 
-    Mutation: drop the ``truncated`` half of ``_record(..., degraded=truncated)``
-    (record ``degraded=False`` unconditionally) → the over-cap case reports a
-    clean run and this reds.
+    The leg asks for one row past the cap, so "exactly cap" (the whole corpus
+    fits) is distinguishable from "more than cap" (a window). On a WINDOW it
+    returns nothing and records ``degraded=True``, leaving the shipped
+    graph-side leg's rows in place — the shipped leg answered over the WHOLE
+    label, so swapping in a ranking over the oldest N ids would make the read
+    lexically weaker than the leg it replaced, silently.
+
+    Mutations: (a) drop the ``+ 1`` in the ``LIMIT`` → a corpus exactly at the
+    cap is misread as truncated and reds the first test; (b) return ``ranked``
+    on truncation instead of ``[]`` → the tiny-cap tests red.
     """
+
+    def test_a_corpus_that_exactly_fits_the_cap_is_not_truncated(
+            self, force_sparse_tfidf):
+        """``cap == corpus size`` is a COMPLETE ranking, not a window.
+
+        The one-extra-row probe is what buys this: without it the leg cannot
+        tell the two apart and a store whose size happens to equal the cap
+        would lose its lexical leg for nothing.
+        """
+        graph, ids = _graph_with_corpus()
+        corpus = len(TOPIC_DOCS) + 1  # the seven fixture points
+        trace: list[dict] = []
+        rows = run_bm25_query(graph, QUERY, entity_type="point", limit=20,
+                              corpus_cap=corpus, leg_trace=trace)
+        assert trace and trace[-1]["degraded"] is False, trace
+        assert trace[-1]["reason"] == "ok", trace
+        assert rows and rows[0][0] == ids["target"], (
+            f"a complete corpus must still rank; got {rows}")
 
     def test_under_the_cap_the_leg_is_not_degraded(self, force_sparse_tfidf):
         graph, _ids = _graph_with_corpus()
@@ -717,30 +919,29 @@ class TestCorpusCap:
                        corpus_cap=1000, leg_trace=trace)
         assert trace and trace[-1]["degraded"] is False, trace
 
-    def test_at_or_over_the_cap_the_leg_declares_itself_degraded(
+    def test_over_the_cap_the_leg_declines_instead_of_window_ranking(
             self, force_sparse_tfidf):
-        graph, ids = _graph_with_corpus()
-        # Seven fixture points: cap=7 is "at the cap" (the leg cannot tell
-        # "exactly cap" from "more than cap") and the WHOLE corpus fits, so
-        # the ranking is complete and the reason is the honest "ok" — the
-        # degraded flag is a truncation claim, not a "found nothing" one.
+        """Over the cap: NO rows, ``degraded=True`` — never a windowed ranking.
+
+        ``count=0`` and an empty return are the contract the sdk relies on to
+        keep the shipped leg's whole-label rows (``if _bm25_hits``). The
+        ``degraded`` flag is what separates this from a clean empty result, so
+        a measurement cannot read a declined window as "the arm ran and found
+        nothing".
+        """
+        graph, _ids = _graph_with_corpus()
         trace: list[dict] = []
         rows = run_bm25_query(graph, QUERY, entity_type="point", limit=20,
-                              corpus_cap=7, leg_trace=trace)
-        assert trace and trace[-1]["degraded"] is True, trace
-        assert trace[-1]["reason"] == "ok", trace
-        assert rows and rows[0][0] == ids["target"], (
-            f"a truncated-at-the-cap corpus must still rank; got {rows}")
-        # cap=1 is plainly over it, and the ONE row it keeps is a fixture
-        # artifact (id-ascending first row), NOT a property of the cap — so
-        # assert the flag (the subject of this test) and the reason VOCABULARY,
-        # never that the window happens to hold the query's term.
-        trace = []
-        rows = run_bm25_query(graph, QUERY, entity_type="point", limit=20,
                               corpus_cap=1, leg_trace=trace)
+        assert rows == [], (
+            "a corpus wider than the cap must not be ranked over a window; "
+            f"got {rows}")
         assert trace and trace[-1]["degraded"] is True, trace
-        assert trace[-1]["reason"] in ("ok", "empty_results"), trace
-        assert isinstance(rows, list)
+        assert trace[-1]["count"] == 0, trace
+        assert trace[-1]["reason"] == "empty_results", trace
+        assert trace[-1]["mechanism"] == LEXICAL_MECHANISM_BM25, (
+            f"the leg DID run (it read the corpus), so mechanism is set; "
+            f"trace={trace}")
 
 
 class TestServableFamilies:
@@ -758,7 +959,8 @@ class TestServableFamilies:
     """
 
     def test_refused_families_are_not_scanned(self, force_sparse_tfidf):
-        """A refused family must not reach the graph AT ALL.
+        """A refused family must not reach the graph AT ALL — and must not
+        claim the ``mechanism`` key.
 
         Pre-fix, ``event``/``subject`` were in ``BM25_ENTITY_TYPES``: the leg
         issued ``MATCH (n:Event) …`` (a full-label scan) and reported
@@ -766,6 +968,11 @@ class TestServableFamilies:
         found nothing when it could never match. Mutation (pre-fix state): add
         ``event`` (or ``subject``) back to ``BM25_ENTITY_TYPES`` → the query
         counter below is non-empty and this reds.
+
+        The ``ran is False`` half is the #8486 measurement contract: a
+        consumer counting ``mechanism == "bm25"`` must not count a refusal as
+        a run (``_record``'s own docstring). Mutation: record the refusal with
+        ``ran=True`` → the ``mechanism`` key appears and this reds.
         """
         graph, _ids = _graph_with_corpus()
 
@@ -789,7 +996,13 @@ class TestServableFamilies:
                 "must be refused BEFORE the corpus scan — the leg cannot "
                 f"score it; scanned: {spy.queries}")
             assert trace and trace[-1]["reason"] == "empty_results", trace
-            assert trace[-1]["ran"] is True, trace
+            assert trace[-1]["ran"] is False, (
+                f"nothing was read for {family!r}, so the leg did not run; "
+                f"trace={trace}")
+            assert "mechanism" not in trace[-1], (
+                f"a REFUSED family must not claim the BM25 mechanism — a "
+                f"consumer counting mechanism=='bm25' would count a read that "
+                f"never happened; trace={trace}")
 
     def test_the_served_families_are_the_ones_with_a_declared_fts_field(self):
         """The tuple and the text projection must agree — no third option.
@@ -814,6 +1027,65 @@ def _e2e_sdk() -> tuple[TortoiseSDK, str]:
     for content in TOPIC_DOCS_END_TO_END:
         sdk.create_point("statement", content)
     return sdk, target
+
+
+class TestMutationPointers:
+    """A documented mutation must name a test that EXISTS.
+
+    ``tortoise/bm25.py``'s ``LEXICAL_WEIGHT_MAX`` block is the only durable
+    link between the bound and the tests that prove it, and it used to name
+    ``test_lexical_weight_is_bounded_below_the_dense_leg`` — a test that has
+    never existed (the real ones are ``TestLexicalWeightBound.``
+    ``test_weight_is_clamped_below_the_dense_leg`` and ``TestReadPath.``
+    ``test_lexical_weight_is_bounded_at_the_read_path``). A fixer retracing the
+    mutation to check it still bites then finds nothing, and a pointer that
+    points nowhere is worse than none: it reads as coverage.
+
+    Mutation (pre-fix): the docstring's stale name → the referenced attribute
+    does not resolve and this reds.
+    """
+
+    def test_the_bound_points_at_real_tests(self):
+        import re
+        from pathlib import Path
+
+        import tortoise.bm25 as bm25_module
+
+        source = Path(bm25_module.__file__).read_text()
+
+        # Two shapes are accepted, because both have been used here: a
+        # qualified ``TestClass.test_method`` and a BARE ``test_method`` (the
+        # stale pointer this test was written for was bare). A bare name
+        # resolves if ANY Test class in this module defines it. ``.py`` is
+        # excluded so the file name (``tests/test_bm25_lexical_8488.py``) is
+        # not read as a test pointer.
+        qualified = set(re.findall(
+            r"\b(Test[A-Za-z0-9_]+)\.(test_[A-Za-z0-9_]+)", source))
+        bare = set(re.findall(
+            r"(?<![A-Za-z0-9_.])(test_[A-Za-z0-9_]+)(?![\w.])", source))
+        bare -= {name for _cls, name in qualified}
+
+        # Non-vacuity: the pointer text must still BE there, or "every
+        # pointer resolves" is trivially true of an empty set.
+        assert qualified or bare, (
+            "the LEXICAL_WEIGHT_MAX block must name the tests its mutation "
+            "reds (a claim with no pointer is unverifiable)")
+
+        this_module = sys.modules[__name__]
+        test_classes = [obj for obj in vars(this_module).values()
+                        if isinstance(obj, type)]
+        missing = []
+        for class_name, test_name in sorted(qualified):
+            cls = getattr(this_module, class_name, None)
+            if cls is None or not hasattr(cls, test_name):
+                missing.append(f"{class_name}.{test_name}")
+        for test_name in sorted(bare):
+            if not any(hasattr(cls, test_name) for cls in test_classes):
+                missing.append(test_name)
+        assert not missing, (
+            "tortoise/bm25.py points a mutation at test(s) that do not "
+            f"exist in this file: {missing} — a fixer retracing the mutation "
+            "finds nothing and reads it as coverage")
 
 
 class TestOperatorContract:

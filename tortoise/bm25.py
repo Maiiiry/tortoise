@@ -118,11 +118,16 @@ DEFAULT_LEXICAL_WEIGHT = 1.0
 
 #: ⛔ THE BOUND (#7704 / #1657). The lexical leg may never carry more fusion
 #: weight than the strongest leg it is fused with. Dropping this clamp is the
-#: mutation that reds ``test_lexical_weight_is_bounded_below_the_dense_leg``:
-#: with an unbounded weight the lexical leg alone decides the order and the
-#: dense leg's best hit — the read's actual answer — falls below a lexical
-#: also-ran. A DISABLED dense leg (weight <= 0) is not the strongest leg, so
-#: it does not lower this bound — see :func:`resolve_lexical_weight`.
+#: mutation that reds TWO tests —
+#: ``TestLexicalWeightBound.test_weight_is_clamped_below_the_dense_leg`` (the
+#: unit) and ``TestReadPath.test_lexical_weight_is_bounded_at_the_read_path``
+#: (the read path) — both in ``tests/test_bm25_lexical_8488.py``, which also
+#: pins that the pointer names tests that exist
+#: (``TestMutationPointers.test_the_bound_points_at_real_tests``): with an
+#: unbounded weight the lexical leg alone decides the order and the dense
+#: leg's best hit — the read's actual answer — falls below a lexical also-ran.
+#: A DISABLED dense leg (weight <= 0) is not the strongest leg, so it does not
+#: lower this bound — see :func:`resolve_lexical_weight`.
 LEXICAL_WEIGHT_MAX = 1.0
 
 

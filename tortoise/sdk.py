@@ -24530,7 +24530,11 @@ class TortoiseSDK:
             # DEFAULT_BM25_CORPUS_CAP (see run_bm25_query), and it returns []
             # on ANY failure — in which case ``raw_results["fts"]`` keeps the
             # shipped leg's rows untouched, so enabling the arm can never leave
-            # the read with a lexically weaker pool than it had before.
+            # the read with a lexically weaker pool than it had before. The
+            # same holds when the corpus is WIDER than the cap: the leg
+            # declines its windowed ranking and returns [], because the shipped
+            # leg answered over the whole label and a first-N-ids window can
+            # only lose matches (the leg records ``degraded=True`` + a warning).
             # ``meter=False``: the shipped leg already counted the lexical
             # slot in the tally; this is the same slot scored differently, not
             # a second leg.

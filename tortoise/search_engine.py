@@ -1314,20 +1314,26 @@ def run_fts_query(
 #: answered by an indexed top-k: it has to see the candidate population.
 #:
 #: The cap is a memory/latency bound, not a ranking parameter, and it is
-#: LOUD: a corpus at or over the cap is scored over the first ``cap`` rows in
-#: id order — oldest-first on this tree's ULID ids — and the leg records
-#: ``degraded=True`` so the read never claims a whole-corpus ranking it did not
-#: compute. Raise it (or add an id-descending window) before enabling the arm
-#: on a store that large.
+#: LOUD **and DECLINED**: the leg asks for one row more than the cap, so it can
+#: tell "exactly cap" (a complete ranking) from "more than cap" (a window) —
+#: and on a WINDOW it returns NO rows at all, recording ``degraded=True``. The
+#: shipped graph-side leg answers over the whole label (it is index-backed), so
+#: replacing its rows with a ranking over the first ``cap`` ids in id order —
+#: oldest-first on this tree's ULID ids, i.e. blind to the newest documents,
+#: which are the likeliest lexical answer — would make the read lexically
+#: WEAKER than the leg it replaced, silently, on a store the operator never
+#: measured. Declining keeps the shipped rows (the same fail-safe the empty
+#: arm gets) and leaves the signal in the trace. Raise the cap (or add an
+#: id-descending window) before enabling the arm on a store that large.
 #:
 #: ⚠️ What ``degraded=True`` then COSTS the read, stated because it is wider
 #: than "this leg ran": ``read_status.classify_leg_trace`` reports the read as
 #: ``degraded`` when any leg entry is degraded, and ``ask_lane`` sets
 #: ``retrieval_degraded`` the same way. On a store at the cap that is the
-#: intended signal (the ranking IS partial), but it also means #2952's
-#: narrower reading ("the leg contributed no results") does not apply —
-#: rows were contributed. That is the deliberate trade: a truncated ranking
-#: must not read as a clean one.
+#: intended signal (the corpus the arm could see was a window), but it also
+#: means #2952's narrower reading ("the leg contributed no results") does not
+#: apply. That is the deliberate trade: a truncated corpus must not read as a
+#: clean measurement.
 #:
 #: ⛔ Cost, stated and NOT measured. Unlike ``run_vector_query``'s embedded
 #: brute force — which scores inside the engine and returns ``limit`` rows —
@@ -1444,13 +1450,25 @@ def run_bm25_query(
     (``ok`` / ``empty_results`` / ``query_failed`` / ``breaker_open``); a query
     whose tokens all get dropped by the caller's numeric policy is
     ``empty_results`` (the leg ran, nothing matched), never a new term the
-    declaration layer does not know. The same term covers a REFUSED family
-    (``BM25_ENTITY_TYPES``): the refusal records ``ran=True`` (so
-    ``mechanism`` is written and a consumer can tell it from a breaker skip),
-    and what it must NOT be read as is "the leg searched this family and found
-    nothing" — the leg cannot search it at all. ``degraded`` is recorded only
-    where the leg's OWN result is incomplete (corpus at the cap, a failed
-    read, an open breaker), never on a clean empty result.
+    declaration layer does not know.
+
+    WHO RAN, and what the ``mechanism`` key therefore means. Three exit
+    branches return ``[]`` and they do NOT claim the same thing:
+
+    * REFUSED family (``BM25_ENTITY_TYPES``) — ``ran=False``, so NO
+      ``mechanism`` key is written: nothing was read, and the leg cannot
+      search that family at all. A consumer counting ``mechanism == "bm25"``
+      must not count it (that is ``_record``'s own contract).
+    * corpus WIDER than ``corpus_cap`` — ``ran=True``, ``degraded=True``,
+      ``count=0``: the leg DID read, and it declined to return a windowed
+      ranking (see ``DEFAULT_BM25_CORPUS_CAP``), so the shipped whole-label
+      rows survive. ``degraded`` is what separates this from a clean empty.
+    * a query that matched nothing — ``ran=True``, ``degraded=False``,
+      ``empty_results``, ``count=0``.
+
+    ``degraded`` is recorded only where the leg's OWN result is incomplete or
+    declined (a failed read, an open breaker, a corpus over the cap), never on
+    a clean empty result.
 
     ``keep_numeric`` is threaded, never decided: the search lane's
     byte-identical control is a RECORDED decision and its reopen belongs to the
@@ -1499,7 +1517,12 @@ def run_bm25_query(
         # nothing — refused here rather than reported as a clean "ran, found
         # nothing" (there is no second, per-family implementation of "how
         # operators/events are served"; this early return IS the refusal).
-        _record(ran=True, degraded=False, reason="empty_results", count=0)
+        #
+        # ``ran=False``: nothing was read, so NO ``mechanism`` key may be
+        # written. #8486's baseline counts ``mechanism == "bm25"``, and a
+        # refusal tallied as a run would inflate it with reads that never
+        # happened (the shape ``_record`` itself calls out).
+        _record(ran=False, degraded=False, reason="empty_results", count=0)
         return []
 
     from .bm25 import bm25_rank
@@ -1528,10 +1551,11 @@ def run_bm25_query(
 
     try:
         start = time.monotonic()
-        # Order by the id key so a corpus OVER ``corpus_cap`` is truncated
-        # deterministically (the cap caveat in DEFAULT_BM25_CORPUS_CAP);
-        # ``coalesce`` lets a node family whose text lives on ``_searchText``
-        # (the multi-field FTS index's field) be scored rather than skipped.
+        # Order by the id key so the corpus read is DETERMINISTIC (the cap
+        # contract in DEFAULT_BM25_CORPUS_CAP); ``coalesce`` lets a node family
+        # whose text lives on ``_searchText`` (the multi-field FTS index's
+        # field) be scored rather than skipped. One row over the cap is
+        # requested on purpose — see ``truncated`` below.
         cypher = (
             f"MATCH (n:{label}) WHERE {' AND '.join(where)} "
             f"RETURN n.{id_field}, coalesce(n.content, n._searchText, ''), "
@@ -1539,30 +1563,39 @@ def run_bm25_query(
             f"ORDER BY n.{id_field} ASC LIMIT $cap"
         )
         rows = graph.query(
-            cypher, params={"cap": int(corpus_cap)}, timeout=timeout_ms
+            cypher, params={"cap": int(corpus_cap) + 1}, timeout=timeout_ms
         ).result_set
         elapsed = (time.monotonic() - start) * 1000
         if elapsed > timeout_ms:
             logger.warning("BM25 corpus read exceeded timeout: %.0fms > %dms",
                            elapsed, timeout_ms)
+        # ONE row past the cap, so the leg can tell "exactly cap" (the whole
+        # corpus fits — a complete ranking) from "more than cap" (a window).
+        # Without the extra row the two are indistinguishable and a store whose
+        # size happens to equal the cap loses its lexical leg for no reason.
+        truncated = len(rows) > int(corpus_cap)
+        if truncated:
+            # DECLINE, do not return a window. The shipped graph-side leg
+            # answered over the whole label; a ranking over the first ``cap``
+            # ids (oldest-first on ULID ids) is not the same answer and is
+            # often a weaker one — so the caller keeps the shipped rows, the
+            # same fail-safe an empty arm gets. ``degraded`` records WHY the
+            # slot was left alone; ``count=0`` because nothing was returned.
+            logger.warning(
+                "BM25 corpus exceeds the %d-row cap — declining to replace "
+                "the shipped lexical rows with a ranking over the first %d "
+                "ids; raise %s or measure on a smaller corpus (#8486)",
+                corpus_cap, corpus_cap, "DEFAULT_BM25_CORPUS_CAP")
+            _breaker_record("bm25", True)
+            _record(ran=True, degraded=True, reason="empty_results", count=0)
+            return []
         docs = [
             (row[0], index_text(row[1], row[2])) for row in rows if row[0]
         ]
         ranked = bm25_rank(
             query, docs, limit=limit, keep_numeric=keep_numeric)
-        # The cap is LOUD: a corpus at the cap may have been truncated (the
-        # query has no count to tell "exactly cap" from "more than cap"), and
-        # the ranking is then over a WINDOW, not the corpus. Recording
-        # ``degraded`` is what stops a read from claiming a whole-corpus
-        # lexical score it did not compute — and what stops a measurement
-        # (#8486) from silently baselining a truncated ranking.
-        truncated = len(rows) >= int(corpus_cap)
-        if truncated:
-            logger.warning(
-                "BM25 corpus reached the %d-row cap — the lexical ranking is "
-                "over the FIRST %d ids, not the whole label", corpus_cap, corpus_cap)
         _breaker_record("bm25", True)
-        _record(ran=True, degraded=truncated,
+        _record(ran=True, degraded=False,
                 reason=("ok" if ranked else "empty_results"),
                 count=len(ranked))
         return ranked
