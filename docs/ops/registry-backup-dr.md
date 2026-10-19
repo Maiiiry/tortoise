@@ -596,8 +596,8 @@ corresponds to exactly one recovery condition and one evidence tier.**
 
 | Tier | Kind | Filed by | Recovery evidence (the ONLY thing that clears it) | Owner |
 |---|---|---|---|---|
-| unreachable | `R2_DOWN` (frozen key **retained**, meaning narrowed) | the driver's `head-bucket` preflight **and** the watcher's R2 read | the substrate **ANSWERS** — a probe reaches it | **watcher** (was driver) |
-| unlistable | `R2_UNLISTABLE` (**new**) | the driver's listing leg (`R2_LIST_OK=0`) and the app's `storage_error` (read from `/status` by the driver) | the driver's **whole-pool measurement**: `head-bucket` OK + `storage_error` clear + `R2_LIST_OK=1` | **driver** |
+| unreachable | `R2_DOWN` (frozen key **retained**, meaning narrowed) | the driver's `head-bucket` preflight **and** the watcher's R2 read | the substrate **ANSWERS** — a probe reaches it (an *answered refusal* counts: it reached R2) | **watcher** (was driver) |
+| unlistable | `R2_UNLISTABLE` (**new**) | the driver's listing leg (`R2_LIST_OK=0`), the app's `storage_error` (read from `/status` by the driver) **and the watcher's classified listing-tier failure** | the driver's **whole-pool measurement**: `head-bucket` OK + `storage_error` clear + `R2_LIST_OK=1` | **driver** |
 
 **Why R2_DOWN keeps its key instead of being renamed `R2_UNREACHABLE`.**
 `tortoise/incident_kinds.py` freezes kind strings: the kind IS the R2 dedup key
@@ -613,9 +613,14 @@ had nothing to do.
 `R2_DOWN`: `kind_owner()`/`KIND_OWNERS` make it watcher-owned, so the driver's
 `resolve_global` refuses it and leaves the sentinel intact (pinned by
 `registry-cron.test.sh` case 66 and by `tests/test_alert_store.py`). The watcher
-may not clear `R2_UNLISTABLE`: its probe measures reachability, not the pool
-(pinned by `tests/test_alert_store.py`). No provenance exception was added — the
-`writer` field on a sentinel is diagnostic only.
+may not clear `R2_UNLISTABLE` — **filing it and clearing it are different
+rights**: since #8472 the watcher FILES the listing tier when its own read
+proves the substrate answered, but recovery still needs the driver's whole-pool
+measurement, so its `resolve` is refused (pinned by
+`tests/test_alert_store.py::test_watcher_cannot_clear_r2_unlistable` and
+`tests/test_backup_watcher.py::test_watcher_never_clears_r2_unlistable`). No
+provenance exception was added — the `writer` field on a sentinel is diagnostic
+only.
 
 **Suppression is per-kind, so the two tiers suppress independently.**
 `ops/suppression.json` is keyed `{"KIND": {"until": "ISO"}}`, and the issue
@@ -623,18 +628,44 @@ titles differ (`[DR] R2_DOWN …` vs `[DR] R2_UNLISTABLE …`), so pausing one t
 does not pause the other and the GH-search adoption path cannot cross-adopt them
 (`github_issue.incident_title_matches` is `[DR] {kind}`-prefix anchored).
 
-**NAMED RESIDUAL — a watcher-side permission failure is filed at the
-reachability tier.** The watcher's probe is `storage.list("backups/")` →
-`list-objects-v2`. On FAILURE it cannot tell "R2 does not answer" from "R2
-answers but this key cannot list" (the body's premise that only the driver tests
-the listing tier is imprecise for the watcher), so it files the incident at the
-reachability tier (`R2_DOWN`) — the tier its evidence *claims*. When the real
-cause is a watcher-side `ListObjects` failure, the incident is therefore filed
-under `R2_DOWN` while the driver's `R2_UNLISTABLE` (if its listing leg also
-fails) is the accurate one; both can be open, and the `R2_DOWN` one clears as
-soon as the watcher's read succeeds again. This is a labelling residual, not a
-lost signal — filed as **#8472**. Anti-flap/hysteresis for the tier BOTH surfaces
-can file is **#3146**.
+**The watcher's failing read is classified, not assumed (#8472 — the residual is
+CLOSED).** The watcher's probe is `storage.list("backups/")` →
+`list-objects-v2`, and it fails for BOTH reasons above, so a bare failure cannot
+say which tier it belongs to. Until #8472 it filed the tier its evidence
+*claimed* — reachability — which mislabels a permission fault as a network
+outage. The read failure is now classified before it is filed
+(`backup_watcher._classify_r2_read_failure`), from two independent sources:
+
+1. **The exception itself.** A service error RESPONSE — an R2 reply, i.e. the
+   `head-bucket`-passes / `list-objects-v2`-fails shape — proves the substrate
+   ANSWERED, so the tier is the LISTING one. Matched structurally (botocore's
+   `ClientError` shape: a `response` mapping carrying `ResponseMetadata`), not
+   by matching error text.
+2. **`R2Storage.probe_reachable()`** — an OPTIONAL store capability (a
+   `head_bucket` call, deliberately not a listing). It answers for a failing
+   read that is not a permission refusal (a bare transport failure), and its
+   test is ANSWER vs NO ANSWER, not success vs failure: a 403/404/5xx is an
+   answer, only connect/DNS/timeout is not. That keeps it permission-blind —
+   however restricted the key, being refused proves R2 is up.
+3. **Neither → UNDETERMINED.** The incident is still filed (no signal is lost)
+   under `R2_DOWN`, and its body says in as many words that the tiers could not
+   be told apart and that it does NOT assert unreachability. A probe that
+   raises decides nothing either; nothing is ever inferred.
+
+Consequences: a **listing-tier** poll files `R2_UNLISTABLE` (the watcher's own
+filing; the driver still owns the clear) **and clears `R2_DOWN`**, because an
+answered refusal satisfies that kind's own recovery condition — so the two
+tiers no longer sit open together on one fault. A **reachability/undetermined**
+poll files `R2_DOWN` as before. The classified tier is on the heartbeat
+(`r2_tier`) as well as in the incident body, so the reading is observable
+without opening the issue.
+
+**Residual after #8472 (bounded).** Two writers can now file `R2_UNLISTABLE`
+for one fault — the watcher (its read) and the driver (its listing leg) — so if
+their access keys diverge, the driver can clear an incident the watcher will
+re-file on its next poll. The health signal is still true (that surface really
+cannot list); the churn is the anti-flap/hysteresis class tracked by **#3146**,
+not a labelling error.
 
 **Not done here (deliberately).** ADR-011 is a dated, human-gated decision record
 and is not edited by this change; this runbook section is the operational home.
@@ -729,8 +760,8 @@ warning ahead of it.
 | METADATA_LOST | archives exist but the graph's per-graph state object missing | Re-run sweep (state re-created) |
 | BACKUP_SET_MISSING | state exists but no archives (bulk delete/erroneous prune) | Investigate R2; restore from a retained archive if possible |
 | DRIVER_DOWN | driver heartbeat stale (> 4h) — workflow disabled/dead | Re-enable the workflow; GH 60-day auto-disable |
-| R2_DOWN | #3147: R2 is **UNREACHABLE** — no probe reaches the substrate. The driver files it when its own `head-bucket` preflight fails. Filed by BOTH surfaces: the driver's preflight AND the watcher's R2 read (on a FAILING read the watcher cannot tell the two tiers apart, so it files at this one — see the named residual in §"The two R2 tiers (#3147)") | Check R2 reachability (network/endpoint/billing) and the R2 credentials. **Auto-resolves** on the WATCHER's own evidence: its next R2 probe reaches the substrate. The driver deliberately CANNOT clear it (`resolve_global` refuses a watcher-owned kind) — its passing preflight is not the watcher's evidence |
-| R2_UNLISTABLE | #3147: R2 **answers** (a probe reaches it) but the pool cannot be **listed** — the driver's `R2_LIST_OK=0` class (typically the access key lacks `ListObjects`), or a non-null `/status.storage_error`. The unlistable half of the old single `R2_DOWN` key | Check the R2 access key's `ListObjects` permission (`head-bucket` succeeds while `list-objects-v2` fails), the bucket policy, and — for a `storage_error` filing — the app-side storage. **Auto-resolves** on the DRIVER's whole-pool measurement: preflight OK + `storage_error` clear + `R2_LIST_OK=1`. The watcher deliberately cannot clear it (its probe measures reachability, not the pool) |
+| R2_DOWN | #3147: R2 is **UNREACHABLE** — no probe reaches the substrate. The driver files it when its own `head-bucket` preflight fails. Filed by BOTH surfaces: the driver's preflight AND the watcher's R2 read — but since #8472 the watcher CLASSIFIES its failing read first and files this kind only when nothing answered (or when the tiers could not be told apart, which its body states explicitly); a read that was REFUSED files `R2_UNLISTABLE` instead. See §"The two R2 tiers (#3147)" | Check R2 reachability (network/endpoint/billing) and the R2 credentials. **Auto-resolves** on the WATCHER's own evidence: a probe reaches the substrate — an *answered refusal* counts, because being refused proves R2 replied. The driver deliberately CANNOT clear it (`resolve_global` refuses a watcher-owned kind) — its passing preflight is not the watcher's evidence |
+| R2_UNLISTABLE | #3147: R2 **answers** (a probe reaches it) but the pool cannot be **listed** — the driver's `R2_LIST_OK=0` class (typically the access key lacks `ListObjects`), a non-null `/status.storage_error`, **or a watcher R2 read that was REFUSED rather than unanswered (#8472)**. The unlistable half of the old single `R2_DOWN` key | Check the R2 access key's `ListObjects` permission (`head-bucket` succeeds while `list-objects-v2` fails), the bucket policy, and — for a `storage_error` filing — the app-side storage. The incident body names the failing probe, the error and which key/secret to check. **Auto-resolves** on the DRIVER's whole-pool measurement: preflight OK + `storage_error` clear + `R2_LIST_OK=1`. The watcher deliberately cannot clear it — it may FILE this tier on its own evidence (#8472) but recovery needs the whole-pool measurement |
 | ALERTER_DOWN | daemon's GitHub PAT dead (`gh_ok: false`) | **NOT EMITTED — no writer exists.** `gh_ok` is not on `/status`, so the driver has nothing to read; the condition currently surfaces only as a red workflow run. See "Kinds with no writer" below (deferred: #3033; the writer is tracked as **#3412**) |
 | APP_DOWN | app unreachable from the driver | Fly health; cold-start OOM (#545) |
 | WATCHER_DOWN | watcher heartbeat stale (daemon dead) | Check app logs; restart |
@@ -1141,7 +1172,7 @@ curl -m 900 -sS -X POST -H "Authorization: Bearer $FASTAPI_INTERNAL_KEY" \
 - **NEVER detection while the app is down** — daemon-only; a never-backed-up team during an outage is silent until recovery.
 - **GH single-provider scheduling axis** — the driver terminates in GitHub; a GH incident delays backup triggers (the daemon still alerts).
 - **R2 outage** — neither fabricates (UNKNOWN on fresh boot) nor silences (GH-search fallback + the driver's `R2_DOWN`/`R2_UNLISTABLE` filings) once a known-good baseline exists.
-- **Watcher-side `ListObjects` failure is labelled at the reachability tier (#3147 → #8472)** — the watcher's R2 read cannot tell "R2 does not answer" from "R2 answers but this key cannot list", so it files `R2_DOWN` while `R2_UNLISTABLE` is the accurate kind. The fault is still filed and paged; only the kind label is imprecise. See §"The two R2 tiers (#3147)".
+- ~~Watcher-side `ListObjects` failure is labelled at the reachability tier (#3147 → #8472)~~ — **CLOSED by #8472**: the watcher's failing R2 read is classified before it is filed (service error response / `R2Storage.probe_reachable()`), so a refused listing files `R2_UNLISTABLE` and only an unanswered or genuinely undecidable read files `R2_DOWN` (with its body saying so). See §"The two R2 tiers (#3147)".
 
 ### Post-#2313 residuals (recorded 2026-09-06 audit — #2378)
 

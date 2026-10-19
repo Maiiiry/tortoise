@@ -12,7 +12,10 @@ import pytest
 from tortoise.alert_store import AlertStore, CloseCooldown
 from tortoise.backup_watcher import (
     HEARTBEAT_KEY,
+    R2_TIER_LISTING,
+    R2_TIER_UNDETERMINED,
     BackupWatcher,
+    _classify_r2_read_failure,
     compute_status,
 )
 from tortoise.hosted_backup import MemoryStorage
@@ -44,6 +47,7 @@ def _ts(hours_ago: float) -> datetime:
 class _Channels:
     def __init__(self):
         self.issues: dict[int, str] = {}
+        self.bodies: dict[int, str] = {}
         self.telegram: list[str] = []
         self._next = 1
 
@@ -51,6 +55,7 @@ class _Channels:
         n = self._next
         self._next += 1
         self.issues[n] = title
+        self.bodies[n] = body
         return n
 
     def close_issue(self, number, comment=None):
@@ -304,6 +309,206 @@ def test_watcher_degraded_mode_keeps_cached_surface():
     # R2_DOWN is the one incident that SHOULD fire while degraded (neither
     # fabricate NOR silence); no STALE for the healthy team.
     assert list(ch.issues.values()) == ["[DR] R2_DOWN"]
+
+
+# ── #8472: the watcher files the tier its EVIDENCE names ────────────────────
+
+
+class _ServiceError(Exception):
+    """botocore ``ClientError``'s SHAPE — a ``response`` mapping + metadata.
+
+    Deliberately NOT a botocore import: ``backup_watcher`` classifies the tier
+    structurally (a service error RESPONSE is an answer), so a fake with the
+    same shape exercises the real rule rather than a mock of it.
+    """
+
+    def __init__(self, code: str = "AccessDenied", status: int = 403) -> None:
+        super().__init__(
+            f"An error occurred ({code}) when calling the ListObjectsV2 "
+            "operation: Access Denied")
+        self.response = {
+            "Error": {"Code": code, "Message": "Access Denied"},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        }
+
+
+class _RefusedListingStorage(MemoryStorage):
+    """R2 ANSWERS and refuses the listing — the ``head-bucket`` passes /
+    ``list-objects-v2`` fails shape, i.e. the #3147 LISTING tier."""
+
+    def list(self, prefix):
+        raise RuntimeError(f"R2 list failed for {prefix}") from _ServiceError()
+
+
+class _TransportDownStorage(MemoryStorage):
+    """A bare transport failure: nothing answers, and the probe says so."""
+
+    def list(self, prefix):
+        raise RuntimeError(f"R2 list failed for {prefix}") from ConnectionError(
+            "connection refused")
+
+    def probe_reachable(self) -> bool:
+        return False
+
+
+def _degraded_poll(watcher: BackupWatcher, ch: _Channels) -> None:
+    """Baseline poll on a HEALTHY store, so a later failure is
+    degraded-from-known-good (a first-contact failure is honest silence)."""
+    storage = watcher._storage
+    _seed_archive(storage, "team_a", 1)
+    _seed_state(storage, "team_a")
+    watcher.poll()
+    assert ch.issues == {}
+
+
+def test_watcher_files_the_listing_tier_when_r2_refuses_the_listing():
+    """#8472 indicator 1: a permission refusal is the LISTING tier.
+
+    The failing read is a ``list``, which cannot by itself tell "R2 does not
+    answer" from "R2 answers and this key cannot list" — the mislabel the
+    watcher shipped while the #3147 split landed. The service's own error
+    response is the discriminator: a refusal means R2 ANSWERED, so the accurate
+    kind is ``R2_UNLISTABLE`` (driver-owned; filing it is the watcher's right,
+    clearing it is not) and ``R2_DOWN`` is false — nothing was unreachable.
+    """
+    ch = _Channels()
+    w = _watcher(MemoryStorage(), ch)
+    _degraded_poll(w, ch)
+
+    w._storage = _RefusedListingStorage()
+    w.poll()
+
+    assert list(ch.issues.values()) == ["[DR] R2_UNLISTABLE"]
+    body = ch.bodies[next(iter(ch.issues))]
+    assert "LISTING tier" in body
+    assert "ListObjects" in body  # the recovery procedure the operator needs
+    assert "REACHABILITY tier" not in body  # never a fabricated unreachability
+
+
+def test_watcher_files_the_reachability_tier_when_nothing_answers():
+    """#8472 indicator 2, the determinate half: the probe did not answer."""
+    ch = _Channels()
+    w = _watcher(MemoryStorage(), ch)
+    _degraded_poll(w, ch)
+
+    w._storage = _TransportDownStorage()
+    w.poll()
+
+    assert list(ch.issues.values()) == ["[DR] R2_DOWN"]
+    body = ch.bodies[next(iter(ch.issues))]
+    assert "REACHABILITY tier" in body
+    assert "LISTING tier" not in body
+
+
+def test_watcher_says_so_in_the_body_when_the_tiers_cannot_be_told_apart():
+    """#8472 indicator 2, the honest half.
+
+    A store with no reachability probe and a failure that carries no service
+    response leaves the tier UNDETERMINED. The incident is still filed (the
+    fault is never lost) but its body must state that it does not assert
+    unreachability, so the operator is not sent to a network hunt for what is a
+    permission fault.
+    """
+    ch = _Channels()
+    w = _watcher(MemoryStorage(), ch)
+    _degraded_poll(w, ch)
+
+    class _Boom(MemoryStorage):
+        def list(self, prefix):
+            raise RuntimeError("r2 read failed")  # no service response, no probe
+
+    w._storage = _Boom()
+    w.poll()
+
+    assert list(ch.issues.values()) == ["[DR] R2_DOWN"]
+    body = ch.bodies[next(iter(ch.issues))]
+    assert "did NOT distinguish" in body
+    assert "does NOT assert unreachability" in body
+    assert "REACHABILITY tier" not in body
+
+
+def test_listing_tier_clears_r2_down_and_files_unlistable():
+    """The two tiers are INDEPENDENT: a poll that reaches R2 is not unreachable.
+
+    ``R2_DOWN``'s recovery condition is "a probe reaches the substrate", and an
+    answered refusal is exactly that — so the reachability incident is cleared
+    in the same poll that files the listing one, rather than lingering on
+    evidence that is now known to be false.
+    """
+    ch = _Channels()
+    w = _watcher(MemoryStorage(), ch)
+    _degraded_poll(w, ch)
+
+    w._storage = _TransportDownStorage()
+    w.poll()
+    assert list(ch.issues.values()) == ["[DR] R2_DOWN"]
+
+    w._storage = _RefusedListingStorage()
+    w.poll()
+    assert list(ch.issues.values()) == ["[DR] R2_UNLISTABLE"]
+
+
+def test_watcher_never_clears_r2_unlistable():
+    """#8472 indicator 3: the #3147 ownership guard still holds.
+
+    The watcher may FILE the listing tier on its own evidence, but recovery
+    needs the driver's whole-pool measurement — so a healthy watcher poll (and
+    even a listing-tier poll of its own) must leave a driver-filed
+    ``R2_UNLISTABLE`` open. Its own filing must also DEDUP onto that incident
+    rather than doubling it.
+    """
+    ch = _Channels()
+    storage = MemoryStorage()
+    _seed_archive(storage, "team_a", 1)
+    _seed_state(storage, "team_a")
+    alert_storage = MemoryStorage()
+    alert_storage.upload(
+        "ops/alerts/R2_UNLISTABLE/_.json",
+        json.dumps({"kind": "R2_UNLISTABLE", "issue_number": 7,
+                    "filed_at": "2026-09-10T00:00:00Z", "writer": "driver"}).encode(),
+    )
+    ch.issues[7] = "[DR] R2_UNLISTABLE"  # the driver's issue, still OPEN
+    store = AlertStore(
+        alert_storage, file_issue=ch.file_issue, close_issue=ch.close_issue,
+        search_open=ch.search_open, push_telegram=ch.push_telegram,
+        repo="daniel-ospina/tortoise", assignee="u", now=lambda: FIXED,
+    )
+    w = BackupWatcher(
+        storage, store, org_provider=lambda: ["team_a"], state_reader=lambda t: {},
+        driver_heartbeat_reader=lambda: {}, stale_threshold_min=90,
+        driver_down_threshold_min=240, grace_min=0, now=lambda: FIXED,
+    )
+    w.poll()  # healthy poll — the watcher cannot clear the driver's tier
+    assert 7 in ch.issues
+
+    w._storage = _RefusedListingStorage()
+    w.poll()  # its own listing-tier filing adopts, never duplicates
+    assert 7 in ch.issues
+    assert len(ch.issues) == 1
+
+
+def test_classify_r2_failure_probe_that_raises_is_not_evidence():
+    """A probe that itself fails decides NOTHING — never a fabricated tier."""
+
+    class _Store:
+        def probe_reachable(self):
+            raise RuntimeError("probe blew up")
+
+    tier, detail = _classify_r2_read_failure(_Store(), RuntimeError("boom"))
+    assert tier == R2_TIER_UNDETERMINED
+    assert detail["r2_tier"] == R2_TIER_UNDETERMINED
+    assert detail["error"] == "boom"
+
+
+def test_classify_r2_failure_reads_a_service_answer_through_the_cause_chain():
+    """``R2Storage`` re-raises as ``RuntimeError(...) from e`` — the service's
+    own error (the answer) is one link down the chain."""
+
+    try:
+        raise RuntimeError("R2 list failed for backups/") from _ServiceError()
+    except RuntimeError as e:
+        tier, _ = _classify_r2_read_failure(MemoryStorage(), e)
+    assert tier == R2_TIER_LISTING
 
 
 def test_watcher_production_key_parse():

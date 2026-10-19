@@ -287,6 +287,29 @@ class TestDrStatus:
         assert body["enabled"] is True
         assert "watcher" in body and "driver" in body
 
+    def test_status_publishes_the_watcher_r2_tier(self, client, mem_storage):
+        """#8472: the classification a failing poll made is readable on /status.
+
+        The watcher records WHICH R2 tier it filed on its heartbeat; publishing
+        it beside `r2_ok` is what lets an operator tell a network fault from a
+        missing `ListObjects` permission without opening the incident. Asserted
+        through the real endpoint because the block is hand-built there — a
+        heartbeat field nothing reads would be dead weight.
+        """
+        from tortoise.backup_watcher import HEARTBEAT_KEY
+
+        mem_storage.upload(HEARTBEAT_KEY, json.dumps({
+            "last_poll_at": "2026-08-08T12:00:00+00:00",
+            "r2_ok": False,
+            "r2_tier": "listing",
+            "status": {},
+        }).encode())
+        r = client.get("/v1/internal/backups/status", headers=INTERNAL_HEADERS)
+        assert r.status_code == 200, r.text
+        watcher = r.json()["watcher"]
+        assert watcher["r2_ok"] is False
+        assert watcher["r2_tier"] == "listing"
+
     def test_status_publishes_the_telemetry_drop_block(self, client, mem_storage,
                                                        monkeypatch):
         """#4095: the NORMAL return — the body the hourly driver and an operator

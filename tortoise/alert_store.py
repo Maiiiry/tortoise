@@ -113,6 +113,10 @@ IssueOpen = Callable[[int], bool]           # (issue number) -> still open?
 # owned by the DRIVER, the only surface that measures the whole pool). Before the
 # split the watcher could not distinguish them and so could not clear either,
 # which is why ADR-011 had to refuse it the right to close `R2_DOWN` at all.
+# #8472 keeps FILING and CLEARING apart: the watcher now classifies its failing
+# read and may FILE `R2_UNLISTABLE` when the substrate answered and refused it,
+# but recovery still needs the whole-pool measurement, so `kind_owner()` still
+# refuses the watcher's resolve — a filer is not automatically an owner.
 #
 # ⛔ The MAP is declared ONCE, in `tortoise/incident_kinds.py` (#4780): each
 # kind's `KindSpec.owner`. It is imported above (not restated) so existing

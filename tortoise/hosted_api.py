@@ -35988,6 +35988,13 @@ async def backups_status(request: Request):
             "last_poll_at": hb.get("last_poll_at"),
             "age_minutes": watcher_age_min,
             "r2_ok": hb.get("r2_ok"),
+            # #8472: WHICH tier a failing watcher poll filed — `reachability`,
+            # `listing`, `undetermined`, or None on a healthy poll. Published
+            # beside `r2_ok` because the classification is what tells an
+            # operator whether to look at the network or at the key's
+            # `ListObjects` permission, and reading it here does not require
+            # opening the incident.
+            "r2_tier": hb.get("r2_tier"),
         },
         "driver": {"last_heartbeat_at": driver_hb.get("ran_at"), "age_minutes": driver_age_min},
         # #3944: the analytics heartbeat the external DR driver reads to detect

@@ -57,6 +57,7 @@ import os
 import re
 import secrets
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Callable, Protocol  # noqa: UP035
 
@@ -949,6 +950,32 @@ def _r2_config_from_env() -> tuple[str, str, str, str]:
     )
 
 
+#: The reachability probe's own budget (#8472). Small ON PURPOSE and separate
+#: from the store's reads: the probe answers "did anything answer?", so it must
+#: never inherit a real read's retry/timeout budget — an unreachable endpoint
+#: would otherwise cost the caller's poll interval twice.
+_R2_PROBE_TIMEOUT_S = 5
+
+
+def _answered_by_service(e: BaseException) -> bool:
+    """True when ``e`` is a SERVICE ERROR RESPONSE — the substrate ANSWERED (#8472).
+
+    The distinction the R2 tiers need is ANSWER vs NO ANSWER, not success vs
+    failure: R2 refusing a call with ``403 AccessDenied`` (or 404/5xx) has
+    reached us and replied, which is a different fault from a connection that
+    never opened. Checked STRUCTURALLY — a ``response`` mapping carrying
+    ``ResponseMetadata`` is botocore's ``ClientError`` shape — so this module
+    does not have to import botocore to classify an error it did not raise.
+
+    Deliberately permission-blind: a key so restricted that even the probe is
+    refused reports ``answered``, which is the truthful reading (the substrate
+    is up; the key is the problem).
+    """
+    response = getattr(e, "response", None)
+    return isinstance(response, Mapping) and isinstance(
+        response.get("ResponseMetadata"), Mapping)
+
+
 def _is_no_such_key_error(e: Exception) -> bool:
     """True when ``e`` is a botocore ClientError for a missing S3/R2 key."""
     try:
@@ -983,6 +1010,20 @@ class R2Storage:
             )
         self._client = None
 
+    def _client_kwargs(self) -> dict[str, str]:
+        """The ONE place the S3 client is parameterised (#8472).
+
+        Shared by the cached client and the probe's throwaway one, so the probe
+        can never address a different endpoint or credential than the reads it
+        is judging — a drift that would silently misclassify the tier.
+        """
+        return {
+            "endpoint_url": self._endpoint,
+            "aws_access_key_id": self._ak,
+            "aws_secret_access_key": self._sk,
+            "region_name": "auto",
+        }
+
     def _s3(self):
         if self._client is None:
             try:
@@ -991,13 +1032,7 @@ class R2Storage:
                 raise RuntimeError(
                     "boto3 not installed — install with: pip install 'tortoise[backups]'"
                 ) from e
-            self._client = boto3.client(
-                "s3",
-                endpoint_url=self._endpoint,
-                aws_access_key_id=self._ak,
-                aws_secret_access_key=self._sk,
-                region_name="auto",
-            )
+            self._client = boto3.client("s3", **self._client_kwargs())
         return self._client
 
     def upload(self, key: str, data: bytes, content_type: str | None = None) -> None:
@@ -1060,6 +1095,68 @@ class R2Storage:
             if _is_no_such_key_error(e):
                 raise KeyError(key) from e
             raise RuntimeError(f"R2 download failed for {key}: {e}") from e
+
+    def probe_reachable(self) -> bool:
+        """Whether the substrate ANSWERS a probe at all — the reachability tier.
+
+        #8472: the watcher's R2 read is ``list("backups/")`` →
+        ``list-objects-v2``, which fails for BOTH of the #3147 reasons — the
+        substrate does not answer (``R2_DOWN``, the reachability tier) and it
+        answers but the access key lacks ``ListObjects`` (``R2_UNLISTABLE``,
+        the listing tier). A failing read alone cannot tell them apart, so this
+        is the extra evidence that can.
+
+        Deliberately NOT a listing call: ``head_bucket`` asks only whether the
+        bucket endpoint answers. And the test is ANSWER vs NO ANSWER, not
+        success vs failure — a service ERROR RESPONSE (403/404/5xx) is an
+        answer, so only a transport-level failure (connect / DNS / timeout /
+        closed connection) reports ``False``. That is what makes it
+        permission-independent: however restricted the key, a refusal still
+        proves the substrate is up, which is exactly what the tier split needs.
+
+        OPTIONAL capability, not part of :class:`BackupStorage`: an in-memory or
+        not-yet-migrated store has no meaningful reachability probe, and the
+        caller (``backup_watcher``) treats its absence as "cannot discriminate"
+        rather than guessing. Never raises — an unbuildable client or an
+        unclassifiable error reports not-reachable, the conservative direction
+        (the incident is filed either way, just at the reachability tier).
+
+        Runs on its OWN bounded client (see :meth:`_probe_client`): a probe must
+        cost seconds, never a share of the caller's poll interval.
+        """
+        try:
+            self._probe_client().head_bucket(Bucket=self._bucket)
+            return True
+        except Exception as e:  # never raises, by contract
+            return _answered_by_service(e)
+
+    def _probe_client(self):
+        """A throwaway S3 client with a BOUNDED budget, for the probe only (#8472).
+
+        Deliberately NOT the cached client: that one inherits botocore's default
+        retry/timeout policy (no explicit bound at all — the store's own calls
+        are the ones that need the long budget), and a probe that spends the
+        same budget as a real read would cost the watcher's poll interval twice
+        during an outage: once failing the read, once probing it. The probe only
+        has to establish whether ANYTHING answers, so one attempt inside a few
+        seconds is the whole requirement.
+        """
+        import boto3
+
+        kwargs = self._client_kwargs()
+        try:
+            from botocore.config import Config
+
+            kwargs["config"] = Config(
+                connect_timeout=_R2_PROBE_TIMEOUT_S,
+                read_timeout=_R2_PROBE_TIMEOUT_S,
+                retries={"max_attempts": 1},
+            )
+        except ImportError:
+            # boto3 ships botocore, so this is unreachable in a real install;
+            # the unbounded fallback is still better than no probe at all.
+            pass
+        return boto3.client("s3", **kwargs)
 
     def list(self, prefix: str) -> list[str]:
         try:

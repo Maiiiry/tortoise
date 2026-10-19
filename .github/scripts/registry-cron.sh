@@ -210,7 +210,9 @@ kind_owner() { # kind -> the writer whose probes cover this kind's recovery (#31
     # #3147: R2_DOWN (the REACHABILITY tier) belongs here too — the watcher's
     # own R2 read IS a reachability probe, so it can legitimately clear the kind
     # it can evidence (indicator 2). It cannot clear R2_UNLISTABLE, which is
-    # driver-owned: the watcher's failing probe cannot tell the two tiers apart.
+    # driver-owned: #8472 lets the watcher CLASSIFY its failing read and FILE the
+    # listing tier when the substrate answered and refused it, but recovery still
+    # needs the whole-pool measurement only this driver performs. File ≠ clear.
     STALE|NEVER_BACKED_UP|METADATA_LOST|BACKUP_SET_MISSING|DRIVER_DOWN|R2_DOWN)
       echo watcher ;;
     # app: the drill resolves on its own success signal.

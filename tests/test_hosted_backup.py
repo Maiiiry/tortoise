@@ -1630,6 +1630,75 @@ def test_r2storage_happy_path(monkeypatch):
     assert store.list("backups/c/") == []
 
 
+class _ServiceAnswerError(Exception):
+    """botocore ``ClientError``'s SHAPE — a ``response`` mapping + metadata.
+
+    A fake rather than a botocore import so these tests RUN in the canonical dev
+    env (boto3 is an ``[backups]`` extra, absent here): the probe classifies
+    structurally, so this exercises the real rule rather than a mock of it.
+    """
+
+    def __init__(self, code: str = "AccessDenied", status: int = 403) -> None:
+        super().__init__(f"An error occurred ({code}) when calling HeadBucket")
+        self.response = {
+            "Error": {"Code": code, "Message": "denied"},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        }
+
+
+def test_r2storage_probe_reachable_success(monkeypatch):
+    """#8472: a bucket HEAD that succeeds is the reachability tier's YES."""
+    store, fake = _r2_with_fake_boto3(monkeypatch)
+    monkeypatch.setattr(fake, "head_bucket", lambda Bucket: None, raising=False)
+    assert store.probe_reachable() is True
+
+
+def test_r2storage_probe_reachable_true_when_the_key_is_refused(monkeypatch):
+    """#8472: a REFUSAL is an ANSWER — the substrate is up, the key is the fault.
+
+    This is the property that makes the probe permission-independent: a key too
+    restricted to even HEAD the bucket must still report reachable, or the
+    watcher would file every permission fault as a network outage — exactly the
+    mislabel #8472 exists to remove.
+    """
+    store, fake = _r2_with_fake_boto3(monkeypatch)
+
+    def _denied(Bucket):
+        raise _ServiceAnswerError("AccessDenied", 403)
+
+    monkeypatch.setattr(fake, "head_bucket", _denied, raising=False)
+    assert store.probe_reachable() is True
+
+
+def test_r2storage_probe_reachable_true_on_a_server_side_failure(monkeypatch):
+    """A 5xx is still an ANSWER: R2 replied, so nothing is unreachable."""
+    store, fake = _r2_with_fake_boto3(monkeypatch)
+
+    def _throttled(Bucket):
+        raise _ServiceAnswerError("SlowDown", 503)
+
+    monkeypatch.setattr(fake, "head_bucket", _throttled, raising=False)
+    assert store.probe_reachable() is True
+
+
+def test_r2storage_probe_reachable_false_on_transport_failure(monkeypatch):
+    """#8472: nothing answered — the only reading that is NOT reachable.
+
+    A transport exception carries no ``response`` mapping (botocore's
+    ``EndpointConnectionError``/``ConnectTimeoutError`` shape), which is exactly
+    what distinguishes "no answer" from "an error answer".
+    """
+    store, fake = _r2_with_fake_boto3(monkeypatch)
+
+    def _dead(Bucket):
+        raise ConnectionError(
+            "Could not connect to the endpoint URL: "
+            "https://acct.r2.cloudflarestorage.com")
+
+    monkeypatch.setattr(fake, "head_bucket", _dead, raising=False)
+    assert store.probe_reachable() is False
+
+
 # ── listing / retention ──────────────────────────────────────────────────────
 
 

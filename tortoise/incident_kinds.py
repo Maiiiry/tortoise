@@ -168,10 +168,12 @@ class KindSpec:
 KIND_R2_DOWN = "R2_DOWN"
 #: #3147: R2 answers (a probe reaches it) but the pool cannot be LISTED
 #: (``R2_LIST_OK=0``) — typically the access key lacks ``ListObjects`` — or the
-#: app reports a ``storage_error``. A NEW key: no live dedup object or open issue
-#: existed under it, so there is nothing to migrate. Distinct from
-#: :data:`KIND_R2_DOWN` because the two need different recovery evidence and so
-#: have different owners (see the module docstring).
+#: app reports a ``storage_error``. #8472: the WATCHER files it too, when its own
+#: failing R2 read is classified as an ANSWERED REFUSAL rather than as no answer
+#: at all — filing is not clearing, and the resolve stays the driver's. A NEW
+#: key: no live dedup object or open issue existed under it, so there is nothing
+#: to migrate. Distinct from :data:`KIND_R2_DOWN` because the two need different
+#: recovery evidence and so have different owners (see the module docstring).
 KIND_R2_UNLISTABLE = "R2_UNLISTABLE"
 KIND_APP_DOWN = "APP_DOWN"
 KIND_WATCHER_DOWN = "WATCHER_DOWN"

@@ -41,6 +41,7 @@ from .incident_kinds import (
     KIND_METADATA_LOST,
     KIND_NEVER_BACKED_UP,
     KIND_R2_DOWN,
+    KIND_R2_UNLISTABLE,
     KIND_STALE,
 )
 
@@ -48,6 +49,127 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_KEY = "ops/watcher-heartbeat.json"
 SIMULATE_PREFIX = "ops/simulate/"
+
+# ── #8472: WHICH R2 tier a FAILING read belongs to ───────────────────────────
+# The watcher's probe is ``storage.list("backups/")`` → ``list-objects-v2``, and
+# it fails for BOTH of the #3147 failure modes: the substrate does not answer
+# (the reachability tier ``R2_DOWN``, which this watcher owns because a probe
+# reaching R2 is what its own read tests) and the substrate answers but refuses
+# the listing (the listing tier ``R2_UNLISTABLE``, driver-owned because the
+# whole-pool measurement is its evidence). Filing every failure at the
+# reachability tier — which the watcher did while the split landed — sends the
+# operator to the wrong recovery procedure: a permission fault reads as a
+# network outage. So a failing read is CLASSIFIED before it is filed (see
+# ``_classify_r2_read_failure``), and when the evidence cannot separate the two
+# the incident body says so instead of asserting unreachability.
+R2_TIER_REACHABILITY = "reachability"
+R2_TIER_LISTING = "listing"
+R2_TIER_UNDETERMINED = "undetermined"
+
+#: The tier evidence, as published in the incident body. The body is written
+#: create-once and read by whoever is on call, so each field says what was
+#: MEASURED and which recovery procedure it points at — never a bare label.
+_TIER_EVIDENCE: dict[str, dict[str, str]] = {
+    R2_TIER_LISTING: {
+        "finding": "R2 ANSWERED and refused the read — the LISTING tier, "
+                   "not a reachability failure (#8472)",
+        "recovery": "check the R2 access key's ListObjects permission, the "
+                    "bucket policy, and the key/secret in use by THIS "
+                    "surface (the substrate is up)",
+    },
+    R2_TIER_REACHABILITY: {
+        "finding": "no probe reached the substrate — the REACHABILITY tier (#8472)",
+        "recovery": "check R2 reachability (endpoint, DNS/network, billing) "
+                    "and the R2 credentials",
+    },
+    R2_TIER_UNDETERMINED: {
+        "finding": "the failing read did NOT distinguish 'R2 does not answer' "
+                   "from 'R2 answers and refuses the listing' — this incident "
+                   "does NOT assert unreachability (#8472)",
+        "recovery": "check BOTH, endpoint/network FIRST and then the access "
+                    "key's ListObjects permission",
+    },
+}
+
+
+def _exception_chain(exc: BaseException):
+    """``exc`` and its causes/contexts, newest first, without looping.
+
+    ``R2Storage`` re-raises each failure as ``RuntimeError(...) from e``, so the
+    service's own error object (the one carrying the answer) is one link down.
+    """
+    seen: set[int] = set()
+    e: BaseException | None = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        yield e
+        e = e.__cause__ or e.__context__
+
+
+def _answered_by_service(exc: BaseException) -> bool:
+    """Whether the exception chain proves the substrate ANSWERED (#8472).
+
+    An error RESPONSE is an answer: R2 refusing the call (``AccessDenied``,
+    ``403``, ``404``, ``5xx``) has been reached and replied, which is a
+    different fault from a connection that never opened — and only the latter
+    is the reachability tier. Matched STRUCTURALLY (a ``response`` mapping
+    carrying ``ResponseMetadata`` is botocore's ``ClientError`` shape) so this
+    module carries no botocore import of its own.
+    """
+    for e in _exception_chain(exc):
+        response = getattr(e, "response", None)
+        if isinstance(response, Mapping) and isinstance(
+                response.get("ResponseMetadata"), Mapping):
+            return True
+    return False
+
+
+def _classify_r2_read_failure(storage, exc: BaseException) -> tuple[str, dict[str, Any]]:
+    """Which #3147 tier a FAILING R2 read belongs to, plus the published evidence.
+
+    Two independent sources, cheapest and most specific first:
+
+    1. **The exception itself.** A service ERROR RESPONSE is proof the substrate
+       answered — no extra call needed, and it is what the ``head-bucket``
+       passes / ``list-objects-v2`` fails shape looks like from here.
+    2. **The store's OPTIONAL reachability probe** (``probe_reachable``). It
+       covers the failures that are not permission refusals — a transport-level
+       read failure is exactly what it exists to name, and it answers for any
+       store that implements it, whatever the failing call was.
+    3. Neither → ``UNDETERMINED``. Never a fabricated reachability claim: the
+       incident is still filed (the operator is still paged) but its body states
+       that the tiers could not be told apart.
+
+    The probe may itself be absent (an in-memory/legacy store) or raise; both
+    leave the tier honestly undetermined rather than guessing.
+
+    Returns ``(tier, detail)`` — ``detail`` is the dict published in the
+    incident body, so it carries the finding, the recovery pointer and the
+    (single-line) error.
+    """
+    answered: bool | None = True if _answered_by_service(exc) else None
+    if answered is None:
+        probe = getattr(storage, "probe_reachable", None)
+        if callable(probe):
+            try:
+                answered = bool(probe())
+            except Exception:  # a raising probe is NOT reachability evidence
+                logger.warning("R2 reachability probe raised — tier undetermined",
+                               exc_info=True)
+                answered = None
+    if answered is True:
+        tier = R2_TIER_LISTING
+    elif answered is False:
+        tier = R2_TIER_REACHABILITY
+    else:
+        tier = R2_TIER_UNDETERMINED
+    detail: dict[str, Any] = {
+        "r2_tier": tier,
+        **_TIER_EVIDENCE[tier],
+        "probe": "storage.list('backups/') → list-objects-v2",
+        "error": " ".join(str(exc).split())[:500],
+    }
+    return tier, detail
 
 
 def _read_json(storage, key: str) -> dict[str, Any]:
@@ -500,6 +622,11 @@ class BackupWatcher:
 
     def _poll_inner(self, now: datetime) -> dict[str, Any]:
         # ── R2 read (the only external read the daemon makes). ──
+        # #8472: on FAILURE the read is classified into its #3147 tier here,
+        # while the exception (and the store) that carries the evidence is still
+        # in hand; `_drive_alerts` then files the kind that matches. None on a
+        # healthy poll.
+        r2_failure: tuple[str, dict[str, Any]] | None = None
         try:
             r2_orgs = _org_prefixes(self._storage)
             # (The `ops/state.json` read that used to sit here was dead — the
@@ -528,7 +655,9 @@ class BackupWatcher:
             self._known_newest = newest_by_org
             self._known_state_orgs = state_orgs
         except Exception as e:
-            logger.warning("R2 read failed (r2_ok=false): %s", e)
+            r2_failure = _classify_r2_read_failure(self._storage, e)
+            logger.warning("R2 read failed (r2_ok=false, tier=%s): %s",
+                           r2_failure[0], e)
             r2_orgs, state_orgs, newest_by_org, driver_ts, r2_ok = [], [], {}, None, False
             if not self._known_good:
                 self._last_status = {"unknown": True, "r2_ok": False}
@@ -756,6 +885,7 @@ class BackupWatcher:
                 status, r2_ok,
                 prev_per_team=prev_per_team,
                 census_confirmed=census_confirmed,
+                r2_failure=r2_failure,
             )
 
         # Re-baseline the universe-shrink reference ONLY on a confirmed poll (the
@@ -777,6 +907,10 @@ class BackupWatcher:
                     {
                         "last_poll_at": now.isoformat(),
                         "r2_ok": r2_ok,
+                        # #8472: WHICH tier a failing poll filed (None when the
+                        # read was healthy), so the classification is observable
+                        # on the heartbeat and not only in the incident body.
+                        "r2_tier": (r2_failure[0] if r2_failure else None),
                         "eligible_degraded": self._eligible_degraded,
                         "status": status.get("per_team", {}),
                     }
@@ -841,7 +975,8 @@ class BackupWatcher:
                 "(retried next poll)"
             )
 
-    def _alert_leg(self, op: str, kind: str, subject: str = "") -> bool:
+    def _alert_leg(self, op: str, kind: str, subject: str = "",
+                   detail: dict[str, Any] | None = None) -> bool:
         """One alert-store leg, contained AND attributed (#3031 cycle-2 review P2).
 
         Contained per leg rather than per block, for two reasons:
@@ -859,6 +994,9 @@ class BackupWatcher:
         orphan — the defect the graph path had and the team path shared).
         `CloseCooldown` is logged at INFO without a traceback: it means "still
         open, backing off" rather than "something broke".
+
+        ``detail`` (open legs only) is the EVIDENCE the store publishes in the
+        incident body — #8472 uses it so an R2 tier is never a bare label.
 
         #3146: for a resolve leg "SUCCEEDED" means the incident is no longer
         owed — a resolve left ON RECORD by the recovery window
@@ -891,7 +1029,14 @@ class BackupWatcher:
                 outcome = self._alerts.resolve_incident_state(kind, subject)
                 return outcome not in (
                     ResolveOutcome.SKIPPED_FRESH, ResolveOutcome.SKIPPED_WINDOW)
-            getattr(self._alerts, op)(kind, subject)
+            if op == "open_incident":
+                # #8472: an open leg may carry the EVIDENCE that decided its
+                # tier, which the store publishes (redacted) in the incident
+                # body. A resolve leg takes no detail — `resolve_incident`
+                # writes its own recovery comment.
+                self._alerts.open_incident(kind, subject, detail)
+            else:
+                self._alerts.resolve_incident(kind, subject)
             return True
         except CloseCooldown as cool:
             logger.info(
@@ -907,7 +1052,8 @@ class BackupWatcher:
 
     def _drive_alerts(self, status: dict[str, Any], r2_ok: bool | None,
                       *, prev_per_team: set[str] | None = None,
-                      census_confirmed: bool = False) -> None:
+                      census_confirmed: bool = False,
+                      r2_failure: tuple[str, dict[str, Any]] | None = None) -> None:
         """#3031: drive the alert store — fail-soft, never at the heartbeat's expense.
 
         The heartbeat written right after this call is the watcher's OWN
@@ -1116,21 +1262,36 @@ class BackupWatcher:
                     if not self._alert_leg("resolve_incident", KIND_BACKUP_SET_MISSING, org):
                         pending_bsm.add(org)
                 self._last_backup_set_missing = cur_bsm | pending_bsm
-            # R2_DOWN: emit while degraded-from-known-good, resolve when healthy.
-            # #3147: the kind's meaning is NARROWED to the reachability tier (the
-            # substrate does not answer), and its owner is this WATCHER — the one
-            # surface whose own R2 read is the reachability evidence. So this leg
-            # is now a legitimate open+resolve pair rather than an open the owner
-            # (the driver) had to close. The unlistable tier (R2 answers but the
-            # pool cannot be listed, R2_LIST_OK=0) is the DRIVER's R2_UNLISTABLE;
-            # this probe cannot discriminate it, so on FAILURE the watcher files
-            # the reachability tier (a named residual — see the runbook).
+            # R2: emit while degraded-from-known-good, resolve when healthy.
+            # #3147: the kinds follow the TIERS. `R2_DOWN` means the substrate
+            # does not ANSWER and is WATCHER-owned — this surface's own R2 read
+            # is the reachability evidence, so the leg is a legitimate
+            # open+resolve pair. `R2_UNLISTABLE` means R2 answers and REFUSES the
+            # listing and is DRIVER-owned (the whole-pool measurement is its
+            # recovery evidence) — so the watcher may FILE it on its own
+            # evidence but never CLEAR it; the ownership guard is the store's
+            # (`KIND_OWNERS`), and nothing here calls a resolve for it.
+            # #8472: a failing read is no longer filed at the reachability tier
+            # by default — `r2_failure` carries the tier the evidence names (see
+            # `_classify_r2_read_failure`), and an UNDETERMINED failure keeps the
+            # reachability kind while its body states that the tiers could not be
+            # told apart (a labelling claim is never fabricated).
             # Its own guard kept for symmetry with the other legs; the outer
             # `except` below remains as a backstop for structural errors (a
             # malformed status dict), and per-leg containment means it is now
             # only reached for defects rather than for an ordinary store failure.
             if r2_ok is False:
-                self._alert_leg("open_incident", KIND_R2_DOWN)
+                tier, detail = r2_failure or (R2_TIER_UNDETERMINED, {})
+                if tier == R2_TIER_LISTING:
+                    # R2 ANSWERED and refused the listing: file the listing tier.
+                    # `R2_DOWN` is then FALSE for this poll — a probe did reach
+                    # the substrate, which is that kind's own recovery condition
+                    # — so it is resolved rather than left to linger on wrong
+                    # evidence.
+                    self._alert_leg("open_incident", KIND_R2_UNLISTABLE, "", detail)
+                    self._alert_leg("resolve_incident", KIND_R2_DOWN)
+                else:
+                    self._alert_leg("open_incident", KIND_R2_DOWN, "", detail)
             else:
                 self._alert_leg("resolve_incident", KIND_R2_DOWN)
         except Exception:
