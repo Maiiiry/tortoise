@@ -227,7 +227,8 @@ test('#8670: the inert effect cannot outlive its dialog (page-lockout guard)', (
   // Both cards also sit behind other conditions that can flip mid-dialog with the
   // id and the list untouched: the session card is the deepest arm of
   // `!sessionsLoading && state && sessionsOn && sessionsLoaded`, and the graph
-  // card is gated on the owner/admin role. A flag blind to those does not change
+  // card is gated on the owner/admin role AND on the Settings home's
+  // `tab === 'graphs'` block. A flag blind to those does not change
   // on the transition that unmounts the card, so its effect neither re-runs nor
   // cleans up and the page keeps `inert` with no dialog left. The guard therefore
   // does two things: it pins that the flag IS the render gate (one value, so the
@@ -269,21 +270,33 @@ test('#8670: the inert effect cannot outlive its dialog (page-lockout guard)', (
   assert.equal(sessionArmed({ sessions: [{ id: 's8' }] }), false,
     'a row that leaves the live list unmounts the card')
 
-  // ── graph delete: the role is part of the render gate too ──
+  // ── graph delete: the role and the OPEN TAB are part of the render gate too ──
+  // The card is nested in the Settings home's `tab === 'graphs'` block, and that
+  // tab moves without a click: the #2509 popstate/hashchange handler calls
+  // `setTab` straight from browser Back / an address-bar edit, which `inert`
+  // cannot block. So the tab belongs to the flag exactly as the role does.
+  const graphsTabAt = mainJsx.indexOf("{tab === 'graphs' && (")
+  const graphCardAt = mainJsx.indexOf('{graphDeleteArmed && (() => {')
+  assert.ok(graphsTabAt >= 0 && graphCardAt > graphsTabAt,
+    'the graph-delete card renders INSIDE the `tab === \'graphs\'` block — so the tab is part of its render gate')
   const graphFlag = constExpr(mainJsx, 'graphDeleteArmed')
   const graphArmed = (over = {}) => evalFlag(
     graphFlag,
-    ['roleIsOwnerAdmin', 'confirmDeleteId', 'graphs'],
+    ['roleIsOwnerAdmin', 'confirmDeleteId', 'graphs', 'tab'],
     Object.entries({
       roleIsOwnerAdmin: () => true,
       confirmDeleteId: 'g1',
       graphs: [{ graph_id: 'g1' }],
+      tab: 'graphs',
       ...over,
     }).map(([, v]) => v))
-  assert.equal(graphArmed(), true, 'the literal: an armed dialog for an owner/admin')
+  assert.equal(graphArmed(), true, 'the literal: an armed dialog for an owner/admin on the Graphs tab')
   // A demotion / org switch re-derives the role and unmounts the card.
   assert.equal(graphArmed({ roleIsOwnerAdmin: () => false }), false,
     'a role change unmounts the card — the flag must clear (page-lockout guard)')
+  // Browser Back / an address-bar hash edit while the dialog is open.
+  assert.equal(graphArmed({ tab: 'overview' }), false,
+    'leaving the Graphs tab unmounts the card — the flag must clear (page-lockout guard)')
   assert.equal(graphArmed({ confirmDeleteId: null }), false, 'no id, no dialog')
   assert.equal(graphArmed({ graphs: [{ graph_id: 'g2' }] }), false,
     'a row that leaves the live list unmounts the card')

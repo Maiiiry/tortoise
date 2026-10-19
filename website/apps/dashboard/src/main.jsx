@@ -2871,7 +2871,16 @@ function claimIntentInFlight() {
   // second tab) unmounts the card. A flag without the role would not change on
   // that transition, so the effect would neither re-run nor clean up and the
   // page outside the card would keep `inert` with no dialog left to release it.
-  const graphDeleteArmed = roleIsOwnerAdmin() && !!confirmDeleteId
+  //
+  // #8670 review P1 (same shape, second condition): the card is also nested in
+  // the Settings home's `tab === 'graphs'` block, and `tab` can change WITHOUT a
+  // click — the popstate/hashchange handler (#2509) calls `setTab` straight from
+  // browser Back or an address-bar edit, and `inert` does not disable browser
+  // chrome. That unmounts the card while `confirmDeleteId` and `graphs` are
+  // untouched, so the flag has to carry the tab too; leaving it out strands
+  // `inert` on the whole page with no dialog to release it. Returning to the
+  // tab re-arms the flag, so the effect re-applies on the way back in.
+  const graphDeleteArmed = tab === 'graphs' && roleIsOwnerAdmin() && !!confirmDeleteId
     && graphs.some((g) => g.graph_id === confirmDeleteId)
   const graphDeleteDialogRef = React.useRef(null)
   const graphDeleteInertRef = React.useRef(null)
