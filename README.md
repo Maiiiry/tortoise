@@ -1,3 +1,46 @@
+> # ⛔ EVALUATED 2026-10-18 — ALL SIX ARE SUPERSEDED. **DO NOT MERGE.**
+>
+> Every patch below is a snapshot of work that had **already shipped in `main`**, or a
+> snapshot that would **undo shipped work**. None is a merge candidate. Nothing here is
+> new; there is nothing to rebase, land, or deploy. Full evidence:
+> **issue #9060** · report `/tmp/eldato-reports/REPORT-stashes.md`.
+>
+> | patch | verdict | superseded by |
+> |---|---|---|
+> | `stash0` `feat/2654-tm` (`assembly.py`, +206/−20) | OBSOLETE — landed verbatim | `a67d61afc` — duration-state resolution (#2654) **#8050**, 2026-10-11 |
+> | `stash1` `feat/3662-capture-consent-gate` (7 files, +271/−7) | OBSOLETE — and its docs text is now **wrong** | `a4b800854` — SDK consent gate (#3662) **#7811**, 2026-10-09; hosted-door question settled later by `b169733a1` (#8535), **Option 1** |
+> | `stash2` `feat/167-story-arch` | **NOT WORK** — one `.pyc`, 0 source lines | — |
+> | `stash3` `feat/7697-hybrid-search-v2` (+52/−7) | OBSOLETE — 4 of 5 source files comment-only; the 3 behavioural bits are in `main` in better form | `sdk.py:23274`, `projection/__init__.py:10255,10768` |
+> | `stash4` same branch (`search_engine.py`, +4/−45) | OBSOLETE **+ REGRESSIVE** — applying it **deletes** the landed index-accelerated vector leg (`db.idx.vector.queryNodes` / `is_embedded`) and reverts Docker/server retrieval to brute force | `main` is strictly ahead (`search_engine.py:1861-1964`) |
+> | `stash5` same branch (+55/−25) | OBSOLETE — parallel `degradation_chain` (#7780) and the Point-embedding write (#7778) both landed, journal-aware | `search_engine.py:2497`; `projection/entities.py::_upsert_point_props` |
+>
+> **Three corrections to the text below.**
+>
+> 1. **The "risk" column was wrong on the day it was written.** It ranked `stash1` first as
+>    "#3662 OPEN, no PR — at risk"; the #3662 SDK gate merged **2026-10-09** (`a4b800854`,
+>    PR #7811) — **three days before this export**. It read the *issue tracker's* state, not
+>    the *code's* (the merged-but-open-issue pattern, #8469). The issue is now CLOSED.
+> 2. **`stash1`'s doc text contradicts a recorded owner decision.** It calls the hosted MCP
+>    `tortoise_session_capture` door "an open product question (#3662)". The owner settled it
+>    as **Option 1** on 2026-10-13 (`b169733a1`, #8535) with an `OVERRIDES:` marker on #3662.
+>    Landing that patch would re-open a closed decision and strip the marker.
+> 3. **The application recipe below does not work for 4 of the 6.** `git stash show -p` emits
+>    no binary payload for the `__pycache__` entries and those files do not exist in a
+>    checkout, so `git apply` refuses at the first hunk (`No such file or directory`). Only
+>    `git apply --exclude='*.pyc'` reaches the text hunks — and on current `main` every
+>    non-empty patch then fails anyway on context drift. `stash2` "applies" only because,
+>    after excluding the `.pyc`, it is empty.
+>
+> Also note `stash3`/`4`/`5` are **alternate snapshots, not a stack** — `stash4` and `stash5`
+> share the same post-image for `search_engine.py` (`d6705c2a3`), so applying the sequence
+> conflicts. And the branch name `7697-hybrid-search-v2` mis-attributes issue #7697, which is
+> a CI/docs lychee issue none of these patches touch.
+>
+> Keep this branch as the record. Do not merge it — this file also replaces the repository's
+> root `README.md`.
+
+---
+
 # Local git stashes, exported before a machine handover — 2026-10-12
 
 Six `git stash` entries were sitting on the box that had been running the autonomous
