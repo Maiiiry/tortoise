@@ -3328,11 +3328,13 @@ def _journal_safe_params(params, cypher=None):
 # fold — and none of the five is closed in this increment. They are the surface
 # §17.1's atomic write has to close; a lexical inventory cannot, because each is
 # one hop below anything a runtime signal is placed on. (The whole-graph
-# DESTRUCTIVE verbs are the OTHER axis and are closed on the write handle since
-# #9209: `proj.g.delete()`, `GRAPH.DELETE`, `GRAPH.COPY` and the keyspace forms
-# a graph is also reachable as a Redis KEY through — `DEL`, `UNLINK`, `MOVE`,
-# `RENAME` — refuse on a non-disposable graph, unconditionally for `FLUSHALL` /
-# `FLUSHDB` / `SWAPDB`.)
+# DESTRUCTIVE axis is the other one, and it is closed on the write handle since
+# #9209: `proj.g.delete()`, `GRAPH.DELETE`, `GRAPH.COPY`, and — because a graph
+# is also a Redis KEY — ANY command through the handle that names a graph key
+# (`DEL`, `UNLINK`, `SET`, `EXPIRE`, `MOVE`, `RENAME`/`RENAMENX`, and whatever
+# verb comes next: the rule resolves the KEY, it does not enumerate verbs)
+# refuse on a non-disposable graph, unconditionally for `FLUSHALL` / `FLUSHDB` /
+# `SWAPDB`. Reads stay exempt, and a command that names no graph is untouched.)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3438,13 +3440,38 @@ def _graph_metadata_write_scope(reason: str = "graph-metadata"):
     return _cache_write_authorized(reason)
 
 
-#: #9209 — the KEYSPACE verbs that destroy or relocate a graph, and the
-#: verbs that take the whole keyspace. A FalkorDB graph is a Redis KEY of type
-#: ``graphdata``, so these reach it while looking nothing like Cypher; MEASURED
-#: through ``proj.g.execute_command`` on a non-test graph: ``DEL`` → 1 (gone),
-#: ``UNLINK`` → 1 (gone), ``RENAME`` → True (source gone, destination holds it).
-_KEYSPACE_DESTRUCTIVE_VERBS = frozenset({"DEL", "UNLINK", "MOVE", "RENAME"})
-#: ... and the ones NO single disposable name can authorize (see the guard).
+#: #9209 — a FalkorDB graph is a Redis KEY of type ``graphdata``, so the
+#: KEYSPACE commands reach it while looking nothing like Cypher. MEASURED on the
+#: live engine through ``proj.g.execute_command`` against a NON-test graph:
+#: ``DEL`` → 1 (gone), ``UNLINK`` → 1 (gone), ``RENAME <graph> <dst>`` → True
+#: (source gone), ``RENAMENX`` → True (source gone), ``SET`` → True (the graph
+#: key replaced by a string), ``EXPIRE 1`` → True (gone after the TTL).
+#:
+#: ⛔ THE GUARD IS A PROPERTY, NOT A VERB LIST. The first cut of this fix
+#: enumerated four verbs and was BYPASSED by their siblings — the same defect
+#: one syntax over, which is why the rule now reads: any non-Cypher command
+#: that NAMES A GRAPH KEY is a keyspace write and carries L2's name rule,
+#: unless it is one of the few commands that only READ. A new write verb is
+#: therefore refused by DEFAULT instead of being silently forwarded, which is
+#: the direction this guard has to fail.
+#:
+#: The exempt set is the ``GRAPH.*`` families that carry their own guards (the
+#: ``GRAPH.QUERY`` bulk-wipe gap is pre-existing and documented in the module
+#: comment — it is not this issue's) plus the commands that only read a key.
+#: It grows only when a real caller needs a new read through this handle.
+_KEYSPACE_GUARD_EXEMPT = frozenset({
+    # the Cypher-carrying family: guarded by ``_guard_execute_command``
+    "GRAPH.QUERY", "GRAPH.RO_QUERY", "GRAPH.PROFILE", "GRAPH.EXPLAIN",
+    "GRAPH.SLOWLOG", "GRAPH.CONFIG", "GRAPH.LIST",
+    # reads: no value is replaced or removed (``EXISTS`` is ``sdk._graph_exists``)
+    "EXISTS", "TYPE", "TTL", "PTTL", "DBSIZE", "INFO", "PING", "KEYS",
+    "SCAN",
+})
+#: verbs that RENAME a graph key: the DESTINATION is replaced even when it does
+#: not exist yet, so both names carry the rule whenever the source is a graph.
+_KEYSPACE_RENAME_VERBS = frozenset({"RENAME", "RENAMENX"})
+#: the verbs NO single disposable name can authorize: they take every graph on
+#: the server (``SWAPDB``: every graph in both DBs).
 _KEYSPACE_GLOBAL_VERBS = frozenset({"FLUSHALL", "FLUSHDB", "SWAPDB"})
 
 
@@ -3551,10 +3578,13 @@ class _GuardedGraph:
     comment above. ``__getattr__`` below forwards only the remaining non-query
     attributes (``name``, ``call_procedure``, the index/constraint DDL, ...) to
     the underlying handle; #9209 DECLARED that remaining set in
-    ``_FORWARDED_NON_CYPHER_ATTRS`` and moved the whole-graph verbs (``delete``,
-    ``copy``) and the destructive command channel (``GRAPH.DELETE`` /
-    ``GRAPH.COPY`` / ``FLUSHALL`` / ``FLUSHDB``) out of it, onto the L2 name
-    check this wrapper already applies to a bulk ``DETACH DELETE``.
+    ``_FORWARDED_NON_CYPHER_ATTRS`` (extending it with the INSTANCE attributes a
+    class-level census cannot see) and moved the whole-graph verbs (``delete``,
+    ``copy``) and the destructive command channel out of it, onto the L2 name
+    check this wrapper already applies to a bulk ``DETACH DELETE``. That channel
+    is guarded by a PROPERTY, not a verb list: any command naming a graph KEY
+    (a graph is a Redis key of type ``graphdata``) carries the name rule, plus
+    the unconditional refusal of ``FLUSHALL`` / ``FLUSHDB`` / ``SWAPDB``.
     """
 
     __slots__ = ("_g", "_proj")
@@ -3710,41 +3740,68 @@ class _GuardedGraph:
                 "REFUSING to run GRAPH.COPY onto",
                 graph_name=_graph_name_text(target),
             )
-        elif verb in _KEYSPACE_DESTRUCTIVE_VERBS:
-            self._guard_keyspace_verb(verb, args)
+        elif verb in _KEYSPACE_RENAME_VERBS:
+            self._guard_keyspace_rename(verb, args)
+        elif verb not in _KEYSPACE_GUARD_EXEMPT:
+            # ANY other command is a suspected keyspace WRITE (#9209). It only
+            # carries the name rule if one of its arguments actually names a
+            # graph, so a lock/counter key is untouched — but a verb this list
+            # has never heard of cannot be silently forwarded just because it
+            # is new.
+            self._guard_keyspace_write(verb, args)
 
-    def _guard_keyspace_verb(self, verb: str, args) -> None:
-        """#9209 — a graph is a Redis KEY, so the keyspace verbs reach it.
+    def _guard_keyspace_write(self, verb: str, args) -> None:
+        """#9209 — a command that NAMES a graph key is a keyspace write.
 
-        MEASURED on the live engine through ``proj.g.execute_command``, on a
-        NON-test server graph: ``DEL <graph>`` → 1 (gone), ``UNLINK <graph>`` →
-        1 (gone), ``RENAME <graph> <dst>`` → True (source gone, ``dst`` holds
-        it). None of these is a ``GRAPH.*`` verb, so nothing above looks at
-        them, and a guard that enumerated only the ``GRAPH.*`` family would have
-        left the same hole one syntax over.
+        MEASURED on the live engine through ``proj.g.execute_command`` against a
+        NON-test graph: ``DEL <graph>`` → 1 (gone), ``UNLINK`` → 1 (gone),
+        ``SET <graph> hijack`` → True (the graph key replaced by a string),
+        ``EXPIRE <graph> 1`` → True (gone after the TTL), ``MOVE``/``RENAME``
+        relocate it. The class is "any command that writes a graph key", so the
+        rule is derived from the RESOLVED KEY, not from a list of destructive
+        verb spellings — the first cut of this guard enumerated four verbs and
+        was bypassed by ``RENAMENX``, ``SET`` and ``EXPIRE``, i.e. the same hole
+        one syntax over.
 
-        The rule stays PRECISE rather than blanket — a keyspace verb may act on
-        a key that is NOT a graph (a lock key, a counter), and refusing those
-        would be an over-block with no defect behind it — so the argument is
-        resolved against ``GRAPH.LIST`` and only a real graph key carries the
-        name rule. ``RENAME`` needs both names when the SOURCE is a graph: the
-        source is destroyed AND the destination is replaced (Redis ``RENAME``
-        overwrites), so checking only the source would let a disposable graph be
-        renamed onto a live one.
+        Precision is why the argument is resolved against ``GRAPH.LIST``: a
+        command may act on a key that is NOT a graph (a lock key, a counter),
+        and refusing those would be an over-block with no defect behind it.
 
         If ``GRAPH.LIST`` cannot be read the guard REFUSES: an unreadable list
         means "cannot prove this key is not a graph", and failing open here
         would be the silent-destruction direction the whole issue is about.
         """
-        targets = [k for k in (_graph_name_text(a) for a in args[1:]) if k]
-        if not targets:
+        candidates = [k for k in (_graph_name_text(a) for a in args[1:]) if k]
+        if not candidates:
             return
         graphs = self._graph_keys()
-        named = [k for k in targets if k in graphs]
-        if verb == "RENAME" and targets[0] in graphs:
-            # the destination is REPLACED even when it does not exist yet
-            named = targets[:2]
-        for key in named:
+        for key in candidates:
+            if key in graphs:
+                self._proj._assert_test_graph(
+                    f"REFUSING to run {verb} on the graph", graph_name=key)
+
+    def _guard_keyspace_rename(self, verb: str, args) -> None:
+        """#9209 — ``RENAME``/``RENAMENX`` destroy the source AND replace the dst.
+
+        Redis ``RENAME`` overwrites an existing destination, and the destination
+        need not exist yet for the rename to put a graph there — so checking only
+        the source would let a disposable graph land on a live name, and
+        checking only existing graphs would miss the destination entirely. When
+        the SOURCE is a graph, BOTH names carry the rule; when it is not, only a
+        destination that IS a graph can be destroyed (its value is replaced).
+        """
+        if len(args) < 3:
+            return  # the vendor's own arity error to raise, not a shape to read
+        source = _graph_name_text(args[1])
+        destination = _graph_name_text(args[2])
+        graphs = self._graph_keys()
+        if source in graphs:
+            targets = [source, destination]
+        else:
+            targets = [destination] if destination in graphs else []
+        for key in targets:
+            if not key:
+                continue
             self._proj._assert_test_graph(
                 f"REFUSING to run {verb}", graph_name=key)
 

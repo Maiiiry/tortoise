@@ -16,7 +16,17 @@ guard. But the whole-graph *destructive* verbs are not Cypher at all:
   cache-shaped graph that no journal backs — the second-writer surface §17.1
   forbids — under a name the write handle chose freely;
 * ``proj.g.execute_command("FLUSHALL")`` — every graph on the server, not just
-  this one.
+  this one;
+* and, because a graph is a Redis KEY of type ``graphdata``, every keyspace
+  write that names it: ``DEL``/``UNLINK`` (gone), ``SET`` (replaced by a
+  string), ``EXPIRE``/``PEXPIRE`` (gone after the TTL), ``MOVE``/``RENAME``/
+  ``RENAMENX`` (relocated) — all MEASURED on the pre-fix tree.
+
+The command-channel guard is deliberately a PROPERTY ("this command names a
+graph key"), not a list of dangerous verb spellings: the first cut of this fix
+enumerated four verbs and the reviewer bypassed it with ``RENAMENX``/``SET``/
+``EXPIRE`` — the same hole one syntax over. The parametrised samples below are
+evidence of the property, never a claim that they are the complete set.
 
 ``__getattr__`` forwards all of them verbatim, by construction, so no verb-level
 guard can see them. MEASURED on the pre-fix tree: on a NON-test server graph,
@@ -276,9 +286,29 @@ def test_graph_delete_is_refused_before_the_wire():
 # destructive capability one syntax over.
 
 
+#: The verbs below are not a CLAIM about which verbs are dangerous — they are
+#: samples of the property "this command writes a graph KEY". The guard decides
+#: on the resolved key, not on the verb, precisely because a verb list was
+#: bypassed by the family's siblings (`RENAMENX`, `SET`, `EXPIRE`) in the first
+#: cut of this fix. Each sample is a MEASURED pre-fix destroyer/relocator of a
+#: non-test graph through `proj.g.execute_command`.
+_KEYSPACE_WRITE_SAMPLES = [
+    ("DEL", lambda name: (name,)),
+    ("UNLINK", lambda name: (name,)),
+    ("SET", lambda name: (name, "hijacked")),
+    ("EXPIRE", lambda name: (name, 1)),
+    ("PEXPIRE", lambda name: (name, 1000)),
+    ("MOVE", lambda name: (name, 1)),
+    ("RENAMENX", lambda name: (name, name + "_dst")),
+]
+
+
 @_requires_falkordb
-@pytest.mark.parametrize("verb", ["DEL", "UNLINK"])
-def test_keyspace_removal_is_refused_on_a_non_test_graph(verb):
+@pytest.mark.parametrize(
+    ("verb", "argv"), _KEYSPACE_WRITE_SAMPLES,
+    ids=[verb for verb, _ in _KEYSPACE_WRITE_SAMPLES])
+def test_a_command_that_writes_a_graph_key_is_refused(verb, argv):
+    """A graph is a Redis KEY: any command that writes it carries the name rule."""
     name = _non_test_name(verb.lower())
     proj = FalkorProjection.from_uri(_uri(), graph_name=name)
     try:
@@ -287,11 +317,11 @@ def test_keyspace_removal_is_refused_on_a_non_test_graph(verb):
         assert before and before >= 1
 
         with pytest.raises(RuntimeError, match="non-test graph"):
-            proj.g.execute_command(verb, name)
+            proj.g.execute_command(verb, *argv(name))
 
-        assert _count(proj, name) == before, f"{verb} removed the graph"
+        assert _count(proj, name) == before, f"{verb} wrote/destroyed the graph"
     finally:
-        _drop(proj, name)
+        _drop(proj, name, name + "_dst")
         proj.close()
 
 
@@ -332,6 +362,42 @@ def test_keyspace_rename_is_refused_onto_a_non_test_destination():
         assert _count(proj, dst) == before, "the live destination was overwritten"
     finally:
         _drop(proj, src, dst)
+        proj.close()
+
+
+@_requires_falkordb
+def test_a_read_on_a_non_test_graph_is_allowed():
+    """No over-block: reads are exempt — `sdk._graph_exists` uses EXISTS."""
+    name = _non_test_name("exists")
+    proj = FalkorProjection.from_uri(_uri(), graph_name=name)
+    try:
+        proj.g.query("CREATE (p:Point {id:'p1'})")
+        assert proj.g.execute_command("EXISTS", name) == 1
+        assert proj.g.execute_command("TYPE", name)  # does not raise
+    finally:
+        _drop(proj, name)
+        proj.close()
+
+
+@_requires_falkordb
+def test_rename_of_a_non_graph_key_onto_a_live_graph_is_refused():
+    """``RENAME <string key> <live graph>`` REPLACES the graph's value."""
+    name = _test_name("ren3_src")
+    dst = _non_test_name("ren3_dst")
+    proj = FalkorProjection.from_uri(_uri(), graph_name=name)
+    plain = f"9209:plain:{uuid.uuid4().hex[:8]}"
+    try:
+        proj.g.query("CREATE (p:Point {id:'p1'})")
+        proj.db.select_graph(dst).query("CREATE (p:Point {id:'live'})")
+        proj.g.execute_command("SET", plain, "1")
+        before = _count(proj, dst)
+
+        with pytest.raises(RuntimeError, match="non-test graph"):
+            proj.g.execute_command("RENAME", plain, dst)
+
+        assert _count(proj, dst) == before, "the live graph's value was replaced"
+    finally:
+        _drop(proj, name, dst)
         proj.close()
 
 
