@@ -2719,23 +2719,31 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 #     is "no wipe by *forgetting* an opt-in"; those callers carry their own
 #     confirmation/authorization (e.g. ``team_delete`` requires the team name
 #     to match).
-#   * ``_GuardedGraph`` is a "guarded QUERY" wrapper, not a guarded handle, and
-#     only its ``query`` verb applies the bulk-wipe check. It EXPLICITLY
-#     defines ``query``, ``ro_query``, ``_query``, ``profile``, ``explain``
-#     and ``execute_command``; ``__getattr__`` forwards only the remaining,
-#     non-Cypher attributes (``name``, ``schema``, ...). So
-#     ``proj.g._query("MATCH (n) DETACH DELETE n")``, ``proj.g.profile(...)``
+#   * ``_GuardedGraph`` is a "guarded QUERY" wrapper, not a guarded handle. It
+#     EXPLICITLY defines ``query``, ``ro_query``, ``_query``, ``profile``,
+#     ``explain``, ``execute_command`` (and, since #9209, the WHOLE-GRAPH verbs
+#     ``delete`` and ``copy``, plus the command channel's ``GRAPH.DELETE`` /
+#     ``GRAPH.COPY`` / ``FLUSHALL`` / ``FLUSHDB``); ``__getattr__`` forwards
+#     only the remaining, non-Cypher attributes, which #9209 DECLARED in
+#     ``_FORWARDED_NON_CYPHER_ATTRS`` and a census test pins, so a vendor verb
+#     cannot arrive unexamined. Only ``query`` applies the bulk-wipe CLASSIFIER
+#     (#9209's verbs are name-checked directly, with no Cypher to classify).
+#     So ``proj.g._query("MATCH (n) DETACH DELETE n")``, ``proj.g.profile(...)``
 #     (PROFILE executes) and ``proj.g.execute_command("GRAPH.QUERY", <graph>,
-#     "MATCH (n) DETACH DELETE n")`` each reach a whole-graph wipe on a
-#     NON-test server graph passing NEITHER layer, and ``proj.g.delete()``
-#     (GRAPH.DELETE — e.g. tests/test_hosted_backup.py) is a non-Cypher verb
-#     no query guard can see at all. All of these PRE-DATE #2944 (``query`` was
-#     the only verb that checked ``_is_bulk_wipe`` before it too); they are
-#     recorded because this comment is the guard's own map of its holes.
-#     Closing them is a separate change, not a doc fix: it first needs a
-#     decision on ``_is_bulk_wipe``'s scope (#3007/#3037), because more verbs
-#     applying a classifier with those two defects would REFUSE more
-#     legitimate operations than it catches.
+#     "MATCH (n) DETACH DELETE n")`` still reach a whole-graph wipe on a
+#     NON-test server graph passing NEITHER layer — these PRE-DATE #2944
+#     (``query`` was the only verb that checked ``_is_bulk_wipe`` before it
+#     too) and are recorded because this comment is the guard's own map of its
+#     holes. ``proj.g.delete()`` / ``proj.g.copy(dst)`` used to be the same class
+#     of hole (``GRAPH.DELETE`` / ``GRAPH.COPY`` — e.g. tests/test_hosted_backup.py,
+#     tests/test_graphcopy_boolean_index_3154.py) and are now name-checked: the
+#     engine refuses an EXISTING ``GRAPH.COPY`` destination (measured), so the
+#     copy guard is about minting an unjournalled cache-shaped graph, not about
+#     destroying one.
+#     Closing the remaining raw-query verbs is a separate change, not a doc fix:
+#     it first needs a decision on ``_is_bulk_wipe``'s scope (#3007/#3037),
+#     because more verbs applying a classifier with those two defects would
+#     REFUSE more legitimate operations than it catches.
 #   * ``_is_bulk_wipe`` USED TO over-classify label/LIMIT/WITH-scoped deletes and
 #     ``WHERE id(n) IN [..]``-scoped ones, so ``event_store.purge_overflow`` was
 #     refused on a non-test server graph and
@@ -3294,19 +3302,29 @@ def _journal_safe_params(params, cypher=None):
 # that 300+-site surface is §17.1's mechanism (1), the atomic write, and it is
 # recorded as still-open on `#7951` rather than papered over here.
 #
-# ⛔ THE RESIDUAL IS THREE ESCAPES, NOT ONE — named so it is stated, not
+# ⛔ THE RESIDUAL IS FOUR ESCAPES, NOT THREE — named so it is stated, not
 # discovered. A writer that wants to write this cache directly has:
 #   1. `proj.g.query("CREATE …")`     — the guarded handle itself (the SDK's
 #      own live lane, above);
 #   2. `proj.g._g.query("CREATE …")`  — one private hop past the handle into
 #      the raw `_GuardedGraph`;
 #   3. `proj.db.select_graph(<g>).query("CREATE …")` — straight at the
-#      falkordb client, naming ANY graph.
-# All three are verified ALLOWED against a journal-backed projection. (2) and
-# (3) are the same class as (1) — they bypass the same fold — and none of the
-# three is guarded in this increment. They are the surface §17.1's atomic
-# write has to close; a lexical inventory cannot, because each is one hop
-# below anything a runtime signal is placed on.
+#      falkordb client, naming ANY graph;
+#   4. `proj.g.copy(<dst>)` / `proj.g.execute_command("GRAPH.COPY", …)` —
+#      `GRAPH.COPY` mints a whole graph holding an unjournalled duplicate of
+#      this cache (never a REPLACEMENT: the engine refuses an existing
+#      destination, measured). #9209 did NOT close this; it put the same L2
+#      name rule on it that the Cypher verbs use, so the duplicate can only be
+#      minted under a disposable name. A non-disposable destination is now
+#      refused; a `test_` one still mints an unjournalled cache-shaped graph.
+# All four are ALLOWED (outside the L2 name rule) against a journal-backed
+# projection. (2) and (3) are the same class as (1) — they bypass the same fold
+# — and none of the four is closed in this increment. They are the surface
+# §17.1's atomic write has to close; a lexical inventory cannot, because each is
+# one hop below anything a runtime signal is placed on. (The whole-graph
+# DESTRUCTIVE verbs are the OTHER axis and are closed on the write handle since
+# #9209: `proj.g.delete()`, `GRAPH.DELETE`, `FLUSHALL`/`FLUSHDB` refuse on a
+# non-disposable graph, unconditionally for the flush forms.)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3412,6 +3430,58 @@ def _graph_metadata_write_scope(reason: str = "graph-metadata"):
     return _cache_write_authorized(reason)
 
 
+def _graph_name_text(value) -> str:
+    """Read a graph-name ARGUMENT as text (#9209).
+
+    A name arrives from the vendor's own call shapes, so it can be ``str``,
+    ``bytes`` or absent. Anything that is not text cannot be shown to be a
+    disposable test graph, so it degrades to ``""`` — which the name rule
+    refuses. Fails closed, and never guesses a name into existence.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value if isinstance(value, str) else ""
+
+
+#: #9209 — the non-Cypher verbs of ``falkordb.Graph`` that this wrapper FORWARDS
+#: untouched (``__getattr__``), each with the reason it is not a whole-graph
+#: destructive verb. They are NOT guards: the wrapper has no business vetting a
+#: read, a schema drop that costs query speed and no data, or the server's own
+#: slowlog. The WHOLE-GRAPH verbs (``delete``/``copy``) and the raw command
+#: channel's equivalents are explicitly defined on the wrapper and refuse on a
+#: non-disposable graph — see ``_GuardedGraph.delete`` / ``.copy`` /
+#: ``.execute_command``.
+#:
+#: The census test (``tests/test_9209_handle_noncypher_verbs.py``) fails when
+#: ``falkordb`` adds a public verb that is neither guarded nor declared here, so
+#: a vendor upgrade cannot silently widen what this handle forwards.
+_FORWARDED_NON_CYPHER_ATTRS = frozenset({
+#   reads / introspection — no write of any kind
+    "name", "list_indices", "list_constraints", "slowlog",
+#   the slowlog is server bookkeeping; resetting it loses log entries, not data
+    "slowlog_reset",
+#   index / constraint DDL: schema, never corpus state. A dropped index costs
+#   query speed and is rebuilt by ``_ensure_indexes``; no record describes it.
+    "create_node_range_index", "create_node_fulltext_index",
+    "create_node_vector_index", "create_node_unique_constraint",
+    "create_node_mandatory_constraint",
+    "create_edge_range_index", "create_edge_fulltext_index",
+    "create_edge_vector_index", "create_edge_unique_constraint",
+    "create_edge_mandatory_constraint",
+    "drop_node_range_index", "drop_node_fulltext_index",
+    "drop_node_vector_index", "drop_node_unique_constraint",
+    "drop_node_mandatory_constraint",
+    "drop_edge_range_index", "drop_edge_fulltext_index",
+    "drop_edge_vector_index", "drop_edge_unique_constraint",
+    "drop_edge_mandatory_constraint",
+#   ``call_procedure`` is an OPEN escape, named rather than claimed closed: a
+#   procedure can drop an index or the whole graph, and this wrapper cannot
+#   enumerate the server's procedure catalogue. Same class as ``proj.db`` — a
+#   caller that reaches the raw surface can build its own client anyway.
+    "call_procedure",
+})
+
+
 class _GuardedGraph:
     """Wrapper around the FalkorDB Graph handle that guards bulk graph-wipe queries.
 
@@ -3452,7 +3522,12 @@ class _GuardedGraph:
     the text the #8479 scan reads — see
     ``cypher_guard._guard_numeric_literals``). See KNOWN GAPS in the module
     comment above. ``__getattr__`` below forwards only the remaining non-query
-    attributes (``name``, ``delete``, ``schema``, ...) to the underlying handle.
+    attributes (``name``, ``call_procedure``, the index/constraint DDL, ...) to
+    the underlying handle; #9209 DECLARED that remaining set in
+    ``_FORWARDED_NON_CYPHER_ATTRS`` and moved the whole-graph verbs (``delete``,
+    ``copy``) and the destructive command channel (``GRAPH.DELETE`` /
+    ``GRAPH.COPY`` / ``FLUSHALL`` / ``FLUSHDB``) out of it, onto the L2 name
+    check this wrapper already applies to a bulk ``DETACH DELETE``.
     """
 
     __slots__ = ("_g", "_proj")
@@ -3547,7 +3622,103 @@ class _GuardedGraph:
         # #7162: the returned args carry the `WITH *` barrier when the shape
         # needs it, so they — not the original `args` — are what gets dispatched.
         args = _guard_execute_command(args, getattr(self._g, "client", None))
+        # #9209: the command channel's DESTRUCTIVE verbs are not Cypher, so
+        # every verb-level guard above forwards them untouched. Refuse them
+        # here, before the wire — see `delete` / `copy` below for the verb form.
+        self._guard_whole_graph_command(args)
         return self._g.execute_command(*args, **kwargs)
+
+    def _guard_whole_graph_command(self, args) -> None:
+        """#9209: refuse the command channel's whole-graph verbs.
+
+        ``GRAPH.DELETE <g>`` destroys a graph; ``GRAPH.COPY <src> <dst>`` writes
+        a whole unjournalled duplicate of the derived cache under ``dst`` (the
+        engine refuses an EXISTING destination — measured: ``ResponseError:
+        destination key already exists`` — so a copy cannot replace a live
+        cache, but it does mint a new graph that no journal backs, which is the
+        second-writer surface §17.1 forbids); ``FLUSHALL`` / ``FLUSHDB`` reach
+        EVERY graph on the server. None of them is Cypher, so
+        ``_guard_execute_command`` (which inspects only the four ``GRAPH.*``
+        query verbs) never looks at them.
+
+        The name rule is L2's, unchanged: a non-disposable SERVER graph is
+        refused, a ``test_``/``tortoise_test`` graph is allowed, and embedded is
+        exempt — identical to what ``proj.g.query`` already does with a bulk
+        ``DETACH DELETE``, so the two lanes cannot disagree about which graphs
+        are disposable. ``FLUSHALL``/``FLUSHDB`` get NO exemption: they take
+        every graph, including graphs on the same server no journal backs, so no
+        single name can authorize them (see the "do NOT FLUSHALL" note on the
+        truncation path above).
+        """
+        if not args:
+            return
+        verb = args[0]
+        if isinstance(verb, bytes):
+            verb = verb.decode("utf-8", "replace")
+        if not isinstance(verb, str):
+            return  # the vendor's own error to raise; not a shape we can read
+        verb = verb.upper()
+        if verb in ("FLUSHALL", "FLUSHDB"):
+            raise RuntimeError(
+                "Graph guard: REFUSING FLUSHALL/FLUSHDB through the write "
+                "handle — it deletes EVERY graph on the server, not just this "
+                "projection's disposable one. Delete the specific graph "
+                "(test_* / tortoise_test* graphs are allowed) or use "
+                "FalkorProjection.rebuild(confirm_destructive=True). See #9209."
+            )
+        if verb == "GRAPH.DELETE":
+            target = args[1] if len(args) > 1 else self._proj.graph_name
+            self._proj._assert_test_graph(
+                "REFUSING to run GRAPH.DELETE",
+                graph_name=_graph_name_text(target),
+            )
+        elif verb == "GRAPH.COPY":
+            # GRAPH.COPY <src> <dst>: the DESTINATION is what is written, and it
+            # comes into existence holding a whole unjournalled duplicate of this
+            # projection's derived cache. It is NOT a destruction (the engine
+            # refuses an existing destination), so the name rule here reads
+            # "may a cache be forked outside the journal into this name" — the
+            # same disposable-name test the destructive verbs use.
+            target = args[2] if len(args) > 2 else None
+            self._proj._assert_test_graph(
+                "REFUSING to run GRAPH.COPY onto",
+                graph_name=_graph_name_text(target),
+            )
+
+    def delete(self) -> None:
+        """``GRAPH.DELETE`` — L2 applies (#9209).
+
+        The vendor's ``Graph.delete`` issues the command through the
+        per-instance ``execute_command`` binding, so which class-level guard is
+        installed does not decide whether it is checked at all. Defining the
+        verb HERE is what makes it checked: ``__getattr__`` no longer forwards
+        it. Test graphs and embedded mode keep working (the same L2 exemption
+        the Cypher verbs use).
+        """
+        self._proj._assert_test_graph(
+            "REFUSING to run GRAPH.DELETE",
+            graph_name=self._proj.graph_name,
+        )
+        return self._g.delete()
+
+    def copy(self, clone):
+        """``GRAPH.COPY`` — the DESTINATION carries the name rule (#9209).
+
+        The source is only read; the destination is WRITTEN, and it is created
+        holding a whole unjournalled duplicate of this projection's derived
+        cache — a graph that looks like a cache but that no journal backs, i.e.
+        the second-writer surface §17.1 forbids. (MEASURED: the engine refuses
+        an EXISTING destination — ``ResponseError: destination key already
+        exists`` — so ``copy`` cannot destroy a live cache; the guard is about
+        minting, not deleting, and its docstring says so.) A ``test_`` /
+        ``tortoise_test`` destination (the suite's own graph-copy regressions)
+        still works, and so does embedded mode.
+        """
+        self._proj._assert_test_graph(
+            "REFUSING to run GRAPH.COPY onto",
+            graph_name=_graph_name_text(clone),
+        )
+        return self._g.copy(clone)
 
     def __getattr__(self, name):
         return getattr(self._g, name)
@@ -13886,20 +14057,28 @@ class FalkorProjection(
         # L2: name/embedded check. Redundant with _GuardedGraph.query below
         # on purpose — this method is the readable contract; the guarded
         # handle is the last line of defence for every other caller that goes
-        # through it. Callers on ``proj.db``, on the wrapper's OTHER query
+        # through it. Callers on ``proj.db``, or on the wrapper's OTHER query
         # verbs (``proj.g._query`` / ``profile`` / ``execute_command`` — only
-        # ``query`` applies the bulk-wipe check), or on the non-Cypher verbs
-        # ``_GuardedGraph.__getattr__`` forwards (e.g. ``proj.g.delete()`` →
-        # GRAPH.DELETE) bypass BOTH layers — see the KNOWN GAPS note in the
-        # module comment.
+        # ``query`` applies the bulk-wipe check) bypass BOTH layers — see the
+        # KNOWN GAPS note in the module comment. The whole-graph NON-Cypher
+        # verbs (``proj.g.delete()`` / ``.copy()`` / ``GRAPH.DELETE`` /
+        # ``GRAPH.COPY`` / ``FLUSHALL``) are NOT in that list since #9209: they
+        # carry the same L2 name check on the verb itself.
         self._assert_test_graph(
             f"REFUSING to run bulk DETACH DELETE on non-test graph "
             f"({operation})"
         )
         self.g.query("MATCH (n) DETACH DELETE n")
 
-    def _assert_test_graph(self, reason: str = "") -> None:
+    def _assert_test_graph(self, reason: str = "", *,
+                           graph_name: str | None = None) -> None:
         """L2 of the destructive-op guard: refuse bulk wipe on a non-test graph.
+
+        ``graph_name`` (#9209): the graph the DESTRUCTIVE OPERATION would act
+        on, when that is not this projection's own graph — ``GRAPH.DELETE
+        <other>`` and ``GRAPH.COPY <src> <dst>`` name their target as an
+        ARGUMENT. Defaults to ``self._graph_name``, which is every pre-existing
+        caller's meaning.
 
         Test graphs must start with 'test_' or 'tortoise_test'.
         Embedded mode (path=) is exempt from the NAME check — the graph-name
@@ -13922,10 +14101,11 @@ class FalkorProjection(
         """
         if getattr(self, "_is_embedded", False):
             return
-        if not self._graph_name.startswith(("test_", "tortoise_test")):
+        name = self._graph_name if graph_name is None else graph_name
+        if not name.startswith(("test_", "tortoise_test")):
             msg = (
                 f"Graph guard: operation blocked on non-test graph "
-                f"'{self._graph_name}'. "
+                f"'{name}'. "
                 f"{reason} — destructive bulk ops require a graph name starting "
                 f"with 'test_' or 'tortoise_test'."
             ).rstrip()
