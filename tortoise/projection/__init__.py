@@ -3745,9 +3745,10 @@ class _GuardedGraph:
 
         Both refusals are the Cypher wipe path's, in the same order
         (``FalkorProjection.query``): the §17.1 declaration first (a
-        journal-backed projection needs a declared lane — the sanctioned wipe,
-        ``_wipe_all_nodes``, runs inside ``_replay_write_scope()``), then L2's
-        name rule.
+        journal-backed projection needs a declared lane — the sanctioned wipe
+        is ``_wipe_all_nodes``, which takes L1's explicit ``confirm_destructive``
+        opt-in, and ``rebuild`` runs its wipe inside ``_replay_write_scope()``),
+        then L2's name rule.
         """
         self._refuse_undeclared_wipe("GRAPH.DELETE")
         return self._g.delete()
@@ -3777,8 +3778,9 @@ class _GuardedGraph:
                 f"(docs/architecture/STORAGE-ARCHITECTURE.md §17.1) and no "
                 f"write lane is declared. A whole-graph destruction has no "
                 f"journal record, so replay cannot restore it; the sanctioned "
-                f"wipe is `FalkorProjection._wipe_all_nodes`, which runs inside "
-                f"`_replay_write_scope()`. statement={what}"
+                f"wipe is `FalkorProjection._wipe_all_nodes`, which takes L1's "
+                f"explicit `confirm_destructive` opt-in (the `rebuild` lane "
+                f"runs it inside `_replay_write_scope()`). statement={what}"
             )
         _assert_disposable_server_graph(
             str(target),
