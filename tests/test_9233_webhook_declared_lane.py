@@ -286,11 +286,14 @@ def test_every_webhook_write_declares_its_lane(sdk_with_journal, monkeypatch):
 
 
 def test_the_lane_name_is_pinned():
-    """The name is what a refusal message and §17.1's carve-out paragraph cite.
+    """The declaration REASON is what the pin reads back at the write handle.
 
-    Read against a LITERAL, not against `wd.WEBHOOK_WRITE_LANE` — an expectation
-    read from the code under test cannot fail when that code is renamed, and a
-    rename would leave every other test in this file green (#9233 review P2).
+    It is not rendered into a refusal (`_cache_write_authorized`: a refusal fires
+    precisely when the var is None, so there is no reason in flight to print) —
+    which is why this is a name a TEST cites, not a message an operator sees.
+    Read against a LITERAL, not against `wd.WEBHOOK_WRITE_LANE`: an expectation
+    read from the code under test cannot fail when that code is renamed (#9233
+    review P2).
     """
     from tortoise import webhook_delivery as wd
 
@@ -409,6 +412,60 @@ def test_a_cursor_failure_is_reported_as_failed_not_delivered(
     assert summary["failed"] >= 1, f"the failure is not counted at all: {summary}"
 
 
+def test_a_refused_failure_write_is_not_swallowed(sdk_with_journal,
+                                                  monkeypatch):
+    """The FAILURE branch's refusal must be loud too.
+
+    `_mark_failed` writes `SET s.attempts=…` and the next backoff. Swallowed, the
+    attempt is never recorded: the subscription is immediately due again and
+    `max_attempts` can never trip, so a dead endpoint is retried forever with no
+    disable. The `refuse=True` walks cannot cover this (the declaration IS in
+    flight there), so it is aimed here (#9233 review round 2).
+    """
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 2)
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 types=["PointAdded"], description="9233 attempts")
+
+    _instrument(monkeypatch, refuse="SET s.attempts=")
+    with pytest.raises(DirectCacheWriteRefused):
+        wd.dispatch_pending(proj, transport=_ScriptedTransport([500]))
+
+    assert wd.get_subscription(proj, sub["sub_id"])["attempts"] == 0, (
+        "the fixture refused the wrong statement — the attempt landed, so this "
+        "test proves nothing about a refused failure write"
+    )
+
+
+def test_a_receipt_failure_does_not_un_deliver_the_event(
+        sdk_with_journal, monkeypatch):
+    """The cursor is the COMMIT POINT; the receipt is its audit.
+
+    `_mark_delivered` writes the cursor first, so a receipt failure means the
+    delivery already committed — reporting it as failed and breaking the batch
+    skipped the remaining events and stalled the tenant (#9233 review round 2).
+    """
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 3)
+    wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                           types=["PointAdded"], description="9233 receipt")
+
+    def _no_receipt(*_a, **_kw):
+        raise RuntimeError("receipt write hiccup")
+
+    monkeypatch.setattr(wd, "_write_receipt", _no_receipt)
+    summary = wd.dispatch_pending(proj, transport=_ScriptedTransport([200]))
+
+    assert summary["failed"] == 0 and summary["delivered"] == 3, (
+        "a receipt failure was reported as a failed delivery, so the batch "
+        f"stalled on an already-committed event: {summary}"
+    )
+
+
 def test_a_refused_index_ddl_does_not_cache_the_schema_flag(
         sdk_with_journal, monkeypatch):
     """`ensure_subscription_schema` swallows "the index already exists" on
@@ -473,6 +530,15 @@ def test_every_declared_statement_writes_only_declared_labels(
 
     declared = [c for c, r, w in seen if w and r is not None]
     assert declared, "no declared statement was recorded — the walk is stale"
+
+    # A LABEL-LESS write (`MATCH (n) DETACH DELETE n`, `CREATE (n {…})`) has an
+    # empty label set, so the subset check below would pass it — the class check
+    # is fail-open exactly where a bulk wipe lives (#9233 review round 2).
+    label_less = [c for c in declared if not _labels_written(c)]
+    assert not label_less, (
+        "a declared statement writes NO named label (a bulk wipe or an "
+        f"unlabelled create): {label_less}"
+    )
 
     offenders = {c: _labels_written(c) for c in declared
                  if _labels_written(c) - _DECLARED_LABELS}

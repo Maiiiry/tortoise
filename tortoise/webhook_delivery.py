@@ -486,6 +486,8 @@ def _write_receipt(proj, *, sub_id: str, event: dict, attempt: int, status: str,
         },
     )
     # Prune: keep the newest MAX_RECEIPTS for this subscription.
+    from tortoise.projection import DirectCacheWriteRefused
+
     try:
         _run(proj,
             "MATCH (r:DeliveryReceipt {sub_id:$sid}) "
@@ -493,6 +495,11 @@ def _write_receipt(proj, *, sub_id: str, event: dict, attempt: int, status: str,
             "DETACH DELETE r",
             params={"sid": sub_id, "keep": MAX_RECEIPTS},
         )
+    except DirectCacheWriteRefused:
+        # Not "the prune is optional": a REFUSAL means the statement never
+        # reached the store, so it propagates like every other refusal on this
+        # path (see `_run`). The broad clause is for an engine that cannot prune.
+        raise
     except Exception:  # noqa: BLE001, RUF100
         logger.debug("webhook_delivery: receipt prune failed for %s", sub_id)
 
@@ -1066,6 +1073,19 @@ def _due_subscriptions(proj, now: datetime,
 
 def _mark_delivered(proj, sub: dict, event: dict, http_status: int | None,
                     now: datetime, duration_ms: int) -> None:
+    """Advance the cursor (the at-least-once COMMIT POINT), then record a receipt.
+
+    ⛔ THE TWO WRITES ARE NOT ONE STEP. The cursor moving IS the commit — a crash
+    after it must never re-deliver — so a cursor failure propagates (the caller
+    reports the event as FAILED and retries it first). The RECEIPT is the audit
+    of an already-committed delivery: a receipt failure is logged and does not
+    un-deliver the event, but a REFUSAL still propagates (it means the statement
+    never landed, not that the store hiccuped). Conflating the two reported a
+    committed delivery as failed and stalled the rest of the batch (#9233 review
+    round 2).
+    """
+    from tortoise.projection import DirectCacheWriteRefused
+
     _run(proj,
         "MATCH (s:ContextSubscription {sub_id:$id}) SET s.cursor=$cursor, "
         "s.attempts=0, s.next_attempt_at=NULL, s.delivered=s.delivered+1, "
@@ -1073,10 +1093,17 @@ def _mark_delivered(proj, sub: dict, event: dict, http_status: int | None,
         params={"id": sub["sub_id"], "cursor": int(event.get("seq") or 0),
                 "ts": _iso(now)},
     )
-    _write_receipt(proj, sub_id=sub["sub_id"], event=event,
-                   attempt=int(sub.get("attempts") or 0) + 1, status="delivered",
-                   http_status=http_status, error=None, now=now,
-                   duration_ms=duration_ms)
+    try:
+        _write_receipt(proj, sub_id=sub["sub_id"], event=event,
+                       attempt=int(sub.get("attempts") or 0) + 1,
+                       status="delivered", http_status=http_status, error=None,
+                       now=now, duration_ms=duration_ms)
+    except DirectCacheWriteRefused:
+        raise
+    except Exception as e:  # noqa: BLE001, RUF100
+        logger.warning(
+            "webhook_delivery: delivered receipt not recorded for %s: %s",
+            sub.get("sub_id"), redact_error(e))
 
 
 def _mark_failed(proj, sub: dict, event: dict, http_status: int | None,
@@ -1116,7 +1143,12 @@ def _mark_failed(proj, sub: dict, event: dict, http_status: int | None,
 
 def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                      batch: int = DEFAULT_BATCH) -> dict:
-    """Push pending events to every due subscription. NEVER raises.
+    """Push pending events to every due subscription. Best-effort: see the ONE exception.
+
+    Never raises for a subscriber, transport or graph failure — but a §17.1
+    REFUSAL of this module's own write (`DirectCacheWriteRefused`) DOES
+    propagate: it means the statement never landed, so counting it as a delivery
+    is a cursor that never advances (#9233, contract 3 in the module docstring).
 
     Three triggers, one predicate (#8098): the end of a tenant's dream cycle
     (``hosted_api._dream_worker`` — the cadence for NEW events), the SCHEDULED
@@ -1211,12 +1243,13 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                     # than counted (#9233 review P1).
                     raise
                 except Exception as e:
-                    # The POST landed but the CURSOR did not. At-least-once says
-                    # re-deliver, so the event must not be counted as delivered:
-                    # reporting `delivered` while the cursor is unmoved is the
-                    # infinite re-POST this counter exists to make visible, and
-                    # `max_attempts` can never trip because the success path
-                    # never calls `_mark_failed`.
+                    # `_mark_delivered` advances the cursor FIRST and only lets a
+                    # CURSOR failure escape (a receipt failure is logged there).
+                    # At-least-once says re-deliver, so the event must not be
+                    # counted as delivered: reporting `delivered` with the cursor
+                    # unmoved is the infinite re-POST this counter exists to make
+                    # visible, and `max_attempts` can never trip because the
+                    # success path never calls `_mark_failed`.
                     logger.warning("webhook_delivery: cursor write failed for %s: %s",
                                    sub.get("sub_id"), redact_error(e))
                     summary["failed"] += 1

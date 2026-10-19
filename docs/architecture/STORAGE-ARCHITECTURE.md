@@ -1515,7 +1515,7 @@ Pins: `tests/test_9079_ep_epoch_declared.py`. The obligations' source of truth i
 
 **⚠️ THE CARVE-OUT IS NOT ONE LANE — it is THREE declared classes, each with its own name, obligations and pin.** The graph-metadata scope above is the first; the other two declare through the SAME `_cache_write_authorized` primitive but own different obligations, so they do not delegate to `_graph_metadata_write_scope` (its docstring carries the epoch's claims, and inheriting one you contradict is how a declaration starts lying). This paragraph is the ledger a reader auditing §17.1 for second writers reads, so a new lane belongs here in the PR that declares it:
 
-| lane | name (the string a refusal cites) | what it writes | recovery for the class | pin |
+| lane | declaration reason (read back at the write handle by its pin — never rendered into a refusal) | what it writes | recovery for the class | pin |
 |---|---|---|---|---|
 | graph-metadata | `graph-metadata:ep-epoch` (`#9123`) | `:EpMeta.ep_version`, the monotonic EP ordering counter | a rebuild RESETS it, and replayed stamps sit ahead until it re-climbs (`#5166`) | `tests/test_9079_ep_epoch_declared.py` |
 | onboarding metadata | `onboarding.metadata` (`#9121`) | `:OnboardingState` / `:OnboardingStep` + the `onboards` / `COMPLETED_STEP` edges | capture-and-RESTORE by the replay engines (`#4641`), not replay; the JSONL-fallback restore has no capture (a stated pre-existing hole) | `tests/test_9079_onboarding_declared_lane.py` |

@@ -144,6 +144,7 @@ from tortoise.monitoring import (
 )
 from tortoise.onboarding import state as _os  # #2001 (W5) canonical FLOW-state module
 from tortoise.projection import (
+    DirectCacheWriteRefused,  # #9233: §17.1 refusal is not a crypto failure
     is_missing_graph_error,  # #2163: absent-graph GRAPH.DELETE family == success
     journal_mint_write_ahead,  # #3390: journal the intended name BEFORE the CREATE
 )
@@ -2881,11 +2882,15 @@ async def _dispatch_webhooks(org_id: str, graph_namespace: str | None = None,
     (``_webhook_retry_sweep_pass``, #8098). Nothing on the write path ever
     awaits this: a capture must stay 2xx regardless of a subscriber's endpoint.
 
-    Best-effort by construction. ``dispatch_pending`` itself never raises; this
-    wrapper additionally catches the SDK/edge failures around it (an
-    unreachable graph, a build failure) and logs — a delivery problem must
-    never surface as a dream failure, and it must never abort the worker (the
-    roots are already drained; a raise here would be read as a dream bug).
+    Best-effort by construction. ``dispatch_pending`` does not raise for a
+    subscriber, transport or graph failure; this wrapper additionally catches
+    everything above it (an unreachable graph, a build failure) and logs — a
+    delivery problem must never surface as a dream failure, and it must never
+    abort the worker (the roots are already drained; a raise here would be read
+    as a dream bug). ⚠️ That INCLUDES a §17.1 refusal of the store's own write
+    (#9233), which is deliberately loud at the dispatcher: swallowing it here is
+    the documented behaviour of this wrapper, and the refusal is logged as the
+    error it is rather than as a delivery.
 
     Returns the dispatcher summary (``None`` when it could not run) so a caller
     can aggregate/assert on what actually happened.
@@ -27734,6 +27739,17 @@ async def create_context_subscription(
         return await asyncio.to_thread(_create)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    except DirectCacheWriteRefused as e:
+        # §17.1's third door refused the store's own write (#9233). This is NOT
+        # the encryption-key failure below (both are RuntimeError subclasses,
+        # which is why this arm must come first): the operator needs §17.1, not
+        # a crypto knob.
+        raise HTTPException(
+            status_code=500,
+            detail="webhook subscription could not be recorded: the projection "
+                   "refused a cache write (§17.1 — the cache is derived from "
+                   "the journal)",
+        ) from e
     except RuntimeError as e:
         # TORTOISE_ENCRYPTION_KEY unset/malformed (crypto fail-loud contract).
         raise HTTPException(
