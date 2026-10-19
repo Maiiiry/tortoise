@@ -969,8 +969,13 @@ _STALE_BASIS_CLAIM_RE = re.compile(r"\bsince the \d{4}-\d{2}-\d{2} refresh\b",
                                    re.IGNORECASE)
 
 # The separators that bound a CLAUSE inside a note, so a stale claim can be cut
-# out without taking its neighbours with it.
-_CLAUSE_SEPARATORS = (" — ", "; ", ". ")
+# out without taking its neighbours with it. A COMMA is a separator here because
+# prose in this map writes clauses that way: `#2350: its FIRST weight, this value
+# is a CI measurement since the 2026-10-17 refresh, and the #4348 trap says do not
+# drop the row` has no `—`/`;`/`.` anywhere near the clause, so without `", "`
+# both bounds stayed at the extremes and the WHOLE note was cleared — the same
+# record loss the clause-by-clause strip exists to prevent (#9134 review, P2).
+_CLAUSE_SEPARATORS = (" — ", "; ", ". ", ", ")
 
 # A basis a PREVIOUS render of ours appended to the end of a tail
 # (` — ci-timing top-15 2026-10-19 (run 39191149586)[; was 42.4 | : top-15 saw …]`).
@@ -1018,9 +1023,38 @@ def _is_stale_provenance(tail: str) -> bool:
                 or _STALE_BASIS_CLAIM_RE.search(body))
 
 
+# OUR OWN basis strings — the shapes `render_refreshed_manifest` writes. A note
+# is "pure provenance" only when it is NOTHING BUT these, joined by ` — `:
+# `#9017 CI-junit 2026-10-18 (run 39165691659); was 42.6`,
+# `ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 3 of 4 testcases =
+# 274.5s, a LOWER bound; kept 275.9`. `_PURE_PROVENANCE_RE` is only a PREFIX
+# match, so using it alone read `#9017 CI-junit 2026-10-18 (run 42); was 180.7 —
+# do not drop this row; required for the #4348 floor` as "nothing survives" and
+# deleted the instruction with it (#9134 review, P2). The remainder after these
+# tokens must be separators only.
+_OUR_BASIS_TOKEN_RE = re.compile(
+    r"(?:\d+\s+)?"          # `#9017 ` — `_note_body` strips the `#`
+    r"(?:ci-timing\s+top-15|CI-junit)\s+\d{4}-\d{2}-\d{2}"
+    r"(?:\s*\(run [^)]*\))?"
+    r"(?::[^—]*|;[ \t]*was[ \t]+[0-9]+(?:\.[0-9]+)?)?"
+    r"|\d{4}-\d{2}-\d{2}(?!\S)",
+    re.IGNORECASE)
+# …and what may be left between two such tokens once they are removed.
+_BASIS_GLUE_RE = re.compile(r"^[\s—–\-;,.()]*$")
+
+
 def _is_pure_provenance(tail: str) -> bool:
-    """Is the whole note nothing but the citation (so a re-base leaves nothing)?"""
-    return bool(_PURE_PROVENANCE_RE.match(_note_body(tail)))
+    """Is the whole note nothing but OUR basis citations (so a re-base leaves
+    nothing but what this render writes)?
+
+    Built by SUBTRACTION rather than by a prefix match: every basis token is
+    removed, and what remains must be separators only. A note that opens with a
+    citation and continues into a rationale is therefore NOT pure, which is the
+    direction that cannot lose a record — misreading pure as impure only keeps a
+    slightly stale citation, while the reverse deletes the rationale.
+    """
+    remainder = _OUR_BASIS_TOKEN_RE.sub("", _note_body(tail))
+    return bool(_BASIS_GLUE_RE.match(remainder))
 
 
 def _strip_stale_basis_claim(tail: str) -> str:

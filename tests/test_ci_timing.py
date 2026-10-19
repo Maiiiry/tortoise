@@ -1278,17 +1278,69 @@ def test_an_unchanged_row_keeps_its_provenance_tail(tmp_path: Path) -> None:
             "(run 39165691659); was 11.0") in text
 
 
+def test_a_note_that_OPENS_with_a_citation_is_not_deleted_whole() -> None:
+    """`_PURE_PROVENANCE_RE` is a PREFIX match, so "opens with a citation" must
+    not be read as "is nothing but a citation".
+
+    `# #9017 CI-junit 2026-10-18 (run 42); was 180.7 — do not drop this row` was
+    classified pure, and the re-base then cleared the whole tail — losing the
+    instruction the note exists for (#9134 review, P2). A note that is genuinely
+    only our basis strings must still classify pure, so the map does not grow a
+    sentence per refresh.
+    """
+    pure = (
+        "  # #9017 CI-junit 2026-10-18 (run 39165691659); was 42.6",
+        "  # ci-timing top-15 2026-10-19 (run 39191149586); was 11.8",
+        "  # #9017 CI-junit 2026-10-18 (run 1); was 20.3 — ci-timing top-15 "
+        "2026-10-19 (run 2): top-15 saw 2 of 15 testcases = 49.2s, a LOWER "
+        "bound; kept 49.2",
+    )
+    for tail in pure:
+        assert ci_timing._is_pure_provenance(tail), tail
+    impure = (
+        "  # #9017 CI-junit 2026-10-18 (run 42); was 180.7 — do not drop this "
+        "row; required for the #4348 floor",
+        "  # #2350: its FIRST weight — this value is a CI measurement since the "
+        "2026-10-17 refresh; required for the durations coverage half",
+    )
+    for tail in impure:
+        assert not ci_timing._is_pure_provenance(tail), tail
+
+
+def test_a_comma_bounded_stale_clause_does_not_take_the_whole_note() -> None:
+    """A clause can be separated by a COMMA.
+
+    With `_CLAUSE_SEPARATORS` holding only ` — `/`; `/`. `, the bounds of a
+    comma-bracketed claim stayed at the extremes of the note, so the head and the
+    tail were both empty and the whole note was cleared — the same record loss
+    clause-by-clause stripping exists to prevent (#9134 review, P2).
+    """
+    stripped = ci_timing._strip_stale_basis_claim(
+        "  # #2350: rationale, this value is a CI measurement since the "
+        "2026-10-17 refresh, and the #4348 trap says do not drop the row")
+    assert "#2350: rationale" in stripped, stripped
+    assert "do not drop the row" in stripped, stripped
+    assert "since the 2026-10-17 refresh" not in stripped, stripped
+
+
 def test_declared_test_counts_counts_test_functions(tmp_path: Path) -> None:
     """The coverage witness's denominator, unit-tested: module-level, class
     methods and `test`-prefixed helpers count; a non-test helper does not; a
     missing or unparsable file is ABSENT (UNKNOWN) rather than 0."""
     (tmp_path / "tests" / "sub").mkdir(parents=True)
     (tmp_path / "tests" / "test_alpha.py").write_text(
+        "import pytest\n"
         "def test_one():\n    pass\n"
         "def test_two():\n    pass\n"
         "class TestThing:\n"
         "    def test_method(self):\n        pass\n"
-        "def helper():\n    pass\n",
+        "def helper():\n    pass\n"
+        # pytest registers a fixture-decorated `test*` def as a FIXTURE, never as
+        # a testcase — counting it made `declared > collected` and the row's
+        # floor unsatisfiable (#9134 review, P2).
+        "@pytest.fixture\ndef test_tools():\n    yield None\n"
+        # …and a def nested inside another test is not collected at all.
+        "def test_outer():\n    def test_inner():\n        pass\n",
         encoding="utf-8",
     )
     (tmp_path / "tests" / "sub" / "test_beta.py").write_text(
@@ -1299,7 +1351,10 @@ def test_declared_test_counts_counts_test_functions(tmp_path: Path) -> None:
         ["test_alpha.py", "sub/test_beta.py", "test_broken.py", "test_gone.py"],
         tmp_path,
     )
-    assert counts == {"test_alpha.py": 3, "sub/test_beta.py": 1}
+    # 4 = test_one, test_two, TestThing.test_method, test_outer. The
+    # fixture-decorated `test_tools` and the nested `test_inner` are NOT
+    # collected, and counting them is what made `declared > collected`.
+    assert counts == {"test_alpha.py": 4, "sub/test_beta.py": 1}
 
 
 def test_declared_test_counts_never_attaches_a_basename_twin(tmp_path: Path) -> None:

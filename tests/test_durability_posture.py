@@ -363,9 +363,19 @@ def test_wrapped_detector_sees_a_claim_split_across_lines(tmp_path):
 
 
 def test_no_wrapped_durability_claim_anywhere_in_the_scanned_roots():
-    """A line break must not hide the claim from the gate. ``tortoise/api.py``
+    """A line break must not hide the PREDICATE claim from the gate. ``tortoise/api.py``
     carried `(the journal IS the` / `truth)` while this gate reported clean,
-    which is the fail-open shape the gate exists to forbid."""
+    which is the fail-open shape the gate exists to forbid.
+
+    SCOPE: the joined re-scan covers only the two predicate alternations
+    (`is truth` / `is durable`), not `source of truth`. That is deliberate and
+    measured — the `source of truth` alternations have legitimate cross-line
+    neighbours in this tree (`corpus files (source of truth), (2) the FULL
+    \`events/\` JSONL directory`, `single source of truth with apply, #330` /
+    `# Journal-order`), so joining them repo-wide fabricates false positives. A
+    wrapped `source of` / `truth` is therefore NOT caught here; narrowing the
+    claim in that direction is what keeps this gate honest about its own reach.
+    """
     offenders: list[str] = []
     for path in _scanned_files():
         rel = path.relative_to(REPO).as_posix()

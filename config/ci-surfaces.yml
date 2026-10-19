@@ -5435,6 +5435,12 @@ durations:
 # SINGLE test (any measured entry satisfies "saw 1 of 1", so a fixture-dominated
 # wheel-build or embedded-boot row would be discounted on one fixture line) and a
 # file with NO declared count (UNKNOWN, and unknown must not licence a discount).
+# The declared count is a count of `def`s, so for a PARAMETRISED file it is a
+# FLOOR: one `def` with 20 argvalues reports "saw 20 of 1", which satisfies the
+# witness on a fraction of the file's tests. The guard cannot see that from an AST
+# alone (it would need pytest's own collection, which it cannot run offline
+# against the sampled run), so a parametrised row can still be discounted on
+# partial coverage — the direction that UNDER-weights it, never the reverse.
 # A row the guard HELD keeps its recorded value and its note, and the rejected
 # reading is APPENDED to it, e.g.
 #   test_surface_manifest.py: 199.1  # #9017 CI-junit 2026-10-18 (run 39165691659);
