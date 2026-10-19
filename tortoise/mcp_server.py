@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time as _time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 
@@ -282,10 +283,12 @@ def _emit_mcp_tool_call_telemetry(org_id: str, tool_name: str, status: str,
       transport in force is ``"stdio"``: the gate's message prefix is shared
       by the HTTP tenant-context refusal and by `_safe`'s unset-transport
       refusal, which record ``auth_error`` with ``error_kind = None`` rather
-      than claim a gate they never touched. ``exec_error`` has ONE more producer
-      with ``error_kind = "safe_error"``: a dispatch whose `_safe` failure was
-      shipped inside a wrap envelope the tool's own schema forbids (#8482) —
-      it is not an exception either, because `_safe` ANSWERED with a dict.
+      than claim a gate they never touched. ``exec_error`` has ONE more
+      producer family, with ``error_kind = "safe_error"``: a dispatch whose
+      failure `_safe` ANSWERED with a dict instead of raising — the general
+      `_SafeError` payload (#8135) and the wrap envelope the tool's own schema
+      forbids (#8482), which is the same producer class and deliberately shares
+      the kind.
     - ``timeout`` — the transport wait bound fired at this seam
       (``error_kind = "wait_bound"``).
     - ``cancelled`` — the caller cancelled the dispatch
@@ -300,6 +303,20 @@ def _emit_mcp_tool_call_telemetry(org_id: str, tool_name: str, status: str,
     the number of items the call returned, or ``None`` when the shape of the
     result makes the count unknowable — see the block above, and read ``0`` and
     ``None`` as two different facts.
+
+    ⚠️ COMPARABILITY BREAK — #8135, and it must be stated rather than shipped as
+    a silent improvement. ``mcp_tool_call`` is an established dispatch series:
+    the p99 22.5 s population the #3834 wait bound was JUSTIFIED by, and the
+    series the activation scorecard's stages 4/5 read. Before #8135 a call
+    whose failure `_safe` swallowed was recorded ``ok``, so the ``ok`` RATE of
+    any window that straddles that deploy is not comparable with one that does
+    not — retroactively nothing changes (no row is rewritten), and only NEW rows
+    carry the corrected classification. No reader changes behaviour: the
+    scorecard's stage 4 counts by ``tool_name`` ALONE (#4039) and stage 5 reads
+    ``result_count``, ``retention_indicator`` reads ``result_count``, and
+    ``tools/surface_manifest.telemetry_tools`` reads ``tool_name`` — none of
+    them filters on ``status`` (verified repo-wide). The break is therefore in
+    what the series MEANS, not in what any consumer computes from it.
 
     The #888 research brief
     (``docs/epics/2026-08-11-888-surface-design/01-research-brief.md``) still
@@ -1043,6 +1060,91 @@ def _maybe_wrap_envelope_violation(result) -> bool:
     return not isinstance(payload.get("result"), list)
 
 
+# ── #8135: the discriminator for a payload-carried `_safe` failure ─────────
+# `_safe` ANSWERS a failure with an `_SafeError` dict instead of raising, so the
+# exception ladder in `_wrapped_call_tool` never sees it and the call was
+# recorded `status="ok"`, `error_kind=None` — a failed retrieval
+# indistinguishable from a successful one in the very series (#888/#3834) the
+# friction evidence is measured from and the activation scorecard reads.
+#
+# The TYPE cannot be the discriminator AT THIS SEAM. FastMCP rebuilds the
+# payload through ``pydantic_core.to_jsonable_python`` in
+# ``FunctionTool.convert_result`` (``fastmcp/tools/base.py``), so the dict that
+# arrives here is a plain dict and `isinstance(payload, _SafeError)` — the gate
+# #3926 established INSIDE the tool bodies, where the type still exists — is
+# False for a real failure (measured in this worktree). Key presence cannot be
+# the discriminator either: a successful write may carry a user prop literally
+# named ``error`` (that is WHY #3926 made `_SafeError` a dict subclass).
+#
+# So the failure is recorded WHERE THE TYPE IS KNOWN — `_safe`, the single
+# funnel every SDK failure passes through — and matched here BY VALUE.
+
+#: `_safe` failures produced by the dispatch currently being classified.
+#: A mutable LIST held in a ContextVar (not one ContextVar per failure) because
+#: the dispatch task AND the sync-threadpool worker that runs a tool body each
+#: get a COPY of the context: a ``set()`` from inside the body would never reach
+#: this seam, while a mutation of the object the copy points at does. The same
+#: mechanism carries ``request_load_owner``'s token into the dispatch task in
+#: ``_await_under_mcp_wait_bound``.
+_dispatch_safe_failures: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "tortoise_dispatch_safe_failures", default=None)
+
+#: Failures retained per dispatch. A tool body calls `_safe` a handful of times,
+#: so this is not reached in practice; it bounds the holder for a body that
+#: loops over caller-sized batches. Dropping the OLDEST can only make a failure
+#: MISS (it reads ``ok``) — it can never misclassify a success.
+_MAX_RECORDED_SAFE_FAILURES = 8
+
+
+def _note_safe_failure(payload: dict[str, Any]) -> None:
+    """Record a `_safe` failure for the dispatch in flight (#8135).
+
+    Called from `_safe` itself, so the seam learns the failure's TYPE while the
+    type still exists. Outside a dispatch (`_safe` driven directly by a test, a
+    tool function called without the MCP seam) no holder is set and this is a
+    no-op — which is also why `_safe`'s behaviour is unchanged for every caller
+    that does not go through `_wrapped_call_tool`.
+    """
+    recorded = _dispatch_safe_failures.get()
+    if recorded is None:
+        return
+    recorded.append(payload)
+    if len(recorded) > _MAX_RECORDED_SAFE_FAILURES:
+        del recorded[:-_MAX_RECORDED_SAFE_FAILURES]
+
+
+def _returned_safe_failure(payload: Any) -> dict[str, Any] | None:
+    """The `_safe` failure THIS dispatch returned, or ``None`` (#8135).
+
+    BY VALUE, not by identity: FastMCP has already serialized the payload, so
+    the dict compared here is a rebuilt copy of the one `_safe` returned. Read
+    THROUGH the wrap envelope for the same reason `_safe_failure_message` is —
+    FastMCP wraps a ``-> list[dict]`` tool's result as ``{"result": ...}``, so
+    a top-level-only read would miss every array-envelope tool.
+
+    Equality is what keeps a RECOVERED failure out of the failure column.
+    ``tortoise_suggest_entry_points`` calls `_safe(tortoise_fts_query)` and,
+    when that fails, returns a DIFFERENT `_safe` call's result: its dispatch
+    SUCCEEDED, and a "did any `_safe` call fail" flag would record it as
+    ``exec_error``. Requiring the returned payload to EQUAL a recorded failure
+    does not — and the false-negative direction (a tool that returns a
+    transformed copy of a failure) deliberately reads ``ok`` rather than
+    inventing a failure the wire never showed.
+    """
+    failures = _dispatch_safe_failures.get()
+    if not failures or not isinstance(payload, dict):
+        return None
+    candidates = [payload]
+    inner = payload.get("result")
+    if isinstance(inner, dict):
+        candidates.append(inner)
+    for candidate in candidates:
+        for failure in failures:
+            if candidate == failure:
+                return failure
+    return None
+
+
 def _safe_failure_message(payload: Any) -> str | None:
     """The `_safe` failure TEXT a payload carries, read THROUGH the envelope.
 
@@ -1155,6 +1257,10 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
         dry_run=name in _dry_run_tool_names() and bool((arguments or {}).get("dry_run")),
     )
     status, error_kind, result_count = "ok", None, None
+    # #8135: open the per-dispatch failure holder BEFORE the dispatch task is
+    # created, so the task's copied context carries this exact list object into
+    # the tool body (see `_dispatch_safe_failures`).
+    _safe_failure_token = _dispatch_safe_failures.set([])
     t0 = _time.perf_counter()
     try:
         result = await _await_under_mcp_wait_bound(
@@ -1200,6 +1306,32 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
             # `auth_error` either way — each of them IS an auth refusal.
             error_kind = ("stdio_auth_gate"
                           if _transport_mode.get() == "stdio" else None)
+        # #8135: a failure `_safe` SWALLOWED. It is not an exception at this seam
+        # (`_safe` ANSWERED with a dict), so the ladder above never saw it, and
+        # every such call used to be recorded `ok` with no kind — including a
+        # quota wall, a bundle-validation rejection and an unrecognised recall
+        # mode. `_returned_safe_failure` matches the payload this dispatch
+        # actually RETURNED, so a tool that recovered from a secondary `_safe`
+        # failure stays `ok`.
+        #
+        # `exec_error` and NOT a new status member: the SDK DID raise and `_safe`
+        # only caught it, so this is the same class the ladder's own
+        # `exec_error` names. The kind is `safe_error` — the member #8482
+        # already established for a `_safe`-answered failure (the envelope
+        # repair below is the same producer class, so folding in a second name
+        # would split one failure class across two kinds). The payload's own
+        # `code` (`ERR_QUOTA` / `ERR_BUNDLE_INVALID` / …) is deliberately NOT
+        # folded in: those are a MIXED int/string namespace (`-32006` vs
+        # `"ERR_BUNDLE_INVALID"`) and `error_kind` is documented as the
+        # offending field / exception class, so folding them in would put a bare
+        # integer in a column of names — and the code is already on the payload
+        # the caller receives.
+        #
+        # Only when nothing else has classified it: the wait-bound statuses and
+        # the auth refusal above are more specific and set their own status, so
+        # a `_safe` payload that reached them keeps THAT classification.
+        if status == "ok" and _returned_safe_failure(payload) is not None:
+            status, error_kind = "exec_error", "safe_error"
         # #8482: ...and repair the payload the tool's OWN schema forbids. Last,
         # so the classification above still sees the shape the dispatch
         # produced rather than the repaired one. The schema read is behind a
@@ -1211,10 +1343,12 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
                 if status == "ok":
                     # The seam has just PROVEN this dispatch failed and told the
                     # client so (`is_error`); leaving the row `ok` would put the
-                    # scorecard and the wire in disagreement — the same
-                    # "a failure that reads as a success" defect #8135 owns for
-                    # the general `_SafeError` case. Only when nothing else has
-                    # classified it: the wait-bound statuses are set above.
+                    # scorecard and the wire in disagreement. Only when nothing
+                    # else has classified it: the wait-bound and auth statuses
+                    # are set above, and since #8135 the payload-carried
+                    # `_safe` failure is already `exec_error`/`safe_error` — the
+                    # SAME pair this line produces, so the two producers of one
+                    # failure class agree on what it is called.
                     status, error_kind = "exec_error", "safe_error"
         return result
     except asyncio.CancelledError:
@@ -1238,6 +1372,10 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
         # comparability with that population. The bound's own telemetry is the
         # breach event, which measures the caller-visible wait on both arms.
         latency_ms = int((_time.perf_counter() - t0) * 1000)
+        # #8135: close the failure holder before emitting. `reset` restores the
+        # caller's context (None outside a dispatch), so the list cannot outlive
+        # this call.
+        _dispatch_safe_failures.reset(_safe_failure_token)
         try:
             _emit_mcp_tool_call_telemetry(org_id, name, status, latency_ms,
                                           error_kind, result_count)
@@ -1617,9 +1755,30 @@ class _SafeError(dict):
 
     As a dict subclass the value still indexes, compares, and serializes
     exactly as the plain error dict did — the wire shape is unchanged.
+
+    ⚠️ Two separate questions, two separate gates — do not collapse them:
+
+    * INSIDE a tool body, "did this call fail?" is answered by
+      ``isinstance(result, _SafeError)`` (#3926). Key presence is wrong there
+      because a SUCCESSFUL write's props may carry a user key named ``error``.
+    * AT the telemetry seam (``_wrapped_call_tool``), the type no longer exists:
+      FastMCP reserializes the payload (``pydantic_core.to_jsonable_python``),
+      so a real failure arrives as a plain dict. The failure is therefore
+      recorded HERE, on construction — the one moment the type is known — and
+      matched by value at the seam. Zero wire change; see
+      ``_dispatch_safe_failures`` (#8135).
     """
 
     __slots__ = ()
+
+    def __init__(self, payload=None, **kwargs):
+        super().__init__(payload if payload is not None else {}, **kwargs)
+        # Registered on EVERY construction, so the seam's discriminator is the
+        # TYPE rather than a list of the call sites that happen to build it —
+        # a tool that answers with an `_SafeError` of its own is covered too.
+        # Outside a dispatch this is a no-op (see `_note_safe_failure`), which
+        # keeps `_safe`'s behaviour identical for every non-MCP caller.
+        _note_safe_failure(self)
 
 
 def _safe(fn, *args, **kwargs):
@@ -1635,6 +1794,7 @@ def _safe(fn, *args, **kwargs):
     hosted production (TORTOISE_API_KEY unset), which would silently bypass auth.
     """
     mode = _transport_mode.get()
+
     if mode is None:
         return _SafeError({
             "error": (
