@@ -677,8 +677,26 @@ AUDIT_FALLBACK_DROP_COUNT = Counter(
 # here would hand the caller a failure for a write that persisted, and would
 # kill the derived cache too). So a lost record row must be OBSERVABLE rather
 # than a log line nothing watches — the same "signal with no channel" class as
-# the journal counter above. ``reason`` is ``malformed_dsn`` · ``no_tenant`` ·
-# ``write_failed``, so the three fixes are distinguishable in one read.
+# the journal counter above. ``reason`` is the COMPLETE vocabulary — every one
+# of these is emitted by ``tortoise/record_writer.py::write_live_record`` except
+# the two the SDK adds, and each names its own fix, so a value found here is
+# self-describing in one read:
+#
+#   ``malformed_dsn``         the DSN is configured but unusable (record_writer's
+#                             seam, and `TortoiseSDK._record_write_without_journal`
+#                             on the journal-less lane);
+#   ``no_tenant``             armed with no tenant in scope — refused rather than
+#                             filed under a guessed tenant (#9192);
+#   ``write_failed``          the record was unreachable or the projection
+#                             refused the record;
+#   ``no_journal``            armed on a deployment with NO journal, so the write
+#                             has no source and no replay could heal it (SDK);
+#   ``no_durable_journal``    armed, but the log this record was appended to is a
+#                             SCRATCH buffer (`_InMemoryEventLog`, the M2 capture
+#                             lane) — a row from it would be unreproducible;
+#   ``seam_unimportable``     the record module itself could not be imported
+#                             (a failing import hook), so the seam never ran (SDK).
+#
 # Single writer: ``record_record_write_failure`` (the #501/#3677 house shape).
 RECORD_WRITE_FAILURE_COUNT = Counter(
     "tortoise_record_write_failures_total",
@@ -1255,12 +1273,33 @@ def record_error() -> None:
 def record_record_write_failure(reason: str) -> None:
     """Count one ARMED record write that did not happen (#9188).
 
-    ``reason`` is ``malformed_dsn`` (the DSN is configured but unusable),
-    ``no_tenant`` (armed with no tenant in scope — the write is refused rather
-    than filed under a guessed tenant, #9192) or ``write_failed`` (the record
-    was unreachable or the projection refused). Called from
-    ``TortoiseSDK._emit_event``'s record hook, whose swallow is deliberate for
-    the same reason the journal append's is: the capture already committed.
+    ``reason`` is the vocabulary documented at ``RECORD_WRITE_FAILURE_COUNT``,
+    restated here because THIS function is the definition site an operator
+    reads. Six distinct values: four emitted by ``tortoise/record_writer.py::
+    write_live_record`` and three by ``TortoiseSDK`` — ``malformed_dsn`` is
+    raised by BOTH, which is why the counts overlap (4 + 3 − 1 = 6). The split
+    is named because each value names a different fix:
+
+    * ``malformed_dsn`` — the DSN is configured but unusable (the seam; and
+      ``TortoiseSDK._record_write_without_journal`` on the journal-less lane,
+      where the seam is never called and this is the only signal);
+    * ``no_tenant`` — armed with no tenant in scope, so the write is refused
+      rather than filed under a guessed tenant (#9192); set
+      ``TORTOISE_RECORD_ORG_ID``/``_GRAPH_ID`` or wrap in
+      ``record_writer.use_record_tenant(...)``;
+    * ``write_failed`` — the record was unreachable or the projection refused
+      the record; ``replay`` heals it from the journal;
+    * ``no_journal`` — armed on a deployment with no JSONL journal (SDK): the
+      write has no source, and no replay can heal it;
+    * ``no_durable_journal`` — armed, but the log the record was appended to is
+      a SCRATCH buffer rather than a journal (the M2 capture lane's
+      ``_InMemoryEventLog``), so a row from it could never be reproduced;
+    * ``seam_unimportable`` — ``tortoise.record_writer`` could not be imported
+      (SDK), so the seam never ran.
+
+    Called from ``TortoiseSDK._emit_event``'s record hook and from
+    ``record_writer.write_live_record``, whose swallow is deliberate for the
+    same reason the journal append's is: the capture already committed.
     """
     RECORD_WRITE_FAILURE_COUNT.labels(reason=reason).inc()
 

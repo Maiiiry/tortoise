@@ -762,7 +762,19 @@ class _InMemoryEventLog:
     """Duck-typed EventLog (append/read_all) backing the session-capture
     extraction readback. The graph (via the EventAPI projection) is the
     durable store; this log only carries the events of the current capture so
-    the caller can read the extracted Points back. No file I/O, no temp files."""
+    the caller can read the extracted Points back. No file I/O, no temp files.
+
+    ``durable = False`` is a CONTRACT, not a comment (#9188 review): these
+    records are appended here and NOWHERE else, so `EventAPI._emit` must not
+    hand them to the Postgres record. The record is ``replay(journal)`` — a row
+    from this buffer has no journal record behind it, could never be
+    reproduced, and no replay could ever correct it (the extraction's own
+    in-capture dedup even DELETEs a repeated Point from the graph, leaving the
+    row asserting a Point neither the graph nor any journal holds). The door
+    reads this attribute; every other log defaults to durable.
+    """
+
+    durable = False
 
     def __init__(self):
         self._events: list[dict] = []
@@ -6948,12 +6960,21 @@ class TortoiseSDK:
         misconfiguration.
 
         Unarmed is the normal case and costs one env lookup: no counter, no
-        warning.
+        warning. A MALFORMED DSN is not "unarmed" and must not disappear into
+        the swallow below: the journal-less lane is the one shape where the
+        seam's own `malformed_dsn` count can never fire (there is no
+        `write_live_record` call to carry it), so a typo'd
+        ``TORTOISE_RECORD_DSN`` on this lane would otherwise produce no signal
+        at all — the exact silent hole this method exists to close.
         """
         try:
             from . import record_writer
-            armed = record_writer.record_dsn() is not None
         except Exception:
+            return
+        try:
+            armed = record_writer.record_dsn() is not None
+        except record_writer.RecordWriteError as exc:
+            self._record_write_failure("malformed_dsn", exc)
             return
         if armed:
             self._record_write_failure(

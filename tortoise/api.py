@@ -161,7 +161,17 @@ class EventAPI:
         # reach the journal and never the record. Best-effort by construction
         # (`write_live_record` counts and logs, never raises): the append above
         # already committed.
-        record_writer.write_live_record(event)
+        #
+        # ⛔ but only when the log IS a journal. `durable` is the log's own
+        # answer, defaulting True for every duck-typed double and for
+        # `EventLog`; `TortoiseSDK._extract_session_llm` hands this door an
+        # `_InMemoryEventLog` (no file I/O, by design) whose records no journal
+        # ever carries, so a row from it could never be reproduced or healed by
+        # a replay — the record is `replay(journal)`, and a scratch buffer is
+        # not a journal. The seam counts `no_durable_journal` and writes
+        # nothing.
+        record_writer.write_live_record(
+            event, durable=getattr(self.log, "durable", True))
         if self.projection is not None:
             # #7951 §17.1: journal-first door — the append above is the COMMIT
             # POINT, so the fold runs inside the live-write scope.

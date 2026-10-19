@@ -131,6 +131,7 @@ from . import record_projection, status_vocabulary
 _logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CONNECT_TIMEOUT_SECONDS",
     "POSITION_ROW_DEFERRED_ON",
     "RECORD_DSN_ENV",
     "RECORD_GRAPH_ENV",
@@ -173,6 +174,16 @@ RECORD_DSN_ENV = "TORTOISE_RECORD_DSN"
 #: sets :func:`use_record_tenant` per request, and that always wins.
 RECORD_ORG_ENV = "TORTOISE_RECORD_ORG_ID"
 RECORD_GRAPH_ENV = "TORTOISE_RECORD_GRAPH_ID"
+
+#: The bound on OPENING the record's connection, in seconds. libpq's default is
+#: ``0`` — wait forever — and the live door opens one connection per journal
+#: record ON THE CALLER'S THREAD, after the journal append has committed. So an
+#: armed-but-unreachable record (a dead host, or a firewall dropping SYNs) would
+#: stall every capture for as long as the kernel takes, which is the difference
+#: between "the record is degraded" and "the capture path is hung". A DSN that
+#: names its own ``connect_timeout`` WINS: the operator's explicit bound is not
+#: silently replaced by this one.
+CONNECT_TIMEOUT_SECONDS = 10
 
 #: The DSN schemes a DB-API Postgres driver accepts. A value outside this set is
 #: a *misconfiguration*, never an unarmed state.
@@ -305,10 +316,14 @@ def record_dsn(explicit: str | None = None) -> str | None:
 #: hosted process serves many tenant graphs, so a module-level or
 #: environment-supplied org/graph files tenant A's rows under tenant B with no
 #: error (the row is well-formed and the FK only checks that the graph exists).
-#: So this is a ContextVar the REQUEST sets, never an env fallback — env is
-#: process-global too, i.e. the same single value for every tenant the process
-#: serves. Unset ⇒ an armed write is REFUSED and counted (`no_tenant`), never
-#: guessed.
+#: So this is a ContextVar the REQUEST sets. It is NOT the only surface — the
+#: env pair is the single-tenant arming surface, resolved by
+#: :func:`record_tenant` — but it is the only one that can be per-request, so a
+#: scope ALWAYS wins over env (env is process-global: the same single value for
+#: every tenant the process serves, #9192). Neither set ⇒ an armed write is
+#: REFUSED and counted (`no_tenant`), never guessed. Ask
+#: :func:`record_tenant` — not :func:`current_record_tenant` — to learn whether
+#: an armed write will be refused.
 _RECORD_TENANT: contextvars.ContextVar[tuple[str, str] | None] = (
     contextvars.ContextVar("tortoise_record_tenant", default=None)
 )
@@ -338,10 +353,17 @@ def use_record_tenant(org_id: str, graph_id: str):
 
 
 def current_record_tenant() -> tuple[str, str] | None:
-    """The tenant this scope's record writes are filed under, or ``None``.
+    """The tenant this SCOPE set, or ``None``. Scope only — never env.
 
-    ``None`` is a REFUSAL for an armed write, not a default: the caller must say
-    whose data this is (see :func:`use_record_tenant`).
+    ⛔ ``None`` here does NOT mean an armed write is refused: this is the
+    request scope alone, and :func:`record_tenant` falls back to the
+    single-tenant ``RECORD_ORG_ENV``/``RECORD_GRAPH_ENV`` pair, so a process
+    armed by env is refused nothing while this returns ``None``. Use
+    :func:`record_tenant` to ask "what tenant would an armed write be filed
+    under, and would it be refused?" — that ``None``, and only that one, is the
+    refusal. This function answers the narrower "did the caller say whose data
+    this is?", which is what a scope-aware caller wants (see
+    :func:`use_record_tenant`).
     """
     return _RECORD_TENANT.get()
 
@@ -384,7 +406,10 @@ def _default_connect(dsn: str) -> Any:
             "the record is armed but no Postgres driver is installed — install "
             "the 'postgres' extra (pip install -e '.[postgres]')"
         ) from exc
-    return psycopg2.connect(dsn)
+    if "connect_timeout" in dsn:
+        # The operator bounded it already; do not replace their number.
+        return psycopg2.connect(dsn)
+    return psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_SECONDS)
 
 
 @dataclass
@@ -541,7 +566,22 @@ def write_records(
     )
 
 
-def write_live_record(record: Mapping[str, Any]) -> RecordWrite | None:
+def _count_write_failure(reason: str) -> None:
+    """Count one lost record write. **Never raises** (#5148's rule, one frame on).
+
+    The caller's journal append is already committed, so nothing here may hand
+    the caller an exception for a write that persisted — not the import of
+    ``monitoring`` (a failing import hook) and not the metrics call itself. The
+    bare-``except`` swallow is deliberate and narrow: the RETURN VALUE of a
+    counter is nothing a caller can use.
+    """
+    with contextlib.suppress(Exception):
+        from . import monitoring
+        monitoring.record_record_write_failure(reason)
+
+
+def write_live_record(record: Mapping[str, Any], *,
+                      durable: bool = True) -> RecordWrite | None:
     """The LIVE door: one journal record that has ALREADY been appended.
 
     Called at each of the three places the journal is appended on a live write
@@ -550,13 +590,27 @@ def write_live_record(record: Mapping[str, Any]) -> RecordWrite | None:
     SDK's. §17.1: the append is the commit point, so this runs after it and
     before any cache fold.
 
+    ``durable`` says whether the log the record was appended to is a JOURNAL.
+    The record is ``replay(journal)`` — its whole repair story is "rebuild the
+    record from the log" — so a record appended to a SCRATCH buffer must not
+    become a row: nothing could ever reproduce it and no replay could correct
+    it. The M2 session-capture extraction lane appends through
+    `EventAPI._emit` to `_InMemoryEventLog` (no file I/O, by design), so a
+    capture on that lane would otherwise file rows the journal never carried.
+    ``False`` ⇒ nothing is written and ``no_durable_journal`` is counted, the
+    same observable-misconfiguration shape as ``no_journal``. Read AFTER the
+    arming check, so an UNARMED deployment stays byte-identical (no counter, no
+    warning) on this lane too.
+
     Returns ``None`` when the record is not armed (no DSN): nothing was
     attempted, no connection, no plan — the unarmed deployment is
     byte-identical to the pre-record one (§2.0's sequence). Otherwise it
     returns the write, and a FAILURE never raises: it is counted
     (``monitoring.metrics()["record_write_failures"]``) and logged, because the
     journal already holds the record and a question about the derived record
-    must not fail a write that persisted. ``replay`` heals the gap.
+    must not fail a write that persisted. ``replay`` heals the gap. That
+    contract is enforced, not just intended: every counter call goes through
+    :func:`_count_write_failure`, which suppresses its own failures.
 
     The transaction is THIS write's own (the journal append was a file append,
     so there is nothing to span): the seam opens the connection, this commits
@@ -568,21 +622,31 @@ def write_live_record(record: Mapping[str, Any]) -> RecordWrite | None:
     uncached, so a migration edit can never be read stale). That is a
     DELIBERATE residual: one record, one transaction, no batching, because a
     batch seam's ordering across three independent doors is a throughput
-    question with no measurement behind it yet.
+    question with no measurement behind it yet. The UNHEALTHY case is bounded
+    too, and that is the residual the healthy measurement cannot see: opening
+    the connection is capped by :data:`CONNECT_TIMEOUT_SECONDS` (~10 s per
+    record, not "forever"), because this runs on the caller's thread after the
+    journal append committed.
     """
-    from . import monitoring
-
     try:
         armed = record_dsn() is not None
     except RecordWriteError as exc:
-        monitoring.record_record_write_failure("malformed_dsn")
+        _count_write_failure("malformed_dsn")
         _logger.warning("the record write did not happen (malformed_dsn): %s", exc)
         return None
     if not armed:
         return None
+    if not durable:
+        _count_write_failure("no_durable_journal")
+        _logger.warning(
+            "the record write did not happen (no_durable_journal) — the record "
+            "is armed but this log is a scratch buffer, not a journal, so no "
+            "replay could reproduce the row: %s", record.get("type"),
+        )
+        return None
     tenant = record_tenant()
     if tenant is None:
-        monitoring.record_record_write_failure("no_tenant")
+        _count_write_failure("no_tenant")
         _logger.warning(
             "the record write did not happen (no_tenant) — the record is armed "
             "but no tenant is in scope: wrap the write in "
@@ -601,7 +665,7 @@ def write_live_record(record: Mapping[str, Any]) -> RecordWrite | None:
             connection.commit()
         return write
     except Exception as exc:
-        monitoring.record_record_write_failure("write_failed")
+        _count_write_failure("write_failed")
         _logger.warning(
             "the record write did not happen (write_failed) — the journal has "
             "the record and a replay heals the record: %s", exc,
