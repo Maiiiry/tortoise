@@ -288,11 +288,12 @@ _DUMP_PAGE_SIZE = 1000
 #: saw — never ``>`` against a negative start (see ``_paged_rows``).
 #:
 #: ⛔ This was ``id(n) > $cursor`` with ``cursor = -1``, and that form is silently
-#: WRONG for NODE ids on FalkorDB's Rust core (``MODULE LIST`` ``graph`` ver
-#: **60002** on ``falkordb/falkordb:latest``, **60001** on ``falkordb:6.0.1`` —
-#: ``docs/evidence/7846-indexed-graph-restore/README.md`` maps both). Measured
-#: 2026-10-19 against live servers holding 3 nodes, the pinned v4 core
-#: (``42006``) and a v6 server (``60002``):
+#: WRONG for NODE ids on the v6 Rust core of FalkorDB as served by
+#: ``falkordb/falkordb:latest`` (``MODULE LIST`` ``graph`` ver **60002**, measured
+#: here; ``docs/evidence/7846-indexed-graph-restore/README.md`` maps **60001** to
+#: ``falkordb/falkordb:6.0.1``, which this note does NOT claim to have probed).
+#: Measured 2026-10-19 against live servers holding 3 nodes, the pinned v4 core
+#: (``42006``) and one v6 server (``60002``):
 #:
 #:     nodes:                           v4 (42006)   v6 (60002)
 #:     id(n) > -1    (the old form)        3 rows      0 rows   (!!)
@@ -312,10 +313,17 @@ _DUMP_PAGE_SIZE = 1000
 #: ``id(r) >= -1`` all return every edge. ``>= -1`` is not a fix either — it
 #: returns 0 node rows on v4 as well.
 #:
-#: Consequence of the old form was concrete: the FIRST node page was empty on
-#: every v6 server, so ``dump_graph`` exported 0 nodes for a populated graph and
-#: the fail-closed guard below refused — **no backup could be taken on v6**, with
-#: a message that blamed a truncated read (#9226).
+#: Consequence of the old form was concrete: the FIRST node page was empty on the
+#: v6 server measured, so ``dump_graph`` exported 0 nodes for a populated graph
+#: and the fail-closed guard below refused — **no backup could be taken on that
+#: engine**, with a message that blamed a truncated read (#9226).
+#:
+#: ⛔ And the SHIPPED form needs a guard of its own on the same engine: for a graph
+#: ABSENT from the registry, ``id(n) >= 0`` returns a phantom row ``(0, [], {})``
+#: while ``MATCH (n)`` returns nothing and the store's own count is 0 (an
+#: empty-but-PRESENT graph reads as 0 rows on both cores). ``dump_graph``
+#: therefore does not page a graph whose independent count is 0 — see the
+#: ``node_rows`` skip there, which keeps a never-written graph dumping as empty.
 #: Offsetting the cursor instead of negating it is engine-independent: an
 #: integer `id` is non-negative, so ``id >= 0`` is the true first page on both
 #: cores and ``id >= last + 1`` is exactly the old ``id > last``.
@@ -459,7 +467,20 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
     # concurrent deletes do not turn a faithful dump into a false failure.
     source_count_start = _independent_counts(g)
 
-    for internal_id, labels, props in _paged_rows(g, _DUMP_NODE_PAGE_QUERY, 0):
+    # ⛔ An independent count of ZERO is the answer, not a page read. On v6
+    # (60002) a node read of a graph that is ABSENT from the engine registry
+    # fabricates one row — `id(n) >= 0` returns the phantom `(0, [], {})` while
+    # `MATCH (n)` returns nothing and the aggregate counts 0 nodes. Paging such a
+    # graph would export that phantom as a node (`node_count: 1`, then
+    # `restore_graph` materialises it), and `len(nodes) < source_node_count` is
+    # one-sided so the guard would not catch it. An EMPTY-BUT-PRESENT graph reads
+    # as 0 rows on both cores, so this skip is limited to the count-0 case and
+    # changes nothing for a graph that has anything to export.
+    node_rows = (
+        () if source_count_start[0] == 0
+        else _paged_rows(g, _DUMP_NODE_PAGE_QUERY, 0)
+    )
+    for internal_id, labels, props in node_rows:
         _collect(internal_id, labels, props)
 
     raw_edges: list[tuple[int, int, str, dict]] = []

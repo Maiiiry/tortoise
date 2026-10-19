@@ -1,7 +1,7 @@
 """#9226 — `dump_graph`'s keyset paging must not compare a NODE `id()` to a
-NEGATIVE value: on the FalkorDB v6 Rust core nothing matches, so every dump
-started with an empty node page, exported 0 nodes and refused — no backup could
-be taken on that engine.
+NEGATIVE value: on the v6 Rust core measured here (graph module **60002**) the
+node read matches nothing, so every dump started with an empty node page,
+exported 0 nodes and refused — no backup could be taken on that engine.
 
 Measured 2026-10-19 against live servers holding 3 nodes, the pinned v4 core
 (**42006**) and a v6 server (**60002** — `falkordb/falkordb:latest`; `60001` is
@@ -31,7 +31,9 @@ THE REGRESSION TEST THEREFORE ENCODES THE MEASURED v6 SEMANTICS FOR NODES. A
 fake handle is not a convenience here — it is the only way a v4-only CI can pin
 a v6 defect, and each rule it applies below is a measurement, not a guess:
 
-* ``id(n) > <negative>``  -> NO rows   (the node-id coercion that broke the dump)
+* ``id(n) > <negative>``  -> NO rows   (the v6 node-id rule that broke the dump;
+  the MECHANISM is not established — see the note in `hosted_backup.py` — so the
+  fake encodes the OBSERVED rule and no theory of why)
 * ``id(n) >= <n>=0``      -> rows with ``id >= n``
 * ``id(n) > <n>=0``       -> rows with ``id > n``
 * ``id(r) > <any>``/``>=``-> normal comparison, NEGATIVES INCLUDED (edges are
@@ -172,6 +174,51 @@ def test_the_edge_read_pages_the_same_way_on_v6():
     assert calls[0][1]["cursor"] >= 0, calls[0][1]
 
 
+# ── the phantom row on a registry-absent graph ───────────────────────────
+
+
+class _AbsentGraphV6:
+    """A v6 handle for a graph name the engine registry does NOT contain.
+
+    MEASURED on 60002, 2026-10-19: ``MATCH (n) WHERE id(n) >= 0`` answers with
+    the phantom row ``(0, [], {})`` although ``MATCH (n)`` and both aggregate
+    counts answer 0; on v4 (42006) every one of them answers 0. `dump_graph`
+    must therefore NOT page a graph whose independent count is 0 — otherwise the
+    phantom is exported as a node, and `restore_graph` materialises it.
+    """
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def query(self, cypher, params=None, timeout=None):
+        params = params or {}
+        self.calls.append((cypher, dict(params)))
+        if "count(" in cypher:
+            return _Result([[0]])
+        if "id(n) >=" in cypher:
+            return _Result([[0, [], {}]])  # the phantom
+        return _Result([])
+
+
+def test_an_absent_graph_dumps_as_empty_and_never_pages_the_phantom():
+    """MEASURED v6 behaviour: a graph absent from the registry answers the node
+    page with a phantom ``(0, [], {})`` while its counts are 0. Exporting that
+    phantom is a regression the truncation guard cannot see (the guard is
+    one-sided), so the dump must be empty AND must not have issued the page."""
+    from tortoise.hosted_backup import dump_graph
+
+    calls = []
+    payload = dump_graph(_AbsentGraphV6(calls), "never_written")
+
+    assert payload["node_count"] == 0, (
+        f"an absent graph must dump as empty — the v6 phantom was exported: "
+        f"{payload['nodes']}")
+    assert payload["edge_count"] == 0
+    assert not [c for c in calls if "id(n) >=" in c[0]], (
+        "the node page was issued for a graph whose independent count is 0 — the "
+        f"v6 phantom only exists on that read: {[c[0] for c in calls]}")
+
+
 # ── the live proof, on whatever engine this lane can reach ───────────────
 
 
@@ -216,11 +263,15 @@ def _live_target() -> str | None:
     return None
 
 
-def test_dump_graph_pages_a_live_graph_end_to_end():
+def test_dump_graph_pages_a_live_graph_end_to_end(monkeypatch):
     """The end-to-end shape the outage broke: seed → dump → every node exported.
 
-    Skips (visibly) when this lane has no non-embedded FalkorDB, exactly like the
-    rest of the live suite — it never early-returns green (#942).
+    The page size is pinned SMALL on purpose (``_DUMP_PAGE_SIZE`` monkeypatched to
+    4 against 15 nodes): with the production default of 1000 this would take one
+    page and never exercise the ``last + 1`` advance on a real engine, so a wrong
+    offset would leave the test green. Skips (visibly) when this lane has no
+    non-embedded FalkorDB, exactly like the rest of the live suite — it never
+    early-returns green (#942).
     """
     uri = _live_target()
     if uri is None:
@@ -228,8 +279,11 @@ def test_dump_graph_pages_a_live_graph_end_to_end():
 
     import uuid
 
+    from tortoise import hosted_backup
     from tortoise.hosted_backup import dump_graph
     from tortoise.projection import FalkorProjection
+
+    monkeypatch.setattr(hosted_backup, "_DUMP_PAGE_SIZE", 4)
 
     name = f"test_9226_paging_{uuid.uuid4().hex[:8]}"
     proj = FalkorProjection.from_uri(uri, graph_name=name)

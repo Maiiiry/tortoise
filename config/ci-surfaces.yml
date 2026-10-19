@@ -758,15 +758,18 @@ surfaces:
   # #3154 note in tools/ci_selection.py). A hosted_backup.py-only change now
   # selects this file (docker-lane; dump/restore round-trips).
   - test_dump_edge_asymmetry_3895.py
-  # #9226: the dump's keyset page must not compare `id()` to a NEGATIVE value —
-  # on FalkorDB's v6 (Rust) core nothing matches it, so the FIRST page was empty
-  # and `dump_graph` exported 0 nodes for a populated graph: no backup could be
-  # taken on that engine family. Owns to `api` for the same reason as
+  # #9226: the dump's keyset page must not compare a NODE `id()` to a NEGATIVE
+  # value — on the v6 (Rust) core measured here (graph module 60002) nothing
+  # matches it, so the FIRST page was empty and `dump_graph` exported 0 nodes for
+  # a populated graph: no backup could be taken on that engine. Owns to `api` for
+  # the same reason as
   # test_dump_edge_asymmetry_3895.py above — tortoise/hosted_backup.py owns that
   # surface, so a hosted_backup.py-only change selects this file. The v6 rule is
   # encoded in a fake handle because CI runs v4 only; one end-to-end leg runs on
   # whatever sanctioned non-embedded server the lane can reach, and skips
-  # VISIBLY (never early-returns green) when there is none.
+  # VISIBLY (never early-returns green) when there is none. The same fake pins
+  # the engine's OTHER measured quirk — a phantom `(0, [], {})` row for a graph
+  # ABSENT from the registry — which `dump_graph` now refuses to page.
   - test_9226_dump_paging_v6.py
   # #3902: the per-graph event-log counter (:GraphEventMeta.last_seq) must
   # survive the backup boundary. Registered under `api` because
