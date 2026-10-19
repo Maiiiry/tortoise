@@ -58,32 +58,41 @@ Composition fixture: the committed ``tests/fixtures/ask_spotcheck_composition.js
 Path resolution order: ``--fixture`` CLI arg → ``TORTOISE_SPOTCHECK_FIXTURE``
 env → committed fixture → ``/tmp/ask_spotcheck.json`` (legacy compat).
 
-DISTILLED + PLANTED-SUPERSESSION leg (``--distilled``, #9095): the epic
-#2281 harness could only seed RAW turns, so its D7 measurement ("does the
-reader commit the current state?") and the D8 product gate ("0% of
-superseded points appear as live answers" — ``docs/product-success-eval.md``)
-had no instrument at all. This leg seeds the authored, hermetic corpus at
-``tests/fixtures/ask_spotcheck_distilled.json`` — three planted
-knowledge-update pairs (residence / diet / employer) — through
-``seed_distilled_corpus`` (the capture EXTRACTION write shape + the
-product's own ``supersede_point``), and reports, from ONE run per case,
-both arms of the paired read (D4: no parallel benchmark): ``raw``
-(``_seed_memory`` only) and ``distilled`` (+ distilled claims +
-supersession). Numbers: ``current_state`` (the knowledge-update class — the
-reader committed the CURRENT value) and ``superseded_live`` (the D8 gate —
-how many superseded claims rendered as their own block body with no
-``[SUPERSEDED BY:`` marker). One machine-readable ``DISTILLED_JSON`` line
-carries both, per arm. ``current_state`` has NO pass threshold (D8: the first
-run sets it); ``superseded_live.rendered_live > 0`` is a hard failure of the
-run, and so is a case the instrument never observed — an unmeasured gate is
-never a pass. D8's two compliant outcomes are "flagged OR excluded", and both
-are reported rather than inferred: ``retrievable`` records whether the
-superseded claim came out of the lane's own retrieval pool at all, and
-``excluded`` records the compliant case where it did but the reader was not
-served it (a PASS — a claim nobody could retrieve is the retrieval gap, and a
-probe that cannot read the store fails closed as UNMEASURED).
-``TORTOISE_SPOTCHECK_JUDGE=mock`` grades the leg key-free
-(CI); without it the composition path's fail-fast judge-key rule applies.
+Distilled-corpus leg (#9095 — epic #2281 D7/D8): ``--distilled`` runs a
+SECOND, additive instrument over the committed planted-supersession corpus
+(``tests/fixtures/ask_spotcheck_supersession.json``: three hand-authored
+old→new pairs), because the 21-question composition seeds only RAW episodic
+turns and has no supersession case at all — so neither the epic's distilled
+knowledge-update number nor its *"0% superseded points appear as live
+answers"* product gate had any instrument. For each case the leg seeds TWO
+fresh stores in ONE invocation (the D4 rule: extend, never a parallel
+benchmark) — ``raw`` (the turn store alone) and ``distilled`` (the same turn
+store plus the distilled claims and the planted supersession, written through
+the product's own ``create_point(is_episodic=False, validFrom=…, …)`` +
+``supersede_point``) — and prints two numbers plus one machine-readable
+``DISTILLED_JSON`` line: the knowledge-update ``current_state`` rate (no pass
+threshold; the first run sets it) and the ``superseded_live`` D8 gate.
+
+The D8 gate has exactly the shapes ``docs/product-success-eval.md`` allows
+("must be flagged **or excluded**"), and the leg reports which one it saw
+rather than inferring one from the other:
+
+* ``rendered_live > 0`` — the superseded claim reached the reader as a live
+  body with no flag: the gate is 0%, so the run FAILS;
+* a claim OBSERVED as a flagged render (``[SUPERSEDED BY: …]`` or a closed
+  ``[valid <from> → <to>]`` window) — a PASS;
+* a claim NOT observed, but proven retrievable by the lane's own pool probe
+  (``retrievable is True``) — ``excluded``, D8's other compliant outcome: a
+  PASS, reported as its own field;
+* a claim not observed and NOT retrievable (``False``), or a probe that could
+  not read the store (``None``) — a retrieval GAP / UNMEASURED case: the run
+  FAILS. An unmeasured gate is never a pass.
+
+``excluded`` is never inferred from a failed text match alone: a distilled
+claim rendered in a shape the matcher cannot attribute is UNMEASURED, not
+excluded (see ``_superseded_live_state``). ``TORTOISE_SPOTCHECK_JUDGE=mock``
+grades the leg key-free (CI); the composition path's #2071 fail-fast
+judge-key rule is not widened.
 """
 from __future__ import annotations
 
@@ -117,6 +126,7 @@ from tools.longmem_eval.judge import (  # noqa: E402
 from tools.longmem_eval.reader import _parse_model_spec  # noqa: E402
 from tortoise.ask_lane import run_ask_lane  # noqa: E402
 from tortoise.ingest import _PROVIDERS  # noqa: E402
+from tortoise.retrieval import _BODY_FENCE  # noqa: E402
 from tortoise.sdk import (  # noqa: E402
     _SESSION_LLM_PROVIDER_PRIORITY,
     TortoiseSDK,
@@ -134,30 +144,12 @@ _COMMITTED_FIXTURE = os.path.join(
 _LEGACY_FIXTURE = "/tmp/ask_spotcheck.json"
 _FIXTURE_ENV = "TORTOISE_SPOTCHECK_FIXTURE"
 
-#: #9095: the authored, hermetic DISTILLED corpus (three planted
-#: knowledge-update pairs). Resolution order: ``--distilled-corpus`` CLI arg →
-#: ``TORTOISE_SPOTCHECK_DISTILLED_CORPUS`` env → this committed file.
-DISTILLED_FIXTURE = os.path.join(
-    _REPO_ROOT, "tests", "fixtures", "ask_spotcheck_distilled.json")
-_DISTILLED_FIXTURE_ENV = "TORTOISE_SPOTCHECK_DISTILLED_CORPUS"
-
 #: #9095: key-free grading for the distilled leg only
 #: (``TORTOISE_SPOTCHECK_JUDGE=mock``). It grades through the benchmark's own
 #: ``MockJudge`` so the planted-supersession gate can run in CI without a
 #: provider key; the composition path is deliberately NOT widened by it —
 #: #2071's fail-fast (no key → exit before grading) stays exactly as it was.
 DISTILLED_JUDGE_ENV = "TORTOISE_SPOTCHECK_JUDGE"
-
-#: #9095: the product's OWN flag vocabulary, mirrored — NOT invented. A
-#: superseded hit is annotated ``[SUPERSEDED BY: <newest superseding
-#: claim>]`` by ``tortoise/retrieval._validity_marker`` (#1353/#1367), and
-#: that marker IS the D8 product gate ("must be flagged or excluded"): the
-#: superseded claim may still reach the reader, but never unflagged. A single
-#: literal so the gate and its report can never disagree about what "flagged"
-#: means; ``tests/test_ask_spotcheck_distilled.py`` pins it against REAL
-#: rendered evidence (not this constant) so a renderer drift fails the suite
-#: instead of silently turning the gate into a guaranteed green.
-SUPERSEDED_MARKER = "[SUPERSEDED BY:"
 
 
 def _to_iso_date(raw: str) -> str:
@@ -704,6 +696,620 @@ def _normalize(text) -> str:
     return re.sub(r"\s+", " ", str(text or "").lower()).strip()
 
 
+# ===========================================================================
+# #9095 — the DISTILLED corpus leg: epic #2281's D7 measurement + D8 gate
+# ===========================================================================
+#
+# Deliberately a SIBLING of the raw-turn instrument above, not a mode flag on
+# ``_seed_memory``: a flag would move the store of every non-opt-in caller (the
+# same class of mistake ``SEED_SEARCH_KEYS_BY_DEFAULT`` exists to prevent), and
+# the 21-question composition must keep its store and its number.
+
+#: The committed planted-supersession corpus (#9095): three hand-authored
+#: old→new pairs (residence, diet, employer). Authored, hermetic and small on
+#: purpose — the standing method (owner, 2026-09-23) is *run it small and by
+#: hand first*, and the first run should show input rows → output rows for a
+#: handful of planted cases, not a generated set. Rejected: the LongMemEval
+#: knowledge-update subset (not row-by-row reviewable, not hermetic).
+_SUPERSESSION_FIXTURE = os.path.join(
+    _REPO_ROOT, "tests", "fixtures", "ask_spotcheck_supersession.json")
+_SUPERSESSION_ENV = "TORTOISE_SPOTCHECK_SUPERSESSION_FIXTURE"
+
+#: The arm the D8 gate is evaluated on. The RAW arm is reported too (the paired
+#: read D4 requires), but the promise — *"0% superseded points appear as live
+#: answers"* — is about DISTILLED points, and the raw-turn store has none.
+_DISTILLED_GATE_ARM = "distilled"
+
+
+class _ClaimRender:
+    """One rendered evidence block, split into ANNOTATION and BODY (#9095).
+
+    The product's supersession flagging lives entirely in the annotation
+    prefix the renderer adds (``_render_block`` → ``_validity_marker``):
+    ``[SUPERSEDED BY: <successor snippet>]`` and the closed window
+    ``[valid <from> → <to>; expired <at>]``. The BODY is the claim itself.
+
+    Splitting them is what makes the D8 gate honest. Two independent traps sit
+    on the same string:
+
+      1. **The snippet trap.** The SUCCESSOR's block carries the PREDECESSOR's
+         text verbatim inside ``[SUPERSEDES: <old content>]``. A whole-line
+         substring test therefore reads the successor as "the old claim,
+         rendered live" — the gate would then demand the successor stop naming
+         what it replaced. Only the BODY may be tested for the old claim.
+      2. **The episodic-record trap.** A raw turn Point that says the old
+         claim is NOT the superseded point: it is the episodic record of what
+         was said at the time, and rendering it unflagged is correct. The
+         superseded point is the DISTILLED claim, and a distilled claim's
+         rendered block is the one carrying a validity window — turns carry
+         none. Attribution therefore needs the window marker, or every
+         correct corpus reads as a D8 failure.
+    """
+
+    __slots__ = ("body", "flagged", "is_claim", "prefix")
+
+    def __init__(self, prefix: str, body: str) -> None:
+        self.prefix = prefix
+        self.body = body
+        # A distilled claim renders its WINDOW; a raw turn/episodic record
+        # never does. This is the attribution rule, not a heuristic: the
+        # window is written by the create path (``validFrom``) and closed by
+        # ``supersede_point``, and turns are written by the capture turn store,
+        # which stamps no window at all.
+        self.is_claim = bool(_VALID_WINDOW_OPEN.search(prefix))
+        # The product's two flagging forms: an explicit successor reference and
+        # a CLOSED window (an arrow — "stopped being true here"). An OPEN
+        # window (``[valid since …]``) asserts the claim is still true, so it is
+        # the failure shape, not a flag.
+        self.flagged = bool(
+            _FLAG_SUPERSEDED_BY.search(prefix)
+            or _FLAG_CLOSED_WINDOW.search(prefix))
+
+
+#: One annotation group the renderer puts BEFORE the body: a bracketed marker
+#: group (``[session …]``, ``[user]``, ``[SUPERSEDED BY: …]``, ``[valid …]``)
+#: or the parenthesized session-date annotation.
+_ANNOTATION_GROUP = re.compile(
+    r"\s*(?:\[[^\[\]\n]*\]|\((?i:session date|today|now)[^)\n]*\))")
+_DATE_PREAMBLE = re.compile(r"^Current Date:[^\n]*\n*")
+_VALID_WINDOW_OPEN = re.compile(r"\[valid ")
+_FLAG_SUPERSEDED_BY = re.compile(r"\[SUPERSEDED BY:")
+_FLAG_CLOSED_WINDOW = re.compile(r"\[valid [^\]]*→")
+
+
+def load_supersession_cases(path: str | None = None) -> list[dict]:
+    """Load the committed planted-supersession corpus (#9095).
+
+    Resolution order: explicit ``path`` (CLI) → the
+    ``TORTOISE_SPOTCHECK_SUPERSESSION_FIXTURE`` env → the committed fixture.
+    Each case is one
+    knowledge-update pair: a ``old_claim``/``new_claim`` (text + session id +
+    ``valid_from``), the ``answer`` the current state IS, and a capture-shaped
+    two-session ``haystack_*`` block so the raw-turn arm can be paired from the
+    same run.
+    """
+    candidates = [p for p in (path, os.environ.get(_SUPERSESSION_ENV)) if p]
+    candidates.append(_SUPERSESSION_FIXTURE)
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            with open(cand) as f:
+                data = json.load(f)
+            cases = data["cases"] if isinstance(data, dict) else data
+            if not isinstance(cases, list) or not cases:
+                raise ValueError(
+                    f"supersession corpus {cand!r}: expected a non-empty list "
+                    f"of cases or a {{\"cases\": [...]}} wrapper")
+            return cases
+    raise FileNotFoundError(
+        "no planted-supersession corpus found (tried "
+        f"{candidates}; set --supersession-fixture or {_SUPERSESSION_ENV})")
+
+
+def _seed_distilled_claim(sdk: TortoiseSDK, claim: dict) -> str:
+    """Write ONE distilled claim the way the capture extraction writer does.
+
+    ``create_point(kind='statement', is_episodic=False, session_id=…, …)`` is
+    the extraction path's own call (``session_id`` infers ``extractedFrom`` =
+    ``session:<id>``), and it embeds the content itself — so the claim is
+    reachable on both retrieval legs without a private write. ``validFrom``
+    stamps the bi-temporal window START (§4.7 D3); ``quote`` + ``source_turn_id``
+    anchor the claim to the verbatim turn it was distilled FROM, which is the
+    provenance the read path (and the A8 own-source collapse) resolves.
+
+    Points are seeded LIVE (post-promotion): the D8 promise is about live
+    claims, and a draft would make the gate measure a shape the product never
+    shows a reader.
+    """
+    out = sdk.create_point(
+        "statement", claim["text"], is_episodic=False, dedup=True,
+        session_id=claim["session_id"],
+        validFrom=claim["valid_from"],
+        quote=claim["text"],
+        source_turn_id=f"{claim['session_id']}_t0",
+    )
+    pid = out["id"]
+    # The (:Session)-[:CONTAINS]->(:Point) edge capture's extraction writer
+    # wires (and the shipping read resolves identity from). MERGE, so a
+    # re-seed converges.
+    sdk._get_proj().g.query(
+        "MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
+        "MERGE (s)-[:CONTAINS]->(p)",
+        params={"sid": claim["session_id"], "pid": pid},
+    )
+    return pid
+
+
+def seed_distilled_corpus(sdk: TortoiseSDK, case: dict) -> dict[str, str]:
+    """Seed ONE planted case's distilled corpus, ADDITIVELY (#9095 D7).
+
+    Writes the two distilled claims and then the supersession through the
+    product's OWN ``supersede_point`` (CORRECTS + ``outdated`` + the
+    predecessor's ``validTo`` = the successor's ``validFrom`` — contiguous
+    windows, §4.7). Nothing here restates the product's write shape: a fixture
+    that taught a shape the product cannot produce would make the instrument
+    measure itself.
+
+    Additive by contract: this does NOT touch ``_seed_memory``'s raw turn leg,
+    so a caller gets the distilled corpus ALONGSIDE the turn store it already
+    had, and the 21-question composition's store and number are unchanged.
+    """
+    old_id = _seed_distilled_claim(sdk, case["old_claim"])
+    new_id = _seed_distilled_claim(sdk, case["new_claim"])
+    sdk.supersede_point(old_id, new_id)
+    return {"old": old_id, "new": new_id}
+
+
+def _evidence_blocks(evidence: str) -> list[str]:
+    """Split rendered reader evidence into one block per hit.
+
+    ``render_context`` joins blocks with a blank line and prefixes the whole
+    context with a ``Current Date:`` line; the preamble is not a hit, and
+    counting it would make every case look like it rendered something.
+
+    A hit whose body carries a BLANK line is rendered by ``_fence_body`` with
+    every non-blank continuation line marked (``"  | "``) and its blank line
+    left blank — so a naive blank-line split tears ONE multi-paragraph claim
+    into several pseudo-blocks and no block then carries the claim's whole
+    body. That tear is not cosmetic: it makes a served claim unmatchable, and
+    an unmatchable claim used to read as "not served" (a false green on the
+    very gate this instrument is). Fenced continuations are therefore REJOINED
+    onto the block they belong to, which is why a multi-paragraph claim is one
+    block here, exactly as ``_render_block`` produced it.
+    """
+    blocks: list[str] = []
+    for block in re.split(r"\n[ \t]*\n", str(evidence or "")):
+        block = _DATE_PREAMBLE.sub("", block.strip("\n")).strip("\n")
+        if not block.strip():
+            continue
+        if blocks and block.startswith(_BODY_FENCE):
+            # A FENCED continuation line (``_fence_body`` marks every
+            # non-blank continuation of a body): the same hit, not a new one.
+            blocks[-1] = f"{blocks[-1]}\n\n{block}"
+            continue
+        blocks.append(block)
+    return blocks
+
+
+def _unfence(text: object) -> str:
+    """Undo ``_fence_body``'s continuation-line marker (``"  | "``).
+
+    The fence is a RENDERING transform, not part of the claim: comparing a
+    claim against a fenced body must undo it, or every multi-paragraph claim
+    reads as never served (``"a. | b."`` never ends with/contains ``"a. b."``)
+    and the D8 gate goes quietly blind on exactly the shapes the corpus will
+    grow into. Byte-identical for anything with no continuation line.
+    """
+    lines = str(text or "").splitlines()
+    return "\n".join(
+        line[len(_BODY_FENCE):] if line.startswith(_BODY_FENCE) else line
+        for line in lines)
+
+
+def _normalize_render(text: object) -> str:
+    """``_normalize`` over the UNFENCED text (rendered evidence/body)."""
+    return _normalize(_unfence(text))
+
+
+def _strip_annotations(block: str) -> tuple[str, str]:
+    """``(annotation prefix, body)`` for one rendered block (see
+    :class:`_ClaimRender` for why the split is load-bearing).
+
+    Only LEADING annotation groups are stripped, so a bracket that is part of
+    the claim's own text stays in the body where it belongs. A snippet whose
+    own text contains ``]`` truncates its group early — the body then carries
+    the residue, and since the residue is not a leading group it is never
+    mistaken for an annotation.
+    """
+    text = str(block or "")
+    pos = 0
+    while True:
+        m = _ANNOTATION_GROUP.match(text, pos)
+        if not m:
+            break
+        pos = m.end()
+    return text[:pos], text[pos:]
+
+
+def _superseded_live_state(evidence: str, claim_text: str) -> tuple[bool, bool, bool]:
+    """``(seen, rendered_live, flagged)`` for ONE superseded claim.
+
+    Read over the ASSEMBLED READER EVIDENCE (not package stats): the promise
+    is about what the reader was shown — the dead claim must be "flagged or
+    excluded".
+
+    * ``seen`` — a DISTILLED-claim render NAMES the superseded claim:
+      anywhere in the block, prefix included. A MENTION is deliberately not
+      an OBSERVATION: the successor's ``[SUPERSEDES: <old content>]`` marker
+      names the predecessor without ever showing it, so a gate that counted
+      ``seen`` as "the claim was exercised" would go green on a corpus whose
+      old claim never rendered at all. Observation is ``rendered_live or
+      flagged`` — the claim's text in a distilled-claim BODY.
+    * ``rendered_live`` — such a render presents the old claim as its BODY
+      with NO flag: the reader is told a dead claim still true. The D8 failure.
+    * ``flagged`` — a render carries ``[SUPERSEDED BY: …]`` or a CLOSED window
+      ``[valid <from> → <to>]``: the product's two ways of saying "this
+      stopped being true".
+
+    Both BODY comparisons run over the UNFENCED text (:func:`_unfence`): a
+    multi-paragraph claim renders fenced, and matching the fence instead of
+    the claim would read a served claim as unserved.
+    """
+    norm = _normalize(claim_text)
+    if not norm:
+        return False, False, False
+    seen = rendered_live = flagged = False
+    for block in _evidence_blocks(evidence):
+        render = _ClaimRender(*_strip_annotations(block))
+        # A raw turn/episodic record of the same words is NOT the superseded
+        # point — it is the episodic log of what was said then, and it renders
+        # unflagged by design. Only distilled claims are in scope.
+        if not render.is_claim:
+            continue
+        if norm not in _normalize_render(block):
+            continue
+        seen = True
+        if norm in _normalize_render(render.body):
+            if render.flagged:
+                flagged = True
+            else:
+                rendered_live = True
+    return seen, rendered_live, flagged
+
+
+def _judge_committed(case: dict, result: dict, judge) -> bool:
+    """Does the reader's answer commit the CURRENT state (the D7 KU number)?
+
+    Graded by the same semantic judge as the rest of the spot-check, so the
+    number is comparable to the 21-question aggregate. There is NO pass
+    threshold on this one: D8 says the first run SETS it.
+    """
+    return bool(judge.judge(
+        question_type=case.get("question_type") or "knowledge-update",
+        question=case.get("question") or "",
+        answer=case.get("answer") or "",
+        hypothesis=result.get("answer") or "",
+        abstention=False,
+    ))
+
+
+def _distilled_judge():
+    """The distilled leg's judge: key-free ``MockJudge`` when
+    ``TORTOISE_SPOTCHECK_JUDGE=mock``, else the composition path's rule.
+
+    Read ONLY here (never on the composition path), so #2071's fail-fast rule
+    is not widened: without the explicit opt-in a missing provider key still
+    exits before grading.
+    """
+    if (os.environ.get(DISTILLED_JUDGE_ENV, "").strip().lower()
+            == "mock"):
+        return build_judge(mock=True)
+    _require_judge_key()
+    return build_judge()
+
+
+def superseded_claim_retrievable(sdk: TortoiseSDK, case: dict,
+                                 old_point_id: str | None,
+                                 question_date: str | None = None
+                                 ) -> bool | None:
+    """Is the superseded claim in the ask lane's OWN retrieval pool? (#9095)
+
+    The D8 product gate (``docs/product-success-eval.md``: "0% of superseded
+    points appear as live answers — **must be flagged or excluded**") admits
+    TWO compliant states, and a claim that is not served looks the same in
+    both: it is absent from the reader's evidence. A render-only reading
+    cannot tell
+
+    * **excluded** — the claim WAS retrievable and the reader was simply not
+      served it (D8's own second option, a PASS), from
+    * a **retrieval gap** — the claim never came out of the store at all, so
+      the gate was never exercised (UNMEASURED, never a pass),
+
+    and reporting the first as the second is a false red on the product's
+    best-case behaviour. This probe settles it mechanically against the local,
+    freshly-seeded store: it re-runs the lane's own retrieval — same resolved
+    caps, same knobs, ``include_terminal=True`` (the lane's documented call,
+    so a terminal claim is IN scope; a probe with terminal filtered would
+    report every supersession as a gap) — and reports whether the superseded
+    claim's Point came back at all.
+
+    ``True`` → retrievable but not rendered ⇒ excluded ⇒ a reported PASS.
+    ``False`` → absent from the pool ⇒ a retrieval gap ⇒ the hard failure.
+    ``None`` → the probe could not read the store (no id, or it raised) ⇒
+    UNKNOWN, and the caller FAILS CLOSED: an unreadable probe is not evidence
+    of a pass.
+
+    ``_record_reads=False``: this is a MEMBERSHIP probe, never a caller
+    reading these keys. The read funnel records the rows it returns, and a
+    probe's candidate rows would bias ``f`` HIGH — the direction that removes
+    the saving the instrument measures (#7983's pool-caller rule).
+    """
+    if not old_point_id:
+        return None
+    # Lazy import: the probe is a measurement helper, not a module-load cost.
+    from tortoise.retrieval import (
+        ASK_FUSION_K_ENV,
+        ASK_FUSION_WEIGHTS_ENV,
+        ask_env_bool,
+        ask_env_int,
+        ask_env_weights,
+        resolve_ask_retrieval_caps,
+    )
+    caps = resolve_ask_retrieval_caps()
+    try:
+        hits = sdk.tortoise_fts_query(
+            case["question"], limit=caps["limit"],
+            pool_size=caps["pool_size"], include_terminal=True,
+            query_date=question_date,
+            # The lane's own A1/A3/A4 knobs, resolved the same way it does.
+            keep_numeric=ask_env_bool("TORTOISE_ASK_NUMERIC_TOKENS", True),
+            search_keys_prf=ask_env_bool("TORTOISE_ASK_SEARCH_KEYS_PRF",
+                                         False),
+            fusion_weights=ask_env_weights(ASK_FUSION_WEIGHTS_ENV, None),
+            fusion_k=ask_env_int(ASK_FUSION_K_ENV, 60),
+            _record_reads=False)
+    except Exception:  # noqa: BLE001, RUF100 — an unreadable probe is UNKNOWN
+        return None
+    return any(str(h.get("id") or "") == str(old_point_id) for h in hits)
+
+
+def _run_one_arm(sdk: TortoiseSDK, case: dict, arm: str, judge,
+                 mutate=None) -> dict:
+    """Run one case through ONE arm and return its readings."""
+    _seed_memory(sdk, case)
+    qdate = _to_iso_date(case.get("question_date") or "")
+    ids: dict | None = None
+    if arm == _DISTILLED_GATE_ARM:
+        ids = seed_distilled_corpus(sdk, case)
+        if mutate is not None:
+            mutate(sdk)
+    try:
+        result = run_ask_lane(sdk, case["question"], question_date=qdate)
+    except Exception as exc:  # noqa: BLE001, RUF100 — a per-case reader or
+        # retrieval fault is a MISS for this case, never a whole-run abort
+        # (same posture as the 21-question loop). Nothing was OBSERVED, so
+        # the D8 leg fails CLOSED rather than passing on an unread case.
+        return {"ok": False, "answer": "", "committed": False,
+                "old_seen": False, "observed": False,
+                "rendered_live": False, "flagged": False,
+                "retrievable": None, "excluded": False,
+                "note": f"ask unavailable: {type(exc).__name__}"}
+    evidence = result.get("evidence") or ""
+    seen, rendered_live, flagged = _superseded_live_state(
+        evidence, case["old_claim"]["text"])
+    # An OBSERVED claim is one whose text rendered as a distilled-claim BODY —
+    # either flagged (pass) or live (the D8 failure). A mere MENTION (the
+    # successor's ``[SUPERSEDES: <old>]`` snippet) is not observation.
+    observed = bool(rendered_live or flagged)
+    # The RAW arm has no superseded claim to probe — there is nothing there to
+    # retrieve — so it reports ``retrievable: None``.
+    retrievable = (superseded_claim_retrievable(
+        sdk, case, (ids or {}).get("old"), qdate) if ids else None)
+    # D8's "flagged OR excluded": EXCLUDED is only ever claimed on POSITIVE
+    # evidence — the claim is in the lane's own pool AND its body appeared
+    # nowhere in the reader's evidence. A claim that is absent AND not
+    # retrievable stays the retrieval gap it is.
+    return {
+        "ok": True,
+        "answer": result.get("answer") or "",
+        "committed": _judge_committed(case, result, judge),
+        "old_seen": seen,
+        "observed": observed,
+        "rendered_live": rendered_live,
+        "flagged": flagged,
+        "retrievable": retrievable,
+        "excluded": bool(not observed and retrievable is True),
+        "note": "",
+    }
+
+
+def _arm_totals(cases: list[dict], arm: str) -> tuple[dict, dict]:
+    rows = [c["arms"][arm] for c in cases]
+    n = len(rows)
+    committed = sum(1 for r in rows if r["committed"])
+    seen = sum(1 for r in rows if r["old_seen"])
+    observed = sum(1 for r in rows if r.get("observed"))
+    live = sum(1 for r in rows if r["rendered_live"])
+    excluded = sum(1 for r in rows if r.get("excluded"))
+    return (
+        {"committed": committed, "n": n,
+         "rate": (committed / n) if n else 0.0},
+        {"seen": seen, "observed": observed, "rendered_live": live,
+         "excluded": excluded, "n": n,
+         "rate": (live / n) if n else 0.0},
+    )
+
+
+def _distilled_gate_failures(records: list[dict]) -> list[str]:
+    """The D8 gate's hard failures, one list, FAIL CLOSED (#9095).
+
+    Per case on the DISTILLED arm (the raw arm holds no distilled claim, so
+    there is nothing there to flag — that contrast IS the measurement):
+
+    1. the reader was unavailable — no measurement was taken;
+    2. ``rendered_live`` — the superseded claim reached the reader as a live
+       body with no flag: the gate is 0%, so the run FAILS;
+    3. NOT observed, with the probe reporting ``retrievable is False`` — the
+       claim never came out of the store: a retrieval GAP, so the gate was
+       never exercised (UNMEASURED, never a pass);
+    4. NOT observed, with the probe unreadable (``None``) — UNKNOWN, and an
+       unreadable probe is not evidence of a pass.
+
+    A NOT-observed claim with ``retrievable is True`` is D8's other compliant
+    outcome ("must be flagged or **excluded**") and is a PASS, reported in
+    ``superseded_live.excluded`` so the pass is visible rather than an absence
+    that looks like a miss. ``current_state`` is NEVER a gate: D8 gives the
+    knowledge-update rate no threshold, the first run sets it.
+    """
+    failures: list[str] = []
+    for record in records:
+        cid = record.get("case_id") or "<unnamed>"
+        arm = record["arms"][_DISTILLED_GATE_ARM]
+        if not arm.get("ok"):
+            failures.append(
+                f"{cid}: no measurement — {arm.get('note')} (the D8 gate "
+                f"cannot be read off a failed reader)")
+            continue
+        if arm.get("rendered_live"):
+            failures.append(
+                f"{cid}: the superseded claim rendered LIVE (no "
+                f"[SUPERSEDED BY:] flag, no closed window) — the D8 gate "
+                f"is 0%")
+            continue
+        if arm.get("observed"):
+            continue
+        if arm.get("excluded"):
+            continue
+        retrievable = arm.get("retrievable")
+        if retrievable is None:
+            failures.append(
+                f"{cid}: the superseded claim was never observed and the "
+                f"retrievability probe could not read the store — the D8 "
+                f"gate is UNMEASURED, not passed")
+        else:
+            failures.append(
+                f"{cid}: the superseded claim was NEVER RETRIEVED from the "
+                f"store (absent from the lane's own pool) — a retrieval "
+                f"GAP: the D8 gate is UNMEASURED, not passed")
+    return failures
+
+
+
+def _default_sdk_factory() -> TortoiseSDK:
+    db = os.path.join(tempfile.mkdtemp(prefix="ask_distilled_"), "t.db")
+    return TortoiseSDK(db)
+
+
+def run_distilled_leg(*, cases: list[dict] | None = None, judge=None,
+                      out=None, fixture: str | None = None,
+                      sdk_factory=None, mutate=None) -> dict:
+    """Run the planted-supersession leg: BOTH arms, ONE invocation (#9095).
+
+    Per case, two fresh stores:
+
+      * **raw** — ``_seed_memory`` only (the turn store, i.e. the pre-D7
+        instrument's shape);
+      * **distilled** — the same turn store PLUS the distilled corpus and the
+        planted supersession (``seed_distilled_corpus``).
+
+    Same case, same judge, one run — the D4 rule (extend W2-b; no parallel
+    benchmark). Prints human lines plus ONE machine-readable ``DISTILLED_JSON``
+    line on the same stream (no second file, no second invocation) carrying the
+    two numbers the epic's exits need:
+
+      * ``current_state {committed, n, rate}`` — the knowledge-update class:
+        how often the reader committed the CURRENT state. No pass threshold
+        (D8: the first run sets it).
+      * ``superseded_live {seen, observed, rendered_live, excluded, rate}`` —
+        the D8 product gate. ``rendered_live > 0`` is a hard failure of the
+        run. So is a claim that was NOT observed without being proven
+        excluded: a claim the instrument could not observe was not shown to be
+        flagged, it was merely not seen (``_distilled_gate_failures``).
+        ``excluded`` counts D8's other compliant outcome, so a pass by
+        exclusion is reported rather than read as a silent absence.
+
+    ``mutate`` is the mutation hook (the falsification probe: drop the
+    supersession and the gate must go RED). It runs on the distilled arm after
+    seeding.
+    """
+    if cases is None:
+        cases = load_supersession_cases(fixture)
+    if judge is None:
+        judge = build_judge()
+    out = out or sys.stdout
+    sdk_factory = sdk_factory or _default_sdk_factory
+
+    records: list[dict] = []
+    for case in cases:
+        arms = {}
+        for arm in ("raw", _DISTILLED_GATE_ARM):
+            sdk = sdk_factory()
+            try:
+                arms[arm] = _run_one_arm(sdk, case, arm, judge, mutate)
+            finally:
+                sdk.close()
+        records.append({"case_id": case["case_id"], "arms": arms})
+        raw, dist = arms["raw"], arms[_DISTILLED_GATE_ARM]
+        # D8's two compliant outcomes are named separately in the human line:
+        # a pass by EXCLUSION must not read like a case that went unobserved.
+        outcome = ("LIVE" if dist["rendered_live"]
+                   else "flagged" if dist["flagged"]
+                   else "excluded" if dist.get("excluded")
+                   else "UNMEASURED" if dist.get("ok") else "unavailable")
+        print(
+            f"  {case['case_id']:10s} "
+            f"raw: committed={raw['committed']} "
+            f"seen={raw['old_seen']} live={raw['rendered_live']} | "
+            f"distilled: committed={dist['committed']} "
+            f"seen={dist['old_seen']} live={dist['rendered_live']} "
+            f"flagged={dist['flagged']} excluded={dist.get('excluded')} "
+            f"[{outcome}]",
+            file=out)
+
+    raw_state, raw_live = _arm_totals(records, "raw")
+    dist_state, dist_live = _arm_totals(records, _DISTILLED_GATE_ARM)
+    n = len(records)
+    # The D8 gate: no superseded claim rendered live, AND every planted claim
+    # either OBSERVED as a distilled render or PROVEN excluded — fail closed on
+    # the unmeasured (a named failure per case, not just a boolean).
+    failures = _distilled_gate_failures(records)
+    ok = bool(n) and not failures
+
+    report = {
+        "fixture": fixture or os.environ.get(_SUPERSESSION_ENV)
+                   or _SUPERSESSION_FIXTURE,
+        "judge_model": getattr(judge, "model_id", ""),
+        "gate_arm": _DISTILLED_GATE_ARM,
+        "n_cases": n,
+        "seed": {"turns_embedded": SEED_TURNS_EMBEDDED_BY_DEFAULT,
+                 "search_keys": SEED_SEARCH_KEYS_BY_DEFAULT},
+        "current_state": dist_state,
+        "superseded_live": dist_live,
+        "raw_arm": {"current_state": raw_state,
+                    "superseded_live": raw_live},
+        "cases": records,
+        "hard_failures": failures,
+        "ok": ok,
+    }
+
+    print(f"\ndistilled current-state (KU class, {_DISTILLED_GATE_ARM} arm): "
+          f"{dist_state['committed']}/{n} "
+          f"({dist_state['rate']:.2f}) — no pass threshold, the first run "
+          f"sets it (D8)", file=out)
+    print(f"superseded-live (D8 gate, {_DISTILLED_GATE_ARM} arm): "
+          f"{dist_live['rendered_live']}/{n} rendered live, "
+          f"{dist_live['observed']}/{n} observed, "
+          f"{dist_live['excluded']}/{n} excluded — "
+          f"{'PASS' if ok else 'FAIL'} (must be 0 rendered live, {n} "
+          f"observed-or-excluded)", file=out)
+    print(f"  paired raw-turn arm: KU {raw_state['committed']}/{n}, "
+          f"superseded seen {raw_live['seen']}/{n} "
+          f"(a raw-turn store holds no distilled claim to flag)", file=out)
+    for failure in failures:
+        print(f"distilled: HARD FAILURE — {failure}", file=sys.stderr)
+    print("DISTILLED_JSON " + json.dumps(report, sort_keys=True), file=out)
+    return report
+
+
 def _require_judge_key() -> str:
     """Fail-fast pre-flight (issue #2071 step 6): the semantic judge grades
     EVERY question, so a judge provider key is required BEFORE any question
@@ -838,497 +1444,6 @@ def _record(question: dict, result: dict, judge) -> dict:
     }
 
 
-# ── #9095: the distilled + planted-supersession leg ──────────────────────
-
-
-def load_distilled_cases(path: str | None = None) -> list[dict]:
-    """Load the authored distilled/supersession corpus (#9095).
-
-    Resolution order: explicit ``path`` → ``TORTOISE_SPOTCHECK_DISTILLED_CORPUS``
-    env → the committed ``tests/fixtures/ask_spotcheck_distilled.json``.
-    Accepts a bare list or a ``{"cases": [...]}`` wrapper. Raises
-    ``FileNotFoundError`` when none exists — a missing corpus is NEVER an
-    empty run (an empty run reads as a green gate).
-    """
-    candidates = [p for p in (path, os.environ.get(_DISTILLED_FIXTURE_ENV))
-                  if p] + [DISTILLED_FIXTURE]
-    for cand in candidates:
-        if cand and os.path.exists(cand):
-            with open(cand) as f:
-                data = json.load(f)
-            if isinstance(data, dict) and "cases" in data:
-                cases = data["cases"]
-            elif isinstance(data, list):
-                cases = data
-            else:
-                raise ValueError(
-                    f"distilled corpus {cand!r}: expected a list of cases or "
-                    f"a {{\"cases\": [...]}} wrapper")
-            if not cases:
-                raise ValueError(
-                    f"distilled corpus {cand!r} carries no cases — an empty "
-                    f"corpus cannot measure the D8 gate")
-            return cases
-    raise FileNotFoundError(
-        "no distilled corpus found (tried "
-        f"{candidates}; set --distilled-corpus or {_DISTILLED_FIXTURE_ENV})")
-
-
-def _claim_session_id(case: dict, claim: dict, role: str) -> str:
-    """The haystack session a distilled claim was EXTRACTED FROM."""
-    ids = case.get("haystack_session_ids") or []
-    idx = claim.get("session_index")
-    if not isinstance(idx, int) or isinstance(idx, bool) \
-            or not 0 <= idx < len(ids):
-        raise ValueError(
-            f"planted case {case.get('question_id')!r}: distilled.{role}"
-            f".session_index {idx!r} does not name a haystack session "
-            f"({len(ids)} present)")
-    sid = ids[idx]
-    if not isinstance(sid, str) or not sid.strip():
-        raise ValueError(
-            f"planted case {case.get('question_id')!r}: distilled.{role} "
-            f"names session index {idx} whose id is {sid!r}")
-    return sid
-
-
-def _claim_turn_index(case: dict, claim: dict, role: str) -> int:
-    """The SOURCE TURN ordinal of a distilled claim (``source_turn_id``)."""
-    idx = claim.get("turn_index")
-    if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
-        raise ValueError(
-            f"planted case {case.get('question_id')!r}: distilled.{role}"
-            f".turn_index {idx!r} is not a turn ordinal")
-    return idx
-
-
-def seed_distilled_corpus(sdk: TortoiseSDK, case: dict) -> dict[str, str]:
-    """Write ONE planted case's distilled claim pair (#9095) — ADDITIVE.
-
-    ``_seed_memory``'s raw turn leg is not touched: this is a SIBLING seeder,
-    so the 21-question composition keeps its store and its number (the same
-    reason ``SEED_SEARCH_KEYS_BY_DEFAULT`` exists — a mode flag on the shared
-    seeder would move every non-opt-in caller).
-
-    The write is the capture EXTRACTION writer's own call, not a new shape:
-    ``create_point(kind='statement', is_episodic=False, session_id=…,
-    extractedFrom='session:<sid>', validFrom=…, source_turn_id=…, quote=…)``
-    (a distilled claim is not an episodic turn — the raw turn store already
-    holds that), then the ``(:Session)-[:CONTAINS]->(:Point)`` provenance edge
-    capture wires itself, then the supersession through the product's own
-    :meth:`TortoiseSDK.supersede_point` — CORRECTS edge + the old point's
-    terminal status + the contiguous bitemporal window (``validTo`` = the
-    successor's ``validFrom``). Nothing here writes a status flag by hand: a
-    harness that faked the marking could not measure whether the PRODUCT's
-    marking is what the reader sees.
-
-    Idempotent for a re-seed (``dedup=True`` folds on ``(pointKind,
-    content_hash)``, and an already-superseded predecessor is not
-    re-superseded). Returns ``{"old": <id>, "new": <id>}``.
-    """
-    spec = case.get("distilled")
-    if not isinstance(spec, dict) or not spec.get("old") or not spec.get("new"):
-        raise ValueError(
-            f"planted case {case.get('question_id')!r} carries no "
-            f"distilled.old / distilled.new pair")
-    proj = sdk._get_proj()
-    ids: dict[str, str] = {}
-    for role in ("old", "new"):
-        claim = spec[role]
-        content = claim.get("content")
-        valid_from = claim.get("valid_from")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError(
-                f"planted case {case.get('question_id')!r}: distilled.{role}"
-                f".content is empty")
-        if not isinstance(valid_from, str) or not valid_from.strip():
-            raise ValueError(
-                f"planted case {case.get('question_id')!r}: distilled.{role}"
-                f".valid_from is empty — a supersession needs a WINDOW")
-        sid = _claim_session_id(case, claim, role)
-        turn_index = _claim_turn_index(case, claim, role)
-        written = sdk.create_point(
-            "statement",
-            content,
-            is_episodic=False,
-            dedup=True,
-            session_id=sid,
-            extractedFrom=f"session:{sid}",
-            validFrom=valid_from,
-            source_turn_id=turn_index,
-            quote=claim.get("quote") or "",
-        )
-        pid = str(written["id"])
-        # Node MERGE BEFORE the edge MERGE (capture's #490 ordering rule).
-        proj.g.query(
-            "MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
-            "MERGE (s)-[:CONTAINS]->(p)",
-            params={"sid": sid, "pid": pid},
-        )
-        ids[role] = pid
-    old_point = sdk.get_point(ids["old"]) or {}
-    if (old_point.get("status") or "") != "superseded":
-        sdk.supersede_point(ids["old"], ids["new"])
-    return ids
-
-
-def superseded_live_in_evidence(evidence: str, case: dict) -> dict:
-    """The D8 gate read out of the ASSEMBLED READER EVIDENCE (#9095).
-
-    ``docs/product-success-eval.md``: "0% of superseded points appear as live
-    answers (must be flagged or excluded)" — so the check reads exactly what
-    the reader saw, not package stats. ``_render_block`` renders one hit as
-    ``<annotation prefix> <body>``: the body is the TAIL of its block, while
-    every marker and snippet lives in the PREFIX. Two consequences, both
-    load-bearing:
-
-    * a block is the OLD claim when its normalized text ENDS WITH the claim's
-      content — a bracketed prefix can never satisfy that, so **the snippet
-      trap is closed**: the SUCCESSOR's block carries ``[SUPERSEDES: <old
-      content>]`` and holds the old content verbatim, and a substring check
-      would count it (a guaranteed green on exactly the case the gate exists
-      to catch);
-    * of the blocks that ARE the old claim, one that carries no
-      ``[SUPERSEDED BY:`` marker was served as a live answer — the violation.
-
-    Identity note: an authored case keeps its distilled claim content
-    DISTINCT from every raw turn's text (distillation is not transcription),
-    which is what lets the superseded claim's block be told apart from the
-    turn it was distilled from. ``tests/test_ask_spotcheck_distilled.py``
-    pins that corpus property, so a corpus edit cannot silently make this
-    check ambiguous.
-
-    Returns ``{"seen": int, "rendered_live": int, "rate": float|None}``.
-    Those three are the whole RENDER reading. ``run_distilled_case`` adds the
-    two fields that decide what ``seen == 0`` MEANS — ``retrievable`` and
-    ``excluded`` — because only a retrieval probe can tell an exclusion (a
-    compliant D8 pass) from a retrieval gap (an unmeasured gate); see
-    ``superseded_claim_retrievable``. ``seen`` is how many blocks rendered the
-    old claim at all; ``rate`` is
-    ``None`` when ``seen == 0`` — an unobserved case is UNMEASURED, never
-    0.0 (that would be a green gate on a harness that saw nothing). Whole
-    blocks are split on the blank line ``render_context`` joins them with; a
-    multi-PARAGRAPH claim body spans blocks (both authored and product claims
-    here are single-line, and a claim that is not found reads as ``seen == 0``
-    — this function never reports a pass it did not observe; whether that
-    absence is an exclusion or a retrieval gap is decided by the probe, not
-    assumed here).
-    """
-    old = ((case.get("distilled") or {}).get("old") or {})
-    target = _normalize(old.get("content"))
-    seen = rendered_live = 0
-    for block in (evidence or "").split("\n\n"):
-        if not target or not _normalize(block).endswith(target):
-            continue
-        seen += 1
-        if SUPERSEDED_MARKER not in block:
-            rendered_live += 1
-    return {"seen": seen, "rendered_live": rendered_live,
-            "rate": (rendered_live / seen) if seen else None}
-
-
-def superseded_claim_retrievable(sdk: TortoiseSDK, case: dict,
-                                 old_point_id: str | None,
-                                 question_date: str | None = None
-                                 ) -> bool | None:
-    """Is the superseded claim in the ask lane's OWN retrieval pool? (#9095)
-
-    The D8 product gate (``docs/product-success-eval.md``: "0% of superseded
-    points appear as live answers — **must be flagged or excluded**") admits
-    TWO compliant states, and they render identically the moment the claim is
-    not served: ``seen == 0``. A render-only reading cannot tell
-
-    * **excluded** — the claim WAS retrievable and the reader was simply not
-      served it (D8's own second option, a PASS), from
-    * a **retrieval gap** — the claim never came out of the store at all, so
-      the gate was never exercised (UNMEASURED, never a pass),
-
-    and reporting the first as the second is a false red on the product's
-    best-case behaviour. This probe settles it mechanically against the local,
-    freshly-seeded store: it re-runs the lane's own retrieval — same resolved
-    caps, same knobs, ``include_terminal=True`` (the lane's documented call,
-    so a terminal claim is IN scope; a probe with terminal filtered would
-    report every supersession as a gap) — and reports whether the superseded
-    claim's Point came back at all.
-
-    ``True`` → retrievable but not rendered ⇒ excluded ⇒ a reported PASS.
-    ``False`` → absent from the pool ⇒ a retrieval gap ⇒ the hard failure.
-    ``None`` → the probe could not read the store (no id, or it raised) ⇒
-    UNKNOWN, and the caller FAILS CLOSED: an unreadable probe is not evidence
-    of a pass.
-
-    ``_record_reads=False``: this is a MEMBERSHIP probe, never a caller
-    reading these keys. The read funnel records the rows it returns, and a
-    probe's candidate rows would bias ``f`` HIGH — the direction that removes
-    the saving the instrument measures (#7983's pool-caller rule).
-    """
-    if not old_point_id:
-        return None
-    # Lazy import: the probe is a measurement helper, not a module-load cost.
-    from tortoise.retrieval import (
-        ASK_FUSION_K_ENV,
-        ASK_FUSION_WEIGHTS_ENV,
-        ask_env_bool,
-        ask_env_int,
-        ask_env_weights,
-        resolve_ask_retrieval_caps,
-    )
-    caps = resolve_ask_retrieval_caps()
-    try:
-        hits = sdk.tortoise_fts_query(
-            case["question"], limit=caps["limit"],
-            pool_size=caps["pool_size"], include_terminal=True,
-            query_date=question_date,
-            # The lane's own A1/A3/A4 knobs, resolved the same way it does.
-            keep_numeric=ask_env_bool("TORTOISE_ASK_NUMERIC_TOKENS", True),
-            search_keys_prf=ask_env_bool("TORTOISE_ASK_SEARCH_KEYS_PRF",
-                                         False),
-            fusion_weights=ask_env_weights(ASK_FUSION_WEIGHTS_ENV, None),
-            fusion_k=ask_env_int(ASK_FUSION_K_ENV, 60),
-            _record_reads=False)
-    except Exception:  # noqa: BLE001, RUF100 — an unreadable probe is UNKNOWN
-        return None
-    return any(str(h.get("id") or "") == str(old_point_id) for h in hits)
-
-
-def _distilled_judge():
-    """The distilled leg's judge: key-free ``MockJudge`` when
-    ``TORTOISE_SPOTCHECK_JUDGE=mock``, else the composition path's rule."""
-    if (os.environ.get(DISTILLED_JUDGE_ENV, "").strip().lower()
-            == "mock"):
-        return build_judge(mock=True)
-    _require_judge_key()
-    return build_judge()
-
-
-def run_distilled_case(case: dict, judge) -> dict:
-    """ONE planted case, BOTH arms, one invocation (D4: paired, never a
-    parallel benchmark).
-
-    ``raw`` = ``_seed_memory`` only; ``distilled`` = ``_seed_memory`` +
-    ``seed_distilled_corpus``. Same case, same judge, same reader — the only
-    variable is whether the store carries a distilled, superseded claim.
-    Each arm gets its own temp DB, so neither can contaminate the other.
-    """
-    record: dict = {"question_id": case.get("question_id") or ""}
-    for arm in ("raw", "distilled"):
-        db = os.path.join(tempfile.mkdtemp(prefix=f"ask_spot_{arm}_"), "t.db")
-        sdk = TortoiseSDK(db)
-        try:
-            _seed_memory(sdk, case)
-            ids = seed_distilled_corpus(sdk, case) if arm == "distilled" \
-                else None
-            qdate = _to_iso_date(case.get("question_date") or "")
-            try:
-                result = run_ask_lane(sdk, case["question"],
-                                      question_date=qdate)
-            except Exception as e:  # noqa: BLE001, RUF100 — same per-question
-                # rule as the composition leg: an unavailable reader is a
-                # FAILED measurement, recorded (never a silent pass) rather
-                # than aborting the remaining cases.
-                unavailable = superseded_live_in_evidence("", case)
-                unavailable["retrievable"] = None
-                unavailable["excluded"] = False
-                record[arm] = {
-                    "answer": "",
-                    "evidence": "",
-                    "error": f"ask unavailable: {type(e).__name__}",
-                    "current_state": {"committed": False, "n": 0,
-                                      "rate": None},
-                    "superseded_live": unavailable,
-                }
-                continue
-            ok, note, kind = _grade(case, result, judge)
-            evidence = result.get("evidence") or ""
-            superseded = superseded_live_in_evidence(evidence, case)
-            # The RAW arm has no superseded claim to probe — there is nothing
-            # there to retrieve — so it reports ``retrievable: None``.
-            retrievable = (superseded_claim_retrievable(
-                sdk, case, (ids or {}).get("old"), qdate) if ids else None)
-            # D8's "flagged OR excluded": a retrievable claim that never
-            # reached the reader was EXCLUDED — a compliant PASS, reported as
-            # its own field — not the retrieval gap it used to be read as.
-            superseded["retrievable"] = retrievable
-            superseded["excluded"] = bool(not superseded["seen"]
-                                          and retrievable is True)
-            record[arm] = {
-                "answer": result.get("answer") or "",
-                "evidence": evidence,
-                "judge": kind,
-                "note": note,
-                "current_state": {"committed": bool(ok), "n": 1,
-                                  "rate": 1.0 if ok else 0.0},
-                "superseded_live": superseded,
-            }
-        finally:
-            sdk.close()
-    return record
-
-
-def _arm_summary(records: list[dict], arm: str) -> dict:
-    """Aggregate ONE arm's numbers across the planted cases."""
-    committed = measured = seen = rendered_live = excluded = 0
-    for rec in records:
-        whole = rec.get(arm) or {}
-        cs = whole.get("current_state") or {}
-        n = int(cs.get("n") or 0)
-        measured += n
-        committed += 1 if (n and cs.get("committed")) else 0
-        sl = whole.get("superseded_live") or {}
-        seen += int(sl.get("seen") or 0)
-        rendered_live += int(sl.get("rendered_live") or 0)
-        excluded += 1 if sl.get("excluded") else 0
-    return {
-        "current_state": {
-            "committed": committed, "n": measured,
-            "rate": (committed / measured) if measured else None},
-        "superseded_live": {
-            "seen": seen, "rendered_live": rendered_live,
-            "rate": (rendered_live / seen) if seen else None,
-            # D8's second compliant state, counted so the readout stays
-            # honest: excluded cases are PASSES, never silent absences.
-            "excluded": excluded},
-    }
-
-
-def _distilled_payload(records: list[dict]) -> dict:
-    """The machine-readable distilled report (one ``DISTILLED_JSON`` line)."""
-    return {
-        "cases": [
-            {"question_id": rec.get("question_id") or "",
-             "raw": {"current_state": (rec.get("raw") or {}).get(
-                 "current_state"),
-                     "superseded_live": (rec.get("raw") or {}).get(
-                         "superseded_live"),
-                     "error": (rec.get("raw") or {}).get("error")},
-             "distilled": {
-                 "current_state": (rec.get("distilled") or {}).get(
-                     "current_state"),
-                 "superseded_live": (rec.get("distilled") or {}).get(
-                     "superseded_live"),
-                 "error": (rec.get("distilled") or {}).get("error")}}
-            for rec in records
-        ],
-        "arms": {arm: _arm_summary(records, arm)
-                 for arm in ("raw", "distilled")},
-    }
-
-
-def _distilled_hard_failures(payload: dict) -> list[str]:
-    """The D8 gate's failure list — FAIL CLOSED.
-
-    Two hard failures, both per case, both on the DISTILLED arm (the raw arm
-    has no superseded point, so there is nothing there to flag — that
-    contrast IS the measurement):
-
-    1. ``rendered_live > 0`` — a superseded claim reached the reader as a live
-       answer. The product gate is 0%, so any occurrence fails the run.
-    2. ``seen == 0`` **and not excluded** — the superseded claim was never
-       retrieved (``retrievable is False``) or the probe could not tell
-       (``None``), so the gate was never exercised. That is a RETRIEVAL gap in
-       the instrument/store, not a pass, and an unmeasured gate must never
-       read green. ``seen == 0`` **with** ``excluded`` is D8's own other
-       compliant outcome ("must be flagged or **excluded**") and is a PASS.
-
-    Plus an unavailable reader (``n == 0`` with an error): no measurement was
-    taken. ``current_state`` alone is NEVER a hard failure — D8 gives the
-    knowledge-update rate no threshold; the first run sets it.
-    """
-    failures: list[str] = []
-    for case in payload.get("cases") or []:
-        qid = case.get("question_id") or "<unnamed>"
-        arm = case.get("distilled") or {}
-        if arm.get("error"):
-            failures.append(
-                f"{qid}: no measurement — {arm['error']} (the D8 gate cannot "
-                f"be read off a failed reader)")
-            continue
-        sl = arm.get("superseded_live") or {}
-        if int(sl.get("rendered_live") or 0) > 0:
-            failures.append(
-                f"{qid}: {sl['rendered_live']} superseded claim(s) rendered "
-                f"live (no {SUPERSEDED_MARKER} marker) — the D8 gate is 0%")
-        elif not int(sl.get("seen") or 0):
-            if sl.get("excluded"):
-                # Retrievable and simply not served: D8's "excluded" is a
-                # PASS, and it is REPORTED (``excluded: true``) so the pass
-                # is visible rather than an absence that looks like a miss.
-                continue
-            if sl.get("retrievable") is None:
-                failures.append(
-                    f"{qid}: the superseded claim was never observed and the "
-                    f"retrievability probe could not read the store — the "
-                    f"D8 gate is UNMEASURED, not passed")
-            else:
-                failures.append(
-                    f"{qid}: the superseded claim was NEVER RETRIEVED from "
-                    f"the store (absent from the lane's own pool) — a "
-                    f"retrieval GAP: the D8 gate is UNMEASURED, not passed")
-    return failures
-
-
-def _format_distilled_line(idx: int, total: int, rec: dict) -> str:
-    """One human line per planted case: both arms side by side."""
-    parts = []
-    for arm in ("raw", "distilled"):
-        whole = rec.get(arm) or {}
-        if whole.get("error"):
-            parts.append(f"{arm}: {whole['error']}")
-            continue
-        cs = whole.get("current_state") or {}
-        sl = whole.get("superseded_live") or {}
-        # "excluded" is D8's second compliant state — named in the report so a
-        # pass by exclusion is never mistaken for a case that went unobserved.
-        flag = " excluded" if sl.get("excluded") else ""
-        parts.append(
-            f"{arm}: committed={cs.get('committed')} "
-            f"superseded_live={sl.get('rendered_live')}/{sl.get('seen')}{flag}")
-    return (f"[distilled {idx}/{total}] "
-            f"{(rec.get('question_id') or '')[:34]:34s} " + " | ".join(parts))
-
-
-def _run_distilled_leg(corpus_path: str | None) -> int:
-    """Run the distilled + planted-supersession leg (``--distilled``)."""
-    try:
-        cases = load_distilled_cases(corpus_path)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"ask_spotcheck: {exc}", file=sys.stderr)
-        return 2
-    try:
-        judge = _distilled_judge()
-    except (RuntimeError, ValueError) as exc:
-        print(f"ask_spotcheck: {exc}", file=sys.stderr)
-        return 2
-    records: list[dict] = []
-    try:
-        for i, case in enumerate(cases):
-            rec = run_distilled_case(case, judge)
-            records.append(rec)
-            print(_format_distilled_line(i + 1, len(cases), rec))
-    except ValueError as exc:
-        print(f"ask_spotcheck: {exc}", file=sys.stderr)
-        return 2
-    payload = _distilled_payload(records)
-    failures = _distilled_hard_failures(payload)
-    payload["hard_failures"] = failures
-    for arm in ("raw", "distilled"):
-        cs = payload["arms"][arm]["current_state"]
-        sl = payload["arms"][arm]["superseded_live"]
-        rate = "unmeasured" if cs["rate"] is None else f"{cs['rate']:.2f}"
-        live = ("unmeasured" if sl["rate"] is None
-                else f"{sl['rate']:.2f}")
-        print(f"distilled[{arm}]: current_state {cs['committed']}/{cs['n']} "
-              f"({rate}; D8 sets no threshold — this run sets it) — "
-              f"superseded_live {sl['rendered_live']}/{sl['seen']} ({live}; "
-              f"product gate 0%; excluded {sl.get('excluded') or 0})")
-    for failure in failures:
-        print(f"distilled: HARD FAILURE — {failure}", file=sys.stderr)
-    print("DISTILLED_JSON " + json.dumps(payload, sort_keys=True))
-    print(f"distilled: {len(cases)} planted case(s), judge={judge.model_id}, "
-          f"{len(failures)} hard failure(s) (#9095)")
-    return 0 if not failures else 1
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="eval-lane ask QA spot-check (issue #2071: full-semantic "
@@ -1341,21 +1456,38 @@ def main(argv: list[str] | None = None) -> int:
              f"then {_LEGACY_FIXTURE})")
     ap.add_argument(
         "--distilled", action="store_true",
-        help="run the DISTILLED + planted-supersession leg (#9095) instead "
-             "of the composition: the authored 3-case corpus, both arms "
-             "per case, emitting one DISTILLED_JSON line. The two legs are "
-             "kept apart on purpose — their classes have different targets "
-             "(0.8 aggregate vs a 0% rendered-live gate) and folding them "
-             "would make both numbers unreadable")
+        help="run the PLANTED-SUPERSESSION distilled-vs-raw leg (#9095: epic "
+             "#2281 D7/D8) instead of the 21-question spot-check — one run, "
+             "both arms, plus a DISTILLED_JSON line. The two legs are kept "
+             "apart on purpose: their classes have different targets (a 0.8 "
+             "aggregate vs a 0% rendered-live gate) and folding them would "
+             "make both numbers unreadable")
     ap.add_argument(
-        "--distilled-corpus", default=None,
-        help=f"distilled corpus path (default: {_DISTILLED_FIXTURE_ENV} env, "
-             f"then the committed tests/fixtures/"
-             f"ask_spotcheck_distilled.json)")
+        "--supersession-fixture", default=None,
+        help="planted-supersession corpus path (default: the "
+             f"{_SUPERSESSION_ENV} env, then the committed "
+             "tests/fixtures/ask_spotcheck_supersession.json)")
     args = ap.parse_args(argv)
 
     if args.distilled:
-        return _run_distilled_leg(args.distilled_corpus)
+        # Same fail-fast posture as the 21-question path: the KU number is
+        # graded, so no judge key means no number — never a silent skip. The
+        # ONE opt-out is an explicit ``TORTOISE_SPOTCHECK_JUDGE=mock`` (the
+        # benchmark's own MockJudge), so the D8 gate can run key-free in CI;
+        # it is read HERE only, so the composition path's rule is not widened.
+        try:
+            judge = _distilled_judge()
+        except (RuntimeError, ValueError) as exc:
+            print(f"ask_spotcheck: {exc}", file=sys.stderr)
+            return 2
+        try:
+            report = run_distilled_leg(fixture=args.supersession_fixture,
+                                       judge=judge)
+        except (FileNotFoundError, ValueError) as exc:
+            # No corpus, no number — never an empty run reported as a pass.
+            print(f"ask_spotcheck: {exc}", file=sys.stderr)
+            return 2
+        return 0 if report["ok"] else 1
 
     spotcheck = _load_composition(args.fixture)
     # Fail-fast pre-flight (issue #2071 step 6): no judge key → exit BEFORE
