@@ -47,6 +47,17 @@ claim-match threshold or `classify()` therefore reds CI instead of silently revi
 every figure §10 quotes. (`results/7947-score-all.json` — run 1 — cannot be pinned that
 way: its receipts were never retained, so it is a record, not a derivation.)
 
+⛔ **An unscorable run is REFUSED, not settled.** Two reachable defects fixed here,
+both about a delta that does not EXIST: a MISSING precision/recall delta used to
+satisfy the parity tolerance (`all(d is None or …)`), so two arms that each emitted
+zero claims — `precision = hits / 0` is None, Δloss is 0 because every qualifier is
+`absent` on both sides — certified branch 2 and the artifact recorded D3 as
+**settled**; and the unconditional `Δprecision={v:+.1f}` format string raised
+`TypeError` on that same run *before* `write_text()`, so no artifact existed at all.
+Now `main()` exits 2 when a split has no precision delta, every delta renders `n/a`,
+and any missing delta makes the verdict `no branch matched — scoring input
+incomplete` (a route `verdict_label` always had and nothing reached).
+
 Both files live under `tests/eval/write_path/`, which is registered as a
 `SOURCE_PATTERNS` entry of the `eval` surface (`tools/ci_selection.py`) precisely so a
 change to the harness, the scorer, the generator or a sealed `gold/*.json` selects the

@@ -110,6 +110,40 @@ def test_missing_deltas_never_certify():
     assert evaluate_branches(None, None, None, contaminated=CLEAN)["branch_3_stays_provisional"]
 
 
+def test_a_missing_precision_or_recall_delta_is_not_inside_the_tolerance():
+    """`d is None` used to satisfy the tolerance, so an ABSENT delta certified a branch.
+
+    Both arms emitting ZERO claims gives precision `hits / 0` — None — and recall None
+    with it, while Δloss is 0 because every qualifier is `absent` on both sides. So
+    `evaluate_branches(0.0, None, None)` returned `branch_2_certified=True` and
+    `verdict_label` recorded D3 as **SETTLED** off two empty extracts — the exact
+    failure `certified = parity and not contaminated` exists to prevent, reached
+    without tripping any contamination flag (`partial`/`truncated`/`s2_error` are all
+    clean: the output is EMPTY, not incomplete).
+
+    `test_missing_deltas_never_certify` passed `(None, None, None)`, which the
+    `loss is not None` leg alone rejects, so the cell that matters — a PRESENT loss
+    beside a MISSING P/R delta — had no test at all, and the fail-open survived
+    five review cycles. The three tuples here cover the whole reachable shape.
+    """
+    for prec, rec in ((None, None), (None, 0.0), (0.0, None)):
+        verdict = evaluate_branches(0.0, prec, rec, contaminated=CLEAN)
+        assert verdict["branch_2_applies"] is False, (prec, rec)
+        assert verdict["branch_2_certified"] is False, (prec, rec)
+        assert verdict["scoring_input_incomplete"] is True, (prec, rec)
+        label = verdict_label(verdict)
+        assert label == "no branch matched — scoring input incomplete", label
+        assert not label.startswith("settled"), label
+
+
+def test_a_complete_parity_is_still_certified():
+    """Control: the presence guard must reject MISSING deltas, not all deltas."""
+    verdict = evaluate_branches(0.0, 0.0, 0.0, contaminated=CLEAN)
+    assert verdict["scoring_input_incomplete"] is False
+    assert verdict["branch_2_certified"] is True
+    assert verdict_label(verdict) == "settled (branch 2 certified)"
+
+
 # ── the recorded verdict string: ONE route per case ──────────────────────────────
 
 def test_verdict_label_distinguishes_uncertifiable_parity_from_branch_3():
@@ -445,3 +479,75 @@ def test_every_committed_preserved_cell_rests_on_a_word_bounded_marker():
                     "committed run, so §10's 'latent, not a wrong number' no longer "
                     "holds and the runs need re-scoring under a word-bounded table")
     assert checked >= 20, f"only {checked} surviving-claim cells inspected — the pin is vacuous"
+
+
+# ── an arm that emits NOTHING: refused at the CLI, never crashed ────────────────
+
+def test_an_arm_that_emits_no_claims_is_refused_not_crashed(tmp_path, capsys):
+    """An empty extract made `main()` die with a `TypeError`, writing no artifact.
+
+    The decision-input print formatted the three deltas unconditionally, and
+    `_d()` returns None whenever an arm has no reading for a key — which is what
+    precision is for an arm that emitted zero claims (`hits / 0`). So the run
+    that most needs the "cannot certify" record produced NO record at all: the
+    traceback landed before `out_path.write_text()`.
+
+    Fail-closed now, two ways: the deltas render `n/a` (see the sibling test), and
+    a split with no precision delta is REFUSED with a message instead of being
+    scored as a measurement. An empty extract sets no contamination flag either
+    (`partial`/`truncated`/`s2_error` are clean — the output is empty, not
+    incomplete), so this is the one input the receipt guards cannot see.
+    """
+    arms = _receipts_copy(tmp_path)
+    for sid in HOLDOUT_SESSIONS:
+        receipt = arms / f"{sid}.arms.json"
+        rec = json.loads(receipt.read_text())
+        rec["embed_list"] = {arm: {"points": [], "operators": []} for arm in sq.ARMS}
+        receipt.write_text(json.dumps(rec))
+
+    out = tmp_path / "score.json"
+    with pytest.raises(SystemExit) as exc:
+        _score_with(arms, out)
+    assert exc.value.code == 2, "ap.error must REFUSE the run (exit 2), not crash"
+    assert "no precision delta" in capsys.readouterr().err
+    assert not out.exists(), (
+        "a refused run must not write a score artifact — an artifact whose decision "
+        "input is an empty extract is the 'settled off nothing' failure this guards")
+
+
+def test_an_unscorable_delta_is_labelled_incomplete_and_the_artifact_still_writes(
+        tmp_path, capsys, monkeypatch):
+    """A delta that does not EXIST renders `n/a`; the run is recorded, not settled.
+
+    Same crash, different leg: recall is None when the split has no planted units,
+    and the old format string died on THAT too (`TypeError: unsupported format
+    string passed to NoneType.__format__`) before the artifact was written. Here
+    the precision legs are present, so the run is not refused — it is scored, and
+    the route is recorded honestly: no branch was evaluated, so the label says
+    "scoring input incomplete" rather than "settled (branch 2 certified)", which
+    is what a missing delta used to certify.
+    """
+    import shutil
+
+    gold = tmp_path / "gold"
+    shutil.copytree(sq.GOLD_DIR, gold)
+    for sid in HOLDOUT_SESSIONS:
+        path = gold / f"{sid}.gold.json"
+        doc = json.loads(path.read_text())
+        doc["planted_units"] = []          # no planted facts → no recall reading
+        path.write_text(json.dumps(doc))
+    monkeypatch.setattr(sq, "GOLD_DIR", gold)
+
+    out = tmp_path / "score.json"
+    assert _score_with(COMMITTED_ARMS, out) == 0
+    console = capsys.readouterr().out
+    assert "n/a pp" in console, (
+        "the missing recall delta must render as n/a — formatting it crashed the "
+        f"scorer before the artifact was written; console was:\n{console}")
+
+    di = json.loads(out.read_text())["decision_input"]
+    assert di["branches"]["holdout"]["delta_recall_pp"] is None
+    assert di["branch_2_applies"] is False
+    assert di["branch_2_certified"] is False
+    assert di["verdict"] == "no branch matched — scoring input incomplete", di["verdict"]
+    assert "SCORING INPUT INCOMPLETE" in console

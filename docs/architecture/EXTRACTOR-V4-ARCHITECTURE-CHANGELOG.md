@@ -625,3 +625,14 @@ re-derived (run 2 still regenerates byte-identically — now pinned by a test, n
   entry, a `score_qualifiers.py`-only change selected `core` — which registers none of the tests pinning the
   rule, the corpus counts or the artifact. Both halves are now registered (`eval`, plus `core` via
   `CORE_ALSO`) and pinned by `test_write_path_measurement_source_edit_selects_eval`.
+- **A delta that does not EXIST was read as a delta that PASSES — and, before that, crashed the scorer.** Two
+  defects on the same input (an arm that emits no claims): `parity` accepted a missing P/R delta
+  (`all(d is None or abs(d) <= tol)`), so Δloss 0 with precision/recall `None` — every qualifier `absent` on
+  both sides — certified branch 2 and `verdict_label` recorded D3 as **settled** off two empty extracts, with
+  no contamination flag tripped (`partial`/`truncated`/`s2_error` are clean: the output is EMPTY, not
+  incomplete); and the decision-input print formatted the three deltas unconditionally, so the same run raised
+  `TypeError: unsupported format string passed to NoneType.__format__` *before* the artifact was written.
+  `main()` now refuses a split with no precision delta (exit 2, message), every delta renders `n/a`, and a
+  missing delta makes the verdict `no branch matched — scoring input incomplete`. No committed figure changes:
+  run 2 still regenerates byte-identically (the artifact pin is what proves it), and the fix is pinned by
+  four tests that fail on the pre-fix code (two of them on the `TypeError`, verified by reverting the module).

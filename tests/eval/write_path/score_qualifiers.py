@@ -365,6 +365,11 @@ def evaluate_branches(delta_loss_pp: float | None, delta_precision_pp: float | N
       ``truncated``/error means the arm's extract is not what the model produced,
       so its loss is overstated; on this corpus one qualifier moves the holdout
       delta by 10 pp, i.e. across the band.
+    * **A missing delta is not a passing one.** ``None`` means the split has no
+      reading (an arm emitted zero claims, so ``precision = hits / n_claims`` is
+      undefined), never that the arm matched — so parity requires all three deltas
+      to be PRESENT, and an absent one is recorded as
+      ``scoring_input_incomplete`` instead of silently satisfying the tolerance.
     """
     def _pp(v: float | None) -> float | None:
         return None if v is None else round(v, 9)
@@ -383,8 +388,19 @@ def evaluate_branches(delta_loss_pp: float | None, delta_precision_pp: float | N
     condition_met = ((loss is not None and loss > BAND_PP)
                      or any(d is not None and d < -PR_TOLERANCE_PP for d in (prec, rec)))
     fires = condition_met and not narrative_dirty
+    # ⛔ A MISSING P/R delta is not a PASSING one. `all(d is None or abs(d) <= tol)`
+    # made an ABSENT delta satisfy the tolerance, so a split in which an arm emitted
+    # NO claims read as certified: precision is `hits / n_claims` with `n_claims ==
+    # 0` — None — and recall is None for the same reason, while Δloss is 0 because
+    # every qualifier is `absent` on both sides. `evaluate_branches(0.0, None, None)`
+    # therefore returned `branch_2_certified=True`, and `verdict_label` recorded D3
+    # as SETTLED off two empty extracts. That is the exact failure `certified =
+    # parity and not contaminated` exists to prevent, reached without tripping any
+    # contamination flag. S2's flags cannot see it either: an arm that emits nothing
+    # is not `partial`/`truncated`/`errored` — its OUTPUT is empty, not incomplete.
+    scoring_input_incomplete = any(d is None for d in (loss, prec, rec))
     parity = (loss is not None and abs(loss) <= BAND_PP
-              and all(d is None or abs(d) <= PR_TOLERANCE_PP for d in (prec, rec)))
+              and all(d is not None and abs(d) <= PR_TOLERANCE_PP for d in (prec, rec)))
     certified = parity and not contaminated
     # Branch 3's EFFECT ("stays provisional") is what an uncertifiable parity
     # produces too: the registered rule has no branch for "met, but the run cannot
@@ -392,6 +408,10 @@ def evaluate_branches(delta_loss_pp: float | None, delta_precision_pp: float | N
     provisional = not fires and not certified
     return {"branch_1_fires": fires, "branch_2_applies": parity,
             "branch_2_certified": certified, "branch_3_stays_provisional": provisional,
+            # Recorded so the ROUTE can be named: a split with a delta that does
+            # not exist cannot evaluate any branch, and calling that "branch 3"
+            # (the effect flag below) would assert a route the inputs contradict.
+            "scoring_input_incomplete": scoring_input_incomplete,
             "contaminated_receipts": list(contaminated),
             # ⛔ SUPPRESSION REQUIRES THE CONDITION, not merely a dirty narrative
             # receipt. Direction alone cannot say it: at Δ = +2 pp with a partial
@@ -415,6 +435,13 @@ def verdict_label(verdict: dict) -> str:
                 "incomplete and would overstate the delta")
     if verdict["branch_1_fires"]:
         return "the falsifier FIRES (branch 1)"
+    if verdict.get("scoring_input_incomplete"):
+        # Deliberately AFTER the fire: a fire carried by the Δloss leg is real
+        # evidence even when a P/R leg is missing (suppression would be silence).
+        # Before the parity legs it must be, because a missing delta can never
+        # certify — and this is the honest route for an unscorable split, so the
+        # label reaches the sentence the module already had and nothing reached.
+        return "no branch matched — scoring input incomplete"
     if verdict["branch_2_certified"]:
         return "settled (branch 2 certified)"
     if verdict["branch_2_applies"]:
@@ -587,6 +614,20 @@ def main(argv: list[str] | None = None) -> int:
         va, vb = a.get(key), b.get(key)
         return None if va is None or vb is None else 100 * (vb - va)
 
+    def _pp_fmt(v: float | None) -> str:
+        """Render a delta that may not EXIST — `n/a`, never a `TypeError`.
+
+        `_d()` returns None whenever either arm has no reading for the key, and
+        precision/recall are None when an arm emitted zero claims (or the split has
+        no planted units). The three deltas used to be formatted unconditionally,
+        which killed the scorer with
+        ``TypeError: unsupported format string passed to NoneType.__format__``
+        BEFORE ``out_path.write_text()`` — so the run that most needs the
+        "cannot certify" record produced no artifact at all. The pooled lines below
+        already render their rates this way.
+        """
+        return "n/a" if v is None else f"{v:+.1f}"
+
     print("\n── THE DECISION INPUT (pre-registered: HOLDOUT only) ──")
     decision: dict[str, dict] = {}
     for name in ("tuning", "holdout"):
@@ -597,8 +638,20 @@ def main(argv: list[str] | None = None) -> int:
                           "delta_recall_pp": d_rec}
         ra, na = split_agg[name]["raw"], split_agg[name]["narrative"]
         print(f"  {name:8} n={ra['n']:<3} loss raw={ra['loss']}/{ra['n']} "
-              f"narrative={na['loss']}/{na['n']}  Δloss={d_loss:+.1f} pp  "
-              f"Δprecision={d_prec:+.1f} pp  Δrecall={d_rec:+.1f} pp")
+              f"narrative={na['loss']}/{na['n']}  Δloss={_pp_fmt(d_loss)} pp  "
+              f"Δprecision={_pp_fmt(d_prec)} pp  Δrecall={_pp_fmt(d_rec)} pp")
+    # ⛔ An arm that emitted NO claims has no precision to compare (`hits / 0`), so
+    # the split cannot be scored at all. REFUSE the run: with the delta formatted as
+    # `n/a` the scorer would otherwise write an artifact whose decision input is an
+    # empty extract, and before this guard the unconditioned format string crashed
+    # here instead. A run nobody can score is a harness failure, not a measurement.
+    unscorable = [name for name in ("tuning", "holdout")
+                  if decision[name]["delta_precision_pp"] is None]
+    if unscorable:
+        ap.error("no precision delta for split(s) " + ", ".join(unscorable)
+                 + " — an arm emitted no claims in that split (precision is hits / "
+                   "n_claims), so no branch of the rule can be evaluated; fix the "
+                   "arm's extract and re-run")
     hold = decision["holdout"]
     # ⛔ A branch is certified only on CLEAN receipts. The extractor's own `partial`
     # flag (rung-4 prefix-accept: the tail of the list was dropped) or a stage error
@@ -629,7 +682,15 @@ def main(argv: list[str] | None = None) -> int:
           + ("" if not parity else
              ("  → CERTIFIED" if certified else
               "  → NOT CERTIFIED: a holdout receipt is incomplete")))
-    if branch_3 and parity:
+    if verdict["scoring_input_incomplete"]:
+        # A delta the rule reads does not EXIST (an empty planted-unit set gives no
+        # recall; an empty extract gives no precision). No branch can be evaluated,
+        # so the console must not claim branch 3 APPLIED — the label in the artifact
+        # says "scoring input incomplete" and the two must agree case by case.
+        print("  ⛔ SCORING INPUT INCOMPLETE: a delta this rule reads does not exist "
+              "— no branch can be evaluated.")
+        print("  → VERDICT: D3 STAYS PROVISIONAL (unscorable run; not a finding either way)")
+    elif branch_3 and parity:
         # Branch 3 is "anything else". When branch 2 APPLIED and was then not
         # certified, branch 3 was not reached — the registration simply has no
         # branch for "met, but the run cannot be trusted". Its EFFECT is adopted and
