@@ -262,6 +262,47 @@ def test_the_capacity_guards_derived_source_selects_the_guard():
     )
 
 
+def test_the_engine_pin_guards_are_selected_on_the_files_they_pin():
+    """#9085 review P1: a revert of the engine pin must run the guard that pins it.
+
+    `tests/test_runner_ports_6673.py` is registered `core` and carries BOTH #8124
+    guards that read these two files — the compose sweep (whose `COMPOSE_GLOBS`
+    includes `apps/*/docker-compose*.yml`) and the quickstart hand-out
+    (`test_the_selfhost_quickstart_hands_out_the_compose_pin_not_latest`).
+
+    Neither path was kept by the selector, so a one-line revert of either pin
+    merged green and reddened `main` on the post-merge push (the
+    #1349/#3332/#3616 silent-drop class):
+
+    * `apps/` is in `NON_PYTHON_PREFIXES` and matches no `SOURCE_PATTERNS` row,
+      so the diff filtered to `changed == []` and took the docs-only early
+      return — tier-1 smoke only (measured before the `CORE_ALSO` entries:
+      `surfaces=[]`, the guard absent).
+    * `docs/quickstart-selfhosted.md` matched the `#3329` `docs/` pattern that
+      carries `test_capacity_page.py` (`onboarding`), not `core` (measured:
+      `surfaces=['onboarding']`, the guard absent).
+
+    Asserted on the SURFACE and on the guard FILE, not on non-emptiness: a bare
+    "surfaces is non-empty" check passes on the pre-entry tree for the quickstart
+    (`onboarding` is selected without the guard), which is a gate that can only
+    ever pass. Watched RED before the two `CORE_ALSO` entries, GREEN after.
+    """
+    guard = "test_runner_ports_6673.py"
+    for changed in ("apps/graph-viz/docker-compose.yml",
+                    "docs/quickstart-selfhosted.md"):
+        assert (REPO / changed).exists(), f"pinned file is gone: {changed}"
+        r = _sel([changed])
+        assert "core" in r["surfaces"], (
+            f"{changed} selects {r['surfaces']} — the #8124 engine pin it carries "
+            f"is guarded by a `core`-registered test, so a revert of that pin "
+            f"merges green and reds main after the merge"
+        )
+        assert guard in r["test_files"], (
+            f"{changed} does not select {guard} — nothing checks the engine pin "
+            f"on the one diff that can revert it (selected: {r['test_files']})"
+        )
+
+
 def test_the_onboarding_copy_gate_is_wired_not_left_to_the_tier1_fallback():
     """#3673 indicator (2): the parity gate runs on every PR touching either copy.
 
@@ -1929,6 +1970,32 @@ def test_install_queue_reconcile_schedule_tool_change_selects_core_not_tier1():
     r = _sel(["tools/install-queue-reconcile-schedule.sh"])
     assert "core" in r["surfaces"], r
     assert "test_install_queue_reconcile_schedule.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
+def test_ci_queue_health_tool_change_selects_core_not_tier1():
+    # tools/ci_queue_health.py owns tests/test_ci_queue_health.py (the hermetic
+    # cases pinning the FLOOD classification — a deep queue of PR runs is not a
+    # flood, a reporting workflow holding the queue is — the governor's bounds
+    # (never a pull-request-event run, never a workflow outside TRIM_SAFE), and
+    # the truncation labelling).
+    #
+    # Without its CORE_ALSO entry this is the #1349/#3332/#3616 silent-drop
+    # class: `tools/` is a flat NON_PYTHON_PREFIXES entry, so a tool-only change
+    # came back with `changed == []` and took the docs-only early return —
+    # `select()` returned NO surface and the guard never ran on the file it
+    # guards.
+    #
+    # Measured before the fix: `_sel(["tools/ci_queue_health.py"])` ->
+    # surfaces=[], full=False, test_ci_queue_health.py absent.
+    #
+    # CORE_ALSO (not TOOL_CARVEOUTS) is the deliberate choice: the suite is
+    # hermetic and `core`-registered, so selecting `core` runs it at the lowest
+    # CI cost. Mutation check: removing the CORE_ALSO entry selects no surface,
+    # so assert 1 below fails.
+    r = _sel(["tools/ci_queue_health.py"])
+    assert "core" in r["surfaces"], r
+    assert "test_ci_queue_health.py" in r["test_files"], r
     assert r["full"] is False, r
 
 
