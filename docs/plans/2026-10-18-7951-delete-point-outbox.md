@@ -29,8 +29,9 @@ aboutObjects: "#7951, #7950, STORAGE-ARCHITECTURE.md §17.1, tortoise/sdk.py del
 > re-creates the Point from the journal — `recover_from_log` rebuilds only an empty graph. Test pins
 > and the evidence probe were
 > re-measured at that head (`docs/evidence/7951-delete-point-outbox/`). What else is superseded, by
-> location: **§2**'s deliverable sentence, the first three rows of **§5 (Wiring Check)**, and in **§4
-> (Adversarial Threat Surface)** the T1/T2/T2-text/T3/T8 rows all carry an in-place ⚠️ note, and
+> location: **§2**'s deliverable sentence, **§3**'s delete-door row and its closing "the record can and
+> must precede it" sentence (BOTH reversed by #9207), the first three rows of **§5 (Wiring Check)**,
+> and in **§4 (Adversarial Threat Surface)** the T1/T2/T2-text/T3/T8 rows all carry an in-place ⚠️ note, and
 > T3b/T3c/T3d are new rows in §4; the tests are renamed and inverted, so the current names are `test_the_cache_delete_lands_before_the_destruction_record`
 > (T1), `test_a_failed_cache_write_appends_no_destruction_record` (T2),
 > `test_a_landed_destroy_whose_record_failed_is_reported` (T3) and
@@ -116,7 +117,7 @@ generalized the delete's class to all of them (review round 2):
 | door | die between append and cache | replay | die between cache and append |
 |---|---|---|---|
 | `create_point` / `update_point` | `missing_in_cache` — the record exists, the node does not | materialises the write | ahead of truth, no repair path |
-| `delete_point` | **`extra_in_cache`** — the cache holds a node the record no longer has (§17.1's second-writer signature, *not* a lag) | **removes** the node, destructively | resurrection on the next rebuild |
+| `delete_point` ⚠️ **#9207 reversed this row**: the door is now cache-first, so its window is `missing_in_cache` (cache destroyed, record not written — the cache is BEHIND), repaired only by a destructive `rebuild_all`. The row below describes the #7951 order | **`extra_in_cache`** — the cache holds a node the record no longer has (§17.1's second-writer signature, *not* a lag) | **removes** the node, destructively | resurrection on the next rebuild |
 
 On a delete the second window's harm is resurrection, which is strictly worse than loss and is why
 the delete door is worth a unit of its own.
@@ -132,7 +133,9 @@ before the write.
 `_delete_session_sync` journal **after** their guarded deletes, gated on the guarded delete's own row
 count, and that is correct: those `DETACH DELETE`s are CONDITIONAL (`WHERE present = 0`), so the record
 cannot be stated before the write without claiming a destruction the guard may refuse. `delete_point`'s
-delete is unconditional once the probe passes, so the record can and must precede it.
+delete is unconditional once the probe passes ⚠️ **#9207 REVERSED the conclusion this sentence drew
+from that**: the record now FOLLOWS the `DETACH DELETE` (see `tortoise/sdk.py`'s door comment and the
+banner above).
 
 ## 4. Adversarial Threat Surface (declared)
 
@@ -145,6 +148,7 @@ delete is unconditional once the probe passes, so the record can and must preced
 | T3b | a raise does NOT prove "nothing was destroyed" — a lost reply sits over an APPLIED write, so "no record" would be a silent unrecorded destroy | `test_a_lost_reply_over_an_applied_destroy_is_still_recorded` (the delete lands, the reply raises ⇒ the door reads the cache back, appends the destruction record, logs `_reply_lost`, and RETURNS `True` — no refusal is raised, because nothing was lost) | **YES** — measured against `b77d24084`: the old door raised its COMMITTED-arm refusal ("… was DESTROYED in the record and not in the cache … The cache is `extra_in_cache`") over a node the statement had already deleted, sending the caller after a divergence that was not there |
 | T3d | the landed-destroy arm's cause clause is false on the path where the statement APPLIED and then raised a transport error and only the append failed | `test_the_landed_destroy_arm_does_not_claim_the_statement_succeeded` (lost reply + append failure ⇒ `destroy_verified is True`, message must not say "did not report a failure of its own", no doubled period) | **YES** — but the red is the missing ATTRIBUTE, not message text: at `b77d24084` the append runs first, so it raised before the `DETACH DELETE` was issued (no destroy applied, node live) and the predecessor's "the ordering skipped the `DETACH DELETE`" was true; the test fails on `destroy_verified` |
 | T3c | neither verdict is provable (the delete raises AND the read-back raises) | `test_an_unreadable_after_state_writes_no_record_and_claims_nothing` (no record; `destroy_verified is False`; the message must NOT contain "did not report a failure of its own" — that raise is how the arm is reached — nor "the cache no longer holds this Point", nor call a present node "behind the TRUTH"; its PRESENT branch sends the caller to a re-issue and never to `rebuild_all`) | **YES** — the old `record_committed=True` arm claimed a cache state nobody verified |
+| T3e | a `graph was deleted or replaced` abort whose KEY is gone is read back as a landed destroy (the read auto-creates the empty graph, answers `count(n)=0`, and the door returns `True` with a written record) | `test_a_deleted_graph_key_is_never_read_as_a_landed_destroy` (`EXISTS` 0 ⇒ the engine's `ResponseError` surfaces, NO read-back is issued, no record) | **YES** — measured against `origin/main`: the read runs, `landed` is `True`, and the door returns `True` |
 | T4 | journal-first journals a destruction that never happened | `test_a_missing_point_journals_nothing` (unknown id ⇒ `False`, zero records) | no (guard) |
 | T5 | the record's declared shape drifts in with an ordering fix | `test_the_delete_record_keeps_its_declared_shape` (one record, `op=delete`, `label=Point`, no `state`, no JSONL `PointRetracted`) | no (guard) |
 | T6 | the `:GraphEvent` subscriber surface silently changes | `test_the_graph_event_row_is_still_written_after_the_delete` (`poll_events` still reports `PointRetracted` with `deleted: true`) | no (guard) |
@@ -156,10 +160,12 @@ delete is unconditional once the probe passes, so the record can and must preced
 **Measured** (`TORTOISE_TEST_CARVE_OUT=1`, embedded lane): `5 failed, 5 passed` on the pre-change
 source (`origin/main`'s `tortoise/sdk.py` and `tortoise/exceptions.py` — T1/T2/T3/T8/T10 red,
 T4-T7/T9 green), `10 passed` after. ⚠️ Those two counts belong to the PRE-#9207 suite as this plan
-first shipped it; re-measured by #9207 against `b77d24084` with the current 13-test file it is
+first shipped it; re-measured by #9207 against `b77d24084` with the then-current 13-test file it was
 `8 failed, 5 passed` (T1/T2/T3/T8/T3b/T3c/T3d/T10 red, T4-T7/T9 green — T10's delete-door assertions
 survive the reversal, but its additive `update_point` record-noun assertion reddens on the
-predecessor's `PointAdded`) and `13 passed` after. The
+predecessor's `PointAdded`) and `13 passed` after. At THIS head the file has **14 tests**: against
+`origin/main`'s `tortoise/sdk.py` + `tortoise/exceptions.py` it is **`9 failed, 5 passed`** (the extra
+red is T3e, the deleted-graph-key gate) and **`14 passed`** after. The
 guards (T4-T7) pass on both sides by design and say so in their docstrings rather than implying
 detection power. T9 is a guard on the EVIDENCE ARTIFACT, not on the door: it is red against the
 pre-fix probe (whose restore put a BOUND method on the guarded handle's class) and green against the

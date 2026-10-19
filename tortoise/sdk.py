@@ -10875,11 +10875,12 @@ class TortoiseSDK:
           - Entity → delete_entity
         Returns True if a node was found and deleted, False otherwise.
 
-        Can raise instead of returning: the Point branch inherits
-        `delete_point`'s §17.1 refusal, `WriteNotLandedError`
-        (``operation="delete_point"``), when the destruction record does not
-        confirm after the cache write (#9207's order). The entity branch is
-        unchanged.
+        Can raise instead of returning: the Point branch inherits both of
+        `delete_point`'s refusals — `WriteNotLandedError`
+        (``operation="delete_point"``) when the destruction record does not
+        confirm after a landed destroy (``destroy_verified=True``), and the same
+        class with ``destroy_verified=False`` when NEITHER store's state is known.
+        The entity branch is unchanged.
 
         #3300: for the Point branch the `PointRetracted` row is the
         :GraphEvent SUBSCRIBER signal only — rebuild parity comes from the
@@ -11615,9 +11616,12 @@ class TortoiseSDK:
         destructive `rebuild_all`, which every caller reads as "the delete
         happened" while `get_point` disagrees.
 
-        Raises ``WriteNotLandedError`` (``operation="delete_point"``) in the one
-        window this order still has: the destroy LANDED and the
-        `EntityMutated` op=delete record did not confirm. The refusal says so
+        Raises ``WriteNotLandedError`` (``operation="delete_point"``) in TWO
+        windows, and they are distinguishable on the exception:
+
+        * the destroy LANDED and the `EntityMutated` op=delete record did not
+          confirm — ``destroy_verified=True``, ``record_committed=False``. The
+          refusal says so
         (the record is UNCONFIRMED, never known-absent — a journal append can
         write and then raise: a partial `write(2)` stopped by ENOSPC/EIO, or a
         write whose close failed, #5612 having removed the buffered flush). In
@@ -11625,8 +11629,15 @@ class TortoiseSDK:
         nothing repairs it by itself: `recover_from_log` rebuilds only an EMPTY
         graph, and `rebuild_all` is destructive — it RE-CREATES the Point from
         the journal (undoing the delete), after which the delete must be
-        re-issued. A no-op id still
-        returns ``False``; ``True`` still means the node was destroyed.
+        re-issued.
+        * NEITHER store's state is known — ``destroy_verified=False``: the
+          `DETACH DELETE` raised and the cache could not be read back (or its
+          graph key was gone, so the read would have re-created it). No record is
+          written and the refusal claims NOTHING about either store; the caller
+          must establish the cache state with `get_point` before acting.
+
+        A no-op id still returns ``False``; ``True`` still means the node was
+        destroyed (or was already absent when the statement ran).
         """
         proj = self._get_proj()
         exists = proj.g.query(
@@ -11901,13 +11912,18 @@ class TortoiseSDK:
         answers ``None`` (unverified). Neither issues a read, so nothing is
         re-created, and neither claims a destroy.
         """
-        from .retry import graph_abort_family
+        from .retry import _ARM_STATE_INDEPENDENT, _abort_arm
 
-        # The presence probe is paid ONLY on the graph-abort family: it is the
-        # family whose read would re-create a deleted key, and the state-independent
-        # arms (write slot / MISCONF) must not pay an EXISTS round trip on a
-        # failure that has nothing to do with the graph (#7405's contract).
-        if exc is not None and graph_abort_family(exc):
+        # The presence probe is paid on EVERY family except the state-independent
+        # one. Keying it on the graph-abort family alone was too narrow: the read
+        # below is the read that AUTO-CREATES an absent key, and a non-family raise
+        # (a transport error, a non-retryable `ResponseError`) does not prove the
+        # key is still there — `retry.py` states that doctrine for the retry
+        # predicate itself ("a raise does not prove the statement did not land").
+        # So only the arms whose failure is BY CONSTRUCTION unrelated to the graph
+        # (write slot / MISCONF) skip the probe, which is what keeps #7405's
+        # contract (`test_a_write_slot_exhaustion_pays_no_graph_presence_probe`).
+        if exc is not None and _abort_arm(exc) != _ARM_STATE_INDEPENDENT:
             presence = self._graph_presence(proj)
             if presence is False:
                 return False   # key ABSENT: the caller re-raises the loud #7685 error

@@ -496,8 +496,10 @@ def test_an_unreadable_after_state_writes_no_record_and_claims_nothing(
         "nothing verified the cache after the failure, so the message must not "
         f"assert what it holds: {msg!r}")
     # The PRESENT branch may not say the cache is BEHIND the truth: this arm
-    # writes no record, so a present node means the two stores agree. The
-    # ABSENT branch's "ahead of the TRUTH" IS true once a read shows it.
+    # writes no record, so a present node means the two stores agree. The ABSENT
+    # branch names the direction CORRECTLY — cache destroyed with no record is
+    # `missing_in_cache` (the record holds the Point, the cache does not), i.e.
+    # the cache is BEHIND the TRUTH, not ahead of it.
     present_branch = msg.split("PRESENT")[-1].split("ABSENT")[0]
     assert "behind the TRUTH" not in msg, (
         "the first cut of this clause called a present node 'behind a TRUTH "
@@ -507,13 +509,19 @@ def test_an_unreadable_after_state_writes_no_record_and_claims_nothing(
     assert "rebuild_all" not in present_branch, (
         "a destructive rebuild is the ABSENT branch's repair, not this one: "
         f"{present_branch!r}")
+    absent_branch = msg.split("ABSENT")[-1]
+    assert "BEHIND the TRUTH" in absent_branch, (
+        "a destroyed cache with no record is `missing_in_cache` — the cache is "
+        f"BEHIND the truth, and the message must not invert it: {absent_branch!r}")
+    assert "ahead" not in absent_branch.lower(), (
+        f"the inverted direction came back: {absent_branch!r}")
     assert _mutations(events, pid) == [], (
         "an unverified cache state must never be recorded")
     assert _live(proj, pid) is True, (
         "premise: the injected failure never reached the engine")
 
 
-# ── T3d: a deleted graph key is UNKNOWN, never "landed" ────────────────────
+# ── T3e: a deleted graph key is never read back as "landed" ────────────────
 
 def test_a_deleted_graph_key_is_never_read_as_a_landed_destroy(env, monkeypatch):
     """A `graph was deleted or replaced` abort must not be swallowed by the
@@ -533,8 +541,12 @@ def test_a_deleted_graph_key_is_never_read_as_a_landed_destroy(env, monkeypatch)
     returned True over a graph that no longer exists.
 
     MUTATION: drop the `_graph_presence` gate (or treat "absent" as present) and
-    the read runs, `landed` comes back True, `delete_point` RETURNS True and a
-    record is written — this reddens on all three.
+    the read-back RUNS — asserted here, and the assertion is what reddens: this
+    fixture leaves the Point in the graph, so the read finds it and the door
+    raises the loud error instead of writing a record. (On a real v6 server the
+    same read answers 0 and the door RETURNS True with a written record — that is
+    the defect this gate exists to prevent, measured on a live engine when the
+    gate was absent.)
     """
     import redis.exceptions as redis_exc
 

@@ -608,9 +608,11 @@ class WriteNotLandedError(RuntimeError):
                 "(`get_point`), then: node PRESENT ⇒ the destroy did not land, "
                 "the cache and the TRUTH still agree, and the delete must be "
                 "RE-ISSUED; node ABSENT with no "
-                f"{self.record} record ⇒ the destroy landed unrecorded (the "
-                "cache is ahead of the TRUTH), and the repair is a DESTRUCTIVE "
-                "`rebuild_all`, which re-creates the Point from the journal"
+                f"{self.record} record ⇒ the destroy landed unrecorded — the "
+                "cache is BEHIND the TRUTH (`missing_in_cache`: the journal still "
+                "holds the Point, the cache does not) — and the repair is a "
+                "DESTRUCTIVE `rebuild_all`, which re-creates the Point from the "
+                "journal"
             )
         elif operation == "delete_point":
             # The DELETE door's unconfirmed arm, REWRITTEN FOR #9207's ORDER.

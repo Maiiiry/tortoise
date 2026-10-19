@@ -94,11 +94,14 @@ only (the worktree and the `mkdtemp` names are per-run); every measured line is 
 ```console
 $ TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
     tests/test_7951_delete_point_outbox.py -q
-13 passed
+14 passed
 ```
 
 `tests/test_7951_delete_point_outbox.py` carries the threat rows this door declares: T1 the ordering
-(cache before record), T2 no record for a destroy the cache did not perform, T3/T8 a landed destroy
+(cache before record), T3e a `graph was deleted or replaced` abort whose KEY is gone is never read
+back as a landed destroy (the read would auto-create the empty graph and answer `count(n)=0`, so the
+door gates the read on `EXISTS` and surfaces the engine's own error instead), T2 no record for a
+destroy the cache did not perform, T3/T8 a landed destroy
 whose append failed (reported, and repaired only by a destructive rebuild), T3b a raise that does not
 prove "nothing was destroyed" (the door reads the cache back, so a lost reply over an APPLIED write is
 still recorded), T3d the landed-destroy arm's OWN reason (a lost reply over an APPLIED destroy whose append then
@@ -111,8 +114,9 @@ caller to a re-issue and must NOT send them to `rebuild_all`, which is the ABSEN
 all three clauses were false in the first cut of the shared prose), T4 no record for a no-op delete, T5 the
 record's declared shape, T6 the `:GraphEvent` subscriber row, T7 the journal-less (`None`) arm, T9 the
 evidence probe's own instrumentation, T10 the delete door's own record in the refusal and the graph on
-the cache clause. **T1/T2/T3/T8/T3b/T3c/T3d/T10 were measured RED against #9207's predecessor** (the
-record-first order: `8 failed / 5 passed` with this 13-test file — T10 reddens on its `update_point`
+the cache clause. **T1/T2/T3/T3e/T8/T3b/T3c/T3d/T10 were measured RED against #9207's predecessor** (the
+record-first order: with the CURRENT 14-test file, `9 failed / 5 passed` at `origin/main` — T10
+reddens on its `update_point`
 record-noun assertion, which the predecessor answered with `PointAdded`), and the reason differs by row
 because the old order got each case wrong in its own direction: T1 read `['journal', 'cache']` (the record first); T2/T3c/T8
 read a committed `EntityMutated` op=delete over a cache that never performed the destroy; **T3** is
