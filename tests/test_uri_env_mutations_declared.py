@@ -990,13 +990,15 @@ def _scope_map(src: str) -> list[tuple[str, str | None]]:
         # Paren balance over `code`, the `_code_only` output — code brackets
         # only, so a bracket inside copy cannot freeze the continuation state
         # (#8995). NOT over the raw line (#8487), and NOT over a second,
-        # `tokenize`-based counter: `tokenize` emits ONE column for an
+        # `tokenize`-based counter: `tokenize` emits ONE column for the
         # `FSTRING_MIDDLE` holding `{{`, so the second brace of `f"a {{ b"`
         # reaches a tokenize-span counter as code and opens a paren that
-        # nothing closes (measured: 7 files / 9,056 mislabelled lines at
-        # `9ed16dd18`, `tests/test_ship_test_onboarding.py` alone losing 5,845
-        # from its first `{{` onward). `_code_only` blanks the whole literal,
-        # f-string braces included, in one column-aligned pass.
+        # nothing closes. Measured on this tree by diffing the two scope maps
+        # over the whole guard scan set (1,008 files): 8 files / 9,263
+        # mislabelled lines, every one of them from a `{{` on an f-string line
+        # — `tests/test_ship_test_onboarding.py` alone loses 5,845 lines from
+        # its `{{` at L546. `_code_only` blanks the whole literal, f-string
+        # braces included, in one column-aligned pass.
         for ch in code:
             if ch in "([{":
                 paren += 1
@@ -1404,9 +1406,10 @@ def test_a_def_inside_a_docstring_is_not_a_function_start():
     `fake` rather than to `test_first`, so any report about them names a scope
     the file does not have (the wrong-name class #8487 produced).
 
-    Discriminating by construction: `_scope_map` routed through the raw line
-    (`_code_only` makes the whole line code-only — it blanks
-    strings for the `def` match) maps line 3 to ``("fn", "fake")``.
+    Discriminating by construction: a counter that blanks only BRACKETS and
+    not string literals — the pre-#8487 raw-line count — maps line 3 to
+    ``("fn", "fake")``, while the `_code_only`-based map keeps it in
+    ``test_first``.
     """
     src = (
         "def test_first():\n"
@@ -1542,7 +1545,7 @@ def test_a_comment_cannot_open_a_string_or_freeze_the_scope_map():
     """A `#` comment is COPY for both lexers (#8937 review — the COMMENT arm
     had no pin left once the interim raw-line counter was replaced).
 
-    Two arms, each discriminating on its own:
+    Two arms, each discriminating against a DIFFERENT pre-fix shape:
 
     * `_code_only` truncates at `#` BEFORE it looks at quotes, so a comment
       that MENTIONS a triple quote cannot open a region. Without that branch
@@ -1550,7 +1553,13 @@ def test_a_comment_cannot_open_a_string_or_freeze_the_scope_map():
       is blanked as string content, and the next real `def` is not recognised
       — so statements after it are attributed to the function above it.
     * the continuation counter runs over `_code_only`'s output, so an
-      unmatched `(` in a comment cannot freeze it for the rest of the file.
+      unmatched `(` in a comment cannot freeze it for the rest of the file —
+      the raw-line count (#8487/#8995) does freeze it. That arm is observed on
+      the `def` AFTER the comment line, never on the comment line itself:
+      `_scope_map` assigns a line's scope BEFORE applying that line's bracket
+      delta, so a frozen counter can only show up downstream. Pre-fix scope
+      maps are identical to this one for the comment LINE, which is why the
+      pin here is `scopes[5]`.
     """
     line = '    note = 1  # a """ triple quote and a ( bracket in prose'
     code, triple = _code_only(line, None)
@@ -1571,9 +1580,6 @@ def test_a_comment_cannot_open_a_string_or_freeze_the_scope_map():
         'def second():\n'
         '    return 2\n'
     )
-    assert _scope_map(src)[1][0] == "fn", (
-        "the bracket inside the comment was counted as an open expression",
-        _scope_map(src)[1])
     scopes = _scope_map(src)
     assert scopes[1] == ("fn", "_helper"), scopes[1]
     assert scopes[5] == ("fn", "second"), (
@@ -1586,17 +1592,17 @@ def test_scope_map_ignores_an_escaped_brace_in_an_fstring():
 
     A `tokenize`-span counter sees one column for the `FSTRING_MIDDLE` that
     holds `{{`, so the SECOND brace reaches the counter as code and opens a
-    paren nothing closes: `f"a {{ b"` nets `+1`. Measured at `9ed16dd18`, that
-    mislabelled 7 files / 9,056 lines from their first `{{` — and a COMPLIANT
-    test appended downstream reded with two violations naming the wrong
-    function. `_code_only` blanks the whole literal, escaped braces included.
+    paren nothing closes: `f"a {{ b"` nets `+1`. Measured on this tree (the
+    guard scan set, 1,008 files, scope maps diffed against the tokenize-span
+    counter), that mislabelled 8 files / 9,263 lines from their first `{{` —
+    and a COMPLIANT test appended downstream reded with two violations naming
+    the wrong function. `_code_only` blanks the whole literal, escaped braces
+    included.
 
     Only a NET-POSITIVE surplus is observable: `}}` nets `-1` and the clamp
-    absorbs it, so a `}}` line alone cannot discriminate. Of the 104 files in
-    `tests/` that carry `{{` in an f-string, 95 are balanced and 1 is
-    net-negative (both invisible to the clamp) and only 7 of the 8 net-positive
-    ones diverge (the eighth has no `def` after its surplus). This source
-    therefore carries the `{{` arm ONLY.
+    absorbs it, so a `}}` line alone cannot discriminate (a `{{`/`}}`-balanced
+    line is invisible to the clamp as well). This source therefore carries the
+    `{{` arm ONLY.
     """
     src = (
         'import os\n'

@@ -2261,9 +2261,18 @@ def test_drop_test_graph_never_raises_when_the_name_cannot_be_classified(monkeyp
         assert _live_utils.drop_test_graph(proj) is False, (
             "an unclassifiable name must not delete anything")
         assert proj.db.calls == [], proj.db.calls
-        assert any(e.get("event") == "failed" for e in
-                   _live_utils.graph_delete_events()), (
-            "the failure was silent — nothing recorded it")
+        # Scoped to THIS graph name: `graph_delete_events()` is the whole
+        # session-global record, so an unscoped `any(event == "failed")` is
+        # satisfied by any EARLIER test's teardown and could not detect a
+        # silent failure here at all (the sibling refusal test filters the same
+        # way). The reason is asserted too — a bare "failed" entry recorded by
+        # some other arm would not carry the gate's own prefix.
+        events = [e for e in _live_utils.graph_delete_events()
+                  if e.get("name") == "test_proj125_0123abcd"]
+        assert events and events[-1]["event"] == "failed", (
+            "the failure was silent — nothing recorded it for this graph",
+            events)
+        assert str(events[-1].get("reason", "")).startswith("gate:"), events
     finally:
         _live_utils._restore_graph_delete_events(snapshot)
 
