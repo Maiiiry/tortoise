@@ -1235,6 +1235,24 @@ surfaces:
   # guard HERE is what makes the file selected for the code it holds.
   - test_5612_journal_append_serialization.py
   - test_kind_vocabulary_consistency.py
+  # #9123 (§17.1's THIRD lane): the `:EpMeta` epoch declaration. BOTH its
+  # subjects — `tortoise/projection/__init__.py` (the new
+  # `_graph_metadata_write_scope`) and `tortoise/sdk.py`
+  # (`TortoiseSDK._advance_ep_version`) — are `SHARED_MODULES`, so a diff to
+  # either runs the FULL matrix and the file is selected regardless (the
+  # `#6211` idiom: do NOT re-read this entry as "`core` covers the code-side
+  # diffs", it does not). `core` is a belt-and-braces arm, and it is
+  # load-bearing for the diffs that really do select `core` rather than the
+  # full matrix — a `config/ci-surfaces.yml`-only diff, or a
+  # `tortoise/projection/`-SIBLING-only one (e.g. `entities.py`): both select
+  # `['core']` and 578 files, which includes this one. (A push/schedule event,
+  # a shared module and an unknown path each go to the full matrix instead.)
+  # It is also what satisfies `--integrity`'s "every test file is
+  # classified" rule. Not mirrored onto
+  # the `#7951` siblings' six surfaces: their guard's subjects span them,
+  # this file's do not, and an over-broad registration would run it on diffs
+  # it cannot observe.
+  - test_9079_ep_epoch_declared.py
   # #7983 (§17.4.4/§17.4.6): the read ledger — the instrument the hot fraction
   # `f` never had. `core` is the right arm: neither tortoise/read_ledger.py (a NEW
   # file, so it matches no SOURCE_PATTERN) nor tortoise/sdk.py selects anything
@@ -1910,6 +1928,13 @@ surfaces:
   - test_embed_metering.py   # #4488: the tally/middleware/hook + the registry-lane writer/reader (dual with `api`/`eval`)
   - test_retrieval_metering.py   # #4489: the tally/middleware/hook + the registry-lane writer/reader (dual with `api`)
   - test_embedder_provision.py
+  # #3990: the why block must name the operator that mediates a support (id +
+  # type + Layer-3 label) plus any mitigation on it. `tortoise/why.py` selects
+  # `core` and nothing else, so this is the surface its guard has to live on —
+  # registered on `ep` it would never run for the file it pins (measured:
+  # select(['tortoise/why.py'], 'pull_request') -> ['core']).
+  - test_why_operator_mediation.py
+  - test_why_layer_rate.py  # #3990: the why-layer rate instrument (W0/W1/W2/W3 + M4/M5/M6 movement control); `tools/why_layer_rate.py` is in ci_selection.CORE_ALSO so a tool-only diff selects `core` too
   - test_embedding_model_required.py   # #4861: the REQUIRED-embedder contract (core: embeddings.py + exceptions.py)
   - test_hermetic_egress_guard.py  # #4387: pins the suite-wide egress guard installed by tests/conftest.py — a conftest change already forces `full`, so this registration exists to keep the guard's own file in the surface it protects
   - test_embedded_evidence.py
@@ -5473,6 +5498,16 @@ durations:
   test_invite_fusion_http.py: 12.2
   test_signup_token_revoke.py: 4.0
   test_w4_why_enrichment.py: 4.0
+  test_why_operator_mediation.py: 4.5  # #3990 measured locally (9 tests, embedded graphs)
+  test_why_layer_rate.py: 22.0  # #3990 measured locally (15 tests; each movement control seeds a fresh graph)
+  #3400 trap: files ADDED BY A MAIN PUSH carry no junit row until the next
+  # refresh, which dropped `durations` coverage to 89.9% (below the 90% floor)
+  # and reds `ci_selection.py --integrity` on EVERY PR (python-ci.yml's required
+  # manifest-integrity job). Local embedded/docker-lane readings, measured at
+  # this branch head as the sum of testcase/@time over all tests:
+  test_7951_enforce_atomic_write.py: 7.4  # #7951: 19 tests, 7.39s wall (measured at the rebase head; refresh from the first post-merge run)
+  test_9079_onboarding_declared_lane.py: 3.6  # #9079: 14 tests, 3.63s wall (same convention)
+  test_write_op_reachability.py: 3.3  # #8135: 43 tests + 1 xfail, 3.25s wall (same convention)
   test_capture_loop_responsiveness.py: 10.2
   # #2988/#3243: AST pins plus behavioural tests that park real daemon-pool
   # workers on threading.Event gates and drive a reachable cold-start through
@@ -6549,6 +6584,7 @@ durations:
   test_7951_create_point_outbox.py: 3.2  # unmeasured — #7951 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). MEASURED this turn: WITHOUT this row `duration_coverage_issues()` red at 772/858 = 89.98% — the same shape as the `test_7950_capstone_probe.py` row above. Local embedded-lane reading 3.2s (14 tests × ~0.23s). Refresh from the first post-merge run that includes it.
   test_7951_update_point_outbox.py: 7.2  # unmeasured — #7951 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). MEASURED this turn: WITHOUT this row `duration_coverage_issues()` red (790/878 = 90.0% at the floor, and the file packs at the flat 2.0s default) — the same shape as the `test_7951_create_point_outbox.py` row above. Local embedded-lane reading 7.2s (6 tests; two of them rebuild the graph). Refresh from the first post-merge run that includes it.
   test_7951_delete_point_outbox.py: 5.0  # unmeasured — #7951 increment 4a (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only), and an absent row packs it at the flat 2.0s default, which drops `duration_coverage_issues()` under the 90% floor — the same shape as the `test_7951_create_point_outbox.py` row above. Local embedded-lane readings 4.3–6.8 s when the file collected 6 tests; at this head it collects 10 (T1-T10, TWO of which call `rebuild_all` — T3 and T8) and measured 7.5 s here on the same lane, so the 5.0 weight is a lower-ish bound in the right neighbourhood rather than a stale one. Refresh from the first post-merge run that includes it.
+  test_9079_ep_epoch_declared.py: 7.2  # unmeasured — #9123 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). MEASURED this turn: WITHOUT this row `duration_coverage_issues()` red at 840/934 = 89.9% — the same shape as the `test_7951_create_point_outbox.py` row above. Local embedded-lane readings 5.9/6.0/6.4 s over three runs (6 tests; one calls `rebuild_all`). ⚠️ A longer reading (148 s) is NOT this file's weight: the FIRST `create_point` in a process lazily loads the embedding model — 15.7 s standalone, and 134 s for the one test that pays it under fleet load 65 — after which creates are 0.16 s. That one-time load is paid once per file and is not what this weight packs. Declared above the quiet-box readings so a cold leg cannot under-pack. Refresh from the first post-merge run that includes it.
   test_audit_fallback_home_isolation.py: 2.4
   test_ci_stall_identify.py: 16.0  # #5035: the 1.8 predated this PR's subprocess-launching tests. A quiet-machine estimate (measured 12.3, 14.8, 16.3 s; 25.9 s under moderate load and 34-40 s at fleet load 67-79 — the file spawns pytest children, so it tracks box load hard). `tools/ci_timing.py --refresh-durations` is the canonical (CI-measured) writer; this line is a local estimate until it next runs.
   test_env_contract_covers_supabase_config.py: 2.0  # #4030: appended by hand so the entry exists at all — main sat only just above the guard's floor (764/848 fast files = 90.09%), and this new fast file tipped `duration_coverage_issues()` below it (764/849 = 89.99%, formatted as the `90.0%` in that error). Local estimate: 3.24 s measured for this file plus its paired pin in test_ci_selection.py, most of it one conftest import. `tools/ci_timing.py --refresh-durations` replaces it with the CI-measured value.
