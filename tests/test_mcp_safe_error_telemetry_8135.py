@@ -33,7 +33,6 @@ from fastmcp.tools import FunctionTool
 
 from tortoise import mcp_server as ms
 
-
 # ── Harness ───────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -163,6 +162,44 @@ async def test_a_code_less_safe_error_is_recorded_as_a_failure(events, stdio):
 
 
 @pytest.mark.asyncio
+async def test_the_real_recall_tool_is_classified_through_its_wider_payload(
+        events, stdio, monkeypatch):
+    """The FLAGSHIP retrieval tool, driven through its real body (#8135 P1).
+
+    `tortoise_recall` does NOT return the `_SafeError` verbatim: it answers
+    ``{"mode": mode, **results}`` — a NEW plain dict. Whole-dict equality
+    therefore never matched it, and a swallowed quota/backend failure on
+    ``tortoise_recall`` (one of only three names in
+    `RETRIEVAL_TOOL_ALLOWLIST`, i.e. the population stage 4/5 measures) was
+    still recorded ``ok``. The match must use the identifying ``error`` text
+    `_safe` produced in this dispatch, which survives the spread.
+
+    Pre-fix this asserts ``ok``: that is what makes it a pin and not a
+    restatement of the #8482 envelope repair (which cannot reach a ``-> dict``
+    tool at all — there is no wrap envelope to repair).
+    """
+    class _RaisingRecallSDK:
+        def recall_state(self, *a, **kw):
+            raise _quota_error()
+
+    monkeypatch.setattr(ms, "_get_org_sdk", _RaisingRecallSDK)
+
+    result = await ms.mcp.call_tool("tortoise_recall", {"query": "q"})
+
+    # The wire is unchanged: the caller still sees the mode-spread failure.
+    assert result.structured_content == {
+        "mode": "state", "error": "points quota exceeded",
+        "code": ms.ERR_QUOTA}
+    row = events[-1]
+    assert row["status"] == "exec_error", (
+        "tortoise_recall reshapes the _SafeError into {mode, **results}; a "
+        f"whole-dict match misses it and the failure reads ok: {row}")
+    assert row["error_kind"] == "safe_error", row
+    # A failure returned no collection — unknown, never 0 (#3675).
+    assert row["result_count"] is None, row
+
+
+@pytest.mark.asyncio
 async def test_a_plain_dict_refusal_is_still_recorded_ok_this_is_the_boundary(
         events, stdio):
     """SCOPE, pinned: this fix covers `_SafeError` payloads, not plain dicts.
@@ -234,6 +271,38 @@ async def test_a_union_envelope_tool_is_classified_through_the_envelope(
     row = events[-1]
     assert row["status"] == "exec_error", row
     assert row["error_kind"] == "safe_error", row
+
+
+def test_returned_safe_failure_matches_a_failure_spread_into_a_wider_payload():
+    """`tortoise_recall`'s shape: ``{"mode": ..., **_safe_failure}``.
+
+    The failure is a NEW dict, so whole-dict equality cannot match it. The
+    identifying ``error`` text can — and only that text: a payload carrying a
+    DIFFERENT message, a non-string ``error`` (the wait-bound refusal's
+    ``{"error": {code, message}}``), or a success whose user prop happens to be
+    named ``error`` must all stay unmatched (the false-positive direction).
+    """
+    failure = ms._SafeError({"error": "points quota exceeded",
+                            "code": ms.ERR_QUOTA})
+    token = ms._dispatch_safe_failures.set([failure])
+    try:
+        spread = {"mode": "state", **failure}
+        assert spread != failure, "premise: the spread is a different dict"
+        assert ms._returned_safe_failure(spread) is failure
+        # ...and still through a wrap envelope, for a union-annotated tool.
+        assert ms._returned_safe_failure(
+            {"result": {"mode": "state", **failure}}) is failure
+        # A DIFFERENT message this dispatch never produced is not a match.
+        assert ms._returned_safe_failure(
+            {"mode": "state", "error": "a user prop"}) is None
+        # A non-string `error` (the wait-bound refusal shape) is not a `_safe`
+        # failure and must not be matched by it.
+        assert ms._returned_safe_failure(
+            {"error": {"code": ms.ERR_TIMEOUT, "message": "x"}}) is None
+        # An unrelated payload with no text at all is not a match.
+        assert ms._returned_safe_failure({"mode": "state"}) is None
+    finally:
+        ms._dispatch_safe_failures.reset(token)
 
 
 def test_returned_safe_failure_reads_through_the_envelope():
@@ -379,13 +448,12 @@ async def test_the_wire_is_unchanged_by_the_classification(events, stdio):
     assert events[-1]["status"] == "exec_error"
 
 
-def test_safe_outside_a_dispatch_is_unchanged(monkeypatch):
+def test_safe_outside_a_dispatch_is_unchanged():
     """`_safe` driven directly (no MCP seam) must not need a dispatch holder.
 
     The holder is only open inside `_wrapped_call_tool`; `_note_safe_failure`
     is a no-op otherwise, and the return value is the same `_SafeError`.
     """
-    monkeypatch.setattr(ms, "_transport_mode", ms._transport_mode)
     token = ms._transport_mode.set("http")
     try:
         assert ms._dispatch_safe_failures.get() is None, (

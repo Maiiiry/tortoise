@@ -1113,6 +1113,21 @@ def _note_safe_failure(payload: dict[str, Any]) -> None:
         del recorded[:-_MAX_RECORDED_SAFE_FAILURES]
 
 
+def _carried_error_text(payload: Any) -> str | None:
+    """The `_safe` failure TEXT a dict carries, or ``None``.
+
+    `_safe` answers every failure with a string ``error`` (``#329``'s quota
+    branch adds ``code``; the auth gate and the generic branch carry the text
+    alone). Reading that ONE identifying value — rather than comparing whole
+    dicts — is what makes the match survive a tool body that SPREADS the
+    failure into a wider payload instead of returning it verbatim.
+    """
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("error")
+    return message if isinstance(message, str) else None
+
+
 def _returned_safe_failure(payload: Any) -> dict[str, Any] | None:
     """The `_safe` failure THIS dispatch returned, or ``None`` (#8135).
 
@@ -1122,14 +1137,40 @@ def _returned_safe_failure(payload: Any) -> dict[str, Any] | None:
     FastMCP wraps a ``-> list[dict]`` tool's result as ``{"result": ...}``, so
     a top-level-only read would miss every array-envelope tool.
 
-    Equality is what keeps a RECOVERED failure out of the failure column.
+    Two matches, in order, because a tool body may return the failure VERBATIM
+    or RESHAPE it:
+
+    * **Exact dict equality** — the common case (an object-annotated tool whose
+      body is ``return _safe(...)``).
+    * **The identifying ``error`` TEXT** `_safe` itself produced in THIS
+      dispatch. ``tortoise_recall`` returns ``{"mode": mode, **results}`` — a
+      NEW plain dict, so whole-dict equality missed it and the flagship
+      retrieval tool recorded a swallowed quota/backend failure as ``ok``
+      (#8135 review P1). Reading the text through the envelope as well as the
+      top level covers both shapes, and a transform that ADDS keys (every tool
+      in the tree) cannot hide the failure any more.
+
+    The text is not key presence: it is equality against a string this
+    dispatch's own `_safe` call produced, so #3926's false positive (a
+    SUCCESSFUL write whose user props carry a key named ``error``) stays out — a
+    user value equalling a message `_safe` produced in the same call is not a
+    realistic collision, whereas ``"error" in payload`` reclassifies every such
+    write.
+
+    Identity is what keeps a RECOVERED failure out of the failure column.
     ``tortoise_suggest_entry_points`` calls `_safe(tortoise_fts_query)` and,
     when that fails, returns a DIFFERENT `_safe` call's result: its dispatch
     SUCCEEDED, and a "did any `_safe` call fail" flag would record it as
-    ``exec_error``. Requiring the returned payload to EQUAL a recorded failure
-    does not — and the false-negative direction (a tool that returns a
-    transformed copy of a failure) deliberately reads ``ok`` rather than
-    inventing a failure the wire never showed.
+    ``exec_error``. Requiring the returned payload to CARRY a recorded
+    failure's text does not — the recovered payload carries the SUCCESSFUL
+    call's result, not the failed one's message.
+
+    Residual, deliberate: a tool that REWRITES the text (prefixes it with its
+    own prose) or buries it deeper than the top level / wrap envelope still
+    reads ``ok``. No tool in the tree does either — every `_safe` return site
+    hands the `_SafeError` back verbatim, and `tortoise_recall`'s only reshape
+    keeps the text at the `error` key. That false-negative direction is
+    preferred to inventing a failure the wire never showed.
     """
     failures = _dispatch_safe_failures.get()
     if not failures or not isinstance(payload, dict):
@@ -1141,6 +1182,12 @@ def _returned_safe_failure(payload: Any) -> dict[str, Any] | None:
     for candidate in candidates:
         for failure in failures:
             if candidate == failure:
+                return failure
+        carried = _carried_error_text(candidate)
+        if carried is None:
+            continue
+        for failure in failures:
+            if _carried_error_text(failure) == carried:
                 return failure
     return None
 
@@ -1311,8 +1358,10 @@ async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None,
         # every such call used to be recorded `ok` with no kind — including a
         # quota wall, a bundle-validation rejection and an unrecognised recall
         # mode. `_returned_safe_failure` matches the payload this dispatch
-        # actually RETURNED, so a tool that recovered from a secondary `_safe`
-        # failure stays `ok`.
+        # actually RETURNED — by exact value, or by the identifying `error` text
+        # when the tool body SPREAD the failure into a wider payload
+        # (`tortoise_recall`'s `{"mode": mode, **results}`) — so a tool that
+        # recovered from a secondary `_safe` failure stays `ok`.
         #
         # `exec_error` and NOT a new status member: the SDK DID raise and `_safe`
         # only caught it, so this is the same class the ladder's own
