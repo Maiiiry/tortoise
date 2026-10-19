@@ -276,6 +276,62 @@ def test_5153_served_document_pins_the_canonical_mcp_key_variable():
         ".env.example must name the open Pi reflect-hook dependency (#1117)")
 
 
+def test_8169_onboarding_documents_the_support_direction_of_strength():
+    """#8169: the advice taught only how to WEAKEN an operator.
+
+    Every operator-strength move this document carried was a dampener
+    (`tortoise_mitigate_operator`, strength 0.10–0.50), so an agent holding
+    evidence that SUPPORTED a connection had no documented move — the gap
+    that left #6151's supporter half with no surface to write to. The
+    mechanism itself was already there (#6151 owner ruling → PR #8181:
+    `tortoise/weights.py::annotation_factor`, a symmetric 0.5–2.0 multiplier
+    where an unset rating is exactly 1.0); what was missing HERE was the
+    instruction to use it, because `tortoise_annotate_operator` read like a
+    cosmetic note rather than the positive counterpart to dampening.
+
+    Two things are pinned together, because either alone is the defect:
+    the branch must exist, AND it must not be confused with #2315 — the
+    `never > 0.50` rule governs `mitigation_strength`, not the annotation
+    multiplier, so a document that merged the two would re-open a settled
+    decision instead of documenting one.
+
+    Canonical only: the mirror is pinned byte-identical by
+    `test_m8_deploy_mirror_matches_canonical`, so this covers both copies.
+    """
+    skill = LIVE_SKILL.read_text(encoding="utf-8")
+
+    # The weakening branch must survive: this change ADDS a direction.
+    start = skill.index("5. **Mitigate, don't NAND, for fit.**")
+    step = skill[start:skill.index("\n6. **Options can IMPL/NAND each other**")]
+    assert "tortoise_mitigate_operator" in step
+    assert "never >0.50" in step, (
+        "the mitigation band is #2315's ruling and must stay stated")
+
+    # The supporting branch, sliced so a claim made elsewhere in a 900-line
+    # document cannot satisfy it.
+    heading = "Rating semantics — the SUPPORT direction"
+    assert heading in step, (
+        "step 5 must carry the positive counterpart to mitigating — rating "
+        "the operator to make a connection count MORE (#8169)")
+    rating = step[step.index(heading):]
+    assert "annotation_factor" in rating, (
+        "the rating band must name its single source in tortoise/weights.py")
+    assert "#2315" in rating, (
+        "the band must separate itself from #2315's never >0.50 dampener "
+        "rule — the two multipliers are different mechanisms")
+    assert "1.0" in rating, "an unset rating is exactly neutral and must say so"
+    for edge in ("0.5", "2.0"):
+        assert edge in rating, (
+            f"the symmetric band's {edge} edge must be stated, or the "
+            "document implies an unbounded gain")
+
+    # `annotate_operator` takes FOUR required dimensions, not two — a doc that
+    # names only bias/precision sends the caller at a TypeError.
+    for dim in ("bias", "precision", "consistency", "directness"):
+        assert dim in step, (
+            f"annotate_operator requires {dim!r}; the step must name all four")
+
+
 def _installer_skills() -> list[str]:
     """The served installer's `SKILLS=(...)` payload set."""
     installer = (REPO_ROOT / "website" / "apps" / "dashboard" / "public"
