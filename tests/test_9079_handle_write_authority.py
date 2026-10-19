@@ -1,4 +1,4 @@
-"""#9124 — §17.1's THIRD door: the projection's write handle refuses.
+"""#9124 — §17.1's THIRD door: the projection's write handle detects and refuses.
 
 `#7951` made §17.1 load-bearing at two doors — the fold
 (`FalkorProjection.apply`) and the public raw-query lane
@@ -14,14 +14,25 @@ This suite is the acceptance gate for closing it. It is written against the
 BEHAVIOUR (a second writer is refused, a sanctioned lane still writes), not
 against the shape of the fix, so it survives a refactor that keeps §17.1.
 
+⛔ MEASURE FIRST, REFUSE WHEN DECLARED (#9124, owner decision option B). The
+refusal is armed by `_HANDLE_GUARD_ENFORCES`, and the LANDED state has it
+`False`: the handle records an undeclared write (a counter plus one WARNING)
+without raising, because the SDK's write surface is not yet fully declared and
+arming it now refuses the product's own doors — measured as 16 failed / 4 errors
+across `test_7951_update_point_outbox.py`, `test_7951_delete_point_outbox.py`,
+`test_5048_retract_instant_recorded.py` and
+`test_6239_promote_after_supersede.py`. So every test below that asserts a
+REFUSAL takes the `enforced` fixture, which flips the switch for that test — the
+guard's correctness is still proven, and the default stays non-breaking. The
+two `measure` tests pin the other half, so neither mode can rot silently.
+
 WHY EVERY MUTATING VERB, AND WHY AN ENUMERATION TEST. A guard on `query` alone
 is one private hop (`proj.g._query`) or one verb (`proj.g.profile`, which
 EXECUTES via `GRAPH.PROFILE`) away from being no guard at all — the #3595
-shared-decision precedent. So the parametrized case covers all three
-mutating-capable query verbs, and
-`test_the_handle_exposes_no_unguarded_mutating_query_verb` enumerates the
-handle's OWN verbs: a seventh verb added later fails here instead of silently
-re-opening §17.1.
+shared-decision precedent. The parametrized case reads the SHARED verb tuple
+(`_HANDLE_MUTATING_VERBS`, also read by `tests/test_9124_declared_live_doors.py`
+and by the handle's own enumeration test), so "what is a mutating verb" cannot
+drift between the three readers.
 
 WHAT IS *NOT* CLAIMED. This closes escape (1) of the three named in
 `tortoise/projection/__init__.py`'s SCOPE block. Escapes (2)
@@ -41,16 +52,53 @@ import pytest
 from tortoise.projection import (
     DirectCacheWriteRefused,
     _GuardedGraph,
+    _HANDLE_MUTATING_VERBS,
     _live_write_scope,
     _replay_write_scope,
+    _reset_undeclared_handle_writes,
+    undeclared_handle_writes,
 )
 
-#: The verbs on `_GuardedGraph` that can put a MUTATING statement on the wire.
-#: `explain` is listed because it is applied for enumeration uniformity, not
-#: because `GRAPH.EXPLAIN` executes: a plan is never a write, so refusing a
-#: mutating statement there costs nothing and closes a verb a future refactor
-#: could start dispatching.
-MUTATING_CAPABLE_VERBS = ("query", "ro_query", "_query", "profile", "explain")
+#: The verbs on `_GuardedGraph` that can put a MUTATING statement on the wire —
+#: the SHARED tuple (`_HANDLE_MUTATING_VERBS`), not a copy: the declaration
+#: census in `tests/test_9124_declared_live_doors.py` and the handle's own
+#: enumeration test read the same list, so a new verb cannot be covered in one
+#: reader and forgotten in another.
+MUTATING_CAPABLE_VERBS = _HANDLE_MUTATING_VERBS
+
+#: The five CYPHER verbs, i.e. the shared tuple minus `execute_command` — which
+#: is guarded too, but takes its Cypher at ``args[2]`` inside a Redis command
+#: and therefore gets its own test below rather than the uniform per-verb call.
+MUTATING_QUERY_VERBS = tuple(
+    verb for verb in _HANDLE_MUTATING_VERBS if verb != "execute_command")
+
+
+@pytest.fixture
+def enforced(monkeypatch):
+    """Arm the third door for one test (part 2's state, exercised deliberately).
+
+    `_HANDLE_GUARD_ENFORCES` is a module constant and a code change to flip, not
+    an env var or constructor argument — so a test flips it on the imported
+    module, which is exactly the reference the handle reads at call time.
+    """
+    import tortoise.projection as projection
+
+    monkeypatch.setattr(projection, "_HANDLE_GUARD_ENFORCES", True)
+    return projection
+
+
+@pytest.fixture
+def measure_only(monkeypatch):
+    """Pin the LANDED mode: detect and count, never raise.
+
+    Explicit rather than inherited from the module default so a test that needs
+    to observe the census cannot be silently changed by part 2's flip.
+    """
+    import tortoise.projection as projection
+
+    monkeypatch.setattr(projection, "_HANDLE_GUARD_ENFORCES", False)
+    _reset_undeclared_handle_writes()
+    return projection
 
 
 @pytest.fixture
@@ -91,7 +139,7 @@ def _journal_lines(path: Path) -> list[dict]:
 
 # ── the load-bearing pin: a direct write through the handle FAILS ─────────
 
-def test_a_mutating_statement_through_the_write_handle_is_refused(armed_sdk):
+def test_a_mutating_statement_through_the_write_handle_is_refused(armed_sdk, enforced):
     """RED before this lane: `proj.g.query("CREATE …")` wrote the cache direct.
 
     This is the exact statement shape the capstone probe issued at
@@ -116,7 +164,7 @@ def test_a_mutating_statement_through_the_write_handle_is_refused(armed_sdk):
     )
 
 
-def test_a_refused_handle_write_lands_nothing(armed_sdk):
+def test_a_refused_handle_write_lands_nothing(armed_sdk, enforced):
     """The refusal is PRE-WRITE.
 
     A guard that raised AFTER dispatch would leave exactly the corruption it
@@ -129,7 +177,7 @@ def test_a_refused_handle_write_lands_nothing(armed_sdk):
     assert _count(proj, "Point", "id", "handle-nothing") == 0
 
 
-def test_a_property_rewrite_through_the_write_handle_is_refused(armed_sdk):
+def test_a_property_rewrite_through_the_write_handle_is_refused(armed_sdk, enforced):
     """The capstone's `SET` shape, not just `CREATE`.
 
     The probe's finding was a property GAINED on an existing node
@@ -144,8 +192,8 @@ def test_a_property_rewrite_through_the_write_handle_is_refused(armed_sdk):
         )
 
 
-@pytest.mark.parametrize("verb", MUTATING_CAPABLE_VERBS)
-def test_every_mutating_capable_verb_on_the_handle_is_guarded(armed_sdk, verb):
+@pytest.mark.parametrize("verb", MUTATING_QUERY_VERBS)
+def test_every_mutating_capable_verb_on_the_handle_is_guarded(armed_sdk, enforced, verb):
     """Parametrized because a guard on `query` alone is one hop from no guard.
 
     `ro_query` is mutating-CAPABLE despite its name (the vendor's
@@ -175,7 +223,7 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
 
     source = inspect.getsource(_GuardedGraph)
     guarded = []
-    for verb in MUTATING_CAPABLE_VERBS:
+    for verb in MUTATING_QUERY_VERBS:
         body = inspect.getsource(getattr(_GuardedGraph, verb))
         assert "_refuse_unauthorized_cache_write" in body, (
             f"`_GuardedGraph.{verb}` does not consult §17.1's authorization; a "
@@ -184,7 +232,7 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
         )
         guarded.append(verb)
 
-    assert set(guarded) == set(MUTATING_CAPABLE_VERBS)
+    assert set(guarded) == set(MUTATING_QUERY_VERBS)
     # `execute_command` carries a statement only in its args, so it is checked
     # separately — and this is the assertion that keeps it from being forgotten.
     assert "_refuse_unauthorized_cache_write" in inspect.getsource(
@@ -199,7 +247,7 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
     )
 
 
-def test_a_mutating_statement_through_the_command_channel_is_refused(armed_sdk):
+def test_a_mutating_statement_through_the_command_channel_is_refused(armed_sdk, enforced):
     """`execute_command` is a mutating verb too.
 
     A `GRAPH.QUERY` payload is dispatched by the vendor's client directly; it
@@ -305,7 +353,7 @@ def test_the_live_scope_authorizes_the_write_handle(armed_sdk):
     assert _count(proj, "Point", "id", "handle-live") == 1
 
 
-def test_the_authorization_is_context_local_and_expires(armed_sdk):
+def test_the_authorization_is_context_local_and_expires(armed_sdk, enforced):
     """A scope is a per-call declaration, not a mode.
 
     It must not leak out of the `with` (a raising body included): an escaping
@@ -333,6 +381,92 @@ def test_an_unarmed_projection_is_outside_section_17_1(armed_sdk):
     proj._bind_journal(None)
     proj.g.query("CREATE (n:Point {id:'handle-unarmed'})")
     assert _count(proj, "Point", "id", "handle-unarmed") == 1
+
+
+# ── MEASURE MODE — the state part 1 ships ────────────────────────────────
+
+def test_the_landed_mode_measures_and_does_not_refuse(armed_sdk, measure_only):
+    """The LANDED state: an undeclared write is COUNTED, not raised (#9124).
+
+    Arming the handle ahead of the declaration programme refuses the product's
+    own write doors (measured: 16 failed / 4 errors across the four §17.1
+    suites named in this module's docstring), so part 1 ships the detection and
+    defers the refusal. This pin is what makes that sequencing explicit rather
+    than an oversight: it fails the day someone flips the switch without the
+    declarations — and `tests/test_9124_declared_live_doors.py`
+    (`test_arming_the_guard_requires_a_fully_declared_surface`) fails with the
+    list of what is still undeclared.
+    """
+    proj = armed_sdk._get_proj()
+    assert proj._journal_backed
+    assert measure_only._HANDLE_GUARD_ENFORCES is False
+    _reset_undeclared_handle_writes()
+
+    proj.g.query("CREATE (n:Point {id:'handle-measured'})")
+
+    assert _count(proj, "Point", "id", "handle-measured") == 1, (
+        "measure mode must let the write through — it is a DETECTOR, not a gate")
+    census = undeclared_handle_writes()
+    assert any("handle-measured" in key for key in census), (
+        f"the measure-mode census missed the write it exists to see: {census!r}")
+
+
+def test_a_declared_lane_is_not_measured(armed_sdk, measure_only):
+    """The census counts UNDECLARED writes only — a lane is not a violation.
+
+    Without this the census would count every sanctioned write and the number
+    would be unreadable; with it, an empty census means "the declared surface
+    held", which is the signal part 2 arms on.
+    """
+    proj = armed_sdk._get_proj()
+    _reset_undeclared_handle_writes()
+    with _live_write_scope("declared-lane-9124"):
+        proj.g.query("CREATE (n:Point {id:'handle-declared'})")
+    with _replay_write_scope():
+        proj.g.query("CREATE (n:Point {id:'handle-replay-9124'})")
+    assert _count(proj, "Point", "id", "handle-declared") == 1
+    assert _count(proj, "Point", "id", "handle-replay-9124") == 1
+    assert undeclared_handle_writes() == {}, (
+        "a declared lane was counted as an undeclared write: "
+        f"{undeclared_handle_writes()!r}")
+
+
+def test_a_declared_door_writes_through_the_handle_with_no_declaration_of_its_own(
+        armed_sdk, enforced, force_sparse_tfidf):
+    """The DOORS part 1 declared still write once the handle is armed.
+
+    This is the dependency the four declarations exist for, executable: with the
+    handle REFUSING, `delete_point` / `retract_point` / `invalidate_point` /
+    `supersede_point` must complete — each appends its record and then writes a
+    cache the guard would otherwise refuse. A door declared too early (i.e.
+    apply-first) would fail here rather than silently pass in measure mode.
+
+    `force_sparse_tfidf` pins the embedder OFF for the same reason the
+    sanctioned-lane test above does: seven `create_point`s against a cold HF
+    cache spend minutes in blocked-egress retries, and this test is about the
+    write lane's authority, never about retrieval.
+    """
+    sdk = armed_sdk
+
+    # retract_point
+    retracted = sdk.create_point("statement", "declared-door retracted")["id"]
+    assert sdk.retract_point(retracted)["id"] == retracted
+
+    # invalidate_point — a LIVE corrector, so the CORRECTS arm really writes
+    superseded = sdk.create_point("statement", "declared-door superseded")["id"]
+    corrector = sdk.create_point("statement", "declared-door corrector")["id"]
+    assert sdk.invalidate_point(superseded, corrector)["invalidated"] is True
+
+    # supersede_point
+    old = sdk.create_point("statement", "declared-door old")["id"]
+    new = sdk.create_point("statement", "declared-door new")["id"]
+    assert sdk.supersede_point(old, new)["invalidated"] is True
+
+    # delete_point
+    doomed = sdk.create_point("statement", "declared-door deleted")["id"]
+    assert sdk.delete_point(doomed) is True
+    proj = sdk._get_proj()
+    assert _count(proj, "Point", "id", doomed) == 0
 
 
 # ── the schema-DDL decision (#9124's own, per the issue thread) ───────────
@@ -372,7 +506,7 @@ def test_schema_ddl_survives_the_armed_guard(armed_sdk):
     )
 
 
-def test_the_schema_declaration_does_not_authorize_a_data_write(armed_sdk):
+def test_the_schema_declaration_does_not_authorize_a_data_write(armed_sdk, enforced):
     """The declaration covers the SCHEMA, not data.
 
     `_ensure_indexes` opens the graph-metadata lane around the sweep. That must

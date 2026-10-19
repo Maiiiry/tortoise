@@ -1486,6 +1486,17 @@ surfaces:
   # `--changed-files tortoise/cypher_guard.py` → surfaces=['core']. `--integrity`
   # also requires every test file to be classified, which this entry satisfies.
   - test_9079_handle_write_authority.py
+  # #9124 part 1 (the DECLARATION census): every mutating entry point that
+  # reaches the write handle must be declared or inventoried, enumerated from
+  # the SOURCE of `tortoise/sdk.py` and `tortoise/event_store.py` rather than
+  # from a hand list. Its subjects are `tortoise/event_store.py` (which matches
+  # no named SOURCE_PATTERN and falls through to `core` — the only subject a
+  # `core`-only registration must catch), plus `tortoise/sdk.py` and
+  # `tortoise/projection/__init__.py`, each of which selects the FULL matrix
+  # (`ci_selection.py --changed-files tortoise/sdk.py` → `"full": true`), so
+  # they need no arm of their own. `--integrity` also requires every test file
+  # to be classified, which this entry satisfies.
+  - test_9124_declared_live_doors.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
   # create-side suite above (`tortoise/sdk.py`), so it is registered on the

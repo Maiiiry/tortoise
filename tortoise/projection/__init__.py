@@ -15,7 +15,9 @@ from __future__ import annotations  # noqa: I001
 
 import bisect
 import contextlib
+import functools
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -3282,27 +3284,48 @@ def _journal_safe_params(params, cypher=None):
 # gate REFUSES BY DEFAULT — so a writer that forgets to declare itself fails
 # closed, which is the direction the definitional rule requires.
 #
-# SCOPE — STATED SO IT IS NOT OVER-READ. This closes the FOLD
-# (`FalkorProjection.apply`), the public raw-query lane
+# SCOPE — STATED SO IT IS NOT OVER-READ. This DETECTS an unauthorized write at
+# the FOLD (`FalkorProjection.apply`), the public raw-query lane
 # (`FalkorProjection.query`) and — since #9124 — the projection's WRITE HANDLE
 # (`proj.g`, `_GuardedGraph`) for a journal-backed projection. The handle is
 # *also* the live path of every SDK writer (`create_point`'s `CREATE (:Point)`,
-# `update_point`'s `SET n += $props`), which is why closing it needed the
-# writers that legitimately write outside the two original scopes to DECLARE
-# themselves first (#9121 onboarding, #9122 the `:Event` writers, #9123 the
-# `:EpMeta` epoch, and the schema DDL in `_ensure_indexes`). With those
-# declarations in place a refusal at the handle means an UNDECLARED writer —
-# which is exactly the second writer §17.1 forbids, and no longer the product's
-# own write path. Every mutating-capable verb is covered (`query`, `ro_query`,
-# `_query`, `profile`, `explain`, `execute_command`), because a guard on
-# `query` alone is one private hop or one verb name away from being no guard.
-# Converting the 300+-site surface to the atomic write is §17.1's mechanism (1)
-# and remains open on `#7951`.
+# `update_point`'s `SET n += $props`), which is why arming it needed the writers
+# that legitimately write outside the two original scopes to DECLARE themselves
+# first (#9121 onboarding, #9122 the `:Event` writers, #9123 the `:EpMeta`
+# epoch, and the schema DDL in `_ensure_indexes`). With those declarations in
+# place a refusal at the handle means an UNDECLARED writer — which is exactly
+# the second writer §17.1 forbids, and no longer the product's own write path.
+# Every mutating-capable verb is covered (`_HANDLE_MUTATING_VERBS`: `query`,
+# `ro_query`, `_query`, `profile`, `explain`, `execute_command`), because a
+# guard on `query` alone is one private hop or one verb name away from being no
+# guard. Converting the 300+-site surface to the atomic write is §17.1's
+# mechanism (1) and remains open on `#7951`.
+#
+# ⛔ THE HANDLE'S *DETECTION* IS COMPLETE; ITS *REFUSAL IS NOT YET ARMED*.
+# Owner decision (option B, #9124) sequences the declaration programme in two
+# changes, because arming the handle first refuses the PRODUCT: measuring the
+# SDK surface (
+# `tests/test_9124_declared_live_doors.py` enumerates it in code, so the number
+# cannot go stale) finds that of the entry points reaching this handle only a
+# handful already append their record BEFORE the cache write. The rest are
+# apply-first — their write precedes the record that describes it — and moving
+# the record above the write changes the commit contract, so each needs its own
+# decision (#9206, #9207, and the promote arm of `update_point` / the unchecked
+# `_emit_event` of `supersede_point`). So:
+#   * PART 1 (landed): every journal-first door declares its lane, `event_store`
+#     declares its own, and `_HANDLE_GUARD_ENFORCES` is **False** — the handle
+#     MEASURES an undeclared write (counter + one WARNING naming the statement)
+#     instead of refusing it, which breaks nothing and prints the census;
+#   * PART 2 (blocked on those declarations): flip `_HANDLE_GUARD_ENFORCES` to
+#     True, so an undeclared write RAISES. Until then this door is a loud
+#     detector, NOT an enforcement point — do not read the guard's presence as
+#     "§17.1 is enforced here".
 #
 # ⛔ THE RESIDUAL IS STILL TWO ESCAPES, NOT ONE — named so it is stated, not
 # discovered. A writer that wants to write this cache directly has:
-#   1. `proj.g.query("CREATE …")`     — the guarded handle itself. **CLOSED
-#      (#9124)**; a mutating statement outside a declared scope raises
+#   1. `proj.g.query("CREATE …")`     — the guarded handle itself. **DETECTED
+#      (#9124 part 1)**: a mutating statement outside a declared scope is
+#      counted, logged, and (once `_HANDLE_GUARD_ENFORCES` is True) raises
 #      `DirectCacheWriteRefused`;
 #   2. `proj.g._g.query("CREATE …")`  — one private hop past the handle into
 #      the raw `_GuardedGraph`;
@@ -3325,7 +3348,96 @@ class DirectCacheWriteRefused(RuntimeError):
     `proj.g`) is issued against a **journal-backed** projection outside a
     sanctioned scope. The projection is the derived cache of a journal; a write
     it did not receive through its journal is the second writer §17.1 forbids.
+
+    ⚠️ At the HANDLE it raises only once `_HANDLE_GUARD_ENFORCES` is True
+    (#9124 part 2). Until then the handle records the same violation in
+    `undeclared_handle_writes()` and logs it, because arming ahead of the
+    declaration programme refuses the product's own write doors.
     """
+
+
+#: #9124 — is §17.1's THIRD door REFUSING, or only MEASURING?
+#:
+#: False is the landed state (part 1): the handle DETECTS an undeclared cache
+#: write, records it in `_UNDECLARED_HANDLE_WRITES` and logs one WARNING per
+#: distinct statement, but does NOT raise. True is part 2, and it is a code
+#: constant rather than an env var or constructor argument on purpose — the
+#: same property the declarations have, so an operator cannot silently turn
+#: enforcement off in production.
+#:
+#: ⛔ DO NOT FLIP THIS UNTIL `tests/test_9124_declared_live_doors.py`'s two
+#: inventories are EMPTY. They are the measured remainder: the doors that are
+#: apply-first today (their cache write precedes the record that describes it,
+#: so they need the order changed and its failure contract decided) and the
+#: writers that journal nothing at all (which need a named lane or a move onto
+#: the fold). Flipping with either inventory non-empty refuses the product's own
+#: writes — measured, see `tests/test_9079_handle_write_authority.py`'s
+#: `enforced` fixture and #9124's issue thread.
+_HANDLE_GUARD_ENFORCES: bool = False
+
+#: The measure-mode census: normalised statement -> how many times the handle
+#: saw it arrive with NO declared lane. A dict rather than a Counter so it can
+#: be read without the locking subtleties of a live Counter view; the lock is
+#: held only for the one increment (the guard sits on the write hot path).
+_UNDECLARED_HANDLE_WRITES: dict[str, int] = {}
+_UNDECLARED_HANDLE_WRITES_LOCK = threading.Lock()
+
+#: The verbs on `_GuardedGraph` that can put a MUTATING statement on the wire.
+#: ONE list, read by the guard's own enumeration test and by the SDK's
+#: declaration census (`tests/test_9124_declared_live_doors.py`), so "what is a
+#: mutating verb" cannot drift between the two readers — the #3595
+#: shared-decision precedent.
+#:
+#: `explain` is listed although `GRAPH.EXPLAIN` only PLANS: it is guarded for
+#: enumeration uniformity, so a verb cannot be one refactor away from unguarded
+#: (refusing a plan costs nothing).
+_HANDLE_MUTATING_VERBS: tuple[str, ...] = (
+    "query", "ro_query", "_query", "profile", "explain", "execute_command",
+)
+
+
+def _normalise_handle_statement(statement: str) -> str:
+    """Collapse a statement to one line so the census keys are readable."""
+    return " ".join((statement or "").split())[:200]
+
+
+def _record_undeclared_handle_write(statement: str) -> None:
+    """MEASURE MODE: count an undeclared write instead of refusing it.
+
+    One WARNING per distinct statement (not per occurrence): the census is what
+    the declaration programme consumes, and a hot door would otherwise bury the
+    log in the same line. The count is still exact, so a reader can tell one
+    call from a thousand.
+    """
+    key = _normalise_handle_statement(statement)
+    with _UNDECLARED_HANDLE_WRITES_LOCK:
+        first = key not in _UNDECLARED_HANDLE_WRITES
+        _UNDECLARED_HANDLE_WRITES[key] = _UNDECLARED_HANDLE_WRITES.get(key, 0) + 1
+    if first:
+        logger.warning(
+            "§17.1: a mutating statement reached the projection's write handle "
+            "with NO declared lane (%s). The door is MEASURING, not refusing "
+            "(#9124 part 1): declare the writer (`_live_write_scope` after its "
+            "journal append, `_replay_write_scope`, or "
+            "`_graph_metadata_write_scope`) before the guard is armed.", key)
+
+
+def undeclared_handle_writes() -> dict[str, int]:
+    """Measure-mode census: every undeclared statement the handle has seen.
+
+    Empty when the door has been armed (`_HANDLE_GUARD_ENFORCES`) or when every
+    writer declares a lane. This is the ONE reader a test uses to prove the
+    handle actually observes a write (a detector nobody reads is not a
+    detector).
+    """
+    with _UNDECLARED_HANDLE_WRITES_LOCK:
+        return dict(_UNDECLARED_HANDLE_WRITES)
+
+
+def _reset_undeclared_handle_writes() -> None:
+    """Clear the measure-mode census (tests; also the operator's census reset)."""
+    with _UNDECLARED_HANDLE_WRITES_LOCK:
+        _UNDECLARED_HANDLE_WRITES.clear()
 
 
 #: The single-writer authorization for the current context. ``None`` = no
@@ -3364,6 +3476,51 @@ def _live_write_scope(reason: str = "live-door"):
 def _replay_write_scope():
     """The replay engines' scope: the record came FROM the journal."""
     return _cache_write_authorized("replay")
+
+
+def _declares_live_write_lane(reason: str):
+    """Declare a WHOLE entry point as a journal-first live lane (§17.1, #9124).
+
+    The equivalent of opening ``with _live_write_scope(reason):`` around the
+    door's body, for the doors whose write region IS the body: `delete_point`,
+    `invalidate_point`, `retract_point` and `supersede_point` each validate,
+    append their record, and then write — hundreds of lines with `try/except`
+    and retry blocks in between, so a hand-placed ``with`` would reindent the
+    whole region and bury the semantic change (the declaration) in a mechanical
+    one. The decorator states the same fact in one line.
+
+    ⛔ IT IS ONLY HONEST FOR A JOURNAL-FIRST DOOR, and that is not a comment —
+    it is checked. Wrapping the whole body also authorizes anything issued
+    BEFORE the append, so a declaration on an apply-first door would bless a
+    cache write with no committed record (the #9068 defect).
+    `tests/test_9124_declared_live_doors.py` therefore pins, for EVERY declared
+    door, that its first mutating handle statement is TEXTUALLY after its first
+    journal append: a later edit that adds a write above the append reddens
+    there instead of silently widening the lane.
+
+    A per-call ContextVar scope, exactly like the inline form: nothing about
+    this is an instance attribute, constructor argument or env switch, and it
+    is released in a ``finally`` (the ``with``), so a raising door cannot leak
+    its authorization into the caller's next write.
+    """
+    def _declare(fn):
+        if inspect.iscoroutinefunction(fn):
+            # An async wrapper would open the scope, return the coroutine and
+            # close it — authorizing NOTHING while looking like it did, which
+            # is the one failure mode this helper must not have.
+            raise TypeError(
+                "_declares_live_write_lane wraps a synchronous door: for an "
+                "async door open `with _live_write_scope(...)` INSIDE the "
+                "coroutine body instead")
+
+        @functools.wraps(fn)
+        def _declared(*args, **kwargs):
+            with _live_write_scope(reason):
+                return fn(*args, **kwargs)
+
+        return _declared
+
+    return _declare
 
 
 def _graph_metadata_write_scope(reason: str = "graph-metadata"):
@@ -3485,14 +3642,18 @@ class _GuardedGraph:
     (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``,
     ``execute_command``), so it does not depend on the inner handle's class to
     refuse the ``=~`` operator. NOTE the override is NOT uniform: only
-    ``query`` applies the bulk-wipe check (L2) as well. The five query verbs
-    (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``) carry ALL
-    THREE pre-dispatch refusals — the #3595 operator guard, the #7174
-    numeric-domain guard on their ``params``, and (since #8479) that same domain
-    applied to the statement's own TEXT — while ``execute_command`` carries the
-    operator and statement-text guards (a raw command has no params map to walk;
-    the vendor inlines params into the statement text instead, which is exactly
-    the text the #8479 scan reads — see
+    ``query`` applies the bulk-wipe check (L2) as well. All six verbs carry the
+    §17.1 AUTHORITY check (`_refuse_unauthorized_cache_write`) first — in MEASURE
+    mode it counts an undeclared write, once `_HANDLE_GUARD_ENFORCES` is True it
+    refuses it (`_HANDLE_MUTATING_VERBS` is the one list of what counts as a
+    mutating verb). The five query verbs (``query``, ``ro_query``, ``_query``,
+    ``profile``, ``explain``) additionally carry the other pre-dispatch
+    refusals — the #3595 operator guard, the #7174 numeric-domain guard on their
+    ``params``, and (since #8479) that same domain applied to the statement's own
+    TEXT — while ``execute_command`` carries the operator and statement-text
+    guards after recovering its statement from ``args`` (a raw command has no
+    params map to walk; the vendor inlines params into the statement text
+    instead, which is exactly the text the #8479 scan reads — see
     ``cypher_guard._guard_numeric_literals``). See KNOWN GAPS in the module
     comment above. ``__getattr__`` below forwards only the remaining non-query
     attributes (``name``, ``delete``, ``schema``, ...) to the underlying handle.
@@ -3533,12 +3694,26 @@ class _GuardedGraph:
         ONLY a journal-backed projection refuses; an unbound projection
         (`_journal_backed` False) has no journal to be the single writer OF, so
         §17.1 has nothing to enforce there (the same arming rule as the fold).
+
+        ⚠️ MEASURE, THEN REFUSE. `_HANDLE_GUARD_ENFORCES` is False in the landed
+        state (#9124 part 1), so a violation is RECORDED (a counter plus one
+        WARNING naming the statement) instead of raised: arming the handle ahead
+        of the declaration programme refuses the product's own write doors —
+        measured on this issue as 16 failed / 4 errors across
+        `test_7951_update_point_outbox.py`, `test_7951_delete_point_outbox.py`,
+        `test_5048_retract_instant_recorded.py` and
+        `test_6239_promote_after_supersede.py`. The detection itself is complete
+        and identical in both modes; only the refusal is gated. Do not read this
+        method's presence as "§17.1 is enforced at the handle".
         """
         if _CACHE_WRITE_AUTHORIZED.get() is not None:
             return
         if not getattr(self._proj, "_journal_backed", False):
             return
         if not _statement_writes(statement):
+            return
+        if not _HANDLE_GUARD_ENFORCES:
+            _record_undeclared_handle_write(statement)
             return
         raise DirectCacheWriteRefused(
             "Refusing a mutating statement issued at the projection's write "
