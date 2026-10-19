@@ -437,6 +437,7 @@ emit_codex_agents_block() {
   local state="" prev_version="" same_bytes=0
   local state_kind="" c_start c_startline c_end c_endline c_fence_start
   local c_near_s c_near_e c_mangled_s c_mangled_e c_fence_open
+  local block_inside_fence orig_mode links
   _emit_fail() {
     # ONE place that cleans up and fails. It EXITS rather than returning: a
     # `cmd || helper` list is itself an errexit-exempt context, so a helper that
@@ -652,6 +653,27 @@ EOF
       paired) [ "${c_startline:-0}" -gt "${c_fence_start:-0}" ] && block_inside_fence=1 ;;
     esac
   fi
+
+  # A pair whose END marker sits BELOW an open fence STRADDLES it: the fence opens
+  # inside the block, so the replace window contains the fence line itself and
+  # rewriting it deletes the fence — and whatever it was quoting becomes live
+  # instructions. Measured: a build snippet inside the fence vanished and the line
+  # after the block was promoted to prose, while the run reported "✓ upgraded".
+  # Refused rather than warned: a warning does not put a deleted code block back.
+  if [ "${c_fence_open:-0}" = "1" ] && [ "$state_kind" = "paired" ] \
+     && [ "${c_fence_start:-0}" -ge "${c_startline:-0}" ] \
+     && [ "${c_fence_start:-0}" -le "${c_endline:-0}" ]; then
+    echo "  ✗ AGENTS.md — the Tortoise block's markers STRADDLE an UNTERMINATED code fence" >&2
+    echo "      start marker line ${c_startline}, end marker line ${c_endline}, fence opens on line ${c_fence_start}" >&2
+    echo "      — i.e. the fence is INSIDE the block. Rewriting the block would delete the" >&2
+    echo "      fence line and quote its contents as live instructions, so nothing was" >&2
+    echo "      written. Close the fence, or delete the stale Tortoise block by hand," >&2
+    echo "      then re-run." >&2
+    rm -rf "$tmpdir"
+    echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
+    exit 3
+  fi
+
   if [ "$block_inside_fence" = "1" ]; then
     echo "  ⚠ AGENTS.md has an UNTERMINATED code fence — the Tortoise block will be written" >&2
     echo "    inside it and read as code, not as instructions. Close the fence and re-run." >&2
@@ -712,27 +734,91 @@ EOF
     # file, then `mv` turned AGENTS.md into a link to it.
     staged="$(mktemp "$(dirname "$target")/.tortoise-agents.XXXXXX")" \
       || _emit_fail "could not stage a temp file next to $target — nothing was changed"
-    # cp -p first preserves the file's mode (a 0600 AGENTS.md stays 0600) and
-    # ownership; cat then overwrites content in place.
-    cp -p "$target" "$staged" || { rm -f "$staged"; _emit_fail "could not copy $target — nothing was changed"; }
+    # `cp` WITHOUT `-p`: the mode is captured separately and restored explicitly
+    # below, so nothing depends on the copy carrying it — and `-p` REFUSES on a
+    # filesystem or user that cannot carry mode/ownership, which would reject an
+    # install the older in-place write handled.
+    cp "$target" "$staged" || { rm -f "$staged"; _emit_fail "could not copy $target — nothing was changed"; }
     # The mode is captured so it can be RESTORED, and the staged copy is made
-    # writable meanwhile: `cp -p` gives the staged file the target's mode, so a
-    # read-only AGENTS.md (0444) could not be upgraded even though the directory
-    # and the `mv` were writable — and the failure named no cause at all.
+    # writable meanwhile: `cp` gives the staged file the umask default, but a
+    # read-only AGENTS.md (0444) must come back out of here still 0444 — and the
+    # old failure named no cause at all.
     orig_mode="$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null || true)"
-    chmod u+w "$staged" 2>/dev/null || true
+    if [ -z "$orig_mode" ]; then
+      rm -f "$staged"
+      _emit_fail "could not read the mode of $target — nothing was changed, because rewriting it without the mode could loosen its permissions (a 0444 file must stay 0444)"
+    fi
+    chmod u+w "$staged" || { rm -f "$staged"; _emit_fail "could not make the staged copy writable — nothing was changed"; }
     if ! cat "$pre" "$block" "$post" > "$staged"; then
       rm -f "$staged"
-      _emit_fail "could not write the staged file — $target is read-only or its directory is not writable; the original is untouched"
+      _emit_fail "could not write the staged copy — the original is untouched (a full disk or a quota limit is the usual cause; read-only and an unwritable directory are ruled out by this point)"
     fi
     # Put the user's mode back before the rename, so a read-only AGENTS.md stays
     # read-only instead of being silently loosened to the umask default.
-    [ -n "$orig_mode" ] && { chmod "$orig_mode" "$staged" 2>/dev/null || true; }
-    mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
+    chmod "$orig_mode" "$staged" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on $target — nothing was changed"; }
+    # A HARD LINKED alias (CLAUDE.md -> AGENTS.md) shares the inode, so a rename
+    # SPLITS it: the alias keeps the pre-run bytes while the report says the block
+    # was upgraded (measured — the alias still held the stale v1 text). Rewrite the
+    # same inode when the file has other links; rename only when it is the only one.
+    links="$(stat -c '%h' "$target" 2>/dev/null || stat -f '%l' "$target" 2>/dev/null || echo 1)"
+    if [ "${links:-1}" -gt 1 ]; then
+      chmod u+w "$target" || { rm -f "$staged"; _emit_fail "could not make $target writable to rewrite it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
+      if ! cat "$staged" > "$target"; then
+        chmod "$orig_mode" "$target" 2>/dev/null || true
+        rm -f "$staged"
+        _emit_fail "could not rewrite $target in place (partially written — re-run after checking the file)"
+      fi
+      chmod "$orig_mode" "$target" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on $target — the block WAS written"; }
+      rm -f "$staged"
+    else
+      mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
+    fi
   elif [ "$state_kind" = "none" ]; then
     if [ -f "$target" ]; then
-      printf '\n\n' >> "$target" || _emit_fail "could not append to $target"
-      cat "$block" >> "$target" || _emit_fail "could not append the block to $target (partially written — re-run after checking the file)"
+      # SAME staging discipline as the replace path. Appending with `>>` onto the
+      # user's own file could not work at all for a read-only AGENTS.md (0444):
+      # bash printed its own "Permission denied" and the installer named no cause
+      # or remedy (measured). Copy, make the COPY writable, append there, put the
+      # mode back, rename — so a read-only file is upgraded and stays read-only.
+      staged="$(mktemp "$(dirname "$target")/.tortoise-agents.XXXXXX")" \
+        || _emit_fail "could not stage a temp file next to $target — nothing was changed"
+      # NOT `cp -p`: preserving the mode here makes the copy fail on a filesystem
+      # or user where mode/ownership cannot be carried (measured), refusing an
+      # install that `>>` handled. The mode is restored explicitly below instead.
+      cp "$target" "$staged" || { rm -f "$staged"; _emit_fail "could not copy $target — nothing was changed"; }
+      orig_mode="$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null || true)"
+      if [ -z "$orig_mode" ]; then
+        rm -f "$staged"
+        _emit_fail "could not read the mode of $target — nothing was changed, because rewriting it without the mode could loosen its permissions (a 0444 file must stay 0444)"
+      fi
+      chmod u+w "$staged" || { rm -f "$staged"; _emit_fail "could not make the staged copy writable — nothing was changed"; }
+      if ! printf '\n\n' >> "$staged" || ! cat "$block" >> "$staged"; then
+        rm -f "$staged"
+        _emit_fail "could not write the staged copy — the original is untouched (a full disk or a quota limit is the usual cause; read-only and an unwritable directory are ruled out by this point)"
+      fi
+      chmod "$orig_mode" "$staged" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on the staged copy — nothing was changed"; }
+      # A HARD LINKED alias (CLAUDE.md -> AGENTS.md is a common way to dual-name
+      # agent files) shares the inode, so `mv` would silently split it: the alias
+      # kept the old bytes and the report still said the block was created
+      # (measured). Append IN PLACE when the file has other links, exactly as the
+      # pre-staging code did, and put the mode back afterwards.
+      links="$(stat -c '%h' "$target" 2>/dev/null || stat -f '%l' "$target" 2>/dev/null || echo 1)"
+      if [ "${links:-1}" -gt 1 ]; then
+        chmod u+w "$target" || { rm -f "$staged"; _emit_fail "could not make $target writable to append in place (it has $links hard links, which a rename would split) — nothing was changed"; }
+        # ONLY the new bytes: $staged is a COPY of $target plus the block, so
+        # `cat "$staged" >> "$target"` would duplicate the user's whole file
+        # (measured: 24 bytes -> 1208 with the body present twice, reported as
+        # success). Append the separator and the block, as the pre-staging code did.
+        if ! printf '\n\n' >> "$target" || ! cat "$block" >> "$target"; then
+          chmod "$orig_mode" "$target" 2>/dev/null || true
+          rm -f "$staged"
+          _emit_fail "could not append to $target in place (partially written — re-run after checking the file)"
+        fi
+        chmod "$orig_mode" "$target" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on $target — the block WAS appended"; }
+        rm -f "$staged"
+      else
+        mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
+      fi
     else
       cat "$block" > "$target" || _emit_fail "could not create $target"
     fi

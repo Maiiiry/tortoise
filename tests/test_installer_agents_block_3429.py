@@ -142,6 +142,7 @@ from __future__ import annotations
 
 import os
 import re
+import pytest
 import subprocess
 from pathlib import Path
 
@@ -1265,3 +1266,151 @@ def test_a_block_written_inside_an_unterminated_fence_is_not_silent(tmp_path):
     assert "UNTERMINATED code fence" in done.stderr, (
         f"a block written inside an open fence must not be silent:\n{done.stderr}")
     assert text.count(START) == 1, "the block IS written (unchanged behaviour)"
+
+
+def test_a_pair_that_straddles_an_unterminated_fence_is_refused(tmp_path):
+    """Review P2: the block's END marker below the fence line puts the fence
+    INSIDE the replace window, so rewriting the block deletes the fence line and
+    promotes whatever it was quoting to live instructions.
+
+    Measured against the condition that warned here: a build snippet inside the
+    fence vanished and the trailing line became prose, while the run reported
+    "✓ upgraded". Destroying a user's code block while reporting success cannot be
+    fixed by warning, so this case is refused and nothing is written.
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    original = f"# House\n\n{START}\nold\n\n```bash\nnpm run build\n{END}\nAFTER\n"
+    target.write_text(original, encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 3, (
+        "a straddling pair must be refused, not rewritten:\n"
+        + done.stdout + done.stderr)
+    assert "STRADDLE" in done.stderr, done.stderr
+    assert target.read_text(encoding="utf-8") == original, (
+        "nothing may be written when the block's window contains the fence line")
+    assert not list(project.glob(".tortoise-agents.*")), (
+        "no staged file may be left behind — the refusal must not stage at all")
+
+
+def test_a_read_only_agents_md_with_no_block_still_gets_one(tmp_path):
+    """Review P2: the append path wrote with `>>` straight onto the user's file,
+    so a 0444 AGENTS.md got bash's "Permission denied" and no named cause, while
+    the replace path handled read-only files. Both paths must behave the same."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    target.write_text("# House\n", encoding="utf-8")
+    target.chmod(0o444)
+
+    done = _run(installer, home, project)
+    text = target.read_text(encoding="utf-8")
+
+    assert done.returncode == 0, (
+        "a read-only AGENTS.md with no block must still get one:\n"
+        + done.stdout + done.stderr)
+    assert text.count(START) == 1, "the block must be appended"
+    assert text.startswith("# House\n"), "the user's content must be preserved"
+    assert (target.stat().st_mode & 0o777) == 0o444, (
+        f"the read-only mode must survive: got {oct(target.stat().st_mode & 0o777)}")
+
+
+@pytest.mark.parametrize("existing_block", [True, False], ids=["replace", "append"])
+def test_an_unreadable_mode_refuses_rather_than_loosening_permissions(
+        tmp_path, existing_block):
+    """Review P3: the mode restore was `chmod … 2>/dev/null || true`, so a failed
+    `stat` silently loosened a 0444 file to the umask default and still reported
+    success. Fail closed instead: the user's mode is not ours to drop."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    # BOTH write paths must fail closed: with a block it takes the replace path,
+    # without one it takes the append path, and each reads the mode itself.
+    original = (f"# House\n\n{START}\nold\n{END}\n" if existing_block
+                else "# House\n")
+    target.write_text(original, encoding="utf-8")
+    target.chmod(0o444)
+    # A `stat` that always fails: both the GNU and the BSD form must be defeated.
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake = shim / "stat"
+    fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake.chmod(0o755)
+
+    env_path = f"{shim}:{os.environ.get('PATH', '')}"
+    done = subprocess.run(
+        ["bash", str(installer), "--harness", "codex"],
+        cwd=str(project), env={**os.environ, "HOME": str(home), "PATH": env_path},
+        capture_output=True, text=True, timeout=180)
+
+    assert done.returncode == 3, (
+        "an unreadable mode must refuse rather than rewrite with looser "
+        f"permissions:\n{done.stdout}{done.stderr}")
+    assert "could not read the mode" in done.stderr, done.stderr
+    assert target.read_text(encoding="utf-8") == original, "nothing may be written"
+    assert (target.stat().st_mode & 0o777) == 0o444, "the mode must be untouched"
+
+
+@pytest.mark.parametrize("existing_block", [True, False], ids=["replace", "append"])
+def test_a_hardlinked_alias_sees_the_block(tmp_path, existing_block):
+    """Review P2/P1: BOTH write paths went from in-place writing to `cp` + `mv`,
+    which REPLACES the inode. A hardlinked alias of AGENTS.md — `ln AGENTS.md
+    CLAUDE.md` is a common way to dual-name agent files — kept the pre-run bytes
+    and silently diverged, while the report said the block was created/upgraded.
+
+    Measured on the replace path: inode split, the alias still held the stale v1
+    block, and the run reported "✓ upgraded". Measured on the append path: the
+    alias had no block at all.
+
+    The body carries a UNIQUE line and the assertion is EXACT: an earlier version
+    of this test passed against an arm that appended the whole staged copy (i.e.
+    duplicated the user's file) because it counted markers instead of comparing
+    content.
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    body = "# House\nUNIQUE-LINE-ONE\n"
+    if existing_block:
+        original = f"{body}\n{START}\nold block\n{END}\nTAIL\n"
+    else:
+        original = body
+    target.write_text(original, encoding="utf-8")
+    alias = project / "CLAUDE.md"
+    alias.hardlink_to(target)
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = target.read_text(encoding="utf-8")
+    assert target.stat().st_ino == alias.stat().st_ino, (
+        "the install must not split a hardlinked alias")
+    assert alias.read_text(encoding="utf-8") == text, "the alias must hold the same bytes"
+    assert text.count("UNIQUE-LINE-ONE") == 1, (
+        "the user's content must appear exactly once — appending the whole staged "
+        f"copy duplicates it:\n{text[:400]}")
+    assert text.count("# House") == 1, "the original body must not be duplicated"
+    assert text.count("tortoise:block v") == 1, "the alias must see the upgraded block"
+    assert "old block" not in text, "the stale block must be replaced on both paths"
+    assert text.count(START) == 1 and text.count(END) == 1, "exactly one block"
+    if existing_block:
+        assert text.endswith("TAIL\n"), "content after the block must survive"
