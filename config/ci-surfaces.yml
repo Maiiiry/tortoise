@@ -2870,6 +2870,11 @@ surfaces:
   - test_pack_shipping.py
   - test_pack_shipping_wheel.py
   - test_pack_state.py
+  # #9068: the #5475 pack-approval-set residuals MEASURED — a :Pipeline row,
+  # a journal-less fold, and the DECLARED offline re-typing. Registered beside
+  # the pack tests it reads (`pack_state.graph_kind_namespaces` /
+  # `resolved_pack_set`) so the scope of #5475's closure claim is executable.
+  - test_9068_pack_gate_residuals.py
   - test_pipeline_cli.py
   - test_postmerge_verdict.py
   # #6139: guards `tools/pr_lead_time.py` — the PR lead-time decomposition.
