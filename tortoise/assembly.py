@@ -569,7 +569,7 @@ _RE_OR_CHAIN = re.compile(r"\sor\s.+?\sor\s", re.IGNORECASE | re.DOTALL)
 # the measured corpus form ("Which three events happened in the order from
 # first to last: A, B, and C" / "What is the order of the three events:
 # 'A', 'B', and 'C'"). The colon is the strong signal: the two head forms
-# carry no " or " at all, so _RE_ORDERING cannot see them.
+# carry no " or " at all, so _ordering_match cannot see them.
 # The "earliest to latest" head form is deliberately NOT an alternative here:
 # a question containing it always matches ``_RE_RECENCY`` ("\blatest\b") and
 # is rejected by the R13 guard before this pattern is ever tried, so the
@@ -612,10 +612,166 @@ _RE_OPTION_LEAD = re.compile(
 # ── shape templates (ordered high-precision) ─────────────────────────────
 
 # ordering: "Which <X> (did I …|…) first[,:] A or B?" / "Who … first, A or B?"
-_RE_ORDERING = re.compile(
-    r"^\s*(?:which|who|what)\b[^?]*?\bfirst\b[^?]*?\b(?P<a>.+?)\s+or\s+"
-    r"(?P<b>[^?]+?)\??\s*$",
-    re.IGNORECASE | re.DOTALL)
+#
+# ⛔ This shape is a SCAN, not a regex — the regex was an availability defect
+# (#8147, the third of the #8072/#8097 class). The form was
+#
+#   ^\s*(?:which|who|what)\b[^?]*?\bfirst\b[^?]*?\b(?P<a>.+?)\s+or\s+
+#   (?P<b>[^?]+?)\??\s*$
+#
+# and it is ~O(n³) in the question length: TWO lazy `[^?]*?` runs each have to
+# be re-tried at every offset before the `\b…\b` probe can fail, and the tail
+# `(?P<a>.+?)\s+or\s+(?P<b>[^?]+?)` re-splits at every position before `$`
+# fails. Measured on this checkout: 0.095 s at len 604, 0.84 s at len 1204,
+# 2.7 s at len 1804 and 3.3 s at len 1984 for `"who " + "first " * n` — and
+# `MAX_ASK_QUESTION_CHARS` is 2000, so len 1984 is VALID ask input
+# (`ask_lane._ask_validate` accepts it) on a lane with no timeout. Same defect
+# class as `_RE_OR_CHAIN` above and the #2653 colon-list tail; the fix is the
+# same one those got: remove the regex instead of tuning it.
+#
+# The scan is linear by construction (one left-to-right pass for the `first`
+# probe, one for the `or` split, O(1) work per offset, no backtracking). Its
+# language is EXACTLY the regex's — the equivalence argument, and the
+# 1.6M-string generated-domain comparison that back it, are on
+# ``_ordering_match`` below.
+#
+# The two literal tokens keep a tiny anchored regex (`_ORDERING_*` below)
+# purely so the scan inherits `re.IGNORECASE`'s Unicode case folding
+# EXACTLY — 'firſt' (U+017F) and 'fİrst' (U+0130) are case-folded to 'first'
+# by `re`, and a hand-rolled `.lower()` compare silently drops them.
+_ORDERING_HEAD = re.compile(r"(?:which|who|what)", re.IGNORECASE)
+_ORDERING_FIRST = re.compile(r"first", re.IGNORECASE)
+_ORDERING_OR = re.compile(r"or", re.IGNORECASE)
+
+
+def _is_word_char(ch: str) -> bool:
+    """`re`'s `\\w` for ONE character — what a `\\b` assertion is built on.
+
+    Verified equal to `str.isalnum() or ch == '_'` over U+0000..U+10FFFF
+    (0 mismatches), and `re`'s `\\s` equal to `str.isspace()` over the same
+    range (0 mismatches). That is what lets ``_ordering_match`` test the
+    pattern's character classes without a regex call per position and still
+    be character-for-character identical to the regex it replaced.
+    """
+    return ch.isalnum() or ch == "_"
+
+
+def _ordering_match(question: str) -> bool:
+    r"""Does the ORDERING template match ``question``? (#8147 — was
+    ``_RE_ORDERING.match``.)
+
+    LINEAR in ``len(question)``: ~O(1) work per offset, no backtracking. The
+    crafted input that cost the regex 3.3 s (``"who " + "first " * 330``,
+    len 1984 — inside ``MAX_ASK_QUESTION_CHARS``) runs in tens of
+    microseconds.
+
+    EQUIVALENCE with the pattern it replaced, clause by clause:
+
+    * ``^\s*(?:which|who|what)\b`` — skip leading whitespace, then the head
+      must match there (the alternation and its boundary are the only freedom,
+      and `_ORDERING_HEAD` is the same alternation under the same flags).
+    * ``[^?]*?\bfirst\b`` — the EARLIEST whole-word ``first`` that no ``?``
+      precedes. Later candidates are strictly more constrained (they shrink
+      every span the rest of the pattern may use), so testing the earliest is
+      exact, not an approximation.
+    * ``[^?]*?\b`` before ``(?P<a>…)`` — this run is VACUOUS at the one offset
+      that matters. ``\bfirst\b`` already forced a boundary at ``end('first')``
+      and an empty run contains no ``?``, so ``g = end('first')`` is always
+      legal; and every larger ``g`` only shrinks the allowed split (``a`` must
+      stay non-empty), so the smallest is also the most permissive. The run is
+      therefore reduced away, not approximated.
+    * ``(?P<a>.+?)\s+or\s+`` — ``.`` under DOTALL is unconstrained, so the
+      question is only whether SOME ``or`` has whitespace on BOTH sides and
+      sits at least two characters past ``first`` (one for ``a``, one for the
+      ``\s+``). Any ``a`` content is accepted, including whitespace and ``?``.
+    * ``(?P<b>[^?]+?)\??\s*$`` — ``b`` runs to the END of the string, so the
+      only acceptable shapes are (i) no ``?`` at or after ``b``'s start, or
+      (ii) exactly ONE ``?`` — the question's trailing one — after a non-empty
+      ``b`` with whitespace after it. That is what ``trail`` plus the cached
+      first-``?`` lookup below encode in O(1) per candidate.
+
+    The groups (``a`` / ``b``) are NOT reproduced: no caller ever read them —
+    all eight call sites used the match as a predicate — so this returns bool.
+    """
+    n = len(question)
+    if n == 0:
+        return False
+    # ^\s*
+    i = 0
+    while i < n and question[i].isspace():
+        i += 1
+    # (?:which|who|what)\b
+    head = _ORDERING_HEAD.match(question, i)
+    if head is None:
+        return False
+    start = head.end()
+    if start < n and _is_word_char(question[start]):   # \b after the head
+        return False
+    # [^?]*?\bfirst\b — the earliest whole-word 'first' with no '?' before it
+    stop = question.find("?", start)                  # first '?' at/after start
+    if stop < 0:
+        stop = n
+    first_end = -1
+    j = start
+    while j < stop:
+        # Cheap gate first: under IGNORECASE no character other than 'f'/'F'
+        # can start `first` (checked over U+0000..U+10FFFF — the exotic folds
+        # in this token are at positions 1 and 3, 'İ'/'ı' for 'i' and 'ſ' for
+        # 's', and `_ORDERING_FIRST` handles those exactly), so the regex call
+        # is only needed where the first character can possibly match.
+        if question[j] == "f" or question[j] == "F":
+            tok = _ORDERING_FIRST.match(question, j)
+            if tok is not None:
+                end = tok.end()
+                if (not _is_word_char(question[j - 1])     # \b before 'first'
+                        and (end == n                     # \b after 'first'
+                             or not _is_word_char(question[end]))):
+                    first_end = end
+                    break
+        j += 1
+    if first_end < 0 or first_end >= n:
+        # no 'first', or nothing after it to hold `a`: `.+?` needs >= 1 char
+        return False
+    # tail bookkeeping for `[^?]+?\??\s*$`: `trail` is the start of the maximal
+    # TRAILING whitespace run, so an optional `?` immediately before it is the
+    # only one the pattern can absorb.
+    trail = n
+    while trail > 0 and question[trail - 1].isspace():
+        trail -= 1
+    # first '?' at/after a `b` start. Cached: `b` starts are monotonically
+    # increasing through the loop, so each new search resumes past the previous
+    # hit and the whole loop stays O(n) rather than O(n) per candidate.
+    q_from = -1
+    q_next = -1
+    # (.+?)\s+or\s+ — 'a' needs >= 1 char, so the 'or' is at least 2 past
+    # 'first'; and `\s+` after it needs a character to consume (o + 2).
+    for o in range(first_end + 2, n - 2):
+        if not question[o - 1].isspace():              # \s+ before 'or'
+            continue
+        if _ORDERING_OR.match(question, o) is None:
+            continue
+        after = o + 2
+        if not question[after].isspace():              # \s+ after 'or'
+            continue
+        b_start = after + 1
+        if b_start > n - 1:                            # `b` needs >= 1 char
+            continue
+        # ⛔ The EARLIEST `b` start is the only one worth testing: the `\s+`
+        # after 'or' makes every later candidate sit inside that whitespace
+        # run, and a '?' — the only character `[^?]` excludes — can never be
+        # inside a whitespace run, so a later candidate can only fail where
+        # this one would pass.
+        if q_from < 0 or (q_next >= 0 and b_start > q_next):
+            q_next = question.find("?", b_start)
+            q_from = b_start
+        if q_next < 0:
+            # no '?' at or after `b`: `[^?]+` runs to the end of the question
+            return True
+        if q_next > b_start and q_next == trail - 1:
+            # exactly ONE '?' and it is the trailing one: `[^?]+` stops before
+            # it, `\??` takes it, `\s*$` takes the trailing whitespace
+            return True
+    return False
 
 # ── #8056 class-plural temporal ENUMERATION ─────────────────────────────
 # "What is the order of the concerts and musical events I attended in the
@@ -720,8 +876,32 @@ _RE_INTERVAL_BETWEEN = re.compile(
     r"(?P<b>[^?]+?)\??\s*$",
     re.IGNORECASE | re.DOTALL)
 # leading "Between A and B, how many <unit> passed?"
+#
+# ⛔ The whitespace runs adjacent to the two SPANS are SINGLE `\s`, not
+# `\s+`/`\s*` (#8147, found while enumerating the patterns on
+# `classify_question`'s path — it was the WORST of the class, well beyond the
+# `_RE_ORDERING` the issue was filed for). `\s+` BOTH SIDES of the lazy
+# `.+?` overlap on whitespace, so on a crafted in-bound question the engine
+# re-tries every (left-run, span-end, right-run) triple: measured on the old
+# form, 30 ms at len 257, 1.96 s at len 1007 and **21 s at len 1990** for
+# `"between" + " " * n`, plus 57 s through `.search`. `ask_lane` accepts any
+# question up to `MAX_ASK_QUESTION_CHARS` (2000) and `run_ask_lane` has no
+# timeout, so that is a live CPU burn on the ask path — the same defect the
+# `_RE_OR_CHAIN` note above and #8147's own shape record.
+#
+# A single `\s` is the #8097/#2653 fix: it absorbs one separator, the span
+# itself covers every extra (`a` is `.+?` and `b` is `[^?]+?`, both of which
+# match whitespace), and the classes stop overlapping so there is nothing to
+# re-try. The optional `\s?` before the colon plays the same role for the
+# old `\s*` (which required giving whitespace back to `b`). Equivalence over
+# 727,813 generated strings: 0 language mismatches AND 0 `_clean`ed
+# group-`a`/`b` mismatches — the two captures the interval's subject
+# extraction reads (`extract_subject_terms`).
+#
+# ⛔ `how\s+many\s+` / `years?)\s+(?:…)passed` keep their `\s+`: both sides
+# there are LITERALS, so the runs cannot overlap and cannot backtrack.
 _RE_INTERVAL_BETWEEN_LEAD = re.compile(
-    r"^\s*between\s+(?P<a>.+?)\s+and\s+(?P<b>[^?]+?)\s*,\s*how\s+many\s+"
+    r"^\s*between\s(?P<a>.+?)\sand\s(?P<b>[^?]+?)\s?,\s*how\s+many\s+"
     r"(?:days?|weeks?|months?|years?)\s+(?:(?:had|have)\s+)?passed\??\s*$",
     re.IGNORECASE | re.DOTALL)
 # interval since-until: "how many <unit> had passed since X when Y"
@@ -780,7 +960,7 @@ def _date_lookup_surface(question: str, residual: str, spans) -> bool:
         return False
     if not _RE_WH_LOOKUP.search(question):
         return False
-    if (_RE_ORDERING.match(question) or _RE_CURRENT.match(question)
+    if (_ordering_match(question) or _RE_CURRENT.match(question)
             or _RE_CURRENT_STILL.match(question)
             or _RE_INTERVAL_SINCE.match(question)
             or _RE_INTERVAL_BETWEEN.match(question)
@@ -890,7 +1070,7 @@ def _relative_guarded(question: str):
     q = question
     if _RE_OR_CHAIN.search(q):
         return None
-    if (_RE_ORDERING.match(q) or _RE_INTERVAL_SINCE.match(q)
+    if (_ordering_match(q) or _RE_INTERVAL_SINCE.match(q)
             or _RE_INTERVAL_BETWEEN.match(q)
             or _RE_INTERVAL_BETWEEN_LEAD.match(q)):
         return None
@@ -1004,7 +1184,7 @@ def classify_question(question: str) -> AssemblyShape | None:
     # main and `class-plural`/`None` here (#8779 F1, the list half).
     m_cls = _RE_CLASS_PLURAL.match(q)
     if m_cls is not None and not (
-            _RE_ORDERING.match(q) or _RE_ORDERING_LIST.match(q)
+            _ordering_match(q) or _RE_ORDERING_LIST.match(q)
             # ...and a compound question that names a CURRENT-STATE subject
             # ("…, and what is the current status of my car?") is not a class
             # enumeration either: this branch runs BEFORE the current-state
@@ -1060,7 +1240,7 @@ def classify_question(question: str) -> AssemblyShape | None:
     # duration-state/interval arms below.
     if _RE_OR_CHAIN.search(q) and not (
             _nary_terms(q)
-            and (_RE_ORDERING.match(q) or _RE_ORDERING_LIST.match(q))):
+            and (_ordering_match(q) or _RE_ORDERING_LIST.match(q))):
         return None
     # #2654 — duration-state ("how long had I been X when Y"): the state is
     # a single resolved subject and the span runs from its state entry to
@@ -1104,7 +1284,7 @@ def classify_question(question: str) -> AssemblyShape | None:
         return AssemblyShape.INTERVAL
     if _RE_INTERVAL_BETWEEN.match(q) or _RE_INTERVAL_BETWEEN_LEAD.match(q):
         return AssemblyShape.INTERVAL
-    m_ord = _RE_ORDERING.match(q)
+    m_ord = _ordering_match(q)          # bool, not a match object (#8147)
     m_list = None if m_ord else _RE_ORDERING_LIST.match(q)
     if m_list and _RE_CURRENT.match(q):
         # "the order I placed:" is a CURRENT_STATE subject, not an option
@@ -1119,7 +1299,7 @@ def classify_question(question: str) -> AssemblyShape | None:
         # with fewer than 3 terms for a 3+ list (R1).
         if _nary_terms(q):
             return AssemblyShape.ORDERING
-        if m_ord is None:
+        if not m_ord:
             # the colon-list head with fewer than 3 decomposable options is
             # not a shape this branch can answer
             return None
