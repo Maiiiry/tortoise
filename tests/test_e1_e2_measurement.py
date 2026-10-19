@@ -26,6 +26,9 @@ So the pins here are:
 6. **Collecting this file must not mutate the interpreter.** The probe is imported
    at collection time, so a process-global `logging.disable` in it would silence
    every `caplog` assertion in the files that run after this one (#9110 review P1).
+7. **The committed log IS what the probe prints** — the corpus is pinned to a
+   rebuild and the log is pinned to a run, so an edited log or a probe improved
+   without a re-take cannot pass as the bundle's evidence (#9110 review P2).
 
 DB-free: the pipeline runs with a scripted model, ``sdk=None``, no network.
 """
@@ -368,6 +371,30 @@ def test_the_produced_log_passes_the_structural_check(log_text):
 def test_the_committed_log_passes_the_structural_check():
     findings, _state = check.check(_LOG.read_text(encoding="utf-8"))
     assert findings == [], findings
+
+
+def test_the_committed_log_is_what_the_probe_prints(run):
+    """The log the bundle is ABOUT is the one file in it with no reproduction pin.
+
+    The corpus is pinned (`test_committed_corpus_matches_a_fresh_build`), and the
+    structural checker reconciles the committed log WITH ITSELF — so a hand-edited
+    log, or a probe improved without re-taking the log, would keep both green. The
+    documented re-take command claims the log reproduces; this is what verifies it.
+
+    ``sha=`` is the only genuinely non-reproducible line: ``measurement_sha()``
+    reads ``HEAD``, and the log necessarily names the PARENT commit (the one the run
+    was taken at) because it cannot name the commit that adds it.
+    """
+    def strip(text: str) -> str:
+        return "\n".join("sha=<masked>" if ln.startswith("sha=") else ln
+                         for ln in text.splitlines())
+
+    committed = _LOG.read_text(encoding="utf-8")
+    assert strip(run["text"]) == strip(committed), (
+        "e1-e2.log is not what the probe prints — re-take it "
+        "(`.venv/bin/python docs/evidence/7949-capstone/probes/e1_e2_probe.py \\ "
+        "| tee docs/evidence/7949-capstone/e1-e2.log`) and update `Measured at:`"
+    )
 
 
 def test_checker_fails_when_a_denominator_is_missing(log_text):
