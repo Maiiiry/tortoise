@@ -108,6 +108,9 @@ from . import file_indexer  # noqa: F401 — binds the classifier/identity modul
 from .projection import FalkorProjection
 # #7951 §17.1: the single-writer scope the live doors open around their fold.
 from .projection import _live_write_scope
+# #9123 §17.1: the GRAPH-METADATA lane — a write with no journal record that
+# describes it, and whose loss a rebuild absorbs.
+from .projection import _graph_metadata_write_scope
 # #7951 review P1: the journal payload is built from the WRITE INTENT, so it
 # must state what the store will HOLD — the transport model lives in the
 # projection package (one home), not in a second copy at this call site.
@@ -20006,16 +20009,54 @@ class TortoiseSDK:
         ``ep_dirty_at`` with the SAME epoch inside the CREATE statement that
         writes the point — instead of issuing a second, post-CREATE ``SET``
         (see create_point for why that second write is not free).
+
+        §17.1 (#9123): this MERGE is a DECLARED **graph-metadata** write, not a
+        projection of the journal — ``_graph_metadata_write_scope`` states the
+        two properties that earn it:
+
+        * **no record describes it, as graph metadata.** ``:EpMeta.ep_version``
+          is a graph-wide monotonic counter that orders EP dirty-markings
+          across processes. No journal event writes it and no event can: it is
+          not a fact about the corpus, so journalling the COUNTER would put a
+          non-fact in the log and make ``derived == replay(journal)`` depend on
+          it. ⚠️ The counter's VALUE does ride the record — as each Point's own
+          ``ep_dirty_at`` stamp, written by ``create_point``'s CREATE map and
+          restored by the replay's open-set passthrough. Unjournalled counter,
+          journalled value: both halves are true, and the next obligation is a
+          bound rather than an absence because of the second one.
+        * **a rebuild may reset it, and nothing reconciles over its value.**
+          ``rebuild`` folds journal records; ``:EpMeta`` is not one, so the
+          epoch does not come back — and no reconciliation reports divergence
+          when it does not. ⚠️ But the epoch IS an **ordering bound**, not an
+          inert hint: ``_sweep_dirty_roots`` clears a dirty flag only under
+          ``n.ep_dirty_at <= $run_ep``, and ``_ep_epoch()`` returns 0 on a graph
+          with no ``:EpMeta`` — so the stamps the replay restored sit AHEAD of
+          the reset counter, those flags stay dirty until it re-climbs past
+          them, and ``TortoiseEP._flush_cache``'s stale-run guard
+          (``current > _run_ep_version``) cannot fire in the direction it
+          exists for over the same window. A DELAYED sweep, not corruption,
+          and pre-existing (``#5166``).
+          ``tests/test_9079_ep_epoch_declared.py`` pins both halves.
+
+        Why the declaration had to exist: this statement is the most frequently
+        refused one on #9079's measuring lane (5 of 7 failures) — it runs
+        outside every scope today (``create_point`` opens its own scope around
+        its CREATE, and this write happens BEFORE it), so closing the guarded
+        handle would refuse the create hot path. The scope goes AROUND
+        ``_graph_write_with_retry`` rather than inside its lambda, so the whole
+        retry — including every re-issued attempt — runs under ONE declaration
+        and #7405/#7685's predicate is untouched.
         """
         proj = self._get_proj()
-        rows = self._graph_write_with_retry(
-            lambda: proj.g.query(
-                "MERGE (m:EpMeta) "
-                "SET m.ep_version = coalesce(m.ep_version, 0) + 1 "
-                "RETURN m.ep_version"
-            ).result_set,
-            what="_advance_ep_version MERGE(:EpMeta)",
-        )
+        with _graph_metadata_write_scope("graph-metadata:ep-epoch"):
+            rows = self._graph_write_with_retry(
+                lambda: proj.g.query(
+                    "MERGE (m:EpMeta) "
+                    "SET m.ep_version = coalesce(m.ep_version, 0) + 1 "
+                    "RETURN m.ep_version"
+                ).result_set,
+                what="_advance_ep_version MERGE(:EpMeta)",
+            )
         return int(rows[0][0]) if rows else 1
 
     def _mark_dirty(self, point_ids: list[str], *, ep_version: int | None = None,
@@ -22621,11 +22662,91 @@ class TortoiseSDK:
         return self._find_point_by_content(content, pointKind=pointKind,
                                            exclude_id=exclude_id)
 
+    def _check_checkpoint_items(self, items: Any) -> None:
+        """#8554 — refuse a malformed ``checkpoint`` item batch (fail-closed).
+
+        The item contract ``checkpoint`` documents is ``{wing, room, content}``
+        with ``content`` REQUIRED. Before #8554 nothing validated it: an item
+        whose ``content`` was ``None``/non-str reached ``_content_hash``'s
+        ``text.encode`` and escaped as a bare
+        ``AttributeError: 'NoneType' object has no attribute 'encode'`` — a
+        crash from a private helper that names neither ``checkpoint`` nor
+        ``content``, i.e. a caller error that reads as an internal bug (and an
+        absent ``content`` key escaped as a bare ``KeyError: 'content'``, a
+        non-dict item or a non-list ``items`` as a bare ``TypeError``).
+
+        Validated ONCE, here, because ``checkpoint`` reads each item's
+        ``content`` in two independent places — the tier-1 dedup loop (into
+        ``_content_hash``) and the write loop — so a per-read check would be
+        two homes that can drift.
+
+        The shape mirrors ``ingest``'s Phase-1 item check (``_check_item_shape``,
+        #902 A2): the SAME ``BundleValidationError`` carrying EVERY violation
+        (not just the first), so a caller fixes the whole batch in one pass and
+        the MCP ``tortoise_checkpoint`` wire returns
+        ``{error, code: ERR_BUNDLE_INVALID, violations}`` instead of an opaque
+        error. The "bundle" in the class name is accurate here: a checkpoint call
+        IS a batch of items whose schema is the caller's to get right.
+
+        Why fail-closed rather than the #5240 answer: there ``update_point(None)``
+        is a deliberate "no content edit" because the REPLAY fold cannot record
+        a live clear (``_revise_point``'s ``coalesce($c, n.content)``). That
+        reasoning does NOT transfer — in ``checkpoint`` ``content`` is a
+        required field, there is no edit to no-op, and skipping the item would
+        discard the caller's write with no error at all.
+        """
+        violations: list[dict] = []
+        # A tuple is accepted: it iterated fine before #8554, so refusing it
+        # would break a working caller over a container-type detail that is
+        # NOT this issue's defect. What is refused is a container that can
+        # never be a batch — ``str``/``bytes`` (each index is a character),
+        # ``dict`` (each index is a key) and any non-iterable/singleton — which
+        # before #8554 escaped as a bare
+        # ``TypeError: string indices must be integers`` / ``'NoneType' object
+        # is not iterable`` naming neither ``checkpoint`` nor ``items``.
+        if not isinstance(items, (list, tuple)):
+            # No item index exists for a bad container — ``-1`` is the
+            # "container, not item" sentinel. Every violation keeps the
+            # ``{section, index, message}`` key set the A2 wire contract pins
+            # (tests/test_failure_contract.py).
+            violations.append({
+                "section": "items", "index": -1,
+                "message": "checkpoint: items must be a list of "
+                           "{wing, room, content} items — got "
+                           f"{type(items).__name__}",
+            })
+        else:
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    violations.append({
+                        "section": "items", "index": index,
+                        "message": f"checkpoint: items[{index}] must be a "
+                                   f"dict of {{wing, room, content}} — got "
+                                   f"{type(item).__name__}",
+                    })
+                    continue
+                # Same wording and same test as ingest's Phase-1 content
+                # gate (absent == None == non-str), so the two bulk surfaces
+                # cannot disagree about what a required content is.
+                content = item.get("content")
+                if content is None or not isinstance(content, str):
+                    violations.append({
+                        "section": "items", "index": index,
+                        "message": f"checkpoint: items[{index}] requires 'content'",
+                    })
+        if violations:
+            from .exceptions import BundleValidationError
+            raise BundleValidationError(violations)
+
     def checkpoint(self, items: list[dict], agent_name: str = "checkpoint",
                    threshold: float = 0.95) -> dict:
         """Session batch save — two-tier dedup (content hash + embedding similarity).
 
-        Each item: {wing, room, content}. Returns {filed: N, duplicates: M}.
+        Each item: {wing, room, content} — ``content`` is REQUIRED and must be
+        a ``str``; a missing/``None``/non-str ``content``, a non-dict item or a
+        non-list ``items`` raises ``BundleValidationError`` naming the item
+        index and ``content`` (never an ``AttributeError``/``KeyError`` from a
+        private helper — #8554). Returns {filed: N, duplicates: M}.
         threshold: cosine similarity for semantic dedup (0.0-1.0).
                    Set to 1.0 to disable semantic dedup (hash-only).
 
@@ -22637,6 +22758,11 @@ class TortoiseSDK:
         ≥ 0.95, while looser paraphrases (0.77-0.90) stay below and file
         as distinct points. Keep in sync with mcp_server.tortoise_checkpoint.
         """
+        # #8554: fail-closed BEFORE the projection is opened, before any hash,
+        # dedup read or write. One home for the item schema (see
+        # ``_check_checkpoint_items``).
+        self._check_checkpoint_items(items)
+
         from datetime import datetime, timezone
         filed, duplicates = 0, 0
         proj = self._get_proj()
