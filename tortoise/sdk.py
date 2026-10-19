@@ -9741,6 +9741,10 @@ class TortoiseSDK:
         "failover_used", "errors", "warnings"} carries the provider-routing
         surface (which adapter ran, whether failover was used, and the v2
         pipeline's errors/warnings lists for P1's fail-closed surfacing).
+        #8584: ``meta["deletions"]`` carries the extractor's result-level
+        DELETE-soft records UNapplied — the capture path does not retract points
+        (E7 gates 1/3 are owner-approval items), and the receipt warns instead of
+        dropping them silently.
 
         Fails closed without a routing-usable provider key — the inner gate
         checks exactly what the adapter consumes: DEEPSEEK_API_KEY /
@@ -10245,6 +10249,47 @@ class TortoiseSDK:
                     "(non-capture canonical / paraphrase fold / missing "
                     "node — deferred surface)")
 
+        # ── retractions (E7 D5): result-level DELETE-soft records are
+        #    DELIBERATELY NOT APPLIED here (#8584) ─────────────────────────
+        # ``extractor_v2.execute_embed`` resolves an explicit withdrawal ("forget
+        # my gym schedule") into ``out["deletions"]`` — a RESULT-level record
+        # (D8: deliberately not in the Layer-1 payload). Its only consumer today
+        # is the EVAL lane (``tools/longmem_eval/ingest_v2._apply_deletions`` →
+        # ``sdk.retract_point``), which ingests per-question into a fresh
+        # throwaway graph.
+        #
+        # ⛔ This path must NOT apply them, and that is a RECORDED DECISION, not
+        # an oversight: E7 gate 1 (payload channel + ``compute_client_commit_id``
+        # canonical + hosted reconcile/quota semantics) and gate 3 (NOOP/DELETE
+        # applied to a SHARED production graph outside the eval harness — needs
+        # gate 1 plus an operator-action audit) are owner/architecture-approval
+        # items (`docs/plans/2026-08-20-1539-e7-consolidation.md` §5, both marked
+        # ⛔ "not approved by default"). A capture path that "helpfully"
+        # retracted here would silently reverse that decision — a tombstone on a
+        # shared graph is expensive to undo and is exactly the class of change the
+        # gate exists for (#8584's two-halves note).
+        #
+        # What the drop must NOT be is SILENT (the #1529/#2104 discipline this
+        # method already applies to ``errors`` and ``noops``): pre-#8584 a
+        # retraction reached the extractor, produced a record, and vanished with
+        # no trace on any product surface. So: the records ride
+        # ``meta["deletions"]`` (structured, for a caller that may act on them)
+        # and the capture RECEIPT carries a warning naming what was withdrawn and
+        # left unapplied.
+        deletions = out.get("deletions") or []
+        if deletions:
+            del_ids = [str(d.get("point_id") or "").strip()
+                       for d in deletions if isinstance(d, dict)]
+            del_ids = [i for i in del_ids if i]
+            named = ", ".join(del_ids[:5])
+            if len(del_ids) > 5:
+                named += f" (+{len(del_ids) - 5} more)"
+            warnings.append(
+                f"{len(deletions)} retraction(s) resolved to DELETE-soft "
+                "record(s) and were NOT applied — this capture path does not "
+                "retract points (E7 gates 1/3 pending owner approval, #8584): "
+                f"{named or 'no resolvable point id'}")
+
         # ── events ──
         # #2552: payload events are created under their CONTENT-ADDRESSED
         # ``ev_<sha>`` ids (the ``_server_id`` channel — the same id
@@ -10425,6 +10470,12 @@ class TortoiseSDK:
             # #5516: this capture's write-time source-change notices — the
             # capture RECEIPT is the write result its caller sees.
             "source_change_notices": source_change_notices,
+            # #8584: the extractor's result-level DELETE-soft records, carried
+            # UNapplied (see the block above the events loop for why application
+            # is gated, and why the drop is surfaced rather than swallowed).
+            # Additive: absent (not []) on every receipt that produced none, so
+            # a caller can distinguish "no retraction" from "not read at all".
+            "deletions": deletions,
         }
         return extracted, meta
 

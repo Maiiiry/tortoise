@@ -250,9 +250,25 @@ NOOP/DELETE-soft records live in `result["noops"]` / `result["deletions"]` (extr
 
 > Anything here needs explicit owner/architecture approval before it can be implemented. Not approved by default.
 
-1. **⛔ NOOP/DELETE-soft in the Layer-1 payload + 3-site (production capture→commit).** The `duplicates` **property on the graph is APPROVED** (04-plan §4) and lands in-scope via `ingest_v2`. What is NOT approved: adding `noops`/`retractions` **sections to the Layer-1 payload schema**, including them in `compute_client_commit_id`'s canonical, and applying them in hosted `reconcile` (D8). That is a production-path schema evolution + 3-site change (payload + client_commit_id + ingest) with P4-parity and quota implications (a NOOP commit writes zero new points — quota semantics for no-op deltas) — a separate issue/lane.
+1. **⛔ NOOP/DELETE-soft in the Layer-1 payload + 3-site (production capture→commit).** The `duplicates` **property on the graph is APPROVED** (04-plan §4) and lands in-scope via `ingest_v2`. What is NOT approved: adding `noops`/`retractions` **sections to the Layer-1 payload schema**, including them in `compute_client_commit_id`'s canonical, and applying them in hosted `reconcile` (D8). That is a production-path schema evolution + 3-site change (payload + client_commit_id + ingest) with P4-parity and quota implications (a NOOP commit writes zero new points — quota semantics for no-op deltas) — a separate issue/lane. **#8584 is that lane, and it recorded the WITHDRAWAL, not an approval:** the capture path surfaces the unapplied records on `meta["deletions"]` + a receipt warning instead of applying them (see gate 3's status note). This gate stays ⛔.
 2. **⛔ A new "duplicate of" edge type.** Explicitly NOT allowed — a Point↔Point "duplicate of" edge is not in the ontology (existing Point↔Point edges: IMPL/NAND/hasPart/CORRECTS), and IMPL would couple EP weights (how-to-use-tortoise hazard; prior art: REPHRASE is a label, not a written operator). The plan uses the approved additive `duplicates` property + existing CONTAINS edges only. Any plan delta that introduces such an edge violates the epic contract and must be rejected.
 3. **⛔ NOOP/DELETE applied to the shared production graph outside the eval harness.** The eval ingests per-question into fresh graphs (axis-2 isolation) — DELETE-soft can never touch another question's points. Production-capture retractions/duplicates on the shared real graph require the payload channel (gate 1) + operator-action audit; not in this issue.
+   **Status (#8584 — re-measured on `main` 2026-10-14).** The gate is still the
+   shipped behaviour, so the gap is real and not provenance-stale: `execute_embed`
+   emits the result-level record, `tools/longmem_eval/ingest_v2._apply_deletions`
+   remains the ONLY capture-lane caller of `sdk.retract_point`, and
+   `sdk._extract_session_v2` (the shared self-hosted + hosted seam) does not
+   retract — it read `payload`/`errors`/`warnings`/`noops` and never
+   `deletions`. Because the application is ⛔ unapproved, #8584 did **not** wire
+   it; it **withdrew the promise from the product path** instead of leaving it
+   silently unmet: the seam now carries the records on `meta["deletions"]` and
+   puts a warning on the capture receipt naming the withheld points and this
+   gate. `tests/test_capture_deletions_8584.py` pins BOTH halves — the prior
+   point stays live (`status` unchanged; no `retract_point` from capture), and
+   the drop is never silent. **The route to the other half is an owner ruling on
+   this gate** (gate 1's payload + `client_commit_id` + quota work, plus the
+   operator-action audit) — not a capture-lane patch, which would reverse this
+   recorded decision.
 4. **⛔ LLM entity-resolution on the capture latency path beyond the bounded deadline.** The resolver reuses the existing `_complete` 600s wall-clock bound; if that proves too slow for production capture (a capture is already 4 flash prompts), the resolver must be deferred/async or disabled via env — never extend capture latency unbounded. Flag for the run-protocol step (pilot) to measure.
 5. **⛔ Ontology/kind additions for retraction or dedup semantics.** None — `retractions` is an embed-list field (additive), DELETE uses status machinery (existing), NOOP uses a property (approved). Any new kind/pack/expansion-pack proposal is out of scope (epic contract: "Ontology is sacred").
 
