@@ -1435,7 +1435,8 @@ def _release_owner_quietly(db, sock: str | None = None) -> None:
         if release is not None:
             release()
             return
-        forget_owner(sock or owner_socket_of(db))
+        # #8411: pass the CLIENT (see `_release_owner`).
+        forget_owner(sock or owner_socket_of(db), db)
     except Exception:  # GC/teardown context: never raise
         pass
 
@@ -1633,7 +1634,11 @@ def _release_owner(client, inner, sock: str | None = None) -> None:
         if release is not None:
             release()
             return
-        forget_owner(sock if sock is not None else owner_socket_of(inner))
+        # #8411: pass the CLIENT so `forget_owner` can read whether its own
+        # hand-off was counted. Without the identity a raw client that never
+        # held a count would still decrement (and unlink) on a snapshot.
+        forget_owner(sock if sock is not None else owner_socket_of(inner),
+                     client)
     except Exception:  # teardown context: never raise
         pass
 
@@ -1984,9 +1989,18 @@ def begin_owner_release(client, socket_file: str | None) -> str | None:
     at-fork subtraction count two pending decrements for one claim. The
     publish is therefore idempotent for a client already in flight.
 
+    #8411: a client whose OWN hand-off counted nothing holds no claim, so it
+    must publish NO marker. The at-fork correction subtracts every marker
+    whose client is past the point of no return from the inherited count, so
+    a marker for a claim that never existed would subtract a LIVE
+    co-tenant's count — dropping a live claim, the #1557 kill polarity, one
+    fork deep.
+
     Returns the socket key to hand back to `end_owner_release`, or None when
     there is no socket to key on (nothing was published).
     """
+    if owner_record_counted(client) is False:
+        return None
     if not socket_file:
         return None
     key = os.path.abspath(socket_file)
@@ -2312,6 +2326,62 @@ OWNER_RECORD_JOINED = False
 OWNER_RECORD_FAILED = None
 
 
+#: #8411: the attribute the in-flight hand-off stamps on the client it just
+#: tried to record, carrying `record_owner`'s ANSWER for THAT client
+#: (`True`/`False` = counted, absent = unknown). The release seam reads it to
+#: decide whether this client holds a count to give back.
+_OWNER_COUNTED_ATTR = "_t_owner_record_counted"
+
+
+def stamp_owner_counted(client, counted: bool) -> None:
+    """Record, ON the client, whether ITS OWN hand-off was counted (#8411).
+
+    Called by the `RedisMixin.__init__` patch immediately after the
+    hand-off, on the object that owns the server. `forget_owner` and
+    `begin_owner_release` read it back through `owner_record_counted`.
+
+    Never raises: the stamp is bookkeeping for a later teardown, so an
+    object that refuses attributes must not break a construction (it then
+    reads back as UNKNOWN, which keeps the pre-#8411 behaviour).
+    """
+    try:
+        setattr(client, _OWNER_COUNTED_ATTR, bool(counted))
+    except Exception:  # never raise: bookkeeping for a later teardown
+        return
+
+
+def owner_record_counted(client) -> bool | None:
+    """Did THIS client's own hand-off get COUNTED? Tri-state (#8411).
+
+    ``True``/``False`` answer for a client whose hand-off stamped it;
+    ``None`` when nothing is known (no stamp — an object that predates the
+    patch, a synthetic client, a raw client whose record was written by the
+    at-fork adoption). Unknown deliberately keeps the pre-#8411 behaviour in
+    both readers: a claim nobody can account for is LEFT ALONE (a leak at
+    worst, never the #1557 kill), which is the safe direction.
+
+    Resolves the INNER client too, because the guarded `tortoise.FalkorDB`
+    wrapper's release seam only ever sees the WRAPPER while the patch stamped
+    the redislite `Redis` it owns (`owner_socket_of` documents the same
+    shape). A callable ``.client`` is a bound method on a raw redislite
+    client — never an inner client.
+    """
+    try:
+        if client is None:
+            return None
+        sentinel = object()
+        counted = getattr(client, _OWNER_COUNTED_ATTR, sentinel)
+        if counted is not sentinel:
+            return bool(counted)
+        inner = getattr(client, "client", None)
+        if inner is None or callable(inner) or inner is client:
+            return None
+        counted = getattr(inner, _OWNER_COUNTED_ATTR, sentinel)
+        return None if counted is sentinel else bool(counted)
+    except Exception:
+        return None  # unreadable -> unknown -> leave the claim alone
+
+
 def record_owner(socket_file: str | None) -> bool | None:
     """Record THIS process as a live owner of the server at ``socket_file``.
 
@@ -2383,9 +2453,10 @@ def forget_owner(socket_file: str | None, client=None) -> bool:
 
     ``client`` is the guarded wrapper whose claim this call releases, when
     there is one. It is passed through so the in-flight release marker is
-    retracted BY IDENTITY (#3630); a raw redislite client (or any other
-    identity-less caller) never published a marker and passes nothing, so it
-    consumes none.
+    retracted BY IDENTITY (#3630), and so this call can tell whether the
+    client's OWN hand-off was counted (#8411). A caller with no identity
+    (nothing to attribute) passes nothing and keeps the pre-#8411
+    behaviour.
     """
     if not socket_file:
         return False
@@ -2403,6 +2474,17 @@ def forget_owner(socket_file: str | None, client=None) -> bool:
     # will never be released there — a LEAK, never a claim dropped while a
     # client is live (the kill polarity).
     _retract_one_owner_release(key, client)
+    # #8411: THIS client's own hand-off answered `OWNER_RECORD_FAILED` — it
+    # wrote no record and added no count, so it has no claim to release.
+    # Deciding from the snapshot alone (as the pre-fix code did) let such a
+    # client's close decrement, or `pop`, a count held by a DIFFERENT, LIVE
+    # client of this process, and then unlink that client's `<pid>-` record —
+    # the measured unlink-while-live (`_owner_records` then reads 0 live
+    # owners for a server whose co-tenant is pinging). NOT a `held == 0`
+    # special case: that would still unlink another holder's record file on
+    # the same pid prefix.
+    if owner_record_counted(client) is False:
+        return False  # nothing held, nothing released (idempotent)
     held = _owner_refcounts.get(key, 0)
     if held > 1:
         _owner_refcounts[key] = held - 1
@@ -2884,11 +2966,23 @@ def _install_owner_record_patch() -> None:
                 # and must KEEP the claim (fail CLOSED, lifetime note above);
                 # BOTH counted arms (created, joined) release it.
                 recorded = record_owner(sock) is not OWNER_RECORD_FAILED
+                # #8411: thread THIS call's answer to the release seam, on
+                # the very object it describes. The release seam otherwise
+                # only sees the per-process refcount, which cannot say
+                # whether the CLOSING client was ever counted — a client
+                # whose hand-off wrote nothing would then decrement (and
+                # unlink) on the strength of a co-tenant's count.
+                stamp_owner_counted(self, recorded)
                 if not recorded:
                     release_claim = False
             except Exception:
                 # Fail CLOSED: the client is live but has no owner record, so
-                # keep the in-flight claim (the lifetime note above).
+                # keep the in-flight claim (the lifetime note above). #8411:
+                # `record_owner` is never-raise, so this net means the count
+                # it holds cannot be trusted — stamp UNCOUNTED, which makes
+                # the release seam leave every claim alone (a leak at worst,
+                # never a live co-tenant's claim spent).
+                stamp_owner_counted(self, False)
                 release_claim = False
         finally:
             if claimed and release_claim:

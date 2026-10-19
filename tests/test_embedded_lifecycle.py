@@ -2434,6 +2434,341 @@ def test_record_owner_holds_and_releases_the_shared_lock(tmp_path):
                 os.close(_fd)
 
 
+# ── #8411: the close decides about THIS client, never a refcount snapshot ──
+
+
+def _drop_failed_handoff_claim(sock: str) -> None:
+    """Retract the claim a FAILED owner hand-off deliberately left behind.
+
+    Production KEEPS that claim for the process's life (fail CLOSED: the
+    client is live but unrecorded, so the last-client decision must still see
+    it). Both halves of it are process-GLOBAL state, so a test that provokes
+    the failure must drop them or it pollutes every later test in this
+    process — the claim ledger the #4879/#4926 seams assert is EMPTY, and the
+    on-disk claim file that would pin the socket.
+    """
+    import tortoise.embedded_lifecycle as _lifecycle
+    from tortoise.embedded_lifecycle import _owner_lock_fds, _owner_refcounts
+
+    key = os.path.abspath(sock)
+    with _lifecycle._inflight_claim_lock:
+        _lifecycle._in_flight_replays.pop(key, None)
+        _lifecycle._retract_inflight_claim(key)
+    _owner_refcounts.pop(key, None)
+    _fd = _owner_lock_fds.pop(key, None)
+    if _fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(_fd)
+
+
+def test_forget_owner_never_spends_a_cotenants_count_for_an_uncounted_client(
+        tmp_path):
+    """#8411: a client whose own hand-off answered `OWNER_RECORD_FAILED`
+    holds NO count, so its close must be a no-op — it may neither decrement
+    nor `pop` the count a LIVE co-tenant holds, nor unlink that co-tenant's
+    record (all clients of a process share one `<pid>-<start>` file).
+
+    Pre-fix `forget_owner` decided from the per-process snapshot alone: with
+    one counted client held=1, so `held > 1` was False and the uncounted
+    client's close popped the count and unlinked the file. MEASURED on this
+    tree with an orphaned live server: after the uncounted client's close the
+    reaper read `_owner_records == (0, 1)` — no live owner — while the
+    co-tenant was still pinging.
+
+    Mutation: delete the `owner_record_counted(client) is False` guard from
+    `forget_owner` and the count assertion (1, not None) fails.
+    """
+    from tortoise.embedded_lifecycle import (
+        _owner_refcounts,
+        forget_owner,
+        owner_record_counted,
+        record_owner,
+        stamp_owner_counted,
+    )
+
+    class _Client:
+        pass
+
+    sock = str(tmp_path / "uncounted" / "redis.socket")
+    key = os.path.abspath(sock)
+    try:
+        assert record_owner(sock) is True, "the live co-tenant's claim"
+        # The failing client: nothing written, count untouched. Its stamped
+        # answer is what the release seam must read.
+        uncounted = _Client()
+        stamp_owner_counted(uncounted, False)
+        assert owner_record_counted(uncounted) is False
+        assert forget_owner(sock, uncounted) is False
+        assert _owner_refcounts.get(key) == 1, (
+            "#8411: an UNCOUNTED client's close must not spend the live "
+            "co-tenant's count")
+        assert _owner_entries(sock), (
+            "#8411: an UNCOUNTED client's close must not unlink the live "
+            "co-tenant's owner record")
+        # Inverted case (must stay exactly as before): a COUNTED client's
+        # close still decrements, and the last one still removes the record.
+        counted = _Client()
+        stamp_owner_counted(counted, True)
+        assert forget_owner(sock, counted) is True
+        assert key not in _owner_refcounts
+        assert _owner_entries(sock) in (None, [])
+    finally:
+        _owner_refcounts.pop(key, None)
+        from tortoise.embedded_lifecycle import _owner_lock_fds
+        _fd = _owner_lock_fds.pop(key, None)
+        if _fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(_fd)
+
+
+def test_owner_counted_answer_resolves_the_wrapper_inner_client():
+    """#8411: the guarded `tortoise.FalkorDB` wrapper's release seam only
+    ever sees the WRAPPER, while the hand-off stamped the redislite `Redis`
+    it owns — so the stamped answer must be resolvable through `.client`.
+
+    A raw redislite client exposes `.client` as a BOUND METHOD, which is
+    never an inner client (the #4487 shape) — that reads as UNKNOWN, i.e.
+    the pre-#8411 behaviour, never as a false "uncounted".
+    """
+    from tortoise.embedded_lifecycle import (
+        owner_record_counted,
+        stamp_owner_counted,
+    )
+
+    class _Inner:
+        pass
+
+    class _Wrapper:
+        def __init__(self, inner):
+            self.client = inner
+
+    inner = _Inner()
+    stamp_owner_counted(inner, False)
+    assert owner_record_counted(_Wrapper(inner)) is False
+    stamp_owner_counted(inner, True)
+    assert owner_record_counted(_Wrapper(inner)) is True
+
+    class _Raw:
+        def client(self):  # a bound method, never an inner client
+            raise AssertionError("must not be called")
+
+    assert owner_record_counted(_Raw()) is None, (
+        "a callable `.client` is never an inner client (#4487)")
+    assert owner_record_counted(object()) is None, (
+        "no stamp -> UNKNOWN -> keep the pre-#8411 behaviour")
+    assert owner_record_counted(None) is None
+
+
+def test_uncounted_client_publishes_no_owner_release_marker(tmp_path):
+    """#8411: the at-fork release ledger must not carry a marker for a claim
+    that never existed. The child's correction subtracts every marker whose
+    client passed the point of no return from the INHERITED count, so an
+    uncounted client's marker would subtract a LIVE co-tenant's claim —
+    dropping a live claim (the #1557 kill polarity, one fork deep).
+
+    Mutation: delete the `owner_record_counted(client) is False` guard from
+    `begin_owner_release` and the `is None` / empty-ledger assertions fail.
+    """
+    from tortoise.embedded_lifecycle import (
+        _owner_releases_in_flight,
+        begin_owner_release,
+        end_owner_release,
+        stamp_owner_counted,
+    )
+
+    class _Client:
+        pass
+
+    sock = str(tmp_path / "markers" / "redis.socket")
+    key = os.path.abspath(sock)
+    try:
+        uncounted = _Client()
+        stamp_owner_counted(uncounted, False)
+        assert begin_owner_release(uncounted, sock) is None
+        end_owner_release(None, uncounted)
+        assert key not in _owner_releases_in_flight, (
+            "#8411: a client that never held a count must publish no marker")
+        # Inverted case: a COUNTED client still publishes (the ledger's whole
+        # purpose), and its own retraction still removes exactly its entry.
+        counted = _Client()
+        stamp_owner_counted(counted, True)
+        assert begin_owner_release(counted, sock) == key
+        assert _owner_releases_in_flight.get(key) == [counted]
+        end_owner_release(key, counted)
+        assert key not in _owner_releases_in_flight
+    finally:
+        _owner_releases_in_flight.pop(key, None)
+
+
+def test_failed_handoff_close_keeps_the_live_cotenants_owner_record(
+        tmp_path, monkeypatch):
+    """#8411 (end-to-end through the real construction seam): when the FIRST
+    client's owner hand-off fails and a LATER client records successfully,
+    the first client's close must leave the later client's record and count
+    alone — the live client must stay visible to the reaper.
+
+    The failure is injected as a per-call `os.open` failure (`_write_owner_
+    record_file` -> False, the EMFILE/ENOSPC shape), which is the only way a
+    live client exists with no count: a pre-existing record would return
+    True through `FileExistsError`.
+
+    Mutation: delete the guard from `forget_owner` and the record vanishes,
+    `_owner_records` drops to no evidence, and the count assertion fails.
+    """
+    import tortoise.embedded_lifecycle as _lifecycle
+    from tortoise.embedded_lifecycle import _owner_refcounts
+    from tortoise.embedded_reaper import _owner_records
+
+    db_path = str(tmp_path / "handoff_uncounted.db")
+    real_write = _lifecycle._write_owner_record_file
+    state = {"failed_once": False}
+
+    def _flaky_write(socket_file):
+        if not state["failed_once"]:
+            state["failed_once"] = True
+            return False  # nothing written, count untouched
+        return real_write(socket_file)
+
+    monkeypatch.setattr(_lifecycle, "_write_owner_record_file",
+                        _flaky_write)
+    first = FalkorDB(db_path)   # the UNCOUNTED client
+    monkeypatch.setattr(_lifecycle, "_write_owner_record_file", real_write)
+    second = None
+    sock = None
+    try:
+        assert state["failed_once"], "the failure injection must have fired"
+        sock = first.client.socket_file
+        key = os.path.abspath(sock)
+        assert _owner_refcounts.get(key) is None, (
+            "test setup: the failing hand-off must leave NO count")
+        second = FalkorDB(db_path)  # count 0 -> NEW-record branch, count 1
+        assert _owner_refcounts.get(key) == 1
+        assert _owner_records(sock) == (1, 1), (
+            "test setup: the counted client's record must be live")
+
+        first.close()  # the UNCOUNTED client closes FIRST, second is LIVE
+
+        assert _owner_refcounts.get(key) == 1, (
+            "#8411: the uncounted client's close must not drop a live "
+            "co-tenant's count")
+        assert _owner_records(sock) == (1, 1), (
+            "#8411: the live co-tenant's owner record must SURVIVE the "
+            "uncounted client's close — pre-fix it was unlinked and the "
+            "reaper read no live owner for a pinging server")
+        assert second.client.ping(), "the co-tenant is still live"
+
+        second.close()  # inverted case: the LAST client still cleans up
+        assert key not in _owner_refcounts
+        assert _owner_records(sock) in (None, (0, 1)), (
+            "the last client's close must still release the record")
+    finally:
+        with contextlib.suppress(Exception):
+            first.close()
+        with contextlib.suppress(Exception):
+            if second is not None:
+                second.close()
+        if sock:
+            _drop_failed_handoff_claim(sock)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs SIGKILL (POSIX)")
+def test_uncounted_close_keeps_an_orphaned_servers_live_owner_evidence(
+        tmp_path, monkeypatch):
+    """#8411: the REACHABLE sequence the issue asked to construct, measured
+    end to end — a live client of an ORPHANED server whose owner evidence is
+    destroyed by an uncounted client's close.
+
+    1. a child process creates the server and is SIGKILLed (so no release
+       runs: the only record left names a DEAD pid — the pidfile pid is dead
+       and this process holds no claim for the key);
+    2. B attaches and its hand-off FAILS (`OWNER_RECORD_FAILED`);
+    3. A attaches: count is still 0, so A takes the NEW-record branch;
+    4. B closes first, while A is live.
+
+    Pre-fix step 4 unlinked A's record and dropped A's count, so
+    `_owner_records` read `(0, 1)` — "no live owner" — for a server whose
+    client was still pinging (the #1557/#3599 reaper direction).
+
+    Mutation: delete the guard from `forget_owner`; `_owner_records` then
+    reads `(0, 1)` and every `(1, ...)` assertion below fails.
+    """
+    import tortoise.embedded_lifecycle as _lifecycle
+    from tortoise.embedded_lifecycle import _owner_refcounts
+    from tortoise.embedded_reaper import _owner_records
+
+    db_path = str(tmp_path / "orphaned_8411.db")
+    # A subprocess, not `os.fork()`: the creator must die WITHOUT running a
+    # release seam, and forking a threaded pytest process to start a fresh
+    # redislite server is the flakier construction.
+    creator = _subprocess.run(
+        [sys.executable, "-c",
+         "import os, signal, sys; sys.path.insert(0, os.getcwd());"
+         "import tortoise; from tortoise import FalkorDB;"
+         f"db = FalkorDB({db_path!r}); db.client.set('orphan_probe', '1');"
+         "os.kill(os.getpid(), signal.SIGKILL)"],
+        capture_output=True, text=True, timeout=180)
+    assert creator.returncode == -_signal.SIGKILL, (
+        f"the orphan creator must die by SIGKILL so no release seam runs "
+        f"(rc={creator.returncode}); stderr={creator.stderr[-800:]}")
+    orphan_server = _registry_redis_pid(db_path)
+    assert orphan_server is not None, "the orphaned server must be running"
+
+    real_write = _lifecycle._write_owner_record_file
+    state = {"failed_once": False}
+
+    def _flaky_write(socket_file):
+        if not state["failed_once"]:
+            state["failed_once"] = True
+            return False
+        return real_write(socket_file)
+
+    first = second = None
+    sock = None
+    try:
+        monkeypatch.setattr(_lifecycle, "_write_owner_record_file",
+                           _flaky_write)
+        first = FalkorDB(db_path)  # step 2: the UNCOUNTED client
+        monkeypatch.setattr(_lifecycle, "_write_owner_record_file",
+                           real_write)
+        sock = first.client.socket_file
+        key = os.path.abspath(sock)
+        assert state["failed_once"], "the failure injection must have fired"
+        assert _owner_refcounts.get(key) is None, "step 2: B is UNCOUNTED"
+        orphan_evidence = _owner_records(sock)
+        assert orphan_evidence is not None and orphan_evidence[0] == 0, (
+            f"step 1: only a DEAD owner's record may remain, got "
+            f"{orphan_evidence!r}")
+
+        second = FalkorDB(db_path)  # step 3: NEW-record branch, count 1
+        live_evidence = _owner_records(sock)
+        assert live_evidence is not None and live_evidence[0] == 1, (
+            f"step 3: A must be one LIVE owner, got {live_evidence!r}")
+
+        first.close()  # step 4: the uncounted client closes FIRST
+
+        assert _owner_refcounts.get(key) == 1, (
+            "#8411: A's count must survive B's close")
+        after = _owner_records(sock)
+        assert after is not None and after[0] == 1, (
+            f"#8411: the reaper must still read ONE live owner after the "
+            f"uncounted client's close — measured (0, 1) pre-fix, got "
+            f"{after!r}")
+        assert second.client.ping(), "A is still live and usable"
+    finally:
+        with contextlib.suppress(Exception):
+            if first is not None:
+                first.close()
+        with contextlib.suppress(Exception):
+            if second is not None:
+                second.close()
+        # The orphan's record names a dead pid, so a torn-down server can
+        # never be reaped by the records alone — stop it explicitly.
+        if _pid_alive(orphan_server):
+            _kill_quiet(orphan_server)
+        if sock:
+            _drop_failed_handoff_claim(sock)
+
+
 def test_record_owner_never_follows_a_symlinked_lock(tmp_path):
     """#4577 / #4098: `record_owner` opens `.lock` with `O_NOFOLLOW`, so a
     symlink planted at `.lock` is never followed — the process takes no lock
