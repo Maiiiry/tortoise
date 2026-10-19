@@ -38,8 +38,7 @@ the classifier's own polarity is "anything not provably read-only is a write".
 That OVER-report polarity is what `_text` implements — every unresolved part of
 an f-string or a `+` skeleton returns `None` rather than a placeholder, because
 a placeholder lets `f"MATCH (n:Point {{id:$id}}) {action}"` read as a non-write
-and drop the whole function out of the census. Five such functions are pinned in
-`_UNRESOLVED` for that reason, not because they are believed to write.
+and drop the whole function out of the census. `_UNRESOLVED` for that reason, not because they are believed to write.
 
 WHICH EXPRESSION IS THE HANDLE. `proj.g`, `self._get_proj().g` (any attribute
 chain whose LAST attribute is `g`), `getattr(x, "g")`, and any name bound from
@@ -47,15 +46,20 @@ one of those by `h = proj.g`, `h: Any = proj.g`, `h, _ = proj.g, 1` or
 `raw = getattr(graph, "g", None)` — the shapes the tree actually uses
 (`event_store.py`, `onboarding/state.py`, `onboarding/seed.py`,
 `fallback_snapshot.py`, `weights.py`, `why.py`).
-⛔ KNOWN LIMIT, stated rather than implied: a handle RECEIVED AS A PARAMETER is
-not resolved (there is no binding to follow), and neither is one passed through
-`functools.partial`. Measured on this tree when part 1 landed: sdk.py has 7
-verb calls on a parameter receiver (3 read-only `MATCH … RETURN` probes —
-`_refuse_inverted_point_window`, `_refuse_inconsistent_validity_precision`,
-`_source_reachable_by` — and 4 calls to the SDK's own `query` method), and none
-of them is a write, so nothing is hidden TODAY; a future write through a
-parameter-received handle would be invisible here, which is why the shape is
-named in this docstring instead of being claimed away.
+⛔ KNOWN LIMIT — what the census cannot see, stated rather than implied. A handle
+passed as an ARGUMENT is resolved as the handle only when it arrives on a
+PARAMETER of the receiving function (any parameter except `self`/`cls`), which is
+the over-report direction: `clear_config_reset(self._get_proj().g)` → `clear_config_reset(g)` issues a
+`DETACH DELETE` at projection/__init__.py:1509 and is invisible without it
+(measured: 23 such writers package-wide). `functools.partial` over a verb, and a
+handle stashed on an object attribute (`self._h = proj.g`) then used later, are
+NOT resolved. Measured on this tree: sdk.py's 7 verb calls on a parameter
+receiver are 3 read-only `MATCH … RETURN` probes (`_holds_role_available`,
+`_refuse_inverted_point_window`, `_refuse_inconsistent_validity_precision`), 1
+unresolved read (`_source_reachable_by`) and 3 calls to the SDK's own `query`
+method (`self.query`, excluded because `self` is never a handle parameter); none
+is a write. A new write through one of the unresolved shapes would be invisible here,
+so the shapes are named in this docstring instead of being claimed away.
 
 WHY `sdk.py` AND `event_store.py`, AND NOT EVERY MODULE. These two are what part
 1 DECLARES: the SDK's journal-first doors and the `:GraphEvent` store. The other
@@ -230,10 +234,16 @@ _UNRESOLVED = {
     "_review_prune",
     "_reverse_bfs_neighbors",
     "_semantic_dedup",
+    "_source_reachable_by",
     "_state_related_objects",
     "_state_related_points",
     "_unsweepable_dirty_roots",
+    "backfill_about_entities",
     "list_batch",
+    "paginated_query",
+    "query",
+    "search_sessions",
+    "suggest_entry_points",
     "tortoise_fts_query",
     "traverse",
 }
@@ -294,7 +304,13 @@ def _text(expr, consts, local):
             parts.append(resolved)
         return "".join(parts)
     if isinstance(expr, ast.Name):
-        return local.get(expr.id, consts.get(expr.id))
+        # A name BOUND in this function but with an unresolvable value must NOT
+        # fall back to a module constant of the same name: that would classify
+        # the statement from a literal that is not its runtime value (the
+        # under-report direction).
+        if expr.id in local:
+            return local[expr.id]
+        return consts.get(expr.id)
     if isinstance(expr, ast.BinOp):
         left, right = _text(expr.left, consts, local), _text(expr.right, consts, local)
         if left is None or right is None:
@@ -303,16 +319,24 @@ def _text(expr, consts, local):
     return None
 
 
-def _is_handle_ref(expr, aliases) -> bool:
+def _is_handle_ref(expr, aliases, params=()) -> bool:
     """Does this expression name the write handle?
 
     `proj.g`, `self._get_proj().g` (any attribute chain ending in `g`),
-    `getattr(p, "g")`, or a NAME already bound to one of those.
+    `getattr(p, "g")`, a NAME already bound to one of those, or a PARAMETER of
+    the enclosing function that is not `self`/`cls`. The last case is a
+    deliberate over-report: a handle RECEIVED AS AN ARGUMENT has no binding to
+    follow, and measured on this tree it is how a real writer hides
+    (`clear_config_reset(self._get_proj().g)` → `clear_config_reset(g)` issues a
+    `DETACH DELETE` at projection/__init__.py:1509 with no declaring lane).
+    Counting a parameter receiver as the handle can over-report a helper that
+    takes a *projection* — which stays visible in the census — and it cannot
+    hide a writer.
     """
     if isinstance(expr, ast.Attribute):
         return expr.attr == "g"
     if isinstance(expr, ast.Name):
-        return expr.id in aliases
+        return expr.id in aliases or expr.id in params
     if isinstance(expr, ast.Call):
         return (getattr(expr.func, "id", None) == "getattr"
                 and len(expr.args) >= 2
@@ -332,30 +356,61 @@ def _add_alias_target(target, aliases) -> None:
             _add_alias_target(elt, aliases)
 
 
-def _bind_handle_aliases(node, aliases) -> None:
-    """`h = proj.g`, `h = getattr(p, "g")`, `h, _ = proj.g, 1`, `h: X = proj.g`.
+def _carries_handle(expr, aliases, params=()) -> bool:
+    """Does this expression DELIVER the handle — directly, or through a wrapper?
 
-    A receiver-name check alone misses every module that binds the handle to a
-    local first — which is exactly how `event_store.py` and the onboarding
-    funnel reach it, and how three read-side modules would have stayed outside
-    the package-wide scan.
+    `proj.g`, an alias, a handle parameter, `getattr(p, "g")`, and the same
+    inside a call's arguments (`closing(proj.g)`), a list/tuple
+    (`for h in [proj.g]`), or either arm of a conditional
+    (`h = proj.g if cond else None`). A wrapper is followed one level: enough for
+    the shapes in this tree, and wrong in the safe direction when a call happens
+    to take the handle as a side input.
+    """
+    if _is_handle_ref(expr, aliases, params):
+        return True
+    if isinstance(expr, ast.Call):
+        return any(_carries_handle(arg, aliases, params) for arg in expr.args)
+    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+        return any(_carries_handle(elt, aliases, params) for elt in expr.elts)
+    if isinstance(expr, ast.IfExp):
+        return (_carries_handle(expr.body, aliases, params)
+                or _carries_handle(expr.orelse, aliases, params))
+    return False
+
+
+def _bind_handle_aliases(node, aliases, params=()) -> None:
+    """Every binding shape that can put the handle in a local.
+
+    `h = proj.g`, `h: X = proj.g`, `raw = getattr(p, "g")`, `h, _ = proj.g, 1`,
+    `if (h := proj.g):`, `with closing(proj.g) as h:`, `for h in [proj.g]:`,
+    `h = proj.g if cond else None`. A receiver-name check alone misses every
+    module that binds the handle first — which is how `event_store.py` and the
+    onboarding funnel reach it.
     """
     if isinstance(node, ast.Assign):
-        targets, value = node.targets, node.value
+        value, targets = node.value, node.targets
     elif isinstance(node, ast.AnnAssign):
-        targets, value = [node.target], node.value
+        value, targets = node.value, [node.target]
+    elif isinstance(node, ast.NamedExpr):
+        value, targets = node.value, [node.target]
+    elif isinstance(node, ast.withitem):
+        value, targets = node.context_expr, [node.optional_vars]
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        value, targets = node.iter, [node.target]
     else:
         return
-    if value is None:
+    if value is None or not targets:
         return
-    if _is_handle_ref(value, aliases):
+    if _carries_handle(value, aliases, params):
         for target in targets:
-            _add_alias_target(target, aliases)
+            if target is not None:
+                _add_alias_target(target, aliases)
         return
-    if isinstance(value, (ast.Tuple, ast.List)) and len(targets) == 1:
+    if isinstance(value, (ast.Tuple, ast.List)) and len(targets) == 1 \
+            and targets[0] is not None:
         pairs = zip(value.elts, _flatten_target(targets[0]))
         for part, target in pairs:
-            if _is_handle_ref(part, aliases):
+            if _carries_handle(part, aliases, params):
                 _add_alias_target(target, aliases)
 
 
@@ -366,40 +421,54 @@ def _flatten_target(target):
 
 
 def _bound_names(node, consts, local):
-    """``{name: text}`` for a single string-ish assignment/annotation/augassign."""
+    """``{name: text-or-None}`` for a single string-ish assignment/annotation.
+
+    A name bound here is recorded even when its text is unresolvable (value
+    ``None``), so `_text` can tell "bound, unknown" from "not bound".
+    """
     if isinstance(node, ast.Assign) and len(node.targets) == 1 \
             and isinstance(node.targets[0], ast.Name):
-        text = _text(node.value, consts, local)
-        return {node.targets[0].id: text} if text is not None else {}
+        return {node.targets[0].id: _text(node.value, consts, local)}
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
             and node.value is not None:
-        text = _text(node.value, consts, local)
-        return {node.target.id: text} if text is not None else {}
+        return {node.target.id: _text(node.value, consts, local)}
     if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
         extra = _text(node.value, consts, local)
-        if extra is not None and node.target.id in local:
+        if extra is not None and node.target.id in local \
+                and local[node.target.id] is not None:
             return {node.target.id: local[node.target.id] + extra}
+        return {node.target.id: None}
     return {}
 
 
 def _module_consts(tree):
+    """String constants bound at MODULE level, and only those.
+
+    An `ast.walk` over the whole tree would let a string assigned inside one
+    function become a module-wide constant, so a different function's `stmt`
+    could be classified from a literal that is not its runtime value — the under-
+    report direction this enumerator exists to avoid.
+    """
     out: dict[str, str] = {}
-    for node in ast.walk(tree):
+    for node in tree.body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             for name, text in _bound_names(node, out, out).items():
-                out.setdefault(name, text)
+                if text is not None:
+                    out.setdefault(name, text)
     return out
 
 
 def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
     """Map each innermost function to what it does at the write handle.
 
-    Returns ``{function name: {lineno, writes, reads, appends, scopes,
-    aliases}}`` for every function holding at least one mutating call. ``writes``
-    is a sorted list of ``(line, verb, statement-prefix)``; ``scopes`` a list of
-    ``(line, opener name)``; ``appends`` the lines of journal-append calls.
-    Nested functions are attributed to THEMSELVES, never to their enclosing
-    function (a helper's write is not its caller's).
+    Returns ``{function name: {lineno, writes, reads, appends, scopes, aliases,
+    params}}`` for every function holding at least one mutating call. Both call
+    lists carry the CONTROL-FLOW DEPTH as their last element — `writes` entries
+    are ``(line, verb, statement-prefix, depth)`` and `appends` entries are
+    ``(line, depth)`` — because an append only guarantees the record precedes a
+    write when it is no deeper in the branch tree than that write. Nested
+    functions are attributed to THEMSELVES, never to their enclosing function (a
+    helper's write is not its caller's).
     """
     tree = ast.parse(source, filename=filename)
     consts = _module_consts(tree)
@@ -408,10 +477,18 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
     def visit(node, current, local, cond=0):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             current = node.name
-            facts.setdefault(current, {
+            fact = facts.setdefault(current, {
                 "lineno": node.lineno, "writes": [], "reads": 0, "appends": [],
-                "scopes": [], "aliases": set(),
+                "scopes": [], "aliases": set(), "params": set(),
             })
+            args = node.args
+            fact["params"] = {
+                arg.arg for arg in (
+                    list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+                    + ([args.vararg] if args.vararg else [])
+                    + ([args.kwarg] if args.kwarg else []))
+                if arg.arg not in ("self", "cls")
+            }
             local = {}
             for decorator in node.decorator_list:
                 if isinstance(decorator, ast.Call):
@@ -428,7 +505,7 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
         # `g = proj.g` / `raw = getattr(graph, "g", None)` — event_store, the
         # onboarding funnel and the three read-side modules all bind the handle
         # to a LOCAL, so a receiver-name check alone would miss their writers.
-        _bind_handle_aliases(node, fact["aliases"])
+        _bind_handle_aliases(node, fact["aliases"], fact["params"])
         local.update(_bound_names(node, consts, local))
 
         if isinstance(node, ast.Call):
@@ -439,7 +516,8 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
                 fact["scopes"].append((node.lineno, opener))
             elif isinstance(node.func, ast.Attribute) \
                     and node.func.attr in _HANDLE_MUTATING_VERBS \
-                    and _is_handle_ref(node.func.value, fact["aliases"]):
+                    and _is_handle_ref(node.func.value, fact["aliases"],
+                                       fact["params"]):
                 # `execute_command("GRAPH.QUERY", <graph>, <cypher>)` — the
                 # statement sits at index 2 (cypher_guard's own pinned shape),
                 # every other verb takes it positionally.
@@ -492,11 +570,13 @@ def _journal_first_violation(fact) -> str | None:
         return (f"writes at line {first_write[0]}, BEFORE its first append at "
                 f"{first_append[0]} ({first_write[1]}: {first_write[2]!r}) — that "
                 "is the apply-first shape, and the declaration would bless it")
-    if first_append[1] > first_write[3]:
+    if first_append[1] > min(write[3] for write in fact["writes"]):
+        unconditional = min(write[3] for write in fact["writes"])
         return (f"appends its record at line {first_append[0]} inside a "
-                f"conditional/try block while writing at line {first_write[0]} "
-                f"OUTSIDE it ({first_write[1]}) — the record is not guaranteed to "
-                "precede the write")
+                f"conditional/try block while a write runs OUTSIDE any branch "
+                f"(depth {unconditional}, e.g. line {fact['writes'][0][0]} "
+                f"{fact['writes'][0][1]}) — the record is not guaranteed to "
+                "precede that write")
     return None
 
 
@@ -718,18 +798,64 @@ class Door:
 
     def chained_write(self, self_proj):
         self_proj.g.query("CREATE (n:Point)")
+
+    def parameter_write(self, g):
+        g.query("CREATE (n:Point)")
+
+    def walrus_write(self, proj):
+        if (h := proj.g):
+            h.query("CREATE (n:Point)")
+
+    def with_write(self, proj):
+        with closing(proj.g) as h:
+            h.query("CREATE (n:Point)")
+
+    def for_write(self, proj):
+        for h in [proj.g]:
+            h.query("CREATE (n:Point)")
+
+    def ifexp_write(self, proj, cond):
+        h = proj.g if cond else None
+        if h is not None:
+            h.query("CREATE (n:Point)")
 '''
     surface = enumerate_handle_surface(src, "<synthetic-shapes>")
     missing = sorted({
         "interpolated_write", "module_const_write", "getattr_alias_write",
-        "tuple_alias_write", "chained_write",
+        "tuple_alias_write", "chained_write", "parameter_write",
+        "walrus_write", "with_write", "for_write", "ifexp_write",
     } - set(surface))
     assert not missing, (
         "the enumerator lost these shapes — each one is a mutating statement "
         f"through the write handle, so the census would under-report: {missing}")
-    for name in ("interpolated_write", "module_const_write",
-                 "getattr_alias_write", "tuple_alias_write", "chained_write"):
+    for name in sorted(surface):
         assert _kind(surface[name]) == "no-journal", (name, surface[name])
+
+
+def test_the_ordering_pin_catches_a_conditional_append_with_a_later_write():
+    """The shape that survives a first-write-only depth check (#9124 review 2).
+
+    `if cond: append(); write(A)` followed by an UNCONDITIONAL `write(B)` used to
+    read as journal-first, because only the FIRST write's depth was compared —
+    while in fact `write(B)` runs with no record whenever `cond` is false.
+    """
+    src = '''
+def _emit_event(*a, **k):
+    return True
+
+
+class Door:
+    def half_conditional(self, proj, cond):
+        if cond:
+            self._emit_event("X")
+            proj.g.query("CREATE (n:A)")
+        proj.g.query("CREATE (n:B)")
+'''
+    fact = enumerate_handle_surface(src, "<synthetic-half-conditional>")[
+        "half_conditional"]
+    assert min(w[3] for w in fact["writes"]) == 0, fact
+    assert _journal_first_violation(fact), fact
+    assert _kind(fact) == "apply-first", fact
 
 
 def test_the_enumerator_sees_an_apply_first_door_as_apply_first():
@@ -793,51 +919,127 @@ def _modules_reaching_the_handle():
     return out
 
 
+#: Package-wide `(module, function)` pairs whose statement the static census cannot
+#: resolve but a human has PROVEN read-only (it is a `MATCH … RETURN` whose
+#: interpolated fragment carries no write clause). Empty in part 1: every such
+#: statement currently sits in the flip gate's "unproven" bucket, which is why
+#: the flip is blocked. Filling one in is a reviewed act — and it is never the
+#: right remedy to wrap a read in a write lane.
+_PROVEN_READS: set[tuple[str, str]] = set()
+
+
+def _is_unresolved_only(fact) -> bool:
+    """Is every mutating call in this function an UNRESOLVED statement?"""
+    return all(write[2] == "<unresolved>" for write in fact["writes"])
+
+
 def test_arming_the_guard_requires_a_fully_declared_surface():
     """`_HANDLE_GUARD_ENFORCES = True` is only allowed once nothing is left.
 
     This is the owner's decision made executable (#9124, option B): the guard is
-    flipped LAST, when every mutating entry point either declares a lane or is an
-    inventoried part-2 remainder. The scan is package-wide — `sdk.py` and
-    `event_store.py` are what part 1 declared, but `hosted_api.py`, `mining.py`,
-    `ingest.py`, the connectors and the rest reach the same handle, and arming
-    while any of them is undeclared refuses the product (measured: 16 failed / 4
-    errors across four §17.1 suites).
+    flipped LAST. The scan is package-wide — `sdk.py` and `event_store.py` are
+    what part 1 declared, but `hosted_api.py`, `mining.py`, `ingest.py`, the
+    connectors and the rest reach the same handle, and arming while any of them
+    is undeclared refuses the product (measured: 16 failed / 4 errors across
+    four §17.1 suites).
+
+    THE REMAINDER HAS TWO KINDS, and the remedy differs, so the message says
+    which is which. A function whose statement the census could PROVE mutating
+    needs a declared lane (or an inventory entry). A function whose statement it
+    could NOT resolve needs a HUMAN verdict — prove it read-only, or declare a
+    lane if it writes — because the runtime door classifies the REAL text, so a
+    static "unresolved" is not itself a refusal risk: `_statement_writes` on the
+    actual statement is what would refuse. Telling a reader to wrap a read in a
+    write lane is how a redundant, misleading scope gets added (the #9124 review
+    P2), so an unresolved entry is reported as unproven, never as a missing lane.
 
     While the switch is OFF the census is still proven REAL (not an empty scan):
     every inventoried SDK name must appear in it.
     """
-    remaining: dict[str, list[str]] = {}
+    provable: dict[str, list[str]] = {}
+    unproven: dict[str, list[str]] = {}
     for path in _modules_reaching_the_handle():
         surface = enumerate_handle_surface(path.read_text(errors="replace"), str(path))
         rel = path.relative_to(ROOT).as_posix()
-        undeclared = [f"{name}:{fact['lineno']}"
-                      for name, fact in surface.items()
-                      if not fact["scopes"] and (rel, name) not in _CALLER_DECLARED]
-        if undeclared:
-            remaining[rel] = sorted(undeclared)
+        for name, fact in sorted(surface.items()):
+            if fact["scopes"] or (rel, name) in _CALLER_DECLARED:
+                continue
+            if (rel, name) in _PROVEN_READS:
+                continue
+            bucket = unproven if _is_unresolved_only(fact) else provable
+            bucket.setdefault(rel, []).append(f"{name}:{fact['lineno']}")
 
     if _HANDLE_GUARD_ENFORCES:
-        assert not remaining, (
+        blocked = []
+        for rel, names in sorted(provable.items()):
+            blocked.append(f"  {rel}: {len(names)} UNDECLARED writer(s), e.g. "
+                           f"{names[:4]} — declare a lane, or inventory it as a "
+                           "part-2 remainder")
+        for rel, names in sorted(unproven.items()):
+            blocked.append(f"  {rel}: {len(names)} UNPROVEN statement(s), e.g. "
+                           f"{names[:4]} — the census cannot resolve these; "
+                           "prove each read-only (pin it in `_PROVEN_READS`) or "
+                           "declare a lane if it writes. Do NOT wrap a read in "
+                           "a write lane")
+        assert not blocked, (
             "`_HANDLE_GUARD_ENFORCES` is True while the write surface is NOT "
             "fully declared — arming here refuses the product's own writes. "
-            "Declare a lane for every entry point below (or inventory it as a "
-            "documented part-2 remainder; a helper whose only caller declares "
-            "belongs in `_CALLER_DECLARED`, not in a new scope) before "
-            "flipping the switch:\n"
-            + "\n".join(f"  {path}: {len(names)} undeclared, e.g. {names[:4]}"
-                        for path, names in sorted(remaining.items())))
+            "A helper whose only caller declares belongs in `_CALLER_DECLARED`. "
+            "Before flipping the switch, clear both lists:\n" + "\n".join(blocked))
         return
 
     # Part 1's state: measuring, and the census must be able to see the remainder
     # it is measuring — a scanner that silently returns nothing would make the
     # check above vacuous on the day someone flips the switch.
-    sdk_remaining = {name.split(":")[0] for name in remaining.get(
-        "tortoise/sdk.py", [])}
-    assert _all_inventoried() <= sdk_remaining, (
+    sdk_seen = {name.split(":")[0]
+                for bucket in (provable, unproven)
+                for name in bucket.get("tortoise/sdk.py", [])}
+    assert _all_inventoried() <= sdk_seen, (
         "the package scan did not see every inventoried SDK entry point — the "
         "scan itself is broken, so the arming gate would pass vacuously. "
-        f"missing={sorted(_all_inventoried() - sdk_remaining)}")
+        f"missing={sorted(_all_inventoried() - sdk_seen)}")
+
+
+def test_the_caller_declared_exemptions_are_still_caller_declared():
+    """`_CALLER_DECLARED` is an assertion, not an amnesty.
+
+    Each entry is credited because its ONLY call site sits inside a function that
+    opens one of the lanes. That is a property of the CALL GRAPH, so it is
+    checked: delete the wrapper (or add a second, undeclared caller) and this
+    test reddens instead of the flip gate silently green-lighting it.
+    """
+    offenders = []
+    for rel, callee in sorted(_CALLER_DECLARED):
+        path = ROOT / rel
+        tree = ast.parse(path.read_text(errors="replace"))
+        callers = []
+        for func in [n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            for call in ast.walk(func):
+                if isinstance(call, ast.Call):
+                    target = getattr(call.func, "id", None) or getattr(
+                        call.func, "attr", None)
+                    if target == callee:
+                        callers.append(func)
+        if not callers:
+            offenders.append(f"{rel}::{callee} has no call site at all")
+            continue
+        for func in callers:
+            # The CALLER need not touch the handle itself (both wrappers are
+            # pure `with <scope>(...): return self._x(...)` shells), so the scope
+            # is looked for in its own body, not in its surface fact.
+            opens = []
+            for node in ast.walk(func):
+                if isinstance(node, ast.Call):
+                    opener = getattr(node.func, "id", None) or getattr(
+                        node.func, "attr", None)
+                    if opener in _SCOPE_CALL_NAMES:
+                        opens.append(opener)
+            if not opens:
+                offenders.append(
+                    f"{rel}::{callee} is called from {func.name}:{func.lineno}, "
+                    "which declares no lane — the exemption is stale")
+    assert not offenders, ("\n  " + "\n  ".join(offenders))
 
 
 def test_the_measure_mode_census_is_what_a_flip_would_refuse(armed_sdk_factory):
