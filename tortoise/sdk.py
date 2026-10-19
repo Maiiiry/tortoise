@@ -11366,11 +11366,19 @@ class TortoiseSDK:
             rebuild" until that fold lands.
 
             So the commit point is "after the guarded write, before anything
-            that can strand it" — the point ``invalidate_point`` and
-            ``retract_point`` already use, and the reason this arm was the only
-            apply-first door in its family. It is reached only with a NON-EMPTY
-            ``result_set``: every zero-row promote has already returned (the
-            idempotent live no-op) or raised (the diagnostic above).
+            that can strand it". It is the CLOSEST point this arm can take to
+            its siblings' policy, NOT the point they use: ``invalidate_point``
+            and ``retract_point`` record BEFORE their writes, because their
+            statements cannot legitimately refuse. This arm's ``SET`` can —
+            that is why `#8830` exempted it — so it records immediately AFTER
+            the guarded write instead. Do not read this as "the siblings adopt
+            the same order": the question "may the record precede the write?"
+            is answered differently on each side of that line, and the outbox
+            pin (`test_the_promote_arm_stays_apply_first_a_recorded_deviation`)
+            exists to keep this arm's answer. It is reached only with a
+            NON-EMPTY ``result_set``: every zero-row promote has already
+            returned (the idempotent live no-op) or raised (the diagnostic
+            above).
 
             Best-effort, as at the old tail: ``_emit_event`` never raises, and
             the write it describes has already landed, so a failed append is
