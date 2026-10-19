@@ -1,7 +1,7 @@
 """#9226 — `dump_graph`'s keyset paging must not compare a NODE `id()` to a
 NEGATIVE value: on the v6 Rust core measured here (graph module **60002**) the
-node read matches nothing, so every dump started with an empty node page,
-exported 0 nodes and refused — no backup could be taken on that engine.
+node read matches nothing, so every node that was not an edge endpoint vanished
+and a graph holding one could not be dumped at all.
 
 Measured 2026-10-19 against live servers holding 3 nodes, the pinned v4 core
 (**42006**) and a v6 server (**60002** — `falkordb/falkordb:latest`; `60001` is
@@ -133,8 +133,9 @@ def test_the_page_predicate_never_uses_a_negative_comparison(query):
 
 
 def test_the_first_page_is_not_empty_on_a_v6_engine():
-    """THE REGRESSION: before the fix this yielded NOTHING, so `dump_graph`
-    exported 0 nodes for a populated graph on every v6 server."""
+    """THE REGRESSION: before the fix this yielded NOTHING, so every node that
+    was not an edge endpoint vanished from the dump (measured on 60002: a graph
+    with an isolated node refused as TRUNCATED)."""
     calls = []
     rows = list(_paged_rows(_V6Graph(calls), _DUMP_NODE_PAGE_QUERY, 0, batch=2))
 
@@ -293,14 +294,16 @@ def test_dump_graph_pages_a_live_graph_end_to_end(monkeypatch):
     """The end-to-end shape the outage broke: seed → dump → every node exported.
 
     The page size is pinned SMALL on purpose (``_DUMP_PAGE_SIZE`` monkeypatched to
-    4 against 15 nodes, which works only because ``_paged_rows`` reads the
-    constant at CALL time — see
-    ``test_the_page_size_constant_reaches_the_page_read``): with the production
-    default of 1000 this would take one page and terminate on the
-    ``len(rows) < batch`` branch, never exercising the ``last + 1`` advance on a
-    real engine, so a wrong offset would leave the test green. Skips (visibly)
-    when this lane has no non-embedded FalkorDB, exactly like the rest of the live
-    suite — it never early-returns green (#942).
+    4 against 15 nodes, which works because ``_paged_rows`` reads the constant at
+    CALL time — see ``test_the_page_size_constant_reaches_the_page_read``): at the
+    production default of 1000 the dump takes ONE page and never executes the
+    ``last + 1`` advance on a real engine, so a wrong offset would leave this
+    test green. The page count and the batch actually sent are ASSERTED, because
+    that is what makes this a multi-page test rather than a single-page one
+    wearing its name.
+
+    Skips (visibly) when this lane has no non-embedded FalkorDB, exactly like the
+    rest of the live suite — it never early-returns green (#942).
     """
     uri = _live_target()
     if uri is None:
@@ -314,6 +317,19 @@ def test_dump_graph_pages_a_live_graph_end_to_end(monkeypatch):
 
     monkeypatch.setattr(hosted_backup, "_DUMP_PAGE_SIZE", 4)
 
+    page_calls: list[dict] = []
+
+    class _RecordingGraph:
+        """Delegates to the real handle; records the page queries it sees."""
+
+        def __init__(self, graph):
+            self._graph = graph
+
+        def query(self, cypher, params=None, timeout=None):
+            if "id(n) >=" in cypher:
+                page_calls.append(dict(params or {}))
+            return self._graph.query(cypher, params=params, timeout=timeout)
+
     name = f"test_9226_paging_{uuid.uuid4().hex[:8]}"
     proj = FalkorProjection.from_uri(uri, graph_name=name)
     try:
@@ -322,10 +338,14 @@ def test_dump_graph_pages_a_live_graph_end_to_end(monkeypatch):
                 "CREATE (:Point {id:$id, pointKind:'statement', is_operator:false})",
                 params={"id": f"p{i}"},
             )
-        payload = dump_graph(proj.g, name)
+        payload = dump_graph(_RecordingGraph(proj.g), name)
         assert payload["node_count"] == 15, (
             "dump_graph must export every node — 0 here is the #9226 v6 outage: "
             f"exported {payload['node_count']}")
+        assert len(page_calls) >= 2, (
+            "this leg must exercise MULTI-page paging on a real engine, or the "
+            f"`last + 1` advance is untested: cursors={[c.get('cursor') for c in page_calls]}")
+        assert [c["batch"] for c in page_calls] == [4] * len(page_calls), page_calls
     finally:
         # Delete BEFORE close, through the repo's sanctioned per-run teardown
         # (#8746): it is fail-closed on the graph name and never raises, whereas
