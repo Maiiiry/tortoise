@@ -108,7 +108,7 @@ from .retrieval_metering import metered_query as _metered_query
 from . import file_indexer  # noqa: F401 — binds the classifier/identity module (§4.4); sourceKind registration is registry-owned (source_credibility.SOURCE_KIND_DEFAULTS)
 from .projection import FalkorProjection
 # #7951 §17.1: the single-writer scope the live doors open around their fold.
-from .projection import _live_write_scope
+from .projection import _declares_live_write_lane, _live_write_scope
 # #9123 §17.1: the GRAPH-METADATA lane — a write with no journal record that
 # describes it, and whose loss a rebuild absorbs.
 from .projection import _graph_metadata_write_scope
@@ -8201,9 +8201,12 @@ class TortoiseSDK:
             raise WriteNotLandedError(pid, getattr(proj, "graph_name", None))
         # #7951 §17.1: the cache write runs inside the live-write scope — the
         # door declares itself to the guard, and every statement below runs
-        # strictly AFTER the append above. (The scope is documentary on the
-        # raw handle: the §17.1 guard covers `FalkorProjection.apply`/`.query`,
-        # and the raw handle's remaining sites are the recorded residual.)
+        # strictly AFTER the append above. Since #9124 the declaration is
+        # LOAD-BEARING rather than documentary: the §17.1 guard now covers the
+        # raw guarded handle too (`proj.g`), which is the handle this `CREATE`
+        # uses, so without the scope an armed handle refuses the create hot
+        # path. The declaration is a lane, not an exemption — the append above
+        # is the commit point and every write here follows it.
         with _live_write_scope("create_point"):
             self._graph_write_with_retry(
                 lambda: proj.g.query(
@@ -11414,12 +11417,17 @@ class TortoiseSDK:
         # `test_the_promote_arm_stays_apply_first_a_recorded_deviation` and
         # `test_a_refused_promote_journals_no_revision`.
         #
-        # ⛔ NOT ROUTED THROUGH THE FOLD YET. The writes below still go through
-        # the raw guarded handle, so no `_live_write_scope` is opened here: the
-        # §17.1 guard covers `FalkorProjection.apply`/`.query`, and a scope
-        # around a raw handle would authorize nothing (the same statement
-        # `create_point`'s scope makes about itself). Moving these writes onto
-        # the fold is increment 3, and that is when this door declares itself.
+        # ⛔ NOT ROUTED THROUGH THE FOLD YET, AND STILL UNDECLARED (#9124).
+        # The non-promote writes below go through the raw guarded handle, whose
+        # §17.1 door now DETECTS an undeclared write (#9124 part 1), so this
+        # door is one of the measured remainder in
+        # `tests/test_9124_declared_live_doors.py`'s MIXED-ARM inventory. It
+        # cannot declare `_live_write_scope` yet, for the reason the promote arm
+        # below states: the SAME write region serves an arm whose record is
+        # stated only AFTER its guarded write, so a scope placed here would
+        # authorize that arm too. Moving these writes onto the fold — and
+        # deciding the promote arm with them — is part 2 (#9124), and that is
+        # when this door declares itself.
         # #1904: content_hash is derived from content — keep it out of the
         # event record (mirrors create_point's snapshot strip at emit).
         # #4208: the vector this path just DERIVED from the content is stripped
@@ -11809,11 +11817,21 @@ class TortoiseSDK:
                              new_content=props.get("content"), **emit_props)
         return result
 
+    @_declares_live_write_lane("delete_point")
     def delete_point(self, id: str) -> bool:
         """Delete a Point and its relationships. Returns True if found.
 
         Implementation behind delete(id) — the consolidated Point/entity
         delete (epic #888 W2).
+
+        §17.1 LANE (#9124): JOURNAL-FIRST, declared. The `EntityMutated
+        op=delete` record is appended BEFORE the `DETACH DELETE` (the outbox
+        ordering below), and every mutating statement in this method follows
+        that append — so the whole method is the live lane's write region and
+        carries `@_declares_live_write_lane`. That ordering is not merely
+        stated here: `tests/test_9124_declared_live_doors.py` re-derives it from
+        the source for every declared door, so a write added above the append
+        reddens there rather than silently widening the lane.
 
         Raises ``WriteNotLandedError`` (``operation="delete_point"``) instead of
         returning when the §17.1 outbox refuses the destruction: either the
@@ -12143,9 +12161,16 @@ class TortoiseSDK:
                     f"call retract_point({point_id!r}) instead."
                 ) from None
 
+    @_declares_live_write_lane("invalidate_point")
     def invalidate_point(self, id: str, corrected_by_id: str,
                          *, valid_to_precision: str | None = None) -> dict:
         """Mark a Point outdated, linked to its replacement via CORRECTS edge.
+
+        §17.1 LANE (#9124): JOURNAL-FIRST, declared. The `PointInvalidated`
+        record is appended before the terminal stamp and the `CORRECTS` merge
+        ("validated-emit-then-mutate" below), so every mutating statement in
+        this method follows the append and the method carries
+        `@_declares_live_write_lane`.
 
         Validation contract (#330/#2498) — all checks run BEFORE any write so
         a failure can never leave a partial graph state:
@@ -12308,10 +12333,27 @@ class TortoiseSDK:
             return self.supersede_point(old_id, new_id)
         return self.invalidate_point(old_id, new_id)
 
+    @_declares_live_write_lane("supersede_point")
     def supersede_point(self, old_id: str, new_id: str,
                         *, valid_from: str | None = None,
                         valid_to_precision: str | None = None) -> dict:
         """Atomically replace old Point with new — CORRECTS edge + outdated flag + edge transfer.
+
+        §17.1 LANE (#9124): JOURNAL-FIRST, declared — with ONE stated residual
+        that this declaration does NOT close. The `PointSuperseded` record is
+        appended before any mutating statement (all ~15 of them follow it), so
+        the method carries `@_declares_live_write_lane`. The residual is that
+        the append's RETURN is not checked here, so a FAILED append still
+        proceeds to the cache: the lane is honest about ORDER and says nothing
+        about CONFIRMATION. The doors that gate on a per-call append outcome do
+        so ARM BY ARM, not door by door: `create_point` and `update_point`'s
+        NON-promote arm raise `WriteNotLandedError` on `_record_committed is
+        False`, and `delete_point` gates on `_delete_committed =
+        _journal_entity_mutation(...)`. `update_point`'s PROMOTE arm (its record
+        is emitted after the write, return discarded), `invalidate_point` and
+        `retract_point` discard the append's return exactly as this door does,
+        so the same residual is carried by FOUR doors, not one. Closing it is
+        part 2 of #9124 (it changes the failure contract, not the order).
 
         E6 (#1538) D2 — bi-temporal validity windows: the supersession ALSO
         stamps the old point's window END (``validTo`` = the successor's
@@ -13028,8 +13070,23 @@ class TortoiseSDK:
             "edges_transferred": transferred,
         }
 
+    @_declares_live_write_lane("retract_point")
     def retract_point(self, id: str) -> dict:
         """Tombstone-retract a Point: status='retracted' (point stays in graph).
+
+        §17.1 LANE (#9124): JOURNAL-FIRST, declared. `PointRetracted` is
+        appended before the CAS `SET` ("append-before-mutation" below), and the
+        method's every mutating statement follows it, so the method carries
+        `@_declares_live_write_lane`.
+
+        ⚠️ ORDER is what the declaration guarantees; CONFIRMATION is not. The
+        append's return is discarded here, so a FAILED append still retracts the
+        cache node and reports success — measured on this branch by forcing
+        `_emit_event` to return False: the point came back `status='retracted'`.
+        Only `create_point`, `update_point`'s non-promote arm and `delete_point`
+        gate on their append's return; `invalidate_point`, this door and
+        `supersede_point` do not. That residual is part 2 of #9124 (it changes
+        the failure contract).
 
         #432: retraction is a TERMINAL state transition, not a deletion — the
         projection keeps the point with status='retracted' and default query
