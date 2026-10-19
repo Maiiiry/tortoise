@@ -1168,19 +1168,17 @@ def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
         new_value = previous if kept else measured
         if kept:
             kept_as_lower_bound += 1
-        # Drop a basis a PREVIOUS render of ours appended, so a row that is held
-        # or re-based week after week states ONE basis instead of growing a
-        # sentence per refresh (this map is rewritten every week and nothing else
-        # prunes it). Only where a new basis is written below — a row this render
-        # does not touch keeps its line verbatim, including an older basis.
-        if kept:
-            tail = _PRIOR_BASIS_RE.sub("", tail)
+        if kept and sample_label:
             # A HELD row keeps its note. Its value did not move, so the reading
             # its note cites IS still the basis of the surviving value — the
             # map's rule ("a note whose cited run is not in the basis is dropped")
             # does not reach it. The renderer used to substitute the rejected
             # reading's basis for the citation, so 13 held rows lost the run that
             # actually produced their number (#9134 review, P2).
+            #
+            # The strip first is what keeps a row held week after week stating ONE
+            # basis: this map is rewritten every week and nothing else prunes it.
+            tail = _PRIOR_BASIS_RE.sub("", tail)
             if declared <= 0:
                 reason = ("no declared testcase count for this file (UNKNOWN), so "
                           "the reading cannot prove it saw the whole file")
@@ -1195,34 +1193,34 @@ def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
             # follows it (`test_2296_document_created_journal.py` lost 27.0's
             # whole "WHAT THE NUMBER IS" note that way).
             tail = _restate_unmeasured_marker(tail)
-            if sample_label:
-                # Two shapes: an ENTRY-COUNTED witness states what it saw
-                # (`top-15 saw 2 of 10 testcases = 36.0s`); a witness that cannot
-                # count at all (single-test file, absent denominator) states why
-                # the count cannot decide, then the reading itself.
-                basis = (
-                    f"{sample_label}: top-15 saw {observed} of {declared} "
-                    f"testcases = {measured:.1f}s, a LOWER bound; kept {previous:.1f}"
-                    if reason is None else
-                    f"{sample_label}: {reason}; the reading ({measured:.1f}s) is "
-                    f"a LOWER bound; kept {previous:.1f}")
-                tail = f"{tail} — {basis}" if tail.strip() else f"  # {basis}"
-        # A stale `# unmeasured` marker stops being true once the reading is
-        # ADOPTED, and the marker is recognised by its LEADING TOKEN rather than
-        # by the whole tail: authors write long-form provenance (`# unmeasured —
-        # #7359: …`), and the old whole-tail `fullmatch` cleared only the bare
-        # form, so a measured row kept a `# unmeasured` claim the refresh had
-        # falsified (#8254 review, P3 — 3 rows went stale that way). Any OTHER
-        # trailing comment is preserved verbatim, including one that merely
-        # mentions the word later on; `\b` keeps a token like `# unmeasuredly` out.
-        elif _UNMEASURED_LEAD_RE.match(tail):
+            # Two shapes: a COUNTED witness states what it saw (`top-15 saw 2 of
+            # 10 testcases = 36.0s`); a witness that cannot count at all
+            # (single-test file, absent denominator) states why the count cannot
+            # decide, then the reading itself.
+            basis = (
+                f"{sample_label}: top-15 saw {observed} of {declared} "
+                f"testcases = {measured:.1f}s, a LOWER bound; kept {previous:.1f}"
+                if reason is None else
+                f"{sample_label}: {reason}; the reading ({measured:.1f}s) is "
+                f"a LOWER bound; kept {previous:.1f}")
+            tail = f"{tail} — {basis}" if tail.strip() else f"  # {basis}"
+        elif not kept and _UNMEASURED_LEAD_RE.match(tail):
+            # A stale `# unmeasured` marker stops being true once the reading is
+            # ADOPTED, and the marker is recognised by its LEADING TOKEN rather
+            # than by the whole tail: authors write long-form provenance
+            # (`# unmeasured — #7359: …`), and the old whole-tail `fullmatch`
+            # cleared only the bare form, so a measured row kept a `# unmeasured`
+            # claim the refresh had falsified (#8254 review, P3 — 3 rows went
+            # stale that way). Any OTHER trailing comment is preserved verbatim,
+            # including one that merely mentions the word later on; `\b` keeps a
+            # token like `# unmeasuredly` out.
             tail = ""
-        # RE-BASE ONLY WHAT THIS RENDER ACTUALLY CHANGED. The map's rule is "a
-        # row's comment is kept only while the value AND its stated basis are
-        # unchanged" — so a row whose value survives untouched by the reading
-        # keeps its note exactly as it was, and a row whose value moves gets the
-        # basis it was actually re-derived from.
         elif sample_label and new_value != previous:
+            # RE-BASE ONLY WHAT THIS RENDER ACTUALLY CHANGED. The map's rule is "a
+            # row's comment is kept only while the value AND its stated basis are
+            # unchanged" — so a row whose value survives untouched by the reading
+            # keeps its note exactly as it was, and a row whose value moves gets
+            # the basis it was actually re-derived from.
             tail = _PRIOR_BASIS_RE.sub("", tail)
             if tail.strip() and _is_stale_provenance(tail):
                 # A note that IS the citation has nothing that survives a re-base
