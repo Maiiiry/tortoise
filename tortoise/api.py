@@ -168,8 +168,10 @@ class EventAPI:
         # `_InMemoryEventLog` (no file I/O, by design) whose records no journal
         # ever carries, so a row from it could never be reproduced or healed by
         # a replay — the record is `replay(journal)`, and a scratch buffer is
-        # not a journal. The seam counts `no_durable_journal` and writes
-        # nothing.
+        # not a journal. The seam DECLINES it (no row) and counts the decline on
+        # `monitoring.metrics()["record_non_journal_skips"]`, NOT on
+        # `record_write_failures`: a lane with no journal by design lost nothing a
+        # replay could restore (#9231 review P2).
         record_writer.write_live_record(
             event, durable=getattr(self.log, "durable", True))
         if self.projection is not None:

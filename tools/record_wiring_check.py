@@ -83,9 +83,21 @@ _RECORD_STEMS = frozenset({"record_projection", "record_writer"})
 #: The names that mean "this file calls the record's write half" — and the
 #: record module they must be reached THROUGH. A bare `replay`/`RecordWriter`
 #: is not evidence: a module can hold a local helper of either name, or
-#: construct a writer it never writes with. Only an attribute off the record
-#: module counts, so the check cannot go green on a name collision.
-_CALL_NAMES = frozenset({"write_live_record", "write_records", "write"})
+#: construct a writer it never writes with. Only a binding that resolves to the
+#: record module counts (via the module itself, an import alias, or a
+#: `from … import`), so the check cannot go green on a name collision.
+#: `replay` is here because `record_projection.replay` IS the write half — a
+#: fourth door spelled that way writes record rows exactly as `write_records`
+#: does (#9231 review P2).
+_CALL_NAMES = frozenset({"write_live_record", "write_records", "write", "replay"})
+
+#: The names that take a `position` parameter, so a call that omits
+#: `position=False` writes an invented `journal_event.seq`. `replay`/
+#: `replay_plan` are what the parameter actually lives on
+#: (`record_projection.py`), `write_records`/`write` are the raw seam spellings,
+#: and `write_live_record` is NOT here: it takes no `position`, and passes the
+#: literal internally — that is the point of a single door.
+_POSITION_NAMES = frozenset({"write_records", "write", "replay", "replay_plan"})
 
 #: The one LIVE door: the helper every journal-append site calls. Its existence
 #: is what the position check anchors on.
@@ -128,17 +140,105 @@ def _imports_the_record(names: set[str]) -> bool:
     return False
 
 
+def _record_bindings(
+        tree: ast.AST) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
+    """`({local module name: record stem}, {local function: (stem, name)})`.
+
+    A door is not always spelled `record_writer.write_records(...)`. The
+    ordinary Python spellings — `from .record_writer import write_records` then
+    a bare call, `import tortoise.record_writer as rw` then `rw.write_records`,
+    `from . import record_writer as rw` — are the SAME production call, and an
+    earlier version of this check saw none of them because it matched only
+    `Name.attr` where the name was literally `record_writer` (#9231 review P2).
+    Resolving each module's own import table closes that without a second list
+    of module names.
+    """
+    modules: dict[str, str] = {}
+    functions: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                stem = alias.name.split(".")[-1]
+                if stem not in _RECORD_STEMS:
+                    continue
+                # `import tortoise.record_writer` binds `tortoise`, so the
+                # spelling is `tortoise.record_writer.write_records(…)` —
+                # resolved by the dotted-path branch below.
+                local = alias.asname or (
+                    alias.name.split(".")[0] if "." in alias.name
+                    else alias.name)
+                modules[local] = stem
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                stem = alias.name.split(".")[-1]
+                if stem in _RECORD_STEMS:
+                    # `from . import record_writer [as rw]`
+                    modules[alias.asname or alias.name] = stem
+                    continue
+                owner = (node.module or "").split(".")[-1]
+                if owner in _RECORD_STEMS:
+                    # `from .record_writer import write_records [as wr]`
+                    functions[alias.asname or alias.name] = (owner, alias.name)
+    return modules, functions
+
+
+def _dotted(node: ast.AST) -> str | None:
+    """`a.b.c` for a pure attribute chain rooted at a Name, else None."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _resolve_record_call(
+        call: ast.Call,
+        modules: dict[str, str],
+        functions: dict[str, tuple[str, str]],
+) -> tuple[str | None, str | None]:
+    """`(record stem, called name)` when `call` reaches the record module.
+
+    The base expression decides: a module binding (`record_writer`, an import
+    alias, `tortoise.record_writer`), a function imported straight out of the
+    module, or a constructed `RecordWriter()` whose `.write(…)` is the seam.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        return functions.get(func.id, (None, None))
+    if not isinstance(func, ast.Attribute):
+        return None, None
+    name = func.attr
+    base = func.value
+    if isinstance(base, ast.Name) and base.id in modules:
+        return modules[base.id], name
+    if isinstance(base, ast.Name) and base.id in _RECORD_STEMS:
+        return base.id, name
+    dotted = _dotted(base)
+    if dotted:
+        head = dotted.split(".")[-1]
+        if head in _RECORD_STEMS:
+            return head, name
+        if dotted in modules:
+            return modules[dotted], name
+    if isinstance(base, ast.Call):
+        owner, _ctor = _resolve_record_call(base, modules, functions)
+        if owner is not None:
+            return owner, name          # `record_writer.RecordWriter().write(…)`
+    return None, None
+
+
 def _record_calls(tree: ast.AST) -> set[str]:
     """Calls reached THROUGH the record module (never a bare name collision)."""
+    modules, functions = _record_bindings(tree)
     found: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if (isinstance(func, ast.Attribute) and func.attr in _CALL_NAMES
-                and isinstance(func.value, ast.Name)
-                and func.value.id in _RECORD_STEMS):
-            found.add(func.attr)
+        if isinstance(node, ast.Call):
+            owner, name = _resolve_record_call(node, modules, functions)
+            if owner is not None and name in _CALL_NAMES:
+                found.add(name)
     return found
 
 
@@ -155,7 +255,8 @@ def find_production_callers() -> tuple[list[dict[str, object]], list[str]]:
         except (OSError, SyntaxError, UnicodeDecodeError) as exc:
             problems.append(f"{rel}: could not be parsed ({exc})")
             continue
-        if not _imports_the_record(_imported_names(tree)):
+        if not (_imports_the_record(_imported_names(tree))
+                or any(_record_bindings(tree))):
             continue
         called = sorted(_record_calls(tree))
         if called:
@@ -166,7 +267,8 @@ def find_production_callers() -> tuple[list[dict[str, object]], list[str]]:
 def layer_writers() -> tuple[dict[str, list[str]], list[str]]:
     """`{table: [record types]}` derived from the fold's own registry."""
     try:
-        sys.path.insert(0, str(REPO_ROOT))
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
         from tortoise import record_projection
     except Exception as exc:                          # unimportable fold
         return {}, [f"could not import tortoise.record_projection ({exc})"]
@@ -261,7 +363,7 @@ def live_door_defers_the_position() -> list[str]:
     problems: list[str] = []
     calls = [
         node for node in ast.walk(door)
-        if isinstance(node, ast.Call) and _call_name(node) in _CALL_NAMES
+        if isinstance(node, ast.Call) and _call_name(node) in _POSITION_NAMES
     ]
     if not calls:
         return [
@@ -281,18 +383,48 @@ def live_door_defers_the_position() -> list[str]:
     return problems
 
 
+def position_problems_for_module(tree: ast.AST, rel: str) -> list[str]:
+    """Every `position`-taking record call in ONE module must bind `False`.
+
+    The walker below feeds this the real tree; the tests feed it synthetic
+    modules, which is the only way to prove the rule FIRES on a spelling that
+    does not exist yet (asserting `position_problems == []` on the real tree
+    only proves the rule is SATISFIED — a rule mutated to `return []` stayed
+    green, #9231 review P2).
+    """
+    modules, functions = _record_bindings(tree)
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        owner, name = _resolve_record_call(node, modules, functions)
+        if owner is None or name not in _POSITION_NAMES:
+            continue
+        bound = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+        value = bound.get("position")
+        if not (isinstance(value, ast.Constant) and value.value is False):
+            problems.append(
+                f"{rel}:{node.lineno} calls {name}(…) with "
+                f"position={ast.unparse(value) if value is not None else '<unset>'}"
+                " — a live caller has no journal ordinal (#9190), so it"
+                " must pass the literal `position=False`"
+            )
+    return problems
+
+
 def production_callers_defer_the_position() -> list[str]:
-    """EVERY production call to the raw `write_records` seam must pass
+    """EVERY production call to a `position`-taking record entry point must pass
     `position=False` as a LITERAL.
 
     `live_door_defers_the_position` reads only the body of `write_live_record`,
-    so a FOURTH door that calls `record_writer.write_records([...])` directly —
-    omitting `position`, whose signature default is `True` — satisfies claim 1
-    (a production caller exists), is never visited by claim 3, and writes an
-    invented `journal_event.seq` that collides with a later replay's numbering
-    on `(org_id, graph_id, seq)` in silence (#9190; #9231 review P2). The seam
-    is public, so the rule has to hold wherever it is spelled in the shipped
-    package, not only in the one body that happens to be the current door.
+    so a FOURTH door that calls the seam directly — `write_records([...])`,
+    `replay([...], conn)`, `RecordWriter().write([...])`, each of whose signature
+    default is `position=True` — satisfies claim 1 (a production caller exists),
+    is never visited by claim 3, and writes an invented `journal_event.seq` that
+    collides with a later replay's numbering on `(org_id, graph_id, seq)` in
+    silence (#9190; #9231 review P2). `replay` is named explicitly because it is
+    the function the parameter actually lives on: a door spelled
+    `record_projection.replay(...)` was invisible to BOTH checks.
 
     `write_live_record` is NOT held to this: it takes no `position` parameter
     and passes the literal internally, which is the point of a single door.
@@ -306,29 +438,20 @@ def production_callers_defer_the_position() -> list[str]:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue  # `find_production_callers` already reports this
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not (isinstance(func, ast.Attribute) and func.attr == "write_records"
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id in _RECORD_STEMS):
-                continue
-            bound = {kw.arg: kw.value for kw in node.keywords if kw.arg}
-            value = bound.get("position")
-            if not (isinstance(value, ast.Constant) and value.value is False):
-                problems.append(
-                    f"{rel}:{node.lineno} calls write_records(…) with "
-                    f"position={ast.unparse(value) if value is not None else '<unset>'}"
-                    " — a live caller has no journal ordinal (#9190), so it"
-                    " must pass the literal `position=False`"
-                )
+        problems.extend(position_problems_for_module(tree, rel))
     return problems
 
 
 def check() -> tuple[int, dict[str, object]]:
-    """The whole gate, memoised — it reads the tree and imports the fold, and a
-    test file asks it several times (the import dominates the cost)."""
+    """The whole gate: read the tree, import the fold, return `(exit code, report)`.
+
+    NOT memoised (it was documented as memoised once, which was false — the
+    docstring described a cache that did not exist, #9231 review P2). A caller
+    that needs it twice should hold the result: the import dominates the cost
+    and `sys.path` is not appended twice, but a verdict tool that silently
+    re-reads a tree it just measured is a stale answer waiting to happen, so no
+    cache is offered.
+    """
     callers, parse_problems = find_production_callers()
     writers, fold_problems = layer_writers()
 
@@ -347,6 +470,20 @@ def check() -> tuple[int, dict[str, object]]:
                     f"{layer} layer has NO writer: {table} is not written by "
                     "any record type in RECORD_MUTATIONS"
                 )
+    # A STALE exemption is a FAILURE, not a permanent licence (#9231 review P2):
+    # `DECLARED_GAPS` is the one lever that can turn this gate from exit 1 to
+    # exit 0 (delete the sole failure a missing layer produces), so it must not
+    # outlive the reason it was granted. The day `journal_event` gains a live
+    # writer, #9190 is done and this entry has to go — silently keeping it would
+    # hide the NEXT table that lost its writer.
+    for table, deferral in DECLARED_GAPS.items():
+        if writers.get(table):
+            gaps.append(
+                f"DECLARED_GAPS is STALE: {table} HAS a writer now "
+                f"({', '.join(sorted(set(writers[table])))}), so the deferral "
+                f"({deferral.splitlines()[0][:60]}…) must be removed — a "
+                "standing exemption turns a future missing writer into a pass"
+            )
     position_problems = (live_door_defers_the_position()
                          + production_callers_defer_the_position())
 

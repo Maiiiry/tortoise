@@ -49,10 +49,14 @@ WHAT IS NOT HERE, NAMED SO THE ABSENCE IS VISIBLE.
 """
 from __future__ import annotations
 
+import ast
+import fnmatch
 import importlib.util
 import json
 import os
+import shutil
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -239,6 +243,172 @@ def test_every_layer_has_a_writer_in_the_one_registry(wiring):
         assert any(writers.get(table) for table in tables), (
             f"{layer} has no writer among {tables}: {sorted(writers)}"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1b. The gate's own guards: the position rule must FIRE, and its one exemption
+#     must be pinned (a green gate that cannot fail is the defect it guards)
+# ════════════════════════════════════════════════════════════════════════════
+
+#: Every ordinary way to write a FOURTH door — each omitting `position`, whose
+#: signature default is `True`, which is the invented `journal_event.seq`
+#: (#9190). The earlier rule matched only `record_writer.write_records(…)`, so
+#: four of these six were invisible to it (#9231 review P2).
+_DOOR_SPELLINGS = {
+    "attribute": (
+        'from . import record_writer\n'
+        'def f(rec):\n'
+        '    record_writer.write_records([rec], org_id="o", graph_id="g")\n'),
+    "from-import": (
+        'from .record_writer import write_records\n'
+        'def f(rec):\n'
+        '    write_records([rec], org_id="o", graph_id="g")\n'),
+    "module-alias": (
+        'from . import record_writer as rw\n'
+        'def f(rec):\n'
+        '    rw.write_records([rec], org_id="o", graph_id="g")\n'),
+    "dotted": (
+        'import tortoise.record_writer\n'
+        'def f(rec):\n'
+        '    tortoise.record_writer.write_records([rec], org_id="o", graph_id="g")\n'),
+    "writer-object": (
+        'from . import record_writer\n'
+        'def f(rec):\n'
+        '    record_writer.RecordWriter().write([rec], org_id="o", graph_id="g")\n'),
+    "replay": (
+        'from . import record_projection\n'
+        'def f(rec, conn):\n'
+        '    record_projection.replay([rec], conn, org_id="o", graph_id="g")\n'),
+    "replay-plan": (
+        'from . import record_projection\n'
+        'def f(rec):\n'
+        '    record_projection.replay_plan([rec], org_id="o", graph_id="g")\n'),
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(_DOOR_SPELLINGS))
+def test_the_position_rule_fires_on_every_spelling_of_a_new_door(wiring, spelling):
+    """The rule must FIRE on a door that does not exist yet (#9231 review P2).
+
+    `position_problems == []` on the real tree only proves the three existing
+    doors COMPLY — a rule mutated to `return []` stayed green, because nothing
+    ever fed it a violating call. Each spelling below is a real way to write a
+    fourth door, and each omits `position`: the invented `journal_event.seq`
+    that collides with a later replay's numbering on `(org_id, graph_id, seq)`
+    in silence. `replay` is the function the parameter actually lives on, so a
+    door spelled that way used to escape BOTH claims of the gate.
+    """
+    check, _, _ = wiring
+    rel = "tortoise/a_new_door.py"
+    tree = ast.parse(_DOOR_SPELLINGS[spelling], filename=rel)
+    problems = check.position_problems_for_module(tree, rel)
+    assert problems, f"{spelling}: the position rule did not fire"
+    assert "position=False" in problems[0], problems[0]
+
+    compliant = _DOOR_SPELLINGS[spelling].replace(
+        'graph_id="g"', 'graph_id="g", position=False')
+    assert check.position_problems_for_module(
+        ast.parse(compliant, filename=rel), rel) == [], (
+        f"{spelling}: a compliant call must not be reported")
+
+    if spelling != "replay-plan":
+        # Claim 1 must SEE the same call: a spelling invisible to both checks is
+        # how a fourth door writes rows while the gate reports WIRED.
+        assert check._record_calls(tree), (
+            f"{spelling}: claim 1 is blind to this spelling too")
+
+
+def test_the_declared_gap_is_pinned_and_a_stale_one_fails_the_gate(wiring,
+                                                                   monkeypatch):
+    """`DECLARED_GAPS` is the ONE lever that can turn this gate from exit 1 to 0.
+
+    Exempting a genuinely missing writer (simulated: `point`) removed the only
+    failure the epistemic layer produced, and the tool then printed `WIRED`
+    with every test green (#9231 review P2). So the exempted set is pinned
+    exactly, each entry must name its tracker, and a STALE exemption — a table
+    that has since gained a writer — is a gate FAILURE rather than a permanent
+    licence.
+    """
+    check, _, report = wiring
+    assert set(check.DECLARED_GAPS) == {"journal_event"}, sorted(check.DECLARED_GAPS)
+    assert "#9190" in check.DECLARED_GAPS["journal_event"]
+    assert [gap["table"] for gap in report["declared_gaps"]] == ["journal_event"]
+
+    stale = dict(check.DECLARED_GAPS)
+    stale["point"] = "a hurried exemption that would hide the epistemic layer"
+    monkeypatch.setattr(check, "DECLARED_GAPS", stale)
+    code, stale_report = check.check()
+    assert code == 1, f"a stale exemption was accepted as {stale_report['verdict']}"
+    assert any("STALE" in gap for gap in stale_report["gaps"]), stale_report["gaps"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1c. The schema the writer PARSES must exist where the writer is INSTALLED
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_record_schema_ships_with_the_wheel():
+    """A wheel has no `supabase/` tree, so the migrations must ship IN the package.
+
+    `record_projection.table_columns()` READS the schema rather than restating
+    the columns (a second declaration is the one that goes stale), and a wheel
+    ships no `supabase/`. Measured consequence before this: in a wheel install
+    `table_columns()` raised before the first statement, so EVERY armed live
+    write failed `write_failed` — the record stayed empty while this PR's own
+    static gate certified it green (#9231 review P2).
+
+    Verified against the real build too: `uv build --wheel` then
+    `zipfile.namelist()` contains the seven
+    `tortoise/record_migrations/*_record_*.sql` files.
+
+    The MANIFEST line is the SAME trap one level down, and it was measured
+    missing here (#9231 review P2): the discovery stub is owned by no package
+    (`package-dir` remaps the package's sources to `supabase/migrations`), so an
+    sdist built without `include tortoise/record_migrations/__init__.py` carries
+    the 7 SQL files and NOT the stub — and a wheel rebuilt from that sdist finds
+    no `tortoise.record_migrations` package and ships ZERO schema. That is the
+    `tortoise/packs` G1 silent-empty class, on the path whose only consumer is
+    the writer itself. Mutation check: deleting the MANIFEST line fails here.
+    """
+    with open(REPO_ROOT / "pyproject.toml", "rb") as fh:
+        conf = tomllib.load(fh)["tool"]["setuptools"]
+    assert conf["package-dir"]["tortoise.record_migrations"] == "supabase/migrations"
+    patterns = conf["package-data"]["tortoise.record_migrations"]
+    for name in record_projection.RECORD_MIGRATIONS:
+        assert any(fnmatch.fnmatch(name, pattern) for pattern in patterns), (
+            f"{name} is not matched by {patterns} — a wheel install would not "
+            "ship the schema its own writer parses")
+    assert (REPO_ROOT / "tortoise" / "record_migrations" / "__init__.py").exists(), (
+        "the discovery stub is what makes `packages.find` see the mapped package")
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "include tortoise/record_migrations/__init__.py" in manifest, (
+        "without the MANIFEST include the sdist drops the discovery stub, and a "
+        "wheel rebuilt from that sdist ships NO record schema at all")
+
+
+def test_the_schema_resolves_without_the_repo_checkout(monkeypatch, tmp_path):
+    """`table_columns()` must work where `supabase/` does not exist (`site-packages`).
+
+    Before this, `_migrations_dir()` was `REPO_ROOT/supabase/migrations` and
+    nothing else, so the wheel's copy was never read even when present.
+    """
+    repo_dir = REPO_ROOT / "supabase" / "migrations"
+    site = tmp_path / "site-packages"
+    packaged = site / "tortoise" / "record_migrations"
+    packaged.mkdir(parents=True)
+    for name in record_projection.RECORD_MIGRATIONS:
+        shutil.copy(repo_dir / name, packaged / name)
+
+    monkeypatch.setattr(record_projection, "REPO_ROOT", site)
+    monkeypatch.setattr(record_projection, "PACKAGED_MIGRATIONS", packaged)
+    assert record_projection._migrations_dir() == packaged
+    columns = record_projection.table_columns()
+    assert "point" in columns and "props" in columns["point"], sorted(columns)
+
+    # The CHECKOUT still wins where it is complete: a migration edit must be
+    # read as edited, never as the copy an install happens to carry.
+    monkeypatch.setattr(record_projection, "REPO_ROOT", REPO_ROOT)
+    assert record_projection._migrations_dir() == repo_dir
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -429,24 +599,31 @@ def test_the_live_path_never_writes_a_journal_position(wiring):
 
 
 def test_the_seam_writes_nothing_from_a_scratch_buffer(monkeypatch):
-    """`durable=False` ⇒ no connection, no row, one named count (#9231 review P1).
+    """`durable=False` ⇒ no connection, no row, one named DECLINE (#9231 P1/P2).
 
     The record is `replay(journal)`: a row whose record the journal never
     carried can be neither reproduced nor healed, so the seam must refuse it
     BEFORE opening a connection — that is what `_default_connect` raising
-    proves. The count is the signal that a lane is filing unreproducible rows.
+    proves. The count is the signal that a lane filed nothing — on the SKIP
+    counter, not on `record_write_failures`, because a lane with no journal by
+    design lost nothing a replay could restore (#9231 review P2).
     """
     monkeypatch.setenv(record_writer.RECORD_DSN_ENV,
                        "postgresql://record:record@127.0.0.1:1/record")
     monkeypatch.setattr(record_writer, "_default_connect", lambda dsn: pytest.fail(
         "a non-durable record opened a record connection"))
-    before = dict(monitoring.record_write_failure_counts())
+    before = dict(monitoring.record_non_journal_skip_counts())
+    failures_before = dict(monitoring.record_write_failure_counts())
     with use_record_tenant(ORG, GRAPH):
         assert record_writer.write_live_record(
             {"type": "PointAdded", "id": "p1"}, durable=False) is None
-    after = dict(monitoring.record_write_failure_counts())
-    assert after.get("no_durable_journal", 0) > before.get("no_durable_journal", 0), after
-    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
+    after = dict(monitoring.record_non_journal_skip_counts())
+    failures_after = dict(monitoring.record_write_failure_counts())
+    assert after.get("no_durable_journal", 0) > before.get(
+        "no_durable_journal", 0), after
+    assert failures_after == failures_before, (
+        "a DECLINE on a no-journal-by-design lane was counted as a FAILURE — "
+        f"`record_write_failures` must stay zero-meaningful: {failures_after}")
 
 
 def test_the_sdk_door_reads_durability_off_its_log(capture_sdk, monkeypatch):
@@ -470,12 +647,11 @@ def test_the_sdk_door_reads_durability_off_its_log(capture_sdk, monkeypatch):
     assert log is not None, "the fixture configures a journal"
     assert log.durable is True, "a real journal is durable by default"
     log.durable = False
-    before = dict(monitoring.record_write_failure_counts())
+    before = dict(monitoring.record_non_journal_skip_counts())
     sdk.capture_session([{"role": "user", "content": "We chose FalkorDB."}])
-    after = dict(monitoring.record_write_failure_counts())
+    after = dict(monitoring.record_non_journal_skip_counts())
     assert after.get("no_durable_journal", 0) > before.get(
         "no_durable_journal", 0), after
-    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
 
 
 def test_the_m2_capture_lane_never_files_a_row_its_journal_never_carried(        capture_sdk, monkeypatch):
@@ -499,7 +675,8 @@ def test_the_m2_capture_lane_never_files_a_row_its_journal_never_carried(       
         "the M2 capture lane opened a record connection for a record its "
         "journal never carried"))
     sdk, _journal = capture_sdk()
-    before = dict(monitoring.record_write_failure_counts())
+    failures_before = dict(monitoring.record_write_failure_counts())
+    skips_before = dict(monitoring.record_non_journal_skip_counts())
     with use_record_tenant(ORG, GRAPH):
         extracted, meta = sdk._extract_session_llm(
             [{"role": "user", "content": "We chose FalkorDB for the hot cache."},
@@ -508,10 +685,18 @@ def test_the_m2_capture_lane_never_files_a_row_its_journal_never_carried(       
             "sess-m2-scratch", "2026-10-19T00:00:00+00:00")
     assert extracted, "the M2 lane must really have emitted"
     assert meta.get("mode") != "empty", meta
-    after = dict(monitoring.record_write_failure_counts())
-    assert after.get("no_durable_journal", 0) > before.get(
-        "no_durable_journal", 0), after
-    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
+    skips_after = dict(monitoring.record_non_journal_skip_counts())
+    failures_after = dict(monitoring.record_write_failure_counts())
+    assert skips_after.get("no_durable_journal", 0) > skips_before.get(
+        "no_durable_journal", 0), skips_after
+    # THE (#9231 review P2) PIN: a healthy armed capture — the SDK's headline
+    # API, emitted THROUGH this by-design non-journal lane — must not move the
+    # FAILURE counter. Pre-fix it moved once per extracted record, so
+    # `record_write_failures` could never be zero on a working armed deployment
+    # and the one channel the seam adds taught operators to ignore it.
+    assert failures_after == failures_before, (
+        "a by-design non-journal lane counted a LOSS: the failure counter no "
+        f"longer reads zero on the healthy capture path — {failures_after}")
 
 
 def test_a_real_journal_is_still_durable_for_the_door(monkeypatch):
@@ -564,13 +749,169 @@ def test_the_demo_cli_lane_files_nothing_from_a_journal_it_deletes(monkeypatch):
                        "postgresql://record:record@127.0.0.1:1/record")
     monkeypatch.setattr(record_writer, "_default_connect", lambda dsn: pytest.fail(
         "the demo lane filed a record from the journal file it deletes"))
-    before = dict(monitoring.record_write_failure_counts())
+    before = dict(monitoring.record_non_journal_skip_counts())
     with use_record_tenant(ORG, GRAPH):
         cli._cmd_demo(None)
-    after = dict(monitoring.record_write_failure_counts())
+    after = dict(monitoring.record_non_journal_skip_counts())
     assert after.get("no_durable_journal", 0) > before.get(
         "no_durable_journal", 0), after
-    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
+
+
+def test_a_scratch_event_log_is_born_non_durable(tmp_path):
+    """`EventLog.scratch()` is the ONE home of the marker (#9231 review P2).
+
+    The MCP mining lane was correct and had NO detector: deleting its
+    ``log.durable = False`` line reddened nothing, so `EventLog.durable = True`
+    silently took the lane back to filing rows from a directory nothing
+    references — the P1 that marker exists to prevent. A construction-time
+    method gives the decision one tested home instead of an inline assignment a
+    refactor can drop.
+    """
+    from tortoise.log import EventLog
+
+    assert EventLog(tmp_path / "journal.jsonl").durable is True
+    scratch = EventLog.scratch(tmp_path / "scratch.jsonl")
+    assert scratch.durable is False
+    assert scratch.path == tmp_path / "scratch.jsonl"
+
+
+def test_every_tempfile_backed_event_log_is_built_with_scratch():
+    """AST pin: a `tempfile` journal site cannot file rows from a scratch file.
+
+    The behavioural legs above drive the demo lane and the in-memory lane; this
+    one catches the NEXT temp-file site, and the exact shape the MCP lane had
+    before `scratch()` existed (`EventLog(os.path.join(tempfile.mkdtemp(…), …))`)
+    — that spelling is red because the constructor call names `tempfile`.
+    """
+    offenders: list[str] = []
+    for path in sorted((REPO_ROOT / "tortoise").rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "EventLog(" not in source:
+            continue
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        for node in ast.walk(ast.parse(source, filename=rel)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(
+                func, "id", None)
+            if name != "EventLog":
+                continue
+            call = ast.unparse(node).lower()
+            if "tempfile" in call or "mkdtemp" in call:
+                offenders.append(f"{rel}:{node.lineno} {ast.unparse(node)}")
+    assert offenders == [], (
+        "a temp-file journal is a SCRATCH buffer: build it with "
+        f"`EventLog.scratch(…)`, not `EventLog(…)` — {offenders}")
+
+
+def test_an_armed_live_write_commits_and_closes_exactly_once(monkeypatch):
+    """The SHIPPED composition had no CI coverage at all (#9231 review P2).
+
+    Both Postgres legs SKIP without `TEST_RECORD_DB_URI`, and every DB-free leg
+    asserts a REFUSAL (`no_tenant`, `no_durable_journal`, `malformed_dsn`) — so
+    `write_live_record → write_records(position=False) → commit() → close()` was
+    only ever exercised by an operator with a database. Deleting the `commit()`
+    left CI green and every layer row uncommitted on an armed deployment. This
+    drives the real door against a fake seam and counts the promises it makes:
+    the record reaches the seam unchanged, the position is deferred, and the
+    connection this write opened is committed once and closed once.
+    """
+
+    class _Conn:
+        commits = 0
+        closes = 0
+
+        def commit(self):
+            self.commits += 1
+
+        def close(self):
+            self.closes += 1
+
+    conn = _Conn()
+    seen: dict[str, object] = {}
+
+    def _fake_write_records(records, **kwargs):
+        seen["records"] = list(records)
+        seen["kwargs"] = kwargs
+        return record_writer.RecordWrite(
+            outcome=record_writer.RecordWriteOutcome.APPLIED,
+            events=len(records), statements=1, first_seq=1, last_seq=1,
+            connection=conn)
+
+    monkeypatch.setenv(record_writer.RECORD_DSN_ENV,
+                       "postgresql://record:record@127.0.0.1:1/record")
+    monkeypatch.setattr(record_writer, "write_records", _fake_write_records)
+    record = {"type": "PointAdded", "id": "p1"}
+    with use_record_tenant(ORG, GRAPH):
+        write = record_writer.write_live_record(record)
+
+    assert write is not None and write.applied
+    assert seen["records"] == [record], seen["records"]
+    kwargs = seen["kwargs"]
+    assert kwargs["position"] is False, "the live door invented a position"
+    assert (kwargs["org_id"], kwargs["graph_id"]) == (ORG, GRAPH), kwargs
+    assert (conn.commits, conn.closes) == (1, 1), (
+        "the live write must commit AND close the connection it opened, once")
+
+
+def test_a_dead_record_costs_a_capture_one_connect_not_one_per_record(monkeypatch):
+    """A connect timeout bounds ONE connect, not a CAPTURE (#9231 review P1).
+
+    The live door is called once per journal record, on the caller's thread: on
+    a blackholed host each call paid `CONNECT_TIMEOUT_SECONDS` again, so a
+    25-record capture spent ~4 minutes inside one `capture_session` — a wedged
+    capture, while the seam went on reporting success. A failed connect now
+    trips the breaker, so the REST of that capture is refused locally and
+    counted `circuit_open`; a success closes it again.
+    """
+    attempts: list[str] = []
+
+    def _dead(dsn):
+        attempts.append(dsn)
+        raise OSError("no route to host")
+
+    monkeypatch.setenv(record_writer.RECORD_DSN_ENV,
+                       "postgresql://record:record@127.0.0.1:1/record")
+    monkeypatch.setattr(record_writer, "_default_connect", _dead)
+    before = dict(monitoring.record_write_failure_counts())
+    with use_record_tenant(ORG, GRAPH):
+        for _ in range(5):
+            assert record_writer.write_live_record({"type": "PointAdded"}) is None
+    after = dict(monitoring.record_write_failure_counts())
+
+    assert len(attempts) == 1, (
+        f"5 records paid the connect timeout {len(attempts)} times — the bound "
+        "is per capture, not per record")
+    assert after.get("write_failed", 0) - before.get("write_failed", 0) == 1, after
+    assert after.get("circuit_open", 0) - before.get("circuit_open", 0) == 4, after
+
+    # A REFUSAL is not an unreachable record: a totality/statement failure means
+    # the connection was fine, so it must not silence the record for a minute.
+    record_writer._close_live_breaker()
+
+    def _refuse(records, **kwargs):
+        raise record_writer.RecordWriteError("totality refused this record")
+
+    monkeypatch.setattr(record_writer, "write_records", _refuse)
+    with use_record_tenant(ORG, GRAPH):
+        assert record_writer.write_live_record({"type": "PointAdded"}) is None
+    assert record_writer._breaker_is_open() is False, (
+        "a refused record tripped the breaker — the connection was fine")
+
+    # The breaker also HEALS: a success closes it, so a recovered record writes
+    # again without a restart.
+    monkeypatch.setattr(record_writer, "write_records",
+                        lambda records, **kwargs: record_writer.RecordWrite(
+                            outcome=record_writer.RecordWriteOutcome.APPLIED,
+                            events=len(records)))
+    record_writer._trip_live_breaker()
+    with use_record_tenant(ORG, GRAPH):
+        assert record_writer.write_live_record({"type": "PointAdded"}) is None
+    record_writer._close_live_breaker()
+    with use_record_tenant(ORG, GRAPH):
+        assert record_writer.write_live_record({"type": "PointAdded"}) is not None
+    assert record_writer._breaker_is_open() is False
 
 
 # ════════════════════════════════════════════════════════════════════════════

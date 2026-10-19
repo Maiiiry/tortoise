@@ -7043,7 +7043,10 @@ class TortoiseSDK:
             return
         # DURABILITY IS READ, not assumed (#9231 review P1): no log at all is
         # NOT durable, and a log that declares itself a scratch buffer is not
-        # either. The seam counts `no_durable_journal` and files nothing.
+        # either. The seam DECLINES it and counts the decline on
+        # `monitoring.metrics()["record_non_journal_skips"]` — not on
+        # `record_write_failures`, since that lane has no journal by design and
+        # nothing was lost (#9231 review P2).
         log = self._event_log
         durable = log is not None and getattr(log, "durable", True)
         record_writer.write_live_record(record, durable=durable)

@@ -81,6 +81,15 @@ own ordering, retry and watermark semantics. That is a design with its own state
 machine; if #9188 wants one it decides one there. A seam cannot half-own it,
 and half-owning it is how a record silently loses rows.
 
+**OVERRIDES:** one door deliberately departs from this decision — the LIVE door
+(`write_live_record`). It runs after the caller's journal append has already
+committed (§17.1 makes the append the commit point), so raising there would
+hand a producer an exception for a write that PERSISTED (#5148's rule). It
+counts ``write_failed``/``circuit_open`` and warns instead, which keeps the
+``degraded`` vs ``unconfigured`` distinction on the counter surface rather than
+the exception surface. `write_records`/`RecordWriter.write` — the path a caller
+with an open transaction uses — still FAILS exactly as this decision says.
+
 **4. Per-record vs batch ⇒ ONE batch per call.** Forced by the position, not
 preferred. `replay_plan` numbers records by their index in the batch, so one
 replay per record would number every record `seq=1` and the
@@ -121,6 +130,7 @@ import contextvars
 import hashlib
 import logging
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -133,10 +143,12 @@ _logger = logging.getLogger(__name__)
 
 __all__ = [
     "CONNECT_TIMEOUT_SECONDS",
+    "LIVE_WRITE_BREAKER_SECONDS",
     "POSITION_ROW_DEFERRED_ON",
     "RECORD_DSN_ENV",
     "RECORD_GRAPH_ENV",
     "RECORD_ORG_ENV",
+    "RecordConnectError",
     "RecordWrite",
     "RecordWriteError",
     "RecordWriteOutcome",
@@ -186,6 +198,29 @@ RECORD_GRAPH_ENV = "TORTOISE_RECORD_GRAPH_ID"
 #: silently replaced by this one.
 CONNECT_TIMEOUT_SECONDS = 10
 
+#: How long the LIVE door stops trying after a connect to the record FAILED, in
+#: seconds. :data:`CONNECT_TIMEOUT_SECONDS` bounds ONE connect; it does not bound
+#: a CAPTURE, and the door is called once per journal record on the caller's
+#: thread — so a capture emitting N records paid N × the timeout while
+#: ``write_live_record`` (fail-soft by design) went on reporting success. Under
+#: exactly the drop/blackhole case the timeout exists for, that is the wedged
+#: capture the bound was supposed to prevent: 25 records × 10 s ≈ 4 minutes
+#: inside one ``capture_session`` call.
+#:
+#: So a connect failure TRIPS this breaker: every further live write for the next
+#: ``LIVE_WRITE_BREAKER_SECONDS`` is refused locally and counted
+#: ``circuit_open`` — no socket, no timeout, no stall — and the first SUCCESSFUL
+#: write closes it again. Connection-refused fails instantly and is unaffected in
+#: cost; this bounds the shape that does not. It is deliberately process-wide
+#: (one record, one deployment) and deliberately time-based rather than
+#: attempt-based: a probe after the window re-tests the record once, so a healed
+#: record recovers on its own with no restart.
+LIVE_WRITE_BREAKER_SECONDS = 60.0
+
+#: When the live breaker closes again, on ``time.monotonic()`` (0.0 = closed).
+#: Module-level on purpose: the cost it bounds is per PROCESS, not per call.
+_breaker_open_until = 0.0
+
 #: The DSN schemes a DB-API Postgres driver accepts. A value outside this set is
 #: a *misconfiguration*, never an unarmed state.
 _DSN_SCHEMES: tuple[str, ...] = ("postgresql://", "postgres://")
@@ -211,6 +246,19 @@ class RecordWriteError(Exception):
     ``except RecordWriteError as exc: isinstance(exc.__cause__,
     record_projection.UnknownJournalRecordType)``. The seam wraps rather than
     re-raises because the cause is what a human reads.
+    """
+
+
+class RecordConnectError(RecordWriteError):
+    """The record is ARMED but its connection could not be OPENED.
+
+    A :class:`RecordWriteError` in every respect (one catchable class for a
+    caller), and a separate class for one reason: only THIS failure means the
+    record is unreachable RIGHT NOW rather than refusing this one record, so it
+    is what trips the live door's breaker (:data:`LIVE_WRITE_BREAKER_SECONDS`).
+    A totality refusal or a statement-level Postgres error must NOT trip it —
+    the connection was fine, and hiding real record errors behind a 60 s silence
+    would be worse than the cost the breaker saves.
     """
 
 
@@ -503,8 +551,10 @@ class RecordWriter:
             except RecordWriteError:
                 raise
             except Exception as exc:
-                # Armed-but-unreachable MUST NOT read as unarmed (decision 3).
-                raise RecordWriteError(
+                # Armed-but-unreachable MUST NOT read as unarmed (decision 3),
+                # and it is its OWN class so the live door can bound the cost of
+                # a dead record (`LIVE_WRITE_BREAKER_SECONDS`).
+                raise RecordConnectError(
                     f"the record is armed but its connection could not be "
                     f"opened ({type(exc).__name__})"
                 ) from exc
@@ -572,6 +622,25 @@ def write_records(
     )
 
 
+def _breaker_is_open(now: float | None = None) -> bool:
+    """Has a recent connect failure silenced the live door for now?"""
+    return (time.monotonic() if now is None else now) < _breaker_open_until
+
+
+def _trip_live_breaker(now: float | None = None) -> None:
+    """A connect to the record failed: stop paying for it once per record."""
+    global _breaker_open_until
+    _breaker_open_until = (
+        (time.monotonic() if now is None else now) + LIVE_WRITE_BREAKER_SECONDS
+    )
+
+
+def _close_live_breaker() -> None:
+    """The record answered: re-open the door (and reset the test seam)."""
+    global _breaker_open_until
+    _breaker_open_until = 0.0
+
+
 def _count_write_failure(reason: str) -> None:
     """Count one lost record write. **Never raises** (#5148's rule, one frame on).
 
@@ -584,6 +653,19 @@ def _count_write_failure(reason: str) -> None:
     with contextlib.suppress(Exception):
         from . import monitoring
         monitoring.record_record_write_failure(reason)
+
+
+def _count_non_journal_skip(reason: str = "no_durable_journal") -> None:
+    """Count one DECLINED non-journal write. **Never raises** (#5148's rule).
+
+    A sibling of :func:`_count_write_failure` with the same swallow and a
+    different channel: ``monitoring.record_non_journal_skips``, not
+    ``record_write_failures`` (#9231 review P2). Same rule, because the caller's
+    journal-less append has committed just the same.
+    """
+    with contextlib.suppress(Exception):
+        from . import monitoring
+        monitoring.record_non_journal_skip(reason)
 
 
 def write_live_record(record: Mapping[str, Any], *,
@@ -603,10 +685,14 @@ def write_live_record(record: Mapping[str, Any], *,
     it. The M2 session-capture extraction lane appends through
     `EventAPI._emit` to `_InMemoryEventLog` (no file I/O, by design), so a
     capture on that lane would otherwise file rows the journal never carried.
-    ``False`` ⇒ nothing is written and ``no_durable_journal`` is counted, the
-    same observable-misconfiguration shape as ``no_journal``. Read AFTER the
-    arming check, so an UNARMED deployment stays byte-identical (no counter, no
-    warning) on this lane too.
+    ``False`` ⇒ nothing is written and the DECLINE is counted on
+    ``monitoring.metrics()["record_non_journal_skips"]`` — NOT on
+    ``record_write_failures``, because a lane that has no journal by design lost
+    nothing a replay could restore (#9231 review P2: counting it as a failure
+    made that counter permanently non-zero on the healthy capture path, since
+    every ``capture_session`` emits through the M2 lane). Read AFTER the arming
+    check, so an UNARMED deployment stays byte-identical (no counter, no log
+    line) on this lane too.
 
     Returns ``None`` when the record is not armed (no DSN): nothing was
     attempted, no connection, no plan — the unarmed deployment is
@@ -629,10 +715,23 @@ def write_live_record(record: Mapping[str, Any], *,
     DELIBERATE residual: one record, one transaction, no batching, because a
     batch seam's ordering across three independent doors is a throughput
     question with no measurement behind it yet. The UNHEALTHY case is bounded
-    too, and that is the residual the healthy measurement cannot see: opening
-    the connection is capped by :data:`CONNECT_TIMEOUT_SECONDS` (~10 s per
-    record, not "forever"), because this runs on the caller's thread after the
-    journal append committed.
+    too, in two places that answer different questions: opening the connection
+    is capped by :data:`CONNECT_TIMEOUT_SECONDS` (~10 s), and a connect that
+    FAILS trips :data:`LIVE_WRITE_BREAKER_SECONDS` so the REST of the capture
+    is refused locally (counted ``circuit_open``) instead of paying that
+    timeout once per record — N records used to cost N × 10 s inside one
+    ``capture_session`` call, which is a wedged capture, not a degraded one.
+
+    ``OVERRIDES:`` the module's decision 3 (`Armed but unreachable ⇒ the write
+    FAILS (RecordWriteError)`) does not apply to this door, and that is a
+    deliberate departure rather than an oversight. Decision 3 governs
+    :meth:`RecordWriter.write`, whose caller's write has NOT yet committed; this
+    door runs AFTER the caller's append is the commit point (§17.1), so raising
+    here would hand a producer an exception for a write that persisted — the
+    #5148 rule. The distinction decision 3 exists to keep (`degraded` vs
+    `unconfigured`) is kept by the counter and the warning instead of by the
+    exception, on the ``monitoring.record_write_failures`` surface. #9187 owns
+    decision 3; the reversal is recorded there.
     """
     try:
         armed = record_dsn() is not None
@@ -643,9 +742,13 @@ def write_live_record(record: Mapping[str, Any], *,
     if not armed:
         return None
     if not durable:
-        _count_write_failure("no_durable_journal")
-        _logger.warning(
-            "the record write did not happen (no_durable_journal) — the record "
+        # A DECLINE, not a loss: this lane has no journal by design, so no row is
+        # missing that a replay could restore (#9231 review P2). Counted on the
+        # skip counter and logged at DEBUG — a warning per extracted record on
+        # the healthy M2 capture path is the same noise the counter was.
+        _count_non_journal_skip("no_durable_journal")
+        _logger.debug(
+            "the record write was declined (no_durable_journal) — the record "
             "is armed but this log is a scratch buffer, not a journal, so no "
             "replay could reproduce the row: %s", record.get("type"),
         )
@@ -662,15 +765,33 @@ def write_live_record(record: Mapping[str, Any], *,
         )
         return None
     org_id, graph_id = tenant
+    if _breaker_is_open():
+        # A recent connect FAILED. Refuse locally: the journal already holds the
+        # record, a replay heals it, and paying the connect timeout once per
+        # record is what turns a degraded record into a wedged capture.
+        _count_write_failure("circuit_open")
+        _logger.warning(
+            "the record write did not happen (circuit_open) — a connect to the "
+            "record failed within the last %.0fs, so this write is refused "
+            "without a socket: %s", LIVE_WRITE_BREAKER_SECONDS,
+            record.get("type"),
+        )
+        return None
     connection: Any | None = None
     try:
         write = write_records([record], org_id=org_id, graph_id=graph_id,
                               position=False)  # #9190: never invent a position
+        _close_live_breaker()
         connection = write.connection
         if connection is not None:
             connection.commit()
         return write
     except Exception as exc:
+        if isinstance(exc, RecordConnectError):
+            # Unreachable RIGHT NOW (not a refusal of this one record): bound the
+            # cost of the rest of the capture. A totality or statement failure
+            # deliberately does NOT trip it — the connection was fine.
+            _trip_live_breaker()
         _count_write_failure("write_failed")
         _logger.warning(
             "the record write did not happen (write_failed) — the journal has "

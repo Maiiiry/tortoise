@@ -2184,6 +2184,32 @@ def test_record_wiring_check_tool_change_selects_core_not_tier1():
     assert set(r["test_files"]) != _tier1(), r
 
 
+def test_9078_guard_runs_on_a_main_only_diff():
+    # #9231 review P1: the SAME guard (`test_9078_record_written_by_production_
+    # path.py`) also drives `tortoise/__main__.py` — `cli._cmd_demo(None)` — to
+    # prove the demo lane files nothing from the journal file it deletes. That
+    # path is an EXACT `SOURCE_PATTERNS["api"]` entry, so an `__main__.py`-only
+    # diff selects `api`, REPLACES the `core` fallback (`core` is added only in
+    # the `if not found:` branch, and `CORE_ALSO` does not list `__main__.py`)
+    # and never collected the leg. Since removing `EventLog.scratch(...)` from
+    # `_cmd_demo` is NECESSARILY an `__main__.py`-touching diff, the one change
+    # that can break that leg merged with the leg never run — the
+    # #1349/#2938/#3154/#4367 silent-drop class, the same shape
+    # `test_socket_bound_not_multiplied_2969.py` is dual-registered for.
+    #
+    # Measured before the fix: `_sel(["tortoise/__main__.py"])` ->
+    # surfaces=['api'], full=False, guard ABSENT from test_files.
+    #
+    # Mutation check: deleting the dual `api` arm in config/ci-surfaces.yml
+    # fails the first pair of asserts; the `core` arm is checked by
+    # `test_record_wiring_check_tool_change_selects_core_not_tier1` above, so
+    # neither arm can be dropped believing the other covers it.
+    r = _sel(["tortoise/__main__.py"])
+    assert r["full"] is False, r
+    assert r["surfaces"] == ["api"], r
+    assert "test_9078_record_written_by_production_path.py" in r["test_files"], r
+
+
 def test_source_currency_tool_change_selects_core_not_tier1():
     # #5581: tools/source_currency.py owns tests/test_source_currency_5581.py
     # (`core`) — the §4.6 aggregate, the sourced disclosure, and the flag-gated

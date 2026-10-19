@@ -2720,7 +2720,7 @@ rows:
   class: agent-reachable
   cluster_canonical: null
 - name: tortoise_mine_conversations
-  served_from: tortoise/mcp_server.py:7e4594164cdeb8a9
+  served_from: tortoise/mcp_server.py:78f60fbdec710059
   served_attributes: 9885413e99690d9c
   family: mining
   family_rank: 11
