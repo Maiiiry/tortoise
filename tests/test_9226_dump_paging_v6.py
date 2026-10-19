@@ -32,6 +32,7 @@ outage (#9226).
 """
 from __future__ import annotations
 
+import contextlib
 import re
 
 import pytest
@@ -60,29 +61,25 @@ class _V6Graph:
     def __init__(self, calls):
         self.calls = calls  # the (query, params) pairs, for the shape assertions
 
-    def query(self, cypher, params=None, timeout=None):  # noqa: ARG002
+    def query(self, cypher, params=None, timeout=None):
         params = params or {}
         self.calls.append((cypher, dict(params)))
         cursor = params["cursor"]
         batch = params["batch"]
         if "id(n)" in cypher and "id(n) >=" in cypher:
-            op = ">="
             rows = [n for n in _NODES if n[0] >= cursor]
             key = 0
         elif "id(n) > $" in cypher:
-            op = ">"
             # THE MEASURED v6 RULE, and the reason this class exists.
             if cursor < 0:
                 return _Result([])
             rows = [n for n in _NODES if n[0] > cursor]
             key = 0
         elif "id(r) >=" in cypher:
-            op = ">="
             rows = [(s, d, t, p, i) for i, (s, d, t, p) in enumerate(_EDGES)
                     if i >= cursor]
             key = 4
         elif "id(r) > $" in cypher:
-            op = ">"
             if cursor < 0:
                 return _Result([])
             rows = [(s, d, t, p, i) for i, (s, d, t, p) in enumerate(_EDGES)
@@ -181,11 +178,12 @@ def _live_target() -> str | None:
             from tortoise.projection import FalkorProjection
 
             proj = FalkorProjection.from_uri(uri)
-        except Exception:  # noqa: BLE001 - unreachable/refusing target is not a failure
+        except Exception:
+            # an unreachable/refusing target is not a failure of this probe
             continue
         try:
             proj.g.query("RETURN 1")
-        except Exception:  # noqa: BLE001
+        except Exception:
             proj.close()
             continue
         proj.close()
@@ -222,7 +220,5 @@ def test_dump_graph_pages_a_live_graph_end_to_end():
             f"exported {payload['node_count']}")
     finally:
         proj.close()
-        try:
+        with contextlib.suppress(Exception):
             proj.db.select_graph(name).delete()
-        except Exception:  # noqa: BLE001
-            pass
