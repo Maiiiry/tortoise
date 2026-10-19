@@ -1,0 +1,345 @@
+"""#9210 — `rebuild_all`'s SNAPSHOT RESTORE declares itself, not the replay lane.
+
+`rebuild_all` does two unlike things in one body. Its FOLD pass projects
+records that came FROM the journal — `_replay_write_scope()` states the truth
+for it. But the same engine also puts back, verbatim, state it CAPTURED FROM
+THE GRAPH THAT IS ABOUT TO BE DESTROYED: `:Batch` markers and
+`Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
+onboarding state machine, the `:TeamMeta` first-org marker, the `#2814` config
+registry, and the `:GraphEventMeta` watermark. **Not one of those classes rides
+a journal record** (`#990`, `#3947`, `#4641`, `#5353`, `#2814`, `#4653` each
+say so at its writer), so the replay lane's contract — "this content came from
+the record" — is FALSE for every one of them.
+
+Handing them the replay permit is therefore an over-authorization: the
+declaration claims a wider write scope than the restore performs. `#9124`'s
+guard makes that legibility defect load-bearing, because a method-wide permit
+means every FUTURE addition to that 4,000-line body inherits a claim nobody
+made about it — the next lane reads "authorized by replay" and trusts it.
+
+What is pinned here is the DECLARATION, observed **at the write handle** (the
+`#9123` precedent): the scope is read at the moment the statement is issued,
+so a `with` block that wraps a block the write never runs inside cannot pass.
+Three properties, and each one names the wrong behaviour it makes impossible:
+
+1. every non-record restore write observes its OWN named lane, so a restore
+   can no longer be authorized by a claim that is false for it;
+2. an OUTER `_replay_write_scope()` cannot cover a restore write — the inner
+   declaration shadows it — so the over-broad permit `#9213`/`#9124` introduces
+   around the whole engine cannot re-acquire these statements (and the same
+   test proves the permit really was in force over the fold, so it cannot pass
+   vacuously);
+3. the lane does not over-claim in the other direction: nothing observes a
+   restore reason unless it IS one of the snapshot-restore statements.
+
+MUTATION for every test here: replace a `self._restore_write(..., reason=...)`
+call in `rebuild_all` with the bare `self.g.query(...)` it wraps — test 1 and
+test 2 both go red on the observed reason (and 2 goes red with `"replay"`, the
+false contract, rather than with `None`).
+
+Lane: either. The fixtures build the SDK the way the embedded carve-out suite
+does, and the bulk-wipe guard passes on the redirected `test_*_tortoise` graph
+too, so this file needs no `carve_out` classification.
+"""
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from tortoise.onboarding.state import ONBOARDING_NODE_LABEL
+from tortoise.pack_state import PACK_INSTALL_LABEL
+from tortoise.projection import (
+    _CACHE_WRITE_AUTHORIZED,
+    _TEAM_META_LABEL,
+    _replay_write_scope,
+)
+from tortoise.sdk import TortoiseSDK
+
+#: The declared lane, pinned as a LITERAL (`#9123`'s precedent), not imported:
+#: a lane that renames itself silently is a lane the next reader cannot find,
+#: and a test that imports the name would follow the rename instead of failing
+#: on it. `test_the_lane_constant_matches_the_pinned_literal` reconciles the two
+#: so the literal cannot drift off the module's constant either.
+RESTORE = "pre-wipe-restore"
+
+#: leg → the reason `rebuild_all` must carry for that leg's statement, plus
+#: the normalized fragment that identifies the statement. One entry per
+#: snapshot-restore leg `#9210` names.
+_LEGS = {
+    "batch-marker": (
+        f"{RESTORE}: :Batch markers (#990)",
+        "MERGE (b:Batch {id:$id}) SET b += $props",
+    ),
+    "batch-link": (
+        f"{RESTORE}: Point.batch_id links (#990)",
+        "MATCH (p:Point {id:$pid}) SET p.batch_id = $bid",
+    ),
+    "session": (
+        f"{RESTORE}: :Session containers (#3947)",
+        "MERGE (s:Session {id:$id}) SET s += $props",
+    ),
+    "session-link": (
+        f"{RESTORE}: :Session CONTAINS links (#3947)",
+        "MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
+        "MERGE (s)-[:CONTAINS]->(p)",
+    ),
+    "onboarding": (
+        f"{RESTORE}: onboarding state machine (#4641)",
+        f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) SET n += $props",
+    ),
+    "team-meta": (
+        f"{RESTORE}: :TeamMeta first-org marker (#5353)",
+        f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",
+    ),
+    "config": (
+        f"{RESTORE}: config registry {PACK_INSTALL_LABEL} (#2814)",
+        f"MERGE (n:{PACK_INSTALL_LABEL} {{namespace:$identity}}) "
+        "SET n += $props",
+    ),
+    "watermark": (
+        f"{RESTORE}: :GraphEventMeta watermark (#4653)",
+        "MERGE (m:GraphEventMeta) ON CREATE SET m.last_seq = $last, "
+        "m.first_seq = $first",
+    ),
+}
+
+
+# ── harness ──────────────────────────────────────────────────────────────────
+
+
+def _mk_sdk(tmp_path):
+    events = tmp_path / "events"
+    events.mkdir(parents=True, exist_ok=True)
+    sdk = TortoiseSDK(
+        db_path=str(tmp_path / "rs.db"),
+        # A `test_`-prefixed namespace keeps the bulk-wipe guard passing under
+        # the docker redirect (graph name becomes `test_..._tortoise`).
+        namespace=f"test_rs_{os.urandom(4).hex()}",
+        event_log_path=str(events / "events.jsonl"),
+    )
+    return sdk, events
+
+
+def _record_authorizations(monkeypatch):
+    """Record `(statement, §17.1 authorization IN FORCE)` at the write handle.
+
+    Patched on the CLASS, not the instance: `_GuardedGraph` is
+    `__slots__`-restricted and every writer in the engine goes through it, so
+    the observation lands exactly where the guard will read it when `#9124`
+    closes the third door — not around a caller, where a scope the write never
+    runs inside would pass.
+    """
+    from tortoise.projection import _GuardedGraph
+
+    real = _GuardedGraph.query
+    seen: list[tuple[str, str | None]] = []
+
+    def query(self, cypher: str, params=None, timeout=None):
+        seen.append((cypher, _CACHE_WRITE_AUTHORIZED.get()))
+        return real(self, cypher, params=params, timeout=timeout)
+
+    monkeypatch.setattr(_GuardedGraph, "query", query)
+    return seen
+
+
+def _norm(cypher: str) -> str:
+    return " ".join(str(cypher).split())
+
+
+#: Statement verbs that WRITE. The lane authorizes WRITES, so the "does it
+#: over-claim" half is asserted over these only: a helper the restore calls
+#: also READS under the scope (`reestablish_watermark` probes `:GraphEvent` and
+#: the live counter before its MERGE), and a read under a write declaration is
+#: not a write authorized by a claim that does not describe it.
+_WRITE_VERBS = ("CREATE", "MERGE", "SET ", "DELETE", "REMOVE", "DROP ")
+
+
+def _writes(cypher: str) -> bool:
+    text = f"{_norm(cypher)} "
+    return any(verb in text for verb in _WRITE_VERBS)
+
+
+def _leg_of(cypher: str) -> str | None:
+    """The leg whose statement fragment this is, else None."""
+    text = _norm(cypher)
+    for leg, (_reason, fragment) in _LEGS.items():
+        if _norm(fragment) in text:
+            return leg
+    return None
+
+
+def _seed_prewipe_state(sdk, events):
+    """Plant every class whose ONLY post-wipe carrier is the snapshot.
+
+    Each write is the product's own: a bare `CREATE`/`MERGE` on the write
+    handle, riding no journal record — which is the whole reason the class has
+    to be captured and restored instead of replayed. The journaled Point is
+    what makes the run a REAL `rebuild_all` (the wipe happens and the replay
+    re-creates the node the batch link and the CONTAINS edge point at).
+    """
+    created = sdk.create_point("statement", "journaled, so the replay is real")
+    pid = created["id"] if isinstance(created, dict) else created
+    proj = sdk._get_proj()
+    g = proj.g
+    g.query("MERGE (b:Batch {id:'batch-1'}) SET b.reason = 'quarantine'")
+    g.query("MATCH (p:Point {id:$pid}) SET p.batch_id = 'batch-1'",
+            params={"pid": pid})
+    g.query("MERGE (s:Session {id:'sess-1'}) SET s.capture_ok = true")
+    g.query(
+        "MATCH (s:Session {id:'sess-1'}), (p:Point {id:$pid}) "
+        "MERGE (s)-[:CONTAINS]->(p)", params={"pid": pid})
+    g.query(
+        f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:'org-1'}}) "
+        "SET n.completed = false")
+    g.query(f"CREATE (m:{_TEAM_META_LABEL} {{name:'Acme', created:'2026-01-01'}})")
+    g.query(
+        f"MERGE (n:{PACK_INSTALL_LABEL} {{namespace:'ns-1'}}) SET n.version = 1")
+    g.query("MERGE (m:GraphEventMeta) SET m.last_seq = 7, m.first_seq = 1")
+    return pid, proj, events
+
+
+def _observed_restore_legs(seen):
+    """`{leg: [reason, …]}` for every restore leg that actually ran."""
+    out: dict[str, list[str | None]] = {}
+    for cypher, reason in seen:
+        leg = _leg_of(cypher)
+        if leg is not None:
+            out.setdefault(leg, []).append(reason)
+    return out
+
+
+def _assert_every_leg_declares_itself(seen, *, context: str):
+    observed = _observed_restore_legs(seen)
+    # VACUITY GUARD: a leg that never ran cannot be evidence either way. The
+    # fixture seeds all eight, so a missing one means the seed or the capture
+    # changed, not that the declaration is fine.
+    assert set(observed) == set(_LEGS), (
+        f"{context}: these snapshot-restore legs did not reach the write "
+        f"handle, so the pin would be vacuous: missing="
+        f"{sorted(set(_LEGS) - set(observed))}; observed={sorted(observed)}")
+    wrong = {
+        leg: reasons for leg, reasons in observed.items()
+        if reasons != [_LEGS[leg][0]]
+    }
+    assert not wrong, (
+        f"{context}: every snapshot-restore write must run inside its OWN "
+        "named declaration — the record-replay lane's contract ('this content "
+        "came FROM the record') is false for all of them (#9210). "
+        f"observed={wrong!r}")
+
+
+# ── the declaration ──────────────────────────────────────────────────────────
+
+
+def test_every_snapshot_restore_leg_declares_itself(tmp_path, monkeypatch):
+    """RED before #9210: the restore writes ran under NO declaration at all.
+
+    `_CACHE_WRITE_AUTHORIZED` is `None` at these statements on the pre-fix
+    tree, which is precisely what `#9124`'s closed door reads as "refuse" — so
+    the leg that says "these writes are not record replays" is what keeps the
+    restore alive when the door closes, and what stops the answer to "which
+    writes are authorized by replay" from being "whatever this method happens
+    to contain".
+    """
+    sdk, events = _mk_sdk(tmp_path)
+    try:
+        _, proj, _ = _seed_prewipe_state(sdk, events)
+        seen = _record_authorizations(monkeypatch)
+
+        proj.rebuild_all(str(events), confirm_destructive=True)
+
+        _assert_every_leg_declares_itself(seen, context="rebuild_all")
+    finally:
+        sdk.close()
+
+
+def test_an_outer_replay_permit_cannot_cover_a_restore_write(tmp_path,
+                                                             monkeypatch):
+    """The over-authorization `#9210` names: a method-wide replay permit.
+
+    `#9124`'s shape opens `_replay_write_scope()` around the WHOLE engine, so
+    every statement inside it — the restore legs included — is authorized by a
+    contract that is false for the restore. This test opens exactly that
+    permit around the rebuild and requires the restore legs to be unaffected:
+    the inner declaration shadows the outer one.
+
+    WHY IT CANNOT PASS VACUOUSLY: the same run must observe the outer permit at
+    work on the fold (`reason == "replay"` on a statement that is NOT a
+    restore leg). Without that half, a `_replay_write_scope()` that never
+    reached the handle would let the test pass while proving nothing.
+
+    RED before #9210 with `reason == "replay"` on every restore leg — the false
+    contract in the observable — rather than with `None`.
+    """
+    sdk, events = _mk_sdk(tmp_path)
+    try:
+        _, proj, _ = _seed_prewipe_state(sdk, events)
+        seen = _record_authorizations(monkeypatch)
+
+        with _replay_write_scope():
+            proj.rebuild_all(str(events), confirm_destructive=True)
+
+        # The permit was REAL: it reached the handle on the fold.
+        permit_on_non_restore = [
+            cypher for cypher, reason in seen
+            if reason == "replay" and _leg_of(cypher) is None and _writes(cypher)]
+        assert permit_on_non_restore, (
+            "the outer replay permit never reached the handle, so this test "
+            "would be vacuous — it proves nothing about the restore; "
+            f"reasons seen={sorted({r for _c, r in seen if r})}")
+
+        _assert_every_leg_declares_itself(
+            seen, context="rebuild_all inside an outer _replay_write_scope()")
+    finally:
+        sdk.close()
+
+
+def test_the_restore_lane_does_not_claim_a_record_fold(tmp_path, monkeypatch):
+    """The mirror defect: a lane that authorizes MORE than it describes.
+
+    A restore declaration that covered the fold would be the same
+    over-authorization pointing the other way — the fold's contract ("the
+    record came FROM the journal") is true, and stating the restore reason over
+    it would make the restore lane answer a question it was not asked. Only
+    the statements classified above may observe it.
+    """
+    sdk, events = _mk_sdk(tmp_path)
+    try:
+        _, proj, _ = _seed_prewipe_state(sdk, events)
+        seen = _record_authorizations(monkeypatch)
+
+        proj.rebuild_all(str(events), confirm_destructive=True)
+
+        misattributed = [
+            _norm(cypher)[:120] for cypher, reason in seen
+            if isinstance(reason, str) and reason.startswith(RESTORE)
+            and _leg_of(cypher) is None and _writes(cypher)]
+        assert not misattributed, (
+            "the pre-wipe restore lane was in force over a write that is not a "
+            f"snapshot restore (#9210): {misattributed}")
+    finally:
+        sdk.close()
+
+
+@pytest.mark.parametrize("leg", sorted(_LEGS))
+def test_each_leg_has_its_own_reason(leg):
+    """The reason names the LEG, not the class: "which writes are authorized by
+    replay" is only answerable if each declaration says what it is."""
+    reason, _fragment = _LEGS[leg]
+    assert reason.startswith(f"{RESTORE}: "), reason
+    assert len(reason) > len(f"{RESTORE}: ") + 5, reason
+
+
+def test_the_lane_constant_matches_the_pinned_literal():
+    """The other half of the pin: the module's constant must spell the lane the
+    tests above pinned, so neither can be renamed past the other.
+
+    This is the ONE test here that reaches for the symbol the fix adds; every
+    behavioural test above is written against the literal, which is why they
+    go red on the OBSERVED AUTHORIZATION (a `None`, and a `"replay"`) on the
+    pre-fix tree rather than on an ImportError.
+    """
+    from tortoise.projection import _PREWIPE_RESTORE_LANE
+
+    assert _PREWIPE_RESTORE_LANE == RESTORE

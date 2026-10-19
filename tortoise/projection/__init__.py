@@ -3264,6 +3264,17 @@ def _journal_safe_params(params, cypher=None):
 #     — including what those properties do NOT claim (the epoch value rides the
 #     record as each Point's `ep_dirty_at`, and the epoch is an ordering BOUND
 #     a reset inverts for a while, `#5166`).
+#   * `_prewipe_restore_write_scope(...)` — the PRE-WIPE RESTORE lane: the
+#     writes that put back, verbatim, state CAPTURED FROM THIS GRAPH
+#     immediately before its wipe (`:Batch` + `batch_id`, `:Session` +
+#     `CONTAINS`, the onboarding state machine, `:TeamMeta`, the config
+#     registry, the `:GraphEventMeta` watermark). Every one of these classes
+#     rides NO journal record — which is exactly why the replay lane's
+#     contract ("this content came FROM the record") is FALSE for them, and
+#     why `rebuild_all` may not hand them the replay permit (#9210: one
+#     method-wide permit made every future addition to that engine inherit a
+#     claim that was never true of the restore). See the obligation it states
+#     at `_prewipe_restore_write_scope`.
 #   * `onboarding.metadata` (`tortoise/onboarding/state.py`, #9121) — the
 #     onboarding FLOW metadata (`:OnboardingState`, `:OnboardingStep`, the
 #     `COMPLETED_STEP` edges) is graph-resident org-level metadata, not a
@@ -3357,6 +3368,60 @@ def _live_write_scope(reason: str = "live-door"):
 def _replay_write_scope():
     """The replay engines' scope: the record came FROM the journal."""
     return _cache_write_authorized("replay")
+
+
+#: The reason prefix every pre-wipe restore write carries. Pinned as a
+#: literal because a test reads it back AT THE WRITE HANDLE (`#9210`): a lane
+#: that renames itself silently is a lane the next reader cannot find.
+_PREWIPE_RESTORE_LANE = "pre-wipe-restore"
+
+
+def _prewipe_restore_write_scope(reason: str):
+    """The PRE-WIPE RESTORE lane: state copied from THIS graph, not replayed.
+
+    `rebuild_all` does two different things under one method body. The FOLD
+    pass projects records that came from the journal — `_replay_write_scope`
+    states the truth for it. But the same engine also puts back, verbatim,
+    state it CAPTURED FROM THE GRAPH THAT IS ABOUT TO BE DESTROYED (the `#548`
+    snapshot, and its durable `#2943` sidecar): `:Batch` markers and
+    `Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
+    `:OnboardingState` machine, the `:TeamMeta` first-org marker, the `#2814`
+    config registry, and the `:GraphEventMeta` watermark.
+
+    **None of those writes is a projection of a journal record** — the classes
+    ride no record at all (`#5353`, `#3947`, `#4641`, `#990`, `#2814`, `#4653`
+    each say so at their writer), and the restore re-establishes them from the
+    pre-wipe capture instead. Handing them the replay permit would authorize
+    them under a contract that is FALSE for them, which is what `#9210`
+    removes: the restore is now a NAMED declaration, so "which writes are
+    authorized by replay" stays answerable, and a future addition to that
+    engine has to choose a lane instead of inheriting one.
+
+    What it claims, and what it does NOT:
+
+    * the content came from THIS GRAPH's own pre-wipe capture, not from the
+      record — so it is recoverable only through that carrier (the in-memory
+      snapshot, or the durable sidecar beside the event log), never by
+      replaying the journal;
+    * it is **not** a permit for a record fold: a write a journal record could
+      describe belongs on `_live_write_scope` (append first, then fold) or on
+      `_replay_write_scope` (the record came from the journal). `#9068` is the
+      shape this must never become — a declaration that blesses an
+      unjournalled cache write of RECOVERABLE state; the classes here are
+      disclosed as captured-and-restored, not as journal-derived;
+    * it does not make those classes durable. The `#4641` onboarding fallback
+      gap (`tortoise/backup.py`'s JSONL path) and the `#4664` unrestored
+      `:GraphEvent` rows are unchanged by this lane; naming a gap is not
+      closing it.
+
+    NESTING is the property that makes it load-bearing under an over-broad
+    permit: the reason is a `ContextVar`, so an inner restore declaration
+    SHADOWS an outer `_replay_write_scope()` over the same statements. A
+    restore write therefore cannot be authorized as a replay even when the
+    caller wrapped the whole rebuild in one — pinned at the write handle by
+    `tests/test_9210_rebuild_declares_restore.py`.
+    """
+    return _cache_write_authorized(f"{_PREWIPE_RESTORE_LANE}: {reason}")
 
 
 def _graph_metadata_write_scope(reason: str = "graph-metadata"):
@@ -9471,6 +9536,19 @@ class FalkorProjection(
         if prior is None or self._replay_seq > prior:
             mints[key] = self._replay_seq
 
+    def _restore_write(self, cypher: str, *, params=None, reason: str):
+        """Issue ONE pre-wipe snapshot-restore write under its own declaration.
+
+        The declaration travels WITH the write (a required `reason`, never a
+        method-wide scope) so a restore leg cannot be added to `rebuild_all`
+        without stating what it is: a caller that reaches for `self.g.query`
+        here is not declaring anything, and the `#9210` test reads the reason
+        back at the handle. See `_prewipe_restore_write_scope` for the
+        contract (state captured from THIS graph, not a journal replay).
+        """
+        with _prewipe_restore_write_scope(reason):
+            return self.g.query(cypher, params=params)
+
     @_clears_replay_anchors
     @_fail_closed("rebuild_all")
     @tolerates_altered_numbers
@@ -11930,14 +12008,16 @@ class FalkorProjection(
                 _log_identity_skip("Batch", bid, "id (MERGE key)")
                 continue
             clean = {k: v for k, v in props.items() if k != "id"}
-            self.g.query(
+            self._restore_write(
                 "MERGE (b:Batch {id:$id}) SET b += $props",
                 params={"id": bid, "props": clean},
+                reason=":Batch markers (#990)",
             )
         for pid, bid in batch_point_links:
-            self.g.query(
+            self._restore_write(
                 "MATCH (p:Point {id:$pid}) SET p.batch_id = $bid",
                 params={"pid": pid, "bid": bid},
+                reason="Point.batch_id links (#990)",
             )
 
         # Pass 1b tail (#2943, #4305): re-apply the snapshot Point properties
@@ -12054,10 +12134,11 @@ class FalkorProjection(
                     clauses.append(set_embedding_clause("n", "$emb"))
                 params["emb"] = list(emb)
             try:
-                self.g.query(
+                self._restore_write(
                     "MATCH (n:Point {id:$pid}) " + restore_guard
                     + "SET " + ", ".join(clauses),
                     params=params,
+                    reason="Point derived properties (#4305)",
                 )
             except Exception as e:
                 # #4305 review P2: this runs AFTER the wipe, so a value the
@@ -12122,15 +12203,17 @@ class FalkorProjection(
                 _log_identity_skip("Session snapshot", sid, "id (MERGE key)")
                 continue
             clean = {k: v for k, v in props.items() if k != "id"}
-            self.g.query(
+            self._restore_write(
                 "MERGE (s:Session {id:$id}) SET s += $props",
                 params={"id": sid, "props": clean},
+                reason=":Session containers (#3947)",
             )
         for sid, pid in session_point_links:
-            self.g.query(
+            self._restore_write(
                 "MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
                 "MERGE (s)-[:CONTAINS]->(p)",
                 params={"sid": sid, "pid": pid},
+                reason=":Session CONTAINS links (#3947)",
             )
 
         # ── #4641: restore the onboarding state machine ─────────────────
@@ -12164,10 +12247,11 @@ class FalkorProjection(
                 continue
             clean = {k: v for k, v in props.items() if k != "org_id"}
             try:
-                self.g.query(
+                self._restore_write(
                     f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) "
                     "SET n += $props",
                     params={"oid": oid, "props": clean},
+                    reason="onboarding state machine (#4641)",
                 )
             except Exception as e:
                 onboarding_restore_failures += 1
@@ -12192,11 +12276,12 @@ class FalkorProjection(
             sid = props.get("org_subject_id")
             if isinstance(sid, str):
                 try:
-                    self.g.query(
+                    self._restore_write(
                         f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}), "
                         "(s:Subject {id:$sid}) "
                         f"MERGE (n)-[:{ONBOARDS_EDGE}]->(s)",
                         params={"oid": oid, "sid": sid},
+                        reason="onboarding onboards edge (#4641)",
                     )
                 except Exception as e:
                     onboarding_restore_failures += 1
@@ -12421,9 +12506,10 @@ class FalkorProjection(
         team_meta_missing = False
         for props in team_meta_snapshot:
             try:
-                self.g.query(
+                self._restore_write(
                     f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",
                     params={"props": props},
+                    reason=":TeamMeta first-org marker (#5353)",
                 )
             except Exception as e:
                 team_meta_restore_failures += 1
@@ -12556,12 +12642,13 @@ class FalkorProjection(
                 continue
             identity_prop = spec.identity_prop
             try:
-                self.g.query(
+                self._restore_write(
                     f"MERGE (n:{spec.label} "
                     f"{{{identity_prop}:$identity}}) SET n += $props",
                     params={"identity": identity,
                             "props": {k: v for k, v in props.items()
                                       if k != identity_prop}},
+                    reason=f"config registry {spec.label} (#2814)",
                 )
             except Exception as e:
                 config_restore_failures += 1
@@ -13476,8 +13563,10 @@ class FalkorProjection(
             # re-created after the wipe; (c) the file carried the mark.
             leftover_carry = (None if leftover is None else
                               _event_meta_last_seq(leftover.get("event_meta")))
-            restored = reestablish_watermark(
-                self, _event_meta_last_seq(event_meta_snapshot))
+            with _prewipe_restore_write_scope(
+                    ":GraphEventMeta watermark (#4653)"):
+                restored = reestablish_watermark(
+                    self, _event_meta_last_seq(event_meta_snapshot))
             if restored is None:
                 if leftover is not None:
                     logger.error(

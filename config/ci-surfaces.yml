@@ -3084,6 +3084,13 @@ surfaces:
   # post-restore marker verification, both in tortoise/projection/ (core
   # fallback), over the `#2789` guard's probe in tortoise/hosted_api.py.
   - test_rebuild_team_meta_marker_5353.py
+  # #9210: the SAME wipe+replay, read from the other side — every non-record
+  # snapshot-restore leg (`:Batch`, `:Session`, onboarding, `:TeamMeta`, the
+  # config registry, the `:GraphEventMeta` watermark) must observe its own
+  # named §17.1 declaration AT THE WRITE HANDLE, and must not inherit the
+  # replay lane even when the engine is wrapped in one. `tortoise/projection/`
+  # is the file it pins, so a projection change must run it.
+  - test_9210_rebuild_declares_restore.py
   - test_projection_embedded_socket_timeout.py  # #3350: embedded lane socket timeout + bounded retry (carve-out)
   - test_projection_lifecycle.py
   - test_projection_maxmemory_message.py  # #2981: a full-but-healthy DB is not corrupt — maxmemory write-refusal gets its own error, never the rebuild advice
@@ -6610,6 +6617,13 @@ durations:
   test_graph_delete_hygiene_report.py: 1.8
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
+  # #9210: added by a PR, so no CI reading exists yet (#3400 trap). MEASURED
+  # locally on a quiet box in the embedded lane: 25.2 s for the whole file (11
+  # tests, three of which run a real `rebuild_all`), of which ~15 s is the
+  # FIRST `create_point`'s one-time embedding-model load — the same artefact
+  # #9123 recorded for its own file. Declared ABOVE the quiet-box reading so a
+  # cold leg cannot under-pack it.
+  test_9210_rebuild_declares_restore.py: 30.0
   # #4492: added by a PR, so no CI reading exists yet (`--refresh-durations`
   # samples push-to-main runs only). Hermetic — no DB, no network, no PGlite
   # (the SQL is asserted separately by the PGlite suite, which does not run in
