@@ -508,6 +508,30 @@ def _isolate_process_env():
             os.environ[k] = v
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_record_env(monkeypatch):
+    """The record's ARMING env must come from a test, never from the shell.
+
+    `.env.example` documents arming the Postgres record with
+    ``TORTOISE_RECORD_DSN`` plus the tenant pair. A developer (or an ops host)
+    with that exported would have EVERY SDK/``EventAPI`` test in this suite arm
+    the record, and file rows from a pytest tmp-dir journal into that
+    deployment's real record — rows nothing can replay, because the journal
+    dies with the test. This is the same ``record != replay(journal)`` class the
+    #9231 guard file refuses at the seam, one layer up (#9231 review P2).
+
+    A test that WANTS the record armed re-arms it through ``monkeypatch``, as
+    the record tests already do — so this is a no-op for every correct test and
+    removes only the ambient precondition. CI is unaffected either way (no CI
+    job sets these); the hazard is local.
+    """
+    from tortoise import record_writer
+
+    for name in (record_writer.RECORD_DSN_ENV, record_writer.RECORD_ORG_ENV,
+                 record_writer.RECORD_GRAPH_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _fresh_capture_spool():
     """#3963: start every pytest SESSION with a fresh capture spool.

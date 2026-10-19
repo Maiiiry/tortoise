@@ -4239,6 +4239,27 @@ def tortoise_backfill_v25(dry_run: bool = True) -> dict:
 # {"error": message} on failure (via _safe — the repo-wide convention).
 
 
+def _scratch_event_log():
+    """A journal-less lane's SCRATCH log — never a journal, never files a row.
+
+    The miner appends to it and the directory is referenced by nothing after the
+    call, so a record row filed from it asserts entities no replay can ever
+    reproduce or heal (``record != replay(journal)``). ``durable = False`` is
+    the seam's own contract, read off the log by every door (#9231 review P1);
+    this helper exists so the decision has ONE tested home instead of an inline
+    marker a later edit can drop without reddening anything.
+    """
+    import os
+    import tempfile
+
+    from tortoise.log import EventLog
+
+    log = EventLog(os.path.join(
+        tempfile.mkdtemp(prefix="tortoise_mcp_mine_"), "events.jsonl"))
+    log.durable = False
+    return log
+
+
 def tortoise_mine_conversations(transcript: str | None = None,
                                 corpus_dir: str | None = None,
                                 source_id: str | None = None,
@@ -4267,20 +4288,10 @@ def tortoise_mine_conversations(transcript: str | None = None,
                          "(or corpus_dir= for a batch)"}
     try:
         from tortoise.api import EventAPI  # noqa: I001
-        from tortoise.log import EventLog
         from tortoise.mining import mine_conversation
-        import tempfile, os  # noqa: E401
         log = sdk._get_event_log()
         if log is None:
-            log = EventLog(os.path.join(
-                tempfile.mkdtemp(prefix="tortoise_mcp_mine_"), "events.jsonl"))
-            # A SCRATCH buffer, never a journal: the miner appends to it and the
-            # directory is referenced by nothing after this call, so a record
-            # row filed from it can never be replayed or healed. Marked at the
-            # construction site because the seam reads `durable` off the log
-            # (#9231 review P1) — the sdk returned None, i.e. this lane is
-            # journal-less by design.
-            log.durable = False
+            log = _scratch_event_log()
         api = EventAPI(log, initiated_by="extractor", agent_id="mcp",
                        projection=sdk._get_proj())
     except Exception as exc:

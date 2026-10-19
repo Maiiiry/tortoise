@@ -326,6 +326,13 @@ def _cmd_demo(args):
     with NamedTemporaryFile(suffix=".jsonl", mode="w+", delete=False) as tmp:
         tmp.close()
         log = EventLog(tmp.name)
+        # A SCRATCH buffer, and NOT a journal: this lane runs a MOCK extractor
+        # over the sample transcript and then UNLINKS the file, so a record row
+        # filed from it asserts Points that nothing can ever replay — and
+        # `demo`/`onboard` is the FIRST thing a new user runs. Marked at the
+        # construction site because the seam reads `durable` off the log
+        # (#9231 review P1).
+        log.durable = False
         api = EventAPI(log, initiated_by="extractor", agent_id="mock@0")
         MockExtractor().run(text, transcript.name, api)
         events = log.read_all()

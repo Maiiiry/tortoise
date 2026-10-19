@@ -281,6 +281,32 @@ def live_door_defers_the_position() -> list[str]:
     return problems
 
 
+def _record_seam_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """Local names bound to the record module, and names that ARE `write_records`.
+
+    A door need not spell `record_writer.write_records(...)`. It can
+    `from .record_writer import write_records` or alias the module
+    (`from . import record_writer as rw`), and a check that only matches the
+    attribute spelling lets that door through — the same false PASS this rule
+    exists to close (#9231 review P2).
+    """
+    modules: set[str] = set()
+    functions: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                head = alias.name.split(".")[-1]
+                if head in _RECORD_STEMS:
+                    modules.add(alias.asname or head)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in _RECORD_STEMS:
+                    modules.add(alias.asname or alias.name)
+                if alias.name == "write_records":
+                    functions.add(alias.asname or alias.name)
+    return modules, functions
+
+
 def production_callers_defer_the_position() -> list[str]:
     """EVERY production call to the raw `write_records` seam must pass
     `position=False` as a LITERAL.
@@ -306,13 +332,23 @@ def production_callers_defer_the_position() -> list[str]:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue  # `find_production_callers` already reports this
+        # Hoisted out of the node walk: the alias sets are per-MODULE, and
+        # recomputing them inside the walk made this quadratic in call nodes
+        # (measured: the gate utility went from ~1 s to a >300 s pytest
+        # timeout, #9231 review P2 follow-up).
+        modules, functions = _record_seam_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if not (isinstance(func, ast.Attribute) and func.attr == "write_records"
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id in _RECORD_STEMS):
+            through_module = (isinstance(func, ast.Attribute)
+                              and func.attr == "write_records"
+                              and isinstance(func.value, ast.Name)
+                              and (func.value.id in _RECORD_STEMS
+                                   or func.value.id in modules))
+            bare_import = (isinstance(func, ast.Name)
+                           and func.id in functions)
+            if not (through_module or bare_import):
                 continue
             bound = {kw.arg: kw.value for kw in node.keywords if kw.arg}
             value = bound.get("position")
@@ -336,9 +372,18 @@ def check() -> tuple[int, dict[str, object]]:
     declared_gaps: list[dict[str, str]] = []
     for layer, tables in LAYERS.items():
         for table in tables:
-            if writers.get(table):
-                continue
             deferral = DECLARED_GAPS.get(table)
+            if writers.get(table):
+                if deferral:
+                    # STALE exemption: the table HAS a writer, so the deferral
+                    # is no longer true and must be removed. Left unchecked it
+                    # is a permanent licence to pass a future regression in
+                    # this table (#9231 review P2).
+                    gaps.append(
+                        f"{layer} layer: {table} is DECLARED as a gap but HAS "
+                        "a writer — remove the stale DECLARED_GAPS entry"
+                    )
+                continue
             if deferral:
                 declared_gaps.append(
                     {"layer": layer, "table": table, "deferral": deferral})

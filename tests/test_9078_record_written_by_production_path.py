@@ -53,6 +53,7 @@ import importlib.util
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -446,6 +447,114 @@ def test_the_seam_writes_nothing_from_a_scratch_buffer(monkeypatch):
             {"type": "PointAdded", "id": "p1"}, durable=False) is None
     after = dict(monitoring.record_write_failure_counts())
     assert after.get("no_durable_journal", 0) > before.get("no_durable_journal", 0), after
+    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
+
+
+def test_the_declared_gap_set_is_exact(wiring):
+    """A declared gap is an EXEMPTION — so the exempted set must be pinned.
+
+    `DECLARED_GAPS` turns "this layer has no writer" from a red gate into a
+    green one. Without an assertion on the SET, any table can be exempted and
+    the gate reports WIRED for a layer nothing writes (#9231 review P2): the
+    mechanism that fixed the layer-1 report is also a general-purpose silencer
+    for the next unwritten table. Each entry must also name its owning issue.
+    """
+    _, _, report = wiring
+    assert {gap["table"] for gap in report["declared_gaps"]} == {"journal_event"}, (
+        "the exempted set changed — a table was declared as a gap (or a stale "
+        "entry was left behind): " + repr(report["declared_gaps"])
+    )
+    for gap in report["declared_gaps"]:
+        assert "9190" in gap["deferral"], gap
+
+
+def test_the_position_rule_fires_on_every_spelling_of_a_new_door(
+        tmp_path, monkeypatch):
+    """A fourth door is refused however it spells the seam (#9231 review P2).
+
+    Asserting `position_problems == []` on the real tree proves the rule is
+    SATISFIED — never that it FIRES: mutating the function to `return []` left
+    that assertion green. Three spellings are fed through the real checker,
+    including `from .record_writer import write_records` and the aliased
+    module, which bypassed the first version of this check.
+    """
+    import tools.record_wiring_check as check
+
+    pkg = tmp_path / "tortoise"
+    pkg.mkdir()
+    (pkg / "door_attr.py").write_text(
+        "from . import record_writer\n"
+        "def f(r):\n"
+        "    return record_writer.write_records([r], org_id='o', graph_id='g')\n",
+        encoding="utf-8")
+    (pkg / "door_alias.py").write_text(
+        "from . import record_writer as rw\n"
+        "def f(r):\n"
+        "    return rw.write_records([r], org_id='o', graph_id='g')\n",
+        encoding="utf-8")
+    (pkg / "door_bare.py").write_text(
+        "from .record_writer import write_records\n"
+        "def f(r):\n"
+        "    return write_records([r], org_id='o', graph_id='g')\n",
+        encoding="utf-8")
+    (pkg / "door_ok.py").write_text(
+        "from . import record_writer\n"
+        "def f(r):\n"
+        "    return record_writer.write_records([r], org_id='o', graph_id='g',"
+        " position=False)\n",
+        encoding="utf-8")
+    monkeypatch.setattr(check, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(check, "PACKAGE", pkg)
+
+    problems = check.production_callers_defer_the_position()
+    flagged = sorted({problem.split(":", 1)[0] for problem in problems})
+    assert flagged == ["tortoise/door_alias.py", "tortoise/door_attr.py",
+                       "tortoise/door_bare.py"], problems
+    assert not any("door_ok.py" in problem for problem in problems), problems
+
+
+def test_the_scratch_helper_is_never_durable(monkeypatch):
+    """The MCP lane's scratch log declares itself, and the seam refuses it.
+
+    The marker on this construction site is what the first fix added; deleting
+    it reddened nothing, because no test exercised the site (#9231 review P2).
+    """
+    from tortoise.mcp_server import _scratch_event_log
+
+    log = _scratch_event_log()
+    assert log.durable is False
+    monkeypatch.setenv(record_writer.RECORD_DSN_ENV,
+                       "postgresql://record:record@127.0.0.1:1/record")
+    monkeypatch.setattr(record_writer, "_default_connect", lambda dsn: pytest.fail(
+        "the MCP mining lane filed a row from its scratch journal"))
+    before = dict(monitoring.record_write_failure_counts())
+    assert record_writer.write_live_record(
+        {"type": "PointAdded", "id": "p1"},
+        durable=log.durable) is None
+    after = dict(monitoring.record_write_failure_counts())
+    assert after.get("no_durable_journal", 0) > before.get(
+        "no_durable_journal", 0), after
+
+
+def test_the_demo_lane_never_files_a_row(monkeypatch):
+    """`tortoise demo` writes through the REAL doors, then unlinks its journal.
+
+    A mock extractor over the sample transcript: the Events reach `EventAPI._emit`
+    (so, pre-fix, the record) while `NamedTemporaryFile(delete=False)` is
+    UNLINKED immediately after. Armed, that filed 14 synthetic Points nothing
+    could replay, on the first command a new user runs (#9231 review P1).
+    """
+    from tortoise.__main__ import _cmd_demo
+
+    monkeypatch.setenv(record_writer.RECORD_DSN_ENV,
+                       "postgresql://record:record@127.0.0.1:1/record")
+    monkeypatch.setattr(record_writer, "_default_connect", lambda dsn: pytest.fail(
+        "`tortoise demo` filed record rows from a journal it then unlinked"))
+    before = dict(monitoring.record_write_failure_counts())
+    _cmd_demo(types.SimpleNamespace())
+    after = dict(monitoring.record_write_failure_counts())
+    assert after.get("no_durable_journal", 0) > before.get(
+        "no_durable_journal", 0), after
     assert after.get("write_failed", 0) == before.get("write_failed", 0), after
 
 
