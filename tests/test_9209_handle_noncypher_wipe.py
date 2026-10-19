@@ -24,10 +24,11 @@ Coverage map:
   (b) the §17.1 declaration applies — a journal-backed projection refuses an
       undeclared wipe and admits the sanctioned ``_replay_write_scope()`` one;
   (c) neither refusal can be defeated by the command's SPELLING (lowercase), its
-      ENCODING (bytes), its ARGUMENT SHAPE (the combined `"GRAPH.DELETE <name>"`
-      form and leading/trailing whitespace, which redis-py's packer splits into
-      separate arguments before sending), or by naming a graph OTHER than the
-      handle's own;
+      ENCODING (bytes, and ``memoryview`` — which the packer never splits, so
+      the buffer IS the command name), its ARGUMENT SHAPE (the combined
+      `"GRAPH.DELETE <name>"` form and leading/trailing whitespace, which
+      redis-py's packer splits into separate arguments before sending), or by
+      naming a graph OTHER than the handle's own;
   (d) the legitimate paths are unchanged: a test-named graph, the embedded
       backend, an ordinary ``GRAPH.QUERY``, and ``GRAPH.COPY`` (documented as
       NOT this class — it mints a new key and destroys nothing);
@@ -224,6 +225,26 @@ def test_whitespace_and_combined_argument_forms_are_refused():
         assert fake.calls == [], f"{args!r} was transmitted despite the refusal"
 
 
+def test_a_memoryview_command_head_is_classified_like_a_bytes_one():
+    """The packer never splits a ``memoryview``, so it IS the command name.
+
+    ``redis.connection.Encoder.encode`` passes a ``memoryview`` through
+    unchanged and ``PythonRespSerializer.pack``'s bytes branch tests
+    ``b" " in args[0]`` — True only for bytes-like sequences compared as
+    bytes, never for a ``memoryview`` (whose ``in`` compares ints). So the
+    buffer reaches the server as the command name, byte-identical to the
+    refused two-argument form (MEASURED on the pinned redis 7.4.1), and a
+    decoder that handled only ``bytes``/``bytearray`` skipped the guard.
+    """
+    for head in (memoryview(b"GRAPH.DELETE"),
+                 memoryview(b"graph.delete"),
+                 memoryview(bytearray(b"GRAPH.DELETE"))):
+        guarded, fake = _handle(graph_name="prod_tortoise")
+        with pytest.raises(RuntimeError, match="non-test graph"):
+            guarded.execute_command(head, "prod_tortoise")
+        assert fake.calls == [], f"{head!r} was transmitted despite the refusal"
+
+
 def test_a_combined_form_naming_a_disposable_graph_is_admitted():
     """Control: the packer-shaped split is a normalisation, not a ban.
 
@@ -241,12 +262,30 @@ def test_an_unreadable_target_is_refused_rather_than_assumed_to_be_ours():
     Falling back to the handle's own graph name would apply the name rule to a
     graph the command is not about — and a test-named handle would then pass it
     while the wipe destroyed the graph the command actually named. That is the
-    lax half of the target rule, so an unreadable target refuses instead.
+    lax half of the target rule, so an undecodable target refuses instead.
+
+    An ``int`` is the live case: ``Encoder.encode`` turns it into a graph name
+    on the wire, so it is transmissible but not a name this guard can compare
+    against the prefix rule. (``memoryview`` used to be here too; it is now
+    DECODED by ``_as_text`` and refuses through the name rule — see
+    ``test_a_memoryview_command_head_is_classified_like_a_bytes_one``.)
     """
     guarded, fake = _handle(graph_name="test_own")
     with pytest.raises(RuntimeError, match="cannot be applied"):
+        guarded.execute_command("GRAPH.DELETE", 12345)
+    assert fake.calls == []
+
+
+def test_a_memoryview_target_is_checked_against_its_decoded_name():
+    """Decoding the target closes the fallback the old arm relied on."""
+    guarded, fake = _handle(graph_name="test_own")
+    with pytest.raises(RuntimeError, match="non-test graph 'prod_tortoise'"):
         guarded.execute_command("GRAPH.DELETE", memoryview(b"prod_tortoise"))
     assert fake.calls == []
+
+    ok, fake2 = _handle(graph_name="prod_own")
+    assert ok.execute_command("GRAPH.DELETE", memoryview(b"test_target")) == "OK"
+    assert [c[0] for c in fake2.calls] == ["execute_command"]
 
 
 def test_the_checked_name_is_the_target_not_the_handles_own():

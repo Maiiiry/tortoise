@@ -1210,13 +1210,21 @@ def tolerates_altered_numbers(fn):
 
 
 def _as_text(value):
-    """Decode a bytes command/payload so the scan can see its text, else return it.
+    """Decode a bytes-like command/payload so the scan can see its text, else return it.
 
     redis-py accepts the BYTES form of ``execute_command``, and the scanner
     reports ``None`` for anything that is not ``str`` — so without this a bytes
     payload would pass the guard untouched (#3595 review).
+
+    ``memoryview`` is decoded for the same reason, and it is not a corner case:
+    ``redis.connection.Encoder.encode`` passes a ``memoryview`` through
+    UNCHANGED and ``PythonRespSerializer.pack`` never splits it, so
+    ``execute_command(memoryview(b"GRAPH.DELETE"), <graph>)`` reaches the
+    server as a real ``GRAPH.DELETE`` — MEASURED on the pinned redis 7.4.1, the
+    bytes are identical to the refused two-argument form. Leaving it undecoded
+    left the whole-graph wipe guard skipped (#9209 review, P0).
     """
-    if isinstance(value, (bytes, bytearray)):
+    if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).decode("utf-8", "replace")
     return value
 

@@ -2688,11 +2688,14 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 #        SCOPE OF L2, stated exactly because the difference is a live hole:
 #        the ``_is_bulk_wipe`` classifier runs in ``_GuardedGraph.query`` and
 #        ``FalkorProjection.query`` ONLY. The wrapper's other query verbs
-#        (``ro_query``, ``_query``, ``profile``, ``explain``,
-#        ``execute_command``) are overridden and carry the #3595 ``=~``
-#        operator guard, but NOT the bulk-wipe check — see KNOWN GAPS. (The
-#        name check itself is not confined to a ``query`` verb: the L1 lane
-#        calls ``_assert_test_graph`` directly from ``rebuild_all`` and
+#        (``ro_query``, ``_query``, ``profile``, ``explain``) are overridden
+#        and carry the #3595 ``=~`` operator guard, but NOT the bulk-wipe
+#        check — see KNOWN GAPS. (Since #9209 the wrapper's ``execute_command``
+#        DOES carry the bulk-wipe check, but for one command whose effect is
+#        the whole graph rather than a statement in it — ``GRAPH.DELETE``; it
+#        is not the classifier, and every other raw command still bypasses L2.
+#        The name check itself is not confined to a ``query`` verb either: the
+#        L1 lane calls ``_assert_test_graph`` directly from ``rebuild_all`` and
 #        ``_wipe_all_nodes``, which is why the token, not L2, is the gate
 #        there.)
 #
@@ -3365,13 +3368,6 @@ class DirectCacheWriteRefused(RuntimeError):
     """
 
 
-#: The graph-name prefixes L2 admits on a SERVER backend. ONE tuple and ONE
-#: predicate (`_assert_disposable_server_graph`), shared by the two surfaces
-#: that can destroy a whole graph: the Cypher bulk wipe and the non-Cypher
-#: GRAPH.DELETE (#9209) — so a change to the rule cannot be applied to one and
-#: forgotten on the other.
-_DISPOSABLE_GRAPH_PREFIXES: tuple[str, ...] = ("test_", "tortoise_test")
-
 #: The raw command whose effect is the whole graph, not a statement in it.
 #: `GRAPH.COPY` is deliberately absent: it mints a NEW key, and an existing
 #: destination is REFUSED by the engine rather than overwritten — MEASURED on
@@ -3519,6 +3515,16 @@ def _assert_disposable_server_graph(name: str, *, embedded: bool,
     "delete a production graph from a test-named handle" — the lax half of the
     same hole, which is the half that matters.
 
+    The admitted prefixes are an ANONYMOUS local literal, deliberately. A NAMED
+    prefix constant on this surface is a vocabulary copy the drift gate
+    enumerates (``tests/_embedded.py::_DIVERGENCE_REGISTER`` +
+    ``tests/test_graph_name_ownership.py``), and registering one requires it to
+    live in ``tests/_embedded.py`` — a product module cannot import that. Named
+    copies are what that gate exists to catch (a restated copy is left BROAD
+    when the canonical set is NARROWED, i.e. fail-open on an irreversible
+    GRAPH.DELETE), and an anonymous literal is explicitly out of its scope. The
+    dedup this change is for is the PREDICATE, and that is shared.
+
     ``embedded`` exempts the NAME check only: an embedded DB opened with
     ``path`` is a persistent user database, and the name rule has never applied
     to it (``_assert_test_graph``'s long-standing exemption). That is a
@@ -3527,7 +3533,7 @@ def _assert_disposable_server_graph(name: str, *, embedded: bool,
     """
     if embedded:
         return
-    if not str(name).startswith(_DISPOSABLE_GRAPH_PREFIXES):
+    if not str(name).startswith(("test_", "tortoise_test")):
         msg = (
             f"Graph guard: operation blocked on non-test graph '{name}'. "
             f"{reason} — destructive bulk ops require a graph name starting "
@@ -3565,8 +3571,10 @@ class _GuardedGraph:
     defence in depth this wrapper also overrides every query entry point itself
     (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``,
     ``execute_command``), so it does not depend on the inner handle's class to
-    refuse the ``=~`` operator. NOTE the override is NOT uniform: only
-    ``query`` applies the bulk-wipe check (L2) as well. The five query verbs
+    refuse the ``=~`` operator. NOTE the override is NOT uniform: ``query``
+    applies the bulk-wipe check (L2), and ``delete``/``execute_command`` apply
+    it for ``GRAPH.DELETE`` — the one non-Cypher command whose effect is the
+    whole graph (#9209). The five query verbs
     (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``) carry ALL
     THREE pre-dispatch refusals — the #3595 operator guard, the #7174
     numeric-domain guard on their ``params``, and (since #8479) that same domain
