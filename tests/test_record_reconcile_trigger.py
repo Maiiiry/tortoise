@@ -6,7 +6,7 @@ only), so §17.2's *"divergence must be OBSERVED, not merely recoverable"* had a
 mechanism and no observer. ``tortoise/record_reconcile.py`` is the observer and
 ``python -m tortoise record-reconcile`` is its caller.
 
-Five things are pinned here, and each is a way the observer could be worthless:
+Six things are pinned here, and each is a way the observer could be worthless:
 
 1. **A clean projection reconciles CLEAN** — ``divergent == 0``,
    ``field_mismatches == 0``, ``missing_in_cache == 0``. Uses the shipped
@@ -32,10 +32,15 @@ Five things are pinned here, and each is a way the observer could be worthless:
 5. **A PARTIAL declaration's unwritten keys are RESIDENCY, not divergence**
    (§17.3) — counted as ``not_hot``, never as ``missing_in_cache`` — while a
    ``complete`` declaration's missing key still counts as divergence.
-6. **The trigger exists in production** — an AST import-graph pin, so the
-   observer cannot drift back to being reachable only from tests and probes —
-   and its documented exit-code contract, including the usage case argparse
-   answers with ``2``, is pinned rather than narrated.
+6. **The trigger exists in production, AND IT COUNTED SOMETHING** — an AST
+   pin that ``_cmd_record_reconcile`` CALLS the composition (not merely imports
+   it), and a live drive of ``main(["record-reconcile", …])`` over a real cache
+   graph whose verdict the verb has to REPORT: a divergent cache must exit
+   ``3`` with the counts printed. An import-only pin is satisfied by a verb
+   whose body is ``return EXIT_CLEAN`` — a check with a caller that observes
+   nothing is #9189's own defect, one level up. The documented exit-code
+   contract, including the usage case argparse answers with ``2``, is pinned
+   rather than narrated.
 
 ⚠️ This file lives in BOTH the `api`/`core` surfaces and `carve_out:`: item 3
 is embedded-only (§17.1's journal arm exists only on the embedded lane), and a
@@ -53,6 +58,8 @@ import ast
 import contextlib
 import functools
 import os
+import sys
+import types
 import uuid
 import warnings
 from pathlib import Path
@@ -500,7 +507,10 @@ def test_the_reconciler_has_a_non_test_non_docs_caller():
     assert importers, (
         f"no production importer of {_TRIGGER_MODULE} — the observer is again "
         f"reachable only from tests and evidence probes")
-    assert all(not r.startswith(("tests/", "docs/")) for r in importers)
+    # (`tests/` and `docs/` are PRUNED from the walk in `_production_importers`,
+    # so an `all(not r.startswith(("tests/", "docs/")))` here could never fail.
+    # The discriminating assertion is the non-empty one above; the CALL-level
+    # pin is `test_the_verb_CALLS_the_composition_not_merely_imports_it`.)
 
 
 def test_the_trigger_path_is_the_cli_verb():
@@ -518,6 +528,63 @@ def test_the_cli_verb_refuses_without_a_record_dsn(monkeypatch, capsys):
 
     assert rc == rr.EXIT_UNAVAILABLE
     assert "UNKNOWN, not zero" in capsys.readouterr().err
+
+
+def test_a_malformed_record_dsn_is_a_MISCONFIGURATION_not_an_outage(capsys):
+    """The record module OWNS the arming surface; this verb must not re-spell it.
+
+    `tortoise/record_writer.record_dsn` exists to draw exactly this
+    distinction: a value outside `postgresql://`/`postgres://` is a
+    *misconfiguration*, never "the record is unreadable" (an outage). Reading
+    the DSN out of the environment here instead (`args.record_dsn or
+    os.environ.get("TORTOISE_RECORD_DSN")`) dropped that check, so the operator
+    was told an outage had happened and the value was handed to the driver.
+
+    Pre-fix this fails: the message is either `psycopg2 is not installed` or
+    `record is unreadable`, never the fingerprint-only misconfiguration text.
+    """
+    from tortoise import __main__ as cli
+
+    rc = cli.main(["record-reconcile", "--db", "docker://:x@localhost:6379/g",
+                   "--record-dsn", "mysql://user:pw@db.example/record",
+                   "--org", "o", "--graph", "g"])
+    err = capsys.readouterr().err
+
+    assert rc == rr.EXIT_UNAVAILABLE, err
+    assert "must start with postgresql:// or postgres://" in err, err
+    assert "misconfiguration, not an unarmed record" in err, err
+    assert "record is unreadable" not in err, err
+    # Secret hygiene: `record_dsn` fingerprints the value, so the DSN itself
+    # must never reach the operator's terminal.
+    assert "mysql://" not in err, err
+    assert "pw@db.example" not in err, err
+
+
+def test_the_verb_reads_the_record_env_name_the_writer_declares(
+        monkeypatch, capsys):
+    """A rename of `record_writer.RECORD_DSN_ENV` must not silently disarm.
+
+    The verb's own literal `os.environ.get("TORTOISE_RECORD_DSN")` was a SECOND
+    spelling of the resolution, so renaming the constant left `RecordWriter`
+    armed and this verb permanently unarmed (exit 2 forever, no verdict).
+    """
+    from tortoise import __main__ as cli
+    from tortoise import record_writer
+
+    monkeypatch.setattr(record_writer, "RECORD_DSN_ENV",
+                        "TORTOISE_RENAMED_RECORD_DSN")
+    monkeypatch.delenv("TORTOISE_RECORD_DSN", raising=False)
+    monkeypatch.setenv("TORTOISE_RENAMED_RECORD_DSN", "mysql://renamed/record")
+
+    rc = cli.main(["record-reconcile", "--db", "docker://:x@localhost:6379/g",
+                   "--org", "o", "--graph", "g"])
+    err = capsys.readouterr().err
+
+    assert rc == rr.EXIT_UNAVAILABLE, err
+    # The renamed key IS the arming surface: it was read (and refused as
+    # malformed), rather than reported as "no record DSN".
+    assert "must start with postgresql://" in err, err
+    assert "no record DSN" not in err, err
 
 
 def test_a_usage_error_exits_2_not_1(capsys):
@@ -538,3 +605,146 @@ def test_a_usage_error_exits_2_not_1(capsys):
     assert excinfo.value.code == 2
     _cmd = cli._cmd_record_reconcile
     assert "``1`` is never returned" in (_cmd.__doc__ or "")
+
+
+# ── 6. the verb does not merely IMPORT the observer ───────────────────────
+#
+# The import-graph pins above answer "is there a production caller?" — and an
+# import is not a call. The mutation they cannot see is #9189's own defect one
+# level up: keep the `from tortoise.record_reconcile import (…)` line and the
+# DSN guard, replace the read/compare body with `return EXIT_CLEAN`. The verb
+# then observes nothing, prints nothing, and reports **exit 0 = clean** to a
+# scheduler while every import-level pin stays green. Two pins close it: this
+# AST one (the composition must be CALLED) and the live drive below (the
+# verdict must reach the exit code).
+
+#: The names the verb's body must CALL. `exit_code_for` is in the set on
+#: purpose: a constant returned from the verb is the mutation above.
+_VERB_MUST_CALL = frozenset({
+    "read_cache_view",
+    "read_record_view",
+    "reconcile_record_and_cache",
+    "record_key_map",
+    "log_result",
+    "exit_code_for",
+})
+
+
+def _called_names(func_node: ast.AST) -> set[str]:
+    """Every name invoked by a ``Call`` inside ``func_node`` (bare or dotted)."""
+    called: set[str] = set()
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            called.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            called.add(node.func.attr)
+    return called
+
+
+def test_the_verb_CALLS_the_composition_not_merely_imports_it():
+    """An import satisfies reachability, not observation."""
+    tree = ast.parse((_REPO_ROOT / "tortoise" / "__main__.py").read_text(
+        encoding="utf-8"))
+    verb = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_cmd_record_reconcile"),
+        None)
+    assert verb is not None, (
+        "`_cmd_record_reconcile` is gone — the trigger has no CLI home")
+
+    missing = sorted(_VERB_MUST_CALL - _called_names(verb))
+    assert not missing, (
+        f"`_cmd_record_reconcile` never CALLS {missing}: it imports the "
+        f"observer and does not run it, so the verb would report a verdict it "
+        f"did not compute")
+
+
+class _FakeConn:
+    """Stands in for the record connection — the VERB owns closing it."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeProjection:
+    """A projection over a REAL cache graph, with a close() the verb must call."""
+
+    def __init__(self, graph) -> None:
+        self.g = graph
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _drive_the_verb(monkeypatch, graph, view):
+    """Run ``python -m tortoise record-reconcile`` over a REAL cache graph.
+
+    Only the two HANDLES are faked (the record connection and the projection's
+    ``from_uri``): the cache reader, the record key map, the comparison and the
+    verdict→exit-code mapping are the shipped ones, so what this asserts is
+    that the verb really composes them and really reports the result.
+    """
+    from tortoise import __main__ as cli
+    from tortoise.projection import FalkorProjection
+
+    conn = _FakeConn()
+    fake_psycopg2 = types.ModuleType("psycopg2")
+    fake_psycopg2.connect = lambda dsn, **kw: conn        # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg2", fake_psycopg2)
+    monkeypatch.setattr(
+        cp, "read_record_view",
+        lambda conn, *, org_id, graph_id: view, raising=True)
+
+    projection = _FakeProjection(graph)
+    monkeypatch.setattr(
+        FalkorProjection, "from_uri",
+        staticmethod(lambda uri, graph_name=None: projection))
+
+    rc = cli.main(["record-reconcile", "--db", "docker://:x@localhost:6379/g",
+                   "--record-dsn", "postgresql://fake/record",
+                   "--org", "o", "--graph", "g"])
+    return rc, conn, projection
+
+
+def test_the_cli_verb_COUNTS_a_divergent_cache(monkeypatch, cache_graph, capsys):
+    """The verdict the verb reports is the one it COMPUTED (exit 3 + the count).
+
+    Pre-fix this test fails if the body returns a constant: `return EXIT_CLEAN`
+    reports 0 over a cache holding a node the record does not have — a
+    permanently green observer with a caller, which is the defect #9189 exists
+    to close.
+    """
+    view = _record_view()
+    _project(view, cache_graph)
+    cache_graph.query("CREATE (:Point {id:'p-9189-cli-direct'})")
+
+    rc, conn, projection = _drive_the_verb(monkeypatch, cache_graph, view)
+    printed = capsys.readouterr()
+
+    assert rc == rr.EXIT_DIVERGENT, printed.out + printed.err
+    assert "extra_in_cache=1" in printed.out, printed.out
+    assert "verdict=divergent" in printed.out, printed.out
+    assert conn.closed and projection.closed, "the verb must close both handles"
+
+
+def test_the_cli_verb_reports_clean_only_when_it_compared(
+        monkeypatch, cache_graph, capsys):
+    """The positive control: a faithful cache exits 0 — with a nonzero denominator.
+
+    Pinned beside the divergent drive so `0` can only come from a comparison
+    that ran (the vacuity refusal makes an empty comparison exit 2, never 0).
+    """
+    view = _record_view()
+    _project(view, cache_graph)
+
+    rc, _, _ = _drive_the_verb(monkeypatch, cache_graph, view)
+    printed = capsys.readouterr()
+
+    assert rc == rr.EXIT_CLEAN, printed.out + printed.err
+    assert "0 divergent of 2 checked" in printed.out, printed.out

@@ -358,3 +358,117 @@ def test_the_s2_census_quote_matches_the_log():
         "docs/evidence/7950-capstone/README.md quotes census numbers that are "
         "not in s2-wiring-census.log — re-quote the block after re-measuring:\n"
         + "\n".join(missing))
+
+
+# --------------------------------------------------------------------------
+# #9189 review (the re-cut census): the log is a MEASUREMENT, and the pattern
+# must see every spelling a wired caller can use. Two ways the deciding
+# artifact could lie, both pinned here.
+# --------------------------------------------------------------------------
+
+_CENSUS_PROBE = (_REPO_ROOT / "docs" / "evidence" / "7950-capstone"
+                 / "probes" / "s2_wiring_census.py")
+
+
+def _load_census_probe():
+    """Load the S2 census probe by path (the directory is hyphenated)."""
+    spec = _ilu.spec_from_file_location("capstone_s2_wiring_census",
+                                       str(_CENSUS_PROBE))
+    assert spec and spec.loader
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CENSUS_MODULE = _load_census_probe()
+
+
+def test_the_census_pattern_sees_every_call_spelling(tmp_path):
+    """A wired `reconcile` must be COUNTED, however it is spelled.
+
+    The re-cut pattern's bare-call alternative carries a `(?<![\\w.])`
+    lookbehind, which rejects a dotted receiver — so without its own
+    alternative the MODULE-QUALIFIED spelling
+    (`reconciliation.reconcile(a, b)`, the natural one for a module-level
+    function imported as a module) reads as **0 production call sites** while
+    the reconciler IS wired. That is the stale-evidence failure this census
+    exists to prevent, reproduced inside the census. Pre-fix this test fails on
+    the first two cases.
+    """
+    source = "\n".join([
+        "from tortoise import reconciliation",
+        "reconciliation.reconcile(record_reader, cache_reader)",
+        "x = reconcile(record_reader, cache_reader)",
+        "from tortoise.reconciliation import (",
+        "    reconcile,",
+        ")",
+        "def reconcile(a, b):",          # a definition is NOT a call site
+        "self.reconcile(a, b)",          # nor is a method of the same name
+        "consistency.reconcile(a, b)",   # nor is another module's
+        # ...and PROSE inside a multi-line f-string is not a call site either
+        # (3.12 tokenizes it as FSTRING_START/MIDDLE/END, not one STRING).
+        "note = f\"\"\"",
+        "the reconciler is wired: reconciliation.reconcile(a, b)",
+        "and reconcile(a, b) is the bare spelling",
+        "\"\"\"",
+    ])
+    (tmp_path / "wired.py").write_text(source, encoding="utf-8")
+
+    hits = _CENSUS_MODULE.census(
+        [str(tmp_path)], _CENSUS_MODULE.TARGETS["reconciliation.reconcile"])
+    lines = [h.split(": ", 1)[1] for h in hits]
+
+    assert "reconciliation.reconcile(record_reader, cache_reader)" in lines
+    assert "x = reconcile(record_reader, cache_reader)" in lines
+    assert not any(ln.startswith("def reconcile") for ln in lines)
+    assert not any("self.reconcile(" in ln for ln in lines)
+    assert not any("consistency.reconcile(" in ln for ln in lines)
+    # A multi-line f-string's prose is not a call site. `_prose_lines` claims
+    # STRING *and* FSTRING spans; before that claim held, these two lines
+    # inflated the count.
+    assert not any("the reconciler is wired" in ln for ln in lines)
+    assert not any("is the bare spelling" in ln for ln in lines)
+
+
+def _production_section(text: str) -> list[str]:
+    """The census output ABOVE the test population (the production counts)."""
+    out: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("test population:"):
+            break
+        out.append(line)
+    return out
+
+
+def test_the_s2_census_log_is_a_LIVE_measurement(monkeypatch, capsys):
+    """S2's deciding artifact is re-MEASURED, not compared to itself.
+
+    `test_the_s2_census_quote_matches_the_log` pins the README to the log, and
+    both are committed text — so together they cannot detect the TREE moving
+    out from under the claim. That is what makes the log a stale flag rather
+    than a measurement. Here the committed probe is re-run over the production
+    population and the result is compared to the committed log: a new caller, a
+    removed caller, or a line move all redden this instead of silently
+    contradicting the artifact the S2 verdict rests on.
+
+    Only the PRODUCTION population is pinned. The log's `test population:`
+    counts are informational: they move whenever any test file mentions one of
+    these names, which is not a claim about whether the product is wired.
+    """
+    monkeypatch.chdir(_REPO_ROOT)
+    measured = _CENSUS_MODULE.census_all(_CENSUS_MODULE.PROD_DIRS,
+                                        _CENSUS_MODULE.TARGETS)
+    printed = [f"production population: {_CENSUS_MODULE.PROD_DIRS}/**/*.py", ""]
+    for name in _CENSUS_MODULE.TARGETS:
+        hits = measured[name]
+        printed.append(f"== {name}: {len(hits)} production call site(s) ==")
+        printed.extend(f"  {h}" for h in hits)
+        printed.append("")
+
+    committed = _S2_CENSUS_LOG.read_text(encoding="utf-8")
+    assert [ln for ln in printed if ln] == [
+        ln for ln in _production_section(committed) if ln], (
+        "s2-wiring-census.log no longer matches a live run of "
+        "docs/evidence/7950-capstone/probes/s2_wiring_census.py — re-run the "
+        "probe and re-cut the log (and anything quoting it):\n"
+        + "\n".join(printed))

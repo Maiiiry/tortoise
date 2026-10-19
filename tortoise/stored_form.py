@@ -64,13 +64,30 @@ faithful projection that can never go green (#9184). :data:`BOOLEAN_FORM_PROPS`
 the vector rule lives here: ONE spelling, shared with the check that reads it.
 It normalises BOTH directions over the DECLARED vocabulary, so ``'false'`` is
 ``False`` and garbage stays exact — a genuinely different marker is still a
-divergence. ⚠️ It deliberately does NOT change :func:`is_verbatim`, whose
-truthiness read decides what the WRITER stores; that half is #9184's.
+divergence.
+
+THE MARKER IS READ THROUGH THE SAME VOCABULARY BY THE CHECK
+-----------------------------------------------------------
+The boolean rule fixes the MARKER's own comparison, and that alone was not
+enough: the VECTOR rule reads the marker too, to decide whether the truth side
+may be narrowed. Read through ``bool(...)`` — the ``bool('false') is True`` trap
+— a record holding the falsy spelling claims verbatim, so a cache that
+legitimately stored the narrowed ``f32`` vector is reported a PERMANENT
+``field_mismatches``: #8615's symptom, reached through #9184's spelling.
+:func:`declares_verbatim` is the CHECK-side read — the marker through
+:func:`declared_boolean`, with the old truthiness read kept only as the fallback
+for a value OUTSIDE the declared vocabulary (where truthiness is the
+fail-closed direction). ⚠️ It deliberately does NOT change
+:func:`is_verbatim`, whose truthiness read decides what the WRITER stores; that
+half is #9184's. A record holding ``'false'`` therefore still has its vector
+written un-narrowed, and the exact-agreement branch decides it before the
+marker is consulted at all.
 
 THE SINGLE SPELLING
 ===================
-:data:`STORED_VECTOR_PROPS` / :func:`is_verbatim` / :func:`narrow_to_stored_width`
-are the one place the storage form is spelled. Three consumers read them:
+:data:`STORED_VECTOR_PROPS` / :func:`is_verbatim` / :func:`declares_verbatim` /
+:func:`narrow_to_stored_width` are the one place the storage form is spelled.
+Three consumers read them:
 
 * ``tortoise/cache_projection.py::node_statement`` — the WRITER, which emits
   ``n.embedding = vecf32($embedding)`` vs ``= $embedding`` from this rule;
@@ -91,6 +108,7 @@ __all__ = [
     "STORED_VECTOR_PROPS",
     "VERBATIM_MARKER",
     "declared_boolean",
+    "declares_verbatim",
     "is_verbatim",
     "narrow_to_stored_width",
 ]
@@ -163,8 +181,44 @@ def is_verbatim(*prop_maps: Mapping[str, object]) -> bool:
     ``OR`` of every side, and the fail-closed direction (see the module
     docstring): a marker anywhere means compare exactly. A missing key, ``None``
     and ``False`` all mean "the store narrows".
+
+    ⚠️ This is the WRITER's read (``node_statement`` chooses ``vecf32`` vs the
+    raw value from it), and its truthiness is #9184's remaining half: a record
+    holding the string ``'false'`` reads as verbatim HERE. The CHECK must not
+    inherit that — see :func:`declares_verbatim`.
     """
     return any(bool(m.get(VERBATIM_MARKER)) for m in prop_maps)
+
+
+def declares_verbatim(*prop_maps: Mapping[str, object]) -> bool:
+    """True when ANY of ``prop_maps`` DECLARES the verbatim storage form.
+
+    The CHECK-side read of the marker — the one that must not carry
+    ``bool('false')`` into the comparison (:data:`BOOLEAN_FORM_PROPS`'s reason,
+    one property over). Per side:
+
+    * a DECLARED spelling decides on its own: ``'false'``/``0``/``FALSE`` mean
+      "the store narrows", so the vector rule applies and a faithful ``f32``
+      cache compares equal — #8615's forgiveness reaches the falsy spelling;
+    * a value OUTSIDE the declared vocabulary falls back to the truthiness read
+      :func:`is_verbatim` uses, the fail-closed direction, because claiming
+      verbatim anywhere produces the STRICTER exact comparison;
+    * a missing key or ``None`` means "the store narrows", exactly as in
+      :func:`is_verbatim`: a non-verbatim point carries no marker at all, and
+      reading that absence as verbatim would report every narrowed vector as a
+      divergence.
+
+    ``OR`` of every side, for the reason the module docstring records: a marker
+    dropped on its own node must not let a narrowed vector hide.
+    """
+    for props in prop_maps:
+        value = props.get(VERBATIM_MARKER)
+        declared = declared_boolean(value)
+        if declared is True:
+            return True
+        if declared is None and bool(value):
+            return True
+    return False
 
 
 def narrow_to_stored_width(vector: Iterable[object]) -> list[float] | None:

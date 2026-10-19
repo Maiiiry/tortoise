@@ -5096,9 +5096,15 @@ carve_out:
 # binds a real journal to a fresh embedded projection (that arm does not exist
 # on the server lane), so without this row the file was collected-and-SKIPPED by
 # every full selection: a permanently green, permanently unexecuted gate, which
-# is the #4047 shape this list exists to close. Also in `api` + `core` above —
-# `core` is what makes `carve_out_run` true for a `record_reconcile.py`-only
-# diff, and `api` for the `__main__.py` verb that REPLACES the core fallback.
+# is the #4047 shape this list exists to close. Also in `api` + `core` above.
+# For an `__main__.py`-only diff the `api` entry is what carries the file (that
+# verb is an EXACT `api` SOURCE_PATTERN). A `record_reconcile.py`-only diff
+# selects `core` by fallback, and `carve_out_run` is true for it through the
+# OTHER core-owned carve-out files below — `carve_out_by_surface` files each
+# row under the FIRST surface `classify_test_file` returns (`api` here), so
+# this file's own `core` entry never reaches the carve-out map. Keep the `core`
+# entry for its `select()` role (the readers are core-owned), do not read it as
+# the carve-out trigger.
 # Mirrored in tests/_embedded.TEST_NO_REDIRECT_STEMS.
 - test_record_reconcile_trigger.py
 # #2814: authoritative-config durability across rebuild_all (the embedded

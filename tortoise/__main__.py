@@ -613,7 +613,13 @@ def _cmd_record_reconcile(args):
 
     Exit codes, because a scheduler's only signal is the code:
       ``0`` clean · ``3`` divergence OBSERVED · ``2`` the comparison could not
-      be made (no DSN, psycopg2 absent, an unreadable side, nothing compared).
+      be made (no DSN, a MALFORMED DSN, psycopg2 absent, an unreadable side,
+      nothing compared).
+
+    The DSN is resolved by :func:`tortoise.record_writer.record_dsn` — the
+    module that DECLARES the arming surface — so this verb cannot drift from
+    the writer's notion of "armed", and a non-Postgres value is reported as the
+    MISCONFIGURATION it is rather than as an unreadable record (an outage).
 
     ⚠️ ``2`` ALSO covers a USAGE error, and ``1`` is never returned here:
     argparse's own ``error()`` exits ``2`` for a missing required argument
@@ -625,7 +631,6 @@ def _cmd_record_reconcile(args):
     ``3`` are the answers this verb promises.
     """
     import json as _json
-    import os
 
     from tortoise.cache_projection import read_record_view
     from tortoise.reconciliation import ReconciliationUnavailable
@@ -638,8 +643,19 @@ def _cmd_record_reconcile(args):
         reconcile_record_and_cache,
         record_key_map,
     )
+    # The DSN is resolved by the module that DECLARES the arming surface — not
+    # re-spelled here. `record_dsn` owns `RECORD_DSN_ENV` (so a rename cannot
+    # silently disarm this verb while `RecordWriter` stays armed) and it REFUSES
+    # a non-Postgres scheme, which is a MISCONFIGURATION and must not be
+    # reported as "the record is unreadable" (an outage).
+    from tortoise.record_writer import RecordWriteError, record_dsn
 
-    dsn = args.record_dsn or os.environ.get("TORTOISE_RECORD_DSN")
+    try:
+        dsn = record_dsn(args.record_dsn)
+    except RecordWriteError as e:
+        print(f"Error: {e} — nothing was compared, so divergence is UNKNOWN, "
+              f"not zero.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
     if not dsn:
         print("Error: no record DSN — pass --record-dsn or set "
               "TORTOISE_RECORD_DSN. Nothing was compared, so divergence is "

@@ -404,6 +404,71 @@ class TestStoredBooleanForm:
                               {"id": "p1", "embedding_verbatim": True})
         assert disagreed.field_mismatches == 1
 
+    # ── the trap, in the COMPOSITION the marker feeds (#9189 review) ─────
+    #
+    # Fixing the MARKER's own comparison left the same string deciding the
+    # VECTOR rule: `is_verbatim` read `'false'` truthily, so a record holding
+    # the falsy spelling claimed the verbatim storage form and a cache that
+    # legitimately stored the `f32` width was reported divergent FOREVER —
+    # #8615's symptom, reached through #9184's spelling. The three tests below
+    # are what the marker-only tests above cannot see, because they carry no
+    # `embedding` at all.
+
+    def test_the_falsy_spelling_does_not_force_a_permanent_vector_mismatch(self):
+        """`'false'` means the store NARROWS — a faithful cache agrees.
+
+        Pre-fix (`is_verbatim`'s truthiness in the vector rule) this reported
+        `field_mismatches == 1` on a correctly projected point.
+        """
+        from tortoise.stored_form import narrow_to_stored_width
+        stored = narrow_to_stored_width([0.1, 0.2])
+        assert stored is not None and stored != [0.1, 0.2]   # the narrowing is REAL
+        report = self._one(
+            {"id": "p1", "embedding": [0.1, 0.2],
+             "embedding_verbatim": "false"},
+            {"id": "p1", "embedding": stored, "embedding_verbatim": False})
+        assert report.field_mismatches == 0, report.render()
+        assert report.divergent == 0
+        assert report.form_normalized == 2   # the vector AND the marker
+
+    def test_a_verbatim_record_still_refuses_the_narrowed_vector(self):
+        """The `'false'` fix must not widen the rule for a true marker."""
+        from tortoise.stored_form import narrow_to_stored_width
+        stored = narrow_to_stored_width([0.1, 0.2])
+        report = self._one(
+            {"id": "p1", "embedding": [0.1, 0.2],
+             "embedding_verbatim": "true"},
+            {"id": "p1", "embedding": stored, "embedding_verbatim": True})
+        assert report.field_mismatches == 1, report.render()
+        assert report.form_normalized == 1   # only the marker's own form
+
+    def test_an_unparseable_marker_keeps_the_strict_vector_comparison(self):
+        """Outside the declared vocabulary, degrade to STRICT — never to False."""
+        from tortoise.stored_form import narrow_to_stored_width
+        stored = narrow_to_stored_width([0.1, 0.2])
+        report = self._one(
+            {"id": "p1", "embedding": [0.1, 0.2],
+             "embedding_verbatim": "maybe"},
+            {"id": "p1", "embedding": stored, "embedding_verbatim": "maybe"})
+        assert report.field_mismatches == 1, report.render()
+
+    def test_the_check_and_the_writer_read_the_marker_differently(self):
+        """#9184's remaining half, recorded where the difference is made.
+
+        `is_verbatim` decides what the WRITER stores and still reads `'false'`
+        truthily (so that vector is written un-narrowed and compared exactly by
+        the agreement branch). The CHECK reads the DECLARED boolean. Pinning the
+        asymmetry keeps the residual visible instead of re-discovering it.
+        """
+        from tortoise.stored_form import declares_verbatim, is_verbatim
+        marker = {"embedding_verbatim": "false"}
+        assert is_verbatim(marker) is True          # the writer: still truthy
+        assert declares_verbatim(marker) is False   # the check: the declared value
+        assert declares_verbatim({"embedding_verbatim": "true"}) is True
+        assert declares_verbatim({}) is False       # no marker ⇒ the store narrows
+        assert declares_verbatim({"embedding_verbatim": None}) is False
+        assert declares_verbatim({"embedding_verbatim": "maybe"}) is True
+
     def test_an_unparseable_marker_value_stays_exact(self):
         """Outside the declared vocabulary, degrade to exact — never to False."""
         report = self._one({"id": "p1", "embedding_verbatim": "maybe"},

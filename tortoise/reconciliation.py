@@ -44,7 +44,7 @@ from .stored_form import (
     BOOLEAN_FORM_PROPS,
     STORED_VECTOR_PROPS,
     declared_boolean,
-    is_verbatim,
+    declares_verbatim,
     narrow_to_stored_width,
 )
 
@@ -125,12 +125,16 @@ def _props_relation(prop: str, truth_props: Mapping, cache_props: Mapping) -> st
     * **vectors** (:data:`STORED_VECTOR_PROPS`) — the truth side is narrowed to
       the width the cache stores, UNLESS either side declares
       ``embedding_verbatim``, in which case the value is stored un-narrowed and
-      compared exactly (#8615). The CACHE side is never narrowed: the
-      acceptance window is the exact rounding of the RECORD's value, a single
-      point rather than the band a two-sided narrowing would allow. Both sides
-      must be sequences for the narrowing to apply — a scalar under a vector
-      property name is not a vector, and the exact comparison above has already
-      decided it.
+      compared exactly (#8615). The marker is read through
+      :func:`declares_verbatim`, NOT :func:`is_verbatim`'s truthiness: a record
+      holding ``'false'`` means "the store narrows", and reading it truthily
+      (``bool('false') is True``) would report a faithful ``f32`` cache as a
+      permanent divergence — #8615's symptom reached through #9184's spelling.
+      The CACHE side is never narrowed: the acceptance window is the exact
+      rounding of the RECORD's value, a single point rather than the band a
+      two-sided narrowing would allow. Both sides must be sequences for the
+      narrowing to apply — a scalar under a vector property name is not a
+      vector, and the exact comparison above has already decided it.
     * **boolean-valued properties** (:data:`BOOLEAN_FORM_PROPS`) — the record's
       column is ``text`` and the cache's property is a boolean, so the two sides
       are compared by the boolean they DECLARE (:func:`declared_boolean`), in
@@ -146,7 +150,7 @@ def _props_relation(prop: str, truth_props: Mapping, cache_props: Mapping) -> st
         truth_bool = declared_boolean(truth_value)
         if truth_bool is not None and truth_bool == declared_boolean(cache_value):
             return FIELD_FORM
-    if prop not in STORED_VECTOR_PROPS or is_verbatim(truth_props, cache_props):
+    if prop not in STORED_VECTOR_PROPS or declares_verbatim(truth_props, cache_props):
         return FIELD_DIVERGENT
     if not isinstance(truth_value, (list, tuple)) \
             or not isinstance(cache_value, (list, tuple)):
