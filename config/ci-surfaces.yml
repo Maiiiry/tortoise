@@ -2985,6 +2985,13 @@ surfaces:
   - test_search_engine.py
   - test_search_engine_gaps.py
   - test_search_engine_nameerror.py
+  # #8488: the in-process Okapi BM25 lexical arm. `tortoise/bm25.py` is a NEW
+  # module, so it matches no SOURCE_PATTERNS entry and falls through to `core`
+  # (its siblings live here too). The file is ALSO in `carve_out` (#8488): its
+  # `pytestmark` is `embedded_only`, so under a docker URI the D-2 hook SKIPS it
+  # — a `core`-only registration would leave the manifest green and the file
+  # never executed.
+  - test_bm25_lexical_8488.py
   - test_determinism_tie_order_3019.py
   # #4999: the vector leg's trace must report WHICH path it took (index vs
   # brute-force scan). Pins the unpatterned engine module
@@ -4680,6 +4687,12 @@ slow_files:
 # Mirrors tests/_embedded.TEST_NO_REDIRECT_STEMS (pinned by test_ci_selection
 # + test_markers).
 carve_out:
+# #8488: the in-process Okapi BM25 lexical arm. Module-level `embedded_only`
+# (its subject is the embedded lane + the shipped read), so a `core`-only
+# registration would make the manifest green and run NOTHING on a docker leg.
+# Mirrored in tests/_embedded.TEST_NO_REDIRECT_STEMS (the pin is
+# test_ci_selection.py::test_carve_out_mirrors_test_no_redirect_stems).
+- test_bm25_lexical_8488.py
 - test_precision_leak_4028.py  # #4028: the surface half asserts embedded brute-force floor semantics
 - test_graph_integrity_gate.py
 - test_per_session_census.py
