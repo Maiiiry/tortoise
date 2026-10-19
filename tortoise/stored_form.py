@@ -53,6 +53,20 @@ node — and a dropped flag is precisely the ``live != rebuild`` class #5004
 exists to prevent. ``OR`` is also the fail-closed direction: claiming verbatim
 anywhere produces the STRICTER comparison.
 
+THE SECOND FORM RULE: A BOOLEAN-VALUED PROPERTY (#9184)
+======================================================
+The same defect class reaches one more property, on the MARKER rather than the
+vector. ``embedding_verbatim`` is ``text`` in the record (a journal ``True``
+lands there as ``'true'``) and a graph BOOLEAN in the cache, so exact equality
+reports a permanent ``field_mismatches`` entry for every verbatim point — a
+faithful projection that can never go green (#9184). :data:`BOOLEAN_FORM_PROPS`
++ :func:`declared_boolean` hold that rule, in this module, for the same reason
+the vector rule lives here: ONE spelling, shared with the check that reads it.
+It normalises BOTH directions over the DECLARED vocabulary, so ``'false'`` is
+``False`` and garbage stays exact — a genuinely different marker is still a
+divergence. ⚠️ It deliberately does NOT change :func:`is_verbatim`, whose
+truthiness read decides what the WRITER stores; that half is #9184's.
+
 THE SINGLE SPELLING
 ===================
 :data:`STORED_VECTOR_PROPS` / :func:`is_verbatim` / :func:`narrow_to_stored_width`
@@ -70,9 +84,13 @@ from __future__ import annotations
 import struct
 from collections.abc import Iterable, Mapping
 
+from .env_truthy import FALSY, TRUTHY
+
 __all__ = [
+    "BOOLEAN_FORM_PROPS",
     "STORED_VECTOR_PROPS",
     "VERBATIM_MARKER",
+    "declared_boolean",
     "is_verbatim",
     "narrow_to_stored_width",
 ]
@@ -87,6 +105,56 @@ STORED_VECTOR_PROPS: frozenset[str] = frozenset({"embedding"})
 #: The PRIMARY marker that says a caller owns the value's storage form, so the
 #: vector is written and compared un-narrowed (#5004).
 VERBATIM_MARKER = "embedding_verbatim"
+
+#: The properties whose two sides hold DIFFERENT FORMS of one declared value by
+#: SCHEMA, not by value: the record column is ``text`` (so a journal payload's
+#: ``True`` lands as the string ``'true'``) while the cache holds a graph
+#: boolean. An exact comparison of a FAITHFUL projection therefore reports a
+#: permanent, unrepairable ``field_mismatches`` entry — the same class as #8615
+#: (a property whose STORED FORM differs between the stores), on the marker
+#: rather than the vector (#9184).
+#:
+#: **OVERRIDES:** exact by-value comparison of a boolean-valued property between
+#: the record and the cache — the record's column is ``text`` and the cache's
+#: property is a boolean, so an exact comparison reports the SCHEMA's choice of
+#: type as divergence and can never go green for a verbatim point (#9184).
+#:
+#: ⛔ This is NOT ``is_verbatim``'s truthiness read and does NOT widen it. The
+#: normalisation is the DECLARED boolean vocabulary (:func:`declared_boolean`:
+#: real booleans, ``0``/``1``, and the ``env_truthy`` truthy/falsy spellings) in
+#: BOTH directions, so ``'false'`` is ``False`` — never the ``bool('false')``
+#: trap — and a value outside that vocabulary stays EXACT (it is not coerced to
+#: either side). A genuinely different marker (``'true'`` vs ``False``) is still
+#: a divergence. One entry today, deliberately a SET so a second boolean-form
+#: property must be declared here rather than special-cased at a call site.
+BOOLEAN_FORM_PROPS: frozenset[str] = frozenset({VERBATIM_MARKER})
+
+
+def declared_boolean(value: object) -> bool | None:
+    """The DECLARED boolean a value spells, or ``None`` when it spells none.
+
+    ``None`` means "not a boolean spelling", never ``False``: an unparseable
+    value must degrade to the exact comparison the caller would have made
+    anyway (the totality argument :func:`narrow_to_stored_width` records for a
+    hand-editable record). Reading it as ``False`` would make every garbage
+    string compare EQUAL to a boolean ``false`` — an impossible comparison
+    reported as agreement (the #1382 class).
+
+    The vocabulary is the tree's already-declared one (:mod:`tortoise.env_truthy`,
+    #4097), not a new list: ``bool``, ``int`` ``0``/``1``, and the truthy/falsy
+    spellings, case-insensitive and stripped.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUTHY:
+            return True
+        if normalized in FALSY:
+            return False
+    return None
 
 
 def is_verbatim(*prop_maps: Mapping[str, object]) -> bool:

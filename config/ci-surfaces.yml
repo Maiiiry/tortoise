@@ -55,6 +55,16 @@ carve_shards: 3
 
 surfaces:
   api:
+  # #9189: DUAL-REGISTERED with `core` — the trigger's caller is the
+  # `record-reconcile` verb in `tortoise/__main__.py`, an EXACT `api`
+  # SOURCE_PATTERN match that REPLACES the `core` fallback in `select()`. A
+  # verb-only edit (say, re-routing `record-reconcile` to the journal's
+  # `_cmd_reconcile`) would then select `api` alone and never run the pin that
+  # the reconciler still has a production caller — the fail-open direction of
+  # #9189's whole point. Keep the `core` entry too: the readers and the
+  # comparison live in `tortoise/record_reconcile.py` /
+  # `tortoise/reconciliation.py`, neither of which matches a SOURCE_PATTERN.
+  - test_record_reconcile_trigger.py
   # #7809: DUAL-REGISTERED with `core` AND `eval` — without this `api` arm the
   # guard is SKIPPED on the exact change it exists to guard. The pre-warm it
   # pins lives in `tortoise/hosted_api.py`, an EXACT `api` SOURCE_PATTERNS match
@@ -3238,6 +3248,17 @@ surfaces:
   # DUAL-REGISTERED with `api` (above) for the hosted /v1/search field.
   - test_residency_marker.py
   - test_reconciliation.py
+  # #9189 (§17.2): the reconciler's PRODUCTION TRIGGER. `tortoise/reconciliation.py`
+  # had a comparison and no production caller (measured at `f96a18da1` and
+  # re-derived for #9189), so "continuous reconciliation" had a mechanism and no
+  # observer. The subject is the new `tortoise/record_reconcile.py` (readers +
+  # the residency/divergence partition + the count's three landing places) and
+  # the `record-reconcile` CLI verb that gives it a non-test, non-docs caller
+  # (`tortoise/__main__.py`, an EXACT `api` SOURCE_PATTERN — hence the DUAL
+  # registration: an `__main__.py`-only PR selects `api`, which REPLACES the
+  # `core` fallback, so a `core`-only entry would never run on the change that
+  # breaks the trigger path — the #1349/#2938/#3154 silent-drop class).
+  - test_record_reconcile_trigger.py
   # #7950 (capstone S2 evidence) / PR #8609 review finding 3: the end-to-end
   # chain probe's RECONCILIATION READERS must map the REAL property sets. They
   # originally returned `{}` per key, which made `field_mismatches`

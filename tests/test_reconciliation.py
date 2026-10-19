@@ -343,6 +343,106 @@ class TestStoredVectorForm:
         assert report.field_mismatches == 1
 
 
+class TestStoredBooleanForm:
+    """#9184 — `embedding_verbatim` is `text` in the record and a boolean in the cache.
+
+    The record column is ``embedding_verbatim text`` and the write path does not
+    coerce, so a journal payload's ``True`` lands there as the string ``'true'``
+    while ``cache_projection.node_statement`` writes a graph BOOLEAN. Exact
+    equality therefore reports ONE permanent ``field_mismatches`` entry for
+    every verbatim point — a faithful projection that can never go green, and
+    the same class as #8615 (a property whose STORED FORM differs by schema).
+
+    The rule is ``stored_form.BOOLEAN_FORM_PROPS`` + ``declared_boolean``: the
+    two sides are compared by the boolean they DECLARE, over the tree's own
+    recorded truthy/falsy vocabulary (#4097) and in BOTH directions. It is not
+    ``bool(value)`` — ``bool('false')`` is ``True`` — so ``'false'`` reads as
+    ``False`` and a genuinely different marker stays a divergence. Fields it
+    absorbs are counted apart (``form_normalized``), so the decision is visible
+    in the report instead of being folded into a mismatch count.
+    """
+
+    @staticmethod
+    def _one(record_props, cache_props):
+        return reconcile_views({"Point:p1": record_props},
+                               {"Point:p1": cache_props})
+
+    def test_a_faithful_verbatim_marker_is_not_a_field_mismatch(self):
+        report = self._one({"id": "p1", "embedding_verbatim": "true"},
+                           {"id": "p1", "embedding_verbatim": True})
+        assert report.field_mismatches == 0
+        assert report.divergent == 0
+        assert report.divergent_keys == ()
+
+    def test_the_form_divergence_is_its_own_named_count(self):
+        """Not swallowed: an operator can see the rule decided something."""
+        report = self._one({"id": "p1", "embedding_verbatim": "true"},
+                           {"id": "p1", "embedding_verbatim": True})
+        assert report.form_normalized == 1
+        assert report.as_dict()["form_normalized"] == 1
+        assert "form_normalized=1" in report.render()
+
+    def test_it_does_not_touch_the_render_when_nothing_was_normalized(self):
+        report = reconcile_views({"p1": {"x": 1}}, {"p1": {"x": 1}})
+        assert "form_normalized" not in report.render()
+
+    def test_a_genuinely_different_marker_is_still_a_mismatch(self):
+        """The check must still be a check: `true` vs `False` is divergence."""
+        report = self._one({"id": "p1", "embedding_verbatim": "true"},
+                           {"id": "p1", "embedding_verbatim": False})
+        assert report.field_mismatches == 1
+        assert report.divergent == 1
+        assert report.form_normalized == 0
+
+    def test_the_false_spelling_is_FALSE_not_truthy(self):
+        """`bool('false')` is `True` — the trap this rule must not fall into."""
+        agreed = self._one({"id": "p1", "embedding_verbatim": "false"},
+                           {"id": "p1", "embedding_verbatim": False})
+        assert agreed.form_normalized == 1
+        assert agreed.field_mismatches == 0
+        disagreed = self._one({"id": "p1", "embedding_verbatim": "false"},
+                              {"id": "p1", "embedding_verbatim": True})
+        assert disagreed.field_mismatches == 1
+
+    def test_an_unparseable_marker_value_stays_exact(self):
+        """Outside the declared vocabulary, degrade to exact — never to False."""
+        report = self._one({"id": "p1", "embedding_verbatim": "maybe"},
+                           {"id": "p1", "embedding_verbatim": True})
+        assert report.field_mismatches == 1
+        assert report.form_normalized == 0
+
+    def test_a_marker_on_one_side_only_is_still_a_mismatch(self):
+        """Presence is checked before the form rule (a dropped marker counts)."""
+        report = self._one({"id": "p1"},
+                           {"id": "p1", "embedding_verbatim": True})
+        assert report.field_mismatches == 1
+        assert report.form_normalized == 0
+
+    def test_the_rule_is_a_declared_table_not_a_truthiness_class(self):
+        """A second boolean-ish property must be DECLARED, not silently equal."""
+        from tortoise.stored_form import BOOLEAN_FORM_PROPS, VERBATIM_MARKER
+        assert frozenset({VERBATIM_MARKER}) == BOOLEAN_FORM_PROPS
+        report = self._one({"id": "p1", "some_flag": "true"},
+                           {"id": "p1", "some_flag": True})
+        assert report.field_mismatches == 1
+        assert report.form_normalized == 0
+
+    def test_declared_boolean_is_total_and_never_raises(self):
+        """A record is a FILE: an odd value must degrade, not explode."""
+        from tortoise.stored_form import declared_boolean
+        assert declared_boolean(True) is True
+        assert declared_boolean(False) is False
+        assert declared_boolean(1) is True
+        assert declared_boolean(0) is False
+        assert declared_boolean(" TRUE ") is True
+        assert declared_boolean("false") is False
+        assert declared_boolean("maybe") is None
+        assert declared_boolean(None) is None
+        assert declared_boolean(2) is None
+        assert declared_boolean([1]) is None
+        assert declared_boolean({"a": 1}) is None
+
+
 def _storage_arch_section(heading: str) -> str:
     """One `### …` section of STORAGE-ARCHITECTURE.md, up to the next heading."""
     doc = (Path(__file__).resolve().parents[1]
@@ -375,3 +475,39 @@ def test_section_17_2_carries_the_stored_form_overrides_line():
     assert "stored_form" in section, (
         "§17.2 must name `tortoise/stored_form.py` as the one spelling of the "
         "storage form, shared by the writer and both checks (#8615)")
+
+
+def test_section_17_2_names_9184_and_its_own_cost():
+    """The exclusion is NAMED on the artifact a lane reads — never silent.
+
+    #9189's own words: *"Excluding it silently is the failure this child exists
+    to prevent."* The boolean-form rule is visible in three places, and this
+    pins the doc half: §17.2 must name the defect issue, the count that keeps
+    the rule's cost visible, and the fact that the schema decision is still
+    open. A rule whose record stops saying so reads as an accident, and the next
+    reader holding an exact-comparison habit deletes it.
+    """
+    section = _storage_arch_section("### 17.2 Cache coherence")
+    assert "#9184" in section, "§17.2 must name the marker's stored-form defect"
+    assert "form_normalized" in section, (
+        "§17.2 must name the count that keeps the rule's cost visible")
+    assert "declared_boolean" in section or "BOOLEAN_FORM_PROPS" in section, (
+        "§17.2 must name the one spelling of the boolean form")
+    assert "stays open" in section, (
+        "§17.2 must record that the schema normalisation is still #9184's, so "
+        "this rule is not mistaken for the fix")
+    assert "record_reconcile" in section, (
+        "§17.2 must name the reconciler's production trigger (#9189)")
+
+
+def test_section_17_2_still_carries_exactly_one_overrides_line():
+    """#9184's rule is a second stored-form exception, NOT a second `OVERRIDES:`.
+
+    The marker is reserved for a decision that departs from the common default.
+    The boolean form is the SAME decision shape #8615 already recorded (compare
+    the stored form, not the schema's choice of type), so it extends that
+    record rather than adding a competing one — two `OVERRIDES:` lines for one
+    rule would make the section unreadable about which default it departs from.
+    """
+    section = _storage_arch_section("### 17.2 Cache coherence")
+    assert len([ln for ln in section.splitlines() if "OVERRIDES:" in ln]) == 1

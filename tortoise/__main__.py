@@ -603,6 +603,97 @@ def _cmd_reconcile(args):
     return 0
 
 
+def _cmd_record_reconcile(args):
+    """#9189 / §17.2 — the record↔cache reconciler's PRODUCTION TRIGGER.
+
+    Compares the two stores for ONE ``org_id``/``graph_id`` scope and lands the
+    number (§17.2 requires divergence to be OBSERVED, not merely recoverable).
+    The comparison itself is ``tortoise/record_reconcile.py``; this verb is what
+    gives it a caller that is neither a test nor an evidence probe.
+
+    Exit codes, because a scheduler's only signal is the code:
+      ``0`` clean · ``3`` divergence OBSERVED · ``2`` the comparison could not
+      be made (no DSN, psycopg2 absent, an unreadable side, nothing compared).
+      ``1`` usage.
+    """
+    import json as _json
+    import os
+
+    from tortoise.cache_projection import read_record_view
+    from tortoise.reconciliation import ReconciliationUnavailable
+    from tortoise.record_reconcile import (
+        EXIT_UNAVAILABLE,
+        VERDICT_CLEAN,
+        exit_code_for,
+        log_result,
+        read_cache_view,
+        reconcile_record_and_cache,
+        record_key_map,
+    )
+
+    dsn = args.record_dsn or os.environ.get("TORTOISE_RECORD_DSN")
+    if not dsn:
+        print("Error: no record DSN — pass --record-dsn or set "
+              "TORTOISE_RECORD_DSN. Nothing was compared, so divergence is "
+              "UNKNOWN, not zero.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    try:
+        import psycopg2
+    except ImportError:
+        print("Error: psycopg2 is not installed — the record cannot be read, "
+              "so divergence is UNKNOWN, not zero. Install the `postgres` "
+              "extra.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+
+    from tortoise.projection import FalkorProjection
+    from tortoise.residency import read_declaration
+
+    conn = None
+    proj = None
+    try:
+        try:
+            conn = psycopg2.connect(dsn)
+            view = read_record_view(conn, org_id=args.org, graph_id=args.graph)
+        except Exception as e:
+            raise ReconciliationUnavailable(
+                f"record is unreadable ({type(e).__name__}) — divergence is "
+                f"UNKNOWN, not zero") from e
+
+        cache_graph = args.cache_graph or args.graph
+        try:
+            proj = FalkorProjection.from_uri(args.db, graph_name=cache_graph)
+        except Exception as e:
+            raise ReconciliationUnavailable(
+                f"cache {cache_graph!r} could not be opened "
+                f"({type(e).__name__}) — divergence is UNKNOWN, not zero") from e
+        declaration = read_declaration(proj.g)
+        result = reconcile_record_and_cache(
+            record_key_map(view),
+            read_cache_view(proj.g),
+            declaration=declaration,
+        )
+    except ReconciliationUnavailable as e:
+        print(f"Record↔cache reconciliation UNAVAILABLE: {e}", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    finally:
+        if proj is not None:
+            proj.close()
+        if conn is not None:
+            conn.close()
+
+    line = log_result(result)
+    if args.json:
+        print(_json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(line)
+        if result.verdict() == VERDICT_CLEAN:
+            print(f"✓ record == cache for {args.org}/{args.graph} "
+                  f"({result.checked} keys checked)")
+        else:
+            print(f"✗ {result.verdict().upper()}: see the counts above",
+                  file=sys.stderr)
+    return exit_code_for(result)
+
 
 def _cmd_init(args):
     """Auto-detect FalkorDB and create default graph — onboarding."""
@@ -10903,6 +10994,25 @@ def main(argv: list[str] | None = None) -> int:
     rc = sp.add_parser("reconcile", help="Replay unprojected EventRecorded entries from JSONL into FalkorDB")
     rc.add_argument("--db", required=True, help="FalkorDB docker:// URI")
     rc.add_argument("--log", required=True, help="Path to events.jsonl")
+    # #9189 / §17.2: the SECOND divergence surface — Postgres (truth) vs
+    # FalkorDB (cache) — has a comparison but, until this verb, no production
+    # caller. Deliberately NOT `reconcile` (that replays the journal) and
+    # deliberately not on the capture turn: a sweep an operator can schedule.
+    rr = sp.add_parser(
+        "record-reconcile",
+        help="Compare the Postgres record (truth) with the cached graph (cache) "
+             "and report divergence as counts (§17.2). Exit 0 clean / 3 "
+             "divergent / 2 could not be compared")
+    rr.add_argument("--db", required=True,
+                    help="Cache target: FalkorDB docker:// URI")
+    rr.add_argument("--record-dsn", default=None,
+                    help="Postgres record DSN (default: $TORTOISE_RECORD_DSN)")
+    rr.add_argument("--org", required=True, help="Record org_id (the scope)")
+    rr.add_argument("--graph", required=True, help="Record graph_id (the scope)")
+    rr.add_argument("--cache-graph", default=None,
+                    help="Cache graph name (default: the same as --graph)")
+    rr.add_argument("--json", action="store_true",
+                    help="Machine-readable JSON output")
     bk = sp.add_parser("backup", help="Backup events.jsonl + FalkorDB to timestamped dir")
     bk.add_argument("--db", required=True, help="Path to database file")
     bk.add_argument("--events", default="events.jsonl", help="Path to event log")
@@ -11490,6 +11600,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_audit(args)
     elif args.cmd == "reconcile":
         return _cmd_reconcile(args)
+    elif args.cmd == "record-reconcile":
+        return _cmd_record_reconcile(args)
     elif args.cmd == "backfill":
         _cmd_backfill(args)
         return 0
