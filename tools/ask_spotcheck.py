@@ -76,7 +76,13 @@ how many superseded claims rendered as their own block body with no
 carries both, per arm. ``current_state`` has NO pass threshold (D8: the first
 run sets it); ``superseded_live.rendered_live > 0`` is a hard failure of the
 run, and so is a case the instrument never observed — an unmeasured gate is
-never a pass. ``TORTOISE_SPOTCHECK_JUDGE=mock`` grades the leg key-free
+never a pass. D8's two compliant outcomes are "flagged OR excluded", and both
+are reported rather than inferred: ``retrievable`` records whether the
+superseded claim came out of the lane's own retrieval pool at all, and
+``excluded`` records the compliant case where it did but the reader was not
+served it (a PASS — a claim nobody could retrieve is the retrieval gap, and a
+probe that cannot read the store fails closed as UNMEASURED).
+``TORTOISE_SPOTCHECK_JUDGE=mock`` grades the leg key-free
 (CI); without it the composition path's fail-fast judge-key rule applies.
 """
 from __future__ import annotations
@@ -993,13 +999,20 @@ def superseded_live_in_evidence(evidence: str, case: dict) -> dict:
     check ambiguous.
 
     Returns ``{"seen": int, "rendered_live": int, "rate": float|None}``.
-    ``seen`` is how many blocks rendered the old claim at all; ``rate`` is
+    Those three are the whole RENDER reading. ``run_distilled_case`` adds the
+    two fields that decide what ``seen == 0`` MEANS — ``retrievable`` and
+    ``excluded`` — because only a retrieval probe can tell an exclusion (a
+    compliant D8 pass) from a retrieval gap (an unmeasured gate); see
+    ``superseded_claim_retrievable``. ``seen`` is how many blocks rendered the
+    old claim at all; ``rate`` is
     ``None`` when ``seen == 0`` — an unobserved case is UNMEASURED, never
     0.0 (that would be a green gate on a harness that saw nothing). Whole
     blocks are split on the blank line ``render_context`` joins them with; a
     multi-PARAGRAPH claim body spans blocks (both authored and product claims
-    here are single-line, and a claim that is not found simply reads as
-    ``seen == 0`` — failing CLOSED, never open).
+    here are single-line, and a claim that is not found reads as ``seen == 0``
+    — this function never reports a pass it did not observe; whether that
+    absence is an exclusion or a retrieval gap is decided by the probe, not
+    assumed here).
     """
     old = ((case.get("distilled") or {}).get("old") or {})
     target = _normalize(old.get("content"))
@@ -1012,6 +1025,70 @@ def superseded_live_in_evidence(evidence: str, case: dict) -> dict:
             rendered_live += 1
     return {"seen": seen, "rendered_live": rendered_live,
             "rate": (rendered_live / seen) if seen else None}
+
+
+def superseded_claim_retrievable(sdk: TortoiseSDK, case: dict,
+                                 old_point_id: str | None,
+                                 question_date: str | None = None
+                                 ) -> bool | None:
+    """Is the superseded claim in the ask lane's OWN retrieval pool? (#9095)
+
+    The D8 product gate (``docs/product-success-eval.md``: "0% of superseded
+    points appear as live answers — **must be flagged or excluded**") admits
+    TWO compliant states, and they render identically the moment the claim is
+    not served: ``seen == 0``. A render-only reading cannot tell
+
+    * **excluded** — the claim WAS retrievable and the reader was simply not
+      served it (D8's own second option, a PASS), from
+    * a **retrieval gap** — the claim never came out of the store at all, so
+      the gate was never exercised (UNMEASURED, never a pass),
+
+    and reporting the first as the second is a false red on the product's
+    best-case behaviour. This probe settles it mechanically against the local,
+    freshly-seeded store: it re-runs the lane's own retrieval — same resolved
+    caps, same knobs, ``include_terminal=True`` (the lane's documented call,
+    so a terminal claim is IN scope; a probe with terminal filtered would
+    report every supersession as a gap) — and reports whether the superseded
+    claim's Point came back at all.
+
+    ``True`` → retrievable but not rendered ⇒ excluded ⇒ a reported PASS.
+    ``False`` → absent from the pool ⇒ a retrieval gap ⇒ the hard failure.
+    ``None`` → the probe could not read the store (no id, or it raised) ⇒
+    UNKNOWN, and the caller FAILS CLOSED: an unreadable probe is not evidence
+    of a pass.
+
+    ``_record_reads=False``: this is a MEMBERSHIP probe, never a caller
+    reading these keys. The read funnel records the rows it returns, and a
+    probe's candidate rows would bias ``f`` HIGH — the direction that removes
+    the saving the instrument measures (#7983's pool-caller rule).
+    """
+    if not old_point_id:
+        return None
+    # Lazy import: the probe is a measurement helper, not a module-load cost.
+    from tortoise.retrieval import (
+        ASK_FUSION_K_ENV,
+        ASK_FUSION_WEIGHTS_ENV,
+        ask_env_bool,
+        ask_env_int,
+        ask_env_weights,
+        resolve_ask_retrieval_caps,
+    )
+    caps = resolve_ask_retrieval_caps()
+    try:
+        hits = sdk.tortoise_fts_query(
+            case["question"], limit=caps["limit"],
+            pool_size=caps["pool_size"], include_terminal=True,
+            query_date=question_date,
+            # The lane's own A1/A3/A4 knobs, resolved the same way it does.
+            keep_numeric=ask_env_bool("TORTOISE_ASK_NUMERIC_TOKENS", True),
+            search_keys_prf=ask_env_bool("TORTOISE_ASK_SEARCH_KEYS_PRF",
+                                         False),
+            fusion_weights=ask_env_weights(ASK_FUSION_WEIGHTS_ENV, None),
+            fusion_k=ask_env_int(ASK_FUSION_K_ENV, 60),
+            _record_reads=False)
+    except Exception:  # noqa: BLE001, RUF100 — an unreadable probe is UNKNOWN
+        return None
+    return any(str(h.get("id") or "") == str(old_point_id) for h in hits)
 
 
 def _distilled_judge():
@@ -1039,8 +1116,8 @@ def run_distilled_case(case: dict, judge) -> dict:
         sdk = TortoiseSDK(db)
         try:
             _seed_memory(sdk, case)
-            if arm == "distilled":
-                seed_distilled_corpus(sdk, case)
+            ids = seed_distilled_corpus(sdk, case) if arm == "distilled" \
+                else None
             qdate = _to_iso_date(case.get("question_date") or "")
             try:
                 result = run_ask_lane(sdk, case["question"],
@@ -1049,26 +1126,39 @@ def run_distilled_case(case: dict, judge) -> dict:
                 # rule as the composition leg: an unavailable reader is a
                 # FAILED measurement, recorded (never a silent pass) rather
                 # than aborting the remaining cases.
+                unavailable = superseded_live_in_evidence("", case)
+                unavailable["retrievable"] = None
+                unavailable["excluded"] = False
                 record[arm] = {
                     "answer": "",
                     "evidence": "",
                     "error": f"ask unavailable: {type(e).__name__}",
                     "current_state": {"committed": False, "n": 0,
                                       "rate": None},
-                    "superseded_live": superseded_live_in_evidence(
-                        "", case),
+                    "superseded_live": unavailable,
                 }
                 continue
             ok, note, kind = _grade(case, result, judge)
+            evidence = result.get("evidence") or ""
+            superseded = superseded_live_in_evidence(evidence, case)
+            # The RAW arm has no superseded claim to probe — there is nothing
+            # there to retrieve — so it reports ``retrievable: None``.
+            retrievable = (superseded_claim_retrievable(
+                sdk, case, (ids or {}).get("old"), qdate) if ids else None)
+            # D8's "flagged OR excluded": a retrievable claim that never
+            # reached the reader was EXCLUDED — a compliant PASS, reported as
+            # its own field — not the retrieval gap it used to be read as.
+            superseded["retrievable"] = retrievable
+            superseded["excluded"] = bool(not superseded["seen"]
+                                          and retrievable is True)
             record[arm] = {
                 "answer": result.get("answer") or "",
-                "evidence": result.get("evidence") or "",
+                "evidence": evidence,
                 "judge": kind,
                 "note": note,
                 "current_state": {"committed": bool(ok), "n": 1,
                                   "rate": 1.0 if ok else 0.0},
-                "superseded_live": superseded_live_in_evidence(
-                    result.get("evidence") or "", case),
+                "superseded_live": superseded,
             }
         finally:
             sdk.close()
@@ -1076,8 +1166,8 @@ def run_distilled_case(case: dict, judge) -> dict:
 
 
 def _arm_summary(records: list[dict], arm: str) -> dict:
-    """Aggregate ONE arm's two numbers across the planted cases."""
-    committed = measured = seen = rendered_live = 0
+    """Aggregate ONE arm's numbers across the planted cases."""
+    committed = measured = seen = rendered_live = excluded = 0
     for rec in records:
         whole = rec.get(arm) or {}
         cs = whole.get("current_state") or {}
@@ -1087,13 +1177,17 @@ def _arm_summary(records: list[dict], arm: str) -> dict:
         sl = whole.get("superseded_live") or {}
         seen += int(sl.get("seen") or 0)
         rendered_live += int(sl.get("rendered_live") or 0)
+        excluded += 1 if sl.get("excluded") else 0
     return {
         "current_state": {
             "committed": committed, "n": measured,
             "rate": (committed / measured) if measured else None},
         "superseded_live": {
             "seen": seen, "rendered_live": rendered_live,
-            "rate": (rendered_live / seen) if seen else None},
+            "rate": (rendered_live / seen) if seen else None,
+            # D8's second compliant state, counted so the readout stays
+            # honest: excluded cases are PASSES, never silent absences.
+            "excluded": excluded},
     }
 
 
@@ -1129,9 +1223,12 @@ def _distilled_hard_failures(payload: dict) -> list[str]:
 
     1. ``rendered_live > 0`` — a superseded claim reached the reader as a live
        answer. The product gate is 0%, so any occurrence fails the run.
-    2. ``seen == 0`` — the superseded claim never reached the reader, so the
-       gate was never exercised. That is a RETRIEVAL gap in the instrument,
-       not a pass, and an unmeasured gate must never read green.
+    2. ``seen == 0`` **and not excluded** — the superseded claim was never
+       retrieved (``retrievable is False``) or the probe could not tell
+       (``None``), so the gate was never exercised. That is a RETRIEVAL gap in
+       the instrument/store, not a pass, and an unmeasured gate must never
+       read green. ``seen == 0`` **with** ``excluded`` is D8's own other
+       compliant outcome ("must be flagged or **excluded**") and is a PASS.
 
     Plus an unavailable reader (``n == 0`` with an error): no measurement was
     taken. ``current_state`` alone is NEVER a hard failure — D8 gives the
@@ -1152,9 +1249,21 @@ def _distilled_hard_failures(payload: dict) -> list[str]:
                 f"{qid}: {sl['rendered_live']} superseded claim(s) rendered "
                 f"live (no {SUPERSEDED_MARKER} marker) — the D8 gate is 0%")
         elif not int(sl.get("seen") or 0):
-            failures.append(
-                f"{qid}: the superseded claim was never observed in the "
-                f"reader's evidence — the D8 gate is UNMEASURED, not passed")
+            if sl.get("excluded"):
+                # Retrievable and simply not served: D8's "excluded" is a
+                # PASS, and it is REPORTED (``excluded: true``) so the pass
+                # is visible rather than an absence that looks like a miss.
+                continue
+            if sl.get("retrievable") is None:
+                failures.append(
+                    f"{qid}: the superseded claim was never observed and the "
+                    f"retrievability probe could not read the store — the "
+                    f"D8 gate is UNMEASURED, not passed")
+            else:
+                failures.append(
+                    f"{qid}: the superseded claim was NEVER RETRIEVED from "
+                    f"the store (absent from the lane's own pool) — a "
+                    f"retrieval GAP: the D8 gate is UNMEASURED, not passed")
     return failures
 
 
@@ -1168,9 +1277,12 @@ def _format_distilled_line(idx: int, total: int, rec: dict) -> str:
             continue
         cs = whole.get("current_state") or {}
         sl = whole.get("superseded_live") or {}
+        # "excluded" is D8's second compliant state — named in the report so a
+        # pass by exclusion is never mistaken for a case that went unobserved.
+        flag = " excluded" if sl.get("excluded") else ""
         parts.append(
             f"{arm}: committed={cs.get('committed')} "
-            f"superseded_live={sl.get('rendered_live')}/{sl.get('seen')}")
+            f"superseded_live={sl.get('rendered_live')}/{sl.get('seen')}{flag}")
     return (f"[distilled {idx}/{total}] "
             f"{(rec.get('question_id') or '')[:34]:34s} " + " | ".join(parts))
 
@@ -1208,7 +1320,7 @@ def _run_distilled_leg(corpus_path: str | None) -> int:
         print(f"distilled[{arm}]: current_state {cs['committed']}/{cs['n']} "
               f"({rate}; D8 sets no threshold — this run sets it) — "
               f"superseded_live {sl['rendered_live']}/{sl['seen']} ({live}; "
-              f"product gate 0%)")
+              f"product gate 0%; excluded {sl.get('excluded') or 0})")
     for failure in failures:
         print(f"distilled: HARD FAILURE — {failure}", file=sys.stderr)
     print("DISTILLED_JSON " + json.dumps(payload, sort_keys=True))

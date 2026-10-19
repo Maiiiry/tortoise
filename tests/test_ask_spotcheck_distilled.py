@@ -27,7 +27,14 @@ What these tests pin, in order:
    render, the distilled arm renders the old claim WITH ``[SUPERSEDED BY:``;
 6. the machine-readable ``DISTILLED_JSON`` line exists with the two required
    blocks, and the gate FAILS CLOSED when a superseded claim renders live or
-   when the case was never observed (an unmeasured gate is never a pass).
+   when the case was never observed AND could not be retrieved (a case that
+   was retrieved but not served was EXCLUDED — D8's own second compliant
+   option, reported as ``excluded: true`` and passing);
+7. no retry-on-the-asserted-value helper stands in for that measurement: the
+   retrievability probe records, per case and arm, whether the claim was in
+   the lane's own pool, so a partial pool reads as a measured retrieval GAP
+   (a failure) instead of a vacuous pass — and both the exclusion pass and the
+   gap failure are pinned by mutation.
 
 Assertions are on the RESOLVED graph and on the reader evidence the product
 assembles — never a grep of source text.
@@ -50,11 +57,11 @@ from tools.ask_spotcheck import (  # noqa: E402, RUF100
     load_distilled_cases,
     main,
     seed_distilled_corpus,
+    superseded_claim_retrievable,
     superseded_live_in_evidence,
 )
 from tortoise.ask_lane import (  # noqa: E402, RUF100
     _reset_ask_reader_cache_for_tests,
-    run_ask_lane,
 )
 from tortoise.sdk import TortoiseSDK  # noqa: E402, RUF100
 
@@ -102,28 +109,6 @@ def _case(case_id: str) -> dict:
         if case["question_id"] == case_id:
             return case
     raise AssertionError(f"no planted case {case_id!r} in {DISTILLED_FIXTURE}")
-
-
-def _ask(sdk: TortoiseSDK, case: dict, *, want_live: bool,
-         attempts: int = 3) -> dict:
-    """``run_ask_lane`` on the eval-only local lane, retried until the OLD
-    claim actually reached the reader's context (or, for ``want_live=False``,
-    until it demonstrably did not).
-
-    Retrying on the ASSERTED value matters in both directions: the embedded
-    engine degrades PER STRATEGY ("one strategy down, others continue"), so a
-    partial pool would read as "the superseded claim was never served" — a
-    vacuous pass on the very gate this issue exists to make honest.
-    """
-    result: dict = {"evidence": "", "answer": ""}
-    for _ in range(attempts):
-        result = run_ask_lane(sdk, case["question"],
-                              question_date="2023-05-22")
-        seen = superseded_live_in_evidence(
-            result.get("evidence") or "", case)["seen"]
-        if bool(seen) is want_live:
-            return result
-    return result
 
 
 # ── 1. The corpus is authored, planted and unambiguous ────────────────────
@@ -346,10 +331,19 @@ def test_superseded_live_reads_the_block_body_and_survives_the_snippet_trap():
     assert got == {"seen": 2, "rendered_live": 1, "rate": 0.5}, got
 
 
-def test_hard_failures_fail_closed_on_a_live_block_or_an_unobserved_case():
-    """``rendered_live > 0`` is a hard failure of the run (the D8 gate), and
-    so is a case the instrument never observed (``seen == 0``): a supersession
-    the harness cannot see is not a supersession the gate cleared.
+def test_hard_failures_fail_closed_on_a_live_block_or_a_retrieval_gap():
+    """``rendered_live > 0`` is a hard failure of the run (the D8 gate); so is
+    a case the instrument never observed **and could not retrieve**.
+
+    D8 says "must be flagged or **excluded**", so ``seen == 0`` splits on the
+    retrievability probe, and the two branches must NOT be conflated:
+
+    * ``retrievable is True`` ⇒ EXCLUDED ⇒ a reported PASS (pre-fix this was
+      a false red on the product's own best-case behaviour);
+    * ``retrievable is False`` ⇒ RETRIEVAL GAP ⇒ hard failure (unmeasured is
+      never a pass);
+    * ``retrievable is None`` ⇒ the probe could not read the store ⇒ hard
+      failure, fail CLOSED (an unreadable probe is not evidence of a pass).
 
     The KU ``current_state`` rate has NO threshold here (D8: the first run
     sets it), so it is never a hard failure.
@@ -359,20 +353,40 @@ def test_hard_failures_fail_closed_on_a_live_block_or_an_unobserved_case():
         "distilled": {"current_state": {"committed": False, "n": 1,
                                         "rate": 0.0},
                       "superseded_live": {"seen": 1, "rendered_live": 0,
-                                          "rate": 0.0}}}]}
+                                          "rate": 0.0, "retrievable": True,
+                                          "excluded": False}}}]}
     assert _distilled_hard_failures(clean) == []
 
     live = json.loads(json.dumps(clean))
     live["cases"][0]["distilled"]["superseded_live"] = {
-        "seen": 1, "rendered_live": 1, "rate": 1.0}
+        "seen": 1, "rendered_live": 1, "rate": 1.0, "retrievable": True,
+        "excluded": False}
     fails = _distilled_hard_failures(live)
     assert fails and "ku-a" in fails[0] and "live" in fails[0], fails
 
-    unobserved = json.loads(json.dumps(clean))
-    unobserved["cases"][0]["distilled"]["superseded_live"] = {
-        "seen": 0, "rendered_live": 0, "rate": None}
-    fails = _distilled_hard_failures(unobserved)
-    assert fails and "ku-a" in fails[0] and "observ" in fails[0], fails
+    # (a) retrievable but never served = the D8 "excluded" PASS, reported.
+    excluded = json.loads(json.dumps(clean))
+    excluded["cases"][0]["distilled"]["superseded_live"] = {
+        "seen": 0, "rendered_live": 0, "rate": None,
+        "retrievable": True, "excluded": True}
+    assert _distilled_hard_failures(excluded) == []
+
+    # (b) the claim never came out of the store = a RETRIEVAL gap, not a pass.
+    gap = json.loads(json.dumps(clean))
+    gap["cases"][0]["distilled"]["superseded_live"] = {
+        "seen": 0, "rendered_live": 0, "rate": None,
+        "retrievable": False, "excluded": False}
+    fails = _distilled_hard_failures(gap)
+    assert fails and "ku-a" in fails[0] and "GAP" in fails[0], fails
+    assert "observ" in fails[0] or "RETRIEV" in fails[0], fails
+
+    # (c) an unreadable probe is UNKNOWN — fail closed, never a green.
+    unread = json.loads(json.dumps(clean))
+    unread["cases"][0]["distilled"]["superseded_live"] = {
+        "seen": 0, "rendered_live": 0, "rate": None,
+        "retrievable": None, "excluded": False}
+    fails = _distilled_hard_failures(unread)
+    assert fails and "UNMEASURED" in fails[0], fails
 
 
 # ── 5. End-to-end: both arms, one run, one judge ───────────────────────────
@@ -394,10 +408,11 @@ def test_both_arms_from_one_run(echo_reader):
     assert rec["question_id"] == case["question_id"]
     assert set(rec) >= {"question_id", "raw", "distilled"}, rec
 
-    # RAW ARM — the store holds turns only, so there is nothing to flag and
-    # nothing that carries the current state.
+    # RAW ARM — the store holds turns only, so there is nothing to flag,
+    # nothing that carries the current state, and nothing to probe.
     assert rec["raw"]["superseded_live"] == {
-        "seen": 0, "rendered_live": 0, "rate": None}, rec["raw"]
+        "seen": 0, "rendered_live": 0, "rate": None,
+        "retrievable": None, "excluded": False}, rec["raw"]
     assert rec["raw"]["current_state"]["committed"] is False, rec["raw"]
 
     # DISTILLED ARM — the old claim IS served (seen >= 1) and IS flagged.
@@ -405,6 +420,15 @@ def test_both_arms_from_one_run(echo_reader):
     assert rec["distilled"]["superseded_live"]["rendered_live"] == 0, (
         rec["distilled"])
     assert "[SUPERSEDED BY:" in rec["distilled"]["evidence"]
+    # The instrument MEASURED the claim's presence in the lane's own pool, so
+    # "seen >= 1" above is an observation, not a lucky single shot: this is
+    # what replaces the retry-on-the-asserted-value helper the file used to
+    # carry (a partial pool reads as a retrieval GAP and fails the gate, never
+    # as a vacuous pass).
+    assert rec["distilled"]["superseded_live"]["retrievable"] is True, (
+        rec["distilled"])
+    assert rec["distilled"]["superseded_live"]["excluded"] is False, (
+        rec["distilled"])
     # ... and the reader, seeing the distilled current state, commits it.
     assert rec["distilled"]["current_state"] == {
         "committed": True, "n": 1, "rate": 1.0}, rec["distilled"]
@@ -431,14 +455,106 @@ def test_unmarked_supersession_is_a_hard_failure(echo_reader, monkeypatch):
                         lambda self, old_id, new_id, **kw: {"invalidated": True})
     rec = run_distilled_case(_case(CASES[0]["question_id"]), MockJudge())
     assert rec["distilled"]["superseded_live"] == {
-        "seen": 1, "rendered_live": 1, "rate": 1.0}, rec["distilled"]
+        "seen": 1, "rendered_live": 1, "rate": 1.0,
+        "retrievable": True, "excluded": False}, rec["distilled"]
     assert "[SUPERSEDED BY:" not in rec["distilled"]["evidence"]
     failures = _distilled_hard_failures(_distilled_payload([rec]))
     assert failures and CASES[0]["question_id"] in failures[0], failures
     assert "rendered live" in failures[0], failures
 
 
-# ── 6. The machine-readable line, and the composition leg untouched ───────
+# ── 6. D8's "flagged OR EXCLUDED": exclusion is a pass, a gap is not ────
+
+def test_retrievability_probe_reads_the_lane_pool_and_discriminates(tmp_path):
+    """The probe behind the exclusion split must ANSWER, not always say yes:
+    the superseded claim's own id is in the lane's ``include_terminal=True``
+    pool, an id that is not in the store is not, and a missing id is UNKNOWN
+    (``None`` — the caller fails closed on it). A probe that returned ``True``
+    unconditionally would turn every retrieval gap into a silent pass.
+    """
+    from tools.ask_spotcheck import _to_iso_date
+
+    case = _case(CASES[0]["question_id"])
+    sdk = TortoiseSDK(str(tmp_path / "probe.db"))
+    try:
+        _seed_memory(sdk, case)
+        ids = seed_distilled_corpus(sdk, case)
+        qdate = _to_iso_date(case["question_date"])
+        # a TERMINAL point is IN scope for the probe — the lane's own
+        # retrieval is called with include_terminal=True, so a filtered probe
+        # would report every supersession as a retrieval gap
+        assert superseded_claim_retrievable(sdk, case, ids["old"], qdate) is True
+        assert superseded_claim_retrievable(sdk, case, ids["new"], qdate) is True
+        assert superseded_claim_retrievable(
+            sdk, case, "point-not-in-this-store", qdate) is False
+        assert superseded_claim_retrievable(sdk, case, None, qdate) is None
+    finally:
+        sdk.close()
+
+
+def test_an_excluded_supersession_is_a_reported_pass(echo_reader, monkeypatch):
+    """The P2 this fixes: D8's own second option — "must be flagged or
+    EXCLUDED" — used to read as a hard failure.
+
+    Mutation: the assembly drops terminal hits (the shape a future/lane-local
+    change that excludes superseded points would have). The store still holds
+    the claim and the lane's retrieval still returns it, so the only reason it
+    never appears in the evidence is that it was EXCLUDED. The instrument must
+    report that as its own field and PASS — not call it an unmeasured gate.
+    """
+    import tortoise.retrieval as retrieval
+    from tools.ask_spotcheck import _distilled_payload, run_distilled_case
+    from tools.longmem_eval.judge import MockJudge
+
+    original = retrieval.assemble_context
+
+    def _exclude_terminal(hits, *args, **kwargs):
+        return original([h for h in hits
+                         if (h.get("status") or "live") != "superseded"],
+                        *args, **kwargs)
+
+    monkeypatch.setattr(retrieval, "assemble_context", _exclude_terminal)
+    rec = run_distilled_case(_case(CASES[0]["question_id"]), MockJudge())
+    sl = rec["distilled"]["superseded_live"]
+    assert sl["seen"] == 0, rec["distilled"]
+    assert "[SUPERSEDED BY:" not in rec["distilled"]["evidence"]
+    # ... the claim WAS in the pool: retrievable, hence EXCLUDED, hence pass.
+    assert sl["retrievable"] is True, sl
+    assert sl["excluded"] is True, sl
+    payload = _distilled_payload([rec])
+    assert _distilled_hard_failures(payload) == [], payload
+    assert payload["arms"]["distilled"]["superseded_live"]["excluded"] == 1
+
+
+def test_a_retrieval_gap_still_fails_closed(echo_reader, monkeypatch):
+    """The other half of the split: when the claim never comes out of the
+    store, ``seen == 0`` is still the fail-closed RETRIEVAL gap — the exclusion
+    fix must not turn an unmeasured gate into a green.
+
+    Mutation: the retrieval never returns terminal hits at all (an index/gap
+    in the store, the way an unfiltered probe cannot see the claim either), so
+    the claim is unobservable AND unretrievable.
+    """
+    from tools.ask_spotcheck import _distilled_payload, run_distilled_case
+    from tools.longmem_eval.judge import MockJudge
+
+    original = TortoiseSDK.tortoise_fts_query
+
+    def _live_only(self, *args, **kwargs):
+        kwargs["include_terminal"] = False
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(TortoiseSDK, "tortoise_fts_query", _live_only)
+    rec = run_distilled_case(_case(CASES[0]["question_id"]), MockJudge())
+    sl = rec["distilled"]["superseded_live"]
+    assert sl["seen"] == 0, rec["distilled"]
+    assert sl["retrievable"] is False, sl
+    assert sl["excluded"] is False, sl
+    failures = _distilled_hard_failures(_distilled_payload([rec]))
+    assert failures and "GAP" in failures[0], failures
+
+
+# ── 7. The machine-readable line, and the composition leg untouched ───────
 
 def test_distilled_leg_emits_one_json_line_and_exits_clean(monkeypatch,
                                                           capsys,
@@ -455,9 +571,14 @@ def test_distilled_leg_emits_one_json_line_and_exits_clean(monkeypatch,
         assert set(payload["arms"][arm]["current_state"]) == {
             "committed", "n", "rate"}
         assert set(payload["arms"][arm]["superseded_live"]) == {
-            "seen", "rendered_live", "rate"}
+            "seen", "rendered_live", "rate", "excluded"}
     assert payload["arms"]["distilled"]["superseded_live"]["rendered_live"] == 0
+    assert payload["arms"]["distilled"]["superseded_live"]["excluded"] == 0
     assert payload["arms"]["distilled"]["current_state"]["n"] == len(CASES)
+    # every case is REPORTED as retrievable, so "rendered_live == 0" is a
+    # measured flag, not an absence of evidence
+    assert all(c["distilled"]["superseded_live"]["retrievable"] is True
+               for c in payload["cases"]), payload["cases"]
     assert rc == 0, (rc, out)
 
 
