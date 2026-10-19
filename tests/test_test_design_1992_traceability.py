@@ -64,14 +64,52 @@ the invariants that were being checked by hand are checked here instead:
    dismissible-hide with re-open path when complete" AND "neither card carries a
    dismissal" — one claim, two opposite answers, in one sentence. The previous
    guard asserted the absence of one literal phrase, so it passed a row that
-   stated both. Claims are now read per clause and attached to the door named in
-   that clause; a door-less denial that contradicts an affirming door is a
-   failure. Polarity is bound to a negation that GOVERNS "dismiss", never to any
-   negation in the clause: the clause-wide scan the first version used read
-   `never a counted checklist of its own, and it is dismissible once complete` as
-   a DENIAL (so a regressed row affirming an Overview dismissal passed), and read
-   the correct row's `implements no hide` as a denial of the Settings door's
-   recorded dismissible-hide. Both counterexamples are in-suite rejection cases.
+   stated both. The guard now requires the corrected claim to still be PRESENT and
+   rejects the enumerated denial shapes below. Its contract is stated exactly, because
+   eight review rounds measured that a stronger one cannot be delivered:
+     MUST   both claims are present VERBATIM (a reworded or dropped claim fails);
+     MUST   no enumerated denial shape is present (see `_DENIED_SHAPES` /
+            `_OVERVIEW_SHAPES`), including in a comma clause that does not repeat the
+            door name and across a comma in either door order;
+     LIMIT  a denial that REUSES a required claim's exact wording with a pronoun — "…
+            dismissible-hide with a re-open path when complete, but it carries no
+            dismissal" — is NOT caught. Resolving "it" to the Settings door is
+            anaphora, not a pattern; and the wording has to be masked out of the
+            residual so that the door-agnostic `no … dismiss` shape can exist at all.
+            `_STATED_LIMIT_ROWS` pins this in an executable test so no reader can
+            mistake the guard for a truth oracle;
+     LIMIT  `non-dismissible` / `undismissable` on its own, and any unenumerated
+            phrasing. This is a regression guard for one documentation row — it
+            proves the corrected claim is still there and the measured contradictions
+            are gone, NOT that arbitrary English is classified.
+   The Overview door is matched under
+   both the prose word `Overview` and the component name its own docs use,
+   `OverviewNextActionCard` — a row naming the door only by component was previously
+   read as claiming nothing about it. The Settings door does not need to be named: the
+   denial shapes key on the dismissal vocabulary, and the Settings claim is required
+   as a verbatim sentence.
+   This is NOT a natural-language polarity classifier, and six review rounds of one
+   are why. Two versions were written and each was wrong in the direction that
+   matters, measured on real sentences: a clause-wide negation scan read "never a
+   counted checklist … and it is dismissible once complete" as a DENIAL, so a row
+   AFFIRMING an Overview dismissal passed the guard whose whole purpose is that
+   claim; and the broad "any `dismiss*` token affirms" rule — added so that correct
+   prose was not rejected — read every unenumerated denial ("… whose dismissal is
+   disabled", "has neither a dismiss button …") as an affirmation, and it made the
+   fail-closed branch unreachable, because every clause containing "dismiss"
+   matched it. Distance-bounding the negation scan did not help: it only required
+   the unrelated negation to be NEARER. There is no bounded keyword rule that
+   classifies arbitrary English.
+   So the guard is DECIDABLE: it requires the two claims the row must carry (the
+   Overview's "no dismissal", the Settings door's recorded "dismissible-hide with a
+   re-open path") and a denylist of the shapes that contradict them — the
+   superseded wording, a dismissal asserted for the Overview, a denial of the
+   Settings record in any of its measured forms, and a door-less denial. Widening
+   that vocabulary is a deliberate edit here, never a silent pass; the limits of the
+   denylist are the LIMIT items above. Every enumerated shape is a `must_fail` row in
+   `test_the_dismissal_door_guard_rejects_the_one_sentence_contradiction`, and a row
+   that keeps the claim but states a dismissal in a form the denylist does not list is
+   a disclosed LIMIT, not a silent pass that is claimed as a catch.
 11. **The superseded mirror claim is reconciled where it survived, not only
    where it was first noticed.** `03-scope.md` §4 E2E-6 — the AUTHORITY this
    module's door pin anchors to — still read "mirrored as a dismissible
@@ -345,113 +383,155 @@ def _missing_e2e6_doors(
     return (required | contract_doors) - cited
 
 
-# ── dismissal claims: every one of them belongs to a DOOR ──────────────
-#: The two doors `05-ux-decisions.md` row "Affordance: setup card" describes.
-#: The Settings Setup guide owns the recorded dismissible-hide; the Overview
-#: next action owns none. Matched as PATTERNS over the names the epic's own docs
-#: use — the prose name ("the Settings Setup guide", "the Overview next
-#: action") AND the component name (`SetupGuideCard`,
-#: `OverviewNextActionCard`). Keying either door on one literal phrase makes a row
-#: that names the door any other way invisible: with the phrase-only table a row
-#: denying the Settings door's recorded dismissal via `SetupGuideCard` was read as
-#: claiming nothing about it. Both shapes are pinned in-suite.
-#:
-#: The component-name alternative sits INSIDE the branch that requires the door's
-#: own word (`settings` / `overview`), never standalone: a clause that mentions
-#: `SetupGuideCard` while talking about the OVERVIEW ("the shipped `SetupGuideCard`
-#: collapses to a status today") is a claim about the Overview door, and matching
-#: the component name alone attributed the Overview's denial to the Settings door.
-_DOOR_RES = {
-    "settings": re.compile(
-        r"\bsettings\b[^.;]{0,40}?(?:\bset\s*up\s+guide\b|\bguide\b|\bcard\b"
-        r"|setup[\s_-]*guide[\s_-]*card)",
-        re.I),
-    "overview": re.compile(
-        r"\boverview\b|\bcontinue[\s-]*setup\s+card\b",
-        re.I),
-}
+# ── dismissal claims: the row must still CARRY the corrected claim ──────
+# The row `05-ux-decisions.md` "Affordance: setup card" is CITED by the map as the
+# authority for the corrected claim, so it must still state that claim and must not
+# state its negation.
+#
+# ⛔ This is NOT a natural-language polarity classifier, and six review rounds are
+# why. Four versions of one were written; each was measured wrong in BOTH
+# directions, and each fix opened the side the previous one had closed:
+#   * a clause-wide negation scan read "never a counted checklist … and it is
+#     dismissible once complete" as a DENIAL, so a row AFFIRMING an Overview
+#     dismissal passed the guard whose whole purpose is that claim;
+#   * distance-bounding that scan only required the unrelated negation to be
+#     NEARER ("has no toggle and is dismissible" still passed);
+#   * a broad "any `dismiss*` token affirms" rule (added so correct prose was not
+#     rejected) read every unenumerated denial as an affirmation and made the
+#     fail-closed branch unreachable;
+#   * requiring the recorded-decision copula made PRE-phrase negations fall
+#     through, but a post-phrase negation ("… is a dismissible-hide that never
+#     shipped") still matched, and a retirement-window rule then rejected correct
+#     prose that mentioned "later"/"no data loss" after the claim.
+# There is no bounded keyword rule that classifies arbitrary English, and the next
+# wording was always one sentence away.
+#
+# So the guard is DECIDABLE instead: it requires the two claims VERBATIM. A denial
+# cannot contain the sentence — "does not have a dismissible-hide with a re-open
+# path" does not contain "dismissible-hide with a re-open path" — so a reworded
+# denial REMOVES the claim and fails, whatever its grammar. `_DENIED_SHAPES` is
+# defence in depth for a row that keeps the claim and contradicts it elsewhere.
+#
+# The contract, stated so it cannot be over-claimed: a row must (a) still contain
+# both claims verbatim, and (b) contain none of the enumerated contradicting
+# shapes. Rewording a claim is a FAILURE that names what must be restored; adding a
+# newly-invented contradicting shape to `_DENIED_SHAPES` is a deliberate edit.
 
-#: A denial quantified over BOTH doors ("neither card carries a dismissal",
-#: "no door ..."). This is the shape that swallowed the Settings door's
-#: recorded dismissal while an adjacent clause asserted it.
-_DOORLESS_DENIAL = re.compile(
-    r"\b(?:neither|no)\s+(?:of\s+the\s+)?(?:both\s+)?(?:cards?|doors?)\b", re.I)
-
-#: A negation that GOVERNS "dismiss" — the dismissal PHRASE, never a distance.
-#:
-#: Two earlier versions of this rule were wrong, measured on real clauses:
-#:   (a) scanning the whole clause for any negation scored
-#:       "never a counted checklist of its own — and the Overview door is
-#:       dismissible once complete" as a DENIAL, so a row AFFIRMING an Overview
-#:       dismissal passed the guard whose entire purpose is that claim;
-#:   (b) bounding that scan to 24 chars did not fix it — it only required the
-#:       unrelated negation to be NEARER: "the Overview card has no toggle and is
-#:       dismissible once complete" still scored as a denial. The same bound also
-#:       rejected CORRECT prose ("cannot be dismissed", "nothing ... is
-#:       dismissible", "undismissable") as an affirmation.
-#: So each alternative below matches a negation governing the dismissal token,
-#: with at most two words between them ("no counted dismissal"), plus the
-#: idiomatic forms. A negation attached to some OTHER noun ("no toggle", "no
-#: hide", "not a checklist") is not a claim about dismissal and no longer denies.
-_DISMISSAL_DENIAL = re.compile(
-    r"\b(?:no|zero)\s+(?:\w+\s+){0,2}?dismiss"              # no dismissal
-    r"|\bnot\s+(?:\w+\s+){0,2}?dismiss"                      # not dismissible
-    r"|\bnever\s+(?:\w+\s+){0,2}?dismiss"                    # never dismissed
-    r"|\bwithout\s+(?:\w+\s+){0,2}?dismiss"                  # without dismissal
-    r"|\b(?:cannot|can't|won't|doesn't|don't|isn't|aren't)\b(?:\s+be)?\s+dismiss"
-    r"|\b(?:is|are|was|were|can\s+be|will\s+be)\s+not\s+dismiss"   # is not dismissible
-    r"|\bnothing\b[^.;]{0,24}?\b(?:is|are)\s+dismiss"         # nothing ... is dismissible
-    r"|\bneither\b[^.;]{0,24}?\b(?:carries|has|offers|implements)\b[^.;]{0,12}?dismiss"
-    r"|\bundismiss\w*",                                      # undismissable
-    re.I,
+#: The two claims the cited row must still carry — matched verbatim (whitespace
+#: normalised, case-insensitive), because a fragment is satisfiable by a denial.
+_REQUIRED_CLAIMS = (
+    ("the Settings door's recorded decision", "dismissible-hide with a re-open path"),
+    ("the Overview door's answer", "carries no dismissal"),
 )
-_DISMISSAL = re.compile(r"dismiss", re.I)
 
+#: Shapes that contradict the corrected claim. They are matched over the WHOLE row,
+#: because a denial contradicts the claim it qualifies wherever it sits — including in
+#: the comma clause AFTER the door name ("… dismissible-hide with a re-open path when
+#: complete, and it has no dismissal").
+#:
+#: The ONE sentence that is legitimately negative — the Overview door's own answer,
+#: `carries no dismissal` — is removed from the text before these run (see
+#: `_dismissal_claim_conflicts`). That removal is what lets a door-agnostic `no …
+#: dismiss` rule exist at all: without it, the required Overview claim matched it and
+#: the live row was rejected. An earlier version instead scoped the door shapes to
+#: comma SEGMENTS, which let a denial in the FOLLOWING clause escape (each such shape
+#: requires the door name) — a measured fail-open on four rows, so segmentation was
+#: removed rather than layered over.
+_DENIED_SHAPES = (
+    (re.compile(r"dismissible\s+checklist", re.I),
+     "the superseded wording — the Overview next action is not a dismissible "
+     "checklist"),
+    (re.compile(r"\b(?:neither|no)\s+(?:of\s+the\s+)?(?:both\s+)?(?:cards?|doors?)\b"
+                r"[^.;]{0,80}?dismiss", re.I),
+     "a door-LESS denial (\"neither card …\" / \"no door …\") contradicts the "
+     "Settings door's dismissible-hide"),
+    (re.compile(r"\b(?:does\s+not|doesn't|do\s+not|never|no\s+longer|not|without)\b"
+                r"[^.;]{0,40}?dismissible[\s-]*hide", re.I),
+     "the Settings door's recorded dismissible-hide is DENIED before it is named "
+     "(\"does not have a dismissible-hide\", \"never had a dismissible-hide\")"),
+    (re.compile(r"dismiss\w*\b[^.;]{0,80}?\b(?:not\s+implemented|never\s+shipped"
+                r"|not\s+what\s+shipped|rejected|reversed|superseded|withdrawn"
+                r"|disabled|removed|dropped|absent|does\s+not\s+exist)", re.I),
+     "the Settings door's recorded dismissible-hide is stated and then "
+     "retired/denied"),
+    # Door-agnostic, so it also catches a denial in a clause that never repeats the
+    # door name. It must require an actual `dismiss` token: keying on a bare
+    # `without`/`lacks` was measured rejecting correct prose ("the CTA opens Settings
+    # without a full reload", "later steps proceed without blocking", "the CTA lacks a
+    # tooltip today"). `non-dismissible` alone remains a STATED LIMIT — it cannot be
+    # told apart from the billing banner this module's own notes describe as
+    # legitimately non-dismissible.
+    (re.compile(r"\b(?:lacks?|without|nothing|neither|no|zero)\b[^.;]{0,40}?"
+                r"\bdismiss", re.I),
+     "a dismissal is denied, contradicting the Settings door's recorded "
+     "dismissible-hide"),
+)
 
-def _dismissal_claims(text: str) -> dict[str, set[str]]:
-    """Clause-level `door -> {"affirms", "denies"}` for every dismissal claim.
-
-    `;`/`.` split each claim away from its neighbours so it stays attached to the
-    door named in the SAME clause. Averaging the whole row into one boolean is
-    what let "the Settings card collapses / dismissible-hides when complete" and
-    "neither card carries a dismissal" sit in one sentence: two doors, two
-    answers, and a reader tracing either one gets a different claim.
-    """
-    claims: dict[str, set[str]] = {"settings": set(), "overview": set()}
-    for clause in re.split(r"[;.]", text):
-        if not _DISMISSAL.search(clause):
-            continue
-        # Bound to the dismissal token, never to the clause: see _DISMISSAL_DENIAL.
-        verdict = "denies" if _DISMISSAL_DENIAL.search(clause) else "affirms"
-        doors = [d for d, rx in _DOOR_RES.items() if rx.search(clause)]
-        for door in doors:
-            claims[door].add(verdict)
-        if verdict == "denies" and _DOORLESS_DENIAL.search(clause):
-            claims.setdefault("*", set()).add(verdict)
-    return claims
+#: The Overview door's answer asserted POSITIVELY. Matched on a text with BOTH required
+#: claims masked out, because the shape has to span a comma to catch a denial that
+#: follows the correct claim ("… carries no dismissal, but it is dismissible once
+#: complete") — and across that comma it would otherwise reach the Settings claim's own
+#: `dismissible-hide` in the reverse-order row. `(?!al\b)` keeps "dismissal" itself out
+#: of the shape; the verbs are affirmative only.
+_OVERVIEW_SHAPES = (
+    (re.compile(r"\b(?:overview|overviewnextactioncard)\w*\b[^.;]{0,120}?"
+                r"\b(?:is|are|was|were|remains?|shows?|has|have|provides?|offers?"
+                r"|carries|renders|exposes|includes|contains|adds)\b[^.;]{0,30}?"
+                r"\bdismiss(?!al\b)", re.I),
+     "the Overview door is asserted to have a dismissal (it has none)"),
+)
 
 
 def _dismissal_claim_conflicts(live: str) -> list[str]:
-    """The ways one row can give two answers for one dismissal claim.
+    """The ways the cited row can fail to carry ONE answer per door.
 
-    Returns the violations (an empty list = one answer per door).
+    Empty list = both claims are present verbatim and no contradicting shape is.
     """
-    claims = _dismissal_claims(live)
+    text = " ".join(live.split())
+    # Drop the one legitimately negative sentence — the Overview door's own answer —
+    # before the denial shapes run, so a door-agnostic `no … dismiss` rule cannot read
+    # it as a denial of the Settings door. Its presence is required just below.
+    residual = text.lower().replace(_REQUIRED_CLAIMS[1][1], " ")
+    # Both claims masked: the Overview shape must span a comma to catch a denial that
+    # follows the correct claim, and across that comma it would otherwise reach the
+    # Settings claim's own `dismissible-hide` in the reverse-order row.
+    both_masked = residual.replace(_REQUIRED_CLAIMS[0][1], " ")
     out: list[str] = []
-    if "affirms" in claims["overview"]:
-        out.append("the Overview door carries no dismissal in the shipped "
-                   "dashboard (`OverviewNextActionCard`), but the row affirms one")
-    if "denies" not in claims["overview"]:
-        out.append("the row must state that the Overview door carries NO "
-                   "dismissal — that is the claim the map corrected")
-    if "denies" in claims["settings"]:
-        out.append('the decision recorded for the Settings door IS a '
-                   'dismissible-hide with a re-open path (row "Layout: Setup '
-                   'guide"), but the row denies it')
-    if "denies" in claims.get("*", set()) and "affirms" in claims["settings"]:
-        out.append("a door-LESS denial (\"neither card ...\" / \"no door ...\") "
-                   "contradicts the Settings door's affirmed dismissible-hide")
+    for label, claim in _REQUIRED_CLAIMS:
+        if claim not in text.lower():
+            out.append(f"the row no longer states {label} — it must carry "
+                       f'{claim!r} verbatim; a reworded or negated version drops '
+                       "the claim, which is the point of matching it whole")
+    for rx, why in _DENIED_SHAPES:
+        if rx.search(residual):
+            out.append(why)
+    for rx, why in _OVERVIEW_SHAPES:
+        if rx.search(both_masked):
+            out.append(why)
     return out
+
+
+#: Rows that DO contradict the corrected claim and are deliberately NOT caught, so the
+#: limitation stated in the module docstring is executable rather than prose. Two of
+#: these reuse a required claim verbatim with a pronoun; one asserts the Overview
+#: dismissal in the very words of the Settings claim. Closing them needs anaphora
+#: resolution, and deleting them from this tuple would silently overclaim the guard.
+_STATED_LIMIT_ROWS = (
+    "the Settings Setup guide is the counted checklist card, and the decision recorded "
+    "for that door is dismissible-hide with a re-open path when complete, but it "
+    "carries no dismissal; the Overview next action carries no dismissal",
+    "the Settings card's recorded decision is dismissible-hide with a re-open path, and "
+    "the Settings card carries no dismissal; the Overview next action carries no "
+    "dismissal",
+    "the Overview card is dismissible-hide with a re-open path; the Settings Setup guide "
+    "is the counted checklist card, and the decision recorded for that door is "
+    "dismissible-hide with a re-open path when complete; the Overview next action "
+    "carries no dismissal",
+    "the Settings Setup guide is the counted checklist card, and the decision recorded "
+    "for that door is dismissible-hide with a re-open path when complete; the Overview "
+    "next action carries no dismissal; the Settings guide is nonetheless "
+    "non-dismissible",
+)
 
 
 def _orphan_close_parens(text: str) -> list[str]:
@@ -607,6 +687,40 @@ def test_the_plan_cites_the_same_surfaces_for_every_e2e_row():
         + "; ".join(f"{k} plan={p} map={m}" for k, (p, m) in sorted(drift.items())))
 
 
+def _plan_role_violations(block: str) -> list[str]:
+    """Ways the plan's DE2E-6 section can get the two door roles wrong.
+
+    Both directions matter, and the FIRST version of this check only did the
+    first: presence alone is blind to a section that gives BOTH doors BOTH roles
+    ("the Overview next action is also the counted checklist card, and the Settings
+    Setup guide is one next step") — the "two answers for one capability" defect
+    this module exists for. So each door's role is asserted positively AND the
+    other door's role is asserted absent.
+    """
+    block = block.lower()
+    out: list[str] = []
+    if "the settings setup guide is the counted checklist card" not in block:
+        out.append("the plan must state that the Settings Setup guide IS the "
+                   "counted checklist card (its role), not only that it renders "
+                   "the same state")
+    if "the overview next action is one next step" not in block:
+        out.append("the plan must state the Overview next action's role (ONE next "
+                   "step + a CTA), not only that it mirrors the state")
+    for forbidden, why in (
+        ("the overview next action is the counted checklist card",
+         "the counted checklist belongs to the Settings door"),
+        ("the overview next action is also the counted checklist card",
+         "the counted checklist belongs to the Settings door"),
+        ("the settings setup guide is one next step",
+         "ONE next step + a CTA belongs to the Overview door"),
+    ):
+        if forbidden in block:
+            out.append(f"the plan gives both doors the same role ({forbidden!r}) — "
+                       f"{why}")
+    out.extend(_dismissal_claim_conflicts(block))
+    return out
+
+
 def test_the_plan_assigns_each_door_its_own_role():
     """The plan's DE2E-6 `Assert` is the spec a child issue implements, and it is
     the third copy of the door ROLES as well as of the surface set.
@@ -623,16 +737,20 @@ def test_the_plan_assigns_each_door_its_own_role():
     text = PLAN.read_text(encoding="utf-8")
     m = re.search(r"^### DE2E-6\b.*?(?=^### |\Z)", text, re.M | re.S)
     assert m, "the `### DE2E-6` section is gone from 06-plan.md"
-    block = m.group(0).lower()
-    assert "the settings setup guide is the counted checklist card" in block, (
-        "the plan must state that the Settings Setup guide IS the counted "
-        "checklist card (its role), not only that it renders the same state")
-    assert "the overview next action is one next step" in block, (
-        "the plan must state the Overview next action's role (ONE next step + a "
-        "CTA), not only that it mirrors the state")
-    assert not _dismissal_claim_conflicts(block), (
-        "the plan's DE2E-6 gives two answers for one dismissal claim:\n- "
-        + "\n- ".join(_dismissal_claim_conflicts(block)))
+    block = m.group(0)
+    assert _plan_role_violations(block) == [], (
+        "the plan's DE2E-6 gives a wrong or doubled door role:\n- "
+        + "\n- ".join(_plan_role_violations(block)))
+    # Non-vacuity: a section that hands BOTH roles to BOTH doors must fail. The
+    # presence-only form of this check passed exactly this mutation.
+    doubled = block + ("\nnote: the overview next action is also the counted "
+                       "checklist card, and the settings setup guide is one "
+                       "next step + a cta.\n")
+    assert _plan_role_violations(doubled), (
+        "the door-role check passes a section that gives both doors both roles")
+    assert any("same role" in v for v in _plan_role_violations(doubled)), (
+        "the doubled-role mutation is caught, but not by the role check: "
+        + str(_plan_role_violations(doubled)))
 
 
 def test_capability_rows_are_the_scopes_rows_in_order():
@@ -831,110 +949,114 @@ def test_the_ux_decision_row_the_map_cites_no_longer_claims_a_dismissible_list()
         + "\n- ".join(conflicts) + "\nrow: " + live)
 
 
+def test_the_dismissal_guard_states_its_own_limit_rather_than_overclaiming():
+    """The limits the module docstring names are real and pinned here.
+
+    Each row below DOES contradict the corrected claim and is NOT caught — anaphora
+    ("it carries no dismissal", where "it" is the Settings door) and a claim asserted
+    in the other door's exact words cannot be separated by a pattern. Naming them as
+    limits, in an executable tuple, is what stops the guard from being read as a truth
+    oracle. If a future change makes one of these catchable, move it into
+    `test_the_dismissal_door_guard_rejects_the_one_sentence_contradiction`'s must_fail
+    table — do not just delete it from here.
+    """
+    for row in _STATED_LIMIT_ROWS:
+        assert not _dismissal_claim_conflicts(row), (
+            f"a stated-limit row is now caught — move it to the must_fail table "
+            f"instead of leaving the docstring understating the guard: {row!r}")
+
+
 def test_the_dismissal_door_guard_rejects_the_one_sentence_contradiction():
-    """Non-vacuity, and the RECEIPT for why the previous guard was too narrow.
+    """Non-vacuity, and the RECEIPT for every rule this guard has had.
 
     The reviewed head's live row said the Settings card "collapses to compact
     status / dismissible-hide with re-open path when complete" and then "neither
-    card carries a dismissal" — both claims in one sentence. The literal-only
-    assertion above (`"dismissible checklist card" not in live`) passed it,
-    because the contradiction lives in the two doors, not in one phrase.
+    card carries a dismissal" — both claims in one sentence, and an earlier
+    literal-only assertion passed it because the contradiction lives in the two
+    doors, not in one phrase.
+
+    The table below is the accumulated receipt: each `must_fail` row is a wording
+    that one of this guard's earlier rules certified CLEAN, and each `must_pass`
+    row is wording one of them wrongly rejected. A rule is only worth keeping if it
+    keeps both columns.
     """
-    prefix_head = (
-        "Dashboard renders the SAME state on both of its doors — the Settings "
-        "Setup guide is the counted checklist card (collapses to compact status "
-        "/ dismissible-hide with re-open path when complete, per row \"Layout: "
-        "Setup guide\"); the Overview next action mirrors that state as ONE next "
-        "step + a CTA into the guide — never a counted checklist of its own, "
-        "and neither card carries a dismissal. ")
-    assert _dismissal_claim_conflicts(prefix_head), (
-        "the guard passes the exact self-contradicting sentence it exists for")
-    assert any("door-LESS" in c for c in _dismissal_claim_conflicts(prefix_head))
-    # a row that never says what the Overview door does is the same defect from
-    # the other side: silence let the next action be read as the checklist.
-    silent = ("the Settings Setup guide is the counted checklist card "
-              "(dismissible-hide with re-open path when complete)")
-    assert _dismissal_claim_conflicts(silent), (
-        "a row that never states the Overview door's answer must not pass")
-    # and the corrected shape must be clean, in both doors' presence
-    good = ("the Settings Setup guide is the counted checklist card, and the "
-            "decision recorded for THAT door is dismissible-hide with a "
-            "re-open path when complete; the Overview next action mirrors that "
-            "state as ONE next step + a CTA and carries no dismissal")
-    assert not _dismissal_claim_conflicts(good), _dismissal_claim_conflicts(good)
+    settings_claim = ("the Settings Setup guide is the counted checklist card, and "
+                      "the decision recorded for that door is dismissible-hide with "
+                      "a re-open path when complete")
+    overview_claim = "the Overview next action carries no dismissal"
+    row = f"{settings_claim}; {overview_claim}"
 
-    # The two counterexamples the round-4 review MEASURED on the pre-fix guard,
-    # which read polarity from ANY negation anywhere in the clause. They are kept
-    # as in-suite rejection cases so the rule cannot silently regress to it.
-    # (a) FAIL-OPEN: the row's own "never a counted checklist" supplied the
-    #     negation, so a row AFFIRMING a dismissible Overview passed the guard.
-    regressed = (
-        "the Settings Setup guide is the counted checklist card and the decision "
-        "recorded for THAT door is dismissible-hide with a re-open path; the "
-        "Overview next action mirrors that state as ONE next step + a CTA into the "
-        "guide — never a counted checklist of its own — and the Overview door is "
-        "dismissible once complete")
-    assert _dismissal_claim_conflicts(regressed), (
-        "the guard passes a row that AFFIRMS a dismissible Overview door: a "
-        "negation elsewhere in the clause must not deny the door's own claim")
-    # (b) FALSE POSITIVE: a correct row whose Settings clause mentions "no hide"
-    #     was rejected as denying the Settings door's recorded dismissible-hide.
-    correct_with_no_hide = (
-        "the Settings Setup guide is the counted checklist card — its recorded "
-        "decision is dismissible-hide with a re-open path, though the shipped card "
-        "implements no hide; the Overview next action carries no dismissal")
-    assert not _dismissal_claim_conflicts(correct_with_no_hide), (
-        "the guard rejects a correct row because 'implements no hide' reads as a "
-        "denial of the Settings door: "
-        + str(_dismissal_claim_conflicts(correct_with_no_hide)))
-
-    # Round-5 counterexamples. (b) above was only half the fail-open: bounding the
-    # negation scan to 24 chars still DENIED these, because the unrelated negation
-    # only had to be nearer than "dismiss".
-    for nearby_negation in (
-        "the Overview card has no toggle and is dismissible once complete",
-        "the Overview next action is not a checklist and is dismissible",
-        "the Overview card is not a counted checklist but it is dismissible",
-    ):
-        assert _dismissal_claim_conflicts(nearby_negation), (
-            "a negation attached to some OTHER noun (a toggle, a checklist) must "
-            f"not deny the door's dismissal claim: {nearby_negation!r}")
-
-    # ... and the converse: idiomatic denials that name no "no"/"not" adjacent to
-    # "dismiss" were read as AFFIRMATIONS by the clause/proximity scans.
-    for idiomatic_denial in (
-        "the Overview card cannot be dismissed",
-        "nothing on the Overview is dismissible",
-        "the Overview card is undismissable",
-    ):
-        assert not _dismissal_claim_conflicts(idiomatic_denial), (
-            f"a denial phrased {idiomatic_denial!r} must read as a denial, not an "
-            "affirmation: " + str(_dismissal_claim_conflicts(idiomatic_denial)))
-
-    # A door named by its COMPONENT must be seen, and a denial of its recorded
-    # dismissal must fail. With a phrase-only door table the Settings door was
-    # invisible here and the row passed.
-    by_component = ("the Settings-tab `SetupGuideCard` is not dismissible; "
-                    "the Overview next action carries no dismissal")
-    assert _dismissal_claim_conflicts(by_component), (
-        "a row denying the Settings door's recorded dismissible-hide via the "
-        "component name must fail")
-    assert any("Settings door IS a dismissible-hide" in c
-               for c in _dismissal_claim_conflicts(by_component)), (
-        "the component-name door shape is not attributed to the Settings door: "
-        + str(_dismissal_claim_conflicts(by_component)))
-    # ... while the component name inside an OVERVIEW sentence stays the Overview's
-    # claim. Matching `SetupGuideCard` standalone attributed the Overview's denial
-    # to the Settings door and failed the correct live row.
-    overview_mentions_component = (
-        "the Settings Setup guide is the counted checklist card and its recorded "
-        "decision is dismissible-hide with a re-open path; the Overview next "
-        "action is ONE next step + a CTA and carries no dismissal (the shipped "
-        "`SetupGuideCard` collapses to a status today and implements no hide)")
-    assert not _dismissal_claim_conflicts(overview_mentions_component), (
-        "a component name mentioned inside the Overview's clause must not be "
-        "read as a claim about the Settings door: "
-        + str(_dismissal_claim_conflicts(overview_mentions_component)))
+    must_pass = (
+        row,
+        # the live shape: the "never a counted checklist" negation belongs to the
+        # Overview clause and must not deny either claim
+        f"{settings_claim}; the Overview next action mirrors the state — never a "
+        f"counted checklist of its own — and carries no dismissal",
+        # trailing prose about OTHER things must not be read as retiring the claim,
+        # and a non-dismissal "without"/"lacks" or a legitimately non-dismissible
+        # BANNER must not be read as a denial of the Settings door
+        f"{settings_claim}, and later steps are unaffected; {overview_claim}",
+        # the two claims joined by a COMMA rather than `;` — one clause, both doors.
+        # Door-scoped shapes are matched per comma segment, so neither door's wording
+        # is attributed to the other (measured false rejection, both orders).
+        f"the Settings card's recorded decision is dismissible-hide with a re-open "
+        f"path, and the Overview next action carries no dismissal",
+        f"{overview_claim}, and the Settings card's recorded decision is "
+        f"dismissible-hide with a re-open path",
+        f"{row}; the CTA opens Settings without a full reload",
+        f"{row}; later steps proceed without blocking",
+        f"{row}; the CTA lacks a tooltip today",
+        f"{row}; the billing banner is non-dismissible",
+        f"{settings_claim}, not a blocking modal; {overview_claim}",
+        # the Settings door named by the component its own docs use
+        f"the Settings-tab `SetupGuideCard` is the counted checklist card and its "
+        f"recorded decision is dismissible-hide with a re-open path; {overview_claim}",
+    )
+    must_fail = (
+        # the superseded wording
+        f"{settings_claim}; neither card carries a dismissal",
+        f"{settings_claim}; the Overview next action is a dismissible checklist",
+        # the Overview door affirmed to have a dismissal
+        f"{settings_claim}; the Overview next action is dismissible once complete",
+        # the component-named Overview door, WITH both claims present — so this row
+        # cannot pass via the missing-claim rule and actually exercises the shape
+        f"{settings_claim}; `OverviewNextActionCard` shows a dismiss control; "
+        f"{overview_claim}",
+        f"{settings_claim}; the Overview card renders a dismiss control once "
+        f"complete; {overview_claim}",
+        f"{settings_claim}; the Settings card has no dismissal; {overview_claim}",
+        # a denial in the comma clause AFTER the door name — the four rows that the
+        # comma-segment version let through (measured regression), now receipts
+        f"{settings_claim}, and it has no dismissal; {overview_claim}",
+        f"{settings_claim}, and nothing there can be dismissed; {overview_claim}",
+        f"{settings_claim}, which lacks any dismiss control; {overview_claim}",
+        f"{overview_claim}, but it is dismissible once complete; {settings_claim}",
+        f"{settings_claim}; the Overview next action is not only dismissible but "
+        f"re-openable",
+        # a row that never states the Overview's answer
+        settings_claim,
+        # the Settings record negated in many grammatical positions — each drops the
+        # VERBATIM claim, which is why the verbatim form is what gets matched
+        f"the Settings Setup guide does not have a dismissible-hide with a re-open "
+        f"path; {overview_claim}",
+        f"the Settings Setup guide is non-dismissible; {overview_claim}",
+        f"the Settings Setup guide lacks any dismissal; {overview_claim}",
+        f"the Settings Setup guide has nothing to dismiss; {overview_claim}",
+        f"the Settings Setup guide no longer carries a dismissible-hide; "
+        f"{overview_claim}",
+        # the claim present AND retired in the same row
+        f"{settings_claim} — a dismissible-hide that never shipped; {overview_claim}",
+        f"{settings_claim}, since superseded; {overview_claim}",
+        f"{settings_claim}; the dismissible-hide with a re-open path was removed; "
+        f"{overview_claim}",
+    )
+    for r in must_pass:
+        assert not _dismissal_claim_conflicts(r), (
+            f"the guard rejects a correct row: {r!r}\n- "
+            + "\n- ".join(_dismissal_claim_conflicts(r)))
+    for r in must_fail:
+        assert _dismissal_claim_conflicts(r), (
+            f"the guard certifies a contradicting row CLEAN: {r!r}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
