@@ -1136,7 +1136,7 @@ def _missing_carve_out(doc: str) -> bool:
     """
     strong = [p for p in _paragraphs(doc) if _is_unconditional_contract_paragraph(p)]
     if not strong:
-        return False        # nothing claimed here — the census asserts a claim exists
+        return False        # no strong claim here — the census asserts one exists
     return any(not _states_carve_out(p) for p in strong)
 
 
@@ -1223,10 +1223,22 @@ def test_every_never_raises_contract_statement_names_the_refusal_carve_out():
     for module, fn in _NEVER_RAISES_CONTRACT_SITES:
         doc = _function_docstring(trees[module], fn)
         assert doc, f"{module}.{fn} lost its docstring — the contract is unstated"
+        # BOTH liveness checks, and the STRONG one is the load-bearing one: a bare
+        # pointer ("Best-effort: see the ONE exception.") satisfies
+        # `_is_contract_paragraph`, so without the second assert a site could drop
+        # its unconditional sentence, keep the pointer, and this census would go
+        # green while guarding nothing there (#9233 review round 8, ISSUE 1).
         assert [p for p in _paragraphs(doc) if _is_contract_paragraph(p)], (
             f"{module}.{fn} no longer states a best-effort contract; if the "
             "contract moved, update _NEVER_RAISES_CONTRACT_SITES rather than "
             "leaving a stale sentence behind")
+        assert [p for p in _paragraphs(doc)
+                if _is_unconditional_contract_paragraph(p)], (
+            f"{module}.{fn} makes no UNCONDITIONAL claim any more, so the "
+            "carve-out pin guards nothing at this site: a bare pointer phrase "
+            "(`best-effort`) satisfies the check above. Either restore the "
+            "never-raises sentence or drop the site from "
+            "_NEVER_RAISES_CONTRACT_SITES")
         if _missing_carve_out(doc):
             offenders.append(f"{module}.{fn}")
 
