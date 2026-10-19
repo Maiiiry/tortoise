@@ -24,7 +24,10 @@ Coverage map:
   (b) the §17.1 declaration applies — a journal-backed projection refuses an
       undeclared wipe and admits the sanctioned ``_replay_write_scope()`` one;
   (c) neither refusal can be defeated by the command's SPELLING (lowercase), its
-      ENCODING (bytes), or by naming a graph OTHER than the handle's own;
+      ENCODING (bytes), its ARGUMENT SHAPE (the combined `"GRAPH.DELETE <name>"`
+      form and leading/trailing whitespace, which redis-py's packer splits into
+      separate arguments before sending), or by naming a graph OTHER than the
+      handle's own;
   (d) the legitimate paths are unchanged: a test-named graph, the embedded
       backend, an ordinary ``GRAPH.QUERY``, and ``GRAPH.COPY`` (documented as
       NOT this class — it mints a new key and destroys nothing);
@@ -187,6 +190,62 @@ def test_lowercase_and_bytes_spellings_are_refused():
         guarded.execute_command(b"GRAPH.DELETE", b"prod_tortoise")
     with pytest.raises(RuntimeError, match="non-test graph"):
         guarded.execute_command("Graph.Delete", "prod_tortoise")
+    assert fake.calls == []
+
+
+def test_whitespace_and_combined_argument_forms_are_refused():
+    """redis-py SPLITS ``args[0]`` on whitespace before it encodes the command.
+
+    ``redis.connection.PythonRespSerializer.pack`` does
+    ``args = tuple(args[0].encode().split()) + args[1:]`` — the documented "the
+    client might have included 1 or more literal arguments in the command name,
+    e.g. 'CONFIG GET'" shape. So ``execute_command("GRAPH.DELETE <name>")``,
+    ``" GRAPH.DELETE"`` and the bytes forms all reach the server as a real
+    two-argument ``GRAPH.DELETE``, and a guard that read ``args[0]`` verbatim
+    would classify a command name the server never receives.
+
+    MEASURED on the pinned redis 7.4.1 — all of these emit the SAME bytes as the
+    refused two-argument form:
+
+        pack(("GRAPH.DELETE", "prod_tortoise"))  -> b'*2\\r\\n$12\\r\\nGRAPH.DELETE\\r\\n$13\\r\\nprod_tortoise\\r\\n'
+        pack(("GRAPH.DELETE prod_tortoise",))    -> identical
+        pack((" GRAPH.DELETE", "prod_tortoise")) -> identical
+    """
+    for args in (
+        ("GRAPH.DELETE prod_tortoise",),
+        (b"GRAPH.DELETE prod_tortoise",),
+        (" GRAPH.DELETE", "prod_tortoise"),
+        ("GRAPH.DELETE ", "prod_tortoise"),
+        ("GRAPH.DELETE\nprod_tortoise",),
+    ):
+        guarded, fake = _handle(graph_name="prod_tortoise")
+        with pytest.raises(RuntimeError, match="non-test graph"):
+            guarded.execute_command(*args)
+        assert fake.calls == [], f"{args!r} was transmitted despite the refusal"
+
+
+def test_a_combined_form_naming_a_disposable_graph_is_admitted():
+    """Control: the packer-shaped split is a normalisation, not a ban.
+
+    Without this the whitespace cases above would pass just as well if the
+    guard refused every ``GRAPH.DELETE`` that arrives in one argument.
+    """
+    guarded, fake = _handle(graph_name="prod_own")
+    assert guarded.execute_command("GRAPH.DELETE test_target") == "OK"
+    assert [c[0] for c in fake.calls] == ["execute_command"]
+
+
+def test_an_unreadable_target_is_refused_rather_than_assumed_to_be_ours():
+    """A target the guard cannot decode must fail CLOSED (#9209 review, P2).
+
+    Falling back to the handle's own graph name would apply the name rule to a
+    graph the command is not about — and a test-named handle would then pass it
+    while the wipe destroyed the graph the command actually named. That is the
+    lax half of the target rule, so an unreadable target refuses instead.
+    """
+    guarded, fake = _handle(graph_name="test_own")
+    with pytest.raises(RuntimeError, match="cannot be applied"):
+        guarded.execute_command("GRAPH.DELETE", memoryview(b"prod_tortoise"))
     assert fake.calls == []
 
 

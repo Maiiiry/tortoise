@@ -296,12 +296,21 @@ def main() -> int:
                 # ``name != expected`` guard IS its authorization, so it drops
                 # through the sanctioned sweep helper: presence re-check + the
                 # cross-process lock (#2961's AOF-poison guard), no L1/L2.
+                # ``detach=False`` because the drop is the whole graph:
+                # ``GRAPH.DELETE`` removes it wholesale, so the DETACH is
+                # redundant — and on a graph with no replayable record it is
+                # the materialising half of the AOF-poisoning sequence
+                # (``tortoise/graph_delete_guard.py`` module docstring; the same
+                # reason ``tests/_live_utils.py`` calls it with ``detach=False``).
+                # It would also walk every node of a 100k-operator bench graph.
                 from tortoise.graph_delete_guard import safe_graph_delete
-                if not safe_graph_delete(proj.db, name):
+                if not safe_graph_delete(proj.db, name, detach=False):
                     print(
-                        f"# WARNING: drop of {name} was refused or skipped "
-                        f"(absent, or the delete lock was unavailable) — "
-                        f"the graph is left for a later sweep",
+                        f"# WARNING: drop of {name} sent nothing — the graph "
+                        f"was already absent, or the delete lock was "
+                        f"unavailable. If it is still present it stays behind "
+                        f"(no test-scoped sweep reaps this namespace); re-run "
+                        f"with --drop to retry.",
                         file=sys.stderr)
                 else:
                     print(f"# dropped graph {name}")

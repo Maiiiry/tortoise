@@ -2720,8 +2720,10 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 #     is "no wipe by *forgetting* an opt-in"; those callers carry their own
 #     confirmation/authorization (e.g. ``team_delete`` requires the team name
 #     to match).
-#   * ``_GuardedGraph`` is a "guarded QUERY" wrapper, not a guarded handle, and
-#     only its ``query`` and ``delete`` verbs apply the bulk-wipe check. It
+#   * ``_GuardedGraph`` is a "guarded QUERY" wrapper, not a guarded handle: its
+#     ``query``, ``delete`` and ``execute_command`` paths apply the bulk-wipe
+#     check (``execute_command`` only for the one command whose effect is the
+#     whole graph, ``GRAPH.DELETE`` — #9209). It
 #     EXPLICITLY defines ``query``, ``ro_query``, ``_query``, ``profile``,
 #     ``explain``, ``execute_command`` and ``delete``; ``__getattr__`` forwards
 #     only the remaining, non-Cypher attributes (``name``, ``schema``, ...). So
@@ -2734,6 +2736,11 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 #     ``_GuardedGraph.delete()`` is now an explicit method and
 #     ``execute_command`` classifies its command, so BOTH non-Cypher wipe verbs
 #     refuse on §17.1 + L2 (``tests/test_9209_handle_noncypher_wipe.py``). The
+#     classification reads the vector redis-py actually transmits
+#     (``_wire_command_parts``), not ``args[0]`` verbatim — the packer splits
+#     the `"GRAPH.DELETE <name>"` / `" GRAPH.DELETE"` forms into a real
+#     two-argument command, so a verbatim read would guard a name the server
+#     never receives. The
 #     remaining verbs are still unguarded as described — they are the surface
 #     #3007/#3037's classifier decision gates. All of these PRE-DATE #2944
 #     (``query`` was the only verb that checked ``_is_bulk_wipe`` before it
@@ -3315,19 +3322,35 @@ def _journal_safe_params(params, cypher=None):
 # below anything a runtime signal is placed on.
 #
 # A FOURTH escape is now CLOSED (#9209): the write handle's NON-CYPHER wipe
-# verbs. `proj.g.delete()` (GRAPH.DELETE) reached the vendor handle through
+# verb. `proj.g.delete()` (GRAPH.DELETE) reached the vendor handle through
 # `_GuardedGraph.__getattr__`, and `proj.g.execute_command("GRAPH.DELETE",
 # <name>)` went out as a raw command — so the ONE call that destroys the whole
 # graph passed neither the §17.1 declaration nor L2, while the equivalent
-# Cypher statement was refused on both. Those two are the only paths whose
-# effect is the ENTIRE graph rather than a statement in it, so they are the
-# ones this block names; both now carry the same refusals as
+# Cypher statement was refused on both. What is closed is that verb, in every
+# spelling redis-py can transmit: the command vector is normalised with the
+# packer's own whitespace split (`_wire_command_parts`), so
+# `"GRAPH.DELETE <name>"`, `" GRAPH.DELETE"` and the bytes forms cannot slip
+# past by spelling. Both now carry the same refusals as
 # `MATCH (n) DETACH DELETE n` (`_GuardedGraph.delete` /
 # `_GuardedGraph.execute_command`, pinned by
-# `tests/test_9209_handle_noncypher_wipe.py`). The remaining non-query
-# attributes `__getattr__` forwards (`name`, `schema`, `copy`, …) either read
-# or mint state; `copy` WRITES UNDER A NEW KEY and destroys nothing, so it is
-# not this escape class.
+# `tests/test_9209_handle_noncypher_wipe.py`).
+#
+# ⛔ THE CLASS IS NOT CLOSED, and the rest is named here rather than implied
+# (the two escapes above are unchanged and this is a third list, not a
+# replacement):
+#   * `proj.g.client` / `proj.g._g` — `__getattr__` forwards both, and
+#     `client` is the raw Redis client, so `proj.g.client.execute_command(
+#     "GRAPH.DELETE", <g>)` bypasses both layers. It is escape (2) above by
+#     another attribute; `_g` is named there and `client` is named here.
+#   * `_WIPE_COMMANDS` holds ONE command. A FalkorDB graph IS a Redis key
+#     (`tortoise/graph_key_restore.py` does DUMP -> DEL -> RESTORE on it), so
+#     `execute_command("DEL"|"UNLINK", <g>)` destroys the same graph, and
+#     `FLUSHDB`/`FLUSHALL` take every graph on the server. None of those is
+#     classified here — widening the set is the #3007/#3037 decision (more
+#     verbs refusing is not free), filed as #9237.
+#   * the remaining forwarded attributes (`name`, `schema`, `copy`, …) either
+#     read or mint state; `copy` WRITES UNDER A NEW KEY and destroys nothing
+#     (MEASURED: an existing destination is refused by the engine).
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3356,6 +3379,41 @@ _DISPOSABLE_GRAPH_PREFIXES: tuple[str, ...] = ("test_", "tortoise_test")
 #: `ResponseError: destination key already exists`, destination unchanged), so
 #: it destroys nothing and is not this class.
 _WIPE_COMMANDS: frozenset[str] = frozenset({"GRAPH.DELETE"})
+
+
+def _wire_command_parts(args: tuple) -> tuple:
+    """The command vector redis-py will ACTUALLY transmit for ``args``.
+
+    ``redis.connection.PythonRespSerializer.pack`` splits ``args[0]`` on
+    whitespace before encoding — the documented "the client might have included
+    1 or more literal arguments in the command name, e.g. 'CONFIG GET'" shape:
+
+        if isinstance(args[0], str):
+            args = tuple(args[0].encode().split()) + args[1:]
+        elif b" " in args[0]:
+            args = tuple(args[0].split()) + args[1:]
+
+    MEASURED on the pinned redis 7.4.1: ``pack(("GRAPH.DELETE prod_tortoise",))``
+    and ``pack((" GRAPH.DELETE", "prod_tortoise"))`` both emit
+    ``b'*2\\r\\n$12\\r\\nGRAPH.DELETE\\r\\n$13\\r\\nprod_tortoise\\r\\n'`` — byte
+    identical to the refused two-argument form. A wipe guard that read
+    ``args[0]`` verbatim therefore classified a command name the server NEVER
+    receives, and forwarded a real ``GRAPH.DELETE`` (#9209 review, P1).
+
+    Mirroring the packer is deliberate: the guard must see the vector the
+    server sees, and a second, "cleaner" normalisation would be a second
+    definition of that vector (the ONE-seam reasoning of agent-infra#1362).
+    """
+    if not args:
+        return ()
+    head = args[0]
+    if isinstance(head, str):
+        # ``args[0].encode().split()`` — ALWAYS split (one part if no space).
+        return tuple(head.encode().split()) + tuple(args[1:])
+    if isinstance(head, (bytes, bytearray)) and b" " in bytes(head):
+        # The packer splits the bytes form only when a literal space is present.
+        return tuple(bytes(head).split()) + tuple(args[1:])
+    return tuple(args)
 
 #: The single-writer authorization for the current context. ``None`` = no
 #: sanctioned projection is in flight, so the default is REFUSAL. A ContextVar
@@ -3623,15 +3681,28 @@ class _GuardedGraph:
         # `MATCH (n) DETACH DELETE n` on this same handle was refused on both.
         # The command name is checked case-insensitively because the engine's
         # command dispatch is: a guard that only matched `"GRAPH.DELETE"` would
-        # be defeated by `"graph.delete"`.
-        verb, target = (
-            (_as_text(args[0]), _as_text(args[1]))
-            if len(args) >= 2 else (None, None)
-        )
+        # be defeated by `"graph.delete"`. The vector is classified AFTER the
+        # packer's own whitespace split (``_wire_command_parts``), because
+        # redis-py turns `"GRAPH.DELETE prod_tortoise"` and `" GRAPH.DELETE"`
+        # into a real two-argument `GRAPH.DELETE` on the wire — reading
+        # `args[0]` verbatim classified a command name the server never sees.
+        parts = _wire_command_parts(args)
+        verb = _as_text(parts[0]) if parts else None
         if isinstance(verb, str) and verb.upper() in _WIPE_COMMANDS:
-            self._refuse_undeclared_wipe(
-                verb.upper(),
-                target=target if isinstance(target, str) else None)
+            target: str | None = None
+            if len(parts) >= 2:
+                target = _as_text(parts[1])
+                if not isinstance(target, str):
+                    # Fail CLOSED: a target this guard cannot read is a target
+                    # it cannot check, and falling back to the handle's OWN
+                    # graph name would check a live graph the command is not
+                    # about — the lax half of the target rule.
+                    raise RuntimeError(
+                        f"Graph guard: refusing {verb.upper()} — the target is "
+                        f"a {type(parts[1]).__name__}, not a graph name this "
+                        f"guard can read, so the name rule cannot be applied "
+                        f"to it.")
+            self._refuse_undeclared_wipe(verb.upper(), target=target)
         return self._g.execute_command(*args, **kwargs)
 
     def delete(self):
@@ -14024,12 +14095,14 @@ class FalkorProjection(
         # on purpose — this method is the readable contract; the guarded
         # handle is the last line of defence for every other caller that goes
         # through it. Callers on ``proj.db``, and on the wrapper's OTHER query
-        # verbs (``proj.g._query`` / ``profile`` / ``execute_command`` — only
-        # ``query``/``delete`` apply the bulk-wipe check) bypass BOTH layers
+        # verbs (``proj.g._query`` / ``profile`` / ``execute_command`` for any
+        # verb but ``GRAPH.DELETE`` — ``query``/``delete``/``GRAPH.DELETE``
+        # apply the bulk-wipe check) bypass BOTH layers
         # — see the KNOWN GAPS note in the module comment. (The non-Cypher
-        # ``proj.g.delete()`` → GRAPH.DELETE escape that used to be listed here
-        # is CLOSED by #9209: it now runs §17.1's declaration + L2, like this
-        # method.)
+        # ``proj.g.delete()`` / ``proj.g.execute_command("GRAPH.DELETE", …)``
+        # escapes that used to be listed here are CLOSED by #9209: both now run
+        # §17.1's declaration + L2, like this method. The commands outside
+        # ``_WIPE_COMMANDS`` and the forwarded raw client are NOT — #9237.)
         self._assert_test_graph(
             f"REFUSING to run bulk DETACH DELETE on non-test graph "
             f"({operation})"
