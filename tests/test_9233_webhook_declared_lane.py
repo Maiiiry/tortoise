@@ -1071,48 +1071,73 @@ def _module_path(name: str) -> Path:
     return {"webhook_delivery": MODULE, "hosted_api": HOSTED_API}[name]
 
 
-#: Vocabulary a reword plausibly reaches for when it states the same contract.
-#: A lexical gate this narrow is a FALSE-RED generator: the cheapest way out of
-#: it is to wedge a literal phrase back into the prose instead of writing the
-#: clearest sentence (#9233 review round 6, ISSUE 2).
-_CONTRACT_PHRASES = (
-    "never raise", "never propagate", "never propagates", "does not raise",
-    "doesn't raise", "cannot raise", "cannot escape", "non-raising",
-    "best-effort",
+#: The UNCONDITIONAL half of the contract — a sentence that says a failure cannot
+#: escape. Every paragraph carrying one of these must name the carve-out in the
+#: SAME paragraph.
+_UNCONDITIONAL_CONTRACT_PHRASES = (
+    "never raise", "never propagate", "does not raise", "doesn't raise",
+    "cannot raise", "cannot escape", "non-raising",
 )
 
-#: The carve-out tokens: the lane, and the exception's own name.
-_CARVE_OUT_TOKENS = ("§17.1", "DirectCacheWriteRefused")
+#: A POINTER, not an unconditional claim: `dispatch_pending`'s own first line is
+#: "Best-effort: see the ONE exception." — it states the contract without
+#: re-stating it, so demanding the carve-out there is a false red. It still
+#: counts as "this docstring states a contract", which is what the census asserts.
+_CONTRACT_POINTERS = ("best-effort",)
+
+_CONTRACT_PHRASES = _UNCONDITIONAL_CONTRACT_PHRASES + _CONTRACT_POINTERS
+
+#: The carve-out tokens: the lane (whitespace-tolerant — `§ 17.1` is the same
+#: claim) and the exception's own name.
+_CARVE_OUT_17_1_RE = re.compile(r"§\s*17\s*\.\s*1")
+_CARVE_OUT_TOKENS = ("directcachewriterefused",)
 
 
 def _paragraphs(doc: str) -> list[str]:
     return [p for p in re.split(r"\n\s*\n", doc) if p.strip()]
 
 
-def _is_contract_paragraph(paragraph: str) -> bool:
+def _has_any_phrase(paragraph: str, phrases) -> bool:
     lowered = paragraph.lower().replace("\u2019", "'")
-    return any(phrase in lowered for phrase in _CONTRACT_PHRASES)
+    return any(phrase in lowered for phrase in phrases)
+
+
+def _is_contract_paragraph(paragraph: str) -> bool:
+    """Does this paragraph state the best-effort contract at all?"""
+    return _has_any_phrase(paragraph, _CONTRACT_PHRASES)
+
+
+def _is_unconditional_contract_paragraph(paragraph: str) -> bool:
+    """Does this paragraph make the STRONG claim (a failure cannot escape)?"""
+    return _has_any_phrase(paragraph, _UNCONDITIONAL_CONTRACT_PHRASES)
 
 
 def _states_carve_out(paragraph: str) -> bool:
-    return any(token in paragraph for token in _CARVE_OUT_TOKENS)
+    return (bool(_CARVE_OUT_17_1_RE.search(paragraph))
+            or _has_any_phrase(paragraph, _CARVE_OUT_TOKENS))
 
 
 def _missing_carve_out(doc: str) -> bool:
-    """True when `doc` states a best-effort contract whose own PARAGRAPH never
-    names the §17.1 refusal.
+    """True when `doc` makes an unconditional never-raises claim in a paragraph
+    that does not name the §17.1 refusal.
 
     Paragraph-scoped on purpose: a document-wide search passes the exact shape
     this pin exists to catch — an unconditional "never raises" sentence whose
     carve-out sits in some OTHER paragraph (measured: "See the module header
-    for the §17.1 write-lane declaration" beside it went green). The carve-out
-    must be in the sentence the reader who adds a call site is reading
-    (#9233 review round 6, ISSUE 1).
+    for the §17.1 write-lane declaration" beside it went green).
+
+    `all()` over the STRONG paragraphs, not `any()` over all of them
+    (#9233 review round 7): with the weak pointer phrases mixed in, `any()` let
+    an unconditional contract paragraph coexist with a carve-out paragraph
+    elsewhere — the same hole one paragraph over. A paragraph that merely points
+    at the exception ("Best-effort: see the ONE exception.") is not held to the
+    carve-out, because it does not make the claim — that is the split that keeps
+    the pin honest without false-redding real prose.
     """
-    contract_paragraphs = [p for p in _paragraphs(doc) if _is_contract_paragraph(p)]
-    if not contract_paragraphs:
-        return False        # nothing stated here — the census asserts it IS stated
-    return not any(_states_carve_out(p) for p in contract_paragraphs)
+    strong = [p for p in _paragraphs(doc) if _is_unconditional_contract_paragraph(p)]
+    if not strong:
+        return False        # nothing claimed here — the census asserts a claim exists
+    return any(not _states_carve_out(p) for p in strong)
 
 
 def _function_docstring(tree: ast.Module, name: str) -> str | None:
@@ -1123,25 +1148,58 @@ def _function_docstring(tree: ast.Module, name: str) -> str | None:
 
 
 def test_the_contract_pin_reads_paragraphs_not_the_whole_docstring():
-    """The checker this census rests on, pinned in BOTH directions.
+    """The checker this census rests on, pinned POSITIVELY in both directions.
 
-    A document-wide search for the carve-out passes the pre-fix shape — an
-    unconditional contract sentence with the §17.1 caveat parked in a different
-    paragraph — and a hard-coded phrase list reds a correct reword. Those were
-    the two failure modes of the first cut of this pin (#9233 review round 6).
+    Two failure modes had to be closed on the checker itself (#9233 review
+    rounds 6-7): a document-wide search passes the pre-fix shape (an
+    unconditional claim whose caveat is parked in another paragraph), and a
+    hard-coded phrase list reds a correct reword. Each case below is asserted to
+    take the branch it is named for — an assertion that can only pass through
+    the "nothing stated" early return would prove nothing, which is exactly what
+    the first cut of the middle case did.
     """
-    # the pre-fix SHAPE: contract stated, carve-out only in a NEIGHBOUR
-    assert _missing_carve_out(
+    # (a) the pre-fix SHAPE: claim stated, carve-out only in a NEIGHBOUR
+    neighbour = (
         "Push pending events. NEVER raises.\n\n"
-        "See the module header for the §17.1 write-lane declaration.\n"
-    ), "a carve-out in a neighbouring paragraph must not satisfy the pin"
-    # a reword that keeps the carve-out where it belongs
-    assert not _missing_carve_out(
-        "This pass contains every delivery and graph failure per graph,\n"
-        "including a §17.1 ``DirectCacheWriteRefused`` from the dispatch, so it\n"
-        "cannot end the sweep.\n"
-    ), "a correct reword that names the refusal in the same paragraph must pass"
-    # a docstring that states no contract at all is not this pin's business
+        "See the module header for the §17.1 write-lane declaration.\n")
+    assert _is_unconditional_contract_paragraph(_paragraphs(neighbour)[0])
+    assert _missing_carve_out(neighbour), (
+        "a carve-out in a neighbouring paragraph must not satisfy the pin")
+
+    # (b) a REWORD that keeps the carve-out where it belongs — must pass, and
+    #     must have been a live case (it carries a strong phrase of its own)
+    reword = (
+        "This pass contains every delivery and graph failure per graph, including\n"
+        "a §17.1 ``DirectCacheWriteRefused`` from the dispatch, so the loop\n"
+        "cannot escape it.\n")
+    assert _is_unconditional_contract_paragraph(reword), (
+        "the reword case carries no unconditional contract phrase, so it can "
+        "only pass through the nothing-stated branch — it would not prove the "
+        "checker accepts a reword")
+    assert not _missing_carve_out(reword), (
+        "a correct reword that names the refusal in the same paragraph must pass")
+    assert _missing_carve_out(
+        reword.replace("§17.1 ", "").replace("DirectCacheWriteRefused", "it")), (
+        "the same reword with its carve-out stripped must RED — otherwise the "
+        "case above passes for the wrong reason")
+
+    # (c) a strong claim in ONE paragraph and the carve-out in another (the
+    #     residual hole `any()` left open) — must red even though a contract
+    #     paragraph does name the refusal
+    elsewhere = (
+        "Never raises for a subscriber or transport failure.\n\n"
+        "Best-effort containment: a §17.1 ``DirectCacheWriteRefused`` propagates\n"
+        "out of the store, per graph.\n")
+    assert _missing_carve_out(elsewhere), (
+        "an unconditional claim whose carve-out lives in a DIFFERENT paragraph "
+        "must red — that is the hole `any()` left open")
+
+    # (d) a pointer without the strong claim is not held to the carve-out
+    pointer = "Push pending events. Best-effort: see the ONE exception.\n"
+    assert not _is_unconditional_contract_paragraph(pointer)
+    assert not _missing_carve_out(pointer)
+
+    # (e) a docstring that states no contract at all is not this pin's business
     assert not _missing_carve_out("Coerce a value.\n")
 
 
