@@ -3094,10 +3094,11 @@ surfaces:
   - test_rebuild_team_meta_marker_5353.py
   # #9210: the SAME wipe+replay, read from the other side — every non-record
   # snapshot-restore leg (`:Batch`, `:Session`, onboarding, `:TeamMeta`, the
-  # config registry, the `:GraphEventMeta` watermark) must observe its own
-  # named §17.1 declaration AT THE WRITE HANDLE, and must not inherit the
-  # replay lane even when the engine is wrapped in one. `tortoise/projection/`
-  # is the file it pins, so a projection change must run it.
+  # config registry, the `#4305` derived Point properties, the
+  # `:GraphEventMeta` watermark) must observe its own named §17.1 declaration
+  # AT THE WRITE HANDLE, and must not inherit the replay lane even when the
+  # engine is wrapped in one. `tortoise/projection/` is the file it pins, so a
+  # projection change must run it.
   - test_9210_rebuild_declares_restore.py
   - test_projection_embedded_socket_timeout.py  # #3350: embedded lane socket timeout + bounded retry (carve-out)
   - test_projection_lifecycle.py
@@ -6625,12 +6626,14 @@ durations:
   test_graph_delete_hygiene_report.py: 1.8
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
-  # #9210: added by a PR, so no CI reading exists yet (#3400 trap). 15 tests
-  # (5 functions, one parametrized over the 11 legs). MEASURED locally in the
-  # embedded lane: 27.3 s on a quiet box and 35.1 s under fleet load, of which
-  # ~15 s is the FIRST `create_point`'s one-time embedding-model load — the
-  # same artefact #9123 recorded for its own file. Declared ABOVE the LOADED
-  # reading so a busy leg cannot under-pack it.
+  # #9210: added by a PR, so no CI reading exists yet (#3400 trap). 4 tests.
+  # MEASURED locally in the embedded lane: 27.3 s on a quiet box and 35.1 s
+  # under fleet load, of which ~15 s is the FIRST `create_point`'s one-time
+  # embedding-model load — the same artefact #9123 recorded for its own file.
+  # Declared ABOVE the LOADED reading so a busy leg cannot under-pack it. The
+  # weight is unchanged by the deletion of the eleven table-only parametrized
+  # cases (they never executed product code, so they were never part of this
+  # measurement).
   test_9210_rebuild_declares_restore.py: 45.0
   # #4492: added by a PR, so no CI reading exists yet (`--refresh-durations`
   # samples push-to-main runs only). Hermetic — no DB, no network, no PGlite

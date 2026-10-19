@@ -7,15 +7,19 @@ THE GRAPH THAT IS ABOUT TO BE DESTROYED: `:Batch` markers and
 `Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
 onboarding state machine (node, `onboards` anchor, `COMPLETED_STEP` links), the
 `:TeamMeta` first-org marker, the `#2814` config registry, the `#4305` derived
-Point properties, and the `:GraphEventMeta` watermark. **Not one of those
-classes rides a journal record** (`#990`, `#3947`, `#4641`, `#5353`, `#2814`,
-`#4653` each say so at its writer), so the replay lane's contract — "this
-content came from the record" — is FALSE for every one of them. (`#4305` is
-the exception in MECHANISM only: the journal owns `content_hash` and
-`embedding` when it wrote them, so those are re-applied only where it did not,
-and the non-derived `_REPLAY_GAP_PROPS` apply to graph-only ids only. Its value
-still exists only in the pre-wipe capture, which is the property this lane is
-about.)
+Point properties, and the `:GraphEventMeta` watermark. **None of those writes
+is a projection of a journal record** (`#990`, `#4641`, `#5353`, `#2814`,
+`#4653` each say so at their writer), so the replay lane's contract — "this
+content came from the record" — is FALSE for them. Two legs are exceptions in
+MECHANISM only, and the `#3947` one is why it is NOT cited as a writer that
+says so: `#4305`'s journal owns `content_hash` and `embedding` when it wrote
+them (those are re-applied only where it did not, and the non-derived
+`_REPLAY_GAP_PROPS` apply to graph-only ids only), and the `#3947` `:Session`
+NODE **is** journal-carried for a post-`#3664` journal as a `SessionRecorded`
+record (folded by `_fold_session_recorded`) — only its `CONTAINS` edge and the
+re-application of its properties ride no record, and the restore is idempotent
+over the journal-carried half. The edge's value still exists only in the
+pre-wipe capture, which is the property this lane is about.
 
 Handing them the replay permit is therefore an over-authorization: the
 declaration claims a wider write scope than the restore performs. `#9124`'s
@@ -28,8 +32,8 @@ What is pinned here is the DECLARATION, observed **at the write handle** (the
 so a `with` block that wraps a block the write never runs inside cannot pass.
 Three properties, and each one names the wrong behaviour it makes impossible:
 
-1. every non-record restore write observes its OWN named lane, so a restore
-   can no longer be authorized by a claim that is false for it;
+1. every DIRECT snapshot-restore write observes its OWN named lane, so a
+   restore can no longer be authorized by a claim that is false for it;
 2. an OUTER `_replay_write_scope()` cannot cover a restore write — the inner
    declaration shadows it — so the over-broad permit `#9213`/`#9124` introduces
    around the whole engine cannot re-acquire these statements (and the same
@@ -39,9 +43,22 @@ Three properties, and each one names the wrong behaviour it makes impossible:
    restore reason unless it IS one of the snapshot-restore statements.
 
 MUTATION for every test here: replace a `self._restore_write(..., reason=...)`
-call in `rebuild_all` with the bare `self.g.query(...)` it wraps — test 1 and
-test 2 both go red on the observed reason (and 2 goes red with `"replay"`, the
+call in `rebuild_all` with the bare `self.g.query(...)` it wraps — tests 1 and
+2 both go red on the observed reason (and 2 goes red with `"replay"`, the
 false contract, rather than with `None`).
+
+WHAT THIS DOES NOT COVER — the two disclosed residuals, so neither is read as
+covered by the properties above:
+
+* the `:GraphEventMeta` watermark is the one restore leg that does not go
+  through `_restore_write` (its statement lives in
+  `event_store.reestablish_watermark`), so a write a future edit adds INSIDE
+  that helper inherits the watermark's declaration instead of failing the
+  required-`reason` contract;
+* `rebuild_all` also carries graph-only Points back by building
+  `synthetic_events` from the same pre-wipe capture and FOLDING them, so that
+  half is authorized by whatever permit the caller opened over the engine —
+  `"replay"` under `#9124`/`#9213` — and not by this lane.
 
 Lane: either. The fixtures build the SDK the way the embedded carve-out suite
 does, and the bulk-wipe guard passes on the redirected `test_*_tortoise` graph
@@ -51,8 +68,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 from tortoise.onboarding.state import (
     COMPLETED_STEP_EDGE,
     ONBOARDING_NODE_LABEL,
@@ -60,6 +75,7 @@ from tortoise.onboarding.state import (
     ONBOARDS_EDGE,
 )
 from tortoise.pack_state import PACK_INSTALL_LABEL
+from tortoise.pipeline import PIPELINE_LABEL
 from tortoise.projection import (
     _CACHE_WRITE_AUTHORIZED,
     _TEAM_META_LABEL,
@@ -74,65 +90,94 @@ from tortoise.sdk import TortoiseSDK
 #: so the literal cannot drift off the module's constant either.
 RESTORE = "pre-wipe-restore"
 
-#: leg → the reason `rebuild_all` must carry for that leg's statement, plus
-#: the normalized fragment that identifies the statement. One entry per
-#: snapshot-restore leg `#9210` names.
-_LEGS = {
+
+def _config_registry_parts() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The config leg's reasons and statement fragments, DERIVED from the registry.
+
+    The restore is ONE code site templated over EVERY class in
+    `projection._config_classes()` — `PackInstall(namespace)`,
+    `PackManifest(namespace)`, `Pipeline(pipelineKey)`, `PipelineStage(stageKey)`
+    and key-scoped `Meta(key)` — each writing under its own reason
+    (`config registry {spec.label} (#2814)`) with its own statement.
+
+    Pinning the `PackInstall` literal alone classified ONE of those five arms:
+    a snapshot carrying any other class is a restore write that matches no
+    fragment, so `test_the_restore_lane_does_not_claim_a_record_fold` reports
+    the lane as over-claiming on CORRECT product code — a false RED, and the
+    same defect class round 1 fixed for `point-derived` and `onboards`.
+    Deriving both halves from the registry means the table cannot go stale: a
+    class added there is classified here on the same commit.
+    """
+    from tortoise.projection import _config_classes
+
+    reasons: list[str] = []
+    fragments: list[str] = []
+    for spec in _config_classes():
+        reasons.append(f"{RESTORE}: config registry {spec.label} (#2814)")
+        fragments.append(
+            f"MERGE (n:{spec.label} {{{spec.identity_prop}:$identity}}) "
+            "SET n += $props")
+    return tuple(reasons), tuple(fragments)
+
+
+_CONFIG_REASONS, _CONFIG_FRAGMENTS = _config_registry_parts()
+
+#: leg → (`reasons` it must carry, statement `fragments` that identify it). ONE
+#: entry per snapshot-restore leg `#9210` names; a leg whose statement is
+#: templated over a registry (the config registry) carries one reason and one
+#: fragment PER class, because the product emits one per class.
+_LEGS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "batch-marker": (
-        f"{RESTORE}: :Batch markers (#990)",
-        "MERGE (b:Batch {id:$id}) SET b += $props",
+        (f"{RESTORE}: :Batch markers (#990)",),
+        ("MERGE (b:Batch {id:$id}) SET b += $props",),
     ),
     "batch-link": (
-        f"{RESTORE}: Point.batch_id links (#990)",
-        "MATCH (p:Point {id:$pid}) SET p.batch_id = $bid",
+        (f"{RESTORE}: Point.batch_id links (#990)",),
+        ("MATCH (p:Point {id:$pid}) SET p.batch_id = $bid",),
     ),
     "session": (
-        f"{RESTORE}: :Session containers (#3947)",
-        "MERGE (s:Session {id:$id}) SET s += $props",
+        (f"{RESTORE}: :Session containers (#3947)",),
+        ("MERGE (s:Session {id:$id}) SET s += $props",),
     ),
     "session-link": (
-        f"{RESTORE}: :Session CONTAINS links (#3947)",
-        "MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
-        "MERGE (s)-[:CONTAINS]->(p)",
+        (f"{RESTORE}: :Session CONTAINS links (#3947)",),
+        ("MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
+         "MERGE (s)-[:CONTAINS]->(p)",),
     ),
     "onboarding": (
-        f"{RESTORE}: onboarding state machine (#4641)",
-        f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) SET n += $props",
+        (f"{RESTORE}: onboarding state machine (#4641)",),
+        (f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) SET n += $props",),
     ),
     "onboarding-onboards": (
-        f"{RESTORE}: onboarding onboards edge (#4641)",
-        f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}), "
-        f"(s:Subject {{id:$sid}}) MERGE (n)-[:{ONBOARDS_EDGE}]->(s)",
+        (f"{RESTORE}: onboarding onboards edge (#4641)",),
+        (f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}), "
+         f"(s:Subject {{id:$sid}}) MERGE (n)-[:{ONBOARDS_EDGE}]->(s)",),
     ),
     "onboarding-step": (
-        f"{RESTORE}: onboarding COMPLETED_STEP links (#4641)",
-        f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) "
-        f"MERGE (s:{ONBOARDING_STEP_LABEL} {{org_id:$oid, step_id:$step_id}}) "
-        f"MERGE (n)-[:{COMPLETED_STEP_EDGE}]->(s)",
+        (f"{RESTORE}: onboarding COMPLETED_STEP links (#4641)",),
+        (f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) "
+         f"MERGE (s:{ONBOARDING_STEP_LABEL} {{org_id:$oid, step_id:$step_id}}) "
+         f"MERGE (n)-[:{COMPLETED_STEP_EDGE}]->(s)",),
     ),
     "team-meta": (
-        f"{RESTORE}: :TeamMeta first-org marker (#5353)",
-        f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",
+        (f"{RESTORE}: :TeamMeta first-org marker (#5353)",),
+        (f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",),
     ),
-    "config": (
-        f"{RESTORE}: config registry {PACK_INSTALL_LABEL} (#2814)",
-        f"MERGE (n:{PACK_INSTALL_LABEL} {{namespace:$identity}}) "
-        "SET n += $props",
-    ),
+    "config": (_CONFIG_REASONS, _CONFIG_FRAGMENTS),
     "watermark": (
-        f"{RESTORE}: :GraphEventMeta watermark (#4653)",
-        "MERGE (m:GraphEventMeta) ON CREATE SET m.last_seq = $last, "
-        "m.first_seq = $first",
+        (f"{RESTORE}: :GraphEventMeta watermark (#4653)",),
+        ("MERGE (m:GraphEventMeta) ON CREATE SET m.last_seq = $last, "
+         "m.first_seq = $first",),
     ),
     "point-derived": (
-        f"{RESTORE}: Point derived properties (#4305)",
+        (f"{RESTORE}: Point derived properties (#4305)",),
         # ARM-AGNOSTIC on purpose: the restore prefixes a
         # `clear_then_set_prefix(...)` guard whenever it carries a vector, so a
         # fragment ending in `SET ` matches only the no-embedding arm and would
         # report a MISSING leg (blaming the fixture) on correct product code.
         # No other statement in the run binds alias `n` with `$pid` — the
         # batch/session links use `p`.
-        "MATCH (n:Point {id:$pid}) ",
+        ("MATCH (n:Point {id:$pid}) ",),
     ),
 }
 
@@ -195,8 +240,8 @@ def _writes(cypher: str) -> bool:
 def _leg_of(cypher: str) -> str | None:
     """The leg whose statement fragment this is, else None."""
     text = _norm(cypher)
-    for leg, (_reason, fragment) in _LEGS.items():
-        if _norm(fragment) in text:
+    for leg, (_reasons, fragments) in _LEGS.items():
+        if any(_norm(fragment) in text for fragment in fragments):
             return leg
     return None
 
@@ -249,6 +294,14 @@ def _seed_prewipe_state(sdk, events):
     g.query(f"CREATE (m:{_TEAM_META_LABEL} {{name:'Acme', created:'2026-01-01'}})")
     g.query(
         f"MERGE (n:{PACK_INSTALL_LABEL} {{namespace:'ns-1'}}) SET n.version = 1")
+    # A SECOND config class on purpose. The config restore is ONE statement
+    # TEMPLATE over every `_config_classes()` label (five today), each with its
+    # own reason, so a fixture seeding `:PackInstall` alone exercises one arm
+    # of five and lets a label-blind classification pass — which is exactly the
+    # false RED (`:Pipeline` restore reported as the lane over-claiming) this
+    # table now derives its way out of.
+    g.query(
+        f"MERGE (n:{PIPELINE_LABEL} {{pipelineKey:'pipe-1'}}) SET n.version = 1")
     g.query("MERGE (m:GraphEventMeta) SET m.last_seq = 7, m.first_seq = 1")
     # The #4305 derived restore: a GRAPH-ONLY `:Point` (no journal record), so
     # the replay cannot re-derive its `content_hash` — that value exists only
@@ -284,13 +337,34 @@ def _assert_every_leg_declares_itself(seen, *, context: str):
     # declaration for it.
     wrong = {
         leg: reasons for leg, reasons in observed.items()
-        if any(reason != _LEGS[leg][0] for reason in reasons)
+        if any(reason not in _LEGS[leg][0] for reason in reasons)
     }
     assert not wrong, (
         f"{context}: every snapshot-restore write must run inside its OWN "
         "named declaration — the record-replay lane's contract ('this content "
         "came FROM the record') is false for all of them (#9210). "
         f"observed={wrong!r}")
+    # The config registry is ONE templated site over FIVE declared labels, so a
+    # fixture that reaches a single arm would leave the label-blindness this
+    # table removes untested. Two labels observed is what the seed guarantees.
+    config_labels = set(observed.get("config") or ())
+    assert len(config_labels) >= 2, (
+        f"{context}: the config-registry leg must be exercised for MORE than "
+        "one declared label, or its label-agnostic classification is "
+        f"unproven: observed={sorted(config_labels)}")
+    # ONE reason, ONE leg. Two legs sharing a reason would each be acceptable
+    # under the other's declaration, so "which writes does the restore "
+    # authorize" would stop being answerable per leg — the property the
+    # deleted table-only test claimed in its name and could not check.
+    by_reason: dict[str, set[str]] = {}
+    for leg, reasons in observed.items():
+        for reason in reasons:
+            if reason is not None:
+                by_reason.setdefault(reason, set()).add(leg)
+    shared = {r: sorted(legs) for r, legs in by_reason.items() if len(legs) > 1}
+    assert not shared, (
+        f"{context}: a reason must name ONE restore leg, not several — a "
+        f"shared reason makes two legs interchangeable: {shared!r}")
 
 
 # ── the declaration ──────────────────────────────────────────────────────────
@@ -384,15 +458,6 @@ def test_the_restore_lane_does_not_claim_a_record_fold(tmp_path, monkeypatch):
             f"snapshot restore (#9210): {misattributed}")
     finally:
         sdk.close()
-
-
-@pytest.mark.parametrize("leg", sorted(_LEGS))
-def test_each_leg_has_its_own_reason(leg):
-    """The reason names the LEG, not the class: "which writes are authorized by
-    replay" is only answerable if each declaration says what it is."""
-    reason, _fragment = _LEGS[leg]
-    assert reason.startswith(f"{RESTORE}: "), reason
-    assert len(reason) > len(f"{RESTORE}: ") + 5, reason
 
 
 def test_the_lane_constant_matches_the_pinned_literal():

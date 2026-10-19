@@ -3274,15 +3274,24 @@ def _journal_safe_params(params, cypher=None):
 #     lane's contract ("this content came FROM the record") is FALSE for them,
 #     and why `rebuild_all` may not hand them the replay permit (#9210: one
 #     method-wide permit made every future addition to that engine inherit a
-#     claim that was never true of the restore). ⚠️ `#4305` is the one leg
-#     whose MECHANISM differs, not whose lane does: the journal owns
-#     `content_hash` and `embedding` when it wrote them, so those are
-#     re-applied only where it did not, and the NON-derived
-#     `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`, `posterior_alpha`,
-#     `posterior_beta`) apply to a graph-only id only — journal-independent
-#     by design. So the "rides no journal record" clause must not be extended
-#     to this leg unqualified. See the obligation it states at
-#     `_prewipe_restore_write_scope`.
+#     claim that was never true of the restore). ⚠️ TWO legs differ in
+#     MECHANISM while staying in this lane, so the "rides no journal record"
+#     clause must not be extended to either of them unqualified:
+#       · `#4305` — the journal owns `content_hash` and `embedding` when it
+#         wrote them, so those are re-applied only where it did not, and the
+#         NON-derived `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`,
+#         `posterior_alpha`, `posterior_beta`) apply to a graph-only id only —
+#         journal-independent by design;
+#       · `#3947` — the `:Session` NODE is journal-carried for a post-`#3664`
+#         journal: the durable carrier is the `SessionRecorded` record, folded
+#         by `_fold_session_recorded`, and the restore's own writer comment
+#         says exactly that (#3664 is why it no longer depends on the
+#         snapshot). Only the `CONTAINS` edge and the re-application of the
+#         node's properties ride no record; the restore runs idempotently
+#         over both, so its lane is unchanged — but "`#3947` says so at its
+#         writer" is NOT this leg's evidence, because its writer says the
+#         reverse.
+#     See the obligations it states at `_prewipe_restore_write_scope`.
 #   * `onboarding.metadata` (`tortoise/onboarding/state.py`, #9121) — the
 #     onboarding FLOW metadata (`:OnboardingState`, `:OnboardingStep`, the
 #     `COMPLETED_STEP` edges) is graph-resident org-level metadata, not a
@@ -3398,17 +3407,27 @@ def _prewipe_restore_write_scope(reason: str):
     `#4305` derived Point properties, and the `:GraphEventMeta` watermark.
 
     **None of those writes is a projection of a journal record** — the classes
-    ride no record at all (`#5353`, `#3947`, `#4641`, `#990`, `#2814`, `#4653`
-    each say so at their writer), and the restore re-establishes them from the
-    pre-wipe capture instead. ⚠️ **`#4305` is the exception in MECHANISM, not
-    in lane**: the journal owns `content_hash` and `embedding` when it wrote
-    them, so those fields are re-applied only where it did not, and the
-    NON-derived `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`,
-    `posterior_alpha`, `posterior_beta`) are applied to a graph-only id only —
-    journal-independent by design. So "rides no journal record" is not this
-    leg's story; "the value exists only in the pre-wipe capture" is, and that
-    is what puts it in this lane rather than the fold's. Handing them the
-    replay permit would authorize
+    ride no record at all (`#5353`, `#4641`, `#990`, `#2814`, `#4653` each say
+    so at their writer), and the restore re-establishes them from the pre-wipe
+    capture instead. ⚠️ **TWO legs are exceptions in MECHANISM, not in
+    lane.**
+
+    * `#4305`: the journal owns `content_hash` and `embedding` when it wrote
+      them, so those fields are re-applied only where it did not, and the
+      NON-derived `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`,
+      `posterior_alpha`, `posterior_beta`) are applied to a graph-only id only
+      — journal-independent by design. So "rides no journal record" is not
+      this leg's story; "the value exists only in the pre-wipe capture" is.
+    * `#3947`: the `:Session` NODE **is** journal-carried for a post-`#3664`
+      journal — its durable carrier is the `SessionRecorded` record, folded by
+      `_fold_session_recorded`, which is what its writer comment below states
+      ("a journaled capture no longer depends on this snapshot"). Only the
+      `CONTAINS` edge and the re-application of the node's properties ride no
+      record. That is why `#3947` is NOT cited here as a writer that "says so":
+      its writer says the opposite, and the restore is idempotent over both
+      halves, which is the property this lane actually needs.
+
+    Handing them the replay permit would authorize
     them under a contract that is FALSE for them, which is what `#9210`
     removes: the restore is now a NAMED declaration, so "which writes are
     authorized by replay" stays answerable, and a future addition to that
@@ -3429,7 +3448,20 @@ def _prewipe_restore_write_scope(reason: str):
     * it does not make those classes durable. The `#4641` onboarding fallback
       gap (`tortoise/backup.py`'s JSONL path) and the `#4664` unrestored
       `:GraphEvent` rows are unchanged by this lane; naming a gap is not
-      closing it.
+      closing it;
+    * **it covers the DIRECT restore writes only.** `rebuild_all` also carries
+      graph-only Points back by building `synthetic_events` from the same
+      pre-wipe capture and FOLDING them (`events = list(synthetic_events) +
+      journal_events`), so that half is authorized by whatever permit the
+      caller opened over the engine (`"replay"` under the `#9124`/`#9213`
+      shape), not by this lane. Disclosed, not claimed.
+
+    SCOPE — `rebuild_all` only. The sibling journal engine `rebuild()` /
+    `_replay_log` still restores the `:GraphEventMeta` watermark and the
+    `:TeamMeta` marker inside its own method-wide `_replay_write_scope()`, so
+    those two writes still declare `"replay"` today. That is the SAME class of
+    defect this lane removes, deliberately left to `#9124`/`#9213` rather than
+    fixed in one engine's `try` body.
 
     NESTING is the property that makes it load-bearing under an over-broad
     permit: the reason is a `ContextVar`, so an inner restore declaration
@@ -9562,6 +9594,19 @@ class FalkorProjection(
         here is not declaring anything, and the `#9210` test reads the reason
         back at the handle. See `_prewipe_restore_write_scope` for the
         contract (state captured from THIS graph, not a journal replay).
+
+        ⚠️ **The funnel is not literally exhaustive, and the ONE exception is
+        named so it is not read as one.** The `:GraphEventMeta` watermark is
+        restored by `event_store.reestablish_watermark` (two probe reads + one
+        `MERGE` in ANOTHER module), so its call site opens
+        `_prewipe_restore_write_scope(":GraphEventMeta watermark (#4653)")`
+        around the helper instead of calling this method. Consequence to keep
+        in view: a write a future edit adds INSIDE that helper inherits the
+        watermark's declaration rather than failing the required-`reason`
+        contract, and the `#9210` leg table classifies the helper's
+        statement, not whatever else lands there. Closing that seam means
+        threading a `reason`/funnel into the helper — `#9124`'s work, not
+        silently assumed here.
         """
         with _prewipe_restore_write_scope(reason):
             return self.g.query(cypher, params=params)
