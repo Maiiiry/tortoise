@@ -1049,6 +1049,71 @@ def test_every_dispatch_write_is_refusal_armed():
     )
 
 
+# ── the never-raises CONTRACT statements name their one exception ──────────
+
+HOSTED_API = Path(__file__).resolve().parent.parent / "tortoise" / "hosted_api.py"
+
+#: Every place a caller READS this lane's best-effort contract, `(module, function)`.
+#: `dispatch_pending` now has exactly ONE exception (§17.1 refusal), so each of
+#: these statements must name it: a reader who trusts an unconditional
+#: "never raises" adds a call site with no refusal arm, which is the drift the
+#: `#9233` raise path exists to remove (review round 5 — the sweep pass kept the
+#: stale "the same best-effort one `dispatch_pending` keeps").
+_NEVER_RAISES_CONTRACT_SITES = (
+    ("webhook_delivery", "dispatch_pending"),
+    ("webhook_delivery", "_status_code"),
+    ("hosted_api", "_dispatch_webhooks"),
+    ("hosted_api", "_webhook_retry_sweep_pass"),
+)
+
+
+def _module_path(name: str) -> Path:
+    return MODULE if name == "webhook_delivery" else HOSTED_API
+
+
+def _function_docstring(tree: ast.Module, name: str) -> str | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name:
+            return ast.get_docstring(node)
+    return None
+
+
+def test_every_never_raises_contract_statement_names_the_refusal_carve_out():
+    """The raise path this lane added is not optional reading: every statement of
+    the best-effort contract must carry the carve-out, not just the module header.
+
+    RED before the fix: `_webhook_retry_sweep_pass`'s docstring justified its own
+    containment with "the same best-effort one ``dispatch_pending`` keeps" — a
+    contract `dispatch_pending` no longer keeps — so the one sentence a future
+    call site author reads asserted the wrong invariant. The census is DERIVED
+    from a stated list rather than grepped, and it refuses to pass on a
+    docstring that states no contract at all (an emptied docstring is not a fix).
+    """
+    trees = {name: ast.parse(_module_path(name).read_text())
+             for name in {m for m, _ in _NEVER_RAISES_CONTRACT_SITES}}
+    offenders: list[str] = []
+    for module, fn in _NEVER_RAISES_CONTRACT_SITES:
+        doc = _function_docstring(trees[module], fn)
+        assert doc, f"{module}.{fn} lost its docstring — the contract is unstated"
+        lowered = doc.lower().replace("\u2019", "'")
+        states_contract = any(
+            phrase in lowered
+            for phrase in ("never raise", "does not raise", "doesn't raise"))
+        assert states_contract, (
+            f"{module}.{fn} no longer states a best-effort contract; if the "
+            "contract moved, update _NEVER_RAISES_CONTRACT_SITES rather than "
+            "leaving a stale sentence behind")
+        names_carve_out = ("§17.1" in doc) or ("DirectCacheWriteRefused" in doc)
+        if not names_carve_out:
+            offenders.append(f"{module}.{fn}")
+
+    assert not offenders, (
+        "these statements assert an unconditional never-raises contract while "
+        "`dispatch_pending` re-raises `DirectCacheWriteRefused`: "
+        f"{offenders} — name the §17.1 refusal as the ONE exception"
+    )
+
+
 # ── what the declaration does NOT claim ───────────────────────────────────
 
 def test_a_rebuild_does_not_restore_the_store(sdk_with_journal, journal_path,

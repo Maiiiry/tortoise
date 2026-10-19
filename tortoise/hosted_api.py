@@ -3185,10 +3185,16 @@ def _webhook_retry_targets() -> list[dict[str, str]]:
 async def _webhook_retry_sweep_pass() -> dict:
     """#8098: ONE sweep pass — enumerate, gate, dispatch at bounded concurrency.
 
-    Never raises for a delivery/graph problem (``_guarded_step`` still wraps it,
-    but the contract here is the same best-effort one ``dispatch_pending``
-    keeps): a dead subscriber endpoint, an unreadable graph, or a failed
-    enumeration costs this pass, never the loop.
+    Never raises for a delivery/graph problem (``_guarded_step`` still wraps it):
+    a dead subscriber endpoint, an unreadable graph, or a failed enumeration
+    costs this pass, never the loop.
+
+    ⚠️ ``dispatch_pending``'s ONE exception (#9233) is contained HERE, per graph:
+    a §17.1 ``DirectCacheWriteRefused`` refusing that store's own write originates
+    in the dispatch and is caught by ``_one``'s ``except Exception``, so it costs
+    that tenant's pass rather than the sweep — which is what lets this pass call
+    the dispatcher without a refusal arm of its own. A new call site does NOT
+    inherit that containment: it needs its own arm.
 
     Cancellation DOES propagate — shutdown cancels the loop task, so the pass
     must not swallow ``CancelledError`` to keep its ``_WEBHOOK_SWEEP_INFLIGHT``
