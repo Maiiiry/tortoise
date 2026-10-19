@@ -6618,12 +6618,12 @@ durations:
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
   # #9210: added by a PR, so no CI reading exists yet (#3400 trap). MEASURED
-  # locally on a quiet box in the embedded lane: 25.2 s for the whole file (11
-  # tests, three of which run a real `rebuild_all`), of which ~15 s is the
-  # FIRST `create_point`'s one-time embedding-model load — the same artefact
-  # #9123 recorded for its own file. Declared ABOVE the quiet-box reading so a
-  # cold leg cannot under-pack it.
-  test_9210_rebuild_declares_restore.py: 30.0
+  # locally in the embedded lane: 25.2 s for the file on a quiet box and 35.1 s
+  # under fleet load (10 + 15 tests; three run a real `rebuild_all`, and the
+  # difference is the ~15 s FIRST `create_point`'s one-time embedding-model
+  # load — the same artefact #9123 recorded for its own file). Declared ABOVE
+  # the LOADED reading so a busy leg cannot under-pack it.
+  test_9210_rebuild_declares_restore.py: 45.0
   # #4492: added by a PR, so no CI reading exists yet (`--refresh-durations`
   # samples push-to-main runs only). Hermetic — no DB, no network, no PGlite
   # (the SQL is asserted separately by the PGlite suite, which does not run in

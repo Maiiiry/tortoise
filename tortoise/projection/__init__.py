@@ -12301,12 +12301,13 @@ class FalkorProjection(
                 onboarding_restore_failures += 1
                 continue
             try:
-                self.g.query(
+                self._restore_write(
                     f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) "
                     f"MERGE (s:{ONBOARDING_STEP_LABEL} "
                     "{org_id:$oid, step_id:$step_id}) "
                     f"MERGE (n)-[:{COMPLETED_STEP_EDGE}]->(s)",
                     params={"oid": oid, "step_id": step_id},
+                    reason="onboarding COMPLETED_STEP links (#4641)",
                 )
             except Exception as e:
                 onboarding_restore_failures += 1

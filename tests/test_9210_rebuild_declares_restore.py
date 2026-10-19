@@ -47,7 +47,12 @@ import os
 
 import pytest
 
-from tortoise.onboarding.state import ONBOARDING_NODE_LABEL
+from tortoise.onboarding.state import (
+    COMPLETED_STEP_EDGE,
+    ONBOARDING_NODE_LABEL,
+    ONBOARDING_STEP_LABEL,
+    ONBOARDS_EDGE,
+)
 from tortoise.pack_state import PACK_INSTALL_LABEL
 from tortoise.projection import (
     _CACHE_WRITE_AUTHORIZED,
@@ -88,6 +93,17 @@ _LEGS = {
         f"{RESTORE}: onboarding state machine (#4641)",
         f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) SET n += $props",
     ),
+    "onboarding-onboards": (
+        f"{RESTORE}: onboarding onboards edge (#4641)",
+        f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}), "
+        f"(s:Subject {{id:$sid}}) MERGE (n)-[:{ONBOARDS_EDGE}]->(s)",
+    ),
+    "onboarding-step": (
+        f"{RESTORE}: onboarding COMPLETED_STEP links (#4641)",
+        f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) "
+        f"MERGE (s:{ONBOARDING_STEP_LABEL} {{org_id:$oid, step_id:$step_id}}) "
+        f"MERGE (n)-[:{COMPLETED_STEP_EDGE}]->(s)",
+    ),
     "team-meta": (
         f"{RESTORE}: :TeamMeta first-org marker (#5353)",
         f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",
@@ -101,6 +117,10 @@ _LEGS = {
         f"{RESTORE}: :GraphEventMeta watermark (#4653)",
         "MERGE (m:GraphEventMeta) ON CREATE SET m.last_seq = $last, "
         "m.first_seq = $first",
+    ),
+    "point-derived": (
+        f"{RESTORE}: Point derived properties (#4305)",
+        "MATCH (n:Point {id:$pid}) SET ",
     ),
 }
 
@@ -180,6 +200,12 @@ def _seed_prewipe_state(sdk, events):
     """
     created = sdk.create_point("statement", "journaled, so the replay is real")
     pid = created["id"] if isinstance(created, dict) else created
+    # A journaled `:Subject` is the `onboards` edge's endpoint: the replay
+    # re-creates it (`SubjectAdded`), so the edge's `MATCH` has something to
+    # bind — the restore of a snapshot edge against a minted endpoint would be
+    # a different write than the one this test pins.
+    subject = sdk.create_subject("org owner")
+    sid = subject["id"] if isinstance(subject, dict) else subject
     proj = sdk._get_proj()
     g = proj.g
     g.query("MERGE (b:Batch {id:'batch-1'}) SET b.reason = 'quarantine'")
@@ -189,13 +215,28 @@ def _seed_prewipe_state(sdk, events):
     g.query(
         "MATCH (s:Session {id:'sess-1'}), (p:Point {id:$pid}) "
         "MERGE (s)-[:CONTAINS]->(p)", params={"pid": pid})
+    # The onboarding state machine's THREE snapshot-restore writes: the state
+    # node, its `onboards` org anchor (needs `org_subject_id`), and the
+    # `COMPLETED_STEP` step links (#4641) — the leg whose loss forges a
+    # grandfathered completion, so leaving it un-declared is not cosmetic.
     g.query(
         f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:'org-1'}}) "
-        "SET n.completed = false")
+        "SET n.completed = false, n.org_subject_id = $sid", params={"sid": sid})
+    g.query(
+        f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:'org-1'}}) "
+        f"MERGE (s:{ONBOARDING_STEP_LABEL} "
+        "{org_id:'org-1', step_id:'welcome'}) "
+        f"MERGE (n)-[:{COMPLETED_STEP_EDGE}]->(s)")
     g.query(f"CREATE (m:{_TEAM_META_LABEL} {{name:'Acme', created:'2026-01-01'}})")
     g.query(
         f"MERGE (n:{PACK_INSTALL_LABEL} {{namespace:'ns-1'}}) SET n.version = 1")
     g.query("MERGE (m:GraphEventMeta) SET m.last_seq = 7, m.first_seq = 1")
+    # The #4305 derived restore: a GRAPH-ONLY `:Point` (no journal record), so
+    # the replay cannot re-derive its `content_hash` — that value exists only
+    # in the pre-wipe capture, which is what makes it a restore and not a fold.
+    g.query(
+        "CREATE (p:Point {id:'p-graphonly', content:'graph only', "
+        "content_hash:'c0ffee', status:'live'})")
     return pid, proj, events
 
 
