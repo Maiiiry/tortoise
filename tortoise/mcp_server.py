@@ -190,9 +190,12 @@ _pending_telemetry: set = set()
 
 # ── #3675: result-bearing telemetry on ``mcp_tool_call`` ────────────────────
 # Until this, the row carried no result information at all, so ``status ==
-# "ok"`` — which means ONLY "the tool did not raise" — was the entire success
-# signal. A ``tortoise_search`` that returned 8 relevant points and one that
-# returned NOTHING were the same row. That is why the activation scorecard
+# "ok"`` — which at the time meant ONLY "the tool did not raise" — was the
+# entire success signal. (Since #8135 it means "the dispatch neither raised nor
+# returned a failure `_safe` swallowed"; the definition below is the PRE-#8135
+# one, kept because it is the reason this block exists.) A ``tortoise_search``
+# that returned 8 relevant points and one that returned NOTHING were the same
+# row. That is why the activation scorecard
 # (#3674) ships ``recall_attempted`` and refuses to ship "answered from
 # memory": it can see the ATTEMPT and not the ANSWER.
 #
@@ -1843,7 +1846,6 @@ def _safe(fn, *args, **kwargs):
     hosted production (TORTOISE_API_KEY unset), which would silently bypass auth.
     """
     mode = _transport_mode.get()
-
     if mode is None:
         return _SafeError({
             "error": (

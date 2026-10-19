@@ -2854,3 +2854,32 @@ def test_operator_client_prefers_flag_over_env_and_writes_out(
              "--operator-key", "from-flag", "--out", str(out)])
     assert seen["key"] == "from-flag"
     assert json.loads(out.read_text()) == payload
+
+
+# ── The operator runbook states the meaning of `ok` the EMITTER has (#8135) ──
+# The runbook was maintained in lockstep with this metric as recently as #3675
+# (commit f16e088da), so it is the live home of the claim an operator acts on —
+# not a historical record. #8135 changed what an `ok` row EXCLUDES, and the
+# runbook kept teaching the pre-#8135 meaning ("only that the tool did not
+# raise"), which is now false for a `_safe`-swallowed failure. A doc test rather
+# than a comment, because this exact sentence drifted once already.
+def test_the_runbook_states_the_meaning_of_ok_the_emitter_has() -> None:
+    from pathlib import Path
+
+    doc = (Path(__file__).resolve().parent.parent
+           / "docs/runbook/b7-activation-scorecard.md").read_text()
+    # Prose is hard-wrapped; compare on a whitespace-collapsed copy so a reflow
+    # neither fails this test nor lets a stale clause hide inside a line break.
+    flat = " ".join(doc.split())
+
+    assert "means only that the tool did not raise" not in flat, (
+        "the runbook still teaches the PRE-#8135 meaning of `status == ok`")
+    assert "does not raise" not in flat, (
+        "the runbook still teaches the PRE-#8135 meaning of `status == ok`")
+    # ...and it carries the corrected definition, both halves of it.
+    assert "neither raised nor returned a failure `_safe` swallowed" in flat, (
+        "the runbook must state that `ok` also excludes a `_safe`-swallowed "
+        "failure")
+    assert "#9084" in flat, (
+        "the runbook must name the plain-dict refusal class that still reads "
+        "`ok` (#9084), or an operator will read a `status` filter as complete")
