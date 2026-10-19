@@ -2,6 +2,15 @@
 
 <!-- What this PR does and why. Reference the tracked issue. -->
 
+<!-- The closing keyword must be on its OWN BARE LINE, exactly like the one
+     above: no backticks, no code fence, no blockquote. GitHub ignores a closing
+     keyword inside an inline code span or a fenced block, so a body ending in
+     `` `Closes #123`. `` does NOT close #123 — the issue stays OPEN after your
+     fix merges. That is what happened on PR #2949 (#2892 stayed open for a
+     month with its fix already in `main`). `pr-close-keyword.yml` fails this PR
+     if the only closing keyword in the body is inert. A PR that should not close
+     its issue says `Refs #123` instead. -->
+
 Closes #<issue-number>
 
 ## Contribution license

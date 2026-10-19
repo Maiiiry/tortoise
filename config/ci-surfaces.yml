@@ -2209,6 +2209,13 @@ surfaces:
   - test_destructive_wipe_guard.py
   - test_session_attribution.py
   - test_ci_selection.py
+  # #8183: the closing-keyword guard (tools/pr_close_keyword.py) — rejects a
+  # `Closes #N` that a markdown code span or fenced block makes INERT (GitHub
+  # ignores it, so the issue stays OPEN after the fix merges: #2892). Hermetic
+  # (stdlib only, no DB, no network) like its sibling parser pin above. The
+  # TOOL's own edits fall closed to FULL via TOOL_CARVEOUTS; this entry covers
+  # the test file's edits.
+  - test_pr_close_keyword.py
   # #6144: the required-status-check set is declared in THREE places — live
   # branch protection, `.mergify.yml`'s queue_conditions/merge_conditions, and
   # `.github/settings.yml`. Nothing read two of them: `.mergify.yml` stated the

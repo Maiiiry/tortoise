@@ -1750,6 +1750,19 @@ TOOL_CARVEOUTS = (
     "tools/ci_check_repair_launchd.py",
     "tools/ci-check-repair-local.sh",
     "tools/install-ci-check-repair-schedule.sh",
+    # #8183: the closing-keyword guard (tools/pr_close_keyword.py) owns
+    # tests/test_pr_close_keyword.py AND the workflow that runs it
+    # (.github/workflows/pr-close-keyword.yml). Same silent-drop class as the
+    # carve-outs above: no SOURCE_PATTERNS entry matches the path, the flat
+    # "tools/" prefix in NON_PYTHON_PREFIXES swallows it, `changed` comes back
+    # empty and select() takes the docs-only early return — which bypasses the
+    # `if not matched: matched.add("core")` fallback entirely (so registering the
+    # TEST in ci-surfaces.yml does not cover a TOOL edit). A guard that is
+    # silently absent on the change that can break it is the same class of
+    # failure it exists to prevent, one level up. It lands in the unknown-path
+    # branch -> FULL matrix (fail closed).
+    # Pinned by test_ci_selection.test_pr_close_keyword_tool_change_fails_closed_to_full.
+    "tools/pr_close_keyword.py",
 )
 
 

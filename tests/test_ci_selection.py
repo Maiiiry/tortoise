@@ -2273,6 +2273,21 @@ def test_finding_provenance_tool_change_fails_closed_to_full():
     assert "core" in r["surfaces"]
 
 
+def test_pr_close_keyword_tool_change_fails_closed_to_full():
+    # #8183: tools/pr_close_keyword.py owns tests/test_pr_close_keyword.py and
+    # .github/workflows/pr-close-keyword.yml. Same silent-drop class as the
+    # carve-outs above: the flat "tools/" NON_PYTHON_PREFIXES entry swallows a
+    # tool-only change, so without a TOOL_CARVEOUTS entry `changed` is empty and
+    # the docs-only return runs tier-1 smoke only — the guard's own contract
+    # tests (including the confirmed #2949 fixture) would never run on the PR
+    # that changes the guard. No SOURCE_PATTERNS entry matches, so it lands in
+    # the unknown-path fail-closed branch -> FULL.
+    r = _sel(["tools/pr_close_keyword.py"])
+    assert r["full"] is True
+    assert r["test_files"] == "ALL"
+    assert "core" in r["surfaces"]
+
+
 def test_edge_census_tool_change_fails_closed_to_full():
     # #4503: tools/edge_census.py owns
     # tests/test_4503_edge_relationship_accounting.py. Same silent-drop class
