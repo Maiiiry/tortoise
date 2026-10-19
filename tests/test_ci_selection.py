@@ -144,6 +144,14 @@ def test_docs_scanning_gates_stay_in_tier1():
         "surface, so a diff that ONLY adds the copy runs tier1 only; without "
         "this registration the fourth copy merges green (#4309 class)"
     )
+    assert "test_b7_runbook_ok_semantics_8135.py" in tier1, (
+        "#8135 review (P1): the B7 operator runbook's `status == \"ok\"` pin "
+        "reads docs/runbook/b7-activation-scorecard.md — `docs/` is in "
+        "NON_PYTHON_PREFIXES and the runbook matches no SOURCE_PATTERNS "
+        "entry, so a runbook-only diff runs tier1 only; without this "
+        "registration the pre-#8135 sentence (or a dropped #9084 plain-dict "
+        "clause) merges green (#4309 class, same as #8614)"
+    )
 
 
 def test_fly_secret_drift_gate_runs_on_a_runbook_only_diff():
@@ -170,6 +178,35 @@ def test_fly_secret_drift_gate_runs_on_a_runbook_only_diff():
         "a docs/infra-runbook.md-only diff must select the guards that bind its "
         "prose (`test_fly_secret_drift.py`) — otherwise a docs-only edit that "
         "re-breaks a claim it pins merges green (#8614 review, #4309 class)"
+    )
+
+
+def test_b7_runbook_ok_semantics_gate_runs_on_a_runbook_only_diff():
+    """#8135 review (P1, two reviews): the runbook's `ok` pin must run on the runbook.
+
+    `tests/test_b7_runbook_ok_semantics_8135.py` binds the claim
+    `docs/runbook/b7-activation-scorecard.md` makes about
+    `mcp_tool_call.status == "ok"` — the claim #8135 corrected after it had
+    already drifted once (#3675). `docs/` is in NON_PYTHON_PREFIXES and the
+    runbook matches no SOURCE_PATTERNS entry, so a runbook-only diff filters to
+    `changed == []` and takes the docs-only early return — tier1 ONLY.
+
+    The pin used to live in `tests/test_activation_scorecard.py`, registered on
+    `api` and `core` but NOT in `tier1`, so it was asleep on the one change that
+    can break it: re-introducing "means only that the tool did not raise", or
+    deleting the #9084 plain-dict clause, in a docs-only PR merged green.
+    Dropping the tier1 entry moves the pin back into that hole (#4309 silent-drop
+    class; the #8614 shape one runbook over).
+    """
+    r = _sel(["docs/runbook/b7-activation-scorecard.md"])
+    assert r["full"] is False
+    assert r["surfaces"] == []
+    assert "test_b7_runbook_ok_semantics_8135.py" in r["test_files"], (
+        "a docs/runbook/b7-activation-scorecard.md-only diff must select the "
+        "pin that binds its prose (test_b7_runbook_ok_semantics_8135.py) — "
+        "otherwise a docs-only edit that re-teaches the pre-#8135 meaning of "
+        "`ok`, or drops the #9084 boundary, merges green (#8135 review P1, "
+        "#4309 class)"
     )
 
 
@@ -1970,6 +2007,32 @@ def test_install_queue_reconcile_schedule_tool_change_selects_core_not_tier1():
     r = _sel(["tools/install-queue-reconcile-schedule.sh"])
     assert "core" in r["surfaces"], r
     assert "test_install_queue_reconcile_schedule.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
+def test_ci_queue_health_tool_change_selects_core_not_tier1():
+    # tools/ci_queue_health.py owns tests/test_ci_queue_health.py (the hermetic
+    # cases pinning the FLOOD classification — a deep queue of PR runs is not a
+    # flood, a reporting workflow holding the queue is — the governor's bounds
+    # (never a pull-request-event run, never a workflow outside TRIM_SAFE), and
+    # the truncation labelling).
+    #
+    # Without its CORE_ALSO entry this is the #1349/#3332/#3616 silent-drop
+    # class: `tools/` is a flat NON_PYTHON_PREFIXES entry, so a tool-only change
+    # came back with `changed == []` and took the docs-only early return —
+    # `select()` returned NO surface and the guard never ran on the file it
+    # guards.
+    #
+    # Measured before the fix: `_sel(["tools/ci_queue_health.py"])` ->
+    # surfaces=[], full=False, test_ci_queue_health.py absent.
+    #
+    # CORE_ALSO (not TOOL_CARVEOUTS) is the deliberate choice: the suite is
+    # hermetic and `core`-registered, so selecting `core` runs it at the lowest
+    # CI cost. Mutation check: removing the CORE_ALSO entry selects no surface,
+    # so assert 1 below fails.
+    r = _sel(["tools/ci_queue_health.py"])
+    assert "core" in r["surfaces"], r
+    assert "test_ci_queue_health.py" in r["test_files"], r
     assert r["full"] is False, r
 
 
