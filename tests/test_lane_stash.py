@@ -149,6 +149,39 @@ def _fail(cp) -> str:
     return f"rc={cp.returncode}\nstdout:\n{cp.stdout}\nstderr:\n{cp.stderr}"
 
 
+def _merge_commit_without_an_index_parent(repo, subject: str) -> str:
+    """A 2-parent commit whose subject looks like a stash's, and NO index parent.
+
+    This is the object `discover`'s recall-first SUBJECT path can surface: parent
+    count alone accepts it, and a stash-shaped subject matches, but every `git
+    stash push` writes its second parent as the `index on <branch>: ...` commit and
+    this one's second parent is an ordinary commit. Shared by the `discover` recall
+    test and the `recover` refusal test so the two cannot drift apart: if the shape
+    oracle and `recover`'s gate are meant to agree, they must agree about the SAME
+    object.
+
+    (`git commit-tree -p X -p X` silently drops the duplicate and yields a 1-parent
+    commit — measured — which the parent-count test rejects before the subject path
+    is ever consulted, so the second parent here is a real distinct commit.)
+    """
+    base = repo.git("rev-parse", "HEAD").stdout.strip()
+    tree = repo.git("rev-parse", "HEAD^{tree}").stdout.strip()
+
+    def commit_tree(*parents: str, message: str) -> str:
+        args = ["git", "commit-tree", tree]
+        for parent in parents:
+            args += ["-p", parent]
+        made = subprocess.run(
+            [*args, "-m", message], cwd=str(repo.root), capture_output=True,
+            text=True, env=_env(),
+        )
+        assert made.returncode == 0, made.stderr
+        return made.stdout.strip()
+
+    second = commit_tree(base, message="fetched upstream, not an index commit")
+    return commit_tree(base, second, message=subject)
+
+
 # ── the acceptance evidence ────────────────────────────────────────────────
 
 def test_acceptance_lane_a_never_applies_lane_bs_entry(repo):
@@ -2973,9 +3006,11 @@ def test_discover_marks_this_lanes_own_entry_and_the_recipe_needs_no_dash_m(repo
 def test_discover_attributes_a_peer_lanes_lost_entry_and_offers_NO_recipe(repo):
     """A lost entry carrying ANOTHER lane's marker must not be advertised here.
 
-    `recover` refuses a foreign-marked entry by design; printing the recipe anyway
-    would send the lane into that refusal, and a lane that then forced it with `-m`
-    would re-open the #8051 adoption door.
+    `recover` refuses a foreign-marked entry by design, so this listing prints the
+    OWNING lane and nothing else: no `recover` line, and no restore command either —
+    advertising another lane's work with a restore recipe would invite the lane to
+    take it, and the repo-wide rule block forbids the bare `git stash apply` that
+    recipe used to name (#8423 review P2).
     """
     repo.dirty(repo.b, "f.txt", "base\npeer work\n")
     assert repo.lane(repo.b, "push", "-m", "peer work").returncode == 0
@@ -2988,6 +3023,13 @@ def test_discover_attributes_a_peer_lanes_lost_entry_and_offers_NO_recipe(repo):
     assert sha[:12] in found.stdout, found.stdout
     assert "NOT this lane" in found.stdout, found.stdout
     assert "refused here by design" in found.stdout, found.stdout
+    # ONE lost entry in this fixture, so this covers the whole listing: no restore
+    # line of ANY kind may appear for it (a `git stash apply <sha>` hint here is
+    # exactly what the rule block above forbids).
+    assert "restore:" not in found.stdout, (
+        f"a peer lane's entry must be listed with its owner and NO restore line:\n"
+        f"{found.stdout}"
+    )
     assert f"recover {sha}" not in found.stdout, (
         f"no recovery recipe may be offered for a peer lane's entry:\n{found.stdout}"
     )
@@ -3046,33 +3088,49 @@ def test_discover_recall_first_accepts_a_stash_subject_without_an_index_parent(r
 
     The `index on <branch>: ...` second parent is the primary signal, but the subject
     is an ADDITIONAL accept path so an object git can still describe cannot be hidden
-    from a lane that lost it. `recover` remains the precision gate (it re-checks the
-    shape and refuses a non-stash), so an extra listing costs one line.
+    from a lane that lost it. The price of that recall is the operator's explicit
+    assertion, NOT a `recover` refusal: the recipe printed for this class carries
+    `-m`, and `recover` without it refuses the object (pinned by
+    :func:`test_recover_refuses_a_stash_like_subject_without_an_index_parent`).
     """
-    base = repo.git("rev-parse", "HEAD").stdout.strip()
-    tree = repo.git("rev-parse", "HEAD^{tree}").stdout.strip()
-
-    def commit_tree(*parents: str, message: str) -> str:
-        args = ["git", "commit-tree", tree]
-        for parent in parents:
-            args += ["-p", parent]
-        made = subprocess.run(
-            [*args, "-m", message], cwd=str(repo.root), capture_output=True,
-            text=True, env=_env(),
-        )
-        assert made.returncode == 0, made.stderr
-        return made.stdout.strip()
-
-    # A DISTINCT second parent: `git commit-tree -p X -p X` silently drops the
-    # duplicate and yields a 1-parent commit (measured), which the parent-count
-    # test rejects before the subject path is ever consulted.
-    second = commit_tree(base, message="fetched upstream, not an index commit")
-    sha = commit_tree(base, second, message="WIP on feat/x: deadbeef lost work")
+    sha = _merge_commit_without_an_index_parent(
+        repo, "WIP on feat/x: deadbeef lost work"
+    )
 
     found = repo.lane(repo.a, "discover")
     assert found.returncode == 0, _fail(found)
     assert sha[:12] in found.stdout, found.stdout
     assert "feat/x" in found.stdout, found.stdout
+    # the recipe this listing prints for a subject-only candidate asks for -m:
+    # that assertion is the gate, so the listing must not imply `recover` accepted it
+    assert f'recover {sha} -m "<why this entry is yours>"' in found.stdout, found.stdout
+
+
+def test_recover_refuses_a_stash_like_subject_without_an_index_parent(repo):
+    """`recover` must gate the SHAPE, not only the parent count and the subject.
+
+    A 2-parent merge titled `WIP on <branch>: ...` whose second parent is not the
+    `index on <branch>: ...` commit passes both the parent-count test and the
+    subject heuristic, so without this check `recover <sha>` STORES a non-stash into
+    the repo-GLOBAL register and pins it to this lane — the false positive that
+    `discover`'s recall-first subject path can surface, landing in every lane's
+    register. `-m` remains the override: it is the operator's explicit assertion.
+    """
+    sha = _merge_commit_without_an_index_parent(
+        repo, "WIP on feat/x: deadbeef lost work"
+    )
+
+    refused = repo.lane(repo.a, "recover", sha)
+    assert refused.returncode == 2, _fail(refused)
+    assert "not a stash's 'index on" in refused.stderr, refused.stderr
+    assert repo.stash_shas() == [], "a refused recover must not touch the register"
+    assert repo.stash_pins() == {}, "a refused recover must not pin anything"
+
+    # `-m` is the documented operator override, and it is what the recipe asks for:
+    # the entry is then stored deliberately, with the claim on the record.
+    asserted = repo.lane(repo.a, "recover", sha, "-m", "I vouch for this entry")
+    assert asserted.returncode == 0, _fail(asserted)
+    assert repo.stash_shas() == [sha], repo.stash_shas()
 
 
 def test_discover_orders_by_commit_time_not_by_the_iso_string(repo):

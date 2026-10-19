@@ -1067,9 +1067,13 @@ def _entry_ownership(row: dict, key: str, own_shas: set[str]) -> tuple[str, str]
 #     (+ the untracked commit), and its second parent's subject is always
 #     `index on <branch>: <sha> <subject>`. A commit orphaned by an amend, reset
 #     or rebase has 1 parent; a real merge has 2 but not that second-parent
-#     subject. So the shape test is parent-count AND the index marker — a
-#     subject-only match would list a user commit literally titled e.g. "On the
-#     origin of species:" as a stash.
+#     subject. So the shape test is parent-count AND (the index marker OR a
+#     stash-shaped `WIP on|On <branch>:` subject). The subject fallback is a
+#     DELIBERATE recall trade: it can list a user commit literally titled e.g.
+#     "On the origin of species:", and the precision gate is `recover` — which
+#     refuses to STORE such a candidate unless the operator asserts it with `-m`
+#     (checked there, not here: `discover` is read-only, `recover` writes the
+#     repo-global register).
 #   * An object a lane REF pins is REACHABLE, so `fsck` never offers it: pinned
 #     entries cannot appear here at all. Register rows are subtracted as well,
 #     and that subtraction is load-bearing: under `--no-reflogs` git reports a
@@ -1078,9 +1082,12 @@ def _entry_ownership(row: dict, key: str, own_shas: set[str]) -> tuple[str, str]
 #     #8051 adoption door.
 #
 # DISCOVERY IS DELIBERATELY RECALL-FIRST; `recover` IS THE PRECISION GATE. An
-# entry whose second parent cannot be read is still listed — a false positive
-# costs one printed line plus `recover`'s own refusal, while a false NEGATIVE is
-# the lost work this command exists to surface.
+# entry that only matches the SUBJECT path is still listed — a false positive costs
+# one printed line plus `recover`'s own refusal (its second-parent SHAPE check),
+# while a false NEGATIVE is the lost work this command exists to surface. The
+# refusal is only real because `cmd_recover` grew that check: before it, a 2-parent
+# merge with a stash-like subject passed the parent-count and subject tests and was
+# STORED into the repo-global register.
 
 #: Shas per `git log --no-walk` argv. A post-rebase repo can hold thousands of
 #: unreachable commits, and a per-sha `log`/`rev-list` pair would make `discover`
@@ -1224,9 +1231,16 @@ def _looks_like_stash(meta: dict, parent2_subjects: dict[str, str]) -> bool:
 
     2 parents (HEAD + index) or 3 (+ untracked), AND a second parent that is the
     ``index on <branch>: ...`` commit every ``git stash push`` writes. The subject
-    test is an ADDITIONAL accept path, never the primary one: ``recover`` re-checks
-    the shape and refuses a non-stash, so an extra candidate costs one printed line
-    while a missed candidate costs the work.
+    test is an ADDITIONAL accept path, never the primary one, because a false
+    NEGATIVE is the lost work this command exists to surface.
+
+    The price of that recall is a printed line, and the precision gate is
+    ``cmd_recover``'s own second-parent SHAPE check: a subject-only candidate is
+    listed here but REFUSED there unless the operator asserts it with ``-m`` (the
+    form the printed recipe carries). That refusal is a real gate — without it a
+    2-parent merge titled ``WIP on feat/x: ...`` and no index parent was STORED
+    into the repo-global register, which is why the shape check lives in
+    ``cmd_recover`` and not only in this listing.
     """
     parents = meta["parents"]
     if len(parents) not in (2, 3):
@@ -1302,13 +1316,17 @@ def _entry_files(sha: str) -> list[str] | None:
     return None
 
 
-def _discover_verdict(entry: dict, key: str) -> tuple[str, str]:
-    """``(owner, restore line)`` for a lost entry — the attribution this lane can act on.
+def _discover_verdict(entry: dict, key: str) -> tuple[str, str | None]:
+    """``(owner, restore line or None)`` for a lost entry — what this lane may act on.
 
     The ownership input is the entry's OWN message marker, not the branch: a bare
     push carries neither, and a branch names a branch rather than a lane. A recipe
-    is printed ONLY when `recover` would accept it — telling a lane to recover a
-    peer's entry would just be refused (correctly) by `cmd_recover`.
+    is printed ONLY where `recover` will act on it, and it never advertises work
+    that is not this lane's: an own-marked entry recovers bare (``provably_own``),
+    an unattributable one recovers with ``-m`` (the operator's assertion), and a
+    PEER's marked entry gets NO recipe at all — `cmd_recover` refuses it by design,
+    and a lane that followed a printed restore line here would be restoring
+    another lane's work (the same adoption door #8051 closed).
     """
     marker = entry["lane"]
     if marker == key:
@@ -1320,10 +1338,9 @@ def _discover_verdict(entry: dict, key: str) -> tuple[str, str]:
         )
     if marker is not None:
         return (
-            f"lane {marker!r} — NOT this lane",
-            f"refused here by design: recover it from lane {marker!r} (its own "
-            "worktree), or restore it deliberately with `git stash apply "
-            f"{entry['sha'][:12]}`",
+            f"lane {marker!r} — NOT this lane; refused here by design: `recover` will "
+            "not act on it, so only that lane's own worktree can restore it",
+            None,
         )
     return (
         "unattributable — a bare `git stash push` writes no lane marker",
@@ -1365,7 +1382,8 @@ def cmd_discover(args: argparse.Namespace) -> int:
             tail = f" (+{more} more)" if more else ""
             print(f"    files ({len(files)}): {', '.join(shown)}{tail}")
         print(f"    owner: {owner}")
-        print(f"    restore: {restore}")
+        if restore is not None:
+            print(f"    restore: {restore}")
     if len(lost) > limit:
         print(f"\n{len(lost) - limit} more not shown — raise --limit (0 = no limit)")
     return 0
@@ -1775,13 +1793,30 @@ def cmd_recover(args: argparse.Namespace) -> int:
     commit_subject = subject
     # A stash commit has 2 parents (HEAD + index) or 3 with `-u`/`-a` (the
     # untracked tree). A plain commit has 1; a 2-parent merge has 2 and would
-    # pass a parent count alone, so the SUBJECT must also look like a stash
-    # unless the operator asserts it with -m (an explicit human claim, which is
-    # the only thing that lets a store of a rescued entry proceed).
+    # pass a parent count alone, so the SHAPE (the second parent is the
+    # `index on ...` commit, checked below) and the SUBJECT must also look like a
+    # stash unless the operator asserts it with -m (an explicit human claim, which
+    # is the only thing that lets a store of a rescued entry proceed).
     if len(parents) not in (3, 4):
         raise LaneStashError(
             f"{args.sha} has {len(parents) - 1} parent(s); a stash commit has 2 (HEAD + "
             "index) or 3 (with -u/-a), so this is not a stash entry"
+        )
+    # The SHAPE, not only the parent COUNT: every `git stash push` writes its second
+    # parent as the `index on <branch>: ...` commit, so a 2-parent merge without one
+    # is a merge — or any unrelated object that `discover`'s recall-first SUBJECT
+    # path surfaced. This check belongs HERE and not only in `discover`: `recover`
+    # STORES what it accepts into the repo-GLOBAL register (and pins it to this
+    # lane), so a listing-only gate would let a false positive into every lane's
+    # register. `-m` overrides it exactly as it overrides the subject heuristic
+    # below: the operator's explicit assertion is the gate that remains, and it is
+    # the one the printed recipe asks for.
+    index_subject = _out("log", "-1", "--format=%s", parents[2])
+    if not args.message and not index_subject.startswith("index on "):
+        raise LaneStashError(
+            f"{args.sha}'s second parent ({index_subject!r}) is not a stash's "
+            "'index on <branch>: ...' commit, so this cannot be shown to be a stash "
+            "entry — pass -m <message> to assert it explicitly"
         )
     if not args.message and not _subject_branch(subject):
         raise LaneStashError(
