@@ -252,8 +252,16 @@ class TestResolveApiKey:
 
     def test_c1_minted_key_reports_scopes_and_no_legacy(self, fake):
         """E2E-9: a C1-minted key (graph_id set, scopes, deleg=0) reports its
-        allowlist and is NOT legacy full-access."""
+        allowlist and is NOT legacy full-access.
+
+        #8694: the delegated child's LINEAGE must resolve — a child is only as
+        live as the key that minted it — so the fixture seeds the parent it
+        names. Before #8694 a `created_by_key_id` pointing at nothing was
+        inert; the mint never produces one (the column is the minting caller's
+        id), and an unverifiable delegation now fails closed.
+        """
         fake.tables["organizations"] = [dict(FREE_TEAM)]
+        fake.seed("api_keys", [_key_row(id="key-000", lookup_hash="not-this-token")])
         fake.seed("api_keys", [_key_row(
             graph_id="g_abc123def4567890",
             scopes=["graphs:read", "graphs:write"],

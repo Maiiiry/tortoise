@@ -340,12 +340,20 @@ class TestAPIKeyC1Tenancy:
         assert listed["created_by_key_id"] is None
 
     def test_apikey_create_scoped_graph_key_stores_props(self, sdk, team):
-        """A C1-minted graph-bound key stores its tenancy props."""
+        """A C1-minted graph-bound key stores its tenancy props.
+
+        #8694: the child's LINEAGE must resolve, so the parent it names is a
+        real minted key. ``apikey_verify`` now fails closed on a delegated key
+        whose ancestor attests nothing (a child is only as live as the key that
+        minted it), and a dangling ``created_by_key_id`` is not a shape the
+        mint can produce — the column is the MINTING CALLER's id.
+        """
+        parent = sdk.apikey_create(team["id"], "user-1")
         result = sdk.apikey_create(
             team["id"], "user-1",
             graph_id="g_abc123def4567890",
             scopes=["graphs:read", "graphs:write"],
-            created_by_key_id="key-parent-000",
+            created_by_key_id=parent["id"],
             delegation_depth=0,
         )
         reg = sdk._get_registry()
@@ -357,12 +365,15 @@ class TestAPIKeyC1Tenancy:
         assert rows[0][0] == "g_abc123def4567890"
         assert rows[0][1] == ["graphs:read", "graphs:write"]
         assert rows[0][2] == 0
-        assert rows[0][3] == "key-parent-000"
-        listed = sdk.apikey_list(team["id"])[0]
+        assert rows[0][3] == parent["id"]
+        # apikey_list is repo-wide (not org-scoped), so pick OUR row rather
+        # than trusting position — the fixture team may hold other keys.
+        listed = next(k for k in sdk.apikey_list(team["id"])
+                      if k["id"] == result["id"])
         assert listed["graph_id"] == "g_abc123def4567890"
         assert listed["scopes"] == ["graphs:read", "graphs:write"]
         assert listed["delegation_depth"] == 0
-        assert listed["created_by_key_id"] == "key-parent-000"
+        assert listed["created_by_key_id"] == parent["id"]
         # Still authenticates (registry parity: hash path unchanged)
         valid = sdk.apikey_verify(result["api_key"])
         assert valid is not None

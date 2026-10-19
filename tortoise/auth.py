@@ -100,6 +100,17 @@ def is_dev_mode() -> bool:
 # provisioning service). A tuple so callers use ``token.startswith(PREFIXES)``.
 API_KEY_PREFIXES = ("tt_", "tk_")
 
+# #8694: bound on the DELEGATION LINEAGE walk (``created_by_key_id`` upward).
+# One level of delegation exists today — ``chk_minted_key_no_escalation`` plus
+# the ``POST /v1/team/keys`` gate keep a deleg=0 key from minting another key —
+# so a real chain is at most one hop. The bound is declared ONCE here and
+# consumed by BOTH lanes (``supabase_control.key_lineage_live`` and the registry
+# twin in ``sdk``) so the two can never disagree about how far they look, and
+# it is deep enough that a future depth change (a child allowed to delegate
+# onward) cannot silently leave an orphan beyond the horizon: the walk stops
+# and FAILS CLOSED instead of returning "no revoked ancestor found".
+KEY_LINEAGE_MAX_DEPTH = 8
+
 
 def hash_api_key(key: str) -> str:
     """PBKDF2-HMAC-SHA256 hash an API key for at-rest storage. Not reversible.

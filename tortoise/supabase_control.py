@@ -1054,6 +1054,16 @@ def resolve_api_key(cp, token: str) -> dict | None:
         scopes = row.get("scopes") or []
         delegation_depth = row.get("delegation_depth")
         created_by_key_id = row.get("created_by_key_id")
+        # #8694: a DELEGATED key is authorized by inheritance, so an ancestor
+        # that is revoked (or attests nothing) takes this branch down WITH it
+        # — at RESOLUTION, not merely out of a listing. This is the gate that
+        # makes every revoke path cascade, and REST ``get_current_org`` + MCP
+        # ``OrgResolutionMiddleware`` both resolve through this function, so a
+        # single check closes both lanes. A directly-minted key has a NULL
+        # lineage and pays no extra round-trip.
+        if created_by_key_id is not None and not key_lineage_live(
+                cp, created_by_key_id):
+            return None
         # D2 (epic key model): legacy full-access = owner-minted (deleg NULL)
         # with an empty allowlist — every pre-C1 key matches (E2E-5 zero
         # migration); a MINTED key (deleg=0) with empty scopes is a no-op
@@ -1374,14 +1384,145 @@ def insert_api_key(cp, row: dict) -> None:
     cp.query("api_keys", method="POST", json_body=row)
 
 
-def revoke_api_key(cp, key_id: str, now: str | None = None) -> None:
-    """Set revoked_at on an api_keys row (recovery-cap auto-revoke)."""
+# ── #8694: delegated-key LINEAGE — liveness at resolve + cascade at revoke ──
+#
+# A ``deleg=0`` child key is minted FROM a live caller key: the mint records
+# ``created_by_key_id`` (see ``hosted_api._mint_key``), and that column is the
+# join key every reader already carries. Until #8694 NOTHING on the resolution
+# path consulted those ancestors, so a delegated child was authorized by its
+# OWN row alone: an owner could revoke a compromised ``keys:manage`` parent and
+# every credential it had handed out kept authenticating indefinitely.
+#
+# The fix is two halves, and the RESOLVE half is the load-bearing one:
+#
+#   * :func:`key_lineage_live` is called from ``resolve_api_key`` (the SAME
+#     function REST ``get_current_org`` and MCP ``OrgResolutionMiddleware``
+#     both resolve through) and fails closed on the first ancestor that is
+#     revoked, unresolvable, or beyond ``KEY_LINEAGE_MAX_DEPTH``. Enforcing it
+#     AT RESOLUTION is what makes EVERY revoke path cascade — including the
+#     ones that grow no stamp of their own (graph-delete, the recovery-cap
+#     auto-revoke, an out-of-band UPDATE).
+#   * :func:`revoke_key_descendants` stamps the descendants' own
+#     ``revoked_at`` so ``GET /v1/team/keys``, the key counts and the dashboards
+#     read truthfully. A STAMP ALONE WOULD NOT BE A FIX: it leaves a resolve
+#     window between the two writes, and it only covers the revoke paths that
+#     remember to call it.
+
+
+def key_lineage_live(cp, parent_key_id: str | None) -> bool:
+    """#8694: is this key's DELEGATION LINEAGE still live?
+
+    Walks ``created_by_key_id`` upward from ``parent_key_id`` and returns False
+    as soon as an ancestor cannot be shown live. ``None`` (a directly-minted
+    key — session mint, owner-class mint, or a pre-C1 node with no lineage) is
+    TRIVIALLY live: no lineage means no inherited authority, so the #8694 gate
+    is a no-op for it (acceptance: "No behaviour change for a child whose
+    lineage is NULL").
+
+    Fail-closed on all three unattested cases, on purpose:
+
+      * **revoked ancestor** — the defect this fixes.
+      * **ancestor row missing** — the child claims an authority that does not
+        exist (row purged, hand-seeded lineage). A delegation we cannot verify
+        is not a delegation we can honour; the caller re-mints in one call.
+      * **cycle / depth exceeded** — a corrupt chain must not loop, and must
+        not be read as "no revoked ancestor found".
+
+    Deliberately narrow: only ``revoked_at`` is consulted. ``enabled`` /
+    ``expires_at`` / scope narrowing on the ancestor are DIFFERENT questions
+    (the #8692 permission vocabulary); widening this predicate silently would
+    be a behaviour change nobody ruled on.
+    """
+    from tortoise.auth import KEY_LINEAGE_MAX_DEPTH
+
+    seen: set[str] = set()
+    current = parent_key_id
+    depth = 0
+    while current:
+        if current in seen or depth >= KEY_LINEAGE_MAX_DEPTH:
+            return False
+        seen.add(current)
+        depth += 1
+        rows = cp.query(
+            "api_keys",
+            select=["id", "revoked_at", "created_by_key_id"],
+            filters=[("id", "eq", current)],
+        )
+        if not rows or rows[0].get("revoked_at") is not None:
+            return False
+        current = rows[0].get("created_by_key_id")
+    return True
+
+
+def _revoke_children_of(cp, parent_key_id: str, stamp: str) -> list[str]:
+    """One level of the #8694 cascade: conditionally revoke ``parent_key_id``'s
+    still-live children and report which ids THIS call claimed.
+
+    ``PATCH`` + ``select`` = ``Prefer: return=representation`` (the same idiom
+    ``claim_api_key_revocation`` uses), so the returned rows are exactly the
+    rows the ``revoked_at IS NULL`` condition matched — never a re-read a
+    concurrent writer could make lie.
+    """
+    updated = cp.query(
+        "api_keys",
+        select=["id"],
+        method="PATCH",
+        filters=[("created_by_key_id", "eq", parent_key_id),
+                 ("revoked_at", "is", None)],
+        json_body={"revoked_at": stamp},
+    )
+    return [r["id"] for r in (updated or [])]
+
+
+def revoke_key_descendants(cp, key_id: str, now: str | None = None) -> list[str]:
+    """#8694: stamp ``revoked_at`` on every DELEGATED DESCENDANT of ``key_id``.
+
+    Returns the ids stamped, so the caller can put the cascade COUNT in its
+    audit event ("one audit event naming the cascade count") instead of leaving
+    the blast radius reconstructible only from the child rows.
+
+    Breadth-first and bounded by ``KEY_LINEAGE_MAX_DEPTH`` — written for depths
+    > 0 even though one level exists today, so a future change that lets a
+    child delegate onward cannot leave grandchildren live behind a revoked
+    grandparent. Each level touches only rows that are still live, so re-running
+    it (the idempotent revoke path) is free.
+    """
+    from tortoise.auth import KEY_LINEAGE_MAX_DEPTH
+
+    stamp = now or datetime.now(timezone.utc).isoformat()  # noqa: UP017
+    stamped: list[str] = []
+    frontier = [key_id]
+    depth = 0
+    while frontier and depth < KEY_LINEAGE_MAX_DEPTH:
+        depth += 1
+        frontier = [
+            child
+            for parent in frontier
+            for child in _revoke_children_of(cp, parent, stamp)
+        ]
+        stamped.extend(frontier)
+    return stamped
+
+
+def revoke_api_key(cp, key_id: str, now: str | None = None) -> list[str]:
+    """Set revoked_at on an api_keys row (recovery-cap auto-revoke).
+
+    #8694: revocation CASCADES — the row's delegated descendants are stamped in
+    the same call, and the ids are returned so a caller can audit the blast
+    radius. The cascade lives on this low-level primitive (not on one endpoint)
+    on purpose: every revoke path funnels through here or through
+    :func:`claim_api_key_revocation`, so a future caller cannot forget it. The
+    load-bearing half is still :func:`key_lineage_live` at resolution — a stamp
+    only keeps the INVENTORY truthful.
+    """
+    stamp = now or datetime.now(timezone.utc).isoformat()  # noqa: UP017
     cp.query(
         "api_keys",
         method="PATCH",
         filters=[("id", "eq", key_id)],
-        json_body={"revoked_at": now or datetime.now(timezone.utc).isoformat()},  # noqa: UP017
+        json_body={"revoked_at": stamp},
     )
+    return revoke_key_descendants(cp, key_id, stamp)
 
 
 def claim_api_key_revocation(cp, key_id: str, now: str | None = None) -> bool:
@@ -1401,13 +1542,20 @@ def claim_api_key_revocation(cp, key_id: str, now: str | None = None) -> bool:
     else already did", so the loser can compensate and refuse. Never raises on
     a lost claim (only on a real transport failure, via the seam).
     """
+    stamp = now or datetime.now(timezone.utc).isoformat()  # noqa: UP017
     updated = cp.query(
         "api_keys",
         select=["id"],
         method="PATCH",
         filters=[("id", "eq", key_id), ("revoked_at", "is", None)],
-        json_body={"revoked_at": now or datetime.now(timezone.utc).isoformat()},  # noqa: UP017
+        json_body={"revoked_at": stamp},
     )
+    if updated:
+        # #8694: the claimant's victory cascades — a rotate (the primitive's
+        # only caller) destroys a credential, so whatever that credential had
+        # delegated dies with it. The WINNER only: the loser must not stamp
+        # anything it did not release.
+        revoke_key_descendants(cp, key_id, stamp)
     return bool(updated)
 
 # ── #1879: durable multi-worker mint serialization ────────────────────────

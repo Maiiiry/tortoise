@@ -1387,7 +1387,17 @@ class TestLastUsedAtTracking:
                 assert result["created_by_key_id"] is None
 
                 # Minted key: scopes + deleg=0 → NOT legacy
+                #
+                # #8694: the child's LINEAGE must resolve — a delegated key is
+                # only as live as the key that minted it, so the parent it
+                # names is a real node here. A dangling `created_by_key_id` is
+                # not a shape the mint can produce (the value is the minting
+                # caller's id) and now fails closed at resolution.
                 minted_token = "tt_minted_key_c1_000000001"
+                sdk._get_registry().query(
+                    "CREATE (k:APIKey {id: 'parent-key', "
+                    "org_id: 'legacy-team', created_by: 'test'})",
+                )
                 sdk._get_registry().query(
                     "CREATE (k:APIKey {id: $id, org_id: $tid, "
                     "key_hash: $kh, key_prefix: $kp, created_by: $cb, "
@@ -7632,6 +7642,18 @@ class TestProvisioningService:
         fake.seed("organizations", [dict(FREE_TEAM, dashboard_key_login=True)])
         fake.seed("org_memberships",
                   [_membership_row(user_id=_U1, org_id="team-free-001")])
+        # #8694: the delegated child's LINEAGE must resolve (a child is only as
+        # live as the key that minted it), so the caller it names is a real
+        # row. Without it the resolve 401s before the minted-key guard below
+        # can run, and the property under test would never be exercised.
+        fake.seed("api_keys", [{
+            "id": "k-caller", "org_id": "team-free-001",
+            "lookup_hash": _lh("tt_" + uuid.uuid4().hex), "key_prefix": "tt_call",
+            "created_via": "provisioned", "created_by": _U1,
+            "created_at": "2026-09-02T00:00:00Z", "revoked_at": None,
+            "expires_at": None, "graph_id": None, "scopes": [],
+            "created_by_key_id": None, "delegation_depth": None,
+        }])
         token = "tk_" + uuid.uuid4().hex
         fake.seed("api_keys", [{
             "id": "mk-1", "org_id": "team-free-001",

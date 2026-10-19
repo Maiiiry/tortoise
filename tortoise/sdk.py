@@ -5737,6 +5737,85 @@ def _ledger_record(label: str, rows: list[dict]) -> None:
     read_ledger.record_rows(label, rows)
 
 
+# ── #8694: registry twin of the delegated-key lineage gate ──────────────────
+#
+# The registry (selfhost) lane keeps its keys as ``APIKey`` nodes, with the SAME
+# ``created_by_key_id`` lineage the Supabase lane records, and it resolves
+# through TWO different functions: ``TortoiseSDK.apikey_verify`` (the MCP
+# ``OrgResolutionMiddleware`` lane, ``mcp_auth.py``) and
+# ``hosted_api.get_current_org``'s registry branch (the REST lane). Both must
+# consult the ancestor's ``revoked_at`` or a revoked parent's children keep
+# authenticating on one of the two doors.
+#
+# ``supabase_control.key_lineage_live`` / ``revoke_key_descendants`` are the
+# siblings of these two, and both pairs read the SAME
+# ``tortoise.auth.KEY_LINEAGE_MAX_DEPTH`` bound so the lanes cannot disagree
+# about how far they look (the constant is declared once, in ``auth``).
+#
+# Deliberately module-level private functions, not SDK methods: adding a public
+# ``TortoiseSDK`` method is a SURFACE change that needs owner sign-off, and this
+# is lane plumbing, not a capability anyone consumes.
+
+
+def _registry_key_lineage_live(reg, parent_key_id: str | None) -> bool:
+    """#8694: registry twin of ``supabase_control.key_lineage_live``.
+
+    Walks ``created_by_key_id`` upward from ``parent_key_id`` and fails closed
+    on a revoked ancestor, a missing ancestor node, a cycle, or a chain deeper
+    than ``KEY_LINEAGE_MAX_DEPTH``. ``None`` = a directly-minted key (no
+    inherited authority) = trivially live, so the owner/session-mint lane pays
+    no extra query.
+    """
+    from tortoise.auth import KEY_LINEAGE_MAX_DEPTH
+
+    seen: set[str] = set()
+    current = parent_key_id
+    depth = 0
+    while current:
+        if current in seen or depth >= KEY_LINEAGE_MAX_DEPTH:
+            return False
+        seen.add(current)
+        depth += 1
+        rows = reg.query(
+            "MATCH (k:APIKey {id:$id}) RETURN k.revoked_at, k.created_by_key_id",
+            params={"id": current},
+        ).result_set
+        if not rows or rows[0][0] is not None:
+            return False
+        current = rows[0][1]
+    return True
+
+
+def _registry_revoke_key_descendants(reg, key_id: str, now: str) -> list[str]:
+    """#8694: registry twin of ``supabase_control.revoke_key_descendants``.
+
+    Stamps ``revoked_at`` on ``key_id``'s live delegated descendants and
+    returns the ids, breadth-first and bounded by ``KEY_LINEAGE_MAX_DEPTH``
+    (written for depths > 0 even though one level exists today). The
+    ``revoked_at IS NULL`` predicate makes the write a claim, so an already
+    revoked child is not re-stamped and re-running is free.
+    """
+    from tortoise.auth import KEY_LINEAGE_MAX_DEPTH
+
+    stamped: list[str] = []
+    frontier = [key_id]
+    depth = 0
+    while frontier and depth < KEY_LINEAGE_MAX_DEPTH:
+        depth += 1
+        nxt: list[str] = []
+        for parent in frontier:
+            rows = reg.query(
+                "MATCH (k:APIKey {created_by_key_id:$pid}) "
+                "WHERE k.revoked_at IS NULL "
+                "SET k.revoked_at = $now RETURN k.id",
+                params={"pid": parent, "now": now},
+            ).result_set
+            nxt.extend(r[0] for r in rows)
+        stamped.extend(nxt)
+        frontier = nxt
+    return stamped
+
+
 class TortoiseSDK:
     """Layer 1 facade for Tortoise epistemic graph interaction.
 
@@ -28263,8 +28342,16 @@ class TortoiseSDK:
             "MATCH (k:APIKey {id:$id}) SET k.revoked_at = $now",
             params={"id": key_id, "now": now},
         )
+        # #8694: revocation CASCADES to the delegated descendants — the audit
+        # below names the blast radius instead of leaving it reconstructible
+        # only from the child nodes. (The load-bearing half is the lineage gate
+        # in ``apikey_verify``/``get_current_org``; this stamp keeps the
+        # inventory — ``apikey_list``, the key counts, the dashboard — truthful.)
+        cascaded = _registry_revoke_key_descendants(reg, key_id, now)
         self._audit(rows[0][1], None, "apikey_revoke",
-                     resource_type="apikey", resource_id=key_id)
+                     resource_type="apikey", resource_id=key_id,
+                     detail={"cascaded_key_ids": cascaded,
+                             "cascaded": len(cascaded)})
         return {"revoked": True, "key_id": key_id, "revoked_at": now}
 
     def apikey_verify(self, key_plaintext: str) -> dict | None:
@@ -28301,6 +28388,14 @@ class TortoiseSDK:
         ]
         if matches:
             m = matches[0]
+            # #8694: a DELEGATED key's authority is inherited, not owned — it
+            # is only as live as the key that minted it. This is the MCP
+            # (selfhost) door and ``hosted_api.get_current_org``'s registry
+            # branch is the REST one; both must ask, or a revoked parent's
+            # children keep entering through the door that does not.
+            if not _registry_key_lineage_live(self._get_registry(),
+                                              m.get("created_by_key_id")):
+                return None
             delegation_depth = m.get("delegation_depth")
             scopes = m.get("scopes") or []
             # C5 #2114 (parity): REST's registry-lane resolution derives the

@@ -5865,6 +5865,18 @@ async def get_current_org(request: Request) -> dict:
         if org_id is None:
             await _audit_auth_failure(request, "invalid_key")
             raise HTTPException(status_code=401, detail="Invalid API key")
+        # #8694: a DELEGATED (deleg=0) key holds INHERITED authority, so it is
+        # only as live as the key it was minted from — a revoked parent takes
+        # the child down with it, AT RESOLUTION (never merely out of a list).
+        # The Supabase twin lives in ``resolve_api_key`` and the MCP/selfhost
+        # twin in ``TortoiseSDK.apikey_verify``; this is the REST/selfhost
+        # door, and leaving it out would make selfhost the fail-open lane.
+        # A directly-minted key carries a NULL lineage and is unaffected.
+        from tortoise.sdk import _registry_key_lineage_live
+        if created_by_key_id is not None and not _registry_key_lineage_live(
+                sdk._get_registry(), created_by_key_id):
+            await _audit_auth_failure(request, "parent_key_revoked")
+            raise HTTPException(status_code=401, detail="Invalid API key")
         # #685: track last_used_at for key hygiene/rotation — write-through on
         # every successful auth. The registry graph is small (orgs × keys) and
         # a single indexed SET on an already-fetched node adds negligible overhead.
@@ -11632,6 +11644,12 @@ def _claim_key_revocation(org_id: str, key_id: str, now: str) -> bool:
         "SET k.revoked_at = $now RETURN k.id",
         params={"tid": org_id, "id": key_id, "now": now},
     ).result_set
+    if rows:
+        # #8694: the claimant's victory cascades — a rotate destroys a
+        # credential, so whatever that credential delegated dies with it. The
+        # loser stamps nothing it did not release (this is inside the claim).
+        from tortoise.sdk import _registry_revoke_key_descendants
+        _registry_revoke_key_descendants(sdk._get_registry(), key_id, now)
     return bool(rows)
 
 
@@ -12347,11 +12365,21 @@ async def revoke_api_key(key_id: str, request: Request, org: dict = Depends(get_
     org from the key itself and ignore the query (byte-compatible by
     design).
     #2297 POLICY A: the SESSION lane is owner/admin-gated (a member must not
-    revoke keys it cannot toggle — #1148 parity); KEY-auth unchanged."""
+    revoke keys it cannot toggle — #1148 parity); KEY-auth unchanged.
+
+    #8694: revocation CASCADES. Revoking a key also revokes every key DELEGATED
+    from it (its ``created_by_key_id`` descendants, walked by
+    ``revoke_key_descendants`` / ``_registry_revoke_key_descendants``), and one
+    ``api_key_revoke`` audit event names the cascade. The load-bearing half is
+    NOT here: the delegated-lineage gate at RESOLUTION (``key_lineage_live`` /
+    ``_registry_key_lineage_live``) is what makes a revoked ancestor take its
+    children down on every revoke path, including the ones that grow no stamp.
+    The response shape is unchanged (``revoked``/``already``/``revoked_at``)."""
     from tortoise.supabase_control import (
         api_key_by_id,
         get_control_plane,
         is_supabase_enabled,
+        revoke_key_descendants,
     )
     from tortoise.supabase_control import (
         revoke_api_key as _sb_revoke,
@@ -12395,19 +12423,38 @@ async def revoke_api_key(key_id: str, request: Request, org: dict = Depends(get_
             # must own the key unconditionally — a None org fails closed
             # (the old strict `!=` behavior), never a silent revoke widen.
             _ensure_key_in_pinned_org(org["org_id"], row.get("org_id"), required=True)
-            if row.get("revoked_at") is not None:
-                return {"revoked": True, "already": True, "key_id": key_id}
             from datetime import datetime
             now = datetime.now(UTC).isoformat()
-            await _cp_offload(
+            if row.get("revoked_at") is not None:
+                # #8694: the parent is already dead, but its delegated children
+                # may still be LIVE (a parent revoked before this rule existed,
+                # or one revoked out of band). Re-revoking is idempotent in the
+                # parent and converges the INVENTORY here — the resolve gate
+                # already made the children unusable, this makes the listing
+                # say so. Response shape is unchanged (byte-identical).
+                await _cp_offload(
+                    lambda: revoke_key_descendants(get_control_plane(), key_id,
+                                                  now),
+                    op="revoke_key_descendants")
+                return {"revoked": True, "already": True, "key_id": key_id}
+            cascaded = await _cp_offload(
                 lambda: _sb_revoke(get_control_plane(), key_id, now),
-                op="revoke_api_key")
+                op="revoke_api_key") or []
         except HTTPException:
             raise
         except Exception:
             import logging
             logging.getLogger("tortoise.api").exception("revoke_api_key failed")
             raise HTTPException(status_code=500, detail="Internal server error")  # noqa: B904
+        # #8694: one audit event naming the CASCADE (the rows this revoke
+        # stamped), so a parent revocation's blast radius is legible from the
+        # trail instead of only from the child rows' timestamps.
+        await _async_audit(
+            request, org["org_id"], "api_key_revoke",
+            resource_type="api_key", resource_id=key_id,
+            detail={"cascaded_key_ids": list(cascaded),
+                    "cascaded": len(cascaded)},
+        )
         return {"revoked": True, "key_id": key_id, "revoked_at": now}
     sdk = _make_sdk(namespace="registry")
     try:
@@ -12423,20 +12470,33 @@ async def revoke_api_key(key_id: str, request: Request, org: dict = Depends(get_
         # own the key unconditionally (a None org fails closed, matching
         # the old strict `!=`).
         _ensure_key_in_pinned_org(org["org_id"], rows[0][0], required=True)
-        if rows[0][1] is not None:
-            return {"revoked": True, "already": True, "key_id": key_id}
         from datetime import datetime
         now = datetime.now(UTC).isoformat()
+        if rows[0][1] is not None:
+            # #8694: same inventory convergence as the Supabase lane above.
+            from tortoise.sdk import _registry_revoke_key_descendants
+            _registry_revoke_key_descendants(sdk._get_registry(), key_id, now)
+            return {"revoked": True, "already": True, "key_id": key_id}
         sdk._get_registry().query(
             "MATCH (k:APIKey {id: $id}) SET k.revoked_at = $now",
             params={"id": key_id, "now": now},
         )
+        # #8694: revocation CASCADES to the delegated descendants (the same
+        # stamp the Supabase lane performs inside `revoke_api_key`).
+        from tortoise.sdk import _registry_revoke_key_descendants
+        cascaded = _registry_revoke_key_descendants(sdk._get_registry(), key_id,
+                                                    now)
     except HTTPException:
         raise
     except Exception:
         import logging
         logging.getLogger("tortoise.api").exception("revoke_api_key failed")
         raise HTTPException(status_code=500, detail="Internal server error")  # noqa: B904
+    await _async_audit(
+        request, org["org_id"], "api_key_revoke",
+        resource_type="api_key", resource_id=key_id,
+        detail={"cascaded_key_ids": list(cascaded), "cascaded": len(cascaded)},
+    )
     return {"revoked": True, "key_id": key_id, "revoked_at": now}
 
 
