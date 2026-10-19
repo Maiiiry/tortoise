@@ -469,6 +469,15 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # leaks a live-server URI into every later module (the sdk_factory lane flip).
     # DELIBERATE_URI: the setenv IS the test input.
     "test_2500_terminal_ep_backfill.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
+    # #9219: the same shape as test_2500 above — `session_indexer.main()` assigns
+    # `os.environ["TORTOISE_DB_URI"]` DIRECTLY, so `_run_indexer` records the
+    # CURRENT value first (a setenv with nothing to restore would let a dead
+    # endpoint leak into every module collected after it). The URI is not the
+    # test input here; it is the value being RESTORED, and the fixture-param
+    # monkeypatch undoes it at teardown. DELIBERATE_URI (restoration, not a lane
+    # flip). The site landed in #9197 without its triage entry and redded the
+    # required `test (e)`/`python-ci-gate` on main.
+    "test_9079_event_writers_journal.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     # #7017: the engine-probe suite is hermetic — every probe is injected, so
     # the URI's SOLE role is as the input to `graph_target_from_env()`, and the
     # endpoint-resolution tests set/del it precisely to pin which endpoint

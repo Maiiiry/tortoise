@@ -286,8 +286,25 @@ def main() -> int:
                 # rejects it, and the old ``except`` swallowed that, so the
                 # documented cleanup silently left the graph behind (#5084).
                 # The canonical channel is the client's ``delete()``.
-                proj.g.delete()
-                print(f"# dropped graph {name}")
+                #
+                # #9209: NOT ``proj.g.delete()``. That is the projection's
+                # GUARDED write handle, and it now runs §17.1 + L2 on a
+                # whole-graph wipe — a non-disposable namespace (the usage
+                # example's ``tm1338scale`` → ``org_tm1338scale``) is refused,
+                # and the swallow below would turn that refusal into exactly
+                # the silent leave-behind #5084 fixed. This script's own
+                # ``name != expected`` guard IS its authorization, so it drops
+                # through the sanctioned sweep helper: presence re-check + the
+                # cross-process lock (#2961's AOF-poison guard), no L1/L2.
+                from tortoise.graph_delete_guard import safe_graph_delete
+                if not safe_graph_delete(proj.db, name):
+                    print(
+                        f"# WARNING: drop of {name} was refused or skipped "
+                        f"(absent, or the delete lock was unavailable) — "
+                        f"the graph is left for a later sweep",
+                        file=sys.stderr)
+                else:
+                    print(f"# dropped graph {name}")
             except Exception as exc:
                 print(f"# WARNING: drop failed: {exc}", file=sys.stderr)
         sdk.close()
