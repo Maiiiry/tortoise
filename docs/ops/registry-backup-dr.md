@@ -382,7 +382,8 @@ legacy-flat classification index leaves the pool *unmeasured*: the driver then
 never reads it as fresh, never files a false `STALE` from a failed read, and
 never lets it silence the 0-team envelope. A listing that fails while
 `head-bucket` passes also files **R2_UNLISTABLE** (storage reachable,
-pool unverifiable — #3147) so a "successful" sweep cannot keep the run green. A failed
+pool unverifiable — #3147) so a "successful" sweep cannot keep the run green; the
+watcher applies the same rule to its own read via a bucket-level head (#8422). A failed
 read while the sweep is OFF is **not** a confirmed deliberate pause, so it
 files SWEEP_OFF_STALE. An unclassifiable `/status` (no boolean `.enabled`, or a
 non-JSON 200) fails **closed** as SWEEP_NO_COVERAGE. A held sweep lock is not
@@ -425,10 +426,11 @@ measured this run — a sweep that "completes" with R2 down must not close the
 incident it just filed (that would re-file and re-close forever). It can
 therefore also clear from the disabled path once storage is proven back.
 `R2_DOWN` (#3147, the REACHABILITY tier — **watcher-owned**) clears only on the
-watcher's own evidence: its R2 probe reaches the substrate again. The driver
-files it when its preflight fails but **cannot** clear it (`resolve_global`
-refuses a watcher-owned kind), which is what makes the split safe in both
-directions.
+watcher's own evidence: its R2 probe reaches the substrate again — a completed
+read, or (since #8422) a bucket-level HEAD that answers even while the listing
+still fails. The driver files it when its preflight fails but **cannot** clear it
+(`resolve_global` refuses a watcher-owned kind), which is what makes the split
+safe in both directions.
 `WATCHER_DOWN` clears on **watcher evidence** (a `.watcher` block with a real
 boolean `running` read this run) — a missing/malformed block neither files nor
 clears it, because unknown is not evidence the daemon is alive.
@@ -596,8 +598,8 @@ corresponds to exactly one recovery condition and one evidence tier.**
 
 | Tier | Kind | Filed by | Recovery evidence (the ONLY thing that clears it) | Owner |
 |---|---|---|---|---|
-| unreachable | `R2_DOWN` (frozen key **retained**, meaning narrowed) | the driver's `head-bucket` preflight **and** the watcher's R2 read | the substrate **ANSWERS** — a probe reaches it | **watcher** (was driver) |
-| unlistable | `R2_UNLISTABLE` (**new**) | the driver's listing leg (`R2_LIST_OK=0`) and the app's `storage_error` (read from `/status` by the driver) | the driver's **whole-pool measurement**: `head-bucket` OK + `storage_error` clear + `R2_LIST_OK=1` | **driver** |
+| unreachable | `R2_DOWN` (frozen key **retained**, meaning narrowed) | the driver's `head-bucket` preflight **and** the watcher's R2 read (the watcher files it only when its own read fails **and** its bucket-level HEAD answers nothing, #8422) | the substrate **ANSWERS** — a probe reaches it | **watcher** (was driver) |
+| unlistable | `R2_UNLISTABLE` (**new**) | the driver's listing leg (`R2_LIST_OK=0`), the app's `storage_error` (read from `/status` by the driver), **and** the watcher when its own read fails while a bucket-level HEAD **answers** (#8422) | the driver's **whole-pool measurement**: `head-bucket` OK + `storage_error` clear + `R2_LIST_OK=1` | **driver** |
 
 **Why R2_DOWN keeps its key instead of being renamed `R2_UNREACHABLE`.**
 `tortoise/incident_kinds.py` freezes kind strings: the kind IS the R2 dedup key
@@ -613,9 +615,11 @@ had nothing to do.
 `R2_DOWN`: `kind_owner()`/`KIND_OWNERS` make it watcher-owned, so the driver's
 `resolve_global` refuses it and leaves the sentinel intact (pinned by
 `registry-cron.test.sh` case 66 and by `tests/test_alert_store.py`). The watcher
-may not clear `R2_UNLISTABLE`: its probe measures reachability, not the pool
-(pinned by `tests/test_alert_store.py`). No provenance exception was added — the
-`writer` field on a sentinel is diagnostic only.
+may FILE `R2_UNLISTABLE` (filing has never been owner-gated) but may not CLEAR
+it: its bucket-level HEAD measures reachability, not the pool's measurement
+(pinned by `tests/test_alert_store.py`, and the watcher's leg does not even
+attempt the resolve — `tests/test_backup_watcher.py`). No provenance exception
+was added — the `writer` field on a sentinel is diagnostic only.
 
 **Suppression is per-kind, so the two tiers suppress independently.**
 `ops/suppression.json` is keyed `{"KIND": {"until": "ISO"}}`, and the issue
@@ -623,18 +627,44 @@ titles differ (`[DR] R2_DOWN …` vs `[DR] R2_UNLISTABLE …`), so pausing one t
 does not pause the other and the GH-search adoption path cannot cross-adopt them
 (`github_issue.incident_title_matches` is `[DR] {kind}`-prefix anchored).
 
-**NAMED RESIDUAL — a watcher-side permission failure is filed at the
-reachability tier.** The watcher's probe is `storage.list("backups/")` →
-`list-objects-v2`. On FAILURE it cannot tell "R2 does not answer" from "R2
-answers but this key cannot list" (the body's premise that only the driver tests
-the listing tier is imprecise for the watcher), so it files the incident at the
-reachability tier (`R2_DOWN`) — the tier its evidence *claims*. When the real
-cause is a watcher-side `ListObjects` failure, the incident is therefore filed
-under `R2_DOWN` while the driver's `R2_UNLISTABLE` (if its listing leg also
-fails) is the accurate one; both can be open, and the `R2_DOWN` one clears as
-soon as the watcher's read succeeds again. This is a labelling residual, not a
-lost signal — filed as **#8472**. Anti-flap/hysteresis for the tier BOTH surfaces
-can file is **#3146**.
+**RESOLVED (#8422) — the watcher's filing is tier-exact.** The residual this
+section used to carry: the watcher's probe was `storage.list("backups/")` →
+`list-objects-v2`, whose FAILURE cannot tell "R2 does not answer" from "R2
+answers but this key cannot list", so a watcher-side permission fault was filed
+at the reachability tier (`R2_DOWN`) while the driver's `R2_UNLISTABLE` — if its
+listing leg also failed — was the accurate one. The watcher now asks a
+BUCKET-LEVEL HEAD (`BackupStorage.head_bucket()`, implemented by `R2Storage` as
+the S3 `head_bucket` call — the same bucket-scoped probe the driver's preflight
+uses, because R2's S3 API does not reliably support account-level `list_buckets`
+from an object-scoped key): a head that ANSWERS is positive evidence the
+substrate is reachable, so the failed read is filed as **`R2_UNLISTABLE`**; only a
+head that also fails leaves **`R2_DOWN`**. The probe runs only on a failed poll (a
+completed read is its own reachability evidence), and its absence — an older or
+custom store — keeps the reachability tier, so a failure is never relabelled
+without evidence.
+
+**The boundary this probe cannot cross, stated so it is not mistaken for a gap:**
+a store that REFUSES the bucket-level head for a permission reason is
+indistinguishable from one that does not answer. That ambiguity IS the
+reachability tier's definition ("no probe reaches the substrate"), so a refused
+head stays `R2_DOWN`. Nothing in the incident BODY distinguishes the two cases
+yet — recording the probe outcome in the incident's `detail` is the remaining
+indicator of **#8472** (the duplicate tracker for this residual), deliberately not
+absorbed here. Two consequences worth knowing at triage:
+(1) `R2_DOWN` and `R2_UNLISTABLE` can be open together on one poll — the head
+answered and the listing did not, which is exactly the two-tier model working;
+(2) `R2_DOWN` CLEARS on that same positive head even while the listing still
+fails, because its recovery condition (a probe reaches R2) is then satisfied —
+the stranded-open alternative would leave a recovered tier paging for as long as
+the listing grant stays broken. Anti-flap/hysteresis for the tier BOTH surfaces
+can file is **#3146**, and one interlock there is worth knowing: a watcher
+listing failure RESETS the incident's `healthy_streak` (the store's DEDUP path),
+so a driver whose own whole-pool measurement is clean cannot clear
+`R2_UNLISTABLE` while another surface still cannot measure the pool. That is
+deliberate — an incident must not close while a configured writer still observes
+the condition — so a key that lost `ListObjects` for ONE surface keeps the tier
+open until that surface recovers, rather than flapping open/closed per writer
+cadence.
 
 **Not done here (deliberately).** ADR-011 is a dated, human-gated decision record
 and is not edited by this change; this runbook section is the operational home.
