@@ -287,60 +287,80 @@ wired through `tortoise session capture` (write-before-upload) and
 `tortoise session drain` (run by `session-start.sh`). See
 `docs/plans/2026-09-17-3963-capture-spool.md`.
 
-### A backlogged spool never blocks a turn (agent-infra#2100)
+### The drain is bounded, and a blocked box says so (#2100)
 
-A cloud cell once became unusable because of this spool: 320+ queued captures,
-every one `waiting on backoff` against an exhausted graph quota (402). The
-flush ran on the turn's own stack, so `session_start` consumed the whole turn —
-the lane log was 259–262 B, `agent_end` arrived with no assistant text and no
-tool call. Capture is observability; it must never be able to do that.
+A capture feature is observability: it must never be able to make a machine's
+capacity unusable. It could, and did — agent-infra#2100 measured one cloud cell
+whose spool had grown to 3.3 MB / 320 **quota-deferred** entries, where every
+lane produced 259–262 B of banner-only output and looked dead while two sibling
+boxes ran normally.
 
-What is pinned by tests, and where:
+Three properties close that, and they are all pinned in the suite:
 
-- **Scheduled, never inline — Pi leg only** (`tortoise-capture.ts`, its
-  `node --test` suite). The extension hands the flush to `setImmediate`, so
-  neither the spool scan nor a request runs inside a handler Pi awaits. The
-  Claude leg's drain was ALREADY backgrounded by `claude-hooks/session-start.sh`
-  (`nohup … >/dev/null 2>&1 &`), which is why it never had this defect — and why
-  it carries no budget: nothing on its turn path waits for it.
-- **Hard time budget — Pi leg only.** One flush gets `FLUSH_BUDGET_MS` (5 s) of
-  wall clock, shared across entries; a single upload gets `min(remaining budget,
-  request timeout)`. The remainder stays spooled and is reported
-  (`budgetExhausted`), never silently dropped. A fault inside the flush is one
-  `spool flush error` line, never an exception on Pi's event loop.
-- **A refusal is a named state — both legs** (`health.json` in the spool,
-  written by either leg, read by either). A 402 is counted as `quotaRefusals`
-  and recorded as `{"state":"blocked","status":402,"queued":N}`. The status is
-  the contract: the clients do **not** prose-match the message — #4614 made the
-  402 carry a machine-readable category for exactly that reason.
-- **A per-box health line — both legs, byte-identical**
-  (`captureHealthLine` / `capture_health_line`, parity-tested by running the real
-  TypeScript against Python's directory). Four distinct answers, because four
-  distinct situations must never read alike:
+* **Nothing the handlers do AFTER the durable snapshot runs on the tick Pi
+  awaits.** `session_start` and `agent_end` write their snapshot inline (that is
+  the #3963 durability guarantee — a kill must not lose the turn) and then only
+  *schedule* (`setImmediate`) the health line and the replay. Fire-and-forget
+  alone was not enough: an `async` body runs synchronously up to its first
+  `await`, so `void flush(…)` still charged the spool scan and its turn reads to
+  the turn's critical path.
+  `session_shutdown` is the exception by nature — Pi runs it before exit — so
+  there the bounds are what protect the exit, and the *live* session is filed
+  first (one `onlySessionId` pass) rather than ranked behind older entries it
+  can only be filed by shutdown.
+* **One pass is bounded.** At most `FLUSH_MAX_ATTEMPTS` (8) POSTs and
+  `FLUSH_BUDGET_MS` (5 s) of wall clock, checked between entries (never
+  mid-POST, so a completed attempt's outcome is always recorded). Entries the
+  pass never reached stay queued — counted as `remaining` and continued in the
+  background on an `unref()`d timer, so a pending continuation can never keep a
+  finished Pi process alive either. Removal on the bound is the spool's own
+  count/byte ceiling, unchanged.
+* **A quota refusal is a NAMED state, not a growing backlog.** The first 402
+  carrying one of the server's categories (`quota_exceeded` for the plan
+  allowance, `cohort_cost_cap` for the org spend cap — the two are named
+  separately, because a spend cap reported as "quota" sends the owner to buy a
+  plan that cannot lift it) stops the pass (the remaining entries cannot
+  succeed either) and is recorded in `<spool>/status.json`, so the *next*
+  process reports it without re-POSTing to rediscover it. A filed entry clears
+  the marker — a stale `BLOCKED` would be its own lie — and so does observing
+  nothing pending at all (see below).
 
-  | line | meaning |
-  |---|---|
-  | `capture: OK (0 queued)` | nothing to file |
-  | `capture: BACKLOG (<n> queued[, <k> rejected])` | waiting, no refusal (a network blip clears itself) |
-  | `capture: BLOCKED (<n> queued, <status>[, <k> rejected])` | a refusal retrying cannot fix |
-  | `capture: UNKNOWN (spool unreadable)` | the spool could not be READ — never folded into `OK` |
+Every `session_start` prints exactly one health line, which is the per-box
+surface an operator (or a lane log that produced 259 B) reads:
 
-  `tortoise session health` prints it and always exits 0; `tortoise doctor`
-  carries it as a row; the Pi extension prints it on its own lane log when a
-  flush is refused or its budget is reached. The drain prints it to stderr, but
-  the SessionStart hook discards that stream — so it is an operator's line for a
-  drain run by hand, not a fleet surface.
+```
+capture: OK (0 queued)
+capture: DRAINING (12 queued)
+capture: BLOCKED (320 queued, 402 quota)
+capture: INACTIVE (no TORTOISE_API_KEY, 3 queued)
+capture: UNREADABLE (cannot list …/capture-spool/entries)
+```
 
-The `, <k> rejected` suffix appears on BOTH shapes — queued and rejected captures
-coexist on a box that lost a key mid-outage, and the line must not hide either.
+`queued` is **pending** work — recomputed from the spool on every call as
+entries that are neither FILED (the server already accepted exactly that
+content; the entry is kept, not unlinked) nor TERMINAL (kept, never retried —
+#7708). Counting raw meta files would count spool *occupancy*, which only grows
+on a healthy box: `OK (0 queued)` would never print and `BLOCKED` could never
+clear. The recorded marker is only trusted while something is still pending, so
+a quota that has since lifted, or a spool another leg has drained, cannot keep
+claiming a block — nothing pending reads `OK` and clears the marker.
 
-`rejected` exists because a terminal entry is never retried: a box whose every
-capture is refused (a rotated key answers 401) has `queued == 0`, and the count
-alone would call a dead capture pipeline healthy.
+The Python leg's `flush_spool` carries no attempt cap or budget of its own: it
+runs on explicit commands (`session capture`, `session drain`), never on a turn
+path — `claude-hooks/session-start.sh` backgrounds the drain with
+`nohup … >/dev/null 2>&1 &`, which is why this defect was Pi-only. It shares
+everything else with the Pi leg, because both write the same spool **and the
+same `<spool>/status.json`**: the same named `blocked` state (same two 402
+categories, classified by STATUS and the server's code, never by prose) and the
+same health line, byte for byte (a parity test executes this TypeScript against
+a directory the Python leg wrote). That is deliberate — two records, or two
+spellings, would let the two surfaces of one box disagree about whether it is
+blocked, which is the false PASS #2100 removes.
 
-The spool stays **capped** — 1000 entries / 256 MiB, oldest-first eviction with a
-recorded reason, both numbers pinned equal on both legs. The cap is what bounds
-the per-turn prune; it is deliberately not lowered to the size of the measured
-incident, because a blocked box's captures are the user's data and evicting them
-to make a number look better is the loss the retry policy exists to prevent. The
-defect was the inline flush, not the ceiling.
+Operators reach the same line from the CLI: `tortoise session health` prints it
+(local-only, no credential, always exits 0 — the blocked box is exactly the one
+that must be able to answer), `tortoise doctor` carries it as a `Capture spool`
+row (`❌` blocked, `⚠️` unreadable, `ℹ️` draining/inactive — a pending capture on
+a live box and a keyless install are normal states, and painting them as
+warnings is how a real block gets ignored), and a hand-run `session drain` prints
+it to stderr when the spool is blocked or unreadable.

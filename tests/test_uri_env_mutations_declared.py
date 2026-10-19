@@ -8,6 +8,22 @@ delenvs the URI constructs embedded and passes green — O1/T1's "≥90% on
 docker" math then counts it as docker-covered while it never touches the
 server (the #942 vacuity vector, cycle-8 P1-3).
 
+SCOPE (#9061): every test module in the tree, at any depth —
+`tests/**/test_*.py` (1076 modules as of 2026-10-18), and the carve-out
+exemption applies to the MODULE its stem resolves to — `tests/<stem>.py`, or the
+registry's subdirectory module where that is where it lives
+(`test_smoke_embedded` → `tests/bench/`), never to a same-named file elsewhere.
+It used to be
+`tests/test_*.py` plus `tests/e2e/test_*.py`, which left
+`tests/longmem_eval/`, `tests/e2e/auth/`, `tests/e2e/hosted/`, `tests/eval/…`,
+`tests/bench/` and `tests/mini_beir/` outside a guard whose whole purpose is
+to notice a mutation wherever it is written: 72 modules and 7 live mutation
+sites were unscanned while it reported green. `test_both_guards_scan_the_
+recursive_population` binds the two GUARDS to that enumeration (a pin on the
+helper alone stayed green when both guards were reverted to the flat glob),
+and `test_a_subdirectory_module_cannot_inherit_a_carve_out_exemption` keeps
+the exemption from following a stem into a subdirectory.
+
 Lane intents:
   DELIBERATE_URI            — the site intentionally forces the docker lane
                               (module-level live probes, docker-lane fixture
@@ -83,13 +99,35 @@ and the `empty-uri-default-ok:` marker.
 from __future__ import annotations
 
 import ast
-import io
 import re
-import tokenize
+import sys
+import warnings
 from pathlib import Path
 
 _TESTS_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _TESTS_ROOT.parent
+
+
+def _iter_test_module_paths() -> list[Path]:
+    """Every test module in the tree, at ANY depth (#9061).
+
+    A non-recursive `glob("test_*.py")` plus `e2e/` reached 1004 of the 1076
+    test modules and stated no boundary, so `tests/longmem_eval/`,
+    `tests/e2e/auth/`, `tests/e2e/hosted/`, `tests/eval/…`, `tests/bench/` were
+    all silently outside a guard whose whole purpose is to notice a mutation
+    wherever it is written. It also made the census's guarantee depend on a
+    filename's directory, which nothing enforces.
+
+    Recursive by construction, and `test_the_scan_is_recursive` pins that so a
+    later "simplify" cannot quietly restore the blind spot.
+    """
+    return sorted(_TESTS_ROOT.glob("**/test_*.py"))
+
+
+def _scan_key(path: Path) -> str:
+    """The declaration key for *path*: `tests/`-relative, so a subdirectory
+    file cannot share a declaration with a same-named top-level one."""
+    return path.relative_to(_TESTS_ROOT).as_posix()
 
 # ── DELIBERATE_URI_MUTATIONS (cycle-8 P1-3) ─────────────────────────────────
 # dict[file, list[regex]] — every mutation line in `file` must match at least
@@ -247,7 +285,12 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     "test_integration_search.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
     "test_search_engine.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
     "test_session_capture_e2e.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
-    "test_billing_upgrade.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
+    # #9061: keyed by tests/-relative path — this module lives in tests/e2e/,
+    # and a bare-name key matched it only because a lookup fallback stripped
+    # the directory, which authorizes ANY same-named file in any directory (the
+    # fallback is gone; `test_declaration_path_rejects_undeclared` pins that a
+    # subdirectory twin is not authorized).
+    "e2e/test_billing_upgrade.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
     # ── DELIBERATE_URI: fixtures/tests that force the docker lane directly ──
     "test_consolidation_4way.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     "test_doctor.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
@@ -470,6 +513,33 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
         r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
         r'monkeypatch\.setenv\(\s*$',
         r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
+    # ── #9061: sites the census did not previously scan at all. Keys are
+    #    `tests/`-relative because these live in a subdirectory, so they can
+    #    never share a declaration with a top-level file of the same name.
+    # The module-level LIVE-PROBE pattern the census docstring documents
+    # ("save-restore: `_old_uri = os.environ.get(...)` captured and assigned
+    # BACK in a finally"): `_PROBE_GRAPH` is installed before the import-time
+    # FTS probe runs and the `finally` puts the saved `_OLD_URI` back. The
+    # restore sites are declared as well as the set, because the census counts
+    # every matching line — that is what makes the pairing auditable rather
+    # than assumed. DELIBERATE_URI (the probe needs a THROWAWAY graph name, not
+    # the embedded lane); the `monkeypatch` site is the function-scoped `sdk`
+    # fixture, auto-undone at teardown.
+    "longmem_eval/test_assembly_arm.py": [
+        r'os\.environ\["TORTOISE_DB_URI"\]\s*=',
+        r'os\.environ\.pop\(\s*["\']TORTOISE_DB_URI["\']',
+        r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
+    # The arm's `--db` scoping tests (#1349 isolation): an explicit `--db` must
+    # beat a stale `TORTOISE_DB_URI`, so the stale value is set to a DIFFERENT
+    # endpoint and then the store's own `_temporary_env_var` proves the scoped
+    # value wins and is restored. MIXED INTENT: the `setenv`s are
+    # DELIBERATE_URI (the stale env IS the input); the `delenv` is
+    # DELIBERATE_EMBEDDED_LANE — it establishes the no-stale-URI baseline that
+    # the first arm asserts against. All function-scoped `monkeypatch`, so no
+    # lane flip can leak into a later module.
+    "longmem_eval/test_vector_arm.py": [
+        r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"',
+        r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
 }
 
 # Carve-out TEST-MODULE stems (Task 5 wires these into TEST_NO_REDIRECT_STEMS;
@@ -551,25 +621,98 @@ def _exempt_stems() -> frozenset[str]:
             TEST_NO_REDIRECT_STEMS)
 
 
+def _exempt_paths() -> frozenset[Path]:
+    """The exempt MODULES: each carve-out STEM resolved to ONE path (#9061).
+
+    The exempt set is a list of carve-out STEMS, and a stem is not a path. Two
+    wrong answers were available here, and both were live at some point:
+
+    * matching on `path.stem` let the exemption follow the NAME into any
+      directory, so a same-named module anywhere was silently outside both
+      guards; and
+    * assuming `tests/<stem>.py` dropped the exemption of every carve-out whose
+      module does not sit at the top level — `test_smoke_embedded` is
+      `tests/bench/test_smoke_embedded.py`: it is in `config/ci-surfaces.yml`'s
+      carve-out set (`a carve_out file is excluded from EVERY docker leg`) and
+      `tests/_embedded.py` names it as a stem precisely because "tests/bench
+      rides the P2 flip via the push_extra distribution, so its URI job must
+      keep the file embedded". A stem-only predicate called that file exempt;
+      a top-level-only predicate called it scanned. Neither read the registry.
+
+    So the stem is RESOLVED: the top-level module when one exists, otherwise
+    the module the registry's stem names. A stem that resolves to more than one
+    module is ambiguous, and `test_every_carve_out_stem_resolves_to_one_module`
+    reds on it — that is what keeps a same-stem file in another directory from
+    inheriting the exemption.
+    """
+    by_stem: dict[str, list[Path]] = {}
+    for p in _iter_test_module_paths():
+        by_stem.setdefault(p.stem, []).append(p)
+    exempt: set[Path] = set()
+    for stem in _exempt_stems():
+        top = _TESTS_ROOT / f"{stem}.py"
+        candidates = [top] if top.is_file() else by_stem.get(stem, [])
+        if len(candidates) == 1:
+            exempt.add(candidates[0])
+        # 0 candidates (a dead stem) and 2+ (an ambiguous one) are BOTH red in
+        # `test_every_carve_out_stem_resolves_to_one_module`. Until they are
+        # fixed the exemption fails CLOSED — nothing is exempted, so an
+        # ambiguity can only over-report, never silently exempt two modules.
+    return frozenset(exempt)
+
+
+def _is_exempt_module(path: Path) -> bool:
+    """True only for the carve-out MODULE the registry names (#9061).
+
+    By PATH, never by name: the exemption's stated rationale ("carve-out
+    modules run in the URI-less lane and never co-run with docker-lane files")
+    is a property of one module, so it is granted to that module and to nothing
+    that merely shares its name. `_exempt_paths` resolves the registry; this is
+    the single-path reading of it.
+    """
+    return path in _exempt_paths()
+
+
+def _scanned_modules():
+    """Yield (key, src) for every scanned module — the ONE scan population.
+
+    Both guards read this, so they cannot narrow independently, and
+    `test_both_guards_scan_the_recursive_population` pins the population to the
+    recursive enumeration (#9061).
+
+    The exempt set is resolved ONCE here: resolving per module would re-glob
+    the tree 1076 times."""
+    exempt = _exempt_paths()
+    for f in _iter_test_module_paths():
+        if f in exempt:
+            continue
+        yield _scan_key(f), f.read_text(encoding="utf-8")
+
+
 def _uri_mutation_sites():
-    """Yield (file_name, line_number, line) for every mutation site in a
+    """Yield (key, line_number, line) for every mutation site in a
     NON-allowlist (migrated) test file. The executable census — the plan's
     Step 1 grep is the enumeration, this is its machine form."""
-    exempt = _exempt_stems()
-    for f in sorted(_TESTS_ROOT.glob("test_*.py")) \
-            + sorted((_TESTS_ROOT / "e2e").glob("test_*.py")):
-        if f.stem in exempt:
-            continue
-        src = f.read_text(encoding="utf-8")
+    for key, src in _scanned_modules():
         for m in _MUTATION_RE.finditer(src):
             line = src.count("\n", 0, m.start()) + 1
-            yield f.name, line, src.split("\n")[line - 1].strip()
+            yield key, line, src.split("\n")[line - 1].strip()
 
 
 def _is_declared(fname: str, line: str) -> bool:
     """The declaration-guard matching logic (factored for pinning): a
     mutation line is declared when the file's DELIBERATE_URI_MUTATIONS
-    entry exists and at least one declared regex matches the line."""
+    entry exists and at least one declared regex matches the line.
+
+    *fname* is the `tests/`-relative key (`longmem_eval/test_vector_arm.py`),
+    which for a top-level module IS its bare name — so the 98 pre-#9061 bare
+    entries keep working without a second lookup path. There is deliberately NO
+    bare-name fallback: it was tried, and it re-opened cross-file laundering —
+    `sub/test_config.py` matched the declaration written for
+    `tests/test_config.py`, so a declaration for one file authorized any
+    same-named file in any directory. `test_declaration_keys_are_unambiguous`
+    keeps bare keys honest; `test_declaration_path_rejects_undeclared` pins that
+    a same-named subdirectory module is NOT authorized."""
     declared = DELIBERATE_URI_MUTATIONS.get(fname)
     return bool(declared) and any(re.search(p, line) for p in declared)
 
@@ -593,72 +736,233 @@ def test_uri_mutations_declared_files_exist():
     """The table's file keys must resolve to real test modules — a typo'd
     key silently exempts nothing (and the guard's missing-file red would be
     the only signal)."""
+    scanned = {_scan_key(p) for p in _iter_test_module_paths()}
+    scanned_names = {p.name for p in _iter_test_module_paths()}
     for fname in DELIBERATE_URI_MUTATIONS:
-        assert (_TESTS_ROOT / fname).exists() \
-            or (_TESTS_ROOT / "e2e" / fname).exists(), \
+        assert fname in scanned or fname in scanned_names, \
             f"DELIBERATE_URI_MUTATIONS key {fname!r} is not a test module"
+
+
+def test_the_scan_is_recursive():
+    """#9061: the census must see EVERY directory, not `tests/` + `tests.e2e/`.
+
+    Pins the enumeration itself, because the guard's only failure mode when it
+    narrows is silence: 72 modules and 7 mutation sites were outside it while
+    it reported green.
+    """
+    scanned = {_scan_key(p) for p in _iter_test_module_paths()}
+    for required in ("longmem_eval/test_assembly_arm.py",
+                     "longmem_eval/test_vector_arm.py",
+                     "e2e/auth/test_bff_flow.py"):
+        assert required in scanned, (
+            f"the census scan does not reach {required!r} — the glob stopped "
+            f"covering the tree (#9061)")
+
+
+def test_both_guards_scan_the_recursive_population():
+    """#9061: the PINS above are worthless unless the GUARDS use the population.
+
+    `test_the_scan_is_recursive` passed even with both guards reverted to the
+    pre-#9061 flat glob, because the 72 newly-visible modules hold no violation
+    today — a pin with nothing to see is silent, not safe. So bind each guard's
+    population to the recursive enumeration and require that neither can scan
+    independently:
+
+      * both guards yield from the SAME seam (`_scanned_modules`), and
+      * that seam IS the recursive enumeration minus the carve-out modules.
+    """
+    exempt = _exempt_paths()
+    expected = {_scan_key(p) for p in _iter_test_module_paths()
+                if p not in exempt}
+    restored = {name for name, _src in _non_exempt_test_files()}
+    assert restored == expected, (
+        "the restoration guard's population drifted from the recursive scan "
+        f"— missing {sorted(expected - restored)[:5]}")
+    # The declaration guard's output is SITES, not a population, so a narrowed
+    # scan would not show up in its results — pin that it READS the seam
+    # functionally (`test_both_guards_consume_the_one_population`).
+
+
+def test_both_guards_consume_the_one_population(monkeypatch):
+    """#9061: a guard that iterates its OWN glob can narrow without reddening.
+
+    Functional, not textual: the population seam is replaced by one synthetic
+    module and each guard must report on THAT module. A guard holding its own
+    `glob(...)` would not see the sentinel and reds here, whatever its source
+    looks like — the previous version of this pin scanned the file's own text
+    for `_scanned_modules()`, which a mere annotation on the def line defeated
+    (the string then matched the TEST's literal instead of the function).
+    """
+    sentinel = "synthetic/sub/test_planted_9061.py"
+    planted = 'x = 1\nos.environ.pop("TORTOISE_DB_URI", None)\n'
+    monkeypatch.setattr(sys.modules[__name__], "_scanned_modules",
+                        lambda: iter([(sentinel, planted)]))
+    sites = list(_uri_mutation_sites())
+    files = list(_non_exempt_test_files())
+    assert [s[0] for s in sites] == [sentinel], (
+        "the declaration guard did not read the one scan population — it is "
+        f"iterating its own glob (#9061): {sites}")
+    assert [name for name, _src in files] == [sentinel], (
+        "the restoration guard did not read the one scan population — it is "
+        f"iterating its own glob (#9061): {files}")
+
+
+def test_a_subdirectory_module_cannot_inherit_a_carve_out_exemption():
+    """#9061: the exempt set is a list of STEMS; a stem is not a path.
+
+    Matching on `path.stem` exempted ANY module whose name appeared in the
+    carve-out registry, so the moment the scan went recursive a new same-named
+    file in any directory was silently outside both guards. The exemption is a
+    property of the module the registry NAMES, so it is granted by path — and
+    the stem is RESOLVED to that module rather than assumed to be top-level
+    (`test_smoke_embedded` is `tests/bench/test_smoke_embedded.py`: a predicate
+    of `tests/<stem>.py` would have revoked a live carve-out exemption instead
+    of fixing the inheritance).
+    """
+    stack = _TESTS_ROOT / "bench" / "test_smoke_embedded.py"
+    assert stack.is_file(), "the module this pin reads has moved"
+    assert _is_exempt_module(stack), (
+        "the module the carve-out registry names by stem lost its exemption — "
+        "`test_smoke_embedded` resolves to tests/bench/, not to a top-level "
+        "file (#9061)")
+    # …and the NAME buys nothing in another directory: a same-stem module
+    # elsewhere does not inherit it (nothing resolves by name any more).
+    for other in ("mini_beir", "eval/retrieval"):
+        intruder = _TESTS_ROOT / other / "test_smoke_embedded.py"
+        assert not _is_exempt_module(intruder), (
+            f"a module in {other}/ inherited the carve-out exemption by STEM "
+            "— the exemption must be granted by path (#9061)")
+    assert not _is_exempt_module(stack.parent / "test_embedded_lifecycle.py"), (
+        "a sibling module in the carve-out's directory must not inherit its "
+        "exemption")
+
+
+def test_every_carve_out_stem_resolves_to_one_module():
+    """Every exempt stem must name exactly ONE module — the registry's target.
+
+    `_exempt_paths` resolves a stem to the module the carve-out registry names,
+    and that is only sound while the resolution is UNAMBIGUOUS: a stem matching
+    two modules (a top-level file plus an `e2e/` twin, say) must red here
+    instead of silently exempting both. A stem naming NO module is a dead entry
+    — the exemption it claims is granted to nothing, which reads as registered
+    coverage in `TEST_NO_REDIRECT_STEMS` while doing no work.
+    """
+    by_stem: dict[str, list[str]] = {}
+    for p in _iter_test_module_paths():
+        by_stem.setdefault(p.stem, []).append(_scan_key(p))
+    exempt = _exempt_stems()
+    ambiguous = {s: by_stem[s] for s in exempt if len(by_stem.get(s, [])) > 1}
+    assert not ambiguous, (
+        "carve-out stem(s) resolving to more than one module — the exemption "
+        "would land on the wrong file: "
+        + "; ".join(f"{s} -> {v}" for s, v in sorted(ambiguous.items())))
+    dead = sorted(s for s in exempt if s not in by_stem)
+    assert not dead, (
+        f"carve-out stem(s) naming no test module: {dead} — a dead exemption "
+        "looks like registered coverage and does no work")
+    # …and the resolution must reach the module the stem names, not skip it.
+    assert (_TESTS_ROOT / "bench" / "test_smoke_embedded.py") in _exempt_paths(), (
+        "`test_smoke_embedded` resolves to tests/bench/ — the resolved exempt "
+        "set must contain it (#9061)")
+
+
+def test_declaration_keys_are_unambiguous():
+    """A bare-name key must match exactly ONE module.
+
+    Keys are looked up by `tests/`-relative key, which for a top-level module IS
+    its bare name, so the 98 pre-#9061 entries need no second lookup path. The
+    hazard a bare name still carries is REASSIGNMENT: a key written for
+    `tests/test_foo.py` keeps its name when that file is deleted and a
+    `tests/sub/test_foo.py` appears, and nothing about the string changes.
+    """
+    by_name: dict[str, list[str]] = {}
+    for p in _iter_test_module_paths():
+        by_name.setdefault(p.name, []).append(_scan_key(p))
+    ambiguous = {k: v for k, v in by_name.items() if len(v) > 1}
+    offenders = sorted(k for k in DELIBERATE_URI_MUTATIONS if k in ambiguous)
+    assert not offenders, (
+        "bare-name declaration key(s) matching more than one module — key "
+        "them by their tests/-relative path instead: "
+        + "; ".join(f"{k} -> {ambiguous[k]}" for k in offenders))
+    # …and a bare key must still BE the top-level module it was written for.
+    # `by_name` catches a key that matches two paths TODAY; it cannot see a
+    # reassignment, and a bare key whose module is gone matches NO site at all —
+    # a dead declaration that reads as coverage while authorizing nothing.
+    moved = sorted(k for k in DELIBERATE_URI_MUTATIONS
+                   if "/" not in k and not (_TESTS_ROOT / k).is_file())
+    assert not moved, (
+        "bare-name declaration key(s) whose top-level module no longer exists "
+        f"— dead declarations: {moved}")
+
+
+def test_the_cost_skip_cannot_hide_a_uri_agnostic_leak():
+    """#9061: the restoration guard's fast-path must not skip the bare-instance
+    check, which does not depend on the URI string.
+
+    The guard skips a module that mentions neither `TORTOISE_DB_URI` nor a bare
+    `pytest.MonkeyPatch()`. That skip is sound by construction — a module whose
+    source contains neither cannot hold a site this guard reports, and the
+    second predicate IS the URI-agnostic check's trigger, so it cannot hide a
+    module that check would flag. A URI-ONLY skip is still wrong: a fixture that
+    sets some OTHER variable through a bare MonkeyPatch and never calls
+    `.undo()` leaks exactly like the #2062 pop did, and its source contains no
+    URI at all. So the fixture below is a real violation with no URI in it — if
+    the skip is ever narrowed back to the URI alone, this reports nothing and
+    the test reds.
+    """
+    src = (
+        "import pytest\n"
+        "\n\n"
+        "@pytest.fixture\n"
+        "def port_fixture():\n"
+        "    mp = pytest.MonkeyPatch()\n"
+        '    mp.setenv("TORTOISE_TEST_DOCKER_PORT", "1234")\n'
+        "    yield\n"
+    )
+    assert "TORTOISE_DB_URI" not in src, "the fixture must contain no URI string"
+    violations = _restoration_violations([("synthetic_no_uri.py", src)])
+    assert violations, (
+        "a fixture-created bare MonkeyPatch() with no .undo() must be reported "
+        "even when the file contains no TORTOISE_DB_URI — the cost skip must "
+        "not gate the URI-agnostic check (#9061)")
+    assert "undo" in " ".join(violations), violations
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Restoration guard (#2084) — static scope/evidence analysis helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-def _code_bracket_deltas(src: str) -> list[int]:
-    """Net bracket delta per line, counting ONLY brackets in CODE (#8995).
-
-    `_scope_map`'s continuation counter decides whether a `def` line is a real
-    definition or a wrapped continuation of the expression above it, so a
-    bracket counted as code when it is actually COPY poisons the classification
-    for the REST of the file. That is exactly what happened to
-    `test_time_aware_sdk_2520.py`: `assert "(as of" in t` (line 115) opened a
-    paren that nothing closes, so every later `def` — including the `_ku_sdk`
-    contextmanager that saves and restores `TORTOISE_DB_URI` — was read as a
-    continuation line of the test above it. Its restore then fell OUTSIDE that
-    test's body window and `test_uri_mutations_restored` reded on a mutation
-    that is restored in a `finally`, with a message naming the wrong function.
-    An unmatched bracket in copy is not an open expression.
-
-    String and comment tokens are located with `tokenize` (which understands
-    quoting, escapes, triple quotes and f-strings), and their spans are skipped
-    by the counter. An unparsable fragment falls back to the raw count — the
-    pre-#8995 behaviour, never a silent under-count.
-    """
-    lines = src.split("\n")
-    excluded: dict[int, list[tuple[int, int]]] = {}
-    stringish = {tokenize.STRING, tokenize.COMMENT}
-    fstring_middle = getattr(tokenize, "FSTRING_MIDDLE", None)
-    if fstring_middle is not None:
-        stringish.add(fstring_middle)
-    try:
-        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-            if tok.type not in stringish:
-                continue
-            (start_row, start_col), (end_row, end_col) = tok.start, tok.end
-            for row in range(start_row, end_row + 1):
-                if row - 1 >= len(lines):
-                    continue
-                span_start = start_col if row == start_row else 0
-                span_end = end_col if row == end_row else len(lines[row - 1])
-                excluded.setdefault(row, []).append((span_start, span_end))
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        excluded = {}
-    deltas: list[int] = []
-    for row, line in enumerate(lines, start=1):
-        spans = excluded.get(row, ())
-        delta = 0
-        for col, ch in enumerate(line):
-            if any(s <= col < e for s, e in spans):
-                continue
-            if ch in "([{":
-                delta += 1
-            elif ch in ")]}":
-                delta -= 1
-        deltas.append(delta)
-    return deltas
-
-
 def _scope_map(src: str) -> list[tuple[str, str | None]]:
-    """Per-line scope classification: ("top", None) for module-level
+    """Per-line scope classification, with a FAIL-CLOSED fallback.
+
+    `_scope_map_pass` carries a single-quoted literal across a backslash
+    continuation. If the source ends with that literal still open it cannot
+    tokenize at all, so the carry established nothing about where the code ends
+    — and honouring it would attribute every remaining line to the function
+    that opened the literal, HIDING violations rather than surfacing them. The
+    second pass disables the carry, which is the pre-carry behaviour."""
+    try:
+        # A test file may carry a deprecation-shaped escape sequence; compiling
+        # it here must not print a warning the guard never printed before.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compile(src, "<scope-map>", "exec")
+    except (SyntaxError, ValueError):
+        # The source does not parse, so NOTHING it says about where a literal
+        # ends can be trusted — and a carry on an unterminated literal
+        # attributes the rest of the file to the function that opened it,
+        # HIDING violations instead of surfacing them. Fail CLOSED: no carry,
+        # which over-reports rather than under-reports.
+        scopes, _ = _scope_map_pass(src, allow_single_carry=False)
+        return scopes
+    scopes, _ = _scope_map_pass(src, allow_single_carry=True)
+    return scopes
+
+
+def _scope_map_pass(
+    src: str, *, allow_single_carry: bool
+) -> tuple[list[tuple[str, str | None]], str | tuple[str, str] | None]:
+    """One pass. ("top", None) for module-level
     code, ("fixture", <name>) inside a @pytest.fixture-decorated
     function, ("fn", <name>) inside any other function.
 
@@ -673,11 +977,10 @@ def _scope_map(src: str) -> list[tuple[str, str | None]]:
     scopes: list[tuple[str, str | None]] = [("top", None)] * len(lines)
     # Continuation state comes from CODE brackets only — a bracket inside a
     # string literal or comment is copy, not an open expression (#8995).
-    deltas = _code_bracket_deltas(src)
     stack: list[tuple[int, str, str]] = []  # (indent, kind, name)
     paren = 0
     pending_fixture = False
-    triple: str | None = None
+    state: str | tuple[str, str] | None = None
     for i, line in enumerate(lines):
         # Count brackets in CODE ONLY. A bracket inside a string literal or a
         # comment is not a continuation: `assert "(as of" in text` left the
@@ -687,7 +990,7 @@ def _scope_map(src: str) -> list[tuple[str, str | None]]:
         # `tests/test_time_aware_sdk_2520.py`, where a compliant
         # `@contextmanager` helper was reported as a mutation inside an
         # unrelated test (#8937 / #8487).
-        code, triple = _code_only(line, triple)
+        code, state = _code_only(line, state, allow_single_carry=allow_single_carry)
         stripped = code.strip()
         if stripped.startswith("@") and paren == 0:
             # precise fixture-marker test: `.fixture(` / `.fixture\n` — a
@@ -714,23 +1017,56 @@ def _scope_map(src: str) -> list[tuple[str, str | None]]:
             scopes[i] = stack[-1][1:] if stack else ("top", None)
         else:
             scopes[i] = stack[-1][1:] if stack else ("top", None)
-        # Paren balance from the tokenize-based per-line counter: code
-        # brackets only, so a bracket inside a string literal or comment
-        # cannot freeze the continuation state (#8995). `deltas` is computed
-        # once per source above; the INDENT in this loop comes from
-        # `_code_only`, whose output is COLUMN-ALIGNED with the line, so a
-        # triple-quoted region closing mid-line cannot shift the resumed
-        # code's column (#8937 review r7).
-        paren = max(0, paren + deltas[i])
-    return scopes
+        # Paren balance over `code`, the `_code_only` output — code brackets
+        # only, so a bracket inside copy cannot freeze the continuation state
+        # (#8995). NOT over the raw line (#8487), and NOT over a second,
+        # `tokenize`-based counter: `tokenize` emits ONE column for the
+        # `FSTRING_MIDDLE` holding `{{`, so the second brace of `f"a {{ b"`
+        # reaches a tokenize-span counter as code and opens a paren that
+        # nothing closes. Measured on this tree by diffing the two scope maps
+        # over the whole guard scan set — every module `_scanned_modules()`
+        # scans (`_iter_test_module_paths()`, not a flat glob): 8 files / 9,263
+        # mislabelled lines, every one of them a `{{` on an f-string line —
+        # `tests/test_ship_test_onboarding.py` alone loses 5,845 lines from its
+        # `{{` at L546. `_code_only` blanks the whole literal, f-string braces
+        # included, in one column-aligned pass.
+        for ch in code:
+            if ch in "([{":
+                paren += 1
+            elif ch in ")]}":
+                paren = max(0, paren - 1)
+    return scopes, state
 
 
-def _code_only(line: str, triple: str | None) -> tuple[str, str | None]:
+def _code_only(
+    line: str,
+    state: str | tuple[str, str] | None,
+    *,
+    allow_single_carry: bool = True,
+) -> tuple[str, str | tuple[str, str] | None]:
     """The CODE part of one line: string literals and comments replaced by
     spaces, so a bracket inside them cannot unbalance a continuation count.
 
     COLUMN-ALIGNED: the returned text is the same length as `line`, so the
     leading-whitespace count of the code is the code's real indent.
+
+    `state` is the carried lexer state: `None`, a triple-quote delimiter, or a
+    ``('single', quote)`` pair for a single-quoted literal still open at end of
+    line. That last case is a BACKSLASH CONTINUATION — the only way such a
+    literal spans lines in valid code — and it carries because without it the
+    continuation line reads as CODE: measured, ``q = "MATCH (n )\\`` followed
+    by an INDENTED ``    (foo"`` leaves the ``(`` counted, so a later
+    module-level statement is attributed to the function above it — HIDING it
+    (review r11 P2). At COLUMN 0 the same shape fails the other way: the
+    continuation closes the function, its body reads as module scope, and the
+    guard over-reports instead. It carries ONLY when `allow_single_carry` — `_scope_map` turns it OFF for a source
+    that does not compile, because there an unclosed literal proves nothing and
+    a carry would swallow the tail.
+
+    KNOWN LIMIT (pinned by `test_pep701_nested_quote_is_a_KNOWN_limitation`):
+    an f-string nesting the SAME quote kind in a replacement field
+    (``f"{d["a(b"]}"``) closes at the nested quote, so that field's brackets
+    are read as code. 3.12 accepts the shape; no file in this tree uses it.
 
     Tracks a triple-quoted region across lines (docstrings are the common
     case), honouring backslash escapes on the closing delimiter exactly as
@@ -744,6 +1080,24 @@ def _code_only(line: str, triple: str | None) -> tuple[str, str | None]:
     out: list[str] = []
     i = 0
     n = len(line)
+    triple = state if isinstance(state, str) else None
+    carried = state[1] if isinstance(state, tuple) else None
+    if carried is not None:
+        quote = carried
+        while i < n:
+            if line[i] == "\\":
+                out.append(" " * min(2, n - i))
+                i += 2
+                continue
+            if line[i] == quote:
+                out.append(" ")
+                i += 1
+                carried = None
+                break
+            out.append(" ")
+            i += 1
+        if carried is not None:
+            return "".join(out), ("single", quote)
     while i < n:
         if triple is not None:
             end = _find_unescaped(line, triple, i)
@@ -773,17 +1127,30 @@ def _code_only(line: str, triple: str | None) -> tuple[str, str | None]:
             quote = ch
             out.append(" ")
             i += 1
+            closed = False
             while i < n:
                 if line[i] == "\\":
-                    out.append("  ")
+                    out.append(" " * min(2, n - i))
                     i += 2
                     continue
                 if line[i] == quote:
                     out.append(" ")
                     i += 1
+                    closed = True
                     break
                 out.append(" ")
                 i += 1
+            if not closed:
+                # Unterminated at end of line. In a source that COMPILES this
+                # is necessarily a backslash continuation — no other unclosed
+                # single-quoted literal is legal — so the parity of the trailing
+                # backslashes needs no test of its own: `_scope_map` only
+                # enables the carry for sources that compile (measured: adding
+                # a parity test changes NONE of the scan set's scope maps,
+                # because every shape it would reject is already unparsable).
+                if allow_single_carry:
+                    return "".join(out), ("single", quote)
+                return "".join(out), triple
             continue
         out.append(ch)
         i += 1
@@ -923,6 +1290,34 @@ def _restoration_violations(files) -> list[str]:
     """
     violations: list[str] = []
     for fname, src in files:
+        # #9061: `_scope_map` (`_code_only`'s one column-aligned pass plus
+        # the per-line bracket scan) is the whole cost of this guard, so it has
+        # to run on the modules that can hold a violation, not on the size of
+        # the tree. The skip is SOUND BY CONSTRUCTION, which is why it may
+        # narrow the analysis at all: its two predicates are this guard's OWN —
+        # a module whose source mentions
+        # neither `TORTOISE_DB_URI` (the raw-mutation census below) nor a bare
+        # `pytest.MonkeyPatch(` (the URI-agnostic bare-instance arm) cannot hold
+        # a site this guard would report, so nothing it would flag is skipped.
+        # Cost is the secondary argument, and on this shared box the absolute
+        # is not even stable: the whole file measured 20s, 221s and 261s on
+        # 2026-10-19 over the same population — fleet load, not tree size. The
+        # skip is therefore justified by what it cannot hide, not by what it
+        # saves. Cost scales with SITES.
+        #
+        # BOTH strings are required here: the bare-instance check below
+        # (`pytest.MonkeyPatch()` without `.undo()`) is URI-AGNOSTIC — a fixture
+        # that sets TORTOISE_TEST_DOCKER_PORT through a bare MonkeyPatch has no
+        # `TORTOISE_DB_URI` in its source and still leaks if it never undoes. A
+        # URI-only skip silently stopped looking at the FOUR modules that use
+        # `pytest.MonkeyPatch(` AND carry no URI string today (18 capture an
+        # instance across the population; the other 14 mention the URI and are
+        # let in by that alone — no violation among any of them yet, which is
+        # what made it a latent hole rather than a live one), which is why
+        # `test_the_cost_skip_cannot_hide_a_uri_agnostic_leak` plants a URI-free
+        # leak and asserts it is still reported.
+        if "TORTOISE_DB_URI" not in src and not _MONKEYPATCH_INST_RE.search(src):
+            continue
         lines = src.split("\n")
         scopes = _scope_map(src)
         # leak-scope raw sites: (lineno, scope_kind, scope_name)
@@ -1064,13 +1459,10 @@ def _restoration_violations(files) -> list[str]:
 
 
 def _non_exempt_test_files():
-    """(name, src) for every scan-relevant test module (same census as the
-    declaration guard — carve-outs and this task's own files exempt)."""
-    exempt = _exempt_stems()
-    for f in sorted(_TESTS_ROOT.glob("test_*.py")) \
-            + sorted((_TESTS_ROOT / "e2e").glob("test_*.py")):
-        if f.stem not in exempt:
-            yield f.name, f.read_text(encoding="utf-8")
+    """(name, src) for every scan-relevant test module — the same population
+    as the declaration guard (`_scanned_modules`), so the two guards cannot
+    narrow independently (#9061)."""
+    yield from _scanned_modules()
 
 
 def test_uri_mutations_restored():
@@ -1100,9 +1492,10 @@ def test_a_def_inside_a_docstring_is_not_a_function_start():
     `fake` rather than to `test_first`, so any report about them names a scope
     the file does not have (the wrong-name class #8487 produced).
 
-    Discriminating by construction: `_scope_map` routed through the raw line
-    (`_code_bracket_deltas` makes only BRACKETS code-only — it does not blank
-    strings for the `def` match) maps line 3 to ``("fn", "fake")``.
+    Discriminating by construction: a counter that blanks only BRACKETS and
+    not string literals — the pre-#8487 raw-line count — maps line 3 to
+    ``("fn", "fake")``, while the `_code_only`-based map keeps it in
+    ``test_first``.
     """
     src = (
         "def test_first():\n"
@@ -1238,16 +1631,21 @@ def test_a_comment_cannot_open_a_string_or_freeze_the_scope_map():
     """A `#` comment is COPY for both lexers (#8937 review — the COMMENT arm
     had no pin left once the interim raw-line counter was replaced).
 
-    Two arms, each discriminating on its own:
+    Two arms, each discriminating against a DIFFERENT pre-fix shape:
 
     * `_code_only` truncates at `#` BEFORE it looks at quotes, so a comment
       that MENTIONS a triple quote cannot open a region. Without that branch
       the `\"\"\"` in the comment sets the triple state, every following line
       is blanked as string content, and the next real `def` is not recognised
       — so statements after it are attributed to the function above it.
-    * `_code_bracket_deltas` counts code brackets only (`tokenize` excludes
-      COMMENT), so an unmatched `(` in a comment cannot freeze the
-      continuation counter for the rest of the file.
+    * the continuation counter runs over `_code_only`'s output, so an
+      unmatched `(` in a comment cannot freeze it for the rest of the file —
+      the raw-line count (#8487/#8995) does freeze it. That arm is observed on
+      the `def` AFTER the comment line, never on the comment line itself:
+      `_scope_map` assigns a line's scope BEFORE applying that line's bracket
+      delta, so a frozen counter can only show up downstream. Pre-fix scope
+      maps are identical to this one for the comment LINE, which is why the
+      pin here is `scopes[5]`.
     """
     line = '    note = 1  # a """ triple quote and a ( bracket in prose'
     code, triple = _code_only(line, None)
@@ -1268,14 +1666,148 @@ def test_a_comment_cannot_open_a_string_or_freeze_the_scope_map():
         'def second():\n'
         '    return 2\n'
     )
-    assert _code_bracket_deltas(src)[1] == 0, (
-        "the bracket inside the comment was counted as an open expression",
-        _code_bracket_deltas(src)[1])
     scopes = _scope_map(src)
     assert scopes[1] == ("fn", "_helper"), scopes[1]
     assert scopes[5] == ("fn", "second"), (
         "comment copy swallowed the next def — it was attributed to "
         f"`_helper` — got {scopes[5]}")
+
+
+def test_scope_map_ignores_an_escaped_brace_in_an_fstring():
+    """`{{` in an f-string is ONE brace of COPY, not an open bracket (#8995).
+
+    A `tokenize`-span counter sees one column for the `FSTRING_MIDDLE` that
+    holds `{{`, so the SECOND brace reaches the counter as code and opens a
+    paren nothing closes: `f"a {{ b"` nets `+1`. Measured on this tree (the
+    whole guard scan set — every `_scanned_modules()` module — with the two
+    scope maps diffed against the tokenize-span counter), that mislabelled 8
+    files / 9,263 lines from their first `{{` — and a COMPLIANT test appended
+    downstream reded with two violations naming the wrong function.
+    `_code_only` blanks the whole literal, escaped braces included.
+
+    Only a NET-POSITIVE surplus is observable: `}}` nets `-1` and the clamp
+    absorbs it, so a `}}` line alone cannot discriminate (a `{{`/`}}`-balanced
+    line is invisible to the clamp as well). This source therefore carries the
+    `{{` arm ONLY.
+    """
+    src = (
+        'import os\n'
+        'def first():\n'
+        '    assert f"a {{ b" in _text()\n'
+        '\n'
+        '\n'
+        'def second():\n'
+        '    old = os.environ.get("TORTOISE_DB_URI")\n'
+        '    os.environ["TORTOISE_DB_URI"] = _uri()\n'
+        '    try:\n'
+        '        yield\n'
+        '    finally:\n'
+        '        os.environ["TORTOISE_DB_URI"] = old\n'
+    )
+    scopes = _scope_map(src)
+    assert scopes[5] == ("fn", "second"), (
+        "an escaped brace in copy must not freeze the continuation counter — "
+        f"got {scopes[5]}")
+    assert _restoration_violations([("synthetic_8995_f.py", src)]) == [], (
+        "a mutation restored in a finally must stay green when an earlier line "
+        "carries `{{` inside an f-string")
+
+
+def test_code_only_carries_a_backslash_continued_literal():
+    """A single-quoted literal continued with a backslash spans LINES (r11 P2).
+
+    `_code_only` is a per-line lexer, so it carries the open quote in its state
+    or the continuation line reads as CODE. Measured before the carry:
+    ``q = "MATCH (n )\\`` followed by an INDENTED ``    (foo"`` leaves the
+    ``(`` counted and a later module-level statement attributed to the function
+    above it — HIDING it, the #8995 class rebuilt inside its own fix. At column
+    0 the shape over-reports instead (the continuation closes the function, so
+    its body reads as module scope), which is why this pin uses the INDENTED
+    form on purpose.
+    """
+    src = (
+        'def f():\n'
+        '    q = "MATCH (n )\\\n'
+        '    (foo"\n'
+        '    return 1\n'
+        '\n'
+        '\n'
+        'def g():\n'
+        '    pass\n'
+    )
+    compile(src, "<test>", "exec")  # the shape is VALID code, not a stray
+    scopes = _scope_map(src)
+    assert scopes[6] == ("fn", "g"), (
+        "the continuation line was read as code and froze the scope map — "
+        f"got {scopes[6]}")
+    line = '    q = "MATCH (n )\\'
+    code, state = _code_only(line, None)
+    assert len(code) == len(line), code
+    assert state == ("single", '"'), state
+
+
+def test_an_unterminated_literal_does_not_swallow_the_rest_of_the_file():
+    """A source that does not PARSE must not carry a literal across it (r11 P2).
+
+    The carry is gated on `compile()`: in a source that parses, an unclosed
+    single-quoted literal at end of line is necessarily a backslash
+    continuation, but in one that does NOT parse it proves nothing — and
+    honouring it attributes every later line to the function that opened the
+    literal, HIDING a top-level mutation the raw count surfaces. Fail closed.
+
+    Each shape below is a SyntaxError; in every one the module-level statement
+    after it must stay `("top", None)`. Non-vacuous against the gate: with the
+    carry enabled unconditionally, all five arms move to `('fn','f')`.
+    """
+    strays = (
+        '    x = "oops\n',            # no trailing backslash
+        "    x = \"oops\\\\\n",          # EVEN run: an escaped backslash, continues nothing
+        '    x = "oops\\ \n',        # whitespace after the backslash
+        '    x = "oops (\n',          # a bracket inside the stray literal
+        '    x = "oops\\\n',         # ODD run, but the literal never closes
+    )
+    for stray in strays:
+        src = 'def f():\n' + stray + 'import os\nos.environ.pop("TORTOISE_DB_URI")\n'
+        try:
+            compile(src, "<test>", "exec")
+        except SyntaxError:
+            pass
+        else:  # pragma: no cover - the shapes are chosen to be unparsable
+            raise AssertionError(f"{stray!r} parses; the arm proves nothing")
+        scope = _scope_map(src)[2]
+        assert scope == ("top", None), (
+            f"{stray!r} carried across an unparsable source and attributed a "
+            f"top-level mutation to the function above it — got {scope}")
+
+
+def test_pep701_nested_quote_is_a_KNOWN_limitation():
+    """PEP-701 nesting is NOT handled, and this pin says so out loud (r11 P2).
+
+    3.12 accepts ``f"{d["a(b"]}"`` and the compiler reads it, but `_code_only`
+    closes the literal at the NESTED quote, so that replacement field's
+    brackets are counted as code and everything after the line is attributed to
+    the scope above it. Documented in `_code_only`'s docstring; no file in this
+    tree uses the shape today.
+
+    If this test FAILS, the lexer gained nesting awareness: delete this pin and
+    the docstring's KNOWN LIMIT paragraph, and assert the correct scope here.
+    """
+    src = (
+        'def f():\n'
+        '    d = {"a(b": 1}\n'
+        '    x = f"{d["a(b"]}"\n'
+        '\n'
+        '\n'
+        'def g():\n'
+        '    pass\n'
+    )
+    compile(src, "<test>", "exec")  # PEP-701 is valid 3.12
+    scopes = _scope_map(src)
+    assert scopes[6] == ("fn", "f"), (
+        "the PEP-701 shape is now handled — see this test's docstring")
+    code, _ = _code_only('    x = f"{d["a(b"]}"', None)
+    assert "(" in code, (
+        "the nested quote no longer leaks the bracket — update the docstring")
 
 
 def test_module_scoped_pop_without_restore_reds():
@@ -1676,6 +2208,14 @@ def test_declaration_path_rejects_undeclared():
         "test_hosted_api.py", 'monkeypatch.delenv("TORTOISE_DB_URI")')
     assert _is_declared(
         "test_directional_impl.py", 'os.environ["TORTOISE_DB_URI"] = _uri')
+    # #9061: a declaration is bound to ONE module. Before the bare-name lookup
+    # fallback was removed, a same-named module in a subdirectory inherited its
+    # top-level twin's declaration — a declaration written for one file
+    # authorizing another, which is the census's own failure class one level up.
+    assert not _is_declared(
+        "sub/test_config.py", 'monkeypatch.delenv("TORTOISE_DB_URI")')
+    assert not _is_declared(
+        "e2e/test_config.py", 'monkeypatch.delenv("TORTOISE_DB_URI")')
 
 
 def test_restoration_exemption_boundary():

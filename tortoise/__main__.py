@@ -5243,12 +5243,27 @@ def _cmd_session_drain_best_effort(args) -> int:
         _print_capture_health()
 
 
+def _capture_key_presence() -> str | None:
+    """``""`` when this box has NO transmitting credential (capture is INACTIVE).
+
+    ``None`` when it cannot be determined: a corrupt/unreadable config is not
+    evidence that the box is keyless, and :func:`capture_health_line` treats
+    ``None`` as "do not claim INACTIVE" — the same "a check that could not look
+    is not an answer" rule the line's own ``UNREADABLE`` state follows.
+    """
+    try:
+        _cfg_path, _config, api_key, _api_url = _resolve_transmit_config()
+    except Exception:
+        return None
+    return api_key or ""
+
+
 def _print_capture_health() -> None:
     """Print the per-box capture health line when it needs explaining (agent-infra#2100).
 
     Best-effort by construction: a health read must never break the exit-0
-    contract of the drain, and an `OK` line on every drain would be noise. Only
-    a BLOCKED spool is worth printing.
+    contract of the drain, and an `OK`/`DRAINING` line on every drain would be
+    noise. Only a BLOCKED or an UNREADABLE spool is worth printing.
 
     NOTE the surface: this writes to the DRAIN's stderr, which the SessionStart
     hook redirects to /dev/null. It is therefore an operator's line for a drain
@@ -5260,26 +5275,27 @@ def _print_capture_health() -> None:
 
     try:
         from tortoise.capture_spool import capture_health_line, spool_dir
-        line = capture_health_line(spool_dir())
+        health = capture_health_line(spool_dir(), api_key=_capture_key_presence())
     except Exception:
         return
-    # BLOCKED and UNKNOWN only: a BACKLOG on a normal SessionStart is usually
-    # the live session held back for its own final flush, and a line about it on
-    # every start is noise. `tortoise session health` reports the full picture.
-    # UNKNOWN is printed because a drain that could not READ the spool is the
-    # one case where printing nothing would leave the operator with the silent
-    # empty backlog this issue removed.
-    if "BLOCKED" in line or "UNKNOWN" in line:
-        print(line, file=_sys.stderr)
+    # BLOCKED and UNREADABLE only: a DRAINING spool on a normal SessionStart is
+    # usually the live session held back for its own final flush (and INACTIVE is
+    # already reported by this command's own keyless message), so a line about
+    # either on every start is noise — the alert-fatigue pattern recorded at the
+    # doctor's consent row. UNREADABLE is printed because a drain that could not
+    # READ the spool is the one case where printing nothing would leave the
+    # operator with the silent empty backlog this issue removed.
+    if health.state in ("blocked", "unreadable"):
+        print(health.line, file=_sys.stderr)
 
 
 def _cmd_session_health() -> int:
     """Print the per-box capture health line (agent-infra#2100). Always exits 0.
 
-    Answered from the LOCAL spool — the queued captures and the durable refusal
+    Answered from the LOCAL spool — the pending captures and the durable refusal
     record both legs write — so it needs no credential and no network. That is
     the point: the box that most needs to report `capture: BLOCKED (n queued,
-    402)` is the box whose captures are being refused.
+    402 quota)` is the box whose captures are being refused.
 
     Real failures (an unreadable spool root) are REPORTED, never laundered into
     a healthy reading: a health check that says `OK` when it could not look is
@@ -5289,9 +5305,10 @@ def _cmd_session_health() -> int:
 
     try:
         from tortoise.capture_spool import capture_health_line, spool_dir
-        print(capture_health_line(spool_dir()))
+        print(capture_health_line(spool_dir(),
+                                 api_key=_capture_key_presence()).line)
     except Exception as exc:
-        print(f"capture: UNKNOWN (health read failed: {exc})", file=_sys.stderr)
+        print(f"capture: UNREADABLE (health read failed: {exc})", file=_sys.stderr)
     return 0
 
 
@@ -9744,28 +9761,33 @@ def _cmd_doctor(args):
                         f"check unavailable: {str(e)[:60]}"))
 
     # agent-infra#2100: the capture SPOOL is a per-box health surface in its own right — a
-    # box whose graph quota is exhausted refuses every capture, and an operator
-    # who reads only "hooks installed" would call the box idle when it is
-    # blocked. `❌` only for BLOCKED: a backlog (a flaky network, entries in
-    # their backoff) clears by itself, so it warns rather than failing.
+    # box whose graph allowance is exhausted refuses every capture, and an
+    # operator who reads only "hooks installed" would call the box idle when it is
+    # blocked. The severity is decided by the HEALTH STATE, never by "not
+    # BLOCKED": an `UNREADABLE` (the spool could not be READ) is a check that did
+    # not run, and an `else ✅` arm laundered it into a pass — the same "cannot
+    # read → healthy" false PASS the line's own UNREADABLE state exists to
+    # prevent, one level up. Every state is named here so a new one cannot fall
+    # through.
     #
-    # The severity is decided by the LINE'S STATE, never by "not BLOCKED": an
-    # `UNKNOWN` (the spool could not be READ) is a check that did not run, and
-    # an `else ✅` arm laundered it into a pass — the same "cannot read →
-    # healthy" false PASS the line's own UNKNOWN state exists to prevent, one
-    # level up. Every state is named here so a new one cannot fall through.
+    # `❌` only for BLOCKED: only a refusal retrying cannot fix fails the report
+    # (and so the exit code). DRAINING and INACTIVE are INFORMATION, not warnings:
+    # a pending capture on a live box is usually the running session awaiting its
+    # own final flush, and a keyless box is a normal install — painting either as
+    # "1 warn" is the alert-fatigue pattern the consent row below already
+    # records (#3615).
     try:
         from tortoise.capture_spool import capture_health_line, spool_dir
-        _capture_line = capture_health_line(spool_dir())
-        if "BLOCKED" in _capture_line:
-            _capture_icon = "❌"
-        elif "BACKLOG" in _capture_line or "UNKNOWN" in _capture_line:
-            _capture_icon = "⚠️"
-        elif "OK" in _capture_line:
-            _capture_icon = "✅"
-        else:  # a line whose shape we do not know is not a pass
-            _capture_icon = "⚠️"
-        results.append(("Capture spool", _capture_icon, _capture_line))
+        _capture_health = capture_health_line(
+            spool_dir(), api_key=_capture_key_presence())
+        _capture_icon = {
+            "blocked": "❌",
+            "unreadable": "⚠️",
+            "draining": "ℹ️",
+            "inactive": "ℹ️",
+            "ok": "✅",
+        }.get(_capture_health.state, "⚠️")  # an unknown state is not a pass
+        results.append(("Capture spool", _capture_icon, _capture_health.line))
     except MemoryError:
         raise
     except Exception as e:

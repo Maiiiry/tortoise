@@ -3125,28 +3125,33 @@ def test_an_empty_role_is_not_a_turn_on_either_leg(tmp_path):
 # ── (22) agent-infra#2100 — a capture spool must never block a lane turn ──────────────
 #
 # The measured failure: a cloud cell's spool held 320+ queued uploads, every
-# one `waiting on backoff` because the hosted graph quota answered 402. A
+# one `waiting on backoff` because the hosted graph allowance answered 402. A
 # capture feature — pure observability — made that box's capacity unusable: the
 # lane log was 259–262 B, an `agent_end` with no assistant text and no tool
 # call, while two sibling boxes ran lanes normally.
 #
-# The Pi leg's half of that fix (a SCHEDULED, hard time-bounded flush) lives in
+# The Pi leg's half (a SCHEDULED, hard time-bounded flush) lives in
 # `tortoise/pi-hooks/tortoise-capture.ts` and its `node --test` suite. This half
-# pins the two surfaces BOTH legs share, because both write the same spool:
-#   (2) a quota/402 refusal is a NAMED state carrying the count;
-#   (4) the per-box health line `capture: BLOCKED (<n> queued, 402)`.
+# pins what BOTH legs SHARE, because both write the same spool DIRECTORY and one
+# `status.json`:
+#   (2) a quota/402 refusal is a NAMED, durable state carrying the count;
+#   (4) the per-box health line, byte-identical on both legs.
+#
+# Those two are one contract, not two features. A second record file or a
+# second vocabulary would let the two surfaces of one box disagree about whether
+# it is blocked — the false PASS this issue removes.
 
 
 def test_a_quota_refusal_is_recorded_as_a_named_blocked_state_with_the_count(tmp_path):
     """ACCEPTANCE (2). 320 captures "waiting on backoff" was unrecoverable from
     every surface: `session drain` printed counts and never said WHY. A 402 is
-    the org's graph quota — a state retrying cannot clear — so it is recorded
-    durably with the number still queued.
+    the org's graph allowance — a state retrying cannot clear — so it is
+    recorded durably with the number still pending.
 
     MUTATION THAT REDS THIS: count a 402 only in `deferred` (no quota bucket, no
-    health record) → nothing on the box names the blocking status.
+    status record) → nothing on the box names the blocking status.
     """
-    from tortoise.capture_spool import capture_health_line, read_capture_health
+    from tortoise.capture_spool import capture_health_line, read_capture_status
 
     root = tmp_path / "spool"
     for i in range(50):
@@ -3158,51 +3163,55 @@ def test_a_quota_refusal_is_recorded_as_a_named_blocked_state_with_the_count(tmp
         now=1000.0,
     )
     assert summary.quota_refusals == 50, "every refusal must be counted as quota"
+    assert summary.quota == {"status": 402, "code": "quota_exceeded",
+                             "detail": "quota_exceeded"}
 
-    health = read_capture_health(root)
-    assert health is not None, "the refusal must be DURABLE, not only a console line"
-    assert health["state"] == "blocked"
-    assert health["status"] == 402
-    assert health["queued"] == 50
-    assert capture_health_line(root) == "capture: BLOCKED (50 queued, 402)"
+    status = read_capture_status(root)
+    assert status is not None, "the refusal must be DURABLE, not only a console line"
+    assert status["state"] == "blocked"
+    assert status["status"] == 402
+    assert status["reason"] == "quota_exceeded"
+    line = capture_health_line(root)
+    assert line.state == "blocked" and line.queued == 50 and line.status == 402
+    assert line.line == "capture: BLOCKED (50 queued, 402 quota)"
 
 
 def test_a_quota_block_survives_a_flush_that_attempts_nothing(tmp_path):
     """The next drain finds every entry inside the window the 402 armed, so it
-    attempts NOTHING. Reading that as "no refusal" would flip the box to a
-    generic backlog and lose the only evidence of the quota block.
+    attempts NOTHING. Clearing the record on that evidence would flip the box to
+    a generic draining state and lose the only account of the block — this is
+    the steady state the issue was measured in.
 
-    MUTATION THAT REDS THIS: drop the carry-forward branch of
-    `_record_capture_health` → the second flush records `backlog` and the health
-    line stops naming the 402.
+    MUTATION THAT REDS THIS: write `ok` on any pass (instead of only on a pass
+    that ATTEMPTED a POST) → the second flush erases the 402.
     """
-    from tortoise.capture_spool import capture_health_line, read_capture_health
+    from tortoise.capture_spool import capture_health_line, read_capture_status
 
     root = tmp_path / "spool"
     write_spool_entry(root, _snapshot("q-carry"))
     flush_spool(root, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
                 now=1000.0)
-    assert read_capture_health(root)["state"] == "blocked"
+    assert read_capture_status(root)["state"] == "blocked"
 
     # Inside the backoff window: nothing is attempted.
     again = flush_spool(root, _Server().post, now=1000.0 + 1)
     assert again.attempted == 0 and again.quota_refusals == 0
-    health = read_capture_health(root)
-    assert health["state"] == "blocked", "a block was forgotten by a no-op flush"
-    assert health["status"] == 402
-    assert capture_health_line(root) == "capture: BLOCKED (1 queued, 402)"
+    status = read_capture_status(root)
+    assert status["state"] == "blocked", "a block was forgotten by a no-op flush"
+    assert status["status"] == 402
+    assert capture_health_line(root).line == "capture: BLOCKED (1 queued, 402 quota)"
 
 
 def test_the_blocked_state_clears_once_the_captures_file(tmp_path):
     """A stale BLOCKED sends an operator chasing a problem that is fixed.
 
-    MUTATION THAT REDS THIS: never rewrite the record on success → the line keeps
-    reporting a quota refusal after every capture landed.
+    MUTATION THAT REDS THIS: never supersede the record on a later attempt → the
+    line keeps reporting a refusal after every capture landed.
     """
     from tortoise.capture_spool import (
         RETRY_MAX_SECONDS,
         capture_health_line,
-        read_capture_health,
+        read_capture_status,
     )
 
     root = tmp_path / "spool"
@@ -3210,45 +3219,225 @@ def test_the_blocked_state_clears_once_the_captures_file(tmp_path):
         write_spool_entry(root, _snapshot(f"unblock-{i}"))
     flush_spool(root, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
                 now=1000.0)
-    assert read_capture_health(root)["state"] == "blocked"
+    assert read_capture_status(root)["state"] == "blocked"
 
     server = _Server()
     filed = flush_spool(root, server.post,
                         now=1000.0 + (RETRY_MAX_SECONDS + 60) * 1000)
     assert filed.filed == 3
-    assert read_capture_health(root)["state"] == "ok"
-    assert capture_health_line(root) == "capture: OK (0 queued)"
+    assert read_capture_status(root)["state"] == "ok"
+    assert capture_health_line(root).line == "capture: OK (0 queued)"
 
 
-def test_a_network_backlog_is_not_reported_as_blocked(tmp_path):
+def test_the_blocked_state_self_heals_when_the_spool_empties_under_it(tmp_path):
+    """The other leg (or `session drain --retry-terminal`) can file everything
+    while THIS box's record still says `blocked`. Nothing pending is not a
+    block, so the next health read clears the marker instead of reporting it
+    forever — the one-way latch that made the line untrustworthy.
+
+    MUTATION THAT REDS THIS: trust `state == "blocked"` without recomputing
+    pending work → a box that is filing perfectly reads BLOCKED.
+    """
+    from tortoise.capture_spool import (
+        capture_health_line,
+        read_capture_status,
+        write_capture_status,
+    )
+
+    root = tmp_path / "spool"
+    write_spool_entry(root, _snapshot("heal"))
+    write_capture_status(root, {"version": 1, "state": "blocked", "status": 402,
+                                "reason": "quota_exceeded",
+                                "updated_at": "2026-01-01T00:00:00.000000Z"})
+    assert capture_health_line(root).line == "capture: BLOCKED (1 queued, 402 quota)"
+
+    summary = flush_spool(root, _Server().post, now=1000.0)
+    assert summary.filed == 1
+    # A stale marker with NOTHING pending is healed by the read itself, not by
+    # the flush: this is what a checker run on another leg's box sees.
+    write_capture_status(root, {"version": 1, "state": "blocked", "status": 402,
+                                "reason": "quota_exceeded",
+                                "updated_at": "2026-01-01T00:00:00.000000Z"})
+    line = capture_health_line(root)
+    assert line.state == "ok" and line.line == "capture: OK (0 queued)"
+    assert read_capture_status(root)["state"] == "ok", (
+        "the read reported OK but left the stale block on disk")
+
+
+def test_a_network_backlog_is_a_DRAINING_state_not_a_block(tmp_path):
     """`BLOCKED` must mean "a refusal the client cannot fix". A flaky network is
-    a BACKLOG: it clears by itself, and reporting it as a quota block would send
-    an operator to raise a tier that was never the problem.
+    a DRAINING spool: it clears by itself, and reporting it as a quota block
+    would send an operator to raise a tier that was never the problem.
 
-    MUTATION THAT REDS THIS: report `blocked` for any queued entry → the two
+    MUTATION THAT REDS THIS: record `blocked` for any refused POST → the two
     causes become indistinguishable on the per-box line.
     """
-    from tortoise.capture_spool import capture_health_line, read_capture_health
+    from tortoise.capture_spool import capture_health_line, read_capture_status
 
     root = tmp_path / "spool"
     write_spool_entry(root, _snapshot("net"))
     flush_spool(root, _Server(PostOutcome(ok=False, detail="connection reset")).post,
                 now=1000.0)
-    health = read_capture_health(root)
-    assert health["state"] == "backlog"
-    assert "status" not in health, "a network failure has no HTTP refusal to name"
-    assert capture_health_line(root) == "capture: BACKLOG (1 queued)"
+    status = read_capture_status(root)
+    assert status["state"] == "ok", "no quota was observed, so nothing is blocked"
+    assert "status" not in status, "a network failure has no HTTP refusal to name"
+    line = capture_health_line(root)
+    assert line.state == "draining"
+    assert line.line == "capture: DRAINING (1 queued)"
+
+
+def test_a_PERMANENT_refusal_does_not_latch_a_permanent_BLOCKED(tmp_path):
+    """REGRESSION (r2 review, P2). A rotated key answers 401, so every entry goes
+    TERMINAL — never retried, and `queued` is therefore 0. Counting a terminal
+    entry as "refused NOW" latched the box at `BLOCKED` forever: `tortoise
+    doctor` exited 1 on a box whose capture pipeline was healthy, and no
+    supported command could clear it (`session drain --retry-terminal` clears
+    the marker, and the next flush re-quarantines the same log).
+
+    A terminal entry is a HISTORICAL refusal, not a live block; the verdict after
+    a permanent refusal was always "kept on disk, re-file by hand", and the line
+    must not promote it to a permanent failure of the box.
+
+    MUTATION THAT REDS THIS: count a terminal entry as a live refusal (the
+    `rejected > 0 and queued == 0` branch) → this box reads BLOCKED.
+    """
+    from tortoise.capture_spool import (
+        DISCARD_HTTP_REJECTED,
+        capture_health_line,
+        count_pending_captures,
+    )
+
+    root = tmp_path / "spool"
+    for i in range(2):
+        write_spool_entry(root, _snapshot(f"deadkey-{i}"))
+    summary = flush_spool(
+        root, _Server(PostOutcome(ok=False, status=401, detail="invalid api key")).post,
+        now=1000.0,
+    )
+    assert summary.filed == 0
+    assert [d["reason"] for d in summary.discarded] == [DISCARD_HTTP_REJECTED] * 2
+    assert count_pending_captures(root) == 0, (
+        "a drain never retries a terminal entry, so it is not pending work")
+    line = capture_health_line(root)
+    assert line.state == "ok", f"a historical refusal is not a live block: {line}"
+    assert line.line == "capture: OK (0 queued)"
+
+
+def test_a_TORN_transcript_does_not_latch_a_permanent_BLOCKED(tmp_path):
+    """REGRESSION (r2 review, P2) — the commoner shape of the same latch. A torn
+    UTF-8 turn log is quarantined by OUR OWN client-side write, not refused by
+    anything, and the flush cannot fix it: `--retry-terminal` clears the marker
+    and the next flush re-quarantines the identical log. Reporting that as
+    `BLOCKED … rejected` names a refusal that never happened, and makes
+    `tortoise doctor` exit 1 on a box that files perfectly.
+
+    MUTATION THAT REDS THIS: fold every terminal reason into one "rejected" count
+    → a single-session box with one torn append reads BLOCKED forever.
+    """
+    from tortoise.capture_spool import (
+        DISCARD_TRANSCRIPT_TORN,
+        _log_path,
+        capture_health_line,
+        count_pending_captures,
+    )
+
+    root = tmp_path / "spool"
+    write_spool_entry(root, _snapshot("torn"))
+    # Bytes that are not a parseable turn (invalid UTF-8): a torn append.
+    _log_path(root, "torn").write_bytes(b"\xff\xfe{\"role\": \"user\", ")
+    summary = flush_spool(root, _Server().post, now=1000.0)
+    assert [d["reason"] for d in summary.discarded] == [DISCARD_TRANSCRIPT_TORN]
+    assert summary.filed == 0 and summary.attempted == 0
+    assert count_pending_captures(root) == 0
+    line = capture_health_line(root)
+    assert line.state == "ok", f"a torn local write is not a refusal: {line}"
+    assert line.line == "capture: OK (0 queued)"
+
+
+def test_an_UNLISTABLE_spool_is_UNREADABLE_never_OK_and_never_heals(tmp_path):
+    """`queued == 0` used to be decided by folding EVERY readdir failure into 0 —
+    so a spool the process could not read reported a healthy box, and the
+    self-heal then OVERWROTE the durable block marker with `ok`.
+
+    MUTATION THAT REDS THIS: fold the readdir failure back into `0 queued`, or
+    heal the marker before asking whether the spool could be listed.
+    """
+    import os
+    import stat
+
+    from tortoise.capture_spool import (
+        capture_health_line,
+        count_pending_captures,
+        read_capture_status,
+        write_capture_status,
+    )
+
+    root = tmp_path / "spool"
+    write_spool_entry(root, _snapshot("hidden"))
+    write_capture_status(root, {"version": 1, "state": "blocked", "status": 402,
+                               "reason": "quota_exceeded",
+                               "updated_at": "2026-01-01T00:00:00.000000Z"})
+    entries = root / "entries"
+    entries.chmod(0o000)
+    try:
+        if os.access(entries, os.R_OK):  # root ignores mode bits
+            pytest.skip("running as root")
+        assert count_pending_captures(root) is None
+        line = capture_health_line(root)
+        assert line.state == "unreadable"
+        assert line.line == f"capture: UNREADABLE (cannot list {entries})"
+        assert read_capture_status(root)["state"] == "blocked", (
+            "an unreadable spool must not heal (destroy) the durable marker")
+    finally:
+        entries.chmod(stat.S_IRWXU)
+
+
+def test_an_UNREADABLE_meta_is_counted_as_pending_never_as_absent(tmp_path):
+    """A meta we cannot parse is UNKNOWABLE, not gone: it may be an entry that
+    was mid-write on a box that is about to be killed. Folding it into "nothing
+    pending" is the same false PASS one level down from the readdir case.
+
+    MUTATION THAT REDS THIS: `continue` on a parse failure → the box reads OK
+    while an unaccounted entry sits in `entries/`.
+    """
+    from tortoise.capture_spool import capture_health_line, count_pending_captures
+
+    root = tmp_path / "spool"
+    (root / "entries").mkdir(parents=True)
+    (root / "entries" / "junk.meta.json").write_text("{not json", encoding="utf-8")
+    assert count_pending_captures(root) == 1
+    assert capture_health_line(root).line == "capture: DRAINING (1 queued)"
+
+
+def test_a_KEYLESS_box_reports_INACTIVE_with_its_backlog(tmp_path):
+    """A box with no credential can never file anything, so its backlog grows
+    forever — the state the issue was measured in (`capture` silently doing
+    nothing). The count is NOT dropped on this branch, and the reason is named.
+
+    MUTATION THAT REDS THIS: return `OK (0 queued)`/`DRAINING` for a keyless box
+    → the one box that can never drain looks like an ordinary idle one.
+    """
+    from tortoise.capture_spool import capture_health_line
+
+    root = tmp_path / "spool"
+    for i in range(2):
+        write_spool_entry(root, _snapshot(f"nokey-{i}"))
+    line = capture_health_line(root, api_key="")
+    assert line.state == "inactive"
+    assert line.line == "capture: INACTIVE (no TORTOISE_API_KEY, 2 queued)"
+    # `None` = the caller cannot know, and must NOT claim INACTIVE.
+    assert capture_health_line(root).state == "draining"
 
 
 def test_session_health_prints_the_line_and_always_exits_0(tmp_path, monkeypatch,
-                                                           capsys):
+                                                          capsys):
     """ACCEPTANCE (4) on the CLI. A health check must be readable on an idle box
-    with no credential configured — it is answered from the SPOOL, not the
-    network, so it is dispatched before the api-key gate (the same rule
-    `session spool` / `session disclosure` follow).
+    — it is answered from the SPOOL, not the network, so it is dispatched before
+    the api-key gate (the same rule `session spool` / `session disclosure`
+    follow).
 
     MUTATION THAT REDS THIS: return 1 without an api key, or print a bare count
-    → the one surface an operator runs cannot say `BLOCKED (n queued, 402)`.
+    → the one surface an operator runs cannot say `BLOCKED (n queued, 402 quota)`.
     """
     from tortoise import __main__ as cli
     from tortoise.capture_spool import flush_spool
@@ -3260,23 +3449,26 @@ def test_session_health_prints_the_line_and_always_exits_0(tmp_path, monkeypatch
                 now=1000.0)
 
     monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda: root)
-    monkeypatch.setattr(cli, "_resolve_config_path",
-                        lambda *a, **k: (None, {}, None, None))
+    monkeypatch.setattr(
+        cli, "_resolve_config_path",
+        lambda *a, **k: (None, {"api_key": "tt_cli"}, "tt_cli",
+                         "https://api.premiselabs.co"))
     assert cli.main(["session", "health"]) == 0
     out = capsys.readouterr().out
-    assert "capture: BLOCKED (7 queued, 402)" in out, out
+    assert "capture: BLOCKED (7 queued, 402 quota)" in out, out
 
 
 def test_the_health_line_is_the_SAME_STRING_on_both_legs(tmp_path):
-    """The two legs share one spool directory, so a checker could run either.
-    A per-leg spelling (`BLOCKED (7 queued, HTTP 402)`) would make the fleet's
-    grep work on one box and silently fail on the next.
+    """The two legs share one spool directory AND one `status.json`, so a
+    checker may run either. A per-leg spelling (`BLOCKED (7 queued, HTTP 402)`)
+    would make the fleet's grep work on one box and silently fail on the next.
 
     Runtime parity, not a source scan: Python writes and reads its own record,
     then the REAL Pi function is asked about the SAME directory.
 
-    MUTATION THAT REDS THIS: change either leg's wording/punctuation → the two
-    strings differ.
+    MUTATION THAT REDS THIS: change either leg's wording/punctuation, or give a
+    leg its own record file → the two strings differ or one leg cannot see the
+    other's refusal.
     """
     from tortoise.capture_spool import capture_health_line
 
@@ -3286,14 +3478,14 @@ def test_the_health_line_is_the_SAME_STRING_on_both_legs(tmp_path):
         write_spool_entry(root, _snapshot(f"parity-{i}"))
     flush_spool(root, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
                 now=1000.0)
-    python_line = capture_health_line(root)
-    assert python_line == "capture: BLOCKED (4 queued, 402)"
+    python_line = capture_health_line(root).line
+    assert python_line == "capture: BLOCKED (4 queued, 402 quota)"
 
     ext = (REPO / "tortoise" / "pi-hooks" / "tortoise-capture.ts").as_uri()
     driver = tmp_path / "health-parity.mjs"
     driver.write_text(
         f'import {{ captureHealthLine }} from "{ext}";\n'
-        f'console.log(captureHealthLine({json.dumps(str(root))}));\n',
+        f'console.log(captureHealthLine({json.dumps(str(root))}).line);\n',
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -3304,64 +3496,183 @@ def test_the_health_line_is_the_SAME_STRING_on_both_legs(tmp_path):
     assert proc.stdout.strip().splitlines()[-1] == python_line
 
 
-def test_a_spool_of_permanently_refused_captures_is_BLOCKED_not_OK(tmp_path):
-    """The false PASS on the terminal path. A terminal entry is never retried, so
-    `queued` is 0 — and a box whose every upload is refused (a rotated key
-    answers 401) reported `capture: OK`, i.e. a dead capture pipeline reading as
-    a healthy one.
+def test_the_health_line_is_the_SAME_STRING_on_both_legs_for_every_state(tmp_path):
+    """The parity test above pins the BLOCKED shape. Every OTHER shape an
+    operator greps for — DRAINING, OK, UNREADABLE, INACTIVE — is just as
+    load-bearing and just as easy to spell differently on one leg.
 
-    MUTATION THAT REDS THIS: skip terminal entries without counting them.
-    """
-    from tortoise.capture_spool import capture_health_line, capture_spool_counts
-
-    root = tmp_path / "spool"
-    for i in range(2):
-        write_spool_entry(root, _snapshot(f"deadkey-{i}"))
-    summary = flush_spool(
-        root, _Server(PostOutcome(ok=False, status=401, detail="invalid api key")).post,
-        now=1000.0,
-    )
-    assert summary.filed == 0
-    assert capture_spool_counts(root) == (0, 2), "rejected captures are still ON the box"
-    assert capture_health_line(root) == "capture: BLOCKED (0 queued, 401, 2 rejected)"
-
-
-def test_an_unreadable_spool_reports_UNKNOWN_never_OK(tmp_path):
-    """`queued == 0` short-circuited the line to OK BEFORE the durable record was
-    consulted, and every readdir/parse failure was folded into 0 — so a spool the
-    process could not read (or a corrupt meta) reported a healthy box.
-
-    MUTATION THAT REDS THIS: fold the readdir/parse failure back into `0 queued`.
+    MUTATION THAT REDS THIS: reword any state on one leg (or drop the `, N
+    queued` from INACTIVE) → the two strings differ.
     """
     import os
     import stat
 
-    from tortoise.capture_spool import capture_health_line, capture_spool_counts
+    from tortoise.capture_spool import capture_health_line
 
-    root = tmp_path / "spool"
-    write_spool_entry(root, _snapshot("hidden"))
-    entries = root / "entries"
-    entries.chmod(0o000)
+    node = _node_that_can_strip_ts()
+    ext = (REPO / "tortoise" / "pi-hooks" / "tortoise-capture.ts").as_uri()
+
+    draining = tmp_path / "draining"
+    write_spool_entry(draining, _snapshot("drain-1"))
+
+    filed = tmp_path / "filed"
+    write_spool_entry(filed, _snapshot("filed-1"))
+    flush_spool(filed, _Server().post, now=1000.0)
+
+    inactive = tmp_path / "inactive"
+    for i in range(2):
+        write_spool_entry(inactive, _snapshot(f"inactive-{i}"))
+
+    unreadable = tmp_path / "unreadable"
+    (unreadable / "entries").mkdir(parents=True)
+
+    cases = [("draining", draining, None),
+             ("ok", filed, None),
+             ("inactive", inactive, ""),
+             ("unreadable", unreadable, None)]
+    unreadable.chmod(0o755)
+    (unreadable / "entries").chmod(0o000)
     try:
-        if os.access(entries, os.R_OK):  # root ignores mode bits
+        if os.access(unreadable / "entries", os.R_OK):  # root ignores mode bits
             pytest.skip("running as root")
-        assert capture_spool_counts(root) is None
-        assert capture_health_line(root) == "capture: UNKNOWN (spool unreadable)"
+        driver = tmp_path / "health-parity-every-state.mjs"
+        driver.write_text(
+            f'import {{ captureHealthLine }} from "{ext}";\n'
+            + "".join(
+                f'console.log(captureHealthLine({json.dumps(str(d))},'
+                f' {json.dumps({} if k is None else {"apiKey": k})}).line);\n'
+                for _, d, k in cases),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [node, "--experimental-strip-types", str(driver)],
+            capture_output=True, text=True, timeout=60, cwd=str(REPO),
+        )
+        assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+        ts_lines = proc.stdout.strip().splitlines()[-len(cases):]
+        py_lines = [capture_health_line(d, api_key=k).line for _, d, k in cases]
+        assert ts_lines == py_lines, f"legs disagree: ts={ts_lines} py={py_lines}"
+        assert py_lines == [
+            "capture: DRAINING (1 queued)",
+            "capture: OK (0 queued)",
+            "capture: INACTIVE (no TORTOISE_API_KEY, 2 queued)",
+            f"capture: UNREADABLE (cannot list {unreadable / 'entries'})",
+        ], py_lines
     finally:
-        entries.chmod(stat.S_IRWXU)
+        (unreadable / "entries").chmod(stat.S_IRWXU)
 
-    corrupt = tmp_path / "corrupt"
-    write_spool_entry(corrupt, _snapshot("corrupt"))
-    (corrupt / "entries" / "junk.meta.json").write_text("{not json", encoding="utf-8")
-    assert capture_health_line(corrupt) == "capture: UNKNOWN (spool unreadable)"
+
+def test_the_drain_reports_a_BLOCKED_spool_on_its_own_stderr(tmp_path, monkeypatch,
+                                                            capsys):
+    """The drain run BY HAND must explain the spool it could not file, and must
+    NOT add a line to every run. (The SessionStart hook backgrounds the drain
+    with `>/dev/null 2>&1`, so this is an operator's line, not the fleet's
+    health surface — the durable answers are `session health` / `doctor`.)
+
+    MUTATION THAT REDS THIS: print nothing, or print for DRAINING/OK too.
+    """
+    from tortoise import __main__ as cli
+
+    monkeypatch.setattr(cli, "_capture_key_presence", lambda: "tt_configured")
+
+    blocked = tmp_path / "blocked"
+    write_spool_entry(blocked, _snapshot("drain-blocked"))
+    flush_spool(blocked, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
+                now=1000.0)
+    monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda: blocked)
+    cli._print_capture_health()
+    err = capsys.readouterr().err
+    assert "capture: BLOCKED (1 queued, 402 quota)" in err, err
+
+    # A spool the drain could not READ must also be printed: silence there is
+    # the empty-backlog reading this issue removed.
+    unreadable = tmp_path / "unreadable"
+    (unreadable / "entries").mkdir(parents=True)
+    unreadable.chmod(0o755)
+    (unreadable / "entries").chmod(0o000)
+    import os
+    if not os.access(unreadable / "entries", os.R_OK):
+        monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda: unreadable)
+        cli._print_capture_health()
+        err = capsys.readouterr().err
+        assert "capture: UNREADABLE (cannot list" in err, err
+        (unreadable / "entries").chmod(0o755)
+
+    # A DRAINING spool is the live session awaiting its own final flush, and an
+    # OK one has nothing to say: neither may add noise to every drain.
+    for quiet_state in ("draining", "ok"):
+        quiet = tmp_path / quiet_state
+        if quiet_state == "draining":
+            write_spool_entry(quiet, _snapshot("live-session"))
+        monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda q=quiet: q)
+        cli._print_capture_health()
+        assert capsys.readouterr().err == "", (
+            f"a {quiet_state} spool must not add noise to every drain")
+
+
+def test_quota_is_named_by_STATUS_and_the_servers_CODE_never_by_generic_prose(tmp_path):
+    """#4614 (a recorded decision in `hosted_api`) made the 402 carry a
+    machine-readable category precisely because capture clients are FORBIDDEN
+    from prose-matching the message. So a bare 402 IS a quota refusal, the
+    server's own 402 category is named as itself, and the endpoint's
+    fail-closed 500 body (`Quota check failed: …`, no category) is NOT — that is
+    a database failure, and reporting it as a quota block sends an operator to
+    raise a tier over an outage.
+
+    MUTATION THAT REDS THIS: classify on `"quota" in detail` → the 500 becomes a
+    block, and the bare 402 stops being one.
+    """
+    from tortoise.capture_spool import PostOutcome as PO
+    from tortoise.capture_spool import capture_health_line, quota_refusal
+
+    quiet402 = tmp_path / "quiet-402"
+    for i in range(3):
+        write_spool_entry(quiet402, _snapshot(f"quiet-{i}"))
+    refused = flush_spool(
+        quiet402, _Server(PO(ok=False, status=402, detail="payment required")).post,
+        now=1000.0,
+    )
+    assert refused.quota_refusals == 3, "a 402 is a quota refusal whatever it says"
+    assert capture_health_line(quiet402).line == \
+        "capture: BLOCKED (3 queued, 402 quota)"
+
+    loud500 = tmp_path / "loud-500"
+    for i in range(3):
+        write_spool_entry(loud500, _snapshot(f"loud-{i}"))
+    failed = flush_spool(
+        loud500,
+        _Server(PO(ok=False, status=500,
+                   detail="Quota check failed: connection refused")).post,
+        now=1000.0,
+    )
+    assert failed.quota_refusals == 0, "prose mentioning quota is NOT a quota refusal"
+    assert failed.quota is None
+    assert capture_health_line(loud500).line == "capture: DRAINING (3 queued)"
+
+    # The org's SPEND CAP is a 402 category too, and it is named as ITSELF: the
+    # operator who reads "quota" buys a plan that cannot lift it.
+    cap = tmp_path / "spend-cap"
+    write_spool_entry(cap, _snapshot("cap"))
+    capped = flush_spool(
+        cap, _Server(PO(ok=False, status=402,
+                        detail='{"code": "cohort_cost_cap"}')).post, now=1000.0)
+    assert capped.quota == {"status": 402, "code": "cohort_cost_cap",
+                            "detail": '{"code": "cohort_cost_cap"}'}
+    assert capture_health_line(cap).line == \
+        "capture: BLOCKED (1 queued, 402 cohort_cost_cap)"
+    assert quota_refusal(PO(ok=True, status=200)) is None
 
 
 def test_the_spool_ceilings_are_finite_and_identical_on_both_legs(tmp_path):
-    """ACCEPTANCE (3). The cap test elsewhere supplies its OWN bounds, so both
-    shipped constants could become Infinity and every suite would stay green —
-    the mechanism pinned, the bound unpinned. The two legs share the directory,
-    so they must also agree on the numbers: a divergence would evict different
-    captures depending on which harness wrote last.
+    """ACCEPTANCE (3), as SHIPPED. The caps were deliberately NOT lowered to the
+    size of the measured incident (a blocked box's captures are the user's data,
+    and evicting them to make a number look better is the loss the retry policy
+    exists to prevent): the defect was the INLINE flush, not the ceiling. What
+    was never pinned is the pair itself — the eviction test elsewhere supplies
+    its OWN bounds, so both shipped constants could become Infinity and every
+    suite would stay green. The two legs share the directory, so they must also
+    agree on the numbers: a divergence would evict different captures depending
+    on which harness wrote last.
 
     MUTATION THAT REDS THIS: raise a ceiling on one leg only.
     """
@@ -3386,123 +3697,3 @@ def test_the_spool_ceilings_are_finite_and_identical_on_both_legs(tmp_path):
     assert json.loads(proc.stdout.strip().splitlines()[-1]) == [
         capture_spool.SPOOL_MAX_ENTRIES, capture_spool.SPOOL_MAX_TOTAL_BYTES,
     ]
-
-
-def test_the_health_line_is_the_SAME_STRING_on_both_legs_for_every_state(tmp_path):
-    """The parity test above pins the BLOCKED shape. The two other shapes an
-    operator greps for — `UNKNOWN` (a spool that cannot be read) and the
-    `rejected` suffix — are just as load-bearing and just as easy to spell
-    differently on one leg.
-
-    MUTATION THAT REDS THIS: reword `UNKNOWN` or the `rejected` suffix on one leg.
-    """
-    from tortoise.capture_spool import capture_health_line
-
-    node = _node_that_can_strip_ts()
-    ext = (REPO / "tortoise" / "pi-hooks" / "tortoise-capture.ts").as_uri()
-    driver = tmp_path / "health-parity.mjs"
-    driver.write_text(
-        f'import {{ captureHealthLine }} from "{ext}";\n'
-        f'console.log(captureHealthLine({json.dumps(str(tmp_path / "rejected"))}));\n'
-        f'console.log(captureHealthLine({json.dumps(str(tmp_path / "unreadable"))}));\n',
-        encoding="utf-8",
-    )
-
-    rejected = tmp_path / "rejected"
-    for i in range(2):
-        write_spool_entry(rejected, _snapshot(f"rej-{i}"))
-    flush_spool(rejected, _Server(PostOutcome(ok=False, status=401, detail="nope")).post,
-                now=1000.0)
-
-    unreadable = tmp_path / "unreadable"
-    (unreadable / "entries").mkdir(parents=True)
-    (unreadable / "entries" / "junk.meta.json").write_text("{", encoding="utf-8")
-
-    proc = subprocess.run(
-        [node, "--experimental-strip-types", str(driver)],
-        capture_output=True, text=True, timeout=60, cwd=str(REPO),
-    )
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    ts_lines = proc.stdout.strip().splitlines()[-2:]
-    assert ts_lines == [
-        capture_health_line(rejected),
-        capture_health_line(unreadable),
-    ], f"legs disagree: ts={ts_lines} py={[capture_health_line(rejected), capture_health_line(unreadable)]}"
-    assert ts_lines[0] == "capture: BLOCKED (0 queued, 401, 2 rejected)"
-    assert ts_lines[1] == "capture: UNKNOWN (spool unreadable)"
-
-
-def test_the_drain_reports_a_BLOCKED_spool_on_its_own_stderr(tmp_path, monkeypatch,
-                                                             capsys):
-    """The drain run BY HAND must explain the spool it could not file, and must
-    NOT add an `OK` line to every run. (The SessionStart hook backgrounds the
-    drain with `>/dev/null 2>&1`, so this is an operator's line, not the fleet's
-    health surface — the durable answers are `session health` / `doctor`.)
-
-    MUTATION THAT REDS THIS: print nothing, or print for BACKLOG too.
-    """
-    from tortoise import __main__ as cli
-
-    blocked = tmp_path / "blocked"
-    write_spool_entry(blocked, _snapshot("drain-blocked"))
-    flush_spool(blocked, _Server(PostOutcome(ok=False, status=402, detail="quota")).post,
-                now=1000.0)
-    monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda: blocked)
-    cli._print_capture_health()
-    err = capsys.readouterr().err
-    assert "capture: BLOCKED (1 queued, 402)" in err, err
-
-    # A spool the drain could not READ must also be printed: silence there is
-    # the empty-backlog reading this issue removed.
-    unreadable = tmp_path / "unreadable"
-    (unreadable / "entries").mkdir(parents=True)
-    (unreadable / "entries" / "junk.meta.json").write_text("{", encoding="utf-8")
-    monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda: unreadable)
-    cli._print_capture_health()
-    err = capsys.readouterr().err
-    assert "capture: UNKNOWN (spool unreadable)" in err, err
-
-    quiet = tmp_path / "quiet"
-    monkeypatch.setattr("tortoise.capture_spool.spool_dir", lambda: quiet)
-    cli._print_capture_health()
-    assert capsys.readouterr().err == "", "an OK spool must not add noise to every drain"
-
-
-def test_quota_is_classified_by_STATUS_never_by_the_response_prose(tmp_path):
-    """#4614 (a recorded decision in `hosted_api.py`) made the 402 carry a
-    machine-readable category precisely because capture clients are FORBIDDEN
-    from prose-matching the message. So a 402 whose body says nothing about
-    quota IS a quota refusal, and the endpoint's real fail-closed 500 body
-    (`Quota check failed: …`) is NOT — that is a database failure, and reporting
-    it as a quota block sends an operator to raise a tier over an outage.
-
-    MUTATION THAT REDS THIS: classify on `"quota" in detail` again → both
-    assertions invert.
-    """
-    from tortoise.capture_spool import capture_health_line, read_capture_health
-
-    quiet402 = tmp_path / "quiet-402"
-    for i in range(3):
-        write_spool_entry(quiet402, _snapshot(f"quiet-{i}"))
-    refused = flush_spool(
-        quiet402, _Server(PostOutcome(ok=False, status=402, detail="payment required")).post,
-        now=1000.0,
-    )
-    assert refused.quota_refusals == 3, "a 402 is a quota refusal whatever it says"
-    assert read_capture_health(quiet402)["state"] == "blocked"
-    assert capture_health_line(quiet402) == "capture: BLOCKED (3 queued, 402)"
-
-    loud500 = tmp_path / "loud-500"
-    for i in range(3):
-        write_spool_entry(loud500, _snapshot(f"loud-{i}"))
-    failed = flush_spool(
-        loud500,
-        _Server(PostOutcome(ok=False, status=500,
-                            detail="Quota check failed: connection refused")).post,
-        now=1000.0,
-    )
-    assert failed.quota_refusals == 0, "prose mentioning quota is NOT a quota refusal"
-    health = read_capture_health(loud500)
-    assert health["state"] == "backlog", "a 5xx is transient, not a block"
-    assert health.get("reason") != "quota_exceeded"
-    assert capture_health_line(loud500) == "capture: BACKLOG (3 queued)"
