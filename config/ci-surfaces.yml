@@ -4104,6 +4104,7 @@ surfaces:
   - longmem_eval/test_freq_count_disposition.py  # #2886: guards tools/longmem_eval/freq_count_disposition.py (the census frequency/count disposition tool) — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so an eval-tool change alone selects it
   - test_temporal_aggregate_arm.py  # #2886: guards tools/longmem_eval/retrieve.py's `temporal_aggregate_verdict` adapter — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so a retrieve.py-only change selects it (dual-registered with `core` for the core's verdict semantics)
   - longmem_eval/test_temporal_admission_trace.py  # #2976: temporal admission trace — pool-membership vs reader-window-cut receipts + TR-machinery-inert mechanism pin (hermetic, no DB)
+  - longmem_eval/test_oracle_ceiling.py  # #2976: the ORACLE CEILING made reproducible — variant-aware gold grading (42/52) vs the plain floor (25/52) from the committed rows + gold fixture, the committed-grade-column-is-the-floor trap, gold-session-only reader context, and the fail-closed join (hermetic, no DB; offline --mock run verified). `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so an oracle_ceiling.py-only change selects it.
   - longmem_eval/test_probe_v2.py  # #2578 Task 5: v2-lane structural probe — wave guard, saturation stop rule, substrate measurement (embedded-safe)
   - longmem_eval/test_context_assembly_arms.py  # #3011: 4-arm (A/B/C/D) context-assembly runner — arm source selection, metrics 5/8/9, report shape (hermetic)
   - longmem_eval/test_context_assembly_leakage.py  # #3011: gold-leakage hard stop — static reference assertion + gold-field perturbation (hermetic)
@@ -5653,6 +5654,7 @@ durations:
   test_backups_v1_alias.py: 0.1
   eval/write_path/test_write_path_operator_lane.py: 25.0
   longmem_eval/test_temporal_admission_trace.py: 0.1
+  longmem_eval/test_oracle_ceiling.py: 8.3  # #2976: measured locally (15 tests, 8.26s wall on this host) — committed rows + fixture scoring plus one offline --mock reader run
   test_2884_ep_state_journaled.py: 4.7
   test_3276_has_ep_measured.py: 4.6
   test_4220_blog_residue_cleanup.py: 0.1

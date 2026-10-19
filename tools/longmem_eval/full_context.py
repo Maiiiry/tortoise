@@ -45,7 +45,7 @@ import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import dataset as ds
 from .dataset_audit import audit_dataset
@@ -120,13 +120,24 @@ def run_cell(
     checkpoint: str | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     split: str = ds.DEFAULT_SPLIT,
+    hits_for: Callable[[dict], list[dict]] | None = None,
+    cell: str = "option-5 full-context comparison",
+    extraction_approach: str = CELL_EXTRACTION_APPROACH,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the full-context cell over instances (reader + judge only).
 
     Per-question error isolation + checkpoint/resume mirror the main runner:
     transient LLM errors retry with backoff; a question that still fails is
     recorded in ``failures`` and the run continues. Returns (outcomes, report).
+
+    ``hits_for`` / ``cell`` / ``extraction_approach`` are the SEAM the
+    oracle-ceiling cell (#2976, ``tools/longmem_eval/oracle_ceiling.py``)
+    injects through: it is the same reader-only loop and the same report
+    machinery, but the context is restricted to the gold answer sessions
+    instead of the whole haystack. Defaults reproduce today's full-context
+    cell byte-identically (``None`` → ``full_haystack_hits``).
     """
+    hits_for = hits_for or full_haystack_hits
     done: dict[str, dict] = {}
     failures: list[dict] = []
     if checkpoint:
@@ -150,7 +161,7 @@ def run_cell(
             continue
         t0 = time.monotonic()
         try:
-            hits = full_haystack_hits(question)
+            hits = hits_for(question)
             question_date = question.get("question_date", "") or None
             context_text = render_context(hits, question_date=question_date)
             context_tokens = _estimate_tokens(context_text)
@@ -228,7 +239,7 @@ def run_cell(
         split=split,
         reader_model=reader.model_id,
         judge_model=judge.model_id,
-        extraction_approach=CELL_EXTRACTION_APPROACH,
+        extraction_approach=extraction_approach,
         ingest_mode="full-context-cell",
         ks=(5, 10, 20),
         top_k=len(instances[0].get("haystack_sessions") or []) if instances else 20,
@@ -237,7 +248,7 @@ def run_cell(
         # dataset recall-semantics audit record.
         dataset_semantics_audit=audit_dataset(instances),
         extra={
-            "cell": "option-5 full-context comparison",
+            "cell": cell,
             "outcomes": [
                 {k: o[k] for k in (
                     "question_id", "question_type", "question_date", "label",
