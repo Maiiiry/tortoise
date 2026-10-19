@@ -52,7 +52,8 @@ passed as an ARGUMENT is resolved as the handle only when it arrives on a
 PARAMETER of the receiving function (any parameter except `self`/`cls`), which is
 the over-report direction: `clear_config_reset(self._get_proj().g)` → `clear_config_reset(g)` issues a
 `DETACH DELETE` at projection/__init__.py:1519 (`clear_config_reset`, def at 1509) and is invisible without it
-(measured: 23 such writers package-wide). `functools.partial` over a verb, and a
+(measured: without the rule 76 functions leave the census entirely, 28 of them
+carrying a provable write). `functools.partial` over a verb, and a
 handle stashed on an object attribute (`self._h = proj.g`) then used later, are
 NOT resolved. Measured on this tree: sdk.py has 4 verb calls on a parameter
 receiver — 3 resolved read-only `MATCH … RETURN` probes
@@ -628,24 +629,28 @@ def _journal_first_violation(fact) -> str | None:
     if not fact["appends"]:
         return ("appends no record at all — a live lane is 'append first, then "
                 "write the cache'")
-    shallowest = min(fact["writes"], key=lambda write: write[3])
-    # EXISTENTIAL, not "the first append": a door may emit a best-effort
-    # diagnostic record inside `try/except` and its real record unconditionally,
-    # so what matters is that SOME record precedes the shallowest write — one
-    # that runs no deeper in the branch tree than that write does.
-    if not any(append[0] < shallowest[0] and append[1] <= shallowest[3]
-               for append in fact["appends"]):
-        earliest = min(fact["appends"])
-        if earliest[0] > shallowest[0]:
-            return (f"writes at line {shallowest[0]} "
-                    f"({shallowest[1]}: {shallowest[2]!r}) BEFORE its first "
-                    f"append at {earliest[0]} — that is the apply-first shape, "
-                    "and the declaration would bless it")
-        return (f"has no append that runs before line {shallowest[0]} at depth "
-                f"{shallowest[3]} — its records are at "
-                f"{[(line, depth) for line, depth in fact['appends']]}, so a "
-                "branch can reach the write with no record appended")
-    return None
+    # PER WRITE, existentially over the appends: a write is covered when SOME
+    # record both precedes it and runs no deeper in the branch tree than it does.
+    # Per-write (not "against the shallowest write") because a write inside a
+    # branch EARLIER than every append is still an unjournalled write — and
+    # existential over the appends because a door may emit a best-effort
+    # diagnostic record inside `try/except` before its real unconditional one.
+    uncovered = [write for write in fact["writes"]
+                 if not any(append[0] < write[0] and append[1] <= write[3]
+                            for append in fact["appends"])]
+    if not uncovered:
+        return None
+    shallowest = min(uncovered, key=lambda write: write[3])
+    earliest = min(fact["appends"])
+    if earliest[0] > shallowest[0]:
+        return (f"writes at line {shallowest[0]} "
+                f"({shallowest[1]}: {shallowest[2]!r}) BEFORE its first append "
+                f"at {earliest[0]} — that is the apply-first shape, and the "
+                "declaration would bless it")
+    return (f"has no append that covers its write at line {shallowest[0]} "
+            f"(depth {shallowest[3]}); its records are at "
+            f"{[(line, depth) for line, depth in fact['appends']]}, so a branch "
+            "can reach that write with no record appended")
 
 
 def _kind(fact) -> str:
@@ -702,6 +707,12 @@ def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
     surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
     offenders = []
     for name, fact in sorted(surface.items(), key=lambda kv: kv[1]["lineno"]):
+        if fact.get("duplicate_writer_defs"):
+            offenders.append(
+                f"{name} is defined more than once and BOTH definitions write — "
+                "the name-level verdict mixes one def's lane with another def's "
+                f"write (defs at {sorted(fact['def_linenos'])})")
+            continue
         if ("tortoise/sdk.py", name) in _PROVEN_READS:
             # Proven read-only in review: the ONE register the flip gate also
             # consults, so the two gates cannot demand contradictory bookkeeping.
@@ -806,6 +817,11 @@ def test_every_live_declared_door_is_journal_first():
         openers = {opener for _line, opener in fact["scopes"]}
         if not openers & set(_LIVE_LANE_NAMES):
             continue
+        if fact.get("duplicate_writer_defs"):
+            offenders.append(
+                f"{name} merges two writing DEFINITIONS, so its write/append "
+                "order compares lines from different functions — split it")
+            continue
         violation = _journal_first_violation(fact)
         if violation:
             offenders.append(
@@ -833,6 +849,9 @@ def test_the_event_store_declares_every_writer():
     returned nothing while the API reported success (#9208).
     """
     surface = enumerate_handle_surface(EVENT_STORE_PY.read_text(), str(EVENT_STORE_PY))
+    assert not any(fact.get("duplicate_writer_defs") for fact in surface.values()), (
+        "an event_store name merges two writing definitions — the store's own "
+        f"surface must be unambiguous: {sorted(surface)}")
     undeclared = {
         name: fact for name, fact in surface.items() if not fact["scopes"]
     }
@@ -1102,10 +1121,14 @@ def _modules_reaching_the_handle():
 
 #: Package-wide `(module, function)` pairs whose statement the static census cannot
 #: resolve but a human has PROVEN read-only (it is a `MATCH … RETURN` whose
-#: interpolated fragment carries no write clause). Empty in part 1: every such
-#: statement currently sits in the flip gate's "unproven" bucket, which is why
-#: the flip is blocked. Filling one in is a reviewed act — and it is never the
-#: right remedy to wrap a read in a write lane.
+#: interpolated fragment carries no write clause). Empty in part 1, and the flip
+#: is blocked without it. Bucketing is PER FUNCTION, so of the 308 unresolved
+#: statements in the population 226 sit in the "unproven" bucket, 44 sit in
+#: functions that already declare a lane (no bucket), and 38 ride in a function
+#: that also has a provable write (so they are listed as a missing lane, not as
+#: unproven — the per-function granularity is the limit of a source-order
+#: census). Filling one in is a reviewed act — and it is never the right remedy
+#: to wrap a read in a write lane.
 _PROVEN_READS: set[tuple[str, str]] = set()
 
 
@@ -1147,6 +1170,14 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
     seen_sdk: set[str] = set()
     for rel, surface in population:
         for name, fact in sorted(surface.items()):
+            # BEFORE any accounting: a name whose DEFINITIONS both write merges
+            # one def's lane with another def's write, so its verdict is unsound
+            # whatever else it looks like — including looking declared.
+            assert not fact.get("duplicate_writer_defs"), (
+                f"{rel}::{name} is defined more than once and BOTH definitions "
+                "write the handle — the name-level verdict would mix one def's "
+                "lane with another def's write; split the census per definition "
+                "or merge the definitions")
             accounted = bool(fact["scopes"]) or (rel, name) in _CALLER_DECLARED
             proven_read = (rel, name) in _PROVEN_READS
             if rel == "tortoise/sdk.py":
@@ -1188,26 +1219,48 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
 
 
 def _call_is_inside_a_scope(func, callee) -> bool:
-    """Is a call to `callee` inside the body of a `with <scope>(...):` block?"""
+    """Does a call to `callee` RUN inside a declared lane opened by `func`?
+
+    Three ways to be covered, and nothing else: inside the body of a
+    `with <scope>(...):` block (sync or async), inside a `@_declares_live_write_lane`
+    window (that decorator covers the whole body), or — for a `with` — a nested
+    `def`/`lambda` boundary STOPS the search, because a function defined in the
+    block does not run in it.
+    """
+    for decorator in func.decorator_list:
+        # decorator form: `@_declares_live_write_lane(...)` covers the whole body
+        if isinstance(decorator, ast.Call):
+            opener = getattr(decorator.func, "id", None) or getattr(
+                decorator.func, "attr", None)
+            if opener in _LIVE_LANE_NAMES:
+                return True
     for node in ast.walk(func):
-        if not isinstance(node, ast.With):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
             continue
-        openers = []
-        for item in node.items:
-            if isinstance(item.context_expr, ast.Call):
-                opener = getattr(item.context_expr.func, "id", None) or getattr(
-                    item.context_expr.func, "attr", None)
-                if opener in _SCOPE_CALL_NAMES:
-                    openers.append(opener)
-        if not openers:
+        if not any(isinstance(item.context_expr, ast.Call)
+                   and (getattr(item.context_expr.func, "id", None)
+                        or getattr(item.context_expr.func, "attr", None))
+                   in _SCOPE_CALL_NAMES for item in node.items):
             continue
         for body_node in node.body:
-            for inner in ast.walk(body_node):
-                if isinstance(inner, ast.Call):
-                    target = getattr(inner.func, "id", None) or getattr(
-                        inner.func, "attr", None)
-                    if target == callee:
-                        return True
+            if _calls_within(body_node, callee):
+                return True
+    return False
+
+
+def _calls_within(node, callee) -> bool:
+    """A call to `callee` in this subtree, not crossing a nested function boundary."""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(current, ast.Call):
+            target = getattr(current.func, "id", None) or getattr(
+                current.func, "attr", None)
+            if target == callee:
+                return True
+        stack.extend(ast.iter_child_nodes(current))
     return False
 
 
