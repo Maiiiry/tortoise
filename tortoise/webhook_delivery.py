@@ -208,13 +208,20 @@ def _run(proj, cypher: str, params: dict | None = None):
     `hosted_api`, which imports the projection, and a module-level import here
     would make the dependency direction circular.
 
-    ⛔ A REFUSAL MUST NOT BE SWALLOWED ANYWHERE ON THIS PATH. The two handlers
-    that exist for ordinary failures (the index DDL's "already exists", and the
-    dispatcher's cursor/receipt writes) re-raise `DirectCacheWriteRefused`
-    explicitly. A refusal means the statement never reached the store, so
-    treating it as success is the silent-loss shape §17.1 exists to prevent
-    (#9233 review P1 — measured: a refused cursor write reported `delivered=1`
-    with `cursor == 0`, re-POSTing the same event on every pass forever).
+    ⛔ A REFUSAL MUST NOT BE SWALLOWED ANYWHERE ON THIS PATH. EVERY handler on
+    this path that exists for an ORDINARY failure re-raises
+    `DirectCacheWriteRefused` explicitly, ahead of its broad clause — there is
+    no count to outgrow here, so a new handler must add the arm rather than
+    find itself outside the sentence:
+    `ensure_subscription_schema` (the index DDL's "already exists"),
+    `_write_receipt` (the prune), `_mark_delivered` (the delivered receipt), and
+    in `dispatch_pending` the `_mark_delivered` cursor write, the `_mark_failed`
+    failure write, and the failure write on the undecryptable-secret branch
+    (#9233 review rounds 2-4). A refusal means the statement never reached the
+    store, so treating it as success is the silent-loss shape §17.1 exists to
+    prevent (#9233 review P1 — measured: a refused cursor write reported
+    `delivered=1` with `cursor == 0`, re-POSTing the same event on every pass
+    forever).
     """
     from tortoise.projection import _cache_write_authorized, _statement_writes
 
@@ -751,9 +758,11 @@ class WebhookTransport:
 def _status_code(value) -> int | None:
     """Coerce a transport's status to an int, or ``None`` when unusable.
 
-    Defensive on purpose: ``dispatch_pending`` promises never to raise, and a
-    transport (or a subclass) that returns a non-numeric status would otherwise
-    raise INSIDE the dispatch loop and escape to the dream worker as a failure.
+    Defensive on purpose: ``dispatch_pending`` never raises for a subscriber or
+    transport failure (a §17.1 refusal of its own write is the ONE exception),
+    and a transport (or a subclass) that returns a non-numeric status would
+    otherwise raise INSIDE the dispatch loop and escape to the dream worker as a
+    failure.
     """
     try:
         return int(value)
@@ -1210,9 +1219,22 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
         except Exception as e:
             logger.error("webhook_delivery: cannot decrypt secret for %s: %s",
                          sub.get("sub_id"), redact_error(e))
-            _mark_failed(proj, sub, events[0], None,
-                         "subscription secret unreadable (encryption key "
-                         "rotated or unset)", now_dt, 0)
+            # The failure write is contained here for the SAME reason as the
+            # rejection branch below: the contract is "never raises for a
+            # subscriber, transport or graph failure" (contract 3), and an
+            # escape from the `for sub in subs:` loop would abort delivery for
+            # every REMAINING subscription in the pass. A refusal is the one
+            # exception, so it propagates (#9233 review round 4).
+            try:
+                _mark_failed(proj, sub, events[0], None,
+                             "subscription secret unreadable (encryption key "
+                             "rotated or unset)", now_dt, 0)
+            except DirectCacheWriteRefused:
+                raise
+            except Exception as write_err:  # noqa: BLE001, RUF100
+                logger.warning(
+                    "webhook_delivery: failure write failed for %s: %s",
+                    sub.get("sub_id"), redact_error(write_err))
             continue
         for event in events:
             started = time.monotonic()

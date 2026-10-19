@@ -20,14 +20,16 @@ and this issue's contract is executable now instead of blocked on a sibling.
 `test_the_instrument_refuses_an_undeclared_write` is the control: without it every
 "declared" assertion below would also pass on a guard that refuses nothing.
 
-⛔ THE DECLARATION MUST NOT HIDE A REFUSAL. `_run` opens the lane, but two
-handlers on the delivery path exist for ORDINARY failures (the index DDL's
-"already exists", the dispatcher's cursor/receipt writes) and a broad `except
-Exception` there would count a refused statement as a completed write: measured
-before the fix, a refused cursor write returned `{'delivered': 1, …}` with
-`cursor == 0`, re-POSTing the same event on every pass forever (and
-`max_attempts` can never trip, because the success path never calls
-`_mark_failed`). Both are pinned below.
+⛔ THE DECLARATION MUST NOT HIDE A REFUSAL. `_run` opens the lane, but the handlers
+on the delivery path exist for ORDINARY failures (the index DDL's "already
+exists", the delivered receipt, the receipt prune, the dispatcher's cursor and
+failure writes) and a broad `except Exception` there would count a refused
+statement as a completed write: measured before the fix, a refused cursor write
+returned `{'delivered': 1, …}` with `cursor == 0`, re-POSTing the same event on
+every pass forever (and `max_attempts` can never trip, because the success path
+never calls `_mark_failed`). Every one of those handlers re-raises a refusal
+ahead of its broad clause, and `test_every_ordinary_failure_handler_on_the_write_path_re_raises_refusals`
++ `test_every_dispatch_write_is_refusal_armed` keep the set closed.
 
 ⛔ THE DECLARATION IS NOT A DURABILITY UPGRADE, and this suite says so rather
 than implying it: `test_a_rebuild_does_not_restore_the_store` runs a REAL
@@ -439,6 +441,104 @@ def test_a_refused_failure_write_is_not_swallowed(sdk_with_journal,
     )
 
 
+def test_an_undecryptable_secret_does_not_abort_the_rest_of_the_pass(
+        sdk_with_journal, monkeypatch, caplog):
+    """The DECRYPT branch's failure write is contained like the rejection branch's.
+
+    That branch called `_mark_failed` OUTSIDE any handler, and the `for sub in
+    subs:` loop has no enclosing try — so an ORDINARY failure of that write (a
+    graph hiccup, not a refusal) escaped `dispatch_pending` and aborted delivery
+    for every REMAINING subscription in the pass. That contradicts contract 3
+    ("never raises for a subscriber, transport or graph failure") one call site
+    away from the branch that did get the containment (#9233 review round 4).
+    """
+    import logging
+    from datetime import UTC, datetime, timedelta
+
+    from tortoise import crypto
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 2)
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    wd.create_subscription(proj, url="https://hooks.example.com/undecryptable",
+                           types=["PointAdded"], description="9233 no secret",
+                           now=t0)
+    second = wd.create_subscription(
+        proj, url="https://hooks.example.com/fine", types=["PointAdded"],
+        description="9233 fine", now=t0 + timedelta(seconds=1))
+
+    real_decrypt = crypto.decrypt_token
+    calls = {"n": 0}
+
+    def _first_decrypt_fails(token):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("cannot decrypt (key rotated or unset)")
+        return real_decrypt(token)
+
+    def _failure_write_hiccups(*_a, **_kw):
+        raise RuntimeError("graph hiccup on the failure write")
+
+    monkeypatch.setattr(crypto, "decrypt_token", _first_decrypt_fails)
+    monkeypatch.setattr(wd, "_mark_failed", _failure_write_hiccups)
+
+    transport = _ScriptedTransport()
+    with caplog.at_level(logging.WARNING, logger="tortoise.webhook_delivery"):
+        summary = wd.dispatch_pending(proj, transport=transport)
+
+    assert calls["n"] >= 2, (
+        "the pass never reached the second subscription — the undecryptable-"
+        f"secret branch ended it, which is the abort under test: {calls}"
+    )
+    assert summary["delivered"] == 2 and summary["failed"] == 0, (
+        f"a contained failure write distorted the summary: {summary}"
+    )
+    assert wd.get_subscription(proj, second["sub_id"])["cursor"] == 2, (
+        "the remaining subscription was not drained — the pass aborted"
+    )
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("failure write failed" in m for m in messages), (
+        f"the contained failure write was not logged at all: {messages}"
+    )
+
+
+def test_a_refused_failure_write_on_the_decrypt_branch_is_not_swallowed(
+        sdk_with_journal, monkeypatch):
+    """The containment added above must not be a broad clause only: a §17.1
+    REFUSAL of that same failure write still propagates.
+
+    Stated pin, not a regression: pre-fix the refusal propagated too (the call
+    had no handler at all), so this test's job is to hold the ARM in place once
+    the ordinary failure is contained — losing it would silently re-open the
+    swallow (#9233 review round 4).
+    """
+    from tortoise import crypto
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 2)
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 types=["PointAdded"], description="9233 decrypt")
+
+    def _no_decrypt(_token):
+        raise RuntimeError("cannot decrypt (key rotated or unset)")
+
+    monkeypatch.setattr(crypto, "decrypt_token", _no_decrypt)
+    transport = _ScriptedTransport([200])
+    _instrument(monkeypatch, refuse="SET s.attempts=")
+    with pytest.raises(DirectCacheWriteRefused):
+        wd.dispatch_pending(proj, transport=transport)
+
+    assert transport.calls == [], (
+        "the POST happened, so the refusal under test was not the decrypt "
+        "branch's failure write"
+    )
+    assert wd.get_subscription(proj, sub["sub_id"])["attempts"] == 0, (
+        "the fixture refused the wrong statement — the attempt landed"
+    )
+
+
 def test_a_receipt_failure_does_not_un_deliver_the_event(
         sdk_with_journal, monkeypatch, caplog):
     """The cursor is the COMMIT POINT; the receipt is its audit.
@@ -783,6 +883,169 @@ def test_every_funnel_caller_is_covered_or_stated():
     assert callers == covered, (
         "the funnel's caller set drifted from what this suite covers/excuses: "
         f"unseen={sorted(callers - covered)} stale={sorted(covered - callers)}"
+    )
+
+def _statement_text(call: ast.Call) -> str | None:
+    """The literal statement a `_run`-shaped call passes, or `None` if unknowable.
+
+    The statement is the first ARGUMENT THAT IS A STRING — `_run(proj, cypher,
+    params)` puts the projection first, so reading `args[0]` would render `proj`.
+    A `JoinedStr` (the `_DUE_PREDICATE` statements) contributes its constant
+    parts; an argument that is a variable (`ensure_subscription_schema`'s loop
+    `stmt`) has no renderable text, and `None` is then treated as MUTATING — the
+    pin fails closed rather than skipping a site it cannot read.
+    """
+    for arg in call.args:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if isinstance(arg, ast.JoinedStr):
+            parts = [v.value for v in arg.values
+                     if isinstance(v, ast.Constant) and isinstance(v.value, str)]
+            return " ".join(parts)
+    return None
+
+
+def _write_path_functions(tree: ast.Module) -> frozenset[str]:
+    """Functions that issue a MUTATING statement through `_run` — derived.
+
+    Uses `_statement_writes`, the same predicate `_run` gates on, so the pin and
+    the funnel cannot disagree about what a write is. Read-only funnel callers
+    (`_due_subscriptions`, the readers) are excluded: there is no refusal for
+    their statements to swallow, and the artifact that admits a read into the
+    write set is a classifier change, which re-derives this set.
+    """
+    out = {"_run"}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_run"):
+                continue
+            text = _statement_text(node)
+            if text is None or _statement_writes(text):
+                out.add(fn.name)
+                break
+    return frozenset(out)
+
+
+def _try_body_ids(node: ast.Try) -> set[int]:
+    """Ids of every node in a `try`'s GUARDED body — not `else`/`finally`.
+
+    A raise inside `finally:` is NOT caught by that `try`'s handlers, so a
+    line-range containment test would let a call there count as guarded and pass
+    the pin on code that violates its own contract (#9233 review round 4).
+    """
+    ids: set[int] = set()
+    for stmt in node.body:
+        for child in ast.walk(stmt):
+            ids.add(id(child))
+    return ids
+
+
+def _is_broad_handler(handler: ast.ExceptHandler) -> bool:
+    """Does this clause catch (near-)everything, refusals included?
+
+    A bare `except:`, `except Exception`, `except BaseException`, the exception
+    GROUP names, and a tuple that contains any of them (`except (Exception,
+    OSError):`) — the tuple shape is a swallow that a name-only check misses.
+    """
+    broad = {"Exception", "BaseException", "ExceptionGroup", "BaseExceptionGroup"}
+    node = handler.type
+    if node is None:
+        return True
+    if isinstance(node, ast.Name):
+        return node.id in broad
+    if isinstance(node, ast.Tuple):
+        return any(isinstance(e, ast.Name) and e.id in broad for e in node.elts)
+    return False
+
+
+def _is_refusal_arm(handler: ast.ExceptHandler) -> bool:
+    """`except DirectCacheWriteRefused: raise` — the arm contract 3 promises."""
+    return (isinstance(handler.type, ast.Name)
+            and handler.type.id == "DirectCacheWriteRefused"
+            and any(isinstance(s, ast.Raise) for s in handler.body))
+
+
+def _call_names(stmts) -> set[str]:
+    names: set[str] = set()
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                names.add(node.func.id)
+    return names
+
+
+def test_every_ordinary_failure_handler_on_the_write_path_re_raises_refusals():
+    """`_run`'s docstring claims EVERY ordinary-failure handler on this path
+    re-raises a refusal ahead of its broad clause — executable here, not prose.
+
+    The claim used to carry a count of two handlers while five existed, which is
+    how an audit reads "covered" without looking at the prune / receipt /
+    `_mark_failed` sites. The count is gone; this pin is what makes the
+    replacement sentence checkable (#9233 review round 4). The write-path set is
+    DERIVED from the classifier, so a new writer is inspected the moment it
+    exists rather than when someone remembers to add it here.
+
+    MUTATION: delete an `except DirectCacheWriteRefused: raise` arm (the prune's,
+    or `_mark_delivered`'s receipt) — this test names the site. So does changing
+    a broad clause to `except (Exception, OSError):` and dropping the arm.
+    """
+    tree = _module_tree()
+    write_path = _write_path_functions(tree)
+    offenders: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Try):
+                continue
+            if not (_call_names(node.body) & write_path):
+                continue        # not a write-path handler
+            if not any(_is_broad_handler(h) for h in node.handlers):
+                continue        # nothing swallowed — the failure propagates
+            if not any(_is_refusal_arm(h) for h in node.handlers):
+                offenders.append(f"{fn.name}:{node.lineno}")
+
+    assert not offenders, (
+        "a handler on the write path swallows a §17.1 refusal — it must re-raise "
+        f"`DirectCacheWriteRefused` ahead of its broad clause: {offenders} "
+        f"(derive-checked write path: {sorted(write_path)})"
+    )
+
+
+def test_every_dispatch_write_is_refusal_armed():
+    """The dispatch LOOP must not let an ordinary failure end the pass, and must
+    not let a refusal be swallowed: every `_mark_*` call in `dispatch_pending`
+    sits inside a `try` BODY that carries the refusal arm (a call in the same
+    try's `finally:` is not guarded — a raise there bypasses its handlers).
+
+    RED before the fix: the undecryptable-secret branch's `_mark_failed` call had
+    no `try` at all, so a graph hiccup there escaped the loop and aborted every
+    remaining subscription (#9233 review round 4).
+    """
+    tree = _module_tree()
+    dispatch = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "dispatch_pending")
+    guarded: set[int] = set()
+    for node in ast.walk(dispatch):
+        if isinstance(node, ast.Try) and any(_is_refusal_arm(h) for h in node.handlers):
+            guarded |= _try_body_ids(node)
+
+    unguarded = [
+        f"{node.func.id}:{node.lineno}"
+        for node in ast.walk(dispatch)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in {"_mark_failed", "_mark_delivered"}
+        and id(node) not in guarded
+    ]
+    assert not unguarded, (
+        "a dispatch write is outside every refusal-armed try: an ordinary "
+        "failure there aborts the rest of the pass, and a refusal there is "
+        f"swallowed: {unguarded}"
     )
 
 
