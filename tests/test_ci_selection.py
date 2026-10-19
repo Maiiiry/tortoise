@@ -1536,6 +1536,30 @@ def test_docs_lint_baseline_tool_change_selects_core_not_tier1():
     assert r["full"] is False, r
 
 
+def test_e1_e2_evidence_bundle_change_selects_core_not_the_docs_only_return():
+    # #9076: the E1+E2 evidence bundle (`docs/evidence/7949-capstone/` — the probe,
+    # the corpus JSON + builder, the evidence log) and its structural checker
+    # (`tools/e1_e2_census_check.py`) own `tests/test_e1_e2_measurement.py`,
+    # registered `core`. MEASURED before the CORE_ALSO entries: all three paths
+    # returned `surfaces=[]`, `full=False`, 50 files — `docs/` and `tools/` are
+    # flat NON_PYTHON_PREFIXES entries, so the changed list came back empty and
+    # select() took the docs-only early return (tier-1 smoke). The pin ran there
+    # only because this PR dual-registers it in `tier1`; `tier1` is a CURATED
+    # list, so the guard's owning surface was nominal and one tier1 edit from
+    # dropping it silently. These asserts are on the `core` arm, which is what the
+    # entries create: after the change, `surfaces=['core']` and the pin is present.
+    # Mutation check: removing either CORE_ALSO entry restores `surfaces=[]` and
+    # fails the second assert.
+    for path in ("docs/evidence/7949-capstone/probes/e1_e2_probe.py",
+                 "docs/evidence/7949-capstone/corpus/e1e2_corpus.json",
+                 "docs/evidence/7949-capstone/e1-e2.log",
+                 "tools/e1_e2_census_check.py"):
+        r = _sel([path])
+        assert "core" in r["surfaces"], (path, r["surfaces"])
+        assert r["full"] is False, (path, r)
+        assert "test_e1_e2_measurement.py" in r["test_files"], (path, r)
+
+
 def test_supabase_control_change_selects_the_org_purge_rpc_guard():
     # #7968 / PR #8179 review P1: `purge_org_control_plane` lives in
     # `tortoise/supabase_control.py`, which IS a SOURCE_PATTERNS["api"] entry —

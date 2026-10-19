@@ -1172,6 +1172,34 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # Pinned by
              # tests/test_ci_selection.py::test_capstone_probe_change_selects_core_not_tier1.
              "docs/evidence/7950-capstone/probes/",
+             # #9076: the E1+E2 evidence bundle
+             # (`docs/evidence/7949-capstone/` — the probe, the corpus JSON and its
+             # builder, the evidence log) and its structural checker
+             # (`tools/e1_e2_census_check.py`) own
+             # `tests/test_e1_e2_measurement.py`, registered `core`.
+             #
+             # MEASURED before these entries (2026-10-18, `select()` in-process):
+             # a diff touching ANY of them returned `surfaces=[]`, `full=False`,
+             # 50 test files — i.e. `docs/` and `tools/` are flat
+             # NON_PYTHON_PREFIXES entries, the changed list came back empty and
+             # select() took the docs-only early return. The pin still RAN, but
+             # only because this PR also dual-registers it in `tier1` (the same
+             # `core`=home / `tier1`=docs-only pairing the extractor-v4 guards
+             # above use). That is the fragile state these entries remove: `tier1`
+             # is a CURATED list, so the guard's owning surface (`core`) was
+             # nominal and one tier1 edit from dropping the pin silently — the
+             # #1349/#3332/#3616 class, reached through the early return rather
+             # than through `_selection_relevant`. After: `surfaces=['core']`,
+             # `full=False`, pin present — the same shape and remedy as
+             # `docs/evidence/7950-capstone/probes/` above, and (unlike that
+             # entry) it is a cost/home fix rather than a hole fix, which is
+             # stated so the polarity is not misread later.
+             "docs/evidence/7949-capstone/",
+             # `tools/` is a flat NON_PYTHON_PREFIXES entry too, so the checker was
+             # swallowed by the same early return; its pins are `core`-registered
+             # and hermetic, so `core` is the right lane (the shape
+             # `tools/lane_stash.py` above takes).
+             "tools/e1_e2_census_check.py",
              # #4030: `supabase/config.toml` is the committed LOCAL-stack config,
              # and every env var it resolves by `env(NAME)` substitution must be
              # declared in `.env.example` — the guard for that pair
