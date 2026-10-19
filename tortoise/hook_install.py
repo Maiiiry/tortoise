@@ -252,6 +252,39 @@ def breadcrumb_file(harness: str, kind: str) -> Path:
     return local_state_dir("capture-errors") / breadcrumb_name(harness, kind)
 
 
+def breadcrumb_harness(filename: str | os.PathLike[str],
+                       kind: str) -> str | None:
+    """The harness a ``capture-errors`` FILENAME names for ``kind``, or None.
+
+    The INVERSE of :func:`breadcrumb_name`, kept in the SAME module so the
+    forward and reverse derivations cannot drift apart — the failure mode a
+    second literal (``"-install.json"`` written out in a listing) would
+    produce: a future change to the name FORMAT would silently keep parsing
+    names the writers no longer write, and list files that are not records.
+
+    The slot shape is taken from :func:`breadcrumb_name` itself (called with
+    an EMPTY harness, so no harness name is guessed at), never written out
+    here.  A name that does not end with that shape — or whose remainder is
+    empty, or does not regenerate EXACTLY under :func:`breadcrumb_name` — is
+    ``None``: an unrelated file that happens to sit in ``capture-errors/`` is
+    not a record of this kind.  The regenerate step is a tautology for
+    today's format and is deliberately kept: it is what refuses a name that
+    merely CONTAINS the shape once the format grows a prefix or a stamp.
+
+    ``kind`` is validated by :func:`breadcrumb_name` (an unrecognised kind
+    raises rather than inheriting a slot — see there), so a caller cannot get
+    an ``install-inert`` answer for a ``capture-failure`` question.
+    """
+    empty = breadcrumb_name("", kind)
+    name = Path(filename).name
+    if not empty or not name.endswith(empty) or name == empty:
+        return None
+    harness = name[:-len(empty)]
+    if breadcrumb_name(harness, kind) != name:
+        return None
+    return harness
+
+
 #: Substrings that identify a hook body as Tortoise's. Deliberately specific
 #: (a bare word ``tortoise`` would match a foreign hook that merely mentions
 #: it) — the pre-#3795 un-markered hooks contain several of these.

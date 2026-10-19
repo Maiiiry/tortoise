@@ -1747,3 +1747,170 @@ def test_the_vendor_phrasing_constraint_is_recorded_in_the_code(tmp_path):
                        ("capture_breadcrumb.py", module)):
         assert re.search(r"prompt-injection", text), name
         assert re.search(r"imperative", text, re.IGNORECASE), name
+
+
+# ── the OPERATOR listing: install-inert evidence read back (#8360) ────────
+#
+# The agent-facing payload above is a HOOK surface: shell renders install-inert
+# because that record is reached when Python or the module dir did not resolve.
+# The functions below are the OTHER surface — a command the operator runs, which
+# is inside a working interpreter by construction — and it exists because a
+# CAPTURE-LESS seam (the Hermes ``pre_llm_call`` plugin) writes the same record
+# and had no automated reader at all: ``session verify`` enumerates
+# ``capture_install.CAPTURE_SEAM`` (no ``hermes``) and the agent renderer owns
+# only ``capture-failure``, so an inert read seam read as a healthy empty graph.
+
+
+def _seed_install_record(base: Path, harness: str, **overrides) -> Path:
+    record = {"harness": harness,
+              "detail": "the installed plugin resolved no tortoise reflex",
+              "recorded_at": "2026-10-13T08:21:16Z",
+              "kind": "install-inert"}
+    record.update(overrides)
+    path = base / f"{harness}-install.json"
+    base.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return path
+
+
+def test_the_listing_names_the_record_and_its_detail(tmp_path):
+    """#8360's target: the reader NAMES the record's ``detail`` and its slot, so
+    a user learns WHICH cause fired (no reflex resolved vs every reflex failed)
+    rather than only that something is wrong.
+
+    Mutation: drop ``why:``/``record:`` from the block — the verdict no longer
+    names the cause and this REDs."""
+    from tortoise.capture_breadcrumb import (
+        read_install_inert_records,
+        render_install_inert_records,
+    )
+
+    path = _seed_install_record(tmp_path, "hermes")
+    records = read_install_inert_records(tmp_path)
+    assert [r["harness"] for r in records] == ["hermes"]
+    out = render_install_inert_records(records)
+    fields = _fields(out)
+    assert fields["code"] == "install-inert"
+    assert fields["harness"] == "hermes"
+    assert fields["when"] == "2026-10-13T08:21:16Z"
+    assert "resolved no tortoise reflex" in fields["why"]
+    assert fields["record"] == str(path)
+
+
+def test_the_listing_is_generic_over_the_slot_not_over_a_harness_list(tmp_path):
+    """The whole point of the generic arm: a future capture-less seam is
+    reported the day it writes a record — no per-harness arm, no closed list.
+
+    Mutation: enumerate a fixed harness list (e.g. ``CAPTURE_SEAM``) instead of
+    the directory — the unknown harness disappears and this REDs."""
+    from tortoise.capture_breadcrumb import read_install_inert_records
+
+    _seed_install_record(tmp_path, "hermes")
+    _seed_install_record(tmp_path, "some-future-seam")
+    records = read_install_inert_records(tmp_path)
+    assert [r["harness"] for r in records] == ["hermes", "some-future-seam"]
+
+
+def test_only_kind_install_inert_at_the_slot_counts_as_evidence(tmp_path):
+    """The READ condition is the WRITE condition (``session_verify``'s rule): a
+    ``capture-failure`` record, a foreign kind, a corrupt file, a directory and
+    a non-object document at the install slot are NOT inert evidence.
+
+    Mutation: list every ``*-install.json`` file without the ``kind`` gate — a
+    capture outage is reported as an inert install and this REDs."""
+    from tortoise.capture_breadcrumb import read_install_inert_records
+
+    _seed_install_record(tmp_path, "hermes")
+    _seed_install_record(tmp_path, "claude", kind="capture-failure")
+    _seed_install_record(tmp_path, "codex", kind="something-else")
+    (tmp_path / "cursor-install.json").write_text("{not json", encoding="utf-8")
+    (tmp_path / "pi-install.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "openclaw-install.json").mkdir()
+    assert [r["harness"] for r in read_install_inert_records(tmp_path)] == [
+        "hermes"]
+
+
+def test_the_slot_names_the_record_not_a_disagreeing_field(tmp_path):
+    """The slot is the identity: both writers derive their ``harness`` field
+    from the same value they derive the FILENAME from, so a disagreement means
+    a foreign or hand-edited file.  A slot-keyed listing must not let such a
+    file label itself as another seam's evidence (and ``--harness`` filters on
+    that same identity).
+
+    Mutation: trust ``record["harness"]`` (``setdefault`` instead of an
+    assignment) — the foreign file is listed as ``hermes`` evidence and this
+    REDs."""
+    from tortoise.capture_breadcrumb import read_install_inert_records
+
+    # A file at claude's slot whose own field claims to be hermes's evidence.
+    _seed_install_record(tmp_path, "claude")
+    path = tmp_path / "claude-install.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["harness"] = "hermes"
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    records = read_install_inert_records(tmp_path)
+    assert [r["harness"] for r in records] == ["claude"]
+
+
+def test_a_file_outside_the_slot_shape_is_never_a_record(tmp_path):
+    """``breadcrumb_harness`` is the INVERSE of the one filename derivation, and
+    it refuses anything that does not regenerate exactly — e.g. the
+    ``capture-failure`` slot name, or a name that merely contains the shape.
+
+    Mutation: derive the harness by ``stem.split("-")[0]`` — a
+    ``claude.json``/``x-install-install.json`` file becomes a record and this
+    REDs."""
+    from tortoise.capture_breadcrumb import read_install_inert_records
+    from tortoise.hook_install import (
+        KIND_CAPTURE_FAILURE,
+        KIND_INSTALL_INERT,
+        breadcrumb_harness,
+        breadcrumb_name,
+    )
+
+    assert breadcrumb_harness("hermes-install.json", KIND_INSTALL_INERT) == "hermes"
+    assert breadcrumb_harness("claude.json", KIND_CAPTURE_FAILURE) == "claude"
+    for name in ("claude.json", "-install.json", "hermes-install.json.bak",
+                 "install.json", "hermes-install.JSON"):
+        assert breadcrumb_harness(name, KIND_INSTALL_INERT) is None, name
+    # The forward derivation is the authority: a harness name with the slot's
+    # own suffix embedded still round-trips.
+    assert breadcrumb_harness(
+        breadcrumb_name("a-install", KIND_INSTALL_INERT),
+        KIND_INSTALL_INERT) == "a-install"
+    assert read_install_inert_records(tmp_path) == []
+
+
+def test_a_credential_in_a_record_cannot_render_in_cleartext(tmp_path):
+    """Every listing field arrives in the same attacker-influenceable JSON, so
+    all of them take the redact-then-bound path — a token planted in ``detail``
+    must not be printed by the operator surface either.
+
+    Mutation: print ``record["detail"]`` raw — the token renders and this
+    REDs."""
+    from tortoise.capture_breadcrumb import (
+        read_install_inert_records,
+        render_install_inert_records,
+    )
+
+    token = "ghp_" + "a1B2c3D4e5" * 4
+    _seed_install_record(tmp_path, "hermes",
+                         detail=f"the reflex failed with {token} in argv")
+    out = render_install_inert_records(read_install_inert_records(tmp_path))
+    assert token not in out, out
+    assert "[REDACTED:github_token]" in out, out
+
+
+def test_an_empty_listing_says_so_and_never_claims_health_it_cannot_see():
+    """No records is reported as *nothing recorded*, not as "healthy": the
+    listing cannot see a seam that has never tried, and the wording must not
+    turn the absence of evidence into a verdict.
+
+    Mutation: render an empty string for the empty case — the CLI prints
+    nothing at all and this REDs."""
+    from tortoise.capture_breadcrumb import render_install_inert_records
+
+    assert render_install_inert_records([]) == ""
+    out = render_install_inert_records([], empty=True)
+    assert "No install-inert breadcrumbs were recorded" in out
+    assert "healthy" not in out.lower()

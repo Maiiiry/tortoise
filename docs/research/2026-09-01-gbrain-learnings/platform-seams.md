@@ -239,12 +239,21 @@ docs: "plugins are opt-in"). So the install prints the two required steps
 `hermes plugins enable tortoise-volunteer`), and the plugin writes the same
 `capture-errors/<harness>-install.json` (`kind: install-inert`) breadcrumb the
 shipped shell hooks write when its reflex cannot resolve — an inert install
-must leave evidence, never read as a working seam (#4314). Caveat
-(2026-10-13): unlike the shell seams, whose `session-start.sh` renders the
-record, a capture-less Python plugin has **no automated reader** — `session
-verify` enumerates `capture_install.CAPTURE_SEAM` (no `hermes` arm) and the
-Python renderer owns only `capture-failure`; the record is operator-inspectable
-at its canonical slot, and the reader is tracked by #8360.
+must leave evidence, never read as a working seam (#4314). Correction
+(2026-10-13, resolved by #8360): unlike the shell seams, whose `session-start.sh`
+renders the record, a capture-less Python plugin had **no automated reader** —
+`session verify` enumerates `capture_install.CAPTURE_SEAM` (no `hermes` arm,
+and it fires a capture probe Hermes does not have) and the Python AGENT
+renderer owns only `capture-failure`, so the record was reachable only by
+inspecting its canonical slot by hand. `tortoise session breadcrumbs` now
+reads that slot back on an operator surface: it is GENERIC over
+`~/.tortoise/capture-errors/<harness>-install.json` (the harness is recovered
+from the filename through the one shared derivation), names each record's
+`detail` and slot, and exits non-zero when any evidence exists — so a future
+capture-less seam is reported the day it writes a record. The record is
+also self-clearing: the plugin drops its own record on the first turn where its
+reflex RESOLVES, so the evidence always describes the seam's most recent
+attempt rather than a since-repaired one.
 
 ## Fail-open / fail-closed posture (all seams)
 

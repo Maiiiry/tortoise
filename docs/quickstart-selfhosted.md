@@ -312,6 +312,36 @@ breadcrumb back. Codex and Cursor ship a `session-end.sh` only — they have no
 `SessionStart` hook, so their agents are not told (the breadcrumb is still
 written for them).
 
+### Reading the install evidence back by hand (#8360)
+
+A seam that has **no capture hook** (the Hermes `pre_llm_call` plugin: its
+ingestion rides `tortoise sessions import`) has no `SessionStart` render path at
+all, so `tortoise session verify` cannot report it either — that command's
+harness set *is* the capture seam set, and it fires a capture probe. Its
+`install-inert` record is read back by a generic local reader:
+
+```bash
+tortoise session breadcrumbs              # every recorded install-inert breadcrumb
+tortoise session breadcrumbs --harness hermes
+tortoise session breadcrumbs --json       # machine-readable (records + exit_code)
+```
+
+```text
+code:     install-inert
+harness:  hermes
+when:     2026-10-20T09:00:00Z
+why:      the installed Hermes plugin resolved no tortoise reflex (checked PATH, the installer's ~/.tortoise/hook-src-dir record, and $VIRTUAL_ENV) and injected nothing
+record:   ~/.tortoise/capture-errors/hermes-install.json
+```
+
+It is generic over `~/.tortoise/capture-errors/<harness>-install.json`, names
+the record's own `detail` (so the cause is named, not just the symptom), needs
+**no API key** (local evidence must not be hidden by a broken config), and
+exits `1` when any evidence exists — a record is historical evidence, never a
+"healthy" verdict. A seam clears its own record when its install leg next
+resolves, and `tortoise session verify --harness <name>` re-measures the seams
+it can fire.
+
 ### Upgrading an existing hook install
 
 Installed hooks are per-project copies (`.claude/hooks/session-start.sh`,

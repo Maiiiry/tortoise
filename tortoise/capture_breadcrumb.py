@@ -52,6 +52,19 @@ as injected context.  The recovery half is therefore written as *available
 actions* (``Recovery: `tortoise session drain` retries now``) and never as
 commands (``Run `tortoise session drain` now``).  Do not "fix" this into
 imperatives: an imperative costs the whole payload its context-injection path.
+
+PYTHON SURFACE, TWO REACHABILITY ARGUMENTS (#8360).  The "pure shell" rule
+above governs the AGENT-facing payload and stands — that record is reached
+precisely when the interpreter or the module dir could not be resolved.  It does
+NOT say the ``install-inert`` slot is unreadable from Python: a command the
+OPERATOR runs is, by construction, inside a working interpreter, so
+:func:`read_install_inert_records` / :func:`render_install_inert_records` below
+are the operator LISTING over that slot — a record listing, not a second copy of
+the shell payload's prose (different shape, no recovery prescription, no
+duplicated string).  Until #8360 that listing did not exist, so a CAPTURE-LESS
+Python seam (the Hermes ``pre_llm_call`` plugin) wrote evidence that nothing
+reported, and an inert read seam was indistinguishable from a healthy empty
+graph (``tortoise session breadcrumbs``).
 """
 from __future__ import annotations
 
@@ -60,7 +73,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from tortoise.hook_install import KIND_CAPTURE_FAILURE
+from tortoise.hook_install import KIND_CAPTURE_FAILURE, KIND_INSTALL_INERT
 from tortoise.security import redact_secrets
 
 #: The bounded length of the rendered ``why`` line.  A breadcrumb detail is an
@@ -384,3 +397,188 @@ def render_file(path: str | Path) -> str:
     if not isinstance(data, dict):
         return ""
     return render(data)
+
+
+# ── the OPERATOR surface: install-inert evidence read back (#8360) ────────
+#
+# ⛔ TWO SURFACES, TWO DIFFERENT RULES — NOT TWO COPIES OF ONE PAYLOAD.  The
+# agent-facing payload above is still Python for ``capture-failure`` ONLY, and
+# still shell for ``install-inert`` (see the module docstring): that record is
+# reached BECAUSE the interpreter or the module dir could not be resolved, so a
+# Python renderer could never be the path that tells the agent.
+#
+# The functions below are the OTHER surface, and its reachability argument is
+# the opposite one: a command the OPERATOR runs is, by construction, running in
+# a working interpreter — so the same record that is unreachable from the agent
+# path is perfectly reachable here.  Until #8360 nothing read the
+# ``install-inert`` slot back on a surface a user could reach: ``session
+# verify`` enumerates ``capture_install.CAPTURE_SEAM`` (which deliberately has
+# no ``hermes`` — Hermes has no capture hook, its ingestion rides
+# ``sessions import``), and ``hook_install``+this module's agent renderer only
+# ever answered for the shell seams.  A capture-less Python seam (the Hermes
+# ``pre_llm_call`` plugin, ``tortoise/hermes-plugin/__init__.py``) was therefore
+# indistinguishable from a healthy empty graph: it writes the same record and
+# NOTHING reported it.
+#
+# The payload here is DELIBERATELY A DIFFERENT SHAPE from the four-line agent
+# payload (``code/what/why/next``): it is a RECORD LISTING, so it carries the
+# record's slot path and its own stamp, and it makes no recovery prescription
+# (a listing cannot know which harness's repair applies, and this repo does not
+# prescribe a command that may refuse — see ``hook_install``'s
+# ``_artifact_detail_would_refuse``).  No prose is duplicated from the shell
+# renderer.
+
+#: The listing header/footer.  STATEMENTS, never imperatives and never a
+#: verdict about NOW: a record states what the seam recorded WHEN IT WAS
+#: WRITTEN, which is exactly what makes a capture-less seam's inertness
+#: visible without this module having to re-fire anything.
+_INSTALL_LISTING_FOOTER = (
+    "Install-inert evidence is HISTORICAL: each record states that the seam's "
+    "install leg resolved nothing at the time it was recorded, never that the "
+    "graph was empty. A seam clears its own record when that leg next "
+    "resolves; `tortoise session verify --harness <h>` re-measures the seams "
+    "this verifier can fire and clears a stale record before it does."
+)
+
+
+def install_inert_record_dir() -> Path:
+    """The directory the ``install-inert`` records live in — ONE derivation.
+
+    Delegates to :func:`hook_install.local_state_dir` (the same base
+    ``__main__._capture_error_file``, ``capture_spool`` and the shipped shell
+    hooks derive), so the ``TORTOISE_IMPORT_RECEIPT_DIR`` override is honoured
+    here for free rather than re-spelled.  It can RAISE (that resolver touches
+    ``Path.home()`` only when there is no override), which is why the CLI
+    boundary guards it.
+    """
+    from tortoise.hook_install import local_state_dir
+
+    return local_state_dir("capture-errors")
+
+
+def read_install_inert_records(base: str | Path | None = None) -> list[dict]:
+    """Every well-formed ``install-inert`` record in ``base``, in name order.
+
+    GENERIC BY CONSTRUCTION: the directory is enumerated and the HARNESS is
+    recovered from each filename through the one shared derivation
+    (:func:`hook_install.breadcrumb_harness`), so a future capture-less seam
+    is reported the day it writes a record — no per-harness arm to add, and no
+    closed list that could drift from the writers.
+
+    ⛔ THE READ CONDITION IS THE WRITE CONDITION (the ``session verify`` rule,
+    ``_install_link``): a file counts as evidence ONLY when it parses as a
+    dict AND its ``kind`` marker equals :data:`hook_install.KIND_INSTALL_INERT`.
+    A foreign file dropped in the slot, a corrupt record, a directory, an
+    oversized record, or a legacy ``capture-failure`` record left at a
+    single-slot path can therefore never be reported as an inert install — the
+    same gate that stops a capture outage being read as an install leg.
+
+    Each returned dict is the record itself plus:
+
+    * ``harness`` — the harness named by the record's SLOT, which is what the
+      writers derive their own ``harness`` field from (Python writers go
+      through :func:`hook_install.breadcrumb_name`, the shell ones write
+      ``$crumb_dir/$harness-install.json``), so the two agree by construction.
+      The slot WINS: a foreign file dropped in ``claude-install.json`` that
+      claims ``"harness": "hermes"`` must not be able to label itself as
+      another seam's evidence in a slot-keyed listing;
+    * ``path`` — the slot the record was read from, so an operator can inspect
+      it directly.  It is rendered through the same redact-then-bound path as
+      every other field: a record is attacker-influenceable text.
+    """
+    from tortoise.hook_install import KIND_INSTALL_INERT, breadcrumb_harness
+
+    directory = Path(base) if base is not None else install_inert_record_dir()
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    records: list[dict] = []
+    for entry in entries:
+        harness = breadcrumb_harness(entry.name, KIND_INSTALL_INERT)
+        if harness is None:
+            continue
+        record = _read_record(entry)
+        if record is None or record.get("kind") != KIND_INSTALL_INERT:
+            continue
+        record = dict(record)
+        record["harness"] = harness
+        record["path"] = str(entry)
+        records.append(record)
+    return records
+
+
+def _read_record(path: Path) -> dict | None:
+    """The record at ``path`` bounded and parsed, or ``None``.
+
+    Bounded to :data:`MAX_RECORD_BYTES` exactly like :func:`render_file` — the
+    bound is on the READ, so a multi-megabyte file cannot make this listing
+    O(record).  Unlike ``render_file`` (whose caller must never lose the
+    agent's payload) an oversized or malformed record here is simply not
+    evidence, so it is DROPPED rather than given a synthetic ``why:``: a
+    listing that reported an unparsed file as an inert install would be the
+    false verdict #4314 exists to prevent.
+
+    The read is deliberately NOT factored out of :func:`render_file` into one
+    shared helper: the two differ in exactly one thing, and it is the thing
+    that matters — an oversized record is a SYNTHETIC payload there (the
+    agent must be told something) and NOT EVIDENCE here (nothing may be
+    reported as an inert install on a record nobody could parse).  A shared
+    reader would have to carry both policies, and the policy is the point.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_RECORD_BYTES + 1)
+    except Exception:
+        return None
+    if len(raw) > MAX_RECORD_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def render_install_inert_record(record: dict) -> str:
+    """One listing block for an ``install-inert`` record — never ``""``.
+
+    Not the agent payload: no ``what:``/``next:``, because this is a record
+    listing for an OPERATOR (who is running a working interpreter and can go
+    and look at the slot named on the last line), not injected context.
+    ``why:`` is the record's own ``detail`` — the whole point of #8360 is that
+    the reader NAMES it, so a user can see WHICH cause fired (no reflex
+    resolved vs. every reflex failed) rather than only that something is
+    wrong.  Every value goes through :func:`bound_detail`/:func:`one_line`,
+    so a planted credential cannot render and no field can span lines and
+    forge another.
+    """
+    harness = one_line(str(record.get("harness") or "")) or "unknown"
+    stamp = one_line(str(record.get("recorded_at") or "")) or "an unrecorded time"
+    why = one_line(record.get("detail")) or "no detail was recorded"
+    slot = one_line(str(record.get("path") or "")) or "unknown"
+    return "\n".join((
+        f"{'code:':<{_FIELD_WIDTH}}{KIND_INSTALL_INERT}",
+        f"{'harness:':<{_FIELD_WIDTH}}{harness}",
+        f"{'when:':<{_FIELD_WIDTH}}{stamp}",
+        f"{'why:':<{_FIELD_WIDTH}}{why}",
+        f"{'record:':<{_FIELD_WIDTH}}{slot}",
+    )) + "\n"
+
+
+def render_install_inert_records(records: list[dict], *,
+                                 empty: bool = False) -> str:
+    """The whole operator listing: one block per record plus the footer.
+
+    ``empty=True`` renders the documented no-evidence line — the CLI's own
+    success case — so the wording of "nothing was recorded" is pinned in ONE
+    place instead of being assembled by the caller.
+    """
+    if not records:
+        if not empty:
+            return ""
+        return ("No install-inert breadcrumbs were recorded: no seam on this "
+                "machine has reported that its install leg resolved "
+                "nothing.\n")
+    blocks = [render_install_inert_record(r) for r in records]
+    return "\n".join(blocks) + "\n" + _INSTALL_LISTING_FOOTER + "\n"

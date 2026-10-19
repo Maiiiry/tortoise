@@ -4547,6 +4547,15 @@ def _cmd_session(args) -> int:
         # it just created — refusing it for want of a hosted key would make the
         # one surface that exists to be accurate silent exactly there.
         return _cmd_session_disclosure(args)
+    if args.session_cmd == "breadcrumbs":
+        # #8360: the READER for the local `install-inert` evidence, dispatched
+        # BEFORE the api_key gate for the same reason `spool`/`drain`/
+        # `disclosure` are: it touches no network and no credential, and the
+        # record it reports is written precisely when an install is in
+        # trouble — refusing to show it for want of a hosted key would silence
+        # the diagnostic exactly where it is needed. A broken/absent config must
+        # not hide local evidence.
+        return _cmd_session_breadcrumbs(args)
 
     # Transmitting-identity resolver (#2369 D1.2, #3660): this resolver runs
     # BEFORE dispatch, so the uploaders (`capture`) and the read-only
@@ -4580,8 +4589,78 @@ def _cmd_session(args) -> int:
     elif args.session_cmd == "view":
         return _cmd_session_view(args, api_key, api_url)
     else:
-        print("Unknown session command. Try capture, probe, verify, list, or "
-              "view.", file=sys.stderr)
+        print("Unknown session command. Try capture, probe, verify, "
+              "breadcrumbs, list, or view.", file=sys.stderr)
+        return 1
+
+
+def _cmd_session_breadcrumbs(args) -> int:
+    """`tortoise session breadcrumbs` — the READER for install-inert evidence.
+
+    #8360 closes a capture-less gap: ``tortoise/hermes-plugin/__init__.py``
+    writes the canonical ``~/.tortoise/capture-errors/hermes-install.json``
+    (``kind: install-inert``) record when its reflex resolves nothing, and
+    until this command NOTHING read it back to a user — ``session verify``
+    enumerates ``capture_install.CAPTURE_SEAM`` (no ``hermes``: Hermes has no
+    capture hook, its ingestion rides ``sessions import``), and
+    ``capture_breadcrumb``'s agent renderer deliberately owns only
+    ``capture-failure``.  An inert Hermes read seam therefore read exactly like
+    a healthy empty graph.
+
+    The listing is GENERIC over ``<harness>-install.json`` (the harness comes
+    from the filename through the one shared derivation), so the next
+    capture-less seam is reported without a per-harness arm here, and
+    ``--harness`` is deliberately NOT ``choices=``-restricted: the closed set
+    of capture seams is the wrong set for this slot.
+
+    EXIT CODE: 0 when no evidence was recorded, 1 when at least one record
+    exists.  A record is EVIDENCE, not a live verdict — the payload says so and
+    stamps each record — and the bias is deliberate: reporting "nothing wrong"
+    while an install leg is inert is the defect #4314/#8360 exist to kill,
+    whereas a since-repaired record is refuted by the seam's own next
+    resolution (a seam clears its record when its leg resolves) or by
+    ``tortoise session verify --harness <h>``, which clears a stale install
+    record before it fires.
+    """
+    import json as _json
+
+    from tortoise.capture_breadcrumb import (
+        read_install_inert_records,
+        render_install_inert_records,
+    )
+
+    wanted = getattr(args, "harness", None)
+    try:
+        records = read_install_inert_records()
+        if wanted:
+            records = [r for r in records
+                       if str(r.get("harness") or "") == wanted]
+        exit_code = 1 if records else 0
+        if getattr(args, "json", False):
+            print(_json.dumps({
+                "records": [
+                    {key: r.get(key) for key in
+                     ("harness", "kind", "recorded_at", "detail", "path")}
+                    for r in records
+                ],
+                "exit_code": exit_code,
+            }, indent=2))
+        else:
+            text = render_install_inert_records(records, empty=True)
+            if not records and wanted:
+                text = (f"No install-inert breadcrumb was recorded for "
+                        f"{wanted}: its install leg has not reported "
+                        f"resolving nothing.\n")
+            print(text, end="")
+        return exit_code
+    except MemoryError:
+        raise  # resource exhaustion is not a refusal; the handler allocates
+    except Exception as e:
+        # A catch-all, not an enumeration (#3987/#3988 class): the read path
+        # touches ``Path.home()`` (which can RAISE), the filesystem, and
+        # ``json.loads``, whose raise-set is open-ended.
+        print(f"breadcrumbs failed: {e.__class__.__name__}: {e}",
+              file=sys.stderr)
         return 1
 
 
@@ -11057,6 +11136,34 @@ def main(argv: list[str] | None = None) -> int:
     session_spool.add_argument(
         "--model", default=None, help="Model label to record with the session")
     session_list = session_sp.add_parser("list", help="List all sessions")  # noqa: F841
+    # #8360: the READER for the local `capture-errors/<harness>-install.json`
+    # (``kind: install-inert``) evidence. `session verify` cannot report it for a
+    # CAPTURE-LESS seam (its harness set is `capture_install.CAPTURE_SEAM`, and
+    # it fires a capture probe), and the Python agent renderer owns only
+    # `capture-failure` — so a Hermes install whose reflex resolves nothing left
+    # a record no user surface named. Generic by design (any
+    # `<harness>-install.json` slot), which is why `--harness` filters rather
+    # than restricts: the closed set of capture seams is the WRONG set for a
+    # slot that exists for seams that have no capture leg.
+    session_breadcrumbs = session_sp.add_parser(
+        "breadcrumbs",
+        help="Report the local install-inert breadcrumbs — the evidence an "
+             "inert seam's install leg left behind (#8360)",
+        description="Read back the `capture-errors/<harness>-install.json` "
+                    "(kind: install-inert) records the seams on this machine "
+                    "have written — the evidence an inert install leg left "
+                    "behind. Local only: no API key and no network, so a "
+                    "broken config cannot hide it.",
+        epilog="Exit code: 0 when no install-inert record exists, 1 when at "
+               "least one does (a record is historical evidence, never a "
+               "'healthy' verdict).")
+    session_breadcrumbs.add_argument(
+        "--harness", default=None,
+        help="Only this harness's record (not restricted to the capture "
+             "seams: a capture-less seam such as hermes writes here too)")
+    session_breadcrumbs.add_argument(
+        "--json", action="store_true",
+        help="Emit the machine-readable listing (records + exit_code)")
     session_view = session_sp.add_parser("view", help="View a specific session")
     session_view.add_argument("id", help="Session ID")
     # #3517: the capture disclosure, rendered from runtime structured data. The

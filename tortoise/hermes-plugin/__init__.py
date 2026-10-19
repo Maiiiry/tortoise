@@ -35,6 +35,7 @@ MARKER: tortoise-hermes-plugin — ``tortoise install hermes`` and its
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -78,16 +79,43 @@ _TRUTHY = {"1", "true", "yes", "on"}
 #: indistinguishable to a user.
 #:
 #: NOTE: the record lands in the canonical
-#: ``capture-errors/<harness>-install.json`` slot, but a capture-less Python
-#: seam has NO automated reader yet (unlike the shell seams, whose
-#: ``session-start.sh`` renders ``install-inert``). ``session verify``
-#: enumerates ``capture_install.CAPTURE_SEAM`` and has no ``hermes`` arm
-#: (Hermes has no capture hook — ingestion rides ``sessions import``), and
-#: ``capture_breadcrumb.render()`` deliberately owns only
-#: ``capture-failure``. Do not claim otherwise: the record is
-#: operator-inspectable at its canonical slot, and the missing reader is
-#: tracked by #8360.
+#: ``capture-errors/<harness>-install.json`` slot, which ``tortoise session
+#: breadcrumbs`` READS BACK (#8360) — the generic reader over that slot, added
+#: after this seam was the one writer with no reader. ``session verify`` still
+#: cannot report it (it enumerates ``capture_install.CAPTURE_SEAM`` and has no
+#: ``hermes`` arm — Hermes has no capture hook, its ingestion rides ``sessions
+#: import`` — and it fires a capture probe), and ``capture_breadcrumb``'s
+#: AGENT-facing renderer deliberately still owns only ``capture-failure`` (this
+#: record is reached by the shell seams BECAUSE Python or the module dir could
+#: not be resolved; a command the operator runs is not). Do not "simplify" by
+#: adding ``hermes`` to ``CAPTURE_SEAM``, and do not claim ``session verify``
+#: reads this record.
 _INSTALL_INERT_KIND = "install-inert"
+
+
+def _install_crumb_path() -> Path:
+    """The ``install-inert`` slot this seam owns — ONE derivation.
+
+    Same slot layout as ``hook_install.local_state_dir`` /
+    ``breadcrumb_name``: ``<receipt-dir>.parent/capture-errors/
+    <harness>-install.json``, where the receipt dir is
+    ``$TORTOISE_IMPORT_RECEIPT_DIR`` or ``$HOME/.tortoise/import-receipts``.
+
+    Stdlib-only by construction — this module is loaded by the HOST
+    interpreter and must not import ``tortoise.*`` — so the layout is
+    re-expressed here rather than imported; ``tests/test_hermes_seam.py`` pins
+    it to ``hook_install.breadcrumb_file("hermes", KIND_INSTALL_INERT)`` so the
+    writer and the reader cannot drift. An unset ``$HOME`` falls to the
+    ``/nonexistent`` sentinel (never ``Path("")``, which is the process CWD —
+    an agent-writable workspace, #2121 review).
+    """
+    override = os.environ.get("TORTOISE_IMPORT_RECEIPT_DIR")
+    if override:
+        receipt_dir = Path(override)
+    else:
+        receipt_dir = (Path(os.environ.get("HOME") or "/nonexistent")
+                       / ".tortoise" / "import-receipts")
+    return receipt_dir.parent / "capture-errors" / "hermes-install.json"
 
 
 def _disabled() -> bool:
@@ -98,24 +126,13 @@ def _record_install_inert(detail: str) -> None:
     """Best-effort ``install-inert`` breadcrumb, mirroring the shell hooks.
 
     Same slot layout as ``hook_install.local_state_dir`` /
-    ``breadcrumb_name``: ``<receipt-dir>.parent/capture-errors/
-    <harness>-install.json``, where the receipt dir is
-    ``$TORTOISE_IMPORT_RECEIPT_DIR`` or ``$HOME/.tortoise/import-receipts``.
-
-    Stdlib-only by construction — this module is loaded by the HOST
-    interpreter and must not import ``tortoise.*``. A failed write can never
-    raise into the agent turn, and an unset ``$HOME`` falls to the
+    ``breadcrumb_name`` (see :func:`_install_crumb_path`).  A failed write can
+    never raise into the agent turn, and an unset ``$HOME`` falls to the
     ``/nonexistent`` sentinel (never ``Path("")``, which is the process CWD —
     an agent-writable workspace, #2121 review).
     """
     try:
-        override = os.environ.get("TORTOISE_IMPORT_RECEIPT_DIR")
-        if override:
-            receipt_dir = Path(override)
-        else:
-            receipt_dir = (Path(os.environ.get("HOME") or "/nonexistent")
-                           / ".tortoise" / "import-receipts")
-        crumb = receipt_dir.parent / "capture-errors" / "hermes-install.json"
+        crumb = _install_crumb_path()
         crumb.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "harness": "hermes",
@@ -126,6 +143,29 @@ def _record_install_inert(detail: str) -> None:
         crumb.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except Exception:  # evidence is best-effort, never fatal
         pass
+
+
+def _clear_install_inert() -> None:
+    """Remove this seam's OWN record after a reflex RESOLVES (#8360).
+
+    The record's claim is "the install leg resolved nothing", so a run that
+    resolved a reflex REFUTES it — the same doctrine as
+    ``session_verify._clear_install_inert_breadcrumb`` (which clears the slot
+    immediately BEFORE firing so only the current fire's record can count).
+    Without this, ONE inert turn (e.g. a PATH that briefly lacked
+    ``tortoise``) would leave a record that the reader,
+    ``tortoise session breadcrumbs``, reports indefinitely while every later
+    turn injects normally — the INVERSE of the #4314 defect: a healthy install
+    reading as inert.  What is cleared is evidence that is no longer true, not
+    an outage being hidden: only a reflex that ran and exited 0 gets here.
+
+    Best-effort and stdlib-only, exactly like the writer: a failed unlink can
+    never break an agent turn.
+    """
+    with contextlib.suppress(Exception):
+        # No evidence to remove, no permission, or an unresolvable HOME — all
+        # are the same non-event on the agent path.
+        _install_crumb_path().unlink()
 
 
 def _venv_owner_of(module_dir: Path) -> Path | None:
@@ -241,7 +281,9 @@ def _reflex_block(user_message: str, session_id: str) -> str:
     A turn where NO reflex resolves, or where every resolved reflex FAILS, is
     an inert install or a broken one — not an empty graph — so it leaves an
     ``install-inert`` breadcrumb before returning "" (an empty graph exits 0
-    and stays silent, which is the documented content fail-open).
+    and stays silent, which is the documented content fail-open).  A turn where
+    a reflex RESOLVES clears any earlier record (:func:`_clear_install_inert`),
+    so the evidence on disk always describes the seam's most recent attempt.
     """
     if not user_message.strip():
         return ""
@@ -266,6 +308,9 @@ def _reflex_block(user_message: str, session_id: str) -> str:
             last_error = f"{type(exc).__name__}: {exc}"
             continue
         if proc.returncode == 0:
+            # The install leg RESOLVED and ran: any earlier inert record is
+            # refuted, so it must not keep reporting this install as inert.
+            _clear_install_inert()
             return (proc.stdout or "").strip()
         last_error = f"exit {proc.returncode}"
     _record_install_inert(

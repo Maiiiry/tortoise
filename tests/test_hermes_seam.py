@@ -594,8 +594,8 @@ def _install_inert_crumb(tmp_path) -> Path:
     Derived from the SHARED filename rule (``hook_install.breadcrumb_name``)
     rather than a second literal, so the plugin's stdlib-only mirror of the
     slot (it cannot import ``tortoise.*``) cannot drift from the slot a
-    reader will read. The plugin's automated reader is still missing (#8360);
-    this pins that the record at least lands where that reader must look.
+    reader will read. The record's READER is ``tortoise session breadcrumbs``
+    (#8360) — see ``test_an_inert_hermes_install_is_reported_by_the_reader``.
     """
     from tortoise.hook_install import KIND_INSTALL_INERT, breadcrumb_name
 
@@ -635,6 +635,94 @@ def test_plugin_leaves_install_inert_evidence_when_every_reflex_fails(
         encoding="utf-8"))
     assert record["kind"] == "install-inert"
     assert "failed" in record["detail"]
+
+
+def test_the_plugin_slot_is_the_one_the_reader_enumerates(tmp_path,
+                                                         monkeypatch):
+    """The plugin cannot import ``tortoise.*``, so its slot is a STDLIB MIRROR
+    of the shared derivation — and ``session breadcrumbs`` enumerates the
+    shared one.  Pin the two to each other: the reader is generic over
+    ``capture-errors/<harness>-install.json``, so a mirror that drifted would
+    report nothing at all while the seam went inert (#8360).
+
+    Mutation: rename the slot in the plugin (``hermes.json``, another dir) —
+    the record lands where no reader looks and this REDs."""
+    from tortoise.hook_install import KIND_INSTALL_INERT, breadcrumb_file
+
+    module = _install_and_load(tmp_path, monkeypatch)
+    assert module._install_crumb_path() == breadcrumb_file(
+        "hermes", KIND_INSTALL_INERT)
+
+
+def test_an_inert_hermes_install_is_reported_by_the_reader(
+        tmp_path, monkeypatch):
+    """#8360 end-to-end, on the surface a user runs: an installed Hermes seam
+    whose reflex resolves NOTHING leaves the record, and
+    ``tortoise session breadcrumbs`` reports it — naming the record's
+    ``detail`` — instead of leaving an inert read seam indistinguishable from a
+    healthy empty graph.
+
+    Driven for real: ``install hermes`` writes the plugin, the INSTALLED copy
+    runs with nothing resolvable on PATH, and the real CLI reads it back.
+
+    Mutation: drop the ``session breadcrumbs`` dispatch (or the reader) — the
+    record exists and nothing reports it, which is exactly the filed defect."""
+    module = _install_and_load(tmp_path, monkeypatch)
+    (tmp_path / "bin" / "tortoise").unlink()  # nothing resolvable
+    assert module.on_pre_llm_call(user_message="what do we know?") is None
+
+    r = _run(["session", "breadcrumbs"], _env())
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "install-inert" in r.stdout, r.stdout
+    assert "hermes" in r.stdout, r.stdout
+    # The DETAIL is named — the user learns which cause fired, not just that
+    # something is wrong.
+    assert "resolved no tortoise reflex" in r.stdout, r.stdout
+    assert "hermes-install.json" in r.stdout, r.stdout
+    # Never a healthy verdict on an inert seam.
+    assert "healthy" not in r.stdout.lower(), r.stdout
+
+    # The same facts, machine-readable (a CI/script surface).
+    rj = _run(["session", "breadcrumbs", "--json"], _env())
+    assert rj.returncode == 1, (rj.returncode, rj.stdout, rj.stderr)
+    listing = json.loads(rj.stdout)
+    assert listing["exit_code"] == 1
+    assert listing["records"][0]["harness"] == "hermes"
+    assert listing["records"][0]["kind"] == "install-inert"
+    assert "resolved no tortoise reflex" in listing["records"][0]["detail"]
+
+
+def test_a_resolving_reflex_clears_the_evidence_it_refuted(tmp_path,
+                                                          monkeypatch):
+    """#8360's other direction: the record claims "the install leg resolved
+    nothing", so a turn that RESOLVES a reflex must clear it.  Without the
+    clear, one inert turn reports forever while every later turn injects — a
+    healthy install reading as inert, the inverse of the #4314 defect, and a
+    stale record would make the reader's exit code permanently non-zero.
+
+    Mutation: drop the ``_clear_install_inert()`` call on the rc==0 path — the
+    record survives a resolving reflex and this REDs."""
+    module = _install_and_load(tmp_path, monkeypatch, block=_BLOCK)
+    crumb = _install_inert_crumb(tmp_path)
+    fake = tmp_path / "bin" / "tortoise"
+    healthy = fake.read_text()
+
+    # 1. inert (PATH briefly lost the reflex) -> evidence
+    fake.unlink()
+    assert module.on_pre_llm_call(user_message="how is CI deployed?") is None
+    assert crumb.exists()
+    assert _run(["session", "breadcrumbs"], _env()).returncode == 1
+
+    # 2. the reflex resolves -> the refuted record is gone, and the reader says
+    #    nothing was recorded (not "healthy").
+    fake.write_text(healthy)
+    fake.chmod(0o755)
+    assert module.on_pre_llm_call(user_message="how is CI deployed?") == {
+        "context": _BLOCK}
+    assert not crumb.exists()
+    r = _run(["session", "breadcrumbs"], _env())
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "No install-inert breadcrumbs were recorded" in r.stdout, r.stdout
 
 
 def test_plugin_truthy_mirror_is_the_canonical_vocabulary(tmp_path,
