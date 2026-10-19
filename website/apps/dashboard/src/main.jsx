@@ -605,7 +605,22 @@ function SettingsTab(props) {
   // while `confirmSessionId` stays truthy. Gate the page-level copy on the
   // dialog that ACTUALLY renders, so a delete reason can never be suppressed
   // with no surface left to show it (exactly one visible surface, always).
-  const sessionDeleteArmed = !!confirmSessionId && sessions.some((x) => String(x.id) === confirmSessionId)
+  //
+  // #8670 review P1: the flag therefore models the WHOLE render gate, not just
+  // the list membership. The card lives in the deepest arm of this home's status
+  // chain (`!sessionsLoading && state && sessionsOn && sessionsLoaded`), and any
+  // of those can flip while the dialog is open WITHOUT `sessions` or
+  // `confirmSessionId` changing: a failed background `loadAll` sets
+  // `sessionsLoaded = false` and touches neither (`main.jsx`'s #3520 retry arm),
+  // and a `refreshOnboarding()` landing `session_recording: false` flips
+  // `sessionsOn` with `sessions` intact. A flag blind to those would not change
+  // on that transition, so the inert effect below would neither re-run nor clean
+  // up: the page outside the card would keep `inert` with no dialog left to
+  // release it — the page-wide keyboard lockout that effect exists to prevent.
+  // The flag IS the card's render gate (`{sessionDeleteArmed && `), so the
+  // effect's dependency flips exactly when the card mounts and unmounts.
+  const sessionDeleteArmed = !sessionsLoading && !!state && sessionsOn && sessionsLoaded
+    && !!confirmSessionId && sessions.some((x) => String(x.id) === confirmSessionId)
   // #8670 (a11y): the #2577 APG containment set for the captured-session delete
   // dialog — the last of the aria-modal family to get it. The dialog declared
   // modality but moved no focus out of the page behind it: Tab walked straight
@@ -910,7 +925,12 @@ function SettingsTab(props) {
                 unreadable while the gate stays up. The dialog renders only
                 while its session is still listed, so a successful DELETE
                 closes it and a failed one keeps it armed. */}
-            {confirmSessionId && (() => {
+            {/* #8670 review P1: the render gate IS the derived flag, so the
+                inert effect's dependency cannot drift from "this card actually
+                renders". `ds` is still resolved below (a vanished row must not
+                render a card) — `sessionDeleteArmed` already proves the row is
+                in the list, so that guard is now belt-and-braces. */}
+            {sessionDeleteArmed && (() => {
               const ds = sessions.find((x) => String(x.id) === confirmSessionId)
               if (!ds) return null
               const sessionTypedOk = deleteTypedMatches(sessionConfirmTyped, DELETE_CONFIRM_WORD)
@@ -2842,7 +2862,17 @@ function claimIntentInFlight() {
   // while the id stays set. The effect is keyed on this DERIVED flag for that
   // reason: keyed on the id, a successful delete would unmount the card with the
   // background still marked inert and nothing left to release it.
-  const graphDeleteArmed = !!confirmDeleteId && graphs.some((g) => g.graph_id === confirmDeleteId)
+  //
+  // #8670 review P1: the flag models the WHOLE render gate, not just the live
+  // row. The card renders only when the role still allows it (its gate is
+  // `graphDeleteArmed` below, which includes the role), and `roleIsOwnerAdmin()`
+  // is re-derived from `teams` on every render — a role change landing while the
+  // dialog is open (`refreshTeam` after an org switch, a demotion applied from a
+  // second tab) unmounts the card. A flag without the role would not change on
+  // that transition, so the effect would neither re-run nor clean up and the
+  // page outside the card would keep `inert` with no dialog left to release it.
+  const graphDeleteArmed = roleIsOwnerAdmin() && !!confirmDeleteId
+    && graphs.some((g) => g.graph_id === confirmDeleteId)
   const graphDeleteDialogRef = React.useRef(null)
   const graphDeleteInertRef = React.useRef(null)
   // #2392 minimal set — the restore half (see the key-create dialog above: the
@@ -6434,11 +6464,19 @@ function claimIntentInFlight() {
 
 
   // ── #300: graphs + members + backups (session JWT authed) ──
-  function myRole() {
+  // #8670 review P1: a HOISTED function declaration, not a `const`, on purpose.
+  // The graph-delete background-inert flag (`graphDeleteArmed`) is declared
+  // beside its effect, far ABOVE this line, because it is that effect's
+  // dependency — and the flag has to model the card's WHOLE render gate, which
+  // includes the role. Reading the `isOwnerAdmin` const from up there would be a
+  // TDZ throw (the const is not initialized yet at that point in the render),
+  // so the predicate is a hoisted declaration both sites share: `isOwnerAdmin`
+  // for the render, and the flag for the effect's dependency.
+  function roleIsOwnerAdmin() {
     const t = teams.find((x) => x.org_id === currentOrgId)
-    return t ? t.role : ''
+    return !!t && (t.role === 'owner' || t.role === 'admin')
   }
-  const isOwnerAdmin = myRole() === 'owner' || myRole() === 'admin'
+  const isOwnerAdmin = roleIsOwnerAdmin()
 
   async function loadGraphs(orgId) {
     const tok = sessionTokenRef.current
@@ -11763,7 +11801,7 @@ function claimIntentInFlight() {
                 on top of the 7-day Trash recovery window. Failure keeps the
                 modal open (armed retry) and lands the reason in the
                 page-level banner (#2301). */}
-            {isOwnerAdmin && confirmDeleteId && (() => {
+            {graphDeleteArmed && (() => {
               const dg = graphs.find((x) => x.graph_id === confirmDeleteId)
               if (!dg) return null
               const typedOk = deleteTypedMatches(deleteConfirmTyped)

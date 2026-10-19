@@ -58,6 +58,49 @@ function count(src, needle) {
   return src.split(needle).length - 1
 }
 
+/** The full right-hand side of `const <name> = …` in `src`, multi-line safe.
+ * Stops at the end of the INITIALIZER: it continues while brackets are open, or
+ * the line ends on a continuation operator, or the NEXT line STARTS on one (the
+ * repo's prettier style puts `&&` at the start of the wrapped line). Returns the
+ * expression text so it can be EVALUATED, not merely matched. */
+function constExpr(src, name) {
+  const marker = `const ${name} = `
+  const start = src.indexOf(marker)
+  assert.ok(start >= 0, `expected main.jsx to declare \`${marker.trim()}\``)
+  const lines = src.slice(start + marker.length).split('\n')
+  const out = []
+  let depth = 0
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+    out.push(line)
+    for (const ch of line) {
+      if ('([{'.includes(ch)) depth += 1
+      else if (')]}'.includes(ch)) depth -= 1
+    }
+    const next = (lines[i + 1] ?? '').trim()
+    const continues = depth > 0
+      || /(?:&&|\|\||[?:+.,(])$/.test(line.trim())
+      || /^(?:&&|\|\||\?|:|\.|\+)/.test(next)
+    if (!continues) break
+  }
+  // Drop any trailing line comment so the expression stays evaluable.
+  return out.join('\n').replace(/\/\/+[^\n]*$/gm, '').trim()
+}
+
+/** Evaluate one of main.jsx's derived flags with caller-supplied inputs.
+ *
+ * A SOURCE PIN CANNOT PROVE THIS. The pre-fix flags were `!!id && list.some(…)`
+ * — text that satisfies any regex for “derived from the live list” while
+ * ignoring the rest of the card's render gate (#8670 review P1). Running the
+ * real initializer against the states that matter is the only check that goes
+ * RED on that shape, so the page-lockout guard below drives it. */
+function evalFlag(expr, names, args) {
+  // An expression lifted from the repository's own source, never external input.
+  // eslint-disable-next-line no-new-func
+  const fn = new Function(...names, `return (${expr})`)
+  return fn(...args)
+}
+
 // Both spellings the dashboard uses: JSX `aria-modal="true"` and the
 // createElement modules' `'aria-modal': 'true'`. Deliberately NOT the bare word —
 // `dialogFocus.js` and this change's own comments discuss aria-modal in prose.
@@ -179,12 +222,80 @@ test('#8670: the inert effect cannot outlive its dialog (page-lockout guard)', (
   // list and return null once it is gone, while the id state stays set — so an
   // effect keyed on the id would never clean up and the page would stay `inert`
   // with no dialog to release it. The flag must be DERIVED from the live list.
-  assert.match(mainJsx,
-    /const sessionDeleteArmed = !!confirmSessionId && sessions\.some\(\(x\) => String\(x\.id\) === confirmSessionId\)/,
-    'the session-delete effect must be keyed on the rendered-dialog flag')
-  assert.match(mainJsx,
-    /const graphDeleteArmed = !!confirmDeleteId && graphs\.some\(\(g\) => g\.graph_id === confirmDeleteId\)/,
-    'the graph-delete effect must be keyed on the rendered-dialog flag')
+  //
+  // #8670 review P1 — “the live list” is only PART of the card's render gate.
+  // Both cards also sit behind other conditions that can flip mid-dialog with the
+  // id and the list untouched: the session card is the deepest arm of
+  // `!sessionsLoading && state && sessionsOn && sessionsLoaded`, and the graph
+  // card is gated on the owner/admin role. A flag blind to those does not change
+  // on the transition that unmounts the card, so its effect neither re-runs nor
+  // cleans up and the page keeps `inert` with no dialog left. The guard therefore
+  // does two things: it pins that the flag IS the render gate (one value, so the
+  // two cannot drift), and it EVALUATES the real initializer against every state
+  // in that gate — the assertions the pre-fix expressions fail.
+  assert.match(mainJsx, /\{sessionDeleteArmed && \(\(\) => \{/,
+    'the session-delete card must RENDER from the same flag its inert effect is keyed on')
+  assert.match(mainJsx, /\{graphDeleteArmed && \(\(\) => \{/,
+    'the graph-delete card must RENDER from the same flag its inert effect is keyed on')
+
+  // ── session delete: every condition of the render gate clears the flag ──
+  const sessionFlag = constExpr(mainJsx, 'sessionDeleteArmed')
+  const sessionArmed = (over = {}) => evalFlag(
+    sessionFlag,
+    ['confirmSessionId', 'sessions', 'sessionsOn', 'sessionsLoaded', 'sessionsLoading', 'state'],
+    Object.entries({
+      confirmSessionId: 's7',
+      sessions: [{ id: 's7' }, { id: 's8' }],
+      sessionsOn: true,
+      sessionsLoaded: true,
+      sessionsLoading: false,
+      state: { session_recording: true },
+      ...over,
+    }).map(([, v]) => v))
+  assert.equal(sessionArmed(), true, 'the literal: an armed dialog on a loaded, recording home')
+  // The P1 itself: a failed background `loadAll` sets `sessionsLoaded = false`
+  // and changes NEITHER `sessions` NOR `confirmSessionId` — the card unmounts.
+  assert.equal(sessionArmed({ sessionsLoaded: false }), false,
+    'a failed sessions reload unmounts the card — the flag must clear (page-lockout guard)')
+  // A background `refreshOnboarding()` landing `session_recording: false`.
+  assert.equal(sessionArmed({ sessionsOn: false }), false,
+    'a recording flip unmounts the card — the flag must clear (page-lockout guard)')
+  assert.equal(sessionArmed({ sessionsLoading: true }), false,
+    'the home’s own loading arm does not render the card')
+  assert.equal(sessionArmed({ state: null }), false,
+    'the “couldn’t load capture status” arm does not render the card')
+  // …and the shapes the flag already covered must stay covered.
+  assert.equal(sessionArmed({ confirmSessionId: null }), false, 'no id, no dialog')
+  assert.equal(sessionArmed({ sessions: [{ id: 's8' }] }), false,
+    'a row that leaves the live list unmounts the card')
+
+  // ── graph delete: the role is part of the render gate too ──
+  const graphFlag = constExpr(mainJsx, 'graphDeleteArmed')
+  const graphArmed = (over = {}) => evalFlag(
+    graphFlag,
+    ['roleIsOwnerAdmin', 'confirmDeleteId', 'graphs'],
+    Object.entries({
+      roleIsOwnerAdmin: () => true,
+      confirmDeleteId: 'g1',
+      graphs: [{ graph_id: 'g1' }],
+      ...over,
+    }).map(([, v]) => v))
+  assert.equal(graphArmed(), true, 'the literal: an armed dialog for an owner/admin')
+  // A demotion / org switch re-derives the role and unmounts the card.
+  assert.equal(graphArmed({ roleIsOwnerAdmin: () => false }), false,
+    'a role change unmounts the card — the flag must clear (page-lockout guard)')
+  assert.equal(graphArmed({ confirmDeleteId: null }), false, 'no id, no dialog')
+  assert.equal(graphArmed({ graphs: [{ graph_id: 'g2' }] }), false,
+    'a row that leaves the live list unmounts the card')
+
+  // The predicates the flags are built from must be the LIVE ones: a flag that
+  // re-implemented the role test locally would pass the scenarios above while
+  // the render gate used a different expression.
+  assert.match(mainJsx, /const isOwnerAdmin = roleIsOwnerAdmin\(\)/,
+    'the render gate and the inert flag must read ONE role predicate')
+  assert.match(mainJsx, /function roleIsOwnerAdmin\(\) \{[^}]*t\.role === 'owner' \|\| t\.role === 'admin'/,
+    'the shared role predicate must stay the owner/admin test')
+
   assert.doesNotMatch(mainJsx, /if \(!confirmSessionId \|\| typeof document === 'undefined'\)/,
     'keying the inert effect on the ID would leak `inert` when the row leaves the list')
   assert.doesNotMatch(mainJsx, /if \(!confirmDeleteId \|\| typeof document === 'undefined'\)/,
