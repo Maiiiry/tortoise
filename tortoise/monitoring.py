@@ -659,6 +659,34 @@ JOURNAL_WRITE_FAILURE_COUNT = Counter(
     "tortoise_journal_write_failures_total",
     "JSONL rebuild-journal append failures on a configured journal (#4240)",
 )
+# #9079: a MUTATING statement that reached a journal-backed projection's derived
+# cache OUTSIDE a sanctioned write scope — the §17.1 "second writer" residual,
+# counted by the writer LANE that issued it instead of described in a docstring.
+#
+# WHY A COUNTER AND NOT A REFUSAL. `proj.g.query` is refused on the handle's
+# read-only verbs and raw command channel, but NOT on `query` itself: the
+# recorded #7951 OVERRIDES (docs/plans/2026-10-14-7951-atomic-write-outbox.md)
+# keeps that verb an allowed direct cache write until §17.1's mechanism (1)
+# lands, because unjournaled live writers (class (a)) reach the cache through it
+# and their callers are FAIL-OPEN — closing it today silently stops onboarding
+# writes (`tests/test_7951_enforce_atomic_write.py`
+# `test_onboarding_writes_are_not_refused_on_a_journal_backed_lane` is the P0
+# pin). This counter is the missing half: the residual becomes a MEASUREMENT
+# (`site=` names the writer function, so the conversion worklist is exactly the
+# label set) rather than a claim nothing can check, and it reads 0 the day the
+# door closes.
+#
+# CARDINALITY: the label is derived from a CODE location (`_caller_site`), never
+# from caller-supplied data, so the child set is bounded by the number of writer
+# functions in the package.
+# Single writer: ``record_direct_cache_write`` (the #501/#3677 house shape —
+# callers never touch the metric object directly).
+DIRECT_CACHE_WRITE_COUNT = Counter(
+    "tortoise_direct_cache_writes_total",
+    "Mutating statements reaching a journal-backed cache outside a sanctioned "
+    "scope, by writer lane (§17.1 residual, #9079)",
+    ["site"],
+)
 # #7924 review P2: an audit event that reached NO durable sink — the fallback
 # location could not be resolved, or the JSONL append failed. That write is
 # deliberately fail-soft (audit failure must never break the serving flow —
@@ -1256,6 +1284,29 @@ def journal_write_failure_count() -> int:
     used by ``metrics()`` and by tests (mirrors ``analytics_outcome_counts``).
     """
     return _counter_val(JOURNAL_WRITE_FAILURE_COUNT)
+
+
+def record_direct_cache_write(site: str) -> None:
+    """Count one unauthorized direct cache write, keyed by writer LANE (#9079).
+
+    Called by ``projection._observe_direct_cache_write`` — never by a caller
+    directly (the #501/#3677 house shape). ``site`` is a ``module:function``
+    derived from the issuing code frame, so the label set is the conversion
+    worklist: every child is one function that writes a journal-backed cache
+    without declaring a journaled scope.
+    """
+    DIRECT_CACHE_WRITE_COUNT.labels(site=site or "<unknown>").inc()
+
+
+def direct_cache_write_counts() -> dict[str, int]:
+    """In-process snapshot of ``DIRECT_CACHE_WRITE_COUNT``, keyed by writer lane.
+
+    The readable form of the §17.1 residual census (#9079): ``/metrics`` carries
+    the Prometheus form, ``metrics()`` serves this dict on the health surface
+    (the hosted app has no ``/metrics`` route — the same reason every other
+    ``record_*`` family rides that payload).
+    """
+    return _collect_by_label(DIRECT_CACHE_WRITE_COUNT, "site")
 
 
 def record_audit_fallback_drop(reason: str) -> None:
@@ -4391,6 +4442,14 @@ def metrics(sdk=None, setup_timeout=None) -> dict:
         # app exposes its own health dict and has no `/metrics` route, so a
         # drop there is counted here but not surfaced by that endpoint.
         "audit_fallback_drops": audit_fallback_drop_counts(),
+        # #9079: the §17.1 residual CENSUS — mutating statements that reached a
+        # journal-backed cache outside a sanctioned scope, keyed by writer lane.
+        # It rides this payload for the same reason the two families above do
+        # (the hosted app exposes no `/metrics` route). An EMPTY dict is the
+        # healthy reading on a journal-backed deployment: it means every cache
+        # write in this process declared itself, which is the state §17.1's
+        # mechanism (1) is working toward.
+        "direct_cache_writes": direct_cache_write_counts(),
         # #4095: an allowlist-dropped telemetry key is the same "signal with no
         # channel" class as the audit drop above, and #3821's counter had no
         # production reader at all. It rides THIS payload for the same reason:

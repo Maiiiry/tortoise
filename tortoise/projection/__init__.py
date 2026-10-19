@@ -15,6 +15,7 @@ from __future__ import annotations  # noqa: I001
 
 import bisect
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -32,6 +33,8 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from tortoise.cypher_guard import (  # #3595 `=~` guard — the ONE seam
+    _GRAPH_QUERY_COMMANDS,  # #9079: the raw command channel's query verbs
+    _as_text,  # #9079: the bytes/str decoding the command-channel check needs
     _guard_execute_command,
     _guard_numeric_literals,  # #8479: the SAME domain, on the statement TEXT
     _guard_numeric_params,  # #7174: the store's numeric domain, same seam
@@ -3155,24 +3158,43 @@ def _journal_safe_params(params, cypher=None):
 # closed, which is the direction the definitional rule requires.
 #
 # SCOPE — STATED SO IT IS NOT OVER-READ. This closes the FOLD
-# (`FalkorProjection.apply`) and the public raw-query lane
-# (`FalkorProjection.query`) for a journal-backed projection. It does NOT yet
-# refuse a mutating statement issued straight at the guarded handle
-# (`proj.g.query(...)`). That handle is *also* the live path of every SDK
-# writer — `create_point`'s `CREATE (:Point)`, `update_point`'s
-# `SET n += $props` — so a blanket refusal there would break the product's own
-# write path, not a violation of it: the SDK's live doors journal, and there is
-# no runtime signal at the
-# handle that separates a journaled live write from a direct one. Converting
-# that 300+-site surface is §17.1's mechanism (1), the atomic write, and it is
-# recorded as still-open on `#7951` rather than papered over here.
+# (`FalkorProjection.apply`), the public raw-query lane
+# (`FalkorProjection.query`), and — since `#9079` — EVERY OTHER mutating-capable
+# verb on the guarded handle: `ro_query`, `_query`, `profile`, `explain` and the
+# raw command channel `execute_command` (whose `GRAPH.QUERY` payload carries a
+# Cypher statement no query verb ever sees). It does NOT yet refuse a mutating
+# statement issued through the handle's `query` verb (`proj.g.query(...)`). That
+# handle is *also* the live path of every SDK writer — `create_point`'s
+# `CREATE (:Point)`, `update_point`'s `SET n += $props` — so a blanket refusal
+# there would break the product's own write path, not a violation of it: the
+# SDK's live doors journal, and there is no runtime signal at the handle that
+# separates a journaled live write from a direct one. Converting that 300+-site
+# surface is §17.1's mechanism (1), the atomic write, and it is recorded as
+# still-open on `#7951` rather than papered over here.
 #
-# ⛔ THE RESIDUAL IS THREE ESCAPES, NOT ONE — named so it is stated, not
-# discovered. A writer that wants to write this cache directly has:
-#   1. `proj.g.query("CREATE …")`     — the guarded handle itself (the SDK's
-#      own live lane, above);
+# ⛔ WHY `query` IS STILL OPEN, AND WHAT HAPPENS INSTEAD OF A REFUSAL THERE.
+# This is a RECORDED decision, not an oversight: `#7951`'s plan doc carries the
+# OVERRIDES line that keeps the raw handle an allowed direct cache write until
+# mechanism (1) lands (docs/plans/2026-10-14-7951-atomic-write-outbox.md),
+# because unjournaled live writers — §17.1's class (a) — reach the cache through
+# it and their callers are FAIL-OPEN, so closing it silently stops them.
+# `onboarding.state._run` is the pinned case: it was moved ONTO this handle
+# *because* the public lane refused it, and
+# `tests/test_7951_enforce_atomic_write.py::test_onboarding_writes_are_not_refused_on_a_journal_backed_lane`
+# asserts that it keeps working (#7951's P0). So `#9079` closes the six doors
+# that carry no sanctioned write traffic and makes the seventh MEASURABLE
+# instead: `_observe_direct_cache_write` counts every unauthorized mutating
+# statement on `query` into
+# `tortoise_direct_cache_writes_total{site=<module:function>}`, which is the
+# conversion worklist mechanism (1) needs and a 0-reading once it lands.
+#
+# ⛔ THE RESIDUAL IS THREE ESCAPES, NAMED SO IT IS STATED, NOT DISCOVERED. A
+# writer that wants to write this cache directly has:
+#   1. `proj.g.query("CREATE …")`     — the guarded handle's write verb (the
+#      SDK's own live lane; censused, not refused — see above);
 #   2. `proj.g._g.query("CREATE …")`  — one private hop past the handle into
-#      the raw `_GuardedGraph`;
+#      the raw `_GuardedGraph` (`#9079` also leaves `_g.execute_command` open by
+#      the same hop);
 #   3. `proj.db.select_graph(<g>).query("CREATE …")` — straight at the
 #      falkordb client, naming ANY graph.
 # All three are verified ALLOWED against a journal-backed projection. (2) and
@@ -3186,8 +3208,11 @@ def _journal_safe_params(params, cypher=None):
 class DirectCacheWriteRefused(RuntimeError):
     """§17.1: a write reached the derived cache without authorization.
 
-    Raised when a fold (`FalkorProjection.apply`) or a mutating statement on
-    the public raw-query lane (`FalkorProjection.query`) is issued against a
+    Raised when a fold (`FalkorProjection.apply`) or a mutating statement on a
+    **door that carries no sanctioned write traffic** — the public raw-query
+    lane (`FalkorProjection.query`), the handle's read-only verbs
+    (`_GuardedGraph.ro_query` / `._query` / `.profile` / `.explain`) and the
+    raw command channel (`_GuardedGraph.execute_command`) — is issued against a
     **journal-backed** projection outside a sanctioned scope. The projection is
     the derived cache of a journal; a write it did not receive through its
     journal is the second writer §17.1 forbids.
@@ -3228,6 +3253,161 @@ def _live_write_scope(reason: str = "live-door"):
 def _replay_write_scope():
     """The replay engines' scope: the record came FROM the journal."""
     return _cache_write_authorized("replay")
+
+
+@functools.lru_cache(maxsize=2048)
+def _statement_writes_cached(statement: str) -> bool:
+    """``_statement_writes`` behind a bounded cache (the §17.1 door check).
+
+    WHY IT IS CACHED. ``_refuse_unauthorized_cache_write`` runs on EVERY
+    statement that reaches a projection door, and most of those are READS on a
+    journal-backed projection (`proj.g.query` is the SDK's read lane too, so
+    this runs on the retrieval hot path). The classifier is a handful of
+    regexes over the statement text — measured ~10-20 µs on a 500-character
+    statement — and the statement TEXT of a code literal is one of a few
+    hundred distinct strings repeated for the life of the process. `lru_cache`
+    makes the amortised cost a dict lookup while keeping the memory bounded
+    (``maxsize`` × statement length), which a per-statement regex cannot do.
+
+    The cache is keyed on the statement ALONE — the classifier is pure in that
+    argument (no projection state, no params: ``_statement_writes`` treats the
+    text only), so a hit cannot return another statement's answer.
+    """
+    return _statement_writes(statement)
+
+
+def _refuse_unauthorized_cache_write(proj, statement, *, verb: str) -> None:
+    """§17.1 — the ONE `DirectCacheWriteRefused` decision, shared by every door.
+
+    Every projection door that may carry a mutating statement defers to THIS
+    function, so the doors cannot drift apart (the `#3595` shared-decision
+    pattern: one classifier, one policy, N call sites). ``#9079`` is the reason
+    it is extracted — before this, the same three-line predicate was copy-pasted
+    into `FalkorProjection.query` alone and the handle's five other mutating-
+    capable verbs had no check at all.
+
+    THE POLICY, in the order the checks run (cheapest first):
+
+    1. **No journal ⇒ nothing to enforce.** ``_journal_backed`` is False unless a
+       live door that OWNS a journal bound it (`FalkorProjection._bind_journal`),
+       so an embedded/URI projection never pays more than an attribute read.
+    2. **A sanctioned scope authorizes.** ``_CACHE_WRITE_AUTHORIZED`` is set by
+       the live doors (`_live_write_scope`) and the replay engines
+       (`_replay_write_scope`) for exactly the writes that follow a journal
+       append, and by nothing else — it is not settable from an instance
+       attribute, a constructor argument or an env var.
+    3. **A provable read passes.** ``_statement_writes`` is the SAME conservative
+       classifier the parameter gate uses, so a read costs nothing here and an
+       UNREADABLE statement fails CLOSED — the same direction `#7174`/`#8479`
+       chose, for the same reason (a false "read" lets a second writer through;
+       a false "write" refuses a statement that should have been refused last).
+
+    ``statement=None`` means the caller could not decode a statement out of a
+    channel that normally carries one (the raw ``execute_command`` payload) —
+    that is the unreadable case above, and it refuses.
+
+    The remaining door, stated where the decision is made rather than discovered:
+    ``_GuardedGraph.query`` — the SDK's OWN live write lane — is deliberately NOT
+    behind this refusal. See the SCOPE note in the module comment: the recorded
+    `#7951` OVERRIDES (docs/plans/2026-10-14-7951-atomic-write-outbox.md) keeps
+    that handle an allowed direct cache write until §17.1's mechanism (1) lands,
+    because unjournaled live writers (class (a) — `onboarding.state._run` is the
+    pinned example) reach the cache through it and their callers are FAIL-OPEN.
+    ``_observe_direct_cache_write`` counts that traffic instead, so the residual
+    is measurable while mechanism (1) is in flight.
+    """
+    if not getattr(proj, "_journal_backed", False):
+        return
+    if _CACHE_WRITE_AUTHORIZED.get() is not None:
+        return
+    if statement is not None and not _statement_writes_cached(statement):
+        return
+    shown = " ".join((statement or "<undecodable statement>").split())[:160]
+    raise DirectCacheWriteRefused(
+        f"Refusing a mutating statement on {verb}: this projection is the "
+        "derived cache of a journal "
+        "(docs/architecture/STORAGE-ARCHITECTURE.md §17.1), so a write that "
+        "did not come through its journal is the second writer the rule "
+        "forbids. Write through the journal instead (`TortoiseSDK`'s public "
+        "write API); replay engines run inside `_replay_write_scope()`. "
+        f"statement={shown}"
+    )
+
+
+def _caller_site(skip: int = 0) -> str:
+    """``module:function`` of the first frame outside this module.
+
+    Used ONLY as a metric LABEL (`_observe_direct_cache_write`), so its "site"
+    is a CODE location and the label set is bounded by the number of writer
+    functions in the package — never by caller-supplied data. Frames are walked
+    with ``sys._getframe`` (not ``inspect.stack``) so the cost stays a pointer
+    chase rather than a source-context build on the write path.
+    """
+    import sys
+
+    frame = sys._getframe(1 + skip)
+    here = __file__
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename != here:
+            module = filename.rsplit("/", 1)[-1]
+            return f"{module}:{frame.f_code.co_name}"
+        frame = frame.f_back
+    return "<unknown>"
+
+
+def _observe_direct_cache_write(proj, statement) -> None:
+    """Count — never refuse — a direct cache write on the SDK's write handle.
+
+    `#9079`'s census. The handle refusal is blocked on the recorded `#7951`
+    OVERRIDES (see `_refuse_unauthorized_cache_write`), so the residual has to
+    be MADE VISIBLE instead: this increments
+    ``tortoise_direct_cache_writes_total{site=}`` (one child per writer
+    function), which is the worklist §17.1's mechanism (1) has to convert —
+    "the second writer touches this cache from N places" is a measurement, not
+    a docstring claim. Counting is deliberately separated from refusing so the
+    instrument survives the day the door closes (the census then reads 0).
+
+    Off unless a journal is bound, so the embedded/URI lanes pay one attribute
+    read for it.
+    """
+    if not getattr(proj, "_journal_backed", False):
+        return
+    if _CACHE_WRITE_AUTHORIZED.get() is not None:
+        return
+    if not _statement_writes_cached(statement):
+        return
+    from tortoise.monitoring import record_direct_cache_write
+
+    record_direct_cache_write(_caller_site(1))
+
+
+def _execute_command_statement(args):
+    """``(verb, statement)`` for a raw command payload; ``(None, None)`` when N/A.
+
+    The four ``GRAPH.*`` query verbs carry their Cypher at ``args[2]``
+    (``(cmd, graph_name, cypher, ...)``) — the same positional contract
+    ``cypher_guard._guard_execute_command`` parses, and this function reads it
+    the same way rather than inventing a second shape. Every other command
+    (``GRAPH.DELETE``, ``EXISTS``, ``GRAPH.CONFIG``, a non-``GRAPH`` command) has
+    no statement at all and returns ``(None, None)``; the ``#9079`` authority
+    decision only applies to the query verbs.
+
+    A query verb whose statement argument is missing or is not text (a malformed
+    payload: the vendor always passes ``str``) returns ``(verb, None)`` — the
+    caller turns that into a REFUSAL, because an undecodable payload on a
+    write-capable channel must fail CLOSED rather than ride through unexamined.
+    ``bytes`` payloads ARE decoded (``cypher_guard._as_text``): redis-py accepts
+    the bytes form of every command, so a bytes statement is readable, not
+    malformed.
+    """
+    if len(args) < 3:
+        return None, None
+    verb = _as_text(args[0])
+    if not isinstance(verb, str) or verb.upper() not in _GRAPH_QUERY_COMMANDS:
+        return None, None
+    statement = _as_text(args[2])
+    return verb, (statement if isinstance(statement, str) else None)
 
 
 class _GuardedGraph:
@@ -3303,6 +3483,13 @@ class _GuardedGraph:
         # #8479: the OTHER half of that domain — a number written into the
         # statement's own TEXT, which no param map can carry.
         _guard_numeric_literals(cypher)
+        # #9079: the census. This verb is the SDK's OWN live write lane and the
+        # unjournaled class (a) writers' lane, so it is COUNTED, not refused —
+        # see `_observe_direct_cache_write` for why the refusal is blocked on
+        # the recorded #7951 OVERRIDES. Placed before the bulk-wipe check so a
+        # statement that is going to be refused anyway is still counted (the
+        # count is "writes the cache could receive", not "writes that ran").
+        _observe_direct_cache_write(self._proj, cypher)
         if _is_bulk_wipe(cypher):
             self._proj._assert_test_graph(
                 "REFUSING to run bulk DETACH DELETE on non-test graph"
@@ -3324,6 +3511,14 @@ class _GuardedGraph:
         _guard_unsupported_cypher(cypher)
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
+        # #9079 §17.1: a DECLARED read-only verb carries no sanctioned write
+        # traffic anywhere in the package (`grep`-verified before the guard was
+        # added), so a mutating statement here is a second writer by
+        # definition and is refused on the shared decision. A read never
+        # reaches `_statement_writes`' write branch, so this is free on the
+        # lane it serves.
+        _refuse_unauthorized_cache_write(
+            self._proj, cypher, verb="`proj.g.ro_query`")
         cypher = self._bar(cypher)
         return self._g.ro_query(
             cypher, params=_journal_safe_params(params, cypher), timeout=timeout
@@ -3335,6 +3530,11 @@ class _GuardedGraph:
         _guard_unsupported_cypher(cypher)
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
+        # #9079 §17.1: same decision, same reason as `ro_query` above — this is
+        # the vendor's internal verb, never a sanctioned SDK write lane (the SDK
+        # writes through `query`).
+        _refuse_unauthorized_cache_write(
+            self._proj, cypher, verb="`proj.g._query`")
         cypher = self._bar(cypher)
         return self._g._query(
             cypher, params=_journal_safe_params(params, cypher),
@@ -3347,6 +3547,13 @@ class _GuardedGraph:
         _guard_unsupported_cypher(cypher)
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
+        # #9079 §17.1: PROFILE/EXPLAIN do not execute the write, but they DO
+        # put the statement on the wire on a channel nothing else authority-
+        # checks. Refusing here is what keeps the VERB enumeration closed: a new
+        # mutating-capable verb has to make the same decision (see
+        # `tests/test_9079_raw_handle_write_authority.py`).
+        _refuse_unauthorized_cache_write(
+            self._proj, cypher, verb="`proj.g.profile`")
         cypher = self._bar(cypher)
         return self._g.profile(cypher, params=_journal_safe_params(params, cypher))
 
@@ -3354,6 +3561,9 @@ class _GuardedGraph:
         _guard_unsupported_cypher(cypher)
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
+        # #9079 §17.1: same decision as `profile` above.
+        _refuse_unauthorized_cache_write(
+            self._proj, cypher, verb="`proj.g.explain`")
         cypher = self._bar(cypher)
         return self._g.explain(cypher, params=_journal_safe_params(params, cypher))
 
@@ -3365,6 +3575,22 @@ class _GuardedGraph:
         # #7162: the returned args carry the `WITH *` barrier when the shape
         # needs it, so they — not the original `args` — are what gets dispatched.
         args = _guard_execute_command(args, getattr(self._g, "client", None))
+        # #9079 §17.1: the raw command channel is a WRITE door that bypassed
+        # every authority check — `proj.g.execute_command("GRAPH.QUERY", <g>,
+        # "CREATE …")` reached the cache directly even though
+        # `FalkorProjection.query` (the lane the same statement would take
+        # twenty lines away) refuses it. No repo code sends a mutating
+        # `GRAPH.QUERY` through this channel (the one caller, `sdk.py`'s
+        # `EXISTS` probe, is not a `_GRAPH_QUERY_COMMANDS` verb), so closing it
+        # costs the product's write lane nothing.
+        #
+        # A `_GRAPH_QUERY_COMMANDS` payload whose statement cannot be read is
+        # passed to the decision as `None` — which REFUSES (fail closed), the
+        # same direction `_statement_writes` fails for an unreadable statement.
+        verb, statement = _execute_command_statement(args)
+        if verb is not None:
+            _refuse_unauthorized_cache_write(
+                self._proj, statement, verb="`proj.g.execute_command`")
         return self._g.execute_command(*args, **kwargs)
 
     def __getattr__(self, name):
@@ -13632,21 +13858,17 @@ class FalkorProjection(
         # (`proj.g.query` is the SDK's write lane); it is the raw lane a caller
         # reaches for when it wants to write the cache without the projection,
         # and a mutating statement here is exactly the second writer §17.1
-        # forbids. Reads pass unchanged; the classifier is the same
-        # conservative `_statement_writes` the parameter gate uses, so an
-        # unreadable statement fails CLOSED.
-        if self._journal_backed and _CACHE_WRITE_AUTHORIZED.get() is None \
-                and _statement_writes(cypher):
-            raise DirectCacheWriteRefused(
-                "Refusing a mutating statement on the raw-query lane: "
-                "`FalkorProjection.query` bypasses the projection and this "
-                "projection is the derived cache of a journal "
-                "(docs/architecture/STORAGE-ARCHITECTURE.md §17.1). Write "
-                "through the journal instead (`TortoiseSDK._apply_and_journal` "
-                "or the SDK's public write API); replay engines run inside "
-                "`_replay_write_scope()`. statement="
-                + " ".join((cypher or "").split())[:160]
-            )
+        # forbids. Reads pass unchanged.
+        #
+        # #9079: the decision itself now lives in ONE shared function
+        # (`_refuse_unauthorized_cache_write`), called by this lane AND by the
+        # handle's read-only verbs and raw command channel. Before that, each
+        # door carried its own copy (this one did; the other five had none), so
+        # a change to the classifier or the policy could reach one door and
+        # miss the rest — the drift `#3595` fixed for the `=~` guard by sharing
+        # `_guard_unsupported_cypher`.
+        _refuse_unauthorized_cache_write(
+            self, cypher, verb="the raw-query lane (`FalkorProjection.query`)")
         # L2 guard (#99): refuse bulk graph-wipe on non-test graphs. There is
         # NO bypass attribute (#2944 removed `_skip_guard`): this path is
         # unconditional, exactly like _GuardedGraph.query. The authorized

@@ -102,6 +102,20 @@ surfaces:
   # subjects span `projection/` (core), `sdk.py`, `api.py` (api),
   # `backup.py`/`consistency.py`/`mining.py` (core), and `__main__.py` (api).
   - test_7951_enforce_atomic_write.py
+  # #9079: the OTHER mutating-capable doors on the projection's guarded handle.
+  # `proj.g.ro_query` / `._query` / `.profile` / `.explain` and the raw command
+  # channel (`.execute_command` with a `GRAPH.QUERY` payload) now make the SAME
+  # §17.1 authority decision as `FalkorProjection.query` (one shared
+  # `_refuse_unauthorized_cache_write`), and the one door deliberately left open
+  # — `proj.g.query`, the SDK's own live write lane (#7951 OVERRIDES) — is
+  # CENSUSED into `tortoise_direct_cache_writes_total{site=}` so the residual is
+  # measurable. Subjects: `tortoise/projection/__init__.py`,
+  # `tortoise/cypher_guard.py` (the command-channel verbs) and
+  # `tortoise/monitoring.py` (the counter + its `metrics()` reader) — the same
+  # subjects as the #7951 enforcement suite below, so it rides the same six
+  # surfaces: each of them REPLACES the `core` fallback, and an unregistered file
+  # is selected by no diff at all (#2938/#1349 silent-drop class).
+  - test_9079_raw_handle_write_authority.py
   - test_7951_create_point_outbox.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
@@ -1365,6 +1379,8 @@ surfaces:
   # `sdk.py` are this guard's subjects; an `sdk.py`-only change selects the
   # full matrix, and a `projection/`-only change falls through to `core`.
   - test_7951_enforce_atomic_write.py
+  # #9079: same door-inventory subject as the #7951 enforcement suite above — registered here for the same reason (this surface REPLACES the `core` fallback).
+  - test_9079_raw_handle_write_authority.py
   - test_7951_create_point_outbox.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
@@ -3499,6 +3515,8 @@ surfaces:
   # #1349/#2938 silent-drop class; full rationale in the `api` entry).
   - test_7951_write_doors.py
   - test_7951_enforce_atomic_write.py
+  # #9079: same door-inventory subject as the #7951 enforcement suite above — registered here for the same reason (this surface REPLACES the `core` fallback).
+  - test_9079_raw_handle_write_authority.py
   - test_7951_create_point_outbox.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
@@ -3663,6 +3681,8 @@ surfaces:
   # (the #1349/#2938 silent-drop class; full rationale in the `api` entry).
   - test_7951_write_doors.py
   - test_7951_enforce_atomic_write.py
+  # #9079: same door-inventory subject as the #7951 enforcement suite above — registered here for the same reason (this surface REPLACES the `core` fallback).
+  - test_9079_raw_handle_write_authority.py
   - test_7951_create_point_outbox.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
@@ -3947,6 +3967,8 @@ surfaces:
   # #1349/#2938 silent-drop class; full rationale in the `api` entry).
   - test_7951_write_doors.py
   - test_7951_enforce_atomic_write.py
+  # #9079: same door-inventory subject as the #7951 enforcement suite above — registered here for the same reason (this surface REPLACES the `core` fallback).
+  - test_9079_raw_handle_write_authority.py
   - test_7951_create_point_outbox.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
@@ -4220,6 +4242,8 @@ surfaces:
   # silent-drop class; full rationale in the `api` entry).
   - test_7951_write_doors.py
   - test_7951_enforce_atomic_write.py
+  # #9079: same door-inventory subject as the #7951 enforcement suite above — registered here for the same reason (this surface REPLACES the `core` fallback).
+  - test_9079_raw_handle_write_authority.py
   - test_7951_create_point_outbox.py
   # #5045 review P1: the cost-dimension CENSUS walks every tracked `.py`, and
   # `tortoise/embeddings.py` / `cross_lens.py` select `eval`, REPLACING the `core`
