@@ -21266,11 +21266,20 @@ class TortoiseSDK:
         """
         proj = self._get_proj()
         # #689: retracted points must not feed Beta priors into EP.
-        rows = proj.g.query(
-            "MATCH (n:Point) WHERE n.baseline_set = true AND n.ep_alpha IS NOT NULL "
-            "AND (n.status IS NULL OR n.status <> 'retracted') "
-            "RETURN n.id, n.ep_alpha, n.ep_beta"
-        ).result_set
+        # #9063: the sweep runs per epistemic label because a persisted prior on
+        # a Subject/Object/Event was never loaded — MEASURED before the fix: a
+        # Subject carrying ``ep_alpha=20`` ran as ``Beta(1,1)`` and shipped
+        # ``confidence`` 0.5088 (``_evidence`` never held its id). Calibrating a
+        # non-Point node without this is a write EP IGNORES, which is worse than
+        # the gate refusing the run: it would report a prior-read belief that was
+        # never read.
+        rows: list = []
+        for _q in epistemic_label_queries(
+                "MATCH (n:{label}) WHERE n.baseline_set = true "
+                "AND n.ep_alpha IS NOT NULL "
+                "AND (n.status IS NULL OR n.status <> 'retracted') "
+                "RETURN n.id, n.ep_alpha, n.ep_beta"):
+            rows.extend(proj.g.query(_q).result_set)
         for pid, alpha, beta in rows:
             if pid not in self._evidence:
                 self._evidence[pid] = (alpha, beta)
@@ -21436,10 +21445,22 @@ class TortoiseSDK:
         )
         if source != BASELINE_SOURCE_INHERITED:
             _set_clause += ", n.credibility = null, n.baseline_system_default = null"
-        written = proj.g.query(
-            f"MATCH (n:Point {{id: $id}}) SET {_set_clause} RETURN n.id",
-            params={"id": claim_id, "a": alpha, "b": beta, "src": source},
-        ).result_set
+        # #9063: an id-anchored sweep per epistemic label (the #7853 index
+        # rule), not ``MATCH (n:Point {id:$id})``. Confidence propagates across
+        # ALL FOUR epistemic labels (#7813/#7853 owner ruling) and EP reads a
+        # Subject/Object/Event operand exactly as it reads a Point — but this
+        # writer could only reach a ``:Point``. MEASURED before the fix: on a
+        # ``:Subject`` it returned ``{'alpha': 5.0, 'beta': 2.0, ...}`` while
+        # the graph kept ``ep_alpha``/``baseline_set`` NULL, so the
+        # calibration gate's ``:Subject`` hole had NO write that could close
+        # it — the state was permanent, not merely unset.
+        written = []
+        for _q in epistemic_label_queries(
+                f"MATCH (n:{{label}} {{id: $id}}) SET {_set_clause} RETURN n.id"):
+            written.extend(proj.g.query(
+                _q,
+                params={"id": claim_id, "a": alpha, "b": beta, "src": source},
+            ).result_set)
         # #2884 D3/FIX-3: a baseline clears the posteriors LIVE (`null`), so a
         # rebuild must replay the CLEAR or it resurrects the stale posteriors
         # the live graph no longer holds. `RETURN n.id` binds the journal to
@@ -22219,65 +22240,191 @@ class TortoiseSDK:
             scope.update(inputs)
         return scope
 
+    @staticmethod
+    def _ep_gate_universe_clauses(alias: str) -> str:
+        """#9063: the calibration gate's participant predicate, ONE declaration.
+
+        "Has no baseline yet, is not an operator node, and is one EP's live set
+        admits" — the three clauses every shape of
+        ``_uncalibrated_ep_participants`` composes. ``alias`` is the Cypher
+        node variable.
+
+        Two of them were WRONG before #9063, in ways that made a node EP reads
+        and writes invisible to the gate:
+
+          * ``is_operator`` — the absence-or-false form, exactly as EP's own
+            factor extraction spells it (``_affected_factors`` Batch 3,
+            #3139/#3154). A bare ``= false`` drops every legacy plain node on
+            a graph written before the property existed (or a GRAPH.COPY'd
+            one), so the gate saw an empty universe and passed.
+          * liveness — the shared ``_live_only``, which is the run's OWN live
+            set (not draft, not terminal, and not the legacy
+            ``outdated=true`` flag). It replaces the hand-rolled
+            draft/terminal Python mirror the gate used to carry.
+        """
+        return (
+            f"coalesce({alias}.baseline_set, false) = false "
+            f"AND ({alias}.is_operator IS NULL OR {alias}.is_operator = false) "
+            f"AND {_live_only(f'{alias}.status')}"
+        )
+
+    #: Evidence point kinds the gate polices when it has NO run selection to
+    #: scope to (#344/#1157/#2199). A structural kind (diary, session, issue…)
+    #: is not an authored belief, so demanding a prior of one is noise — unless
+    #: EP actually CONSUMES it, in which case the factor sweep gates it whatever
+    #: kind it carries (#9063's third axis).
+    _EP_EVIDENCE_KINDS: tuple[str, ...] = (
+        "statement", "observation", "hypothesis")
+
+    def _uncalibrated_ep_participants(
+            self, scope: set[str] | None = None) -> list[str]:
+        """#9063: ids of the belief-bearing nodes EP consumes that have no prior.
+
+        This is the calibration gate's UNIVERSE, expressed in EP's own terms.
+        Before #9063 the universe was a graph-wide ``calibrate_summary()``
+        intersection — ``MATCH (n:Point)`` AND ``n.is_operator = false`` AND
+        ``pointKind <> 'assessment'`` AND an evidence-kind filter — while the
+        run's participant set is wider on three independent axes (label,
+        ``is_operator`` shape, ``pointKind``). A node EP READS AND WRITES was
+        therefore invisible to the gate: measured on the embedded engine, a
+        ``:Subject`` operator operand ran EP with no raise and had
+        ``n.confidence`` (0.5088456) stamped, and the ``:Event`` and
+        ``assessment`` classes measured the same. A gate that cannot see a
+        participant is as wrong as a gate that sees too much.
+
+        Two shapes, because the two callers know different things:
+
+        * ``scope`` given (#7739's computed run selection) — an id-anchored
+          sweep per epistemic label (``epistemic_label_queries``, the #7853
+          index rule). Scope members are factor participants BY CONSTRUCTION:
+          ``_ep_run_scope`` unions the affected claims with every factor
+          INPUT. So no label / ``is_operator`` / ``pointKind`` filter may be
+          re-applied here — an in-scope node is one the run consumes, whatever
+          it happens to be called.
+
+        * ``scope is None`` — the whole-graph posture of ``dream`` /
+          ``get_confidence`` / the no-arg ``compute_confidence``, which have no
+          computed selection. Three sweeps, whose UNION is the universe:
+          (1) the pre-#7739 evidence-kind Point posture, preserved verbatim in
+          substance so an unwired authored claim still fails closed there;
+          (2) every OPERATOR OPERAND (EP's factor shape, any label, any kind);
+          (3) both endpoints of every operator-less ``IMPL|NAND`` direct edge
+          (#888 W5), which is a factor shared by its endpoints.
+
+        Deliberately NOT here: a blanket "every epistemic node" sweep. Session
+        Events, diary Points and other structural nodes are created without a
+        baseline by design, so gating them WOULD freeze every whole-graph EP
+        surface on any real graph. Only nodes EP actually consumes are gated.
+
+        Always returns ids, never the audit dicts: the per-row ``provenance`` /
+        guidance rendering stays in ``calibrate_summary()`` (the human audit
+        surface), off the gate's path.
+        """
+        g = self._get_proj().g
+        found: set[str] = set()
+        if scope is not None:
+            # An EMPTY scope is a real scope — nothing reachable, nothing to
+            # gate — and is never treated as ``None`` (#7739).
+            if not scope:
+                return []
+            params = {"ids": sorted(scope)}
+            for _q in epistemic_label_queries(
+                    "MATCH (n:{label}) WHERE n.id IN $ids AND "
+                    + self._ep_gate_universe_clauses("n") + " RETURN n.id"):
+                found.update(r[0] for r in g.query(_q, params=params).result_set)
+            return sorted(found)
+
+        # (1) Pre-#7739 whole-graph posture: an uncalibrated, unwired authored
+        # claim still blocks the surfaces that have no selection.
+        rows = g.query(
+            "MATCH (n:Point) WHERE " + self._ep_gate_universe_clauses("n")
+            + " AND n.pointKind IN $kinds RETURN n.id",
+            params={"kinds": list(self._EP_EVIDENCE_KINDS)},
+        ).result_set
+        found.update(r[0] for r in rows)
+        # (2) EP's operator factor: every operand of a live operator, whatever
+        # label (Subject/Object/Event, #7853) or kind (assessment, diary…,
+        # #9063) it carries. Anchored on the operator, so no label scan.
+        rows = g.query(
+            "MATCH (o:Point)-[:IMPL|NAND]->(c) WHERE "
+            "(o.is_operator = true OR o.op_type IS NOT NULL) "
+            f"AND {_live_only('o.status')} "
+            f"AND {epistemic_disjunction('c')} "
+            "AND (c.is_operator IS NULL OR c.is_operator = false) "
+            f"AND coalesce(c.baseline_set, false) = false "
+            f"AND {_live_only('c.status')} "
+            "RETURN DISTINCT c.id",
+        ).result_set
+        found.update(r[0] for r in rows)
+        # (3) Operator-less direct edges (#888 W5): the edge IS the factor and
+        # BOTH endpoints are its inputs — `create_direct_edge` admits all four
+        # epistemic labels on either end (#7902), so neither side may be
+        # assumed to be a Point.
+        rows = g.query(
+            "MATCH (a)-[:IMPL|NAND]->(b) WHERE "
+            f"{epistemic_disjunction('a')} "
+            f"AND {epistemic_disjunction('b')} "
+            "AND (a.is_operator IS NULL OR a.is_operator = false) "
+            "AND (b.is_operator IS NULL OR b.is_operator = false) "
+            "AND a.op_type IS NULL AND b.op_type IS NULL "
+            f"AND {_live_only('a.status')} "
+            f"AND {_live_only('b.status')} "
+            "AND (coalesce(a.baseline_set, false) = false "
+            "     OR coalesce(b.baseline_set, false) = false) "
+            "RETURN DISTINCT a.id, coalesce(a.baseline_set, false), "
+            "       b.id, coalesce(b.baseline_set, false)",
+        ).result_set
+        for a_id, a_cal, b_id, b_cal in rows:
+            if not a_cal:
+                found.add(a_id)
+            if not b_cal:
+                found.add(b_id)
+        return sorted(found)
+
     def _ensure_calibrated(self, surface: str, *,
                            scope: set[str]
                            | Callable[[], set[str]] | None = None) -> None:
         """#1157: shared calibration gate for EP surfaces.
 
-        Raises CalibrationError when evidence-kind Points (statement /
-        observation / hypothesis) are uncalibrated (no baseline). Extracted
+        Raises CalibrationError when a node EP CONSUMES has no prior. Extracted
         from compute_confidence's require_calibration gate so dream and
         get_confidence share the SAME check — the #7478 target is zero EP
         surfaces running uncalibrated EP silently, not just the explicit
         compute_confidence surface (#344 only covers the explicit surface).
 
+        #9063: the universe is ``_uncalibrated_ep_participants`` — EP's own
+        participant predicate — not a graph-wide ``calibrate_summary()``
+        intersection. That intersection was narrower than the run's
+        participant set on three axes (``:Point`` only; ``is_operator =
+        false``; ``pointKind <> 'assessment'``), so a ``:Subject`` / ``:Event``
+        / assessment-kind node could be read AND written by EP with no raise.
+        The graph-wide scan also left the gate's hot path.
+
         Args:
             surface: human-readable caller name for the error message
                 (e.g. "dream", "get_confidence").
-            scope: #7739 — either the set of Point ids the caller's EP run can
+            scope: #7739 — either the set of ids the caller's EP run can
                 actually consume (see ``_ep_run_scope``), or a zero-arg
-                callable returning that set. A CALLABLE is evaluated lazily,
-                only when the graph already has at least one uncalibrated
-                evidence point — so a fully calibrated graph (the common
-                case) pays NOTHING for scoping. ``None`` (default) keeps the
-                whole-graph posture for callers without a computed selection
-                (dream, get_confidence, the no-arg compute_confidence path).
-                An EMPTY set is a real scope (nothing reachable → nothing to
-                gate) and is never treated as ``None``.
+                callable returning that set. A CALLABLE is evaluated only here
+                (the caller must not derive a selection the graph does not
+                need) and its result is then queried id-anchored, so a scoped
+                call never runs a graph-wide sweep. ``None`` (default) keeps
+                the whole-graph posture for callers without a computed
+                selection (dream, get_confidence, the no-arg
+                compute_confidence path). An EMPTY set is a real scope (nothing
+                reachable → nothing to gate) and is never treated as ``None``.
         """
         from .exceptions import CalibrationError
-        summary = self.calibrate_summary()
-        evidence_kinds = {"statement", "observation", "hypothesis"}
-        uncalibrated = [
-            s for s in summary
-            if not s["calibrated"] and s.get("pointKind") in evidence_kinds
-            # #780/PR #1212: draft points never feed EP (factor extraction
-            # and propagation exclude them by default) — demanding
-            # calibration of a draft is noise; the gate only guards live
-            # evidence. Status NULL = live, mirroring _live_only.
-            and s.get("status") != "draft"
-            # #7739: the same rule extends to TERMINAL points — EP's live set
-            # is ``_live_only`` (live.py) = not draft AND NOT terminal, so a
-            # retracted / superseded / outdated / archived point (or the
-            # legacy ``outdated=true`` flag invalidate_point writes without a
-            # status) is one EP will never consume. Demanding its calibration
-            # is the same noise as demanding a draft's. The shared #2498
-            # Python mirror keeps the vocabulary from drifting; status NULL =
-            # live, mirroring _live_only.
-            and not is_terminal_status(s.get("status"),
-                                       s.get("outdated", False))
-        ]
-        # #7739: only now, and only if there is something to scope, ask the
-        # caller for the run's consumed set — an uncalibrated point INSIDE it
-        # still raises; an unrelated lane's point stops freezing this caller.
-        if uncalibrated and scope is not None:
-            scope_set = scope() if callable(scope) else scope
-            uncalibrated = [s for s in uncalibrated if s["id"] in scope_set]
+        scope_set = (scope() if callable(scope) else scope) if scope is not None else None
+        uncalibrated = self._uncalibrated_ep_participants(scope_set)
         if uncalibrated:
-            ids = [s["id"] for s in uncalibrated[:10]]
+            ids = uncalibrated[:10]
             msg = (
-                f"{surface}: {len(uncalibrated)} uncalibrated evidence points. "
-                f"First 10: {ids}. Run calibrate_summary() for full guidance."
+                f"{surface}: {len(uncalibrated)} uncalibrated EP participants. "
+                f"First 10: {ids}. Set a prior with set_point_baseline(<id>, "
+                f"alpha, beta) — it writes any epistemic node (Point, Subject, "
+                f"Object, Event). Run calibrate_summary() for Point-level "
+                f"guidance."
             )
             raise CalibrationError(msg)
 

@@ -599,8 +599,12 @@ def test_pinned_gap__non_point_write_is_not_graph_persisted():
         assert sorted(s1._dirty_roots) == [obj, sub], (
             "in-process mirror only")
 
-        # the write-triggered local dream selects nothing for these roots
-        d = s1.dream(mode="local")
+        # the write-triggered local dream selects nothing for these roots.
+        # #9063: the calibration gate is bypassed on purpose HERE — this test
+        # pins the DIRTY-ROOT lifecycle, and an uncalibrated non-Point
+        # participant now (correctly) fails the gate closed before the dream
+        # selector runs, which would mask the gap being pinned.
+        d = s1.dream(mode="local", require_calibration=False)
         assert d["affected_claims"] == []
         assert d["iterations"] == 0
 
@@ -608,7 +612,7 @@ def test_pinned_gap__non_point_write_is_not_graph_persisted():
         s1.close()
         s2 = TortoiseSDK(db)
         assert s2._hydrate_dirty_roots() == set()
-        assert s2.compute_confidence()["iterations"] == 0
+        assert s2.compute_confidence(require_calibration=False)["iterations"] == 0
 
         # CONTROL: a :Point endpoint takes the pre-existing persisted path.
         pt = _point(s2, "ctrl-7902-pin")
