@@ -6271,14 +6271,19 @@ durations:
   # #9190: a file ADDED BY A PR can never have a CI duration at PR time —
   # `tools/ci_timing.py --refresh-durations` samples push-to-main runs only — so
   # this row carries a LOCAL measurement rather than waiting for one. Measured on
-  # this host 2026-10-19 at the PR head:
+  # this host 2026-10-19 at head 4836c671c, where THIS file defines 42 tests and
+  # the #5612 sibling above defines 16 (58 together):
   # `TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest
-  # tests/test_9190_journal_position.py -q` -> "37 passed in 2.95s", with
-  # "53 passed in 6.77s" for this file plus the #5612 suite. The repo's durations
-  # coverage floor (`DURATION_COVERAGE_MIN = 0.90`) sat at 0.9003 with this file
-  # unweighted — 0.3 files of headroom — so the row is not cosmetic: one more
-  # unmeasured fast file tips `--integrity` red. Refresh from the first
-  # post-merge push run that includes the file.
+  # tests/test_9190_journal_position.py -q` -> "42 passed in 2.42s", 2.74s and
+  # 3.06s on three warm repeats, and 4.93s on the first (cold-import) run; with
+  # `tests/test_5612_journal_append_serialization.py` added -> "58 passed in
+  # 3.68s". The 3.0 weight is the STEADY-STATE figure, not the cold one: the
+  # fast leg runs one file per invocation, so a shard pays the import once.
+  # The row is not cosmetic either: the coverage floor (`DURATION_COVERAGE_MIN
+  # = 0.90`) over the 943-file fast pool measures 850/943 = 90.138% with this
+  # row weighted against 849/943 = 90.032% without it — 0.3 files of headroom,
+  # so one more unmeasured fast file tips `--integrity` red. Refresh from the
+  # first post-merge push run that includes the file.
   test_9190_journal_position.py: 3.0
   test_5917_torn_tail_seal.py: 2.0
   test_longmem_costing.py: 0.2
