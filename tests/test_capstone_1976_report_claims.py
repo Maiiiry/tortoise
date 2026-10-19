@@ -51,20 +51,26 @@ WHAT THIS PINS
 7. The surface counts follow from the report's **own per-surface table**, never from a
    restated number: the not-green set `{7, 12}` and the derived `15 green` are recomputed
    from the table's rows and then required in all four places the report states them (status
-   line, "Surfaces:" paragraph, Verdict, indicator 2), and every green count a site states is
-   read — so a site that keeps its true sentence and gains a stale one fails. Each leg is
-   also recorded on its own surface row. The defect this pins: the headline numbers are the
-   artefact's whole deliverable and were hand-maintained, so they drifted from the table
-   three times ("three stated, five listed"; "16 green" beside a table whose surface 12
-   already carried a failed leg; the leg set said to be five while the table carried six).
+   line, "Surfaces:" paragraph, Verdict, indicator 2), and every green count **and not-green
+   count** a site states is read — in digits or spelled out (`fifteen green`, `2 are not (7
+   and 12)`) — so a site that keeps its true sentence and gains a stale one fails, and a
+   count that disagrees with the list beside it fails at its own site. Required, not
+   optional: a site whose count no reading matches is a site that is not guarded at all.
+   Each leg is also recorded on its own surface row. The defect this pins: the headline
+   numbers are the artefact's whole deliverable and were hand-maintained, so they drifted
+   from the table three times ("three stated, five listed"; "16 green" beside a table whose
+   surface 12 already carried a failed leg; the leg set said to be five while the table
+   carried six).
 8. The leg-gap set is derived and stated **identically** wherever it appears: the surface
    set, the leg total and the per-kind breakdown (automated attempted-and-failing / automated
    never run / walk-through / manual) are all counted off the rows and required in the status
    line, the "Surfaces:" paragraph, the leg-gap bullet (whose buckets and whose automated
-   sub-breakdown must both sum to the derived numbers) and the Verdict, which must name
-   exactly `{5, 7, 8, 12, 15, 16}`. A count that does not reconcile with its own list is this
-   artefact's recurring defect, and it reached the pull-request description too ("five",
-   where the document says six).
+   sub-breakdown must both sum to the derived numbers, and which is read only up to the
+   bullet's own indented sub-items — a slice that ended at the next column-0 bullet ran 107
+   lines past it, so the Totals paragraph could satisfy the buckets for a bullet that
+   stated none) and the Verdict, which must name exactly `{5, 7, 8, 12, 15, 16}`. A count
+   that does not reconcile with its own list is this artefact's recurring defect, and it
+   reached the pull-request description too ("five", where the document says six).
 9. The report's `Surfaces` column — labelled "verbatim from `04-test-design.md`" —
    is the map's cell, compared as whitespace-normalised TEXT. A number-SET
    comparison (the first version) passed `10, 9, 2, 1` against `1, 2, 9, 10`,
@@ -90,6 +96,13 @@ synthetic doc text and the resolver rejects it; check 6 fails on "8 files, 201 t
 checks 7–8 fail on it too (its per-surface table's only not-green row is 7, so the derived
 set is `{7}` against a stated `16 green`; it carries no "seven legs" claim at all, and its
 rows 7, 8 and 12 carry none of their leg clauses). Checks 9 and 10 are non-vacuous in-suite.
+So are the two fail-opens found in the count readings at `035102ea`, and each is driven
+negatively below: a leg-gap bullet whose buckets
+were moved into the Totals paragraph must stop reading as stating them (pre-fix the widest
+slice still read them), a status line whose count is changed to `3 are not (7 and 12)` must
+be read as 3 (pre-fix no reading matched the `are not` form, so the assertion was inert),
+and a stale spelled-out `sixteen green` beside the true `15 green` must be read (pre-fix
+only digits were).
 
 Static: doc-text scans plus file reads. No network, DB or graph.
 """
@@ -132,13 +145,23 @@ def _section(heading: str, text: str | None = None) -> str:
     return text[start:] if end == -1 else text[start:end]
 
 
+#: A bullet ends at the next bullet at ANY indent. The leg-gap bullet's own sub-items are
+#: indented two spaces (`  - **hosted-e2e (automated) — 12.**`), so a column-0-only
+#: terminator ran the slice 107 lines past the bullet — through the whole per-surface
+#: table, the Totals paragraph and the browser walk — and every bucket assertion could be
+#: met from text outside the bullet (removing the buckets from the bullet and pasting them
+#: into Totals left the guard green). The sub-items are the bullet's own detail; the
+#: vocabulary the leg-gap check reads is stated in its opening lines.
+_BULLET_END = re.compile(r"\n[ \t]*- ")
+
+
 def _bullet(marker: str, text: str | None = None) -> str:
-    """The single `- **Which sha:**`-style bullet, up to the next top-level bullet."""
+    """The single `- **Which sha:**`-style bullet, up to the next bullet at any indent."""
     text = _doc_text(text)
     assert marker in text, f"{marker!r} not found in {DOC.name}"
     start = text.index(marker)
-    end = text.find("\n- ", start + len(marker))
-    return text[start:] if end == -1 else text[start:end]
+    end = _BULLET_END.search(text, start + len(marker))
+    return text[start:] if end is None else text[start : end.start()]
 
 
 def _single_line(prefix: str, text: str | None = None) -> str:
@@ -172,6 +195,19 @@ def _claim_block(prefix: str, text: str | None = None) -> str:
         f"expected exactly one paragraph starting {prefix!r}, found {len(blocks)}"
     )
     return _fold(blocks[0])
+
+
+def _with_doc_edit(old: str, new: str, text: str | None = None) -> str:
+    """The document with one asserted-unique substitution.
+
+    The negative tests below drive the guard against a document that has been edited the
+    way a real drift edit looks. The substitution must be unique, or the mutation would be
+    testing something other than what it names.
+    """
+    text = _doc_text(text)
+    found = text.count(old)
+    assert found == 1, f"expected exactly one {old!r} in {DOC.name}, found {found}"
+    return text.replace(old, new, 1)
 
 
 def _leg_gap_sentence(text: str | None = None) -> str:
@@ -666,6 +702,10 @@ _GREEN_READINGS = (
     ),
     re.compile(r"(?<![\w.])(\d+)\s+are\s+green\b", re.IGNORECASE),
     re.compile(r"(?<![\w.])(\d+)\s+green\b", re.IGNORECASE),
+    # Spelled-out `N green` — the report spells its other headline counts (`**six**
+    # surfaces`, `**seven legs**`), so a spelled-out green count is a plausible edit, and
+    # reading it is what the comment above already claimed.
+    re.compile(r"(?<![\w.])(" + _WORD_ALTERNATION + r")\s+green\b", re.IGNORECASE),
     re.compile(
         r"(?<![\w.])(" + _WORD_ALTERNATION + r")\s+of the 17 (?:surfaces are|are)\s+green",
         re.IGNORECASE,
@@ -812,10 +852,19 @@ def _stated_leg_totals(site: str) -> set[int]:
     return found
 
 
+#: Every way this report states a NOT-GREEN count. The status line phrases it "2 are not
+#: (7 and 12)", not "2 not green": without the `N are not` form no reading matched that
+#: site, so the count assertion written for it could never fail (a `3 are not (7 and 12)`
+#: — a count disagreeing with the list beside it, this artefact's recurring defect — left
+#: the suite green). An optional `surfaces` keeps a faithful reword readable.
 _NOT_GREEN_READINGS = (
     re.compile(r"(?<![\w.])(\d+)\s+not green\b", re.IGNORECASE),
     re.compile(
         r"(?<![\w.])(" + _WORD_ALTERNATION + r")\s+not green\b", re.IGNORECASE
+    ),
+    re.compile(
+        r"(?<![\w.])(" + _NUMERAL_ALTERNATION + r")\s+(?:surfaces?\s+)?are\s+not\b",
+        re.IGNORECASE,
     ),
 )
 
@@ -905,9 +954,13 @@ def test_the_not_green_set_and_the_green_count_follow_from_the_per_surface_table
             f"it reads {sorted(_green_readings(site)) or 'none'}. Site: {site}"
         )
     for name in ("\"Surfaces:\" paragraph", "status line"):
-        assert _not_green_readings(sites[name]) in (set(), {len(not_green)}), (
-            f"the {name} states a not-green count that disagrees with the table's "
-            f"{sorted(not_green)}: it reads {sorted(_not_green_readings(sites[name]))}. "
+        # Required, not optional: a site that states no readable count is not guarded at
+        # all, and the status line is the site where the drift originally occurred.
+        assert _not_green_readings(sites[name]) == {len(not_green)}, (
+            f"the {name} must state the not-green count the table derives "
+            f"({len(not_green)}); it reads "
+            f"{sorted(_not_green_readings(sites[name])) or 'none'}, which no reading can "
+            "reconcile with the table. State it as `N not green` or `N are not (...)`. "
             "Site: " + sites[name]
         )
 
@@ -940,6 +993,60 @@ def test_the_not_green_set_and_the_green_count_follow_from_the_per_surface_table
             f"the Verdict must name surface {surface} as not green, by name: "
             + sites["Verdict"]
         )
+
+
+def test_the_count_readings_read_every_spelling_the_guard_claims():
+    """A count is only guarded if the guard can READ it — driven with both fail-opens.
+
+    Two sites where the check above could not fail, both found by mutation against the head
+    document. (a) The status line states its not-green count as "2 are not (7 and 12)", a
+    form no reading matched, so the loop over `_not_green_readings` could never fail there
+    — although its message claimed to police exactly that site: `3 are not (7 and 12)`, a
+    count that does not reconcile with the list beside it, left the suite green. (b) `N
+    green` was digits-only, so a spelled-out stale count (`sixteen green`, beside the true
+    `15 green`) was invisible in a document that spells its other headline counts out.
+    """
+    not_green = _not_green_surfaces()
+    green = len(_surface_rows()) - len(not_green)
+
+    # (a) the status line's COUNT is read, not only the surfaces listed after it
+    status = _claim_block("**Status:")
+    assert _not_green_readings(status) == {len(not_green)}, (
+        "the status line's not-green count must be readable by `_NOT_GREEN_READINGS` "
+        f"(the table derives {len(not_green)}); it reads "
+        f"{sorted(_not_green_readings(status)) or 'none'}, so the count assertion is inert "
+        "at this site. Site: " + status
+    )
+    drifted = _with_doc_edit("2 are not (7 and 12)", "3 are not (7 and 12)")
+    assert _not_green_readings(_claim_block("**Status:", drifted)) == {3}, (
+        "a status line whose count (3) disagrees with its own list (7 and 12) must be "
+        "read as 3 — that is the \"three stated, five listed\" defect this guard exists "
+        "for, at the site where it originally occurred"
+    )
+    assert _surfaces_named_in(
+        _claim_block("**Status:", drifted), r"are not"
+    ) == not_green, "the mutation must move only the count, not the list"
+
+    # (b) spelled-out green counts are read in the same form the report spells its others
+    summary = _claim_block("**Surfaces:")
+    assert _green_readings(summary) == {green}, (
+        f"the \"Surfaces:\" paragraph must read as {green} green: " + summary
+    )
+    spelled_true = _claim_block(
+        "**Surfaces:", _with_doc_edit("— 15 green;", "— 15 green (fifteen green);")
+    )
+    assert _green_readings(spelled_true) == {green}, (
+        "a faithful spelled-out restatement of the same count must not read as a "
+        "contradiction: " + spelled_true
+    )
+    spelled_stale = _claim_block(
+        "**Surfaces:", _with_doc_edit("— 15 green;", "— 15 green (sixteen green);")
+    )
+    assert _green_readings(spelled_stale) == {green, green + 1}, (
+        "a stale spelled-out green count beside the true one must be read, so the site "
+        "assertion fails; pre-fix it was invisible and the drift passed. Site: "
+        + spelled_stale
+    )
 
 
 def test_the_leg_gap_set_is_six_surfaces_and_seven_legs_wherever_it_is_stated():
@@ -1126,6 +1233,62 @@ def test_the_leg_gap_set_is_six_surfaces_and_seven_legs_wherever_it_is_stated():
         "partly" in manual_clause.group(0)
     ), (
         "the enumerated clause must state the manual leg's state: " + manual_clause.group(0)
+    )
+
+
+def test_the_leg_gap_bullet_is_read_only_as_far_as_its_own_sub_items():
+    """The bucket assertions must be satisfiable by the bullet alone — driven negatively.
+
+    The leg-gap bullet's own sub-items are indented two spaces, so a terminator of "the next
+    COLUMN-0 bullet" ran the slice 107 lines past the bullet: the whole `## Per-surface
+    evidence` table, the Totals paragraph and the browser walk were all inside it, and every
+    bucket assertion could be met from text the bullet does not say. Proven by mutation on
+    the head document (buckets and their total moved out of the bullet into Totals, nothing
+    contracted): the derived readings must change. Pre-fix they did not — `_stated_leg_totals`
+    still returned `{7}` and the three buckets were still found.
+    """
+    marker = "- **Which layer was not fully reached"
+    legs = sum(_leg_kinds().values())
+
+    bullet = _bullet(marker)
+    assert "## Per-surface evidence" not in bullet and "**Totals" not in bullet, (
+        "the leg-gap bullet's slice still runs past its own sub-items into the rest of the "
+        f"document ({len(bullet.splitlines())} lines), so its counts can be satisfied from "
+        "outside the bullet: " + bullet
+    )
+    assert _stated_leg_totals(bullet) == {legs}, (
+        f"the bullet itself must state its {legs}-leg total: " + bullet
+    )
+
+    # Move the total-and-buckets line out of the bullet and into the Totals paragraph —
+    # the reviewer's mutation. Only the bullet's own text may speak for the bullet.
+    text = _doc_text()
+    bucket_lines = [
+        line
+        for line in bullet.splitlines()
+        if "legs** between them" in line and "automated" in line
+    ]
+    assert len(bucket_lines) == 1, (
+        "expected exactly one line in the leg-gap bullet stating its total and buckets, "
+        f"found {len(bucket_lines)}: {bullet}"
+    )
+    moved = _with_doc_edit(bucket_lines[0] + "\n", "", text)
+    totals_anchor = "**Totals, stated so the arithmetic can be checked:** "
+    moved = _with_doc_edit(totals_anchor, totals_anchor + _fold(bucket_lines[0]) + " ", moved)
+
+    mutated = _bullet(marker, moved)
+    assert _stated_leg_totals(mutated) != {legs}, (
+        "a leg-gap bullet that no longer states its own total still reads as stating one "
+        "— the reading is coming from outside the bullet: " + mutated
+    )
+    stated = re.findall(
+        r"\*\*(" + _NUMERAL_ALTERNATION + r") (automated|walk-through|manual)\*\*",
+        mutated,
+        re.IGNORECASE,
+    )
+    assert len(stated) != 3, (
+        "a leg-gap bullet that no longer states its three buckets still satisfies the "
+        "bucket assertion — the reading is coming from outside the bullet: " + mutated
     )
 
 
