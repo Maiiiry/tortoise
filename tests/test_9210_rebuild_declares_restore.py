@@ -5,11 +5,15 @@ records that came FROM the journal — `_replay_write_scope()` states the truth
 for it. But the same engine also puts back, verbatim, state it CAPTURED FROM
 THE GRAPH THAT IS ABOUT TO BE DESTROYED: `:Batch` markers and
 `Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
-onboarding state machine, the `:TeamMeta` first-org marker, the `#2814` config
-registry, and the `:GraphEventMeta` watermark. **Not one of those classes rides
-a journal record** (`#990`, `#3947`, `#4641`, `#5353`, `#2814`, `#4653` each
-say so at its writer), so the replay lane's contract — "this content came from
-the record" — is FALSE for every one of them.
+onboarding state machine (node, `onboards` anchor, `COMPLETED_STEP` links), the
+`:TeamMeta` first-org marker, the `#2814` config registry, the `#4305` derived
+Point properties, and the `:GraphEventMeta` watermark. **Not one of those
+classes rides a journal record** (`#990`, `#3947`, `#4641`, `#5353`, `#2814`,
+`#4653` each say so at its writer), so the replay lane's contract — "this
+content came from the record" — is FALSE for every one of them. (`#4305` is
+the exception in MECHANISM only: it re-applies what the replay did NOT write,
+journal-gated. Its value still exists only in the pre-wipe capture, which is
+the property this lane is about.)
 
 Handing them the replay permit is therefore an over-authorization: the
 declaration claims a wider write scope than the restore performs. `#9124`'s
@@ -120,7 +124,13 @@ _LEGS = {
     ),
     "point-derived": (
         f"{RESTORE}: Point derived properties (#4305)",
-        "MATCH (n:Point {id:$pid}) SET ",
+        # ARM-AGNOSTIC on purpose: the restore prefixes a
+        # `clear_then_set_prefix(...)` guard whenever it carries a vector, so a
+        # fragment ending in `SET ` matches only the no-embedding arm and would
+        # report a MISSING leg (blaming the fixture) on correct product code.
+        # No other statement in the run binds alias `n` with `$pid` — the
+        # batch/session links use `p`.
+        "MATCH (n:Point {id:$pid}) ",
     ),
 }
 
@@ -209,6 +219,13 @@ def _seed_prewipe_state(sdk, events):
     proj = sdk._get_proj()
     g = proj.g
     g.query("MERGE (b:Batch {id:'batch-1'}) SET b.reason = 'quarantine'")
+    # A SECOND marker on purpose: a restore leg is N-per-class (a second
+    # `:Batch`, a second step link, a second graph-only Point), so the
+    # declaration assert must compare each observation to the reason rather
+    # than require exactly one. Without this seed that distinction is
+    # untested and an "observed exactly once" assertion would pass here and
+    # fire on correct product code in the field.
+    g.query("MERGE (b:Batch {id:'batch-2'}) SET b.reason = 'second'")
     g.query("MATCH (p:Point {id:$pid}) SET p.batch_id = 'batch-1'",
             params={"pid": pid})
     g.query("MERGE (s:Session {id:'sess-1'}) SET s.capture_ok = true")
@@ -253,15 +270,19 @@ def _observed_restore_legs(seen):
 def _assert_every_leg_declares_itself(seen, *, context: str):
     observed = _observed_restore_legs(seen)
     # VACUITY GUARD: a leg that never ran cannot be evidence either way. The
-    # fixture seeds all eight, so a missing one means the seed or the capture
+    # fixture seeds all eleven, so a missing one means the seed or the capture
     # changed, not that the declaration is fine.
     assert set(observed) == set(_LEGS), (
         f"{context}: these snapshot-restore legs did not reach the write "
         f"handle, so the pin would be vacuous: missing="
         f"{sorted(set(_LEGS) - set(observed))}; observed={sorted(observed)}")
+    # `any`, not `reasons != [expected]`: a restore loop is N-per-class (a
+    # second `:Batch`, a second step link, a second graph-only Point), so
+    # "observed exactly once" would fire on correct code and then blame the
+    # declaration for it.
     wrong = {
         leg: reasons for leg, reasons in observed.items()
-        if reasons != [_LEGS[leg][0]]
+        if any(reason != _LEGS[leg][0] for reason in reasons)
     }
     assert not wrong, (
         f"{context}: every snapshot-restore write must run inside its OWN "

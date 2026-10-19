@@ -3267,14 +3267,19 @@ def _journal_safe_params(params, cypher=None):
 #   * `_prewipe_restore_write_scope(...)` — the PRE-WIPE RESTORE lane: the
 #     writes that put back, verbatim, state CAPTURED FROM THIS GRAPH
 #     immediately before its wipe (`:Batch` + `batch_id`, `:Session` +
-#     `CONTAINS`, the onboarding state machine, `:TeamMeta`, the config
-#     registry, the `:GraphEventMeta` watermark). Every one of these classes
-#     rides NO journal record — which is exactly why the replay lane's
-#     contract ("this content came FROM the record") is FALSE for them, and
-#     why `rebuild_all` may not hand them the replay permit (#9210: one
+#     `CONTAINS`, the onboarding state machine — node, `onboards` anchor and
+#     `COMPLETED_STEP` links, `:TeamMeta`, the config registry, the `#4305`
+#     derived Point properties, the `:GraphEventMeta` watermark). Every one of
+#     these classes rides NO journal record — which is exactly why the replay
+#     lane's contract ("this content came FROM the record") is FALSE for them,
+#     and why `rebuild_all` may not hand them the replay permit (#9210: one
 #     method-wide permit made every future addition to that engine inherit a
-#     claim that was never true of the restore). See the obligation it states
-#     at `_prewipe_restore_write_scope`.
+#     claim that was never true of the restore). ⚠️ `#4305` is the one leg
+#     whose MECHANISM differs, not whose lane does: it re-applies only the
+#     derived field the replay did NOT write (`_REPLAY_GAP_PROPS`,
+#     journal-gated), so the "rides no journal record" clause must not be
+#     extended to it unqualified. See the obligation it states at
+#     `_prewipe_restore_write_scope`.
 #   * `onboarding.metadata` (`tortoise/onboarding/state.py`, #9121) — the
 #     onboarding FLOW metadata (`:OnboardingState`, `:OnboardingStep`, the
 #     `COMPLETED_STEP` edges) is graph-resident org-level metadata, not a
@@ -3385,13 +3390,18 @@ def _prewipe_restore_write_scope(reason: str):
     state it CAPTURED FROM THE GRAPH THAT IS ABOUT TO BE DESTROYED (the `#548`
     snapshot, and its durable `#2943` sidecar): `:Batch` markers and
     `Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
-    `:OnboardingState` machine, the `:TeamMeta` first-org marker, the `#2814`
-    config registry, and the `:GraphEventMeta` watermark.
+    `:OnboardingState` machine (node, `onboards` anchor, `COMPLETED_STEP`
+    links), the `:TeamMeta` first-org marker, the `#2814` config registry, the
+    `#4305` derived Point properties, and the `:GraphEventMeta` watermark.
 
     **None of those writes is a projection of a journal record** — the classes
     ride no record at all (`#5353`, `#3947`, `#4641`, `#990`, `#2814`, `#4653`
     each say so at their writer), and the restore re-establishes them from the
-    pre-wipe capture instead. Handing them the replay permit would authorize
+    pre-wipe capture instead. ⚠️ **`#4305` is the exception in MECHANISM, not
+    in lane**: it re-applies only the derived field the replay did NOT write
+    (`_REPLAY_GAP_PROPS`, journal-gated), so "rides no journal record" is not
+    its story — "the value exists only in the pre-wipe capture" is, and that
+    is what puts it in this lane rather than the fold's. Handing them the replay permit would authorize
     them under a contract that is FALSE for them, which is what `#9210`
     removes: the restore is now a NAMED declaration, so "which writes are
     authorized by replay" stays answerable, and a future addition to that
