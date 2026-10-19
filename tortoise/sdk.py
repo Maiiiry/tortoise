@@ -12124,9 +12124,14 @@ class TortoiseSDK:
         the method carries `@_declares_live_write_lane`. The residual is that
         the append's RETURN is not checked here, so a FAILED append still
         proceeds to the cache: the lane is honest about ORDER and says nothing
-        about CONFIRMATION. `update_point`/`delete_point`/`retract_point` gate
-        on `_emit_event(…) is False`; this door does not, and fixing that is
-        part 2 of #9124 (it changes the failure contract, not the order).
+        about CONFIRMATION. For contrast, the doors that DO gate on a per-call
+        append outcome are `create_point`/`update_point` (their
+        `_record_committed is False` → `WriteNotLandedError`) and
+        `delete_point` (`_delete_committed = _journal_entity_mutation(...)`);
+        `invalidate_point` and `retract_point` discard the append's return, so
+        THEY carry the same residual as this door — three doors, not one.
+        Closing it is part 2 of #9124 (it changes the failure contract, not the
+        order).
 
         E6 (#1538) D2 — bi-temporal validity windows: the supersession ALSO
         stamps the old point's window END (``validTo`` = the successor's
@@ -12851,6 +12856,16 @@ class TortoiseSDK:
         appended before the CAS `SET` ("append-before-mutation" below), and the
         method's every mutating statement follows it, so the method carries
         `@_declares_live_write_lane`.
+
+        ⚠️ ORDER is what the declaration guarantees; CONFIRMATION is not. The
+        append's return is discarded here (unlike `create_point`/`update_point`,
+        which gate on `_record_committed is False`, and `delete_point`, which
+        gates on `_journal_entity_mutation`'s), so a FAILED append still
+        retracts the cache node and reports success — measured on this branch
+        by forcing `_emit_event` to return False: the point came back
+        `status='retracted'`. That residual is part 2 of #9124 (it changes the
+        failure contract), and it is shared with `invalidate_point` and
+        `supersede_point`.
 
         #432: retraction is a TERMINAL state transition, not a deletion — the
         projection keeps the point with status='retracted' and default query

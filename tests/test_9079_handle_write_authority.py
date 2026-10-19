@@ -72,6 +72,15 @@ MUTATING_CAPABLE_VERBS = _HANDLE_MUTATING_VERBS
 MUTATING_QUERY_VERBS = tuple(
     verb for verb in _HANDLE_MUTATING_VERBS if verb != "execute_command")
 
+#: Every OTHER callable defined on `_GuardedGraph`, with the reason it can put no
+#: mutating statement on the wire. The enumeration test compares the class's own
+#: members (dunders excluded) against this set plus the shared verb tuple, so a
+#: new method is a failure rather than a silent gap.
+_NON_MUTATING_HANDLE_METHODS = {
+    "_refuse_unauthorized_cache_write",  # the check itself
+    "_bar",  # #7162: rewrites the statement text, dispatches nothing
+}
+
 
 @pytest.fixture
 def enforced(monkeypatch):
@@ -214,10 +223,15 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
 
     Structural, not behavioural: a SEVENTH verb added to the handle later fails
     here instead of silently re-opening §17.1 (the `#3595` shared-decision
-    precedent). The source is read rather than the bound methods, because the
-    property asserted is "the check is called inside the verb", which is not
-    observable from outside without issuing a statement per verb — and that is
-    what the parametrized test above does for the verbs we know about.
+    precedent). The CLASS is enumerated, not the shared tuple — iterating the
+    tuple and comparing it back to itself cannot fail, so that form proved
+    nothing; every public method defined on `_GuardedGraph` must now be either a
+    shared mutating verb or one of the explicitly NON-mutating names below, and
+    an unlisted verb fails by construction. The source is read rather than the
+    bound methods, because the property asserted is "the check is called inside
+    the verb", which is not observable from outside without issuing a statement
+    per verb — and that is what the parametrized test above does for the verbs
+    we know about.
     """
     import inspect
 
@@ -233,6 +247,22 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
         guarded.append(verb)
 
     assert set(guarded) == set(MUTATING_QUERY_VERBS)
+
+    # THE ENUMERATION. `vars()` on the class, so a verb added tomorrow is neither
+    # "in the shared tuple" nor "in the allow-list" and reddens here.
+    public_members = {
+        name for name, value in vars(_GuardedGraph).items()
+        if not name.startswith("__") and callable(value)
+    }
+    accounted = set(_HANDLE_MUTATING_VERBS) | set(_NON_MUTATING_HANDLE_METHODS)
+    assert public_members == accounted, (
+        "`_GuardedGraph` gained or lost a method without this gate noticing. "
+        "A new verb that can put a mutating statement on the wire belongs in "
+        "`_HANDLE_MUTATING_VERBS` (shared with the declaration census); a "
+        "method that cannot write belongs in `_NON_MUTATING_HANDLE_METHODS` "
+        f"with the reason. Unaccounted: {sorted(public_members - accounted)}; "
+        f"listed but absent: {sorted(accounted - public_members)}"
+    )
     # `execute_command` carries a statement only in its args, so it is checked
     # separately — and this is the assertion that keeps it from being forgotten.
     assert "_refuse_unauthorized_cache_write" in inspect.getsource(

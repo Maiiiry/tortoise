@@ -3425,17 +3425,20 @@ def _record_undeclared_handle_write(statement: str) -> None:
 def undeclared_handle_writes() -> dict[str, int]:
     """Measure-mode census: every undeclared statement the handle has seen.
 
-    Empty when the door has been armed (`_HANDLE_GUARD_ENFORCES`) or when every
-    writer declares a lane. This is the ONE reader a test uses to prove the
-    handle actually observes a write (a detector nobody reads is not a
-    detector).
+    Empty in a process that has written nothing yet, or when every writer
+    declares a lane. Statements recorded while the door was MEASURING are
+    RETAINED if the door is later armed (arming does not clear this dict, and a
+    refusal is not counted at all), so an armed process reports the pre-arm
+    census; `_reset_undeclared_handle_writes()` is the only thing that clears
+    it. This is the ONE reader a test uses to prove the handle actually
+    observes a write (a detector nobody reads is not a detector).
     """
     with _UNDECLARED_HANDLE_WRITES_LOCK:
         return dict(_UNDECLARED_HANDLE_WRITES)
 
 
 def _reset_undeclared_handle_writes() -> None:
-    """Clear the measure-mode census (tests; also the operator's census reset)."""
+    """Clear the measure-mode census (tests only — no operator surface exposes it)."""
     with _UNDECLARED_HANDLE_WRITES_LOCK:
         _UNDECLARED_HANDLE_WRITES.clear()
 
@@ -3672,18 +3675,9 @@ class _GuardedGraph:
         public raw-query lane) were closed by #7951. This handle —
         `proj.g`, the projection's write handle, and the module's "single handle
         every projection write passes through" — was the stated residual: a
-        mutating statement issued HERE bypassed both. It is now refused on the
-        same terms and by the same shared classifier (`_statement_writes`), so
-        the three doors cannot disagree about what a write is.
-
-        WHY IT IS SAFE TO ARM NOW. #7951 deliberately left this door open
-        because it is *also* the SDK's live write lane: a blanket refusal there
-        broke the product's own writers, not a violation of it. The writers that
-        legitimately write outside the two original scopes now declare
-        themselves (the onboarding lane, the two direct `:Event` writers, the
-        `:EpMeta` epoch, and the schema DDL in `_ensure_indexes`), so a refusal
-        here means an UNDECLARED writer — which is exactly the second writer
-        §17.1 forbids.
+        mutating statement issued HERE bypassed both. It is MEASURED on the same
+        terms and by the same shared classifier (`_statement_writes`) that the
+        other two doors use, so the three cannot disagree about what a write is.
 
         ORDER. Called FIRST in every mutating-capable verb, BEFORE any other
         pre-dispatch guard: a refusal that ran after the `=~`/numeric guards
@@ -3691,9 +3685,10 @@ class _GuardedGraph:
         first makes the refusal the one answer for "may this statement reach
         the cache at all".
 
-        ONLY a journal-backed projection refuses; an unbound projection
-        (`_journal_backed` False) has no journal to be the single writer OF, so
-        §17.1 has nothing to enforce there (the same arming rule as the fold).
+        ONLY a journal-backed projection is measured or refused; an unbound
+        projection (`_journal_backed` False) has no journal to be the single
+        writer OF, so §17.1 has nothing to enforce there (the same arming rule
+        as the fold).
 
         ⚠️ MEASURE, THEN REFUSE. `_HANDLE_GUARD_ENFORCES` is False in the landed
         state (#9124 part 1), so a violation is RECORDED (a counter plus one
@@ -3702,9 +3697,15 @@ class _GuardedGraph:
         measured on this issue as 16 failed / 4 errors across
         `test_7951_update_point_outbox.py`, `test_7951_delete_point_outbox.py`,
         `test_5048_retract_instant_recorded.py` and
-        `test_6239_promote_after_supersede.py`. The detection itself is complete
-        and identical in both modes; only the refusal is gated. Do not read this
-        method's presence as "§17.1 is enforced at the handle".
+        `test_6239_promote_after_supersede.py`. The reason is a census, not a
+        hunch: the product's own write path is still largely undeclared — the 9
+        apply-first public doors, the 2 mixed-arm doors (`update_point`,
+        `capture_session`) and every writer that appends no record at all, all
+        inventoried in `tests/test_9124_declared_live_doors.py`, which also
+        REFUSES the flip while any module has an undeclared entry point. The
+        detection itself is complete and identical in both modes; only the
+        refusal is gated. Do not read this method's presence as "§17.1 is
+        enforced at the handle".
         """
         if _CACHE_WRITE_AUTHORIZED.get() is not None:
             return
@@ -15061,7 +15062,8 @@ class FalkorProjection(
         empty result set. The declaration is scoped to this ONE function on
         purpose: it authorizes the schema, not a data write. A ``CREATE`` of a
         node added here would inherit the declaration, which is why the sweep's
-        body is kept to DDL and catalogue reads — see
+        body is kept to DDL, the two ``:Meta`` index-version markers it MERGEs,
+        and catalogue reads — see
         ``tests/test_9079_handle_write_authority.py``,
         ``test_schema_ddl_survives_the_armed_guard``, whose companion assertion
         would go red on exactly that substitution.
