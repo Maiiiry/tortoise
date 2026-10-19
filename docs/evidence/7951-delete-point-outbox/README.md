@@ -16,7 +16,7 @@ aboutObjects: "#7951, #9207, #7950, STORAGE-ARCHITECTURE.md §17.1, tortoise/sdk
 reproducible by any lane.
 
 ⚠️ **#9207 REVERSED this door's ordering**, so the numbers below are #9207's, not increment 4a's.
-#7951 moved the record ABOVE the `DETACH DELETE` to close the resurrection window; #9207 measured the
+\#7951 moved the record ABOVE the `DETACH DELETE` to close the resurrection window; #9207 measured the
 window that opened in exchange — with §17.1's write door armed (#9124) the append committed, the
 `DETACH DELETE` was refused **pre-write**, and `get_point` still served the Point, so the journal
 claimed a destruction the cache never performed and only a destructive `rebuild_all` could resolve it.
