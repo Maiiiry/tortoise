@@ -55,7 +55,14 @@ the over-report direction: `clear_config_reset(self._get_proj().g)` → `clear_c
 (measured: without the rule 76 functions leave the census entirely, 28 of them
 carrying a provable write). `functools.partial` over a verb, and a
 handle stashed on an object attribute (`self._h = proj.g`) then used later, are
-NOT resolved. Measured on this tree: sdk.py has 4 verb calls on a parameter
+NOT resolved. Three more shapes sit outside the census ENTIRELY: a handle
+reached one hop down (`proj.g._g.query(...)` — the last attribute must be `g`),
+a graph resolved off the client (`proj.db.select_graph(<name>).query(...)`), and a
+mutating call at MODULE or CLASS-BODY level (the walk only classifies inside a
+function). The first two bypass `_GuardedGraph`, so they are escapes 2 and 3 of
+§17.1's door (`tortoise/projection/__init__.py`), documented as out of scope; the
+third WOULD pass through the guarded handle, so it is a real gap in the flip gate
+and is named rather than claimed away. Measured on this tree: sdk.py has 4 verb calls on a parameter
 receiver — 3 resolved read-only `MATCH … RETURN` probes
 (`_holds_role_available`, `_refuse_inverted_point_window`,
 `_refuse_inconsistent_validity_precision`) and 1 unresolved read
@@ -289,6 +296,10 @@ def _runs_in_a_branch(node, field: str) -> bool:
     if isinstance(node, ast.match_case):
         return field == "body"
     return False
+
+
+#: Distinguishes "never bound in this function" from "bound, but unknown".
+_UNBOUND = object()
 
 
 def _text(expr, consts, local):
@@ -531,7 +542,9 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
             fact = facts.setdefault(current, {
                 "name": node.name, "lineno": node.lineno, "scope": scope,
                 "writes": [], "reads": 0, "appends": [], "scopes": [],
-                "aliases": set(), "params": set(),
+                "aliases": set(), "params": set(), "scope_spans": [],
+                "end_lineno": getattr(node, "end_lineno", node.lineno)
+                or node.lineno,
             })
             args = node.args
             fact["params"] = {
@@ -548,6 +561,12 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
                         decorator.func, "attr", None)
                     if opener in _SCOPE_CALL_NAMES:
                         facts[current]["scopes"].append((decorator.lineno, opener))
+                        if opener in _LIVE_LANE_NAMES:
+                            # A lane DECORATOR covers the whole body.
+                            facts[current]["scope_spans"].append(
+                                (node.lineno,
+                                 getattr(node, "end_lineno", node.lineno) or
+                                 node.lineno))
         if current is None:
             for child in ast.iter_child_nodes(node):
                 visit(child, current, local, cond, scope)
@@ -558,7 +577,34 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
         # onboarding funnel and the three read-side modules all bind the handle
         # to a LOCAL, so a receiver-name check alone would miss their writers.
         _bind_handle_aliases(node, fact["aliases"], fact["params"])
-        local.update(_bound_names(node, consts, local))
+        for bound_name, bound_text in _bound_names(node, consts, local).items():
+            prior = local.get(bound_name, _UNBOUND)
+            if prior is not _UNBOUND and prior is not None \
+                    and bound_text is not None \
+                    and _statement_writes(prior) != _statement_writes(bound_text):
+                # Rebound to a statement of the OTHER class on some path: which
+                # one runs depends on the branch, so neither may be assumed.
+                local[bound_name] = None
+            else:
+                local[bound_name] = bound_text
+
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                call = item.context_expr
+                if not isinstance(call, ast.Call):
+                    continue
+                opener = getattr(call.func, "id", None) or getattr(
+                    call.func, "attr", None)
+                if opener in _SCOPE_CALL_NAMES and node.body:
+                    # Mark the context call so the plain-call arm below does not
+                    # ALSO claim the rest of the function: a `with` releases the
+                    # ContextVar at its exit, so only the body is authorized.
+                    fact.setdefault("_with_calls", set()).add(id(call))
+                    start = min(stmt.lineno for stmt in node.body)
+                    end = max(getattr(stmt, "end_lineno", stmt.lineno) or stmt.lineno
+                              for stmt in node.body)
+                    if opener in _SCOPE_CALL_NAMES:
+                        fact["scope_spans"].append((start, end))
 
         if isinstance(node, ast.Call):
             opener = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
@@ -567,6 +613,11 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
                 fact["appends"].append((node.lineno, cond))
             elif opener in _SCOPE_CALL_NAMES:
                 fact["scopes"].append((node.lineno, opener))
+                if id(node) not in fact.get("_with_calls", set()):
+                    # `_cache_write_authorized(...)` used as a plain call sets the
+                    # ContextVar for the REST of this context (it is not released
+                    # until an outer scope resets it), so it covers to the end.
+                    fact["scope_spans"].append((node.lineno, fact["end_lineno"]))
             elif isinstance(node.func, ast.Attribute) \
                     and node.func.attr in _HANDLE_MUTATING_VERBS \
                     and _is_handle_ref(node.func.value, fact["aliases"],
@@ -633,10 +684,32 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
             "reads": fact["reads"], "appends": list(fact["appends"]),
             "scopes": list(fact["scopes"]), "aliases": set(fact["aliases"]),
             "params": set(fact["params"]),
+            # The LINE SPANS a lane covers, so "declared" can mean the writes run
+            # INSIDE the lane rather than that the function mentions one.
+            "scope_spans": list(fact["scope_spans"]),
             "duplicate_writer_defs": len(def_linenos) > 1,
             "def_linenos": def_linenos,
         }
     return surface
+
+
+def _writes_are_inside_a_lane(fact) -> bool:
+    """Do ALL of this function's writes run INSIDE a lane it opens?
+
+    Presence is not containment (the #9124 final-review P2): a function that
+    opens `with _replay_write_scope()` for a READ and then writes outside it
+    mentions a lane without holding one around the write, and arming would refuse
+    that write. `scope_spans` records the line range each lane actually covers
+    (a `with` body, or the whole body for a lane decorator, or the rest of the
+    context for a plain `_cache_write_authorized` call), so this asks the real
+    question. Measured over the whole population when it landed: 0 functions
+    regress.
+    """
+    spans = fact.get("scope_spans") or []
+    if not fact.get("scopes") or not spans:
+        return False
+    return all(any(start <= write[0] <= end for start, end in spans)
+               for write in fact["writes"])
 
 
 def _journal_first_violation(fact) -> str | None:
@@ -682,7 +755,7 @@ def _journal_first_violation(fact) -> str | None:
 def _kind(fact) -> str:
     """Classify one function: declared, or which inventory it belongs to."""
     if fact["scopes"]:
-        return "declared"
+        return "declared" if _writes_are_inside_a_lane(fact) else "outside-lane"
     if not fact["appends"]:
         return "no-journal"
     return "apply-first" if _journal_first_violation(fact) else "journal-first"
@@ -769,6 +842,13 @@ def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
             continue
         kind = _kind(fact)
         reason = _inventory_of(name)
+        if kind == "outside-lane":
+            offenders.append(
+                f"{name}:{fact['lineno']} OPENS a lane ({fact['scopes']}) but "
+                f"writes outside it at line {fact['writes'][0][0]} — presence is "
+                "not containment; move the write inside the lane or declare one "
+                "that covers it")
+            continue
         if kind == "declared":
             if reason is not None:
                 offenders.append(
@@ -1349,8 +1429,17 @@ def test_every_proven_read_names_a_real_census_entry():
     a part-2 entry must still prove its key.
     """
     surfaces = dict(_modules_reaching_the_handle())
-    offenders = [f"{rel}::{key}" for rel, key in sorted(_PROVEN_READS)
-                 if key not in surfaces.get(rel, {})]
+    offenders = []
+    for rel, key in sorted(_PROVEN_READS):
+        fact = surfaces.get(rel, {}).get(key)
+        if fact is None:
+            offenders.append(f"{rel}::{key} names no census entry")
+        elif fact["scopes"] or not _is_unresolved_only(fact):
+            # A PROVABLE write blessed as a "proven read" would be skipped by
+            # both gates — the verdict matters as much as the key form.
+            offenders.append(
+                f"{rel}::{key} is not an UNPROVEN, undeclared statement "
+                f"(writes={fact['writes'][:2]}, scopes={fact['scopes']})")
     assert not offenders, (
         "these `_PROVEN_READS` entries name no census entry (wrong key form? the "
         "census key is scope-qualified — `TortoiseSDK.delete_point`, not "
@@ -1401,7 +1490,8 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
         # whatever else it looks like — including looking declared.
         duplicate_offenders.extend(_duplicate_writer_offenders(surface, f"{rel}::"))
         for name, fact in sorted(surface.items()):
-            accounted = bool(fact["scopes"]) or (rel, name) in _CALLER_DECLARED
+            accounted = _writes_are_inside_a_lane(fact) \
+                or (rel, name) in _CALLER_DECLARED
             proven_read = (rel, name) in _PROVEN_READS
             if rel == "tortoise/sdk.py":
                 seen_sdk.add(_bare_name(name))
@@ -1507,6 +1597,68 @@ def _calls_within(node, callee) -> bool:
                 return True
         stack.extend(ast.iter_child_nodes(current))
     return False
+
+
+def test_a_lane_opened_by_a_nested_function_does_not_cover_the_caller():
+    """The exemption proof is CONTAINMENT, and a nested def's lane is not ours.
+
+    `_call_is_inside_a_scope` walks `_own_body_nodes`, which stops at every
+    `def`/`lambda`: `def outer: def inner: with scope: callee()` must NOT credit
+    `outer`. Without this pin the pre-fix `ast.walk(func)` restores the bug with
+    the suite green (the class this file keeps closing: a guard with no producer).
+    """
+    src = '''
+class C:
+    def nested(self):
+        def inner():
+            with _live_write_scope("inner"):
+                self._callee()
+        return inner
+
+    def proper(self):
+        with _replay_write_scope():
+            return self._callee()
+
+    def exits_first(self):
+        with _replay_write_scope():
+            pass
+        return self._callee()
+
+    @_declares_live_write_lane("whole body")
+    def decorated(self):
+        return self._callee()
+'''
+    fns = {node.name: node for node in ast.walk(ast.parse(src))
+           if isinstance(node, ast.FunctionDef)}
+    assert _call_is_inside_a_scope(fns["nested"], "_callee") is False
+    assert _call_is_inside_a_scope(fns["proper"], "_callee") is True
+    assert _call_is_inside_a_scope(fns["exits_first"], "_callee") is False
+    assert _call_is_inside_a_scope(fns["decorated"], "_callee") is True
+
+
+def test_a_proven_read_entry_must_be_unproven_and_undeclared(monkeypatch):
+    """The register pins the VERDICT, not just the key form.
+
+    A provable write blessed as a "proven read" would be skipped by BOTH gates,
+    so an entry in the right key form but the wrong shape must be refused.
+    """
+    surfaces = dict(_modules_reaching_the_handle())
+    sdk = surfaces["tortoise/sdk.py"]
+    # A REAL key, so the entry reaches the VERDICT clause rather than the
+    # "no such entry" clause: a DECLARED door is a provable write, not an
+    # unproven read.
+    declared = sorted(key for key, fact in sdk.items() if fact["scopes"])
+    assert declared, "the census found no declared SDK door — the probe is stale"
+    monkeypatch.setattr("test_9124_declared_live_doors._PROVEN_READS",
+                        {("tortoise/sdk.py", declared[0])})
+    with pytest.raises(AssertionError, match="is not an UNPROVEN, undeclared"):
+        test_every_proven_read_names_a_real_census_entry()
+    # ...and the FORM clause still refuses a bare name.
+    monkeypatch.setattr(
+        "test_9124_declared_live_doors._PROVEN_READS",
+        {("tortoise/sdk.py", declared[0].split(".")[-1])})
+    with pytest.raises(AssertionError, match="names no census entry"):
+        test_every_proven_read_names_a_real_census_entry()
 
 
 def test_the_append_exclusions_append_nothing():
