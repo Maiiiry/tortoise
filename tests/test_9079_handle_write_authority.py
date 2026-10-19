@@ -1,0 +1,386 @@
+"""#9124 — §17.1's THIRD door: the projection's write handle refuses.
+
+`#7951` made §17.1 load-bearing at two doors — the fold
+(`FalkorProjection.apply`) and the public raw-query lane
+(`FalkorProjection.query`) — and stated the third as an explicit residual: the
+handle `proj.g` (`_GuardedGraph`), which the module docstring calls *"the single
+handle every projection write passes through"*. The capstone measured the hole
+(`docs/evidence/7950-capstone/README.md`, S1 **NOT-GREEN**):
+
+    ARMED RAW HANDLE (proj.g.query): SUCCEEDED (direct cache write)
+    Point:p1 gained an unauthorized property (Point.second_writer_marker)
+
+This suite is the acceptance gate for closing it. It is written against the
+BEHAVIOUR (a second writer is refused, a sanctioned lane still writes), not
+against the shape of the fix, so it survives a refactor that keeps §17.1.
+
+WHY EVERY MUTATING VERB, AND WHY AN ENUMERATION TEST. A guard on `query` alone
+is one private hop (`proj.g._query`) or one verb (`proj.g.profile`, which
+EXECUTES via `GRAPH.PROFILE`) away from being no guard at all — the #3595
+shared-decision precedent. So the parametrized case covers all three
+mutating-capable query verbs, and
+`test_the_handle_exposes_no_unguarded_mutating_query_verb` enumerates the
+handle's OWN verbs: a seventh verb added later fails here instead of silently
+re-opening §17.1.
+
+WHAT IS *NOT* CLAIMED. This closes escape (1) of the three named in
+`tortoise/projection/__init__.py`'s SCOPE block. Escapes (2)
+`proj.g._g.query(...)` and (3) `proj.db.select_graph(<g>).query(...)` stay
+OPEN — each is one hop below anything a runtime signal is placed on, and a
+lexical inventory cannot reach them. They are §17.1's atomic-write work and
+this suite does not assert they are closed.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from tortoise.projection import (
+    DirectCacheWriteRefused,
+    _GuardedGraph,
+    _live_write_scope,
+    _replay_write_scope,
+)
+
+#: The verbs on `_GuardedGraph` that can put a MUTATING statement on the wire.
+#: `explain` is listed because it is applied for enumeration uniformity, not
+#: because `GRAPH.EXPLAIN` executes: a plan is never a write, so refusing a
+#: mutating statement there costs nothing and closes a verb a future refactor
+#: could start dispatching.
+MUTATING_CAPABLE_VERBS = ("query", "ro_query", "_query", "profile", "explain")
+
+
+@pytest.fixture
+def armed_sdk(tmp_path):
+    """A real SDK with a configured JSONL journal, so the guard is ARMED.
+
+    Lane-agnostic, exactly like `tests/test_7951_enforce_atomic_write.py`'s
+    fixture: an explicit `db_path` makes the projection embedded when no URI is
+    configured, and the SDK's own construction is redirected to the docker
+    server in a URI-set session. `event_log_path` is what arms §17.1 at the
+    handle (`_get_proj` -> `_bind_journal`).
+    """
+    from tortoise.sdk import TortoiseSDK
+
+    journal = tmp_path / "journal.jsonl"
+    sdk = TortoiseSDK(str(tmp_path / "handle-authority.db"),
+                      event_log_path=str(journal))
+    sdk._journal_path_for_test = journal
+    try:
+        yield sdk
+    finally:
+        sdk.close()
+
+
+def _count(proj, label: str, prop: str, value: str) -> int:
+    return int(proj.g.query(
+        f"MATCH (n:{label} {{{prop}:$v}}) RETURN count(n)",
+        params={"v": value},
+    ).result_set[0][0])
+
+
+def _journal_lines(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()]
+
+
+# ── the load-bearing pin: a direct write through the handle FAILS ─────────
+
+def test_a_mutating_statement_through_the_write_handle_is_refused(armed_sdk):
+    """RED before this lane: `proj.g.query("CREATE …")` wrote the cache direct.
+
+    This is the exact statement shape the capstone probe issued at
+    `proj.g.query` and recorded as `SUCCEEDED (direct cache write)`.
+
+    MUTATION: delete the `_refuse_unauthorized_cache_write` call from
+    `_GuardedGraph.query` and this test fails with `DID NOT RAISE` — the write
+    silently lands again.
+    """
+    proj = armed_sdk._get_proj()
+    assert proj._journal_backed, (
+        "the fixture must ARM the guard (`event_log_path` configured); an "
+        "unarmed projection is outside §17.1 and this test would be vacuous"
+    )
+
+    with pytest.raises(DirectCacheWriteRefused) as exc:
+        proj.g.query("CREATE (n:Point {id:'handle-9124'})")
+
+    assert "17.1" in str(exc.value), (
+        "the refusal must cite the rule it enforces so the next writer can "
+        f"read why; message={str(exc.value)!r}"
+    )
+
+
+def test_a_refused_handle_write_lands_nothing(armed_sdk):
+    """The refusal is PRE-WRITE.
+
+    A guard that raised AFTER dispatch would leave exactly the corruption it
+    claims to prevent, with a stack trace on top — the second writer would have
+    written and the caller would only learn about it.
+    """
+    proj = armed_sdk._get_proj()
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.query("CREATE (n:Point {id:'handle-nothing'})")
+    assert _count(proj, "Point", "id", "handle-nothing") == 0
+
+
+def test_a_property_rewrite_through_the_write_handle_is_refused(armed_sdk):
+    """The capstone's `SET` shape, not just `CREATE`.
+
+    The probe's finding was a property GAINED on an existing node
+    (`Point.second_writer_marker`) — a `MATCH … SET`, i.e. a classifier that
+    only recognised node creation would have left the observed hole open.
+    """
+    proj = armed_sdk._get_proj()
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.query(
+            "MATCH (n:Point {id:'handle-rewrite'}) "
+            "SET n.second_writer_marker = 'x'"
+        )
+
+
+@pytest.mark.parametrize("verb", MUTATING_CAPABLE_VERBS)
+def test_every_mutating_capable_verb_on_the_handle_is_guarded(armed_sdk, verb):
+    """Parametrized because a guard on `query` alone is one hop from no guard.
+
+    `ro_query` is mutating-CAPABLE despite its name (the vendor's
+    "read-only" verb dispatches whatever statement it is handed), `_query` is
+    the private hop both public verbs delegate to, and `profile`/`explain` put
+    the statement on the wire WITHOUT routing through `_query` (a raw
+    `GRAPH.PROFILE` never calls a query verb).
+    """
+    proj = armed_sdk._get_proj()
+    statement = "CREATE (n:Point {id:'handle-verb-" + verb.strip('_') + "'})"
+    kwargs = {"read_only": False} if verb == "_query" else {}
+    with pytest.raises(DirectCacheWriteRefused):
+        getattr(proj.g, verb)(statement, **kwargs)
+
+
+def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
+    """Enumeration: every query verb on `_GuardedGraph` consults ONE check.
+
+    Structural, not behavioural: a SEVENTH verb added to the handle later fails
+    here instead of silently re-opening §17.1 (the `#3595` shared-decision
+    precedent). The source is read rather than the bound methods, because the
+    property asserted is "the check is called inside the verb", which is not
+    observable from outside without issuing a statement per verb — and that is
+    what the parametrized test above does for the verbs we know about.
+    """
+    import inspect
+
+    source = inspect.getsource(_GuardedGraph)
+    guarded = []
+    for verb in MUTATING_CAPABLE_VERBS:
+        body = inspect.getsource(getattr(_GuardedGraph, verb))
+        assert "_refuse_unauthorized_cache_write" in body, (
+            f"`_GuardedGraph.{verb}` does not consult §17.1's authorization; a "
+            "mutating statement through it would write the derived cache "
+            "directly, which is the door #9124 closes"
+        )
+        guarded.append(verb)
+
+    assert set(guarded) == set(MUTATING_CAPABLE_VERBS)
+    # `execute_command` carries a statement only in its args, so it is checked
+    # separately — and this is the assertion that keeps it from being forgotten.
+    assert "_refuse_unauthorized_cache_write" in inspect.getsource(
+        _GuardedGraph.execute_command), (
+        "`_GuardedGraph.execute_command` must recover the statement from its "
+        "args and consult §17.1: a raw `GRAPH.QUERY` never reaches `query`, so "
+        "an unguarded command channel is this door re-opened under another name"
+    )
+    assert source.count("def _refuse_unauthorized_cache_write") == 1, (
+        "the handle must have exactly ONE authorization check — a second copy "
+        "is a second policy that can drift from the shared classifier"
+    )
+
+
+def test_a_mutating_statement_through_the_command_channel_is_refused(armed_sdk):
+    """`execute_command` is a mutating verb too.
+
+    A `GRAPH.QUERY` payload is dispatched by the vendor's client directly; it
+    never calls `query`/`_query`, so a guard that only covered the query verbs
+    would leave the raw channel as the one unguarded write path on this handle.
+    """
+    proj = armed_sdk._get_proj()
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(
+            "GRAPH.QUERY", proj._graph_name,
+            "CREATE (n:Point {id:'handle-cmd'})",
+        )
+    assert _count(proj, "Point", "id", "handle-cmd") == 0
+
+
+# ── reads are not writes ─────────────────────────────────────────────────
+
+def test_reads_through_the_write_handle_still_pass(armed_sdk):
+    """GREEN before this lane, and it must stay so.
+
+    The reconciler and every diagnostic read through this handle. A classifier
+    that refused reads would break the whole product, so this is the pin that
+    keeps the guard narrow — and it is RED for a guard that refuses on the
+    handle rather than on the statement (`_statement_writes`).
+    """
+    proj = armed_sdk._get_proj()
+    assert proj.g.query("MATCH (n:Point) RETURN count(n)").result_set[0][0] == 0
+    assert proj.g.ro_query("MATCH (n:Point) RETURN count(n)").result_set[0][0] == 0
+
+
+def test_a_read_whose_text_contains_a_write_keyword_still_passes(armed_sdk):
+    """The classifier strips literals, so a keyword inside DATA is not a write.
+
+    `_statement_writes` is conservative by design, but "conservative" must not
+    mean "any statement mentioning SET is a write": a diagnostic that filters on
+    a property VALUE would be refused, and the natural workaround is to bypass
+    the handle — which is how a guard creates the hole it was closing.
+    """
+    proj = armed_sdk._get_proj()
+    proj.g.query("MATCH (n:Point) WHERE n.note = 'SET n.x = 1' RETURN count(n)")
+
+
+# ── the sanctioned lanes still write ─────────────────────────────────────
+
+def test_the_sdk_write_lane_still_writes_on_a_journal_backed_projection(
+        armed_sdk, force_sparse_tfidf):
+    """GREEN before this lane — and this is the DEPENDENCY, executable.
+
+    `force_sparse_tfidf` pins the embedder OFF: this test is about the WRITE
+    LANE's authority, not about retrieval, and the ambient HF cache is
+    present-or-absent per lane (a cold, cache-less lane spent 141 s in
+    blocked-egress retries here before this pin). The assertions are unchanged
+    either way — the write must land and must be journalled.
+
+    The handle is *also* the SDK's live write lane (312 direct `proj.g.query(`
+    sites in `tortoise/sdk.py` alone). Arming the guard without the declaration
+    children does not "fail safe": it refuses the PRODUCT'S OWN writes, in
+    exactly three statement classes — `:EpMeta`'s epoch (#9123), the two direct
+    `:Event` writers (#9122), and the onboarding lane (#9121). This test is
+    what makes that ordering constraint CATCHABLE rather than remembered: it
+    goes RED the moment the guard lands ahead of any one of them.
+    """
+    sdk = armed_sdk
+    # `create_point` returns the created node's DICT, not a bare id — the id is
+    # `["id"]`, the same idiom `tests/test_7951_enforce_atomic_write.py` uses
+    # (`.get("id")`). Passing the dict straight to `_count` would bind it as a
+    # map value, match nothing, and read 0 whether or not the write landed.
+    point_id = sdk.create_point("concept", "handle authority lane")["id"]
+    assert point_id, "the SDK's own public write API must still write"
+    proj = sdk._get_proj()
+    assert _count(proj, "Point", "id", point_id) == 1
+    assert any(rec.get("type") for rec in _journal_lines(
+        sdk._journal_path_for_test)), (
+        "the write must still be journalled — the guard does not replace the "
+        "journal, it only refuses a write that bypassed it"
+    )
+
+
+def test_the_replay_scope_authorizes_the_write_handle(armed_sdk):
+    """A replay engine legitimately writes this cache: it IS the journal.
+
+    `_replay_write_scope` is the declaration those engines use, so the third
+    door must honour it — otherwise `rebuild` (which replays through the same
+    handle) would be refused by the guard that exists to protect its output.
+    """
+    proj = armed_sdk._get_proj()
+    with _replay_write_scope():
+        proj.g.query("CREATE (n:Point {id:'handle-replay'})")
+    assert _count(proj, "Point", "id", "handle-replay") == 1
+
+
+def test_the_live_scope_authorizes_the_write_handle(armed_sdk):
+    """The live doors' declaration reaches the third door too.
+
+    #7951 R3 recorded that `create_point`'s scope is a RESERVED marker whose
+    `CREATE` still runs on this handle; that is precisely why the scope has to
+    be honoured HERE, or the marker would be a promise the handle does not keep
+    and the transition to the fold would be blocked by the guard.
+    """
+    proj = armed_sdk._get_proj()
+    with _live_write_scope("test-door"):
+        proj.g.query("CREATE (n:Point {id:'handle-live'})")
+    assert _count(proj, "Point", "id", "handle-live") == 1
+
+
+def test_the_authorization_is_context_local_and_expires(armed_sdk):
+    """A scope is a per-call declaration, not a mode.
+
+    It must not leak out of the `with` (a raising body included): an escaping
+    authorization would turn every later write in the process into a sanctioned
+    one, which is strictly worse than no guard because it reads as one.
+    """
+    proj = armed_sdk._get_proj()
+    with pytest.raises(RuntimeError):
+        with _live_write_scope("test-leak"):
+            proj.g.query("CREATE (n:Point {id:'handle-in-scope'})")
+            raise RuntimeError("boom")
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.query("CREATE (n:Point {id:'handle-after-scope'})")
+
+
+def test_an_unarmed_projection_is_outside_section_17_1(armed_sdk):
+    """No journal, nothing to be the single writer of.
+
+    The guard's arming rule is identical to the fold's: a projection with no
+    journal is not a DERIVED cache, so refusing its writes would break every
+    embedded, journal-less caller (`FalkorProjection(db_path)` on its own) for
+    no gain.
+    """
+    proj = armed_sdk._get_proj()
+    proj._bind_journal(None)
+    proj.g.query("CREATE (n:Point {id:'handle-unarmed'})")
+    assert _count(proj, "Point", "id", "handle-unarmed") == 1
+
+
+# ── the schema-DDL decision (#9124's own, per the issue thread) ───────────
+
+def test_schema_ddl_survives_the_armed_guard(armed_sdk):
+    """Schema DDL is INSIDE the guard's surface, and it declares itself.
+
+    The issue thread measured the trap: `_ensure_indexes` runs the DDL sweep
+    outside every scope, the creation sites are `try/except`-LOGGED rather than
+    raised, so arming the handle guard without a declaration for the sweep does
+    not fail loudly — it leaves the projection with no fulltext indexes, and a
+    fulltext query then returns an EMPTY result set recorded as
+    `empty_results`, indistinguishable from a genuine zero-match.
+
+    So this asserts the OUTCOME (the indexes exist), not the absence of a log
+    line: a guard that turned the §17.1 suites green while degrading retrieval
+    must fail here.
+    """
+    sdk = armed_sdk
+    proj = sdk._get_proj()
+    assert proj._journal_backed
+
+    # Force the full sweep on the ARMED projection (the fast path would skip
+    # it), which is the state in which the guard meets the DDL.
+    proj._schema_is_current = lambda: False
+    proj._ensure_indexes()
+
+    rows = proj.g.ro_query("CALL db.indexes()").result_set
+    names = {str(cell) for row in rows for cell in row}
+    assert any("content" in c and "search_keys" in c for c in names), (
+        "the Point fulltext index must exist after the sweep — without it "
+        f"fulltext retrieval silently returns nothing; catalogue={sorted(names)}"
+    )
+    assert any("pointKind" in c for c in names), (
+        "the Point range indexes must exist after the sweep; "
+        f"catalogue={sorted(names)}"
+    )
+
+
+def test_the_schema_declaration_does_not_authorize_a_data_write(armed_sdk):
+    """The declaration covers the SCHEMA, not data.
+
+    `_ensure_indexes` opens the graph-metadata lane around the sweep. That must
+    not become a general permission: a node write issued from ordinary code
+    immediately after the sweep is still refused.
+    """
+    proj = armed_sdk._get_proj()
+    proj._schema_is_current = lambda: False
+    proj._ensure_indexes()
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.query("CREATE (n:Point {id:'handle-after-sweep'})")

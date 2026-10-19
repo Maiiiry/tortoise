@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from tortoise.cypher_guard import (  # #3595 `=~` guard — the ONE seam
+    _GRAPH_QUERY_COMMANDS,  # #9124: recover the statement a raw command carries
     _guard_execute_command,
     _guard_numeric_literals,  # #8479: the SAME domain, on the statement TEXT
     _guard_numeric_params,  # #7174: the store's numeric domain, same seam
@@ -3282,42 +3283,48 @@ def _journal_safe_params(params, cypher=None):
 # closed, which is the direction the definitional rule requires.
 #
 # SCOPE — STATED SO IT IS NOT OVER-READ. This closes the FOLD
-# (`FalkorProjection.apply`) and the public raw-query lane
-# (`FalkorProjection.query`) for a journal-backed projection. It does NOT yet
-# refuse a mutating statement issued straight at the guarded handle
-# (`proj.g.query(...)`). That handle is *also* the live path of every SDK
-# writer — `create_point`'s `CREATE (:Point)`, `update_point`'s
-# `SET n += $props` — so a blanket refusal there would break the product's own
-# write path, not a violation of it: the SDK's live doors journal, and there is
-# no runtime signal at the
-# handle that separates a journaled live write from a direct one. Converting
-# that 300+-site surface is §17.1's mechanism (1), the atomic write, and it is
-# recorded as still-open on `#7951` rather than papered over here.
+# (`FalkorProjection.apply`), the public raw-query lane
+# (`FalkorProjection.query`) and — since #9124 — the projection's WRITE HANDLE
+# (`proj.g`, `_GuardedGraph`) for a journal-backed projection. The handle is
+# *also* the live path of every SDK writer (`create_point`'s `CREATE (:Point)`,
+# `update_point`'s `SET n += $props`), which is why closing it needed the
+# writers that legitimately write outside the two original scopes to DECLARE
+# themselves first (#9121 onboarding, #9122 the `:Event` writers, #9123 the
+# `:EpMeta` epoch, and the schema DDL in `_ensure_indexes`). With those
+# declarations in place a refusal at the handle means an UNDECLARED writer —
+# which is exactly the second writer §17.1 forbids, and no longer the product's
+# own write path. Every mutating-capable verb is covered (`query`, `ro_query`,
+# `_query`, `profile`, `explain`, `execute_command`), because a guard on
+# `query` alone is one private hop or one verb name away from being no guard.
+# Converting the 300+-site surface to the atomic write is §17.1's mechanism (1)
+# and remains open on `#7951`.
 #
-# ⛔ THE RESIDUAL IS THREE ESCAPES, NOT ONE — named so it is stated, not
+# ⛔ THE RESIDUAL IS STILL TWO ESCAPES, NOT ONE — named so it is stated, not
 # discovered. A writer that wants to write this cache directly has:
-#   1. `proj.g.query("CREATE …")`     — the guarded handle itself (the SDK's
-#      own live lane, above);
+#   1. `proj.g.query("CREATE …")`     — the guarded handle itself. **CLOSED
+#      (#9124)**; a mutating statement outside a declared scope raises
+#      `DirectCacheWriteRefused`;
 #   2. `proj.g._g.query("CREATE …")`  — one private hop past the handle into
 #      the raw `_GuardedGraph`;
 #   3. `proj.db.select_graph(<g>).query("CREATE …")` — straight at the
 #      falkordb client, naming ANY graph.
-# All three are verified ALLOWED against a journal-backed projection. (2) and
-# (3) are the same class as (1) — they bypass the same fold — and none of the
-# three is guarded in this increment. They are the surface §17.1's atomic
-# write has to close; a lexical inventory cannot, because each is one hop
-# below anything a runtime signal is placed on.
+# (2) and (3) are verified ALLOWED against a journal-backed projection and are
+# NOT guarded in this increment; they are the same class as (1) — they bypass
+# the same fold — and they are the surface §17.1's atomic write has to close.
+# A lexical inventory cannot, because each is one hop below anything a runtime
+# signal is placed on.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class DirectCacheWriteRefused(RuntimeError):
     """§17.1: a write reached the derived cache without authorization.
 
-    Raised when a fold (`FalkorProjection.apply`) or a mutating statement on
-    the public raw-query lane (`FalkorProjection.query`) is issued against a
-    **journal-backed** projection outside a sanctioned scope. The projection is
-    the derived cache of a journal; a write it did not receive through its
-    journal is the second writer §17.1 forbids.
+    Raised when a fold (`FalkorProjection.apply`), a mutating statement on
+    the public raw-query lane (`FalkorProjection.query`), or a mutating
+    statement issued at the projection's write handle (`_GuardedGraph`, i.e.
+    `proj.g`) is issued against a **journal-backed** projection outside a
+    sanctioned scope. The projection is the derived cache of a journal; a write
+    it did not receive through its journal is the second writer §17.1 forbids.
     """
 
 
@@ -3412,6 +3419,42 @@ def _graph_metadata_write_scope(reason: str = "graph-metadata"):
     return _cache_write_authorized(reason)
 
 
+
+def _command_statement(args, kwargs) -> str:
+    """Recover the Cypher text a raw ``execute_command`` payload carries.
+
+    ``_GuardedGraph.execute_command`` has no ``cypher`` argument — the statement
+    travels positionally inside a Redis command (``("GRAPH.QUERY", graph,
+    cypher, ...)``, ``cypher_guard._GRAPH_QUERY_COMMANDS``), and the vendor also
+    inlines params into that same string. Recovering it is what keeps the raw
+    command channel from being the one mutating verb on this handle the §17.1
+    check cannot see: a ``GRAPH.QUERY`` never calls ``query``/``ro_query``/
+    ``_query``, so it would otherwise be a silence, not a refusal.
+
+    Returns the statement text when the payload IS a graph-query command, else
+    ``""`` — every other command (``GRAPH.DELETE``, ``GRAPH.COPY``, ``INFO``,
+    ``GRAPH.CONFIG``, a non-``GRAPH`` command) carries no Cypher and is left to
+    the existing guards.
+
+    The shape mirrored here is the one ``cypher_guard._guard_execute_command``
+    already pins (MEASURED against ``falkordb`` 1.6.2: ``args[3]`` is a flag such
+    as ``--compact``, never a params map), so the two readers of this channel
+    cannot disagree about where the Cypher lives.
+    """
+    if len(args) < 3:
+        return ""
+    verb, statement = args[0], args[2]
+    if isinstance(verb, bytes):
+        verb = verb.decode("utf-8", "replace")
+    if isinstance(statement, bytes):
+        statement = statement.decode("utf-8", "replace")
+    if not isinstance(verb, str) or not isinstance(statement, str):
+        return ""
+    if verb.upper() not in _GRAPH_QUERY_COMMANDS:
+        return ""
+    return statement
+
+
 class _GuardedGraph:
     """Wrapper around the FalkorDB Graph handle that guards bulk graph-wipe queries.
 
@@ -3461,7 +3504,57 @@ class _GuardedGraph:
         self._g = g
         self._proj = projection
 
+    def _refuse_unauthorized_cache_write(self, statement: str) -> None:
+        """§17.1 at the THIRD door: this handle is not a bypass.
+
+        `FalkorProjection.apply` (the fold) and `FalkorProjection.query` (the
+        public raw-query lane) were closed by #7951. This handle —
+        `proj.g`, the projection's write handle, and the module's "single handle
+        every projection write passes through" — was the stated residual: a
+        mutating statement issued HERE bypassed both. It is now refused on the
+        same terms and by the same shared classifier (`_statement_writes`), so
+        the three doors cannot disagree about what a write is.
+
+        WHY IT IS SAFE TO ARM NOW. #7951 deliberately left this door open
+        because it is *also* the SDK's live write lane: a blanket refusal there
+        broke the product's own writers, not a violation of it. The writers that
+        legitimately write outside the two original scopes now declare
+        themselves (the onboarding lane, the two direct `:Event` writers, the
+        `:EpMeta` epoch, and the schema DDL in `_ensure_indexes`), so a refusal
+        here means an UNDECLARED writer — which is exactly the second writer
+        §17.1 forbids.
+
+        ORDER. Called FIRST in every mutating-capable verb, BEFORE any other
+        pre-dispatch guard: a refusal that ran after the `=~`/numeric guards
+        would still be pre-write (they do not dispatch either), but keeping it
+        first makes the refusal the one answer for "may this statement reach
+        the cache at all".
+
+        ONLY a journal-backed projection refuses; an unbound projection
+        (`_journal_backed` False) has no journal to be the single writer OF, so
+        §17.1 has nothing to enforce there (the same arming rule as the fold).
+        """
+        if _CACHE_WRITE_AUTHORIZED.get() is not None:
+            return
+        if not getattr(self._proj, "_journal_backed", False):
+            return
+        if not _statement_writes(statement):
+            return
+        raise DirectCacheWriteRefused(
+            "Refusing a mutating statement issued at the projection's write "
+            "handle (`proj.g`): this projection is the derived cache of a "
+            "journal, so a write it did not receive through that journal is "
+            "the second writer §17.1 forbids "
+            "(docs/architecture/STORAGE-ARCHITECTURE.md §17.1). Write through "
+            "the journal instead (`TortoiseSDK._apply_and_journal` or the "
+            "SDK's public write API); a live door that appends first declares "
+            "`_live_write_scope()`, a replay engine that is replaying the "
+            "journal's own records declares `_replay_write_scope()`. "
+            "statement=" + " ".join((statement or "").split())[:160]
+        )
+
     def query(self, cypher: str, params=None, timeout=None):
+        self._refuse_unauthorized_cache_write(cypher)
         # #3595: refuse an unsupported operator BEFORE it is sent. FalkorDB
         # answers `=~` with an EMPTY result set, so this is the one decision
         # point for the `proj.g` path. The decision itself lives in
@@ -3500,6 +3593,11 @@ class _GuardedGraph:
         )
 
     def ro_query(self, cypher: str, params=None, timeout=None):
+        # The "read-only" verb is mutating-CAPABLE, not read-only: the name is
+        # the vendor's, and a statement handed to it is dispatched the same way.
+        # Guarding it is what stops the check from being one verb-name away from
+        # no check at all.
+        self._refuse_unauthorized_cache_write(cypher)
         # Same refusal for the read-only verb: the raw handle this wrapper
         # holds is guarded too, but keep the projection's own wrapper complete
         # rather than relying on the inner handle's class.
@@ -3514,6 +3612,7 @@ class _GuardedGraph:
     def _query(self, cypher: str, params=None, timeout=None, read_only=False):
         # The vendor's `query`/`ro_query` both delegate to `_query`; a caller
         # reaching `_query` directly must not slip past the refusal either.
+        self._refuse_unauthorized_cache_write(cypher)
         _guard_unsupported_cypher(cypher)
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
@@ -3525,7 +3624,11 @@ class _GuardedGraph:
 
     def profile(self, cypher: str, params=None):
         # PROFILE/EXPLAIN put the statement on the wire WITHOUT routing through
-        # `_query`, so they carry their own refusal.
+        # `_query`, so they carry their own refusal. `GRAPH.PROFILE` EXECUTES
+        # the statement, so this verb is mutating-capable and must be guarded
+        # exactly like `query`; guarding `query` alone would leave the same
+        # write one verb away.
+        self._refuse_unauthorized_cache_write(cypher)
         _guard_unsupported_cypher(cypher)
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
@@ -3533,6 +3636,13 @@ class _GuardedGraph:
         return self._g.profile(cypher, params=_journal_safe_params(params, cypher))
 
     def explain(self, cypher: str, params=None):
+        # `GRAPH.EXPLAIN` only PLANS — it does not execute — so it is not in
+        # `_statement_writes`' threat model on its own. It is guarded for
+        # ENUMERATION UNIFORMITY: a verb that is unguarded is a verb a future
+        # refactor can start dispatching, and the cost of guarding it is zero
+        # (a plan is never a write, and a mutating statement is refused before
+        # it is planned).
+        self._refuse_unauthorized_cache_write(cypher)
         _guard_unsupported_cypher(cypher)
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
@@ -3540,6 +3650,14 @@ class _GuardedGraph:
         return self._g.explain(cypher, params=_journal_safe_params(params, cypher))
 
     def execute_command(self, *args, **kwargs):
+        # #9124: the raw Redis command channel is a mutating verb on this handle
+        # too — a `GRAPH.QUERY` payload never reaches `query`/`_query`, so an
+        # unguarded channel would be the third door re-opened under another
+        # name. The statement is recovered from the payload (a raw `GRAPH.QUERY`
+        # inlines its params into that same string, so this is the whole write).
+        statement = _command_statement(args, kwargs)
+        if statement:
+            self._refuse_unauthorized_cache_write(statement)
         # #3595 (review round 2, P2): the raw Redis command channel carries
         # `GRAPH.QUERY` / `GRAPH.PROFILE` / ... too, and the guarded handles
         # beneath `self._g` already intercept it — but keep the wrapper's own
@@ -9477,6 +9595,35 @@ class FalkorProjection(
     def rebuild_all(self, log_dir: str, *,
                     confirm_destructive: bool = False,
                     require_empty: bool = False) -> dict:
+        """#9124: declare the REPLAY lane, then run the rebuild.
+
+        Every write ``rebuild_all`` performs — the whole-graph wipe, and the
+        per-record folds that follow it — is the cache being reconstructed FROM
+        the journal. That is precisely the lane ``_replay_write_scope`` names
+        (#7951), and it is the declaration §17.1's THIRD door requires before it
+        will let a mutating statement reach ``proj.g``.
+
+        Without it, the guard refuses the replay of the first ``PointAdded``
+        record (measured: ``MERGE (n:Point {id:$id}) … SET n.content=…`` raises
+        ``DirectCacheWriteRefused``) and the rebuild path — the very tool the
+        journal exists for — breaks. ``rebuild`` (single-log) already declares
+        this scope; ``rebuild_all`` did not, which is the asymmetry this fixes.
+
+        The scope is also what makes the wipe legitimate at the third door: a
+        wipe REMOVES derived state so the record can be replayed into it, and
+        never writes unjournalled state ahead of the journal — the class §17.1
+        forbids.
+        """
+        with _replay_write_scope():
+            return self._rebuild_all_replay(
+                log_dir,
+                confirm_destructive=confirm_destructive,
+                require_empty=require_empty,
+            )
+
+    def _rebuild_all_replay(self, log_dir: str, *,
+                            confirm_destructive: bool = False,
+                            require_empty: bool = False) -> dict:
         """Rebuild from all .jsonl files in a directory. Returns counts.
 
         #3585 (R8/R9): the whole fold runs inside the non-folded-event
@@ -13896,7 +14043,18 @@ class FalkorProjection(
             f"REFUSING to run bulk DETACH DELETE on non-test graph "
             f"({operation})"
         )
-        self.g.query("MATCH (n) DETACH DELETE n")
+        # #9124: the third door (§17.1's write handle) refuses a mutating
+        # statement at `proj.g` unless a sanctioned lane declares it. THIS is a
+        # sanctioned lane, and it is the one the replay engines own: the wipe
+        # REMOVES derived state so the record can be replayed into it — it never
+        # writes unjournalled state ahead of the journal, which is the class
+        # §17.1 forbids. `_replay_write_scope` is the declaration #7951 already
+        # gives the replay engines, so the wipe declares the same thing as the
+        # replay that follows it. Measured without it: `rebuild_all` raises
+        # `DirectCacheWriteRefused` on this literal statement and the rebuild
+        # path breaks (#9124's own acceptance run found it).
+        with _replay_write_scope():
+            self.g.query("MATCH (n) DETACH DELETE n")
 
     def _assert_test_graph(self, reason: str = "") -> None:
         """L2 of the destructive-op guard: refuse bulk wipe on a non-test graph.
@@ -14716,6 +14874,27 @@ class FalkorProjection(
         )
 
     def _ensure_indexes(self) -> None:
+        """Create the store's schema — DECLARED to §17.1 as graph metadata.
+
+        The DDL this function issues is graph metadata in the sense
+        ``_graph_metadata_write_scope`` defines: no journal record describes an
+        index, and a rebuild recreates it (`_ensure_indexes` runs on every
+        projection construction). Without this declaration the handle guard
+        (#9124) would refuse the sweep, and the failure would be SILENT — the
+        creation sites are ``try/except``-logged, so the graph would simply end
+        up with no fulltext indexes and every fulltext query would answer an
+        empty result set. The declaration is scoped to this ONE function on
+        purpose: it authorizes the schema, not a data write. A ``CREATE`` of a
+        node added here would inherit the declaration, which is why the sweep's
+        body is kept to DDL and catalogue reads — see
+        ``tests/test_9079_handle_write_authority.py``,
+        ``test_schema_ddl_survives_the_armed_guard``, whose companion assertion
+        would go red on exactly that substitution.
+        """
+        with _graph_metadata_write_scope("schema-ddl"):
+            self._ensure_indexes_declared()
+
+    def _ensure_indexes_declared(self) -> None:
         """Create this store's indexes, and resolve its vector-index handle.
 
         ⛔ The historical opening line — *"Create indexes on frequently-filtered

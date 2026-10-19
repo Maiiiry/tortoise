@@ -1473,6 +1473,19 @@ surfaces:
   # otherwise run this suite never — the #1349/#2938/#3154 silent-drop class.
   - test_9079_onboarding_declared_lane.py
   - test_7951_create_point_outbox.py
+  # #9124 (the THIRD door): the projection's WRITE HANDLE (`proj.g`,
+  # `_GuardedGraph`) refuses a mutating statement outside a declared scope, on
+  # every mutating-capable verb, plus the schema-DDL declaration that keeps the
+  # refusal from silently disabling fulltext retrieval. Its subjects are
+  # `tortoise/projection/__init__.py` (SHARED_MODULE — a change there selects the
+  # full matrix) and `tortoise/cypher_guard.py` (the
+  # `_GRAPH_QUERY_COMMANDS`/statement-recovery seam for `execute_command`,
+  # which matches no named SOURCE_PATTERN and falls through to `core`). So a
+  # single `core` arm runs it on BOTH subjects a change can re-open the door
+  # through — verified with the repo's own selector:
+  # `--changed-files tortoise/cypher_guard.py` → surfaces=['core']. `--integrity`
+  # also requires every test file to be classified, which this entry satisfies.
+  - test_9079_handle_write_authority.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
   # create-side suite above (`tortoise/sdk.py`), so it is registered on the
