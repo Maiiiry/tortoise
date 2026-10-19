@@ -643,6 +643,7 @@ def _cmd_record_reconcile(args):
         reconcile_record_and_cache,
         record_key_map,
     )
+
     # The DSN is resolved by the module that DECLARES the arming surface — not
     # re-spelled here. `record_dsn` owns `RECORD_DSN_ENV` (so a rename cannot
     # silently disarm this verb while `RecordWriter` stays armed) and it REFUSES
