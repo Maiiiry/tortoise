@@ -1212,6 +1212,27 @@ def test_a_summary_less_leg_still_counts_its_failures(tmp_path: Path) -> None:
     # a summary-less leg can only report what it saw fail — never passes.
     assert agg["total_counts"]["passed"] == 10, agg["total_counts"]
 
+    # ...and the contribution is attributed to the LEG that made it. Recording it
+    # only in the total left the artifact's per-leg detail summing to 5 beside an
+    # `outcome.failed` of 6, so the sixth failure could not be traced to any log
+    # (#9134 review cycle 2). The parsed summary stays honest — it really did say
+    # nothing — and the derived numbers sit beside it.
+    by_log = {source["log"]: source for source in agg["log_sources"]}
+    summary_less = by_log["pytest-b.log"]
+    assert summary_less["counts"]["failed"] == 0, (
+        "the parsed summary must keep saying what the log said (nothing)"
+    )
+    assert summary_less["counts_from_progress"] == {"failed": 2}, summary_less
+    attributed = sum(
+        source["counts"]["failed"]
+        + source.get("counts_from_progress", {}).get("failed", 0)
+        for source in agg["log_sources"]
+    )
+    assert attributed == agg["total_counts"]["failed"], (
+        f"the legs account for {attributed} failure(s) but the total says "
+        f"{agg['total_counts']['failed']} — the difference belongs to no log"
+    )
+
 
 def test_a_held_row_does_not_strand_the_markers_own_separator() -> None:
     """The restated marker must replace the WORDS only.
@@ -3737,4 +3758,24 @@ def test_the_committed_artifact_agrees_with_its_own_failure_detail() -> None:
         assert outcome["failed"] == listed, (
             f"outcome.failed={outcome['failed']} but {listed} test(s) are named in "
             "the artifact's own failed_tests"
+        )
+
+    # The per-leg detail has to ADD UP to the total, or a failure is counted that
+    # no log accounts for and cannot be traced (#9134 review cycle 2: the legs
+    # summed to 5 beside `outcome.failed: 6`). A summary-less leg's parsed summary
+    # is legitimately all-zero, so its contribution is the one recorded beside it.
+    sources = artifact.get("log_sources", [])
+    if sources and "failed" in outcome:
+        unattributable = {}
+        for key in ("failed", "error"):
+            attributed = sum(
+                source.get("counts", {}).get(key, 0)
+                + source.get("counts_from_progress", {}).get(key, 0)
+                for source in sources
+            )
+            if attributed != outcome.get(key):
+                unattributable[key] = (attributed, outcome.get(key))
+        assert not unattributable, (
+            "the artifact's log_sources do not add up to its outcome "
+            f"(attributed, outcome): {unattributable}"
         )

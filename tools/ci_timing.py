@@ -2021,14 +2021,27 @@ def aggregate_logs(logs_dir: Path | str) -> dict:
         # not an absence of failures, so a summary-less leg contributes what its
         # progress lines told us — failures only, never passed/skipped, which a
         # summary-less log cannot establish.
+        #
+        # The contribution is recorded ON THE LEG, not only in the total: adding
+        # it to `total_counts` alone left the artifact's per-leg detail summing
+        # to 5 while `outcome.failed` read 6, so the sixth failure belonged to no
+        # leg and could not be traced (#9134 review cycle 2). `counts` keeps the
+        # parsed summary — the honest "this log said nothing" — and the derived
+        # numbers live beside it under their own key.
+        from_progress: dict[str, int] = {}
         if not any(parsed["counts"].values()):
             for state, key in (("FAILED", "failed"), ("ERROR", "error")):
-                total_counts[key] += sum(
-                    1 for st in parsed["outcomes"].values() if st == state)
+                seen = sum(1 for st in parsed["outcomes"].values() if st == state)
+                if seen:
+                    total_counts[key] += seen
+                    from_progress[key] = seen
         killed_any = killed_any or parsed["killed"]
         failed_tests.update(n for n, st in parsed["outcomes"].items() if st in ("FAILED", "ERROR"))
-        log_sources.append({"log": Path(log_path).name, "error": parsed["error"],
-                            "counts": parsed["counts"]})
+        source: dict = {"log": Path(log_path).name, "error": parsed["error"],
+                        "counts": parsed["counts"]}
+        if from_progress:
+            source["counts_from_progress"] = from_progress
+        log_sources.append(source)
     return {"files": files, "total_counts": total_counts, "killed_any": killed_any,
             "failed_tests": failed_tests, "log_sources": log_sources}
 
