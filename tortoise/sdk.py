@@ -19307,6 +19307,15 @@ class TortoiseSDK:
         # ``ep_prior_only_cypher`` so a #2199 baseline cannot read contested
         # there either; only the genuinely UNMEASURED (no persisted prior)
         # listing remains get_contested_claims' deliberate divergence.
+        # #7927: a SECOND divergence now exists, and it is also deliberate —
+        # get_contested_claims sweeps the four epistemic labels (#7813) and
+        # lists a MEASURED :Subject/:Object/:Event belief, while this scan is
+        # ``MATCH (n:Point)`` and therefore cannot. Do not "harmonize" that
+        # either without deciding which surface the entity belongs on: this
+        # scan feeds the PR prune (Point rewiring), not the belief report.
+        # The claim leg below keeps its own pre-#7927 ``n.is_operator = false``
+        # — the same bare form the widened scans replaced — so it is
+        # unchanged by that widening.
         contested: dict[str, dict] = {}
         rows = proj.g.query(
             "MATCH (n:Point) "
@@ -20907,7 +20916,7 @@ class TortoiseSDK:
                          include_draft: bool = False,
                          stats: dict | None = None
                          ) -> tuple[list[str], set[tuple[str, str, str]]]:
-        """BFS subgraph selection from anchor Points — A9 return contract.
+        """BFS subgraph selection from anchor epistemic nodes — A9 return contract.
 
         Delegates to the shared _bfs_select_operators in tortoise.analyze.
         Returns ``(operator_ids, factor_anchors)`` — the operator Point IDs
@@ -20918,12 +20927,20 @@ class TortoiseSDK:
         to operator nodes, GATE-2 Q3). With include_draft=False (default,
         #780) draft anchors, operators and frontier points are excluded.
 
+
         ``stats`` (#6211): OPTIONAL out-parameter, filled by the selector with
         ``truncated`` / ``operators_seen`` / ``operators_used`` / ``op_cap``.
         The return tuple is unchanged, so every existing caller (the dreamer,
         the calibration scope probe) is unaffected; only a caller that does not
         own the operator cap passes it — ``compute_confidence`` — which needs
         the cap in its RESULT, not on stderr.
+
+
+        #7927: an anchor may be any of ``live.EPISTEMIC_LABELS``
+        (:Point/:Subject/:Object/:Event, owner ruling #7813) — the widening
+        lives in the shared selector, so this surface inherits it rather than
+        re-spelling a label predicate (pinned by
+        ``tests/test_7927_epistemic_read_surfaces.py``).
         """
         from .analyze import _bfs_select_operators
         proj = self._get_proj()
