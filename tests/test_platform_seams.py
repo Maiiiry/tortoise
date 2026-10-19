@@ -74,6 +74,15 @@ def env(tmp_path, monkeypatch):
     (cwd/.tortoise, ~/.tortoise) can NEVER flip the child into hosted mode
     (a real hosted identity on the runner machine would make the
     local-graph tests vacuous/failing — see the wave-1 review P2).
+
+    PATH is pinned to ``_minimal_path`` for the SAME reason, one seam over
+    (#8323 class: the ambient environment must not reach the child).
+    ``volunteer-turn.sh`` prefers ``command -v tortoise`` over the checkout
+    that OWNS it, so a stale or broken global install (e.g. a Homebrew
+    ``/opt/homebrew/bin/tortoise`` whose own import is dead) shadows the
+    reflex under test and the hook fail-opens to empty output — a RED that
+    says nothing about this repo. With ``tortoise`` off PATH the hook takes
+    its documented next candidate, the checkout's own ``.venv/bin/tortoise``.
     """
     db = tmp_path / "seams.db"
     base = {
@@ -81,6 +90,7 @@ def env(tmp_path, monkeypatch):
         "TORTOISE_DB_PATH": str(db),
         "TORTOISE_DB_URI": "",
         "HOME": str(tmp_path / "home"),
+        "PATH": str(_minimal_path(tmp_path)),
     }
     subprocess.run(
         [_PY, "-c", _SEED], env=base, check=True,
@@ -114,6 +124,61 @@ def _run(argv, env, stdin: str | None = None, cwd: str | None = None):
         text=True,
         timeout=180,
     )
+
+
+# ── #8323 — every `tortoise install` child must be HOME-isolated ────────
+# `--dir` scopes the READ half (claude/cline/devin).  The CAPTURE half is
+# HOME-scoped for four harnesses — `pi` (~/.pi/agent/extensions), `codex`
+# ($CODEX_HOME, default ~/.codex), `cursor` (~/.cursor) and `openclaw`
+# (~/.openclaw) — and `capture_install.install_capture` resolves it from
+# `Path.home()`, i.e. from the CHILD's $HOME.  A child env that inherits
+# $HOME therefore installs into the developer's real home on every run:
+#
+#   * it adds a SECOND Pi capture producer on a machine where Pi is the live
+#     harness — the double-POST / `409 in flight` collision the installer's
+#     own legacy guard exists to prevent (#3713) — and it rotates
+#     `~/.codex/hooks/tortoise-session-end.sh.bak.N`;
+#   * it turns RED on any machine whose real home carries the legacy-disabled
+#     state, because `capture_install` refuses to install over an existing
+#     `.tortoise-capture.disabled` next to a legacy `tortoise-capture/` dir —
+#     a failure with nothing to do with the code under test.
+#
+# The guard is MECHANICAL (not a review checklist) so the leak cannot return
+# one inline `{**os.environ, ...}` at a time: it fails the moment any install
+# child is handed the running user's home.
+
+
+def _real_home() -> Path:
+    """The running user's home — what a child inherits when HOME is unpinned."""
+    return Path(os.path.expanduser("~"))
+
+
+@pytest.fixture(autouse=True)
+def _install_never_inherits_the_real_home(monkeypatch):
+    """#8323: no `tortoise install` child may see the real $HOME."""
+    real = _real_home().resolve()
+    real_run = subprocess.run
+
+    def guarded(argv, *args, **kwargs):
+        cmd = [str(a) for a in
+               (argv if isinstance(argv, (list, tuple)) else [argv])]
+        if "install" in cmd:
+            env = kwargs.get("env")
+            assert env is not None, (
+                "a `tortoise install` run was given no explicit env, so it "
+                "inherits the developer's real home and installs the "
+                "HOME-scoped capture seam there (#8323): " + " ".join(cmd))
+            home = env.get("HOME")
+            assert home, (
+                "a `tortoise install` child env has no HOME — the installer "
+                "falls back to the real home (#8323): " + " ".join(cmd))
+            assert Path(home).resolve() != real, (
+                "a `tortoise install` child inherited the developer's real "
+                f"home ({real}); the HOME-scoped capture seams would install "
+                "into it (#8323): " + " ".join(cmd))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded)
 
 
 # ── 1. `tortoise volunteer` CLI ─────────────────────────────────────────
@@ -192,8 +257,44 @@ def test_volunteer_cli_raw_prompt_that_parses_as_json(tmp_path):
 # ── 2. `tortoise install` — agent-first harness registration ────────────
 
 
+def test_install_writes_home_scoped_capture_seams_into_the_temp_home(tmp_path):
+    """#8323: `--dir` scopes the READ half only.  The capture seam is
+    HOME-scoped for `pi` (an extension file under `~/.pi/agent/extensions`)
+    and `codex` (a script + registration under `$CODEX_HOME`), so both must
+    land in the TEMP home.
+
+    This is the assertion that fails the moment the HOME pin is dropped: the
+    install then writes the developer's real home and this file has no
+    artifact here at all.  Paths are DERIVED from the installer's own
+    contracts (`PI_EXTENSION_NAME`, the `codex` HarnessLayout) so a rename
+    cannot silently turn this into a test of nothing.
+    """
+    from tortoise import hook_install
+    from tortoise.capture_install import PI_EXTENSION_NAME
+
+    home = tmp_path / "home"
+    assert home.resolve() != _real_home().resolve()
+
+    r = _run(["install", "pi", "--dir", str(tmp_path)], _isolated(tmp_path))
+    assert r.returncode == 0, r.stderr
+    pi_ext = home / ".pi" / "agent" / "extensions" / PI_EXTENSION_NAME
+    assert pi_ext.is_file(), (
+        "the pi capture extension did not land in the isolated home — the "
+        f"install wrote the developer's real home instead: {r.stdout}")
+    assert "tortoise" in pi_ext.read_text(encoding="utf-8").lower(), pi_ext
+
+    layout = hook_install.get_layout("codex")
+    r = _run(["install", "codex", "--dir", str(tmp_path)],
+             _isolated(tmp_path))
+    assert r.returncode == 0, r.stderr
+    codex_root = home / layout.root_home_default
+    assert (codex_root / layout.settings_file).is_file(), (r.stdout, r.stderr)
+    for spec in layout.scripts:
+        assert (codex_root / spec.rel_command).is_file(), (spec, r.stdout)
+
+
 def test_install_codex_writes_registration(tmp_path):
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "codex", "--dir", str(tmp_path)], env)
     assert r.returncode == 0, r.stderr
     cfg = json.loads((tmp_path / ".codex" / "hooks.json").read_text())
@@ -207,7 +308,7 @@ def test_install_codex_writes_registration(tmp_path):
 
 
 def test_install_codex_idempotent_and_uninstall(tmp_path):
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     _run(["install", "codex", "--dir", str(tmp_path)], env)
     _run(["install", "codex", "--dir", str(tmp_path)], env)
     cfg = json.loads((tmp_path / ".codex" / "hooks.json").read_text())
@@ -230,7 +331,7 @@ def test_install_claude_merges_preserving_existing_hooks(tmp_path):
     target = tmp_path / ".claude" / "settings.json"
     target.parent.mkdir(parents=True)
     target.write_text(json.dumps(existing))
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "claude", "--dir", str(tmp_path)], env)
     assert r.returncode == 0, r.stderr
     cfg = json.loads(target.read_text())
@@ -254,7 +355,7 @@ def test_install_claude_idempotent_reinstall(tmp_path):
     registration (regression: the merge dedup used to miss wrapper-shaped
     entries; #3963: the capture seam adds a SECOND, distinct hook on the same
     event, so the invariant is per-command, not per-group)."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     _run(["install", "claude", "--dir", str(tmp_path)], env)
     _run(["install", "claude", "--dir", str(tmp_path)], env)
     _run(["install", "claude", "--dir", str(tmp_path)], env)
@@ -274,7 +375,7 @@ def test_install_codex_refuses_non_object_config(tmp_path):
     target = tmp_path / ".codex" / "hooks.json"
     target.parent.mkdir(parents=True)
     target.write_text("[1, 2, 3]")
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "codex", "--dir", str(tmp_path)], env)
     assert r.returncode == 1
     assert "not a JSON object" in r.stderr
@@ -282,7 +383,7 @@ def test_install_codex_refuses_non_object_config(tmp_path):
 
 
 def test_install_cline_writes_hook_file(tmp_path):
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "cline", "--dir", str(tmp_path)], env)
     assert r.returncode == 0, r.stderr
     hook = tmp_path / ".cline" / "hooks" / "UserPromptSubmit"
@@ -297,7 +398,7 @@ def test_install_cline_refuses_overwrite_of_foreign_hook(tmp_path):
     hook = tmp_path / ".cline" / "hooks" / "UserPromptSubmit"
     hook.parent.mkdir(parents=True)
     hook.write_text("#!/usr/bin/env bash\necho user-authored\n")
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "cline", "--dir", str(tmp_path)], env)
     assert r.returncode == 1
     assert "refusing" in r.stderr.lower()
@@ -309,7 +410,7 @@ def test_install_cline_refuses_overwrite_of_foreign_hook(tmp_path):
 
 
 def test_install_cline_uninstall_removes_own_hook(tmp_path):
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     _run(["install", "cline", "--dir", str(tmp_path)], env)
     hook = tmp_path / ".cline" / "hooks" / "UserPromptSubmit"
     assert hook.exists()
@@ -335,7 +436,7 @@ def test_install_devin_writes_unwrapped_registration(tmp_path):
     UserPromptSubmit key at the TOP LEVEL — a `"hooks"` wrapper is the codex/
     claude shape and would register nothing in Devin (it would read the file
     as an event named `hooks`)."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "devin", "--dir", str(tmp_path)], env)
     assert r.returncode == 0, r.stderr
     target = tmp_path / ".devin" / "hooks.v1.json"
@@ -350,7 +451,7 @@ def test_install_devin_writes_unwrapped_registration(tmp_path):
 def test_install_devin_preserves_other_events_and_foreign_hooks(tmp_path):
     """A pre-existing .devin/hooks.v1.json keeps every other event and the
     user's own UserPromptSubmit hook, on install AND on --uninstall."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     target = tmp_path / ".devin" / "hooks.v1.json"
     target.parent.mkdir(parents=True)
     cfg = {
@@ -381,7 +482,7 @@ def test_install_devin_preserves_other_events_and_foreign_hooks(tmp_path):
 def test_install_devin_idempotent_reinstall(tmp_path):
     """A second install is a byte-identical no-op (a re-run is the upgrade
     path) and never appends a duplicate registration."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     target = tmp_path / ".devin" / "hooks.v1.json"
     assert _run(["install", "devin", "--dir", str(tmp_path)],
                 env).returncode == 0
@@ -396,7 +497,7 @@ def test_install_devin_idempotent_reinstall(tmp_path):
 def test_install_devin_uninstall_when_absent_is_clean_noop(tmp_path):
     """--uninstall with no registration is a clean no-op that creates NO
     file (the #2383 inversion) and does not traceback."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     target = tmp_path / ".devin" / "hooks.v1.json"
     r = _run(["install", "devin", "--dir", str(tmp_path), "--uninstall"], env)
     assert r.returncode == 0, r.stderr
@@ -408,7 +509,7 @@ def test_install_devin_uninstall_when_absent_is_clean_noop(tmp_path):
 def test_install_devin_refuses_malformed_config(tmp_path):
     """Invalid JSON, a non-object top level, and a non-list UserPromptSubmit
     are each REFUSED untouched — never clobbered, never a traceback."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     target = tmp_path / ".devin" / "hooks.v1.json"
     target.parent.mkdir(parents=True)
     for bad in ("{not json", "[1, 2]", '{"UserPromptSubmit": {"a": 1}}'):
@@ -423,7 +524,7 @@ def test_install_devin_refuses_malformed_config(tmp_path):
 def test_install_devin_rejects_non_devin_intent(tmp_path):
     """`install pi` (no read seam) must NOT fall into the devin target — and
     `install devin` must not touch a codex/claude/cline registration."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "pi", "--dir", str(tmp_path)], env)
     assert not (tmp_path / ".devin" / "hooks.v1.json").exists()
     assert r.returncode == 0  # pi installs its capture extension
@@ -445,7 +546,7 @@ def test_install_devin_refuses_symlink_escape(tmp_path):
     proj = tmp_path / "proj"
     (proj / ".devin").mkdir(parents=True)
     (proj / ".devin" / "hooks.v1.json").symlink_to(outside)
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "devin", "--dir", str(proj)], env)
     assert r.returncode == 1
     assert "Refusing" in r.stderr
@@ -456,7 +557,7 @@ def test_install_devin_warns_when_claude_hook_also_registered(tmp_path):
     """Devin reads `.claude/` hooks by default (read_config_from.claude), so a
     repo carrying BOTH registrations runs the reflex twice per turn. The
     install must SAY so (the duplicate is otherwise silent)."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     assert _run(["install", "claude", "--dir", str(tmp_path)],
                 env).returncode == 0
     r = _run(["install", "devin", "--dir", str(tmp_path)], env)
@@ -474,7 +575,7 @@ def test_install_devin_advisory_never_fails_the_install(tmp_path):
     cannot parse (non-object JSON, a non-dict `hooks`, non-UTF-8 bytes) must
     leave the devin install a SUCCESS — never a reported FAILURE over a file
     the install already wrote."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     target = tmp_path / ".devin" / "hooks.v1.json"
     (tmp_path / ".claude").mkdir()
     settings = tmp_path / ".claude" / "settings.json"
@@ -492,7 +593,7 @@ def test_install_devin_advisory_never_fails_the_install(tmp_path):
 def test_install_devin_repairs_stale_script_path(tmp_path):
     """Same stale-path repair as codex/claude — a dead volunteer-turn.sh
     path is rewritten in place, not left as a silent dead hook."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     target = tmp_path / ".devin" / "hooks.v1.json"
     target.parent.mkdir(parents=True)
     stale = "/old/vanished/path/volunteer-turn.sh devin"
@@ -515,7 +616,7 @@ def test_install_refuses_symlink_escape(tmp_path):
     target_dir = tmp_path / "proj" / ".claude"
     target_dir.mkdir(parents=True)
     (target_dir / "settings.json").symlink_to(outside)
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "claude", "--dir", str(target_dir.parent)], env)
     assert r.returncode == 1
     assert "Refusing" in r.stderr
@@ -530,7 +631,7 @@ def test_install_refuses_symlinked_intermediate_dir(tmp_path):
     proj = tmp_path / "proj"
     (proj / ".cline").parent.mkdir(parents=True, exist_ok=True)
     (proj / ".cline").symlink_to(outside)
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "cline", "--dir", str(proj)], env)
     assert r.returncode == 1
     assert "Refusing" in r.stderr
@@ -542,7 +643,7 @@ def test_install_cline_refuses_directory_target(tmp_path):
     traceback."""
     hook = tmp_path / ".cline" / "hooks" / "UserPromptSubmit"
     hook.mkdir(parents=True)
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "cline", "--dir", str(tmp_path)], env)
     assert r.returncode == 1
     assert "is a directory" in r.stderr
@@ -724,7 +825,7 @@ def test_install_uninstall_when_absent_is_clean_noop(tmp_path):
     """--uninstall with NO registration must be a clean no-op — it must NOT
     invert into a fresh install (the pre-#2383 bug registered a per-turn
     hook on double-uninstall)."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     for harness, rel in (("codex", ".codex/hooks.json"),
                          ("claude", ".claude/settings.json"),
                          ("cline", ".cline/hooks/UserPromptSubmit")):
@@ -768,7 +869,7 @@ def test_install_uninstall_when_absent_is_clean_noop(tmp_path):
 def test_install_cline_uninstall_absent_no_traceback(tmp_path):
     """cline --uninstall with no hook file: clean message, no FileNotFound
     traceback (the pre-#2383 raw traceback path)."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     r = _run(["install", "cline", "--dir", str(tmp_path), "--uninstall"], env)
     assert r.returncode == 0, r.stderr
     assert "Traceback" not in r.stderr
@@ -779,7 +880,7 @@ def test_install_codex_repairs_stale_script_path(tmp_path):
     """A registration pointing at a STALE (moved/dead) volunteer-turn.sh
     path is repaired in place on reinstall — not left as a silent dead hook
     while install reports success."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     stale = "/old/vanished/path/volunteer-turn.sh codex"
     cfg = {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command",
                                                       "command": stale}]}]}}
@@ -798,7 +899,7 @@ def test_install_codex_repairs_stale_script_path(tmp_path):
 
 def test_install_claude_repairs_stale_script_path(tmp_path):
     """Same stale-path repair for the claude wrapper shape."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     stale = "/gone/volunteer-turn.sh claude"
     cfg = {"hooks": {"UserPromptSubmit": [
         {"hooks": [{"type": "command", "command": stale}]}]}}
@@ -816,7 +917,7 @@ def test_install_uninstall_dangling_symlink_no_inversion(tmp_path):
     """R2 P1: --uninstall against a DANGLING in-root symlink target must be
     a clean no-op — the R1 guard's is_symlink() carve-out let it fall
     through to the fresh-install write (re-inverting the #2383 bug)."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     for harness, rel in (("codex", ".codex/hooks.json"),
                          ("claude", ".claude/settings.json")):
         target = tmp_path / rel
@@ -837,7 +938,7 @@ def test_install_codex_leaves_user_wrapper_untouched(tmp_path):
     — merely CONTAINING the substring — must NEVER be rewritten on
     reinstall; the pre-R2 repair replaced the whole command and silently
     stripped the security wrapper."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     wrapped = ("'/usr/local/bin/firejail' "
                "'/opt/tortoise/volunteer-turn.sh' codex")
     cfg = {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command",
@@ -857,7 +958,7 @@ def test_install_codex_leaves_user_wrapper_untouched(tmp_path):
 def test_install_codex_leaves_foreign_volunteer_hook_untouched(tmp_path):
     """R2 (security): another product's OWN live volunteer-turn.sh hook at a
     different path must not be hijacked by the repair."""
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
     # A LIVE foreign volunteer engine hook at another path (still running) —
     # structurally identical to ours (2 tokens, harness word) but serving a
     # different engine: must not be hijacked by the repair.
@@ -895,7 +996,7 @@ def test_uninstall_never_deletes_config_the_installer_did_not_write(tmp_path):
     removed) is the other half of the pin — a refusal that also refuses our
     own hook would pass every survival assertion while breaking the command.
     """
-    env = {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
+    env = _isolated(tmp_path)
 
     # (a) codex: a user WRAPPER of our script survives --uninstall.
     wrap_dir = tmp_path / "wrap"
@@ -982,10 +1083,6 @@ def test_uninstall_never_deletes_config_the_installer_did_not_write(tmp_path):
 # traceback) — a green suite that would also pass before the fix pins nothing.
 
 
-def _install_env():
-    return {**os.environ, "TORTOISE_SECRET_PEPPER": "test-static-pepper"}
-
-
 def _write_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
@@ -1044,7 +1141,8 @@ def test_read_half_boundary_refuses_every_raise_set_member(
     raise-set: raise it deliberately; the boundary must hold — exit 1, a
     populated "Install failed" line, and NO traceback."""
     setup(tmp_path)
-    r = _run(["install", harness, "--dir", str(tmp_path)], _install_env())
+    r = _run(["install", harness, "--dir", str(tmp_path)],
+             _isolated(tmp_path))
     assert r.returncode == 1, (case_id, r.stdout, r.stderr)
     assert "Traceback" not in r.stderr, (case_id, r.stderr)
     for token in tokens:
@@ -1071,7 +1169,8 @@ def test_read_half_wrong_shape_hooks_null_is_never_a_traceback(tmp_path):
     ``(OSError, RuntimeError)`` tuple — the ``TypeError`` escapes as a
     traceback and ``"Traceback" not in r.stderr`` REDs."""
     _write_bytes(tmp_path / ".claude" / "settings.json", b'{"hooks": null}')
-    r = _run(["install", "claude", "--dir", str(tmp_path)], _install_env())
+    r = _run(["install", "claude", "--dir", str(tmp_path)],
+             _isolated(tmp_path))
     assert "Traceback" not in r.stderr, r.stderr
     assert r.returncode in (0, 1), (r.returncode, r.stdout, r.stderr)
     if r.returncode == 1:
@@ -1089,7 +1188,7 @@ def test_read_half_boundary_permission_error(tmp_path):
     target.chmod(0o000)
     try:
         r = _run(["install", "claude", "--dir", str(tmp_path)],
-                 _install_env())
+                 _isolated(tmp_path))
     finally:
         target.chmod(0o600)
     assert r.returncode == 1, (r.stdout, r.stderr)
@@ -1104,7 +1203,8 @@ def test_read_half_boundary_top_level_null_is_clean_refusal(tmp_path):
     generic message and never a traceback."""
     (tmp_path / ".claude").mkdir(parents=True)
     (tmp_path / ".claude" / "settings.json").write_text("null")
-    r = _run(["install", "claude", "--dir", str(tmp_path)], _install_env())
+    r = _run(["install", "claude", "--dir", str(tmp_path)],
+             _isolated(tmp_path))
     assert r.returncode == 1, (r.stdout, r.stderr)
     assert "Traceback" not in r.stderr, r.stderr
     assert "not a JSON object" in r.stderr, r.stderr
@@ -1761,7 +1861,7 @@ def test_demand_gated_harnesses_have_no_installer(tmp_path):
     rows exist — so this is a guard over `tortoise/__main__.py` + the matrix,
     not evidence about any one change.
     """
-    env = {**os.environ, "HOME": str(tmp_path / "home")}
+    env = _isolated(tmp_path)
     listing = _run(["install", "--list"], env, cwd=str(tmp_path))
     assert listing.returncode == 0, listing.stderr
     assert "gemini, opencode" in listing.stdout, (
