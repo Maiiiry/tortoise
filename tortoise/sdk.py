@@ -6918,7 +6918,18 @@ class TortoiseSDK:
         append failed. Folding anyway would put the DERIVED store ahead of the
         journal on a failed append — window (a) of the contract, the one a
         replay cannot undo.
+
+        #9068: the #5475 INPUT CONSTRAINT runs here too, on the record itself
+        (``_refuse_unapproved_kinds_in_record``), BEFORE the append. This door
+        is the GitHub indexer's write path
+        (``indexer/github_indexer.py`` → ``issue_to_object`` carries
+        ``object_kind='pm:issue'``), so leaving it ungated let the polling
+        entry point most callers actually use install ``pm`` on a ``dev``-only
+        graph — the same defect #9068 closed for the connectors, one file
+        over. Gating at the CHOKEPOINT (not at each caller) also covers the
+        ``-created`` Event the indexer mints from the same record family.
         """
+        self._refuse_unapproved_kinds_in_record(proj, event)
         if journal:
             # (#7951 P1-b) Mirror `_create_entity`'s `createdAt` synthesis on
             # the journaling path, BEFORE the append (so the record and the
@@ -10727,6 +10738,12 @@ class TortoiseSDK:
         # #329: id mutation + server-managed fields rejected
         props = _sanitize_props(props, reject_id=True,
                                 reject_belief_props=True)
+        # #9068: the props this update is about to `SET n +=` go through the
+        # SAME #5475 input constraint as creation — `_sanitize_props` rejects
+        # only reserved envelope/actor/belief names, so
+        # `update_point(id, pointKind='marketing:x')` used to reach the SET and
+        # widen the graph's approved set (a mined property is a mined property
+        # on the update path too).
         # R2 (#1541) D3: search_keys is stored flat (see _flatten_search_keys_prop).
         _flatten_search_keys_prop(props)
         # E4 (#5007): same rule as `create_point` / the `Point` model — an
@@ -28584,11 +28601,24 @@ class TortoiseSDK:
         — a kind property written by a door that never names it as one (measured:
         ``create_event(..., uses=[{'name': 'x', 'kind': 'marketing:campaign'}])``
         widened a ``dev``-only graph before this check existed).
+
+        The fold's SNAKE aliases are screened too (#9068 review P1). The
+        ``create_*`` doors forward caller ``props`` with ``**props``, and the
+        fold reads ``ev.get("object_kind")`` / ``subject_kind`` /
+        ``document_kind`` — so ``create_object("x",
+        props={"object_kind": "pm:issue"})`` survived a camel-only screen and
+        was folded onto the MINED ``objectKind``. That is the exact vector
+        ``pack_state._KIND_PROP_ALIASES`` closes for the record predicate, so
+        the props door reads the same declaration instead of re-spelling it.
         """
+        from .pack_state import _KIND_PROP_ALIASES as _kind_aliases
         from .pack_state import _KIND_PROP_KEYS as _gated_kind_props
         for kind_prop in _gated_kind_props:
             if kind_prop in props:
                 self._refuse_unapproved_kind(kind_prop, props.get(kind_prop))
+        # The canonical prop name is reported (never the alias): the refusal
+        # message tells the caller which PROPERTY it must change, and the alias
+        # would name a spelling the stored node does not carry.
         uses = props.get("uses")
         if isinstance(uses, dict):
             uses = [uses]
@@ -28600,6 +28630,40 @@ class TortoiseSDK:
                     # The fold's own default is 'other' (a bare core kind), so
                     # an absent 'kind' is the same write it will perform.
                     self._refuse_unapproved_kind("objectKind", item.get("kind"))
+
+    def _refuse_unapproved_kinds_in_record(self, proj, record: dict) -> None:
+        """#9068: the #5475 gate for a PRE-BUILT record, not a props dict.
+
+        ``_refuse_unapproved_kinds_in_props`` serves the ``create_*`` funnels,
+        whose caller props are camel-spelled keyed kwargs. The doors below
+        instead forward a WHOLE record the fold will consume verbatim
+        (``_apply_and_journal``, ``_doc_write``) or a props dict landing in a
+        ``SET n +=`` (``update_point``/``_update_entity``), and those carry the
+        fold's SNAKE aliases (``object_kind``/``subject_kind``/
+        ``document_kind``) — which the props gate does not screen. The record
+        predicate (``pack_state.unapproved_kinds_in_record``) screens the same
+        three spellings the mining leg reads, so this door and the connector
+        folds cannot disagree about what a record would install.
+
+        Why it is P1 and not bookkeeping: ``_apply_and_journal`` is the
+        GHITHUB INDEXER's write door (``indexer/github_indexer.py``), and the
+        Object it hands over carries ``object_kind='pm:issue'`` — so the
+        polling entry point most callers actually use widened a ``dev``-only
+        graph's approved set with ``pm``, the identical defect #9068 closes for
+        the connectors two files away.
+
+        PROJECTION WITH NO GRAPH HANDLE: nothing to read, so nothing is
+        refused here. That is the same fail-open shape
+        ``_installed_namespaces_for_gate`` takes for an SDK that was never
+        ``__init__``-ed (a test seam, not a tenant surface) — every live
+        projection a tenant write reaches carries ``.g``.
+        """
+        g = getattr(proj, "g", None)
+        if g is None:
+            return
+        from .pack_state import refuse_unapproved_kinds_in_records
+        refuse_unapproved_kinds_in_records(
+            g, [record], writer="the SDK live-write door (_apply_and_journal)")
 
 
     # ── Entity CRUD (ONTOLOGY v2.5 §3, all 7 types) ──────────────────
@@ -29200,6 +29264,10 @@ class TortoiseSDK:
         # #329: id + sourcePath/source_path are server-managed — reject
         props = _sanitize_props(props, reject_id=True,
                                 reject_belief_props=True)
+        # #9068: the same input constraint as `update_point` — the per-label
+        # branches below write caller props with a live `SET n += $p`, and the
+        # kind properties among them are MINED back into the approval set.
+        self._refuse_unapproved_kinds_in_record(self._get_proj(), props)
         # #3998 (D30): the generic entity surface reaches `:Source` TOO, and its
         # per-label branch below writes caller props with a live `SET n += $p`.
         # Without this the closed :Source surface declared in
@@ -31934,6 +32002,14 @@ class TortoiseSDK:
         # skipped, so the DERIVED store can never lead the TRUTH. Before this
         # fix the fold ran first and the record was journalled after it — the
         # window no replay can undo (contract window (a)).
+        # #9068: the #5475 input constraint on the record this door folds. ``ev``
+        # carries ``document_kind`` (the FOLD's snake alias, which
+        # ``_refuse_unapproved_kinds_in_props`` does not screen) and it is
+        # persisted as ``documentKind`` — a property
+        # ``pack_state.graph_kind_namespaces`` mines back into the approval set,
+        # so an ungated fold here would install a pack by writing it. Before the
+        # append, so a refusal leaves the journal AND the graph untouched.
+        self._refuse_unapproved_kinds_in_record(proj, ev)
         p = {k: v for k, v in ev.items() if k not in ("type", "id")}
         _failures_before = self._journal_write_failures
         self._emit_event("DocumentCreated", id=doc_id, **p)
@@ -34248,6 +34324,11 @@ class TortoiseSDK:
                 (Action was dissolved in Ontology v3.0).
         """
         proj = self._get_proj()
+        # #9068: `source_kind` lands on the auto-created ``:Source`` as
+        # ``sourceKind`` — a mined kind property — so it takes the same #5475
+        # input constraint as `create_source`. The cheap pre-check inside the
+        # gate means a core/bare spelling pays no graph read.
+        self._refuse_unapproved_kind("sourceKind", source_kind)
         proj.link_source_to_entity(source_url, entity_id, entity_label, source_kind)
 
     def get_org_structure(self, subject_id: str) -> dict:

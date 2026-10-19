@@ -462,12 +462,32 @@ of the exceptions and break it.
 **Gated — every live door that persists a `pack_state._KIND_PROP_KEYS`
 property:** the SDK entity funnel (`_create_entity`), the point door
 (`create_point`), `update_point` / `update_entity`, `EventAPI._emit`,
-`sdk._apply_and_journal`, `sdk._doc_write`, `mining`'s emitter,
-`link_source_to_entity`, and the REST object/subject/commit doors. The refusal
+`sdk._apply_and_journal` (the door the **GitHub indexer** writes through —
+`issue_to_object` carries `object_kind='pm:issue'`, so an ungated chokepoint
+let the polling entry point install `pm` on a `dev`-only graph), `sdk._doc_write`,
+the conversation miner's emitter (`mining._emit_event`), `link_source_to_entity`,
+and the REST object/subject/commit doors. The refusal
 is an **input constraint**: a *namespaced* kind may only use a namespace the
 resolved set already holds, and an unapproved spelling is REJECTED (422 /
 `UnapprovedKindNamespace`), never silently normalised — a rewrite would store a
 kind the caller did not write.
+
+Every one of those doors reads the SAME predicate: a pre-built record (the
+SDK's live-write doors and the connector folds) goes through
+`pack_state.unapproved_kinds_in_record` — which screens the mined key set, the
+fold's snake aliases (`object_kind` / `subject_kind` / `document_kind`) and
+`uses[].kind` — and the `create_*`-style doors screen their props with the same
+key set **and the same alias leg** (`create_object(props={"object_kind":
+"pm:issue"})` was a live bypass of the camel-only props screen until #9068: the
+fold reads the snake spelling and writes the mined camel property). A per-door
+list is how the widening survived the first closure, so a door that gates
+individually is a bug, not a variation.
+Doors on a hot path (`_apply_and_journal`, `_emit`, the connector batches, the
+`update_*` props) run a cheap pre-check first
+(`pack_state.record_names_a_pack`, `connectors._gate_kinds`): a record whose
+kinds name no pack pays **no graph read at all**, so the common case (core
+kinds, bare spellings) costs the same as before the gate — which matters most
+on the webhook arms, where the "batch" is one delivered message.
 
 **Gated — the connector folds (#9068).** `github` / `linear` / `slack` fold
 records with a bare `proj.apply(...)` and never meet an SDK door.
@@ -478,7 +498,13 @@ so the fold is a real write: each connector `ingest` (and both webhook paths)
 now pre-validates its whole batch against ONE approval-set read before the
 first `apply`, so a refusal leaves the graph untouched rather than
 half-imported. Before that gate, github's `object_kind='pm:issue'` put `pm`
-into a `dev`-only graph's approved set.
+into a `dev`-only graph's approved set. On the webhook arms the gate runs
+**before** the caller's `on_event` callback (a consumer is told about writes
+that landed, not about deliveries that were refused) and before Slack's
+per-message permalink enrichment (a refused batch must not spend an API call
+per message). A refusal there is answered **422** with the refusal's own message
+— the same posture `hosted_api` takes — not 500: the payload refuses identically
+on every retry, so a 500 buys a retry loop and discards the remedy text.
 
 **The mining leg reads a generic `kind` only off ontology labels (#9068).**
 Seven of the eight kind properties are spelled in the ontology's own vocabulary
@@ -502,7 +528,8 @@ legitimate pipeline edits).
 A re-typing that DOES need a namespace the graph has not approved is an
 operator decision: run the migration, or add the pack
 (`PUT /v1/graphs/{graph_id}/packs`). Nothing on a tenant surface can widen the
-set by writing.
+set by writing — but "tenant surface" is load-bearing in that sentence, so read
+the table above as the list of what it excludes, not as a footnote.
 
 ## Chains
 

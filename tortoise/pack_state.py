@@ -588,7 +588,7 @@ _ATTRIBUTABLE_BARE_KIND_KEYS: tuple[str, ...] = ("eventKind",)
 
 #: The labels that may carry an ONTOLOGY kind (#9068).
 #:
-#: Six of the eight keys in ``_KIND_PROP_KEYS`` need no such guard: they are
+#: Seven of the eight keys in ``_KIND_PROP_KEYS`` need no such guard: they are
 #: SPELLED in the ontology's own vocabulary (``objectKind``, ``pointKind``,
 #: ``eventKind``, ``sourceKind``, ``documentKind``, ``subjectKind``,
 #: ``actionKind``), so a value under one of them can only have been written as
@@ -768,6 +768,13 @@ def graph_kind_namespaces(g) -> frozenset[str]:
       graph's own historical rows: it is the SANCTIONED way to introduce a
       pack namespace into data written before the pack existed, so its
       ``SET n.<kindProp>`` is a widening BY DESIGN (see its docstring).
+
+    The doors that DO gate a pre-built record all funnel into
+    ``refuse_unapproved_kinds_in_records`` (the SDK's ``_apply_and_journal``,
+    ``_doc_write``, ``update_point``/``_update_entity``,
+    ``link_source_to_entity``, ``EventAPI._emit`` and the connector folds), so
+    the key set screened is this one everywhere — a per-door list is how the
+    widening survived the first closure.
 
     ⚠️ COST: one property scan per key (8) — a whole-graph read. The
     caller's memo does NOT shelter it: ``tenant_view`` folds the approval set
@@ -1422,6 +1429,63 @@ def unapproved_kinds_in_record(record: dict,
     return out
 
 
+def record_names_a_pack(record: dict) -> bool:
+    """#9068: does this record's kinds name ANY pack namespace at all?
+
+    The CHEAP pre-check for a LIVE door that folds a record on a hot path. Its
+    own docstring is the reason it exists: ``kind_named_packs`` already skips
+    the whole-graph approval-set read for a spelling that names no pack (bare /
+    empty / ``core:``), and the overwhelming majority of records carry exactly
+    those spellings. Without this check every gated fold would pay a
+    whole-graph scan (``graph_installed_namespaces``: 8 property scans) to
+    learn that there was nothing to refuse — the cost that made the SDK doors
+    gate PER WRITE and pre-check first.
+
+    Reads EXACTLY the key set ``unapproved_kinds_in_record`` reads (the mined
+    ``_KIND_PROP_KEYS``, the fold's snake aliases, and ``uses[].kind``) and
+    derives the attribution flag from ``_ATTRIBUTABLE_BARE_KIND_KEYS`` the same
+    way, so the pre-check can never admit a record the full gate would screen:
+    a cheaper list of keys would be a widening under another name.
+
+    Only the ATTRIBUTION leg is a catalog read (memoized per resolved packs
+    dir) — never a graph read, so a graph outage cannot turn this into a
+    silent widening here: the full gate still reads the set (and raises) once
+    a record names a pack.
+    """
+    if not isinstance(record, dict):
+        return False
+
+    def _names(value) -> bool:
+        if not isinstance(value, str):
+            return False
+        return bool(kind_named_packs(
+            value, attribute_bare=False))
+
+    for prop in _KIND_PROP_KEYS:
+        # The bare-attribution leg is included for the attributable key ONLY:
+        # a bare ``eventKind`` a single pack declares IS mined back into that
+        # pack's namespace, so it must reach the full gate.
+        value = record.get(prop)
+        if not isinstance(value, str):
+            continue
+        if kind_named_packs(value,
+                            attribute_bare=prop in _ATTRIBUTABLE_BARE_KIND_KEYS):
+            return True
+    for alias in _KIND_PROP_ALIASES:
+        if _names(record.get(alias)):
+            return True
+    uses = record.get("uses")
+    if isinstance(uses, dict):
+        uses = [uses]
+    elif isinstance(uses, str):
+        uses = []
+    if isinstance(uses, (list, tuple)):
+        for item in uses:
+            if isinstance(item, dict) and _names(item.get("kind")):
+                return True
+    return False
+
+
 def refuse_unapproved_kinds_in_records(g, records, *, writer: str,
                                       approved=_APPROVED_NOT_GIVEN
                                       ) -> None:
@@ -1453,6 +1517,14 @@ def refuse_unapproved_kinds_in_records(g, records, *, writer: str,
     """
     records = [r for r in records if isinstance(r, dict)]
     if not records:
+        return
+    # ⚠️ THE PRE-CHECK COMES FIRST (#9068 review), and it is a pure
+    # short-circuit, not a second rule: a record whose kinds name NO pack
+    # cannot be refused by the loop below (``unapproved_kind_pack`` returns
+    # ``None`` for every such value), so skipping the read here changes no
+    # answer — it only stops a live door on the common path (core kinds, bare
+    # spellings) from paying a whole-graph scan to learn it has nothing to do.
+    if not any(record_names_a_pack(r) for r in records):
         return
     if approved is _APPROVED_NOT_GIVEN:
         approved = resolved_pack_set_from_graph(g).namespaces

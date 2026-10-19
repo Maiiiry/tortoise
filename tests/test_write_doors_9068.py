@@ -49,6 +49,8 @@ from tortoise.pack_state import (
     _ONTOLOGY_LABELS,
     graph_installed_namespaces,
     graph_kind_namespaces,
+    record_names_a_pack,
+    refuse_unapproved_kinds_in_records,
     unapproved_kinds_in_record,
 )
 from tortoise.sdk import TortoiseSDK, UnapprovedKindNamespace
@@ -137,6 +139,14 @@ class TestGenericKindIsNotAnOntologyKind:
             "MERGE (n:Graph {id: 'g-9068'}) SET n.kind = $k",
             params={"k": f"{MARKETING}:default"},
         )
+        # The WRITE is asserted, not assumed: if the MERGE silently no-opped,
+        # the only assertion below would hold on the PRE-fix (label-agnostic)
+        # code too and this test would degenerate into a copy of its sibling.
+        written = sdk._get_proj().g.query(
+            "MATCH (n:Graph {id: 'g-9068'}) RETURN n.kind").result_set
+        assert [tuple(r) for r in written] == [(f"{MARKETING}:default",)], (
+            "fixture: the namespaced kind must really be ON the :Graph node — "
+            "a label-agnostic scan is what has to find it")
         assert graph_installed_namespaces(sdk) == frozenset({DEV})
 
     def test_legacy_kind_on_an_ontology_label_still_widens(self, tmp_path):
@@ -247,6 +257,39 @@ class TestUnapprovedKindsInRecord:
         assert unapproved_kinds_in_record(record, None) == []
         assert unapproved_kinds_in_record(record, frozenset({DEV})), (
             "control: the same record must be refused against a set")
+
+    def test_the_pre_check_spends_no_graph_read(self):
+        """A record naming NO pack pays no whole-graph read (#9068 review).
+
+        The gate now sits on HOT live doors (``_apply_and_journal`` runs once
+        per indexed issue, ``_emit`` once per ingest event, the connector
+        batches once per fold), so the cheap pre-check is what keeps them from
+        paying an 8-scan approval-set read to learn there is nothing to
+        refuse.
+
+        FAIL-ON: the pre-check is dropped (or re-spelled over a narrower key
+        list), so the common core-kind record reaches the graph read — the
+        ``_Exploding`` handle raises and the call under test fails.
+        REACHABLE: the SAME handle IS reached for a namespaced record, so the
+        absence of a read above is the pre-check and not a broken fake.
+        """
+        class _Exploding:
+            def query(self, *args, **kwargs):
+                raise AssertionError(
+                    "the approval set was read for a record naming no pack")
+
+        assert record_names_a_pack({"objectKind": "other",
+                                    "eventKind": "deployment"}) is False
+        accept = refuse_unapproved_kinds_in_records  # the door's own entry
+        accept(_Exploding(), [{"objectKind": "other",
+                               "eventKind": "deployment"}], writer="test")
+
+        assert record_names_a_pack({"object_kind": f"{MARKETING}:x"}) is True
+        assert record_names_a_pack(
+            {"uses": [{"name": "x", "kind": f"{MARKETING}:x"}]}) is True
+        with pytest.raises(AssertionError):
+            accept(_Exploding(), [{"object_kind": f"{MARKETING}:x"}],
+                   writer="test")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -360,33 +403,538 @@ class TestConnectorFoldIsGated:
         assert proj.g.query(
             "MATCH (o:Object {objectKind: 'pm:issue'}) RETURN o").result_set
 
-    def test_linear_and_slack_ingest_are_gated_too(self, tmp_path):
-        """The gate is per CONNECTOR, not a github special case.
+    def test_linear_and_slack_ingest_are_gated_too(self, tmp_path,
+                                                   force_embedder_on):
+        """The gate is per CONNECTOR, not a github special case — and it runs
+        BEFORE the first ``apply``, not merely somewhere before the return.
 
         FAIL-ON: a connector's ``ingest`` writes an unapproved namespaced kind
-        (the door inventory is only as good as its least-gated member).
+        (the door inventory is only as good as its least-gated member), OR the
+        gate is moved to the END of ``ingest`` — a gate after the
+        ``for ev in events: proj.apply(ev)`` loop still raises and still passes
+        a ``pytest.raises``-only test, while leaving every record folded behind
+        the refusal. The ``:Event``/``:Source`` emptiness assertions are what
+        make the ORDERING observable.
 
-        REACHABLE: each connector's own ``poll()`` is stubbed to return one
-        record naming ``marketing``, and each is asserted to raise — so both
-        the linear and slack arms are exercised, not just the shape.
+        REACHABLE: each arm is BUILT BY THE CONNECTOR'S OWN MAPPER (production
+        shape — ``sourceKind``/``eventKind``, no ``objectKind`` at all), the
+        unapproved spelling is injected into a key the connector really writes
+        (``sourceKind``, a mined property), and the second half of each arm
+        ingests the SAME record once the namespace is approved and asserts it
+        LANDED — so neither arm is passing because of a malformed payload.
+
+        ``force_embedder_on`` pins the write path's embedder to the suite's
+        deterministic stub: the pass-controls LET A FOLD LAND.
         """
         from tortoise.connectors import linear as linear_mod
         from tortoise.connectors import slack as slack_mod
 
-        for module, cls, record in (
-            (linear_mod, "LinearConnector",
-             {"type": "EventRecorded", "object_kind": f"{MARKETING}:campaign"}),
-            (slack_mod, "SlackConnector",
-             {"type": "EventRecorded", "objectKind": f"{MARKETING}:campaign"}),
+        linear_issue = {
+            "identifier": "ENG-9068", "title": "Widen the gate",
+            "description": "body", "state": {"name": "In Progress"},
+            "createdAt": "2026-07-10T10:00:00Z", "completedAt": None,
+            "canceledAt": None, "assignee": {"email": "a@b.c"},
+            "team": {"key": "ENG"},
+            "url": "https://linear.app/ENG/issue/ENG-9068",
+        }
+        slack_msg = {"text": "hello", "ts": "1690000000.123456",
+                     "user": "U1"}
+
+        def _linear_record() -> dict:
+            ev = linear_mod.LinearConnector({})._issue_to_event(linear_issue)
+            assert ev is not None, "fixture: the mapper must produce a record"
+            ev["sourceKind"] = f"{MARKETING}:linear_card"
+            return ev
+
+        def _slack_record() -> dict:
+            conn = slack_mod.SlackConnector({})
+            conn.channel_id = "C9068"
+            ev = conn._message_to_event(slack_msg)
+            assert ev is not None, "fixture: the mapper must produce a record"
+            ev["sourceKind"] = f"{MARKETING}:slack_message"
+            return ev
+
+        for module, cls, make_record in (
+            (linear_mod, "LinearConnector", _linear_record),
+            (slack_mod, "SlackConnector", _slack_record),
         ):
             sub = tmp_path / module.__name__.rsplit(".", 1)[-1]
             sub.mkdir(exist_ok=True)
             sdk = _mk_sdk(sub)
             _seed_install(sdk, DEV)
+            record = make_record()
+            proj = sdk._get_proj()
             conn = getattr(module, cls)({})
-            conn.poll = lambda record=record: [record]
-            with pytest.raises(UnapprovedKindNamespace):
-                conn.ingest(sdk._get_proj())
+            conn.poll = lambda record=record: [dict(record)]
+            with pytest.raises(UnapprovedKindNamespace) as excinfo:
+                conn.ingest(proj)
+            assert MARKETING in str(excinfo.value)
+            # ORDERING: the gate is before the FIRST apply, so the refusal is
+            # not a half-import (a gate moved after the loop leaves these
+            # nodes behind and this assertion is what catches it).
+            assert proj.g.query("MATCH (n:Event) RETURN n").result_set == [], (
+                f"{cls}: the refused batch was folded anyway — the gate ran "
+                "after an apply")
+            assert proj.g.query("MATCH (n:Source) RETURN n").result_set == []
+            assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+            # PASS-CONTROL: the same record LANDS once the namespace is
+            # approved, so both arms are gated by the gate and not by the
+            # payload shape.
+            _seed_install(sdk, MARKETING)
+            conn.poll = lambda record=record: [dict(record)]
+            assert conn.ingest(proj) == 1
+            assert proj.g.query(
+                "MATCH (n:Event) RETURN n").result_set, (
+                f"{cls}: the record never folded on the approved graph")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3b. The SDK's OWN live doors — the chokepoint the indexer writes through
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestSdkLiveDoorsAreGated:
+    def test_github_indexer_fold_refuses_and_writes_nothing(self, tmp_path):
+        """⭐ #9068: the chokepoint behind the GITHUB INDEXER.
+
+        ``github_indexer`` folds every issue through
+        ``TortoiseSDK._apply_and_journal`` and the Object it hands over comes
+        from ``github_map.issue_to_object`` — which carries
+        ``object_kind='pm:issue'`` (the fold's SNAKE spelling, which the
+        camel-only props gate does not screen). So the polling entry point most
+        callers actually use widened a ``dev``-only graph with ``pm`` — the
+        identical defect this PR closes for the connectors, one file over.
+
+        FAIL-ON: ``_apply_and_journal`` folds without asking (the record gate
+        is removed, or reduced to the camel-only props gate).
+        REACHABLE: the record is built by the REAL mapper (no hand-written
+        dict), the refusal names ``pm``, and the pass-control below lands the
+        same record once ``pm`` is approved.
+        """
+        from tortoise import github_map
+
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        proj = sdk._get_proj()
+        record = github_map.issue_to_object(ISSUE, "test/repo")
+        assert record is not None and record["object_kind"] == f"{PM}:issue", (
+            "fixture: the mapper's kinds must be the namespaced production "
+            "shape")
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            sdk._apply_and_journal(proj, dict(record))
+        assert PM in str(excinfo.value)
+        assert proj.g.query("MATCH (n:Object) RETURN n").result_set == []
+        assert proj.g.query("MATCH (n:Event) RETURN n").result_set == []
+        assert graph_installed_namespaces(sdk) == frozenset({DEV}), (
+            "the refused fold must not have widened the approval set")
+
+    def test_github_indexer_fold_admits_when_pm_is_approved(
+            self, tmp_path, force_embedder_on):
+        """CONTROL for the refusal above — the indexer path still works.
+
+        FAIL-ON: the gate refuses (or drops) the indexer's fold on a graph
+        that DOES hold ``pm`` — i.e. the new door broke the live path.
+        REACHABLE: the Object node is asserted with the mapper's own kind, so a
+        silently-skipped apply is observable.
+        """
+        from tortoise import github_map
+
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        _seed_install(sdk, PM)
+        proj = sdk._get_proj()
+        sdk._apply_and_journal(
+            proj, github_map.issue_to_object(ISSUE, "test/repo"))
+        rows = proj.g.query(
+            "MATCH (o:Object) RETURN o.objectKind, o.name").result_set
+        assert [(r[0], r[1]) for r in rows] == [(f"{PM}:issue", "test/repo#42")]
+
+    def test_update_point_cannot_install_a_pack(self, tmp_path,
+                                              force_embedder_on):
+        """``update_point``'s props land in a live ``SET n +=`` — mined too.
+
+        ``_sanitize_props`` rejects only reserved envelope/actor/belief names,
+        so ``update_point(id, pointKind='marketing:x')`` reached the SET and
+        widened the graph's approved set.
+
+        FAIL-ON: the update door is ungated, so the namespaced kind is
+        persisted and ``marketing`` joins the approved set.
+        REACHABLE: the point is created on the SAME graph first (so the refusal
+        is about the update and not a missing node), and the control below
+        updates with a bare kind on the same graph and succeeds.
+        """
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        point = sdk.create_point("statement", "gated write")
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            sdk.update_point(point["id"], pointKind=f"{MARKETING}:campaign")
+        assert MARKETING in str(excinfo.value)
+        assert graph_installed_namespaces(sdk) == frozenset({DEV}), (
+            "the refused update must not have widened the approval set")
+        stored = sdk._get_proj().g.query(
+            "MATCH (n:Point {id: $id}) RETURN n.pointKind",
+            params={"id": point["id"]}).result_set
+        assert [r[0] for r in stored] == ["statement"], (
+            "the refused value must not have been written")
+
+        # CONTROL: a bare (core) kind is an input the gate ADMITS — this is an
+        # input constraint, never a blanket ban on updating kind properties.
+        sdk.update_point(point["id"], pointKind="hypothesis")
+        assert [r[0] for r in sdk._get_proj().g.query(
+            "MATCH (n:Point {id: $id}) RETURN n.pointKind",
+            params={"id": point["id"]}).result_set] == ["hypothesis"]
+
+    def test_event_api_emit_cannot_install_a_pack(self, tmp_path,
+                                                 force_embedder_on):
+        """``EventAPI._emit`` is the ingest CLI's write door (same defect).
+
+        FAIL-ON: ``_emit`` appends + folds an unvalidated ``object_kind``, so
+        ``marketing`` joins a ``dev``-only graph's approved set.
+        REACHABLE: the SAME door writes a bare core kind successfully right
+        after (``object_kind='other'``), so the refusal is the gate and not a
+        broken emitter.
+        """
+        from tortoise.api import EventAPI
+        from tortoise.log import EventLog
+
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        proj = sdk._get_proj()
+        api = EventAPI(EventLog(str(tmp_path / "events.jsonl")),
+                       initiated_by="extractor", projection=proj)
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            api.add_object("campaign", object_kind=f"{MARKETING}:campaign")
+        assert MARKETING in str(excinfo.value)
+        assert proj.g.query("MATCH (n:Object) RETURN n").result_set == []
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        # CONTROL: the identical door with a bare core kind still writes.
+        api.add_object("an object", object_kind="other")
+        assert proj.g.query(
+            "MATCH (o:Object {objectKind: 'other'}) RETURN o").result_set
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3c. The props doors screen the fold's SNAKE aliases too (review P1)
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestPropsDoorsScreenTheFoldAliases:
+    def test_create_object_snake_alias_cannot_install_a_pack(
+            self, tmp_path, force_embedder_on):
+        """⭐ The funnel the PR lists as gated was bypassable under the alias.
+
+        ``create_entity`` relays caller ``props`` with ``**props``, so
+        ``props={"object_kind": "pm:issue"}`` survived the CAMEL-only screen
+        (``_KIND_PROP_KEYS``) and reached the fold, which reads
+        ``ev.get("object_kind")`` and writes the MINED ``o.objectKind`` —
+        ``pm`` installed by a write, from the SDK's own public door.
+
+        FAIL-ON: ``_refuse_unapproved_kinds_in_props`` drops its
+        ``_KIND_PROP_ALIASES`` leg, so the snake spelling folds and widens.
+        REACHABLE: an Object node really lands through the same door for a
+        bare alias right after (CONTROL), so the refusal is the gate and not a
+        broken funnel; and the alias value is the production spelling the fold
+        consumes (asserted below on the landing arm).
+        """
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            sdk.create_object("x", props={"object_kind": f"{PM}:issue"})
+        assert PM in str(excinfo.value)
+        assert excinfo.value.prop == "objectKind", (
+            "the refusal must name the stored property, not the alias")
+        assert sdk._get_proj().g.query(
+            "MATCH (n:Object) RETURN n").result_set == []
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        # CONTROL: the SAME alias path with a bare spelling lands, and it
+        # lands AS the camel property (which is why the alias leg is needed).
+        sdk.create_object("y", props={"object_kind": "other"})
+        rows = sdk._get_proj().g.query(
+            "MATCH (o:Object) RETURN o.name, o.objectKind").result_set
+        assert [tuple(r) for r in rows] == [("y", "other")]
+
+    def test_update_entity_cannot_install_a_pack(
+            self, tmp_path, force_embedder_on):
+        """``_update_entity`` is the MCP ``tortoise_update_entity`` door.
+
+        ``_sanitize_props`` is a DENYLIST of reserved envelope/actor/belief
+        names, and ``reject_server_managed_props`` at the MCP boundary does not
+        list the kind properties — so ``update_entity(id,
+        objectKind='marketing:campaign')`` reached a live ``SET n += $p``.
+
+        FAIL-ON: the update door is ungated (the props are persisted and the
+        namespace joins the approved set).
+        REACHABLE: the Object is created on the SAME graph first, and the
+        CONTROL updates it with a bare kind and the value is read back.
+        """
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        obj = sdk.create_object("thing")
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            sdk.update_entity(obj["id"], objectKind=f"{MARKETING}:campaign")
+        assert MARKETING in str(excinfo.value)
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+        assert [r[0] for r in sdk._get_proj().g.query(
+            "MATCH (o:Object {id: $id}) RETURN o.objectKind",
+            params={"id": obj["id"]}).result_set] == ["other"]
+
+        sdk.update_entity(obj["id"], objectKind="portfolio")
+        assert [r[0] for r in sdk._get_proj().g.query(
+            "MATCH (o:Object {id: $id}) RETURN o.objectKind",
+            params={"id": obj["id"]}).result_set] == ["portfolio"]
+
+    def test_link_source_to_entity_cannot_install_a_pack(
+            self, tmp_path, force_embedder_on):
+        """``sourceKind`` on the auto-created ``:Source`` is MINED.
+
+        ``link_source_to_entity`` relays ``source_kind`` to
+        ``projection/edges.py``'s ``ON CREATE SET s.sourceKind=$sk`` with the
+        caller's string, so a namespaced value installed its pack.
+
+        FAIL-ON: the door is ungated.
+        REACHABLE: the CONTROL links the same source with a bare kind and the
+        ``sourceKind`` is read back off the ``:Source`` node.
+        """
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        obj = sdk.create_object("target")
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            sdk.link_source_to_entity(
+                "https://example.test/refused", obj["id"], "Object",
+                f"{MARKETING}:anything")
+        assert MARKETING in str(excinfo.value)
+        assert sdk._get_proj().g.query(
+            "MATCH (s:Source) RETURN s").result_set == []
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        sdk.link_source_to_entity(
+            "https://example.test/ok", obj["id"], "Object", "web")
+        assert [r[0] for r in sdk._get_proj().g.query(
+            "MATCH (s:Source) RETURN s.sourceKind").result_set] == ["web"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3d. The webhook folds — the path PR #9073 claimed gated and never tested
+# ══════════════════════════════════════════════════════════════════════════
+
+class _ApiStub:
+    """The connector's ``api`` seam: ``api.get_proj()`` (see ``ingest(proj)``)."""
+
+    def __init__(self, proj):
+        self._proj = proj
+
+    def get_proj(self):
+        return self._proj
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class TestWebhookFoldsAreGated:
+    def test_github_webhook_fold_refuses_and_fires_no_consumer(
+            self, tmp_path, force_embedder_on):
+        """⭐ #9068 review P2: ``do_POST``'s gate had NO test.
+
+        The gate lived inline in the handler, so deleting it (or moving it
+        below ``proj.apply``) red nothing. It now lives in one method the
+        handler calls, and this test drives THAT method.
+
+        FAIL-ON: the webhook write step folds without the gate (the record
+        lands and ``marketing`` joins the approved set), OR the gate runs after
+        ``on_event`` (the consumer callback fires for a write that never
+        happens — observable through ``seen``).
+        REACHABLE: the record is the shape the gate refuses and the pass-arm
+        below folds the SAME record once the namespace is approved.
+        """
+        from tortoise.connectors.github import GitHubConnector
+
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        proj = sdk._get_proj()
+        conn = GitHubConnector(config={"repo": "test/r"}, api=_ApiStub(proj))
+        seen: list[dict] = []
+        ev = {"type": "EventRecorded", "eventId": "gh-9068",
+              "eventKind": "github.issue.opened",
+              "sourceKind": f"{MARKETING}:card"}
+
+        with pytest.raises(UnapprovedKindNamespace) as excinfo:
+            conn._fold_webhook_event(dict(ev), on_event=seen.append)
+        assert MARKETING in str(excinfo.value)
+        assert seen == [], "on_event fired for a delivery that never landed"
+        assert proj.g.query("MATCH (n:Event) RETURN n").result_set == []
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+        _seed_install(sdk, MARKETING)
+        conn._fold_webhook_event(dict(ev), on_event=seen.append)
+        assert len(seen) == 1
+        assert proj.g.query("MATCH (n:Event) RETURN n").result_set
+
+    def test_slack_webhook_fold_refuses_and_fires_no_consumer(self, tmp_path):
+        """The same pin for Slack's handler (it had none either)."""
+        from tortoise.connectors.slack import SlackConnector
+
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        proj = sdk._get_proj()
+        conn = SlackConnector(config={"token": "x"}, api=_ApiStub(proj))
+        seen: list[dict] = []
+        ev = {"type": "EventRecorded", "eventId": "sl-9068",
+              "eventKind": "slack.message",
+              "sourceKind": f"{MARKETING}:slack_message"}
+
+        with pytest.raises(UnapprovedKindNamespace):
+            conn._fold_webhook_event(dict(ev), on_event=seen.append)
+        assert seen == []
+        assert proj.g.query("MATCH (n:Event) RETURN n").result_set == []
+        assert graph_installed_namespaces(sdk) == frozenset({DEV})
+
+    def test_github_webhook_answers_a_refusal_422_and_keeps_the_store_empty(
+            self, tmp_path, force_embedder_on):
+        """Review P3: a DETERMINISTIC refusal must not be answered 500.
+
+        ``UnapprovedKindNamespace`` is the SDK's "you may not write this"
+        signal; ``hosted_api`` maps it to 422. Answering 500 told GitHub to
+        retry a payload that refuses identically every time, and threw away the
+        refusal's own remedy text (``Next steps: …``).
+
+        FAIL-ON: the handler's blanket ``except Exception`` swallows it as 500
+        (and the body is empty, so the remedy is lost).
+        REACHABLE: the same handler answers 200 for the SAME payload once the
+        namespace is approved — so the status is a function of the gate, not of
+        a broken server.
+        """
+        import json as _json
+        import urllib.error
+        import urllib.request
+
+        from tortoise.connectors.github import GitHubConnector
+
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        proj = sdk._get_proj()
+        port = _free_port()
+        gh = GitHubConnector(config={"repo": "test/r", "webhook_port": port,
+                                     "webhook_secret": ""}, api=_ApiStub(proj))
+        # The mapper's production event names no pack; inject the namespaced
+        # spelling into the key the fold MINES, so the refusal is the only
+        # variable between the two arms.
+        gh._webhook_to_event = lambda event_type, payload: {
+            "type": "EventRecorded", "eventId": "gh-webhook-9068",
+            "eventKind": "github.issue.opened",
+            "sourceKind": f"{MARKETING}:card"}
+        body = _json.dumps({"action": "opened"}).encode()
+        url = f"http://127.0.0.1:{port}/"
+        assert gh.start_webhook() == port
+        try:
+            def _post():
+                req = urllib.request.Request(
+                    url, data=body,
+                    headers={"Content-Type": "application/json",
+                             "X-GitHub-Event": "issues"})
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return r.status, r.read()
+                except urllib.error.HTTPError as exc:
+                    return exc.code, exc.read()
+
+            status, payload = _post()
+            assert status == 422, (
+                f"a deterministic refusal was answered {status}")
+            assert MARKETING.encode() in payload, (
+                "the refusal's remedy text must reach the caller")
+            assert proj.g.query("MATCH (n:Event) RETURN n").result_set == []
+
+            _seed_install(sdk, MARKETING)
+            status, _ = _post()
+            assert status == 200, "the approved arm must be admitted"
+            assert proj.g.query("MATCH (n:Event) RETURN n").result_set
+        finally:
+            gh.stop_webhook()
+
+
+class TestGateCostOnTheHotPaths:
+    def test_a_batch_naming_no_pack_spends_no_graph_read(self):
+        """Review P2/P3: the gate is on HOT doors — it must pre-check.
+
+        ``_gate_kinds`` resolves the approval set with
+        ``graph_installed_namespaces`` (8 whole-graph scans, O(nodes)), and the
+        WEBHOOK arms call it with ONE record per delivered message. A record
+        whose kinds name no pack cannot be refused, so the read is pure cost.
+
+        FAIL-ON: the pre-check is dropped, so a bare/core batch reaches the
+        graph read (the fake's ``g`` raises).
+        REACHABLE: the SAME fake IS reached for a namespaced batch, so the
+        first arm's silence is the pre-check and not a broken fake.
+        """
+        from tortoise.connectors import _READ_THE_SET, _gate_kinds
+
+        class _ExplodingProj:
+            @property
+            def g(self):
+                raise AssertionError(
+                    "the approval set was read for a batch naming no pack")
+
+        bare = [{"type": "EventRecorded", "eventKind": "github.issue.opened",
+                 "sourceKind": "github_issue", "objectKind": "other"}]
+        assert _gate_kinds(_ExplodingProj(), bare, writer="test") is _READ_THE_SET, (
+            "the sentinel must pass through unchanged: a batch that read "
+            "nothing may not hand the next batch a resolved set")
+        with pytest.raises(AssertionError):
+            _gate_kinds(_ExplodingProj(),
+                        [{"object_kind": f"{MARKETING}:x"}], writer="test")
+
+    def test_slack_ingest_gates_before_the_network_enrichment(
+            self, tmp_path, force_embedder_on):
+        """Review P3: enrich-after-refusal spent a permalink call per message.
+
+        ``_enrich_source_urls`` costs one ``chat.getPermalink`` per message; on
+        a refused batch every one of those calls was spent on records that are
+        then dropped wholesale.
+
+        FAIL-ON: the gate is back below ``_enrich_source_urls`` (the enrichment
+        runs for a batch that never lands).
+        REACHABLE: the pass-arm below shows the same connector DOES enrich once
+        the namespace is approved, so an empty ``calls`` is ordering, not a
+        broken hook.
+        """
+        from tortoise.connectors import slack as slack_mod
+
+        sdk = _mk_sdk(tmp_path)
+        _seed_install(sdk, DEV)
+        proj = sdk._get_proj()
+        calls: list[int] = []
+        conn = slack_mod.SlackConnector({})
+        ev = {"type": "EventRecorded", "eventId": "sl-9068",
+              "eventKind": "slack.message",
+              "sourceKind": f"{MARKETING}:slack_message"}
+        conn.poll = lambda: [dict(ev)]
+        conn._enrich_source_urls = lambda events: calls.append(len(events))
+
+        with pytest.raises(UnapprovedKindNamespace):
+            conn.ingest(proj)
+        assert calls == [], (
+            "the permalink enrichment ran for a batch the gate REFUSED")
+
+        _seed_install(sdk, MARKETING)
+        assert conn.ingest(proj) == 1
+        assert calls == [1], "the approved arm still enriches exactly once"
 
 
 # ══════════════════════════════════════════════════════════════════════════

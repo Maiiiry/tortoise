@@ -71,6 +71,24 @@ class EventAPI:
         # caller change required for existing lanes.
         if actor is not None:
             event["actor_user_id"] = actor
+        # #9068: the #5475 INPUT CONSTRAINT. This door writes a MINED kind
+        # property on every one of its producers (`add_object` →
+        # ``object_kind``, `add_subject` → ``subject_kind``, `add_document` →
+        # ``document_kind``, `add_event` → ``eventKind`` + ``uses[]``), and
+        # ``_emit`` is how the ingest CLI persists them — so an unvalidated
+        # value here installed a pack on the graph by writing it. It runs
+        # BEFORE the append: the append is the COMMIT POINT, and a refusal
+        # after it would leave the journal carrying a record whose fold then
+        # refused, which no replay could heal.
+        #
+        # The RECORD predicate (not the props one) because the payload uses the
+        # fold's snake spellings, and it is cheap on the common path: a record
+        # naming no pack namespace pays no graph read at all.
+        _g = getattr(self.projection, "g", None)
+        if _g is not None:
+            from .pack_state import refuse_unapproved_kinds_in_records
+            refuse_unapproved_kinds_in_records(
+                _g, [event], writer="the EventAPI emitter")
         self.log.append(event)
         if self.projection is not None:
             # #7951 §17.1: journal-first door — the append above is the COMMIT

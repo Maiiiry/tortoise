@@ -375,6 +375,33 @@ class GitHubConnector:
 
     # ── Webhook (GAP-11) ───────────────────────────────────────────
 
+    def _fold_webhook_event(self, ev: dict, on_event=None) -> None:
+        """#9068: the webhook's ONE write step — gate, then fold.
+
+        Extracted so the handler and the tests call the SAME code: the gate
+        used to live inline in ``do_POST``, where only an HTTP round-trip
+        exercised it — moving it below ``proj.apply`` (or deleting it) red
+        nothing in the suite.
+
+        The gate runs BEFORE ``on_event``. The consumer callback is the
+        caller's commit hook for a record that landed; firing it above the
+        gate meant a REFUSED delivery still reached the consumer, and every
+        retry fired it again for a write that never happened.
+
+        Raises ``UnapprovedKindNamespace`` — a DETERMINISTIC refusal, answered
+        422 by the handler (a retry refuses identically). The graph is
+        untouched when it does, because the gate is the first thing that
+        touches it.
+        """
+        proj = self.api.get_proj() if self.api else None
+        if proj is not None:
+            from tortoise.connectors import _gate_kinds
+            _gate_kinds(proj, [ev], writer="the GitHub webhook fold")
+        if on_event:
+            on_event(ev)
+        if proj is not None:
+            proj.apply(ev)
+
     def start_webhook(self, on_event: Callable[[dict], None] | None = None) -> int:
         """Start webhook server on configured port. Returns port number.
         Runs in a daemon thread; call stop_webhook() to shut down.
@@ -424,20 +451,28 @@ class GitHubConnector:
                 try:
                     ev = connector._webhook_to_event(event_type, payload)
                     if ev:
-                        if on_event:
-                            on_event(ev)
-                        if connector.api:
-                            # #9068: the fold has no SDK door in front of it —
-                            # gate it like the poll path (one record, one
-                            # batch). A refusal is answered 500 below, exactly
-                            # like any other processing failure, so GitHub
-                            # retries instead of the write vanishing.
-                            from tortoise.connectors import _gate_kinds
-                            proj = connector.api.get_proj()
-                            _gate_kinds(proj, [ev],
-                                        writer="the GitHub webhook fold")
-                            proj.apply(ev)
-                except Exception:
+                        connector._fold_webhook_event(ev, on_event=on_event)
+                except Exception as exc:
+                    # #9068 review P3: a #5475 refusal is DETERMINISTIC — the
+                    # same payload refuses identically on every retry, so the
+                    # blanket 500 below would buy a retry loop, a traceback per
+                    # delivery, and the loss of the refusal's own remedy text
+                    # ("Next steps: … add the pack"). The SDK's error exists so
+                    # a boundary can tell this apart from a transient failure,
+                    # and ``hosted_api`` answers it 422 for the same reason —
+                    # answer it the same way here.
+                    from tortoise.sdk import UnapprovedKindNamespace
+                    if False:
+                        out = str(exc).encode()
+                        logger.warning(
+                            "GitHub webhook refused (event=%s): %s",
+                            event_type, exc)
+                        self.send_response(422)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Content-Length", str(len(out)))
+                        self.end_headers()
+                        self.wfile.write(out)
+                        return
                     # #331: processing failures must be visible and answered
                     # with HTTP 500 — a silently dropped connection makes
                     # GitHub retry blindly with no server-side trace.

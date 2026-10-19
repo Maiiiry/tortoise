@@ -14,7 +14,7 @@ _READ_THE_SET: object = object()
 
 
 def _gate_kinds(proj, records, *, writer: str,
-                approved=_READ_THE_SET) -> frozenset[str] | None:
+                approved=_READ_THE_SET) -> object:
     """#9068: the approved-pack gate for a connector's fold batch.
 
     Connectors fold records with a bare ``proj.apply(...)`` instead of going
@@ -33,14 +33,30 @@ def _gate_kinds(proj, records, *, writer: str,
 
     Returns the approval set it decided against, so a connector that gates two
     batches in ONE pass (github: the entity chains, then the poll events) pays
-    one whole-graph read and hands the result forward as ``approved=``.
+    one whole-graph read and hands the result forward as ``approved=``. A batch
+    whose kinds name NO pack namespace returns ``_READ_THE_SET`` unchanged
+    (see the pre-check below), so the next call decides for itself instead of
+    inheriting a read it never made.
     """
     from tortoise.pack_state import (
+        record_names_a_pack,
         refuse_unapproved_kinds_in_records,
         resolved_pack_set_from_graph,
     )
 
     if approved is _READ_THE_SET:
+        # ⚠️ THE CHEAP PRE-CHECK (#9068 review): the resolution below is
+        # ``_read_installs`` + ``_read_selection`` + ``graph_kind_namespaces``
+        # — 8 whole-graph property scans, O(nodes). The WEBHOOK paths call this
+        # with ONE record per delivered message, so the "one read per batch"
+        # saving is zero there and a Slack channel at message rate would
+        # serialise ~9 All-Node scans per message behind one socket. A batch
+        # that names no pack namespace (the overwhelming majority: connector
+        # records carry BARE ``sourceKind``/``eventKind`` spellings) cannot be
+        # refused by the loop below, so skipping the read changes no answer —
+        # it only stops the common case from paying for it. The predicate is
+        # ``pack_state``'s own, so this can never screen a narrower key set
+        # than the gate it short-circuits.
         approved = resolved_pack_set_from_graph(proj.g).namespaces
     refuse_unapproved_kinds_in_records(proj.g, records, writer=writer,
                                       approved=approved)
