@@ -21,6 +21,10 @@ shape / `_manifest.json` / judge-blindness line-refs).
 tests/eval/write_path/
   generate_corpus.py        # deterministic corpus generator + authoring spec
   schema.py                 # canonical fixture/gold/baseline schemas + validators
+  raw_vs_narrative.py       # #7947: the two-arm harness (story=raw vs story=narrative)
+  score_qualifiers.py       # #7947: the pre-registered scorer + branch rule (pure
+                            #   `evaluate_branches`, so the boundary is unit-tested)
+  results/                  # committed score files (run 1 is NOT re-derivable; run 2 is)
   corpus.py                 # paths, fixtures_hash, manifest verification, pending baseline
   fixtures/<session>.json         # {session_id, harness, conversation} ONLY
   gold/<session>.gold.json        # SEALED — the entire answer key
@@ -28,6 +32,7 @@ tests/eval/write_path/
   baselines/main.json             # committed PRODUCT-lane baseline (posture llm)
   baselines/m2.json               # committed CI-lane baseline (posture m2, deterministic)
   receipts/                       # validated run receipts (llm + m2 lanes)
+  receipts/7947-arms-2026-10-18/  # #7947: 7 sessions x 2 arms, per-session receipts
   salience_labels.jsonl           # #4917: OWNER-confirmed not-an-entity name labels
   test_write_path_corpus.py       # contract tests (S4/S15)
 ```
@@ -113,6 +118,26 @@ the session-capture boundary set (`claude`, `claude-desktop`, `claude-web`,
   NEGATE remain thin (1 and 2 instances), and the corpus plants only the
   kinds the write path already supports — it measures recall, not the F1/F2
   ontology mapping.
+* `planted_qualifiers` — **(issue #7947)** the hedge/scope/stance ground truth the
+  raw-vs-narrative measurement scores: `{id, planted_turn, verbatim_qualifier,
+  class ∈ hedge|scope|stance, bound_claim?, notes}`. 25 across the corpus (15
+  tuning / 10 holdout, of which 9 carry no `bound_claim`), pinned by
+  `test_planted_qualifier_counts_the_measurement_quotes` because the write-up's
+  published verdict is computed on exactly those denominators.
+  ⛔ **GENERATOR-OWNED — never hand-edit the gold to add or change a qualifier.**
+  The section is derived from `generate_corpus._PLANTED_QUALIFIERS` and validated
+  by `schema._validate_planted_qualifiers`, which fails closed on the ways a
+  hand-edit goes wrong at gold level: the section is not a list, an entry is not an
+  object, an unknown key, a missing/non-string `verbatim_qualifier`, an `id` that is
+  not a string or that repeats, a `planted_turn` that is not an in-range int, a turn
+  whose content is not a string, an anchor that is not verbatim (normalized) in its
+  planted turn, an unknown `class`, and a `bound_claim` that is not a string or names
+  no planted unit of this gold. (No count is given on purpose — the list is the
+  contract, and a count silently goes stale.) This is not hypothetical: `#7947`'s first lane hand-added
+  `planted_qualifiers` straight into the sealed gold, which reddened **18** tests
+  (`_reject_unknown_keys`, `test_generator_is_byte_idempotent`,
+  `test_fixtures_hash_covers_fixture_and_gold_files`) and had to be undone by
+  making the section generator-owned. Add a row to the table instead.
 * `salient_units` — 1:1 with `planted_units`, carrying **point-level**
   `survival` semantics (the unit of analysis is the POINT — the
   research-brief/plan write-path unit assumption; NOT eval-spec §5's

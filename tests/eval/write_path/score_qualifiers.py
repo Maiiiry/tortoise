@@ -1,0 +1,693 @@
+"""Scoring for the raw-vs-narrative falsifier (#7947).
+
+Pre-registered endpoint (issue comment, fixed before any run):
+
+    per planted qualifier, classify the arm's extracted output bound to the same
+    claim as preserved | weakened | strengthened | flattened | absent | unknown
+    PRIMARY metric = loss rate = (flattened + absent) / planted qualifiers, per arm
+
+**Instrument.** The primary classification is a deterministic marker instrument:
+for each qualifier it asks two questions and combines them.
+
+  * ``claim_present`` — do the bound claim's content words (from its
+    ``verbatim_anchor``, or the qualifier's own words when unbound) appear among
+    the arm's extracted claims?
+  * ``marker_present`` — does the arm's output carry a same-class marker, i.e. a
+    hedge marker for a hedge, a scope marker for a scope, a stance marker for a
+    stance?
+
+  = ``preserved`` if both; ``flattened`` if the claim survived with no same-class
+  marker; ``absent`` if the claim did not survive.
+
+This is deliberately crude and deliberately reproducible. ⛔ **The PRIMARY loss
+metric is LESS exposed to the marker table, not unexposed:** ``loss = flattened +
+absent`` and ``absent`` never reads a marker, but ``flattened`` does — so the
+volume sensitivity that ``distortion_rate`` describes can only move a cell from
+``flattened`` to ``preserved``. Measured on the committed run, restricting the
+marker search to the single best-matching claim moves tuning Δloss −13.3 → −6.7 pp
+and pooled −4.0 → 0.0 pp, and leaves the holdout Δ unchanged at +10.0 pp — i.e.
+it can move the decision input's neighbours but not the decision input. The
+DISTORTION reading (``distortion_rate``) is the volume-sensitive one and is
+reported as secondary, never as the decision input.
+Its known weakness is paraphrase — an arm may
+preserve a hedge with vocabulary the marker list lacks, which would read as
+``flattened``. That error is only possible in the DANGEROUS direction (it can
+under-credit preservation).
+
+⚠️ The second opinion the registration contemplated for exactly those decisive
+``flattened`` cases — a judge-arbitration pass — was **registered but NOT run**,
+and this module has no flag for it: the deterministic instrument needed no
+session-to-session variance estimate, so the registered repeat-run check was
+never exercised either. Both facts are recorded in §10 of
+``docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md``; do not read the absence of a
+``--judge`` flag as the pass having been run and folded in.
+
+The marker lists are part of the registered instrument: they are printed in the
+output so a reader can audit them.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+WRITE_PATH_DIR = Path(__file__).resolve().parent
+GOLD_DIR = WRITE_PATH_DIR / "gold"
+
+ARMS = ("raw", "narrative")
+CLASSES = ("hedge", "scope", "stance")
+
+#: The pre-registered corpus split. The DECISION input is the HOLDOUT delta; the
+#: tuning half is reported so a reader can see the split was real, and the pooled
+#: figure is reported (labelled) because it is the number a reader will otherwise
+#: reach for — it is NOT what the registration decides on, and on the committed
+#: run it differs from the decision input by 14 pp AND IN SIGN (-4.0 pooled vs
+#: +10.0 holdout), which is precisely why the two are never interchangeable.
+TUNING_SESSIONS = ("wp01_quarry_debug", "wp02_lumen_refactor", "wp03_ember_design",
+                   "wp04_aurora_perf")
+HOLDOUT_SESSIONS = ("wp05_retro_writeup", "wp06_quarry_rollout", "wp07_bluepeak_followup")
+#: Pre-registered decision band on the holdout delta (pp).
+BAND_PP = 10.0
+#: Pre-registered allowed drop in precision/recall (pp) before branch 1 fires.
+PR_TOLERANCE_PP = 5.0
+
+# ── the instrument: same-class markers ──────────────────────────────────────
+MARKERS: dict[str, tuple[str, ...]] = {
+    "hedge": (
+        "probably", "maybe", "might", "may ", "perhaps", "i think", "i believe",
+        "roughly", "about ", "mostly", "seems", "appears", "suggests", "likely",
+        "uncertain", "not sure", "as far as i recall", "hypothesis", "tentativ",
+        "circumstantial", "correlates with", "realistically", "my read", "i'd guess",
+        "i would guess", "believe", "assume", "assumption", "plausible",
+        "possibl", "could be", "suspect", "impression", "no evidence",
+        "double check", "double-check", "verify", "unconfirmed",
+    ),
+    "scope": (
+        "only", "just ", "except", "until", "before ", "not for", "limited to",
+        "as long as", "provided", "unless", "in scope", "out of scope",
+        "on my machine", "hosted lane", "eu region", "single ", "one ", "prior to",
+    ),
+    "stance": (
+        "agree", "agreed", "push back", "comfortable", "risky", "tempting",
+        "rather", "signed off", "decision", "concern", "worried", "prefer",
+        "wants", "against", "support", "oppose", "review", "accepted", "rejected",
+        "endorse", "sign-off", "signoff",
+    ),
+}
+
+#: Words too common to identify a claim. Kept small and visible on purpose.
+#: Read as a prose block on purpose — the word list is the instrument, and a
+#: list literal would bury it (SIM905 is the style rule, not a defect here).
+STOP = frozenset(
+    "the a an and or of to in on for with is are was were be been that this it its "  # noqa: SIM905
+    "we our you your they their he she his her as at by from into not no yes so but "
+    "if then than there here what which who whom when where why how all any both "
+    "each few more most other some such only own same too very can will just should "
+    "now also has have had do does did doing i me my".split()
+)
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", s.lower())
+
+
+def _content_words(s: str) -> set[str]:
+    return {w for w in _norm(s).split() if w and w not in STOP and len(w) > 2}
+
+
+def render_claims(embed_list: dict) -> list[str]:
+    """One string PER EXTRACTED CLAIM for one arm.
+
+    Per-claim, not pooled: the marker test must be bound to the claim the
+    qualifier modifies. Pooling the whole output would let a hedge anywhere in
+    a 20-point list "preserve" every qualifier in the session, which would
+    report near-zero loss for BOTH arms and make the delta noise.
+    """
+    out: list[str] = []
+    for p in embed_list.get("points") or []:
+        if isinstance(p, dict):
+            c = _norm(str(p.get("content") or ""))
+            if c.strip():
+                out.append(c)
+    for op in embed_list.get("operators") or []:
+        if isinstance(op, dict):
+            c = _norm(json.dumps(op))
+            if c.strip():
+                out.append(c)
+    return out
+
+
+def _claims_matching(anchor_words: set[str], claims: list[str],
+                     threshold: float = 0.6) -> list[str]:
+    """The extracted claims that identify the same claim as the anchor."""
+    hits: list[str] = []
+    for c in claims:
+        if not anchor_words:
+            continue
+        cw = set(c.split())
+        overlap = len(anchor_words & cw) / len(anchor_words)
+        if overlap >= threshold:
+            hits.append(c)
+    return hits
+
+
+def classify(qualifier: dict, units: dict[str, dict], claims: list[str]) -> dict:
+    """Deterministic classification for one qualifier against one arm.
+
+    The marker is looked for IN THE MATCHED CLAIM(S) ONLY — never the whole
+    output — so "preserved" means *this qualifier survived on its own claim*.
+    """
+    qclass = qualifier["class"]
+    bound = qualifier.get("bound_claim")
+    unit = units.get(bound) if bound else None
+
+    # What must appear for "the same claim survived"?
+    anchor = ""
+    if unit:
+        anchor = unit.get("verbatim_anchor") or ""
+    if not anchor:
+        anchor = qualifier["verbatim_qualifier"]
+    want = _content_words(anchor)
+    matched = _claims_matching(want, claims)
+    claim_present = bool(matched)
+
+    # Marker must be IN the matched claim, not somewhere in the session.
+    matched_text = " \n ".join(matched)
+    marker_present = any(m in matched_text for m in MARKERS[qclass])
+
+    if claim_present and marker_present:
+        outcome = "preserved"
+    elif claim_present:
+        outcome = "flattened"
+    else:
+        outcome = "absent"
+
+    return {
+        "id": qualifier["id"],
+        "class": qclass,
+        "bound_claim": bound,
+        "verbatim_qualifier": qualifier["verbatim_qualifier"],
+        "claim_present": claim_present,
+        "marker_present": marker_present,
+        "outcome": outcome,
+        "matching_claims": len(matched),
+        "matched_excerpt": matched_text[:220],
+        "anchor_words_total": len(want),
+    }
+
+
+def score_session(session_id: str, arm: str, arms_dir: Path) -> dict:
+    arms = json.loads((arms_dir / f"{session_id}.arms.json").read_text())
+    gold = json.loads((GOLD_DIR / f"{session_id}.gold.json").read_text())
+    units = {u["id"]: u for u in gold.get("planted_units", [])}
+    qualifiers = gold.get("planted_qualifiers", [])
+
+    # ⛔ An arm whose extract the EXTRACTOR ITSELF marked incomplete (`partial`,
+    # rung-4 prefix-accept: the tail of the model's list was dropped) or that
+    # raised is NOT that arm's output — scoring it understates its claims and
+    # so overstates its loss. The run is still scored (it is the record of what
+    # happened) but the receipt is flagged, the decision block refuses to
+    # certify a branch on it, and the flag is written into the output.
+    stats = (arms.get("s2_stats") or {}).get(arm) or {}
+    receipt_flags = {
+        "partial": bool(stats.get("partial")),
+        "truncated": bool(stats.get("truncated")),
+        "s2_error": arms.get("s2_errors", {}).get(arm),
+    }
+    embed_list = arms["embed_list"].get(arm) or {}
+    claims = render_claims(embed_list)
+
+    rows = [classify(q, units, claims) for q in qualifiers]
+    n = len(rows)
+    matched = sum(1 for r in rows if r["claim_present"])
+    lost = sum(1 for r in rows if r["outcome"] in ("flattened", "absent"))
+    fl = sum(1 for r in rows if r["outcome"] == "flattened")
+    ab = sum(1 for r in rows if r["outcome"] == "absent")
+    return {
+        "session_id": session_id,
+        "arm": arm,
+        "n_qualifiers": n,
+        "preserved": sum(1 for r in rows if r["outcome"] == "preserved"),
+        "flattened": fl,
+        "absent": ab,
+        "matched": matched,
+        # Among qualifiers whose claim SURVIVED extraction, how often was the
+        # qualifier itself flattened? This is a reading of §10's question that is
+        # not confounded by claim-drop (a dropped claim is `absent`, not counted
+        # here) — but it IS volume-sensitive in one direction: `classify()` looks
+        # for the marker in the union of every claim that matches the anchor, so
+        # an arm that emits more claims gets more chances to have some matched
+        # claim carry it, which biases its distortion DOWN. Measured on the
+        # committed run, restricting to the single best-matching claim moves
+        # pooled narrative distortion 23.5% -> 29.4% and leaves raw at 20.0%.
+        # Report it as a secondary reading, never as the decision input.
+        "distortion_rate": (fl / matched) if matched else None,
+        "loss": lost,
+        "loss_rate": (lost / n) if n else None,
+        "points": len(embed_list.get("points") or []),
+        "operators": len(embed_list.get("operators") or []),
+        "receipt_flags": receipt_flags,
+        "rows": rows,
+    }
+
+
+def precision_recall(session_id: str, arm: str, arms_dir: Path) -> dict:
+    """Registered secondary guard: did the arm keep the planted facts?
+
+    Lexical, same idiom as the qualifier instrument: a planted unit counts as
+    RECALLED when some extracted claim carries >=60% of its anchor's content
+    words. A claim counts as a HIT (precision numerator) when it matches some
+    planted unit. Crude on purpose — it is the volume guard, not the endpoint:
+    E1 asks that volume fall *without losing the facts that matter*.
+    """
+    arms = json.loads((arms_dir / f"{session_id}.arms.json").read_text())
+    gold = json.loads((GOLD_DIR / f"{session_id}.gold.json").read_text())
+    units = gold.get("planted_units", [])
+    embed_list = arms["embed_list"].get(arm) or {}
+    claims = render_claims(embed_list)
+
+    recalled = 0
+    for u in units:
+        want = _content_words(u.get("verbatim_anchor") or "")
+        if want and _claims_matching(want, claims):
+            recalled += 1
+
+    hits = 0
+    for c in claims:
+        cw = set(c.split())
+        for u in units:
+            want = _content_words(u.get("verbatim_anchor") or "")
+            if want and len(want & cw) / len(want) >= 0.6:
+                hits += 1
+                break
+
+    n_units = len(units)
+    n_claims = len(claims)
+    return {
+        "session_id": session_id,
+        "arm": arm,
+        "planted_units": n_units,
+        "recalled": recalled,
+        "recall": (recalled / n_units) if n_units else None,
+        "claims_emitted": n_claims,
+        "claims_hit": hits,
+        "precision": (hits / n_claims) if n_claims else None,
+    }
+
+
+def evaluate_branches(delta_loss_pp: float | None, delta_precision_pp: float | None,
+                      delta_recall_pp: float | None, *, contaminated: list[str]) -> dict:
+    """Apply the pre-registered §7 rule to the HOLDOUT deltas.
+
+    Pure, so the boundary cases can be tested without a run. Two decisions this
+    encodes, both of which the measurement depends on:
+
+    * **Rounded percentage points, not raw floats.** ``100 * (7/10 - 6/10)`` is
+      ``9.999999999999998``, so a raw ``> 10.0`` test would decide the same
+      mathematical +10 pp differently depending on summation order — a branch
+      flipped by representation error is not reproducible.
+    * **No branch is certified on an incomplete receipt.** ``partial``/
+      ``truncated``/error means the arm's extract is not what the model produced,
+      so its loss is overstated; on this corpus one qualifier moves the holdout
+      delta by 10 pp, i.e. across the band.
+    """
+    def _pp(v: float | None) -> float | None:
+        return None if v is None else round(v, 9)
+
+    loss, prec, rec = _pp(delta_loss_pp), _pp(delta_precision_pp), _pp(delta_recall_pp)
+    # ⛔ The contamination rule is ONE-SIDED BY DIRECTION, not by convenience. A
+    # dropped tail removes claims, so an incomplete RAW arm OVERSTATES raw's loss
+    # (Δ understated → a fire is real evidence, merely under-detected), while an
+    # incomplete NARRATIVE arm OVERSTATES Δ — it can MANUFACTURE a branch-1 fire off
+    # an extract the extractor itself calls incomplete. So `fires` is suppressed only
+    # when the narrative receipt is the dirty one; refusing it in both directions
+    # would let a broken raw arm hide a real fire.
+    narrative_dirty = any(t.endswith(":narrative") for t in contaminated)
+    fires = ((loss is not None and loss > BAND_PP) or any(
+        d is not None and d < -PR_TOLERANCE_PP for d in (prec, rec))) and not narrative_dirty
+    parity = (loss is not None and abs(loss) <= BAND_PP
+              and all(d is None or abs(d) <= PR_TOLERANCE_PP for d in (prec, rec)))
+    certified = parity and not contaminated
+    # Branch 3's EFFECT ("stays provisional") is what an uncertifiable parity
+    # produces too: the registered rule has no branch for "met, but the run cannot
+    # be trusted", and inventing one here would hide it.
+    provisional = not fires and not certified
+    return {"branch_1_fires": fires, "branch_2_applies": parity,
+            "branch_2_certified": certified, "branch_3_stays_provisional": provisional,
+            "contaminated_receipts": list(contaminated),
+            "falsifier_suppressed_by_contamination": narrative_dirty}
+
+
+def verdict_label(verdict: dict) -> str:
+    """The recorded verdict string. ONE place, because the route is the whole point.
+
+    A single `branch_3` flag cannot say which route was taken — it is true for
+    "parity met, uncertifiable" AND for "branch 3 reached", and collapsing the two
+    records a route the flags contradict. This is the label a reader audits, so it
+    must agree with the console, case by case.
+    """
+    if verdict.get("falsifier_suppressed_by_contamination"):
+        return ("branch 1's condition was MET but SUPPRESSED: the narrative receipt is "
+                "incomplete and would overstate the delta")
+    if verdict["branch_1_fires"]:
+        return "the falsifier FIRES (branch 1)"
+    if verdict["branch_2_certified"]:
+        return "settled (branch 2 certified)"
+    if verdict["branch_2_applies"]:
+        return "provisional (branch 2 met, not certifiable; branch 3 not reached)"
+    if verdict["branch_3_stays_provisional"]:
+        return "provisional (branch 3: anything else, by the rule's own terms)"
+    return "no branch matched — scoring input incomplete"
+
+
+def check_protocol_pins(arms_dir: Path, sessions: tuple[str, ...]) -> list[str]:
+    """Every receipt in a run must describe the same protocol.
+
+    "Identical protocol" is the whole basis of the comparison, and the risky
+    differences are exactly the ones a console print does not survive: a different
+    model, chunk size, protocol date, or — the ones this measurement's OWN limits
+    section names as decisive — a different prompt/label-order/environment pin,
+    since `TORTOISE_LABEL_ORDER=shuffle` reseeds the label order FROM THE STORY and
+    so differs between arms at identical prompt length.
+    """
+    pins: dict[str, dict] = {}
+    for sid in sessions:
+        rec = json.loads((arms_dir / f"{sid}.arms.json").read_text())
+        pins[sid] = {
+            "model_id": rec.get("model_id"),
+            "chunk_size": rec.get("chunk_size"),
+            "session_date": rec.get("session_date"),
+            # Only SET pins are compared: an all-unset run is consistent with itself,
+            # and a receipt predating the `env_pins` field is not evidence of a
+            # difference.
+            "env_pins": {k: v for k, v in (rec.get("env_pins") or {}).items() if v},
+        }
+    errors: list[str] = []
+    for key in ("model_id", "chunk_size", "session_date"):
+        seen = {json.dumps(p[key]) for p in pins.values()}
+        if len(seen) > 1:
+            errors.append(f"receipts disagree on {key}: "
+                          + "; ".join(f"{s}={p[key]!r}" for s, p in pins.items()))
+    env_seen: dict[str, list[str]] = {}
+    for sid, p in pins.items():
+        env_seen.setdefault(json.dumps(p["env_pins"], sort_keys=True), []).append(sid)
+    if len(env_seen) > 1:
+        errors.append("receipts disagree on the ENVIRONMENT pins (a differing "
+                      "TORTOISE_LABEL_ORDER/prompt/cap changes the prompting, not just the story): "
+                      + " | ".join(f"{v} → {p}" for p, v in env_seen.items()))
+    return errors
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="score the raw-vs-narrative arms (#7947)")
+    ap.add_argument("--sessions", nargs="+", required=True)
+    ap.add_argument("--arms-dir", default=str(Path.home() / ".cache" / "pi-7947" / "arms"))
+    ap.add_argument("--out", default=str(Path.home() / ".cache" / "pi-7947" / "score.json"))
+    args = ap.parse_args(argv)
+
+    # ⛔ The split is pre-registered and FIXED. Running with a subset silently computes
+    # the decision input on fewer qualifiers while the output still names the full
+    # registered split — a verdict on 6 of 10 qualifiers recorded as the registered
+    # one. Refuse instead of guessing.
+    missing = [s for s in (*TUNING_SESSIONS, *HOLDOUT_SESSIONS) if s not in set(args.sessions)]
+    if missing:
+        ap.error(f"the pre-registered split requires all 7 sessions; missing: {', '.join(missing)}")
+    # A duplicate is worse than a typo: it passes the completeness check above and
+    # silently re-weights the holdout (wp05 listed twice: n=13, Δ=15.4 pp, branch 1
+    # FIRES) while the per-session table still prints each session once.
+    dupes = sorted({s for s in args.sessions if args.sessions.count(s) > 1})
+    if dupes:
+        ap.error(f"duplicate session(s) in --sessions: {', '.join(dupes)}")
+
+    arms_dir = Path(args.arms_dir)
+
+    # ⛔ "Identical protocol" is a claim the whole comparison rests on, and the scorer
+    # did not check it: receipts from a different model, chunk size, protocol date or
+    # environment would score silently as if they were one run. Two arms inside ONE
+    # session may never disagree (that would mean the arms differ in more than `story`),
+    # and a run must be internally consistent.
+    pin_errors = check_protocol_pins(arms_dir, (*TUNING_SESSIONS, *HOLDOUT_SESSIONS))
+    if pin_errors:
+        ap.error("; ".join(pin_errors))
+    _probe = json.loads((arms_dir / f"{TUNING_SESSIONS[0]}.arms.json").read_text())
+    print(f"  protocol pins (all {len(TUNING_SESSIONS) + len(HOLDOUT_SESSIONS)} receipts agree): "
+          + json.dumps({k: _probe.get(k) for k in ("model_id", "chunk_size", "session_date")}))
+    results: list[dict] = []
+    pr: list[dict] = []
+    for sid in args.sessions:
+        for arm in ARMS:
+            results.append(score_session(sid, arm, arms_dir))
+            pr.append(precision_recall(sid, arm, arms_dir))
+
+    by_session: dict[str, dict[str, dict]] = {}
+    for r in results:
+        by_session.setdefault(r["session_id"], {})[r["arm"]] = r
+
+    print(f"{'session':24} {'arm':10} {'n':>3} {'pres':>5} {'flat':>5} {'abs':>4} {'loss%':>7}")
+    for sid, arms in by_session.items():
+        for arm in ARMS:
+            r = arms.get(arm)
+            if not r:
+                continue
+            lr = "n/a" if r["loss_rate"] is None else f"{100 * r['loss_rate']:.0f}%"
+            print(f"{sid:24} {arm:10} {r['n_qualifiers']:>3} {r['preserved']:>5} "
+                  f"{r['flattened']:>5} {r['absent']:>4} {lr:>7}")
+
+    # Aggregate loss rate over pooled qualifiers (equal weight per qualifier).
+    agg: dict[str, dict] = {}
+    for arm in ARMS:
+        rows = [r for r in results if r["arm"] == arm]
+        n = sum(r["n_qualifiers"] for r in rows)
+        lost = sum(r["loss"] for r in rows)
+        matched = sum(r["matched"] for r in rows)
+        flat = sum(r["flattened"] for r in rows)
+        agg[arm] = {
+            "n": n, "loss": lost,
+            "loss_rate": (lost / n) if n else None,
+            "flattened": flat,
+            "absent": sum(r["absent"] for r in rows),
+            "matched": matched,
+            "distortion_rate": (flat / matched) if matched else None,
+            "points": sum(r["points"] for r in rows),
+        }
+    print()
+    for arm in ARMS:
+        a = agg[arm]
+        lr = "n/a" if a["loss_rate"] is None else f"{100 * a['loss_rate']:.1f}%"
+        dr = "n/a" if a["distortion_rate"] is None else f"{100 * a['distortion_rate']:.1f}%"
+        print(f"POOLED {arm:10} n={a['n']:<3} loss={a['loss']:<3} "
+              f"(flat={a['flattened']} absent={a['absent']}) loss_rate={lr}  "
+              f"| matched={a['matched']} distortion={dr}")
+
+    # ── the pre-registered split: the HOLDOUT delta is the decision input ──
+    split_agg: dict[str, dict[str, dict]] = {}
+    for name, sel in (("tuning", TUNING_SESSIONS), ("holdout", HOLDOUT_SESSIONS)):
+        rows = [r for s in sel for r in results if r["session_id"] == s]
+        split_agg[name] = {}
+        for arm in ARMS:
+            rs = [r for r in rows if r["arm"] == arm]
+            n = sum(r["n_qualifiers"] for r in rs)
+            lost = sum(r["loss"] for r in rs)
+            matched = sum(r["matched"] for r in rs)
+            flat = sum(r["flattened"] for r in rs)
+            split_agg[name][arm] = {
+                "n": n,
+                "loss": lost,
+                "loss_rate": (lost / n) if n else None,
+                "matched": matched,
+                "flattened": flat,
+                "absent": sum(r["absent"] for r in rs),
+                "distortion_rate": (flat / matched) if matched else None,
+            }
+
+    # Precision/recall on the same split (the other half of branch 1).
+    split_pr: dict[str, dict[str, dict]] = {}
+    for name, sel in (("tuning", TUNING_SESSIONS), ("holdout", HOLDOUT_SESSIONS)):
+        split_pr[name] = {}
+        for arm in ARMS:
+            rows = [r for r in pr if r["arm"] == arm and r["session_id"] in sel]
+            u = sum(r["planted_units"] for r in rows)
+            rec = sum(r["recalled"] for r in rows)
+            nc = sum(r["claims_emitted"] for r in rows)
+            h = sum(r["claims_hit"] for r in rows)
+            split_pr[name][arm] = {
+                "recall": (rec / u) if u else None,
+                "recalled": rec,
+                "planted_units": u,
+                "precision": (h / nc) if nc else None,
+                "claims_hit": h,
+                "claims_emitted": nc,
+            }
+
+    def _d(a: dict, b: dict, key: str) -> float | None:
+        va, vb = a.get(key), b.get(key)
+        return None if va is None or vb is None else 100 * (vb - va)
+
+    print("\n── THE DECISION INPUT (pre-registered: HOLDOUT only) ──")
+    decision: dict[str, dict] = {}
+    for name in ("tuning", "holdout"):
+        d_loss = _d(split_agg[name]["raw"], split_agg[name]["narrative"], "loss_rate")
+        d_prec = _d(split_pr[name]["raw"], split_pr[name]["narrative"], "precision")
+        d_rec = _d(split_pr[name]["raw"], split_pr[name]["narrative"], "recall")
+        decision[name] = {"delta_loss_pp": d_loss, "delta_precision_pp": d_prec,
+                          "delta_recall_pp": d_rec}
+        ra, na = split_agg[name]["raw"], split_agg[name]["narrative"]
+        print(f"  {name:8} n={ra['n']:<3} loss raw={ra['loss']}/{ra['n']} "
+              f"narrative={na['loss']}/{na['n']}  Δloss={d_loss:+.1f} pp  "
+              f"Δprecision={d_prec:+.1f} pp  Δrecall={d_rec:+.1f} pp")
+    hold = decision["holdout"]
+    # ⛔ A branch is certified only on CLEAN receipts. The extractor's own `partial`
+    # flag (rung-4 prefix-accept: the tail of the list was dropped) or a stage error
+    # means the arm's output is incomplete, so its loss is overstated — and on this
+    # corpus ONE qualifier moves the holdout Δ by 10 pp, i.e. across the band.
+    contaminated = [
+        f"{sid}:{arm}" for sid in HOLDOUT_SESSIONS
+        for arm in ARMS
+        if any(by_session.get(sid, {}).get(arm, {}).get("receipt_flags", {}).get(k)
+               for k in ("partial", "truncated", "s2_error"))
+    ]
+    verdict = evaluate_branches(hold["delta_loss_pp"], hold["delta_precision_pp"],
+                                hold["delta_recall_pp"], contaminated=contaminated)
+    fires = verdict["branch_1_fires"]
+    parity = verdict["branch_2_applies"]
+    certified = verdict["branch_2_certified"]
+    branch_3 = verdict["branch_3_stays_provisional"]
+    print(f"  branch 1 (falsifier fires: Δloss > +{BAND_PP:.0f} pp or a P/R drop > "
+          f"{PR_TOLERANCE_PP:.0f} pp): {'FIRES' if fires else 'does not fire'}")
+    print(f"  branch 2 (near-parity: |Δloss| <= {BAND_PP:.0f} pp and |ΔP/R| <= "
+          f"{PR_TOLERANCE_PP:.0f} pp):      {'APPLIES' if parity else 'does not apply'}"
+          + ("" if not parity else
+             ("  → CERTIFIED" if certified else
+              "  → NOT CERTIFIED: a holdout receipt is incomplete")))
+    if branch_3 and parity:
+        # Branch 3 is "anything else". When branch 2 APPLIED and was then not
+        # certified, branch 3 was not reached — the registration simply has no
+        # branch for "met, but the run cannot be trusted". Its EFFECT is adopted and
+        # is labelled as such; calling this "branch 3 applies" is a false statement
+        # about the rule, and the one a reader will use to call the verdict rigged.
+        print("  branch 3 (anything else → stays provisional): NOT REACHED — branch 2 applied "
+              "and could not be certified.")
+        print("          The registration has no branch for 'met, but the run cannot be trusted';")
+        print("          its EFFECT is adopted and recorded here as exactly that.")
+        print("          → VERDICT: D3 STAYS PROVISIONAL (uncertifiable parity)")
+    else:
+        print(f"  branch 3 (anything else → stays provisional): "
+              f"{'APPLIES' if branch_3 else 'not reached'}"
+              + ("  → VERDICT: D3 STAYS PROVISIONAL" if branch_3 else ""))
+    if verdict["falsifier_suppressed_by_contamination"]:
+        print("  ⛔ BRANCH 1 WAS SUPPRESSED: its condition was met, but the NARRATIVE receipt is"
+              " incomplete — a")
+        print("     dropped tail removes claims and so OVERSTATES the delta. Not a finding either"
+              " way until re-run.")
+    if contaminated:
+        print(f"  ⛔ INCOMPLETE RECEIPTS IN THE HOLDOUT: {', '.join(contaminated)}")
+        for tag in contaminated:
+            sid, arm = tag.split(":")
+            fl = by_session[sid][arm]["receipt_flags"]
+            print(f"     {tag}: partial={fl['partial']} truncated={fl['truncated']} "
+                  f"s2_error={fl['s2_error']}")
+        print("     → that arm's output is not the extract it should have produced; its loss is"
+              " overstated and a")
+        print("       Δ that sits near the band cannot be certified. Re-run that arm before deciding.")
+    print("  ⚠️ the holdout delta is ONE qualifier wide (10 pp here); read the split and the")
+    print("     anchor-subset lines, not just the sign. The pooled delta below is NOT the decision input.")
+
+    # ── the bound / unbound subset the anchor strictness depends on ──
+    subset: dict[str, dict[str, dict]] = {}
+    for name, sel in (("tuning", TUNING_SESSIONS), ("holdout", HOLDOUT_SESSIONS)):
+        subset[name] = {}
+        for arm in ARMS:
+            rows = [r for s in sel for r in by_session.get(s, {}).get(arm, {}).get("rows", [])]
+            for label, keep in (("bound", True), ("unbound", False)):
+                rs = [r for r in rows if bool(r.get("bound_claim")) is keep]
+                n = len(rs)
+                lost = sum(1 for r in rs if r["outcome"] in ("flattened", "absent"))
+                subset[name].setdefault(arm, {})[label] = {
+                    "n": n, "loss": lost,
+                    "loss_rate": (lost / n) if n else None,
+                }
+    print("\n── ANCHOR SUBSET (#7947 declares 9 of 25 unbound; they use their own words) ──")
+    for name in ("tuning", "holdout"):
+        for label in ("bound", "unbound"):
+            ra = subset[name]["raw"][label]
+            na = subset[name]["narrative"][label]
+            if not ra["n"] or not na["n"]:
+                continue
+            d = 100 * (na["loss_rate"] - ra["loss_rate"])
+            print(f"  {name:8} {label:7} n={ra['n']:<3} raw={ra['loss']}/{ra['n']} "
+                  f"narrative={na['loss']}/{na['n']}  Δloss={d:+.1f} pp")
+
+    delta = None
+    ddelta = None
+    if agg["raw"]["loss_rate"] is not None and agg["narrative"]["loss_rate"] is not None:
+        delta = agg["narrative"]["loss_rate"] - agg["raw"]["loss_rate"]
+        print(f"\nDELTA loss  (narrative - raw, POOLED) = {100 * delta:+.1f} pp"
+              f"   [NOT the decision input — see the holdout delta above]")
+    if agg["raw"]["distortion_rate"] is not None and agg["narrative"]["distortion_rate"] is not None:
+        ddelta = agg["narrative"]["distortion_rate"] - agg["raw"]["distortion_rate"]
+        print(f"DELTA flat  (narrative - raw, POOLED) = {100 * ddelta:+.1f} pp"
+              f"   [distortion among claims that survived; volume-sensitive — §10]")
+
+    for arm in ARMS:
+        rows = [r for r in pr if r["arm"] == arm]
+        u = sum(r["planted_units"] for r in rows)
+        rec = sum(r["recalled"] for r in rows)
+        nc = sum(r["claims_emitted"] for r in rows)
+        h = sum(r["claims_hit"] for r in rows)
+        rr = f"{100 * rec / u:.1f}%" if u else "n/a"
+        pp = f"{100 * h / nc:.1f}%" if nc else "n/a"
+        print(f"PLANTED {arm:10} recall={rr} ({rec}/{u})  precision={pp} "
+              f"({h}/{nc} claims match a planted unit)")
+
+    out = {
+        "instrument": {
+            "kind": "deterministic-same-class-markers",
+            "markers": {k: list(v) for k, v in MARKERS.items()},
+            "claim_present_threshold": 0.6,
+            "marker_scope": "matched claim only (not the whole output)",
+            "note": "can only under-credit preservation; flattened is the arbitrable class",
+        },
+        "aggregate": agg,
+        "precision_recall": pr,
+        "decision_input": {
+            "split": "holdout",
+            "sessions": list(HOLDOUT_SESSIONS),
+            "band_pp": BAND_PP,
+            "pr_tolerance_pp": PR_TOLERANCE_PP,
+            "branches": decision,
+            "branch_1_fires": fires,
+            "branch_2_applies": parity,
+            "branch_2_certified": certified,
+            "branch_3_stays_provisional": branch_3,
+            "contaminated_receipts": contaminated,
+            "falsifier_suppressed_by_contamination":
+                verdict["falsifier_suppressed_by_contamination"],
+            "verdict": verdict_label(verdict),
+            "certification_note": (
+                "a branch is certified only on clean receipts; `partial`/`truncated`/"
+                "s2_error means the arm's extract is incomplete and its loss overstated"),
+            "one_qualifier_is_pp": 100 / max(1, split_agg["holdout"]["raw"]["n"]),
+        },
+        "splits": {"aggregate": split_agg, "precision_recall": split_pr,
+                   "anchor_subset": subset},
+        "delta_pp": None if delta is None else 100 * delta,
+        "delta_distortion_pp": None if ddelta is None else 100 * ddelta,
+        "delta_pp_is_decision_input": False,
+        "band_pp": BAND_PP,
+        "per_session": by_session,
+    }
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2))
+    print(f"\nwrote {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
