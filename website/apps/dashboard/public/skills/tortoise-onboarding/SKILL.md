@@ -939,7 +939,8 @@ cannot reach the graph (never decide against a dead connection):
 
    **Rating semantics — the SUPPORT direction (#6151 owner ruling, PR #8181;
    single source: `tortoise/weights.py` → `annotation_factor`).** Rating an
-   operator is not a cosmetic note: its four dimensions combine into a
+   operator is not a cosmetic note: its four dimensions — `bias`, `precision`,
+   `consistency`, `directness`, all FOUR required arguments — combine into a
    symmetric, bounded multiplier on the operator's EP weight, so a well-rated
    connection counts for MORE than an unrated one and the worst-rated for
    less. Unset is exactly neutral (factor 1.0) and is the default; the worst
@@ -948,10 +949,13 @@ cannot reach the graph (never decide against a dead connection):
    to `mitigate_operator`'s dampening, and it needs no source. `bias` is
    INVERTED (a one-sided source counts for less). Two bounds: the factor
    multiplies the base weight and the result is then clamped to [0.1, 10.0],
-   so it applies in full to an ordinary IMPL (base 1.0), only partly to a NAND
-   (base 8.0 → 16.0 clamps to 10.0, a 1.25× gain at best) and not at all to a
-   NAND whose target is itself an operator (its neutral 16.0 is already on the
-   ceiling); and never use a rating to disagree with a connection — that is
+   so it applies in full to an ordinary IMPL (base 1.0), but only partly to a
+   NAND when RAISING the weight (base 8.0 → 16.0 clamps to 10.0, a 1.25× gain
+   at best) and not at all to a NAND whose target is itself an operator — its
+   neutral 16.0 is already on the ceiling, so a better rating gains nothing
+   there, while a worse one still reduces it (16.0 × 0.5 = 8.0, no clamp).
+   The band therefore stays symmetric — only the GAIN is squeezed near the
+   ceiling. And never use a rating to disagree with a connection — that is
    NAND's job. #2315's `never > 0.50` rule is untouched: it governs mitigation
    strength, not this multiplier.
 6. **Options can IMPL/NAND each other** — two go well together (IMPL), three

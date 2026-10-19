@@ -314,22 +314,49 @@ def test_8169_onboarding_documents_the_support_direction_of_strength():
         "step 5 must carry the positive counterpart to mitigating — rating "
         "the operator to make a connection count MORE (#8169)")
     rating = step[step.index(heading):]
+    # Phrases below are matched against a WHITESPACE-FOLDED view: the document
+    # is hard-wrapped at ~78 columns, so any multi-word phrase straddles a
+    # newline and a raw substring test silently never matches.
+    flat = " ".join(rating.split())
     assert "annotation_factor" in rating, (
         "the rating band must name its single source in tortoise/weights.py")
     assert "#2315" in rating, (
         "the band must separate itself from #2315's never >0.50 dampener "
         "rule — the two multipliers are different mechanisms")
     assert "1.0" in rating, "an unset rating is exactly neutral and must say so"
-    for edge in ("0.5", "2.0"):
-        assert edge in rating, (
-            f"the symmetric band's {edge} edge must be stated, or the "
-            "document implies an unbounded gain")
+    # Anchored on the PHRASE (and on a `\b`, so #2315's `0.50` cannot stand in
+    # for it), not on the bare number. `"0.5"` is a substring of the
+    # `never > 0.50` text this same slice is REQUIRED to carry four lines up,
+    # so a bare `"0.5" in rating` stayed green with the worst-edge sentence
+    # deleted — the assertion whose message is "the 0.5 edge must be stated"
+    # never tested that, and a one-sided band would have passed.
+    assert re.search(r"worst rating is 0\.5\b", flat), (
+        "the band's WORST edge (0.5) must be stated where the band is defined, "
+        "or the document implies a gain-only multiplier")
+    assert re.search(r"best is 2\.0\b", flat), (
+        "the band's BEST edge (2.0) must be stated where the band is defined")
+
+    # The bounds must be DIRECTIONAL. `annotation_factor` is applied before the
+    # [0.1, 10.0] clamp, so on an operator-targeting NAND (base 16.0) the ceiling
+    # squeezes the GAIN only: 16.0 * 2.0 clamps to 10.0 (gains nothing) while
+    # 16.0 * 0.5 = 8.0 reduces freely. Stated direction-blind ("not at all"),
+    # the paragraph contradicted its own symmetry claim and told an agent a
+    # rating cannot lower that weight (see weights.py:126-127, sdk.py:14060-14063).
+    assert "RAISING" in flat, (
+        "the NAND bound must be scoped to RAISING the weight — the clamp "
+        "absorbs gain only, and a direction-blind bound is false")
+    assert "gains nothing" in flat and "reduces it" in flat, (
+        "both directions at the ceiling must be stated: a better rating gains "
+        "nothing there, a worse one still reduces it")
 
     # `annotate_operator` takes FOUR required dimensions, not two — a doc that
-    # names only bias/precision sends the caller at a TypeError.
+    # names only bias/precision sends the caller at a TypeError. Asserted in
+    # `rating` (the band's own paragraph), so the dimensions are stated where
+    # the instruction to rate lives, not merely somewhere in step 5.
     for dim in ("bias", "precision", "consistency", "directness"):
-        assert dim in step, (
-            f"annotate_operator requires {dim!r}; the step must name all four")
+        assert dim in rating, (
+            f"annotate_operator requires {dim!r}; the rating paragraph must "
+            "name all four")
 
 
 def _installer_skills() -> list[str]:
