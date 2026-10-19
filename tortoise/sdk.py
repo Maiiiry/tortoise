@@ -5007,9 +5007,11 @@ def _decorate_fallback_hits(results: list[dict], graph) -> list[dict]:
         # #2350 (E-prec): the precision block owes every read path the same
         # 3-state end the primary decoration carries — the embedded fallback
         # must not relabel an ended-unknown window as still-true.
-        if (st.get("valid_from") or st.get("valid_to")
-                or st.get("valid_from_precision")
-                or st.get("valid_to_precision")):
+        # #9201: the gate is the decoration's ``has_window`` fact, not field
+        # truthiness — ``valid_from=""`` is present-but-falsey and an
+        # unparseable start emits no precision token, so the value test would
+        # drop ``end_state`` on THIS surface only (the drift #2350 closed).
+        if st.get("has_window"):
             if st.get("valid_from_precision"):
                 r["valid_from_precision"] = st["valid_from_precision"]
             if st.get("valid_to_precision"):
@@ -26088,6 +26090,14 @@ class TortoiseSDK:
                 valid_to_precision=(
                     point_state.get(pid, {}).get("valid_to_precision")
                     or pt.get("validToPrecision") or ""),
+                # #9201: the window-EMISSION fact, resolved by the ONE home
+                # (``validity.window_present``) at the batch decoration. ⚠️ The
+                # point-props fetch that builds ``pt`` does NOT carry the
+                # validity fields, so there is deliberately NO raw-props
+                # fallback here: when the decoration read fails this block is
+                # dropped (pre-existing — #9232 tracks it), and the gate says
+                # so rather than pretending otherwise.
+                has_window=bool(point_state.get(pid, {}).get("has_window")),
                 end_state=(
                     point_state.get(pid, {}).get("end_state")
                     or _resolve_end_state(

@@ -19,6 +19,7 @@ from typing import Any, Literal
 from .env_truthy import is_truthy
 from .security import entity_label, validate_entity_type
 from .validity import window_read_fields  # #2350: ONE read-projection home
+from .validity import window_present  # #9201: the window-emission gate's home
 # #8316: the READ half of the stored-embedding shape seam. A caller-supplied
 # embedding is stored VERBATIM as a plain Cypher `List` (PR #3018's recorded
 # decision) and a read spelled `<alias>.embedding` makes
@@ -643,6 +644,14 @@ class SearchResult:
     valid_from_precision: str = ""
     valid_to_precision: str = ""
     end_state: str = ""
+    # #9201: whether the point carries window information AT ALL — the
+    # emission gate below, resolved by ``validity.window_present`` at the
+    # decoration. It cannot be inferred from the fields above: ``""`` is a
+    # PRESENT start that is falsey, and since #9201 an unparseable start emits
+    # no precision token either, so a value-truthiness gate would drop the
+    # block (``end_state`` included) for a window that really exists — the
+    # cross-surface drift #2350 exists to prevent. Never emitted on the wire.
+    has_window: bool = False
     subject: dict | None = None  # {id, name, kind} | None — ≤1 hop, fail-closed (D10)
     # #4889: the fail-loud counterpart to an absent ``subject``. Emitted only
     # when the whole batch resolved no subject AND the graph has no
@@ -724,13 +733,18 @@ class SearchResult:
         # carries window information at all — undated points stay byte-
         # identical (no keys), a dated point states its end state so a
         # still-true window (``open``) is never confused with one whose end is
-        # un-datable (``unknown``). ``valid_from_precision`` is INCLUDED in the
-        # gate: a falsey-but-present start (``""``) is a real bound for the
-        # ONE read-projection home, so the resolved ``day`` must reach the
-        # wire — gating on a truthy ``valid_from`` alone silently dropped the
-        # block on that surface only (the cross-surface drift of #2350).
-        if (self.valid_from or self.valid_to or self.valid_to_precision
-                or self.valid_from_precision):
+        # un-datable (``unknown``).
+        # #9201: the gate is ``has_window`` — the resolved presence fact from
+        # ``validity.window_present`` — NOT the truthiness of the fields below.
+        # ``valid_from=""`` is a real bound that is falsey, and an unparseable
+        # start now emits no precision token, so a truthiness gate would drop
+        # ``end_state`` on THIS surface only while the other read paths kept it.
+        # The old value test stays OR'd in so a construction that supplies the
+        # window fields but not ``has_window`` degrades to the previous
+        # behaviour instead of to silence (the #2349/#2350 hazard: an
+        # ended-unknown window reading as still-true).
+        if (self.has_window or self.valid_from or self.valid_to
+                or self.valid_to_precision or self.valid_from_precision):
             if self.valid_from_precision:
                 d["valid_from_precision"] = self.valid_from_precision
             if self.valid_to_precision:
@@ -3944,13 +3958,13 @@ def fetch_point_epistemic_state(graph, point_ids: list[str]) -> dict[str, dict]:
             # #2350 (E-prec): the additive precision block, resolved by the ONE
             # read-projection home so search/recall annotation cannot drift
             # from ``get_historical_knowledge``/``assembly``. The bounds are
-            # passed RAW: ``window_read_fields``' presence gate is
-            # ``is not None`` (a falsey-but-present bound — ``""``, ``0`` —
-            # is a REAL bound, matching ``_covers`` and
-            # ``_assert_window_start_not_inverted``). Pre-normalizing with
-            # ``or None`` here made the same stored window read ``day`` in
-            # assembly / ``get_historical_knowledge`` and ``None`` here — the
-            # exact cross-surface drift this module exists to prevent.
+            # passed RAW — pre-normalizing with ``or None`` here made the same
+            # stored window read ``day`` in assembly /
+            # ``get_historical_knowledge`` and ``None`` here, the exact
+            # cross-surface drift this module exists to prevent. Since #9201
+            # the START is resolved by its own ruling-derived predicate (a
+            # start naming no instant claims no precision) while the END keeps
+            # the presence reading — see ``validity.window_read_fields``.
             _wf = window_read_fields(
                 row[2], row[3],
                 row[21] if len(row) > 21 else None,
@@ -3959,6 +3973,14 @@ def fetch_point_epistemic_state(graph, point_ids: list[str]) -> dict[str, dict]:
             st.setdefault("valid_from_precision", _wf["valid_from_precision"])
             st.setdefault("valid_to_precision", _wf["valid_to_precision"])
             st.setdefault("end_state", _wf["end_state"])
+            # #9201: the emission fact, from the same RAW inputs the projection
+            # just consumed. ``SearchResult.has_window`` / the fallback gate
+            # read it instead of re-deriving presence from field truthiness.
+            st.setdefault("has_window", window_present(
+                row[2], row[3],
+                row[21] if len(row) > 21 else None,
+                row[22] if len(row) > 22 else None,
+            ))
             old_id, old_content, old_created = row[5], row[6], row[7]
             new_id, new_status, new_content, new_created = row[8], row[9], row[10], row[11]
             if old_id and old_id not in {s["id"] for s in st["supersedes"]}:

@@ -55,9 +55,11 @@ response_fields:
     byte-identical
 - response: tortoise_search
   field: valid_from_precision
-  emitted_when: '#2350 — the hit is a Point carrying a validity window whose start precision is resolvable: one
-    of year|month|day (a legacy bare-ISO start reads as day). Emitted with the same block as valid_to_precision
-    and end_state, whenever valid_from / valid_to / valid_from_precision / valid_to_precision is present'
+  emitted_when: '#2350/#9201 — the hit is a Point carrying a validity window whose START names an instant:
+    its declared year|month|day, else `day` (a legacy bare-ISO start). ABSENT when the start names no
+    instant (`""`, `TBD`, unparseable) — per the #6140 owner ruling no start was recorded, so no precision
+    is claimed (read `end_state`, which is still emitted). Emitted with the same block as valid_to_precision
+    and end_state, whenever the hit carries window information'
   unchanged_when_off: n/a — not flag-gated; an undated hit stays byte-identical (no window keys at all), never a
     defaulted value
 - response: tortoise_search
@@ -142,9 +144,10 @@ response_fields:
 - response: sdk:get_historical_knowledge
   field: chain[].valid_from_precision / chain[].valid_to_precision / chain[].end_state (and the same triple on valid_point
     / candidates / nearest)
-  emitted_when: '#2350 — the additive precision block on EVERY chain entry and on each resolved entry: valid_from_precision
-    (year|month|day), valid_to_precision (year|month|day or the end-only `unknown`), end_state (open|known|unknown).
-    Resolved by `window_read_fields` in tortoise/validity.py, the ONE read-projection home'
+  emitted_when: '#2350/#9201 — the additive precision block on EVERY chain entry and on each resolved entry: valid_from_precision
+    (year|month|day, absent when the start names no instant — the #6140 ruling), valid_to_precision (year|month|day
+    or the end-only `unknown`), end_state (open|known|unknown). Resolved by `window_read_fields` in
+    tortoise/validity.py, the ONE read-projection home'
   unchanged_when_off: n/a — not flag-gated; additive keys, and a legacy dated window still reads as day / open
 - response: sdk:get_historical_knowledge
   field: end_state_unknown

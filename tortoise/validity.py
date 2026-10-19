@@ -32,7 +32,11 @@ closed-unknown).
 Legacy compatibility is total: a window written by #1538 carries no precision
 property, ``effective_precision`` reports ``"day"`` for its present bounds,
 ``end_state`` reports ``END_OPEN`` for its open end — byte-identical reads,
-no migration.
+no migration — with ONE ruling-derived exception on the START side, #9201: a
+stored start that NAMES NO INSTANT (``""``, ``"TBD"``) has no start to be
+day-precise about, so ``start_precision`` reports ``None`` for it (see that
+function). The END axis keeps the ``effective_precision`` reading until #9202's
+own ruling.
 """
 from __future__ import annotations
 
@@ -100,6 +104,99 @@ def effective_precision(bound: object, declared: object) -> str | None:
     if bound is not None:
         return "day"
     return None
+
+
+def names_an_instant(value: object) -> bool:
+    """Does *value* name a real instant that ``_created_sort_key`` can order?
+
+    ONE home for the question the START axis turns on (#9201). It is the same
+    measure ``sdk._supersede_window_start_source`` applies to a stored start
+    (``stored_vf is not None and _created_sort_key(stored_vf)[0] == 0``) and
+    the one ``commit_schema.validate_validity_window`` orders with — spelled
+    once here so a reader of ``start_precision`` does not have to re-derive it
+    from a predicate that lives three modules away.
+
+    ⛔ ``False`` does NOT mean "no window": ``""`` and ``"TBD"`` are PRESENT
+    bounds that name no instant (see ``window_present``). It also does not mean
+    the value is falsey — epoch ``0`` names the instant 1948-… and answers
+    ``True``.
+    """
+    if value is None:
+        return False
+    # Lazy — ``search_engine`` imports this module at module scope, so a
+    # top-level import would be a cycle (the same lazy import
+    # ``_supersede_window_start_source`` uses).
+    from .search_engine import _created_sort_key
+    return _created_sort_key(value)[0] == 0
+
+
+def start_precision(bound: object, declared: object) -> str | None:
+    """The precision a READ path should report for a window's START (#9201).
+
+    The #6140 owner ruling (2026-10-11 — *"A and C (c should be a warning)"*)
+    settled that a stored ``validFrom`` that names no instant (``""``,
+    ``"TBD"``) means **no start was recorded**, so the window is OPEN BELOW.
+    The precision axis kept the older ``is not None`` gate, so the same stored
+    value still reported ``"day"`` — a day-granularity claim about a datum the
+    ruling says does not exist, on every read surface alike.
+
+    So the START is gated by whether it NAMES AN INSTANT (``names_an_instant``,
+    the one home for that question):
+
+      * a start that names no instant claims no precision: ``None`` — and that
+        includes a caller-declared token, because a precision describes its
+        bound and there is no bound here to describe (``validate_validity_precision``
+        refuses a declaration only when the bound is ABSENT, so this shape is
+        reachable through the public write API and must not propagate a
+        granularity the ruling says was never recorded);
+      * a start that names an instant reports its DECLARED token, else the
+        legacy ``"day"`` — epoch ``0`` names a real instant, so it stays a day
+        rather than collapsing into the ``None`` bucket.
+
+    ⚠️ LANDING ORDER. This is the PRECISION half of #6140. The COVERAGE half
+    (``sdk._covers`` also requiring orderability, so an unparseable start reads
+    as OPEN BELOW instead of non-covering) is NOT on ``main`` yet — it arrives
+    with PR #9205. Until it does, a reply for such a start says "no precision"
+    here while ``get_historical_knowledge`` still reports it non-covering; the
+    two halves are one ruling and must not be read as one being complete.
+
+    ⛔ THE END IS NOT THIS FUNCTION'S BUSINESS (#9202). Whether a
+    present-but-unorderable ``validTo`` should report ``END_UNKNOWN`` changes
+    what ``end_state`` means for every window already persisted, so it awaits
+    its own owner ruling; ``effective_precision`` keeps the ``is not None``
+    gate on that side. Deciding it here would settle #9202 silently.
+    """
+    if not names_an_instant(bound):
+        return None
+    declared_token = normalize_precision(declared, field="precision")
+    return declared_token if declared_token is not None else "day"
+
+
+def window_present(
+    valid_from: object,
+    valid_to: object,
+    valid_from_precision: object,
+    valid_to_precision: object,
+) -> bool:
+    """Does this point carry window information at all? ONE home (#9201).
+
+    The read paths emit the precision block only for a DATED point and must
+    stay byte-identical for an undated one (#2350), so the emission gate needs
+    this question answered directly. Value-truthiness cannot answer it, and
+    that is load-bearing on BOTH sides of the answer:
+
+      * ``""`` is a PRESENT bound (it feeds ``window_read_fields`` raw), yet it
+        is falsey — a truthiness gate drops the whole block, ``end_state``
+        included, for a window that genuinely exists;
+      * an unparseable start claims no precision since #9201, so the gate can
+        no longer lean on a precision token to notice the bound.
+
+    A declared precision counts as window information even when its bound was
+    cleared: the write boundary refuses that shape, but a graph written before
+    the validator can hold it, and the reader must still say what it knows.
+    """
+    return (valid_from is not None or valid_to is not None
+            or bool(valid_from_precision) or bool(valid_to_precision))
 
 
 def end_state(valid_to: object, valid_to_precision: object) -> str:
@@ -189,15 +286,21 @@ def window_read_fields(
     a dated bound) yields ``day`` for a present bound and ``open`` for an
     absent end — the pre-#2350 reading.
 
-    Callers pass the bounds RAW. The presence gate is ``is not None`` (inside
-    ``effective_precision``/``end_state``), so a falsey-but-present bound —
-    ``""``, ``0`` — is a REAL bound and reads as ``day``, the same predicate
-    ``_covers`` orders with. Pre-normalizing at a call site (``bound or
+    Callers pass the bounds RAW. Pre-normalizing at a call site (``bound or
     None``) makes the same stored window resolve differently per surface,
     which is the drift this home exists to prevent (#2350 review P2).
+
+    ⛔ THE TWO ENDS ARE RESOLVED BY DIFFERENT PREDICATES, and that asymmetry is
+    a RULING, not drift. The START goes through ``start_precision``: since
+    #6140 (owner, 2026-10-11) a start that names no instant (``""``, ``"TBD"``)
+    means no start was recorded, so it reads ``None`` — while a falsey-but-
+    ORDERABLE start (epoch ``0``) is still a REAL bound and still reads ``day``.
+    The END keeps ``effective_precision``' ``is not None`` gate: whether a
+    present-but-unorderable ``validTo`` should read ``unknown`` is #9202's
+    question and is deliberately NOT answered here.
     """
     return {
-        "valid_from_precision": effective_precision(valid_from, valid_from_precision),
+        "valid_from_precision": start_precision(valid_from, valid_from_precision),
         "valid_to_precision": effective_precision(valid_to, valid_to_precision),
         "end_state": end_state(valid_to, valid_to_precision),
     }

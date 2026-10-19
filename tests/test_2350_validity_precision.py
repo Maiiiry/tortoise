@@ -461,10 +461,15 @@ def test_embedded_fallback_decorates_a_falsey_but_present_start(lane):
     precision block as the primary ``SearchResult.to_dict`` gate, but its gate
     omitted ``valid_from_precision``. For a falsey-but-PRESENT start
     (``validFrom=''``) the fetched state is
-    ``valid_from=None, valid_from_precision='day', end_state='open'``, so the
+    ``valid_from=None, valid_from_precision=None, end_state='open'``, so the
     primary path emitted the block and the fallback emitted NEITHER key — the
     cross-surface drift this feature exists to remove, on the fourth surface.
-    Pre-fix ``valid_from_precision``/``end_state`` were absent here."""
+    Pre-fix ``valid_from_precision``/``end_state`` were absent here.
+
+    #9201: the START's token is ``None`` rather than ``day`` (a start that
+    names no instant claims no precision — the #6140 ruling); the block's
+    PRESENCE is what this pins, and it is now resolved by ``has_window`` so the
+    token's absence cannot drop ``end_state`` again."""
     from tortoise.sdk import _decorate_fallback_hits
 
     sdk, _events = lane
@@ -472,7 +477,7 @@ def test_embedded_fallback_decorates_a_falsey_but_present_start(lane):
     assert _props(sdk, p["id"])["validFrom"] == ""
 
     hits = _decorate_fallback_hits([{"id": p["id"]}], sdk._get_proj().g)
-    assert hits[0]["valid_from_precision"] == "day"
+    assert hits[0].get("valid_from_precision") is None
     assert hits[0]["end_state"] == "open"
 
     # control — an undated hit still gains NO window keys (the gate is not a
@@ -497,14 +502,19 @@ def test_assembly_window_rows_carry_the_precision_block(lane):
 
 
 def test_falsey_but_present_bound_resolves_identically_on_all_three_read_paths(lane):
-    """#2350 review P2: the ONE read-projection home gates on ``is not None``
-    (a falsey-but-PRESENT bound — ``validFrom=""`` — is a REAL bound, the
-    same predicate ``_covers`` orders with), so search/recall, assembly and
-    ``get_historical_knowledge`` must resolve the SAME stored window the same
-    way. Pre-fix, ``fetch_point_epistemic_state`` pre-normalized with
-    ``or None`` (precision ``None``) and ``SearchResult.to_dict`` dropped the
-    block entirely, while the other two surfaces said ``day``/``open`` — the
-    exact cross-surface drift the module exists to prevent."""
+    """#2350 review P2: the ONE read-projection home took the bounds RAW, so a
+    falsey-but-PRESENT bound — ``validFrom=""`` — must resolve the SAME stored
+    window the same way on search/recall, assembly and
+    ``get_historical_knowledge``. Pre-fix, ``fetch_point_epistemic_state``
+    pre-normalized with ``or None`` (precision ``None``) and
+    ``SearchResult.to_dict`` dropped the block entirely, while the other two
+    surfaces said ``day``/``open`` — the exact cross-surface drift the module
+    exists to prevent.
+
+    #9201: the shared resolution for such a start is now ``None`` (it names no
+    instant, so it claims no precision — the #6140 ruling) instead of ``day``.
+    The assertion is one predicate for all three surfaces, ``.get(...) is
+    None``, which is the cross-surface AGREE­MENT this test is about."""
     sdk, _events = lane
     from tortoise.assembly import docker_walker_port
 
@@ -515,19 +525,19 @@ def test_falsey_but_present_bound_resolves_identically_on_all_three_read_paths(l
 
     # 1. get_historical_knowledge (raw bound)
     gk = sdk.get_historical_knowledge(p["id"], A_DATE)
-    assert gk["chain"][0]["valid_from_precision"] == "day"
+    assert gk["chain"][0].get("valid_from_precision") is None
     assert gk["chain"][0]["end_state"] == "open"
 
     # 2. assembly window rows (raw bound)
     port = docker_walker_port(sdk)
     today = datetime.date.today()
     row = next(r for r in port.window_rows(today, today) if r["id"] == p["id"])
-    assert row["valid_from_precision"] == "day"
+    assert row.get("valid_from_precision") is None
     assert row["end_state"] == "open"
 
     # 3. search/recall wire — the outlier pre-fix
     hit = next(r for r in _scan(sdk) if r["id"] == p["id"])
-    assert hit["valid_from_precision"] == "day"
+    assert hit.get("valid_from_precision") is None
     assert hit["end_state"] == "open"
 
 
