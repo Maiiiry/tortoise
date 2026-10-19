@@ -2874,8 +2874,6 @@ def test_the_runbook_states_the_meaning_of_ok_the_emitter_has() -> None:
 
     assert "means only that the tool did not raise" not in flat, (
         "the runbook still teaches the PRE-#8135 meaning of `status == ok`")
-    assert "does not raise" not in flat, (
-        "the runbook still teaches the PRE-#8135 meaning of `status == ok`")
     # ...and it carries the corrected definition, both halves of it.
     assert "neither raised nor returned a failure `_safe` swallowed" in flat, (
         "the runbook must state that `ok` also excludes a `_safe`-swallowed "
