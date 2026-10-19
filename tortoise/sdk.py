@@ -2914,8 +2914,10 @@ def _deleted_point_payload(id: str) -> dict:
 # journal and leave the divergence SILENT. This door writes the cache first
 # precisely so a cache write that cannot be issued (a refusal, an engine error)
 # appends NOTHING — the record can never claim a destruction the cache still
-# serves, which is the divergence #7951's append-first ordering produced on every
-# delete with §17.1's write door armed (#9124). The window it has instead — a
+# serves, which is the divergence #7951's append-first ordering produced on a
+# delete whose cache write did not land (#9207 measured the shape; the trigger is
+# RARE — §17.1's write door gates the FOLD lanes, not this door's raw handle). The
+# window it has instead — a
 # destroy that LANDED whose append then failed — is reported, never silent
 # (`WriteNotLandedError`, `record_committed=False`), and it resolves only through
 # a destructive `rebuild_all` (which re-creates the Point), after which the
@@ -11764,7 +11766,7 @@ class TortoiseSDK:
             # with no record is the silent unrecorded destroy this door exists
             # to prevent. ``False`` is the clean refusal (#9207's indicator): a
             # delete refused before it wrote leaves NO destruction record.
-            landed = self._delete_landed_anyway(proj, id)
+            landed = self._delete_landed_anyway(proj, id, exc)
             if landed is False:
                 raise
             if landed is None:
@@ -11862,7 +11864,8 @@ class TortoiseSDK:
         found = self.delete_point(id)
         return {"deleted": found, "id": id}
 
-    def _delete_landed_anyway(self, proj, point_id: str) -> bool | None:
+    def _delete_landed_anyway(self, proj, point_id: str,
+                              exc: BaseException | None = None) -> bool | None:
         """Did a FAILED `delete_point` write land in the cache anyway? (#9207)
 
         `_graph_write_with_retry` retries only the aborted-write family
@@ -11882,7 +11885,35 @@ class TortoiseSDK:
         the FOLD lanes (`apply`, the projection's own `query`), NOT this raw
         handle, so a READ here cannot be refused and turn "unknown" into a
         spurious verdict.
+
+        ⛔ The read is GATED ON GRAPH PRESENCE, and that gate is not a
+        refinement — it is the difference between a measurement and a silent
+        success. A Cypher read on a graph whose KEY is gone AUTO-CREATES an empty
+        graph on this engine (`tests/test_graph_write_repair.py` pins the same
+        fact; `tortoise/hosted_api.py` notes it for `select`), so after a
+        `graph was deleted or replaced while the query was running` abort the
+        read would answer `count(n) = 0` — "the Point is gone" — while its real
+        effect was to re-materialise the deleted key. The door would then write a
+        destruction record and return True over a graph that no longer exists.
+        So the read only runs on a CONFIRMED present key. An ABSENT key answers
+        ``False`` — the caller re-raises the engine's own error (the loud #7685
+        surface) rather than a success — and a probe that could not answer at all
+        answers ``None`` (unverified). Neither issues a read, so nothing is
+        re-created, and neither claims a destroy.
         """
+        from .retry import graph_abort_family
+
+        # The presence probe is paid ONLY on the graph-abort family: it is the
+        # family whose read would re-create a deleted key, and the state-independent
+        # arms (write slot / MISCONF) must not pay an EXISTS round trip on a
+        # failure that has nothing to do with the graph (#7405's contract).
+        if exc is not None and graph_abort_family(exc):
+            presence = self._graph_presence(proj)
+            if presence is False:
+                return False   # key ABSENT: the caller re-raises the loud #7685 error
+            if presence is None:
+                return None    # probe could not answer: claim nothing
+            # Confirmed present: the read-back is safe to issue.
         try:
             rows = proj.g.query(
                 "MATCH (n:Point {id:$id}) RETURN count(n)",

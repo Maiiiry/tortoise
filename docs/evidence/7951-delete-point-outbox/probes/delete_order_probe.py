@@ -15,10 +15,15 @@ It demonstrates, against the shipped modules:
   2. A cache write that RAISES appends NO record: the node is still there, the
      journal is untouched, and the caller gets the engine's own error.
      Pre-#9207 the journal already held the destruction at that point — the
-     divergence the door arming (#9124) turns from a rare crash window into
-     every delete. (A ZERO-ROW write is different, and IS recorded: the node is
-     absent either way, so the record is true of the cache — see the door's own
-     comment and `tests/test_7405_remaining_writes.py`.)
+     divergence #9207 measured. ⛔ That trigger is NOT the §17.1 write door
+     (#9124), which gates the FOLD lanes and not this door's raw `proj.g.query`
+     handle — section 1 below prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED`
+     with the guard armed. It is a generic engine/transport failure with the node
+     still present: RARE, and why the ordering is argued from the DIRECTION of
+     the divergence rather than its frequency. (A ZERO-ROW write is different,
+     and IS recorded: the node is absent either way, so the record is true of
+     the cache — see the door's own comment and
+     `tests/test_7405_remaining_writes.py`.)
   3. A destroy that LANDED and then failed to record is reported, never silent
      (`WriteNotLandedError`, `record_committed=False` since the append raised).
      It does not heal by itself: `recover_from_log` rebuilds only an EMPTY

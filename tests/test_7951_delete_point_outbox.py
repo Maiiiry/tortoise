@@ -21,9 +21,14 @@ are not equally harmful:
   statement, an engine error, a kill) leaves the journal claiming a destruction
   the cache never performed. The cache SERVES a Point the truth says is gone,
   which §17.1's own definition forbids (the cache must never be AHEAD of the
-  truth), and only a DESTRUCTIVE `rebuild_all` resolves it. With §17.1's write
-  door armed (#9124) this stops being a rare crash window and becomes every
-  delete: the refusal is decided PRE-WRITE, so it is deterministic.
+  truth), and only a DESTRUCTIVE `rebuild_all` resolves it. ⛔ The trigger is
+  NOT the §17.1 write door: that gates the FOLD lanes (`FalkorProjection.apply`
+  and the projection's own `query`), while this door writes through the raw
+  guarded handle (`proj.g.query`), which the gate does not cover — the probe in
+  this directory prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the
+  guard armed. So the window is a generic engine/transport failure with the node
+  still present: RARE. The ordering is justified by the DIRECTION of the
+  divergence it leaves, not by its frequency.
 * the cache first (#9207) — a `DETACH DELETE` that fails or matches nothing
   appends NOTHING, so the record can never over-claim. The remaining window is
   the append failing after a landed destroy: the cache is ahead of the truth
@@ -506,6 +511,79 @@ def test_an_unreadable_after_state_writes_no_record_and_claims_nothing(
         "an unverified cache state must never be recorded")
     assert _live(proj, pid) is True, (
         "premise: the injected failure never reached the engine")
+
+
+# ── T3d: a deleted graph key is UNKNOWN, never "landed" ────────────────────
+
+def test_a_deleted_graph_key_is_never_read_as_a_landed_destroy(env, monkeypatch):
+    """A `graph was deleted or replaced` abort must not be swallowed by the
+    read-back.
+
+    MEASURED engine fact: a Cypher read against a graph whose KEY is gone
+    AUTO-CREATES an empty graph (the repo pins the same behaviour in
+    `tests/test_graph_write_repair.py`), so the read-back would answer
+    `count(n) = 0` — indistinguishable from "the Point was destroyed" — while its
+    real effect was to re-materialise the deleted key. The door would then write
+    a destruction record and return True over a graph that no longer exists.
+
+    So the read is gated on CONFIRMED presence: with `EXISTS` answering 0 no
+    record is written and NO read is issued (asserted — the read is what would
+    re-create the key), and the engine's own error surfaces. That is the loud
+    #7685 surface, which tells the operator the key is absent — not a delete that
+    returned True over a graph that no longer exists.
+
+    MUTATION: drop the `_graph_presence` gate (or treat "absent" as present) and
+    the read runs, `landed` comes back True, `delete_point` RETURNS True and a
+    record is written — this reddens on all three.
+    """
+    import redis.exceptions as redis_exc
+
+    from tortoise.exceptions import WriteNotLandedError
+
+    sdk, events = env
+    proj = sdk._get_proj()
+    pid = sdk.create_point("observation", "graph deleted mid-delete")["id"]
+
+    real_query = type(proj.g).query
+    real_exec = type(proj.g).execute_command
+    reads_after_abort: list[str] = []
+    aborted = {"v": False}
+
+    def abort_then_read(_self, cypher, *args, **kwargs):
+        stmt = cypher or ""
+        if _DELETE_CYPHER in stmt:
+            aborted["v"] = True
+            raise redis_exc.ResponseError(
+                "graph was deleted or replaced while the query was running, "
+                "aborting")
+        if aborted["v"] and "RETURN count(n)" in stmt and "> 0" not in stmt:
+            reads_after_abort.append(stmt)
+        return real_query(_self, cypher, *args, **kwargs)
+
+    def key_is_gone(_self, *args, **kwargs):
+        if args and args[0] == "EXISTS":
+            return 0
+        return real_exec(_self, *args, **kwargs)
+
+    monkeypatch.setattr(type(proj.g), "query", abort_then_read)
+    monkeypatch.setattr(type(proj.g), "execute_command", key_is_gone)
+    try:
+        with pytest.raises(redis_exc.ResponseError) as ei:
+            sdk.delete_point(pid)
+    finally:
+        monkeypatch.setattr(type(proj.g), "query", real_query)
+        monkeypatch.setattr(type(proj.g), "execute_command", real_exec)
+
+    assert reads_after_abort == [], (
+        "the read-back ran against a graph whose key is gone — on this engine "
+        "that AUTO-CREATES the deleted graph, which is the silent-success path "
+        f"#9207 must not have: {reads_after_abort!r}")
+    assert not isinstance(ei.value, WriteNotLandedError), (
+        "an absent key is the graph-abort family's loud surface, not this "
+        "door's unverified arm")
+    assert not [r for r in _journal(events)
+                if r.get("op") == "delete" or r.get("type") == "EntityMutated"], (
+        "no destruction record may be written when the cache state is unknown")
 
 
 # ── T4: nothing is journaled for a delete that cannot happen ──────────────
