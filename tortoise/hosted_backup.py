@@ -283,12 +283,36 @@ def _dump_node(internal_id, labels, props) -> dict:
 #: truncated; the independent aggregate count below is the load-bearing guard.
 _DUMP_PAGE_SIZE = 1000
 
+#: Keyset-paged reads, ordered on the internal `id()`. The comparison is
+#: ``>=`` against a cursor the caller has ALREADY advanced past the last row it
+#: saw — never ``>`` against a negative start (see ``_paged_rows``).
+#:
+#: ⛔ This was ``id(n) > $cursor`` with ``cursor = -1``, and that form is silently
+#: WRONG on FalkorDB's Rust core (``MODULE LIST`` ``graph`` ver **60001**, the
+#: engine behind ``falkordb/falkordb:latest`` and ``falkordb-server:6.0.1``).
+#: Measured 2026-10-19 against a live v6 server holding 3 nodes:
+#:
+#:     literal id(n) > -1   -> 0 rows      (!!)   id(n) >= 0 -> 3 rows
+#:     literal id(n) > 0    -> 2 rows             id(n) > -1 via param -> 0 rows
+#:
+#: i.e. a NEGATIVE operand compared against `id()` matches nothing on v6 — every
+#: id sorts BELOW it. It is not a 32-bit wrap: `id(n) > -4294967296` and
+#: `id(n) > -9223372036854775808` also answer 0 rows on that server, so the
+#: existing rows above are the load-bearing part of this note, not a mechanism.
+#: The same queries answer correctly on both v4 cores (``42004`` app image and
+#: ``42006`` = the engine CI pins). Consequence of the old form: the FIRST page
+#: was empty on every v6 server, so ``dump_graph`` exported 0 nodes for a
+#: populated graph and the fail-closed guard below refused — **no backup could
+#: be taken on v6**, with a message that blamed a truncated read (#9226).
+#: Offsetting the cursor instead of negating it is engine-independent: an
+#: integer `id` is non-negative, so ``id >= 0`` is the true first page on both
+#: cores and ``id >= last + 1`` is exactly the old ``id > last``.
 _DUMP_NODE_PAGE_QUERY = (
-    "MATCH (n) WHERE id(n) > $cursor "
+    "MATCH (n) WHERE id(n) >= $cursor "
     "RETURN id(n), labels(n), properties(n) ORDER BY id(n) LIMIT $batch"
 )
 _DUMP_EDGE_PAGE_QUERY = (
-    "MATCH (a)-[r]->(b) WHERE id(r) > $cursor "
+    "MATCH (a)-[r]->(b) WHERE id(r) >= $cursor "
     "RETURN id(a), id(b), type(r), properties(r), id(r) "
     "ORDER BY id(r) LIMIT $batch"
 )
@@ -302,8 +326,17 @@ def _paged_rows(g, query: str, key_index: int, *, batch: int = _DUMP_PAGE_SIZE):
     ``query`` must select that key as column ``key_index`` and take ``$cursor`` /
     ``$batch``. An increasing-id cursor is stable against concurrent inserts and
     deletes — unlike SKIP, which re-counts a moving set.
+
+    The page predicate is ``id(...) >= $cursor`` and the cursor is advanced to
+    ``last + 1`` — so the first call sends ``0``, the inclusive lower bound of the
+    id space, and never a negative value. That is not cosmetic: a NEGATIVE
+    comparison against ``id()`` matches nothing on the v6 Rust core, which made every first page
+    empty and made ``dump_graph`` unusable on that engine (#9226 — see
+    ``_DUMP_NODE_PAGE_QUERY``). Advancing past the last row keeps the paging
+    identical on both cores because ids are non-negative integers, so
+    ``>= last + 1`` is exactly the old ``> last``.
     """
-    cursor = -1
+    cursor = 0
     while True:
         rows = g.query(
             query, params={"cursor": cursor, "batch": batch}
@@ -311,7 +344,7 @@ def _paged_rows(g, query: str, key_index: int, *, batch: int = _DUMP_PAGE_SIZE):
         if not rows:
             return
         yield from rows
-        cursor = int(rows[-1][key_index])
+        cursor = int(rows[-1][key_index]) + 1
         if len(rows) < batch:
             return
 
