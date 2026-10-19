@@ -11218,6 +11218,38 @@ class TortoiseSDK:
             and not (_derived_embedding and k == "embedding")
         }
         _promote_arm = 'status' in props
+
+        def _record_promote() -> None:
+            """Append the promote's record where the promote LANDS (#7951 2b).
+
+            The promote arm is APPLY-FIRST by decision (`#8830`): its guarded
+            ``SET`` can legitimately match nothing, so the record may not
+            precede the write. It must not follow the arms that run AFTER it
+            either. The tag sync and ``_mark_dirty`` come later and can raise —
+            a witnessed tag sync that cannot land aborts the whole call — which
+            left a landed promotion with NO record: measured on `main`, a
+            ``update_point(status='live', tags=[...])`` whose TAGGED merge could
+            not land left the node ``status='live'``, told the caller the call
+            had failed, and appended zero ``PointRevised``. Replay then
+            re-created the point as ``draft`` and the promotion was gone
+            (live ≠ replay, the class this ordering exists to close).
+
+            So the commit point is "after the guarded write, before anything
+            that can strand it" — the point ``invalidate_point`` and
+            ``retract_point`` already use, and the reason this arm was the only
+            apply-first door in its family. It is reached only with a NON-EMPTY
+            ``result_set``: every zero-row promote has already returned (the
+            idempotent live no-op) or raised (the diagnostic above).
+
+            Best-effort, as at the old tail: ``_emit_event`` never raises, and
+            the write it describes has already landed, so a failed append is
+            counted in ``_journal_write_failures`` rather than mis-reported as
+            ``WriteNotLandedError`` — which would claim the opposite of what
+            happened.
+            """
+            self._emit_event("PointRevised", id=id,
+                             new_content=props.get("content"), **emit_props)
+
         if not _promote_arm:
             # The append's OWN per-call outcome is the commit signal — a
             # per-call value, not a delta of the shared
@@ -11349,6 +11381,9 @@ class TortoiseSDK:
                     # the graph-wide EP epoch and persisting `ep_dirty` for a
                     # promote that matched nothing (#8854 review r9 P2).
                     return self.get_point(id)
+                # LANDED: record it HERE, before the tag sync and `_mark_dirty`
+                # below can strand it (#7951 2b — see `_record_promote`).
+                _record_promote()
             else:
                 self._graph_write_with_retry(
                     lambda: proj.g.query(
@@ -11394,6 +11429,9 @@ class TortoiseSDK:
                     # no-op, answered with no writes rather than through the
                     # tail's `_mark_dirty` EP advance.
                     return self.get_point(id)
+                # LANDED: see the `:Object` arm above — same commit point, same
+                # reason (#7951 2b).
+                _record_promote()
             else:
                 # #7405: one key per statement, each an absolute
                 # `SET n += $props` — a re-issue writes the same value to
@@ -11571,26 +11609,11 @@ class TortoiseSDK:
         # Dreaming (#85): property mutations can affect confidence.
         self._mark_dirty([id])
         result = self.get_point(id)
-        # #548: emit PointRevised event for rebuild parity.
-        # The PROMOTE arm's record is stated only now, AFTER its guarded write:
-        # the emit above ran for the unguarded arms (the outbox ordering), and
-        # this one may not precede a `SET` that can legitimately match nothing
-        # (see the outbox block above). The payload is the same dict either
-        # way — one record shape, one commit point per call.
-        # A promote that applies NOTHING never reaches here: a status-only
-        # promote on a live node leaves before this emit on BOTH of its routes —
-        # the PRE-write probe (no PROMOTE WRITE issued, and the `:Object` label
-        # probe is not reached either: the route returns on its status read at
-        # the top of the door, having issued only `RETURN n.status` + `get_point`)
-        # and the POST-write early return
-        # (statement issued, matched nothing) — and every other zero-row
-        # promote raises in the diagnostic above. So this emit is reached only
-        # by a promote that landed, and the `res.result_set` conjunct that used
-        # to guard it was unreachable-false (#8854 review round 11 P3;
-        # mechanism corrected round 12).
-        if _promote_arm:
-            self._emit_event("PointRevised", id=id,
-                             new_content=props.get("content"), **emit_props)
+        # The PROMOTE arm's record is NOT emitted here any more (#7951 2b): it
+        # commits where the promote lands, inside the arm, so the tag sync and
+        # `_mark_dirty` below it cannot strand a landed promotion. The unguarded
+        # arms still record BEFORE their writes (the outbox ordering above); the
+        # payload is the same dict either way — one record shape per call.
         return result
 
     def delete_point(self, id: str) -> bool:
