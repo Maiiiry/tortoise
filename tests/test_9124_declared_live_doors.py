@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -478,7 +479,12 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
     """Map each innermost function to what it does at the write handle.
 
     Returns ``{scope-qualified name: {lineno, writes, reads, appends, scopes,
-    aliases, params}}`` for every function holding at least one mutating call.
+    aliases, params, def_linenos, duplicate_writer_defs}}`` for every function
+    holding at least one mutating call. `def_linenos` lists every definition of
+    that BARE name in this module that writes, and `duplicate_writer_defs` is
+    set when there are two or more: a bare name is what the inventories key on,
+    so one row would account for both writers. `_duplicate_writer_offenders`
+    turns the flag into the gates' refusal.
     Both call lists carry the CONTROL-FLOW DEPTH as their last element —
     `writes` entries are ``(line, verb, statement-prefix, depth)`` and `appends`
     entries are ``(line, depth)`` — because an append only guarantees the record
@@ -594,6 +600,22 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
                 visit(child, current, local, nested, scope)
 
     visit(tree, None, {})
+    # A name defined more than once whose definitions BOTH write the handle
+    # cannot carry a name-level verdict: the inventories are keyed on the BARE
+    # name (`_inventory_of` resolves a scoped key to its last component), so ONE
+    # row would account for both writers and the undeclared twin would pass on
+    # its sibling's declaration. Flagged on EVERY writing def of the name and
+    # carried into the surface, where `_duplicate_writer_offenders` is the one
+    # reader the gates share. THE FLAG MUST HAVE A PRODUCER HERE: round 4 left
+    # four gates reading it while nothing wrote it, so all four were tautologies
+    # (`fact.get(...)` returned `None` for every entry, and `sorted()` of the
+    # companion `def_linenos` was unreachable) — an inert enforcer, which is the
+    # class this suite exists to prevent (#9124 review, round 5).
+    writing_defs: dict[str, list[int]] = {}
+    for fact in facts.values():
+        if fact["writes"]:
+            writing_defs.setdefault(fact["name"], []).append(fact["lineno"])
+
     surface: dict[str, dict] = {}
     for fact in facts.values():
         if not fact["writes"]:
@@ -605,11 +627,14 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
             # than merged: mixing one def's lane with another def's write is
             # exactly the unsound verdict the scope-qualified key prevents.
             key = f"{key}@{fact['lineno']}"
+        def_linenos = sorted(writing_defs[fact["name"]])
         surface[key] = {
             "lineno": fact["lineno"], "writes": list(fact["writes"]),
             "reads": fact["reads"], "appends": list(fact["appends"]),
             "scopes": list(fact["scopes"]), "aliases": set(fact["aliases"]),
             "params": set(fact["params"]),
+            "duplicate_writer_defs": len(def_linenos) > 1,
+            "def_linenos": def_linenos,
         }
     return surface
 
@@ -617,14 +642,15 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
 def _journal_first_violation(fact) -> str | None:
     """Why this function's record does not provably precede its write, or None.
 
-    One check, existential over the appends and measured against the SHALLOWEST
-    write: some append must have (a) a smaller line number than that write and
-    (b) a control-flow depth no greater than it. (a) alone is not enough — an
-    `_emit_event` inside an `if`/`try` while the write runs unconditionally is
-    the "declaration blesses a cache write with no committed record" shape even
-    when its line comes first; (b) alone is not enough — a record appended AFTER
-    the write is not a commit point. Neither, of course, is sufficient: a record
-    skipped by an earlier `return` is invisible to an AST.
+    One check, run PER WRITE and existentially over the appends: for EVERY
+    mutating statement there must be some append with (a) a smaller line number
+    and (b) a control-flow depth no greater than that write's. (a) alone is not
+    enough — an `_emit_event` inside an `if`/`try` while the write runs
+    unconditionally is the "declaration blesses a cache write with no committed
+    record" shape even when its line comes first; (b) alone is not enough — a
+    record appended AFTER the write is not a commit point. Neither, of course,
+    is sufficient: a record skipped by an earlier `return` is invisible to an
+    AST.
     """
     if not fact["appends"]:
         return ("appends no record at all — a live lane is 'append first, then "
@@ -693,6 +719,32 @@ def _all_inventoried() -> set[str]:
     return {name for members in _INVENTORY.values() for name in members}
 
 
+def _duplicate_writer_offenders(surface: dict, where: str = "") -> list[str]:
+    """ONE message per censused name whose DEFINITIONS all write the handle.
+
+    The name-level verdict is what the inventories, `_kind` and the flip gate's
+    `accounted` skip all speak in, so a name defined twice with both definitions
+    writing has no sound single answer — it must be refused, not classified.
+    `enumerate_handle_surface` sets `duplicate_writer_defs`/`def_linenos`; this
+    is the ONE reader the gates share, so the flag cannot be asserted at one
+    site and silently dropped at another.
+
+    NON-VACUITY is the point of the split: the four gates used to read
+    `fact.get("duplicate_writer_defs")` while nothing produced the key, so every
+    one of those reads was a tautology no surface could redden. The producer is
+    pinned by `test_two_writing_definitions_of_one_name_are_flagged` and this
+    reader's use on the gates' path by
+    `test_a_duplicate_writer_definition_reds_the_gates`.
+    """
+    return [
+        f"{where}{name}:{fact['lineno']} is defined more than once and BOTH "
+        "definitions write the handle — the name-level verdict mixes one def's "
+        f"lane with another def's write (defs at {sorted(fact['def_linenos'])})"
+        for name, fact in sorted(surface.items(), key=lambda kv: kv[1]["lineno"])
+        if fact.get("duplicate_writer_defs")
+    ]
+
+
 # ── the live gate: every SDK entry point is declared or accounted for ─────
 
 def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
@@ -705,13 +757,11 @@ def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
     names `supersede_point` by function and line.
     """
     surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
-    offenders = []
+    offenders = _duplicate_writer_offenders(surface)
     for name, fact in sorted(surface.items(), key=lambda kv: kv[1]["lineno"]):
         if fact.get("duplicate_writer_defs"):
-            offenders.append(
-                f"{name} is defined more than once and BOTH definitions write — "
-                "the name-level verdict mixes one def's lane with another def's "
-                f"write (defs at {sorted(fact['def_linenos'])})")
+            # Already reported above, with both definitions' line numbers: a
+            # merged name-level verdict is refused, never classified.
             continue
         if ("tortoise/sdk.py", name) in _PROVEN_READS:
             # Proven read-only in review: the ONE register the flip gate also
@@ -812,15 +862,14 @@ def test_every_live_declared_door_is_journal_first():
     that residue is what a reviewer reads, not what this test proves.
     """
     surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
-    checked, offenders = [], []
+    checked, offenders = [], _duplicate_writer_offenders(surface)
     for name, fact in surface.items():
         openers = {opener for _line, opener in fact["scopes"]}
         if not openers & set(_LIVE_LANE_NAMES):
             continue
         if fact.get("duplicate_writer_defs"):
-            offenders.append(
-                f"{name} merges two writing DEFINITIONS, so its write/append "
-                "order compares lines from different functions — split it")
+            # Already refused above: its write/append order would compare lines
+            # from two different definitions.
             continue
         violation = _journal_first_violation(fact)
         if violation:
@@ -838,6 +887,70 @@ def test_every_live_declared_door_is_journal_first():
         "them")
 
 
+#: The inventoried NO-JOURNAL / apply-first helpers each whole-door live lane
+#: reaches TRANSITIVELY (#9124 review, round 3 P2). `@_declares_live_write_lane`
+#: covers the whole body, so a helper's write runs inside the caller's lane —
+#: `_mark_dirty` is inventoried as `no-journal` (it appends nothing) yet its
+#: three `proj.g.query` writes are authorized whenever one of the four doors
+#: reaches it. The per-FUNCTION census cannot see the edge
+#: (`enumerate_handle_surface` attributes each write to the innermost function
+#: only), so the edge is pinned HERE: it can neither grow nor vanish silently.
+#: Measured on this tree: all four doors reach exactly this one helper.
+_DECLARED_DOOR_NESTED_INVENTORIED = {
+    "delete_point": {"_mark_dirty"},
+    "invalidate_point": {"_mark_dirty"},
+    "retract_point": {"_mark_dirty"},
+    "supersede_point": {"_mark_dirty"},
+}
+
+
+def test_a_whole_door_lane_authorizes_only_the_pinned_nested_writes():
+    """The transitive hole in a whole-door declaration, pinned (#9124 r3 P2).
+
+    A declared door's lane authorizes EVERY nested call, so a no-journal write
+    added inside any helper a declared door calls is blessed silently — the
+    "declaration blesses a cache write with no committed record" defect one call
+    edge away. The census is per FUNCTION and therefore structurally blind to
+    the edge; this pin is the compensating gate. It asserts the MEASURED set, so
+    a new nested write reds and must be reviewed before it is listed — it is not
+    a claim that the listed writes are justified (that is the inventory entry's
+    review, and `_mark_dirty`'s writes are a re-derivable flatten).
+    """
+    tree = ast.parse(SDK_PY.read_text(), str(SDK_PY))
+    inventoried = (_NO_JOURNAL | _APPLY_FIRST_HELPERS | _APPLY_FIRST_DOORS
+                   | _MIXED_ARM_DOORS)
+    measured: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name in _DECLARED_DOOR_NESTED_INVENTORIED:
+            calls = {
+                callee for sub in ast.walk(node) if isinstance(sub, ast.Call)
+                for callee in [getattr(sub.func, "attr", None)
+                               or getattr(sub.func, "id", None)]
+                if callee in inventoried
+            }
+            measured[node.name] = calls
+    missing = set(_DECLARED_DOOR_NESTED_INVENTORIED) - set(measured)
+    assert not missing, (
+        "a pinned declared door is not in the source, so the pin measures "
+        f"nothing for it: {sorted(missing)}")
+    assert any(measured.values()), (
+        "no declared door reaches an inventoried helper at all — the pin would "
+        "be vacuous and the nested-call residual would be unmeasured")
+    delta = {
+        door: {"added": sorted(calls - _DECLARED_DOOR_NESTED_INVENTORIED[door]),
+               "gone": sorted(_DECLARED_DOOR_NESTED_INVENTORIED[door] - calls)}
+        for door, calls in measured.items()
+        if calls != _DECLARED_DOOR_NESTED_INVENTORIED[door]
+    }
+    assert not delta, (
+        "a declared door's NESTED no-journal/apply-first calls changed. The "
+        "door's lane authorizes every one of them and the per-function census "
+        "cannot see the edge — review the write, then pin it here:\n  "
+        + "\n  ".join(f"{door}: added={v['added']} gone={v['gone']}"
+                      for door, v in sorted(delta.items())))
+
+
 def test_the_event_store_declares_every_writer():
     """The `:GraphEvent` store declares its own lane (#9124 part 1).
 
@@ -849,9 +962,9 @@ def test_the_event_store_declares_every_writer():
     returned nothing while the API reported success (#9208).
     """
     surface = enumerate_handle_surface(EVENT_STORE_PY.read_text(), str(EVENT_STORE_PY))
-    assert not any(fact.get("duplicate_writer_defs") for fact in surface.values()), (
+    assert not _duplicate_writer_offenders(surface, "event_store "), (
         "an event_store name merges two writing definitions — the store's own "
-        f"surface must be unambiguous: {sorted(surface)}")
+        "surface must be unambiguous")
     undeclared = {
         name: fact for name, fact in surface.items() if not fact["scopes"]
     }
@@ -1062,6 +1175,95 @@ class Bar:
         "the undeclared twin inherited a scope from its same-named sibling — "
         "that is the collapse the scope-qualified key removes")
     assert surface["Bar.door"]["writes"], surface["Bar.door"]
+    # Both twins carry `duplicate_writer_defs` (`_duplicate_writer_offenders`
+    # refuses a name-level verdict on them); what THIS test pins is that the
+    # per-def CLASSIFICATION is still computed rather than merged.
+    assert all(fact["duplicate_writer_defs"] for fact in surface.values()), surface
+
+
+def test_two_writing_definitions_of_one_name_are_flagged():
+    """The duplicate-definitions flag has a PRODUCER, and it can RED (#9124 r5).
+
+    Round 4 rewrote the surface to be scope-qualified and dropped the producer
+    of `duplicate_writer_defs` while keeping four gates that read it — so all
+    four were tautologies: `fact.get(...)` was `None` for every entry, and the
+    `sorted(fact['def_linenos'])` message was unreachable. Nothing could redden
+    the hazard the flag exists for: one bare name (what every inventory is
+    keyed on) carrying TWO writers, with one row accounting for both.
+
+    Non-vacuity: with the flag never set, the `is True` assertions and the two
+    offenders fail. The second half is the GREEN control — same name, one
+    writing def — where the residue is nothing to refuse.
+    """
+    src_two_writers = '''
+class Stub:
+    def door(self, proj, pid):
+        proj.g.query("CREATE (n:Point {id:$id})", params={"id": pid})
+
+
+class Impl:
+    def door(self, proj, pid):
+        proj.g.query("MERGE (n:Point {id:$id})", params={"id": pid})
+'''
+    surface = enumerate_handle_surface(src_two_writers, "<synthetic-dupes>")
+    assert set(surface) == {"Stub.door", "Impl.door"}, sorted(surface)
+    def_linenos = sorted(fact["lineno"] for fact in surface.values())
+    for key, fact in surface.items():
+        assert fact["duplicate_writer_defs"] is True, (key, fact)
+        assert fact["def_linenos"] == def_linenos, (key, fact)
+    offenders = _duplicate_writer_offenders(surface, "<synthetic>::")
+    assert len(offenders) == 2, offenders
+    assert all(o.startswith("<synthetic>::") and "BOTH definitions write" in o
+               for o in offenders), offenders
+    assert all(f"defs at {def_linenos}" in o for o in offenders), (
+        "the offender message must name BOTH definitions' lines — round 4's "
+        "dead branch carried `sorted(fact['def_linenos'])` and could never "
+        f"print it: {offenders}")
+
+    src_one_writer = '''
+class Stub:
+    def door(self, proj, pid):
+        proj.g.query("MATCH (n:Point {id:$id}) RETURN n", params={"id": pid})
+
+
+class Impl:
+    def door(self, proj, pid):
+        proj.g.query("CREATE (n:Point {id:$id})", params={"id": pid})
+'''
+    surface = enumerate_handle_surface(src_one_writer, "<synthetic-dupes>")
+    # The read-only twin never reaches the surface: only ONE definition of the
+    # name writes, so the name-level verdict is unambiguous.
+    assert set(surface) == {"Impl.door"}, sorted(surface)
+    assert surface["Impl.door"]["duplicate_writer_defs"] is False, surface
+    assert surface["Impl.door"]["def_linenos"] == [
+        surface["Impl.door"]["lineno"]], surface
+    assert _duplicate_writer_offenders(surface) == []
+
+
+def test_a_duplicate_writer_definition_reds_the_gates(monkeypatch):
+    """A flagged surface REFUSES at a real gate — the flag is on that path.
+
+    Round 4's four gates read a key nothing produced, so no surface could make
+    them fail. This poisons the enumerator for one gate
+    (`test_the_event_store_declares_every_writer`) so the flag→gate path is
+    exercised: the poisoned fact HAS the flag, so the gate must refuse with the
+    duplicate-definitions message. Delete that refusal from the gate and this
+    test fails — the fact then reads as an undeclared writer instead, and the
+    `match=` no longer finds the refusal. (Production of the flag itself is
+    `test_two_writing_definitions_of_one_name_are_flagged`, which reds when the
+    producer is removed; this test would not.)
+    """
+    fake = {"Store.door": {
+        "lineno": 10, "writes": [(11, "query", "CREATE (n:Point)", 0)],
+        "reads": 0, "appends": [], "scopes": [], "aliases": set(),
+        "params": set(), "duplicate_writer_defs": True,
+        "def_linenos": [10, 30],
+    }}
+    monkeypatch.setattr(sys.modules[__name__], "enumerate_handle_surface",
+                        lambda *a, **k: fake)
+    with pytest.raises(AssertionError, match="BOTH definitions write") as raised:
+        test_the_event_store_declares_every_writer()
+    assert "[10, 30]" in str(raised.value), str(raised.value)
 
 
 # ── the flip gate: arming requires a fully declared surface ───────────────
@@ -1168,16 +1370,13 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
     provable: dict[str, list[str]] = {}
     unproven: dict[str, list[str]] = {}
     seen_sdk: set[str] = set()
+    duplicate_offenders: list[str] = []
     for rel, surface in population:
+        # BEFORE any accounting: a name whose DEFINITIONS both write merges one
+        # def's lane with another def's write, so its verdict is unsound
+        # whatever else it looks like — including looking declared.
+        duplicate_offenders.extend(_duplicate_writer_offenders(surface, f"{rel}::"))
         for name, fact in sorted(surface.items()):
-            # BEFORE any accounting: a name whose DEFINITIONS both write merges
-            # one def's lane with another def's write, so its verdict is unsound
-            # whatever else it looks like — including looking declared.
-            assert not fact.get("duplicate_writer_defs"), (
-                f"{rel}::{name} is defined more than once and BOTH definitions "
-                "write the handle — the name-level verdict would mix one def's "
-                "lane with another def's write; split the census per definition "
-                "or merge the definitions")
             accounted = bool(fact["scopes"]) or (rel, name) in _CALLER_DECLARED
             proven_read = (rel, name) in _PROVEN_READS
             if rel == "tortoise/sdk.py":
@@ -1186,6 +1385,11 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
                 continue
             bucket = unproven if _is_unresolved_only(fact) else provable
             bucket.setdefault(rel, []).append(f"{name}:{fact['lineno']}")
+
+    assert not duplicate_offenders, (
+        "a name is defined more than once and BOTH definitions write the handle, "
+        "so its name-level verdict is unsound whatever else it looks like — "
+        "including looking declared:\n  " + "\n  ".join(duplicate_offenders))
 
     # THE FLOOR — proven REAL in both modes, on the same population the armed
     # check uses.

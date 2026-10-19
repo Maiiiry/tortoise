@@ -3501,6 +3501,18 @@ def _declares_live_write_lane(reason: str):
     journal append: a later edit that adds a write above the append reddens
     there instead of silently widening the lane.
 
+    ⛔ IT ALSO AUTHORIZES EVERY NESTED CALL, which is a stated residual rather
+    than an oversight: `delete_point`, `invalidate_point`, `retract_point` and
+    `supersede_point` each call `_mark_dirty`, and `_mark_dirty` writes through
+    the handle while appending no record — those writes are covered by the
+    door's lane, and a per-FUNCTION census cannot see the call edge. The
+    measured set is pinned in
+    `tests/test_9124_declared_live_doors.py::test_a_whole_door_lane_authorizes_only_the_pinned_nested_writes`,
+    so it can only change with a reviewed line there. That pin records the set;
+    it does not claim the nested writes are justified (`_mark_dirty`'s are a
+    re-derivable flatten), and a new no-journal write reached from a declared
+    door must be reviewed instead of being assumed blessed.
+
     A per-call ContextVar scope, exactly like the inline form: nothing about
     this is an instance attribute, constructor argument or env switch, and it
     is released in a ``finally`` (the ``with``), so a raising door cannot leak

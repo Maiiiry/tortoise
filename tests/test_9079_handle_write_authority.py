@@ -295,29 +295,46 @@ def test_a_mutating_statement_through_the_command_channel_is_refused(armed_sdk, 
 
 # ── reads are not writes ─────────────────────────────────────────────────
 
-def test_reads_through_the_write_handle_still_pass(armed_sdk):
+def test_reads_through_the_write_handle_still_pass(armed_sdk, measure_only):
     """GREEN before this lane, and it must stay so.
 
     The reconciler and every diagnostic read through this handle. A classifier
     that refused reads would break the whole product, so this is the pin that
-    keeps the guard narrow — and it is RED for a guard that refuses on the
-    handle rather than on the statement (`_statement_writes`).
+    keeps the guard narrow — and the CENSUS is what makes it a pin at all: in
+    the landed measure mode nothing is refused, so "did not raise" alone passes
+    on a classifier that calls every statement a write (#9124 review, round 5).
+    `measure_only` resets the census, so a non-empty one here means
+    `_statement_writes` misread a read — the condition part 2 would turn into a
+    refusal of every diagnostic read in the product.
     """
     proj = armed_sdk._get_proj()
     assert proj.g.query("MATCH (n:Point) RETURN count(n)").result_set[0][0] == 0
     assert proj.g.ro_query("MATCH (n:Point) RETURN count(n)").result_set[0][0] == 0
+    assert undeclared_handle_writes() == {}, (
+        "a read through the write handle was counted as an UNDECLARED WRITE — "
+        "`_statement_writes` over-classified it, and under `enforced` that is "
+        f"a refusal of every diagnostic read: {undeclared_handle_writes()!r}")
 
 
-def test_a_read_whose_text_contains_a_write_keyword_still_passes(armed_sdk):
+def test_a_read_whose_text_contains_a_write_keyword_still_passes(
+        armed_sdk, enforced):
     """The classifier strips literals, so a keyword inside DATA is not a write.
 
     `_statement_writes` is conservative by design, but "conservative" must not
     mean "any statement mentioning SET is a write": a diagnostic that filters on
     a property VALUE would be refused, and the natural workaround is to bypass
     the handle — which is how a guard creates the hole it was closing.
+
+    ARMED (`enforced`), which is the mode where the mistake is visible at all:
+    in the landed measure mode this statement executes whether or not the
+    classifier misreads it, so the test passed for a classifier that called the
+    literal a write (#9124 review, round 5).
     """
     proj = armed_sdk._get_proj()
     proj.g.query("MATCH (n:Point) WHERE n.note = 'SET n.x = 1' RETURN count(n)")
+    assert undeclared_handle_writes() == {}, (
+        "the keyword inside the STRING LITERAL was read as a write clause — a "
+        f"diagnostic filtering on data would be refused: {undeclared_handle_writes()!r}")
 
 
 # ── the sanctioned lanes still write ─────────────────────────────────────
