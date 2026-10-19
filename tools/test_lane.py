@@ -216,10 +216,35 @@ from pathlib import Path
 LANE_IMAGE_PIN = "falkordb/falkordb-server:v4.20.6"
 IMAGE = os.environ.get("TORTOISE_TEST_LANE_IMAGE", LANE_IMAGE_PIN)
 
-#: Tags that mean "whatever upstream published last" (#8124). An image is
-#: accepted only with an explicit version tag or an ``@sha256:`` digest.
-_FLOATING_TAGS = frozenset({"", "latest", "latest-alpine", "edge", "edge-c",
-                            "edge-rs"})
+#: A tag that means "whatever upstream published last" (#8124). The rule is
+#: the floating FAMILY, not an enumerated allow-list: upstream publishes
+#: ``latest``, ``latest-6.0.1``, ``latest-alpine``, ``edge``, ``edge-c``,
+#: ``edge-rs``, ``edge-ts``, ``edge-x64``, ``edge-rhel9-x64``,
+#: ``edge-alpine-arm64v8`` … — and an enumerated set is always one publication
+#: behind, so a lane exporting ``edge-ts`` slipped the seam that exists to stop
+#: exactly that (measured 2026-10-19 on Docker Hub). ONE predicate owns the
+#: verdict here and in ``tests/test_runner_ports_6673.py``'s lane sweep, which
+#: classifies the same family; a second, divergent definition is how the two
+#: guards disagree.
+_FLOATING_TAG_RE = re.compile(r"(?:latest|edge)[a-z0-9._-]*\Z", re.IGNORECASE)
+
+
+def is_floating_image(ref: str) -> bool:
+    """True for ``latest*``, an ``edge*`` build, or NO tag at all.
+
+    The refusal is the floating FAMILY — the spellings that mean "whatever
+    upstream published last" — not an allow-list of literal tags: a tag that
+    does not begin with ``latest``/``edge`` is an explicit selection. Untagged
+    is included deliberately because Docker reads it as ``:latest``, and a
+    digest is always a pin.
+    """
+    ref = ref.strip()
+    if "@sha256:" in ref:               # a digest IS the pin
+        return False
+    last = ref.rsplit("/", 1)[-1]
+    if ":" not in last:
+        return True                     # no tag = implicitly :latest
+    return bool(_FLOATING_TAG_RE.match(last.rsplit(":", 1)[-1]))
 
 
 def assert_pinned_image(image: str) -> str:
@@ -231,14 +256,11 @@ def assert_pinned_image(image: str) -> str:
     ``reply_compact`` panics the server on a query this suite issues, so the
     lane reports ``Connection closed by server`` instead of a test result (see
     "IMAGE PIN" in the module docstring). Refused, so the crash cannot be
-    reintroduced by exporting the old default from a shell profile.
+    reintroduced by exporting the old default from a shell profile. The test
+    is the floating FAMILY (see ``is_floating_image``): an explicit version —
+    any tag that is not ``latest*``/``edge*`` — and a digest both pass.
     """
-    ref = image.strip()
-    if "@sha256:" in ref:      # a digest IS the pin
-        return image
-    last = ref.rsplit("/", 1)[-1]
-    tag = last.rsplit(":", 1)[-1].lower() if ":" in last else ""
-    if tag in _FLOATING_TAGS:
+    if is_floating_image(image):
         raise SystemExit(
             f"test-lane: refusing the floating image {image!r} — "
             f"TORTOISE_TEST_LANE_IMAGE must name an explicit version tag or an "

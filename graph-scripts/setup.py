@@ -610,6 +610,18 @@ def _container_status(name: str) -> str:
     return out or "missing"
 
 
+def _container_image(name: str) -> str:
+    """The image the container was CREATED from ('' when unreadable).
+
+    `docker start` never re-resolves an image: a container created before the
+    pin existed keeps its original engine ID for life (#8124). The status alone
+    therefore cannot answer "is this container pinned?" — this can.
+    """
+    return _run_output(
+        ["docker", "container", "inspect", "-f", "{{.Config.Image}}", name]
+    )
+
+
 def _port_collision(port: str) -> str | None:
     """Return container ID using this port, or None."""
     out = _run_output(["docker", "ps", "--format", "{{.ID}} {{.Ports}}"])
@@ -626,14 +638,28 @@ def step8() -> None:
 
     status = _container_status(_FALKORDB_CONTAINER)
 
-    if status == "running":
-        _skip("container already running")
-        return
-
-    if status == "exited":
-        print("  Restarting stopped container...")
-        _run(["docker", "start", _FALKORDB_CONTAINER])
-        return
+    # #8124: an EXISTING container is the case the pin does not reach by itself.
+    # `docker run` only happens on the `missing` path, and a container created
+    # from the old floating `falkordb/falkordb:latest` keeps its engine for life
+    # (`docker start` never re-resolves an image) — under `--restart
+    # unless-stopped` that is the panicking 6.0.x engine restarted forever, on
+    # the container MOST likely to be broken (it is the one that crashed).
+    # Recreating is safe: the data dir is a bind mount, not the container's.
+    if status in ("running", "exited"):
+        created_image = _container_image(_FALKORDB_CONTAINER)
+        if created_image and created_image != FALKORDB_IMAGE:
+            print(f"  Container was created from {created_image!r}, not the "
+                  f"pinned {FALKORDB_IMAGE!r} (#8124) — recreating it on the "
+                  f"pin (data in ./data is a bind mount and is kept)...")
+            _run(["docker", "rm", "-f", _FALKORDB_CONTAINER])
+            status = "missing"
+        elif status == "running":
+            _skip("container already running")
+            return
+        else:
+            print("  Restarting stopped container...")
+            _run(["docker", "start", _FALKORDB_CONTAINER])
+            return
 
     if status not in ("missing",):
         print(f"  Removing stale container ({status})...")
