@@ -74,7 +74,10 @@ def _probe_falkordb(candidates: list[str | None]) -> tuple[bool, str | None]:
             continue
         _proj = None
         try:
-            _proj = FalkorProjection.from_uri(_uri)
+            # explicit test-prefixed graph_name: the census in
+            # tests/test_derived_names.py refuses a bare from_uri(_uri) site,
+            # whose absent name would resolve to the shared env-URI graph.
+            _proj = FalkorProjection.from_uri(_uri, graph_name="test_9209_probe")
             _proj.g.query("RETURN 1")
             return True, _uri
         except Exception:
