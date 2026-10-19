@@ -11631,10 +11631,14 @@ class TortoiseSDK:
         the journal (undoing the delete), after which the delete must be
         re-issued.
         * NEITHER store's state is known — ``destroy_verified=False``: the
-          `DETACH DELETE` raised and the cache could not be read back (or its
-          graph key was gone, so the read would have re-created it). No record is
-          written and the refusal claims NOTHING about either store; the caller
-          must establish the cache state with `get_point` before acting.
+          `DETACH DELETE` raised and the presence probe / read-back could not
+          answer. No record is written and the refusal claims NOTHING about either
+          store; the caller must establish the cache state with `get_point`
+          before acting.
+
+        An ABSENT graph key does NOT reach either arm: the door re-raises the
+        engine's own error (the loud #7685 surface) and writes no record, because
+        on this engine a read against a deleted key would re-create the graph.
 
         A no-op id still returns ``False``; ``True`` still means the node was
         destroyed (or was already absent when the statement ran).
@@ -11677,7 +11681,8 @@ class TortoiseSDK:
         neighbor_ids = [cid for cid in neighbor_claims if cid != id]
         # ── #9207 — THE CACHE WRITE IS THE COMMIT POINT ON THIS DOOR ──────
         # #9207 REVISES #7951's ordering here, deliberately and with the
-        # measurement in hand (the OVERRIDES line is recorded on the issue).
+        # measurement in hand (the OVERRIDES line is recorded on the issue —
+        # #9207, comment 6278248112, posted with this change).
         #
         # #7951 put the `EntityMutated` op=delete APPEND first, so a cache
         # write that cannot be guaranteed could never destroy a node the
@@ -11876,7 +11881,7 @@ class TortoiseSDK:
         return {"deleted": found, "id": id}
 
     def _delete_landed_anyway(self, proj, point_id: str,
-                              exc: BaseException | None = None) -> bool | None:
+                              exc: BaseException) -> bool | None:
         """Did a FAILED `delete_point` write land in the cache anyway? (#9207)
 
         `_graph_write_with_retry` retries only the aborted-write family
@@ -11888,9 +11893,12 @@ class TortoiseSDK:
         destruction record must be written. One read settles it.
 
         ``True`` — the Point is gone, so the write applied and the record must
-        follow it; ``False`` — the Point is still there, so nothing was
-        destroyed and the refusal is clean; ``None`` — the read failed too, so
-        the caller must not claim either state.
+        follow it; ``False`` — the write did not land: either the Point is still
+        there, or the graph key is absent (the loud #7685 surface), or the raise
+        is from the state-independent family (not-landed by construction) — in
+        every case nothing was destroyed and the caller re-raises cleanly;
+        ``None`` — the probe or the read could not answer, so the caller must not
+        claim either state.
 
         Reading through the guarded handle is deliberate: the §17.1 gate covers
         the FOLD lanes (`apply`, the projection's own `query`), NOT this raw
@@ -11906,7 +11914,9 @@ class TortoiseSDK:
         read would answer `count(n) = 0` — "the Point is gone" — while its real
         effect was to re-materialise the deleted key. The door would then write a
         destruction record and return True over a graph that no longer exists.
-        So the read only runs on a CONFIRMED present key. An ABSENT key answers
+        So the read only runs on a CONFIRMED present key — and the
+        state-independent arm (write slot / MISCONF) never reaches it at all,
+        because that arm is not-landed by construction. An ABSENT key answers
         ``False`` — the caller re-raises the engine's own error (the loud #7685
         surface) rather than a success — and a probe that could not answer at all
         answers ``None`` (unverified). Neither issues a read, so nothing is
@@ -11914,22 +11924,27 @@ class TortoiseSDK:
         """
         from .retry import _ARM_STATE_INDEPENDENT, _abort_arm
 
-        # The presence probe is paid on EVERY family except the state-independent
-        # one. Keying it on the graph-abort family alone was too narrow: the read
-        # below is the read that AUTO-CREATES an absent key, and a non-family raise
-        # (a transport error, a non-retryable `ResponseError`) does not prove the
-        # key is still there — `retry.py` states that doctrine for the retry
-        # predicate itself ("a raise does not prove the statement did not land").
-        # So only the arms whose failure is BY CONSTRUCTION unrelated to the graph
-        # (write slot / MISCONF) skip the probe, which is what keeps #7405's
-        # contract (`test_a_write_slot_exhaustion_pays_no_graph_presence_probe`).
-        if exc is not None and _abort_arm(exc) != _ARM_STATE_INDEPENDENT:
-            presence = self._graph_presence(proj)
-            if presence is False:
-                return False   # key ABSENT: the caller re-raises the loud #7685 error
-            if presence is None:
-                return None    # probe could not answer: claim nothing
-            # Confirmed present: the read-back is safe to issue.
+        # The state-independent arms (write slot / MISCONF) are DEFINITIVELY "did
+        # not land" — `retry.retryable_aborted_write` retries them for exactly that
+        # reason — so there is nothing to read back and nothing to record. They
+        # return here, BEFORE the presence probe (which they would only discard,
+        # #7405's `test_a_write_slot_exhaustion_pays_no_graph_presence_probe`) and
+        # before the read (which is the read that AUTO-CREATES an absent key).
+        if _abort_arm(exc) == _ARM_STATE_INDEPENDENT:
+            return False
+
+        # EVERY other arm is gated on graph presence. Keying the gate on the
+        # graph-abort family alone was too narrow: a non-family raise (a transport
+        # error, a non-retryable `ResponseError`) does not prove the key is still
+        # there — `retry.py` states that doctrine for the retry predicate itself
+        # ("a raise does not prove the statement did not land") — so it must not
+        # reach the read ungated either.
+        presence = self._graph_presence(proj)
+        if presence is False:
+            return False   # key ABSENT: the caller re-raises the loud #7685 error
+        if presence is None:
+            return None    # probe could not answer: claim nothing
+        # Confirmed present: the read-back is safe to issue.
         try:
             rows = proj.g.query(
                 "MATCH (n:Point {id:$id}) RETURN count(n)",

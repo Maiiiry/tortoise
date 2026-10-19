@@ -29,12 +29,15 @@ gate) and the record follows only once that statement has RETURNED. Because a ra
 "nothing was destroyed" — the transport family may have applied the write and lost the reply — the
 door READS THE CACHE BACK after a failure: gone ⇒ the destroy landed and the destruction is recorded;
 present ⇒ the clean refusal, nothing recorded; unreadable ⇒ a third arm that records nothing and
-states only that the destroy is UNVERIFIED (`destroy_verified=False`).
+states only that the destroy is UNVERIFIED (`destroy_verified=False`). The read is issued only on a
+CONFIRMED present key, and the state-independent arm (write slot / MISCONF — not-landed by
+construction) returns before both the probe and the read, so nothing re-creates an absent graph.
 
 **What this proves, and what it does not.** It proves the §17.1 **ordering** on the hard-delete door:
-no record can exist for a destroy the cache did not perform (a cache write that RAISES appends
-nothing — a zero-row write IS recorded, because the node is absent either way and the record is
-therefore true of the cache), and every residual window is reported rather than silent: a landed
+no record can exist for a destroy the cache did not perform — a cache write that raises WITHOUT
+having applied appends nothing (a raise OVER an applied write is read back and recorded: that is T3b,
+and a zero-row write IS recorded, because the node is absent either way and the record is therefore
+true of the cache) — and every residual window is reported rather than silent: a landed
 destroy whose append failed is `record_committed=False`, a lost reply over an APPLIED destroy is
 recorded and logged, and an unreadable after-state raises an arm that asserts neither store. A
 completed delete stays durable across replay. It does
@@ -94,13 +97,15 @@ only (the worktree and the `mkdtemp` names are per-run); every measured line is 
 ```console
 $ TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
     tests/test_7951_delete_point_outbox.py -q
-14 passed
+17 passed
 ```
 
 `tests/test_7951_delete_point_outbox.py` carries the threat rows this door declares: T1 the ordering
 (cache before record), T3e a `graph was deleted or replaced` abort whose KEY is gone is never read
 back as a landed destroy (the read would auto-create the empty graph and answer `count(n)=0`, so the
-door gates the read on `EXISTS` and surfaces the engine's own error instead), T2 no record for a
+door gates the read on `EXISTS` and surfaces the engine's own error instead), T3f/T3g which families
+reach that read-back at all (state-independent: never; an unrecognised transport raise: still gated),
+T3h what the refusal's DEFAULT claims (nothing — `destroy_verified=False`), T2 no record for a
 destroy the cache did not perform, T3/T8 a landed destroy
 whose append failed (reported, and repaired only by a destructive rebuild), T3b a raise that does not
 prove "nothing was destroyed" (the door reads the cache back, so a lost reply over an APPLIED write is
@@ -115,7 +120,7 @@ all three clauses were false in the first cut of the shared prose), T4 no record
 record's declared shape, T6 the `:GraphEvent` subscriber row, T7 the journal-less (`None`) arm, T9 the
 evidence probe's own instrumentation, T10 the delete door's own record in the refusal and the graph on
 the cache clause. **T1/T2/T3/T3e/T8/T3b/T3c/T3d/T10 were measured RED against #9207's predecessor** (the
-record-first order: with the CURRENT 14-test file, `9 failed / 5 passed` at `origin/main` — T10
+record-first order: with the CURRENT 17-test file, `12 failed / 5 passed` at `origin/main` — T10
 reddens on its `update_point`
 record-noun assertion, which the predecessor answered with `PointAdded`), and the reason differs by row
 because the old order got each case wrong in its own direction: T1 read `['journal', 'cache']` (the record first); T2/T3c/T8

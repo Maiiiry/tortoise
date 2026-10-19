@@ -55,6 +55,11 @@ are not equally harmful:
 * an append that LANDS and then raises is reported as UNCONFIRMED
   (`record_committed=False` — the record may durably exist) and the landed
   record is applied by the next replay (T8);
+* a raise from the state-independent arm (write slot / MISCONF) is not-landed by
+  construction: no presence probe, no read-back, no record (T3f); a raise the
+  classifier does not recognise is STILL gated on the key, so the read cannot
+  auto-create an absent graph (T3g); and the refusal's DEFAULT claims neither
+  store (T3h);
 * the evidence probe's own class-attribute patch is restored to the CLASS
   FUNCTION, so each section measures its OWN graph (T9);
 * the message names THIS door's record (`EntityMutated op=delete`, derived from
@@ -501,9 +506,9 @@ def test_an_unreadable_after_state_writes_no_record_and_claims_nothing(
     # `missing_in_cache` (the record holds the Point, the cache does not), i.e.
     # the cache is BEHIND the TRUTH, not ahead of it.
     present_branch = msg.split("PRESENT")[-1].split("ABSENT")[0]
-    assert "behind the TRUTH" not in msg, (
+    assert "behind the truth" not in present_branch.casefold(), (
         "the first cut of this clause called a present node 'behind a TRUTH "
-        f"that no longer records a destruction for it': {msg!r}")
+        f"that no longer records a destruction for it': {present_branch!r}")
     assert "re-issue" in present_branch.lower() or "RE-ISSUE" in present_branch, (
         f"the PRESENT branch must send the caller to a re-issue: {present_branch!r}")
     assert "rebuild_all" not in present_branch, (
@@ -596,6 +601,150 @@ def test_a_deleted_graph_key_is_never_read_as_a_landed_destroy(env, monkeypatch)
     assert not [r for r in _journal(events)
                 if r.get("op") == "delete" or r.get("type") == "EntityMutated"], (
         "no destruction record may be written when the cache state is unknown")
+
+
+# ── T3f: the state-independent arm never reads the cache back ─────────────
+
+def test_a_state_independent_raise_is_not_landed_by_construction(env,
+                                                                 monkeypatch):
+    """A write-slot raise answers ``False`` — no probe, no read-back.
+
+    `retry.retryable_aborted_write` retries the state-independent arms for ONE
+    reason: the engine ABORTED the statement, so nothing was applied. That makes
+    them "not landed" BY CONSTRUCTION, so this door must not read the cache back
+    on them — and the read it would issue is the read that AUTO-CREATES a deleted
+    graph key (T3e). It must not pay the presence probe either: its answer would
+    only be discarded (#7405's cost contract,
+    `test_a_write_slot_exhaustion_pays_no_graph_presence_probe`).
+
+    This pins the gate cycle 3 keyed on the graph-abort family alone: with that
+    narrower form the state-independent arm fell THROUGH to the read-back, and
+    this test reddens on ``reads == ['MATCH ... RETURN count(n)']`` while every
+    other row in the suite stays green.
+
+    MUTATION: restore `if exc is not None and _abort_arm(exc) !=
+    _ARM_STATE_INDEPENDENT:` (the graph-abort-only gate), or drop the
+    short-circuit `return False`, and the read-back runs.
+    """
+    import redis.exceptions as redis_exc
+
+    sdk, events = env
+    proj = sdk._get_proj()
+    pid = sdk.create_point("observation", "write slot exhausted")["id"]
+
+    real_query = type(proj.g).query
+    real_exec = type(proj.g).execute_command
+    reads: list[str] = []
+    probes: list[tuple] = []
+
+    def slot_abort(_self, cypher, *args, **kwargs):
+        if _DELETE_CYPHER in (cypher or ""):
+            raise redis_exc.ResponseError(
+                "another write is in progress, retry the query")
+        if "RETURN count(n)" in (cypher or "") and "> 0" not in (cypher or ""):
+            reads.append(cypher)
+        return real_query(_self, cypher, *args, **kwargs)
+
+    def count_probes(_self, *args, **kwargs):
+        if args and args[0] == "EXISTS":
+            probes.append(args)
+            return 1
+        return real_exec(_self, *args, **kwargs)
+
+    monkeypatch.setattr(type(proj.g), "query", slot_abort)
+    monkeypatch.setattr(type(proj.g), "execute_command", count_probes)
+    try:
+        with pytest.raises(redis_exc.ResponseError):
+            sdk.delete_point(pid)
+    finally:
+        monkeypatch.setattr(type(proj.g), "query", real_query)
+        monkeypatch.setattr(type(proj.g), "execute_command", real_exec)
+
+    assert reads == [], (
+        "the state-independent arm is not-landed by construction, so the read "
+        f"back must not be issued: {reads!r}")
+    assert probes == [], (
+        "a probe whose answer is discarded must not be paid for: " + repr(probes))
+    assert _live(proj, pid) is True, "premise: nothing deleted the Point"
+    assert _mutations(events, pid) == [], (
+        "a refused write must not journal a destruction")
+
+
+# ── T3g: a raise OUTSIDE the abort families is still gated on the key ─────
+
+def test_a_transport_raise_is_gated_on_the_key(env, monkeypatch):
+    """A raise the classifier does not recognise must not reach the read unguarded.
+
+    `retry._abort_arm` answers ``None`` for anything that is not a
+    `ResponseError`, and the door's read-back is the read that AUTO-CREATES an
+    absent key. So a transport error (a `ConnectionError`) is gated exactly like
+    the graph-abort family: with the key ABSENT the read is NOT issued and the
+    caller re-raises.
+
+    MUTATION: gate on `graph_abort_family(exc)` instead — a non-family raise
+    falls through to the read, ``reads`` is non-empty, and this reddens while
+    T3f stays green (the two rows pin the two halves of the same gate).
+    """
+    sdk, events = env
+    proj = sdk._get_proj()
+    pid = sdk.create_point("observation", "transport raise")["id"]
+
+    real_query = type(proj.g).query
+    real_exec = type(proj.g).execute_command
+    reads: list[str] = []
+    raised = {"v": False}
+
+    def transport_raise(_self, cypher, *args, **kwargs):
+        if _DELETE_CYPHER in (cypher or ""):
+            raised["v"] = True
+            raise ConnectionError("connection reset by peer")
+        if raised["v"] and "RETURN count(n)" in (cypher or ""):
+            reads.append(cypher)
+        return real_query(_self, cypher, *args, **kwargs)
+
+    def key_is_gone(_self, *args, **kwargs):
+        if args and args[0] == "EXISTS":
+            return 0
+        return real_exec(_self, *args, **kwargs)
+
+    monkeypatch.setattr(type(proj.g), "query", transport_raise)
+    monkeypatch.setattr(type(proj.g), "execute_command", key_is_gone)
+    try:
+        with pytest.raises(ConnectionError):
+            sdk.delete_point(pid)
+    finally:
+        monkeypatch.setattr(type(proj.g), "query", real_query)
+        monkeypatch.setattr(type(proj.g), "execute_command", real_exec)
+
+    assert reads == [], (
+        "an unrecognised raise does not prove the key is present, so the read "
+        f"back may not be issued against an absent key: {reads!r}")
+    assert _mutations(events, pid) == [], "nothing was destroyed, nothing recorded"
+
+
+# ── T3h: the exception's DEFAULT claims nothing ───────────────────────────
+
+def test_the_default_refusal_claims_neither_store():
+    """`destroy_verified` defaults to False, and the default text says so.
+
+    The constructor's default IS the safety argument: a producer that does not
+    KNOW the destroy landed must get the arm that claims nothing. Pinned by the
+    TEXT, so a default flipped to ``True`` reddens (the landed-destroy arm's prose
+    asserts a cache state nobody verified).
+
+    MUTATION: `destroy_verified: bool = True` in the constructor and both
+    assertions below fail.
+    """
+    from tortoise.exceptions import WriteNotLandedError
+
+    exc = WriteNotLandedError("p_1", "cache_graph", operation="delete_point")
+    assert exc.destroy_verified is False, (
+        "the default must be the arm that CLAIMS NOTHING")
+    text = str(exc)
+    assert "NOT VERIFIED" in text or "UNVERIFIED" in text, text
+    assert "the cache no longer holds this Point" not in text, (
+        "the default must not assert a cache state it did not establish: "
+        + text)
 
 
 # ── T4: nothing is journaled for a delete that cannot happen ──────────────
