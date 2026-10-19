@@ -4325,9 +4325,14 @@ surfaces:
   # the rounded-band boundary, the one-sided contamination rule and the
   # route-label table. PURE arithmetic: it imports only `score_qualifiers`
   # (stdlib, no DB/network/model), so `eval` beside its siblings is the whole
-  # registration. Without this row the file is unclassified: `manifest-integrity`
-  # (required) reds on drift, AND a `score_qualifiers.py`-only change never
-  # selects the tests that pin the rule it edits (#1349/#2938 silent-drop class).
+  # registration. This row is MANIFEST CLASSIFICATION ONLY: it makes
+  # `manifest-integrity` (required) stop reding on drift and puts the file in
+  # the `eval` test set. It does NOT by itself make a `score_qualifiers.py`-only
+  # change select it — selection is driven by `SOURCE_PATTERNS`, and
+  # `tests/eval/write_path/` is registered there (tools/ci_selection.py) for
+  # exactly that half, with `core` kept via `CORE_ALSO` because
+  # test_extractor_v2.py / test_salience_labels_4917.py read those sources.
+  # Pinned by tests/test_ci_selection.py::test_write_path_measurement_source_edit_selects_eval.
   - eval/write_path/test_score_qualifiers.py
   # #5085: the additive blind BANDED semantic judge + calibration harness
   # (hermetic unit/contract layer — no DB/network/LLM; the real judged run is

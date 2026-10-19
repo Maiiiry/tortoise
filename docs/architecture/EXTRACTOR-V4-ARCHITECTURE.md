@@ -1201,7 +1201,11 @@ Holdout alone (wp05–wp07): raw 100% loss / 42.4% recall / 2 of the 2 surviving
 **40% loss / 66.7% recall**, precision parity (49.2% vs 50.0%), 0 of 6 distorted. Artifact:
 `tests/eval/write_path/results/7947-score-all.json` — ⚠️ **not reproducible from committed artifacts:** run 1's
 per-session arm outputs were not retained (the receipts convention came in with run 2), so this file is a
-record of that run, not something the repo can re-derive. Run 2's is re-derivable.
+record of that run, not something the repo can re-derive. Run 2's is re-derivable. (The `instrument.note`
+string in BOTH files was corrected in place on 2026-10-18 — it formerly claimed the lexical error "can only
+under-credit preservation", which the two-sided bullet below contradicts. That is the instrument's
+DESCRIPTION, not a measurement: no number, classification or verdict changed — run 1's file carries the
+correction by hand precisely because its receipts are gone.)
 
 **⚠️ Run 1's numbers are reported, not withdrawn — but the SECOND run shows the magnitude is not a stable
 result.** One qualifier out of ten moves the holdout figure by 10 pp, and the raw arm moved by 28 pp between
@@ -1220,9 +1224,20 @@ the work and are declared here rather than dropped:**
   claim** — a LOOSER test than the bound subset, not a stricter one, and 4 of the 10 decision-input
   qualifiers are of this kind. The two are reported separately below because they do not measure the same
   thing.
-- **The instrument is lexical and can only UNDER-credit preservation** (an arm may keep a hedge in vocabulary
-  the marker list lacks and be scored `flattened`). The error direction favours neither arm by construction
-  but it does inflate both loss rates.
+- **The instrument is lexical, and its error is TWO-SIDED.** It can **under-credit preservation** (an arm
+  may keep a hedge in vocabulary the marker list lacks and be scored `flattened`) — the conservative
+  direction for a loss metric — and it can **over-credit it**: `marker_present` is an unbounded substring
+  test over a table that mixes space-suffixed markers (`"may "`, `"one "`, `"just "`, `"before "`) with bare
+  stems (`"only"`, `"except"`, `"single "`, `"support"`, `"review"`, `"decision"`, `"likely"`), so
+  `"commonly"` satisfies scope's `"only"`, `"exception"` satisfies `"except"` and `"unlikely"` satisfies
+  hedge's `"likely"`, turning a `flattened` cell into `preserved` and thus UNDERSTATING loss. That second
+  direction is **not arm-neutral** — the arm emitting more claim text has more chances to contain a
+  mid-word hit, and the narrative emits 25–35 % more claims — so it leans toward the arm whose loss this
+  measurement treats as the risk. It is **latent on these runs, not a wrong number**: every `preserved` row
+  in both committed score files was checked and none is carried by a mid-word hit (the three preserved
+  `scope` rows are the literal "the admin screen is the only place…" and "defaults off until the perf review
+  signs off" ×2). Word-bounding the match would remove the class, but the marker table is the REGISTERED
+  instrument, so that belongs in a newly registered run rather than a silent re-scoring of these two.
 - **One annotation binds a warrant to the claim it warrants, deliberately.** `wp02 q_01` ("the team signed off
   last Friday") is *also* planted as the fact `wp02 u_02`, but its `bound_claim` is `u_01`, the migration
   decision — so it scores `flattened` when the warrant and the decision survive as separate claims. That is the

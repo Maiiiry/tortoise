@@ -89,7 +89,7 @@
     },
     "claim_present_threshold": 0.6,
     "marker_scope": "matched claim only (not the whole output)",
-    "note": "can only under-credit preservation; flattened is the arbitrable class"
+    "note": "TWO-SIDED: under-credits preservation when the marker vocabulary is missing (a preserved hedge reads as flattened), and OVER-credits it when an unbounded substring match hits mid-word (e.g. 'commonly' matches scope's 'only'), which understates loss; the over-credit is not arm-neutral (more claim text = more chances) \u2014 flattened stays the arbitrable class"
   },
   "aggregate": {
     "raw": {

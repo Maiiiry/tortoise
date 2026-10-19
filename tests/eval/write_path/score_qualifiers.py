@@ -31,8 +31,34 @@ DISTORTION reading (``distortion_rate``) is the volume-sensitive one and is
 reported as secondary, never as the decision input.
 Its known weakness is paraphrase — an arm may
 preserve a hedge with vocabulary the marker list lacks, which would read as
-``flattened``. That error is only possible in the DANGEROUS direction (it can
-under-credit preservation).
+``flattened``. ⛔ **The error is TWO-SIDED, and this module used to claim it was
+not** ("only possible in the DANGEROUS direction … can only under-credit
+preservation"). Both directions are real:
+
+  * **under-credit (flattened for a preserved qualifier)** — missing vocabulary,
+    as above. This is the conservative direction for a *loss* metric.
+  * **over-credit (preserved for a flattened qualifier)** — ``marker_present`` is
+    an UNBOUNDED SUBSTRING test over a table that mixes space-suffixed markers
+    (``"may "``, ``"one "``, ``"just "``, ``"before "``) with bare stems
+    (``"only"``, ``"except"``, ``"single "``, ``"support"``, ``"review"``,
+    ``"decision"``, ``"likely"``), so ``"commonly"`` satisfies scope's
+    ``"only"``, ``"none "``/``"gone "`` satisfy ``"one "``,
+    ``"exception(al)"`` satisfies ``"except"`` and ``"unlikely"`` satisfies
+    hedge's ``"likely"``. Each of those turns a ``flattened`` cell into
+    ``preserved`` — i.e. it UNDERSTATES loss.
+
+**The over-credit is NOT arm-neutral**, which is what makes it worth this much
+prose: the arm that emits more claim text gets more chances to contain a mid-word
+hit, and §10 records the narrative emitting 25–35 % more claims — so this error
+leans toward the arm whose loss this measurement treats as the risk. It is
+**latent, not a wrong number, on the committed run**: every ``preserved`` row in
+both committed score files was checked and none is carried by a mid-word hit (the
+three preserved ``scope`` rows are the literal "the admin screen is the only
+place…" and "defaults off until the perf review signs off" ×2). The fix that would
+remove the class — word-bounding the match (``re.search(rf"\\b{re.escape(m.strip())}",
+matched_text)``) — is deliberately NOT applied here: the marker table is the
+REGISTERED instrument, so changing it silently would make these runs and any
+future run non-comparable. It belongs in a newly registered run (#7947 §10).
 
 ⚠️ The second opinion the registration contemplated for exactly those decisive
 ``flattened`` cases — a judge-arbitration pass — was **registered but NOT run**,
@@ -62,6 +88,17 @@ GOLD_DIR = WRITE_PATH_DIR / "gold"
 
 ARMS = ("raw", "narrative")
 CLASSES = ("hedge", "scope", "stance")
+
+#: Which receipt flag contaminates WHICH arm. The two arms' inputs have different
+#: producers: S2 builds both extracts, but S1 builds the narrative story only, so
+#: an S1 chunk that raised or hit its length cap leaves the narrative short of a
+#: chunk and cannot touch the raw arm's input (which is the transcript itself).
+#: Treating them symmetrically would let a broken raw-adjacent marker hide a real
+#: fire; ignoring the S1 half altogether let a truncated narrative manufacture one.
+CONTAMINATION_KEYS: dict[str, tuple[str, ...]] = {
+    "raw": ("partial", "truncated", "s2_error"),
+    "narrative": ("partial", "truncated", "s2_error", "s1_error", "s1_truncated"),
+}
 
 #: The pre-registered corpus split. The DECISION input is the HOLDOUT delta; the
 #: tuning half is reported so a reader can see the split was real, and the pooled
@@ -215,10 +252,22 @@ def score_session(session_id: str, arm: str, arms_dir: Path) -> dict:
     # happened) but the receipt is flagged, the decision block refuses to
     # certify a branch on it, and the flag is written into the output.
     stats = (arms.get("s2_stats") or {}).get(arm) or {}
+    s1_stats = arms.get("s1_stats") or []
     receipt_flags = {
         "partial": bool(stats.get("partial")),
         "truncated": bool(stats.get("truncated")),
         "s2_error": arms.get("s2_errors", {}).get(arm),
+        # ⛔ The S1 half, recorded (run-level: S1 runs once per session, so both
+        # arms carry the same value) and consumed for the NARRATIVE arm only —
+        # S1 produces that arm's input; the raw arm never touches it
+        # (`CONTAMINATION_KEYS`). An S1 chunk that raised, or a summary that hit
+        # the length cap (`extractor_v2.run_s1`'s documented tail-drop), leaves
+        # the narrative story missing a chunk: it can drop claims — raising
+        # narrative loss and MANUFACTURING a branch-1 fire — or move the cell
+        # across the band. Up to this point the harness wrote `errors` into the
+        # receipt and nothing read it.
+        "s1_error": bool(arms.get("errors")),
+        "s1_truncated": any(s.get("finish_reason") == "length" for s in s1_stats),
     }
     embed_list = arms["embed_list"].get(arm) or {}
     claims = render_claims(embed_list)
@@ -555,11 +604,17 @@ def main(argv: list[str] | None = None) -> int:
     # flag (rung-4 prefix-accept: the tail of the list was dropped) or a stage error
     # means the arm's output is incomplete, so its loss is overstated — and on this
     # corpus ONE qualifier moves the holdout Δ by 10 pp, i.e. across the band.
+    #
+    # The keys are PER ARM because the two arms' inputs have different producers:
+    # S2 builds both, but S1 builds the NARRATIVE story only. A failed or
+    # length-capped S1 chunk therefore contaminates the narrative arm and cannot
+    # touch the raw arm's input, while an S2 flag contaminates whichever arm it
+    # belongs to.
     contaminated = [
         f"{sid}:{arm}" for sid in HOLDOUT_SESSIONS
         for arm in ARMS
         if any(by_session.get(sid, {}).get(arm, {}).get("receipt_flags", {}).get(k)
-               for k in ("partial", "truncated", "s2_error"))
+               for k in CONTAMINATION_KEYS[arm])
     ]
     verdict = evaluate_branches(hold["delta_loss_pp"], hold["delta_precision_pp"],
                                 hold["delta_recall_pp"], contaminated=contaminated)
@@ -600,7 +655,8 @@ def main(argv: list[str] | None = None) -> int:
             sid, arm = tag.split(":")
             fl = by_session[sid][arm]["receipt_flags"]
             print(f"     {tag}: partial={fl['partial']} truncated={fl['truncated']} "
-                  f"s2_error={fl['s2_error']}")
+                  f"s2_error={fl['s2_error']} s1_error={fl['s1_error']} "
+                  f"s1_truncated={fl['s1_truncated']}")
         print("     → that arm's output is not the extract it should have produced; its loss is"
               " overstated and a")
         print("       Δ that sits near the band cannot be certified. Re-run that arm before deciding.")
@@ -660,7 +716,18 @@ def main(argv: list[str] | None = None) -> int:
             "markers": {k: list(v) for k, v in MARKERS.items()},
             "claim_present_threshold": 0.6,
             "marker_scope": "matched claim only (not the whole output)",
-            "note": "can only under-credit preservation; flattened is the arbitrable class",
+            # Two-sided, and the artifact records it: under-credit from missing
+            # vocabulary, over-credit from unbounded substring matching (a
+            # mid-word hit — "commonly" reads as scope's "only"). Word-bounding
+            # the table would remove the second class, but the table is the
+            # REGISTERED instrument, so that belongs in a newly registered run.
+            "note": ("TWO-SIDED: under-credits preservation when the marker "
+                     "vocabulary is missing (a preserved hedge reads as "
+                     "flattened), and OVER-credits it when an unbounded "
+                     "substring match hits mid-word (e.g. 'commonly' matches "
+                     "scope's 'only'), which understates loss; the over-credit "
+                     "is not arm-neutral (more claim text = more chances) — "
+                     "flattened stays the arbitrable class"),
         },
         "aggregate": agg,
         "precision_recall": pr,
@@ -680,7 +747,9 @@ def main(argv: list[str] | None = None) -> int:
             "verdict": verdict_label(verdict),
             "certification_note": (
                 "a branch is certified only on clean receipts; `partial`/`truncated`/"
-                "s2_error means the arm's extract is incomplete and its loss overstated"),
+                "s2_error means the arm's extract is incomplete and its loss overstated, "
+                "and on the narrative arm `s1_error`/`s1_truncated` means its STORY input "
+                "is missing a chunk for the same reason"),
             "one_qualifier_is_pp": 100 / max(1, split_agg["holdout"]["raw"]["n"]),
         },
         "splits": {"aggregate": split_agg, "precision_recall": split_pr,

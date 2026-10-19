@@ -598,3 +598,30 @@ vs raw-with-transcript-suppressed — on clean (non-`partial`) receipts, with ~1
 
 **Not touched.** Raw stays the source. Its argument is independent of qualifier loss (a summary cannot see
 prior state; re-extraction is always from raw, §10) and §2.4's raw-fact layer is untouched by this result.
+
+### What the review cycles corrected in the measurement's own instruments (2026-10-18/19)
+
+Recorded here because each one changed a CLAIM about the numbers, not a number: no committed figure was
+re-derived (run 2 still regenerates byte-identically — now pinned by a test, not by prose).
+
+- **The lexical instrument's error direction was stated one-sidedly, and it is two-sided.** The module
+  docstring and the emitted `instrument.note` both said the marker test "can only under-credit preservation".
+  It can also **over-credit** it: `marker_present` is an unbounded substring test, so `"commonly"` satisfies
+  scope's `"only"` and a `flattened` cell reads as `preserved` — understating loss, and not arm-neutrally (the
+  arm emitting more claim text gets more chances to contain a mid-word hit). Corrected in the module, in the
+  emitted note (both committed score files carry the corrected note; run 1's by hand, since its receipts are
+  gone), and in §10's limits, with a test asserting no committed `preserved` cell rests on a mid-word hit.
+  Word-bounding the table would remove the class, but that is a REGISTERED-instrument change, so it belongs in
+  a newly registered run rather than a silent re-scoring of these two.
+- **S1 failures were written into the receipt and read by nothing.** `build_inputs()` swallows a per-chunk S1
+  raise into `errors` and carries on, and `run_s1` was called without `stats`, so a length-capped summary
+  (S1's documented tail-drop) left no trace at all — a narrative story missing a chunk could therefore move
+  the decision cell while `branch_2_certified` stayed true. The harness now records `s1_stats` and prints the
+  S1 errors, and the scorer consumes both **on the narrative arm only** (S1 builds that arm's input; the raw
+  arm's is the transcript). This is the same "the flag was in the receipt, unread" defect the cycle before
+  fixed for S2, one stage earlier.
+- **The rule's own tests reached no CI surface.** `test_score_qualifiers.py` was registered nowhere
+  (`manifest-integrity` reds on drift), and because `tests/eval/write_path/` was not a `SOURCE_PATTERNS`
+  entry, a `score_qualifiers.py`-only change selected `core` — which registers none of the tests pinning the
+  rule, the corpus counts or the artifact. Both halves are now registered (`eval`, plus `core` via
+  `CORE_ALSO`) and pinned by `test_write_path_measurement_source_edit_selects_eval`.

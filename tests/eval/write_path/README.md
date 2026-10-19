@@ -35,7 +35,24 @@ tests/eval/write_path/
   receipts/7947-arms-2026-10-18/  # #7947: 7 sessions x 2 arms, per-session receipts
   salience_labels.jsonl           # #4917: OWNER-confirmed not-an-entity name labels
   test_write_path_corpus.py       # contract tests (S4/S15)
+  test_score_qualifiers.py        # #7947: the rule, the guards, and the artifact pin
 ```
+
+⛔ **`results/7947-score-replication-2026-10-18.json` is pinned by a test, not by
+prose.** The PR body and §10 publish
+`score_qualifiers.py --arms-dir receipts/7947-arms-2026-10-18` as the reproducer, so
+`test_the_committed_score_artifact_regenerates_byte_identically` runs it and asserts
+the written file equals the committed one byte for byte. Editing `MARKERS`, the 0.6
+claim-match threshold or `classify()` therefore reds CI instead of silently revising
+every figure §10 quotes. (`results/7947-score-all.json` — run 1 — cannot be pinned that
+way: its receipts were never retained, so it is a record, not a derivation.)
+
+Both files live under `tests/eval/write_path/`, which is registered as a
+`SOURCE_PATTERNS` entry of the `eval` surface (`tools/ci_selection.py`) precisely so a
+change to the harness, the scorer, the generator or a sealed `gold/*.json` selects the
+surface that owns their pinning tests (plus `core`, whose `test_extractor_v2.py` and
+`test_salience_labels_4917.py` read these sources). Registering the TEST file in
+`config/ci-surfaces.yml` only classifies it; selection is driven by that table.
 
 **`salience_labels.jsonl` is not a fixture of this corpus** — it is the
 **owner-sourced ground truth** for the write path's salience gate (25 real

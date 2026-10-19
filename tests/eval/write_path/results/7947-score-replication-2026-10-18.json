@@ -89,7 +89,7 @@
     },
     "claim_present_threshold": 0.6,
     "marker_scope": "matched claim only (not the whole output)",
-    "note": "can only under-credit preservation; flattened is the arbitrable class"
+    "note": "TWO-SIDED: under-credits preservation when the marker vocabulary is missing (a preserved hedge reads as flattened), and OVER-credits it when an unbounded substring match hits mid-word (e.g. 'commonly' matches scope's 'only'), which understates loss; the over-credit is not arm-neutral (more claim text = more chances) \u2014 flattened stays the arbitrable class"
   },
   "aggregate": {
     "raw": {
@@ -285,7 +285,7 @@
     ],
     "falsifier_suppressed_by_contamination": false,
     "verdict": "provisional (branch 2 met, not certifiable; branch 3 not reached)",
-    "certification_note": "a branch is certified only on clean receipts; `partial`/`truncated`/s2_error means the arm's extract is incomplete and its loss overstated",
+    "certification_note": "a branch is certified only on clean receipts; `partial`/`truncated`/s2_error means the arm's extract is incomplete and its loss overstated, and on the narrative arm `s1_error`/`s1_truncated` means its STORY input is missing a chunk for the same reason",
     "one_qualifier_is_pp": 10.0
   },
   "splits": {
@@ -446,7 +446,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -503,7 +505,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -562,7 +566,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -631,7 +637,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -702,7 +710,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -771,7 +781,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -842,7 +854,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -911,7 +925,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -982,7 +998,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -1039,7 +1057,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -1098,7 +1118,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -1167,7 +1189,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -1238,7 +1262,9 @@
         "receipt_flags": {
           "partial": true,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {
@@ -1295,7 +1321,9 @@
         "receipt_flags": {
           "partial": false,
           "truncated": false,
-          "s2_error": null
+          "s2_error": null,
+          "s1_error": false,
+          "s1_truncated": false
         },
         "rows": [
           {

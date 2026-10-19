@@ -5865,6 +5865,60 @@ def test_surface_audit_maps_tortoise_api_source_as_api_pin(tmp_path):
     assert "tortoise/api.py" not in [r["path"] for r in report["uncovered"]]
 
 
+def test_write_path_measurement_source_edit_selects_eval():
+    """#7947 review P1: editing the scorer must run the tests that pin the rule.
+
+    `score_qualifiers.py` (and `raw_vs_narrative.py`, `generate_corpus.py`,
+    `schema.py`, and every `gold/*.json`) live under `tests/eval/write_path/`
+    and NONE of them is named `test_*.py`, so before the `tests/eval/write_path/`
+    SOURCE_PATTERNS entry a change to them matched no pattern and fell to the
+    `tests/` -> `core` fallback. `test_score_qualifiers.py` and
+    `test_write_path_corpus.py` are registered on `eval` ONLY, so the tests
+    that pin the pre-registered decision rule (`MARKERS` / `BAND_PP` /
+    `classify()` / `evaluate_branches()`) and the corpus counts §10 publishes a
+    verdict on ran on NO diff-selected leg — every published number could move
+    with every gate green. Registering the TEST file in
+    config/ci-surfaces.yml does not fix this half: selection is driven by
+    SOURCE_PATTERNS.
+
+    `core` must stay too (CORE_ALSO): `test_extractor_v2.py` imports
+    `tests.eval.write_path.runner` and `test_salience_labels_4917.py` reads
+    `tests/eval/write_path/salience_labels.jsonl`, so an `eval`-only match
+    would trade one silent drop for another.
+
+    Watched RED before the entry existed (`surfaces == ['core']`, neither pin
+    in `test_files`), GREEN after — mutation-real, not a tautology: deleting
+    the SOURCE_PATTERNS entry reproduces the red.
+    """
+    cases = (
+        # the rule itself — the decisive one: `evaluate_branches`/`verdict_label`
+        "tests/eval/write_path/score_qualifiers.py",
+        # the instrument's calibration inputs
+        "tests/eval/write_path/raw_vs_narrative.py",
+        # the generator whose output the pinned counts are read off
+        "tests/eval/write_path/generate_corpus.py",
+        # a hand-edited sealed gold — the scenario `[gold]` in MEMORY.md warns about
+        "tests/eval/write_path/gold/wp01_quarry_debug.gold.json",
+    )
+    for changed in cases:
+        r = _sel([changed])
+        assert r["full"] is False
+        assert r["surfaces"] == ["core", "eval"], (
+            f"a write-path measurement source edit ({changed}) must select the "
+            f"`eval` surface that owns its pinning tests (and keep `core`, whose "
+            f"tests read the same sources); got {r['surfaces']}")
+        selected = set(r["test_files"]) | set(r["slow_selected"])
+        assert "eval/write_path/test_score_qualifiers.py" in selected, (
+            f"the test that pins the pre-registered rule must run on {changed}; "
+            f"selected {sorted(selected)}")
+        assert "eval/write_path/test_write_path_corpus.py" in selected, (
+            f"the corpus counts §10's verdict is computed on must be pinned on "
+            f"{changed}; selected {sorted(selected)}")
+        assert "test_extractor_v2.py" in selected, (
+            "the core-registered importer of tests.eval.write_path.runner must "
+            f"still run on {changed}; selected {sorted(selected)}")
+
+
 def test_tortoise_api_change_selects_api_and_core():
     # #2938 item 1: mapping `tortoise/api.py` to `api` closes the coverage gap,
     # but its pinning tests are registered across surfaces — CORE_ALSO keeps

@@ -11,10 +11,12 @@ No database, no fixtures, no model — pure arithmetic.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
+from tests.eval.write_path import score_qualifiers as sq
 from tests.eval.write_path.score_qualifiers import (
     BAND_PP,
     HOLDOUT_SESSIONS,
@@ -259,3 +261,187 @@ def test_unset_environment_pins_are_consistent_with_each_other(tmp_path):
     """The 7 committed receipts carry NO `env_pins` — absence is not a disagreement."""
     assert check_protocol_pins(_write_receipts(tmp_path, env_pins={s: {} for s in SESSIONS}),
                                SESSIONS) == []
+
+
+# ── the reproducibility claim, pinned ──────────────────────────────────────
+
+WRITE_PATH = Path(__file__).parent
+COMMITTED_SCORE = WRITE_PATH / "results" / "7947-score-replication-2026-10-18.json"
+COMMITTED_ARMS = WRITE_PATH / "receipts" / "7947-arms-2026-10-18"
+
+
+def test_the_committed_score_artifact_regenerates_byte_identically(tmp_path, capsys):
+    """The PR body and §10 both publish this command as the reproducer.
+
+    Nothing else in CI ran it. §10's decisive numbers — holdout Δloss +10.0 pp,
+    Δprecision +0.8, Δrecall +3.0, the two-tenths-of-a-qualifier band, the
+    recorded route string — are computed by `main()`, so without this test an
+    edit to `MARKERS`, to the 0.6 claim-match threshold or to `classify()`
+    changes every published figure while every other gate stays green. That is
+    the exact failure mode the corpus-count pin exists for (a generator edit
+    re-renders the gold, keeps the gates green, and silently falsifies the
+    write-up), left open on the half that CONSUMES the gold.
+
+    Hermetic: the scorer is stdlib-only (`json`/`re`/`argparse`/`pathlib`), and
+    both inputs are the committed receipts and gold. No DB, network or model.
+    """
+    out = tmp_path / "score.json"
+    rc = sq.main(["--sessions", *SESSIONS,
+                  "--arms-dir", str(COMMITTED_ARMS),
+                  "--out", str(out)])
+    capsys.readouterr()  # the console table is not the artifact
+    assert rc == 0
+    assert out.read_bytes() == COMMITTED_SCORE.read_bytes(), (
+        "a fresh score over the committed receipts no longer reproduces "
+        f"{COMMITTED_SCORE.name} — every number §10 publishes was derived from "
+        "this file, so either the scorer changed the measurement (re-run the "
+        "registered protocol and update §10), or the committed artifact was "
+        "hand-edited")
+
+
+# ── the lexical instrument's error is two-sided (and used to claim otherwise) ─
+
+def test_the_marker_match_over_credits_a_mid_word_hit():
+    """The registered instrument's over-credit is real, and must stay documented.
+
+    `marker_present` is an UNBOUNDED SUBSTRING test over a table that mixes
+    space-suffixed markers with bare stems, so `"commonly"` satisfies scope's
+    `"only"` and a FLATTENED cell reads as `preserved` — an error that
+    UNDERSTATES loss, the opposite direction from the one the module docstring
+    and the emitted `instrument.note` claimed until this change.
+
+    Word-bounding the table would remove the class, but the table is the
+    REGISTERED instrument: doing it silently would make the two runs and any
+    future run non-comparable, so it belongs in a newly registered run. This
+    test therefore pins the CURRENT behaviour AND the two-sided description; if
+    someone word-bounds the match, this test must be updated together with a new
+    registration, which is the point of pinning it rather than leaving prose.
+    """
+    unit = {"u1": {"id": "u1", "verbatim_anchor": "the deploy runs on the staging cluster"}}
+    qualifier = {"id": "q1", "class": "scope", "bound_claim": "u1",
+                 "verbatim_qualifier": "only on Tuesdays"}
+    plain = "the deploy runs on the staging cluster"
+    assert sq.classify(qualifier, unit, [plain])["outcome"] == "flattened"
+    hit = sq.classify(qualifier, unit, [f"{plain} commonly"])["outcome"]
+    assert hit == "preserved", (
+        "the mid-word over-credit the module now documents has been removed — "
+        "that is a REGISTERED-instrument change: re-run the protocol and update "
+        "§10 rather than editing this expectation")
+
+
+# ── the S1 half of the contamination guard ──────────────────────────────
+
+def _receipts_copy(tmp_path):
+    import shutil
+
+    dst = tmp_path / "arms"
+    shutil.copytree(COMMITTED_ARMS, dst)
+    return dst
+
+
+def _score_with(arms_dir, out):
+    return sq.main(["--sessions", *SESSIONS, "--arms-dir", str(arms_dir),
+                    "--out", str(out)])
+
+
+def test_a_failed_s1_chunk_contaminates_the_narrative_arm_only(tmp_path, capsys):
+    """The narrative arm's INPUT is built by S1, and nothing read `errors`.
+
+    `build_inputs()` swallows a per-chunk S1 failure into a top-level `errors`
+    list and carries on, so the narrative story is missing a chunk — a shortened
+    story can drop claims (raising narrative loss, i.e. MANUFACTURING a branch-1
+    fire) or move the cell across the band, while `branch_2_certified` stayed
+    true. That list sat in the receipt, read by nothing: the same "the flag was
+    in the receipt, unread" defect this measurement had just fixed for S2, one
+    stage earlier, and it contradicted the artifact's own `certification_note`
+    ("a branch is certified only on clean receipts").
+
+    `raw` must NOT be contaminated by it: the raw arm's input is the transcript,
+    which S1 never touches, and refusing the raw arm there would let a broken
+    narrative hide a real fire.
+    """
+    arms = _receipts_copy(tmp_path)
+    receipt = arms / "wp06_quarry_rollout.arms.json"
+    rec = json.loads(receipt.read_text())
+    rec["errors"] = ["S1 chunk failed: RuntimeError: boom"]
+    receipt.write_text(json.dumps(rec))
+
+    out = tmp_path / "score.json"
+    assert _score_with(arms, out) == 0
+    capsys.readouterr()
+    cont = json.loads(out.read_text())["decision_input"]["contaminated_receipts"]
+    assert "wp06_quarry_rollout:narrative" in cont, cont
+    assert "wp06_quarry_rollout:raw" not in cont, (
+        "an S1 failure cannot contaminate the raw arm — its input never goes "
+        f"through S1; got {cont}")
+
+
+def test_a_length_capped_s1_summary_contaminates_the_narrative_arm(tmp_path, capsys):
+    """S1 truncation is a silent tail-drop (`finish_reason == "length"`), never a raise.
+
+    `run_s1` was called WITHOUT `stats`, so this documented path left no trace in
+    the receipt at all. The harness now passes `stats` and records `s1_stats`.
+    """
+    arms = _receipts_copy(tmp_path)
+    receipt = arms / "wp06_quarry_rollout.arms.json"
+    rec = json.loads(receipt.read_text())
+    rec["s1_stats"] = [{"ok": True}, {"ok": True, "finish_reason": "length"}]
+    receipt.write_text(json.dumps(rec))
+
+    out = tmp_path / "score.json"
+    assert _score_with(arms, out) == 0
+    capsys.readouterr()
+    cont = json.loads(out.read_text())["decision_input"]["contaminated_receipts"]
+    assert "wp06_quarry_rollout:narrative" in cont, cont
+    assert "wp06_quarry_rollout:raw" not in cont, cont
+
+
+def test_the_clean_committed_receipts_carry_no_s1_flag():
+    """The committed receipts carry `errors: []` — the S1 guard must not fire on them."""
+    rec = json.loads((COMMITTED_ARMS / "wp05_retro_writeup.arms.json").read_text())
+    flags = sq.score_session("wp05_retro_writeup", "narrative", COMMITTED_ARMS)["receipt_flags"]
+    assert rec["errors"] == []
+    assert flags["s1_error"] is False
+    assert flags["s1_truncated"] is False
+
+
+def test_every_committed_preserved_cell_rests_on_a_word_bounded_marker():
+    """The over-credit is LATENT on the two committed runs — pinned, not asserted.
+
+    Recomputed from the committed receipts + gold (never from a console claim):
+    for every qualifier whose claim survived extraction, either a WORD-BOUNDED
+    marker is present in the matched claim text (genuine preservation), or no
+    marker is present at all (`flattened`). No cell in either run is carried by
+    a mid-word hit, which is what lets §10 say the error is real but did not move
+    a number. An edit to the gold, the receipts or `MARKERS` that introduces one
+    reds this instead of silently revising the write-up.
+    """
+    checked = 0
+    for sid in SESSIONS:
+        gold = json.loads((WRITE_PATH / "gold" / f"{sid}.gold.json").read_text())
+        units = {u["id"]: u for u in gold.get("planted_units", [])}
+        arms = json.loads((COMMITTED_ARMS / f"{sid}.arms.json").read_text())
+        for arm in sq.ARMS:
+            claims = sq.render_claims(arms["embed_list"].get(arm) or {})
+            for q in gold.get("planted_qualifiers", []):
+                bound = q.get("bound_claim")
+                unit = units.get(bound) if bound else None
+                anchor = (unit or {}).get("verbatim_anchor") or q["verbatim_qualifier"]
+                matched = sq._claims_matching(sq._content_words(anchor), claims)
+                if not matched:
+                    continue  # `absent` never reads a marker
+                checked += 1
+                text = " \n ".join(matched)
+                markers = sq.MARKERS[q["class"]]
+                word_bounded = any(re.search(rf"\b{re.escape(m.strip())}", text)
+                                   for m in markers)
+                if word_bounded:
+                    continue
+                mid_word = [m for m in markers if m in text]
+                assert not mid_word, (
+                    f"{sid}:{arm} {q['id']} ({q['class']}) reads `preserved` only "
+                    f"through a mid-word substring hit {mid_word} — the "
+                    "over-credit the module documents is now moving a cell in a "
+                    "committed run, so §10's 'latent, not a wrong number' no longer "
+                    "holds and the runs need re-scoring under a word-bounded table")
+    assert checked >= 20, f"only {checked} surviving-claim cells inspected — the pin is vacuous"

@@ -78,23 +78,48 @@ def build_inputs(model, conversation: list[dict], *, chunk_size: int = CHUNK_SIZ
     Arm B calls the SHIPPED S1 (real generation). Arm A skips S1 entirely and
     hands S2 the raw transcript — the narrative is never produced, which is
     exactly what "extract without the narrative" means.
+
+    ⛔ **An S1 failure is recorded, not swallowed silently.** A per-chunk S1 raise
+    is non-fatal in production too, so the loop carries on — but the narrative
+    story is then MISSING a chunk, and scoring it as if complete can drop claims
+    (raising narrative loss, i.e. manufacturing a branch-1 fire) or move a cell
+    across the band. That fact therefore goes into the receipt (`errors`, and
+    `s1_stats` so a length-truncated S1 chunk — `extractor_v2.run_s1`'s documented
+    one-shot escalation path — leaves a trace too), and `score_qualifiers`
+    consumes it on the narrative arm. Before this, the list was written and read
+    by nothing: the same "the flag was in the receipt, unread" defect this
+    measurement had just fixed for S2, left open for S1.
     """
     edus = ev2._edus_from_conversation(conversation)
     if not edus:
-        return {"edus": [], "chunks": 0, "stories": {}, "errors": ["no conversation content"]}
+        return {"edus": [], "chunks": 0, "stories": {}, "errors": ["no conversation content"],
+                "s1_stats": []}
 
     raw_text = ev2._edus_to_text(edus)
 
     chunks = ev2.chunk_transcript(edus, target=chunk_size)
     chunk_stories: list[str] = []
     errors: list[str] = []
+    s1_stats: list[dict] = []
     for chunk in chunks:
+        stats: dict = {}
+        ok = True
         try:
             chunk_stories.append(
-                ev2.run_s1(model, ev2._edus_to_text(chunk), session_date=SESSION_DATE)
+                ev2.run_s1(model, ev2._edus_to_text(chunk), session_date=SESSION_DATE,
+                           stats=stats)
             )
         except Exception as e:  # per-chunk failure is non-fatal in production too
+            ok = False
             errors.append(f"S1 chunk failed: {type(e).__name__}: {e}")
+        finally:
+            # `finish_reason == "length"` is S1's documented tail-drop signal; it
+            # is never an exception, so without these stats it is invisible.
+            entry: dict = {"ok": ok}
+            for key in ("finish_reason", "recovery"):
+                if key in stats:
+                    entry[key] = stats[key]
+            s1_stats.append(entry)
     narrative = ev2.compile_stories(chunk_stories) if chunk_stories else ""
 
     return {
@@ -103,6 +128,7 @@ def build_inputs(model, conversation: list[dict], *, chunk_size: int = CHUNK_SIZ
         "chunk_stories": chunk_stories,
         "stories": {"raw": raw_text, "narrative": narrative},
         "errors": errors,
+        "s1_stats": s1_stats,
     }
 
 
@@ -115,6 +141,10 @@ def run_arms(model, conversation: list[dict], *, chunk_size: int = CHUNK_SIZE):
         "session_date": SESSION_DATE,
         "chunks": built["chunks"],
         "errors": list(built["errors"]),
+        # S1 produces the NARRATIVE arm's input (`raw` never consumes it) — kept in
+        # the receipt so an S1 chunk raise or a length-truncated summary is
+        # auditable, and consumed by the scorer for that arm only.
+        "s1_stats": list(built["s1_stats"]),
         "stories": built["stories"],
         "story_sha": {k: _sha(v) for k, v in built["stories"].items()},
         "story_chars": {k: len(v) for k, v in built["stories"].items()},
@@ -226,6 +256,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"        !! {arm}: PARTIAL — the extractor dropped the tail of "
                       "the list (rung-4 partial accept); this arm's output is incomplete",
                       file=sys.stderr)
+        # ⛔ S1 failures used to be written into the receipt and PRINTED NOWHERE —
+        # the same "in the receipt, unread" defect as the S2 partial above, one
+        # stage earlier. A dropped S1 chunk shortens the NARRATIVE story only.
+        for err in res["errors"]:
+            print(f"        !! S1: {err} — the narrative story is missing a chunk",
+                  file=sys.stderr)
+        truncated_chunks = [s for s in res["s1_stats"]
+                            if s.get("finish_reason") == "length"]
+        if truncated_chunks:
+            print("        !! S1: "
+                  f"{len(truncated_chunks)} chunk summary(ies) hit the length cap — "
+                  "the chunk tail may be missing from the narrative story",
+                  file=sys.stderr)
     return 0
 
 
