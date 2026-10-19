@@ -5680,7 +5680,6 @@ durations:
   test_consolidation_4way.py: 9.0
   test_invite_fusion_http.py: 12.2
   test_signup_token_revoke.py: 4.0
-  test_w4_why_enrichment.py: 4.0
   test_why_operator_mediation.py: 4.5  # #3990 measured locally (9 tests, embedded graphs)
   test_why_layer_rate.py: 22.0  # #3990 measured locally (15 tests; each movement control seeds a fresh graph)
   #3400 trap: files ADDED BY A MAIN PUSH carry no junit row until the next
@@ -5852,7 +5851,7 @@ durations:
   test_battery_corpus_v11.py: 3.3
   test_tenancy_spine.py: 3.0
   test_transport_wait_bound.py: 2.1
-  test_collision_preflight.py: 3.6
+  test_collision_preflight.py: 23.5  # ci-timing top-15 2026-10-19 (run 39191149586); was 3.6
   # #8051: LOCAL readings on this fleet-loaded host (subprocess + real-git
   # harness): 173s / 182s at 61 tests (head 876dabfe), 187s at 69, 192s at 76,
   # 198s at 79, 223s at 82, 241s at 83, 250s at 83, 227s at 87, 323s at 90, 273s
@@ -5885,19 +5884,6 @@ durations:
   # published here re-stales silently — the per-reading counts stay only because a
   # reading is meaningless without the run it came from.
   test_lane_stash.py: 355.0
-  test_collision_preflight.py: 23.5
-  test_collision_preflight.py: 23.5  # ci-timing top-15 2026-10-19 (run 39191149586); was 3.6
-  # #8051: 102 tests. 330.0 is from LOCAL readings on this
-  # fleet-loaded host (subprocess + real-git harness): 173s / 182s at 61 tests
-  # (head 876dabfe), 187s at 69, 192s at 76, 198s at 79, 223s at 82, 241s at 83,
-  # 250s at 83, 227s at 87, 323s at 90, 273s at 92, 234s at 94, 288s / 295s at 98,
-  # 318s at 101, 289s at 102. The weight this
-  # replaces — 160.0, published with an "88-169s" range — sat BELOW every one of
-  # those readings; each superseded weight (185.0 / 250.0 / 260.0) was overtaken by
-  # a later reading (worst 323s at 90 tests), so 330.0 is above every reading and
-  # erring high is correct for sharding. Refresh from the first post-merge junit
-  # artifact.
-  test_lane_stash.py: 330.0
   # #5612: 12.2 is the HIGHER of two local readings of this file at head 4b112ccbc
   # (5.9 s / 12.2 s; hermetic — temp-dir journals + the committed fixture, no DB;
   # the spread is fleet I/O, same as #6144 above). Erring high is correct for
@@ -5915,9 +5901,7 @@ durations:
   test_analytics_offloop_4015.py: 0.6
   test_free_team_entitlement.py: 4.8
   test_integration_search.py: 2.8
-  test_kind_classifier.py: 2.5
   test_kind_vocabulary_consistency.py: 2.0  # unmeasured — new in #2786; no push-to-main sweep has collected it yet, so it carries the flat default exactly as an absent key would (#3419/#2788 rule — do NOT substitute a local timing, the map is a shard-layout input). The row is also what restores `durations` coverage above the 90% floor, which a test-adding PR drops by construction.
-  test_kind_classifier.py: 1.8
   test_kind_classifier.py: 2.5  # ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 33 testcases = 1.8s, a LOWER bound; kept 2.5
   test_longmem_preflight.py: 0.8
   test_battery_ep_outcome.py: 1.8
@@ -6938,7 +6922,7 @@ durations:
   # the file; a marker on the comment lines above would outlive its own truth
   # (#9110 review P2, the #8254/#2876 stale-basis class).
   test_e1_e2_measurement.py: 2.0  # unmeasured — #9076: flat default until a CI sweep measures this file
-  test_write_op_reachability.py: 2.7
+  test_write_op_reachability.py: 3.3  # #8135: 43 tests + 1 xfail, 3.25s wall (same convention)
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py

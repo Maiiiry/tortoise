@@ -1034,6 +1034,30 @@ def _restate_unmeasured_marker(tail: str) -> str:
             else f"{prefix}{_CARRIED_FORWARD}")
 
 
+def _strip_unmeasured_marker(tail: str) -> str:
+    """Remove an ADOPTED row's `# unmeasured` MARKER and keep the record after it.
+
+    An adopted reading makes the marker false, but what usually follows it is the
+    row's RATIONALE (`# unmeasured — #7359: added after the sampled run; refresh
+    from CI junit`), and clearing the whole tail deleted that record — the same
+    loss the HELD path was fixed for via `_restate_unmeasured_marker` (#9134
+    review, P2: the adopted path kept `tail = ""`). Only the marker token goes;
+    the rest is re-emitted with its own `# ` prefix so the re-base below can
+    append this sample's basis to it.
+
+    The marker is recognised by its LEADING TOKEN (`_UNMEASURED_LEAD_RE`), not by
+    a `fullmatch` of the whole tail: authors write the long form, so a
+    whole-tail match cleared only the bare shape and left a `# unmeasured` claim
+    standing on a row the refresh had measured (#8254 review, P3 — 3 rows went
+    stale that way). `\b` keeps a token like `# unmeasuredly` out.
+    """
+    match = _UNMEASURED_LEAD_RE.match(tail)
+    if not match:
+        return tail
+    rest = tail[match.end():].strip()
+    return f"  # {rest}" if rest else ""
+
+
 def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
                               captured_at: str, *,
                               coverage: dict[str, tuple[int, int]] | None = None,
@@ -1168,6 +1192,14 @@ def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
         new_value = previous if kept else measured
         if kept:
             kept_as_lower_bound += 1
+        # An ADOPTED row's `# unmeasured` marker is FALSIFIED by the adoption, so
+        # the marker goes — but the note behind it is the row's record, and the
+        # old `tail = ""` here deleted it along with the marker (#9134 review,
+        # P2). Stripping only the token lets the re-base below append this
+        # sample's basis to the surviving note, which is the treatment a HELD row
+        # already got via `_restate_unmeasured_marker`.
+        if not kept:
+            tail = _strip_unmeasured_marker(tail)
         if kept and sample_label:
             # A HELD row keeps its note. Its value did not move, so the reading
             # its note cites IS still the basis of the surviving value — the
@@ -1204,17 +1236,6 @@ def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
                 f"{sample_label}: {reason}; the reading ({measured:.1f}s) is "
                 f"a LOWER bound; kept {previous:.1f}")
             tail = f"{tail} — {basis}" if tail.strip() else f"  # {basis}"
-        elif not kept and _UNMEASURED_LEAD_RE.match(tail):
-            # A stale `# unmeasured` marker stops being true once the reading is
-            # ADOPTED, and the marker is recognised by its LEADING TOKEN rather
-            # than by the whole tail: authors write long-form provenance
-            # (`# unmeasured — #7359: …`), and the old whole-tail `fullmatch`
-            # cleared only the bare form, so a measured row kept a `# unmeasured`
-            # claim the refresh had falsified (#8254 review, P3 — 3 rows went
-            # stale that way). Any OTHER trailing comment is preserved verbatim,
-            # including one that merely mentions the word later on; `\b` keeps a
-            # token like `# unmeasuredly` out.
-            tail = ""
         elif sample_label and new_value != previous:
             # RE-BASE ONLY WHAT THIS RENDER ACTUALLY CHANGED. The map's rule is "a
             # row's comment is kept only while the value AND its stated basis are

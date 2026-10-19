@@ -60,11 +60,20 @@ CANONICAL_DOC = REPO / CANONICAL_DOC_REL
 # never crosses a newline and the alternations keep their local scope. The
 # extension is scoped to the SAME paths and adds no false positives (the
 # legitimate "the derivation is the truth, the cache is a copy" stays green).
+#
+# The LAST alternation is #9134's P2: a pre-existing red was greened by rewording
+# `journal is the truth` to `the journal is the durable record`, which moves the
+# claim out of the `truth` window while still ATTRIBUTING DURABILITY to the
+# journal — the opposite of this doc's rule ("durability = the store's own
+# persistence plus an off-box copy of it. Nothing else."; the JSONL "is never the
+# durability mechanism"). Durability is now a SUBJECT-ATTRIBUTION predicate, so
+# the same claim cannot come back in a different wording.
 _SUBJECT = r"(?:event log|journal|jsonl|\blog\b|event stream)"
 CLAIM_RE = re.compile(
     rf"{_SUBJECT}.{{0,40}}source of truth"
     rf"|source of truth.{{0,40}}(?:durab|{_SUBJECT})"
-    rf"|{_SUBJECT}.{{0,40}}is (?:the )?truth",
+    rf"|{_SUBJECT}.{{0,40}}is (?:the )?truth"
+    rf"|{_SUBJECT}.{{0,40}}is (?:the )?durab(?:le|ility)",
     re.IGNORECASE,
 )
 
