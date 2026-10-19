@@ -4274,6 +4274,13 @@ def tortoise_mine_conversations(transcript: str | None = None,
         if log is None:
             log = EventLog(os.path.join(
                 tempfile.mkdtemp(prefix="tortoise_mcp_mine_"), "events.jsonl"))
+            # A SCRATCH buffer, never a journal: the miner appends to it and the
+            # directory is referenced by nothing after this call, so a record
+            # row filed from it can never be replayed or healed. Marked at the
+            # construction site because the seam reads `durable` off the log
+            # (#9231 review P1) — the sdk returned None, i.e. this lane is
+            # journal-less by design.
+            log.durable = False
         api = EventAPI(log, initiated_by="extractor", agent_id="mcp",
                        projection=sdk._get_proj())
     except Exception as exc:

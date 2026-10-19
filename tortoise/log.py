@@ -774,6 +774,17 @@ def read_for_replay(log) -> list[dict]:
 
 
 class EventLog:
+    #: Is this log a JOURNAL — a durable, replayable truth set — or a scratch
+    #: buffer that must never feed the record? ``record_writer.write_live_record``
+    #: refuses to file a row from a non-durable log (``no_durable_journal``), and
+    #: that guard is only sound if the answer is EXPLICIT: reading it as
+    #: ``getattr(log, "durable", True)`` makes a temp buffer durable by
+    #: accident and files rows whose only journal is a directory nothing
+    #: references — ``record != replay(journal)``, unhealable (#9231 review P1).
+    #: A log constructed onto a scratch path (the MCP mining lane's temp file)
+    #: sets this ``False`` at its construction site.
+    durable: bool = True
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
 

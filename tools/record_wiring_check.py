@@ -53,10 +53,28 @@ PACKAGE = REPO_ROOT / "tortoise"
 #: view needs is the `object` row. Stated here because a maintainer looking for
 #: a procedural TABLE must not find one.
 LAYERS: dict[str, tuple[str, ...]] = {
-    "event stream": ("event", "source", "session"),
+    "event stream": ("event", "source", "session", "journal_event"),
     "semantic": ("object", "subject"),
     "epistemic": ("point", "relation"),
     "procedural": ("object",),
+}
+
+#: Tables a layer OWNS whose writer is a NAMED deferral rather than an
+#: oversight. A table here is still REPORTED (it is never silently dropped from
+#: `LAYERS`), but its absence does not fail the gate — the deferral is the
+#: decision, and hiding it in a shorter table list is how a green gate came to
+#: mean "layer 1 is written" while `public.record_event_stream` stayed empty
+#: (#9231 review P2).
+DECLARED_GAPS: dict[str, str] = {
+    "journal_event": (
+        "layer 1's relational truth set. Migration 20261012000001 defines "
+        "layer 1 AS `public.journal_event` and 20261012000004 exposes it as "
+        "`public.record_event_stream`. It is written by a REPLAY, never by "
+        "the live door: the live path has no journal ordinal (#9190) and an "
+        "invented `seq` collides with a later replay's numbering, so the live "
+        "door defers the row (`position=False`). The view is therefore empty "
+        "until #9190 lands the ordinal."
+    ),
 }
 
 #: The modules that ARE the record, never callers of it.
@@ -263,24 +281,80 @@ def live_door_defers_the_position() -> list[str]:
     return problems
 
 
+def production_callers_defer_the_position() -> list[str]:
+    """EVERY production call to the raw `write_records` seam must pass
+    `position=False` as a LITERAL.
+
+    `live_door_defers_the_position` reads only the body of `write_live_record`,
+    so a FOURTH door that calls `record_writer.write_records([...])` directly —
+    omitting `position`, whose signature default is `True` — satisfies claim 1
+    (a production caller exists), is never visited by claim 3, and writes an
+    invented `journal_event.seq` that collides with a later replay's numbering
+    on `(org_id, graph_id, seq)` in silence (#9190; #9231 review P2). The seam
+    is public, so the rule has to hold wherever it is spelled in the shipped
+    package, not only in the one body that happens to be the current door.
+
+    `write_live_record` is NOT held to this: it takes no `position` parameter
+    and passes the literal internally, which is the point of a single door.
+    """
+    problems: list[str] = []
+    for path in _iter_package_modules():
+        if path.stem in _RECORD_STEMS:
+            continue
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue  # `find_production_callers` already reports this
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "write_records"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id in _RECORD_STEMS):
+                continue
+            bound = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            value = bound.get("position")
+            if not (isinstance(value, ast.Constant) and value.value is False):
+                problems.append(
+                    f"{rel}:{node.lineno} calls write_records(…) with "
+                    f"position={ast.unparse(value) if value is not None else '<unset>'}"
+                    " — a live caller has no journal ordinal (#9190), so it"
+                    " must pass the literal `position=False`"
+                )
+    return problems
+
+
 def check() -> tuple[int, dict[str, object]]:
     """The whole gate, memoised — it reads the tree and imports the fold, and a
     test file asks it several times (the import dominates the cost)."""
     callers, parse_problems = find_production_callers()
     writers, fold_problems = layer_writers()
 
-    gaps = [
-        f"{layer} layer has NO writer: none of {list(tables)} is written by "
-        "any record type in RECORD_MUTATIONS"
-        for layer, tables in LAYERS.items()
-        if not any(writers.get(table) for table in tables)
-    ]
-    position_problems = live_door_defers_the_position()
+    gaps = []
+    declared_gaps: list[dict[str, str]] = []
+    for layer, tables in LAYERS.items():
+        for table in tables:
+            if writers.get(table):
+                continue
+            deferral = DECLARED_GAPS.get(table)
+            if deferral:
+                declared_gaps.append(
+                    {"layer": layer, "table": table, "deferral": deferral})
+            else:
+                gaps.append(
+                    f"{layer} layer has NO writer: {table} is not written by "
+                    "any record type in RECORD_MUTATIONS"
+                )
+    position_problems = (live_door_defers_the_position()
+                         + production_callers_defer_the_position())
 
     report: dict[str, object] = {
         "production_callers": callers,
         "layer_writers": {t: sorted(set(types)) for t, types in writers.items()},
         "gaps": gaps,
+        "declared_gaps": declared_gaps,
         "parse_problems": parse_problems,
         "fold_problems": fold_problems,
         "position_problems": position_problems,
@@ -334,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ✗ {layer:12s}: no writer for any of {list(tables)}")
     for problem in report["position_problems"]:
         print(f"  ✗ position: {problem}")
+    for gap in report.get("declared_gaps", []):
+        print(f"  ⚠ {gap['layer']:12s}: {gap['table']} — DECLARED GAP: {gap['deferral']}")
     if report.get("reason"):
         print(f"  reason: {report['reason']}")
     return code

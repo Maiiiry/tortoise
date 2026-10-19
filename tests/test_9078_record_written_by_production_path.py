@@ -215,18 +215,20 @@ def test_the_write_half_has_a_production_caller(wiring):
 
 
 def test_only_the_shipped_package_can_satisfy_the_wiring_gate(wiring):
-    """A probe cannot join: production is the installed package, not a path.
+    """The gate's caller set is EXACTLY the three shipped doors — no probe can join.
 
-    Both halves stated, because either alone is satisfiable by accident: the
-    gate sees `tortoise/` modules only, AND the SDK is the caller that sees it.
+    Production is the installed package, not a path a probe could join, so the
+    claim is that the caller list is the expected door set and nothing else.
+    Asserting `module.startswith("tortoise/")` alone is true by construction:
+    `find_production_callers` builds every path from `PACKAGE = REPO_ROOT/
+    "tortoise"`, so it could never fail and proved nothing (#9231 review P2).
     """
     _, _, report = wiring
-    modules = [caller["module"] for caller in report["production_callers"]]
-    assert modules, "no production caller at all"
-    for module in modules:
-        assert module.startswith("tortoise/"), module
-    assert not any(m.startswith(("tests/", "docs/", "supabase/tests/"))
-                   for m in modules), modules
+    modules = {caller["module"] for caller in report["production_callers"]}
+    assert modules == {"tortoise/api.py", "tortoise/mining.py", "tortoise/sdk.py"}, (
+        "the door set moved — a door was added or removed without this gate "
+        "learning the new place: " + repr(sorted(modules))
+    )
 
 
 def test_every_layer_has_a_writer_in_the_one_registry(wiring):
@@ -289,14 +291,18 @@ def test_an_armed_capture_without_a_tenant_is_refused_and_counted(
 
     monkeypatch.setattr(record_writer, "_default_connect", _must_not_connect)
     sdk, _journal = capture_sdk()
+    # A DELTA, not a process-global `>=` (#9231 review P2): the counter is a
+    # module-level Prometheus Counter, so `>= 1` would pass on some OTHER
+    # test's refusal — an accident, not this claim.
+    before = dict(monitoring.record_write_failure_counts())
     receipt = sdk.capture_session([
         {"role": "user", "content": "We chose FalkorDB for the hot cache."},
         {"role": "assistant", "content": "Noted."},
     ])
     assert receipt["ok"] is True
-    counts = monitoring.record_write_failure_counts()
-    assert counts.get("no_tenant", 0) >= 1, counts
-    assert "write_failed" not in counts, counts
+    after = dict(monitoring.record_write_failure_counts())
+    assert after.get("no_tenant", 0) > before.get("no_tenant", 0), (before, after)
+    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
 
 
 def test_the_single_tenant_environment_pair_resolves_a_tenant(capture_sdk,
@@ -443,8 +449,36 @@ def test_the_seam_writes_nothing_from_a_scratch_buffer(monkeypatch):
     assert after.get("write_failed", 0) == before.get("write_failed", 0), after
 
 
-def test_the_m2_capture_lane_never_files_a_row_its_journal_never_carried(
-        capture_sdk, monkeypatch):
+def test_the_sdk_door_reads_durability_off_its_log(capture_sdk, monkeypatch):
+    """A door READS `durable`; it must not assume every `EventLog` is a journal.
+
+    `EventLog` now declares `durable = True` explicitly rather than relying on
+    the doors' `getattr(log, "durable", True)` fallback, so a log constructed
+    onto a SCRATCH path can say so — which is exactly what the MCP mining
+    lane's temp-file journal does (`mcp_server`, `tempfile.mkdtemp`). Before
+    this, `sdk.py` and `mining.py` passed no `durable` at all, so such a buffer
+    filed rows whose journal was a directory nothing references, and no replay
+    could ever heal them (#9231 review P1).
+    """
+    monkeypatch.setenv(record_writer.RECORD_DSN_ENV,
+                       "postgresql://record:record@127.0.0.1:1/record")
+    monkeypatch.setattr(record_writer, "_default_connect", lambda dsn: pytest.fail(
+        "the SDK door filed a record from a log that declared itself a "
+        "scratch buffer"))
+    sdk, _journal = capture_sdk()
+    log = sdk._get_event_log()
+    assert log is not None, "the fixture configures a journal"
+    assert log.durable is True, "a real journal is durable by default"
+    log.durable = False
+    before = dict(monitoring.record_write_failure_counts())
+    sdk.capture_session([{"role": "user", "content": "We chose FalkorDB."}])
+    after = dict(monitoring.record_write_failure_counts())
+    assert after.get("no_durable_journal", 0) > before.get(
+        "no_durable_journal", 0), after
+    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
+
+
+def test_the_m2_capture_lane_never_files_a_row_its_journal_never_carried(        capture_sdk, monkeypatch):
     """The M2 extraction lane appends to a SCRATCH buffer, so it never writes.
 
     `TortoiseSDK._extract_session_llm` builds `EventAPI(_InMemoryEventLog())`
@@ -554,9 +588,12 @@ def test_the_record_connection_is_bounded(monkeypatch):
     monkeypatch.setitem(sys.modules, "psycopg2",
                         types.SimpleNamespace(connect=_connect))
     record_writer._default_connect("postgresql://u:p@127.0.0.1:1/db")
-    assert calls[0][1].get("connect_timeout") == record_writer.CONNECT_TIMEOUT_SECONDS
-    assert isinstance(record_writer.CONNECT_TIMEOUT_SECONDS, int)
-    assert 0 < record_writer.CONNECT_TIMEOUT_SECONDS <= 30
+    # Not `== record_writer.CONNECT_TIMEOUT_SECONDS`: that compares the
+    # implementation's constant to itself and cannot fail (#9231 review P2).
+    # The bound is the independent claim; the DSN-override below is the other.
+    assert "connect_timeout" in calls[0][1], calls[0][1]
+    assert isinstance(calls[0][1]["connect_timeout"], int), calls[0][1]
+    assert 0 < calls[0][1]["connect_timeout"] <= 30, calls[0][1]
     record_writer._default_connect(
         "postgresql://u:p@127.0.0.1:1/db?connect_timeout=3")
     assert "connect_timeout" not in calls[1][1], (

@@ -6932,7 +6932,12 @@ class TortoiseSDK:
             # not hand the caller an ImportError for a write that SUCCEEDED.
             self._record_write_failure("seam_unimportable", exc)
             return
-        record_writer.write_live_record(record)
+        # DURABILITY IS READ, not assumed (#9231 review P1): no log at all is
+        # NOT durable, and a log that declares itself a scratch buffer is not
+        # either. The seam counts `no_durable_journal` and files nothing.
+        log = self._event_log
+        durable = log is not None and getattr(log, "durable", True)
+        record_writer.write_live_record(record, durable=durable)
 
     def _record_write_failure(self, reason: str, exc: BaseException) -> None:
         """Count and report one armed record write that did not happen (#9188).

@@ -932,7 +932,12 @@ class ConversationMiner:
         # before the fold — this miner builds its OWN envelope and appends
         # directly, so without this call every record it mines reaches the
         # journal and never the record. Best-effort by construction.
-        record_writer.write_live_record(record)
+        # DURABILITY IS READ, not assumed (#9231 review P1): the miner appends
+        # to `api.log`, which may be the MCP lane's temp scratch buffer. The
+        # seam must see that, or a scratch buffer files a row the journal can
+        # never replay.
+        record_writer.write_live_record(
+            record, durable=getattr(api.log, "durable", True))
         if api.projection is not None:
             # #7951 §17.1: journal-first door (its own envelope) — the append
             # above is the COMMIT POINT, so the fold runs inside the
