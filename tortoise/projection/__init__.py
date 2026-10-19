@@ -3343,32 +3343,35 @@ def _journal_safe_params(params, cypher=None):
 # `proj.g.delete()` refuses — the non-Cypher verb is strictly stricter here,
 # not equal.
 #
-# ⛔ THE CLASS IS NOT CLOSED. What follows is a map of the KNOWN remainder, not
-# an enumeration — `__getattr__` forwards the vendor handle's entire surface,
-# so ANY completeness claim here would be false the moment falkordb adds a
-# verb. The three escapes above are unchanged; these are additional:
-#   * `proj.g.client` / `proj.g._g` — `__getattr__` forwards both, and
-#     `client` is the raw Redis client, so `proj.g.client.execute_command(
-#     "GRAPH.DELETE", <g>)` bypasses both layers. It is escape (2) above by
-#     another attribute; `_g` is named there and `client` is named here.
-#   * `proj.g.call_procedure` — forwarded, and the vendor implements it by
-#     building `CALL <procedure>(…)` and calling the INNER handle's `_query`
-#     (`falkordb/graph.py`), so the text runs arbitrary Cypher: MEASURED, on a
+# ⛔ THE CLASS IS NOT CLOSED. What follows is a map of what was MEASURED to be
+# reachable and destructive, not an enumeration — `__getattr__` forwards the
+# vendor handle's surface, so a completeness claim here would be false the
+# moment falkordb adds a verb. The three escapes above are unchanged; these are
+# additional, each measured on this branch:
+#   * `proj.g.client` — `__getattr__` forwards the vendor handle's client, and
+#     that client's `execute_command` is the #3595 guarded channel, whose own
+#     docstring says it inspects only the four `GRAPH.*` query verbs and
+#     forwards every other command untouched — `GRAPH.DELETE` included. So
+#     `proj.g.client.execute_command("GRAPH.DELETE", <g>)` bypasses both layers.
+#     (`proj.g._g` reaches the vendor handle by the SLOT on this class, not by
+#     forwarding, so hardening `__getattr__` would not close it.)
+#   * `proj.g.call_procedure` — forwarded; the vendor builds
+#     `CALL <procedure>(…)` and dispatches it through the INNER handle's
+#     `_query`, so the text runs arbitrary Cypher: MEASURED, on a
 #     journal-backed non-test graph, `call_procedure("db.labels() MATCH (n)
-#     DETACH DELETE n //", read_only=False)` empties the graph while
-#     `delete()` / `execute_command("GRAPH.DELETE", …)` both refuse on the
-#     same handle. It is the same class as escape (2) — a forwarded hop to a
-#     Cypher-executing seam — and pre-dates this change.
-#   * the vendor's `drop_*_index` / `drop_*_constraint` family — forwarded, and
-#     they DESTROY state with neither layer: MEASURED, `proj.g.
-#     drop_node_range_index("Point", "id")` removes a live index and answers
-#     `OK`. The sharp case is a USER-DEFINED vector index: `_ensure_indexes`
-#     recreates only the hard-coded `Point.embedding` index
-#     (`_ensure_vector_index_api`), so an index on any other label or property
-#     is never rebuilt, and that label's dense read falls back to a full scan
+#     DETACH DELETE n //", read_only=False)` emptied the graph while
+#     `delete()` / `execute_command("GRAPH.DELETE", …)` both refused on the
+#     same handle.
+#   * the vendor's `drop_*` verbs — forwarded, and they destroy state with
+#     neither layer: MEASURED, `proj.g.drop_node_range_index("Point", "id")`
+#     removed a live index and answered OK. Recovery is not uniform either:
+#     `_ensure_indexes` recreates the RANGE/FULLTEXT indexes it DECLARES
+#     (`_POINT_RANGE_INDEX_PROPS`, `_RANGE_INDEX_LABEL_PROPS`,
+#     `_FULLTEXT_INDEX_LABEL_FIELDS`) and the `Point.embedding` VECTOR index, but
+#     a VECTOR index on any other label or property is not recreated, and that
+#     label's dense read then falls back to a full scan
 #     (`mechanism=scan_fallback`, ``tortoise/search_engine.py``) — degraded, not
-#     gone — with no graph-journal record; the vector-index inventory warning is
-#     what records it. Pre-existing, same forwarded-seam root.
+#     gone. Pre-existing, same forwarded-seam root.
 #   * `_WIPE_COMMANDS` holds ONE command. A FalkorDB graph IS a Redis key
 #     (`tortoise/graph_key_restore.py` does DUMP -> DEL -> RESTORE on it), so
 #     `execute_command("DEL"|"UNLINK", <g>)` destroys the same graph, and
@@ -3376,9 +3379,7 @@ def _journal_safe_params(params, cypher=None):
 #     classified here — widening the set is the #3007/#3037 decision (more
 #     verbs refusing is not free), filed as #9237.
 #   * `copy` WRITES UNDER A NEW KEY and destroys nothing (MEASURED: an existing
-#     destination is refused by the engine); the rest of the forwarded surface
-#     (`name`, `schema`, `slowlog*`, …) reads. Naming those is not a claim that
-#     the surface has been audited — the bullets above are what was found.
+#     destination is refused by the engine).
 # ═══════════════════════════════════════════════════════════════════════════
 
 
