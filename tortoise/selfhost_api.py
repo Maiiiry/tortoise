@@ -430,16 +430,17 @@ async def dream(full: bool = False, mode: str | None = None,
     no #329 bucket — the per-pass operator budget bounds stale-first
     passes).
 
-    Incremental (default) or full=True whole-graph. Mirrors hosted_api.
+    Incremental (default) or full=True whole-graph. Mirrors hosted_api:
+    the default arm is PINNED to LOCAL mode and never lets the SDK's context
+    auto-selector upgrade a small/empty graph to a full pass (#8152).
+    `dirty_only` is a DEPRECATED no-op (epic 903-C6) and is not passed.
     """
     sdk = _sdk()
     try:
         if mode is not None:
             result = sdk.dream(mode=mode, budget=budget)
-        elif full:
-            result = sdk.dream(full=True)
         else:
-            result = sdk.dream(dirty_only=True)
+            result = sdk.dream(mode="full" if full else "local")
         return {"status": "ok", "result": result}
     except Exception as e:  # noqa: BLE001, F841, RUF100
         _logger.exception("selfhost dream failed")

@@ -9247,6 +9247,10 @@ async def dream(
     """Trigger EP stabilization (dreaming, #85) for the org's graph.
 
     Incremental (default): stabilizes the org's accumulated dirty subgraph.
+    The default arm is PINNED to LOCAL mode — it never lets the SDK's
+    context auto-selector upgrade the pass (#8152), so the response shape
+    does not depend on graph size and the #329 budget below counts exactly
+    the pass that runs.
     full=True: whole-graph stabilization. mode: explicit strategy override
     (I1 precedence — wins over full). budget: per-pass operator cap.
     Fast-path queries never block on this — dreaming is a background
@@ -9267,10 +9271,25 @@ async def dream(
     # C5 #2114 (D-C5-3): dreaming mutates the graph (EP writes) → write
     # scope, unconditional (not gated on mode).
     _require_scope(org, "graphs:write", "dream")
-    # I1 precedence: an explicit mode wins; else full=True ⇒ full; else the
-    # SDK auto-selects. The budget counts FULL passes only (incl. override).
-    effective_full = (mode == "full") if mode is not None else full
-    if effective_full:
+    # I1 precedence resolved ONCE, and the SAME value drives both the #329
+    # decision here and the pass below — a mode selected in one place and run
+    # in another is how an AUTO-selected full pass went unbudgeted (#8152).
+    #
+    # The final arm is LOCAL, not the SDK's context auto-selector: this
+    # endpoint's documented contract is the incremental pass ("Incremental
+    # (default)" above), `test_dream_incremental` pins its response shape
+    # (`converged`/`iterations`), and `_dream_worker` — the reference
+    # implementation one layer down — already calls `mode="local"` (W1).
+    # `dirty_only=True` used to select it and does NOT: it is a DEPRECATED
+    # no-op since epic 903-C6, so the handler was really asking the SDK to
+    # auto-select — which returns `full` on a small/empty graph and `local`
+    # on a large one. That made one request's body depend on a graph statistic
+    # and let a tenant below `_AUTO_FULL_OPERATOR_THRESHOLD` run whole-graph
+    # passes outside the bucket.
+    effective_mode = mode if mode is not None else ("full" if full else "local")
+    # Only FULL-mode passes (incl. via the explicit override) consume the
+    # bucket (I4).
+    if effective_mode == "full":
         tid = org["org_id"]
         now_ts = _t.time()
         bucket = _DREAM_FULL_BUCKETS.setdefault(tid, [])
@@ -9333,18 +9352,21 @@ async def dream(
     def _run_dream(sdk):
         # #3718: sdk.dream is a long, CPU-heavy SYNCHRONOUS graph pass — the
         # worst on-loop blocker on this surface (seconds, not the ~35ms of a
-        # point write). All three branches run on the DEDICATED dream pool (see
-        # `_DREAM_EXECUTOR`), serialized per graph against the write-triggered
-        # `_dream_worker` drain (`_dream_lock`). `_run_dream_on_pool` owns the
-        # SDK's close.
+        # point write). Every branch (default local, full sugar, explicit mode)
+        # runs on the DEDICATED dream pool (see `_DREAM_EXECUTOR`), serialized
+        # per graph against the write-triggered `_dream_worker` drain
+        # (`_dream_lock`). `_run_dream_on_pool` owns the SDK's close.
         with _dream_lock(_dk):
-            if mode is not None:
-                return sdk.dream(mode=mode, budget=budget)
-            if full:
-                return sdk.dream(full=True)
             if queued_roots:
                 sdk._mark_dirty(queued_roots)
-            return sdk.dream(dirty_only=True)
+            # `budget` rides the explicit-mode arm only, as it always has: the
+            # full=True sugar has never carried a per-pass cap (a full pass is
+            # complete-in-one-pass by contract, and an unsatisfiable explicit
+            # cap raises BudgetExceededError, which this surface does not map —
+            # #9138).
+            if mode is None:
+                return sdk.dream(mode=effective_mode)
+            return sdk.dream(mode=effective_mode, budget=budget)
 
     return await _run_dream_on_pool(_run_dream, lambda: sdk)
 
