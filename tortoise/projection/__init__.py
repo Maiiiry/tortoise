@@ -2758,6 +2758,13 @@ def _union_prewipe_snapshot(leftover: dict | None, fresh: dict) -> dict:
 #     reaches the vendor handle exactly as ``proj.g._query(...)`` does, and no
 #     wrapper can guard a hop below itself — both are named escapes, not
 #     closed doors.
+#     ⛔ AND THE ENUMERATION IS NOT THE RULE (#9209 review round 6): a FalkorDB
+#     graph IS a Redis key, so ``execute_command("DEL", <own graph>)`` (and
+#     ``UNLINK`` / ``RENAME`` / ``EXPIRE 0``) wiped an armed cache while the
+#     verb list named only GRAPH.DELETE and the flushes. The handle now enforces
+#     a NAMESPACE boundary instead — outside the ``GRAPH.`` family it refuses
+#     every command except read-only probes
+#     (``_GuardedGraph._refuse_key_space_handle_command``).
 #   * ``_is_bulk_wipe`` USED TO over-classify label/LIMIT/WITH-scoped deletes and
 #     ``WHERE id(n) IN [..]``-scoped ones, so ``event_store.purge_overflow`` was
 #     refused on a non-test server graph and
@@ -3330,9 +3337,9 @@ def _journal_safe_params(params, cypher=None):
 # write has to close; a lexical inventory cannot, because each is one hop
 # below anything a runtime signal is placed on.
 #
-# ⛔ ESCAPE (4) WAS THE WHOLE-GRAPH WIPE, AND IT IS NOW CLOSED (#9209). The
-# three above are all *statements*, so both of §17.1's doors read text; a
-# graph destruction carries no statement, and it was reachable two ways:
+# ⛔ ESCAPE (4) WAS THE WHOLE-GRAPH WIPE, AND ITS NON-CYPHER DOOR IS NOW CLOSED
+# (#9209). The three above are all *statements*, so both of §17.1's doors read
+# text; a graph destruction carries no statement, and it was reachable two ways:
 # `proj.g.delete()` (the `__getattr__`-forwarded `GRAPH.DELETE`, which no
 # verb-level guard can see BY CONSTRUCTION) and
 # `proj.g.execute_command("GRAPH.DELETE", <graph>)` (a command the #3595/
@@ -3351,18 +3358,35 @@ def _journal_safe_params(params, cypher=None):
 # the same command as two arguments), so the coverage is not spelling-shaped.
 # `_GuardedGraph._refuse_unauthorized_graph_wipe` is the single decision for all
 # of these spellings.
-# ⛔ NOT claimed closed by it: the Cypher-bearing command channel
+# ⛔ AND THE SERVER-WIDE/GRAPH-NAMING LIST IS NOT THE RULE EITHER (review round
+# 6). A FalkorDB graph IS a Redis key, so the SAME wipe is reachable through the
+# key space with a command that carries no statement and no graph name.
+# MEASURED on an armed projection while `_DESTRUCTIVE_HANDLE_COMMANDS` named
+# only GRAPH.DELETE and the flushes:
+#     proj.g.execute_command("DEL", <own graph>)        -> 'OK', count 2 -> 0
+#     proj.g.execute_command("UNLINK", <own graph>)     -> 1,    count 2 -> 0
+#     proj.g.execute_command("RENAME", <own graph>, x)  -> True, cache moved
+#     proj.g.execute_command("EXPIRE", <own graph>, 0)  -> 1,    count -> 0
+# So the armed handle now enforces a NAMESPACE boundary instead:
+# `_GuardedGraph._refuse_key_space_handle_command` refuses ANY command that
+# leaves the `GRAPH.` family on a journal-backed projection, except the
+# read-only probes this repo actually sends (`_ARMED_READ_ONLY_COMMANDS`;
+# `tortoise/sdk.py::_graph_presence` probes `EXISTS` on the retry path, and its
+# caller treats a refusal as "do not retry" — so over-refusing there would drop
+# a legitimate retry silently). `GRAPH.COPY` stays allowed because it is inside
+# the family and removes nothing from this cache.
+# ⛔ NOT claimed closed by any of it: the Cypher-bearing command channel
 # (`execute_command("GRAPH.QUERY", <g>, "MATCH (n) DETACH DELETE n")`), which
 # needs statement recovery (#9124); the private hop `proj.g._g.delete()` (the
 # `delete()` analogue of escape (2) above — no wrapper can guard a hop below
-# itself); and the handle's other non-Cypher verbs (`copy`, index/constraint
-# DDL) — none of which destroys this cache, so refusing them would be a refusal
-# of something the cache never lost. `call_procedure` is NOT in that list: it
-# pastes a caller-controlled string into CYPHER position, so it is now defined
-# on the wrapper and its reconstructed statement goes through L2
-# (`_is_bulk_wipe`) exactly as `query`'s does — §17.1's statement door for it is
-# #9124's, stated as open here (on an EMBEDDED armed projection it can still
-# wipe, exactly as `proj.g.query` can, because L2 exempts embedded mode).
+# itself); and the handle's other GRAPH.* verbs that write but destroy nothing
+# (`copy`, index/constraint DDL) — refusing those would refuse an operation the
+# cache never lost anything to. `call_procedure` is NOT in that list: it pastes
+# a caller-controlled string into CYPHER position, so it is defined on the
+# wrapper and its reconstructed statement goes through L2 (`_is_bulk_wipe`)
+# exactly as `query`'s does — §17.1's statement door for it is #9124's, stated
+# as open here (on an EMBEDDED armed projection it can still wipe, exactly as
+# `proj.g.query` can, because L2 exempts embedded mode).
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3372,19 +3396,21 @@ class DirectCacheWriteRefused(RuntimeError):
     Raised when a fold (`FalkorProjection.apply`), a mutating statement on the
     public raw-query lane (`FalkorProjection.query`), a whole-graph destruction
     through the write handle's non-Cypher verbs (`GRAPH.DELETE` via
-    `proj.g.delete()` / `proj.g.execute_command`, #9209), or a server-wide
-    `FLUSHALL` / `FLUSHDB` is attempted against a **journal-backed**
+    `proj.g.delete()` / `proj.g.execute_command`, #9209), a KEY-SPACE command on
+    that same handle (`DEL` / `UNLINK` / `RENAME` / `EXPIRE 0` … — the cache is
+    stored under the graph's own Redis key, so these are the same wipe), or a
+    server-wide `FLUSHALL` / `FLUSHDB` is attempted against a **journal-backed**
     projection. The projection is the derived cache of a journal; a write — or a
     wipe — it did not receive through its journal is the second writer §17.1
     forbids.
 
-    ⛔ THE THREE CLASSES DO NOT SHARE ONE AUTHORIZATION RULE, and this docstring
+    ⛔ THE CLASSES DO NOT SHARE ONE AUTHORIZATION RULE, and this docstring
     is where a caller looks before writing a `with` block, so stated apart: the
     fold, the raw-query lane and `GRAPH.DELETE` are refused OUTSIDE a sanctioned
-    scope (so declaring one authorizes them); `FLUSHALL` / `FLUSHDB` are refused
-    on any journal-backed projection, scope or NOT — a declaration says "this
-    write is a projection of the journal", and no declaration can say that about
-    graphs this journal never wrote and no replay can restore.
+    scope (so declaring one authorizes them); `FLUSHALL` / `FLUSHDB` and every
+    key-space command are refused on any journal-backed projection, scope or
+    NOT — a declaration says "this write is a projection of the journal", and
+    none of those can say that.
     """
 
 
@@ -3521,6 +3547,26 @@ _DESTRUCTIVE_HANDLE_COMMANDS: frozenset[str] = frozenset(
 #: them, so there is no "which graph" question to answer and no declared lane
 #: that could make one safe.
 _SERVER_WIDE_COMMANDS: frozenset[str] = frozenset({"FLUSHALL", "FLUSHDB"})
+
+#: The graph namespace: every command here addresses a GRAPH (whose Cypher
+#: argument `cypher_guard._guard_execute_command` classifies) or writes
+#: elsewhere (`GRAPH.COPY`), and none of them reaches the Redis KEY SPACE this
+#: graph is stored under. That distinction — not a list of verbs — is what the
+#: armed handle enforces below.
+_GRAPH_NAMESPACE_PREFIX = "GRAPH."
+
+#: Read-only commands an armed handle may still send. Deliberately tiny and
+#: read-only, and it exists for ONE measured caller:
+#: `tortoise/sdk.py::_graph_presence` probes `proj.g.execute_command("EXISTS",
+#: <graph>)` on the retry path. That probe SWALLOWS its exceptions and answers
+#: "do not retry", so an over-refusal here would not fail loudly — it would
+#: silently drop a legitimately retried write (#7685). Nothing here can remove
+#: or overwrite the cache key: `RESTORE`, `COPY` and `SET` are not reads and
+#: are deliberately absent.
+_ARMED_READ_ONLY_COMMANDS: frozenset[str] = frozenset(
+    {"EXISTS", "TYPE", "TTL", "PTTL", "INFO", "PING", "DBSIZE", "KEYS",
+     "SCAN", "MEMORY"}
+)
 
 #: Destructive commands whose first word after the verb names the graph they
 #: address (``GRAPH.DELETE <graph>``). The rest name none.
@@ -3764,6 +3810,16 @@ class _GuardedGraph:
                 verb,
                 words[0] if (verb in _GRAPH_TARGETING_COMMANDS and words) else None,
             )
+        else:
+            # #9209 (review round 6): the destructive class is NOT something
+            # `_DESTRUCTIVE_HANDLE_COMMANDS` can enumerate. A FalkorDB graph IS
+            # a Redis key, so the same wipe is reachable through the key space
+            # with a command carrying no statement and no graph name — `DEL`,
+            # `UNLINK`, `RENAME` and `EXPIRE 0` were MEASURED wiping an armed
+            # cache while the enumerated list named none of them. The rule is
+            # the NAMESPACE, not the verb list; see
+            # `_refuse_key_space_handle_command`.
+            self._refuse_key_space_handle_command(verb)
         # #3595 (review round 2, P2): the raw Redis command channel carries
         # `GRAPH.QUERY` / `GRAPH.PROFILE` / ... too, and the guarded handles
         # beneath `self._g` already intercept it — but keep the wrapper's own
@@ -3791,9 +3847,17 @@ class _GuardedGraph:
         as the projection's: the wrapper is also built in-tree over a graph that
         is NOT the projection's own (`tortoise/hosted_api.py`, where
         ``_GuardedGraph(proj.db.select_graph(graph_name), proj)`` binds another
-        graph to the same projection), and judging such a delete by
-        ``_proj._graph_name`` would authorize it against a name it does not
-        delete.
+        graph to the same projection), so the handle's own name is the thing
+        this verb actually removes.
+
+        ⛔ THE RULE IS THEN EXACT, and it over-refuses ON PURPOSE: on an armed
+        projection this refuses any target that is not the projection's own
+        graph, INCLUDING inside a declared scope on a disposable ``test_*``
+        graph. L2 (``_assert_test_graph``) reads exactly one graph name, so a
+        delete of some OTHER graph cannot be judged disposable by this door, and
+        declining beats dispatching against a name no check looked at. A wrapper
+        over another graph therefore has no in-scope delete path — that is the
+        intended trade, so a maintainer reading this does not "fix" it away.
         """
         self._refuse_unauthorized_graph_wipe(
             "GRAPH.DELETE", getattr(self._g, "name", None)
@@ -3813,6 +3877,14 @@ class _GuardedGraph:
         DEFINED here and the reconstructed statement goes through the same
         ``_is_bulk_wipe`` → L2 check ``query`` applies — no more, and no less.
 
+        ⛔ L2 HERE IS NOT GATED ON THE JOURNAL, and that is ``query``'s
+        polarity: this is a STATEMENT path, and L2 is the test-graph guard every
+        statement path applies whether or not a journal is bound (``proj.g.query``
+        refuses a bulk ``DETACH DELETE`` on a non-test graph on an UNARMED
+        projection too). So the transparent pass-through an unarmed projection
+        gets for ``delete()`` / ``execute_command`` deliberately does NOT extend
+        to this verb, and the unarmed test pins both halves.
+
         ⛔ NOT claimed closed by #9209: §17.1's STATEMENT door for procedures —
         a mutating procedure on an armed projection outside a declared scope.
         That is #9124's statement-recovery work, exactly as it is for every
@@ -3830,6 +3902,66 @@ class _GuardedGraph:
             )
         return self._g.call_procedure(
             procedure, read_only=read_only, args=args, emit=emit
+        )
+
+    def _refuse_key_space_handle_command(self, command: str | None) -> None:
+        """§17.1 at the handle's KEY-SPACE door (#9209, review round 6).
+
+        ⛔ THE RULE IS THE NAMESPACE, NOT A VERB LIST, because a FalkorDB graph
+        IS a Redis key: the cache this journal derives is stored under the
+        graph's own name, so the whole-graph wipe is reachable with commands
+        that carry no Cypher statement and no graph argument at all. Measured on
+        an armed projection after the first version of this change shipped an
+        enumerated list (`GRAPH.DELETE` + `FLUSHALL`/`FLUSHDB`):
+
+            proj.g.execute_command("DEL", <own graph>)     -> 'OK', count 2 -> 0
+            proj.g.execute_command("UNLINK", <own graph>)  -> 1,    count 2 -> 0
+            proj.g.execute_command("RENAME", <own graph>, x) -> True, cache moved
+            proj.g.execute_command("EXPIRE", <own graph>, 0) -> 1,   count -> 0
+
+        so every review round that enumerated verbs found another spelling
+        (`GRAPH.DELETE`/`FLUSHALL`, then `DEL`/`UNLINK`/`RENAME`/`EXPIRE`, then
+        whatever is next). An enumeration cannot be finished here; a namespace
+        boundary can. On an armed projection this channel is GRAPH-scoped, and
+        a command that leaves the ``GRAPH.`` family can only be talking about
+        the KEY SPACE the cache lives in — so it is refused unless it is one of
+        the read-only probes (`_ARMED_READ_ONLY_COMMANDS`), which cannot remove
+        or overwrite a key.
+
+        No declared scope authorizes it, on the same reasoning
+        ``_SERVER_WIDE_COMMANDS`` uses: a declaration says "this write is a
+        projection of the journal", and a key-space command is precisely not
+        one — it removes the projection. A caller who really means it does it at
+        the client (`proj.db`), where it is visible as what it is.
+
+        ``None`` (an argument no word can be read from — an int, a None, an
+        object) is passed through unchanged: every classification here is a
+        POSITIVE match, and the client refuses a payload it cannot serialize
+        anyway. Unarmed projections are untouched (pre-#9209 pass-through).
+        """
+        if not getattr(self._proj, "_journal_backed", False):
+            return
+        if command is None:
+            return
+        if command.startswith(_GRAPH_NAMESPACE_PREFIX):
+            return
+        if command in _ARMED_READ_ONLY_COMMANDS:
+            return
+        raise DirectCacheWriteRefused(
+            f"Refusing `{command}` on the write handle of a journal-backed "
+            "projection: this channel is GRAPH-scoped, the derived cache is "
+            "stored under the graph's own Redis KEY, and a key-space command "
+            "(DEL, UNLINK, RENAME, EXPIRE 0, MOVE, SWAPDB, MIGRATE, RESTORE, "
+            "SET …) removes or overwrites it without carrying a statement — "
+            "the same wipe as GRAPH.DELETE, with no record and no replay "
+            "direction (docs/architecture/STORAGE-ARCHITECTURE.md 17.1). "
+            "Refused for the WHOLE namespace rather than for a list of verbs "
+            "because that list has been incomplete at every review round. "
+            "Read-only probes (" + ", ".join(sorted(_ARMED_READ_ONLY_COMMANDS)) +
+            ") are allowed; a deliberate key-space write belongs at the "
+            "client (`proj.db`), where it is visible as what it is. No "
+            "declared scope authorizes this: a declaration says this write is "
+            "a projection of the journal."
         )
 
     def _refuse_unauthorized_graph_wipe(self, command: str,

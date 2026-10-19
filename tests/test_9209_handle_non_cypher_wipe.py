@@ -35,14 +35,34 @@ exactly the corruption it claims to prevent, with a traceback on top.
 
 WHAT IT DOES NOT CLAIM. Not every non-Cypher mutation is refused — only the one
 that destroys this cache. `GRAPH.COPY` writes this cache's contents into
-ANOTHER graph and removes nothing here, so it must stay allowed: a blacklist
-that refused it would be refusing an operation the cache never lost anything
-to, and `tests/test_graphcopy_boolean_index_3154.py` legitimately copies
-through this handle. That asymmetry is the rule, and
+ANOTHER graph and removes nothing here, so it must stay allowed: a rule that
+refused it would be refusing an operation the cache never lost anything to, and
+`tests/test_graphcopy_boolean_index_3154.py` legitimately copies through this
+handle. That asymmetry is the rule, and
 `test_an_unrelated_non_cypher_verb_...` is what keeps it honest. The
 Cypher-bearing raw command
 (``execute_command("GRAPH.QUERY", <g>, "MATCH (n) DETACH DELETE n")``) is NOT
 closed here — it needs statement recovery, which is #9124's door.
+
+⛔ THE VERB LIST IS NOT THE RULE EITHER (review round 6), and this suite was
+written wrongly once because of it: a FalkorDB graph IS a Redis key, so
+``execute_command("DEL", <own graph>)`` — and ``UNLINK``, ``RENAME``,
+``EXPIRE 0`` — wiped an armed cache while the enumerated list named only
+``GRAPH.DELETE`` and the flushes. MEASURED, on a real journal-backed SDK at
+the head that shipped the list:
+
+    proj.g.execute_command("DEL", proj._graph_name)        -> 'OK', 2 -> 0
+    proj.g.execute_command("UNLINK", proj._graph_name)     -> 1,    2 -> 0
+    proj.g.execute_command("RENAME", proj._graph_name, x)  -> True, cache moved
+    proj.g.execute_command("EXPIRE", proj._graph_name, 0)  -> 1,    2 -> 0
+
+So the armed handle enforces a NAMESPACE boundary instead: outside the
+``GRAPH.`` family it refuses every command except the read-only probes the repo
+actually sends (``_ARMED_READ_ONLY_COMMANDS``), because anything else that can
+reach the key space can remove the cache. The tests below pin BOTH halves —
+the refusal, and that a read still passes (an over-refusal here would silently
+drop a legitimately retried write: `tortoise/sdk.py::_graph_presence` probes
+``EXISTS`` and answers "do not retry" when it raises).
 """
 from __future__ import annotations
 
@@ -337,9 +357,9 @@ def test_an_unrelated_non_cypher_verb_leaves_the_armed_cache_intact(
        refused) — a guard that "cleared" its own state on an unrelated verb
        would re-open §17.1 for the rest of the process.
 
-    MUTATION: make `_refuse_unauthorized_graph_wipe` refuse every non-Cypher
-    verb and (1) fails; make it clear/disarm anything on the way through and (3)
-    fails.
+    MUTATION: make `_refuse_unauthorized_graph_wipe` / `_refuse_key_space_handle_
+    command` refuse every non-Cypher verb and (1) fails; make them clear/disarm
+    anything on the way through and (3) fails.
     """
     proj = sdk_with_journal._get_proj()
     before = _count(proj)
@@ -356,6 +376,153 @@ def test_an_unrelated_non_cypher_verb_leaves_the_armed_cache_intact(
         proj.g.delete()
     assert _count(proj) == before, (
         "the arming did not survive an unrelated non-Cypher verb"
+    )
+
+
+# ── the key-space door: the cache IS a Redis key (review round 6) ────────
+
+#: Every one of these DESTROYS the graph's key — and with it the armed cache —
+#: while carrying no Cypher statement and, in the first two, no graph argument
+#: that any Cypher-reading guard could see. Measured wiping a real armed cache
+#: at the head that enumerated only GRAPH.DELETE and the flushes.
+_KEY_SPACE_WIPES = [
+    ("DEL",),
+    ("UNLINK",),
+    ("RENAME", "<other>"),
+    ("EXPIRE", 0),
+    ("PEXPIRE", 0),
+]
+
+
+@pytest.mark.parametrize("tail", _KEY_SPACE_WIPES,
+                         ids=[t[0] for t in _KEY_SPACE_WIPES])
+def test_a_key_space_command_on_the_graph_key_is_refused(
+        sdk_with_journal, tail):
+    """RED at the previous head: the cache went to 0 with no error at all.
+
+    The graph's derived cache is stored under the graph's OWN Redis key, so
+    ``DEL`` / ``UNLINK`` / ``RENAME`` / ``EXPIRE 0`` are the same whole-graph
+    wipe as ``GRAPH.DELETE`` — with no statement for either Cypher door to read
+    and, for the first two, no graph name in a position the classifier looked
+    at. That is why the fix is a NAMESPACE boundary and not four more entries in
+    a verb list: the list was incomplete at every round that used one.
+
+    PRE-DISPATCH, as everywhere in this suite: the count is read AFTER the
+    refusal, so a guard that raised on top of a completed wipe fails here.
+
+    MUTATION: return early from `_refuse_key_space_handle_command` and this
+    fails with DID NOT RAISE and the node count at 0 (verified against the
+    head before this test existed).
+    """
+    proj = sdk_with_journal._get_proj()
+    assert proj._journal_backed, "the fixture must ARM the guard"
+    before = _count(proj)
+    assert before > 0, "the armed cache must hold something a wipe could destroy"
+
+    args = [tail[0], proj._graph_name]
+    for extra in tail[1:]:
+        args.append(proj._graph_name + "_9209_dst" if extra == "<other>" else extra)
+
+    with pytest.raises(DirectCacheWriteRefused) as exc:
+        proj.g.execute_command(*args)
+
+    assert "17.1" in str(exc.value), (
+        f"the refusal must cite the rule it enforces; message={str(exc.value)!r}"
+    )
+    assert _count(proj) == before, (
+        f"`{tail[0]}` was refused AFTER it destroyed the cache — an armed "
+        "projection whose wipe raises on top of a completed deletion is worse "
+        "than no guard at all"
+    )
+
+
+@pytest.mark.parametrize("verb", [b"DEL", "del", "DEL"])
+def test_the_key_space_refusal_is_not_spelling_shaped(sdk_with_journal, verb):
+    """Bytes and case, because the client accepts both and Redis is
+    case-insensitive — the same two spellings the GRAPH.DELETE cases pin.
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(verb, proj._graph_name)
+    assert _count(proj) == before
+
+
+def test_the_joined_key_space_spelling_is_refused_too(sdk_with_journal):
+    """The client splits the first argument, so ``"DEL <graph>"`` in one string
+    is the same command as two arguments (`_handle_command_words`).
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(f"DEL {proj._graph_name}")
+    assert _count(proj) == before
+
+
+def test_a_key_space_command_is_refused_on_NAMESPACE_not_on_a_list(
+        sdk_with_journal):
+    """The rule's own evidence: a verb named NOWHERE in the module is refused.
+
+    ``SET``/``RESTORE``/``SWAPDB`` are not in any list (and adding them would
+    only move the incompleteness), yet each can overwrite, restore over, or
+    swap away the key the cache lives under. The guard must refuse them because
+    they leave the ``GRAPH.`` namespace, not because someone enumerated them.
+
+    MUTATION: replace the namespace check with a verb allow-list of the currently
+    enumerated commands and this fails (``SET`` would be dispatched).
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+    for args in (("SET", proj._graph_name, "{} "), ("RESTORE", proj._graph_name, 0, "x"),
+                 ("SWAPDB", 0, 1)):
+        with pytest.raises(DirectCacheWriteRefused) as exc:
+            proj.g.execute_command(*args)
+        assert "GRAPH." in str(exc.value), (
+            "the refusal must name the boundary it enforces so the next writer "
+            f"can see why; message={str(exc.value)!r}"
+        )
+    assert _count(proj) == before
+
+
+def test_a_read_only_probe_still_passes_on_an_armed_projection(sdk_with_journal):
+    """The other half of the rule: over-refusal here would be SILENT.
+
+    `tortoise/sdk.py::_graph_presence` probes ``proj.g.execute_command("EXISTS",
+    <graph>)`` on its retry path and treats a refusal as "do not retry" — so a
+    guard that refused the read would not fail loudly, it would quietly drop a
+    legitimately retried write (#7685). Both spellings the SDK uses are pinned.
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+
+    assert proj.g.execute_command("EXISTS", proj._graph_name), (
+        "EXISTS must still answer on an armed projection — the SDK's retry gate "
+        "reads it"
+    )
+    assert proj.g.execute_command(b"TYPE", proj._graph_name) is not None
+    assert _count(proj) == before
+
+
+def test_a_graph_namespace_command_that_destroys_nothing_still_passes(
+        sdk_with_journal):
+    """The precise half of the NAMESPACE rule, on the command channel.
+
+    ``GRAPH.COPY`` is inside the family and removes nothing from this cache, so
+    the boundary must not touch it — the same asymmetry
+    `test_an_unrelated_non_cypher_verb_...` pins for the forwarded attribute.
+
+    MUTATION: make `_refuse_key_space_handle_command` refuse the whole non-empty
+    command space instead of leaving the ``GRAPH.`` family alone and this fails.
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+    dst = proj._graph_name + "_9209_ns_copy"
+
+    proj.g.execute_command("GRAPH.COPY", proj._graph_name, dst)
+
+    assert _count(proj) == before, "GRAPH.COPY changed this cache"
+    assert _count(proj, proj.db.select_graph(dst)) == before, (
+        "GRAPH.COPY did not actually run — 'cache intact' would be vacuous"
     )
 
 
@@ -545,7 +712,16 @@ def test_an_unarmed_projection_passes_through_unchanged():
     No journal ⇒ no truth store for the cache to be ahead of, so the wipe is the
     pre-#9209 pass-through (this is the polarity `_journal_backed` documents, and
     it is why `graph-scripts/dream-scale-bench.py`'s `proj.g.delete()` keeps
-    working).
+    working). The pass-through covers the handle's whole NON-STATEMENT surface —
+    `delete()` and `execute_command` — and it includes the key-space commands
+    (``DEL``), which have nothing to enforce against without a journal.
+
+    ⛔ The STATEMENT path is the asymmetry, and it is `query`'s polarity, not an
+    exception carved here: ``call_procedure`` reconstructs a CYPHER statement, so
+    it goes through L2 regardless of arming — exactly as
+    ``proj.g.query("MATCH (n) DETACH DELETE n")`` refuses a non-test graph on an
+    unarmed projection too. Pinned so a later "consistency" edit cannot quietly
+    remove L2 from it, and so the docstring cannot drift from the code.
     """
     proj = _armed_projection(graph_name="prod_tortoise", embedded=False)
     proj._journal_backed = False
@@ -553,7 +729,18 @@ def test_an_unarmed_projection_passes_through_unchanged():
 
     assert guarded.delete() == "OK"
     assert guarded.execute_command("GRAPH.DELETE", "prod_tortoise") == "OK"
-    assert [c[0] for c in proj.g.calls] == ["delete", "execute_command"]
+    assert guarded.execute_command("DEL", "prod_tortoise") == "OK"
+    assert [c[0] for c in proj.g.calls] == [
+        "delete", "execute_command", "execute_command"
+    ]
+
+    # The statement half: same polarity as `query`, armed or not.
+    with pytest.raises(RuntimeError) as exc:
+        guarded.call_procedure("db.labels() MATCH (n) DETACH DELETE n //", False)
+    assert "non-test graph" in str(exc.value), (
+        "call_procedure must apply L2's name check exactly as `query` does — "
+        f"message={str(exc.value)!r}"
+    )
 
 
 # ── the drift guard: every forwarded verb is classified ───────────────────
