@@ -1024,11 +1024,12 @@ def _scope_map_pass(
         # `FSTRING_MIDDLE` holding `{{`, so the second brace of `f"a {{ b"`
         # reaches a tokenize-span counter as code and opens a paren that
         # nothing closes. Measured on this tree by diffing the two scope maps
-        # over the whole guard scan set (1,008 files): 8 files / 9,263
-        # mislabelled lines, every one of them from a `{{` on an f-string line
-        # — `tests/test_ship_test_onboarding.py` alone loses 5,845 lines from
-        # its `{{` at L546. `_code_only` blanks the whole literal, f-string
-        # braces included, in one column-aligned pass.
+        # over the whole guard scan set — every module `_scanned_modules()`
+        # scans (`_iter_test_module_paths()`, not a flat glob): 8 files / 9,263
+        # mislabelled lines, every one of them a `{{` on an f-string line —
+        # `tests/test_ship_test_onboarding.py` alone loses 5,845 lines from its
+        # `{{` at L546. `_code_only` blanks the whole literal, f-string braces
+        # included, in one column-aligned pass.
         for ch in code:
             if ch in "([{":
                 paren += 1
@@ -1143,8 +1144,8 @@ def _code_only(
                 # single-quoted literal is legal — so the parity of the trailing
                 # backslashes needs no test of its own: `_scope_map` only
                 # enables the carry for sources that compile (measured: adding
-                # a parity test changes 0 of 1,008 scan-set scope maps, because
-                # every shape it would reject is already unparsable).
+                # a parity test changes NONE of the scan set's scope maps,
+                # because every shape it would reject is already unparsable).
                 if allow_single_carry:
                     return "".join(out), ("single", quote)
                 return "".join(out), triple
@@ -1287,11 +1288,12 @@ def _restoration_violations(files) -> list[str]:
     """
     violations: list[str] = []
     for fname, src in files:
-        # #9061: `_scope_map` (tokenize plus a per-line bracket scan) is the
-        # whole cost of this guard, so it has to run on the modules that can
-        # hold a violation, not on the size of the tree. The skip is SOUND BY
-        # CONSTRUCTION, which is why it may narrow the analysis at all: its two
-        # predicates are this guard's OWN — a module whose source mentions
+        # #9061: `_scope_map` (`_code_only`'s one column-aligned pass plus
+        # the per-line bracket scan) is the whole cost of this guard, so it has
+        # to run on the modules that can hold a violation, not on the size of
+        # the tree. The skip is SOUND BY CONSTRUCTION, which is why it may
+        # narrow the analysis at all: its two predicates are this guard's OWN —
+        # a module whose source mentions
         # neither `TORTOISE_DB_URI` (the raw-mutation census below) nor a bare
         # `pytest.MonkeyPatch(` (the URI-agnostic bare-instance arm) cannot hold
         # a site this guard would report, so nothing it would flag is skipped.
@@ -1675,11 +1677,11 @@ def test_scope_map_ignores_an_escaped_brace_in_an_fstring():
     A `tokenize`-span counter sees one column for the `FSTRING_MIDDLE` that
     holds `{{`, so the SECOND brace reaches the counter as code and opens a
     paren nothing closes: `f"a {{ b"` nets `+1`. Measured on this tree (the
-    guard scan set, 1,008 files, scope maps diffed against the tokenize-span
-    counter), that mislabelled 8 files / 9,263 lines from their first `{{` —
-    and a COMPLIANT test appended downstream reded with two violations naming
-    the wrong function. `_code_only` blanks the whole literal, escaped braces
-    included.
+    whole guard scan set — every `_scanned_modules()` module — with the two
+    scope maps diffed against the tokenize-span counter), that mislabelled 8
+    files / 9,263 lines from their first `{{` — and a COMPLIANT test appended
+    downstream reded with two violations naming the wrong function.
+    `_code_only` blanks the whole literal, escaped braces included.
 
     Only a NET-POSITIVE surplus is observable: `}}` nets `-1` and the clamp
     absorbs it, so a `}}` line alone cannot discriminate (a `{{`/`}}`-balanced
