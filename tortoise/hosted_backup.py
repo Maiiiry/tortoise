@@ -340,7 +340,7 @@ _DUMP_EDGE_PAGE_QUERY = (
 _COUNT_ALL_EDGES_QUERY = "MATCH ()-[r]->() RETURN count(r)"
 
 
-def _paged_rows(g, query: str, key_index: int, *, batch: int = _DUMP_PAGE_SIZE):
+def _paged_rows(g, query: str, key_index: int, *, batch: int | None = None):
     """Yield every row of ``query``, keyset-paged on the ``id()`` ordering key.
 
     ``query`` must select that key as column ``key_index`` and take ``$cursor`` /
@@ -356,7 +356,17 @@ def _paged_rows(g, query: str, key_index: int, *, batch: int = _DUMP_PAGE_SIZE):
     ``_DUMP_NODE_PAGE_QUERY``). Advancing past the last row keeps the paging
     identical on both cores because ids are non-negative integers, so
     ``>= last + 1`` is exactly the old ``> last``.
+
+    ``batch`` defaults to the CURRENT ``_DUMP_PAGE_SIZE``, read here rather than
+    in the signature. A def-time default would bind at import, so a runtime
+    retune of the module constant — which is exactly how
+    ``tests/test_9226_dump_paging_v6.py`` pins a small page size to make the live
+    dump take MORE THAN ONE page — would be silently ignored: the dump would
+    page at 1000, finish on the ``len(rows) < batch`` branch, and never exercise
+    the ``last + 1`` advance at all.
     """
+    if batch is None:
+        batch = _DUMP_PAGE_SIZE
     cursor = 0
     while True:
         rows = g.query(

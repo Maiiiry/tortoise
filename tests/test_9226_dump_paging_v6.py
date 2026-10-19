@@ -47,11 +47,11 @@ outage (#9226).
 """
 from __future__ import annotations
 
-import contextlib
 import re
 
 import pytest
 
+from tests import _live_utils
 from tortoise.hosted_backup import (
     _DUMP_EDGE_PAGE_QUERY,
     _DUMP_NODE_PAGE_QUERY,
@@ -174,6 +174,33 @@ def test_the_edge_read_pages_the_same_way_on_v6():
     assert calls[0][1]["cursor"] >= 0, calls[0][1]
 
 
+def test_the_page_size_constant_reaches_the_page_read(monkeypatch):
+    """The page size must be read at CALL time, not bound as a def-time default.
+
+    ``_paged_rows``'s ``batch`` defaulted to ``_DUMP_PAGE_SIZE`` in the
+    signature, which binds once at import: retuning the module constant changed
+    nothing, so the dump always paged at 1000 and finished on the
+    ``len(rows) < batch`` branch. That made the live leg below unable to exercise
+    the ``last + 1`` advance on any engine — a wrong offset stayed green. It is
+    pinned hermetically here (this test needs no server) by asserting the
+    constant visibly changes the ``$batch`` the read actually sends, and that the
+    small size really forces a second page.
+    """
+    from tortoise import hosted_backup
+
+    monkeypatch.setattr(hosted_backup, "_DUMP_PAGE_SIZE", 2)
+
+    calls = []
+    rows = list(hosted_backup._paged_rows(
+        _V6Graph(calls), _DUMP_NODE_PAGE_QUERY, 0))
+
+    assert [c[1]["batch"] for c in calls] == [2, 2, 2], (
+        "the monkeypatched page size never reached the read — a def-time default "
+        f"bound it at import: params sent were {[c[1] for c in calls]}")
+    assert [r[0] for r in rows] == [n[0] for n in _NODES]
+    assert len(calls) > 1, "5 nodes at batch=2 must take more than one page"
+
+
 # ── the phantom row on a registry-absent graph ───────────────────────────
 
 
@@ -239,7 +266,6 @@ def _live_target() -> str | None:
     """
     import os
 
-    from tests import _live_utils
     from tests._canonical_store_guard import canonical_store_refusal
 
     for uri in (os.environ.get("TORTOISE_DB_URI"),
@@ -267,11 +293,14 @@ def test_dump_graph_pages_a_live_graph_end_to_end(monkeypatch):
     """The end-to-end shape the outage broke: seed → dump → every node exported.
 
     The page size is pinned SMALL on purpose (``_DUMP_PAGE_SIZE`` monkeypatched to
-    4 against 15 nodes): with the production default of 1000 this would take one
-    page and never exercise the ``last + 1`` advance on a real engine, so a wrong
-    offset would leave the test green. Skips (visibly) when this lane has no
-    non-embedded FalkorDB, exactly like the rest of the live suite — it never
-    early-returns green (#942).
+    4 against 15 nodes, which works only because ``_paged_rows`` reads the
+    constant at CALL time — see
+    ``test_the_page_size_constant_reaches_the_page_read``): with the production
+    default of 1000 this would take one page and terminate on the
+    ``len(rows) < batch`` branch, never exercising the ``last + 1`` advance on a
+    real engine, so a wrong offset would leave the test green. Skips (visibly)
+    when this lane has no non-embedded FalkorDB, exactly like the rest of the live
+    suite — it never early-returns green (#942).
     """
     uri = _live_target()
     if uri is None:
@@ -298,6 +327,11 @@ def test_dump_graph_pages_a_live_graph_end_to_end(monkeypatch):
             "dump_graph must export every node — 0 here is the #9226 v6 outage: "
             f"exported {payload['node_count']}")
     finally:
+        # Delete BEFORE close, through the repo's sanctioned per-run teardown
+        # (#8746): it is fail-closed on the graph name and never raises, whereas
+        # issuing GRAPH.DELETE through an ALREADY-CLOSED projection — behind a
+        # bare ``suppress(Exception)`` — cannot be observed at all when it does
+        # not reach the server. Leftovers on a shared lane instance are the
+        # #7357 cache-eviction churn this file's ``_live_target`` docstring cites.
+        _live_utils.drop_test_graph(proj, name=name)
         proj.close()
-        with contextlib.suppress(Exception):
-            proj.db.select_graph(name).delete()

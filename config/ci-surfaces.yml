@@ -5473,6 +5473,7 @@ durations:
   test_quota.py: 11.8
   test_no_legacy_token_path.py: 0.5
   test_dump_edge_asymmetry_3895.py: 0.8
+  test_9226_dump_paging_v6.py: 3.0  # #9226 (#3400/#4348 trap): a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so this is the branch's LOCAL reading under the `# unmeasured` convention, not a CI measurement. MEASURED on this host 2026-10-20 against a live docker-lane server (pytest `--junitxml`, sum of testcase/@time over ALL 8 tests = 2.99s; the live end-to-end leg runs, it does not skip, on a provisioned lane). Required for the durations half as well as the surface half: without the row the file packs at the flat 2.0s default AND it consumes the LAST slot of the #3400 coverage budget — at the pre-row head the fast pool was 942 files with 94 unweighted, i.e. exactly 90.02% against a floor that fires under 90%, so the next unweighted fast file would have redded `duration_coverage_issues()` repo-wide and been attributed to an unrelated PR. With the row: 849/942 = 90.13%. Refresh from the first post-merge run that includes it; do NOT drop the row without re-deriving the floor at that head.
   test_divergence_conformance.py: 4.8
   test_from_uri_userinfo.py: 3.1
   test_export_cli.py: 10.0
