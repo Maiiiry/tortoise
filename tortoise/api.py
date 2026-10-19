@@ -77,11 +77,11 @@ class EventAPI:
         ``TestReplayIsDeliberatelyUngated5475`` rather than as a gate.
 
         It runs BEFORE ``self.log.append`` in ``_emit``, and that ordering is
-        load-bearing: the append is this seam's COMMIT POINT (the journal IS the
-        reconstruction source), so a refusal raised after it would leave a
-        record that is
-        faithfully replayed on the next ``rebuild_all`` — refused live, widened
-        anyway on replay. Fail closed means fail BEFORE the commit, not after.
+        load-bearing: the append is this seam's COMMIT POINT — past it a refusal
+        can no longer prevent the write — so a refusal raised after it would
+        leave a record that is faithfully replayed on the next ``rebuild_all``
+        — refused live, widened anyway on replay. Fail closed means fail BEFORE
+        the commit, not after.
 
         One approval-set read per CALL (not per kind property): the read is a
         whole-graph scan (``graph_installed_namespaces``' own COST note), and a
