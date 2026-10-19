@@ -18,6 +18,12 @@ a pass (#9110 reviews).
 
 Printing is not enough on its own: every finding below fails the run, because a
 log that omits its denominator is exactly the artifact this epic exists to refuse.
+That includes OMITTING IT ENTIRELY: the disclosure set is REQUIRED (four arms by
+name, the mint-skip transform, one value-literal line per arm, the per-class
+coverage table and the discriminating control), so a log with those lines DELETED
+is a finding rather than a smaller measurement — every other rule reconciles only
+the lines it is given, and an absent line reconciled against nothing used to pass
+(#9110 review P2, measured as three separate deletions).
 
 Usage:
     python tools/e1_e2_census_check.py docs/evidence/7949-capstone/e1-e2.log
@@ -26,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import sys
@@ -40,6 +47,18 @@ DROP_POINT_LINE = re.compile(
 FUSED_LINE = re.compile(r"^e2-atomic fused content=.* cause=(?P<cause>\S+)$")
 CRITERIA = ("e1", "e1-control", "e2-state", "e2-atomic before=")
 VERDICTS = {"PASS", "FAIL", "UNPREREGISTERED"}
+
+#: The arms the measurement is DEFINED by, and which must therefore be PRESENT.
+#: Requiring them is the difference between "reconcile whatever lines are here"
+#: and "a disclosure cannot be deleted": before this list existed the whole
+#: counterfactual set — both arms, the mint-skip transform and the two
+#: ``counterfactual arm=`` estimates — could be deleted and the gate still exited
+#: 0, taking the 22.5 pp estimate and the arbiter arm (the bundle's central
+#: finding) with it (#9110 review P2). A renamed arm fails here on purpose: the
+#: disclosure set is part of the contract, so changing it must move this list.
+REQUIRED_ARMS = ("before", "after-vet-shipped", "after-vet-arbiter",
+                 "counterfactual-mint-skip")
+LITERALS_LINE = re.compile(r"matches=(?P<matches>\[.*\])$")
 
 
 class Log:
@@ -102,6 +121,22 @@ def check(text: str) -> tuple[list[str], dict]:
                         "the product's measurement")
     if not any(v == "no" for v in seen.values()):
         findings.append("[V2] no non-counterfactual arm is present")
+    # ── V2 (cont.): the disclosure set is REQUIRED, never conditional ─────
+    # Every rule below reconciles the lines it is GIVEN, so an ABSENT line was
+    # indistinguishable from a satisfied one. A log with its disclosures deleted
+    # is not a smaller measurement — it is the same claim with the parts that
+    # could contradict it removed (#9110 review P2, measured as M1/M2/M3).
+    for required in REQUIRED_ARMS:
+        if required not in arms:
+            findings.append(f"[V2] the log omits the required arm {required!r} — "
+                            f"an absent arm is not a pass")
+    before_arm = next((a for a in arms
+                       if seen.get(a) == "no" and a != scored), None)
+    cf_arms = [a for a in arms if seen.get(a) == "yes"]
+    if not cf_arms:
+        findings.append("[V2] the log carries no counterfactual arm — the estimate "
+                        "of what a mechanism that does not exist would buy is part "
+                        "of the measurement, not an optional extra")
 
     # ── V3 + V4: numerators, denominators, and their equality ─────────────
     shares: dict[str, float] = {}
@@ -145,8 +180,6 @@ def check(text: str) -> tuple[list[str], dict]:
     # and pass every other check, because V3 reconciled only the arm lines with
     # themselves. Within-log arithmetic on printed counts, the same class of
     # check V3 already does: it still cannot detect a wholly forged log.
-    before_arm = next((a for a in arms
-                       if seen.get(a) == "no" and a != scored), None)
     e1_kv = log.kv(log.one("e1 "))
     if before_arm is None or scored not in shares or before_arm not in shares:
         findings.append("[V3] the e1 line cannot be reconciled: the before arm "
@@ -180,6 +213,77 @@ def check(text: str) -> tuple[list[str], dict]:
                     f"arm lines' difference (before - after = "
                     f"{expected_reduction:.6f}) — the movement claimed is not "
                     f"the printed counts")
+
+    # ── V3 (cont.): the value-literal disclosure, one line per arm ────────
+    # `values=42` is a claim about a set of literals, and every arm prints the
+    # set (``metric=state_value_literals``). Requiring the line and reconciling
+    # its decoded length with the count is what makes ``E1-E2.md`` limit 5's
+    # "every match is printed, so a reader audits the literals" true of the log
+    # rather than of the code — deleting the lines used to pass (#9110 review P2).
+    for arm in arms:
+        declared = log.kv(next((ln for ln in log.find(
+            f"arm={arm} metric=state_value_points ")), None)).get("values", "")
+        lit = log.one(f"arm={arm} metric=state_value_literals ")
+        if lit is None:
+            findings.append(f"[V3] arm {arm} prints no state_value_literals line — "
+                            f"the count in values= is unauditable")
+            continue
+        m = LITERALS_LINE.search(lit)
+        try:
+            parsed = json.loads(m.group("matches")) if m else None
+        except json.JSONDecodeError:
+            parsed = None
+        if not isinstance(parsed, list) or not all(
+                isinstance(x, list) and len(x) == 2
+                and all(isinstance(y, str) for y in x) for x in parsed):
+            findings.append(f"[V3] arm {arm}: the state_value_literals line does "
+                            f"not carry a [class, literal] list")
+        elif declared.isdigit() and len(parsed) != int(declared):
+            findings.append(
+                f"[V3] arm {arm}: the value count says {declared} but the printed "
+                f"literals are {len(parsed)} — the number is not the set it counts")
+
+    # ── V4 (cont.): each counterfactual's estimate reconciles with its arm ─
+    # The `counterfactual arm=` line is the ONLY place the bundle's "what a
+    # mint-time rule would buy" figure is stated, so it is reconciled with the
+    # arm's own share the same way the `e1` line is (#9110 review P2: it could be
+    # deleted, or disagree with the counts, and nothing noticed).
+    for arm in cf_arms:
+        line = log.one(f"counterfactual arm={arm} ")
+        if line is None:
+            findings.append(f"[V4] counterfactual arm {arm} states no "
+                            f"`counterfactual arm=` estimate — the arm is present "
+                            f"but what it would buy is not")
+            continue
+        kv = log.kv(line)
+        arm_cen = next((ln for ln in log.find(f"arm={arm} metric=real_facts ")), None)
+        arm_cen_kv = log.kv(arm_cen)
+        for key in ("real_facts", "state_values"):
+            if kv.get(key, "").isdigit() and arm_cen_kv.get("count" if key == "real_facts"
+                                                           else "values", "").isdigit():
+                pass  # the two keys are not the same shape; reconciled below
+        if (before_arm in shares and arm in shares
+                and kv.get("reduction", "").replace("-", "").replace(".", "").isdigit()):
+            expected = shares[before_arm] - shares[arm]
+            if not math.isclose(float(kv["reduction"]), expected, rel_tol=0,
+                                abs_tol=5e-6):
+                findings.append(
+                    f"[V4] counterfactual arm {arm}: reduction={kv['reduction']} is "
+                    f"not the arm lines' difference ({expected:.6f}) — the estimate "
+                    f"is not the printed counts")
+        elif before_arm in shares and arm in shares:
+            findings.append(f"[V4] counterfactual arm {arm} states no readable "
+                            f"reduction")
+        facts = log.kv(next((ln for ln in log.find(
+            f"arm={arm} metric=real_facts ")), None)).get("count", "")
+        values = log.kv(next((ln for ln in log.find(
+            f"arm={arm} metric=state_value_points ")), None)).get("values", "")
+        for key, printed in (("real_facts", facts), ("state_values", values)):
+            if kv.get(key, "").isdigit() and printed.isdigit() \
+                    and int(kv[key]) != int(printed):
+                findings.append(
+                    f"[V4] counterfactual arm {arm}: {key}={kv[key]} is not the "
+                    f"arm's own {printed} — the estimate disagrees with its arm")
 
     # ── V3 (cont.) / V5-V7: EVERY criterion line reconciles with its arm lines ──
     # `e1` is reconciled above. The three sibling criteria are printed by the
@@ -243,7 +347,6 @@ def check(text: str) -> tuple[list[str], dict]:
                     f"({before_n} → {after_n})")
 
     gate_arms = [a for a in arms if seen.get(a) == "no"]
-    cf = [a for a in arms if seen.get(a) == "yes"]
     gate_shas = {pre_shas.get(a) for a in gate_arms if pre_shas.get(a)}
     if len(gate_shas) > 1:
         findings.append(f"[V4] the non-counterfactual arms do not share one "
@@ -253,9 +356,10 @@ def check(text: str) -> tuple[list[str], dict]:
         findings.append("[V4] no pre-gate population sha is recorded for the "
                         "non-counterfactual arms")
     mint = log.kv(log.one("mint_skip "))
-    if cf and not mint.get("dropped_objects"):
-        findings.append("[V4] a counterfactual arm is present but the mint-skip "
-                        "transform does not state how many objects it removed")
+    if not mint.get("dropped_objects", "").isdigit():
+        findings.append("[V4] the mint-skip transform does not state how many "
+                        "objects it removed — the counterfactual's denominator is "
+                        "unstated, which is not the same as zero")
     if mint.get("dropped_objects", "").isdigit():
         n_drop = int(mint["dropped_objects"])
         declared = sum(1 for ln in log.find("arm=") if "dropped kind=object" in ln
@@ -336,10 +440,48 @@ def check(text: str) -> tuple[list[str], dict]:
             state["undetected_classes"] = undetected
         per_class = [log.kv(ln) for ln in log.find("coverage class=")]
         declared = sum(int(kv.get("rows", "0") or 0) for kv in per_class)
-        if per_class and cov.get("rows", "").isdigit() and \
-                declared != int(cov["rows"]):
-            findings.append(f"[V8] the per-class rows sum to {declared} but the "
-                            f"coverage header says {cov['rows']}")
+        if not per_class:
+            findings.append("[V8] the coverage table has no per-class rows — the "
+                            "2-detector table is the disclosure V8 exists to "
+                            "protect, and an absent table is not an all-detected "
+                            "one")
+        else:
+            if cov.get("rows", "").isdigit() and declared != int(cov["rows"]):
+                findings.append(f"[V8] the per-class rows sum to {declared} but the "
+                                f"coverage header says {cov['rows']}")
+            missing = [kv for kv in per_class
+                       if not all(kv.get(k, "").isdigit()
+                                  for k in ("rows", "dd_positive", "value_gate"))]
+            if missing:
+                findings.append(f"[V8] {len(missing)} coverage row(s) do not state "
+                                f"rows=, dd_positive= and value_gate= — a row without "
+                                f"both detectors cannot show which one reached it")
+            else:
+                positives = sum(int(kv["dd_positive"]) for kv in per_class)
+                if cov.get("positively_classified", "").isdigit() and \
+                        positives != int(cov["positively_classified"]):
+                    findings.append(
+                        f"[V8] the per-class dd_positive column sums to {positives} "
+                        f"but the header says positively_classified="
+                        f"{cov['positively_classified']} — the two disclosures "
+                        f"disagree")
+                # ABSENT is neither EMPTY nor a pass: the undetected list and the "
+                # table are two statements about the same thing, so each must be
+                # exactly the other (#9110 review P2 — M2 deleted the table and an "
+                # undetected list could stand alone, unchecked).
+                class_names = [ln.split("class=", 1)[1].split()[0]
+                               for ln in log.find("coverage class=")]
+                detectless = sorted(
+                    cls for cls, kv in zip(class_names, per_class, strict=True)
+                    if int(kv["dd_positive"]) == 0 and int(kv["value_gate"]) == 0)
+                if "undetected_classes=" in cov_line \
+                        and sorted(state.get("undetected_classes") or []) != detectless:
+                    findings.append(
+                        f"[V8] undetected_classes="
+                        f"{','.join(sorted(state.get('undetected_classes') or []))} is "
+                        f"not what the class table shows "
+                        f"({','.join(detectless)}) — the coverage header and its "
+                        f"table disagree")
 
     # ── V9: pre-registration binding ──────────────────────────────────────
     pre = log.kv(log.one("prereg="))
@@ -424,6 +566,61 @@ def check(text: str) -> tuple[list[str], dict]:
         findings.append(
             f"[V10] the e1 line observes NO_REDUCTION with reduction="
             f"{reduction} — the observation contradicts the arithmetic beside it")
+
+    # ── V12: the discriminating control (E1-E2.md limit 6) ────────────────
+    # The bundle's central conclusion rests on an arm whose 0.0 pp is
+    # arithmetic-IDENTICAL under two different explanations: the gate cannot
+    # remove a definite description, or this corpus references every Object so
+    # Rule 2 always fires. Without the control the log cannot tell them apart, and
+    # the doc's ``⇒ by construction`` sentence was drawn from the arms alone
+    # (#9110 review P2). So the control is REQUIRED, and its numbers are
+    # reconciled like every other claim in the log.
+    ctl = log.kv(log.one("control variant=unreferenced-definite-descriptions "))
+    if not ctl:
+        findings.append("[V12] the log carries no discriminating control — the "
+                        "0.0 pp cannot then be told apart from a corpus that "
+                        "references every Object")
+        state["control"] = None
+    else:
+        for key in ("stripped_objects", "stripped_references", "objects",
+                    "the_prefix", "share", "removed"):
+            if not ctl.get(key):
+                findings.append(f"[V12] the control does not state {key}=")
+        nums = {k: ctl.get(k, "") for k in
+                ("stripped_objects", "objects", "the_prefix", "removed")}
+        if all(v.isdigit() for v in nums.values()):
+            if int(nums["stripped_objects"]) <= 0:
+                findings.append("[V12] the control strips no reference — it then "
+                                "separates nothing")
+            if int(nums["removed"]) != int(nums["stripped_objects"]):
+                findings.append(
+                    f"[V12] the control strips {nums['stripped_objects']} "
+                    f"reference(s) but removes {nums['removed']} Object(s) — the "
+                    f"discards it exists to show landing did not all land")
+            if mint.get("dropped_objects", "").isdigit() and \
+                    int(nums["stripped_objects"]) != int(mint["dropped_objects"]):
+                findings.append(
+                    f"[V12] the control strips {nums['stripped_objects']} "
+                    f"reference(s) but the mint-skip transform names "
+                    f"{mint['dropped_objects']} positively-classified Objects — "
+                    f"the two are not the same population")
+            if int(nums["objects"]) <= 0 or int(nums["the_prefix"]) > int(nums["objects"]):
+                findings.append(f"[V12] the control's object counts are impossible "
+                                f"({nums})")
+        try:
+            ctl_share = float(ctl["share"])
+            ctl_objects = int(ctl["objects"])
+            ctl_prefix = int(ctl["the_prefix"])
+        except (KeyError, ValueError):
+            findings.append("[V12] the control's share/objects/the_prefix are not "
+                            "readable numbers")
+        else:
+            if ctl_objects <= 0 or not math.isclose(
+                    ctl_share, ctl_prefix / ctl_objects, rel_tol=0, abs_tol=5e-6):
+                findings.append(
+                    f"[V12] the control's share={ctl_share} is not "
+                    f"{ctl_prefix}/{ctl_objects} — the share is not its own counts")
+        state["control"] = ctl
     state["result"] = result
     return findings, state
 

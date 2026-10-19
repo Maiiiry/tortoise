@@ -210,6 +210,12 @@ MEASURED_STATE_VALUES = 42            # value MATCHES across 34 Points (patterns
                                       # overlap by design: `62 percent` also
                                       # matches `count` for `62`)
 MEASURED_REAL_FACTS = 90              # planted must-keep units, both sides
+#: The discriminating control (``E1-E2.md`` limit 6). Same arm, same corpus, only
+#: the references of the 9 positively-classified definite descriptions stripped:
+#: the discards LAND, which is what makes the 0.0 pp a CORPUS property.
+MEASURED_CONTROL_STRIPPED = 9
+MEASURED_CONTROL_REMOVED = 9
+MEASURED_CONTROL_SHARE = 0.375        # 6 of 16 Objects remain `the <X>`
 
 
 @pytest.fixture(scope="module")
@@ -286,6 +292,52 @@ def test_atomicity_is_reported_and_split_is_named_as_the_blocker(run):
     fused = [ln for ln in run["text"].splitlines() if ln.startswith("e2-atomic fused ")]
     assert fused, "the fused Point must be listed, not merely counted"
     assert all("cause=SPLIT-not-implemented" in ln for ln in fused)
+
+
+def test_the_discriminating_control_separates_the_gate_from_the_corpus(run):
+    """#9110 review P2: is the 0.0 pp the GATE, or is it this CORPUS?
+
+    The arbiter arm's "9 discards attempted, all 9 downgraded, 0 removals" is
+    arithmetic-identical under two explanations: S2.2 cannot remove a definite
+    description, or every Object in this corpus is wired to the statement it was
+    minted from, so ``apply_vet`` Rule 2 always fires. The bundle's central
+    conclusion (and the mint-time recommendation to #7949) rests on which one, so
+    the probe measures it: strip ONLY those 9 references, keep the entities and
+    their statements, run the same arm again.
+
+    This is the control *failing* on the pre-fix probe in the only way that
+    matters — before it existed there was no measurement, and the doc asserted the
+    stronger claim from four arms that cannot distinguish the two cases.
+    """
+    line = next(ln for ln in run["text"].splitlines()
+                if ln.startswith("control variant=unreferenced-definite-descriptions "))
+    assert f"stripped_objects={MEASURED_CONTROL_STRIPPED}" in line, line
+    assert f"stripped_references={MEASURED_CONTROL_STRIPPED}" in line, line
+    assert f"removed={MEASURED_CONTROL_REMOVED}" in line, line
+    assert f"share={MEASURED_CONTROL_SHARE:.6f}" in line, line
+    assert "objects=16" in line and "the_prefix=6" in line, line
+    assert "real_facts=90" in line, (
+        "the control must still show E2 unharmed — the point is that the removals "
+        "land WITHOUT losing a fact")
+    # the contrast: the same arm on the referenced corpus removes nothing
+    assert "arm=after-vet-arbiter metric=objects total=25 " in run["text"]
+    assert "counterfactual arm=after-vet-arbiter reduction=0.000000" in run["text"]
+
+
+def test_strip_references_keeps_the_entity_and_drops_only_the_edge():
+    """The control's variable must be the REFERENCE, not the candidate list."""
+    embed = {"entities": [{"name": "the thing"}, {"name": "Maya Chen"}],
+             "events": [], "points": [
+                 {"content": "Maya Chen owns the thing",
+                  "about_entities": ["the thing", "Maya Chen"]}],
+             "operators": [], "chain_notes": [], "link_before_create": []}
+    variant, stripped = probe.strip_references(embed, {"the thing"})
+    assert stripped == 1
+    assert [e["name"] for e in variant["entities"]] == ["the thing", "Maya Chen"]
+    assert variant["points"][0]["about_entities"] == ["Maya Chen"]
+    assert variant["points"][0]["content"] == "Maya Chen owns the thing"
+    assert embed["points"][0]["about_entities"] == ["the thing", "Maya Chen"], (
+        "the control must not mutate the measured candidate set in place")
 
 
 def test_coverage_honesty_names_the_classes_with_no_detector(run):
@@ -456,19 +508,49 @@ def test_checker_accepts_a_coverage_table_with_every_class_detected(log_text):
     """#9110 review P2: an EMPTY undetected list is a PASS, an ABSENT field is not.
 
     Every class having a detector is the outcome #4894 is meant to produce; a
-    gate that rejects it has hard-coded today's coverage deficit into the bar.
+    gate that rejects it has hard-coded today's coverage deficit into the bar. The
+    scenario is the WHOLE disclosure — an empty `undetected_classes=` beside a
+    table whose every row still shows no detector is a header contradicting its own
+    table, which the next test pins as a finding.
     """
     header = next(ln for ln in log_text.splitlines()
                   if ln.startswith("coverage rows="))
     detected = re.sub(r"undetected_classes=.*$", "undetected_classes=", header)
     assert detected != header
-    findings, state = check.check(log_text.replace(header, detected))
+    every_class_detected = log_text.replace(header, detected)
+    for ln in log_text.splitlines():
+        if ln.startswith("coverage class=") and "dd_positive=0 value_gate=0" in ln:
+            every_class_detected = every_class_detected.replace(
+                ln, ln.replace("value_gate=0", "value_gate=1"))
+    findings, state = check.check(every_class_detected)
     assert findings == [], findings
     assert state["undetected_classes"] == []
     absent = re.sub(r" undetected_classes=\S*", "", header)
     assert absent != header
     findings, _ = check.check(log_text.replace(header, absent))
     assert any("[V8]" in f and "undetected_classes" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_coverage_header_contradicts_its_table(log_text):
+    """#9110 review P2 (M2): the two coverage disclosures must be each other.
+
+    Deleting the per-class table used to pass — the `per_class and …` guard made an
+    absent table behave like an all-detected one. Requiring the rows closes that,
+    and this pins the other direction: a header whose `undetected_classes=` list
+    does not match what the rows show is a finding.
+    """
+    header = next(ln for ln in log_text.splitlines()
+                  if ln.startswith("coverage rows="))
+    lied = re.sub(r"undetected_classes=.*$", "undetected_classes=branch_name", header)
+    assert lied != header
+    findings, _ = check.check(log_text.replace(header, lied))
+    assert any("[V8]" in f and "disagree" in f for f in findings), findings
+    # ... and the per-class column must sum to the header's positively_classified
+    row = next(ln for ln in log_text.splitlines()
+               if ln.startswith("coverage class=definite_description "))
+    findings, _ = check.check(
+        log_text.replace(row, row.replace("dd_positive=9", "dd_positive=7")))
+    assert any("[V8]" in f and "dd_positive" in f for f in findings), findings
 
 
 def test_checker_fails_when_an_unpreregistered_log_carries_a_scored_verdict(
@@ -575,6 +657,118 @@ def test_checker_requires_green_when_asked(log_text, tmp_path):
     path.write_text(log_text, encoding="utf-8")
     assert check.main([str(path)]) == 0
     assert check.main([str(path), "--require-green"]) == 1
+
+
+# ── 4b. the gate cannot pass by OMISSION (#9110 review P2) ────────────────
+#
+# Every rule above reconciles the lines it is GIVEN, so all three of these
+# deletions used to pass with ZERO findings and exit 0 — the log could drop the
+# counterfactual set (the 22.5 pp estimate and the arbiter arm that carries this
+# bundle's central finding), the whole per-class coverage table, or every
+# value-literal line, and still be called structurally sound. "Absent" is not
+# "empty" and it is not a pass: the same treatment V7 gives
+# `split-implemented=no` now applies to the rest of the disclosure set.
+
+
+def test_checker_fails_when_every_counterfactual_arm_is_deleted(log_text):
+    """M1: both counterfactual arms, the mint-skip transform and its estimates."""
+    mutated = "\n".join(
+        ln for ln in log_text.splitlines()
+        if not (ln.startswith("arm=after-vet-arbiter ")
+                or ln.startswith("arm=counterfactual-mint-skip ")
+                or ln.startswith("mint_skip ")
+                or ln.startswith("counterfactual arm=")))
+    assert "arm=after-vet-arbiter counterfactual=" not in mutated
+    assert "mint_skip " not in mutated
+    findings, _ = check.check(mutated)
+    assert any("[V2]" in f and "after-vet-arbiter" in f for f in findings), findings
+    assert any("[V2]" in f and "counterfactual-mint-skip" in f
+               for f in findings), findings
+    assert any("[V2]" in f and "no counterfactual arm" in f for f in findings), findings
+    assert any("[V4]" in f and "mint-skip" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_counterfactual_estimates_are_deleted(log_text):
+    """The `counterfactual arm=` lines are the only place the estimates appear."""
+    mutated = "\n".join(ln for ln in log_text.splitlines()
+                        if not ln.startswith("counterfactual arm="))
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V4]" in f and "states no `counterfactual arm=`" in f
+               for f in findings), findings
+
+
+def test_checker_fails_when_a_counterfactual_estimate_disagrees_with_its_arm(
+        log_text):
+    """The 22.5 pp estimate is reconciled with the arm that produced it."""
+    original = ("counterfactual arm=counterfactual-mint-skip reduction=0.225000 "
+                "real_facts=90 state_values=42")
+    assert original in log_text
+    mutated = log_text.replace(
+        original,
+        "counterfactual arm=counterfactual-mint-skip reduction=0.300000 "
+        "real_facts=90 state_values=42")
+    findings, _ = check.check(mutated)
+    assert any("[V4]" in f and "difference" in f for f in findings), findings
+    lied = log_text.replace(
+        original,
+        "counterfactual arm=counterfactual-mint-skip reduction=0.225000 "
+        "real_facts=89 state_values=42")
+    findings, _ = check.check(lied)
+    assert any("[V4]" in f and "real_facts" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_per_class_coverage_table_is_deleted(log_text):
+    """M2: the 2-detector table is the disclosure V8 exists to protect."""
+    mutated = "\n".join(ln for ln in log_text.splitlines()
+                        if not ln.startswith("coverage class="))
+    assert "coverage class=" not in mutated
+    assert "coverage rows=" in mutated
+    findings, _ = check.check(mutated)
+    assert any("[V8]" in f and "no per-class rows" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_value_literal_lines_are_deleted(log_text):
+    """M3: `values=42` is unauditable without the matches it counts."""
+    mutated = "\n".join(ln for ln in log_text.splitlines()
+                        if " metric=state_value_literals " not in ln)
+    assert "metric=state_value_literals" not in mutated
+    findings, _ = check.check(mutated)
+    assert any("[V3]" in f and "unauditable" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_value_count_is_not_the_printed_set(log_text):
+    """The one number E2 is read from must equal the literals printed beside it."""
+    mutated = log_text.replace(
+        "arm=before metric=state_value_points points=34 values=42",
+        "arm=before metric=state_value_points points=34 values=7")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V3]" in f and "not the set it counts" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_discriminating_control_is_deleted(log_text):
+    """#9110 review P2: without the control the 0.0 pp has two explanations."""
+    mutated = "\n".join(ln for ln in log_text.splitlines()
+                        if not ln.startswith("control variant="))
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V12]" in f and "discriminating control" in f
+               for f in findings), findings
+
+
+def test_checker_fails_when_the_control_did_not_remove_what_it_stripped(log_text):
+    """The control's claim is *the discards LAND*; a partial landing is not it."""
+    line = next(ln for ln in log_text.splitlines()
+                if ln.startswith("control variant="))
+    mutated = log_text.replace(line, line.replace("removed=9", "removed=0"))
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V12]" in f and "removes 0 Object" in f for f in findings), findings
+    stripped_nothing = log_text.replace(line, line.replace(
+        "stripped_objects=9", "stripped_objects=0"))
+    findings, _ = check.check(stripped_nothing)
+    assert any("[V12]" in f for f in findings), findings
 
 
 # ── 5. the pre-registration binding ───────────────────────────────────────

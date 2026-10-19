@@ -42,6 +42,16 @@ product. The two counterfactual arms are reported as **estimates of what a
 mechanism that does not exist would buy** — never as green. ``tools
 /e1_e2_census_check.py`` fails if a counterfactual arm is ever the scored one.
 
+⚠️ **The four arms cannot tell a GATE property from a CORPUS property, so the run
+also measures the difference** (``discriminating_control``, printed as
+``control variant=unreferenced-definite-descriptions``). Every audited Object in
+the corpus is wired to the statement it was minted from, so ``apply_vet`` Rule 2
+downgrades every discard and the arbiter arm reads 0.0 pp — arithmetic that is
+identical whether "S2.2 cannot remove a definite description" or "this corpus
+references every Object". The control strips only those references and re-runs the
+arm: the discards then LAND (9 of 9), which is what makes the 0.0 pp a statement
+about a fully-referenced population rather than about S2.2. ``E1-E2.md`` limit 6.
+
 ⚠️ **The extractor is held constant on purpose.** The candidate set is
 ``docs/evidence/7949-capstone/corpus/e1e2_corpus.json``, produced by a scripted
 model so the pipeline runs with no network and no provider key. That is not a
@@ -208,6 +218,73 @@ def mint_skip_transform(embed_list: dict) -> tuple[dict, dict]:
         "dropped_objects": dropped,
         "stripped_references": stripped,
         "statements_left_unreferenced": would_drop_statements,
+    }
+
+
+def strip_references(embed_list: dict, names: set[str]) -> tuple[dict, int]:
+    """The same candidate set with `names` no longer referenced by any statement.
+
+    The ENTITY stays and so does the statement that named it — only the
+    ``about_entities`` edge goes. That is what a corpus looks like in which the
+    Object was never wired to the statement it came from, and it is the single
+    variable that separates *"the gate cannot remove a definite description"*
+    from *"this corpus makes every removal a downgrade"* (``E1-E2.md`` limit 6).
+    """
+    gone = set(names)
+    variant = json.loads(json.dumps(embed_list))
+    stripped = 0
+    for p in variant["points"]:
+        refs = [str(n) for n in (p.get("about_entities") or [])]
+        kept = [n for n in refs if n not in gone]
+        stripped += len(refs) - len(kept)
+        p["about_entities"] = kept
+    return variant, stripped
+
+
+def discriminating_control(corpus: dict, embed_list: dict, names: list[str],
+                           arbiter_census: dict) -> dict:
+    """Is E1 unreachable because of the GATE, or because of the CORPUS?
+
+    Every audited Object in ``e1e2_corpus.json`` is wired to the statement it was
+    minted from (``build_e1e2_corpus.py``: ``about: [name]`` on all 25 rows, a
+    corpus-CONSTRUCTION decision — the source attests a reference on 15 of them).
+    ``apply_vet`` Rule 2 therefore downgrades every discard, and the arbiter arm
+    reads 0.0 pp — arithmetic that is IDENTICAL under two very different
+    explanations:
+
+    * the gate cannot remove a definite description at S2.2 (a gate property), or
+    * this corpus references every Object, so Rule 2 always fires (a corpus
+      property).
+
+    The four arms cannot tell them apart, and the bundle's ``⇒ by construction``
+    sentence was drawn from them alone (#9110 review P2). So: take exactly the
+    Objects the arbiter arm tries to discard, strip ONLY their references, and run
+    the same arm again.
+
+    * the discards now LAND ⇒ the 0.0 pp is a CORPUS property, and the gate does
+      reach a definite description when nothing defends it;
+    * they are still kept ⇒ the 0.0 pp is a GATE property, and E1 would be
+      unreachable at S2.2 as a rule.
+
+    Reporting WHICH one it is — instead of asserting the stronger claim — is the
+    difference between a measurement and a plausible story.
+    """
+    names = sorted({str(o) for o in names})
+    variant, stripped = strip_references(embed_list, set(names))
+    res = run_arm(variant, vet=True, arbiter=definite_description_arbiter)
+    cen = census(res, corpus)
+    removed = [n for n in arbiter_census.get("objects") or []
+               if n not in cen["objects"]]
+    return {
+        "objects": cen["objects_total"],
+        "the_prefix": cen["objects_the_prefix"],
+        "share": cen["share"],
+        "real_facts": cen["real_facts"],
+        "stripped_objects": len(names),
+        "stripped_references": stripped,
+        "removed": len(removed),
+        "removed_names": removed,
+        "warnings": list(res["warnings"]),
     }
 
 
@@ -735,6 +812,26 @@ def _run(argv: list[str] | None = None) -> int:
                      f"real_facts={c['real_facts']} "
                      f"state_values={c['state_value_count']} "
                      f"note=NOT SCORED (mechanism absent from production)")
+
+    # ── the discriminating control (E1-E2.md limit 6) ─────────────────────
+    # The four arms make the 0.0 pp on the shipped/arbiter arms indistinguishable
+    # from "every Object in this corpus is referenced, so Rule 2 always fires".
+    # Strip only the references of the Objects the arbiter tries to discard and
+    # run that arm again: if the discards now LAND, the 0.0 pp is a CORPUS
+    # property, not a gate property (#9110 review P2). Printed rather than only
+    # asserted in prose, so the structural gate checks it like every other claim.
+    ctl = discriminating_control(corpus, embed, mint_meta["dropped_objects"],
+                                 results["after-vet-arbiter"]["census"])
+    lines.append(
+        f"control variant=unreferenced-definite-descriptions "
+        f"arm=after-vet-arbiter stripped_objects={ctl['stripped_objects']} "
+        f"stripped_references={ctl['stripped_references']} "
+        f"objects={ctl['objects']} the_prefix={ctl['the_prefix']} "
+        f"share={_fmt(ctl['share'])} real_facts={ctl['real_facts']} "
+        f"removed={ctl['removed']} "
+        f"note=the same Objects the referenced corpus keeps are REMOVED when "
+        f"nothing references them, so the 0.0 pp is a corpus property (every "
+        f"Object wired to its statement), not a property of S2.2")
 
     # SCORED means a bar was READ, not merely that an artifact existed. Keying
     # this on `prereg is not None` (the pre-fix shape) let a malformed artifact
