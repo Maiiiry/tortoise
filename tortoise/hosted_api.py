@@ -28994,6 +28994,14 @@ def _reset_registry_probe_sdk() -> None:
     with _KEEPALIVE_LOCK:
         sdk, _REGISTRY_PROBE_SDK = _REGISTRY_PROBE_SDK, None
         _REGISTRY_PROBE_URI = None
+        if os.environ.get("TX9247DBG"):
+            import sys as _s
+            try:
+                _g = sdk._get_proj().graph_name
+            except Exception as _e:
+                _g = f"<{_e}>"
+            print(f"#9247DBG RESET pid={os.getpid()} graph={_g}",
+                  file=_s.stderr, flush=True)
     try:  # noqa: SIM105
         sdk.close()
     except Exception:
@@ -29013,6 +29021,15 @@ def _registry_probe_sdk() -> TortoiseSDK:
     uri = os.environ.get("TORTOISE_DB_URI")
     cached = _REGISTRY_PROBE_SDK
     cached_uri = _REGISTRY_PROBE_URI
+    if os.environ.get("TX9247DBG"):
+        import sys as _s
+        try:
+            _cg = None if cached is None else cached._get_proj().graph_name
+        except Exception as _e:
+            _cg = f"<{_e}>"
+        print(f"#9247DBG ENTRY pid={os.getpid()} cached={_cg} "
+              f"dbpath={os.environ.get('TORTOISE_DB_PATH')}",
+              file=_s.stderr, flush=True)
     if cached is not None and cached_uri == uri:
         return cached
     with _KEEPALIVE_LOCK:
@@ -29042,6 +29059,15 @@ def _registry_probe_sdk() -> TortoiseSDK:
             raise
         _REGISTRY_PROBE_SDK = sdk
         _REGISTRY_PROBE_URI = uri
+        if os.environ.get("TX9247DBG"):
+            import sys as _s
+            try:
+                _g = sdk._get_proj().graph_name
+            except Exception as _e:
+                _g = f"<{_e}>"
+            print(f"#9247DBG BUILD pid={os.getpid()} graph={_g} "
+                  f"dbpath={os.environ.get('TORTOISE_DB_PATH')}",
+                  file=_s.stderr, flush=True)
         return sdk
 
 

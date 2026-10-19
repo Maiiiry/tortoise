@@ -35,6 +35,35 @@ def _close_keepalive_anchors(module) -> None:
                 pass
 
 
+def _drop_cached_registry_probe(module) -> None:
+    """Drop the hosted API's cached registry probe (#9247).
+
+    It is the SECOND process-global SDK handle this fixture has to reap, and it
+    leaks state the keepalive anchors do not: ``_registry_probe_sdk`` caches a
+    handle keyed on ``TORTOISE_DB_URI`` **string**, and the #1647 URI-aware
+    redirect maps that one string onto a PER-TEST server graph. An un-cached
+    build is correct; a handle built under a DIFFERENT test's patch is not —
+    every read through ``_registry_anchor()`` (``_membership_role``,
+    ``_org_node``) then answers from the other test's graph.
+
+    And it does get built out of band: ``_sweep_events`` →
+    ``_registry_existing_graphs()`` → ``_registry_probe_sdk()`` runs on the
+    monitoring pool thread, so a build can land after a test's teardown reset
+    and be served to the NEXT test (measured: 403 "Requires owner or admin role
+    in team" from a mint whose caller was an owner, and an org missing from
+    ``GET /v1/organizations`` right after it was created — the two #9221
+    nodeids that reddened ``test (a)``).
+
+    Same class as the anchor reap above, so same site: the handle is poisoned BY
+    the patching mechanism, so the helper that installs the patch is where it is
+    dropped — before the test can take a target of its own, and again after.
+    """
+    try:  # noqa: SIM105
+        module._reset_registry_probe_sdk()
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def patched_tortoise_sdk(db_path: str) -> Iterator[None]:
     """Run one test's hosted-API SDK constructions against a temp embedded DB.
@@ -56,6 +85,12 @@ def patched_tortoise_sdk(db_path: str) -> Iterator[None]:
       every registry access (each eviction shut the redislite daemon down
       mid-test, losing the seed between a fixture's write and the gate read
       → #2090 403).
+    - drop the hosted API's cached registry PROBE (#9247). It is keyed on the
+      ``TORTOISE_DB_URI`` STRING while this patch rebinds what that string
+      addresses, so a handle built before the patch — including one the
+      monitoring pool's ``_sweep_events`` built *between* tests — would be
+      served for the whole test and every ``_registry_anchor()`` read would
+      answer from another test's graph. See `_drop_cached_registry_probe`.
 
     Exit (exception-safe):
     - restore the pin if it was set at enter (else pop it) FIRST, restore
@@ -96,6 +131,11 @@ def patched_tortoise_sdk(db_path: str) -> Iterator[None]:
 
     ha_mod.TortoiseSDK.__init__ = _patched_init
     _close_keepalive_anchors(ha_mod)
+    # #9247: an out-of-band build (the ``_sweep_events`` pool thread) can have
+    # repopulated the probe cache AFTER the previous test's reset, with THAT
+    # test's target. Drop it now that the patch is installed, so anything built
+    # from here on is bound to ``db_path``.
+    _drop_cached_registry_probe(ha_mod)
     # clear() kept for parity with the #1497/#1950 precedents (a no-op after
     # the deterministic close above).
     ha_mod._FALLBACK_KEEPALIVE.clear()
@@ -115,6 +155,10 @@ def patched_tortoise_sdk(db_path: str) -> Iterator[None]:
             os.environ["TORTOISE_DB_PATH"] = _prev_db_path
         ha_mod.TortoiseSDK.__init__ = _orig_init
         _close_keepalive_anchors(ha_mod)
+        # #9247: and drop the probe this test built from ``db_path`` — the next
+        # test gets its own target, and the cache is keyed on the uri STRING
+        # (which does not change between tests).
+        _drop_cached_registry_probe(ha_mod)
         ha_mod.app.dependency_overrides.clear()
 
 

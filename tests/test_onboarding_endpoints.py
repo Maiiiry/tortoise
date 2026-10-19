@@ -693,6 +693,30 @@ class TestOnboardingTeam:
         app.dependency_overrides[get_current_user] = lambda: {
             "user_id": "user-1", "email": "user-1@example.com"}
         r4 = client.get("/v1/organizations")
+        import sys as _s
+        import hashlib as _hl
+        _o = _hl.sha1
+        _log = []
+
+        def _spy(d=b"", *a, **k):
+            if b"registry_tortoise" in d or b"tortoise" == d[-8:]:
+                _log.append(repr(d)[:300])
+            return _o(d, *a, **k)
+        _hl.sha1 = _spy
+        try:
+            _dbg = _make_sdk(namespace="registry")
+            _dbg._get_proj()
+            _anc = __import__('tortoise.hosted_api', fromlist=['x'])._registry_anchor()
+            _anc._get_proj()
+        finally:
+            _hl.sha1 = _o
+        print("#9247SPY " + " | ".join(_log[-6:]), file=_s.stderr, flush=True)
+        print(f"#9247R4 sub={sub_org_id} body={r4.json()} "
+              f"fresh_graph={_dbg._get_proj().graph_name} "
+              f"anchor_graph={__import__('tortoise.hosted_api', fromlist=['x'])._registry_anchor()._get_proj().graph_name} "
+              f"teams={_dbg._get_registry().query('MATCH (t:Team) RETURN t.id').result_set} "
+              f"mem={_dbg._get_registry().query('MATCH (m:Membership) RETURN m.user_id, m.org_id').result_set}",
+              file=_s.stderr, flush=True)
         assert r4.status_code == 200, r4.text
         assert any(t["org_id"] == sub_org_id for t in r4.json())
         # deletable by the owner (DELETE /v1/organizations/{id})

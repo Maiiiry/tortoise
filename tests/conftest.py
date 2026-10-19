@@ -1575,8 +1575,24 @@ from tests._verdict import (  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _process_global_isolation(monkeypatch):
-    """#5049 rule 4: reset declared process globals + ambient env per test."""
+    """#5049 rule 4: reset declared process globals + ambient env per test.
+
+    #9247: the reset is SYMMETRIC — it runs on the way IN as well as out. It was
+    teardown-only, and one of the declared globals (`hosted_api`'s cached
+    registry probe) is repopulated OUT OF BAND: `_sweep_events` calls
+    `_registry_existing_graphs()` → `_registry_probe_sdk()` on the monitoring
+    pool thread (boot, once per `TestClient` lifespan), so a build could land
+    after the previous test's teardown reset carrying THAT test's redirect
+    target, and be served to the next test — whose reads through
+    `_registry_anchor()` (`_membership_role`, `_org_node`) then answered from
+    the wrong graph. Measured as two 403-shaped reds on `test (a)`: a mint that
+    403'd "Requires owner or admin role in team" for an owner while the lock
+    was held (#9221's nodeid), and an org missing from `GET /v1/organizations`
+    immediately after it was created. A leading reset makes the boundary hold
+    regardless of who repopulated the cache in between.
+    """
     reset_process_globals()
+    _reset_hosted_registry_probe()
     for var in AMBIENT_ENV_GLOBALS:
         monkeypatch.delenv(var, raising=False)
     yield
@@ -1592,6 +1608,12 @@ def _reset_hosted_registry_probe() -> None:
     would inherit a handle an earlier test built — the #5049 order-dependence
     class. Lazy `sys.modules` lookup: a test that never imported `hosted_api`
     pays one dict read, not an import.
+
+    #9247: this runs at BOTH ends of every test (see `_process_global_isolation`).
+    The cache is keyed on the `TORTOISE_DB_URI` STRING while the #1647 test
+    redirect maps that one string onto a PER-TEST server graph, so a handle
+    built under another test's target answers every later read from the wrong
+    graph — and the monitoring pool's `_sweep_events` builds one out of band.
     """
     module = sys.modules.get("tortoise.hosted_api")
     if module is None:

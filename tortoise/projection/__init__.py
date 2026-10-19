@@ -7697,6 +7697,11 @@ class FalkorProjection(
                               + hashlib.sha1(
                                   (_sess + path + graph_name).encode()
                               ).hexdigest()[:12])
+                    if os.environ.get("TX9247DBG"):
+                        import sys as _s9247
+                        print(f"#9247REDIR pid={os.getpid()} sess={_sess} "
+                              f"path={path} graph_name={graph_name!r} "
+                              f"-> {_graph}", file=_s9247.stderr, flush=True)
                 path = None  # fall through to the host-mode branch below
                 graph_name = _graph
                 # Cycle-8 P2-5: append the mint to the product-side session
