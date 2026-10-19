@@ -7,11 +7,13 @@ default, and the skill (J8) must carry the operational markers.
 
 Canonical key enumeration (plan §5.5/E2E-6.2, INGEST_CONTRACT §2.2/§3.2):
   top-level  = {granularity, batch_id, created, deduped, ids, nudges,
-                warnings}  (+ results for granularity="granular")
+                warnings, coverage}  (+ results for granularity="granular")
   created/deduped = {points, entities, sources, connections}
   ids        = {points, entities, sources, connections, refs}
   failure    = {error, code, violations}  (never a results key)
   warnings   = the TWELVE-key closed set (§3.2 table)
+  coverage   = {embedding, ep:{points, operators}}  (§3.3 — #8530 write-side
+               declaration: measured post-write, never inferred)
 
 Skill markers (J8 — the how-to-use-tortoise skill section is #1057's
 deliverable; the skill file lives in the agent-infra repo and is mirrored
@@ -36,9 +38,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # ── canonical enumeration anchors (INGEST_CONTRACT §2.2/§2.3/§3.2) ────
 TOP_LEVEL = {"granularity", "batch_id", "created", "deduped", "ids",
-             "nudges", "warnings"}
+             "nudges", "warnings", "coverage"}
 SECTION_COUNTS = {"points", "entities", "sources", "connections"}
 IDS_KEYS = {"points", "entities", "sources", "connections", "refs"}
+#: #8530 — the write-coverage report's canonical shape (§3.3). Pinned so a
+#: field cannot appear or vanish without the doc moving with it.
+COVERAGE_KEYS = {"embedding", "ep"}
+COVERAGE_EMBEDDING_KEYS = {"points", "embedded", "missing", "degraded",
+                           "reason"}
+COVERAGE_EP_KEYS = {"points", "operators"}
+COVERAGE_EP_POINT_KEYS = {"written", "live", "not_live", "not_live_ids",
+                          "ids_truncated"}
+#: `unmet`/`participating`/`inert` are ALWAYS present (null when
+#: `assessed` is false) — a claimed 0 is not a substitute for an assessment
+#: that did not run.
+COVERAGE_EP_OPERATOR_KEYS = {"written", "assessed", "participating", "inert",
+                             "unmet", "inert_operators", "ids_truncated"}
 WARNING_KEYS = {
     "append_only_items", "modified_item_residue", "mitigation_orphan_residue",
     "mitigation_drift_duplicate", "nfc_straddle_duplicate",
@@ -102,6 +117,14 @@ def test_sdk_success_response_key_set_equal(sdk):
         assert res["granularity"] == granularity
         assert len(res["batch_id"]) == 26
         assert isinstance(res["warnings"], list)
+        # #8530: the write-coverage declaration rides every success response.
+        assert set(res["coverage"].keys()) == COVERAGE_KEYS
+        assert set(res["coverage"]["embedding"].keys()) >= COVERAGE_EMBEDDING_KEYS
+        assert set(res["coverage"]["ep"].keys()) == COVERAGE_EP_KEYS
+        assert (set(res["coverage"]["ep"]["points"].keys())
+                == COVERAGE_EP_POINT_KEYS)
+        assert (set(res["coverage"]["ep"]["operators"].keys())
+                == COVERAGE_EP_OPERATOR_KEYS)
         # E2E-6.2 closed-set enforcement: every emitted warning's key-prefix
         # is in the TWELVE-key enumeration (a key outside it is a divergence)
         for w in res["warnings"]:
@@ -127,6 +150,7 @@ def test_mcp_success_response_key_set_equal(sdk, monkeypatch):
         assert set(res["created"].keys()) == SECTION_COUNTS
         assert set(res["deduped"].keys()) == SECTION_COUNTS
         assert set(res["ids"].keys()) == IDS_KEYS
+        assert set(res["coverage"].keys()) == COVERAGE_KEYS
     finally:
         _transport_mode.set(None)
         _current_org_id.set(None)
@@ -205,6 +229,12 @@ def test_doc_carries_canonical_enumeration_anchors():
     for key in sorted(WARNING_KEYS):
         assert f"`{key}`" in doc or key in doc, \
             f"§3.2 warnings table missing key {key!r}"
+    # #8530 — §3.3 must carry its fields, or the write-side declaration has no
+    # documented contract to conform to (the §3.2 anchor rule, same shape).
+    for key in (sorted(COVERAGE_KEYS) + sorted(COVERAGE_EMBEDDING_KEYS)
+                + sorted(COVERAGE_EP_POINT_KEYS)
+                + sorted(COVERAGE_EP_OPERATOR_KEYS)):
+        assert key in doc, f"§3.3 write-coverage section missing {key!r}"
     # failure-half conformance: the doc carries the {error, code, violations}
     # failure example (plan A12(a) requires success + failure examples)
     assert "{error, code" in doc, "§5 failure example missing {error, code..."

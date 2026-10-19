@@ -347,6 +347,12 @@ SUPERSEDE_STRUCTURAL_RELS = (
 INGEST_GRANULARITIES = ("bulk", "granular")
 INGEST_PROMOTION_POLICIES = ("gated", "auto")
 
+#: #8530 — how many offending ids the write-coverage report NAMES per list.
+#: The COUNTS are always exact; a list past this cap is truncated and SAYS SO
+#: (``ids_truncated``), so a 5,000-point bundle cannot turn its own success
+#: response into megabytes of ids while still reporting the honest total.
+_INGEST_COVERAGE_ID_CAP = 100
+
 
 # ── Session LLM extraction (epic #909 M2 — issue #822) ─────────────────────
 # The deterministic regex extraction loop is REMOVED as a product path: LLM
@@ -16940,9 +16946,30 @@ class TortoiseSDK:
 
         Returns {granularity, batch_id, created: {points, entities, sources,
         connections}, deduped: {...}, ids: {points, entities, sources,
-        connections, refs}, nudges: [...], warnings: [...]} (+ results for
+        connections, refs}, nudges: [...], warnings: [...],
+        coverage: {embedding: {...}, ep: {points: {...}, operators: {...}}}} (+ results for
         granularity='granular'). The key set is the canonical enumeration
         (INGEST_CONTRACT §2.2 — a docs/behavior conformance test pins it).
+
+        #8530 — `coverage` reports what the write ACTUALLY produced, measured
+        post-write, because `created` alone cannot distinguish a complete graph
+        from a degraded one: `created.points` counts an unembedded Point
+        identically to an embedded one (semantic search will never return the
+        former), and `created.connections` counts an operator that EP will drop
+        as degenerate identically to one that participates (§11.1, #780/#2422).
+        `coverage.embedding` gives {points, embedded, missing, reason} — the
+        write-side declaration #2952 requires on the READ side — plus the
+        embedder's own state when it is degraded; `coverage.ep` gives the
+        liveness of the Points it wrote (with the non-live ids) and the
+        participation of every operator it wrote, from EP's own selector. It
+        carries the verdict too: `embedding.degraded` when a written Point holds
+        no vector, and `ep.operators.unmet` when a
+        `promotion_policy='auto'` write leaves operators unable to participate
+        (under `gated` that state is the contracted one, so it is reported but
+        not called unmet). It is a STRUCTURED MARKER, not a §3.2 warning, by the
+        read side's own precedent (#2952's `vector_leg_unavailable`) — and the
+        §3.2 warning set is closed and pinned against the served skill mirror,
+        which a code PR cannot re-sync.
         """
         if granularity not in INGEST_GRANULARITIES:
             raise ValueError(
@@ -17590,6 +17617,16 @@ class TortoiseSDK:
             except Exception:
                 pass  # nudges are advisory — never fail the ingest
 
+        # ── #8530 write coverage — what the graph ACTUALLY got ─────────
+        # Measured after the last write, before the response is built: the
+        # embedding half is one read over the ids this call addressed, the EP
+        # half reuses EP's own selector. Both facts were already held by the
+        # writer and neither used to reach the caller (#8530) — so this runs
+        # unconditionally, and both warning entries it may append land in the
+        # same `warnings` list this response carries.
+        coverage = self._ingest_coverage(
+            ids["points"], ids["connections"], promotion_policy)
+
         out = {
             "granularity": granularity,
             "batch_id": batch_id,
@@ -17598,6 +17635,7 @@ class TortoiseSDK:
             "ids": ids,
             "nudges": nudges,
             "warnings": warnings,
+            "coverage": coverage,
         }
         if results is not None:
             out["results"] = results
@@ -18262,6 +18300,213 @@ class TortoiseSDK:
             "SET s.status = 'live', s.updatedAt = $now",
             params={"id": op_id, "now": _now_iso()},
         )
+
+    # ── write coverage (#8530) — the WRITE-side twin of #2952 ─────────
+
+    def _ingest_coverage(self, point_ids: list[str],
+                         connection_ids: list, promotion_policy: str) -> dict:
+        """#8530 — report what the write ACTUALLY produced, measured post-write.
+
+        The write response used to report creation and nothing else, so two
+        lossy outcomes were indistinguishable from a clean success (#8530,
+        both hit in one 49-point / 68-connection re-file):
+
+        1. **Unembedded points.** With the embedder degraded (`sentence-
+           transformers` unavailable, a load timeout, a width drop) every Point
+           is written with ``embedding IS NULL`` — semantic search will never
+           return it — and ``created.points`` said 49 either way. The writer
+           already HELD the fact (`_note_embed_skip`, ``EmbeddingModel.status``);
+           it just never said it.
+        2. **EP-absent relations.** ``created.connections`` counts a relation as
+           written even when the operator behind it cannot participate in belief
+           propagation — EP's selector drops an operator whose live inputs fall
+           below 2 (#780/#2422), which is exactly what a still-``draft``
+           connection endpoint produces under ``promotion_policy='auto'``. The
+           only way to see it was a downstream EP diagnostic nobody reads
+           (``skipped_factors``, #6105).
+
+        Both are MEASURED here, never inferred:
+
+        * the embedding half is one ``MATCH`` over the ids this call wrote —
+          the same measurement the #8530 report made by hand
+          (``missing embeddings: 49 of 49``), so a caller can never be told
+          "degraded" when the store is not, or the reverse;
+        * the EP half reuses EP's OWN selector
+          (:meth:`TortoiseEP._affected_factors`, the ``#780``/``#2422``
+          predicate and the ``#992`` skip records), so this report cannot
+          drift from what a later ``compute_confidence`` will actually do —
+          re-spelling the liveness predicate here is how two surfaces start
+          disagreeing. A written-but-DRAFT operator is classified without the
+          selector at all: §11.1 already states it is EP-inert by
+          construction.
+
+        ``promotion_policy`` gates one field only — ``ep.operators.unmet``.
+        Under ``gated`` (the default) a draft operator is the CONTRACTED state
+        (docs/INGEST_CONTRACT.md §11.1), so a still-inert operator is BY
+        DESIGN and ``unmet`` stays false; under ``auto`` the policy's whole
+        purpose is promotion, so an operator that still cannot participate is
+        a divergence and ``unmet`` is true. Both policies report the same DATA
+        (counts + ids); only the verdict differs.
+
+        ⛔ Deliberately NOT a ``warnings`` entry, though #8530 asked for one:
+        the §3.2 warning set is CLOSED and pinned against the served skill
+        mirror, whose bytes are pinned to an upstream commit
+        (``config/served-skills-upstream.yml``) this repo cannot re-sync from a
+        code PR — a new key here would red the served-skill parity gate with no
+        way to land the matching skill edit. The structured marker is also the
+        READ side's own precedent: #2952 declares a degraded read with
+        ``vector_leg_unavailable``/``degraded_read`` in the response, not with a
+        warning. Same posture, same channel.
+
+        Cost: ONE status/embedding query per write, plus — only when at least
+        one written operator is itself EP-live — one input query and the
+        selector's own batched queries. The assessment is bounded by the
+        bundle: its seeds are the ids this call wrote plus their operator
+        inputs. If the assessment itself fails it degrades to
+        ``assessed: False`` with ``participating``/``inert`` as ``None`` — never
+        to a claimed ``0`` (a fabricated zero is the #8530 failure in a new
+        place).
+
+        Returns ``{"embedding": {...}, "ep": {"points": {...},
+        "operators": {...}}}`` — see docs/INGEST_CONTRACT.md §3.3.
+        """
+        operator_ids = [c for c in connection_ids if isinstance(c, str)]
+        addressed = [p for p in point_ids if isinstance(p, str)]
+        cap = _INGEST_COVERAGE_ID_CAP
+
+        # ── ONE post-write read: status + EP liveness + vector presence for
+        # every Point this call addressed (operators are Points too, so they
+        # ride the same query). ``_live_only`` is the SHARED predicate, used
+        # here in Cypher exactly as EP uses it — not a re-spelling.
+        by_id: dict[str, dict] = {}
+        if addressed or operator_ids:
+            rows = self._get_proj().g.query(
+                "MATCH (p:Point) WHERE p.id IN $ids "
+                "RETURN p.id, p.status, (p.embedding IS NULL), "
+                f"({_live_only('p.status')})",
+                params={"ids": addressed + operator_ids},
+            ).result_set
+            for pid, status, no_vec, ep_live in rows:
+                by_id[pid] = {"status": status, "no_vec": bool(no_vec),
+                              "live": bool(ep_live)}
+
+        # ── embedding coverage ────────────────────────────────────────────
+        missing = [pid for pid in addressed
+                   if by_id.get(pid, {}).get("no_vec", True)]
+        n_points = len(addressed)
+        embedding = {"points": n_points, "embedded": n_points - len(missing),
+                     "missing": len(missing), "degraded": bool(missing),
+                     "reason": "ok"}
+        if missing:
+            from .embeddings import EmbeddingModel
+            state = EmbeddingModel.status()
+            embedding["reason"] = ("missing_embeddings"
+                                   if state.get("available") else "no_embedder")
+            embedding["embedder_state"] = state.get("state")
+            embedding["failure_kind"] = state.get("failure_kind")
+
+        # ── point liveness (EP participation of the NODES) ────────────────
+        not_live = [pid for pid in addressed
+                    if not by_id.get(pid, {}).get("live", False)]
+        ep_points = {
+            "written": n_points,
+            "live": n_points - len(not_live),
+            "not_live": len(not_live),
+            "not_live_ids": not_live[:cap],
+            "ids_truncated": len(not_live) > cap,
+        }
+
+        # ── operator participation (§11.1 + EP's own selector) ────────────
+        ops = {"written": len(operator_ids),
+               # No operator written ⇒ nothing to assess, and a 0 here is then
+               # TRUE rather than a fabricated one.
+               "assessed": not operator_ids,
+               "participating": 0 if not operator_ids else None,
+               "inert": 0 if not operator_ids else None,
+               "unmet": False,
+               "inert_operators": [], "ids_truncated": False}
+        inert: list[dict] = []
+        if operator_ids:
+            # A written operator that is NOT itself EP-live can never
+            # participate — EP's selector excludes it outright (§11.1) — so it
+            # is classified from the status read, no selector round-trip.
+            live_ops = [o for o in operator_ids
+                        if by_id.get(o, {}).get("live", False)]
+            for o in operator_ids:
+                if o not in live_ops:
+                    rec: dict = {"operator_id": o,
+                                 "reason": "operator_not_live"}
+                    st = by_id.get(o, {}).get("status")
+                    if st is not None:
+                        rec["status"] = st
+                    inert.append(rec)
+            if live_ops:
+                try:
+                    seed_rows = self._get_proj().g.query(
+                        "MATCH (o:Point)-[:IMPL|NAND]->(c) "
+                        "WHERE o.id IN $ops "
+                        f"AND {epistemic_disjunction('c')} "
+                        "RETURN DISTINCT c.id",
+                        params={"ops": live_ops},
+                    ).result_set
+                    # Seeds: what this call wrote, plus the inputs of its
+                    # operators — so an operator fed by PRE-EXISTING points is
+                    # assessed too, instead of being silently absent from the
+                    # selector's discovery (Batch 1 seeds on INPUT ids).
+                    seeds = set(addressed)
+                    seeds.update(r[0] for r in seed_rows if r and r[0])
+                    skipped: list[dict] = []
+                    factors = self._get_ep()._affected_factors(
+                        seeds, include_draft=False, skipped=skipped)
+                    participating = {f[0] for f in factors}
+                    skip_map = {s.get("operator_id"): s for s in skipped}
+                    for o in live_ops:
+                        if o in participating:
+                            continue
+                        s = skip_map.get(o)
+                        if s is not None:
+                            rec2: dict = {"operator_id": o,
+                                          "reason": s.get("reason")}
+                            if "participating_inputs" in s:
+                                rec2["participating_inputs"] = s[
+                                    "participating_inputs"]
+                            inert.append(rec2)
+                        else:
+                            # EP neither consumed nor skipped it — reported as
+                            # such rather than dressed up as one of the two.
+                            inert.append({"operator_id": o,
+                                          "reason": "not_selected"})
+                except Exception:  # noqa: BLE001, RUF100
+                    # The assessment is observational — a failure to MEASURE
+                    # must never fail the write, and must never be reported as
+                    # a measured zero.
+                    _logger.warning(
+                        "ingest write-coverage: operator participation could "
+                        "not be assessed (#8530) — reporting assessed=False",
+                        exc_info=True,
+                    )
+                    ops["assessed"] = False
+                else:
+                    inert_live = [i for i in inert
+                                  if i["operator_id"] in live_ops]
+                    ops["assessed"] = True
+                    ops["participating"] = len(live_ops) - len(inert_live)
+                    ops["inert"] = len(inert)
+                    ops["inert_operators"] = inert[:cap]
+                    ops["ids_truncated"] = len(inert) > cap
+                    ops["unmet"] = bool(inert) and promotion_policy == "auto"
+            else:
+                # No written operator is itself EP-live: the classification
+                # above is COMPLETE, not partial.
+                ops["assessed"] = True
+                ops["participating"] = 0
+                ops["inert"] = len(inert)
+                ops["inert_operators"] = inert[:cap]
+                ops["ids_truncated"] = len(inert) > cap
+                ops["unmet"] = bool(inert) and promotion_policy == "auto"
+
+        return {"embedding": embedding,
+                "ep": {"points": ep_points, "operators": ops}}
 
     def file_decision(self, options: list[str], evidence: list[str],
                       choice: int) -> dict:

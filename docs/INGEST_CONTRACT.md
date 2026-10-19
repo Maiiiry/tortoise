@@ -140,7 +140,21 @@ Rules that hold regardless of granularity or policy:
     "refs": {"pA": "01J8…", "pB": "01J8…", "src1": "…"}
   },
   "nudges": [],
-  "warnings": []
+  "warnings": [],
+  "coverage": {
+    "embedding": {"points": 2, "embedded": 2, "missing": 0,
+                  "degraded": false, "reason": "ok"},
+    "ep": {
+      "points": {"written": 2, "live": 0, "not_live": 2,
+                 "not_live_ids": ["01J8…", "01J8…"], "ids_truncated": false},
+      "operators": {"written": 1, "assessed": true, "participating": 0,
+                    "inert": 1, "unmet": false,
+                    "inert_operators": [{"operator_id": "01J8…",
+                                         "reason": "operator_not_live",
+                                         "status": "draft"}],
+                    "ids_truncated": false}
+    }
+  }
 }
 ```
 
@@ -172,6 +186,13 @@ Key points:
   ([§3.2](#32-warnings--the-twelve-keys)).
 - `nudges` is advisory, never enforced; `warnings` names divergences the
   engine noticed (see [§3.2](#32-warnings--the-twelve-keys)).
+- **`coverage`** reports what the write ACTUALLY produced, measured after the
+  last write — `created` counts, by contrast, are true and misleading (an
+  unembedded Point and an EP-inert operator both count as written). Read it
+  before treating a success as a complete graph; see
+  [§3.3](#33-write-coverage--what-the-write-actually-produced-8530). The
+  §2.2 block above is a `gated` write, whose points are draft BY CONTRACT —
+  hence `live: 0` with `unmet: false`.
 
 ### 2.3 Both granularities
 
@@ -188,6 +209,17 @@ with its primitive result and a `deduped` flag:
   "ids": {"points": ["01J8…"], "entities": [], "sources": [], "connections": [], "refs": {}},
   "nudges": [],
   "warnings": [],
+  "coverage": {
+    "embedding": {"points": 1, "embedded": 1, "missing": 0,
+                  "degraded": false, "reason": "ok"},
+    "ep": {
+      "points": {"written": 1, "live": 0, "not_live": 1,
+                 "not_live_ids": ["01J8…"], "ids_truncated": false},
+      "operators": {"written": 0, "assessed": true, "participating": 0,
+                    "inert": 0, "unmet": false, "inert_operators": [],
+                    "ids_truncated": false}
+    }
+  },
   "results": [
     {"section": "points", "index": 0, "ref": "pA", "item": {"tags": ["x"]},
      "result": {"id": "01J8…", "pointKind": "statement", "status": "draft", "content": "A implies B"},
@@ -237,6 +269,7 @@ policy):
 | `nudges` | `[]` | Advisory only, never enforced. |
 | `warnings` | `["<key>:<ids>:<detail>", …]` | Divergences the engine noticed (never fatal). Each entry is a key-prefixed string — the key is the §3.2 closed-set token, then the affected ids, then any context (colon-delimited). A warning key outside the §3.2 table is a divergence. |
 | `results` | per-item array | Granular mode only. |
+| `coverage` | `{embedding, ep}` | What the write ACTUALLY produced, measured after the last write (#8530) — see [§3.3](#33-write-coverage--what-the-write-actually-produced-8530). |
 
 `ids["connections"]` descriptor shapes:
 
@@ -278,6 +311,76 @@ enumeration** — a warning key outside this table is a divergence; report it.
 > (`mitigation_orphan_residue`, `mitigation_drift_duplicate`) describe
 > crash-orphan re-link and post-re-key drift; **no write door emits them yet** —
 > they are reserved vocabulary for those recovery flows, not observable today.
+
+---
+
+### 3.3 Write coverage — what the write ACTUALLY produced (#8530)
+
+`created` is true and can mislead. Two lossy outcomes used to be
+indistinguishable from a clean success, and both were hit in one 49-point /
+68-connection re-file (#8530):
+
+1. **Unembedded Points.** With the embedder degraded — `sentence-transformers`
+   unavailable, a load timeout, a store-width drop — every Point is written
+   with `embedding IS NULL`. Semantic search will never return those Points,
+   and `created.points: 49` reads exactly like 49 embedded ones.
+2. **EP-absent relations.** `created.connections` counts a relation as written
+   even when its operator cannot participate in belief propagation. EP drops
+   an operator whose live inputs fall below 2 ([§11.1](#111-derived-liveness),
+   #780/#2422) — which is what a still-`draft` endpoint produces under
+   `promotion_policy="auto"`. The only place that showed up was EP's own
+   `skipped_factors` diagnostic (#6105), which a caller has to already know to
+   go read.
+
+`coverage` closes both, **measured after the last write** — never inferred from
+the request:
+
+```json
+"coverage": {
+  "embedding": {"points": 49, "embedded": 0, "missing": 49,
+                "degraded": true, "reason": "no_embedder",
+                "embedder_state": "unavailable", "failure_kind": "load_timeout"},
+  "ep": {
+    "points":    {"written": 49, "live": 47, "not_live": 2,
+                  "not_live_ids": ["01J8…", "01J8…"], "ids_truncated": false},
+    "operators": {"written": 3, "assessed": true, "participating": 2,
+                  "inert": 1, "unmet": true,
+                  "inert_operators": [{"operator_id": "01J8…",
+                                       "reason": "degenerate",
+                                       "participating_inputs": 1}],
+                  "ids_truncated": false}
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `embedding.points` | Points this call addressed (`created.points` + the deduped ones). |
+| `embedding.embedded` / `missing` | How many of those carry a vector. `missing` is measured from the graph (`embedding IS NULL`), not from the write attempt. |
+| `embedding.degraded` | `missing > 0`. **Read this before treating a write as retrievable.** |
+| `embedding.reason` | `"ok"` \| `"no_embedder"` (the embedder is not loaded — `EmbeddingModel.status()`) \| `"missing_embeddings"` (the embedder is available but rows carry no vector — a width drop, an encode failure, or a dedup hit on an older unembedded row). |
+| `embedding.embedder_state`, `embedding.failure_kind` | The embedder's own declared state, present only when `missing > 0` (`ready` \| `cooldown` \| `unavailable`; `not_installed` \| `load_timeout` \| …). |
+| `ep.points.live` / `not_live` | How many of the addressed Points are EP-live, by the SHARED liveness predicate EP itself uses. `not_live_ids` names them (capped at 100 — `ids_truncated` says when). |
+| `ep.operators.written` | Every operator this call wrote (created, deduped or absorbed) — the bare-string entries of `ids["connections"]`. |
+| `ep.operators.participating` | How many of them EP's own factor selector will actually consume. |
+| `ep.operators.inert` / `inert_operators` | The rest, each with EP's own reason: `operator_not_live` (the operator itself is draft/terminal — [§11.1](#111-derived-liveness)), `degenerate` (fewer than 2 live inputs — the `#780`/`#2422` skip), `source_stripped` (a directional operator lost its idx-0 source), or `not_selected` (EP neither consumed nor skipped it — reported as itself, never dressed up). |
+| `ep.operators.unmet` | `true` when `promotion_policy="auto"` and an operator still cannot participate. Under `gated` it stays `false`: a draft operator is the CONTRACTED state, so the counts are reported but not called a failure. |
+| `ep.operators.assessed` | `false` only when the assessment itself could not run. `participating`/`inert` are then `null` — **never a claimed zero**. |
+
+How to act on it:
+
+- `embedding.degraded` → re-file once the embedder is live, or backfill with
+  `graph-scripts/backfill_embeddings.py`. A keyword-only graph is the
+  #2952 failure on the WRITE side: not hybrid retrieval, and now declared.
+- `ep.operators.unmet` → promote the ids in `ep.points.not_live_ids`
+  (`tortoise_update_point(id, props={"status":"live"})`); the operators join
+  on the next EP run. Then re-read `list_batch(batch_id)` / run EP and confirm
+  `skipped_factors` is empty.
+
+> **Why a structured marker and not a §3.2 warning.** The warning key set is
+> closed (§3.2) and the READ side declares its own degradation the same way —
+> #2952's `vector_leg_unavailable` / `degraded_read` markers — rather than by
+> warning. `coverage` is the write-side twin of that declaration.
 
 ---
 
@@ -560,6 +663,13 @@ tools). "Promote a second endpoint and the operator activates" is the
 is the second required conjunct. Promote a second endpoint and the operator activates; until then it
 cannot propagate belief. This is the derived-liveness rule (A9's selector
 predicate for operator nodes).
+
+> **#8530 — this state is now REPORTED by the write.** `ingest` measures every
+> operator it wrote against this exact rule and returns the verdict in
+> `coverage.ep.operators` — `participating` / `inert`, each inert operator's
+> reason, and `unmet: true` when a `promotion_policy="auto"` write leaves one
+> unable to participate. You no longer have to discover it from a later EP
+> `skipped_factors` diagnostic. See [§3.3](#33-write-coverage--what-the-write-actually-produced-8530).
 
 ---
 
