@@ -81,14 +81,14 @@ surfaces:
   # #9068 review P1: DUAL-REGISTERED with `core` (below) AND `onboarding`, plus
   # `ep` / `eval` / `sdk` — the six-surface set. The
   # door INVENTORY this file pins (`_gate_call_sites`) walks ALL of
-  # `tortoise/**`, and THREE of the thirteen doors it inventories live in
+  # `tortoise/**`, and THREE of the declared doors it inventories live in
   # `tortoise/hosted_api.py` (`commit_session`, `create_object`,
   # `create_subject`) — an EXACT `api` SOURCE_PATTERN match that REPLACES the
   # `core` fallback in `select()` (`core` is added only when NOTHING named
   # matched). Measured before this arm:
   # `--changed-files tortoise/hosted_api.py` → surfaces=['api','onboarding']
   # with `test_9068_pack_gate_residuals.py` ABSENT, so a hosted_api-only PR
-  # that added a FOURTEENTH gate call site (or moved one of the three) merged
+  # that added a NEW gate call site (or moved one of the three) merged
   # GREEN with `_DOORS` stale, and only reddened `main` on the next full-matrix
   # run — the #1349/#3332/#3616 silent-drop class, on the file where the two
   # `#8380` REST doors landed. `tortoise/__main__.py` is the same shape (it is
@@ -2655,6 +2655,14 @@ surfaces:
   - test_event_log.py
   - test_event_provenance.py
   - test_event_store.py
+  # #9208: the `:GraphEvent` change feed's SILENT death. A refused store write
+  # (e.g. §17.1's third door refusing an undeclared one) used to be swallowed by
+  # `_emit_event`'s and `append_event`'s bare `except`, so the feed stopped while
+  # `poll_events` kept answering `[]` — a dead feed and an idle one, the same
+  # reply. `core` is the right arm: the subjects are `tortoise/event_store.py`
+  # (no SOURCE_PATTERN of its own) and `tortoise/sdk.py` (a SHARED_MODULE), and
+  # its siblings (`test_event_store.py`, `test_change_feed_2353.py`) live here.
+  - test_9208_change_feed_degraded.py
   # #2353: the semantic change feed — the `:GraphEvent` → per-claim-delta fold
   # (`tortoise/change_feed.py`), the off-by-default `changes` response field on
   # `poll_events`, the re-pin of the store's transition-only contract, and the
@@ -3667,7 +3675,7 @@ surfaces:
   # reason as the sibling above. `_gate_call_sites` scans ALL of `tortoise/**`,
   # and `tortoise/analyze.py` / `dream.py` / `ranking.py` select `ep`, REPLACING
   # the `core` fallback — so without this arm an `ep`-only change could add a
-  # FOURTEENTH #5475 gate call site while `_DOORS` stayed stale and green (the
+  # NEW #5475 gate call site while `_DOORS` stayed stale and green (the
   # #1349/#3332/#3616 silent-drop class). Pinned over the whole scanned
   # population by `test_9068_pack_gate_residuals.py::
   # test_the_inventory_runs_on_a_diff_to_every_module_it_scans`.
@@ -3849,7 +3857,7 @@ surfaces:
   # (above), and `ep` / `eval` / `sdk` — the six surfaces a module the #5475 door
   # inventory scans can resolve to. `tortoise/hosted_api.py` is an EXACT
   # `api`+`onboarding` SOURCE_PATTERN match that REPLACES the `core` fallback —
-  # so on a `hosted_api.py`-only diff (where three of the thirteen doors live)
+  # so on a `hosted_api.py`-only diff (where three of the declared doors live)
   # the inventory would not run at all. Full rationale in the `api` entry;
   # pinned over the whole scanned population by
   # `test_9068_pack_gate_residuals.py::
@@ -4143,7 +4151,7 @@ surfaces:
   # sibling above. `_gate_call_sites` scans ALL of `tortoise/**`, and
   # `tortoise/ask_lane.py` / `crypto.py` / `ids.py` / `models.py` / `reader.py` /
   # `retrieval.py` / `schemas.py` select `sdk`, REPLACING the `core` fallback —
-  # so an `sdk`-only change could add a FOURTEENTH #5475 gate call site while
+  # so an `sdk`-only change could add a NEW #5475 gate call site while
   # `_DOORS` stayed stale and green (the #1349/#3332/#3616 silent-drop class).
   # Pinned over the whole scanned population by
   # `test_9068_pack_gate_residuals.py::
@@ -4454,7 +4462,7 @@ surfaces:
   # #9068 (the OTHER door inventory) / review P1: same arm, same reason as the
   # sibling above. `_gate_call_sites` scans ALL of `tortoise/**`, and
   # `tortoise/cross_lens.py` / `embeddings.py` select `eval`, REPLACING the
-  # `core` fallback — so an `eval`-only change could add a FOURTEENTH #5475 gate
+  # `core` fallback — so an `eval`-only change could add a NEW #5475 gate
   # call site while `_DOORS` stayed stale and green (the #1349/#3332/#3616
   # silent-drop class). Pinned over the whole scanned population by
   # `test_9068_pack_gate_residuals.py::
@@ -6675,6 +6683,7 @@ durations:
   test_7951_delete_point_outbox.py: 5.0  # unmeasured — #7951 increment 4a (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only), and an absent row packs it at the flat 2.0s default, which drops `duration_coverage_issues()` under the 90% floor — the same shape as the `test_7951_create_point_outbox.py` row above. Local embedded-lane readings 4.3–6.8 s when the file collected 6 tests; at this head it collects 10 (T1-T10, TWO of which call `rebuild_all` — T3 and T8) and measured 7.5 s here on the same lane, so the 5.0 weight is a lower-ish bound in the right neighbourhood rather than a stale one. Refresh from the first post-merge run that includes it.
   test_9079_ep_epoch_declared.py: 7.2  # unmeasured — #9123 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). MEASURED this turn: WITHOUT this row `duration_coverage_issues()` red at 840/934 = 89.9% — the same shape as the `test_7951_create_point_outbox.py` row above. Local embedded-lane readings 5.9/6.0/6.4 s over three runs (6 tests; one calls `rebuild_all`). ⚠️ A longer reading (148 s) is NOT this file's weight: the FIRST `create_point` in a process lazily loads the embedding model — 15.7 s standalone, and 134 s for the one test that pays it under fleet load 65 — after which creates are 0.16 s. That one-time load is paid once per file and is not what this weight packs. Declared above the quiet-box readings so a cold leg cannot under-pack. Refresh from the first post-merge run that includes it.
   test_audit_fallback_home_isolation.py: 2.4
+  test_9208_change_feed_degraded.py: 2.0  # unmeasured — new in #9208 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). Without this row the file is in the fast pool, so it packs at the flat 2.0s default AND `duration_coverage_issues()` sits at 90.02% — one peer lane adding a file tips it under the 90% floor. The weight is the flat default deliberately (a LOCAL reading would not be a shard-layout input, #3419/#2788): the local 42-65 s readings for this file are almost entirely the once-per-leg embedding-model load the #3400 method attributes to no file. Refresh from the first post-merge run that includes it.
   test_ci_stall_identify.py: 16.0  # #5035: the 1.8 predated this PR's subprocess-launching tests. A quiet-machine estimate (measured 12.3, 14.8, 16.3 s; 25.9 s under moderate load and 34-40 s at fleet load 67-79 — the file spawns pytest children, so it tracks box load hard). `tools/ci_timing.py --refresh-durations` is the canonical (CI-measured) writer; this line is a local estimate until it next runs.
   test_env_contract_covers_supabase_config.py: 2.0  # #4030: appended by hand so the entry exists at all — main sat only just above the guard's floor (764/848 fast files = 90.09%), and this new fast file tipped `duration_coverage_issues()` below it (764/849 = 89.99%, formatted as the `90.0%` in that error). Local estimate: 3.24 s measured for this file plus its paired pin in test_ci_selection.py, most of it one conftest import. `tools/ci_timing.py --refresh-durations` replaces it with the CI-measured value.
   test_7936_stable_stub_ids.py: 18.0  # #7936 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). MEASURED this turn: WITHOUT this row `duration_coverage_issues()` red at 777/864 = 89.9% (the file is in the fast pool, so its absence packs it at the flat 2.0s default and drops coverage under the 90% floor) — the same shape as `test_7951_create_point_outbox.py` above, and it is also what reds `tests/test_ci_timing.py`'s four `validate_refreshed_manifest` assertions on the manifest of record. Local embedded-lane reading 16.6–20.4 s (18 tests; three rebuild the graph). Refresh from the first post-merge run that includes it.
