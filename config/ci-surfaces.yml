@@ -1450,6 +1450,19 @@ surfaces:
   # `sdk.py` are this guard's subjects; an `sdk.py`-only change selects the
   # full matrix, and a `projection/`-only change falls through to `core`.
   - test_7951_enforce_atomic_write.py
+  # #9209 (§17.1's FOURTH door, the handle's NON-CYPHER verbs): pinned on the
+  # projection's write handle, `_GuardedGraph`, i.e. the `core` surface — and
+  # `--integrity` requires every test file to carry a classification, which this
+  # entry satisfies (without it `manifest-integrity` reds on the new file).
+  # Deliberately ONE row, unlike the six-surface #7951 door suites above,
+  # because the subject is exactly one file: a change to
+  # `tortoise/projection/__init__.py` selects the FULL matrix
+  # (`--changed-files tortoise/projection/__init__.py` → `"full": true`), so this
+  # suite runs on any projection change with or without the row. `core` is also
+  # the selector's own default registration surface, pinned by
+  # `test_ci_selection.py::test_register_default_surface_is_core`, and
+  # `--integrity` is clean with this row.
+  - test_9209_handle_non_cypher_wipe.py
   # #9122 (§17.1 raw `:Event` writers): MULTI-REGISTERED on `api`, `core` and
   # `sdk`, and each row is load-bearing for a DIFFERENT subject — verified by
   # re-running `select()` with the row withheld:
