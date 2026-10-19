@@ -76,6 +76,10 @@ def test_start_refuses_a_container_that_answers_INSIDE_but_not_on_the_host_port(
     PING` answers PONG from inside, while the published host port is dead. That
     container used to be handed to a lane as usable; the host path is the one a
     lane actually uses, so it is the one readiness must mean."""
+    # #8124: the reuse path now verifies the container's CREATED image
+    # (`_created_image`) before returning it; pinned here so the test
+    # exercises its own property rather than the engine check.
+    monkeypatch.setattr(tl, "_created_image", lambda _n: tl.IMAGE)
     monkeypatch.setattr(tl, "_ping_over_host", lambda port, timeout: False)
     monkeypatch.setattr(tl, "container_state", lambda _n: "running")
     monkeypatch.setattr(tl, "_published_port", lambda _n: (True, 16390))
@@ -933,6 +937,10 @@ def test_start_reuses_a_running_container_without_removing_it(lane, monkeypatch)
     """The reuse path must RETURN, not fall through: falling through would
     `docker rm -f` + recreate a live lane container, destroying the test graphs
     of the run that is using it — the opposite of what reuse is for."""
+    # #8124: the reuse path now verifies the container's CREATED image
+    # (`_created_image`) before returning it; pinned here so the test
+    # exercises its own property rather than the engine check.
+    monkeypatch.setattr(tl, "_created_image", lambda _n: tl.IMAGE)
     removed = []
     monkeypatch.setattr(tl, "container_state", lambda _n: "running")
     monkeypatch.setattr(tl, "_published_port", lambda _n: (True, 16390))
@@ -945,6 +953,98 @@ def test_start_reuses_a_running_container_without_removing_it(lane, monkeypatch)
     monkeypatch.setattr(tl, "_docker", _boom)
     assert tl.start() == ("fdb-lane-0123456789", 16390)
     assert removed == [], "a running lane container must never be removed"
+
+
+def test_created_image_reads_the_image_the_container_was_CREATED_from(monkeypatch):
+    """The property itself, tested DIRECTLY — this file's rule for a function
+    whose real body IS the safety property (`container_state`, `_graph_count`,
+    `_published_port`). #8124: the reuse path must ask what the container was
+    born from, and `{{.Config.Image}}` is the only field that answers it."""
+    seen: list = []
+
+    def fake(*a, **_k):
+        seen.append(a)
+        return _R(0, "falkordb/falkordb:latest\n", "")
+
+    monkeypatch.setattr(tl, "_docker", fake)
+    assert tl._created_image("fdb-lane-x") == "falkordb/falkordb:latest"
+    assert seen and "{{.Config.Image}}" in seen[0], (
+        f"the inspect must ask for Config.Image, got {seen}"
+    )
+
+
+def test_created_image_returns_None_when_docker_cannot_answer(monkeypatch):
+    """None, never `""` and never a guessed pin: a failed query is not evidence
+    about the container, so the caller must not read it as either "pinned" (reuse
+    an unknown engine) or "not pinned" (destroy a live one)."""
+    monkeypatch.setattr(tl, "_docker", lambda *a, **k: _R(1, "", "daemon down"))
+    assert tl._created_image("fdb-lane-x") is None
+    monkeypatch.setattr(tl, "_docker", lambda *a, **k: _R(0, "   \n", ""))
+    assert tl._created_image("fdb-lane-x") is None
+
+
+def test_start_refuses_to_reuse_a_running_container_born_from_a_floating_engine(
+        lane, monkeypatch):
+    """#8124 / #9085 review: the pin must reach an ALREADY-RUNNING container.
+
+    `docker run` is the ONLY path that names an engine, and Docker never
+    re-resolves an image for an existing container — so a lane container created
+    before the pin, from the then-floating `falkordb/falkordb:latest`, keeps the
+    panicking 6.0.x engine for life. The health gate cannot see it (6.0.x answers
+    `PING`; only the aggregate+property projection kills it), so this container
+    used to be handed to the lane as a "ready" DB that exits mid-run as
+    `Connection closed by server` — the exact #8124 symptom. It must be REFUSED,
+    and nothing destructive may touch it: recreating it would destroy the test
+    graphs of the run that is using it.
+    """
+    def _boom(*_a, **_k):  # pragma: no cover - asserted not to run
+        raise AssertionError("a running lane container must not be touched")
+
+    monkeypatch.setattr(tl, "container_state", lambda _n: "running")
+    monkeypatch.setattr(tl, "_created_image",
+                        lambda _n: "falkordb/falkordb:latest")
+    monkeypatch.setattr(tl, "_published_port", lambda _n: (True, 16390))
+    monkeypatch.setattr(tl, "_wait_ready", lambda _n, _host_port=None: True)
+    monkeypatch.setattr(tl, "_docker", _boom)
+    monkeypatch.setattr(tl, "_remove_and_describe", _boom)
+
+    with pytest.raises(SystemExit) as e:
+        tl.start()
+    msg = str(e.value)
+    assert "#8124" in msg, msg
+    assert "falkordb/falkordb:latest" in msg and tl.LANE_IMAGE_PIN in msg, (
+        f"the refusal must name BOTH engines — the one it found and the pin: {msg}"
+    )
+    assert "down" in msg, (
+        f"the refusal must say how to resolve it (recreate on the pin): {msg}"
+    )
+
+
+def test_start_refuses_to_reuse_a_running_container_of_unknown_engine(
+        lane, monkeypatch):
+    """A failed query is never read as permission — the rule `_published_port`
+    and `container_state` already follow in this file.
+
+    When the created image cannot be read, the pin is UNCONFIRMED: handing the
+    container back would reuse an engine nobody verified (the #8124 symptom),
+    and destroying it would delete a container whose provenance is unknown. So
+    it refuses, names the failed query, and touches nothing.
+    """
+    def _boom(*_a, **_k):  # pragma: no cover - asserted not to run
+        raise AssertionError("an unreadable container must not be touched")
+
+    monkeypatch.setattr(tl, "container_state", lambda _n: "running")
+    monkeypatch.setattr(tl, "_created_image", lambda _n: None)
+    monkeypatch.setattr(tl, "_published_port", lambda _n: (True, 16390))
+    monkeypatch.setattr(tl, "_wait_ready", lambda _n, _host_port=None: True)
+    monkeypatch.setattr(tl, "_docker", _boom)
+    monkeypatch.setattr(tl, "_remove_and_describe", _boom)
+
+    with pytest.raises(SystemExit) as e:
+        tl.start()
+    msg = str(e.value)
+    assert "could not be read" in msg, msg
+    assert "#8124" in msg and "down" in msg, msg
 
 
 def test_uri_for_warns_when_docker_host_is_set(monkeypatch, capsys):
@@ -963,6 +1063,10 @@ def test_start_refuses_a_port_it_cannot_move_a_live_lane_to(lane, monkeypatch):
     so an explicit `--port` that disagrees must FAIL — silently ignoring it would
     make the flag a lie, and recreating the container would destroy the graphs of
     the run using it."""
+    # #8124: the reuse path now verifies the container's CREATED image
+    # (`_created_image`) before returning it; pinned here so the test
+    # exercises its own property rather than the engine check.
+    monkeypatch.setattr(tl, "_created_image", lambda _n: tl.IMAGE)
     monkeypatch.setattr(tl, "container_state", lambda _n: "running")
     monkeypatch.setattr(tl, "_published_port", lambda _n: (True, 16390))
 
@@ -979,6 +1083,10 @@ def test_start_refuses_a_port_it_cannot_move_a_live_lane_to(lane, monkeypatch):
 def test_start_accepts_an_explicit_port_that_matches(lane, monkeypatch):
     """The guard must be an EQUALITY, not a refusal of the flag: asking for the
     port the lane already publishes is not a conflict."""
+    # #8124: the reuse path now verifies the container's CREATED image
+    # (`_created_image`) before returning it; pinned here so the test
+    # exercises its own property rather than the engine check.
+    monkeypatch.setattr(tl, "_created_image", lambda _n: tl.IMAGE)
     monkeypatch.setattr(tl, "container_state", lambda _n: "running")
     monkeypatch.setattr(tl, "_published_port", lambda _n: (True, 16390))
     monkeypatch.setattr(tl, "_wait_ready", lambda _n, _host_port=None: True)
@@ -1205,6 +1313,10 @@ def test_start_removes_only_a_container_this_tool_manages(lane, monkeypatch):
 def test_start_refuses_to_reuse_a_running_container_that_is_wedged(lane, monkeypatch):
     """The reuse path must not hand back a URI without checking the server
     answered, or a wedged long-lived container would be reused indefinitely."""
+    # #8124: the reuse path now verifies the container's CREATED image
+    # (`_created_image`) before returning it; pinned here so the test
+    # exercises its own property rather than the engine check.
+    monkeypatch.setattr(tl, "_created_image", lambda _n: tl.IMAGE)
     monkeypatch.setattr(tl, "container_state", lambda _n: "running")
     monkeypatch.setattr(tl, "_published_port", lambda _n: (True, 16390))
     monkeypatch.setattr(tl, "_wait_ready", lambda _n, _host_port=None: False)
@@ -1217,6 +1329,10 @@ def test_a_failed_port_query_never_removes_a_container(lane, monkeypatch):
     """A failed QUERY is not evidence that a container is broken. On the reuse
     path the container may be perfectly healthy and is not ours to delete, so
     the tool must refuse instead of reaping it."""
+    # #8124: the reuse path now verifies the container's CREATED image
+    # (`_created_image`) before returning it; pinned here so the test
+    # exercises its own property rather than the engine check.
+    monkeypatch.setattr(tl, "_created_image", lambda _n: tl.IMAGE)
     def _boom(*_a, **_k):  # pragma: no cover - asserted not to run
         raise AssertionError("a failed port query led to a removal")
 

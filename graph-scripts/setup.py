@@ -647,7 +647,22 @@ def step8() -> None:
     # Recreating is safe: the data dir is a bind mount, not the container's.
     if status in ("running", "exited"):
         created_image = _container_image(_FALKORDB_CONTAINER)
-        if created_image and created_image != FALKORDB_IMAGE:
+        if not created_image:
+            # #8124 review (P3): a failure is never read as permission. `""` is
+            # `_container_image`'s "could not read" — not "it already IS the
+            # pin" — so it must not fall through to "container already
+            # running"/"Restarting stopped container" as if the engine had been
+            # confirmed. Nor is it permission to DESTROY a container whose
+            # provenance is unknown. Say what is unknown, and how to settle it.
+            print(f"  Could not read which image {_FALKORDB_CONTAINER!r} was "
+                  f"created from, so the engine pin ({FALKORDB_IMAGE}) cannot "
+                  f"be confirmed — leaving the container untouched. Check it "
+                  f"with `docker container inspect -f "
+                  f"'{{{{.Config.Image}}}}' {_FALKORDB_CONTAINER}` and run "
+                  f"`docker rm -f {_FALKORDB_CONTAINER}` if that is not the "
+                  f"pin (#8124).")
+            return
+        if created_image != FALKORDB_IMAGE:
             print(f"  Container was created from {created_image!r}, not the "
                   f"pinned {FALKORDB_IMAGE!r} (#8124) — recreating it on the "
                   f"pin (data in ./data is a bind mount and is kept)...")

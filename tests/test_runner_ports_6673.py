@@ -1132,6 +1132,31 @@ def test_setup_keeps_an_existing_container_that_already_runs_the_pin(monkeypatch
             )
 
 
+def test_setup_never_reads_an_unreadable_image_as_the_pin(monkeypatch, capsys):
+    """#8124 review (P3): a failed query is never read as permission.
+
+    `_container_image` returns `""` when `docker inspect` cannot answer, and
+    `""` used to fall through the truthiness test into "container already
+    running" / "Restarting stopped container" — a container whose engine was
+    never established, reported as if it had been confirmed on the pin. It must
+    neither be reused as pinned nor DESTROYED (its provenance is unknown): it is
+    left untouched, and the message says what is unknown and how to settle it.
+    """
+    for status in ("running", "exited"):
+        _setup, calls = _run_step8(monkeypatch, status=status, created_image="")
+        out = capsys.readouterr().out
+        assert not [c for c in calls if c[:2] in (["docker", "rm"],
+                                                 ["docker", "run"],
+                                                 ["docker", "start"])], (
+            f"an unreadable image is not permission to touch the container "
+            f"(status={status}, docker calls: {calls})"
+        )
+        assert "#8124" in out and "untouched" in out, (
+            f"the unreadable branch must name itself, not pass silently "
+            f"(status={status}): {out!r}"
+        )
+
+
 def test_no_lane_entry_point_resolves_a_floating_falkordb_tag():
     """#8124: lane tooling must name an engine, never track a floating tag."""
     refs = _lane_image_references()

@@ -119,7 +119,11 @@ enough: every 6.0.x tag available carries the panic, so the issue body's
 "pin the app image" remedy would have shipped a crashing default anyway.
 
 WHAT THIS DOES AND DOES NOT PROTECT. It protects every lane that uses THIS tool
-(the container is private, so a panic here kills only its own DB). It does NOT
+(the container is private, so a panic here kills only its own DB). That includes
+a lane whose container ALREADY exists: the pin is checked against the image the
+container was CREATED from, not only against the image a new one would use, so
+an `Up` container born from a floating tag is refused rather than reused
+(`_created_image`). It does NOT
 protect a lane pointed at the long-lived SHARED ``falkordb`` container: that one
 is DECLARED ``falkordb/falkordb:latest`` in eldato
 ``operations/memory/docker-compose.yml`` (out of this repo), and only its
@@ -649,6 +653,28 @@ def _graph_count(name: str) -> int | None:
     return len([ln for ln in (r.stdout or "").splitlines() if ln.strip()])
 
 
+def _created_image(name: str) -> str | None:
+    """The image the container was CREATED from, or None if it cannot be read.
+
+    #8124: `docker run` is the ONLY path that names an engine, and `docker start`
+    never re-resolves an image — so a container created from the old floating
+    `falkordb/falkordb:latest` keeps the panicking 6.0.x engine for life. The
+    reuse path could not see that: it asked for the container's *state*, which
+    cannot answer "which engine is this?". The health gate cannot see it
+    either: 6.0.x answers `PING` fine and only dies on the aggregate+property
+    projection, so the lane would be handed a "ready" DB that exits mid-run as
+    `Connection closed by server` — the exact #8124 symptom.
+
+    None rather than "" for the unreadable case, for the same reason
+    `_graph_count` returns None: a failed query is not evidence about the
+    container, and callers must not read it as one.
+    """
+    r = _docker("inspect", "--format", "{{.Config.Image}}", name)
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip() or None
+
+
 def _published_port(name: str) -> tuple[bool, int | None]:
     """`(asked, port)` for the container's 6379 mapping.
 
@@ -702,6 +728,38 @@ def start(port: int | None = None) -> tuple[str, int]:
     name = lane_name()
     state = container_state(name)
     if state == "running":
+        # #8124: the reuse path must not hand back an engine the pin never
+        # approved. `assert_pinned_image` above validates what we WOULD create;
+        # an existing container keeps whatever image it was created from, and
+        # Docker never re-resolves it. Refused rather than recreated: recreating
+        # would destroy the test graphs of the run that is using the container
+        # (the same reason the `--port` branch below refuses instead of
+        # recreating), and a lane container is disposable only by its OWNER's
+        # decision — `down`, then retry.
+        created = _created_image(name)
+        if created is None:
+            raise SystemExit(
+                f"test-lane: {name} is running but the image it was created "
+                f"from could not be read (the `docker inspect "
+                f"{{{{.Config.Image}}}}` query failed or returned nothing), so "
+                f"the pinned engine {image!r} cannot be confirmed — refusing to "
+                f"hand back a database of unknown engine (#8124). Inspect it "
+                f"with `docker container inspect -f '{{{{.Config.Image}}}}' "
+                f"{name}`, or run `uv run python tools/test_lane.py down` and "
+                f"retry"
+            )
+        if created != image:
+            raise SystemExit(
+                f"test-lane: {name} was created from {created!r}, not the "
+                f"pinned {image!r} (#8124) — `docker run` is the only path that "
+                f"names an engine and `docker start` never re-resolves an "
+                f"image, so this container keeps the engine it was born with "
+                f"for life, and a floating tag resolves to engine 6.0.x whose "
+                f"reply_compact PANICS the server mid-run (`Connection closed "
+                f"by server`, not a test result). This container is disposable "
+                f"— run `uv run python tools/test_lane.py down` and retry to "
+                f"recreate it on the pin"
+            )
         asked, published = _published_port(name)
         if not asked:
             # Never remove a container on the strength of a failed QUERY: this
