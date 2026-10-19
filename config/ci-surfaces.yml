@@ -5827,7 +5827,7 @@ durations:
   test_dashboard_client_paths_resolve.py: 3.6
   test_dashboard_login.py: 6.8
   test_capture_phase_d_dedup.py: 2.3  # ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 21 testcases = 1.7s, a LOWER bound; kept 2.3
-  test_ci_selection.py: 184.1  # #9017 CI-junit 2026-10-18 (run 39165691659); was 191.6 — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 2 of 262 testcases = 64.9s, a LOWER bound; kept 184.1
+  test_ci_selection.py: 184.1  # #9017 CI-junit 2026-10-18 (run 39165691659); was 191.6 — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 2 of 263 testcases = 64.9s, a LOWER bound; kept 184.1
   # #6144: measured floor over 3 runs on the dev box (19.0 / 21.2 / 23.4s); the
   # spread is fleet I/O contention, not the guard (user+sys ~4s). The YAML parses
   # are memoized on (path, mtime, size) so the 2.2k-line python-ci.yml is read
