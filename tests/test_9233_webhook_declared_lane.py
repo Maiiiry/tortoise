@@ -440,13 +440,17 @@ def test_a_refused_failure_write_is_not_swallowed(sdk_with_journal,
 
 
 def test_a_receipt_failure_does_not_un_deliver_the_event(
-        sdk_with_journal, monkeypatch):
+        sdk_with_journal, monkeypatch, caplog):
     """The cursor is the COMMIT POINT; the receipt is its audit.
 
-    `_mark_delivered` writes the cursor first, so a receipt failure means the
-    delivery already committed — reporting it as failed and breaking the batch
-    skipped the remaining events and stalled the tenant (#9233 review round 2).
+    `_mark_delivered` advances the cursor first, so a receipt failure must be
+    diagnosed as a RECEIPT failure and the delivery still count — the pre-fix
+    code logged it as "cursor write failed", which reads as the opposite
+    diagnosis. The counters alone cannot tell the two apart (both trees report
+    `delivered`), so the log record is asserted too (#9233 review round 3).
     """
+    import logging
+
     from tortoise import webhook_delivery as wd
 
     proj = sdk_with_journal._get_proj()
@@ -458,12 +462,64 @@ def test_a_receipt_failure_does_not_un_deliver_the_event(
         raise RuntimeError("receipt write hiccup")
 
     monkeypatch.setattr(wd, "_write_receipt", _no_receipt)
-    summary = wd.dispatch_pending(proj, transport=_ScriptedTransport([200]))
+    with caplog.at_level(logging.WARNING, logger="tortoise.webhook_delivery"):
+        summary = wd.dispatch_pending(proj, transport=_ScriptedTransport([200]))
 
     assert summary["failed"] == 0 and summary["delivered"] == 3, (
         "a receipt failure was reported as a failed delivery, so the batch "
         f"stalled on an already-committed event: {summary}"
     )
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("delivered receipt not recorded" in m for m in messages), (
+        f"the receipt failure was not diagnosed as one: {messages}"
+    )
+    assert not any("cursor write failed" in m for m in messages), (
+        "a receipt failure is still logged as a CURSOR failure — the diagnosis "
+        "is inverted, and a cursor failure is the one that must not be "
+        f"swallowed: {messages}"
+    )
+
+
+def test_a_refused_delivered_receipt_write_is_not_swallowed(
+        sdk_with_journal, monkeypatch):
+    """The delivered-branch receipt CREATE re-raises a refusal.
+
+    `_mark_delivered` tolerates an ORDINARY receipt failure (the cursor already
+    committed) but a REFUSAL is not that: the statement never landed. Without the
+    re-raise it becomes a warning + a counted delivery — the silent-loss shape
+    #9233 exists to prevent, and a guard no test covered (#9233 review round 3).
+    """
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 2)
+    sub = wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                                 types=["PointAdded"], description="9233 rcp")
+
+    _instrument(monkeypatch, refuse="CREATE (r:DeliveryReceipt")
+    with pytest.raises(DirectCacheWriteRefused):
+        wd.dispatch_pending(proj, transport=_ScriptedTransport([200]))
+
+    assert wd.read_receipts(proj, sub["sub_id"]) == [], (
+        "the fixture refused the wrong statement — a receipt landed, so this "
+        "test proves nothing about a refused receipt write"
+    )
+
+
+def test_a_refused_receipt_prune_is_not_swallowed(sdk_with_journal,
+                                                  monkeypatch):
+    """The prune's refusal re-raises too: it is the third handler on this path
+    and the one `_run`'s docstring must be able to claim is covered."""
+    from tortoise import webhook_delivery as wd
+
+    proj = sdk_with_journal._get_proj()
+    _seed_stream(proj, 2)
+    wd.create_subscription(proj, url="https://hooks.example.com/cb",
+                           types=["PointAdded"], description="9233 prune")
+
+    _instrument(monkeypatch, refuse="SKIP $keep DETACH DELETE r")
+    with pytest.raises(DirectCacheWriteRefused):
+        wd.dispatch_pending(proj, transport=_ScriptedTransport([200]))
 
 
 def test_a_refused_index_ddl_does_not_cache_the_schema_flag(

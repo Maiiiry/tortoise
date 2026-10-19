@@ -27711,6 +27711,11 @@ async def create_context_subscription(
         a loopback/private/link-local/metadata host (SSRF gate,
         ``security.validate_webhook_url``), an unknown event type (the same
         registry ``events_poll`` validates against), or the per-graph cap.
+      * 500 when the §17.1 write guard REFUSES the store's write — the
+        projection is journal-backed and the declaration is missing. That is an
+        operator/deployment defect, not the caller's: retrying will not help.
+        (It is deliberately NOT the 503 below: both are ``RuntimeError``
+        subclasses, so the specific arm must come first — #9233.)
       * 503 when ``TORTOISE_ENCRYPTION_KEY`` is unset — the signing secret is a
         long-lived credential and is never stored in the clear (``crypto``
         fails loudly rather than downgrade).
