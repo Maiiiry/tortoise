@@ -59,6 +59,12 @@ from tortoise import (
 from tortoise import embed_metering as _embed_metering  # #4488 encode measurement
 from tortoise import mcp_auth as _mcp_auth
 from tortoise import monitoring as _monitoring  # #2924: call-time bound read
+
+# #8692 (phase 3 of #2427): the permission vocabulary + role bundles. Imported
+# as a MODULE attribute (`_permissions`) so a test override reaches the gates,
+# and the symbols are also bound directly because they are the vocabulary the
+# gate call sites name.
+from tortoise import permissions as _permissions
 from tortoise.abuse import (
     _int_env,  # #1081 signup limiter env knobs (SignupVelocityTracker)
     _window_env,  # #5493 window knobs must never fail open
@@ -143,6 +149,13 @@ from tortoise.monitoring import (
     health_probe_interval as _health_probe_interval,  # #2988: shared with selfhost
 )
 from tortoise.onboarding import state as _os  # #2001 (W5) canonical FLOW-state module
+from tortoise.permissions import (
+    Permission,
+    authority_for,
+    holder_user_id,
+    permission_detail,
+    role_allows,
+)
 from tortoise.projection import (
     is_missing_graph_error,  # #2163: absent-graph GRAPH.DELETE family == success
     journal_mint_write_ahead,  # #3390: journal the intended name BEFORE the CREATE
@@ -6339,10 +6352,18 @@ def _require_keys_manage(org: dict, surface: str) -> None:
     must the other key-management surfaces (revoke, list). Legacy
     full-access keys (deleg NULL, scopes=[]) are the owner class and pass;
     deleg=0 keys never reach here (the DI dormancy gate 403s them first);
-    session faces pass (no key_id)."""
+    session faces pass (no key_id).
+
+    #8692: this is the CAPABILITY half of the key-management gate — it asks
+    what the presented CREDENTIAL may do (`keys:manage`, a scope carried on
+    the key), never what a role may do. The role half is the named permission
+    the endpoint passes to `_require_owner_admin` /
+    `_require_owner_admin_or_own_key`; the vocabulary it belongs to is
+    `tortoise.permissions` and `Permission.KEYS_MANAGE` is the same string
+    this predicate test matches."""
     if org.get("key_id") is not None \
             and not org.get("legacy_full_access") \
-            and "keys:manage" not in (org.get("scopes") or []):
+            and Permission.KEYS_MANAGE not in (org.get("scopes") or []):
         raise HTTPException(
             status_code=403,
             detail=f"Missing keys:manage scope to {surface}",
@@ -6354,7 +6375,7 @@ def _require_keys_manage(org: dict, surface: str) -> None:
 #: (`POST /v1/session/key` purpose=bootstrap is member-open; `recovery` is
 #: owner/admin-gated by POLICY A, #2380), so it is the only class the
 #: own-key lane can ever reach.
-_SESSION_KEY_CREATED_VIA = "bootstrap"
+_SESSION_KEY_CREATED_VIA = _permissions.SELF_SERVICE_CREATED_VIA
 
 #: #2446: the bootstrap 3-active backstop (the session-mint lanes' own cap).
 _BOOTSTRAP_KEY_CAP = 3
@@ -6363,40 +6384,33 @@ _BOOTSTRAP_KEY_CAP = 3
 def _session_key_holder(row: dict) -> str | None:
     """#2446: the HOLDER of a credential row — the user who may self-manage it.
 
-    This is the `#2427` brief §4.2 backfill rule expressed as a READ-TIME
-    predicate, deliberately, because the holder COLUMN (`api_keys.
-    owner_user_id`) is delivered by phase 3 (#8692) — not by this issue:
+    #8692 (phase 3 of #2427): the predicate itself now lives in
+    `tortoise.permissions.holder_user_id` — the ONE declaration every gate,
+    the vocabulary's `authority_for` and the role-bundle table read — and this
+    name is kept as the call-site seam the #2446 pins and the registry/
+    supabase lanes already reference (`_resolve_replace_target`, both toggle
+    lanes, `_require_owner_admin_or_own_key`).
 
-        holder(row) = row.created_by   iff created_via == 'bootstrap'
-                                       (the SELF-SERVICE session mint)
-        holder(row) = None             otherwise (ORG-OWNED / shared)
+    It is no longer a class derivation ALONE. `api_keys.owner_user_id` (the
+    additive column this issue delivers) is authoritative when set, which is
+    what makes the HOLDER distinct from the MINTER:
 
-    Why the class gate and not `created_by` alone. `created_by` is the MINTER,
-    not the holder (brief §2.3 item 4): a pre-POLICY-A member-minted DURABLE
-    row also carries the member's id, yet §4.2's backfill makes every
-    non-self-service row ORG-OWNED (`owner_user_id IS NULL` — admin-managed).
-    The bootstrap class IS the self-service mint, so the two agree on today's
-    rows, and the predicate cannot be talked into widening to durable rows a
-    member merely once minted.
+        holder(row) = row.owner_user_id                    when set
+        holder(row) = row.created_by  iff created_via == 'bootstrap'
+        holder(row) = None            otherwise (ORG-OWNED / shared)
 
-    `None` therefore means "not self-manageable by anyone but an owner/admin":
+    Why the second clause survives (do not "simplify" it away): the column is
+    populated by an ADDITIVE backfill over existing self-service rows, so a
+    row minted after the migration arrives with it unset and the derivation
+    yields exactly what the backfill would have written. Both clauses agree on
+    every row in the table — see `holder_user_id`'s docstring and
+    `tests/test_permissions_8692.py`.
+
+    `None` means "not self-manageable by anyone but an owner/admin":
     an org-owned key stays admin-managed, and a member who holds a COPY of a
     shared key must never be able to replace or retire it (#2427 §4.2).
-
-    `created_by` is a user UUID, or the literal ``"api"`` for key-driven
-    mints (never a key id — see `_mint_key`); a non-user attribution is not a
-    holder. When #8692 adds the column this function becomes a one-line read
-    of it (NULL = org-owned), which is why callers must go through it rather
-    than touching `created_by` directly.
     """
-    if not row:
-        return None
-    if row.get("created_via") != _SESSION_KEY_CREATED_VIA:
-        return None
-    holder = row.get("created_by")
-    if not holder or holder == "api":
-        return None
-    return holder
+    return holder_user_id(row)
 
 
 def _key_row_is_expired(row: dict, now: str) -> bool:
@@ -11575,9 +11589,15 @@ def _rotatable_key_row(org_id: str, key_id: str) -> dict | None:
     """#4355: read the displaceable row's CLASS + label (both auth lanes).
 
     Returns ``{org_id, name, graph_id, scopes, delegation_depth,
-    created_by_key_id, created_via, expires_at, revoked_at, created_by}`` or
+    created_by_key_id, created_via, expires_at, revoked_at, created_by,
+    owner_user_id}`` or
     None when the id does not resolve. ``created_by`` rides it for the #2446
-    holder predicate (``_session_key_holder``). Ownership (403) and
+    holder predicate (``_session_key_holder``), and ``owner_user_id`` — the
+    HOLDER itself, phase 3 of #2427 (#8692) — rides it beside it: the
+    predicate prefers the explicit holder and derives from the self-service
+    class only when the column is unset, so a lane that omits it would read
+    every explicitly-held row as org-owned.
+    Ownership (403) and
     slot-occupancy (409) are checked by the caller with the shared helpers —
     this is only the field read.
     ``expires_at`` rides it so a body-omitted expiry inherits the displaced
@@ -11594,7 +11614,7 @@ def _rotatable_key_row(org_id: str, key_id: str) -> dict | None:
     rows = sdk._get_registry().query(
         "MATCH (k:APIKey {id: $id}) RETURN k.org_id, k.name, k.graph_id, "
         "k.scopes, k.delegation_depth, k.created_by_key_id, k.created_via, "
-        "k.expires_at, k.revoked_at, k.created_by",
+        "k.expires_at, k.revoked_at, k.created_by, k.owner_user_id",
         params={"id": key_id},
     ).result_set
     if not rows:
@@ -11604,7 +11624,7 @@ def _rotatable_key_row(org_id: str, key_id: str) -> dict | None:
         "scopes": rows[0][3], "delegation_depth": rows[0][4],
         "created_by_key_id": rows[0][5], "created_via": rows[0][6],
         "expires_at": rows[0][7], "revoked_at": rows[0][8],
-        "created_by": rows[0][9],
+        "created_by": rows[0][9], "owner_user_id": rows[0][10],
     }
 
 
@@ -11717,7 +11737,7 @@ async def create_api_key(request: Request, response: Response, org: dict = Depen
     # #2380 (Task 4): consolidated into the shared
     # _require_owner_admin_if_session helper (fires only when the org dict
     # carries session_user_id).
-    await _require_owner_admin_if_session(org)
+    await _require_owner_admin_if_session(org, Permission.KEYS_MINT_TEAM)
     # Key label + C3 (#2112) scoped-mint body: {name?, graph_id?, scopes?}
     # + #2426 expiry: {expires_in? (days 1-366) XOR expires_at? (ISO)}.
     # Read the body defensively — mint bodies are usually `{}` (dashboard/
@@ -12003,7 +12023,7 @@ async def rotate_api_key(key_id: str, request: Request, response: Response,
     # ── Caller gates (identical order to the siblings; before ANY lookup) ──
     _reject_minted_delegated_key(org, "rotate API keys")
     _require_keys_manage(org, "rotate API keys")
-    await _require_owner_admin_if_session(org)
+    await _require_owner_admin_if_session(org, Permission.KEYS_ROTATE_ANY)
 
     # ── Body: label + expiry ONLY (the replacement's class is inherited) ──
     payload: dict = {}
@@ -12380,7 +12400,7 @@ async def revoke_api_key(key_id: str, request: Request, org: dict = Depends(get_
     # carries session_user_id; predicate unchanged — override seam keeps
     # gating). #2299 (landed): the sibling inline pin checks consolidated
     # into the shared helpers; this #2297 owner/admin gate stays here.
-    await _require_owner_admin_if_session(org)
+    await _require_owner_admin_if_session(org, Permission.KEYS_REVOKE_ANY)
     if is_supabase_enabled():
         try:
             row = await _cp_offload(
@@ -12491,7 +12511,8 @@ async def toggle_dashboard_login(
         # below (the role gate is the pin's second enforcement layer).
         _session_pinned_org(org_id, memberships=memberships)
         # verify this user is owner/admin of that org
-        await _require_owner_admin(user["user_id"], org_id)
+        await _require_owner_admin(user["user_id"], org_id,
+                                   permission=Permission.TEAM_SETTINGS)
         from tortoise.supabase_control import set_dashboard_key_login as _set_flag
         await _cp_offload(
             lambda: _set_flag(cp, org_id, body.enabled),
@@ -12697,18 +12718,23 @@ async def toggle_api_key_enabled(
     rows = sdk._get_registry().query(
         "MATCH (k:APIKey {id: $id}) "
         "RETURN k.org_id, k.revoked_at, k.created_via, k.scopes, "
-        "k.delegation_depth, k.created_by",
+        "k.delegation_depth, k.created_by, k.owner_user_id",
         params={"id": key_id},
     ).result_set
     if not rows:
         raise HTTPException(status_code=404, detail="API key not found")
-    org_id, revoked_at, created_via, current_scopes, deleg, created_by = rows[0]
+    (org_id, revoked_at, created_via, current_scopes, deleg, created_by,
+     owner_user_id) = rows[0]
     # #2446 phase 2 (registry parity with the Supabase lane above): the same
     # gate, the same policy-A 403 for a non-held row, the same enable/disable-
     # only own slice. `created_by` joins the RETURN for the holder predicate.
+    # #8692: so does `owner_user_id` — the HOLDER itself — so this lane reads
+    # the same holder predicate as the Supabase lane instead of deriving from
+    # the self-service class alone.
     gate = await _require_owner_admin_or_own_key(
         user["user_id"], org_id,
-        {"created_via": created_via, "created_by": created_by})
+        {"created_via": created_via, "created_by": created_by,
+         "owner_user_id": owner_user_id})
     if revoked_at is not None:
         raise HTTPException(status_code=409, detail="Cannot modify a revoked key")
     if gate == "own":
@@ -20825,7 +20851,47 @@ async def _membership_role(user_id: str, org_id: str) -> str | None:
     return rows[0][0] if rows else None
 
 
-async def _require_owner_admin(user_id: str, org_id: str) -> dict:
+async def authorize(user_id: str, org_id: str,
+                    permission: Permission | str | None, *,
+                    target: dict | None = None) -> str:
+    """#8692 — THE internal authorization seam: may this principal perform
+    `permission` on `target` in `org_id`?
+
+    Returns the admitted AUTHORITY — ``"owner"`` / ``"admin"`` (the role
+    path) or ``"own"`` (the holder path, a member managing the credential the
+    server handed them) — and raises the historical 403 otherwise. The
+    DECISION is `tortoise.permissions.authority_for`, the single declaration
+    of the bundle table and the owner-only pin; this function owns only the
+    I/O (the membership read and the suspension stamp) so the two cannot
+    drift.
+
+    `permission=None` is the legacy coarse gate (owner-or-admin) and exists so
+    a caller that has not been named over yet keeps its exact behaviour; every
+    surface in #2427 brief §2.2 passes a named permission (pinned by
+    `tests/test_permissions_8692.py`, which reads this module's AST).
+
+    #1853 ordering is preserved verbatim: the role refusal precedes the
+    suspension read (no org-state oracle), and both admitted lanes then check
+    suspension, so this seam widens no org-state access.
+    """
+    role = await _membership_role(user_id, org_id)
+    admitted = authority_for(role, permission, user_id=user_id, target=target)
+    if admitted is None:
+        raise HTTPException(status_code=403,
+                            detail=permission_detail(permission))
+    try:
+        # The suspension-stamp read (orgs row, _org_node) is a SECOND
+        # control-plane call AFTER the role check (#1853 ordering — role
+        # 403 precedes SUSPENDED) — same outage class, same 503.
+        _ensure_not_suspended(await _org_node(org_id))
+    except Exception as _exc:
+        _raise_503_if_cp_outage(_exc)
+        raise
+    return admitted
+
+
+async def _require_owner_admin(user_id: str, org_id: str, *,
+                               permission: Permission | str | None = None) -> dict:
     """Return the membership if the user is owner/admin in the org, else 403.
 
     #1853: a SUSPENDED org 403s here too (checked AFTER role authz — no
@@ -20840,10 +20906,22 @@ async def _require_owner_admin(user_id: str, org_id: str) -> dict:
     The member OWN-KEY slice of the key surfaces goes through
     `_require_owner_admin_or_own_key`, which calls that same helper, so the
     two gates cannot drift.
+
+    #8692 (phase 3 of #2427): a THIN WRAPPER over `authorize`. `permission`
+    names the permission the surface requires (#2427 brief §2.2), and the
+    decision is that permission's membership in the caller's ROLE BUNDLE —
+    no longer "is this a role we recognise". Owner/admin parity is exact
+    because the admin bundle is every permission except the two owner-only
+    powers, which no caller passes here (they go through `_require_owner`).
+    `permission=None` keeps the pre-#8692 coarse gate for the callers that
+    have not been named over yet; the AST tripwire in
+    `tests/test_permissions_8692.py` keeps that list from growing silently.
     """
     role = await _membership_role(user_id, org_id)
-    if role not in ("owner", "admin"):
-        raise HTTPException(status_code=403, detail="Requires owner or admin role in team")
+    admitted = authority_for(role, permission, user_id=user_id)
+    if admitted is None:
+        raise HTTPException(status_code=403,
+                            detail=permission_detail(permission))
     try:
         # The suspension-stamp read (orgs row, _org_node) is a SECOND
         # control-plane call AFTER the role check (#1853 ordering — role
@@ -20855,8 +20933,10 @@ async def _require_owner_admin(user_id: str, org_id: str) -> dict:
     return {"org_id": org_id, "role": role}
 
 
-async def _require_owner_admin_or_own_key(user_id: str, org_id: str,
-                                          row: dict) -> str:
+async def _require_owner_admin_or_own_key(
+        user_id: str, org_id: str, row: dict, *,
+        any_permission: Permission | str = Permission.KEYS_TOGGLE_ANY,
+        own_permission: Permission | str = Permission.KEYS_TOGGLE_OWN) -> str:
     """#2446 phase 2 — the key-management gate with the member OWN-KEY slice.
 
     Returns the caller's authority over the TARGET ROW:
@@ -20885,26 +20965,30 @@ async def _require_owner_admin_or_own_key(user_id: str, org_id: str,
     non-holder member on a suspended org gets the same role detail POLICY A
     gives; BOTH admitted lanes then check suspension, so this slice widens no
     org-state access either.
+
+    #8692: the two halves are NAMED PERMISSIONS now — the org-wide verb
+    (`*_permission`, the admin bundle) and its holder-scoped twin
+    (`*_permission`, the member bundle) — and both decisions flow through
+    `authority_for`. The arguments are keyword-only with the toggle defaults
+    because both call sites today are the enable/disable lane; a rotate or
+    revoke caller passes its own pair. Everything else is unchanged, which is
+    the phase-3 contract (no surface widens on day one).
     """
     role = await _membership_role(user_id, org_id)
-    if role in ("owner", "admin"):
-        admitted = role
-    elif role is not None and _session_key_holder(row) == user_id:
-        # #2446 review P2-1: `role is not None` is load-bearing, not a
-        # tautology. `_membership_role` returns a role ONLY for an ACTIVE
-        # membership (registry `status:'active'`; supabase `status eq
-        # 'active'`), so a REMOVED member — or a row whose membership is gone
-        # entirely — yields None here. Holding the row is NOT enough on its
-        # own: `remove_member` does not revoke the member's api_keys and key
-        # auth performs no membership check, so without this clause a removed
+    admitted = authority_for(role, any_permission, user_id=user_id, target=row)
+    if admitted is None:
+        # #2446 review P2-1: `authority_for` refuses a None role outright, and
+        # the holder path requires an EXPLICIT target whose holder is the
+        # caller. Holding the row is NOT enough on its own: `remove_member`
+        # does not revoke the member's api_keys and key auth performs no
+        # membership check, so without the membership requirement a removed
         # member could still re-enable (or replace) the session credential
-        # they were left with, and authenticate with it. Admission therefore
-        # requires an active membership AND the holder predicate; every other
-        # case falls to the byte-identical POLICY A 403 below.
-        admitted = "own"
-    else:
+        # they were left with, and authenticate with it.
+        admitted = authority_for(role, own_permission, user_id=user_id,
+                                 target=row)
+    if admitted is None:
         raise HTTPException(status_code=403,
-                            detail="Requires owner or admin role in team")
+                            detail=permission_detail(any_permission))
     try:
         _ensure_not_suspended(await _org_node(org_id))
     except Exception as _exc:
@@ -20943,7 +21027,9 @@ def _raise_503_if_cp_outage(exc: BaseException) -> None:
         raise _control_plane_unavailable() from None
 
 
-async def _require_owner_admin_if_session(org: dict) -> None:
+async def _require_owner_admin_if_session(
+        org: dict,
+        permission: Permission | str | None = None) -> None:
     """#2297/#2380 POLICY A gate helper: owner/admin role gate that fires
     ONLY when the org dict was resolved from a SESSION JWT (it carries
     session_user_id — attached solely on the JWT branch of
@@ -20963,20 +21049,37 @@ async def _require_owner_admin_if_session(org: dict) -> None:
 
     Role checked on the RESOLVED org (org["org_id"] — the ?org_id= pin's
     membership-checked org for multi-membership callers, #2230/#2248).
+
+    #8692: `permission` names the permission the guarded surface requires and
+    is forwarded to `_require_owner_admin` — the session-face half of the
+    key-write lanes is gated by a named permission, not by a role.
     """
     session_user_id = org.get(_SESSION_USER_ID_KEY)
     if session_user_id is not None:
-        await _require_owner_admin(session_user_id, org["org_id"])
+        await _require_owner_admin(session_user_id, org["org_id"],
+                                   permission=permission)
 
 
 async def _require_owner(user_id: str, org_id: str, *,
-                         allow_removed: str | None = None) -> dict:
+                         allow_removed: str | None = None,
+                         permission: Permission | str = Permission.ORG_EXPORT) -> dict:
     """Return the membership if the user is the OWNER in the org, else 403.
 
     Strict-owner RBAC for export/deletion (#302) — mirrors
     _require_owner_admin but requires role == 'owner' exactly: admins can
     manage members, but only the owner can export the graph or schedule
     org deletion (issue spec: "Org deletion: Owner-only").
+
+    #8692: the strictness is now EXPRESSED IN THE VOCABULARY rather than in a
+    literal role comparison. `permission` defaults to `org.export` and the
+    delete lane passes `org.delete`; both are in `OWNER_ONLY_PERMISSIONS`, so
+    they are absent from the `admin` bundle and an admin is refused exactly as
+    before (a permission that could be delegated below owner would be a
+    different product promise — #2427 brief §4.2, kept strict deliberately).
+    This lane keeps its OWN role+status read (one query, the #302
+    removed-owner replay) instead of delegating to `authorize`: routing it
+    through `_membership_role` would add a control-plane call and reorder the
+    403-vs-SUSPENDED read that tests/test_suspension_parity.py pins.
 
     allow_removed: when set (the org's deleted_at), a REMOVED owner
     membership also passes — the delete cascade removes the owner's own
@@ -21005,8 +21108,8 @@ async def _require_owner(user_id: str, org_id: str, *,
                 filters=[("user_id", "eq", user_id), ("org_id", "eq", org_id)],
             ),
             op="query")
-        if not rows or rows[0].get("role") != "owner":
-            raise HTTPException(status_code=403, detail="Requires owner role in team")
+        if not rows or not role_allows(rows[0].get("role"), permission):
+            raise HTTPException(status_code=403, detail=permission_detail(permission))
         status = rows[0].get("status")
         if status == "active" or (allow_removed and status == "removed"):
             # #1853: suspension blocks NEW destructive writes, but the
@@ -21019,7 +21122,7 @@ async def _require_owner(user_id: str, org_id: str, *,
             if allow_removed is None:
                 _ensure_not_suspended(await _org_node(org_id))
             return {"org_id": org_id, "role": "owner"}
-        raise HTTPException(status_code=403, detail="Requires owner role in team")
+        raise HTTPException(status_code=403, detail=permission_detail(permission))
     # #1853: anchor-backed registry read (see _require_owner_admin — a
     # fresh SDK's GC can SHUTDOWN NOSAVE the shared embedded server and
     # lose un-saved cascade writes, breaking the idempotent replay).
@@ -21029,15 +21132,15 @@ async def _require_owner(user_id: str, org_id: str, *,
         "RETURN m.role, m.status",
         params={"uid": user_id, "tid": org_id},
     ).result_set
-    if not rows or rows[0][0] != "owner":
-        raise HTTPException(status_code=403, detail="Requires owner role in team")
+    if not rows or not role_allows(rows[0][0], permission):
+        raise HTTPException(status_code=403, detail=permission_detail(permission))
     status = rows[0][1]
     if status == "active" or (allow_removed and status == "removed"):
         # #1853: same gate as the Supabase branch — see above.
         if allow_removed is None:
             _ensure_not_suspended(await _org_node(org_id))
         return {"org_id": org_id, "role": "owner"}
-    raise HTTPException(status_code=403, detail="Requires owner role in team")
+    raise HTTPException(status_code=403, detail=permission_detail(permission))
 
 
 def _utc_now_iso() -> str:
@@ -21111,7 +21214,8 @@ async def invite_to_org(body: dict, user: dict = Depends(get_current_user)):  # 
     )
     if is_supabase_enabled():
         try:
-            await _require_owner_admin(user["user_id"], org_id)
+            await _require_owner_admin(user["user_id"], org_id,
+                                       permission=Permission.MEMBERS_MANAGE)
             org = await _cp_offload(
                 lambda: org_by_id(get_control_plane(), org_id), op="org_by_id")
             if org is None:
@@ -21178,7 +21282,8 @@ async def invite_to_org(body: dict, user: dict = Depends(get_current_user)):  # 
                                 detail="Invites unavailable (control plane error)")
 
     # ── selfhost / registry path (unchanged) ──
-    await _require_owner_admin(user["user_id"], org_id)
+    await _require_owner_admin(user["user_id"], org_id,
+                               permission=Permission.MEMBERS_MANAGE)
     sdk = _make_sdk(namespace="registry")
     reg = sdk._get_registry()
     # #1965: per-org lock around the tier gate + capacity check + dup check
@@ -22323,7 +22428,8 @@ async def resend_invite(invitation_id: str, org_id: str, request: Request,
     from tortoise.supabase_control import (
         invitation_resend as _sb_resend,
     )
-    await _require_owner_admin(user["user_id"], org_id)
+    await _require_owner_admin(user["user_id"], org_id,
+                               permission=Permission.MEMBERS_MANAGE)
     await _check_invite_resend_rate_limit(request, invitation_id)
 
     if is_supabase_enabled():
@@ -22419,7 +22525,8 @@ async def expire_invite(invitation_id: str, org_id: str,
     from tortoise.supabase_control import (
         invitation_expire as _sb_expire,
     )
-    await _require_owner_admin(user["user_id"], org_id)
+    await _require_owner_admin(user["user_id"], org_id,
+                               permission=Permission.MEMBERS_MANAGE)
     if is_supabase_enabled():
         try:
             return await _cp_offload(
@@ -22471,7 +22578,8 @@ async def list_invites(org_id: str, user: dict = Depends(get_current_user)):  # 
     )
     if is_supabase_enabled():
         try:
-            await _require_owner_admin(user["user_id"], org_id)
+            await _require_owner_admin(user["user_id"], org_id,
+                                       permission=Permission.MEMBERS_READ)
             return await _cp_offload(
                 lambda: pending_invitations(get_control_plane(), org_id),
                 op="pending_invitations")
@@ -22482,7 +22590,8 @@ async def list_invites(org_id: str, user: dict = Depends(get_current_user)):  # 
             # fallback to the registry.
             raise HTTPException(status_code=500,  # noqa: B904
                                 detail="Invites unavailable (control plane error)")
-    await _require_owner_admin(user["user_id"], org_id)
+    await _require_owner_admin(user["user_id"], org_id,
+                               permission=Permission.MEMBERS_READ)
     sdk = _make_sdk(namespace="registry")
     # Registry accept sets accepted_at but LEAVES status='pending' — a
     # consumed invite must not appear as actionable (code-review P2,
@@ -22754,7 +22863,8 @@ async def rescind_invite(invitation_id: str, org_id: str,
             # 403, not the SUSPENDED detail — no state oracle, matching the
             # registry branch below). invitation_rescind re-checks RBAC
             # internally (harmless duplicate).
-            await _require_owner_admin(user["user_id"], org_id)
+            await _require_owner_admin(user["user_id"], org_id,
+                                       permission=Permission.MEMBERS_MANAGE)
             return await _cp_offload(
                 lambda: invitation_rescind(
                     get_control_plane(), invitation_id, org_id, user["user_id"]),
@@ -22768,7 +22878,8 @@ async def rescind_invite(invitation_id: str, org_id: str,
             # fallback to the registry.
             raise HTTPException(status_code=500,  # noqa: B904
                                 detail="Invites unavailable (control plane error)")
-    await _require_owner_admin(user["user_id"], org_id)
+    await _require_owner_admin(user["user_id"], org_id,
+                               permission=Permission.MEMBERS_MANAGE)
     sdk = _make_sdk(namespace="registry")
     inv = sdk.invitation_get_by_id(invitation_id)
     if inv is None or inv.get("org_id") != org_id:
@@ -22792,7 +22903,8 @@ async def list_members(org_id: str, user: dict = Depends(get_current_user)):  # 
     via the seam (active + invited; identity rows surface their anon anchor
     as user_id so the members API can round-trip against agents). The
     registry path stays for selfhost."""
-    await _require_owner_admin(user["user_id"], org_id)
+    await _require_owner_admin(user["user_id"], org_id,
+                               permission=Permission.MEMBERS_READ)
     from tortoise.supabase_control import (
         get_control_plane,
         is_supabase_enabled,
@@ -22825,7 +22937,8 @@ async def remove_member(org_id: str, user_id: str, user: dict = Depends(get_curr
     org_memberships status='removed' via the seam (matched by user_id OR
     identity so anon-agent members are removable like registry-mode rows).
     The registry path stays for selfhost."""
-    membership = await _require_owner_admin(user["user_id"], org_id)  # noqa: F841
+    membership = await _require_owner_admin(  # noqa: F841
+        user["user_id"], org_id, permission=Permission.MEMBERS_MANAGE)
     from tortoise.supabase_control import (
         get_control_plane,
         is_supabase_enabled,
@@ -22873,7 +22986,8 @@ async def change_member_role(org_id: str, user_id: str, body: dict, user: dict =
     #765 (plan Task 8 writer inventory): Supabase mode PATCHes
     org_memberships role via the seam (user_id OR identity match). The
     registry path stays for selfhost."""
-    await _require_owner_admin(user["user_id"], org_id)
+    await _require_owner_admin(user["user_id"], org_id,
+                               permission=Permission.MEMBERS_MANAGE)
     new_role = (body or {}).get("role")
     if new_role not in ("admin", "member"):
         raise HTTPException(status_code=422, detail="role must be 'admin' or 'member'")
@@ -23070,7 +23184,8 @@ async def export_org(org_id: str, request: Request,
     """
     org_node = await _org_node(org_id)
     deleted_at = org_node.get("deleted_at") if org_node else None
-    await _require_owner(user["user_id"], org_id, allow_removed=deleted_at)
+    await _require_owner(user["user_id"], org_id, allow_removed=deleted_at,
+                         permission=Permission.ORG_EXPORT)
     if org_node is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     if deleted_at:
@@ -23877,7 +23992,8 @@ async def import_org(org_id: str, request: Request,
     """
     org_node = await _org_node(org_id)
     deleted_at = org_node.get("deleted_at") if org_node else None
-    await _require_owner(user["user_id"], org_id, allow_removed=deleted_at)
+    await _require_owner(user["user_id"], org_id, allow_removed=deleted_at,
+                         permission=Permission.ORG_IMPORT)
     if org_node is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     if deleted_at:
@@ -24274,7 +24390,8 @@ async def delete_org(org_id: str, request: Request,
     """
     org_node = await _org_node(org_id)
     deleted_at = org_node.get("deleted_at") if org_node else None
-    await _require_owner(user["user_id"], org_id, allow_removed=deleted_at)
+    await _require_owner(user["user_id"], org_id, allow_removed=deleted_at,
+                         permission=Permission.ORG_DELETE)
     if org_node is None:
         raise HTTPException(status_code=404, detail="Organization not found")
 
@@ -27015,7 +27132,8 @@ async def session_key(body: dict, request: Request, user: dict = Depends(get_cur
     # awaits). Role is checked on the RESOLVED tid (body org_id when
     # multi-membership, else memberships[0]) — never memberships[0] blindly.
     if purpose == "recovery":
-        await _require_owner_admin(user_id, tid)
+        await _require_owner_admin(user_id, tid,
+                                   permission=Permission.KEYS_RECOVER_ANY)
 
     api_key = f"tt_{_uuid.uuid4().hex}"
     key_hash = _hash(api_key)
@@ -27376,7 +27494,8 @@ async def _session_key_supabase(body: dict, request: Request, user: dict,
     # member-open. Role checked on the RESOLVED tid (body org_id when
     # multi-membership, else memberships[0]).
     if purpose == "recovery":
-        await _require_owner_admin(user_id, tid)
+        await _require_owner_admin(user_id, tid,
+                                   permission=Permission.KEYS_RECOVER_ANY)
 
     api_key = f"tt_{_uuid.uuid4().hex}"
     kid = _short_id()

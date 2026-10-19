@@ -752,6 +752,15 @@ SOURCE_PATTERNS = {
             # main. Same silent-drop shape as the #2938/#3154 entries above.
             "tortoise/email_notify.py",
             "tortoise/quota.py", "tortoise/supabase_control.py",
+            # #8692: the permission vocabulary + role bundles. Every authz gate
+            # in hosted_api.py resolves through it (`authority_for`,
+            # `holder_user_id`), and the guard that pins the bundle table and
+            # the surface→permission mapping is registered in `api` below —
+            # without this entry a permissions.py-only change matched no
+            # pattern, fell through to `core`, and the guard did not run on the
+            # one diff that can weaken every gate at once (the #3154 silent-drop
+            # shape).
+            "tortoise/permissions.py",
             "tortoise/selfhost_api.py", "tortoise/session_auth.py",
             # ask-lane server surfaces: test_metering.py + test_selfhost_rest.py
             # live in the api surface — a metering.py/selfhost.py-only PR must

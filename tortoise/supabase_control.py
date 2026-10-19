@@ -3508,12 +3508,17 @@ def api_key_by_id(cp, key_id: str) -> dict | None:
     select is a projection, so adding a column is additive for every caller
     (rotate / revoke / PATCH / replace-own); omitting it would make every row
     look org-owned and silently 403 the whole member lane.
+    #8692: ``owner_user_id`` is the HOLDER itself (phase 3). It must ride the
+    projection for the same reason as ``created_by`` — the holder predicate
+    prefers it and only falls back to the self-service class derivation when
+    it is unset, so a row carrying an explicit holder would read as org-owned
+    without this column here.
     """
     rows = cp.query(
         "api_keys",
         select=["org_id", "revoked_at", "created_via", "enabled", "name",
                 "scopes", "graph_id", "delegation_depth", "created_by_key_id",
-                "expires_at", "created_by"],
+                "expires_at", "created_by", "owner_user_id"],
         filters=[("id", "eq", key_id)],
     )
     return rows[0] if rows else None

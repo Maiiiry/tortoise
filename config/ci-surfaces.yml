@@ -776,6 +776,15 @@ surfaces:
   # fallback in select(), so without this arm the whole authorization contract
   # would run on no change that can break it.
   - test_own_key_selfservice_2446.py
+  # #8692 (phase 3 of #2427): the permission VOCABULARY + role bundles + the
+  # holder field. Owned by `api` for the same measured reason as the #2446 arm
+  # above — and one more: it is also the AST TRIPWIRE that requires every
+  # production gate call site in `tortoise/hosted_api.py` to name a permission,
+  # so a hosted_api.py-only diff (an EXACT `api` SOURCE_PATTERN that REPLACES
+  # the `core` fallback) MUST run it or a new role-shaped gate ships silent
+  # (the #1349/#3154 silent-drop class). `tortoise/permissions.py` is registered
+  # in the `api` SOURCE_PATTERN for the same reason.
+  - test_permissions_8692.py
   - test_mcp_client.py
   - test_mcp_http.py
   - test_mcp_rename_table.py  # #4282: Phase 0.3 rename table — old name → new name, per tool
@@ -5829,6 +5838,13 @@ durations:
   test_ingest_event_endpoint.py: 1.7
   test_session_key_recovery_gate.py: 3.3
   test_own_key_selfservice_2446.py: 7.8
+  # #8692: a file ADDED BY A PR has no CI junit measurement (the refresher
+  # samples push-to-main runs only), so this is the branch's LOCAL reading under
+  # the `# unmeasured` convention: sum of testcase/@time over ALL 38 tests =
+  # 3.35s, DB-free and monkeypatched (pure vocabulary + AST scans). Without the
+  # row the file packs at the flat 2.0s default and `--integrity` reds the
+  # durations coverage floor (#4348 trap).
+  test_permissions_8692.py: 3.4
   test_topic_summarization.py: 1.6
   test_aggregative_facet_coverage.py: 1.4
   test_de2e5_instantiates_ranking.py: 1.1
