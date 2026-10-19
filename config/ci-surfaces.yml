@@ -1093,6 +1093,14 @@ surfaces:
   # — they fall through to `core` — so without that arm a webhook_delivery-only
   # change would run no guard at all.
   - test_webhook_delivery.py
+  # #9233: the delivery store's §17.1 DECLARATION — the lane that keeps
+  # `#9124`'s armed write handle from refusing the hosted webhook surface. It
+  # rides the same two arms as the engine's contract suite: `core` for a
+  # `tortoise/webhook_delivery.py`-only diff (that file matches no named
+  # SOURCE_PATTERN and falls through to `core`) and `api` for
+  # `tortoise/hosted_api.py`, whose `create_subscription` is the door that
+  # reaches it.
+  - test_9233_webhook_declared_lane.py
   # #8098: the scheduled retry sweep — the TRIGGER the delivery layer lacked
   # (an idle tenant's backoff had nothing to notice it elapsed). The sweep's
   # arm site, its task registration and the never-raise/off-loop dispatch
@@ -3557,6 +3565,12 @@ surfaces:
   # engine's contract tests on that diff. Dual-registered under `api` (above)
   # for `tortoise/hosted_api.py`, which is an exact `api` match.
   - test_webhook_delivery.py
+  # #9233: the `core` half of the dual registration documented at the `api`
+  # entry — the declaration pin for `tortoise/webhook_delivery.py`, which
+  # matches no SOURCE_PATTERNS entry, so a change to the store alone selects
+  # `core` via the `tortoise/` fallback. Without this the declaration guard
+  # would not run on the diff that can break it.
+  - test_9233_webhook_declared_lane.py
   # #8098: the sweep's cheap gate (`webhook_delivery.due_subscription_count`)
   # is the ONE predicate the dispatcher also reads, so it must ride a
   # `webhook_delivery.py`-only diff: that file matches no named SOURCE_PATTERN
