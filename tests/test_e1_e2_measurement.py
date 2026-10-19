@@ -141,6 +141,58 @@ def test_census_reports_the_share_as_both_counts():
     assert cen["state_value_count"] >= 1
 
 
+def test_the_probe_asserts_one_pre_gate_population_across_the_gate_arms():
+    """#9110 review P2: the claim was PRINTED, never asserted.
+
+    `before`, `after-vet-shipped` and `after-vet-arbiter` differ only inside the
+    gate; if a future edit gives one of them its own candidate list, the delta is
+    no longer attributable to the gate and the run must fail — not print three
+    shas for a reader to notice. The mint-skip arm is excluded by construction.
+    """
+    corpus = probe.load_corpus(_CORPUS)
+    embed = probe.build_embed_list(corpus)
+    minted, _meta = probe.mint_skip_transform(embed)
+    arms = [("before", embed, False, None, False, "n/a"),
+            ("after-vet-shipped", embed, True, None, False, "vet-discard"),
+            ("after-vet-arbiter", embed, True, lambda c, n: {"verdicts": []}, True,
+             "vet-discard"),
+            ("counterfactual-mint-skip", minted, True, None, True,
+             "mint-time-transform")]
+    assert probe.assert_one_gate_population(arms) == probe._sha(embed)
+    drifted = json.loads(json.dumps(embed))
+    drifted["points"] = drifted["points"][1:]
+    arms[2] = (arms[2][0], drifted, *arms[2][2:])
+    with pytest.raises(AssertionError, match="one pre-gate population"):
+        probe.assert_one_gate_population(arms)
+
+
+def test_the_log_prints_the_value_literals_it_counts(run):
+    """#9110 review P2: `values=42` was a count nobody could audit.
+
+    The docstring and ``E1-E2.md`` limit 5 promise a reader can audit the matches
+    instead of trusting the count; the literals lived only in the optional
+    ``--json-out`` file, which was not part of the bundle. So the log prints them,
+    class and match, one line per arm — including the overlap, which is the whole
+    reason the figure is a count of MATCHES and not of distinct values.
+    """
+    lines = [ln for ln in run["text"].splitlines()
+             if " metric=state_value_literals " in ln]
+    assert len(lines) == 4, lines
+    for ln in lines:
+        matches = json.loads(re.search(r"matches=(\[.*\])$", ln).group(1))
+        assert matches, ln
+        assert all(len(m) == 2 and all(isinstance(x, str) for x in m)
+                   for m in matches), ln
+    before = json.loads(re.search(
+        r"matches=(\[.*\])$",
+        next(ln for ln in lines if ln.startswith("arm=before "))).group(1))
+    assert len(before) == MEASURED_STATE_VALUES
+    assert ["percent", "62 percent"] in before
+    assert ["count", "62"] in before, (
+        "the overlapping match is the disclosure: the same literal counts under "
+        "two classes, so the total is matches, not distinct values")
+
+
 def test_census_never_divides_by_zero_on_an_empty_graph():
     cen = probe.census({"payload": {"entities": [], "points": []}, "vet": {}}, {"points": []})
     assert cen["objects_total"] == 0
@@ -154,7 +206,9 @@ def test_census_never_divides_by_zero_on_an_empty_graph():
 MEASURED_BEFORE_SHARE = 0.60          # 15 of the 25 audited Objects are `the <X>`
 MEASURED_SHIPPED_REDUCTION = 0.0      # the shipped arm moves the share by NOTHING
 MEASURED_MINT_SKIP_REDUCTION = 0.225  # 9/25 dropped → 6/16 remain `the <X>`
-MEASURED_STATE_VALUES = 42            # value literals across 34 Points
+MEASURED_STATE_VALUES = 42            # value MATCHES across 34 Points (patterns
+                                      # overlap by design: `62 percent` also
+                                      # matches `count` for `62`)
 MEASURED_REAL_FACTS = 90              # planted must-keep units, both sides
 
 
@@ -290,6 +344,152 @@ def test_checker_fails_when_the_anti_gaming_control_is_absent(log_text):
     assert any("[V5]" in f for f in findings), findings
 
 
+def test_checker_fails_when_the_control_line_disagrees_with_its_arm(log_text):
+    """The control line is reconciled with the arm table, not only with itself.
+
+    #9110 round-6 review P2: both sides set to `1` keeps V5's fell-check green
+    while the arms still print `count=90` — the anti-gaming control could then
+    claim a population the run never had.
+    """
+    mutated = log_text.replace(
+        "e1-control before_real_facts=90 after_real_facts=90",
+        "e1-control before_real_facts=1 after_real_facts=1")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V5]" in f and "real_facts" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_e2_state_line_disagrees_with_its_arm(log_text):
+    mutated = log_text.replace("e2-state before=42 after=42",
+                               "e2-state before=7 after=7")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V6]" in f and "state_value_points" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_e2_atomic_line_disagrees_with_its_arm(log_text):
+    mutated = log_text.replace("e2-atomic before=114 after=114",
+                               "e2-atomic before=1 after=1")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V7]" in f and "atomic_points" in f for f in findings), findings
+
+
+def test_checker_fails_when_a_state_value_table_shrinks(log_text):
+    """#9110 round-6 review P1: `e2-state`/`e2-atomic` failed OPEN.
+
+    A lost state-value table is the exact property E2 exists to protect. Before
+    the sibling fell-check existed, `e2-state before=42 after=10` passed with
+    zero findings — V6 only asserted the keys were digits.
+    """
+    mutated = log_text.replace("e2-state before=42 after=42",
+                               "e2-state before=42 after=10")
+    findings, _ = check.check(mutated)
+    assert any("[V6]" in f and "FELL" in f for f in findings), findings
+
+
+def test_checker_fails_when_an_atomicity_table_shrinks(log_text):
+    mutated = log_text.replace("e2-atomic before=114 after=114",
+                               "e2-atomic before=114 after=1")
+    findings, _ = check.check(mutated)
+    assert any("[V7]" in f and "FELL" in f for f in findings), findings
+
+
+def _scored(text: str) -> str:
+    """Turn the measured log into a SCORED, all-green one at a zero threshold.
+
+    Used to exercise the fail-open shapes on a log the other rules ACCEPT: a
+    green scored log is what `--require-green` passes, so it is the one that must
+    not be allowed to hide a loss.
+    """
+    out = text
+    for old, new in (("prereg=UNPREREGISTERED", "prereg=deadbeef"),
+                     ("prereg_e1_threshold=n/a", "prereg_e1_threshold=0.0"),
+                     ("threshold=n/a", "threshold=0.0"),
+                     ("verdict=UNPREREGISTERED", "verdict=PASS"),
+                     ("result=UNPREREGISTERED", "result=GREEN"),
+                     ("exit=3", "exit=0")):
+        assert old in out, old
+        out = out.replace(old, new)
+    return out
+
+
+def test_a_green_scored_log_cannot_hide_a_lost_state_value_table(log_text):
+    """The end-to-end fail-open the review measured: `after=10` still GREEN.
+
+    V6/V9/V10 all accept it today; the criterion line's own number is 10 while
+    the after arm prints 42, so the reconciliation and the fell-check must fire.
+    """
+    scored = _scored(log_text)
+    assert check.check(scored)[0] == [], check.check(scored)[0]
+    mutated = scored.replace("e2-state before=42 after=42",
+                             "e2-state before=42 after=10")
+    findings, _ = check.check(mutated)
+    assert any("[V6]" in f and "FELL" in f for f in findings), findings
+
+
+def test_a_green_scored_log_cannot_hide_a_lost_atomicity_table(log_text):
+    scored = _scored(log_text)
+    mutated = scored.replace("e2-atomic before=114 after=114",
+                             "e2-atomic before=114 after=1")
+    findings, _ = check.check(mutated)
+    assert any("[V7]" in f and "FELL" in f for f in findings), findings
+
+
+def test_checker_fails_when_a_criterion_verdict_contradicts_its_counts(log_text):
+    """A `PASS` beside a fall, and a `FAIL` beside no fall, are both findings."""
+    scored = _scored(log_text)
+    lied = scored.replace("e2-state before=42 after=42",
+                          "e2-state before=42 after=10")
+    findings, _ = check.check(lied)
+    assert any("is PASS while its own counts fell" in f for f in findings), findings
+    failed_without_loss = scored.replace(
+        "e2-atomic before=114 after=114 fused_after=1 verdict=PASS",
+        "e2-atomic before=114 after=114 fused_after=1 verdict=FAIL")
+    assert failed_without_loss != scored
+    findings, _ = check.check(failed_without_loss)
+    assert any("is FAIL while its own counts did not fall" in f
+               for f in findings), findings
+
+
+def test_checker_accepts_a_coverage_table_with_every_class_detected(log_text):
+    """#9110 review P2: an EMPTY undetected list is a PASS, an ABSENT field is not.
+
+    Every class having a detector is the outcome #4894 is meant to produce; a
+    gate that rejects it has hard-coded today's coverage deficit into the bar.
+    """
+    header = next(ln for ln in log_text.splitlines()
+                  if ln.startswith("coverage rows="))
+    detected = re.sub(r"undetected_classes=.*$", "undetected_classes=", header)
+    assert detected != header
+    findings, state = check.check(log_text.replace(header, detected))
+    assert findings == [], findings
+    assert state["undetected_classes"] == []
+    absent = re.sub(r" undetected_classes=\S*", "", header)
+    assert absent != header
+    findings, _ = check.check(log_text.replace(header, absent))
+    assert any("[V8]" in f and "undetected_classes" in f for f in findings), findings
+
+
+def test_checker_fails_when_an_unpreregistered_log_carries_a_scored_verdict(
+        log_text):
+    """The reverse V10 direction: no frozen bar means no scored verdict at all."""
+    mutated = log_text.replace(
+        "e2-atomic before=114 after=114 fused_after=1 verdict=UNPREREGISTERED",
+        "e2-atomic before=114 after=114 fused_after=1 verdict=FAIL")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V10]" in f and "UNPREREGISTERED" in f for f in findings), findings
+
+
+def test_checker_fails_when_a_red_log_has_no_failed_criterion(log_text):
+    """RED means 'scored and something red' — with nothing scored it is a lie."""
+    mutated = log_text.replace("result=UNPREREGISTERED", "result=RED")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V10]" in f and "no criterion is FAIL" in f for f in findings), findings
+
+
 def test_checker_fails_when_a_criterion_passes_without_a_frozen_threshold(log_text):
     mutated = log_text.replace("e1-control before_real_facts=90 after_real_facts=90 "
                                "verdict=UNPREREGISTERED",
@@ -378,6 +578,61 @@ def test_checker_requires_green_when_asked(log_text, tmp_path):
 
 
 # ── 5. the pre-registration binding ───────────────────────────────────────
+
+
+@pytest.mark.parametrize("artifact", [
+    # the shape #9075 has not landed yet: an artifact with no E1 bar
+    {"e2": {"min_state_value_recall": 1.0}},
+    # an `e1` that is not a mapping — the pre-fix shape crashed with AttributeError
+    {"e1": "0.05"},
+    # a bar that is not a number — the pre-fix shape crashed inside float()
+    {"e1": {"min_share_reduction": "5%"}},
+    # a bool is an int in Python; a bar of `true` is not a bar
+    {"e1": {"min_share_reduction": True}},
+])
+def test_a_malformed_preregistration_measures_and_never_scores(artifact, monkeypatch):
+    """#9110 round-6 review P2: the artifact is validated, not consumed blind.
+
+    The pre-fix probe keyed `scored` on `prereg is not None`, so a dict without
+    `e1.min_share_reduction` printed four `UNPREREGISTERED` criteria and then
+    `result=RED` / `exit=1` — telling an operator a bar had been missed when none
+    existed. A non-mapping `e1`, or a non-numeric bar, raised out of `float()` and
+    the run wrote no log at all. Both must MEASURE (exit 3) and say why.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    monkeypatch.setattr(probe, "load_prereg", lambda sha: artifact)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = probe.main(["--prereg", "deadbeef" * 5])
+    text = buf.getvalue()
+    assert code == 3, text
+    assert "prereg-error=" in text, text
+    assert "result=UNPREREGISTERED" in text, text
+    assert "result=RED" not in text, text
+    assert "verdict=UNPREREGISTERED" in text, text
+    findings, state = check.check(text)
+    assert findings == [], findings
+    assert state["result"] == "UNPREREGISTERED"
+
+
+def test_a_valid_preregistration_is_read_once_into_a_numeric_bar(monkeypatch):
+    """The accepted shape still scores — validation must not refuse a good bar."""
+    import io
+    from contextlib import redirect_stdout
+
+    monkeypatch.setattr(probe, "load_prereg",
+                        lambda sha: {"e1": {"min_share_reduction": 0.05},
+                                     "e2": {"min_recall": 1.0}})
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = probe.main(["--prereg", "deadbeef" * 5])
+    text = buf.getvalue()
+    assert code == 1, text
+    assert "result=RED" in text
+    assert "prereg-error=" not in text
+    assert "prereg_e1_threshold=0.05" in text
 
 
 def test_scoring_uses_the_frozen_threshold_and_can_be_red(monkeypatch):

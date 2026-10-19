@@ -8,10 +8,13 @@ stated, and no criterion is called PASS without a pre-registered threshold. It
 does **not** re-derive the numbers — the probe owns them — and it cannot detect a
 forged log (a plausible number would pass), which is the same stated limit the
 sibling capstone gate carries. What it CAN do, and does, is refuse a log whose
-numbers disagree with each other: the ``e1`` line — the one line the verdict is
-read from — is reconciled against the ``arm=`` lines it summarizes (V3), and its
-``observed`` conclusion against its own ``reduction`` (V10), so a reduction
-borrowed from a counterfactual arm is a finding rather than a pass (#9110 review).
+numbers disagree with each other: every criterion line is reconciled against the
+``arm=`` lines it summarizes — ``e1`` (V3), ``e1-control`` (V5), ``e2-state`` (V6)
+and ``e2-atomic`` (V7) — each E2 criterion's verdict is checked against its own
+before/after counts (V5-V7), and the ``e1`` line's ``observed`` conclusion against
+its own ``reduction`` (V10). A reduction borrowed from a counterfactual arm, or a
+state-value table that shrank under a ``PASS``, is therefore a finding rather than
+a pass (#9110 reviews).
 
 Printing is not enough on its own: every finding below fails the run, because a
 log that omits its denominator is exactly the artifact this epic exists to refuse.
@@ -178,6 +181,67 @@ def check(text: str) -> tuple[list[str], dict]:
                     f"{expected_reduction:.6f}) — the movement claimed is not "
                     f"the printed counts")
 
+    # ── V3 (cont.) / V5-V7: EVERY criterion line reconciles with its arm lines ──
+    # `e1` is reconciled above. The three sibling criteria are printed by the
+    # probe from the same `census()` and were, until the #9110 round-6 review,
+    # never checked against the `arm=` lines they summarize — so the anti-gaming
+    # control could print one number while its arm table printed another, and a
+    # state-value table could shrink under a `PASS`, with every V-check green.
+    # Same within-log arithmetic class as V3: it still cannot detect a wholly
+    # forged log, only a log that disagrees with itself.
+    criteria_pairs = (
+        # (finding tag, criterion, arm metric line, arm metric key,
+        #  criterion before key, criterion after key)
+        ("V5", "e1-control", "real_facts", "count",
+         "before_real_facts", "after_real_facts"),
+        ("V6", "e2-state", "state_value_points", "values", "before", "after"),
+        ("V7", "e2-atomic", "atomic_points", "atomic", "before", "after"),
+    )
+
+    def arm_metric(arm: str | None, metric: str) -> dict[str, str]:
+        return log.kv(next((ln for ln in log.find(f"arm={arm} metric={metric} ")),
+                           None))
+
+    for tag, name, metric, arm_key, kb, ka in criteria_pairs:
+        prefix = "e2-atomic before=" if name == "e2-atomic" else f"{name} "
+        crit = log.kv(log.one(prefix))
+        for crit_key, arm in ((kb, before_arm), (ka, scored)):
+            printed = crit.get(crit_key, "")
+            if not printed.isdigit():
+                continue  # V5/V6/V7 already report the missing side
+            arm_line = arm_metric(arm, metric)
+            arm_value = arm_line.get(arm_key, "")
+            if not arm_value.isdigit():
+                findings.append(
+                    f"[{tag}] the {name} line cannot be reconciled: arm {arm!r} "
+                    f"prints no {metric} {arm_key}=")
+            elif int(printed) != int(arm_value):
+                findings.append(
+                    f"[{tag}] the {name} line's {crit_key}={printed} is not the "
+                    f"{arm} arm's {metric} {arm_key}={arm_value} — the line the "
+                    f"criterion is read from disagrees with its own counts")
+
+    # The two E2 criteria carry the anti-gaming control, so each verdict is checked
+    # against its own printed counts: a loss may never read as a pass (#9110 P1).
+    for tag, name, _metric, _key, kb, ka in criteria_pairs[1:]:
+        prefix = "e2-atomic before=" if name == "e2-atomic" else f"{name} "
+        crit = log.kv(log.one(prefix))
+        if crit.get(kb, "").isdigit() and crit.get(ka, "").isdigit():
+            before_n, after_n = int(crit[kb]), int(crit[ka])
+            if after_n < before_n:
+                findings.append(
+                    f"[{tag}] the {name} count FELL ({before_n} → {after_n}) — "
+                    f"the property this criterion exists to protect was lost")
+            verdict = crit.get("verdict", "")
+            if verdict == "PASS" and after_n < before_n:
+                findings.append(
+                    f"[{tag}] {name} is PASS while its own counts fell "
+                    f"({before_n} → {after_n})")
+            if verdict == "FAIL" and after_n >= before_n:
+                findings.append(
+                    f"[{tag}] {name} is FAIL while its own counts did not fall "
+                    f"({before_n} → {after_n})")
+
     gate_arms = [a for a in arms if seen.get(a) == "no"]
     cf = [a for a in arms if seen.get(a) == "yes"]
     gate_shas = {pre_shas.get(a) for a in gate_arms if pre_shas.get(a)}
@@ -256,10 +320,20 @@ def check(text: str) -> tuple[list[str], dict]:
         for key in ("rows", "in_scope", "positively_classified"):
             if not cov.get(key, "").isdigit():
                 findings.append(f"[V8] coverage does not state {key}=")
-        undetected = [c for c in cov.get("undetected_classes", "").split(",") if c]
-        if not undetected:
-            findings.append("[V8] coverage claims every class has a detector")
-        state["undetected_classes"] = undetected
+        # ABSENT is not EMPTY (#9110 review P2). The table is complete when every
+        # class has a detector — that is the outcome the semantic half (#4894) is
+        # meant to produce — so an empty list is a PASS. Only a field that is not
+        # there at all is a finding: the pair is indistinguishable in `kv()` (the
+        # KV regex needs a non-space value), so presence is read off the raw line.
+        cov_line = log.one("coverage rows=") or ""
+        if "undetected_classes=" not in cov_line:
+            findings.append("[V8] coverage does not state undetected_classes= — a "
+                            "missing field cannot be read as an all-detected table")
+            state["undetected_classes"] = []
+        else:
+            undetected = [c for c in cov.get("undetected_classes", "").split(",")
+                          if c]
+            state["undetected_classes"] = undetected
         per_class = [log.kv(ln) for ln in log.find("coverage class=")]
         declared = sum(int(kv.get("rows", "0") or 0) for kv in per_class)
         if per_class and cov.get("rows", "").isdigit() and \
@@ -314,6 +388,17 @@ def check(text: str) -> tuple[list[str], dict]:
         findings.append(f"[V10] no result line (got {result!r})")
     if result == "GREEN" and any(v != "PASS" for v in state["verdicts"].values()):
         findings.append("[V10] the log reports GREEN while a criterion is not PASS")
+    # ... and the two REVERSE directions. Without them a malformed
+    # pre-registration that left every criterion UNPREREGISTERED could still be
+    # reported as RED ("scored and something red") when nothing was scored, and
+    # a scored log could print `FAIL` under an UNPREREGISTERED result.
+    if result == "RED" and not any(v == "FAIL" for v in state["verdicts"].values()):
+        findings.append("[V10] the log reports RED while no criterion is FAIL — "
+                        "nothing was scored red")
+    if result == "UNPREREGISTERED" and any(
+            v != "UNPREREGISTERED" for v in state["verdicts"].values()):
+        findings.append("[V10] an UNPREREGISTERED log carries a scored criterion "
+                        "verdict — no frozen bar existed")
     if result == "UNPREREGISTERED" and exit_kv != "3":
         findings.append(f"[V10] an UNPREREGISTERED log must exit 3, not {exit_kv}")
     if result in ("GREEN", "RED") and exit_kv not in ("0", "1"):

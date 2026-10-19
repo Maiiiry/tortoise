@@ -1549,7 +1549,10 @@ def test_e1_e2_evidence_bundle_change_selects_core_not_the_docs_only_return():
     # dropping it silently. These asserts are on the `core` arm, which is what the
     # entries create: after the change, `surfaces=['core']` and the pin is present.
     # Mutation check: removing either CORE_ALSO entry restores `surfaces=[]` and
-    # fails the second assert.
+    # fails the FIRST assert (`"core" in r["surfaces"]`), which is the one that
+    # names the owning surface. The second assert (`full is False`) still PASSES on
+    # the docs-only early return, which returns `full: False` — the mutation is
+    # caught by the surface assert, not by that one (#9110 review P3).
     for path in ("docs/evidence/7949-capstone/probes/e1_e2_probe.py",
                  "docs/evidence/7949-capstone/corpus/e1e2_corpus.json",
                  "docs/evidence/7949-capstone/e1-e2.log",

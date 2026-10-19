@@ -21,11 +21,14 @@ and it is still replaceable by #9075's corpus without touching the probe.
    row and the probe's drop table — no arm here discards any of the four.
 
    Each labelled name arrives with the ``statement_excerpt`` it was minted from.
-   That statement becomes a ``Point`` carrying ``about_entities: [name]`` —
-   which is what production did (the audit's own reason field says
-   "referenced exactly once" on nine rows), and it is why ``vet_gate.apply_vet``
-   Rule 2 has something to defend. A corpus that emitted bare names with no
-   referencing statement would measure a pipeline nobody runs.
+   That statement becomes a ``Point`` carrying ``about_entities: [name]``, and it
+   is why ``vet_gate.apply_vet`` Rule 2 has something to defend. The audit's
+   ``reason`` field reads "referenced exactly once" on 15 of the 25 rows (and on
+   7 of the 9 names the probe's mint-skip arm drops); the wiring of
+   ``about_entities`` for all 25 is a **corpus-construction decision** the source
+   supports — every row carries the excerpt — not a fact the reason field attests
+   for every row. A corpus that emitted bare names with no referencing statement
+   would measure a pipeline nobody runs.
 
 2. ``tests/eval/write_path/gold/*.gold.json`` — the versioned write-path corpus's
    90 planted units across 7 sessions. These are the repo's own must-keep set

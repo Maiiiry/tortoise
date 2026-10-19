@@ -46,10 +46,13 @@ mechanism that does not exist would buy** — never as green. ``tools
 ``docs/evidence/7949-capstone/corpus/e1e2_corpus.json``, produced by a scripted
 model so the pipeline runs with no network and no provider key. That is not a
 weakness in the E1 measurement — it is the control: the only variable between
-``before`` and ``after`` is the gate, and the probe ASSERTS the pre-gate
-population is byte-identical across the three gate arms. What it cannot claim is
-anything about extraction quality on live traffic; the corpus is the population
-(see the README's limits).
+``before`` and ``after`` is the gate, and the probe ASSERTS
+(``assert_one_gate_population``) that the pre-gate population is byte-identical
+across the three gate arms, so a future edit that gave one gate arm its own
+candidate list fails the run instead of moving an arm's numbers. The mint-skip
+arm is EXCLUDED by construction (its whole point is a different candidate set)
+and is printed apart. What the probe cannot claim is anything about extraction
+quality on live traffic; the corpus is the population (see ``E1-E2.md``'s limits).
 
 **Why a pre-registration gate (§4.4 / #9075).** Thresholds chosen after the run
 are the failure the epic's pre-registration rule exists to stop. ``--prereg
@@ -61,7 +64,9 @@ a verdict, exiting 3. Measured numbers are evidence; a verdict without a frozen
 threshold is not.
 
 Exit codes: ``0`` scored and every criterion green · ``1`` scored and something
-red · ``3`` measured but UNPREREGISTERED (no frozen thresholds) · ``2`` usage.
+red · ``3`` measured but UNPREREGISTERED (no frozen thresholds, or an artifact
+the probe cannot consume — the malformed case is reported on ``prereg-error=``
+and never scored) · ``2`` usage.
 """
 from __future__ import annotations
 
@@ -69,10 +74,12 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 # The pack registry emits declaration notices at import time; they are not this
@@ -107,8 +114,12 @@ THE_PREFIX = re.compile(r"^the\s", re.IGNORECASE)
 #: spelled-out quantity bound to a unit ("forty rows", "ten-minute TTL"). This is
 #: a HEURISTIC and it is stated as one: it is deliberately generous (it would
 #: rather over-count a value than miss one, because the criterion it feeds is
-#: "nothing was lost"), and every value it finds is printed so a reader can audit
-#: the match instead of trusting the count.
+#: "nothing was lost"). The patterns OVERLAP on purpose — `62 percent` is also the
+#: `count` literal `62` — so the figure is a count of MATCHES, not of distinct
+#: values; `state_value_points` is the distinct-Point count. Every match is
+#: PRINTED in the log (one `metric=state_value_literals` line per arm, class and
+#: literal, so the overlap is visible), and a reader audits those literals instead
+#: of trusting the count.
 VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("percent", re.compile(r"\b\d+(?:\.\d+)?\s?(?:%|percent)\b", re.IGNORECASE)),
     ("measure", re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|s|sec|secs|seconds|min|mins|"
@@ -331,7 +342,7 @@ def census(result: dict, corpus: dict) -> dict:
     The payload is what the write path creates node-for-node (``execute_embed``
     maps entities→`:Object`, points→`:Point`), so a payload census and a graph
     census agree by construction; this one needs no server, which keeps the run
-    hermetic. Stated as a limit in the README rather than left implicit.
+    hermetic. Stated as a limit in ``E1-E2.md`` rather than left implicit.
     """
     payload = result["payload"]
     meta = {_norm(p["content"]): p for p in corpus["points"]}
@@ -342,11 +353,13 @@ def census(result: dict, corpus: dict) -> dict:
     must_keep = [t for t in points if (meta.get(t) or {}).get("must_keep")]
     state_points = []
     values = []
+    matches: list[tuple[str, str]] = []
     for t in points:
         vals = find_values(t)
         if vals:
             state_points.append(t)
             values.extend(v for _c, v in vals)
+            matches.extend(vals)
     atomic = [t for t in points if len(claim_units(t)) == 1]
     fused = [t for t in points if len(claim_units(t)) > 1]
 
@@ -362,6 +375,7 @@ def census(result: dict, corpus: dict) -> dict:
         "state_value_points": len(state_points),
         "state_value_count": len(values),
         "state_values": values,
+        "state_value_matches": matches,
         "atomic_points": len(atomic),
         "fused_points": len(fused),
         "fused_list": fused,
@@ -373,6 +387,33 @@ def _sha(obj: object) -> str:
     return hashlib.sha256(
         json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+
+
+MINT_SKIP_ARM = "counterfactual-mint-skip"
+
+
+def assert_one_gate_population(arms: list[tuple]) -> str:
+    """The three GATE arms must share ONE pre-gate population (#9110 review P2).
+
+    ``before``, ``after-vet-shipped`` and ``after-vet-arbiter`` differ only inside
+    the gate; the arbiter arm's extra mechanism answers S2.2's question about the
+    SAME candidates. So a different ``preg_embed_sha`` between them would make the
+    before/after delta an artifact of extraction rather than of the gate, and the
+    run must FAIL rather than print three shas for a reader to notice. Until this
+    assert existed the claim was enforced only for the two non-counterfactual arms
+    (the checker's V4), so a future edit giving the arbiter arm its own candidate
+    list moved that arm's numbers with no gate firing.
+
+    The mint-skip arm is excluded by construction: its whole point is a different
+    candidate set, and it is printed separately (``mint_skip_embed_sha=``).
+    """
+    shas = {_sha(emb) for name, emb, *_rest in arms if name != MINT_SKIP_ARM}
+    if len(shas) != 1:
+        raise AssertionError(
+            "the gate arms do not share one pre-gate population "
+            f"({sorted(shas)}) — the before/after delta is not attributable to "
+            "the gate alone")
+    return shas.pop()
 
 
 # ── pre-registration binding ───────────────────────────────────────────────
@@ -387,6 +428,38 @@ def load_prereg(sha: str) -> dict:
     """Read the frozen thresholds from the COMMIT's tree, never the worktree."""
     raw = _git("show", f"{sha}:{PREREG_ARTIFACT}")
     return json.loads(raw)
+
+
+def prereg_threshold(prereg: object) -> float:
+    """The E1 bar an artifact froze, or an error naming what is wrong with it.
+
+    The artifact is a CLAIM about a bar, so it is validated ONCE and explicitly
+    (#9110 round-6 review P2). Two failure modes existed while it was consumed
+    unvalidated: a dict without ``e1.min_share_reduction`` (the shape #9075 has
+    not landed yet) left ``threshold=None`` but was still treated as SCORED, so
+    the log printed every criterion ``UNPREREGISTERED`` and then ``result=RED`` /
+    ``exit=1`` — telling an operator a bar had been missed when none existed; and
+    a non-mapping ``e1`` (or a non-numeric bar) raised ``AttributeError`` /
+    ``ValueError`` and killed the run before it wrote any log at all.
+
+    ``TypeError``/``KeyError``/``ValueError`` here are the CONTRACT: the caller
+    reports them on the ``prereg-error=`` line and measures UNPREREGISTERED
+    (exit 3) instead of scoring against a bar it cannot read.
+    """
+    if not isinstance(prereg, Mapping):
+        raise TypeError(f"the artifact is a {type(prereg).__name__}, not an object")
+    e1 = prereg.get("e1")
+    if not isinstance(e1, Mapping):
+        raise TypeError("`e1` is absent or is not an object")
+    if "min_share_reduction" not in e1:
+        raise KeyError("`e1.min_share_reduction` is absent")
+    raw = e1["min_share_reduction"]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise TypeError(f"`e1.min_share_reduction` is {raw!r}, not a number")
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"`e1.min_share_reduction` is {raw!r}, not finite")
+    return value
 
 
 def measurement_sha() -> str:
@@ -487,9 +560,11 @@ def _run(argv: list[str] | None = None) -> int:
         (SCORED_ARM, embed, True, None, False, "vet-discard"),
         ("after-vet-arbiter", embed, True, definite_description_arbiter, True,
          "vet-discard"),
-        ("counterfactual-mint-skip", minted, True, None, True,
-         "mint-time-transform"),
+        (MINT_SKIP_ARM, minted, True, None, True, "mint-time-transform"),
     ]
+    # The control the measurement rests on, ASSERTED rather than printed: the
+    # three gate arms see one candidate set, so the delta is the gate's.
+    assert_one_gate_population(arms)
     results: dict[str, dict] = {}
     lines: list[str] = []
 
@@ -523,6 +598,10 @@ def _run(argv: list[str] | None = None) -> int:
         lines.append(f"arm={name} metric=state_value_points "
                      f"points={cen['state_value_points']} "
                      f"values={cen['state_value_count']}")
+        # The literals behind that count, class and match, so the audit path the
+        # docstring promises exists IN the committed log (#9110 review P2).
+        lines.append(f"arm={name} metric=state_value_literals "
+                     f"matches={json.dumps(cen['state_value_matches'], ensure_ascii=False)}")
         lines.append(f"arm={name} metric=atomic_points atomic={cen['atomic_points']} "
                      f"fused={cen['fused_points']}")
         vet_stats = cen["vet"] or {}
@@ -577,20 +656,22 @@ def _run(argv: list[str] | None = None) -> int:
     # ── the criteria ───────────────────────────────────────────────────────
     before_c, after_c = results[BEFORE_ARM]["census"], results[SCORED_ARM]["census"]
     prereg = None
+    threshold = None
     prereg_note = "UNPREREGISTERED"
     if args.prereg:
         try:
             prereg = load_prereg(args.prereg)
+            # Validated ONCE, here: a malformed artifact is a MEASUREMENT with no
+            # bar (exit 3), never a scored run that happens to have no threshold.
+            threshold = prereg_threshold(prereg)
             prereg_note = args.prereg
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        except (subprocess.CalledProcessError, json.JSONDecodeError,
+                TypeError, KeyError, ValueError) as e:
             lines.append(f"prereg-error={type(e).__name__}: {e} "
                          f"artifact={PREREG_ARTIFACT} sha={args.prereg}")
             prereg = None
+            threshold = None
     lines.insert(4, f"prereg={prereg_note} artifact={PREREG_ARTIFACT}")
-
-    threshold = None
-    if isinstance(prereg, dict):
-        threshold = prereg.get("e1", {}).get("min_share_reduction")
 
     # The threshold USED is printed twice on purpose: once as what the artifact
     # froze, once as what this run scored against. The checker fails if the two
@@ -598,9 +679,7 @@ def _run(argv: list[str] | None = None) -> int:
     # its own bar. E2's criteria are "no loss at all" (>= the before side), which
     # satisfies any preservation floor the pre-registration states — so no E2
     # number is consumed, and that is said rather than implied.
-    frozen = "n/a"
-    if isinstance(prereg, dict):
-        frozen = prereg.get("e1", {}).get("min_share_reduction", "ABSENT")
+    frozen = "n/a" if threshold is None else threshold
     lines.append(f"prereg_e1_threshold={frozen}")
     lines.append("prereg_e2_floor=not-consumed note=the E2 criteria are "
                  "no-loss (after >= before), which satisfies any stated floor")
@@ -657,7 +736,10 @@ def _run(argv: list[str] | None = None) -> int:
                      f"state_values={c['state_value_count']} "
                      f"note=NOT SCORED (mechanism absent from production)")
 
-    scored = prereg is not None
+    # SCORED means a bar was READ, not merely that an artifact existed. Keying
+    # this on `prereg is not None` (the pre-fix shape) let a malformed artifact
+    # report RED while every criterion said UNPREREGISTERED.
+    scored = threshold is not None
     green = scored and e1_ok and control_ok and state_ok and atomic_ok
     exit_code = 0 if green else (1 if scored else 3)
     lines.append(f"result={'GREEN' if green else ('RED' if scored else 'UNPREREGISTERED')}")
