@@ -147,9 +147,10 @@ banner above).
 | T3 | a committed record does not survive a failed cache delete (so the window is a resurrect) ⚠️ **#9207 replaced this row** (measured now: red at the message assertion, `_mutations(...) == []`; the cell below is the #7951 measurement of the row this plan shipped): a LANDED destroy whose append failed is now `test_a_landed_destroy_whose_record_failed_is_reported` (`record_committed=False`; the message says the record is UNCONFIRMED and must not say "not committed" nor "Nothing was destroyed in the cache"; `_mutations(...) == []`; `_live(...) is False`; the repaired state after a destructive `rebuild_all` is `_live(...) is True`) | `test_a_committed_delete_record_is_healed_by_replay` (force the delete to fail ⇒ record stands ⇒ `rebuild_all` removes the node) | **YES** — `[]` instead of one delete record |
 | T3b | a raise does NOT prove "nothing was destroyed" — a lost reply sits over an APPLIED write, so "no record" would be a silent unrecorded destroy | `test_a_lost_reply_over_an_applied_destroy_is_still_recorded` (the delete lands, the reply raises ⇒ the door reads the cache back, appends the destruction record, logs `_reply_lost`, and RETURNS `True` — no refusal is raised, because nothing was lost) | **YES** — measured against `b77d24084`: the old door raised its COMMITTED-arm refusal ("… was DESTROYED in the record and not in the cache … The cache is `extra_in_cache`") over a node the statement had already deleted, sending the caller after a divergence that was not there |
 | T3d | the landed-destroy arm's cause clause is false on the path where the statement APPLIED and then raised a transport error and only the append failed | `test_the_landed_destroy_arm_does_not_claim_the_statement_succeeded` (lost reply + append failure ⇒ `destroy_verified is True`, message must not say "did not report a failure of its own", no doubled period) | **YES** — but the red is the missing ATTRIBUTE, not message text: at `b77d24084` the append runs first, so it raised before the `DETACH DELETE` was issued (no destroy applied, node live) and the predecessor's "the ordering skipped the `DETACH DELETE`" was true; the test fails on `destroy_verified` |
+| T3g | the STATE-INDEPENDENT arm (write slot / MISCONF) cannot have applied, so a read there is both unnecessary and hazardous (on an absent key it re-creates the graph) | `test_a_state_independent_refusal_is_never_read_as_a_landed_destroy` (the refusal pays NEITHER a presence probe nor a read-back, and no record) | **YES** — the predecessor reads the cache on every failure |
 | T3c | neither verdict is provable (the delete raises AND the read-back raises) | `test_an_unreadable_after_state_writes_no_record_and_claims_nothing` (no record; `destroy_verified is False`; the message must NOT contain "did not report a failure of its own" — that raise is how the arm is reached — nor "the cache no longer holds this Point", nor call a present node "behind the TRUTH"; its PRESENT branch sends the caller to a re-issue and never to `rebuild_all`) | **YES** — the old `record_committed=True` arm claimed a cache state nobody verified |
 | T3e | a `graph was deleted or replaced` abort whose KEY is gone is read back as a landed destroy (the read auto-creates the empty graph, answers `count(n)=0`, and the door returns `True` with a written record) | `test_a_deleted_graph_key_is_never_read_as_a_landed_destroy` (`EXISTS` 0 ⇒ the engine's `ResponseError` surfaces, NO read-back is issued, no record) | **YES** — but not for that reason at `origin/main`: there the record is appended FIRST, so the abort raises `WriteNotLandedError(record_committed=True)` with the record already on disk, and both T3e's `not isinstance(...)` assertion and its no-record assertion fail (there is no read-back on `origin/main` at all — `_delete_landed_anyway` and `destroy_verified` do not exist there). The auto-created-empty-graph path this gate closes was measured on the GATE-LESS revision of this door, which is what T3e's docstring says |
-| T3f | the presence gate keyed on `graph_abort_family(exc)`, which is FALSE for every non-`ResponseError` raise, so a transport failure (timeout, dropped connection) skipped the probe and issued the read-back against whatever key state the server was in — on an absent key, a read that re-creates the graph and reports a landed destroy | `test_a_transport_failure_pays_the_presence_probe_too` (`ConnectionError` from the `DETACH DELETE` + `EXISTS` 0 ⇒ the probe IS paid, NO read-back is issued, no record, and the engine's own error surfaces) | **YES** — measured by mutating the gate back to `graph_abort_family(exc)`: `exists_calls == []` and the test reddens on its first assertion (14 others stay green) |
+| T3f | the presence gate keyed on `graph_abort_family(exc)`, which is FALSE for every non-`ResponseError` raise, so a transport failure (timeout, dropped connection) skipped the probe and issued the read-back against whatever key state the server was in — on an absent key, a read that re-creates the graph and reports a landed destroy | `test_a_transport_failure_pays_the_presence_probe_too` (`ConnectionError` from the `DETACH DELETE` + `EXISTS` 0 ⇒ the probe IS paid, NO read-back is issued, no record, and the engine's own error surfaces) | **YES** — measured by mutating the gate back to `graph_abort_family(exc)`: the probe is skipped and the read runs, so the test reddens on its first assertion |
 | T4 | journal-first journals a destruction that never happened | `test_a_missing_point_journals_nothing` (unknown id ⇒ `False`, zero records) | no (guard) |
 | T5 | the record's declared shape drifts in with an ordering fix | `test_the_delete_record_keeps_its_declared_shape` (one record, `op=delete`, `label=Point`, no `state`, no JSONL `PointRetracted`) | no (guard) |
 | T6 | the `:GraphEvent` subscriber surface silently changes | `test_the_graph_event_row_is_still_written_after_the_delete` (`poll_events` still reports `PointRetracted` with `deleted: true`) | no (guard) |
@@ -158,19 +159,25 @@ banner above).
 | T9 | the evidence probe restores a BOUND method onto the guarded handle's class, so sections 2-4 silently address section 1's graph | `test_the_evidence_probe_rebinds_the_guarded_handle_per_instance` (patch → restore ⇒ the class attribute is the class FUNCTION again, and a second SDK's write is visible only on its OWN underlying handle) | **YES** (against the pre-fix PROBE, not the door) — its restore assigned `proj.g.query` (bound) to the class, so SDK #2's write lands in SDK #1's graph |
 | T10 | the refusal names a record this door never writes (`PointAdded`) and attaches the graph name to the RECORD clause, sending a caller to the store that does not hold the destruction | `test_the_message_names_the_doors_own_record_and_graph` (the committed and unconfirmed arms both say `EntityMutated op=delete`, never `PointAdded`, and the graph sits in "in the record and not in the cache on graph 'cache_graph'"-style text only on the cache clause) | **YES** — red on the pre-change hardcoded `PointAdded` wording and misplaced `_where` |
 
-**Measured** (`TORTOISE_TEST_CARVE_OUT=1`, embedded lane): `5 failed, 5 passed` on the pre-change
-source (`origin/main`'s `tortoise/sdk.py` and `tortoise/exceptions.py` — T1/T2/T3/T8/T10 red,
-T4-T7/T9 green), `10 passed` after. ⚠️ Those two counts belong to the PRE-#9207 suite as this plan
-first shipped it; re-measured by #9207 against `b77d24084` with the then-current 13-test file it was
-`8 failed, 5 passed` (T1/T2/T3/T8/T3b/T3c/T3d/T10 red, T4-T7/T9 green — T10's delete-door assertions
-survive the reversal, but its additive `update_point` record-noun assertion reddens on the
-predecessor's `PointAdded`) and `13 passed` after. At the 14-test head this plan first recorded, the
-same swap measured **`9 failed, 5 passed`** (the extra red was T3e, the deleted-graph-key gate) and
-**`14 passed`** after. At THIS head the file has **15 tests**: the new one, **T3f**, is red on the
-same predecessor source for a reason of the same kind and provable by reading it — `origin/main`
-appends the record BEFORE the destroy, so the injected `ConnectionError` never surfaces (the door
-raises `WriteNotLandedError(record_committed=True)` first) and no presence probe is paid — and
-**`15 passed`** at this head (MEASURED, embedded lane, `8.3 s`). The
+**Measured** (`TORTOISE_TEST_CARVE_OUT=1`, embedded lane, and re-runnable by any lane):
+
+```console
+$ env -u TORTOISE_DB_URI TORTOISE_TEST_CARVE_OUT=1 uv run pytest \
+      tests/test_7951_delete_point_outbox.py -q                     # green at this head
+# the same file against the pre-#9207 sources shows WHICH rows are red:
+$ git worktree add --detach /tmp/red b77d24084 && cp tests/test_7951_delete_point_outbox.py /tmp/red/tests/
+$ cd /tmp/red && env -u TORTOISE_DB_URI TORTOISE_TEST_CARVE_OUT=1 uv run pytest \
+      tests/test_7951_delete_point_outbox.py -q
+```
+
+⛔ No totals are recorded here, deliberately. This paragraph collected a count
+per commit as the suite grew and each total was stale one push later — the "stale flag that records a past state and is never
+revalidated" failure, in an always-read document. What is STABLE is the RED ROW
+SET: against the pre-#9207 sources every non-guard row is red — T1 (the order),
+T2/T3c/T8 (a committed record over a cache that never performed the destroy), T3
+(its premise), T3b (the mirror error), T3d (the arm the predecessor does not
+have), T3e/T3f (the presence gate, which has no analogue there), T3g (the state-independent arm,
+which it reads like any other), T10 (the `update_point` record noun) — and green when the change is applied. The
 guards (T4-T7) pass on both sides by design and say so in their docstrings rather than implying
 detection power. T9 is a guard on the EVIDENCE ARTIFACT, not on the door: it is red against the
 pre-fix probe (whose restore put a BOUND method on the guarded handle's class) and green against the
@@ -192,7 +199,7 @@ fixed one.
 | the message names this door's own record, and the graph attaches to the cache clause | code | same (T10) | done |
 | test-file classification | config | `config/ci-surfaces.yml` — six-surface dual-registration + a `durations` row; `python tools/ci_selection.py --integrity` green | done |
 | executable demonstration | evidence | `docs/evidence/7951-delete-point-outbox/` (probe + verbatim log, exit 0; re-measured at this head — section 3 now prints the `record_committed=True` arm) | done |
-| MCP / public SDK surface | none | `tools/surface_manifest.py check` OK (82 rows); no tool or public method added/renamed | verified |
+| MCP / public SDK surface | none | `tools/surface_manifest.py check` OK (no tool row added, removed or renamed); no tool or public method added/renamed | verified |
 | raw guarded handle `proj.g.query` | **open** | — | **NOT enforced** (the §17.1 residual; `#7951` stays OPEN) |
 
 ## 6. Residuals — declared, not absorbed
