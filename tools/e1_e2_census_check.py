@@ -7,7 +7,11 @@ control is present, every dropped value names its cause, the coverage deficit is
 stated, and no criterion is called PASS without a pre-registered threshold. It
 does **not** re-derive the numbers — the probe owns them — and it cannot detect a
 forged log (a plausible number would pass), which is the same stated limit the
-sibling capstone gate carries.
+sibling capstone gate carries. What it CAN do, and does, is refuse a log whose
+numbers disagree with each other: the ``e1`` line — the one line the verdict is
+read from — is reconciled against the ``arm=`` lines it summarizes (V3), and its
+``observed`` conclusion against its own ``reduction`` (V10), so a reduction
+borrowed from a counterfactual arm is a finding rather than a pass (#9110 review).
 
 Printing is not enough on its own: every finding below fails the run, because a
 log that omits its denominator is exactly the artifact this epic exists to refuse.
@@ -128,6 +132,51 @@ def check(text: str) -> tuple[list[str], dict]:
         if pre.get("preg_embed_sha"):
             pre_shas[arm] = pre["preg_embed_sha"]
     state["shares"] = shares
+
+    # ── V3 (cont.): the `e1` line reconciles with the arm lines ───────────
+    # The `e1` line is the one line the VERDICT is read from (V9/V10), and it
+    # prints every operand the arm lines print: the before and after shares and
+    # the reduction between them. Without this reconciliation the log could
+    # claim the shipped arm reduced E1 by the COUNTERFACTUAL's margin — the
+    # number this bundle exists to attribute to a mechanism that does not exist —
+    # and pass every other check, because V3 reconciled only the arm lines with
+    # themselves. Within-log arithmetic on printed counts, the same class of
+    # check V3 already does: it still cannot detect a wholly forged log.
+    before_arm = next((a for a in arms
+                       if seen.get(a) == "no" and a != scored), None)
+    e1_kv = log.kv(log.one("e1 "))
+    if before_arm is None or scored not in shares or before_arm not in shares:
+        findings.append("[V3] the e1 line cannot be reconciled: the before arm "
+                        f"({before_arm!r}) or the scored arm ({scored!r}) prints "
+                        "no objects share")
+    else:
+        try:
+            e1_before = float(e1_kv["before_share"])
+            e1_after = float(e1_kv["after_share"])
+            e1_reduction = float(e1_kv["reduction"])
+        except (KeyError, ValueError):
+            findings.append("[V3] the e1 line does not print before_share, "
+                            f"after_share and reduction ({e1_kv})")
+        else:
+            if not math.isclose(e1_before, shares[before_arm], rel_tol=0,
+                                abs_tol=5e-6):
+                findings.append(
+                    f"[V3] the e1 line's before_share={e1_before} is not the "
+                    f"{before_arm} arm's share={shares[before_arm]} — the line "
+                    f"the verdict is read from disagrees with its own counts")
+            if not math.isclose(e1_after, shares[scored], rel_tol=0,
+                                abs_tol=5e-6):
+                findings.append(
+                    f"[V3] the e1 line's after_share={e1_after} is not the "
+                    f"scored arm's ({scored}) share={shares[scored]}")
+            expected_reduction = shares[before_arm] - shares[scored]
+            if not math.isclose(e1_reduction, expected_reduction, rel_tol=0,
+                                abs_tol=5e-6):
+                findings.append(
+                    f"[V3] the e1 line's reduction={e1_reduction} is not the "
+                    f"arm lines' difference (before - after = "
+                    f"{expected_reduction:.6f}) — the movement claimed is not "
+                    f"the printed counts")
 
     gate_arms = [a for a in arms if seen.get(a) == "no"]
     cf = [a for a in arms if seen.get(a) == "yes"]
@@ -269,6 +318,27 @@ def check(text: str) -> tuple[list[str], dict]:
         findings.append(f"[V10] an UNPREREGISTERED log must exit 3, not {exit_kv}")
     if result in ("GREEN", "RED") and exit_kv not in ("0", "1"):
         findings.append(f"[V10] a scored log must exit 0 or 1, not {exit_kv}")
+    # The threshold-free observation is a CONCLUSION about the reduction, so it
+    # must agree with the reduction printed beside it: "the share fell" and
+    # "NO_REDUCTION" cannot both be true.
+    observed = e1_kv.get("observed", "")
+    try:
+        reduction = float(e1_kv["reduction"])
+    except (KeyError, ValueError):
+        reduction = None
+    if observed not in ("NO_REDUCTION", "REDUCTION_OBSERVED"):
+        findings.append(f"[V10] the e1 line carries no observation "
+                        f"(got {observed!r})")
+    elif reduction is None:
+        findings.append("[V10] the e1 line carries no reduction to observe")
+    elif observed == "REDUCTION_OBSERVED" and reduction <= 0:
+        findings.append(
+            f"[V10] the e1 line observes a REDUCTION with reduction="
+            f"{reduction} — the observation contradicts the arithmetic beside it")
+    elif observed == "NO_REDUCTION" and reduction > 0:
+        findings.append(
+            f"[V10] the e1 line observes NO_REDUCTION with reduction="
+            f"{reduction} — the observation contradicts the arithmetic beside it")
     state["result"] = result
     return findings, state
 

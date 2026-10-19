@@ -6438,6 +6438,15 @@ durations:
   # restated figure re-staled for three review rounds. If you need the number, run
   # `ci_selection.duration_coverage_issues()` at YOUR head; do not quote this file.
   test_8093_registry_namespace_doc.py: 2.0
+  # #9076 / #9110: unmeasured — a file ADDED BY A PR cannot appear in a junit
+  # artifact (the #8849/#8093 rule), so it carries the flat default exactly as an
+  # absent key would. Do NOT substitute a local timing: the weight is a
+  # SHARD-LAYOUT input and only a measured CI junit value models the leg that
+  # carries the file. The row is carried rather than omitted because the file is
+  # in the fast pool (`core` + `tier1`) and an absent key moves the durations
+  # coverage RATIO; the old warning about restating a floor figure is not repeated
+  # here — run `ci_selection.duration_coverage_issues()` at YOUR head instead.
+  test_e1_e2_measurement.py: 2.0
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py

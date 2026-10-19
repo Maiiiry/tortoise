@@ -20,8 +20,12 @@ So the pins here are:
    discipline ``tests/test_salience_labels_4917.py`` applies to 9/15).
 4. **The structural checker fails on every dishonest shape** — one test per
    mutation, so the gate cannot pass by omission.
-5. **No criterion is PASS without a frozen threshold**, and the SCORED arm is
-   never a counterfactual.
+5. **No criterion is PASS without a frozen threshold**, the SCORED arm is
+   never a counterfactual, and a threshold the run MEETS cannot green it while a
+   control is red (the probe's `green = …` conjunction is otherwise unpinned).
+6. **Collecting this file must not mutate the interpreter.** The probe is imported
+   at collection time, so a process-global `logging.disable` in it would silence
+   every `caplog` assertion in the files that run after this one (#9110 review P1).
 
 DB-free: the pipeline runs with a scripted model, ``sdk=None``, no network.
 """
@@ -29,6 +33,7 @@ from __future__ import annotations
 
 import importlib.util as _ilu
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -314,6 +319,56 @@ def test_checker_fails_when_a_dropped_point_names_no_cause(log_text):
     assert any("[V6]" in f for f in findings), findings
 
 
+def test_checker_fails_when_the_e1_reduction_is_borrowed_from_a_counterfactual(
+        log_text):
+    """The `e1` line is the one the VERDICT is read from — reconcile it (#9110 P1).
+
+    The exact mutation the review measured as passing: keep both shares at 0.6 (as
+    every arm line prints) and claim the counterfactual's 22.5 pp as the SHIPPED
+    arm's reduction — the number this whole bundle exists to attribute to a
+    mechanism that does not exist in production.
+    """
+    assert "reduction=-0.000000" in log_text
+    mutated = log_text.replace("reduction=-0.000000", "reduction=0.225000")
+    findings, _ = check.check(mutated)
+    assert any("[V3]" in f and "difference" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_e1_shares_disagree_with_the_arm_lines(log_text):
+    mutated = log_text.replace(
+        "before_share=0.600000 after_share=0.600000",
+        "before_share=0.900000 after_share=0.900000")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V3]" in f and "before_share" in f for f in findings), findings
+    assert any("[V3]" in f and "after_share" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_scored_arm_counts_were_edited_consistently(log_text):
+    """A self-consistent edit to the after arm still has to match the e1 line."""
+    original = ("arm=after-vet-shipped metric=objects total=25 numerator=15 "
+                "denominator=25 share=0.600000")
+    assert original in log_text
+    mutated = log_text.replace(
+        original,
+        "arm=after-vet-shipped metric=objects total=20 numerator=1 "
+        "denominator=20 share=0.050000")
+    findings, _ = check.check(mutated)
+    # V3 is satisfied by the arms (1/20 is 0.05) — the e1 line is what objects
+    assert any("[V3]" in f and "after_share" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_observation_contradicts_the_reduction(log_text):
+    mutated = log_text.replace("observed=NO_REDUCTION", "observed=REDUCTION_OBSERVED")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V10]" in f and "contradicts" in f for f in findings), findings
+    # ... and the reverse direction, so neither side can drift alone
+    back = log_text.replace("reduction=-0.000000", "reduction=0.225000")
+    back_findings, _ = check.check(back)
+    assert any("[V10]" in f and "NO_REDUCTION" in f for f in back_findings), back_findings
+
+
 def test_checker_requires_green_when_asked(log_text, tmp_path):
     # the log's result is UNPREREGISTERED, so --require-green must exit 1
     path = tmp_path / "e1-e2.log"
@@ -343,8 +398,16 @@ def test_scoring_uses_the_frozen_threshold_and_can_be_red(monkeypatch):
     assert "verdict=FAIL" in text
 
 
-def test_a_green_run_requires_every_criterion(log_text, monkeypatch):
-    """A threshold the run DOES meet still cannot go green while a control is red."""
+def test_a_zero_threshold_greens_the_arm_but_the_observation_still_says_no(
+        monkeypatch):
+    """A zero threshold is MET by a 0.0 reduction — and cannot hide it.
+
+    This is the threshold-meets-the-run leg, NOT the control-conjunction leg
+    (that one is ``test_a_red_control_keeps_a_scoring_run_red`` below): every
+    control holds in the produced log, so what is pinned here is that a bar the
+    run meets greens it while the threshold-free ``observed=`` line still reports
+    that the share did NOT move.
+    """
     monkeypatch.setattr(probe, "load_prereg",
                         lambda sha: {"e1": {"min_share_reduction": 0.0}})
     import io
@@ -355,12 +418,60 @@ def test_a_green_run_requires_every_criterion(log_text, monkeypatch):
         code = probe.main(["--prereg", "deadbeef" * 5])
     text = buf.getvalue()
     assert "threshold=0.0" in text
-    # reduction == 0.0 >= 0.0 and every control held, so this arm scores green —
-    # and the threshold-free observation line still says the share did NOT move.
     assert code == 0, text
     assert "result=GREEN" in text
     assert "observed=NO_REDUCTION" in text, (
         "a zero threshold must not hide that the share did not move")
+
+
+def test_a_red_control_keeps_a_scoring_run_red(monkeypatch):
+    """A threshold the run DOES meet cannot go green while a control is red.
+
+    Pins the control conjunction in the probe's
+    ``green = scored and e1_ok and control_ok and state_ok and atomic_ok``
+    (#9110 review P2). Without this pin the terms could be deleted and every
+    other test in this file would still pass — leaving a run that LOST a planted
+    must-keep fact printing ``result=GREEN`` and exiting 0, which is exactly what
+    ``--require-green`` accepts. The loss is injected at the ``run_arm`` seam: the
+    SHIPPED arm's payload drops one planted unit, which is what a gate that bought
+    E1 with facts would produce. E1 itself still meets its 0.0 bar, so the only
+    red criterion is the control.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    corpus = probe.load_corpus(_CORPUS)
+    keep = {p["content"] for p in corpus["points"] if p.get("must_keep")}
+    real_run_arm = probe.run_arm
+
+    def run_arm_dropping_one_planted_fact(embed_list, *, vet, arbiter=None):
+        res = real_run_arm(embed_list, vet=vet, arbiter=arbiter)
+        shipped = (vet and arbiter is None
+                   and len(embed_list["entities"]) == len(corpus["objects"]))
+        if not shipped:
+            return res
+        points = list(res["payload"].get("points") or [])
+        idx = next(i for i, p in enumerate(points) if p.get("content") in keep)
+        payload = dict(res["payload"])
+        payload["points"] = points[:idx] + points[idx + 1:]
+        return {**res, "payload": payload}
+
+    monkeypatch.setattr(probe, "run_arm", run_arm_dropping_one_planted_fact)
+    monkeypatch.setattr(probe, "load_prereg",
+                        lambda sha: {"e1": {"min_share_reduction": 0.0}})
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = probe.main(["--prereg", "deadbeef" * 5])
+    text = buf.getvalue()
+    control = next(ln for ln in text.splitlines() if ln.startswith("e1-control "))
+    e1 = next(ln for ln in text.splitlines() if ln.startswith("e1 "))
+    assert "after_real_facts=89" in control, control
+    assert "verdict=FAIL" in control, control
+    # the E1 bar itself is met — so the RED below is the control's doing, not E1's
+    assert "after_share=0.600000" in e1 and "verdict=PASS" in e1, e1
+    assert code == 1, text
+    assert "result=RED" in text
+    assert "result=GREEN" not in text
 
 
 def test_the_threshold_used_must_be_the_one_the_artifact_froze(monkeypatch):
@@ -379,25 +490,94 @@ def test_the_threshold_used_must_be_the_one_the_artifact_froze(monkeypatch):
     assert "threshold=0.05" in text
     findings, _ = check.check(text)
     assert findings == [], findings
-    # mutate the used bar only — the run now scores against a threshold the
-    # artifact never stated, and the checker must refuse it
-    tampered = text.replace("threshold=0.05", "threshold=0.01", 1)
+    # mutate the USED bar only — the run now scores against a threshold the
+    # artifact never stated, and the checker must refuse it. The leading space is
+    # load-bearing: without it the FIRST match is `prereg_e1_threshold=0.05`, the
+    # FROZEN side, which is the wrong direction to tamper and passes anyway
+    # because V9's comparison is symmetric (#9110 review P2).
+    tampered = text.replace(" threshold=0.05", " threshold=0.01", 1)
+    assert "prereg_e1_threshold=0.05" in tampered, (
+        "the FROZEN threshold must be untouched — only the used bar is tampered")
+    assert " threshold=0.01" in tampered
     findings, _ = check.check(tampered)
     assert any("the bar moved" in f for f in findings), findings
 
 
-def test_a_prereg_commit_without_the_artifact_stays_unpreregistered():
-    """`git show` reads the COMMIT's tree — a missing artifact cannot be scored."""
+def test_a_prereg_commit_without_the_artifact_stays_unpreregistered(monkeypatch):
+    """`git show` reads the COMMIT's tree — a missing artifact cannot be scored.
+
+    The absence is injected at the ``git show`` seam rather than pinned on a named
+    commit (#9110 review P2). A HEAD-based pin — the original shape — self-invalidates
+    the moment #9075 lands ``preregistration.json``, which is the very artifact this
+    probe says it is waiting for: `load_prereg` would then succeed and this file
+    would break in whichever lane lands #9075. A fixed pre-artifact sha has the
+    mirror-image flaw — if a squash-merge rewrites it the case silently becomes
+    "the sha does not exist", which is not the property under test. The seam keeps
+    the property itself: the artifact is ABSENT from the tree `git show` is asked
+    for, and the run must MEASURE rather than invent a verdict.
+    """
     import io
     import subprocess
     from contextlib import redirect_stdout
 
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(_REPO_ROOT),
-                          capture_output=True, text=True, check=True).stdout.strip()
+    real_git = probe._git
+
+    def git_whose_tree_lacks_the_artifact(*args: str) -> str:
+        if args and args[0] == "show":
+            raise subprocess.CalledProcessError(
+                128, ["git", *args],
+                output="",
+                stderr=f"fatal: path '{probe.PREREG_ARTIFACT}' does not exist "
+                       f"in 'deadbeef'")
+        return real_git(*args)
+
+    monkeypatch.setattr(probe, "_git", git_whose_tree_lacks_the_artifact)
     buf = io.StringIO()
     with redirect_stdout(buf):
-        code = probe.main(["--prereg", head])
+        code = probe.main(["--prereg", "deadbeef" * 5])
     text = buf.getvalue()
     assert code == 3, text
     assert "prereg-error=" in text
     assert "result=UNPREREGISTERED" in text
+
+
+# ── 6. the probe must not touch PROCESS-global logging ────────────���───────
+
+
+def test_importing_the_probe_leaves_process_logging_enabled(caplog):
+    """#9110 review P1: `logging.disable` at module scope poisoned every `caplog`.
+
+    This module imports the probe at COLLECTION time, so a module-scope
+    `logging.disable(WARNING)` ran before any test in the process. It sets
+    ``logging.Manager.disable``, which ``caplog.at_level()`` does NOT reset (that
+    touches only the logger and handler levels), so `Logger.isEnabledFor` returns
+    False for every level <= 30 and the record is never created — every positive
+    `caplog` assertion later in the same pytest process silently saw zero records,
+    and every `assert not caplog.records` passed for the wrong reason.
+    """
+    assert logging.root.manager.disable == logging.NOTSET, (
+        "importing the probe disabled logging for the whole pytest process: "
+        f"logging.Manager.disable={logging.root.manager.disable}")
+    with caplog.at_level(logging.WARNING):
+        logging.getLogger("e1e2.pin").warning(
+            "this WARNING must survive the probe's import")
+    assert "this WARNING must survive the probe's import" in caplog.text, (
+        "the probe's import swallowed a WARNING record — every caplog assertion "
+        "in this process is now vacuous")
+
+
+def test_a_run_restores_the_logging_state_it_found():
+    """The mute is scoped to the printed log, and the previous state comes back."""
+    import io
+    from contextlib import redirect_stdout
+
+    previous = logging.root.manager.disable
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        probe.main([])
+    assert buf.getvalue(), "the run must still print its log"
+    assert logging.root.manager.disable == previous, (
+        "the run left logging disabled after it returned: "
+        f"{logging.root.manager.disable} != {previous}")
+    assert logging.getLogger("e1e2.pin.after").isEnabledFor(logging.WARNING), (
+        "a WARNING emitted after the run is no longer even created")

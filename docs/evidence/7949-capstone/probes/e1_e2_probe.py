@@ -76,8 +76,13 @@ import sys
 from pathlib import Path
 
 # The pack registry emits declaration notices at import time; they are not this
-# measurement's subject and would bury the numbers in the evidence log.
-logging.disable(logging.WARNING)
+# measurement's subject and would bury the numbers in the evidence log. The mute
+# is applied INSIDE `main()`, never at module scope: `logging.disable` sets
+# `logging.Manager.disable`, which is PROCESS-global, and
+# `tests/test_e1_e2_measurement.py` imports this module at COLLECTION time — so
+# a module-scope call outlives the run and silences every `caplog` assertion at
+# WARNING/INFO in every later test of the same pytest process (`caplog.at_level`
+# sets only the logger and handler levels, never `Manager.disable`).
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT))
@@ -444,6 +449,22 @@ def _f(x: bool) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the measurement to stdout, with the registry's notices muted.
+
+    The mute is SCOPED to this call and restored in a ``finally`` (#9110 review
+    P1). At module scope it leaked into the whole pytest process — see the note
+    beside the ``logging`` import. Only the PRINTED log needs it quiet; the
+    measurement never did.
+    """
+    previous = logging.root.manager.disable
+    logging.disable(logging.WARNING)
+    try:
+        return _run(argv)
+    finally:
+        logging.disable(previous)
+
+
+def _run(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="E1+E2 on one run, one corpus (#9076)")
     ap.add_argument("--corpus", default=str(DEFAULT_CORPUS))
     ap.add_argument("--prereg", default="")
