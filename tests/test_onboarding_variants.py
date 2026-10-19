@@ -323,7 +323,10 @@ def test_8169_onboarding_documents_the_support_direction_of_strength():
     assert "#2315" in rating, (
         "the band must separate itself from #2315's never >0.50 dampener "
         "rule — the two multipliers are different mechanisms")
-    assert "1.0" in rating, "an unset rating is exactly neutral and must say so"
+    assert "neutral (factor 1.0)" in flat, (
+        "an unset rating is exactly neutral and the paragraph must SAY so — "
+        "the bare `1.0` is satisfied by `(base 1.0)` in the bounds sentence, "
+        "so a deleted neutrality clause stayed green")
     # Anchored on the PHRASE (and on a `\b`, so #2315's `0.50` cannot stand in
     # for it), not on the bare number. `"0.5"` is a substring of the
     # `never > 0.50` text this same slice is REQUIRED to carry four lines up,
@@ -336,18 +339,39 @@ def test_8169_onboarding_documents_the_support_direction_of_strength():
     assert re.search(r"best is 2\.0\b", flat), (
         "the band's BEST edge (2.0) must be stated where the band is defined")
 
-    # The bounds must be DIRECTIONAL. `annotation_factor` is applied before the
-    # [0.1, 10.0] clamp, so on an operator-targeting NAND (base 16.0) the ceiling
-    # squeezes the GAIN only: 16.0 * 2.0 clamps to 10.0 (gains nothing) while
-    # 16.0 * 0.5 = 8.0 reduces freely. Stated direction-blind ("not at all"),
-    # the paragraph contradicted its own symmetry claim and told an agent a
-    # rating cannot lower that weight (see weights.py:126-127, sdk.py:14060-14063).
+    # The bounds must be DIRECTIONAL, and the compression must be stated for
+    # BOTH directions. `annotation_factor` is applied before the [0.1, 10.0]
+    # clamp, so on an operator-targeting NAND (base 16.0) the ceiling absorbs
+    # the GAIN entirely (16.0 * 2.0 clamps to 10.0 — nothing to gain) AND
+    # compresses the dampening: only a factor below 10.0/16.0 = 0.625 clears
+    # the ceiling, so a mild down-rating moves nothing and the worst rating
+    # lands at 8.0, a ~20% cut rather than the nominal 50%. Two earlier
+    # revisions of the paragraph were false here and stayed green because the
+    # test pinned the wrong claim: "not at all" (direction-blind) and then
+    # "only the GAIN is squeezed" (magnitude-blind). `weights.py:121-131`
+    # states the true shape — "exact near the bottom of the range and
+    # compresses as the base approaches the ceiling".
     assert "RAISING" in flat, (
         "the NAND bound must be scoped to RAISING the weight — the clamp "
-        "absorbs gain only, and a direction-blind bound is false")
-    assert "gains nothing" in flat and "reduces it" in flat, (
-        "both directions at the ceiling must be stated: a better rating gains "
-        "nothing there, a worse one still reduces it")
+        "absorbs gain only on a plain NAND, so a direction-blind bound is false")
+    assert "gains nothing" in flat, (
+        "the ceiling's effect on the GAIN must be stated: a better rating on an "
+        "operator-targeting NAND cannot raise it")
+    assert "16.0 × 0.625 = 10.0" in flat, (
+        "the absorption threshold must be stated: 16.0 × 0.625 = 10.0, so any "
+        "factor at or above 0.625 is clamped and a mild down-rating is inert "
+        "— without it the paragraph implies every down-rating lands")
+    assert "16.0 × 0.5 = 8.0" in flat, (
+        "the worked worst case must be stated: 16.0 × 0.5 = 8.0, i.e. a ~20% "
+        "cut from the clamped 10.0, not the nominal 50%")
+    assert "compresses" in flat, (
+        "the ceiling compresses the band's EFFECT as the base approaches it "
+        "(weights.py:121-131); a symmetric-band claim without the compression "
+        "is false on a NAND")
+    assert "only the gain" not in flat.lower(), (
+        "the clamp squeezes the DAMPENING too — 'only the GAIN is squeezed' is "
+        "false on a 16.0 base, where a mild down-rating is absorbed and the "
+        "worst lands at 8.0 instead of 4.0")
 
     # `annotate_operator` takes FOUR required dimensions, not two — a doc that
     # names only bias/precision sends the caller at a TypeError. Asserted in

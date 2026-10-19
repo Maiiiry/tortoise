@@ -951,13 +951,16 @@ cannot reach the graph (never decide against a dead connection):
    multiplies the base weight and the result is then clamped to [0.1, 10.0],
    so it applies in full to an ordinary IMPL (base 1.0), but only partly to a
    NAND when RAISING the weight (base 8.0 → 16.0 clamps to 10.0, a 1.25× gain
-   at best) and not at all to a NAND whose target is itself an operator — its
-   neutral 16.0 is already on the ceiling, so a better rating gains nothing
-   there, while a worse one still reduces it (16.0 × 0.5 = 8.0, no clamp).
-   The band therefore stays symmetric — only the GAIN is squeezed near the
-   ceiling. And never use a rating to disagree with a connection — that is
-   NAND's job. #2315's `never > 0.50` rule is untouched: it governs mitigation
-   strength, not this multiplier.
+   at best) and gains nothing on a NAND whose target is itself an operator —
+   its neutral 16.0 already sits on the ceiling, so a better rating cannot
+   raise it. The band keeps its symmetry, but its EFFECT compresses as the
+   base approaches the ceiling, in BOTH directions: with no mitigation on that
+   16.0 base the clamp absorbs every factor at or above 0.625 (16.0 × 0.625 =
+   10.0), so a mild downgrade moves nothing, and even the worst rating only
+   reaches 16.0 × 0.5 = 8.0 — a ~20% cut, not the nominal 50%. And never use a
+   rating to disagree with a connection — that is NAND's job. #2315's
+   `never > 0.50` rule is untouched: it governs mitigation strength, not this
+   multiplier.
 6. **Options can IMPL/NAND each other** — two go well together (IMPL), three
    are mutually exclusive (NAND).
 7. **Rank + sanity-check.** Run `tortoise_compute_confidence` (anchors = the
