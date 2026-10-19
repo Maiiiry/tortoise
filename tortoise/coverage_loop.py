@@ -54,6 +54,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,15 @@ _DATE_RECENCY_RE = re.compile(
     r"(?:\b(\d+)\s+(days?|weeks?|months?)\s+ago\b"
     r"|\blast\s+(\d+)\s+(days?|weeks?|months?)\b)")
 _UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
+
+#: Calendar-date PREFIX carrier — the shapes both date sources actually arrive
+#: in: ISO (``2026-09-01`` / ``2026-09-01T00:00:00Z``) and — measured on the
+#: frozen LongMemEval dataset, 23,867/23,867 values, #3011 — the ingest
+#: producer's ``haystack_dates``/``createdAt`` shape ``2023/05/20 (Sat) 03:29``.
+#: Same shape token as ``tortoise/subgraph_render.py``'s parser; duplicated
+#: rather than imported because that module pulls the eval harness in and this
+#: one is a stdlib-only leaf at import time (see ``_session_of``).
+_CALENDAR_DATE_RE = re.compile(r"^(\d{4})[-/](\d{2})[-/](\d{2})")
 
 #: Fallback date (mirrors the eval seam) — anchors month-day interval bounds
 #: whose year the query does not carry (never used by the eval which passes
@@ -134,40 +144,106 @@ def facet_date_constraint(text: str) -> tuple[str | None, str | None, str | None
     return None, None, None
 
 
+def _calendar_date(value: object) -> str | None:
+    """Normalize a session/question date to ``YYYY-MM-DD``, or ``None``.
+
+    Accepts every shape the two date sources actually carry — ISO
+    (``2026-09-01``, ``2026-09-01T00:00:00Z``) and the ingest producer's real
+    ``2023/05/20 (Sat) 03:29`` (#3011) — and VALIDATES the result through
+    ``date.fromisoformat`` so an out-of-range ``2026-13-45`` is undated too.
+
+    ``None`` means UNDATED (missing, empty, the undated sentinel, free text):
+    no date is ever fabricated, and the caller decides what undated means
+    for its bound (the span qualification drops it — it cannot be proven
+    in-window; the window resolution ignores it).
+    """
+    if not value:
+        return None
+    match = _CALENDAR_DATE_RE.match(str(value).strip())
+    if match is None:
+        return None
+    year, month, day = match.groups()
+    try:
+        return date.fromisoformat(f"{year}-{month}-{day}").isoformat()
+    except ValueError:
+        return None
+
+
+def facet_window_bounds(kind: str | None, start: str | None, end: str | None,
+                        session_dates: dict[str, str] | None = None,
+                        ) -> tuple[str, str] | None:
+    """Resolve a detected date bound into an inclusive ISO ``(lo, hi)``
+    window — THE single source of truth for the R5 window arithmetic.
+
+    The span qualification (:func:`_span_in_window`) and the routed
+    point-level qualification (#2569) both resolve through THIS function, so
+    the two can never disagree about what "in window" means.
+
+    * ``interval`` — ``(start, end)`` as calendar dates, ordered (a reversed
+      "between A and B" still means the window the question named rather
+      than an empty one).
+    * ``recency`` — ``(qdate − N days, qdate)`` where ``qdate`` is the LATEST
+      parseable date in ``session_dates``. The graph carries no global clock,
+      so the haystack's newest session stands in for "now" (the eval passes
+      the question's ``haystack_dates``; unchanged from the pre-#8710 rule).
+
+    ``None`` means NO BOUND: the caller keeps its unqualified input. Every
+    unresolvable input degrades here rather than raising — an unknown kind, a
+    missing/unparseable bound, a recency day count that is not an integer, a
+    recency bound with no parseable session date. That is the #8710 rule and
+    it is structural: a date that cannot be resolved can only ever mean
+    "unbounded", NEVER "matches nothing", because a degenerate hard filter
+    silently kills the facet (the pre-#8710 recency branch raised ``TypeError``
+    on the raw ISO string and the interval branch compared strings, so the
+    whole temporal facet was dead on the producer's ``2023/05/20 (Sat)" shape).
+    """
+    if kind == "interval":
+        lo, hi = _calendar_date(start), _calendar_date(end)
+        if lo is None or hi is None:
+            return None
+        return (lo, hi) if lo <= hi else (hi, lo)
+    if kind == "recency":
+        try:
+            n_days = max(0, int(start or 0))
+        except (TypeError, ValueError):
+            return None
+        known = [d for d in (_calendar_date(v)
+                             for v in (session_dates or {}).values()) if d]
+        if not known:
+            return None
+        qdate = date.fromisoformat(max(known))
+        return ((qdate - timedelta(days=n_days)).isoformat(),
+                qdate.isoformat())
+    return None
+
+
 def _span_in_window(span: frozenset[str],
                     session_dates: dict[str, str] | None,
                     kind: str | None, start: str | None,
                     end: str | None) -> frozenset[str]:
-    """Date-qualify a facet's session span (pure). interval: keep sessions
-    whose date ∈ [start, end]; recency: keep sessions whose date ∈
-    [qdate − N_days, qdate] where the question date is the max session date
-    available (the eval's haystack dates; the graph has no global clock).
-    Unknown dates are kept when no bound applies; when a bound applies an
-    undated session cannot be proven in-window and is dropped (the span
-    stays honest — a facet whose whole span filters out is dropped by the
-    caller)."""
+    """Date-qualify a facet's session span (pure).
+
+    The window comes from :func:`facet_window_bounds` (the shared
+    resolution); the session dates are normalized through
+    :func:`_calendar_date` (ISO and the producer's ``2023/05/20 (Sat) 03:29``
+    shape compare correctly — comparing the RAW strings is what made the
+    interval branch drop every session on the frozen dataset).
+
+    No bound (unknown kind, no session dates, or a bound that cannot be
+    resolved) keeps the span untouched. When a bound DOES apply, an undated
+    session cannot be proven in-window and is dropped (the span stays honest
+    — a facet whose whole span filters out is dropped by the caller).
+    """
     if kind is None or not session_dates:
         return span
-    if kind == "interval":
-        if not start or not end:
-            return span
-        return frozenset(
-            s for s in span
-            if (session_dates.get(s) or "") and start <= session_dates[s] <= end)
-    if kind == "recency":
-        try:
-            n_days = int(start or 0)
-            qdate = max(v for v in session_dates.values() if v)
-        except ValueError:
-            return span
-        if not qdate:
-            return span
-        from datetime import timedelta
-        lo = (qdate - timedelta(days=n_days)).isoformat()
-        return frozenset(
-            s for s in span
-            if (session_dates.get(s) or "") and lo <= session_dates[s] <= qdate)
-    return span
+    window = facet_window_bounds(kind, start, end, session_dates)
+    if window is None:
+        return span
+    lo, hi = window
+    return frozenset(
+        s for s in span
+        if (d := _calendar_date(session_dates.get(s))) is not None
+        and lo <= d <= hi)
 
 
 def _token_overlap(query: str, name: str, *, keep_numeric: bool = False) -> bool:
@@ -199,8 +275,11 @@ def facet_census(proj: Any, query: str, *,
     ``session_dates``: {session_id: ISO-date} over the query's haystack —
     when provided AND the query text carries an interval/recency bound, each
     anchor's span is date-qualified to the in-window sessions (the §4 P0
-    date-range facet). ``max_anchors``/``max_span_sessions`` override the
-    documented bounds (tests pin the defaults).
+    date-range facet) through the SHARED :func:`facet_window_bounds`
+    resolution (#8710 — both date shapes the sources carry, and an
+    unresolvable bound degrades to "no bound" rather than emptying the
+    span). ``max_anchors``/``max_span_sessions`` override the documented
+    bounds (tests pin the defaults).
     """
     if not query or not query.strip():
         return []
