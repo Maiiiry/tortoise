@@ -1186,6 +1186,15 @@ surfaces:
   # SOURCE_PATTERN, so a change to it falls through to `core` — registering the
   # guard HERE is what makes the file selected for the code it holds.
   - test_5612_journal_append_serialization.py
+  # #9075: the capstone pre-registration gate — `docs/evidence/7949-capstone/PRE-REGISTRATION.md`
+  # must name a metric, a denominator and a numeric threshold for E1–E5, its add-commit must
+  # strictly precede every evidence log beside it, the E4 denominator must be 15 (never 4), and
+  # every corpus pin must still re-derive from `tests/eval/write_path/`.
+  # Dual-registered (`core` + `tier1`) for the same docs-only reason as the extractor-v4 guards:
+  # the registration's OWN subject is a doc, and a `docs/`-only diff takes `select()`'s early
+  # return and runs `tier1` only — while a corpus edit under `tests/eval/write_path/` is exactly
+  # the change that silently re-bases every threshold, and that is a `core` selection.
+  - test_capstone_preregistration_9075.py
   # #7983 (§17.4.4/§17.4.6): the read ledger — the instrument the hot fraction
   # `f` never had. `core` is the right arm: neither tortoise/read_ledger.py (a NEW
   # file, so it matches no SOURCE_PATTERN) nor tortoise/sdk.py selects anything
@@ -4458,6 +4467,11 @@ tier1:
 - test_w4_why_enrichment.py
 - test_weights.py
 - test_writer_inventory.py
+# #9075: the capstone pre-registration gate (`core` above) — same no-DB shape (one YAML pins
+# block, a markdown table parse, and a `git log --diff-filter=A` read), and a docs-only PR is
+# exactly the change that can edit a threshold, or add an evidence log that predates the
+# registration.
+- test_capstone_preregistration_9075.py
 # #5092: the extractor-v4 design's step-list guard is a fast, no-DB file scan, so a
 # docs-only PR runs it here — the same placement as `test_retention_promise.py` above.
 - test_extractor_v4_step_list_consistency.py
