@@ -314,16 +314,24 @@ _DUMP_PAGE_SIZE = 1000
 #: returns 0 node rows on v4 as well.
 #:
 #: Consequence of the old form was concrete: the FIRST node page was empty on the
-#: v6 server measured, so ``dump_graph`` exported 0 nodes for a populated graph
-#: and the fail-closed guard below refused — **no backup could be taken on that
-#: engine**, with a message that blamed a truncated read (#9226).
+#: v6 server measured, so any node that was not an edge endpoint disappeared from
+#: the export and the fail-closed guard refused — **a graph holding an isolated
+#: node could not be backed up on that engine**, with a message that blamed a
+#: truncated read (#9226).
 #:
-#: ⛔ And the SHIPPED form needs a guard of its own on the same engine: for a graph
-#: ABSENT from the registry, ``id(n) >= 0`` returns a phantom row ``(0, [], {})``
-#: while ``MATCH (n)`` returns nothing and the store's own count is 0 (an
-#: empty-but-PRESENT graph reads as 0 rows on both cores). ``dump_graph``
-#: therefore does not page a graph whose independent count is 0 — see the
-#: ``node_rows`` skip there, which keeps a never-written graph dumping as empty.
+#: ⛔ And the SHIPPED form needs a guard of its own on the same engine: for a
+#: graph ABSENT from the registry, ``id(n) >= 0`` returns a phantom row
+#: ``(0, [], {})`` while ``MATCH (n)`` returns nothing and the store's own counts
+#: are 0 (an empty-but-PRESENT graph reads as 0 rows on both cores). ``dump_graph``
+#: therefore skips the node page only when a `MATCH (n)` existence probe — which
+#: cannot produce the phantom — finds no node at all; see ``_graph_has_any_node``.
+#:
+#: The blast radius of the old form is NOT "no backup on v6": ``dump_graph``
+#: reconciles edge endpoints by id (#3895), so a graph whose nodes are all edge
+#: endpoints dumped COMPLETE even pre-fix (measured on 60002: 3 nodes / 2 edges).
+#: It is a graph containing an ISOLATED node that could not be dumped — the node
+#: is absent from the (empty) first page and no edge pulls it back, so the totality
+#: guard refuses, and the message blamed a truncated read.
 #: Offsetting the cursor instead of negating it is engine-independent: an
 #: integer `id` is non-negative, so ``id >= 0`` is the true first page on both
 #: cores and ``id >= last + 1`` is exactly the old ``id > last``.
@@ -351,11 +359,11 @@ def _paged_rows(g, query: str, key_index: int, *, batch: int = _DUMP_PAGE_SIZE):
     ``last + 1`` — so the first call sends ``0``, the inclusive lower bound of the
     id space, and never a negative value. That is not cosmetic: a NEGATIVE
     comparison against a NODE ``id()`` answers 0 rows on the v6 Rust core (it does
-    not for relationship ids — measured), which made every first node page empty
-    and made ``dump_graph`` unusable on that engine (#9226 — see
-    ``_DUMP_NODE_PAGE_QUERY``). Advancing past the last row keeps the paging
-    identical on both cores because ids are non-negative integers, so
-    ``>= last + 1`` is exactly the old ``> last``.
+    not for relationship ids — measured), so every node that was not an edge
+    endpoint vanished from the first page and a graph holding one could not be
+    dumped at all (#9226 — see ``_DUMP_NODE_PAGE_QUERY``). Advancing past the last
+    row keeps the paging identical on both cores because ids are non-negative
+    integers, so ``>= last + 1`` is exactly the old ``> last``.
     """
     cursor = 0
     while True:
@@ -387,6 +395,23 @@ def _independent_counts(g) -> tuple[int, int]:
     ).result_set[0][0])
     edges = int(g.query(_COUNT_ALL_EDGES_QUERY).result_set[0][0])
     return nodes, edges
+
+
+_NODE_EXISTS_QUERY = "MATCH (n) RETURN id(n) LIMIT 1"
+
+
+def _graph_has_any_node(g) -> bool:
+    """True when the graph holds at least one node — one row, never a phantom.
+
+    The probe is deliberately ``MATCH (n)`` and NOT the keyset predicate: on v6
+    (``60002``, measured) ``id(n) >= 0`` fabricates a ``(0, [], {})`` row for a
+    graph ABSENT from the engine registry, while ``MATCH (n)`` answers 0 rows for
+    BOTH the absent graph and the empty-but-present one. ``dump_graph`` skips the
+    node page only on that 0-row answer, so the skip cannot hide real nodes —
+    including the bookkeeping nodes an exclusion count would otherwise report as
+    0. A node created after this probe is caught by the post-read check below.
+    """
+    return bool(g.query(_NODE_EXISTS_QUERY).result_set)
 
 
 def dump_graph(g, graph_name: str | None = None) -> dict:
@@ -467,19 +492,21 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
     # concurrent deletes do not turn a faithful dump into a false failure.
     source_count_start = _independent_counts(g)
 
-    # ⛔ An independent count of ZERO is the answer, not a page read. On v6
+    # ⛔ An existence probe decides whether there is anything to page. On v6
     # (60002) a node read of a graph that is ABSENT from the engine registry
     # fabricates one row — `id(n) >= 0` returns the phantom `(0, [], {})` while
     # `MATCH (n)` returns nothing and the aggregate counts 0 nodes. Paging such a
     # graph would export that phantom as a node (`node_count: 1`, then
     # `restore_graph` materialises it), and `len(nodes) < source_node_count` is
-    # one-sided so the guard would not catch it. An EMPTY-BUT-PRESENT graph reads
-    # as 0 rows on both cores, so this skip is limited to the count-0 case and
-    # changes nothing for a graph that has anything to export.
-    node_rows = (
-        () if source_count_start[0] == 0
-        else _paged_rows(g, _DUMP_NODE_PAGE_QUERY, 0)
-    )
+    # one-sided so the guard would not catch it. The probe is `MATCH (n)` because
+    # only that form is phantom-free; it also keeps a bookkeeping-only graph on the
+    # normal path, so `excluded_node_count` still reports its exclusions.
+    nodes_skipped_as_empty = False
+    if _graph_has_any_node(g):
+        node_rows = _paged_rows(g, _DUMP_NODE_PAGE_QUERY, 0)
+    else:
+        node_rows = ()
+        nodes_skipped_as_empty = True
     for internal_id, labels, props in node_rows:
         _collect(internal_id, labels, props)
 
@@ -566,6 +593,17 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
     source_count_end = _independent_counts(g)
     source_node_count = min(source_count_start[0], source_count_end[0])
     source_edge_count = min(source_count_start[1], source_count_end[1])
+    if nodes_skipped_as_empty and source_count_end[0] > 0:
+        # The probe found no node and the store now counts some: a writer created
+        # the graph's first node inside the read window. `min(start, end)` below
+        # would resolve the mismatch to 0 and let an EMPTY artifact pass every
+        # guard, so this is refused explicitly rather than silently emitted.
+        raise ValueError(
+            f"dump_graph({graph_name}): the graph held no nodes when the read "
+            f"began but holds {source_count_end[0]} now — refusing to write an "
+            "empty dump for a graph that gained content mid-read (a torn read "
+            "must never look green)."
+        )
     if len(nodes) < source_node_count:
         raise ValueError(
             f"dump_graph({graph_name}): exported {len(nodes)} data nodes but the "
