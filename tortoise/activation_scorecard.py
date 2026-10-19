@@ -59,17 +59,23 @@ recorded observation of the read side, and mislabelling it as activation is
 precisely the error this lane exists to fix — hence no ``activated`` key, no
 activation rate, anywhere in the payload.
 
-STAGE 4's GATE AND ITS COUNT HAVE DIFFERENT SCOPES — #4039. The gate is the org
-DEFAULT graph's ``first_memory_at``; the count is the org-wide analytics stream
-(``analytics_events`` carries no ``graph_id``). A multi-graph org that produced
-memory only outside the default graph therefore has no gate, and for such an org
-``no_memory_produced_in_lifetime`` would be a claim about the ORG derived from a
-GRAPH-scoped absence — false, and exactly the state inversion this module
-exists to prevent. When that org's windowed retrieval count is EXACT AND
-POSITIVE, the stage refuses instead: ``unavailable`` /
-``no_memory_in_default_graph_org_scope_unknown``. The ambiguity is surfaced, not
-asserted away; the rows where the count cannot be established (withheld) are
-disclosed in ``LIMITATIONS``.
+STAGE 4's GATE IS ORG-SCOPED AS OF #8149, AND ITS COUNT IS ORG-WIDE. The gate
+is the org's earliest memory across its ACTIVE graphs; the count is the
+org-wide analytics stream (``analytics_events`` carries no ``graph_id``). #4039
+established the half this module could see without a new read: a graph-scoped
+absence cannot assert an org-scoped fact when the windowed call count is exact
+and positive, so that case refuses (``unavailable`` /
+``no_memory_in_default_graph_org_scope_unknown``). Its residual — a withheld or
+zero count left a multi-graph org indistinguishable from a single-graph one —
+is REMOVED by reading the scope: when the default graph shows no memory at all,
+the caller enumerates the org's active graphs and folds ``LIFETIME_MEMORY_QUERY``
+across them (see ``org_scope_evidence``, ``org_scope_lifetime``). Existence does
+not need completeness, but an ABSENCE does — ``no_memory_produced_in_lifetime``
+is emitted only when every listed graph was read and none produced memory. Where
+coverage cannot be certified the stage declines to make the org-scope claim at
+all (``not_measurable`` / ``no_memory_in_default_graph_org_scope_unverified``)
+rather than either asserting it or accusing the org of a reporting failure. The
+rows and cost bounds are disclosed in ``LIMITATIONS``.
 
 Stage 5 is where that stops being true. Since #3675 the ``mcp_tool_call``
 props carry ``result_count`` — the number of items the call returned — so a
@@ -205,6 +211,76 @@ RECALL_MAX_PAGES = 100
 # a scope-qualified reason under a `not_measurable` state would keep the
 # mis-scoped classification while fixing only the sentence beside it.
 GRAPH_SCOPE_UNKNOWN_REASON = "no_memory_in_default_graph_org_scope_unknown"
+
+# #8149: the stage-4 reason for the OTHER half of the #4039 ambiguity — the org
+# DEFAULT graph produced no memory, so did every other active graph the read
+# could reach, but the read could not CERTIFY that it reached them ALL (the
+# graph list was unreadable, a listed graph could not be opened or scanned, a
+# lifetime value would not parse, or the org carries more active graphs than
+# `MAX_ORG_SCOPE_GRAPHS`). A THIRD reason, not a reworded pair with either
+# neighbour, because the three facts are different: `no_memory_produced_in_
+# lifetime` says the org has nothing to recall FROM (now an ORG-scope fact, see
+# `org_scope_evidence`); `GRAPH_SCOPE_UNKNOWN_REASON` says an org-wide call
+# count contradicts a graph-scoped gate; this one says the scope question could
+# not be ANSWERED. State is `not_measurable`, deliberately: `unavailable` would
+# accuse a genuinely memory-less org of a reporting failure (the #8149
+# requirement in both directions), while the reason carries the refusal to
+# claim the org-scope absence.
+GRAPH_SCOPE_UNVERIFIED_REASON = "no_memory_in_default_graph_org_scope_unverified"
+
+# #8149: the stage-4 reason for a gate that came from a PARTIAL scan. Memory was
+# found in a non-default graph, but not every active graph could be read, so the
+# folded `first_memory_at` may be LATER than the org's true first memory — and
+# the memory-conditioned count is "calls at or after the gate", so a late gate
+# UNDER-counts it. A lower bound is never published as a count in this module,
+# and a `measured 0` derived from one is exactly the false zero it exists to
+# prevent, so the stage refuses instead. `unavailable` (not `not_measurable`):
+# this org HAS memory, so there is something to measure — reading the graph that
+# could not be opened is what makes it measurable.
+GRAPH_SCOPE_PARTIAL_REASON = "first_memory_at_from_partial_graph_scan"
+
+# The `detail.graph_scope` vocabulary — WHAT the stage-4 gate read, so no
+# consumer has to infer the scope from the reason string (#4039/#8149).
+#
+# ``org_default_graph``  the gate is the org DEFAULT graph only; either the
+#                       caller enumerated no coverage, or it could not certify
+#                       one, so an ABSENCE is not an org-scope fact.
+# ``org_all_active_graphs``  every ACTIVE graph in the org was read (a
+#                       single-graph org included — the default IS all of them),
+#                       so `no_memory_produced_in_lifetime` IS an org-scope fact.
+# ``org_partial_graphs``  some non-default graph was read (and produced the
+#                       memory that established the gate), but not all of them —
+#                       so the gate instant may be LATER than the org's true
+#                       first memory and every memory-conditioned count would be
+#                       a LOWER BOUND. The stage refuses
+#                       (``GRAPH_SCOPE_PARTIAL_REASON``) rather than publish one.
+GRAPH_SCOPE_DEFAULT_ONLY = "org_default_graph"
+GRAPH_SCOPE_ALL_GRAPHS = "org_all_active_graphs"
+GRAPH_SCOPE_PARTIAL = "org_partial_graphs"
+
+# Bound on the stage-4 org-scope fan-out (#8149): the most NON-DEFAULT graphs
+# this read will open for one org. The gate is folded per graph, so the cost is
+# linear in an org's graph count times an unbounded all-time scan — on a path
+# the cohort endpoint folds up to `MAX_COHORT_ORGS = 100` of, inside a 30 s
+# per-org timeout. Past this bound the ABSENCE is not certified (the stage
+# reports ``GRAPH_SCOPE_UNVERIFIED_REASON``) rather than paying an unbounded
+# read or claiming a scope this read did not cover. 20 is deliberately far above
+# the graph counts observed on the beta (multi-graph orgs are single digits):
+# the bound exists to stop a pathological org, not to ration ordinary ones.
+MAX_ORG_SCOPE_GRAPHS = 20
+
+# Why a stage-4 gate read could not certify org-scope COVERAGE. Carried in
+# ``detail.org_scope_uncovered_reason``, never in the stage's ``reason`` (the
+# stage reason is the metric's vocabulary; this is the read's). One vocabulary,
+# written by BOTH the caller that does the reads (`hosted_api`) and the fold
+# here, so the two cannot drift.
+ORG_SCOPE_NOT_ENUMERATED = "org_graphs_not_enumerated"
+ORG_SCOPE_ENUMERATION_FAILED = "org_graphs_enumeration_failed"
+ORG_SCOPE_UNLISTED = "org_graphs_unlisted"
+ORG_SCOPE_GRAPH_UNREADABLE = "org_graph_unreadable"
+ORG_SCOPE_MEMORY_UNREADABLE = "org_scope_memory_unreadable"
+ORG_SCOPE_SCAN_CAP = "org_scope_scan_cap_exceeded"
+
 # Default window = the beta's own <= 24h criterion (product-success-eval.md §5).
 DEFAULT_WINDOW = timedelta(hours=24)
 # A window this wide is a typo or an attempt to scan the whole history; the
@@ -332,6 +408,11 @@ def assert_no_activation_claim(payload: object) -> None:
 
 
 # ── Stage state vocabulary (one home for the whole surface) ────────────────
+#: The "caller did not supply this" sentinel, for payload fields whose ``None``
+#: is a MEANINGFUL value (``first_memory_at_default_graph`` is ``None`` exactly
+#: when the default graph produced no memory — the case #8149 exists for).
+_UNSET: Any = object()
+
 STATE_MEASURED = "measured"
 STATE_UNAVAILABLE = "unavailable"
 STATE_NOT_MEASURABLE = "not_measurable"
@@ -554,11 +635,99 @@ def analytics_write_path_configured() -> bool:
     return bool(os.environ.get("SUPABASE_URL")) and bool(_service_key())
 
 
+def org_scope_evidence(*, graphs_listed: int | None = None,
+                       graphs_scanned: int = 0,
+                       memory_outside_default: bool = False,
+                       failure: str | None = None) -> dict:
+    """Package what stage 4's gate read actually COVERED (#8149).
+
+    One home for the coverage verdict, so the reader that does the reads
+    (``hosted_api._org_scope_gate``) and the fold that acts on it
+    (``_recall_attempted_stage``) cannot disagree about what "org scope"
+    means.
+
+    ``graphs_listed`` is the number of ACTIVE graphs the control plane reports
+    for the org (the default included), or ``None`` when no enumeration was
+    attempted/possible. ``graphs_scanned`` is how many NON-DEFAULT graphs were
+    actually READ. ``memory_outside_default`` says the scan found memory in one
+    of them — which is what establishes the GATE when the default graph has
+    none. ``failure`` names why the read could not cover everything.
+
+    ABSENCE needs completeness; EXISTENCE does not. So ``covered`` — the flag
+    that licenses an org-scope ABSENCE claim — requires every listed graph to
+    have been read; a single graph with memory refutes the absence whatever the
+    scan could not reach, which is why ``graph_scope`` distinguishes the
+    partial-but-conclusive case from the uncertified one.
+    """
+    complete = (failure is None and graphs_listed is not None
+                and graphs_listed >= 1
+                and graphs_scanned == graphs_listed - 1)
+    if memory_outside_default:
+        scope = GRAPH_SCOPE_ALL_GRAPHS if complete else GRAPH_SCOPE_PARTIAL
+    elif complete:
+        scope = GRAPH_SCOPE_ALL_GRAPHS
+    else:
+        scope = GRAPH_SCOPE_DEFAULT_ONLY
+    return {
+        "graphs_listed": graphs_listed,
+        "graphs_scanned": graphs_scanned,
+        "covered": complete,
+        "graph_scope": scope,
+        "uncovered_reason": (None if complete
+                             else (failure or ORG_SCOPE_NOT_ENUMERATED)),
+    }
+
+
+def org_scope_lifetime(per_graph: Iterable[Sequence[Any]]
+                       ) -> tuple[dict | None, str | None]:
+    """Fold one ``(first_memory_at, sessions_with_memory)`` pair per graph.
+
+    The stage-4 gate is "memory was ever produced in the ORG", so the folded
+    value is the EARLIEST memory across every graph read — the default graph's
+    row included, which is how one shape serves both the single-graph org (the
+    default is the whole org) and the multi-graph one.
+
+    Returns ``(lifetime_or_None, failure)``. ``lifetime`` is ``None`` when NO
+    graph read showed memory, which is the only case where an absence may be
+    claimed — and even then only if the caller's coverage was certified (see
+    ``org_scope_evidence``). A graph that HAS memory but whose value will not
+    place on the timeline is a FAILURE, never an absence: dropping it would
+    turn an unreadable memory-bearing graph into "this org produced nothing",
+    the exact inversion this module exists to prevent.
+    """
+    earliest: datetime | None = None
+    sessions = 0
+    failure: str | None = None
+    for entry in per_graph:
+        try:
+            first, count = entry[0], entry[1]
+        except (TypeError, IndexError, KeyError):
+            failure = failure or ORG_SCOPE_MEMORY_UNREADABLE
+            continue
+        try:
+            sessions += int(count or 0)
+        except (TypeError, ValueError):
+            failure = failure or ORG_SCOPE_MEMORY_UNREADABLE
+        if first is None:
+            continue
+        at = _coerce_created_at(first)
+        if at is None:
+            failure = failure or ORG_SCOPE_MEMORY_UNREADABLE
+            continue
+        if earliest is None or at < earliest:
+            earliest = at
+    if earliest is None:
+        return None, failure
+    return {"first_memory_at": earliest.isoformat(),
+            "sessions_with_memory": sessions}, failure
+
+
 def recall_stages(rows: Iterable[dict] | None, first_memory_at: str | None,
                   reason: str | None = None,
                   truncated: bool = False,
                   memory_sessions: int | None = None,
-                  window: tuple[str, str] | None = None) -> tuple[dict, dict]:
+                  window: tuple[str, str] | None = None,
+                  org_scope: dict | None = None) -> tuple[dict, dict]:
     """Stages 4 AND 5, and the shared detail (#3675 extended this to stage 5).
 
     Stage 4 is returned; stage 5's cell rides in ``detail["recall_returned_cell"]``
@@ -574,7 +743,7 @@ def recall_stages(rows: Iterable[dict] | None, first_memory_at: str | None,
     """
     stage, detail = _recall_attempted_stage(
         rows, first_memory_at, reason=reason, truncated=truncated,
-        memory_sessions=memory_sessions, window=window)
+        memory_sessions=memory_sessions, window=window, org_scope=org_scope)
     detail["recall_returned_cell"] = recall_returned_cell(stage, detail)
     return stage, detail
 
@@ -583,7 +752,8 @@ def _recall_attempted_stage(rows: Iterable[dict] | None, first_memory_at: str | 
                             reason: str | None = None,
                             truncated: bool = False,
                             memory_sessions: int | None = None,
-                            window: tuple[str, str] | None = None) -> tuple[dict, dict]:
+                            window: tuple[str, str] | None = None,
+                            org_scope: dict | None = None) -> tuple[dict, dict]:
     """Derive the stage-4 cell from analytics rows.
 
     ``rows`` may be ``None`` to signal "the store was not read" (unreachable,
@@ -603,6 +773,13 @@ def _recall_attempted_stage(rows: Iterable[dict] | None, first_memory_at: str | 
     ``unclassifiable_analytic_rows``, ``analytics_window_out_of_range``) say
     why. Those counters follow the same EXACT OR ABSENT rule: ``None`` means
     the fold that computes them never ran, never a literal ``0``.
+
+    ``org_scope`` (#8149) is the COVERAGE of the gate that produced
+    ``first_memory_at`` — see ``org_scope_evidence``. It governs ONE decision:
+    whether a missing memory may be reported as an ORG-scope absence. Supplying
+    none is read as "nothing enumerated", which cannot license that claim, so a
+    producer that does no enumeration gets the scope-qualified refusal rather
+    than the pre-#8149 graph-scoped claim.
     """
     # EVERY counter is initialised here, not only on the failure paths: the
     # detail key set is identical on every return path, so a consumer read of
@@ -636,6 +813,22 @@ def _recall_attempted_stage(rows: Iterable[dict] | None, first_memory_at: str | 
         "retrieval_tool_allowlist": sorted(RETRIEVAL_TOOL_ALLOWLIST),
         "retrieval_tool_allowlist_wide": sorted(RETRIEVAL_TOOL_ALLOWLIST_WIDE),
     }
+    # #8149 — the gate's COVERAGE, on the same EXACT-OR-ABSENT footing as the
+    # counters above: filled from the caller's evidence on every path, so the
+    # detail key set never varies with `state`. `recall_stages`'s keyword
+    # defaults the evidence to "nothing enumerated" — the strict reading, which
+    # cannot license an org-scope absence claim — so a producer that forgets to
+    # supply it gets a scope-qualified refusal instead of the pre-#8149
+    # (graph-scoped) claim.
+    evidence = org_scope if org_scope is not None else org_scope_evidence()
+    detail.update({
+        "graph_scope": (evidence.get("graph_scope")
+                        or GRAPH_SCOPE_DEFAULT_ONLY),
+        "org_scope_covered": bool(evidence.get("covered")),
+        "org_scope_graphs_listed": evidence.get("graphs_listed"),
+        "org_scope_graphs_scanned": evidence.get("graphs_scanned"),
+        "org_scope_uncovered_reason": evidence.get("uncovered_reason"),
+    })
     if rows is None:
         return _stage(None, "calls", reason or "analytics_store_unreachable"), detail
 
@@ -715,6 +908,18 @@ def _recall_attempted_stage(rows: Iterable[dict] | None, first_memory_at: str | 
         # would report nothing-to-measure for an org that has memory.
         if memory_sessions:
             return _stage(None, "calls", "first_memory_at_missing"), detail
+        # #8149 — PRECEDENCE: CERTIFIED COVERAGE FIRST. When the caller read
+        # every ACTIVE graph in the org and none produced memory, the absence is
+        # an ORG-scope fact and this reason is exactly what it says. That is the
+        # single-graph org (the default IS the whole org) AND the multi-graph org
+        # whose other graphs were all read empty — the two shapes the pre-#8149
+        # read could not tell apart. A positive org-wide call count does not
+        # contradict it: an org with no memory ANYWHERE has nothing to recall
+        # from, whatever its retrieval calls did or failed to do (#4039's
+        # conservative refusal existed only because the scope was unknown).
+        if (org_scope or {}).get("covered"):
+            return _stage(None, "calls", "no_memory_produced_in_lifetime",
+                          state=STATE_NOT_MEASURABLE), detail
         # `recall_attempted_any` is the count over the ORG-WIDE windowed stream
         # and it is emitted ONLY when exact (above), so a POSITIVE value here is
         # a positive, verified observation that this org made retrieval calls in
@@ -725,15 +930,17 @@ def _recall_attempted_stage(rows: Iterable[dict] | None, first_memory_at: str | 
         # the state (the metric exists and this gate cannot reach it) rather
         # than assert it. The SAME pinned retrieval allowlist is the trigger, so
         # the evidence and the count are one definition. `None` (withheld) or
-        # `0` (exact zero) leaves no org-wide activity to contradict the gate,
-        # so a single-graph org with no memory stays `not_measurable` as before.
+        # `0` (exact zero) leaves no org-wide activity to contradict the gate.
         if detail["recall_attempted_any"]:
             return _stage(None, "calls", GRAPH_SCOPE_UNKNOWN_REASON,
                           state=STATE_UNAVAILABLE), detail
-        # No memory has ever been produced, so no retrieval can have been
-        # "from memory". Report the raw count for visibility, but the stage is
-        # unmeasurable rather than zero.
-        return _stage(None, "calls", "no_memory_produced_in_lifetime",
+        # Nothing contradicts the gate and the coverage is NOT certified, so
+        # the graph-scoped absence stays graph-scoped: `not_measurable` (there is
+        # no value to report and nothing here retry-fixes) with a reason that
+        # says the SCOPE was unverified rather than that the ORG produced no
+        # memory. `unavailable` would accuse a genuinely memory-less org of a
+        # reporting failure; the #8149 residual is the other direction.
+        return _stage(None, "calls", GRAPH_SCOPE_UNVERIFIED_REASON,
                       state=STATE_NOT_MEASURABLE), detail
 
     if truncated:
@@ -751,6 +958,13 @@ def _recall_attempted_stage(rows: Iterable[dict] | None, first_memory_at: str | 
     memory_at = _coerce_created_at(first_memory_at)
     if memory_at is None:
         return _stage(None, "calls", "first_memory_at_unparseable"), detail
+
+    if (org_scope or {}).get("graph_scope") == GRAPH_SCOPE_PARTIAL:
+        # The gate came from SOME of the org's graphs, so the true first memory
+        # may be earlier and every count below would be a LOWER BOUND. Refusing
+        # is the only option that does not publish a lower bound as a count
+        # (the same rule the page-cap and unparseable-row refusals apply).
+        return _stage(None, "calls", GRAPH_SCOPE_PARTIAL_REASON), detail
 
     if window is None:
         # The window re-check is not optional on the counting path: reading
@@ -1130,51 +1344,81 @@ LIMITATIONS: tuple[str, ...] = (
     "window; past it the stage still refuses rather than under-reporting. (An "
     "org with no lifetime memory reads `not_measurable` instead — the "
     "no-memory check deliberately precedes the page-cap check.)",
-    "Stage 4 is GATED on `first_memory_at` from the org DEFAULT graph while it "
-    "COUNTS an org-wide stream. A multi-graph org that produced memory only in "
-    "a non-default graph can read `not_measurable` "
-    "(`no_memory_produced_in_lifetime`) even though its windowed recall calls "
-    "are counted in `detail.recall_attempted_any` when that count is exact "
-    "(a windowed, untruncated, fully-placeable read; otherwise it is None and "
-    "the exclusion counters name why). The state is graph-scoped, "
-    "the count is org-wide. #4039: a windowed retrieval CALL is counted by its "
+    "Stage 4's GATE is ORG-SCOPED since #8149 (#4039's residual): the gate is "
+    "`first_memory_at` folded across the org's ACTIVE graphs, and the count is "
+    "the org-wide stream. A windowed retrieval CALL is counted by its "
     "`tool_name` alone — `status` and `result_count` are not read — so the "
     "count is calls, not answers: a call that FAILED (`status` `exec_error`) or "
     "returned nothing (`result_count` 0) is counted exactly like one that "
-    "returned items. When that exact count is POSITIVE the stage no longer "
-    "makes the org-scope claim — it reports `unavailable` "
-    f"(`{GRAPH_SCOPE_UNKNOWN_REASON}`). The refusal is therefore deliberately "
-    "CONSERVATIVE: this read cannot tell an org whose memory lives in another "
-    "graph from a single-graph org whose only windowed recall activity failed "
-    "or returned nothing, so such a single-graph org reads `unavailable` "
-    "rather than `not_measurable`. RESIDUAL, not fixed: "
-    "a multi-graph org whose count is withheld (a truncated page, an "
-    "unplaceable or unclassifiable row, an out-of-window row) or is an exact "
-    "`0` (no retrieval call in the window) still reads "
-    "`no_memory_produced_in_lifetime`, because no org-wide call count "
-    "contradicts "
-    "the graph-scoped absence — this read cannot enumerate the org's other "
-    "graphs, so that case is indistinguishable from a single-graph org with no "
-    "memory. Making the gate itself org-scoped is the fix that would remove the "
-    "residual; it is a new read (an org's graph list, then a lifetime memory "
-    "scan per graph) rather than an instrumentation-definition choice — "
-    "tracked in #8149.",
-    "`detail.first_memory_at` is the earliest memory-bearing SESSION's capture "
-    "time (`min(s.created_at)`), NOT the creation time of the first extracted "
-    "memory Point. Extraction runs after the session is written, so this "
-    "boundary is at-or-before the true instant and the recall count can include "
-    "calls made in the capture->extraction gap — an upward bias, not a "
-    "conservative one.",
+    "returned items. HOW THE SCOPE IS ESTABLISHED: when the org DEFAULT graph "
+    "shows no memory at all, the read enumerates the org's active graphs "
+    "(`backup_sweep.enumerate_org_graphs` -> `supabase_control.graph_metadata`) "
+    "and runs `LIFETIME_MEMORY_QUERY` against each non-default graph, so the "
+    "gate is the earliest memory in ANY of them. Existence does not need "
+    "completeness — one graph with memory establishes the gate — but ABSENCE "
+    "does: `no_memory_produced_in_lifetime` is emitted only when every listed "
+    "graph was read and none produced memory, which makes it a claim about the "
+    "ORG rather than about the default graph. `detail.graph_scope` says what "
+    "the gate read, and `detail.org_scope_graphs_listed` / "
+    "`org_scope_graphs_scanned` say what that verdict rests on. THE COST is paid "
+    "only by an org whose default graph has NO memory: such an org pays one "
+    "control-plane graph list (~3 PostgREST round trips) plus one graph open "
+    "and one lifetime scan PER additional active graph, while an org WITH "
+    "default-graph memory reads exactly as before, with no extra read. "
+    "RESIDUAL: when coverage cannot be CERTIFIED — the graph list is "
+    "unreadable, a listed graph cannot be opened or scanned, a lifetime value "
+    "will not place on the timeline, or the org carries more than "
+    "`MAX_ORG_SCOPE_GRAPHS` non-default active graphs (the per-org fan-out "
+    "bound) — the absence is NOT claimed at org scope: the stage reports "
+    "`not_measurable` "
+    f"(`{GRAPH_SCOPE_UNVERIFIED_REASON}`) and names the uncovered reason in "
+    "`detail.org_scope_uncovered_reason`. `unavailable` is deliberately NOT "
+    "used there: an uncertified scope must not accuse a genuinely memory-less "
+    "org of a reporting failure. #4039's `unavailable` "
+    f"(`{GRAPH_SCOPE_UNKNOWN_REASON}`) therefore survives on exactly one path: "
+    "an exact POSITIVE org-wide call count together with UNCERTIFIED coverage, "
+    "where the calls are real but the memory they might have read is "
+    "unreachable to this gate. A PARTIAL scan that DID find memory is the "
+    "third case: existence is proved (so the org is not memory-less) but the "
+    "earliest instant is not certified, so the memory-conditioned counts would "
+    "be a LOWER BOUND — they are refused as `unavailable` "
+    f"(`{GRAPH_SCOPE_PARTIAL_REASON}`), never published as a measured count "
+    "(which could be a false `0`).",
+    "`sessions_with_memory_all_time` is the SAME fold — since #8149 it sums every "
+    "active graph the gate read, so it is an org-scope count on the same coverage "
+    "terms as `first_memory_at` (read both `org_scope_*` fields before citing "
+    "it). `detail.first_memory_at` is the gate's value — since #8149 the EARLIEST "
+    "memory in any of the org's active graphs — and "
+    "`detail.first_memory_at_default_graph` carries the default graph's own "
+    "value beside it, so the two cannot be confused. It is the earliest "
+    "memory-bearing SESSION's capture time (`min(s.created_at)`), NOT the "
+    "creation time of the first extracted memory Point. Extraction runs after "
+    "the session is written, so this boundary is at-or-before the true instant "
+    "and the recall count can include calls made in the "
+    "capture->extraction gap — an upward bias, not a conservative one.",
 )
 
 
 def assemble(*, org_id: str, since: str, until: str, graph_stages: dict,
              graph_detail: dict, recall_cell: dict, recall_detail: dict,
              lifetime: dict | None, analytics_state: str,
-             integrity: list[str] | None = None) -> dict:
+             integrity: list[str] | None = None,
+             default_graph_lifetime: Any = _UNSET) -> dict:
     """Compose the response. Deliberately contains NO ``activated`` key and no
     activation rate at any depth — ``tests/test_activation_scorecard.py``
-    asserts that recursively."""
+    asserts that recursively.
+
+    ``lifetime`` is the value stage 4's GATE actually used. Since #8149 that is
+    the ORG-scope fold (earliest memory across the org's active graphs), so
+    ``default_graph_lifetime`` carries the default graph's OWN row alongside it:
+    the gate and its provenance are two different facts, and a payload that
+    published only one of them would leave a consumer unable to tell an
+    org-scope gate from a graph-scope one. It defaults to a SENTINEL rather than
+    to ``None`` because ``None`` is a MEANINGFUL value here (the default graph
+    produced no memory — the exact case the org-scope gate exists for): a caller
+    that predates #8149 falls back to ``lifetime``, which for every such caller
+    WAS the default graph's row.
+    """
     stages = dict(graph_stages)
     stages["recall_attempted"] = recall_cell
     # #3675 stage 5. Its cell is produced by ``recall_stages`` — it shares stage
@@ -1192,11 +1436,19 @@ def assemble(*, org_id: str, since: str, until: str, graph_stages: dict,
     detail = {
         **{k: v for k, v in graph_detail.items() if k != "integrity"},
         "first_memory_at": (lifetime or {}).get("first_memory_at"),
+        "first_memory_at_default_graph": (
+            (lifetime if default_graph_lifetime is _UNSET
+             else default_graph_lifetime) or {}).get("first_memory_at"),
         "sessions_with_memory_all_time": (lifetime or {}).get("sessions_with_memory"),
         **{k: v for k, v in recall_detail.items()
            if k != "recall_returned_cell"},
         "analytics_write_path": analytics_state,
-        "graph_scope": "org_default_graph",
+        # #8149: the SCOPE the gate read, written by the fold that knows the
+        # coverage (`_recall_attempted_stage`). A hand-built `recall_detail`
+        # without it falls back to the graph-scope label rather than inventing
+        # an org-scope one.
+        "graph_scope": (recall_detail.get("graph_scope")
+                        or GRAPH_SCOPE_DEFAULT_ONLY),
         "stage3_predicate": STAGE3_PREDICATE,
         "recall_returned_predicate": (
             "calls whose properties.result_count >= 1 (an int; null or absent "
@@ -1465,6 +1717,18 @@ def org_failure_reason(payload: dict | None) -> str | None:
 #: the affected orgs stay named in `stages.recall_attempted.orgs_unavailable`.
 ORG_SCOPED_STAGE_4_REASONS = frozenset({GRAPH_SCOPE_UNKNOWN_REASON})
 
+#: Stage-4 `not_measurable` reasons that are likewise a property of ONE ORG and
+#: that a cohort reader would otherwise have to open each org to find. The
+#: roll-up bins these orgs in `orgs_not_measurable`, whose sentence ("there is
+#: nothing to measure") is TRUE here — what it does not say is WHICH orgs are
+#: there because their scope could not be certified rather than because the org
+#: genuinely produced no memory (#8149). Hoisted as its own attributed note for
+#: the same reason `ORG_SCOPED_STAGE_4_REASONS` exists: a per-org condition must
+#: not be dressed as a store-level one, and it must not be dropped either.
+ORG_SCOPED_STAGE_4_NOT_MEASURABLE_REASONS = frozenset({
+    GRAPH_SCOPE_UNVERIFIED_REASON,
+})
+
 
 def shared_stage_notes(payloads: Sequence[dict | None]) -> list[str]:
     """ONE cohort-level note per distinct reason the SHARED stage is unmeasured.
@@ -1477,6 +1741,10 @@ def shared_stage_notes(payloads: Sequence[dict | None]) -> list[str]:
 
     The HOISTED SENTENCE is about the store, so it is only written for reasons
     that actually are store-level — `ORG_SCOPED_STAGE_4_REASONS` get their own.
+    Since #8149 the same attribution applies to the per-org `not_measurable`
+    reasons in `ORG_SCOPED_STAGE_4_NOT_MEASURABLE_REASONS`: those orgs land in
+    `orgs_not_measurable`, so without a note a cohort of 100 would read as 100
+    orgs that produced nothing when some of them merely could not be certified.
     """
     counts: dict[str, int] = {}
     for payload in payloads:
@@ -1500,6 +1768,30 @@ def shared_stage_notes(payloads: Sequence[dict | None]) -> list[str]:
             f"{COHORT_SHARED_STAGE} is unavailable for {n} org(s): {reason} — "
             f"this stage reads ONE shared analytics store, so it is a "
             f"server-level condition rather than a per-org read failure")
+    # #8149 — the NOT-MEASURABLE side of the same attribution rule. These orgs
+    # are binned in `orgs_not_measurable`, which is true (there is no value) but
+    # does not say WHY: the org's own scope could not be certified. Counted per
+    # reason so a cohort of 100 does not read as 100 orgs that produced nothing.
+    capped: dict[str, int] = {}
+    for payload in payloads:
+        if payload is None:
+            continue
+        cell = (payload.get("stages") or {}).get(COHORT_SHARED_STAGE) or {}
+        if cell.get("state") != STATE_NOT_MEASURABLE:
+            continue
+        reason = str(cell.get("reason") or "")
+        if reason in ORG_SCOPED_STAGE_4_NOT_MEASURABLE_REASONS:
+            capped[reason] = capped.get(reason, 0) + 1
+    for reason, n in sorted(capped.items()):
+        notes.append(
+            f"{COHORT_SHARED_STAGE} is not measurable for {n} org(s): {reason} "
+            f"— a property of EACH named org, not of the shared store: its "
+            f"memory is absent from the org default graph and this read could "
+            f"not certify that the org has no OTHER active graph (the graph "
+            f"list was unreadable, a graph could not be scanned, or the "
+            f"{MAX_ORG_SCOPE_GRAPHS}-graph bound was exceeded), so no org-scope "
+            f"absence is claimed; the orgs are named in "
+            f"stages.{COHORT_SHARED_STAGE}.orgs_not_measurable")
     return notes
 
 

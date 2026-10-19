@@ -16984,27 +16984,40 @@ async def _scorecard_for_org(org: dict, since_iso: str, until_iso: str,
         RECALL_PAGE_CAP as _CAP,
     )
 
-    def _read_graph() -> tuple[list, dict | None]:
+    def _read_graph() -> tuple[list, dict | None, dict]:
         sdk = _data_sdk(org)
         proj = sdk._get_proj()
         funnel = proj.g.query(
             _FUNNEL, params={"since": since_iso, "until": until_iso}
         ).result_set
         life = proj.g.query(LIFETIME_MEMORY_QUERY).result_set
-        return funnel, ({"first_memory_at": life[0][0],
-                         "sessions_with_memory": life[0][1]} if life else None)
+        default_lifetime = ({"first_memory_at": life[0][0],
+                             "sessions_with_memory": life[0][1]}
+                            if life else None)
+        # #8149: the stage-4 gate's ORG scope, read on the SAME worker hand-off
+        # as the graph legs it belongs to (it opens other graphs, so it must not
+        # run on the loop either). It reads nothing at all unless the default
+        # graph shows NO memory — the one path the graph-scope residual can bite.
+        return funnel, default_lifetime, _org_scope_gate(
+            org, default_lifetime, log)
 
-    # ── Stages 1-3, and the lifetime baseline for stage 4 ──────────────────
+    # ── Stages 1-3, and the org-scope lifetime baseline for stage 4 ────────
     graph_error: str | None = None
     rows: list = []
     lifetime: dict | None = None
+    # #8149: `{"lifetime": <org-scope gate|None>, "evidence": <coverage dict>}`.
+    # Left empty when the graph read FAILED: `_read_recall` refuses the stage on
+    # `graph_error` before the gate is ever consulted, so there is nothing to
+    # certify and no read to pay for.
+    scoped: dict = {"lifetime": None, "evidence": None}
     try:
         # The FalkorDB client is synchronous and LIFETIME_MEMORY_QUERY is an
         # unbounded all-time scan, so this runs on the scorecard's OWN pool
         # (#3060 doctrine, above) rather than the loop's shared default
         # executor — a slow graph must not stall other tenants of that pool
         # (#3772 is the same separation for the write handlers).
-        rows, lifetime = await _run_off_loop(_SCORECARD_EXECUTOR, _read_graph)
+        rows, lifetime, scoped = await _run_off_loop(
+            _SCORECARD_EXECUTOR, _read_graph)
     except HTTPException:
         # An authorization/tenancy denial from `_data_sdk` is NOT a graph
         # outage — swallowing it would convert a 403 into a 200 with
@@ -17042,15 +17055,21 @@ async def _scorecard_for_org(org: dict, since_iso: str, until_iso: str,
     # ── Stage 4 ────────────────────────────────────────────────────────────
     analytics_state = ("configured" if analytics_write_path_configured()
                        else "unset")
+    # `scoped["lifetime"]` is the ORG-scope gate when it was established (a
+    # non-default graph produced the memory the default graph lacks) and the
+    # default graph's own row otherwise, so a single-graph org is unchanged.
     recall_cell, recall_detail = await asyncio.to_thread(
-        _read_recall, org, since_iso, until_iso, lifetime, graph_error,
-        analytics_state, log, _EVENT, _CAP, _MAX_PAGES)
+        _read_recall, org, since_iso, until_iso,
+        scoped["lifetime"] or lifetime, graph_error,
+        analytics_state, log, _EVENT, _CAP, _MAX_PAGES, scoped["evidence"])
 
     payload = assemble(
         org_id=org["org_id"], since=since_iso, until=until_iso,
         graph_stages=graph_stages, graph_detail=graph_detail,
         recall_cell=recall_cell, recall_detail=recall_detail,
-        lifetime=lifetime, analytics_state=analytics_state,
+        lifetime=scoped["lifetime"] or lifetime,
+        default_graph_lifetime=lifetime,
+        analytics_state=analytics_state,
     )
     if graph_error:
         payload["integrity"].append(graph_error)
@@ -17063,9 +17082,164 @@ async def _scorecard_for_org(org: dict, since_iso: str, until_iso: str,
     return payload
 
 
+# ── #8149: the stage-4 gate's ORG SCOPE ────────────────────────────────────
+# Stage 4 is gated on "this org has ever produced memory" and counts the
+# org-wide analytics stream. Until #8149 the gate read the org DEFAULT graph
+# only, so a multi-graph org that produced memory in a NON-default graph could
+# read `no_memory_produced_in_lifetime` — a claim about the ORG derived from a
+# GRAPH-scoped read (the residual #4039 disclosed and did not pay for).
+#
+# The fix is to READ THE SCOPE rather than to refuse harder: enumerate the org's
+# ACTIVE graphs and fold `LIFETIME_MEMORY_QUERY` across them. Three properties
+# the shape is built around:
+#
+#   * CONDITIONAL COST. Nothing here runs unless the default graph shows NO
+#     memory at all. An org WITH default-graph memory — the common case on the
+#     beta — pays not one extra read.
+#   * EXISTENCE DOES NOT NEED COMPLETENESS; ABSENCE DOES. One graph with memory
+#     establishes the gate, so a partial scan that finds memory is conclusive and
+#     the stage proceeds normally. Claiming NO memory anywhere needs every
+#     listed graph read, so any gap (enumeration failure, an unopenable graph, an
+#     unparseable value, the `MAX_ORG_SCOPE_GRAPHS` bound) downgrades the result
+#     to "scope unverified" instead of asserting the absence.
+#   * BOTH FAILURE DIRECTIONS ARE CLOSED. An unreadable graph list must not turn
+#     a genuinely memory-less org into `unavailable` (accusing a healthy org of a
+#     reporting failure), and it must not restore the pre-#8149 graph-scoped
+#     org claim either. The vocabulary for that middle state is the module's
+#     `GRAPH_SCOPE_UNVERIFIED_REASON`.
+#
+# The enumeration is the SAME seam the backup sweep uses
+# (`backup_sweep.enumerate_org_graphs` -> `supabase_control.graph_metadata`), so
+# the scorecard and the sweep cannot disagree about which graphs an org has. It
+# is a CONTROL-PLANE read: on the Supabase lane ~3 PostgREST round trips, then
+# one graph open and one all-time scan per additional active graph.
+
+def _org_active_graphs(org: dict) -> list[dict]:
+    """The org's ACTIVE graphs, default first — the stage-4 org-scope seam.
+
+    The ONE thing tests (and a future second producer) stub to say what graphs
+    an org has. Fail-closed: it raises rather than guessing a graph list, and
+    the caller turns that into an uncertified scope — never into an absence and
+    never into a reporting failure.
+    """
+    from tortoise.backup_sweep import enumerate_org_graphs
+    from tortoise.supabase_control import get_control_plane
+
+    return enumerate_org_graphs(get_control_plane(), org["org_id"])
+
+
+def _org_scope_gate(org: dict, lifetime: dict | None, log) -> dict:
+    """Fold stage 4's gate across the org's ACTIVE graphs (#8149).
+
+    Returns ``{"lifetime": <org-scope lifetime|None>, "evidence": <coverage>}``:
+    the folded gate the stage-4 fold should use, plus the coverage verdict from
+    ``activation_scorecard.org_scope_evidence`` so the fold can tell an
+    ORG-scope absence from a DEFAULT-GRAPH-scope one.
+
+    TOTAL by construction — it never raises. Every read here is fail-soft into
+    the EVIDENCE (which is what decides whether an absence may be claimed),
+    never into a fabricated absence and never into a bare exception that would
+    turn one unopenable graph into a per-org read failure for the whole
+    scorecard.
+
+    ``lifetime`` is the DEFAULT graph's own row. When it already shows memory,
+    the gate is established and this function returns it untouched without
+    reading anything: a graph-scoped gate is not a problem when the graph it
+    read HAS the memory the stage is about.
+    """
+    from tortoise.activation_scorecard import (
+        LIFETIME_MEMORY_QUERY,
+        MAX_ORG_SCOPE_GRAPHS,
+        ORG_SCOPE_ENUMERATION_FAILED,
+        ORG_SCOPE_GRAPH_UNREADABLE,
+        ORG_SCOPE_SCAN_CAP,
+        ORG_SCOPE_UNLISTED,
+        org_scope_evidence,
+        org_scope_lifetime,
+    )
+
+    default = lifetime or {}
+    if default.get("first_memory_at") or default.get("sessions_with_memory"):
+        # The default graph produced memory (or memory whose timestamp is
+        # missing — `first_memory_at_missing`, which the stage reports on its
+        # own). Either way the gate is established and NO extra read is paid.
+        return {"lifetime": lifetime, "evidence": org_scope_evidence()}
+    try:
+        graphs = _org_active_graphs(org)
+    except Exception:
+        log.warning(
+            "activation scorecard org-graph enumeration failed (fail-soft): %s",
+            org["org_id"], exc_info=True)
+        return {"lifetime": lifetime,
+                "evidence": org_scope_evidence(
+                    failure=ORG_SCOPE_ENUMERATION_FAILED)}
+
+    listed = [g for g in graphs if isinstance(g, dict)]
+    others = [g for g in listed if g.get("kind") != "default"]
+    if not listed:
+        # No default could be derived for this org (no `graph_name`, a drift
+        # race, a name that matches no org): nothing here can certify a scope.
+        return {"lifetime": lifetime,
+                "evidence": org_scope_evidence(failure=ORG_SCOPE_UNLISTED)}
+    if len(others) > MAX_ORG_SCOPE_GRAPHS:
+        # The fan-out bound. Refusing coverage is the honest answer; opening an
+        # unbounded number of graphs on a path the cohort endpoint folds 100 of
+        # is not (see the module's LIMITATIONS).
+        return {"lifetime": lifetime,
+                "evidence": org_scope_evidence(
+                    graphs_listed=len(listed), graphs_scanned=0,
+                    failure=ORG_SCOPE_SCAN_CAP)}
+
+    failure: str | None = None
+    pairs: list[tuple] = [(default.get("first_memory_at"),
+                           default.get("sessions_with_memory"))]
+    scanned = 0
+    for graph in others:
+        namespace = graph.get("namespace")
+        if not namespace:
+            # A listed graph with no storage key cannot be opened: the graph
+            # list named a graph this read cannot address.
+            failure = failure or ORG_SCOPE_GRAPH_UNREADABLE
+            continue
+        sdk = None
+        try:
+            sdk = _make_sdk(graph_name=str(namespace))
+            result = sdk._get_proj().g.query(LIFETIME_MEMORY_QUERY).result_set
+        except Exception:
+            log.warning(
+                "activation scorecard other-graph read failed (fail-soft): "
+                "%s %s", org["org_id"], graph.get("graph_id"), exc_info=True)
+            failure = failure or ORG_SCOPE_GRAPH_UNREADABLE
+            continue
+        finally:
+            # The per-graph SDK owns a projection/connection; the scorecard's
+            # own pool is 2 workers and the cohort folds 100 orgs through it,
+            # so a leaked handle here is a leak per graph per org per request.
+            if sdk is not None:
+                # `suppress` (not a bare pass) — the read already owns the
+                # failure it would be reporting.
+                with suppress(Exception):
+                    sdk.close()
+        scanned += 1
+        row = result[0] if result else (None, 0)
+        pairs.append((row[0], row[1]))
+
+    folded, fold_failure = org_scope_lifetime(pairs)
+    if fold_failure:
+        failure = failure or fold_failure
+    memory_outside_default = bool(folded and folded.get("first_memory_at"))
+    return {
+        "lifetime": folded if memory_outside_default else lifetime,
+        "evidence": org_scope_evidence(
+            graphs_listed=len(listed), graphs_scanned=scanned,
+            memory_outside_default=memory_outside_default, failure=failure),
+    }
+
+
 def _read_recall(org: dict, since: str, until: str, lifetime: dict | None,
                  graph_error: str | None, analytics_state: str, log,
-                 event: str, cap: int, max_pages: int):
+                 event: str, cap: int, max_pages: int,
+                 org_scope: dict | None = None):
     """Read the analytics rows for the window and fold them into stages 4-5.
 
     Returns `(stage_cell, detail)` where `detail` also carries stage 5's cell
@@ -17088,6 +17262,15 @@ def _read_recall(org: dict, since: str, until: str, lifetime: dict | None,
     outside the graph this read opens, so the fold refuses it as `unavailable`
     / `no_memory_in_default_graph_org_scope_unknown`.
 
+    `lifetime` is the value stage 4's gate should use and `org_scope` is the
+    COVERAGE of the read that produced it (#8149 — see `_org_scope_gate`). The
+    two travel together on purpose: the fold needs both to tell an ORG-scope
+    absence (every active graph read, none produced memory) from a
+    DEFAULT-GRAPH-scope one (coverage uncertified), and passing the value
+    without the coverage is how the pre-#8149 code made a graph-scoped fact
+    into an org-scoped claim. Every refusal path below forwards the evidence
+    too, so `detail.graph_scope` describes the read on ALL of them.
+
     #4038: the read WALKS the window to completion through
     ``SupabaseControlPlane.query_all`` (keyset on `id`, ending on an EMPTY
     page). It used to be ONE request at ``cap`` rows, which turned a full page
@@ -17109,10 +17292,12 @@ def _read_recall(org: dict, since: str, until: str, lifetime: dict | None,
     )
     if analytics_state != "configured":
         return _recall_stages(
-            None, None, reason="analytics_write_path_unconfigured")
+            None, None, reason="analytics_write_path_unconfigured",
+            org_scope=org_scope)
     if graph_error:
         # first_memory_at is unknown, so stage 4 cannot be conditioned.
-        return _recall_stages(None, None, reason=graph_error)
+        return _recall_stages(None, None, reason=graph_error,
+                              org_scope=org_scope)
     try:
         from tortoise.supabase_control import get_control_plane
         cp = get_control_plane()
@@ -17152,12 +17337,14 @@ def _read_recall(org: dict, since: str, until: str, lifetime: dict | None,
             (lifetime or {}).get("first_memory_at"),
             truncated=truncated,
             window=(since, until),
-            memory_sessions=(lifetime or {}).get("sessions_with_memory"))
+            memory_sessions=(lifetime or {}).get("sessions_with_memory"),
+            org_scope=org_scope)
     except Exception:
         log.warning("activation scorecard analytics unreachable (fail-soft): %s",
                     org["org_id"], exc_info=True)
         return _recall_stages(
-            None, None, reason="analytics_store_unreachable")
+            None, None, reason="analytics_store_unreachable",
+            org_scope=org_scope)
 
 
 # ── #3676: the cross-tenant cohort endpoint ────────────────────────────────

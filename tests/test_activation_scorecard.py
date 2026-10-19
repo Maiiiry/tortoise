@@ -153,6 +153,109 @@ def _stub_graph(monkeypatch, *, created_at="2026-09-16T01:00:00+00:00",
     monkeypatch.setattr(ha, "_data_sdk", lambda org: _SDK())
 
 
+def _stub_org_graphs(monkeypatch, active: int = 1,
+                     enumeration_error: bool = False) -> list[dict]:
+    """Declare the org's ACTIVE graphs — the seam the stage-4 gate enumerates
+    (#8149), returned default-first exactly as `graph_metadata` reports them.
+
+    ``active=1`` is a SINGLE-GRAPH org: the default graph IS the org's whole
+    scope, so an absence there is an org-scope fact. ``active=2+`` is a
+    MULTI-GRAPH org, whose non-default graphs the gate must read before it may
+    call the org memory-less.
+    """
+    import tortoise.hosted_api as ha
+
+    org_id = ORG["org_id"]
+    rows = [{"graph_id": "default", "kind": "default",
+             "namespace": f"org_{org_id}"}]
+    for n in range(1, active):
+        rows.append({"graph_id": f"g{n}", "kind": "custom",
+                     "namespace": f"org_{org_id}_g{n}"})
+
+    def _enumerate(org):
+        if enumeration_error:
+            raise RuntimeError("team-graph enumeration failed")
+        return [dict(r) for r in rows]
+
+    monkeypatch.setattr(ha, "_org_active_graphs", _enumerate)
+    return rows
+
+
+def _stub_scope_scan(monkeypatch, *, memory_in: dict[str, str] | None = None,
+                     unreadable: tuple[str, ...] = ()) -> dict:
+    """Bind the per-graph lifetime scan the org-scope gate runs (#8149).
+
+    ``memory_in`` maps a graph NAMESPACE to that graph's `first_memory_at`; a
+    namespace absent from it reads as a graph that produced no memory. Every
+    open and close is recorded in the returned dict, so the COST of the
+    org-scope read is asserted rather than assumed (the default-graph read goes
+    through `_data_sdk`, so `opened` counts ONLY the extra reads this fix adds).
+    """
+    import tortoise.hosted_api as ha
+    from tortoise.activation_scorecard import LIFETIME_MEMORY_QUERY as _LIFETIME
+
+    stats: dict[str, list[str]] = {"opened": [], "closed": []}
+    memory_in = dict(memory_in or {})
+
+    class _Res:
+        def __init__(self, r):
+            self.result_set = r
+
+    class _G:
+        def __init__(self, namespace):
+            self._ns = namespace
+
+        def query(self, q, params=None):
+            assert q is _LIFETIME, q
+            first = memory_in.get(self._ns)
+            return _Res([(first, 1)] if first is not None else [(None, 0)])
+
+    class _Proj:
+        def __init__(self, namespace):
+            self.g = _G(namespace)
+
+    class _SDK:
+        def __init__(self, namespace):
+            self._ns = namespace
+
+        def _get_proj(self):
+            return _Proj(self._ns)
+
+        def close(self):
+            stats["closed"].append(self._ns)
+
+    def _make_sdk(*, namespace=None, graph_name=None):
+        # The scan opens a graph by its FULL name (the control plane's
+        # namespace); a namespace-mode open would land on a different graph.
+        assert graph_name is not None, "the org-scope scan must open by name"
+        if graph_name in unreadable:
+            raise RuntimeError(f"graph {graph_name} unreachable")
+        stats["opened"].append(graph_name)
+        return _SDK(graph_name)
+
+    monkeypatch.setattr(ha, "_make_sdk", _make_sdk)
+    return stats
+
+
+def _supabase_env(monkeypatch, rows=None):
+    """Configure the analytics leg with a control plane that returns ``rows``.
+
+    The `_CP` stub answers every table, so the ANALYTICS read gets ``rows`` while
+    the org-graph enumeration is stubbed separately (`_stub_org_graphs`) — the
+    real enumeration would try to read the `graphs` table off this same stub.
+    """
+    import tortoise.supabase_control as sc
+
+    monkeypatch.setenv("SUPABASE_URL", "https://fake.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc")
+
+    class _CP:
+        def query(self, *a, **kw):
+            return list(rows or [])
+
+    monkeypatch.setattr(sc, "get_control_plane", lambda: _CP())
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """Authed verdict TestClient over a temp embedded graph, with the analytics
@@ -700,9 +803,22 @@ def test_truncated_page_does_not_mask_a_no_memory_org():
     """The no-lifetime-memory fact comes from the GRAPH, so it is independent of
     how many analytics rows were fetched. Checking truncation first reported an
     org with no memory as `unavailable` (a recoverable reporting failure) —
-    putting it in a cohort's `orgs_unavailable` list."""
-    from tortoise.activation_scorecard import recall_stages
-    stage, _ = recall_stages([{}] * 1000, None, truncated=True, memory_sessions=0)
+    putting it in a cohort's `orgs_unavailable` list.
+
+    Since #8149 the org-scope claim also needs CERTIFIED coverage, so the fold is
+    told that the org's whole scope was read (a single active graph): truncated
+    rows plus no memory in an org whose scope was covered stays
+    `not_measurable`, and the same rows with UNCERTIFIED coverage refuse the
+    org-scope claim (`GRAPH_SCOPE_UNVERIFIED_REASON`) instead of asserting it."""
+    from tortoise.activation_scorecard import (
+        GRAPH_SCOPE_UNVERIFIED_REASON,
+        org_scope_evidence,
+        recall_stages,
+    )
+
+    certified = org_scope_evidence(graphs_listed=1)
+    stage, _ = recall_stages([{}] * 1000, None, truncated=True,
+                             memory_sessions=0, org_scope=certified)
     assert stage["state"] == "not_measurable", stage
     assert stage["reason"] == "no_memory_produced_in_lifetime", stage
     # ...but truncation still refuses when the org DOES have memory.
@@ -713,6 +829,12 @@ def test_truncated_page_does_not_mask_a_no_memory_org():
     # change to `STATE_NOT_MEASURABLE` pass all 58 tests (review cycle 6).
     assert stage["state"] == "unavailable", stage
     assert stage["reason"] == "analytics_page_cap_truncated", stage
+
+    # #8149: an UNCOVERED scope is the third state, not either of the two above.
+    stage, _ = recall_stages([{}] * 1000, None, truncated=True,
+                             memory_sessions=0)
+    assert stage["state"] == "not_measurable", stage
+    assert stage["reason"] == GRAPH_SCOPE_UNVERIFIED_REASON, stage
 
 
 def test_properties_as_a_json_string_is_counted(client, monkeypatch):
@@ -1172,23 +1294,23 @@ def test_memory_without_a_timestamp_is_unavailable_not_no_memory(client, monkeyp
 
 def test_no_memory_in_lifetime_without_org_wide_activity_is_not_measurable(
         client, monkeypatch):
-    """The GREEN half of #4039's verification table: an org that has produced
-    no memory anywhere — and whose org-wide windowed retrieval count is an exact
-    `0`, so nothing contradicts the graph-scoped absence — stays
+    """The GREEN half of #4039's verification table — and #8149's INDICATOR 2.
+    An org that has produced no memory anywhere — and whose org-wide windowed
+    retrieval count is an exact `0`, so nothing contradicts the absence — stays
     `not_measurable`/`no_memory_produced_in_lifetime`. There is nothing to
     recall FROM and no retry changes that, so the state must not be upgraded to
-    `unavailable` merely because the gate is graph-scoped."""
-    import tortoise.supabase_control as sc
+    `unavailable` merely because the gate needed a scope read.
+
+    The org here is SINGLE-GRAPH, which is what licenses the org-scope claim
+    under #8149: the default graph IS its whole scope, so "no memory in the
+    default graph" and "no memory in the org" are the same sentence. The
+    fixture must state that (``_stub_org_graphs(active=1)``) — an org whose
+    graph list cannot be read refuses the claim instead (see
+    ``test_an_unreadable_graph_list_refuses_the_org_claim_without_accusing``)."""
     _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00", turn_points=2, extracted=0)  # stored, no memory
+    _stub_org_graphs(monkeypatch, active=1)
+    _supabase_env(monkeypatch)
 
-    monkeypatch.setenv("SUPABASE_URL", "https://fake.supabase.co")
-    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc")
-
-    class _CP:
-        def query(self, *a, **kw):
-            return []
-
-    monkeypatch.setattr(sc, "get_control_plane", lambda: _CP())
     body = client.get("/v1/activation/scorecard", params=WINDOW).json()
     stage = body["stages"]["recall_attempted"]
     assert stage["value"] is None, stage
@@ -1200,6 +1322,12 @@ def test_no_memory_in_lifetime_without_org_wide_activity_is_not_measurable(
     # The exact zero IS reported: 0 org-wide retrieval calls in the window is
     # the evidence that this absence is not merely a graph-scope artifact.
     assert body["detail"]["recall_attempted_any"] == 0, body["detail"]
+    # #8149: the payload says WHICH scope the gate read, and on what evidence.
+    assert body["detail"]["graph_scope"] == "org_all_active_graphs", body["detail"]
+    assert body["detail"]["org_scope_covered"] is True, body["detail"]
+    assert body["detail"]["org_scope_graphs_listed"] == 1, body["detail"]
+    assert body["detail"]["org_scope_graphs_scanned"] == 0, body["detail"]
+    assert body["detail"]["org_scope_uncovered_reason"] is None, body["detail"]
 
 
 def test_no_memory_in_lifetime_with_an_org_wide_retrieval_call_is_ambiguous(
@@ -1246,19 +1374,312 @@ def test_no_memory_in_lifetime_with_an_org_wide_retrieval_call_is_ambiguous(
 def test_the_graph_scope_refusal_is_disclosed_in_the_payload():
     """#4039 asks for the ambiguity to be SURFACED, not only detected. A reason
     string nobody can interpret is not disclosure, so the distinct reason must
-    appear in the payload's own `limitations` — with the residual stated (the
-    rows where the count is withheld or 0 still read as an org-scope absence).
+    appear in the payload's own `limitations`.
+
+    #8149 adds the second reason and its own residual (coverage that cannot be
+    certified), so both must be disclosed and `RESIDUAL` must survive as a
+    statement about the NEW residual rather than disappear with the old one.
     """
     from tortoise.activation_scorecard import (
+        GRAPH_SCOPE_PARTIAL_REASON,
         GRAPH_SCOPE_UNKNOWN_REASON,
+        GRAPH_SCOPE_UNVERIFIED_REASON,
         LIMITATIONS,
+        MAX_ORG_SCOPE_GRAPHS,
     )
     disclaimers = " ".join(LIMITATIONS)
     assert GRAPH_SCOPE_UNKNOWN_REASON in disclaimers, disclaimers
+    assert GRAPH_SCOPE_UNVERIFIED_REASON in disclaimers, disclaimers
+    assert GRAPH_SCOPE_PARTIAL_REASON in disclaimers, disclaimers
+    # The cost bound is part of the disclosure: a reader must be able to see
+    # WHY a scope could go uncertified.
+    assert str(MAX_ORG_SCOPE_GRAPHS) in disclaimers, disclaimers
     # The gate's scope is still disclosed separately, so the refusal reason and
     # `detail.graph_scope` cannot be read as contradicting each other.
     assert "graph_scope" in disclaimers, disclaimers
     assert "RESIDUAL" in disclaimers, disclaimers
+
+
+# ── #8149: the stage-4 gate's ORG scope ────────────────────────────────────
+
+def test_memory_in_another_graph_is_measured_not_an_org_absence(
+        client, monkeypatch):
+    """#8149 INDICATOR 1 — the residual's RED half, at the endpoint.
+
+    A MULTI-GRAPH org whose memory lives in graph B and which made NO retrieval
+    call in the window must not read `not_measurable` /
+    `no_memory_produced_in_lifetime`: that pair would be a claim about the ORG
+    derived from a GRAPH-scoped absence. Pre-#8149 the withheld/`0` count left
+    nothing to contradict the graph-scoped gate, so this exact fixture read the
+    false org-scope claim. The gate is now folded across the org's active
+    graphs, so the stage is MEASURED: memory exists (in B), zero retrieval calls
+    followed it.
+    """
+    _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00",
+                turn_points=2, extracted=0)  # no memory in the DEFAULT graph
+    graphs = _stub_org_graphs(monkeypatch, active=2)
+    stats = _stub_scope_scan(
+        monkeypatch,
+        memory_in={graphs[1]["namespace"]: "2026-09-16T09:00:00+00:00"})
+    _supabase_env(monkeypatch)  # and NO retrieval call in the window
+
+    body = client.get("/v1/activation/scorecard", params=WINDOW).json()
+    stage = body["stages"]["recall_attempted"]
+    assert stage["state"] == "measured", stage
+    assert stage["value"] == 0, stage
+    assert stage["reason"] is None, stage
+    # The gate is graph B's memory, and the payload says so — an org-scope gate
+    # and a default-graph gate must be distinguishable from the payload alone.
+    assert (body["detail"]["first_memory_at"]
+            == "2026-09-16T09:00:00+00:00"), body["detail"]
+    assert body["detail"]["first_memory_at_default_graph"] is None, body["detail"]
+    assert body["detail"]["graph_scope"] == "org_all_active_graphs", body["detail"]
+    assert body["detail"]["org_scope_covered"] is True, body["detail"]
+    assert body["detail"]["org_scope_graphs_listed"] == 2, body["detail"]
+    assert body["detail"]["org_scope_graphs_scanned"] == 1, body["detail"]
+    # COST: exactly one extra graph opened — and closed again.
+    assert stats["opened"] == [graphs[1]["namespace"]], stats
+    assert stats["closed"] == [graphs[1]["namespace"]], stats
+
+
+def test_all_active_graphs_read_empty_makes_the_org_claim_true(
+        client, monkeypatch):
+    """The other half of indicator 1: when every active graph IS read and none
+    produced memory, `no_memory_produced_in_lifetime` is finally a TRUE
+    org-scope claim — the sentence the pre-#8149 read could only assert for a
+    single-graph org. It must not degrade to the scope-unverified refusal just
+    because the org has more than one graph."""
+    _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00",
+                turn_points=2, extracted=0)
+    graphs = _stub_org_graphs(monkeypatch, active=3)
+    stats = _stub_scope_scan(monkeypatch)  # every graph reads empty
+    _supabase_env(monkeypatch)
+
+    body = client.get("/v1/activation/scorecard", params=WINDOW).json()
+    stage = body["stages"]["recall_attempted"]
+    assert stage["state"] == "not_measurable", stage
+    assert stage["reason"] == "no_memory_produced_in_lifetime", stage
+    assert body["detail"]["org_scope_covered"] is True, body["detail"]
+    assert body["detail"]["org_scope_graphs_listed"] == 3, body["detail"]
+    assert body["detail"]["org_scope_graphs_scanned"] == 2, body["detail"]
+    assert body["detail"]["first_memory_at"] is None, body["detail"]
+    assert sorted(stats["opened"]) == sorted(g["namespace"] for g in graphs[1:]), stats
+
+
+def test_an_unreadable_graph_list_refuses_the_org_claim_without_accusing(
+        client, monkeypatch):
+    """#8149's FAILURE PATH, direction 1: the enumeration itself fails.
+
+    Both wrong answers are refused here. `unavailable` would accuse a genuinely
+    memory-less org of a reporting failure (the #4039 inversion, mirrored);
+    `no_memory_produced_in_lifetime` would restore the graph-scoped org claim
+    this issue exists to remove. The honest cell is `not_measurable` with the
+    SCOPE-qualified reason, and `detail.org_scope_uncovered_reason` names the
+    enumeration as the thing that could not be read.
+    """
+    from tortoise.activation_scorecard import GRAPH_SCOPE_UNVERIFIED_REASON
+
+    _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00",
+                turn_points=2, extracted=0)
+    _stub_org_graphs(monkeypatch, enumeration_error=True)
+    stats = _stub_scope_scan(monkeypatch)
+    _supabase_env(monkeypatch)
+
+    body = client.get("/v1/activation/scorecard", params=WINDOW).json()
+    stage = body["stages"]["recall_attempted"]
+    assert stage["state"] == "not_measurable", stage
+    assert stage["value"] is None, stage
+    assert stage["reason"] == GRAPH_SCOPE_UNVERIFIED_REASON, stage
+    assert stage["reason"] != "no_memory_produced_in_lifetime", stage
+    assert body["detail"]["org_scope_covered"] is False, body["detail"]
+    assert (body["detail"]["org_scope_uncovered_reason"]
+            == "org_graphs_enumeration_failed"), body["detail"]
+    assert body["detail"]["graph_scope"] == "org_default_graph", body["detail"]
+    # No scan is attempted without a graph list — the failure costs nothing.
+    assert stats["opened"] == [], stats
+
+
+def test_an_unreadable_other_graph_refuses_the_org_claim(client, monkeypatch):
+    """#8149's FAILURE PATH, direction 2: the LIST reads, one GRAPH does not.
+
+    A partial scan cannot certify an absence, so the org-scope claim is refused
+    (the same cell as the enumeration failure, a different named reason) — and
+    the scorecard still answers 200: one unreachable graph must not become a
+    per-org read failure for the whole surface.
+    """
+    from tortoise.activation_scorecard import GRAPH_SCOPE_UNVERIFIED_REASON
+
+    _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00",
+                turn_points=2, extracted=0)
+    graphs = _stub_org_graphs(monkeypatch, active=3)
+    stats = _stub_scope_scan(monkeypatch,
+                            unreadable=(graphs[2]["namespace"],))
+    _supabase_env(monkeypatch)
+
+    resp = client.get("/v1/activation/scorecard", params=WINDOW)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    stage = body["stages"]["recall_attempted"]
+    assert stage["state"] == "not_measurable", stage
+    assert stage["reason"] == GRAPH_SCOPE_UNVERIFIED_REASON, stage
+    assert body["detail"]["org_scope_covered"] is False, body["detail"]
+    assert (body["detail"]["org_scope_uncovered_reason"]
+            == "org_graph_unreadable"), body["detail"]
+    assert body["detail"]["org_scope_graphs_scanned"] == 1, body["detail"]
+    # The readable graph was still scanned (and its handle released).
+    assert stats["opened"] == [graphs[1]["namespace"]], stats
+    assert stats["closed"] == [graphs[1]["namespace"]], stats
+
+
+def test_memory_found_in_a_partially_scanned_org_refuses_the_count(
+        client, monkeypatch):
+    """EXISTENCE DOES NOT NEED COMPLETENESS — but a COUNT DOES.
+
+    One readable graph with memory proves the org is not memory-less, so the
+    stage must not claim an org-scope absence. It must not publish a count
+    either: the folded gate may be later than the org's true first memory, so
+    every memory-conditioned count is a LOWER BOUND — and a lower bound
+    published as `measured` is how a false `0` gets born (the rule this module
+    applies to the page cap and to unparseable rows). The stage therefore
+    refuses as `unavailable` (the metric exists; reading the graph that could not
+    be opened is what makes it measurable) with a reason that names the partial
+    scan."""
+    from tortoise.activation_scorecard import GRAPH_SCOPE_PARTIAL_REASON
+
+    _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00",
+                turn_points=2, extracted=0)
+    graphs = _stub_org_graphs(monkeypatch, active=3)
+    _stub_scope_scan(
+        monkeypatch,
+        memory_in={graphs[1]["namespace"]: "2026-09-16T09:00:00+00:00"},
+        unreadable=(graphs[2]["namespace"],))
+    _supabase_env(monkeypatch)
+
+    body = client.get("/v1/activation/scorecard", params=WINDOW).json()
+    stage = body["stages"]["recall_attempted"]
+    assert stage["state"] == "unavailable", stage
+    assert stage["value"] is None, stage
+    assert stage["reason"] == GRAPH_SCOPE_PARTIAL_REASON, stage
+    # The evidence the refusal rests on is still in the payload.
+    assert body["detail"]["graph_scope"] == "org_partial_graphs", body["detail"]
+    assert body["detail"]["org_scope_covered"] is False, body["detail"]
+    assert (body["detail"]["first_memory_at"]
+            == "2026-09-16T09:00:00+00:00"), body["detail"]
+    assert (body["detail"]["org_scope_uncovered_reason"]
+            == "org_graph_unreadable"), body["detail"]
+
+
+def test_the_org_scope_scan_cap_refuses_coverage_without_fanning_out(
+        client, monkeypatch):
+    """#8149's COST BOUND. Past `MAX_ORG_SCOPE_GRAPHS` non-default graphs the
+    read refuses to certify coverage instead of opening an unbounded number of
+    graphs on a path the cohort endpoint folds 100 orgs through — and it opens
+    NONE of them, so the bound is a bound on the READ, not only on the claim."""
+    from tortoise.activation_scorecard import (
+        GRAPH_SCOPE_UNVERIFIED_REASON,
+        MAX_ORG_SCOPE_GRAPHS,
+    )
+
+    _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00",
+                turn_points=2, extracted=0)
+    _stub_org_graphs(monkeypatch, active=MAX_ORG_SCOPE_GRAPHS + 2)
+    stats = _stub_scope_scan(monkeypatch)
+    _supabase_env(monkeypatch)
+
+    body = client.get("/v1/activation/scorecard", params=WINDOW).json()
+    stage = body["stages"]["recall_attempted"]
+    assert stage["state"] == "not_measurable", stage
+    assert stage["reason"] == GRAPH_SCOPE_UNVERIFIED_REASON, stage
+    assert (body["detail"]["org_scope_uncovered_reason"]
+            == "org_scope_scan_cap_exceeded"), body["detail"]
+    assert stats["opened"] == [], stats
+
+
+def test_a_default_graph_with_memory_pays_no_extra_read_at_all(
+        client, monkeypatch):
+    """#8149's COST, the common case: an org whose DEFAULT graph HAS memory
+    reads exactly as before. Nothing enumerates — the graph list seam is made to
+    explode if it is called — because a graph-scoped gate is only a problem when
+    the graph it read does NOT hold the memory the stage is about."""
+    import tortoise.hosted_api as ha
+
+    _stub_graph(monkeypatch, created_at="2026-09-16T01:00:00+00:00",
+                turn_points=2, extracted=1)  # memory IN the default graph
+
+    def _explode(org):  # pragma: no cover - the assertion is the point
+        raise AssertionError("the graph list must not be read for this org")
+
+    monkeypatch.setattr(ha, "_org_active_graphs", _explode)
+    _supabase_env(monkeypatch,
+                  rows=[{"properties": {"tool_name": "tortoise_search"},
+                         "created_at": "2026-09-16T13:00:00+00:00"}])
+
+    body = client.get("/v1/activation/scorecard", params=WINDOW).json()
+    stage = body["stages"]["recall_attempted"]
+    assert stage["state"] == "measured", stage
+    assert stage["value"] == 1, stage
+    assert body["detail"]["graph_scope"] == "org_default_graph", body["detail"]
+    assert (body["detail"]["first_memory_at"]
+            == body["detail"]["first_memory_at_default_graph"]), body["detail"]
+
+
+def test_org_scope_lifetime_folds_the_earliest_memory_across_graphs():
+    """The fold itself (#8149). The gate is the EARLIEST memory in the org, so a
+    later graph must not mask an earlier one — and a graph that HAS memory but
+    will not place it on the timeline is a FAILURE, never an absence: dropping
+    it would turn an unreadable memory-bearing graph into "this org produced
+    nothing" and restore the very claim the issue removes."""
+    from tortoise.activation_scorecard import org_scope_lifetime
+
+    folded, failure = org_scope_lifetime(
+        [(None, 0), ("2026-09-16T09:00:00+00:00", 2),
+         ("2026-09-15T23:00:00+00:00", 1)])
+    assert folded == {"first_memory_at": "2026-09-15T23:00:00+00:00",
+                      "sessions_with_memory": 3}, folded
+    assert failure is None, failure
+
+    # No memory anywhere: no lifetime, and that alone is not a failure.
+    folded, failure = org_scope_lifetime([(None, 0), (None, 0)])
+    assert folded is None and failure is None, (folded, failure)
+
+    # Memory exists, the value will not parse: a failure, NOT an absence.
+    folded, failure = org_scope_lifetime([(None, 0), ("not-a-timestamp", 1)])
+    assert folded is None, folded
+    assert failure == "org_scope_memory_unreadable", failure
+
+
+def test_org_scope_evidence_only_licenses_an_absence_when_covered():
+    """`covered` is the ONE flag that licenses an org-scope ABSENCE claim, and it
+    must require every listed graph to have been read (#8149). The graph-scope
+    LABEL is a different question — a partial scan that still found memory is
+    conclusive about existence and must say so."""
+    from tortoise.activation_scorecard import org_scope_evidence
+
+    single = org_scope_evidence(graphs_listed=1)
+    assert single["covered"] is True, single
+    assert single["graph_scope"] == "org_all_active_graphs", single
+
+    covered = org_scope_evidence(graphs_listed=3, graphs_scanned=2)
+    assert covered["covered"] is True, covered
+
+    partial = org_scope_evidence(graphs_listed=3, graphs_scanned=1,
+                                 memory_outside_default=True,
+                                 failure="org_graph_unreadable")
+    assert partial["covered"] is False, partial
+    assert partial["graph_scope"] == "org_partial_graphs", partial
+    assert partial["uncovered_reason"] == "org_graph_unreadable", partial
+
+    # Nothing enumerated (the pre-#8149 caller shape) licenses nothing, and the
+    # label stays the graph one rather than claiming an org scope.
+    none = org_scope_evidence()
+    assert none["covered"] is False, none
+    assert none["graph_scope"] == "org_default_graph", none
+    assert none["uncovered_reason"] == "org_graphs_not_enumerated", none
+
+    # A list is not enough without a count of what was read, and an EMPTY list
+    # is an unlisted org rather than a single-graph one.
+    assert org_scope_evidence(graphs_listed=2)["covered"] is False
+    assert org_scope_evidence(graphs_listed=0)["covered"] is False
 
 
 def test_unavailable_is_reserved_for_the_recoverable_failures(client, monkeypatch):
@@ -2157,6 +2578,44 @@ def test_cohort_attributes_the_graph_scope_refusal_to_each_org():
     assert cell["value"] == 4, cell
 
 
+def test_cohort_hoists_the_unverified_scope_reason_per_org():
+    """#8149: a scope-UNVERIFIED org is `not_measurable`, so it lands in
+    `orgs_not_measurable` — a list whose sentence ("there is nothing to
+    measure") is true but does not say WHY, and here the why matters: some of
+    those orgs produced no memory at all while others merely could not have
+    their scope certified. Left un-attributed, a 100-org cohort reads as 100
+    orgs that produced nothing. The same attribution rule #4039 pinned for its
+    `unavailable` sibling is applied to the new reason, with the store-level
+    sentence reserved for genuinely store-level causes."""
+    from tortoise.activation_scorecard import (
+        GRAPH_SCOPE_UNVERIFIED_REASON,
+        shared_stage_notes,
+    )
+    scoped = _payload(1, 1, 0, "not_measurable")
+    scoped["stages"]["recall_attempted"]["reason"] = GRAPH_SCOPE_UNVERIFIED_REASON
+    other = _payload(1, 1, 0, "not_measurable")
+    other["stages"]["recall_attempted"]["reason"] = "no_memory_produced_in_lifetime"
+
+    notes = shared_stage_notes([scoped, other])
+    # ONLY the new reason is hoisted: `no_memory_produced_in_lifetime` is the
+    # healthy answer and needs no note, so a cohort of genuinely empty orgs stays
+    # silent.
+    assert len(notes) == 1, notes
+    note = notes[0]
+    assert GRAPH_SCOPE_UNVERIFIED_REASON in note, note
+    assert "property of EACH named org" in note, note
+    assert "server-level" not in note, note
+    assert "orgs_not_measurable" in note, note
+
+    # The roll-up bins the org where the note says it is, and never as a
+    # reporting failure.
+    report = roll_up_cohort(["a"], [scoped])
+    cell = report["stages"]["recall_attempted"]
+    assert cell["state"] == "not_measurable", cell
+    assert cell["orgs_not_measurable"] == ["a"], cell
+    assert cell["orgs_unavailable"] == [], cell
+
+
 def test_cohort_client_refuses_a_response_bound_to_another_org_list(
         monkeypatch, capsys):
     """The client binds the report to the orgs it ASKED FOR. The server echoes
@@ -2257,8 +2716,20 @@ def test_recall_any_is_exact_or_absent_on_every_path():
     it stays `not_measurable` only while the exact count does NOT contradict the
     graph-scoped gate (withheld, or an exact `0`). An exact POSITIVE count is
     org-wide evidence against an org-scope absence, so that path refuses with
-    the scope-qualified reason instead. Both directions are asserted below."""
-    from tortoise.activation_scorecard import recall_stages
+    the scope-qualified reason instead.
+
+    #8149 adds the OTHER axis this test now pins twice for every no-memory
+    input: COVERAGE. With the org's whole scope read (`certified`) the absence
+    is an org-scope fact and the reason says so; without it the read declines
+    the claim (`GRAPH_SCOPE_UNVERIFIED_REASON`, still `not_measurable`). Both
+    directions are asserted below."""
+    from tortoise.activation_scorecard import (
+        GRAPH_SCOPE_UNVERIFIED_REASON,
+        org_scope_evidence,
+        recall_stages,
+    )
+    # A single-graph org: the default graph IS the org's whole scope.
+    certified = org_scope_evidence(graphs_listed=1)
     window = ("2026-09-16T00:00:00+00:00", "2026-09-17T00:00:00+00:00")
     clean = [{"properties": {"tool_name": "tortoise_search"},
               "created_at": "2026-09-16T13:00:00+00:00"}]
@@ -2267,7 +2738,10 @@ def test_recall_any_is_exact_or_absent_on_every_path():
 
     # Out-of-window row: the window failure is named, the count withheld — so
     # the graph-scoped gate is NOT contradicted and `not_measurable` stands.
-    stage, detail = recall_stages(rows, None, memory_sessions=0, window=window)
+    # (Coverage is CERTIFIED here — #8149's org-scope claim needs that; the
+    # uncertified variant is asserted at the end of this test.)
+    stage, detail = recall_stages(rows, None, memory_sessions=0, window=window,
+                                  org_scope=certified)
     assert stage["state"] == "not_measurable", stage
     assert stage["reason"] == "no_memory_produced_in_lifetime", stage
     assert detail["analytics_window_out_of_range"] == 1, detail
@@ -2280,28 +2754,40 @@ def test_recall_any_is_exact_or_absent_on_every_path():
     assert stage_pos["state"] == "unavailable", stage_pos
     assert stage_pos["reason"] == "no_memory_in_default_graph_org_scope_unknown", stage_pos
 
+    # ...and with CERTIFIED coverage the same positive count no longer
+    # contradicts anything: the org has no memory in ANY active graph, so there
+    # is nothing to recall from whatever its retrieval calls did (#8149 — this
+    # is the refusal #4039 had to make only because the scope was unknown).
+    stage_pos_cov, ok_cov = recall_stages(clean, None, memory_sessions=0,
+                                         window=window, org_scope=certified)
+    assert ok_cov["recall_attempted_any"] == 1, ok_cov
+    assert stage_pos_cov["state"] == "not_measurable", stage_pos_cov
+    assert stage_pos_cov["reason"] == "no_memory_produced_in_lifetime", stage_pos_cov
+
     # An exact 0 contradicts nothing: no org-wide activity, so the org-scope
     # absence is unsupported rather than contradicted — `not_measurable`.
     stage_zero, zero = recall_stages(
         [{"properties": {"tool_name": "tortoise_health"},
           "created_at": "2026-09-16T13:00:00+00:00"}],
-        None, memory_sessions=0, window=window)
+        None, memory_sessions=0, window=window, org_scope=certified)
     assert zero["recall_attempted_any"] == 0, zero
     assert stage_zero["state"] == "not_measurable", stage_zero
     assert stage_zero["reason"] == "no_memory_produced_in_lifetime", stage_zero
 
-    # Unplaceable rows: withheld, and the COUNTER names why — the gate is not
-    # contradicted by an unreadable row, so the state stays `not_measurable`
-    # (the disclosed RESIDUAL: a multi-graph org is indistinguishable from a
-    # single-graph one here; see the module's LIMITATIONS).
+    # Unplaceable rows: withheld, and the COUNTER names why — with CERTIFIED
+    # coverage the org-scope absence still stands; without it (#8149) the read
+    # declines to make the claim at all rather than assert it. Both directions
+    # are asserted at the end of this test.
     bad_stamp = [{"properties": {"tool_name": "tortoise_search"},
                   "created_at": "not-a-timestamp"}]
-    withheld, s1 = recall_stages(bad_stamp, None, memory_sessions=0, window=window)
+    withheld, s1 = recall_stages(bad_stamp, None, memory_sessions=0, window=window,
+                                 org_scope=certified)
     assert s1["recall_attempted_any"] is None, s1
     assert s1["unparseable_analytic_rows"] == 1, s1
     assert withheld["state"] == "not_measurable", withheld
     assert withheld["reason"] == "no_memory_produced_in_lifetime", withheld
-    _, s2 = recall_stages([42, *clean], None, memory_sessions=0, window=window)
+    _, s2 = recall_stages([42, *clean], None, memory_sessions=0, window=window,
+                          org_scope=certified)
     assert s2["recall_attempted_any"] is None, s2
     assert s2["unclassifiable_analytic_rows"] == 1, s2
     # A WIDE-only unplaceable row withholds the count on the NO-MEMORY path
@@ -2317,11 +2803,26 @@ def test_recall_any_is_exact_or_absent_on_every_path():
 
     # A truncated page is a lower bound, not a count.
     _, s3 = recall_stages(clean * 1000, None, memory_sessions=0,
-                          window=window, truncated=True)
+                          window=window, truncated=True, org_scope=certified)
     assert s3["recall_attempted_any"] is None, s3
     # A missing window is never a count.
     _, s4 = recall_stages(clean, None, memory_sessions=0)
     assert s4["recall_attempted_any"] is None, s4
+
+    # #8149 — the UNCOVERED half of the org-scope rule. With no coverage
+    # evidence supplied (the pre-#8149 caller shape) every no-memory row above
+    # refuses the ORG-scope claim instead of making it: `not_measurable` — never
+    # `unavailable`, which would accuse a genuinely memory-less org of a
+    # reporting failure — with the scope-qualified reason naming the doubt.
+    for withheld_rows in (rows, bad_stamp, [42, *clean], wide_bad):
+        uncovered, _ = recall_stages(
+            withheld_rows, None, memory_sessions=0, window=window)
+        assert uncovered["state"] == "not_measurable", uncovered
+        assert uncovered["reason"] == GRAPH_SCOPE_UNVERIFIED_REASON, uncovered
+    uncovered_truncated, _ = recall_stages(
+        clean * 1000, None, memory_sessions=0, window=window, truncated=True)
+    assert uncovered_truncated["reason"] == GRAPH_SCOPE_UNVERIFIED_REASON, \
+        uncovered_truncated
 
     # The COUNTING path holds the same rule: an unplaceable row refuses the
     # stage AND withholds the unconditioned count (it used to report it).
