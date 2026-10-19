@@ -8,15 +8,22 @@ Runs on the EMBEDDED lane (no server needed):
 
 It demonstrates, against the shipped modules:
 
-  1. `delete_point` appends its `EntityMutated` op=delete record BEFORE the
-     `DETACH DELETE` — the ordering §17.1 requires on the door where the
-     apply-first window does not merely LOSE a write, it lets the next replay
-     UNDO the deletion.
-  2. A FAILED append refuses the delete: the node survives, the journal holds
-     nothing, and the caller is told (`WriteNotLandedError`). Pre-fix the node
-     was destroyed with no record and `rebuild_all` resurrected it.
-  3. A committed record whose cache delete did not land is healed by a replay —
-     the residual window is the replay-healable one.
+  1. `delete_point` issues its `DETACH DELETE` BEFORE it appends the
+     `EntityMutated` op=delete record (#9207), so the record cannot claim a
+     destruction the cache still holds. #7951 had this the other way round; the
+     probe now measures #9207's order and prints which one ran.
+  2. A cache write that RAISES appends NO record: the node is still there, the
+     journal is untouched, and the caller gets the engine's own error.
+     Pre-#9207 the journal already held the destruction at that point — the
+     divergence the door arming (#9124) turns from a rare crash window into
+     every delete. (A ZERO-ROW write is different, and IS recorded: the node is
+     absent either way, so the record is true of the cache — see the door's own
+     comment and `tests/test_7405_remaining_writes.py`.)
+  3. A destroy that LANDED and then failed to record is reported, never silent
+     (`WriteNotLandedError`, `record_committed=False` since the append raised).
+     It does not heal by itself: `recover_from_log` rebuilds only an EMPTY
+     graph, so the repair is a DESTRUCTIVE `rebuild_all`, which re-creates the
+     Point from the journal (undoing the delete) — the caller then re-issues.
   4. The RECORDED RESIDUALS are shown, not hidden: the raw handle
      (`proj.g.query`) still writes the cache directly, and `delete_entity` (the
      generic entity delete) is still apply-first — both recorded on #7951 and in
@@ -123,7 +130,7 @@ def main() -> int:
         proj = sdk._get_proj()
         print(f"journal_backed (guard armed): {proj._journal_backed}")
 
-        # ── 1. the ordering: journal BEFORE the cache delete ───────────────
+        # ── 1. the ordering: cache delete BEFORE the record (#9207) ────────
         pid = sdk.create_point("observation", "a deletion in order")["id"]
         order: list[str] = []
         real_mutate = sdk._journal_entity_mutation
@@ -143,19 +150,19 @@ def main() -> int:
             sdk._journal_entity_mutation = real_mutate
 
         print(f"delete_point order:              {order}")
-        journal_first = (order.count("journal-EntityMutated-delete") == 1
-                         and "cache-DETACH-DELETE" in order
-                         and order.index("journal-EntityMutated-delete")
-                         < order.index("cache-DETACH-DELETE"))
+        cache_first = (order.count("journal-EntityMutated-delete") == 1
+                       and "cache-DETACH-DELETE" in order
+                       and order.index("cache-DETACH-DELETE")
+                       < order.index("journal-EntityMutated-delete"))
         print("ORDERING VERDICT: "
-              f"{'JOURNAL-FIRST' if journal_first else 'APPLY-FIRST (DEFECT)'}")
+              f"{'CACHE-FIRST (#9207)' if cache_first else 'RECORD-FIRST (the #9207 DEFECT)'}")
         print(f"delete records committed:        {len(_deletes(events, pid))}")
         print(f"Point live after the delete:     {_live(proj, pid)}")
         proj.rebuild_all(str(events), confirm_destructive=True)
         print(f"Point live after rebuild_all:    {_live(proj, pid)}  "
               "(0 = the deletion is durable)")
 
-        # ── 2. a failed append refuses the delete (no resurrection) ────────
+        # ── 2. a cache write that did not land appends NO record (#9207) ───
         tmp2 = Path(tempfile.mkdtemp(prefix="tt7951-del-fail-"))
         events2 = tmp2 / "events"
         events2.mkdir()
@@ -164,36 +171,33 @@ def main() -> int:
         try:
             proj2 = sdk2._get_proj()
             pid2 = sdk2.create_point("observation", "must survive")["id"]
-            log2 = sdk2._get_event_log()
-
-            def _boom(_event):
-                raise OSError("simulated journal append failure (probe)")
-
-            log2.append = _boom
-            refused: BaseException | None = None
+            _orig2, restore2 = _patch_query(proj2.g, _fail_deletes)
+            raised2: BaseException | None = None
             try:
                 sdk2.delete_point(pid2)
             except Exception as exc:  # the refusal is the point of the probe
-                refused = exc
-                print(f"failed append raised:            {type(exc).__name__}"
+                raised2 = exc
+                print(f"failed cache delete raised:      {type(exc).__name__}"
                       f" (operation={getattr(exc, 'operation', '?')!r},"
                       f" record_committed={getattr(exc, 'record_committed', '?')!r})")
-            print(f"Point live after refused delete: {_live(proj2, pid2)}  "
-                  "(1 = nothing was destroyed)")
-            print(f"delete records committed:        {len(_deletes(events2, pid2))}")
-            # The NO-record arm: a caller that re-issues is right here.
-            no_record_arm = (refused is not None
-                             and type(refused).__name__ == "WriteNotLandedError"
-                             and getattr(refused, "record_committed", None) is False)
-            refusal_ok = (_live(proj2, pid2) == 1
-                          and not _deletes(events2, pid2)
-                          and no_record_arm)
+            finally:
+                restore2()
+            recorded2 = len(_deletes(events2, pid2))
+            live2 = _live(proj2, pid2)
+            print(f"Point live after refused delete: {live2}  "
+                  "(1 = the destroy did not land)")
+            print(f"delete records committed:        {recorded2}  "
+                  "(0 = the journal claims nothing the cache did not do)")
+            # No record for a destroy that never happened. Pre-#9207 this read
+            # 1 — the record was already on disk before the refused write.
+            no_record_ok = (raised2 is not None and live2 == 1
+                            and recorded2 == 0)
             print("REFUSAL VERDICT: "
-                  f"{'NOTHING DESTROYED, NOTHING SKIPPED FROM THE RECORD' if refusal_ok else 'VIOLATED'}")
+                  f"{'NO RECORD FOR A DESTROY THAT DID NOT HAPPEN' if no_record_ok else 'THE RECORD OVER-CLAIMED (DEFECT)'}")
         finally:
             sdk2.close()
 
-        # ── 3. a committed record heals a failed cache delete ──────────────
+        # ── 3. a landed destroy whose append failed: reported, truth wins ──
         tmp3 = Path(tempfile.mkdtemp(prefix="tt7951-del-heal-"))
         events3 = tmp3 / "events"
         events3.mkdir()
@@ -201,35 +205,47 @@ def main() -> int:
                            event_log_path=str(events3 / "events.jsonl"))
         try:
             proj3 = sdk3._get_proj()
-            pid3 = sdk3.create_point("observation", "cache lags")["id"]
-            _orig3, restore3 = _patch_query(proj3.g, _fail_deletes)
-            raised: BaseException | None = None
+            pid3 = sdk3.create_point("observation", "destroyed, not recorded")["id"]
+            log3 = sdk3._get_event_log()
+
+            def _boom3(_event):
+                raise OSError("simulated journal append failure (probe)")
+
+            real_append3 = log3.append
+            log3.append = _boom3
+            raised3: BaseException | None = None
             try:
                 sdk3.delete_point(pid3)
             except Exception as exc:
-                raised = exc
-                print(f"failed cache delete raised:      {type(exc).__name__}"
+                raised3 = exc
+                print(f"failed append after the destroy: {type(exc).__name__}"
                       f" (operation={getattr(exc, 'operation', '?')!r},"
-                      f" record_committed={getattr(exc, 'record_committed', '?')!r},"
-                      f" record={getattr(exc, 'record', '?')!r})")
+                      f" record_committed={getattr(raised3, 'record_committed', '?')!r},"
+                      f" record={getattr(raised3, 'record', '?')!r})")
             finally:
-                restore3()
-            committed = len(_deletes(events3, pid3))
-            # The COMMITTED arm: the record landed and the cache write did not,
-            # so the caller must be told "do NOT re-issue blindly".
-            committed_arm = (raised is not None
-                             and type(raised).__name__ == "WriteNotLandedError"
-                             and getattr(raised, "record_committed", None) is True
-                             and getattr(raised, "record", None)
-                             == "EntityMutated op=delete")
-            print(f"record committed despite failure: {committed}")
-            print(f"caller told COMMITTED (no blind re-issue): {committed_arm}")
-            print(f"Point live before rebuild:       {_live(proj3, pid3)}")
+                log3.append = real_append3
+            recorded3 = len(_deletes(events3, pid3))
+            live3 = _live(proj3, pid3)
+            # The arm is UNCONFIRMED, never "the cache still holds it": the
+            # destroy landed before the append was attempted.
+            reported = (raised3 is not None
+                        and type(raised3).__name__ == "WriteNotLandedError"
+                        and getattr(raised3, "record_committed", None) is False
+                        and getattr(raised3, "record", None)
+                        == "EntityMutated op=delete"
+                        and "Nothing was destroyed in the cache"
+                        not in str(raised3))
+            print(f"record committed despite failure: {recorded3}  "
+                  "(0 = the append never landed)")
+            print(f"caller told UNCONFIRMED (not silent): {reported}")
+            print(f"Point live before rebuild:       {live3}  "
+                  "(0 = the destroy landed)")
             proj3.rebuild_all(str(events3), confirm_destructive=True)
-            healed = _live(proj3, pid3)
-            print(f"Point live after rebuild:        {healed}")
+            restored = _live(proj3, pid3)
+            print(f"Point live after rebuild:        {restored}  "
+                  "(1 = the TRUTH still held it and the replay restored it)")
             print("COMMIT VERDICT: "
-                  f"{'COMMITTED + REPLAY-HEALABLE' if committed == 1 and healed == 0 and committed_arm else 'LOST'}")
+                  f"{'REPORTED, REPAIRED ONLY BY A DESTRUCTIVE REBUILD' if reported and recorded3 == 0 and live3 == 0 and restored == 1 else 'LOST'}")
         finally:
             sdk3.close()
 
@@ -259,7 +275,7 @@ def main() -> int:
         print("RESIDUAL: the raw handle is NOT closed, and `_delete_entity` is "
               "still apply-first — both recorded on #7951; increment 4a routes "
               "ONE delete door (`delete_point`).")
-        return 0 if (journal_first and refusal_ok and committed_arm) else 1
+        return 0 if (cache_first and no_record_ok and reported) else 1
     finally:
         sdk.close()
 

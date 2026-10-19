@@ -11,6 +11,32 @@ aboutObjects: "#7951, #7950, STORAGE-ARCHITECTURE.md §17.1, tortoise/sdk.py del
 
 # #7951 increment 4a — the outbox ordering on `delete_point`
 
+> ⚠️ **SUPERSEDED IN PART BY #9207 (2026-10-19) — the ORDERING only.** This plan put the
+> `EntityMutated` op=delete record ABOVE the `DETACH DELETE` and made the append the commit point,
+> to close the resurrection window. #9207 measured the window that opened in exchange: on a
+> journal-backed projection with §17.1's write door armed (#9124) the append committed, the
+> `DETACH DELETE` was refused **pre-write** (`DirectCacheWriteRefused`), `delete_point` raised, and
+> `get_point` still served the Point — a journal record claiming a destruction the cache never
+> performed, resolvable only by a destructive `rebuild_all`. That refusal is deterministic, so this
+> was every delete, not a rare crash. The door now issues the destroy FIRST and appends the record
+> only once it has RETURNED (any row count — a zero-row write still leaves the node absent, so the
+> record is true of the cache); the remaining window (a landed destroy whose append failed) is
+> reported (`record_committed=False`) and is repaired only by a DESTRUCTIVE `rebuild_all`, which
+> re-creates the Point from the journal — `recover_from_log` rebuilds only an empty graph. Test pins
+> and the evidence probe were
+> re-measured at that head (`docs/evidence/7951-delete-point-outbox/`). What else is superseded, by
+> location: **§2**'s deliverable sentence, the first three rows of **§5 (Wiring Check)**, and in **§4
+> (Adversarial Threat Surface)** the T1/T2/T2-text/T3/T8 rows all carry an in-place ⚠️ note, and
+> T3b/T3c/T3d are new rows in §4; the tests are renamed and inverted, so the current names are `test_the_cache_delete_lands_before_the_destruction_record`
+> (T1), `test_a_failed_cache_write_appends_no_destruction_record` (T2),
+> `test_a_landed_destroy_whose_record_failed_is_reported` (T3) and
+> `test_an_append_that_lands_then_raises_is_reported_as_unconfirmed` (T8, #9207's order applies to it);
+> the LAST **§5** row ("executable demonstration") also says "section 3 now prints the
+> `record_committed=True` arm" — it now prints the `False` arm; and **§8's rejected alternative 1**
+> (journal-after-delete gated on the row count) is the position this door now takes WITHOUT the gate —
+> the record is written after the statement returns, whatever its row count. Still standing, unchanged
+> by the reversal: T4-T7 and T9, and the residual declarations.
+
 **Parent epic:** `#7879` · **Issue:** `#7951` (P0-blocker) · **Capstone:** `#7950`
 **Architecture of record:** `docs/architecture/STORAGE-ARCHITECTURE.md` §2.0 (owner ruling, 2026-10-08),
 §17.1 (the write-path rule)
@@ -48,6 +74,10 @@ of the destruction (`PointRetracted` is a `:GraphEvent`-only subscriber row — 
 
 **`delete_point` appends its `EntityMutated` op=delete record BEFORE the `DETACH DELETE`, and a failed
 append refuses the delete instead of performing an unrecorded destruction.**
+⚠️ **#9207 REVERSED this deliverable**: the `DETACH DELETE` is issued FIRST and the record follows only
+a landed destroy (a refused cache write therefore appends nothing), because the order above committed a
+destruction record over a cache that had never performed it. Read "BEFORE" here as the superseded
+position; the current contract is §2's ⚠️ note in `tortoise/sdk.py::delete_point` and the banner.
 
 ### What changes, precisely
 
@@ -104,21 +134,28 @@ delete is unconditional once the probe passes, so the record can and must preced
 
 | # | threat class | the test that covers it | fails pre-change? |
 |---|---|---|---|
-| T1 | the `DETACH DELETE` happens before the record is appended | `test_delete_point_appends_the_record_before_the_cache_delete` (positional spy on `_journal_entity_mutation` vs the delete statement) | **YES** — `['cache', 'journal']` |
-| T2 | a failed append still destroys the node | `test_a_failed_append_does_not_delete_the_point` (append raises ⇒ `WriteNotLandedError(operation="delete_point")`, node still live, no record) | **YES** — `DID NOT RAISE`, node destroyed |
-| T2 (text) | the refusal states the opposite of its own state (`False` reported as "not committed" / "no rebuild record was committed") | same test: the NEGATIVE assertions `"not committed" not in msg`, `"no rebuild record was committed" not in msg`, `"was not applied" not in msg` — a positive substring check cannot catch an overclaim, which is why the old `"did not confirm"` assertion passed while the test's premise was contradicted | **YES** — red on the shared create-shaped text (review round 3) |
-| T3 | a committed record does not survive a failed cache delete (so the window is a resurrect) | `test_a_committed_delete_record_is_healed_by_replay` (force the delete to fail ⇒ record stands ⇒ `rebuild_all` removes the node) | **YES** — `[]` instead of one delete record |
+| T1 | the `DETACH DELETE` happens before the record is appended ⚠️ **#9207 inverted this row** (§4's Measured paragraph re-measured the CURRENT test file against `b77d24084`, where T1 reads `['journal', 'cache']`; the verdict in this row's last cell is the ORIGINAL #7951 measurement, when the file asserted this row's own, now-reversed claim) — the record must NOT be appended first; the current test is `test_the_cache_delete_lands_before_the_destruction_record`, red on the pre-change source as `['journal', 'cache']` | `test_delete_point_appends_the_record_before_the_cache_delete` (positional spy on `_journal_entity_mutation` vs the delete statement) | **YES** — `['cache', 'journal']` |
+| T2 | a failed append still destroys the node ⚠️ **#9207 inverted this row too** (measured now against `b77d24084`: the old door raised its committed-arm refusal over a LIVE node, so the cell below is the #7951 measurement of the row as this plan shipped it) — a refused cache write must append nothing; the current test is `test_a_failed_cache_write_appends_no_destruction_record` (`DirectCacheWriteRefused` from the `DETACH DELETE` ⇒ no record, node live, no `PointRetracted`), and the row it replaces asserted the FORWARD half (`test_a_failed_append_does_not_delete_the_point`) | `test_a_failed_append_does_not_delete_the_point` (append raises ⇒ `WriteNotLandedError(operation="delete_point")`, node still live, no record) | **YES** — `DID NOT RAISE`, node destroyed |
+| T2 (text) ⚠️ **#9207 superseded this row**: T2's path now lets `DirectCacheWriteRefused` propagate (a refused destroy raises the engine's own error), so it renders no `WriteNotLandedError` text; the negative-text assertions it described live in **T3** (`test_a_landed_destroy_whose_record_failed_is_reported`: `"not committed" not in msg`, `"Nothing was destroyed in the cache" not in msg`) | the refusal states the opposite of its own state (`False` reported as "not committed") | the landed-destroy arm's message, asserted in T3 — a positive substring check cannot catch an overclaim, which is why the old `"did not confirm"` assertion passed while the test's premise was contradicted | **YES** — red on the shared create-shaped text (review round 3), now on T3 |
+| T3 | a committed record does not survive a failed cache delete (so the window is a resurrect) ⚠️ **#9207 replaced this row** (measured now: red at the message assertion, `_mutations(...) == []`; the cell below is the #7951 measurement of the row this plan shipped): a LANDED destroy whose append failed is now `test_a_landed_destroy_whose_record_failed_is_reported` (`record_committed=False`; the message says the record is UNCONFIRMED and must not say "not committed" nor "Nothing was destroyed in the cache"; `_mutations(...) == []`; `_live(...) is False`; the repaired state after a destructive `rebuild_all` is `_live(...) is True`) | `test_a_committed_delete_record_is_healed_by_replay` (force the delete to fail ⇒ record stands ⇒ `rebuild_all` removes the node) | **YES** — `[]` instead of one delete record |
+| T3b | a raise does NOT prove "nothing was destroyed" — a lost reply sits over an APPLIED write, so "no record" would be a silent unrecorded destroy | `test_a_lost_reply_over_an_applied_destroy_is_still_recorded` (the delete lands, the reply raises ⇒ the door reads the cache back, appends the destruction record, logs `_reply_lost`, and RETURNS `True` — no refusal is raised, because nothing was lost) | **YES** — measured against `b77d24084`: the old door raised its COMMITTED-arm refusal ("… was DESTROYED in the record and not in the cache … The cache is `extra_in_cache`") over a node the statement had already deleted, sending the caller after a divergence that was not there |
+| T3d | the landed-destroy arm's cause clause is false on the path where the statement APPLIED and then raised a transport error and only the append failed | `test_the_landed_destroy_arm_does_not_claim_the_statement_succeeded` (lost reply + append failure ⇒ `destroy_verified is True`, message must not say "did not report a failure of its own", no doubled period) | **YES** — but the red is the missing ATTRIBUTE, not message text: at `b77d24084` the append runs first, so it raised before the `DETACH DELETE` was issued (no destroy applied, node live) and the predecessor's "the ordering skipped the `DETACH DELETE`" was true; the test fails on `destroy_verified` |
+| T3c | neither verdict is provable (the delete raises AND the read-back raises) | `test_an_unreadable_after_state_writes_no_record_and_claims_nothing` (no record; `destroy_verified is False`; the message must NOT contain "did not report a failure of its own" — that raise is how the arm is reached — nor "the cache no longer holds this Point", nor call a present node "behind the TRUTH"; its PRESENT branch sends the caller to a re-issue and never to `rebuild_all`) | **YES** — the old `record_committed=True` arm claimed a cache state nobody verified |
 | T4 | journal-first journals a destruction that never happened | `test_a_missing_point_journals_nothing` (unknown id ⇒ `False`, zero records) | no (guard) |
 | T5 | the record's declared shape drifts in with an ordering fix | `test_the_delete_record_keeps_its_declared_shape` (one record, `op=delete`, `label=Point`, no `state`, no JSONL `PointRetracted`) | no (guard) |
 | T6 | the `:GraphEvent` subscriber surface silently changes | `test_the_graph_event_row_is_still_written_after_the_delete` (`poll_events` still reports `PointRetracted` with `deleted: true`) | no (guard) |
 | T7 | the `None` outcome (no journal / nothing to log — the DEFAULT embedded shape) is read as a refusal, so every delete on every journal-less SDK fails closed | `test_a_journal_less_sdk_still_deletes` (journal-less SDK ⇒ `delete_point` returns `True` and the node is gone) | no (guard) |
-| T8 | an append that LANDS and then raises is reported as committed | `test_an_append_that_lands_then_raises_is_reported_as_unconfirmed` (append writes then raises ⇒ refusal with `record_committed=False`, `DETACH DELETE` not issued, record on disk, replay removes the Point) | **YES** — the pre-change door ignored `_emit_event`'s outcome, so no refusal is raised at all |
+| T8 | an append that LANDS and then raises is reported as unconfirmed ⚠️ **#9207 re-pointed this row**: the append now FOLLOWS the destroy, so the test asserts `record_committed=False` with the `DETACH DELETE` already landed (`_live(...) is False` is its own stated premise), the `EntityMutated` op=delete record present in the journal, and `_live(...) is False` after the replay | `test_an_append_that_lands_then_raises_is_reported_as_unconfirmed` (append writes then raises ⇒ refusal with `record_committed=False`, record on disk, replay removes the Point) | **YES** — the pre-change door ignored `_emit_event`'s outcome, so no refusal is raised at all |
 | T9 | the evidence probe restores a BOUND method onto the guarded handle's class, so sections 2-4 silently address section 1's graph | `test_the_evidence_probe_rebinds_the_guarded_handle_per_instance` (patch → restore ⇒ the class attribute is the class FUNCTION again, and a second SDK's write is visible only on its OWN underlying handle) | **YES** (against the pre-fix PROBE, not the door) — its restore assigned `proj.g.query` (bound) to the class, so SDK #2's write lands in SDK #1's graph |
 | T10 | the refusal names a record this door never writes (`PointAdded`) and attaches the graph name to the RECORD clause, sending a caller to the store that does not hold the destruction | `test_the_message_names_the_doors_own_record_and_graph` (the committed and unconfirmed arms both say `EntityMutated op=delete`, never `PointAdded`, and the graph sits in "in the record and not in the cache on graph 'cache_graph'"-style text only on the cache clause) | **YES** — red on the pre-change hardcoded `PointAdded` wording and misplaced `_where` |
 
 **Measured** (`TORTOISE_TEST_CARVE_OUT=1`, embedded lane): `5 failed, 5 passed` on the pre-change
 source (`origin/main`'s `tortoise/sdk.py` and `tortoise/exceptions.py` — T1/T2/T3/T8/T10 red,
-T4-T7/T9 green), `10 passed` after. The
+T4-T7/T9 green), `10 passed` after. ⚠️ Those two counts belong to the PRE-#9207 suite as this plan
+first shipped it; re-measured by #9207 against `b77d24084` with the current 13-test file it is
+`8 failed, 5 passed` (T1/T2/T3/T8/T3b/T3c/T3d/T10 red, T4-T7/T9 green — T10's delete-door assertions
+survive the reversal, but its additive `update_point` record-noun assertion reddens on the
+predecessor's `PointAdded`) and `13 passed` after. The
 guards (T4-T7) pass on both sides by design and say so in their docstrings rather than implying
 detection power. T9 is a guard on the EVIDENCE ARTIFACT, not on the door: it is red against the
 pre-fix probe (whose restore put a BOUND method on the guarded handle's class) and green against the
@@ -128,9 +165,9 @@ fixed one.
 
 | touch point | type | covered by | status |
 |---|---|---|---|
-| `delete_point` append-before-delete | code | `tests/test_7951_delete_point_outbox.py` (T1, T3) | done |
-| failed append ⇒ no delete ⇒ `WriteNotLandedError` | code | same (T2) | done |
-| the unconfirmed arm's caller-facing text is the DELETE door's own (never "not committed") | code | same (T2, negative assertions); `tortoise/exceptions.py` `WriteNotLandedError` | done |
+| `delete_point` delete-before-append ⚠️ (#9207 reversed "append-before-delete") | code | `tests/test_7951_delete_point_outbox.py` (T1, T3) | done |
+| failed cache write ⇒ NO record (the engine's own error propagates); landed destroy + failed append ⇒ `WriteNotLandedError` | code | same (T2, T3) | done |
+| the unconfirmed arm's caller-facing text is the DELETE door's own (never "not committed") | code | same (T3, negative assertions); `tortoise/exceptions.py` `WriteNotLandedError` | done |
 | `_journal_entity_mutation` returns the per-call outcome | code | same (T2); `tests/test_unjournaled_mutation_class.py` (45 tests, unchanged shape) | done |
 | the no-op delete still journals nothing | code | same (T4) | done |
 | the journal-less (`None`) outcome is not a refusal | code | same (T7) | done |

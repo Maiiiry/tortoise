@@ -10,30 +10,30 @@ relation 'onBoard': the declaration binds no write path — 'onBoard' is neither
 relation 'funds': semantics 'funds' is retired in favour of 'transacts' (ONTOLOGY §8, #7852) — packs align to the core vocabulary (#7848)
 relation 'producedBy': semantics 'produces' is retired in favour of 'causes' (ONTOLOGY §8, #7852) — packs align to the core vocabulary (#7848)
 relation 'holds': semantics 'holds' is retired in favour of 'ownedBy' (ONTOLOGY §8, #7852) — packs align to the core vocabulary (#7848)
-pack registry /tmp/cell-t3/.worktrees/repair-c2a/packs: 1 pack(s) carry a non-blocking lifecycle declaration note — a `statuses` word shared with the connector vocabulary, or a bare object kind claimed by more than one pack (see registry.lifecycle_warnings): venture: kindDefs 'investment': 'statuses' reuses the shared connector vocabulary word(s) active — this kind owns its own state (the built-in connector fold does not apply to it), but the spelling is ambiguous to a reader; rename or record the intent
-rebuild: the event-log dir /tmp/tt7951-del-p4xvt90i/events differs from the embedded DB dir /tmp/tt7951-del-p4xvt90i — the durable pre-wipe snapshot is written next to the log, so automatic recovery on DB open will not see it; re-run `tortoise rebuild --dir /tmp/tt7951-del-p4xvt90i/events` to recover (#2943)
+pack registry /Users/danielospina/Documents/GitHub/tortoise/.worktrees/fix/p0-delcommit/packs: 1 pack(s) carry a non-blocking lifecycle declaration note — a `statuses` word shared with the connector vocabulary, or a bare object kind claimed by more than one pack (see registry.lifecycle_warnings): venture: kindDefs 'investment': 'statuses' reuses the shared connector vocabulary word(s) active — this kind owns its own state (the built-in connector fold does not apply to it), but the spelling is ambiguous to a reader; rename or record the intent
+rebuild: the event-log dir /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tt7951-del-wl8c9d7z/events differs from the embedded DB dir /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tt7951-del-wl8c9d7z — the durable pre-wipe snapshot is written next to the log, so automatic recovery on DB open will not see it; re-run `tortoise rebuild --dir /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tt7951-del-wl8c9d7z/events` to recover (#2943)
 Point prop 'ep_dirty' is not declared — persisted via open-set passthrough (#2795); declare it in POINT_PROPS for parity
 Point prop 'ep_dirty_at' is not declared — persisted via open-set passthrough (#2795); declare it in POINT_PROPS for parity
-failed to append EntityMutated event to SDK log /tmp/tt7951-del-fail-a8nr41d6/events/events.jsonl: simulated journal append failure (probe) — the write is LIVE-ONLY and will not survive a rebuild (#4240)
-rebuild: the event-log dir /tmp/tt7951-del-heal-x42r65q_/events differs from the embedded DB dir /tmp/tt7951-del-heal-x42r65q_ — the durable pre-wipe snapshot is written next to the log, so automatic recovery on DB open will not see it; re-run `tortoise rebuild --dir /tmp/tt7951-del-heal-x42r65q_/events` to recover (#2943)
+failed to append EntityMutated event to SDK log /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tt7951-del-heal-dr0lt3y4/events/events.jsonl: simulated journal append failure (probe) — the write is LIVE-ONLY and will not survive a rebuild (#4240)
+rebuild: the event-log dir /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tt7951-del-heal-dr0lt3y4/events differs from the embedded DB dir /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tt7951-del-heal-dr0lt3y4 — the durable pre-wipe snapshot is written next to the log, so automatic recovery on DB open will not see it; re-run `tortoise rebuild --dir /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tt7951-del-heal-dr0lt3y4/events` to recover (#2943)
 Point prop 'ep_dirty' is not declared — persisted via open-set passthrough (#2795); declare it in POINT_PROPS for parity
 Point prop 'ep_dirty_at' is not declared — persisted via open-set passthrough (#2795); declare it in POINT_PROPS for parity
 journal_backed (guard armed): True
-delete_point order:              ['journal-EntityMutated-delete', 'cache-DETACH-DELETE']
-ORDERING VERDICT: JOURNAL-FIRST
+delete_point order:              ['cache-DETACH-DELETE', 'journal-EntityMutated-delete']
+ORDERING VERDICT: CACHE-FIRST (#9207)
 delete records committed:        1
 Point live after the delete:     0
 Point live after rebuild_all:    0  (0 = the deletion is durable)
-failed append raised:            WriteNotLandedError (operation='delete_point', record_committed=False)
-Point live after refused delete: 1  (1 = nothing was destroyed)
-delete records committed:        0
-REFUSAL VERDICT: NOTHING DESTROYED, NOTHING SKIPPED FROM THE RECORD
-failed cache delete raised:      WriteNotLandedError (operation='delete_point', record_committed=True, record='EntityMutated op=delete')
-record committed despite failure: 1
-caller told COMMITTED (no blind re-issue): True
-Point live before rebuild:       1
-Point live after rebuild:        0
-COMMIT VERDICT: COMMITTED + REPLAY-HEALABLE
+failed cache delete raised:      RuntimeError (operation='?', record_committed='?')
+Point live after refused delete: 1  (1 = the destroy did not land)
+delete records committed:        0  (0 = the journal claims nothing the cache did not do)
+REFUSAL VERDICT: NO RECORD FOR A DESTROY THAT DID NOT HAPPEN
+failed append after the destroy: WriteNotLandedError (operation='delete_point', record_committed=False, record='EntityMutated op=delete')
+record committed despite failure: 0  (0 = the append never landed)
+caller told UNCONFIRMED (not silent): True
+Point live before rebuild:       0  (0 = the destroy landed)
+Point live after rebuild:        1  (1 = the TRUTH still held it and the replay restored it)
+COMMIT VERDICT: REPORTED, REPAIRED ONLY BY A DESTRUCTIVE REBUILD
 RAW HANDLE LANE (proj.g.query):  SUCCEEDED, rows = [['via-raw-handle']]
 delete_entity order:             ['cache-DETACH-DELETE', 'journal-EntityMutated-delete', 'cache-DETACH-DELETE', 'cache-DETACH-DELETE', 'cache-DETACH-DELETE', 'cache-DETACH-DELETE', 'cache-DETACH-DELETE']
 RESIDUAL: the raw handle is NOT closed, and `_delete_entity` is still apply-first — both recorded on #7951; increment 4a routes ONE delete door (`delete_point`).
