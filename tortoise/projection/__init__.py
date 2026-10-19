@@ -3343,9 +3343,10 @@ def _journal_safe_params(params, cypher=None):
 # `proj.g.delete()` refuses — the non-Cypher verb is strictly stricter here,
 # not equal.
 #
-# ⛔ THE CLASS IS NOT CLOSED, and the rest is named here rather than implied
-# (the two escapes above are unchanged and this is a third list, not a
-# replacement):
+# ⛔ THE CLASS IS NOT CLOSED. What follows is a map of the KNOWN remainder, not
+# an enumeration — `__getattr__` forwards the vendor handle's entire surface,
+# so ANY completeness claim here would be false the moment falkordb adds a
+# verb. The three escapes above are unchanged; these are additional:
 #   * `proj.g.client` / `proj.g._g` — `__getattr__` forwards both, and
 #     `client` is the raw Redis client, so `proj.g.client.execute_command(
 #     "GRAPH.DELETE", <g>)` bypasses both layers. It is escape (2) above by
@@ -3357,19 +3358,27 @@ def _journal_safe_params(params, cypher=None):
 #     DETACH DELETE n //", read_only=False)` empties the graph while
 #     `delete()` / `execute_command("GRAPH.DELETE", …)` both refuse on the
 #     same handle. It is the same class as escape (2) — a forwarded hop to a
-#     Cypher-executing seam — and pre-dates this change; it is named because
-#     `__getattr__` forwards it and this list is the guard's own hole map.
+#     Cypher-executing seam — and pre-dates this change.
+#   * the vendor's `drop_*_index` / `drop_*_constraint` family — forwarded, and
+#     they DESTROY state with neither layer: MEASURED, `proj.g.
+#     drop_node_range_index("Point", "id")` removes a live index and answers
+#     `OK`. The sharp case is a USER-DEFINED vector index: `_ensure_indexes`
+#     recreates only the hard-coded `Point.embedding` index
+#     (`_ensure_vector_index_api`), so an index on any other label or property
+#     is never rebuilt, and that label's dense read falls back to a full scan
+#     (`mechanism=scan_fallback`, ``tortoise/search_engine.py``) — degraded, not
+#     gone — with no graph-journal record; the vector-index inventory warning is
+#     what records it. Pre-existing, same forwarded-seam root.
 #   * `_WIPE_COMMANDS` holds ONE command. A FalkorDB graph IS a Redis key
 #     (`tortoise/graph_key_restore.py` does DUMP -> DEL -> RESTORE on it), so
 #     `execute_command("DEL"|"UNLINK", <g>)` destroys the same graph, and
 #     `FLUSHDB`/`FLUSHALL` take every graph on the server. None of those is
 #     classified here — widening the set is the #3007/#3037 decision (more
 #     verbs refusing is not free), filed as #9237.
-#   * the remaining forwarded attributes (`name`, `schema`, `copy`, …) read or
-#     mint state; `copy` WRITES UNDER A NEW KEY and destroys nothing
-#     (MEASURED: an existing destination is refused by the engine). This
-#     bullet is about the ones that neither read nor mint, which are the three
-#     above — not a claim that no forwarded attribute executes.
+#   * `copy` WRITES UNDER A NEW KEY and destroys nothing (MEASURED: an existing
+#     destination is refused by the engine); the rest of the forwarded surface
+#     (`name`, `schema`, `slowlog*`, …) reads. Naming those is not a claim that
+#     the surface has been audited — the bullets above are what was found.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3600,13 +3609,14 @@ class _GuardedGraph:
     the text the #8479 scan reads — see
     ``cypher_guard._guard_numeric_literals``). See KNOWN GAPS in the module
     comment above. ``__getattr__`` below forwards only the remaining non-query
-    attributes (``name``, ``schema``, ``copy``, ``call_procedure``, ...) to the
-    underlying handle. The one DESTRUCTIVE verb among them whose effect is the
-    WHOLE graph, ``delete()`` (GRAPH.DELETE), is defined explicitly HERE so it
-    cannot be forwarded past the guards (#9209); ``call_procedure`` is
-    forwarded and runs arbitrary Cypher through the inner handle — a named,
-    pre-existing escape in the module's KNOWN GAPS list, not a claim of
-    coverage.
+    attributes (``name``, ``schema``, ``copy``, ``call_procedure``, ``drop_*_index``,
+    ...) to the underlying handle. The one DESTRUCTIVE verb among them whose
+    effect is the WHOLE graph, ``delete()`` (GRAPH.DELETE), is defined
+    explicitly HERE so it cannot be forwarded past the guards (#9209). The rest
+    of the forwarded surface is NOT covered, and the module's KNOWN GAPS list
+    names the ones measured to destroy state (``call_procedure`` runs arbitrary
+    Cypher; the ``drop_*_index``/``drop_*_constraint`` family removes live
+    indexes) rather than claiming the surface is safe.
     """
 
     __slots__ = ("_g", "_proj")
