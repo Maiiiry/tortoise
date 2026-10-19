@@ -57,6 +57,27 @@ Composition fixture: the committed ``tests/fixtures/ask_spotcheck_composition.js
 (21 questions — the reproducibility gap closed by issue #2071 step 1).
 Path resolution order: ``--fixture`` CLI arg → ``TORTOISE_SPOTCHECK_FIXTURE``
 env → committed fixture → ``/tmp/ask_spotcheck.json`` (legacy compat).
+
+DISTILLED + PLANTED-SUPERSESSION leg (``--distilled``, #9095): the epic
+#2281 harness could only seed RAW turns, so its D7 measurement ("does the
+reader commit the current state?") and the D8 product gate ("0% of
+superseded points appear as live answers" — ``docs/product-success-eval.md``)
+had no instrument at all. This leg seeds the authored, hermetic corpus at
+``tests/fixtures/ask_spotcheck_distilled.json`` — three planted
+knowledge-update pairs (residence / diet / employer) — through
+``seed_distilled_corpus`` (the capture EXTRACTION write shape + the
+product's own ``supersede_point``), and reports, from ONE run per case,
+both arms of the paired read (D4: no parallel benchmark): ``raw``
+(``_seed_memory`` only) and ``distilled`` (+ distilled claims +
+supersession). Numbers: ``current_state`` (the knowledge-update class — the
+reader committed the CURRENT value) and ``superseded_live`` (the D8 gate —
+how many superseded claims rendered as their own block body with no
+``[SUPERSEDED BY:`` marker). One machine-readable ``DISTILLED_JSON`` line
+carries both, per arm. ``current_state`` has NO pass threshold (D8: the first
+run sets it); ``superseded_live.rendered_live > 0`` is a hard failure of the
+run, and so is a case the instrument never observed — an unmeasured gate is
+never a pass. ``TORTOISE_SPOTCHECK_JUDGE=mock`` grades the leg key-free
+(CI); without it the composition path's fail-fast judge-key rule applies.
 """
 from __future__ import annotations
 
@@ -106,6 +127,31 @@ _COMMITTED_FIXTURE = os.path.join(
     _REPO_ROOT, "tests", "fixtures", "ask_spotcheck_composition.json")
 _LEGACY_FIXTURE = "/tmp/ask_spotcheck.json"
 _FIXTURE_ENV = "TORTOISE_SPOTCHECK_FIXTURE"
+
+#: #9095: the authored, hermetic DISTILLED corpus (three planted
+#: knowledge-update pairs). Resolution order: ``--distilled-corpus`` CLI arg →
+#: ``TORTOISE_SPOTCHECK_DISTILLED_CORPUS`` env → this committed file.
+DISTILLED_FIXTURE = os.path.join(
+    _REPO_ROOT, "tests", "fixtures", "ask_spotcheck_distilled.json")
+_DISTILLED_FIXTURE_ENV = "TORTOISE_SPOTCHECK_DISTILLED_CORPUS"
+
+#: #9095: key-free grading for the distilled leg only
+#: (``TORTOISE_SPOTCHECK_JUDGE=mock``). It grades through the benchmark's own
+#: ``MockJudge`` so the planted-supersession gate can run in CI without a
+#: provider key; the composition path is deliberately NOT widened by it —
+#: #2071's fail-fast (no key → exit before grading) stays exactly as it was.
+DISTILLED_JUDGE_ENV = "TORTOISE_SPOTCHECK_JUDGE"
+
+#: #9095: the product's OWN flag vocabulary, mirrored — NOT invented. A
+#: superseded hit is annotated ``[SUPERSEDED BY: <newest superseding
+#: claim>]`` by ``tortoise/retrieval._validity_marker`` (#1353/#1367), and
+#: that marker IS the D8 product gate ("must be flagged or excluded"): the
+#: superseded claim may still reach the reader, but never unflagged. A single
+#: literal so the gate and its report can never disagree about what "flagged"
+#: means; ``tests/test_ask_spotcheck_distilled.py`` pins it against REAL
+#: rendered evidence (not this constant) so a renderer drift fails the suite
+#: instead of silently turning the gate into a guaranteed green.
+SUPERSEDED_MARKER = "[SUPERSEDED BY:"
 
 
 def _to_iso_date(raw: str) -> str:
@@ -786,16 +832,418 @@ def _record(question: dict, result: dict, judge) -> dict:
     }
 
 
+# ── #9095: the distilled + planted-supersession leg ──────────────────────
+
+
+def load_distilled_cases(path: str | None = None) -> list[dict]:
+    """Load the authored distilled/supersession corpus (#9095).
+
+    Resolution order: explicit ``path`` → ``TORTOISE_SPOTCHECK_DISTILLED_CORPUS``
+    env → the committed ``tests/fixtures/ask_spotcheck_distilled.json``.
+    Accepts a bare list or a ``{"cases": [...]}`` wrapper. Raises
+    ``FileNotFoundError`` when none exists — a missing corpus is NEVER an
+    empty run (an empty run reads as a green gate).
+    """
+    candidates = [p for p in (path, os.environ.get(_DISTILLED_FIXTURE_ENV))
+                  if p] + [DISTILLED_FIXTURE]
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            with open(cand) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "cases" in data:
+                cases = data["cases"]
+            elif isinstance(data, list):
+                cases = data
+            else:
+                raise ValueError(
+                    f"distilled corpus {cand!r}: expected a list of cases or "
+                    f"a {{\"cases\": [...]}} wrapper")
+            if not cases:
+                raise ValueError(
+                    f"distilled corpus {cand!r} carries no cases — an empty "
+                    f"corpus cannot measure the D8 gate")
+            return cases
+    raise FileNotFoundError(
+        "no distilled corpus found (tried "
+        f"{candidates}; set --distilled-corpus or {_DISTILLED_FIXTURE_ENV})")
+
+
+def _claim_session_id(case: dict, claim: dict, role: str) -> str:
+    """The haystack session a distilled claim was EXTRACTED FROM."""
+    ids = case.get("haystack_session_ids") or []
+    idx = claim.get("session_index")
+    if not isinstance(idx, int) or isinstance(idx, bool) \
+            or not 0 <= idx < len(ids):
+        raise ValueError(
+            f"planted case {case.get('question_id')!r}: distilled.{role}"
+            f".session_index {idx!r} does not name a haystack session "
+            f"({len(ids)} present)")
+    sid = ids[idx]
+    if not isinstance(sid, str) or not sid.strip():
+        raise ValueError(
+            f"planted case {case.get('question_id')!r}: distilled.{role} "
+            f"names session index {idx} whose id is {sid!r}")
+    return sid
+
+
+def _claim_turn_index(case: dict, claim: dict, role: str) -> int:
+    """The SOURCE TURN ordinal of a distilled claim (``source_turn_id``)."""
+    idx = claim.get("turn_index")
+    if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+        raise ValueError(
+            f"planted case {case.get('question_id')!r}: distilled.{role}"
+            f".turn_index {idx!r} is not a turn ordinal")
+    return idx
+
+
+def seed_distilled_corpus(sdk: TortoiseSDK, case: dict) -> dict[str, str]:
+    """Write ONE planted case's distilled claim pair (#9095) — ADDITIVE.
+
+    ``_seed_memory``'s raw turn leg is not touched: this is a SIBLING seeder,
+    so the 21-question composition keeps its store and its number (the same
+    reason ``SEED_SEARCH_KEYS_BY_DEFAULT`` exists — a mode flag on the shared
+    seeder would move every non-opt-in caller).
+
+    The write is the capture EXTRACTION writer's own call, not a new shape:
+    ``create_point(kind='statement', is_episodic=False, session_id=…,
+    extractedFrom='session:<sid>', validFrom=…, source_turn_id=…, quote=…)``
+    (a distilled claim is not an episodic turn — the raw turn store already
+    holds that), then the ``(:Session)-[:CONTAINS]->(:Point)`` provenance edge
+    capture wires itself, then the supersession through the product's own
+    :meth:`TortoiseSDK.supersede_point` — CORRECTS edge + the old point's
+    terminal status + the contiguous bitemporal window (``validTo`` = the
+    successor's ``validFrom``). Nothing here writes a status flag by hand: a
+    harness that faked the marking could not measure whether the PRODUCT's
+    marking is what the reader sees.
+
+    Idempotent for a re-seed (``dedup=True`` folds on ``(pointKind,
+    content_hash)``, and an already-superseded predecessor is not
+    re-superseded). Returns ``{"old": <id>, "new": <id>}``.
+    """
+    spec = case.get("distilled")
+    if not isinstance(spec, dict) or not spec.get("old") or not spec.get("new"):
+        raise ValueError(
+            f"planted case {case.get('question_id')!r} carries no "
+            f"distilled.old / distilled.new pair")
+    proj = sdk._get_proj()
+    ids: dict[str, str] = {}
+    for role in ("old", "new"):
+        claim = spec[role]
+        content = claim.get("content")
+        valid_from = claim.get("valid_from")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(
+                f"planted case {case.get('question_id')!r}: distilled.{role}"
+                f".content is empty")
+        if not isinstance(valid_from, str) or not valid_from.strip():
+            raise ValueError(
+                f"planted case {case.get('question_id')!r}: distilled.{role}"
+                f".valid_from is empty — a supersession needs a WINDOW")
+        sid = _claim_session_id(case, claim, role)
+        turn_index = _claim_turn_index(case, claim, role)
+        written = sdk.create_point(
+            "statement",
+            content,
+            is_episodic=False,
+            dedup=True,
+            session_id=sid,
+            extractedFrom=f"session:{sid}",
+            validFrom=valid_from,
+            source_turn_id=turn_index,
+            quote=claim.get("quote") or "",
+        )
+        pid = str(written["id"])
+        # Node MERGE BEFORE the edge MERGE (capture's #490 ordering rule).
+        proj.g.query(
+            "MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
+            "MERGE (s)-[:CONTAINS]->(p)",
+            params={"sid": sid, "pid": pid},
+        )
+        ids[role] = pid
+    old_point = sdk.get_point(ids["old"]) or {}
+    if (old_point.get("status") or "") != "superseded":
+        sdk.supersede_point(ids["old"], ids["new"])
+    return ids
+
+
+def superseded_live_in_evidence(evidence: str, case: dict) -> dict:
+    """The D8 gate read out of the ASSEMBLED READER EVIDENCE (#9095).
+
+    ``docs/product-success-eval.md``: "0% of superseded points appear as live
+    answers (must be flagged or excluded)" — so the check reads exactly what
+    the reader saw, not package stats. ``_render_block`` renders one hit as
+    ``<annotation prefix> <body>``: the body is the TAIL of its block, while
+    every marker and snippet lives in the PREFIX. Two consequences, both
+    load-bearing:
+
+    * a block is the OLD claim when its normalized text ENDS WITH the claim's
+      content — a bracketed prefix can never satisfy that, so **the snippet
+      trap is closed**: the SUCCESSOR's block carries ``[SUPERSEDES: <old
+      content>]`` and holds the old content verbatim, and a substring check
+      would count it (a guaranteed green on exactly the case the gate exists
+      to catch);
+    * of the blocks that ARE the old claim, one that carries no
+      ``[SUPERSEDED BY:`` marker was served as a live answer — the violation.
+
+    Identity note: an authored case keeps its distilled claim content
+    DISTINCT from every raw turn's text (distillation is not transcription),
+    which is what lets the superseded claim's block be told apart from the
+    turn it was distilled from. ``tests/test_ask_spotcheck_distilled.py``
+    pins that corpus property, so a corpus edit cannot silently make this
+    check ambiguous.
+
+    Returns ``{"seen": int, "rendered_live": int, "rate": float|None}``.
+    ``seen`` is how many blocks rendered the old claim at all; ``rate`` is
+    ``None`` when ``seen == 0`` — an unobserved case is UNMEASURED, never
+    0.0 (that would be a green gate on a harness that saw nothing). Whole
+    blocks are split on the blank line ``render_context`` joins them with; a
+    multi-PARAGRAPH claim body spans blocks (both authored and product claims
+    here are single-line, and a claim that is not found simply reads as
+    ``seen == 0`` — failing CLOSED, never open).
+    """
+    old = ((case.get("distilled") or {}).get("old") or {})
+    target = _normalize(old.get("content"))
+    seen = rendered_live = 0
+    for block in (evidence or "").split("\n\n"):
+        if not target or not _normalize(block).endswith(target):
+            continue
+        seen += 1
+        if SUPERSEDED_MARKER not in block:
+            rendered_live += 1
+    return {"seen": seen, "rendered_live": rendered_live,
+            "rate": (rendered_live / seen) if seen else None}
+
+
+def _distilled_judge():
+    """The distilled leg's judge: key-free ``MockJudge`` when
+    ``TORTOISE_SPOTCHECK_JUDGE=mock``, else the composition path's rule."""
+    if (os.environ.get(DISTILLED_JUDGE_ENV, "").strip().lower()
+            == "mock"):
+        return build_judge(mock=True)
+    _require_judge_key()
+    return build_judge()
+
+
+def run_distilled_case(case: dict, judge) -> dict:
+    """ONE planted case, BOTH arms, one invocation (D4: paired, never a
+    parallel benchmark).
+
+    ``raw`` = ``_seed_memory`` only; ``distilled`` = ``_seed_memory`` +
+    ``seed_distilled_corpus``. Same case, same judge, same reader — the only
+    variable is whether the store carries a distilled, superseded claim.
+    Each arm gets its own temp DB, so neither can contaminate the other.
+    """
+    record: dict = {"question_id": case.get("question_id") or ""}
+    for arm in ("raw", "distilled"):
+        db = os.path.join(tempfile.mkdtemp(prefix=f"ask_spot_{arm}_"), "t.db")
+        sdk = TortoiseSDK(db)
+        try:
+            _seed_memory(sdk, case)
+            if arm == "distilled":
+                seed_distilled_corpus(sdk, case)
+            qdate = _to_iso_date(case.get("question_date") or "")
+            try:
+                result = run_ask_lane(sdk, case["question"],
+                                      question_date=qdate)
+            except Exception as e:  # noqa: BLE001, RUF100 — same per-question
+                # rule as the composition leg: an unavailable reader is a
+                # FAILED measurement, recorded (never a silent pass) rather
+                # than aborting the remaining cases.
+                record[arm] = {
+                    "answer": "",
+                    "evidence": "",
+                    "error": f"ask unavailable: {type(e).__name__}",
+                    "current_state": {"committed": False, "n": 0,
+                                      "rate": None},
+                    "superseded_live": superseded_live_in_evidence(
+                        "", case),
+                }
+                continue
+            ok, note, kind = _grade(case, result, judge)
+            record[arm] = {
+                "answer": result.get("answer") or "",
+                "evidence": result.get("evidence") or "",
+                "judge": kind,
+                "note": note,
+                "current_state": {"committed": bool(ok), "n": 1,
+                                  "rate": 1.0 if ok else 0.0},
+                "superseded_live": superseded_live_in_evidence(
+                    result.get("evidence") or "", case),
+            }
+        finally:
+            sdk.close()
+    return record
+
+
+def _arm_summary(records: list[dict], arm: str) -> dict:
+    """Aggregate ONE arm's two numbers across the planted cases."""
+    committed = measured = seen = rendered_live = 0
+    for rec in records:
+        whole = rec.get(arm) or {}
+        cs = whole.get("current_state") or {}
+        n = int(cs.get("n") or 0)
+        measured += n
+        committed += 1 if (n and cs.get("committed")) else 0
+        sl = whole.get("superseded_live") or {}
+        seen += int(sl.get("seen") or 0)
+        rendered_live += int(sl.get("rendered_live") or 0)
+    return {
+        "current_state": {
+            "committed": committed, "n": measured,
+            "rate": (committed / measured) if measured else None},
+        "superseded_live": {
+            "seen": seen, "rendered_live": rendered_live,
+            "rate": (rendered_live / seen) if seen else None},
+    }
+
+
+def _distilled_payload(records: list[dict]) -> dict:
+    """The machine-readable distilled report (one ``DISTILLED_JSON`` line)."""
+    return {
+        "cases": [
+            {"question_id": rec.get("question_id") or "",
+             "raw": {"current_state": (rec.get("raw") or {}).get(
+                 "current_state"),
+                     "superseded_live": (rec.get("raw") or {}).get(
+                         "superseded_live"),
+                     "error": (rec.get("raw") or {}).get("error")},
+             "distilled": {
+                 "current_state": (rec.get("distilled") or {}).get(
+                     "current_state"),
+                 "superseded_live": (rec.get("distilled") or {}).get(
+                     "superseded_live"),
+                 "error": (rec.get("distilled") or {}).get("error")}}
+            for rec in records
+        ],
+        "arms": {arm: _arm_summary(records, arm)
+                 for arm in ("raw", "distilled")},
+    }
+
+
+def _distilled_hard_failures(payload: dict) -> list[str]:
+    """The D8 gate's failure list — FAIL CLOSED.
+
+    Two hard failures, both per case, both on the DISTILLED arm (the raw arm
+    has no superseded point, so there is nothing there to flag — that
+    contrast IS the measurement):
+
+    1. ``rendered_live > 0`` — a superseded claim reached the reader as a live
+       answer. The product gate is 0%, so any occurrence fails the run.
+    2. ``seen == 0`` — the superseded claim never reached the reader, so the
+       gate was never exercised. That is a RETRIEVAL gap in the instrument,
+       not a pass, and an unmeasured gate must never read green.
+
+    Plus an unavailable reader (``n == 0`` with an error): no measurement was
+    taken. ``current_state`` alone is NEVER a hard failure — D8 gives the
+    knowledge-update rate no threshold; the first run sets it.
+    """
+    failures: list[str] = []
+    for case in payload.get("cases") or []:
+        qid = case.get("question_id") or "<unnamed>"
+        arm = case.get("distilled") or {}
+        if arm.get("error"):
+            failures.append(
+                f"{qid}: no measurement — {arm['error']} (the D8 gate cannot "
+                f"be read off a failed reader)")
+            continue
+        sl = arm.get("superseded_live") or {}
+        if int(sl.get("rendered_live") or 0) > 0:
+            failures.append(
+                f"{qid}: {sl['rendered_live']} superseded claim(s) rendered "
+                f"live (no {SUPERSEDED_MARKER} marker) — the D8 gate is 0%")
+        elif not int(sl.get("seen") or 0):
+            failures.append(
+                f"{qid}: the superseded claim was never observed in the "
+                f"reader's evidence — the D8 gate is UNMEASURED, not passed")
+    return failures
+
+
+def _format_distilled_line(idx: int, total: int, rec: dict) -> str:
+    """One human line per planted case: both arms side by side."""
+    parts = []
+    for arm in ("raw", "distilled"):
+        whole = rec.get(arm) or {}
+        if whole.get("error"):
+            parts.append(f"{arm}: {whole['error']}")
+            continue
+        cs = whole.get("current_state") or {}
+        sl = whole.get("superseded_live") or {}
+        parts.append(
+            f"{arm}: committed={cs.get('committed')} "
+            f"superseded_live={sl.get('rendered_live')}/{sl.get('seen')}")
+    return (f"[distilled {idx}/{total}] "
+            f"{(rec.get('question_id') or '')[:34]:34s} " + " | ".join(parts))
+
+
+def _run_distilled_leg(corpus_path: str | None) -> int:
+    """Run the distilled + planted-supersession leg (``--distilled``)."""
+    try:
+        cases = load_distilled_cases(corpus_path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ask_spotcheck: {exc}", file=sys.stderr)
+        return 2
+    try:
+        judge = _distilled_judge()
+    except (RuntimeError, ValueError) as exc:
+        print(f"ask_spotcheck: {exc}", file=sys.stderr)
+        return 2
+    records: list[dict] = []
+    try:
+        for i, case in enumerate(cases):
+            rec = run_distilled_case(case, judge)
+            records.append(rec)
+            print(_format_distilled_line(i + 1, len(cases), rec))
+    except ValueError as exc:
+        print(f"ask_spotcheck: {exc}", file=sys.stderr)
+        return 2
+    payload = _distilled_payload(records)
+    failures = _distilled_hard_failures(payload)
+    payload["hard_failures"] = failures
+    for arm in ("raw", "distilled"):
+        cs = payload["arms"][arm]["current_state"]
+        sl = payload["arms"][arm]["superseded_live"]
+        rate = "unmeasured" if cs["rate"] is None else f"{cs['rate']:.2f}"
+        live = ("unmeasured" if sl["rate"] is None
+                else f"{sl['rate']:.2f}")
+        print(f"distilled[{arm}]: current_state {cs['committed']}/{cs['n']} "
+              f"({rate}; D8 sets no threshold — this run sets it) — "
+              f"superseded_live {sl['rendered_live']}/{sl['seen']} ({live}; "
+              f"product gate 0%)")
+    for failure in failures:
+        print(f"distilled: HARD FAILURE — {failure}", file=sys.stderr)
+    print("DISTILLED_JSON " + json.dumps(payload, sort_keys=True))
+    print(f"distilled: {len(cases)} planted case(s), judge={judge.model_id}, "
+          f"{len(failures)} hard failure(s) (#9095)")
+    return 0 if not failures else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="eval-lane ask QA spot-check (issue #2071: full-semantic "
-                    "grading; fail-fast on missing judge key)")
+                    "grading; fail-fast on missing judge key; #9095: "
+                    "--distilled runs the planted-supersession leg)")
     ap.add_argument(
         "--fixture", default=None,
         help=f"composition path (default: {_FIXTURE_ENV} env, then the "
              f"committed tests/fixtures/ask_spotcheck_composition.json, "
              f"then {_LEGACY_FIXTURE})")
+    ap.add_argument(
+        "--distilled", action="store_true",
+        help="run the DISTILLED + planted-supersession leg (#9095) instead "
+             "of the composition: the authored 3-case corpus, both arms "
+             "per case, emitting one DISTILLED_JSON line. The two legs are "
+             "kept apart on purpose — their classes have different targets "
+             "(0.8 aggregate vs a 0% rendered-live gate) and folding them "
+             "would make both numbers unreadable")
+    ap.add_argument(
+        "--distilled-corpus", default=None,
+        help=f"distilled corpus path (default: {_DISTILLED_FIXTURE_ENV} env, "
+             f"then the committed tests/fixtures/"
+             f"ask_spotcheck_distilled.json)")
     args = ap.parse_args(argv)
+
+    if args.distilled:
+        return _run_distilled_leg(args.distilled_corpus)
 
     spotcheck = _load_composition(args.fixture)
     # Fail-fast pre-flight (issue #2071 step 6): no judge key → exit BEFORE

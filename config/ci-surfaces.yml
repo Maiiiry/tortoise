@@ -4062,6 +4062,12 @@ surfaces:
   - test_ask_seed_shape.py   # #3914: every ask-lane seeder emits the CAPTURE shape (Session + CONTAINS edge, no sessionId/eventId prop) — asserted on the RESOLVED graph, mutation-proven against the edge
   - test_ask_spotcheck_judge.py
   - test_ask_spotcheck_seed_shape.py   # #3910: the spot-check fixture seeds the CAPTURE shape (Session + CONTAINS edge, no sessionId/eventId prop) — mutation-proven against the edge
+  # #9095: the distilled + planted-supersession leg. Its subject is the ask
+  # spot-check's own seeder/measurement (`tools/ask_spotcheck.py`, which writes
+  # `create_point` claims + `supersede_point` through `tortoise/sdk.py`), so an
+  # sdk-surface change must run it — and its D8 gate reads the product's own
+  # `[SUPERSEDED BY:` rendering, which lives on the retrieval path.
+  - test_ask_spotcheck_distilled.py
   - test_client_surface.py
   # #6869: `commit_session(base_url=..., api_key=...)` configures the Tortoise
   # API POST only — this pins that it does NOT select the extraction provider
@@ -5986,6 +5992,10 @@ durations:
   test_ask_eval_only.py: 4.6
   test_ask_seed_shape.py: 0.6
   test_ask_spotcheck_seed_shape.py: 0.3
+  # #9095: measured locally 2026-10-19 on the embedded lane (10 tests, 8.1s —
+  # five fresh embedded SDK constructions, each paying the engine boot).
+  # Refresh from the first post-merge CI run that measures it.
+  test_ask_spotcheck_distilled.py: 8.1
   test_battery_recall_wiring.py: 0.3
   test_blog_agent_delete_guard.py: 2.5
   test_blog_post_status_validation.py: 2.5  # #4311: analogue estimate (same Node type-stripping harness as test_blog_agent_delete_guard.py); refresh from the first post-merge junit artifact

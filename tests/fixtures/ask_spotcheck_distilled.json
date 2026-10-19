@@ -1,0 +1,114 @@
+{
+  "_about": "D7/D8 planted-supersession corpus for tools/ask_spotcheck.py (#9095). Authored BY HAND, hermetic, three cases — the standing method (owner, 2026-09-23): run it small and by hand first, show input rows -> output rows. Each case is one knowledge-update pair: an OLD value asserted in an earlier session and a NEW value asserted in a later one. The reader is asked for the CURRENT state, so a correct reader answers the NEW value.",
+  "_shape": "Each case is question-shaped (the keys _seed_memory consumes) PLUS a `distilled` block naming the two distilled claims the extraction writer would have produced: content (the distilled claim), valid_from (its window start), session_index + turn_index (the source turn it was distilled from), and quote (the source turn's own words). Distilled content is deliberately NOT verbatim-identical to any raw turn: distillation is not transcription, and the identity distinction is what lets the D8 check tell the superseded claim's block apart from the raw turn carrying the same fact.",
+  "cases": [
+    {
+      "question_id": "ku-residence-planted",
+      "question": "Where does the user live?",
+      "question_type": "knowledge-update",
+      "question_date": "2023/05/22 (Mon) 09:00",
+      "answer": "in the suburbs",
+      "haystack_session_ids": ["ku-res-old", "ku-res-new"],
+      "haystack_dates": ["2022/11/05 (Sat) 10:00", "2023/04/18 (Tue) 09:00"],
+      "answer_session_ids": ["ku-res-new"],
+      "haystack_sessions": [
+        [
+          {"role": "user", "content": "I live in Chicago."},
+          {"role": "assistant", "content": "Noted, you live in Chicago."}
+        ],
+        [
+          {"role": "user", "content": "I moved out of the city last week."},
+          {"role": "assistant", "content": "Understood, thanks for the update."}
+        ]
+      ],
+      "distilled": {
+        "old": {
+          "content": "The user lives in Chicago.",
+          "valid_from": "2022-11-05",
+          "session_index": 0,
+          "turn_index": 0,
+          "quote": "I live in Chicago."
+        },
+        "new": {
+          "content": "The user lives in the suburbs.",
+          "valid_from": "2023-04-18",
+          "session_index": 1,
+          "turn_index": 0,
+          "quote": "I moved out of the city last week."
+        }
+      }
+    },
+    {
+      "question_id": "ku-diet-planted",
+      "question": "What does the user eat?",
+      "question_type": "knowledge-update",
+      "question_date": "2023/05/22 (Mon) 09:00",
+      "answer": "vegetarian",
+      "haystack_session_ids": ["ku-diet-old", "ku-diet-new"],
+      "haystack_dates": ["2022/12/12 (Mon) 18:30", "2023/05/02 (Tue) 12:15"],
+      "answer_session_ids": ["ku-diet-new"],
+      "haystack_sessions": [
+        [
+          {"role": "user", "content": "I eat steak almost every day."},
+          {"role": "assistant", "content": "Good to know for the meal plan."}
+        ],
+        [
+          {"role": "user", "content": "I gave up meat in March for good."},
+          {"role": "assistant", "content": "Thanks for telling me, I will adjust."}
+        ]
+      ],
+      "distilled": {
+        "old": {
+          "content": "The user eats steak almost every day.",
+          "valid_from": "2022-12-12",
+          "session_index": 0,
+          "turn_index": 0,
+          "quote": "I eat steak almost every day."
+        },
+        "new": {
+          "content": "The user is vegetarian since March.",
+          "valid_from": "2023-05-02",
+          "session_index": 1,
+          "turn_index": 0,
+          "quote": "I gave up meat in March for good."
+        }
+      }
+    },
+    {
+      "question_id": "ku-employer-planted",
+      "question": "Who does the user work for?",
+      "question_type": "knowledge-update",
+      "question_date": "2023/05/22 (Mon) 09:00",
+      "answer": "at Northwind",
+      "haystack_session_ids": ["ku-job-old", "ku-job-new"],
+      "haystack_dates": ["2022/08/03 (Wed) 09:45", "2023/03/09 (Thu) 17:20"],
+      "answer_session_ids": ["ku-job-new"],
+      "haystack_sessions": [
+        [
+          {"role": "user", "content": "I work for Contoso as a data analyst."},
+          {"role": "assistant", "content": "Noted, Contoso data analyst."}
+        ],
+        [
+          {"role": "user", "content": "I joined a new company called Northwind today."},
+          {"role": "assistant", "content": "Congratulations on the new role."}
+        ]
+      ],
+      "distilled": {
+        "old": {
+          "content": "The user works for Contoso as a data analyst.",
+          "valid_from": "2022-08-03",
+          "session_index": 0,
+          "turn_index": 0,
+          "quote": "I work for Contoso as a data analyst."
+        },
+        "new": {
+          "content": "The user now works at Northwind.",
+          "valid_from": "2023-03-09",
+          "session_index": 1,
+          "turn_index": 0,
+          "quote": "I joined a new company called Northwind today."
+        }
+      }
+    }
+  ]
+}
