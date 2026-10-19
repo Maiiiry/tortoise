@@ -287,23 +287,31 @@ _DUMP_PAGE_SIZE = 1000
 #: ``>=`` against a cursor the caller has ALREADY advanced past the last row it
 #: saw — never ``>`` against a negative start (see ``_paged_rows``).
 #:
-#: ⛔ This was ``id(n) > $cursor`` with ``cursor = -1``, and that form is silently
-#: WRONG on FalkorDB's Rust core (``MODULE LIST`` ``graph`` ver **60001**, the
-#: engine behind ``falkordb/falkordb:latest`` and ``falkordb-server:6.0.1``).
-#: Measured 2026-10-19 against a live v6 server holding 3 nodes:
+#: ⛔ This was ``id(n) > $cursor`` with ``cursor = -1``, which is silently WRONG
+#: on FalkorDB's Rust core (``MODULE LIST`` ``graph`` ver **60001**, the engine
+#: behind ``falkordb/falkordb:latest`` and ``falkordb-server:6.0.1``). Measured
+#: 2026-10-19 against live servers holding 3 nodes — the pinned v4 core
+#: (``42006``) and a v6 server:
 #:
-#:     literal id(n) > -1   -> 0 rows      (!!)   id(n) >= 0 -> 3 rows
-#:     literal id(n) > 0    -> 2 rows             id(n) > -1 via param -> 0 rows
+#:     query                            v4 (42006)   v6 (60001)
+#:     id(n) > -1    (the old form)        3 rows      0 rows   (!!)
+#:     id(n) >= 0    (the shipped form)    3 rows      3 rows
+#:     id(n) > 0                           2 rows      2 rows
+#:     id(n) > -2                          0 rows      0 rows
+#:     id(n) > -4294967296                 0 rows      0 rows
+#:     id(n) > -9223372036854775808        0 rows      0 rows
+#:     id(n) >= -1  (the tempting fix)     0 rows      0 rows
 #:
-#: i.e. a NEGATIVE operand compared against `id()` matches nothing on v6 — every
-#: id sorts BELOW it. It is not a 32-bit wrap: `id(n) > -4294967296` and
-#: `id(n) > -9223372036854775808` also answer 0 rows on that server, so the
-#: existing rows above are the load-bearing part of this note, not a mechanism.
-#: The same queries answer correctly on both v4 cores (``42004`` app image and
-#: ``42006`` = the engine CI pins). Consequence of the old form: the FIRST page
+#: So the two cores disagree at exactly ONE point — the boundary ``> -1``, which
+#: is the value the old code sent — and that is the whole defect. Every operand
+#: below ``-1`` answers 0 rows on BOTH cores, so the ``-4294967296`` and
+#: ``-9223372036854775808`` probes are NOT evidence of a 32-bit wrap: a negative
+#: operand is outside the id domain on either core, and only ``-1`` happens to
+#: fall on v4's boundary. That is also why ``>= -1`` is not a fix — it returns 0
+#: rows on v4 as well. Consequence of the old form was concrete: the FIRST page
 #: was empty on every v6 server, so ``dump_graph`` exported 0 nodes for a
-#: populated graph and the fail-closed guard below refused — **no backup could
-#: be taken on v6**, with a message that blamed a truncated read (#9226).
+#: populated graph and the fail-closed guard below refused — **no backup could be
+#: taken on v6**, with a message that blamed a truncated read (#9226).
 #: Offsetting the cursor instead of negating it is engine-independent: an
 #: integer `id` is non-negative, so ``id >= 0`` is the true first page on both
 #: cores and ``id >= last + 1`` is exactly the old ``id > last``.
