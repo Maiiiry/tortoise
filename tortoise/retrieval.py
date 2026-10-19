@@ -909,14 +909,19 @@ def _validity_marker(h: dict) -> str:
       - live hit with ``valid_from`` → ``[valid since <from>]``
       - superseded hit → ``[valid <from> → <to>]``; with ``expired_at`` →
         ``[valid <from> → <to>; expired <tx-date>]``
-      - an ENDED-but-un-datable window (``end_state == 'unknown'``, i.e.
-        ``validToPrecision='unknown'`` with no ``validTo``) →
+      - an ENDED-but-un-datable window (``end_state == 'unknown'`` — either
+        ``validToPrecision='unknown'`` with no ``validTo``, or a STORED
+        ``validTo`` that names no instant, #9202) →
         ``[valid since <from>; end unknown]`` (with ``expired_at`` →
         ``…; expired <tx-date>; end unknown``). #2350: the marker is
         interpolated into the reader evidence, so ``[valid since <from>]``
         asserts the claim is STILL TRUE — rendering an un-datable end that
         way would fabricate coverage, the exact hazard the 3-state end
-        exists to prevent.
+        exists to prevent. ⚠️ The stored-un-datable spelling reaches the
+        ``if vt:`` branch above first and renders the RAW stored value
+        (``[valid <from> → TBD]``) — honest, but not yet the ``end unknown``
+        marker; that rendering is #9202's recorded residual, not a claim that
+        the end is dated.
       - undated hits → NO validity marker (byte-identical rendering)
     ISO date strings (YYYY-MM-DD — the dataset/``when`` normalization): no
     full timestamps in the reader context; timestamps stay on the graph

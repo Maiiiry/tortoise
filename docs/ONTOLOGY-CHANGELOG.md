@@ -33,6 +33,50 @@ aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 
 ---
 
+> **The 3-state end's un-datable case, settled (#9202, 2026-10-19 — a READ of §4.7's existing vocabulary, recorded without a model version bump):**
+>
+> §4.7's 3-state end already declares `END_UNKNOWN` as *"the window ended, but at a time we
+> cannot pin"*. What it did not say is which state a **stored** `validTo` that names no instant
+> belongs to, and the read path therefore reported `known` while the same triple (since #9201)
+> reported `valid_to_precision: null` — one block making two opposite claims about one end — and
+> `_covers`, which cannot order the value, could not exclude the window, so it covered every later
+> instant with **no flag firing**. From now on a stored end that names no instant is
+> **`END_UNKNOWN`** (the second spelling of the same state, beside the caller-declared
+> `validToPrecision = 'unknown'`), and covering candidates then fire `end_state_unknown` /
+> `indeterminate_end_ids` on the `get_historical_knowledge` reply.
+>
+> - **`known` is refuted, not merely superseded.** It means "the end is DATED"; since #9201 the
+>   same block reports `None` precision for that value. `END_KNOWN` now requires datability, not
+>   presence — presence is not precision, and it is not datability either.
+> - **`open` is refuted.** It means "no end was asserted", which the record contradicts (the column
+>   holds a value the author wrote), and reading an un-datable end as still-true is the
+>   fabricated-coverage anti-pattern §4.7 and `tortoise/validity.py`'s headline name (#2349/#2350).
+>   `open` stays reserved for an ABSENT bound, so the open/un-datable distinction survives.
+> - **The #6140 ruler's ruling does NOT generalise to the end.** That ruling (owner, 2026-10-11,
+>   *"A and C (c should be a warning)"*) settled the **START**, where an unparseable value means
+>   *no start was recorded* ⇒ open below; its own plan comment scoped the END to #2350's 3-state
+>   contract, which is the vocabulary this entry uses. The END has two kinds of "no usable date"
+>   and the START has one — the asymmetry §4.7 already declares.
+> - **`""` is not split from `"TBD"`.** The read path's ONE presence convention is `is not None`
+>   (pinned by the #2350 review-P2 and #9201 work); a second presence notion for the empty string
+>   would buy nothing, because `_covers` cannot exclude either value.
+> - **Coverage does not move.** `_covers` still cannot exclude such a window — there is no instant
+>   to compare — so the instant remains covered *and the reply now says so*, which is exactly the
+>   warning the `known` reading never gave. Whether a window past an un-datable end should cover at
+>   all is the #7818 boundary decision, not this one. The write boundary is untouched too: it still
+>   ACCEPTS an un-datable end (the #6140 `C` warning is START-scoped); only the READING changed.
+>
+> **OVERRIDES:** comparable agent-memory products surveyed for the #6140 decision (Zep/Graphiti)
+> leave `invalid_at` **null** when no temporal information is found, and their model reads a null
+> `invalid_at` as *still true* — we do not collapse an ASSERTED-but-un-datable end into "still true",
+> because §4.7's 3-state end exists precisely so an un-datable end is never read as still-true
+> (#2349/#2350). `END_OPEN` is reserved for a bound that is absent. The vocabulary's ONE home is
+> `tortoise/validity.py::end_state`; the response-field contract is recorded in
+> `config/surface-manifest.yml`. Residuals left deliberately open: the **write** boundary does not
+> yet warn on an un-datable `validTo` (the #6140 `C` warning is start-only), and the reader-facing
+> `[valid …]` marker (`tools/longmem_eval/retrieve.py`) still renders the raw stored value
+> (`→ TBD`) rather than an `end unknown` marker — honest, but not yet stated in the vocabulary.
+>
 > **Changelog v3.29 (2026-10-17 — issue #3554 — the canonical `:Session` capture-container is declared, and §4.1's `speaker` row is corrected):**
 >
 > **A new model section (§4.8), recorded in its OWN release.** The `:Session` capture container

@@ -66,15 +66,19 @@ response_fields:
   field: valid_to_precision
   emitted_when: '#2350 — the end precision of the hit''s validity window: year|month|day, the end-only `unknown`
     marker (the window ENDED but is un-datable), or null where the stored end is PRESENT but names no instant
-    (`TBD` — no granularity to claim; #9201). ABSENT (not null) when the window has no end at all, so the open
-    shape stays distinguishable. Emitted with the same block as valid_from_precision and end_state'
+    (`TBD` — no granularity to claim; #9201), and such a hit''s `end_state` is `unknown` (#9202). ABSENT (not null)
+    when the window has no end at all, so the open shape stays distinguishable. Emitted with the same block as
+    valid_from_precision and end_state'
   unchanged_when_off: n/a — not flag-gated; absent when the point has no end, so an open-ended hit stays
     byte-identical
 - response: tortoise_search
   field: end_state
   emitted_when: '#2350 — the 3-state window end, one of open|known|unknown (tortoise/validity.py is its ONE home),
     emitted whenever the point carries ANY window information so an ended-unknown window is never read as still-true
-    (the #2349 fabricated-coverage hazard)'
+    (the #2349 fabricated-coverage hazard). `known` requires the stored end to be DATED: a stored end that names no
+    instant (`TBD`, `""`, `not-a-date`) reports `unknown`, not `known`, since #9202 — it is an asserted end we cannot
+    pin, `_covers` cannot exclude it, and reading it as `open` would claim no end was asserted (#9202; the #6140 START
+    ruling does not generalise to the end, §4.7)'
   unchanged_when_off: n/a — not flag-gated; the key is absent on undated hits (byte-identical), never defaulted
 - response: tortoise_search
   field: provenance.currency
@@ -148,14 +152,17 @@ response_fields:
     / candidates / nearest)
   emitted_when: '#2350 — the additive precision block on EVERY chain entry and on each resolved entry: valid_from_precision
     (year|month|day, or null for a PRESENT bound that names no instant — #9201), valid_to_precision (year|month|day,
-    the end-only `unknown`, or null for a present un-datable end), end_state (open|known|unknown; a stored-but-un-datable
-    END still reads `known` until #9202''s owner ruling). Resolved by `window_read_fields` in
+    the end-only `unknown`, or null for a present un-datable end), end_state (open|known|unknown; a stored end that
+    names no instant reports `unknown` since #9202 — see the `end_state` row), plus `end_state_unknown` /
+    `indeterminate_end_ids` at the top level for it). Resolved by `window_read_fields` in
     tortoise/validity.py, the ONE read-projection home'
   unchanged_when_off: n/a — not flag-gated; additive keys, and a legacy dated window still reads as day / open
 - response: sdk:get_historical_knowledge
   field: end_state_unknown
-  emitted_when: '#2350 — only when at least one COVERING candidate''s end is un-datable (validToPrecision = unknown
-    with no validTo); true, and always alongside indeterminate_end_ids'
+  emitted_when: '#2350 — only when at least one COVERING candidate''s end is un-datable, in EITHER spelling:
+    validToPrecision = unknown with no validTo (the declared marker), or a STORED validTo that names no instant
+    (`TBD`/`""`/`not-a-date`, end_state `unknown` since #9202 — the case that previously fired no flag at all);
+    true, and always alongside indeterminate_end_ids'
   unchanged_when_off: yes — absent when no covering candidate has an unknown end, so those replies stay byte-identical
 - response: sdk:get_historical_knowledge
   field: indeterminate_end_ids

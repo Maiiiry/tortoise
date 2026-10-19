@@ -123,8 +123,16 @@ def test_effective_precision_denies_a_bound_that_names_no_instant():
 
 
 def test_window_read_fields_denies_precision_to_an_unorderable_bound():
-    """#9201: the ONE read-projection home reports no precision for a bound
-    that names no instant, on either end, and leaves the orderable end alone."""
+    """#9201 + #9202: the ONE read-projection home reports no precision for a
+    bound that names no instant, and the triple it returns never contradicts
+    itself — an un-datable END is ``unknown``, not ``known``/``open``.
+
+    #9201 pinned ``end_state == "known"`` here as a PLACEHOLDER for #9202 (its
+    docstring said so: "#9202 changes it on purpose"). It had to change: a
+    ``valid_to_precision: None`` beside ``end_state: "known"`` is one block
+    making two opposite claims about the same end (``known`` = "the end is
+    dated" / ``None`` = "no granularity can be claimed").
+    """
     from tortoise.validity import window_read_fields
 
     assert window_read_fields("", "2024-01-01", None, None) == {
@@ -135,7 +143,7 @@ def test_window_read_fields_denies_precision_to_an_unorderable_bound():
     assert window_read_fields("2024-01-01", "TBD", None, None) == {
         "valid_from_precision": "day",
         "valid_to_precision": None,
-        "end_state": "known",
+        "end_state": "unknown",
     }
 
 
@@ -147,6 +155,46 @@ def test_end_state_is_three_valued():
     assert end_state("2024-01-01", None) == END_KNOWN
     assert end_state("2024-01-01", "month") == END_KNOWN
     assert end_state(None, "unknown") == END_UNKNOWN
+
+
+def test_end_state_denies_known_to_a_bound_that_names_no_instant():
+    """#9202: a STORED end that names no instant is ``END_UNKNOWN``.
+
+    The issue's measurement, re-taken after #9201: ``_created_sort_key("TBD")``
+    is ``(1, "TBD")``, so ``_covers`` can never exclude the window above it —
+    the window covers every later instant — while the reply said
+    ``end_state: "known"`` and fired no flag. ``known`` means "the end is
+    DATED", which is exactly what this value is not.
+
+    The two refuted alternatives, each pinned here so a later lane does not
+    re-derive them:
+
+    * ``known`` (the pre-#9202 reading) contradicts #9201's ``None`` precision
+      for the same value, in the same triple.
+    * ``open`` (the symmetric reading of the #6140 START ruling) claims NO end
+      was asserted, erasing the open/un-datable distinction §4.7 requires —
+      the fabricated-coverage hazard (#2349/#2350) the 3-state end exists for.
+
+    Controls at the bottom: a dated end stays ``known``, an ABSENT end stays
+    ``open``, a caller-DECLARED ``unknown`` stays ``unknown``, and the numeric
+    bounds stay ``known`` (an epoch is an instant; a huge ``int`` must not
+    reach ``float()`` — the #9201 review-P3 failure mode, on this end too).
+    """
+    from tortoise.validity import END_KNOWN, END_OPEN, END_UNKNOWN, end_state
+
+    for unparseable in ("TBD", "", "not-a-date"):
+        assert end_state(unparseable, None) == END_UNKNOWN, unparseable
+    # the declared marker is unchanged, and still wins wherever it is legal
+    assert end_state(None, "unknown") == END_UNKNOWN
+    assert end_state("TBD", "unknown") == END_UNKNOWN
+    # controls — nothing else moved
+    assert end_state("2024-06-01", None) == END_KNOWN
+    assert end_state("2024-06-01T00:00:00+00:00", None) == END_KNOWN
+    assert end_state(None, None) == END_OPEN
+    assert end_state(None, "") == END_OPEN
+    assert end_state(0, None) == END_KNOWN       # epoch 0 IS an instant
+    assert end_state(False, None) == END_KNOWN
+    assert end_state(10 ** 400, None) == END_KNOWN  # no OverflowError
 
 
 def test_validate_refuses_unknown_start():
@@ -602,9 +650,10 @@ def test_unorderable_end_is_emitted_as_null_on_every_read_surface(lane):
     emit ``null`` — a brand-new cross-surface divergence introduced by the
     start-side fix. All four surfaces must agree on ``None``.
 
-    ``end_state`` stays ``known``: whether a stored-but-un-datable END should
-    report ``END_UNKNOWN`` is #9202's owner decision, and this read fix does
-    not pre-empt it. That assertion is the pin — #9202 changes it on purpose.
+    ``end_state`` is ``unknown`` since #9202: a stored end that names no
+    instant is not DATED, so ``known`` would contradict the ``null`` precision
+    this test pins in the same triple. The #9201 lane left it ``known`` on
+    purpose, as a pin for #9202 to flip — this IS that flip.
     """
     sdk, _events = lane
     from tortoise.assembly import docker_walker_port
@@ -616,25 +665,34 @@ def test_unorderable_end_is_emitted_as_null_on_every_read_surface(lane):
     # 1. get_historical_knowledge (raw bound)
     gk = sdk.get_historical_knowledge(p["id"], A_DATE)
     assert gk["chain"][0]["valid_to_precision"] is None
-    assert gk["chain"][0]["end_state"] == "known"
+    assert gk["chain"][0]["end_state"] == "unknown"
+    # …and the reply now carries the WARNING the ``known`` reading never gave.
+    # `_covers` still cannot exclude the window (there is no instant to compare
+    # against), so the instant is still COVERED — the reply says so out loud
+    # instead of reading as a still-true claim.
+    assert gk["status"] == "found"
+    assert gk["end_state_unknown"] is True
+    assert gk["indeterminate_end_ids"] == [p["id"]]
 
     # 2. assembly window rows
     port = docker_walker_port(sdk)
     today = datetime.date.today()
     row = next(r for r in port.window_rows(today, today) if r["id"] == p["id"])
     assert row["valid_to_precision"] is None
+    assert row["end_state"] == "unknown"
 
     # 3. search/recall wire
     hit = next(r for r in _scan(sdk) if r["id"] == p["id"])
     assert "valid_to_precision" in hit, hit
     assert hit["valid_to_precision"] is None
-    assert hit["end_state"] == "known"
+    assert hit["end_state"] == "unknown"
 
     # 4. the embedded fallback decoration
     from tortoise.sdk import _decorate_fallback_hits
     fb = _decorate_fallback_hits([{"id": p["id"]}], sdk._get_proj().g)
     assert "valid_to_precision" in fb[0], fb[0]
     assert fb[0]["valid_to_precision"] is None
+    assert fb[0]["end_state"] == "unknown"
 
     # CONTROL — an OPEN end (no validTo at all) keeps its absent key on the
     # wire; emitting ``null`` there would erase the open/un-datable distinction.
@@ -643,6 +701,15 @@ def test_unorderable_end_is_emitted_as_null_on_every_read_surface(lane):
     open_hit = next(r for r in _scan(sdk) if r["id"] == open_ended["id"])
     assert "valid_to_precision" not in open_hit
     assert open_hit["end_state"] == "open"
+    open_gk = sdk.get_historical_knowledge(open_ended["id"], A_DATE)
+    assert "end_state_unknown" not in open_gk
+
+    # CONTROL — a DATED end is untouched: still ``known``, still no flag.
+    dated = sdk.create_point("statement", "dated end",
+                             validFrom="2024-01-01", validTo="2024-12-31")
+    dated_gk = sdk.get_historical_knowledge(dated["id"], A_DATE)
+    assert dated_gk["chain"][0]["end_state"] == "known"
+    assert "end_state_unknown" not in dated_gk
 
 
 def test_check_consistency_reference_fold_states_the_terminalizer_precision(lane):

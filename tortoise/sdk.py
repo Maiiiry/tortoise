@@ -26733,18 +26733,21 @@ class TortoiseSDK:
         carries a window (``chain``, ``valid_point``, ``candidates``,
         ``nearest``) also carries ``valid_from_precision``,
         ``valid_to_precision`` and ``end_state`` (``open`` | ``known`` |
-        ``unknown``). A window whose end is marked un-datable
-        (``validToPrecision == "unknown"``, no ``validTo``) is an ENDED window
-        — but because no instant is attested, ``_covers`` cannot exclude it and
-        the reply would otherwise read exactly like a still-true one, so the
-        top level also carries ``end_state_unknown: true`` and
+        ``unknown``). An un-datable end has TWO spellings and one meaning —
+        the caller-declared marker (``validToPrecision == "unknown"``, no
+        ``validTo``) or a STORED end that names no instant (``validTo =
+        "TBD"`` / ``""`` / ``"not-a-date"``, #9202) — and both are ENDED
+        windows: because no instant is attested, ``_covers`` cannot exclude
+        them and the reply would otherwise read exactly like a still-true one,
+        so the top level also carries ``end_state_unknown: true`` and
         ``indeterminate_end_ids`` whenever a COVERING candidate has an unknown
         end. Read ``end_state_unknown`` before treating a ``found`` reply as
         attestation that the claim was true at ``at_date``: it says the window
         may have ended before then, and this read cannot tell. Legacy windows
         carry no precision property, so their replies are unchanged
         (``end_state`` is ``open``/``known`` and no unknown markers are
-        emitted).
+        emitted) — unless the legacy window carries an un-datable ``validTo``,
+        which is exactly the case #9202 closes.
         """
         from .search_engine import _created_sort_key
         from .validity import END_UNKNOWN, window_read_fields
