@@ -2822,6 +2822,14 @@ surfaces:
   # #3301: the four search legs must apply the canonical OBJECT vocabulary —
   # per-leg returned-set tests (docker lane).
   - test_object_search_visibility_3301.py
+  # #8166: the OBJECT status WRITE guard — the twin of test_subject_supersession_1423's
+  # `TestSubjectStatusWriteIsValidated`, plus the per-kind pack vocabulary, the
+  # ingest Phase-1 mirror, replay durability and the families the guard must NOT
+  # touch (`:Point:Object` precedence, url-keyed `:Source` status). Same
+  # projection/journal/write-path seam as its siblings above;
+  # `tortoise/sdk.py` + `tortoise/commit_ops.py` are SHARED_MODULE -> full matrix,
+  # so `core` is the default home.
+  - test_object_status_write_guard_8166.py
   # #1423: Subject supersession — the write path (a Subject-addressed
   # supersession applies instead of the #1370 warn-and-skip), the journaled
   # `EntityMutated op=supersede` record, rebuild_all byte-parity including the

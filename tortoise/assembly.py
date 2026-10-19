@@ -3939,15 +3939,16 @@ def collect_class_slices(port, window: ClassWindow, *,
 # set that was a frozen snapshot of a source it did not reference drifts the
 # moment the canonical set moves.
 #
-# The one divergence is ``outdated``, and it is LOAD-BEARING — not dead. The
-# generic write path CAN put it on an :Object: ``create_entity("object", ...)``
-# spreads caller props over its literal defaults, and ``_update_entity`` issues
-# an unvalidated ``SET n += $props``; ``status`` is not a server-managed prop,
-# so both are reachable from the MCP surface (``tortoise_create_entity`` /
-# ``tortoise_update_entity``). Dropping the member would flip such a successor
-# from recall-excluded (NAME-ONLY annotation) to a verified link. The guard
-# that would reject the status (#2977 / PR #3326, ``OBJECT_STATUS_VALUES``) is
-# NOT on main.
+# The one divergence is ``outdated``, and it is LOAD-BEARING — not dead. Since
+# #8166 the generic write path REFUSES it (``OBJECT_STATUS_VALUES`` has no
+# ``outdated``, and both ``create_entity("object", ...)`` and
+# ``_update_entity`` validate against ``declared_object_statuses``), so a new
+# writer can no longer mint it. The member stays because the probe's question
+# is "could a STORED successor be dead?", not "may a writer mint this": a
+# graph can hold an ``outdated``:Object written by a pre-#8166 SDK, a raw Cypher
+# producer or a JSONL replay of either — the #2977 NET-over-DOOR doctrine.
+# Dropping the member would flip such a successor from recall-excluded
+# (NAME-ONLY annotation) to a verified link.
 #
 # The divergence is FROZEN by tests/test_assembly_pure.py, which asserts this
 # set equal to ``OBJECT_TERMINAL_STATUSES | {"outdated"}`` — a silent drop or

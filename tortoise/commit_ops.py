@@ -48,6 +48,12 @@ _logger = logging.getLogger(__name__)
 #
 # This is NOT ``TortoiseSDK.STATE_EXCLUDED_STATUS`` (a class attr missing
 # 'archived' and used for the POINT pool).
+#
+# #8166: this set is the read surface's NET, not the write door. The DOOR is
+# ``declared_object_statuses`` below — an undeclared value can never be MINTED
+# by ``create_entity``/``update_entity`` any more, but the NET stays a net so a
+# state a legacy/pre-fix SDK or a raw producer already stored still reads as
+# dead here rather than as current.
 OBJECT_TERMINAL_STATUSES = frozenset(
     {"superseded", "deprecated", "archived", "retracted"})
 
@@ -57,6 +63,104 @@ OBJECT_TERMINAL_STATUSES = frozenset(
 # supersession fold is only valid when a successor VISIBLE to that view
 # remains.
 _RECALL_OBJECT_EXCLUDED_STATUS = OBJECT_TERMINAL_STATUSES
+
+# ═════════════════════════════════════════════════════════════════════════
+# #8166 — THE canonical, WRITABLE Object lifecycle (the DOOR, matching the
+# :Subject guard #1423/#8087 landed for its family). The generic entity write
+# surface (``create_entity("object", ...)`` and ``update_entity``) validates an
+# Object ``status`` against ``declared_object_statuses(kind)`` below and
+# REFUSES anything else BEFORE any write, so an undeclared value (``"dead"``)
+# can neither be STORED nor leak onto the four retrieval legs. Re-measured at
+# 58d28af0d before this landed: ``create_entity("object", status="dead")`` and
+# ``update_entity(<object_id>, status="dead")`` both stored 'dead', and the
+# structural leg served it as CURRENT (``OBJECT_TERMINAL_STATUSES`` is a
+# DENYLIST of known terminal states, so a status it has never heard of reads as
+# current on every leg).
+#
+# WHY THIS SET, and not a fresh literal: every member below is one this repo
+# ALREADY declares, so the door cannot drift from the writers it mirrors.
+#   * ``live`` — the mint default (``create_entity`` seeds ``status='live'``;
+#     ONTOLOGY §4.3: ``ObjectRegistered`` → live).
+#   * ``in_progress`` / ``completed`` — the two values the BUILT-IN connector
+#     fold writes (``status_folds.BUILTIN_CONNECTOR_FOLDS``, #1350/#2729) and
+#     the value the hosted onboarding STATE seed passes (``POST /v1/objects``).
+#   * ``superseded`` / ``deprecated`` / ``archived`` / ``retracted`` — the
+#     terminal members the read surfaces already exclude
+#     (``OBJECT_TERMINAL_STATUSES`` above). ``retracted`` IS writable: §5 makes
+#     retraction the Object tombstone verb (vs. delete, which hard-deletes) —
+#     it has no SDK producer yet, which is why #2977's read set kept it.
+#
+# ``draft`` and ``outdated`` are deliberately ABSENT. §4.3 gives an Object no
+# draft state, and ``outdated`` is a POINT/lifecycle-cache word the Object
+# family never mints — its presence in ``assembly._RECALL_OBJECT_EXCLUDED_STATUSES``
+# is the LEGACY/raw-producer allowance (see that module), not a writable verb.
+# Refusing it here is what keeps that allowance a net rather than a door.
+#
+# ⚠️ NOT a closed graph-wide vocabulary: a pack-declared kind OWNS its Object
+# state (#2729 — ``kindDefs[<kind>].statuses``), so the effective door is
+# ``declared_object_statuses(kind)`` = this set ∪ the kind's declared statuses.
+# A static set here would refuse the shipped venture pack's own lifecycle
+# (``sdk.create_object(..., objectKind="venture:tranche", status="released")``
+# is a supported call, pinned by ``tests/test_venture_pack.py``).
+OBJECT_STATUS_VALUES = frozenset({
+    "live",
+    "in_progress",
+    "completed",
+    "superseded",
+    "deprecated",
+    "archived",
+    "retracted",
+})
+
+
+def declared_object_statuses(kind: str | None = None) -> frozenset:
+    """The DECLARED, WRITABLE Object status vocabulary for ``kind`` (#8166).
+
+    ``OBJECT_STATUS_VALUES`` ∪ the lifecycle statuses the Object's OWN kind
+    declares in its pack (``kindDefs[<kind>].statuses``, #2729). Both spellings
+    of a pack kind are honoured (``venture:tranche`` and the bare ``tranche``
+    the extraction commit stores) through ``StatusFoldIndex.kind_forms_for``, so
+    a namespaced declaration cannot be inert for a bare-spelled node.
+
+    The kind scoping is deliberate, not incidental: the vocabulary is PER-KIND
+    (#2729 contract 1 — "the declaration is a closed vocabulary"). A FLAT union
+    across installed packs would accept ``status="met"`` on a goal Object
+    merely because the venture pack declares ``met`` for ``tranche``/
+    ``condition`` kinds — re-opening exactly the #7856 defect that made
+    ``update_entity(id, status="met")`` indistinguishable from ``goalState``.
+
+    Fails CLOSED to the canonical set when the pack catalog cannot be resolved
+    (``domain_loader._get_registry`` is None or raises): the door is a guard,
+    and a guard that silently stops guarding during a registry outage is the
+    hole itself. The refusal message names the declared set, so a caller on a
+    pack kind sees why. Read at CALL time (the same lazy, cycle-free access
+    ``projection.entities._status_fold_index`` uses) so a pack installed or
+    updated in this process is honoured without a restart.
+
+    ``None`` → the canonical set alone (the anonymous/legacy Object).
+    """
+    declared = set(OBJECT_STATUS_VALUES)
+    if not kind:
+        return frozenset(declared)
+    try:
+        # Function-level import: ``domain_loader`` reaches ``pack_registry``
+        # → ``status_folds``, and this module must stay importable from the
+        # projection during replay (no module-level cycle).
+        from .domain_loader import _get_registry
+
+        reg = _get_registry()
+        index = reg.status_fold_index if reg is not None else None
+    except Exception:  # noqa: BLE001 — a guard must never crash the write path
+        index = None
+    if index is not None:
+        try:
+            forms = set(index.kind_forms_for(kind))
+            for ns_kind, statuses in index.statuses_by_kind.items():
+                if forms & set(index.kind_forms_for(ns_kind)):
+                    declared.update(statuses)
+        except Exception:  # noqa: BLE001 — see above; canonical set stands
+            pass
+    return frozenset(declared)
 
 # ═════════════════════════════════════════════════════════════════════════
 # #1423 — THE canonical SUBJECT terminal vocabulary for the SEARCH/RECALL read
@@ -93,9 +197,9 @@ SUBJECT_TERMINAL_STATUSES = frozenset(
 # undeclared value (``"dead"``) can no longer be STORED and leak on every
 # read leg — the general hole the ``retracted`` observation is one instance
 # of. Points carry the same guard (``sdk.POINT_STATUS_VALUES``). The OBJECT
-# family has no write-side guard yet: ``update_entity(<object>, status=...)``
-# is still unvalidated, which is a PRE-EXISTING hole outside this lane's
-# scope (#1423 is the Subject family).
+# family's twin is ``OBJECT_STATUS_VALUES`` / ``declared_object_statuses``
+# above (#8166) — it was a PRE-EXISTING hole when #1423 landed, and is not
+# one now.
 SUBJECT_STATUS_VALUES = frozenset(
     {"draft", "live", "superseded", "deprecated", "archived"})
 

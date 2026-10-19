@@ -52,6 +52,11 @@ from .commit_ops import OBJECT_TERMINAL_STATUSES as _OBJECT_TERMINAL_STATUSES
 # used by the Subject `status` write guards in `create_entity` and
 # `_update_entity`. Imported so neither surface re-literals the vocabulary.
 from .commit_ops import SUBJECT_STATUS_VALUES as _SUBJECT_STATUS_VALUES
+# #8166: the DECLARED, writable OBJECT lifecycle — the Object twin of the
+# #1423 guard. A function, not a set: a pack-declared kind OWNS its Object
+# state vocabulary (#2729), so the door resolves the canonical set ∪ the
+# kind's declared `statuses`. See `commit_ops.declared_object_statuses`.
+from .commit_ops import declared_object_statuses as _declared_object_statuses
 from .env_truthy import env_flag, is_truthy  # #4097: the declared truthy contract
 from .ids import entity_name_id as _entity_name_id
 from .ids import ulid
@@ -169,7 +174,10 @@ DECIDE_DEFAULT_CREDIBILITY = "medium"  # → Beta(3,1) via source_credibility
 # objective map's state was an unvalidated free string written by a throwaway
 # script (`unmet`/`active`/`met`/`guideline`), so a reader could not tell a
 # belief about a goal from its state, and `update_entity(id, status="met")`
-# was accepted (the #2977 OBJECT_STATUS_VALUES guard is not on main). The
+# was accepted (the #2977 `OBJECT_STATUS_VALUES` guard was not on main when
+# this landed; #8166 put the Object write guard in, and its PER-KIND
+# vocabulary refuses `status="met"` on a goal while the venture pack's
+# `met` stays writable on ITS OWN kinds). The
 # vocabulary is the owner's closed set (the #7871 read-side comment: `met` /
 # `active` / `blocked` / `unmet` / `superseded` / `abandoned`) plus
 # `guideline` — the value the objective map already uses for the demoted
@@ -15859,6 +15867,12 @@ class TortoiseSDK:
           ``create_subject``) validates every item's ``status`` in bundle order
           before the name MERGE, so a bundle-wide refusal is the only one that
           matches the writer (see the loop below);
+        - an undeclared ``:Object`` ``status`` on ANY entity item (#8166) —
+          refused bundle-wide for the same reason: the Object writer
+          (``create_entity(type='object')``, reached through
+          ``create_object``) now validates an item's ``status`` against
+          ``declared_object_statuses(<item objectKind>)`` before the name
+          merge;
         - two endpoints that resolve to the SAME name-merged node (two refs, or
           a ref and the node id) — a self-edge ``create_direct_edge`` refuses.
 
@@ -15940,21 +15954,59 @@ class TortoiseSDK:
         # above gives the flag, and the one the sibling `:Subject` arm inside
         # the endpoint loop could never provide.
         #
-        # `:Object` and `:Event` are deliberately NOT refused: their writers do
-        # not validate, they STORE the value (measured), so a refusal here
-        # would reject bundles the writer accepts — the over-rejection class
-        # this PR already fixed once.
+        # #8166: `:Object` joined this class when the Object write guard landed.
+        # Until then the Object writer did NOT validate — it STORED the value
+        # (measured) — so refusing it here would have rejected bundles the
+        # writer accepts (the over-rejection class #7925 fixed once). Now the
+        # writer refuses an undeclared Object `status` BEFORE any merge, for
+        # EVERY entity item in bundle order, so Phase 1 must refuse it too or a
+        # bundle with a declared Point item would raise in step 3 after the
+        # Point had committed — the exact #2422/#7925 partial-mutation class.
+        # The two arms differ only in their AUTHORITY, not their scope:
+        #  * `:Subject` → the closed §4.2 set, and an explicit `None` is refused
+        #    (`create_entity(type='subject', status=None)` raises).
+        #  * `:Object` → `declared_object_statuses(<item's objectKind>)`, which
+        #    includes the kind's pack-declared statuses (#2729), and an explicit
+        #    `None` is ACCEPTED (NULL is the legacy/LIVE encoding of the
+        #    property; `create_entity("object", ..., status=None)` is a working
+        #    call). The kind is read at the SAME fold depth as the status.
+        # `:Event` is still NOT refused: its writer does not validate, and no
+        # retrieval leg gates on an Event status.
         for i, item in enumerate(bundle.get("entities") or []):
             if not isinstance(item, dict):
                 continue
-            if _ENTITY_ITEM_LABELS.get(
-                    str(item.get("type") or "").strip().lower()) != "Subject":
+            _istatus_label = _ENTITY_ITEM_LABELS.get(
+                str(item.get("type") or "").strip().lower())
+            if _istatus_label not in ("Subject", "Object"):
                 continue
+            _istatus_depth = _item_flatten_depth(item, "entities")
             _declares_status, own_status = _item_declared_status(
-                item, _item_flatten_depth(item, "entities"))
-            if not (_declares_status and (
-                    not isinstance(own_status, str)
-                    or own_status not in _SUBJECT_STATUS_VALUES)):
+                item, _istatus_depth)
+            if not _declares_status:
+                continue
+            if _istatus_label == "Object":
+                if own_status is None:
+                    continue
+                _ikind_declared, _ikind_val = _item_prop_at_depth(
+                    item, "objectKind", _istatus_depth)
+                _ikind = _ikind_val if _ikind_declared else "other"
+                _ideclared = _declared_object_statuses(
+                    _ikind if isinstance(_ikind, str) else None)
+                if isinstance(own_status, str) and own_status in _ideclared:
+                    continue
+                violations.append({
+                    "section": "entities", "index": i,
+                    "message": f"ingest: entities[{i}] declares status "
+                               f"{own_status!r} for an :Object of kind "
+                               f"{_ikind!r} — the writer validates against the "
+                               f"declared Object lifecycle and refuses it "
+                               f"mid-write, so the bundle is rejected at "
+                               f"validation. Must be one of: "
+                               f"{', '.join(sorted(_ideclared))}",
+                })
+                continue
+            if isinstance(own_status, str) and (
+                    own_status in _SUBJECT_STATUS_VALUES):
                 continue
             violations.append({
                 "section": "entities", "index": i,
@@ -16504,15 +16556,24 @@ class TortoiseSDK:
                             and isinstance(declared, str) and \
                             declared in self._INGEST_TERMINAL_STATUSES \
                             and not (elabel == "Subject"
-                                     and declared not in _SUBJECT_STATUS_VALUES):
+                                     and declared not in _SUBJECT_STATUS_VALUES) \
+                            and not (elabel == "Object"
+                                     and declared not in
+                                     _OBJECT_TERMINAL_STATUSES):
                         # #7925 review P2: a :Subject status that is terminal
                         # in the guard's vocabulary but OUTSIDE the label's own
                         # (`retracted`) is refused by the vocabulary leg above,
                         # which owns it: the write raises before any mint, so
                         # this arm's "applies status at MINT" claim would be
                         # false and would give one defect two diagnoses.
-                        # `:Object`/`:Event` writers store the value, so for
-                        # them the mint claim holds and this arm stays.
+                        # `:Object` is excluded on the same rule since #8166: a
+                        # status outside ``OBJECT_TERMINAL_STATUSES`` (today
+                        # only the legacy ``outdated``) is refused by the Object
+                        # vocabulary leg, so naming it here would report one
+                        # item twice. A DECLARED terminal Object status still
+                        # applies at mint, so for it the claim below holds —
+                        # as it does unconditionally for `:Event`, whose writer
+                        # stores the value with no vocabulary.
                         # Deliberately does NOT claim the node gets created
                         # for a name-merged label: a status that is terminal in
                         # the guard's vocabulary but outside the label's own
@@ -16866,8 +16927,14 @@ class TortoiseSDK:
           ``create_subject``) validates every item's ``status`` against
           ``SUBJECT_STATUS_VALUES`` before the name merge, so an invalid value
           (outside that set, non-string, or an explicit ``null``) on ANY entity
-          item is a Phase-1 violation, while ``:Object``/``:Event`` statuses
-          are stored verbatim and stay accepted. Props are read at the depth
+          item is a Phase-1 violation. ``:Object`` statuses joined it (#8166):
+          ``create_entity(type='object')`` validates against
+          ``commit_ops.declared_object_statuses(<item objectKind>)`` — the
+          canonical lifecycle ∪ the kind's pack-declared ``statuses`` (#2729) —
+          so an undeclared value is a Phase-1 violation too, while an explicit
+          ``null`` stays accepted (NULL is the legacy/LIVE encoding of the
+          property). ``:Event`` statuses are still stored verbatim and stay
+          accepted. Props are read at the depth
           the ITEM'S write door flattens (``_item_prop_at_depth``): TWICE for a
           ``subject``/``object``/``event`` item (step 3 relays
           ``create_subject``/``create_object``/``create_event`` →
@@ -29730,6 +29797,56 @@ class TortoiseSDK:
                         f"{', '.join(sorted(_SUBJECT_STATUS_VALUES))}"
                     )
 
+        # #8166: the OBJECT twin of the Subject guard above, and the half
+        # #8087 deliberately left out of scope. Before this, a `:Object`
+        # `status` took the unvalidated non-Point branch (`SET n += $p`), was
+        # STORED, and every retrieval leg served it as CURRENT: the four legs
+        # exclude `commit_ops.OBJECT_TERMINAL_STATUSES`, a DENYLIST of KNOWN
+        # terminal states, so a status the vocabulary has never heard of
+        # (measured: `"dead"`) reads as current BY CONSTRUCTION. No read-side
+        # rule can hide a value the vocabulary does not know, so the DOOR
+        # closes — the shape the Point guard (#3311) and the Subject guard
+        # (#1423) already use.
+        #
+        # The vocabulary is PER-KIND (`declared_object_statuses(<objectKind>)`)
+        # because a pack-declared kind owns its Object state (#2729): the
+        # shipped venture pack writes `pending`/`released`/`unmet`/`met` to its
+        # own kinds through this very surface
+        # (`tests/test_venture_pack.py::
+        # test_object_supersession_leaves_only_the_latest_state_live`). The
+        # stored `objectKind` is the fallback when the
+        # same call does not rewrite it.
+        #
+        # `NOT 'Point' IN labels(n)` is the #3311 POINT-LABEL PRECEDENCE: on a
+        # `:Point:Object` node the Point arm above already validated the status
+        # against `POINT_STATUS_VALUES` and dropped the key from `props` (the
+        # Point vocabulary carries `draft`/`outdated`, which the Object
+        # vocabulary must not reject). The conjunct keeps that precedence true
+        # even if the arms are ever reordered.
+        #
+        # An explicit `status=None` is left alone: NULL is the legacy/LIVE
+        # encoding of this property (§4.3: the property is a cache), unlike a
+        # Subject, whose closed §4.2 lifecycle the writer seeds and therefore
+        # refuses None for. Refusing None here would break a working
+        # `create_entity("object", ..., status=None)` call shape.
+        if "status" in props and props["status"] is not None:
+            _obj_rows = proj.g.query(
+                "MATCH (n:Object {id:$id}) WHERE NOT 'Point' IN labels(n) "
+                "RETURN n.objectKind",
+                params={"id": id_val},
+            ).result_set
+            if _obj_rows:
+                _obj_kind = props.get("objectKind") or _obj_rows[0][0]
+                _status = props["status"]
+                _declared = _declared_object_statuses(
+                    _obj_kind if isinstance(_obj_kind, str) else None)
+                if not isinstance(_status, str) or _status not in _declared:
+                    raise ValueError(
+                        f"Invalid status {_status!r} for a :Object of kind "
+                        f"{_obj_kind!r}. "
+                        f"Must be one of: {', '.join(sorted(_declared))}"
+                    )
+
         # #4649: a write can MOVE the node it addressed. The only identity key a
         # caller may rewrite is `url` (a :Source's identity): `id` is refused by
         # `_sanitize_props` above, and `eventId` is refused for every EVENT
@@ -30109,6 +30226,34 @@ class TortoiseSDK:
                  "status": "live", **props},
                 "SubjectAdded", is_episodic=is_episodic)
         elif t == "object":
+            # #8166 (the #1423 review-P1 shape, Object family): `status` arrives
+            # through `**props` below and OVERRIDES the `"status": "live"`
+            # default, so this surface is a SECOND door onto an undeclared
+            # Object status — and unlike a no-op re-mention, this one is
+            # JOURNALED (`ObjectRegistered` carries the state), so bad state
+            # also became DURABLE through replay. Validate against the declared
+            # vocabulary for this Object's kind and fail closed, exactly as
+            # `_update_entity` does above.
+            #
+            # `props.get("objectKind", "other")` mirrors the literal default
+            # the write below uses, so the kind the vocabulary is resolved
+            # against is the kind the node is minted with. An explicit
+            # `status=None` is accepted: NULL is the legacy/LIVE encoding of
+            # the property (the same reason `_update_entity` leaves it alone),
+            # and `create_entity("object", ..., status=None)` is a working call
+            # today.
+            _obj_kind = props.get("objectKind", "other")
+            _obj_status = props.get("status")
+            if _obj_status is not None:
+                _declared = _declared_object_statuses(
+                    _obj_kind if isinstance(_obj_kind, str) else None)
+                if (not isinstance(_obj_status, str)
+                        or _obj_status not in _declared):
+                    raise ValueError(
+                        f"Invalid status {_obj_status!r} for a :Object of "
+                        f"kind {_obj_kind!r}. "
+                        f"Must be one of: {', '.join(sorted(_declared))}"
+                    )
             node = self._create_entity(
                 "Object", _entity_name_id("Object", name),
                 {"name": name, "objectKind": props.pop("objectKind", "other"),
