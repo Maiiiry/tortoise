@@ -1,0 +1,110 @@
+{
+  "arms": [
+    {
+      "id": "raw"
+    },
+    {
+      "id": "distilled"
+    }
+  ],
+  "benchmark": "ask-distilled-supersession",
+  "corpus": {
+    "files": {
+      "fixtures/ask-diet-verbatim.json": "sha256:3e5113e52b1862cbf6aa8322684f27d888faf01c31fe1dd420b74104ca9a8835",
+      "fixtures/ask-diet.json": "sha256:0354cd0ecfae70732bdc0a630ff518d8aefa49fce1b897a017ef68463539ff00",
+      "fixtures/ask-employer-verbatim.json": "sha256:41d795d44ba778fd99590700103331fdd76a415bbc335298eafed6e0c71741d4",
+      "fixtures/ask-employer.json": "sha256:73044cb3e21b9546e2ced2fc005e0002f417200d134adfb8b30fdabd71916440",
+      "fixtures/ask-residence-verbatim.json": "sha256:0fde8aefe6fa2830bb1f4e20c55a0b3dfdd73764a73890ab850e5239c27cf7b6",
+      "fixtures/ask-residence.json": "sha256:7ba04c0db9056aad71c7f9675fbefe9f93c47442df3985516c9fba4deb59c5a4",
+      "gold/ask-diet-verbatim.gold.json": "sha256:52348b48b42135068bc9e62ffd48f3f94488423057d40abc419eac898adabd36",
+      "gold/ask-diet.gold.json": "sha256:8b452fda29239e16f92a8b6ff17232a7fed74a56aa95d5b5d05da76a167749cc",
+      "gold/ask-employer-verbatim.gold.json": "sha256:632168e33f588893dd9d29e8cb71debf10393f2d44e28bab2d063c666b7b1007",
+      "gold/ask-employer.gold.json": "sha256:41195c4e5dfe9a6d29bbe28b1f51b0008c5735b6a5a559c1eb8729ac78233eae",
+      "gold/ask-residence-verbatim.gold.json": "sha256:532537b33762ce01f7dfcad9b51b334ecdad9cfb5a4f4bb40c3451487eaa37f0",
+      "gold/ask-residence.gold.json": "sha256:405c7baedb403c563507721b9757d0f970238a02543861c980e39619963578cc"
+    },
+    "fixtures_hash": "sha256:7e99ae35bfd4e09fe8866318e1a655cca1787a85b7e95abf743bffb5bba90ad2",
+    "n_cases": 6,
+    "root": "tests/eval/ask"
+  },
+  "decision_rule": {
+    "d7_current_state": {
+      "arm": "distilled",
+      "class": "knowledge-update",
+      "reported_alongside": "the paired raw arm, same cases, same run",
+      "rule": "RECORD current_state committed/n. NO pass threshold \u2014 epic D8: the first run sets it"
+    },
+    "d8_superseded_live": {
+      "arm": "distilled",
+      "class": "knowledge-update",
+      "note": "the promise is already stated; this module does not invent a threshold for it, it measures the stated one",
+      "on_fail": "regression (gate_regression)",
+      "pass_iff": "every planted claim observed as a distilled-claim render (seen == n) AND zero rendered live",
+      "source": "docs/product-success-eval.md:132 \u2014 '0% of superseded points appear as live answers'"
+    },
+    "verbatim_no_regression": {
+      "arms": [
+        "raw",
+        "distilled"
+      ],
+      "class": "verbatim",
+      "rule": "for EVERY verbatim case, distilled.committed >= raw.committed; any per-case loss fails the run",
+      "why": "the epic's exit bar is 'commits current state on the knowledge-update class AND no regression on verbatim/raw' \u2014 a win on KU with a loss on verbatim is a FAIL, not a trade",
+      "why_not_a_threshold": "a paired within-run comparison of the same case in two arms, so it needs no pre-set number"
+    },
+    "verdicts": {
+      "inconclusive": "corpus hash / config identity mismatch",
+      "pass": "all three gates pass",
+      "regression": "any gate fails (failure_origin gate_regression)"
+    }
+  },
+  "epic": "2281",
+  "falsification": [
+    {
+      "expected": "d8_superseded_live fails (rendered_live > 0) \u21d2 verdict regression \u2014 the gate can say NO",
+      "probe": "drop the planted supersession (DELETE the CORRECTS edge, reopen the window)"
+    },
+    {
+      "expected": "verbatim_no_regression fails \u21d2 verdict regression, even when the KU number improves",
+      "probe": "make the distilled arm lose a verbatim case"
+    },
+    {
+      "expected": "fixtures_hash no longer matches the pre-registration \u21d2 verdict inconclusive (hash_mismatch)",
+      "probe": "edit any fixture or gold byte"
+    }
+  ],
+  "issue": "9097",
+  "reader_model": "deepseek/deepseek-v4-flash",
+  "report_path": "docs/benchmarks/ask-distilled-supersession/run-report.md",
+  "run_command": "tools/run-with-eval-keys.sh .venv/bin/python -m tools.longmem_eval.ask_sealed run --prereg docs/benchmarks/ask-distilled-supersession/preregistration.json --commit $(git rev-parse HEAD) --run-out <run.json> --report-out docs/benchmarks/ask-distilled-supersession/run-report.md",
+  "schema": "ask-sealed-preregistration/v1",
+  "scoring": {
+    "arms_per_case": [
+      "raw",
+      "distilled"
+    ],
+    "current_state": "semantic judge on question_type/question from the fixture against the SEALED gold answer, abstention=False; denominator = the class's cases",
+    "excluding_abs": "no abstention cases; the ask lane's abstention path is measured elsewhere",
+    "ingest": "raw arm: capture-shaped episodic turns; distilled arm: the same turn store PLUS distilled claims written through the product's own create_point(is_episodic=False, validFrom=\u2026) and the supersession through the product's own supersede_point",
+    "invocation": "both arms in ONE invocation, one fresh store per arm per case (D4: extend W2-b, no parallel benchmark)",
+    "judge_pin": "longmemeval-official-anscheck-gpt4o-2024-08-06-v1",
+    "judge_rubric_id_hash": "82d07b0de05daa48",
+    "precision": "n is small by design (3 planted pairs \u2192 3 KU + 3 verbatim cases; the standing method is run it small and by hand first). The rates are recorded with their n and carry NO precision claim; this is a first-run record, not an estimate of a population",
+    "reader_constancy": "one reader identity across both arms; the resolution is recorded in the receipt and a stub reader is never evidence",
+    "reader_pin": "deepseek/deepseek-v4-flash",
+    "superseded_live": "read over the ASSEMBLED READER EVIDENCE: a distilled-claim render (a validity window) whose BODY is the superseded claim with no flag = live; [SUPERSEDED BY: \u2026] or a closed window [valid <from> \u2192 <to>] = flagged"
+  },
+  "split": {
+    "knowledge-update": [
+      "diet",
+      "employer",
+      "residence"
+    ],
+    "verbatim": [
+      "diet-verbatim",
+      "employer-verbatim",
+      "residence-verbatim"
+    ]
+  },
+  "written_before_any_arm_run": true
+}

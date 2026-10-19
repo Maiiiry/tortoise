@@ -1,0 +1,39 @@
+{
+  "case_class": "knowledge-update",
+  "case_id": "residence",
+  "haystack_dates": [
+    "2023/03/02 (Thu) 10:00",
+    "2023/05/20 (Sat) 10:00"
+  ],
+  "haystack_session_ids": [
+    "residence-old",
+    "residence-new"
+  ],
+  "haystack_sessions": [
+    [
+      {
+        "content": "I live in Lisbon.",
+        "role": "user"
+      }
+    ],
+    [
+      {
+        "content": "I live in Porto.",
+        "role": "user"
+      }
+    ]
+  ],
+  "new_claim": {
+    "session_id": "residence-new",
+    "text": "I live in Porto.",
+    "valid_from": "2023-05-20"
+  },
+  "old_claim": {
+    "session_id": "residence-old",
+    "text": "I live in Lisbon.",
+    "valid_from": "2023-03-02"
+  },
+  "question": "Where do I live?",
+  "question_date": "2023/06/01 (Thu) 10:00",
+  "question_type": "knowledge-update"
+}

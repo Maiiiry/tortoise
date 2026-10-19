@@ -10,6 +10,26 @@ retrieval recall@k, context tokens and latency, with the full methodology in
 a provenance JSON. **No "#1" claims — published numbers carry their
 methodology** (design-locked 2026-08-15, issue #1144 axis 2).
 
+## Sealed ask-lane benchmark (epic #2281 Q3 exit bar, issue #9097)
+
+`tools/longmem_eval/ask_sealed.py` promotes the ask spot-check's distilled +
+planted-supersession leg (`tools/ask_spotcheck.py --distilled`, #9095) to the
+pre-registered sealed-benchmark discipline: a PRE-REGISTRATION record written
+before any arm runs (`docs/benchmarks/ask-distilled-supersession/
+preregistration.json`), a corpus whose grading key lives in a SEALED gold tree
+the runner never opens (`tests/eval/ask/`), the D7 knowledge-update number
+(recorded, no threshold) + the D8 "0% superseded live" gate + a paired
+verbatim/raw no-regression bar, and a receipt in the W7 vocabulary with
+ask-lane metric validation. The published report is machine-rendered:
+
+```bash
+.venv/bin/python -m tools.longmem_eval.ask_sealed preregister   # BEFORE the run
+tools/run-with-eval-keys.sh .venv/bin/python -m tools.longmem_eval.ask_sealed \
+    run --prereg docs/benchmarks/ask-distilled-supersession/preregistration.json \
+        --commit "$(git rev-parse HEAD)" --run-out <run.json> \
+        --report-out docs/benchmarks/ask-distilled-supersession/run-report.md
+```
+
 ## Usage
 
 ```bash

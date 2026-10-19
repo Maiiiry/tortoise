@@ -1,0 +1,6 @@
+{
+  "answer": "I work at Northwind Traders.",
+  "case_class": "knowledge-update",
+  "case_id": "employer",
+  "superseded_claim": "I work at Contoso Ltd."
+}

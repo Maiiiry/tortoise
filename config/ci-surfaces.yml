@@ -3413,6 +3413,15 @@ surfaces:
   # W2-b (#2098): BPRE write-path gate — core fallback catches engine
   # code with no surface mapping (tortoise/session_import/ parsers etc.).
   - eval/write_path/test_write_path_benchmark.py
+  # #9097: the SEALED ask corpus's hermetic contract (manifest + fixtures/gold
+  # split + pre-registration + receipt). A `tests/eval/ask/**`-only diff (a
+  # fixture or a gold byte) names no SOURCE_PATTERNS surface and falls back to
+  # `core`, so WITHOUT this arm the one edit the sealing exists to make
+  # impossible — a gold-only retune — would select no file that verifies the
+  # hash. Same reasoning as the W2-b arm above; the pipeline half
+  # (`test_ask_sealed_benchmark.py`) stays on `eval`/`sdk` where its subjects
+  # live.
+  - test_ask_sealed_corpus.py
   # #2121: the Hermes seam — the shipped plugin template
   # (tortoise/hermes-plugin/) and the session-store parser
   # (tortoise/session_import/parsers.py) name no SOURCE_PATTERNS surface, so a
@@ -4230,6 +4239,12 @@ surfaces:
   # gate loudly rather than silently passing. Mutation-proven: drop the
   # supersession and the gate goes RED.
   - test_ask_spotcheck_distilled_corpus.py
+  # #9097: the SEALED promotion of the #9095 instrument — pre-registration,
+  # the fixtures/sealed-gold split, the D8 + verbatim gates and the ask-lane
+  # receipt. The pipeline half drives `run_ask_lane` + the capture-shaped
+  # seeder, so an ask_lane/sdk change must run it.
+  - test_ask_sealed_benchmark.py
+  - test_ask_sealed_corpus.py
   - test_client_surface.py
   # #6869: `commit_session(base_url=..., api_key=...)` configures the Tortoise
   # API POST only — this pins that it does NOT select the extraction provider
@@ -4480,6 +4495,8 @@ surfaces:
   - longmem_eval/test_assembly_arm.py  # #2165 Task 7: v2-lane eval arm A/A-widened/B admission + R9 geometry (docker-lane)
   - test_ask_eval_only.py  # #3849: N6 pins tools/longmem_eval/reader.py's prompt re-export (an eval-owned file) — also under api/core/sdk
   - longmem_eval/test_measure_temporal.py  # #2578 Task 2: measurement scaffold — census 133->55 pin, prereg writer, refusal classifier (embedded-safe)
+  - test_ask_sealed_benchmark.py  # #9097: guards tools/longmem_eval/ask_sealed.py (the pre-registration writer, the sealed run, the D8 + verbatim gates, the ask receipt, the machine-rendered report) — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so an ask_sealed.py-only change selects it; dual-registered with `sdk` because it drives `run_ask_lane`
+  - test_ask_sealed_corpus.py  # #9097: the hermetic half (corpus manifest + sealed-gold split + pre-registration contract + receipt validation). Also registered in `core` below, because a `tests/eval/ask/**`-only diff falls back to `core` — without that arm a gold-only edit (the one this whole module exists to make impossible) would select no file that checks it.
   - longmem_eval/test_freq_count_disposition.py  # #2886: guards tools/longmem_eval/freq_count_disposition.py (the census frequency/count disposition tool) — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so an eval-tool change alone selects it
   - test_temporal_aggregate_arm.py  # #2886: guards tools/longmem_eval/retrieve.py's `temporal_aggregate_verdict` adapter — `tools/longmem_eval/` is a SOURCE_PATTERNS entry of this surface, so a retrieve.py-only change selects it (dual-registered with `core` for the core's verdict semantics)
   - longmem_eval/test_temporal_admission_trace.py  # #2976: temporal admission trace — pool-membership vs reader-window-cut receipts + TR-machinery-inert mechanism pin (hermetic, no DB)
@@ -6228,6 +6245,13 @@ durations:
   # `tortoise` import). Refresh from the first post-merge CI run that measures
   # it.
   test_ask_spotcheck_distilled_corpus.py: 8.7
+  # Measured locally 2026-10-19 (17 tests). Three of them execute real sealed
+  # runs over embedded stores (6 cases x 2 arms each): ~14s per run once the
+  # embedder is warm, ~148s for the first one in a cold process (that delta is
+  # the sentence-transformers load, which any ask-lane file in the shard pays
+  # once). Refresh from the first post-merge CI run that measures it.
+  test_ask_sealed_benchmark.py: 45
+  test_ask_sealed_corpus.py: 0.5
   test_battery_recall_wiring.py: 0.3
   test_blog_agent_delete_guard.py: 2.5
   test_blog_post_status_validation.py: 2.5  # #4311: analogue estimate (same Node type-stripping harness as test_blog_agent_delete_guard.py); refresh from the first post-merge junit artifact

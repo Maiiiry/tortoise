@@ -1,0 +1,32 @@
+{
+  "case_ids": [
+    "diet",
+    "diet-verbatim",
+    "employer",
+    "employer-verbatim",
+    "residence",
+    "residence-verbatim"
+  ],
+  "classes": [
+    "knowledge-update",
+    "verbatim"
+  ],
+  "corpus": "ask",
+  "files": {
+    "fixtures/ask-diet-verbatim.json": "sha256:3e5113e52b1862cbf6aa8322684f27d888faf01c31fe1dd420b74104ca9a8835",
+    "fixtures/ask-diet.json": "sha256:0354cd0ecfae70732bdc0a630ff518d8aefa49fce1b897a017ef68463539ff00",
+    "fixtures/ask-employer-verbatim.json": "sha256:41d795d44ba778fd99590700103331fdd76a415bbc335298eafed6e0c71741d4",
+    "fixtures/ask-employer.json": "sha256:73044cb3e21b9546e2ced2fc005e0002f417200d134adfb8b30fdabd71916440",
+    "fixtures/ask-residence-verbatim.json": "sha256:0fde8aefe6fa2830bb1f4e20c55a0b3dfdd73764a73890ab850e5239c27cf7b6",
+    "fixtures/ask-residence.json": "sha256:7ba04c0db9056aad71c7f9675fbefe9f93c47442df3985516c9fba4deb59c5a4",
+    "gold/ask-diet-verbatim.gold.json": "sha256:52348b48b42135068bc9e62ffd48f3f94488423057d40abc419eac898adabd36",
+    "gold/ask-diet.gold.json": "sha256:8b452fda29239e16f92a8b6ff17232a7fed74a56aa95d5b5d05da76a167749cc",
+    "gold/ask-employer-verbatim.gold.json": "sha256:632168e33f588893dd9d29e8cb71debf10393f2d44e28bab2d063c666b7b1007",
+    "gold/ask-employer.gold.json": "sha256:41195c4e5dfe9a6d29bbe28b1f51b0008c5735b6a5a559c1eb8729ac78233eae",
+    "gold/ask-residence-verbatim.gold.json": "sha256:532537b33762ce01f7dfcad9b51b334ecdad9cfb5a4f4bb40c3451487eaa37f0",
+    "gold/ask-residence.gold.json": "sha256:405c7baedb403c563507721b9757d0f970238a02543861c980e39619963578cc"
+  },
+  "fixtures_hash": "sha256:7e99ae35bfd4e09fe8866318e1a655cca1787a85b7e95abf743bffb5bba90ad2",
+  "generator": "tests/eval/ask/generate_corpus.py",
+  "schema_version": 1
+}

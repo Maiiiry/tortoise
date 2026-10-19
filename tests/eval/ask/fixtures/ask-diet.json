@@ -1,0 +1,39 @@
+{
+  "case_class": "knowledge-update",
+  "case_id": "diet",
+  "haystack_dates": [
+    "2023/04/04 (Tue) 08:30",
+    "2023/05/26 (Fri) 08:30"
+  ],
+  "haystack_session_ids": [
+    "diet-old",
+    "diet-new"
+  ],
+  "haystack_sessions": [
+    [
+      {
+        "content": "I eat a vegetarian diet.",
+        "role": "user"
+      }
+    ],
+    [
+      {
+        "content": "I eat a vegan diet.",
+        "role": "user"
+      }
+    ]
+  ],
+  "new_claim": {
+    "session_id": "diet-new",
+    "text": "I eat a vegan diet.",
+    "valid_from": "2023-05-26"
+  },
+  "old_claim": {
+    "session_id": "diet-old",
+    "text": "I eat a vegetarian diet.",
+    "valid_from": "2023-04-04"
+  },
+  "question": "What diet am I on?",
+  "question_date": "2023/06/01 (Thu) 10:00",
+  "question_type": "knowledge-update"
+}
