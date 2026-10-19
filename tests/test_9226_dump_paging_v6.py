@@ -208,11 +208,20 @@ def test_the_page_size_constant_reaches_the_page_read(monkeypatch):
 class _AbsentGraphV6:
     """A v6 handle for a graph name the engine registry does NOT contain.
 
-    MEASURED on 60002, 2026-10-19: ``MATCH (n) WHERE id(n) >= 0`` answers with
+    MEASURED on 60002, 2026-10-19/20: ``MATCH (n) WHERE id(n) >= 0`` answers with
     the phantom row ``(0, [], {})`` although ``MATCH (n)`` and both aggregate
     counts answer 0; on v4 (42006) every one of them answers 0. `dump_graph`
-    must therefore NOT page a graph whose independent count is 0 — otherwise the
-    phantom is exported as a node, and `restore_graph` materialises it.
+    must therefore NOT page the NODE read of a graph whose independent count is
+    0 — otherwise the phantom is exported as a node, and `restore_graph`
+    materialises it.
+
+    The phantom is NODE-only, measured: on the same absent graph the engine
+    answers the EDGE page (``_DUMP_EDGE_PAGE_QUERY``) and the reconcile
+    ``id(n) IN $ids`` read with 0 rows, and the ``id(n) = $id`` liveness probe
+    with ``count(n) = 0``. Those answers are modelled EXPLICITLY below (not
+    swallowed by a catch-all) so this file pins what was measured: an
+    unmodelled statement RAISES, because a silent ``[]`` would let a future read
+    on this path pass the test without the engine's answer ever being asserted.
     """
 
     def __init__(self, calls):
@@ -221,18 +230,40 @@ class _AbsentGraphV6:
     def query(self, cypher, params=None, timeout=None):
         params = params or {}
         self.calls.append((cypher, dict(params)))
-        if "count(" in cypher:
+        # The two aggregates, discriminated the same way their own text does.
+        if "$skip_labels" in cypher:      # _COUNT_DATA_NODES_QUERY
             return _Result([[0]])
+        if "()-[r]->()" in cypher:        # _COUNT_ALL_EDGES_QUERY
+            return _Result([[0]])
+        if "id(n) = $id" in cypher:       # _first_live_node_id: count(n) = 0
+            return _Result([[0]])          # driven by _TornReadV6 below
         if "id(n) >=" in cypher:
-            return _Result([[0, [], {}]])  # the phantom
-        return _Result([])
+            return _Result([[0, [], {}]])  # the phantom — NODE read only
+        if "id(r) >=" in cypher:
+            return _Result([])             # MEASURED: no phantom on the edge read
+        if "id(n) IN $ids" in cypher:
+            return _Result([])             # MEASURED: no phantom on the reconcile
+        if "GraphEventMeta" in cypher:
+            return _Result([])             # no counter node (never emitted)
+        if "MATCH (n) RETURN id(n) LIMIT 1" in cypher:
+            return _Result([])             # the probe: phantom-free, MEASURED
+        raise AssertionError(f"unmodelled statement: {cypher}")
 
 
 def test_an_absent_graph_dumps_as_empty_and_never_pages_the_phantom():
     """MEASURED v6 behaviour: a graph absent from the registry answers the node
     page with a phantom ``(0, [], {})`` while its counts are 0. Exporting that
     phantom is a regression the truncation guard cannot see (the guard is
-    one-sided), so the dump must be empty AND must not have issued the page."""
+    one-sided), so the dump must be empty AND must not have issued the page.
+
+    The edge/reconcile halves are asserted too, because the manifest's claim is
+    "the phantom is not paged": those reads ARE issued (the edge page is
+    deliberately unconditional — it recovers nodes created mid-read) and the
+    measured answer for each is 0 rows, so no phantom edge can reach
+    ``raw_edges``. If the engine ever fabricates there, the fake's explicit
+    branch is the line to change, and this test is where the new answer gets
+    pinned.
+    """
     from tortoise.hosted_backup import dump_graph
 
     calls = []
@@ -242,9 +273,192 @@ def test_an_absent_graph_dumps_as_empty_and_never_pages_the_phantom():
         f"an absent graph must dump as empty — the v6 phantom was exported: "
         f"{payload['nodes']}")
     assert payload["edge_count"] == 0
+    assert payload["read_edge_count"] == 0
     assert not [c for c in calls if "id(n) >=" in c[0]], (
         "the node page was issued for a graph whose independent count is 0 — the "
         f"v6 phantom only exists on that read: {[c[0] for c in calls]}")
+    assert [c for c in calls if "id(r) >=" in c[0]], (
+        "the edge page was NOT issued — the dump skipped it without a measurement "
+        f"saying the engine needs that: {[c[0] for c in calls]}")
+
+
+class _CreatedMidReadV6:
+    """Probe sees an empty graph; a writer then creates A, B and A→B.
+
+    The race the end-count comparison exists for: the emptiness probe answers
+    0 rows, so the node page is skipped, but the UNCONDITIONAL edge page returns
+    the new edge and the reconcile returns both endpoints. The artifact is then
+    COMPLETE and must be written — not refused as "empty" (measured counts:
+    0 nodes / 0 edges at the start read, 2 / 1 at the end read).
+
+    The count branches discriminate on the aggregates' OWN text, never on a bare
+    ``count(``: `_first_live_node_id`'s liveness probe is also a ``count(n)``
+    read, so a loose match would let it consume this fixture's positional "end"
+    slot and invert the end count — a trap that would HIDE a regression.
+    """
+
+    _END_NODES = 2
+
+    def __init__(self):
+        self.calls = []
+        self._node_counts = 0
+        self._edge_counts = 0
+
+    def query(self, cypher, params=None, timeout=None):
+        params = params or {}
+        self.calls.append((cypher, dict(params)))
+        if "$skip_labels" in cypher:      # _COUNT_DATA_NODES_QUERY
+            self._node_counts += 1
+            return _Result([[0 if self._node_counts == 1 else self._END_NODES]])
+        if "()-[r]->()" in cypher:        # _COUNT_ALL_EDGES_QUERY
+            self._edge_counts += 1
+            return _Result([[0 if self._edge_counts == 1 else 1]])
+        if "id(n) >=" in cypher:
+            raise AssertionError(
+                "the node page must be skipped — the probe found no node")
+        if "id(r) >=" in cypher:
+            return _Result([[0, 1, "IMPL", {}, 0]])
+        if "id(n) IN $ids" in cypher:
+            return _Result([[0, ["Point"], {"id": "a"}],
+                            [1, ["Point"], {"id": "b"}]])
+        if "GraphEventMeta" in cypher:
+            return _Result([])
+        if "MATCH (n) RETURN id(n) LIMIT 1" in cypher:
+            return _Result([])
+        raise AssertionError(f"unmodelled statement: {cypher}")
+
+
+def test_a_graph_gaining_its_first_nodes_mid_read_is_dumped_not_refused():
+    """The mid-read refusal must not fire on a dump that is COMPLETE.
+
+    ``nodes_skipped_as_empty`` records that the PROBE saw nothing, not that the
+    artifact is missing anything. In this race the edge page plus the reconcile
+    recover both nodes, so the dump is whole; refusing it would discard a good
+    backup with a message asserting it captured nothing (fail-closed, but wrong).
+    Pre-fix this raised ``ValueError``.
+    """
+    from tortoise.hosted_backup import dump_graph
+
+    fake = _CreatedMidReadV6()
+    payload = dump_graph(fake, "grew_mid_read")
+
+    assert payload["node_count"] == 2, payload["nodes"]
+    assert payload["edge_count"] == 1, payload["edges"]
+    assert not [c for c in fake.calls if "id(n) >=" in c[0]], (
+        "the node page was issued even though the probe found no node")
+
+
+class _PartiallyRecoveredMidReadV6(_CreatedMidReadV6):
+    """The same race, plus an ISOLATED node the reconcile cannot recover.
+
+    A and B come back as A→B's endpoints; C has no edge yet, so the skipped node
+    page is the only read that could ever have seen it. The store ends with 3
+    data nodes and the dump holds 2 — a PARTIAL artifact that every other guard
+    would pass, because ``min(start=0, end=3)`` is 0.
+    """
+
+    _END_NODES = 3
+
+
+def test_a_partially_recovered_mid_read_still_refuses():
+    """``len(nodes) < source_count_end`` — not ``not nodes`` — is the condition.
+
+    Keying the refusal on "the dump is empty" leaves the partial case open: with
+    ``not nodes`` this exact fixture wrote a 2-node dump for a 3-node graph and
+    recorded ``source_node_count: 0``, which the one-sided ledger check reads as
+    green. Restore then loses node C silently.
+    """
+    from tortoise.hosted_backup import dump_graph
+
+    with pytest.raises(ValueError, match="gained content mid-read"):
+        dump_graph(_PartiallyRecoveredMidReadV6(), "grew_mid_read_partial")
+
+
+class _TornReadV6(_CreatedMidReadV6):
+    """The probe-race with a TORN reconcile: the edge comes back, its nodes do not.
+
+    Drives `_first_live_node_id` — the ``id(n) = $id RETURN count(n)`` liveness
+    probe, which is why ``_AbsentGraphV6`` models that statement explicitly
+    rather than through a ``count(`` catch-all. The store says the node is LIVE
+    while the reconcile did not return it, so the dump is torn and must refuse
+    rather than drop the edge. (The mid-read ``gained content`` guard is NOT what
+    fires here: the endpoint is unresolved first, which is the more precise
+    diagnosis.)
+    """
+
+    def query(self, cypher, params=None, timeout=None):
+        params = params or {}
+        if "id(n) IN $ids" in cypher:
+            self.calls.append((cypher, dict(params)))
+            return _Result([])             # the reconcile LOST the endpoints
+        if "id(n) = $id" in cypher:
+            self.calls.append((cypher, dict(params)))
+            return _Result([[1]])          # but the node is LIVE right now
+        return super().query(cypher, params=params, timeout=timeout)
+
+
+def test_a_torn_reconcile_refuses_instead_of_dropping_the_edge():
+    """#3895: a LIVE endpoint the reconcile did not return means a TORN read.
+
+    The alternative reading — the node was deleted and the edge is stale — is
+    only allowed when the liveness probe says it is gone. This pins that probe's
+    statement (it is otherwise unreachable from the fakes above) and the refusal
+    it drives, so neither can be deleted without a red.
+    """
+    from tortoise.hosted_backup import dump_graph
+
+    fake = _TornReadV6()
+    with pytest.raises(ValueError, match="LIVE but was not returned"):
+        dump_graph(fake, "torn_read")
+    assert [c for c in fake.calls if "id(n) = $id" in c[0]], (
+        "the liveness probe was never issued — a torn read would be silently "
+        f"classified as a stale edge: {[c[0] for c in fake.calls]}")
+
+
+class _GrewUnrecoveredV6:
+    """Probe sees an empty graph; a node appears and NOTHING recovers it.
+
+    No edge is created, so the edge page is empty, the reconcile is never asked,
+    and the end count says 1 node. The artifact really is empty — the case the
+    refusal exists for — and it must still raise.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self._node_counts = 0
+
+    def query(self, cypher, params=None, timeout=None):
+        params = params or {}
+        self.calls.append((cypher, dict(params)))
+        if "$skip_labels" in cypher:      # _COUNT_DATA_NODES_QUERY
+            self._node_counts += 1
+            return _Result([[0 if self._node_counts == 1 else 1]])
+        if "()-[r]->()" in cypher:        # _COUNT_ALL_EDGES_QUERY
+            return _Result([[0]])
+        if "id(n) >=" in cypher:
+            raise AssertionError("the node page must be skipped")
+        if "id(r) >=" in cypher:
+            return _Result([])
+        if "id(n) IN $ids" in cypher:
+            raise AssertionError("nothing to reconcile — the edge page was empty")
+        if "GraphEventMeta" in cypher:
+            return _Result([])
+        if "MATCH (n) RETURN id(n) LIMIT 1" in cypher:
+            return _Result([])
+        raise AssertionError(f"unmodelled statement: {cypher}")
+
+
+def test_an_empty_dump_for_a_graph_that_gained_a_node_still_refuses():
+    """The relaxation must not open the hole it narrows.
+
+    A graph that held no nodes at the probe and holds one now, with no edge to
+    recover it, still resolves to ``min(start, end) == 0`` — so every totality
+    guard would pass an EMPTY artifact. This must keep raising.
+    """
+    from tortoise.hosted_backup import dump_graph
+
+    with pytest.raises(ValueError, match="gained content mid-read"):
+        dump_graph(_GrewUnrecoveredV6(), "grew_unrecovered")
 
 
 # ── the live proof, on whatever engine this lane can reach ───────────────

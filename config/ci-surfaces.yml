@@ -770,7 +770,13 @@ surfaces:
   # whatever sanctioned non-embedded server the lane can reach, and skips
   # VISIBLY (never early-returns green) when there is none. The same fake pins
   # the engine's OTHER measured quirk — a phantom `(0, [], {})` row for a graph
-  # ABSENT from the registry — which `dump_graph` now never pages.
+  # ABSENT from the registry — which `dump_graph` never pages the NODE read for.
+  # SCOPED ON PURPOSE: the phantom is measured on the node read only (on the same
+  # absent graph the edge page and the `id(n) IN $ids` reconcile answer 0 rows),
+  # and the fake now models BOTH of those reads explicitly, so the test asserts
+  # the measured answer instead of silently accepting an unmodelled statement.
+  # The edge read stays unguarded deliberately — it is what recovers the nodes a
+  # mid-read writer creates after the emptiness probe.
   - test_9226_dump_paging_v6.py
   # #3902: the per-graph event-log counter (:GraphEventMeta.last_seq) must
   # survive the backup boundary. Registered under `api` because
@@ -5482,7 +5488,7 @@ durations:
   test_quota.py: 11.8
   test_no_legacy_token_path.py: 0.5
   test_dump_edge_asymmetry_3895.py: 0.8
-  test_9226_dump_paging_v6.py: 3.0  # #9226 (#3400/#4348 trap): a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so this is the branch's LOCAL reading under the `# unmeasured` convention, not a CI measurement. MEASURED on this host 2026-10-20 against a live docker-lane server (pytest `--junitxml`, sum of testcase/@time over ALL 8 tests = 2.99s; the live end-to-end leg runs, it does not skip, on a provisioned lane). Required for the durations half as well as the surface half: without the row the file packs at the flat 2.0s default AND it consumes the LAST slot of the #3400 coverage budget — at the pre-row head the fast pool was 942 files with 94 unweighted, i.e. exactly 90.02% against a floor that fires under 90%, so the next unweighted fast file would have redded `duration_coverage_issues()` repo-wide and been attributed to an unrelated PR. With the row: 849/942 = 90.13%. Refresh from the first post-merge run that includes it; do NOT drop the row without re-deriving the floor at that head.
+  test_9226_dump_paging_v6.py: 2.0  # unmeasured — #9226 (#3400/#4348 trap): a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so it carries the flat default exactly as an absent key would — the #3419/#9003 rule, NOT the branch's local reading. A local timing is deliberately NOT substituted, though one was taken (2.99s over 8 tests against a live docker-lane server): a weight is a SHARD-LAYOUT input, and the #3419 venture-pack row records what a local number did to unrelated files' grouping. The ROW ITSELF is required for the durations half as well as the surface half, and the durable reason is structural rather than a snapshot: `duration_coverage_issues()` measures PRESENCE, not value, and the fast pool sits ~0.1pp over the #3400 90% floor — at the pre-row head it was exactly 90.02% (942 files, 94 unweighted), the last slot the floor had, so the next unweighted fast file would have redded the check repo-wide and been attributed to an unrelated PR. (Re-measured at this head after merging main: 943 fast files, 850 weighted = 90.14%, `duration_coverage_issues() == []`. Those counts move with every main merge — the structural fact above is what to re-check, not the percentages.) Refresh from the first post-merge run that includes it (the marker leads the tail so the refresher clears it); do NOT drop the row without re-deriving the floor at that head.
   test_divergence_conformance.py: 4.8
   test_from_uri_userinfo.py: 3.1
   test_export_cli.py: 10.0

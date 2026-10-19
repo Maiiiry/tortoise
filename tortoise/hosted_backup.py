@@ -323,8 +323,19 @@ _DUMP_PAGE_SIZE = 1000
 #: graph ABSENT from the registry, ``id(n) >= 0`` returns a phantom row
 #: ``(0, [], {})`` while ``MATCH (n)`` returns nothing and the store's own counts
 #: are 0 (an empty-but-PRESENT graph reads as 0 rows on both cores). ``dump_graph``
-#: therefore skips the node page only when a `MATCH (n)` existence probe — which
-#: cannot produce the phantom — finds no node at all; see ``_graph_has_any_node``.
+#: therefore skips the **node page** only when a `MATCH (n)` existence probe —
+#: which cannot produce the phantom — finds no node at all; see
+#: ``_graph_has_any_node``.
+#:
+#: ⚠️ The phantom is MEASURED on the NODE read ONLY, so the guard is deliberately
+#: scoped to it. On the same absent graph, 60002 answers the EDGE page
+#: (``_DUMP_EDGE_PAGE_QUERY``) and the reconcile ``id(n) IN $ids`` read with 0
+#: rows — no phantom — so guarding the edge read would change nothing on the
+#: engine as measured and would cost a real recovery: when the probe sees an
+#: empty graph and a writer creates the first nodes AND their edge inside the
+#: read window, the unconditional edge page is what pulls those endpoints back
+#: (#9226 review). Do not "tidy" the edge read behind the probe without
+#: re-measuring the engine first.
 #:
 #: The blast radius of the old form is NOT "no backup on v6": ``dump_graph``
 #: reconciles edge endpoints by id (#3895), so a graph whose nodes are all edge
@@ -503,7 +514,7 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
     source_count_start = _independent_counts(g)
 
     # ⛔ An existence probe decides whether there is anything to page. On v6
-    # (60002) a node read of a graph that is ABSENT from the engine registry
+    # (60002) a NODE read of a graph that is ABSENT from the engine registry
     # fabricates one row — `id(n) >= 0` returns the phantom `(0, [], {})` while
     # `MATCH (n)` returns nothing and the aggregate counts 0 nodes. Paging such a
     # graph would export that phantom as a node (`node_count: 1`, then
@@ -511,6 +522,13 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
     # one-sided so the guard would not catch it. The probe is `MATCH (n)` because
     # only that form is phantom-free; it also keeps a bookkeeping-only graph on the
     # normal path, so `excluded_node_count` still reports its exclusions.
+    #
+    # The probe gates the NODE page alone, and that is measured rather than
+    # assumed: on the same absent graph the EDGE page and the reconcile read both
+    # answer 0 rows on 60002, so there is no phantom to keep out of `raw_edges`.
+    # Leaving the edge read unconditional also preserves the mid-read recovery
+    # below — a graph whose first nodes (and their edge) are created after this
+    # probe still exports COMPLETE instead of being refused.
     nodes_skipped_as_empty = False
     if _graph_has_any_node(g):
         node_rows = _paged_rows(g, _DUMP_NODE_PAGE_QUERY, 0)
@@ -603,16 +621,45 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
     source_count_end = _independent_counts(g)
     source_node_count = min(source_count_start[0], source_count_end[0])
     source_edge_count = min(source_count_start[1], source_count_end[1])
-    if nodes_skipped_as_empty and source_count_end[0] > 0:
-        # The probe found no node and the store now counts some: a writer created
-        # the graph's first node inside the read window. `min(start, end)` below
-        # would resolve the mismatch to 0 and let an EMPTY artifact pass every
-        # guard, so this is refused explicitly rather than silently emitted.
+    if nodes_skipped_as_empty and len(nodes) < source_count_end[0]:
+        # The probe found no node, and the dump collected FEWER data nodes than
+        # the store NOW holds: a writer created the graph's first node(s) inside
+        # the read window and they were not all captured. `min(start, end)` below
+        # resolves to 0 for this branch (the start count was 0), so every
+        # totality guard would pass a PARTIAL artifact and record it
+        # `source_node_count: 0` — refused explicitly instead.
+        #
+        # Why not ``not nodes`` (the obvious reading of "refuse the empty dump"):
+        # the edge page is unconditional and its endpoints are reconciled, so a
+        # node-page-skipped read CAN be complete (probe empty; a writer then
+        # creates A, B and A→B; the reconcile returns both — that dump must be
+        # written, #9226 review P3). But the SAME recovery is partial when an
+        # ISOLATED node appears beside the edge's endpoints: A and B come back
+        # through the reconcile and C does not, so `not nodes` would emit a
+        # 2-node dump for a 3-node graph, silently. Comparing against the END
+        # count closes the CREATE-ONLY race: complete → no refusal, empty or
+        # partial → refuse.
+        #
+        # Two limits are deliberate. (1) This compares CARDINALITY, not
+        # membership, so an interleaving that deletes as well as creates can still
+        # slip through (recover A+B, the writer deletes B and adds isolated C, end
+        # count 2 == len(nodes) 2). Closing that needs an id-SET comparison — a
+        # second full node read — and it is the same accepted limitation as the
+        # ``min(start, end)`` bound on the guard below, so it is named rather than
+        # paid for. (2) It compares against the END count with no ``min(start,
+        # end)``, so a node created after the reconcile still refuses a dump the
+        # ordinary path would accept: stricter than the guard below, chosen
+        # because in THIS branch every node is a creation and the two cannot be
+        # told apart. ``nodes`` and ``source_count_end[0]`` are the same
+        # population (both apply the export-skip predicate), and a node captured
+        # then deleted mid-read only makes ``len(nodes)`` larger, which cannot
+        # trip this.
         raise ValueError(
             f"dump_graph({graph_name}): the graph held no nodes when the read "
-            f"began but holds {source_count_end[0]} now — refusing to write an "
-            "empty dump for a graph that gained content mid-read (a torn read "
-            "must never look green)."
+            f"began but holds {source_count_end[0]} now, and this dump captured "
+            f"{len(nodes)} of them — refusing to write a partial dump for a "
+            "graph that gained content mid-read (a torn read must never look "
+            "green)."
         )
     if len(nodes) < source_node_count:
         raise ValueError(
