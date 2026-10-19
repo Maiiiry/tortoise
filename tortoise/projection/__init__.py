@@ -3275,10 +3275,13 @@ def _journal_safe_params(params, cypher=None):
 #     and why `rebuild_all` may not hand them the replay permit (#9210: one
 #     method-wide permit made every future addition to that engine inherit a
 #     claim that was never true of the restore). ⚠️ `#4305` is the one leg
-#     whose MECHANISM differs, not whose lane does: it re-applies only the
-#     derived field the replay did NOT write (`_REPLAY_GAP_PROPS`,
-#     journal-gated), so the "rides no journal record" clause must not be
-#     extended to it unqualified. See the obligation it states at
+#     whose MECHANISM differs, not whose lane does: the journal owns
+#     `content_hash` and `embedding` when it wrote them, so those are
+#     re-applied only where it did not, and the NON-derived
+#     `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`, `posterior_alpha`,
+#     `posterior_beta`) apply to a graph-only id only — journal-independent
+#     by design. So the "rides no journal record" clause must not be extended
+#     to this leg unqualified. See the obligation it states at
 #     `_prewipe_restore_write_scope`.
 #   * `onboarding.metadata` (`tortoise/onboarding/state.py`, #9121) — the
 #     onboarding FLOW metadata (`:OnboardingState`, `:OnboardingStep`, the
@@ -3398,10 +3401,14 @@ def _prewipe_restore_write_scope(reason: str):
     ride no record at all (`#5353`, `#3947`, `#4641`, `#990`, `#2814`, `#4653`
     each say so at their writer), and the restore re-establishes them from the
     pre-wipe capture instead. ⚠️ **`#4305` is the exception in MECHANISM, not
-    in lane**: it re-applies only the derived field the replay did NOT write
-    (`_REPLAY_GAP_PROPS`, journal-gated), so "rides no journal record" is not
-    its story — "the value exists only in the pre-wipe capture" is, and that
-    is what puts it in this lane rather than the fold's. Handing them the replay permit would authorize
+    in lane**: the journal owns `content_hash` and `embedding` when it wrote
+    them, so those fields are re-applied only where it did not, and the
+    NON-derived `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`,
+    `posterior_alpha`, `posterior_beta`) are applied to a graph-only id only —
+    journal-independent by design. So "rides no journal record" is not this
+    leg's story; "the value exists only in the pre-wipe capture" is, and that
+    is what puts it in this lane rather than the fold's. Handing them the
+    replay permit would authorize
     them under a contract that is FALSE for them, which is what `#9210`
     removes: the restore is now a NAMED declaration, so "which writes are
     authorized by replay" stays answerable, and a future addition to that

@@ -11,9 +11,11 @@ Point properties, and the `:GraphEventMeta` watermark. **Not one of those
 classes rides a journal record** (`#990`, `#3947`, `#4641`, `#5353`, `#2814`,
 `#4653` each say so at its writer), so the replay lane's contract — "this
 content came from the record" — is FALSE for every one of them. (`#4305` is
-the exception in MECHANISM only: it re-applies what the replay did NOT write,
-journal-gated. Its value still exists only in the pre-wipe capture, which is
-the property this lane is about.)
+the exception in MECHANISM only: the journal owns `content_hash` and
+`embedding` when it wrote them, so those are re-applied only where it did not,
+and the non-derived `_REPLAY_GAP_PROPS` apply to graph-only ids only. Its value
+still exists only in the pre-wipe capture, which is the property this lane is
+about.)
 
 Handing them the replay permit is therefore an over-authorization: the
 declaration claims a wider write scope than the restore performs. `#9124`'s
