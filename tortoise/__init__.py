@@ -36,6 +36,14 @@ __version__ = "0.2.0"
 
 import os
 
+# #8483: imported FIRST, before any other tortoise submodule, because the instant it
+# records is the "when did this process begin loading tortoise's code" half of the
+# staleness comparison in `tortoise/code_currency.py`. Imported later, an edit landing
+# between the two imports would be recorded as already-loaded and the server would
+# under-report its own staleness — the one error direction that matters here.
+# Stdlib-only (it imports nothing from tortoise), so it cannot close a cycle.
+from tortoise import code_currency as _code_currency  # noqa: F401
+
 from tortoise.config import RELATIVE_PATH_ERROR
 
 # #1371/#5386: the eager import binds `atexit_fast_close` (used at the

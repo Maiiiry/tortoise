@@ -3579,6 +3579,19 @@ surfaces:
   # class). This file pins that calendar attendees are grounded on the meeting's
   # OWN evidence before they become CRM contacts/opportunities.
   - test_8491_cal_attendee_grounding.py
+  # #8483: the MCP server's own staleness SIGNAL. A `pi` session spawns one
+  # `tortoise.mcp_server` child and that process holds its code revision for the
+  # session's whole life (measured 2026-10-13: five servers, one 12h53m old, none
+  # supervised), so a read-path fix that lands after the spawn is invisible — and
+  # fails as an `ImportError` that reads like an empty graph, which invites the
+  # duplicate write `how-to-use-tortoise` warns about. `tortoise/mcp_server.py` is a
+  # SHARED_MODULE (a diff to it forces the full matrix), so this registration is what
+  # puts the file on `core` at all; `tortoise/code_currency.py` matches no
+  # SOURCE_PATTERN and falls through to the same `core` fallback, which is why this is
+  # the surface that must carry it (an unregistered file reds `--integrity`). Hermetic:
+  # fixture trees for the verdict, a patched `monitoring.metrics` for the health
+  # payload, no Docker/FalkorDB/network — so it is deliberately NOT carve_out-registered.
+  - test_code_currency_8483.py
   ep:
   # #7951 (remaining doors) / review P1: DUAL-REGISTERED with `core` (below)
   # and the other exact-match surfaces. The write-door INVENTORY scans ALL of
@@ -6629,6 +6642,13 @@ durations:
   # restated figure re-staled for three review rounds. If you need the number, run
   # `ci_selection.duration_coverage_issues()` at YOUR head; do not quote this file.
   test_8093_registry_namespace_doc.py: 2.0
+  # #8483: 16 tests, HERMETIC (fixture trees for the staleness verdict itself; a
+  # patched `monitoring.metrics` for the health payload; no Docker/FalkorDB/network).
+  # Measured 14.3s of pytest time locally at this branch's head — the wall is
+  # IMPORT-dominated (`import tortoise` plus `tortoise.mcp_server`/fastmcp), not test
+  # work, so a fix that adds cases barely moves it. Erring high (16.0) is correct for
+  # sharding. No test COUNT is published elsewhere in this map — it would re-stale.
+  test_code_currency_8483.py: 16.0
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py

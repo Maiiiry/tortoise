@@ -21,6 +21,13 @@ from fastmcp.tools import ToolResult
 from pydantic import ValidationError as PydanticValidationError
 from tortoise.auth import is_dev_mode as _is_dev_mode
 from tortoise.config import is_db_uri as _is_db_uri
+# #8483: the staleness signal. A `pi` session's MCP server is spawned once and lives
+# for the session, so a read-path fix that lands after the spawn is invisible to that
+# session for as long as it runs. `code_currency` answers "is the code I loaded still
+# the code in the checkout?" from two facts we already have (this process's load
+# instant and the source files' mtimes) — no reload, no supervisor, which is what
+# #8483 asks for at minimum: detectability.
+from tortoise import code_currency as _code_currency
 from tortoise.sdk import (TortoiseSDK, INGEST_GRANULARITIES,
                           INGEST_PROMOTION_POLICIES, _first_non_draft_status,
                           _RESERVED_ACTOR_PROPS, SUPERSEDE_STRUCTURAL_RELS,
@@ -1909,6 +1916,20 @@ def _safe(fn, *args, **kwargs):
             return _SafeError({"error": _scrub_error(str(e)),
                                **({"batch_id": e.batch_id} if e.batch_id else {})})
         msg = _scrub_error(str(e))
+        # #8483: the stale-load signature. A server that outlives a code change holds the
+        # module objects it imported, so a name added to the checkout after the spawn
+        # fails here as an ImportError (or as a missing attribute on an already-loaded
+        # module) — and that failure reads exactly like "the graph has nothing in it",
+        # which is what invites the duplicate write. Naming the cause, ONLY while the
+        # process is really stale, turns a misleading failure into a self-diagnosing
+        # one; when the process is fresh the hint is absent and this error is
+        # byte-identical to the pre-#8483 text. It is appended AFTER `_scrub_error` on
+        # purpose: the hint is ours (relative paths, a duration) and `_scrub_error`'s
+        # host:port pattern would mangle the timestamp inside it.
+        if isinstance(e, (ImportError, AttributeError)):
+            _hint = _code_currency.stale_code_hint()
+            if _hint:
+                msg = f"{msg} — {_hint}"
         return _SafeError({"error": msg})
 
 
@@ -3311,16 +3332,36 @@ def tortoise_health() -> dict:
     cannot be measured, the report carries the per-call ``graph_size_error``
     marker (``None`` when ``graph_size`` was really measured, so a 0 is a
     genuinely empty graph; a string otherwise), instead of the previous
-    indistinguishable ok/0."""
+    indistinguishable ok/0.
+
+    #8483 (health-truthful, the client half): the report now carries a ``code``
+    block — ``{pid, revision, stale, changed_count, changed_files, loaded_at,
+    age_seconds, scan_error}`` from ``tortoise.code_currency`` — because every
+    field above describes the DATABASE while this server's own code can be
+    hours older than the checkout (a per-session spawn outlives every commit).
+    Before this, the payload said ``{"status": "ok", "falkordb":
+    "connected"}`` throughout a stale-load incident: the graph really was fine,
+    only the client's code was not, and nothing on the surface could say so.
+    ``status`` is deliberately NOT downgraded — a healthy DB with stale client
+    code is not an outage, and folding the two would fire every dashboard
+    alert on every code change.
+    """
     # #236: route through _safe() so every tool is gated (defense-in-depth;
     # reachable only post-auth over HTTP).
     # #3143: pass the cold-start allowance (call-time resolved) so a reachable
     # graph whose cold-start exceeds /health's shared budget is reported ok
     # with its real graph_size instead of degraded/0.
-    return _safe(lambda: monitoring.metrics(
+    report = _safe(lambda: monitoring.metrics(
         sdk=_get_org_sdk(),
         setup_timeout=monitoring.probe_setup_timeout(),
     ))
+    # #8483: attach the client-side block on a real report only. A `_SafeError`
+    # payload is a FAILURE envelope that the telemetry seam (#8135) matches by
+    # value — adding keys to it would change a shape other code discriminates
+    # on, and a failed health probe already answers "what is wrong" itself.
+    if isinstance(report, dict) and not isinstance(report, _SafeError):
+        report["code"] = _code_currency.report()
+    return report
 
 
 def tortoise_session_context() -> dict:
