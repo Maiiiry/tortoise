@@ -3333,10 +3333,15 @@ def _journal_safe_params(params, cypher=None):
 # spelling redis-py can transmit: the command vector is normalised with the
 # packer's own whitespace split (`_wire_command_parts`), so
 # `"GRAPH.DELETE <name>"`, `" GRAPH.DELETE"` and the bytes forms cannot slip
-# past by spelling. Both now carry the same refusals as
-# `MATCH (n) DETACH DELETE n` (`_GuardedGraph.delete` /
-# `_GuardedGraph.execute_command`, pinned by
-# `tests/test_9209_handle_noncypher_wipe.py`).
+# past by spelling. Both now carry the §17.1 declaration and L2 that
+# `FalkorProjection.query` applies to `MATCH (n) DETACH DELETE n`
+# (`_GuardedGraph.delete` / `_GuardedGraph.execute_command`, pinned by
+# `tests/test_9209_handle_noncypher_wipe.py`). Note the door, not the
+# statement, is what the layers are attached to: `_GuardedGraph.query` itself
+# still applies L2 ONLY, so on a journal-backed TEST-named graph
+# `proj.g.query("MATCH (n) DETACH DELETE n")` is admitted while
+# `proj.g.delete()` refuses — the non-Cypher verb is strictly stricter here,
+# not equal.
 #
 # ⛔ THE CLASS IS NOT CLOSED, and the rest is named here rather than implied
 # (the two escapes above are unchanged and this is a third list, not a
@@ -3345,15 +3350,26 @@ def _journal_safe_params(params, cypher=None):
 #     `client` is the raw Redis client, so `proj.g.client.execute_command(
 #     "GRAPH.DELETE", <g>)` bypasses both layers. It is escape (2) above by
 #     another attribute; `_g` is named there and `client` is named here.
+#   * `proj.g.call_procedure` — forwarded, and the vendor implements it by
+#     building `CALL <procedure>(…)` and calling the INNER handle's `_query`
+#     (`falkordb/graph.py`), so the text runs arbitrary Cypher: MEASURED, on a
+#     journal-backed non-test graph, `call_procedure("db.labels() MATCH (n)
+#     DETACH DELETE n //", read_only=False)` empties the graph while
+#     `delete()` / `execute_command("GRAPH.DELETE", …)` both refuse on the
+#     same handle. It is the same class as escape (2) — a forwarded hop to a
+#     Cypher-executing seam — and pre-dates this change; it is named because
+#     `__getattr__` forwards it and this list is the guard's own hole map.
 #   * `_WIPE_COMMANDS` holds ONE command. A FalkorDB graph IS a Redis key
 #     (`tortoise/graph_key_restore.py` does DUMP -> DEL -> RESTORE on it), so
 #     `execute_command("DEL"|"UNLINK", <g>)` destroys the same graph, and
 #     `FLUSHDB`/`FLUSHALL` take every graph on the server. None of those is
 #     classified here — widening the set is the #3007/#3037 decision (more
 #     verbs refusing is not free), filed as #9237.
-#   * the remaining forwarded attributes (`name`, `schema`, `copy`, …) either
-#     read or mint state; `copy` WRITES UNDER A NEW KEY and destroys nothing
-#     (MEASURED: an existing destination is refused by the engine).
+#   * the remaining forwarded attributes (`name`, `schema`, `copy`, …) read or
+#     mint state; `copy` WRITES UNDER A NEW KEY and destroys nothing
+#     (MEASURED: an existing destination is refused by the engine). This
+#     bullet is about the ones that neither read nor mint, which are the three
+#     above — not a claim that no forwarded attribute executes.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3584,9 +3600,13 @@ class _GuardedGraph:
     the text the #8479 scan reads — see
     ``cypher_guard._guard_numeric_literals``). See KNOWN GAPS in the module
     comment above. ``__getattr__`` below forwards only the remaining non-query
-    attributes (``name``, ``schema``, ``copy``, ...) to the underlying handle;
-    the one DESTRUCTIVE verb among them, ``delete()`` (GRAPH.DELETE), is defined
-    explicitly HERE so it cannot be forwarded past the guards (#9209).
+    attributes (``name``, ``schema``, ``copy``, ``call_procedure``, ...) to the
+    underlying handle. The one DESTRUCTIVE verb among them whose effect is the
+    WHOLE graph, ``delete()`` (GRAPH.DELETE), is defined explicitly HERE so it
+    cannot be forwarded past the guards (#9209); ``call_procedure`` is
+    forwarded and runs arbitrary Cypher through the inner handle — a named,
+    pre-existing escape in the module's KNOWN GAPS list, not a claim of
+    coverage.
     """
 
     __slots__ = ("_g", "_proj")
