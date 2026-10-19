@@ -178,6 +178,45 @@ def test_a_partial_narrative_receipt_cannot_fire_branch_1():
     assert evaluate_branches(20.0, 0.0, 0.0, contaminated=CLEAN)["branch_1_fires"] is True
 
 
+def test_a_dirty_narrative_receipt_is_not_called_a_suppressed_fire_when_the_condition_failed():
+    """Suppression needs the CONDITION, not merely a dirty narrative receipt.
+
+    A narrative receipt being incomplete says nothing about whether branch 1's
+    condition was met. At Δ = +2.0 pp — plainly inside the ±10 pp band — the
+    condition is NOT met, so recording ``falsifier_suppressed_by_contamination``
+    and labelling the cell "branch 1's condition was MET but SUPPRESSED" asserts a
+    fact about the rule that the rule's own inputs contradict, and it overwrites
+    the route that IS available (branch 2 met, not certifiable). Direction alone
+    cannot distinguish the two; the flag must gate on the condition itself.
+    """
+    dirty = ["wp06_quarry_rollout:narrative"]
+    verdict = evaluate_branches(2.0, 0.0, 0.0, contaminated=dirty)
+    assert verdict["branch_1_fires"] is False
+    assert verdict["branch_2_applies"] is True
+    assert verdict["branch_2_certified"] is False
+    assert verdict["falsifier_suppressed_by_contamination"] is False
+    label = verdict_label(verdict)
+    assert label == "provisional (branch 2 met, not certifiable; branch 3 not reached)"
+    assert "SUPPRESSED" not in label
+    # The dirty receipt is still recorded — the run stays auditable.
+    assert verdict["contaminated_receipts"] == dirty
+
+
+def test_suppression_still_fires_when_the_precision_leg_is_what_met_the_condition():
+    """The condition is a disjunction; the fix must not narrow it to Δloss only.
+
+    Branch 1 fires on ``Δloss > +10 pp`` OR a precision/recall drop > 5 pp. A
+    condition-aware suppression gate that only looked at ``loss`` would silently
+    stop reporting a precision-borne fire that a dirty narrative arm withheld.
+    """
+    dirty = ["wp06_quarry_rollout:narrative"]
+    for prec, rec in ((-15.0, 0.0), (0.0, -15.0)):
+        verdict = evaluate_branches(2.0, prec, rec, contaminated=dirty)
+        assert verdict["branch_1_fires"] is False
+        assert verdict["falsifier_suppressed_by_contamination"] is True
+        assert "SUPPRESSED" in verdict_label(verdict)
+
+
 # ── the protocol-pins guard ───────────────────────────────────────────────
 
 SESSIONS = (*TUNING_SESSIONS, *HOLDOUT_SESSIONS)

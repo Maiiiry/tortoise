@@ -329,8 +329,11 @@ def evaluate_branches(delta_loss_pp: float | None, delta_precision_pp: float | N
     # when the narrative receipt is the dirty one; refusing it in both directions
     # would let a broken raw arm hide a real fire.
     narrative_dirty = any(t.endswith(":narrative") for t in contaminated)
-    fires = ((loss is not None and loss > BAND_PP) or any(
-        d is not None and d < -PR_TOLERANCE_PP for d in (prec, rec))) and not narrative_dirty
+    # The CONDITION, computed once and independently of contamination: branch 1's
+    # condition is met by Δloss > band OR a precision/recall drop beyond tolerance.
+    condition_met = ((loss is not None and loss > BAND_PP)
+                     or any(d is not None and d < -PR_TOLERANCE_PP for d in (prec, rec)))
+    fires = condition_met and not narrative_dirty
     parity = (loss is not None and abs(loss) <= BAND_PP
               and all(d is None or abs(d) <= PR_TOLERANCE_PP for d in (prec, rec)))
     certified = parity and not contaminated
@@ -341,7 +344,13 @@ def evaluate_branches(delta_loss_pp: float | None, delta_precision_pp: float | N
     return {"branch_1_fires": fires, "branch_2_applies": parity,
             "branch_2_certified": certified, "branch_3_stays_provisional": provisional,
             "contaminated_receipts": list(contaminated),
-            "falsifier_suppressed_by_contamination": narrative_dirty}
+            # ⛔ SUPPRESSION REQUIRES THE CONDITION, not merely a dirty narrative
+            # receipt. Direction alone cannot say it: at Δ = +2 pp with a partial
+            # narrative arm nothing was suppressed — no fire was available — and
+            # labelling that cell "branch 1's condition was MET but SUPPRESSED"
+            # asserts a route the rule's own inputs contradict, while overwriting
+            # the route that IS available (branch 2 met, not certifiable).
+            "falsifier_suppressed_by_contamination": condition_met and narrative_dirty}
 
 
 def verdict_label(verdict: dict) -> str:

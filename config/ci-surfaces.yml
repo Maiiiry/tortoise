@@ -4321,6 +4321,14 @@ surfaces:
   - eval/write_path/test_write_path_corpus.py
   - eval/write_path/test_write_path_grading.py
   - eval/write_path/test_write_path_runner.py
+  # #7947: the pre-registered decision rule itself (§7 of the measurement) —
+  # the rounded-band boundary, the one-sided contamination rule and the
+  # route-label table. PURE arithmetic: it imports only `score_qualifiers`
+  # (stdlib, no DB/network/model), so `eval` beside its siblings is the whole
+  # registration. Without this row the file is unclassified: `manifest-integrity`
+  # (required) reds on drift, AND a `score_qualifiers.py`-only change never
+  # selects the tests that pin the rule it edits (#1349/#2938 silent-drop class).
+  - eval/write_path/test_score_qualifiers.py
   # #5085: the additive blind BANDED semantic judge + calibration harness
   # (hermetic unit/contract layer — no DB/network/LLM; the real judged run is
   # opt-in via `runner run --judge semantic`).
