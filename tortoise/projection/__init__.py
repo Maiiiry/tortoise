@@ -3278,6 +3278,20 @@ def _journal_safe_params(params, cypher=None):
 #     with the writers. `:TeamMeta` is its documented sibling (#5353 below),
 #     not a vetted precedent: it holds no declaration of its own — its writers
 #     escape at (3).
+#   * `structural-edge.derived` (`tortoise/projection/edges.py`, #9195) — the
+#     SDK's structural-edge mints (`create_edge` and `create_about_edge`, each
+#     with ONE `MERGE`, plus `create_edge`'s three typed wrappers — two mints
+#     over one statement shape). It is a DECLARATION and not a scope for
+#     journalled links: the write mints no node, no property and no identity
+#     (`MATCH` on both endpoints), so its whole content is
+#     `(source, predicate, target)` between two entities that already exist.
+#     What makes it honest is stated PER RELATION there, not globally:
+#     `DERIVABLE_STRUCTURAL_RELS` are snapshot-carried (replay resurrects them
+#     from the endpoint Point's record) and every other allowlisted predicate
+#     has NO replay carrier — measured, and disclosed on the lane rather than
+#     blessed (`#9079`'s census carries the class). `references` keeps its own
+#     shape: the generic verb writes it bare, with no `sourceVersion` anchor
+#     (`#5213` option 3, §9.6).
 #
 # The declaration is not a bypass flag: it is a per-call `with` block (no
 # instance attribute, constructor argument or env var can set it), and the
