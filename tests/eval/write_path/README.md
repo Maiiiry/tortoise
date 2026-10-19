@@ -17,7 +17,7 @@ shape / `_manifest.json` / judge-blindness line-refs).
 
 ## Layout
 
-```
+```text
 tests/eval/write_path/
   generate_corpus.py        # deterministic corpus generator + authoring spec
   schema.py                 # canonical fixture/gold/baseline schemas + validators
@@ -152,8 +152,8 @@ the session-capture boundary set (`claude`, `claude-desktop`, `claude-web`,
 * `distractor_leakage_tolerance: 1` — research-recommended ≤1/run (gbrain
   measured 1/86); supersedes the epic's literal "zero" wording.
 
-**Baseline (DM-5):** TWO posture-keyed committed baselines (posture split,
-#2098 round 2): `baselines/main.json` = the PRODUCT lane (extractor posture
+**Baseline (DM-5):** TWO posture-keyed committed baselines (the posture split of #2098
+round 2): `baselines/main.json` = the PRODUCT lane (extractor posture
 `llm`, real v2 extractor — the number the W4 gate / W7 publication consume,
 gated manually at bless with `justification`), and `baselines/m2.json` = the
 deterministic CI lane (extractor posture `m2`, TORTOISE_SESSION_EXTRACTOR=m2

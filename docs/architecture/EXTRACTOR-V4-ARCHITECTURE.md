@@ -1136,8 +1136,10 @@ Option 4 (narrative as *focus*, raw as *source*) **hedges precisely this unresol
 
 The research names it: **does the summary lose the hedging / scope / stance information that a claim's confidence depends on?** Adjacent evidence (no head-to-head study exists): summaries can be unfaithful, hallucination propagates across summary chains, and summarising raises precision while **dropping recall**. **Any measurement must be run on OUR corpus — none of these transferred cleanly.**
 
-#### ⛔ FIRST, WHAT THIS DESIGN CANNOT TEST — the premise is §S2.1's (2026-09-23); the consequence was
-drawn on 2026-10-18. It governs how every number below may be read
+#### ⛔ FIRST, WHAT THIS DESIGN CANNOT TEST — the premise is §S2.1's, the consequence is drawn here
+
+§S2.1 recorded the premise on **2026-09-23**; the consequence was drawn on **2026-10-18**, in review of the
+first run. This block governs how every number below may be read.
 
 **Both arms receive the full raw transcript.** `render_s2_prompt()` appends
 `_render_source_transcript(edus)` to the S2 prompt **whenever the transcript is under
