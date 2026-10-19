@@ -642,6 +642,21 @@ surfaces:
   # SELECTS `api` — a named-surface match REPLACES the `core` fallback, so a
   # core-only registration would never run on an api-only PR.
   - test_cost_allocation.py
+  # #5045: the declared cost-dimension registry (`tortoise/cost_dimensions.py`,
+  # no SOURCE_PATTERN -> `core`) + its audit tool. Dual-registered with `core`:
+  # the registry's bindings and the dead-hook scan read
+  # `tortoise/metering.py`, `tortoise/hosted_api.py` and
+  # `tortoise/supabase_control.py`, which SELECT `api` — a named-surface match
+  # REPLACES the `core` fallback (#2938), so a core-only registration would never
+  # run on an api-only PR, which is exactly the PR that can add a dimension's
+  # writer call site or rename a ledger column. Also registered on `ep`, `sdk`,
+  # `eval` and `onboarding` (each surface's own block carries its arm): the file
+  # is a CENSUS over every tracked `.py`, so a
+  # `ranking.py`/`reader.py`/`embeddings.py`/`onboarding/**`
+  # diff can add an undeclared per-org counter and would otherwise run neither
+  # `undeclared_metric_findings()` nor `foreign_metric_findings()` (#5045 review
+  # P1 — the same six-surface reasoning `test_7951_write_doors.py` carries).
+  - test_cost_dimensions.py
   # #4241: the metering period-anchor repair's periodic caller. Registered with
   # `api` because the step (`_reconcile_metering_periods`) and both call sites
   # live in `tortoise/hosted_api.py`, which SELECTS `api` — a named-surface match
@@ -2783,6 +2798,13 @@ surfaces:
   # #4493: the allocation rule, the fail-closed basis reader and the revived
   # per-team Gauge — dual-registered with `api` (see that block).
   - test_cost_allocation.py
+  # #5045: the declared cost-dimension registry — the coverage matrix, the
+  # binding/ledger/cardinality checks and the dead-hook scan. Registered on
+  # `core` because `tortoise/cost_dimensions.py` and `tortoise/monitoring.py`
+  # match no SOURCE_PATTERN and fall to `core`, and on `api` because the ledger
+  # and the production call sites it verifies live in metering.py / hosted_api.py
+  # (see that surface's entry).
+  - test_cost_dimensions.py
   # #4490: the per-org compute dimension's metric family/writer/reader live in
   # tortoise/monitoring.py — a monitoring.py-only PR (which maps to `core`) must
   # run this file. Dual-registered with `api` (the middleware is in hosted_api.py).
@@ -2878,6 +2900,13 @@ surfaces:
   # would not run on the change that can break them. The prose→value DERIVATION
   # half is #2817 (`tortoise/value_normalizer.py`), deliberately not pinned here.
   - test_money_value_2782.py
+  # #2817: the DERIVE half of the money value — `tortoise/value_normalizer.py`
+  # (prose -> canonical props, abstention-first). Like `money.py` it matches no
+  # SOURCE_PATTERNS entry and is not a SHARED_MODULE, so a value_normalizer.py
+  # change falls through to `core` — this entry is what makes the eight
+  # failure-mode tables run on the change that can break them. URI-less (pure
+  # unit), so it runs on the docker leg exactly as its money sibling does.
+  - test_value_normalizer_2817.py
   # #2814: authoritative-config durability across rebuild_all — the config
   # registry + sidecar section live in tortoise/projection/ (core fallback),
   # and pack_state/pack_manifest_store are the writer modules whose labels
@@ -3608,8 +3637,24 @@ surfaces:
   - test_supplementary.py
   - test_w4_why_enrichment.py
   - test_weights.py
+  # #5045 review P1: the cost-dimension CENSUS (`test_cost_dimensions.py`) walks
+  # EVERY tracked `.py` for an undeclared per-org metric and for a production
+  # call site of every declared writer. `tortoise/ranking.py` / `analyze.py` /
+  # `dream.py` select `ep`, REPLACING the `core` fallback (#2938) — so an
+  # `ep`-only change that added `Counter("tortoise_x_total", ..., ["org"])` ran
+  # NEITHER `undeclared_metric_findings()` nor `foreign_metric_findings()` and
+  # went silently green: the "seventh counter added in a hurry" failure #5045
+  # exists to end. Same arm set as `test_7951_write_doors.py`, the census
+  # precedent in this file.
+  - test_cost_dimensions.py
   onboarding:
   - test_4932_per_pr_artifact_scope.py
+  # #5045 review P1: the cost-dimension CENSUS walks every tracked `.py`, and
+  # `tortoise/onboarding/**` selects `onboarding`, REPLACING the `core` fallback
+  # (#2938) — so an `onboarding`-only change could add an undeclared per-org
+  # counter and run neither metric check. Same six-surface arm set as
+  # `test_7951_write_doors.py` (the census precedent in this file).
+  - test_cost_dimensions.py
   # #7951 (remaining doors) / review P1: DUAL-REGISTERED with `core` (below)
   # and the other exact-match surfaces. The write-door INVENTORY scans ALL of
   # `tortoise/**`, and `tortoise/capture_disclosure.py` + `tortoise/onboarding/*.py`
@@ -4143,6 +4188,13 @@ surfaces:
   # (`tortoise/sdk.py`, `tortoise/why.py`, `tortoise/ep.py`); embedded-only, so
   # also in `carve_out` below.
   - test_6871_operator_input_set.py
+  # #5045 review P1: the cost-dimension CENSUS walks every tracked `.py`, and
+  # `tortoise/reader.py` / `retrieval.py` / `models.py` select `sdk`, REPLACING
+  # the `core` fallback (#2938) — so an `sdk`-only change could add a writer's
+  # production call site (or an undeclared per-org counter) and run neither the
+  # dead-hook scan nor the metric checks. Same six-surface arm set as
+  # `test_7951_write_doors.py` (the census precedent in this file).
+  - test_cost_dimensions.py
   classify:
   # Issue #1695 (extractor-v3 classify-later): the kind-classification and
   # chain-enforcement surface. Pure-logic files (stub encoders, golden
@@ -4169,6 +4221,13 @@ surfaces:
   - test_7951_write_doors.py
   - test_7951_enforce_atomic_write.py
   - test_7951_create_point_outbox.py
+  # #5045 review P1: the cost-dimension CENSUS walks every tracked `.py`, and
+  # `tortoise/embeddings.py` / `cross_lens.py` select `eval`, REPLACING the `core`
+  # fallback (#2938) — so an `eval`-only change (the embedding lane is exactly
+  # where a new cost counter is most likely to be added) ran neither
+  # `undeclared_metric_findings()` nor `foreign_metric_findings()`. Same
+  # six-surface arm set as `test_7951_write_doors.py` above.
+  - test_cost_dimensions.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
   # create-side suite above (`tortoise/sdk.py`), so it is registered on the
@@ -5648,6 +5707,7 @@ durations:
   test_mcp_telemetry.py: 0.4
   test_monitoring.py: 40.1  # #9017 CI-junit 2026-10-18 (run 39165691659); was 5.1
   test_cost_allocation.py: 20.3
+  test_cost_dimensions.py: 11.5
   test_operator_source_search.py: 0.6
   test_pack_shipping.py: 0.7
   test_query_suggestions.py: 0.4
@@ -5831,6 +5891,7 @@ durations:
   test_event_log.py: 0.1
   test_event_state_carrier_2788.py: 2.0  # unmeasured — new in #2788; no sweep has collected it, so it carries the flat default exactly as an absent key would (the `#3419`/`test_venture_pack.py` rule). Do NOT substitute a local timing: the weight is a SHARD-LAYOUT input and only a measured CI junit value models the leg that carries the file.
   test_money_value_2782.py: 2.0  # unmeasured — new in #2782; no sweep has collected it, so it carries the flat default exactly as an absent key would (the `#3419`/`#2788` rule). Do NOT substitute a local timing: the weight is a SHARD-LAYOUT input and only a measured CI junit value models the leg that carries the file. (A local run's first SDK-constructing test carries a one-time embedder init; it is process-global and amortises across every SDK test in the shard, so it is not this file's weight.)
+  test_value_normalizer_2817.py: 2.0  # unmeasured — new in #2817; no sweep has collected it, so it carries the flat default exactly as an absent key would (the `#3419`/`#2788` rule). Do NOT substitute a local timing: the weight is a SHARD-LAYOUT input and only a measured CI junit value models the leg that carries the file.
   test_evidence_assembly.py: 0.2
   test_fake_control_plane.py: 0.1
   test_falkordb_compat.py: 0.1
