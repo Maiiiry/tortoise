@@ -7518,8 +7518,12 @@ function claimIntentInFlight() {
   // team's record at once (and a switch across the second attempt then retains
   // both). Coexisting is honest — the two answers are about different rows and
   // each names its own — so they are composed rather than one being suppressed.
-  // The one supersede rule is ROW-scoped and lives in `clearRotateAmbiguity`:
-  // a notice is dropped only when something resolved THAT row's ambiguity.
+  //
+  // #8255 (review P2): the supersede rule is ROW-scoped on BOTH sides — the
+  // notice may only be dropped when something resolved THAT row's ambiguity, and
+  // (symmetrically) the latch below will not overwrite a retained notice that
+  // names a different, still-unresolved row. Reading a rule that is enforced in
+  // one direction only is how the other direction got re-opened.
   function errorBannerText(error, refusalText, ambiguousText) {
     const transient = errorMessage(error)
     const retained = [refusalText, ambiguousText].filter(Boolean).join(' ')
@@ -7835,6 +7839,28 @@ function claimIntentInFlight() {
         const why = errorMessage(e)
         setRotateOutcomes((prev) => {
           const prior = (prev && prev[_teamAtCall]) || {}
+          // #8255 (review P2): the slot holds ONE notice and that notice is
+          // ROW-scoped (`… refresh the key list before relying on <row>`), so a
+          // latch for a DIFFERENT row must not overwrite one that is still
+          // unresolved. Overwriting it would be the same silent retire the
+          // row-scoped clear was made to stop, moved to the write side: an
+          // attempt that says nothing about row A would drop row A's unknown
+          // outcome, and nothing re-establishes it. Retention is the
+          // fail-conservative direction, the one `clearRotateAmbiguity` takes —
+          // a true notice retained is a nuisance, a true notice dropped is the
+          // defect this whole disclosure exists to close.
+          //
+          // The trade-off is stated so the next reader does not "simplify" this
+          // back into an overwrite: the record carries ONE notice, so with two
+          // lost responses on different rows of one team the OLDER unresolved
+          // one wins. That does not silence the newer attempt — while the team
+          // is still ours the row-truth message below lands in the transient
+          // slot and the banner composes both (see `errorBannerText`). It is
+          // lost only when the team was also left, which is the rarer case and
+          // the one where the user cannot act on it anyway.
+          //
+          // Returning `prev` is a React bail-out — no re-render, no state write.
+          if (prior.ambiguous && prior.ambiguousKeyId && prior.ambiguousKeyId !== keyId) return prev
           return {
             ...prev,
             [_teamAtCall]: {
@@ -7842,7 +7868,8 @@ function claimIntentInFlight() {
               ambiguous: `The rotate request failed${why ? ` (${why})` : ''}, and its outcome could not be confirmed — refresh the key list before relying on ${rowName}.`,
               // #8255 (review P2): the notice's SUBJECT, so the clearer can tell
               // a later attempt on this row (which resolves it) from an attempt
-              // on a different row (which says nothing about this one).
+              // on a different row (which says nothing about this one) — and so
+              // the latch above can refuse to overwrite another row's notice.
               ambiguousKeyId: keyId,
             },
           }

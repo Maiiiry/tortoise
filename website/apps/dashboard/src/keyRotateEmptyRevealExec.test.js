@@ -906,6 +906,87 @@ test('#8255 P2: a definite 4xx retry on ANOTHER row does not retire this row\u20
     'the fresh refusal detail still renders beside it \u2014 the banner composes both (they answer different rows)')
 })
 
+// ── #8255 (review P2, second cut): the rule holds on the WRITE side too ────
+//
+// The notice names ONE row (`… before relying on <row>`), so the latch may not
+// overwrite a retained notice that names a DIFFERENT, still-unresolved row. The
+// first cut wrote `ambiguous`/`ambiguousKeyId` unconditionally, which reached the
+// harm the row-scoped clear had just stopped — and needs no team switch: two
+// lost responses on one team's two rows suffice. Pre-fix the case below reds at
+// `ambiguousKeyId` (the record is re-pointed at `agent key`), and the
+// team-switch variant reds at `/residue row/` (row A's unknown outcome is gone
+// and no surface re-establishes it).
+
+test('#8255 P2: a lost-response rotate on ANOTHER row does not OVERWRITE this row\u2019s notice', async () => {
+  const stale = {
+    plaintext: '', expiresAt: null, warning: '',
+    ambiguous: 'The rotate request failed, and its outcome could not be confirmed \u2014 refresh the key list before relying on residue row.',
+    ambiguousKeyId: 'k-old',
+  }
+  const rows = [
+    { id: 'k-old', key_id: 'k-old', name: 'residue row', key_prefix: 'tt_live_re', created_at: '2026-08-01T00:00:00.000Z' },
+    { id: 'k-other', key_id: 'k-other', name: 'agent key', key_prefix: 'tt_agent', created_at: '2026-08-02T00:00:00.000Z' },
+  ]
+  const env = rotateEnv({
+    keys: rows,
+    reject: Object.assign(new Error('Network request failed'), { status: 0 }),
+  })
+  env.deps.setRotateOutcomes({ 'org-A': stale })
+  await env.regenerateKey('k-other')
+  const { calls } = env
+  assert.equal(recordOf(calls, 'org-A').ambiguousKeyId, 'k-old',
+    'the retained notice still names the row it was written for \u2014 this attempt was about agent key')
+  assert.match(ambiguousOf(calls, 'org-A'), /residue row/,
+    'so the unresolved row keeps its disclosure: overwriting it would silently retire an unknown outcome nothing re-establishes')
+  assert.doesNotMatch(ambiguousOf(calls, 'org-A'), /agent key/,
+    'and the slot is not re-pointed at the row this attempt touched')
+  assert.equal(calls.rotateOutcomes.filter((m) => m['org-A'] && m['org-A'].ambiguous).length, 1,
+    'the latch BAILED OUT (React Object.is) rather than rewriting the record with the same notice under a new subject')
+  // Nothing is lost on the same-team path: this attempt\u2019s own unknown outcome
+  // is the transient row-truth message, and the banner composes the two.
+  const surfaced = calls.error.filter(Boolean).at(-1) || ''
+  assert.match(surfaced, /agent key/,
+    'the newer attempt is still disclosed \u2014 through the transient slot, which is its correct home while the team is ours')
+  assert.match(surfaced, /could not be confirmed/, 'and it carries the unknown-outcome wording')
+  const { errorBannerText } = build({ errorMessage }, ['function errorBannerText'])
+  const banner = errorBannerText(surfaced, refusalOf(calls), ambiguousOf(calls, 'org-A'))
+  assert.match(banner, /residue row/, 'the banner renders BOTH \u2014 the retained notice')
+  assert.match(banner, /agent key/, 'and the fresh one; they answer different rows')
+})
+
+test('#8255 P2: a team switch during that second attempt keeps the FIRST row\u2019s notice', async () => {
+  // The documented single-slot trade-off: with the team gone, the newer attempt
+  // has no honest place to be disclosed (the transient slot is un-keyed and must
+  // not be written across teams), so the older unresolved notice is what
+  // survives. Pinned so a later "fix" back to overwrite has to argue with it.
+  const stale = {
+    plaintext: '', expiresAt: null, warning: '',
+    ambiguous: 'The rotate request failed, and its outcome could not be confirmed \u2014 refresh the key list before relying on residue row.',
+    ambiguousKeyId: 'k-old',
+  }
+  const rows = [
+    { id: 'k-old', key_id: 'k-old', name: 'residue row', key_prefix: 'tt_live_re', created_at: '2026-08-01T00:00:00.000Z' },
+    { id: 'k-other', key_id: 'k-other', name: 'agent key', key_prefix: 'tt_agent', created_at: '2026-08-02T00:00:00.000Z' },
+  ]
+  const orgIdRef = { current: 'org-A' }
+  const env = rotateEnv({
+    keys: rows,
+    orgIdRef,
+    apiImpl: async () => {
+      orgIdRef.current = 'org-B'
+      throw Object.assign(new Error('Network request failed'), { status: 0 })
+    },
+  })
+  env.deps.setRotateOutcomes({ 'org-A': stale })
+  await env.regenerateKey('k-other')
+  assert.match(ambiguousOf(env.calls, 'org-A'), /residue row/,
+    'the older unresolved notice survives a switch across a later rotate on another row')
+  assert.doesNotMatch(ambiguousOf(env.calls, 'org-A'), /agent key/)
+  assert.equal(env.calls.loadAll, 0, 'and no refresh lands under the new team')
+  assert.deepEqual(env.calls.error.filter(Boolean), [],
+    'nor does the notice ride the un-keyed transient slot under the new team\u2019s header')
+})
+
 test('#8255 P2: a definite 4xx whose team switch lands at the RTT keeps the notice', async () => {
   const stale = {
     plaintext: '', expiresAt: null, warning: '',

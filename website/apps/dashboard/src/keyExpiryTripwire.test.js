@@ -207,6 +207,12 @@ test('#2426: the show-once key card states the expiry (server echo / never)', ()
     'and the latch must write that subject beside the notice')
   assert.doesNotMatch(rotBody, /clearRotateAmbiguity\(_teamAtCall\)/,
     'no team-wide clear may run at attempt start — nothing is resolved at that point (#8255 review P2)')
+  // #8255 (review P2, second cut): the rule is row-scoped on the WRITE side too.
+  // An unconditional latch overwrote a retained notice naming a DIFFERENT,
+  // still-unresolved row — the same silent retire the clearer was scoped to
+  // stop, reachable without a team switch (two lost responses, two rows).
+  assert.match(rotBody, /if \(prior\.ambiguous && prior\.ambiguousKeyId && prior\.ambiguousKeyId !== keyId\) return prev/,
+    'the latch must refuse to overwrite another row’s unresolved notice (#8255 review P2)')
   assert.match(rotBody, /has already been revoked/, 'the refusal must state the OLD key is already revoked')
   assert.match(rotBody, /\[_teamAtCall\]: \{ plaintext, expiresAt: \(mk && mk\.expires_at\) \|\| null, warning \}/,
     'rotate captures the server expiry echo + the partial-state warning into the per-team outcome')
