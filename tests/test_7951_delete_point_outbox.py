@@ -60,7 +60,9 @@ are not equally harmful:
 * a `graph was deleted or replaced` abort whose graph KEY is gone is NOT read
   back as a landed destroy — on this engine a Cypher read against a missing key
   AUTO-CREATES it and answers `count(n)=0`, so the read-back is gated on
-  CONFIRMED presence and issues no read at all (T3e);
+  CONFIRMED presence and issues no read at all (T3e); the same gate is paid on the
+  TRANSPORT family, where the abort classifier returns no arm at all and the
+  first cut skipped the probe (T3f);
 * the message names THIS door's record (`EntityMutated op=delete`, derived from
   the door, never `PointAdded`) and attaches the graph to the CACHE clause, not
   the record's (T10).
@@ -603,6 +605,84 @@ def test_a_deleted_graph_key_is_never_read_as_a_landed_destroy(env, monkeypatch)
     assert not [r for r in _journal(events)
                 if r.get("op") == "delete" or r.get("type") == "EntityMutated"], (
         "no destruction record may be written when the cache state is unknown")
+
+
+# ── T3f: the presence gate is paid on the TRANSPORT family too ────────────
+
+def test_a_transport_failure_pays_the_presence_probe_too(env, monkeypatch):
+    """A NON-family failure must not skip the gate either (#9207 review).
+
+    T3e pins the graph-abort family. The gate that shipped FIRST keyed on
+    `graph_abort_family(exc)`, and `_abort_arm` returns ``None`` for anything
+    that is not a `redis.exceptions.ResponseError` — so a transport failure
+    (timeout, dropped connection: the family for which the read-back exists at
+    all) skipped the presence probe and issued the read against whatever key
+    state the server was in. On an ABSENT key that read AUTO-CREATES the empty
+    graph and answers `count(n) = 0`, which the door reads as "landed": it
+    would write a destruction record and RETURN True over a graph that no
+    longer exists.
+
+    The gate now covers EVERY family except the state-independent one
+    (write-slot / MISCONF, which #7405's
+    `test_a_write_slot_exhaustion_pays_no_graph_presence_probe` keeps probe-free).
+
+    MUTATION: restore `graph_abort_family(exc)` as the gate condition (or drop
+    the probe for non-ResponseError raises) and this reddens: the read-back runs
+    — asserted here — and, on this fixture's live key, the door raises the loud
+    error instead of the engine's own; on a real v6 server the same read answers
+    0 and the door RETURNS True with a written record.
+    """
+    from tortoise.exceptions import WriteNotLandedError
+
+    sdk, events = env
+    proj = sdk._get_proj()
+    pid = sdk.create_point("observation", "transport failure mid-delete")["id"]
+
+    real_query = type(proj.g).query
+    real_exec = type(proj.g).execute_command
+    reads_after_failure: list[str] = []
+    failed = {"v": False}
+    exists_calls: list[object] = []
+
+    def fail_then_read(_self, cypher, *args, **kwargs):
+        stmt = cypher or ""
+        if _DELETE_CYPHER in stmt:
+            failed["v"] = True
+            raise ConnectionError("connection reset by peer")
+        if failed["v"] and "RETURN count(n)" in stmt and "> 0" not in stmt:
+            reads_after_failure.append(stmt)
+        return real_query(_self, cypher, *args, **kwargs)
+
+    def key_is_gone(_self, *args, **kwargs):
+        if args and args[0] == "EXISTS":
+            exists_calls.append(args)
+            return 0
+        return real_exec(_self, *args, **kwargs)
+
+    monkeypatch.setattr(type(proj.g), "query", fail_then_read)
+    monkeypatch.setattr(type(proj.g), "execute_command", key_is_gone)
+    try:
+        with pytest.raises(ConnectionError) as ei:
+            sdk.delete_point(pid)
+    finally:
+        monkeypatch.setattr(type(proj.g), "query", real_query)
+        monkeypatch.setattr(type(proj.g), "execute_command", real_exec)
+
+    assert exists_calls, (
+        "the presence probe was SKIPPED for a transport failure — the read-back "
+        "below then runs against an unseen key state, and on an absent key that "
+        "read re-creates the graph and reports a landed destroy")
+    assert reads_after_failure == [], (
+        "the read-back ran without a confirmed key on a NON-family failure: "
+        f"{reads_after_failure!r}")
+    assert not isinstance(ei.value, WriteNotLandedError), (
+        "an absent key is the engine's own loud error, not this door's "
+        "unverified arm")
+    assert not [r for r in _journal(events)
+                if r.get("op") == "delete" or r.get("type") == "EntityMutated"], (
+        "no destruction record may be written for a destroy nobody verified")
+    assert _live(proj, pid) is True, (
+        "premise: the injected transport failure never reached the engine")
 
 
 # ── T4: nothing is journaled for a delete that cannot happen ──────────────
