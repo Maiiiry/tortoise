@@ -11235,11 +11235,22 @@ class TortoiseSDK:
             (live ≠ replay, the class this ordering exists to close).
 
             So the commit point is "after the guarded write, before anything
-            that can strand it" — the point ``invalidate_point`` and
-            ``retract_point`` already use, and the reason this arm was the only
-            apply-first door in its family. It is reached only with a NON-EMPTY
-            ``result_set``: every zero-row promote has already returned (the
-            idempotent live no-op) or raised (the diagnostic above).
+            that can strand it". It is the closest point this arm can take to
+            its siblings' policy: ``invalidate_point`` and ``retract_point``
+            record BEFORE their writes, which this arm cannot do because its
+            ``SET`` may legitimately refuse — the reason `#8830` exempted it.
+            It is reached only with a NON-EMPTY ``result_set``: every zero-row
+            promote has already returned (the idempotent live no-op) or raised
+            (the diagnostic above).
+
+            What this does NOT close: replay still does not restore the
+            promotion's ``status``, because ``_revise_point`` folds no status
+            clause and the pure fold's ``PointRevised`` branch folds none
+            either. The record now exists — so the revision's CONTENT, tags and
+            belief survive ``rebuild_all`` instead of being dropped with it —
+            but the status gap is the fold's, tracked separately (#9248
+            comment). Do not cite this comment as making live == replay for a
+            promotion.
 
             Best-effort, as at the old tail: ``_emit_event`` never raises, and
             the write it describes has already landed, so a failed append is

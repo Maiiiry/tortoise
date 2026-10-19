@@ -1934,9 +1934,8 @@ def test_a_status_only_promote_on_a_live_node_stays_an_idempotent_noop(
     NOT pinned here: that the silent no-op also emits no ``PointRevised``. That
     silence comes from the POST-write early return — the promote statement IS
     issued, matches nothing, and ``update_point`` returns ``get_point(id)``
-    before the tail emit — so ``res.result_set`` gates nothing at this head (the
-    conjunct was deleted once the early return made it unreachable-false). The
-    observable is pinned by
+    before reaching an emit — because a promote's record is appended inside the
+    arm, only for a non-empty ``result_set``. The observable is pinned by
     ``test_a_live_status_only_promote_emits_no_point_revised``.
     """
     sdk = _sdk(tmp_path, "promoteidem")
@@ -2088,15 +2087,14 @@ def test_a_live_status_only_promote_emits_no_point_revised(
 
     The MECHANISM is the early return for a status-only promote on a live node.
     This fixture flips the node live AT the guarded ``SET``, so the statement IS
-    issued, matches nothing, and the POST-write early return leaves before the
-    tail emit; the PRE-write probe route (a point already live at entry) leaves
-    even earlier, returning on its status read at the top of the door, before
-    the ``:Object`` label probe — no PROMOTE WRITE and no label/validity read is
-    issued, only ``RETURN n.status`` plus ``get_point``. An earlier
-    ``res.result_set`` conjunct on that emit became unreachable-false once those
-    early returns
-    existed; this test pins the OBSERVABLE, so it holds whichever route produces
-    the silence.
+    issued, matches nothing, and the POST-write early return leaves before any
+    record is appended (a promote's record commits inside the arm, and only for
+    a non-empty ``result_set``); the PRE-write probe route (a point already live
+    at entry) leaves even earlier, returning on its status read at the top of
+    the door, before the ``:Object`` label probe — no PROMOTE WRITE and no
+    label/validity read is issued, only ``RETURN n.status`` plus
+    ``get_point``. This test pins the OBSERVABLE, so it holds whichever route
+    produces the silence.
 
     The store half of `PointRevised` is the change-feed switch, which is read
     from the environment AT CALL TIME — so the emit IS observable in this
@@ -2848,9 +2846,14 @@ def test_a_landed_promote_is_journaled_before_a_later_arm_can_abort(
     must not follow the TAG sync either: that arm is witnessed, so an
     unlandable tag merge aborts the whole call, and a record appended at the tail
     was never reached. Measured on `main`: the node ended `status='live'`, the
-    caller was told the call failed, and ZERO `PointRevised` was appended —
-    `rebuild_all` then replayed the creation as `draft` and the promotion was
-    gone.
+    caller was told the call failed, and ZERO `PointRevised` was appended — so
+    `rebuild_all` also lost the revision's CONTENT, tags and belief, not only
+    the promotion.
+
+    Scope, stated because the assertion is a COUNT and cannot see it: the record
+    now exists, but replay still does not restore `status` — `_revise_point`
+    folds no status clause and neither does the pure fold's `PointRevised`
+    branch. That gap is the fold's (tracked on #9248) and is NOT closed here.
 
     No other test combines `status` with `tags`; this is the union that exposed
     the window, and the assertion is on ONE emit so a double record also reds.
