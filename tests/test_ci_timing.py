@@ -212,18 +212,33 @@ def test_generate_is_deterministic_and_bounds_history(tmp_path: Path, fake_env: 
     assert (out1 / "ci-timing.json").read_bytes() == (out3 / "ci-timing.json").read_bytes()
     assert (out1 / "ci-timing.md").read_bytes() == (out3 / "ci-timing.md").read_bytes()
 
-    # history accumulation: seeding the committed json (the repo docs/ path)
-    # gives a second sample → 2 rows; --max-history=1 bounds it back to 1
+    # history accumulation: seeding the committed json (the repo docs/ path) with
+    # a DIFFERENT run gives a second sample → 2 rows; --max-history=1 bounds it
+    # back to 1
     repo_docs = tmp_path / "repo" / "docs"
     repo_docs.mkdir(parents=True)
     shutil.copy(out1 / "ci-timing.json", repo_docs / "ci-timing.json")
     run2 = subprocess.run(  # noqa: F841
         [sys.executable, str(tools),
-         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4243",
          "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(repo_docs)],
         capture_output=True, text=True, check=True,
     )
     assert len(json.loads((repo_docs / "ci-timing.json").read_text())["history"]) == 2
+    # ...but a REPEAT sample of an already-recorded run REPLACES its row. The
+    # artifact once carried 5 rows over 4 run ids — the same run twice, once
+    # with `failed: 5` and once with `failed: 6` — because a re-render prepended
+    # the corrected row and left the stale copy beside it (#9134 review cycle 3).
+    run2b = subprocess.run(  # noqa: F841
+        [sys.executable, str(tools),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(repo_docs)],
+        capture_output=True, text=True, check=True,
+    )
+    rows = json.loads((repo_docs / "ci-timing.json").read_text())["history"]
+    assert [r["run_id"] for r in rows] == ["4242", "4243"], (
+        f"a repeat sample must replace its row, not stack a second one: {rows}"
+    )
     run3 = subprocess.run(  # noqa: F841
         [sys.executable, str(tools),
          "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
@@ -3746,7 +3761,9 @@ def test_the_committed_artifact_agrees_with_its_own_failure_detail() -> None:
     )
 
     run_ids = [entry.get("run_id") for entry in history]
-    duplicates = sorted({r for r in run_ids if run_ids.count(r) > 1})
+    # `run_id` is null when the writer ran without a sampled run, which is a
+    # legitimate row — only a REPEATED id means one run was sampled twice.
+    duplicates = sorted({r for r in run_ids if r is not None and run_ids.count(r) > 1})
     assert not duplicates, (
         "one run is sampled twice — a re-render prepended a corrected row without "
         f"replacing the stale one: {duplicates}"

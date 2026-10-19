@@ -1993,6 +1993,25 @@ def paid_vs_selected_cli(args) -> int:
     return 0
 
 
+def _log_identity(log_path: str, logs_dir: Path | str) -> str:
+    """Name a log source by its path under `logs_dir`, not by its basename alone.
+
+    The downloaded artifacts are one directory per CI leg, and most of those
+    directories contain a file literally called `pytest.log` — the real artifact
+    carried 15 sources all named `pytest.log`. A basename therefore cannot say
+    WHICH leg reported a failure, which defeats the point of recording a
+    summary-less leg's derived counts beside it (#9134 review cycle 3): the one
+    leg carrying `counts_from_progress` was indistinguishable from the other 14.
+
+    Falls back to the basename when the path is not under `logs_dir` (a caller
+    may hand `parse`-style single files), so the value is always present.
+    """
+    try:
+        return str(Path(log_path).relative_to(Path(logs_dir)))
+    except ValueError:
+        return Path(log_path).name
+
+
 def aggregate_logs(logs_dir: Path | str) -> dict:
     """Sum every leg's `pytest-*.log` under `logs_dir` into the artifact's parts.
 
@@ -2037,7 +2056,7 @@ def aggregate_logs(logs_dir: Path | str) -> dict:
                     from_progress[key] = seen
         killed_any = killed_any or parsed["killed"]
         failed_tests.update(n for n, st in parsed["outcomes"].items() if st in ("FAILED", "ERROR"))
-        source: dict = {"log": Path(log_path).name, "error": parsed["error"],
+        source: dict = {"log": _log_identity(log_path, logs_dir), "error": parsed["error"],
                         "counts": parsed["counts"]}
         if from_progress:
             source["counts_from_progress"] = from_progress
@@ -2156,6 +2175,13 @@ def main() -> int:
         "failed_tests": sorted(failed_tests),
     }
     history = [row] + load_history(json_path)  # noqa: RUF005
+    # A re-render of an ALREADY SAMPLED run must replace its row, not stack a
+    # second one: the two rows describe the same run with whatever the generator
+    # said at each time, so a corrected re-render left the stale copy beside it
+    # (measured: 5 entries, 4 distinct run ids, `failed: 6` next to `failed: 5`).
+    # The freshly measured row is the one that survives.
+    if run_id:
+        history = [row] + [e for e in history[1:] if e.get("run_id") != run_id]
     history = history[: args.max_history]
 
     flakes = candidate_flakes(history)
