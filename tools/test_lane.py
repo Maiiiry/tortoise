@@ -82,6 +82,55 @@ query explicitly requests. There is deliberately no env seam for it (unlike
 override is exactly how the private lane stops being a drop-in. Pinned by
 ``tests/test_test_lane_tool.py::test_start_passes_the_canonical_engine_args``.
 
+IMAGE PIN — WHY THE DEFAULT IS A PINNED SERVER IMAGE (#8124)
+--------------------------------------------------------------
+The default used to be ``falkordb/falkordb:latest``. That floating tag now
+resolves to engine 6.0.x, whose ``reply_compact`` PANICS the server on a query
+shape this suite really issues: the process exits, so the lane does not fail
+like a bad assertion — it fails like ``Connection closed by server``, which the
+DB-unreachable session guard then reports as "no TORTOISE_DB_URI database could
+be reached" (the #6073 wedge class), not as a server panic.
+
+MEASURED (2026-10-19, one disposable container per reading, ``--compact`` — the
+reply mode the client actually uses):
+
+  * ``falkordb/falkordb:latest`` (module 60002) and ``falkordb/falkordb:6.0.1``
+    (module 60001) — BOTH panic ``FalkorDB panic: panicked at
+    src/reply.rs:655:58: called `Option::unwrap()` on a `None` value``, frames
+    ``reply::reply_compact`` -> ``graph_core::execute_query``; container
+    ``Exited (1)``.
+  * the minimum trigger needs no data (the graph need not even exist):
+    ``OPTIONAL MATCH (s:Session) RETURN count(s) AS n, s.harness AS h`` — an
+    OPTIONAL MATCH whose projection mixes an AGGREGATE column with a node
+    PROPERTY column. Each half alone is fine (``RETURN count(s)``,
+    ``RETURN s.harness``, and ``MATCH ... RETURN count(s), s.harness`` all
+    answer normally).
+  * ``falkordb/falkordb-server:v4.20.6`` (module 42006) and ``v4.20.4``
+    (module 42004) — answer it normally and stay ``Up``; the shipped
+    reproducer ``tests/test_onboarding_w6_capture_disclosure.py::
+    TestFirstCaptureDisclosure::test_off_switch_409_never_writes_the_checkpoint``
+    PASSES (215.07 s) on v4.20.6 where it FAILS in ~5 s on both 6.0.x builds.
+
+So the pin is ``falkordb/falkordb-server:v4.20.6`` — the SAME engine
+``.github/actions/falkordb-provision`` gives the CI gate (#6386), which is the
+other half of this tool's drop-in argument: a lane that runs the gate's engine
+predicts the gate. Pinning the APP-image family alone was measured NOT to be
+enough: every 6.0.x tag available carries the panic, so the issue body's
+"pin the app image" remedy would have shipped a crashing default anyway.
+
+WHAT THIS DOES AND DOES NOT PROTECT. It protects every lane that uses THIS tool
+(the container is private, so a panic here kills only its own DB). It does NOT
+protect a lane pointed at the long-lived SHARED ``falkordb`` container: that one
+is DECLARED ``falkordb/falkordb:latest`` in eldato
+``operations/memory/docker-compose.yml`` (out of this repo), and only its
+CREATION TIME keeps 6.0.x away — measured 2026-10-19 it runs image
+``d9d844a6c58c``, created 2026-08-03, graph module **42001**: what ``latest``
+resolved to THEN, not the ``de76956472bb`` / module 60002 build the tag resolves
+to now. The next ``docker compose up --force-recreate`` on that file arms the
+panic for every peer lane, so the ``TORTOISE_TEST_LANE_IMAGE`` seam is
+validated (``assert_pinned_image``) and a floating tag is REFUSED rather than
+copy-pasted back in.
+
 CONTRACT — THE TARGET IS NOT A PARAMETER
 ----------------------------------------
 The container this tool acts on is ALWAYS ``fdb-lane-<sha1(worktree)[:10]>``,
@@ -157,9 +206,51 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-#: Overridable so CI can pin a digest/version; `latest` matches the existing
-#: in-repo precedent (scripts/restore-smoke.sh also runs falkordb/falkordb:latest).
-IMAGE = os.environ.get("TORTOISE_TEST_LANE_IMAGE", "falkordb/falkordb:latest")
+#: The lane's engine. Overridable so a lane can name a DIGEST or another
+#: EXPLICIT version — never a floating tag (``assert_pinned_image`` refuses one;
+#: #8124). See "IMAGE PIN" in the module docstring for the measurement that
+#: moved this off ``falkordb/falkordb:latest``; the old comment here justified
+#: the floating tag by a ``scripts/restore-smoke.sh`` precedent that does not
+#: exist in this repo (``git ls-files`` matches no ``scripts/`` path).
+#: Default = the engine the CI gate itself runs (#6386).
+LANE_IMAGE_PIN = "falkordb/falkordb-server:v4.20.6"
+IMAGE = os.environ.get("TORTOISE_TEST_LANE_IMAGE", LANE_IMAGE_PIN)
+
+#: Tags that mean "whatever upstream published last" (#8124). An image is
+#: accepted only with an explicit version tag or an ``@sha256:`` digest.
+_FLOATING_TAGS = frozenset({"", "latest", "latest-alpine", "edge", "edge-c",
+                            "edge-rs"})
+
+
+def assert_pinned_image(image: str) -> str:
+    """Return ``image`` unchanged if it is a PIN; refuse a floating tag.
+
+    #8124: the seam exists so CI can pin a digest or compare two explicit
+    versions — not so a lane can re-select ``latest`` by accident. A floating
+    tag is not a cosmetic risk here: it resolves to an engine whose
+    ``reply_compact`` panics the server on a query this suite issues, so the
+    lane reports ``Connection closed by server`` instead of a test result (see
+    "IMAGE PIN" in the module docstring). Refused, so the crash cannot be
+    reintroduced by exporting the old default from a shell profile.
+    """
+    ref = image.strip()
+    if "@sha256:" in ref:      # a digest IS the pin
+        return image
+    last = ref.rsplit("/", 1)[-1]
+    tag = last.rsplit(":", 1)[-1].lower() if ":" in last else ""
+    if tag in _FLOATING_TAGS:
+        raise SystemExit(
+            f"test-lane: refusing the floating image {image!r} — "
+            f"TORTOISE_TEST_LANE_IMAGE must name an explicit version tag or an "
+            f"@sha256: digest (#8124). `latest` resolves to engine 6.0.x, whose "
+            f"reply_compact PANICS the server on `OPTIONAL MATCH ... RETURN "
+            f"count(s), s.harness` and exits it, so the lane reports "
+            f"\"Connection closed by server\" instead of a test result. The "
+            f"pinned default is {LANE_IMAGE_PIN} (the engine the CI gate runs)."
+        )
+    return image
+
+
 #: #8071: the engine args the canonical SHARED docker-lane container runs with
 #: (eldato ``operations/memory/docker-compose.yml`` -> ``FALKORDB_ARGS``). The
 #: private lane REPLACES that instance for a concurrent lane, so it must be
@@ -574,6 +665,9 @@ def start(port: int | None = None) -> tuple[str, int]:
     """
     if port is not None and not (0 < port < 65536):
         raise SystemExit(f"test-lane: --port {port} is not a valid TCP port")
+    # #8124: validated FIRST, for the same reason the port is — a floating tag
+    # must fail before the orphan sweep and before any container is touched.
+    image = assert_pinned_image(IMAGE)
     # #8180: the call site that makes ownership reaping actually BITE. Every lane
     # that starts sweeps containers whose owning worktree is gone, so a lane
     # closed without `down` (measured: `cmux workspace close` never runs it)
@@ -646,7 +740,7 @@ def start(port: int | None = None) -> tuple[str, int]:
         # #8071: engine parity with the SHARED instance (see the module
         # docstring's ENGINE PARITY section).
         "-e", f"FALKORDB_ARGS={LANE_FALKORDB_ARGS}",
-        IMAGE,
+        image,
         timeout=IMAGE_PULL_TIMEOUT,   # the image may need pulling first
     )
     if r.returncode != 0:

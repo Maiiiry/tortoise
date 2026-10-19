@@ -58,6 +58,14 @@ def _host_probe_and_sweep_are_stubbed(monkeypatch):
     the gate itself is not relaxed."""
     monkeypatch.setattr(tl, "_ping_over_host", lambda port, timeout: True)
     monkeypatch.setenv("TORTOISE_TEST_LANE_REAP", "0")
+    # #8124: the lane's image comes from `TORTOISE_TEST_LANE_IMAGE` read at
+    # IMPORT time, and a lane that exports it (to compare engines) must not be
+    # able to move these tests — `start()` now refuses a floating tag, so an
+    # inherited `...:latest` would red the whole file for an environment
+    # reason. Pin the module attribute too, since deleting the env var does not
+    # undo an import that already happened.
+    monkeypatch.delenv("TORTOISE_TEST_LANE_IMAGE", raising=False)
+    monkeypatch.setattr(tl, "IMAGE", tl.LANE_IMAGE_PIN)
 
 
 # ── #8180: the three defects, as regressions ─────────────────────────────
@@ -1147,6 +1155,33 @@ def test_start_rejects_an_invalid_port_before_touching_docker(lane, monkeypatch)
         with pytest.raises(SystemExit) as exc:
             tl.start(port=bad)
         assert "not a valid TCP port" in str(exc.value)
+
+
+def test_start_refuses_a_floating_image_before_touching_docker(lane, monkeypatch):
+    """#8124: the image pin is validated FIRST, for the same ordering reason as
+    the port — and it is a REFUSAL, not a warning.
+
+    `falkordb/falkordb:latest` now resolves to engine 6.0.x, whose
+    `reply_compact` panics the server on `OPTIONAL MATCH (s) RETURN count(s) AS
+    n, s.harness AS h` and exits it: the lane then reports `Connection closed by
+    server` instead of a test result, and on a shared instance it takes every
+    peer lane down. The seam stays (a digest or an explicit version is fine) so
+    this must fail on the floating value, not by forbidding the override.
+    """
+    def _boom(*_a, **_k):  # pragma: no cover - asserted not to run
+        raise AssertionError("docker was called before image validation")
+
+    monkeypatch.setattr(tl, "container_state", _boom)
+    monkeypatch.setattr(tl, "_docker", _boom)
+    monkeypatch.setattr(tl, "reap_orphans", _boom)
+    monkeypatch.setattr(tl, "IMAGE", "falkordb/falkordb:latest")
+    with pytest.raises(SystemExit) as exc:
+        tl.start()
+    assert "#8124" in str(exc.value)
+    assert "falkordb/falkordb:latest" in str(exc.value)
+    # ... and the pinned value still passes the validator (the guard did not
+    # become a ban on configuring the lane at all).
+    assert tl.assert_pinned_image(tl.LANE_IMAGE_PIN) == tl.LANE_IMAGE_PIN
 
 
 def test_start_removes_only_a_container_this_tool_manages(lane, monkeypatch):
