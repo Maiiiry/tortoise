@@ -205,12 +205,68 @@ async def test_generic_sdk_exception_is_recorded_as_a_failure(events, stdio):
 
 
 @pytest.mark.asyncio
-async def test_a_wrap_envelope_tool_is_classified_through_the_envelope(
+async def test_a_union_envelope_tool_is_classified_through_the_envelope(
         events, stdio):
-    """A ``-> list[dict]`` tool ships ``{"result": <failure>}`` (#8482).
+    """A ``-> list[dict] | dict`` tool ships ``{"result": <failure>}`` UNREPAIRED.
 
-    A top-level-only read would miss it, so this pins the read-through — the
-    shape ``_safe_failure_message`` already established.
+    This is the read-through's only non-vacuous producer — the shape
+    ``tortoise_query`` actually has in the registry. FastMCP wraps the result
+    (``{"result": ...}``, wrap marker set), but the envelope admits a dict
+    (``anyOf`` in the generated ``result`` schema), so ``_violates_wrap_envelope``
+    answers ``False`` and #8482's repair deliberately does NOT fire
+    (``mcp_server.py::_violates_wrap_envelope``: ``anyOf``/undeclared → False).
+    A TOP-LEVEL-ONLY read in ``_returned_safe_failure`` therefore leaves this row
+    ``ok`` — which is the fail-open hole #8135 closes.
+
+    Deliberately NOT the ``-> list[dict]`` case: pre-#8135 that row already read
+    ``exec_error``/``safe_error`` via the #8482 envelope repair, so it cannot
+    prove the read-through fires (see the agreement check below).
+    """
+    def union_tool(query: str = "q") -> list[dict] | dict:
+        return ms._safe(_QuotaSDK().query, query)
+
+    result = await _call("_8135_union", union_tool, {"query": "q"})
+
+    assert result.structured_content == {
+        "result": {"error": "points quota exceeded", "code": ms.ERR_QUOTA}}
+    assert result.is_error is False, (
+        "a union envelope admits a dict result, so #8482 leaves the wire alone")
+    row = events[-1]
+    assert row["status"] == "exec_error", row
+    assert row["error_kind"] == "safe_error", row
+
+
+def test_returned_safe_failure_reads_through_the_envelope():
+    """The read-through itself: delete the inner candidate and this fails.
+
+    ``_returned_safe_failure`` keeps TWO candidates (the payload, and the
+    ``result`` inside a FastMCP wrap envelope) because ``_safe_failure_message``
+    established that shape for #8482. This pins the inner one directly, so the
+    read-through cannot be removed silently while the union-envelope test above
+    happens to pass for another reason.
+    """
+    failure = {"error": "points quota exceeded", "code": ms.ERR_QUOTA}
+    token = ms._dispatch_safe_failures.set([failure])
+    try:
+        assert ms._returned_safe_failure({"result": dict(failure)}) == failure
+        # The top-level candidate still works — an object-annotated tool.
+        assert ms._returned_safe_failure(dict(failure)) == failure
+        # ...and a payload that is neither shape is not a recorded failure.
+        assert ms._returned_safe_failure({"result": {"other": 1}}) is None
+        assert ms._returned_safe_failure({"result": [failure]}) is None
+    finally:
+        ms._dispatch_safe_failures.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_an_array_envelope_tool_agrees_with_the_repair(events, stdio):
+    """A ``-> list[dict]`` tool: #8482's repair ALREADY produces this pair.
+
+    An AGREEMENT check between the two producers of ``exec_error``/``safe_error``
+    (the payload classification and the envelope repair) — not a pin on the
+    read-through: pre-#8135 this row read the same pair via the repair, so it
+    cannot tell the two apart. Kept so a divergence (one producer moving, the
+    other not) is visible.
     """
     def search_tool(query: str = "q") -> list[dict]:
         return ms._safe(_QuotaSDK().query, query)

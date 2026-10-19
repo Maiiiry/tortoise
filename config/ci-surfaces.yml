@@ -5718,7 +5718,7 @@ durations:
   test_invites.py: 0.3
   test_joint_index_ingest.py: 0.5
   test_mcp_telemetry.py: 0.4
-  test_mcp_safe_error_telemetry_8135.py: 2.6  # #8135: measured locally (11 tests)
+  test_mcp_safe_error_telemetry_8135.py: 3.9  # #8135: measured locally (13 tests)
   test_monitoring.py: 40.1  # #9017 CI-junit 2026-10-18 (run 39165691659); was 5.1
   test_cost_allocation.py: 20.3
   test_cost_dimensions.py: 11.5
