@@ -284,7 +284,6 @@ def discriminating_control(corpus: dict, embed_list: dict, names: list[str],
         "stripped_references": stripped,
         "removed": len(removed),
         "removed_names": removed,
-        "warnings": list(res["warnings"]),
     }
 
 
@@ -829,6 +828,10 @@ def _run(argv: list[str] | None = None) -> int:
         f"objects={ctl['objects']} the_prefix={ctl['the_prefix']} "
         f"share={_fmt(ctl['share'])} real_facts={ctl['real_facts']} "
         f"removed={ctl['removed']} "
+        # WHICH Objects landed, not only how many: the count is reconciled against
+        # this list by the structural gate, so the identities are auditable from
+        # the log rather than only assertable from the probe (#9110 review P3).
+        f"removed_names={json.dumps(ctl['removed_names'], ensure_ascii=False)} "
         f"note=the same Objects the referenced corpus keeps are REMOVED when "
         f"nothing references them, so the 0.0 pp is a corpus property (every "
         f"Object wired to its statement), not a property of S2.2")

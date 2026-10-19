@@ -771,6 +771,144 @@ def test_checker_fails_when_the_control_did_not_remove_what_it_stripped(log_text
     assert any("[V12]" in f for f in findings), findings
 
 
+def test_checker_fails_when_the_control_names_nothing_it_removed(log_text):
+    """The count was checkable; the identities behind it were not (#9110 P3)."""
+    line = next(ln for ln in log_text.splitlines()
+                if ln.startswith("control variant="))
+    assert "removed_names=" in line
+    mutated = log_text.replace(line, re.sub(r"removed_names=\[.*?\] ", "", line))
+    assert "removed_names=" not in mutated
+    findings, _ = check.check(mutated)
+    assert any("[V12]" in f and "name what it removed" in f
+               for f in findings), findings
+    # ... and the names are the set the count counts: `removed=9` beside 8 names
+    # is the same defect one level up from the deleted field.
+    names = json.loads(re.search(r"removed_names=(\[.*?\]) ", line).group(1))
+    short = log_text.replace(
+        line, line.replace(json.dumps(names, ensure_ascii=False), "[]"))
+    findings, _ = check.check(short)
+    assert any("[V12]" in f and "names 0" in f for f in findings), findings
+
+
+# ── 4c. the MECHANISM block: the gate that is the finding must have RUN ───
+#
+# The bundle's central finding is that the shipped gate fired and ``apply_vet``
+# Rule 2 downgraded every discard, so E1 could not move. That mechanism is
+# disclosed only by the ``metric=vet`` / ``metric=vet-downgrades`` /
+# ``vet-warning=`` lines — and until now NO rule read any of them, so the scored
+# arm could print ``enabled=no``, ``discarded=0`` and no warnings at all and still
+# be called structurally sound. A gate that never ran produces the same 0.0 pp as
+# one that ran and could not move, so every other number in the log stayed put
+# (#9110 review P2, measured as five accepted mutations).
+
+
+def test_checker_fails_when_the_scored_arm_ran_with_the_gate_off(log_text):
+    """`enabled=no` is legal ONLY on the baseline arm."""
+    mutated = log_text.replace(
+        "arm=after-vet-shipped metric=vet pass=s2 enabled=yes",
+        "arm=after-vet-shipped metric=vet pass=s2 enabled=no")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V13]" in f and "enabled=no" in f for f in findings), findings
+    # the baseline arm is where `no` belongs — and it must stay accepted
+    baseline = "arm=before metric=vet pass=s2 enabled=no"
+    assert baseline in log_text
+    assert not [f for f in check.check(log_text)[0] if "[V13]" in f]
+
+
+def test_checker_fails_when_the_candidate_count_is_not_its_outcome_table(
+        log_text):
+    """`candidates=` and `discarded=` are reconciled with `by_outcome=`."""
+    original = ("candidates=140 discarded=3 "
+                'by_outcome={"DISCARD": 3, "KEEP": 137}')
+    assert original in log_text
+    more = log_text.replace(original, original.replace("candidates=140",
+                                                       "candidates=999"), 1)
+    findings, _ = check.check(more)
+    assert any("[V13]" in f and "sum of by_outcome" in f
+               for f in findings), findings
+    # A discard count of 0 beside a DISCARD outcome is the exact shape that makes
+    # "the gate ran and removed 3" unreadable.
+    zeroed = log_text.replace(
+        original,
+        'candidates=140 discarded=0 by_outcome={"DISCARD": 3, "KEEP": 137}', 1)
+    findings, _ = check.check(zeroed)
+    assert any("[V13]" in f and "DISCARD outcome count" in f
+               for f in findings), findings
+
+
+def test_checker_fails_when_the_downgrade_count_is_not_its_warnings(log_text):
+    """`vet-downgrades count=6` must be the 6 warnings printed beside it."""
+    mutated = log_text.replace(
+        "arm=after-vet-shipped metric=vet-downgrades count=6",
+        "arm=after-vet-shipped metric=vet-downgrades count=0")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V14]" in f and "not the set of downgrades" in f
+               for f in findings), findings
+
+
+def test_checker_fails_when_an_arms_downgrade_warnings_are_deleted(log_text):
+    """Deleting the warnings while the count stands is the same disagreement."""
+    mutated = "\n".join(
+        ln for ln in log_text.splitlines()
+        if not (ln.startswith("arm=after-vet-shipped vet-warning=")
+                and "kept (Layer-1 referential integrity)" in ln))
+    assert mutated != log_text
+    assert "arm=after-vet-shipped metric=vet-downgrades count=6" in mutated
+    findings, _ = check.check(mutated)
+    assert any("[V14]" in f and "count=6" in f for f in findings), findings
+
+
+def test_checker_fails_when_the_mechanism_block_is_deleted(log_text):
+    """An absent mechanism block is not "the gate did nothing"."""
+    mutated = "\n".join(
+        ln for ln in log_text.splitlines()
+        if not (" metric=vet " in ln or " metric=vet-downgrades " in ln))
+    assert "metric=vet" not in mutated
+    findings, _ = check.check(mutated)
+    assert any("[V13]" in f and "no metric=vet line" in f
+               for f in findings), findings
+    assert any("[V14]" in f and "no metric=vet-downgrades line" in f
+               for f in findings), findings
+
+
+def test_checker_fails_when_the_fused_count_is_not_the_fused_lines(log_text):
+    """`fused_after` counts the fused rows printed under it (#9110 P3)."""
+    mutated = log_text.replace("fused_after=1 verdict=", "fused_after=0 verdict=")
+    assert mutated != log_text
+    findings, _ = check.check(mutated)
+    assert any("[V7]" in f and "set it counts" in f for f in findings), findings
+    assert any("[V7]" in f and "disagrees with its own arm" in f
+               for f in findings), findings
+
+
+def test_checker_fails_when_the_state_value_point_counts_are_missing(log_text):
+    """"42 over 34 Points" loses its denominator silently (#9110 P3)."""
+    for key in ("before_points", "after_points"):
+        mutated = re.sub(rf" {key}=\d+", "", log_text)
+        assert mutated != log_text
+        findings, _ = check.check(mutated)
+        assert any("[V6]" in f and key in f for f in findings), (key, findings)
+    lied = log_text.replace("before_points=34", "before_points=99")
+    findings, _ = check.check(lied)
+    assert any("[V6]" in f and "before_points=99" in f
+               for f in findings), findings
+
+
+def test_checker_fails_when_the_mint_skip_disclosures_are_missing(log_text):
+    """The mint-skip claim is about REFERENCES, not only removed Objects."""
+    for key in ("stripped_references", "statements_left_unreferenced"):
+        mutated = re.sub(rf" {key}=\d+", "", log_text)
+        assert mutated != log_text
+        findings, _ = check.check(mutated)
+        assert any("[V4]" in f and key in f for f in findings), (key, findings)
+    impossible = log_text.replace("statements_left_unreferenced=9",
+                                 "statements_left_unreferenced=11")
+    findings, _ = check.check(impossible)
+    assert any("[V4]" in f and "unreferenced" in f for f in findings), findings
+
+
 # ── 5. the pre-registration binding ───────────────────────────────────────
 
 

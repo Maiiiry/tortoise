@@ -16,6 +16,15 @@ its own ``reduction`` (V10). A reduction borrowed from a counterfactual arm, or 
 state-value table that shrank under a ``PASS``, is therefore a finding rather than
 a pass (#9110 reviews).
 
+The MECHANISM the bundle's finding rests on is checked the same way (V13/V14):
+the scored arm's ``metric=vet`` block must show the gate ENABLED, and its
+``candidates``/``discarded`` counts must be its own ``by_outcome`` table, because
+a gate that never ran also produces 0.0 pp — arithmetic-identical to the result
+this bundle publishes. ``metric=vet-downgrades count=`` is likewise reconciled
+with the ``vet-warning=`` lines that report each downgrade. Both held on the
+committed log when they were added; a future drift in either direction is now a
+finding instead of a differently-worded story (#9110 review P2).
+
 Printing is not enough on its own: every finding below fails the run, because a
 log that omits its denominator is exactly the artifact this epic exists to refuse.
 That includes OMITTING IT ENTIRELY: the disclosure set is REQUIRED (four arms by
@@ -59,6 +68,16 @@ VERDICTS = {"PASS", "FAIL", "UNPREREGISTERED"}
 REQUIRED_ARMS = ("before", "after-vet-shipped", "after-vet-arbiter",
                  "counterfactual-mint-skip")
 LITERALS_LINE = re.compile(r"matches=(?P<matches>\[.*\])$")
+#: ``by_outcome=`` is a JSON object with spaces in it, so it is read with a
+#: DEDICATED pattern: the shared ``KV`` regex stops at the first space and yields
+#: ``{"DISCARD":``, which ``json.loads`` raises on. ``LITERALS_LINE`` beside it is
+#: the same shape for the same reason.
+BY_OUTCOME_LINE = re.compile(r"by_outcome=(?P<by>\{.*?\})\s+mechanical=")
+MECHANICAL_LINE = re.compile(r"mechanical=(?P<mech>\{.*\})\s*$")
+REMOVED_NAMES_LINE = re.compile(r"removed_names=(?P<names>\[.*\])\s+note=")
+#: The marker ``apply_vet`` Rule 2 emits once per downgraded discard. It is the
+#: only place a downgrade is named, so it is what ``vet-downgrades count=`` counts.
+KEPT_MARKER = "kept (Layer-1 referential integrity)"
 
 
 class Log:
@@ -256,12 +275,6 @@ def check(text: str) -> tuple[list[str], dict]:
                             f"but what it would buy is not")
             continue
         kv = log.kv(line)
-        arm_cen = next((ln for ln in log.find(f"arm={arm} metric=real_facts ")), None)
-        arm_cen_kv = log.kv(arm_cen)
-        for key in ("real_facts", "state_values"):
-            if kv.get(key, "").isdigit() and arm_cen_kv.get("count" if key == "real_facts"
-                                                           else "values", "").isdigit():
-                pass  # the two keys are not the same shape; reconciled below
         if (before_arm in shares and arm in shares
                 and kv.get("reduction", "").replace("-", "").replace(".", "").isdigit()):
             expected = shares[before_arm] - shares[arm]
@@ -327,6 +340,99 @@ def check(text: str) -> tuple[list[str], dict]:
 
     # The two E2 criteria carry the anti-gaming control, so each verdict is checked
     # against its own printed counts: a loss may never read as a pass (#9110 P1).
+    # ── V13/V14: the MECHANISM block — the scored arm's gate RAN ──────────
+    # The bundle's central finding is a mechanism: TORTOISE_VET=1 fired on 3
+    # candidates and ``apply_vet`` Rule 2 downgraded all 3, so E1 could not move.
+    # Until this rule existed NO part of the ``metric=vet`` / ``metric=vet-
+    # downgrades`` / ``vet-warning=`` block was read, so the scored arm could print
+    # ``enabled=no``, ``discarded=0`` and no warnings at all and still be called
+    # structurally sound — a gate that never ran produces the same 0.0 pp as one
+    # that ran and could not move, so nothing else in the log shifted (#9110
+    # review P2, measured as five separate accepted mutations).
+    for arm in arms:
+        vet_lines = log.find(f"arm={arm} metric=vet ")
+        if not vet_lines:
+            findings.append(f"[V13] arm {arm} prints no metric=vet line — whether "
+                            f"the gate RAN on this arm is then unstated, and 0.0 pp "
+                            f"from a gate that never ran is indistinguishable from "
+                            f"one that could not move")
+        for ln in vet_lines:
+            kv = log.kv(ln)
+            pass_name = kv.get("pass", "?")
+            enabled = kv.get("enabled", "")
+            mech_m = MECHANICAL_LINE.search(ln)
+            try:
+                mech = json.loads(mech_m.group("mech")) if mech_m else None
+            except json.JSONDecodeError:
+                mech = None
+            if enabled not in ("yes", "no"):
+                findings.append(f"[V13] arm {arm} (pass={pass_name}) does not state "
+                                f"enabled= — the gate's on/off state is not printed")
+            elif enabled == "no" and arm != before_arm:
+                # `no` is legal ONLY on the declared baseline arm: every other arm
+                # is a measurement of the gate, and one with the gate off says
+                # nothing about it.
+                findings.append(
+                    f"[V13] arm {arm} (pass={pass_name}) prints enabled=no — only "
+                    f"the baseline arm ({before_arm}) may run with the gate off; a "
+                    f"scored or counterfactual arm with the gate disabled measures "
+                    f"no mechanism at all")
+            if isinstance(mech, dict) and "enabled" in mech \
+                    and enabled in ("yes", "no") \
+                    and bool(mech["enabled"]) != (enabled == "yes"):
+                findings.append(
+                    f"[V13] arm {arm} (pass={pass_name}) prints enabled={enabled} "
+                    f"beside mechanical enabled={mech['enabled']} — the two "
+                    f"disclosures of the same switch disagree")
+            by_m = BY_OUTCOME_LINE.search(ln)
+            try:
+                by = json.loads(by_m.group("by")) if by_m else None
+            except json.JSONDecodeError:
+                by = None
+            if not isinstance(by, dict) or not all(
+                    isinstance(v, int) and not isinstance(v, bool) for v in by.values()):
+                findings.append(
+                    f"[V13] arm {arm} (pass={pass_name}): by_outcome= is not a JSON "
+                    f"object of integer counts — the outcome table the discard "
+                    f"arithmetic is read from is unreadable")
+                continue
+            cand = kv.get("candidates", "")
+            if not cand.isdigit():
+                findings.append(f"[V13] arm {arm} (pass={pass_name}) does not state "
+                                f"candidates=")
+            elif int(cand) != sum(by.values()):
+                findings.append(
+                    f"[V13] arm {arm} (pass={pass_name}): candidates={cand} is not "
+                    f"the sum of by_outcome= ({sum(by.values())}) — the "
+                    f"candidate count is not its own outcome table")
+            disc = kv.get("discarded", "")
+            if not disc.isdigit():
+                findings.append(f"[V13] arm {arm} (pass={pass_name}) does not state "
+                                f"discarded=")
+            elif int(disc) != by.get("DISCARD", 0):
+                findings.append(
+                    f"[V13] arm {arm} (pass={pass_name}): discarded={disc} is not "
+                    f"the DISCARD outcome count ({by.get('DISCARD', 0)}) — the "
+                    f"number of removals is not the table beside it")
+
+    for arm in arms:
+        line = log.one(f"arm={arm} metric=vet-downgrades ")
+        if line is None:
+            findings.append(f"[V14] arm {arm} prints no metric=vet-downgrades line — "
+                            f"how many of its discards were downgraded to KEEP is "
+                            f"then unstated, which is not the same as none")
+            continue
+        count = log.kv(line).get("count", "")
+        kept = sum(1 for ln in log.find(f"arm={arm} vet-warning=")
+                   if KEPT_MARKER in ln)
+        if not count.isdigit():
+            findings.append(f"[V14] arm {arm}: vet-downgrades does not state count=")
+        elif int(count) != kept:
+            findings.append(
+                f"[V14] arm {arm}: vet-downgrades count={count} but {kept} of its "
+                f"vet-warning= line(s) report a discard downgraded to KEEP — the "
+                f"count is not the set of downgrades it counts")
+
     for tag, name, _metric, _key, kb, ka in criteria_pairs[1:]:
         prefix = "e2-atomic before=" if name == "e2-atomic" else f"{name} "
         crit = log.kv(log.one(prefix))
@@ -360,6 +466,33 @@ def check(text: str) -> tuple[list[str], dict]:
         findings.append("[V4] the mint-skip transform does not state how many "
                         "objects it removed — the counterfactual's denominator is "
                         "unstated, which is not the same as zero")
+    # ── V4 (cont.): the mint-skip's own transform, disclosed not implied ───
+    # `dropped_objects` is the denominator of the counterfactual, but the CLAIM
+    # the transform makes is about REFERENCES: the Object is removed and the
+    # statements it explained are left behind. Those two fields were printed and
+    # never read, so they could be deleted — or disagree with the drop table —
+    # without a finding (#9110 review P3).
+    if mint.get("dropped_objects", "").isdigit():
+        for key in ("stripped_references", "statements_left_unreferenced"):
+            if not mint.get(key, "").isdigit():
+                findings.append(
+                    f"[V4] the mint-skip transform does not state {key}= — the "
+                    f"transform's claim is about references, and an absent field "
+                    f"cannot be read as zero")
+        if mint.get("stripped_references", "").isdigit() and mint.get(
+                "statements_left_unreferenced", "").isdigit():
+            n_refs = int(mint["stripped_references"])
+            n_bare = int(mint["statements_left_unreferenced"])
+            if n_bare > n_refs:
+                findings.append(
+                    f"[V4] the mint-skip transform leaves {n_bare} statement(s) "
+                    f"unreferenced after stripping only {n_refs} reference(s) — a "
+                    f"statement can only lose its last reference by losing one")
+            if n_bare > int(mint["dropped_objects"]):
+                findings.append(
+                    f"[V4] the mint-skip transform leaves {n_bare} statement(s) "
+                    f"unreferenced but drops only {mint['dropped_objects']} "
+                    f"Object(s) — more statements were emptied than objects removed")
     if mint.get("dropped_objects", "").isdigit():
         n_drop = int(mint["dropped_objects"])
         declared = sum(1 for ln in log.find("arm=") if "dropped kind=object" in ln
@@ -383,12 +516,32 @@ def check(text: str) -> tuple[list[str], dict]:
                         f"({control['before_real_facts']} → "
                         f"{control['after_real_facts']})")
 
-    # ── V6: state values, both sides, and every loss with its cause ───────
+    # ── V6: state values, both sides, and every loss with its cause ─────────
     st = log.kv(log.one("e2-state "))
     for key in ("before", "after"):
         if not st.get(key, "").isdigit():
             findings.append(f"[V6] the state-value count is not printed on both "
                             f"sides ({key}= missing)")
+    # `42` is a count of MATCHES over `34` Points (E1-E2.md limit 5), and the
+    # Point count was printed but never required or reconciled — so the sentence
+    # "over 34 Points" could lose its operand with nothing noticing (#9110 review
+    # P3). It reconciles with the same arms `before`/`after` do.
+    for crit_key, arm in (("before_points", before_arm), ("after_points", scored)):
+        printed = st.get(crit_key, "")
+        if not printed.isdigit():
+            findings.append(f"[V6] the e2-state line does not state {crit_key}= — "
+                            f"the value count is then a number of matches with no "
+                            f"denominator of Points")
+            continue
+        arm_value = arm_metric(arm, "state_value_points").get("points", "")
+        if not arm_value.isdigit():
+            findings.append(f"[V6] the e2-state line cannot be reconciled: arm "
+                            f"{arm!r} prints no state_value_points points=")
+        elif int(printed) != int(arm_value):
+            findings.append(
+                f"[V6] the e2-state line's {crit_key}={printed} is not the {arm} "
+                f"arm's state_value_points points={arm_value} — the denominator "
+                f"beside the count is not the arm's")
     for ln in log.lines:
         m = DROP_POINT_LINE.match(ln)
         if not m:
@@ -410,10 +563,36 @@ def check(text: str) -> tuple[list[str], dict]:
     if not log.one("split-implemented=no"):
         findings.append("[V7] the log does not state that SPLIT is unimplemented — "
                         "an atomicity failure could then be read as a pass")
-    for ln in log.find("e2-atomic fused "):
+    fused_rows = log.find("e2-atomic fused ")
+    for ln in fused_rows:
         m = FUSED_LINE.match(ln)
         if not m or m.group("cause") in ("", "n/a", "None"):
             findings.append(f"[V7] a fused Point names no cause: {ln[:120]}")
+    # `fused_after` is a count of the fused Points printed below it, so it equals
+    # them — and the two buckets partition the population, so they sum to it. Both
+    # were unread: `fused_after=0` beside a fused row passed with 0 findings
+    # (#9110 review P3).
+    fused_arm = arm_metric(scored, "atomic_points")
+    if at.get("fused_after", "").isdigit() \
+            and int(at["fused_after"]) != len(fused_rows):
+        findings.append(
+            f"[V7] e2-atomic fused_after={at['fused_after']} but the log prints "
+            f"{len(fused_rows)} `e2-atomic fused` line(s) — the count is not the "
+            f"set it counts")
+    if fused_arm.get("fused", "").isdigit() and at.get("fused_after", "").isdigit() \
+            and int(fused_arm["fused"]) != int(at["fused_after"]):
+        findings.append(
+            f"[V7] e2-atomic fused_after={at['fused_after']} is not the scored "
+            f"arm's atomic_points fused={fused_arm['fused']} — the line disagrees "
+            f"with its own arm")
+    if fused_arm.get("atomic", "").isdigit() and fused_arm.get("fused", "").isdigit():
+        points_total = arm_metric(scored, "real_facts").get("points", "")
+        buckets = int(fused_arm["atomic"]) + int(fused_arm["fused"])
+        if points_total.isdigit() and buckets != int(points_total):
+            findings.append(
+                f"[V7] atomic + fused = {buckets} but the arm has "
+                f"{points_total} Point(s) — the two buckets are supposed to "
+                f"partition the population")
 
     # ── V8: coverage honesty ──────────────────────────────────────────────
     cov = log.kv(log.one("coverage rows="))
@@ -586,6 +765,31 @@ def check(text: str) -> tuple[list[str], dict]:
                     "the_prefix", "share", "removed"):
             if not ctl.get(key):
                 findings.append(f"[V12] the control does not state {key}=")
+        # WHICH Objects the control removed was computed and never printed, so the
+        # discards it exists to show landing could be read only as a COUNT
+        # (#9110 review P3). The names are now the set that count counts — read
+        # with a dedicated pattern, because the shared KV regex stops at the first
+        # space inside a JSON list of names.
+        names_m = REMOVED_NAMES_LINE.search(log.one(
+            "control variant=unreferenced-definite-descriptions ") or "")
+        try:
+            removed_names = json.loads(names_m.group("names")) if names_m else None
+        except json.JSONDecodeError:
+            removed_names = None
+        if removed_names is None:
+            findings.append("[V12] the control does not name what it removed "
+                            "(removed_names=) — the discards it exists to show "
+                            "landing are then a bare count")
+        elif (not isinstance(removed_names, list)
+                or not all(isinstance(n, str) for n in removed_names)):
+            findings.append("[V12] the control's removed_names= is not a list of "
+                            "Object names")
+            removed_names = None
+        if ctl.get("removed", "").isdigit() and removed_names is not None \
+                and len(removed_names) != int(ctl["removed"]):
+            findings.append(
+                f"[V12] the control says it removed {ctl['removed']} Object(s) but "
+                f"names {len(removed_names)} — the count is not the set it counts")
         nums = {k: ctl.get(k, "") for k in
                 ("stripped_objects", "objects", "the_prefix", "removed")}
         if all(v.isdigit() for v in nums.values()):
