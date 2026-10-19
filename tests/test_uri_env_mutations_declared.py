@@ -487,7 +487,6 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # `TortoiseSDK` with a journal-backed fake and pre-builds the projection
     # before `main()` writes the var. Function-scoped `monkeypatch` — auto-undone
     # at teardown, so no lane leaks into a later module.
-    "test_9079_event_writers_journal.py": [r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     # #7017: the engine-probe suite is hermetic — every probe is injected, so
     # the URI's SOLE role is as the input to `graph_target_from_env()`, and the
     # endpoint-resolution tests set/del it precisely to pin which endpoint
