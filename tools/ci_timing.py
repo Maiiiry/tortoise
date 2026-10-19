@@ -44,6 +44,7 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
     )
 
 import argparse
+import ast
 import glob
 import json
 import math
@@ -650,6 +651,17 @@ def declared_test_counts(keys, repo_root: Path) -> dict[str, int]:
       refusal). The conservative direction for a coverage FLOOR is the opposite
       one, and closing it needs pytest's own collection, which this tool cannot
       run offline against the sampled run;
+    * the count is what pytest COLLECTS, not every `def` whose name starts with
+      `test`: a `@pytest.fixture` named `test_tools` or `test_proj` is a
+      FIXTURE, and a nested `def test_inner` inside another test is not
+      collected at all. Counting those broke the floor's other side — measured
+      on the tree as this was written, `tests/test_mcp_telemetry.py` counted 21
+      against 20 collected and `tests/test_pre_migration_safety.py` 14 against
+      13, which makes `observed >= declared` UNSATISFIABLE for those rows and
+      holds them at whatever weight they carry forever, with a witness
+      ("saw 20 of 21") that names a testcase that does not exist. Only
+      module-level `test*` defs and `test*` methods of `Test*` classes count, so
+      the count can only ever be ≤ the collected count;
     * a key the tree does not hold (a file deleted since) is ABSENT from the
       result rather than guessed, and an absent denominator cannot prove
       coverage for that row — UNKNOWN is not "fully covered", so a row it
@@ -660,8 +672,6 @@ def declared_test_counts(keys, repo_root: Path) -> dict[str, int]:
       refuses by rule (#6092 F3, #9134 review);
     * a file that does not parse is absent for the same reason.
     """
-    import ast
-
     root = Path(repo_root) / "tests"
     counts: dict[str, int] = {}
     for key in keys:
@@ -672,12 +682,43 @@ def declared_test_counts(keys, repo_root: Path) -> dict[str, int]:
             tree = ast.parse(candidate.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
-        counts[key] = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test")
-        )
+        counts[key] = _collected_test_count(tree)
     return counts
+
+
+def _is_fixture_decorated(node: object) -> bool:
+    """True when a def carries `@pytest.fixture` (so pytest registers it as a
+    fixture, never as a testcase)."""
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Attribute) and target.attr == "fixture":
+            return True
+        if isinstance(target, ast.Name) and target.id == "fixture":
+            return True
+    return False
+
+
+def _is_test_def(node: object) -> bool:
+    return (
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test")
+        and not _is_fixture_decorated(node)
+    )
+
+
+def _collected_test_count(tree: ast.Module) -> int:
+    """How many testcases pytest collects from a parsed module.
+
+    Module-level `test*` defs plus `test*` methods of `Test*` classes. Fixture-
+    decorated defs and defs nested inside another function are excluded: pytest
+    collects neither, and counting them makes the coverage floor unsatisfiable
+    for the file (the `declared > collected` defect this docstring records).
+    """
+    count = sum(1 for node in tree.body if _is_test_def(node))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            count += sum(1 for sub in node.body if _is_test_def(sub))
+    return count
 
 
 def _duration_line_key(line: str) -> str:
@@ -945,8 +986,11 @@ _PRIOR_BASIS_RE = re.compile(
 # is HELD: the value is still carried forward, so the meaning is RESTATED rather
 # than deleted, which is what clearing the whole tail did to this marker's
 # long-form rows (#9134 review, P2).
-_UNMEASURED_LEAD_RE = re.compile(r"^[ \t]*#[ \t]*unmeasured\b[ \t]*(?:[—–-][ \t]*)?")
-_CARRIED_FORWARD = "carried forward (not a full-file measurement)"
+# groups: 1 = the note's own `# ` prefix, 2 = the marker's separator (if any)
+_UNMEASURED_LEAD_RE = re.compile(
+    r"^([ \t]*#[ \t]*)unmeasured\b[ \t]*([—–-])?[ \t]*"
+)
+_CARRIED_FORWARD = "carried forward (not a full-file CI measurement)"
 
 
 # The `  # ` comment marker a tail opens with, captured so a rewritten note can be
@@ -1019,19 +1063,30 @@ def _strip_stale_basis_claim(tail: str) -> str:
 def _restate_unmeasured_marker(tail: str) -> str:
     """Restate a HELD row's `# unmeasured` marker instead of deleting it.
 
-    A row the guard held keeps a value that is still NOT a measurement of the
-    file, so its marker must not silently vanish (#9134 review, P2): the meaning
-    is rewritten to `carried forward (not a full-file measurement)` and the rest
-    of the note — which says why the row exists — is kept.
+    A row the guard held keeps a value that is still NOT this run's measurement
+    of the file, so its marker must not silently vanish (#9134 review, P2): the
+    marker WORDS are replaced by `carried forward (not a full-file CI
+    measurement)` and everything after them — the note's own reason — is kept
+    VERBATIM, separator included.
+
+    Replacing the words only is the fix for a second defect in the same path
+    (#9134 review, P2): the old code consumed the marker's separator and re-added
+    its own, so a tail that already read `# unmeasured — by the refresher —
+    #2296: …` came out as `… (not a full-file measurement) — by the refresher —
+    #2296: …` with the ORIGINAL dash stranded beside the new one. The phrase also
+    claimed the row was "not a full-file measurement" when its own note says the
+    reading IS the pytest session total; it is the CI-measured full-file reading
+    that is absent, which is what the added `CI` says.
     """
     match = _UNMEASURED_LEAD_RE.match(tail)
     if not match:
         return tail
-    rest = tail[match.end():].strip()
-    prefix_match = _NOTE_PREFIX_RE.match(tail)
-    prefix = prefix_match.group(0) if prefix_match else "  # "
-    return (f"{prefix}{_CARRIED_FORWARD} — {rest}" if rest
-            else f"{prefix}{_CARRIED_FORWARD}")
+    prefix, dash, rest = match.group(1), match.group(2), tail[match.end():]
+    # the marker's OWN separator, re-emitted as it was (never beside a second
+    # one, which is what stranded the original dash); ` — ` only when the
+    # original note ran straight on after the marker word.
+    separator = "" if not rest.strip() else (f" {dash} " if dash else " — ")
+    return f"{prefix}{_CARRIED_FORWARD}{separator}{rest}".rstrip()
 
 
 def _strip_unmeasured_marker(tail: str) -> str:
@@ -1903,6 +1958,46 @@ def paid_vs_selected_cli(args) -> int:
     return 0
 
 
+def aggregate_logs(logs_dir: Path | str) -> dict:
+    """Sum every leg's `pytest-*.log` under `logs_dir` into the artifact's parts.
+
+    Extracted from `main()` so the aggregation is testable — the summary-less-leg
+    defect below was invisible to every test precisely because it lived inline
+    (#9134 review, P2).
+    """
+    files: dict[str, dict] = {}
+    total_counts = {k: 0 for k in COUNT_KEYS}
+    killed_any = False
+    failed_tests: set[str] = set()
+    log_sources: list[dict] = []
+    for log_path in sorted(glob.glob(str(Path(logs_dir) / "**" / "*.log"), recursive=True)):
+        parsed = parse_log(Path(log_path))
+        for fname, entry in parsed["files"].items():
+            acc = files.setdefault(fname, {"tests": 0, "total_ms": 0.0, "max_ms": 0.0})
+            acc["tests"] += entry["tests"]
+            acc["total_ms"] += entry["total_ms"]
+            acc["max_ms"] = max(acc["max_ms"], entry["max_ms"])
+        for k in COUNT_KEYS:
+            total_counts[k] += parsed["counts"][k]
+        # A leg whose log carries no pytest SUMMARY line reports 0 of everything
+        # while its progress lines still name the testcases that failed — the
+        # artifact then shipped `outcome.failed: 5` beside SIX `failed_tests`
+        # entries (one all-zero log source; #9134 review, P2). A truncation is
+        # not an absence of failures, so a summary-less leg contributes what its
+        # progress lines told us — failures only, never passed/skipped, which a
+        # summary-less log cannot establish.
+        if not any(parsed["counts"].values()):
+            for state, key in (("FAILED", "failed"), ("ERROR", "error")):
+                total_counts[key] += sum(
+                    1 for st in parsed["outcomes"].values() if st == state)
+        killed_any = killed_any or parsed["killed"]
+        failed_tests.update(n for n, st in parsed["outcomes"].items() if st in ("FAILED", "ERROR"))
+        log_sources.append({"log": Path(log_path).name, "error": parsed["error"],
+                            "counts": parsed["counts"]})
+    return {"files": files, "total_counts": total_counts, "killed_any": killed_any,
+            "failed_tests": failed_tests, "log_sources": log_sources}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate the CI timing measurement artifact (#1477)")
     ap.add_argument("--repo", required=True, help="owner/repo (used for gh api calls)")
@@ -1989,24 +2084,12 @@ def main() -> int:
             # review round 7).
             print(f"::warning::gh api failed for run {run_id}: {exc}", file=sys.stderr)
 
-    files: dict[str, dict] = {}
-    total_counts = {k: 0 for k in COUNT_KEYS}
-    killed_any = False
-    failed_tests: set[str] = set()
-    log_sources: list[dict] = []
-    for log_path in sorted(glob.glob(str(Path(args.logs_dir) / "**" / "*.log"), recursive=True)):
-        parsed = parse_log(Path(log_path))
-        for fname, entry in parsed["files"].items():
-            acc = files.setdefault(fname, {"tests": 0, "total_ms": 0.0, "max_ms": 0.0})
-            acc["tests"] += entry["tests"]
-            acc["total_ms"] += entry["total_ms"]
-            acc["max_ms"] = max(acc["max_ms"], entry["max_ms"])
-        for k in COUNT_KEYS:
-            total_counts[k] += parsed["counts"][k]
-        killed_any = killed_any or parsed["killed"]
-        failed_tests.update(n for n, st in parsed["outcomes"].items() if st in ("FAILED", "ERROR"))
-        log_sources.append({"log": Path(log_path).name, "error": parsed["error"],
-                            "counts": parsed["counts"]})
+    aggregated = aggregate_logs(args.logs_dir)
+    files = aggregated["files"]
+    total_counts = aggregated["total_counts"]
+    killed_any = aggregated["killed_any"]
+    failed_tests = aggregated["failed_tests"]
+    log_sources = aggregated["log_sources"]
 
     now = (os.environ.get("CI_TIMING_NOW")
            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))  # noqa: UP017

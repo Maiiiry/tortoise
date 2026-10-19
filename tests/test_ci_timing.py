@@ -1185,6 +1185,58 @@ def test_a_dated_refresh_claim_inside_a_rationale_loses_only_that_clause() -> No
     assert yaml.safe_load(text)["durations"]["test_rationale.py"] == 5.6
 
 
+def test_a_summary_less_leg_still_counts_its_failures(tmp_path: Path) -> None:
+    """`outcome.failed` must not be smaller than `failed_tests`.
+
+    The shipped artifact read `failed: 5` beside SIX `failed_tests` entries: one
+    leg's log had been truncated before pytest's summary line, so it reported 0
+    of everything while its progress lines named a failure. The two fields are
+    the same event counted twice, so a truncation must not make them disagree
+    (#9134 review, P2).
+
+    Non-vacuity: pre-fix `total_counts["failed"]` is 1 while `failed_tests` has
+    3 entries.
+    """
+    (tmp_path / "pytest-a.log").write_text(
+        "FAILED tests/test_a.py::test_1 - AssertionError\n"
+        "= 10 passed, 1 failed in 3.00s =\n")
+    (tmp_path / "pytest-b.log").write_text(
+        "FAILED tests/test_b.py::test_2 - AssertionError\n"
+        "FAILED tests/test_b.py::test_3 - AssertionError\n")
+
+    agg = ci_timing.aggregate_logs(tmp_path)
+
+    assert len(agg["failed_tests"]) == 3
+    assert agg["total_counts"]["failed"] == 3, agg["total_counts"]
+    # a summary-less leg can only report what it saw fail — never passes.
+    assert agg["total_counts"]["passed"] == 10, agg["total_counts"]
+
+
+def test_a_held_row_does_not_strand_the_markers_own_separator() -> None:
+    """The restated marker must replace the WORDS only.
+
+    The map's `test_2296_document_created_journal.py` row was originally written
+    `# unmeasured — by the refresher — #2296: …`. The old restatement consumed
+    the marker's dash and re-added its own, so the row came out as
+    `… (not a full-file measurement) — by the refresher — #2296: …` — one
+    dangling fragment and a doubled dash (#9134 review, P2). The phrase was also
+    false for that row: it says the reading IS the pytest session total, i.e. a
+    full-file measurement; what is missing is the CI-measured one.
+
+    Non-vacuity: pre-fix this asserts nothing (the separator is stranded).
+    """
+    from tools.ci_timing import _restate_unmeasured_marker
+
+    restated = _restate_unmeasured_marker(
+        "  # unmeasured — by the refresher — #2296: WHAT THE NUMBER IS: the "
+        "pytest session total, NOT what the refresher computes.")
+    assert restated == (
+        "  # carried forward (not a full-file CI measurement) — by the "
+        "refresher — #2296: WHAT THE NUMBER IS: the pytest session total, NOT "
+        "what the refresher computes."), restated
+    assert restated.count("—") == 2, restated
+
+
 def test_a_held_row_restates_an_unmeasured_marker_and_keeps_the_rationale() -> None:
     """A HELD row's value is still carried forward, so its `# unmeasured` meaning
     must survive in a form that is true — restated, not deleted with the rationale
@@ -1208,7 +1260,7 @@ def test_a_held_row_restates_an_unmeasured_marker_and_keeps_the_rationale() -> N
     row = next(ln for ln in text.split("\n")
                if ln.strip().startswith("test_journal.py:"))
     assert "WHAT THE NUMBER IS" in row
-    assert "carried forward (not a full-file measurement)" in row
+    assert "carried forward (not a full-file CI measurement)" in row
     # the stale marker token itself must not survive as the leading tail token:
     # the artifact measured this file, so `# unmeasured` would be a false claim.
     assert not re.match(r"[ \t]*#\s*unmeasured\b", row.split("#", 1)[1]

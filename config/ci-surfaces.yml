@@ -5419,7 +5419,7 @@ durations:
 # Coverage rests on measurement: every row below is a measured value except the
 # pinned row (test_mcp_rename_table.py, held equal to its measured sibling), the
 # RETAINED row (test_selfhost_health_probe_executor.py), and any row marked
-# `# unmeasured` or `# carried forward (not a full-file measurement)` (a file no
+# `# unmeasured` or `# carried forward (not a full-file CI measurement)` (a file no
 # source leg collected in full, whose value is carried forward and is not a
 # measurement of the file).
 #
@@ -5605,7 +5605,7 @@ durations:
   test_graph_diagnostics.py: 25.9  # #9017 CI-junit 2026-10-18 (run 39165691659); was 7.6 — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 3 testcases = 17.4s, a LOWER bound; kept 25.9
   eval/write_path/test_write_path_runner.py: 146.2  # #9017 CI-junit 2026-10-18 (run 39165691659); was 135.8 — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 3 of 32 testcases = 133.0s, a LOWER bound; kept 146.2
   test_unjournaled_mutation_class.py: 4.9  # #9017 CI-junit 2026-10-18 (run 39165691659); was 7.0
-  test_2296_document_created_journal.py: 27.0  # carried forward (not a full-file measurement) — by the refresher — #2296: a file ADDED BY A PR can never have a CI duration at PR time (`tools/ci_timing.py --refresh-durations` samples push-to-main runs only). Measured on this host 2026-10-14 on a private `tools/test_lane.py` docker container reached via TORTOISE_DB_URI: pytest session total 26.49s (that reading was the file's original 7 tests; the file now collects 8 and a later re-measure on a loaded host read 24.9s). WHAT THE NUMBER IS: the pytest session total, NOT what the refresher computes — it reads the TEXTUAL `--durations=15` block out of the CI log, so a CI reading is a LOWER bound. Refresh from the first post-merge push run that includes it. — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 10 testcases = 6.1s, a LOWER bound; kept 27.0
+  test_2296_document_created_journal.py: 27.0  # carried forward (not a full-file CI measurement) — by the refresher — #2296: a file ADDED BY A PR can never have a CI duration at PR time (`tools/ci_timing.py --refresh-durations` samples push-to-main runs only). Measured on this host 2026-10-14 on a private `tools/test_lane.py` docker container reached via TORTOISE_DB_URI: pytest session total 26.49s (that reading was the file's original 7 tests; the file now collects 8 and a later re-measure on a loaded host read 24.9s). WHAT THE NUMBER IS: the pytest session total, NOT what the refresher computes — it reads the TEXTUAL `--durations=15` block out of the CI log, so a CI reading is a LOWER bound. Refresh from the first post-merge push run that includes it. — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 10 testcases = 6.1s, a LOWER bound; kept 27.0
   test_3311_multilabel_status_vocab.py: 2.5  # #9017 CI-junit 2026-10-18 (run 39165691659); was 5.3
   test_url_keyed_source_write_4649.py: 170.0  # unmeasured — #4649: locally measured (23 tests, live FalkorDB on a spare container; 169.5s wall for the whole file). Needed here rather than left to the sweep because tools/ci_timing.py --refresh-durations samples push-to-main runs only, so a file ADDED BY A PR can never have a measured duration at PR time — the >=90% coverage floor (#2876) fails by construction for any test-adding PR. Refresh from CI junit once this file has run on main.
   test_e2e_wrangler_prewarm.py: 15.9  # #8743/#8816: locally measured on this host. WHAT THE FILE IS NOW (24 test functions, 25 executions): 23 in-memory plus ONE function parametrized over both `from_repo_root` values, which EXECUTES `website/apps/dashboard/deploy.sh` against a scratch tree with stubbed npm/npx (no DB, no fixture). Of the 23 in-memory arms, 5 exercise the guard's own helpers on literal text or hand-built documents (so "each reads the workflow files" was not true of them); the other 18 read a repo file — of the 15 that read the workflow/action files, 11 parse them by `yaml.safe_load` and 4 scan their text, 2 read `website/README.md`, and 2 read `deploy.sh`, one of which also scans a workflow. WHERE THE TIME GOES: the parsing arms, NOT the shared conftest import — nearly every arm re-globs and re-parses all 36 files (32 workflows + the 4 composite actions) (ci.yml and deploy-pages.yml are large). MEASURED at the #8874 head: session totals 11.4 s on an idle host, 18.9 s cold, and 15.9 s on a loaded one where `--durations=0` attributes call 12.8 s / setup 4.3 s / slowest single call 1.2 s. 15.9 is committed as the weight; the 4.0 this row used to carry was about a third of the measured session, and its "the conftest import dominates" sentence was wrong in the other direction. PR #8852 review: the note said 11 before that, which was wrong even for the 12-arm file it described. Hand-added for the same reason the test_8474_ontology_record.py entry below gives: `tools/ci_timing.py --refresh-durations` samples push-to-main runs only, so a file ADDED BY A PR can never have a measured duration at PR time and the >=90% coverage floor (#2876) fails by construction for any test-adding PR. Refresh from the first post-merge run that includes it.
@@ -6548,7 +6548,7 @@ durations:
   test_verbatim_span.py: 0.5  # unmeasured
   test_ops_safety.py: 16.8  # unmeasured
   test_org_graph_open_tripwire.py: 4.3  # ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 13 testcases = 3.6s, a LOWER bound; kept 4.3
-  test_backup_e2e.py: 13.1  # carried forward (not a full-file measurement) — ci-timing top-15 2026-10-19 (run 39191149586): a single-test file cannot prove full coverage from a top-15 projection; the reading (4.8s) is a LOWER bound; kept 13.1
+  test_backup_e2e.py: 13.1  # carried forward (not a full-file CI measurement) — ci-timing top-15 2026-10-19 (run 39191149586): a single-test file cannot prove full coverage from a top-15 projection; the reading (4.8s) is a LOWER bound; kept 13.1
   test_embedded_lifecycle_fast_close.py: 9.1  # unmeasured
   # #5011: 64 tests, docker lane — one full fold+graph-diff per assertion, nine of
   # them rebuild_all a journal, so the shared test container + the session-hygiene
@@ -6590,7 +6590,7 @@ durations:
   test_flip_gate.py: 6.7  # unmeasured
   test_fork_safety_3845.py: 11.3
   test_fork_slot_wedge_3845.py: 2.1  # unmeasured
-  test_graph_integrity_gate.py: 9.2  # carried forward (not a full-file measurement) — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 87 testcases = 2.9s, a LOWER bound; kept 9.2
+  test_graph_integrity_gate.py: 9.2  # carried forward (not a full-file CI measurement) — ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 87 testcases = 2.9s, a LOWER bound; kept 9.2
   test_graphcopy_boolean_index_3154.py: 11.9  # ci-timing top-15 2026-10-19 (run 39191149586); was 0.8
   test_guard.py: 32.0  # ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 15 testcases = 9.4s, a LOWER bound; kept 32.0
   test_hard_reject.py: 0.7  # unmeasured

@@ -67,13 +67,20 @@ CANONICAL_DOC = REPO / CANONICAL_DOC_REL
 # journal — the opposite of this doc's rule ("durability = the store's own
 # persistence plus an off-box copy of it. Nothing else."; the JSONL "is never the
 # durability mechanism"). Durability is now a SUBJECT-ATTRIBUTION predicate, so
-# the same claim cannot come back in a different wording.
+# the same claim cannot come back in a different wording. The determiner slot is
+# a SLOT, not the literal `the`: `the journal is A durable record` and `the event
+# log is ITS durability mechanism` are the same claim, and pinning `(?:the )?`
+# made the gate see only the one reword that happened to be reviewed. Measured
+# over all 304 scanned files: no false positives (nothing in the tree attributes
+# durability to the log in any determiner form).
 _SUBJECT = r"(?:event log|journal|jsonl|\blog\b|event stream)"
+# any possessive/indefinite determiner, or none
+_DURAB_DET = r"(?:the |a |an |our |its |their |your )?"
 CLAIM_RE = re.compile(
     rf"{_SUBJECT}.{{0,40}}source of truth"
     rf"|source of truth.{{0,40}}(?:durab|{_SUBJECT})"
     rf"|{_SUBJECT}.{{0,40}}is (?:the )?truth"
-    rf"|{_SUBJECT}.{{0,40}}is (?:the )?durab(?:le|ility)",
+    rf"|{_SUBJECT}.{{0,40}}is {_DURAB_DET}durab(?:le|ility)",
     re.IGNORECASE,
 )
 
@@ -90,7 +97,7 @@ CLAIM_RE = re.compile(
 # positives — measured, not assumed.
 WRAPPED_CLAIM_RE = re.compile(
     rf"{_SUBJECT}.{{0,40}}is (?:the )?truth"
-    rf"|{_SUBJECT}.{{0,40}}is (?:the )?durab(?:le|ility)",
+    rf"|{_SUBJECT}.{{0,40}}is {_DURAB_DET}durab(?:le|ility)",
     re.IGNORECASE,
 )
 
@@ -396,6 +403,11 @@ def test_claim_regex_matches_the_original_defect_forms():
         # The first one is the exact reword that greened a real red.
         "the journal is the durable record",
         "the event log is the durability mechanism",
+        # the DETERMINER slot, not just `the`: a reword that swaps the article
+        # is the same claim, and pinning `(?:the )?` saw only the reviewed one.
+        "the journal is a durable record",
+        "the journal is our durable record",
+        "the event log is its durability mechanism",
         # `_SUBJECT` includes a bare `log`, so this is DELIBERATELY a hit: it
         # attributes durability to the log, which the canonical doc denies.
         "the log is durable",
