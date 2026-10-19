@@ -3350,8 +3350,13 @@ def _journal_safe_params(params, cypher=None):
 # needs statement recovery (#9124); the private hop `proj.g._g.delete()` (the
 # `delete()` analogue of escape (2) above — no wrapper can guard a hop below
 # itself); and the handle's other non-Cypher verbs (`copy`, index/constraint
-# DDL, `call_procedure`) — none of which destroys this cache, so refusing them
-# would be a refusal of something the cache never lost.
+# DDL) — none of which destroys this cache, so refusing them would be a refusal
+# of something the cache never lost. `call_procedure` is NOT in that list: it
+# pastes a caller-controlled string into CYPHER position, so it is now defined
+# on the wrapper and its reconstructed statement goes through L2
+# (`_is_bulk_wipe`) exactly as `query`'s does — §17.1's statement door for it is
+# #9124's, stated as open here (on an EMBEDDED armed projection it can still
+# wipe, exactly as `proj.g.query` can, because L2 exempts embedded mode).
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3480,8 +3485,10 @@ def _graph_metadata_write_scope(reason: str = "graph-metadata"):
 #: no graph name, and ``_guard_execute_command`` forwards every non-``GRAPH``
 #: command untouched — so an armed projection could lose its cache to a bare
 #: ``proj.g.execute_command("FLUSHALL")``. The module's own maxmemory message
-#: already tells an operator "do NOT FLUSHALL" (:8230); this is that advice
-#: ENFORCED at the handle, and NO declared scope authorizes them
+#: already tells an operator "do NOT FLUSHALL" — the DB-refused-writes
+#: maxmemory message in `FalkorProjection._write_refusal_message`, cited by NAME
+#: because the line number was wrong twice in this change's own review; this is
+#: that advice ENFORCED at the handle, and NO declared scope authorizes them
 #: (``_SERVER_WIDE_COMMANDS``): a declaration says "this write is a projection
 #: of the journal", and a flush also removes graphs this projection never wrote
 #: and cannot rebuild.
@@ -3552,6 +3559,35 @@ def _handle_command_words(args) -> tuple[str | None, tuple[str, ...]]:
     return words[0].upper(), rest
 
 
+def _call_procedure_statement(procedure, args=None, emit=None) -> str | None:
+    """The statement ``Graph.call_procedure`` will build, or ``None``.
+
+    Mirrors the pinned vendor EXACTLY, including the part that is easy to get
+    wrong: ``args`` are converted to ``$paramN`` PLACEHOLDERS and passed as
+    ``params`` — the vendor's own comment is *"CALL <proc>(1) -> CYPHER
+    param_0=1 CALL <proc>($param_0)"* — so an argument VALUE never reaches the
+    wire statement. Rendering the values here instead would classify a
+    statement the vendor does not send, and it cuts BOTH ways: an arg whose text
+    carries a scoping construct would exempt a real wipe, and a read whose arg
+    merely contains ``DETACH DELETE`` would be refused (verified in review).
+    Only ``procedure`` — and ``emit`` — sit in CYPHER position, which is why
+    they are the caller-controlled surface this guard exists for: on an armed
+    projection,
+    ``proj.g.call_procedure("db.labels() MATCH (n) DETACH DELETE n //", False)``
+    emptied the graph while the same DETACH DELETE through ``proj.g.query`` was
+    refused by L2 on the same non-test graph.
+    """
+    text = _handle_command_text(procedure)
+    if text is None:
+        return None
+    proc_args = args if isinstance(args, (list, tuple)) else ()
+    placeholders = ",".join(f"$param{index}" for index in range(len(proc_args)))
+    statement = f"CALL {text}({placeholders})"
+    if emit is not None and len(emit) > 0:
+        statement += f"YIELD {','.join(str(word) for word in emit)}"
+    return statement
+
+
 class _GuardedGraph:
     """Wrapper around the FalkorDB Graph handle that guards bulk graph-wipe queries.
 
@@ -3595,14 +3631,21 @@ class _GuardedGraph:
 
     #9209 — the handle's NON-CYPHER door. ``__getattr__`` forwards the
     remaining attributes (``name``, ``schema``, ``copy``, ...) to the
-    underlying handle, and the one forwarded verb that destroys the graph
-    (``delete`` → ``GRAPH.DELETE``) is now DEFINED HERE instead, plus the same
-    command — and the server-wide ``FLUSHALL`` / ``FLUSHDB`` — refused on the
-    raw command channel: a forwarded attribute is unreachable by any
-    verb-level guard by construction, and a command that carries no statement
-    is unreachable by a statement classifier. All of them are refused on a
-    journal-backed projection unless a declared write scope is in flight, and
-    even then L2 still refuses a non-test server graph.
+    underlying handle, and the two forwarded verbs that can destroy the graph
+    are now DEFINED HERE instead: ``delete`` (``GRAPH.DELETE``) and
+    ``call_procedure`` (whose caller-controlled procedure string is CYPHER
+    position — see its docstring). The raw command channel additionally refuses
+    ``GRAPH.DELETE`` and the server-wide ``FLUSHALL`` / ``FLUSHDB``. A
+    forwarded attribute is unreachable by any verb-level guard by construction,
+    and a command that carries no statement is unreachable by a statement
+    classifier.
+
+    ⛔ TWO POLARITIES, stated apart because they are deliberately different:
+    ``GRAPH.DELETE`` is refused on a journal-backed projection unless a declared
+    write scope is in flight, and inside one L2 still refuses a non-test server
+    graph; ``FLUSHALL`` / ``FLUSHDB`` are refused on ANY journal-backed
+    projection, scope or not — no declaration can claim the graphs they take
+    were written through this journal.
     """
 
     __slots__ = ("_g", "_proj")
@@ -3739,6 +3782,38 @@ class _GuardedGraph:
             "GRAPH.DELETE", getattr(self._g, "name", None)
         )
         return self._g.delete(*args, **kwargs)
+
+    def call_procedure(self, procedure, read_only=True, args=None, emit=None):
+        """A procedure call — L2 reads the statement the vendor will build.
+
+        #9209 round 3: the vendor pastes the caller's ``procedure`` string into
+        ``CALL <procedure>(<args>)`` and sends that through ``_query``, so this
+        forwarded attribute was a CYPHER channel no verb-level guard on this
+        wrapper could see. MEASURED before this method existed, on an armed
+        projection: ``proj.g.call_procedure("db.labels() MATCH (n) DETACH DELETE
+        n //", False)`` emptied the graph, while the same DETACH DELETE through
+        ``proj.g.query`` was refused by L2 on the same non-test graph. So it is
+        DEFINED here and the reconstructed statement goes through the same
+        ``_is_bulk_wipe`` → L2 check ``query`` applies — no more, and no less.
+
+        ⛔ NOT claimed closed by #9209: §17.1's STATEMENT door for procedures —
+        a mutating procedure on an armed projection outside a declared scope.
+        That is #9124's statement-recovery work, exactly as it is for every
+        other Cypher-bearing verb on this handle, and it is why this method
+        applies L2 and no more. Stated exactly, because the difference is a
+        live hole and not a rounding error: on an EMBEDDED armed projection
+        this verb can still wipe the cache, because L2 exempts embedded mode —
+        the same exemption `proj.g.query("MATCH (n) DETACH DELETE n")` gets
+        today, and the same one #9124 removes for every statement-bearing verb.
+        """
+        statement = _call_procedure_statement(procedure, args=args, emit=emit)
+        if statement is not None and _is_bulk_wipe(statement):
+            self._proj._assert_test_graph(
+                "REFUSING to run bulk DETACH DELETE on non-test graph"
+            )
+        return self._g.call_procedure(
+            procedure, read_only=read_only, args=args, emit=emit
+        )
 
     def _refuse_unauthorized_graph_wipe(self, command: str,
                                        target: str | None = None) -> None:

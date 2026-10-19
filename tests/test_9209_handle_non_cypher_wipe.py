@@ -412,6 +412,79 @@ def test_a_destructive_command_naming_another_graph_is_refused():
     )
 
 
+def test_a_bulk_wipe_hidden_in_a_procedure_call_is_refused():
+    """Round 3 finding, now a pin: `call_procedure` pastes caller text into CYPHER.
+
+    The vendor builds ``CALL <procedure>(<args>)`` and sends it through
+    ``_query``, so ``proj.g.call_procedure`` was a forwarded attribute that no
+    verb-level guard could see — MEASURED before the fix, on an armed
+    projection: ``call_procedure("db.labels() MATCH (n) DETACH DELETE n //",
+    False)`` emptied the graph while ``proj.g.query`` refused the same DETACH
+    DELETE on the same non-test graph. `_GuardedGraph.call_procedure` is now
+    defined and runs the statement through the same L2 classifier `query` uses.
+
+    MUTATION: remove `call_procedure` from `_GuardedGraph` (back to a forwarded
+    attribute) and this fails — the vendor call is dispatched instead of raising.
+    """
+    proj = _armed_projection(graph_name="prod_tortoise", embedded=False)
+    guarded = _GuardedGraph(proj.g, proj)
+
+    with pytest.raises(RuntimeError, match="non-test graph"):
+        guarded.call_procedure(
+            "db.labels() MATCH (n) DETACH DELETE n //", read_only=False
+        )
+
+    assert proj.g.calls == [], f"the wipe was dispatched: {proj.g.calls!r}"
+
+
+def test_arguments_cannot_exempt_or_invent_a_wipe():
+    """The classified statement must be the one the VENDOR sends.
+
+    The vendor turns ``args`` into ``$paramN`` placeholders and passes the
+    values as ``params``, so an argument VALUE is never in the wire statement.
+    Rendering the values into the classified text instead — the first version of
+    this guard did — is wrong in BOTH directions, and a verifier measured both:
+    an arg carrying a scoping construct made `_is_bulk_wipe` read False while the
+    vendor still sent the wipe, and a read-only call whose ARG merely contained
+    ``DETACH DELETE`` was refused. The wipe is in the ``procedure`` text, so that
+    is what must be classified.
+    """
+    proj = _armed_projection(graph_name="prod_tortoise", embedded=False)
+    guarded = _GuardedGraph(proj.g, proj)
+
+    # (a) an argument whose text LOOKS scoping must not exempt the real wipe
+    with pytest.raises(RuntimeError, match="non-test graph"):
+        guarded.call_procedure(
+            "db.labels() MATCH (n) DETACH DELETE n //",
+            read_only=False,
+            args=["\nMATCH (n:Foo) RETURN n"],
+        )
+    assert proj.g.calls == [], f"the wipe was dispatched: {proj.g.calls!r}"
+
+    # (b) an argument VALUE containing the delete verb must not over-refuse a
+    proj.g.calls = []
+    proj.g.call_procedure = lambda *a, **k: "OK"
+    assert guarded.call_procedure(
+        "db.idx.fulltext.queryNodes",
+        read_only=True,
+        args=["index_name", "MATCH (n) DETACH DELETE n"],
+    ) == "OK", "a read-only call was refused for text in an ARGUMENT value"
+
+
+def test_a_read_only_procedure_call_still_passes(sdk_with_journal):
+    """The no-over-refusal half: L2 must not become a wall around procedures.
+
+    ``db.labels()`` is a read. A guard that refused procedure calls wholesale
+    would pass the wipe test above and break every diagnostic that uses one.
+    """
+    proj = sdk_with_journal._get_proj()
+
+    labels = proj.g.call_procedure("db.labels", read_only=True).result_set
+
+    assert labels, "the procedure call returned nothing — it did not reach the graph"
+    assert ["Subject"] in labels
+
+
 def test_delete_judges_the_handles_own_graph_not_the_projections():
     """Review finding, now a pin: `delete()` must name the graph it REMOVES.
 
@@ -510,16 +583,22 @@ for _kind in ("node", "edge"):
         _NON_DESTRUCTIVE_FORWARDED[f"drop_{_kind}_{_op}_constraint"] = "schema DDL"
 
 #: Verbs the wrapper defines itself. `delete` is here BECAUSE OF #9209 — it is
-#: the destructive one, and defining it is what closes the forwarding hole.
+#: the destructive one, and defining it is what closes the forwarding hole —
+#: and `call_procedure` joined it in round 3: the vendor pastes the caller's
+#: procedure string into CYPHER position, so a forwarded attribute was a write
+#: channel no verb-level guard could see.
 _GUARDED_ON_THE_WRAPPER = frozenset(
-    {"query", "ro_query", "_query", "profile", "explain", "execute_command", "delete"}
+    {"query", "ro_query", "_query", "profile", "explain", "execute_command",
+     "delete", "call_procedure"}
 )
 
 #: Statement-bearing channels that are NOT this suite's: they carry Cypher, so
 #: §17.1's statement recovery (#9124) owns them. Declared, not silently ignored.
-_STATEMENT_BEARING_NOT_CLOSED_HERE = {
-    "call_procedure": "issues `CALL <proc>` through the inner handle (#9124)",
-}
+#: EMPTY since #9209's round 3 — `call_procedure` was the only entry and it is
+#: now DEFINED on the wrapper (its reconstructed statement goes through L2), so
+#: it moved to `_GUARDED_ON_THE_WRAPPER`. Kept as a named bucket so the next
+#: statement-bearing forward has a place to be declared instead of forgotten.
+_STATEMENT_BEARING_NOT_CLOSED_HERE: dict[str, str] = {}
 
 
 def test_every_handle_verb_is_classified(sdk_with_journal):
