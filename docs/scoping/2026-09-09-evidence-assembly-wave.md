@@ -75,7 +75,11 @@ assembly:
    (keep the point + ONE verbatim source ref), so one fact occupies one slot.
 2. Cross-item near-dupe dedup (embedding/similarity or shared-anchor overlap)
    before the window fill.
-3. Order: exact-value/verbatim-marked items first; recency tiebreak.
+3. Order: D3 hit-type tiers — distilled statement Points first, then verbatim
+   source turn Points, then raw chunks; the #1763/#1945 exact-value/verbatim
+   mark (then relevance, recency as its upstream tiebreak) orders WITHIN a
+   tier (#9092 replaced the earlier value-mark-only tiers, where a raw chunk
+   tied with an exact-value statement and could lead it).
 The consumer (any downstream model) receives a deduped, tight, ordered package.
 Measurement: same reader/judge/slice → the 2 flooding regressions should recover;
 the burial class should not regress further. ~40-min cached cycle after a

@@ -21,8 +21,9 @@ Design contract under test (docs/scoping/2026-09-09-evidence-assembly-wave.md
   * (b) cross-item near-dupe dedup — two statements restating the SAME
         fact (exact / ≥0.9 near-verbatim content, or same source turn +
         overlapping quotes) dedupe to one slot BEFORE the window fill,
-  * (c) ordering — exact-value/verbatim-marked packages first, relevance
-        (pool order) preserved within a tier,
+  * (c) ordering — D3 hit-type tiers: statement Points first, then verbatim
+        source turn Points, then raw chunks; the #1763/#1945 value mark (and
+        relevance / pool order) is preserved WITHIN a tier,
   * (d) OFF parity — the eval retrieval seam adds the arm as a tri-state
         kwarg defaulting to None (env-gated fail-safe OFF) and the ask
         lane defaults the knob OFF; the OFF path never invokes packaging
@@ -332,12 +333,18 @@ def test_standalone_duplicate_chunk_content_dedups_to_container():
     assert stats["collapsed_duplicates"] == 1
 
 
-# ── (c) ordering: value/verbatim-marked packages first ────────────────────
+# ── (c) ordering: D3 hit-type tiers, value mark inside a tier ────────────
+#
+# Epic #2281 D3: STATEMENT Points lead, then verbatim source TURN Points, then
+# raw chunks. The #1763/#1945 value mark does NOT pick the tier — it breaks
+# ties INSIDE one (so an exact-value statement still leads its unmarked
+# peers, and a `raw_chunk`-marked chunk keeps leading its FELLOW CHUNKS
+# without ever being lifted over a distilled statement).
 
 def test_verbatim_marked_point_leads_window_over_higher_ranked_unmarked():
     """A verbatim-marked point ranks into the window FIRST even when it sits
     BELOW an unmarked point in pool order (the #1763/#1945 precise classes
-    lead; relevance order preserved within each tier)."""
+    lead INSIDE the statement tier; relevance order preserved within a tier)."""
     pool = [
         _point("pt:unmarked", "some unrelated filler about cooking pasta"),
         _point("pt:verbatim", "I bought the tea set from cousin Rachel for "
@@ -365,9 +372,13 @@ def test_answer_string_class_orders_within_marked_tier():
         "pt:low-verbatim", "pt:answer", "pt:unmarked"]
 
 
-def test_source_chunk_mark_orders_chunk_above_unmarked_point():
-    """A raw-chunk-marked package leads the window (the eval marks raw
-    chunks with ``raw_chunk`` — the #1945 precise source class)."""
+def test_raw_chunk_mark_does_not_lift_a_chunk_over_a_statement():
+    """RE-PINNED from ``test_source_chunk_mark_orders_chunk_above_unmarked_point``
+    (D3, #9092). The eval marks raw chunks with ``raw_chunk``; that mark used
+    to put the chunk in the SAME value tier as an exact-value statement, so a
+    ``raw_chunk``-marked chunk arriving at a better pool rank LED the reader
+    window over a distilled statement. Under D3 the mark only orders chunks
+    among themselves — the statement leads regardless of rank."""
     pool = [
         _point("pt:1", "unrelated filler"),
         _chunk("lme:0:c9", ["User: I bought the tea set from cousin "
@@ -375,7 +386,65 @@ def test_source_chunk_mark_orders_chunk_above_unmarked_point():
     ]
     packaged, _ = package_evidence_pool(
         pool, mark_for=_marks_for(raw_chunk={"lme:0:c9"}))
-    assert [h["id"] for h in packaged] == ["lme:0:c9", "pt:1"]
+    assert [h["id"] for h in packaged] == ["pt:1", "lme:0:c9"]
+
+
+def test_statement_leads_over_raw_chunk_marked_chunk_at_better_pool_rank():
+    """D3 (#9092): a distilled statement package leads a ``raw_chunk``-marked
+    chunk that arrived at a BETTER pool rank (0 vs 1). The mark is a
+    within-tier tiebreak, never a tier of its own — this is the exact defect
+    the #1945 value-tier set caused by carrying ``raw_chunk`` alongside
+    ``answer_string``/``verbatim``."""
+    pool = [
+        _chunk("lme:0:c1", ["User: I bought the tea set from cousin "
+                             "Rachel for 300 dollars"]),
+        _point("pt:1", "the tea set from cousin Rachel cost 300 dollars"),
+    ]
+    packaged, _ = package_evidence_pool(
+        pool, mark_for=_marks_for(raw_chunk={"lme:0:c1"}))
+    assert [h["id"] for h in packaged] == ["pt:1", "lme:0:c1"]
+
+
+def test_turn_point_orders_between_statement_and_raw_chunk():
+    """D3 (#9092): the three tiers, all in one pool with the WORST hit type
+    at the BEST rank — statement (rank 2) then turn Point (rank 1) then raw
+    chunk (rank 0). Rank must not cross a tier boundary."""
+    pool = [
+        _chunk("lme:0:c1", ["User: the garden fence needs repainting "
+                             "before the winter"]),
+        _turn("lme:0:t3", "user", "my sister borrowed the blue ladder"),
+        _point("pt:1", "the road bike repairs cost 300 dollars"),
+    ]
+    packaged, _ = package_evidence_pool(
+        pool, mark_for=_marks_for(raw_chunk={"lme:0:c1"}))
+    assert [h["id"] for h in packaged] == ["pt:1", "lme:0:t3", "lme:0:c1"]
+
+
+def test_value_mark_does_not_lift_a_turn_point_to_the_statement_tier():
+    """D3 (#9092): a turn Point carrying the ``verbatim`` value mark stays in
+    the MIDDLE tier — the mark does not raise it over an unmarked distilled
+    statement (D3: turn Points are the middle tier, full stop)."""
+    pool = [
+        _turn("lme:0:t3", "user", "the tea set cost 300 dollars"),
+        _point("pt:1", "filler about the garden fence"),
+    ]
+    packaged, _ = package_evidence_pool(
+        pool, mark_for=_marks_for(verbatim={"lme:0:t3"}))
+    assert [h["id"] for h in packaged] == ["pt:1", "lme:0:t3"]
+
+
+def test_raw_chunk_mark_still_orders_chunks_among_themselves():
+    """D3 (#9092): the ``raw_chunk`` mark keeps its #1945 meaning WITHIN the
+    chunk tier — a marked chunk leads unmarked chunks even from a worse pool
+    rank (the mark is demoted, never discarded)."""
+    pool = [
+        _chunk("lme:0:c1", ["User: the garden fence needs repainting"]),
+        _chunk("lme:0:c2", ["User: I bought the tea set from cousin "
+                             "Rachel for 300 dollars"]),
+    ]
+    packaged, _ = package_evidence_pool(
+        pool, mark_for=_marks_for(raw_chunk={"lme:0:c2"}))
+    assert [h["id"] for h in packaged] == ["lme:0:c2", "lme:0:c1"]
 
 
 # ── (d) OFF parity: tri-state fail-safe OFF on both seams ─────────────────
