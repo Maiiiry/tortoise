@@ -285,8 +285,13 @@ def main() -> int:
                 # sends it as a Cypher body — FalkorDB parses it as one and
                 # rejects it, and the old ``except`` swallowed that, so the
                 # documented cleanup silently left the graph behind (#5084).
-                # The canonical channel is the client's ``delete()``.
-                proj.g.delete()
+                # The canonical channel is the client's ``delete()`` — and it
+                # must be the CLIENT, not the write handle: since #9209
+                # ``proj.g.delete()`` refuses a non-disposable name, and this
+                # script's own namespace (``tm1338_scale_bench``) is not one.
+                # The ownership proof just above is this script's authorization;
+                # it has already established the graph is the one it minted.
+                proj.db.select_graph(name).delete()
                 print(f"# dropped graph {name}")
             except Exception as exc:
                 print(f"# WARNING: drop failed: {exc}", file=sys.stderr)

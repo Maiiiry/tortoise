@@ -211,17 +211,154 @@ def test_copy_command_is_refused_onto_a_non_test_destination():
         proj.close()
 
 
+# The server-GLOBAL verbs are tested WITHOUT a live dispatch on purpose: if the
+# guard regressed, the test's own "failure path" would be the wipe — on the
+# shared lane that is every other lane's graphs, so a red test would be a
+# destructive event. A recording fake pins the same property (refusal BEFORE the
+# wire) with nothing to destroy.
+
+class _RecordingHandle:
+    """Minimal vendor-handle stand-in: records every command it is sent."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self.client = None
+
+    def execute_command(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return "OK"
+
+
+class _StubProj:
+    """The two projection attributes the guard reads, with L2's rule applied."""
+
+    def __init__(self, name: str = "test_9209_stub"):
+        self.graph_name = name
+
+    def _assert_test_graph(self, reason: str = "", *, graph_name=None):
+        name = self.graph_name if graph_name is None else graph_name
+        if not name.startswith(("test_", "tortoise_test")):
+            raise RuntimeError(
+                f"Graph guard: operation blocked on non-test graph '{name}'. "
+                f"{reason}"
+            )
+
+
+@pytest.mark.parametrize("verb", ["FLUSHALL", "FLUSHDB", "SWAPDB"])
+def test_global_keyspace_verbs_are_refused_before_the_wire(verb):
+    """``FLUSHALL``/``FLUSHDB``/``SWAPDB`` reach EVERY graph — no name authorizes them.
+
+    Parametrised over the spellings a caller can use; the refusal must happen
+    BEFORE the command is dispatched, which the recording fake proves directly.
+    """
+    inner = _RecordingHandle()
+    guarded = _GuardedGraph(inner, _StubProj())
+    with pytest.raises(RuntimeError, match=verb):
+        guarded.execute_command(verb)
+    assert inner.calls == [], f"{verb} reached the wire before the guard refused"
+
+
+def test_graph_delete_is_refused_before_the_wire():
+    """The same ordering pin for the ``GRAPH.*`` family."""
+    inner = _RecordingHandle()
+    guarded = _GuardedGraph(inner, _StubProj())
+    with pytest.raises(RuntimeError, match="non-test graph"):
+        guarded.execute_command("GRAPH.DELETE", "prod_9209_wire")
+    assert inner.calls == []
+
+
+# ── a graph is also a Redis KEY (#9209 review finding) ───────────────────
+#
+# MEASURED on the pre-fix tree, through ``proj.g.execute_command`` on a non-test
+# server graph: ``DEL <graph>`` -> 1 (gone), ``UNLINK <graph>`` -> 1 (gone),
+# ``RENAME <graph> <dst>`` -> True (source gone, dst holds it). None of these is
+# a ``GRAPH.*`` verb, so enumerating only that family would have left the same
+# destructive capability one syntax over.
+
+
 @_requires_falkordb
-def test_flush_all_is_refused_even_on_a_disposable_graph():
-    """``FLUSHALL`` reaches EVERY graph on the server — no name can authorize it."""
-    name = _test_name("flush")
+@pytest.mark.parametrize("verb", ["DEL", "UNLINK"])
+def test_keyspace_removal_is_refused_on_a_non_test_graph(verb):
+    name = _non_test_name(verb.lower())
     proj = FalkorProjection.from_uri(_uri(), graph_name=name)
     try:
         proj.g.query("CREATE (p:Point {id:'p1'})")
         before = _count(proj, name)
-        with pytest.raises(RuntimeError, match="FLUSHALL"):
-            proj.g.execute_command("FLUSHALL")
-        assert _count(proj, name) == before
+        assert before and before >= 1
+
+        with pytest.raises(RuntimeError, match="non-test graph"):
+            proj.g.execute_command(verb, name)
+
+        assert _count(proj, name) == before, f"{verb} removed the graph"
+    finally:
+        _drop(proj, name)
+        proj.close()
+
+
+@_requires_falkordb
+def test_keyspace_rename_is_refused_when_the_source_is_a_non_test_graph():
+    """Redis ``RENAME`` destroys the source AND replaces the destination."""
+    src = _non_test_name("ren_src")
+    dst = _non_test_name("ren_dst")
+    proj = FalkorProjection.from_uri(_uri(), graph_name=src)
+    try:
+        proj.g.query("CREATE (p:Point {id:'p1'})")
+        before = _count(proj, src)
+
+        with pytest.raises(RuntimeError, match="non-test graph"):
+            proj.g.execute_command("RENAME", src, dst)
+
+        assert _count(proj, src) == before, "the source graph was relocated"
+        assert _count(proj, dst) is None, "the source graph landed on the destination"
+    finally:
+        _drop(proj, src, dst)
+        proj.close()
+
+
+@_requires_falkordb
+def test_keyspace_rename_is_refused_onto_a_non_test_destination():
+    """A disposable graph must not be RENAMEd onto a live one (RENAME overwrites)."""
+    src = _test_name("ren2_src")
+    dst = _non_test_name("ren2_dst")
+    proj = FalkorProjection.from_uri(_uri(), graph_name=src)
+    try:
+        proj.g.query("CREATE (p:Point {id:'p1'})")
+        proj.db.select_graph(dst).query("CREATE (p:Point {id:'live'})")
+        before = _count(proj, dst)
+
+        with pytest.raises(RuntimeError, match="non-test graph"):
+            proj.g.execute_command("RENAME", src, dst)
+
+        assert _count(proj, dst) == before, "the live destination was overwritten"
+    finally:
+        _drop(proj, src, dst)
+        proj.close()
+
+
+@_requires_falkordb
+def test_a_keyspace_verb_on_a_non_graph_key_is_allowed():
+    """PRECISION, not blanket: a lock-style key is not a graph and is not blocked."""
+    name = _test_name("keyprec")
+    proj = FalkorProjection.from_uri(_uri(), graph_name=name)
+    lock = f"9209:lock:{uuid.uuid4().hex[:8]}"
+    try:
+        proj.g.execute_command("SET", lock, "1")
+        assert proj.g.execute_command("DEL", lock) == 1, (
+            "a non-graph key was refused — the guard over-blocks"
+        )
+    finally:
+        _drop(proj, name)
+        proj.close()
+
+
+@_requires_falkordb
+def test_a_keyspace_verb_on_a_disposable_graph_still_works():
+    name = _test_name("keyok")
+    proj = FalkorProjection.from_uri(_uri(), graph_name=name)
+    try:
+        proj.g.query("CREATE (p:Point {id:'p1'})")
+        assert proj.g.execute_command("DEL", name) == 1
+        assert _count(proj, name) is None
     finally:
         _drop(proj, name)
         proj.close()
@@ -286,3 +423,38 @@ def test_every_vendor_verb_is_guarded_or_declared():
         "#9209: the whole-graph destructive verbs must be guarded, not "
         f"forwarded: missing {sorted(destructive - defined)}"
     )
+
+
+@_requires_falkordb
+def test_the_census_also_covers_instance_attributes():
+    """``falkordb.Graph.__init__`` sets attributes a CLASS-level census cannot see.
+
+    Measured: ``proj.g.client.execute_command("GRAPH.DELETE", <non-test graph>)``
+    returned OK and the graph was gone — and ``client`` appears in no class
+    surface, so the class-only census above called the wrapper complete. The
+    instance surface is enumerated here so that hop is DECLARED (it is an
+    accepted escape, not a guard) rather than invisible.
+    """
+    name = _test_name("attrs")
+    proj = FalkorProjection.from_uri(_uri(), graph_name=name)
+    try:
+        instance = {
+            n for n in vars(proj.g._g) if not n.startswith("_")
+        }
+        assert "client" in instance, (
+            "the vendor no longer exposes `client` on the instance — this "
+            "census (and the SCOPE escape it names) needs re-reading"
+        )
+        defined = set()
+        for klass in _GuardedGraph.__mro__:
+            defined |= {n for n in vars(klass) if not n.startswith("_")}
+        undeclared = instance - defined - set(_FORWARDED_NON_CYPHER_ATTRS)
+        assert not undeclared, (
+            "#9209: the write handle forwards these INSTANCE attributes "
+            f"unguarded and undeclared: {sorted(undeclared)} — guard it (if it "
+            "can destroy or replace a graph) or declare it in "
+            "_FORWARDED_NON_CYPHER_ATTRS and name it in the SCOPE escape list."
+        )
+    finally:
+        _drop(proj, name)
+        proj.close()

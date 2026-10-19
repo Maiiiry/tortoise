@@ -3302,7 +3302,7 @@ def _journal_safe_params(params, cypher=None):
 # that 300+-site surface is §17.1's mechanism (1), the atomic write, and it is
 # recorded as still-open on `#7951` rather than papered over here.
 #
-# ⛔ THE RESIDUAL IS FOUR ESCAPES, NOT THREE — named so it is stated, not
+# ⛔ THE RESIDUAL IS FIVE ESCAPES, NOT THREE — named so it is stated, not
 # discovered. A writer that wants to write this cache directly has:
 #   1. `proj.g.query("CREATE …")`     — the guarded handle itself (the SDK's
 #      own live lane, above);
@@ -3316,15 +3316,23 @@ def _journal_safe_params(params, cypher=None):
 #      destination, measured). #9209 did NOT close this; it put the same L2
 #      name rule on it that the Cypher verbs use, so the duplicate can only be
 #      minted under a disposable name. A non-disposable destination is now
-#      refused; a `test_` one still mints an unjournalled cache-shaped graph.
-# All four are ALLOWED (outside the L2 name rule) against a journal-backed
-# projection. (2) and (3) are the same class as (1) — they bypass the same fold
-# — and none of the four is closed in this increment. They are the surface
+#      refused; a `test_` one still mints an unjournalled cache-shaped graph;
+#   5. `proj.g.client.execute_command(…)` — `client` is a PUBLIC instance
+#      attribute the vendor sets in `Graph.__init__`, so `__getattr__` forwards
+#      it and no wrapper guard can close it (measured: `GRAPH.DELETE` through it
+#      returned OK on a non-test graph). Same class as (3) — it is the raw
+#      client, one hop away. Declared in `_FORWARDED_NON_CYPHER_ATTRS`, not
+#      claimed closed.
+# All five are ALLOWED (outside the L2 name rule) against a journal-backed
+# projection. (2), (3) and (5) are the same class as (1) — they bypass the same
+# fold — and none of the five is closed in this increment. They are the surface
 # §17.1's atomic write has to close; a lexical inventory cannot, because each is
 # one hop below anything a runtime signal is placed on. (The whole-graph
 # DESTRUCTIVE verbs are the OTHER axis and are closed on the write handle since
-# #9209: `proj.g.delete()`, `GRAPH.DELETE`, `FLUSHALL`/`FLUSHDB` refuse on a
-# non-disposable graph, unconditionally for the flush forms.)
+# #9209: `proj.g.delete()`, `GRAPH.DELETE`, `GRAPH.COPY` and the keyspace forms
+# a graph is also reachable as a Redis KEY through — `DEL`, `UNLINK`, `MOVE`,
+# `RENAME` — refuse on a non-disposable graph, unconditionally for `FLUSHALL` /
+# `FLUSHDB` / `SWAPDB`.)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -3430,6 +3438,16 @@ def _graph_metadata_write_scope(reason: str = "graph-metadata"):
     return _cache_write_authorized(reason)
 
 
+#: #9209 — the KEYSPACE verbs that destroy or relocate a graph, and the
+#: verbs that take the whole keyspace. A FalkorDB graph is a Redis KEY of type
+#: ``graphdata``, so these reach it while looking nothing like Cypher; MEASURED
+#: through ``proj.g.execute_command`` on a non-test graph: ``DEL`` → 1 (gone),
+#: ``UNLINK`` → 1 (gone), ``RENAME`` → True (source gone, destination holds it).
+_KEYSPACE_DESTRUCTIVE_VERBS = frozenset({"DEL", "UNLINK", "MOVE", "RENAME"})
+#: ... and the ones NO single disposable name can authorize (see the guard).
+_KEYSPACE_GLOBAL_VERBS = frozenset({"FLUSHALL", "FLUSHDB", "SWAPDB"})
+
+
 def _graph_name_text(value) -> str:
     """Read a graph-name ARGUMENT as text (#9209).
 
@@ -3479,6 +3497,15 @@ _FORWARDED_NON_CYPHER_ATTRS = frozenset({
 #   enumerate the server's procedure catalogue. Same class as ``proj.db`` — a
 #   caller that reaches the raw surface can build its own client anyway.
     "call_procedure",
+#   INSTANCE attributes, not class ones — `falkordb.Graph.__init__` sets these
+#   per instance, so `dir(Graph)` never shows them and a class-level census
+#   cannot see them (measured: `proj.g.client.execute_command("GRAPH.DELETE",
+#   <non-test graph>)` returned OK and the graph was gone). `client` is an OPEN
+#   escape of exactly the `proj.db` class — it is one hop to the raw guarded
+#   client, and no guard on this wrapper can close a public attribute that the
+#   vendor hands out. DECLARED, not claimed closed; see the SCOPE block's
+#   escape list, which names this hop. `schema` is a read.
+    "client", "schema", "connection",
 })
 
 
@@ -3645,10 +3672,9 @@ class _GuardedGraph:
         refused, a ``test_``/``tortoise_test`` graph is allowed, and embedded is
         exempt — identical to what ``proj.g.query`` already does with a bulk
         ``DETACH DELETE``, so the two lanes cannot disagree about which graphs
-        are disposable. ``FLUSHALL``/``FLUSHDB`` get NO exemption: they take
-        every graph, including graphs on the same server no journal backs, so no
-        single name can authorize them (see the "do NOT FLUSHALL" note on the
-        truncation path above).
+        are disposable. ``FLUSHALL``/``FLUSHDB``/``SWAPDB`` get NO exemption:
+        they take every graph / every DB, so no single name can authorize them
+        (see the "do NOT FLUSHALL" note on the truncation path above).
         """
         if not args:
             return
@@ -3658,12 +3684,12 @@ class _GuardedGraph:
         if not isinstance(verb, str):
             return  # the vendor's own error to raise; not a shape we can read
         verb = verb.upper()
-        if verb in ("FLUSHALL", "FLUSHDB"):
+        if verb in _KEYSPACE_GLOBAL_VERBS:
             raise RuntimeError(
-                "Graph guard: REFUSING FLUSHALL/FLUSHDB through the write "
-                "handle — it deletes EVERY graph on the server, not just this "
-                "projection's disposable one. Delete the specific graph "
-                "(test_* / tortoise_test* graphs are allowed) or use "
+                "Graph guard: REFUSING " + verb + " through the write "
+                "handle — it takes EVERY graph on the server (every DB), not "
+                "just this projection's disposable one. Delete the specific "
+                "graph (test_* / tortoise_test* graphs are allowed) or use "
                 "FalkorProjection.rebuild(confirm_destructive=True). See #9209."
             )
         if verb == "GRAPH.DELETE":
@@ -3684,6 +3710,60 @@ class _GuardedGraph:
                 "REFUSING to run GRAPH.COPY onto",
                 graph_name=_graph_name_text(target),
             )
+        elif verb in _KEYSPACE_DESTRUCTIVE_VERBS:
+            self._guard_keyspace_verb(verb, args)
+
+    def _guard_keyspace_verb(self, verb: str, args) -> None:
+        """#9209 — a graph is a Redis KEY, so the keyspace verbs reach it.
+
+        MEASURED on the live engine through ``proj.g.execute_command``, on a
+        NON-test server graph: ``DEL <graph>`` → 1 (gone), ``UNLINK <graph>`` →
+        1 (gone), ``RENAME <graph> <dst>`` → True (source gone, ``dst`` holds
+        it). None of these is a ``GRAPH.*`` verb, so nothing above looks at
+        them, and a guard that enumerated only the ``GRAPH.*`` family would have
+        left the same hole one syntax over.
+
+        The rule stays PRECISE rather than blanket — a keyspace verb may act on
+        a key that is NOT a graph (a lock key, a counter), and refusing those
+        would be an over-block with no defect behind it — so the argument is
+        resolved against ``GRAPH.LIST`` and only a real graph key carries the
+        name rule. ``RENAME`` needs both names when the SOURCE is a graph: the
+        source is destroyed AND the destination is replaced (Redis ``RENAME``
+        overwrites), so checking only the source would let a disposable graph be
+        renamed onto a live one.
+
+        If ``GRAPH.LIST`` cannot be read the guard REFUSES: an unreadable list
+        means "cannot prove this key is not a graph", and failing open here
+        would be the silent-destruction direction the whole issue is about.
+        """
+        targets = [k for k in (_graph_name_text(a) for a in args[1:]) if k]
+        if not targets:
+            return
+        graphs = self._graph_keys()
+        named = [k for k in targets if k in graphs]
+        if verb == "RENAME" and targets[0] in graphs:
+            # the destination is REPLACED even when it does not exist yet
+            named = targets[:2]
+        for key in named:
+            self._proj._assert_test_graph(
+                f"REFUSING to run {verb}", graph_name=key)
+
+    def _graph_keys(self) -> frozenset[str]:
+        """The graph names on this server, for the keyspace-verb guard (#9209).
+
+        Fails CLOSED: if the catalogue cannot be read, the caller must not guess
+        that a key is not a graph.
+        """
+        try:
+            rows = self._proj.db.list_graphs()
+        except Exception as exc:
+            raise RuntimeError(
+                "Graph guard: cannot read GRAPH.LIST, so it cannot prove the "
+                f"target key is not a graph — refusing the destructive "
+                f"keyspace verb (#9209): {exc}"
+            ) from exc
+        return frozenset(
+            k for k in (_graph_name_text(r) for r in rows) if k)
 
     def delete(self) -> None:
         """``GRAPH.DELETE`` — L2 applies (#9209).
@@ -3692,8 +3772,9 @@ class _GuardedGraph:
         per-instance ``execute_command`` binding, so which class-level guard is
         installed does not decide whether it is checked at all. Defining the
         verb HERE is what makes it checked: ``__getattr__`` no longer forwards
-        it. Test graphs and embedded mode keep working (the same L2 exemption
-        the Cypher verbs use).
+        it. Embedded mode stays exempt from the NAME rule through
+        ``_assert_test_graph``'s ``_is_embedded`` early return, exactly as it is
+        for the Cypher verbs — the exemption is the guard's, not this verb's.
         """
         self._proj._assert_test_graph(
             "REFUSING to run GRAPH.DELETE",
@@ -3712,7 +3793,8 @@ class _GuardedGraph:
         exists`` — so ``copy`` cannot destroy a live cache; the guard is about
         minting, not deleting, and its docstring says so.) A ``test_`` /
         ``tortoise_test`` destination (the suite's own graph-copy regressions)
-        still works, and so does embedded mode.
+        still works; embedded mode is exempt from the NAME rule by
+        ``_assert_test_graph``'s own early return, as for the Cypher verbs.
         """
         self._proj._assert_test_graph(
             "REFUSING to run GRAPH.COPY onto",
