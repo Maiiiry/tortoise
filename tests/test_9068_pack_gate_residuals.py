@@ -1,20 +1,32 @@
 """#9068 — the write paths that never meet a #5475 gated door, MEASURED.
 
 `#5475`'s closure property is **a write may not widen the graph's approved
-pack set**. At this branch's base that property is enforced at these doors and
-no others — the SDK point door (`sdk.create_point`), the SDK entity funnel
-(`sdk._create_entity`, which `create_object`/`create_subject`/`create_event`/
-`create_document`/`create_source`/`create_entity` all relay through), the hosted
-commit door's pre-validation (`hosted_api.commit_session`), and the two
-`POST /v1/{objects,subjects}` doors (`hosted_api.create_object` /
-`hosted_api.create_subject`, via `_require_approved_kind`, #8380). "And no
-others" is not prose either: `test_the_door_inventory_is_the_declared_doors_and_no_others`
-re-derives the inventory from the #5475 gate CALL SITES by AST, so a SIXTH door
-reds this suite instead of silently falsifying this paragraph. It is an inventory
-of the BASE, not of the future — `PR #9070` gates eight further seams
-(`update_point`, `_update_entity`, `link_source_to_entity`, `ingest_corpus`,
-`EventAPI._emit`, `_apply_and_journal`, `_doc_write`, `mining`'s emitter) and
-none of those is claimed closed here.
+pack set**. At this branch's base that property is enforced at these THIRTEEN
+doors and no others — stated as doors rather than as a cardinality, because a
+count is the part that goes stale:
+
+* the SDK point door (`sdk.create_point`) and the SDK entity funnel
+  (`sdk._create_entity`, which `create_object`/`create_subject`/`create_event`/
+  `create_document`/`create_source`/`create_entity` all relay through);
+* the two UPDATE doors (`sdk.update_point`, `sdk._update_entity`, #9070);
+* the second writers of an already-mined property — `sdk.link_source_to_entity`
+  (its `sourceKind` keyword) and `sdk.ingest_corpus` (its `eventKind` keyword);
+* the record-building doors that journal-then-fold — `sdk._apply_and_journal`
+  and `sdk._doc_write`;
+* the journal-first seam every pipeline writes through — `api.EventAPI._emit`
+  (`#8982`) and `mining.ConversationMiner._emit_event`;
+* the hosted commit door's pre-validation (`hosted_api.commit_session`), and the
+  two `POST /v1/{objects,subjects}` doors (`hosted_api.create_object` /
+  `hosted_api.create_subject`, via `_require_approved_kind`, #8380).
+
+"And no others" is not prose either: `test_the_door_inventory_is_the_declared_doors_and_no_others`
+re-derives the inventory from the #5475 gate CALL SITES by AST, so a FOURTEENTH
+door reds this suite instead of silently falsifying this paragraph — and
+`test_the_gate_helper_vocabulary_is_complete` reds it when a new gate HELPER
+appears, which is the failure this file only missed once: `#9070` introduced
+`_refuse_unapproved_kinds_in_record` and the doors behind it were invisible to
+the call-site scan until the helper was registered in `_GATE_HELPERS`. It is an
+inventory of the BASE, not of the future.
 The decision is expressed more than once — the SDK's `_unapproved_kind_refusal`,
 `pack_state.kind_namespace_is_approved`, and the approval-gated vocabulary
 membership (`compile_vocab(installed_namespaces=…)`, which `validate_layer1`
@@ -25,14 +37,16 @@ looking, and several writers still widen the set today. `#9068` records that;
 this module makes it a *measurement* instead of prose, so the claim's true
 scope is executable and cannot drift back:
 
-* two tests here PASS and pin the two halves of that scope that are real — the
-  gated door refusing (and moving nothing), and the deliberate
-  data-mining leg the gate's back-compat rests on;
+* six tests PASS. Four pin the SCOPE and the pin MECHANIC — the door inventory
+  (below), the completeness of the gate vocabulary that inventory is derived
+  from, the fail-closed mechanics the two pins rest on, and the gated door
+  refusing (and moving nothing); one pins the deliberate data-mining leg the
+  gate's back-compat rests on; and one is the **declared** departure (offline
+  re-typing);
 * two tests are `xfail(strict=True, raises=AssertionError)` on the **fixed**
   behaviour of the two residuals nothing is currently fixing, so closing either
   one XPASSes its pin and FAILS the suite on purpose rather than letting the pin
-  rot — the idiom `tests/test_url_keyed_source_write_4649.py` uses for `#5048`;
-* one test PASSES and is the **declared** departure (offline re-typing).
+  rot — the idiom `tests/test_url_keyed_source_write_4649.py` uses for `#5048`.
 
 Both pins are ``xfail(strict=True, raises=AssertionError)``, and each half of
 that marker is load-bearing: ``strict`` alone reacts to the ASSERTION, so a pin
@@ -78,25 +92,23 @@ read the set before, perform ONE write, read it after.
    "records ∪ data" a second time (that re-derivation is the drift
    `graph_installed_namespaces` exists to prevent). **XFAIL.**
 
-**Widening at HEAD, named but NOT pinned** — a fix is already in flight
-(`PR #9070`, open), and a `strict` pin would red the suite the moment it lands.
-This list is deliberately NOT presented as the whole seam table: `PR #9070`
-measures EIGHT seams at essentially this base, every one of which still widens
-the set at HEAD (none of them reaches a gate — the SDK's only gate calls are
-`sdk.create_point` and `sdk._create_entity`, and `hosted_api`'s are the
-commit-door pre-check and the two REST doors):
+**Closed upstream at this base, and NOT re-pinned here** — `#9070` landed and
+gates the eight seams this module previously only NAMED. This module does not
+re-pin them: their pins live in `tests/test_vocab_gating_by_graph.py`
+(`TestUpdateDoorsRefuseUnapprovedPacks5475`,
+`TestJournalSeamRefusesUnapprovedPacks5475`,
+`TestRecordBuildingSeamsRefuseUnapprovedPacks5475`,
+`TestSecondWritersOfAKindProperty5475`, `TestIngestCorpusEventKind5475`) and in
+`#9070`'s own before/after measurements. They are listed here because they are
+DOORS in the inventory below, not because this module measures them:
 
-* `update_point` / `update_entity` (`#8968`) and the journal-first seam
-  (`api.EventAPI._emit` → `projection._upsert_*`, `#8982`) — the two with their
-  own issues, measured on this module's own fixture;
+* the UPDATE doors — `update_point` / `_update_entity` (`#8968`);
+* the journal-first seam — `api.EventAPI._emit` → `projection._upsert_*`
+  (`#8982`) — and `mining.ConversationMiner._emit_event`;
 * the SECOND writers of an already-mined property — `link_source_to_entity`
   (its `sourceKind` keyword) and `ingest_corpus` (its `eventKind` keyword, on a
   raw-Cypher writer);
-* the record-building doors — `sdk._apply_and_journal`, `sdk._doc_write`, and
-  `mining.ConversationMiner._emit_event`.
-
-See `PR #9070` for the full seam table and the measured before/after per seam;
-none of the five in the last two groups is claimed as closed here.
+* the record-building doors — `sdk._apply_and_journal`, `sdk._doc_write`.
 
 **Deliberately ungated, DECLARED** (3) — `migrate_kinds` re-types with raw
 Cypher, and `retype` / `tools/retype_snapshot` work on a dump. `#9068` residual
@@ -132,6 +144,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import re
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -257,29 +270,61 @@ def _approved(sdk: TortoiseSDK) -> frozenset[str] | None:
 # ── The scope claim: the door inventory, RE-DERIVED from the source ───────
 
 #: The `#5475` gate helpers. A DOOR is a function that CALLS one of these; the
-#: helpers are not doors themselves, so a call inside another helper (the two
-#: `TortoiseSDK._refuse_*` wrappers, `hosted_api._require_approved_kind`) is a
-#: composition step, not a door.
+#: helpers are not doors themselves, so a call inside another helper (the SDK's
+#: `_refuse_*` / `_unapproved_kind_refusal` wrappers,
+#: `EventAPI._refuse_unapproved_kinds`, `hosted_api._require_approved_kind`,
+#: `pack_state.refuse_unapproved_kinds_in_payload`) is a composition step, not a
+#: door. `unapproved_kind_pack` is here too: it is the pure decision helper the
+#: refusal composes, so nothing may treat it as a door.
+#:
+#: Kept in step with the source by
+#: `test_the_gate_helper_vocabulary_is_complete`, which re-derives every DEF
+#: whose NAME is in the gate vocabulary and reds when one is unregistered. That
+#: guard exists because the call-site scan is only as complete as this list:
+#: `#9070` added `_refuse_unapproved_kinds_in_record`, and every door behind it
+#: was invisible to this scan until the name was registered here.
 _GATE_HELPERS: frozenset[str] = frozenset({
     "_refuse_unapproved_kind",
+    "_refuse_unapproved_kinds",
     "_refuse_unapproved_kinds_in_props",
+    "_refuse_unapproved_kinds_in_record",
     "_unapproved_kind_refusal",
     "_require_approved_kind",
+    "refuse_unapproved_kinds_in_payload",
+    "unapproved_kind_pack",
+    "unapproved_kind_refusal",
 })
 
+#: The naming convention the #5475 gate is written in — derived from the source,
+#: so a new helper cannot arrive unannounced. Anything matching this that is not
+#: in `_GATE_HELPERS` reds `test_the_gate_helper_vocabulary_is_complete`.
+_GATE_VOCABULARY = re.compile(
+    r"^(?:.*_)?(?:refuse_unapproved\w*|unapproved_kind\w*|require_approved_kind)$")
+
 #: The doors the module docstring states — that header's inventory, executable.
-#: The residual list at HEAD carries NO sixth entry, so "these doors and no
-#: others" is a claim about the BASE: `PR #9070` places eight further gates at
-#: the update/journal seams, and the day one of them lands this test reds and
-#: the header has to be updated in the same PR — which is the point. A
-#: paragraph asserting a scope nobody checks back is the drift that #6139/#7551
-#: hit from the manifest side and that this module exists to close.
+#: THIRTEEN at this base: the two SDK create funnels, the two UPDATE doors, the
+#: two second-writers of a mined property, the two record-building doors, the two
+#: journal-first emitters, the commit-door pre-check and the two REST doors
+#: (`#9070` landed the update/journal seams; `#8380` the REST pair). "And no
+#: others" is a claim about the BASE: the day a new gate CALL SITE — or a new
+#: gate HELPER, see `_GATE_VOCABULARY` — lands, this reds and the header has to
+#: be updated in the same PR, which is the point. A paragraph asserting a scope
+#: nobody checks back is the drift that #6139/#7551 hit from the manifest side
+#: and that this module exists to close.
 _DOORS: frozenset[str] = frozenset({
-    "tortoise/sdk.py:TortoiseSDK.create_point",
-    "tortoise/sdk.py:TortoiseSDK._create_entity",
+    "tortoise/api.py:EventAPI._emit",
     "tortoise/hosted_api.py:commit_session",
     "tortoise/hosted_api.py:create_object",
     "tortoise/hosted_api.py:create_subject",
+    "tortoise/mining.py:ConversationMiner._emit_event",
+    "tortoise/sdk.py:TortoiseSDK._apply_and_journal",
+    "tortoise/sdk.py:TortoiseSDK._create_entity",
+    "tortoise/sdk.py:TortoiseSDK._doc_write",
+    "tortoise/sdk.py:TortoiseSDK._update_entity",
+    "tortoise/sdk.py:TortoiseSDK.create_point",
+    "tortoise/sdk.py:TortoiseSDK.ingest_corpus",
+    "tortoise/sdk.py:TortoiseSDK.link_source_to_entity",
+    "tortoise/sdk.py:TortoiseSDK.update_point",
 })
 
 
@@ -322,7 +367,7 @@ def _gate_call_sites() -> dict[str, list[tuple[str, int]]]:
     """Every ``#5475`` gate call under ``tortoise/``, keyed ``<file>:<qualname>``.
 
     The pre-filter (a file has to SPELL a helper to call it) only keeps the
-    parse set to the two modules that gate; the AST pass decides.
+    parse set to the modules that gate; the AST pass decides.
     """
     root = Path(__file__).resolve().parent.parent
     sites: dict[str, list[tuple[str, int]]] = {}
@@ -335,14 +380,35 @@ def _gate_call_sites() -> dict[str, list[tuple[str, int]]]:
     return sites
 
 
+def _gate_vocabulary_defs() -> set[str]:
+    """Every DEF under ``tortoise/`` whose NAME is in the ``#5475`` vocabulary.
+
+    Deliberately NOT the same filter as `_gate_call_sites`: a new helper may be
+    DEFINED in a module that spells none of the registered names (that is
+    exactly how `_refuse_unapproved_kinds_in_record` would have been missed had
+    it been the only new name), so the pre-filter here keys on the vocabulary
+    stem rather than on the registered set.
+    """
+    root = Path(__file__).resolve().parent.parent
+    defs: set[str] = set()
+    for path in sorted((root / "tortoise").rglob("*.py")):
+        source = path.read_text(encoding="utf-8", errors="replace")
+        if "unapproved" not in source and "approved_kind" not in source:
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and _GATE_VOCABULARY.match(node.name)):
+                defs.add(node.name)
+    return defs
+
+
 def test_the_door_inventory_is_the_declared_doors_and_no_others() -> None:
     """The header's scope claim, made executable — "these doors and no others".
 
     A door is a function that CALLS a #5475 gate helper; a call inside another
-    helper is composition, so it is excluded by leaf name. If a sixth gate call
-    site lands — `PR #9070` places eight at the update/journal seams — this reds
-    and the header must be updated in the same PR rather than left asserting a
-    scope the source no longer has.
+    helper is composition, so it is excluded by leaf name. If a fourteenth gate
+    call site lands, this reds and the header must be updated in the same PR
+    rather than left asserting a scope the source no longer has.
     """
     doors = {
         key for key in _gate_call_sites()
@@ -354,6 +420,32 @@ def test_the_door_inventory_is_the_declared_doors_and_no_others() -> None:
         f"site was added or removed. Live doors: {sorted(doors)}; stated: "
         f"{sorted(_DOORS)}. Update the header — and if the new door WIDENS the "
         "approved set, pin it beside the residuals below")
+
+
+def test_the_gate_helper_vocabulary_is_complete() -> None:
+    """The inventory above is only as complete as `_GATE_HELPERS`.
+
+    A DOOR is found by the helper it CALLS, so a gate helper nobody registered
+    is a whole family of doors hidden from `test_the_door_inventory_...` — the
+    scan does not crash, it silently reports fewer doors. That is not
+    hypothetical: `#9070` introduced `_refuse_unapproved_kinds_in_record`, and
+    the two doors behind it (`_apply_and_journal`, `_doc_write`) plus the two
+    that carried their own `_refuse_unapproved_kinds_in_props` call were
+    invisible until the name was added.
+
+    So the vocabulary is DERIVED from the source, not trusted from the list: any
+    DEF whose name matches `_GATE_VOCABULARY` must be registered, and every
+    registered name must still exist. A new helper reds this — which is the
+    correct signal that the inventory needs re-reading, not an expiry.
+    """
+    live = _gate_vocabulary_defs()
+
+    assert live == set(_GATE_HELPERS), (
+        "the #5475 gate vocabulary changed: a helper was added or renamed "
+        f"without being registered in `_GATE_HELPERS`. Live: {sorted(live)}; "
+        f"registered: {sorted(_GATE_HELPERS)}. Register the name (its DOORS "
+        "then reappear in the inventory test) or, if it is not a gate, rename "
+        "it so the vocabulary stays decidable")
 
 
 def test_the_pin_mechanic_is_fail_closed() -> None:
