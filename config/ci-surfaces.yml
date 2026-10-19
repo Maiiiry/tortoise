@@ -1309,6 +1309,12 @@ surfaces:
   - test_4125_legacy_session_source_migration.py
   - test_4932_per_pr_artifact_scope.py
   - test_2350_validity_precision.py
+  # #9201: the START-precision read pin (`tortoise/validity.py`'s
+  # `start_precision`/`window_present` + the search-wire emission gate).
+  # `validity.py` matches no SOURCE_PATTERN, so a change to it falls through to
+  # `core` — registering the guard HERE is what makes the file selected for the
+  # code it holds, the same reason #2350's own suite is registered above.
+  - test_9201_start_precision_names_no_instant.py
   # #5142: the ONTOLOGY record of the D10 code half — the `format` markers vs
   # `_SOURCE_HANDLED`, the deferred document/corpus-source node collapse, and
   # the document `:Source` scoping. Half its subject is `tortoise/projection/
