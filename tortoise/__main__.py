@@ -326,6 +326,12 @@ def _cmd_demo(args):
     with NamedTemporaryFile(suffix=".jsonl", mode="w+", delete=False) as tmp:
         tmp.close()
         log = EventLog(tmp.name)
+        # A SCRATCH buffer, never a journal: this file is DELETED a few lines
+        # below, so a record row filed from it could never be reproduced or
+        # healed by a replay. Marked at the construction site because the seam
+        # reads `durable` off the log (#9231 review P2) — the demo lane has no
+        # journal by construction.
+        log.durable = False
         api = EventAPI(log, initiated_by="extractor", agent_id="mock@0")
         MockExtractor().run(text, transcript.name, api)
         events = log.read_all()

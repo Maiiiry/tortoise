@@ -125,6 +125,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from . import record_projection, status_vocabulary
 
@@ -406,7 +407,12 @@ def _default_connect(dsn: str) -> Any:
             "the record is armed but no Postgres driver is installed — install "
             "the 'postgres' extra (pip install -e '.[postgres]')"
         ) from exc
-    if "connect_timeout" in dsn:
+    # The operator's bound is a QUERY KEY, not a substring: `dsn` is the whole
+    # URI, and a password such as `postgresql://svc:connect_timeout@host/db`
+    # (needs no percent-encoding, passes `_DSN_SCHEMES`) would otherwise take
+    # the "already bounded" branch and restore libpq's wait-forever default on
+    # the per-record connect this constant exists to cap (#9231 review P2).
+    if "connect_timeout" in parse_qs(urlsplit(dsn).query):
         # The operator bounded it already; do not replace their number.
         return psycopg2.connect(dsn)
     return psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_SECONDS)

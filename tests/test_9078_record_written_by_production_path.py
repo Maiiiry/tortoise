@@ -545,6 +545,34 @@ def test_a_real_journal_is_still_durable_for_the_door(monkeypatch):
     assert len(api.log.events) == 1, "the append still happened"
 
 
+def test_the_demo_cli_lane_files_nothing_from_a_journal_it_deletes(monkeypatch):
+    """`tortoise demo` writes a temp journal and then UNLINKS it — scratch.
+
+    `_cmd_demo` is a shipped CLI lane, and its `EventLog` points at a
+    `NamedTemporaryFile` the command deletes on the next line, so a record row
+    filed from it is a row no replay can ever reproduce or heal (`record !=
+    replay(journal)`). It was the second scratch-journal construction site
+    (the MCP mining lane's `mkdtemp()` journal is the other), and it was the
+    one still answering `durable=True` because the marker lives on the LOG, not
+    on the class of log the door happens to see (#9231 review P2). The writes
+    happen through `EventAPI._emit`, so pre-fix this test fires the connect
+    tripwire instead of counting.
+    """
+    from tortoise import __main__ as cli
+
+    monkeypatch.setenv(record_writer.RECORD_DSN_ENV,
+                       "postgresql://record:record@127.0.0.1:1/record")
+    monkeypatch.setattr(record_writer, "_default_connect", lambda dsn: pytest.fail(
+        "the demo lane filed a record from the journal file it deletes"))
+    before = dict(monitoring.record_write_failure_counts())
+    with use_record_tenant(ORG, GRAPH):
+        cli._cmd_demo(None)
+    after = dict(monitoring.record_write_failure_counts())
+    assert after.get("no_durable_journal", 0) > before.get(
+        "no_durable_journal", 0), after
+    assert after.get("write_failed", 0) == before.get("write_failed", 0), after
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 6. Resilience — the seam's "never raises" is ENFORCED, and bounded
 # ════════════════════════════════════════════════════════════════════════════
@@ -598,6 +626,20 @@ def test_the_record_connection_is_bounded(monkeypatch):
         "postgresql://u:p@127.0.0.1:1/db?connect_timeout=3")
     assert "connect_timeout" not in calls[1][1], (
         "an explicit connect_timeout on the DSN must win over the default")
+    # A QUERY KEY, not a substring: the DSN is the whole URI, so a password
+    # that merely CONTAINS the characters must not read as the operator's
+    # bound — that branch would restore libpq's wait-forever default on the
+    # per-record connect this constant exists to cap (#9231 review P2).
+    record_writer._default_connect(
+        "postgresql://svc:connect_timeout@127.0.0.1:1/db")
+    assert "connect_timeout" in calls[2][1], (
+        "a password containing `connect_timeout` is not the operator's bound: "
+        f"the seam must still cap the connect, got {calls[2][1]!r}")
+    assert 0 < calls[2][1]["connect_timeout"] <= 30, calls[2][1]
+    record_writer._default_connect(
+        "postgresql://u:p@127.0.0.1:1/db?connect_timeout_extra=3")
+    assert "connect_timeout" in calls[3][1], (
+        "a similarly-spelled query key is not `connect_timeout`")
 
 
 def test_a_malformed_dsn_on_the_journal_less_lane_is_counted(
