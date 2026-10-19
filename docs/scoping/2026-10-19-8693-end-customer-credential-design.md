@@ -35,8 +35,9 @@ one code fact that changes the design's shape**:
 | (body: delegated credential "mints" a scoped token) | C5 (`#2114`) **landed**: per-graph key binding, `_require_scope`, `_reject_graph_bound_org_surface` are live (`hosted_api.py:6451`, `:6601`, `:6625`) | The delegated credential has a *shipped* enforcement spine; the design composes it rather than inventing one |
 
 **Verdict:** the design work this issue asks for is **unblocked and done here**. What remains
-blocked is *building* it: the end-user team provisioning + the cross-team minting capability are
-`#557` S1 (`2026-08-15-557-sub-tenancy-scoping.md` §Approach), which has zero sub-issues today.
+blocked is *building* it: the end-user team provisioning + the cross-team provisioning/lifecycle
+capability (§9.1) are `#557` S1 (`2026-08-15-557-sub-tenancy-scoping.md` §Approach), which has zero
+sub-issues today.
 
 ---
 
@@ -69,9 +70,18 @@ nothing cross-team is required.
   the `pro` tier the same decision gates sub-tenancy to (D2 Q4). The cap is per org; sub-tenancy
   therefore *requires* the credential to live in the end user's own team — which is what D2 already
   says. Design B is recorded here as the evidence a reopen would use, **not** as a plan.
-- Second independent reason: `POST /v1/graphs` is **session-authed only** (`hosted_api.py:19275`,
-  `get_current_user` + membership check), so programmatic per-end-user graph creation in the
-  embedder's org has no key-auth path today either.
+- **Second reason, corrected after review — key-auth graph creation DOES exist.** Earlier drafts of
+  this section claimed `POST /v1/graphs` was the only route and reachable with a session token
+  alone; that was wrong, and the corrected version is stronger, not weaker. Programmatic creation
+  ships under key
+  auth at `POST /v1/organizations/{org_id}/graphs` (`create_org_graph`,
+  `hosted_api.py:19220-19245`). What Design B would need is an **owner-class key carrying
+  `graphs:create`** (`:19242-19244`; the scope is in `_OWNER_SCOPE_ALLOWLIST`, `:11225-11229`) that
+  is **not** a minted child — `deleg=0` keys are rejected outright (`:19237-19241`, "Minted keys
+  cannot provision graphs", and the child policy cannot mint `graphs:create` at all). Handing the
+  end-user lane that class of key is exactly the owner-class authority §3.3 property 1 refuses to
+  give it. (`POST /v1/graphs`, `:19275`, is the session
+  alias for the same provisioning service — not the only programmatic path.)
 
 ---
 
@@ -147,7 +157,12 @@ Required properties of that authority, stated here so S1 is judged against them:
 3. **Per-mint audit**: every end-user credential mint writes an `api_key_create` row naming the
    acting credential (`created_by_key_id`) — the row already carries the lineage; the *audit* side is
    §6.
-4. **Revocable as a unit, and its revocation must reach its children** — measured gap, §6.3.
+4. **Revocable as a unit, and its revocation must reach its children** — measured gap, §5.3
+   (`#8694`).
+5. **Lifecycle reach over what it minted** — the same authority must be able to **rotate** and
+   **revoke** the credentials it minted, or §5's Replace button cannot work. Measured at this head:
+   it cannot today (both verbs are pinned to the caller's own org, §5.2). Same boundary as property
+   1 — teams it provisioned, nothing else; the required verb set is in §9.1.
 
 ---
 
@@ -193,7 +208,19 @@ One action, in **the builder's app**, in plain language — no keys, no tokens, 
 
 1. **Replace endpoint**: on the button, the builder's backend calls Tortoise `rotate` against the
    end-user's credential id, inside that end-user's team, using the provisioning credential. One
-   round trip.
+   round trip **from the builder's app** — but **not one shipped call.** Measured at this head, the
+   cross-team lifecycle reach does **not** exist: both lifecycle verbs are pinned to the caller's
+   own org — `rotate` at `hosted_api.py:12047`, `DELETE /v1/team/keys/{key_id}` at `:12397`
+   (supabase lane) / `:12425` (registry lane) — each calling
+   `_ensure_key_in_pinned_org(org["org_id"], row.get("org_id"), required=True)`, whose contract is
+   that the resolved org "must own the key UNCONDITIONALLY" (`:6162-6185`). A target key in the
+   end-user's team therefore raises `403 "Not your API key"` for a builder-org credential. Key auth
+   cannot escape the pin: on the key lane the org is resolved *from the key itself* and `?org_id=`
+   is ignored (the `DELETE` docstring states it, `:12345-12348`). The end-user credential cannot
+   self-rotate either — every `deleg=0` caller is rejected at `:12004`
+   (`_reject_minted_delegated_key(org, "rotate API keys")`). So this step is **one call the builder
+   makes plus one capability Tortoise must grant**: the cross-team provisioning authority of §9.1
+   extended to the lifecycle verbs. Until that lands, the button 403s for every end user.
 2. **Re-propagate**: the response is the **only** time the new plaintext exists (reveal-once). The
    builder stores it and re-issues its own session/app token; Tortoise keeps only the hash.
 3. **Say nothing about Tortoise**: the end user must never learn the platform credential exists —
@@ -214,13 +241,21 @@ key = one end-user space, not everything"). Containing it means: revoke the prov
 2. **No cross-team enumeration** — the provisioning credential's children live in *other* teams, and
    every key-listing surface is org-scoped (`GET /v1/team/keys`, `hosted_api.py:12187`).
 
-**Design position:** per-end-user Replace/Revoke (§5.1, §5.2) does not depend on either gap — with
-D2's model the end-user credential is reachable through its own team. **Containment does.** The
-tier's stated isolation claim ("a stolen child key = one end-user space") is only true for the
-*child*; the *parent* leak is currently unbounded in N. So: `#8694` **and** a builder-side child
-enumeration must land before this tier is exposed to real end users, or the compromise runbook is
-"N cross-team revoke calls issued from the builder's own record of its end users". Recorded as a
-precondition (§10), not silently assumed.
+**Design position:** per-end-user Replace/Revoke (§5.1, §5.2) does not depend on **either of these
+two containment gaps** — replacing one credential the builder already has on record needs no child
+enumeration and no cascade. **Containment does.** But Replace/Revoke does depend on a capability
+that is equally missing, and §5.2 measures it: the **cross-team lifecycle reach**. "The end-user
+credential is reachable through its own team" is true only for a caller *inside* that team, which
+the builder's credential is not; and the child cannot rotate itself (`:12004`). The tier's stated
+isolation claim ("a stolen child key = one end-user space") is only true for the *child*; the
+*parent* leak is currently unbounded in N **and** the parent cannot revoke what it minted. So
+**three** things must land before this tier is exposed to real end users: `#8694` (cascade) or a
+provisioning-side child enumeration; a builder-side child enumeration; and §9.1's lifecycle
+authority. The fallback runbook until then is **not** "N cross-team revoke calls issued from the
+builder's own record" — that runbook carries the same 403 as the Replace button; it is "the owner
+revokes the parent, and the children die with it" once `#8694` lands. Recorded as preconditions
+(§10), not silently assumed. The one shape that needs no cross-team reach is named in §9.1 (an
+in-team manager credential), and it is a fallback, not the recommendation.
 
 ### 5.4 What the end user cannot do (and should not)
 
@@ -282,11 +317,11 @@ The issue's indicator, answered without hedging:
 | 1 | Know which end user is which | the entire identity map (`app_user_id → team_id, credential_id`), and the obligation to keep PII out of labels | an opaque team + graph + credential; **no identity store** (§2) |
 | 2 | Create an end-user tenant | the call at signup/login, keyed to its own user id | sub-tenant provisioning `#557` S1 (**specified, unbuilt**) + `#318` default-pack activation |
 | 3 | Mint the end-user credential | one server-side call at login, with the expiry it wants | the mint, the child-policy clamping (scopes ∩ mintable, depth 0, no escalation), lineage — **shipped** primitives; the **cross-team** minting authority is the surface request (§9) |
-| 4 | The "leaked" affordance (button, copy, flow) | **all of it** — the UI, the wording, the re-issue of its own session | `rotate`: atomic, cap-neutral, class-inheriting, reveal-once (**shipped**, `#4355`); `DELETE` for terminal revoke (**shipped**) |
+| 4 | The "leaked" affordance (button, copy, flow) | **all of it** — the UI, the wording, the re-issue of its own session | `rotate`: atomic, cap-neutral, class-inheriting, reveal-once (**shipped**, `#4355`); `DELETE` for terminal revoke (**shipped**) — **but both only within the caller's own team** (`_ensure_key_in_pinned_org`, §5.2). Reaching an end-user credential from the builder's org is a surface request (§9.1), **not shipped** |
 | 5 | Isolation guarantee | nothing | the namespace boundary + scope resolution + (recommended) graph binding — **shipped** (§6.1) |
 | 6 | Rate limiting / abuse | the login-time mint cadence it drives | `abuse.py` key-create velocity evaluation on mint **and** rotate (`#308` R2, `_abuse_evaluate_keys`); per-embedder provisioning rate limit is `#557` S1 (D2/Q6) |
 | 7 | Audit | reads it, keeps its own copy of the end-user map | append-only, RLS-tenant-scoped `audit_events`; `api_key_create` / `api_key_rotate` rows (**shipped**); **revoke is NOT audited — measured gap, §8, filed as #9177**; `keys.audit.read` has no read surface (`#2427` §4.1) |
-| 8 | Containment of a leaked *provisioning* credential | issues N per-end-user revokes from its own map, until cascade/enumeration lands | `#8694` (cascade) + child enumeration — **both missing** (§5.3) |
+| 8 | Containment of a leaked *provisioning* credential | issues N per-end-user revokes from its own map — which itself needs §9.1's lifecycle reach | `#8694` (cascade) + child enumeration + cross-team revoke — **all three missing** (§5.3) |
 | 9 | Metering into its bill | sees the aggregate | per-team ledger **shipped**; parent-link roll-up specified for `#557` S3 (§6.2) |
 
 **One-line summary:** *Tortoise provides the credential lifecycle for a tenant it already isolates;
@@ -308,8 +343,12 @@ the builder provides the identity, the affordance, and the containment runbook.*
 | Key cap per org = 2 / 5 / 10 / 20 (free/solo/pro/team) | `product/pricing.json` → `tiers.*.max_api_keys` |
 | Metering identity is `(org_id, period_start)` | `tortoise/metering.py:6`, `:108`, `get_current_usage` |
 | No embedder/parent linkage in the control plane | `supabase/migrations/0006_teams.sql:23-43` (no parent column); no `embedder` concept in `tortoise/` |
-| Graph creation is session-authed only | `hosted_api.py:19275` (`POST /v1/graphs` → `get_current_user` + membership) |
-| `api_key_create` and `api_key_rotate` are audited | `hosted_api.py:11916`, `:12159`, `:27258`, `:27475` |
+| Graph creation: **two routes, one service** — key auth exists (`graphs:create`, non-minted key only) plus a session alias | `hosted_api.py:19220-19245` (`POST /v1/organizations/{org_id}/graphs` → `create_org_graph`, `get_current_org_gated`; `deleg=0` rejected `:19237-19241`, scope check `:19242-19244`); `:19275` (`POST /v1/graphs`, session alias) |
+| `rotate` is pinned to the caller's OWN org — a cross-team target key is a 403 | `hosted_api.py:12047` (`_ensure_key_in_pinned_org(…, required=True)`); helper contract `:6162-6185` ("must own the key UNCONDITIONALLY") → `403 "Not your API key"` |
+| `DELETE /v1/team/keys/{key_id}` carries the same pin on **both** lanes; key auth cannot override it | `hosted_api.py:12397` (supabase lane), `:12425` (registry lane); handler docstring "Org-scoped" (`:12335`); the key lane resolves the org from the key and ignores `?org_id=` (`:12345-12348`) |
+| A minted (`deleg=0`) credential cannot rotate anything, itself included | `hosted_api.py:12004` (`_reject_minted_delegated_key(org, "rotate API keys")`) |
+| `api_key_create` and `api_key_rotate` are audited | `hosted_api.py:11916` (`api_key_create`), `:12159` (`api_key_rotate`) |
+| The member self-service / recovery lanes audit a **third** action, `api_key_mint` — not evidence for create/rotate | `hosted_api.py:27258`, `:27475` (`_async_audit(…, "api_key_mint", …)`); named here so the three action names are not conflated (`#2446` lanes) |
 | **Key revoke writes NO audit row** | `hosted_api.py:12333-12451` (handler body, zero `_async_audit`); `supabase_control.revoke_api_key:1377` is a bare PATCH — **gap, filed as #9177** |
 | Parent revocation does not cascade to children | `#8694` OPEN (`#2427` §2.4) |
 | `#524` OAuth machinery shipped | `tortoise/oauth.py`; `hosted_api.py:38504-38807` (`/oauth/token`, `/oauth/revoke`, discovery) |
@@ -322,9 +361,22 @@ the builder provides the identity, the affordance, and the containment runbook.*
 method is added, by this design. What the tier needs is named here so the approval decision and the
 `#557` decomposition have one contract to build against:
 
-1. **v1 — cross-team minting authority (required, REST/internal only).** A capability that mints a
-   child credential **inside a team the caller provisioned**, under the caller's own authority.
-   Candidate shapes, cheapest first:
+1. **v1 — cross-team provisioning + lifecycle authority (required, REST/internal only).** A
+   capability that mints a child credential **inside a team the caller provisioned**, **and** can
+   **rotate and revoke the credentials it minted**, under the caller's own authority.
+   **Verbs in scope:** `POST /v1/team/keys` (mint) **plus** `POST /v1/team/keys/{key_id}/rotate` and
+   `DELETE /v1/team/keys/{key_id}` — only for a key whose `created_by_key_id` names the calling
+   credential. Without the two lifecycle verbs §5's Replace/Revoke story cannot be built at all: as
+   of this head both are pinned to the caller's own org (§5.2, §8) and the child cannot rotate
+   itself (`hosted_api.py:12004`). The authority is the same "teams it provisioned, nothing else"
+   boundary as minting (§3.3 properties 1 and 5) — it is **not** a master token and **not**
+   impersonation (D2/Q1).
+   **The alternative shape, stated so nobody re-derives it:** a per-end-user *manager* credential
+   held **inside** the end-user's team, used to rotate that team's end-user credential. It needs no
+   cross-team reach, but it needs a **deleg-NULL provisioning lane** (`rotate` rejects every
+   `deleg=0` caller at `:12004`) and it places an owner-class credential in the very team the end
+   user's graph lives in, which weakens §6.1's dormancy argument. Recorded as the fallback.
+   Candidate shapes for the cross-team authority, cheapest first:
    - **S-a (recommended)**: extend the existing mint route with an explicit, separately-authorised
      *target team* parameter — reusing the shipped `create_api_key` child-policy path, so the
      created class cannot be widened by the caller.
@@ -350,11 +402,14 @@ cost of a provisioning path that lives in the hosted control plane rather than t
 ### Preconditions before this tier is exposed to real end users
 
 1. `#557` S1 provisioning (teams + custom graphs, per §3.2) — unbuilt, scoped, zero sub-issues.
-2. `#8694` (revocation cascade) **or** a provisioning-side child enumeration — otherwise the
+2. **Cross-team lifecycle authority (§9.1)** — or the in-team manager shape it names as the
+   fallback. Without it, the Replace button and the containment runbook both 403 from the builder's
+   org (§5.2, §5.3), so the tier's headline UX is unimplementable.
+3. `#8694` (revocation cascade) **or** a provisioning-side child enumeration — otherwise the
    provisioning-credential compromise is unbounded in N (§5.3).
-3. An audit row on **revoke** (`#9177`, §8) — the compromise story's "old credential dead" must be
+4. An audit row on **revoke** (`#9177`, §8) — the compromise story's "old credential dead" must be
    *checkable* afterwards, not merely true.
-4. `keys.audit.read`-equivalent read surface (`#2427` §4.1) — without it the builder cannot *see* the
+5. `keys.audit.read`-equivalent read surface (`#2427` §4.1) — without it the builder cannot *see* the
    trail it is accountable for.
 
 ### Accepted residuals
@@ -376,9 +431,11 @@ grants (phase 4 of `#2427`); an end-user Tortoise account; federation.
 1. **Identity model** — an end user is an opaque builder-held id; no Tortoise account, no membership
    row, no PII (§2) ✔
 2. **Delegated credential contract** — class, team placement, scopes, expiry, lineage, and the
-   cross-team minting authority named as a surface request rather than cut (§3, §9) ✔
-3. **Compromise UX** — one Replace action, one backend call, same powers, old credential dead
-   atomically, and the containment precondition stated (§5) ✔
+   cross-team minting **and lifecycle** authority named as a surface request rather than cut (§3,
+   §5.2, §9.1) ✔
+3. **Compromise UX** — one Replace action, one backend call **from the builder's app** (the
+   Tortoise-side cross-team reach is the §9.1 request, measured as absent — §5.2), same powers, old
+   credential dead atomically, and the containment preconditions stated (§5, §10) ✔
 4. **Isolation + metering mapping** — three shipped locks, per-team ledger free, roll-up contract
    handed to `#557` S3 (§6) ✔
 5. **Abuse + audit** — velocity evaluation shipped; per-embedder provisioning limit in S1; builder-
