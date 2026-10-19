@@ -17,9 +17,13 @@ reproducible by any lane.
 
 ⚠️ **#9207 REVERSED this door's ordering**, so the numbers below are #9207's, not increment 4a's.
 \#7951 moved the record ABOVE the `DETACH DELETE` to close the resurrection window; #9207 measured the
-window that opened in exchange — with §17.1's write door armed (#9124) the append committed, the
-`DETACH DELETE` was refused **pre-write**, and `get_point` still served the Point, so the journal
-claimed a destruction the cache never performed and only a destructive `rebuild_all` could resolve it.
+mirror window that opened in exchange — a `DETACH DELETE` that does not land (a generic
+engine/transport failure, the node still present) raised with the destruction record ALREADY
+committed, so `get_point` still served the Point while the journal claimed it was gone, and only a
+destructive `rebuild_all` could resolve it. ⛔ It is NOT a systematic pre-write refusal: §17.1's write
+door (#9124) gates the FOLD lanes, not the raw `proj.g.query` lane this door writes through — section 1
+of the probe below prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the guard armed, which is
+why the failure in the test is INJECTED.
 The destroy is now issued FIRST (`MATCH … DETACH DELETE n`, with NO `RETURN` clause and no row-count
 gate) and the record follows only once that statement has RETURNED. Because a raise does not prove
 "nothing was destroyed" — the transport family may have applied the write and lost the reply — the

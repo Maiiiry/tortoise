@@ -201,14 +201,21 @@ def test_the_cache_delete_lands_before_the_destruction_record(env, monkeypatch):
 def test_a_failed_cache_write_appends_no_destruction_record(env, monkeypatch):
     """THE #9207 INVARIANT: the record may only claim what the cache DID.
 
-    The failure injected is the one #9207 MEASURED: the cache write refused by
-    §17.1's write door on a journal-backed projection (#9124), which raises
-    `DirectCacheWriteRefused` implement-side, before any statement reaches the
-    engine. Pre-fix (the #7951 append-first order) the journal ALREADY held the
-    `EntityMutated` op=delete record at that point while the cache still served
-    the Point — a committed record claiming a cache state the cache does not
-    have, whose only repair is a destructive `rebuild_all` that deletes a Point
-    the caller never managed to delete.
+    The failure injected is a cache write that did not reach the engine and
+    raised with the Point still present — the SHAPE #9207 cares about, injected
+    here because this door writes through the raw guarded handle (`proj.g.query`),
+    which §17.1's write door (#9124) does NOT cover: the gate raises
+    `DirectCacheWriteRefused` from the fold lanes (`FalkorProjection.apply` and
+    the projection's own `query`), so on THIS door it is not a systematic
+    pre-write refusal — the lane's own probe measured
+    `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the guard armed. The
+    reachable trigger is a generic engine/transport failure, which is rare; what
+    the ordering buys is the DIRECTION of the divergence it leaves. Pre-fix (the
+    #7951 append-first order) the journal ALREADY held the `EntityMutated`
+    op=delete record at that point while the cache still served the Point — a
+    committed record claiming a cache state the cache does not have, whose only
+    repair is a destructive `rebuild_all` that deletes a Point the caller never
+    managed to delete.
 
     The LOSS is asserted, not the code path: no destruction record for this id,
     the node still live, and no `:GraphEvent` `PointRetracted` row published to

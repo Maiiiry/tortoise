@@ -506,7 +506,7 @@ class WriteNotLandedError(RuntimeError):
                  detail: str = "", *, record_committed: bool = False,
                  operation: str = "create_point",
                  record: str | None = None,
-                 destroy_verified: bool = True) -> None:
+                 destroy_verified: bool = False) -> None:
         self.point_id = point_id
         self.graph = graph
         self.operation = operation
@@ -523,14 +523,16 @@ class WriteNotLandedError(RuntimeError):
         self.record_committed = record_committed
         # `delete_point` ONLY. `record_committed=False` has two sub-cases on
         # that door since #9207, and they must NOT share prose: the destroy
-        # LANDED and only the record is unconfirmed (the default), or the door
-        # could not determine whether the destroy landed at all
-        # (`destroy_verified=False` — the `DETACH DELETE` raised AND the
-        # read-back raised). The single message the door used to raise on both
-        # asserted "the `DETACH DELETE` did not report a failure of its own",
-        # which is the OPPOSITE of the second case, where that raise IS why the
-        # arm was reached — the same class of false claim #9207 exists to
-        # remove, one layer up.
+        # LANDED and only the record is unconfirmed, or the door could not
+        # determine whether the destroy landed at all. The flag is therefore
+        # OPT-IN (#9207 review): it defaults to the arm that CLAIMS NOTHING,
+        # because a constructor that forgets it must not assert a cache state
+        # nobody read — the door that knows the destroy landed passes True.
+        # The single message the class used to emit on both cases asserted
+        # "the `DETACH DELETE` did not report a failure of its own", which is the
+        # OPPOSITE of the unverified case, where that raise IS why the arm was
+        # reached — the same class of false claim #9207 exists to remove, one
+        # layer up.
         self.destroy_verified = destroy_verified
         _where = f" on graph {graph!r}" if graph else ""
         if record_committed:

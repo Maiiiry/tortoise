@@ -11669,17 +11669,26 @@ class TortoiseSDK:
         # #7951 put the `EntityMutated` op=delete APPEND first, so a cache
         # write that cannot be guaranteed could never destroy a node the
         # journal had not recorded. That closed the "`rebuild_all` resurrects
-        # it" window — and opened the one #9207 measured, which the caller
-        # cannot escape and which no replay repairs in the direction it asked
-        # for: with §17.1's write door armed, the append committed, the
-        # `DETACH DELETE` was refused, `delete_point` raised, and `get_point`
-        # still served the Point. The journal then records a destruction the
-        # cache never performed — the state §17.1's own definition forbids
-        # ("a derived cache that is also written to directly is not derived":
-        # the cache must never be AHEAD of the truth), and only a DESTRUCTIVE
-        # `rebuild_all` resolves it. The door is the proof that this is not a
-        # rare crash window but a systematic one: a refusal is decided
-        # pre-write, every time.
+        # it" window — and opened the mirror one: if the `DETACH DELETE` does
+        # NOT land, `delete_point` raised with a destruction record already
+        # committed, so `get_point` still served the Point while the truth
+        # claimed it was gone. A retry cannot be re-issued out of that state —
+        # over a still-present node it appends a SECOND destruction record for
+        # one intent — and only a DESTRUCTIVE `rebuild_all` resolves it.
+        #
+        # ⛔ What that window is NOT is a systematic pre-write refusal. The
+        # §17.1 write door (#9124) raises `DirectCacheWriteRefused` from the FOLD
+        # lanes (`FalkorProjection.apply` and the projection's own `query`);
+        # THIS door writes through the raw guarded handle (`proj.g.query`), which
+        # the gate does not cover. This lane's own probe measured exactly that —
+        # `journal_backed (guard armed): True`, then
+        # `RAW HANDLE LANE (proj.g.query): SUCCEEDED`
+        # (docs/evidence/7951-delete-point-outbox/probes/delete_order_probe.py,
+        # delete-order-probe.log). So the reachable trigger is a generic
+        # engine/transport failure with the node still present: RARE. The
+        # ordering below is justified by the DIRECTION of the divergence it
+        # leaves, not by its frequency — and the refusal test injects the
+        # failure rather than claiming the door produces it.
         #
         # So the destroy is issued FIRST and the record is written only once it
         # has RETURNED. A cache write that raises appends NOTHING, so #9207's
@@ -11774,9 +11783,11 @@ class TortoiseSDK:
             _reply_lost = exc
         if _reply_lost is not None:
             _logger.warning(
-                "delete_point: the DETACH DELETE applied but raised on the way "
-                "back (%s: %s) — the cache no longer holds the Point, so the "
-                "destruction record is written from the cache's own state",
+                "delete_point: the DETACH DELETE raised (%s: %s) and the cache "
+                "no longer holds the Point — either this statement applied and "
+                "the reply was lost, or the Point was already gone. The "
+                "destruction record is written from the cache's own state, "
+                "which is what this door can verify",
                 type(_reply_lost).__name__, _reply_lost)
         # The destroy LANDED (or the Point was already absent). Only now may
         # the journal say so.
@@ -11788,7 +11799,8 @@ class TortoiseSDK:
                 "its record then did not confirm; if that record did not land "
                 "the TRUTH still holds this Point",
                 operation="delete_point",
-                record="EntityMutated op=delete")
+                record="EntityMutated op=delete",
+                destroy_verified=True)
         # #3300 residual: ONE event type must not mean two end-states.
         # `delete_point` hard-deletes; `retract_point` tombstones. The single
         # `PointRetracted` (id=) call emitted BOTH stores, and its fold has
@@ -11866,9 +11878,10 @@ class TortoiseSDK:
         destroyed and the refusal is clean; ``None`` — the read failed too, so
         the caller must not claim either state.
 
-        Reading through the guarded handle is deliberate: this is a read, which
-        §17.1's write door (#9124) leaves alone, so the probe cannot be refused
-        and turn "unknown" into a spurious verdict.
+        Reading through the guarded handle is deliberate: the §17.1 gate covers
+        the FOLD lanes (`apply`, the projection's own `query`), NOT this raw
+        handle, so a READ here cannot be refused and turn "unknown" into a
+        spurious verdict.
         """
         try:
             rows = proj.g.query(

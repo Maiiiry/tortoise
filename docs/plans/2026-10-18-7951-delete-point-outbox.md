@@ -13,12 +13,16 @@ aboutObjects: "#7951, #7950, STORAGE-ARCHITECTURE.md §17.1, tortoise/sdk.py del
 
 > ⚠️ **SUPERSEDED IN PART BY #9207 (2026-10-19) — the ORDERING only.** This plan put the
 > `EntityMutated` op=delete record ABOVE the `DETACH DELETE` and made the append the commit point,
-> to close the resurrection window. #9207 measured the window that opened in exchange: on a
-> journal-backed projection with §17.1's write door armed (#9124) the append committed, the
-> `DETACH DELETE` was refused **pre-write** (`DirectCacheWriteRefused`), `delete_point` raised, and
-> `get_point` still served the Point — a journal record claiming a destruction the cache never
-> performed, resolvable only by a destructive `rebuild_all`. That refusal is deterministic, so this
-> was every delete, not a rare crash. The door now issues the destroy FIRST and appends the record
+> to close the resurrection window. #9207 measured the mirror window that opened in exchange: a
+> `DETACH DELETE` that does not land (a generic engine/transport failure with the node still present)
+> raised out of the door with the destruction record ALREADY committed, so `get_point` still served
+> the Point while the truth claimed it was gone — resolvable only by a destructive `rebuild_all`, and a
+> retry over a still-present node appends a SECOND record for one intent. ⛔ That window is RARE, not a
+> systematic pre-write refusal: §17.1's write door (#9124) raises `DirectCacheWriteRefused` from the
+> FOLD lanes, and this door writes through the raw guarded handle (`proj.g.query`), which the gate does
+> not cover — measured by this lane's own probe (`RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the
+> guard armed). The ordering is justified by the DIRECTION of the divergence it leaves, not its
+> frequency. The door now issues the destroy FIRST and appends the record
 > only once it has RETURNED (any row count — a zero-row write still leaves the node absent, so the
 > record is true of the cache); the remaining window (a landed destroy whose append failed) is
 > reported (`record_committed=False`) and is repaired only by a DESTRUCTIVE `rebuild_all`, which
