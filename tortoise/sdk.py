@@ -11434,24 +11434,18 @@ class TortoiseSDK:
             rebuild" until that fold lands.
 
             So the commit point is "after the guarded write, before anything
-            that can strand it". That is the CLOSEST this arm can take to its
-            siblings' policy, not the point they use, and the discriminator is
-            NOT "can the statement refuse" — ``retract_point`` appends
-            ``PointRetracted`` 44 lines before a CAS that raises on a zero row
-            (``sdk.py``'s ``_retract_witness`` docstring says so explicitly).
-            The discriminator is whether a refusal leaves the RECORD TRUE.
-            ``retract_point``'s zero row means the point is already terminal,
-            so the journaled retraction describes reality either way. A zero-row
-            promote means this call promoted nothing — the node is gone, its
-            status cannot promote, or it was already there (the idempotent
-            no-op named at the end of this paragraph) — so a record ahead of it
-            would journal a transition this call did not perform. That is why
-            this arm is apply-first (`#8830`) and records immediately AFTER the
-            guarded write, and
+            that can strand it". It is the closest this arm can take to its
+            siblings' journal-first policy (§17.1, #9124) and is NOT that
+            policy: a zero-row promote is a ROUTINE refusal (the node is gone,
+            or its status cannot promote), so a record ahead of it would
+            describe a transition the call did not perform. That is why this
+            arm is apply-first (`#8830`) and records immediately after the
+            guarded write;
             ``test_the_promote_arm_stays_apply_first_a_recorded_deviation``
-            keeps it there. It is reached only with a NON-EMPTY
+            keeps it there. Recording is reached only with a NON-EMPTY
             ``result_set``: every zero-row promote has already returned (the
-            idempotent live no-op) or raised (the diagnostic above).
+            idempotent live no-op, which journals nothing — #1088) or raised
+            (the diagnostic above).
 
             Best-effort, as at the old tail: ``_emit_event`` never raises, and
             the write it describes has already landed, so a failed append is
