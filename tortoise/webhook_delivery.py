@@ -30,8 +30,22 @@ THE CONTRACTS THIS MODULE PINS
 3. **Best-effort, never a caller's failure.** ``dispatch_pending`` never
    raises: a subscriber's dead endpoint, a TLS failure, or a graph hiccup
    becomes a receipt and a backoff, never an exception on the capture path.
-   Delivery runs at the END of a tenant's dream cycle (``hosted_api``
-   ``_dream_worker``) and on demand; it is never awaited by a mutation.
+   Delivery never runs inside a mutation: it runs at the END of a tenant's
+   dream cycle (``hosted_api`` ``_dream_worker``), from the SCHEDULED RETRY
+   SWEEP (#8098 — ``hosted_api._webhook_retry_sweep_pass``), and on demand.
+3b. **Two triggers, one due predicate (#8098).** The dream cycle is the
+   cadence for NEW events (a write enqueues the dream that pushes it), but it
+   is a WRITE-triggered cadence: for an idle tenant no dream runs, so a retry
+   whose ``next_attempt_at`` elapses would wait for that tenant's next write.
+   The sweep is the second trigger, and both it and the dispatcher build their
+   query from the SAME two module-level clauses below — ``_DUE_PREDICATE``
+   (is it due by TIME) and ``_BEHIND_PREDICATE`` (is it actually BEHIND the
+   stream) — so a change to one can never leave the other behind. The gate
+   admits a graph only when the answer to both is yes, which is the condition
+   that makes "one SDK open only for the graphs that answered yes" true: see
+   the ``#8098 review F3`` notes on those constants for what the temporal half
+   alone was admitting (every tenant that had ever registered a webhook,
+   forever).
 4. **Retry is bounded, then the subscription is DISABLED.** Exponential
    backoff (``BASE_BACKOFF_S * 2**(attempt-1)``, capped at
    ``MAX_BACKOFF_S``); after ``max_attempts`` consecutive failures the
@@ -45,6 +59,14 @@ THE CONTRACTS THIS MODULE PINS
    creation, and never by a read path; it is stored encrypted via
    ``crypto.encrypt_token`` (Fernet, ``TORTOISE_ENCRYPTION_KEY``), the same
    at-rest treatment as the OAuth tokens on the Org node.
+6. **The destination is judged at CONNECT time, not only at registration.**
+   ``create_subscription`` refuses a non-global IP literal and a local name,
+   but it does not resolve DNS — so the answer DNS gives at DISPATCH is the
+   first real look at the destination. ``_pinned_targets`` resolves, refuses
+   any non-global answer (and any MIXED answer, whole), and dials the vetted
+   ADDRESS with ``Host``/SNI still on the hostname. A refusal is a receipt
+   (``retrying``/``exhausted``), never a silent success — see the transport
+   section (#8103, closing the residual #2081 documented).
 
 STORAGE (graph-native, per-graph = per-org — mirrors ``event_store``: the
 namespace IS the partition, there is no ``org_id`` property):
@@ -61,15 +83,23 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import math
 import os
+import ssl
 import time
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from urllib.parse import urlsplit
 
-from tortoise.env_truthy import FALSY
+from tortoise.env_truthy import FALSY, env_flag
 
 from .ids import ulid
-from .security import env_int, redact_error, validate_webhook_url
+from .security import (
+    env_int,
+    redact_error,
+    resolve_webhook_addresses,
+    validate_webhook_url,
+)
 
 logger = logging.getLogger("tortoise.webhook_delivery")
 
@@ -78,6 +108,26 @@ logger = logging.getLogger("tortoise.webhook_delivery")
 #: is a no-op; registration still works so a tenant can stage a subscription
 #: before ops flips egress on.
 KILL_SWITCH_ENV = "TORTOISE_WEBHOOK_DISPATCH"
+
+#: #8098: the scheduled retry sweep. Interval BETWEEN passes, in seconds. The
+#: retry-resume target is "within ≤ one interval of ``next_attempt_at``", so
+#: this is the knob that bounds retry latency for an IDLE tenant; the first
+#: retry backoff is ``BASE_BACKOFF_S`` (30s), hence the 60s default (≤30s of
+#: overshoot on the shortest backoff).
+SWEEP_INTERVAL_ENV = "TORTOISE_WEBHOOK_SWEEP_INTERVAL"
+SWEEP_INTERVAL_DEFAULT_S = 60
+#: Enable knob for the SWEEP alone (tristate, default ON). Separate from the
+#: ``TORTOISE_WEBHOOK_DISPATCH`` kill switch so an operator can stop the
+#: always-on fleet sweep without disabling the write-triggered dream-cycle push
+#: (and vice versa: the kill switch stops BOTH — it is honoured by the sweep too).
+SWEEP_ENABLED_ENV = "TORTOISE_WEBHOOK_SWEEP"
+#: Graph-dispatch concurrency within ONE pass. Each graph is an independent
+#: connect + read (+ HTTP when due), so a pass over N idle tenants is N serial
+#: round trips at 1; bounded because every graph is a real connection and the
+#: pass must not become a fleet-wide connection stampede.
+SWEEP_CONCURRENCY_ENV = "TORTOISE_WEBHOOK_SWEEP_CONCURRENCY"
+SWEEP_CONCURRENCY_DEFAULT = 4
+SWEEP_CONCURRENCY_MAX = 16
 
 #: Consecutive failures before a subscription is disabled (no further dispatch).
 MAX_ATTEMPTS_DEFAULT = 8
@@ -132,6 +182,50 @@ def backoff_seconds(attempt: int) -> int:
 
 def max_attempts() -> int:
     return env_int("TORTOISE_WEBHOOK_MAX_ATTEMPTS", MAX_ATTEMPTS_DEFAULT)
+
+
+def sweep_enabled() -> bool:
+    """Is the SCHEDULED retry sweep armed? (tristate, default ON).
+
+    ``env_flag`` semantics, deliberately: unset/blank/garbage resolve to the
+    default, so a typo can never silently disarm the one trigger that retries an
+    idle tenant. A deployment that wants it off says so explicitly (``0``).
+    """
+    return env_flag(SWEEP_ENABLED_ENV, True)
+
+
+def sweep_interval_s() -> int:
+    """Validate ``TORTOISE_WEBHOOK_SWEEP_INTERVAL`` to a positive int.
+
+    Same contract as ``monitoring.event_retention_interval``: anything that is
+    not a positive whole number of seconds falls back to the default with a
+    warning. ``0``/negative is REFUSED rather than accepted because
+    ``asyncio.sleep(0)`` returns immediately — an accepted zero would turn the
+    sweep into a busy loop against every tenant graph in the fleet.
+    """
+    raw = os.environ.get(SWEEP_INTERVAL_ENV)
+    if raw is None or not str(raw).strip():
+        return SWEEP_INTERVAL_DEFAULT_S
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a whole number of seconds — using %ds",
+            SWEEP_INTERVAL_ENV, raw, SWEEP_INTERVAL_DEFAULT_S)
+        return SWEEP_INTERVAL_DEFAULT_S
+    if value < 1:
+        logger.warning(
+            "%s=%r is not a positive number of seconds — using %ds (a "
+            "zero/negative interval would sweep the fleet in a busy loop)",
+            SWEEP_INTERVAL_ENV, raw, SWEEP_INTERVAL_DEFAULT_S)
+        return SWEEP_INTERVAL_DEFAULT_S
+    return value
+
+
+def sweep_concurrency() -> int:
+    """Clamp ``TORTOISE_WEBHOOK_SWEEP_CONCURRENCY`` to ``[1, MAX]``."""
+    value = env_int(SWEEP_CONCURRENCY_ENV, SWEEP_CONCURRENCY_DEFAULT)
+    return max(1, min(int(value), SWEEP_CONCURRENCY_MAX))
 
 
 def _iso(dt: datetime) -> str:
@@ -348,6 +442,107 @@ def verify_signature(secret: str, header: str, body: bytes, *,
 
 # ── Transport ─────────────────────────────────────────────────────────────
 
+#: Default port per scheme — used to decide whether the ``Host`` header may
+#: omit the port when the request is re-pointed at a vetted address (#8103).
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+#: How many vetted addresses one delivery may DIAL. Every answer is validated
+#: (a mixed answer is refused whole), and the loop is bounded by COUNT here while
+#: the shared budget in ``WebhookTransport.post`` bounds it by TIME — both are
+#: needed: each candidate is a separate socket and a separate TLS handshake, so
+#: time alone would still open as many sockets as the resolver invented inside
+#: the budget. Same number as ``cimd.MAX_ADDRESSES``.
+MAX_PINNED_ADDRESSES = 8
+
+
+def _pinned_targets(url: str, *, resolver=None
+                    ) -> tuple[tuple[str, str, str | None], ...]:
+    """Return the CONNECT-TIME pin candidates for ``url``, one per vetted address.
+
+    Each entry is ``(pinned_url, host_header, sni_hostname)``.
+
+    The residual #2081 left documented: the registration predicate
+    (``security.validate_webhook_url``) never resolves, so the name is only
+    judged at DISPATCH — by the resolver, whose answer nothing checked. A name
+    that is public at registration and re-pointed afterwards (DNS rebinding),
+    or one that was private all along, would make this process sign and POST an
+    event payload to an address the tenant never should have reached.
+
+    So the delivery resolves FIRST, judges EVERY answer with the shared policy
+    :func:`security.is_global_address` — the same predicate the registration gate
+    applies to a literal, wrapped for the connect half in
+    :func:`security.resolve_webhook_addresses` — and then pins the socket: the returned URL carries the VETTED
+    ADDRESS, while the returned ``host_header`` and ``sni`` keep the HTTP
+    ``Host`` header and the TLS server name on the hostname. Resolve-then-
+    hand-the-name-to-the-client would only NARROW the TOCTOU window (the
+    client resolves again); dialing the address we vetted REMOVES it.
+
+    ``validate_webhook_url`` runs first as a defence-in-depth re-check: the URL
+    being dispatched is a value read back from the graph, not a value that
+    passed through registration in this process, so the full registration
+    policy is re-applied rather than assumed. Both halves therefore share ONE
+    policy home (``security``) instead of growing a second list here.
+
+    ONE CANDIDATE PER VETTED ADDRESS, in resolver order — the caller fails over
+    between them. Pinning to a single address would have quietly dropped the
+    multi-address failover the un-pinned transport inherited from
+    ``socket.create_connection`` (a dual-stack target whose first answer is
+    unreachable on this host would stop delivering); the addresses are all
+    vetted, so trying them in turn keeps that behaviour AND the pin.
+    """
+    validate_webhook_url(url)
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").strip().lower().rstrip(".")
+        port = parts.port
+    except ValueError as e:  # malformed IPv6 literal / bad port
+        raise ValueError(f"webhook url is not parseable: {e}") from e
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _DEFAULT_PORTS:
+        raise ValueError(
+            f"webhook url scheme must be http or https, not {scheme or '(none)'}")
+    if not host:
+        raise ValueError("webhook url has no host")
+    default_port = _DEFAULT_PORTS[scheme]
+    port = port or default_port
+    # The name must be ASCII before it is used ANYWHERE: ``Host`` is a header
+    # value and ``sni_hostname`` a TLS server name, and httpx encodes neither
+    # with a utf-8 fallback — so handing it the raw IDN form raises
+    # ``UnicodeEncodeError`` on EVERY attempt. That is not a ``ConnectError``,
+    # so it lands in ``post``'s catch-all, the delivery is recorded as failed,
+    # and ``MAX_ATTEMPTS_DEFAULT`` then DISABLES the subscription: an IDN
+    # callback host that delivers today would go silently to zero deliveries.
+    # Pre-pin delivery worked because httpx's own urlparse IDNA-encoded the name
+    # before dialing — so normalise ONCE, here (``bücher.example.com`` →
+    # ``xn--bcher-kva.example.com``), and use the punycode form for the resolver,
+    # the ``Host`` header and SNI alike. It is also the form libc resolves and
+    # the form the subscriber's vhost and certificate are keyed on. IPv6
+    # literals are already ASCII and pass through unchanged.
+    try:
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError as e:
+        raise ValueError(
+            f"webhook url host {host!r} is not a valid IDNA name ({e}) — "
+            f"refusing to deliver") from e
+    # Every answer must be global; a mixed answer is refused WHOLE. Only then
+    # are addresses chosen, and they are what gets dialed.
+    addresses = resolve_webhook_addresses(ascii_host, port, resolver=resolver)
+    target = parts.path or "/"
+    if parts.query:
+        target = f"{target}?{parts.query}"
+    bracketed = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    host_header = bracketed if port == default_port else f"{bracketed}:{port}"
+    # SNI (and therefore certificate verification) stays on the NAME: httpcore
+    # passes ``request.extensions['sni_hostname']`` to ``start_tls`` and httpx
+    # forwards extensions to httpcore.
+    sni = ascii_host if scheme == "https" else None
+    candidates: list[tuple[str, str, str | None]] = []
+    for address in addresses[:MAX_PINNED_ADDRESSES]:
+        literal = f"[{address}]" if ":" in address else address
+        candidates.append((f"{scheme}://{literal}:{port}{target}", host_header, sni))
+    return tuple(candidates)
+
+
 class WebhookTransport:
     """The one place an outbound POST happens. Injectable for tests.
 
@@ -356,21 +551,104 @@ class WebhookTransport:
     redirect would let the subscriber move the actual request somewhere the
     predicate never saw. A 3xx is therefore a FAILED delivery (the caller
     sees the status in the receipt).
+
+    The CONNECT-TIME half of that control is :func:`_pinned_targets` (#8103):
+    the target is resolved and judged here, and the request goes to a vetted
+    address — so a rebound name cannot reach what registration refused, while a
+    dual-stack target keeps its multi-address failover. A refusal is returned as
+    ``(None, reason)``, i.e. an ordinary failed delivery that
+    ``dispatch_pending`` records as a ``retrying``/``exhausted`` receipt: never
+    a raise, and never a silent success.
+
+    ``trust_env=False`` is load-bearing, not hygiene: an env-configured proxy
+    would take an absolute-form request and resolve the NAME itself, which
+    silently discards the pin and lets DNS decide the destination again. A
+    direct connection is what makes the check meaningful — the same choice
+    ``cimd``'s fetch makes by driving ``httpcore`` directly.
+
+    ``resolver`` is injectable so the pin is testable without DNS.
     """
 
-    def __init__(self, timeout_s: int = TIMEOUT_S) -> None:
+    def __init__(self, timeout_s: int = TIMEOUT_S, *, resolver=None) -> None:
         self.timeout_s = timeout_s
+        self._resolver = resolver
 
     def post(self, url: str, body: bytes, headers: dict) -> tuple[int | None, str | None]:
-        """Return ``(status_code, error)`` — exactly one of the two is ``None``."""
+        """Return ``(status_code, error)`` — exactly one of the two is ``None``.
+
+        The candidate addresses share ONE ``timeout_s`` budget, so a hostile
+        resolver cannot turn one delivery into ``MAX_PINNED_ADDRESSES`` connect
+        timeouts. Stated exactly: the CONNECT phase is bounded by ``timeout_s`` in
+        total. ``httpx``'s float timeout is a PER-PHASE timeout, so a candidate
+        that completes its connect inside the budget may still spend one further
+        read/write phase after the last deadline check — the same per-phase
+        property the pre-pin ``httpx.post(timeout=...)`` had for a single target.
+        """
+        try:
+            candidates = _pinned_targets(url, resolver=self._resolver)
+        except ValueError as e:
+            # A refused target is a RECEIPT, never a raise — same contract as a
+            # transport failure, so the retry/backoff/disable path owns it.
+            return None, redact_error(e)
         import httpx
 
-        try:
-            resp = httpx.post(url, content=body, headers=headers,
-                              timeout=self.timeout_s, follow_redirects=False)
-            return resp.status_code, None
-        except Exception as e:
-            return None, redact_error(e)
+        # Scrub any caller-supplied ``Host`` in ANY case spelling before setting
+        # ours: two Host headers make h11 refuse the request outright, so a
+        # stray lowercase key would turn the override into a hard delivery
+        # failure instead of an override.
+        out_headers = {k: v for k, v in headers.items() if k.lower() != "host"}
+        # ``Host`` and ``sni_hostname`` are the same for every candidate — the
+        # pin moves the ADDRESS only, never the name the subscriber's vhost and
+        # its certificate are keyed on.
+        host_header, sni = candidates[0][1], candidates[0][2]
+        out_headers["Host"] = host_header
+        extensions = {"sni_hostname": sni} if sni else None
+        # ``trust_env=False`` keeps an env-configured proxy from re-resolving the
+        # name and discarding the pin — but httpx reads ``SSL_CERT_FILE`` /
+        # ``SSL_CERT_DIR`` ONLY when ``trust_env`` is on, so turning it off also
+        # silently dropped the CA seam an operator-configured deployment relies
+        # on. Restored EXPLICITLY here: a bundle supplied by env var still
+        # verifies. Left UNSET otherwise, so an unset environment keeps httpx's
+        # own default (and any ``verify`` a caller injects).
+        cafile = os.environ.get("SSL_CERT_FILE")
+        capath = os.environ.get("SSL_CERT_DIR")
+        client_kwargs: dict = {"follow_redirects": False, "trust_env": False}
+        if cafile or capath:
+            client_kwargs["verify"] = ssl.create_default_context(
+                cafile=cafile, capath=capath)
+        # Connect-class failures move on to the NEXT vetted address; any other
+        # error is the answer — a read-phase failure is not attributable to the
+        # address (the peer, or a middlebox in front of it, answered), so walking
+        # on to the untried candidates would not fix it.
+        connect_errors = (httpx.ConnectError, httpx.ConnectTimeout)
+        error: str | None = None
+        # The ADDRESS CAP bounds the loop by COUNT; the budget bounds it by TIME.
+        # Eight blackholed answers at the 10 s default would otherwise be ~80 s
+        # of wall clock for ONE event, against ~10 s before the pin. Each attempt
+        # gets what is left of one overall budget, and the loop stops when it is
+        # gone.
+        deadline = time.monotonic() + self.timeout_s
+        for pinned_url in (candidate[0] for candidate in candidates):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                error = (
+                    f"connect budget of {self.timeout_s}s exhausted before any "
+                    f"vetted address answered"
+                    + (f" (last error: {error})" if error else ""))
+                break
+            attempt_timeout = min(float(self.timeout_s), remaining)
+            try:
+                with httpx.Client(timeout=attempt_timeout,
+                                  **client_kwargs) as client:
+                    resp = client.post(pinned_url, content=body,
+                                       headers=out_headers, extensions=extensions)
+                return resp.status_code, None
+            except connect_errors as e:
+                error = redact_error(e)
+                continue
+            except Exception as e:
+                return None, redact_error(e)
+        return None, error or "no vetted address accepted the connection"
 
 
 def _status_code(value) -> int | None:
@@ -403,13 +681,279 @@ def _delivery_body(sub: dict, event: dict) -> bytes:
 
 # ── Dispatcher ────────────────────────────────────────────────────────────
 
-def _due_subscriptions(proj, now: datetime) -> list[dict]:
+#: The ONE due predicate (#8098). The dispatcher reads it as a MATCH+RETURN
+#: of the rows; the sweep reads it as a bare COUNT over a RAW graph handle (no
+#: SDK, no index, no node — see ``due_subscription_count``). Two copies of this
+#: string is the drift this constant exists to prevent.
+#:
+#: ⛔ TWO clauses, and BOTH are needed (#8098 review F3/P1). The temporal half
+#: alone is TRUE for any subscription in its healthy steady state:
+#: ``create_subscription`` writes no ``next_attempt_at`` and ``_mark_delivered``
+#: resets it to NULL on every success, so "due by time" describes a subscription
+#: for its entire life, not only while it owes something. Gating on it alone
+#: therefore paid a full per-graph SDK open (plus the three
+#: ``ensure_subscription_schema`` index statements) every interval for every
+#: tenant that had EVER registered a webhook, whether or not a single event was
+#: pending — the exact fleet-wide cost the sweep exists to bound.
+_DUE_PREDICATE = (
+    "s.disabled_at IS NULL "
+    "AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= $now)"
+)
+
+#: The WORK half of the predicate, kept beside the temporal half so the two can
+#: never drift (#8098 review F3). A subscription is only worth an SDK open when
+#: it is behind the stream — ``s.cursor < $head`` means at least one event with
+#: a higher ``seq`` EXISTS, i.e. ``read_after`` can return something (a delivery
+#: that caught up has ``cursor == head`` and is a guaranteed no-op).
+#:
+#: THREE admission cases survive on purpose, and all are cheap no-ops the gate
+#: cannot see without reading the stream itself:
+#:
+#: * a ``types``-filtered subscription whose pending events are all of a type it
+#:   does not want (the filter is applied app-side in ``read_after``);
+#: * a subscription whose unread events were PURGED (retention) while its
+#:   cursor stayed behind — the counter's head then exceeds the store's max seq;
+#: * a MISSED seq: ``next_seq`` handed a number out but nothing was appended
+#:   under it (``sdk._emit_event`` calls ``next_seq`` then ``append_event`` in
+#:   one ``try/except`` that logs and continues, and ``append_event`` also skips
+#:   a duplicate ``event_id``). The counter then sits ABOVE
+#:   ``max(:GraphEvent.seq)`` — the same SHAPE the purge produces, and the more
+#:   common source of it, because it needs no retention window at all.
+#:
+#: ⛔ NONE of these is bounded by the retry ladder (#8098 review, non-counted):
+#: the ladder disables a subscription only when a delivery FAILS, and none of
+#: them ever fails a delivery. The FIRST is bounded by the TENANT (a
+#: ``types``-filtered subscription is quiet for at most as long as no matching
+#: event is emitted, so it resolves when the tenant's next matching event
+#: arrives — not on a timer).
+#:
+#: The PURGED-CURSOR and MISSED-SEQ cases have NO bound at all: ``read_after``
+#: returns ``[]``, so nothing is delivered and nothing
+#: FAILS — no attempt accrues, no backoff is written, and nothing ever disables
+#: the subscription inside ``max_attempts``. Their cursor stays below ``$head``
+#: forever — the missed-seq graph heals only on that tenant's next SUCCESSFUL
+#: emit, which for an idle tenant never comes — so the graph is admitted (one SDK
+#: open, one no-op dispatch) on every interval, indefinitely. That is cheap but
+#: unbounded, and it is stated here rather than papered over: the real remedy is
+#: to advance such a cursor past ``:GraphEventMeta.first_seq`` (purge) or to the
+#: store's max seq (missed) when ``read_after`` comes back empty — deliberately
+#: NOT done in #8098, because silently advancing a cursor past events that
+#: retention removed is a delivery-loss decision that belongs with the dispatch
+#: state machine, not smuggled in as a cost optimisation.
+_BEHIND_PREDICATE = "(s.cursor IS NULL OR s.cursor < $head)"
+
+
+def event_head_seq(graph) -> int:
+    """#8098: the highest ``:GraphEvent`` seq this graph has HANDED OUT (0 if none).
+
+    The ``$head`` half of ``_BEHIND_PREDICATE``, and the reason the gate can
+    answer "nothing owed" for a caught-up subscription. Takes a RAW graph handle
+    (``proj.g`` or ``db.select_graph(name)``) for the same reason
+    ``due_subscription_count`` does: the sweep must not open an SDK to ask.
+
+    ONE node read, not a scan: every writer allocates through
+    ``event_store.next_seq``, which MERGEs a single ``:GraphEventMeta`` node per
+    graph and bumps ``last_seq`` there — so the head is a property of one node
+    rather than an aggregate over the (unbounded, purged, millisecond-indexed)
+    ``:GraphEvent`` label. That matters: the gate runs once per tenant graph per
+    interval, so its cost has to stay flat.
+
+    ``:GraphEventMeta`` ABSENT means nothing was ever allocated through the
+    allocator — a graph that has never emitted. The fallback still asks the
+    events themselves, because a store whose events predate the counter (a
+    fixture, or a graph written by ``append_event`` directly) must not be
+    STARVED by a gate that assumed "no counter ⇒ no events". ABSENT is one of
+    TWO cases that reach the fallback (the other is a counter that is not a
+    trustworthy position, below); a healthy counter keeps the steady state at
+    the one-node read.
+
+    A corrupt counter is treated EXACTLY like an absent one, and for the same
+    reason: ``head`` is not the sweep's gate alone. The dispatcher threads it
+    into ``_BEHIND_PREDICATE`` (``s.cursor < $head``), so a head of 0 answers
+    "nothing owed" for every subscription on the graph — ``create_subscription``
+    writes ``cursor: 0``, and ``0 < 0`` is false. Reading a corrupt counter as 0
+    would therefore STARVE the graph's deliveries with no log line at all, which
+    is the opposite of this gate's stated bias.
+
+    "Corrupt" is the same domain ``event_store.next_seq`` refuses on the write
+    side: anything that is not a real number (a numeric STRING included — the
+    store is explicit that a property of another type is "refused, never
+    coerced", because ``'5' + 1`` cannot be compared), a NEGATIVE value, or a
+    ``bool`` — which is an ``int`` subclass, so ``int(True) == 1`` would
+    otherwise pass as a trustworthy head of 1 while the events run to 5. A
+    non-integral float (``2.9``) is not a position either. All of them take the
+    events fallback, whose head is at or above every deliverable seq: it can only
+    over-admit, never stall.
+
+    ⚠️ COST, stated rather than implied (an earlier revision of this docstring
+    priced the corrupt path as "one SDK open" — it is not). The fallback is the
+    aggregate over ``:GraphEvent`` the opening paragraph exists to avoid on the
+    steady path, so an UNTRUSTWORTHY graph pays it on every pass, and the counter
+    does not become trustworthy on its own. What the write side actually does,
+    MEASURED — the three classes behave differently and only one self-heals:
+
+    * a non-number, a ``bool`` AND a negative are REFUSED by ``next_seq`` and
+      left unchanged (the negative fails its ``prev >= 0`` grant test — a graph
+      holding one cannot emit at all). ``reestablish_watermark`` refuses the
+      non-number/bool AFTER the write ("the monotone clause only compares
+      numbers … preserved rather than replaced"), and a rebuild never reaches a
+      negative in the first place: ``capture_watermark`` — the pre-wipe read —
+      raises "the live :GraphEventMeta.last_seq is -1, outside the event-store
+      integer domain", so the rebuild ABORTS instead of repairing it. **None of
+      these three has an automatic repair path**, and this fallback is permanent
+      for them;
+    * only a NON-INTEGRAL FLOAT is bumped by ``next_seq`` (``2.9`` → ``3.9``,
+      handing out a seq an existing ``:GraphEvent`` already holds — the #4653
+      collision), and ``reestablish_watermark`` reports it repaired only when the
+      events' max exceeds it: with ``max(:GraphEvent.seq) = 3`` and a counter of
+      ``3.9`` the monotone clause PRESERVES ``3.9`` while the read-back truncates
+      and RETURNS ``3`` — a false repair. So even this class clears only below
+      the events' max.
+
+    ⛔ THE ONE CASE THIS FIX'S OVER-ADMISSION IS NOT A CHEAP NO-OP. Every
+    unbounded admission ``_BEHIND_PREDICATE`` enumerates costs one SDK open and
+    one no-op dispatch. A :GraphEvent row whose ``seq`` is FRACTIONAL is not that:
+    the head here is ``ceil(max_seq)``, but ``_mark_delivered`` writes the cursor
+    as ``int(seq)``, so the cursor can never reach the head. MEASURED on three
+    events with the last rewritten to ``3.5``: head 4, pass 1 delivers 3
+    (cursor → 3), and passes 2, 3, … each RE-DELIVER the same event, staying due
+    forever. That is bounded only by the at-least-once contract (a re-post
+    carries the same stable delivery id, so an idempotent consumer dedupes it),
+    not by anything here. The remedy is the cursor write, tracked with the rest
+    of it in #9032; no shipped writer mints a fractional ``seq``, so this needs a
+    hand-written or restored row.
+
+    A too-LARGE counter is left alone for that same asymmetry — it over-admits
+    too, and clamping it would stall deliveries.
+    """
+
+    def _as_seq(raw) -> int | None:
+        """A usable COUNTER value, or ``None`` when it must not be trusted.
+
+        Strictly numeric: no string coercion (``event_store`` refuses a
+        non-number rather than parsing it), no ``bool`` (an ``int`` subclass),
+        no non-integral float. The LAST of those is this function's addition to
+        ``next_seq``'s guard rather than a copy of it, and a counter at/above
+        ``MAX_SEQ`` is accepted here although ``next_seq`` refuses it — both for
+        the reason the outer docstring gives: over-admitting is the cheap side.
+        """
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        if isinstance(raw, float) and not raw.is_integer():
+            return None
+        seq = int(raw)
+        return seq if seq >= 0 else None
+
+    def _events_head() -> int:
+        """The events' own max seq — deliberately OVER-admitting, never strict.
+
+        ⚠️ NOT ``_as_seq``, on purpose. Strictness is right for the counter and
+        WRONG here: on this read a rejection IS the stall direction, because the
+        value returned is the ``$head`` that decides whether a subscription is
+        returned at all. A ``:GraphEvent.seq`` that is not an integer (a float
+        from a hand-written or restored row) must still be rounded UP so
+        ``read_after``'s payload is not filtered out by ``s.cursor < $head``;
+        coercing a numeric string generously has the same justification. Only a
+        value no number can be made of falls to 0.
+        """
+        rows = graph.query(
+            "MATCH (e:GraphEvent) RETURN max(e.seq)").result_set
+        raw = rows[0][0] if rows else None
+        try:
+            num = float(raw)
+        except (TypeError, ValueError):
+            return 0
+        if not math.isfinite(num):
+            return 0
+        return max(0, math.ceil(num))
+
+    rows = graph.query(
+        "MATCH (m:GraphEventMeta) RETURN max(m.last_seq)").result_set
+    head = _as_seq(rows[0][0] if rows else None)
+    if head is None:
+        return _events_head()
+    return head
+
+
+def due_subscription_count(graph, now: datetime | None = None,
+                          head: int | None = None) -> int:
+    """#8098: how many subscriptions this graph owes a delivery RIGHT NOW.
+
+    THE SWEEP'S GATE, and the reason the sweep is affordable. It takes a RAW
+    graph handle (``proj.g``, or ``db.select_graph(name)`` from the data-plane
+    handle) rather than a projection, so the caller does not have to open an SDK
+    — let alone a projection with its journal bind and embedder warm-up — to ask
+    a question whose answer is "no" for every tenant that has never registered a
+    subscription (i.e. almost all of them).
+
+    Cost, MEASURED (embedded FalkorDB via a redislite server, 300 calls after
+    warm-up, p50 / p95 ms): the COUNT read — which was the whole pre-fix gate —
+    is 0.5/2.1 on an empty graph, 0.5–1.4/1.4–4.3 with 2000 unrelated
+    ``:Filler`` nodes, 0.5–0.7/3.9–5.7 with 25 subscriptions (the per-graph cap,
+    index present). The HEAD read (``event_head_seq``) is 0.6–1.9/3.7–9.8, and
+    the FULL gate (both clauses, both reads) is 1.4–3.5/10.5–17.4. Two things
+    that measurement is here to record: the cost is FLAT in graph SIZE (a label
+    scan reads the label's node set, not the graph — which is also why the
+    ``MAX_SUBSCRIPTIONS`` cap bounds it; the head is a property of ONE node) and
+    it creates NOTHING (no index, no node — the p95 tail is the embedded store's
+    own jitter, the same on every row, not a function of the read).
+
+    FOR SCALE, the term the second clause REMOVES (same box, same script): one
+    ``TortoiseSDK`` + ``_get_proj()`` + ``dispatch_pending`` on a graph whose
+    subscription is caught up — the per-graph, per-interval cost the pre-fix
+    always-true gate paid for every subscriber tenant, forever — measures
+    **20.7 / 76.9 ms**. So the extra head read is ~1–2 ms spent to avoid a
+    ~20 ms (p50) to ~77 ms (p95) SDK open that delivered nothing, and the
+    ratio only grows with the journal bind and the embedder warm-up, neither of
+    which the embedded measurement pays in full.
+
+    The ``:ContextSubscription`` label has no index unless a subscription was
+    created (``ensure_subscription_schema`` is the only place one is minted), so
+    this read is the label scan it must be on a graph that has never held a
+    subscription; a graph that HAS one carries the index.
+
+    WHAT IT ANSWERS (#8098 review F3/P1): "does this graph owe a delivery right
+    now" — a subscription that is due by TIME (``_DUE_PREDICATE``) **and** behind
+    the stream (``_BEHIND_PREDICATE``). The second half is not an optimization:
+    without it the gate is TRUE for the whole life of every healthy subscription
+    (``_mark_delivered`` resets ``next_attempt_at`` to NULL), so every pass paid
+    a full ``_make_sdk(graph_name=…)`` + ``_get_proj()`` (journal bind, embedder
+    warm-up) for a dispatcher that then delivered nothing. ``head`` is read once
+    per graph (``event_head_seq``) and may be passed in by a caller that already
+    read it (``dispatch_pending`` does, so the two see ONE head).
+
+    Never raises for a *state* problem — an unheld label reads as 0. A transport
+    failure DOES propagate, and the caller treats that graph as "unknown, skip
+    this pass" rather than "not due" (a failed read must not be read as "no").
+    """
+    if head is None:
+        head = event_head_seq(graph)
+    rows = graph.query(
+        f"MATCH (s:ContextSubscription) WHERE {_DUE_PREDICATE} "
+        f"AND {_BEHIND_PREDICATE} RETURN count(s)",
+        params={"now": _iso(now or _now()), "head": int(head)},
+    ).result_set
+    return int(rows[0][0]) if rows and rows[0][0] is not None else 0
+
+
+def _due_subscriptions(proj, now: datetime,
+                       head: int | None = None) -> list[dict]:
+    """The dispatcher's half of the ONE predicate — same two clauses as the gate.
+
+    The cursor clause is what makes the gate and the dispatcher answer the SAME
+    question (#8098 review F3): a caught-up subscription is not returned here at
+    all, so ``dispatch_pending`` no longer reads the stream once per caught-up
+    subscription, and a graph whose subscriptions are all caught up returns
+    BEFORE ``ensure_subscription_schema`` (three ``CREATE INDEX`` statements)
+    like a graph with no subscriptions at all.
+    """
+    if head is None:
+        head = event_head_seq(proj.g)
     rows = proj.g.query(
         "MATCH (s:ContextSubscription) "
-        "WHERE s.disabled_at IS NULL "
-        "AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= $now) "
+        f"WHERE {_DUE_PREDICATE} AND {_BEHIND_PREDICATE} "
         "RETURN properties(s) ORDER BY s.created_at ASC",
-        params={"now": _iso(now)},
+        params={"now": _iso(now), "head": int(head)},
     ).result_set
     return [r[0] for r in rows]
 
@@ -468,8 +1012,11 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
                      batch: int = DEFAULT_BATCH) -> dict:
     """Push pending events to every due subscription. NEVER raises.
 
-    Runs at the end of a tenant's dream cycle (``hosted_api._dream_worker``)
-    and on demand. Each subscription is drained IN ORDER from its cursor; the
+    Three triggers, one predicate (#8098): the end of a tenant's dream cycle
+    (``hosted_api._dream_worker`` — the cadence for NEW events), the SCHEDULED
+    RETRY SWEEP (``hosted_api._webhook_retry_sweep_pass`` — the trigger for a
+    retry whose backoff elapsed while the tenant stayed idle), and on demand.
+    Each subscription is drained IN ORDER from its cursor; the
     first failure stops that subscription's batch (head-of-line ordering is
     what makes the at-least-once contract re-deliverable) and schedules the
     retry. Returns a summary dict for logging/tests:
@@ -489,7 +1036,11 @@ def dispatch_pending(proj, *, transport=None, now: datetime | None = None,
         # every test that drives a dream) must take this path WITHOUT creating
         # an index. Index creation is a graph WRITE, and a delivery pass that
         # has nothing to deliver should leave the graph byte-identical.
-        subs = _due_subscriptions(proj, now_dt)
+        # "Nothing to deliver" includes "every subscription is caught up" —
+        # `_due_subscriptions` carries the ``cursor < head`` clause, so the
+        # head is read ONCE here and threaded into the query (#8098 review F3).
+        head = event_head_seq(proj.g)
+        subs = _due_subscriptions(proj, now_dt, head=head)
     except Exception as e:
         logger.warning("webhook_delivery: subscription read failed: %s",
                        redact_error(e))

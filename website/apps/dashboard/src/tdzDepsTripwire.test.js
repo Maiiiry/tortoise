@@ -389,6 +389,8 @@ test('#3726: the analyzer sees EXACTLY these hook deps arrays in main.jsx', () =
   "tab, team, checking, authed, welcomeMode, deepLinkTick",
   "reposLoaded, onboarding, reposList, currentOrgId, reposLoadFailed",
   "accountMenuOpen",
+  // #2728: the dialog's background-inert effect, keyed on the graph it holds.
+  "packsGraphId",
   "createTeamOpen",
   "revealKey",
   "authMode, sessionBooted",
@@ -404,12 +406,21 @@ test('#3726: the analyzer sees EXACTLY these hook deps arrays in main.jsx', () =
   "",
   "",
   "currentOrgId",
+  // #2728: the Configured-packs home's summary read (Settings tab + the
+  // selected graph + the graph list that supplies the initial default).
+  "tab, packsHomeGraphId, graphs, currentOrgId",
   "overviewDataComplete, overviewAnnounced",
   "tab, welcomeMode, team",
   "overviewSkeletonLive, frameStale",
   "keys",
   "backupInfo",
   "tab",
+  // #3514 review P2 — the two dialog effects in MemorySources: Escape is bound on
+  // the DOCUMENT while the dialog is open (a keydown whose target is outside the
+  // modal never reaches the modal's own handler), and focus is MOVED on each
+  // state transition (a reconciled control never honours `autoFocus`).
+  "comingSoonKey",
+  "comingSoonKey, comingSoonStatus",
   ])
 })
 
