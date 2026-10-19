@@ -38,7 +38,8 @@ the classifier's own polarity is "anything not provably read-only is a write".
 That OVER-report polarity is what `_text` implements — every unresolved part of
 an f-string or a `+` skeleton returns `None` rather than a placeholder, because
 a placeholder lets `f"MATCH (n:Point {{id:$id}}) {action}"` read as a non-write
-and drop the whole function out of the census. `_UNRESOLVED` for that reason, not because they are believed to write.
+and drop the whole function out of the census. `_UNRESOLVED` lists them for that reason, not because they are believed to
+write.
 
 WHICH EXPRESSION IS THE HANDLE. `proj.g`, `self._get_proj().g` (any attribute
 chain whose LAST attribute is `g`), `getattr(x, "g")`, and any name bound from
@@ -50,15 +51,17 @@ one of those by `h = proj.g`, `h: Any = proj.g`, `h, _ = proj.g, 1` or
 passed as an ARGUMENT is resolved as the handle only when it arrives on a
 PARAMETER of the receiving function (any parameter except `self`/`cls`), which is
 the over-report direction: `clear_config_reset(self._get_proj().g)` → `clear_config_reset(g)` issues a
-`DETACH DELETE` at projection/__init__.py:1509 and is invisible without it
+`DETACH DELETE` at projection/__init__.py:1519 (`clear_config_reset`, def at 1509) and is invisible without it
 (measured: 23 such writers package-wide). `functools.partial` over a verb, and a
 handle stashed on an object attribute (`self._h = proj.g`) then used later, are
-NOT resolved. Measured on this tree: sdk.py's 7 verb calls on a parameter
-receiver are 3 read-only `MATCH … RETURN` probes (`_holds_role_available`,
-`_refuse_inverted_point_window`, `_refuse_inconsistent_validity_precision`), 1
-unresolved read (`_source_reachable_by`) and 3 calls to the SDK's own `query`
-method (`self.query`, excluded because `self` is never a handle parameter); none
-is a write. A new write through one of the unresolved shapes would be invisible here,
+NOT resolved. Measured on this tree: sdk.py has 4 verb calls on a parameter
+receiver — 3 resolved read-only `MATCH … RETURN` probes
+(`_holds_role_available`, `_refuse_inverted_point_window`,
+`_refuse_inconsistent_validity_precision`) and 1 unresolved read
+(`_source_reachable_by`) — and none is a write. `self.query(...)` calls are NOT
+in that population, because `self`/`cls` are never treated as handle parameters.
+A NESTED function writing through an alias captured from its parent is also not
+resolved (aliases are tracked per function; measured 0 live instances). A new write through one of the unresolved shapes would be invisible here,
 so the shapes are named in this docstring instead of being claimed away.
 
 WHY `sdk.py` AND `event_store.py`, AND NOT EVERY MODULE. These two are what part
@@ -96,6 +99,18 @@ EVENT_STORE_PY = ROOT / "tortoise" / "event_store.py"
 _APPEND_CALL_RE = re.compile(
     r"^(?:_?emit_event|_?apply_and_journal|_?journal_\w+|_?emit_\w+_record"
     r"|append_event)$")
+
+#: Names the pattern above would call an append but which append NO record — a
+#: helper that normalises params or reads a timestamp. Counting one of these as
+#: the commit point would make `_journal_first_violation` pass on a door whose
+#: record never landed (the #9124 review round-3 P2, measured: `_journal_instant`
+#: is called before the folds' writes). The list may only grow with PROOF, and
+#: `test_the_append_exclusions_append_nothing` is that proof — it re-reads each
+#: definition and fails if the body calls a real append helper.
+_APPEND_NOT_A_RECORD = {
+    "_journal_instant",       # entities.py: reads the record's instant
+    "_journal_safe_params",   # projection/__init__.py: sanitises params
+}
 
 #: The scope openers, PLUS the decorator that opens one around a whole door.
 #: `_onboarding_write_scope` is the onboarding funnel's own opener (`with
@@ -328,7 +343,7 @@ def _is_handle_ref(expr, aliases, params=()) -> bool:
     deliberate over-report: a handle RECEIVED AS AN ARGUMENT has no binding to
     follow, and measured on this tree it is how a real writer hides
     (`clear_config_reset(self._get_proj().g)` → `clear_config_reset(g)` issues a
-    `DETACH DELETE` at projection/__init__.py:1509 with no declaring lane).
+    `DETACH DELETE` at projection/__init__.py:1519 (`clear_config_reset`, def at 1509) with no declaring lane).
     Counting a parameter receiver as the handle can over-report a helper that
     takes a *projection* — which stays visible in the census — and it cannot
     hide a writer.
@@ -462,24 +477,36 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
     """Map each innermost function to what it does at the write handle.
 
     Returns ``{function name: {lineno, writes, reads, appends, scopes, aliases,
-    params}}`` for every function holding at least one mutating call. Both call
-    lists carry the CONTROL-FLOW DEPTH as their last element — `writes` entries
-    are ``(line, verb, statement-prefix, depth)`` and `appends` entries are
-    ``(line, depth)`` — because an append only guarantees the record precedes a
-    write when it is no deeper in the branch tree than that write. Nested
-    functions are attributed to THEMSELVES, never to their enclosing function (a
-    helper's write is not its caller's).
+    params, def_linenos, duplicate_writer_defs}}`` for every function holding at
+    least one mutating call. Both call lists carry the CONTROL-FLOW DEPTH as
+    their last element — `writes` entries are ``(line, verb, statement-prefix,
+    depth)`` and `appends` entries are ``(line, depth)`` — because an append only
+    guarantees the record precedes a write when it is no deeper in the branch
+    tree than that write.
+
+    The census is built per DEFINITION and then keyed by name (what an inventory
+    entry names): `def_linenos` records every definition merged in, and
+    `duplicate_writer_defs` flags a name whose definitions BOTH write — merging
+    one def's lane with another def's write would be unsound, so the gate reports
+    it instead. Nested functions are attributed to THEMSELVES, never to their
+    enclosing function (a helper's write is not its caller's).
     """
     tree = ast.parse(source, filename=filename)
     consts = _module_consts(tree)
-    facts: dict[str, dict] = {}
+    # Keyed by DEFINITION, not by name: a module may define the same function
+    # name twice (a Protocol stub plus its implementation — `apply`,
+    # `exact_objects`), and merging them would report one def's line with
+    # another's writes. The public surface is still keyed by name (that is what
+    # an inventory entry names), and a name whose defs BOTH write is flagged.
+    facts: dict[tuple[str, int], dict] = {}
 
     def visit(node, current, local, cond=0):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            current = node.name
+            current = (node.name, node.lineno)
             fact = facts.setdefault(current, {
-                "lineno": node.lineno, "writes": [], "reads": 0, "appends": [],
-                "scopes": [], "aliases": set(), "params": set(),
+                "name": node.name, "lineno": node.lineno, "writes": [],
+                "reads": 0, "appends": [], "scopes": [], "aliases": set(),
+                "params": set(),
             })
             args = node.args
             fact["params"] = {
@@ -510,7 +537,8 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
 
         if isinstance(node, ast.Call):
             opener = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-            if opener and _APPEND_CALL_RE.match(opener):
+            if opener and _APPEND_CALL_RE.match(opener) \
+                    and opener not in _APPEND_NOT_A_RECORD:
                 fact["appends"].append((node.lineno, cond))
             elif opener in _SCOPE_CALL_NAMES:
                 fact["scopes"].append((node.lineno, opener))
@@ -547,36 +575,71 @@ def enumerate_handle_surface(source: str, filename: str = "<src>") -> dict:
                 visit(child, current, local, nested)
 
     visit(tree, None, {})
+    surface: dict[str, dict] = {}
+    writers_per_name: dict[str, int] = {}
     for fact in facts.values():
+        if not fact["writes"]:
+            continue
         fact["writes"].sort()
-    return {name: fact for name, fact in facts.items() if fact["writes"]}
+        name = fact["name"]
+        writers_per_name[name] = writers_per_name.get(name, 0) + 1
+        entry = surface.get(name)
+        if entry is None:
+            surface[name] = {
+                "lineno": fact["lineno"], "writes": list(fact["writes"]),
+                "reads": fact["reads"], "appends": list(fact["appends"]),
+                "scopes": list(fact["scopes"]), "aliases": set(fact["aliases"]),
+                "params": set(fact["params"]), "def_linenos": {fact["lineno"]},
+            }
+            continue
+        entry["writes"].extend(fact["writes"])
+        entry["reads"] += fact["reads"]
+        entry["appends"].extend(fact["appends"])
+        entry["scopes"].extend(fact["scopes"])
+        entry["aliases"] |= fact["aliases"]
+        entry["params"] |= fact["params"]
+        entry["def_linenos"].add(fact["lineno"])
+    for name, entry in surface.items():
+        entry["writes"].sort()
+        # Two DEFINITIONS of one name that both write: the name-level verdict
+        # would mix one def's lane with another's write, so it is reported
+        # instead of merged. No such pair exists today.
+        entry["duplicate_writer_defs"] = writers_per_name[name] > 1
+    return surface
 
 
 def _journal_first_violation(fact) -> str | None:
     """Why this function's record does not provably precede its write, or None.
 
-    Two checks, both necessary and neither sufficient: SOURCE ORDER (the first
-    append is not after the first write) and CONTROL-FLOW DEPTH (the append is
-    not buried deeper than the write — an `_emit_event` inside an `if`/`try`
-    while the write runs unconditionally is the "declaration blesses a cache
-    write with no committed record" shape even when its line comes first).
+    One check, existential over the appends and measured against the SHALLOWEST
+    write: some append must have (a) a smaller line number than that write and
+    (b) a control-flow depth no greater than it. (a) alone is not enough — an
+    `_emit_event` inside an `if`/`try` while the write runs unconditionally is
+    the "declaration blesses a cache write with no committed record" shape even
+    when its line comes first; (b) alone is not enough — a record appended AFTER
+    the write is not a commit point. Neither, of course, is sufficient: a record
+    skipped by an earlier `return` is invisible to an AST.
     """
     if not fact["appends"]:
         return ("appends no record at all — a live lane is 'append first, then "
                 "write the cache'")
-    first_write = fact["writes"][0]
-    first_append = min(fact["appends"])
-    if first_write[0] < first_append[0]:
-        return (f"writes at line {first_write[0]}, BEFORE its first append at "
-                f"{first_append[0]} ({first_write[1]}: {first_write[2]!r}) — that "
-                "is the apply-first shape, and the declaration would bless it")
-    if first_append[1] > min(write[3] for write in fact["writes"]):
-        unconditional = min(write[3] for write in fact["writes"])
-        return (f"appends its record at line {first_append[0]} inside a "
-                f"conditional/try block while a write runs OUTSIDE any branch "
-                f"(depth {unconditional}, e.g. line {fact['writes'][0][0]} "
-                f"{fact['writes'][0][1]}) — the record is not guaranteed to "
-                "precede that write")
+    shallowest = min(fact["writes"], key=lambda write: write[3])
+    # EXISTENTIAL, not "the first append": a door may emit a best-effort
+    # diagnostic record inside `try/except` and its real record unconditionally,
+    # so what matters is that SOME record precedes the shallowest write — one
+    # that runs no deeper in the branch tree than that write does.
+    if not any(append[0] < shallowest[0] and append[1] <= shallowest[3]
+               for append in fact["appends"]):
+        earliest = min(fact["appends"])
+        if earliest[0] > shallowest[0]:
+            return (f"writes at line {shallowest[0]} "
+                    f"({shallowest[1]}: {shallowest[2]!r}) BEFORE its first "
+                    f"append at {earliest[0]} — that is the apply-first shape, "
+                    "and the declaration would bless it")
+        return (f"has no append that runs before line {shallowest[0]} at depth "
+                f"{shallowest[3]} — its records are at "
+                f"{[(line, depth) for line, depth in fact['appends']]}, so a "
+                "branch can reach the write with no record appended")
     return None
 
 
@@ -614,6 +677,10 @@ def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
     surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
     offenders = []
     for name, fact in sorted(surface.items(), key=lambda kv: kv[1]["lineno"]):
+        if ("tortoise/sdk.py", name) in _PROVEN_READS:
+            # Proven read-only in review: the ONE register the flip gate also
+            # consults, so the two gates cannot demand contradictory bookkeeping.
+            continue
         kind = _kind(fact)
         reason = _inventory_of(name)
         if kind == "declared":
@@ -904,18 +971,28 @@ def _modules_reaching_the_handle():
     undeclared entry points, and `onboarding/state.py` — the #9121 write funnel,
     which DOES declare its lane — was not among them. Selection goes through the
     SAME enumerator the census uses, so population and census cannot disagree.
+    A module that will not PARSE is collected, never skipped: a silent skip
+    shrinks the population, and a shrunken population is how the flip gate goes
+    vacuously green. Returns ``[(relative path, surface)]`` so the gate consumes
+    the parse this function already paid for.
     """
-    out = []
+    out, unparsable = [], []
     for path in sorted((ROOT / "tortoise").rglob("*.py")):
         source = path.read_text(errors="replace")
         try:
-            parsed = ast.parse(source)
+            surface = enumerate_handle_surface(source, str(path))
         except SyntaxError:
+            unparsable.append(path.relative_to(ROOT).as_posix())
             continue
-        if parsed is None:  # pragma: no cover — keep the linters honest
-            continue
-        if enumerate_handle_surface(source, str(path)):
-            out.append(path)
+        if surface:
+            out.append((path.relative_to(ROOT).as_posix(), surface))
+    assert not unparsable, (
+        "these package modules do not parse, so the population the flip gate "
+        f"scans is not the whole tree: {unparsable}")
+    assert out, (
+        "the package-wide scan found NO module with a mutating handle call — the "
+        "enumerator or the tree walk is broken, and an empty population would "
+        "let the flip gate pass vacuously")
     return out
 
 
@@ -946,28 +1023,50 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
     THE REMAINDER HAS TWO KINDS, and the remedy differs, so the message says
     which is which. A function whose statement the census could PROVE mutating
     needs a declared lane (or an inventory entry). A function whose statement it
-    could NOT resolve needs a HUMAN verdict — prove it read-only, or declare a
-    lane if it writes — because the runtime door classifies the REAL text, so a
-    static "unresolved" is not itself a refusal risk: `_statement_writes` on the
-    actual statement is what would refuse. Telling a reader to wrap a read in a
-    write lane is how a redundant, misleading scope gets added (the #9124 review
-    P2), so an unresolved entry is reported as unproven, never as a missing lane.
+    could NOT resolve needs a HUMAN verdict — prove it read-only (and pin it in
+    `_PROVEN_READS`, the ONE register both tests consult) or declare a lane if it
+    writes. The runtime door classifies the REAL text, so a static "unresolved"
+    is not itself a refusal risk; but it is not a non-risk either, which is why
+    an unproven entry blocks the flip rather than being assumed read-only.
+    Telling a reader to wrap a read in a write lane is how a redundant,
+    misleading scope gets added (#9124 review P2), so an unproven entry is
+    reported as unproven, never as a missing lane.
 
-    While the switch is OFF the census is still proven REAL (not an empty scan):
-    every inventoried SDK name must appear in it.
+    The VACUITY FLOOR runs in BOTH modes, before either branch: the population
+    must be non-empty and must contain every inventoried SDK entry point —
+    otherwise a broken enumerator would make the armed check pass over an empty
+    set, which is the rubber stamp this whole suite exists to prevent.
     """
+    population = _modules_reaching_the_handle()
     provable: dict[str, list[str]] = {}
     unproven: dict[str, list[str]] = {}
-    for path in _modules_reaching_the_handle():
-        surface = enumerate_handle_surface(path.read_text(errors="replace"), str(path))
-        rel = path.relative_to(ROOT).as_posix()
+    seen_sdk: set[str] = set()
+    for rel, surface in population:
         for name, fact in sorted(surface.items()):
-            if fact["scopes"] or (rel, name) in _CALLER_DECLARED:
+            accounted = bool(fact["scopes"]) or (rel, name) in _CALLER_DECLARED
+            proven_read = (rel, name) in _PROVEN_READS
+            if rel == "tortoise/sdk.py":
+                seen_sdk.add(name)
+            if proven_read or accounted:
                 continue
-            if (rel, name) in _PROVEN_READS:
-                continue
+            assert not fact.get("duplicate_writer_defs"), (
+                f"{rel}::{name} is defined more than once and BOTH definitions "
+                "write the handle — the name-level verdict would mix one def's "
+                "lane with another def's write")
             bucket = unproven if _is_unresolved_only(fact) else provable
             bucket.setdefault(rel, []).append(f"{name}:{fact['lineno']}")
+
+    # THE FLOOR — proven REAL in both modes, on the same population the armed
+    # check uses.
+    assert len(population) > 10, (
+        f"the package-wide scan found only {len(population)} module(s) with a "
+        "mutating handle call; a population that small means the enumerator or "
+        "the tree walk is broken, and the armed check would pass vacuously")
+    missing = sorted(_all_inventoried() - seen_sdk)
+    assert not missing, (
+        "the package scan did not see every inventoried SDK entry point — the "
+        "scan itself is broken, so the arming gate would pass vacuously. "
+        f"missing={missing}")
 
     if _HANDLE_GUARD_ENFORCES:
         blocked = []
@@ -986,18 +1085,72 @@ def test_arming_the_guard_requires_a_fully_declared_surface():
             "fully declared — arming here refuses the product's own writes. "
             "A helper whose only caller declares belongs in `_CALLER_DECLARED`. "
             "Before flipping the switch, clear both lists:\n" + "\n".join(blocked))
-        return
 
-    # Part 1's state: measuring, and the census must be able to see the remainder
-    # it is measuring — a scanner that silently returns nothing would make the
-    # check above vacuous on the day someone flips the switch.
-    sdk_seen = {name.split(":")[0]
-                for bucket in (provable, unproven)
-                for name in bucket.get("tortoise/sdk.py", [])}
-    assert _all_inventoried() <= sdk_seen, (
-        "the package scan did not see every inventoried SDK entry point — the "
-        "scan itself is broken, so the arming gate would pass vacuously. "
-        f"missing={sorted(_all_inventoried() - sdk_seen)}")
+
+def _call_is_inside_a_scope(func, callee) -> bool:
+    """Is a call to `callee` inside the body of a `with <scope>(...):` block?"""
+    for node in ast.walk(func):
+        if not isinstance(node, ast.With):
+            continue
+        openers = []
+        for item in node.items:
+            if isinstance(item.context_expr, ast.Call):
+                opener = getattr(item.context_expr.func, "id", None) or getattr(
+                    item.context_expr.func, "attr", None)
+                if opener in _SCOPE_CALL_NAMES:
+                    openers.append(opener)
+        if not openers:
+            continue
+        for body_node in node.body:
+            for inner in ast.walk(body_node):
+                if isinstance(inner, ast.Call):
+                    target = getattr(inner.func, "id", None) or getattr(
+                        inner.func, "attr", None)
+                    if target == callee:
+                        return True
+    return False
+
+
+def test_the_append_exclusions_append_nothing():
+    """`_APPEND_NOT_A_RECORD` may only hold names that append NO record.
+
+    The pattern that recognises an append (`_journal_*`, `_emit_*`) is a
+    heuristic over NAMES, and a helper like `_journal_instant` reads a timestamp.
+    Counting one of those as the commit point would let
+    `_journal_first_violation` pass on a door whose record never landed, so each
+    exclusion is PROVEN here: the definition is found in the package and its body
+    calls no append helper. An exclusion that stops existing fails too.
+    """
+    defs: dict[str, list[ast.AST]] = {}
+    for path in sorted((ROOT / "tortoise").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(errors="replace"))
+        except SyntaxError:  # pragma: no cover — population test reports those
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defs.setdefault(node.name, []).append(node)
+
+    offenders = []
+    for name in sorted(_APPEND_NOT_A_RECORD):
+        bodies = defs.get(name)
+        if not bodies:
+            offenders.append(f"{name} is excluded but no longer defined anywhere")
+            continue
+        for body in bodies:
+            for call in ast.walk(body):
+                if not isinstance(call, ast.Call):
+                    continue
+                target = getattr(call.func, "id", None) or getattr(
+                    call.func, "attr", None)
+                if target and _APPEND_CALL_RE.match(target) \
+                        and target not in _APPEND_NOT_A_RECORD:
+                    offenders.append(
+                        f"{name} (definition at line {body.lineno}) CALLS "
+                        f"{target} — it appends a record, so excluding it would "
+                        "hide a real commit point")
+                    break
+    assert not offenders, "\n  " + "\n  ".join(offenders)
 
 
 def test_the_caller_declared_exemptions_are_still_caller_declared():
@@ -1025,20 +1178,16 @@ def test_the_caller_declared_exemptions_are_still_caller_declared():
             offenders.append(f"{rel}::{callee} has no call site at all")
             continue
         for func in callers:
-            # The CALLER need not touch the handle itself (both wrappers are
-            # pure `with <scope>(...): return self._x(...)` shells), so the scope
-            # is looked for in its own body, not in its surface fact.
-            opens = []
-            for node in ast.walk(func):
-                if isinstance(node, ast.Call):
-                    opener = getattr(node.func, "id", None) or getattr(
-                        node.func, "attr", None)
-                    if opener in _SCOPE_CALL_NAMES:
-                        opens.append(opener)
-            if not opens:
+            # CONTAINMENT, not mere presence: the call must sit inside the body
+            # of a `with <scope>(...):` — a caller that opens a lane, leaves it,
+            # and only then calls the callee would be credited by a
+            # "some opener appears in the body" check while the callee's writes
+            # run unauthorized.
+            if not _call_is_inside_a_scope(func, callee):
                 offenders.append(
                     f"{rel}::{callee} is called from {func.name}:{func.lineno}, "
-                    "which declares no lane — the exemption is stale")
+                    "which does not hold a lane around that call — the "
+                    "exemption is stale")
     assert not offenders, ("\n  " + "\n  ".join(offenders))
 
 
