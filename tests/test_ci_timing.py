@@ -945,11 +945,104 @@ def test_a_partial_reading_cannot_lower_a_recorded_weight(tmp_path: Path) -> Non
     assert durations["test_surface_manifest.py"] == 199.1
     assert durations["test_6211_ep_scale.py"] == 19.0
     assert stats["kept_as_lower_bound"] == 2
-    # held rows state the floor they were held against, so a reader can audit it
-    assert ("test_surface_manifest.py: 199.1  # "
-            f"{_LOWER_BOUND_LABEL}: top-15 saw 2 of 10 testcases = 36.0s, a LOWER "
-            "bound; kept 199.1") in text
+    # A HELD row keeps the note that records the run its surviving value came
+    # from, and the rejected reading is APPENDED — substituting the basis for the
+    # citation is how 13 held rows lost the run that produced their number
+    # (#9134 review, P2).
+    assert ("test_surface_manifest.py: 199.1  # #9017 CI-junit 2026-10-18 "
+            "(run 39165691659); was 180.7"
+            f" — {_LOWER_BOUND_LABEL}: top-15 saw 2 of 10 testcases = 36.0s, a "
+            "LOWER bound; kept 199.1") in text
     assert ci_timing.validate_refreshed_manifest(text) == []
+
+
+def _rendered_single_test(tmp_path: Path) -> tuple[str, dict]:
+    """A file that declares ONE `def test` — the shape that is unprovable."""
+    path = _bridge_manifest(
+        tmp_path,
+        "surfaces:\n  core:\n    - test_single.py\n"
+        "durations:\n  test_single.py: 42.4  # #9017 CI-junit 2026-10-18 "
+        "(run 39165691659); was 58.1\n",
+    )
+    return ci_timing.render_refreshed_manifest(
+        path.read_text(),
+        # a `venv` + `pip install` wheel test: its cost is fixture time, and one
+        # measured entry is all a single-test file can ever show
+        {"test_single.py": 40.6},
+        "2026-10-19T05:02:37Z",
+        coverage={"test_single.py": (1, 1)},
+        sample_label=_LOWER_BOUND_LABEL,
+    )
+
+
+def test_a_single_test_file_can_never_be_proven_fully_covered(tmp_path: Path) -> None:
+    """THE OTHER HALF OF THE #9134 P1 DEFECT. `declared == 1` makes `observed <
+    declared` unsatisfiable: ANY measured entry gives `observed >= 1`, so a
+    partial reading of a single-test file was classified fully covered and its
+    weight could be lowered — the `test_backup_e2e.py` 13.1 -> 4.8 and
+    `bench/test_smoke_embedded.py` 38.6 -> 24.3 shape.
+
+    Non-vacuity: pre-fix `kept = observed < declared and measured < previous` is
+    False here (1 < 1), so the row is adopted at 40.6 and both assertions fail.
+    """
+    text, stats = _rendered_single_test(tmp_path)
+    assert yaml.safe_load(text)["durations"]["test_single.py"] == 42.4
+    assert stats["kept_as_lower_bound"] == 1
+    row = next(ln for ln in text.split("\n")
+               if ln.strip().startswith("test_single.py:"))
+    # the note says WHY it could not be adopted, not that it saw the only test
+    assert "a single-test file cannot prove full coverage" in row
+    assert "kept 42.4" in row
+
+
+def test_an_absent_denominator_is_unknown_not_fully_covered(tmp_path: Path) -> None:
+    """A witness that DOES NOT COVER the row (no declared count: an unparsable
+    or deleted file) is UNKNOWN, and UNKNOWN must not licence a discount.
+
+    Non-vacuity: pre-fix `observed, declared = (0, 0)` made `observed < declared`
+    False, so the row was adopted at 4.0.
+    """
+    text, _ = ci_timing.render_refreshed_manifest(
+        "surfaces:\n  core:\n    - test_unknown.py\n    - test_covered.py\n"
+        "durations:\n  test_unknown.py: 30.0  # #3554: a local estimate\n"
+        "  test_covered.py: 5.0\n",
+        {"test_unknown.py": 4.0, "test_covered.py": 4.0},
+        "2026-10-19T05:02:37Z",
+        coverage={"test_covered.py": (5, 5)},
+        sample_label=_LOWER_BOUND_LABEL,
+    )
+    durations = yaml.safe_load(text)["durations"]
+    assert durations["test_unknown.py"] == 30.0
+    # the row that DOES have a witness may still be adopted — the rule is about
+    # proof, not about freezing the map
+    assert durations["test_covered.py"] == 4.0
+    row = next(ln for ln in text.split("\n")
+               if ln.strip().startswith("test_unknown.py:"))
+    assert "no declared testcase count" in row
+    assert "#3554: a local estimate" in row
+
+
+def test_a_held_row_states_one_basis_across_refreshes(tmp_path: Path) -> None:
+    """The map is rewritten every week: a held row must not accumulate one basis
+    sentence per refresh (nothing else prunes this file)."""
+    path = _bridge_manifest(
+        tmp_path,
+        "surfaces:\n  core:\n    - test_held.py\n"
+        "durations:\n  test_held.py: 50.0\n",
+    )
+    first, _ = ci_timing.render_refreshed_manifest(
+        path.read_text(), {"test_held.py": 10.0}, "2026-10-19T05:02:37Z",
+        coverage={"test_held.py": (1, 9)}, sample_label=_LOWER_BOUND_LABEL)
+    second, _ = ci_timing.render_refreshed_manifest(
+        first, {"test_held.py": 11.0}, "2026-10-26T05:02:37Z",
+        coverage={"test_held.py": (1, 9)},
+        sample_label="ci-timing top-15 2026-10-26 (run 40000000000)")
+    held_row = next(ln for ln in second.split("\n")
+                    if ln.strip().startswith("test_held.py:"))
+    assert held_row.count("a LOWER bound; kept 50.0") == 1
+    assert "2026-10-19" not in held_row
+    assert "run 40000000000" in held_row
+    assert yaml.safe_load(second)["durations"]["test_held.py"] == 50.0
 
 
 def test_a_partial_reading_may_raise_a_recorded_weight(tmp_path: Path) -> None:
@@ -983,30 +1076,55 @@ def test_a_rebased_row_replaces_a_stale_provenance_tail(tmp_path: Path) -> None:
     cited run is not in the basis is dropped as stale provenance" — is applied by
     the writer, and the replacement states the basis that IS.
 
-    Non-vacuity: pre-fix every tail was preserved verbatim, so both the
-    `not in text` and the `was 199.1` assertions fail.
+    The row's value MOVES here: a note that IS the citation has nothing that
+    survives a re-base. A HELD row is the opposite case and keeps its citation —
+    see `test_a_partial_reading_cannot_lower_a_recorded_weight`.
+
+    Non-vacuity: pre-fix every tail was preserved verbatim, so the `not in text`
+    assertions fail.
     """
-    text, _ = _rendered_lower_bound(tmp_path)
-    held_row = next(ln for ln in text.split("\n")
-                    if ln.strip().startswith("test_surface_manifest.py:"))
-    assert "run 39165691659" not in held_row
-    assert "CI-junit" not in held_row
-    assert "was 180.7" not in held_row
+    text, _ = ci_timing.render_refreshed_manifest(
+        "surfaces:\n  core:\n    - test_rebased.py\n"
+        "durations:\n  test_rebased.py: 36.0  # #9017 CI-junit 2026-10-18 "
+        "(run 39165691659); was 180.7\n",
+        {"test_rebased.py": 199.1},
+        "2026-10-19T05:02:37Z",
+        coverage={"test_rebased.py": (7, 7)},
+        sample_label=_LOWER_BOUND_LABEL,
+    )
+    row = next(ln for ln in text.split("\n")
+               if ln.strip().startswith("test_rebased.py:"))
+    assert "run 39165691659" not in row
+    assert "CI-junit" not in row
+    assert "was 180.7" not in row
+    assert row.strip() == f"test_rebased.py: 199.1  # {_LOWER_BOUND_LABEL}; was 36.0"
 
 
 def test_a_rebased_row_keeps_a_design_note_and_appends_the_new_basis() -> None:
-    """A NON-provenance note is a record, not stale provenance: the #6211 block's
-    reasoning is kept, and the new basis is APPENDED to a row that carries its own
-    note. A tool output must not silently overwrite a recorded decision."""
+    """A NON-provenance note is a record, not stale provenance: the row's own
+    reasoning is kept, and the new basis is APPENDED to it. A tool output must not
+    silently overwrite a recorded decision.
+
+    Asserted on the ROW LINE, not on the standalone block comment above it: the
+    renderer only rewrites rows matching `_DURATION_LINE_RE`, so a block-comment
+    assertion holds for a renderer that deletes every row tail (#9134 review, P3).
+    """
     text, _ = ci_timing.render_refreshed_manifest(
-        LOWER_BOUND_MANIFEST,
-        {"test_6211_ep_scale.py": 3.3},
+        "surfaces:\n  core:\n    - test_designed.py\n"
+        "durations:\n"
+        "  test_designed.py: 19.0  # #6211: locally measured, docker lane — do NOT "
+        "substitute a local timing for a CI reading.\n",
+        {"test_designed.py": 3.3},
         "2026-10-19T05:02:37Z",
-        coverage={"test_6211_ep_scale.py": (1, 4)},
+        coverage={"test_designed.py": (1, 4)},
         sample_label=_LOWER_BOUND_LABEL,
     )
-    # the block comment above the row is untouched
-    assert "# 3,353-claim fixture build)." in text
+    row = next(ln for ln in text.split("\n")
+               if ln.strip().startswith("test_designed.py:"))
+    assert row.startswith("  test_designed.py: 19.0  # #6211: locally measured")
+    assert "do NOT substitute a local timing" in row
+    assert row.strip().endswith("a LOWER bound; kept 19.0")
+    assert yaml.safe_load(text)["durations"]["test_designed.py"] == 19.0
 
 
 def test_a_rebased_row_keeps_a_rationale_note_and_appends_the_basis() -> None:
@@ -1034,21 +1152,26 @@ def test_a_rebased_row_keeps_a_rationale_note_and_appends_the_basis() -> None:
     assert row.strip().endswith("a LOWER bound; kept 5.6")
 
 
-def test_a_dated_refresh_claim_inside_a_rationale_is_stale_provenance() -> None:
+def test_a_dated_refresh_claim_inside_a_rationale_loses_only_that_clause() -> None:
     """…but a note that DATES the value (`this value is a CI measurement since the
     2026-10-17 refresh`) is a claim about the reading even when it sits mid-note,
-    and a re-base makes it false — the #9134 review named this exact row. Leaving
-    it would put `since the 2026-10-17 refresh` next to a value measured on the
-    19th and a `was 3.7` that contradicts it.
+    and a re-base makes it false — the #9134 review named this exact row. ONLY THE
+    CLAUSE is dropped: clearing the tail deleted a load-bearing `#4348 trap — do
+    not drop the row without re-deriving the floor` instruction from
+    `test_2350_validity_precision.py` (#9134 review, P2).
+
+    Non-vacuity: the pre-fix `_is_stale_provenance` branch set `tail = ""`, so the
+    `#4348` assertion below fails.
     """
     text, _ = ci_timing.render_refreshed_manifest(
         "surfaces:\n  core:\n    - test_rationale.py\n"
         "durations:\n"
-        "  test_rationale.py: 5.6  # #2350: a file ADDED BY A PR has no CI record "
+        "  test_rationale.py: 3.7  # #2350: a file ADDED BY A PR has no CI record "
         "of its own, so the #3400 flat default was its FIRST weight — this value "
         "is a CI measurement since the 2026-10-17 refresh; required for the "
-        "coverage half (#4348 trap).\n",
-        {"test_rationale.py": 3.7},
+        "coverage half (#4348 trap — do not drop the row without re-deriving the "
+        "floor at that head).\n",
+        {"test_rationale.py": 5.6},
         "2026-10-19T05:02:37Z",
         coverage={"test_rationale.py": (2, 142)},
         sample_label=_LOWER_BOUND_LABEL,
@@ -1056,7 +1179,41 @@ def test_a_dated_refresh_claim_inside_a_rationale_is_stale_provenance() -> None:
     row = next(ln for ln in text.split("\n")
                if ln.strip().startswith("test_rationale.py:"))
     assert "since the 2026-10-17 refresh" not in row
-    assert f"{_LOWER_BOUND_LABEL}: top-15 saw 2 of 142" in row
+    assert "#2350: a file ADDED BY A PR" in row
+    assert "(#4348 trap — do not drop the row without re-deriving the floor at that head)" in row
+    assert row.strip().endswith("was 3.7")
+    assert yaml.safe_load(text)["durations"]["test_rationale.py"] == 5.6
+
+
+def test_a_held_row_restates_an_unmeasured_marker_and_keeps_the_rationale() -> None:
+    """A HELD row's value is still carried forward, so its `# unmeasured` meaning
+    must survive in a form that is true — restated, not deleted with the rationale
+    behind it (`test_2296_document_created_journal.py` lost its whole "WHAT THE
+    NUMBER IS" note that way, #9134 review P2).
+
+    Non-vacuity: pre-fix the marker branch set `tail = ""` regardless of `kept`,
+    so the rationale assertions fail.
+    """
+    text, stats = ci_timing.render_refreshed_manifest(
+        "surfaces:\n  core:\n    - test_journal.py\n"
+        "durations:\n"
+        "  test_journal.py: 27.0  # unmeasured by the refresher — #2296: WHAT THE "
+        "NUMBER IS: the pytest session total, NOT what the refresher computes.\n",
+        {"test_journal.py": 6.1},
+        "2026-10-19T05:02:37Z",
+        coverage={"test_journal.py": (1, 10)},
+        sample_label=_LOWER_BOUND_LABEL,
+    )
+    assert stats["kept_as_lower_bound"] == 1
+    row = next(ln for ln in text.split("\n")
+               if ln.strip().startswith("test_journal.py:"))
+    assert "WHAT THE NUMBER IS" in row
+    assert "carried forward (not a full-file measurement)" in row
+    # the stale marker token itself must not survive as the leading tail token:
+    # the artifact measured this file, so `# unmeasured` would be a false claim.
+    assert not re.match(r"[ \t]*#\s*unmeasured\b", row.split("#", 1)[1]
+                        if "#" in row else "")
+    assert yaml.safe_load(text)["durations"]["test_journal.py"] == 27.0
 
 
 def test_an_unchanged_row_keeps_its_provenance_tail(tmp_path: Path) -> None:
@@ -1091,6 +1248,95 @@ def test_declared_test_counts_counts_test_functions(tmp_path: Path) -> None:
         tmp_path,
     )
     assert counts == {"test_alpha.py": 3, "sub/test_beta.py": 1}
+
+
+def test_declared_test_counts_never_attaches_a_basename_twin(tmp_path: Path) -> None:
+    """#9134 review: a key with no file under `tests/` is ABSENT (UNKNOWN).
+
+    The function used to fall back to a UNIQUE basename match, which is exactly
+    the attachment `_resolve_to_manifest_keys` refuses by rule ("a basename
+    therefore never SELECTS a key here" — #6092 F3): it would pair one file's
+    declared count with another file's measured reading.
+
+    Non-vacuity: with the fallback present `sub/test_beta.py` resolves to
+    `tests/other/test_beta.py` and the result is `{"sub/test_beta.py": 2}`.
+    """
+    (tmp_path / "tests" / "other").mkdir(parents=True)
+    (tmp_path / "tests" / "other" / "test_beta.py").write_text(
+        "def test_a():\n    pass\ndef test_b():\n    pass\n", encoding="utf-8")
+    counts = ci_timing.declared_test_counts(["sub/test_beta.py"], tmp_path)
+    assert counts == {}
+
+
+def test_parse_log_counts_distinct_testcases_not_duration_phases(tmp_path: Path) -> None:
+    """THE #9134 P1 ROOT CAUSE. A `--durations` block lists PHASES: one testcase can
+    contribute a setup, a call and a teardown line. `tests` is the COVERAGE
+    WITNESS compared against `declared_test_counts`, so counting ENTRIES let a
+    reading that saw one testcase of a four-test file report three and be
+    classified fully covered — the fail-open direction (#9134 review, P1).
+
+    Non-vacuity: `parse_log` used to add 1 per matched line, so both `tests`
+    assertions below read 3.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    log = write_log(logs, "pytest-log-test-a.log",
+                    """============================= slowest 3 durations =============================
+
+2.00s setup    tests/test_alpha.py::test_one
+7.00s call     tests/test_alpha.py::test_one
+0.50s teardown tests/test_alpha.py::test_one
+
+============================= short test summary info =============================
+""")
+    parsed = ci_timing.parse_log(log)
+    assert parsed["files"]["test_alpha.py"]["tests"] == 1
+    assert parsed["file_paths"]["test_alpha.py"]["tests"] == 1
+    # the SECONDS still sum every phase: fixture cost is part of what the file costs
+    assert parsed["files"]["test_alpha.py"]["total_ms"] == pytest.approx(9500.0)
+
+
+def test_a_phase_only_reading_cannot_pass_itself_off_as_full_coverage(
+    tmp_path: Path,
+) -> None:
+    """The end-to-end shape of the same defect: a file declaring 4 tests, read from
+    a block carrying one testcase's setup+call+teardown, must NOT be adopted
+    downward on the strength of "3 of 4 testcases seen".
+
+    Non-vacuity: with entry counting the witness is (3, 4) -> `observed <
+    declared` is False -> the row is adopted at 2.0.
+    """
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_alpha.py").write_text(
+        "\n".join(f"def test_{i}():\n    pass" for i in range(4)) + "\n",
+        encoding="utf-8")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    write_log(logs, "pytest-log-test-a.log",
+              """============================= slowest 3 durations =============================
+
+0.50s setup    tests/test_alpha.py::test_one
+1.00s call     tests/test_alpha.py::test_one
+0.50s teardown tests/test_alpha.py::test_one
+
+============================= short test summary info =============================
+""")
+    measurements = ci_timing.collector_file_measurements(logs)
+    declared = ci_timing.declared_test_counts(measurements, repo)
+    coverage = {path: (m["tests"], declared[path])
+                for path, m in measurements.items() if path in declared}
+    assert coverage == {"test_alpha.py": (1, 4)}
+    text, stats = ci_timing.render_refreshed_manifest(
+        "surfaces:\n  core:\n    - test_alpha.py\n"
+        "durations:\n  test_alpha.py: 19.0\n",
+        {path: m["seconds"] for path, m in measurements.items()},
+        "2026-10-19T05:02:37Z",
+        coverage=coverage,
+        sample_label=_LOWER_BOUND_LABEL,
+    )
+    assert stats["kept_as_lower_bound"] == 1
+    assert yaml.safe_load(text)["durations"]["test_alpha.py"] == 19.0
 
 
 def test_collector_file_measurements_pairs_the_winning_reading_with_its_own_count(

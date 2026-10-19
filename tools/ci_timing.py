@@ -430,6 +430,15 @@ def parse_log(path: Path) -> dict:
     """
     files: dict[str, dict] = {}
     file_paths: dict[str, dict] = {}
+    # The durations block lists the slowest PHASES, not testcases: one testcase can
+    # contribute a `setup`, a `call` and a `teardown` line (a module fixture is
+    # reported as `3.20s setup tests/test_beta.py::test_four`). `tests` is used as a
+    # COVERAGE WITNESS against the file's declared testcase count
+    # (`declared_test_counts`), so it must count DISTINCT nodeids — counting
+    # entries let a reading that saw 1 of 4 testcases plus two slow fixtures report
+    # 3 "testcases" and be classified fully covered (#9134 review, P1).
+    nodeids: dict[str, set[str]] = {}
+    path_nodeids: dict[str, set[str]] = {}
     counts = {k: 0 for k in COUNT_KEYS}
     outcomes: dict[str, str] = {}
     killed = False
@@ -485,18 +494,25 @@ def parse_log(path: Path) -> dict:
                 m = DURATION_RE.match(line)
                 if m:
                     ms = float(m.group(1)) * 1000
-                    node_path = m.group(3).split("::")[0]
+                    nodeid = m.group(3)
+                    node_path = nodeid.split("::")[0]
                     fname = node_path.split("/")[-1]
+                    rel_path = _tests_relative_path(node_path)
                     # Two accumulators over the same durations: the basename
                     # one feeds the rendered artifact, the path one feeds the
-                    # bridge's resolution.
-                    for target in (
-                        files.setdefault(fname, {"tests": 0, "total_ms": 0.0, "max_ms": 0.0}),
-                        file_paths.setdefault(
-                            _tests_relative_path(node_path),
+                    # bridge's resolution. `seconds` sums every PHASE line (a
+                    # testcase's setup and teardown are part of what the file
+                    # costs), while `tests` counts the DISTINCT nodeids those
+                    # lines belong to.
+                    for target, seen in (
+                        (files.setdefault(fname, {"tests": 0, "total_ms": 0.0, "max_ms": 0.0}),
+                         nodeids.setdefault(fname, set())),
+                        (file_paths.setdefault(
+                            rel_path,
                             {"tests": 0, "total_ms": 0.0, "max_ms": 0.0}),
+                         path_nodeids.setdefault(rel_path, set())),
                     ):
-                        target["tests"] += 1
+                        seen.add(nodeid)
                         target["total_ms"] += ms
                         target["max_ms"] = max(target["max_ms"], ms)
         m = V_PROGRESS_RE.match(line)
@@ -511,6 +527,10 @@ def parse_log(path: Path) -> dict:
             for n, key in COUNT_RE.findall(line):
                 if key in counts:
                     counts[key] = int(n)
+    for fname, entry in files.items():
+        entry["tests"] = len(nodeids[fname])
+    for rel_path, entry in file_paths.items():
+        entry["tests"] = len(path_nodeids[rel_path])
     return {"files": files, "file_paths": file_paths, "counts": counts,
             "outcomes": outcomes, "killed": killed, "error": error}
 
@@ -582,6 +602,10 @@ def collector_file_measurements(logs_dir: Path) -> dict[str, dict]:
     one for resolution — and `tests` is the COVERAGE WITNESS: the source block
     prints only the slowest `--durations=15` entries of each job, so a file
     whose tests did not all land in it is measured over a SUBSET of its work.
+    `tests` counts DISTINCT testcases (nodeids), never duration ENTRIES: one
+    testcase can contribute a setup, a call and a teardown line, so an entry
+    count would let a reading that saw 1 of 4 testcases look fully covered —
+    the exact fail-open the witness exists to prevent (#9134 review, P1).
     `render_refreshed_manifest` consumes that witness through its `coverage`
     parameter; without it a refresh silently lands a lower bound as a weight
     (measured on #9134: `test_surface_manifest.py` 199.1 -> 36.0, 5.5x, from a
@@ -626,9 +650,14 @@ def declared_test_counts(keys, repo_root: Path) -> dict[str, int]:
       refusal). The conservative direction for a coverage FLOOR is the opposite
       one, and closing it needs pytest's own collection, which this tool cannot
       run offline against the sampled run;
-    * a key the tree does not hold (a file deleted since, a subdir twin) is
-      ABSENT from the result rather than guessed, and an absent denominator
-      disables the refusal for that row — UNKNOWN is not "fully covered";
+    * a key the tree does not hold (a file deleted since) is ABSENT from the
+      result rather than guessed, and an absent denominator cannot prove
+      coverage for that row — UNKNOWN is not "fully covered", so a row it
+      cannot be resolved for may be RAISED by a reading but never LOWERED. A
+      basename FALLBACK used to bridge that gap and was deleted: attaching a
+      unique basename match is how `e2e/test_x.py`'s denominator would be
+      paired with `test_x.py`'s reading, the mispairing `_resolve_to_manifest_keys`
+      refuses by rule (#6092 F3, #9134 review);
     * a file that does not parse is absent for the same reason.
     """
     import ast
@@ -638,13 +667,7 @@ def declared_test_counts(keys, repo_root: Path) -> dict[str, int]:
     for key in keys:
         candidate = root / key
         if not candidate.is_file():
-            # A key whose subdirectory is not mirrored under `tests/` (the map
-            # is keyed tests-relative, so this is already the normal shape) —
-            # fall back to a UNIQUE basename match, and never to a guess.
-            matches = sorted(p for p in root.rglob(Path(key).name) if p.is_file())
-            if len(matches) != 1:
-                continue
-            candidate = matches[0]
+            continue
         try:
             tree = ast.parse(candidate.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
@@ -892,27 +915,123 @@ _PURE_PROVENANCE_RE = re.compile(
     r"^(?:\d+\s+)?"                       # an optional `#<issue>` ref (its `#` stripped)
     r"(?:ci-timing\b|CI-junit\b|junit\b|\d{4}-\d{2}-\d{2}\b|run\s+\d{6,}\b)",
     re.IGNORECASE)
-# …and one shape inside an otherwise-rational note that is still a claim about WHEN
-# THIS VALUE was measured — `this value is a CI measurement since the 2026-10-17
-# refresh` (#9134 review named that row). A re-base makes the sentence false while
-# leaving the rest of the note (why the row exists, that the coverage floor needs
-# it) true, so the whole tail would have to be dropped to fix it; the row's other
-# claim — `was 3.7` — would then contradict the sentence left standing. Narrow on
-# purpose: it matches the dated-refresh CLAIM, not the word "refresh".
+# …and one CLAUSE inside an otherwise-rational note that is still a claim about
+# WHEN THIS VALUE was measured — `this value is a CI measurement since the
+# 2026-10-17 refresh` (#9134 review named that row). A re-base makes that clause
+# false. It is STRIPPED CLAUSE-BY-CLAUSE and the rest of the note survives: the
+# note also carries why the row exists and, on `test_2350_validity_precision.py`,
+# a load-bearing `#4348 trap — do not drop the row without re-deriving the floor`
+# instruction. Clearing the whole tail to fix one dated clause is what deleted
+# that instruction (#9134 review, P2 — a tool output must not overwrite a record).
+# Narrow on purpose: it matches the dated-refresh CLAIM, not the word "refresh".
 _STALE_BASIS_CLAIM_RE = re.compile(r"\bsince the \d{4}-\d{2}-\d{2} refresh\b",
                                    re.IGNORECASE)
+
+# The separators that bound a CLAUSE inside a note, so a stale claim can be cut
+# out without taking its neighbours with it.
+_CLAUSE_SEPARATORS = (" — ", "; ", ". ")
+
+# A basis a PREVIOUS render of ours appended to the end of a tail
+# (` — ci-timing top-15 2026-10-19 (run 39191149586)[; was 42.4 | : top-15 saw …]`).
+# Stripping it before writing this render's basis is what keeps a row held (or
+# re-based) week after week stating ONE basis instead of growing a sentence per
+# refresh — the map is rewritten every week and nothing else prunes.
+_PRIOR_BASIS_RE = re.compile(
+    r"(?:^[ \t]*#[ \t]*|[ \t]+—[ \t]+)ci-timing top-15 \d{4}-\d{2}-\d{2} \(run [^)]*\)"
+    r"(?:;[ \t]*was [0-9]+(?:\.[0-9]+)?|:[^—]*)?[ \t]*$")
+
+# `# unmeasured` — the marker the map documents as "carried forward and is not a
+# measurement". Recognised by its LEADING token, and its replacement when the row
+# is HELD: the value is still carried forward, so the meaning is RESTATED rather
+# than deleted, which is what clearing the whole tail did to this marker's
+# long-form rows (#9134 review, P2).
+_UNMEASURED_LEAD_RE = re.compile(r"^[ \t]*#[ \t]*unmeasured\b[ \t]*(?:[—–-][ \t]*)?")
+_CARRIED_FORWARD = "carried forward (not a full-file measurement)"
+
+
+# The `  # ` comment marker a tail opens with, captured so a rewritten note can be
+# re-emitted with its own inner `#` intact (`  # #2350: …` keeps the issue ref).
+_NOTE_PREFIX_RE = re.compile(r"^[ \t]*#[ \t]*")
+
+
+def _note_body(tail: str) -> str:
+    """The text of a `  # …` tail, without the comment marker (for MATCHING: the
+    `#` of an issue ref like `#2350` is stripped too, which is what the citation
+    regexes are written against)."""
+    return tail.strip().lstrip("# \t")
 
 
 def _is_stale_provenance(tail: str) -> bool:
     """Is this trailing note a claim about WHICH READING produced the value (so a
-    re-base falsifies it and the map's rule drops it)?
+    re-base falsifies it and the map's rule rewrites it)?
 
-    See `_PURE_PROVENANCE_RE` (the note IS the citation) and
-    `_STALE_BASIS_CLAIM_RE` (the note is a rationale that also dates the value).
+    See `_PURE_PROVENANCE_RE` (the note IS the citation — nothing in it survives a
+    re-base) and `_STALE_BASIS_CLAIM_RE` (the note is a rationale that also DATES
+    the value — only that clause is stale, see `_strip_stale_basis_claim`).
     """
-    body = tail.strip().lstrip("# \t")
+    body = _note_body(tail)
     return bool(_PURE_PROVENANCE_RE.match(body)
                 or _STALE_BASIS_CLAIM_RE.search(body))
+
+
+def _is_pure_provenance(tail: str) -> bool:
+    """Is the whole note nothing but the citation (so a re-base leaves nothing)?"""
+    return bool(_PURE_PROVENANCE_RE.match(_note_body(tail)))
+
+
+def _strip_stale_basis_claim(tail: str) -> str:
+    """Drop ONLY the clause of a rationale that dates the value; keep the record.
+
+    `#2350: … its FIRST weight — this value is a CI measurement since the
+    2026-10-17 refresh; required for the durations coverage half (#4348 trap — do
+    not drop the row without re-deriving the floor)` keeps its `#2350` reasoning,
+    its `#4348` instruction, and loses only `this value is a CI measurement since
+    the 2026-10-17 refresh`. Returns "" when nothing of the note survives.
+    """
+    body = _note_body(tail)
+    match = _STALE_BASIS_CLAIM_RE.search(body)
+    if not match:
+        return tail
+    # Rewrite from the PREFIX-PRESERVING body, so `#2350` keeps its `#`.
+    prefix_match = _NOTE_PREFIX_RE.match(tail)
+    prefix = prefix_match.group(0) if prefix_match else "  # "
+    body = tail[prefix_match.end():] if prefix_match else tail.strip()
+    body = body.rstrip()
+    match = _STALE_BASIS_CLAIM_RE.search(body)
+    if not match:  # pragma: no cover — the matcher above already found it
+        return tail
+    left = 0
+    for sep in _CLAUSE_SEPARATORS:
+        i = body.rfind(sep, 0, match.start())
+        if i != -1:
+            left = max(left, i + len(sep))
+    right = len(body)
+    for sep in _CLAUSE_SEPARATORS:
+        i = body.find(sep, match.end())
+        if i != -1:
+            right = min(right, i)
+    head = body[:left].rstrip().rstrip("—,;. ").rstrip()
+    rest = body[right:].lstrip(" ;—,.").strip()
+    kept = f"{head}; {rest}" if head and rest else (head or rest)
+    return f"{prefix}{kept}" if kept else ""
+
+
+def _restate_unmeasured_marker(tail: str) -> str:
+    """Restate a HELD row's `# unmeasured` marker instead of deleting it.
+
+    A row the guard held keeps a value that is still NOT a measurement of the
+    file, so its marker must not silently vanish (#9134 review, P2): the meaning
+    is rewritten to `carried forward (not a full-file measurement)` and the rest
+    of the note — which says why the row exists — is kept.
+    """
+    match = _UNMEASURED_LEAD_RE.match(tail)
+    if not match:
+        return tail
+    rest = tail[match.end():].strip()
+    prefix_match = _NOTE_PREFIX_RE.match(tail)
+    prefix = prefix_match.group(0) if prefix_match else "  # "
+    return (f"{prefix}{_CARRIED_FORWARD} — {rest}" if rest
+            else f"{prefix}{_CARRIED_FORWARD}")
 
 
 def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
@@ -934,26 +1053,32 @@ def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
     check at the end.
 
     `coverage` IS THE LOWER-BOUND GUARD (#9134 review, P1). It maps a MEASURED
-    path to `(observed, declared)` — the testcases the reading saw, and the ones
-    the file declares. The reading sums only the testcases that landed in a job's
-    `--durations=15` block, so it is a SUM OVER A SUBSET of the file's work: it
-    can prove a file costs AT LEAST that much (it may RAISE a weight) and it
-    cannot prove the file got faster (it may not LOWER one). Landing it anyway
-    is what a 3-7x under-weight looks like, and the map's header names the harm:
-    an understated weight "can red `python-ci-gate` with zero test failures
+    path to `(observed, declared)` — the DISTINCT testcases the reading saw, and
+    the ones the file declares. The reading sums only the testcases that landed
+    in a job's `--durations=15` block, so it is a SUM OVER A SUBSET of the file's
+    work: it can prove a file costs AT LEAST that much (it may RAISE a weight)
+    and it cannot prove the file got faster (it may not LOWER one). Landing it
+    anyway is what a 3-7x under-weight looks like, and the map's header names the
+    harm: an understated weight "can red `python-ci-gate` with zero test failures
     (#3395)". A row whose reading covers EVERY declared test is comparable to the
     recorded figure and is adopted either way — without that, a wrong value could
     never be corrected at all, because the projection rarely covers a whole file.
-    An absent `coverage` (or an absent denominator for the key) keeps the old
-    adopt-always behaviour: a caller that has no witness must not be reported as
-    having one.
+    FULL-COVERAGE PROOF requires `declared > 1`: a single-`def` file is satisfied
+    by any measured entry, so its reading can never be trusted to discount, and
+    an ABSENT denominator for the key is UNKNOWN (it may be raised, never
+    lowered). An absent `coverage` (`None`) is the different case — the caller
+    supplied no witness at all, so the pre-#9134 adopt-always behaviour stands:
+    a caller that has no witness must not be reported as having one.
 
     `sample_label` names the basis written onto every row this render RE-BASES
     (`ci-timing top-15 2026-10-19 (run 39191149586)`), in the shape the map
     already uses for a re-derived row. It pairs with the stale-provenance rule
-    above: the cited note is dropped because it no longer applies, and the
-    replacement says what does. Absent → tails are left alone, so every existing
-    caller and test keeps its current output.
+    above: a note that IS the citation is dropped because it no longer applies, a
+    rationale that merely DATES the value loses only that clause, and either way
+    the replacement says what the basis now is. A HELD row (`kept`) keeps its
+    note — its value did not move, so its cited reading is still the basis — and
+    the rejected reading is appended to it instead of substituted for it. Absent
+    → tails are left alone, so every existing caller and test keeps its output.
     """
     lines = manifest_text.split("\n")
     # Both reads below parse manifest text through PyYAML, and either can raise
@@ -1022,35 +1147,92 @@ def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
         # whole refresh — carrying the row forward is the tool's existing
         # merge-not-replace contract, and a refusal would let one partial reading
         # block the other 88 rows.
-        kept = observed < declared and measured < previous
+        #
+        # WHAT COUNTS AS PROOF, and the two cases that do NOT (both added by the
+        # #9134 review, because each was fail-OPEN in the discount direction):
+        #   * `declared <= 1` — a single-`def` file is unprovable by construction:
+        #     ANY measured entry gives `observed >= 1`, so `observed >= declared`
+        #     is satisfied by a reading that saw one fixture line of a file whose
+        #     cost is a `venv` build or an embedded-server boot. The three rows
+        #     this PR first lowered (test_backup_e2e.py 13.1 -> 4.8,
+        #     bench/test_smoke_embedded.py 38.6 -> 24.3, test_pack_shipping_wheel.py
+        #     42.4 -> 40.6) are exactly that shape;
+        #   * an ABSENT denominator — a measured path with no declared count (a
+        #     file this tool cannot parse, a deleted file) is UNKNOWN, not
+        #     "fully covered"; UNKNOWN must not licence a discount.
+        # An absent WITNESS (`coverage=None`) is different: the caller supplied no
+        # evidence at all, and the pre-#9134 adopt-always behaviour stands, so
+        # every existing caller and test keeps its output.
+        provable = coverage is not None and declared > 1 and observed >= declared
+        kept = coverage is not None and not provable and measured < previous
         new_value = previous if kept else measured
         if kept:
             kept_as_lower_bound += 1
-        # A stale `# unmeasured` marker stops being true once measured, and the
-        # marker is recognised by its LEADING TOKEN rather than by the whole
-        # tail: authors write long-form provenance (`# unmeasured — #7359: …`),
-        # and the old whole-tail `fullmatch` cleared only the bare form, so a
-        # measured row kept a `# unmeasured` claim the refresh had falsified
-        # (#8254 review, P3 — 3 rows went stale that way). Any OTHER trailing
-        # comment is preserved verbatim, including one that merely mentions the
-        # word later on; `\b` keeps a token like `# unmeasuredly` out.
-        if re.match(r"[ \t]*#\s*unmeasured\b", tail):
+        # Drop a basis a PREVIOUS render of ours appended, so a row that is held
+        # or re-based week after week states ONE basis instead of growing a
+        # sentence per refresh (this map is rewritten every week and nothing else
+        # prunes it). Only where a new basis is written below — a row this render
+        # does not touch keeps its line verbatim, including an older basis.
+        if kept:
+            tail = _PRIOR_BASIS_RE.sub("", tail)
+            # A HELD row keeps its note. Its value did not move, so the reading
+            # its note cites IS still the basis of the surviving value — the
+            # map's rule ("a note whose cited run is not in the basis is dropped")
+            # does not reach it. The renderer used to substitute the rejected
+            # reading's basis for the citation, so 13 held rows lost the run that
+            # actually produced their number (#9134 review, P2).
+            if declared <= 0:
+                reason = ("no declared testcase count for this file (UNKNOWN), so "
+                          "the reading cannot prove it saw the whole file")
+            elif declared == 1:
+                reason = ("a single-test file cannot prove full coverage from a "
+                          "top-15 projection")
+            else:
+                reason = None
+            # `# unmeasured` stops being true once a leg collected the file at
+            # all, but the value is STILL carried forward — so the marker's
+            # meaning is restated, never deleted along with the rationale that
+            # follows it (`test_2296_document_created_journal.py` lost 27.0's
+            # whole "WHAT THE NUMBER IS" note that way).
+            tail = _restate_unmeasured_marker(tail)
+            if sample_label:
+                # Two shapes: an ENTRY-COUNTED witness states what it saw
+                # (`top-15 saw 2 of 10 testcases = 36.0s`); a witness that cannot
+                # count at all (single-test file, absent denominator) states why
+                # the count cannot decide, then the reading itself.
+                basis = (
+                    f"{sample_label}: top-15 saw {observed} of {declared} "
+                    f"testcases = {measured:.1f}s, a LOWER bound; kept {previous:.1f}"
+                    if reason is None else
+                    f"{sample_label}: {reason}; the reading ({measured:.1f}s) is "
+                    f"a LOWER bound; kept {previous:.1f}")
+                tail = f"{tail} — {basis}" if tail.strip() else f"  # {basis}"
+        # A stale `# unmeasured` marker stops being true once the reading is
+        # ADOPTED, and the marker is recognised by its LEADING TOKEN rather than
+        # by the whole tail: authors write long-form provenance (`# unmeasured —
+        # #7359: …`), and the old whole-tail `fullmatch` cleared only the bare
+        # form, so a measured row kept a `# unmeasured` claim the refresh had
+        # falsified (#8254 review, P3 — 3 rows went stale that way). Any OTHER
+        # trailing comment is preserved verbatim, including one that merely
+        # mentions the word later on; `\b` keeps a token like `# unmeasuredly` out.
+        elif _UNMEASURED_LEAD_RE.match(tail):
             tail = ""
         # RE-BASE ONLY WHAT THIS RENDER ACTUALLY CHANGED. The map's rule is "a
         # row's comment is kept only while the value AND its stated basis are
-        # unchanged" — so a row whose value survives keeps its note untouched
-        # (the note is still true of it), and a row whose value moves gets the
+        # unchanged" — so a row whose value survives untouched by the reading
+        # keeps its note exactly as it was, and a row whose value moves gets the
         # basis it was actually re-derived from.
-        if sample_label and (new_value != previous or kept):
+        elif sample_label and new_value != previous:
+            tail = _PRIOR_BASIS_RE.sub("", tail)
             if tail.strip() and _is_stale_provenance(tail):
-                # Stale provenance: the cited run is not this sample's, and the
-                # basis written below is. Dropping it is the map's own documented
-                # rule, not a preference.
-                tail = ""
-            basis = (f"{sample_label}: top-15 saw {observed} of {declared} "
-                     f"testcases = {measured:.1f}s, a LOWER bound; kept {previous:.1f}"
-                     if kept else
-                     f"{sample_label}; was {previous:.1f}")
+                # A note that IS the citation has nothing that survives a re-base
+                # (the cited run is not this sample's, and the basis written below
+                # is). A RATIONALE that merely DATES the value loses only that
+                # clause — deleting the rest is what removed
+                # `test_2350_validity_precision.py`'s `#4348 trap — do not drop
+                # the row` instruction (#9134 review, P2).
+                tail = "" if _is_pure_provenance(tail) else _strip_stale_basis_claim(tail)
+            basis = f"{sample_label}; was {previous:.1f}"
             # A surviving DESIGN note is kept and the new basis is appended to it,
             # never substituted for it: notes like "Do NOT substitute a local
             # timing" or a #5275 recording are decisions, and a tool output does
