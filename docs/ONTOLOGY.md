@@ -848,9 +848,8 @@ silently-empty cell.
 
 **Who is an owner in this table.** A writer owns a property when it carries a
 `SET <alias>.<prop>` clause for it. A property used only as a `MERGE` key is **not** attributed
-— so the `id` row names `_rebuild_all_replay` (whose `SET s += $props` restores
-the whole schema) and not the ten writers whose `MERGE (s:Session {id: …})` mints
-the key.
+— so the `id` row names `rebuild_all` (whose `SET s += $props` restores the whole
+schema) and not the ten writers whose `MERGE (s:Session {id: …})` mints the key.
 `id` is the Session's identity key, minted by every writer above; the cell records
 who *sets* it.
 
@@ -858,10 +857,9 @@ who *sets* it.
 `tortoise/sdk.py::_write_session_and_turns` (#3551) plus the one turn store
 `_TURN_WRITE_CYPHER` (#3086); the hosted `POST /v1/sessions` handler and
 `TortoiseSDK.capture_session` hold no copy of the MERGE text and add only their
-own **outcome** counters. `_rebuild_all_replay` — the private body `rebuild_all`
-delegates its replay to since #9124, so the replay could hold a declared write
-lane — is the one writer whose property set IS the whole schema (`SET s +=
-$props` over the pre-wipe snapshot), declared as such rather than enumerated.
+own **outcome** counters. `rebuild_all` is the one writer whose property set IS
+the whole schema (`SET s += $props` over the pre-wipe snapshot), declared as
+such rather than enumerated.
 
 #### D9 retrofit — the recorded honest gaps
 
