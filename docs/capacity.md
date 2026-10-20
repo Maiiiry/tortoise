@@ -260,16 +260,25 @@ kept as the engine-6.0.0 predicate-drop guard (#6976): the cache load's
 back-message sweep, the BFS undirected direct-edge sweep and Batch 3, whose two
 `MATCH` / undirected forms anchor on their own.
 
-Four sites traverse and were already `Node By Index Scan` without a barrier on
-`origin/main`, so they carry none: `_load_cache`'s message sweep,
-`seed_operators`, `_affected_factors` Batch 2 and the selector's
-operator→target leg (the last is not emitted by a pass at all — it is pinned by
-the selector test). A real pass emits **19 distinct unbarriered id-set
-statements**, and they partition exactly: the cache's message sweep **8**
-(IMPL and NAND x 4 labels), its node-params/`ep_alpha` load **4**, the draft
-filter **4**, the seed lookup **1**, `seed_operators` **1**, Batch 2 **1** —
-8 + 4 + 4 + 1 + 1 + 1 = 19, every one index-anchored. All of the above are
-in the pinned set: `tests/test_6211_ep_anchor.py` captures the statements the
+Three sites in `ep.py` traverse and were already `Node By Index Scan` without a
+barrier on `origin/main`, so they carry none: `_load_cache`'s
+message sweep, `seed_operators` and `_affected_factors` Batch 2. Those three
+plus the three reads that do not traverse at all are the pass's **19 distinct
+unbarriered id-set statements** — the traversing sites at **8 + 1 + 1** (the
+message sweep is 2 relations x 4 epistemic labels) and the single-node probes at
+**4 + 1 + 4**: the cache's per-label node-params load (the `ep_alpha` /
+`ep_beta` probe), the seed lookup (one per label the seed set spans — 1 on a
+`:Point` seed set) and the draft filter. Every one of them is index-anchored.
+The operator selector's operator->target leg is NOT one of these: it is a
+selector-only statement a pass never emits, and it needs no barrier (measured
+`Node By Index Scan`). One further id-set statement sits OUTSIDE this census
+and outside the pinned set: a run whose journal is wired (`_emit`, i.e. an event
+log) and which carries evidence priors also re-reads them for the pre-write's
+journal record, and that read NAMES NO LABEL — so a per-label index cannot
+anchor it (the label-free form is deliberate: a `:Point:Object` node must be
+journaled once, #7853). It is the last unanchored id-set leg of a pass, filed as
+**#9304**. All eleven barriered sites and all three unbarriered traversing ones
+are in the pinned set: `tests/test_6211_ep_anchor.py` captures the statements the
 pass emits and asserts the PLAN of each (`Node By Index Scan`, and no
 `Node By Label Scan`; the selector test additionally rejects `All Node Scan`),
 never their text; each is
