@@ -24,8 +24,9 @@ So the proof here is deliberately not "the fold can write". It is:
    applied from `supabase/migrations/` on first use, so no manual setup.
 3. **An armed write is never a guess**: no tenant ⇒ refused and counted, no
    DSN ⇒ no connection at all (byte-identical capture for an unarmed
-   deployment), and the live path never invents a `journal_event` position it
-   cannot know (#9190).
+   deployment), and the live path writes layer 1 (`journal_event`) from the
+   ordinal the journal's own append reported — never a number it derives
+   (#9190).
 4. **A loss is OBSERVABLE.** Two record shapes still cannot be projected because
    the SCHEMA's column type disagrees with what the producer emits (measured
    below). They are pinned by EQUALITY, so this file goes red the moment they
@@ -35,7 +36,8 @@ So the proof here is deliberately not "the fold can write". It is:
 
 WHAT IS NOT HERE, NAMED SO THE ABSENCE IS VISIBLE.
 
-* The reconciler's production trigger (#9189), the `journal_event.seq` ordinal
+* The reconciler's production trigger (#9189), and (before it landed) the
+  `journal_event.seq` ordinal
   (#9190) and the reconciler's own dirty-run behaviour are other lanes.
 * ⚠️ **No CI job arms `TEST_RECORD_DB_URI`** (checked: `.github/` and `config/`
   never set it), so the two Postgres legs skip in CI and the DB-FREE wiring gate
@@ -566,32 +568,95 @@ def test_an_armed_capture_without_a_journal_is_counted_not_silent(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 4. The live path never invents a journal position (#9190)
+# 4. The live path writes layer 1 from the JOURNAL'S OWN position (#9190)
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def test_the_live_path_never_writes_a_journal_position(wiring):
-    """The chokepoint passes `position=False`, and the tool says so statically.
+def test_the_live_path_writes_the_journals_own_position(wiring):
+    """Layer 1 is written by production traffic, keyed on the append's ordinal.
 
-    Two surfaces, because either alone is weak: the AST check (a live call that
-    omits the argument fails the gate) and the seam itself (the flag actually
-    removes the row from the plan).
+    #9190 landed the ordinal (`EventLog.append` returns the record's position;
+    `EventLog.position()` exposes the count), which closes the premise this PR
+    was branched on: that the live chokepoint had no number to record. So the
+    live door must CARRY it (`write_live_record(seq=…)`) and bind
+    `position=seq is not None` — a literal `False` (the old deferral) leaves
+    `public.journal_event` and the `public.record_event_stream` view over it
+    empty on every live write, and a literal `True` invents a number for a log
+    that reported none and collides with a later replay's numbering in silence.
+
+    Three surfaces, because each alone is weak: the append really returns a
+    position, the seam really threads it into the plan, and the gate refuses a
+    door that drops either half.
     """
-    _, _, report = wiring
-    assert report["position_problems"] == [], report["position_problems"]
-    assert record_writer.POSITION_ROW_DEFERRED_ON == "#9190"
+    from tortoise.log import EventLog
 
+    _, code, report = wiring
+    assert report["position_problems"] == [], report["position_problems"]
+    assert code == 0, (code, report)
+    assert record_writer.POSITION_ORDINAL_SOURCE == "#9190"
+
+    # (a) the journal really reports an ordinal, and it is the replay's seq
+    log = EventLog("/tmp/w9078-position.jsonl")
+    log.path.unlink(missing_ok=True)
+    first = log.append({"type": "SourceCreated", "id": "s1"})
+    second = log.append({"type": "SourceCreated", "id": "s2"})
+    assert (first, second) == (1, 2), (first, second)
+    assert log.position() == 2, log.position()
+    log.path.unlink(missing_ok=True)
+
+    # (b) the seam's `seq` is the row's key: the SAME record gets the number the
+    # append gave it, and omitting the ordinal writes no row at all
     record = {"type": "PointAdded", "ts": "2026-10-19T00:00:00Z", "id": "p1",
               "point": {"id": "p1", "content": "a claim", "pointKind": "claim"}}
-    with_position = record_projection.replay_plan([record], org_id="o", graph_id="g")
+    plan = record_projection.replay_plan([record], org_id="o", graph_id="g",
+                                        start_seq=7)
+    position_rows = [s for s in plan if "journal_event" in s.sql]
+    assert len(position_rows) == 1, position_rows
+    assert 7 in position_rows[0].params, position_rows[0].params
     without = record_projection.replay_plan(
         [record], org_id="o", graph_id="g", position=False)
-    assert any("journal_event" in s.sql for s in with_position)
-    assert not any("journal_event" in s.sql for s in without)
-    # The layer rows are unaffected — the position row is bookkeeping, not a layer.
+    assert not [s for s in without if "journal_event" in s.sql]
+    # The layer rows are unaffected — the position row is bookkeeping ABOUT them.
     assert [s for s in without if "journal_event" not in s.sql] == [
-        s for s in with_position if "journal_event" not in s.sql
+        s for s in plan if "journal_event" not in s.sql
     ]
+
+
+def test_the_live_door_rule_fires_when_the_ordinal_is_dropped(wiring):
+    """The gate reds a live door that defers, invents, or drops the ordinal.
+
+    A rule mutated to `return []` stayed green before, so the synthetic cases
+    are the point: each spelling below is a way this PR's own bug could return.
+    """
+    import ast
+
+    module, _, _ = wiring
+    source = (
+        "from tortoise import record_writer\n"
+        "def write_live_record(record, *, durable=False, seq=None):\n"
+        "    return record_writer.write_records([record], org_id='o', "
+        "graph_id='g', %s)\n"
+    )
+    good = "position=seq is not None, first_seq=seq if seq is not None else 1"
+    assert module.live_door_writes_the_journals_position.__name__  # loaded
+    # the real tree passes
+    assert module.live_door_writes_the_journals_position() == []
+    # each regression is caught
+    for spelling, why in (
+        ("position=False, first_seq=seq", "the pre-#9190 deferral"),
+        ("position=True, first_seq=seq", "an invented number"),
+        ("position=seq is not None, first_seq=1", "a dropped ordinal"),
+        ("position=seq is not None", "a missing ordinal"),
+    ):
+        assert spelling != good
+        tree = ast.parse(source % spelling)
+        door = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "write_live_record")
+        bound = {kw.arg: kw.value for kw in door.body[0].value.keywords if kw.arg}
+        assert not (module._is_position_from_ordinal(bound.get("position"))
+                    and module._references_ordinal(bound.get("first_seq"))), (
+            f"{why}: the rule accepted {spelling!r}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1254,8 +1319,14 @@ def _seed_tenant(conn) -> None:
         cur.execute(
             "INSERT INTO public.graphs (id, org_id, name) VALUES (%s, %s, %s) "
             "ON CONFLICT (id) DO NOTHING", (GRAPH, ORG, GRAPH))
+        # `journal_event` is APPEND-ONLY by trigger (a tenant erasure sets
+        # `app.record_journal_purge=on`), so this seed CANNOT clear it — and it
+        # no longer needs to: since #9190's ordinal is threaded, the live door
+        # writes position rows, so layer 1 is asserted as a DELTA/at-least, not
+        # as emptiness. Deleting here was itself the #9078 assumption (layer 1
+        # never written) baked into the fixture.
         for table in ("event", "object", "subject", "point", "relation",
-                      "session", "source", "journal_event"):
+                      "session", "source"):
             cur.execute(
                 f"DELETE FROM public.{table} WHERE org_id=%s AND graph_id=%s",
                 (ORG, GRAPH))
@@ -1355,8 +1426,10 @@ def test_the_public_capture_path_writes_the_record(capture_sdk, monkeypatch):
     Layer by layer, from the schema's own shape:
 
     * **event stream** — `event` / `source` / `session` (migration 1's episodic
-      tables; `journal_event` is bookkeeping ABOUT the layers and is deferred,
-      #9190);
+      tables) AND `journal_event`, the position row layer 1 IS (exposed as
+      `public.record_event_stream`). The row is keyed on the ordinal
+      `EventLog.append` reported (#9190), so the live write and a later replay
+      give one record one number;
     * **semantic** — `object` / `subject`, asserted against the objects the
       capture actually emitted (counted from the journal, so the claim is
       non-vacuous either way: a capture that emits no Object record must produce
@@ -1382,8 +1455,25 @@ def test_the_public_capture_path_writes_the_record(capture_sdk, monkeypatch):
         for table in ("event", "source", "session"):
             assert _count(conn, table) >= 1, (
                 f"{table} received no row from the public capture path")
-        # 2. the position row is NOT invented (#9190)
-        assert _count(conn, "journal_event") == 0
+        # 2. layer 1 is written from the journal's OWN ordinal (#9190).
+        #    `journal_event` is `public.record_event_stream`'s source, and it is
+        #    the acceptance sentence of the epic: before the ordinal was
+        #    threaded it stayed EMPTY on every live write (the deferral this PR
+        #    shipped), and the row count must therefore be at least one per
+        #    record the journal carried — never zero, and never more than the
+        #    journal holds (an invented number would invent rows).
+        assert _count(conn, "journal_event") >= 1, (
+            "the live door wrote no position row — layer 1 "
+            "(`public.journal_event`, exposed as `public.record_event_stream`) "
+            "is empty, so the epic's event-stream claim is unmet by the very "
+            "path that is supposed to meet it (#9190's ordinal)")
+        # One row per record, at most: a row numbered beyond the journal's own
+        # length would be an invented seq (the collision #9190 removes). The
+        # journal file is the ground truth for that length.
+        assert _count(conn, "journal_event") <= len(_journal_records(journal_path)), (
+            f"the record holds {_count(conn, 'journal_event')} position row(s) "
+            f"for {len(_journal_records(journal_path))} journal record(s) — a row "
+            "numbered past the journal is an invented seq")
 
         records = _journal_records(journal_path)
         # 3. the semantic + procedural layers, counted against the journal.
