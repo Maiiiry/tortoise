@@ -36,6 +36,7 @@ from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from tortoise.cypher_guard import (  # #3595 `=~` guard — the ONE seam
     _GRAPH_QUERY_COMMANDS,  # #9124: recover the statement a raw command carries
+    _command_shape,  # #9124/#9079: the ONE reader of a raw command's shape
     _guard_execute_command,
     _guard_numeric_literals,  # #8479: the SAME domain, on the statement TEXT
     _guard_numeric_params,  # #7174: the store's numeric domain, same seam
@@ -3806,14 +3807,32 @@ def _decision_key(inner, verb: str, statement, args):
     """The `(store, graph, statement)` a dispatch is about to decide.
 
     The TARGET GRAPH is the inner handle's own name for the query verbs (the
-    vendor always writes the graph it belongs to) and ``args[1]`` for a raw
-    command, which names its graph in the payload. It is deliberately NOT the
-    projection's `graph_name`: a write handle may front any graph, and keying on
-    the owner is how the boolean acquired its hole.
+    vendor always writes the graph it belongs to) and the graph a raw command
+    NAMES for ``execute_command`` — read through ``cypher_guard._command_shape``,
+    the SAME reader the door one hop below consults, so both ends of one decision
+    compute one key. ⛔ It is NOT ``args[1]`` blindly (#9079 review, P2): the
+    client splits ``args[0]`` before packing, so the graph can ride inside the
+    first argument, and a non-``str`` spelling must be decoded exactly as the
+    door decodes it — a key no consultation asks about suppresses nothing and one
+    write is censused two or three times (measured: a ``bytes`` graph name).
+
+    It is deliberately NOT the projection's `graph_name`: a write handle may
+    front any graph, and keying on the owner is how the boolean acquired its
+    hole.
     """
     graph = getattr(inner, "name", None)
-    if verb == "execute_command" and len(args) >= 2:
-        graph = args[1]
+    if verb == "execute_command":
+        # ⛔ THE GRAPH COMES FROM THE SAME READER THE DOOR USES (#9079 review,
+        # P2). It used to be ``args[1]`` RAW while `cypher_guard`'s door asked
+        # about ``_as_text(args[1])`` and, for a payload that carries the graph
+        # inside ``args[0]``, about a graph that is not at ``args[1]`` at all —
+        # so the key was a graph no consultation names and the suppression
+        # suppressed nothing: one write measured 2-3 times (measured with a
+        # ``bytes`` graph name: key ``(store, None, stmt)``, question
+        # ``(store, "<graph>", stmt)``).
+        shape = _command_shape(args)
+        if shape is not None:
+            graph = shape.graph
     store = _client_store_key(getattr(inner, "client", None))
     return (store, graph if isinstance(graph, str) else None,
             _normalise_handle_statement(statement))
@@ -4473,27 +4492,40 @@ def _command_statement(args, kwargs) -> str:
     the existing guards.
 
     The shape mirrored here is the one ``cypher_guard._guard_execute_command``
-    already pins (MEASURED against ``falkordb`` 1.6.2: ``args[3]`` is a flag such
-    as ``--compact``, never a params map), so the two readers of this channel
-    cannot disagree about where the Cypher lives.
+    already pins — LITERALLY: both call ``cypher_guard._command_shape``, so the
+    two readers of this channel cannot disagree about where the Cypher lives or
+    which spelling carries it (MEASURED against ``falkordb`` 1.6.2: ``args[3]`` is
+    a flag such as ``--compact``, never a params map).
 
-    ⛔ THE COMMAND WORD IS DECODED WITH THE SAME HELPER THE #9209 CLASSIFIER
-    USES (``_handle_command_text``): ``bytes``, ``bytearray`` and ``memoryview``
-    all name ``GRAPH.QUERY`` on the wire (a buffer is passed through by
-    ``redis.connection.Encoder``), so a reader that accepts only ``bytes`` reads
-    a payload the server executes but it cannot see — and that is the direction
-    that leaves a write out of the §17.1 census (measured: "#9209 review" on
-    the handle-door classifier; the same blind spot sat in this reader).
+    ⛔ THE FIRST ARGUMENT IS SPLIT, NOT READ AS ONE TOKEN (#9079 review, P1).
+    Both pinned ``redis`` serializers pack ``args[0]`` with ``.encode().split()``
+    / ``.split()`` before sending, so these reach the server byte-identically and
+    must be classified identically:
+
+        execute_command("GRAPH.QUERY", <graph>, "CREATE (n:X)")   # canonical
+        execute_command("GRAPH.QUERY <graph>", "CREATE (n:X)")    # 2 args
+        execute_command("GRAPH.QUERY <graph> CREATE (n:X)")       # 1 arg
+
+    A ``len(args) < 3`` gate saw NONE of the last two and returned ``""``, so a
+    write on an ARMED journal-backed projection landed with no refusal and no
+    census entry (measured; the same spelling-shaped defect #9209 closed at the
+    classifier).
+
+    ⛔ THE COMMAND WORD IS DECODED WITH THE SAME DECODER THE HOOK USES
+    (``cypher_guard._as_text``, inside `_command_shape`): ``bytes``,
+    ``bytearray`` and ``memoryview`` all name ``GRAPH.QUERY`` on the wire (a
+    buffer is passed through by ``redis.connection.Encoder``), so a reader that
+    accepts only ``bytes`` reads a payload the server executes but it cannot
+    see — and that is the direction that leaves a write out of the §17.1 census
+    (measured: "#9209 review" on the handle-door classifier; the same blind spot
+    sat in this reader).
     """
-    if len(args) < 3:
+    shape = _command_shape(args)
+    if shape is None or shape.statement is None:
         return ""
-    verb = _handle_command_text(args[0])
-    statement = _handle_command_text(args[2])
-    if verb is None or statement is None:
+    if shape.verb not in _GRAPH_QUERY_COMMANDS:
         return ""
-    if verb.upper() not in _GRAPH_QUERY_COMMANDS:
-        return ""
-    return statement
+    return shape.statement
 
 
 class _GuardedGraph:
@@ -4855,15 +4887,20 @@ class _GuardedGraph:
             decided_args = _guard_execute_command(
                 args, getattr(self._g, "client", None))
             # #9079 (review P2): the key must be the statement the dispatch
-            # CARRIES — the #7162 barrier above rewrites ``args[2]``, and the
+            # CARRIES — the #7162 barrier above rewrites the payload, and the
             # guarded channel one hop down consults the barred text. Keying on
             # the pre-barrier text suppressed nothing there, so one
             # ``GRAPH.QUERY`` was censused twice (measured: one entry per
-            # spelling).
+            # spelling). The barred statement is read back through the SAME
+            # `_command_shape` the door uses, because the Cypher is not always
+            # at ``args[2]``: the client splits ``args[0]``, so a 2-arg or 1-arg
+            # payload carries it at another position and a fixed index would
+            # key on a flag (or on nothing) instead.
+            decided_shape = _command_shape(decided_args)
             return _dispatch_decided(
                 self._g, "execute_command", *decided_args,
-                decided_statement=(decided_args[2]
-                                   if len(decided_args) >= 3 else None),
+                decided_statement=(decided_shape.statement
+                                   if decided_shape is not None else None),
                 **kwargs)
         finally:
             _HANDLE_STATEMENT_DECIDED.reset(token)
@@ -9176,7 +9213,12 @@ class FalkorProjection(
     #     projection that never bound a journal is NOT under the guard, because
     #     with no journal there is no truth store for its cache to be ahead of
     #     (§17.1 has nothing to enforce). Only ``_bind_journal`` sets it
-    #     ``True``, and only a live door that OWNS a journal calls it.
+    #     ``True``, and NOTHING clears it — ``close()`` releases the
+    #     `(store, graph)` REGISTRY entry, never this flag (#9079 review, P2:
+    #     clearing it disarmed this projection's own doors while the graph was
+    #     still writable, because a server close is a pool disconnect that
+    #     redis-py reconnects on the next command). A live door that OWNS a
+    #     journal calls ``_bind_journal``.
     #   * the REFUSAL lives in the authorization ContextVar
     #     (``_CACHE_WRITE_AUTHORIZED``, default ``None`` = refusal), and it is
     #     read ONLY on the ``_journal_backed`` branch. So the gate refuses by
@@ -17271,6 +17313,17 @@ class FalkorProjection(
             # with its owner. A stale entry would judge a LATER projection that
             # reuses the name without a journal — a fail-closed gate over the
             # wrong graph, which is how a guard starts blocking the product.
+            #
+            # ⛔ THE OWNER FLAG IS NOT CLEARED (#9079 review, P2). Releasing the
+            # REGISTRY key is the intended disarm; ``_journal_backed`` is what
+            # tells THIS projection's own doors (the write handle, `apply`, the
+            # public `query`) that the graph it holds is a derived cache of a
+            # journal that still exists on disk. Clearing it disarmed every §17.1
+            # door on the projection while the graph stayed WRITABLE — a server
+            # ``db.close()`` is a pool disconnect, and redis-py reconnects on the
+            # next command — so a post-close write landed with no census entry
+            # and, once armed, no refusal. The flag is a property of the graph
+            # and its journal, not of this connection.
             finalizer = getattr(self, "_journal_backed_finalizer", None)
             if finalizer is not None:
                 finalizer.detach()
@@ -17279,7 +17332,6 @@ class FalkorProjection(
                 getattr(self, "_journal_backed_store", None),
                 getattr(self, "graph_name", None))
             self._journal_backed_store = None
-            self._journal_backed = False
         try:
             # #1475: route through db._t_close (when present) so the db's
             # _t_closed flag is set — the GC finalizer must recognize this

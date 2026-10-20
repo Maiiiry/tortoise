@@ -66,6 +66,17 @@ is only honest if it says where it stops:
   * a channel that cannot name its store (a duck-typed handle with no ``.client``)
     is matched by graph NAME only — the cycle-1 defect, still the behaviour on
     that one channel (stated on ``_JOURNAL_BACKED_KEYS``).
+
+WHAT THIS FILE PROVES ON THE PRE-FIX TREE (stated exactly, #9079 review P3). It
+collects **32** cases under pytest (at the review head 25: 15 test functions,
+with one parametrisation adding 5 and one adding 7; the review fix adds the
+split-spelling, bytes-graph-name and `close()` pins). On ``origin/main`` it does
+not report "8 failed / 4 passed": its module-level imports
+(`_client_store_key`, `_journal_backed_graphs`, `_journal_backed_keys`,
+`_dispatch_decided`) do not exist there, so the run is a single collection
+**ImportError** — 0 passed, 0 failed, and the pins cannot execute at all. That is
+a stronger statement than a failure count, and it is the one a reader should
+quote.
 """
 
 from __future__ import annotations
@@ -181,6 +192,50 @@ def test_escape_three_the_command_channel_is_refused_when_armed(armed_sdk, enfor
     assert _count(proj, "Esc4", "id", "e4") == 0
 
 
+# ── the door reads the command the CLIENT will actually SEND ──────────────
+#
+# ⛔ THE FIRST ARGUMENT IS SPLIT BY THE SERIALIZER (#9079 review, P1). Both
+# pinned ``redis`` packers do ``args[0].encode().split()`` / ``args[0].split()``
+# before sending, so these three spellings reach the server BYTE-IDENTICAL:
+#
+#     execute_command("GRAPH.QUERY", <graph>, "CREATE (n:Split {id:'s'})")
+#     execute_command("GRAPH.QUERY <graph>", "CREATE (n:Split {id:'s'})")
+#     execute_command("GRAPH.QUERY <graph> CREATE (n:Split {id:'s'})")
+#
+# A reader gated on ``len(args) >= 3`` and an exact verb at ``args[0]`` saw only
+# the first: MEASURED pre-fix, the other two wrote an ARMED journal-backed cache
+# with no refusal and no census entry — the same spelling-shaped class #9209
+# closed at the classifier, through the door this file is named after.
+_SPLIT_WRITE = "CREATE (n:Split {id:'s'})"
+
+
+@pytest.mark.parametrize("build", [
+    pytest.param(lambda p: ("GRAPH.QUERY", p.graph_name, _SPLIT_WRITE),
+                 id="three-args"),
+    pytest.param(lambda p: (f"GRAPH.QUERY {p.graph_name}", _SPLIT_WRITE),
+                 id="head-carries-the-graph"),
+    pytest.param(lambda p: (f"GRAPH.QUERY {p.graph_name} {_SPLIT_WRITE}",),
+                 id="head-carries-the-statement-too"),
+])
+def test_every_spelling_the_client_serializer_produces_is_refused(
+        armed_sdk, enforced, build):
+    """RED for the last two spellings before the splitter fix."""
+    proj = armed_sdk._get_proj()
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(*build(proj))
+    assert _count(proj, "Split", "id", "s") == 0, (
+        "a refused write must land nothing, whatever spelling carried it")
+
+
+def test_a_split_spelling_is_refused_at_the_client_handle(armed_sdk, enforced):
+    """Escape (3) takes the same splitter, one hop below the write handle."""
+    proj = armed_sdk._get_proj()
+    with pytest.raises(DirectCacheWriteRefused):
+        _client(proj).execute_command(
+            f"GRAPH.QUERY {proj.graph_name}", "CREATE (n:Split2 {id:'s2'})")
+    assert _count(proj, "Split2", "id", "s2") == 0
+
+
 # ── the landed mode: COUNTED exactly once per write, not refused ──────────
 
 @pytest.mark.parametrize("shape", [
@@ -197,6 +252,20 @@ def test_escape_three_the_command_channel_is_refused_when_armed(armed_sdk, enfor
     ("connection.execute_command",
      lambda proj: proj.db.connection.execute_command(
          "GRAPH.QUERY", proj.graph_name, "CREATE (n:Once {id:'once'})")),
+    # ⛔ THE GRAPH HALF OF THE SUPPRESSION KEY IS NORMALISED TOO (#9079 review,
+    # P2). The door asks about ``_as_text(args[1])``; a key built from the RAW
+    # ``args[1]`` held ``(store, None, stmt)`` for a bytes graph name, which no
+    # consultation ever asks about — so nothing was suppressed and one write was
+    # measured 3 times.
+    ("proj.g.execute_command (bytes graph name)",
+     lambda proj: proj.g.execute_command(
+         "GRAPH.QUERY", proj.graph_name.encode(),
+         b"CREATE (n:Once {id:'once'})")),
+    # ... and the same for the spellings whose graph rides inside ``args[0]``:
+    # the key must name the graph the door judges, not ``args[1]`` blindly.
+    ("proj.g.execute_command (head carries the graph)",
+     lambda proj: proj.g.execute_command(
+         f"GRAPH.QUERY {proj.graph_name}", "CREATE (n:Once {id:'once'})")),
 ])
 def test_one_write_is_counted_exactly_once_whatever_the_channel(
         armed_sdk, measure_only, shape):
@@ -372,6 +441,32 @@ def test_the_registry_names_the_journal_backed_graph_and_is_released_on_close(tm
     sdk.close()
     assert name not in _journal_backed_graphs(), (
         "closing the projection must release its registration")
+
+
+def test_close_releases_the_registry_but_not_the_journal_authority(tmp_path):
+    """`close()` disarms the REGISTRY, never the projection's own doors.
+
+    RED before the fix: ``close()`` also wrote ``self._journal_backed = False``,
+    which disarmed every §17.1 door on that projection (the write handle,
+    `apply`, the public `query`) while the graph stayed WRITABLE — a server
+    ``db.close()`` is a pool disconnect and redis-py reconnects on the next
+    command — so a post-close write landed with no census entry and, once armed,
+    no refusal. The flag says "this graph is a derived cache of a journal that
+    exists on disk"; closing a connection does not make that untrue.
+    """
+    from tortoise.sdk import TortoiseSDK
+
+    sdk = TortoiseSDK(str(tmp_path / "closed.db"),
+                      event_log_path=str(tmp_path / "journal.jsonl"))
+    proj = sdk._get_proj()
+    assert proj._journal_backed, "the fixture must arm the guard"
+    sdk.close()
+    assert proj.graph_name not in _journal_backed_graphs(), (
+        "the (store, graph) registration is the release close() owes")
+    assert proj._journal_backed, (
+        "close() disarmed the projection's own §17.1 doors: a post-close write "
+        "would reach the journal-backed graph with no census entry and no "
+        "refusal, because the journal still exists and the client reconnects")
 
 
 def test_a_same_named_graph_in_another_store_is_not_judged_as_this_journal(enforced):
