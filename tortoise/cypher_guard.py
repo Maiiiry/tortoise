@@ -1469,6 +1469,20 @@ class _CommandShape(NamedTuple):
         and the Cypher is not always ``args[2]`` (see `_command_shape`).
         """
         if self.index is None:
+            # ⛔ SPLICE INTO THE ORIGINAL TEXT, do not re-join the words (#9079
+            # review). `" ".join(head.split()[:2] + [statement])` collapses the
+            # whitespace run between the graph and the statement, and the
+            # statement itself used to be re-joined too — which altered
+            # whitespace runs INSIDE string literals on the wire
+            # (`WHERE n.content = 'a  b'` → `'a b'`). A guard that alters the
+            # payload it forwards is the class `_guard_execute_command` says it
+            # refuses; only the Cypher substring is replaced here.
+            head = args[0]
+            if isinstance(head, str):
+                parts = head.split(None, len(self.prefix))
+                if len(parts) > len(self.prefix):
+                    return (head[: len(head) - len(parts[-1])] + statement,
+                            *args[1:])
             head = " ".join((*self.prefix, statement))
             return (head, *args[1:])
         return (*args[: self.index], statement, *args[self.index + 1:])
@@ -1514,7 +1528,13 @@ def _command_shape(args) -> _CommandShape | None:
     if not words:
         # An empty/whitespace head is DROPPED by the serializer, so the command
         # the server sees STARTS at ``args[1]`` (measured in the #9209 review).
-        if len(tail) < 2 or tail[0] is None:
+        # ⛔ A NON-TEXT SUCCESSOR IS "CANNOT JUDGE", NOT A CRASH (#9079 review):
+        # `_as_text` passes an unreadable payload through unchanged, so
+        # `execute_command("", 5, 2)` reached `tail[0].upper()` and raised
+        # `AttributeError` on a hot guard. Pre-fix that payload was forwarded
+        # untouched; `None` keeps it in the same unmeasured direction and leaves
+        # the refusal to the write handle's `_command_payload_is_unreadable`.
+        if len(tail) < 2 or not isinstance(tail[0], str):
             return None
         return _CommandShape(
             tail[0].upper(), tail[1],
@@ -1526,8 +1546,14 @@ def _command_shape(args) -> _CommandShape | None:
         if len(words) > 2:
             # The statement (or its head) rides inside the FIRST argument; the
             # tail is flags, so it is not part of the Cypher.
+            # ⛔ THE STATEMENT IS THE ORIGINAL TEXT, not the re-joined words
+            # (#9079 review): `" ".join(words[2:])` collapsed whitespace runs
+            # inside the Cypher — including inside string literals — and
+            # `with_statement` then put that altered text on the wire whenever
+            # the #7162 barrier rewrote the payload. `split(None, 2)` keeps the
+            # remainder byte-for-byte.
             return _CommandShape(
-                verb, graph, " ".join(words[2:]), None,
+                verb, graph, head.split(None, 2)[2], None,
                 (words[0], graph))
         if not tail or tail[0] is None:
             return _CommandShape(verb, graph, None, None)

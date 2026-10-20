@@ -68,15 +68,19 @@ is only honest if it says where it stops:
     that one channel (stated on ``_JOURNAL_BACKED_KEYS``).
 
 WHAT THIS FILE PROVES ON THE PRE-FIX TREE (stated exactly, #9079 review P3). It
-collects **32** cases under pytest (at the review head 25: 15 test functions,
-with one parametrisation adding 5 and one adding 7; the review fix adds the
-split-spelling, bytes-graph-name and `close()` pins). On ``origin/main`` it does
+collects **36** cases under pytest (25 at the first review head: 15 test
+functions, with one parametrisation adding 5 and one adding 7; the review fixes
+add the split-spelling, bytes-graph-name, `close()` and command-target pins, plus
+the two raw-shape pins). On ``origin/main`` it does
 not report "8 failed / 4 passed": its module-level imports
 (`_client_store_key`, `_journal_backed_graphs`, `_journal_backed_keys`,
 `_dispatch_decided`) do not exist there, so the run is a single collection
 **ImportError** — 0 passed, 0 failed, and the pins cannot execute at all. That is
 a stronger statement than a failure count, and it is the one a reader should
-quote.
+quote. The four pins added by the last review fix WERE measured on the pre-fix
+tree (the branch head before that fix): both command-target cases failed with
+``DID NOT RAISE DirectCacheWriteRefused`` / ``census={}`` and both raw-shape
+cases failed on the re-joined statement.
 """
 
 from __future__ import annotations
@@ -569,9 +573,86 @@ def test_a_write_handle_over_a_journal_less_projection_cannot_write_a_journals_c
         with pytest.raises(DirectCacheWriteRefused):
             proj_outsider.db.select_graph(proj_victim.graph_name).query(
                 "CREATE (n:Hijack {id:'h2'})")
+        # ⛔ AND THE COMMAND CHANNEL NAMES ITS OWN GRAPH (#9079 review, P2): the
+        # journal-less projection's OWN handle (its own graph) issuing a
+        # GRAPH.QUERY that names the JOURNAL-BACKED graph. `execute_command`
+        # writes the graph the COMMAND names, which is not `self._g.name`, so
+        # judging the handle's name left the write undecided while
+        # `_decision_key` planted the suppression for the command's graph — the
+        # client door below stood down and the write landed.
+        with pytest.raises(DirectCacheWriteRefused):
+            proj_outsider.g.execute_command(
+                "GRAPH.QUERY", proj_victim.graph_name,
+                "CREATE (n:Hijack {id:'h3'})")
+        assert int(proj_victim.db.select_graph(proj_victim.graph_name).query(
+            "MATCH (n:Hijack) RETURN count(n)").result_set[0][0]) == 0
     finally:
         victim.close()
         outsider.close()
+
+
+class _JournalLessOwner:
+    """A projection with NO journal that shares another projection's STORE.
+
+    `_GuardedGraph` is built in-tree over a projection that did not create the
+    graph it fronts (`tortoise/hosted_api.py`
+    does `_GuardedGraph(proj.db.select_graph(<name>), proj)`), and that
+    projection often has no journal at all. Only `_journal_backed` is read by
+    the §17.1 door on this path, so a stub states the premise DETERMINISTICALLY
+    — including on the embedded lane, where two SDKs never share a store.
+    """
+
+    _journal_backed = False
+    _is_embedded = False
+
+
+def test_a_handle_on_another_graph_judges_the_graph_its_command_names(
+        armed_sdk, enforced):
+    """P2 (#9079 review) — the handle's own name is NOT the graph it writes.
+
+    `execute_command` writes the graph the COMMAND names, which need not be
+    `self._g.name`. The door judged the handle's own graph (nothing to decide
+    for a journal-less owner) while `_decision_key` — correctly — keyed the
+    suppression on the COMMAND's graph, so the client door one hop below stood
+    down for a graph this handle had never decided about: the write reached a
+    JOURNAL-BACKED cache with no refusal and no census entry.
+    """
+    from tortoise.projection import _GuardedGraph
+
+    proj = armed_sdk._get_proj()
+    other = proj.db.select_graph(f"not_the_journal_{id(proj)}")
+    handle = _GuardedGraph(other, _JournalLessOwner())
+    with pytest.raises(DirectCacheWriteRefused):
+        handle.execute_command(
+            "GRAPH.QUERY", proj.graph_name, "CREATE (n:Hijack2 {id:'h4'})")
+    assert _count(proj, "Hijack2", "id", "h4") == 0, (
+        "a refused write must land nothing, whatever graph the COMMAND names")
+
+
+def test_that_command_is_censused_exactly_once_in_measure_mode(
+        armed_sdk, measure_only):
+    """The same shape, censused: MEASURE mode must see the write ONCE.
+
+    RED before the fix: the handle door declined to decide (it judged the
+    handle's own graph), the suppression then told the client door to stand
+    down, and the census held ZERO entries for a write that landed — the
+    "count is exact" contract `_record_undeclared_handle_write` states.
+    """
+    from tortoise.projection import _GuardedGraph
+
+    proj = armed_sdk._get_proj()
+    other = proj.db.select_graph(f"not_the_journal_{id(proj)}")
+    handle = _GuardedGraph(other, _JournalLessOwner())
+    handle.execute_command(
+        "GRAPH.QUERY", proj.graph_name, "CREATE (n:Hijack3 {id:'h5'})")
+    hits = _hits(undeclared_handle_writes(), "Hijack3")
+    assert hits, (
+        "a write to a journal-backed graph through a command channel was not "
+        f"measured at all: census={undeclared_handle_writes()}")
+    assert sum(hits.values()) == 1, (
+        f"one write counted {sum(hits.values())} times: {hits}")
+    assert _count(proj, "Hijack3", "id", "h5") == 1, (
+        "measure mode does not refuse — the write lands, exactly once")
 
 
 def test_the_hook_is_installed_by_the_projection():
@@ -580,3 +661,44 @@ def test_the_hook_is_installed_by_the_projection():
     import tortoise.projection as projection
 
     assert cypher_guard._JOURNAL_WRITE_AUTHORITY is projection._journal_write_authority
+
+
+# ── the raw-command shape reader does not crash and does not rewrite ──────
+
+def test_a_non_text_successor_after_an_empty_head_is_not_a_crash():
+    """`_command_shape(("", 5, 2))` answers "cannot judge", it does not raise.
+
+    RED before the fix: `_as_text` passes an unreadable payload through
+    unchanged, so the empty-head branch called ``tail[0].upper()`` on an `int`
+    and raised `AttributeError` on a hot guard. Pre-fix that payload was
+    forwarded untouched, so raising here is a new failure path (#9079 review).
+    """
+    from tortoise.cypher_guard import _command_shape
+
+    assert _command_shape(("", 5, 2)) is None
+    assert _command_shape(("", "GRAPH.QUERY", 5, "CREATE (n:X)")) is not None
+
+
+def test_the_shape_reader_does_not_rewrite_the_statement_it_forwards():
+    """The Cypher's OWN whitespace survives — including inside literals.
+
+    RED before the fix: the statement was derived as
+    ``" ".join(head.split()[2:])``, which collapses whitespace runs, and
+    `with_statement` then put that collapsed text on the wire when the #7162
+    barrier rewrote the payload — ``n.c = 'a  b'`` became ``n.c = 'a b'``. A
+    guard altering the payload it forwards is the class
+    `_guard_execute_command` says it refuses (#9079 review).
+    """
+    from tortoise.cypher_guard import _command_shape
+
+    statement = "MATCH (n) WHERE n.c = 'a  b' DETACH DELETE n"
+    head = "GRAPH.QUERY g " + statement
+    shape = _command_shape((head,))
+    assert shape is not None
+    assert shape.statement == statement, (
+        "the statement must be the ORIGINAL text, not the re-joined words")
+    rewriting = "MATCH (n) WITH * WHERE n.c = 'a  b' DETACH DELETE n"
+    assert shape.with_statement((head,), rewriting) == (
+        "GRAPH.QUERY g " + rewriting,), (
+        "rebuilding the payload must replace only the Cypher, keeping the "
+        "literal's own whitespace")
