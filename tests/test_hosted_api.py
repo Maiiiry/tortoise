@@ -9401,22 +9401,22 @@ class TestUriRegistryProbeConnectionReuse:
 
     def test_a_changed_store_path_rebuilds_instead_of_probing_the_old_store(
             self, monkeypatch):
-        """#9376: the cache key is the STORE, not one of its inputs.
+        """#9334: the cache key is the STORE, not one of its inputs.
 
         The URI alone does not identify what a handle is bound to. The suite's
         canonical fixture (`tests/_http_fixtures.patched_tortoise_sdk`)
         replaces `TortoiseSDK.__init__` so every construction binds that TEST's
         temp DB and pins `TORTOISE_DB_PATH` to it, while the docker lane's
         `TORTOISE_DB_URI` string stays constant for the whole run. Keyed on the
-        URI alone, `_registry_anchor()` therefore handed a later test a
-        connection to an EARLIER test's (torn-down) temp DB — measured on main
-        at adaf3daea as an org that had just been created through the live store
-        being ABSENT from `GET /v1/organizations`
+        URI alone, a handle built under one store configuration was therefore
+        reused under the next one — the cache cannot see the rebind. On main at
+        adaf3daea that surfaced as an org that had just been created through the
+        live store being ABSENT from `GET /v1/organizations`
         (`tests/test_onboarding_endpoints.py::TestOnboardingTeam::
         test_create_team_then_session_key_mint_registry`, 1 failed / 43 passed
-        at file scope; 44 passed with this key). The same stale handle answers
-        `_org_node`/`_membership_role` with EMPTY, which is the false 403
-        `Requires owner or admin role in team`.
+        at file scope; 44 passed with this key), and the same handle answers
+        `_org_node`/`_membership_role` with EMPTY — the false 403 `Requires owner
+        or admin role in team`.
 
         The regression is stated as behaviour, not as a key comparison: after
         the store the process addresses changes, the probe must CONSTRUCT a new
