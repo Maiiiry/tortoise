@@ -24,13 +24,14 @@ WHAT IS PINNED HERE, and why each test is discriminating:
 1. ``test_every_id_anchored_pass_query_is_planned_as_an_index_read`` — the
    queries ``ep.py`` actually EMITS (captured off the graph handle, not
    re-written in the test) plan through ``Node By Index Scan`` and contain no
-   ``Node By Label Scan``. Measured discriminating power, per statement:
-   removing the barrier reddens it at the seed neighbourhood, the plain-seed
-   direct-edge expansion, the bridge hop and Batch 1. At the two OR-split
-   sweeps and at Batch 3 the barrier is NOT what does the work — the endpoint
-   split (and, at Batch 3, the two-``MATCH`` form) anchors on its own — so the
-   barrier is kept at those three as the engine-6.0.0 predicate-drop guard
-   (#6976), not as a cost fix, and this file does not claim otherwise.
+   ``Node By Label Scan``. Measured discriminating power, per site: removing
+   the barrier reddens it at the seed neighbourhood, the plain-seed direct-edge
+   expansion, the bridge hop, Batch 1 and — in the selector test — all four
+   ``analyze.py`` legs. It does NOT redden it at three redundant sites: the
+   cache's back-message sweep, the BFS undirected direct-edge sweep and Batch 3
+   anchor on their own (two-``MATCH`` / undirected forms), so the barrier is
+   kept there as the engine-6.0.0 predicate-drop guard (#6976), not as a cost
+   fix, and this file does not claim otherwise.
 2. ``test_the_hop_budget_tracks_the_frontier_not_the_graph`` — the cost half:
    the hop's traversal touches fewer records than the graph has edges, on a
    fixture whose background is deliberately much larger than the frontier.

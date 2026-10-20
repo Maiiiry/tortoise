@@ -260,16 +260,19 @@ kept as the engine-6.0.0 predicate-drop guard (#6976): the cache load's
 back-message sweep, the BFS undirected direct-edge sweep and Batch 3, whose two
 `MATCH` / undirected forms anchor on their own.
 
-Four statements traverse and were already `Node By Index Scan` without a
-barrier on `origin/main`, so they carry none: `_load_cache`'s message sweep,
+Four sites traverse and were already `Node By Index Scan` without a barrier on
+`origin/main`, so they carry none: `_load_cache`'s message sweep,
 `seed_operators`, `_affected_factors` Batch 2 and the selector's
-operator→target leg. (Nine further distinct id-set statements do not traverse
-at all — the seed lookup, the node-params sweep and the draft filter, the last
-two per epistemic label — and they are index-anchored as well, so the same
-assertion pins them.) All of the above are
+operator→target leg (the last is not emitted by a pass at all — it is pinned by
+the selector test). A real pass emits **19 distinct unbarriered id-set
+statements**, and they partition exactly: the cache's message sweep **8**
+(IMPL and NAND x 4 labels), its node-params/`ep_alpha` load **4**, the draft
+filter **4**, the seed lookup **1**, `seed_operators` **1**, Batch 2 **1** —
+8 + 4 + 4 + 1 + 1 + 1 = 19, every one index-anchored. All of the above are
 in the pinned set: `tests/test_6211_ep_anchor.py` captures the statements the
-pass emits and asserts the PLAN of each (`Node By Index Scan`, no label or
-all-node scan), never their text; each is
+pass emits and asserts the PLAN of each (`Node By Index Scan`, and no
+`Node By Label Scan`; the selector test additionally rejects `All Node Scan`),
+never their text; each is
 reached by the fixture (`_load_cache`'s sweeps and Batch 2 directly,
 `seed_operators` through an operator seed — the 300 operators hanging off the
 hub claim). On the 23k-node / 160k-edge fixture that assertion covers the pass's
@@ -315,25 +318,44 @@ the posteriors agree to ~1e-12, the summation order; `run` shuffles the factor
 list per iteration anyway).
 
 The split's own cost, measured rather than assumed, because it emits MORE
-statements per pass. Instrumenting the graph handle and counting every query a
-`TortoiseEP.run()` issues on the 40-claim interactive zone that
+statements per pass — and it is a real cost, paid on the interactive path.
+Instrumenting the graph handle and counting every query a `TortoiseEP.run()`
+issues on the 40-claim interactive zone that
 `tests/test_ep_local_395.py::test_ac5_interactive_latency_zone` builds, this
-branch emits **11 more statements per pass** than `origin/main`: 183 and 185 vs
-172 and 174 for the two passes one `compute_confidence()` runs (502 vs 480
-statements over the whole call). Nothing replaces anything — the two splits are
-the entire delta, and both grow:
+branch emits **11 more statements per pass** than `origin/main` (**+22** for the
+two passes one `compute_confidence()` runs). Only the DELTA is quoted here: the
+absolute totals move with how much of the call the recorder sees (a
+`TortoiseEP.g`-level recorder and a graph-handle-level one disagree by the
+sweeps that never reach the pass), and the delta is identical either way.
+Nothing replaces anything — the two splits are the entire delta, and an added
+`WITH *` barrier emits no statement of its own:
 
 | site | `origin/main` | this branch |
 |---|---|---|
-| `_affected_factors` Batch 3 | **1** (one unlabelled `MATCH (a)-[r:IMPL\|NAND]->(b) … (a.id IN $ids OR b.id IN $ids)`) | **8** (2 anchors x 4 epistemic labels) |
+| `_affected_factors` Batch 3 | **1** (one unlabelled `MATCH (a)-[r:IMPL\|NAND]->(b) ... (a.id IN $ids OR b.id IN $ids)`) | **8** (2 anchors x 4 epistemic labels) |
 | `_load_cache` back-message sweep | **4** (target-labelled, `b.id IN $ids` in the same predicate) | **8** (2 anchors x 4 epistemic labels) |
 
-Every other sweep is byte-identical in count, and the added `WITH *` barriers
-emit no statements of their own, so +7 (Batch 3) and +4 (cache) is the whole of
-it; `tests/test_6211_ep_anchor.py` pins both site counts so this arithmetic
-cannot rot silently. The wall cost of those 11 statements is inside the noise:
-6 interleaved runs gave medians of **1,149 ms** before and **1,175 ms** after —
-inside the run-to-run range of either tree (1,044-1,245 ms vs 1,079-1,194 ms).
+The wall cost of those 11 statements is **not** inside the noise. Three
+independent interleaved blocks of 45 paired runs each (order alternated both
+ways, one child process per run) gave **1.024 s -> 1.108 s, +8 %** — per-block
+medians 1.034/1.126, 1.011/1.108, 1.007/1.099 (+8.9 %, +9.6 %, +9.2 %) — with
+the branch slower in **114 of 135** paired runs (37/45, 40/45, 37/45; sign test
+p < 1e-4). A 6-run sequence had suggested the cost was inside the range; the
+interleaved study is what settles it, and it settles it the other way. The AC5
+guard itself is flaky on this host for BOTH trees — it trips its `< 1.2 s`
+bound on `origin/main` too, and more often here (#9015 tracks that flake), so
+per-run tallies from one host are not worth quoting as a characterisation.
+
+**That cost is accepted, not denied.** The alternative on the other side is the
+plan this change exists to remove: a label scan of the traversal's endpoint,
+graph-proportional, which aborted the pass outright at a few thousand points.
+Narrowing the fan-out back is not free either — sweeping only the labels
+actually present (`live.epistemic_labels_of`) would also make the endpoint
+duplication disappear, and with it the only observable failure that the
+edge-keyed dedupe exists to catch (a multi-labelled `:Point:Object` endpoint
+swept once per label is what produces the duplicate row).
+Cutting the statement count while keeping that observability is a follow-up, not
+a one-line change.
 
 What remains open after it: the pass **completes slowly** — the same one-anchor
 pass took **89 s** on the fixture, of which ~43 s is a per-message graph read
