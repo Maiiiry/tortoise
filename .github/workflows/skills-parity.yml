@@ -9,7 +9,8 @@
 #   * the upstream arm (`--check-upstream`) — the pin is HONEST (its commit
 #     really hashes to the pinned sha256), CURRENT (the bytes at upstream `main`
 #     HEAD are still those bytes) and has the right SCOPE (upstream `skills/`
-#     equals the pin's keys plus its declared `out_of_scope:` entries), so an
+#     equals the upstream directories the pin's `upstream_path`s bind, plus its
+#     declared `out_of_scope:` entries), so an
 #     upstream ADDITION or REMOVAL is reported instead of being invisible to a
 #     pin-keyed loop.
 #
@@ -58,16 +59,17 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.12'
+          # One uv version per repo — the same pin as `ci.yml` and
+          # `deploy-hosted.yml`. (`--no-project` below means uv.lock is not
+          # consulted here; the pin is about resolving reproducibly, not the lock.)
           version: '0.12.3'
       - name: The pin is honest, current and complete against the MIT repo (#4643)
-        # `--no-project`: the script's only third-party import is pyyaml, so a
-        # full project sync (numpy/scipy/fastapi/falkordb plus the dev group)
-        # would be paid for nothing — and would bring CI's stale-`.venv` failure
-        # mode (#1917) into a gate that must fail on SKILL BYTES.
+        # `--no-project --with pyyaml`: this tool's only third-party import is
+        # pyyaml, so there is no reason to sync the project env (and its `dev`
+        # group) once a day for a byte comparison. Same shape as the deploy step.
         run: |
-          uv run --no-project --with pyyaml==6.0.3 python3 \
-            tools/served_skills_parity.py --check-upstream \
-            --report skills-parity-report.md
+          uv run --no-project --with pyyaml==6.0.3 python3 tools/served_skills_parity.py \
+            --check-upstream --report skills-parity-report.md
         env:
           # The upstream `skills/` listing is the one GitHub API call in the
           # tool: 60 requests/hour unauthenticated, 5000/hour with a token.
