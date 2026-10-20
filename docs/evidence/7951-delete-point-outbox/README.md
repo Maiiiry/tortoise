@@ -20,10 +20,15 @@ reproducible by any lane.
 mirror window that opened in exchange — a `DETACH DELETE` that does not land (a generic
 engine/transport failure, the node still present) raised with the destruction record ALREADY
 committed, so `get_point` still served the Point while the journal claimed it was gone, and only a
-destructive `rebuild_all` could resolve it. ⛔ It is NOT a systematic pre-write refusal: §17.1's write
-door (#9124) gates the FOLD lanes, not the raw `proj.g.query` lane this door writes through — section 4
-of the probe below (the residuals) prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the guard armed, which is
-why the failure in the test is INJECTED.
+destructive `rebuild_all` could resolve it. ⛔ It is NOT a systematic pre-write refusal, and the reason
+is the guard's ARMING STATE, not a gap in its coverage: §17.1's write surface has three doors
+(#9124 part 1), and this statement is issued at the third one — the projection's write handle,
+`proj.g.query` — which DETECTS a mutating statement with no declared lane but does not yet REFUSE it
+(`_HANDLE_GUARD_ENFORCES` is `False`; part 2 arms it). Section 4 of the probe below (the residuals)
+prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with that door measuring, which is why the failure
+in the test is INJECTED. ⚠️ Declaration state: `delete_point` holds NO live lane (`#9207`'s
+apply-first order makes one false) and is inventoried in `_APPLY_FIRST_DOORS`, so part 2's armed
+handle REFUSES it until an "apply-first, by decision" lane exists (#9124 / #9206).
 The destroy is now issued FIRST (`MATCH … DETACH DELETE n`, with NO `RETURN` clause and no row-count
 gate) and the record follows only once that statement has RETURNED. Because a raise does not prove
 "nothing was destroyed" — the transport family may have applied the write and lost the reply — the
@@ -35,10 +40,14 @@ states only that the destroy is UNVERIFIED (`destroy_verified=False`).
 no record can exist for a destroy the cache did not perform — the record follows the VERIFIED cache
 state, so a cache write that raises appends nothing UNLESS the read-back proves the destroy landed (a
 lost reply over an applied write IS recorded: the cache is what the record describes), and a zero-row
-write IS recorded, because the node is absent either way. Every residual window is reported rather
-than silent: a landed
+write IS recorded, because the node is absent either way. Every residual window in which CODE RUNS is
+reported rather than silent: a landed
 destroy whose append failed is `record_committed=False`, a lost reply over an APPLIED destroy is
-recorded and logged, and an unreadable after-state raises an arm that asserts neither store. A
+recorded and logged, and an unreadable after-state raises an arm that asserts neither store. ⚠️ The
+one window no code can report is a PROCESS DEATH between the destroy returning and the append
+(`kill -9`, OOM, power loss): nothing raises and nothing is logged, and the next `rebuild_all`
+re-creates the Point from its `PointAdded` line. That is the crash window #9207 accepts in exchange
+for closing one that was systematic — removing it entirely is §17.1's atomic write (increment 2b). A
 completed delete stays durable across replay. It does
 **not** claim §17.1 is closed — the raw handle is still open, and `delete_entity` (the generic entity
 delete) is still apply-first; both are shown in the probe's own last section. Plans of record:
@@ -70,17 +79,24 @@ delete_entity order:             ['cache-DETACH-DELETE', 'journal-EntityMutated-
 RESIDUAL: the raw handle is NOT closed, and `_delete_entity` is still apply-first — both recorded on #7951; increment 4a routes ONE delete door (`delete_point`).
 ```
 
-**Raw output:** `delete-order-probe.log` (verbatim — **re-measured** after the review that found the
-earlier copy still carried the pre-`60dc70e` `RuntimeError`; the shipped live engine also logs, and
-the headline block omits: the pack-registry / ontology-relation advisories (`#7852`/`#7848`), the
+**Raw output:** `delete-order-probe.log` (verbatim — **re-measured** at this head, after the §17.1
+reconciliation that withdrew this door's live-lane declaration; the shipped live engine also logs, and
+the log carries every one of those lines: the pack-registry / ontology-relation advisories
+(`#7852`/`#7848`), the **`§17.1 … NO declared lane` measure-mode advisories** (`#9124` part 1 — this
+door's `DETACH DELETE`, `_mark_dirty`'s `UNWIND … SET n.ep_dirty` and `invalidate_messages`'s
+`REMOVE r.msg_*` are now counted as UNDECLARED, which is the visible consequence of `delete_point`
+being apply-first and holding no lane), the
 undeclared `ep_dirty`/`ep_dirty_at` Point props (`#2795`), the `#2943` snapshot-dir note (twice — once
 per temp dir), and the probe-induced `failed to append EntityMutated event` line (`#4240`, section 3's
 deliberate journal failure)).
 Exit code `0`. Those advisory lines carry the paths of the worktree the log was measured in
 (`pack registry /Users/danielospina/Documents/GitHub/tortoise/.worktrees/fix/p0-delcommit/packs`,
 plus the per-run `mkdtemp` dirs) — they are the engine's own report, not probe output, and are left
-unfiltered so the log stays verbatim. Re-running the probe therefore differs from it in those paths
-only (the worktree and the `mkdtemp` names are per-run); every measured line is stable.
+unfiltered so the log stays verbatim; the WORKTREE path is normalized to that canonical
+`fix/p0-delcommit` form (both captures ran in a worktree of this branch), and the cold-cache
+HuggingFace download warning/progress line is omitted as environment noise rather than output.
+Re-running the probe therefore differs from the log in those paths only (the worktree form and the
+`mkdtemp` names are per-run); every measured line is stable.
 
 ## What each line means
 
@@ -150,8 +166,10 @@ reads and writes to section 1's graph.
 
 ## The residuals, shown rather than hidden
 
-1. **The raw handle (`proj.g.query`) is still open** — the recorded `OVERRIDES:` departure on
-   `#7951`; a blanket refusal would break the product's own live write path (`#8389`).
+1. **The raw handle (`proj.g.query`) is DETECTED but not yet REFUSING** — the recorded `OVERRIDES:`
+   departure on `#7951`; a blanket refusal would break the product's own live write path (`#8389`).
+   #9124 part 1 counts and logs an undeclared write here; part 2 arms the refusal, and this
+   apply-first door then needs a lane (or is refused) — see `_APPLY_FIRST_DOORS`.
 2. **`delete_entity` (the generic entity delete) is still apply-first** — it `DETACH DELETE`s per
    matched canonical label and journals afterwards, so it still carries the resurrection window.
    Closing it needs a pre-read per label (to journal only the label that matched). Named in

@@ -15,25 +15,32 @@ It demonstrates, against the shipped modules:
   2. A cache write that RAISES appends NO record: the node is still there, the
      journal is untouched, and the caller gets the engine's own error.
      Pre-#9207 the journal already held the destruction at that point — the
-     divergence #9207 measured. ⛔ That trigger is NOT the §17.1 write door
-     (#9124), which gates the FOLD lanes and not this door's raw `proj.g.query`
-     handle — section 4 below (the residuals) prints
-     `RAW HANDLE LANE (proj.g.query): SUCCEEDED`
-     with the guard armed. It is a generic engine/transport failure with the node
-     still present: RARE, and why the ordering is argued from the DIRECTION of
-     the divergence rather than its frequency. (A ZERO-ROW write is different,
-     and IS recorded: the node is absent either way, so the record is true of
-     the cache — see the door's own comment and
+     divergence #9207 measured. ⛔ That trigger is NOT a systematic pre-write
+     refusal, and the reason is the GUARD'S ARMING STATE: §17.1's write surface
+     has three doors (#9124 part 1) and this statement is issued at the THIRD
+     one — the projection's write handle, `proj.g.query`. It is DETECTED there
+     (a mutating statement with no declared lane is counted and logged), but its
+     REFUSAL is not armed (`_HANDLE_GUARD_ENFORCES` is `False` in part 1), so
+     nothing refuses the statement today — which is why section 4 below (the
+     residuals) prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with that
+     door measuring. What is reachable is a generic engine/transport failure
+     with the node still present: RARE, and why the ordering is argued from the
+     DIRECTION of the divergence rather than its frequency. (⚠️ Once part 2 arms
+     the handle, this apply-first door is REFUSED: it holds no journal-first
+     lane since #9207 — see `_APPLY_FIRST_DOORS`.) (A ZERO-ROW write is
+     different, and IS recorded: the node is absent either way, so the record is
+     true of the cache — see the door's own comment and
      `tests/test_7405_remaining_writes.py`.)
   3. A destroy that LANDED and then failed to record is reported, never silent
      (`WriteNotLandedError`, `record_committed=False` since the append raised).
      It does not heal by itself: `recover_from_log` rebuilds only an EMPTY
      graph, so the repair is a DESTRUCTIVE `rebuild_all`, which re-creates the
      Point from the journal (undoing the delete) — the caller then re-issues.
-  4. The RECORDED RESIDUALS are shown, not hidden: the raw handle
-     (`proj.g.query`) still writes the cache directly, and `delete_entity` (the
-     generic entity delete) is still apply-first — both recorded on #7951 and in
-     plan §7 increment 4.
+  4. The RECORDED RESIDUALS are shown, not hidden: the write handle
+     (`proj.g.query`) is DETECTED but not yet REFUSING (#9124 part 1 —
+     measure mode, `_HANDLE_GUARD_ENFORCES` is `False`), and `delete_entity`
+     (the generic entity delete) is still apply-first — both recorded on #7951
+     and in plan §7 increment 4.
 
 Instrumenting the door means swapping `query` on the GUARDED GRAPH CLASS
 (`_GuardedGraph` keeps its state in `__slots__` and defines `query` on the

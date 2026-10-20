@@ -18,10 +18,17 @@ aboutObjects: "#7951, #7950, STORAGE-ARCHITECTURE.md §17.1, tortoise/sdk.py del
 > raised out of the door with the destruction record ALREADY committed, so `get_point` still served
 > the Point while the truth claimed it was gone — resolvable only by a destructive `rebuild_all`, and a
 > retry over a still-present node appends a SECOND record for one intent. ⛔ That window is RARE, not a
-> systematic pre-write refusal: §17.1's write door (#9124) raises `DirectCacheWriteRefused` from the
-> FOLD lanes, and this door writes through the raw guarded handle (`proj.g.query`), which the gate does
-> not cover — measured by this lane's own probe (`RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the
-> guard armed). The ordering is justified by the DIRECTION of the divergence it leaves, not its
+> systematic pre-write refusal, and the REASON is the guard's arming state rather than a gap in its
+> coverage: §17.1's write surface has three doors (#9124 part 1) and this statement is issued at the
+> third one — the projection's write handle, `proj.g.query` — which DETECTS a mutating statement with
+> no declared lane but does not yet REFUSE it (`_HANDLE_GUARD_ENFORCES` is `False`; part 2 arms it).
+> Measured by this lane's own probe (`RAW HANDLE LANE (proj.g.query): SUCCEEDED` with that door
+> measuring). ⚠️ **Consequence for §17.1's declaration inventory:** `delete_point` therefore holds NO
+> live lane — its #9124 part-1 `@_declares_live_write_lane("delete_point")` was journal-first-only and
+> is WITHDRAWN, and the door is inventoried in `_APPLY_FIRST_DOORS`
+> (`tests/test_9124_declared_live_doors.py`). Arming the handle (part 2) REFUSES this apply-first
+> door until an "apply-first, by decision" lane exists (#9124 / #9206). The ordering is justified by
+> the DIRECTION of the divergence it leaves, not its
 > frequency. The door now issues the destroy FIRST and appends the record
 > only once it has RETURNED (any row count — a zero-row write still leaves the node absent, so the
 > record is true of the cache); the remaining window (a landed destroy whose append failed) is
@@ -200,11 +207,13 @@ fixed one.
 | test-file classification | config | `config/ci-surfaces.yml` — six-surface dual-registration + a `durations` row; `python tools/ci_selection.py --integrity` green | done |
 | executable demonstration | evidence | `docs/evidence/7951-delete-point-outbox/` (probe + verbatim log, exit 0; re-measured at this head — section 3 now prints the `record_committed=True` arm) | done |
 | MCP / public SDK surface | none | `tools/surface_manifest.py check` OK (no tool row added, removed or renamed); no tool or public method added/renamed | verified |
-| raw guarded handle `proj.g.query` | **open** | — | **NOT enforced** (the §17.1 residual; `#7951` stays OPEN) |
+| raw guarded handle `proj.g.query` (this door's `DETACH DELETE`) | **measured** | — | **DETECTED, not yet REFUSING** (#9124 part 1: counted + logged, `_HANDLE_GUARD_ENFORCES` False); the door holds NO live lane since #9207 reversed its order, so part 2 refuses it |
 
 ## 6. Residuals — declared, not absorbed
 
-1. **The raw guarded handle stays open** for the other ~287 sites; this routes one door's ORDER, not the
+1. **The raw guarded handle stays open** for the other ~287 sites — and for THIS door it is
+   DETECTED, not yet REFUSING (#9124 part 1: counted + logged; `_HANDLE_GUARD_ENFORCES` arms the
+   refusal in part 2). This routes one door's ORDER, not the
    handle. The `OVERRIDES:` line above remains in force.
 2. **`delete_entity` (the generic entity delete) is still apply-first.** It `DETACH DELETE`s per matched
    canonical label and journals each match afterwards; it therefore still carries the resurrection
@@ -245,9 +254,15 @@ fixed one.
    CONDITIONAL and the record must not claim a destruction the guard refused. `delete_point`'s delete is
    unconditional once the probe passes, so gating on its result would preserve exactly the window this
    increment closes — the unrecorded destroy.
-2. **A `_live_write_scope` around the delete's raw-handle writes.** REJECTED — a scope authorizes
-   nothing on the raw handle (the guard covers `FalkorProjection.apply`/`.query`), so it would imply an
-   enforcement that is not there. Increment 3 is where the door declares itself.
+2. **A `_live_write_scope` around the delete's raw-handle writes.** REJECTED — a `_live_write_scope`
+   claims "the record was appended FIRST" (it is the journal-first lane), so around an apply-first
+   door it would authorize a cache write with no committed record — the #9068 defect, and now
+   literally pinned: #9124 part 1 landed `@_declares_live_write_lane("delete_point")` on this door
+   and #9207's reversal made it FALSE, which is why it was withdrawn and `delete_point` sits in
+   `_APPLY_FIRST_DOORS`. ⚠️ The handle's measure/enforce state is not an argument here: the handle
+   DETECTS this write today (`_HANDLE_GUARD_ENFORCES` is `False`, #9124 part 2 arms it), so a lane
+   would change nothing it can see and would still be a false claim about the order. An
+   "apply-first, by decision" lane is §17.1 work (#9124 / #9206), not this increment's.
 3. **A blanket refusal on the guarded handle.** REJECTED — `#8389` verbatim; carried as the recorded
    `OVERRIDES:` departure.
 4. **Widening the record to a new event type for a Point hard delete.** REJECTED — `EntityMutated`

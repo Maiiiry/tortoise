@@ -22,13 +22,16 @@ are not equally harmful:
   the cache never performed. The cache SERVES a Point the truth says is gone,
   which §17.1's own definition forbids (the cache must never be AHEAD of the
   truth), and only a DESTRUCTIVE `rebuild_all` resolves it. ⛔ The trigger is
-  NOT the §17.1 write door: that gates the FOLD lanes (`FalkorProjection.apply`
-  and the projection's own `query`), while this door writes through the raw
-  guarded handle (`proj.g.query`), which the gate does not cover — the probe in
-  this directory prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the
-  guard armed. So the window is a generic engine/transport failure with the node
-  still present: RARE. The ordering is justified by the DIRECTION of the
-  divergence it leaves, not by its frequency.
+  NOT the §17.1 write door in a REFUSING state: that surface has three doors
+  (#9124 part 1) and this statement is issued at the third one — the
+  projection's write handle (`proj.g.query`) — which is DETECTED but not yet
+  REFUSING (`_HANDLE_GUARD_ENFORCES` is `False` until #9124 part 2), so the
+  probe in this directory prints `RAW HANDLE LANE (proj.g.query): SUCCEEDED`
+  with the guard measuring. So the window is a generic engine/transport failure
+  with the node still present: RARE. The ordering is justified by the DIRECTION
+  of the divergence it leaves, not by its frequency. (⚠️ Once part 2 arms the
+  handle this door is REFUSED — it is apply-first by #9207's decision, so it
+  holds no journal-first lane and is inventoried in `_APPLY_FIRST_DOORS`.)
 * the cache first (#9207) — a `DETACH DELETE` that fails or matches nothing
   appends NOTHING, so the record can never over-claim. The remaining window is
   the append failing after a landed destroy: the cache is ahead of the truth
@@ -220,19 +223,19 @@ def test_a_failed_cache_write_appends_no_destruction_record(env, monkeypatch):
 
     The failure injected is a cache write that did not reach the engine and
     raised with the Point still present — the SHAPE #9207 cares about, injected
-    here because this door writes through the raw guarded handle (`proj.g.query`),
-    which §17.1's write door (#9124) does NOT cover: the gate raises
-    `DirectCacheWriteRefused` from the fold lanes (`FalkorProjection.apply` and
-    the projection's own `query`), so on THIS door it is not a systematic
-    pre-write refusal — the lane's own probe measured
-    `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the guard armed. The
-    reachable trigger is a generic engine/transport failure, which is rare; what
-    the ordering buys is the DIRECTION of the divergence it leaves. Pre-fix (the
-    #7951 append-first order) the journal ALREADY held the `EntityMutated`
-    op=delete record at that point while the cache still served the Point — a
-    committed record claiming a cache state the cache does not have, whose only
-    repair is a destructive `rebuild_all` that deletes a Point the caller never
-    managed to delete.
+    here because the reachable trigger is a generic engine/transport failure:
+    §17.1's third door (#9124 part 1) is this same raw handle (`proj.g.query`),
+    and it DETECTS a mutating statement but does not yet REFUSE one
+    (`_HANDLE_GUARD_ENFORCES` is `False`; part 2 arms it), so nothing raises
+    `DirectCacheWriteRefused` here in the landed state — the lane's own probe
+    measured `RAW HANDLE LANE (proj.g.query): SUCCEEDED` with the guard
+    measuring. The reachable trigger is therefore rare; what the ordering buys
+    is the DIRECTION of the divergence it leaves. Pre-fix (the #7951
+    append-first order) the journal ALREADY held the `EntityMutated` op=delete
+    record at that point while the cache still served the Point — a committed
+    record claiming a cache state the cache does not have, whose only repair is
+    a destructive `rebuild_all` that deletes a Point the caller never managed
+    to delete.
 
     The LOSS is asserted, not the code path: no destruction record for this id,
     the node still live, and no `:GraphEvent` `PointRetracted` row published to
