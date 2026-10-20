@@ -391,14 +391,36 @@ def test_the_eager_init_statement_is_a_mutating_one():
     No graph, no fixture: this is the shared classifier the guard itself uses
     (`FalkorProjection.query` → `_statement_writes`), so the claim "escape (3)
     carries an undeclared mutating statement" is the guard's own reading, not
-    this file's opinion. Deleting the classifier's `MERGE` recognition (or
-    narrowing it) turns this RED.
+    this file's opinion.
+
+    The failure claim is deliberately NARROW (#9150 review cycle 2, P2). The
+    statement is a MULTI-CLAUSE write (`MERGE … ON CREATE SET …`), so
+    `_WRITE_CLAUSE_RE` matches `CREATE` and `SET` independently of `MERGE`:
+    deleting the classifier's `MERGE` arm alone leaves this GREEN (measured —
+    `_statement_writes("CREATE (:TeamMeta {name:$name})")` is `True`, and so is
+    the fragment, whose `ON CREATE SET` matches both other arms). What reds here
+    is the classifier ceasing to read this statement as a write AT ALL —
+    `_WRITE_CLAUSE_RE` losing `CREATE`/`SET`, or `_statement_writes` regressing
+    — which is the premise the residual rests on. The classifier's individual
+    arms belong to its own suite, not to this pin; an earlier revision of this
+    docstring claimed the `MERGE` arm, which was the same
+    wrong-pin-attribution defect the module docstring's failure map had.
+
+    The `:OnboardingState` label is the other half, and had no pin: all three
+    records say these five sites CREATE an `:OnboardingState`, so a fragment
+    that stopped naming that node would leave every record describing a write
+    to something no longer written.
     """
     cypher, _params = _os.eager_init_query(
         "CREATE (:TeamMeta {name:$name})",
         {"name": "escape3"},
         org_id="org9121-residual",
         fork=_os.FORK_SELF,
+    )
+    assert ":OnboardingState" in cypher, (
+        "`eager_init_query()` no longer creates an `:OnboardingState` — the "
+        "node all three records say the five escape-(3) sites CREATE. Re-derive "
+        f"the residual before letting those records stand:\n{cypher}"
     )
     assert _statement_writes(cypher) is True, (
         "`eager_init_query()` no longer builds a statement the §17.1 classifier "
@@ -636,15 +658,24 @@ def test_the_opener_inventory_is_pinned_so_a_new_lane_moves_this_file():
 
     The instrument check below iterates the DERIVED set, so on its own it accepts
     any number of openers — measured: adding `_future_lane_write_scope()` to
-    `projection/__init__.py` left 12/12 green (#9150 review, P2). The honest fix
-    for the escape-(3) residual (#9157) is exactly that shape — a new named
-    opener, the shape #9123 and #9195 both used — so the day it lands, this
-    file's note, the opener inventory in `projection/__init__.py` and this list
-    have to move TOGETHER instead of drifting back to a universal claim that the
-    escape disproves.
+    `projection/__init__.py` left 12/12 green (#9150 review, P2). Derived, then
+    compared: `_declaration_primitives()` reads the production source, so the
+    expected set below is the only hand-written part.
 
-    Derived, then compared: `_declaration_primitives()` reads the production
-    source, so the expected set below is the only hand-written part.
+    ⛔ WHAT THIS PIN DOES *NOT* COVER, and the earlier revision of this docstring
+    claimed it did (#9150 review cycle 2, P2): its population is ONE module
+    (`_projection_openers()` → `_openers_under(projection/__init__.py)`), so a new
+    opener defined ANYWHERE ELSE does not move `expected` and this stays green.
+    That is not hypothetical — both existing precedents live outside this file:
+    `#9195`'s `_structural_edge_write_scope` is `tortoise/projection/edges.py:817`
+    and `#9079`'s `_onboarding_write_scope` is `tortoise/onboarding/state.py:481`,
+    and `onboarding/state.py` is the likeliest home for the `#9157` fix. Those
+    are caught by `test_the_detector_population_is_pinned_by_content` (whose
+    population is derived over all of `tortoise/`) and by
+    `test_no_eager_init_site_declares_itself_yet` (a site that starts declaring
+    itself) — not here. This pin's job is the BULLET LIST a reader is told is
+    exhaustive, so it moves when the list gains an entry defined in the module
+    that list lives in.
     """
     expected = {
         "_live_write_scope",
