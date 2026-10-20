@@ -585,8 +585,9 @@ already sits and stays readable. A file with more than one HARD LINK (`ln
 AGENTS.md CLAUDE.md` dual-names agent files) is written through the SAME inode
 instead of renamed, so the alias never keeps stale instructions, and a failed or
 interrupted in-place write is rolled back to the original bytes; if the rollback
-itself cannot be verified the installer exits 3, says so and leaves an intact
-copy at the path it prints. A read-only (`0444`) `AGENTS.md` is upgraded
+itself cannot be verified the installer exits 3 (143 if a signal interrupted it),
+says so and leaves an intact copy at the path it prints — it sits in the
+installer's temporary directory, which is why the path is printed. A read-only (`0444`) `AGENTS.md` is upgraded
 normally and kept read-only — the installer stages a writable copy and restores
 the mode — and if the mode cannot be read it refuses rather than rewrite the
 file with looser permissions. Close the fence before re-running.

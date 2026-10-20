@@ -1559,6 +1559,9 @@ def test_a_signal_is_reported_as_a_failure_not_a_success(tmp_path):
     assert (target.stat().st_mode & 0o777) == 0o444, (
         "the mode must be restored: got "
         f"{oct(target.stat().st_mode & 0o777)}\nrc={proc.returncode}\n{out}\n{err}")
+    assert not list(project.glob(".tortoise-agents.*")), (
+        "a verified restore must not leave its staging file behind — an untracked "
+        "`.tortoise-agents.*` is one `git add -A` from being committed")
 
 
 def test_a_failed_restore_keeps_the_backup_and_does_not_claim_success(tmp_path):
@@ -1686,3 +1689,57 @@ def test_a_signal_whose_restore_fails_still_reports_and_keeps_the_backup(tmp_pat
     assert Path(match.group(1)).exists(), "the named copy must exist"
     assert "AGENTS.md" not in out or "upgraded" not in out, (
         "an interrupted write must not report the AGENTS.md block as upgraded:\n" + out)
+
+
+def test_the_append_path_refuses_when_a_concurrent_run_wrote_the_block(tmp_path):
+    """Review P2: renaming made the last writer win, but appending IN PLACE adds a
+    SECOND block pair — measured: two parallel runs on a hardlinked, block-less
+    file, both printing success, leaving `starts=2 ends=2` and a file the next run
+    refuses as MALFORMED. A block that appears between the pre-state read and the
+    append must therefore abort instead of duplicating.
+
+    The state is injected deterministically: the shim writes a block into the
+    target the moment the staged copy is read back, i.e. inside the window.
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    original = "# House\nUNIQUE-ONE\n"
+    target.write_text(original, encoding="utf-8")
+    alias = project / "CLAUDE.md"
+    alias.hardlink_to(target)
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake = shim / "cat"
+    # When the append arm cats the block, first plant a competing block in the
+    # target — the exact effect of a parallel run winning the race.
+    fake.write_text(
+        '#!/bin/sh\n'
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        '    */block)\n'
+        '      printf "\\n\\n%s\\nother run\\n%s\\n" "<!-- tortoise:start -->" "<!-- tortoise:end -->" >> "$AGENTS_RACE_TARGET"\n'
+        '      ;;\n'
+        '  esac\n'
+        'done\n'
+        'exec /bin/cat "$@"\n',
+        encoding="utf-8")
+    fake.chmod(0o755)
+
+    done = subprocess.run(
+        ["bash", str(installer), "--harness", "codex"], cwd=str(project),
+        env={**os.environ, "HOME": str(home), "PATH": f"{shim}:{os.environ['PATH']}",
+             "AGENTS_RACE_TARGET": str(target)},
+        capture_output=True, text=True, timeout=180)
+
+    text = target.read_text(encoding="utf-8")
+    assert done.returncode == 3, (
+        "a block appearing mid-write must abort, not duplicate:\n" + done.stdout + done.stderr)
+    assert "another install wrote a Tortoise block" in done.stderr, done.stderr
+    assert text.count(START) == 1 and text.count(END) == 1, (
+        f"exactly one block must remain, got {text.count(START)}/{text.count(END)}:\n{text[:300]}")
+    assert "UNIQUE-ONE" in text, "the user's content must survive"

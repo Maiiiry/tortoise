@@ -460,6 +460,11 @@ emit_codex_agents_block() {
     set +e
     undo_inplace
     if [ -n "$backup" ] && [ -f "$backup" ] && cmp -s "$backup" "$target"; then
+      # Verified restore: nothing of ours is needed any more, and a leftover
+      # `.tortoise-agents.*` is an untracked file one `git add -A` from being
+      # committed (measured: TERM left one in the project root).
+      [ -n "$staged" ] && rm -f "$staged"
+      [ -n "$tmpdir" ] && rm -rf "$tmpdir"
       echo "  ✗ AGENTS.md — interrupted while writing it in place" >&2
       echo "      the original was restored; nothing was upgraded." >&2
       echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 143)" >&2
@@ -875,6 +880,16 @@ EOF
         cmp -s "$target" "$backup" || { rm -f "$staged"; _emit_fail "the copy kept of $target does not match it, so nothing was changed (a full disk or a quota limit is the usual cause)"; }
         trap 'on_signal' INT TERM HUP
         chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to append in place (it has $links hard links, which a rename would split) — nothing was changed"; }
+        # A concurrent run may have written the block since the pre-state was read.
+        # Renaming used to make the last writer win; appending IN PLACE would add a
+        # SECOND pair and leave a file the next run refuses as MALFORMED (measured).
+        # Cheap optimistic check: fail closed instead of duplicating.
+        if grep -qF -- "$ms" "$target" 2>/dev/null || grep -qF -- "$me" "$target" 2>/dev/null; then
+          chmod "$orig_mode" "$target" 2>/dev/null || true
+          trap - INT TERM HUP
+          rm -f "$staged"
+          _emit_fail "another install wrote a Tortoise block while this one was running, so nothing was appended (re-run to upgrade it)"
+        fi
         # ONLY the new bytes: $staged is a COPY of $target plus the block, so
         # `cat "$staged" >> "$target"` would duplicate the user's whole file
         # (measured: 24 bytes -> 1208 with the body present twice, reported as
