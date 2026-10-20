@@ -2846,8 +2846,8 @@ def test_a_landed_promote_is_journaled_before_a_later_arm_can_abort(
 
     `update_point` carries the promote TWICE — a `:Point:Object` arm and a plain
     `:Point` arm — so both are covered here: a pin on one arm does not red the
-    other, and deleting either `_record_promote()` call left the suite green
-    before this parametrization.
+    other, and deleting the `:Point:Object` arm's `_record_promote()` call left
+    the suite green before this parametrization.
 
     `#8830` exempts the promote arm from the outbox ordering — its guarded `SET`
     can legitimately match nothing, so the record may not precede the write. It
