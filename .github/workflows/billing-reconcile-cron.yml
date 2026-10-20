@@ -1,0 +1,447 @@
+name: billing-reconcile-cron
+
+# The cadenced caller of the billing mirror reconciler (#8878).
+#
+# WHY THIS EXISTS. The stored `tier` on an org IS its entitlement
+# (`billing.effective_tier` never derives upward) and its ONLY writer is the
+# Stripe webhook. One missed/failed `customer.subscription.*` delivery
+# therefore capped a paying org at the lower tier PERMANENTLY: measured
+# 2026-10-17, the fleet's own org was billed on the Pro price and enforced at
+# Solo's 25 000-node cap, every hosted write refused with "upgrade your plan"
+# while reads kept working — i.e. silent, and unrecoverable without a human.
+#
+# WHY AN EXTERNAL DRIVER (and not an in-process timer or a boot thread). Same
+# reasoning the backup pipeline recorded in #596: a timer inside the app dies
+# with the process and is invisible when the app is crash-looping or the
+# deploy is wedged — exactly when a missed delivery is most likely. The boot
+# reconcile thread this would otherwise restore was removed at #4262 and
+# re-adding a boot-blocking Stripe call is a regression. This job has an
+# independent failure domain: it runs even when the app is down (the request
+# then fails loudly, which is the signal).
+#
+# WHAT COUNTS AS A FAILURE. The endpoint (POST /v1/internal/billing/reconcile)
+# answers 200 with a summary. This job fails the run AND PAGES TELEGRAM when:
+#   * the request itself fails (curl rc != 0: app down / internal key wrong /
+#     the 600 s client ceiling), or
+#   * the endpoint answers 503 — and the CAUSE is named. The endpoint emits TWO
+#     named 503 statuses (plus an UNRECOGNISED fallback arm):
+#       - `enumeration_incomplete`: the pass could not certify the WHOLE fleet,
+#         so it compared an unknown fraction of it and refuses to report that as
+#         clean. The THREE raise sites are a partial page, a LOWER-BOUND page
+#         (`the enumeration is a LOWER BOUND`), or a missing
+#         `query_all`/`query_with_total` seam (`exposes neither query_all nor
+#         query_with_total`). ⛔ They do NOT share one remedy: the LOWER-BOUND
+#         and missing-seam legs are STRUCTURAL (retrying does not help), while
+#         a PARTIAL page is usually CONCURRENT MUTATION — a row inserted or
+#         deleted mid-walk — and certifies on the next walk, so retry ONCE
+#         before treating it as structural. The body's `reason` names the leg.
+#         (A
+#         control-plane OUTAGE is a different path entirely: `query_all` raises a
+#         bare RuntimeError, which this endpoint does not catch, so it arrives as
+#         an unnamed 500 whose body is the app's generic
+#         `{"detail": "Internal server error"}` — no `status`, no `reason`.)
+#       - `reconcile_stuck`: a previous pass has held the reconcile lock past
+#         its staleness bound and is presumed WEDGED — the fleet is NOT being
+#         reconciled, and retrying will NOT help (the lock clears when that pass
+#         ends or the process restarts).
+#       - anything else: UNRECOGNISED — the driver refuses to name a runbook it
+#         cannot verify, and says so instead of guessing. Do not collapse these
+#         arms back into one: naming the wrong cause was a real defect here.
+#     (see `_BILLING_RECONCILE_STALE_S` in `tortoise/hosted_api.py`), or
+#   * the response cannot be read as a summary at all (not a JSON object, or
+#     missing any field the verdict below keys on — a shape change must fail
+#     closed, never read as a clean pass), or
+#   * `failed` is non-empty (a billed org could not be reconciled: a pass that
+#     verified nothing must not read as a clean pass), or
+#   * `unrepaired` is non-empty (Stripe resolved a tier the store did not end
+#     up holding — a read-only reconciler is a BROKEN reconciler, #8878), or
+#   * any `drift` entry has direction "up" (a paying customer WAS being
+#     under-delivered; it is repaired now, and the reconciler also pages it
+#     through the billing notify channel — this is the independent leg that
+#     still fires if that channel is unconfigured), or
+#   * a run triggered by `workflow_dispatch` got 202 `already_running` and
+#     therefore did no work at all.
+#
+# 202 TO A SCHEDULED RUN IS NOT A FAILURE. The endpoint answers it for a
+# concurrent pass and its docstring calls that benign (nothing queues; the next
+# scheduled run retries). An operator running the runbook's §4.2 curl inside
+# the daily window would otherwise make the daily job page a false billing
+# incident — the sibling #596 driver reads the BODY's `.status` for the same
+# reason. The two triggers want opposite answers, so this branches on the
+# trigger: `schedule` → notice + success (the manual pass is covering the
+# fleet); `workflow_dispatch` → error, because a dispatched run that did NO
+# work must not look like a completed pass.
+#
+# The Telegram leg is what makes "PAGES" true rather than aspirational: a red
+# run alone only reaches whoever opens the Actions tab (a scheduled run also
+# emails whoever last touched the default branch, which is not an owner). The
+# runbook (§4.2) advertised the page before anything delivered one. That leg
+# needs the repo ON the runner: `Page on failure` sources
+# `.github/scripts/telegram-send.sh`, and a GitHub-hosted runner's
+# `$GITHUB_WORKSPACE` starts empty, so `jobs.drive` runs `actions/checkout`
+# FIRST. Without it the `.` failed and, under `set -euo pipefail`, the step
+# exited before `tg_send` — a page step that could never deliver, which is the
+# same defect one layer down.
+#
+# RESIDUAL, stated rather than implied (the sibling backup driver's #596 header
+# covers BOTH legs; this one covers only the app-down leg): if GitHub silently
+# stops running this schedule — it disables schedules after ~60 days of repo
+# inactivity, `docs/infra-runbook.md` records "a missing run looks like
+# silence" — no request is made, so nothing fails and nothing pages. Nothing
+# here watches for a MISSING pass. Closing that needs a run stamp plus an
+# out-of-band staleness check (the driver-disabled leg #596 built); it is not
+# claimed as covered here.
+#
+# Drift DOWN (a portal downgrade or cancellation the mirror had not seen) is
+# reported in the summary and is NOT a failure: it is Stripe truth arriving
+# late, not a customer being short-changed. A `direction` of `null` (the pair
+# could not be ranked) is likewise not a failure.
+
+on:
+  schedule:
+    - cron: '43 4 * * *'   # daily, off the top of the hour (GH jitter)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: billing-reconcile
+  cancel-in-progress: false   # scheduled runs never overlap
+
+jobs:
+  drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      INTERNAL_API_URL: ${{ secrets.INTERNAL_API_URL }}
+      FASTAPI_INTERNAL_KEY: ${{ secrets.FASTAPI_INTERNAL_KEY }}
+      # Which trigger this run is. Read by the 202 branch below: a scheduled run
+      # overlapping an operator's pass is BENIGN (the operator's pass is
+      # covering the fleet), while a manually dispatched run that did no work is
+      # the thing the dispatcher needs to be told. Bound in `env:` rather than
+      # interpolated into the shell text, so the step's script is the same in CI
+      # and in the tests that RUN it (tests/test_deploy_workflow.py).
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      # The `Page on failure` step SOURCES a repo script
+      # (`.github/scripts/telegram-send.sh`), and a GitHub-hosted runner's
+      # `$GITHUB_WORKSPACE` starts EMPTY — `actions/checkout` is the only thing
+      # that populates it. Without this, the `. <script>` line fails with "No
+      # such file or directory" and, under `set -euo pipefail`, the step exits
+      # non-zero BEFORE `tg_send` is ever called: every failure path fired no
+      # page at all, one layer under the very defect `33eb1364d` set out to
+      # close. `permissions: contents: read` above is sufficient for checkout,
+      # and the sibling #596 driver (`registry-backup-cron.yml`) checks out for
+      # exactly this reason.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run billing reconcile pass
+        # Secrets are bound in `env:` above and read QUOTED — never interpolated
+        # into the shell text (#4361: substitution happens before bash parses,
+        # so a secret is code there, not data).
+        run: |
+          set -euo pipefail
+          if [ -z "${INTERNAL_API_URL:-}" ] || [ -z "${FASTAPI_INTERNAL_KEY:-}" ]; then
+            echo "::error::INTERNAL_API_URL / FASTAPI_INTERNAL_KEY are unset — the billing reconciler cannot run."
+            exit 1
+          fi
+          out="$(mktemp)"
+          # This repository's Actions logs are PUBLIC, and the reconcile body
+          # carries per-org CUSTOMER identifiers (org id + billing state).
+          # Nothing is printed raw: the shell redacts org ids and Stripe object
+          # ids, and the summary below prints a stable fingerprint instead
+          # (#8895 review P2). An operator who needs the real ids re-reads the
+          # payload through the internal endpoint with FASTAPI_INTERNAL_KEY.
+          #
+          # The id shape matters: this fleet mints org ids as 26-hex
+          # (``uuid.uuid4().hex[:26]`` in hosted_api/supabase_control; ULID for
+          # tenant ids), NOT as hyphenated UUIDs, so a UUID-only pattern redacts
+          # nothing an actual customer id looks like. Both shapes are covered
+          # here; the python redactor below redacts the row's own id BY VALUE.
+          redact_once() {
+            sed -E \
+              -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<org-id>/g' \
+              -e 's/(^|[^0-9A-Za-z])[0-9a-f]{10,13}-[0-9a-f]{12}([^0-9A-Za-z]|$)/\1<org-id>\2/g' \
+              -e 's/(^|[^0-9A-Za-z])[0-9a-f]{26}([^0-9A-Za-z]|$)/\1<org-id>\2/g' \
+              -e 's/(^|[^0-9A-Za-z])(cus|sub)_[A-Za-z0-9]{6,}([^0-9A-Za-z_]|$)/\1<stripe-id>\3/g'
+          }
+          redact_stream() {
+            # APPLIED TWICE on purpose. The boundary classes consume their own
+            # delimiter, so on a line carrying two ids (`a, b`) the first match
+            # eats the gap and the second id is never seen. Re-running the same
+            # rules over the OUTPUT catches it, because the delimiter has been
+            # re-emitted. Cheaper and more portable than lookarounds (BSD sed
+            # has none).
+            redact_once | redact_once
+          }
+          show_body() {
+            # The REAL id shapes this fleet mints: hosted orgs are
+            # ``uuid4().hex[:26]`` (26 hex, no dashes) and registry orgs are
+            # ``ulid()`` = <hex-ts>-<12hex>. A bare UUID pattern matches NEITHER.
+            # Indent every line: a body may contain a newline followed by a
+            # workflow command (`::error::`, `::warning::`), and printing it raw
+            # would let the PAYLOAD forge an annotation in this arm. Leading
+            # whitespace makes such a line inert without hiding the text.
+            redact_stream < "$1" | sed 's/^/    /' | head -c 2000 || true
+          }
+          # `-m 600` is required, not decoration. `/v1/internal/` is
+          # PREFIX-EXEMPT from the 10 s transport wait bound and has no
+          # server-side ceiling (tests/test_transport_wait_bound.py: its CRON
+          # callers publish their own patience — `registry-cron.sh` posts the
+          # sweep with `curl -m 600`), so without a client bound a wedged
+          # endpoint is killed by `timeout-minutes` and the log says nothing.
+          # With it the driver reads the legible `curl rc=28` below.
+          rc=0
+          status="$(curl -sS -m 600 -o "$out" -w '%{http_code}' \
+            -X POST "${INTERNAL_API_URL%/}/v1/internal/billing/reconcile" \
+            -H "Authorization: Bearer ${FASTAPI_INTERNAL_KEY}")" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::billing reconcile request failed (curl rc=${rc}; rc=28 is the 600 s ceiling expiring)"
+            show_body "$out"
+            exit 1
+          fi
+          echo "HTTP ${status}"
+          echo
+          if [ "$status" = "202" ]; then
+            # The endpoint answers 202 `already_running` for a CONCURRENT pass,
+            # and its own docstring calls that benign — nothing queues, the next
+            # scheduled run retries. Keying on "any non-200 is an error" turned
+            # a benign overlap into a false billing incident: an operator
+            # running the runbook §4.2 curl inside the daily window made the
+            # daily job PAGE. The sibling #596 driver reads the BODY's `.status`
+            # for exactly this reason; this reads the trigger, because the two
+            # triggers want opposite answers.
+            if [ "${EVENT_NAME:-}" = "schedule" ]; then
+              echo "::notice::a reconcile pass is already running — this scheduled run is a no-op and the next one retries (nothing is queued)"
+              exit 0
+            fi
+            # A dispatched run that did NO work is the dispatcher's business:
+            # nothing was queued, so silently greening would look like a pass.
+            echo "::error::a reconcile pass is already running, so this ${EVENT_NAME:-manual} run did NO work — nothing is queued; re-dispatch once the in-flight pass finishes"
+            exit 1
+          fi
+          if [ "$status" = "503" ]; then
+            # The endpoint emits TWO named 503 statuses, plus an UNRECOGNISED
+            # fallback arm. They need opposite responses, so they must never be
+            # collapsed into one message.
+            cause="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' "$out" 2>/dev/null || true)"
+            # $cause is REMOTE data, and this step's rule is that no fragment of
+            # remote data reaches the (public) log unredacted. It is also
+            # single-line from here on: a value carrying a newline would be
+            # parsed by the runner as a SECOND workflow command, so `::error::`
+            # could be forged from a response body.
+            cause="$(printf '%s' "$cause" | redact_stream | tr -d '\n\r')"
+            case "$cause" in
+              reconcile_stuck)
+                echo "::error::billing reconcile is STUCK (HTTP 503 reconcile_stuck) — a previous pass has held the lock past the staleness bound and is presumed wedged. The fleet is NOT being reconciled, and the lock clears only when that pass ends or the process restarts; retrying will NOT help."
+                ;;
+              enumeration_incomplete)
+                echo "::error::billing reconcile could not certify the fleet enumeration (HTTP 503 enumeration_incomplete) — the pass compared an unknown fraction of the fleet; nothing to repair. The body's reason names the leg: a LOWER-BOUND page or a MISSING enumeration seam is STRUCTURAL (retrying will not help), while a PARTIAL page is usually a row changed mid-walk and certifies on the next run — retry that leg ONCE, then treat it as structural."
+                ;;
+              *)
+                # Do NOT guess. Claiming a cause we did not read is the same
+                # fault one remove out: the operator runs the wrong runbook.
+                echo "::error::billing reconcile returned HTTP 503 with an UNRECOGNISED cause${cause:+ (status=${cause})} — read the body below before acting; the driver will not name a runbook it cannot verify"
+                ;;
+            esac
+            show_body "$out"
+            exit 1
+          fi
+          if [ "$status" != "200" ]; then
+            echo "::error::billing reconcile returned HTTP ${status}"
+            # Diagnostics are not sacrificed with the redaction: the body is
+            # printed through the same shape-redactor used for the summary.
+            show_body "$out"
+            exit 1
+          fi
+          python3 - "$out" <<'PY'
+          import hashlib, json, re, sys
+
+          # Shape patterns are a SAFETY NET only: the id a row is about is
+          # redacted BY VALUE below, because no shape list can enumerate every
+          # id shape the fleet mints. Two shapes are known to reach this body:
+          # hyphenated UUIDs, and the 26-hex ids ``_new_org_org_id`` actually
+          # mints (``uuid.uuid4().hex[:26]``).
+          _UUID = re.compile(
+              r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+              re.IGNORECASE)
+          _HEX26 = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{26}(?![0-9A-Za-z])")
+          # Registry orgs are ``ids.ulid()`` = <hex-ts>-<12hex>: an ~11-hex
+          # MILLISECOND stamp, a hyphen, then 12 hex. The UUID pattern matches
+          # none of them and the 26-hex pattern matches none of them either, so
+          # without this rule a registry org named in prose is published
+          # verbatim. The stamp widens with time, hence a range not a width.
+          _ULID = re.compile(
+              r"(?<![0-9A-Za-z])[0-9a-f]{10,13}-[0-9a-f]{12}(?![0-9A-Za-z])")
+          # Stripe object ids (customers/<cus_…>, subscriptions/<sub_…>) reach
+          # ``failed[].error`` through ``StripeAPIError('stripe GET <path> …')``.
+          _STRIPE_ID = re.compile(
+              r"(?<![A-Za-z0-9])(?:cus|sub)_[A-Za-z0-9]{6,}(?![A-Za-z0-9_])")
+
+          def redact_row(row):
+              """Replace customer org ids with a STABLE fingerprint.
+
+              The Actions log of this public repository must not publish which
+              customer is on which paid tier (#8895 review P2). A fingerprint
+              still lets an operator correlate one org across runs, which is
+              all the log needs.
+
+              The row's OWN id is redacted by VALUE, in every string field —
+              ``failed[].error`` is the scrubbed provider message and embeds it
+              in prose (``no organizations row matched id='<org_id>'``), so a
+              key-based filter, or a shape list that does not name the shape
+              this fleet mints, publishes it anyway. The shape patterns above
+              remain as a net for ids that are not this row's (a Stripe customer
+              id, an org named in a provider message).
+
+              The fingerprint is computed from the ORIGINAL id, before any
+              substitution: hashing a shape-substituted value collapsed every
+              UUID-shaped org onto one constant and defeated the correlation
+              the fingerprint exists for.
+              """
+              if not isinstance(row, dict):
+                  return row
+              raw_id = row.get("org_id")
+              fingerprint = ""
+              if raw_id:
+                  fingerprint = "org-" + hashlib.sha256(
+                      str(raw_id).encode()).hexdigest()[:10]
+              out = {}
+              for key, value in row.items():
+                  if key == "org_id" and value:
+                      out[key] = fingerprint
+                      continue
+                  if isinstance(value, str):
+                      if raw_id:
+                          value = value.replace(str(raw_id), fingerprint)
+                      value = _UUID.sub("<org-id>", value)
+                      value = _ULID.sub("<org-id>", value)
+                      value = _HEX26.sub("<org-id>", value)
+                      value = _STRIPE_ID.sub("<stripe-id>", value)
+                  out[key] = value
+              return out
+
+          try:
+              data = json.load(open(sys.argv[1]))
+          except (OSError, ValueError) as exc:
+              print(f"::error::reconcile response is not JSON ({exc.__class__.__name__}) "
+                    "— the pass cannot be verified")
+              sys.exit(1)
+          if not isinstance(data, dict):
+              print("::error::reconcile response is not a JSON object — the pass "
+                    "cannot be verified")
+              sys.exit(1)
+          # Required BEFORE the verdict is computed. Every read below has a
+          # default, so a response that simply OMITS a field would read as a
+          # clean pass — the same "verified nothing, looked clean" failure this
+          # job exists to catch. A renamed/reshaped summary must page, not pass.
+          required = {"checked", "repaired", "unchanged", "unverified",
+                      "skipped", "drift", "unrepaired", "failed"}
+          missing = sorted(required - set(data))
+          if missing:
+              print(f"::error::reconcile summary is missing {missing} — the "
+                    "response contract changed, so a clean pass cannot be told "
+                    "from an unverified one; failing closed")
+              sys.exit(1)
+          # The counters are coerced to INTEGERS before use. Two defects die here:
+          # a value carrying a newline could forge a workflow command from this
+          # printer (the same forgery `show_body` indents away), and a STRING count
+          # would pass the truthiness tests below while `checked == 0` silently
+          # stopped matching. STRICT, not "the digits inside whatever this is":
+          # filtering digits turns 2.0 into 20 and -3 into 3, a silent 10x on a green
+          # pass, so anything that is not plain digits fails closed.
+          def _count(value, name):
+              text = str(value).strip()
+              # A bounded length too: isdecimal() still admits a 5 000-digit
+              # string, and int() refuses past 4300 (int_max_str_digits), which
+              # would exit 1 as a traceback instead of this annotation.
+              if not text.isdecimal() or len(text) > 18:
+                  print(f"::error::reconcile summary field {name} is not an integer "
+                        "- the response contract changed; failing closed")
+                  sys.exit(1)
+              return int(text)
+          data = dict(data)
+          for _k in ("checked", "repaired", "unchanged", "unverified", "skipped"):
+              data[_k] = _count(data.get(_k), _k)
+          drift_up = [d for d in data["drift"] if d.get("direction") == "up"]
+          failed = data["failed"]
+          unrepaired = data["unrepaired"]
+          summary = (
+              f"checked={data['checked']} repaired={data['repaired']} "
+              f"up={len(drift_up)} unchanged={data['unchanged']} "
+              f"unverified={data['unverified']} skipped={data['skipped']} "
+              f"failed={len(failed)} unrepaired={len(unrepaired)}"
+          )
+          print(summary)
+          if data["unverified"]:
+                # Not a failure: no active subscription could be established.
+                # THREE causes land here - Stripe named none, the customer lookup
+                # failed, or the pricing ladder could not be read - so this line must
+                # not assert which, and must not claim the orgs are billed (the third
+                # cause means we do not KNOW).
+                print(f"::warning::{data['unverified']} org(s) could not be verified "
+                      "against an active Stripe subscription (Stripe named none, the "
+                      "customer lookup failed, or pricing.json could not be read) - not "
+                      "downgraded, review them; a broken pricing.json shows up "
+                      "here and/or as failed rows naming the ladder")
+          if data["checked"] == 0:
+              # Loud, never fatal. The enumeration is CERTIFIED complete before
+              # this point (an uncertifiable one raises and 500s), so 0 means a
+              # fleet with no billed org — a real state on a fresh deployment.
+              print("::warning::the pass checked 0 orgs — a certified-empty fleet "
+                    "is valid, but on a fleet with paying customers it is not")
+          problems = []
+          failed = [redact_row(r) for r in failed]
+          unrepaired = [redact_row(r) for r in unrepaired]
+          drift_up = [redact_row(r) for r in drift_up]
+          if failed:
+              problems.append(f"{len(failed)} org(s) FAILED to reconcile: {failed}")
+          if unrepaired:
+              problems.append(
+                  f"{len(unrepaired)} org(s) were NOT repaired (Stripe truth "
+                  f"did not reach the store): {unrepaired}")
+          if drift_up:
+              problems.append(
+                  f"{len(drift_up)} paying org(s) were being UNDER-DELIVERED "
+                  f"(repaired on this pass): {drift_up}")
+          if problems:
+              for p in problems:
+                  print(f"::error::{p}")
+              sys.exit(1)
+          PY
+
+      - name: Page on failure
+        # `failure()` covers timeouts and any failing step above, which is the
+        # whole point: the leg that matters most (app down) is exactly the one
+        # where the in-app notify channel is unreachable, so the page must come
+        # from HERE. Deliberately Telegram and NOT an auto-filed issue: an issue
+        # ledger needs a resolve leg to retire it, and a stale open incident is
+        # the defect #8841 records. Best-effort by design — an undeliverable
+        # page must not turn a red run green (it stays red).
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ] || [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are unset — the failed reconcile pass was NOT paged. The red run is the only signal; configure the secrets or fix the runbook's claim."
+            exit 0
+          fi
+          . .github/scripts/telegram-send.sh
+          tg_send "$TELEGRAM_CHAT_ID" \
+            "billing reconcile FAILED — a paying org may be capped at the wrong tier. ${run_url}" \
+            || echo "::warning::the Telegram page was not delivered (see the log above) — the red run remains the signal"
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Billing mirror reconcile (#8878)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "See the step log for the pass summary and any drift rows." >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
