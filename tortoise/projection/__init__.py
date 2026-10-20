@@ -3760,10 +3760,13 @@ def _prewipe_restore_write_scope(reason: str):
     removes for `:TeamMeta`, deliberately left to `#9213` rather than fixed
     inside one engine's `try` body. ⚠️ Do not call that claim "truthful": it is
     DEFERRED and disclosed, and a blanket restore reason is not the honest fix
-    there either, because `reestablish_watermark` stores
-    `max(carried, max(:GraphEvent.seq))` — the value can come from the replayed
-    log when it is higher, so the two sources must be split before one lane can
-    describe the write (pinned at the helper seam by
+    there either, because `reestablish_watermark` folds THREE inputs — the
+    CARRIED value `capture_watermark` took before the wipe, a LIVE
+    `:GraphEventMeta.last_seq` a concurrent emitter may have raised, and any
+    replayed `:GraphEvent.seq`, which after a rebuild is normally absent
+    (`#4664`; the helper's own docstring expects `last_seq + 1`) — so the
+    source that competes with the capture is the LIVE counter, and the two
+    must be split before one lane can describe the write (pinned at the helper seam by
     `tests/test_rebuild_event_meta_watermark_4653.py::test_reestablish_watermark_never_moves_below_the_replayed_log`,
     and the deferred lane itself is measured by
     `tests/test_9210_rebuild_declares_restore.py::test_the_journal_engines_watermark_stays_disclosed_as_deferred`).
@@ -10820,11 +10823,13 @@ class FalkorProjection(
         """Issue ONE pre-wipe snapshot-restore write under its own declaration.
 
         The declaration travels WITH the write (a required `reason`, never a
-        method-wide scope) so a restore leg cannot be added to `rebuild_all`
-        without stating what it is: a caller that reaches for `self.g.query`
-        here is not declaring anything, and the `#9210` test reads the reason
-        back at the handle. See `_prewipe_restore_write_scope` for the
-        contract (state captured from THIS graph, not a journal replay).
+        method-wide scope), so every restore that USES this funnel states what
+        it is: a caller that reaches for `self.g.query` here is not declaring
+        anything, and the `#9210` test reads the reason back at the handle.
+        ⚠️ That guarantee reaches the callers OF THIS FUNNEL only; the two
+        exceptions are named below, so neither is read as covered. See
+        `_prewipe_restore_write_scope` for the lane's contract (state
+        captured from THIS graph, not a journal replay).
 
         ⚠️ **The funnel is VOLUNTARY, and its exceptions are named so neither
         is read as covered.** Two of them, and the second one is not bounded:

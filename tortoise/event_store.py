@@ -563,9 +563,13 @@ def reestablish_watermark(proj, carried_last_seq: int | None, *,
     that defect, disclosed here and left to `#9213`, NOT because the value
     comes from the replayed log (it does not: the carry is a pre-wipe read of
     the live counter). ⚠️ A blanket restore reason is not the honest fix for
-    that caller either: `last_seq` is `max(carried, max(:GraphEvent.seq))`, so
-    the stored value can be the REPLAYED seq when it is higher — the two
-    sources have to be split before one lane can describe the write. The lane
+    that caller either: `last_seq` is the `max` of the CARRIED value, a LIVE
+    `:GraphEventMeta.last_seq` a concurrent emitter may have raised, and any
+    replayed `:GraphEvent.seq` — and after a rebuild that last term is
+    normally absent, because those rows are not replayed (`#4664`), so the
+    source that actually competes with the carry is the LIVE counter, not the
+    replay. The captured input and the live one have to be split before one
+    lane can describe the write. The lane
     is opened at the write below, never at the call site: the
     scope is a `ContextVar`, so an inner declaration shadows an outer one, and a
     `with` around the call would be silently discarded — the exact way the
