@@ -29204,7 +29204,11 @@ def _registry_probe_key() -> tuple[str | None, str | None, str | None]:
     `run_on_daemon_worker` states plainly that `wait_for` cancels the awaitable,
     not the thread (CPython #87185) — so a probe built by that worker can land
     AFTER the reset and be inherited by the NEXT test, which is a cross-test
-    hand-me-down the reset cannot prevent. Measured at this head, on the lane's
+    hand-me-down the reset cannot prevent. It is worse than a pure ordering
+    question: `_reset_registry_probe_sdk` early-returns on an empty slot BEFORE
+    taking `_KEEPALIVE_LOCK`, while `_registry_probe_sdk` builds UNDER that lock
+    and stamps on completion, so a build already IN FLIGHT when the reset runs
+    also survives it. Measured at this head, on the lane's
     private container, at FILE scope: `tests/test_onboarding_endpoints.py` is
     44 passed with this key and 1 failed / 43 passed with the key collapsed to
     `(TORTOISE_DB_URI,)` — failing at `assert any(t["org_id"] == sub_org_id for
@@ -29219,9 +29223,12 @@ def _registry_probe_key() -> tuple[str | None, str | None, str | None]:
     lifetime — a reconfiguration, a fixture that repins the store under a live
     handle, or a worker build that outlives the teardown reset — and it is a
     strict refinement: a changed key can only force a rebuild, it can never
-    reuse. Residual on #9334 rather than claimed closed here: for the
-    non-pinning `_patch_tortoise_sdk_init` call sites below, the env cannot
-    distinguish such a handle from a legitimate one.
+    reuse. Residual recorded on #8867 (OPEN — "the probe-cache lifecycle
+    protocol: close-under-use, lock invariant, single-probe fallback, lifespan
+    reset" is literally this defect, and the measured race + stack are recorded
+    there): for the non-pinning `_patch_tortoise_sdk_init` call sites below, the
+    env cannot distinguish such a handle from a legitimate one, and the reset's
+    own lock invariant is what would have to close it.
 
     So the key is a SET of ambient inputs, and each component is there for a
     DIFFERENT reason — stated precisely, because two of the three are not what
