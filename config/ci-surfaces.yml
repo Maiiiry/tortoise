@@ -3331,6 +3331,14 @@ surfaces:
   # post-restore marker verification, both in tortoise/projection/ (core
   # fallback), over the `#2789` guard's probe in tortoise/hosted_api.py.
   - test_rebuild_team_meta_marker_5353.py
+  # #9210: the SAME wipe+replay, read from the other side — every non-record
+  # snapshot-restore leg (`:Batch`, `:Session`, onboarding, `:TeamMeta`, the
+  # config registry, the `#4305` derived Point properties, the
+  # `:GraphEventMeta` watermark) must observe its own named §17.1 declaration
+  # AT THE WRITE HANDLE, and must not inherit the replay lane even when the
+  # engine is wrapped in one. `tortoise/projection/` is the file it pins, so a
+  # projection change must run it.
+  - test_9210_rebuild_declares_restore.py
   - test_projection_embedded_socket_timeout.py  # #3350: embedded lane socket timeout + bounded retry (carve-out)
   - test_projection_lifecycle.py
   - test_projection_maxmemory_message.py  # #2981: a full-but-healthy DB is not corrupt — maxmemory write-refusal gets its own error, never the rebuild advice
@@ -7017,6 +7025,25 @@ durations:
   test_graph_delete_hygiene_report.py: 1.8
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
+  # #9210: added by a PR, so no CI reading exists yet (#3400 trap). 7 test
+  # functions, 7 collected cases (both counts are 7 today — the file carries no
+  # parametrization since the eleven table-only cases were deleted; the sixth is
+  # the shape rule's ONE exemption, `_NOT_A_RESTORE_STATEMENTS`, added in round 3
+  # so the rule cannot red on the `config_reset` marker write, and the seventh
+  # pins the sibling `rebuild()` engine's watermark on the engine's `"replay"`
+  # as a DISCLOSED deferral to #9213 — so it reds when that lane changes, not
+  # after someone re-reads the sentence it replaced).
+  # MEASURED locally in the embedded lane: 27.3 s on a quiet box and 35.1 s
+  # under fleet load, of which ~15 s is the FIRST `create_point`'s one-time
+  # embedding-model load — the same artefact #9123 recorded for its own file.
+  # The whole file measured 7.3 s / 6.2 s warm over two runs on 2026-10-20 with
+  # the seventh case in it (the model already loaded in-process), so the
+  # declared 45.0 stays ABOVE the highest LOADED reading and a busy leg cannot
+  # under-pack it. The
+  # weight is unchanged by the deletion of the eleven table-only parametrized
+  # cases (they never executed product code, so they were never part of this
+  # measurement).
+  test_9210_rebuild_declares_restore.py: 45.0
   # #4492: added by a PR, so no CI reading exists yet (`--refresh-durations`
   # samples push-to-main runs only). Hermetic — no DB, no network, no PGlite
   # (the SQL is asserted separately by the PGlite suite, which does not run in
