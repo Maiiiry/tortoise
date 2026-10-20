@@ -514,7 +514,7 @@
       ],
       "killed": false,
       "run_id": "39191149586",
-      "sample_time": "2026-10-19T23:49:51Z",
+      "sample_time": "2026-10-20T00:22:55Z",
       "sha": "8464f850f938ff048666a24ade2081e4518987b6",
       "steps_max_job_ms": 1300000,
       "steps_total_ms": 9951000
@@ -806,7 +806,7 @@
     "created_at": "2026-10-19T02:41:31Z",
     "head_sha": "8464f850f938ff048666a24ade2081e4518987b6",
     "run_id": "39191149586",
-    "sample_time": "2026-10-19T23:49:51Z",
+    "sample_time": "2026-10-20T00:22:55Z",
     "selection": "latest completed event=push&branch=main run, exclude_pull_requests=true, cancelled skipped"
   },
   "schema_version": 1,
