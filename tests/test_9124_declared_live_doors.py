@@ -284,9 +284,15 @@ _UNRESOLVED = {
     # each function's only handle reach is ONE read:
     #   `calibrate_summary` — `MATCH … OPTIONAL MATCH … RETURN` (a read)
     #   `_uncalibrated_ep_participants` — `MATCH … RETURN n.id` (a read)
-    # with no SET/CREATE/MERGE/DELETE/REMOVE in the assembled query and no write
-    # through another SDK method (`calibrate_summary` names `set_point_baseline`
-    # only inside advice strings — it never calls it).
+    # with no SET/CREATE/MERGE/DELETE/REMOVE in the assembled query and no CALL
+    # to any `sdk.py` function the census proves reaches the write handle
+    # (`calibrate_summary` names `set_point_baseline` only inside advice strings
+    # — it never calls it, and neither function calls any other writer).
+    # That second claim is pinned against the CENSUS's own list of writing
+    # functions, not against a hand-written list of method names: a check that
+    # knew only `set_point_baseline` stayed green while the sentence it was cited
+    # for went false (`self.invalidate_point(…)` is not a `set_point_baseline`
+    # call and not a `<handle>.<verb>` call either).
     # ⛔ CITED BY SYMBOL, NEVER BY `sdk.py:<line>`. The numbers this note first
     # carried were 268 lines off within hours of being measured (they landed in
     # `_apply_source_inheritance`, whose `MATCH … REMOVE` is the opposite of the
@@ -326,10 +332,13 @@ _UNRESOLVED = {
     # They are declared ONCE, above (the #9063 entry). Both PRs that landed on
     # 2026-10-20 declared them at different offsets, so the merge kept both
     # copies: a duplicate element in a SET is silently collapsed by Python — the
-    # intent still holds — but `ruff` B033 flags it, and the lint shard goes red
-    # on `main` for every PR that inherits it. Adding a row for a name that is
-    # already in the set is the same defect as #9259's duplicate DICT key, one
-    # container over: the declaration reads as two decisions where there is one.
+    # intent still holds — but `ruff` B033 flags it, and the lint shard reds for
+    # every PR that inherits it. The duplicates have since been removed twice
+    # over (#9249 on `main`, and the same deletion here), so what this note
+    # guards is the RULE rather than that repair: adding a row for a name that
+    # is already in the set is the same defect as #9259's duplicate DICT key,
+    # one container over — the declaration reads as two decisions where there
+    # is one.
 }
 
 _INVENTORY = {
@@ -494,6 +503,9 @@ def _bind_handle_aliases(node, aliases, params=()) -> None:
         return
     if isinstance(value, (ast.Tuple, ast.List)) and len(targets) == 1 \
             and targets[0] is not None:
+        # `strict=False` states the existing behaviour: an unpacking target
+        # SHORTER than the value tuple silently truncates, which is all this
+        # alias walk needs (it is a census, not a validator).
         pairs = zip(value.elts, _flatten_target(targets[0]), strict=False)
         for part, target in pairs:
             if _carries_handle(part, aliases, params):
@@ -1131,11 +1143,16 @@ def _local_bindings(func) -> dict[str, list[ast.expr]]:
 
 
 def _params_of(func) -> set[str]:
-    """Every parameter name of `func` — values the assembly cannot read."""
+    """Every parameter name of `func` — values the assembly cannot read.
+
+    `self`/`cls` are excluded, exactly as `enumerate_handle_surface` does it:
+    they are not values that can carry statement text, and counting them would
+    make every `self.<verb>(…)` call read as a reach on a handle PARAMETER.
+    """
     args = func.args
     names = {arg.arg for arg in list(args.args) + list(args.kwonlyargs)}
     names |= {arg.arg for arg in (args.vararg, args.kwarg) if arg is not None}
-    return names
+    return {name for name in names if name not in ("self", "cls")}
 
 
 def _statement_argument(call: ast.Call) -> ast.expr | None:
@@ -1159,19 +1176,29 @@ def _module_bindings(module) -> dict[str, list[ast.expr]]:
     hidden in a module constant passed the pin (measured). Cached, because the
     resolver asks per NAME.
     """
-    cached = _MODULE_BINDINGS_CACHE.get(id(module))
-    if cached is None:
-        cached = _local_bindings(
+    entry = _MODULE_BINDINGS_CACHE.get(id(module))
+    if entry is None or entry[0] is not module:
+        entry = (module, _local_bindings(
             node for node in module.body
             if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign,
-                                 ast.NamedExpr, ast.For)))
-        _MODULE_BINDINGS_CACHE[id(module)] = cached
-    return cached
+                                 ast.NamedExpr, ast.For))))
+        _MODULE_BINDINGS_CACHE[id(module)] = entry
+    return entry[1]
 
 
-#: `id(module AST) -> its module-level bindings`. The AST outlives the lookup
-#: (the caller holds it), so the id cannot be recycled underneath it.
-_MODULE_BINDINGS_CACHE: dict[int, dict[str, list[ast.expr]]] = {}
+#: `id(module AST) -> (the AST itself, its module-level bindings)`.
+#: ⛔ THE AST IS RETAINED IN THE ENTRY — that is what makes an identity key
+#: safe here. The sdk module is held by the caller, but the IMPORTED-CALLEE hop
+#: is not: `_resolve_callee` does `ast.parse(candidate.read_text())`, `_fragments_of`
+#: uses it for the duration of the recursion, and then it is unreachable while
+#: its `id` stays a live key — a later `ast.parse` can be allocated at the same
+#: address and this cache would hand back ANOTHER module's constants. Wrong
+#: fragments can resolve a write AWAY (the fail-open direction this pin exists
+#: to prevent). It does not bite today (only `tortoise/live.py` is reached that
+#: way and every re-parse yields identical bindings), so this is a trap defused
+#: rather than a live failure — but the retention, not the comment, is what
+#: holds it. `test_the_module_bindings_cache_retains_its_module` pins that.
+_MODULE_BINDINGS_CACHE: dict[int, tuple[object, dict[str, list[ast.expr]]]] = {}
 
 
 def _function_returns(func) -> list[ast.expr]:
@@ -1292,26 +1319,48 @@ def _assembled_statement_fragments(func, call: ast.Call,
     return fragments, unread
 
 
+def _handle_aliases(func) -> set[str]:
+    """Every local name in `func` bound to the write handle.
+
+    ALIAS-AWARE, like `enumerate_handle_surface`: the census resolves
+    `h = proj.g; h.query(...)`, so a receiver-name-only check would let a SECOND
+    reach hide behind the "found 1 call" assertion in
+    `test_the_calibration_readers_assemble_no_write_clause` — the assertion that
+    is the whole point of the pin would be the thing that misses it.
+
+    ONE cumulative pass over the function, so an alias counts for calls on
+    EITHER side of its binding. That is the over-report direction, deliberately:
+    a call is counted as a handle reach even when it precedes the binding, which
+    can only make the "found 1 call" assertion stricter, never looser. (An
+    earlier version of this docstring claimed positional scoping and sorted the
+    walk by `lineno` to implement it; the sort was inert, because the alias set
+    was complete before any call was tested. Stated as it behaves.)
+    """
+    aliases: set[str] = set()
+    params = _params_of(func)
+    for node in ast.walk(func):
+        _bind_handle_aliases(node, aliases, params)
+    return aliases
+
+
 def _handle_query_calls(func) -> list[ast.Call]:
     """Every `<handle>.<verb>(...)`-shaped call in `func` — its handle reach.
 
-    ALIAS-AWARE, like `enumerate_handle_surface`: the census resolves
-    `h = proj.g; h.query(...)`, so a receiver-name-only check here would let a
-    SECOND reach hide behind the "found 1 call" assertion in
-    `test_the_calibration_readers_assemble_no_write_clause` — the assertion
-    that is the whole point of the pin would be the thing that misses it.
-    Bindings are collected in SOURCE ORDER (the census visits in order too), so
-    an alias counts only for the calls below its binding.
+    Alias-aware AND handle-parameter aware. `_is_handle_ref` counts a function
+    PARAMETER as the handle — the census's documented over-report, because a
+    handle RECEIVED AS AN ARGUMENT has no binding to follow and that is how a
+    real writer hides (`clear_config_reset(proj.g)` → `clear_config_reset(g)`)
+    — so `params` is threaded through here exactly as `enumerate_handle_surface`
+    threads it (line ~700). Without it, a second reach through a handle
+    parameter left the "found 1 call" assertion green over two statements.
     """
-    aliases: set[str] = set()
-    for node in sorted(ast.walk(func),
-                       key=lambda sub: getattr(sub, "lineno", 0)):
-        _bind_handle_aliases(node, aliases)
+    aliases = _handle_aliases(func)
+    params = _params_of(func)
     return [node for node in ast.walk(func)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in _HANDLE_MUTATING_VERBS
-            and _is_handle_ref(node.func.value, aliases)]
+            and _is_handle_ref(node.func.value, aliases, params)]
 
 
 def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
@@ -1385,13 +1434,42 @@ def test_the_symbol_pin_reads_the_comment_not_the_rows():
                 if name not in _comments_in(with_note)]
 
 
+def _census_writer_names() -> frozenset[str]:
+    """Bare names of every `sdk.py` function the census PROVES reaches a write.
+
+    `enumerate_handle_surface` keeps a fact for every function holding at least
+    one mutating `<handle>.<verb>` call, so that surface IS the census's own
+    answer to "does this name write" — using it here keeps this pin from
+    introducing a second, narrower notion of "write" (#3595's shared-decision
+    precedent, which this file's module docstring states). Keys are
+    scope-qualified (`TortoiseSDK.set_point_baseline`), resolved to the LAST
+    component exactly as `_inventory_of` resolves them.
+    """
+    cached = _CENSUS_WRITER_NAMES.get("names")
+    if cached is None:
+        surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
+        cached = frozenset(key.rsplit(".", 1)[-1] for key in surface)
+        _CENSUS_WRITER_NAMES["names"] = cached
+    return cached
+
+
+#: One entry, filled on first use: parsing `sdk.py` is ~0.25 s and every
+#: `_calibration_read_offenders` call would otherwise pay it again.
+_CENSUS_WRITER_NAMES: dict[str, frozenset[str]] = {}
+
+
 def _calibration_read_offenders(functions, readers=_CALIBRATION_READERS,
-                                module=None, path: Path = SDK_PY) -> list[str]:
+                                module=None, path: Path = SDK_PY,
+                                writers: frozenset[str] | None = None
+                                ) -> list[str]:
     """The per-row checks of the note, over `functions` (name -> def node).
 
     Extracted so the synthetic non-vacuity tests can run the SAME code on a
-    hand-built function instead of asserting against a copy of it.
+    hand-built function instead of asserting against a copy of it. `writers` is
+    the set of names the census proves write; `None` means "ask the census",
+    which is what the real pin does.
     """
+    writers = _census_writer_names() if writers is None else writers
     offenders: list[str] = []
     for name, read_shape in readers:
         func = functions.get(name)
@@ -1422,15 +1500,31 @@ def _calibration_read_offenders(functions, readers=_CALIBRATION_READERS,
             offenders.append(
                 f"{name}: the assembled statement no longer contains "
                 f"{read_shape!r}, so the note's stated read shape is stale")
-        # The note's second claim: no write through ANOTHER SDK method. The name
-        # may appear in advice strings (it does), so pin the CALL, not the word.
-        if any(isinstance(node, ast.Call)
-               and getattr(node.func, "attr", getattr(node.func, "id", None))
-               == "set_point_baseline"
-               for node in ast.walk(func)):
+        # The note's second claim: no write through ANOTHER SDK method. Pinned
+        # against the census's writer list rather than one method name — a
+        # `set_point_baseline`-only check left `self.invalidate_point(…)` (or
+        # `record_calibration`, or `_touch_inherited_at`) invisible while the
+        # note went false. The name may appear in advice STRINGS (it does), so
+        # this pins CALLS. The handle reach itself is excluded here: it is the
+        # call the statement above was assembled from, and `query` is on the
+        # surface too (`TortoiseSDK.query`), so counting it would red every row.
+        aliases = _handle_aliases(func)
+        params = _params_of(func)
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = getattr(node.func, "attr", None) or getattr(
+                node.func, "id", None)
+            if callee not in writers:
+                continue
+            receiver = getattr(node.func, "value", None)
+            if receiver is not None and _is_handle_ref(
+                    receiver, aliases, params):
+                continue
             offenders.append(
-                f"{name}: CALLS `set_point_baseline` — the note says it only "
-                "names it in advice strings, so this row DOES write")
+                f"{name}: CALLS `{callee}`, which the census proves reaches the "
+                "write handle — the note says this row is a read, so either "
+                "the call goes or the row moves out of `_UNRESOLVED`")
     return offenders
 
 
@@ -1549,6 +1643,128 @@ class Door:
     assert len(_handle_query_calls(func)) == 2, (
         "the handle reach through the alias `h` was not counted, so a second "
         "statement (and any write added to it) is invisible to the pin")
+
+
+def test_the_handle_reach_follows_a_handle_parameter():
+    """NON-VACUITY for the `params` arm of `_handle_query_calls` (review MINOR).
+
+    The census counts a handle RECEIVED AS AN ARGUMENT — its documented
+    over-report, and the shape a real writer hides in
+    (`clear_config_reset(proj.g)` → `clear_config_reset(g)`).
+    `_handle_query_calls` called `_is_handle_ref` WITHOUT the parameter set, so
+    a reach whose receiver is a handle parameter was not a reach at all: the
+    "found 1 call" assertion accounted for the statements it could see and
+    stayed green over the one it could not.
+
+    `self` is excluded from that set on purpose (`_params_of`, matching
+    `enumerate_handle_surface`), so `self.<verb>(…)` is never mistaken for a
+    handle reach — the second assertion holds that.
+    """
+    source = '''
+class Door:
+    def reading(self, g, ids):
+        return g.query("MATCH (n:Point) WHERE n.id IN $ids RETURN n.id")
+'''
+    func = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef))
+    assert len(_handle_query_calls(func)) == 1, (
+        "the handle reach through the handle PARAMETER `g` was not counted — "
+        "a second such reach would leave the pin's one-call assertion green "
+        "over an uninspected statement")
+    assert "self" not in _params_of(func), (
+        "`self` was counted as a handle parameter, so every `self.<verb>(…)` "
+        "call would read as a handle reach and the one-call assertion would "
+        "fire on a method call that touches no handle at all")
+
+
+def test_the_write_pin_sees_a_write_through_another_sdk_method():
+    """NON-VACUITY for the cross-method arm of `_calibration_read_offenders`.
+
+    The note claimed "no write through another SDK method" while the pin knew
+    exactly one name (`set_point_baseline`). These rows are hand-checked READS
+    whether or not the statement carries a clause, so a `self.invalidate_point(
+    …)` (or `record_calibration`, or `_touch_inherited_at`) added to either
+    function left the pin green and the note false. The arm is driven by the
+    census's own writer list, and the polarity is held both ways: a call the
+    census does not prove writes is clean, and the handle reach itself is never
+    mistaken for a method write (`query` is on the surface too).
+    """
+    source = '''
+class Door:
+    def reading(self, proj):
+        query = "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id"
+        self.invalidate_point("p1")
+        return proj.g.query(query).result_set
+'''
+    func = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef))
+    offenders = _calibration_read_offenders(
+        {"reading": func}, (("reading", "RETURN n.id"),),
+        writers=frozenset({"invalidate_point"}))
+    assert any("invalidate_point" in offender for offender in offenders), (
+        "a write through ANOTHER SDK method produced no offender, so the "
+        f"note's second claim can rot false with nothing red (offenders={offenders})")
+
+    # …and the arm is not a blanket "any call": a name the census does not
+    # prove writes is clean.
+    clean = source.replace('self.invalidate_point("p1")', 'self._get_proj()')
+    clean_func = next(node for node in ast.walk(ast.parse(clean))
+                      if isinstance(node, ast.FunctionDef))
+    assert not _calibration_read_offenders(
+        {"reading": clean_func}, (("reading", "RETURN n.id"),),
+        writers=frozenset({"invalidate_point"})), (
+        "a call to a function the census does not prove writes was reported as "
+        "a write — this arm must follow the census, not sound like a keyword"
+        )
+
+    # …and the handle reach is not double-counted as a method write, even though
+    # `query` is itself on the census's surface (`TortoiseSDK.query`).
+    handle_only = source.replace('        self.invalidate_point("p1")\n', '')
+    handle_func = next(node for node in ast.walk(ast.parse(handle_only))
+                       if isinstance(node, ast.FunctionDef))
+    assert not _calibration_read_offenders(
+        {"reading": handle_func}, (("reading", "RETURN n.id"),),
+        writers=frozenset({"query"})), (
+        "the handle reach `proj.g.query(...)` was reported as a write through "
+        "another SDK method")
+
+
+def test_the_module_bindings_cache_retains_its_module():
+    """NON-VACUITY for the identity cache in `_module_bindings` (review MINOR).
+
+    The cache is keyed on `id(module)`, and the comment used to claim the id
+    "cannot be recycled underneath it". That is true only for the sdk AST the
+    caller holds — NOT for the imported-callee hop, where `_resolve_callee`
+    parses `tortoise/live.py`, uses it, and drops it while its id stays a live
+    key: a later `ast.parse` can land on that address and the cache would hand
+    back ANOTHER module's constants (wrong fragments can resolve a write away).
+    The entry now RETAINS the AST, which makes the recycled id unrepresentable
+    rather than merely unlikely — and the identity guard is held below too.
+    """
+    module = ast.parse('_WHERE = "WHERE n.id IN $ids"')
+    key = id(module)
+    bindings = _module_bindings(module)
+    assert "_WHERE" in bindings
+    entry = _MODULE_BINDINGS_CACHE[key]
+    assert entry[0] is module, (
+        "the cache entry does not retain the AST it was built from, so nothing "
+        "keeps this `id` from being recycled by a later `ast.parse` while the "
+        "key is still live")
+    assert entry[1] is bindings, (
+        "the cache entry does not carry the bindings it answers with")
+    assert _module_bindings(module) is bindings, (
+        "a repeated lookup for the SAME module must not rebuild")
+
+    # An id that collides with an entry built from a DIFFERENT AST must be
+    # rejected — that is the exact state a recycled id produces, simulated
+    # deterministically.
+    impostor = ast.parse('_LIVE = "AND n.status = 1"')
+    _MODULE_BINDINGS_CACHE[id(impostor)] = (object(), {"_STALE": []})
+    assert "_STALE" not in _module_bindings(impostor), (
+        "a cache entry whose key matched but whose AST was a different object "
+        "was returned, so a recycled id serves another module's constants")
+    assert "_LIVE" in _module_bindings(impostor), (
+        "the impostor entry was not replaced with the real module's bindings")
 
 
 def test_every_live_declared_door_is_journal_first():
