@@ -315,6 +315,46 @@ def test_green_with_zero_numerator_is_a_finding():
     assert any("at least ONE success" in m for m in msgs), msgs
 
 
+def test_green_with_boolean_counts_is_a_finding():
+    """A JSON ``true`` is not an integer count (#9089 review, P2).
+
+    ``bool`` subclasses ``int``, so the pre-fix ``isinstance(num, int)`` arm
+    accepted ``"numerator": true, "denominator": true`` and ``0 < True <= True``
+    then passed the range arm: the gate read a malformed block as a GREEN
+    *measurement* (reproduced: ``_codes`` empty, ``--require-green`` exit 0),
+    which is the one wrong-typed shape this file's contract turned the wrong
+    way. Both halves are asserted, because either alone still admits a count
+    of one boolean and one real number.
+    """
+    for field in ("numerator", "denominator"):
+        rec = _record()
+        _green(rec)
+        rec["rows"][0][field] = True
+        assert "V5" in _codes(rec), field
+    rec = _record()
+    _green(rec)
+    rec["rows"][0].update(numerator=1, denominator=True)
+    assert "V5" in _codes(rec), "a true denominator is not a denominator"
+
+
+def test_e4_measured_with_a_boolean_denominator_is_a_finding():
+    """The same bool-is-an-int hole on V10's row arm (#9089 review, P2).
+
+    V10 asks whether E4's measured denominator is a positive count; with
+    ``denominator: true`` that question was answered ``True > 0``, so the one
+    row carrying numbers could be measured against a boolean and the tally
+    still printed "denominators agree".
+    """
+    receipt = probe.e4_receipt({"s4_merge": {"s2_items": 15,
+                                           "kept_from_s2": 14}})
+    rec = _completed_record(receipt)
+    e4 = next(r for r in rec["rows"] if r["criterion"] == "E4")
+    e4["denominator"] = True
+    rec["run"]["e4_receipt"]["denominator"] = True
+    msgs = _messages(rec)
+    assert any("no positive" in m for m in msgs), msgs
+
+
 def test_green_row_naming_a_blocker_is_a_finding():
     rec = _record()
     _green(rec)

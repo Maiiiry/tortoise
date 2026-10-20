@@ -102,6 +102,22 @@ _BLOCKER_RE = re.compile(r"^#\d+$")
 _BLOCK_KEYS = ("run", "prereg", "corpus")
 
 
+def _count(value: object) -> bool:
+    """An INTEGER count — never a bool (#9089 review).
+
+    ``bool`` is a subclass of ``int``, so a bare ``isinstance(x, int)`` accepts
+    a JSON ``true``, and ``0 < True <= True`` then passes every numeric arm of
+    V5/V10: a block saying ``"numerator": true, "denominator": true`` was read
+    as a GREEN *measurement* (reproduced on this module's own ``_green``
+    fixture: no finding, ``--require-green`` exit 0). That is the one malformed
+    shape this file's stated contract reads the WRONG WAY — every other
+    wrong-typed block (non-object block, unhashable criterion, non-iterable
+    ``steps_observed``) is refused as malformed — so it is refused here too
+    rather than counted.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _non_object_blocks(record: dict) -> list[tuple[str, str]]:
     """Nested blocks that are PRESENT but not JSON objects, as ``(key, type)``.
 
@@ -356,7 +372,7 @@ def check(record: dict, *, repo: Path,
             if kind != "measurement":
                 f.add("V5", where, "GREEN requires evidence_kind='measurement' "
                                    "— a refusal record cannot be green")
-            if not isinstance(num, int) or not isinstance(den, int):
+            if not _count(num) or not _count(den):
                 f.add("V5", where, "GREEN requires integer numerator and "
                                    "denominator")
             elif den <= 0:
@@ -543,15 +559,15 @@ def check(record: dict, *, repo: Path,
         # row that carries numbers could be measured 0/0 and the gate would
         # still print "denominators agree" — the silent-zero shape V5 exists
         # to refuse, reachable only through the row V5 cannot see.
-        if measured and not (isinstance(e4_den, int) and e4_den > 0):
+        if measured and not (_count(e4_den) and e4_den > 0):
             f.add("V10", "rows[E4]", f"E4 is MEASURED but carries no positive "
                                         f"denominator ({e4_den!r}) — an empty "
                                         "denominator measures nothing, and "
                                         "V5's GREEN-only arm cannot reach this "
                                         "row (E4 is never GREEN here)")
         receipt = run.get("e4_receipt")
-        if isinstance(receipt, dict) and isinstance(e4_den, int) \
-                and isinstance(receipt.get("denominator"), int) \
+        if isinstance(receipt, dict) and _count(e4_den) \
+                and _count(receipt.get("denominator")) \
                 and receipt["denominator"] != e4_den:
             f.add("V10", "rows[E4]",
                   f"the row's denominator ({e4_den}) and the run's e4_receipt "
