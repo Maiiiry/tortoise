@@ -2377,6 +2377,39 @@ def expand_structural_hops(
 
 # ── RRF fusion ───────────────────────────────────────────────────────────────
 
+def _mid_ranks(leg_scores: list[float]) -> list[float]:
+    """PROTOTYPE #7704: average rank among EQUAL scores (standard competition
+    ranking with ties averaged, RANK.AVG). A leg that scores two documents
+    identically has said nothing about which is better, so it must not hand
+    them different ranks: RRF is rank-based, and a positional rank turns the
+    caller's tie-break into a relevance signal.
+
+    PRECONDITIONS this creates (verified against all four call sites, and the
+    reason it is NOT free — see #7704): the leg is SCORE-SORTED DESC (grouping
+    is adjacent-only) and its scores are MEANINGFUL. ``temporal_leg`` encodes
+    rank by list position and passes 0.0 for every row, so it violates both by
+    construction: tie-averaging collapses it to one block and moves a
+    tail-placed pick from rank 3 to rank 0.
+
+    Average rank is chosen over minimum rank: ``1/(k+rank+1)`` is convex, so
+    min-rank INFLATES a tied leg's total contribution (+29% at a 40-row tie
+    group, +68% at 100), while averaging shrinks it by the Jensen gap (-2.1% /
+    -7.2%). Neither preserves the #1657 relative leg weights; the shrink is the
+    smaller and the non-dominating error."""
+    n = len(leg_scores)
+    ranks: list[float] = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and leg_scores[j + 1] == leg_scores[i]:
+            j += 1
+        mid = (i + j) / 2.0
+        for t in range(i, j + 1):
+            ranks[t] = mid
+        i = j + 1
+    return ranks
+
+
 def rrf_fusion(
     ranked_lists: list[list[tuple[str, float]]],
     k: int = 60,
@@ -2458,7 +2491,13 @@ def rrf_fusion(
                     strategy_names[i], w,
                 )
                 w = 1.0
-        for rank, (pid, _score) in enumerate(ranked):
+        # PROTOTYPE #7704: mid-rank for tied leg scores. Materialise ONCE —
+        # the shipped loop enumerated a leg in a single pass, so a generator
+        # leg was tolerated; indexing and then zipping the same iterator would
+        # silently return {}.
+        ranked = list(ranked)
+        ranks = _mid_ranks([sc for _pid, sc in ranked])
+        for rank, (pid, _score) in zip(ranks, ranked):
             rrf_score = w / (k + rank + 1)
             scores[pid] = scores.get(pid, 0.0) + rrf_score
     # R5 (#1544): optional recency multiplier — a multiplier, NOT an additive
