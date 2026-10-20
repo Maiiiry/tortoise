@@ -5917,7 +5917,6 @@ durations:
   # are PR-ADDED files, so the push-to-main sweep cannot have measured them yet.
   test_6211_ep_result_shape.py: 19.0
   test_6211_ep_scale.py: 19.0  # ci-timing top-15 2026-10-19 (run 39191149586): top-15 saw 1 of 4 testcases = 3.3s, a LOWER bound; kept 19.0
-  test_6211_ep_scale.py: 19.0
   # #6211 (hop anchoring): locally measured on this host, whole file, 7 tests /
   # 5.4-7.6 s (it builds an 8k-edge fixture and profiles one hop). The count is
   # re-derived at every revision, never carried forward — an earlier revision of
