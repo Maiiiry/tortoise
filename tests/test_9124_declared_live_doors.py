@@ -1244,15 +1244,15 @@ def _resolve_callee(name: str, module, path: Path):
         if node.level:
             package = path.parent.relative_to(ROOT).as_posix().replace("/", ".")
             module_name = ".".join(filter(None, [package, module_name]))
-        candidate = ROOT / (module_name.replace(".", "/") + ".py")
-        if not candidate.exists():
-            # A PACKAGE import (`from .projection import _stored_prop_value`)
-            # resolves through its `__init__.py`, not a sibling module file.
-            # Without this hop the callee was UNRESOLVABLE — and an
-            # unresolvable CALL used to be dropped in silence (see the REPORT
-            # arm in `_fragments_of`), so a write introduced in that helper's
-            # return was never read and never announced.
-            candidate = ROOT / (module_name.replace(".", "/")) / "__init__.py"
+        # ⛔ PACKAGE FIRST — Python's own resolution order, and it is
+        # load-bearing here: `tortoise/projection.py` exists as a 37-line shim,
+        # so a module-first resolver parsed the SHIM, found no def, and never
+        # reached the package `__init__.py` where `_stored_prop_value` actually
+        # lives. (Verified: `import tortoise.projection` resolves to the
+        # package, not the shim.)
+        package = ROOT / (module_name.replace(".", "/")) / "__init__.py"
+        candidate = package if package.exists() else ROOT / (
+            module_name.replace(".", "/") + ".py")
         if not candidate.exists():
             continue
         other = ast.parse(candidate.read_text(), str(candidate))
@@ -1275,6 +1275,14 @@ _FRAGMENT_DEPTH_CAP = 16
 #: `dir(builtins)`, hoisted: it was rebuilt every time an UNBOUND name was
 #: walked, which is exactly the arm whose cost grows with the statement.
 _BUILTIN_NAMES = frozenset(dir(builtins))
+
+#: Builtins whose RESULT cannot carry statement text, so a parameter handed to
+#: one genuinely IS a scalar. `str` is deliberately NOT here: it returns its
+#: argument verbatim, so `f"…{str(extra)}"` would smuggle a caller's Cypher past
+#: the pin (measured GREEN while the bare `{extra}` form was RED). Anything not
+#: on this list — `str`, `list`, an SDK helper — leaves the argument reported.
+_SCALAR_COERCIONS = frozenset(
+    {"int", "float", "bool", "len", "abs", "round", "hash"})
 
 
 def _fragments_of(expr, bindings, params, module, path, followed, unread,
@@ -1328,11 +1336,15 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
     seen.append(bindings)  # RETAINED, so this `id` cannot be recycled under us
     call_names = {id(node.func) for node in ast.walk(expr)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-    # A parameter used as a positional ARGUMENT was handed to something that can
-    # read it; one interpolated straight into the text was not. Computed over the
-    # whole expression, so the two states cannot be confused by walk order.
-    call_arg_ids = {id(arg) for node in ast.walk(expr)
-                    if isinstance(node, ast.Call) for arg in node.args}
+    # A parameter passed to a SCALAR COERCION cannot carry statement text; one
+    # interpolated straight into the text, or passed to `str(...)` (which returns
+    # it verbatim), can. Computed over the whole expression, so the two states
+    # cannot be confused by walk order.
+    scalar_arg_ids = {id(arg) for node in ast.walk(expr)
+                      if isinstance(node, ast.Call)
+                      and isinstance(node.func, ast.Name)
+                      and node.func.id in _SCALAR_COERCIONS
+                      for arg in node.args}
     for sub in ast.walk(expr):
         if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
             callee, callee_module, callee_path = _resolve_callee(
@@ -1343,6 +1355,19 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
                 for returned in _function_returns(callee):
                     fragments.extend(_fragments_of(
                         returned, callee_bindings, _params_of(callee),
+                        callee_module, callee_path, followed, unread, depth + 1,
+                        visited,
+                        params_are_inspected=bool(sub.args or sub.keywords)))
+                # A DEFAULT is a value the call site need not supply, so it is
+                # walked here rather than blessed with the arguments: a write
+                # sitting in `def _suffix(extra=" SET …")` is otherwise never
+                # read (measured GREEN before this loop existed).
+                for default in list(callee.args.defaults) \
+                        + list(callee.args.kw_defaults):
+                    if default is None:
+                        continue
+                    fragments.extend(_fragments_of(
+                        default, callee_bindings, _params_of(callee),
                         callee_module, callee_path, followed, unread, depth + 1,
                         visited, params_are_inspected=True))
             elif callee is None and sub.func.id not in _BUILTIN_NAMES:
@@ -1376,7 +1401,7 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
             # name is an ARGUMENT to a call (`int(limit)`); otherwise the text is
             # assembled from a value this walk never saw, and `unread` says so
             # rather than blessing it — the census's own polarity.
-            if params_are_inspected or id(sub) in call_arg_ids:
+            if params_are_inspected or id(sub) in scalar_arg_ids:
                 continue
             unread.add(sub.id)
         elif (sub.id in _BUILTIN_NAMES and module is not None
@@ -2024,6 +2049,21 @@ def test_a_directly_interpolated_parameter_is_reported_not_blessed():
         "read-only, so a caller-supplied write passed the pin — the top-level "
         f"scope has no argument to have inspected (offenders={offenders})")
 
+    # ⛔ `str(extra)` is the same hole one call away: `str` is a builtin (so the
+    # callee REPORT arm is silent) and returns its argument VERBATIM, so an
+    # exemption that blessed "any call argument" let a caller's Cypher through.
+    # Only scalar coercions (`int`, `len`, …) may bless an argument.
+    via_str = (
+        'class Door:\n'
+        '    def reading(self, proj, extra):\n'
+        '        query = f"MATCH (n:Point) RETURN n.id {str(extra)}"\n'
+        '        return proj.g.query(query).result_set\n')
+    assert any("could not be read out" in offender
+               for offender in _offenders_for(via_str)), (
+        "`str(extra)` is a builtin call, so it was treated as a benign scalar "
+        "and a caller-supplied write passed through verbatim — only coercions "
+        "whose result cannot carry statement text may exempt an argument")
+
     benign = (
         'class Door:\n'
         '    def reading(self, proj, ids):\n'
@@ -2034,6 +2074,51 @@ def test_a_directly_interpolated_parameter_is_reported_not_blessed():
     assert not _offenders_for(benign), (
         "a parameter used as a scalar ARGUMENT (`int(...)`, `len(...)`) was "
         "reported as unread, so every such fragment would red a real row")
+
+
+def test_the_callee_resolver_prefers_the_package_over_a_sibling_shim():
+    """NON-VACUITY for `_resolve_callee`'s package preference (review P2).
+
+    `tortoise/projection.py` exists as a 37-line shim, so a MODULE-first
+    resolver parsed the shim, found no def, and never reached the package
+    `__init__.py` where `_stored_prop_value` actually lives — the package hop
+    added for exactly that import never fired, and nothing tested it. Python
+    resolves `import tortoise.projection` to the PACKAGE, so the resolver must
+    too (verified: the package wins at runtime).
+    """
+    tree = ast.parse(SDK_PY.read_text(), str(SDK_PY))
+    func, _module, _path = _resolve_callee("_stored_prop_value", tree, SDK_PY)
+    assert func is not None, (
+        "`from .projection import _stored_prop_value` did not resolve: the "
+        "sibling `tortoise/projection.py` shim was parsed INSTEAD of the "
+        "package `__init__.py` that Python actually imports, so that callee's "
+        "return was unreadable")
+
+
+def test_a_write_in_a_callee_default_is_read():
+    """NON-VACUITY for the DEFAULT walk in `_fragments_of` (review P2).
+
+    `params_are_inspected` blesses a callee's parameters because "its argument
+    was inspected in the caller's expression" — but a DEFAULT is a value the
+    call site need not supply at all, so it was neither inspected nor reported:
+    a callee called WITH an argument (so its parameters are blessed) whose other
+    default carries the write came back GREEN with an empty `unread`, because
+    `_function_returns` never walks defaults.
+    """
+    source = (
+        'def _suffix(seen, extra=" SET n.poked = 1"):\n'
+        '    return f"{seen}{extra}"\n'
+        '\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) RETURN n.id "\n'
+        '        query += f"{_suffix(\"\")}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(source, with_module=True)
+    assert any("not a read any more" in offender for offender in offenders), (
+        "a write sitting in a callee's DEFAULT was never walked, and the "
+        "call's argument presence blessed the parameters — so the pin stayed "
+        f"green over a writing statement (offenders={offenders})")
 
 
 def test_the_calibration_reader_list_is_bound_to_the_rows_it_guards():
