@@ -131,6 +131,72 @@ _ESCAPE3_CALL_SITES = {
     ("tortoise/hosted_api.py", "_eager_provision_org_graph"): 1,
 }
 
+#: Spelled numerals for the count above, so the four records' PROSE count is a
+#: pinned claim instead of one a hand edit can change while every assertion stays
+#: green (#9150 review cycle 4: "the five" was unpinned in all four records).
+_COUNT_WORDS = {0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
+                5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine"}
+
+
+# ── record slices: pin the RECORD, not the module that carries it ──────────
+def _record(*, path: str, start: str, end: str) -> str:
+    """The flattened prose of ONE record's region, `start` up to the next `end`.
+
+    Every prose pin in this file must read the region its claim is about. A
+    whole-module scan passes while the region says NOTHING, whenever the same
+    words appear elsewhere in a 30 000-line module — measured four times in
+    review (#9150): `eager_init_query`/`select_graph` occur ABOVE the escape-(3)
+    note (the module docstring, `def eager_init_query`, the #4641 width bullet),
+    `#9157` occurs in `_live_write_scope`'s docstring BELOW the inventory bullet,
+    the site names could be re-added anywhere in `state.py`, and `#9144` could be
+    cited anywhere in the projection module.
+
+    The boundary is ASSERTED, not assumed: a moved or deleted marker raises here
+    instead of silently widening the scan back to the whole file (which is how
+    every one of those four false PASSes happened).
+
+    Leading comment markers are STRIPPED before flattening: these records are
+    `#`-commented Python, and a plain `split()` leaves a bare `#` between the
+    words of a wrapped sentence (measured: "the five # `eager_init_query()` call
+    sites"), so a claim was assertable only within one physical line.
+    """
+    source = (_REPO / path).read_text(encoding="utf-8")
+    lo = source.find(start)
+    hi = source.find(end, lo + 1) if lo != -1 else -1
+    assert lo != -1 and hi != -1, (
+        f"`{path}` no longer carries the region this pin reads "
+        f"({start!r} … {end!r}) — the record moved or was deleted, so every "
+        "claim about it must be re-derived. A missing boundary must never "
+        "widen the scan to the whole file"
+    )
+    lines = (ln.lstrip().removeprefix("#").strip()
+             for ln in source[lo:hi].splitlines())
+    return " ".join(" ".join(lines).split())
+
+
+def _assert_site_count(region: str, template: str, what: str) -> None:
+    """The record's NUMERAL must equal the AST inventory's count.
+
+    `template` is the record's own sentence with `{n}` standing in for the
+    numeral — the same convention the exact-phrase pins already use, so a
+    re-wording reds this instead of silently un-pinning the count.
+    """
+    n = sum(_ESCAPE3_CALL_SITES.values())
+    word = _COUNT_WORDS.get(n)
+    assert word is not None, (
+        f"the escape-(3) inventory now holds {n} sites — extend `_COUNT_WORDS` "
+        "and update the four records' numerals in the same change"
+    )
+    for candidate in (word, word.capitalize()):
+        if template.format(n=candidate) in region:
+            return
+    raise AssertionError(
+        f"{what} no longer says {template.format(n=word)!r} — the escape-(3) "
+        f"site count in prose and the AST inventory ({n}) disagree. A count in "
+        "prose is a claim like any other: update the numeral in the same change "
+        "as the inventory (#9157)"
+    )
+
 
 def _parse(rel: str) -> tuple[ast.Module, dict[ast.AST, ast.AST]]:
     tree = ast.parse((_REPO / rel).read_text(encoding="utf-8"))
@@ -393,18 +459,17 @@ def test_the_eager_init_statement_is_a_mutating_one():
     carries an undeclared mutating statement" is the guard's own reading, not
     this file's opinion.
 
-    The failure claim is deliberately NARROW (#9150 review cycle 2, P2). The
-    statement is a MULTI-CLAUSE write (`MERGE … ON CREATE SET …`), so
-    `_WRITE_CLAUSE_RE` matches `CREATE` and `SET` independently of `MERGE`:
-    deleting the classifier's `MERGE` arm alone leaves this GREEN (measured —
-    `_statement_writes("CREATE (:TeamMeta {name:$name})")` is `True`, and so is
-    the fragment, whose `ON CREATE SET` matches both other arms). What reds here
-    is the classifier ceasing to read this statement as a write AT ALL —
-    `_WRITE_CLAUSE_RE` losing `CREATE`/`SET`, or `_statement_writes` regressing
-    — which is the premise the residual rests on. The classifier's individual
-    arms belong to its own suite, not to this pin; an earlier revision of this
-    docstring claimed the `MERGE` arm, which was the same
-    wrong-pin-attribution defect the module docstring's failure map had.
+    What REDS here is the classifier ceasing to read this statement as a write
+    AT ALL — and that needs ALL THREE arms the fragment matches to go
+    (`CREATE`, `MERGE`, `SET`); any ONE of them deleted leaves this GREEN
+    (measured per arm: dropping `MERGE`, or dropping `CREATE`+`SET` while
+    keeping `MERGE`, both still classify the statement as a write). What this
+    pin buys is the PREMISE the residual rests on, not a check of the
+    classifier's individual arms — those belong to its own suite. An earlier
+    revision of this docstring claimed the `MERGE` arm alone, and the revision
+    after that claimed `CREATE`/`SET`; both were the same
+    wrong-red-trigger-attribution defect the module docstring's failure map had
+    (#9150 review cycles 2 and 4).
 
     The `:OnboardingState` label is the other half, and had no pin: all FOUR
     records say these five sites CREATE an `:OnboardingState`
@@ -454,17 +519,12 @@ def test_the_declaration_note_names_the_seam_it_does_not_cover():
     ABOVE the note. A pin that cannot fail on the edit it guards is the
     #1349/#2938 false-PASS class, one level up from where this file closed it.
     """
-    source = (_REPO / "tortoise/onboarding/state.py").read_text(encoding="utf-8")
-    start = source.find("It does NOT cover the eager-init statement")
-    end = source.find("SEAM: `#9123`", start)
-    assert start != -1 and end != -1, (
-        "`tortoise/onboarding/state.py` no longer carries the escape-(3) note — "
-        "neither the\n  * It does NOT cover the eager-init statement …\n"
-        "bullet nor the `SEAM: `#9123`` marker that closes it is present any "
-        "more. Deleting the note restores the over-claim that five "
-        "`eager_init_query()` call sites disprove (#9157)"
+    note = _record(
+        path="tortoise/onboarding/state.py",
+        start="It does NOT cover the eager-init statement",
+        # the SEAM block is the next thing a reader is told about this lane
+        end="SEAM: `#9123`",
     )
-    note = " ".join(source[start:end].split())
     for phrase in ("eager_init_query", "select_graph", "#9157",
                    "do not close escape (3) believing"):
         assert phrase in note, (
@@ -475,6 +535,8 @@ def test_the_declaration_note_names_the_seam_it_does_not_cover():
             "occur elsewhere in this module, and a whole-file scan passed "
             "while the note said none of it (#9157)"
         )
+    _assert_site_count(note, "{n} call sites build that statement",
+                       "the escape-(3) NOTE in `tortoise/onboarding/state.py`")
 
 
 def test_the_note_and_the_ast_inventory_agree():
@@ -484,6 +546,11 @@ def test_the_note_and_the_ast_inventory_agree():
     `eager_init_query()` site appearing in `sdk.py` / `hosted_api.py` makes the
     note stale (RED here forces the same change to re-read the residual), and a
     site's name leaving the note is caught by the per-site presence check.
+
+    ⛔ The per-site names are checked against the NOTE, not the module (#9150
+    review cycle 4, P1): the whole-module scan this replaces passed while every
+    name had been deleted from the note and re-added as a comment anywhere else
+    in `state.py` — the sibling of the cycle-3 P1, one function down.
     """
     measured = _eager_init_sites()
     assert measured == _ESCAPE3_CALL_SITES, (
@@ -494,14 +561,17 @@ def test_the_note_and_the_ast_inventory_agree():
         "`onboarding/state.py` + the guard's opener inventory in "
         "`projection/__init__.py` have to be updated in the same change (#9157)"
     )
-    source = " ".join(
-        (_REPO / "tortoise/onboarding/state.py").read_text(encoding="utf-8").split()
+    note = _record(
+        path="tortoise/onboarding/state.py",
+        start="It does NOT cover the eager-init statement",
+        end="SEAM: `#9123`",
     )
     for rel, func in measured:
-        assert f"{rel}::{func}" in source, (
+        assert f"{rel}::{func}" in note, (
             f"the declaration's note no longer names the escape-(3) site "
             f"{rel}::{func} — a lane doing the §17.1 door inventory would read "
-            "the onboarding class as fully declared"
+            "the onboarding class as fully declared. The name must be in the "
+            "NOTE, not merely somewhere in `state.py`"
         )
 
 
@@ -818,17 +888,11 @@ def test_the_guards_inventory_names_this_lane_and_its_residual():
     so asserting it here only ever tested a different text than this docstring
     claims.
     """
-    source = (_REPO / "tortoise/projection/__init__.py").read_text(encoding="utf-8")
-    start = source.find("#   * `onboarding.metadata`")
-    end = source.find("#   * `structural-edge.derived`", start)
-    assert start != -1 and end != -1, (
-        "the `onboarding.metadata` bullet is gone from the §17.1 opener "
-        "inventory in `tortoise/projection/__init__.py` (or the next bullet "
-        "that delimits it moved) — the file that ENFORCES the rule no longer "
-        "says this lane exists, so a reader trusting it concludes the "
-        "onboarding writes are journal-first (#9121)"
+    bullet = _record(
+        path="tortoise/projection/__init__.py",
+        start="#   * `onboarding.metadata`",
+        end="#   * `structural-edge.derived`",
     )
-    bullet = " ".join(source[start:end].split())
     for phrase in (
         # the opener is NOT a `_live_write_scope` opener: the bullet says the
         # LANE appends nothing, and why that is not a contradiction.
@@ -846,6 +910,9 @@ def test_the_guards_inventory_names_this_lane_and_its_residual():
             "lane is journal-first (it is not) or fully delegated (it is not: "
             "#9157)"
         )
+    _assert_site_count(bullet, "the {n} `eager_init_query()` call sites",
+                       "the `onboarding.metadata` bullet in "
+                       "`tortoise/projection/__init__.py`")
 
 
 def test_the_live_scope_docstring_names_the_opener_the_lane_actually_calls():
@@ -863,14 +930,16 @@ def test_the_live_scope_docstring_names_the_opener_the_lane_actually_calls():
     Derived, not eyeballed: the mechanism names are read out of `state.py`'s own
     opener, so re-wording the docstring around a mechanism the lane does not use
     cannot satisfy this.
+
+    ⛔ Both halves are checked where the claim lives (#9150 review cycle 4, P1).
+    The alias half used to be a raw text scan of the WHOLE of `state.py`, which
+    proved nothing about the docstring (the false sentence could be re-added
+    verbatim and this stayed green) and false-RED on a TRUE prose mention of the
+    alias. It is now (a) a DOCSTRING assertion — the sentence the defect lived
+    in — and (b) an AST assertion that the module never calls or imports the
+    alias, which is what "never through this alias" actually means and which a
+    comment cannot violate.
     """
-    state_source = (_REPO / "tortoise/onboarding/state.py").read_text(
-        encoding="utf-8")
-    assert "_live_write_scope" not in state_source, (
-        "`tortoise/onboarding/state.py` now opens `_live_write_scope` itself — "
-        "re-read the opener inventory's onboarding bullet in "
-        "`tortoise/projection/__init__.py` (and this pin) (#9121)"
-    )
     tree, _parents = _parse("tortoise/onboarding/state.py")
     opener = next(
         (node for node in ast.walk(tree)
@@ -919,6 +988,33 @@ def test_the_live_scope_docstring_names_the_opener_the_lane_actually_calls():
         "the lane opens THIS alias, which `tortoise/onboarding/state.py` never "
         "imports; a reader trusts the docstring over the code, and this is the "
         "file that ENFORCES §17.1 (#9121)"
+    )
+    # The defect this pin exists for was a SENTENCE, so it is asserted on the
+    # docstring: the alias must not be described as how this lane declares.
+    assert "_live_write_scope" not in doc, (
+        "`_live_write_scope`'s docstring names ITSELF for the onboarding lane "
+        "again. `tortoise/onboarding/state.py` never imports this alias — its "
+        "opener calls `_cache_write_authorized(ONBOARDING_WRITE_LANE)` "
+        "directly (two spellings, one primitive) (#9121)"
+    )
+    # ... and the CODE half: `state.py` must not reach the alias by call, getattr
+    # or import. A comment naming it is not a mechanism and must not red this.
+    alias_uses = {
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == "_live_write_scope"
+    } | {
+        node.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "_live_write_scope"
+    } | {
+        a.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+        for a in node.names if a.name == "_live_write_scope"
+    }
+    assert not alias_uses, (
+        "`tortoise/onboarding/state.py` now CALLS or imports the "
+        "`_live_write_scope` alias — re-read the opener inventory's onboarding "
+        "bullet in `tortoise/projection/__init__.py` and this pin. (A COMMENT "
+        "naming the alias is fine and does not trip this; only a call, a "
+        "getattr or an import does.) (#9121)"
     )
 
 
@@ -1007,9 +1103,13 @@ def test_the_plan_doc_and_the_storage_ledger_carry_the_residual():
 
     Both now state `#9157`, and this pin is why they cannot drift back.
     """
-    for rel, what in (
-        ("docs/plans/2026-10-14-7951-atomic-write-outbox.md", "the increment-4 tracker"),
-        ("docs/architecture/STORAGE-ARCHITECTURE.md", "§17.1's door ledger"),
+    for rel, what, template in (
+        ("docs/plans/2026-10-14-7951-atomic-write-outbox.md",
+         "the increment-4 tracker",
+         "the {n} `eager_init_query()` call sites"),
+        ("docs/architecture/STORAGE-ARCHITECTURE.md",
+         "§17.1's door ledger",
+         "the {n} `eager_init_query()` sites"),
     ):
         flat = " ".join((_REPO / rel).read_text(encoding="utf-8").split())
         for phrase in ("#9157", "eager_init_query", "select_graph"):
@@ -1019,6 +1119,7 @@ def test_the_plan_doc_and_the_storage_ledger_carry_the_residual():
                 "writer outside the declared lane, which the five escape-(3) "
                 "sites disprove (#9157)"
             )
+        _assert_site_count(flat, template, f"{what} (`{rel}`)")
 
 
 def test_the_inventory_cites_the_issue_that_owns_the_journalling_increment():
@@ -1030,17 +1131,27 @@ def test_the_inventory_cites_the_issue_that_owns_the_journalling_increment():
     an auto-filed `NEVER_BACKED_UP` incident stub with `{}` detail, files no
     scope). The increment is **#9129**. No pin covered this, so nothing reddened;
     this is that pin.
+
+    ⛔ SCOPED TO THE BULLET (#9150 review cycle 4, P2). The `#9144` half used to
+    be a ban on that string across the whole 30 000-line module, so a LEGITIMATE
+    future citation of `#9144` anywhere in `projection/__init__.py` red the pin
+    and was reported as "the onboarding-journalling increment is `#9129`" — the
+    same wider-than-the-claim defect the sibling pins were cured of.
     """
-    source = (_REPO / "tortoise/projection/__init__.py").read_text(encoding="utf-8")
-    flat = " ".join(source.split())
-    assert "(`#9129`), not assumed by this lane" in flat, (
-        "`tortoise/projection/__init__.py` no longer cites `#9129` for the "
-        "onboarding-journalling increment — either the citation was dropped or "
-        "it points somewhere else (it once pointed at `#9144`, an auto-filed "
-        "NEVER_BACKED_UP incident stub that files no scope)"
+    bullet = _record(
+        path="tortoise/projection/__init__.py",
+        start="#   * `onboarding.metadata`",
+        end="#   * `structural-edge.derived`",
     )
-    assert "#9144" not in flat, (
-        "`tortoise/projection/__init__.py` cites `#9144`, which is a "
-        "NEVER_BACKED_UP incident stub — the onboarding-journalling increment is "
-        "`#9129` (#9121 residual)"
+    assert "(`#9129`), not assumed by this lane" in bullet, (
+        "the `onboarding.metadata` bullet in `tortoise/projection/__init__.py` "
+        "no longer cites `#9129` for the onboarding-journalling increment — "
+        "either the citation was dropped or it points somewhere else (it once "
+        "pointed at `#9144`, an auto-filed NEVER_BACKED_UP incident stub that "
+        "files no scope)"
+    )
+    assert "#9144" not in bullet, (
+        "the `onboarding.metadata` bullet in `tortoise/projection/__init__.py` "
+        "cites `#9144`, which is a NEVER_BACKED_UP incident stub — the "
+        "onboarding-journalling increment is `#9129` (#9121 residual)"
     )
