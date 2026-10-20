@@ -85,8 +85,10 @@ surface this suite never looked at.
 from __future__ import annotations
 
 import ast
+import io
 import re
 import sys
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -94,6 +96,13 @@ import pytest
 from tortoise.projection import (
     _HANDLE_GUARD_ENFORCES,
     _HANDLE_MUTATING_VERBS,
+    # The repo's ONE definition of a write clause, and the literal/comment
+    # stripper it reads (see `_assembled_write_evidence`): a local copy of this
+    # regex drifted from it twice over — fail-open on the clauses it omitted and
+    # false-red on the property names it stopped excluding (#7174) — which is the
+    # #3595 shared-decision rule this file's docstring already invokes.
+    _LITERAL_OR_COMMENT_RE,
+    _WRITE_CLAUSE_RE,
     _statement_writes,
 )
 
@@ -993,11 +1002,35 @@ def test_no_two_census_entries_share_a_bare_function_name():
 #: note on almost every merge, so a number rots here without anything reddening.
 _SDK_LINE_ANCHOR = re.compile(r"sdk\.py:\d+")
 
-#: The Cypher clauses that make a statement a WRITE. Checked against the
-#: ASSEMBLED text, not the resolvable half, because for these two rows the
-#: unresolvable fragment IS the `WHERE` text — that is why the census could not
-#: settle them and why a human had to.
-_WRITE_CLAUSE_RE = re.compile(r"\b(?:SET|CREATE|MERGE|DELETE|DETACH|REMOVE)\b")
+#: ⛔ NO LOCAL WRITE-CLAUSE REGEX HERE. What counts as a write is
+#: `_statement_writes` + `_WRITE_CLAUSE_RE` from `tortoise.projection` — the
+#: SAME pair the runtime door consults (this file's docstring, #3595). The first
+#: version of this pin declared its own `\b(?:SET|CREATE|MERGE|DELETE|DETACH|
+#: REMOVE)\b` and every difference from the canonical def ran the wrong way:
+#: it was case-sensitive and had no `FOREACH`/`DROP` (a lower-case `set`, a
+#: `FOREACH (…) | SET …` or a `DROP INDEX` appended to these statements is a
+#: write to the door and was invisible here — the note could rot false with
+#: nothing red), and it dropped the `(?<![\w.$:])` lookbehind that keeps a
+#: PROPERTY named like a keyword from reading as a clause (`RETURN n.SET` is a
+#: well-formed READ; #7174 is the recorded false refusal that lookbehind fixed).
+
+
+def _assembled_write_evidence(assembled: str) -> str | None:
+    """The write evidence in an assembled statement, or ``None`` for a read.
+
+    Delegates the VERDICT to `_statement_writes` and only uses the canonical
+    `_WRITE_CLAUSE_RE` (over the same literal-stripped text `_statement_writes`
+    reads) to name the clause for the failure message — so the message and the
+    door cannot disagree either. A statement that writes only through a write
+    PROCEDURE (`CALL db.idx.fulltext.createNodeIndex(…)`) has no clause to
+    name, so it is reported by the classifier alone rather than as a read.
+    """
+    if not _statement_writes(assembled):
+        return None
+    clause = _WRITE_CLAUSE_RE.search(_LITERAL_OR_COMMENT_RE.sub(" ", assembled))
+    if clause is not None:
+        return repr(clause.group(0))
+    return "a write PROCEDURE call (no write clause, per `_statement_writes`)"
 
 #: The two rows the #9063 note covers, each with the read shape the note states.
 _CALIBRATION_READERS: tuple[tuple[str, str], ...] = (
@@ -1024,6 +1057,28 @@ def _unresolved_block_source() -> str:
         "reads its source to check the hand-check note, so move the pin with it")
 
 
+def _comments_in(block_source: str) -> str:
+    """The COMMENT text inside a source block, and nothing else.
+
+    The `#9063` note lives in comments; the two function names it must cite live
+    in the SET ROWS (`"calibrate_summary",` is itself a string element of the
+    literal). Searching the block as plain text therefore cannot tell the note
+    from the rows: deleting the whole note while keeping the rows left the
+    positive half of the symbol pin green, i.e. the exact failure it exists to
+    prevent (a reader who cannot re-verify the note deletes the rows) was
+    unguarded on the symbol side. Resolving the anchor against COMMENT tokens
+    only makes that deletion red.
+
+    Tokenizes with `tokenize`, so a `#` inside a string literal is not a
+    comment and a `#9063`-shaped string element cannot be mistaken for one.
+    """
+    comments: list[str] = []
+    for token in tokenize.generate_tokens(io.StringIO(block_source).readline):
+        if token.type == tokenize.COMMENT:
+            comments.append(token.string.lstrip("#"))
+    return "\n".join(comments)
+
+
 def _string_constants(node) -> list[str]:
     """Every string literal inside `node` (f-string fragments included)."""
     return [sub.value for sub in ast.walk(node)
@@ -1045,6 +1100,18 @@ def _local_bindings(func) -> dict[str, list[ast.expr]]:
                     bound.setdefault(target.id, []).append(node.value)
         elif (isinstance(node, ast.AnnAssign) and node.value is not None
               and isinstance(node.target, ast.Name)):
+            bound.setdefault(node.target.id, []).append(node.value)
+        elif (isinstance(node, ast.AugAssign)
+              and isinstance(node.target, ast.Name)):
+            # `query += f" LIMIT {int(limit)}"` — an APPEND to the statement, and
+            # `_uncalibrated_ep_participants` (one of the two rows this helper
+            # exists to check) builds its statement exactly that way. Without
+            # this arm the augmented fragment was never inspected, so
+            # `query += " SET n.poked = 1"` produced NO offender: the read shape
+            # was still satisfied by the plain assignments above it and the pin
+            # stayed green while the statement wrote. Same arm, same reason, as
+            # `_bound_names` (line ~511) — the census's own walker already had
+            # it, so this helper was the narrower of the two.
             bound.setdefault(node.target.id, []).append(node.value)
     return bound
 
@@ -1073,12 +1140,25 @@ def _assembled_statement_fragments(func, call: ast.Call) -> list[str]:
 
 
 def _handle_query_calls(func) -> list[ast.Call]:
-    """Every `proj.g.query(...)`-shaped call in `func` — its handle reach."""
+    """Every `<handle>.<verb>(...)`-shaped call in `func` — its handle reach.
+
+    ALIAS-AWARE, like `enumerate_handle_surface`: the census resolves
+    `h = proj.g; h.query(...)`, so a receiver-name-only check here would let a
+    SECOND reach hide behind the "found 1 call" assertion in
+    `test_the_calibration_readers_assemble_no_write_clause` — the assertion
+    that is the whole point of the pin would be the thing that misses it.
+    Bindings are collected in SOURCE ORDER (the census visits in order too), so
+    an alias counts only for the calls below its binding.
+    """
+    aliases: set[str] = set()
+    for node in sorted(ast.walk(func),
+                       key=lambda sub: getattr(sub, "lineno", 0)):
+        _bind_handle_aliases(node, aliases)
     return [node for node in ast.walk(func)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in _HANDLE_MUTATING_VERBS
-            and _is_handle_ref(node.func.value, aliases=set())]
+            and _is_handle_ref(node.func.value, aliases)]
 
 
 def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
@@ -1087,8 +1167,14 @@ def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
     NON-VACUITY: the note as first committed carried `(sdk.py:23143)` and
     `(sdk.py:23531)`, so a `sdk.py:<n>` anchor in the `_UNRESOLVED` block reds
     this test. The positive half is what makes the note verifiable at all: both
-    function names must appear, because the symbol is the only anchor that
-    survives `sdk.py` moving under it.
+    function names must appear IN THE COMMENT TEXT, because the symbol is the
+    only anchor that survives `sdk.py` moving under it.
+
+    ⛔ The positive half reads COMMENTS, not the block's raw text: the two rows
+    are themselves string elements (`"calibrate_summary",`), so a plain
+    `name in block` was satisfied by the inventory the note is ABOUT — deleting
+    the whole note kept it green. `_comments_in` is what makes deleting the note
+    red; `test_the_symbol_pin_reads_the_comment_not_the_rows` holds that line.
     """
     block = _unresolved_block_source()
     anchors = _SDK_LINE_ANCHOR.findall(block)
@@ -1099,31 +1185,56 @@ def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
         "(measured on this note: 268 lines off, landing in a writer). Cite the "
         "function by NAME — the symbol is authoritative, the number is not:"
         f"\n  {block}")
-    missing = [name for name, _shape in _CALIBRATION_READERS if name not in block]
+    note = _comments_in(block)
+    missing = [name for name, _shape in _CALIBRATION_READERS if name not in note]
     assert not missing, (
         "the note no longer names the function(s) it is the hand-check FOR "
         f"({missing}) — without the symbol the note anchors at nothing and a "
-        "reader cannot re-verify it, which is exactly how it rotted before")
+        "reader cannot re-verify it, which is exactly how it rotted before. "
+        "The names must be in the COMMENT, not only in the set rows: a reader "
+        "who cannot re-verify the note deletes the rows. Comments seen:"
+        f"\n  {note}")
 
 
-def test_the_calibration_readers_assemble_no_write_clause():
-    """Re-derive the note's claim from `sdk.py`: one handle READ each, no write.
+def test_the_symbol_pin_reads_the_comment_not_the_rows():
+    """NON-VACUITY for the symbol pin: the ROWS alone must not satisfy it.
 
-    The claim is not decorative — it is the entire reason these two functions
-    are in `_UNRESOLVED` (``statement not provably read-only``) instead of being
-    declared writers. Checked mechanically so a later edit that adds a `SET` to
-    one of them reds HERE (and forces the row to be re-examined) instead of
-    rotting the note into a false claim.
-
-    Every fragment that can reach the assembled statement is inspected, because
-    the reason the census could not settle these is that the `WHERE` text is
-    built in a LOCAL and interpolated — the same indirection is followed here.
+    The exact defect the P2 review found: `_unresolved_block_source()` returns
+    the whole set literal, whose elements ARE the two names, so the pin was
+    green with the entire `#9063` note deleted. This is that state, built by
+    hand: two declared rows, no comment. Under the fix `_comments_in` sees no
+    names and the pin would red; under the old `name in block` both names are
+    "present" and it would stay green.
     """
-    module = ast.parse(SDK_PY.read_text(), str(SDK_PY))
-    functions = {node.name: node for node in ast.walk(module)
-                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    rows_only = (
+        '_UNRESOLVED = {\n'
+        '    "calibrate_summary",\n'
+        '    "_uncalibrated_ep_participants",\n'
+        '}\n')
+    note = _comments_in(rows_only)
+    assert note == "", f"the block has no comments, yet {note!r} was read"
+    assert [name for name, _s in _CALIBRATION_READERS if name not in note], (
+        "the symbol pin is satisfied by the SET ROWS alone — deleting the "
+        "#9063 note would leave it green, which is the failure it exists to "
+        "prevent")
+    # …and the note, once present, IS what satisfies it.
+    with_note = rows_only.replace(
+        "_UNRESOLVED = {",
+        "# `calibrate_summary` and `_uncalibrated_ep_participants` are reads.\n"
+        "_UNRESOLVED = {")
+    assert not [name for name, _s in _CALIBRATION_READERS
+                if name not in _comments_in(with_note)]
+
+
+def _calibration_read_offenders(functions, readers=_CALIBRATION_READERS,
+                                ) -> list[str]:
+    """The per-row checks of the note, over `functions` (name -> def node).
+
+    Extracted so the synthetic non-vacuity tests can run the SAME code on a
+    hand-built function instead of asserting against a copy of it.
+    """
     offenders: list[str] = []
-    for name, read_shape in _CALIBRATION_READERS:
+    for name, read_shape in readers:
         func = functions.get(name)
         if func is None:
             offenders.append(f"{name}: no such function in tortoise/sdk.py")
@@ -1136,10 +1247,10 @@ def test_the_calibration_readers_assemble_no_write_clause():
                 "trusting either")
             continue
         assembled = " ".join(_assembled_statement_fragments(func, calls[0]))
-        write = _WRITE_CLAUSE_RE.search(assembled)
+        write = _assembled_write_evidence(assembled)
         if write:
             offenders.append(
-                f"{name}: the assembled statement carries {write.group(0)!r} — "
+                f"{name}: the assembled statement carries {write} — "
                 "this row is not a read any more")
         if read_shape not in assembled:
             offenders.append(
@@ -1154,10 +1265,124 @@ def test_the_calibration_readers_assemble_no_write_clause():
             offenders.append(
                 f"{name}: CALLS `set_point_baseline` — the note says it only "
                 "names it in advice strings, so this row DOES write")
+    return offenders
+
+
+def test_the_calibration_readers_assemble_no_write_clause():
+    """Re-derive the note's claim from `sdk.py`: one handle READ each, no write.
+
+    The claim is not decorative — it is the entire reason these two functions
+    are in `_UNRESOLVED` (``statement not provably read-only``) instead of being
+    declared writers. Checked mechanically so a later edit that adds a `SET` to
+    one of them reds HERE (and forces the row to be re-examined) instead of
+    rotting the note into a false claim.
+
+    Every fragment that can reach the assembled statement is inspected, because
+    the reason the census could not settle these is that the `WHERE` text is
+    built in a LOCAL and interpolated — the same indirection is followed here,
+    INCLUDING an append (`query += …`), which is how
+    `_uncalibrated_ep_participants` finishes its statement.
+    """
+    module = ast.parse(SDK_PY.read_text(), str(SDK_PY))
+    functions = {node.name: node for node in ast.walk(module)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    offenders = _calibration_read_offenders(functions)
     assert not offenders, (
         "the hand-check note above `_UNRESOLVED` no longer matches the code it "
         "describes — fix the note, or move the row out of that inventory:\n  "
         + "\n  ".join(offenders))
+
+
+def test_the_write_pin_sees_a_write_appended_with_augassign():
+    """NON-VACUITY for the `ast.AugAssign` arm of `_local_bindings` (P1).
+
+    `_uncalibrated_ep_participants` builds its statement with `query = …` in an
+    `if`/`else` and finishes it with `query += …`. Without an `ast.AugAssign`
+    arm the appended fragment was never inspected, so a write added THAT way
+    produced no offender while the stated read shape stayed satisfied by the
+    plain assignments — the join in `_assembled_statement_fragments` simply
+    never saw it, so the pin stayed green over a writing row. This is that
+    shape, declared read-only on the first two fragments and writing on the
+    third, which is precisely how the real function is laid out.
+    """
+    source = '''
+class Door:
+    def reading(self, proj, ids, *, limit=None):
+        where = f"WHERE n.id IN $ids"
+        query = f"MATCH (n:Point) WHERE {where} RETURN n.id"
+        if limit is not None:
+            query += " SET n.poked = 1"
+        return proj.g.query(query, params={"ids": ids}).result_set
+'''
+    functions = {node.name: node for node in ast.walk(ast.parse(source))
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    offenders = _calibration_read_offenders(
+        functions, (("reading", "RETURN n.id"),))
+    assert any("not a read any more" in offender for offender in offenders), (
+        "a write appended with `query += …` produced no offender, so the note "
+        f"can rot false with nothing red (offenders={offenders})")
+
+    # …and the polarity holds: the same function with a READ-only append is clean.
+    clean = source.replace('" SET n.poked = 1"', 'f" LIMIT {int(limit)}"')
+    clean_functions = {
+        node.name: node for node in ast.walk(ast.parse(clean))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert not _calibration_read_offenders(
+        clean_functions, (("reading", "RETURN n.id"),)), (
+        "a read-only `query += …` must not red the pin")
+
+
+def test_the_write_pin_uses_the_shared_write_classifier():
+    r"""NON-VACUITY for the #3595 rule: no local notion of "write" (review P1).
+
+    The pin first declared its own clause regex, which disagreed with the
+    runtime door in BOTH directions: it was case-sensitive and had no
+    `FOREACH`/`DROP`, so three real writes were invisible to it; and it lacked
+    the `(?<![\w.$:])` lookbehind, so a property named like a keyword reddened
+    it on a well-formed READ (#7174's false refusal, one layer out).
+    """
+    invisible_to_a_local_regex = {
+        "lower-case clause":
+            "MATCH (n:Point) WHERE n.id IN $ids set n.ep = 1 RETURN n.id",
+        "FOREACH body":
+            "MATCH (n:Point) FOREACH (x IN [1] | SET n.ep = 1) RETURN n.id",
+        "DROP": "MATCH (n:Point) RETURN n.id DROP INDEX ON :Point(id)",
+        "write PROCEDURE":
+            "MATCH (n:Point) RETURN n.id CALL "
+            "db.idx.fulltext.createNodeIndex('Point','content')",
+    }
+    for label, statement in invisible_to_a_local_regex.items():
+        assert _assembled_write_evidence(statement) is not None, (
+            f"{label}: `_statement_writes` calls this a write but the pin did "
+            f"not flag it — {statement!r}")
+    read_with_a_keyword_property = (
+        "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id, n.SET, n.DROP")
+    assert _assembled_write_evidence(read_with_a_keyword_property) is None, (
+        "a READ whose property names look like clauses was flagged as a write "
+        "— the canonical classifier excludes `n.SET`/`n.DROP` (#7174), so a "
+        "local regex without that lookbehind would false-red this pin")
+
+
+def test_the_handle_reach_count_follows_an_alias():
+    """NON-VACUITY for the alias arm of `_handle_query_calls` (review P1).
+
+    The census resolves `h = proj.g; h.query(…)`; a receiver-name-only check
+    here would see only ONE reach in the function below and the "found 1 call"
+    assertion would pass while the second statement — the one a write would be
+    added to — stayed uninspected.
+    """
+    source = '''
+class Door:
+    def reading(self, proj):
+        proj.g.query("MATCH (n:Point) RETURN n.id")
+        h = proj.g
+        h.query("MATCH (n:Point) RETURN n.id")
+'''
+    func = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef))
+    assert len(_handle_query_calls(func)) == 2, (
+        "the handle reach through the alias `h` was not counted, so a second "
+        "statement (and any write added to it) is invisible to the pin")
 
 
 def test_every_live_declared_door_is_journal_first():
