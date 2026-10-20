@@ -1,0 +1,70 @@
+name: registry-backup-cron
+
+# Per-team knowledge-graph backup driver (#596). External driver with an
+# independent failure domain: an OOM crash-loop (#545) or a silently skipped
+# workflow must not blind the pipeline — the driver's DIRECT R2 freshness
+# check (aws CLI) covers the app-down leg, and the in-process staleness
+# daemon (driver-disabled leg) covers this workflow being disabled.
+
+on:
+  schedule:
+    - cron: '17 * * * *'   # hourly, off top-of-hour (GH jitter absorbed by thresholds)
+  workflow_dispatch:
+    inputs:
+      run_now:
+        type: boolean
+        description: Run the sweep now (staging/ops)
+        default: false
+      simulate_app_down:
+        type: boolean
+        description: Point the pre-flight at a dead URL (staging E2E)
+        default: false
+
+permissions:
+  contents: read
+  issues: write          # GITHUB_TOKEN files/closes APP_DOWN etc.; no PAT on GH
+
+concurrency:
+  group: registry-backup
+  cancel-in-progress: false   # scheduled runs never overlap
+
+jobs:
+  drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      INTERNAL_API_URL: ${{ secrets.INTERNAL_API_URL }}
+      FASTAPI_INTERNAL_KEY: ${{ secrets.FASTAPI_INTERNAL_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_REPO: daniel-ospina/tortoise
+      # Review finding (Config/R2b): Actions does NOT export GITHUB_TOKEN into
+      # step envs — the `permissions: issues: write` grant was dead because the
+      # driver read an empty GH_TOKEN and every incident POST/close 401'd, so
+      # the "loud" channel silently filed nothing.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BACKUP_STALE_THRESHOLD_MIN: "90"
+      BACKUP_DRIVER_DOWN_THRESHOLD_MIN: "240"
+      # #3146 review P2: Actions passes ONLY what is enumerated here, so the
+      # recovery-window knobs the runbook documents were unreachable in
+      # production (the driver's only caller is this job). Bind all three as
+      # repository VARIABLES (Settings → Secrets and variables → Actions →
+      # Variables, not Secrets) — an unset variable expands to the empty
+      # string, which `recovery_streak_for` treats as "no override", so the
+      # declared window stands until an operator deliberately sets one.
+      #   ALERT_RECOVERY_STREAK=1     → the fleet-wide "clear now" lever
+      #   ALERT_RECOVERY_STREAKS=…    → per-kind windows
+      #   BACKUP_POOL_RESOLVE_STREAK  → the legacy POOL_STALE-only alias
+      ALERT_RECOVERY_STREAK: ${{ vars.ALERT_RECOVERY_STREAK }}
+      ALERT_RECOVERY_STREAKS: ${{ vars.ALERT_RECOVERY_STREAKS }}
+      BACKUP_POOL_RESOLVE_STREAK: ${{ vars.BACKUP_POOL_RESOLVE_STREAK }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run backup driver
+        run: bash .github/scripts/registry-cron.sh
+        env:
+          SIMULATE_APP_DOWN: ${{ inputs.simulate_app_down }}
