@@ -29197,20 +29197,31 @@ def _registry_probe_key() -> tuple[str | None, str | None, str | None]:
     `_membership_role` answering EMPTY, i.e. a false 403 `Requires owner or admin
     role in team` where the caller IS the owner.
 
-    ⚠️ Scope, so the key is not credited with a separation it does not make: the
-    teardown reset in `tests/conftest.py::_process_global_isolation` closes the
-    handle after EVERY test (measured: the probe is None at 75/75 entries of the
-    two suites this fix names), so a cross-test hand-me-down is not the operator
-    those two suites show. It is NOT an impossibility: those sweeps run on
-    ABANDONED daemon threads — `run_on_daemon_worker` states plainly that
-    `wait_for` cancels the awaitable, not the thread (CPython #87185) — so a
-    `_sweep_events` build can land AFTER that reset and survive into the next
-    test; and for the non-pinning call sites below the key cannot tell such a
-    handle from a legitimate one. What the key separates is two store
-    configurations inside ONE handle's lifetime — a reconfiguration, or a
-    fixture that repins the store under a live handle — and it is a strict
-    refinement: a changed key can only force a rebuild, it can never reuse.
-    Residual recorded on #9334 rather than claimed closed here.
+    ⚠️ Scope, so the key is not credited with a separation it does not make.
+    The teardown reset in `tests/conftest.py::_process_global_isolation` closes
+    the handle after EVERY test, but it cannot close one that does not exist yet
+    when it runs: `_sweep_events` runs on an ABANDONED daemon worker —
+    `run_on_daemon_worker` states plainly that `wait_for` cancels the awaitable,
+    not the thread (CPython #87185) — so a probe built by that worker can land
+    AFTER the reset and be inherited by the NEXT test, which is a cross-test
+    hand-me-down the reset cannot prevent. Measured at this head, on the lane's
+    private container, at FILE scope: `tests/test_onboarding_endpoints.py` is
+    44 passed with this key and 1 failed / 43 passed with the key collapsed to
+    `(TORTOISE_DB_URI,)` — failing at `assert any(t["org_id"] == sub_org_id for
+    t in r4.json())`, the org just created through the live store absent from
+    `GET /v1/organizations` — and `tests/test_session_key_http.py` is 31 passed
+    vs 1 failed / 30 passed. Both named nodeids pass IN ISOLATION under either
+    key, so file scope is the reproduction; and the probe is None at 75/75 test
+    ENTRIES of the two suites, which is an entry measurement and cannot see a
+    build that lands after an entry.
+
+    What the key separates is two store configurations inside ONE handle's
+    lifetime — a reconfiguration, a fixture that repins the store under a live
+    handle, or a worker build that outlives the teardown reset — and it is a
+    strict refinement: a changed key can only force a rebuild, it can never
+    reuse. Residual on #9334 rather than claimed closed here: for the
+    non-pinning `_patch_tortoise_sdk_init` call sites below, the env cannot
+    distinguish such a handle from a legitimate one.
 
     So the key is a SET of ambient inputs, and each component is there for a
     DIFFERENT reason — stated precisely, because two of the three are not what

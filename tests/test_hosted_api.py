@@ -9418,6 +9418,19 @@ class TestUriRegistryProbeConnectionReuse:
         `_org_node`/`_membership_role` with EMPTY — the false 403 `Requires owner
         or admin role in team`.
 
+        ⚠️ The reproduction is FILE scope, and re-measured at this head on the
+        lane's private container: `tests/test_onboarding_endpoints.py` is
+        44 passed with this key and 1 failed / 43 passed with
+        `_registry_probe_key()` collapsed to `(TORTOISE_DB_URI,)`, failing at
+        `assert any(t["org_id"] == sub_org_id for t in r4.json())`;
+        `tests/test_session_key_http.py` is 31 passed vs 1 failed / 30 passed.
+        Both named nodeids pass IN ISOLATION under either key, so a green
+        isolated run is not evidence the key is unnecessary. The handle that
+        crosses the test boundary is built by `_sweep_events` on an ABANDONED
+        daemon worker (`run_on_daemon_worker`: `wait_for` cancels the awaitable,
+        not the thread), so it lands AFTER the teardown reset — the reset cannot
+        close what does not exist yet.
+
         The regression is stated as behaviour, not as a key comparison: after
         the store the process addresses changes, the probe must CONSTRUCT a new
         handle and close the old one. Reusing the old handle is the defect —
