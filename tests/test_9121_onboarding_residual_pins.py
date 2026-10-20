@@ -287,27 +287,6 @@ def _bindings(enclosing: ast.AST) -> list[tuple[ast.AST, ast.AST | None]]:
             if bound:
                 out.append((ast.Name(id=bound, ctx=ast.Store()), None))
     return out
-    out: list[tuple[ast.AST, ast.AST | None]] = []
-    for sub in ast.walk(enclosing):
-        if isinstance(sub, ast.Assign):
-            out.extend((target, sub.value) for target in sub.targets)
-        elif isinstance(sub, ast.AnnAssign):
-            out.append((sub.target, sub.value))
-        elif isinstance(sub, ast.AugAssign):
-            out.append((sub.target, None))
-        elif isinstance(sub, (ast.For, ast.AsyncFor)):
-            out.append((sub.target, sub.iter))
-        elif isinstance(sub, (ast.With, ast.AsyncWith)):
-            for item in sub.items:
-                if item.optional_vars is not None:
-                    out.append((item.optional_vars, item.context_expr))
-        elif isinstance(sub, ast.NamedExpr):
-            out.append((sub.target, sub.value))
-        elif isinstance(sub, ast.comprehension):
-            out.append((sub.target, sub.iter))
-        elif isinstance(sub, ast.ExceptHandler) and sub.name:
-            out.append((ast.Name(id=sub.name, ctx=ast.Store()), None))
-    return out
 
 
 def _is_select_graph(value: ast.AST | None) -> bool:
@@ -612,11 +591,18 @@ def _openers_in(
 def _projection_openers() -> set[str]:
     """The opener NAMES `tortoise/projection/__init__.py` defines (the inventory).
 
-    NAMES here, unlike the detector population above: this is ONE module, where a
-    duplicated function name is not a thing, and the bullet list a reader is
-    shown is a list of names. (The wide detector population must key on identity
-    precisely because its population spans modules — see
-    `_declaration_primitives()`.)
+    NAMES here, unlike the detector population above, because the bullet list a
+    reader is shown is a list of names.
+
+    ⛔ The justification is NOT "this module has no duplicate function names" —
+    it has ten, nested and same-scope (`_replay_seq` at two lines, `query`,
+    `wrapper`, `__init__` …; measured, #9150 review cycle 11, P2). It is that
+    every OPENER is a module-level `def` and no opener NAME is defined twice at
+    module level, which
+    `test_no_opener_name_is_defined_twice_in_the_inventory_module` pins —
+    otherwise a second function sharing an opener's name would be invisible here
+    (a set of names has no second slot), the same defect cycle 5 fixed for the
+    wide population by keying it on identity.
     """
     return {name for _rel, name in
             _openers_under(_REPO / "tortoise" / "projection" / "__init__.py")}
@@ -674,6 +660,58 @@ def _binding_parent(tree: ast.Module, call: ast.AST) -> ast.AST | None:
     return None
 
 
+def _scanned_modules() -> list[str]:
+    """Every module the escape-(3) inventory sweep reads: ALL of `tortoise/`.
+
+    ⛔ A NAMED POPULATION, because its width is the whole guarantee (#9150
+    review cycle 11, P2): the sentence this file pins is unqualified ("five call
+    sites"), so a sixth caller in any other module must be visible. While the
+    loop header was inline, narrowing it to the two modules that hold today's
+    sites — a plausible cleanup — left 17/17 green and let a planted sixth site
+    in `tortoise/selfhost.py` go unseen, so the guarantee held only as long as
+    nobody edited a `for` line. `test_the_inventory_scan_sweeps_every_module`
+    pins it against an independently computed `rglob`.
+    """
+    return sorted(str(p.relative_to(_REPO)) for p in (_REPO / "tortoise").rglob("*.py"))
+
+
+def test_the_inventory_scan_sweeps_every_module():
+    """The sweep's WIDTH is the guarantee — pin it, don't leave it in a `for`.
+
+    ⛔ Measured before this pin existed (#9150 review cycle 11, P2): narrowing
+    `_scanned_modules()` to the two modules that hold today's sites —
+    `("tortoise/sdk.py", "tortoise/hosted_api.py")`, a plausible cleanup — left
+    17/17 green, and with that narrowing a sixth site planted in
+    `tortoise/selfhost.py` (a door the plan doc itself names) stayed invisible
+    while the shipped file on the same tree red. The `rglob` is recomputed HERE,
+    independently, so the narrowing reds.
+    """
+    scanned = _scanned_modules()
+    on_disk = sorted(
+        str(path.relative_to(_REPO))
+        for path in (_REPO / "tortoise").rglob("*.py")
+    )
+    assert scanned == on_disk, (
+        "the escape-(3) inventory no longer sweeps every module under `tortoise/` "
+        f"— unscanned: {sorted(set(on_disk) - set(scanned))}. A sixth "
+        "`eager_init_query()` site in one of those modules would leave the note "
+        "in `onboarding/state.py` stale with every pin green (#9157)"
+    )
+    # …and the width must actually be WIDER than the modules that hold today's
+    # sites, or the sweep is a formality: `selfhost.py` is the door the plan doc
+    # names, so it stands for the class of files a hardcoded pair would drop.
+    site_modules = {rel for rel, _func in _ESCAPE3_CALL_SITES}
+    assert "tortoise/selfhost.py" in scanned, (
+        "`tortoise/selfhost.py` — named as a door by the plan doc — is not "
+        f"scanned for eager-init sites: {scanned[:3]}…"
+    )
+    assert len(scanned) > len(site_modules) * 10, (
+        f"the sweep covers {len(scanned)} modules for {len(site_modules)} "
+        "site modules — if that gap closes, this pin is no longer the width "
+        "check it claims to be"
+    )
+
+
 def _eager_init_sites() -> dict[tuple[str, str], int]:
     """(file, enclosing function) -> count, read off the production source."""
     sites: dict[tuple[str, str], int] = {}
@@ -682,9 +720,7 @@ def _eager_init_sites() -> dict[tuple[str, str], int]:
     # any other module must be visible. The defining module builds the STRING and
     # issues nothing, so it is skipped by the enclosing-function shape, not by a
     # file allow-list.
-    for rel in sorted(
-        str(p.relative_to(_REPO)) for p in (_REPO / "tortoise").rglob("*.py")
-    ):
+    for rel in _scanned_modules():
         tree, parents = _parse(rel)
         for node, _call, _targets in _eager_init_calls(tree):
             enclosing = _enclosing_function(node, parents)
@@ -1201,6 +1237,61 @@ def test_the_opener_inventory_is_pinned_so_a_new_lane_moves_this_file():
     )
 
 
+def test_no_opener_name_is_defined_twice_in_the_inventory_module():
+    """Why NAMES suffice for the inventory: no opener name is defined twice.
+
+    ⛔ `_projection_openers()` used to justify keying on names with "this is ONE
+    module, where a duplicated function name is not a thing" — which the module
+    contradicts (#9150 review cycle 11, P2): it defines ten duplicated names,
+    including same-scope pairs (`_replay_seq`, `_replay_mint_seq`, `query` at two
+    lines, `wrapper`, `__init__`). The real reason names suffice is narrower and
+    checkable: every OPENER is a module-level `def` and no opener
+    NAME appears twice at module level. Without this pin a second function
+    sharing an opener's name would be invisible to the inventory — a set of names
+    has no second slot — which is the cycle-5 defect one scope narrower.
+    """
+    rel = "tortoise/projection/__init__.py"
+    tree, _parents = _parse(rel)
+    module_level: dict[str, list[int]] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            module_level.setdefault(node.name, []).append(node.lineno)
+
+    openers = _projection_openers()
+    assert openers <= set(module_level), (
+        "an opener in this inventory is not a module-level `def` — names are "
+        f"then not enough to identify it: {sorted(openers - set(module_level))}"
+    )
+    duplicated = {
+        name: lines for name, lines in module_level.items()
+        if name in openers and len(lines) > 1
+    }
+    assert not duplicated, (
+        f"an OPENER name is defined twice at module level: {duplicated}. The "
+        "second definition is invisible to `_projection_openers()` (a set of "
+        "names), so a lane declared there would leave the bullet list in this "
+        "module and the note in `onboarding/state.py` claiming an inventory it "
+        "no longer has (#9157). Key the inventory on identity before allowing "
+        "this — the detector population already does."
+    )
+    # …and the module really does contain duplicated names, so this pin is
+    # measuring a property of the OPENERS and not of the module: if that ever
+    # stops being true, the docstring above is stale rather than the rule.
+    # …and the module really does contain duplicated names IN SOME SCOPE, so this
+    # pin measures a property of the OPENERS rather than of the file: if that ever
+    # stops being true, the docstring above is stale rather than the rule. (All
+    # ten measured duplicates are nested — `_replay_seq` twice inside one class —
+    # which is exactly why "module level" has to be the qualifier.)
+    every_scope: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            every_scope[node.name] = every_scope.get(node.name, 0) + 1
+    assert any(count > 1 for count in every_scope.values()), (
+        "this module no longer has ANY duplicated function name, so the "
+        "docstring's distinction (duplicates exist, but not of openers) is stale"
+    )
+
+
 def test_the_detector_population_is_pinned_by_content():
     """The DETECTOR population needs a content anchor of its own.
 
@@ -1569,9 +1660,13 @@ def test_a_diff_to_the_note_itself_selects_this_file():
     * the two `docs/` records that
       `test_the_plan_doc_and_the_storage_ledger_carry_the_residual` reads, whose
       ONLY wiring is the two `SOURCE_PATTERNS["onboarding"]` entries added for
-      this file: delete one and the pin silently stops running on the record it
-      guards (nothing reds — `test_every_source_pattern_is_selectable` checks
-      entry → runs, never the removal direction).
+      this file. ⛔ Deleting one does NOT go unnoticed (#9150 review cycle 11,
+      P2 — this parenthetical claimed "nothing reds", which is false): a
+      `tools/ci_selection.py` diff selects the FULL matrix, so this pin runs and
+      reds on the removal, because both docs are in `subjects` below.
+      `test_every_source_pattern_is_selectable` alone cannot see a removal —
+      it checks entry → runs, never the other direction — which is exactly why
+      the two docs are in `subjects`.
     """
     from tools.ci_selection import load_manifest, select
 
