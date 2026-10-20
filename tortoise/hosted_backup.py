@@ -327,6 +327,23 @@ _DUMP_PAGE_SIZE = 1000
 #: which cannot produce the phantom — finds no node at all; see
 #: ``_graph_has_any_node``.
 #:
+#: The probe's OWN statement has its own measured row set (same v6 core, 60002;
+#: absent graph vs empty-but-PRESENT graph):
+#:
+#:     statement                                          absent   present
+#:     keyset page (id(n) >= 0 … RETURN id(n),…)          [[0,[],{}]]  []
+#:     MATCH (n) RETURN id(n) LIMIT 1  (shipped probe)     []       []
+#:     MATCH (n) RETURN count(n)                          [[0]]    [[0]]
+#:
+#: Two consequences, and both are why the probe has this exact shape. The
+#: phantom belongs to the keyset PROJECTION, not to `MATCH (n)` as a clause —
+#: the probe projects `id(n)` too and still answers 0 rows on the absent graph,
+#: so it is measured, not assumed, that a `MATCH (n)` that never pages cannot
+#: fabricate the phantom. And the aggregate CANNOT serve as the probe: `count(n)`
+#: answers one `0` row in BOTH cases, so it cannot tell an absent graph from an
+#: empty-present one — existence here must be judged by ROWS RETURNED, not by a
+#: count. Do not "simplify" the probe to `count(n)` without re-measuring this.
+#:
 #: ⚠️ The phantom is MEASURED on the NODE read ONLY, so the guard is deliberately
 #: scoped to it. On the same absent graph, 60002 answers the EDGE page
 #: (``_DUMP_EDGE_PAGE_QUERY``) and the reconcile ``id(n) IN $ids`` read with 0
@@ -425,12 +442,18 @@ def _graph_has_any_node(g) -> bool:
     """True when the graph holds at least one node — one row, never a phantom.
 
     The probe is deliberately ``MATCH (n)`` and NOT the keyset predicate: on v6
-    (``60002``, measured) ``id(n) >= 0`` fabricates a ``(0, [], {})`` row for a
-    graph ABSENT from the engine registry, while ``MATCH (n)`` answers 0 rows for
-    BOTH the absent graph and the empty-but-present one. ``dump_graph`` skips the
-    node page only on that 0-row answer, so the skip cannot hide real nodes —
-    including the bookkeeping nodes an exclusion count would otherwise report as
-    0. A node created after this probe is caught by the post-read check below.
+    (``60002``, MEASURED — see the matrix in ``_DUMP_NODE_PAGE_QUERY``'s notes)
+    ``id(n) >= 0`` fabricates a ``(0, [], {})`` row for a graph ABSENT from the
+    engine registry, while THIS statement — measured verbatim, not assumed from
+    the clause's shape — answers 0 rows for BOTH the absent graph and the
+    empty-but-present one. ``dump_graph`` skips the node page only on that 0-row
+    answer, so the skip cannot hide real nodes — including the bookkeeping nodes
+    an exclusion count would otherwise report as 0. A node created after this
+    probe is caught by the post-read check below.
+
+    The verdict is the RESULT SET's emptiness (``bool``), never an aggregate:
+    ``MATCH (n) RETURN count(n)`` is measured to answer one ``0`` row in BOTH
+    cases, so it would answer True for an empty graph and never skip anything.
     """
     return bool(g.query(_NODE_EXISTS_QUERY).result_set)
 
@@ -519,9 +542,11 @@ def dump_graph(g, graph_name: str | None = None) -> dict:
     # `MATCH (n)` returns nothing and the aggregate counts 0 nodes. Paging such a
     # graph would export that phantom as a node (`node_count: 1`, then
     # `restore_graph` materialises it), and `len(nodes) < source_node_count` is
-    # one-sided so the guard would not catch it. The probe is `MATCH (n)` because
-    # only that form is phantom-free; it also keeps a bookkeeping-only graph on the
-    # normal path, so `excluded_node_count` still reports its exclusions.
+    # one-sided so the guard would not catch it. The probe is the `MATCH (n)`
+    # statement itself (measured 0 rows on 60002, absent AND empty-present — the
+    # matrix is in `_DUMP_NODE_PAGE_QUERY`'s notes); it also keeps a
+    # bookkeeping-only graph on the normal path, so `excluded_node_count` still
+    # reports its exclusions.
     #
     # The probe gates the NODE page alone, and that is measured rather than
     # assumed: on the same absent graph the EDGE page and the reconcile read both

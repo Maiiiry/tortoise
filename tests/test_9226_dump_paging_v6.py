@@ -215,6 +215,19 @@ class _AbsentGraphV6:
     0 — otherwise the phantom is exported as a node, and `restore_graph`
     materialises it.
 
+    The PROBE's own statement was measured on the same core, absent graph vs
+    empty-but-PRESENT graph (create + delete), because the phantom belongs to the
+    keyset PROJECTION and it is the projected ``id(n)`` that fabricates it:
+
+        keyset page (``id(n) >= 0 … RETURN id(n), …``)   [[0, [], {}]]   []
+        ``MATCH (n) RETURN id(n) LIMIT 1``  (the probe)   []              []
+        ``MATCH (n) RETURN count(n)``                    [[0]]           [[0]]
+
+    So the probe answers 0 rows for BOTH empty states, and the aggregate CANNOT
+    replace it (one ``0`` row in both, which would answer True and never skip —
+    the phantom would ship). A probe rewritten to an aggregate reds here: the
+    statement would match no branch below and RAISE.
+
     The phantom is NODE-only, measured: on the same absent graph the engine
     answers the EDGE page (``_DUMP_EDGE_PAGE_QUERY``) and the reconcile
     ``id(n) IN $ids`` read with 0 rows, and the ``id(n) = $id`` liveness probe
@@ -246,7 +259,9 @@ class _AbsentGraphV6:
         if "GraphEventMeta" in cypher:
             return _Result([])             # no counter node (never emitted)
         if "MATCH (n) RETURN id(n) LIMIT 1" in cypher:
-            return _Result([])             # the probe: phantom-free, MEASURED
+            # The probe — measured [] on the absent graph AND on the
+            # empty-but-present one (see the class docstring's matrix).
+            return _Result([])
         raise AssertionError(f"unmodelled statement: {cypher}")
 
 
