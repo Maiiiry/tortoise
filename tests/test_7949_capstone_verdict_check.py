@@ -969,18 +969,92 @@ def test_a_completed_run_does_not_blame_the_preregistration_it_just_read():
                for r in rows)
     assert {r["sha"] for r in rows} == {"a" * 40}
     assert {r["corpus_sha256"] for r in rows} == {"b" * 64}
-    # The sibling link stays (E1/E2 share one corpus) and E4 carries its receipt.
+    # The sibling link stays (E1/E2 share one corpus) and E4 carries its receipt
+    # in BOTH the row's numbers and its note.
     assert by_id["E1"]["sibling"] == "E2" and by_id["E2"]["sibling"] == "E1"
     assert "14/15" in by_id["E4"]["note"], by_id["E4"]["note"]
+    assert (by_id["E4"]["numerator"], by_id["E4"]["denominator"]) == (14, 15)
 
 
-def test_e4_receipt_flags_the_four_edge_denominator():
-    """E4's row fails when the denominator is 4 — the historical defect."""
+def test_e4_receipt_flags_the_four_denominator():
+    """E4's row fails when the denominator is 4 — the historical defect.
+
+    ⛔ The flag is named for the NUMBER (`denominator_is_4`), not for the
+    cause. E4's row is phrased over the 15-edge operator gold, but this surface
+    measures the S4 merge's ITEM accounting; a name claiming "the 4-edge defect"
+    would assert a quantity the receipt cannot see (#9089 review).
+    """
     receipt = probe.e4_receipt({"s4_merge": {"s2_items": 4, "kept_from_s2": 4}})
-    assert receipt["denominator_is_the_4_edge_defect"] is True
+    assert receipt["denominator_is_4"] is True
+    assert "denominator_is_the_4_edge_defect" not in receipt, (
+        "the flag must not claim a quantity (edges) this surface cannot measure")
     ok = probe.e4_receipt({"s4_merge": {"s2_items": 15, "kept_from_s2": 14}})
-    assert ok["denominator_is_the_4_edge_defect"] is False
+    assert ok["denominator_is_4"] is False
     assert (ok["numerator"], ok["denominator"]) == (14, 15)
+
+
+def _completed_record(receipt: dict) -> dict:
+    """The table a COMPLETED run emits, as the gate receives it."""
+    rows = probe.completed_rows(head="a" * 40, corpus_sha="b" * 64,
+                                receipt=receipt)
+    return {
+        "schema": cvc.SCHEMA, "issue": 9080, "epic": 7949, "head": "a" * 40,
+        "prereg": {"sha": "a" * 40, "status": "OK", "artifact": "x"},
+        "corpus": {"path": "corpus.json", "sha256": "b" * 64, "turns": 3},
+        "run": {"status": "COMPLETED", "reason": "eight steps observed",
+                "steps_observed": list(cvc.STEPS),
+                "steps_required": list(cvc.STEPS), "e4_receipt": receipt},
+        "rows": rows,
+    }
+
+
+def test_a_completed_run_carries_E4s_receipt_numbers_into_the_row():
+    """REGRESSION (#9089 review, P2): E4's row carried `None`/`None` while the
+    receipt that decides E4 sat in `run.e4_receipt` and in the row's NOTE.
+
+    V10 fires on the ROW's denominator, so on the only table this probe can
+    produce (verdict BLOCKED, evidence owned by another lane) the criterion's
+    own failing condition was unreachable. Non-vacuity: before the fix the two
+    asserts below read `None` — the numbers existed in the same log, unread.
+    """
+    receipt = probe.e4_receipt({"s4_merge": {"s2_items": 15,
+                                           "kept_from_s2": 14}})
+    by_id = {r["criterion"]: r for r in
+             probe.completed_rows(head="a" * 40, corpus_sha="b" * 64,
+                                  receipt=receipt)}
+    assert (by_id["E4"]["numerator"], by_id["E4"]["denominator"]) == (14, 15)
+    # The other four criteria have no receipt on this surface — a fabricated
+    # zero would read as a measurement.
+    assert all(r["numerator"] is None and r["denominator"] is None
+               for cid, r in by_id.items() if cid != "E4")
+
+
+def test_a_completed_E4_with_the_four_denominator_reds_the_gate():
+    """REGRESSION (#9089 review, P2): the gate must refuse E4 on the table the
+    PROBE produces, not only on a hand-written GREEN row.
+
+    V10 required `verdict in (GREEN, RED)`, and every row of a completed run is
+    `BLOCKED` (E4's evidence artifact belongs to #9077) — so the rule was
+    unreachable on the shipped producer's own output. Non-vacuity: measured
+    before the fix, this record returned rc=0 "structurally sound" with
+    `denominator_is_4: true` sitting unread in the same log.
+    """
+    four = probe.e4_receipt({"s4_merge": {"s2_items": 4, "kept_from_s2": 4}})
+    assert "V10" in _codes(_completed_record(four))
+    # A legitimately larger merge is not the defect.
+    ok = probe.e4_receipt({"s4_merge": {"s2_items": 15, "kept_from_s2": 14}})
+    assert "V10" not in _codes(_completed_record(ok))
+
+
+def test_a_row_and_its_e4_receipt_that_disagree_is_a_finding():
+    """E4 is decided by ONE number: the row and the run's receipt are two
+    copies of it, so a hand-edit of either must not pick the verdict."""
+    receipt = probe.e4_receipt({"s4_merge": {"s2_items": 15,
+                                           "kept_from_s2": 14}})
+    rec = _completed_record(receipt)
+    e4 = next(r for r in rec["rows"] if r["criterion"] == "E4")
+    e4["denominator"] = 50          # the row edited away from the receipt
+    assert "V10" in _codes(rec)
 
 
 def test_the_e3_census_instrument_is_not_shipped_unwired():

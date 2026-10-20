@@ -253,9 +253,13 @@ def e4_receipt(stats: dict) -> dict:
 
     E4's row *"fails if the denominator is 4"*: the historical defect ran the
     merge over only 4 of the 15 edges reachable on the real extraction leg, so
-    a receipt whose denominator is 4 is the defect re-appearing, not a
-    measurement. The receipt is carried verbatim so the check reads the same
-    numbers the pipeline emitted.
+    a 4 denominator is the number the row refuses. ⚠️ What THIS surface can
+    measure is the merge's item accounting — `kept_from_s2` items carried of
+    the `s2_items` handed in — not the 15-edge operator gold the row is phrased
+    over; the edge denominator arrives with #9077's wired leg, and until then
+    the receipt must not be read as "the 4-edge defect re-appeared". The
+    numbers are carried verbatim into E4's row so the gate reads the same ones
+    the pipeline emitted.
     """
     merge = stats.get("s4_merge") or {}
     den = int(merge.get("s2_items") or 0)
@@ -267,7 +271,16 @@ def e4_receipt(stats: dict) -> dict:
         "corrected_by_s4": merge.get("corrected_by_s4"),
         "verbatim_reemissions": merge.get("verbatim_reemissions"),
         "added_by_s4": merge.get("added_by_s4"),
-        "denominator_is_the_4_edge_defect": den == 4,
+        # ⛔ Named for the NUMBER it tests, not for a cause it cannot see.
+        # E4's row says it *fails if the denominator is 4* (the historical
+        # defect's number), and a 4 is refused whatever the quantity counts.
+        # But this surface measures the S4 merge's ITEM accounting
+        # (`_s4_merge_stats`: items handed to the merge / items it carried),
+        # not the 15-EDGE operator gold E4's row is phrased over — the edge
+        # denominator needs #9077's wired leg. So the flag may not be read as
+        # "the 4-edge defect re-appeared": it says "this measurement's
+        # denominator is the number E4 refuses", which is the row's own rule.
+        "denominator_is_4": den == 4,
     }
 
 
@@ -356,6 +369,11 @@ def completed_rows(*, head: str, corpus_sha: str,
     Factored out of ``main()`` because G6 is unreachable while #9116 keeps the
     receipt witnessless: a fix that only lives inside dead code is a fix
     nothing can pin.
+
+    E4 alone carries ``numerator``/``denominator`` (from ``receipt``). The other
+    four criteria have no receipt on this surface yet, and a fabricated zero
+    would read as a measurement; E4's numbers are the ones the run actually
+    computed, so they belong in the row the gate reads.
     """
     rows: list[dict] = []
     for cid in ("E1", "E2", "E3", "E4", "E5"):
@@ -364,7 +382,16 @@ def completed_rows(*, head: str, corpus_sha: str,
             "criterion": cid, "verdict": "BLOCKED",
             "evidence_kind": "measurement",
             "evidence": str(EVIDENCE_DIR / "capstone.log"), "sha": head,
-            "numerator": None, "denominator": None, "corpus_sha256": corpus_sha,
+            # ⛔ E4's row carries the receipt's OWN numbers. `numerator` /
+            # `denominator` used to be None for every row while the receipt sat
+            # in `run.e4_receipt` and in the note — so the gate's V10 ("a
+            # measured E4 whose denominator is 4 is the defect") could not fire
+            # on the only table this probe can produce: the one number that
+            # decides E4 was written in three places and read from none. The
+            # row is the number's home; `check()` reads it from here.
+            "numerator": receipt["numerator"] if cid == "E4" else None,
+            "denominator": receipt["denominator"] if cid == "E4" else None,
+            "corpus_sha256": corpus_sha,
             "sibling": None, "blocked_by": owner,
             "note": "the run completed all eight steps; this criterion's "
                     "evidence artifact is still owned by " + owner,
@@ -380,8 +407,8 @@ def completed_rows(*, head: str, corpus_sha: str,
             row["note"] += (f"; receipt carried: kept_from_s2="
                             f"{receipt['numerator']}/"
                             f"{receipt['denominator']}"
-                            + (", denominator is the 4-edge defect"
-                               if receipt["denominator_is_the_4_edge_defect"]
+                            + (", denominator 4 — the number E4 refuses"
+                               if receipt["denominator_is_4"]
                                else ""))
     return rows
 

@@ -51,8 +51,9 @@ marked green off closed children, with no artifact at all. This closes that.
     V8  a row naming a ``sibling`` must match that sibling's numerator AND
         denominator — the denominators are carried, not restated
     V9  --require-green (the EPIC's closing rule): 5/5 GREEN
-    V10 a MEASURED E4 whose denominator is 4 is the historical 4-edge defect
-        re-appearing, not a measurement
+    V10 a MEASURED E4 whose denominator is 4 fails the criterion on the row's
+        own rule, and E4's row must carry the SAME denominator the run's
+        ``e4_receipt`` computed
     V11 (``--require-resolvable``) the provenance POINTERS resolve in this
         checkout — each row's sha AND the pre-registration commit. OFF by
         default: a squash-merged branch sha is unresolvable in ``main`` by
@@ -497,16 +498,35 @@ def check(record: dict, *, repo: Path,
     # ── V10 E4's own failing condition ────────────────────────────────
     # E4's row says it *"fails if the denominator is 4"*: the historical
     # defect merged 4 of the 15 edges reachable on the real extraction leg.
-    # The probe computes `denominator_is_the_4_edge_defect` and used it only in
-    # a NOTE, so the defect could reappear inside a measured E4 and this gate
-    # still called the table sound.
+    # The probe computes the number, and it once carried it only in a NOTE and
+    # in `run.e4_receipt` while the row's `denominator` stayed null — so the
+    # defect could reappear inside the one table the probe produces and this
+    # gate still called it sound (#9089 review). Two things follow:
+    #   1. the check reads a MEASURED row, not only a GREEN/RED one: on this
+    #      surface E4 is `BLOCKED` (its evidence artifact is another lane's) and
+    #      still measured, which is exactly the row that was unreachable here;
+    #   2. the row and the receipt must carry the SAME number. Otherwise a
+    #      hand-edit of one of the two copies decides E4 while the other
+    #      contradicts it in the same file — the disagreement is the finding.
     e4 = by_id.get("E4")
-    if e4 is not None and e4.get("verdict") in ("GREEN", "RED") \
-            and e4.get("denominator") == 4:
-        f.add("V10", "rows[E4]", "E4 measured with denominator 4 — that is "
-                                    "the historical 4-edge defect (the merge "
-                                    "ran over 4 of the reachable edges), not "
-                                    "a measurement of the criterion")
+    if e4 is not None:
+        e4_den = e4.get("denominator")
+        measured = (e4.get("verdict") in ("GREEN", "RED")
+                    or e4.get("evidence_kind") == "measurement")
+        if measured and e4_den == 4:
+            f.add("V10", "rows[E4]", "E4 measured with denominator 4 — the "
+                                        "criterion fails on that number (the "
+                                        "historical 4-edge defect's "
+                                        "denominator), so this is not a "
+                                        "measurement of the criterion")
+        receipt = run.get("e4_receipt")
+        if isinstance(receipt, dict) and isinstance(e4_den, int) \
+                and isinstance(receipt.get("denominator"), int) \
+                and receipt["denominator"] != e4_den:
+            f.add("V10", "rows[E4]",
+                  f"the row's denominator ({e4_den}) and the run's e4_receipt "
+                  f"({receipt['denominator']}) disagree — one number decides "
+                  "E4, and two copies that differ let a hand-edit pick which")
 
     # ── V8 denominators carried, not restated ────────────────────────────
     for cid, row in by_id.items():

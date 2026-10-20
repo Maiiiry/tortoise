@@ -5138,19 +5138,25 @@ tier1:
 - test_entity_attachment_brief_claims.py
 # #9080: the extractor-v4 capstone's gate + run probe (`core` above) — a pure,
 # no-DB file/JSON read plus `git cat-file`/`merge-base`. Dual-registered with
-# `core`, and this `tier1` arm is LOAD-BEARING, not belt-and-braces: measured at
-# this head, a `docs/`-only `pull_request` diff returns
-# `{"surfaces": [], "full": false, test_files: <the tier-1 set>}` — the docs-only
-# early return selects tier1 and NOTHING else, so this row is the only reason the
-# pin runs on the very diff that can rot the bundle it holds
-# (`docs/evidence/7949-capstone/**` — a shipped log whose refusal rows are tidied
-# into a green one, or a probe whose observation surface moves). Do not delete it
-# as "one cheap redundant row". The `core` half is what `--integrity` reads, and
-# `tools/ci_selection.py::CORE_ALSO` carries `docs/evidence/7949-capstone/probes/`
-# so a PROBE-ONLY diff selects `core` too — the same entry its siblings
-# (`docs/evidence/7950-capstone/probes/`, `docs/evidence/5612-journal-growth/probes/`)
-# carry. Pinned by
-# tests/test_ci_selection.py::test_7949_capstone_probe_change_selects_core_not_tier1.
+# `core`. Scope of this arm, stated exactly (#9089 review P1/P2):
+#
+#   • It is LOAD-BEARING for a genuinely docs-only `pull_request` diff —
+#     measured at this head, such a diff returns
+#     `{"surfaces": [], "full": false, test_files: <the tier-1 set>}` and the
+#     docs-only early return selects tier1 and NOTHING else. So a PR that edits
+#     `docs/00_index.md` still runs this pin here.
+#   • It is NOT the reason the pin runs on `docs/evidence/7949-capstone/**`.
+#     Those paths are CLAIMED by `tools/ci_selection.py::CORE_ALSO`'s BROAD
+#     bundle prefix (`docs/evidence/7949-capstone/`, added by #9076):
+#     `_selection_relevant()` keeps them, the early return is never taken, and
+#     `core` is selected. An earlier revision of this block (and a narrower
+#     `.../probes/` CORE_ALSO row) asserted the opposite; that row was dead
+#     config and is GONE — do not re-add it. Pinned by
+#     tests/test_ci_selection.py::test_7949_capstone_probe_change_selects_core_not_tier1
+#     and ::test_no_core_also_entry_is_shadowed_by_a_parent_prefix.
+#
+# Do not delete the row as "one cheap redundant row": the docs-only case above
+# is the one it covers. The `core` half is what `--integrity` reads.
 - test_7949_capstone_verdict_check.py
 # ── #9017 (2026-10-18): the slow pool's weights and its leg split are MEASURED
 #
@@ -5841,7 +5847,7 @@ durations:
   test_7818_plan_record_5362.py: 2.0  # #7818/#5362: a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so it takes the #3400 flat 2.0s default. Hermetic (one plan-doc read, no fixture/DB); refresh from the first post-merge run that includes it. Required for the durations half as well as the surface half (#4348 trap): without this row the durations coverage fell to 89.9% and `tools/ci_selection.py --integrity` red, which is how this row was found.
   test_7950_capstone_probe.py: 2.0  # #7950: a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so it takes the #3400 flat 2.0s default. MEASURED this turn: WITHOUT this row the durations coverage fell to 89.9% (760/845 fast files) and `tools/ci_selection.py --integrity` red — the surface entry alone does not cover it. The file is DB-free pure-function work, but it is NOT cheap: PR #9196 review P3 measured its 16 tests at 16.6–24.2s locally across runs, of which 14.3–19.3s is the S2 census pin this PR added (`test_the_s2_census_log_is_a_LIVE_measurement` re-tokenizes 241 `tortoise/` + 132 `tools/` files via `census_all(PROD_DIRS, TARGETS)`), so the flat default now under-states the file ~10x for the shard packer. The VALUE deliberately stays at the flat default: a weight is a shard-layout input and this row has no CI measurement yet (the #9003-review pin on the #2818 row states the rule — `tests/test_ci_selection.py::test_2818_new_file_row_carries_the_flat_default_until_a_sweep_collects_it`), so the number is the refresher's to write, not the branch's to hand-pick. Refresh from the first post-merge run that includes it.
   test_7950_capstone_probe.py: 2.0  # #7950: a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so it takes the #3400 flat 2.0s default. MEASURED this turn: WITHOUT this row the durations coverage fell to 89.9% (760/845 fast files) and `tools/ci_selection.py --integrity` red — the surface entry alone does not cover it, and the file itself is DB-free pure-function work (<0.01s per test; the local session total is conftest/DB setup). Refresh from the first post-merge run that includes it.
-  test_7949_capstone_verdict_check.py: 35.0  # #9080 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only), so this is the branch's LOCAL reading under the `# unmeasured` convention. MEASURED at the PR head on 2026-10-20 (docker lane, `--junitxml`): **75 tests**, sum of `testcase/@time` = **28.57-55.95s across runs** (wall 29.78-58.03s; the box is shared, so the SUM is a range and the COUNT is the pinned part); the `git cat-file`/`merge-base` ancestry assertions are subprocess calls, so the file is NOT the pure-file-scan shape its siblings (`core`/`tier1` arms) are. The count and the sum are re-derived together, never carried forward: earlier revisions of this row read 40 tests / 2.26s, 58 tests / 12.93s and 70 tests / 28.57-53.72s, which is why the weight moved off 2.5 and off 13.0. Refresh from the first post-merge run that includes it; do NOT drop the row without re-deriving the floor at that head.
+  test_7949_capstone_verdict_check.py: 35.0  # #9080 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only), so this is the branch's LOCAL reading under the `# unmeasured` convention. MEASURED at the PR head on 2026-10-20 (docker lane, `--junitxml`): **78 tests**, sum of `testcase/@time` = **28.57-55.95s across runs** (wall 29.78-58.03s; the box is shared, so the SUM is a range and the COUNT is the pinned part); the `git cat-file`/`merge-base` ancestry assertions are subprocess calls, so the file is NOT the pure-file-scan shape its siblings (`core`/`tier1` arms) are. The count and the sum are re-derived together, never carried forward: earlier revisions of this row read 40 tests / 2.26s, 58 tests / 12.93s, 70 tests / 28.57-53.72s and 75 tests / 28.57-55.95s, which is why the weight moved off 2.5 and off 13.0. (78 is 75 + the three E4/V10 wiring tests this revision adds; a quiet re-measure of the same file summed 4.10s, so the band above is the CONTENDED host's reading, not a property of the file — the COUNT is what must be re-derived here, the SUM only refreshes from a CI run.) Refresh from the first post-merge run that includes it; do NOT drop the row without re-deriving the floor at that head.
   test_8066_served_skill_relay_ratchet.py: 3.5  # #8066 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). MEASURED this turn: WITHOUT this row `duration_coverage_issues()` red at 782/869 = 89.99% — the file is in the fast pool, so its absence packs it at the flat 2.0s default and drops coverage under the 90% floor. Locally measured (embedded carve-out lane, 2 tests): call 2.67s (the registration ratchet's 1097 `select()` calls) + 0.80s (the `tests/**` walk, after the necessary-condition fast path cut it from 16.0s); conftest/collection setup is the once-per-leg cost the #3400 method attributes to no file. Refresh from the first post-merge run that includes it.
   test_7405_remaining_writes.py: 2.2  # #7405/#8698: a file ADDED BY A PR can never have a CI junit measurement (the refresher samples push-to-main runs only), so the #3400 flat 2.0s default was its FIRST weight — this value is a CI measurement since the 2026-10-17 refresh, so the read-me-from-junit half of this note is dropped with it (see the provenance rule above the block). Required for the durations half as well as the surface half (#4348 trap): the surface entry alone does not cover it — merging origin/main is where the fast pool crossed the DURATION_COVERAGE_MIN floor, which is how this row was found. NO pool figure or percentage is restated here on purpose (each base merge re-stales it; see the #4387 row above). Do NOT drop the row without re-deriving the floor at that head. Refresh from the first post-merge run that includes it.
   test_7405_update_point_writes.py: 2.0  # #7405/#8737: same #3400 flat default as the row above and for the same reason — a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only). Required for the durations half as well as the surface half (#4348 trap): the surface entry alone does not cover it. Refresh from the first post-merge run that includes it.

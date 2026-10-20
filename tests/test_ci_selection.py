@@ -2172,17 +2172,18 @@ def test_7949_capstone_probe_change_selects_core_not_tier1():
     # tests/test_7949_capstone_verdict_check.py (`core`), the DB-free pin on the
     # run's refusal chain and the pure observers every row is derived from.
     #
-    # PR #9089 review P2: `docs/` is a flat NON_PYTHON_PREFIXES entry and no
-    # SOURCE_PATTERNS row matches the probe, so a PROBE-ONLY change came back
-    # with `changed == []` and took the docs-only early return — `select()`
-    # returned NO `core` surface, so the pin's `core` registration never reached
-    # the file it guards (the #1349/#3332/#3616 silent-drop class, the same
-    # shape as `docs/evidence/7950-capstone/probes/` above).
-    #
-    # Measured before the CORE_ALSO entry (2026-10-19):
+    # ⛔ The entry that keeps this `core` is the BUNDLE prefix
+    # (`docs/evidence/7949-capstone/`, added by #9076), NOT a `probes/` row.
+    # This PR added the narrower `docs/evidence/7949-capstone/probes/` and its
+    # claim was wrong on both halves (#9089 review P1): the broader row was
+    # already in place and `path.startswith()` makes a narrower prefix inside
+    # it dead, so (a) the entry changed no selection, and (b) the mutation
+    # claim this comment used to carry ("removing the entry fails assert 1")
+    # was falsified — the test passed with the entry deleted. MEASURED
+    # (2026-10-20, `select()` in-process, narrow row deleted):
     # `_sel(["docs/evidence/7949-capstone/probes/capstone_run.py"])` ->
-    # surfaces=[], full=False, the pin present only through `tier1`.
-    # Mutation check: removing the CORE_ALSO entry fails assert 1 below.
+    # surfaces=['core'], full=False, the pin present. The narrow row was
+    # removed; the mutation check below now names the row that does the work.
     for path in (
         "docs/evidence/7949-capstone/probes/capstone_run.py",
         "docs/evidence/7949-capstone/probes/README.md",
@@ -2191,6 +2192,24 @@ def test_7949_capstone_probe_change_selects_core_not_tier1():
         assert "core" in r["surfaces"], (path, r)
         assert "test_7949_capstone_verdict_check.py" in r["test_files"], (path, r)
         assert r["full"] is False, (path, r)
+
+
+def test_no_core_also_entry_is_shadowed_by_a_parent_prefix():
+    # #9089 review P1: `CORE_ALSO` matching is `path.startswith(entry)`, so an
+    # entry that is a DESCENDANT of another entry can never admit a path its
+    # parent does not — it is dead config that reads as the reason a path is
+    # covered. This bundle added exactly one such row
+    # (`docs/evidence/7949-capstone/probes/` under the bundle prefix) and its
+    # pin passed with the row deleted, so nothing else could notice.
+    #
+    # Non-vacuity: with that row restored this test fails (it is the only
+    # shadowed pair in the tuple, measured 2026-10-20: 63 entries, 1 pair).
+    entries = list(cs.CORE_ALSO)
+    shadowed = sorted((a, b) for a in entries for b in entries
+                      if a != b and a.startswith(b))
+    assert shadowed == [], (
+        "CORE_ALSO rows shadowed by a parent prefix (dead config — delete the "
+        f"narrow row, keep the broad one): {shadowed}")
 
 
 def test_supabase_config_change_selects_core_not_tier1():

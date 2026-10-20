@@ -15,9 +15,12 @@ aboutObjects: "#7949, #9080, #9075, #9076, #9077, #9116, #5199, #7947, EXTRACTOR
 radius — the 13 files this branch touches** (`git diff --name-only origin/main...HEAD`):
 the bundle itself (`docs/evidence/7949-capstone/**`, `tools/capstone_verdict_check.py`,
 `tests/test_7949_capstone_verdict_check.py`); its registration (`config/ci-surfaces.yml`
-`core`/`tier1`/`durations` arms, `docs/00_index.md`); the selection change that makes
-a PROBE-ONLY diff select this suite (`tools/ci_selection.py` + `tests/test_ci_selection.py`,
-the `CORE_ALSO` sibling pattern); the surface re-cut the new caller forces
+`core`/`tier1`/`durations` arms, `docs/00_index.md`); the selection edits
+`tools/ci_selection.py` + `tests/test_ci_selection.py` **remove** a `CORE_ALSO`
+row this branch had added and could not justify (the bundle prefix
+`docs/evidence/7949-capstone/`, landed by #9076, already selects `core` for a
+PROBE-ONLY diff — measured, not assumed), and add a pin that no `CORE_ALSO` row
+is shadowed by a parent prefix; the surface re-cut the new caller forces
 (`config/surface-manifest.yml`, `docs/product/mcp-sdk-surface.md`); and two test-side
 edits that are NOT this bundle's subject — `tests/test_ci_check_repair.py` (the `gh`
 launcher stub) and `tests/test_uri_env_mutations_declared.py` (the declaration for
@@ -182,8 +185,19 @@ refuses) — an honest finding for `#7949`, never a guess.
 
 ## What this bundle does NOT establish
 
-- **No E1–E5 number.** No row carries a numerator or denominator, because no measurement
-  was performed. The table's honesty is structural, not numerical.
+- **No E1–E5 number.** No row of the SHIPPED table carries a numerator or
+  denominator, because no measurement was performed. The table's honesty is structural,
+  not numerical.
+- **No E4 edge denominator.** A COMPLETED run (G6) does carry a number: E4's row takes
+  `numerator`/`denominator` from the run's `e4_receipt` (the S4 merge's
+  `kept_from_s2`/`s2_items`), so the gate's V10 can refuse a denominator of 4 on the
+  table the probe itself produces instead of only on a hand-written row. ⚠️ That receipt
+  measures the merge's **item** accounting; E4's criterion is phrased over the 15-**edge**
+  operator gold, whose denominator needs #9077's wired leg. A 4 here therefore means
+  "this measurement's denominator is the number E4 refuses", not "the 4-edge defect
+  re-appeared" — the pipeline would have to be handed 4 items for the two to coincide,
+  and the receipt cannot tell the two apart. The gate enforces the row's own rule either
+  way; it does not pretend to distinguish the quantities.
 - **No E3 census instrument.** The probe carries none: E3's census reader over the real
   `:Point`/`:Object`/`:Event` nodes belongs to `#5199` (the lane that gives `:Object` /
   `:Event` their anchor at all). Shipping one here would mean a Cypher filter on a
