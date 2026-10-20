@@ -230,7 +230,16 @@ def _bound_names(target: ast.AST) -> set[str]:
 
 
 def _named(nodes, names: tuple[str, ...]) -> bool:
-    """Does any node in `nodes` NAME one of `names`?"""
+    """Does any node in `nodes` NAME one of `names`?
+
+    BOTH spellings, on purpose: a `with` clause may say `_live_write_scope(...)`
+    or `_proj._live_write_scope(...)`, and `_DECLARATION_PRIMITIVES` carries no
+    origin module. Pinned by `test_the_declaration_detector_can_fail`'s attribute
+    case (#9150 review cycle 13, P2): while that arm was unexercised it could be
+    deleted with the suite green, after which a declaration written as
+    `with _proj._live_write_scope(...)` inside `sdk.py::org_create` passed every
+    pin — a silent false PASS on the coupling the note promises.
+    """
     for root in nodes:
         for node in ast.walk(root):
             if isinstance(node, ast.Name) and node.id in names:
@@ -627,6 +636,13 @@ def _eager_init_calls(tree: ast.Module):
     `AnnAssign` / `Return` site was COUNTED by one and never INSPECTED by the
     other — measured: such a site issued on the guarded handle (`proj.g.query`)
     left every pin green while the file reported it as below the handle.
+
+    BOTH call spellings — `_os.eager_init_query(...)` and a bare
+    `eager_init_query(...)` — are matched, and both are pinned by
+    `test_the_eager_init_finder_sees_both_call_spellings` (#9150 review cycle 13,
+    P2: the bare-name arm could be deleted with the suite green, after which a
+    sixth site imported by name became invisible to the inventory, the linkage
+    pin and the CI-subject sweep, and the note went stale green).
     """
     out = []
     # PARENT-AGNOSTIC (#9150 review, P2): walk every CALL, not "the call inside an
@@ -1253,6 +1269,38 @@ def test_the_opener_inventory_is_pinned_so_a_new_lane_moves_this_file():
     )
 
 
+def _module_level_defs(tree: ast.Module) -> dict[str, list[int]]:
+    """`name -> [lineno, …]` for the module-level `def`s of `tree`.
+
+    Module level only, deliberately: a duplicated name NESTED inside a class or a
+    function cannot shadow an opener, because an opener is read off `tree.body`.
+    """
+    found: dict[str, list[int]] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.setdefault(node.name, []).append(node.lineno)
+    return found
+
+
+def _duplicated_module_level_names(
+    tree: ast.Module, names: set[str]
+) -> dict[str, list[int]]:
+    """Which of `names` are defined MORE THAN ONCE at module level.
+
+    The detector behind
+    `test_no_opener_name_is_defined_twice_in_the_inventory_module`, hoisted so it
+    has an instrument check of its own (#9150 review cycle 13, P2: with the
+    computation inline, replacing it with `duplicated = {}` left the suite green,
+    so the only detector in the file with no proof-of-firing was the one
+    justifying name-keyed inventory lookups).
+    """
+    return {
+        name: lines
+        for name, lines in _module_level_defs(tree).items()
+        if name in names and len(lines) > 1
+    }
+
+
 def test_no_opener_name_is_defined_twice_in_the_inventory_module():
     """Why NAMES suffice for the inventory: no opener name is defined twice.
 
@@ -1265,23 +1313,41 @@ def test_no_opener_name_is_defined_twice_in_the_inventory_module():
     NAME appears twice at module level. Without this pin a second function
     sharing an opener's name would be invisible to the inventory — a set of names
     has no second slot — which is the cycle-5 defect one scope narrower.
+
+    Instrument check first (#9150 review cycle 13, P2): the detector must RED on
+    a synthetic module that defines one opener name twice, or this pin could pass
+    with its body emptied.
     """
+    synthetic = ast.parse(textwrap.dedent(
+        """
+        def _live_write_scope(reason):
+            return _cache_write_authorized(reason)
+
+        def _live_write_scope(reason):
+            return _cache_write_authorized(reason)
+
+        def _unique_scope(reason):
+            return _cache_write_authorized(reason)
+        """
+    ))
+    assert _duplicated_module_level_names(
+        synthetic, {"_live_write_scope", "_unique_scope"}
+    ) == {"_live_write_scope": [2, 5]}, (
+        "the duplicate-opener detector does not red on a module that defines one "
+        "opener name twice — with it blind, name-keyed inventory lookups would "
+        "silently miss the second definition"
+    )
+
     rel = "tortoise/projection/__init__.py"
     tree, _parents = _parse(rel)
-    module_level: dict[str, list[int]] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            module_level.setdefault(node.name, []).append(node.lineno)
+    module_level = _module_level_defs(tree)
 
     openers = _projection_openers()
     assert openers <= set(module_level), (
         "an opener in this inventory is not a module-level `def` — names are "
         f"then not enough to identify it: {sorted(openers - set(module_level))}"
     )
-    duplicated = {
-        name: lines for name, lines in module_level.items()
-        if name in openers and len(lines) > 1
-    }
+    duplicated = _duplicated_module_level_names(tree, openers)
     assert not duplicated, (
         f"an OPENER name is defined twice at module level: {duplicated}. The "
         "second definition is invisible to `_projection_openers()` (a set of "
@@ -1290,9 +1356,6 @@ def test_no_opener_name_is_defined_twice_in_the_inventory_module():
         "no longer has (#9157). Key the inventory on identity before allowing "
         "this — the detector population already does."
     )
-    # …and the module really does contain duplicated names, so this pin is
-    # measuring a property of the OPENERS and not of the module: if that ever
-    # stops being true, the docstring above is stale rather than the rule.
     # …and the module really does contain duplicated names IN SOME SCOPE, so this
     # pin measures a property of the OPENERS rather than of the file: if that ever
     # stops being true, the docstring above is stale rather than the rule. (All
@@ -1390,6 +1453,71 @@ def test_the_declaration_detector_can_fail():
             f"{primitive}() — a site closed through that opener would leave "
             "every residual pin in this file green while the note went stale"
         )
+
+    # ⛔ The ATTRIBUTE spelling (#9150 review cycle 13, P2). `_named()` matches
+    # `ast.Name` and `ast.Attribute`, and `_DECLARATION_PRIMITIVES` carries no
+    # origin module — so `with _proj._live_write_scope(...)` must count too.
+    # While that arm was unexercised it could be deleted with the suite green,
+    # after which planting exactly that `with` in `sdk.py::org_create` passed
+    # every pin: a silent false PASS on the coupling the note promises.
+    for primitive in _DECLARATION_PRIMITIVES:
+        tree = ast.parse(textwrap.dedent(
+            f"""
+            def org_create(proj, cypher):
+                with _proj.{primitive}(cypher):
+                    return proj.db.select_graph("g").query(cypher)
+            """
+        ))
+        parents = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+        }
+        assert _declaring_functions(tree, parents) == {"org_create"}, (
+            "the declaration detector no longer recognises an ATTRIBUTE-spelled "
+            f"`with` (`_proj.{primitive}(...)`) — a lane that qualifies the "
+            "opener through its module would enter a declaration with every "
+            "residual pin green"
+        )
+
+
+def test_the_eager_init_finder_sees_both_call_spellings():
+    """The instrument check for `_eager_init_calls()` — both spellings, counted.
+
+    ⛔ The bare-name arm was unpinned (#9150 review cycle 13, P2): deleting
+    `func.id == "eager_init_query"` left 19/19 green, and with it a sixth site
+    spelled `from … import eager_init_query; _q, _p = eager_init_query(...)`
+    became invisible to the inventory, the linkage pin AND the CI-subject sweep —
+    the inventory would report four functions while five sites existed, which is
+    the "note goes stale green" failure this file exists to prevent.
+    """
+    tree = ast.parse(textwrap.dedent(
+        """
+        from tortoise.onboarding.state import eager_init_query
+
+        def via_module(proj, org):
+            handle = proj.db.select_graph("g")
+            q, p = _os.eager_init_query("CREATE (:TeamMeta)", {"n": org})
+            handle.query(q, params=p)
+
+        def via_bare_name(proj, org):
+            handle = proj.db.select_graph("g")
+            q, p = eager_init_query("CREATE (:TeamMeta)", {"n": org})
+            handle.query(q, params=p)
+        """
+    ))
+    found = {
+        enclosing.name
+        for node, _call, _targets in _eager_init_calls(tree)
+        for enclosing in [_enclosing_function(
+            node, {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)})]
+        if enclosing is not None
+    }
+    assert found == {"via_module", "via_bare_name"}, (
+        "`_eager_init_calls()` missed a call spelling — it must match BOTH "
+        "`_os.eager_init_query(...)` and a bare `eager_init_query(...)`, or a "
+        f"sixth site can exist with the note claiming there are five: {sorted(found)}"
+    )
 
 
 def test_a_delegating_opener_joins_both_populations():
