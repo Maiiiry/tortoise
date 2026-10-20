@@ -432,13 +432,51 @@ def test_the_census_pattern_sees_every_call_spelling(tmp_path):
 
 
 def _production_section(text: str) -> list[str]:
-    """The census output ABOVE the test population (the production counts)."""
+    """The census output ABOVE the test population (the production counts).
+
+    A leading `#` block is the artifact's PROVENANCE header — when the numbers
+    were taken and by which command — and carries no measurement of its own, so
+    it is skipped here. The pin that compares against this section compares
+    measurements, not metadata (#9196 review P2: without a header a reader
+    cannot tell which tree the numbers describe, which is how the informational
+    half went stale unseen).
+    """
     out: list[str] = []
     for line in text.splitlines():
+        if line.startswith("#"):
+            continue
         if line.startswith("test population:"):
             break
         out.append(line)
     return out
+
+
+def test_the_s2_census_log_carries_its_provenance():
+    """The log must say WHICH tree its numbers describe (#9196 review P2).
+
+    The production section is re-measured by the pin below, but the
+    `test population:` counts are informational by design — nothing reds when
+    they drift. Their remedy is provenance: a header naming the head, the date
+    and the command, exactly as `e2e-chain-probe.log` carries, so a reader can
+    tell a measurement from a memory. Without it the two stale counts found at
+    #9196 (replay 1 vs 2, rebuild_from_record 6 vs 10) were invisible: nothing
+    in the file said what tree they had been cut from.
+    """
+    text = _S2_CENSUS_LOG.read_text(encoding="utf-8")
+    header = [ln for ln in text.splitlines() if ln.startswith("#")]
+    assert header, (
+        "s2-wiring-census.log carries no `#` provenance header — the log is a "
+        "measurement of ONE tree, so it must name it")
+    joined = "\n".join(header)
+    for needed in ("Measured at:", "feat/9189-tm@",
+                   "probes/s2_wiring_census.py"):
+        assert needed in joined, (
+            f"the census log's provenance header must name {needed!r}: a log "
+            "whose numbers cannot be dated re-stales silently (the #9196 "
+            "review's finding)")
+    assert header == text.splitlines()[:len(header)], (
+        "the provenance header must LEAD the file — a header below a "
+        "measurement reads as if it described the lines above it")
 
 
 def test_the_s2_census_log_is_a_LIVE_measurement(monkeypatch, capsys):
