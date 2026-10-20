@@ -1041,7 +1041,8 @@ def test_no_two_census_entries_share_a_bare_function_name():
 #: `sdk.py: 23508` decays into a pointer at whatever function holds that line
 #: exactly as `sdk.py:23508` does. `test_the_line_anchor_matches_every_spelling`
 #: holds the variants red-eyed.
-_SDK_LINE_ANCHOR = re.compile(r"sdk\.py\s*(?:[:,]|\sline\s)?\s*[Ll]?\d+")
+_SDK_LINE_ANCHOR = re.compile(
+    r"sdk\.py[\s,:]*(?:\(?\s*(?:at\s+)?line\s*[:\s]*)?[Ll]?\d+")
 
 #: ⛔ NO LOCAL WRITE-CLAUSE REGEX HERE. What counts as a write is
 #: `_statement_writes` + `_WRITE_CLAUSE_RE` from `tortoise.projection` — the
@@ -1554,6 +1555,13 @@ def test_the_line_anchor_matches_every_spelling():
         "sdk.py line 23508",
         "sdk.py, 23508",
         "sdk.py 23508",
+        # Second spelling family (review round 2, measured): `\sline\s`
+        # required the word `line` to be WHITESPACE-preceded, so a separator or
+        # a word in front of it reopened the same hole one family over.
+        "sdk.py, line 23508",
+        "sdk.py (line 23508)",
+        "sdk.py at line 23508",
+        "sdk.py::23508",
     ]
     for variant in must_match:
         assert _SDK_LINE_ANCHOR.search(variant), (
