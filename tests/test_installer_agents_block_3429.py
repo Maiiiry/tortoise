@@ -1691,16 +1691,49 @@ def test_a_signal_whose_restore_fails_still_reports_and_keeps_the_backup(tmp_pat
         "an interrupted write must not report the AGENTS.md block as upgraded:\n" + out)
 
 
-def test_the_append_path_refuses_when_a_concurrent_run_wrote_the_block(tmp_path):
-    """Review P2: renaming made the last writer win, but appending IN PLACE adds a
-    SECOND block pair — measured: two parallel runs on a hardlinked, block-less
-    file, both printing success, leaving `starts=2 ends=2` and a file the next run
-    refuses as MALFORMED. A block that appears between the pre-state read and the
-    append must therefore abort instead of duplicating.
-
-    The state is injected deterministically: the shim writes a block into the
-    target the moment the staged copy is read back, i.e. inside the window.
+def test_parallel_runs_on_one_hardlinked_file_never_duplicate_the_block(tmp_path):
+    """Review P1: two genuinely parallel runs on a hardlinked, block-less file both
+    passed an optimistic pre-check before either appended — measured 2 of 12 rounds
+    leaving `starts=2`, both reports claiming success, and the next run refusing the
+    file as MALFORMED. An ordering test cannot see that, so this races real
+    processes: the file must end with exactly one block, every round.
     """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    original = "# House\nUNIQUE-ONE\n"
+    for round_no in range(6):
+        home = tmp_path / f"home{round_no}"
+        home.mkdir()
+        project = tmp_path / f"project{round_no}"
+        project.mkdir()
+        target = project / "AGENTS.md"
+        target.write_text(original, encoding="utf-8")
+        (project / "CLAUDE.md").hardlink_to(target)
+
+        procs = [
+            subprocess.Popen(
+                ["bash", str(installer), "--harness", "codex"], cwd=str(project),
+                env={**os.environ, "HOME": str(home)}, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            for _ in range(2)
+        ]
+        for proc in procs:
+            proc.communicate(timeout=240)
+
+        text = target.read_text(encoding="utf-8")
+        assert text.count(START) == 1 and text.count(END) == 1, (
+            f"round {round_no}: parallel runs left {text.count(START)} start / "
+            f"{text.count(END)} end markers — the next run would refuse this file:\n"
+            + text[:400])
+        assert text.count("UNIQUE-ONE") == 1, (
+            f"round {round_no}: the user's content was duplicated:\n{text[:400]}")
+        assert not list(project.glob(".tortoise-agents.lock")), (
+            "the lock directory must not survive the run")
+
+
+def test_a_held_lock_refuses_instead_of_writing(tmp_path):
+    """The lock must be fail-closed with a remedy, not a silent overwrite: a live
+    holder (this process) leaves a lock that another install cannot break."""
     base = _fixture_tree(tmp_path)
     installer = _patched_installer(tmp_path, base)
     home = tmp_path / "home"
@@ -1708,38 +1741,71 @@ def test_the_append_path_refuses_when_a_concurrent_run_wrote_the_block(tmp_path)
     project = tmp_path / "project"
     project.mkdir()
     target = project / "AGENTS.md"
-    original = "# House\nUNIQUE-ONE\n"
+    original = "# House\n"
     target.write_text(original, encoding="utf-8")
-    alias = project / "CLAUDE.md"
-    alias.hardlink_to(target)
-    shim = tmp_path / "shim"
-    shim.mkdir()
-    fake = shim / "cat"
-    # When the append arm cats the block, first plant a competing block in the
-    # target — the exact effect of a parallel run winning the race.
-    fake.write_text(
-        '#!/bin/sh\n'
-        'for a in "$@"; do\n'
-        '  case "$a" in\n'
-        '    */block)\n'
-        '      printf "\\n\\n%s\\nother run\\n%s\\n" "<!-- tortoise:start -->" "<!-- tortoise:end -->" >> "$AGENTS_RACE_TARGET"\n'
-        '      ;;\n'
-        '  esac\n'
-        'done\n'
-        'exec /bin/cat "$@"\n',
-        encoding="utf-8")
-    fake.chmod(0o755)
+    lock = project / ".tortoise-agents.lock"
+    lock.mkdir()
+    (lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")   # alive, so not stale
 
-    done = subprocess.run(
-        ["bash", str(installer), "--harness", "codex"], cwd=str(project),
-        env={**os.environ, "HOME": str(home), "PATH": f"{shim}:{os.environ['PATH']}",
-             "AGENTS_RACE_TARGET": str(target)},
-        capture_output=True, text=True, timeout=180)
+    done = _run(installer, home, project)
 
-    text = target.read_text(encoding="utf-8")
-    assert done.returncode == 3, (
-        "a block appearing mid-write must abort, not duplicate:\n" + done.stdout + done.stderr)
-    assert "another install wrote a Tortoise block" in done.stderr, done.stderr
-    assert text.count(START) == 1 and text.count(END) == 1, (
-        f"exactly one block must remain, got {text.count(START)}/{text.count(END)}:\n{text[:300]}")
-    assert "UNIQUE-ONE" in text, "the user's content must survive"
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "another install is writing AGENTS.md" in done.stderr, done.stderr
+    assert ".tortoise-agents.lock" in done.stderr, "the message must name the lock to remove"
+    assert target.read_text(encoding="utf-8") == original, "nothing may be written"
+
+
+def test_a_stale_lock_from_a_dead_pid_is_taken_over(tmp_path):
+    """A crashed run must not wedge every later install: a lock whose pid is gone
+    is broken and the install proceeds."""
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    target.write_text("# House\n", encoding="utf-8")
+    lock = project / ".tortoise-agents.lock"
+    lock.mkdir()
+    dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    dead.wait()
+    (lock / "pid").write_text(f"{dead.pid}\n", encoding="utf-8")
+
+    done = _run(installer, home, project)
+
+    assert done.returncode == 0, (
+        "a stale lock must not wedge the install:\n" + done.stdout + done.stderr)
+    assert target.read_text(encoding="utf-8").count(START) == 1
+    assert not lock.exists(), "the lock must be released"
+
+
+def test_every_refusal_releases_the_lock(tmp_path):
+    """Review P1: the MALFORMED refusal path (and the unverified-restore paths)
+    exited without releasing the lock — measured: a malformed file left
+    `.tortoise-agents.lock` behind, an untracked directory in the user's project
+    that also wedges later installs while its pid happens to be reused.
+
+    Every refusal must leave the project as it found it apart from the file.
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+
+    cases = {
+        "malformed": f"{START}\nold\n{START}\n{END}\n",
+        "straddle": f"# H\n\n{START}\nold\n\n```bash\nx\n{END}\nAFTER\n",
+    }
+    for name, body in cases.items():
+        home = tmp_path / f"home-{name}"
+        home.mkdir()
+        project = tmp_path / f"project-{name}"
+        project.mkdir()
+        (project / "AGENTS.md").write_text(body, encoding="utf-8")
+
+        done = _run(installer, home, project)
+
+        assert done.returncode == 3, f"{name}: expected a refusal, got {done.returncode}\n{done.stderr}"
+        assert not (project / ".tortoise-agents.lock").exists(), (
+            f"{name}: the refusal left the lock behind — it wedges later installs")
+        assert not list(project.glob(".tortoise-agents.*")), (
+            f"{name}: the refusal left staging files behind")

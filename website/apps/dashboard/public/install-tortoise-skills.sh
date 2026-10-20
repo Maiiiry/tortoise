@@ -437,7 +437,7 @@ emit_codex_agents_block() {
   local state="" prev_version="" same_bytes=0
   local state_kind="" c_start c_startline c_end c_endline c_fence_start
   local c_near_s c_near_e c_mangled_s c_mangled_e c_fence_open
-  local block_inside_fence orig_mode links backup
+  local block_inside_fence orig_mode links backup lockdir lock_acquired=0 holder=""
   # An IN-PLACE write (the hardlinked-alias arms) truncates the user's only copy,
   # so the original is kept first and restored on any failure — same inode, so the
   # recovery is exact and the alias is untouched. A signal in that window used to
@@ -447,6 +447,25 @@ emit_codex_agents_block() {
     [ -n "$backup" ] && [ -f "$backup" ] && cat "$backup" > "$target" 2>/dev/null
     [ -n "$orig_mode" ] && chmod "$orig_mode" "$target" 2>/dev/null
     trap - INT TERM HUP
+  }
+  # ONE writer at a time. Renaming made a racing pair of installs last-writer-wins;
+  # appending IN PLACE adds a second block pair instead, which the NEXT run refuses
+  # as MALFORMED (measured 2/12 parallel runs). An optimistic pre-check cannot close
+  # that — both runs can pass the check before either writes — and a whole-file grep
+  # also fired on a fenced EXAMPLE of the markers, refusing a file the installer
+  # documents as valid (measured). So the whole read-and-write is taken under a
+  # directory lock, which makes racing runs serialise instead of corrupt.
+  release_lock() { if [ "${lock_acquired:-0}" = "1" ]; then rm -rf "$lockdir" 2>/dev/null; lock_acquired=0; fi; }
+  take_lock() {
+    lockdir="$(dirname "$target")/.tortoise-agents.lock"
+    mkdir "$lockdir" 2>/dev/null && { lock_acquired=1; printf '%s\n' "$$" > "$lockdir/pid" 2>/dev/null || true; return 0; }
+    # A crashed run left it behind: take it over only if its owner is really gone.
+    holder="$(cat "$lockdir/pid" 2>/dev/null || true)"
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -rf "$lockdir" 2>/dev/null || true
+      mkdir "$lockdir" 2>/dev/null && { lock_acquired=1; printf '%s\n' "$$" > "$lockdir/pid" 2>/dev/null || true; return 0; }
+    fi
+    return 1
   }
   # A SIGNAL is a FAILURE, and the trap must say so. The first version restored the
   # bytes and RETURNED, so execution carried on into the success report: measured
@@ -459,12 +478,16 @@ emit_codex_agents_block() {
     # unnamed mktemp dir (measured). `set +e` keeps the reporting reachable.
     set +e
     undo_inplace
+    # The staging file is removed on BOTH branches: a verified restore needs
+    # nothing kept, and an unverified one keeps only the BACKUP (in $tmpdir).
+    [ -n "$staged" ] && rm -f "$staged"
     if [ -n "$backup" ] && [ -f "$backup" ] && cmp -s "$backup" "$target"; then
       # Verified restore: nothing of ours is needed any more, and a leftover
       # `.tortoise-agents.*` is an untracked file one `git add -A` from being
       # committed (measured: TERM left one in the project root).
       [ -n "$staged" ] && rm -f "$staged"
       [ -n "$tmpdir" ] && rm -rf "$tmpdir"
+      release_lock
       echo "  ✗ AGENTS.md — interrupted while writing it in place" >&2
       echo "      the original was restored; nothing was upgraded." >&2
       echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 143)" >&2
@@ -475,6 +498,7 @@ emit_codex_agents_block() {
     if [ -n "$backup" ] && [ -f "$backup" ]; then
       echo "      An intact copy is kept at: $backup" >&2
     fi
+    release_lock
     echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 143)" >&2
     exit 143
   }
@@ -493,7 +517,10 @@ emit_codex_agents_block() {
       echo "      An intact copy is kept at: $backup" >&2
     fi
     echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
-    # NOTE: $tmpdir is deliberately NOT removed here — it holds the only copy.
+    # NOTE: $tmpdir is deliberately NOT removed here — it holds the only copy —
+    # but the LOCK is released: it is not the backup, and a leftover lock wedges
+    # every later install until someone deletes it by hand.
+    release_lock
     exit 3
   }
   _emit_fail() {
@@ -504,6 +531,7 @@ emit_codex_agents_block() {
     echo "  ✗ AGENTS.md — $1" >&2
     echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
     rm -rf "$tmpdir"
+    release_lock
     exit 3
   }
   local ms_re="^${ms}\r?$" me_re="^${me}\r?$"
@@ -518,6 +546,10 @@ emit_codex_agents_block() {
   # file) — refresh the TARGET, never clobber the link.
   target="$file"
   [ -L "$file" ] && target="$(readlink "$file")"
+  # ONE writer at a time — taken BEFORE the state map is read, so the read and the
+  # write are the same critical section (a pre-write re-check cannot close the race:
+  # both runs can pass it before either writes — measured 2/12 parallel runs).
+  take_lock || _emit_fail "another install is writing AGENTS.md right now (lock: ${lockdir:-?}). If no install is running, delete that directory and re-run."
 
   printf '%s\n' \
 "${ms}
@@ -671,6 +703,7 @@ EOF
         echo "      cannot be told apart from an example. Close the fence (or delete the" >&2
         echo "      fence line) and re-run; nothing was written." >&2
         rm -rf "$tmpdir"
+        release_lock
         echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
         exit 3
       elif [ "$s_side" -ge 2 ] && [ "$e_side" -ge 1 ]; then
@@ -686,6 +719,7 @@ EOF
         echo "      Fix the marker lines so exactly one clean pair remains, then re-run." >&2
       fi
       rm -rf "$tmpdir"
+      release_lock
       echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
       exit 3
       ;;
@@ -728,6 +762,7 @@ EOF
     echo "      written. Close the fence, or delete the stale Tortoise block by hand," >&2
     echo "      then re-run." >&2
     rm -rf "$tmpdir"
+    release_lock
     echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
     exit 3
   fi
@@ -880,16 +915,6 @@ EOF
         cmp -s "$target" "$backup" || { rm -f "$staged"; _emit_fail "the copy kept of $target does not match it, so nothing was changed (a full disk or a quota limit is the usual cause)"; }
         trap 'on_signal' INT TERM HUP
         chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to append in place (it has $links hard links, which a rename would split) — nothing was changed"; }
-        # A concurrent run may have written the block since the pre-state was read.
-        # Renaming used to make the last writer win; appending IN PLACE would add a
-        # SECOND pair and leave a file the next run refuses as MALFORMED (measured).
-        # Cheap optimistic check: fail closed instead of duplicating.
-        if grep -qF -- "$ms" "$target" 2>/dev/null || grep -qF -- "$me" "$target" 2>/dev/null; then
-          chmod "$orig_mode" "$target" 2>/dev/null || true
-          trap - INT TERM HUP
-          rm -f "$staged"
-          _emit_fail "another install wrote a Tortoise block while this one was running, so nothing was appended (re-run to upgrade it)"
-        fi
         # ONLY the new bytes: $staged is a COPY of $target plus the block, so
         # `cat "$staged" >> "$target"` would duplicate the user's whole file
         # (measured: 24 bytes -> 1208 with the body present twice, reported as
@@ -913,6 +938,7 @@ EOF
     fi
   fi
   rm -rf "$tmpdir"
+  release_lock
 
   # ── REPORT: derived from what was WRITTEN and what was there before, never
   # from the version token alone.

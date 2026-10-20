@@ -581,13 +581,16 @@ refusing, which would change what the pre-#3429 installer did. A block that
 already sits BELOW the open fence is in the same position as an append — it is
 replaced in place, inside the fence — so that case warns too. A clean pair ABOVE
 the open fence is the one case that does NOT warn: it is rewritten where it
-already sits and stays readable. A file with more than one HARD LINK (`ln
-AGENTS.md CLAUDE.md` dual-names agent files) is written through the SAME inode
-instead of renamed, so the alias never keeps stale instructions, and a failed or
-interrupted in-place write is rolled back to the original bytes; if the rollback
-itself cannot be verified the installer exits 3 (143 if a signal interrupted it),
-says so and leaves an intact copy at the path it prints — it sits in the
-installer's temporary directory, which is why the path is printed. A read-only (`0444`) `AGENTS.md` is upgraded
+already sits and stays readable. Installs serialise on a lock beside the file,
+so two runs cannot both write it — a second waits and then fails naming the
+lock, and a lock left by a crashed run is taken over once its process is gone. A
+file with more than one HARD LINK (`ln AGENTS.md CLAUDE.md` dual-names agent
+files) is written through the SAME inode instead of renamed, so the alias never
+keeps stale instructions, and a failed or interrupted in-place write is rolled
+back to the original bytes; if the rollback itself cannot be verified the
+installer exits 3 (143 if a signal interrupted it), says so and leaves an intact
+copy at the path it prints — it sits in the installer's temporary directory,
+which is why the path is printed. A read-only (`0444`) `AGENTS.md` is upgraded
 normally and kept read-only — the installer stages a writable copy and restores
 the mode — and if the mode cannot be read it refuses rather than rewrite the
 file with looser permissions. Close the fence before re-running.
