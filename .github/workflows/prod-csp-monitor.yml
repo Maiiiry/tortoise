@@ -142,9 +142,9 @@ jobs:
             echo '- a request to the MANUAL-embed beacon host `cloudflareinsights.com`'
             echo '  (which no policy admits since #8334 — the tag fell back to the'
             echo '  cross-origin default), or'
-            echo '- a beacon that LOADED under a policy that admits it but reported'
-            echo '  nowhere (no same-origin `POST /cdn-cgi/rum` observed: analytics'
-            echo '  lost with no console error).'
+            echo '- a beacon that LOADED and then reported nowhere (no same-origin'
+            echo '  `POST /cdn-cgi/rum` observed: analytics lost with no console'
+            echo '  error).'
             echo
             echo 'Run log (tail):'
             echo
@@ -183,12 +183,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # The `--why` text may only assert what a GREEN run MEASURED. `no-tag` is
-        # green (a zone setting; #4706 keep-or-drop is open), so "every surface
-        # loaded the edge-injected beacon" was false on an all-`no-tag` run — the
-        # same run prints `8 of 8 surface(s) carried NO injected beacon tag` — and
-        # the close comment is the artifact the next lane reads.
         run: |
           bash .github/scripts/auto-file-issue.sh resolve \
             --title "$PROD_CSP_MONITOR_TITLE" \
-            --why 'The scheduled deployed-CSP monitor ran green: no anonymous production surface reported a CSP violation, and no surface reported a beacon finding (the edge-injected RUM must stay same-origin on /cdn-cgi/rum). Surfaces that carried no injected tag, or that failed to load, are counted in the run log and are not failures by themselves (#4706 keep-or-drop is open).'
+            --why 'The scheduled deployed-CSP monitor ran green: every surface it MEASURED reported no CSP violation and no beacon-contract finding (no request to the MANUAL-embed apex, and no beacon that loaded and then reported nowhere). `no-tag` is green BY DESIGN — the edge injecting no beacon is a zone setting (#4706 is open) — so this close does NOT assert that every surface loaded the beacon: read the run log for the `no-tag` and `not-measured` counts.'
