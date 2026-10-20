@@ -5753,7 +5753,7 @@ durations:
   test_6211_ep_result_shape.py: 19.0
   test_6211_ep_scale.py: 19.0
   # #6211 (hop anchoring): locally measured on this host, whole file, 5 tests /
-  # 6.5 s (it builds an 8k-edge fixture and profiles one hop). Upper-bounded
+  # 6.9-7.6 s (it builds an 8k-edge fixture and profiles one hop). Upper-bounded
   # like its siblings: an UNDERstated weight skews the balancer against a
   # PR-added file, which this is (#3514).
   test_6211_ep_anchor.py: 9.0

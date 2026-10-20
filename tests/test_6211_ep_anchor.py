@@ -205,7 +205,6 @@ def _statements_under_test(ep: TortoiseEP) -> list[tuple[str, str, dict]]:
     add("operator seed", _capture(ep, ep._affected_claims, ["hop0"], 2, False))
     affected = ep._affected_claims([HUB], 2, False)
     add("factor extraction", _capture(ep, ep._affected_factors, affected, False))
-    ep._load_cache(affected)
     add("cache load", _capture(ep, ep._load_cache, affected))
     return out
 

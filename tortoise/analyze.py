@@ -663,7 +663,11 @@ def _bfs_select_operators(proj, anchors: list[str], max_hops: int | None = 1,
                     alive = _derived_live_operators(frontier_list)
                     if alive:
                         # #7927: ``target`` is a TRAVERSAL position reached
-                        # from the anchored operator.
+                        # from the anchored operator — and, unlike the three
+                        # legs above, this one needs no #6211 barrier: measured
+                        # ``Node By Index Scan (op:Point)`` on the 160k-edge
+                        # fixture (one record for a one-id frontier), so the
+                        # planner already anchors it on ``op.id``.
                         rows = proj.g.query(
                             "MATCH (op:Point {is_operator:true})-[:" + safe_rel + "]->(target) "
                             f"WHERE op.id IN $ops {live_op} {live_t} "

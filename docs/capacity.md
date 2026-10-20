@@ -234,7 +234,7 @@ measurement, the traces, and the three distinct failure modes are in **#6211**.
 shape above looked frontier-proportional, but the frontier was never the anchor:
 every id-set query of the pass was **planned as a label scan of the traversal's
 other endpoint**, with `n.id IN $ids` applied per record afterwards. Measured
-with `GRAPH.PROFILE` on a 23,354-node / 160,000-edge fixture (falkordb-server
+with `GRAPH.PROFILE` on a 23,353-node / 160,000-edge fixture (falkordb-server
 4.20.6), two-hop bridge at a 30-id frontier:
 
 | plan | records walked | wall |
@@ -256,8 +256,8 @@ unanchored on the same fixture, `Node By Label Scan (op:Point)` /
 took **1,507 ms** before them and **98 ms** now (best of 3, same 168
 operators returned).
 
-Three statements are id-anchored but needed no barrier, because their id
-predicate is already on the pattern's anchored side: `_load_cache`'s message
+Three statements that traverse are id-anchored but needed no barrier, because
+their id predicate is already on the pattern's anchored side: `_load_cache`'s message
 sweep, `seed_operators` and `_affected_factors` Batch 2 — each measured
 `Node By Index Scan` before the change, so the barrier would have been
 redundant. All three are still in the pinned set: `tests/test_6211_ep_anchor.py`
@@ -287,8 +287,19 @@ at the issue's 1,000 ms query bound:
 completes; the hop at a 1,000-id frontier went from **5.55 s** to **0.32 s**,
 and `analyze`'s operator-viability query from **242.5 ms** (`All Node Scan`) to
 **12.6 ms** (`Node By Index Scan`) — identical rows in every case. The affected
-sets and the extracted factor lists are byte-identical before and after
-(posteriors agree to ~1e-12, the summation order).
+sets are identical before and after, and so are the extracted factor lists as
+SETS (the OR split appends them in a different order — source-anchored rows
+before target-anchored ones — so a list comparison differs in sequence while
+the posteriors agree to ~1e-12, the summation order; `run` shuffles the factor
+list per iteration anyway).
+
+The split's own cost, measured rather than assumed, because it emits more
+statements per anchor: on the 40-claim interactive zone that
+`tests/test_ep_local_395.py::test_ac5_interactive_latency_zone` guards, both
+trees emit the **same 288 statements** for a pass (the split statements replace
+per-label ones), and 6 interleaved runs gave medians of **1,149 ms** before and
+**1,175 ms** after — inside the run-to-run range of either tree (1,044-1,245 ms
+vs 1,079-1,194 ms).
 
 What remains open after it: the pass **completes slowly** — the same one-anchor
 pass took **89 s** on the fixture, of which ~43 s is a per-message graph read
