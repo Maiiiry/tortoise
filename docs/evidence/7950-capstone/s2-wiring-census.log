@@ -1,8 +1,9 @@
 # #9189 — S2 wiring census: production call sites of the two-store chain
 #   (reconciliation.reconcile / record_projection.replay /
 #   cache_projection.read_record_view / FalkorProjection.rebuild_from_record).
-# Measured at: feat/9189-tm@cdac90f6d on 2026-10-19 (dirty: the #9196 review fix applied
-#   to this log and its pin; production code identical to cdac90f6d)
+# Measured at: feat/9189-tm@500089165 on 2026-10-19 (the commit that TAKES this
+#   measurement; re-run and byte-identical again after merging origin/main@c172b042f,
+#   which touches no censused `file:line`)
 # Command: uv run python docs/evidence/7950-capstone/probes/s2_wiring_census.py
 # Paste of the run as printed, BOTH populations. No expectation block: an expected-value
 #   header above a run's own transcript makes measured-vs-expected unverifiable.
