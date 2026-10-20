@@ -27,6 +27,7 @@ import stat
 import logging
 import tempfile
 import threading
+import weakref
 from collections import defaultdict
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -43,7 +44,9 @@ from tortoise.cypher_guard import (  # #3595 `=~` guard — the ONE seam
     _predicate_drop_barrier,  # #7162: the predicate-drop normaliser
     _skip_cypher_quoted,  # noqa: F401  re-export: the scanner's public test surface
     _unsupported_cypher_operator,  # noqa: F401  re-export
+    _client_store_key,  # #9079: the (store, graph) identity both ends derive
     guarded_client,
+    set_journal_write_authority,  # #9079: §17.1's client-level door
     tolerates_altered_numbers,  # #7174/#5011: the replay/apply exemption
 )
 from tortoise.env_truthy import FALSY, env_flag  # #4097: the declared truthy contract
@@ -3397,21 +3400,45 @@ def _journal_safe_params(params, cypher=None):
 #     detector, NOT an enforcement point — do not read the guard's presence as
 #     "§17.1 is enforced here".
 #
-# ⛔ THE RESIDUAL IS STILL TWO ESCAPES, NOT ONE — named so it is stated, not
-# discovered. A writer that wants to write this cache directly has:
+# ⛔ THE THREE STATEMENT ESCAPES, AND WHERE THE SIGNAL NOW SITS (#9079). A
+# writer that wants to write this cache directly has:
 #   1. `proj.g.query("CREATE …")`     — the guarded handle itself. **DETECTED
 #      (#9124 part 1)**: a mutating statement outside a declared scope is
 #      counted, logged, and (once `_HANDLE_GUARD_ENFORCES` is True) raises
 #      `DirectCacheWriteRefused`;
 #   2. `proj.g._g.query("CREATE …")`  — one private hop past the handle into
-#      the raw `_GuardedGraph`;
+#      the handle's own inner handle;
 #   3. `proj.db.select_graph(<g>).query("CREATE …")` — straight at the
-#      falkordb client, naming ANY graph.
-# (2) and (3) are verified ALLOWED against a journal-backed projection and are
-# NOT guarded in this increment; they are the same class as (1) — they bypass
-# the same fold — and they are the surface §17.1's atomic write has to close.
-# A lexical inventory cannot, because each is one hop below anything a runtime
-# signal is placed on.
+#      client, naming ANY graph.
+# ⛔ (2) AND (3) ARE NO LONGER OPEN (#9079). They bypassed `_GuardedGraph` BY
+# CONSTRUCTION, so no guard on that OBJECT could ever see them — and the two
+# paragraphs above used to say each was "one hop below anything a runtime signal
+# is placed on". MEASURED true on `origin/main` at `02699a4fd` with the handle
+# ARMED: `CREATE`s through both doors landed on a journal-backed cache with no
+# journal record and no refusal. The signal now sits one hop LOWER, where this
+# package's clients actually mint their handles:
+# `tortoise/cypher_guard.guarded_client` already wraps every client and every
+# handle built from one (the `=~` guard, #3595), so `cypher_guard` consults a
+# JOURNAL-WRITE AUTHORITY hook on every guarded Cypher entry point and THIS
+# module installs the decision (`_journal_write_authority`, registered per
+# journal-backed graph name). Same classifier, same authorization ContextVar,
+# same measure/refuse modes as door (1) — so the doors cannot drift. The
+# measurement and the pins are `tests/test_9079_client_handle_door.py`.
+# ⛔ WHAT IS STILL OPEN, stated so it is not discovered — the enumeration is only
+# honest if it says where it stops:
+#   * a RAW vendor client the package did not build (`FalkorDB(...)` directly,
+#     outside `guarded_client` — `cypher_guard`'s own docstring lists the
+#     in-package exceptions) carries no hook at all;
+#   * the RAW SOCKET channels below a guarded connection — `connection.pipeline()`,
+#     `connection.client()` and `connection_pool.get_connection()` — are unbound
+#     by `_guard_connection` (its docstring states the exclusion) and were
+#     MEASURED writing an armed journal-backed cache through `GRAPH.QUERY`;
+#   * a channel that cannot name its STORE (a duck-typed handle with no
+#     `.client`) is matched by graph name only, so a same-named graph of another
+#     store is judged by this journal on that one channel.
+# As with (2) and (3) before #9079, none of these is closable by a lexical
+# inventory; they are the reason §17.1's atomic write ("project it from the
+# record", #7951) is the durable fix and the runtime doors are its guard rails.
 #
 # ⛔ ESCAPE (4) WAS THE WHOLE-GRAPH WIPE, AND ITS NON-CYPHER DOOR IS NOW CLOSED
 # (#9209). The three above are all *statements*, so both of §17.1's doors read
@@ -3495,7 +3522,9 @@ class DirectCacheWriteRefused(RuntimeError):
     Raised when a fold (`FalkorProjection.apply`), a mutating statement on
     the public raw-query lane (`FalkorProjection.query`), a mutating
     statement issued at the projection's write handle (`_GuardedGraph`, i.e.
-    `proj.g`, #9124), a whole-graph destruction through that handle's
+    `proj.g`, #9124), a mutating statement issued at a **client handle** for a
+    journal-backed graph (`proj.db.select_graph(<g>)`, or the write handle's
+    inner handle — #9079), a whole-graph destruction through that handle's
     non-Cypher verbs (`GRAPH.DELETE` via `proj.g.delete()` /
     `proj.g.execute_command`, a KEY-SPACE command — `DEL` / `UNLINK` /
     `RENAME` / `EXPIRE 0` …, because the cache is stored under the graph's
@@ -3508,8 +3537,10 @@ class DirectCacheWriteRefused(RuntimeError):
     refusal, which no disposability check can authorize).
 
     ⚠️ At the HANDLE it raises only once `_HANDLE_GUARD_ENFORCES` is True
-    (#9124 part 2) **for the statement door**. Until then the handle records
-    the same violation in `undeclared_handle_writes()` and logs it, because
+    (#9124 part 2) **for the statement door**, and the CLIENT-level door (#9079)
+    is gated on the SAME constant — the two are one decision, so a projection is
+    never enforced at one door and measuring at the other. Until then both
+    record the same violation in `undeclared_handle_writes()` and log it, because
     arming ahead of the declaration programme refuses the product's own write
     doors. The #9209 NON-statement doors below are NOT gated on that constant —
     they refuse immediately, because a whole-graph removal carries no statement
@@ -3570,13 +3601,19 @@ def _normalise_handle_statement(statement: str) -> str:
     return " ".join((statement or "").split())[:200]
 
 
-def _record_undeclared_handle_write(statement: str) -> None:
+def _record_undeclared_handle_write(statement: str, *, source: str = "proj.g") -> None:
     """MEASURE MODE: count an undeclared write instead of refusing it.
 
     One WARNING per distinct statement (not per occurrence): the census is what
     the declaration programme consumes, and a hot door would otherwise bury the
     log in the same line. The count is still exact, so a reader can tell one
     call from a thousand.
+
+    *source* names WHICH door saw it — `proj.g` (the write handle) or a client
+    handle one hop below it (#9079's escapes 2 and 3). The census KEY stays the
+    statement text alone, so one statement cannot enter the census twice under
+    two spellings of its door; the source only makes the log line say where the
+    writer reached the graph.
     """
     key = _normalise_handle_statement(statement)
     with _UNDECLARED_HANDLE_WRITES_LOCK:
@@ -3584,11 +3621,12 @@ def _record_undeclared_handle_write(statement: str) -> None:
         _UNDECLARED_HANDLE_WRITES[key] = _UNDECLARED_HANDLE_WRITES.get(key, 0) + 1
     if first:
         logger.warning(
-            "§17.1: a mutating statement reached the projection's write handle "
-            "with NO declared lane (%s). The door is MEASURING, not refusing "
-            "(#9124 part 1): declare the writer (`_live_write_scope` after its "
-            "journal append, `_replay_write_scope`, or "
-            "`_graph_metadata_write_scope`) before the guard is armed.", key)
+            "§17.1: a mutating statement reached the projection's write surface "
+            "(%s) with NO declared lane (%s). The door is MEASURING, not "
+            "refusing (#9124 part 1): declare the writer (`_live_write_scope` "
+            "after its journal append, `_replay_write_scope`, or "
+            "`_graph_metadata_write_scope`) before the guard is armed.",
+            source, key)
 
 
 def undeclared_handle_writes() -> dict[str, int]:
@@ -3648,6 +3686,219 @@ def _live_write_scope(reason: str = "live-door"):
 def _replay_write_scope():
     """The replay engines' scope: the record came FROM the journal."""
     return _cache_write_authorized("replay")
+
+
+# ── §17.1'S CLIENT-LEVEL DOOR (#9079, escapes 2 and 3) ────────────────────
+#
+# The statement door sat on ONE object — the write handle `_GuardedGraph`
+# (`proj.g`) — and the module has always said so, including the two escapes it
+# leaves one hop BELOW that object:
+#
+#   2. `proj.g._g.query("CREATE …")`      — the handle's own inner handle;
+#   3. `proj.db.select_graph(<g>).query(…)` — the client, naming ANY graph.
+#
+# Both were DEFEATED BY CONSTRUCTION: neither passes through `_GuardedGraph`, so
+# no verb-level guard on that object can see them. They are not hypothetical — on
+# an ARMED projection both were measured writing the cache with no journal record
+# (`tests/test_9079_client_handle_door.py` is that measurement, and it is the
+# failing test this door was added for).
+#
+# The signal that closes them is placed one hop LOWER, on the handles this
+# package's clients actually mint: `tortoise/cypher_guard.guarded_client` already
+# wraps every client and every handle built from one, so a hook there sees both
+# escapes — and anything else that reaches the graph through a guarded handle.
+# `cypher_guard` cannot call back into this module (this module imports it), so
+# it carries a hook and THIS module installs the decision.
+
+#: The (STORE, graph) pairs this process knows to be JOURNAL-BACKED projections.
+#:
+#: A frozenset, swapped whole under the lock on every register/unregister, so a
+#: reader on the query hot path takes no lock and can never see a half-built
+#: registry. Ref-counted by the dict below: two projections may share one pair,
+#: and the first one to close must not disarm the second.
+#:
+#: ⛔ THE KEY IS `(store, graph)`, NOT THE GRAPH NAME, and the store half is not
+#: decoration: every embedded SDK calls its graph ``tortoise``, and one process
+#: routinely holds several such stores. Keyed on the name alone, a write to
+#: store B's ``tortoise`` was judged by store A's journal and — with the door
+#: armed — REFUSED, a write §17.1 has nothing to say about (measured: two
+#: embedded SDKs in one process, the journal-bound one registering first).
+#: ``store`` is `cypher_guard._client_store_key`'s answer for the client, the
+#: same helper the hook calls, so the two ends of one decision cannot derive
+#: different keys. ``None`` is the channel that could not name its store (a
+#: duck-typed client with no pool) and is matched by NAME only — that residual
+#: is stated here rather than hidden: on that channel a same-named graph of
+#: another store is judged by this journal.
+_JOURNAL_BACKED_KEYS: frozenset[tuple[str | None, str]] = frozenset()
+_JOURNAL_BACKED_COUNTS: dict[tuple[str | None, str], int] = {}
+_JOURNAL_BACKED_KEYS_LOCK = threading.Lock()
+
+#: Which statements `_GuardedGraph` has ALREADY decided, in this context.
+#:
+#: ⛔ A SET OF KEYS, NEVER A BARE BOOLEAN (#9079 review cycle 2, MEASURED). The
+#: write handle's inner handle is itself a guarded client handle, so without some
+#: suppression the client-level door re-takes the SAME decision one hop lower and
+#: counts every `proj.g` write twice. A boolean said "a decision was taken" —
+#: which is true for ANY statement the wrapper dispatched, including one aimed at
+#: a graph the wrapper's own projection says nothing about. Measured bypass with
+#: a journal-LESS projection's write handle pointed at a JOURNAL-BACKED graph
+#: (the `hosted_api` shape): the wrapper's own door let it through (its projection
+#: has no journal) and the boolean told the client door to stay out of it, so the
+#: write landed on the journal-backed cache with no refusal and no census entry.
+#: The key is `(store, graph, normalised statement)`: the suppression can then
+#: only cover the decision actually taken, for the graph it was taken about.
+_HANDLE_STATEMENT_DECIDED: ContextVar[frozenset[tuple[str | None, str, str]]] = (
+    ContextVar("tortoise_handle_statement_decided", default=frozenset()))
+
+
+def _decision_key(inner, verb: str, statement, args):
+    """The `(store, graph, statement)` a dispatch is about to decide.
+
+    The TARGET GRAPH is the inner handle's own name for the query verbs (the
+    vendor always writes the graph it belongs to) and ``args[1]`` for a raw
+    command, which names its graph in the payload. It is deliberately NOT the
+    projection's `graph_name`: a write handle may front any graph, and keying on
+    the owner is how the boolean acquired its hole.
+    """
+    graph = getattr(inner, "name", None)
+    if verb == "execute_command" and len(args) >= 2:
+        graph = args[1]
+    store = _client_store_key(getattr(inner, "client", None))
+    return (store, graph if isinstance(graph, str) else None,
+            _normalise_handle_statement(statement))
+
+
+def _dispatch_decided(inner, verb: str, *args, **kwargs):
+    """Send a statement to `inner` with §17.1's decision ALREADY TAKEN.
+
+    `_GuardedGraph`'s inner handle is itself a guarded client handle, so
+    #9079's client-level door would otherwise take the SAME decision a second
+    time one hop lower and count every `proj.g` write twice in the measure-mode
+    census — which is the evidence the declaration programme consumes. The
+    suppression is scoped to this dispatch AND keyed to the statement it covers,
+    so a writer that reaches the client directly (escape 2 or 3) — or a write to
+    a different graph inside the same call — is still decided there.
+
+    ⚠️ It does NOT cover the nesting INSIDE one client call (the vendor's
+    ``query`` delegates to ``_query``, which dispatches through the guarded
+    command channels). That nesting is `cypher_guard`'s own concern and is
+    decided once by ``_decides_once_per_write``; keeping the two apart is what
+    stops one seam from covering for the other's blind spot.
+
+    A module-level helper rather than a method on the handle: the handle's own
+    surface is ENUMERATED by `tests/test_9079_handle_write_authority.py`, and a
+    dispatch half is not a verb — adding it to that inventory would blur the one
+    list that decides "what is a mutating verb".
+    """
+    key = _decision_key(inner, verb, args[0] if args else None, args)
+    token = _HANDLE_STATEMENT_DECIDED.set(
+        _HANDLE_STATEMENT_DECIDED.get() | {key})
+    try:
+        return getattr(inner, verb)(*args, **kwargs)
+    finally:
+        _HANDLE_STATEMENT_DECIDED.reset(token)
+
+
+def _register_journal_backed_graph(
+        store_key: str | None, graph: str | None) -> None:
+    """Put (store, *graph*) under §17.1 at the CLIENT level too (ref-counted)."""
+    if not isinstance(graph, str) or not graph:
+        return
+    global _JOURNAL_BACKED_KEYS
+    key = (store_key, graph)
+    with _JOURNAL_BACKED_KEYS_LOCK:
+        _JOURNAL_BACKED_COUNTS[key] = _JOURNAL_BACKED_COUNTS.get(key, 0) + 1
+        _JOURNAL_BACKED_KEYS = frozenset(_JOURNAL_BACKED_COUNTS)
+
+
+def _unregister_journal_backed_graph(
+        store_key: str | None, graph: str | None) -> None:
+    """Release one owner of (store, *graph*); the LAST owner disarms it."""
+    if not isinstance(graph, str) or not graph:
+        return
+    global _JOURNAL_BACKED_KEYS
+    key = (store_key, graph)
+    with _JOURNAL_BACKED_KEYS_LOCK:
+        remaining = _JOURNAL_BACKED_COUNTS.get(key, 0) - 1
+        if remaining > 0:
+            _JOURNAL_BACKED_COUNTS[key] = remaining
+        else:
+            _JOURNAL_BACKED_COUNTS.pop(key, None)
+        _JOURNAL_BACKED_KEYS = frozenset(_JOURNAL_BACKED_COUNTS)
+
+
+def _journal_backed_graphs() -> tuple[str, ...]:
+    """The registered graph NAMES, sorted — the reader a test uses."""
+    return tuple(sorted({graph for _store, graph in _JOURNAL_BACKED_KEYS}))
+
+
+def _journal_backed_keys() -> tuple[tuple[str | None, str], ...]:
+    """The registered `(store, graph)` pairs, sorted — the reader a test uses."""
+    return tuple(sorted(_JOURNAL_BACKED_KEYS, key=lambda k: (str(k[0]), k[1])))
+
+
+def _is_journal_backed_target(store_key: str | None, graph: str) -> bool:
+    """Is this write aimed at a journal-backed projection's cache?
+
+    Exact match on `(store, graph)` when the channel could name its store; a
+    NAME-only match only for the channel that could not (stated on
+    `_JOURNAL_BACKED_KEYS`).
+    """
+    if store_key is not None:
+        return (store_key, graph) in _JOURNAL_BACKED_KEYS
+    return any(name == graph for _store, name in _JOURNAL_BACKED_KEYS)
+
+
+def _journal_write_authority(
+        store_key: str | None, graph: str, statement: str) -> None:
+    """§17.1's decision for a statement reaching a CLIENT handle (#9079).
+
+    Installed into `cypher_guard` (see `set_journal_write_authority`), so it runs
+    for EVERY statement that reaches a guarded handle — the client's own
+    `select_graph(...)` handles, `proj.g._g`, the SDK's registry handles, and
+    every in-package `guarded_client` handle. It answers exactly the question
+    `_refuse_unauthorized_cache_write` answers, with the same classifier and the
+    same two modes, so the two doors cannot drift (the #3595 precedent).
+
+    ONLY a journal-backed (store, graph) is judged: §17.1 has nothing to enforce
+    on a graph that is nobody's derived cache, and a process with no
+    journal-bound projection keeps the guard's `None` fast path in
+    `cypher_guard`.
+
+    ⛔ NOT COVERED, stated rather than implied: this is the STATEMENT door. A
+    client handle's non-Cypher destruction (`proj.db.select_graph(<own>).delete()`
+    → ``GRAPH.DELETE``, or a ``copy`` over the cache) carries no statement for
+    ``_statement_writes`` to read, so it is NOT refused here — the same class the
+    write handle's own ``proj.g._g.delete()`` spelling already has, closed there
+    by #9209 and not yet at the client. That is a residual of THIS door.
+    """
+    if (store_key, graph, _normalise_handle_statement(statement)) \
+            in _HANDLE_STATEMENT_DECIDED.get():
+        return
+    if not _is_journal_backed_target(store_key, graph):
+        return
+    if _CACHE_WRITE_AUTHORIZED.get() is not None:
+        return
+    if not _statement_writes(statement):
+        return
+    if not _HANDLE_GUARD_ENFORCES:
+        _record_undeclared_handle_write(statement, source="client handle")
+        return
+    raise DirectCacheWriteRefused(
+        "Refusing a mutating statement issued at a client handle for a "
+        "journal-backed graph (`proj.db.select_graph(...)`, or the write "
+        "handle's inner handle): this graph is the derived cache of a journal, "
+        "so a write it did not receive through that journal is the second "
+        "writer §17.1 forbids (docs/architecture/STORAGE-ARCHITECTURE.md "
+        "§17.1). Write through the journal instead (`TortoiseSDK._apply_and_journal "
+        "or the SDK's public write API); a live door that appends first declares "
+        "`_live_write_scope()`, a replay engine declares "
+        "`_replay_write_scope()`. graph=" + str(graph) + " statement="
+        + " ".join((statement or "").split())[:160]
+    )
+
+
+set_journal_write_authority(_journal_write_authority)
 
 
 #: The reason prefix every pre-wipe restore write carries. Pinned as a
@@ -4303,7 +4554,19 @@ class _GuardedGraph:
         """
         if _CACHE_WRITE_AUTHORIZED.get() is not None:
             return
-        if not getattr(self._proj, "_journal_backed", False):
+        # ⛔ JUDGE THE GRAPH THIS HANDLE ACTUALLY WRITES (#9079 review cycle 2).
+        # `self._proj._journal_backed` alone is the OWNER's flag, and a write
+        # handle may front any graph (`hosted_api` builds
+        # `_GuardedGraph(proj.db.select_graph(<other>), <journal-less proj>)`).
+        # Measured: that shape wrote a JOURNAL-BACKED graph through the wrapper
+        # and was refused only by the client door one hop lower — which the
+        # suppression then blinded. The registry is the same target test the
+        # client door uses, so the two doors answer about the same graph.
+        target = getattr(self._g, "name", None)
+        if not (getattr(self._proj, "_journal_backed", False)
+                or _is_journal_backed_target(
+                    _client_store_key(getattr(self._g, "client", None)),
+                    target)):
             return
         if not _statement_writes(statement):
             return
@@ -4358,7 +4621,7 @@ class _GuardedGraph:
         # dead socket is still an op the capture generated). No-op (one
         # ContextVar read) when no capture is active.
         record_graph_op(cypher)
-        return self._g.query(
+        return _dispatch_decided(self._g, "query", 
             cypher, params=_journal_safe_params(params, cypher), timeout=timeout
         )
 
@@ -4375,7 +4638,7 @@ class _GuardedGraph:
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
         cypher = self._bar(cypher)
-        return self._g.ro_query(
+        return _dispatch_decided(self._g, "ro_query", 
             cypher, params=_journal_safe_params(params, cypher), timeout=timeout
         )
 
@@ -4387,7 +4650,7 @@ class _GuardedGraph:
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
         cypher = self._bar(cypher)
-        return self._g._query(
+        return _dispatch_decided(self._g, "_query", 
             cypher, params=_journal_safe_params(params, cypher),
             timeout=timeout, read_only=read_only,
         )
@@ -4403,7 +4666,7 @@ class _GuardedGraph:
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
         cypher = self._bar(cypher)
-        return self._g.profile(cypher, params=_journal_safe_params(params, cypher))
+        return _dispatch_decided(self._g, "profile", cypher, params=_journal_safe_params(params, cypher))
 
     def explain(self, cypher: str, params=None):
         # `GRAPH.EXPLAIN` only PLANS — it does not execute — so it is not in
@@ -4417,7 +4680,7 @@ class _GuardedGraph:
         _guard_numeric_params(params)
         _guard_numeric_literals(cypher)
         cypher = self._bar(cypher)
-        return self._g.explain(cypher, params=_journal_safe_params(params, cypher))
+        return _dispatch_decided(self._g, "explain", cypher, params=_journal_safe_params(params, cypher))
 
     def execute_command(self, *args, **kwargs):
         # ⛔ TWO DECISIONS, AND THE ORDER IS STATED because they are NOT
@@ -4511,8 +4774,19 @@ class _GuardedGraph:
         # refusal complete rather than depending on the inner handle's class.
         # #7162: the returned args carry the `WITH *` barrier when the shape
         # needs it, so they — not the original `args` — are what gets dispatched.
-        args = _guard_execute_command(args, getattr(self._g, "client", None))
-        return self._g.execute_command(*args, **kwargs)
+        # #9079: this normaliser ALSO consults §17.1's client-level door on the
+        # statement it recovers, so it runs inside the same suppression as the
+        # dispatch below — the statement was decided once, above, and counting it
+        # here would make `proj.g.execute_command` the only shape measured twice.
+        normaliser_key = _decision_key(
+            self._g, "execute_command", statement, args)
+        token = _HANDLE_STATEMENT_DECIDED.set(
+            _HANDLE_STATEMENT_DECIDED.get() | {normaliser_key})
+        try:
+            args = _guard_execute_command(args, getattr(self._g, "client", None))
+            return _dispatch_decided(self._g, "execute_command", *args, **kwargs)
+        finally:
+            _HANDLE_STATEMENT_DECIDED.reset(token)
 
     def delete(self, *args, **kwargs):
         """``GRAPH.DELETE`` — the forwarded verb that destroys the whole graph.
@@ -4568,7 +4842,7 @@ class _GuardedGraph:
                 "carries `name`)."
             )
         self._refuse_unauthorized_graph_wipe("GRAPH.DELETE", target)
-        return self._g.delete(*args, **kwargs)
+        return _dispatch_decided(self._g, "delete", *args, **kwargs)
 
     def call_procedure(self, procedure, read_only=True, args=None, emit=None):
         """A procedure call — L2 reads the statement the vendor will build.
@@ -4645,7 +4919,7 @@ class _GuardedGraph:
                     "override __format__/__str__ (docs/architecture/"
                     "STORAGE-ARCHITECTURE.md 17.1). Pass an exact str."
                 )
-            return self._g.call_procedure(
+            return _dispatch_decided(self._g, "call_procedure", 
                 procedure, read_only=read_only, args=args, emit=emit
             )
         # #9124's door, on the statement THIS verb will actually send: the same
@@ -4657,7 +4931,7 @@ class _GuardedGraph:
             self._proj._assert_test_graph(
                 "REFUSING to run bulk DETACH DELETE on non-test graph"
             )
-        return self._g.call_procedure(
+        return _dispatch_decided(self._g, "call_procedure", 
             procedure, read_only=read_only, args=args, emit=emit
         )
 
@@ -8836,8 +9110,37 @@ class FalkorProjection(
         ARMS the guard: from this point a fold or a mutating raw-query on this
         projection is refused unless the caller declares a sanctioned scope
         (``_live_write_scope`` / ``_replay_write_scope``).
+
+        `#9079`: it also REGISTERS this `(store, graph)` pair as journal-backed,
+        which is what makes §17.1 apply one hop lower too — at the client
+        handles that reach the same graph without ever passing through
+        ``proj.g`` (escapes 2 and 3). A projection that never binds a journal
+        never registers, so a graph that is nobody's derived cache keeps the
+        guard's ``None`` fast path in ``cypher_guard``.
+
+        The registration is RELEASED twice, on purpose: by ``close()`` and by a
+        weakref finalizer, so a projection that is dropped without being closed
+        cannot leave the process judging a later projection's writes by a
+        journal that no longer exists.
         """
+        was = bool(getattr(self, "_journal_backed", False))
         self._journal_backed = bool(journal_path)
+        graph = getattr(self, "graph_name", None)
+        store = _client_store_key(getattr(self, "db", None)) \
+            if self._journal_backed else None
+        finalizer = getattr(self, "_journal_backed_finalizer", None)
+        if self._journal_backed and not was:
+            _register_journal_backed_graph(store, graph)
+            self._journal_backed_store = store
+            self._journal_backed_finalizer = weakref.finalize(
+                self, _unregister_journal_backed_graph, store, graph)
+        elif was and not self._journal_backed:
+            if finalizer is not None:
+                finalizer.detach()
+                self._journal_backed_finalizer = None
+            _unregister_journal_backed_graph(
+                getattr(self, "_journal_backed_store", None), graph)
+            self._journal_backed_store = None
 
     # #7951 round 3: the replay anchors are CONTEXT-LOCAL (ContextVar), not
     # instance attributes. `rebuild_all` runs with them armed on its own
@@ -16878,6 +17181,20 @@ class FalkorProjection(
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        if getattr(self, "_journal_backed", False):
+            # #9079: the (store, graph) pair leaves the client-level registry
+            # with its owner. A stale entry would judge a LATER projection that
+            # reuses the name without a journal — a fail-closed gate over the
+            # wrong graph, which is how a guard starts blocking the product.
+            finalizer = getattr(self, "_journal_backed_finalizer", None)
+            if finalizer is not None:
+                finalizer.detach()
+                self._journal_backed_finalizer = None
+            _unregister_journal_backed_graph(
+                getattr(self, "_journal_backed_store", None),
+                getattr(self, "graph_name", None))
+            self._journal_backed_store = None
+            self._journal_backed = False
         try:
             # #1475: route through db._t_close (when present) so the db's
             # _t_closed flag is set — the GC finalizer must recognize this

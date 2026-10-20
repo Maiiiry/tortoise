@@ -135,6 +135,7 @@ import functools
 import logging
 import re
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 
 from tortoise.exceptions import (
@@ -193,6 +194,165 @@ _GUARDED_CHANNEL_MARKER = "_tortoise_cypher_guarded_channel"
 _GRAPH_QUERY_COMMANDS = frozenset(
     {"GRAPH.QUERY", "GRAPH.RO_QUERY", "GRAPH.PROFILE", "GRAPH.EXPLAIN"}
 )
+
+#: §17.1 (#9079) — THE JOURNAL-WRITE AUTHORITY HOOK.
+#:
+#: §17.1's statement door used to sit on ONE object, the projection's write
+#: handle (``_GuardedGraph``, i.e. ``proj.g``). Two documented escapes are one
+#: hop BELOW that object, and both reach the cache through a handle this module
+#: already wraps:
+#:
+#:   2. ``proj.g._g.query("CREATE …")`` — the write handle's own inner handle;
+#:   3. ``proj.db.select_graph(<g>).query("CREATE …")`` — the client directly,
+#:      naming ANY graph (including the SDK's own write handles, which are built
+#:      by :func:`guarded_client`).
+#:
+#: ``tortoise/projection/__init__.py`` used to say each one is *"one hop below
+#: anything a runtime signal is placed on"*. This is that signal, one hop
+#: lower: every guarded Cypher entry point consults the hook, so the decision
+#: no longer depends on WHICH handle a writer reached. The hook is INSTALLED BY
+#: the projection (it owns the classifier, the authorization ContextVar and the
+#: refusal) and this module only carries the call, because
+#: ``tortoise.projection`` imports this module and the dependency cannot run
+#: both ways.
+#:
+#: ``None`` = no authority installed. That is the state of a process with no
+#: journal-bound projection at all, where §17.1 has nothing to enforce — and it
+#: is also the fast path: one global read per query.
+_JOURNAL_WRITE_AUTHORITY: Callable[[str | None, str, str], None] | None = None
+
+
+def set_journal_write_authority(
+        hook: Callable[[str | None, str, str], None] | None) -> None:
+    """Install (or clear) §17.1's journal-write authority hook.
+
+    *hook* is called as ``hook(store_key, graph_name, statement)`` for every
+    statement that reaches a guarded handle, BEFORE any other pre-dispatch
+    guard, and is expected to raise when the write is unauthorised. Idempotent,
+    so a re-import or a second projection cannot stack hooks.
+
+    ``store_key`` is :func:`_client_store_key`'s answer for the client the
+    handle belongs to (``None`` when the channel carries no client at all). The
+    projection keys its registry on the PAIR, because one process routinely
+    holds several stores whose graphs share a name — every embedded SDK calls
+    its graph ``tortoise`` — and a name-only key would judge one store's cache
+    by another's journal.
+    """
+    global _JOURNAL_WRITE_AUTHORITY
+    _JOURNAL_WRITE_AUTHORITY = hook
+
+
+#: Which STORE a client talks to: its file/socket, or its HOST:PORT.
+#:
+#: The same identity `tortoise/event_store.py::_store_identity` derives from a
+#: PROJECTION, derived here from a CLIENT (the only object a guarded channel
+#: holds). Both the projection and the hook call THIS function, so the two ends
+#: of one decision cannot compute different keys.
+#:
+#: The PORT is part of the identity, not decoration: one host can carry several
+#: FalkorDB servers, and this repo's tests run two on loopback.
+#:
+#: Every step is `getattr`-guarded because callers reach it with duck-typed
+#: handles, a `None` client, and test doubles; ``None`` means "this channel
+#: cannot name its store" and the caller states that as a residual instead of
+#: guessing.
+def _client_store_key(client) -> str | None:
+    """Best-effort store identity for *client* (``None`` when unknowable)."""
+    if client is None:
+        return None
+    # A vendor FalkorDB client keeps the pool under `.connection`; a raw
+    # redis-like client (what a graph handle's `.client` is) keeps it directly.
+    kwargs = None
+    for owner in (getattr(client, "connection", None), client):
+        pool = getattr(owner, "connection_pool", None)
+        candidate = getattr(pool, "connection_kwargs", None)
+        if isinstance(candidate, dict):
+            kwargs = candidate
+            break
+    if kwargs is None:
+        return None
+    # The Redis DB INDEX is part of the identity too: one host:port can carry
+    # several keyspaces, and a same-named graph in another DB is another store.
+    db = kwargs.get("db", 0)
+    path = kwargs.get("path") or kwargs.get("unix_socket_path")
+    if path:
+        return f"file:{path}:db{db}"
+    host = kwargs.get("host")
+    if not host:
+        return None
+    port = kwargs.get("port")
+    base = f"host:{host}:{port}" if port is not None else f"host:{host}"
+    return f"{base}:db{db}"
+
+
+#: How many guarded entries are on the current call chain.
+#:
+#: One statement reaches the guarded seams SEVERAL times: the vendor's ``query``
+#: delegates to ``_query``, both re-enter a guarded override, the vendor's
+#: ``_query`` dispatches through the client's ``execute_command`` (an instance
+#: attribute, guarded) and that call reaches the connection's guarded command
+#: channel. Each of them would take §17.1's decision again, so ONE logical write
+#: would be counted up to four times in the measure-mode census — the evidence
+#: the declaration programme sizes the remainder with. The decision therefore
+#: belongs to the OUTERMOST guarded entry, and this depth is how it knows.
+_JOURNAL_DECISION_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "tortoise_journal_decision_depth", default=0)
+
+
+@contextmanager
+def _journal_decision_scope():
+    """Mark a guarded entry on the call chain (see `_JOURNAL_DECISION_DEPTH`)."""
+    token = _JOURNAL_DECISION_DEPTH.set(_JOURNAL_DECISION_DEPTH.get() + 1)
+    try:
+        yield
+    finally:
+        _JOURNAL_DECISION_DEPTH.reset(token)
+
+
+def _decides_once_per_write(method):
+    """Decide §17.1 once for a whole guarded call, not once per inner seam.
+
+    Applied to every guarded entry point, because the nesting is a property of
+    the VENDOR's delegation, not of one verb: a verb guarded at only its own
+    level still sees its ``_query``/``execute_command`` legs decide again.
+    """
+
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        with _journal_decision_scope():
+            return method(*args, **kwargs)
+
+    return wrapper
+
+
+def _consult_journal_write_authority(handle, statement) -> None:
+    """Give §17.1's authority the statement a guarded handle is about to send.
+
+    Silent when no authority is installed, when the handle cannot name its
+    graph, or when the statement is not text — the hook's own classifier owns
+    the "is this a write" question (ONE classifier, the #3595 precedent), so
+    this function never second-guesses it.
+    """
+    _consult_journal_authority_for_graph(
+        getattr(handle, "name", None), statement,
+        _client_store_key(getattr(handle, "client", None)))
+
+
+def _consult_journal_authority_for_graph(graph, statement, store_key=None) -> None:
+    """The same consultation for a channel that names its graph as an ARGUMENT.
+
+    ``execute_command`` carries no handle — the graph is ``args[1]`` — but it is
+    the same door and must reach the same decision, so the decision takes a
+    graph NAME (and the caller's *store_key*) rather than an object.
+    """
+    hook = _JOURNAL_WRITE_AUTHORITY
+    if hook is None:
+        return
+    if _JOURNAL_DECISION_DEPTH.get() > 1:
+        return  # an inner seam of a call that already decided
+    if not isinstance(graph, str) or not isinstance(statement, str):
+        return
+    hook(store_key, graph, statement)
 
 
 def _unsupported_cypher_operator(cypher: str) -> str | None:
@@ -1163,7 +1323,12 @@ def _guard_query(cypher: str, params=None, *, handle=None) -> str:
     The refusals are the operator scan (#3595), the param map (#7174) and the
     statement TEXT (#8479). The last two are the two halves of the store's
     numeric domain, so a value is guarded whichever surface carries it.
+
+    §17.1's AUTHORITY check runs FIRST (#9079): a write this graph's journal did
+    not authorize may not reach the cache at all, so its answer is the one a
+    caller gets. It is the same order the projection's own write handle uses.
     """
+    _consult_journal_write_authority(handle, cypher)
     _guard_unsupported_cypher(cypher)
     _guard_numeric_params(params)
     _guard_numeric_literals(cypher)
@@ -1309,6 +1474,12 @@ def _guard_execute_command(args, client=None):
             and verb.upper() in _GRAPH_QUERY_COMMANDS
             and isinstance(statement, str)
         ):
+            # §17.1 (#9079): the same authority decision the handle verbs take,
+            # on the statement a raw command actually carries. This channel is
+            # how escape (3) reaches a journal-backed graph without ever
+            # touching `proj.g`.
+            _consult_journal_authority_for_graph(
+                _as_text(args[1]), statement, _client_store_key(client))
             _guard_unsupported_cypher(statement)
             _guard_numeric_literals(statement)
             if _engine_needs_predicate_barrier(client):
@@ -1567,6 +1738,7 @@ class _GuardedExecuteCommand:
         self._raw = raw
         self._client = client
 
+    @_decides_once_per_write
     def __call__(self, *args, **kwargs):
         guarded = _guard_execute_command(args, self._client)
         try:
@@ -1684,24 +1856,29 @@ class _UnsupportedOperatorGuardedQueries:
         super().__init__(client, name)
         self.execute_command = _guarded_execute_command(client.execute_command, client)
 
+    @_decides_once_per_write
     def query(self, q, params=None, timeout=None):
         q = _guard_query(q, params, handle=self)
         return super().query(q, params=params, timeout=timeout)
 
+    @_decides_once_per_write
     def ro_query(self, q, params=None, timeout=None):
         q = _guard_query(q, params, handle=self)
         return super().ro_query(q, params=params, timeout=timeout)
 
+    @_decides_once_per_write
     def _query(self, q, params=None, timeout=None, read_only=False):
         q = _guard_query(q, params, handle=self)
         return super()._query(
             q, params=params, timeout=timeout, read_only=read_only
         )
 
+    @_decides_once_per_write
     def profile(self, query, params=None):
         query = _guard_query(query, params, handle=self)
         return super().profile(query, params=params)
 
+    @_decides_once_per_write
     def explain(self, query, params=None):
         query = _guard_query(query, params, handle=self)
         return super().explain(query, params=params)
@@ -1736,12 +1913,14 @@ class _GuardedHandleProxy:
         self._handle = handle
         self._client = getattr(handle, "client", None)
 
+    @_decides_once_per_write
     def query(self, q, params=None, timeout=None):
         q = _guard_query(q, params, handle=self._handle)
         return _forward_query(
             self._handle.query, q, params, timeout,
             mutating=_statement_mutating(q))
 
+    @_decides_once_per_write
     def ro_query(self, q, params=None, timeout=None):
         q = _guard_query(q, params, handle=self._handle)
         # The arm comes from the TEXT, not the verb: the vendor's "read-only"
@@ -1752,6 +1931,7 @@ class _GuardedHandleProxy:
             self._handle.ro_query, q, params, timeout,
             mutating=_statement_mutating(q))
 
+    @_decides_once_per_write
     def _query(self, q, params=None, timeout=None, read_only=False):
         q = _guard_query(q, params, handle=self._handle)
         # ``read_only`` selects the VERB (``GRAPH.RO_QUERY`` vs ``GRAPH.QUERY``),
@@ -1761,6 +1941,7 @@ class _GuardedHandleProxy:
             mutating=_statement_mutating(q),
             read_only=read_only)
 
+    @_decides_once_per_write
     def profile(self, query, params=None):
         query = _guard_query(query, params, handle=self._handle)
         # GRAPH.PROFILE EXECUTES the statement, so the text decides.
@@ -1768,6 +1949,7 @@ class _GuardedHandleProxy:
             self._handle.profile, query, params,
             mutating=_statement_mutating(query))
 
+    @_decides_once_per_write
     def explain(self, query, params=None):
         query = _guard_query(query, params, handle=self._handle)
         # The arm comes from the POLICY SET, through the same classifier the
@@ -1781,6 +1963,7 @@ class _GuardedHandleProxy:
             mutating=_command_mutating(
                 ("GRAPH.EXPLAIN", getattr(self._handle, "name", ""), query)))
 
+    @_decides_once_per_write
     def execute_command(self, *args, **kwargs):
         args = _guard_execute_command(args, self._client)
         try:

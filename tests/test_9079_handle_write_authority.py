@@ -52,6 +52,7 @@ import pytest
 from tortoise.projection import (
     _HANDLE_MUTATING_VERBS,
     DirectCacheWriteRefused,
+    _graph_metadata_write_scope,
     _GuardedGraph,
     _live_write_scope,
     _replay_write_scope,
@@ -758,10 +759,17 @@ def test_schema_ddl_survives_the_armed_guard(armed_sdk, enforced):
     not the armed sweep created anything — measured: with `enforced` added and
     the declaration deleted, this test still passed, because the indexes were
     inherited from construction. So the two indexes the sweep owes are DROPPED
-    first (through the inner handle, escape (2) of the three the module's SCOPE
-    block names) and the test requires the ARMED sweep to put them back. Armed +
+    first, and the test requires the ARMED sweep to put them back. Armed +
     undeclared, the creation sites' `except Exception` swallow the refusal and
     both assertions below red.
+
+    ⛔ THE DROP DECLARES A LANE NOW (#9079). It used to go through the inner
+    handle (`proj.g._g`, escape (2)), which was the SHORTEST way to say "not a
+    production writer". That escape is a §17.1 DOOR as of #9079 — an UNDECLARED
+    write to a journal-backed cache, refused when armed — so a fixture that
+    reached through it would be asserting the hole this suite exists to close.
+    The fixture states what it is instead (`_graph_metadata_write_scope`), which
+    is exactly the declaration the door asks a real writer for.
     """
     sdk = armed_sdk
     proj = sdk._get_proj()
@@ -769,8 +777,9 @@ def test_schema_ddl_survives_the_armed_guard(armed_sdk, enforced):
 
     # Remove the two indexes this test is about, so their presence afterwards is
     # the armed sweep's work and nothing else.
-    proj.g._g.query("DROP INDEX ON :Point(pointKind)")
-    proj.g._g.query("CALL db.idx.fulltext.drop('Point')")
+    with _graph_metadata_write_scope("test-fixture: drop the indexes"):
+        proj.g._g.query("DROP INDEX ON :Point(pointKind)")
+        proj.g._g.query("CALL db.idx.fulltext.drop('Point')")
     before = {str(cell) for row in proj.g.ro_query("CALL db.indexes()").result_set
               for cell in row}
     assert not any("pointKind" in c for c in before), (
@@ -838,18 +847,30 @@ def test_the_schema_lane_also_authorizes_the_documented_corpus_fixup(
         returns is still refused (`DirectCacheWriteRefused`), which is the
         boundary the companion test above pins from the other side.
 
-    The seed goes through the INNER handle (`proj.g._g`, escape (2) of the three
-    the module's SCOPE block names) on purpose: it is a test-only fixture write,
-    and the guarded handle would rightly refuse it under `enforced`.
+    The seed DECLARES a lane (#9079): it used to go through the INNER handle
+    (`proj.g._g`, escape (2)), which was the shortest way to reach the graph
+    without the guard object. That escape is a §17.1 door now — refused when
+    armed and undeclared — so the fixture deposits its owed state the way a real
+    writer must, with a declaration.
+
+    ⛔ THE LANE IS THE REPLAY ONE, not the graph-metadata one (#9079 review). A
+    `CREATE (n:Point …)` is recoverable CORPUS state — the exact `:Point` a
+    replayed `PointAdded` would produce — and `_graph_metadata_write_scope`'s own
+    contract refuses that: *"a write that a journal record COULD describe belongs
+    on `_live_write_scope` … `#9068` is the shape this must never become"*. The
+    seeded state stands in for a replayed record, so `_replay_write_scope` is the
+    lane that states the truth; the index DDL above is the opposite case and
+    keeps the graph-metadata lane.
     """
     sdk = armed_sdk
     proj = sdk._get_proj()
     assert proj._journal_backed
 
-    proj.g._g.query(
-        "CREATE (n:Point {id:'search-keys-owed', content:'owed search keys', "
-        "search_keys:['alpha','beta']})"
-    )
+    with _replay_write_scope():
+        proj.g._g.query(
+            "CREATE (n:Point {id:'search-keys-owed', content:'owed search keys', "
+            "search_keys:['alpha','beta']})"
+        )
     assert proj._array_valued_search_keys_exist(), (
         "the fixture did not create the owed fixup state — without an array "
         "`search_keys` the sweep never reaches `_fix_point_search_keys` and "
