@@ -273,17 +273,31 @@ _UNRESOLVED = {
     # `{_capture_passthrough_read_fields()}`, …) — the #9124 review's P1 shape,
     # which a placeholder substitution used to flatten into a false READ.
     "_count_ep_factors",
-    # #9063: both calibration readers build their Cypher the same way — the
-    # `WHERE` fragment is bound to a LOCAL (`where = f"WHERE {not_operator} …"`)
-    # and interpolated as `proj.g.query(f"MATCH (n:Point) {where} … RETURN …")`,
-    # which the resolver cannot unfold. Checked by hand: the resolvable part of
+    # #9063: both calibration readers hide their statement from the resolver, in
+    # two DIFFERENT shapes — so "they build their Cypher the same way" is false
+    # for one of them, which is why the shapes are spelled out separately here
+    # rather than as one shared sentence. Both were re-read in `tortoise/sdk.py`
+    # for this note:
+    #   `calibrate_summary` binds a `where` LOCAL (`f"WHERE {not_operator} …"`)
+    #   and interpolates it straight into the call — `proj.g.query(f"MATCH
+    #   (n:Point) {where} … RETURN …")` — so the fragment it cannot unfold is
+    #   that `where` TEXT.
+    #   `_uncalibrated_ep_participants` composes a per-label `query` VARIABLE
+    #   (`f"MATCH (n:{label}) WHERE {where} RETURN n.id"`, an `IN $ids` form, and
+    #   a trailing `LIMIT` appended with `+=`) and passes the VARIABLE —
+    #   `proj.g.query(query, params=params)` — so here the unresolvable fragment
+    #   is the whole ASSEMBLED statement, not one bound piece of it.
+    # What the two share is only WHY they are unresolvable, not what they look
+    # like. Checked by hand: the resolvable part of
     # both statements is a `MATCH … RETURN` read with no write keyword (they
     # list uncalibrated points; neither writes the cache and neither appends a
     # record). Listed here rather than silently called a read, per this set's
     # own rule. (These two rows are why the census reddened on `origin/main`
     # at e08a669b2 — the entries, not the statements, were missing.)
     # ⚠️ The human step covers the WHOLE statement, not just its resolvable
-    # part — for these rows the unresolvable fragment IS the `where` text, so
+    # part — for these rows the unresolvable fragment IS the statement text the
+    # resolver cannot unfold (the `where` local for `calibrate_summary`, the
+    # whole assembled `query` for `_uncalibrated_ep_participants`), so
     # "the readable half has no write keyword" would not settle it. Measured,
     # each function's only handle reach is ONE read:
     #   `calibrate_summary` — `MATCH … OPTIONAL MATCH … RETURN` (a read)
