@@ -88,6 +88,33 @@ _NON_MUTATING_HANDLE_METHODS = {
     "_refuse_key_space_handle_command",
 }
 
+def _wire_reaching_calls(func) -> set[str]:
+    """Calls in `func`'s BODY (never its prose) that reach the client.
+
+    AST-based on purpose: the refusal helpers' DOCSTRINGS quote
+    ``proj.g.execute_command("DEL", …)`` as the evidence for why they exist, so
+    a substring test over `inspect.getsource` reads prose as a dispatch and reds
+    on a method that is correctly filed. Walking the parsed tree sees only real
+    calls.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if not isinstance(target, ast.Attribute):
+            continue
+        base = ast.unparse(target.value)
+        if base in ("self._g", "self._proj.g", "self.g"):
+            found.add(f"{base}.{target.attr}")
+    return found
+
+
 #: #9209 — the third bucket: MUTATING verbs on the handle whose refusal is NOT
 #: the §17.1 statement check, mapped to the guard(s) that must appear in each
 #: verb's own body.
@@ -333,6 +360,24 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
                 "but its body does not consult it — an unguarded mutating "
                 "verb declared guarded is worse than an unlisted one"
             )
+
+    # ⛔ THE BUCKET'S CLAIM IS CHECKED, not just its membership (#9223 review,
+    # measured). `_NON_MUTATING_HANDLE_METHODS` says "this method puts no
+    # mutating statement on the wire", and membership used to be the whole
+    # assertion: adding a `flushall` method that dispatches `FLUSHALL` and filing
+    # it under the bucket with a plausible reason left this gate GREEN. A member
+    # must therefore make no call that reaches the client, which also catches a
+    # future verb that merely delegates.
+    for name in _NON_MUTATING_HANDLE_METHODS:
+        reaching = _wire_reaching_calls(getattr(_GuardedGraph, name))
+        assert not reaching, (
+            f"`_GuardedGraph.{name}` is filed in "
+            "`_NON_MUTATING_HANDLE_METHODS`, but its body calls "
+            f"{sorted(reaching)}: a method that can reach the wire is not "
+            "non-mutating. If it mutates without carrying a statement, it "
+            "belongs in `_NON_STATEMENT_GUARDED_HANDLE_VERBS` with the guard "
+            "that refuses it named"
+        )
     # `execute_command` carries a statement only in its args, so it is checked
     # separately — and this is the assertion that keeps it from being forgotten.
     assert "_refuse_unauthorized_cache_write" in inspect.getsource(
