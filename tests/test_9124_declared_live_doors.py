@@ -1336,15 +1336,22 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
     seen.append(bindings)  # RETAINED, so this `id` cannot be recycled under us
     call_names = {id(node.func) for node in ast.walk(expr)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-    # A parameter passed to a SCALAR COERCION cannot carry statement text; one
-    # interpolated straight into the text, or passed to `str(...)` (which returns
-    # it verbatim), can. Computed over the whole expression, so the two states
-    # cannot be confused by walk order.
-    scalar_arg_ids = {id(arg) for node in ast.walk(expr)
-                      if isinstance(node, ast.Call)
-                      and isinstance(node.func, ast.Name)
-                      and node.func.id in _SCALAR_COERCIONS
-                      for arg in node.args}
+    # A parameter passed to an UNshadowed scalar coercion cannot carry statement
+    # text; one interpolated straight into the text, or passed to `str(...)`
+    # (which returns it verbatim), can. The shadowing checks MIRROR the bare-name
+    # arm below — `int = str` makes `int(extra)` a verbatim pass-through, and
+    # exempting it re-opened the `str(extra)` hole one binding away (measured
+    # GREEN). Computed over the whole expression, so the two states cannot be
+    # confused by walk order.
+    scalar_arg_ids = {
+        id(arg) for node in ast.walk(expr)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _SCALAR_COERCIONS
+        and node.func.id not in bindings
+        and (module is None
+             or node.func.id not in _module_bindings(module))
+        for arg in node.args}
     for sub in ast.walk(expr):
         if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
             callee, callee_module, callee_path = _resolve_callee(
@@ -1390,6 +1397,18 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
                     value, bindings, params, module, path, followed, unread,
                     depth + 1, visited,
                     params_are_inspected=params_are_inspected))
+            if sub.id in params and not params_are_inspected \
+                    and id(sub) not in scalar_arg_ids:
+                # A LOCAL binding of a PARAMETER name must not HIDE it: this
+                # branch is tested before the `params` arm, so a rebind (a `for`
+                # target, a comprehension variable, a nested helper's
+                # assignment — `_local_bindings` is a flat union) resolved the
+                # name to its binding and the `params` arm was never reached,
+                # so a caller-supplied fragment was neither followed nor
+                # reported (measured GREEN: `f"…{extra}"` with
+                # `for extra in []:`). Reported as well, which is the same
+                # over-report direction `_local_bindings` already documents.
+                unread.add(sub.id)
         elif module is not None and sub.id in _module_bindings(module):
             for value in _module_bindings(module)[sub.id]:
                 fragments.extend(_fragments_of(
@@ -2119,6 +2138,62 @@ def test_a_write_in_a_callee_default_is_read():
         "a write sitting in a callee's DEFAULT was never walked, and the "
         "call's argument presence blessed the parameters — so the pin stayed "
         f"green over a writing statement (offenders={offenders})")
+
+
+def test_a_local_rebind_does_not_hide_a_parameter():
+    """NON-VACUITY for the `bindings`-shadows-parameter arm (review P2).
+
+    The `bindings` branch is tested BEFORE the `params` arm, and `_local_bindings`
+    is a flat union that also collects a `for` target, a comprehension variable
+    and a nested helper's assignment. So rebinding a parameter name resolved it
+    to the binding and the `params` arm was never reached: a caller-supplied
+    fragment was neither followed nor reported (`f"…{extra}"` came back GREEN
+    once `for extra in []:` was added).
+    """
+    source = (
+        'class Door:\n'
+        '    def reading(self, proj, extra):\n'
+        '        query = f"MATCH (n:Point) RETURN n.id {extra}"\n'
+        '        for extra in []:\n'
+        '            pass\n'
+        '        return proj.g.query(query).result_set\n')
+    assert any("could not be read out" in offender
+               for offender in _offenders_for(source)), (
+        "a local rebind of a parameter name HID the parameter, so a "
+        "caller-supplied fragment was neither followed nor reported — the "
+        "exact hole the bare `{extra}` case is reported for")
+
+
+def test_a_shadowed_scalar_coercion_does_not_exempt_its_argument():
+    """NON-VACUITY for the shadowing checks on the scalar allow-list (P2).
+
+    The exemption keyed on the call's NAME, without checking that the name still
+    IS the builtin — the asymmetry the bare-name arm already handles. So
+    `int = str; int(extra)` blessed its argument while `str(extra)` is reported,
+    i.e. the `str` hole re-opened one binding away. Same for a module-level
+    rebind (`round = str`).
+    """
+    local = (
+        'class Door:\n'
+        '    def reading(self, proj, extra):\n'
+        '        int = str\n'
+        '        query = f"MATCH (n:Point) RETURN n.id {int(extra)}"\n'
+        '        return proj.g.query(query).result_set\n')
+    assert any("could not be read out" in offender
+               for offender in _offenders_for(local, with_module=True)), (
+        "a locally SHADOWED scalar coercion (`int = str`) exempted its "
+        "argument, re-opening the `str(extra)` pass-through one binding away")
+
+    module_level = (
+        'round = str\n'
+        'class Door:\n'
+        '    def reading(self, proj, extra):\n'
+        '        query = f"MATCH (n:Point) RETURN n.id {round(extra)}"\n'
+        '        return proj.g.query(query).result_set\n')
+    assert any("could not be read out" in offender
+               for offender in _offenders_for(module_level, with_module=True)), (
+        "a MODULE-level rebind of a scalar coercion exempted its argument, so "
+        "a caller-supplied fragment passed through the pin")
 
 
 def test_the_calibration_reader_list_is_bound_to_the_rows_it_guards():
