@@ -1053,8 +1053,11 @@ def test_the_event_store_declares_every_writer():
     assert not undeclared, (
         "every event_store write must declare a lane — "
         "`_graph_metadata_write_scope` for the store's own bookkeeping (schema, "
-        "seq allocator, append, retention) or `_replay_write_scope` for the "
-        "wipe+replay repair. Undeclared:\n  " + "\n  ".join(
+        "seq allocator, append, retention), or `_cache_write_authorized("
+        "restore_reason or \"replay\")` at the write for the wipe+replay "
+        "repair (`#9224` for the replay lane, `#9210` for the restore lane; "
+        "the helper opens it there because an inner scope shadows any `with` "
+        "at the call site). Undeclared:\n  " + "\n  ".join(
             f"{name}:{fact['lineno']} {fact['writes'][0][1]}: "
             f"{fact['writes'][0][2]!r}" for name, fact in undeclared.items()))
     # The store is small enough to pin exactly: a NEW write here must be a

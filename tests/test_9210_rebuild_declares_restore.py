@@ -384,14 +384,28 @@ def _assert_every_leg_declares_itself(seen, *, context: str):
 
 
 def test_every_snapshot_restore_leg_declares_itself(tmp_path, monkeypatch):
-    """RED before #9210: the restore writes ran under NO declaration at all.
+    """RED before #9210: every restore leg observed the REPLAY lane.
 
-    `_CACHE_WRITE_AUTHORIZED` is `None` at these statements on the pre-fix
-    tree, which is precisely what `#9124`'s closed door reads as "refuse" — so
-    the leg that says "these writes are not record replays" is what keeps the
-    restore alive when the door closes, and what stops the answer to "which
-    writes are authorized by replay" from being "whatever this method happens
-    to contain".
+    The pre-fix observation is `"replay"`, NOT `None`. `#9213` landed a
+    method-wide `_replay_write_scope()` in `rebuild_all`, and the restore legs
+    run inside `_rebuild_all_replay` underneath it, so on the merge base these
+    writes were already AUTHORIZED — by a claim that is false for them, which
+    is the defect this lane removes. `"replay"` is in no leg's reason set, so
+    this test reds on the base tree. The revert-mutation agrees: replace a
+    `_restore_write(...)` with the bare `self.g.query(...)` it wraps and the
+    observation falls back to the engine's own `"replay"`, never to `None`.
+
+    What is pinned is therefore the SHADOWING, not the survival of a
+    permit-free tree: `rebuild_all` is called plainly, with no permit opened by
+    the caller, and every restore write must still name its own leg over the
+    engine's replay permit — which is what stops the answer to "which writes
+    are authorized by replay" from being "whatever this method happens to
+    contain".
+
+    MEASURED on this PR's base (`bed945fd3` = `origin/main`) with the lane
+    removed (`_restore_write` → the bare `self.g.query(...)` it wraps, the
+    watermark called without `restore_reason`): all ELEVEN legs observe
+    `"replay"`. `None` is the pre-`#9213` figure, not this base's.
     """
     sdk, events = _mk_sdk(tmp_path)
     try:
@@ -415,10 +429,16 @@ def test_an_outer_replay_permit_cannot_cover_a_restore_write(tmp_path,
     permit around the rebuild and requires the restore legs to be unaffected:
     the inner declaration shadows the outer one.
 
-    WHY IT CANNOT PASS VACUOUSLY: the same run must observe the outer permit at
+    WHY IT CANNOT PASS VACUOUSLY: the same run must observe a replay permit at
     work on the fold (`reason == "replay"` on a statement that is NOT a
     restore leg). Without that half, a `_replay_write_scope()` that never
     reached the handle would let the test pass while proving nothing.
+
+    ⚠️ That half is satisfied by `rebuild_all`'s OWN method-wide permit
+    (`#9213`), not necessarily by the one this test opens: the engine opens one
+    either way, so the observation cannot tell the two apart. The property the
+    test does establish is the one that matters — a replay permit IS in force
+    at the handle during this run, and the restore legs do not inherit it.
 
     RED before #9210 with `reason == "replay"` on every restore leg — the false
     contract in the observable — rather than with `None`.
@@ -431,7 +451,7 @@ def test_an_outer_replay_permit_cannot_cover_a_restore_write(tmp_path,
         with _replay_write_scope():
             proj.rebuild_all(str(events), confirm_destructive=True)
 
-        # The permit was REAL: it reached the handle on the fold.
+        # A replay permit was REAL here: it reached the handle on the fold.
         permit_on_non_restore = [
             cypher for cypher, reason in seen
             if reason == "replay" and _leg_of(cypher) is None and _writes(cypher)]
@@ -478,9 +498,10 @@ def test_the_lane_constant_matches_the_pinned_literal():
     tests above pinned, so neither can be renamed past the other.
 
     This is the ONE test here that reaches for the symbol the fix adds; every
-    behavioural test above is written against the literal, which is why they
-    go red on the OBSERVED AUTHORIZATION (a `None`, and a `"replay"`) on the
-    pre-fix tree rather than on an ImportError.
+    behavioural test above is written against the literal, which is why they go
+    red on the OBSERVED AUTHORIZATION rather than on an ImportError — a
+    `"replay"` on the current base (whose `#9213` permit is the false
+    contract), a `None` on a pre-`#9213` tree.
     """
     from tortoise.projection import _PREWIPE_RESTORE_LANE
 
