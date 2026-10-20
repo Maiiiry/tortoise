@@ -52,6 +52,7 @@ import pytest
 from tortoise.projection import (
     _HANDLE_MUTATING_VERBS,
     DirectCacheWriteRefused,
+    _dispatch_decided,
     _graph_metadata_write_scope,
     _GuardedGraph,
     _live_write_scope,
@@ -89,6 +90,15 @@ _NON_MUTATING_HANDLE_METHODS = {
     "_refuse_key_space_handle_command",
 }
 
+#: Helpers that DISPATCH on a handle they are handed — `_dispatch_decided(self._g,
+#: "query", …)` reaches `self._g.query` exactly as `self._g.query(…)` does, and
+#: since #9079 EVERY wire-reaching dispatch in `_GuardedGraph` uses this form, so
+#: a detector that only followed attribute calls would have been blind to all
+#: seven of them (#9079 review, P2: the gate read as live but could no longer
+#: fail on the form the class actually uses).
+_DISPATCH_HELPERS = frozenset({"_dispatch_decided"})
+
+
 def _wire_reaching_calls(func) -> set[str]:
     """Calls in `func`'s BODY (never its prose) that reach the client.
 
@@ -120,33 +130,38 @@ def _wire_reaching_calls(func) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         target = node.func
-        if isinstance(target, ast.Attribute):
-            base = ast.unparse(target.value)
-            if base in roots:
-                found.add(f"{base}.{target.attr}")
-            continue
-        # ⛔ THE DISPATCH FORM THIS CLASS ACTUALLY USES (#9079 review, P2).
-        # Every wire-reaching verb was rewritten from `self._g.<verb>(…)` to
-        # `_dispatch_decided(self._g, "<verb>", …)`, whose `func` is a NAME —
-        # which the attribute-only walker above skipped. The bucket's own claim
-        # ("a member must make no call that reaches the client") therefore
-        # became unfalsifiable for the only form the class uses: a future method
-        # filed into `_NON_MUTATING_HANDLE_METHODS` that dispatches through the
-        # helper would have passed this gate green. A call whose FIRST
-        # positional argument is a root reaches `<root>.<verb>` just as surely.
-        if isinstance(target, ast.Name) and target.id == "_dispatch_decided":
+        # ⛔ THE DISPATCH FORM COUNTS TOO (#9079 review, P2).
+        # `_dispatch_decided(self._g, "query", …)` is how every verb in the
+        # class now reaches the wire, so skipping it made this gate
+        # unfalsifiable on the very form it is meant to police.
+        if isinstance(target, ast.Name) and target.id in _DISPATCH_HELPERS:
             if not node.args:
-                found.add("_dispatch_decided(<no handle>)")
                 continue
             base = ast.unparse(node.args[0])
             if base not in roots:
                 continue
-            verb = "<dispatch>"
-            if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) \
-                    and isinstance(node.args[1].value, str):
+            verb = "*"
+            if (len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)):
                 verb = node.args[1].value
             found.add(f"{base}.{verb}")
+            continue
+        if not isinstance(target, ast.Attribute):
+            continue
+        base = ast.unparse(target.value)
+        if base in roots:
+            found.add(f"{base}.{target.attr}")
     return found
+
+
+def _dispatch_probe(self):
+    """AST FIXTURE for `test_the_wire_detector_sees_a_dispatch_half`.
+
+    Never called. Its body is the shape every `_GuardedGraph` verb now uses, and
+    the test asserts the detector can see it — a detector that returned an empty
+    set for this source is the P2 the test exists for.
+    """
+    return _dispatch_decided(self._g, "query", "CREATE (n:Probe {id:'p'})")
 
 
 #: #9209 — the third bucket: MUTATING verbs on the handle whose refusal is NOT
@@ -466,22 +481,25 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
     )
 
 
-def test_the_wire_detector_sees_the_dispatch_form_the_handle_uses():
-    """The bucket's gate must be able to FAIL on the form every verb uses.
+def test_the_wire_detector_sees_a_dispatch_half():
+    """The `_NON_MUTATING_HANDLE_METHODS` gate must be able to FAIL on the
+    dispatch form the class actually uses (#9079 review, P2).
 
-    RED before the fix: `_GuardedGraph.query` dispatches through
-    `_dispatch_decided(self._g, "query", …)`, whose `func` is a NAME, and the
-    detector walked `ast.Attribute` funcs only — so it returned an EMPTY set for
-    a verb that writes the cache, and `_NON_MUTATING_HANDLE_METHODS`'s "no call
-    reaches the client" assertion could not fail on the very dispatch form the
-    class uses in all seven of its wire-reaching verbs (#9079 review, P2).
+    RED before the detector fix: every wire-reaching dispatch in `_GuardedGraph`
+    was rewritten from `self._g.<verb>(…)` to `_dispatch_decided(self._g,
+    "<verb>", …)`, whose `func` is an `ast.Name` — so the attribute-only walker
+    returned an EMPTY set for the probe below and the "a non-mutating method must
+    not reach the client" assertion could no longer reds on the form it polices.
     """
-    reaching = _wire_reaching_calls(_GuardedGraph.query)
-    assert "self._g.query" in reaching, (
+    assert _wire_reaching_calls(_dispatch_probe) == {"self._g.query"}, (
         "the detector cannot see `_dispatch_decided(self._g, \"query\", …)`, so "
-        "a mutating method filed into `_NON_MUTATING_HANDLE_METHODS` passes the "
-        f"gate green; saw {sorted(reaching)}"
+        "the non-mutating-handle-methods gate is decorative for every verb in "
+        "the class"
     )
+    # ... and it stays TRUE for the members it polices.
+    for name in sorted(_NON_MUTATING_HANDLE_METHODS):
+        assert not _wire_reaching_calls(getattr(_GuardedGraph, name)), (
+            f"`_GuardedGraph.{name}` reaches the wire")
 
 
 def test_a_mutating_statement_through_the_command_channel_is_refused(armed_sdk, enforced):

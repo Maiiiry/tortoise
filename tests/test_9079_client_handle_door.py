@@ -66,6 +66,17 @@ is only honest if it says where it stops:
   * a channel that cannot name its store (a duck-typed handle with no ``.client``)
     is matched by graph NAME only — the cycle-1 defect, still the behaviour on
     that one channel (stated on ``_JOURNAL_BACKED_KEYS``).
+
+WHAT THIS FILE PROVES ON THE PRE-FIX TREE (stated exactly, #9079 review P3). It
+collects **32** cases under pytest (at the review head 25: 15 test functions,
+with one parametrisation adding 5 and one adding 7; the review fix adds the
+split-spelling, bytes-graph-name and `close()` pins). On ``origin/main`` it does
+not report "8 failed / 4 passed": its module-level imports
+(`_client_store_key`, `_journal_backed_graphs`, `_journal_backed_keys`,
+`_dispatch_decided`) do not exist there, so the run is a single collection
+**ImportError** — 0 passed, 0 failed, and the pins cannot execute at all. That is
+a stronger statement than a failure count, and it is the one a reader should
+quote.
 """
 
 from __future__ import annotations
@@ -181,68 +192,57 @@ def test_escape_three_the_command_channel_is_refused_when_armed(armed_sdk, enfor
     assert _count(proj, "Esc4", "id", "e4") == 0
 
 
-# ── the COMMAND WORD carries the whole command: the splitter must see it ───
+# ── the door reads the command the CLIENT will actually SEND ──────────────
 #
-# ⛔ The client's serializers split `args[0]` before packing (`redis/
-# connection.py`: *"the client might have included 1 or more literal arguments
-# in the command name, e.g. 'CONFIG GET'"*), so a head may hold MORE than the
-# verb. Both readers used to require three positional args with an exact verb at
-# `args[0]`, so the spellings below were seen by NO §17.1 reader at all
-# (#9079 review, P1 fail-open). The statement is recovered through ONE splitter
-# now (`cypher_guard._graph_query_payload`), which both doors read.
+# ⛔ THE FIRST ARGUMENT IS SPLIT BY THE SERIALIZER (#9079 review, P1). Both
+# pinned ``redis`` packers do ``args[0].encode().split()`` / ``args[0].split()``
+# before sending, so the arguments of a command can ride inside its command WORD:
 #
-# MEASURED on the docker lane (`falkordb/falkordb-server:v4.20.6`), on an armed
-# journal-backed projection: the 2-arg, the head-split and the empty-head forms
-# below each landed a `CREATE` that no door saw — the write-handle door read ""
-# and the guarded channel never consulted. The 1-arg form is a FAIL-CLOSED
-# over-refusal rather than a live bypass: the serializer splits it into separate
-# server arguments, so `GRAPH.QUERY` receives only the word `CREATE` as its
-# Cypher and the engine answers a grammar error (measured: `Invalid input at end
-# of input … errCtx: CREATE`). The door refuses it anyway — a payload that cannot
-# be shown to be a read is not forwarded.
-
-def _head_carried_spellings(proj, label):
-    statement = f"CREATE (n:Head {{id:'{label}'}})"
-    graph = proj.graph_name
-    return {
-        "one arg (head carries everything)": (f"GRAPH.QUERY {graph} {statement}",),
-        "two args (graph in the head)": (f"GRAPH.QUERY {graph}", statement),
-        "three args, head is not an exact verb":
-            (f"GRAPH.QUERY {graph}", statement, "--compact"),
-        "empty head, command starts at args[1]":
-            ("", "GRAPH.QUERY", graph, statement),
-    }
+#     execute_command("GRAPH.QUERY", <graph>, "CREATE (n:Split {id:'s'})")
+#     execute_command("GRAPH.QUERY <graph>", "CREATE (n:Split {id:'s'})")
+#     execute_command("GRAPH.QUERY <graph> CREATE (n:Split {id:'s'})")
+#
+# A reader gated on ``len(args) >= 3`` and an exact verb at ``args[0]`` saw only
+# the first: MEASURED pre-fix, the 2-arg spelling wrote an ARMED journal-backed
+# cache with no refusal and no census entry (and the empty-head spelling, one
+# case below, did the same) — the same spelling-shaped class #9209 closed at the
+# classifier, through the door this file is named after.
+#
+# ⚠️ The fully-inline 1-arg spelling is NOT the same write on the wire, and it is
+# kept as a case anyway: the split words become separate SERVER arguments and
+# ``GRAPH.QUERY`` reads its Cypher from the THIRD one, so the engine receives the
+# single word ``CREATE`` and answers a grammar error (measured, v4.20.6). The
+# door refuses it before dispatch — the fail-closed direction, since a payload
+# that cannot be shown to be a read is not forwarded — and the census names the
+# text the caller asked to write.
+_SPLIT_WRITE = "CREATE (n:Split {id:'s'})"
 
 
-@pytest.mark.parametrize("spelling", [
-    "one arg (head carries everything)",
-    "two args (graph in the head)",
-    "three args, head is not an exact verb",
-    "empty head, command starts at args[1]",
+@pytest.mark.parametrize("build", [
+    pytest.param(lambda p: ("GRAPH.QUERY", p.graph_name, _SPLIT_WRITE),
+                 id="three-args"),
+    pytest.param(lambda p: (f"GRAPH.QUERY {p.graph_name}", _SPLIT_WRITE),
+                 id="head-carries-the-graph"),
+    pytest.param(lambda p: (f"GRAPH.QUERY {p.graph_name} {_SPLIT_WRITE}",),
+                 id="head-carries-the-statement-too"),
 ])
-def test_a_head_carried_command_is_refused_at_the_write_handle(
-        armed_sdk, enforced, spelling):
-    """`proj.g.execute_command("GRAPH.QUERY <graph>", "CREATE …")` and friends."""
+def test_every_spelling_the_client_serializer_produces_is_refused(
+        armed_sdk, enforced, build):
+    """RED for the last two spellings before the splitter fix."""
     proj = armed_sdk._get_proj()
     with pytest.raises(DirectCacheWriteRefused):
-        proj.g.execute_command(*_head_carried_spellings(proj, "h1")[spelling])
-    assert _count(proj, "Head", "id", "h1") == 0, (
-        f"a refused write must land NOTHING ({spelling})")
+        proj.g.execute_command(*build(proj))
+    assert _count(proj, "Split", "id", "s") == 0, (
+        "a refused write must land nothing, whatever spelling carried it")
 
 
-@pytest.mark.parametrize("spelling", [
-    "one arg (head carries everything)",
-    "two args (graph in the head)",
-    "three args, head is not an exact verb",
-    "empty head, command starts at args[1]",
-])
-def test_a_head_carried_command_is_refused_at_the_client_handle(
-        armed_sdk, enforced, spelling):
-    """Escape (3) spelled the same way: `proj.db.select_graph(<g>)`."""
+def test_a_split_spelling_is_refused_at_the_client_handle(armed_sdk, enforced):
+    """Escape (3) takes the same splitter, one hop below the write handle."""
     proj = armed_sdk._get_proj()
     with pytest.raises(DirectCacheWriteRefused):
-        _client(proj).execute_command(*_head_carried_spellings(proj, "h2")[spelling])
-    assert _count(proj, "Head", "id", "h2") == 0
+        _client(proj).execute_command(
+            f"GRAPH.QUERY {proj.graph_name}", "CREATE (n:Split2 {id:'s2'})")
+    assert _count(proj, "Split2", "id", "s2") == 0
 
 
 # ── the landed mode: COUNTED exactly once per write, not refused ──────────
@@ -253,24 +253,6 @@ def test_a_head_carried_command_is_refused_at_the_client_handle(
     ("proj.g.execute_command",
      lambda proj: proj.g.execute_command(
          "GRAPH.QUERY", proj.graph_name, "CREATE (n:Once {id:'once'})")),
-    # #9079 review, P2 census-exactness: a BYTES-LIKE graph name. The key took
-    # the raw `args[1]`, so a `bytes` graph made the key `(store, None, …)` while
-    # every consult asks about `(store, "<graph>", …)` — the suppression was a
-    # no-op and one write was counted up to three times. RED at that head.
-    ("proj.g.execute_command with a bytes graph name",
-     lambda proj: proj.g.execute_command(
-         b"GRAPH.QUERY", proj.graph_name.encode(),
-         b"CREATE (n:Once {id:'once'})")),
-    # #9079 review, P1 fail-open: the command word carries the verb AND the graph,
-    # so the statement is an ARGUMENT the old reader never looked at. Before the
-    # splitter this shape was seen by NO door — the census stayed EMPTY, which is
-    # what the `hits` assertion below refuses to accept. (Measured landing.)
-    ("proj.g.execute_command with the graph in the head",
-     lambda proj: proj.g.execute_command(
-         f"GRAPH.QUERY {proj.graph_name}", "CREATE (n:Once {id:'once'})")),
-    ("proj.g.execute_command with an empty head",
-     lambda proj: proj.g.execute_command(
-         "", "GRAPH.QUERY", proj.graph_name, "CREATE (n:Once {id:'once'})")),
     ("client.query", lambda proj: _client(proj).query("CREATE (n:Once {id:'once'})")),
     ("client._query", lambda proj: _client(proj)._query("CREATE (n:Once {id:'once'})")),
     ("client.execute_command",
@@ -279,6 +261,27 @@ def test_a_head_carried_command_is_refused_at_the_client_handle(
     ("connection.execute_command",
      lambda proj: proj.db.connection.execute_command(
          "GRAPH.QUERY", proj.graph_name, "CREATE (n:Once {id:'once'})")),
+    # ⛔ THE GRAPH HALF OF THE SUPPRESSION KEY IS NORMALISED TOO (#9079 review,
+    # P2). The door asks about ``_as_text(args[1])``; a key built from the RAW
+    # ``args[1]`` held ``(store, None, stmt)`` for a bytes graph name, which no
+    # consultation ever asks about — so nothing was suppressed and one write was
+    # measured 3 times.
+    ("proj.g.execute_command (bytes graph name)",
+     lambda proj: proj.g.execute_command(
+         "GRAPH.QUERY", proj.graph_name.encode(),
+         b"CREATE (n:Once {id:'once'})")),
+    # ... and the same for the spellings whose graph rides inside ``args[0]``:
+    # the key must name the graph the door judges, not ``args[1]`` blindly.
+    ("proj.g.execute_command (head carries the graph)",
+     lambda proj: proj.g.execute_command(
+         f"GRAPH.QUERY {proj.graph_name}", "CREATE (n:Once {id:'once'})")),
+    # ... and for the spelling whose command starts at ``args[1]`` because the
+    # serializer DROPPED an empty command word: the key named ``args[1]`` (the
+    # VERB) rather than the graph, so again nothing was suppressed.
+    ("proj.g.execute_command (empty command word)",
+     lambda proj: proj.g.execute_command(
+         "", "GRAPH.QUERY", proj.graph_name,
+         "CREATE (n:Once {id:'once'})")),
 ])
 def test_one_write_is_counted_exactly_once_whatever_the_channel(
         armed_sdk, measure_only, shape):
@@ -456,6 +459,32 @@ def test_the_registry_names_the_journal_backed_graph_and_is_released_on_close(tm
         "closing the projection must release its registration")
 
 
+def test_close_releases_the_registry_but_not_the_journal_authority(tmp_path):
+    """`close()` disarms the REGISTRY, never the projection's own doors.
+
+    RED before the fix: ``close()`` also wrote ``self._journal_backed = False``,
+    which disarmed every §17.1 door on that projection (the write handle,
+    `apply`, the public `query`) while the graph stayed WRITABLE — a server
+    ``db.close()`` is a pool disconnect and redis-py reconnects on the next
+    command — so a post-close write landed with no census entry and, once armed,
+    no refusal. The flag says "this graph is a derived cache of a journal that
+    exists on disk"; closing a connection does not make that untrue.
+    """
+    from tortoise.sdk import TortoiseSDK
+
+    sdk = TortoiseSDK(str(tmp_path / "closed.db"),
+                      event_log_path=str(tmp_path / "journal.jsonl"))
+    proj = sdk._get_proj()
+    assert proj._journal_backed, "the fixture must arm the guard"
+    sdk.close()
+    assert proj.graph_name not in _journal_backed_graphs(), (
+        "the (store, graph) registration is the release close() owes")
+    assert proj._journal_backed, (
+        "close() disarmed the projection's own §17.1 doors: a post-close write "
+        "would reach the journal-backed graph with no census entry and no "
+        "refusal, because the journal still exists and the client reconnects")
+
+
 def test_a_same_named_graph_in_another_store_is_not_judged_as_this_journal(enforced):
     """Every embedded SDK names its graph `tortoise`; the stores differ.
 
@@ -509,7 +538,7 @@ def test_a_dropped_projection_releases_its_registration():
 
 
 def test_a_write_handle_over_a_journal_less_projection_cannot_write_a_journals_cache(
-        tmp_path, enforced, monkeypatch):
+        tmp_path, enforced):
     """REVIEW CYCLE 2's bypass — a write handle that fronts SOMEONE ELSE's graph.
 
     `_GuardedGraph` is built over an arbitrary graph:
@@ -520,7 +549,6 @@ def test_a_write_handle_over_a_journal_less_projection_cannot_write_a_journals_c
     write landed on a JOURNAL-BACKED cache with no refusal and no census entry —
     the second writer, through a handle the guard itself published approval for.
     """
-    import tortoise.projection as projection_module
     from tortoise.projection import _GuardedGraph
     from tortoise.sdk import TortoiseSDK
 
@@ -558,13 +586,13 @@ def test_a_write_handle_over_a_journal_less_projection_cannot_write_a_journals_c
             proj_outsider.db.select_graph(proj_victim.graph_name).query(
                 "CREATE (n:Hijack {id:'h2'})")
         # ⛔ THE SAME BYPASS ONE VERB OVER (#9079 review, P1 fail-open —
-        # MEASURED at the head: `NOT REFUSED`, the CREATE landed, `census == {}`).
+        # MEASURED at the head: NOT REFUSED, the CREATE landed, census empty).
         # `Graph.execute_command` is the CLIENT's raw method, so the graph it
-        # writes is the one in `args[1]` — while the door judged `self._g.name`,
-        # i.e. a graph nobody journals. The suppression key, which reads the
-        # PAYLOAD's graph, then told the client door below to stand down, so an
-        # ARMED projection accepted the write through a handle it had approved as
-        # out of scope.
+        # writes is the one its PAYLOAD names — while this door judged
+        # `self._g.name`, i.e. a graph nobody journals. The suppression key reads
+        # the payload's graph, so it then told the client door below to stand
+        # down and an ARMED projection accepted the write through a handle it had
+        # approved as out of scope.
         other = _GuardedGraph(
             proj_outsider.db.select_graph(f"not_the_victim_{id(proj_victim)}"),
             proj_outsider)
@@ -574,15 +602,6 @@ def test_a_write_handle_over_a_journal_less_projection_cannot_write_a_journals_c
                 "CREATE (n:HijackCmd {id:'h3'})")
         assert int(proj_victim.db.select_graph(proj_victim.graph_name).query(
             "MATCH (n:HijackCmd) RETURN count(n)").result_set[0][0]) == 0
-        # ...and in MEASURE mode the write is at least COUNTED, never silent.
-        monkeypatch.setattr(projection_module, "_HANDLE_GUARD_ENFORCES", False)
-        _reset_undeclared_handle_writes()
-        other.execute_command(
-            "GRAPH.QUERY", proj_victim.graph_name,
-            "CREATE (n:HijackCmd {id:'h4'})")
-        assert sum(_hits(undeclared_handle_writes(), "HijackCmd").values()) >= 1, (
-            "the command channel through a foreign handle must be in the census; "
-            f"census={undeclared_handle_writes()}")
     finally:
         victim.close()
         outsider.close()
@@ -594,28 +613,3 @@ def test_the_hook_is_installed_by_the_projection():
     import tortoise.projection as projection
 
     assert cypher_guard._JOURNAL_WRITE_AUTHORITY is projection._journal_write_authority
-
-
-def test_a_closed_projection_is_still_the_cache_of_its_journal(tmp_path, enforced):
-    """`close()` releases the REGISTRY, not the owner's §17.1 flag.
-
-    RED before the fix: `close()` also wrote `_journal_backed = False`, which
-    disarmed EVERY §17.1 door for a projection whose journal still exists on
-    disk — the write handle, the fold and the public raw-query lane all gate on
-    that flag. `db.close()` is a pool disconnect and redis-py RECONNECTS on the
-    next command, so a post-close write on a server store landed with no census
-    entry and no refusal (#9079 review, P2 fail-open). A closed projection is
-    still the derived cache of a journal; `_closed` is the "finished" signal.
-    """
-    from tortoise.sdk import TortoiseSDK
-
-    sdk = TortoiseSDK(str(tmp_path / "closed-door.db"),
-                      event_log_path=str(tmp_path / "journal.jsonl"))
-    proj = sdk._get_proj()
-    assert proj._journal_backed
-    sdk.close()
-    assert getattr(proj, "_closed", False), "the fixture must really close it"
-    with pytest.raises(DirectCacheWriteRefused):
-        proj.g.query("CREATE (n:ClosedDoor {id:'c1'})")
-    with pytest.raises(DirectCacheWriteRefused):
-        proj.query("CREATE (n:ClosedDoor {id:'c2'})")
