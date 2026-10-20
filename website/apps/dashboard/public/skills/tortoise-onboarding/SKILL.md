@@ -574,7 +574,8 @@ exits 3 without writing, because the markers below the fence cannot be told
 apart from an example), or a marker pair that STRADDLES the fence — its START
 marker above, its END marker below — where the fence opens inside the block and
 a rewrite would delete the fence line and promote its contents to live
-instructions. With NO markers at all there is nothing to disambiguate — the
+instructions — nothing is written, so close the fence or delete the stale
+block by hand. With NO markers at all there is nothing to disambiguate — the
 block is appended where the file ends, which is INSIDE the unclosed fence, so
 the installer warns (`AGENTS.md has an UNTERMINATED code fence`) instead of
 refusing, which would change what the pre-#3429 installer did. A block that
