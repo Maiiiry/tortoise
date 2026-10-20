@@ -11549,11 +11549,21 @@ class TortoiseSDK:
             rebuild" until that fold lands.
 
             So the commit point is "after the guarded write, before anything
-            that can strand it" — the point ``invalidate_point`` and
-            ``retract_point`` already use, and the reason this arm was the only
-            apply-first door in its family. It is reached only with a NON-EMPTY
+            that can strand it". It is the closest this arm can take to its
+            siblings' journal-first policy (§17.1, #9124) and is NOT that
+            policy: a zero-row promote is a ROUTINE refusal (the node is gone,
+            or its status cannot promote), so a record ahead of it would
+            describe a transition the call did not perform. That is why this
+            arm is apply-first (`#8830`) and records immediately after the
+            guarded write. The two halves have separate pins:
+            ``test_the_promote_arm_stays_apply_first_a_recorded_deviation``
+            (the write precedes the record) and
+            ``test_a_landed_promote_is_journaled_before_a_later_arm_can_abort``
+            (the record survives a tag arm that aborts after the promote
+            landed). Recording is reached only with a NON-EMPTY
             ``result_set``: every zero-row promote has already returned (the
-            idempotent live no-op) or raised (the diagnostic above).
+            idempotent live no-op, which journals nothing — #1088) or raised
+            (the diagnostic above).
 
             Best-effort, as at the old tail: ``_emit_event`` never raises, and
             the write it describes has already landed, so a failed append is
