@@ -4684,13 +4684,18 @@ class _GuardedGraph:
             # wrong graph. Refused rather than dispatched against a name no check
             # looked at (#9209 review, measured: an undecodable target read as
             # "no target named" and the other graph was deleted).
+            # ⚠️ NOT "journal-backed" here: this branch is reached when the
+            # projection is armed OR is a non-embedded (server) projection, so
+            # a message that promised a journal would tell an operator a truth
+            # store is bound when none is (#9223 review, measured on
+            # `_journal_backed=False, _is_embedded=False`).
             raise DirectCacheWriteRefused(
-                f"Refusing `{command}` on the write handle of a "
-                "journal-backed projection: it names a target graph whose name "
-                "this guard cannot read, so it cannot tell whether the wipe is "
-                "of this projection's derived cache or of another graph "
-                "(docs/architecture/STORAGE-ARCHITECTURE.md 17.1). Pass the "
-                "graph name as text."
+                f"Refusing `{command}` on the write handle"
+                f"{' of a journal-backed projection' if armed else ''}: it "
+                "names a target graph whose name this guard cannot read, so it "
+                "cannot tell whether the wipe is of this handle's graph or of "
+                "another graph (docs/architecture/STORAGE-ARCHITECTURE.md "
+                "17.1). Pass the graph name as text."
             )
         if armed:
             if target is not None and own_graph is not None and target != own_graph:

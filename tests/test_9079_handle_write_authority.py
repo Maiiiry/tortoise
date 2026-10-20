@@ -102,6 +102,15 @@ def _wire_reaching_calls(func) -> set[str]:
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    roots = {"self._g", "self._proj.g", "self.g"}
+    # ⛔ ALIASES COUNT (#9223 review, measured): `inner = self._g; return
+    # inner.execute_command(...)` reached the client while this helper returned
+    # an empty set, so a one-line refactor defeated the claim it enforces. Any
+    # local assigned FROM a root is a root.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name | ast.Attribute):
+            if ast.unparse(node.value) in roots:
+                roots |= {t.id for t in node.targets if isinstance(t, ast.Name)}
     found = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -110,7 +119,7 @@ def _wire_reaching_calls(func) -> set[str]:
         if not isinstance(target, ast.Attribute):
             continue
         base = ast.unparse(target.value)
-        if base in ("self._g", "self._proj.g", "self.g"):
+        if base in roots:
             found.add(f"{base}.{target.attr}")
     return found
 
@@ -359,6 +368,46 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
                 f"`_GuardedGraph.{verb}` is declared as guarded by `{guard}`, "
                 "but its body does not consult it — an unguarded mutating "
                 "verb declared guarded is worse than an unlisted one"
+            )
+        # ⛔ THE GUARD MUST BE CONSULTED IN CODE, not merely named (#9223
+        # review, measured): the substring assertion above is satisfied by a
+        # DOCSTRING or a COMMENT that names the guard, so a verb whose body was
+        # `"""... `_refuse_unauthorized_graph_wipe` ..."""` followed by
+        # `return self._g.execute_command("FLUSHALL")` passed it. Docstrings and
+        # trailing comments are stripped here before the search.
+        #
+        # WHAT THIS STILL DOES NOT PROVE, stated rather than implied: that the
+        # guard DOMINATES every wire-reaching call on every path. A first attempt
+        # asserted that too and was withdrawn — `call_procedure` has an early
+        # `return self._g.call_procedure(...)` inside an unclassifiable-procedure
+        # branch that RAISES first (so it is safe), while `delete` dispatches
+        # after its guard; a line-order rule cannot tell those apart, and one
+        # that claimed to would be the same "guard map describes a check the code
+        # does not perform" defect this PR exists to remove. A verb that CALLED
+        # its guard with an argument that cannot refuse would also pass. What
+        # actually pins these verbs is BEHAVIOUR: no-op'ing the guards fails 53
+        # of the 70 cases in `tests/test_9209_handle_non_cypher_wipe.py`
+        # (measured in review).
+        code_lines = [
+            line.split("#")[0] for line in body.splitlines()
+        ]
+        # blank the docstring's own lines: parse, then clear the constant's range
+        import ast
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(body))
+        node = tree.body[0]
+        if (node.body and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)):
+            for i in range(node.body[0].lineno - 1, node.body[0].end_lineno):
+                code_lines[i] = ""
+        code = "\n".join(code_lines)
+        for guard in guards:
+            assert guard in code, (
+                f"`_GuardedGraph.{verb}` names `{guard}` only in PROSE — its "
+                "docstring or a comment — and never consults it in code, so the "
+                "declaration reads as guarded while nothing refuses this verb"
             )
 
     # ⛔ THE BUCKET'S CLAIM IS CHECKED, not just its membership (#9223 review,

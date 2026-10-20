@@ -1227,17 +1227,6 @@ def _as_text(value):
     the same way. Decoding it here covers both, because this is the one shared
     decoder.
 
-    ⛔ IT DECODES THE BUFFER, never ``bytes(value)`` (review round 8):
-    ``bytes(subclass)`` calls the subclass's ``__bytes__``, while the client
-    sends the BUFFER — so a ``bytes`` subclass whose ``__bytes__`` lies made the
-    scanner read one command and the server receive another. MEASURED: with
-    ``class Evil(bytes): __bytes__ -> b"GRAPH.COPY"``, the guard classified
-    ``GRAPH.COPY`` (inside the ``GRAPH.`` family) while the wire carried
-    ``GRAPH.DELETE`` and an armed cache was wiped; the same lie defeated the
-    ``=~`` scan. ``memoryview(value).tobytes()`` reads the buffer for every
-    bytes-like shape (``bytes``, ``bytearray``, ``memoryview``) and cannot be
-    overridden by a ``__bytes__``.
-
     ⛔ ``bytes(value)`` would be WRONG here (review round 9): ``bytes(subclass)``
     calls the subclass's ``__bytes__``, so a lying ``bytes`` subclass made the
     scan read one command while the client sent another. Same for a ``str``
