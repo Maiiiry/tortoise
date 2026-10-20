@@ -261,7 +261,7 @@ back-message sweep, the BFS undirected direct-edge sweep and Batch 3, whose two
 `MATCH` / undirected forms anchor on their own.
 
 Three sites in `ep.py` traverse and were already `Node By Index Scan` without a
-barrier on `origin/main`, so they carry none: `_load_cache`'s message sweep,
+barrier on the pre-#6211 tree, so they carry none: `_load_cache`'s message sweep,
 `seed_operators` and `_affected_factors` Batch 2. Those three plus the three
 reads that do not traverse at all are the `ep.py` pass's **19 distinct
 unbarriered id-set statements** — the traversing sites at **8 + 1 + 1** (the
@@ -289,16 +289,17 @@ pass emits and asserts the PLAN of each (`Node By Index Scan`, and no
 never their text; each is
 reached by the fixture (`_load_cache`'s sweeps and Batch 2 directly,
 `seed_operators` through an operator seed — the 300 operators hanging off the
-hub claim). On the 23k-node / 160k-edge fixture that assertion covers the pass's
-**49 distinct** id-set statements (95 emissions) and the operator selector's
-**12 distinct** (37 emissions across the two seeds the assertion uses) — zero
-unanchored in
-either. Against `origin/main`'s code the file's six behavioural tests run `4
-failed, 2 passed` — the emitted-statement plan test, the hop's record bound, the
-OR split's statement counts and the operator selector's four legs fail, while
-the fixture guard and the OR-split row-semantics guard pass, because they pin
-properties `origin/main` already had. (The seventh test in that file pins this
-manifest row and is not part of that count: `origin/main` carries no `durations`
+hub claim). On the fixture the assertion actually runs against, it covers the
+pass's **49 distinct** id-set statements (95 emissions) and the operator
+selector's **12 distinct** (37 emissions across the two seeds the assertion
+uses) — zero unanchored in
+either. Against the pre-#9282 tree (`8c3823b92^`) the file's six behavioural
+tests run `4 failed, 2 passed` — the emitted-statement plan test, the hop's
+record bound, the OR split's statement counts and the operator selector's four
+legs fail, while the fixture guard and the OR-split row-semantics guard pass,
+because they pin
+properties the old tree already had. (The seventh test in that file pins this
+manifest row and is not part of that count: the old tree carries no `durations`
 row for a PR-added file at all, so it fails there for a different reason.) The
 selector's expansion leg is individually discriminating: removing its barrier
 alone reddens the selector test.
@@ -336,15 +337,17 @@ statements per pass — and it is a real cost, paid on the interactive path.
 Instrumenting the graph handle and counting every query a `TortoiseEP.run()`
 issues on the 40-claim interactive zone that
 `tests/test_ep_local_395.py::test_ac5_interactive_latency_zone` builds, this
-branch emits **11 more statements per pass** than `origin/main` (**+22** for the
-two passes one `compute_confidence()` runs). Only the DELTA is quoted here: the
+branch emits **11 more statements per pass** than the tree BEFORE this change
+(`8c3823b92^`, the pre-#9282 baseline — `origin/main` already carries the split,
+so a comparison against it measures zero today) (**+22** for the two passes one
+`compute_confidence()` runs). Only the DELTA is quoted here: the
 absolute totals move with how much of the call the recorder sees (a
 `TortoiseEP.g`-level recorder and a graph-handle-level one disagree by the
 sweeps that never reach the pass), and the delta is identical either way.
 Nothing replaces anything — the two splits are the entire delta, and an added
 `WITH *` barrier emits no statement of its own:
 
-| site | `origin/main` | this branch |
+| site | before the split (`8c3823b92^`) | with the split |
 |---|---|---|
 | `_affected_factors` Batch 3 | **1** (one unlabelled `MATCH (a)-[r:IMPL\|NAND]->(b) ... (a.id IN $ids OR b.id IN $ids)`) | **8** (2 anchors x 4 epistemic labels) |
 | `_load_cache` back-message sweep | **4** (target-labelled, `b.id IN $ids` in the same predicate) | **8** (2 anchors x 4 epistemic labels) |
