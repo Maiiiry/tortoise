@@ -4189,3 +4189,67 @@ def test_sixteen_empty_logs_do_not_make_a_complete_leg_set(
     assert (out / "ci-timing.json").read_text() == before, (
         "sixteen empty logs passed for legs and let a one-leg measurement replace a full one"
     )
+
+
+def test_a_killed_run_must_not_replace_a_complete_measurement(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """The watchdog stops pytest mid-suite: same legs, thousands of missing passes.
+
+    A killed run can still produce a summary-bearing log per leg — the legs that
+    had not started simply report less — so counting legs cannot see it. `killed`
+    is recorded in the artifact and is now read: a killed run may create a row,
+    never replace a complete measurement (#9134 review cycle 10).
+    """
+    out = tmp_path / "out"
+    before = _seed_full_artifact(out)
+    killed_log = FIXTURE_LOG.splitlines()
+    killed_log[-1] = "!!! KeyboardInterrupt !!!"
+    for i in range(17):
+        write_log(
+            tmp_path,
+            f"pytest-log-test-{i}/pytest.log",
+            "\n".join(killed_log) if i == 0 else FIXTURE_LOG,
+        )
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=180,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert (out / "ci-timing.json").read_text() == before, (
+        "a killed run replaced a complete measurement"
+    )
+
+
+def test_progress_only_legs_do_not_count_as_complete_legs(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """A truncated log names failures but cannot establish passes.
+
+    Mid-suite truncation leaves progress lines and no SUMMARY, so seventeen such
+    legs are seventeen partial measurements, not seventeen legs: counting them let
+    `passed 30697 / failed 6` be replaced by `0 / 0`, and the failing test then read
+    as a flake that never happened (#9134 review cycle 10). Only legs that produced
+    a summary count.
+    """
+    out = tmp_path / "out"
+    before = _seed_full_artifact(out)
+    for i in range(17):
+        write_log(tmp_path, f"pytest-log-trunc-{i}/pytest.log",
+                  "FAILED tests/test_alpha.py::test_two - AssertionError\n")
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=180,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert (out / "ci-timing.json").read_text() == before, (
+        "seventeen progress-only logs passed as a complete measurement"
+    )

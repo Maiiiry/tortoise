@@ -1823,7 +1823,9 @@ def _prior_legs(json_path: Path) -> int | None:
     sources = data.get("log_sources")
     if isinstance(sources, list):
         known.append(sum(
-            1 for s in sources if isinstance(s, dict) and not s.get("empty")
+            1
+            for s in sources
+            if isinstance(s, dict) and any((s.get("counts") or {}).values())
         ))
     history = data.get("history")
     if isinstance(history, list):
@@ -2178,6 +2180,12 @@ def main() -> int:
                     help="comma-separated changed paths, for --paid-vs-selected")
     ap.add_argument("--event", default="pull_request",
                     help="selection event for --paid-vs-selected: pull_request (default) or push")
+    ap.add_argument("--allow-fewer-legs", action="store_true",
+                    help="write the artifact even though this render measured FEWER legs "
+                         "than it already records (e.g. a shard was merged or removed). The "
+                         "default keeps the larger sample, because a smaller one can report "
+                         "a test that FAILED in the history as never having run — which reads "
+                         "as a flake that never happened (#9134).")
     args = ap.parse_args()
 
     if args.paid_vs_selected:
@@ -2260,7 +2268,7 @@ def main() -> int:
         "steps_total_ms": sum(s["duration_ms"] for job in steps.values() for s in job),
         "steps_max_job_ms": max((sum(s["duration_ms"] for s in job) for job in steps.values()), default=0),
         "failed_tests": sorted(failed_tests),
-        "legs": sum(1 for source in log_sources if not source.get("empty")),
+        "legs": sum(1 for source in log_sources if any(source["counts"].values())),
     }
     previous = load_history(json_path)
     # A render that MEASURED NOTHING is not a measurement, and must not overwrite
@@ -2270,7 +2278,7 @@ def main() -> int:
     # The refusal is limited to an artifact that already HOLDS measurements
     # (`files`/`outcome`), so a history-only seed — and a first render into an
     # empty directory — still writes what it can.
-    legs = sum(1 for source in log_sources if not source.get("empty"))
+    legs = sum(1 for source in log_sources if any(source["counts"].values()))
     if run_id:
         rest = [e for e in previous if e.get("run_id") != run_id]
     else:
@@ -2294,10 +2302,17 @@ def main() -> int:
     # sixteen are empty cannot pass for a complete set. Comparing across run ids is
     # deliberate: the damage is to the artifact, not to the run.
     prior_legs = _prior_legs(json_path)
-    too_little = legs == 0 or (prior_legs is not None and legs < prior_legs)
-    if too_little and _holds_measurements(json_path):
+    # A KILLED run is a partial measurement whatever its leg count says: the
+    # watchdog stops pytest mid-suite, so the legs that had not started yet report
+    # their progress lines and no summary, and a killed run can easily produce the
+    # same number of summary-bearing legs while missing thousands of passes. It is
+    # a real sample of what ran and an incomplete sample of the suite, so it may
+    # create a row but not replace a complete one.
+    too_little = killed_any or legs == 0 or (prior_legs is not None and legs < prior_legs)
+    if too_little and not args.allow_fewer_legs and _holds_measurements(json_path):
         reason = (
             "nothing" if legs == 0
+            else "a run that was KILLED mid-suite" if killed_any
             else f"{legs} leg(s) where the artifact already records {prior_legs}"
         )
         print(
