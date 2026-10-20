@@ -406,10 +406,15 @@ def test_the_eager_init_statement_is_a_mutating_one():
     docstring claimed the `MERGE` arm, which was the same
     wrong-pin-attribution defect the module docstring's failure map had.
 
-    The `:OnboardingState` label is the other half, and had no pin: all three
-    records say these five sites CREATE an `:OnboardingState`, so a fragment
-    that stopped naming that node would leave every record describing a write
-    to something no longer written.
+    The `:OnboardingState` label is the other half, and had no pin: all FOUR
+    records say these five sites CREATE an `:OnboardingState`
+    (`onboarding/state.py`, `projection/__init__.py`, the increment-4 plan doc
+    and §17.1's door ledger — see
+    `test_the_plan_doc_and_the_storage_ledger_carry_the_residual`), so a fragment
+    that stopped naming that node would leave every record describing a write to
+    something no longer written. (This docstring said "three" for one commit
+    after the population grew to four; a count in prose is a claim like any
+    other — #9150 review cycle 3.)
     """
     cypher, _params = _os.eager_init_query(
         "CREATE (:TeamMeta {name:$name})",
@@ -419,7 +424,7 @@ def test_the_eager_init_statement_is_a_mutating_one():
     )
     assert ":OnboardingState" in cypher, (
         "`eager_init_query()` no longer creates an `:OnboardingState` — the "
-        "node all three records say the five escape-(3) sites CREATE. Re-derive "
+        "node all four records say the five escape-(3) sites CREATE. Re-derive "
         f"the residual before letting those records stand:\n{cypher}"
     )
     assert _statement_writes(cypher) is True, (
@@ -434,20 +439,41 @@ def test_the_declaration_note_names_the_seam_it_does_not_cover():
     """`state.py`'s declaration must state the escape, where a reader looks.
 
     The universal that five call sites disprove ("every onboarding write is
-    declared") is the thing this pins against: the note has to (a) narrow the
-    claim to the `_run` seam, (b) name the mechanism (`eager_init_query` on
-    `select_graph`), and (c) name the residual issue (`#9157`) so the gap is
-    filed rather than implied closed. Deleting any of the three turns this RED.
+    declared") is the thing this pins against. The NOTE has to (a) state the
+    exemption ("It does NOT cover the eager-init statement … on the org-graph
+    lane") — the sentence that stops the universal — (b) name the mechanism
+    (`eager_init_query` on `select_graph`), (c) name the residual issue
+    (`#9157`) and the closing warning, so the gap is filed rather than implied
+    closed.
+
+    ⛔ SCOPED TO THE NOTE, not to the module (#9150 review cycle 3, P1): the
+    whole-file scan this replaces passed while every mechanism word had been
+    DELETED from the note, because `eager_init_query` also occurs at the module
+    docstring, on `def eager_init_query` itself and in the #4641 width bullet,
+    and `select_graph` at the module docstring and in the same bullet — all
+    ABOVE the note. A pin that cannot fail on the edit it guards is the
+    #1349/#2938 false-PASS class, one level up from where this file closed it.
     """
     source = (_REPO / "tortoise/onboarding/state.py").read_text(encoding="utf-8")
-    flat = " ".join(source.split())
+    start = source.find("It does NOT cover the eager-init statement")
+    end = source.find("SEAM: `#9123`", start)
+    assert start != -1 and end != -1, (
+        "`tortoise/onboarding/state.py` no longer carries the escape-(3) note — "
+        "neither the\n  * It does NOT cover the eager-init statement …\n"
+        "bullet nor the `SEAM: `#9123`` marker that closes it is present any "
+        "more. Deleting the note restores the over-claim that five "
+        "`eager_init_query()` call sites disprove (#9157)"
+    )
+    note = " ".join(source[start:end].split())
     for phrase in ("eager_init_query", "select_graph", "#9157",
                    "do not close escape (3) believing"):
-        assert phrase in flat, (
-            f"`tortoise/onboarding/state.py` no longer contains {phrase!r} — the "
-            "declaration's note about the seam it does NOT cover has been "
-            "removed or reworded, which restores the over-claim that five "
-            "`eager_init_query()` call sites disprove"
+        assert phrase in note, (
+            f"the escape-(3) NOTE in `tortoise/onboarding/state.py` no longer "
+            f"contains {phrase!r} — the note has been removed or reworded, "
+            "which restores the over-claim that five `eager_init_query()` call "
+            "sites disprove. The assertion is scoped to the note: these words "
+            "occur elsewhere in this module, and a whole-file scan passed "
+            "while the note said none of it (#9157)"
         )
 
 
@@ -772,33 +798,53 @@ def test_the_declaration_detector_can_fail():
 
 # ── the guard's own opener inventory ─────────────────────────────────────
 def test_the_guards_inventory_names_this_lane_and_its_residual():
-    """`_live_write_scope`'s inventory is what ENFORCES the rule; it must agree.
+    """The `onboarding.metadata` BULLET in the inventory must agree with itself.
 
-    It was written as an exhaustive set of journal-first openers. `#9121` adds
-    an opener that appends nothing, so the block has to say so *in its own
-    terms* — otherwise the next reader trusts "only journal-first doors open
-    this" and reintroduces exactly the P0 this work blocks, or reads the
-    onboarding scope as a §17.1 violation. It also has to name the residual
-    (`#9157`), i.e. that the escape-(3) creation writes are NOT this lane.
+    The opener inventory is what ENFORCES the rule and what a §17.1 door
+    inventory reads as exhaustive. `#9121` adds an opener that appends nothing,
+    so the bullet has to say so *in its own terms* — otherwise the next reader
+    trusts "only journal-first doors open this" and reintroduces exactly the P0
+    this work blocks, or reads the onboarding scope as a §17.1 violation — and it
+    has to name the residual (`#9157`): the escape-(3) creation writes are NOT
+    this lane.
+
+    ⛔ SCOPED TO THE BULLET, not to the file (#9150 review cycle 3, P2): the
+    whole-file phrase scan this replaces passed while the bullet's residual
+    PARAGRAPH had been deleted, because `#9157` also occurs in
+    `_live_write_scope`'s docstring 300 lines below (measured).
+    `_onboarding_write_scope` is NOT this pin's business — it never appears in
+    the inventory at all; that docstring is owned by
+    `test_the_live_scope_docstring_names_the_opener_the_lane_actually_calls`,
+    so asserting it here only ever tested a different text than this docstring
+    claims.
     """
     source = (_REPO / "tortoise/projection/__init__.py").read_text(encoding="utf-8")
-    flat = " ".join(source.split())
+    start = source.find("#   * `onboarding.metadata`")
+    end = source.find("#   * `structural-edge.derived`", start)
+    assert start != -1 and end != -1, (
+        "the `onboarding.metadata` bullet is gone from the §17.1 opener "
+        "inventory in `tortoise/projection/__init__.py` (or the next bullet "
+        "that delimits it moved) — the file that ENFORCES the rule no longer "
+        "says this lane exists, so a reader trusting it concludes the "
+        "onboarding writes are journal-first (#9121)"
+    )
+    bullet = " ".join(source[start:end].split())
     for phrase in (
-        "onboarding.metadata",
         # the opener is NOT a `_live_write_scope` opener: the bullet says the
         # LANE appends nothing, and why that is not a contradiction.
         "THIS LANE APPENDS NOTHING",
         "not every opener",
+        # the class the lane covers, named where the auditor looks
+        "`:OnboardingState`",
         "#9157",
-        "_onboarding_write_scope",
     ):
-        assert phrase in flat, (
-            f"the §17.1 opener inventory in `tortoise/projection/__init__.py` no "
-            f"longer contains {phrase!r} — the declaration block at "
-            "`_live_write_scope` is the file that ENFORCES the rule, so a "
-            "reader who trusts it over `onboarding/state.py` would conclude the "
-            "onboarding lane is journal-first (it is not) or fully delegated "
-            "(it is not: #9157)"
+        assert phrase in bullet, (
+            f"the `onboarding.metadata` bullet of the §17.1 opener inventory in "
+            f"`tortoise/projection/__init__.py` no longer contains {phrase!r} — "
+            "the block is the file that ENFORCES the rule, so a reader who "
+            "trusts it over `onboarding/state.py` would conclude the onboarding "
+            "lane is journal-first (it is not) or fully delegated (it is not: "
+            "#9157)"
         )
 
 
