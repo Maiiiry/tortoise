@@ -240,25 +240,58 @@ def _named(nodes, names: tuple[str, ...]) -> bool:
     return False
 
 
+def _bindings(enclosing: ast.AST) -> list[tuple[ast.AST, ast.AST | None]]:
+    """Every `(target, value)` binding inside `enclosing`, in EVERY binding form.
+
+    ⛔ `Assign`/`AnnAssign` only was the first revision (#9150 review cycle 9,
+    P2). A handle-like name can equally be bound by a `for` target, a
+    `with … as`, a walrus, an `AugAssign`, a comprehension target or an
+    `except … as` — and on those shapes the detector stayed GREEN, which is the
+    false PASS the handle rule exists to prevent. `value` is `None` where the
+    syntax has no single value expression (`AugAssign`, `except … as`); such a
+    binding is treated as a REBINDING, i.e. it fails closed.
+    """
+    out: list[tuple[ast.AST, ast.AST | None]] = []
+    for sub in ast.walk(enclosing):
+        if isinstance(sub, ast.Assign):
+            out.extend((target, sub.value) for target in sub.targets)
+        elif isinstance(sub, ast.AnnAssign):
+            out.append((sub.target, sub.value))
+        elif isinstance(sub, ast.AugAssign):
+            out.append((sub.target, None))
+        elif isinstance(sub, (ast.For, ast.AsyncFor)):
+            out.append((sub.target, sub.iter))
+        elif isinstance(sub, (ast.With, ast.AsyncWith)):
+            for item in sub.items:
+                if item.optional_vars is not None:
+                    out.append((item.optional_vars, item.context_expr))
+        elif isinstance(sub, ast.NamedExpr):
+            out.append((sub.target, sub.value))
+        elif isinstance(sub, ast.comprehension):
+            out.append((sub.target, sub.iter))
+        elif isinstance(sub, ast.ExceptHandler) and sub.name:
+            out.append((ast.Name(id=sub.name, ctx=ast.Store()), None))
+    return out
+
+
+def _is_select_graph(value: ast.AST | None) -> bool:
+    return (isinstance(value, ast.Call)
+            and getattr(value.func, "attr", None) == "select_graph")
+
+
 def _escape_handle_names(enclosing: ast.AST) -> set[str]:
     """Names bound from a `select_graph(...)` call inside `enclosing`."""
     handles: set[str] = set()
-    for sub in ast.walk(enclosing):
-        if (
-            isinstance(sub, (ast.Assign, ast.AnnAssign))
-            and isinstance(sub.value, ast.Call)
-            and getattr(sub.value.func, "attr", None) == "select_graph"
-        ):
-            for target in (sub.targets if isinstance(sub, ast.Assign)
-                           else [sub.target]):
-                handles |= _bound_names(target)
+    for target, value in _bindings(enclosing):
+        if _is_select_graph(value):
+            handles |= _bound_names(target)
     return handles
 
 
 def _rebound_handles(enclosing: ast.AST, handles: set[str]) -> set[str]:
     """Escape-handle names ALSO bound to something that is not `select_graph`.
 
-    The handle set is per FUNCTION; a binding is per ASSIGNMENT (#9150 review
+    The handle set is per FUNCTION; a binding is per BINDING SITE (#9150 review
     cycle 6, P2). `tortoise/hosted_api.py::register_user` issues TWO sites, one
     per arm of `if is_supabase_enabled(): … else:`, and BOTH arms bind the same
     name `org_graph` — so closing one arm on `proj.g` is exactly the §17.1
@@ -266,18 +299,18 @@ def _rebound_handles(enclosing: ast.AST, handles: set[str]) -> set[str]:
     it green (measured on that two-arm shape: `offenders: []`). Fail closed: a
     name bound both ways at this head is reported as an offender, because the
     detector cannot tell which binding the sink used.
+
+    "Both ways" covers every binding form Python has, not just assignment
+    (#9150 review cycle 9, P2): measured on four equivalent two-binding shapes,
+    a `for` target, a walrus and a `with … as` all left the detector GREEN while
+    the plain `Assign` red it — on exactly the closure this rule exists to
+    catch.
     """
     rebound: set[str] = set()
-    for sub in ast.walk(enclosing):
-        if not isinstance(sub, (ast.Assign, ast.AnnAssign)):
+    for target, value in _bindings(enclosing):
+        if _is_select_graph(value):
             continue
-        value = sub.value
-        if (isinstance(value, ast.Call)
-                and getattr(value.func, "attr", None) == "select_graph"):
-            continue
-        for target in (sub.targets if isinstance(sub, ast.Assign)
-                       else [sub.target]):
-            rebound |= _bound_names(target)
+        rebound |= _bound_names(target)
     return rebound & handles
 
 
@@ -361,12 +394,26 @@ def _not_on_the_escape_handle(
 #: #9150 review cycle 8 found invisible) — so a new lane joins the population by
 #: existing.
 def _declaration_primitives() -> set[tuple[str, str]]:
-    """Every §17.1 opener the tree defines, as `(module, function)` — ALL of
-    `tortoise/`.
+    """Every §17.1 declaration site the tree defines, as `(module, function)` —
+    ALL of `tortoise/`.
 
     Two populations, because they answer two questions. This one is the DETECTOR
     population: any function that can put a declaration in flight, wherever it
-    lives. Measured before it was widened (#9150 review, P2): a site wrapped in
+    lives — an OPENER (returns the scope) OR a DOOR (opens and closes it in a
+    `with`, then returns the query result: `webhook_delivery.py::_run`,
+    `event_store.py::reestablish_watermark`). It is deliberately wider than the
+    opener inventory, because `_declaring_functions()` matches
+    `with <name>(...)` and a statement issued through a door is exactly as
+    journal-eligible as through an opener.
+
+    That distinction is not cosmetic (#9150 review cycle 9, P1): while both
+    populations were derived alike, this docstring's `_run` was called "an
+    opener" and the opener inventory — where `projection/__init__.py`'s bullet
+    list is described as exhaustive — therefore claimed two DOORS, while the
+    delegation fixpoint (which propagates by NAME) would enrol a one-line
+    forwarder onto a door as an opener.
+
+    Measured before it was widened (#9150 review, P2): a site wrapped in
     `tortoise/projection/edges.py::_structural_edge_write_scope` left 13/13
     green, because the population was projection-only — so "fails the day one of
     those sites enters a declaration" was false for a real, in-use opener.
@@ -375,29 +422,34 @@ def _declaration_primitives() -> set[tuple[str, str]]:
     is exhaustive.
 
     ⛔ IDENTITY, not a bare name (#9150 review cycle 5, P1). A name-keyed set
-    cannot see a new opener that REUSES an existing name, and a reused name is
+    cannot see a new site that REUSES an existing name, and a reused name is
     the normal case here — `_run` is already in this population
     (`tortoise/webhook_delivery.py::_run`). Measured: adding a declaring `_run`
     to `tortoise/reader.py` (an `sdk`-only module) left this population
     byte-identical and the pin green, while three of the six arm registrations in
     `config/ci-surfaces.yml` justify themselves by that pin firing.
     """
-    return _openers_under(_REPO / "tortoise")
+    return _openers_under(_REPO / "tortoise", opener_only=False)
 
 
-def _openers_under(root: Path) -> set[tuple[str, str]]:
+def _openers_under(root: Path, *, opener_only: bool = True) -> set[tuple[str, str]]:
     """`(module, function)` for every function under `root` that declares.
 
     A FILE path is allowed too (the inventory population is one module:
     `projection/__init__.py`, the bullet list a reader is told is exhaustive —
     `projection/edges.py`'s `_structural_edge_write_scope` is a real opener that
     is NOT in that list).
+
+    `opener_only=False` asks the DOOR question instead — see `_openers_in()`.
     """
     paths = [root] if root.is_file() else sorted(root.rglob("*.py"))
-    return _openers_in({
-        str(path.relative_to(_REPO)): _parse(str(path.relative_to(_REPO)))[0]
-        for path in paths
-    })
+    return _openers_in(
+        {
+            str(path.relative_to(_REPO)): _parse(str(path.relative_to(_REPO)))[0]
+            for path in paths
+        },
+        opener_only=opener_only,
+    )
 
 
 def _declares_directly(node: ast.AST) -> bool:
@@ -406,6 +458,38 @@ def _declares_directly(node: ast.AST) -> bool:
         isinstance(inner, ast.Call)
         and (getattr(inner.func, "id", None) == "_cache_write_authorized"
              or getattr(inner.func, "attr", None) == "_cache_write_authorized")
+        for inner in ast.walk(node)
+    )
+
+
+def _returns_declaration_scope(node: ast.AST) -> bool:
+    """Is this function an OPENER — does it RETURN the declaration scope?
+
+    ⛔ An opener and a DOOR are different objects, and conflating them claimed a
+    lane that does not exist (#9150 review cycle 9, P1). `_declares_directly()`
+    asks "does the body call the primitive AT ALL", which is the right question
+    for the detector population (a door enters a declaration too) and the wrong
+    one for the opener INVENTORY: `tortoise/webhook_delivery.py::_run` and
+    `tortoise/event_store.py::reestablish_watermark` open the scope in a `with`
+    and CLOSE it before returning the query result — they return a value, not a
+    context manager, so they cannot be opened by anything, and a reader told the
+    bullet list is "every opener this module defines" was told about two doors.
+    Worse, the delegation fixpoint propagates by NAME: with a door in the seed, a
+    one-line forwarder onto it was enrolled as an opener in both populations,
+    and in `projection/__init__.py` that reds the inventory pin with "a new
+    opener can authorize a cache write" — which would be untrue.
+
+    The test is the RETURN, because that is what makes a scope openable:
+    `_onboarding_write_scope()` qualifies on its `if` branch (the other returns
+    `contextlib.nullcontext()`, a no-op scope for a read), while a door's
+    returns are the query result and never the primitive.
+    """
+    return any(
+        isinstance(inner, ast.Return)
+        and isinstance(inner.value, ast.Call)
+        and (getattr(inner.value.func, "id", None) == "_cache_write_authorized"
+             or getattr(inner.value.func, "attr", None)
+             == "_cache_write_authorized")
         for inner in ast.walk(node)
     )
 
@@ -427,32 +511,47 @@ def _delegates_to(node: ast.AST, openers: set[str]) -> bool:
                  or getattr(value.func, "attr", None) in openers))
 
 
-def _openers_in(trees: dict[str, ast.Module]) -> set[tuple[str, str]]:
-    """`(module, function)` for every opener in `trees`, TRANSITIVE over
-    delegation.
+def _openers_in(
+    trees: dict[str, ast.Module], *, opener_only: bool = True
+) -> set[tuple[str, str]]:
+    """`(module, function)` for every function in `trees` that declares.
 
-    ⛔ A delegating opener authorizes exactly as much as the one it wraps
-    (#9150 review cycle 8, P1). `return _live_write_scope(reason)` is the
-    ordinary in-module shape — it is the same "two spellings, one primitive"
-    that `onboarding/state.py` has to spell out — and the first revision of this
-    derivation keyed on a DIRECT `_cache_write_authorized` call only, so such an
-    opener joined NEITHER population and a site could enter a declaration with
-    all 15 pins green (measured: a delegating `_future_lane_write_scope` around
-    `sdk.py::org_create`'s statement left the suite 15/15 passed). The docstrings
-    that promise "a new lane joins the population by existing" and "a NEW opener
-    in `projection/__init__.py` must red this suite" were false for it.
+    Two populations, one derivation, and they are NOT the same set
+    (#9150 review cycle 9, P1):
 
-    Conservative by design: only the unambiguous `return <opener>(...)` shape
-    counts, so a function that MERELY calls an opener on one path is left to
-    `_declaring_functions()` (which asks about a `with`, i.e. a door, not an
-    opener). The fixpoint adds 0 members on this tree — the delegation gap is
-    closed without changing either recorded population.
+    * `opener_only=True` — the OPENER inventory: a function that RETURNS the
+      scope (`_returns_declaration_scope()`), so something can be `with`-ed over
+      it. This is the population `tortoise/projection/__init__.py`'s bullet list
+      and `_projection_openers()` are about.
+    * `opener_only=False` — the DETECTOR population: any function whose body
+      calls the primitive, INCLUDING a DOOR (a per-call `with` that closes the
+      scope before it returns). `tortoise/webhook_delivery.py::_run` and
+      `tortoise/event_store.py::reestablish_watermark` live here and only here.
+      `_declaring_functions()` matches `with <name>(...)`, so the `with`-matcher
+      needs the door names, and a statement issued through one is exactly as
+      journal-eligible as through an opener.
+
+    ⛔ Both are TRANSITIVE over delegation (#9150 review cycle 8, P1).
+    `return _live_write_scope(reason)` is the ordinary in-module shape — it is
+    the same "two spellings, one primitive" that `onboarding/state.py` has to
+    spell out — and a derivation keyed on a DIRECT `_cache_write_authorized` call
+    only let such an opener join NEITHER population, so a site could enter a
+    declaration with all 15 pins green (measured: a delegating
+    `_future_lane_write_scope` around `sdk.py::org_create`'s statement left the
+    suite 15/15 passed).
+
+    The fixpoint's seed is this population, which is what keeps a forwarder onto
+    a DOOR out of the opener inventory: in `opener_only` mode `_run` is not a
+    name it knows. The fixpoint adds 0 members on this tree in both modes — the
+    delegation gap is closed without changing either recorded population.
     """
     found: set[tuple[str, str]] = set()
     for rel, tree in trees.items():
         for node in ast.walk(tree):
-            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and _declares_directly(node)):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if _returns_declaration_scope(node) if opener_only \
+                    else _declares_directly(node):
                 found.add((rel, node.name))
     names = {name for _rel, name in found}
     changed = True
@@ -982,12 +1081,18 @@ def test_the_detector_population_is_pinned_by_content():
         ("tortoise/projection/__init__.py", "_replay_write_scope"),
         ("tortoise/projection/__init__.py", "_prewipe_restore_write_scope"),
         # those defined OUTSIDE `projection/__init__.py`:
-        # `tortoise/webhook_delivery.py::_run` is an opener whose name is REUSED
-        # all over the tree (including `onboarding/state.py::_run`, which is the
-        # onboarding funnel and delegates through `_onboarding_write_scope`, one
-        # hop away). It is recorded by IDENTITY, not by name: while this set was
-        # name-keyed, a second declaring `_run` in any module added no key and
-        # left this pin green (#9150 review cycle 5, P1 — measured with a
+        # `tortoise/webhook_delivery.py::_run` is a DOOR, not an opener — it opens
+        # the scope in a `with` and closes it before returning the query result,
+        # so nothing can be `with`-ed over it and it is deliberately ABSENT from
+        # `_projection_openers()`. It is here because this population asks the
+        # DETECTOR question (can a declaration be in flight?) and
+        # `_declaring_functions()` matches `with <name>(...)` — a statement
+        # issued through this door is as journal-eligible as through an opener.
+        # Its name is REUSED all over the tree (including `onboarding/state.py`'s
+        # own `_run` funnel, which delegates through `_onboarding_write_scope`,
+        # one hop away), so it is recorded by IDENTITY, not by name: while this
+        # set was name-keyed, a second declaring `_run` in any module added no key
+        # and left this pin green (#9150 review cycle 5, P1 — measured with a
         # declaring `_run` appended to `tortoise/reader.py`, an `sdk`-only
         # module).
         ("tortoise/webhook_delivery.py", "_run"),
@@ -995,7 +1100,7 @@ def test_the_detector_population_is_pinned_by_content():
         # #9210/#9218 added the watermark re-establish path, which declares its
         # own cache write from `tortoise/event_store.py` — outside projection
         # entirely, and therefore exactly the class this wide population exists
-        # to see.
+        # to see. A DOOR like `_run`, for the same reason.
         ("tortoise/event_store.py", "reestablish_watermark"),
     }
     derived = _declaration_primitives()
@@ -1074,6 +1179,16 @@ def test_a_delegating_opener_joins_both_populations():
                     return None
             """
         )),
+        "synthetic/door.py": ast.parse(textwrap.dedent(
+            """
+            def _run(proj, cypher):
+                with _cache_write_authorized("door"):
+                    return proj.g.query(cypher)
+
+            def _forward_to_door(proj, cypher):
+                return _run(proj, cypher)
+            """
+        )),
     }
     derived = _openers_in(trees)
     assert ("synthetic/direct.py", "_base_write_scope") in derived, derived
@@ -1086,6 +1201,36 @@ def test_a_delegating_opener_joins_both_populations():
         "collected as an OPENER — that is `_declaring_functions()`' question, "
         f"and conflating them makes the inventory claim a lane exists: {derived}"
     )
+
+    # The DOOR shape, which review cycle 9 found in the population
+    # (`webhook_delivery.py::_run`, `event_store.py::reestablish_watermark`).
+    # An opener RETURNS the scope; a door opens it in a `with` and returns the
+    # query result, so nothing can be `with`-ed over it.
+    assert ("synthetic/door.py", "_run") not in derived, (
+        "a DOOR was collected as an OPENER: it returns the query result, not a "
+        "context manager, so `projection/__init__.py`'s bullet list — which a "
+        f"reader is told is exhaustive — would claim a lane that is not one: {derived}"
+    )
+    assert ("synthetic/door.py", "_forward_to_door") not in derived, (
+        "a one-line forwarder onto a DOOR was enrolled as an OPENER: the "
+        "fixpoint propagates by NAME, so a door in the seed certifies its "
+        f"forwarders as openable — they are not: {derived}"
+    )
+
+    # …and the detector population must still SEE a door and its forwarder,
+    # because a statement issued through one enters a declaration exactly as one
+    # issued through an opener does. This is the half that keeps the split from
+    # becoming a hole. (`_not_an_opener` above is NOT here and needs not be: it
+    # `with`s an OPENER, whose name is already in this population, so
+    # `_declaring_functions()` matches that `with` as it stands.)
+    detector = _openers_in(trees, opener_only=False)
+    for key in (("synthetic/door.py", "_run"),
+                ("synthetic/door.py", "_forward_to_door")):
+        assert key in detector, (
+            f"{key} is missing from the DETECTOR population — it opens a "
+            "declaration, so `_declaring_functions()` must be able to match a "
+            f"`with` over it: {sorted(detector)}"
+        )
 
 
 # ── the guard's own opener inventory ─────────────────────────────────────
