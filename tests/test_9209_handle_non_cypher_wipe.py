@@ -66,6 +66,7 @@ drop a legitimately retried write: `tortoise/sdk.py::_graph_presence` probes
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 
 import pytest
@@ -596,6 +597,46 @@ def test_a_buffer_TARGET_cannot_walk_past_the_target_check():
 
     assert proj.g.calls == [], (
         f"a foreign-graph wipe reached the vendor handle; calls={proj.g.calls!r}"
+    )
+
+
+def test_a_buffer_graph_query_payload_is_still_measured(sdk_with_journal):
+    """The SAME decoding gap in the statement reader, on main's side of the merge.
+
+    `_command_statement` decides whether a raw payload carries Cypher (§17.1's
+    statement door, #9124, MEASURE mode in the landed state — it records the
+    statement in the census and refuses only once `_HANDLE_GUARD_ENFORCES` is
+    True). It decoded only ``bytes``, so a ``memoryview`` head returned "" and
+    a ``GRAPH.QUERY`` payload the server executes was not counted at all — a
+    write missing from the inventory part 2 is gated on.
+
+    MUTATION: drop the ``memoryview`` branch from `_handle_command_text` (or
+    decode only ``bytes`` inside `_command_statement`, the pre-merge form) and
+    this fails with an empty census.
+    """
+    from tortoise.projection import (
+        _reset_undeclared_handle_writes,
+        undeclared_handle_writes,
+    )
+
+    proj = sdk_with_journal._get_proj()
+    assert proj._journal_backed, "the fixture must ARM the guard"
+    _reset_undeclared_handle_writes()
+
+    # The pinned client raises `AttributeError` from its response-callback
+    # lookup AFTER the bytes are sent (a `memoryview` has no `.upper()`), so the
+    # payload is not refused here — it is MEASURED, which is exactly part 1's
+    # contract and is why the census is the artifact this test reads.
+    with contextlib.suppress(Exception):
+        proj.g.execute_command(
+            memoryview(b"GRAPH.QUERY"), proj._graph_name,
+            "CREATE (n:Point {id:'buffer-cmd-9209'})",
+        )
+
+    census = undeclared_handle_writes()
+    assert "buffer-cmd-9209" in " ".join(census), (
+        "a buffered GRAPH.QUERY payload was not recorded by §17.1's statement "
+        f"door — the census is what part 2 arms on; census={census!r}"
     )
 
 

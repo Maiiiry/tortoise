@@ -3916,15 +3916,20 @@ def _command_statement(args, kwargs) -> str:
     already pins (MEASURED against ``falkordb`` 1.6.2: ``args[3]`` is a flag such
     as ``--compact``, never a params map), so the two readers of this channel
     cannot disagree about where the Cypher lives.
+
+    ⛔ THE COMMAND WORD IS DECODED WITH THE SAME HELPER THE #9209 CLASSIFIER
+    USES (``_handle_command_text``): ``bytes``, ``bytearray`` and ``memoryview``
+    all name ``GRAPH.QUERY`` on the wire (a buffer is passed through by
+    ``redis.connection.Encoder``), so a reader that accepts only ``bytes`` reads
+    a payload the server executes but it cannot see — and that is the direction
+    that leaves a write out of the §17.1 census (measured: "#9209 review" on
+    the handle-door classifier; the same blind spot sat in this reader).
     """
     if len(args) < 3:
         return ""
-    verb, statement = args[0], args[2]
-    if isinstance(verb, bytes):
-        verb = verb.decode("utf-8", "replace")
-    if isinstance(statement, bytes):
-        statement = statement.decode("utf-8", "replace")
-    if not isinstance(verb, str) or not isinstance(statement, str):
+    verb = _handle_command_text(args[0])
+    statement = _handle_command_text(args[2])
+    if verb is None or statement is None:
         return ""
     if verb.upper() not in _GRAPH_QUERY_COMMANDS:
         return ""
