@@ -9399,6 +9399,64 @@ class TestUriRegistryProbeConnectionReuse:
             "configured URI changed")
         assert closed == [True], "the replaced handle must be closed"
 
+    def test_a_changed_store_path_rebuilds_instead_of_probing_the_old_store(
+            self, monkeypatch):
+        """#9376: the cache key is the STORE, not one of its inputs.
+
+        The URI alone does not identify what a handle is bound to. The suite's
+        canonical fixture (`tests/_http_fixtures.patched_tortoise_sdk`)
+        replaces `TortoiseSDK.__init__` so every construction binds that TEST's
+        temp DB and pins `TORTOISE_DB_PATH` to it, while the docker lane's
+        `TORTOISE_DB_URI` string stays constant for the whole run. Keyed on the
+        URI alone, `_registry_anchor()` therefore handed a later test a
+        connection to an EARLIER test's (torn-down) temp DB — measured on main
+        at adaf3daea as an org that had just been created through the live store
+        being ABSENT from `GET /v1/organizations`
+        (`tests/test_onboarding_endpoints.py::TestOnboardingTeam::
+        test_create_team_then_session_key_mint_registry`, 1 failed / 43 passed
+        at file scope; 44 passed with this key). The same stale handle answers
+        `_org_node`/`_membership_role` with EMPTY, which is the false 403
+        `Requires owner or admin role in team`.
+
+        The regression is stated as behaviour, not as a key comparison: after
+        the store the process addresses changes, the probe must CONSTRUCT a new
+        handle and close the old one. Reusing the old handle is the defect —
+        whatever the key is spelled as.
+        """
+        import tortoise.hosted_api as ha_mod
+
+        monkeypatch.setenv("TORTOISE_DB_URI",
+                           "docker://:pw@localhost:6379/probe-store")
+        monkeypatch.setenv("TORTOISE_DB_PATH", "/tmp/store-a/onboarding.db")
+        constructed, closed = self._install(monkeypatch, ["org_a"])
+        assert ha_mod._registry_existing_graphs() == {"org_a"}
+        assert len(constructed) == 1 and closed == []
+
+        # The SAME URI, a DIFFERENT store — exactly the harness's per-test
+        # rebind, and exactly a production `TORTOISE_DB_PATH` reconfiguration.
+        monkeypatch.setenv("TORTOISE_DB_PATH", "/tmp/store-b/onboarding.db")
+        assert ha_mod._registry_existing_graphs() == {"org_a"}
+
+        assert len(constructed) == 2, (
+            "the cached handle kept addressing the OLD store after the path "
+            "the handle is bound to changed — every read after that point "
+            "answers from a store the process no longer writes to")
+        assert closed == [True], "the replaced handle must be closed"
+
+        # The journal-dir component is pinned as a KEY SUPERSET guard, not as a
+        # #4240 journal binding: `config._resolve_event_log_path` returns None
+        # for namespace="registry" (config.py:128), so this handle carries no
+        # journal at all. The component is retained so a future
+        # namespace/journal change cannot silently reopen this class; its only
+        # observable today is that changing it forces one rebuild.
+        monkeypatch.setenv("TORTOISE_EVENT_LOG_BASE_DIR", "/tmp/journal-b")
+        ha_mod._registry_existing_graphs()
+        assert len(constructed) == 3, (
+            "the key no longer includes TORTOISE_EVENT_LOG_BASE_DIR — the "
+            "superset guard that keeps a future journal/namespace change from "
+            "reopening this class was dropped from _registry_probe_key")
+        assert closed == [True, True], "the replaced handle must be closed"
+
     def test_probe_failure_stays_fail_open_and_reuses_the_connection(
             self, monkeypatch):
         import tortoise.hosted_api as ha_mod

@@ -887,14 +887,23 @@ def _registry_anchor() -> TortoiseSDK:
     the #8098 webhook retry sweep) made that a per-minute cost.
 
     So URI mode delegates to ``_registry_probe_sdk()`` — the #4661 cache that
-    already exists for exactly this shape: one handle per process, keyed by the
-    ``TORTOISE_DB_URI`` STRING (a reconfigured URI closes the stale handle and
-    rebuilds, so a test's private lane or a process reconfiguration can never be
-    served the old server), built under ``_KEEPALIVE_LOCK`` so two threads
-    cannot both build one, and closed by ``_reset_registry_probe_sdk()`` (the
-    suite's isolation hook). Sharing it with the probe is deliberate: both want
+    already exists for exactly this shape: one handle per process, keyed by
+    ``_registry_probe_key()`` — the SET of env inputs that decides what store
+    the handle is bound to, **not** the ``TORTOISE_DB_URI`` string alone — built
+    under ``_KEEPALIVE_LOCK`` so two threads cannot both build one, and closed
+    by ``_reset_registry_probe_sdk()`` (the suite's isolation hook). Sharing it with the probe is deliberate: both want
     "the one registry connection this process holds", and a second cache would
     be the drift ``_control_plane_source``'s docstring warns about (#2823/#2340).
+
+    ⛔ The URI alone was NOT sufficient, and this docstring previously promised
+    otherwise ("a reconfigured URI closes the stale handle … so a test's private
+    lane can never be served the old server"). That promise was false in exactly
+    the case it named: the suite's fixtures rebind the STORE — by patching
+    ``TortoiseSDK.__init__`` and pinning ``TORTOISE_DB_PATH`` — which the URI
+    string cannot see, so a later test was served the previous test's torn-down
+    temp DB (measured: an org minted by the running test was absent from
+    ``GET /v1/organizations``, #9376). The key is the store set now: see
+    ``_registry_probe_key`` for what each component does.
 
     ONE behaviour difference that follows, stated so it is not a surprise: URI
     mode now binds EAGERLY (that `_get_proj()` is what makes the handle worth
@@ -29151,10 +29160,78 @@ def _graph_has_org_namespace(
 # per-call handle is the #2251 anti-stray-DB contract, and a loopback
 # connection is not the cost.
 _REGISTRY_PROBE_SDK: TortoiseSDK | None = None
-#: The `TORTOISE_DB_URI` `_REGISTRY_PROBE_SDK` was built for. A changed URI
-#: means the cached handle addresses ANOTHER server (process reconfiguration,
-#: or a test's private lane) — it is closed and rebuilt, never reused.
-_REGISTRY_PROBE_URI: str | None = None
+
+
+def _registry_probe_key() -> tuple[str | None, str | None, str | None]:
+    """The env inputs `_make_sdk` reads, i.e. what IDENTIFIES the handle.
+
+    ⛔ The URI alone is NOT identity (#9376). This cache used to be keyed on
+    `TORTOISE_DB_URI` only, which is sound in production (the URI is the store
+    and it does not change under a process) and UNSOUND under the suite's
+    canonical fixture shape: `tests/_http_fixtures.patched_tortoise_sdk`
+    replaces `TortoiseSDK.__init__` so every no-path construction binds THAT
+    test's temp DB, and pins `TORTOISE_DB_PATH` to the same file so the anchor
+    and the per-request SDK agree — while `TORTOISE_DB_URI` stays the docker
+    lane's constant string for the whole run. Under that harness the cached
+    handle addresses a DIFFERENT STORE per test but kept the SAME key, so
+    `_registry_anchor()` served a later test a connection to an EARLIER test's
+    torn-down temp DB: a team minted through the live store was then answered
+    from a store whose `:Team`/`:Membership` rows did not exist — a 403
+    `Requires owner or admin role in team` where the caller IS the owner, and a
+    200 whose org is missing from the switcher. That is an authorization answer
+    that depends on which store the cache happened to bind.
+
+    So the key is a SET of ambient inputs, and each component is there for a
+    DIFFERENT reason — stated precisely, because two of the three are not what
+    a reader would assume:
+
+    * `TORTOISE_DB_URI` — the store identity in unpatched production. This is
+      the component that was already correct.
+    * `TORTOISE_DB_PATH` — ⛔ NOT read by `_make_sdk` on this branch: it returns
+      at its URI check before `_resolve_embedded_db_path()` is reached. It is
+      in the key because it is what a PATCHED `TortoiseSDK.__init__` binds, and
+      that patch is the harness shape that produced the incident. Scope, stated
+      honestly: `tests/_http_fixtures.patched_tortoise_sdk` pins it (so the key
+      DOES separate those stores), while `tests/test_hosted_api.py`'s
+      `_patch_tortoise_sdk_init` does NOT pin it itself — 19 call sites, some
+      pinning at the call site and some not. For the non-pinning ones the key is
+      constant across stores, and what separates them is the per-test teardown
+      reset already in `tests/conftest.py::_process_global_isolation` (the
+      #5049 rule-4 hook). This key makes reuse correct wherever the env can see
+      the store; it does not replace that reset.
+    * `TORTOISE_EVENT_LOG_BASE_DIR` — a conservative SUPERSET guard, INERT here:
+      `config._resolve_event_log_path` returns `None` for `namespace="registry"`
+      (`tortoise/config.py:128`), so the registry probe's handle carries no
+      journal today. It is kept so that a future namespace/journal change cannot
+      silently reopen this class; its only cost is a rebuild if it is changed.
+
+    A key that does not identify its value is not a cache, it is a guess — and
+    here the guess is an authorization decision.
+
+    Cost: all three are constant for the life of a production process, so the
+    cached connection (#4661 — the TCP+TLS handshake the probe exists to avoid)
+    is still reused; a changed component rebuilds once, which is the intent.
+
+    The key is sampled at the TOP OF THE CRITICAL SECTION in
+    `_registry_probe_sdk`, not before acquiring the lock: the lock is held
+    across the connect (#4661 measures it in seconds), so a pre-lock sample can
+    block that long and then stamp a handle built under a DIFFERENT env with the
+    stale key — the very defect this function exists to prevent. Residual, not
+    covered: an env mutation DURING `_make_sdk` (a reconfiguration race); the
+    next call's compare evicts the handle rather than serving it.
+    """
+    return (
+        os.environ.get("TORTOISE_DB_URI"),
+        os.environ.get("TORTOISE_DB_PATH"),
+        os.environ.get("TORTOISE_EVENT_LOG_BASE_DIR"),
+    )
+
+
+#: The :func:`_registry_probe_key` `_REGISTRY_PROBE_SDK` was built for. A
+#: changed key means the cached handle addresses ANOTHER store (process
+#: reconfiguration, a test's private lane, or the harness rebinding
+#: `TORTOISE_DB_PATH` per test) — it is closed and rebuilt, never reused.
+_REGISTRY_PROBE_KEY: tuple[str | None, str | None, str | None] | None = None
 
 
 def _reset_registry_probe_sdk() -> None:
@@ -29164,12 +29241,12 @@ def _reset_registry_probe_sdk() -> None:
     `_make_sdk`/`TortoiseSDK` must not inherit a handle an earlier test built
     (#5049 rule 4). The close runs OUTSIDE `_KEEPALIVE_LOCK` so a slow close
     cannot block a concurrent construction (the #2172 lock discipline)."""
-    global _REGISTRY_PROBE_SDK, _REGISTRY_PROBE_URI
+    global _REGISTRY_PROBE_SDK, _REGISTRY_PROBE_KEY
     if _REGISTRY_PROBE_SDK is None:
         return
     with _KEEPALIVE_LOCK:
         sdk, _REGISTRY_PROBE_SDK = _REGISTRY_PROBE_SDK, None
-        _REGISTRY_PROBE_URI = None
+        _REGISTRY_PROBE_KEY = None
     try:  # noqa: SIM105
         sdk.close()
     except Exception:
@@ -29185,28 +29262,35 @@ def _registry_probe_sdk() -> TortoiseSDK:
     the loser. A construction FAILURE is not cached: the exception propagates
     to `_registry_existing_graphs`'s never-raise wrapper and the next probe
     retries, so the fail-open contract is unchanged."""
-    global _REGISTRY_PROBE_SDK, _REGISTRY_PROBE_URI
-    uri = os.environ.get("TORTOISE_DB_URI")
+    global _REGISTRY_PROBE_SDK, _REGISTRY_PROBE_KEY
     cached = _REGISTRY_PROBE_SDK
-    cached_uri = _REGISTRY_PROBE_URI
-    if cached is not None and cached_uri == uri:
+    cached_key = _REGISTRY_PROBE_KEY
+    # Lock-free fast path: compares the CURRENT env against the stamp, so a
+    # changed store is detected here without taking the lock.
+    if cached is not None and cached_key == _registry_probe_key():
         return cached
     with _KEEPALIVE_LOCK:
+        # ⛔ Sampled INSIDE the lock, immediately before construction: the lock
+        # is held across the connect (#4661), so a pre-lock sample could wait
+        # seconds and then stamp a handle built under a different env with a
+        # stale key — a cache key that does not describe its value, which is
+        # the #9375 defect mirrored.
+        key = _registry_probe_key()
         cached = _REGISTRY_PROBE_SDK
-        cached_uri = _REGISTRY_PROBE_URI
-        if cached is not None and cached_uri == uri:
+        cached_key = _REGISTRY_PROBE_KEY
+        if cached is not None and cached_key == key:
             return cached
         if cached is not None:
-            # The configured server changed — a reconfiguration event, not a
+            # The configured STORE changed — a reconfiguration event, not a
             # request event (the embedded anchor evicts on drift the same
-            # way, #1502). Drop the handle: reusing it would probe a server
+            # way, #1502). Drop the handle: reusing it would probe a store
             # this process no longer talks to.
             try:  # noqa: SIM105
                 cached.close()
             except Exception:
                 pass
             _REGISTRY_PROBE_SDK = None
-            _REGISTRY_PROBE_URI = None
+            _REGISTRY_PROBE_KEY = None
         sdk = _make_sdk(namespace="registry")
         try:
             sdk._get_proj()
@@ -29217,7 +29301,7 @@ def _registry_probe_sdk() -> TortoiseSDK:
                 pass
             raise
         _REGISTRY_PROBE_SDK = sdk
-        _REGISTRY_PROBE_URI = uri
+        _REGISTRY_PROBE_KEY = key
         return sdk
 
 
@@ -35275,7 +35359,9 @@ def _control_plane_source_on_worker():
 
     That lifetime is real on BOTH lanes (#8098 review F1): the embedded anchor
     caches ``_registry_g`` in ``_FALLBACK_KEEPALIVE``, and URI mode now
-    delegates to the #4661 URI-keyed ``_registry_probe_sdk()`` cache instead of
+    delegates to the #4661 store-keyed ``_registry_probe_sdk()`` cache (keyed by
+    ``_registry_probe_key()`` — the URI *plus* the store inputs a patched
+    ``__init__`` binds, never the URI string alone) instead of
     constructing a fresh handle — see ``_registry_anchor``'s docstring for why
     the old URI branch made this paragraph false on the lane that ships.
 
