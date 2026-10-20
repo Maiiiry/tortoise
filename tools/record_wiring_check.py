@@ -21,15 +21,21 @@ WHAT IT ASSERTS (exit 0 only when all three hold)
    derived from `record_projection.RECORD_MUTATIONS` — the ONE declaration of
    journal→record — never from a hand-written list here. A second list is the
    second declaration that goes stale.
-3. **The live caller does not invent a position.** The live path cannot write
-   `journal_event.seq` (#9190, `record_writer.POSITION_ROW_DEFERRED_ON`), so a
-   live call that omits `position=False` is a FAILURE: an invented position
-   collides with a later replay's numbering in silence.
+3. **The live caller writes the journal's OWN position — never an invented
+   one.** `EventLog.append` reports the record's position (#9190, landed on main
+   in `b3b4c2fb1`), and layer 1 (`public.journal_event`, exposed as
+   `public.record_event_stream`) is written from it. So the live door must carry
+   the ordinal through (`seq=`) and pass `position=seq is not None`, while every
+   OTHER production call to a `position`-taking entry point must still pass the
+   literal `position=False` — a number IT invents collides with a later replay's
+   numbering on `(org_id, graph_id, seq)` in silence.
 
 EXIT CODES — a signal that cannot be read is not a pass.
 
-    0  wired: a production caller + a writer for every layer + no invented position
-    1  NOT wired: no production caller, a layer with no writer, or an invented position
+    0  wired: a production caller + a writer for every layer + the journal's own
+       position on the live path and no invented one anywhere else
+    1  NOT wired: no production caller, a layer with no writer, an invented
+       position, or a live door that drops the ordinal
     2  CANNOT ANSWER: a module could not be parsed, or the fold could not be read
 
 The tool is read-only and DB-free: it must run in every lane, including where
@@ -88,11 +94,13 @@ DECLARED_GAPS: dict[str, str] = {
     "journal_event": (
         "layer 1's relational truth set. Migration 20261012000001 defines "
         "layer 1 AS `public.journal_event` and 20261012000004 exposes it as "
-        "`public.record_event_stream`. It is written by a REPLAY, never by "
-        "the live door: the live path has no journal ordinal (#9190) and an "
-        "invented `seq` collides with a later replay's numbering, so the live "
-        "door defers the row (`position=False`). The view is therefore empty "
-        "until #9190 lands the ordinal."
+        "`public.record_event_stream`. It is WRITTEN — by the fold's POSITION "
+        "leg, from the ordinal `EventLog.append` reports (#9190), which the "
+        "live door now carries through `write_live_record(seq=…)`. It has no "
+        "`RECORD_MUTATIONS` entry because it is not a record TYPE mutation: it "
+        "is the per-record index the layer rows are keyed from, so the writer "
+        "derivation above cannot see it and this declaration is where it is "
+        "named instead of being dropped from `LAYERS`."
     ),
 }
 
@@ -352,15 +360,21 @@ def _tables_of(mutation: object) -> tuple[set[str], str | None]:
     return set(), f"effect class {name!r} writes no table this check can see"
 
 
-def live_door_defers_the_position() -> list[str]:
-    """The LIVE door must pass `position=False` as a LITERAL, or not exist.
+def live_door_writes_the_journals_position() -> list[str]:
+    """The LIVE door must write layer 1 from the append's ordinal (#9190).
 
-    The live path has no journal ordinal (#9190), so a position row it wrote
-    would be invented — and an invented `seq` collides with a later replay's
-    numbering on the `(org_id, graph_id, seq)` primary key, in silence. Two
-    ways to fail, both checked: the door is missing (the wiring moved and this
-    tool must learn the new place), or its `write_records(...)` call binds
-    `position` to anything but the literal `False`.
+    `EventLog.append` reports the record's journal position, and that number IS
+    `journal_event.seq` — the replay numbers records ``enumerate(records,
+    start=1)`` over the same read, so a live write and a full replay give one
+    record one number by construction. The door therefore has to (a) TAKE the
+    ordinal (`seq`) and (b) bind `position` to `seq is not None`, never to a
+    literal `False` (the pre-#9190 deferral, which left layer 1 empty on every
+    live write) and never to a literal `True` (which would invent a number for
+    a log that reported none — the collision #9190 exists to remove).
+
+    Two ways to fail, both checked: the door is missing (the wiring moved and
+    this tool must learn the new place), or its `write_records(...)` call does
+    not bind `position` to the ordinal-derived expression.
     """
     path = REPO_ROOT / "tortoise" / "record_writer.py"
     try:
@@ -392,14 +406,43 @@ def live_door_defers_the_position() -> list[str]:
     for call in calls:
         bound = {kw.arg: kw.value for kw in call.keywords if kw.arg}
         value = bound.get("position")
-        if not (isinstance(value, ast.Constant) and value.value is False):
+        if not _is_position_from_ordinal(value):
             problems.append(
                 f"{_LIVE_DOOR}() calls {_call_name(call)}(…) with "
                 f"position={ast.unparse(value) if value is not None else '<unset>'}"
-                " — the live path has no journal ordinal (#9190), so it must "
-                "pass the literal `position=False`"
+                " — the live path must WRITE layer 1 from the journal's own "
+                "position (#9190), so bind `position=seq is not None`. A literal "
+                "`False` is the pre-#9190 deferral (layer 1 stays empty on every "
+                "live write); a literal `True` invents a number for a log that "
+                "reported none and collides with a later replay's numbering"
+            )
+        first_seq = bound.get("first_seq")
+        if not _references_ordinal(first_seq):
+            problems.append(
+                f"{_LIVE_DOOR}() calls {_call_name(call)}(…) with "
+                f"first_seq={ast.unparse(first_seq) if first_seq is not None else '<unset>'}"
+                " — the ordinal the append reported (#9190) must be the number "
+                "the row is keyed on, not a default"
             )
     return problems
+
+
+def _is_position_from_ordinal(value: ast.expr | None) -> bool:
+    """Is this `position=` bound to `seq is not None` (the #9190 form)?"""
+    return isinstance(value, ast.Compare) and ast.unparse(value) == "seq is not None"
+
+
+def _references_ordinal(value: ast.expr | None) -> bool:
+    """Does this expression USE the append's ordinal at all?
+
+    Deliberately not "is a bare Name": the honest spelling may be a conditional
+    (`first_seq=seq if seq is not None else 1` — `write_records` needs a number
+    even when the flag is off), and rejecting that shape would push a lane
+    toward a literal default, which is the defect. What must be true is that the
+    row's `seq` comes FROM the append, not from this function.
+    """
+    return value is not None and any(
+        isinstance(node, ast.Name) and node.id == "seq" for node in ast.walk(value))
 
 
 def position_problems_for_module(tree: ast.AST, rel: str) -> list[str]:
@@ -425,8 +468,11 @@ def position_problems_for_module(tree: ast.AST, rel: str) -> list[str]:
             problems.append(
                 f"{rel}:{node.lineno} calls {name}(…) with "
                 f"position={ast.unparse(value) if value is not None else '<unset>'}"
-                " — a live caller has no journal ordinal (#9190), so it"
-                " must pass the literal `position=False`"
+                " — a production caller that invents its own `seq` collides "
+                "with a later replay's numbering (#9190), so it must pass the "
+                "literal `position=False`. The LIVE door is the exception, and "
+                "`live_door_writes_the_journals_position` holds it to the "
+                "ordinal the journal reported"
             )
     return problems
 
@@ -435,7 +481,8 @@ def production_callers_defer_the_position() -> list[str]:
     """EVERY production call to a `position`-taking record entry point must pass
     `position=False` as a LITERAL.
 
-    `live_door_defers_the_position` reads only the body of `write_live_record`,
+    `live_door_writes_the_journals_position` reads only the body of the live
+    door,
     so a FOURTH door that calls the seam directly — `write_records([...])`,
     `replay([...], conn)`, `RecordWriter().write([...])`, each of whose signature
     default is `position=True` — satisfies claim 1 (a production caller exists),
@@ -445,8 +492,9 @@ def production_callers_defer_the_position() -> list[str]:
     the function the parameter actually lives on: a door spelled
     `record_projection.replay(...)` was invisible to BOTH checks.
 
-    `write_live_record` is NOT held to this: it takes no `position` parameter
-    and passes the literal internally, which is the point of a single door.
+    `write_live_record` is NOT held to this: it takes no `position` parameter —
+    it takes the ORDINAL (`seq`) and derives the flag internally, which is the
+    point of a single door (and what lets layer 1 be written on the live path).
     """
     problems: list[str] = []
     for path in _iter_package_modules():
@@ -503,7 +551,7 @@ def check() -> tuple[int, dict[str, object]]:
                 f"({deferral.splitlines()[0][:60]}…) must be removed — a "
                 "standing exemption turns a future missing writer into a pass"
             )
-    position_problems = (live_door_defers_the_position()
+    position_problems = (live_door_writes_the_journals_position()
                          + production_callers_defer_the_position())
 
     report: dict[str, object] = {

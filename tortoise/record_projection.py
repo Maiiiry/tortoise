@@ -1720,8 +1720,11 @@ def replay_plan(records: Sequence[Mapping[str, Any]], *, org_id: str,
     SAME offset from the same durable facts, so a retry never renumbers.
 
     `position=False` omits the per-record row entirely (see :func:`replay`):
-    it is the live path's shape until #9190 gives the chokepoint a real
-    ordinal, and the layer mutations are unaffected.
+    the shape for a caller with NO journal ordinal. The LIVE path is not that
+    caller — `EventLog.append` reports the record's position (#9190), and
+    `record_writer.write_live_record` writes the row from it — so layer 1 is
+    populated by production traffic, not only by a replay. The layer mutations
+    are unaffected either way.
     """
     if start_seq < 1:
         raise RecordProjectionError(

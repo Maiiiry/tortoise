@@ -144,7 +144,7 @@ _logger = logging.getLogger(__name__)
 __all__ = [
     "CONNECT_TIMEOUT_SECONDS",
     "LIVE_WRITE_BREAKER_SECONDS",
-    "POSITION_ROW_DEFERRED_ON",
+    "POSITION_ORDINAL_SOURCE",
     "RECORD_DSN_ENV",
     "RECORD_GRAPH_ENV",
     "RECORD_ORG_ENV",
@@ -161,15 +161,16 @@ __all__ = [
     "write_records",
 ]
 
-#: The record's position row (`public.journal_event`) is NOT written by the live
-#: path yet: a position is a fact only a bounded replay can derive, and the live
-#: chokepoint has no ordinal (`EventLog.append` reports nothing; there is no
-#: count accessor). Writing one anyway would collide on `(org_id, graph_id,
-#: seq)` with a later full replay's numbering — in silence. #9190 owns the
-#: ordinal; the live write passes `position=False` until it lands, and the FOUR
-#: ontology layers are unaffected (the position row is bookkeeping ABOUT them,
-#: not one of them).
-POSITION_ROW_DEFERRED_ON = "#9190"
+#: The record's position row (`public.journal_event` — layer 1, exposed as
+#: `public.record_event_stream`) is written BY THE LIVE PATH, from the ordinal
+#: `EventLog.append` returns (#9190, landed on main in `b3b4c2fb1`). The `seq` is
+#: the journal's own fact: the replay numbers records ``enumerate(records,
+#: start=1)`` over the same read, so a live write and a full replay give one
+#: record one number by construction. What this constant names is the ISSUE that
+#: supplied that ordinal — it used to name a deferral ("the live chokepoint has
+#: no ordinal"), and that premise is closed; leaving the note here is what keeps
+#: the next reader from re-deriving the deferral from an old comment.
+POSITION_ORDINAL_SOURCE = "#9190"
 
 #: The arming key. Present ⇒ armed; unset/blank ⇒ ``NOT_ARMED``. See the module
 #: docstring, decision 2 — and note it is a DSN, not a boolean, so a second
@@ -509,11 +510,12 @@ class RecordWriter:
             the journal append and this projection in ONE transaction; the seam
             then neither opens nor closes nor commits it.
         :param position: write the per-record ``journal_event`` position row
-            (default ``True``). The LIVE path passes ``False``: it has no
-            ordinal to record (
-            :data:`POSITION_ROW_DEFERRED_ON`, #9190), and a guessed one would
-            collide with a later replay's numbering in silence. The four
-            ontology layers are written either way.
+            (default ``True``). The LIVE path writes it too, keyed on the
+            ordinal the journal's own append reported (:data:`POSITION_ORDINAL_SOURCE`,
+            #9190) — never on a number this call derives. A caller that HAS no
+            ordinal passes ``False``; a guessed ``seq`` still collides with a
+            later replay's numbering in silence, and the four ontology layers
+            are written either way.
 
         :raises RecordWriteError: the record was ARMED and the write did not
             happen (malformed DSN, unreachable record, totality refusal, or a
@@ -669,7 +671,8 @@ def _count_non_journal_skip(reason: str = "no_durable_journal") -> None:
 
 
 def write_live_record(record: Mapping[str, Any], *,
-                      durable: bool = True) -> RecordWrite | None:
+                      durable: bool = True,
+                      seq: int | None = None) -> RecordWrite | None:
     """The LIVE door: one journal record that has ALREADY been appended.
 
     Called at each of the three places the journal is appended on a live write
@@ -721,6 +724,15 @@ def write_live_record(record: Mapping[str, Any], *,
     is refused locally (counted ``circuit_open``) instead of paying that
     timeout once per record — N records used to cost N × 10 s inside one
     ``capture_session`` call, which is a wedged capture, not a degraded one.
+
+    ``seq`` is the record's OWN journal position — what `EventLog.append`
+    returned (#9190). It is a fact of the journal, never an allocator: the replay
+    numbers records ``enumerate(records, start=1)`` over the same read, so a live
+    write and a full replay give one record one number by construction, and the
+    position row lands in layer 1 (`public.journal_event`, and the
+    `public.record_event_stream` view over it) on the live path. ``None`` (a log
+    that reports no position — the in-memory capture lane) writes no position
+    row: nothing there could be numbered, and inventing one is the #9190 defect.
 
     ``OVERRIDES:`` the module's decision 3 (`Armed but unreachable ⇒ the write
     FAILS (RecordWriteError)`) does not apply to this door, and that is a
@@ -779,8 +791,12 @@ def write_live_record(record: Mapping[str, Any], *,
         return None
     connection: Any | None = None
     try:
+        # #9190's ordinal, straight from the append. `position=False` only when
+        # the log reported none (the in-memory capture lane): a row needs a
+        # number, and inventing one collides with a later replay's numbering.
         write = write_records([record], org_id=org_id, graph_id=graph_id,
-                              position=False)  # #9190: never invent a position
+                              position=seq is not None,
+                              first_seq=seq if seq is not None else 1)
         _close_live_breaker()
         connection = write.connection
         if connection is not None:
