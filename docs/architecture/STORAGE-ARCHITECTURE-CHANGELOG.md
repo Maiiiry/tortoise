@@ -691,3 +691,23 @@ that was itself a heading cannot collide with this file's own outline.
   - Measured 2026-10-08 (10,000 `Point`s; 87 distinct property names on that sample — itself truncated by FalkorDB's silent 10,000-row cap): 9 of those 87 property names are DERIVED or VOLATI…
   - ✅ The canonical id contract (`#7955`). The stable key is fixed per label — `:Point` → `id` (minted by `tortoise/ids.py::ulid()`), `:Event` → `eventId`, `:Subject`/`:Object` → `name`, `:So…
   - ⛔ CORRECTION TO §17.5 AS WRITTEN — `baseline_source` is NOT unconditionally DERIVED; `baseline_set` is DERIVED, but not as a record column. When an author sets the prior (`baseline_source…
+
+---
+
+### 2026-10-20 — `#9397`: §11.1 and §13 said the `aboutObject` edge carries **no** property. It carries `confidence`.
+
+**What was recorded.** §11.1 (*"Our `aboutObject` links are **property-free** … a full-repo search for a property-bearing edge finds **none**"*) and §13 (*"**no** `aboutObject` edge carries **any property** … we lose nothing semantically by deriving later"*), plus the same fact in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 question 2 and in this ledger's `aboutObject` decision row.
+
+**Why it was wrong, and why the method hid it.** The evidence was a search for a Cypher **property MAP** (`rg -n 'aboutObject \{'`) → 0 matches. A property written by a **`SET r.<prop>` clause on a relationship variable** never matches that pattern, so the search could not see the writer, and a zero from a search that cannot match the writer was recorded as a measured absence. Three shipped sites write one:
+
+| site | what it writes |
+|---|---|
+| `tortoise/session_link.py` — `link_entity` | `MERGE (s)-[r:{edge_type}]->(t) SET r.confidence=$conf`; `edge_type` **defaults to `aboutObject`** |
+| `tortoise/subject_binding.py` — `bind_point_subjects` | `SET r.confidence=$conf` on an already-present about edge; the `object` slot role binds via `aboutObject` (reached from `_extract_session_v2` on the default ingestion path) |
+| `tortoise/projection/entities.py` — `_fold_entity_linked_reason` | the **replay fold** re-SETs it, so the property is journaled — `live == rebuild` |
+
+The property is asserted by a shipped test (`tests/test_subject_binding_1370.py::test_binder_reports_already_present_and_sets_confidence`, reading `r.confidence` off a `(Point)-[:aboutObject]->(Object)` edge), so this was never an obscure branch.
+
+**What changed.** §11.1 states the measured property set (exactly one name — `confidence` — on bound entity links only; the extractor/indexer links that are the bulk of the rows are genuinely bare, so the **cost** conclusion stands) and §13 narrows *"we lose nothing semantically by deriving later"* to *"we lose one recorded attribute"*. **The KEEP ruling and its deferral to post-launch are unchanged** — if anything the finding strengthens keeping the edge. §11.4 rule 1 is now recorded as **in tension** with `#1370` rather than as satisfied: whether a binding confidence belongs on the link or on the claim is an unrecorded design decision, flagged, not resolved here.
+
+**What now prevents a repeat.** `tests/test_9397_about_edge_properties.py` — the retracted absolute sentences must not reappear; the corrected text must name the writers and the property; each recorded writer must still write it; and a **census over relationship-variable `SET` sites** reds if a NEW property-bearing `about*` writer appears without being recorded. The lesson is stated for the next reader: *re-derive a property claim from the WRITER CENSUS, not from a grep whose pattern cannot match the writer.*
