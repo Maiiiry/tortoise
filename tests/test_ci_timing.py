@@ -4376,3 +4376,23 @@ def test_rows_without_a_leg_count_stay_comparable() -> None:
     assert [f["test"] for f in ci_timing.candidate_flakes(history)] == [
         "tests/test_beta.py::test_legacy"
     ]
+
+
+def test_a_pair_with_only_one_known_leg_count_is_not_comparable() -> None:
+    """The shipped artifact is exactly this shape: one row with `legs`, one without.
+
+    Closing the smaller-sample hole only when BOTH rows carried a count left the
+    one-sided pair compared anyway — and that is the real history, because the
+    rows behind the newest predate the field. A one-leg `--allow-fewer-legs` write
+    then published every test of the missing shards as having passed (#9134
+    review cycle 13).
+    """
+    history = [
+        {"counts": {"failed": 0}, "failed_tests": [], "run_id": "9002",
+         "sample_time": "t2", "legs": 1},
+        {"counts": {"failed": 1}, "failed_tests": ["tests/test_removed_shard.py::test_gone"],
+         "run_id": "9001", "sample_time": "t1"},          # predates `legs`
+    ]
+    assert ci_timing.candidate_flakes(history) == [], (
+        "a one-sided leg count was compared and produced a pass for a test that never ran"
+    )

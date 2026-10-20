@@ -1895,9 +1895,15 @@ def candidate_flakes(history: list[dict]) -> list[dict]:
     out: list[dict] = []
     for i in range(min(3, len(history) - 1)):
         newer, older = history[i], history[i + 1]
-        newer_legs, older_legs = newer.get("legs"), older.get("legs")
-        if (isinstance(newer_legs, int) and isinstance(older_legs, int)
-                and newer_legs != older_legs):
+        known = [x for x in (newer.get("legs"), older.get("legs")) if isinstance(x, int)]
+        # Comparable only when the counts are KNOWN EQUAL. One side missing a count
+        # is the state the shipped artifact is in (history[0] has `legs`, the rows
+        # behind it predate it), and comparing that pair anyway let a one-leg
+        # `--allow-fewer-legs` write publish every test of the missing shards as
+        # "passed again" (#9134 review cycle 13). Both sides missing stays
+        # comparable: legacy history must keep working, not silently switch the
+        # detector off.
+        if len(known) == 1 or (len(known) == 2 and known[0] != known[1]):
             continue
         prev_failed = set(older.get("failed_tests", []))
         cur_failed = set(newer.get("failed_tests", []))
