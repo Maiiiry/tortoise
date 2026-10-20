@@ -3796,3 +3796,88 @@ def test_the_committed_artifact_agrees_with_its_own_failure_detail() -> None:
             "the artifact's log_sources do not add up to its outcome "
             f"(attributed, outcome): {unattributable}"
         )
+
+
+def test_log_sources_name_the_leg_not_just_the_file(tmp_path: Path) -> None:
+    """Two legs both upload a file called `pytest.log`; they must stay distinct.
+
+    The downloaded artifacts are one DIRECTORY per CI leg, and most of those
+    directories hold `pytest.log`. Naming a source by its basename alone made the
+    committed artifact list fifteen identical `pytest.log` rows, so the failure
+    one of them reported could not be traced to a leg (#9134 review cycle 3).
+    This test writes the SAME basename under two leg directories: a regression to
+    `Path(log_path).name` collapses them and is caught here, while every other
+    test writes its logs at the logs-dir root where the identity equals the
+    basename and nothing would notice.
+    """
+    (tmp_path / "pytest-log-test-a").mkdir()
+    (tmp_path / "pytest-log-test-d").mkdir()
+    (tmp_path / "pytest-log-test-a" / "pytest.log").write_text(
+        "FAILED tests/test_a.py::test_1 - AssertionError\n= 10 passed, 1 failed in 3.00s =\n")
+    (tmp_path / "pytest-log-test-d" / "pytest.log").write_text(
+        "FAILED tests/test_d.py::test_9 - AssertionError\n")
+
+    agg = ci_timing.aggregate_logs(tmp_path)
+
+    identities = sorted(source["log"] for source in agg["log_sources"])
+    assert identities == ["pytest-log-test-a/pytest.log", "pytest-log-test-d/pytest.log"], identities
+    assert len(set(identities)) == 2, "two legs uploading pytest.log must not share one identity"
+    # ...and the derived failure is attached to the leg that reported it, not lost
+    offender = next(s for s in agg["log_sources"] if s["log"].startswith("pytest-log-test-d"))
+    assert offender["counts_from_progress"] == {"failed": 1}, offender
+
+
+def test_a_logless_re_render_must_not_erase_a_measured_row(tmp_path: Path, fake_env: Path) -> None:
+    """Replacing a row is only allowed when this render MEASURED something.
+
+    When `pick_run` re-picks an already-sampled run whose artifacts have expired,
+    the re-render reads no logs and emits an all-zero row. Letting that replace
+    the good row destroys history silently: the zero row is internally coherent
+    (0 failures, 0 tests listed, no duplicate run id), so every invariant still
+    holds and nothing goes red (#9134 review cycle 4). Only the ABSENCE OF LOGS
+    distinguishes it, so that is what gates the replacement.
+    """
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")
+    tools = Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"
+    out = tmp_path / "out"
+    empty_logs = tmp_path / "no-logs"
+    empty_logs.mkdir()
+    env = dict(os.environ, CI_TIMING_NOW="2026-08-18T00:00:00Z")
+    cmd = [sys.executable, str(tools), "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+           "--out-dir", str(out)]
+
+    subprocess.run([*cmd, "--logs-dir", str(tmp_path / "logs")],
+                   capture_output=True, text=True, check=True, env=env)
+    measured = json.loads((out / "ci-timing.json").read_text())
+    assert measured["outcome"]["failed"] == 1
+
+    # same run, logs gone: the artifact must keep the measured row untouched
+    subprocess.run([*cmd, "--logs-dir", str(empty_logs)],
+                   capture_output=True, text=True, check=True, env=env)
+    after = json.loads((out / "ci-timing.json").read_text())
+    assert len(after["history"]) == 1, [e["run_id"] for e in after["history"]]
+    assert after["history"][0]["counts"]["failed"] == 1, (
+        "a log-less re-render overwrote a measured row with zeros"
+    )
+
+
+def test_no_run_renders_do_not_accumulate_identical_rows(tmp_path: Path, fake_env: Path) -> None:
+    """`--run-id ""` carries no run identity, so repeats must replace, not stack.
+
+    That is the path ci-timing.yml takes when `pick_run` finds nothing. Stacking
+    identical `run_id: null` rows would fill `--max-history` and evict real
+    samples, and no invariant can see it — null ids are excluded from the
+    duplicate check because a single one is legitimate (#9134 review cycle 4).
+    """
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")
+    tools = Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"
+    out = tmp_path / "out"
+    cmd = [sys.executable, str(tools), "--repo", "daniel-ospina/tortoise", "--run-id", "",
+           "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(out)]
+
+    for _ in range(3):
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    history = json.loads((out / "ci-timing.json").read_text())["history"]
+    assert len(history) == 1, [(e.get("run_id"), e["counts"]["failed"]) for e in history]
+    assert history[0]["run_id"] is None

@@ -2174,14 +2174,31 @@ def main() -> int:
         "steps_max_job_ms": max((sum(s["duration_ms"] for s in job) for job in steps.values()), default=0),
         "failed_tests": sorted(failed_tests),
     }
-    history = [row] + load_history(json_path)  # noqa: RUF005
+    previous = load_history(json_path)
     # A re-render of an ALREADY SAMPLED run must replace its row, not stack a
     # second one: the two rows describe the same run with whatever the generator
     # said at each time, so a corrected re-render left the stale copy beside it
     # (measured: 5 entries, 4 distinct run ids, `failed: 6` next to `failed: 5`).
     # The freshly measured row is the one that survives.
+    #
+    # But replacement must not be BLIND: a render that read no logs (`--run-id`
+    # given while the run's artifacts have expired, so `--logs-dir` is empty) is
+    # not a measurement, and letting it replace a good row would silently erase
+    # history while every invariant still held — the row it writes is coherent
+    # (0 failures, 0 tests listed), so only the ABSENCE OF LOGS reveals it. A
+    # no-log render may only create a row when none exists yet.
+    #
+    # The no-run path (`--run-id ""`, what ci-timing.yml calls when no run is
+    # picked) carries no run identity at all, so identical rows would otherwise
+    # accumulate up to `--max-history` and evict real samples.
     if run_id:
-        history = [row] + [e for e in history[1:] if e.get("run_id") != run_id]
+        already = any(e.get("run_id") == run_id for e in previous)
+        if log_sources or not already:
+            history = [row] + [e for e in previous if e.get("run_id") != run_id]
+        else:
+            history = previous
+    else:
+        history = [row] + [e for e in previous if e.get("run_id")]
     history = history[: args.max_history]
 
     flakes = candidate_flakes(history)
