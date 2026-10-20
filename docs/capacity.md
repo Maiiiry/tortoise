@@ -213,7 +213,7 @@ curve, and one of those guards has a **measured failure threshold**.
 | EP affected-claim frontier guard (new **claims** per hop) | **200** (`_EP_GUARD_FRONTIER_CAP`) | `tortoise/ep.py` |
 | Operator-set cap on an explicit-k BFS (the ranking's operator input) | **200 operators**, truncated deterministically by id with a stderr warning — and reported in the caller's RESULT as `truncated` / `operators_seen` / `operators_used` since #6211 | `tortoise/analyze.py` |
 | EP pass query that the engine aborts on its own query timeout | raised as **`EPSubgraphHopError`** (a `ResponseError` subclass) carrying the hop index (or `None` for a pass-level query), phase and frontier size (#6211) | `tortoise/ep.py` |
-| EP id-anchored query planning | the PLAN of every id-set statement the pass emits is asserted to be a `Node By Index Scan` on the frontier, not a label scan of the graph; where the shipped plan was a scan, a `WITH *` anchor barrier (`_EP_ANCHOR_BARRIER`) fixes it — the invariant is the plan, not a syntactic rule, because which sites need the barrier was decided per site by measurement (#6211, below) | `tortoise/ep.py`, `tortoise/analyze.py` |
+| EP id-anchored query planning | the PLAN of every id-set statement the pass emits is asserted to be a `Node By Index Scan` on the frontier, not a label scan of the graph; the one exception is the evidence pre-write's journal read, which names no label so no per-label index can anchor it, and which sits outside the pinned set (#9304). Where the shipped plan was a scan, a `WITH *` anchor barrier (`_EP_ANCHOR_BARRIER`) fixes it — the invariant is the plan, not a syntactic rule, because which sites need the barrier was decided per site by measurement (#6211, below) | `tortoise/ep.py`, `tortoise/analyze.py` |
 | EP degenerate-run guard | fires when the pass has collected **≥ 50%** of the graph's claims, on graphs of **≥ 500** claims | `tortoise/ep.py` |
 | Dreaming per-pass window budget (stale-first) | **200** operators (`TORTOISE_DREAM_WINDOW_BUDGET`) | `tortoise/dream.py` |
 | Dreaming full-mode operator cap (`dream_all`) | **200,000** (`max_total_operators`) | `tortoise/dream.py` |
@@ -261,24 +261,29 @@ back-message sweep, the BFS undirected direct-edge sweep and Batch 3, whose two
 `MATCH` / undirected forms anchor on their own.
 
 Three sites in `ep.py` traverse and were already `Node By Index Scan` without a
-barrier on `origin/main`, so they carry none: `_load_cache`'s
-message sweep, `seed_operators` and `_affected_factors` Batch 2. Those three
-plus the three reads that do not traverse at all are the pass's **19 distinct
+barrier on `origin/main`, so they carry none: `_load_cache`'s message sweep,
+`seed_operators` and `_affected_factors` Batch 2. Those three plus the three
+reads that do not traverse at all are the `ep.py` pass's **19 distinct
 unbarriered id-set statements** — the traversing sites at **8 + 1 + 1** (the
 message sweep is 2 relations x 4 epistemic labels) and the single-node probes at
 **4 + 1 + 4**: the cache's per-label node-params load (the `ep_alpha` /
-`ep_beta` probe), the seed lookup (one per label the seed set spans — 1 on a
-`:Point` seed set) and the draft filter. Every one of them is index-anchored.
-The operator selector's operator->target leg is NOT one of these: it is a
-selector-only statement a pass never emits, and it needs no barrier (measured
-`Node By Index Scan`). One further id-set statement sits OUTSIDE this census
-and outside the pinned set: a run whose journal is wired (`_emit`, i.e. an event
-log) and which carries evidence priors also re-reads them for the pre-write's
-journal record, and that read NAMES NO LABEL — so a per-label index cannot
-anchor it (the label-free form is deliberate: a `:Point:Object` node must be
-journaled once, #7853). It is the last unanchored id-set leg of a pass, filed as
-**#9304**. All eleven barriered sites and all three unbarriered traversing ones
-are in the pinned set: `tests/test_6211_ep_anchor.py` captures the statements the
+`ep_beta` probe), the seed lookup (one per label up to the last epistemic label
+the seeds actually use, in `EPISTEMIC_LABELS` order — 1 on a `:Point` seed set,
+4 on an `:Event` one) and the draft filter. Every one of them is
+index-anchored. The operator selector's operator->target leg is NOT one of
+these: it is selector-only (a pass never emits it), carries no barrier, and is
+measured `Node By Index Scan` — the four barriered `analyze.py` legs are the
+viability, incoming, backward and expansion queries. One further id-set
+statement sits OUTSIDE this census and outside the pinned set: a run whose
+journal is wired (`_emit`, i.e. an event log) and which carries evidence priors
+also re-reads them for the pre-write's journal record, and that read names no
+label — so a per-label index cannot anchor it (the label-free form is deliberate:
+a `:Point:Object` node must be journaled once, #7853). It is the last unanchored
+id-set statement of the `ep.py` pass, filed as **#9304**; the traversal
+`sdk.py` mirrors that `compute_confidence` also runs (`_window_closure`) is a
+separate, still-open leg of the same call (#9299). All eleven barriered sites
+and all six unbarriered ones (three traversing, three single-node probes) are in
+the pinned set: `tests/test_6211_ep_anchor.py` captures the statements the
 pass emits and asserts the PLAN of each (`Node By Index Scan`, and no
 `Node By Label Scan`; the selector test additionally rejects `All Node Scan`),
 never their text; each is

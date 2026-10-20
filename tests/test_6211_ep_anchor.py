@@ -22,9 +22,12 @@ every point the map gains and the reason ``max_hops=1`` "converges" while
 WHAT IS PINNED HERE, and why each test is discriminating:
 
 1. ``test_every_id_anchored_pass_query_is_planned_as_an_index_read`` — the
-   queries ``ep.py`` actually EMITS (captured off the graph handle, not
-   re-written in the test) plan through ``Node By Index Scan`` and contain no
-   ``Node By Label Scan``. Measured discriminating power, per site: removing
+   queries the four captured entry points of ``ep.py`` actually EMIT (captured
+   off the graph handle, not re-written in the test) plan through ``Node By
+   Index Scan`` and contain no ``Node By Label Scan``. (``run()``'s own
+   evidence-prewrite journal read is not captured and is not index-planned —
+   it names no label, so no per-label index can anchor it; #9304.) Measured
+   discriminating power, per site: removing
    the barrier reddens it at the seed neighbourhood, the plain-seed direct-edge
    expansion, the bridge hop, Batch 1 and — in the selector test — all four
    ``analyze.py`` legs. It does NOT redden it at three redundant sites: the
