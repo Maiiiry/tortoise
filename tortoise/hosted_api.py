@@ -888,8 +888,11 @@ def _registry_anchor() -> TortoiseSDK:
 
     So URI mode delegates to ``_registry_probe_sdk()`` — the #4661 cache that
     already exists for exactly this shape: one handle per process, keyed by
-    ``_registry_probe_key()`` — the SET of env inputs that decides what store
-    the handle is bound to, **not** the ``TORTOISE_DB_URI`` string alone — built
+    ``_registry_probe_key()`` — the SET of ambient inputs the cache uses to
+    SEPARATE stores, **not** the ``TORTOISE_DB_URI`` string alone. What a handle
+    is actually BOUND to is decided at construction (the ``__init__`` patch in
+    the suite), so the key does not replace the per-test reset — see
+    ``_registry_probe_key`` for the split. Built
     under ``_KEEPALIVE_LOCK`` so two threads cannot both build one, and closed
     by ``_reset_registry_probe_sdk()`` (the suite's isolation hook). Sharing it with the probe is deliberate: both want
     "the one registry connection this process holds", and a second cache would
@@ -29194,14 +29197,20 @@ def _registry_probe_key() -> tuple[str | None, str | None, str | None]:
     `_membership_role` answering EMPTY, i.e. a false 403 `Requires owner or admin
     role in team` where the caller IS the owner.
 
-    ⚠️ Scope, so the key is not credited with a separation it does not make: a
-    handle cannot cross a TEST boundary either way, because
-    `tests/conftest.py::_process_global_isolation` calls
-    `_reset_registry_probe_sdk()` after every test (measured: the probe is None
-    at 75/75 entries of the two suites this fix names). What the key separates is
-    two store configurations inside ONE handle's lifetime — a reconfiguration,
-    or a fixture that repins the store under a live handle — and it is a strict
+    ⚠️ Scope, so the key is not credited with a separation it does not make: the
+    teardown reset in `tests/conftest.py::_process_global_isolation` closes the
+    handle after EVERY test (measured: the probe is None at 75/75 entries of the
+    two suites this fix names), so a cross-test hand-me-down is not the operator
+    those two suites show. It is NOT an impossibility: those sweeps run on
+    ABANDONED daemon threads — `run_on_daemon_worker` states plainly that
+    `wait_for` cancels the awaitable, not the thread (CPython #87185) — so a
+    `_sweep_events` build can land AFTER that reset and survive into the next
+    test; and for the non-pinning call sites below the key cannot tell such a
+    handle from a legitimate one. What the key separates is two store
+    configurations inside ONE handle's lifetime — a reconfiguration, or a
+    fixture that repins the store under a live handle — and it is a strict
     refinement: a changed key can only force a rebuild, it can never reuse.
+    Residual recorded on #9334 rather than claimed closed here.
 
     So the key is a SET of ambient inputs, and each component is there for a
     DIFFERENT reason — stated precisely, because two of the three are not what
@@ -29215,13 +29224,13 @@ def _registry_probe_key() -> tuple[str | None, str | None, str | None]:
       that patch is the harness shape that produced the incident. Scope, stated
       honestly: `tests/_http_fixtures.patched_tortoise_sdk` pins it (so the key
       DOES separate those stores), while `tests/test_hosted_api.py`'s
-      `_patch_tortoise_sdk_init` does NOT pin it itself — 19 call sites, some
-      pinning at the call site and some not. For the non-pinning ones the key is
-      constant across stores, and what separates them is the per-test teardown
-      reset already in `tests/conftest.py::_process_global_isolation` (the
-      #5049 rule-4 hook), which closes the handle after EVERY test — so a
-      hand-me-down across a test boundary is not the operator here: a handle
-      outliving a store rebind it cannot see is. This key makes reuse correct
+      `_patch_tortoise_sdk_init` does NOT pin it itself — 18 call sites, 10 of
+      which pin at the call site and 8 of which do not. For those 8 the key is
+      constant across stores, so a handle they built is INDISTINGUISHABLE from a
+      legitimate one, and what separates them is the per-test teardown reset in
+      `tests/conftest.py::_process_global_isolation` (the #5049 rule-4 hook),
+      which closes the handle after EVERY test. A handle outliving a store
+      rebind it cannot see is the operator here. This key makes reuse correct
       wherever the env can see the store; it does not replace that reset.
     * `TORTOISE_EVENT_LOG_BASE_DIR` — a conservative SUPERSET guard, INERT here:
       `config._resolve_event_log_path` returns `None` for `namespace="registry"`
@@ -29236,11 +29245,14 @@ def _registry_probe_key() -> tuple[str | None, str | None, str | None]:
     cached connection (#4661 — the TCP+TLS handshake the probe exists to avoid)
     is still reused; a changed component rebuilds once, which is the intent.
 
-    The key is sampled at the TOP OF THE CRITICAL SECTION in
+    The key used for the STAMP is sampled at the top of the critical section in
     `_registry_probe_sdk`, not before acquiring the lock: the lock is held
     across the connect (#4661 measures it in seconds), so a pre-lock sample can
     block that long and then stamp a handle built under a DIFFERENT env with the
-    stale key — the very defect this function exists to prevent. Residual, not
+    stale key — the very defect this function exists to prevent. The lock-free
+    FAST PATH samples it too, and that is sound: it only ever COMPARES against
+    the stamp, so a stale value there can cost one needless rebuild, never a
+    mis-stamp. Residual, not
     covered: an env mutation DURING `_make_sdk` (a reconfiguration race); the
     next call's compare evicts the handle rather than serving it.
     """

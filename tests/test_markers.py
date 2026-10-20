@@ -268,11 +268,13 @@ ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
     "test_document_source_gold.py": {"gold": "test-constructed"},
     # #9192: the two-tenant lane's fixture constructs
     # `TortoiseSDK(db_path=tmp_path/registry.db, namespace="registry")` — the
-    # CANONICAL namespace PROD resolves for the registry control plane, with the
-    # store pinned by `db_path` so the server lane's per-path derivation isolates
-    # it per test (the same `db_path`-bound shape as test_graph_storage / #5331
-    # above). The literal IS the namespace the MCP auth layer under test resolves
-    # its graph-bound `tk_` keys from, so a `test_*` rename would seed a graph the
+    # CANONICAL namespace PROD resolves for the registry control plane. The
+    # store is pinned to an explicit `db_path` under `tmp_path`, and the fixture
+    # delenv's `TORTOISE_DB_URI` first, so this is a genuinely EMBEDDED lane —
+    # isolation is that explicit path (not a server-lane per-path derivation),
+    # the same `db_path`-bound shape as test_graph_storage / #5331 above. The
+    # literal IS the namespace the MCP auth layer under test resolves its
+    # graph-bound `tk_` keys from, so a `test_*` rename would seed a graph the
     # code never reads and every tenant-scope leg here would go vacuously green.
     "test_9192_tenant_armed_by_request.py": {"registry": "prod-coupled"},
 }
