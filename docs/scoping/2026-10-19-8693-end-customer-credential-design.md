@@ -28,7 +28,7 @@ one code fact that changes the design's shape**:
 
 | Issue-body claim | Measured 2026-10-19 | Effect |
 |---|---|---|
-| "`#524` (OAuth 2.1 / token→team mapping) is **open**" | **CLOSED / COMPLETED** 2026-08-14; `tortoise/oauth.py` ships auth-code + PKCE, DCR, RFC 8707 token→team mapping, `/oauth/token`, `/oauth/revoke` (`hosted_api.py:38504-38807`) | The v2 upgrade path (§4) is buildable on shipped machinery |
+| "`#524` (OAuth 2.1 / token→team mapping) is **open**" | **CLOSED / COMPLETED** 2026-08-14; `tortoise/oauth.py` ships auth-code + PKCE, DCR, RFC 8707 token→team mapping, `/oauth/token`, `/oauth/revoke` (`hosted_api.py:38600-38967`: discovery, `/oauth/authorize`, `/oauth/consent`, `/oauth/token`, `/oauth/revoke`, `/register` DCR) | The v2 upgrade path (§4) is buildable on shipped machinery |
 | "blocked on #557 … do not start before #557's **provisioning model** is settled" | **Settled.** Owner decisions Q1–Q7 recorded 2026-08-15 on `#557`; scoping doc `docs/scoping/2026-08-15-557-sub-tenancy-scoping.md` is `doc_status: live`; `#318` (the prerequisite pack-isolation epic) is **CLOSED** with `pack_registry.py`/`pack_state.py` merged | **The blocker named in the issue is met → DESIGN is unblocked** (implementation stays gated on `#557` S1) |
 | "no end-user auth layer" | True, and **still true** — but the tier does not need one: `#557` Q2 chose *key-only for v1* (no end-user account, no consent screen) | §2/§3 design a credential, not an auth layer |
 | (body proposes RFC 8693 as "the external shape") | `#557` Q2 (**owner**, 2026-08-15) chose **key-only for v1**, with RFC 8693-style token exchange as **the designed post-launch upgrade** | §1 D1. RFC 8693 is **not adopted for v1** — it is the recorded v2 step (§4) |
@@ -348,10 +348,10 @@ the builder provides the identity, the affordance, and the containment runbook.*
 | `DELETE /v1/team/keys/{key_id}` carries the same pin on **both** lanes; key auth cannot override it | `hosted_api.py:12397` (supabase lane), `:12425` (registry lane); handler docstring "Org-scoped" (`:12335`); the key lane resolves the org from the key and ignores `?org_id=` (`:12345-12348`) |
 | A minted (`deleg=0`) credential cannot rotate anything, itself included | `hosted_api.py:12004` (`_reject_minted_delegated_key(org, "rotate API keys")`) |
 | `api_key_create` and `api_key_rotate` are audited | `hosted_api.py:11916` (`api_key_create`), `:12159` (`api_key_rotate`) |
-| The member self-service / recovery lanes audit a **third** action, `api_key_mint` — not evidence for create/rotate | `hosted_api.py:27258`, `:27475` (`_async_audit(…, "api_key_mint", …)`); named here so the three action names are not conflated (`#2446` lanes) |
+| The member self-service / recovery lanes audit a **third** action, `api_key_mint` — not evidence for create/rotate | `hosted_api.py:27354`, `:27571` (`_async_audit(…, "api_key_mint", …)`); named here so the three action names are not conflated (`#2446` lanes) |
 | **Key revoke writes NO audit row** | `hosted_api.py:12333-12451` (handler body, zero `_async_audit`); `supabase_control.revoke_api_key:1377` is a bare PATCH — **gap, filed as #9177** |
 | Parent revocation does not cascade to children | `#8694` OPEN (`#2427` §2.4) |
-| `#524` OAuth machinery shipped | `tortoise/oauth.py`; `hosted_api.py:38504-38807` (`/oauth/token`, `/oauth/revoke`, discovery) |
+| `#524` OAuth machinery shipped | `tortoise/oauth.py`; `hosted_api.py:38600-38967` (discovery, `/oauth/token`, `/oauth/revoke`, `/register` DCR) |
 
 ---
 

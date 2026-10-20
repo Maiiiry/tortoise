@@ -236,6 +236,44 @@ def test_cross_subdomain_cookie_sync_gate_runs_on_a_new_file_diff():
     )
 
 
+def test_the_end_customer_credential_design_guard_runs_on_its_doc_only_diff():
+    """#8693 review (P1, finding 1): the design doc must select its own guard.
+
+    `test_8693_end_customer_credential_design.py` pins the end-customer credential
+    DESIGN DOC — half code pins against `tortoise/hosted_api.py` (`rotate`/
+    `DELETE` org pin, owner-class `graphs:create`, the third audit action name),
+    half the corrected prose of
+    `docs/scoping/2026-10-19-8693-end-customer-credential-design.md`. The prose
+    half only breaks on a docs-only edit to that doc, and `docs/` is in
+    NON_PYTHON_PREFIXES with the doc matching no SOURCE_PATTERNS entry, so a
+    doc-only diff filters to `changed == []` and takes the docs-only early return
+    — tier1 ONLY. Registered on `api` (which covers `hosted_api.py` edits) but not
+    in `tier1`, the guard was asleep on the one change that can re-stale it: the
+    doc reverted to the three refuted claims in a one-file PR would merge green
+    and only red `main` post-merge (the #1349/#3332/#3616/#4309 silent-drop
+    class; the #8614/#8135 shape one doc over). Dropping the tier1 entry re-opens
+    that hole.
+
+    Asserted as `surfaces == []` on purpose, not just "the guard is present": the
+    docs-only early return is the whole reason this registration is needed, and a
+    Python path creeping into the selection would mask the loss of the tier1
+    entry (`test_fly_secret_drift_gate_runs_on_a_runbook_only_diff` shape above).
+    """
+    root = Path(__file__).resolve().parents[1]
+    changed = "docs/scoping/2026-10-19-8693-end-customer-credential-design.md"
+    assert (root / changed).exists(), f"guarded design doc is gone: {changed}"
+    r = _sel([changed])
+    assert r["full"] is False
+    assert r["surfaces"] == []
+    assert "test_8693_end_customer_credential_design.py" in r["test_files"], (
+        f"a {changed}-only diff does not select "
+        "tests/test_8693_end_customer_credential_design.py, so its prose pins "
+        "cannot fire on the only change that can break them — a one-file revert "
+        "to the three refuted claims would merge green (#8693 review P1, #4309 "
+        "silent-drop class)"
+    )
+
+
 def test_public_site_surface_change_selects_onboarding_and_skips_slow():
     """#3332: a public *site surface* change selects `onboarding`.
 

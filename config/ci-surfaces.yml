@@ -66,6 +66,13 @@ surfaces:
   # `test_7809_hosted_prewarm_warmup_flag.py <- tortoise/hosted_api.py`). The
   # `eval` arm below covers `tortoise/embeddings.py`, which the same guard pins.
   - test_7809_hosted_prewarm_warmup_flag.py
+  # #8693 review (P2): its own registration, not a rider on the #7809 block above.
+  # `test_8693_end_customer_credential_design.py` pins `tortoise/hosted_api.py`
+  # (`rotate`/`DELETE` org pin, owner-class `graphs:create`, the audit action
+  # names), and `tortoise/hosted_api.py` is an EXACT `api` SOURCE_PATTERNS match
+  # that REPLACES the `core` fallback — so `api` is the arm that reaches these
+  # code pins. The DOC half of the same file is reached from `tier1` instead
+  # (a docs-only diff takes the early return, which never consults `core`).
   - test_8693_end_customer_credential_design.py
   # #2728 review P2: DUAL-REGISTERED with `core` (line ~2688) for the same
   # reason as #7809. `tests/test_pack_selection_by_graph.py` pins
@@ -4694,6 +4701,25 @@ tier1:
 # flat 2.0 default in the durations map), so tier1 is the correct lane. Pinned by
 # tests/test_ci_selection.py::test_b7_runbook_ok_semantics_gate_runs_on_a_runbook_only_diff.
 - test_b7_runbook_ok_semantics_8135.py
+# #8693 review (P1, finding 1): `test_8693_end_customer_credential_design.py`
+# is the guard for the end-customer credential DESIGN DOC
+# (`docs/scoping/2026-10-19-8693-end-customer-credential-design.md`) — half code
+# pins against `tortoise/hosted_api.py`, half the corrected prose. The prose half
+# only breaks on a docs-only edit, and `docs/` is in NON_PYTHON_PREFIXES with the
+# doc matching no SOURCE_PATTERNS entry, so a doc-only diff filters to
+# `changed == []` and takes the docs-only early return — tier1 ONLY. The guard is
+# registered on `api` (which covers `hosted_api.py` edits) but was NOT here, so it
+# was asleep on the one change that can re-stale it: reverting the doc to the
+# three refuted claims in a one-file PR would merge green and only red `main`
+# post-merge (the #1349/#3332/#3616/#4309 silent-drop class, the #8614/#8135
+# shape one doc over). Fast and no-DB (an `ast` parse of `hosted_api.py` plus two
+# doc reads), so tier1 is the correct lane — deliberately NOT the alternative of
+# adding the doc to `SOURCE_PATTERNS["api"]`, which would make a one-file docs
+# edit select the whole `api` surface and re-arm the slow + carve-out legs that
+# docs-only PRs are engineered to skip (#2147/#2148). Pinned by
+# tests/test_ci_selection.py::
+# test_the_end_customer_credential_design_guard_runs_on_its_doc_only_diff.
+- test_8693_end_customer_credential_design.py
 # #8701 review (P1): `test_cross_subdomain_cookie_sync.py` gates the completeness
 # of the key-routing storage-adapter registry (#5735). Its own detector scans a
 # NEW file the moment one lands — but a new file under `website/assets/` (or any
