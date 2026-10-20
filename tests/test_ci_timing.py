@@ -3939,3 +3939,47 @@ def test_no_run_renders_do_not_accumulate_identical_rows(tmp_path: Path, fake_en
     history = json.loads((out / "ci-timing.json").read_text())["history"]
     assert len(history) == 1, [(e.get("run_id"), e["counts"]["failed"]) for e in history]
     assert history[0]["run_id"] is None
+
+
+def test_a_measured_history_row_alone_still_blocks_a_logless_overwrite(tmp_path: Path) -> None:
+    """The artifact's worst state is the one an earlier bug produced.
+
+    A log-less render used to zero the top-level parts while keeping the measured
+    history row, so the committed file could hold `files: {}`, `outcome: 0` and a
+    history row reporting failures. Gating the refusal on `files`/`outcome` alone
+    let a SECOND log-less render then overwrite that surviving row with zeros —
+    destroying the last measurement in the artifact (#9134 review cycle 6).
+
+    Here the top-level guard does not fire (there is nothing top-level left to
+    lose), so this is the ROW guard: an unmeasured render replaces a row only when
+    the row it would replace measured nothing.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "ci-timing.json").write_text(json.dumps({
+        "files": {},
+        "outcome": {"error": 0, "failed": 0, "passed": 0, "skipped": 0, "xfailed": 0, "xpassed": 0},
+        "history": [{
+            "counts": {"error": 0, "failed": 1, "passed": 42, "skipped": 0,
+                       "xfailed": 0, "xpassed": 0},
+            "failed_tests": ["tests/test_alpha.py::test_two"],
+            "run_id": "4242", "sample_time": "t1",
+        }],
+    }))
+    empty_logs = tmp_path / "no-logs"
+    empty_logs.mkdir()
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(empty_logs), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    after = json.loads((out / "ci-timing.json").read_text())
+    row = after["history"][0]
+    assert row["counts"]["failed"] == 1, (
+        f"a log-less render overwrote the last measured row with zeros: {row['counts']}"
+    )
+    assert row["failed_tests"] == ["tests/test_alpha.py::test_two"]

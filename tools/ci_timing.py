@@ -1780,6 +1780,16 @@ def _holds_measurements(json_path: Path) -> bool:
     )
 
 
+def _row_is_measured(entry: dict) -> bool:
+    """Does this history row carry numbers a zero render would erase?"""
+    counts = entry.get("counts")
+    if not isinstance(counts, dict):
+        return False
+    return any(
+        isinstance(counts.get(key), int) and counts[key] > 0 for key in COUNT_KEYS
+    )
+
+
 def load_history(json_path: Path) -> list[dict]:
     """Prior samples from the tool's OWN artifact, or [] if it is unusable.
 
@@ -2240,12 +2250,23 @@ def main() -> int:
     # picked) carries no run identity at all, so identical rows would otherwise
     # accumulate up to `--max-history` and evict real samples.
     if run_id:
-        history = [row] + [e for e in previous if e.get("run_id") != run_id]
+        same = [e for e in previous if e.get("run_id") == run_id]
+        rest = [e for e in previous if e.get("run_id") != run_id]
     else:
         # `--run-id ""` (what ci-timing.yml calls when no run is picked) carries
         # no run identity, so identical rows would otherwise accumulate up to
         # `--max-history` and evict real samples. One no-run row at most.
-        history = [row] + [e for e in previous if e.get("run_id")]
+        same = [e for e in previous if not e.get("run_id")]
+        rest = [e for e in previous if e.get("run_id")]
+    # An unmeasured render may not REPLACE a measured row. The artifact's worst
+    # state — top-level parts zeroed while a history row still reports the real
+    # failures — is what an earlier bug left behind; a log-less render over it
+    # would zero the last measurement too (#9134 review cycle 6). Keeping the
+    # prior row is enough here: the top-level guard above already refuses when
+    # there are top-level measurements to lose, and a history-only seed still
+    # records the new row.
+    keep_prior = not log_sources and bool(same) and _row_is_measured(same[0])
+    history = ([same[0]] if keep_prior else [row]) + rest
     history = history[: args.max_history]
 
     flakes = candidate_flakes(history)
