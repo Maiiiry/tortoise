@@ -93,18 +93,28 @@ def _render_kind_semantics(vocab: dict, ns: str, kinds: list[str]) -> str:
 # Core kind semantics (ONTOLOGY §5 + canonical descriptions).
 #
 # ⛔ `CORE_OBJECT_KINDS` is DERIVED from the canonical set — never a fourth hand-typed copy.
-# Measured before this change: the literal still carried `document` (retired as an `objectKind`
-# by D10 — a document is a `:Source`, ONTOLOGY §4.4) and `concept` (retired by #2727), while
-# OMITTING five kinds §5 declares (`Problem`, `strategy`, `plan`, `goal`, `target`). A
-# kind-name list is an instruction to a model, so both directions steered it wrong.
+# Measured before this change it still carried `document` (retired as an `objectKind` by D10 — a
+# document is a `:Source`, ONTOLOGY §4.4) and `concept` (retired by #2727), while OMITTING five
+# kinds §5 declares (`Problem`, `strategy`, `plan`, `goal`, `target`).
+# ⚠ HONESTY ABOUT ITS REACH (#2786 review): nothing in this repo CONSUMES this constant — the
+# prompt's kind menu is `CORE_SEMANTICS` below, rendered into `core_lines`. It is kept DERIVED
+# rather than deleted so that a future consumer (a probe script outside this repo) cannot pick up
+# a stale list, and it is NOT the surface this change fixes; the prompt fix is the two retired
+# descriptions dropped from `CORE_SEMANTICS`.
 CORE_OBJECT_KINDS = ", ".join(sorted(_CANONICAL_OBJECT_KINDS))
 CORE_SUBJECT_KINDS = "organization, team, role, legalPerson, naturalPerson, other"
-# A DESCRIBED SUBSET of the canonical set — the entries that carry the confusable-kind hints,
-# which is why the guard on it is `⊆` and not `==`. ⛔ Every key must still be a canonical
+# The DESCRIBED SUBSET of the canonical set — the entries that carry the confusable-kind hints,
+# and the ONLY core kinds the prompt's menu renders. ⛔ Every key must be a canonical
 # `objectKind`: a description is an instruction ("emit this when…"), so a stale key asks the
 # model for a kind no read path can resolve (`document` and `concept` did exactly that).
+# The subset is deliberately not the whole axis (a canonical kind with no hint is left
+# undescribed), so the leg that guards it is TWO-directional: no stale key and no silently
+# narrowed/ widened subset — `UNDESCRIBED_CORE_KINDS` below is the sized exception, and adding
+# or dropping a description is a reviewed edit, never a quiet one. Completing the descriptions
+# is rubric authoring and belongs to the calibration lane, not a vocabulary guard.
 # Guarded by `tests/test_kind_vocabulary_consistency.py`
-# ::test_extraction_probe_semantics_are_canonical_kinds.
+# ::test_extraction_probe_semantics_are_canonical_kinds and
+# ::test_extraction_probe_described_subset_is_sized.
 CORE_SEMANTICS = {
     "Project": "A top-level initiative or product line",
     "WorkItem": "A unit of work (epic, issue, task)",
@@ -113,6 +123,14 @@ CORE_SEMANTICS = {
     "standard": "A standard, spec, or canonical reference",
     "other": "No fitting kind — the EXPLICIT uncertain/other bucket (never forced)",
 }
+# The canonical kinds `CORE_SEMANTICS` deliberately leaves UNDESCRIBED (#2786 review): an
+# exception SIZED, like the point axis's, so a description silently dropped (narrowing the
+# prompt's menu) or silently added is a failing test rather than a quiet drift. Completing
+# these is rubric authoring — the calibration lane's, not a vocabulary guard's.
+UNDESCRIBED_CORE_KINDS = frozenset({
+    "Problem", "tag", "user", "skill", "agent", "agreement",
+    "strategy", "plan", "goal", "target",
+})
 NEAR_MISS_ENTITY_KINDS = (
     "product-strategy:useCase, product-strategy:userJourney, "
     "product-strategy:jobToBeDone, product-strategy:valueProposition, "

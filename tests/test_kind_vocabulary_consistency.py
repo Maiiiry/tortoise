@@ -405,3 +405,26 @@ def test_calibration_harness_core_vocabulary_is_the_canonical_set():
         "calibration_harness.VOCAB's core: half drifted from CANONICAL_OBJECT_KINDS: "
         f"harness-only={sorted(core - set(CANONICAL_OBJECT_KINDS))}, "
         f"canonical-only={sorted(set(CANONICAL_OBJECT_KINDS) - core)}")
+
+
+def test_extraction_probe_described_subset_is_sized():
+    """The described-subset leg is TWO-directional: the exception is named and sized.
+
+    ``CORE_SEMANTICS`` is the only core vocabulary the prompt's menu renders, and it is
+    deliberately a SUBSET (a canonical kind with no confusable-kind hint is left undescribed).
+    That makes a one-directional "no stale key" assertion a hole in the direction that matters
+    most here: DELETING a description narrows what the model is offered, and no test would
+    fire. So the undescribed remainder is pinned by NAME (the same sized-exception idiom the
+    point axis uses above), which makes both edits — a description dropped, a canonical kind
+    added — a failing test rather than a quiet drift.
+
+    Completing the descriptions is rubric authoring for the calibration lane; this leg only
+    guarantees the shape of the gap cannot move without review.
+    """
+    pe = _tool_module("probe_extractor")
+    undescribed = set(CANONICAL_OBJECT_KINDS) - set(pe.CORE_SEMANTICS)
+    assert undescribed == set(pe.UNDESCRIBED_CORE_KINDS), (
+        "the probe's described core-kind subset moved — `UNDESCRIBED_CORE_KINDS` is the "
+        "recorded exception and must be updated in the same edit:\n"
+        f"  undescribed but not recorded: {sorted(undescribed - set(pe.UNDESCRIBED_CORE_KINDS))}\n"
+        f"  recorded but now described: {sorted(set(pe.UNDESCRIBED_CORE_KINDS) - undescribed)}")

@@ -227,12 +227,12 @@ def metrics(d: dict) -> dict:
                       if e.get("kind") not in VOCAB),
         "badEvk": sum(1 for e in d.get("events", [])
                       if e.get("eventKind") not in EVK),
-        # HISTORICAL key, structurally 0 on every post-#2727 run: `core:concept` is no longer a
-        # kind, so no current stream can carry it. Kept (rather than deleted) because
-        # `tools/experiments.jsonl` records the field — removing it changes the measurement
-        # schema those records are compared across, which belongs with the measurement lanes
-        # (#9075–#9077), not with a vocabulary guard. Read a new run's 0 as "not a concept
-        # count", never as "no concepts were extracted".
+        # HISTORICAL key, expected 0 once a stream stops carrying the retired kind: `core:concept`
+        # is not in the vocabulary any more, so `minted` flags it and the probe no longer offers
+        # it (#2786) — but a model can still emit the spelling, which leaves this key non-zero.
+        # Kept (rather than deleted) because `tools/experiments.jsonl` records the field —
+        # removing it changes the measurement schema those records are compared across, which
+        # belongs with the measurement lanes (#9075–#9077), not with a vocabulary guard.
         "concepts": sum(1 for e in d.get("entities", [])
                         if e.get("kind") == "core:concept"),
         "mitigates": sum(1 for r in d.get("relations", [])
