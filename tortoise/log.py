@@ -774,8 +774,41 @@ def read_for_replay(log) -> list[dict]:
 
 
 class EventLog:
+    #: Is this log a JOURNAL — a durable, replayable truth set — or a scratch
+    #: buffer that must never feed the record? ``record_writer.write_live_record``
+    #: refuses to file a row from a non-durable log (a DECLINE counted on
+    #: ``monitoring.metrics()["record_non_journal_skips"]``; #9231 review P2), and
+    #: that guard is only sound if the answer is EXPLICIT: reading it as
+    #: ``getattr(log, "durable", True)`` makes a temp buffer durable by
+    #: accident and files rows whose only journal is a directory nothing
+    #: references — ``record != replay(journal)``, unhealable (#9231 review P1).
+    #: A log constructed onto a scratch path (the MCP mining lane's temp file)
+    #: is built with :meth:`scratch`, which sets this ``False`` HERE rather than
+    #: leaving it to each site to remember the assignment.
+    durable: bool = True
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
+
+    @classmethod
+    def scratch(cls, path: str | Path) -> EventLog:
+        """An `EventLog` onto a SCRATCH path — born non-durable, on purpose.
+
+        A scratch log is a per-run buffer (a `mkdtemp()` file, the demo lane's
+        `NamedTemporaryFile` that is unlinked a few lines later): nothing holds
+        it after the call, so a record row filed from it could never be
+        reproduced or healed by a replay. `write_live_record` reads `durable`
+        off the log, so it MUST be `False` at construction rather than an
+        assignment each site is trusted to add — the seam's whole non-journal
+        guard is worthless if a scratch site forgets it
+        (#9231 review P2: the MCP mining lane's marker had no detector).
+
+        Call this instead of ``EventLog(path)`` whenever the path is temporary;
+        the scratch construction sites are pinned by a test.
+        """
+        log = cls(path)
+        log.durable = False
+        return log
 
     def append(self, event: dict) -> None:
         """Append one record, sealing any torn tail first.

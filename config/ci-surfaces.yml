@@ -1127,6 +1127,23 @@ surfaces:
   # `tortoise/mcp_server.py` + `tortoise/hosted_api.py`; the guard must run on
   # the surface change it guards.
   - test_manage_sources_3540.py
+  # #9231 review P1: DUAL-REGISTERED with `core` (below) for the #2969 reason —
+  # this file drives `tortoise/__main__.py` (`cli._cmd_demo(None)`) to prove the
+  # demo lane files nothing from the journal file it deletes, and
+  # `"tortoise/__main__.py"` is an EXACT `SOURCE_PATTERNS["api"]` entry that
+  # REPLACES the `core` fallback in `select()` (`core` is added only in the
+  # `if not found:` branch; `CORE_ALSO` does not list `__main__.py`). Measured
+  # before this arm: `--changed-files tortoise/__main__.py` -> surfaces=['api']
+  # with `test_9078_record_written_by_production_path.py` ABSENT — so a
+  # follow-up that removes the `EventLog.scratch(...)` marker (necessarily a
+  # `__main__.py`-touching diff, the only kind that can break that leg) would
+  # merge with the leg never collected: the #1349/#2938/#3154/#4367
+  # silent-drop class, in the shape `test_socket_bound_not_multiplied_2969.py`
+  # is dual-registered for. Keep BOTH arms: `core` is load-bearing for every
+  # input that falls through to it (`record_writer.py`, `log.py`, the wiring
+  # tool) and this one is load-bearing for the `__main__.py` diff. Pinned by
+  # `tests/test_ci_selection.py::test_9078_guard_runs_on_a_main_only_diff`.
+  - test_9078_record_written_by_production_path.py
   battery:
   - test_battery_arms.py
   # (removed a duplicate test_battery_derive_truth_leg.py entry here on the
@@ -1255,6 +1272,31 @@ surfaces:
   # SOURCE_PATTERN, so a change to it falls through to `core` — registering the
   # guard HERE is what makes the file selected for the code it holds.
   - test_5612_journal_append_serialization.py
+  # #9188 (epic #7879, #9078's wiring child): the record's FIRST production call
+  # site. `core` because most of what it reads is `core`-selected — the three
+  # journal-append doors (`tortoise/sdk.py`, `tortoise/api.py`,
+  # `tortoise/mining.py`), `tortoise/record_writer.py`,
+  # `tortoise/record_projection.py`, `tortoise/monitoring.py`, `tortoise/log.py`
+  # (all the `core` fallback) and `tools/record_wiring_check.py`. NOT the `core`
+  # fallback for that tool: `tools/` is a flat NON_PYTHON_PREFIXES entry, so a
+  # wiring-check-only diff selected NO surface and fell to tier-1 smoke, where
+  # this file is not registered — a PR that disarms the gate would have merged
+  # green with the gate never run (#9231 review P1). The tool is in
+  # `tools/ci_selection.py::CORE_ALSO`, which is what makes an edit to it
+  # select `core` and this file.
+  #
+  # NOT `core`-selected either, and corrected here (#9231 review P1):
+  # `tortoise/__main__.py`, which this file DRIVES (`cli._cmd_demo`) to prove the
+  # demo lane files nothing from the journal it deletes. That path is an exact
+  # `api` SOURCE_PATTERN match, so it selects `api` and REPLACES this fallback;
+  # the file therefore carries a DUAL `api` arm (above). Do not delete one arm
+  # believing the other covers it. `tortoise/mcp_server.py`, `pyproject.toml` and
+  # `tests/conftest.py` are all `SHARED_MODULE`/root → FULL matrix, so they run
+  # this file regardless.
+  #
+  # DB-free except its last leg, which SKIPS unless `TEST_RECORD_DB_URI` names a
+  # Postgres carrying the record migrations — the `TEST_AUDIT_DB_URI` pattern.
+  - test_9078_record_written_by_production_path.py
   - test_kind_vocabulary_consistency.py
   # #9123 (§17.1's THIRD lane): the `:EpMeta` epoch declaration. BOTH its
   # subjects — `tortoise/projection/__init__.py` (the new
