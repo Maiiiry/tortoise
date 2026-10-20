@@ -120,11 +120,32 @@ def _wire_reaching_calls(func) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         target = node.func
-        if not isinstance(target, ast.Attribute):
+        if isinstance(target, ast.Attribute):
+            base = ast.unparse(target.value)
+            if base in roots:
+                found.add(f"{base}.{target.attr}")
             continue
-        base = ast.unparse(target.value)
-        if base in roots:
-            found.add(f"{base}.{target.attr}")
+        # ⛔ THE DISPATCH FORM THIS CLASS ACTUALLY USES (#9079 review, P2).
+        # Every wire-reaching verb was rewritten from `self._g.<verb>(…)` to
+        # `_dispatch_decided(self._g, "<verb>", …)`, whose `func` is a NAME —
+        # which the attribute-only walker above skipped. The bucket's own claim
+        # ("a member must make no call that reaches the client") therefore
+        # became unfalsifiable for the only form the class uses: a future method
+        # filed into `_NON_MUTATING_HANDLE_METHODS` that dispatches through the
+        # helper would have passed this gate green. A call whose FIRST
+        # positional argument is a root reaches `<root>.<verb>` just as surely.
+        if isinstance(target, ast.Name) and target.id == "_dispatch_decided":
+            if not node.args:
+                found.add("_dispatch_decided(<no handle>)")
+                continue
+            base = ast.unparse(node.args[0])
+            if base not in roots:
+                continue
+            verb = "<dispatch>"
+            if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) \
+                    and isinstance(node.args[1].value, str):
+                verb = node.args[1].value
+            found.add(f"{base}.{verb}")
     return found
 
 
@@ -442,6 +463,24 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
     assert source.count("def _refuse_unauthorized_cache_write") == 1, (
         "the handle must have exactly ONE authorization check — a second copy "
         "is a second policy that can drift from the shared classifier"
+    )
+
+
+def test_the_wire_detector_sees_the_dispatch_form_the_handle_uses():
+    """The bucket's gate must be able to FAIL on the form every verb uses.
+
+    RED before the fix: `_GuardedGraph.query` dispatches through
+    `_dispatch_decided(self._g, "query", …)`, whose `func` is a NAME, and the
+    detector walked `ast.Attribute` funcs only — so it returned an EMPTY set for
+    a verb that writes the cache, and `_NON_MUTATING_HANDLE_METHODS`'s "no call
+    reaches the client" assertion could not fail on the very dispatch form the
+    class uses in all seven of its wire-reaching verbs (#9079 review, P2).
+    """
+    reaching = _wire_reaching_calls(_GuardedGraph.query)
+    assert "self._g.query" in reaching, (
+        "the detector cannot see `_dispatch_decided(self._g, \"query\", …)`, so "
+        "a mutating method filed into `_NON_MUTATING_HANDLE_METHODS` passes the "
+        f"gate green; saw {sorted(reaching)}"
     )
 
 

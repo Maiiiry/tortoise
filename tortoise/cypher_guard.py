@@ -244,10 +244,17 @@ def set_journal_write_authority(
 
 #: Which STORE a client talks to: its file/socket, or its HOST:PORT.
 #:
-#: The same identity `tortoise/event_store.py::_store_identity` derives from a
-#: PROJECTION, derived here from a CLIENT (the only object a guarded channel
-#: holds). Both the projection and the hook call THIS function, so the two ends
-#: of one decision cannot compute different keys.
+#: The same NOTION of store identity that `tortoise/event_store.py::
+#: _store_identity` derives from a PROJECTION, derived here from a CLIENT (the
+#: only object a guarded channel holds) — and NOT the same string (#9079 review):
+#: this key is STRICTER (it carries the Redis ``db`` index the event-store key
+#: omits) and it does NOT canonicalise a file path, so two spellings of one
+#: socket compare UNEQUAL here while `_store_identity` folds them together. That
+#: difference is inert today because (a) both ends of ONE decision read the SAME
+#: client's `connection_kwargs`, and (b) the two keys feed separate registries
+#: (`_JOURNAL_BACKED_KEYS` here, `_graph_key` there) and never meet — but a
+#: future caller may not treat them as interchangeable, which is why the
+#: docstring says what it is instead of "the same identity".
 #:
 #: The PORT is part of the identity, not decoration: one host can carry several
 #: FalkorDB servers, and this repo's tests run two on loopback.
@@ -332,7 +339,16 @@ def _consult_journal_write_authority(handle, statement) -> None:
     graph, or when the statement is not text — the hook's own classifier owns
     the "is this a write" question (ONE classifier, the #3595 precedent), so
     this function never second-guesses it.
+
+    ⛔ THE ``None`` SHORT-CIRCUIT IS HERE, not only one level down (#9079
+    review, P3): the store key is derived from the handle's CLIENT, which walks
+    a duck-typed pool and builds a string, and doing that eagerly made the
+    docstring's "one global read per query" claim false for every guarded read
+    in a process that has no journal-bound projection at all (CLI, doctor, the
+    session indexer). One global read, then return.
     """
+    if _JOURNAL_WRITE_AUTHORITY is None:
+        return
     _consult_journal_authority_for_graph(
         getattr(handle, "name", None), statement,
         _client_store_key(getattr(handle, "client", None)))
@@ -1432,6 +1448,93 @@ def _as_text(value):
     return value
 
 
+def _graph_query_payload(args, decode=None):
+    """The ``(verb, graph, statement, trailing)`` a raw command payload carries.
+
+    ``None`` when the payload is not one of the four ``GRAPH.*`` QUERY verbs.
+    *decode* defaults to :func:`_as_text`; the projection passes its own
+    ``_handle_command_text`` (which returns ``None`` for a text SUBCLASS, the
+    fail-closed half of #9209), so each door keeps its own decoder while the
+    two share the SHAPE — which is what the two readers are not allowed to
+    disagree about.
+
+    ⛔ THE COMMAND WORD IS SPLIT, NOT TAKEN AS ONE TOKEN (#9079 review, P1
+    FAIL-OPEN, measured). The pinned ``redis`` serializers call
+    ``args[0].encode().split()`` / ``args[0].split()`` before packing — commented
+    in ``redis/connection.py`` as *"the client might have included 1 or more
+    literal arguments in the command name"* — so the head can carry the verb AND
+    its arguments:
+
+        execute_command("GRAPH.QUERY g", "CREATE (n:X)")                # 2 args
+        execute_command("GRAPH.QUERY g", "CREATE (n:X)", "--compact")  # 3 args
+        execute_command("", "GRAPH.QUERY", "g", "CREATE (n:X)")        # empty head
+
+    MEASURED on the docker lane (``falkordb/falkordb-server:v4.20.6``) on an
+    ARMED journal-backed projection: each of those three landed a ``CREATE`` that
+    NO §17.1 reader saw. The write-handle door recovered ``""`` (it required
+    ``len(args) >= 3`` with an exact verb at ``args[0]``) and the guarded channel
+    below never consulted, because it required the same. Two readers of one
+    channel that disagree about where the Cypher lives is a fail-open; one
+    splitter is the fix.
+
+    ⚠️ ONE ARG IS **NOT** THE SAME WRITE, and saying so matters because it was
+    assumed: the server reads ``GRAPH.QUERY``'s Cypher from its THIRD SERVER
+    ARGUMENT only. So ``execute_command("GRAPH.QUERY g CREATE (n:X)")`` is split
+    into ``("GRAPH.QUERY", "g", "CREATE", "(n:X)")`` and the engine answers a
+    grammar error (measured: ``Invalid input at end of input … errCtx: CREATE``)
+    — that spelling cannot carry a multi-word statement at all. It is still READ
+    here, and the whole remainder is returned as the statement on purpose: the
+    fail-closed direction is to judge the text the CALLER asked to write (and
+    refuse it), never to answer "not a write" because the wire would have
+    truncated it.
+
+    ``trailing`` is what remains of ``args`` AFTER the words consumed, so a
+    caller that must rewrite the statement (the #7162 barrier) can rebuild a
+    canonical ``(verb, graph, statement, *trailing)`` payload without dropping a
+    flag or a non-text argument it could not decode.
+
+    A ONE-WORD HEAD IS THE FAST PATH — it is the spelling every in-repo caller
+    uses — and it keeps the payload's ORIGINAL objects for the caller to
+    dispatch (byte-identical to the pre-split reader): only the forms whose
+    statement is not ``args[2]`` are rebuilt, and for those the packer has
+    already space-joined the words, so the rebuild is wire-accurate.
+    """
+    if not args:
+        return None
+    text = decode if decode is not None else _as_text
+    head = text(args[0])
+    head_words = head.split() if isinstance(head, str) else []
+    count = len(head_words)
+    if count >= 3:
+        trailing = tuple(args[1:])
+        verb, graph, statement = (
+            head_words[0], head_words[1], " ".join(head_words[2:]))
+    else:
+        # The serializer DROPS a head with no words, so the command starts at
+        # ``args[1]`` — and a head with one or two words means the tail carries
+        # the rest. Only that many tail arguments are read; the remainder is
+        # ``trailing`` and is never decoded (it can be a flag, an int, ...).
+        needed = 3 - count
+        if len(args) < 1 + needed:
+            return None
+        words = []
+        for index in range(1, 1 + needed):
+            word = text(args[index])
+            if not isinstance(word, str):
+                return None  # a target we cannot read is not "no target"
+            words.append(word)
+        trailing = tuple(args[1 + needed:])
+        if count == 2:
+            verb, graph, statement = head_words[0], head_words[1], words[0]
+        elif count == 1:
+            verb, graph, statement = head_words[0], words[0], words[1]
+        else:
+            verb, graph, statement = words[0], words[1], words[2]
+    if verb.upper() not in _GRAPH_QUERY_COMMANDS:
+        return None
+    return verb, graph, statement, trailing
+
+
 def _guard_execute_command(args, client=None):
     """Refuse a ``=~`` in a raw ``execute_command`` payload; return args to send.
 
@@ -1443,6 +1546,14 @@ def _guard_execute_command(args, client=None):
     is positional (``(cmd, graph_name, cypher, ...)``). Every other command
     (``GRAPH.DELETE``, ``GRAPH.COPY``, ``GRAPH.CONFIG``, ``INFO``, ...) and
     every non-``GRAPH`` command is forwarded untouched.
+
+    ⛔ THE PAYLOAD IS READ BY :func:`_graph_query_payload`, the ONE splitter
+    (``args[0]`` is split the way the serializer splits it), so this door also
+    sees the spellings whose arguments live in the command WORD —
+    ``execute_command("GRAPH.QUERY g", "CREATE (n:X)")`` and the empty-head form
+    — and the projection's ``_command_statement`` reads the same helper. Two
+    readers of one channel that disagree about where the Cypher lives is a
+    fail-open (#9079 review).
 
     #7162 — the returned tuple is the statement to SEND: the #7162 normaliser can
     insert a ``WITH *`` barrier into ``args[2]``, exactly as it does on the
@@ -1466,26 +1577,28 @@ def _guard_execute_command(args, client=None):
     to be SILENTLY altered (MEASURED; the table is on
     :func:`_numeric_literal_reason`).
     """
-    if len(args) >= 3:
-        verb = _as_text(args[0])
-        statement = _as_text(args[2])
-        if (
-            isinstance(verb, str)
-            and verb.upper() in _GRAPH_QUERY_COMMANDS
-            and isinstance(statement, str)
-        ):
-            # §17.1 (#9079): the same authority decision the handle verbs take,
-            # on the statement a raw command actually carries. This channel is
-            # how escape (3) reaches a journal-backed graph without ever
-            # touching `proj.g`.
-            _consult_journal_authority_for_graph(
-                _as_text(args[1]), statement, _client_store_key(client))
-            _guard_unsupported_cypher(statement)
-            _guard_numeric_literals(statement)
-            if _engine_needs_predicate_barrier(client):
-                barred = _predicate_drop_barrier(statement)
-                if barred != statement:
-                    return tuple([args[0], args[1], barred, *args[3:]])
+    payload = _graph_query_payload(args)
+    if payload is None:
+        return args
+    verb, graph, statement, trailing = payload
+    # §17.1 (#9079): the same authority decision the handle verbs take, on the
+    # statement a raw command actually carries. This channel is how escape (3)
+    # reaches a journal-backed graph without ever touching `proj.g`.
+    _consult_journal_authority_for_graph(
+        graph, statement, _client_store_key(client))
+    _guard_unsupported_cypher(statement)
+    _guard_numeric_literals(statement)
+    if _engine_needs_predicate_barrier(client):
+        barred = _predicate_drop_barrier(statement)
+        if barred != statement:
+            head = _as_text(args[0])
+            if isinstance(head, str) and len(head.split()) == 1:
+                # ONE-WORD head: the statement is ``args[2]``, so keep the
+                # caller's ORIGINAL objects on the wire (a bytes spelling must
+                # stay bytes), exactly as this function behaved before the
+                # splitter — only the statement is replaced.
+                return tuple([args[0], args[1], barred, *args[3:]])
+            return (verb, graph, barred, *trailing)
     return args
 
 

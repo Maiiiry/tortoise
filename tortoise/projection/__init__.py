@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from tortoise.cypher_guard import (  # #3595 `=~` guard — the ONE seam
-    _GRAPH_QUERY_COMMANDS,  # #9124: recover the statement a raw command carries
+    _graph_query_payload,  # #9079: the ONE splitter for a raw command payload
     _guard_execute_command,
     _guard_numeric_literals,  # #8479: the SAME domain, on the statement TEXT
     _guard_numeric_params,  # #7174: the store's numeric domain, same seam
@@ -3818,14 +3818,31 @@ def _decision_key(inner, verb: str, statement, args):
     """The `(store, graph, statement)` a dispatch is about to decide.
 
     The TARGET GRAPH is the inner handle's own name for the query verbs (the
-    vendor always writes the graph it belongs to) and ``args[1]`` for a raw
-    command, which names its graph in the payload. It is deliberately NOT the
-    projection's `graph_name`: a write handle may front any graph, and keying on
-    the owner is how the boolean acquired its hole.
+    vendor always writes the graph it belongs to) and the payload's own graph
+    for a raw command, which names its graph INSIDE the command word or in
+    ``args[1]``. It is deliberately NOT the projection's `graph_name`: a write
+    handle may front any graph, and keying on the owner is how the boolean
+    acquired its hole.
+
+    ⛔ THE GRAPH HALF IS READ THROUGH THE SPLITTER AND DECODED, exactly as the
+    door it suppresses reads it (#9079 review, P2 census-exactness — MEASURED).
+    It used to be the raw ``args[1]``: for a bytes-like graph name
+    (``execute_command(b"GRAPH.QUERY", b"<graph>", ...)`` — redis-py accepts
+    that spelling, which is why ``cypher_guard._as_text`` exists) the key
+    became ``(store, None, stmt)`` while every consultation asks about
+    ``(store, "<graph>", stmt)``, and ``(store, None, …)`` can never match (the
+    consult returns early on a non-``str`` graph). The suppression was a no-op
+    and ONE write was censused up to three times. It was also the raw ``args[1]``
+    for the head-carrying spellings, where ``args[1]`` is part of the STATEMENT
+    and not a graph at all.
     """
     graph = getattr(inner, "name", None)
-    if verb == "execute_command" and len(args) >= 2:
-        graph = args[1]
+    if verb == "execute_command":
+        payload = _graph_query_payload(args)
+        if payload is not None:
+            graph = payload[1]
+        elif len(args) >= 2:
+            graph = _handle_command_text(args[1])
     store = _client_store_key(getattr(inner, "client", None))
     return (store, graph if isinstance(graph, str) else None,
             _normalise_handle_statement(statement))
@@ -4581,11 +4598,12 @@ def _command_statement(args, kwargs) -> str:
 
     ``_GuardedGraph.execute_command`` has no ``cypher`` argument — the statement
     travels positionally inside a Redis command (``("GRAPH.QUERY", graph,
-    cypher, ...)``, ``cypher_guard._GRAPH_QUERY_COMMANDS``), and the vendor also
-    inlines params into that same string. Recovering it is what keeps the raw
-    command channel from being the one mutating verb on this handle the §17.1
-    check cannot see: a ``GRAPH.QUERY`` never calls ``query``/``ro_query``/
-    ``_query``, so it would otherwise be a silence, not a refusal.
+    cypher, ...)``, ``cypher_guard._GRAPH_QUERY_COMMANDS`` — read through the
+    shared splitter, so the head may also carry the whole command), and the
+    vendor also inlines params into that same string. Recovering it is what
+    keeps the raw command channel from being the one mutating verb on this
+    handle the §17.1 check cannot see: a ``GRAPH.QUERY`` never calls ``query``/
+    ``ro_query``/``_query``, so it would otherwise be a silence, not a refusal.
 
     Returns the statement text when the payload IS a graph-query command, else
     ``""`` — every other command (``GRAPH.DELETE``, ``GRAPH.COPY``, ``INFO``,
@@ -4594,8 +4612,18 @@ def _command_statement(args, kwargs) -> str:
 
     The shape mirrored here is the one ``cypher_guard._guard_execute_command``
     already pins (MEASURED against ``falkordb`` 1.6.2: ``args[3]`` is a flag such
-    as ``--compact``, never a params map), so the two readers of this channel
-    cannot disagree about where the Cypher lives.
+    as ``--compact``, never a params map), and both readers now go through ONE
+    splitter (``cypher_guard._graph_query_payload``) so they cannot disagree
+    about where the Cypher lives.
+
+    ⛔ THE COMMAND WORD IS SPLIT, NOT TAKEN AS ONE TOKEN (#9079 review, P1
+    FAIL-OPEN, measured). The client's serializers split ``args[0]`` before
+    packing, so ``execute_command("GRAPH.QUERY g CREATE (n:X)")`` and
+    ``execute_command("GRAPH.QUERY", "g", "CREATE (n:X)")`` put the SAME write
+    on the wire — while this reader, which required ``len(args) >= 3`` with an
+    exact verb at ``args[0]``, answered ``""`` for the first and the handle's
+    §17.1 check never ran (no census entry, no refusal). The word list now comes
+    from the shared splitter, the same one the guarded channel consults.
 
     ⛔ THE COMMAND WORD IS DECODED WITH THE SAME HELPER THE #9209 CLASSIFIER
     USES (``_handle_command_text``): ``bytes``, ``bytearray`` and ``memoryview``
@@ -4605,15 +4633,10 @@ def _command_statement(args, kwargs) -> str:
     that leaves a write out of the §17.1 census (measured: "#9209 review" on
     the handle-door classifier; the same blind spot sat in this reader).
     """
-    if len(args) < 3:
+    payload = _graph_query_payload(args, decode=_handle_command_text)
+    if payload is None:
         return ""
-    verb = _handle_command_text(args[0])
-    statement = _handle_command_text(args[2])
-    if verb is None or statement is None:
-        return ""
-    if verb.upper() not in _GRAPH_QUERY_COMMANDS:
-        return ""
-    return statement
+    return payload[2]
 
 
 class _GuardedGraph:
@@ -4699,7 +4722,7 @@ class _GuardedGraph:
         self._g = g
         self._proj = projection
 
-    def _refuse_unauthorized_cache_write(self, statement: str) -> None:
+    def _refuse_unauthorized_cache_write(self, statement: str, target=None) -> None:
         """§17.1 at the THIRD door: this handle is not a bypass.
 
         `FalkorProjection.apply` (the fold) and `FalkorProjection.query` (the
@@ -4751,7 +4774,22 @@ class _GuardedGraph:
         # and was refused only by the client door one hop lower — which the
         # suppression then blinded. The registry is the same target test the
         # client door uses, so the two doors answer about the same graph.
-        target = getattr(self._g, "name", None)
+        #
+        # ⛔ AND *target* OVERRIDES THE HANDLE'S NAME for the one verb whose
+        # graph is an ARGUMENT (#9079 review, P1 fail-open — MEASURED).
+        # `Graph.execute_command` IS the client's raw method (the vendor binds it
+        # as an instance attribute), so it addresses whatever graph its payload
+        # names and nothing constrains that to `self._g`. Judging `self._g.name`
+        # therefore measured the WRONG graph: a handle over a graph nobody
+        # journals, dispatching `execute_command("GRAPH.QUERY", <a
+        # journal-backed graph>, "CREATE …")`, was not refused — and the
+        # suppression key, which reads the payload's graph, then told the client
+        # door one hop lower to stand down. Measured on an ARMED journal-backed
+        # projection: `NOT REFUSED`, the CREATE landed, `census == {}`. The
+        # caller of this method passes the payload's graph so the door and the
+        # key judge the SAME target.
+        if target is None:
+            target = getattr(self._g, "name", None)
         if not (getattr(self._proj, "_journal_backed", False)
                 or _is_journal_backed_target(
                     _client_store_key(getattr(self._g, "client", None)),
@@ -4901,7 +4939,16 @@ class _GuardedGraph:
         # past as one token.
         statement = _command_statement(args, kwargs)
         if statement:
-            self._refuse_unauthorized_cache_write(statement)
+            # ⛔ The TARGET is the graph the PAYLOAD names, not this handle's
+            # (#9079 review, P1): `Graph.execute_command` is the client's raw
+            # method, so `args[1]` decides where the write lands and `self._g.name`
+            # need not even be the same graph. Measured: judging the handle let a
+            # `_GuardedGraph` over an unjournalled graph write a JOURNAL-BACKED
+            # one, ARMED, with the suppression then blinding the client door.
+            payload = _graph_query_payload(args, decode=_handle_command_text)
+            self._refuse_unauthorized_cache_write(
+                statement,
+                target=payload[1] if payload is not None else None)
 
         # #9209: the guards below read a Cypher STATEMENT, so a command that
         # carries none (``GRAPH.DELETE``, ``FLUSHALL``) reached the graph
@@ -4979,11 +5026,15 @@ class _GuardedGraph:
             # guarded channel one hop down consults the barred text. Keying on
             # the pre-barrier text suppressed nothing there, so one
             # ``GRAPH.QUERY`` was censused twice (measured: one entry per
-            # spelling).
+            # spelling). It is read through the SAME splitter the guarded
+            # channel uses, so the head-carrying spellings key on their text
+            # too instead of on ``args[2]`` (which for those is a flag, not the
+            # statement — #9079 review, P1).
+            dispatched = _graph_query_payload(decided_args)
             return _dispatch_decided(
                 self._g, "execute_command", *decided_args,
-                decided_statement=(decided_args[2]
-                                   if len(decided_args) >= 3 else None),
+                decided_statement=(dispatched[2] if dispatched is not None
+                                   else None),
                 **kwargs)
         finally:
             _HANDLE_STATEMENT_DECIDED.reset(token)
@@ -17425,7 +17476,18 @@ class FalkorProjection(
                 getattr(self, "_journal_backed_store", None),
                 getattr(self, "graph_name", None))
             self._journal_backed_store = None
-            self._journal_backed = False
+            # ⛔ `_journal_backed` IS DELIBERATELY NOT CLEARED (#9079 review,
+            # P2 fail-open). Unregistering the (store, graph) pair is the whole
+            # release: it is what stops a LATER projection that reuses the name
+            # from being judged by this journal. Clearing the OWNER's flag is
+            # strictly wider, and it disarms doors for a projection whose
+            # journal still exists on disk — `db.close()` is a pool disconnect
+            # and redis-py RECONNECTS on the next command, so a post-close
+            # `proj.g.query("CREATE …")` on a server store would land with no
+            # census entry and no refusal. The flag answers "is this graph the
+            # derived cache of a journal", and closing a connection does not
+            # change that; `_closed` is the "this projection is finished"
+            # signal the other doors can read.
         try:
             # #1475: route through db._t_close (when present) so the db's
             # _t_closed flag is set — the GC finalizer must recognize this
