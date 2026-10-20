@@ -1029,9 +1029,19 @@ def test_no_two_census_entries_share_a_bare_function_name():
 # convenience), and the claim it makes is re-derived from `sdk.py` rather than
 # believed.
 
-#: A `sdk.py:<line>` anchor. `tortoise/sdk.py` is ~37k lines and moves under the
-#: note on almost every merge, so a number rots here without anything reddening.
-_SDK_LINE_ANCHOR = re.compile(r"sdk\.py:\d+")
+#: A `sdk.py:<line>` anchor, in ANY of the shapes a human actually writes.
+#: `tortoise/sdk.py` is ~37k lines and moves under the note on almost every
+#: merge, so a number rots here without anything reddening.
+#:
+#: ⛔ WIDENED (review, measured): the first version was `r"sdk\.py:\d+"`, which
+#: matched ONLY the no-whitespace form. Every ordinary spelling of the same
+#: anchor went green — `sdk.py: 23508`, `sdk.py line 23508`, `sdk.py:L23508`,
+#: `sdk.py, 23508`, `sdk.py 23508` — so the pin forbade a citation style it
+#: let through in five of six shapes. The rot does not care about whitespace:
+#: `sdk.py: 23508` decays into a pointer at whatever function holds that line
+#: exactly as `sdk.py:23508` does. `test_the_line_anchor_matches_every_spelling`
+#: holds the variants red-eyed.
+_SDK_LINE_ANCHOR = re.compile(r"sdk\.py\s*(?:[:,]|\sline\s)?\s*[Ll]?\d+")
 
 #: ⛔ NO LOCAL WRITE-CLAUSE REGEX HERE. What counts as a write is
 #: `_statement_writes` + `_WRITE_CLAUSE_RE` from `tortoise.projection` — the
@@ -1522,6 +1532,44 @@ def _handle_query_calls(func) -> list[ast.Call]:
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in _HANDLE_MUTATING_VERBS
             and _is_handle_ref(node.func.value, aliases, params)]
+
+
+def test_the_line_anchor_matches_every_spelling():
+    """Non-vacuity for the widened anchor (review, measured).
+
+    The pin in `test_the_unresolved_hand_check_cites_symbols_not_line_numbers`
+    is only as wide as `_SDK_LINE_ANCHOR`. The first version matched
+    `sdk.py:<digits>` and NOTHING else, so five ordinary spellings of the same
+    citation passed — the pin forbade a style it admitted. Each variant below is
+    a way a human writes the anchor; every one must red.
+
+    The negative cases matter just as much: `tortoise/sdk.py` (a path, no line),
+    `sdk.py` alone, and the note's own self-description `sdk.py:<line>` (not a
+    digit) must NOT match, or the pin would red on a correct note.
+    """
+    must_match = [
+        "sdk.py:23508",
+        "sdk.py: 23508",
+        "sdk.py:L23508",
+        "sdk.py line 23508",
+        "sdk.py, 23508",
+        "sdk.py 23508",
+    ]
+    for variant in must_match:
+        assert _SDK_LINE_ANCHOR.search(variant), (
+            f"the line anchor misses {variant!r} — that spelling of a sdk.py "
+            "citation passes the pin while rotting exactly the same way")
+
+    must_not_match = [
+        "`tortoise/sdk.py` function `calibrate_summary`",
+        "the sdk.py module",
+        "CITED BY SYMBOL, NEVER BY `sdk.py:<line>`",
+        "sdk.py is ~37k lines",
+    ]
+    for variant in must_not_match:
+        assert not _SDK_LINE_ANCHOR.search(variant), (
+            f"the line anchor FALSE-POSITIVES on {variant!r} — a correct note "
+            "must not red")
 
 
 def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
