@@ -4051,9 +4051,42 @@ _CONDITION_PHRASES = (
 #     the memory-loss class this table exists to close.
 #   * the coarse clause-relation slot refuses the within-relation synonyms
 #     `but`/`yet` and `because`/`as`.
+#   * reading the two operator slots as one union refuses the `so`/`then`
+#     rewording ("it rained and so we waited" / "it rained and then we waited"):
+#     the union is what closes the `and`/`then` swap, and it cannot tell a swap
+#     from a rewording that crosses the same two slots.  Taken deliberately — the
+#     swap it buys is memory loss, this cost is noise.
 #   * a one-sided EXTRA operator inside an already-shared slot still folds
 #     ("we ship and test" / "we ship and test but we wait") — the extra is read
 #     as the broadening case, and closing it needs syntax.
+#   * a swap BETWEEN the two OPERATOR slots USED to fold here ("we ship and
+#     test" / "we ship then test") — CLOSED by the union those two slots are now
+#     read as, at the cost of the `so`/`then` rewording below.
+#
+# ⚠️ Which of these residuals a TOKEN-LIST edit can reach was MEASURED (#5325),
+# and each attempt is falsified by a test in `tests/test_never_across_fold_5080.py`:
+#   * a swap BETWEEN the two OPERATOR slots is closable, and IS closed: the two
+#     slots are read as one union as well as one at a time, so `and` against
+#     `then` is now a swap (`_OPERATOR_SLOT_INDICES`).  Widening that union to
+#     the transfer-direction slot would refuse the phase-D restatement pinned as
+#     a must-fold (`to` against `and`), so the union stops at the two slots that
+#     relate two predications.
+#   * compare each slot as a SEQUENCE instead of a set — closes the `and`/`or`
+#     exemplar of the ATTACHMENT class ONLY: a pair that keeps `[and, or]` in
+#     that order and moves the attachment still folds, so the class stays open
+#     and the proxy buys one token.
+#   * declare `but`/`yet` or `because`/`as` EQUIVALENT — folds "we have yet to
+#     ship the build" against "we have but to ship the build" (opposite
+#     meanings: not-yet-shipped against only-need-to-ship), and "we halted as
+#     the tests failed" against "we halted because the tests failed" (`as` may
+#     mean WHILE, and that reading is in the SAME clause-relation family, so no
+#     slot-level signal separates it from the BECAUSE reading).
+#   * the one-sided extra operator is token-for-token identical to the
+#     broadening case, so nothing in the multisets separates "an added detail"
+#     from "an added operator clause".
+# The attachment class and the one-sided extra therefore need a dependency parse
+# or a model over the pair, and every token-list edit above trades a wrong keep
+# (noise) for a wrong drop (memory loss).
 # `before`/`after` are deliberately NOT slots: both are ordinary content tokens
 # (neither is a frame word), so each side keeps its own ordering word and the
 # two-sided substitution rule already refuses the swap.
@@ -4066,6 +4099,13 @@ _CONNECTIVE_SLOTS = (
     frozenset({"than", "as"}),
     frozenset({"to", "from"}),
 )
+# The two slots that relate two PREDICATIONS, and are therefore read together as
+# one union as well as one at a time (#5325): a member can move between them —
+# `and` coordinates, `then` sequences, and "we ship and test"/"we ship then
+# test" is a swap that neither side's own slot can show.  The comparison slot
+# (`as`/`than`) and the transfer-direction slot (`to`/`from`) are NOT in here:
+# `to` against `and` is the phase-D seam's restatement and must keep folding.
+_OPERATOR_SLOT_INDICES = (0, 1)
 _CONNECTIVE_MEMBERS = frozenset().union(*_CONNECTIVE_SLOTS)
 # Multi-word COORDINATIONS.  `as well as` IS `and`, so it is canonicalised to
 # its operator before the slots are read.  Left as written its `as` fills the
@@ -4768,13 +4808,34 @@ def _connective_swap(a: str, b: str) -> frozenset[str]:
     what a token-level predicate cannot do — and a non-empty result is a
     substituted-content difference, the same dimension a swapped content token
     reaches.
+
+    A member can also move BETWEEN the two OPERATOR slots (#5325): `and` asserts
+    a coordination and `then` a sequence, so "we ship and test" against "we ship
+    then test" is a swap even though neither side fills the other's slot, which
+    the per-slot read above cannot see.  Those two slots are therefore ALSO read
+    together, as one union.  Only those two: `to` (transfer direction) against
+    `and` (clause relation) is the phase-D seam's own restatement and must keep
+    folding, and the comparison slot's `as`/`than` do not relate two
+    predications.  The union is read only as a TWO-sided swap, exactly as the
+    per-slot read is — a one-sided operator stays the documented broadening.
+
+    ⚠️ The union has a cost, taken deliberately because a wrong keep is noise
+    while a wrong drop is memory loss: `so` (clause relation) against `then`
+    (branch/sequence) is a genuine rewording — "it rained and so we waited"
+    against "it rained and then we waited" — and it is now refused.  Pinned as a
+    declared residual.
     """
+    slots_a, slots_b = _connective_slots(a), _connective_slots(b)
     out: set[str] = set()
-    for slot_a, slot_b in zip(_connective_slots(a), _connective_slots(b),
-                              strict=True):
+    for slot_a, slot_b in zip(slots_a, slots_b, strict=True):
         only_a, only_b = slot_a - slot_b, slot_b - slot_a
         if only_a and only_b:
             out |= only_a | only_b
+    union_a = frozenset().union(*(slots_a[i] for i in _OPERATOR_SLOT_INDICES))
+    union_b = frozenset().union(*(slots_b[i] for i in _OPERATOR_SLOT_INDICES))
+    only_a, only_b = union_a - union_b, union_b - union_a
+    if only_a and only_b:
+        out |= only_a | only_b
     return frozenset(out)
 
 

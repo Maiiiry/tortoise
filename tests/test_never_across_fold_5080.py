@@ -1227,18 +1227,55 @@ class TestDistinguishingDifference:
             assert not v2.fold_allowed(
                 injected, "we ship the server and the plan unfolds"), injected
 
-    def test_a_connective_swap_between_two_slots_is_a_known_limit(self):
+    def test_a_connective_swap_between_two_operator_slots_is_refused(self):
+        """The cross-OPERATOR-slot swap is CLOSED (#5325, replaces the pin).
+
+        This replaces `test_a_connective_swap_between_two_slots_is_a_known_limit`,
+        which pinned the fold.  A member can move BETWEEN the two slots that
+        relate two predications: `and` coordinates and `then` sequences, and the
+        two claims assert different relations.  The per-slot read could not see
+        it (neither side fills the other's slot), so the two OPERATOR slots are
+        also read as one union (`_OPERATOR_SLOT_INDICES`).
+
+        The two slots NEXT to them are deliberately NOT unioned, and that half is
+        what keeps the legitimate folds folding:
+
+          * `to` (transfer direction) against `and` (clause relation) is the
+            phase-D restatement pinned above as a must-fold;
+          * `and then` / `, then` is the paraphrase the old pin's docstring named,
+            and the `and` is still there on both sides, so the union's two-sided
+            rule leaves it alone.
+        """
+        for prior, candidate in (
+                ("we ship and test", "we ship then test"),
+                ("we ship and test", "we ship else test"),
+                ("we test or we wait", "we test then we wait")):
+            assert v2._connective_swap(prior, candidate), (prior, candidate)
+            assert v2.distinguishing_difference(prior, candidate) \
+                == "substituted_content", (prior, candidate)
+            assert not v2.fold_allowed(prior, candidate)
+            assert not v2.supersede_allowed(prior, candidate)
+        # The paraphrases the old pin cited as the reason NOT to close it.
+        assert v2.fold_allowed("we ship the build and then test",
+                               "we ship the build, then test")
+        assert v2.fold_allowed(
+            "We should ship the web server first to unblock the mobile team.",
+            "We should ship the web server first and unblock the mobile "
+            "team now.")
+
+    def test_a_cross_operator_slot_paraphrase_is_a_known_limit(self):
         """Documented residual, pinned so it cannot go silent (#5325).
 
-        The slot is the FAMILY, not the POSITION: comparing position in the
-        connective sequence would refuse the phase-D restatement above, whose
-        `to` and `and` sit in the same position in two different slots.  The
-        cost is that a swap BETWEEN slots is invisible — `and` (clause
-        relation) against `then` (branch/sequence) asserts a different
-        relation and still folds.  Grouping them would refuse `and then` /
-        `, then`, which is a real paraphrase.
+        The union read above is what closes the `and`/`then` swap, and it cannot
+        tell a SWAP from a genuine rewording that happens to cross the same two
+        slots: `so` (clause relation) and `then` (branch/sequence) both mark a
+        consequence, so "it rained and so we waited" against "it rained and then
+        we waited" is one claim in two spellings and is now refused.  That cost
+        is taken deliberately: a wrong keep is noise while a wrong drop (the
+        `and`/`then` swap it buys) is memory loss.
         """
-        assert v2.fold_allowed("we ship and test", "we ship then test")
+        assert not v2.fold_allowed("it rained and so we waited",
+                                   "it rained and then we waited")
 
     def test_a_connective_permutation_is_a_known_limit(self):
         """Documented residual, pinned so it cannot go silent (#5325).
@@ -1292,6 +1329,134 @@ class TestDistinguishingDifference:
         """
         assert not v2.fold_allowed("we use the tool for a hammer",
                                    "we use the tool as a hammer")
+
+    # ---- #5325: which of the residuals a token-list edit can and cannot reach ----
+    #
+    # Residual 1 (a swap BETWEEN the two operator slots) is CLOSED above by
+    # `test_a_connective_swap_between_two_operator_slots_is_refused`.  The three
+    # below are the ones a token-list edit still cannot reach, each falsified
+    # against this module (by monkeypatch) before being recorded.  TWO are
+    # TRIPWIRES, verified to redden under the fix they forbid: `yet`==`but`
+    # (test 2) and `as`==`because` (test 3).  The first is the exception and says
+    # so — the per-slot ORDER read does not redden it, because ORDER genuinely
+    # closes residual 2's exemplar and only the class stays open; a test that
+    # cannot fail on the fix it forbids is not a tripwire, so it is labelled a
+    # record instead.  None is named `*_is_a_known_limit`: they pin a must-keep,
+    # not a folded residual, which is the half
+    # `TestResidualPinsHaveLiveTrackers` says is out of its scope.
+
+    def test_a_union_over_all_four_slots_would_refuse_two_pins(self):
+        """Why the union is taken over slots {0,1} and NOT over all four (#5325).
+
+        The cross-operator-slot swap above is closed by reading slots 0 and 1
+        together.  The natural next step — union ALL four — is what this test
+        exists to stop: the phase-D restatement pinned above is a must-fold and
+        its two sides are `to` (slot 3) and `and` (slot 0), so a union over every
+        slot refuses it, and `to`/`from` against anything else in slot 3 would go
+        the same way.  This IS a tripwire: widening `_OPERATOR_SLOT_INDICES` to
+        include slot 3 reddens the first assertion.
+        """
+        prior = "We should ship the web server first to unblock the mobile team."
+        candidate = ("We should ship the web server first and unblock the "
+                     "mobile team now.")
+        assert v2.fold_allowed(prior, candidate)
+        # The all-four union is disjoint here, i.e. it reads this must-fold as a
+        # swap — which is exactly why the union is restricted to the operator
+        # slots.
+        union_a = frozenset().union(*v2._connective_slots(prior))
+        union_b = frozenset().union(*v2._connective_slots(candidate))
+        assert union_a == frozenset({"to"}), union_a
+        assert union_b == frozenset({"and"}), union_b
+        assert union_a.isdisjoint(union_b)
+        # …while the restricted union the code actually takes reads this as a
+        # ONE-SIDED member (`and` on the candidate only), which is the documented
+        # broadening and not a swap — so the must-fold survives, and the
+        # cross-operator-slot swap the union IS meant to close is still caught.
+        assert v2._OPERATOR_SLOT_INDICES == (0, 1)
+        assert not frozenset().union(*(v2._connective_slots(prior)[i]
+                                       for i in v2._OPERATOR_SLOT_INDICES))
+        assert frozenset().union(*(v2._connective_slots(candidate)[i]
+                                   for i in v2._OPERATOR_SLOT_INDICES)) \
+            == frozenset({"and"})
+        assert not v2.fold_allowed("we ship and test", "we ship then test")
+
+    def test_an_ordered_slot_read_closes_the_exemplar_not_the_class(self):
+        """Residual 2 is NOT closable by ordering each slot's members (#5325).
+
+        RECORD, not a tripwire: this test passes under the sequence read too, and
+        that is the finding.  Comparing a slot as a SEQUENCE instead of a set
+        does refuse the pinned `we ship and test or we wait` exemplar — its two
+        members appear in opposite order.  But ordering is a proxy for
+        ATTACHMENT, and it stops one token short: the pair below keeps
+        `[and, or]` in that order, carries the same content tokens, and moves
+        only the grouping, so a sequence read folds it exactly as the set read
+        does.  Closing the class needs the parse, which is why the exemplar's pin
+        stays.
+        """
+        def clause_relation_seq(text: str) -> list[str]:
+            flat = v2._canonicalise_coordinations(v2._norm(text))
+            return [t for t in flat.split() if t in v2._CONNECTIVE_SLOTS[0]]
+
+        exemplar_a = "we ship and test or we wait"
+        exemplar_b = "we ship or test and we wait"
+        # Ordering WOULD separate these two — that is the fix that looks right.
+        assert clause_relation_seq(exemplar_a) == ["and", "or"]
+        assert clause_relation_seq(exemplar_b) == ["or", "and"]
+        assert (frozenset().union(*v2._connective_slots(exemplar_a))
+                == frozenset().union(*v2._connective_slots(exemplar_b)))
+        # …and here is a member of the same class that ordering cannot see:
+        # (we ship) AND (we test or wait)  against  (we ship AND test) OR (we wait)
+        reattached_a = "we ship and we test or wait"
+        reattached_b = "we ship and test or we wait"
+        assert clause_relation_seq(reattached_a) == ["and", "or"]
+        assert clause_relation_seq(reattached_b) == ["and", "or"]
+        assert v2.fold_allowed(reattached_a, reattached_b)
+
+    def test_a_synonym_equivalence_for_yet_would_fold_opposite_meanings(self):
+        """The `but`/`yet` over-block is the PRICE of a refusal, not a defect.
+
+        The over-block is real — "we tried but failed" against "we tried yet
+        failed" refuses two near-synonyms — and declaring the two slot members
+        equivalent does close it.  It also folds the pair below, which has the
+        same slot shape and the OPPOSITE meaning: `have yet to ship` is NOT YET
+        SHIPPED, `have but to ship` is ONLY NEED TO SHIP.  The slot read is the
+        only thing separating them (one side owns `yet`, the other `but`, in
+        that slot and nowhere else), so the over-block is what keeps them
+        apart.  A wrong keep is noise; this fold would be memory loss.
+        """
+        prior = "we have yet to ship the build"
+        candidate = "we have but to ship the build"
+        assert v2._connective_slots(prior)[0] == frozenset({"yet"})
+        assert v2._connective_slots(candidate)[0] == frozenset({"but"})
+        # …and the clause-relation slot is the ONLY slot that differs (`to` is
+        # in the transfer slot on BOTH sides), so an equivalence inside that
+        # slot is the whole of the change and leaves nothing to catch it.
+        assert v2._connective_slots(prior)[1:] \
+            == v2._connective_slots(candidate)[1:]
+        assert v2.distinguishing_difference(prior, candidate) \
+            == "substituted_content"
+        assert not v2.fold_allowed(prior, candidate)
+
+    def test_a_synonym_equivalence_for_as_would_pick_one_reading(self):
+        """The `because`/`as` over-block is the PRICE of an ambiguity (#5325).
+
+        `as` carries its ambiguity INSIDE the clause-relation family: "we halted
+        as the tests failed" may mean WHILE (concurrent) as readily as BECAUSE,
+        and both are clause relations, so no slot-level signal separates the
+        reading an equivalence would pick (BECAUSE) from the one that changes
+        the claim (WHILE).  Structurally `as` also fills the comparison slot,
+        which is the same polysemy one slot further on.  `yet` (see the sibling
+        test) fails for the other reason — its idiom has an opposite meaning —
+        so NEITHER member of a within-relation pair can be merged: keeping the
+        clause-relation slot coarse is what keeps both refusals correct.
+        """
+        prior = "we halted as the tests failed"
+        candidate = "we halted because the tests failed"
+        assert v2._connective_slots(prior)[0] == frozenset({"as"})
+        assert v2._connective_slots(prior)[2] == frozenset({"as"})
+        assert v2._connective_slots(candidate)[0] == frozenset({"because"})
+        assert v2._connective_slots(candidate)[2] == frozenset()
+        assert not v2.fold_allowed(prior, candidate)
 
     def test_the_connective_slots_are_pinned_against_the_sibling_tables(self):
         """One token's role is declared in three sets; the overlaps are pinned.
