@@ -809,6 +809,22 @@ def test_no_redirect_stems_registry_exact():
         # working as designed, so the stem is DECLARED here rather than
         # exempted.
         "test_bm25_lexical_8488",
+        # #9209: the write handle's NON-CYPHER verbs. The suite's
+        # `sdk_with_journal` fixture asserts `proj._is_embedded` and counts
+        # real nodes on that embedded projection, and the module carries
+        # module-level `pytestmark = pytest.mark.embedded_only`, so the
+        # exemption's load-bearing reason is the SKIP *and* the REDIRECT: an
+        # explicit `db_path` is NOT enough on its own — `FalkorProjection`'s
+        # URI-aware test redirect (`explicit_path and TORTOISE_DB_URI and
+        # TORTOISE_TEST_MODE == "1" and not exempt`) nulls the path and
+        # renames the graph, so `_is_embedded` is False and 42 of the suite's
+        # 70 cases ERROR before `yield` (MEASURED at the registration-less
+        # head on a private lane container: `28 passed, 42 errors`). The third
+        # leg of the three-way mirror: config/ci-surfaces.yml:carve_out and
+        # TEST_NO_REDIRECT_STEMS were registered with the PR — this pin reding
+        # on the addition is the pin working as designed, so the stem is
+        # DECLARED here rather than exempted.
+        "test_9209_handle_non_cypher_wipe",
         # #9189 (§17.2): the record↔cache observer's journal-backed arm builds a
         # FRESH embedded projection (`tests._embedded.fresh_embedded_proj`) and
         # binds a journal to it, because §17.1's refusal arm does not exist on
