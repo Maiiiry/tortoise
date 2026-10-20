@@ -47,7 +47,7 @@ name: billing-reconcile-cron
 #       - anything else: UNRECOGNISED — the driver refuses to name a runbook it
 #         cannot verify, and says so instead of guessing. Do not collapse these
 #         arms back into one: naming the wrong cause was a real defect here.
-#     (see `_BILLING_RECONCILE_STALE_S` in `tortoise/hosted_api.py`), or
+#         (see `_BILLING_RECONCILE_STALE_S` in `tortoise/hosted_api.py`).
 #   * the response cannot be read as a summary at all (not a JSON object, or
 #     missing any field the verdict below keys on — a shape change must fail
 #     closed, never read as a clean pass), or

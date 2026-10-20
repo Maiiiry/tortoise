@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -80,19 +81,27 @@ def _stored_pointer_is_current(sub: dict) -> bool:
             and not sub.get("cancel_at_period_end"))
 
 
-def _subscription_rank(sub: dict) -> int | None:
+def _subscription_rank(sub: dict) -> float | None:
     """The node cap this subscription's price entitles, or ``None`` if unrankable.
 
     ``None`` covers both "the price is not in the catalog" (``subscription_plan``
     raises ``BillingError`` — the caller decides, see its docstring) and "the
-    pricing ladder could not be read" (``_paid_tier_floor``), because a
-    comparison this function cannot make must never be mistaken for "ranks low".
+    pricing ladder could not be read" (``_UNREADABLE``), because a comparison
+    this function cannot make must never be mistaken for "ranks low".
+
+    ⛔ An UNLIMITED tier ranks ABOVE every finite one, so it returns ``inf`` and
+    not ``None``: skipping it would let a finite-capped sibling win the
+    comparison and be taken as "provably at or above" — re-capping a customer
+    who pays for unlimited nodes (#8946).
     """
     try:
         tier, _interval = subscription_plan(sub)
     except Exception:  # noqa: BLE001, RUF100 — an unreadable price is not a rank
         return None
-    return _paid_tier_floor(tier)
+    cap = _tier_cap(tier)
+    if cap is _UNREADABLE:
+        return None
+    return math.inf if cap is None else cap
 
 
 def _best_ranked(subs):
@@ -1133,6 +1142,41 @@ def org_billing_identity(sdk, org_id: str) -> dict:
     return dict(zip(_IDENTITY_FIELDS, rows[0], strict=True))
 
 
+_UNREADABLE = object()
+"""The ladder could not be READ. ⛔ Distinct from ``None``, which is a REAL cap.
+
+A tier's ``max_graph_nodes`` may legitimately be ``null`` ("unlimited"), and
+``pricing.tier_limits`` only requires the KEY to exist, so a readable
+``pricing.json`` can carry it. An unreadable ladder is the OTHER ``None``: the
+read raised. The two separate on the raise and nowhere else, so one function
+does the reading and returns this sentinel for the fault — every consumer below
+then decides on an unambiguous value instead of re-deriving "was it readable?"
+from a ``None`` that means two things.
+"""
+
+
+def _tier_cap(tier: str | None) -> int | object | None:
+    """A tier's node cap — an ``int``, ``None`` for unlimited, or ``_UNREADABLE``.
+
+    The single read of the ladder. The catch is deliberately BROAD: the
+    unreadable shapes are not one exception family. A LOADED tier missing a
+    limit key raises ``KeyError``; a malformed file ``JSONDecodeError`` (a
+    ``ValueError``); a missing one ``FileNotFoundError`` (an ``OSError``); and a
+    valid-JSON file whose ROOT (or ``tiers`` value) is not an object raises
+    ``AttributeError`` at ``data.get(...)``. That last one is what a
+    hand-written tuple always misses, and an escape here is not a per-org
+    failure: ``_tier_claim`` runs OUTSIDE the per-org ``try`` in
+    ``reconcile_subscriptions``, so it aborts the WHOLE pass as an unnamed 500
+    — the partial pass this cadence exists to prevent — which the driver then
+    reports as a control-plane outage (#750.8).
+    """
+    from tortoise.pricing import tier_limits
+    try:
+        return tier_limits(tier or "free")["max_graph_nodes"]
+    except Exception:  # noqa: BLE001, RUF100 — an unreadable ladder is not a verdict
+        return _UNREADABLE
+
+
 def _paid_tier_floor(tier: str | None) -> int | None:
     """The node cap a tier entitles: RANKS tiers for drift, and is reported.
 
@@ -1146,51 +1190,49 @@ def _paid_tier_floor(tier: str | None) -> int | None:
     Free's cap (``pricing.tier_limits``: "Unknown tiers default to the Free
     limits") and ``team`` resolves to its real 600 000 — neither is special.
 
-    ``None`` therefore does NOT mean "unlimited". It means the ladder could not
-    be READ at all (``tier_limits`` raised on a malformed ``pricing.json`` —
-    #750.8, a config fault), which is the only path that reaches it. Consumers
-    must treat ``None`` as "unrankable", never as "pays the most": the whole
-    point of ranking on the cap is that an unreadable ladder must not clear
-    (pinned by
+    ⛔ ``None`` here means either "unlimited" (a real ``null`` in a readable
+    ladder) or "could not be read" — this is the REPORTING/ordering accessor
+    and it keeps that historical shape, so a consumer that must tell the two
+    apart has to call ``_tier_cap`` instead. ``_tier_claim``, ``_drift_direction``
+    and ``_subscription_rank`` all do; collapsing them onto this function is what
+    made an unlimited top tier read as "ladder unreadable" (#8946).
+
+    An unreadable ladder must never clear as "pays the most": the whole point
+    of ranking on the cap is that a fault is not a rank (pinned by
     ``tests/test_billing.py::TestReconcileSweep::test_an_unreadable_ladder_is_unrankable_not_unlimited``).
     """
-    from tortoise.pricing import tier_limits
-    try:
-        return tier_limits(tier or "free")["max_graph_nodes"]
-    except Exception:  # noqa: BLE001, RUF100 — an unreadable ladder is not a verdict
-        # ⛔ EVERY way an unreadable ladder can present itself, deliberately
-        # broad. The shapes are not one exception family: a LOADED tier missing
-        # a limit key raises ``KeyError``; a malformed file ``JSONDecodeError``
-        # (a ``ValueError``); a missing one ``FileNotFoundError`` (an
-        # ``OSError``); and a valid-JSON file whose ROOT (or ``tiers`` value) is
-        # not an object raises ``AttributeError`` at ``data.get(...)``. The last
-        # is the one a hand-written tuple always misses, and any escape here is
-        # not a per-org failure: ``_tier_claim`` runs OUTSIDE the per-org
-        # ``try``, so it aborts the WHOLE pass as an unnamed 500 — the partial
-        # pass this cadence exists to prevent — which the driver then reports as
-        # a control-plane outage. The documented behaviour is ``None`` →
-        # ``unverified``.
-        return None
+    cap = _tier_cap(tier)
+    return None if cap is _UNREADABLE else cap
 
 
 def _tier_claim(tier: str | None) -> str:
     """What a stored ``tier`` CLAIMS — ``"paid"``, ``"unpaid"`` or ``"unknown"``.
 
-    The third answer is the point. ``_paid_tier_floor`` returns ``None`` when
-    the pricing ladder could not be READ (``tier_limits`` raised on a malformed
-    ``pricing.json`` — #750.8, a documented reachable config fault), and for
-    ``None`` no tier compares above Free's floor. Collapsing that into
-    ``"unpaid"`` takes an UNREADABLE ladder as evidence that a stored ``pro``
-    org pays nothing: it lands in ``skipped``, is logged as "stored at the
-    unpaid tier 'pro'", and passes a pass that exists to catch exactly that.
-    An unread signal is not a zero, so the answer is ``"unknown"`` and the
-    caller must treat it as something a person looks at.
+    The third answer is the point. The pricing ladder can fail to be READ
+    (``tier_limits`` raised on a malformed ``pricing.json`` — #750.8, a
+    documented reachable config fault), and collapsing that into ``"unpaid"``
+    takes an UNREADABLE ladder as evidence that a stored ``pro`` org pays
+    nothing: it lands in ``skipped``, is logged as "stored at the unpaid tier
+    'pro'", and passes a pass that exists to catch exactly that. An unread
+    signal is not a zero, so the answer is ``"unknown"`` and the caller must
+    treat it as something a person looks at.
+
+    ⛔ But ``None`` is NOT the same signal: a readable ladder may carry
+    ``max_graph_nodes: null``, which means UNLIMITED — the tier claims strictly
+    more than Free, so the answer is ``"paid"``. Reading that as "unreadable"
+    counted every org on an unlimited tier as ``unverified`` on every pass, and
+    logged a cause the code never established (#8946). The two separate on the
+    raise, i.e. on ``_UNREADABLE``, never on a truthiness test.
     """
-    floor = _paid_tier_floor(tier)
-    free_floor = _paid_tier_floor("free")
-    if floor is None or free_floor is None:
+    cap = _tier_cap(tier)
+    free_cap = _tier_cap("free")
+    if cap is _UNREADABLE or free_cap is _UNREADABLE:
         return "unknown"
-    return "paid" if floor > free_floor else "unpaid"
+    if cap is None:
+        return "paid"  # unlimited outranks any finite cap
+    if free_cap is None:
+        return "unpaid"  # nothing can outrank an unlimited FREE tier
+    return "paid" if cap > free_cap else "unpaid"
 
 
 def _drift_direction(from_tier: str | None, to_tier: str | None) -> str | None:
@@ -1206,9 +1248,9 @@ def _drift_direction(from_tier: str | None, to_tier: str | None) -> str | None:
     look at, not a no-op.
     ``docs/infra-runbook.md`` §4.2 documents all three values.
     """
-    before = _paid_tier_floor(from_tier)
-    after = _paid_tier_floor(to_tier)
-    if before is None and after is None:
+    before = _tier_cap(from_tier)
+    after = _tier_cap(to_tier)
+    if before is _UNREADABLE or after is _UNREADABLE:
         return None
     if before is None:  # unlimited → finite: a real reduction
         return "down"

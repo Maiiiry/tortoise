@@ -3293,8 +3293,12 @@ class TestReconcileSweep:
         ``direction: null`` = "both caps unlimited". Measured, both are false:
         ``team`` is 600 000 and an unrecognised tier resolves to Free's 10 000
         (``pricing.tier_limits``: "Unknown tiers default to the Free limits").
-        ``None`` is reachable only when the ladder RAISES (#750.8). A runbook
-        that calls it a benign no-op sends the operator past a config fault.
+        ``None`` is reachable when the ladder RAISES (#750.8) — and, since #8946,
+        ALSO from a readable ladder that declares ``max_graph_nodes: null``
+        (unlimited). ``_paid_tier_floor`` keeps returning ``None`` for both, so a
+        consumer that must tell them apart reads ``_tier_cap`` instead (see
+        ``TestTierCapSeparatesTheTwoNones``); a runbook that calls either a benign
+        no-op sends the operator past a config fault.
         """
         import tortoise.pricing as pricing
         from tortoise import billing as bl
@@ -4080,3 +4084,89 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
     message = str(excinfo.value)
     assert "INCONCLUSIVE [#5049]" in message
     assert "POST /v1/billing/checkout answered" in message
+# ---------------------------------------------------------------------------
+# #8946 — the two ``None``s a ladder read can produce
+# ---------------------------------------------------------------------------
+
+
+class TestTierCapSeparatesTheTwoNones:
+    """``pricing.tier_limits`` requires only the KEY to exist, so a readable
+    ``pricing.json`` may carry ``max_graph_nodes: null`` — an UNLIMITED tier, not
+    a fault. Reading that as "the ladder could not be read" put every org on such
+    a tier into ``unverified`` on every pass, logging a cause the code never
+    established, forever. The two sources separate on the RAISE, which is the only
+    place they differ, so one function reads the ladder and returns
+    ``_UNREADABLE`` for the fault.
+    """
+
+    @staticmethod
+    def _with_limits(monkeypatch, ladder):
+        import tortoise.pricing as pricing
+        monkeypatch.setattr(pricing, "tier_limits", ladder)
+
+    @staticmethod
+    def _ladder(caps):
+        def _limits(tier):
+            return {"max_graph_nodes": caps[tier]}
+        return _limits
+
+    def test_an_unlimited_cap_claims_paid(self, monkeypatch):
+        # ⛔ Regression guard for the defect itself: this returned "unknown".
+        from tortoise import billing as bl
+        self._with_limits(monkeypatch, self._ladder({"free": 10000, "pro": None, "team": 600000}))
+
+        assert bl._tier_claim("pro") == "paid", "an unlimited tier claims MORE than Free"
+        assert bl._tier_claim("free") == "unpaid"
+        assert bl._tier_claim("team") == "paid"
+        assert bl._tier_cap("pro") is None
+        assert bl._tier_cap("pro") is not bl._UNREADABLE
+
+    def test_an_unlimited_tier_ranks_above_every_finite_one(self, monkeypatch):
+        from tortoise import billing as bl
+        self._with_limits(monkeypatch, self._ladder({"free": 10000, "pro": None}))
+        # The price→tier resolution is a different concern (and needs a real
+        # catalog); what #8946 changes is what the CAP is worth once resolved.
+        monkeypatch.setattr(bl, "subscription_plan", lambda sub: (sub["tier"], "month"))
+
+        unlimited = {"tier": "pro", "id": "sub_unlimited"}
+        finite = {"tier": "free", "id": "sub_finite"}
+
+        # ``inf``, not ``None``: ``None`` means UNRANKABLE here, and skipping an
+        # unlimited tier lets a finite-capped sibling win the comparison — a
+        # re-cap of someone who pays for unlimited nodes.
+        assert bl._subscription_rank(unlimited) == float("inf")
+        assert bl._subscription_rank(unlimited) > bl._subscription_rank(finite)
+        assert bl._best_ranked([finite, unlimited])[0] is unlimited
+
+    def test_unlimited_to_finite_is_a_downward_drift(self, monkeypatch):
+        from tortoise import billing as bl
+        self._with_limits(monkeypatch, self._ladder({"pro": None, "team": 600000}))
+
+        assert bl._drift_direction("pro", "team") == "down"
+        assert bl._drift_direction("team", "pro") == "up"
+
+    def test_every_unreadable_shape_claims_unknown(self, monkeypatch):
+        """The catch is BROAD on purpose: the four shapes are not one exception
+        family, and ``_tier_claim`` runs OUTSIDE the per-org ``try`` — an escape
+        aborts the whole pass as an unnamed 500."""
+        import json
+
+        from tortoise import billing as bl
+
+        def _key_error(tier):
+            raise KeyError("missing required keys")
+
+        def _decode_error(tier):
+            raise json.JSONDecodeError("bad", "{", 0)
+
+        def _file_error(tier):
+            raise FileNotFoundError("pricing.json")
+
+        def _attribute_error(tier):
+            raise AttributeError("'list' object has no attribute 'get'")
+
+        for shape in (_key_error, _decode_error, _file_error, _attribute_error):
+            self._with_limits(monkeypatch, shape)
+            assert bl._tier_claim("pro") == "unknown", shape.__name__
+            assert bl._tier_cap("pro") is bl._UNREADABLE, shape.__name__
+            assert bl._drift_direction("pro", "team") is None, shape.__name__

@@ -500,9 +500,19 @@ org that has already paid through `current_period_end`, so it needs the billing
 owner, not the runbook. A `failed` row whose error names `pricing.json` (a
 missing limit key) has the same remedy as `direction: null`: fix the ladder.
 
-Note that a cap which is present but `null` is returned by `tier_limits` as-is
-— it ranks as unreadable and still mirrors, so it does not raise: the run can
-green, and can even record a `repaired` tier change nobody proved (#8943). And
+Note that a cap which is present but `null` means **UNLIMITED**, not "unreadable"
+(#8946): `tier_limits` returns it as-is, and since that fix the reconciler ranks
+it ABOVE every finite cap — so an org on such a tier claims `paid` rather than
+`unverified`, and a repair from it to a finite tier records
+`direction: "down"`. Two consequences for an operator: a top tier declared
+unlimited stops filling the `unverified` counter on every pass (before #8946 it
+did, forever, and the log named a cause the code never established), and a
+`direction: "down"` row can now be a REAL reduction of entitlement that the
+ladder itself made — check `from_max_nodes` is `null` before reading it as a
+billing mistake. The earlier caveat — that such a cap "ranks as unreadable" and
+could record `a repaired tier change nobody proved` (#8943) — no longer applies
+to a `null` cap; it applies to a ladder that cannot be READ, which is the
+`direction: null` case below. And
 in the **Actions** log `failed[].org_id` is a stable fingerprint (`org-…`), not
 the real id — the JSON payload carries the real one; re-fetch it with the curl
 at the top of this section unchanged (it carries `--max-time 600` and
@@ -545,7 +555,9 @@ customer's writes) and a `direction`:
   pricing ladder could not be READ (`tier_limits` raised — a malformed or
   incomplete `product/pricing.json`, #750.8). That is a **config fault, not a
   no-op**: an unrecognised tier is NOT this case, it resolves to Free's cap and
-  ranks normally. Never paged; investigate the pricing file.
+  ranks normally, and neither is a `null` cap — that means unlimited and
+  ranks ABOVE every finite cap (#8946). Never paged; investigate the pricing
+  file.
 - `unverified` — no active subscription could be established for an org whose
   stored tier claims PAID entitlement, **or whose claim could not be decided at
   all**. Three causes land here and the counter does not distinguish them:
