@@ -1286,6 +1286,20 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # and hermetic, so `core` is the right lane (the shape
              # `tools/lane_stash.py` above takes).
              "tools/e1_e2_census_check.py",
+             # #9080 (#9089 review): the capstone gate itself
+             # (`tools/capstone_verdict_check.py`) — the closing rule for epic
+             # #7949 — owns `tests/test_7949_capstone_verdict_check.py`, which is
+             # registered `core`. Without this row a GATE-ONLY diff came back
+             # `surfaces=[], full=False`: the pin ran only because it also sits in
+             # the `tier1` curated list, so `core` — the surface the comment in
+             # `config/ci-surfaces.yml` names as its home — was nominal, and one
+             # `tier1` edit would have dropped the pin silently (measured before
+             # this entry: `select(['tools/capstone_verdict_check.py'])` →
+             # surfaces=[], pin present only via tier1). Same shape and remedy as
+             # `tools/e1_e2_census_check.py` above, and the same polarity note:
+             # this is a cost/home fix, not a hole fix. Pinned by
+             # tests/test_ci_selection.py::test_the_capstone_gate_change_selects_core_not_tier1.
+             "tools/capstone_verdict_check.py",
              # #4030: `supabase/config.toml` is the committed LOCAL-stack config,
              # and every env var it resolves by `env(NAME)` substitution must be
              # declared in `.env.example` — the guard for that pair

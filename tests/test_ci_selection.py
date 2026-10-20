@@ -2112,6 +2112,24 @@ def test_capstone_probe_change_selects_core_not_tier1():
         assert r["full"] is False, (path, r)
 
 
+def test_the_capstone_gate_change_selects_core_not_tier1():
+    # #9089 review P2: the GATE itself (tools/capstone_verdict_check.py) owns
+    # tests/test_7949_capstone_verdict_check.py, which is registered `core` —
+    # and `config/ci-surfaces.yml` names `core` as its home. Before the
+    # CORE_ALSO row a gate-only diff came back with NO surface at all and the
+    # pin ran only because it also sits in the `tier1` curated list, so `core`
+    # was nominal and one `tier1` edit would have dropped the pin silently
+    # (the #1349/#3332/#3616 class, reached through the docs-only early return
+    # rather than through `_selection_relevant`).
+    #
+    # MEASURED before the row (2026-10-20, `select()` in-process):
+    # `_sel(["tools/capstone_verdict_check.py"])` -> surfaces=[], full=False.
+    # Mutation check: removing the CORE_ALSO row fails assert 1 below.
+    r = _sel(["tools/capstone_verdict_check.py"])
+    assert "core" in r["surfaces"], r
+    assert "test_7949_capstone_verdict_check.py" in r["test_files"], r
+    assert r["full"] is False, r
+
 def test_the_capstone_evidence_bundle_selects_core_not_tier1():
     # PR #9196 review P1: the S2 verdict's deciding artifacts are committed TEXT
     # — `s2-wiring-census.log` (the census output), `e2e-chain-probe.log` (the

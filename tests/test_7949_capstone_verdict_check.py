@@ -707,6 +707,35 @@ def test_reversed_markers_is_a_usage_error():
         cvc.extract_block(f"{cvc.END}\n{{}}\n{cvc.BEGIN}")
 
 
+def test_two_verdict_blocks_is_a_usage_error_not_a_stale_green(tmp_path, capsys):
+    """REGRESSION (#9089 review): the gate read only the FIRST block.
+
+    `text.index(BEGIN)`/`text.index(END)` stop at the first marker pair, so a log
+    that holds a green table followed by a newer REFUSED run answered "the epic
+    is closeable" off the stale table. Reachable without any forgery: piping a
+    re-run into the committed log (`capstone_run.py | tee -a capstone.log`) is
+    enough, and the gate is the only thing that could have noticed.
+
+    Non-vacuity: measured on the pre-fix tool, the green-first case exited 0
+    with and without `--require-green`; both assertions below are unreachable
+    there.
+    """
+    good = _record()
+    for row in good["rows"]:
+        row["verdict"] = "GREEN"
+    block = f"{cvc.BEGIN}\n{json.dumps(good)}\n{cvc.END}\n"
+    log = tmp_path / "appended.log"
+    log.write_text(f"# run 1 (green)\n{block}\n# run 2 (refused)\n{block}")
+    assert cvc.main([str(log), "--repo", str(_REPO)]) == 2
+    err = capsys.readouterr().err
+    assert "exactly one verdict block" in err, err
+    assert "2" in err and str(cvc.BEGIN) in err, err
+    # And the module-level contract, so a direct caller cannot bypass main().
+    import pytest
+    with pytest.raises(ValueError, match="exactly one verdict block"):
+        cvc.extract_block(f"{block}{block}")
+
+
 # ── the RUN's observers — every row is derived from these ────────────────
 #
 # TWO fixtures, deliberately, because there are two different objects and
@@ -1057,6 +1086,32 @@ def test_a_row_and_its_e4_receipt_that_disagree_is_a_finding():
     assert "V10" in _codes(rec)
 
 
+def test_a_measured_E4_with_an_empty_denominator_is_a_finding():
+    """REGRESSION (#9089 review): V5's "an empty denominator measures
+    nothing" rule lives in its GREEN arm, and E4 is never GREEN on this surface
+    (`completed_rows` writes BLOCKED for every row while #9116 holds) — so 0/0
+    was the one vacuous measurement the gate called sound.
+
+    A run whose `s4_merge` is absent supplies no `s2_items`, and the receipt
+    computes the denominator from it, so this shape is what the PROBE emits for
+    a completed run with no merge step — not a hand-written table.
+
+    Non-vacuity: measured on the pre-fix tool, `_codes()` came back empty for
+    both shapes below and the tally printed "denominators agree".
+    """
+    empty = probe.e4_receipt({"s4_merge": {}})
+    assert empty["denominator"] == 0, empty
+    assert "V10" in _codes(_completed_record(empty))
+    # And explicitly zero, the shape a fabricated row would carry.
+    receipt = probe.e4_receipt({"s4_merge": {"s2_items": 15,
+                                           "kept_from_s2": 14}})
+    rec = _completed_record(receipt)
+    e4 = next(r for r in rec["rows"] if r["criterion"] == "E4")
+    e4["denominator"] = 0
+    rec["run"]["e4_receipt"]["denominator"] = 0
+    assert "V10" in _codes(rec)
+
+
 def test_the_e3_census_instrument_is_not_shipped_unwired():
     """E3's census is #5199's to land WITH its graph reader.
 
@@ -1275,8 +1330,28 @@ def test_the_durations_row_quotes_the_test_count_it_weights():
                 if ln.strip().startswith(
                     "test_7949_capstone_verdict_check.py:")), None)
     assert row is not None, "the durations row is the weight this test guards"
+    # The COMMENT-ONLY tail, exactly as the refresher reads it (`tools/ci_timing.py`
+    # matches `^[ \t]*#\s*unmeasured\b` against the tail it CLEARS on refresh).
+    # ⛔ Slicing from the first `:` instead (`row.split(':', 1)[1]`) starts at the
+    # WEIGHT — ` 2.0  # unmeasured …` — so the marker could never match and the
+    # tolerance below was unreachable: measured, the first post-merge sweep CLEARS
+    # the tail, leaves `test_…py: 4.2`, and this test then redded `main` — the
+    # exact false red the tolerance exists to prevent.
+    tail = row.split("#", 1)[1] if "#" in row else ""
+    unmeasured = bool(re.match(r"[ \t]*unmeasured\b", tail))
+    # A sweep CUTS the file on its first measurement, so on that pass the whole
+    # note is cleared away and the row is left as a bare `key: value` (measured:
+    # `tools/ci_timing.py::render_refreshed_manifest` blanks the tail when it
+    # LEADS with `# unmeasured`). A bare row and a still-unmeasured row are both
+    # the refresher's state — the count is required only of a row that carries a
+    # note this repo wrote and the sweep has not yet taken over.
+    refreshed_or_unmeasured = unmeasured or not tail.strip()
     quoted = re.search(r"(\d+)\s+tests", row)
-    assert quoted, f"the row must quote its measured test count: {row}"
+    if quoted is None:
+        assert refreshed_or_unmeasured, (
+            "a hand-written durations note must quote the measured test count, "
+            f"or LEAD with `# unmeasured` (the refresher owns that tail): {row}")
+        return
     shipped = len(re.findall(r"^def test_",
                              (Path(__file__)).read_text(), re.MULTILINE))
     assert int(quoted.group(1)) == shipped, (

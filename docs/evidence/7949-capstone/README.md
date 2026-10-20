@@ -11,7 +11,7 @@ aboutObjects: "#7949, #9080, #9075, #9076, #9077, #9116, #5199, #7947, EXTRACTOR
 
 # Capstone evidence — `#7949` / `#9080` (extractor-v4, E1–E5)
 
-**Measured at:** `472599b6a` on branch `feat/9080-tm` (2026-10-20). **Blast
+**Measured at:** `6ccc06a23` on branch `feat/9080-tm` (2026-10-20, after merging `origin/main` at `e14eed78b`). **Blast
 radius — the 13 files this branch touches** (`git diff --name-only origin/main...HEAD`):
 the bundle itself (`docs/evidence/7949-capstone/**`, `tools/capstone_verdict_check.py`,
 `tests/test_7949_capstone_verdict_check.py`); its registration (`config/ci-surfaces.yml`
@@ -76,7 +76,7 @@ issue's state, so E5 stays `BLOCKED` even though its measurement exists.
 
 ## What the run did
 
-The acceptance command from the issue, executed verbatim at `472599b6a`:
+The acceptance command from the issue, executed verbatim at `6ccc06a23`:
 
 ```bash
 python docs/evidence/7949-capstone/probes/capstone_run.py \
@@ -88,7 +88,7 @@ python docs/evidence/7949-capstone/probes/capstone_run.py \
 model call or write*):
 
 ```text
-run: REFUSED — commit 472599b6a… does not carry
+run: REFUSED — commit 6ccc06a23… does not carry
      docs/evidence/7949-capstone/preregistration.json
 steps observed: (none)   required: S0 S1 S2.1 S2.2 S2.3 S3 S5 S6
 ```
@@ -118,7 +118,7 @@ first — which is the exact inference the epic exists to stop.
 
 The body's figures are pinned to `9037c7a7b`. Re-measured at `717355e67`:
 
-1. **`docs/evidence/7949-capstone/` did not exist** — still true; this bundle is it.
+1. **`docs/evidence/7949-capstone/` did not exist** — **FALSE now, and it was already false when this was written**: `#9110` landed the E1/E2 evidence (`E1-E2.md`, `e1-e2.log`, `corpus/`, `probes/e1_e2_probe.py`) in this same directory, 16 h before the head this bundle first stamped. What this bundle adds is the *capstone* run and the gate, not the directory.
 2. **"No end-to-end v4 runner exists"** — still true, and now false in the specific
    sense that matters: the *pipeline* entry point does exist (below), and the missing
    runner is now this probe rather than nothing.

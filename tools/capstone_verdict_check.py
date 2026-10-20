@@ -140,11 +140,27 @@ def extract_block(text: str) -> dict:
     the operator reads the same file the gate parses — one artifact, not two
     that can disagree. A missing/malformed block is a usage error (exit 2), not
     a finding: a log with no table is not a red row, it is not a table.
+
+    ⛔ EXACTLY ONE BLOCK, because the gate reads one RUN. `text.index` alone
+    stops at the FIRST marker pair, so an appended re-run left the newer table
+    unread while the stale one still decided the epic — measured on the pre-fix
+    tool: a log holding a 5/5-green block followed by a REFUSED block exited 0,
+    and `--require-green` answered "closeable" for an artifact whose newest run
+    refused. That is reachable WITHOUT forgery — `capstone_run.py | tee -a
+    capstone.log` is enough — so it is an inference hole, not the documented
+    forgery limit. Refusing the ambiguity keeps "one run decides" true.
     """
     if BEGIN not in text or END not in text:
         raise ValueError(
             f"no verdict block: expected the markers {BEGIN!r} / {END!r} "
             "(capstone_run.py emits them)")
+    begins, ends = text.count(BEGIN), text.count(END)
+    if begins != 1 or ends != 1:
+        raise ValueError(
+            f"expected exactly one verdict block, found {begins} {BEGIN!r} and "
+            f"{ends} {END!r} marker(s) — the gate reads ONE run, so an appended "
+            "re-run would leave its table unread (write each run to its own "
+            "file; capstone_run.py emits exactly one pair)")
     start = text.index(BEGIN) + len(BEGIN)
     end = text.index(END)
     if end < start:
@@ -519,6 +535,18 @@ def check(record: dict, *, repo: Path,
                                         "historical 4-edge defect's "
                                         "denominator), so this is not a "
                                         "measurement of the criterion")
+        # V5's "an empty denominator measures nothing" lives in its GREEN arm,
+        # and on this surface E4 can never be green (`completed_rows` writes
+        # BLOCKED for every row while #9116 holds). Without this arm the ONE
+        # row that carries numbers could be measured 0/0 and the gate would
+        # still print "denominators agree" — the silent-zero shape V5 exists
+        # to refuse, reachable only through the row V5 cannot see.
+        if measured and not (isinstance(e4_den, int) and e4_den > 0):
+            f.add("V10", "rows[E4]", f"E4 is MEASURED but carries no positive "
+                                        f"denominator ({e4_den!r}) — an empty "
+                                        "denominator measures nothing, and "
+                                        "V5's GREEN-only arm cannot reach this "
+                                        "row (E4 is never GREEN here)")
         receipt = run.get("e4_receipt")
         if isinstance(receipt, dict) and isinstance(e4_den, int) \
                 and isinstance(receipt.get("denominator"), int) \
