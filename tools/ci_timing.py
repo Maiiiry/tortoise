@@ -483,7 +483,14 @@ def parse_log(path: Path) -> dict:
         # testdb_canary_classify.py's step-wall gate — but only the `test`
         # matrix uploads that file, so the side lanes leave no wall evidence and
         # no classifier consumes one for them.
-        if "KeyboardInterrupt" in line:
+        # Only pytest's OWN interrupt banner counts: a failing assertion whose
+        # source line merely mentions the word is output, not a kill. Since
+        # `killed` now gates whether a render may replace a complete measurement, a
+        # substring match would freeze the artifact permanently on a log that
+        # quotes it (#9134 review cycle 11). pytest's banner is a line of `!`s.
+        stripped = line.strip()
+        if (stripped.startswith("!") and stripped.endswith("!")
+                and "KeyboardInterrupt" in stripped):
             killed = True
         if "slowest" in line and "durations" in line:
             in_durations = True
@@ -1818,8 +1825,14 @@ def _prior_legs(json_path: Path) -> int | None:
     if not isinstance(data, dict):
         return None
     known: list[int] = []
+    # The top-level count is what the LAST render wrote, so it is authoritative:
+    # a max() over retained history rows would make a legitimately smaller suite
+    # (a shard removed, or `--allow-fewer-legs` used) unable to ever lower the
+    # bar — the artifact would refuse every later render forever (#9134 review
+    # cycle 11). `log_sources` and the rows are only fallbacks for an artifact
+    # written before the count existed.
     if isinstance(data.get("legs"), int):
-        known.append(data["legs"])
+        return data["legs"]
     sources = data.get("log_sources")
     if isinstance(sources, list):
         known.append(sum(
@@ -2308,8 +2321,14 @@ def main() -> int:
     # same number of summary-bearing legs while missing thousands of passes. It is
     # a real sample of what ran and an incomplete sample of the suite, so it may
     # create a row but not replace a complete one.
-    too_little = killed_any or legs == 0 or (prior_legs is not None and legs < prior_legs)
-    if too_little and not args.allow_fewer_legs and _holds_measurements(json_path):
+    measured_nothing = legs == 0 or killed_any
+    # `--allow-fewer-legs` relaxes the LEG COUNT only. It must never re-open the
+    # zero-measurement or killed refusals: an explicit opt-out from "my suite got
+    # smaller" is not consent to replace measured numbers with nothing (#9134
+    # review cycle 11).
+    fewer = prior_legs is not None and legs < prior_legs and not args.allow_fewer_legs
+    too_little = measured_nothing or fewer
+    if too_little and _holds_measurements(json_path):
         reason = (
             "nothing" if legs == 0
             else "a run that was KILLED mid-suite" if killed_any

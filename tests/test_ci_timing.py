@@ -4203,8 +4203,11 @@ def test_a_killed_run_must_not_replace_a_complete_measurement(
     """
     out = tmp_path / "out"
     before = _seed_full_artifact(out)
-    killed_log = FIXTURE_LOG.splitlines()
-    killed_log[-1] = "!!! KeyboardInterrupt !!!"
+    # The banner is APPENDED, not substituted for the summary: the point is that
+    # the leg count stays 17 so only the `killed` clause can refuse. Replacing the
+    # summary dropped the leg to a progress-only one, which the leg-count clause
+    # refused anyway — making the assertion pass without `killed` being read.
+    killed_log = [*FIXTURE_LOG.splitlines(), "!!!!!!!!!!! KeyboardInterrupt !!!!!!!!!!!"]
     for i in range(17):
         write_log(
             tmp_path,
@@ -4252,4 +4255,80 @@ def test_progress_only_legs_do_not_count_as_complete_legs(
     assert proc.returncode == 0, proc.stderr[-400:]
     assert (out / "ci-timing.json").read_text() == before, (
         "seventeen progress-only logs passed as a complete measurement"
+    )
+
+
+def test_a_quoted_keyboard_interrupt_is_not_a_kill(tmp_path: Path) -> None:
+    """`killed` now gates writes, so a log that QUOTES the word must not set it.
+
+    A failing assertion whose source line mentions `KeyboardInterrupt` puts the
+    word in the output. When the kill flag only drove a report field that was
+    cosmetic; now it refuses to replace a measurement, so a substring match would
+    freeze the artifact permanently on an innocent log (#9134 review cycle 11).
+    """
+    log = FIXTURE_LOG.splitlines()
+    log.insert(-1, "E   assert 'KeyboardInterrupt' in 'the runner handles it'")
+    parsed = ci_timing.parse_log(write_log(tmp_path, "quoted-kill.log", "\n".join(log)))
+    assert parsed["killed"] is False
+    # pytest's own banner still counts
+    banner = ci_timing.parse_log(write_log(
+        tmp_path, "banner.log",
+        "\n".join([*FIXTURE_LOG.splitlines(), "!!!!!!!! KeyboardInterrupt !!!!!!!!"])))
+    assert banner["killed"] is True
+
+
+def test_allow_fewer_legs_cannot_relax_the_zero_measurement_refusal(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """The opt-out means "my suite got smaller", not "write whatever I measured".
+
+    Relaxing the whole disjunction let `--allow-fewer-legs` with an EMPTY logs dir
+    write `legs 0, passed 0, failed_tests []` over a measured artifact, which
+    `candidate_flakes` then read as the failing test having passed later —
+    re-opening the exact hole cycles 8-10 closed (#9134 review cycle 11).
+    """
+    out = tmp_path / "out"
+    before = _seed_full_artifact(out)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(logs), "--out-dir", str(out), "--allow-fewer-legs"],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert (out / "ci-timing.json").read_text() == before, (
+        "--allow-fewer-legs let a render that measured nothing replace a measured artifact"
+    )
+
+
+def test_allow_fewer_legs_rebaselines_so_later_renders_still_write(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """Otherwise the guard ratchets one-way and the artifact freezes forever.
+
+    `_prior_legs` used to take a max() over the retained history rows, so a write
+    made through the opt-out left the old 17-leg row in place and every later
+    render was refused — verified by the reviewer. The top-level count is what the
+    LAST render wrote, so it is what the next render compares against.
+    """
+    out = tmp_path / "out"
+    _seed_full_artifact(out)  # records legs: 17
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")
+    tools = str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py")
+    cmd = [sys.executable, tools, "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+           "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(out)]
+
+    subprocess.run([*cmd, "--allow-fewer-legs"], capture_output=True, text=True,
+                   check=True, timeout=120)
+    assert json.loads((out / "ci-timing.json").read_text())["legs"] == 1
+
+    # a later render WITHOUT the opt-out must be allowed: 1 leg is now the bar
+    second = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    assert second.returncode == 0, second.stderr[-400:]
+    assert "wrote" in second.stdout, (
+        f"the artifact froze after the opt-out: {second.stderr[-300:]}"
     )
