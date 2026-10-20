@@ -110,12 +110,17 @@ _NON_STATEMENT_GUARDED_HANDLE_VERBS = {
     # drift.
     "delete": ("_refuse_unauthorized_graph_wipe",),
     # `CALL <procedure>(…)` IS Cypher text, so this verb is protected by the L2
-    # bulk-wipe classifier applied to the statement the vendor will build.
-    # §17.1's statement door is #9124's and is deliberately NOT applied here —
-    # stated in the method's own docstring, and the reason this verb cannot sit
-    # in `_HANDLE_MUTATING_VERBS`, whose every member must consult
-    # `_refuse_unauthorized_cache_write`.
-    "call_procedure": ("_is_bulk_wipe", "_assert_test_graph"),
+    # bulk-wipe classifier applied to the statement the vendor will build — AND
+    # it consults §17.1's statement door on that same reconstructed statement
+    # (measure mode until `_HANDLE_GUARD_ENFORCES`), which is asserted below.
+    # It still cannot sit in `_HANDLE_MUTATING_VERBS`: that tuple's other two
+    # readers take ``args[0]`` as a CYPHER STATEMENT (this verb's ``args[0]`` is
+    # a procedure NAME) and index it positionally.
+    "call_procedure": (
+        "_is_bulk_wipe",
+        "_assert_test_graph",
+        "_refuse_unauthorized_cache_write",
+    ),
 }
 
 
