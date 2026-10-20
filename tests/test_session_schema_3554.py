@@ -286,8 +286,10 @@ def test_subdir_scan_keys_sites_repo_relatively_and_compares_in_scope(
 #: Their property sets are hand-declared and verified by a bespoke AST pin named
 #: in ``_ROW_VERIFIERS`` — an exemption here is a claim that a verifier COVERS it,
 #: and ``test_every_exempt_row_has_a_row_verifier`` fails if one does not.
-#: ``rebuild_all`` is excluded separately — it is the whole-schema writer
-#: (``SET s += $props``) and is declared as such.
+#: The whole-schema writer is excluded separately — it is the ONE row declared
+#: ``writes_whole_schema=True`` (``SET s += $props``), so there is no property
+#: name at the site to compare. Since #9124 the write lives in
+#: ``projection._rebuild_all_replay`` (``rebuild_all`` is the entry point).
 #:
 #: ``tortoise/sdk.py::_write_session_and_turns`` was exempted on the reason that
 #: it "builds its ``SET`` clause with an f-string", which is false and made the
@@ -970,8 +972,9 @@ def test_ontology_section_4_8_owner_lists_match_the_declaration() -> None:
 def test_the_set_property_owner_convention_is_stated_in_both_homes() -> None:
     """The ``id`` row's convention must be stated where the row is read.
 
-    ``SESSION_PROPERTY_OWNERS["id"]`` names only ``rebuild_all`` while ten
-    declared writers mint the node with ``MERGE (s:Session {id: …})`` — and the
+    ``SESSION_PROPERTY_OWNERS["id"]`` names only the replay restore (it named
+    ``rebuild_all`` before #9124 moved that write into ``_rebuild_all_replay``)
+    while ten declared writers mint the node with ``MERGE (s:Session {id: …})`` — and the
     module's grouping comment filed ``id`` under "identity + capture shape (the
     shared primitive, #3551)", the opposite of the derived table. The doc pin
     cannot catch it: it compares §4.8 against the same declaration, so both
