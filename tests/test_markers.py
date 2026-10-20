@@ -809,6 +809,20 @@ def test_no_redirect_stems_registry_exact():
         # working as designed, so the stem is DECLARED here rather than
         # exempted.
         "test_bm25_lexical_8488",
+        # #9189 (§17.2): the record↔cache observer's journal-backed arm builds a
+        # FRESH embedded projection (`tests._embedded.fresh_embedded_proj`) and
+        # binds a journal to it, because §17.1's refusal arm does not exist on
+        # the server lane. The file carries NO module-level `embedded_only`
+        # marker — the single embedded case is marked at the test — so the
+        # load-bearing reason it needs the exemption is the REDIRECT: a URI-set
+        # lane would discard the path, connect the construction to the server,
+        # and the refusal/count pair this file exists to prove would certify a
+        # lane it does not target. The third leg of the three-way mirror:
+        # config/ci-surfaces.yml:carve_out and TEST_NO_REDIRECT_STEMS were
+        # registered with the PR — this pin reding on the addition is the pin
+        # working as designed, so the stem is DECLARED here rather than
+        # exempted.
+        "test_record_reconcile_trigger",
     })
     assert frozenset(TEST_NO_REDIRECT_STEMS) == expected, (
         "TEST_NO_REDIRECT_STEMS drifted from the pinned carve-out stems "
@@ -1767,7 +1781,8 @@ def test_ci_runs_the_embedded_only_marker_selection():
 PLATFORM_GATED_TESTS: dict[str, str] = {
     "test_fork_safety_3845.py": (
         "#3845 producer + MUTATION PROOF. `_build_holder()` skips unless "
-        "sys.platform == 'darwin', and every CI job is ubuntu-latest (12/12), "
+        "sys.platform == 'darwin', and every CI job is Linux (11 `ubuntu-latest`, "
+        "2 `ubuntu-24.04`), "
         "so `test_fork_child_does_not_hang_with_the_production_config` (the "
         "fix) and `test_without_the_fix_the_same_race_hangs_a_child` (the "
         "mutation that proves it) execute on a dev-machine macOS run only. "
