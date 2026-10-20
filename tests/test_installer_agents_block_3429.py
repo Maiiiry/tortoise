@@ -1367,7 +1367,8 @@ def test_an_unreadable_mode_refuses_rather_than_loosening_permissions(
 
 
 @pytest.mark.parametrize("existing_block", [True, False], ids=["replace", "append"])
-def test_a_hardlinked_alias_sees_the_block(tmp_path, existing_block):
+@pytest.mark.parametrize("read_only", [False, True], ids=["rw", "ro"])
+def test_a_hardlinked_alias_sees_the_block(tmp_path, existing_block, read_only):
     """Review P2/P1: BOTH write paths went from in-place writing to `cp` + `mv`,
     which REPLACES the inode. A hardlinked alias of AGENTS.md — `ln AGENTS.md
     CLAUDE.md` is a common way to dual-name agent files — kept the pre-run bytes
@@ -1395,6 +1396,11 @@ def test_a_hardlinked_alias_sees_the_block(tmp_path, existing_block):
     else:
         original = body
     target.write_text(original, encoding="utf-8")
+    if read_only:
+        # The in-place arms chmod the target and must put the mode back; without a
+        # 0444 case that restore is a no-op and cannot be observed (review: deleting
+        # it left every test green while a read-only file came back 0644).
+        target.chmod(0o444)
     alias = project / "CLAUDE.md"
     alias.hardlink_to(target)
 
@@ -1414,3 +1420,64 @@ def test_a_hardlinked_alias_sees_the_block(tmp_path, existing_block):
     assert text.count(START) == 1 and text.count(END) == 1, "exactly one block"
     if existing_block:
         assert text.endswith("TAIL\n"), "content after the block must survive"
+    if read_only:
+        assert (target.stat().st_mode & 0o777) == 0o444, (
+            "an in-place write must restore the read-only mode: got "
+            f"{oct(target.stat().st_mode & 0o777)}")
+
+
+def test_a_failed_in_place_rewrite_restores_the_original(tmp_path):
+    """Review P2: the in-place arm truncates the ONLY copy, and `_emit_fail` wipes
+    the tmpdir — so a failed write destroyed the user's file. Measured with a `cat`
+    shim writing 4 bytes and exiting 1: the file came back as "part", with the
+    original text, the block and the trailer all gone, while the message only said
+    "re-run after checking the file".
+
+    The arm now keeps a copy first and restores it, so this asserts the EXACT
+    original bytes are back AND that the failure says so — a rollback that silently
+    "worked" would leave the user unable to tell what happened.
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    original = f"# House\nUNIQUE-ONE\n\n{START}\nold block\n{END}\nTAIL\n"
+    target.write_text(original, encoding="utf-8")
+    target.chmod(0o444)
+    alias = project / "CLAUDE.md"
+    alias.hardlink_to(target)
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake = shim / "cat"
+    # The in-place rewrite is the ONE-argument `cat` whose argument is the staged
+    # temp file; by the time it runs, the shell has already truncated the target.
+    # Fail there and nowhere else, so the rollback (which cats the BACKUP file) is
+    # not intercepted.
+    fake.write_text(
+        '#!/bin/sh\n'
+        'if [ $# -eq 1 ]; then\n'
+        '  case "$1" in\n'
+        '    *.tortoise-agents.*) printf "PARTIAL" ; exit 1 ;;\n'
+        '  esac\n'
+        'fi\n'
+        'exec /bin/cat "$@"\n',
+        encoding="utf-8")
+    fake.chmod(0o755)
+
+    done = subprocess.run(
+        ["bash", str(installer), "--harness", "codex"], cwd=str(project),
+        env={**os.environ, "HOME": str(home), "PATH": f"{shim}:{os.environ['PATH']}"},
+        capture_output=True, text=True, timeout=180)
+
+    assert done.returncode == 3, (
+        "the injected write failure must be reported:\n" + done.stdout + done.stderr)
+    assert "RESTORED" in done.stderr, (
+        "the failure must say the original was restored:\n" + done.stderr)
+    assert target.read_text(encoding="utf-8") == original, (
+        "the original bytes must be back, verbatim")
+    assert (target.stat().st_mode & 0o777) == 0o444, (
+        f"the read-only mode must be restored: {oct(target.stat().st_mode & 0o777)}")
+    assert target.stat().st_ino == alias.stat().st_ino, "the alias must not be split"

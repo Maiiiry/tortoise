@@ -437,7 +437,17 @@ emit_codex_agents_block() {
   local state="" prev_version="" same_bytes=0
   local state_kind="" c_start c_startline c_end c_endline c_fence_start
   local c_near_s c_near_e c_mangled_s c_mangled_e c_fence_open
-  local block_inside_fence orig_mode links
+  local block_inside_fence orig_mode links backup
+  # An IN-PLACE write (the hardlinked-alias arms) truncates the user's only copy,
+  # so the original is kept first and restored on any failure — same inode, so the
+  # recovery is exact and the alias is untouched. A signal in that window used to
+  # leave a 0444 file writable and print nothing (measured: rc 143, mode 644).
+  backup=""
+  undo_inplace() {
+    [ -n "$backup" ] && [ -f "$backup" ] && cat "$backup" > "$target" 2>/dev/null
+    [ -n "$orig_mode" ] && chmod "$orig_mode" "$target" 2>/dev/null
+    trap - INT TERM HUP
+  }
   _emit_fail() {
     # ONE place that cleans up and fails. It EXITS rather than returning: a
     # `cmd || helper` list is itself an errexit-exempt context, so a helper that
@@ -755,20 +765,30 @@ EOF
     fi
     # Put the user's mode back before the rename, so a read-only AGENTS.md stays
     # read-only instead of being silently loosened to the umask default.
-    chmod "$orig_mode" "$staged" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on $target — nothing was changed"; }
+    chmod "$orig_mode" "$staged" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on the staged copy — nothing was changed"; }
     # A HARD LINKED alias (CLAUDE.md -> AGENTS.md) shares the inode, so a rename
     # SPLITS it: the alias keeps the pre-run bytes while the report says the block
     # was upgraded (measured — the alias still held the stale v1 text). Rewrite the
     # same inode when the file has other links; rename only when it is the only one.
     links="$(stat -c '%h' "$target" 2>/dev/null || stat -f '%l' "$target" 2>/dev/null || echo 1)"
     if [ "${links:-1}" -gt 1 ]; then
-      chmod u+w "$target" || { rm -f "$staged"; _emit_fail "could not make $target writable to rewrite it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
+      # This arm TRUNCATES the only copy, so the original is kept first: a failed
+      # write is rolled back byte-for-byte instead of leaving a half file.
+      backup="$tmpdir/orig-agents.md"
+      cp "$target" "$backup" || { rm -f "$staged"; _emit_fail "could not keep a copy of $target before rewriting it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
+      trap 'undo_inplace' INT TERM HUP
+      chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to rewrite it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
       if ! cat "$staged" > "$target"; then
-        chmod "$orig_mode" "$target" 2>/dev/null || true
+        undo_inplace
         rm -f "$staged"
-        _emit_fail "could not rewrite $target in place (partially written — re-run after checking the file)"
+        _emit_fail "could not rewrite $target in place — the original was RESTORED from $backup (a full disk or a quota limit is the usual cause)"
       fi
-      chmod "$orig_mode" "$target" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on $target — the block WAS written"; }
+      if ! chmod "$orig_mode" "$target"; then
+        trap - INT TERM HUP
+        rm -f "$staged"
+        _emit_fail "could not restore mode $orig_mode on $target — the block WAS written"
+      fi
+      trap - INT TERM HUP
       rm -f "$staged"
     else
       mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
@@ -804,17 +824,26 @@ EOF
       # pre-staging code did, and put the mode back afterwards.
       links="$(stat -c '%h' "$target" 2>/dev/null || stat -f '%l' "$target" 2>/dev/null || echo 1)"
       if [ "${links:-1}" -gt 1 ]; then
-        chmod u+w "$target" || { rm -f "$staged"; _emit_fail "could not make $target writable to append in place (it has $links hard links, which a rename would split) — nothing was changed"; }
+        # A partial append also has to be undoable: keep the original first.
+        backup="$tmpdir/orig-agents.md"
+        cp "$target" "$backup" || { rm -f "$staged"; _emit_fail "could not keep a copy of $target before appending in place (it has $links hard links, which a rename would split) — nothing was changed"; }
+        trap 'undo_inplace' INT TERM HUP
+        chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to append in place (it has $links hard links, which a rename would split) — nothing was changed"; }
         # ONLY the new bytes: $staged is a COPY of $target plus the block, so
         # `cat "$staged" >> "$target"` would duplicate the user's whole file
         # (measured: 24 bytes -> 1208 with the body present twice, reported as
         # success). Append the separator and the block, as the pre-staging code did.
         if ! printf '\n\n' >> "$target" || ! cat "$block" >> "$target"; then
-          chmod "$orig_mode" "$target" 2>/dev/null || true
+          undo_inplace
           rm -f "$staged"
-          _emit_fail "could not append to $target in place (partially written — re-run after checking the file)"
+          _emit_fail "could not append to $target in place — the original was RESTORED from $backup (a full disk or a quota limit is the usual cause)"
         fi
-        chmod "$orig_mode" "$target" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on $target — the block WAS appended"; }
+        if ! chmod "$orig_mode" "$target"; then
+          trap - INT TERM HUP
+          rm -f "$staged"
+          _emit_fail "could not restore mode $orig_mode on $target — the block WAS appended"
+        fi
+        trap - INT TERM HUP
         rm -f "$staged"
       else
         mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
