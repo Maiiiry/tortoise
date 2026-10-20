@@ -1774,9 +1774,19 @@ def _holds_measurements(json_path: Path) -> bool:
     if data.get("files"):
         return True
     outcome = data.get("outcome")
-    return isinstance(outcome, dict) and any(
+    if isinstance(outcome, dict) and any(
         isinstance(outcome.get(key), int) and outcome[key] > 0
         for key in COUNT_KEYS
+    ):
+        return True
+    # A measured HISTORY row counts as a measurement too. Its own file may have
+    # lost the top-level parts already, and a render that measured nothing must
+    # not then claim the run is clean: a zeroed row for a DIFFERENT run id made
+    # `candidate_flakes` report a test that had failed as having PASSED — a flake
+    # fabricated from an absent measurement (#9134 review cycle 8).
+    history = data.get("history")
+    return isinstance(history, list) and any(
+        isinstance(entry, dict) and _row_is_measured(entry) for entry in history
     )
 
 
@@ -2209,6 +2219,7 @@ def main() -> int:
         "steps_total_ms": sum(s["duration_ms"] for job in steps.values() for s in job),
         "steps_max_job_ms": max((sum(s["duration_ms"] for s in job) for job in steps.values()), default=0),
         "failed_tests": sorted(failed_tests),
+        "legs": len(log_sources),
     }
     previous = load_history(json_path)
     # A render that MEASURED NOTHING is not a measurement, and must not overwrite
@@ -2219,36 +2230,48 @@ def main() -> int:
     # (`files`/`outcome`), so a history-only seed — and a first render into an
     # empty directory — still writes what it can.
     measured_now = bool(files) or any(total_counts[key] > 0 for key in COUNT_KEYS)
-    if not measured_now and _holds_measurements(json_path):
-        print(
-            "::warning::this render measured nothing — keeping the existing "
-            "artifact instead of overwriting it with zeros",
-            file=sys.stderr,
-        )
-        return 0
-
-    # A re-render of an ALREADY SAMPLED run must REPLACE its row, not stack a
-    # second one: the two rows describe the same run with whatever the generator
-    # said at each time, so a corrected re-render left the stale copy beside it
-    # (measured: 5 entries, 4 distinct run ids, `failed: 6` next to `failed: 5`).
-    # The freshly measured row is the one that survives.
-    #
-    # The no-run path (`--run-id ""`, what ci-timing.yml calls when no run is
-    # picked) carries no run identity at all, so identical rows would otherwise
-    # accumulate up to `--max-history` and evict real samples. One no-run row.
     if run_id:
         same = [e for e in previous if e.get("run_id") == run_id]
         rest = [e for e in previous if e.get("run_id") != run_id]
     else:
+        # `--run-id ""` (what ci-timing.yml calls when no run is picked) carries
+        # no run identity at all, so identical rows would otherwise accumulate up
+        # to `--max-history` and evict real samples. One no-run row at most.
         same = [e for e in previous if not e.get("run_id")]
         rest = [e for e in previous if e.get("run_id")]
-    # An unmeasured render may not REPLACE a measured row — and a keep must not
-    # REORDER the history either: `candidate_flakes` reads `history[i]` as newer
-    # than `history[i+1]`, so hoisting the kept row to the front turned a real
-    # flake into "none" (#9134 review cycle 7). Leaving `previous` untouched
-    # preserves both the numbers and the chronology.
-    keep_prior = not measured_now and bool(same) and _row_is_measured(same[0])
-    history = previous if keep_prior else [row, *rest]
+
+    # Refuse to write when this render would replace a measurement with LESS than
+    # the artifact already holds. Two ways that happens:
+    #
+    #  * it measured NOTHING — no logs, or logs that parse to nothing (a 0-byte or
+    #    SIGKILL-truncated leg), reached when `pick_run` re-picks a run whose
+    #    artifacts have expired;
+    #  * it measured LESS — a partial artifact set (one leg of seventeen uploaded)
+    #    still counts as measured, so its smaller counts would replace the full
+    #    ones, and a test that failed in the kept history but is missing from the
+    #    partial render reads as a FLAKE that never happened (#9134 review cycle 8).
+    #
+    # Rows record how many legs produced them, so the second case is detectable.
+    # Both keep the artifact untouched: a render that measured less is not a
+    # correction of the one that measured more.
+    prior = same[0] if same and isinstance(same[0], dict) else None
+    prior_legs = prior.get("legs") if prior else None
+    fewer_legs = (
+        measured_now
+        and isinstance(prior_legs, int)
+        and len(log_sources) < prior_legs
+        and _row_is_measured(prior)
+    )
+    if (not measured_now or fewer_legs) and _holds_measurements(json_path):
+        reason = "nothing" if not measured_now else "fewer legs than the artifact already records"
+        print(
+            f"::warning::this render measured {reason} — keeping the existing "
+            "artifact instead of replacing measured numbers with a smaller sample",
+            file=sys.stderr,
+        )
+        return 0
+
+    history = [row, *rest]
     history = history[: args.max_history]
 
     flakes = candidate_flakes(history)

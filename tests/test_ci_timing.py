@@ -3685,6 +3685,9 @@ def test_a_valid_history_artifact_is_still_used(tmp_path) -> None:
         {"counts": {"passed": 1, "failed": 1, "error": 0, "skipped": 0, "xfailed": 0, "xpassed": 0, "total_ms": 1.0},
          "failed_tests": ["a"], "run_id": 1, "sample_time": "t1"},
     ]}))
+    # A render that measures NOTHING refuses to touch a measured artifact, so this
+    # one supplies a log: the history it must still consult is the seeded rows.
+    (tmp_path / "pytest.log").write_text(FIXTURE_LOG)
     proc = subprocess.run(
         [sys.executable, str(_CLI), "--repo", "o/r",
          "--logs-dir", str(tmp_path), "--out-dir", str(out)],
@@ -4032,30 +4035,73 @@ def test_a_log_that_parses_to_nothing_must_not_zero_a_measured_artifact(
     assert after["history"][0]["counts"]["failed"] == 1
 
 
-def test_keeping_a_prior_row_does_not_reorder_the_history(
+def test_a_logless_render_for_a_DIFFERENT_run_cannot_fabricate_a_clean_sample(
     tmp_path: Path, fake_env: Path
 ) -> None:
-    """Chronology is load-bearing: `candidate_flakes` reads [0] as newer than [1].
+    """A zeroed row for another run invents a PASS.
 
-    Hoisting the kept row to the front made an older sample appear newer than a
-    newer one, which turned a real flake (failed then passed) into "none"
-    (#9134 review cycle 7). A kept history must be left exactly as it was.
+    `candidate_flakes` reads a later clean sample as proof the test passed then.
+    So a log-less render of run 4243 over an artifact whose only measurements are
+    a measured 4242 row would insert `4243 == 0 failures`, and a test that had
+    FAILED became a flake that never happened (#9134 review cycle 8). The row
+    guard only compared rows with the SAME run id, so that path was wide open.
     """
     out = tmp_path / "out"
     out.mkdir()
-    counts_new = {"error": 0, "failed": 0, "passed": 42, "skipped": 0, "xfailed": 0, "xpassed": 0}
-    counts_old = dict(counts_new, failed=1, passed=41)
     (out / "ci-timing.json").write_text(json.dumps({
-        "files": {"test_alpha.py": {"max_ms": 1000.0, "tests": 42, "total_ms": 12340.0}},
-        "outcome": {"error": 0, "failed": 0, "passed": 42, "skipped": 0, "xfailed": 0, "xpassed": 0},
-        "history": [
-            {"counts": counts_new, "failed_tests": [], "run_id": "4241", "sample_time": "t2"},
-            {"counts": counts_old, "failed_tests": ["tests/test_alpha.py::test_two"],
-             "run_id": "4242", "sample_time": "t1"},
-        ],
+        "files": {},
+        "outcome": {"error": 0, "failed": 0, "passed": 0, "skipped": 0, "xfailed": 0, "xpassed": 0},
+        "history": [{
+            "counts": {"error": 0, "failed": 1, "passed": 42, "skipped": 0,
+                       "xfailed": 0, "xpassed": 0},
+            "failed_tests": ["tests/test_alpha.py::test_two"],
+            "run_id": "4242", "sample_time": "t1", "legs": 17,
+        }],
     }))
+    before = (out / "ci-timing.json").read_text()
     logs = tmp_path / "logs"
     logs.mkdir()
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4243",
+         "--logs-dir", str(logs), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert (out / "ci-timing.json").read_text() == before, (
+        "a log-less render of another run rewrote a measured artifact, inventing "
+        "a clean sample beside the failing one"
+    )
+
+
+def test_a_partial_leg_set_must_not_replace_a_complete_measurement(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """One uploaded leg of seventeen is not a correction of the seventeen.
+
+    A partial artifact set is still `measured_now`, so the smaller counts replaced
+    the complete ones — and any test that failed in the kept history but is absent
+    from the partial render read as a FLAKE (#9134 review cycle 8). Rows record how
+    many legs produced them, so the render can tell it is looking at less.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "ci-timing.json").write_text(json.dumps({
+        "files": {"test_alpha.py": {"max_ms": 1000.0, "tests": 42, "total_ms": 12340.0}},
+        "outcome": {"error": 0, "failed": 1, "passed": 42, "skipped": 3,
+                    "xfailed": 0, "xpassed": 0},
+        "failed_tests": ["tests/test_alpha.py::test_two"],
+        "history": [{
+            "counts": {"error": 0, "failed": 1, "passed": 42, "skipped": 3,
+                       "xfailed": 0, "xpassed": 0},
+            "failed_tests": ["tests/test_alpha.py::test_two"],
+            "run_id": "4242", "sample_time": "t1", "legs": 17,
+        }],
+    }))
+    logs = tmp_path / "logs"
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")  # ONE leg
 
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
@@ -4066,7 +4112,7 @@ def test_keeping_a_prior_row_does_not_reorder_the_history(
 
     assert proc.returncode == 0, proc.stderr[-400:]
     after = json.loads((out / "ci-timing.json").read_text())
-    assert [e["run_id"] for e in after["history"]] == ["4241", "4242"], (
-        f"the kept row was moved out of chronological order: "
-        f"{[(e['run_id'], e['sample_time']) for e in after['history']]}"
+    assert after["outcome"]["passed"] == 42, (
+        f"a one-leg render replaced a seventeen-leg measurement: {after['outcome']}"
     )
+    assert after["history"][0]["counts"]["passed"] == 42
