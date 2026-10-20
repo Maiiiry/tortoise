@@ -85,6 +85,7 @@ surface this suite never looked at.
 from __future__ import annotations
 
 import ast
+import builtins
 import re
 import sys
 from pathlib import Path
@@ -270,13 +271,13 @@ _UNRESOLVED = {
     # at e08a669b2 — the entries, not the statements, were missing.)
     # ⚠️ The human step covers the WHOLE statement, not just its resolvable
     # part — for these rows the unresolvable fragment IS the `where` text, so
-    # "the readable half has no write keyword" would not settle it: measured,
-    # each function's only handle reach is a `MATCH … OPTIONAL MATCH … RETURN`
-    # read (`calibrate_summary`) / `MATCH … RETURN n.id` read
-    # (`_uncalibrated_ep_participants`), with no SET/CREATE/MERGE/DELETE/REMOVE
-    # in the assembled query and no write through another SDK method
-    # (`calibrate_summary` names `set_point_baseline` only inside advice
-    # strings — it never calls it).
+    # "the readable half has no write keyword" would not settle it. Measured,
+    # each function's only handle reach is ONE read:
+    #   `calibrate_summary` — `MATCH … OPTIONAL MATCH … RETURN` (a read)
+    #   `_uncalibrated_ep_participants` — `MATCH … RETURN n.id` (a read)
+    # with no SET/CREATE/MERGE/DELETE/REMOVE in the assembled query and no write
+    # through another SDK method (`calibrate_summary` names `set_point_baseline`
+    # only inside advice strings — it never calls it).
     # ⛔ CITED BY SYMBOL, NEVER BY `sdk.py:<line>`. The numbers this note first
     # carried were 268 lines off within hours of being measured (they landed in
     # `_apply_source_inheritance`, whose `MATCH … REMOVE` is the opposite of the
@@ -1024,52 +1025,225 @@ def _unresolved_block_source() -> str:
         "reads its source to check the hand-check note, so move the pin with it")
 
 
+def _comment_lines(source: str) -> str:
+    """Just the `#` lines of a source slice — the NOTE, not the set members.
+
+    Needed because every symbol the note names is also a literal member of the
+    set, so a whole-block substring check passes with the note itself gutted.
+    """
+    return "\n".join(line for line in source.splitlines()
+                     if line.lstrip().startswith("#"))
+
+
 def _string_constants(node) -> list[str]:
     """Every string literal inside `node` (f-string fragments included)."""
     return [sub.value for sub in ast.walk(node)
             if isinstance(sub, ast.Constant) and isinstance(sub.value, str)]
 
 
-def _local_bindings(func) -> dict[str, list[ast.expr]]:
-    """`name -> every value assigned to it` in `func` (one entry per BRANCH).
+def _string_bindings(nodes) -> dict[str, list[ast.expr]]:
+    """`name -> every value that can flow into it`, every binding form.
 
-    Every binding, not the last one: `_uncalibrated_ep_participants` builds its
-    `query` in an `if`/`else` pair, and checking only the surviving branch would
-    leave the other one unverified.
+    `AugAssign` is NOT optional: `_uncalibrated_ep_participants` appends its
+    `LIMIT` clause with `query += f" LIMIT {int(limit)}"`, so a resolver that
+    only saw `Assign`/`AnnAssign` silently dropped the TAIL of the very
+    statement this test exists to check (measured: an injected
+    `query += " DETACH DELETE n"` passed, and so did `where += " SET …"`).
+    `NamedExpr` is the same shape one expression over.
+
+    Loop and comprehension targets are bound to their ITERABLE, so `{label}` in
+    `_uncalibrated_ep_participants` resolves to the module tuple it iterates
+    instead of being an unexplained hole.
+
+    Every binding is kept, not the last one: the `query` in that function is
+    built in an `if`/`else` pair and both branches must be inspected.
     """
     bound: dict[str, list[ast.expr]] = {}
-    for node in ast.walk(func):
-        if isinstance(node, ast.Assign) and node.value is not None:
+
+    def _bind(target, value) -> None:
+        if value is None:
+            return
+        if isinstance(target, ast.Name):
+            bound.setdefault(target.id, []).append(value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                _bind(elt, value)
+        elif isinstance(target, ast.Starred):
+            _bind(target.value, value)
+
+    for node in nodes:
+        if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    bound.setdefault(target.id, []).append(node.value)
-        elif (isinstance(node, ast.AnnAssign) and node.value is not None
-              and isinstance(node.target, ast.Name)):
-            bound.setdefault(node.target.id, []).append(node.value)
+                _bind(target, node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            _bind(node.target, node.value)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            _bind(node.target, node.iter)
+        # A comprehension can also be the VALUE of a binding
+        # (`_ID_WHITESPACE_SET = ", ".join(_cypher_ws_literal(c) for c in …)`),
+        # and its target is otherwise an unreadable name in the assembled text.
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.comprehension):
+                _bind(sub.target, sub.iter)
     return bound
 
 
-def _assembled_statement_fragments(func, call: ast.Call) -> list[str]:
-    """Every string fragment that can reach `call`'s statement argument.
+def _module_bindings(module) -> dict[str, list[ast.expr]]:
+    """Module-level bindings, so a fragment pulled from a CONSTANT is followed.
 
-    Follows the LOCAL indirection transitively (`query` -> f-string -> `where`
-    -> f-string), because that indirection is exactly why the census could not
-    resolve these statements — a check that stopped at the literals in the call
-    would pass on the readable half and prove nothing about the whole.
+    `where` interpolates module strings (`_ID_WHITESPACE_SET`) and module tuples
+    (`_CALIBRATION_GATED_LABELS`); a walk that stopped at function-local names
+    left the assembled text visibly incomplete and a write hidden in a module
+    constant would pass (measured). Cached: the resolver asks per NAME and the
+    same module is parsed once per test run.
     """
-    bindings = _local_bindings(func)
-    pending: list[ast.expr] = list(call.args) + [kw.value for kw in call.keywords]
-    fragments: list[str] = []
-    seen: set[str] = set()
-    while pending:
-        expr = pending.pop()
-        fragments.extend(_string_constants(expr))
-        for sub in ast.walk(expr):
-            if (isinstance(sub, ast.Name) and sub.id in bindings
-                    and sub.id not in seen):
-                seen.add(sub.id)
-                pending.extend(bindings[sub.id])
+    cached = _MODULE_BINDINGS_CACHE.get(id(module))
+    if cached is None:
+        cached = _string_bindings(
+            node for node in module.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                 ast.NamedExpr, ast.For)))
+        _MODULE_BINDINGS_CACHE[id(module)] = cached
+    return cached
+
+
+#: `id(module AST) -> its module-level bindings`. `module` outlives the lookup
+#: (it is held by the caller), so the id cannot be recycled underneath it.
+_MODULE_BINDINGS_CACHE: dict[int, dict[str, list[ast.expr]]] = {}
+
+
+def _statement_argument(call: ast.Call) -> ast.expr | None:
+    """The statement text: the FIRST POSITIONAL argument of a handle call.
+
+    Keywords are excluded on purpose — `<handle>.query(stmt, params=params)`
+    passes BIND DATA, not Cypher, so following `params` let an unrelated
+    `{"reason": "MERGE"}` in the parameter dict red a provably read-only row
+    (measured: a false FAIL of exactly that shape).
+    """
+    return call.args[0] if call.args else None
+
+
+def _function_returns(func) -> list[ast.expr]:
+    """Every expression a function RETURNS (the values its callers get)."""
+    return [node.value for node in ast.walk(func)
+            if isinstance(node, ast.Return) and node.value is not None]
+
+
+def _resolve_callee(name: str, module, path: Path):
+    """`(FunctionDef, its module, its path)` for a NAME, from here or an import.
+
+    Two hops, both needed: `_cypher_ws_literal` / `_strip_whitespace` are
+    defined in `sdk.py` itself, while `_live_only` arrives through
+    `from .live import _live_only`. Following only same-module definitions left
+    the imported predicate unread (measured: a `SET` spliced into
+    `_strip_whitespace`'s returned f-string passed).
+    """
+    defs = [node for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name]
+    if defs:
+        return defs[0], module, path
+    for node in ast.walk(module):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if not any(alias.name == name for alias in node.names):
+            continue
+        module_name = node.module or ""
+        if node.level:
+            package = path.parent.relative_to(ROOT).as_posix().replace("/", ".")
+            module_name = ".".join(filter(None, [package, module_name]))
+        candidate = ROOT / (module_name.replace(".", "/") + ".py")
+        if not candidate.exists():
+            continue
+        other = ast.parse(candidate.read_text(), str(candidate))
+        found = [node for node in ast.walk(other)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and node.name == name]
+        if found:
+            return found[0], other, candidate
+    return None, module, path
+
+
+def _params_of(func) -> set[str]:
+    """Every parameter name of `func` — values the assembly cannot read."""
+    args = func.args
+    names = {arg.arg for arg in list(args.args) + list(args.kwonlyargs)}
+    names |= {arg.arg for arg in (args.vararg, args.kwarg) if arg is not None}
+    return names
+
+
+def _fragments_of(expr, bindings, params, module, path: Path,
+                  followed: set[int], unread: set[str], depth: int = 0) -> list[str]:
+    """String fragments that can flow out of `expr`, following one level down.
+
+    `bindings`/`params` are the ENCLOSING scope's, so a callee is followed with
+    ITS OWN scope rather than the caller's — otherwise `_strip_whitespace`'s
+    local `out` and its `ch` parameter are reported as unreadable, which is
+    both wrong and would train the next reader to weaken this check.
+    """
+    fragments = _string_constants(expr)
+    if depth > 6:
+        return fragments
+    call_names = {id(node.func) for node in ast.walk(expr)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    for sub in ast.walk(expr):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+            callee, callee_module, callee_path = _resolve_callee(
+                sub.func.id, module, path)
+            if callee is not None and id(callee) not in followed:
+                followed.add(id(callee))
+                callee_bindings = {**_module_bindings(callee_module),
+                                   **_string_bindings(ast.walk(callee))}
+                callee_params = _params_of(callee)
+                for returned in _function_returns(callee):
+                    fragments.extend(_fragments_of(
+                        returned, callee_bindings, callee_params,
+                        callee_module, callee_path, followed, unread, depth + 1))
+            continue
+        if not isinstance(sub, ast.Name) or id(sub) in call_names:
+            # A callee NAME is handled above; naming it again here would report
+            # the function itself as an unread fragment of the statement.
+            continue
+        if sub.id in bindings:
+            for value in bindings[sub.id]:
+                fragments.extend(_fragments_of(
+                    value, bindings, params, module, path, followed, unread,
+                    depth + 1))
+        elif sub.id in _module_bindings(module):
+            for value in _module_bindings(module)[sub.id]:
+                fragments.extend(_fragments_of(
+                    value, bindings, params, module, path, followed, unread,
+                    depth + 1))
+        elif sub.id in params or sub.id in dir(builtins):
+            continue
+        else:
+            unread.add(sub.id)
     return fragments
+
+
+def _assembled_statement_fragments(module, path: Path, func, call: ast.Call
+                                   ) -> tuple[list[str], set[str]]:
+    """String fragments reaching `call`'s statement, and the names NOT read.
+
+    Follows the indirection transitively — `query` -> f-string -> `where` ->
+    f-string -> module constant -> same-module or imported helper's returns —
+    because that indirection is exactly why the census could not resolve these
+    statements; a check that stopped at the literals in the call would pass on
+    the readable half and prove nothing about the whole.
+
+    Parameters and builtins are not followed: they carry bind data and integers,
+    never Cypher text. Anything else that cannot be resolved is RETURNED so the
+    caller can refuse it — the census's own polarity (a fragment that cannot be
+    shown read-only is not called read-only), rather than a silent pass.
+    """
+    statement = _statement_argument(call)
+    if statement is None:
+        return [], set()
+    bindings = {**_string_bindings(ast.walk(func))}
+    unread: set[str] = set()
+    fragments = _fragments_of(statement, bindings, _params_of(func), module, path,
+                              set(), unread)
+    return fragments, unread
 
 
 def _handle_query_calls(func) -> list[ast.Call]:
@@ -1085,12 +1259,21 @@ def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
     """The #9063 note must cite the two SYMBOLS, never a line number.
 
     NON-VACUITY: the note as first committed carried `(sdk.py:23143)` and
-    `(sdk.py:23531)`, so a `sdk.py:<n>` anchor in the `_UNRESOLVED` block reds
-    this test. The positive half is what makes the note verifiable at all: both
-    function names must appear, because the symbol is the only anchor that
-    survives `sdk.py` moving under it.
+    `(sdk.py:23531)`, so a `sdk.py:<n>` anchor anywhere in the block reds this
+    test (including the SAME note with the correct numbers — the class, not the
+    stale instance).
+
+    The positive half asserts on the COMMENT lines only, and requires the
+    function and its read shape on the SAME line. Both halves are measured: the
+    two names are also literal members of the set and are mentioned again in the
+    dedupe note, so a whole-block check passed with the citation gutted
+    ("the calibration reader — `MATCH … OPTIONAL MATCH … RETURN`").
     """
     block = _unresolved_block_source()
+    note = _comment_lines(block)
+    assert note.strip(), (
+        "the `_UNRESOLVED` block carries no comment lines — the hand-check note "
+        "this test guards is gone, so nothing explains why those rows are there")
     anchors = _SDK_LINE_ANCHOR.findall(block)
     assert not anchors, (
         "the `_UNRESOLVED` hand-check note cites sdk.py by LINE NUMBER "
@@ -1098,12 +1281,19 @@ def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
         "into a pointer at whatever function happens to hold that line now "
         "(measured on this note: 268 lines off, landing in a writer). Cite the "
         "function by NAME — the symbol is authoritative, the number is not:"
-        f"\n  {block}")
-    missing = [name for name, _shape in _CALIBRATION_READERS if name not in block]
-    assert not missing, (
-        "the note no longer names the function(s) it is the hand-check FOR "
-        f"({missing}) — without the symbol the note anchors at nothing and a "
-        "reader cannot re-verify it, which is exactly how it rotted before")
+        f"\n  {note}")
+    lines = note.splitlines()
+    uncited = [
+        name for name, shape in _CALIBRATION_READERS
+        if not any(name in line and shape in line for line in lines)]
+    assert not uncited, (
+        f"the NOTE no longer cites {uncited} with the read shape it claims — the "
+        "citation must be one comment line naming the FUNCTION and its shape "
+        "(a bare set member is not a citation: every name here is also a "
+        "literal member of the set, so the note can be gutted while the check "
+        "still passes if it looks at the whole block). Without that, the note "
+        "anchors at nothing and a reader cannot re-verify it — which is exactly "
+        f"how it rotted before:\n  {note}")
 
 
 def test_the_calibration_readers_assemble_no_write_clause():
@@ -1115,9 +1305,21 @@ def test_the_calibration_readers_assemble_no_write_clause():
     one of them reds HERE (and forces the row to be re-examined) instead of
     rotting the note into a false claim.
 
-    Every fragment that can reach the assembled statement is inspected, because
-    the reason the census could not settle these is that the `WHERE` text is
-    built in a LOCAL and interpolated — the same indirection is followed here.
+    NON-VACUITY (each injection was run and reds): a `SET n.poked = 1` spliced
+    into the query literal; into the `where` local; APPENDED with
+    `query += " DETACH DELETE n"` (the form `_uncalibrated_ep_participants`
+    actually uses for its `LIMIT`); hidden in a module-level constant the
+    `where` interpolates; spliced into `_strip_whitespace`'s returned f-string
+    (a helper reached by name and followed into its own module); a second handle
+    call; removing the `OPTIONAL MATCH` the note names; an injected
+    `self.set_point_baseline(...)` call. Counter-case, also run: `{"reason":
+    "MERGE"}` in the statement's PARAMETER dict stays GREEN — bind data is not
+    Cypher, and a check that followed it would red a read-only row.
+
+    WHAT THIS DOES NOT PROVE: a fragment assembled by a helper reached only
+    through an attribute (`obj.method()`) or from a module OUTSIDE `tortoise/`
+    is not followed. Anything it cannot resolve is refused by NAME rather than
+    skipped, so a blind spot cannot be inherited silently.
     """
     module = ast.parse(SDK_PY.read_text(), str(SDK_PY))
     functions = {node.name: node for node in ast.walk(module)
@@ -1135,7 +1337,9 @@ def test_the_calibration_readers_assemble_no_write_clause():
                 "`<handle>.query(...)` call(s) — re-check the row before "
                 "trusting either")
             continue
-        assembled = " ".join(_assembled_statement_fragments(func, calls[0]))
+        fragments, unread = _assembled_statement_fragments(
+            module, SDK_PY, func, calls[0])
+        assembled = " ".join(fragments)
         write = _WRITE_CLAUSE_RE.search(assembled)
         if write:
             offenders.append(
@@ -1154,6 +1358,11 @@ def test_the_calibration_readers_assemble_no_write_clause():
             offenders.append(
                 f"{name}: CALLS `set_point_baseline` — the note says it only "
                 "names it in advice strings, so this row DOES write")
+        if unread:
+            offenders.append(
+                f"{name}: {sorted(unread)} could not be read out of the "
+                "statement at all, so this check cannot say the row is a read "
+                "— resolve them, or extend the resolver and say why")
     assert not offenders, (
         "the hand-check note above `_UNRESOLVED` no longer matches the code it "
         "describes — fix the note, or move the row out of that inventory:\n  "
