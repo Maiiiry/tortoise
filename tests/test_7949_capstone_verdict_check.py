@@ -621,6 +621,31 @@ def test_a_non_iterable_steps_observed_does_not_crash_a_green_row():
     assert "V5" in codes, codes
 
 
+def test_an_unhashable_criterion_in_the_outer_row_is_a_V6_finding_not_a_traceback():
+    """REGRESSION (#9089 review): the THIRD site of the unhashable-criterion shape.
+
+    V2's census and V6's ``cited_ids`` both filter a ``criterion`` down to
+    hashable scalars — but ``cid`` in ``if cid not in cited_ids`` is the OUTER
+    row's value, used as a SET MEMBER, and it was never guarded. So a row whose
+    criterion is ``["E5"]`` raised ``TypeError: unhashable type: 'list'`` out of
+    ``check()``; ``main()`` has no handler, so the tool exited **1** — the code
+    documented as "the table has findings", i.e. a verdict ON THE EVIDENCE —
+    while the artifact was merely malformed. That is the exact failure mode the
+    module's own comments call out on the two peer sites.
+
+    Non-vacuity: `["E5"] not in {...}` raises, so on the pre-fix tool this call
+    errored instead of returning findings (measured: ``TypeError: unhashable
+    type: 'list'``). The row now gets the same "no cited log can carry it"
+    finding the cited-log arm already produces for a row name that is not one.
+    """
+    rec = _record()
+    rec["rows"][4]["criterion"] = ["E5"]
+    findings = cvc.check(rec, repo=_REPO, require_green=False)
+    v6 = [m for code, _w, m in findings.items if code == "V6"]
+    assert v6, findings.render()
+    assert "not a row name" in v6[0], findings.render()
+
+
 def test_an_unhashable_sibling_does_not_crash_the_denominator_check():
     """REGRESSION (#9089 review): `by_id.get(sib)` with an unhashable sibling
     raised TypeError out of `check()` — exit 1 on a traceback.

@@ -101,6 +101,15 @@ _BLOCKER_RE = re.compile(r"^#\d+$")
 #: derived from one list rather than repeated per call site.
 _BLOCK_KEYS = ("run", "prereg", "corpus")
 
+#: The scalar types a row name may have. A ``criterion`` / ``sibling`` that is a
+#: LIST or DICT is UNHASHABLE, so using it as a set member or dict key raises
+#: TypeError out of ``check()`` — an escape that ``main()`` has no handler for,
+#: so it exits 1, the code for "the table has findings" (a verdict on the
+#: EVIDENCE) when the artifact was merely malformed. Declared once so the guard
+#: cannot be remembered on three sites of the same shape and forgotten on a
+#: fourth (#9089 review).
+HASHABLE_SCALARS = (str, int, float, bool, type(None))
+
 
 def _count(value: object) -> bool:
     """An INTEGER count — never a bool (#9089 review).
@@ -292,7 +301,7 @@ def check(record: dict, *, repo: Path,
     # for "the table has findings". Only hashable scalars take part.
     seen = [r.get("criterion") for r in rows
             if isinstance(r, dict)
-            and isinstance(r.get("criterion"), (str, int, float, bool, type(None)))]
+            and isinstance(r.get("criterion"), HASHABLE_SCALARS)]
     for criterion in CRITERIA:
         n = seen.count(criterion)
         if n == 0:
@@ -326,7 +335,7 @@ def check(record: dict, *, repo: Path,
 
     by_id = {r.get("criterion"): r for r in rows
              if isinstance(r, dict)
-             and isinstance(r.get("criterion"), (str, int, float, bool, type(None)))}
+             and isinstance(r.get("criterion"), HASHABLE_SCALARS)}
 
     for row in rows:
         if not isinstance(row, dict):
@@ -513,13 +522,27 @@ def check(record: dict, *, repo: Path,
                         r.get("criterion")
                         for r in (cited_rows if isinstance(cited_rows, list) else [])
                         if isinstance(r, dict)
-                        and isinstance(r.get("criterion"),
-                                       (str, int, float, bool, type(None)))}
+                        and isinstance(r.get("criterion"), HASHABLE_SCALARS)}
                 except (OSError, ValueError, json.JSONDecodeError):
                     f.add("V6", where, f"evidence_kind='refusal' must cite a "
                                        f"capstone log; {evidence!r} is not one")
                 else:
-                    if cid not in cited_ids:
+                    # ⛔ `cid` is the OUTER row's criterion — and it is a SET
+                    # MEMBER here, `cid not in cited_ids`. Both peer sites of
+                    # this shape (the V2 census and `cited_ids` above) filter
+                    # to hashable scalars; this third one did not, so a row
+                    # whose criterion is `["E5"]` raised
+                    # `TypeError: unhashable type: 'list'` out of `check()` and
+                    # `main()` has no handler — exit **1**, documented as "the
+                    # table has findings", i.e. a verdict on the EVIDENCE,
+                    # when the artifact was merely malformed (#9089 review).
+                    # Reported here instead, in the same words the cited-log
+                    # arm already uses for a row name no log can carry.
+                    if not isinstance(cid, HASHABLE_SCALARS):
+                        f.add("V6", where, f"criterion {cid!r} is a "
+                                           f"{type(cid).__name__}, not a row "
+                                           "name — no cited log can carry it")
+                    elif cid not in cited_ids:
                         f.add("V6", where, f"the cited log {evidence!r} does "
                                            f"not carry a {cid} row")
 
