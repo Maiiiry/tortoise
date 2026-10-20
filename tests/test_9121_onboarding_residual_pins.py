@@ -899,10 +899,13 @@ def test_every_eager_init_site_issues_its_statement_on_the_escape_three_handle()
     residual cannot be closed in code while the docstrings still describe it.
     """
     # Driven by the SAME finder and population as the inventory (#9150 review,
-    # P2): a site this pin cannot see is a site it silently certifies.
-    for rel in sorted(
-        str(p.relative_to(_REPO)) for p in (_REPO / "tortoise").rglob("*.py")
-    ):
+    # P2): a site this pin cannot see is a site it silently certifies. The
+    # population is `_scanned_modules()` — the SAME pinned helper the inventory
+    # uses, not a second inline `rglob` (#9150 review cycle 12, P2): while this
+    # loop spelled its own sweep, narrowing it to the two modules that hold
+    # today's sites left every pin green, so the module docstring's "a site
+    # MIGRATED off `select_graph` fails this pin" was true only for those two.
+    for rel in _scanned_modules():
         tree, parents = _parse(rel)
         for node, _call, targets in _eager_init_calls(tree):
             enclosing = _enclosing_function(node, parents)
@@ -1061,6 +1064,19 @@ def test_the_rebinding_rule_covers_every_binding_form():
         "match_capture": """
             match val:
                 case graph:
+                    graph.query(_init_q, params=_init_p)
+        """,
+        # The two other capture forms the arm handles (#9150 review cycle 12,
+        # P2: without these, dropping `MatchStar`/`MatchMapping` from `_bindings`
+        # left every pin green).
+        "match_star": """
+            match val:
+                case [*graph]:
+                    graph.query(_init_q, params=_init_p)
+        """,
+        "match_mapping": """
+            match val:
+                case {**graph}:
                     graph.query(_init_q, params=_init_p)
         """,
         # The handle's own declaration form, rebound: an annotated assignment.
@@ -1420,12 +1436,60 @@ def test_a_delegating_opener_joins_both_populations():
                 return _run(proj, cypher)
             """
         )),
+        # The ATTRIBUTE spelling, on both sides of the derivation (#9150 review
+        # cycle 12, P2: each `or getattr(..., "attr", None)` branch could be
+        # deleted with every pin green).
+        "synthetic/attribute.py": ast.parse(textwrap.dedent(
+            """
+            def _qualified_scope(reason: str = "qualified"):
+                return projection._cache_write_authorized(reason)
+
+            def _qualified_forwarder(reason: str = "fwd"):
+                return guard._qualified_scope(reason)
+            """
+        )),
+        # …and MULTI-HOP delegation, which is what "TRANSITIVE" in the fixpoint
+        # docstring claims: `_top` reaches the primitive through two levels.
+        "synthetic/multihop.py": ast.parse(textwrap.dedent(
+            """
+            def _mid_scope(reason: str = "mid"):
+                return _base_write_scope(reason)
+
+            def _top_scope(reason: str = "top"):
+                return _mid_scope(reason)
+            """
+        )),
+        # The DETECTOR half of the attribute spelling (#9150 review cycle 12,
+        # P2): a door that spells the primitive as an attribute is seen only by
+        # `_declares_directly()`, so without this the `attr` branch of THAT
+        # helper could be deleted with both populations still green.
+        "synthetic/attribute_door.py": ast.parse(textwrap.dedent(
+            """
+            def _qualified_door(proj, cypher):
+                with projection._cache_write_authorized("qualified"):
+                    return proj.g.query(cypher)
+            """
+        )),
     }
     derived = _openers_in(trees)
     assert ("synthetic/direct.py", "_base_write_scope") in derived, derived
     assert ("synthetic/delegating.py", "_future_lane_write_scope") in derived, (
         "the opener derivation still requires a DIRECT `_cache_write_authorized` "
         f"call, so a delegating opener is invisible to both populations: {derived}"
+    )
+    assert ("synthetic/attribute.py", "_qualified_scope") in derived, (
+        "an opener that spells the primitive as an ATTRIBUTE "
+        "(`projection._cache_write_authorized(...)`) is invisible to both "
+        f"populations: {derived}"
+    )
+    assert ("synthetic/attribute.py", "_qualified_forwarder") in derived, (
+        "a forwarder that spells the opener as an ATTRIBUTE "
+        f"(`guard._qualified_scope(...)`) is invisible to both populations: {derived}"
+    )
+    assert ("synthetic/multihop.py", "_mid_scope") in derived, derived
+    assert ("synthetic/multihop.py", "_top_scope") in derived, (
+        "the delegation fixpoint is not TRANSITIVE: `_top_scope` reaches "
+        f"`_cache_write_authorized` through `_mid_scope`, and is missing: {derived}"
     )
     assert ("synthetic/delegating.py", "_not_an_opener") not in derived, (
         "a DOOR (a function that merely calls an opener inside a `with`) was "
@@ -1455,6 +1519,14 @@ def test_a_delegating_opener_joins_both_populations():
     # `with`s an OPENER, whose name is already in this population, so
     # `_declaring_functions()` matches that `with` as it stands.)
     detector = _openers_in(trees, opener_only=False)
+    assert ("synthetic/attribute_door.py", "_qualified_door") in detector, (
+        "a door that spells the primitive as an ATTRIBUTE is invisible to the "
+        f"DETECTOR population, so a `with` over it can never be matched: {detector}"
+    )
+    assert ("synthetic/attribute_door.py", "_qualified_door") not in derived, (
+        "a DOOR was collected as an OPENER because its primitive call is spelled "
+        f"as an attribute: {derived}"
+    )
     for key in (("synthetic/door.py", "_run"),
                 ("synthetic/door.py", "_forward_to_door")):
         assert key in detector, (
@@ -1674,11 +1746,13 @@ def test_a_diff_to_the_note_itself_selects_this_file():
     this_file = Path(__file__).name
     missing: dict[str, list[str]] = {}
     subjects = [
-        # every module the suite PARSES — derived, so a new module is covered the
-        # day it is added rather than the day someone remembers this tuple.
-        str(p.relative_to(_REPO))
-        for p in sorted((_REPO / "tortoise").rglob("*.py"))
-    ] + [
+        # every module the suite PARSES — `_scanned_modules()`, the SAME pinned
+        # helper the inventory sweep uses, so this population cannot be narrowed
+        # without reding `test_the_inventory_scan_sweeps_every_module` (#9150
+        # review cycle 12, P2: an inline copy of the `rglob` here was
+        # revertible to the literal tuple this docstring says it replaced,
+        # silently un-pinning the `ep` arm's justification).
+        *_scanned_modules(),
         # read by the sibling-population pin below (a suite that pins the same
         # mint path), so a diff there must run this file too (#9150 review P2).
         "tests/test_write_ahead_mint.py",
