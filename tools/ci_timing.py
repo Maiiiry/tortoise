@@ -1754,6 +1754,32 @@ def refresh_durations(manifest_path: Path, weights: dict[str, float],
 
 # --- history / flakes -------------------------------------------------------
 
+def _holds_measurements(json_path: Path) -> bool:
+    """Does the artifact already hold measurements this render could destroy?
+
+    A history-only seed carries no `files`/`outcome`, so a log-less render may
+    still write over it; a real artifact does, and a zeroed rewrite would replace
+    measured numbers with zeros (#9134 review cycle 5). Tolerant by design: an
+    unreadable artifact is treated as holding nothing, matching `load_history`'s
+    "a seed is a nice-to-have" contract.
+    """
+    if not json_path.exists():
+        return False
+    try:
+        data = json.loads(json_path.read_text())
+    except (OSError, ValueError, RecursionError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("files"):
+        return True
+    outcome = data.get("outcome")
+    return isinstance(outcome, dict) and any(
+        isinstance(outcome.get(key), int) and outcome[key] > 0
+        for key in COUNT_KEYS
+    )
+
+
 def load_history(json_path: Path) -> list[dict]:
     """Prior samples from the tool's OWN artifact, or [] if it is unusable.
 
@@ -2175,6 +2201,28 @@ def main() -> int:
         "failed_tests": sorted(failed_tests),
     }
     previous = load_history(json_path)
+    # A render that read NO logs is not a measurement, and must not overwrite one.
+    # When `pick_run` re-picks an already-sampled run whose artifacts have
+    # expired, `--logs-dir` is empty: `outcome`, `files` and `failed_tests` all
+    # come from THIS render's logs, so the artifact would be rewritten with
+    # `failed: 0 / passed: 0` beside a history row that still reports the measured
+    # failures — two numbers for one run, and the CI step reports success. The
+    # history guard below cannot catch it because the damage is in the TOP-LEVEL
+    # parts. Refuse instead: an unmeasured render keeps what was measured.
+    # Reachable in CI: ci-timing.yml fails only when artifacts were EXPECTED and
+    # none arrived, so an expired run proceeds into this path.
+    #
+    # The refusal is limited to an artifact that actually HOLDS measurements
+    # (`files`/`outcome`), so a history-only seed — and a first render into an
+    # empty directory — still writes what it can.
+    if not log_sources and _holds_measurements(json_path):
+        print(
+            "::warning::no pytest logs found, so this render measured nothing — "
+            "keeping the existing artifact instead of overwriting it with zeros",
+            file=sys.stderr,
+        )
+        return 0
+
     # A re-render of an ALREADY SAMPLED run must replace its row, not stack a
     # second one: the two rows describe the same run with whatever the generator
     # said at each time, so a corrected re-render left the stale copy beside it
@@ -2192,12 +2240,11 @@ def main() -> int:
     # picked) carries no run identity at all, so identical rows would otherwise
     # accumulate up to `--max-history` and evict real samples.
     if run_id:
-        already = any(e.get("run_id") == run_id for e in previous)
-        if log_sources or not already:
-            history = [row] + [e for e in previous if e.get("run_id") != run_id]
-        else:
-            history = previous
+        history = [row] + [e for e in previous if e.get("run_id") != run_id]
     else:
+        # `--run-id ""` (what ci-timing.yml calls when no run is picked) carries
+        # no run identity, so identical rows would otherwise accumulate up to
+        # `--max-history` and evict real samples. One no-run row at most.
         history = [row] + [e for e in previous if e.get("run_id")]
     history = history[: args.max_history]
 

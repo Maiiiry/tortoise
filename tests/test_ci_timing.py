@@ -3797,6 +3797,24 @@ def test_the_committed_artifact_agrees_with_its_own_failure_detail() -> None:
             f"(attributed, outcome): {unattributable}"
         )
 
+    # The sampled run's history row and the top-level `outcome` describe ONE
+    # measurement, so they may not disagree. A log-less re-render used to write
+    # `outcome.failed: 0` beside a history row of 6: the history guard saw nothing
+    # because the damage was in the top-level parts (#9134 review cycle 5).
+    sampled = artifact.get("sampled_run", {}).get("run_id")
+    same_run = [e for e in history if sampled is not None and e.get("run_id") == sampled]
+    if same_run and outcome:
+        row_counts = same_run[0].get("counts", {})
+        disagreed = {
+            k: (row_counts[k], outcome.get(k))
+            for k in row_counts
+            if k in outcome and row_counts[k] != outcome[k]
+        }
+        assert not disagreed, (
+            "the sampled run's history row and the artifact outcome disagree "
+            f"(history, outcome): {disagreed}"
+        )
+
 
 def test_log_sources_name_the_leg_not_just_the_file(tmp_path: Path) -> None:
     """Two legs both upload a file called `pytest.log`; they must stay distinct.
@@ -3859,6 +3877,46 @@ def test_a_logless_re_render_must_not_erase_a_measured_row(tmp_path: Path, fake_
     assert after["history"][0]["counts"]["failed"] == 1, (
         "a log-less re-render overwrote a measured row with zeros"
     )
+    # ...and the TOP-LEVEL parts, which are computed from THIS render's logs,
+    # must not be zeroed either: otherwise the artifact reports `failed: 0` above
+    # a history row that reports 6, and no history guard can see it (#9134 review
+    # cycle 5). The whole render is refused instead.
+    assert after["outcome"]["failed"] == 1, (
+        f"a log-less re-render zeroed the outcome: {after['outcome']}"
+    )
+    assert after["files"], "a log-less re-render erased the per-file measurements"
+    assert after["failed_tests"] == measured["failed_tests"]
+
+
+def test_a_logless_no_run_render_must_not_erase_a_measured_row(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """The no-run path is refused on the same terms as a sampled run.
+
+    `--run-id ""` with logs records a `run_id: null` row; a second invocation with
+    an empty logs dir used to REPLACE it, because that branch dropped every
+    falsy-id row unconditionally. The result was `[(None, 1)]` becoming
+    `[(None, 0)]` — a measured sample replaced by a render that measured nothing
+    (#9134 review cycle 5).
+    """
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")
+    tools = Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"
+    out = tmp_path / "out"
+    empty_logs = tmp_path / "no-logs"
+    empty_logs.mkdir()
+    cmd = [sys.executable, str(tools), "--repo", "daniel-ospina/tortoise", "--run-id", "",
+           "--out-dir", str(out)]
+
+    subprocess.run([*cmd, "--logs-dir", str(tmp_path / "logs")],
+                   capture_output=True, text=True, check=True)
+    assert json.loads((out / "ci-timing.json").read_text())["outcome"]["failed"] == 1
+
+    subprocess.run([*cmd, "--logs-dir", str(empty_logs)],
+                   capture_output=True, text=True, check=True)
+    after = json.loads((out / "ci-timing.json").read_text())
+    assert len(after["history"]) == 1, [(e.get("run_id"), e["counts"]["failed"]) for e in after["history"]]
+    assert after["history"][0]["counts"]["failed"] == 1
+    assert after["outcome"]["failed"] == 1, after["outcome"]
 
 
 def test_no_run_renders_do_not_accumulate_identical_rows(tmp_path: Path, fake_env: Path) -> None:
