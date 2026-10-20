@@ -12140,8 +12140,10 @@ class TortoiseSDK:
         # `:GraphEvent` store's statement of what this call DID (hence the
         # unconditional `deleted: true` marker), so stating it before the
         # `DETACH DELETE` would publish a destruction that may not happen. An
-        # append that fails now raises above, so no subscriber row is published
-        # for a destruction the journal could not record.
+        # append that refuses (or that LANDS and then raises — the record is then
+        # UNCONFIRMED, never known-absent, #5612) leaves this line unreached, so
+        # no subscriber row is published for a destruction whose record this call
+        # cannot confirm.
         self._emit_event("PointRetracted", _deleted_point_payload(id))
         # Tag GC (#485): delete orphaned :Tag nodes (no incoming TAGGED edges).
         # Idempotent — DETACH DELETE leaves count-0 tags behind that would
