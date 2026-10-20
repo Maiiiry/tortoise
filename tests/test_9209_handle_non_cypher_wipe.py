@@ -74,8 +74,8 @@ import pytest
 from tortoise.projection import (
     DirectCacheWriteRefused,
     FalkorProjection,
-    _GuardedGraph,
     _command_payload_is_unreadable,
+    _GuardedGraph,
     _handle_command_text,
     _handle_command_words,
     _is_bulk_wipe,
@@ -912,8 +912,15 @@ def test_a_buffer_command_word_is_classified_not_forwarded(sdk_with_journal, hea
     response-callback lookup: a refusal-shaped traceback on top of a completed
     deletion.
 
-    MUTATION: drop the ``memoryview`` branch from `_handle_command_text` and this
-    fails with DID NOT RAISE (the wipe lands, and the count is 0).
+    MUTATION: drop the ``memoryview`` branch from `_handle_command_text` AND
+    restore the old ``if command is None: return`` pass-through in
+    `_refuse_key_space_handle_command` — MEASURED, this and the sibling
+    graph-delete case go RED (7/7 buffer cases DID NOT RAISE, count 2 → 0).
+    Either change ALONE leaves the suite green, and that is the honest shape:
+    the decoder branch and the fail-closed refusal are two INDEPENDENT reasons
+    the wipe cannot land, so no single mutation can be claimed for this case.
+    The decode itself is pinned directly by the unit case above, which no
+    refusal can stand in for.
     """
     proj = sdk_with_journal._get_proj()
     before = _count(proj)
@@ -924,18 +931,49 @@ def test_a_buffer_command_word_is_classified_not_forwarded(sdk_with_journal, hea
     )
 
 
-@pytest.mark.parametrize("head", [*_BUFFER_HEADS, memoryview(b"GRAPH.DELETE")])
-def test_a_buffer_graph_delete_is_classified_too(sdk_with_journal, head):
+#: Each buffer head with the DOOR that must refuse it. The door is asserted, not
+#: just the exception: it is what makes the ``head`` parameter load-bearing. A
+#: ``DEL`` spelling destroys this graph through its redis KEY, so the key-space
+#: door has to be the one that answers; ``GRAPH.DELETE`` is the whole-graph
+#: door. A hardcoded head (the defect this case was fixed from) sent
+#: ``GRAPH.DELETE`` for every case, so the three ``DEL`` rows below would fail
+#: their door assertion instead of passing on a refusal from the wrong door.
+_BUFFER_GRAPH_DELETE_CASES = [
+    (memoryview(b"DEL"), "key-space command"),
+    (memoryview(b"del"), "key-space command"),
+    (memoryview(bytearray(b"DEL")), "key-space command"),
+    (memoryview(b"GRAPH.DELETE"), "destroys the WHOLE graph"),
+]
+
+
+@pytest.mark.parametrize(
+    "head, door",
+    _BUFFER_GRAPH_DELETE_CASES,
+    ids=["DEL", "del", "bytearray-DEL", "GRAPH.DELETE"],
+)
+def test_a_buffer_graph_delete_is_classified_too(sdk_with_journal, head, door):
     """The same decoding hole on the graph-delete spelling.
 
     ``execute_command(memoryview(b"GRAPH.DELETE"), <own graph>)`` deleted the
     graph; the measure is the one in `_handle_command_text`'s docstring.
+
+    ``head`` is SENT, not decoration: a previous version hardcoded the
+    ``GRAPH.DELETE`` buffer and parametrised anyway, so the three ``DEL``
+    spellings below were advertised and never exercised, and four cases were
+    byte-identical repeats of one. Every case now reaches the door its own
+    spelling earns — three through the key-space door (``memoryview(b"DEL")`` /
+    ``b"del"`` / a bytearray ``DEL`` on this graph's own key) and one through the
+    ``GRAPH.DELETE`` door — and every one of them dispatched at the pre-#9209
+    head (the decoder read only ``bytes``/``bytearray``, and an unclassifiable
+    command was forwarded), so the case is RED in each spelling there —
+    MEASURED: with that decoder and the old ``if command is None: return``
+    restored, 4/4 go DID NOT RAISE.
     """
     proj = sdk_with_journal._get_proj()
     before = _count(proj)
-    with pytest.raises(DirectCacheWriteRefused):
-        proj.g.execute_command(memoryview(b"GRAPH.DELETE"), proj._graph_name)
-    assert _count(proj) == before
+    with pytest.raises(DirectCacheWriteRefused, match=door):
+        proj.g.execute_command(head, proj._graph_name)
+    assert _count(proj) == before, "a buffered command destroyed the cache"
 
 
 def test_a_buffer_TARGET_cannot_walk_past_the_target_check():

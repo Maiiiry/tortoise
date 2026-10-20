@@ -108,9 +108,12 @@ def _wire_reaching_calls(func) -> set[str]:
     # an empty set, so a one-line refactor defeated the claim it enforces. Any
     # local assigned FROM a root is a root.
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name | ast.Attribute):
-            if ast.unparse(node.value) in roots:
-                roots |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name | ast.Attribute)
+            and ast.unparse(node.value) in roots
+        ):
+            roots |= {t.id for t in node.targets if isinstance(t, ast.Name)}
     found = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
