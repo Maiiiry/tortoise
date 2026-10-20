@@ -3568,8 +3568,11 @@ def _prewipe_restore_write_scope(reason: str):
     Handing them the replay permit would authorize
     them under a contract that is FALSE for them, which is what `#9210`
     removes: the restore is now a NAMED declaration, so "which writes are
-    authorized by replay" stays answerable, and a future addition to that
-    engine has to choose a lane instead of inheriting one.
+    authorized by replay" stays answerable for every restore statement that
+    exists. ⚠️ That last clause is bounded by the mechanism, not by intent:
+    the funnel is VOLUNTARY — a future restore added to that engine as a bare
+    `self.g.query(...)` still inherits `"replay"`, which is the residual the
+    bullet list below states in full.
 
     What it claims, and what it does NOT:
 
@@ -3592,7 +3595,20 @@ def _prewipe_restore_write_scope(reason: str):
       pre-wipe capture and FOLDING them (`events = list(synthetic_events) +
       journal_events`), so that half is authorized by whatever permit the
       caller opened over the engine (`"replay"` under the `#9124`/`#9213`
-      shape), not by this lane. Disclosed, not claimed.
+      shape), not by this lane. Disclosed, not claimed;
+    * **it is VOLUNTARY, so "a future addition has to choose a lane" is a
+      convention, not a gate.** `_rebuild_all_replay` is under a method-wide
+      `_replay_write_scope()` (`#9213`), and nothing forces it to route a
+      restore statement through `_restore_write`. A twelfth restore added as a
+      bare `self.g.query(...)` tomorrow is authorized as `"replay"` — exactly
+      the false contract this lane removes — and `_LEGS` cannot see it, because
+      a table of the eleven statements that exist says nothing about a
+      twelfth. Enforced only as far as the pin reaches: the whole-property-map
+      shape every restore leg uses (`… SET <alias> += $props`) is matched by
+      SHAPE, table-independently, and reds on its reason; every other restore
+      shape (a `SET <alias>.<field> = $param` link, a bare edge `MERGE`) is
+      caught only while it stays in the table. The unbounded guarantee needs
+      `#9124`'s handle guard armed — nothing here claims it today.
 
     WHERE THE WATERMARK'S DECLARATION LIVES — at the write, in
     `tortoise/event_store.py`. That leg's statement is in another module, so a
@@ -9922,19 +9938,38 @@ class FalkorProjection(
         back at the handle. See `_prewipe_restore_write_scope` for the
         contract (state captured from THIS graph, not a journal replay).
 
-        ⚠️ **The funnel is not literally exhaustive, and the ONE exception is
-        named so it is not read as one.** The `:GraphEventMeta` watermark is
-        restored by `event_store.reestablish_watermark` (two probe reads + one
-        `MERGE` in ANOTHER module), so the declaration cannot be a `with` here
-        — the helper's own scope would shadow it. It is therefore stated by
-        handing that helper THIS lane's reason (`restore_reason=…`, #9210): the
-        lane still sits at the write, inside `event_store.py`, which is what
-        `#9124`'s rule requires and what `#9224` asserted for its other caller.
-        Consequence to keep in view: a write a future edit adds INSIDE that
-        helper inherits the lane its caller stated rather than this funnel's
-        required-`reason` contract, so `tests/test_9210_rebuild_declares_restore.py`
-        classifies the watermark's `MERGE` by its own fragment and
-        `tests/test_9124_declared_live_doors.py` pins the module's opener.
+        ⚠️ **The funnel is VOLUNTARY, and its exceptions are named so neither
+        is read as covered.** Two of them, and the second one is not bounded:
+
+        1. the `:GraphEventMeta` watermark is restored by
+           `event_store.reestablish_watermark` (two probe reads + one `MERGE`
+           in ANOTHER module), so the declaration cannot be a `with` here —
+           the helper's own scope would shadow it. It is therefore stated by
+           handing that helper THIS lane's reason (`restore_reason=…`, #9210):
+           the lane still sits at the write, inside `event_store.py`, which is
+           what `#9124`'s rule requires and what `#9224` asserted for its
+           other caller. A write a future edit adds INSIDE that helper
+           inherits the lane its caller stated rather than this funnel's
+           required-`reason` contract, so
+           `tests/test_9210_rebuild_declares_restore.py` classifies the
+           watermark's `MERGE` by its own fragment and
+           `tests/test_9124_declared_live_doors.py` pins the module's opener.
+        2. **NOTHING makes `_rebuild_all_replay` call this method.** It is a
+           helper the eleven known restore statements happen to use, not a
+           gate they must pass: a restore statement added tomorrow as a bare
+           `self.g.query(...)` compiles, runs, and is authorized by the
+           enclosing method-wide `_replay_write_scope()` — i.e. it inherits
+           the very false contract this lane removes. `_LEGS` pins the eleven
+           statements that exist, so it cannot see a twelfth. What DOES bite
+           today is the table-independent half of the pin: a bare restore
+           written in the whole-property-map shape every restore leg uses
+           (`… SET <alias> += $props`) is caught by SHAPE, with no table
+           entry, and goes red on the reason (`"replay"`). Read this as "the
+           restore statements we have are declared, and the map-shaped ones
+           cannot be silently un-declared", NOT as "`rebuild_all` can no
+           longer authorize an undeclared restore". That guarantee needs
+           `#9124`'s handle guard armed. `_prewipe_restore_write_scope`
+           states the same residual where the claim is made.
         """
         with _prewipe_restore_write_scope(reason):
             return self.g.query(cypher, params=params)

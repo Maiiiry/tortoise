@@ -60,13 +60,31 @@ site, and the helper falls back to `#9224`'s `"replay"` — red on the observed
 reason, which is how the trampoline this PR removes was caught.
 
 WHAT THIS DOES NOT COVER — the disclosed residual, so it is not read as
-covered by the properties above: `rebuild_all` also carries graph-only Points
-back by building `synthetic_events` from the same pre-wipe capture and FOLDING
-them, so that half is authorized by whatever permit the caller opened over the
-engine — `"replay"` under `#9124`/`#9213` — and not by this lane. (The
-watermark, which HAD been left outside the pin, is claimed again: its lane is
-now handed to the helper and opened inside it, which is what makes the leg
-truthful rather than deferred.)
+covered by the properties above. THREE things, and the third is not bounded:
+
+1. `rebuild_all` also carries graph-only Points back by building
+   `synthetic_events` from the same pre-wipe capture and FOLDING them, so that
+   half is authorized by whatever permit the caller opened over the engine —
+   `"replay"` under `#9124`/`#9213` — and not by this lane. (The watermark,
+   which HAD been left outside the pin, is claimed again: its lane is now
+   handed to the helper and opened inside it, which is what makes the leg
+   truthful rather than deferred.)
+2. writes an edit adds INSIDE `event_store.reestablish_watermark` inherit the
+   lane their caller stated, rather than the funnel's required-`reason`
+   contract.
+3. **the funnel is VOLUNTARY** — nothing makes `_rebuild_all_replay` route a
+   restore statement through `_restore_write`. A twelfth restore added as a
+   bare `self.g.query(...)` inherits the engine's method-wide `"replay"`, and
+   `_LEGS` cannot see it (a table of the eleven statements that exist says
+   nothing about a twelfth). What the pin DOES have, one pin below, is a
+   TABLE-INDEPENDENT half: a bare restore written in the whole-property-map
+   shape every restore leg uses (`… SET <alias> += $props`) is caught by
+   SHAPE, and `test_a_bare_restore_write_in_the_map_shape_is_caught` proves
+   that half bites by running the engine with the funnel bypassed. The other
+   restore shapes — a `SET <alias>.<field> = $param` link, a bare edge
+   `MERGE` — are caught only while they stay in the table. Closing the gap
+   for all shapes is `#9124`'s handle guard armed, not a test that claims to
+   have done it.
 
 Lane: either. The fixtures build the SDK the way the embedded carve-out suite
 does, and the bulk-wipe guard passes on the redirected `test_*_tortoise` graph
@@ -75,6 +93,7 @@ too, so this file needs no `carve_out` classification.
 from __future__ import annotations
 
 import os
+import re
 
 from tortoise.onboarding.state import (
     COMPLETED_STEP_EDGE,
@@ -259,6 +278,42 @@ def _leg_of(cypher: str) -> str | None:
     return None
 
 
+#: The whole-property-map ASSIGNMENT shape every restore leg uses to put a
+#: captured property set back (`MERGE (b:Batch {id:$id}) SET b += $props`,
+#: `MERGE (n:PackInstall {namespace:$identity}) SET n += $props`,
+#: `MERGE (m:TeamMeta) ON CREATE SET m += $props`). Matched WITHOUT the leg
+#: table on purpose: `#9210`'s residual is that the funnel is VOLUNTARY, so a
+#: pin that only knows the eleven classified statements cannot see a twelfth.
+#: MEASURED over a full `rebuild_all` run: this shape matches restore statements
+#: ONLY — the journal fold's own map write binds `$extra`, not `$props` — which
+#: is what lets it be a RULE here instead of one more table. Checked at source
+#: too: every `+= $props` statement in `tortoise/projection/__init__.py` is one
+#: of these restore legs, plus `_replay_log`'s `:TeamMeta` marker (another
+#: engine, never reached from `rebuild_all`). If a FUTURE non-restore write ever
+#: adopts the shape it must be exempted EXPLICITLY here — the alternative is a
+#: rule with a silent hole.
+_RESTORE_MAP_SHAPE = re.compile(r"\bSET \w+ \+= \$props\b")
+
+
+def _shape_violations(seen):
+    """Writes in the restore MAP SHAPE that carry no restore reason.
+
+    Table-independent by construction: the statement is classified by its
+    SHAPE, so a restore statement that is NOT in `_LEGS` is judged too — which
+    is the half `_leg_of` cannot reach. The reason it must not carry is the
+    engine's own `"replay"`, i.e. the false contract inherited by a write that
+    never declared itself.
+    """
+    out: list[tuple[str, str | None]] = []
+    for cypher, reason in seen:
+        if not _RESTORE_MAP_SHAPE.search(_norm(cypher)):
+            continue
+        if isinstance(reason, str) and reason.startswith(f"{RESTORE}:"):
+            continue
+        out.append((_norm(cypher)[:120], reason))
+    return out
+
+
 def _seed_prewipe_state(sdk, events):
     """Plant every class whose ONLY post-wipe carrier is the snapshot.
 
@@ -378,6 +433,19 @@ def _assert_every_leg_declares_itself(seen, *, context: str):
     assert not shared, (
         f"{context}: a reason must name ONE restore leg, not several — a "
         f"shared reason makes two legs interchangeable: {shared!r}")
+    # The TABLE-INDEPENDENT half: a capture-restore statement is recognized by
+    # its SHAPE, so a leg that is not in `_LEGS` — the residual `#9210` names,
+    # since the funnel is voluntary and a twelfth restore can be written as a
+    # bare `self.g.query(...)` — is still judged instead of silently absent from
+    # `observed`. Without this, `set(observed) == set(_LEGS)` above is satisfied
+    # by every KNOWN leg running while an unknown one rides `"replay"`.
+    shape_bad = _shape_violations(seen)
+    assert not shape_bad, (
+        f"{context}: a write in the snapshot-restore MAP SHAPE "
+        f"(`SET <alias> += $props`) ran WITHOUT a restore declaration, so it "
+        f"inherited the engine's replay permit — the false contract #9210 "
+        f"removes, on a statement the leg table does not classify "
+        f"(observed={shape_bad!r})")
 
 
 # ── the declaration ──────────────────────────────────────────────────────────
@@ -462,6 +530,65 @@ def test_an_outer_replay_permit_cannot_cover_a_restore_write(tmp_path,
 
         _assert_every_leg_declares_itself(
             seen, context="rebuild_all inside an outer _replay_write_scope()")
+    finally:
+        sdk.close()
+
+
+def test_a_bare_restore_write_in_the_map_shape_is_caught(tmp_path,
+                                                       monkeypatch):
+    """The pin's TABLE-INDEPENDENT half, and the proof that it bites.
+
+    This is the residual `#9210` discloses, made observable. The funnel is
+    VOLUNTARY: nothing makes `_rebuild_all_replay` route a restore statement
+    through `_restore_write`, so "the next restore has to declare itself" is a
+    convention while `_LEGS` — a table of the eleven statements that EXIST —
+    reads green on a twelfth that does not. The surviving half of the pin is
+    the SHAPE rule in `_shape_violations`.
+
+    What it does: runs the engine with the funnel BYPASSED — `_restore_write`
+    replaced by the bare `self.g.query(...)` it wraps, which is exactly what a
+    restore leg added tomorrow as a bare write looks like — and requires the
+    shape rule to red on the result, with the reason the bare write actually
+    inherits (`"replay"`, the false contract), not with `None`. Without this
+    half the rule could be a no-op and every other test here would stay green.
+
+    NOT RED on the pre-fix tree, and it cannot be: the bypass is SIMULATED
+    (the ablation), so the test pins a property that holds before and after the
+    fix. Its non-vacuity is the ablation assertion below, not a base-tree
+    failure. Coverage is honestly partial — the map shape catches
+    `SET <alias> += $props`, i.e. the shape every one of the eleven restore legs
+    uses; a restore written as a `SET <alias>.<field> = $param` link or a bare
+    edge `MERGE` is still caught only while it stays in `_LEGS`, until
+    `#9124`'s handle guard is armed.
+    """
+    from tortoise.projection import FalkorProjection
+
+    sdk, events = _mk_sdk(tmp_path)
+    try:
+        _, proj, _ = _seed_prewipe_state(sdk, events)
+        seen = _record_authorizations(monkeypatch)
+
+        def bare_restore(self, cypher, *, params=None, reason):
+            # The mutation `#9210`'s docstring names: a caller that reaches for
+            # `self.g.query` declares nothing, so the write falls back to the
+            # engine's method-wide `"replay"`.
+            return self.g.query(cypher, params=params)
+
+        monkeypatch.setattr(FalkorProjection, "_restore_write", bare_restore)
+
+        proj.rebuild_all(str(events), confirm_destructive=True)
+
+        violations = _shape_violations(seen)
+        assert violations, (
+            "the map-shape pin is VACUOUS: a full rebuild ran with the restore "
+            "funnel bypassed and NOT ONE write was flagged, so the rule that "
+            "is supposed to see an undeclared restore leg sees nothing")
+        reasons = {reason for _cypher, reason in violations}
+        assert reasons == {"replay"}, (
+            "a bypassed restore write must be observed under the engine's own "
+            "replay permit — that inherited `\"replay\"` IS the defect, so a "
+            f"`None` here means the ablation did not run where it claims: "
+            f"reasons={sorted(map(str, reasons))}")
     finally:
         sdk.close()
 
