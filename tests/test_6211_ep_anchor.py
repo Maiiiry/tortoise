@@ -22,15 +22,20 @@ every point the map gains and the reason ``max_hops=1`` "converges" while
 WHAT IS PINNED HERE, and why each test is discriminating:
 
 1. ``test_every_id_anchored_pass_query_is_planned_as_an_index_read`` — the
-   queries ``ep.py`` actually EMITS (captured off the graph handle, not
-   re-written in the test) plan through ``Node By Index Scan`` and contain no
-   ``Node By Label Scan``. Measured discriminating power, per statement:
-   removing the barrier reddens it at the seed neighbourhood, the plain-seed
-   direct-edge expansion, the bridge hop and Batch 1. At the two OR-split
-   sweeps and at Batch 3 the barrier is NOT what does the work — the endpoint
-   split (and, at Batch 3, the two-``MATCH`` form) anchors on its own — so the
-   barrier is kept at those three as the engine-6.0.0 predicate-drop guard
-   (#6976), not as a cost fix, and this file does not claim otherwise.
+   queries the four captured entry points of ``ep.py`` actually EMIT (captured
+   off the graph handle, not re-written in the test) plan through ``Node By
+   Index Scan`` and contain no ``Node By Label Scan``. (``run()``'s own
+   evidence-prewrite journal read is not captured and is not index-planned —
+   it names no label, so no per-label index can anchor it; #9304.) Measured
+   discriminating power, per site: removing
+   the barrier reddens it at the seed neighbourhood, the plain-seed direct-edge
+   expansion, the bridge hop, Batch 1 and — in the selector test — all four
+   **barriered** ``analyze.py`` legs. It does NOT redden it at three redundant
+   sites: the
+   cache's back-message sweep, the BFS undirected direct-edge sweep and Batch 3
+   anchor on their own (two-``MATCH`` / undirected forms), so the barrier is
+   kept there as the engine-6.0.0 predicate-drop guard (#6976), not as a cost
+   fix, and this file does not claim otherwise.
 2. ``test_the_hop_budget_tracks_the_frontier_not_the_graph`` — the cost half:
    the hop's traversal touches fewer records than the graph has edges, on a
    fixture whose background is deliberately much larger than the frontier.
@@ -51,10 +56,13 @@ WHAT IS PINNED HERE, and why each test is discriminating:
 4. ``test_the_operator_selection_queries_are_planned_as_index_reads`` — the
    operator selector in ``tortoise/analyze.py`` is the SAME defect class over
    the LARGEST id set of the pass (the whole operator frontier); all four of
-   its id-set legs are pinned, not just the viability query. Measured
-   ``All Node Scan (t)`` at 242.5 ms -> ``Node By Index Scan (op)`` at 12.6 ms
-   on the same fixture, and 1.4-1.5 s -> under 0.1 s for the whole selection
-   (best of 3).
+   its **barriered** id-set legs are pinned, not just the viability query — and
+   the same assertion also pins its three UNBARRIERED legs (the operator→target
+   expansion, the per-label draft filter and the forward direct-edge sweep),
+   which need no barrier because the pattern's own label anchors them.
+   Measured ``All Node Scan (t)`` at 242.5 ms -> ``Node By Index Scan (op)``
+   at 12.6 ms on the same fixture, and 1.4-1.5 s -> under 0.1 s for the whole
+   selection (best of 3).
 5. ``test_the_records_that_state_this_files_size_are_true`` — the manifest row
    that carries this file's ``durations`` weight states its test COUNT in the
    comment above it, and that count was wrong when it was written (#9282
