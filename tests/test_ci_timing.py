@@ -951,8 +951,9 @@ def test_a_partial_reading_cannot_lower_a_recorded_weight(tmp_path: Path) -> Non
     # (#9134 review, P2).
     assert ("test_surface_manifest.py: 199.1  # #9017 CI-junit 2026-10-18 "
             "(run 39165691659); was 180.7"
-            f" — {_LOWER_BOUND_LABEL}: top-15 saw 2 of 10 testcases = 36.0s, a "
-            "LOWER bound; kept 199.1") in text
+            f" — {_LOWER_BOUND_LABEL}: top-15 saw 2 of 10 testcases = 36.0s in "
+            "the largest single job (not summed across legs), a LOWER bound; "
+            "kept 199.1") in text
     assert ci_timing.validate_refreshed_manifest(text) == []
 
 

@@ -643,7 +643,7 @@ def declared_test_counts(keys, repo_root: Path) -> dict[str, int]:
     produced is a LOWER BOUND on the file's cost (see
     `render_refreshed_manifest`'s `coverage` parameter).
 
-    THREE LIMITS, stated because each of them is a direction this can be wrong:
+    FOUR LIMITS, stated because each of them is a direction this can be wrong:
 
     * a PARAMETRISED test is ONE `def` but N collected nodeids, so this count is
       a FLOOR of the collected count — the effect is that a file can look fully
@@ -1320,7 +1320,8 @@ def render_refreshed_manifest(manifest_text: str, weights: dict[str, float],
             # decide, then the reading itself.
             basis = (
                 f"{sample_label}: top-15 saw {observed} of {declared} "
-                f"testcases = {measured:.1f}s, a LOWER bound; kept {previous:.1f}"
+                f"testcases = {measured:.1f}s in the largest single job "
+                f"(not summed across legs), a LOWER bound; kept {previous:.1f}"
                 if reason is None else
                 f"{sample_label}: {reason}; the reading ({measured:.1f}s) is "
                 f"a LOWER bound; kept {previous:.1f}")
