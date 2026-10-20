@@ -3287,7 +3287,7 @@ class TestReconcileSweep:
                 f"by rank, never by listing order — got {order}")
 
     def test_an_unreadable_ladder_is_unrankable_not_unlimited(self):
-        """``None`` from ``_paid_tier_floor`` means CONFIG FAULT, not unlimited.
+        """``None`` from ``_paid_tier_floor`` is ambiguous: unlimited OR a read failure.
 
         The old docstring said ``None`` = "Team = unlimited" and §4.2 said
         ``direction: null`` = "both caps unlimited". Measured, both are false:
@@ -3308,7 +3308,8 @@ class TestReconcileSweep:
         assert bl._paid_tier_floor("bogus-tier") == bl._paid_tier_floor("free")
         assert bl._drift_direction("bogus-tier", "team") == "up"
 
-        # The only path to None: the ladder cannot be read at all.
+        # Two paths to None — an unreadable ladder here, a readable `null` cap
+        # there — and `_drift_direction`/`_tier_claim` tell them apart.
         def _unreadable(tier):
             raise KeyError("pricing.json tier 'pro' missing required keys")
 
@@ -4092,11 +4093,13 @@ def test_the_client_seam_turns_a_wait_bound_refusal_into_an_inconclusive_skip(
 class TestTierCapSeparatesTheTwoNones:
     """``pricing.tier_limits`` requires only the KEY to exist, so a readable
     ``pricing.json`` may carry ``max_graph_nodes: null`` — an UNLIMITED tier, not
-    a fault. Reading that as "the ladder could not be read" put every org on such
-    a tier into ``unverified`` on every pass, logging a cause the code never
-    established, forever. The two sources separate on the RAISE, which is the only
-    place they differ, so one function reads the ladder and returns
-    ``_UNREADABLE`` for the fault.
+    a fault. Reading that as "the ladder could not be read" logged a cause the
+    code never established for every org on such a tier, forever (#8946) — and
+    ranked the tier below a finite sibling, which could re-cap it. (The
+    ``unverified`` COUNTER is unchanged: ``"paid"`` and ``"unknown"`` share that
+    bucket; what this fixes is the attribution and the rank.) The two sources
+    separate on the RAISE, which is the only place they differ, so one function
+    reads the ladder and returns ``_UNREADABLE`` for the fault.
     """
 
     @staticmethod
@@ -4106,8 +4109,11 @@ class TestTierCapSeparatesTheTwoNones:
 
     @staticmethod
     def _ladder(caps):
+        """A fake ``tier_limits`` that keeps the real unknown-tier behaviour:
+        an unrecognised tier resolves to Free's limits (never raises)."""
         def _limits(tier):
-            return {"max_graph_nodes": caps[tier]}
+            key = tier if tier in caps else "free"
+            return {"max_graph_nodes": caps[key]}
         return _limits
 
     def test_an_unlimited_cap_claims_paid(self, monkeypatch):
@@ -4120,6 +4126,26 @@ class TestTierCapSeparatesTheTwoNones:
         assert bl._tier_claim("team") == "paid"
         assert bl._tier_cap("pro") is None
         assert bl._tier_cap("pro") is not bl._UNREADABLE
+
+    def test_unlimited_FREE_outranks_nothing(self, monkeypatch):
+        """⛔ The Free arm is decided FIRST. Testing ``cap is None`` before
+        ``free_cap is None`` made Free the only tier claiming paid entitlement on
+        a ladder that declares Free itself unlimited — a paid claim for the whole
+        free population, and dead code in the one configuration its comment
+        names. Red before the swap: ``_tier_claim("free")`` returned "paid"."""
+        from tortoise import billing as bl
+
+        # Free unlimited, and a paid tier that is ALSO unlimited: nothing is
+        # above an unlimited Free, so neither claims paid.
+        self._with_limits(monkeypatch, self._ladder({"free": None, "pro": None}))
+        assert bl._tier_claim("free") == "unpaid"
+        assert bl._tier_claim("pro") == "unpaid"
+        assert bl._tier_claim(None) == "unpaid"  # resolves to Free's cap
+        assert bl._tier_claim("bogus-tier") == "unpaid"
+
+        # Free unlimited, paid tier finite: still nothing outranks Free.
+        self._with_limits(monkeypatch, self._ladder({"free": None, "pro": 600000}))
+        assert bl._tier_claim("pro") == "unpaid"
 
     def test_an_unlimited_tier_ranks_above_every_finite_one(self, monkeypatch):
         from tortoise import billing as bl
@@ -4139,11 +4165,57 @@ class TestTierCapSeparatesTheTwoNones:
         assert bl._best_ranked([finite, unlimited])[0] is unlimited
 
     def test_unlimited_to_finite_is_a_downward_drift(self, monkeypatch):
+        """The UNCHANGED ordering, kept as documentation: ``None`` (unlimited) is
+        ranked by the cap, so a repair off it is a real reduction. ⛔ This pair
+        also held pre-fix, so it is NOT the guard for #8946 — the discriminating
+        drift arms are ``test_one_unreadable_side_is_never_a_drift_verdict`` and
+        ``test_two_unlimited_tiers_are_not_an_upgrade``."""
         from tortoise import billing as bl
         self._with_limits(monkeypatch, self._ladder({"pro": None, "team": 600000}))
 
         assert bl._drift_direction("pro", "team") == "down"
         assert bl._drift_direction("team", "pro") == "up"
+
+    def test_two_unlimited_tiers_are_not_an_upgrade(self, monkeypatch):
+        """⛔ Two readable UNLIMITED caps are RANKED, not unreadable — the pair is
+        decided by its own arm, before the ``before is None`` reduction arm, so
+        the answer cannot be mistaken for one. The cap did not move, so the
+        answer is the same "otherwise" answer two finite caps of equal value get:
+        never ``None`` (that means the ladder could not be READ) and never
+        ``"up"`` (nothing was raised, and only ``"up"`` pages). Red against the
+        pre-#8946 code, where both-None hit the ``both floors None`` guard and
+        returned ``None``."""
+        from tortoise import billing as bl
+        self._with_limits(monkeypatch, self._ladder({"pro": None, "team": None}))
+
+        assert bl._drift_direction("pro", "team") == "down"
+        assert bl._drift_direction("team", "pro") == "down"
+        # And the readable pair of equal FINITE caps answers identically — the
+        # rule is "not up", not "not unlimited".
+        self._with_limits(monkeypatch, self._ladder({"pro": 600000, "team": 600000}))
+        assert bl._drift_direction("pro", "team") == "down"
+
+    def test_one_unreadable_side_is_never_a_drift_verdict(self, monkeypatch):
+        """⛔ The arm #8946 actually added to ``_drift_direction``: ``tier_limits``
+        raises PER TIER, so one side can be unreadable while the other ranks
+        normally. Pre-fix that compared a real cap against ``None`` and returned
+        ``"down"`` from an unreadable ``from`` and ``"up"`` from an unreadable
+        ``to`` — and ``"up"`` PAGES: a Telegram/Resend page for a payable
+        customer whose entitlement never moved, caused by a config fault (#750.8,
+        "a fault is not a verdict"). Both assertions are red pre-fix."""
+        from tortoise import billing as bl
+
+        def _only_pro_raises(tier):
+            if tier == "pro":
+                raise KeyError("pricing.json tier 'pro' missing required keys")
+            return {"max_graph_nodes": 600000}
+
+        self._with_limits(monkeypatch, _only_pro_raises)
+
+        assert bl._tier_cap("pro") is bl._UNREADABLE
+        assert bl._tier_cap("team") == 600000
+        assert bl._drift_direction("pro", "team") is None  # pre-fix: "down"
+        assert bl._drift_direction("team", "pro") is None  # pre-fix: "up" (pages)
 
     def test_every_unreadable_shape_claims_unknown(self, monkeypatch):
         """The catch is BROAD on purpose: the four shapes are not one exception

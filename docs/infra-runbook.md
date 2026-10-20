@@ -502,14 +502,20 @@ missing limit key) has the same remedy as `direction: null`: fix the ladder.
 
 Note that a cap which is present but `null` means **UNLIMITED**, not "unreadable"
 (#8946): `tier_limits` returns it as-is, and since that fix the reconciler ranks
-it ABOVE every finite cap — so an org on such a tier claims `paid` rather than
-`unverified`, and a repair from it to a finite tier records
-`direction: "down"`. Two consequences for an operator: a top tier declared
-unlimited stops filling the `unverified` counter on every pass (before #8946 it
-did, forever, and the log named a cause the code never established), and a
-`direction: "down"` row can now be a REAL reduction of entitlement that the
-ladder itself made — check `from_max_nodes` is `null` before reading it as a
-billing mistake. The earlier caveat — that such a cap "ranks as unreadable" and
+it ABOVE every finite cap — so an org on such a tier claims `paid`, and a repair
+from it to a finite tier records `direction: "down"`. What that changes for an
+operator is the **attribution**, not the count: `"paid"` and `"unknown"` share
+the `unverified` bucket and the `::warning::` it drives, so an org on an
+unlimited tier with no verifiable subscription is still counted `unverified` and
+still warns — the log line no longer names a cause the code never established
+("the pricing ladder could not be read") for a ladder that was in fact read and
+said unlimited. The bucket is the honest one either way: `unverified` is the only
+bucket that keeps a stored-*paid* org out of `skipped`. Note also that a
+`direction: "down"` row can be a REAL reduction of entitlement that the ladder
+itself made — check `from_max_nodes` is `null` before reading it as a billing
+mistake; when BOTH of `from_max_nodes` / `to_max_nodes` are `null` the enforced
+cap did not move at all (two unlimited tiers), and only `"up"` ever pages. The
+earlier caveat — that such a cap "ranks as unreadable" and
 could record `a repaired tier change nobody proved` (#8943) — no longer applies
 to a `null` cap; it applies to a ladder that cannot be READ, which is the
 `direction: null` case below. And
@@ -556,8 +562,10 @@ customer's writes) and a `direction`:
   incomplete `product/pricing.json`, #750.8). That is a **config fault, not a
   no-op**: an unrecognised tier is NOT this case, it resolves to Free's cap and
   ranks normally, and neither is a `null` cap — that means unlimited and
-  ranks ABOVE every finite cap (#8946). Never paged; investigate the pricing
-  file.
+  ranks ABOVE every finite cap (#8946). ONE unreadable side is enough (#8946):
+  the raise is per tier, so an unreadable tier against a readable one used to
+  be ranked against `None` and could page a false `up`. Never paged;
+  investigate the pricing file.
 - `unverified` — no active subscription could be established for an org whose
   stored tier claims PAID entitlement, **or whose claim could not be decided at
   all**. Three causes land here and the counter does not distinguish them:
