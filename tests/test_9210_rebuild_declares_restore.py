@@ -7,7 +7,10 @@ THE GRAPH THAT IS ABOUT TO BE DESTROYED: `:Batch` markers and
 `Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
 onboarding state machine (node, `onboards` anchor, `COMPLETED_STEP` links), the
 `:TeamMeta` first-org marker, the `#2814` config registry, the `#4305` derived
-Point properties, and the `:GraphEventMeta` watermark. **None of those writes
+Point properties. (The `:GraphEventMeta` watermark was this lane's until
+`#9224` declared it inside `event_store.reestablish_watermark` under its own
+`_replay_write_scope()` — an inner declaration shadows an outer one, so it is
+that lane's now and is deliberately not claimed here.) **None of those writes
 is a projection of a journal record** (`#990`, `#4641`, `#5353`, `#2814`,
 `#4653` each say so at their writer), so the replay lane's contract — "this
 content came from the record" — is FALSE for them. Two legs are exceptions in
@@ -50,11 +53,13 @@ false contract, rather than with `None`).
 WHAT THIS DOES NOT COVER — the two disclosed residuals, so neither is read as
 covered by the properties above:
 
-* the `:GraphEventMeta` watermark is the one restore leg that does not go
-  through `_restore_write` (its statement lives in
-  `event_store.reestablish_watermark`), so a write a future edit adds INSIDE
-  that helper inherits the watermark's declaration instead of failing the
-  required-`reason` contract;
+* the `:GraphEventMeta` watermark is NOT this lane's leg any more:
+  `#9224` (the `:GraphEvent` store's declaration) opens its own
+  `_replay_write_scope()` INSIDE `event_store.reestablish_watermark`, and an
+  inner declaration shadows an outer one, so this lane cannot claim it even if
+  a future edit wraps the call site again. `tests/test_9124_declared_live_doors.py`
+  is its pin. A write a future edit adds INSIDE that helper therefore inherits
+  `#9224`'s reason rather than this required-`reason` contract;
 * `rebuild_all` also carries graph-only Points back by building
   `synthetic_events` from the same pre-wipe capture and FOLDING them, so that
   half is authorized by whatever permit the caller opened over the engine —
@@ -164,11 +169,6 @@ _LEGS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",),
     ),
     "config": (_CONFIG_REASONS, _CONFIG_FRAGMENTS),
-    "watermark": (
-        (f"{RESTORE}: :GraphEventMeta watermark (#4653)",),
-        ("MERGE (m:GraphEventMeta) ON CREATE SET m.last_seq = $last, "
-         "m.first_seq = $first",),
-    ),
     "point-derived": (
         (f"{RESTORE}: Point derived properties (#4305)",),
         # ARM-AGNOSTIC on purpose: the restore prefixes a
@@ -325,7 +325,7 @@ def _observed_restore_legs(seen):
 def _assert_every_leg_declares_itself(seen, *, context: str):
     observed = _observed_restore_legs(seen)
     # VACUITY GUARD: a leg that never ran cannot be evidence either way. The
-    # fixture seeds all eleven, so a missing one means the seed or the capture
+    # fixture seeds all ten, so a missing one means the seed or the capture
     # changed, not that the declaration is fine.
     assert set(observed) == set(_LEGS), (
         f"{context}: these snapshot-restore legs did not reach the write "
