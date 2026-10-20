@@ -268,6 +268,14 @@ _UNRESOLVED = {
     # record). Listed here rather than silently called a read, per this set's
     # own rule. (These two rows are why the census reddened on `origin/main`
     # at e08a669b2 — the entries, not the statements, were missing.)
+    # ⚠️ The human step covers the WHOLE statement, not just its resolvable
+    # part — for these rows the unresolvable fragment IS the `where` text, so
+    # "the readable half has no write keyword" would not settle it: measured,
+    # each function's only handle reach is a `MATCH … OPTIONAL MATCH … RETURN`
+    # read (sdk.py:23143) / `MATCH … RETURN n.id` read (sdk.py:23531), with no
+    # SET/CREATE/MERGE/DELETE/REMOVE in the assembled query and no write through
+    # another SDK method (`calibrate_summary` names `set_point_baseline` only
+    # inside advice strings).
     "calibrate_summary",
     "_uncalibrated_ep_participants",
     "_cross_lens_pool",
@@ -295,18 +303,14 @@ _UNRESOLVED = {
     "suggest_entry_points",
     "tortoise_fts_query",
     "traverse",
-    # #9261 (`c172b042f`, the #9063 calibration-gate fix): BOTH of these build
-    # their statement from a COMPUTED local — `where` is an f-string fragment
-    # assembled from `_ID_RESOLVABLE_TYPES` / `_ID_WHITESPACE_SET` and loop
-    # variables (`{label}`), so the enumerator sees `'<unresolved>'` where the
-    # query text is. Hand-checked (2026-10-20): the ONLY handle reach in each is
-    # a `MATCH … OPTIONAL MATCH … RETURN` read — no SET/CREATE/MERGE/DELETE, and
-    # `calibrate_summary` writes nothing itself (its advice only NAMES
-    # `set_point_baseline`). Listed here — not silently called a read — because
-    # that is the census being honest about what it can prove; the gate must go
-    # on demanding a lane for anything it CAN see mutating.
-    "calibrate_summary",
-    "_uncalibrated_ep_participants",
+    # ⛔ NO SECOND ROW FOR `calibrate_summary` / `_uncalibrated_ep_participants`.
+    # They are declared ONCE, above (the #9063 entry). Both PRs that landed on
+    # 2026-10-20 declared them at different offsets, so the merge kept both
+    # copies: a duplicate element in a SET is silently collapsed by Python — the
+    # intent still holds — but `ruff` B033 flags it, and the lint shard goes red
+    # on `main` for every PR that inherits it. Adding a row for a name that is
+    # already in the set is the same defect as #9259's duplicate DICT key, one
+    # container over: the declaration reads as two decisions where there is one.
 }
 
 _INVENTORY = {
