@@ -177,7 +177,7 @@ def allowance_reachability(tier: str, nodes_per_op: float) -> dict:
         # the billing rule).
         raise ValueError(
             f"tier {tier!r} publishes no node cap (max_graph_nodes is null) — "
-            "a null cap is unrankable, not unlimited")
+            "an unlimited cap has no upper bound to measure a shortfall against")
     cap = int(cap_raw)
     r = float(nodes_per_op)
     if r < 0 or r != r or r == float("inf"):
