@@ -3592,12 +3592,17 @@ def _prewipe_restore_write_scope(reason: str):
       caller opened over the engine (`"replay"` under the `#9124`/`#9213`
       shape), not by this lane. Disclosed, not claimed.
 
-    SCOPE — `rebuild_all` only. The sibling journal engine `rebuild()` /
-    `_replay_log` still restores the `:GraphEventMeta` watermark and the
-    `:TeamMeta` marker inside its own method-wide `_replay_write_scope()`, so
-    those two writes still declare `"replay"` today. That is the SAME class of
-    defect this lane removes, deliberately left to `#9124`/`#9213` rather than
-    fixed in one engine's `try` body.
+    WHERE THE WATERMARK'S DECLARATION LIVES — at the write, in
+    `tortoise/event_store.py`. That leg's statement is in another module, so a
+    `with` here could not declare it (an inner scope shadows an outer one); the
+    lane is instead handed to `reestablish_watermark(..., restore_reason=...)`,
+    which opens it around its own `MERGE`. The helper's OTHER caller, the
+    journal engine `rebuild()` / `_replay_log`, keeps declaring `"replay"` —
+    it re-derives the value from the replayed log, and that write is `#9224`'s
+    declaration. `rebuild()` still restores the `:TeamMeta` marker inside its
+    method-wide `_replay_write_scope()`, which is the same class of defect this
+    lane removes, deliberately left to `#9213` rather than fixed inside one
+    engine's `try` body.
 
     NESTING is the property that makes it load-bearing under an over-broad
     permit: the reason is a `ContextVar`, so an inner restore declaration
@@ -9918,15 +9923,16 @@ class FalkorProjection(
         ⚠️ **The funnel is not literally exhaustive, and the ONE exception is
         named so it is not read as one.** The `:GraphEventMeta` watermark is
         restored by `event_store.reestablish_watermark` (two probe reads + one
-        `MERGE` in ANOTHER module), and that helper opens its OWN
-        `_replay_write_scope()` around the write (`#9224`, the `:GraphEvent`
-        store's declaration). Because the reason is a `ContextVar`, that INNER
-        declaration shadows any outer one at this call site — so this funnel
-        does NOT declare the watermark, and `#9210`'s leg table does not
-        classify it; `tests/test_9124_declared_live_doors.py` owns that pin.
+        `MERGE` in ANOTHER module), so the declaration cannot be a `with` here
+        — the helper's own scope would shadow it. It is therefore stated by
+        handing that helper THIS lane's reason (`restore_reason=…`, #9210): the
+        lane still sits at the write, inside `event_store.py`, which is what
+        `#9124`'s rule requires and what `#9224` asserted for its other caller.
         Consequence to keep in view: a write a future edit adds INSIDE that
-        helper inherits `#9224`'s declaration rather than this required-
-        `reason` contract.
+        helper inherits the lane its caller stated rather than this funnel's
+        required-`reason` contract, so `tests/test_9210_rebuild_declares_restore.py`
+        classifies the watermark's `MERGE` by its own fragment and
+        `tests/test_9124_declared_live_doors.py` pins the module's opener.
         """
         with _prewipe_restore_write_scope(reason):
             return self.g.query(cypher, params=params)
@@ -13976,7 +13982,16 @@ class FalkorProjection(
             leftover_carry = (None if leftover is None else
                               _event_meta_last_seq(leftover.get("event_meta")))
             restored = reestablish_watermark(
-                    self, _event_meta_last_seq(event_meta_snapshot))
+                    self, _event_meta_last_seq(event_meta_snapshot),
+                    # #9210: the value is the one CAPTURED from this graph
+                    # before the wipe, so this leg states its own lane instead
+                    # of riding the caller's replay permit. The lane has to be
+                    # named HERE and opened INSIDE the helper: an inner scope
+                    # shadows an outer one, so wrapping this call would have
+                    # been silently discarded (#9224 declares `"replay"` for
+                    # the journal engine's call).
+                    restore_reason=f"{_PREWIPE_RESTORE_LANE}: "
+                                   ":GraphEventMeta watermark (#4653)")
             if restored is None:
                 if leftover is not None:
                     logger.error(

@@ -60,8 +60,13 @@ neither the live nor the replay lane:
   `reestablish_watermark`) and raises `first_seq`, so a parked subscriber gets
   the truthful 410 instead of `[]` forever. A declared truncation with a cursor
   contract, not corruption.
-* `_replay_write_scope` for `reestablish_watermark`, which only ever runs as part
-  of a wipe+replay: the value it writes came FROM the journal's own rebuild.
+* the watermark in `reestablish_watermark`, whose lane is stated by its CALLER
+  and opened HERE, at the handle: `rebuild()` re-derives the value from the
+  journal's own rebuild and declares the replay lane (`#9224`), while
+  `rebuild_all` puts back the value it CAPTURED before the wipe and names that
+  leg (`pre-wipe-restore: …`, `#9210`). The declaration has to live at the write
+  because an inner scope SHADOWS an outer one (`_cache_write_authorized` is a
+  `ContextVar`), so a `with` at the call site could not state the lane at all.
 
 ⚠️ The declarations are NOT a licence for the swallow: `append_event` and
 `_refresh_first_seq` still catch bare `Exception` (a store failure must never
@@ -466,8 +471,22 @@ def capture_watermark(proj) -> dict | None:
     return {"last_seq": value}
 
 
-def reestablish_watermark(proj, carried_last_seq: int | None) -> int | None:
+def reestablish_watermark(proj, carried_last_seq: int | None, *,
+                          restore_reason: str | None = None) -> int | None:
     """Re-establish ``:GraphEventMeta`` after a wipe+replay (#4653).
+
+    ``restore_reason`` states which lane the carried value came from, and it is
+    the CALLER's to state because this helper has two callers with unlike
+    authorization: `FalkorProjection.rebuild_all` puts back a value it CAPTURED
+    from this graph immediately before the wipe, so it names its restore leg
+    (``pre-wipe-restore: :GraphEventMeta watermark (#4653)``, #9210) — the replay
+    lane's contract ("this content came FROM the record") is FALSE for it. The
+    journal engine `rebuild()` re-derives the watermark from the replayed log
+    instead, keeps the default, and so keeps this module's landed declaration
+    (#9224). The lane is opened at the write below, never at the call site: the
+    scope is a `ContextVar`, so an inner declaration shadows an outer one, and a
+    `with` around the call would be silently discarded — the exact way the
+    watermark went on declaring `"replay"` while restoring captured state.
 
     The ``last_seq`` monotonicity guard is ``hosted_backup._restore_event_meta``'s
     (#3902): ``last_seq = max(carried, max(:GraphEvent.seq))`` — whatever the
@@ -579,11 +598,17 @@ def reestablish_watermark(proj, carried_last_seq: int | None) -> int | None:
     # `first_seq` is raised, never lowered (see the docstring), and its `CASE`
     # reads the PRE-clause value — Cypher evaluates a SET clause against the
     # state before it.
-    # §17.1 (#9124): this write only ever runs as part of a wipe+replay — the
-    # value it re-establishes came FROM the rebuild of the journal — so it
-    # declares the REPLAY lane rather than arriving at the handle undeclared.
-    from .projection import _replay_write_scope
-    with _replay_write_scope():
+    # §17.1 (#9124, #9210, #9224): this write never arrives at the handle
+    # undeclared, but WHICH lane it declares is the caller's to state — the
+    # replay lane when `rebuild()` re-derived the value from the replayed log
+    # (#9224's landed declaration), this lane's own named restore leg when
+    # `rebuild_all` is putting back the value it captured before the wipe
+    # (#9210). `_cache_write_authorized` is the same single-writer ContextVar
+    # every scope uses, so an undeclared caller still fails closed on `None`;
+    # the lane is opened here because an inner scope shadows an outer one, so a
+    # `with` at the call site could never be the declaration.
+    from .projection import _cache_write_authorized
+    with _cache_write_authorized(restore_reason or "replay"):
         rows = proj.g.query(
             "MERGE (m:GraphEventMeta) "
             "ON CREATE SET m.last_seq = $last, m.first_seq = $first "
@@ -854,7 +879,7 @@ def _refresh_first_seq(proj) -> None:
     inputs produce a floor above every cursor, so both answer 410.
     """
     from .projection import _graph_metadata_write_scope
-    try:  # noqa: SIM105
+    try:
         # §17.1 (#9124): the purge FLOOR is the same graph-metadata lane as the
         # purge that triggers it — it describes the store, not the corpus.
         with _graph_metadata_write_scope("event-store-purge"):

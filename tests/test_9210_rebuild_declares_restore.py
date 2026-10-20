@@ -7,10 +7,7 @@ THE GRAPH THAT IS ABOUT TO BE DESTROYED: `:Batch` markers and
 `Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
 onboarding state machine (node, `onboards` anchor, `COMPLETED_STEP` links), the
 `:TeamMeta` first-org marker, the `#2814` config registry, the `#4305` derived
-Point properties. (The `:GraphEventMeta` watermark was this lane's until
-`#9224` declared it inside `event_store.reestablish_watermark` under its own
-`_replay_write_scope()` — an inner declaration shadows an outer one, so it is
-that lane's now and is deliberately not claimed here.) **None of those writes
+Point properties, and the `:GraphEventMeta` watermark. **None of those writes
 is a projection of a journal record** (`#990`, `#4641`, `#5353`, `#2814`,
 `#4653` each say so at their writer), so the replay lane's contract — "this
 content came from the record" — is FALSE for them. Two legs are exceptions in
@@ -23,6 +20,15 @@ record (folded by `_fold_session_recorded`) — only its `CONTAINS` edge and the
 re-application of its properties ride no record, and the restore is idempotent
 over the journal-carried half. The edge's value still exists only in the
 pre-wipe capture, which is the property this lane is about.
+
+The watermark leg is the one whose STATEMENT lives in another module, and it
+is claimed here anyway: `rebuild_all` hands `event_store.reestablish_watermark`
+its own reason (`restore_reason=…`), and the helper opens the lane around its
+own `MERGE`. That is deliberate — an inner declaration SHADOWS an outer one, so
+`#9224`'s landed `_replay_write_scope()` inside that helper made a `with` at
+this call site inert, and the lane has to be stated at the write. The helper's
+other caller (`rebuild()`) passes nothing and keeps `#9224`'s `"replay"`,
+which is true there: it re-derives the value from the replayed log.
 
 Handing them the replay permit is therefore an over-authorization: the
 declaration claims a wider write scope than the restore performs. `#9124`'s
@@ -48,22 +54,19 @@ Three properties, and each one names the wrong behaviour it makes impossible:
 MUTATION for every test here: replace a `self._restore_write(..., reason=...)`
 call in `rebuild_all` with the bare `self.g.query(...)` it wraps — tests 1 and
 2 both go red on the observed reason (and 2 goes red with `"replay"`, the
-false contract, rather than with `None`).
+false contract, rather than with `None`). The watermark leg's mutation is the
+same shape one level down: drop the `restore_reason=` argument at its call
+site, and the helper falls back to `#9224`'s `"replay"` — red on the observed
+reason, which is how the trampoline this PR removes was caught.
 
-WHAT THIS DOES NOT COVER — the two disclosed residuals, so neither is read as
-covered by the properties above:
-
-* the `:GraphEventMeta` watermark is NOT this lane's leg any more:
-  `#9224` (the `:GraphEvent` store's declaration) opens its own
-  `_replay_write_scope()` INSIDE `event_store.reestablish_watermark`, and an
-  inner declaration shadows an outer one, so this lane cannot claim it even if
-  a future edit wraps the call site again. `tests/test_9124_declared_live_doors.py`
-  is its pin. A write a future edit adds INSIDE that helper therefore inherits
-  `#9224`'s reason rather than this required-`reason` contract;
-* `rebuild_all` also carries graph-only Points back by building
-  `synthetic_events` from the same pre-wipe capture and FOLDING them, so that
-  half is authorized by whatever permit the caller opened over the engine —
-  `"replay"` under `#9124`/`#9213` — and not by this lane.
+WHAT THIS DOES NOT COVER — the disclosed residual, so it is not read as
+covered by the properties above: `rebuild_all` also carries graph-only Points
+back by building `synthetic_events` from the same pre-wipe capture and FOLDING
+them, so that half is authorized by whatever permit the caller opened over the
+engine — `"replay"` under `#9124`/`#9213` — and not by this lane. (The
+watermark, which HAD been left outside the pin, is claimed again: its lane is
+now handed to the helper and opened inside it, which is what makes the leg
+truthful rather than deferred.)
 
 Lane: either. The fixtures build the SDK the way the embedded carve-out suite
 does, and the bulk-wipe guard passes on the redirected `test_*_tortoise` graph
@@ -167,6 +170,16 @@ _LEGS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "team-meta": (
         (f"{RESTORE}: :TeamMeta first-org marker (#5353)",),
         (f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",),
+    ),
+    "watermark": (
+        (f"{RESTORE}: :GraphEventMeta watermark (#4653)",),
+        # The statement lives in `event_store.reestablish_watermark` and is
+        # issued on this run's handle. The lane is stated by the reason the
+        # engine hands that helper, and OPENED inside it — `#9224`'s inner
+        # `_replay_write_scope()` is why a declaration at this call site could
+        # not survive.
+        ("MERGE (m:GraphEventMeta) "
+         "ON CREATE SET m.last_seq = $last",),
     ),
     "config": (_CONFIG_REASONS, _CONFIG_FRAGMENTS),
     "point-derived": (
@@ -325,7 +338,7 @@ def _observed_restore_legs(seen):
 def _assert_every_leg_declares_itself(seen, *, context: str):
     observed = _observed_restore_legs(seen)
     # VACUITY GUARD: a leg that never ran cannot be evidence either way. The
-    # fixture seeds all ten, so a missing one means the seed or the capture
+    # fixture seeds all eleven, so a missing one means the seed or the capture
     # changed, not that the declaration is fine.
     assert set(observed) == set(_LEGS), (
         f"{context}: these snapshot-restore legs did not reach the write "

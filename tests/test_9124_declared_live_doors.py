@@ -126,12 +126,16 @@ _APPEND_NOT_A_RECORD = {
 #: _onboarding_write_scope(cypher):` around the dispatch in
 #: `tortoise/onboarding/state.py`) — a lane declared through a module-local
 #: helper is still declared, and leaving it out reported that module as
-#: undeclared while it was the opposite.
+#: undeclared while it was the opposite. `_prewipe_restore_write_scope` is
+#: `#9210`'s restore funnel (`FalkorProjection._restore_write`): omitted, the
+#: census classified a writer that DOES declare a lane as undeclared and left
+#: it in the `provable` remainder the owner's last-step flip requires cleared.
 _SCOPE_CALL_NAMES = (
     "_live_write_scope",
     "_replay_write_scope",
     "_graph_metadata_write_scope",
     "_onboarding_write_scope",
+    "_prewipe_restore_write_scope",
     "_cache_write_authorized",
     "_declares_live_write_lane",
 )
@@ -417,9 +421,7 @@ def _bind_handle_aliases(node, aliases, params=()) -> None:
     """
     if isinstance(node, ast.Assign):
         value, targets = node.value, node.targets
-    elif isinstance(node, ast.AnnAssign):
-        value, targets = node.value, [node.target]
-    elif isinstance(node, ast.NamedExpr):
+    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
         value, targets = node.value, [node.target]
     elif isinstance(node, ast.withitem):
         value, targets = node.context_expr, [node.optional_vars]
@@ -436,7 +438,7 @@ def _bind_handle_aliases(node, aliases, params=()) -> None:
         return
     if isinstance(value, (ast.Tuple, ast.List)) and len(targets) == 1 \
             and targets[0] is not None:
-        pairs = zip(value.elts, _flatten_target(targets[0]))
+        pairs = zip(value.elts, _flatten_target(targets[0]), strict=False)
         for part, target in pairs:
             if _carries_handle(part, aliases, params):
                 _add_alias_target(target, aliases)
@@ -1061,6 +1063,38 @@ def test_the_event_store_declares_every_writer():
         "ensure_event_schema", "next_seq", "reestablish_watermark",
         "append_event", "purge_expired", "purge_overflow", "_refresh_first_seq",
     }, f"unexpected event_store handle surface: {sorted(surface)}"
+
+
+def test_the_prewipe_restore_funnel_is_declared_not_a_remainder():
+    """`#9210`'s funnel DECLARES a lane, so the census must not call it undeclared.
+
+    `FalkorProjection._restore_write` reaches the handle inside
+    `_prewipe_restore_write_scope(reason)`. The census recognises a lane by the
+    OPENER NAME it can see, so an opener missing from `_SCOPE_CALL_NAMES`
+    reported a writer that DOES declare as undeclared — an instrument that
+    cannot see its own declaration, and its message would then instruct the
+    next lane to declare a lane that is already there. It was not red while the
+    guard was measuring (`_HANDLE_GUARD_ENFORCES is False`), but it sat in the
+    `provable` remainder that the owner's last-step flip
+    (`test_arming_the_guard_requires_a_fully_declared_surface`) requires to be
+    cleared, so the flip would have been blocked by a false positive.
+
+    RED before the opener is registered: `scopes == []`, the write is outside
+    every span, and `_writes_are_inside_a_lane` is False — on correct product
+    code.
+    """
+    surface = enumerate_handle_surface(
+        (ROOT / "tortoise" / "projection" / "__init__.py").read_text(),
+        "tortoise/projection/__init__.py")
+    fact = surface["FalkorProjection._restore_write"]
+    openers = {opener for _lineno, opener in fact["scopes"]}
+    assert openers == {"_prewipe_restore_write_scope"}, (
+        "the restore funnel's write must be seen inside its own opener — an "
+        "opener the census does not know makes a declared writer look "
+        f"undeclared: scopes={fact['scopes']!r}")
+    assert _writes_are_inside_a_lane(fact), (
+        "the census placed the restore funnel's write OUTSIDE every lane "
+        f"span: writes={fact['writes']!r} spans={fact['scope_spans']!r}")
 
 
 # ── non-vacuity: the detector fires on a synthetic undeclared door ────────
@@ -1749,11 +1783,12 @@ def test_the_measure_mode_census_is_what_a_flip_would_refuse(armed_sdk_factory):
     measure mode — and, once the switch is on, one it REFUSES. That is the
     shared-classifier property this whole suite rests on (#3595).
     """
+    import tortoise.projection as projection
     from tortoise.projection import (
-        DirectCacheWriteRefused, _reset_undeclared_handle_writes,
+        DirectCacheWriteRefused,
+        _reset_undeclared_handle_writes,
         undeclared_handle_writes,
     )
-    import tortoise.projection as projection
 
     sdk = armed_sdk_factory()
     proj = sdk._get_proj()
