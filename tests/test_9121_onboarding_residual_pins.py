@@ -311,10 +311,11 @@ def _not_on_the_escape_handle(
 #: literal, so a NEW opener added to `tortoise/projection/__init__.py` — the
 #: shape both #9123 and #9195 used — was invisible to the instrument check,
 #: which iterated the literal and therefore could not notice it. This reads the
-#: production source and returns every function whose body declares through
-#: `_cache_write_authorized`, so a new lane joins the population by existing.
-def _declaration_primitives() -> set[str]:
-    """Every §17.1 opener the tree defines, by AST — ALL of `tortoise/`.
+#: production source and returns every declaring function, so a new lane joins
+#: the population by existing.
+def _declaration_primitives() -> set[tuple[str, str]]:
+    """Every §17.1 opener the tree defines, as `(module, function)` — ALL of
+    `tortoise/`.
 
     Two populations, because they answer two questions. This one is the DETECTOR
     population: any function that can put a declaration in flight, wherever it
@@ -325,19 +326,27 @@ def _declaration_primitives() -> set[str]:
     `_projection_openers()` below is the INVENTORY population: only
     `projection/__init__.py`, because that is the bullet list a reader is told
     is exhaustive.
+
+    ⛔ IDENTITY, not a bare name (#9150 review cycle 5, P1). A name-keyed set
+    cannot see a new opener that REUSES an existing name, and a reused name is
+    the normal case here — `_run` is already in this population
+    (`tortoise/webhook_delivery.py::_run`). Measured: adding a declaring `_run`
+    to `tortoise/reader.py` (an `sdk`-only module) left this population
+    byte-identical and the pin green, while three of the six arm registrations in
+    `config/ci-surfaces.yml` justify themselves by that pin firing.
     """
     return _openers_under(_REPO / "tortoise")
 
 
-def _openers_under(root: Path) -> set[str]:
-    """Functions under `root` whose body declares via `_cache_write_authorized`.
+def _openers_under(root: Path) -> set[tuple[str, str]]:
+    """`(module, function)` for every function under `root` that declares.
 
     A FILE path is allowed too (the inventory population is one module:
     `projection/__init__.py`, the bullet list a reader is told is exhaustive —
     `projection/edges.py`'s `_structural_edge_write_scope` is a real opener that
     is NOT in that list).
     """
-    found: set[str] = set()
+    found: set[tuple[str, str]] = set()
     paths = [root] if root.is_file() else sorted(root.rglob("*.py"))
     for path in paths:
         rel = str(path.relative_to(_REPO))
@@ -351,21 +360,30 @@ def _openers_under(root: Path) -> set[str]:
                     and (getattr(inner.func, "id", None) == "_cache_write_authorized"
                          or getattr(inner.func, "attr", None) == "_cache_write_authorized")
                 ):
-                    found.add(node.name)
+                    found.add((rel, node.name))
     return found
 
 
 def _projection_openers() -> set[str]:
-    """The openers `tortoise/projection/__init__.py` defines (the inventory)."""
-    return _openers_under(_REPO / "tortoise" / "projection" / "__init__.py")
+    """The opener NAMES `tortoise/projection/__init__.py` defines (the inventory).
+
+    NAMES here, unlike the detector population above: this is ONE module, where a
+    duplicated function name is not a thing, and the bullet list a reader is
+    shown is a list of names. (The wide detector population must key on identity
+    precisely because its population spans modules — see
+    `_declaration_primitives()`.)
+    """
+    return {name for _rel, name in
+            _openers_under(_REPO / "tortoise" / "projection" / "__init__.py")}
 
 
 #: The primitives that can authorize a cache write, from two places: every opener
-#: `projection/__init__.py` derives, plus the two names `onboarding/state.py`
-#: uses (its opener lives in another file and declares through the raw ContextVar
-#: helper rather than a projection opener).
+#: the tree derives, plus the two names `onboarding/state.py` uses (its opener
+#: declares through the raw ContextVar helper rather than a projection opener).
+#: NAMES — this is a matcher (`_named`), and the `with`-clause it matches carries
+#: no origin module. The IDENTITY-keyed form is `_declaration_primitives()`.
 _DECLARATION_PRIMITIVES = (
-    _declaration_primitives()
+    {name for _rel, name in _declaration_primitives()}
     | {"_cache_write_authorized", "_onboarding_write_scope"}
 )
 
@@ -807,23 +825,27 @@ def test_the_detector_population_is_pinned_by_content():
     named here.
     """
     expected = {
-        "_graph_metadata_write_scope",
-        "_live_write_scope",
-        "_onboarding_write_scope",
-        "_replay_write_scope",
-        "_prewipe_restore_write_scope",
+        ("tortoise/projection/__init__.py", "_graph_metadata_write_scope"),
+        ("tortoise/projection/__init__.py", "_live_write_scope"),
+        ("tortoise/onboarding/state.py", "_onboarding_write_scope"),
+        ("tortoise/projection/__init__.py", "_replay_write_scope"),
+        ("tortoise/projection/__init__.py", "_prewipe_restore_write_scope"),
         # those defined OUTSIDE `projection/__init__.py`:
-        # `_run` is `tortoise/webhook_delivery.py`'s opener (a name, not the
-        # onboarding funnel — `onboarding/state.py::_run` delegates through
-        # `_onboarding_write_scope`, one hop away, and is covered by that name
-        # above). Recorded because the population is what the detector iterates.
-        "_run",
-        "_structural_edge_write_scope",  # projection/edges.py
+        # `tortoise/webhook_delivery.py::_run` is an opener whose name is REUSED
+        # all over the tree (including `onboarding/state.py::_run`, which is the
+        # onboarding funnel and delegates through `_onboarding_write_scope`, one
+        # hop away). It is recorded by IDENTITY, not by name: while this set was
+        # name-keyed, a second declaring `_run` in any module added no key and
+        # left this pin green (#9150 review cycle 5, P1 — measured with a
+        # declaring `_run` appended to `tortoise/reader.py`, an `sdk`-only
+        # module).
+        ("tortoise/webhook_delivery.py", "_run"),
+        ("tortoise/projection/edges.py", "_structural_edge_write_scope"),
         # #9210/#9218 added the watermark re-establish path, which declares its
         # own cache write from `tortoise/event_store.py` — outside projection
         # entirely, and therefore exactly the class this wide population exists
         # to see.
-        "reestablish_watermark",
+        ("tortoise/event_store.py", "reestablish_watermark"),
     }
     derived = _declaration_primitives()
     assert derived == expected, (
@@ -999,6 +1021,10 @@ def test_the_live_scope_docstring_names_the_opener_the_lane_actually_calls():
     )
     # ... and the CODE half: `state.py` must not reach the alias by call, getattr
     # or import. A comment naming it is not a mechanism and must not red this.
+    # The dynamic `getattr(module, "_live_write_scope")` shape is included: it is
+    # an `ast.Call` whose alias name is a STRING CONSTANT, so the Name/Attribute
+    # arms below cannot see it, and this message says a getattr does red the pin
+    # (#9150 review cycle 5, P2 — measured: it did not).
     alias_uses = {
         node.id for node in ast.walk(tree)
         if isinstance(node, ast.Name) and node.id == "_live_write_scope"
@@ -1008,6 +1034,13 @@ def test_the_live_scope_docstring_names_the_opener_the_lane_actually_calls():
     } | {
         a.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
         for a in node.names if a.name == "_live_write_scope"
+    } | {
+        arg.value for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "id", None) == "getattr"
+             or getattr(node.func, "attr", None) == "getattr")
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and arg.value == "_live_write_scope"
     }
     assert not alias_uses, (
         "`tortoise/onboarding/state.py` now CALLS or imports the "
