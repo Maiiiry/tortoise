@@ -84,17 +84,38 @@ from tortoise.projection import (
 
 # ── fixtures ──────────────────────────────────────────────────────────────
 
+# #9209: the `sdk_with_journal` cases need a REAL embedded projection (the
+# fixture asserts `proj._is_embedded` and counts nodes on it). Declaring the
+# lane is load-bearing, not decoration: an explicit `db_path` alone does NOT
+# keep the construction embedded in a test session — `FalkorProjection`'s
+# URI-aware redirect fires on `explicit_path and TORTOISE_DB_URI and
+# TORTOISE_TEST_MODE == "1" and not exempt`, nulls the path and renames the
+# graph, so `_is_embedded` is False and the fixture assertion errors before
+# `yield`. MEASURED at the head that had no registration (private lane
+# container, `TORTOISE_DB_URI` set): `28 passed, 42 errors`, every error the
+# fixture's own `AssertionError`. Registered in all three homes —
+# `config/ci-surfaces.yml:carve_out`, `tests/_embedded.TEST_NO_REDIRECT_STEMS`
+# and `tests/test_markers.py::test_no_redirect_stems_registry_exact` — so the
+# URI-unset carve-out job runs it (the lane this suite's own timings name).
+pytestmark = pytest.mark.embedded_only
+
+
 @pytest.fixture
 def sdk_with_journal(tmp_path):
     """A real SDK whose projection is ARMED (`event_log_path` configured).
 
-    ALWAYS EMBEDDED, and this is measured rather than assumed: an explicit
-    `db_path` WINS over `TORTOISE_DB_URI` in the SDK, so `proj._is_embedded`
-    stays True even on the docker lane — the same shape
-    `tests/test_7951_enforce_atomic_write.py` uses. (The earlier wording said
-    this construction "reaches the docker server when one is" configured, which
-    a fresh-context review measured FALSE: a run with `TORTOISE_DB_URI` set
-    still logged `_is_embedded: True`.)
+    ALWAYS EMBEDDED — declared, not assumed. The module is
+    `pytest.mark.embedded_only` and its stem is in `TEST_NO_REDIRECT_STEMS`,
+    so `proj._is_embedded` is True because the redirect is EXEMPTED here.
+    (Earlier wording claimed an explicit `db_path` wins over `TORTOISE_DB_URI`
+    on its own and that a URI-set run still showed `_is_embedded: True`; a
+    fresh-context review measured the opposite — with `TORTOISE_TEST_MODE=1`
+    the class-level test redirect fires for `explicit_path` constructions and
+    the projection is a server one, which ERRORed 42 of 70 cases on the docker
+    lane. The measured `True` came from a run with `TORTOISE_TEST_MODE` unset,
+    where the redirect is dormant. `tests/test_7951_enforce_atomic_write.py`,
+    which this docstring used to cite as honouring the same lane, documents the
+    redirect, not an exemption from it.)
 
     That is the right lane for what this suite pins — every refusal below is
     asserted against a real journal-backed projection AND a real node count, and
@@ -109,10 +130,12 @@ def sdk_with_journal(tmp_path):
     journal = tmp_path / "journal.jsonl"
     sdk = TortoiseSDK(str(tmp_path / "noncypher.db"), event_log_path=str(journal))
     assert sdk._get_proj()._is_embedded, (
-        "this suite must run on the EMBEDDED lane: an explicit `db_path` always "
-        "wins over `TORTOISE_DB_URI`, and a case that reached the shared docker "
-        "server would make this suite's failure mode a real wipe of every other "
-        "lane's graphs (#5084)"
+        "this suite must run on the EMBEDDED lane (it is registered in "
+        "ci-surfaces.yml:carve_out + TEST_NO_REDIRECT_STEMS and marked "
+        "embedded_only): an explicit `db_path` alone does NOT win over "
+        "TORTOISE_DB_URI — the class-level test redirect nulls it — and a case "
+        "that reached the shared docker server would make this suite's failure "
+        "mode a real wipe of every other lane's graphs (#5084)"
     )
     sdk.create_entity("subject", "armed-subject", description="a real node")
     try:
