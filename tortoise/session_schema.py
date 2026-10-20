@@ -492,9 +492,10 @@ def session_property_owners() -> dict[str, tuple[str, ...]]:
     enumerates (and what the scanner reads back at the site). A property used
     only as a ``MERGE`` key is NOT attributed: ten writers mint the node with
     ``MERGE (s:Session {id: …})``, but only the replay restore's
-    ``SET s += $props`` (now `_rebuild_all_replay`) owns ``id``. Without that convention the ``id`` row
-    reads as "a replay restore owns the Session id", which is the opposite of
-    what the code does — the contradiction the §4.8 table inherits (#3554
+    ``SET s += $props`` (``_rebuild_all_replay`` since #9124 split the replay
+    body out of ``rebuild_all``) owns ``id``. Without that convention the ``id``
+    row reads as "a replay restore owns the Session id", which is the opposite
+    of what the code does — the contradiction the §4.8 table inherits (#3554
     review).
     """
     owners: dict[str, list[str]] = {prop: [] for prop in SESSION_PROPERTIES}
