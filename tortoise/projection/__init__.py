@@ -3617,9 +3617,29 @@ _HANDLE_MUTATING_VERBS: tuple[str, ...] = (
 )
 
 
-def _normalise_handle_statement(statement: str) -> str:
-    """Collapse a statement to one line so the census keys are readable."""
-    return " ".join((statement or "").split())[:200]
+def _normalise_handle_statement(statement) -> str:
+    """Collapse a statement to one line so the census keys are readable.
+
+    ⛔ TOTAL, and it has to be: this runs on EVERY dispatch to build the
+    suppression key (`_decision_key`), including the channels whose payload is
+    not Cypher text at all — ``execute_command``'s head can be ``bytes`` (the
+    redis-py spelling), and a raw command carries no statement. Raising on those
+    made a legitimate dispatch crash with ``TypeError: sequence item 0: expected
+    str instance, bytes found`` (measured on the embedded lane through
+    ``_GuardedGraph.execute_command(b"COPY", "x")``, three #9209 tests). No text
+    means no key CAN be built, and ``""`` is the honest answer: it can only ever
+    suppress a decision keyed on that same unreadable payload.
+
+    ⛔ A ``str`` SUBCLASS is copied through ``str.__getitem__`` so the key reads
+    the characters the DOOR read (``_as_text`` makes the same copy before the
+    hook): an overridden ``split`` would otherwise derive a key the door can
+    never match, and one write would be counted twice.
+    """
+    if isinstance(statement, str) and type(statement) is not str:
+        statement = str.__getitem__(statement, slice(None))
+    if not isinstance(statement, str):
+        return ""
+    return " ".join(statement.split())[:200]
 
 
 def _record_undeclared_handle_write(statement: str, *, source: str = "proj.g") -> None:
@@ -3799,7 +3819,7 @@ def _decision_key(inner, verb: str, statement, args):
             _normalise_handle_statement(statement))
 
 
-def _dispatch_decided(inner, verb: str, *args, **kwargs):
+def _dispatch_decided(inner, verb: str, *args, decided_statement=None, **kwargs):
     """Send a statement to `inner` with §17.1's decision ALREADY TAKEN.
 
     `_GuardedGraph`'s inner handle is itself a guarded client handle, so
@@ -3816,12 +3836,30 @@ def _dispatch_decided(inner, verb: str, *args, **kwargs):
     decided once by ``_decides_once_per_write``; keeping the two apart is what
     stops one seam from covering for the other's blind spot.
 
+    ⛔ *decided_statement* IS THE STATEMENT THE DISPATCH WILL CARRY, and the two
+    verbs that do not keep it at ``args[0]`` MUST pass it (#9079 review, P2
+    ``census-exactness`` — MEASURED: one write recorded twice for each):
+
+      * ``execute_command`` carries its Cypher at ``args[2]``, and the #7162
+        ``WITH *`` barrier REWRITES it between the door's decision and the
+        dispatch — so the pre-barrier text the caller decided is not the text
+        the guarded channel below consults, and the census held two entries (one
+        per spelling) for one ``GRAPH.QUERY``;
+      * ``call_procedure`` builds ``CALL …`` from a procedure NAME, so keying on
+        ``args[0]`` suppressed nothing the vendor's ``_query`` asked about and
+        the same write was counted twice under one key.
+
+    Defaulting (not requiring) it keeps every statement-first verb unchanged:
+    for ``query``/``_query``/``profile``/``explain`` the Cypher IS ``args[0]``.
+
     A module-level helper rather than a method on the handle: the handle's own
     surface is ENUMERATED by `tests/test_9079_handle_write_authority.py`, and a
     dispatch half is not a verb — adding it to that inventory would blur the one
     list that decides "what is a mutating verb".
     """
-    key = _decision_key(inner, verb, args[0] if args else None, args)
+    statement = decided_statement if decided_statement is not None else (
+        args[0] if args else None)
+    key = _decision_key(inner, verb, statement, args)
     token = _HANDLE_STATEMENT_DECIDED.set(
         _HANDLE_STATEMENT_DECIDED.get() | {key})
     try:
@@ -4814,8 +4852,19 @@ class _GuardedGraph:
         token = _HANDLE_STATEMENT_DECIDED.set(
             _HANDLE_STATEMENT_DECIDED.get() | {normaliser_key})
         try:
-            args = _guard_execute_command(args, getattr(self._g, "client", None))
-            return _dispatch_decided(self._g, "execute_command", *args, **kwargs)
+            decided_args = _guard_execute_command(
+                args, getattr(self._g, "client", None))
+            # #9079 (review P2): the key must be the statement the dispatch
+            # CARRIES — the #7162 barrier above rewrites ``args[2]``, and the
+            # guarded channel one hop down consults the barred text. Keying on
+            # the pre-barrier text suppressed nothing there, so one
+            # ``GRAPH.QUERY`` was censused twice (measured: one entry per
+            # spelling).
+            return _dispatch_decided(
+                self._g, "execute_command", *decided_args,
+                decided_statement=(decided_args[2]
+                                   if len(decided_args) >= 3 else None),
+                **kwargs)
         finally:
             _HANDLE_STATEMENT_DECIDED.reset(token)
 
@@ -4962,8 +5011,13 @@ class _GuardedGraph:
             self._proj._assert_test_graph(
                 "REFUSING to run bulk DETACH DELETE on non-test graph"
             )
-        return _dispatch_decided(self._g, "call_procedure", 
-            procedure, read_only=read_only, args=args, emit=emit
+        # #9079 (review P2): the key is the ``CALL …`` text the vendor will
+        # build, NOT ``args[0]`` — that is the procedure NAME here, so keying
+        # on it suppressed nothing the vendor's ``_query`` asks about and one
+        # procedure write was counted twice (measured).
+        return _dispatch_decided(self._g, "call_procedure",
+            procedure, read_only=read_only, args=args, emit=emit,
+            decided_statement=statement,
         )
 
     def _refuse_key_space_handle_command(self, command: str | None,

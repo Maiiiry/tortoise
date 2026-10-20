@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import pytest
 
+from tortoise.cypher_guard import _client_store_key
 from tortoise.projection import (
     _HANDLE_MUTATING_VERBS,
     DirectCacheWriteRefused,
@@ -222,6 +223,112 @@ def test_one_write_is_counted_exactly_once_whatever_the_channel(
     assert _count(proj, "Once", "id", "once") == 1
 
 
+# ── the suppression key is the statement the DISPATCH carries ─────────────
+#
+# ⛔ The channel above is not the whole question. Its key is ``args[0]``, which
+# is the Cypher for the five query verbs — but NOT for the two verbs that build
+# or rewrite their statement after the door has decided. One write was counted
+# TWICE on each (measured on the embedded lane, one write per case):
+#
+#   * ``execute_command`` — the #7162 ``WITH *`` barrier rewrites ``args[2]``
+#     between the decision and the dispatch, so the guarded channel below asks
+#     about text no key in the suppression set covered;
+#   * ``call_procedure`` — ``args[0]`` is the procedure NAME; the vendor builds
+#     ``CALL …`` and routes it through the guarded ``_query``.
+#
+# Both are census defects only (no refusal is affected: an armed door raises
+# before dispatch), and both matter because the census is the evidence the
+# declaration programme sizes the remainder with.
+
+#: A mutating statement in the #6976 shape, so the #7162 normaliser inserts a
+#: `WITH *` barrier — the write still lands (`_count` sees `Once`), the text the
+#: wire carries is NOT the text the door decided.
+_BARRIER_WRITE = (
+    "MATCH (n:Seed) WHERE n.id = 's' MATCH (n) CREATE (x:Once {id:'once'})")
+
+
+def test_a_barrier_rewritten_command_is_counted_exactly_once(
+        armed_sdk, measure_only, monkeypatch):
+    """One `GRAPH.QUERY` whose text the barrier rewrites is ONE census entry.
+
+    RED before the fix: the pre-barrier text was suppressed and the barred text
+    was not, so the census held TWO entries (one per spelling) for one write.
+    """
+    import tortoise.cypher_guard as cypher_guard
+
+    # An UNREADABLE engine version is the normaliser's own "barrier needed"
+    # verdict (a wrong probe must never be a false CLEAN), so forcing it makes
+    # the barrier deterministic instead of engine-dependent.
+    monkeypatch.setattr(
+        cypher_guard, "_engine_needs_predicate_barrier", lambda client: True)
+    proj = armed_sdk._get_proj()
+    proj.g.query("CREATE (n:Seed {id:'s'})")  # the row the WHERE filters on
+    _reset_undeclared_handle_writes()
+    from tortoise.cypher_guard import _predicate_drop_barrier
+
+    barred = _predicate_drop_barrier(_BARRIER_WRITE)
+    assert barred != _BARRIER_WRITE, (
+        "the fixture no longer produces the #6976 shape, so this test would "
+        "pass without exercising the barrier")
+    proj.g.execute_command("GRAPH.QUERY", proj.graph_name, _BARRIER_WRITE)
+    hits = _hits(undeclared_handle_writes(), "Once")
+    assert sum(hits.values()) == 1, (
+        f"one write counted {sum(hits.values())} times (one per spelling of its "
+        f"text): {hits}")
+    assert _count(proj, "Once", "id", "once") == 1
+
+
+def test_a_mutating_procedure_is_counted_exactly_once(armed_sdk, measure_only):
+    """`call_procedure` builds `CALL …`; that text is what must be suppressed.
+
+    RED before the fix: the key was derived from ``args[0]`` — the procedure
+    NAME — so nothing the vendor's ``_query`` asked about was suppressed and one
+    procedure write was counted twice under one key.
+    """
+    proj = armed_sdk._get_proj()
+    proj.g.call_procedure(
+        "db.idx.fulltext.createNodeIndex", False, args=["Once", "id"])
+    hits = _hits(undeclared_handle_writes(), "createNodeIndex")
+    assert hits, f"the procedure write must be measured at all: {hits}"
+    assert sum(hits.values()) == 1, (
+        f"one procedure write counted {sum(hits.values())} times: {hits}")
+    catalogue = {str(cell) for row in proj.g.ro_query(
+        "CALL db.indexes()").result_set for cell in row}
+    assert any("Once" in entry for entry in catalogue), (
+        f"the procedure must have LANDED in measure mode; catalogue={catalogue}")
+
+
+def test_a_non_text_payload_does_not_break_the_suppression_key():
+    """The key derivation is TOTAL — a raw command head can be `bytes`.
+
+    RED before the fix, and it was a BUILD failure, not a census one: redis-py
+    accepts the bytes spelling of `execute_command`, and normalising that head
+    as text raised `TypeError: sequence item 0: expected str instance, bytes
+    found` on a legitimate dispatch (measured through
+    `_GuardedGraph.execute_command(b"COPY", "x")` on an unarmed embedded
+    projection — three #9209 tests, and the `test-d14-hosted-api` job).
+    """
+    from tortoise.projection import _dispatch_decided
+
+    class _Inner:
+        name = "probe"
+        client = None
+
+        def __init__(self):
+            self.calls = []
+
+        def execute_command(self, *args, **kwargs):
+            self.calls.append(args)
+            return "OK"
+
+    inner = _Inner()
+    assert _dispatch_decided(
+        inner, "execute_command", b"COPY", "probe") == "OK"
+    assert inner.calls == [(b"COPY", "probe")], (
+        "the payload must reach the handle unchanged — the key derivation is "
+        "an observation, never a rewrite")
+
+
 # ── the door is a §17.1 door, not a blanket refusal ───────────────────────
 
 def test_a_declared_lane_authorizes_the_client_handle(armed_sdk, enforced):
@@ -341,6 +448,19 @@ def test_a_write_handle_over_a_journal_less_projection_cannot_write_a_journals_c
         proj_victim = victim._get_proj()
         proj_outsider = outsider._get_proj()
         assert proj_victim._journal_backed and not proj_outsider._journal_backed
+        # ⛔ THIS SHAPE NEEDS BOTH PROJECTIONS ON ONE STORE, and the EMBEDDED lane
+        # gives every SDK its own (a private socket/file), so there the outsider's
+        # handle names ITS OWN graph `tortoise` — a graph no journal derives, which
+        # §17.1 correctly leaves alone (`test_a_graph_that_is_nobodys_cache_…`). The
+        # bypass this test is about is the same NAME in the SAME store, so the
+        # premise is unestablished rather than the door open: state it, and run it
+        # on the docker lane (`tools/test_lane.py uri`), which is where CI's `core`
+        # surface runs this file.
+        if _client_store_key(proj_victim.db) != _client_store_key(proj_outsider.db):
+            pytest.skip(
+                "needs both projections on ONE store (embedded gives each SDK its "
+                f"own): {_client_store_key(proj_victim.db)} != "
+                f"{_client_store_key(proj_outsider.db)}")
         # the shape that bypassed: a journal-LESS projection's write handle over
         # the journal-backed graph.
         handle = _GuardedGraph(
