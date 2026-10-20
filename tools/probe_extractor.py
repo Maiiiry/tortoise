@@ -96,11 +96,13 @@ def _render_kind_semantics(vocab: dict, ns: str, kinds: list[str]) -> str:
 # Measured before this change it still carried `document` (retired as an `objectKind` by D10 — a
 # document is a `:Source`, ONTOLOGY §4.4) and `concept` (retired by #2727), while OMITTING five
 # kinds §5 declares (`Problem`, `strategy`, `plan`, `goal`, `target`).
-# ⚠ HONESTY ABOUT ITS REACH (#2786 review): nothing in this repo CONSUMES this constant — the
-# prompt's kind menu is `CORE_SEMANTICS` below, rendered into `core_lines`. It is kept DERIVED
-# rather than deleted so that a future consumer (a probe script outside this repo) cannot pick up
-# a stale list, and it is NOT the surface this change fixes; the prompt fix is the two retired
-# descriptions dropped from `CORE_SEMANTICS`.
+# ⚠ HONESTY ABOUT ITS REACH (#2786 review): no PRODUCTION path renders this constant — the
+# prompt's kind menu is `CORE_SEMANTICS` below, rendered into `core_lines`; its only in-repo
+# reader is the guard `tests/test_kind_vocabulary_consistency.py`
+# ::test_extraction_probe_object_kinds_are_the_canonical_set, which pins its contents. It is
+# kept DERIVED rather than deleted so that a consumer (an out-of-repo probe script) cannot pick
+# up a stale list, and it is NOT the surface this change fixes; the prompt fix is the two
+# retired descriptions dropped from `CORE_SEMANTICS`.
 CORE_OBJECT_KINDS = ", ".join(sorted(_CANONICAL_OBJECT_KINDS))
 CORE_SUBJECT_KINDS = "organization, team, role, legalPerson, naturalPerson, other"
 # The DESCRIBED SUBSET of the canonical set — the entries that carry the confusable-kind hints,
