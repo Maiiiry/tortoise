@@ -143,6 +143,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1474,6 +1475,10 @@ def test_a_failed_in_place_rewrite_restores_the_original(tmp_path):
         "the injected write failure must be reported:\n" + done.stdout + done.stderr)
     assert "RESTORED" in done.stderr, (
         "the failure must say the original was restored:\n" + done.stderr)
+    # The message is not evidence: the first version printed RESTORED and then
+    # deleted the very backup it named. Require the bytes below AND that no
+    # "could NOT be restored" line appears.
+    assert "could NOT be restored" not in done.stderr, done.stderr
     assert target.read_text(encoding="utf-8") == original, (
         "the original bytes must be back, verbatim")
     assert (target.stat().st_mode & 0o777) == 0o444, (
@@ -1481,43 +1486,12 @@ def test_a_failed_in_place_rewrite_restores_the_original(tmp_path):
     assert target.stat().st_ino == alias.stat().st_ino, "the alias must not be split"
 
 
-# ── The rollback's OWN failure, and ownership on the rename path ─────────────
-#
-# Both are the same class of defect this file already polices one layer up: a run
-# that reports a good outcome it never checked. The in-place arms used to say "the
-# original was RESTORED" without testing the restore, and then deleted the backup;
-# a rename replaces the inode, so `cp` without `-p` silently re-owned the file.
+def test_a_signal_is_reported_as_a_failure_not_a_success(tmp_path):
+    """Review P1: the trap restored the bytes and RETURNED, so execution fell
+    through into the success report. Measured: rc 0 and a "✓ … upgraded" line over
+    an untouched file — a silent lie.
 
-# Every one-argument `cat` in the two in-place paths, plus the backup the rollback
-# reads: `cat "$staged" > "$target"` (replace), `cat "$block" >> "$target"` (append)
-# and `cat "$backup" > "$target"` (the rollback itself). Failing all three is the
-# point — a full disk breaks the restore for the same reason it broke the write.
-_ROLLBACK_CAT_SHIM = (
-    '#!/bin/sh\n'
-    'if [ $# -eq 1 ]; then\n'
-    '  case "$1" in\n'
-    '    *.tortoise-agents.*|*/block|*orig-agents.md) printf "PARTIAL"; exit 1 ;;\n'
-    '  esac\n'
-    'fi\n'
-    'exec /bin/cat "$@"\n'
-)
-
-
-@pytest.mark.parametrize("existing_block", [True, False], ids=["replace", "append"])
-def test_a_rollback_that_fails_says_so_and_keeps_the_original(tmp_path, existing_block):
-    """Review P1/P2: the in-place arms rolled back with an UNCHECKED `cat` and then
-    reported "the original was RESTORED from $backup" — while `_emit_fail` deleted
-    `$tmpdir`, which is where `$backup` lives.
-
-    The cause the message itself named is a full disk or a quota, and that is
-    exactly the condition under which writing the original bytes back ALSO fails:
-    the user got a truncated file, a claim that it had been restored, and no copy
-    of it anywhere. `undo_inplace` now returns the restore's real status (verified
-    with `cmp`) and a failed restore keeps the bytes beside the file and says the
-    file is PARTIAL.
-
-    Vacuous against the pre-fix code: it printed RESTORED, deleted the backup, and
-    the file stayed "PARTIAL".
+    A TERM during the in-place write must exit non-zero and leave the file alone.
     """
     base = _fixture_tree(tmp_path)
     installer = _patched_installer(tmp_path, base)
@@ -1526,8 +1500,83 @@ def test_a_rollback_that_fails_says_so_and_keeps_the_original(tmp_path, existing
     project = tmp_path / "project"
     project.mkdir()
     target = project / "AGENTS.md"
-    # The param picks the WRITE PATH as well as the shim: `replace` needs a block
-    # to replace, `append` needs a file with none.
+    original = f"# House\nUNIQUE-ONE\n\n{START}\nold block\n{END}\nTAIL\n"
+    target.write_text(original, encoding="utf-8")
+    # 0444 matters here: it is what makes the in-place window OBSERVABLE (the arm
+    # chmods it writable, and that transition is the signal to send TERM). Without
+    # it the test killed the installer during skill installation and proved nothing
+    # (observed rc=-15, empty output, original bytes untouched).
+    target.chmod(0o444)
+    alias = project / "CLAUDE.md"
+    alias.hardlink_to(target)
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake = shim / "cat"
+    # Slow ONLY the in-place rewrite, so the signal lands inside the window.
+    fake.write_text(
+        '#!/bin/sh\n'
+        'if [ $# -eq 1 ]; then\n'
+        '  case "$1" in\n'
+        '    *.tortoise-agents.*) sleep 4 ;;\n'
+        '  esac\n'
+        'fi\n'
+        'exec /bin/cat "$@"\n',
+        encoding="utf-8")
+    fake.chmod(0o755)
+
+    proc = subprocess.Popen(
+        ["bash", str(installer), "--harness", "codex"], cwd=str(project),
+        env={**os.environ, "HOME": str(home), "PATH": f"{shim}:{os.environ['PATH']}"},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Wait for the WINDOW rather than guessing a duration: the mode only changes
+    # once the in-place arm has made the file writable, which is the state the
+    # signal must recover from. A fixed sleep raced the skill installation and
+    # sometimes landed before the window (observed: mode 644 left behind because
+    # the signal arrived while the trap was not yet installed).
+    in_window = False
+    for _ in range(120):
+        if proc.poll() is not None:
+            break
+        staged = list(project.glob(".tortoise-agents.*"))
+        if (target.stat().st_mode & 0o777) != 0o444 and staged:
+            in_window = True
+            break
+        time.sleep(0.25)
+    assert in_window, "the in-place window never opened; the test proves nothing"
+    proc.terminate()
+    out, err = proc.communicate(timeout=120)
+
+    assert proc.returncode != 0, (
+        "an interrupted write must not exit 0:\n" + out + err)
+    assert "✓" not in out or "upgraded" not in out, (
+        "an interrupted write must not report success:\n" + out)
+    assert target.read_text(encoding="utf-8") == original, (
+        "the original bytes must be restored")
+    assert (target.stat().st_mode & 0o777) == 0o444, (
+        "the mode must be restored: got "
+        f"{oct(target.stat().st_mode & 0o777)}\nrc={proc.returncode}\n{out}\n{err}")
+
+
+@pytest.mark.parametrize("existing_block", [True, False], ids=["replace", "append"])
+def test_a_failed_restore_keeps_the_backup_and_does_not_claim_success(
+        tmp_path, existing_block):
+    """Review P1: the restore's status was swallowed with `2>/dev/null`, the
+    message said RESTORED unconditionally, and `_emit_fail` then deleted the tmpdir
+    holding the only intact copy. Measured: a 1-byte target, the backup gone, and a
+    claim that it had been restored.
+
+    When the restore cannot be verified the installer must say so and LEAVE the
+    intact copy, naming where it is. Parametrized over BOTH write paths: the
+    append arm's rollback had no test at all, and it fails a different command
+    (`cat "$block" >> "$target"` rather than `cat "$staged" > "$target"`).
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
     original = (f"# House\nUNIQUE-ONE\n\n{START}\nold block\n{END}\nTAIL\n"
                 if existing_block else "# House\nUNIQUE-ONE\n")
     target.write_text(original, encoding="utf-8")
@@ -1536,7 +1585,19 @@ def test_a_rollback_that_fails_says_so_and_keeps_the_original(tmp_path, existing
     shim = tmp_path / "shim"
     shim.mkdir()
     fake = shim / "cat"
-    fake.write_text(_ROLLBACK_CAT_SHIM, encoding="utf-8")
+    # Fail BOTH the in-place write and the restore of the backup: the same I/O
+    # fault, which is what makes an unverified restore dangerous.
+    fake.write_text(
+        '#!/bin/sh\n'
+        'if [ $# -eq 1 ]; then\n'
+        '  case "$1" in\n'
+        '    *.tortoise-agents.*|*/block|*orig-agents.md)\n'
+        '      case "$1" in *orig-agents.md) printf "X" ; exit 1 ;; esac\n'
+        '      printf "PARTIAL" ; exit 1 ;;\n'
+        '  esac\n'
+        'fi\n'
+        'exec /bin/cat "$@"\n',
+        encoding="utf-8")
     fake.chmod(0o755)
 
     done = subprocess.run(
@@ -1544,29 +1605,32 @@ def test_a_rollback_that_fails_says_so_and_keeps_the_original(tmp_path, existing
         env={**os.environ, "HOME": str(home), "PATH": f"{shim}:{os.environ['PATH']}"},
         capture_output=True, text=True, timeout=180)
 
-    assert done.returncode == 3, (
-        "the injected write failure must be reported:\n" + done.stdout + done.stderr)
-    assert "RESTORED" not in done.stderr, (
-        "a rollback that did not verify must NOT be reported as a restore:\n"
-        + done.stderr)
-    assert "could NOT restore it" in done.stderr and "PARTIAL" in done.stderr, (
-        "the failure must say the file is left partial:\n" + done.stderr)
-    kept = project / "AGENTS.md.tortoise-orig"
-    assert kept.exists(), (
-        "the original bytes must survive a failed rollback:\n" + done.stderr)
-    assert kept.read_text(encoding="utf-8") == original, (
-        "the kept copy must be the ORIGINAL bytes, verbatim")
-    assert "AGENTS.md.tortoise-orig" in done.stderr, (
-        "the failure must name where the original bytes are:\n" + done.stderr)
-    assert target.read_text(encoding="utf-8") == "PARTIAL", (
-        "the half-written file is what the user is warned about")
-    assert target.stat().st_ino == alias.stat().st_ino, "the alias must not be split"
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "could NOT be restored" in done.stderr, (
+        "an unverified restore must not be reported as a success:\n" + done.stderr)
+    assert "RESTORED" not in done.stderr.replace("could NOT be restored", ""), (
+        "the message must not also claim the restore succeeded:\n" + done.stderr)
+    # The backup lives in the installer's OWN mktemp dir, so it is found by
+    # reading the path out of the message rather than by guessing a location.
+    match = re.search(r"An intact copy is kept at: (\S+)", done.stderr)
+    assert match, "the message must name where the copy is:\n" + done.stderr
+    backup = Path(match.group(1))
+    assert backup.exists(), f"the named copy must exist: {backup}"
+    assert backup.read_text(encoding="utf-8") == original, (
+        "the surviving copy must hold the original bytes")
 
+# ── Ownership on the rename path, and the unwritable-directory fallback ─────
+#
+# Both are the same class of defect as the rollback: an outcome the code produced
+# without checking or reporting it. `cp` carries no ownership and a rename
+# replaces the inode, so a shared AGENTS.md came back owned by the installer; and
+# staging needs a writable DIRECTORY while the `>>` it replaced needed only a
+# writable FILE, so an install the old code handled was refused.
 
 _STAT_OWNER_SHIM = """#!/bin/sh
-# Report a FOREIGN owner (4242:4242) for AGENTS.md only; every other question is
-# the real one. The installer must put that owner back on the staged copy before
-# renaming it over the target.
+# Report a FOREIGN owner (4242:4242) for AGENTS.md only; every other question gets
+# the real answer. The installer must put that owner back on the staged copy
+# before renaming it over the target.
 if [ "$1" = "-c" ] && [ "$2" = "%u:%g" ] && [ "${3##*/}" = "AGENTS.md" ]; then
   echo "4242:4242"; exit 0
 fi
@@ -1581,11 +1645,11 @@ exec /usr/bin/stat "$@"
 def test_the_rename_path_restores_ownership_or_says_it_cannot(tmp_path, chown_succeeds):
     """Review P3: `cp` (not `cp -p`) carries no ownership and the rename path
     REPLACES the target's inode, so a single-link AGENTS.md owned by another user
-    or group would come back owned by whoever ran the install — silently. `main`
-    used `cp -p`, which preserved ownership or refused the install.
+    or group came back owned by whoever ran the install — silently. `cp -p`
+    preserved ownership or refused the install.
 
-    The owner is now restored where the process may, and where it may not the run
-    says so instead of re-owning the user's file without a word.
+    The owner is restored where the process may; where it may not, the run says so
+    instead of re-owning the user's file without a word.
 
     Vacuous against the pre-fix code: no `chown` was ever called, so [not-permitted]
     had no warning to find and [restored] had no call to point at.
@@ -1625,7 +1689,7 @@ def test_the_rename_path_restores_ownership_or_says_it_cannot(tmp_path, chown_su
         "the original owner must be restored on the staged copy before the rename:"
         f"\n{calls!r}\n{done.stderr}")
     assert ".tortoise-agents." in calls, (
-        f"ownership must be applied to the STAGED copy, not the directory:\n{calls!r}")
+        f"ownership must be applied to the STAGED copy:\n{calls!r}")
     assert "tortoise:block v" in target.read_text(encoding="utf-8"), "the block is written"
     if chown_succeeds:
         assert "ownership" not in done.stderr, (
@@ -1647,7 +1711,7 @@ def test_an_agents_md_in_a_read_only_directory_still_gets_a_block(tmp_path):
     A failed staging attempt now falls back to the in-place append — which keeps a
     copy first — so the block still lands and nothing is refused.
 
-    Vacuous against the pre-fix code: exit 3, `could not stage a temp file`, no
+    Vacuous against the pre-fix code: exit 3, `could not stage a temp file`, and no
     block anywhere.
     """
     base = _fixture_tree(tmp_path)

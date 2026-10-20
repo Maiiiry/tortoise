@@ -583,20 +583,19 @@ replaced in place, inside the fence — so that case warns too. A clean pair ABO
 the open fence is the one case that does NOT warn: it is rewritten where it
 already sits and stays readable. A file with more than one HARD LINK (`ln
 AGENTS.md CLAUDE.md` dual-names agent files) is written through the SAME inode
-instead of renamed, so the alias never keeps stale instructions, and a partial
-in-place write is rolled back to the original bytes — the restore is VERIFIED
-byte-for-byte before the run says so, and if it cannot be made the file is
-reported as PARTIAL with the original kept beside it (for a file called
-`AGENTS.md`, at `AGENTS.md.tortoise-orig`) instead of a restore being claimed.
-A read-only (`0444`) `AGENTS.md` is upgraded normally and kept read-only — the
-installer stages a writable copy and restores the mode — and if the mode cannot
-be read it refuses rather than rewrite the file with looser permissions. A file
-whose DIRECTORY the caller cannot write is appended in place rather than refused:
-staging needs a writable directory, while appending needs only a writable file,
-and a shared group-writable agent file commonly sits in a directory its user does
-not own. The owner and group of the file are restored on the copy that replaces
-it, and a change the installer is not allowed to make is reported rather than
-silently applied. Close the fence before re-running.
+instead of renamed, so the alias never keeps stale instructions, and a failed or
+interrupted in-place write is rolled back to the original bytes; if the rollback
+itself cannot be verified the installer exits 3, says so and leaves an intact
+copy at the path it prints. A file whose DIRECTORY the caller cannot write is
+appended in place rather than refused: staging needs a writable directory, while
+appending needs only a writable file, and a shared group-writable agent file
+commonly sits in a directory its user does not own. A read-only (`0444`)
+`AGENTS.md` is upgraded normally and kept read-only — the installer stages a
+writable copy and restores the mode — and if the mode cannot be read it refuses
+rather than rewrite the file with looser permissions. The owner and group of the
+file are restored on the copy that replaces it, and a change the installer is not
+allowed to make is reported rather than silently applied. Close the fence before
+re-running.
 
 Never hand-edit inside markers you did not write; the next refresh discards it.
 
