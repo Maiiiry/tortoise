@@ -28,12 +28,21 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
 import argparse
 import json
 import re
+import sys as _sys
 from pathlib import Path
 from pathlib import Path as _Path
 
 # ── Ontology vocabulary + SEMANTICS — compiled at runtime from the merged
 # packs (PackRegistry, the canonical source — same lineage as the value brief)
 import yaml
+
+# The ONE canonical object-kind set (#2786). Imported, never re-typed: the vocabulary this
+# probe compiles and the kind semantics below must agree with §5, and a hand-typed copy is
+# exactly how they stopped agreeing.
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from tortoise.pack_registry import (
+    CANONICAL_OBJECT_KINDS as _CANONICAL_OBJECT_KINDS,
+)
 
 
 def _compile_vocab(packs_dir: _Path) -> dict:
@@ -81,17 +90,27 @@ def _render_kind_semantics(vocab: dict, ns: str, kinds: list[str]) -> str:
     return "\n".join(lines)
 
 
-# Core kind semantics (ONTOLOGY §5 + canonical descriptions)
-CORE_OBJECT_KINDS = "Project, WorkItem, document, tag, user, skill, tool, agent, workflow, agreement, standard, concept, other"
+# Core kind semantics (ONTOLOGY §5 + canonical descriptions).
+#
+# ⛔ `CORE_OBJECT_KINDS` is DERIVED from the canonical set — never a fourth hand-typed copy.
+# Measured before this change: the literal still carried `document` (retired as an `objectKind`
+# by D10 — a document is a `:Source`, ONTOLOGY §4.4) and `concept` (retired by #2727), while
+# OMITTING five kinds §5 declares (`Problem`, `strategy`, `plan`, `goal`, `target`). A
+# kind-name list is an instruction to a model, so both directions steered it wrong.
+CORE_OBJECT_KINDS = ", ".join(sorted(_CANONICAL_OBJECT_KINDS))
 CORE_SUBJECT_KINDS = "organization, team, role, legalPerson, naturalPerson, other"
+# A DESCRIBED SUBSET of the canonical set — the entries that carry the confusable-kind hints,
+# which is why the guard on it is `⊆` and not `==`. ⛔ Every key must still be a canonical
+# `objectKind`: a description is an instruction ("emit this when…"), so a stale key asks the
+# model for a kind no read path can resolve (`document` and `concept` did exactly that).
+# Guarded by `tests/test_kind_vocabulary_consistency.py`
+# ::test_extraction_probe_semantics_are_canonical_kinds.
 CORE_SEMANTICS = {
     "Project": "A top-level initiative or product line",
     "WorkItem": "A unit of work (epic, issue, task)",
     "tool": "A tool, CLI, or utility used in the work",
     "workflow": "A reusable procedural sequence",
-    "document": "A document artifact",
     "standard": "A standard, spec, or canonical reference",
-    "concept": "An abstract idea or model — INCLUDING the system's own concepts (points, decisions, claims, options, criteria, lifecycle, the state-centric model). Sessions ABOUT the ontology produce concepts; do NOT force them into other/architecture/standard.",
     "other": "No fitting kind — the EXPLICIT uncertain/other bucket (never forced)",
 }
 NEAR_MISS_ENTITY_KINDS = (
@@ -139,7 +158,7 @@ THE CLAIM GATE (iteration 6 — the corrected discriminator): glue = talk ABOUT 
 
 ## Entity axis (what entities are mentioned) — CLOSED vocab WITH semantics (criteria v1 §2)
 Type every entity mention against the kind SEMANTICS below — never name-matching, never minted kinds. Prefer the MOST SPECIFIC kind; near-miss (⚠) → the closest kind WITH the flag and the confusable sibling named; no fit or low confidence → core:other EXPLICITLY + a pack-proposal note (never forced nearest-kind).
-CONFUSABLE GUARD: product-strategy:architecture is for the DESIGN/STRUCTURE of a solution ("the four-node chain architecture") — NOT for abstract models ("the state-centric model" → core:concept), NOT for implementation details ("Object MERGE key", "rate bucket" → dev:code or core:concept), NOT for work items ("quota fix" → dev:issue is wrong — it is a work item → core:WorkItem).
+CONFUSABLE GUARD: product-strategy:architecture is for the DESIGN/STRUCTURE of a solution ("the four-node chain architecture") — NOT for abstract models ("the state-centric model" → core:other: §5 declares NO `concept` object kind — #2727 retired it — so an abstract model with no fitting kind is the EXPLICIT other bucket), NOT for implementation details ("Object MERGE key", "rate bucket" → dev:code or core:other), NOT for work items ("quota fix" → dev:issue is wrong — it is a work item → core:WorkItem).
 
 CORE:
 {core_lines}

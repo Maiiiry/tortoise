@@ -61,6 +61,7 @@ from tortoise.commit_schema import CORE_POINT_KINDS, EVENT_KINDS, compile_vocab
 from tortoise.pack_registry import (
     CANONICAL_DOCUMENT_KINDS,
     CANONICAL_EVENT_KINDS,
+    CANONICAL_OBJECT_KINDS,
     CANONICAL_POINT_KINDS,
     CORE_KINDS,
     PackRegistry,
@@ -69,7 +70,8 @@ from tortoise.pack_registry import (
 from tortoise.subject_binding import subject_kind_names
 from tortoise.value_extractor import EVENT_KINDS as VALUE_EXTRACTOR_EVENT_KINDS
 
-_DOC = Path(__file__).resolve().parent.parent / "docs" / "ONTOLOGY.md"
+_ROOT = Path(__file__).resolve().parent.parent
+_DOC = _ROOT / "docs" / "ONTOLOGY.md"
 
 
 def _ontology_axis(heading: str) -> frozenset[str]:
@@ -305,3 +307,101 @@ def test_declared_subject_kinds_match_ontology():
         "subject kinds drifted from ONTOLOGY §5: "
         f"binder-only={sorted(binder - declared)}, "
         f"doc-only={sorted(declared - binder - {'other'})}")
+
+
+# ── the TOOLING copies: the extraction probe and the calibration harness ────
+#
+# Indicator 1 is "for each kind category there is exactly one canonical set, or a test asserts
+# `runtime_set == canonical_set`". #9146 landed that leg for the GATE and the PACK-FACING
+# layers; two MORE copies live under `tools/`, and neither was asserted. They are not inert
+# prose: `probe_extractor` is the classification prompt the extraction probe PUTS IN FRONT OF
+# THE MODEL, and `calibration_harness.VOCAB` is the set its `minted` metric treats as
+# in-vocabulary — so a retired kind in either one is a kind the model is instructed to emit and
+# the measurement then scores as CORRECT. The leg that was supposed to catch this
+# (`test_calibration_tools::test_probe_vocab_is_subset_of_packs_and_core`) compared the harness
+# copy against a second hand copy of the same list, so both sides carried the same stale
+# entries and it could never fire — a guard that agrees with itself.
+#
+# The fixture is the canonical set itself, never a transcription of it.
+
+
+def _tool_module(name: str):
+    """Import ``tools/<name>.py`` the way the harness does (``tools/`` on the path)."""
+    import sys
+
+    tools = str(_ROOT / "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    return __import__(name)
+
+
+def _prompt_core_kinds(prompt: str) -> set[str]:
+    """Every ``core:<kind>`` spelling the prompt instructs the model with."""
+    return {tok.split(":", 1)[1]
+            for tok in re.findall(r"\bcore:[A-Za-z_][A-Za-z0-9_]*", prompt)}
+
+
+def test_extraction_probe_object_kinds_are_the_canonical_set():
+    """``probe_extractor.CORE_OBJECT_KINDS`` is the canonical set, not a fourth copy.
+
+    Measured before this leg existed: the probe advertised ``document`` (retired as an
+    ``objectKind`` by D10 — a document is a ``:Source``, ONTOLOGY §4.4) and ``concept``
+    (retired by #2727), while OMITTING five kinds §5 declares — ``Problem``, ``strategy``,
+    ``plan``, ``goal``, ``target``. Both directions are wrong in the same way: the probe could
+    not name a canonical core kind and could name two that resolve nowhere.
+    """
+    pe = _tool_module("probe_extractor")
+    probe = {k.strip() for k in pe.CORE_OBJECT_KINDS.split(",") if k.strip()}
+    assert probe == set(CANONICAL_OBJECT_KINDS), (
+        "probe_extractor.CORE_OBJECT_KINDS drifted from CANONICAL_OBJECT_KINDS: "
+        f"probe-only={sorted(probe - set(CANONICAL_OBJECT_KINDS))}, "
+        f"canonical-only={sorted(set(CANONICAL_OBJECT_KINDS) - probe)}")
+
+
+def test_extraction_probe_semantics_are_canonical_kinds():
+    """The probe's kind→semantics table may describe only kinds the vocabulary declares.
+
+    A description is an INSTRUCTION ("emit this when…"), so a stale entry does not sit there
+    harmlessly — it asks the model for a kind no read path can resolve. The table is also
+    allowed to describe a SUBSET (it carries the confusable-kind hints, not the whole axis), so
+    the assertion is ``⊆``, one-directional on purpose.
+    """
+    pe = _tool_module("probe_extractor")
+    stale = set(pe.CORE_SEMANTICS) - set(CANONICAL_OBJECT_KINDS)
+    assert not stale, (
+        "probe_extractor.CORE_SEMANTICS describes kinds that are not canonical — the probe "
+        f"instructs the model to emit them: {sorted(stale)}")
+
+
+def test_extraction_prompt_advertises_only_canonical_core_kinds():
+    """The BUILT prompt — where the copies actually reach the model — names no stale kind.
+
+    The two constants above are the source; this is the surface. Reading the assembled system
+    prompt (rather than either constant) is what makes the leg catch a stale mention in the
+    prompt's own prose: the ``core:concept`` instruction lived in the confusable-kind guard
+    paragraph, not in ``CORE_SEMANTICS``, and would have survived a fix to the table alone.
+    """
+    pe = _tool_module("probe_extractor")
+    prompt = pe._build_extraction_system(_ROOT / "packs")
+    stale = _prompt_core_kinds(prompt) - set(CANONICAL_OBJECT_KINDS)
+    assert not stale, (
+        "the extraction probe's system prompt instructs the model with non-canonical core "
+        f"kinds: {sorted(stale)}")
+    # Vacuity control: the prompt really does carry core kinds, so an empty parse cannot pass.
+    assert _prompt_core_kinds(prompt), "no `core:<kind>` token found in the prompt at all"
+
+
+def test_calibration_harness_core_vocabulary_is_the_canonical_set():
+    """``calibration_harness.VOCAB``'s ``core:`` half is exactly the canonical set.
+
+    ``metrics()`` counts an entity whose kind is NOT in ``VOCAB`` as ``minted`` — so a stale
+    member does not merely fail to catch drift, it ABSORBS it: an extractor emitting the
+    retired ``core:document`` was scored as in-vocabulary. Measured before this leg existed:
+    the ``core:`` half carried ``concept``/``document`` and omitted ``Problem``.
+    """
+    ch = _tool_module("calibration_harness")
+    core = {k.split(":", 1)[1] for k in ch.VOCAB if k.startswith("core:")}
+    assert core == set(CANONICAL_OBJECT_KINDS), (
+        "calibration_harness.VOCAB's core: half drifted from CANONICAL_OBJECT_KINDS: "
+        f"harness-only={sorted(core - set(CANONICAL_OBJECT_KINDS))}, "
+        f"canonical-only={sorted(set(CANONICAL_OBJECT_KINDS) - core)}")
