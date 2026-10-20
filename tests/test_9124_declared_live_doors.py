@@ -1244,8 +1244,20 @@ def _resolve_callee(name: str, module, path: Path):
     return None, module, path
 
 
+#: How many indirection hops the fragment walk follows before it declares the
+#: statement unreadable. A BACKSTOP, not the mechanism that keeps the walk
+#: finite — `visited` does that — so it sits well below the deepest chain on the
+#: real tree (measured 11 for `_uncalibrated_ep_participants`) and, when it is
+#: reached, it REPORTS the blind spot instead of returning in silence.
+_FRAGMENT_DEPTH_CAP = 16
+
+#: `dir(builtins)`, hoisted: it was rebuilt every time an UNBOUND name was
+#: walked, which is exactly the arm whose cost grows with the statement.
+_BUILTIN_NAMES = frozenset(dir(builtins))
+
+
 def _fragments_of(expr, bindings, params, module, path, followed, unread,
-                  depth: int = 0) -> list[str]:
+                  depth: int = 0, visited=None) -> list[str]:
     """String fragments that can flow out of `expr`, following indirection.
 
     `bindings`/`params` belong to the ENCLOSING scope; a callee is followed with
@@ -1255,11 +1267,38 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
     Anything that cannot be resolved is added to `unread` rather than skipped —
     the census's own polarity (a fragment that cannot be shown read-only is not
     called read-only), so a blind spot cannot be inherited silently. Parameters
-    and builtins are the exception: they carry bind data and integers.
+    are the exception: they carry bind data and integers. A BUILTIN name is
+    benign only when this walk holds the module it came from and the module does
+    not bind that name (`format`, `set`, `next` are ordinary variable names) —
+    with no module AST there is nothing to check it against, so it is reported.
+
+    Two guards, and their POLARITY is the point:
+
+    * `visited` — `(expression, the scope it was resolved in)` pairs already
+      inspected. Without it the walk re-expanded the same subgraph on every
+      path: the real `_uncalibrated_ep_participants` walk collected 275 fragments
+      of which 230 were repeats of a literal it had already seen, where the
+      guard collects 77 — and, because it is no longer the thing keeping the
+      walk finite, 10 fragments that the old ceiling cut are now inspected.
+    * `_FRAGMENT_DEPTH_CAP` — a backstop for a binding CYCLE, and it REPORTS.
+      It used to `return fragments` in silence: past six hops a write held in a
+      variable was neither inspected nor added to `unread`, so the pin stayed
+      green over a writing row (`_uncalibrated_ep_participants` already assembles
+      its statement at depth 7-11 — one hop from live code, not a distant
+      ceiling). A cap may stop the walk; it may never call the fragment read.
     """
+    if visited is None:
+        visited = {}
     fragments = _string_constants(expr)
-    if depth > 6:
+    if depth > _FRAGMENT_DEPTH_CAP:
+        unread.add(
+            f"<depth cap {_FRAGMENT_DEPTH_CAP} reached at "
+            f"{ast.dump(expr)[:60]}>")
         return fragments
+    seen = visited.setdefault(id(expr), [])
+    if any(scope is bindings for scope in seen):
+        return []  # already inspected in this exact scope; nothing new to add
+    seen.append(bindings)  # RETAINED, so this `id` cannot be recycled under us
     call_names = {id(node.func) for node in ast.walk(expr)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     for sub in ast.walk(expr):
@@ -1272,7 +1311,8 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
                 for returned in _function_returns(callee):
                     fragments.extend(_fragments_of(
                         returned, callee_bindings, _params_of(callee),
-                        callee_module, callee_path, followed, unread, depth + 1))
+                        callee_module, callee_path, followed, unread, depth + 1,
+                        visited))
             continue
         if not isinstance(sub, ast.Name) or id(sub) in call_names:
             # A callee NAME is handled above; naming it again here would report
@@ -1282,13 +1322,23 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
             for value in bindings[sub.id]:
                 fragments.extend(_fragments_of(
                     value, bindings, params, module, path, followed, unread,
-                    depth + 1))
+                    depth + 1, visited))
         elif module is not None and sub.id in _module_bindings(module):
             for value in _module_bindings(module)[sub.id]:
                 fragments.extend(_fragments_of(
                     value, bindings, params, module, path, followed, unread,
-                    depth + 1))
-        elif sub.id in params or sub.id in dir(builtins):
+                    depth + 1, visited))
+        elif sub.id in params:
+            continue
+        elif (sub.id in _BUILTIN_NAMES and module is not None
+                and sub.id not in _module_bindings(module)):
+            # The builtin ITSELF, and that is a claim this walk can only make
+            # when it holds the module: a name that SHADOWS a builtin is a
+            # binding, and the two branches above already followed it (local
+            # first, then module) — so the ORDER is what resolves a shadow, and
+            # `format = " SET …"` at module level is inspected rather than
+            # skipped as a scalar. With no module AST there is nothing to check
+            # the name against, so it falls through to `unread`.
             continue
         else:
             unread.add(sub.id)
@@ -1442,13 +1492,15 @@ def _census_writer_names() -> frozenset[str]:
     answer to "does this name write" — using it here keeps this pin from
     introducing a second, narrower notion of "write" (#3595's shared-decision
     precedent, which this file's module docstring states). Keys are
-    scope-qualified (`TortoiseSDK.set_point_baseline`), resolved to the LAST
-    component exactly as `_inventory_of` resolves them.
+    scope-qualified (`TortoiseSDK.set_point_baseline`) and are resolved with
+    `_bare_name`, the SAME resolver `_inventory_of` uses — it strips the
+    `@<lineno>` suffix too, so a same-scope redefinition cannot make a writer
+    name unmatchable by accident.
     """
     cached = _CENSUS_WRITER_NAMES.get("names")
     if cached is None:
         surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
-        cached = frozenset(key.rsplit(".", 1)[-1] for key in surface)
+        cached = frozenset(_bare_name(key) for key in surface)
         _CENSUS_WRITER_NAMES["names"] = cached
     return cached
 
@@ -1489,7 +1541,10 @@ def _calibration_read_offenders(functions, readers=_CALIBRATION_READERS,
             offenders.append(
                 f"{name}: {sorted(unread)} could not be read out of the "
                 "statement at all, so this pin cannot say the row is a read — "
-                "resolve them, or extend the resolver and say why")
+                "resolve them, or extend the resolver and say why (a "
+                "`<depth cap …>` entry means the walk gave up on a binding "
+                "cycle or a chain longer than `_FRAGMENT_DEPTH_CAP`: raise it "
+                "and re-check, never delete the row on this message alone)")
         assembled = " ".join(fragments)
         write = _assembled_write_evidence(assembled)
         if write:
@@ -1621,6 +1676,134 @@ def test_the_write_pin_uses_the_shared_write_classifier():
         "a READ whose property names look like clauses was flagged as a write "
         "— the canonical classifier excludes `n.SET`/`n.DROP` (#7174), so a "
         "local regex without that lookbehind would false-red this pin")
+
+
+def _chain_source(poke_links: int) -> str:
+    """A reader whose ONLY write clause sits behind `poke_links` NAME hops.
+
+    The read shape stays in the statement itself, so a walk that stops following
+    names still sees `RETURN n.id` and still sees no write: the fragment below is
+    exactly the shape where following indirection is the whole check.
+    """
+    lines = [
+        "class Door:",
+        "    def reading(self, proj):",
+        '        query = (f"MATCH (n:Point) WHERE n.id IN $ids"',
+        '                 " RETURN n.id ")',
+        '        p0 = " SET n.poked = 1"',
+    ]
+    for link in range(1, poke_links):
+        lines.append(f'        p{link} = f"{{p{link - 1}}}"')
+    lines.append(f'        query += f"{{p{poke_links - 1}}}"')
+    lines.append("        return proj.g.query(query).result_set")
+    return "\n".join(lines) + "\n"
+
+
+def _offenders_for(source: str, read_shape: str = "RETURN n.id",
+                   with_module: bool = False) -> list[str]:
+    """`_calibration_read_offenders` over a synthetic source, no census walk.
+
+    `with_module` threads the parsed source as the module AST, which is what the
+    real pin does (`sdk.py`); without it the module-constant hop is disabled and
+    a name that only the MODULE binds is unreadable — the documented polarity of
+    `_fragments_of`.
+    """
+    tree = ast.parse(source)
+    functions = {node.name: node for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return _calibration_read_offenders(
+        functions, (("reading", read_shape),),
+        module=tree if with_module else None, writers=frozenset())
+
+
+def test_the_fragment_walk_follows_a_name_past_six_hops():
+    """NON-VACUITY for the depth cap in `_fragments_of` (review P2).
+
+    The walk returned its string constants and STOPPED at `depth > 6`, without
+    recording anything in `unread` — so past six hops a write held in a
+    VARIABLE was neither inspected nor reported, and
+    `_calibration_read_offenders` (`if unread:`) had nothing to say. Measured on
+    the real tree, `_uncalibrated_ep_participants` assembles its statement at
+    depth 7-11, i.e. the ceiling was already a single hop from live code: here
+    the write is 12 name hops down, the read shape is satisfied at the top, and
+    the pre-fix walk came back clean over a statement that writes.
+    """
+    offenders = _offenders_for(_chain_source(12))
+    assert any("not a read any more" in offender for offender in offenders), (
+        "a write reached through 12 name hops produced no offender, so the "
+        "depth ceiling silently dropped it — the pin stays green over a "
+        f"writing row (offenders={offenders})")
+
+
+def test_the_fragment_walk_fails_closed_at_the_depth_cap():
+    """NON-VACUITY for the CAP ITSELF: it must report, never return in silence.
+
+    A cap is unavoidable (the walk follows names, and a binding cycle would
+    otherwise recurse forever), but its polarity has to be the census's: a
+    fragment that cannot be shown read-only is NOT called read-only. The chain
+    below is deliberately deeper than any sane cap, so the pin must red with the
+    blind spot named — the pre-fix `return fragments` said nothing at all and
+    this same function came back clean.
+    """
+    offenders = _offenders_for(_chain_source(40))
+    assert any("depth cap" in offender for offender in offenders), (
+        "the walk hit its depth ceiling and reported nothing, so a write "
+        "deeper than the ceiling is invisible AND unannounced — a silent "
+        f"blind spot is the fail-open this pin exists to prevent "
+        f"(offenders={offenders})")
+
+
+def test_a_builtin_shadowing_name_is_resolved_not_assumed_scalar():
+    """The builtin arm is BENIGN only for a name the walk can PROVE is a builtin.
+
+    `sub.id in dir(builtins)` skipped every builtin-shaped name as though it
+    carried a scalar, rebuilding `dir(builtins)` once per name. Three states are
+    pinned here:
+
+    * a MODULE-level binding that shadows a builtin (`format`, `set`, `next` are
+      ordinary variable names) resolves through the module hop, so its fragment
+      — a write, here — is inspected;
+    * the same shadow with NO module AST is reported in `unread` rather than
+      skipped: with nothing to check the name against, "this is the builtin" is
+      a claim the walk cannot make. This half is NON-VACUOUS — the pre-fix arm
+      skipped it in silence and the function came back clean over a write;
+    * a name that really IS the builtin stays benign (no offender, no `unread`).
+
+    The first half is a regression guard rather than a non-vacuity case: the
+    local-then-module branches already preceded the builtin arm, so the ORDER
+    was already resolving a shadow — what is new is that the arm states that
+    dependency instead of relying on it invisibly.
+    """
+    shadowing = (
+        'format = " SET n.poked = 1"\n'
+        '\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id "\n'
+        '        query += f"{format}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(shadowing, with_module=True)
+    assert any("not a read any more" in offender for offender in offenders), (
+        "a module-level binding that SHADOWS a builtin was skipped as a "
+        f"scalar, so its statement fragment was never inspected "
+        f"(offenders={offenders})")
+    blind = _offenders_for(shadowing)
+    assert any("could not be read out" in offender for offender in blind), (
+        "with no module AST the walk cannot tell a shadowing name from the "
+        "builtin, and it skipped it anyway — a silent blind spot is the "
+        f"fail-open this pin exists to prevent (offenders={blind})")
+
+    # …and a name that IS the builtin stays benign: no offender, no `unread`.
+    benign = (
+        'class Door:\n'
+        '    def reading(self, proj, ids):\n'
+        '        query = (f"MATCH (n:Point) WHERE n.id IN $ids "\n'
+        '                 f"LIMIT {int(len(ids) > 0)}")\n'
+        '        query += " RETURN n.id"\n'
+        '        return proj.g.query(query).result_set\n')
+    assert not _offenders_for(benign, with_module=True), (
+        "a genuine builtin call in the statement was reported as unread, so "
+        "every `int(...)`/`len(...)` fragment would red the pin")
 
 
 def test_the_handle_reach_count_follows_an_alias():
