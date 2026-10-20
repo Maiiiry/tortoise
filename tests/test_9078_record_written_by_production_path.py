@@ -55,6 +55,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -775,31 +776,238 @@ def test_a_scratch_event_log_is_born_non_durable(tmp_path):
     assert scratch.path == tmp_path / "scratch.jsonl"
 
 
+#: The roots the scratch-journal pin WALKS. Declared here, and pinned by
+#: `test_the_scratch_journal_pin_walks_every_declared_root` below, because a
+#: detector whose corpus is NARROWER than its claim is how the
+#: `graph-scripts/smoke_test.py` site survived: the pin said "every temp-file
+#: journal" while walking `tortoise/**` only (#9231 review P2).
+SCRATCH_JOURNAL_ROOTS = ("tortoise", "graph-scripts")
+
+#: Spellings that produce a path (or a directory) nothing holds after the run.
+_SCRATCH_FACTORY_NAMES = (
+    "tempfile", "mkdtemp", "temporarydirectory", "temporaryfile",
+)
+
+
+def _scope_nodes(scope: ast.AST):
+    """Every node of ONE scope, without descending into a nested scope.
+
+    The taint below is deliberately per-scope: a name is scratch because THIS
+    function bound it from `tempfile`, and a same-named local in another
+    function must not inherit that (a false positive would delete a durable
+    journal's marker, the opposite error).
+    """
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                             ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _target_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, (ast.Tuple, ast.List)):
+        out: set[str] = set()
+        for element in node.elts:
+            out |= _target_names(element)
+        return out
+    return set()
+
+
+def _scratch_mentions(node: ast.AST | None) -> bool:
+    """Does this expression name a temp-path factory? (`tempfile.mkdtemp(…)`)"""
+    if node is None:
+        return False
+    text = ast.unparse(node).lower()
+    return any(factory in text for factory in _SCRATCH_FACTORY_NAMES)
+
+
+def _references(node: ast.AST | None, names: set[str]) -> bool:
+    if node is None or not names:
+        return False
+    return any(isinstance(sub, ast.Name) and sub.id in names
+               for sub in ast.walk(node))
+
+
+def _scratch_names_in_scope(scope: ast.AST) -> set[str]:
+    """Names bound to a temp path in ONE scope, transitively.
+
+    `os.path.join(tmpdir, …)` is the spelling that walked past the old textual
+    rule (`"tempfile" in ast.unparse(call)`) even though the directory it joins
+    came from `TemporaryDirectory()`: the call names `tmpdir`, not `tempfile`.
+    So bindings are propagated to a fixpoint instead of pattern-matched — the
+    alias, the `os.path.join`, and the `Path(tmpdir)` wrapper are all the same
+    journal.
+    """
+    tainted: set[str] = set()
+    bindings: list[tuple[list[ast.AST], ast.AST | None]] = []
+    for node in _scope_nodes(scope):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None and _scratch_mentions(
+                        item.context_expr):
+                    tainted |= _target_names(item.optional_vars)
+        elif isinstance(node, ast.Assign):
+            bindings.append((list(node.targets), node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            bindings.append(([node.target], node.value))
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in bindings:
+            if _scratch_mentions(value) or _references(value, tainted):
+                for target in targets:
+                    fresh = _target_names(target) - tainted
+                    if fresh:
+                        tainted |= fresh
+                        changed = True
+    return tainted
+
+
+def _scratch_journal_offenders(rel: str, source: str) -> list[str]:
+    """Every `EventLog(<temp path>)` construction in ONE module.
+
+    `EventLog.scratch(…)` is an attribute call, so it is never an offender —
+    that method IS the remedy.
+    """
+    offenders: list[str] = []
+    tree = ast.parse(source, filename=rel)
+    scopes = [tree] + [node for node in ast.walk(tree) if isinstance(
+        node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    seen: set[int] = set()
+    for scope in scopes:
+        tainted = _scratch_names_in_scope(scope)
+        for node in _scope_nodes(scope):
+            if not isinstance(node, ast.Call) or id(node) in seen:
+                continue
+            func = node.func
+            if getattr(func, "id", None) != "EventLog":
+                continue
+            if _scratch_mentions(node) or any(
+                    _references(arg, tainted) for arg in node.args):
+                seen.add(id(node))
+                offenders.append(f"{rel}:{node.lineno} {ast.unparse(node)}")
+    return offenders
+
+
+def _scratch_journal_corpus() -> list[Path]:
+    """The globbed roots ∩ `git ls-files` — the tracked, reviewable scope.
+
+    Intersecting with the index is what makes the claim checkable: an untracked
+    draft under `graph-scripts/` cannot silently widen the corpus, and a
+    directory that stops existing reds the reach pin below instead of quietly
+    shrinking the pin's reach.
+    """
+    proc = subprocess.run(
+        ["git", "ls-files", "--", *SCRATCH_JOURNAL_ROOTS],
+        cwd=REPO_ROOT, capture_output=True, text=True)
+    assert proc.returncode == 0, f"git ls-files failed:\n{proc.stderr}"
+    tracked = {rel for rel in proc.stdout.splitlines() if rel.endswith(".py")}
+    corpus: list[Path] = []
+    for root in SCRATCH_JOURNAL_ROOTS:
+        corpus.extend(sorted((REPO_ROOT / root).rglob("*.py")))
+    return [p for p in corpus
+            if p.relative_to(REPO_ROOT).as_posix() in tracked]
+
+
+def test_the_scratch_journal_pin_walks_every_declared_root():
+    """The pin's CORPUS, not just its rule, is asserted (#9231 review P2).
+
+    The rule was right and the corpus was `tortoise/**` only, so a live
+    counterexample (`graph-scripts/smoke_test.py`, a `TemporaryDirectory()`
+    journal feeding `EventAPI`, whose rows nothing can replay) sat outside the
+    claim the test's own message made. Reach is part of the assertion now: each
+    declared root must contribute files, and the unsorted package root cannot
+    be the only one.
+    """
+    corpus = _scratch_journal_corpus()
+    per_root = {
+        root: [p for p in corpus
+               if p.relative_to(REPO_ROOT).as_posix().startswith(f"{root}/")]
+        for root in SCRATCH_JOURNAL_ROOTS
+    }
+    empty = [root for root, files in per_root.items() if not files]
+    assert empty == [], (
+        f"declared scratch-journal root(s) {empty} contributed NO tracked "
+        f"files — a corpus that silently shrank reads as CLEAN; "
+        f"corpus={sorted(str(p) for p in corpus)[:5]}…")
+
+
+def test_the_scratch_journal_detector_catches_the_alias_spelling():
+    """The rule itself is pinned, positively AND negatively.
+
+    `os.path.join(tmpdir, "events.jsonl")` names `tmpdir`, not `tempfile`, so a
+    textual rule reads it as durable. These are the two live spellings (the
+    MCP lane's `mkdtemp`, `graph-scripts/smoke_test.py`'s `TemporaryDirectory`)
+    plus the negatives that keep the rule from swallowing a durable journal.
+    """
+    offenders = _scratch_journal_offenders("synthetic.py", '''
+import os
+import tempfile
+from tortoise.log import EventLog
+
+
+def smoke(tmpdir):
+    with tempfile.TemporaryDirectory(prefix="tortoise_smoke_") as tmpdir:
+        log = EventLog(os.path.join(tmpdir, "events.jsonl"))
+        return log
+''')
+    assert len(offenders) == 1, offenders
+    assert "events.jsonl" in offenders[0], offenders
+
+    assert _scratch_journal_offenders("synthetic.py", '''
+import tempfile
+from tortoise.log import EventLog
+
+log = EventLog(tempfile.mkdtemp() + "/events.jsonl")
+'''), "a direct `mkdtemp()` argument must be red"
+
+    # Negatives: the remedy, a durable path, and a same-named local in another
+    # scope (the taint is per-scope, so this must NOT be flagged).
+    assert _scratch_journal_offenders("synthetic.py", '''
+import tempfile
+from pathlib import Path
+from tortoise.log import EventLog
+
+
+def scratch_ok():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        return EventLog.scratch(Path(tmpdir) / "events.jsonl")
+
+
+def durable_ok(tmpdir):
+    return EventLog("/var/lib/tortoise/events.jsonl")
+''') == [], "`scratch()` and a durable path must both stay green"
+
+
 def test_every_tempfile_backed_event_log_is_built_with_scratch():
     """AST pin: a `tempfile` journal site cannot file rows from a scratch file.
 
     The behavioural legs above drive the demo lane and the in-memory lane; this
-    one catches the NEXT temp-file site, and the exact shape the MCP lane had
-    before `scratch()` existed (`EventLog(os.path.join(tempfile.mkdtemp(…), …))`)
-    — that spelling is red because the constructor call names `tempfile`.
+    one catches the NEXT temp-file site, in every root the shipped code and the
+    repo's runnable scripts live in (`SCRATCH_JOURNAL_ROOTS`) — the spelling the
+    MCP lane had before `scratch()` existed
+    (`EventLog(os.path.join(tempfile.mkdtemp(…), …))`) AND the aliased one
+    `graph-scripts/smoke_test.py` had (`EventLog(os.path.join(tmpdir, …))`
+    inside a `TemporaryDirectory` block, which names no `tempfile` at the call
+    and walked past the old textual rule).
+
+    LIMIT, stated so it is not read as more than it is: this is a per-scope
+    NAME-TAINT rule, not interprocedural. A temp path handed through a helper
+    call (`EventLog(_journal_path(tmpdir))`) is not caught; closing that needs a
+    resolver, not a bigger word list.
     """
     offenders: list[str] = []
-    for path in sorted((REPO_ROOT / "tortoise").rglob("*.py")):
+    for path in _scratch_journal_corpus():
         source = path.read_text(encoding="utf-8")
         if "EventLog(" not in source:
             continue
         rel = path.relative_to(REPO_ROOT).as_posix()
-        for node in ast.walk(ast.parse(source, filename=rel)):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(
-                func, "id", None)
-            if name != "EventLog":
-                continue
-            call = ast.unparse(node).lower()
-            if "tempfile" in call or "mkdtemp" in call:
-                offenders.append(f"{rel}:{node.lineno} {ast.unparse(node)}")
+        offenders.extend(_scratch_journal_offenders(rel, source))
     assert offenders == [], (
         "a temp-file journal is a SCRATCH buffer: build it with "
         f"`EventLog.scratch(…)`, not `EventLog(…)` — {offenders}")

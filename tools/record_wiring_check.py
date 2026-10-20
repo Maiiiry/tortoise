@@ -37,6 +37,25 @@ no Postgres exists.
 """
 from __future__ import annotations
 
+import sys
+
+# #5128: refuse a <3.12 interpreter before the imports below.
+if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
+    # #4053: this is an ENVIRONMENT failure, not a wiring verdict. `SystemExit(<str>)`
+    # exits 1, which is NOT WIRED — so a check that never ran would be read by this
+    # tool's own consumer as "the record is not wired", the exact mis-attribution the
+    # sibling tool (`collision_preflight.py`) documents. Emit the message on stderr and
+    # exit 2, CANNOT ANSWER. The constant is defined below; this guard necessarily runs
+    # before it (and before the imports, #5128), so the value is spelled out with the
+    # name in this comment rather than referenced.
+    print(
+        f"record-wiring-check: requires Python >= 3.12 (got "
+        f"{sys.version_info[0]}.{sys.version_info[1]}) — run it as "
+        f"`uv run python tools/record_wiring_check.py`",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)  # EXIT: CANNOT ANSWER — not 1 (NOT WIRED)
+
 import argparse
 import ast
 import json
