@@ -242,13 +242,40 @@ def _escape_handle_names(enclosing: ast.AST) -> set[str]:
     handles: set[str] = set()
     for sub in ast.walk(enclosing):
         if (
-            isinstance(sub, ast.Assign)
+            isinstance(sub, (ast.Assign, ast.AnnAssign))
             and isinstance(sub.value, ast.Call)
             and getattr(sub.value.func, "attr", None) == "select_graph"
         ):
-            for target in sub.targets:
+            for target in (sub.targets if isinstance(sub, ast.Assign)
+                           else [sub.target]):
                 handles |= _bound_names(target)
     return handles
+
+
+def _rebound_handles(enclosing: ast.AST, handles: set[str]) -> set[str]:
+    """Escape-handle names ALSO bound to something that is not `select_graph`.
+
+    The handle set is per FUNCTION; a binding is per ASSIGNMENT (#9150 review
+    cycle 6, P2). `tortoise/hosted_api.py::register_user` issues TWO sites, one
+    per arm of `if is_supabase_enabled(): … else:`, and BOTH arms bind the same
+    name `org_graph` — so closing one arm on `proj.g` is exactly the §17.1
+    violation this file exists to see, and a per-function handle set certified
+    it green (measured on that two-arm shape: `offenders: []`). Fail closed: a
+    name bound both ways at this head is reported as an offender, because the
+    detector cannot tell which binding the sink used.
+    """
+    rebound: set[str] = set()
+    for sub in ast.walk(enclosing):
+        if not isinstance(sub, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = sub.value
+        if (isinstance(value, ast.Call)
+                and getattr(value.func, "attr", None) == "select_graph"):
+            continue
+        for target in (sub.targets if isinstance(sub, ast.Assign)
+                       else [sub.target]):
+            rebound |= _bound_names(target)
+    return rebound & handles
 
 
 def _statement_sinks(
@@ -293,16 +320,31 @@ def _statement_sinks(
 
 
 def _not_on_the_escape_handle(
-    enclosing: ast.AST, issued: set[str], handles: set[str]
+    enclosing: ast.AST, issued: set[str], handles: set[str],
+    rebound: set[str] | None = None,
 ) -> list[str]:
-    """Sinks where the statement leaves the `select_graph` handle, rendered."""
+    """Sinks where the statement leaves the `select_graph` handle, rendered.
+
+    `rebound` is the fail-closed half of the handle rule (#9150 review cycle 6,
+    P2): a name the same function ALSO binds from something other than
+    `select_graph(...)` cannot certify a sink, because the detector cannot tell
+    which binding that sink used.
+    """
+    rebound = rebound or set()
     offenders: list[str] = []
     for lineno, callee, receiver, passed in _statement_sinks(enclosing, issued):
-        if callee.rsplit(".", 1)[-1] == "query" and receiver in handles:
+        if (
+            callee.rsplit(".", 1)[-1] == "query"
+            and receiver in handles
+            and receiver not in rebound
+        ):
             continue
+        why = (f" — the name is ALSO bound off the `select_graph` handle "
+               f"elsewhere in this function: {sorted(rebound)}"
+               if receiver in rebound else "")
         offenders.append(
             f"line {lineno}: {callee}({', '.join(passed)}) — "
-            f"escape-(3) handle(s): {sorted(handles)}"
+            f"escape-(3) handle(s): {sorted(handles)}{why}"
         )
     return offenders
 
@@ -636,7 +678,9 @@ def test_every_eager_init_site_issues_its_statement_on_the_escape_three_handle()
                 f"statement to {sorted(issued)} but nothing in the function "
                 "consumes it — re-derive the residual rather than assuming it"
             )
-            offenders = _not_on_the_escape_handle(enclosing, issued, handles)
+            offenders = _not_on_the_escape_handle(
+                enclosing, issued, handles,
+                _rebound_handles(enclosing, handles))
             assert not offenders, (
                 f"{rel}:{node.lineno} ({enclosing.name}) no longer issues the "
                 f"eager-init statement on the escape-(3) handle: {offenders}. "
@@ -647,12 +691,14 @@ def test_every_eager_init_site_issues_its_statement_on_the_escape_three_handle()
 
 
 def test_the_issuance_detector_reds_on_the_guarded_handle_and_on_run():
-    """The instrument check for the pin above — it must RED on the two closures.
+    """The instrument check for the pin above — it must RED on every closure.
 
-    Written because the pin it guards is worthless if it cannot fire: the
-    previous revision passed on both of these mutations (proved in the review),
-    because it never linked the statement to the handle. Both snippets below are
-    the STATEMENT used correctly, changed only in where it is issued.
+    Written because the pin it guards is worthless if it cannot fire: an earlier
+    revision passed on both of the wrong closures (proved in the review), because
+    it never linked the statement to the handle. Every snippet below is the
+    STATEMENT used correctly, changed only in where it is issued — including the
+    sibling-arm shape that rebinds the SAME handle name off `select_graph`
+    (#9150 review cycle 6, P2).
     """
     cases = {
         # The escape-(3) shape, as production issues it today: NOT an offender.
@@ -663,6 +709,25 @@ def test_the_issuance_detector_reds_on_the_guarded_handle_and_on_run():
                 handle.query(_init_q, params=_init_p)
             """,
             [],
+        ),
+        # `hosted_api.register_user`'s shape: TWO arms, the SAME handle name.
+        # Closing one arm on `proj.g` is the §17.1 violation, and a per-FUNCTION
+        # handle set certified it green (#9150 review cycle 6, P2 — measured).
+        # BOTH arms come back as offenders, on purpose: the detector cannot tell
+        # which binding a sink used, so it fails CLOSED on the pair — one arm
+        # issuing on `select_graph` does not certify the other. (No site in this
+        # tree has that shape today, so the rule costs no false red.)
+        "sibling_arm_rebinding_the_same_name": (
+            """
+            def site(proj, supabase, _init_q, _init_p):
+                if supabase:
+                    org_graph = proj.db.select_graph("g")
+                    org_graph.query(_init_q, params=_init_p)
+                else:
+                    org_graph = proj._get_proj().g
+                    org_graph.query(_init_q, params=_init_p)
+            """,
+            [".query(_init_p, _init_q)"] * 2,
         ),
         # Closed the WRONG way: the guarded handle, i.e. the §17.1 violation.
         "on_the_guarded_handle": (
@@ -691,7 +756,8 @@ def test_the_issuance_detector_reds_on_the_guarded_handle_and_on_run():
         )
         issued = {"_init_q", "_init_p"}
         handles = _escape_handle_names(func)
-        offenders = _not_on_the_escape_handle(func, issued, handles)
+        offenders = _not_on_the_escape_handle(
+            func, issued, handles, _rebound_handles(func, handles))
         assert len(offenders) == len(expected), (
             f"the issuance detector is {'blind' if expected else 'crying wolf'} on "
             f"the {name!r} shape: expected {expected}, got {offenders}"
@@ -1062,36 +1128,43 @@ def test_a_diff_to_the_note_itself_selects_this_file():
     `onboarding` arm existed, an `onboarding`-only diff — the exact drift these
     two pins exist to catch — selected every suite EXCEPT this one, so the note
     could go stale green (the #1349/#2938 silent-drop class). The population is
-    the set of files this suite actually READS — the eight subjects below,
-    derived from the pins above rather than copied from the registration. The
-    two `docs/` records are in it because
-    `test_the_plan_doc_and_the_storage_ledger_carry_the_residual` reads them, and
-    their only wiring is the two `SOURCE_PATTERNS["onboarding"]` entries added
-    for this file: delete one and the pin silently stops running on the record
-    it guards (nothing reds — `test_every_source_pattern_is_selectable` checks
-    entry → runs, never the removal direction). It is
-    deliberately NOT every file the suite PARSES: `_declaration_primitives()`
-    walks all 242 modules under `tortoise/`, and covering that whole population
-    is what the six arms in `config/ci-surfaces.yml` do (#9150 review: with
-    `api` + `core` + `onboarding` only, the 12 modules resolving solely to
-    `ep`/`sdk`/`eval` — `dream.py` first — could take a new §17.1 opener on a PR
-    that never ran this file).
+    every file this suite actually READS, plus the whole module set it PARSES:
 
-    `config/ci-surfaces.yml` is IN the population: this suite reads it (through
-    `load_manifest()`), and it is the one file whose edit silently disables the
-    pin — a registration change resolves to `core` and nothing else, so the
-    change class that breaks this file is the one that must run it.
+    * EVERY `tortoise/**/*.py` (242 files). `_declaration_primitives()` walks
+      `rglob("*.py")`, so ANY of them can take a new §17.1 opener — and the six
+      arms in `config/ci-surfaces.yml` exist to make each one's diff run this
+      file (with `api` + `core` + `onboarding` only, the 12 modules resolving
+      solely to `ep`/`sdk`/`eval` — `dream.py` first — could take a new opener on
+      a PR that never ran this file). DERIVED rather than hand-listed (#9150
+      review cycle 6, P2): the literal tuple of four representative modules that
+      this replaces pinned none of the other 238, and deleting the
+      `api`/`sdk`/`ep`/`eval` rows red nothing at all — so the six-arm
+      justification in that manifest comment was itself unpinned, in exactly the
+      removal direction this pin exists for.
+    * `tests/test_write_ahead_mint.py` — the sibling inventory this file asserts
+      against (`_mint_sites_from_its_owner()`).
+    * `config/ci-surfaces.yml` — this suite reads it through `load_manifest()`, and
+      it is the one file whose edit silently disables the pin: a registration
+      change resolves to `core` and nothing else, so the change class that breaks
+      this file is the one that must run it.
+    * the two `docs/` records that
+      `test_the_plan_doc_and_the_storage_ledger_carry_the_residual` reads, whose
+      ONLY wiring is the two `SOURCE_PATTERNS["onboarding"]` entries added for
+      this file: delete one and the pin silently stops running on the record it
+      guards (nothing reds — `test_every_source_pattern_is_selectable` checks
+      entry → runs, never the removal direction).
     """
     from tools.ci_selection import load_manifest, select
 
     manifest = load_manifest()
     this_file = Path(__file__).name
     missing: dict[str, list[str]] = {}
-    for subject in (
-        "tortoise/onboarding/state.py",
-        "tortoise/projection/__init__.py",
-        "tortoise/sdk.py",
-        "tortoise/hosted_api.py",
+    subjects = [
+        # every module the suite PARSES — derived, so a new module is covered the
+        # day it is added rather than the day someone remembers this tuple.
+        str(p.relative_to(_REPO))
+        for p in sorted((_REPO / "tortoise").rglob("*.py"))
+    ] + [
         # read by the sibling-population pin below (a suite that pins the same
         # mint path), so a diff there must run this file too (#9150 review P2).
         "tests/test_write_ahead_mint.py",
@@ -1104,7 +1177,8 @@ def test_a_diff_to_the_note_itself_selects_this_file():
         # dropped (#9150 review P1).
         "docs/plans/2026-10-14-7951-atomic-write-outbox.md",
         "docs/architecture/STORAGE-ARCHITECTURE.md",
-    ):
+    ]
+    for subject in subjects:
         sel = select([subject], "pull_request", manifest)
         selected = (sel["full"] or sel["test_files"] == "ALL"
                     or this_file in set(sel["test_files"]))
@@ -1135,22 +1209,34 @@ def test_the_plan_doc_and_the_storage_ledger_carry_the_residual():
       `onboarding metadata` row claimed `:OnboardingState` outright.
 
     Both now state `#9157`, and this pin is why they cannot drift back.
+
+    ⛔ SCOPED TO EACH RECORD'S OWN ENTRY (#9150 review cycle 6, P2). The
+    whole-document scan this replaces was only ACCIDENTALLY equivalent: each
+    phrase happened to occur exactly once in each file, so the `onboarding
+    metadata` row (or the increment-4 entry) could be reverted to "class
+    covered" with the disclosure moved to a footnote elsewhere, leaving every
+    assertion green — the same wider-than-the-claim defect the two Python
+    records were cured of, left unfixed for the two docs.
     """
-    for rel, what, template in (
+    for rel, what, template, start, end in (
         ("docs/plans/2026-10-14-7951-atomic-write-outbox.md",
          "the increment-4 tracker",
-         "the {n} `eager_init_query()` call sites"),
+         "the {n} `eager_init_query()` call sites",
+         "**STILL OPEN: the five",
+         "**LANDED SO FAR: the `delete_point` DOOR"),
         ("docs/architecture/STORAGE-ARCHITECTURE.md",
          "§17.1's door ledger",
-         "the {n} `eager_init_query()` sites"),
+         "the {n} `eager_init_query()` sites",
+         "| onboarding metadata |",
+         "| webhook delivery store |"),
     ):
-        flat = " ".join((_REPO / rel).read_text(encoding="utf-8").split())
+        flat = _record(path=rel, start=start, end=end)
         for phrase in ("#9157", "eager_init_query", "select_graph"):
             assert phrase in flat, (
-                f"{what} (`{rel}`) no longer contains {phrase!r}. An auditor "
-                "reading it concludes there is no second `:OnboardingState` "
-                "writer outside the declared lane, which the five escape-(3) "
-                "sites disprove (#9157)"
+                f"{what} (`{rel}`) no longer contains {phrase!r} IN ITS OWN "
+                "ENTRY. An auditor reading it concludes there is no second "
+                "`:OnboardingState` writer outside the declared lane, which the "
+                "five escape-(3) sites disprove (#9157)"
             )
         _assert_site_count(flat, template, f"{what} (`{rel}`)")
 
