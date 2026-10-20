@@ -1653,17 +1653,26 @@ class TortoiseEP:
         # The unsplit form is measured at 0.36 s on a 23k-node / 160k-edge
         # graph REGARDLESS of the affected-set size; each anchored sweep is
         # bounded by the affected claims' incident edges.
-        # Each edge is admitted EXACTLY ONCE without row de-duplication: the
+        # Each edge is admitted EXACTLY ONCE, keyed on the EDGE (`id(r)`): the
         # target-anchored sweep takes every edge whose target is affected, and
         # the source-anchored sweep takes the remainder (`NOT b.id IN $ids`).
-        # De-duplicating on the projected row instead would collapse two
-        # byte-identical PARALLEL direct edges into one factor — a behaviour
-        # change the OR form did not have. The NULL guard keeps an edge to a
-        # node without an `id` property: `NOT (NULL IN …)` is NULL, which would
-        # silently drop the row the OR form returned.
+        # Two reasons the key is the edge and not the projected row:
+        #   * a multi-labelled endpoint (``:Point:Object`` — a shape the write
+        #     path can mint) is matched by TWO label sweeps, so its edges come
+        #     back once per label; the pre-change single-query OR returned them
+        #     once, and this list is appended to (unlike every other
+        #     label-swept site, which dedupes on a node id);
+        #   * two byte-identical PARALLEL direct edges are two factors, and a
+        #     row-keyed dedupe would collapse them into one.
+        # `id(r)` is unique per edge within the query and stable across the
+        # sweeps, so it separates both cases exactly.
+        # The NULL guard keeps an edge to a node without an `id` property:
+        # `NOT (NULL IN …)` is NULL, which would silently drop the row the OR
+        # form returned.
         _non_op = ("({x}.is_operator IS NULL OR {x}.is_operator = false) "
                    "AND {x}.op_type IS NULL")
         dir_rows: list = []
+        _seen_dir: set = set()
         for _anchor in ("a", "b"):
             _other = "b" if _anchor == "a" else "a"
             _conds = [
@@ -1690,14 +1699,18 @@ class TortoiseEP:
                 + _EP_ANCHOR_BARRIER +
                 "MATCH (a)-[r:IMPL|NAND]->(b) "
                 "WHERE " + " AND ".join(_conds) + " "
-                "RETURN a.id, b.id, type(r), "
+                "RETURN id(r), a.id, b.id, type(r), "
                 "       coalesce(r.direction, 'bidirectional'), r.weight"
             ):
-                dir_rows.extend(self._hop_query(
+                for _row in self._hop_query(
                     _q, {"ids": list(affected_claims)}, hop=None,
                     phase="factor_extraction",
                     frontier_size=len(affected_claims),
-                ))
+                ):
+                    if _row[0] in _seen_dir:
+                        continue
+                    _seen_dir.add(_row[0])
+                    dir_rows.append(tuple(_row[1:]))
         for src_id, tgt_id, rel, direction, weight in dir_rows:
             if weight is None:
                 weight = (NAND_BASE_WEIGHT if rel == "NAND" else 1.0)

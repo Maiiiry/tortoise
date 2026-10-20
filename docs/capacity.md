@@ -250,10 +250,12 @@ at every id-anchored statement of the pass whose id predicate sits on the
 direct-edge expansion and both BFS hops, factor extraction (Batch 1 and the
 operator-viability query in `analyze.py`) and the cache load's back-message
 sweep. Three statements are id-anchored but needed no barrier, because their id
-predicate is already on the pattern's anchored side:
-`_load_cache`'s message sweep, `seed_operators`, and `_affected_factors`
-Batch 2 — measured `Node By Index Scan` before the change (pinned by
-`tests/test_6211_ep_anchor.py`, which asserts the plan, not the text).
+predicate is already on the pattern's anchored side: `_load_cache`'s message
+sweep, `seed_operators` and `_affected_factors` Batch 2 — each measured
+`Node By Index Scan` before the change. The first two are pinned by
+`tests/test_6211_ep_anchor.py` (which asserts the PLAN of every statement the
+pass emits, not its text); Batch 2's statement is emitted only when an operator
+seed is present, so it is measured here rather than asserted there.
 
 The two `OR`-shaped sweeps (`(a.id IN $ids OR b.id IN $ids)`, which can never be
 an index anchor) are split into one anchored sweep per endpoint: the

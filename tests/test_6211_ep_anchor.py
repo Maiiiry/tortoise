@@ -159,7 +159,8 @@ def _capture(ep: TortoiseEP, fn, *args, **kw) -> list[tuple[str, dict]]:
         ep.g = real
     # Only the id-set statements are in scope: a whole-graph count or the
     # :EpMeta epoch read are not id-anchored and a label scan is correct there.
-    return [(q, p) for q, p in rec.statements if "$ids" in q]
+    # `$oids` is the operator-seed form of the same predicate (`seed_operators`).
+    return [(q, p) for q, p in rec.statements if "$ids" in q or "$oids" in q]
 
 
 def _plan_text(handle, cypher: str, params: dict) -> str:
@@ -176,6 +177,9 @@ def _statements_under_test(ep: TortoiseEP) -> list[tuple[str, str, dict]]:
 
     add("seed neighbourhood", _capture(ep, ep._live_neighbors_many, [HUB], False, "Point"))
     add("bridge hop", _capture(ep, ep._affected_claims, [HUB], 2, False))
+    # An OPERATOR seed runs the `seed_operators` statement (`$oids`), which the
+    # claim-seed captures above cannot reach.
+    add("operator seed", _capture(ep, ep._affected_claims, ["hop0"], 2, False))
     affected = ep._affected_claims([HUB], 2, False)
     add("factor extraction", _capture(ep, ep._affected_factors, affected, False))
     ep._load_cache(affected)
