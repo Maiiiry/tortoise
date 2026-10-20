@@ -574,8 +574,7 @@ exits 3 without writing, because the markers below the fence cannot be told
 apart from an example), or a marker pair that STRADDLES the fence — its START
 marker above, its END marker below — where the fence opens inside the block and
 a rewrite would delete the fence line and promote its contents to live
-instructions — nothing is written, so close the fence or delete the stale
-block by hand. With NO markers at all there is nothing to disambiguate — the
+instructions. With NO markers at all there is nothing to disambiguate — the
 block is appended where the file ends, which is INSIDE the unclosed fence, so
 the installer warns (`AGENTS.md has an UNTERMINATED code fence`) instead of
 refusing, which would change what the pre-#3429 installer did. A block that
@@ -584,12 +583,13 @@ replaced in place, inside the fence — so that case warns too. A clean pair ABO
 the open fence is the one case that does NOT warn: it is rewritten where it
 already sits and stays readable. A file with more than one HARD LINK (`ln
 AGENTS.md CLAUDE.md` dual-names agent files) is written through the SAME inode
-instead of renamed, so the alias never keeps stale instructions, and a partial
-in-place write is rolled back to the original bytes. A read-only (`0444`)
-`AGENTS.md` is upgraded normally and kept read-only — the installer stages a
-writable copy and restores the mode — and if the mode cannot be read it refuses
-rather than rewrite the file with looser permissions. Close the fence before
-re-running.
+instead of renamed, so the alias never keeps stale instructions, and a failed or
+interrupted in-place write is rolled back to the original bytes; if the rollback
+itself cannot be verified the installer exits 3, says so and leaves an intact
+copy at the path it prints. A read-only (`0444`) `AGENTS.md` is upgraded
+normally and kept read-only — the installer stages a writable copy and restores
+the mode — and if the mode cannot be read it refuses rather than rewrite the
+file with looser permissions. Close the fence before re-running.
 
 Never hand-edit inside markers you did not write; the next refresh discards it.
 

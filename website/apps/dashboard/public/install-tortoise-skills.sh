@@ -448,6 +448,35 @@ emit_codex_agents_block() {
     [ -n "$orig_mode" ] && chmod "$orig_mode" "$target" 2>/dev/null
     trap - INT TERM HUP
   }
+  # A SIGNAL is a FAILURE, and the trap must say so. The first version restored the
+  # bytes and RETURNED, so execution carried on into the success report: measured
+  # rc 0 and "✓ upgraded" over an untouched file — a silent lie, which is the exact
+  # defect class this whole change exists to end.
+  on_signal() {
+    undo_inplace
+    echo "  ✗ AGENTS.md — interrupted while writing it in place" >&2
+    echo "      the original was restored; nothing was upgraded." >&2
+    echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 143)" >&2
+    exit 143
+  }
+  # The restore itself is CHECKED: the same I/O fault that failed the write can fail
+  # it, and the first version printed "the original was RESTORED" unconditionally
+  # and then deleted the tmpdir holding the only intact copy (measured: a 1-byte
+  # target, no backup left, nothing recoverable).
+  fail_inplace() {
+    undo_inplace
+    if [ -n "$backup" ] && cmp -s "$backup" "$target"; then
+      _emit_fail "$1 — the original was RESTORED"
+    fi
+    echo "  ✗ AGENTS.md — $1" >&2
+    echo "      The original could NOT be restored into $target." >&2
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+      echo "      An intact copy is kept at: $backup" >&2
+    fi
+    echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
+    # NOTE: $tmpdir is deliberately NOT removed here — it holds the only copy.
+    exit 3
+  }
   _emit_fail() {
     # ONE place that cleans up and fails. It EXITS rather than returning: a
     # `cmd || helper` list is itself an errexit-exempt context, so a helper that
@@ -776,12 +805,14 @@ EOF
       # write is rolled back byte-for-byte instead of leaving a half file.
       backup="$tmpdir/orig-agents.md"
       cp "$target" "$backup" || { rm -f "$staged"; _emit_fail "could not keep a copy of $target before rewriting it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
-      trap 'undo_inplace' INT TERM HUP
+      # The backup must be COMPLETE before the destructive write: a partial copy
+      # would become the thing we "restore" from.
+      cmp -s "$target" "$backup" || { rm -f "$staged"; _emit_fail "the copy kept of $target does not match it, so nothing was changed (a full disk or a quota limit is the usual cause)"; }
+      trap 'on_signal' INT TERM HUP
       chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to rewrite it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
       if ! cat "$staged" > "$target"; then
-        undo_inplace
         rm -f "$staged"
-        _emit_fail "could not rewrite $target in place — the original was RESTORED from $backup (a full disk or a quota limit is the usual cause)"
+        fail_inplace "could not rewrite $target in place (a full disk or a quota limit is the usual cause)"
       fi
       if ! chmod "$orig_mode" "$target"; then
         trap - INT TERM HUP
@@ -827,16 +858,16 @@ EOF
         # A partial append also has to be undoable: keep the original first.
         backup="$tmpdir/orig-agents.md"
         cp "$target" "$backup" || { rm -f "$staged"; _emit_fail "could not keep a copy of $target before appending in place (it has $links hard links, which a rename would split) — nothing was changed"; }
-        trap 'undo_inplace' INT TERM HUP
+        cmp -s "$target" "$backup" || { rm -f "$staged"; _emit_fail "the copy kept of $target does not match it, so nothing was changed (a full disk or a quota limit is the usual cause)"; }
+        trap 'on_signal' INT TERM HUP
         chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to append in place (it has $links hard links, which a rename would split) — nothing was changed"; }
         # ONLY the new bytes: $staged is a COPY of $target plus the block, so
         # `cat "$staged" >> "$target"` would duplicate the user's whole file
         # (measured: 24 bytes -> 1208 with the body present twice, reported as
         # success). Append the separator and the block, as the pre-staging code did.
         if ! printf '\n\n' >> "$target" || ! cat "$block" >> "$target"; then
-          undo_inplace
           rm -f "$staged"
-          _emit_fail "could not append to $target in place — the original was RESTORED from $backup (a full disk or a quota limit is the usual cause)"
+          fail_inplace "could not append to $target in place (a full disk or a quota limit is the usual cause)"
         fi
         if ! chmod "$orig_mode" "$target"; then
           trap - INT TERM HUP
