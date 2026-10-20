@@ -437,16 +437,61 @@ emit_codex_agents_block() {
   local state="" prev_version="" same_bytes=0
   local state_kind="" c_start c_startline c_end c_endline c_fence_start
   local c_near_s c_near_e c_mangled_s c_mangled_e c_fence_open
-  local block_inside_fence orig_mode links backup
+  local block_inside_fence orig_mode links backup orig_owner restore_path inplace_why
   # An IN-PLACE write (the hardlinked-alias arms) truncates the user's only copy,
   # so the original is kept first and restored on any failure — same inode, so the
   # recovery is exact and the alias is untouched. A signal in that window used to
   # leave a 0444 file writable and print nothing (measured: rc 143, mode 644).
   backup=""
+  # Set by undo_inplace to the path that holds the original bytes afterwards.
+  # `$target` means the rollback VERIFIED; anything else is a path the user must
+  # be told about, and `$backup` (inside $tmpdir) means the scratch dir survives.
+  restore_path=""
+  # Returns 0 ONLY when the original bytes were written back AND compared equal.
+  # Two measured defects this shape closes:
+  #  * the old `[ … ] && cat` one-liner discarded `cat`'s status, so the run said
+  #    "the original was RESTORED" over a half-written file — and a rollback
+  #    fails for exactly the cause that broke the write it is undoing (full disk,
+  #    quota), which is the cause the message itself named as usual;
+  #  * a failing command as the LAST statement of a function aborts the script
+  #    under `set -e` (measured: the old shape exited 1 with NO message at all),
+  #    so the return status is explicit and every caller tests it.
   undo_inplace() {
-    [ -n "$backup" ] && [ -f "$backup" ] && cat "$backup" > "$target" 2>/dev/null
-    [ -n "$orig_mode" ] && chmod "$orig_mode" "$target" 2>/dev/null
+    restore_path=""
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+      if cat "$backup" > "$target" 2>/dev/null && cmp -s "$backup" "$target"; then
+        restore_path="$target"
+        [ -n "$orig_mode" ] && chmod "$orig_mode" "$target" 2>/dev/null
+      else
+        # The rollback failed too. Keep the bytes where the user can still find
+        # them — `_emit_fail` deletes $tmpdir, which is where $backup lives.
+        if cp "$backup" "$target.tortoise-orig" 2>/dev/null \
+           && cmp -s "$backup" "$target.tortoise-orig"; then
+          restore_path="$target.tortoise-orig"
+        else
+          restore_path="$backup"
+        fi
+      fi
+    fi
     trap - INT TERM HUP
+    [ -n "$restore_path" ] && [ "$restore_path" = "$target" ]
+  }
+  undo_on_signal() {
+    if ! undo_inplace; then
+      echo "  ✗ AGENTS.md — interrupted while rewriting in place, and the rollback could NOT be verified" >&2
+      echo "      $target is PARTIAL; the original bytes are at $restore_path" >&2
+    fi
+  }
+  # Ownership is not carried by `cp`, and the rename path REPLACES the inode — so
+  # a single-link AGENTS.md owned by another user or group came back owned by
+  # whoever ran the installer. The old `cp -p` preserved it or refused; restore it
+  # where we may, and never re-own SILENTLY where we may not (`chown`'s own status
+  # is the check — a second `stat` would only restate it).
+  restore_ownership() {
+    [ -n "$orig_owner" ] || return 0
+    chown "$orig_owner" "$1" 2>/dev/null && return 0
+    echo "  ⚠ AGENTS.md — could not restore the file's ownership ($orig_owner) on $target; it is now owned by the user running this install (contents and mode are unchanged)" >&2
+    return 0
   }
   _emit_fail() {
     # ONE place that cleans up and fails. It EXITS rather than returning: a
@@ -455,7 +500,15 @@ emit_codex_agents_block() {
     # read failure ended in a SUCCESS report over an untouched file.
     echo "  ✗ AGENTS.md — $1" >&2
     echo "  (skills above ARE installed; only the AGENTS.md block was not upgraded — exit 3)" >&2
-    rm -rf "$tmpdir"
+    # `rm -rf $tmpdir` is right everywhere EXCEPT when a rollback's only surviving
+    # copy of the user's file is still in there: deleting it is how "the original
+    # was RESTORED" became a false claim over a truncated file.
+    case "${restore_path:-}" in
+      "$tmpdir"/*)
+        echo "  (the scratch directory $tmpdir was KEPT — it holds the only intact copy of the original file)" >&2
+        ;;
+      *) rm -rf "$tmpdir" ;;
+    esac
     exit 3
   }
   local ms_re="^${ms}\r?$" me_re="^${me}\r?$"
@@ -776,12 +829,15 @@ EOF
       # write is rolled back byte-for-byte instead of leaving a half file.
       backup="$tmpdir/orig-agents.md"
       cp "$target" "$backup" || { rm -f "$staged"; _emit_fail "could not keep a copy of $target before rewriting it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
-      trap 'undo_inplace' INT TERM HUP
+      trap 'undo_on_signal' INT TERM HUP
       chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to rewrite it in place (it has $links hard links, which a rename would split) — nothing was changed"; }
       if ! cat "$staged" > "$target"; then
-        undo_inplace
+        if undo_inplace; then
+          rm -f "$staged"
+          _emit_fail "could not rewrite $target in place — the original was RESTORED from $backup and verified byte-for-byte (a full disk or a quota limit is the usual cause)"
+        fi
         rm -f "$staged"
-        _emit_fail "could not rewrite $target in place — the original was RESTORED from $backup (a full disk or a quota limit is the usual cause)"
+        _emit_fail "could not rewrite $target in place, and could NOT restore it — $target is PARTIAL; the original bytes are at $restore_path (a full disk or a quota limit breaks the restore too)"
       fi
       if ! chmod "$orig_mode" "$target"; then
         trap - INT TERM HUP
@@ -791,6 +847,8 @@ EOF
       trap - INT TERM HUP
       rm -f "$staged"
     else
+      orig_owner="$(stat -c '%u:%g' "$target" 2>/dev/null || stat -f '%u:%g' "$target" 2>/dev/null || true)"
+      restore_ownership "$staged"
       mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
     fi
   elif [ "$state_kind" = "none" ]; then
@@ -800,53 +858,65 @@ EOF
       # bash printed its own "Permission denied" and the installer named no cause
       # or remedy (measured). Copy, make the COPY writable, append there, put the
       # mode back, rename — so a read-only file is upgraded and stays read-only.
-      staged="$(mktemp "$(dirname "$target")/.tortoise-agents.XXXXXX")" \
-        || _emit_fail "could not stage a temp file next to $target — nothing was changed"
-      # NOT `cp -p`: preserving the mode here makes the copy fail on a filesystem
-      # or user where mode/ownership cannot be carried (measured), refusing an
-      # install that `>>` handled. The mode is restored explicitly below instead.
-      cp "$target" "$staged" || { rm -f "$staged"; _emit_fail "could not copy $target — nothing was changed"; }
+      #
+      # TWO cases cannot take that route, and both APPEND IN PLACE instead (still
+      # keeping a copy first, so a partial append is undoable):
+      #  * a HARD LINKED alias (`ln AGENTS.md CLAUDE.md` dual-names agent files)
+      #    shares the inode, so a rename SPLITS it: the alias kept the old bytes
+      #    while the report said the block was created (measured);
+      #  * the DIRECTORY is not writable. Staging needs a writable directory, the
+      #    pre-staging `>>` needed only a writable FILE, and the two come apart:
+      #    a shared, group-writable agent file commonly lives in a directory the
+      #    caller does not own (monorepos point AGENTS.md at a shared file).
+      #    Refusing there would reject an install the older code handled, so a
+      #    failed `mktemp` falls back rather than failing.
       orig_mode="$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null || true)"
       if [ -z "$orig_mode" ]; then
-        rm -f "$staged"
         _emit_fail "could not read the mode of $target — nothing was changed, because rewriting it without the mode could loosen its permissions (a 0444 file must stay 0444)"
       fi
-      chmod u+w "$staged" || { rm -f "$staged"; _emit_fail "could not make the staged copy writable — nothing was changed"; }
-      if ! printf '\n\n' >> "$staged" || ! cat "$block" >> "$staged"; then
-        rm -f "$staged"
-        _emit_fail "could not write the staged copy — the original is untouched (a full disk or a quota limit is the usual cause; read-only and an unwritable directory are ruled out by this point)"
-      fi
-      chmod "$orig_mode" "$staged" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on the staged copy — nothing was changed"; }
-      # A HARD LINKED alias (CLAUDE.md -> AGENTS.md is a common way to dual-name
-      # agent files) shares the inode, so `mv` would silently split it: the alias
-      # kept the old bytes and the report still said the block was created
-      # (measured). Append IN PLACE when the file has other links, exactly as the
-      # pre-staging code did, and put the mode back afterwards.
       links="$(stat -c '%h' "$target" 2>/dev/null || stat -f '%l' "$target" 2>/dev/null || echo 1)"
+      staged=""
+      inplace_why=""
       if [ "${links:-1}" -gt 1 ]; then
-        # A partial append also has to be undoable: keep the original first.
+        inplace_why="it has $links hard links, which a rename would split"
+      else
+        staged="$(mktemp "$(dirname "$target")/.tortoise-agents.XXXXXX" 2>/dev/null || true)"
+        [ -n "$staged" ] || inplace_why="its directory is not writable, so there is nowhere to stage a copy"
+      fi
+      if [ -n "$staged" ]; then
+        # NOT `cp -p`: preserving the mode here makes the copy fail on a filesystem
+        # or user where mode/ownership cannot be carried (measured), refusing an
+        # install that `>>` handled. The mode is restored explicitly below instead.
+        cp "$target" "$staged" || { rm -f "$staged"; _emit_fail "could not copy $target — nothing was changed"; }
+        chmod u+w "$staged" || { rm -f "$staged"; _emit_fail "could not make the staged copy writable — nothing was changed"; }
+        if ! printf '\n\n' >> "$staged" || ! cat "$block" >> "$staged"; then
+          rm -f "$staged"
+          _emit_fail "could not write the staged copy — the original is untouched (a full disk or a quota limit is the usual cause; read-only and an unwritable directory are ruled out by this point)"
+        fi
+        chmod "$orig_mode" "$staged" || { rm -f "$staged"; _emit_fail "could not restore mode $orig_mode on the staged copy — nothing was changed"; }
+        orig_owner="$(stat -c '%u:%g' "$target" 2>/dev/null || stat -f '%u:%g' "$target" 2>/dev/null || true)"
+        restore_ownership "$staged"
+        mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
+      else
         backup="$tmpdir/orig-agents.md"
-        cp "$target" "$backup" || { rm -f "$staged"; _emit_fail "could not keep a copy of $target before appending in place (it has $links hard links, which a rename would split) — nothing was changed"; }
-        trap 'undo_inplace' INT TERM HUP
-        chmod u+w "$target" || { trap - INT TERM HUP; rm -f "$staged"; _emit_fail "could not make $target writable to append in place (it has $links hard links, which a rename would split) — nothing was changed"; }
-        # ONLY the new bytes: $staged is a COPY of $target plus the block, so
+        cp "$target" "$backup" || _emit_fail "could not keep a copy of $target before appending in place ($inplace_why) — nothing was changed"
+        trap 'undo_on_signal' INT TERM HUP
+        chmod u+w "$target" || { trap - INT TERM HUP; _emit_fail "could not make $target writable to append in place ($inplace_why) — nothing was changed"; }
+        # ONLY the new bytes: a staged copy would be $target PLUS the block, so
         # `cat "$staged" >> "$target"` would duplicate the user's whole file
         # (measured: 24 bytes -> 1208 with the body present twice, reported as
         # success). Append the separator and the block, as the pre-staging code did.
         if ! printf '\n\n' >> "$target" || ! cat "$block" >> "$target"; then
-          undo_inplace
-          rm -f "$staged"
-          _emit_fail "could not append to $target in place — the original was RESTORED from $backup (a full disk or a quota limit is the usual cause)"
+          if undo_inplace; then
+            _emit_fail "could not append to $target in place — the original was RESTORED from $backup and verified byte-for-byte (a full disk or a quota limit is the usual cause)"
+          fi
+          _emit_fail "could not append to $target in place, and could NOT restore it — $target is PARTIAL; the original bytes are at $restore_path (a full disk or a quota limit breaks the restore too)"
         fi
         if ! chmod "$orig_mode" "$target"; then
           trap - INT TERM HUP
-          rm -f "$staged"
           _emit_fail "could not restore mode $orig_mode on $target — the block WAS appended"
         fi
         trap - INT TERM HUP
-        rm -f "$staged"
-      else
-        mv "$staged" "$target" || { rm -f "$staged"; _emit_fail "could not replace $target — the original is untouched"; }
       fi
     else
       cat "$block" > "$target" || _emit_fail "could not create $target"

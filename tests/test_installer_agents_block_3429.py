@@ -142,9 +142,10 @@ from __future__ import annotations
 
 import os
 import re
-import pytest
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = (REPO_ROOT / "website" / "apps" / "dashboard" / "public"
@@ -1391,10 +1392,7 @@ def test_a_hardlinked_alias_sees_the_block(tmp_path, existing_block, read_only):
     project.mkdir()
     target = project / "AGENTS.md"
     body = "# House\nUNIQUE-LINE-ONE\n"
-    if existing_block:
-        original = f"{body}\n{START}\nold block\n{END}\nTAIL\n"
-    else:
-        original = body
+    original = f"{body}\n{START}\nold block\n{END}\nTAIL\n" if existing_block else body
     target.write_text(original, encoding="utf-8")
     if read_only:
         # The in-place arms chmod the target and must put the mode back; without a
@@ -1481,3 +1479,202 @@ def test_a_failed_in_place_rewrite_restores_the_original(tmp_path):
     assert (target.stat().st_mode & 0o777) == 0o444, (
         f"the read-only mode must be restored: {oct(target.stat().st_mode & 0o777)}")
     assert target.stat().st_ino == alias.stat().st_ino, "the alias must not be split"
+
+
+# ── The rollback's OWN failure, and ownership on the rename path ─────────────
+#
+# Both are the same class of defect this file already polices one layer up: a run
+# that reports a good outcome it never checked. The in-place arms used to say "the
+# original was RESTORED" without testing the restore, and then deleted the backup;
+# a rename replaces the inode, so `cp` without `-p` silently re-owned the file.
+
+# Every one-argument `cat` in the two in-place paths, plus the backup the rollback
+# reads: `cat "$staged" > "$target"` (replace), `cat "$block" >> "$target"` (append)
+# and `cat "$backup" > "$target"` (the rollback itself). Failing all three is the
+# point — a full disk breaks the restore for the same reason it broke the write.
+_ROLLBACK_CAT_SHIM = (
+    '#!/bin/sh\n'
+    'if [ $# -eq 1 ]; then\n'
+    '  case "$1" in\n'
+    '    *.tortoise-agents.*|*/block|*orig-agents.md) printf "PARTIAL"; exit 1 ;;\n'
+    '  esac\n'
+    'fi\n'
+    'exec /bin/cat "$@"\n'
+)
+
+
+@pytest.mark.parametrize("existing_block", [True, False], ids=["replace", "append"])
+def test_a_rollback_that_fails_says_so_and_keeps_the_original(tmp_path, existing_block):
+    """Review P1/P2: the in-place arms rolled back with an UNCHECKED `cat` and then
+    reported "the original was RESTORED from $backup" — while `_emit_fail` deleted
+    `$tmpdir`, which is where `$backup` lives.
+
+    The cause the message itself named is a full disk or a quota, and that is
+    exactly the condition under which writing the original bytes back ALSO fails:
+    the user got a truncated file, a claim that it had been restored, and no copy
+    of it anywhere. `undo_inplace` now returns the restore's real status (verified
+    with `cmp`) and a failed restore keeps the bytes beside the file and says the
+    file is PARTIAL.
+
+    Vacuous against the pre-fix code: it printed RESTORED, deleted the backup, and
+    the file stayed "PARTIAL".
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    # The param picks the WRITE PATH as well as the shim: `replace` needs a block
+    # to replace, `append` needs a file with none.
+    original = (f"# House\nUNIQUE-ONE\n\n{START}\nold block\n{END}\nTAIL\n"
+                if existing_block else "# House\nUNIQUE-ONE\n")
+    target.write_text(original, encoding="utf-8")
+    alias = project / "CLAUDE.md"
+    alias.hardlink_to(target)
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake = shim / "cat"
+    fake.write_text(_ROLLBACK_CAT_SHIM, encoding="utf-8")
+    fake.chmod(0o755)
+
+    done = subprocess.run(
+        ["bash", str(installer), "--harness", "codex"], cwd=str(project),
+        env={**os.environ, "HOME": str(home), "PATH": f"{shim}:{os.environ['PATH']}"},
+        capture_output=True, text=True, timeout=180)
+
+    assert done.returncode == 3, (
+        "the injected write failure must be reported:\n" + done.stdout + done.stderr)
+    assert "RESTORED" not in done.stderr, (
+        "a rollback that did not verify must NOT be reported as a restore:\n"
+        + done.stderr)
+    assert "could NOT restore it" in done.stderr and "PARTIAL" in done.stderr, (
+        "the failure must say the file is left partial:\n" + done.stderr)
+    kept = project / "AGENTS.md.tortoise-orig"
+    assert kept.exists(), (
+        "the original bytes must survive a failed rollback:\n" + done.stderr)
+    assert kept.read_text(encoding="utf-8") == original, (
+        "the kept copy must be the ORIGINAL bytes, verbatim")
+    assert "AGENTS.md.tortoise-orig" in done.stderr, (
+        "the failure must name where the original bytes are:\n" + done.stderr)
+    assert target.read_text(encoding="utf-8") == "PARTIAL", (
+        "the half-written file is what the user is warned about")
+    assert target.stat().st_ino == alias.stat().st_ino, "the alias must not be split"
+
+
+_STAT_OWNER_SHIM = """#!/bin/sh
+# Report a FOREIGN owner (4242:4242) for AGENTS.md only; every other question is
+# the real one. The installer must put that owner back on the staged copy before
+# renaming it over the target.
+if [ "$1" = "-c" ] && [ "$2" = "%u:%g" ] && [ "${3##*/}" = "AGENTS.md" ]; then
+  echo "4242:4242"; exit 0
+fi
+if [ "$1" = "-f" ] && [ "$2" = "%u:%g" ] && [ "${3##*/}" = "AGENTS.md" ]; then
+  echo "4242:4242"; exit 0
+fi
+exec /usr/bin/stat "$@"
+"""
+
+
+@pytest.mark.parametrize("chown_succeeds", [True, False], ids=["restored", "not-permitted"])
+def test_the_rename_path_restores_ownership_or_says_it_cannot(tmp_path, chown_succeeds):
+    """Review P3: `cp` (not `cp -p`) carries no ownership and the rename path
+    REPLACES the target's inode, so a single-link AGENTS.md owned by another user
+    or group would come back owned by whoever ran the install — silently. `main`
+    used `cp -p`, which preserved ownership or refused the install.
+
+    The owner is now restored where the process may, and where it may not the run
+    says so instead of re-owning the user's file without a word.
+
+    Vacuous against the pre-fix code: no `chown` was ever called, so [not-permitted]
+    had no warning to find and [restored] had no call to point at.
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "AGENTS.md"
+    target.write_text(f"# House\n\n{START}\nold block\n{END}\nTAIL\n", encoding="utf-8")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    stat_shim = shim / "stat"
+    stat_shim.write_text(_STAT_OWNER_SHIM, encoding="utf-8")
+    stat_shim.chmod(0o755)
+    log = tmp_path / "chown.log"
+    chown_shim = shim / "chown"
+    chown_shim.write_text(
+        '#!/bin/sh\n'
+        'printf "%s\\n" "$*" >> "$CHOWN_LOG"\n'
+        f'exit {0 if chown_succeeds else 1}\n',
+        encoding="utf-8")
+    chown_shim.chmod(0o755)
+
+    done = subprocess.run(
+        ["bash", str(installer), "--harness", "codex"], cwd=str(project),
+        env={**os.environ, "HOME": str(home), "PATH": f"{shim}:{os.environ['PATH']}",
+             "CHOWN_LOG": str(log)},
+        capture_output=True, text=True, timeout=180)
+
+    assert done.returncode == 0, (
+        "ownership handling must not fail the install:\n" + done.stdout + done.stderr)
+    calls = log.read_text(encoding="utf-8") if log.exists() else ""
+    assert "4242:4242" in calls, (
+        "the original owner must be restored on the staged copy before the rename:"
+        f"\n{calls!r}\n{done.stderr}")
+    assert ".tortoise-agents." in calls, (
+        f"ownership must be applied to the STAGED copy, not the directory:\n{calls!r}")
+    assert "tortoise:block v" in target.read_text(encoding="utf-8"), "the block is written"
+    if chown_succeeds:
+        assert "ownership" not in done.stderr, (
+            "a successful restore must not warn:\n" + done.stderr)
+    else:
+        assert "could not restore the file's ownership" in done.stderr, (
+            "an ownership change must never be silent:\n" + done.stderr)
+        assert "4242:4242" in done.stderr, done.stderr
+
+
+def test_an_agents_md_in_a_read_only_directory_still_gets_a_block(tmp_path):
+    """Review P2 (regression): staging needs a WRITABLE DIRECTORY, while the code
+    this replaced needed only a writable FILE — and the two come apart on the
+    layout the installer itself names: a shared agent file in a directory the
+    caller does not own (a monorepo `AGENTS.md` pointing at a group-writable
+    file). `mktemp` there fails, so the install was refused with exit 3 where the
+    old `>>` appended in place without trouble.
+
+    A failed staging attempt now falls back to the in-place append — which keeps a
+    copy first — so the block still lands and nothing is refused.
+
+    Vacuous against the pre-fix code: exit 3, `could not stage a temp file`, no
+    block anywhere.
+    """
+    base = _fixture_tree(tmp_path)
+    installer = _patched_installer(tmp_path, base)
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    shared = project / "shared"
+    shared.mkdir()
+    real = shared / "AGENTS.md"
+    real.write_text("# House\nUNIQUE-ONE\n", encoding="utf-8")
+    # A symlinked AGENTS.md is the documented layout; the DIR it points into is
+    # what staging needs to write, and it is not writable here.
+    (project / "AGENTS.md").symlink_to("shared/AGENTS.md")
+    shared.chmod(0o555)
+    try:
+        done = _run(installer, home, project)
+        text = real.read_text(encoding="utf-8")
+        leftovers = list(shared.glob(".tortoise-agents.*"))
+    finally:
+        shared.chmod(0o755)
+
+    assert done.returncode == 0, (
+        "an unwritable directory must not refuse an append the old code handled:\n"
+        + done.stdout + done.stderr)
+    assert text.startswith("# House\nUNIQUE-ONE\n"), "the user's content must survive"
+    assert text.count(START) == 1 and text.count(END) == 1, "exactly one block"
+    assert text.count("UNIQUE-ONE") == 1, "the user's body must not be duplicated"
+    assert not leftovers, "no staged file may be left behind"
