@@ -260,16 +260,18 @@ kept as the engine-6.0.0 predicate-drop guard (#6976): the cache load's
 back-message sweep, the BFS undirected direct-edge sweep and Batch 3, whose two
 `MATCH` / undirected forms anchor on their own.
 
-Four statements traverse and were already `Node By Index Scan` without a
-barrier on `origin/main`, so they carry none: `_load_cache`'s message sweep,
+Four sites traverse and were already `Node By Index Scan` without a barrier on
+`origin/main`, so they carry none: `_load_cache`'s message sweep,
 `seed_operators`, `_affected_factors` Batch 2 and the selector's
-operator→target leg. (Nine further distinct id-set statements do not traverse
-at all — the seed lookup, the node-params sweep and the draft filter, the last
-two per epistemic label — and they are index-anchored as well, so the same
-assertion pins them.) All of the above are
+operator→target leg. A real pass emits **19 distinct unbarriered id-set
+statements**: those sites (per epistemic label where applicable), the cache's
+per-label `ep_alpha` load, and the reads that do not traverse at all (the seed
+lookup, the node-params sweep and the draft filter) — and every one of them is
+index-anchored. All of the above are
 in the pinned set: `tests/test_6211_ep_anchor.py` captures the statements the
-pass emits and asserts the PLAN of each (`Node By Index Scan`, no label or
-all-node scan), never their text; each is
+pass emits and asserts the PLAN of each (`Node By Index Scan`, and no
+`Node By Label Scan`; the selector test additionally rejects `All Node Scan`),
+never their text; each is
 reached by the fixture (`_load_cache`'s sweeps and Batch 2 directly,
 `seed_operators` through an operator seed — the 300 operators hanging off the
 hub claim). On the 23k-node / 160k-edge fixture that assertion covers the pass's
@@ -302,12 +304,28 @@ the posteriors agree to ~1e-12, the summation order; `run` shuffles the factor
 list per iteration anyway).
 
 The split's own cost, measured rather than assumed, because it emits more
-statements per anchor: on the 40-claim interactive zone that
-`tests/test_ep_local_395.py::test_ac5_interactive_latency_zone` guards, both
-trees emit the **same 288 statements** for a pass (the split statements replace
-per-label ones), and 6 interleaved runs gave medians of **1,149 ms** before and
-**1,175 ms** after — inside the run-to-run range of either tree (1,044-1,245 ms
-vs 1,079-1,194 ms).
+statements per anchor — and it is a real cost, paid on the interactive path.
+On the 40-claim zone that
+`tests/test_ep_local_395.py::test_ac5_interactive_latency_zone` guards, a pass
+emits **480 statements** on `origin/main` and **502** here (the pre-change
+Batch 3 was ONE unlabelled query and the back-message sweep four; the split
+runs each of them per anchor and per epistemic label), and 45 interleaved runs
+per tree — alternating the order both ways — gave medians of **1.001 s** before
+and **1.067 s** after: **+6-7 %**, the branch slower in **41 of 45** paired
+runs. The AC5 guard itself is flaky on this host for BOTH trees — alternating
+runs of it fail on `origin/main` too, and more often here (#9015 tracks that
+flake, so per-run tallies from one host are not worth quoting); the ~7 % median
+delta is the part this change owns and the stable part.
+
+**This cost is accepted, not denied.** The alternative on the other side is the
+plan this change exists to remove: a label scan of the traversal's endpoint,
+which is graph-proportional and aborted the pass outright at a few thousand
+points. Narrowing the fan-out back is not free either — sweeping only the
+labels actually present (`live.epistemic_labels_of`) would also make the
+endpoint duplication disappear, and with it the only observable failure the
+edge-keyed dedupe guards (a multi-labelled `:Point:Object` endpoint swept once
+per label). Cutting the statement count while keeping that observability is a
+follow-up, not a one-line change.
 
 What remains open after it: the pass **completes slowly** — the same one-anchor
 pass took **89 s** on the fixture, of which ~43 s is a per-message graph read
