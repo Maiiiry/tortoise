@@ -213,7 +213,7 @@ curve, and one of those guards has a **measured failure threshold**.
 | EP affected-claim frontier guard (new **claims** per hop) | **200** (`_EP_GUARD_FRONTIER_CAP`) | `tortoise/ep.py` |
 | Operator-set cap on an explicit-k BFS (the ranking's operator input) | **200 operators**, truncated deterministically by id with a stderr warning — and reported in the caller's RESULT as `truncated` / `operators_seen` / `operators_used` since #6211 | `tortoise/analyze.py` |
 | EP pass query that the engine aborts on its own query timeout | raised as **`EPSubgraphHopError`** (a `ResponseError` subclass) carrying the hop index (or `None` for a pass-level query), phase and frontier size (#6211) | `tortoise/ep.py` |
-| EP id-anchored query planning | every id-set statement whose predicate sits on the pattern's **far** endpoint carries a `WITH *` anchor barrier (`_EP_ANCHOR_BARRIER`), so the plan is a `Node By Index Scan` on the frontier instead of a label scan of the graph (#6211, measured below) | `tortoise/ep.py`, `tortoise/analyze.py` |
+| EP id-anchored query planning | the PLAN of every id-set statement the pass emits is asserted to be a `Node By Index Scan` on the frontier, not a label scan of the graph; where the shipped plan was a scan, a `WITH *` anchor barrier (`_EP_ANCHOR_BARRIER`) fixes it — the invariant is the plan, not a syntactic rule, because which sites need the barrier was decided per site by measurement (#6211, below) | `tortoise/ep.py`, `tortoise/analyze.py` |
 | EP degenerate-run guard | fires when the pass has collected **≥ 50%** of the graph's claims, on graphs of **≥ 500** claims | `tortoise/ep.py` |
 | Dreaming per-pass window budget (stale-first) | **200** operators (`TORTOISE_DREAM_WINDOW_BUDGET`) | `tortoise/dream.py` |
 | Dreaming full-mode operator cap (`dream_all`) | **200,000** (`max_total_operators`) | `tortoise/dream.py` |
@@ -245,29 +245,37 @@ with `GRAPH.PROFILE` on a 23,353-node / 160,000-edge fixture (falkordb-server
 That is why a **single-anchor** pass failed too: its floor is the whole graph's
 edge set plus one traversal per edge (`frontier=1` still cost 0.78 s on the
 fixture above), and it grows with every point the map gains. The barrier is now
-at every id-anchored statement of the pass whose id predicate sits on the
-**far** endpoint of the traversal — the seed neighbourhood, the plain-seed
-direct-edge expansion, both BFS hops, factor extraction (Batches 1 and 3), the
-cache load's back-message sweep, and four legs of the operator selector in
-`analyze.py` (the viability query, the incoming operator leg, the backward
-direct-edge leg and the operator-expansion leg — the last three measured
-unanchored on the same fixture, `Node By Label Scan (op:Point)` /
-`All Node Scan (a)` / `All Node Scan (p)`; one `_bfs_select_operators` call
-took **1,507 ms** before them and **98 ms** now (best of 3, same 168
-operators returned).
+at **eleven** sites (seven in `ep.py`, four in `analyze.py`), and **whether it
+does the work differs per site** — that is why
+the invariant is the plan assertion, not a syntactic rule. Barriered and
+load-bearing (removing the barrier reddens the plan test): the seed
+neighbourhood, the plain-seed direct-edge expansion, the bridge hop, Batch 1,
+and all four of the operator selector's legs in `analyze.py` — the viability
+query (`242.5 ms` -> `12.6 ms`) plus the incoming, backward and expansion legs
+(the last three measured unanchored on the same fixture,
+`Node By Label Scan (op:Point)` / `All Node Scan (a)` / `All Node Scan (p)`;
+one `_bfs_select_operators` call took **1,507 ms** before them and **98 ms** now
+— best of 3, same 168 operators returned). Barriered but NOT load-bearing,
+kept as the engine-6.0.0 predicate-drop guard (#6976): the cache load's
+back-message sweep, the BFS undirected direct-edge sweep and Batch 3, whose two
+`MATCH` / undirected forms anchor on their own.
 
-Three statements that traverse are id-anchored but needed no barrier, because
-their id predicate is already on the pattern's anchored side: `_load_cache`'s message
-sweep, `seed_operators` and `_affected_factors` Batch 2 — each measured
-`Node By Index Scan` before the change, so the barrier would have been
-redundant. All three are still in the pinned set: `tests/test_6211_ep_anchor.py`
-captures the statements the pass emits and asserts the PLAN of each
-(`Node By Index Scan`, no label or all-node scan), never their text; each is
+Four statements traverse and were already `Node By Index Scan` without a
+barrier on `origin/main`, so they carry none: `_load_cache`'s message sweep,
+`seed_operators`, `_affected_factors` Batch 2 and the selector's
+operator→target leg. (Nine further distinct id-set statements do not traverse
+at all — the seed lookup, the node-params sweep and the draft filter, the last
+two per epistemic label — and they are index-anchored as well, so the same
+assertion pins them.) All of the above are
+in the pinned set: `tests/test_6211_ep_anchor.py` captures the statements the
+pass emits and asserts the PLAN of each (`Node By Index Scan`, no label or
+all-node scan), never their text; each is
 reached by the fixture (`_load_cache`'s sweeps and Batch 2 directly,
 `seed_operators` through an operator seed — the 300 operators hanging off the
 hub claim). On the 23k-node / 160k-edge fixture that assertion covers the pass's
 **49 distinct** id-set statements (95 emissions) and the operator selector's
-**12 distinct** (25 emissions) across its four legs — zero unanchored in
+**12 distinct** (37 emissions across the two seeds the assertion uses) — zero
+unanchored in
 either. On `origin/main` the same file fails 3 of its 5 tests, and the
 selector's expansion leg is individually discriminating: removing its barrier
 alone reddens the selector test.

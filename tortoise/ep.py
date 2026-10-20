@@ -48,9 +48,15 @@ _EP_GUARD_MIN_GRAPH_CLAIMS = 500
 # ── The id-anchor barrier (#6211) ──
 # Every EP query that walks an id SET anchors it as `MATCH (n:Label) WHERE
 # n.id IN $ids ...`. That reads as an index read, and FalkorDB does plan the
-# bare form as `Node By Index Scan` — but as soon as the statement CONTINUES
-# into an expanding traversal, the planner anchors the traversal instead and
-# `n.id IN $ids` degrades to a per-record FILTER. Measured on a 23,354-node /
+# bare form as `Node By Index Scan` — but when the statement CONTINUES into an
+# expanding traversal the planner can anchor the TRAVERSAL instead, and
+# `n.id IN $ids` degrades to a per-record FILTER. It is not a blanket rule:
+# which sites lose the anchor is data- and shape-dependent (measured per site in
+# `docs/capacity.md` §7 — at the BFS undirected sweep below, the traversal is
+# already index-anchored and the barrier only guards #6976; at the bridge hop it
+# is the whole difference), so the invariant is the plan assertion in
+# `tests/test_6211_ep_anchor.py`, not a syntactic rule.
+# Measured on a 23,354-node /
 # 160,000-edge graph (`GRAPH.PROFILE`, falkordb-server 4.20.6), two-hop bridge
 # at a 30-id frontier:
 #
@@ -1381,9 +1387,14 @@ class TortoiseEP:
                     dir_rows: list = []
                     # #7853: a is the id-anchored frontier — sweep its labels;
                     # b is widened by traversal.
-                    # #6211: same barrier as the bridge hop — `a.id IN $ids`
-                    # only anchors the plan when it is separated from the
-                    # expanding MATCH (see _EP_ANCHOR_BARRIER).
+                    # #6211: same barrier as the bridge hop, and for the same
+                    # reason (see _EP_ANCHOR_BARRIER). Measured at THIS site the
+                    # barrier is redundant — the undirected `(a)-[r]-(b)` form is
+                    # already `Node By Index Scan (a:Point)` without it — and it is
+                    # kept as the engine-6.0.0 predicate-drop guard (#6976), not as
+                    # a cost fix: removing the barrier leaves the plan assertion in
+                    # `tests/test_6211_ep_anchor.py` green, while removing the
+                    # bridge hop's reddens it.
                     for _qa in epistemic_label_queries(
                         "MATCH (a:{label}) WHERE a.id IN $ids "
                         + _EP_ANCHOR_BARRIER +

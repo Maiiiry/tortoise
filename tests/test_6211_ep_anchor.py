@@ -126,6 +126,17 @@ def _build(sdk: TortoiseSDK) -> None:
         "MATCH (n:Point {id: $hub}) SET n:Object",
         params={"hub": HUB},
     )
+    # ... and a far endpoint with NO id, because the b-anchored half's guard
+    # is ``(_other.id IS NULL OR NOT _other.id IN $ids)`` and ``NOT null IN $ids``
+    # is NULL, not TRUE: drop the IS NULL arm and every edge whose other end
+    # has no id silently disappears. Without such a node in the fixture that
+    # mutant is invisible (every node here carries an id).
+    proj.g.query(
+        "MATCH (h:Point {id: $hub}) "
+        "CREATE (h)-[:IMPL {direction: 'bidirectional'}]->"
+        "(:Point {status: 'live', is_operator: false})",
+        params={"hub": HUB},
+    )
     # Operator-less direct edges (#888 W5): one leaving the affected set, one
     # entering it, one entirely inside it, and TWO byte-identical parallel
     # edges leaving it (they must stay two factors — a row-keyed dedupe would
@@ -284,6 +295,15 @@ def test_direct_edge_factors_are_collected_once_per_edge_from_both_ends(graph):
     # ... but TWO byte-identical parallel edges are TWO factors, not one.
     both = [f for f in factors if f[4] is None and tuple(f[2]) == (HUB, DIRECT_BOTH)]
     assert len(both) == 2, f"parallel direct edges collapsed into {len(both)} factor(s)"
+    # ... and the edge to the id-LESS node survives: the b-anchored half's guard
+    # is `(_other.id IS NULL OR NOT _other.id IN $ids)` because `NOT null IN $ids`
+    # is NULL, not TRUE. Dropping the `IS NULL` arm silently loses every direct
+    # edge whose other end has no id — invisible without such a node here.
+    noid = [f for f in factors if f[4] is None and tuple(f[2]) == (HUB, None)]
+    assert len(noid) == 1, (
+        f"the direct edge to an id-less endpoint produced {len(noid)} factor(s), "
+        "not 1 — the OR split's `IS NULL` guard is load-bearing"
+    )
 
     # The cache's back-message sweep is the other OR split: it must load the
     # back-message slot of a direct edge discovered from EITHER end.
@@ -310,12 +330,13 @@ def test_the_operator_selection_queries_are_planned_as_index_reads(graph):
     rows. It is the operator-viability query, and its id set is the whole
     operator frontier, so it was the worst-anchored statement of the pass.
 
-    The selector's OTHER three id-set legs had the same shape with the id
-    predicate on the far endpoint and are pinned here too — measured
-    unanchored on the 23k/160k fixture before their barriers
-    (`Node By Label Scan (op:Point)`, `All Node Scan (a)`, `All Node Scan (p)`);
-    one `_bfs_select_operators` call took 1.4-1.5 s then and takes ~0.1 s now
-    (best of 3, same 168 operators).
+    The selector's OTHER three id-set legs were measured unanchored too and are
+    pinned here — `Node By Label Scan (op:Point)` for the incoming-operator leg,
+    `All Node Scan (a)` for the backward direct-edge leg and `All Node Scan (p)`
+    for the operator-expansion leg (whose id predicate sits on the pattern's
+    FIRST node: it is the continuation, not the pattern side, that made the
+    planner walk the other endpoint). One `_bfs_select_operators` call took
+    1.4-1.5 s then and takes ~0.1 s now (best of 3, same 168 operators).
     """
     from tortoise.analyze import _bfs_select_operators
 
