@@ -168,11 +168,13 @@ def allowance_reachability(tier: str, nodes_per_op: float) -> dict:
     allowance = int(limits.get("included_write_ops_per_month") or 0)
     cap_raw = limits.get("max_graph_nodes")
     if cap_raw is None:
-        # ``tier_limits`` documents None as "unlimited" for the OBJECT-COUNT
-        # keys, but a null node cap is UNRANKABLE here (billing.py's own rule:
-        # null is "unrankable, never unlimited") — coercing it to 0 would
-        # report the maximum possible shortfall as a fabricated finding, and
-        # the capture gate would TypeError on the comparison anyway.
+        # ``tier_limits`` documents None as "unlimited" for these keys, but THIS
+        # reader cannot proceed with it: coercing it to 0 would report the maximum
+        # possible shortfall as a fabricated finding, and the capture gate would
+        # ``TypeError`` on the comparison anyway. The refusal is local to reachability
+        # accounting — it is NOT a claim that a null cap is unrankable in general
+        # (#8946: `billing._tier_cap` ranks it ABOVE every finite cap, and that is
+        # the billing rule).
         raise ValueError(
             f"tier {tier!r} publishes no node cap (max_graph_nodes is null) — "
             "a null cap is unrankable, not unlimited")

@@ -4145,6 +4145,34 @@ class TestTierCapSeparatesTheTwoNones:
         assert bl._drift_direction("pro", "team") == "down"
         assert bl._drift_direction("team", "pro") == "up"
 
+    def test_two_unlimited_tiers_are_not_a_config_fault(self, monkeypatch):
+        """Both sides unlimited ⇒ EQUAL caps, so the pair is ``"down"`` — the same
+        answer two equal finite caps get, and never ``None``.
+
+        ⛔ This is the case the fix's first cut got wrong in the other direction: on
+        base, both sides ``None`` short-circuited to ``None`` ("unrankable"), which
+        would now report a config fault for a ladder that read perfectly. Probing
+        it matters because ``from_max_nodes``/``to_max_nodes`` are both null, so an
+        operator has no other way to see it.
+        """
+        from tortoise import billing as bl
+        self._with_limits(monkeypatch, self._ladder({"pro": None, "ent": None, "free": 10000}))
+
+        assert bl._drift_direction("pro", "ent") == "down"
+        # and the finite baseline still ranks below an unlimited cap
+        assert bl._drift_direction("free", "ent") == "up"
+
+    def test_a_null_cap_on_FREE_claims_unknown_not_unpaid(self, monkeypatch):
+        """A null cap on the baseline makes the comparison meaningless, and a
+        meaningless comparison is not evidence. Answering ``"unpaid"`` would land
+        every paying org in ``skipped`` — the #8946 defect in the mirror direction.
+        """
+        from tortoise import billing as bl
+        self._with_limits(monkeypatch, self._ladder({"free": None, "pro": 25000, "team": 600000}))
+
+        assert bl._tier_claim("pro") == "unknown"
+        assert bl._tier_claim("team") == "unknown"
+
     def test_every_unreadable_shape_claims_unknown(self, monkeypatch):
         """The catch is BROAD on purpose: the four shapes are not one exception
         family, and ``_tier_claim`` runs OUTSIDE the per-org ``try`` — an escape

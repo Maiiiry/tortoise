@@ -953,10 +953,11 @@ def reconcile_org(sdk, org_id: str, force: bool = False) -> dict:
       it later becomes the only live subscription the pass reds for it until
       the catalog is fixed.
       ⛔ ``None`` from an unreadable ladder is not the only shape a cap can go
-      missing in: a tier whose required keys are PRESENT but whose
-      ``max_graph_nodes`` is ``null`` is returned as-is by ``tier_limits``, so
-      it ranks as unreadable AND mirrors without raising — the run can green,
-      and can even record a ``repaired`` tier change nobody proved (#8943).
+      missing in either direction, and the two are NOT alike (#8946): a tier whose
+      required keys are PRESENT but whose ``max_graph_nodes`` is ``null`` means
+      UNLIMITED — it ranks ABOVE every finite cap, so it neither reads as unreadable
+      nor hides a downgrade. A ladder that cannot be READ is the unrankable case, and
+      it still mirrors without raising — the run can green.
       ⛔ This is the CADENCE's guarantee, not the whole system's, and the
       ``customer.subscription.updated`` webhook can defeat it BEFORE the next
       pass: the handler writes provider truth for the subscription its event
@@ -1231,21 +1232,34 @@ def _tier_claim(tier: str | None) -> str:
     if cap is None:
         return "paid"  # unlimited outranks any finite cap
     if free_cap is None:
-        return "unpaid"  # nothing can outrank an unlimited FREE tier
+        # ⛔ An unlimited FREE tier makes the comparison meaningless, and a
+        # meaningless comparison is not evidence: answering "unpaid" would land
+        # every paying org in ``skipped`` with "stored at the unpaid tier" — the
+        # #8946 defect in the mirror direction. Free IS the free baseline, so a
+        # null cap on it is a ladder fault, and a fault reads UNKNOWN.
+        return "unknown"
     return "paid" if cap > free_cap else "unpaid"
 
 
 def _drift_direction(from_tier: str | None, to_tier: str | None) -> str | None:
     """``"up"`` when the repaired tier raises the enforced cap, ``"down"`` otherwise.
 
-    An UNRANKABLE pair — both floors ``None``, i.e. the pricing ladder could not
-    be read (a malformed ``pricing.json``, not an unrecognised tier: that
-    resolves to Free's cap and ranks normally) — returns ``None``. A third
+    An UNRANKABLE pair — either side ``_UNREADABLE``, i.e. the pricing ladder
+    could not be read (a malformed ``pricing.json``, not an unrecognised tier:
+    that resolves to Free's cap and ranks normally) — returns ``None``. A third
     value, deliberately distinct from ``"down"`` because it is not a downgrade
     either, and neither pages: the caller pages only ``"up"``, and a change we
     cannot prove RAISED the customer's entitlement must never page as a
     payable-customer-under-delivered event. ``None`` here is a CONFIG FAULT to
     look at, not a no-op.
+
+    ⛔ A ``None`` CAP is not this case: it means UNLIMITED (#8946). Two unlimited
+    tiers compare EQUAL and classify ``"down"``, exactly as two equal finite caps
+    do — never ``None``, which would report a config fault for a ladder that read
+    perfectly. ``"down"`` is the non-paging bucket, and the operator-facing
+    consequence is the one §4.2 spells out: an unlimited→finite repair IS a real
+    reduction, so check ``from_max_nodes is null`` before reading a ``"down"`` row
+    as a billing mistake.
     ``docs/infra-runbook.md`` §4.2 documents all three values.
     """
     before = _tier_cap(from_tier)
