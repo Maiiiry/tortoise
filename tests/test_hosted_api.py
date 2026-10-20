@@ -9399,77 +9399,6 @@ class TestUriRegistryProbeConnectionReuse:
             "configured URI changed")
         assert closed == [True], "the replaced handle must be closed"
 
-    def test_a_changed_store_path_rebuilds_instead_of_probing_the_old_store(
-            self, monkeypatch):
-        """#9334: the cache key is the STORE, not one of its inputs.
-
-        The URI alone does not identify what a handle is bound to. The suite's
-        canonical fixture (`tests/_http_fixtures.patched_tortoise_sdk`)
-        replaces `TortoiseSDK.__init__` so every construction binds that TEST's
-        temp DB and pins `TORTOISE_DB_PATH` to it, while the docker lane's
-        `TORTOISE_DB_URI` string stays constant for the whole run. Keyed on the
-        URI alone, a handle built under one store configuration was therefore
-        reused under the next one — the cache cannot see the rebind. On main at
-        adaf3daea that surfaced as an org that had just been created through the
-        live store being ABSENT from `GET /v1/organizations`
-        (`tests/test_onboarding_endpoints.py::TestOnboardingTeam::
-        test_create_team_then_session_key_mint_registry`, 1 failed / 43 passed
-        at file scope; 44 passed with this key), and the same handle answers
-        `_org_node`/`_membership_role` with EMPTY — the false 403 `Requires owner
-        or admin role in team`.
-
-        ⚠️ The reproduction is FILE scope, and re-measured at this head on the
-        lane's private container: `tests/test_onboarding_endpoints.py` is
-        44 passed with this key and 1 failed / 43 passed with
-        `_registry_probe_key()` collapsed to `(TORTOISE_DB_URI,)`, failing at
-        `assert any(t["org_id"] == sub_org_id for t in r4.json())`;
-        `tests/test_session_key_http.py` is 31 passed vs 1 failed / 30 passed.
-        Both named nodeids pass IN ISOLATION under either key, so a green
-        isolated run is not evidence the key is unnecessary. The handle that
-        crosses the test boundary is built by `_sweep_events` on an ABANDONED
-        daemon worker (`run_on_daemon_worker`: `wait_for` cancels the awaitable,
-        not the thread), so it lands AFTER the teardown reset — the reset cannot
-        close what does not exist yet.
-
-        The regression is stated as behaviour, not as a key comparison: after
-        the store the process addresses changes, the probe must CONSTRUCT a new
-        handle and close the old one. Reusing the old handle is the defect —
-        whatever the key is spelled as.
-        """
-        import tortoise.hosted_api as ha_mod
-
-        monkeypatch.setenv("TORTOISE_DB_URI",
-                           "docker://:pw@localhost:6379/probe-store")
-        monkeypatch.setenv("TORTOISE_DB_PATH", "/tmp/store-a/onboarding.db")
-        constructed, closed = self._install(monkeypatch, ["org_a"])
-        assert ha_mod._registry_existing_graphs() == {"org_a"}
-        assert len(constructed) == 1 and closed == []
-
-        # The SAME URI, a DIFFERENT store — exactly the harness's per-test
-        # rebind, and exactly a production `TORTOISE_DB_PATH` reconfiguration.
-        monkeypatch.setenv("TORTOISE_DB_PATH", "/tmp/store-b/onboarding.db")
-        assert ha_mod._registry_existing_graphs() == {"org_a"}
-
-        assert len(constructed) == 2, (
-            "the cached handle kept addressing the OLD store after the path "
-            "the handle is bound to changed — every read after that point "
-            "answers from a store the process no longer writes to")
-        assert closed == [True], "the replaced handle must be closed"
-
-        # The journal-dir component is pinned as a KEY SUPERSET guard, not as a
-        # #4240 journal binding: `config._resolve_event_log_path` returns None
-        # for namespace="registry" (config.py:128), so this handle carries no
-        # journal at all. The component is retained so a future
-        # namespace/journal change cannot silently reopen this class; its only
-        # observable today is that changing it forces one rebuild.
-        monkeypatch.setenv("TORTOISE_EVENT_LOG_BASE_DIR", "/tmp/journal-b")
-        ha_mod._registry_existing_graphs()
-        assert len(constructed) == 3, (
-            "the key no longer includes TORTOISE_EVENT_LOG_BASE_DIR — the "
-            "superset guard that keeps a future journal/namespace change from "
-            "reopening this class was dropped from _registry_probe_key")
-        assert closed == [True, True], "the replaced handle must be closed"
-
     def test_probe_failure_stays_fail_open_and_reuses_the_connection(
             self, monkeypatch):
         import tortoise.hosted_api as ha_mod
@@ -9557,6 +9486,109 @@ class TestUriRegistryProbeConnectionReuse:
         assert ha_mod._REGISTRY_PROBE_SDK is None
         assert ha_mod._registry_existing_graphs() == {"org_a"}
         assert len(constructed) == 2, "the reset did not clear the cache"
+
+    def test_a_changed_path_pin_rebuilds_the_handle(self, monkeypatch):
+        """#9334: the URI is NOT the probe's whole identity.
+
+        Under the epic-#1647 redirect a construction's graph is derived from
+        `sha1(session + path + graph_name)`, and the per-test fixtures re-bind
+        `TORTOISE_DB_PATH` per test while the URI string stays constant. A
+        URI-only cache key therefore handed the AUTH path a handle resolved
+        against the PREVIOUS test's path-derived graph: `_user_memberships`
+        (a fresh `_make_sdk`) found the seeded rows while
+        `_org_node`/`_membership_role` (this cache) found none — the empty
+        auth-path read behind `test_registry_mint_blocks_while_team_lock_held`
+        and the empty `GET /v1/organizations` in
+        `test_create_team_then_session_key_mint_registry`, both deterministic
+        when one process ran both files. Production never rebinds the pin, so
+        the extra key is inert there.
+
+        ⚠️ FILE scope is the reproduction; ISOLATION is not. Re-measured, one
+        process: `tests/test_onboarding_endpoints.py` 44 passed with the pin in
+        the identity vs 1 failed / 43 passed with it dropped, failing at
+        `assert any(t["org_id"] == sub_org_id for t in r4.json())`;
+        `tests/test_session_key_http.py` 31 passed vs 1 failed / 30 passed; and
+        both named nodeids pass in isolation under EITHER identity — so a green
+        isolated run is not evidence the pin is unnecessary. The handle that
+        crosses the boundary is built by `_sweep_events` on an ABANDONED daemon
+        worker (`run_on_daemon_worker`: `wait_for` cancels the awaitable, not the
+        thread), i.e. after the teardown reset — which also early-returns on an
+        empty slot BEFORE taking the lock, so a build in flight survives it too
+        (the reset's own lock invariant is #8867).
+        """
+        import tortoise.hosted_api as ha_mod
+
+        monkeypatch.setenv("TORTOISE_DB_URI",
+                           "docker://:pw@localhost:6379/probe-path")
+        constructed, closed = self._install(monkeypatch, ["org_a"])
+
+        monkeypatch.setenv("TORTOISE_DB_PATH", "/nonexistent/lane-a/t.db")
+        assert ha_mod._registry_existing_graphs() == {"org_a"}
+        assert len(constructed) == 1
+
+        # SAME URI, DIFFERENT path pin -> a different derived graph.
+        monkeypatch.setenv("TORTOISE_DB_PATH", "/nonexistent/lane-b/t.db")
+        assert ha_mod._registry_existing_graphs() == {"org_a"}
+        assert len(constructed) == 2, (
+            "the cache key ignored TORTOISE_DB_PATH — the probe reused a handle "
+            "derived under the previous path, i.e. the auth path reads a store "
+            "the test never seeded")
+        assert closed == [True], "the stale handle was dropped without closing it"
+
+        # An UNCHANGED identity must still be reused (the fix must not defeat
+        # the cache it exists to keep).
+        assert ha_mod._registry_existing_graphs() == {"org_a"}
+        assert len(constructed) == 2, "an unchanged identity rebuilt the handle"
+
+    def test_the_identity_is_sampled_inside_the_lock_not_before_it(
+            self, monkeypatch):
+        """#8867: a cache stamp must describe the handle it is stamped on.
+
+        The lock is held ACROSS the connect (#4661 measures that in seconds), so
+        an identity sampled before acquiring it can wait that long and then label
+        a handle built under a DIFFERENT env. Deterministic here: the main thread
+        holds `_KEEPALIVE_LOCK`, the worker is released into the lock wait, and
+        the env changes before the lock is handed over. Sampling only on the fast
+        path (the pre-fix shape) stamps the OLD path — the #9334 defect mirrored,
+        one level down.
+        """
+        import threading
+
+        import tortoise.hosted_api as ha_mod
+
+        monkeypatch.setenv("TORTOISE_DB_URI",
+                           "docker://:pw@localhost:6379/probe-stamp")
+        monkeypatch.setenv("TORTOISE_DB_PATH", "/nonexistent/stamp-a/t.db")
+        constructed, _closed = self._install(monkeypatch, ["org_a"])
+
+        real_identity = ha_mod._registry_probe_identity
+        samples: list[tuple[str, str]] = []
+        sampled = threading.Event()
+
+        def _observed():
+            value = real_identity()
+            samples.append(value)
+            sampled.set()
+            return value
+
+        monkeypatch.setattr(ha_mod, "_registry_probe_identity", _observed)
+
+        results: list[object] = []
+        worker = threading.Thread(
+            target=lambda: results.append(ha_mod._registry_existing_graphs()))
+        with ha_mod._KEEPALIVE_LOCK:
+            worker.start()
+            assert sampled.wait(10), "the worker never sampled the identity"
+            # The reconfiguration lands while the worker waits for the lock.
+            monkeypatch.setenv("TORTOISE_DB_PATH", "/nonexistent/stamp-b/t.db")
+        worker.join(10)
+
+        assert not worker.is_alive(), "the probe never left the lock wait"
+        assert results == [{"org_a"}]
+        assert ha_mod._REGISTRY_PROBE_PATH == "/nonexistent/stamp-b/t.db", (
+            "the identity was sampled BEFORE the lock and stamped on a handle "
+            "built after it — the stamp does not describe its value")
+        assert len(constructed) == 1
 
 
 class TestOnboardingProjectionSamplesTheRegistryOnce:

@@ -266,16 +266,22 @@ ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
     # "gold" is a fixture graph name, not a server graph the SDK resolves from the
     # registry and not a production-shape namespace.
     "test_document_source_gold.py": {"gold": "test-constructed"},
-    # #9192: the two-tenant lane's fixture constructs
+    # #9192 (landed by PR #9328): the two-tenant lane's fixture constructs
     # `TortoiseSDK(db_path=tmp_path/registry.db, namespace="registry")` — the
     # CANONICAL namespace PROD resolves for the registry control plane. The
-    # store is pinned to an explicit `db_path` under `tmp_path`, and the fixture
-    # delenv's `TORTOISE_DB_URI` first, so this is a genuinely EMBEDDED lane —
-    # isolation is that explicit path (not a server-lane per-path derivation),
-    # the same `db_path`-bound shape as test_graph_storage / #5331 above. The
-    # literal IS the namespace the MCP auth layer under test resolves its
-    # graph-bound `tk_` keys from, so a `test_*` rename would seed a graph the
-    # code never reads and every tenant-scope leg here would go vacuously green.
+    # literal is PROD-COUPLED, not incidental: the fixture seeds the orgs /
+    # graphs / `tk_` keys through that namespace and the app it then drives
+    # resolves (and writes under) the same one. The store is pinned to an
+    # explicit `db_path` under `tmp_path` and the fixture delenv's
+    # `TORTOISE_DB_URI` first, so this is a genuinely EMBEDDED lane — isolation
+    # is that explicit path (not a server-lane per-path derivation), the same
+    # `db_path`-bound shape as test_graph_storage / #5331 above.
+    # Renaming the literal decouples the seed from the resolution — MEASURED:
+    # the rename reds `test_a_registry_graph_id_is_never_installed` and
+    # `test_an_org_wide_credential_is_refused_not_guessed` (2 failed, 23
+    # passed); with the literal restored the file is 25 passed. Same class (and
+    # same failure shape) as the `test_quota`/`test_github_connect` entries
+    # above.
     "test_9192_tenant_armed_by_request.py": {"registry": "prod-coupled"},
 }
 
