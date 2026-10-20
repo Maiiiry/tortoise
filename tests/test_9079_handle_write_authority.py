@@ -66,32 +66,56 @@ from tortoise.projection import (
 #: reader and forgotten in another.
 MUTATING_CAPABLE_VERBS = _HANDLE_MUTATING_VERBS
 
-#: The CYPHER verbs that take a STATEMENT first, i.e. the shared tuple minus the
-#: two verbs whose statement does not arrive as ``args[0]``:
-#:
-#: * ``execute_command`` — a raw Redis command carries its Cypher at ``args[2]``
-#:   (``("GRAPH.QUERY", <graph>, <cypher>)``), and gets its own test below;
-#: * ``call_procedure`` — its first argument is a PROCEDURE NAME, and the vendor
-#:   builds ``CALL <procedure>($paramN…)`` from it (#9209). Handing it a
-#:   ``"CREATE …"`` statement would test a call nobody makes. It is covered by
-#:   the explicit source assertion below plus `tests/test_9209_handle_non_
-#:   cypher_wipe.py`, which measures the statement it really sends.
+#: The five CYPHER verbs, i.e. the shared tuple minus `execute_command` — which
+#: is guarded too, but takes its Cypher at ``args[2]`` inside a Redis command
+#: and therefore gets its own test below rather than the uniform per-verb call.
 MUTATING_QUERY_VERBS = tuple(
-    verb for verb in _HANDLE_MUTATING_VERBS
-    if verb not in ("execute_command", "call_procedure"))
+    verb for verb in _HANDLE_MUTATING_VERBS if verb != "execute_command")
 
 #: Every OTHER callable defined on `_GuardedGraph`, with the reason it can put no
 #: mutating statement on the wire. The enumeration test compares the class's own
-#: members (dunders excluded) against this set plus the shared verb tuple, so a
-#: new method is a failure rather than a silent gap.
+#: members (dunders excluded) against this set, the shared verb tuple and the
+#: non-statement-guarded verbs below, so a new method is a failure rather than a
+#: silent gap.
 _NON_MUTATING_HANDLE_METHODS = {
     "_refuse_unauthorized_cache_write",  # the check itself
     "_bar",  # #7162: rewrites the statement text, dispatches nothing
-    # #9209 — these carry no STATEMENT, so the §17.1 statement check has nothing
-    # to classify; each refuses a destruction of its own on the verb/payload:
-    "delete",  # dispatches `GRAPH.DELETE`; refused by `_refuse_unauthorized_graph_wipe`
-    "_refuse_unauthorized_graph_wipe",  # the #9209 verb-level refusal
-    "_refuse_key_space_handle_command",  # the #9209 key-space refusal
+    # #9209: the two non-Cypher refusal helpers. They RAISE and dispatch nothing,
+    # so they are non-mutating in the sense this bucket means; the verbs that
+    # CONSULT them are in the bucket below, so a helper cannot be smuggled in
+    # here on behalf of an unguarded verb.
+    "_refuse_unauthorized_graph_wipe",
+    "_refuse_key_space_handle_command",
+}
+
+#: #9209 — the third bucket: MUTATING verbs on the handle whose refusal is NOT
+#: the §17.1 statement check, mapped to the guard(s) that must appear in each
+#: verb's own body.
+#:
+#: ⛔ WHY A THIRD BUCKET RATHER THAN ONE OF THE OTHER TWO (#9223 review). The
+#: shared tuple `_HANDLE_MUTATING_VERBS` is not a list of "verbs that write"; it
+#: is the list of verbs that carry a CYPHER STATEMENT, and two other gates
+#: depend on that meaning — `MUTATING_QUERY_VERBS` (below) calls each verb with
+#: a statement positionally, and `tests/test_9124_declared_live_doors.py`
+#: censuses declaration call sites at that same argument index. `delete()`
+#: takes a graph NAME, not a statement, so listing it there would break both
+#: readers and demand a check its body structurally cannot perform. Filing the
+#: two verbs under `_NON_MUTATING_HANDLE_METHODS` would be worse: it would state
+#: in a SECURITY inventory that a mutating verb cannot write. So they get their
+#: own bucket, which is STRICTER than the non-mutating one — membership requires
+#: naming the guard, and the guard is asserted to be in the verb's source.
+_NON_STATEMENT_GUARDED_HANDLE_VERBS = {
+    # `GRAPH.DELETE` carries no Cypher at all: the guard is #9209's non-Cypher
+    # decision, shared with the command channel so the two spellings cannot
+    # drift.
+    "delete": ("_refuse_unauthorized_graph_wipe",),
+    # `CALL <procedure>(…)` IS Cypher text, so this verb is protected by the L2
+    # bulk-wipe classifier applied to the statement the vendor will build.
+    # §17.1's statement door is #9124's and is deliberately NOT applied here —
+    # stated in the method's own docstring, and the reason this verb cannot sit
+    # in `_HANDLE_MUTATING_VERBS`, whose every member must consult
+    # `_refuse_unauthorized_cache_write`.
+    "call_procedure": ("_is_bulk_wipe", "_assert_test_graph"),
 }
 
 
@@ -267,15 +291,43 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
         name for name, value in vars(_GuardedGraph).items()
         if not name.startswith("__") and callable(value)
     }
-    accounted = set(_HANDLE_MUTATING_VERBS) | set(_NON_MUTATING_HANDLE_METHODS)
+    accounted = (set(_HANDLE_MUTATING_VERBS) | set(_NON_MUTATING_HANDLE_METHODS)
+                 | set(_NON_STATEMENT_GUARDED_HANDLE_VERBS))
     assert public_members == accounted, (
         "`_GuardedGraph` gained or lost a method without this gate noticing. "
-        "A new verb that can put a mutating statement on the wire belongs in "
+        "A new verb that can put a mutating STATEMENT on the wire belongs in "
         "`_HANDLE_MUTATING_VERBS` (shared with the declaration census); a "
+        "MUTATING verb whose refusal is not the statement check belongs in "
+        "`_NON_STATEMENT_GUARDED_HANDLE_VERBS` with the guard named; a "
         "method that cannot write belongs in `_NON_MUTATING_HANDLE_METHODS` "
         f"with the reason. Unaccounted: {sorted(public_members - accounted)}; "
         f"listed but absent: {sorted(accounted - public_members)}"
     )
+
+    # THE THIRD BUCKET IS NOT A WAY OUT OF THE GATE (#9223 review). Each entry
+    # must name a guard that really appears in the verb's own body, and the
+    # buckets must stay disjoint — otherwise `delete`/`call_procedure` could be
+    # moved here to dodge the statement assertion while carrying no guard at
+    # all, which is the silent bypass the review declined to author.
+    assert set(_NON_STATEMENT_GUARDED_HANDLE_VERBS).isdisjoint(
+        _NON_MUTATING_HANDLE_METHODS), (
+        "a verb cannot be both \"cannot write\" and \"writes, guarded by a "
+        "non-statement check\""
+    )
+    assert set(_NON_STATEMENT_GUARDED_HANDLE_VERBS).isdisjoint(
+        MUTATING_QUERY_VERBS), (
+        "a verb in the shared statement tuple must carry "
+        "`_refuse_unauthorized_cache_write`; listing it here too would let it "
+        "skip that assertion"
+    )
+    for verb, guards in _NON_STATEMENT_GUARDED_HANDLE_VERBS.items():
+        body = inspect.getsource(getattr(_GuardedGraph, verb))
+        for guard in guards:
+            assert guard in body, (
+                f"`_GuardedGraph.{verb}` is declared as guarded by `{guard}`, "
+                "but its body does not consult it — an unguarded mutating "
+                "verb declared guarded is worse than an unlisted one"
+            )
     # `execute_command` carries a statement only in its args, so it is checked
     # separately — and this is the assertion that keeps it from being forgotten.
     assert "_refuse_unauthorized_cache_write" in inspect.getsource(
@@ -283,16 +335,6 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
         "`_GuardedGraph.execute_command` must recover the statement from its "
         "args and consult §17.1: a raw `GRAPH.QUERY` never reaches `query`, so "
         "an unguarded command channel is this door re-opened under another name"
-    )
-    # `call_procedure` BUILDS its statement from a caller-controlled procedure
-    # name (#9209), so it is in the mutating tuple but cannot run the uniform
-    # per-verb call — pinned here so the tuple entry is not a promise the code
-    # does not keep.
-    assert "_refuse_unauthorized_cache_write" in inspect.getsource(
-        _GuardedGraph.call_procedure), (
-        "`_GuardedGraph.call_procedure` is listed in `_HANDLE_MUTATING_VERBS` "
-        "but does not consult §17.1: the vendor pastes the caller's procedure "
-        "string into `CALL <procedure>(…)` and dispatches it through `_query`"
     )
     assert source.count("def _refuse_unauthorized_cache_write") == 1, (
         "the handle must have exactly ONE authorization check — a second copy "

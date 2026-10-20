@@ -3341,10 +3341,9 @@ def _journal_safe_params(params, cypher=None):
 # place a refusal at the handle means an UNDECLARED writer — which is exactly
 # the second writer §17.1 forbids, and no longer the product's own write path.
 # Every mutating-capable verb is covered (`_HANDLE_MUTATING_VERBS`: `query`,
-# `ro_query`, `_query`, `profile`, `explain`, `execute_command`, and since #9209
-# `call_procedure`, whose statement the vendor builds from its arguments),
-# because a guard on `query` alone is one private hop or one verb name away from
-# being no guard. Converting the 300+-site surface to the atomic write is §17.1's
+# `ro_query`, `_query`, `profile`, `explain`, `execute_command`), because a
+# guard on `query` alone is one private hop or one verb name away from being no
+# guard. Converting the 300+-site surface to the atomic write is §17.1's
 # mechanism (1) and remains open on `#7951`.
 #
 # ⛔ THE HANDLE'S *DETECTION* IS COMPLETE; ITS *REFUSAL IS NOT YET ARMED*.
@@ -3382,11 +3381,6 @@ def _journal_safe_params(params, cypher=None):
 # the same fold — and they are the surface §17.1's atomic write has to close.
 # A lexical inventory cannot, because each is one hop below anything a runtime
 # signal is placed on.
-# All three are verified ALLOWED against a journal-backed projection. (2) and
-# (3) are the same class as (1) — they bypass the same fold — and none of the
-# three is guarded in this increment. They are the surface §17.1's atomic
-# write has to close; a lexical inventory cannot, because each is one hop
-# below anything a runtime signal is placed on.
 #
 # ⛔ ESCAPE (4) WAS THE WHOLE-GRAPH WIPE, AND ITS NON-CYPHER DOOR IS NOW CLOSED
 # (#9209). The three above are all *statements*, so both of §17.1's doors read
@@ -3427,8 +3421,11 @@ def _journal_safe_params(params, cypher=None):
 # a legitimate retry silently). `GRAPH.COPY` stays allowed because it is inside
 # the family and removes nothing from this cache.
 # ⛔ NOT claimed closed by any of it: the Cypher-bearing command channel
-# (`execute_command("GRAPH.QUERY", <g>, "MATCH (n) DETACH DELETE n")`), which
-# needs statement recovery (#9124); the private hop `proj.g._g.delete()` (the
+# (`execute_command("GRAPH.QUERY", <g>, "MATCH (n) DETACH DELETE n")`) — that
+# statement IS recovered and measured by §17.1's handle door since #9124 part 1
+# (`_command_statement` -> `_refuse_unauthorized_cache_write`), but it is only
+# REFUSED once `_HANDLE_GUARD_ENFORCES` is True, so it is detected-and-stated,
+# not closed, here; the private hop `proj.g._g.delete()` (the
 # `delete()` analogue of escape (2) above — no wrapper can guard a hop below
 # itself); and the handle's other GRAPH.* verbs that write but destroy nothing
 # (`copy`, index/constraint DDL) — refusing those would refuse an operation the
@@ -3447,28 +3444,30 @@ class DirectCacheWriteRefused(RuntimeError):
     Raised when a fold (`FalkorProjection.apply`), a mutating statement on
     the public raw-query lane (`FalkorProjection.query`), a mutating
     statement issued at the projection's write handle (`_GuardedGraph`, i.e.
-    `proj.g`, #9124), a whole-graph destruction through that handle's
-    non-Cypher verbs (`GRAPH.DELETE` via `proj.g.delete()` /
-    `proj.g.execute_command`, a KEY-SPACE command — `DEL` / `UNLINK` /
-    `RENAME` / `EXPIRE 0` …, because the cache is stored under the graph's
-    own Redis key — or a server-wide `FLUSHALL` / `FLUSHDB`, #9209) is
-    issued against a **journal-backed** projection. The projection is the
-    derived cache of a journal; a write — or a wipe — it did not receive
+    `proj.g`), a whole-graph destruction through that handle's non-Cypher
+    verbs (`GRAPH.DELETE` via `proj.g.delete()` / `proj.g.execute_command`,
+    #9209), a KEY-SPACE command on that same handle (`DEL` / `UNLINK` /
+    `RENAME` / `EXPIRE 0` … — the cache is stored under the graph's own Redis
+    key, so these are the same wipe), or a server-wide `FLUSHALL` / `FLUSHDB`
+    is attempted against a **journal-backed** projection. The projection is
+    the derived cache of a journal; a write — or a wipe — it did not receive
     through its journal is the second writer §17.1 forbids.
 
-    ⚠️ At the HANDLE, the STATEMENT class raises only once
-    `_HANDLE_GUARD_ENFORCES` is True (#9124 part 2); until then it records
+    ⚠️ At the HANDLE it raises only once `_HANDLE_GUARD_ENFORCES` is True
+    (#9124 part 2) **for the statement door**. Until then the handle records
     the same violation in `undeclared_handle_writes()` and logs it, because
-    arming ahead of the declaration programme refuses the product's own
-    write doors.
+    arming ahead of the declaration programme refuses the product's own write
+    doors. The #9209 NON-statement doors below are NOT gated on that constant —
+    they refuse immediately, because a whole-graph removal carries no statement
+    for the census to name and cannot be recorded as an undeclared write.
 
-    ⛔ THE CLASSES DO NOT SHARE ONE AUTHORIZATION RULE, and this docstring is
-    where a caller looks before writing a `with` block, so stated apart: the
-    fold, the raw-query lane, a handle STATEMENT and `GRAPH.DELETE` are
-    refused OUTSIDE a sanctioned scope (so declaring one authorizes them);
-    `FLUSHALL` / `FLUSHDB` and every KEY-SPACE command are refused on any
-    journal-backed projection, scope or NOT — a declaration says "this write
-    is a projection of the journal", and none of those can say that.
+    ⛔ THE CLASSES DO NOT SHARE ONE AUTHORIZATION RULE, and this docstring
+    is where a caller looks before writing a `with` block, so stated apart: the
+    fold, the raw-query lane and `GRAPH.DELETE` are refused OUTSIDE a sanctioned
+    scope (so declaring one authorizes them); `FLUSHALL` / `FLUSHDB` and every
+    key-space command are refused on any journal-backed projection, scope or
+    NOT — a declaration says "this write is a projection of the journal", and
+    none of those can say that.
     """
 
 
@@ -3507,20 +3506,8 @@ _UNDECLARED_HANDLE_WRITES_LOCK = threading.Lock()
 #: `explain` is listed although `GRAPH.EXPLAIN` only PLANS: it is guarded for
 #: enumeration uniformity, so a verb cannot be one refactor away from unguarded
 #: (refusing a plan costs nothing).
-#:
-#: `call_procedure` is listed because the vendor BUILDS a statement out of its
-#: arguments (`CALL <procedure>($paramN…)`) and sends that through `_query` —
-#: so it is a mutating-capable STATEMENT verb like the rest, and since #9209 it
-#: is defined on the wrapper and consults this same check on the statement it
-#: will actually send. It is EXCLUDED from the uniform per-verb test there
-#: (`tests/test_9079_handle_write_authority.py`) only because its first
-#: argument is a PROCEDURE NAME, not a statement: handing it `"CREATE …"` builds
-#: `CALL CREATE …()`, which is not the shape that test issues. Its coverage is an
-#: explicit source assertion in that file plus the #9209 suite's own
-#: statement cases.
 _HANDLE_MUTATING_VERBS: tuple[str, ...] = (
     "query", "ro_query", "_query", "profile", "explain", "execute_command",
-    "call_procedure",
 )
 
 
@@ -3790,21 +3777,40 @@ _GRAPH_TARGETING_COMMANDS: frozenset[str] = frozenset({"GRAPH.DELETE"})
 def _handle_command_text(value) -> str | None:
     """Decode one command word so the scan can see it, else return it untouched.
 
-    Bytes are accepted because redis-py takes the bytes form and
-    ``cypher_guard._as_text`` exists for the same reason (#3595 review) —
-    measured on the pinned vendor: ``execute_command(b"GRAPH.DELETE", <graph>)``
-    wipes the graph exactly like the str form. ``None`` means "not a command
-    word", which no caller may read as an authorization: every classification
-    here is a positive match only, so an unparseable payload falls through to
-    the guards it always did.
+    ⛔ BYTES-LIKE, not just ``bytes`` (:9209 review, measured). Bytes are
+    accepted because redis-py takes the bytes form and ``cypher_guard._as_text``
+    exists for the same reason (#3595 review) — measured on the pinned vendor:
+    ``execute_command(b"GRAPH.DELETE", <graph>)`` wipes the graph exactly like
+    the str form. A ``memoryview`` is the SAME door one decoder branch away:
+    ``redis.connection.Encoder.encode`` passes a buffer through UNCHANGED and
+    the serializer's ``b" " in args[0]`` test is never true for a
+    ``memoryview`` (its ``in`` compares ints), so the buffer IS the command name
+    on the wire — MEASURED on an armed projection:
+    ``execute_command(memoryview(b"GRAPH.DELETE"), <graph>)`` deleted the graph
+    and only THEN raised ``AttributeError: 'memoryview' object has no attribute
+    'upper'`` from the client's response-callback lookup, i.e. a refusal-shaped
+    traceback on top of a completed wipe.
+
+    ``None`` means "not a command word", which no caller may read as an
+    authorization: every classification here is a positive match only, and a
+    caller that cannot read a word REFUSES (armed) rather than passing it on.
+
+    NOTE ON THE SPLIT: the packer does not split a ``memoryview``, so
+    ``memoryview(b"GRAPH.DELETE x")`` is ONE token on the wire and the server
+    answers ``unknown command`` — while this helper's caller splits it and
+    refuses. That is over-refusal in the fail-closed direction, and it is left
+    that way deliberately: a decoder that has to mirror two packers' buffer
+    handling exactly would be one branch away from a hole again.
     """
+    if isinstance(value, memoryview):
+        value = value.tobytes()
     if isinstance(value, (bytes, bytearray)):
         value = bytes(value).decode("utf-8", "replace")
     return value if isinstance(value, str) else None
 
 
-def _handle_command_words(args) -> tuple[str | None, tuple[str, ...]]:
-    """The verb to classify, and the words the client will ACTUALLY send.
+def _handle_command_words(args) -> tuple[str | None, tuple[str | None, ...]]:
+    """The verb to classify, and the argument words the client will send.
 
     ⛔ The first argument is SPLIT, not taken as one token, because the client
     splits it: both serializers in the pinned ``redis`` (7.4.1) do
@@ -3817,20 +3823,37 @@ def _handle_command_words(args) -> tuple[str | None, tuple[str, ...]]:
     byte-identical — a classifier that reads ``args[0]`` as one token closes one
     spelling and leaves the other open, which is the same spelling-shaped
     coverage defect #9209 exists to end (measured in review).
+
+    ⛔ AND ``args[1:]`` IS PART OF THE COMMAND, which the first version of this
+    helper got wrong in the FAIL-OPEN direction (:9209 review, measured). A
+    first argument carrying ZERO words is DROPPED by the serializer, so the
+    command the server receives STARTS at ``args[1]`` — but this helper returned
+    ``(None, ())`` and the guard never saw the verb:
+
+        proj.g.execute_command("", "FLUSHDB")                  -> 'OK', 2 -> 0
+        proj.g.execute_command("   ", "DEL", <own graph>)      -> 1,    2 -> 0
+        proj.g.execute_command(" ", "GRAPH.DELETE", "victim")  -> other graph deleted
+
+    So the word list is built the way the serializer builds it — the head's
+    words followed by every argument's text — and only a payload with NO
+    readable word at all yields ``None``.
+
+    An argument in the tail that cannot be decoded as text is returned as
+    ``None`` IN ITS POSITION rather than dropped, so a caller cannot mistake
+    "there was a target and I could not read it" for "there was no target".
     """
     if not args:
         return None, ()
-    text = _handle_command_text(args[0])
-    if text is None:
-        return None, ()
-    words = text.split()
-    if not words:
-        return None, ()
-    rest = tuple(words[1:]) + tuple(
-        word for word in (_handle_command_text(arg) for arg in args[1:])
-        if word is not None
+    head = _handle_command_text(args[0])
+    tail: tuple[str | None, ...] = tuple(
+        _handle_command_text(arg) for arg in args[1:]
     )
-    return words[0].upper(), rest
+    words: tuple[str | None, ...] = (
+        (tuple(head.split()) + tail) if head is not None else tail
+    )
+    if not words or words[0] is None:
+        return None, words[1:]
+    return words[0].upper(), words[1:]
 
 
 def _call_procedure_statement(procedure, args=None, emit=None) -> str | None:
@@ -3839,11 +3862,22 @@ def _call_procedure_statement(procedure, args=None, emit=None) -> str | None:
     Mirrors the pinned vendor EXACTLY, including the part that is easy to get
     wrong: ``args`` are converted to ``$paramN`` PLACEHOLDERS and passed as
     ``params`` — the vendor's own comment is *"CALL <proc>(1) -> CYPHER
-    param_0=1 CALL <proc>($param_0)"* — so an argument VALUE never reaches the
-    wire statement. Rendering the values here instead would classify a
-    statement the vendor does not send, and it cuts BOTH ways: an arg whose text
-    carries a scoping construct would exempt a real wipe, and a read whose arg
-    merely contains ``DETACH DELETE`` would be refused (verified in review).
+    param_0=1 CALL <proc>($param_0)"* — so the CYPHER TEXT this helper classifies
+    carries placeholders, never argument values. Rendering the values into it
+    would classify a statement the vendor does not send, and it cuts BOTH ways:
+    an arg whose text carries a scoping construct would exempt a real wipe, and a
+    read whose arg merely contains ``DETACH DELETE`` would be refused (verified in
+    review).
+
+    ⚠️ THE VALUES DO REACH THE WIRE, in the params HEADER, not in this statement
+    (:9209 review): the vendor's ``_query`` prepends
+    ``_build_params_header(params)``, which renders ``CYPHER `param0`=<value>``
+    with ``falkordb.helpers.stringify_param_value`` (strings quoted/escaped, so a
+    value cannot close its own literal and become Cypher). That is why the
+    conclusion above holds — and it is stated rather than left as "values never
+    reach the wire", which would be false, and which is exactly the
+    statement-literal channel ``_guard_numeric_literals`` (#8479) exists for.
+
     Only ``procedure`` — and ``emit`` — sit in CYPHER position, which is why
     they are the caller-controlled surface this guard exists for: on an armed
     projection,
@@ -3860,6 +3894,7 @@ def _call_procedure_statement(procedure, args=None, emit=None) -> str | None:
     if emit is not None and len(emit) > 0:
         statement += f"YIELD {','.join(str(word) for word in emit)}"
     return statement
+
 
 def _command_statement(args, kwargs) -> str:
     """Recover the Cypher text a raw ``execute_command`` payload carries.
@@ -3924,26 +3959,33 @@ class _GuardedGraph:
     guard every query entry point against the #3595 ``=~`` operator. For
     defence in depth this wrapper also overrides every query entry point itself
     (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``,
-    ``execute_command``, ``delete``, ``call_procedure``), so it does not depend
-    on the inner handle's class to refuse the ``=~`` operator. NOTE the override
-    is NOT uniform: only ``query`` and ``call_procedure`` apply the bulk-wipe
-    check (L2) as well — ``call_procedure`` since #9209 round 3, because the
-    vendor builds ``CALL <procedure>($paramN…)`` from a caller-controlled
-    string. All SIX query verbs (``query``, ``ro_query``, ``_query``,
-    ``profile``, ``explain``, ``execute_command``) carry the §17.1 AUTHORITY
-    check (`_refuse_unauthorized_cache_write`, #9124) first — in MEASURE mode
-    it counts an undeclared write, once `_HANDLE_GUARD_ENFORCES` is True it
-    refuses it (`_HANDLE_MUTATING_VERBS` is the one list of what counts as a
-    mutating verb); ``call_procedure`` is a STATEMENT path too, so it carries
-    the same authority check on the statement the vendor will build. The five
-    query verbs (``query``, ``ro_query``, ``_query``, ``profile``,
-    ``explain``) additionally carry the other pre-dispatch refusals — the
-    #3595 operator guard, the #7174 numeric-domain guard on their ``params``,
-    and (since #8479) that same domain applied to the statement's own TEXT —
-    while ``execute_command`` carries the operator and statement-text guards
-    after recovering its statement from ``args`` (a raw command has no params
-    map to walk; the vendor inlines params into the statement text instead,
-    which is exactly the text the #8479 scan reads — see
+    ``execute_command``, ``delete``, ``call_procedure``), so the five statement
+    verbs and ``execute_command`` do not depend on the inner handle's class to
+    refuse the ``=~`` operator. NOTE the override is NOT uniform, in TWO
+    respects. (a) The ``=~`` refusal reaches the five query verbs and
+    ``execute_command``; ``delete`` carries no statement at all, and
+    ``call_procedure`` applies L2 (and only L2) to the statement the vendor
+    builds, so a ``=~`` typed into a procedure string is still refused one
+    layer down by the guarded inner handle rather than here — the same
+    dependency the whole class exists to avoid, stated because the class
+    docstring is this guard's own map. (b) Only ``query`` and
+    ``call_procedure`` apply the bulk-wipe check (L2) as well —
+    ``call_procedure`` since #9209 round 3, because the vendor builds
+    ``CALL <procedure>($paramN…)`` from a caller-controlled string. All six
+    verbs in `_HANDLE_MUTATING_VERBS` carry the §17.1 AUTHORITY check
+    (`_refuse_unauthorized_cache_write`) first — in MEASURE mode it counts an
+    undeclared write, once `_HANDLE_GUARD_ENFORCES` is True it refuses it
+    (`_HANDLE_MUTATING_VERBS` is the one list of what counts as a mutating
+    STATEMENT verb; the two non-statement verbs ``delete`` / ``call_procedure``
+    are guarded by the #9209 doors below, not by that list). The five query
+    verbs (``query``, ``ro_query``, ``_query``, ``profile``, ``explain``)
+    additionally carry the other pre-dispatch refusals — the #3595 operator
+    guard, the #7174 numeric-domain guard on their ``params``, and (since
+    #8479) that same domain applied to the statement's own TEXT — while
+    ``execute_command`` carries the operator and statement-text guards after
+    recovering its statement from ``args`` (a raw command has no params map to
+    walk; the vendor inlines params into the statement text instead, which is
+    exactly the text the #8479 scan reads — see
     ``cypher_guard._guard_numeric_literals``). See KNOWN GAPS in the module
     comment above.
 
@@ -4130,28 +4172,55 @@ class _GuardedGraph:
         return self._g.explain(cypher, params=_journal_safe_params(params, cypher))
 
     def execute_command(self, *args, **kwargs):
-        # #9124: the raw Redis command channel is a mutating verb on this handle
-        # too — a `GRAPH.QUERY` payload never reaches `query`/`_query`, so an
-        # unguarded channel would be the third door re-opened under another
-        # name. The statement is recovered from the payload (a raw `GRAPH.QUERY`
-        # inlines its params into that same string, so this is the whole write).
+        # ⛔ TWO DECISIONS, AND THE ORDER IS STATED because they are NOT
+        # interchangeable (#9124 x #9209).
+        #
+        # (1) §17.1's STATEMENT door (#9124): the raw Redis command channel is a
+        # mutating verb on this handle too — a `GRAPH.QUERY` payload never
+        # reaches `query`/`_query`, so an unguarded channel would be the third
+        # door re-opened under another name. The statement is recovered from the
+        # payload (a raw `GRAPH.QUERY` inlines its params into that same string,
+        # so this is the whole write). This check MEASURES in the landed state
+        # (`_HANDLE_GUARD_ENFORCES` False) and only refuses once part 2 arms it.
+        #
+        # (2) #9209's NON-STATEMENT doors: a command carrying no statement at
+        # all (`GRAPH.DELETE`, `FLUSHALL`, and the whole KEY SPACE — `DEL`,
+        # `UNLINK`, `RENAME`, `EXPIRE 0` …) is invisible to (1), because
+        # `_command_statement` returns "" for anything that is not one of the
+        # four GRAPH.* QUERY verbs. Those REFUSE IMMEDIATELY on an armed
+        # projection — they cannot be MEASURED, because there is no statement to
+        # name in the census. So the measuring check runs first and the raising
+        # one second: a payload that wrote a statement is recorded by (1) and
+        # then refused by (2) if it is also a wipe, before dispatch, and a plain
+        # `GRAPH.QUERY` is only ever seen by (1).
+        #
+        # (2) also sits before the operator/barrier guards below, which do not
+        # classify commands at all. The words come from
+        # `_handle_command_words`, which splits the first argument the way the
+        # client's serializer does, so ``"GRAPH.DELETE <graph>"`` cannot slip
+        # past as one token.
         statement = _command_statement(args, kwargs)
         if statement:
             self._refuse_unauthorized_cache_write(statement)
-        # #9209: the guards around this one read a Cypher STATEMENT, so a command
-        # that carries none (``GRAPH.DELETE``, ``FLUSHALL``, ``DEL``) reached the
-        # graph untouched. The next two decisions therefore run on the VERB, not
-        # on a statement, and they run before the #3595/#7162 chain below — which
-        # does not classify commands at all — so the destructive class is refused
-        # whatever the rest of the chain would have done with it. The words come
-        # from `_handle_command_words`, which splits the first argument the way
-        # the client's serializer does, so ``"GRAPH.DELETE <graph>"`` cannot slip
-        # past as one token.
+
+        # #9209: the guards below read a Cypher STATEMENT, so a command that
+        # carries none (``GRAPH.DELETE``, ``FLUSHALL``) reached the graph
+        # untouched. This decision comes FIRST — before the operator/barrier
+        # guards, which do not classify commands at all — so the destructive
+        # class is refused whatever the rest of the chain would have done
+        # with it. The words come from `_handle_command_words`, which splits
+        # the first argument the way the client's serializer does, so
+        # ``"GRAPH.DELETE <graph>"`` cannot slip past as one token.
         verb, words = _handle_command_words(args)
         if verb in _DESTRUCTIVE_HANDLE_COMMANDS:
+            # A target POSITION exists when the words carry one; ``None`` there
+            # means the argument could not be read as a graph name, which the
+            # decision refuses rather than treating as "no target named".
+            targeting = verb in _GRAPH_TARGETING_COMMANDS and bool(words)
             self._refuse_unauthorized_graph_wipe(
                 verb,
-                words[0] if (verb in _GRAPH_TARGETING_COMMANDS and words) else None,
+                (words[0] if targeting else None),
+                target_present=targeting,
             )
         else:
             # #9209 (review round 6): the destructive class is NOT something
@@ -4237,14 +4306,16 @@ class _GuardedGraph:
         this verb can still wipe the cache, because L2 exempts embedded mode —
         the same exemption `proj.g.query("MATCH (n) DETACH DELETE n")` gets
         today, and the same one #9124 removes for every statement-bearing verb.
+
+        ⛔ AND L2'S OWN BOUNDARY APPLIES HERE UNCHANGED: it classifies a BULK
+        ``DETACH DELETE`` (``_is_bulk_wipe``), so a bare-DELETE procedure string
+        (``CALL db.labels() MATCH (n) DELETE n //``) is NOT refused by this verb
+        — exactly as the same bare DELETE is not refused through
+        ``proj.g.query``. That is the pre-existing scope of L2, pinned by
+        ``test_the_L2_classifier_still_requires_DETACH`` so a reader of this
+        docstring does not have to guess how wide the verb is.
         """
         statement = _call_procedure_statement(procedure, args=args, emit=emit)
-        if statement is not None:
-            # #9124's door, on the statement THIS verb will actually send: the
-            # same authority check the five query verbs carry, so a mutating
-            # procedure is counted (and, once `_HANDLE_GUARD_ENFORCES` is True,
-            # refused) exactly as `proj.g.query`'s statement would be.
-            self._refuse_unauthorized_cache_write(statement)
         if statement is not None and _is_bulk_wipe(statement):
             self._proj._assert_test_graph(
                 "REFUSING to run bulk DETACH DELETE on non-test graph"
@@ -4283,15 +4354,29 @@ class _GuardedGraph:
         one — it removes the projection. A caller who really means it does it at
         the client (`proj.db`), where it is visible as what it is.
 
-        ``None`` (an argument no word can be read from — an int, a None, an
-        object) is passed through unchanged: every classification here is a
-        POSITIVE match, and the client refuses a payload it cannot serialize
-        anyway. Unarmed projections are untouched (pre-#9209 pass-through).
+        ``None`` (no readable command word at all — an empty payload, or an
+        argument no word can be read from: an int, a ``None``, an object) is
+        REFUSED on an armed projection (:9209 review, measured): the first
+        version of this guard returned early here, which is how
+        ``execute_command("", "FLUSHDB")`` — a real flush, with its verb one
+        position to the left of where the guard looked — emptied an armed cache.
+        A classification that cannot be made is not an authorization.
+        Unarmed projections are untouched (pre-#9209 pass-through).
         """
         if not getattr(self._proj, "_journal_backed", False):
             return
         if command is None:
-            return
+            raise DirectCacheWriteRefused(
+                "Refusing a command on the write handle of a journal-backed "
+                "projection: no command WORD could be read from the argument "
+                "the client keys the command on, so this guard cannot say what "
+                "the payload will do to the derived cache — and a payload that "
+                "cannot be classified is not thereby authorized "
+                "(docs/architecture/STORAGE-ARCHITECTURE.md 17.1). An empty or "
+                "unreadable first argument leaves the rest of the payload as "
+                "the command, so it is refused rather than forwarded "
+                "unexamined."
+            )
         if command.startswith(_GRAPH_NAMESPACE_PREFIX):
             return
         if command in _ARMED_READ_ONLY_COMMANDS:
@@ -4314,7 +4399,8 @@ class _GuardedGraph:
         )
 
     def _refuse_unauthorized_graph_wipe(self, command: str,
-                                       target: str | None = None) -> None:
+                                       target: str | None = None,
+                                       *, target_present: bool | None = None) -> None:
         """§17.1 at the handle's NON-CYPHER door (#9209): no undeclared wipe.
 
         ``GRAPH.DELETE`` is not §17.1's *second-writer* class — it removes
@@ -4347,7 +4433,18 @@ class _GuardedGraph:
         scope). This handle addresses exactly one graph; a wipe of any other
         graph is not a door this wrapper can judge, so it is refused here
         rather than waved through on a name it does not own.
+
+        ``target_present`` distinguishes "no target was named" from "a target
+        POSITION existed and its value could not be read as a graph name" (an
+        int, a ``None``, a buffer that is not text). The latter is REFUSED: the
+        foreign-target comparison below cannot run on it and L2 validates THIS
+        projection's name, so dispatching it would wipe a graph against a name
+        no check looked at (#9209 review, measured). ``delete()`` passes the
+        handle's own ``name``, which is the only case where an absent value is
+        genuinely "nothing to judge" (a stub handle without one).
         """
+        if target_present is None:
+            target_present = target is not None
         if not getattr(self._proj, "_journal_backed", False):
             return
         if command in _SERVER_WIDE_COMMANDS:
@@ -4368,6 +4465,21 @@ class _GuardedGraph:
                 "(`proj.db`), deliberately, where it is visible as what it is."
             )
         own_graph = getattr(self._proj, "_graph_name", None)
+        if command in _GRAPH_TARGETING_COMMANDS and target_present and target is None:
+            # A target POSITION existed and could not be read as a graph name
+            # (an int, a ``None``, a buffer that is not text). The foreign-target
+            # branch below cannot run, and L2 reads THIS projection's name — so a
+            # wipe of an unreadable target would be validated against the wrong
+            # graph. Refused rather than dispatched against a name no check
+            # looked at.
+            raise DirectCacheWriteRefused(
+                f"Refusing `{command}` on the write handle of a "
+                "journal-backed projection: it names a target graph whose name "
+                "this guard cannot read, so it cannot tell whether the wipe is "
+                "of this projection's derived cache or of another graph "
+                "(docs/architecture/STORAGE-ARCHITECTURE.md 17.1). Pass the "
+                "graph name as text."
+            )
         if target is not None and own_graph is not None and target != own_graph:
             raise DirectCacheWriteRefused(
                 f"Refusing `{command} {target}` on the write handle of a "

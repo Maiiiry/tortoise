@@ -74,6 +74,7 @@ from tortoise.projection import (
     DirectCacheWriteRefused,
     FalkorProjection,
     _GuardedGraph,
+    _is_bulk_wipe,
     _replay_write_scope,
 )
 
@@ -459,6 +460,183 @@ def test_the_joined_key_space_spelling_is_refused_too(sdk_with_journal):
     assert _count(proj) == before
 
 
+# ── the classifier's own blind spots (review measure, P0) ─────────────────
+
+#: First arguments that carry ZERO command words. The serializer does
+#: ``args[0].encode().split()`` and DROPS the empty result, so the command the
+#: server receives starts at ``args[1]`` — which is where the verb hides.
+_ZERO_WORD_HEADS = ["", "   ", " \t "]
+
+
+@pytest.mark.parametrize("head", _ZERO_WORD_HEADS)
+@pytest.mark.parametrize("flush", ["FLUSHALL", "FLUSHDB"])
+def test_a_zero_word_first_argument_cannot_hide_a_server_wide_flush(
+        sdk_with_journal, head, flush):
+    """P0, measured: ``execute_command("", "FLUSHDB")`` emptied an armed cache.
+
+    The first version of `_handle_command_words` returned ``(None, ())`` when
+    the head carried no words, so the guard saw no verb and the payload was
+    forwarded — with the verb one position to the left of where it looked:
+
+        proj.g.execute_command("", "FLUSHDB")   -> 'OK', nodes 2 -> 0
+
+    The word list is now built the way the serializer builds it (the head's
+    words followed by every argument), so the verb is classified wherever the
+    serializer puts it.
+
+    MUTATION: return ``(None, ())`` from `_handle_command_words` when
+    ``args[0].split()`` is empty — i.e. restore the pre-fix helper — and this
+    fails with DID NOT RAISE and the node count at 0.
+    """
+    proj = sdk_with_journal._get_proj()
+    assert proj._journal_backed, "the fixture must ARM the guard"
+    before = _count(proj)
+    assert before > 0, "the armed cache must hold something a wipe could destroy"
+
+    with pytest.raises(DirectCacheWriteRefused) as exc:
+        proj.g.execute_command(head, flush)
+
+    assert "17.1" in str(exc.value), (
+        f"the refusal must cite the rule it enforces; message={str(exc.value)!r}"
+    )
+    assert _count(proj) == before, (
+        "a flush reached the server because its verb was one argument further "
+        "right than the guard looked — the wipe landed before anything raised"
+    )
+
+
+@pytest.mark.parametrize("head", _ZERO_WORD_HEADS)
+def test_a_zero_word_first_argument_cannot_hide_a_graph_delete(sdk_with_journal, head):
+    """The same blind spot, on the verb that destroys ONE graph.
+
+    ``execute_command(" ", "GRAPH.DELETE", <own graph>)`` deleted the armed
+    cache, and ``execute_command(" ", "GRAPH.DELETE", "victim9209")`` deleted a
+    graph this handle does not own — neither the target check nor L2 ran,
+    because neither was reached.
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(head, "GRAPH.DELETE", proj._graph_name)
+    assert _count(proj) == before, "the cache was wiped by a hidden GRAPH.DELETE"
+
+    with pytest.raises(DirectCacheWriteRefused, match="not 'victim9209'"):
+        proj.g.execute_command(head, "GRAPH.DELETE", "victim9209")
+    assert _count(proj) == before
+
+
+#: The command words the pinned client forwards as a BUFFER, not as ``bytes``:
+#: ``redis.connection.Encoder.encode`` passes a ``memoryview`` through unchanged
+#: and the serializer's ``b" " in args[0]`` test is never true for one, so the
+#: buffer IS the command name on the wire.
+_BUFFER_HEADS = [
+    memoryview(b"DEL"),
+    memoryview(b"del"),
+    memoryview(bytearray(b"DEL")),
+]
+
+
+@pytest.mark.parametrize("head", _BUFFER_HEADS)
+def test_a_buffer_command_word_is_classified_not_forwarded(sdk_with_journal, head):
+    """P0, measured: ``execute_command(memoryview(b"DEL"), <graph>)`` wiped.
+
+    ``_handle_command_text`` decoded only ``bytes``/``bytearray``, so a
+    ``memoryview`` head returned ``None`` → the verb was never classified → the
+    key-space wipe was dispatched, and only THEN did the client raise
+    ``AttributeError: 'memoryview' object has no attribute 'upper'`` from its
+    response-callback lookup: a refusal-shaped traceback on top of a completed
+    deletion.
+
+    MUTATION: drop the ``memoryview`` branch from `_handle_command_text` and this
+    fails with DID NOT RAISE (the wipe lands, and the count is 0).
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(head, proj._graph_name)
+    assert _count(proj) == before, (
+        "a buffered key-space command destroyed the cache before raising"
+    )
+
+
+@pytest.mark.parametrize("head", [*_BUFFER_HEADS, memoryview(b"GRAPH.DELETE")])
+def test_a_buffer_graph_delete_is_classified_too(sdk_with_journal, head):
+    """The same decoding hole on the graph-delete spelling.
+
+    ``execute_command(memoryview(b"GRAPH.DELETE"), <own graph>)`` deleted the
+    graph; the measure is the one in `_handle_command_text`'s docstring.
+    """
+    proj = sdk_with_journal._get_proj()
+    before = _count(proj)
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.execute_command(memoryview(b"GRAPH.DELETE"), proj._graph_name)
+    assert _count(proj) == before
+
+
+def test_a_buffer_TARGET_cannot_walk_past_the_target_check():
+    """The target side of the same hole, and it needed its own fix.
+
+    A ``memoryview`` TARGET could not be decoded, so the argument was DROPPED
+    from the word list: ``execute_command("GRAPH.DELETE", memoryview(b"victim"))``
+    inside a declared scope read as "no target named", skipped the foreign-graph
+    comparison, and L2 validated the projection's own disposable name — so a
+    graph this handle does not own was deleted.
+
+    The refusal must live in the DECISION (`_refuse_unauthorized_graph_wipe`),
+    so this asserts on the stub handle: nothing may reach the vendor.
+    """
+    proj = _armed_projection(graph_name="test_9209", embedded=False)
+    guarded = _GuardedGraph(proj.g, proj)
+
+    with _replay_write_scope(), pytest.raises(
+        DirectCacheWriteRefused, match="not 'victim9209'"
+    ):
+        guarded.execute_command("GRAPH.DELETE", memoryview(b"victim9209"))
+
+    assert proj.g.calls == [], (
+        f"a foreign-graph wipe reached the vendor handle; calls={proj.g.calls!r}"
+    )
+
+
+def test_an_unclassifiable_command_is_refused_not_forwarded():
+    """Fail CLOSED where the classifier cannot speak (:9209 review, P0).
+
+    Every classification here is a positive match, so a payload it cannot read
+    used to fall through to "the client will raise anyway". That assumption is
+    what a buffer head falsified, so it is not relied on any more: an armed
+    handle refuses a command it cannot classify, and — the part that matters —
+    it refuses a GRAPH.DELETE whose TARGET it cannot read, because the foreign
+    comparison cannot run on it and L2 would validate the projection's own name
+    instead.
+
+    MUTATION: return early from `_refuse_key_space_handle_command` on ``None``
+    and drop the ``target_present`` branch, and the in-scope case is dispatched
+    to the vendor handle (``calls`` is non-empty) instead of raising.
+    """
+    proj = _armed_projection(graph_name="test_9209", embedded=False)
+    guarded = _GuardedGraph(proj.g, proj)
+
+    with pytest.raises(DirectCacheWriteRefused):
+        guarded.execute_command(123)
+    with pytest.raises(DirectCacheWriteRefused):
+        guarded.execute_command("GRAPH.DELETE", 123)
+    with _replay_write_scope(), pytest.raises(DirectCacheWriteRefused):
+        guarded.execute_command("GRAPH.DELETE", object())
+
+    assert proj.g.calls == [], (
+        f"an unclassifiable payload reached the vendor handle; calls={proj.g.calls!r}"
+    )
+
+    unarmed = _armed_projection(graph_name="test_9209", embedded=False)
+    unarmed._journal_backed = False
+    _GuardedGraph(unarmed.g, unarmed).execute_command(123)
+    assert unarmed.g.calls == [("execute_command", (123,), {})], (
+        "an UNARMED projection must keep the pre-#9209 pass-through — the guard "
+        "has no truth store to enforce against"
+    )
+
+
 def test_a_key_space_command_is_refused_on_NAMESPACE_not_on_a_list(
         sdk_with_journal):
     """The rule's own evidence: a verb named NOWHERE in the module is refused.
@@ -636,6 +814,36 @@ def test_arguments_cannot_exempt_or_invent_a_wipe():
         read_only=True,
         args=["index_name", "MATCH (n) DETACH DELETE n"],
     ) == "OK", "a read-only call was refused for text in an ARGUMENT value"
+
+
+def test_the_L2_classifier_still_requires_DETACH():
+    """The boundary `call_procedure` inherits, stated as a pin (#9209 review).
+
+    `_GuardedGraph.call_procedure` protects through `_is_bulk_wipe` — the SAME
+    L2 classifier `query` uses — so its reach is L2's reach, no wider: a BULK
+    ``DETACH DELETE`` is classified, a bare ``DELETE`` is not. A reviewer asked
+    for that boundary to be pinned or named, because otherwise the verb's
+    docstring reads wider than it is; both are done here, at the classifier, so
+    a future widening neither breaks this test silently nor leaves the docs
+    claiming a reach the classifier does not have.
+
+    This is the pre-existing scope of L2 (#3007/#3037/#8215), not a regression:
+    the same bare DELETE passes through ``proj.g.query`` today, and #9124's
+    statement door — not L2 — is the layer that judges it.
+    """
+    assert _is_bulk_wipe("CALL db.labels() MATCH (n) DETACH DELETE n //") is True
+    assert _is_bulk_wipe("CALL db.labels() MATCH (n) DELETE n //") is False, (
+        "`_is_bulk_wipe` now classifies a bare DELETE. That is a WIDENING of L2: "
+        "it may be the right call, but it must be a deliberate one — update "
+        "`_GuardedGraph.call_procedure`'s docstring (which states the DETACH "
+        "boundary), this test, and the module comment together, and check the "
+        "event-retention maintenance delete (#3007) still runs on a server graph"
+    )
+    assert _is_bulk_wipe(
+        "CALL db.labels() MATCH (n:Point {id:$p}) DETACH DELETE n //") is False, (
+        "a scoped DETACH DELETE must stay classified as targeted, or every "
+        "targeted delete becomes a bulk-wipe refusal"
+    )
 
 
 def test_a_read_only_procedure_call_still_passes(sdk_with_journal):
