@@ -355,6 +355,53 @@ def test_e4_measured_with_a_boolean_denominator_is_a_finding():
     assert any("no positive" in m for m in msgs), msgs
 
 
+def test_a_boolean_receipt_denominator_against_a_numeric_row_is_a_finding():
+    """A copy that is not a number cannot AGREE with the row's (#9089 cycle 2).
+
+    The agreement arm is the one place where a malformed value must not merely
+    be excluded: the pre-helper code fired here (``True != 15``), and a fix that
+    guards the comparison with ``isinstance``-style narrowing silently SKIPPED
+    it — dropping a true-positive while reporting "denominators agree" about
+    ``15`` and ``true``. So the row keeps its honest count and only the receipt
+    copy is corrupted.
+    """
+    receipt = probe.e4_receipt({"s4_merge": {"s2_items": 15,
+                                           "kept_from_s2": 14}})
+    rec = _completed_record(receipt)
+    e4 = next(r for r in rec["rows"] if r["criterion"] == "E4")
+    assert e4["denominator"] == 15, e4
+    rec["run"]["e4_receipt"]["denominator"] = True
+    msgs = _messages(rec)
+    assert any("cannot agree" in m for m in msgs), msgs
+
+
+def test_sibling_copies_disagree_when_one_is_a_boolean_count():
+    """``True == 1`` must not read as two copies of one number (#9089 cycle 2).
+
+    V8 compares carried denominators with ``!=`` on raw values, so a sibling row
+    carrying ``true`` agreed with the other's ``1``. Pre-existing rather than a
+    regression, but the same malformed-shape class the boolean refusal exists
+    to close, at the comparison that decides whether a number was carried
+    faithfully — so it is closed here too.
+    """
+    rec = _record()
+    _green(rec)
+    rec["rows"][1].update(verdict="GREEN", evidence_kind="measurement",
+                          evidence=rec["rows"][0]["evidence"],
+                          numerator=31, denominator=True, blocked_by=None,
+                          corpus_sha256="a" * 64, sibling="E1")
+    assert "V8" in _codes(rec), "true must not agree with the sibling's 50"
+    # And the honest pair stays silent: the refusal is of the BOOLEAN, not of
+    # the agreement arm.
+    rec = _record()
+    _green(rec)
+    rec["rows"][1].update(verdict="GREEN", evidence_kind="measurement",
+                          evidence=rec["rows"][0]["evidence"],
+                          numerator=31, denominator=50, blocked_by=None,
+                          corpus_sha256="a" * 64, sibling="E1")
+    assert "V8" not in _codes(rec)
+
+
 def test_green_row_naming_a_blocker_is_a_finding():
     rec = _record()
     _green(rec)

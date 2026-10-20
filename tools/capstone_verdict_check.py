@@ -114,8 +114,29 @@ def _count(value: object) -> bool:
     wrong-typed block (non-object block, unhashable criterion, non-iterable
     ``steps_observed``) is refused as malformed — so it is refused here too
     rather than counted.
+
+    Refusal has TWO halves and both are load-bearing: a value that is not a
+    count must be REFUSED where a count is required, and must not silently
+    SKIP the comparison that found it (#9089 review cycle 2 — replacing the
+    ``isinstance`` guard with this helper made the ``e4_receipt`` agreement arm
+    skip a boolean receipt denominator, dropping a V10 that used to fire).
     """
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _count_key(value: object) -> tuple:
+    """A value's IDENTITY for the agreement checks (V8, V10).
+
+    ``True == 1`` and ``1 == 1.0`` in Python, so a raw ``!=`` reads a JSON
+    ``true`` as AGREEING with a sibling row's ``1`` — the same malformed-shape
+    class ``_count`` refuses, at the comparison that decides whether two copies
+    of one number match (#9089 review cycle 2). A real count compares as
+    itself; anything else compares by type and repr, so a boolean, a float or a
+    string can never stand in for the number the other copy carries.
+    """
+    if _count(value):
+        return (True, value)
+    return (False, type(value).__name__, repr(value))
 
 
 def _non_object_blocks(record: dict) -> list[tuple[str, str]]:
@@ -566,13 +587,27 @@ def check(record: dict, *, repo: Path,
                                         "V5's GREEN-only arm cannot reach this "
                                         "row (E4 is never GREEN here)")
         receipt = run.get("e4_receipt")
-        if isinstance(receipt, dict) and _count(e4_den) \
-                and _count(receipt.get("denominator")) \
-                and receipt["denominator"] != e4_den:
-            f.add("V10", "rows[E4]",
-                  f"the row's denominator ({e4_den}) and the run's e4_receipt "
-                  f"({receipt['denominator']}) disagree — one number decides "
-                  "E4, and two copies that differ let a hand-edit pick which")
+        # The agreement arm's guard is NOT a skip (#9089 review cycle 2): a
+        # receipt whose denominator is present but is not an integer count (a
+        # JSON ``true``, a string) is a SECOND COPY THAT CANNOT AGREE, and the
+        # pre-helper arm refused it because ``True != 15``. Guarding with
+        # ``_count(...)`` alone silently skipped that comparison and dropped a
+        # true-positive V10, so the non-count receipt is reported explicitly.
+        if isinstance(receipt, dict) and "denominator" in receipt \
+                and _count(e4_den):
+            receipt_den = receipt.get("denominator")
+            if not _count(receipt_den):
+                f.add("V10", "rows[E4]",
+                      f"the run's e4_receipt denominator is not an integer "
+                      f"count ({receipt_den!r}) while the row's is {e4_den} "
+                      "— one number decides E4, and a copy that is not a "
+                      "number cannot agree with the row's")
+            elif receipt_den != e4_den:
+                f.add("V10", "rows[E4]",
+                      f"the row's denominator ({e4_den}) and the run's "
+                      f"e4_receipt ({receipt_den}) disagree — one number "
+                      "decides E4, and two copies that differ let a hand-edit "
+                      "pick which")
 
     # ── V8 denominators carried, not restated ────────────────────────────
     for cid, row in by_id.items():
@@ -589,8 +624,10 @@ def check(record: dict, *, repo: Path,
         if other is None:
             f.add("V8", f"rows[{cid}]", f"sibling {sib!r} is not a row")
             continue
-        if (row.get("numerator"), row.get("denominator")) != \
-                (other.get("numerator"), other.get("denominator")):
+        if (_count_key(row.get("numerator")),
+                _count_key(row.get("denominator"))) != \
+                (_count_key(other.get("numerator")),
+                 _count_key(other.get("denominator"))):
             f.add("V8", f"rows[{cid}]",
                   f"denominators disagree with sibling {sib}: "
                   f"{row.get('numerator')}/{row.get('denominator')} vs "
