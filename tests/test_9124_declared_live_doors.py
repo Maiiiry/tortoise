@@ -1130,7 +1130,7 @@ def _local_bindings(func) -> dict[str, list[ast.expr]]:
             # `query += " SET n.poked = 1"` produced NO offender: the read shape
             # was still satisfied by the plain assignments above it and the pin
             # stayed green while the statement wrote. Same arm, same reason, as
-            # `_bound_names` (line ~511) — the census's own walker already had
+            # `_bound_names`'s `ast.AugAssign` branch — the census's walker had
             # it, so this helper was the narrower of the two.
             bound.setdefault(node.target.id, []).append(node.value)
         # A comprehension can also be the VALUE of a binding
@@ -1150,13 +1150,18 @@ def _params_of(func) -> set[str]:
     make every `self.<verb>(…)` call read as a reach on a handle PARAMETER.
     """
     args = func.args
-    names = {arg.arg for arg in list(args.args) + list(args.kwonlyargs)}
+    names = {arg.arg for arg in (
+        list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs))}
     names |= {arg.arg for arg in (args.vararg, args.kwarg) if arg is not None}
     return {name for name in names if name not in ("self", "cls")}
 
 
 def _statement_argument(call: ast.Call) -> ast.expr | None:
-    """The statement text: the FIRST POSITIONAL argument of a handle call.
+    """The statement text of a handle call — the census's own argument index.
+
+    `args[0]` for every verb except `execute_command`, whose statement sits at
+    index 2 (`"GRAPH.QUERY", <graph>, <cypher>`) — the same rule
+    `enumerate_handle_surface` applies; see the arm below.
 
     Keywords are excluded on purpose — `<handle>.query(stmt, params=params)`
     passes BIND DATA, not Cypher, so a statement's parameter dict is not part of
@@ -1164,7 +1169,14 @@ def _statement_argument(call: ast.Call) -> ast.expr | None:
     dict red a provably read-only row (measured: a false FAIL, which is how a
     check like this gets weakened by the next reader).
     """
-    return call.args[0] if call.args else None
+    # ⛔ MIRRORS THE CENSUS (`enumerate_handle_surface`: "the statement sits at
+    # index 2 … every other verb takes it positionally"). Returning `args[0]`
+    # unconditionally handed back the literal `"GRAPH.QUERY"` for
+    # `execute_command("GRAPH.QUERY", <graph>, <cypher>)` — the Cypher was
+    # never inspected, and the row red only because its read shape was absent,
+    # which blames the note for a bug in this helper.
+    index = 2 if getattr(call.func, "attr", None) == "execute_command" else 0
+    return call.args[index] if len(call.args) > index else None
 
 
 def _module_bindings(module) -> dict[str, list[ast.expr]]:
@@ -1234,6 +1246,14 @@ def _resolve_callee(name: str, module, path: Path):
             module_name = ".".join(filter(None, [package, module_name]))
         candidate = ROOT / (module_name.replace(".", "/") + ".py")
         if not candidate.exists():
+            # A PACKAGE import (`from .projection import _stored_prop_value`)
+            # resolves through its `__init__.py`, not a sibling module file.
+            # Without this hop the callee was UNRESOLVABLE — and an
+            # unresolvable CALL used to be dropped in silence (see the REPORT
+            # arm in `_fragments_of`), so a write introduced in that helper's
+            # return was never read and never announced.
+            candidate = ROOT / (module_name.replace(".", "/")) / "__init__.py"
+        if not candidate.exists():
             continue
         other = ast.parse(candidate.read_text(), str(candidate))
         found = [node for node in ast.walk(other)
@@ -1246,9 +1266,10 @@ def _resolve_callee(name: str, module, path: Path):
 
 #: How many indirection hops the fragment walk follows before it declares the
 #: statement unreadable. A BACKSTOP, not the mechanism that keeps the walk
-#: finite — `visited` does that — so it sits well below the deepest chain on the
-#: real tree (measured 11 for `_uncalibrated_ep_participants`) and, when it is
-#: reached, it REPORTS the blind spot instead of returning in silence.
+#: finite — `visited` does that — so it sits ABOVE the deepest chain on the
+#: real tree (measured 11 for `_uncalibrated_ep_participants`, i.e. ~5 hops of
+#: headroom) and, when it is reached, it REPORTS the blind spot instead of
+#: returning in silence.
 _FRAGMENT_DEPTH_CAP = 16
 
 #: `dir(builtins)`, hoisted: it was rebuilt every time an UNBOUND name was
@@ -1257,7 +1278,8 @@ _BUILTIN_NAMES = frozenset(dir(builtins))
 
 
 def _fragments_of(expr, bindings, params, module, path, followed, unread,
-                  depth: int = 0, visited=None) -> list[str]:
+                  depth: int = 0, visited=None,
+                  params_are_inspected: bool = False) -> list[str]:
     """String fragments that can flow out of `expr`, following indirection.
 
     `bindings`/`params` belong to the ENCLOSING scope; a callee is followed with
@@ -1267,8 +1289,13 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
     Anything that cannot be resolved is added to `unread` rather than skipped —
     the census's own polarity (a fragment that cannot be shown read-only is not
     called read-only), so a blind spot cannot be inherited silently. Parameters
-    are the exception: they carry bind data and integers. A BUILTIN name is
-    benign only when this walk holds the module it came from and the module does
+    are the exception: they carry bind data and integers — but only when their
+    VALUE was already walked, which is true for a FOLLOWED CALLEE (its argument
+    was inspected in the caller's expression) and NOT true for the top-level
+    function: there the parameter is a value this walk never sees, so a directly
+    interpolated one (`f"…{extra}"`) is reported, while a parameter genuinely
+    used as a scalar argument (`int(limit)`, `len(ids)`) stays benign. A BUILTIN
+    name is benign only when this walk holds the module it came from and the module does
     not bind that name (`format`, `set`, `next` are ordinary variable names) —
     with no module AST there is nothing to check it against, so it is reported.
 
@@ -1301,6 +1328,11 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
     seen.append(bindings)  # RETAINED, so this `id` cannot be recycled under us
     call_names = {id(node.func) for node in ast.walk(expr)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    # A parameter used as a positional ARGUMENT was handed to something that can
+    # read it; one interpolated straight into the text was not. Computed over the
+    # whole expression, so the two states cannot be confused by walk order.
+    call_arg_ids = {id(arg) for node in ast.walk(expr)
+                    if isinstance(node, ast.Call) for arg in node.args}
     for sub in ast.walk(expr):
         if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
             callee, callee_module, callee_path = _resolve_callee(
@@ -1312,7 +1344,16 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
                     fragments.extend(_fragments_of(
                         returned, callee_bindings, _params_of(callee),
                         callee_module, callee_path, followed, unread, depth + 1,
-                        visited))
+                        visited, params_are_inspected=True))
+            elif callee is None and sub.func.id not in _BUILTIN_NAMES:
+                # ⛔ REPORTED, never skipped — this is the polarity the
+                # docstring above states, and the asymmetry that made it a
+                # hole: an unknown NAME reds the pin below
+                # (`else: unread.add(sub.id)`), an unknown CALL did not, so a
+                # write introduced in a helper's return was invisible AND
+                # unannounced. A builtin is the one benign case (`int`, `len`),
+                # and it is the same test the bare-name arm uses.
+                unread.add(f"{sub.func.id}()")
             continue
         if not isinstance(sub, ast.Name) or id(sub) in call_names:
             # A callee NAME is handled above; naming it again here would report
@@ -1322,14 +1363,22 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
             for value in bindings[sub.id]:
                 fragments.extend(_fragments_of(
                     value, bindings, params, module, path, followed, unread,
-                    depth + 1, visited))
+                    depth + 1, visited,
+                    params_are_inspected=params_are_inspected))
         elif module is not None and sub.id in _module_bindings(module):
             for value in _module_bindings(module)[sub.id]:
                 fragments.extend(_fragments_of(
                     value, bindings, params, module, path, followed, unread,
-                    depth + 1, visited))
+                    depth + 1, visited,
+                    params_are_inspected=params_are_inspected))
         elif sub.id in params:
-            continue
+            # Benign when the value was already walked (a followed callee) or the
+            # name is an ARGUMENT to a call (`int(limit)`); otherwise the text is
+            # assembled from a value this walk never saw, and `unread` says so
+            # rather than blessing it — the census's own polarity.
+            if params_are_inspected or id(sub) in call_arg_ids:
+                continue
+            unread.add(sub.id)
         elif (sub.id in _BUILTIN_NAMES and module is not None
                 and sub.id not in _module_bindings(module)):
             # The builtin ITSELF, and that is a claim this walk can only make
@@ -1858,6 +1907,152 @@ class Door:
         "`self` was counted as a handle parameter, so every `self.<verb>(…)` "
         "call would read as a handle reach and the one-call assertion would "
         "fire on a method call that touches no handle at all")
+
+
+def test_an_unresolvable_callee_is_reported_not_dropped():
+    """NON-VACUITY for the REPORT arm of `_fragments_of` (review P1).
+
+    The callee arm recursed only `if callee is not None` and then `continue`d
+    unconditionally, so a call the walk could not resolve contributed neither a
+    fragment nor an `unread` entry — while an unknown NAME redded the pin a few
+    lines below. The pin therefore stayed GREEN over a statement whose suffix
+    it never read, which is the polarity `_fragments_of`'s own docstring
+    forbids ("anything that cannot be resolved is added to `unread` rather
+    than skipped").
+
+    Reachable shape: `_resolve_callee` matches `ImportFrom` by `alias.name`,
+    never by the alias, so `from .cypher import build_suffix as _suffix` +
+    `query += _suffix()` is invisible; and a package import
+    (`from .projection import _stored_prop_value`) resolved through no
+    `__init__.py` hop at all.
+    """
+    source = (
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) RETURN n.id "\n'
+        '        query += f"{_suffix()}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(source)
+    assert any("could not be read out" in offender for offender in offenders), (
+        "a call the walk could not resolve was dropped in silence, so the pin "
+        "stayed green over a statement whose suffix was never read — exactly "
+        f"the fail-open this arm exists to close (offenders={offenders})")
+
+    # …and a genuine BUILTIN call stays benign, or every `int(...)`/`len(...)`
+    # fragment would red the rows this pin exists to keep green.
+    benign = (
+        'class Door:\n'
+        '    def reading(self, proj, ids):\n'
+        '        query = (f"MATCH (n:Point) WHERE n.id IN $ids "\n'
+        '                 f"LIMIT {int(len(ids) > 0)}")\n'
+        '        query += " RETURN n.id"\n'
+        '        return proj.g.query(query).result_set\n')
+    assert not _offenders_for(benign), (
+        "a genuine builtin call was reported as unread, so `int(...)` would "
+        "red every pinned row")
+
+
+def test_the_params_set_matches_the_census_for_a_positional_only_parameter():
+    """NON-VACUITY for `_params_of`'s census parity (review P2).
+
+    `_params_of` claimed to build its set "exactly as `enumerate_handle_surface`
+    does it" but omitted `args.posonlyargs`, while the census includes it and
+    `_is_handle_ref` treats a `params` member as the handle. A handle received
+    as a positional-only parameter was therefore not a reach: as a SECOND reach
+    it left the "found 1 call" assertion green over an uninspected statement —
+    the same hole the `params` arm closed in `db73165cc`.
+    """
+    source = '''
+class Door:
+    def reading(self, g, /, proj):
+        proj.g.query("MATCH (n:Point) RETURN n.id")
+        g.query("MATCH (n:Point) RETURN n.id")
+'''
+    func = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef))
+    assert "g" in _params_of(func), (
+        "a positional-only parameter was missing from `_params_of`, so a "
+        "reach through it was not counted and a second statement stayed "
+        "uninspected")
+    assert len(_handle_query_calls(func)) == 2, (
+        "the handle reach through the POSITIONAL-ONLY parameter `g` was not "
+        "counted, so the one-call assertion stays green over two reaches")
+
+
+def test_the_statement_argument_mirrors_the_census_for_execute_command():
+    """NON-VACUITY for `_statement_argument`'s per-verb index (review P2).
+
+    `enumerate_handle_surface` takes `execute_command`'s statement at index 2
+    (`"GRAPH.QUERY", <graph>, <cypher>`); this helper returned `args[0]` for
+    every verb, so the Cypher was never inspected and the row red only because
+    its read shape was absent — a false FAIL whose message blames the note.
+    """
+    call = next(
+        node for node in ast.walk(ast.parse(
+            'proj.g.execute_command("GRAPH.QUERY", "g", '
+            '"MATCH (n:Point) RETURN n.id")'))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "execute_command")
+    statement = _statement_argument(call)
+    assert isinstance(statement, ast.Constant) \
+        and statement.value == "MATCH (n:Point) RETURN n.id", (
+        "`execute_command`'s statement was read from index 0, so the Cypher "
+        f"at index 2 was never inspected (got {ast.dump(statement) if statement else None})")
+
+
+def test_a_directly_interpolated_parameter_is_reported_not_blessed():
+    """NON-VACUITY for the parameter arm of `_fragments_of` (review P2).
+
+    `elif sub.id in params: continue` blessed EVERY parameter of the enclosing
+    scope, on the docstring's justification that parameters "carry bind data and
+    integers". That is sound for a FOLLOWED CALLEE (its argument was walked in
+    the caller's expression) but NOT for the top-level function, where there is
+    no caller expression in view: a caller passing `" SET n.poked = 1"` into a
+    parameter interpolated as `f"…{extra}"` produced a writing statement the pin
+    called a read. A parameter used as a scalar ARGUMENT (`int(limit)`) stays
+    benign, or the real rows would red.
+    """
+    source = (
+        'class Door:\n'
+        '    def reading(self, proj, extra):\n'
+        '        query = f"MATCH (n:Point) RETURN n.id {extra}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(source)
+    assert any("could not be read out" in offender for offender in offenders), (
+        "a parameter interpolated straight into the statement was blessed as "
+        "read-only, so a caller-supplied write passed the pin — the top-level "
+        f"scope has no argument to have inspected (offenders={offenders})")
+
+    benign = (
+        'class Door:\n'
+        '    def reading(self, proj, ids):\n'
+        '        query = (f"MATCH (n:Point) WHERE n.id IN $ids "\n'
+        '                 f"LIMIT {int(len(ids) > 0)}")\n'
+        '        query += " RETURN n.id"\n'
+        '        return proj.g.query(query).result_set\n')
+    assert not _offenders_for(benign), (
+        "a parameter used as a scalar ARGUMENT (`int(...)`, `len(...)`) was "
+        "reported as unread, so every such fragment would red a real row")
+
+
+def test_the_calibration_reader_list_is_bound_to_the_rows_it_guards():
+    """NON-VACUITY for `_CALIBRATION_READERS` itself (review P2).
+
+    Both pins iterate this hand-maintained tuple, so deleting an entry silently
+    UN-GUARDED that row: with `_uncalibrated_ep_participants` removed, its
+    citation check and its claim re-derivation both vanished and every pin
+    stayed green. Binding the tuple to the `#9063` rows in `_UNRESOLVED` makes a
+    dropped (or extra) entry red instead of quiet — the same `assert scanned >
+    50` idiom the symbol pin already uses.
+    """
+    names = {name for name, _ in _CALIBRATION_READERS}
+    assert names == {"calibrate_summary", "_uncalibrated_ep_participants"}, (
+        "`_CALIBRATION_READERS` no longer names exactly the two #9063 rows, "
+        f"so a row is un-guarded without a red (got {sorted(names)})")
+    assert names <= set(_UNRESOLVED), (
+        "a `_CALIBRATION_READERS` entry is not an `_UNRESOLVED` row, so the "
+        "pin would check a function the note does not cover")
 
 
 def test_the_write_pin_sees_a_write_through_another_sdk_method():
