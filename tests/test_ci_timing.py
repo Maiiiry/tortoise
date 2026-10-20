@@ -4332,3 +4332,47 @@ def test_allow_fewer_legs_rebaselines_so_later_renders_still_write(
     assert "wrote" in second.stdout, (
         f"the artifact froze after the opt-out: {second.stderr[-300:]}"
     )
+
+
+def test_a_smaller_sample_never_invents_a_flake_from_the_tests_it_omits() -> None:
+    """Incomparable samples must not be read as "the test passed later".
+
+    A smaller run omits whole shards, so every test in a removed shard disappears
+    from `failed_tests` — and the flake proxy read that absence as a PASS. That is
+    the harm `--allow-fewer-legs` was accused of doing, and it happened inside
+    `candidate_flakes` regardless of the writer guard (#9134 review cycle 12).
+    """
+    history = [
+        {"counts": {"failed": 0}, "failed_tests": [], "run_id": "4243",
+         "sample_time": "t2", "legs": 1},
+        {"counts": {"failed": 1}, "failed_tests": ["tests/test_beta.py::test_in_removed_shard"],
+         "run_id": "4242", "sample_time": "t1", "legs": 17},
+    ]
+    assert ci_timing.candidate_flakes(history) == [], (
+        "a one-leg sample reported a test from the missing shards as having passed"
+    )
+
+
+def test_comparable_samples_still_report_a_flake() -> None:
+    """Non-vacuity for the test above: same leg count, real disappearance = flake."""
+    def row(legs: int, failed: list[str], sample: str) -> dict:
+        return {"counts": {"failed": len(failed)}, "failed_tests": failed,
+                "run_id": "4242", "sample_time": sample, "legs": legs}
+    history = [
+        row(17, [], "t2"),
+        row(17, ["tests/test_beta.py::test_real"], "t1"),
+    ]
+    flakes = ci_timing.candidate_flakes(history)
+    assert [f["test"] for f in flakes] == ["tests/test_beta.py::test_real"]
+
+
+def test_rows_without_a_leg_count_stay_comparable() -> None:
+    """Legacy rows carry no `legs`; the guard must not silently disable itself."""
+    history = [
+        {"counts": {"failed": 0}, "failed_tests": [], "run_id": "2", "sample_time": "t2"},
+        {"counts": {"failed": 1}, "failed_tests": ["tests/test_beta.py::test_legacy"],
+         "run_id": "1", "sample_time": "t1"},
+    ]
+    assert [f["test"] for f in ci_timing.candidate_flakes(history)] == [
+        "tests/test_beta.py::test_legacy"
+    ]

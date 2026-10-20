@@ -458,13 +458,6 @@ def parse_log(path: Path) -> dict:
         # python-ci.yml ships pytest's output files (or the junitxml/nodeids/
         # step_wall beside them), never a job log.
         #
-        # #6145: matching the banner string has no GENUINE true positive — the
-        # real banner is never in this artifact — so it is deleted rather than
-        # narrowed. What it can match is a QUOTED copy: any assertion that prints
-        # or diffs the workflow text containing it, which would report a kill
-        # that did not happen. That is reachable by construction, not an observed
-        # misfire (no test currently emits the banner on stdout).
-        #
         # What survives covers the SIGINT path only. `timeout -s INT -k 10
         # <budget>` sends INT first, and pytest's interrupt summary carries
         # "KeyboardInterrupt", which IS in the artifact. KNOWN BLIND SPOT: the
@@ -474,20 +467,16 @@ def parse_log(path: Path) -> dict:
         # deleted clause could not see that path either, so it is a pre-existing
         # gap, recorded here rather than papered over.
         #
-        # Residual, stated rather than smoothed: this is still a substring test,
-        # so it is quotable the same way the deleted clause was (an assertion
-        # source line containing the token). It is kept because the signal
-        # genuinely occurs in this input, which the banner does not.
-        #
         # The wall evidence a kill leaves (/tmp/step_wall.txt) is consumed by
         # testdb_canary_classify.py's step-wall gate — but only the `test`
         # matrix uploads that file, so the side lanes leave no wall evidence and
         # no classifier consumes one for them.
-        # Only pytest's OWN interrupt banner counts: a failing assertion whose
-        # source line merely mentions the word is output, not a kill. Since
-        # `killed` now gates whether a render may replace a complete measurement, a
-        # substring match would freeze the artifact permanently on a log that
-        # quotes it (#9134 review cycle 11). pytest's banner is a line of `!`s.
+        #
+        # Only pytest's OWN banner counts — a line of `!`s. A failing assertion
+        # whose source line merely quotes the token is output, not a kill; while
+        # `killed` only fed a report field that was cosmetic, but it now refuses to
+        # replace a complete measurement, so a substring match would freeze the
+        # artifact forever on an innocent log (#9134 review cycle 11).
         stripped = line.strip()
         if (stripped.startswith("!") and stripped.endswith("!")
                 and "KeyboardInterrupt" in stripped):
@@ -1893,17 +1882,31 @@ def candidate_flakes(history: list[dict]) -> list[dict]:
     """Nodeid failed in an earlier sample, absent from the failed list of the
     next sample (i.e. it passed next time) → flake candidate. Checks up to the
     3 most recent consecutive sample pairs. Documented proxy — the retry
-    protocol will make this rerun-based."""
+    protocol will make this rerun-based.
+
+    A pair is only comparable when both samples measured the same number of legs.
+    A SMALLER run omits whole shards, so every test in a removed or missing shard
+    would "disappear from the failed list" and be reported as having passed — a
+    flake invented by an absent measurement. That is exactly what a
+    `--allow-fewer-legs` write leaves in the history (one leg beside seventeen),
+    so the comparison is skipped rather than guessed; rows that predate the count
+    are `None` on both sides and stay comparable.
+    """
     out: list[dict] = []
     for i in range(min(3, len(history) - 1)):
-        prev_failed = set(history[i + 1].get("failed_tests", []))
-        cur_failed = set(history[i].get("failed_tests", []))
+        newer, older = history[i], history[i + 1]
+        newer_legs, older_legs = newer.get("legs"), older.get("legs")
+        if (isinstance(newer_legs, int) and isinstance(older_legs, int)
+                and newer_legs != older_legs):
+            continue
+        prev_failed = set(older.get("failed_tests", []))
+        cur_failed = set(newer.get("failed_tests", []))
         for nodeid in sorted(prev_failed - cur_failed):
             out.append({
                 "test": nodeid,
-                "failed_at": history[i + 1].get("sample_time"),
-                "passed_at": history[i].get("sample_time"),
-                "run_id": history[i + 1].get("run_id"),
+                "failed_at": older.get("sample_time"),
+                "passed_at": newer.get("sample_time"),
+                "run_id": older.get("run_id"),
             })
     return out
 
