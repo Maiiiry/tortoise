@@ -1457,7 +1457,11 @@ def _modules_reaching_the_handle():
 #: the census saw in that function today, so a WRITE added inside
 #: `calibrate_summary` tomorrow is exempted by this entry — a reason to keep the
 #: entries verified against the function's real statements, not a reason to
-#: widen them.
+#: widen them. That verification is a MECHANISM, not an intention: each entry pins
+#: the statements it was proven to issue in `_PROVEN_READ_STATEMENTS` below, and
+#: `test_every_proven_read_names_a_real_census_entry` refuses an entry whose
+#: function reaches the handle with a different set — so a second statement added
+#: to a registered name cannot inherit the old verdict.
 #:
 #: Bucketing is PER FUNCTION, so the statements the census cannot resolve are
 #: accounted for in four places: the "unproven" bucket (a function whose every
@@ -1495,6 +1499,26 @@ _PROVEN_READS: set[tuple[str, str]] = {
     ("tortoise/sdk.py", "TortoiseSDK._uncalibrated_ep_participants"),
 }
 
+#: WHAT WAS PROVEN, not only whose statement was — keyed like `_PROVEN_READS`,
+#: holding the census's call-kind names for that function's unresolved statements,
+#: IN ORDER.
+#:
+#: ⛔ WHY THE REGISTER ALONE IS NOT ENOUGH. Both gates `continue` on a registered
+#: name BEFORE classifying what the function now does, so a POSITIVE verdict
+#: pinned to a NAME blesses every later edit of that name: a second statement
+#: added to `calibrate_summary` tomorrow would inherit today's verdict and pass
+#: both static gates silently (a *provable* write is still caught —
+#: `_is_unresolved_only` fails — but a second UNRESOLVED one is not). The runtime
+#: door classifies the real text, so it is not a fail-open on writes; it is a
+#: static gate that stops looking. Pin the statements, so the verdict has an
+#: extent.
+_PROVEN_READ_STATEMENTS: dict[tuple[str, str], tuple[str, ...]] = {
+    # one `g.query`, resolving to `MATCH (n:Point) {where} … RETURN …`
+    ("tortoise/sdk.py", "TortoiseSDK.calibrate_summary"): ("query",),
+    # one `g.query`, resolving to `MATCH (n:{label}) WHERE … RETURN n.id [LIMIT n]`
+    ("tortoise/sdk.py", "TortoiseSDK._uncalibrated_ep_participants"): ("query",),
+}
+
 
 def test_every_proven_read_names_a_real_census_entry():
     """A `_PROVEN_READS` entry must be a key the census actually emits.
@@ -1504,6 +1528,13 @@ def test_every_proven_read_names_a_real_census_entry():
     that is never revalidated" failure this suite exists to prevent. It held no
     entries in part 1; the `#9261` calibration reads are the first, and each one's
     key is proved here.
+
+    The VERDICT'S EXTENT is proved too: `_PROVEN_READ_STATEMENTS` must name the
+    exact call kinds of that function's unresolved statements, in order. A
+    positive verdict pinned to a NAME would otherwise bless a second statement
+    added to the same function later — the register is consulted before the
+    census classifies anything, so the new statement would inherit the old
+    verdict and pass both static gates silently.
     """
     surfaces = dict(_modules_reaching_the_handle())
     offenders = []
@@ -1522,6 +1553,26 @@ def test_every_proven_read_names_a_real_census_entry():
         "census key is scope-qualified — `TortoiseSDK.delete_point`, not "
         "`delete_point`) — the pin would be a silent no-op:\n  "
         + "\n  ".join(offenders))
+
+    # ── the extent: every registered name pins WHAT it was proven to do ──
+    unmatched = sorted(set(_PROVEN_READS) ^ set(_PROVEN_READ_STATEMENTS))
+    assert not unmatched, (
+        "`_PROVEN_READS` and `_PROVEN_READ_STATEMENTS` disagree about "
+        f"{unmatched} — every proven read must pin its statements, or its verdict "
+        "covers whatever that function grows into next")
+    drift = []
+    for (rel, key), expected in sorted(_PROVEN_READ_STATEMENTS.items()):
+        fact = surfaces[rel][key]
+        got = tuple(write[1] for write in fact["writes"])
+        if got != expected:
+            drift.append(
+                f"{rel}::{key} now issues {got} (lines "
+                f"{[w[0] for w in fact['writes']]}) but was proven as {expected}")
+    assert not drift, (
+        "a registered read-only function changed what it reaches the handle with, "
+        "so the read-only verdict no longer covers it — re-prove the statements "
+        "(and update `_PROVEN_READ_STATEMENTS`) or drop the entry so the census "
+        "classifies it again:\n  " + "\n  ".join(drift))
 
 
 def _is_unresolved_only(fact) -> bool:
@@ -1717,8 +1768,15 @@ def test_a_proven_read_entry_must_be_unproven_and_undeclared(monkeypatch):
     """The register pins the VERDICT, not just the key form.
 
     A provable write blessed as a "proven read" would be skipped by BOTH gates,
-    so an entry in the right key form but the wrong shape must be refused.
+    so an entry in the right key form but the wrong shape must be refused. The
+    third clause pins the verdict's EXTENT: a registered name whose statement set
+    changed (or that pins no extent at all) is refused, because both gates consult
+    the register BEFORE classifying anything, so the old verdict would otherwise
+    cover whatever the function grew into.
     """
+    # Captured BEFORE any patch: the real register the extent clauses probe.
+    real_register = set(_PROVEN_READS)
+    real_statements = dict(_PROVEN_READ_STATEMENTS)
     surfaces = dict(_modules_reaching_the_handle())
     sdk = surfaces["tortoise/sdk.py"]
     # A REAL key, so the entry reaches the VERDICT clause rather than the
@@ -1735,6 +1793,26 @@ def test_a_proven_read_entry_must_be_unproven_and_undeclared(monkeypatch):
         "test_9124_declared_live_doors._PROVEN_READS",
         {("tortoise/sdk.py", declared[0].split(".")[-1])})
     with pytest.raises(AssertionError, match="names no census entry"):
+        test_every_proven_read_names_a_real_census_entry()
+
+    # ── the EXTENT clauses, on the REAL register (non-empty since #9261) ──
+    assert real_register, (
+        "`_PROVEN_READS` is empty, so the extent probe below would pass "
+        "vacuously — it is only meaningful while a verdict spans statements")
+    monkeypatch.setattr("test_9124_declared_live_doors._PROVEN_READS", real_register)
+    grown = dict(real_statements)
+    first = sorted(grown)[0]
+    # A SECOND statement appeared in a function blessed as read-only: the verdict
+    # no longer covers it, and the pin must say so.
+    grown[first] = grown[first] + ("query",)
+    monkeypatch.setattr("test_9124_declared_live_doors._PROVEN_READ_STATEMENTS", grown)
+    with pytest.raises(AssertionError, match="read-only verdict no longer covers"):
+        test_every_proven_read_names_a_real_census_entry()
+    # A registered name with NO pinned extent is refused the other way round.
+    monkeypatch.setattr(
+        "test_9124_declared_live_doors._PROVEN_READ_STATEMENTS",
+        {key: value for key, value in real_statements.items() if key != first})
+    with pytest.raises(AssertionError, match="every proven read must pin its statements"):
         test_every_proven_read_names_a_real_census_entry()
 
 
