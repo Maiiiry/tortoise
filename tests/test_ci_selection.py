@@ -2104,6 +2104,28 @@ def test_the_capstone_evidence_bundle_selects_core_not_tier1():
         assert r["full"] is False, (path, r)
 
 
+def test_the_capstone_census_pin_runs_on_a_main_py_change():
+    # PR #9196 review P1: the OTHER direction of the same hole. The census pin
+    # compares each hit line INCLUDING its `file:line`, and the one live hit is
+    # `tortoise/__main__.py:727: view = read_record_view(...)`. That file is an
+    # EXACT `api` SOURCE_PATTERNS match and NOT in `CORE_ALSO`, so a named-surface
+    # match REPLACES the `core` fallback: before the `api` registration a
+    # `__main__.py`-only diff returned surfaces=['api'] with the `core`-registered
+    # probe ABSENT, and any edit above line 727 (measured: a one-line ruff import
+    # fix) shifts the hit and reddens the pin — on the post-merge full selection
+    # only. The instrument that makes S2's staleness visible must not be invisible
+    # to CI selection on the file whose line it pins (#1349/#2938/#3154 class).
+    #
+    # Measured before the `api` entry (2026-10-19, `select()` in-process):
+    # `_sel(["tortoise/__main__.py"])` -> surfaces=['api'], full=False, 283 test
+    # files, test_7950_capstone_probe.py ABSENT.
+    # Mutation check: removing the `api` entry fails `test_files` below.
+    r = _sel(["tortoise/__main__.py"])
+    assert "api" in r["surfaces"], r
+    assert "test_7950_capstone_probe.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
 def test_supabase_config_change_selects_core_not_tier1():
     # supabase/config.toml is the committed LOCAL-stack config and resolves its
     # providers by `env(NAME)` substitution, so each of those names is required

@@ -65,6 +65,25 @@ surfaces:
   # comparison live in `tortoise/record_reconcile.py` /
   # `tortoise/reconciliation.py`, neither of which matches a SOURCE_PATTERN.
   - test_record_reconcile_trigger.py
+  # PR #9196 review P1: DUAL-REGISTERED with `core` — the S2 census pin
+  # (`test_the_s2_census_log_is_a_LIVE_measurement`) re-measures
+  # `docs/evidence/7950-capstone/s2-wiring-census.log` INCLUDING each hit line's
+  # `file:line`, and its one live hit lives in `tortoise/__main__.py` (the
+  # `record-reconcile` verb's `read_record_view(...)` call) — an EXACT `api`
+  # SOURCE_PATTERNS match that REPLACES the `core` fallback in `select()`. So an
+  # `__main__.py`-only PR selected `api` alone and the pin never ran on the
+  # exact change that shifts its pinned line (measured 2026-10-19:
+  # `select(['tortoise/__main__.py'])` -> surfaces=['api'], 283 test files,
+  # probe ABSENT) — the artifact the S2 verdict rests on could go stale and
+  # `main` would only find out on the post-merge full selection. This is the
+  # #1349/#2938/#3154 silent-drop class, and the same remedy the #9189 entry
+  # above applies to its own file. Keep the `core` entry: the probe's other
+  # subjects (`tortoise/reconciliation.py`, `record_writer.py`,
+  # `cache_projection.py`) match no SOURCE_PATTERN and take the `core`
+  # fallback. Cost is bounded: the file is DB-free pure-function work
+  # (<0.01s/test, durations row 2.0). Pinned by
+  # tests/test_ci_selection.py::test_the_capstone_census_pin_runs_on_a_main_py_change.
+  - test_7950_capstone_probe.py
   # #7809: DUAL-REGISTERED with `core` AND `eval` — without this `api` arm the
   # guard is SKIPPED on the exact change it exists to guard. The pre-warm it
   # pins lives in `tortoise/hosted_api.py`, an EXACT `api` SOURCE_PATTERNS match
