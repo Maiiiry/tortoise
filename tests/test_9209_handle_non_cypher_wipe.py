@@ -85,9 +85,21 @@ from tortoise.projection import (
 def sdk_with_journal(tmp_path):
     """A real SDK whose projection is ARMED (`event_log_path` configured).
 
-    Lane-agnostic, like `tests/test_7951_enforce_atomic_write.py`'s fixture: the
-    explicit `db_path` makes the projection embedded when no URI is configured,
-    and the same construction reaches the docker server when one is.
+    ALWAYS EMBEDDED, and this is measured rather than assumed: an explicit
+    `db_path` WINS over `TORTOISE_DB_URI` in the SDK, so `proj._is_embedded`
+    stays True even on the docker lane — the same shape
+    `tests/test_7951_enforce_atomic_write.py` uses. (The earlier wording said
+    this construction "reaches the docker server when one is" configured, which
+    a fresh-context review measured FALSE: a run with `TORTOISE_DB_URI` set
+    still logged `_is_embedded: True`.)
+
+    That is the right lane for what this suite pins — every refusal below is
+    asserted against a real journal-backed projection AND a real node count, and
+    the cache-intact half needs no server. The consequence, named so it is not
+    mistaken for coverage: with `_is_embedded` True, L2's NAME branch
+    (`_assert_test_graph`) cannot fire here, so the `embedded=False` cases use
+    `_RecordingGraph` and assert the DECISION plus that nothing was dispatched.
+    No server-lane case of the #9209 door exists in this suite.
     """
     from tortoise.sdk import TortoiseSDK
 
