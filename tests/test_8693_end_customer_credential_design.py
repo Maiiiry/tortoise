@@ -113,11 +113,7 @@ def _membership_checks(node: ast.AST, needle: str) -> list[tuple[ast.Compare, as
     for sub in ast.walk(node):
         if not isinstance(sub, ast.Compare):
             continue
-        # `strict=True`: `ast.Compare` guarantees `ops` and `comparators` have
-        # equal length, so a mismatch would be a malformed AST worth raising on
-        # — and `ruff` B905 (in this repo's selected set) reds the lint shard
-        # on `main` without it (`b6e0b65f3`, #9178).
-        for op, comparator in zip(sub.ops, sub.comparators, strict=True):
+        for op, comparator in zip(sub.ops, sub.comparators, strict=False):
             if not isinstance(op, (ast.In, ast.NotIn)):
                 continue
             left = sub.left
