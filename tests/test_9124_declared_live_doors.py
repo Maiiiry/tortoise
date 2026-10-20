@@ -1442,7 +1442,10 @@ def _modules_reaching_the_handle():
 
 #: Package-wide `(module, SCOPE-QUALIFIED key)` pairs whose statement the census cannot
 #: resolve but a human has PROVEN read-only (it is a `MATCH … RETURN` whose
-#: interpolated fragment carries no write clause). Empty in part 1, and the flip
+#: interpolated fragment carries no write clause). Empty in part 1; it carries the
+#: two `#9261` calibration READ statements today (`#9063`'s universe query and the
+#: audit that reuses it — see the entry's own note), and the flip is still
+#: blocked while the package-wide remainder is not empty.
 #: is blocked without it. Bucketing is PER FUNCTION, so of the 308 unresolved
 #: statements in the population 226 sit in the "unproven" bucket, 44 sit in
 #: functions that already declare a lane (no bucket), and 38 ride in a function
@@ -1456,7 +1459,19 @@ def _modules_reaching_the_handle():
 #: bare-name entry is a SILENT NO-OP: accepted into the set, it changes nothing,
 #: and the gate keeps blocking the statement while its author believes it was
 #: proven read-only. `test_every_proven_read_names_a_real_census_entry` pins it.
-_PROVEN_READS: set[tuple[str, str]] = set()
+_PROVEN_READS: set[tuple[str, str]] = {
+    # #9261 (#9063): the calibration gate's demand universe, and the audit that
+    # reuses it. Both statements are `MATCH … RETURN` READS, but the census
+    # cannot resolve them statically — `_uncalibrated_ep_participants` passes a
+    # `query` VARIABLE it composes per label (`name` argument, not a literal),
+    # and `calibrate_summary` interpolates a `where` fragment built above the
+    # call. Proven read-only in review: neither statement carries a
+    # SET/CREATE/DELETE/MERGE arm, and `proj.g.query` is a pure read of the
+    # graph here — declaring a lane would be a WRITE declaration on a read,
+    # which the register's own note calls the wrong remedy.
+    ("tortoise/sdk.py", "TortoiseSDK.calibrate_summary"),
+    ("tortoise/sdk.py", "TortoiseSDK._uncalibrated_ep_participants"),
+}
 
 
 def test_every_proven_read_names_a_real_census_entry():
@@ -1464,8 +1479,9 @@ def test_every_proven_read_names_a_real_census_entry():
 
     Both consumers index the register with the SCOPE-QUALIFIED key, so an entry
     in any other form would sit in the set and change nothing — the "stale flag
-    that is never revalidated" failure this suite exists to prevent. Empty today;
-    a part-2 entry must still prove its key.
+    that is never revalidated" failure this suite exists to prevent. It held no
+    entries in part 1; the `#9261` calibration reads are the first, and each one's
+    key is proved here.
     """
     surfaces = dict(_modules_reaching_the_handle())
     offenders = []

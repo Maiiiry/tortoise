@@ -6788,7 +6788,9 @@ durations:
   test_graph_delete_hygiene_report.py: 1.8
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
-  # #9210: added by a PR, so no CI reading exists yet (#3400 trap). 4 tests.
+  # #9210: added by a PR, so no CI reading exists yet (#3400 trap). 5 test
+  # functions, 5 collected cases (both counts are 5 today — the file carries no
+  # parametrization since the eleven table-only cases were deleted).
   # MEASURED locally in the embedded lane: 27.3 s on a quiet box and 35.1 s
   # under fleet load, of which ~15 s is the FIRST `create_point`'s one-time
   # embedding-model load — the same artefact #9123 recorded for its own file.
