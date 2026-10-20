@@ -356,8 +356,10 @@ def _not_on_the_escape_handle(
 #: literal, so a NEW opener added to `tortoise/projection/__init__.py` — the
 #: shape both #9123 and #9195 used — was invisible to the instrument check,
 #: which iterated the literal and therefore could not notice it. This reads the
-#: production source and returns every declaring function, so a new lane joins
-#: the population by existing.
+#: production source and returns every declaring function — DIRECTLY, or by
+#: delegating to an opener (`return _live_write_scope(reason)`, the shape
+#: #9150 review cycle 8 found invisible) — so a new lane joins the population by
+#: existing.
 def _declaration_primitives() -> set[tuple[str, str]]:
     """Every §17.1 opener the tree defines, as `(module, function)` — ALL of
     `tortoise/`.
@@ -391,21 +393,80 @@ def _openers_under(root: Path) -> set[tuple[str, str]]:
     `projection/edges.py`'s `_structural_edge_write_scope` is a real opener that
     is NOT in that list).
     """
-    found: set[tuple[str, str]] = set()
     paths = [root] if root.is_file() else sorted(root.rglob("*.py"))
-    for path in paths:
-        rel = str(path.relative_to(_REPO))
-        tree, _parents = _parse(rel)
+    return _openers_in({
+        str(path.relative_to(_REPO)): _parse(str(path.relative_to(_REPO)))[0]
+        for path in paths
+    })
+
+
+def _declares_directly(node: ast.AST) -> bool:
+    """Does this function call `_cache_write_authorized()` in its own body?"""
+    return any(
+        isinstance(inner, ast.Call)
+        and (getattr(inner.func, "id", None) == "_cache_write_authorized"
+             or getattr(inner.func, "attr", None) == "_cache_write_authorized")
+        for inner in ast.walk(node)
+    )
+
+
+def _delegates_to(node: ast.AST, openers: set[str]) -> bool:
+    """Is this function's whole body `return <a known opener>(...)`?"""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    body = list(node.body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return False
+    value = body[0].value
+    return (isinstance(value, ast.Call)
+            and (getattr(value.func, "id", None) in openers
+                 or getattr(value.func, "attr", None) in openers))
+
+
+def _openers_in(trees: dict[str, ast.Module]) -> set[tuple[str, str]]:
+    """`(module, function)` for every opener in `trees`, TRANSITIVE over
+    delegation.
+
+    ⛔ A delegating opener authorizes exactly as much as the one it wraps
+    (#9150 review cycle 8, P1). `return _live_write_scope(reason)` is the
+    ordinary in-module shape — it is the same "two spellings, one primitive"
+    that `onboarding/state.py` has to spell out — and the first revision of this
+    derivation keyed on a DIRECT `_cache_write_authorized` call only, so such an
+    opener joined NEITHER population and a site could enter a declaration with
+    all 15 pins green (measured: a delegating `_future_lane_write_scope` around
+    `sdk.py::org_create`'s statement left the suite 15/15 passed). The docstrings
+    that promise "a new lane joins the population by existing" and "a NEW opener
+    in `projection/__init__.py` must red this suite" were false for it.
+
+    Conservative by design: only the unambiguous `return <opener>(...)` shape
+    counts, so a function that MERELY calls an opener on one path is left to
+    `_declaring_functions()` (which asks about a `with`, i.e. a door, not an
+    opener). The fixpoint adds 0 members on this tree — the delegation gap is
+    closed without changing either recorded population.
+    """
+    found: set[tuple[str, str]] = set()
+    for rel, tree in trees.items():
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for inner in ast.walk(node):
-                if (
-                    isinstance(inner, ast.Call)
-                    and (getattr(inner.func, "id", None) == "_cache_write_authorized"
-                         or getattr(inner.func, "attr", None) == "_cache_write_authorized")
-                ):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and _declares_directly(node)):
+                found.add((rel, node.name))
+    names = {name for _rel, name in found}
+    changed = True
+    while changed:
+        changed = False
+        for rel, tree in trees.items():
+            for node in ast.walk(tree):
+                if (not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        or (rel, node.name) in found):
+                    continue
+                if _delegates_to(node, names):
                     found.add((rel, node.name))
+                    names.add(node.name)
+                    changed = True
     return found
 
 
@@ -977,6 +1038,54 @@ def test_the_declaration_detector_can_fail():
             f"{primitive}() — a site closed through that opener would leave "
             "every residual pin in this file green while the note went stale"
         )
+
+
+def test_a_delegating_opener_joins_both_populations():
+    """`return <opener>(reason)` must count as declaring — it authorizes as much.
+
+    The instrument check for the fixpoint in `_openers_in()` (#9150 review cycle
+    8, P1). A wrapper that delegates to a real opener is the ordinary in-module
+    shape — `onboarding/state.py` spells it out as "two spellings, one
+    primitive" — and while the derivation keyed on a DIRECT
+    `_cache_write_authorized` call only, such an opener joined NEITHER
+    population: measured, a delegating `_future_lane_write_scope` wrapping
+    `sdk.py::org_create`'s statement left this suite 15/15 passed, while
+    `test_the_opener_inventory_is_pinned_so_a_new_lane_moves_this_file` and
+    `_declaration_primitives()` both promise a new lane cannot do that.
+
+    Synthetic trees, because these two populations are read from the repo on
+    disk — the point here is the DERIVATION, not where it is pointed.
+    """
+    trees = {
+        "synthetic/direct.py": ast.parse(textwrap.dedent(
+            """
+            def _base_write_scope(reason: str = "base"):
+                return _cache_write_authorized(reason)
+            """
+        )),
+        "synthetic/delegating.py": ast.parse(textwrap.dedent(
+            """
+            def _future_lane_write_scope(reason: str = "future"):
+                '''A one-line wrapper, as a new lane is usually added.'''
+                return _base_write_scope(reason)
+
+            def _not_an_opener(reason: str = "x"):
+                with _base_write_scope(reason):
+                    return None
+            """
+        )),
+    }
+    derived = _openers_in(trees)
+    assert ("synthetic/direct.py", "_base_write_scope") in derived, derived
+    assert ("synthetic/delegating.py", "_future_lane_write_scope") in derived, (
+        "the opener derivation still requires a DIRECT `_cache_write_authorized` "
+        f"call, so a delegating opener is invisible to both populations: {derived}"
+    )
+    assert ("synthetic/delegating.py", "_not_an_opener") not in derived, (
+        "a DOOR (a function that merely calls an opener inside a `with`) was "
+        "collected as an OPENER — that is `_declaring_functions()`' question, "
+        f"and conflating them makes the inventory claim a lane exists: {derived}"
+    )
 
 
 # ── the guard's own opener inventory ─────────────────────────────────────
