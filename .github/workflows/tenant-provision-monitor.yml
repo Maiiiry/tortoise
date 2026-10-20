@@ -1,0 +1,141 @@
+# tenant-provision log monitor (#1133)
+#
+# The #1110 incident (browser signups blocked by missing CORS headers) was
+# discovered by a USER, not by any signal. The function now logs its
+# incident-class failures server-side (FASTAPI_URL misconfig, provision_team
+# failure, uncaught handler errors). "rejected origin" deny-branch lines are
+# intentional diagnosis logging; only a >=5-per-window burst opens an
+# incident (#1149 count-threshold — see marker comment below). This
+# workflow is the consume side: hourly, it queries the project's unified
+# logs stream for tenant-provision error markers and opens a DEDUPLICATED
+# GitHub issue (with log evidence) when any appear, then fails visibly.
+#
+# #3907: the issue is the FINDING, not the occurrence. The title is a STABLE
+# dedupe key and .github/scripts/auto-file-issue.sh searches for it before
+# filing; when it is already open the run records a `Recurrence #N` comment on
+# it (the pre-fix code said "already open — not duplicating" and recorded
+# NOTHING, so an hourly escalation was invisible).
+#
+# Uses the Management API analytics endpoint (the old logs.all endpoint is
+# removed 2026-09-23 — see supabase.com/changelog/48235):
+#   GET /v1/projects/{ref}/analytics/endpoints/logs?sql=<ClickHouse>&
+#       iso_timestamp_start=...&iso_timestamp_end=...
+# Requires the repo's SUPABASE_ACCESS_TOKEN to carry analytics_logs_read
+# (OAuth scope: analytics:read). A 403 on dispatch means the token lacks
+# the scope — generate one with it in Supabase → Account → Access tokens.
+
+name: Monitor tenant-provision logs
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly, :17 (staggered off the top of the hour)
+  workflow_dispatch:
+
+concurrency:
+  group: tenant-provision-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: ybetwichurajbfswfeqa
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan tenant-provision logs for incident markers
+        run: |
+          set -euo pipefail
+          start="$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)"
+          end="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sql="select timestamp, event_message from logs where source = 'function_logs' and event_message like '%tenant-provision%' order by timestamp desc limit 500"
+          # A bare `curl -sS` exits 0 on an HTTP 4xx/5xx, and a Supabase error
+          # body is `{"message": …}` — NOT `{"error": …}` — so the only failure
+          # detection below (`jq -r '.error'`) stayed empty on a 403/5xx and this
+          # monitor printed `✅ no incident-class markers` and exited 0: a blind
+          # monitor reporting healthy. A transport failure is caught by `set -e`;
+          # an HTTP error is not. Require a REAL 2xx before interpreting the body
+          # (a transport failure collapses to 000 and is refused the same way).
+          log_body="$(mktemp)"
+          http="$(curl -sS -o "$log_body" -w '%{http_code}' -G "https://api.supabase.com/v1/projects/$SUPABASE_PROJECT_REF/analytics/endpoints/logs" \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+            --data-urlencode "sql=$sql" \
+            --data-urlencode "iso_timestamp_start=$start" \
+            --data-urlencode "iso_timestamp_end=$end" || echo 000)"
+          out="$(cat "$log_body")"
+          rm -f "$log_body"
+          if [ "$http" != "200" ]; then
+            echo "::error::log query returned HTTP ${http} — the monitor cannot read logs; refusing to report healthy"
+            exit 1
+          fi
+          err="$(printf '%s' "$out" | jq -r '.error // empty')"
+          if [ -n "$err" ]; then
+            echo "::error::log query failed: $err"
+            exit 1
+          fi
+          # NOTE: "AUTH_HOOK_SECRET is not set" is deliberately EXCLUDED — it
+          # fires on every unauthenticated 401 by design (fail-closed Path 2,
+          # hook inert since #832). It becomes meaningful only if the hook is
+          # re-enabled (#1120); re-add it to the marker list then.
+          #
+          # "rejected origin not in allowlist" — COUNT-THRESHOLD, not excluded
+          # (#1149, review #1234): the CORS deny branch logs rejected origins
+          # server-side FOR DIAGNOSIS by design (see index.ts comment on the
+          # deny branches). Security-scanner probes (e.g. the canonical
+          # CORS-misconfig probe Origin: https://evil.example.com) emit 1-2
+          # lines per 3h window — a single probe opened #1149 as a
+          # false-positive incident. BUT the #1110 recurrence class this
+          # monitor exists for IS an allowlist misconfig rejecting LEGIT
+          # origins (dozens+ lines per window) — full removal would blind the
+          # monitor to it. So: count deny lines; only >=5 per window (a
+          # scanner burst or a real outage) opens an incident.
+          deny_count="$(printf '%s' "$out" | jq -r '.result[]? | select(.event_message != null) | .event_message' \
+            | grep -Fc "rejected origin not in allowlist" || true)"
+          hits="$(printf '%s' "$out" | jq -r '.result[]? | select(.event_message != null) | .event_message' \
+            | grep -F \
+              -e "FASTAPI_URL is not set" \
+              -e "Provisioning misconfigured" \
+              -e "provision_team failed" \
+              -e "tenant-provision error" \
+            | sort -u | head -20 || true)"
+          if [ -n "$hits" ] || [ "$deny_count" -ge 5 ]; then
+            # #3907: file the FINDING, not the occurrence. `title` is the STABLE
+            # dedupe key (no run id, no timestamp, no count); the shared
+            # substrate (.github/scripts/auto-file-issue.sh) searches for it
+            # BEFORE filing and, when it is already open, records this
+            # occurrence as a `Recurrence #N` comment on that issue.
+            #
+            # The pre-#3907 code here searched too — but on a hit it said
+            # "already open — not duplicating" and recorded NOTHING, so a
+            # monitor firing hourly on one unchanged fault read as a single
+            # quiet issue and the escalation was invisible (the other half of
+            # #3907). A failed SEARCH now refuses to file (never risk a
+            # duplicate) and fails the step loudly: the red run IS the alert,
+            # the same documented policy as welcome-e2e-monitor.sh (#2140).
+            title="[monitor] incident-class errors in tenant-provision logs ($SUPABASE_PROJECT_REF)"
+            body_file="$(mktemp)"
+            cat > "$body_file" <<EOF
+          Automatic alert from the hourly tenant-provision log monitor (workflow: $GITHUB_WORKFLOW, run: $GITHUB_RUN_ID).
+
+          Evidence (last 3h, deduplicated event_message lines):
+          \`\`\`
+          $hits
+          \`\`\`
+
+          Investigate Supabase function logs: https://supabase.com/dashboard/project/$SUPABASE_PROJECT_REF/logs/edge-functions
+          EOF
+            af_rc=0
+            bash .github/scripts/auto-file-issue.sh file \
+              --title "$title" --body-file "$body_file" --label bug || af_rc=$?
+            rm -f "$body_file"
+            if [ "$af_rc" != "0" ]; then
+              echo "::error::auto-file failed (rc=$af_rc) — the monitor could not file or update its issue; this failing run IS the alert"
+            fi
+            echo "::error::incident-class markers found in tenant-provision logs:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "✅ no incident-class markers in the last 3h of tenant-provision logs"

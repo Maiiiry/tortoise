@@ -1,0 +1,44 @@
+name: registry-restore-drill
+
+# Verification-restore drill (#596): restore a real team archive into a scratch
+# graph and prove the read path (a backup never restored is a guess). Dispatch
+# only — no recurring cron (deferred decision). The rollout drill is
+# operator-invoked per the runbook.
+
+on:
+  workflow_dispatch:
+    inputs:
+      org_id:
+        type: string
+        description: "Team whose archive to drill-restore (default: newest non-empty across teams)"
+        required: false
+      backup_key:
+        type: string
+        description: "Explicit backup key (backups/{org_id}/.../dump.enc). Default: newest non-empty."
+        required: false
+
+# Manual drill, one at a time: two concurrent restores into the same scratch
+# graph would measure each other's writes and the drill's own assertion (that
+# the restored archive is the only thing read) would be meaningless.
+concurrency:
+  group: registry-restore-drill
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      INTERNAL_API_URL: ${{ secrets.INTERNAL_API_URL }}
+      FASTAPI_INTERNAL_KEY: ${{ secrets.FASTAPI_INTERNAL_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run restore drill
+        run: bash .github/scripts/registry-drill.sh
+        env:
+          DRILL_ORG_ID: ${{ inputs.org_id }}
+          DRILL_BACKUP_KEY: ${{ inputs.backup_key }}
