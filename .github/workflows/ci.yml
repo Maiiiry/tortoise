@@ -80,13 +80,28 @@ jobs:
           fetch-depth: 0   # PR base SHA must be present for the diff
       - name: Compute per-surface path gates (#2149)
         id: gate
+        env:
+          # #8734: these two are the only `${{ }}` spans in this `run:`, and GitHub
+          # compiles a `run:` that contains any expression under a 21000-byte cap —
+          # measured at 20944 raw + 66 expression bytes = 21010, so `ci.yml` stopped
+          # loading and the whole workflow ran ZERO jobs on every event (the required
+          # `docs`/`legal-e2e`/`license-surface`/`pricing-artifact`/`test-isolation`
+          # contexts could not be produced, and a push run with no jobs is the
+          # signature of that refusal). A scalar with no `${{ }}` is never compiled
+          # (`ai-review-gate.yml` loads a 34 KB one), so as step env these are
+          # substituted before the script is assembled and the cap stops applying to
+          # it — instead of being re-armed by the next comment anyone adds. Keep
+          # expression spans out of this `run:`; the byte budget is tracked by
+          # tests/test_ci_selection.py.
+          MAIN_HEALTH: ${{ inputs.main_health }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           # #5215 Task 8 (D13): a `workflow_call` main-health run has no PR base,
           # so the empty-diff fallback below would set EVERY gate true and re-run
           # the whole ~20-gate matrix nightly. Under `main_health` only the five
           # always-on required jobs run, so every gated surface is explicitly
-          # false. (`inputs.main_health` is empty on a `pull_request` event.)
-          if [ "${{ inputs.main_health }}" = "true" ]; then
+          # false. (`MAIN_HEALTH` is empty on a `pull_request` event.)
+          if [ "$MAIN_HEALTH" = "true" ]; then
             for key in migrations dashboard dashboard_e2e uv_lock entrypoints \
                        client packaging website hosted flip python drift \
                        driver_scripts ai_review_gate watchdog_scripts \
@@ -97,7 +112,7 @@ jobs:
             echo "changes: main_health call — all gated surfaces false; only the 5 required jobs run"
             exit 0
           fi
-          BASE="${{ github.event.pull_request.base.sha }}"
+          BASE="$BASE_SHA"
           [ -n "$BASE" ] || BASE="origin/main"
           CHANGED=$(git diff --no-renames --name-only "$BASE...HEAD" 2>/dev/null || true)
           echo "changed files vs $BASE:"
@@ -219,7 +234,7 @@ jobs:
                   startswith("packs/"),
               ),
               # welcome-e2e (wrangler preview of website/ + mocked playwright
-              # + the two edge-function node harnesses). Separate-app changes
+              # + the three edge-function node harnesses). Separate-app changes
               # under website/apps/ do NOT trigger it — dashboard-js-tests
               # covers dashboard; blog-admin has no gated suite. (#2160 P3-1:
               # excluded website/apps/ wholesale, not dashboard only.)
@@ -233,16 +248,43 @@ jobs:
                          # subject (website/functions/blog/_lib.ts) already
                          # matches the website/ prefix, but the harness itself
                          # needs a path entry or a test-only PR would not run it.
-                         "tests/test_blog_markdown.mjs"),
-                  # #3501: the BFF auth suites live here and had NO path entry,
-                  # so a PR touching only them could not trigger the job that
-                  # runs them — the job would be skipped, not failed.
+                         "tests/test_blog_markdown.mjs",
+                         "docs/blog-authoring.md",
+                         # #8293: the SEO keyword + agent-limiter harness.
+                         "tests/test_blog_seo_meta.mjs", "tests/test_deck_view.mjs",
+                         # #8816: the wrangler pin is an INPUT to this job — the
+                         # version file, the guard that pins its shape, and the
+                         # workflow that carries the DEPLOY assertions. Without
+                         # them a version-only (or guard-only) PR would not run the
+                         # job whose toolchain it changes.
+                         # This file (`ci.yml`) is deliberately NOT named here: it
+                         # carries three consumers, so naming it would run two full
+                         # e2e suites on every workflow edit. What makes that safe is
+                         # that `legal-e2e` is UNGATED — it installs, verifies and
+                         # boots from the same wiring on every PR, and the guard arm
+                         # `test_the_ci_yml_wrangler_wiring_is_exercised_by_an_ungated_job`
+                         # pins exactly that property.
+                         "config/wrangler-version",
+                         "tests/test_e2e_wrangler_prewarm.py",
+                         ".github/workflows/deploy-pages.yml"),
+                  # #3501: the BFF auth suites live here and had NO path entry —
+                  # a suite-only PR could not trigger the job that runs them.
                   startswith("tests/e2e/auth/"),
                   isfile("tests/test_no_legacy_token_path.py"),
                   isfile("tests/e2e/test_auth_bff_clickthrough.py",
                          "tests/e2e/test_auth_cross_origin_cookie.py"),
                   startswith("supabase/functions/waitlist-subscribe/"),
                   startswith("supabase/functions/tenant-provision/"),
+                  startswith("supabase/functions/deck-view/"),
+                  # #2810: the edge-function harnesses above import these stubs
+                  # (supabase-js.ts, _shared/lookup.ts) — the stub is an input to
+                  # the subject under test, so a stub-only PR must still run them.
+                  startswith("tests/edge-function-stubs/"),
+                  # #4311: the strict tsc project for website/functions/** lives in
+                  # tools/ts/ — kept OUTSIDE the Pages upload root (tools/ts/README.md)
+                  # — so a change to the project or its pinned toolchain runs the
+                  # `website-functions-typecheck` job too.
+                  startswith("tools/ts/"),
                   startswith("supabase/functions/_shared/"),
               ),
               # hosted-e2e (boots uvicorn tortoise.hosted_api:app; engine
@@ -399,6 +441,12 @@ jobs:
               # dist rebuild ran against the previous bundle — is GONE: the job
               # builds before it boots.)
               "dashboard_e2e": any_file(
+                  # #8816: the wrangler inputs — the version file, and the guard
+                  # that pins the shape of the wiring this job's install/boot uses.
+                  # `ci.yml` itself is named at the END of this gate, so it is not
+                  # repeated here.
+                  isfile("config/wrangler-version",
+                         "tests/test_e2e_wrangler_prewarm.py"),
                   isfile("tests/e2e/test_keys_table_mixed.py"),
                   isfile("tests/e2e/test_graphs_management.py"),
                   # #4221: `test_session_login_flow.py` is the SHARED HARNESS
@@ -419,6 +467,18 @@ jobs:
                   # skips the job (skipped, not failed). Same #3501 rationale as
                   # the auth-suite entries under `website` above.
                   isfile("tests/e2e/test_dashboard_onboarding.py"),
+                  # #2809: the identity spec is wired into the job now, and it
+                  # spawns its own Supabase-bound preview — so a PR touching
+                  # ONLY the spec, or only the mock it depends on, must run the
+                  # job instead of skipping it (skipped, not failed: the exact
+                  # inversion that left this file latent-red for months).
+                  # `bff_test_helpers.py` is the stack lifecycle this spec now
+                  # depends on (spawn/stop/D1 resolution) — only the auth specs
+                  # imported it before, so a PR touching ONLY it ran `website`
+                  # and SKIPPED this job.
+                  isfile("tests/e2e/test_dashboard_identity.py",
+                         "tests/e2e/auth/mock_supabase.mjs",
+                         "tests/e2e/auth/bff_test_helpers.py"),
                   # #3806: the ship-test guard's browser half (real clean-browser
                   # walk against the built bundle) + the instrument it guards.
                   isfile("tests/e2e/test_ship_test_onboarding.py",
@@ -1058,10 +1118,6 @@ jobs:
             --markdownlint-expected-files "$EXPECTED_MD_FILES" \
             --lychee-output "$RUNNER_TEMP/lychee-mh.json" \
             --baseline config/docs-lint-baseline.json
-      - name: Relative link sweep (tracked tree, whole repo)
-        run: |
-          python3 tools/docs_lint_baseline.py sweep \
-            --baseline config/docs-lint-baseline.json
 
   dashboard-js-tests:
     needs: changes
@@ -1320,10 +1376,14 @@ jobs:
     # SAME guard: a vendored copy would be a second source of truth free to drift from
     # the one that owns the idiom (#863's "guard nobody runs").
     #
-    # ORDERING: `--dirs` ships in agent-infra#1643. Until that lands and is tagged, this
-    # job is red (the guard exits 2 on an unknown argument) — land it first, then pin
-    # `ref:` to the tag here, matching how this file's other agent-infra jobs consume
-    # agent-infra at a semver pin rather than at whatever `main` happens to be.
+    # ORDERING — SATISFIED: `--dirs` shipped in agent-infra#1643, merged to agent-infra
+    # `main` as `ffa8751ac9afbd0acbfeb32d0619d2208b89217a` and PINNED below. Before that
+    # commit existed this job was red (the guard exits 2 on an unknown argument); the pin
+    # is what stops it following agent-infra `main` from here on, the way this file's other
+    # version-consuming agent-infra jobs fix their revision — node-ci and python-ci at a
+    # tag. (`drift-check` stays on `main` on purpose: detecting drift is its whole job, so
+    # it is the one job that must track it.) A commit pin rather than a tag because #1643
+    # carries no tag yet — replace the sha with the next `v0.1.x` when agent-infra cuts one.
     #
     # `--dirs` names THIS repo's layout — the guard's default set is agent-infra's and
     # `scripts/` here points back at it. The list lives in ONE place, `.sigpipe-grep-dirs`,
@@ -1332,10 +1392,8 @@ jobs:
     # ⚠️ THIS JOB IS NOT A REQUIRED CONTEXT YET (tortoise#7778), so a red here does not
     # block a merge: it is visible but unenforced. The sites it covers are already fixed,
     # so the exposure is a FUTURE reintroduction of the idiom, not the current tree.
-    # Making it required is a branch-protection change — the declaration home, the
-    # required-context record, and the required-set enumeration must move together, and it
-    # must land in the SAME change as the wiring: requiring it earlier would block every
-    # merge while the resolving guard still rejects `--dirs`. Measured repro on #7778.
+    # Making it required is a branch-protection change: the declaration home, the
+    # required-context record, and the required-set enumeration must move together.
     # (The declaration home is deliberately not named here: the recut guard reads any
     # workflow naming it as a workflow reading it as an authoritative source, and reds.)
     # `website/` is excluded: it carries a node_modules tree. Its shell files are NOT
@@ -1347,24 +1405,25 @@ jobs:
         with:
           repository: daniel-ospina/agent-infra
           path: .agent-infra-guard
+          # The reviewed guard, pinned: `--dirs` and the repo-under-scan resolution
+          # (agent-infra#1643). Unpinned, this job would track agent-infra `main` and
+          # could go red on a change nobody in this repo reviewed.
+          ref: ffa8751ac9afbd0acbfeb32d0619d2208b89217a
       - name: SIGPIPE false-negative guard (#841)
         run: |
           bash .agent-infra-guard/scripts/check-no-sigpipe-grep.sh \
             --dirs "$(cat .sigpipe-grep-dirs)"
       # The hook's own block is tested HERE, not left as a file nobody runs. This test
-      # stubs the guard, so it needs no agent-infra and no network — it runs even while
-      # the step above is red for the ordering reason. It exists because the hook's block
-      # once discarded the guard's verdict (a glued `else` made `exit` take two arguments
-      # and fail) while `sh -n` stayed green; only an executed assertion catches that.
+      # stubs the guard, so it needs no agent-infra and no network. It exists because the
+      # hook's block once discarded the guard's verdict (a glued `else` made `exit` take
+      # two arguments and fail) while `sh -n` stayed green; only an executed assertion
+      # catches that.
       - name: SIGPIPE hook block self-test
-        # `if: always()` is REQUIRED here, not defensive. Without it a failing
-        # step above (the NORMAL state while `--dirs` is unlanded — see the
-        # ordering note) SKIPS this step, so the test written to catch a
-        # discarded guard verdict would itself never run in the one case it
-        # exists for. Measured on this PR's own CI run: the guard step exited 2
-        # on `unknown argument: --dirs` and the job log contains no record of
-        # this step at all. The comment above claims it "runs even while the
-        # step above is red"; only this line makes that true.
+        # `if: always()` is REQUIRED here, not defensive. Without it a failing step above
+        # skips this one, so the test written to catch a discarded guard verdict would
+        # itself never run in the one case it exists for — and a FAILING guard is exactly
+        # when the hook's own handling needs asserting. Measured on #7772's own CI run:
+        # the guard step exited 2 and the job log held no record of this step at all.
         if: always()
         run: sh .github/scripts/sigpipe-hook.test.sh
 
@@ -1413,7 +1472,29 @@ jobs:
             echo "::error::cannot derive the client wheel's shared modules"
             exit 1
           fi
-          BAD="$(unzip -Z1 dist-client/*.whl | grep -E '^(tortoise|tortoise_client)/' | \
+          # The wheel's entry list comes from the stdlib, not `unzip` — the
+          # ubuntu-latest image this repo runs on is a self-hosted box with no
+          # `unzip` (packaging-smoke went red on exactly that), and python is
+          # guaranteed by the setup-python step above. ONE line on purpose: a
+          # `python -c 'a\nb'` form hands CPython a literal backslash-n, which
+          # raises SyntaxError — the lister then emits nothing and the grep
+          # gate below goes VACUOUS (empty input, empty `BAD`), i.e. fail-open.
+          wheel_entries() {
+            python -c 'import glob, zipfile; [print(n) for w in sorted(glob.glob("dist-client/*.whl")) for n in zipfile.ZipFile(w).namelist()]'
+          }
+          # One read, and its EXIT STATUS is checked: a lister that lists one
+          # wheel then raises on a second (a stale extra .whl left in
+          # dist-client/) prints the good entries before failing, so testing the
+          # output for emptiness alone would pass on a partial read.
+          CLIENT_WHEEL_ENTRIES="$(wheel_entries)" || {
+            echo "::error::cannot list the client wheel's entries — refusing to pass a vacuous whitelist check"
+            exit 1
+          }
+          if [ -z "$CLIENT_WHEEL_ENTRIES" ]; then
+            echo "::error::the client wheel's entry list is EMPTY — refusing to pass a vacuous whitelist check"
+            exit 1
+          fi
+          BAD="$(printf '%s\n' "$CLIENT_WHEEL_ENTRIES" | grep -E '^(tortoise|tortoise_client)/' | \
             grep -vE "^tortoise/(__init__|${SHARED_RE})\\.py$" | \
             grep -vE '^tortoise_client/(__init__|__main__|cli)\.py$' || true)"
           if [ -n "$BAD" ]; then
@@ -1421,7 +1502,7 @@ jobs:
             echo "$BAD"
             exit 1
           fi
-          unzip -Z1 dist-client/*.whl | grep -E '^(tortoise|tortoise_client)/'
+          printf '%s\n' "$CLIENT_WHEEL_ENTRIES" | grep -E '^(tortoise|tortoise_client)/'
           echo "wheel content OK — thin driver only"
       - name: Acceptance gate (clean venv, client only)
         run: bash client/verify_client.sh
@@ -1447,11 +1528,33 @@ jobs:
         run: python -m build
       - name: Wheel content check — tortoise/packs shipped
         run: |
-          MANIFEST_COUNT="$(unzip -Z1 dist/*.whl | grep -cE '^tortoise/packs/[^/]+/manifest\.yaml$' || true)"
-          [ "$MANIFEST_COUNT" -ge 1 ] || { echo "::error::wheel ships no pack manifests"; unzip -Z1 dist/*.whl | grep tortoise/packs || true; exit 1; }
-          tar tzf dist/*.tar.gz | grep -q 'tortoise/packs/__init__.py' \
-            || { echo "::error::sdist missing tortoise/packs/__init__.py (MANIFEST.in)"; exit 1; }
-          echo "wheel/sdist pack content OK"
+          # Read the archives with the stdlib, NOT `unzip`: this job's runner
+          # image has no `unzip` binary, which is the whole of the packaging-
+          # smoke red ("unzip: command not found" → "wheel ships no pack
+          # manifests" while the wheel itself was fine). The interpreter is
+          # guaranteed by the setup-python step above, so this check no longer
+          # depends on a binary the image may not carry.
+          python - <<'EOF'
+          import glob, sys, tarfile, zipfile
+
+          entries = [n for w in sorted(glob.glob("dist/*.whl"))
+                     for n in zipfile.ZipFile(w).namelist()]
+          manifests = [e for e in entries
+                       if e.startswith("tortoise/packs/")
+                       and e.count("/") == 3 and e.endswith("/manifest.yaml")]
+          if not manifests:
+              print("::error::wheel ships no pack manifests")
+              print("\n".join(e for e in entries if e.startswith("tortoise/packs")))
+              sys.exit(1)
+
+          sdist = [n for t in sorted(glob.glob("dist/*.tar.gz"))
+                   for n in tarfile.open(t).getnames()]
+          if not any(n.endswith("tortoise/packs/__init__.py") for n in sdist):
+              print("::error::sdist missing tortoise/packs/__init__.py (MANIFEST.in)")
+              sys.exit(1)
+
+          print(f"wheel/sdist pack content OK ({len(manifests)} pack manifest(s))")
+          EOF
       - name: Clean-venv pack smoke (bound derived from installed constant)
         run: |
           python -m venv /tmp/packsmoke
@@ -1485,10 +1588,76 @@ jobs:
           test -f docs/EXPANSION_PACKS.md || { echo "::error::EXPANSION_PACKS.md missing"; exit 1; }
           echo "doc-consistency OK"
 
+  # #4311: `website/functions/**` is the production edge surface (agent write
+  # API, admin gate, cache purge, contact form) and NOTHING typechecked it — no
+  # CI job, and the blog-admin SPA's `tsc --noEmit` does not include it. The
+  # strict project already FAILED on `main`:
+  #
+  #   blog/api/posts/[[path]].ts: error TS2322: Type 'string' is not assignable
+  #   to type '"draft" | "published"'.
+  #
+  # — invisible until runtime, on the one tree whose failures are a 500 at the
+  # edge with no test in front of it.
+  #
+  # It rides the EXISTING `website` gate rather than a new `changes` output: a
+  # new output key would spend headroom the next editor needs. That gate script
+  # carries no `${{ }}` spans now, so GitHub does not compile it and the
+  # 21000-byte cap no longer applies to it (#8734 moved the two expression
+  # spans into the step's `env:`; before that it sat at 20944 raw + 66 = 21010
+  # and GitHub refused to LOAD ci.yml — ZERO jobs, every required context
+  # unproducible). `tests/test_merge_throughput.py` pins the pair: the params
+  # stay bound in `env:`, and no expression span returns to the `run:`.
+  # This change adds the `tools/ts/` entry to the `website` predicate (which
+  # already covers `website/functions/**`). The `tools/ts/` entry is what makes
+  # a change to the tsc project itself (strict, include, the pinned toolchain)
+  # run this job too.
+  #
+  # The tsc project + pinned toolchain live in `tools/ts/` OUTSIDE `website/` on
+  # purpose: everything under `website/` is STAGED for public upload
+  # (`rsync -a website/ → $STAGE`, deploy-pages.yml), so a tsconfig.json or
+  # package.json placed next to the Functions would be served at
+  # /functions/tsconfig.json — the same reason config/required-bindings.yml lives
+  # in config/ (tests/test_pages_bindings.py pins that).
+  website-functions-typecheck:
+    needs: changes
+    if: needs.changes.outputs.website == 'true'  # #4311: website/functions/** + tools/ts/ (the tsc project)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tools/ts/package-lock.json
+      # `npm ci` is lockfile-pinned: the exact TypeScript and workers-types
+      # revisions are a REVIEWED artifact, so the strictness of this gate cannot
+      # drift without a diff (the same pinning rule as the wrangler/ruff pins).
+      - name: Install the pinned TypeScript toolchain
+        run: |
+          cd tools/ts
+          npm ci --no-audit --no-fund
+      # No `--noEmit` flag here: it is a compilerOption in the project
+      # (`noEmit: true`), and the project's `include` is the whole Functions
+      # tree — an empty match is a hard tsc error, never a silent pass.
+      - name: Typecheck website/functions (strict, Workers globals)
+        run: |
+          cd tools/ts
+          ./node_modules/.bin/tsc -p tsconfig.website-functions.json
+
   welcome-e2e:
     needs: changes
     if: needs.changes.outputs.website == 'true'  # #2149: website/ (minus dashboard app) + welcome/edge-fn tests
     runs-on: ubuntu-latest
+    # #8379 (finding 2): the `website` gate above also names
+    # `docs/blog-authoring.md`. The doc is an INPUT to the
+    # `tests/test_blog_markdown.mjs` step below — the harness reads it and
+    # executes every documented `[[video: …]]` example through the real
+    # renderer. Without that path entry a docs-only edit to the authoring
+    # contract ran the CommonMark/heading guard but NOT the leg that executes
+    # the examples, so a placeholder id that embeds nothing shipped green. The
+    # rationale lives HERE, not inside the gate script: that `run:` scalar
+    # carries no expression span, so GitHub does not compile it and the
+    # 21000-byte cap does not reach it (#8734).
     # Mocked welcome-page suite (#541) — secret-free per-PR coverage against
     # the LIVE page (Supabase calls mocked via Playwright routes). The #801
     # live signup smoke self-skips without SUPABASE secrets and runs in
@@ -1511,27 +1680,46 @@ jobs:
       # legal-e2e job) instead of the LIVE page — the strict-validity gates,
       # the provision-401 clear→/auth path and the waitForSession validity
       # check land in this PR and only exist in the deployed page AFTER merge.
-      # #2178 (review P1): pre-warm the npx + wrangler caches BEFORE the boot
-      # clock starts — a fresh runner's npx fetch was eating most of the 120s
-      # boot budget (empty /tmp/wrangler.log = cold npx install never finished).
-      - name: Pre-warm wrangler toolchain
+      # The boot below runs the binary this step verified (#8816): the version
+      # comes from config/wrangler-version and is asserted against what npm
+      # resolved, before the boot clock starts (#2178: a cold fetch used to eat
+      # the readiness budget).
+      - name: Install and verify the wrangler toolchain (#8816)
         run: |
-          npx --yes wrangler@4 --version
-          npx --yes wrangler@4 pages dev --help >/dev/null
-      # #3501: the auth suites resolve wrangler via `shutil.which("wrangler")`
-      # and FAIL (not skip) when it is missing — `require_toolchain()` calls
-      # `pytest.fail()`, so a missing toolchain reds this job instead of
-      # reporting a green step that asserted nothing. An earlier draft of that
-      # helper SKIPPED, which is exactly the silent no-op this step exists to
-      # prevent: PATH had no wrangler, so the suite reported "33 skipped", exit
-      # 0, and asserted nothing. Verified with a wrangler-less PATH. Skipping is
-      # still reachable, but only via an explicit `AUTH_ALLOW_NO_TOOLCHAIN=1`
-      # opt-in that no workflow sets.
-      #
-      # The npx pre-warm above does NOT put wrangler on PATH; this does. Removing
-      # this step reds welcome-e2e — it is load-bearing, not belt-and-braces.
-      - name: Install wrangler on PATH (required by the #3501 auth suites)
-        run: npm install -g wrangler@4.127.0
+          # ONE source for the version: config/wrangler-version, read here and
+          # nowhere else in this file. The value is ASSERTED against what npm
+          # actually resolved: this step installs GLOBALLY, so a declared "4" is
+          # resolved against the REGISTRY to the highest 4.x (4.151.1) and fails
+          # that comparison whatever the npm cache holds — a global range install
+          # is a registry resolution, not a local node_modules lookup. `:?`
+          # refuses an empty value before it can float to latest. The TEXT arms
+          # in the guard stop a float being WRITTEN; this assertion is the
+          # runtime backstop on the binary the lane boots. The boot steps below
+          # then run bare `wrangler` — no spec at the call site, so nothing drifts.
+          #
+          # This replaces the best-effort pre-warm (#2178/#8744): an assertion
+          # needs a resolved binary, so the last of the three attempts is hard.
+          # The readiness loop no longer has to absorb a cold fetch, so its
+          # 240s budget is a readiness budget again.
+          WRANGLER_VERSION="$(cat config/wrangler-version)"
+          : "${WRANGLER_VERSION:?config/wrangler-version is empty}"
+          for attempt in 1 2 3; do
+            if npm install -g "wrangler@${WRANGLER_VERSION:?}"; then
+              got="$(wrangler --version | tr -d '[:space:]')"
+              if [ "$got" = "$WRANGLER_VERSION" ]; then
+                echo "wrangler ${got} installed and verified"
+                exit 0
+              fi
+              # A mismatch is not transient: retrying would install the same
+              # wrong version. Fail now, loudly, with both values.
+              echo "::error::resolved wrangler ${got} != declared ${WRANGLER_VERSION}"
+              exit 1
+            fi
+            echo "wrangler install attempt ${attempt}/3 failed - retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not install wrangler ${WRANGLER_VERSION} after 3 attempts"
+          exit 1
       # #4054: the auth suites serve the dashboard's BUILT `dist/` root
       # (tests/e2e/auth/conftest.py -> ensure_dashboard_dist()). Without a
       # lockfile-pinned install here, that helper's `npm run build` has no local
@@ -1549,7 +1737,7 @@ jobs:
         run: |
           cd website
           for attempt in 1 2; do
-            npx --yes wrangler@4.127.0 pages dev . --port 8788 --ip 127.0.0.1 \
+            wrangler pages dev . --port 8788 --ip 127.0.0.1 \
               --compatibility-date=2024-09-23 \
               > /tmp/wrangler.log 2>&1 &
             echo $! > /tmp/wrangler.pid
@@ -1581,10 +1769,24 @@ jobs:
           cat /tmp/wrangler.log || true
           echo "--- /tmp/wrangler.pid: $(cat /tmp/wrangler.pid 2>/dev/null || echo missing) ---"
           exit 1
-      - name: Run welcome page E2E (mocked against the local preview) (#373/#1511)
+      # #8826: `/welcome` is not served by this Pages root, so no
+      # `wrangler pages dev` preview can exercise it. On every host this project
+      # serves, `website/_redirects` 301s `/welcome`, `/welcome/` and
+      # `/welcome.html` to the app origin (and on premiselabs.co the middleware's
+      # APP_ONLY branch does the same), and `website/welcome.html` does not exist
+      # here — the page lives in the dashboard Pages project.
+      - name: Run welcome page E2E (loopback WELCOME_URL; /welcome 301s to the app origin) (#373/#1511)
         run: python -m pytest tests/e2e/test_welcome_page.py -q -rs -p no:cacheprovider
         env:
           WELCOME_URL: http://127.0.0.1:8788/welcome
+          # #4932: this job must NOT grade a branch against PRODUCTION's copy of
+          # the onboarding document. ONBOARDING_SKILL_URL is deliberately left
+          # unset, so before this flag the per-PR run fetched the deployed
+          # artifact on every PR — passing while the PR's own copy was broken,
+          # and redding a PR for whatever happened to be deployed. The
+          # deployed-artifact contract belongs to welcome-e2e-monitor.yml
+          # (scheduled + on-merge, which runs this same file against prod).
+          WELCOME_E2E_PER_PR: "1"
           # Epic #1647 Task 10 (P4): this job runs pytest URI-less BY DESIGN
           # (the e2e surface needs no FalkorDB server) — the URI-required
           # enforcement opt-in.
@@ -1624,10 +1826,18 @@ jobs:
           AUTH_CLICKTHROUGH: "1"
       - name: Run waitlist edge-function behavioral harness (#373)
         run: node --experimental-strip-types tests/test_waitlist_subscribe.mjs
+      - name: Run deck-view edge-function behavioral harness (#8732)
+        # The only enforcement of "a view never touches the mailing list": the
+        # gate writes deck_views, and joining the list stays a separate act.
+        run: node --experimental-strip-types tests/test_deck_view.mjs
       - name: Run tenant-provision CORS runtime harness (#1110)
         run: node --experimental-strip-types tests/test_tenant_provision_cors.mjs
       - name: Run blog SSR markdown renderer harness (#4481)
+        # Also executes every documented example in docs/blog-authoring.md
+        # (#8379 finding 2) — a docs-only edit must reach this step.
         run: node --experimental-strip-types tests/test_blog_markdown.mjs
+      - name: Run blog SEO meta + agent-limiter harness (#8293)
+        run: node --experimental-strip-types tests/test_blog_seo_meta.mjs
 
   legal-e2e:
     runs-on: ubuntu-latest
@@ -1654,32 +1864,63 @@ jobs:
       # tortoise/__init__) + the e2e test extras (playwright, pytest-playwright).
       - run: pip install -e '.[test]'
       - run: python -m playwright install --with-deps chromium
-      # #2178 (review P1): pre-warm the npx + wrangler caches BEFORE the boot
-      # clock starts — a fresh runner's npx fetch was eating most of the 120s
-      # boot budget (empty /tmp/wrangler.log = cold npx install never finished;
-      # #2211 hit this 4x in a row 2026-09-04). --version is fast; the
-      # readiness loop below retries twice at 240s each.
-      - name: Pre-warm wrangler toolchain
+      # The boot below runs the binary this step verified (#8816): the version
+      # comes from config/wrangler-version and is asserted against what npm
+      # resolved, before the boot clock starts (#2178: a cold fetch used to eat
+      # the readiness budget; #8744: a pre-warm that floated fetched a DIFFERENT
+      # wrangler than the boot used).
+      - name: Install and verify the wrangler toolchain (#8816)
         run: |
-          npx --yes wrangler@4 --version
-          npx --yes wrangler@4 pages dev --help >/dev/null
+          # ONE source for the version: config/wrangler-version, read here and
+          # nowhere else in this file. The value is ASSERTED against what npm
+          # actually resolved: this step installs GLOBALLY, so a declared "4" is
+          # resolved against the REGISTRY to the highest 4.x (4.151.1) and fails
+          # that comparison whatever the npm cache holds — a global range install
+          # is a registry resolution, not a local node_modules lookup. `:?`
+          # refuses an empty value before it can float to latest. The TEXT arms
+          # in the guard stop a float being WRITTEN; this assertion is the
+          # runtime backstop on the binary the lane boots. The boot steps below
+          # then run bare `wrangler` — no spec at the call site, so nothing drifts.
+          #
+          # This replaces the best-effort pre-warm (#2178/#8744): an assertion
+          # needs a resolved binary, so the last of the three attempts is hard.
+          # The readiness loop no longer has to absorb a cold fetch, so its
+          # 240s budget is a readiness budget again.
+          WRANGLER_VERSION="$(cat config/wrangler-version)"
+          : "${WRANGLER_VERSION:?config/wrangler-version is empty}"
+          for attempt in 1 2 3; do
+            if npm install -g "wrangler@${WRANGLER_VERSION:?}"; then
+              got="$(wrangler --version | tr -d '[:space:]')"
+              if [ "$got" = "$WRANGLER_VERSION" ]; then
+                echo "wrangler ${got} installed and verified"
+                exit 0
+              fi
+              # A mismatch is not transient: retrying would install the same
+              # wrong version. Fail now, loudly, with both values.
+              echo "::error::resolved wrangler ${got} != declared ${WRANGLER_VERSION}"
+              exit 1
+            fi
+            echo "wrangler install attempt ${attempt}/3 failed - retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not install wrangler ${WRANGLER_VERSION} after 3 attempts"
+          exit 1
       - name: Start wrangler pages dev preview (website/ = Pages root)
         run: |
           cd website
-          # wrangler pinned to 4.127.0 (@4 floats to latest each run — same
-          # drift class as the ruff pin, agent-infra#414). 2026-09-04 ~04:00Z
-          # a runner-fleet cold-npx stall broke this boot on EVERY PR (the
-          # #2178/#2211 hardening class): /tmp/wrangler.log stayed EMPTY — the
-          # cold npx install never finished inside the 120s budget. 4.127.0 is
-          # the version verified to start (macOS in 5s, cold linux ~90s); the
-          # retry's 2nd attempt reuses the warm npm cache.
+          # The binary is the one the install step above verified against
+          # config/wrangler-version (#8816) — no spec here, so nothing can drift.
+          # 2026-09-04 ~04:00Z a runner-fleet cold-npx stall broke this boot on
+          # EVERY PR (#2178/#2211): /tmp/wrangler.log stayed EMPTY because a cold
+          # install never finished inside the readiness budget. That fetch now
+          # happens before the clock starts, and a failure to get it reds loudly.
           #
           # --compatibility-date pinned: wrangler defaults to "today", but the
           # bundled workerd lags a day behind (max date < today) → dev server
           # fails to start. Any stable date ≤ workerd's max works; the
           # middleware uses only stable APIs (next()/ASSETS.fetch).
           for attempt in 1 2; do
-            npx --yes wrangler@4.127.0 pages dev . --port 8788 --ip 127.0.0.1 \
+            wrangler pages dev . --port 8788 --ip 127.0.0.1 \
               --compatibility-date=2024-09-23 \
               > /tmp/wrangler.log 2>&1 &
             echo $! > /tmp/wrangler.pid
@@ -1731,7 +1972,7 @@ jobs:
           # `sessions` table. Without the binding a request carrying a cookie
           # answers 503 ("store unreachable") instead of 401/200.
           for attempt in 1 2; do
-            npx --yes wrangler@4.127.0 pages dev dist --port 8790 --ip 127.0.0.1 \
+            wrangler pages dev dist --port 8790 --ip 127.0.0.1 \
               --compatibility-date=2024-09-23 --d1 SESSIONS \
               > /tmp/wrangler-app.log 2>&1 &
             echo $! > /tmp/wrangler-app.pid
@@ -1822,19 +2063,52 @@ jobs:
           cd website/apps/dashboard
           npm ci
           npm run build
-      # #2178 (review P1): pre-warm the npx + wrangler caches BEFORE the boot
-      # clock starts — a fresh runner's npx fetch was eating most of the 120s
-      # boot budget (first CI run died here with an empty log). --version is
-      # fast; the readiness loops below now retry twice at 240s each.
-      - name: Pre-warm wrangler toolchain
+      # The boot below runs the binary this step verified (#8816): the version
+      # comes from config/wrangler-version and is asserted against what npm
+      # resolved, before the boot clock starts (#2178: a cold fetch used to eat
+      # the readiness budget).
+      - name: Install and verify the wrangler toolchain (#8816)
         run: |
-          npx --yes wrangler@4 --version
-          npx --yes wrangler@4 pages dev --help >/dev/null
+          # ONE source for the version: config/wrangler-version, read here and
+          # nowhere else in this file. The value is ASSERTED against what npm
+          # actually resolved: this step installs GLOBALLY, so a declared "4" is
+          # resolved against the REGISTRY to the highest 4.x (4.151.1) and fails
+          # that comparison whatever the npm cache holds — a global range install
+          # is a registry resolution, not a local node_modules lookup. `:?`
+          # refuses an empty value before it can float to latest. The TEXT arms
+          # in the guard stop a float being WRITTEN; this assertion is the
+          # runtime backstop on the binary the lane boots. The boot steps below
+          # then run bare `wrangler` — no spec at the call site, so nothing drifts.
+          #
+          # This replaces the best-effort pre-warm (#2178/#8744): an assertion
+          # needs a resolved binary, so the last of the three attempts is hard.
+          # The readiness loop no longer has to absorb a cold fetch, so its
+          # 240s budget is a readiness budget again.
+          WRANGLER_VERSION="$(cat config/wrangler-version)"
+          : "${WRANGLER_VERSION:?config/wrangler-version is empty}"
+          for attempt in 1 2 3; do
+            if npm install -g "wrangler@${WRANGLER_VERSION:?}"; then
+              got="$(wrangler --version | tr -d '[:space:]')"
+              if [ "$got" = "$WRANGLER_VERSION" ]; then
+                echo "wrangler ${got} installed and verified"
+                exit 0
+              fi
+              # A mismatch is not transient: retrying would install the same
+              # wrong version. Fail now, loudly, with both values.
+              echo "::error::resolved wrangler ${got} != declared ${WRANGLER_VERSION}"
+              exit 1
+            fi
+            echo "wrangler install attempt ${attempt}/3 failed - retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not install wrangler ${WRANGLER_VERSION} after 3 attempts"
+          exit 1
       - name: Start wrangler pages dev preview (website/ = auth origin, :8788)
         run: |
           cd website
           for attempt in 1 2; do
-            npx --yes wrangler@4 pages dev . --port 8788 --ip 127.0.0.1 \
+            # No spec: this is the binary the install step verified (#8816).
+            wrangler pages dev . --port 8788 --ip 127.0.0.1 \
               --compatibility-date=2024-09-23 \
               > /tmp/wrangler-auth.log 2>&1 &
             echo $! > /tmp/wrangler-auth.pid
@@ -1864,7 +2138,7 @@ jobs:
             # unreachable") instead of 200, so the suite's seeded-session
             # fixtures can never render the shell. The harness seeds the row it
             # reads (tests/e2e/test_session_login_flow.py).
-            npx --yes wrangler@4 pages dev dist --port 8790 --ip 127.0.0.1 \
+            wrangler pages dev dist --port 8790 --ip 127.0.0.1 \
               --compatibility-date=2024-09-23 --d1 SESSIONS \
               > /tmp/wrangler-dash.log 2>&1 &
             echo $! > /tmp/wrangler-dash.pid
@@ -1890,9 +2164,12 @@ jobs:
       # others are NOT wired because they are stale against the #3501 BFF
       # session seam and the #4054 auth-origin move — wiring them would turn
       # this job red on every run. Evidence and the follow-up are on #4221.
-      #   test_dashboard_identity.py    — 21/22 fail (seeds the retired
-      #                                   `sb-tortoise-auth-token`; mocks only
-      #                                   the legacy absolute api host)
+      # #2809: test_dashboard_identity.py HAS been migrated (BFF session seed,
+      # app-origin API mocks, prod-origin subresources proxied to the local
+      # previews) and is wired below — it spawns its OWN Supabase-bound preview
+      # on a pair of runtime-picked ports, because its assertions are about the
+      # DECORATED profile (`/api/session` → `/auth/v1/user`) and a preview with
+      # no `SUPABASE_URL` renders the org-name fallback instead. 22/22 pass.
       #   test_dashboard_gate.py        — 15/19 fail (asserts the pre-#4054
       #                                   prod-origin /auth redirect target)
       #   test_dashboard_billing.py     — 4/4 fail (drives the moved /auth page
@@ -1900,11 +2177,12 @@ jobs:
       #   test_session_login_flow.py    — 3/3 fail (same class); the module
       #                                   itself is the shared harness, so it
       #                                   stays in the change detector above
-      - name: Run dashboard e2e — keys-table (#2166/#2178), graphs, ship-test guard (#3806), onboarding (#4221)
+      - name: Run dashboard e2e — keys-table (#2166/#2178), graphs, ship-test guard (#3806), onboarding (#4221), identity (#2809)
         run: >
           RUN_DASHBOARD_E2E=1
           python -m pytest tests/e2e/test_keys_table_mixed.py tests/e2e/test_graphs_management.py
           tests/e2e/test_ship_test_onboarding.py tests/e2e/test_dashboard_onboarding.py
+          tests/e2e/test_dashboard_identity.py
           -q -rs -p no:cacheprovider
         env:
           # Epic #1647 Task 10 (P4): URI-less e2e surface — the URI-required
@@ -1919,6 +2197,11 @@ jobs:
           kill $(cat /tmp/wrangler-dash.pid) 2>/dev/null || true
           pkill -f 'wrangler.*8788' 2>/dev/null || true
           pkill -f 'wrangler.*8790' 2>/dev/null || true
+          # #2809: the identity spec spawns its OWN preview on a runtime-picked
+          # port, so the port patterns above cannot match it — kill by the
+          # command shape it uses. This is the hard-kill/timeout backstop; the
+          # spec's own `finally` covers the normal path.
+          pkill -f 'wrangler pages dev' 2>/dev/null || true
           pkill workerd 2>/dev/null || true
           true
 

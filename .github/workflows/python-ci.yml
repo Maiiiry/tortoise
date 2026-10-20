@@ -469,6 +469,71 @@ jobs:
         # check. Exit 2 = could not measure, which is NOT a pass.
         run: python3 .github/scripts/check-required-set.py
 
+      - name: "Harness single source — operations/orchestrator-harness/ is a POINTER (#8246)"
+        # `operations/orchestrator-harness/` was retired to a pointer at
+        # agent-infra/scripts/orchestrator-harness/ (see its README). Measured 2026-10-19, before
+        # consolidation, the SAME eight files existed in three copies that had all diverged — this
+        # repo's was behind on five and AHEAD on `lane.sh`, and every fix had to be hand-applied in
+        # 3-4 places.
+        #
+        # ⛔ ENFORCED HERE, NOT IN A WORKFLOW OF ITS OWN (review finding — the fail-open). The guard
+        # used to live in `.github/workflows/harness-single-source.yml`, which was wrong on two
+        # counts: (1) a PATH-SCOPED workflow can never be a required context — it does not run at
+        # all on a PR that touches none of its paths, so a `check-success=` gate on it would block
+        # every unrelated merge, which is why it was in neither branch protection nor `.mergify.yml`
+        # and a red on it blocked nothing; and (2) a new workflow also moves
+        # `tools/mergify_config_guard.py`'s gate digest for no enforcement gain. Hosted in THIS job
+        # for the same reason the required-set sync above is: it is a cheap, unconditional,
+        # fail-closed assertion about repo state whose red must block a merge, and it rides the
+        # aggregate (`python-ci-gate`) that is already required. No branch-protection change, no new
+        # required context, no new workflow.
+        #
+        # The NON-VACUITY arms are not decoration: a guard nobody has seen fire is indistinguishable
+        # from a guard that cannot fire, and this one had a real fail-open (a failed `git ls-files`
+        # read as an empty directory and printed "ok"). Each arm below exits 2 today if the guard
+        # regresses to its pre-fix behaviour, so the arms are pinned from both sides.
+        run: |
+          set -euo pipefail
+          # 1) The intended state.
+          bash tools/check-harness-fork.sh operations/orchestrator-harness
+
+          # 2) A planted script is REFUSED (1).
+          printf '#!/bin/sh\n' > operations/orchestrator-harness/lane.sh
+          rc=0
+          bash tools/check-harness-fork.sh operations/orchestrator-harness || rc=$?
+          rm -f operations/orchestrator-harness/lane.sh
+          [ "$rc" -eq 1 ] || { echo "FAIL: a reappearing harness script must exit 1, got $rc"; exit 1; }
+
+          # 3) A missing pointer directory is UNKNOWN (2), not a pass.
+          rc=0
+          bash tools/check-harness-fork.sh /nonexistent-retired-path || rc=$?
+          [ "$rc" -eq 2 ] || { echo "FAIL: an uncheckable location must exit 2, got $rc"; exit 1; }
+
+          # 4) AN UNREADABLE INDEX IS UNKNOWN (2), NOT AN EMPTY DIRECTORY. This is the fail-open the
+          #    review reproduced: `git ls-files … 2>/dev/null` with the exit status ignored printed
+          #    "ok: … a pointer, not a copy" and exited 0 over a directory full of harness scripts.
+          printf 'garbage' > /tmp/harness-guard-index
+          rc=0
+          GIT_INDEX_FILE=/tmp/harness-guard-index bash tools/check-harness-fork.sh \
+            operations/orchestrator-harness || rc=$?
+          [ "$rc" -eq 2 ] || { echo "FAIL: a broken index must exit 2 (never a pass), got $rc"; exit 1; }
+
+          # 5) NON-CANONICAL SPELLINGS of the same CLEAN directory must not read as a fork. Each of
+          #    these exited 1 before the normalisation, naming the deliberately allowed
+          #    `merge-one.sh` as a fork — a false block an operator typing a trailing slash would hit.
+          for d in ./operations/orchestrator-harness operations/orchestrator-harness/ \
+                   "$PWD/operations/orchestrator-harness"; do
+            rc=0
+            bash tools/check-harness-fork.sh "$d" || rc=$?
+            [ "$rc" -eq 0 ] || { echo "FAIL: '$d' is the clean pointer but exited $rc"; exit 1; }
+          done
+
+          # 6) The pointer still names a LIVE location, so a rename of the canonical path is caught
+          #    here instead of by a confused operator. Not a content comparison — tortoise CI has no
+          #    business cloning agent-infra on every PR.
+          grep -q 'agent-infra.*scripts/orchestrator-harness' operations/orchestrator-harness/README.md \
+            || { echo "FAIL: the pointer no longer names agent-infra/scripts/orchestrator-harness/"; exit 1; }
+
   test:
     # #880: split into parallel shards (matrix). #6135: the COUNT is
     # `config/ci-surfaces.yml::fast_shards` and the shape is the selector's
@@ -1401,7 +1466,58 @@ jobs:
     # config-only PRs (surfaces == [] -> slow_run == false) skip the whole
     # job — the tier-1 smoke in the `test` job still runs.
     if: needs.changes.outputs.slow_run == 'true'
-    runs-on: ubuntu-latest
+    # ⛔ VERSION-PINNED HOSTED LABEL, NOT `ubuntu-latest` (measured 2026-10-19).
+    #
+    # `ubuntu-latest` is NOT "GitHub-hosted" on this repo: `scripts/ci_runner_gate.sh`
+    # re-attaches `ubuntu-latest` to the self-hosted ARM64 pool (`pi-runner-vm-*`)
+    # as a FALLBACK whenever GitHub-hosted looks unhealthy, so the same
+    # `runs-on: ubuntu-latest` resolves to a ~2x slower class, run to run.
+    #
+    # MEASURED, run 39309984832 (main, 2026-10-19T19:19Z): `test-slow (a)` won the
+    # race for `pi-runner-vm-2`, executed **39.6 min of test time** (1561 testcases
+    # in its own junit artifact) and was STILL RUNNING when its 40m in-step watchdog
+    # fired (`rc=137`, "WATCHDOG: pytest killed after 40m"). The job then read 42.1m
+    # and concluded `failure`, so this leg's wall became main's critical path
+    # (`ci_crit_med`/`ci_crit_max` = 42.1m, up from 22.6m) and the REQUIRED
+    # `python-ci-gate` went red naming this leg. The same leg finishes in ~21-22m on
+    # a hosted runner — which is what the committed 18.9m leg weight and the 40m
+    # budget were measured against.
+    # ⚠️ What this pin does NOT claim: that run was ALSO red for real, independent
+    # reasons — three fast shards on GITHUB-HOSTED runners (test (c), test (a),
+    # test (e)) failed in the pytest step with genuine FAILED nodeids (exit code 1,
+    # 8-11 min, well inside their budgets), and this leg's own partial junit records
+    # 1 failure. The pin removes THIS leg's kill and the critical-path inflation it
+    # caused; it does not turn that run green.
+    #
+    # Why ROUTING and not a raised timeout: the 40m budget is 2.11x the leg's
+    # committed weight, i.e. already at the `WATCHDOG_HEADROOM` policy floor (2.0x).
+    # Sizing it for the pool instead would need >=79m (2 x 39.6m), past
+    # `WATCHDOG_CEILING_MIN` (55m) and past this job's own 60m outer cap — and a
+    # budget built for the slowest class would also let a genuinely hung HOSTED leg
+    # hold the REQUIRED aggregate red for 55m, the regression #6135/#6145 exists to
+    # prevent. This leg cannot be carried by the pool inside the policy, so it must
+    # not be schedulable onto it.
+    #
+    # `ubuntu-24.04` is claimed by NO self-hosted runner (the pool carries
+    # `self-hosted,Linux,ARM64,self-hosted-arm64` plus, only while the fallback is
+    # attached, `ubuntu-latest`) — the same pin, and the same reasoning, as
+    # `workflow-lint` (#7867) and finding-provenance.
+    # Cost when GitHub-hosted is healthy: none — the pool only wins these jobs while
+    # the fallback label is attached. During a real GitHub-hosted outage these two
+    # legs WAIT for a hosted runner (the aggregate stays pending — "not answered
+    # yet") instead of being killed into a false red on the class that cannot finish
+    # them, while the fast matrix keeps using the pool.
+    #
+    # ⚠️ NAMED RESIDUAL (not fixed here): the fast matrix (`test (a)`…`test (i)`) is
+    # still `ubuntu-latest`, so the pool can still take it. Its per-shard margin is
+    # thinner than this leg's, not safer: a 9.72m committed estimate against a 20m
+    # budget, and the pool consumed 17.3m and 19.9m of JOB wall on shards (c) and (e)
+    # in the two other main runs measured that evening (39327442614, 39304878787) —
+    # ~78% and ~91% of the 20m pytest budget after ~1.7m of setup. Pinning the whole matrix would remove the fallback the gate exists for,
+    # which is a capacity decision, not a CI-hygiene one; the measurement is filed on
+    # #6897 instead.
+    # Do NOT change it back to `ubuntu-latest`, and never to `self-hosted`.
+    runs-on: ubuntu-24.04
     # #1471: two parallel duration-balanced legs (matrix), mirroring the `test`
     # job's #880 pattern. Serial pytest was 37:44 (run 32241846147, 2026-08-19)
     # — the true critical path of every main push (last python-ci job to
@@ -1436,23 +1552,36 @@ jobs:
           #      hand-maintained artifact. The old a/b lists were balanced when
           #      written (#4711) and were never rechecked.
           #
-          # #5285 re-cut the two rows TWICE: once when its fail-loud suite
-          # entered `slow_files`, and again when that suite's weight was
-          # corrected from 709.0 to 45.0 (709 came from a load-contaminated
-          # measurement — see its `durations` note). They are the LPT legs of
-          # `slow_files - carve_out` on the committed `durations` map — 31 and
-          # 31 files at 14.192 / 14.188 min; each row is a partition of the set,
-          # re-derivable with
-          # `split_fast_gate(sorted(slow_files - carve_out), durations, 2)`.
-          # (The first cut packed 43 files / 16.21m; eight dual-registered
-          # files returned to the fast pool — a second surface's diff would
-          # otherwise run them on NEITHER leg — so #6137 re-cut them to
-          # 13.82m. See config/ci-surfaces.yml's `slow_files` exclusions.)
+          # #9017 re-cut both rows from the CI's OWN per-test junit (2026-10-18,
+          # run 39165691659): the committed map had rotted — 28 of the 64 leg
+          # files of that measurement (29 of today's 65) carried an `# unmeasured`
+          # placeholder — so a first pass re-measured
+          # locally and got the wrong answer, because this repo's host runs a
+          # fleet and local CPU seconds inflate non-uniformly under that load
+          # (`test_index_cli` measured 338s of local CPU for 25s of CI time).
+          # The junit column is authoritative and is what the rows now carry. The
+          # full method and the per-file numbers are in config/ci-surfaces.yml, in
+          # the #9017 block before `slow_files:`.
+          # WHAT IT BOUGHT, stated as the measurement rather than the hope: the
+          # legs this replaces measure 17.06m / 20.82m on the same junit, so the
+          # re-cut takes the critical leg 20.82m -> 18.95m (-1.88m, -9.0%); the pair
+          # that stood BEFORE #9035 was 17.98m / 19.90m, i.e. -4.8% against that.
+          # The ceiling is arithmetic: a perfect split of the 37.88m pool is
+          # 18.94m, and the pre#9017 split was already within 0.97m of it — so the
+          # remaining lever is the POOL, not the cut.
+          # These are the LPT legs of `slow_files - carve_out` on the committed
+          # `durations` map — 33 and 32 files at 18.945m / 18.933m; each row is a
+          # partition of the set. RECOMPUTE them from `durations` before quoting
+          # them: they rot on every re-cut, and this comment has now been wrong
+          # twice for that reason. (History, condensed: the first cut packed 43
+          # files / 16.21m, eight dual-registered files returned to the fast pool
+          # so #6137 re-cut them to 13.82m, #5285 re-cut twice around its
+          # fail-loud suite, #2125 added `test_framework_middleware`.)
           # The in-step watchdog below is sized from the heavier leg
           # (`test_slow_leg_bounds_clear_the_committed_work` pins it), because
           # a leg that outruns its watchdog is killed mid-suite and reports a
           # red — the trap the #3239 budget was written for when these legs'
-          # committed weight was 2.84 min rather than the 14.19 min it is now.
+          # committed weight was 2.84 min rather than the 18.95 min it is now.
           #
           # That drift is why these lists should be COMPUTED, not committed —
           # `push_legs()` already LPT-packs the fast halves from `durations`.
@@ -1462,34 +1591,31 @@ jobs:
           # legs is #6137's design decision and is not pre-empted here.
           - half: a
             files: >-
-              eval/harness/test_harness_benchmark eval/retrieval/test_run
-              test_about_edges test_battery_r1_seed test_battery_setup
-              test_ci_selection test_client_surface
-              test_consistency_divergence_5011 test_control_plane test_dream
-              test_embedded_evidence test_ep_selector test_ep_sources
-              test_epic903_fixtures test_epic903_scheduler
-              test_epic903_warmstart test_graph_diagnostics
+              test_surface_manifest test_hosted_api test_capture_session
+              test_platform_seams eval/why_suite/test_why_suite_benchmark
+              eval/harness/test_harness_benchmark test_commit_endpoint
+              test_relationships_bounded test_skip_guard test_embedded_evidence
+              test_epic903_scheduler test_mcp_http eval/retrieval/test_gate_1349
+              test_ingest_v2_consolidation test_import_endpoint test_ep_selector
+              test_extractor_v2 test_abuse_integration test_hosted_volunteer_context
+              test_projection test_ep_sources test_ingest_mode test_event_provenance
+              test_cli_context test_control_plane test_write_verb test_ingest_validation
+              test_about_edges test_enumeration_surfaces test_framework_middleware
+              test_operator_idempotency_4971 test_indexes
               test_graphcopy_boolean_index_3154
-              test_hosted_volunteer_context test_import_endpoint test_indexes
-              test_ingest test_ingest_v2_consolidation test_ingest_validation
-              test_platform_seams test_projection test_sdk_group3
-              test_skip_guard test_source_inheritance_own
-              test_unjournaled_mutation_class test_write_verb
           - half: b
             files: >-
-              eval/retrieval/test_gate_1349
-              eval/why_suite/test_why_suite_benchmark
-              eval/write_path/test_write_path_runner test_abuse_integration
-              test_backfill_sources test_billing test_capture_session
-              test_cli_context test_commit_endpoint test_dr_endpoints
-              test_enumeration_surfaces test_epic903_modes
-              test_event_provenance test_extractor_v2 test_hosted_api
-              test_index_cli test_index_directory test_ingest_bundle
-              test_ingest_mode test_markers test_mcp_http
-              test_mcp_route_challenge test_monitoring test_oauth_mcp
-              test_operator_idempotency_4971 test_pack_shipping_wheel
-              test_rebuild_parity_fail_loud_3585 test_relationships_bounded
-              test_sdk test_search_engine_gaps test_surface_manifest
+              test_ci_selection test_battery_setup eval/write_path/test_write_path_runner
+              test_source_inheritance_own eval/retrieval/test_run test_epic903_warmstart
+              test_pack_shipping_wheel test_monitoring test_battery_r1_seed test_billing
+              test_dr_endpoints test_epic903_modes test_graph_diagnostics
+              test_epic903_fixtures test_index_cli test_sdk test_index_directory
+              test_client_surface test_ingest_bundle test_oauth_mcp
+              test_rebuild_parity_fail_loud_3585 test_consistency_divergence_5011
+              test_dream test_markers test_ingest test_expand_relationships_6976
+              test_unjournaled_mutation_class test_sdk_group3 test_search_engine_gaps
+              test_3311_multilabel_status_vocab test_mcp_route_challenge
+              test_backfill_sources
     name: test-slow (${{ matrix.half }})
     # #3239: OUTER cap, strictly above the in-step watchdog below — that kill
     # is the one that PRINTS the pass/fail counts (#798); a runner-level cap
@@ -1498,10 +1624,14 @@ jobs:
     # 16.21m (13.82m after the eight dual-registered files returned to the
     # fast pool), so
     # the #3239 literal budget no longer cleared the work: #6137 raised the
-    # watchdog to 35m (2.53x the 13.82m heavier leg) and this cap to 40m (2.90x).
+    # watchdog to 35m (2.53x the 13.82m heavier leg) and this cap to 60m.
     # #5285 then added the fail-loud rebuild suite to `slow_files` and re-cut
-    # BOTH rows by LPT off the committed map — balanced at 14.192m / 14.188m, so
-    # the watchdog holds at 40m (2.82x the heavier leg) against a 28.38m floor.
+    # BOTH rows by LPT off the committed map; #2125 added
+    # `test_framework_middleware` to leg a. #9017 re-cut both rows again from a
+    # MEASURED map: the rows now carry 18.95m / 18.93m (CI junit), so the watchdog
+    # holds at 40m (2.11x the heavier leg) against a 37.89m floor. The literals did NOT move
+    # with the re-cut — 40m already cleared the measured heavier leg — which is
+    # the guard working, not a coincidence to rely on.
     #
     # #798 is an ORDER constraint, not just a magnitude: the in-step watchdog is
     # started INSIDE the job, after the off-watchdog pre-phase, while this cap is
@@ -1762,11 +1892,13 @@ jobs:
           # tests/test_ci_selection.py::test_test_slow_job_carries_junitxml_manifest_guard).
           # #3239: the in-step watchdog must CLEAR the leg's committed weight
           # by tools/ci_selection.WATCHDOG_HEADROOM — the same floor the fast
-          # shards derive their budget from. The heavier leg carries 14.192m
-          # (#5285 re-cut both rows when the fail-loud suite entered
-          # `slow_files`, then again when its weight was corrected) and this
-          # literal is 40m, i.e. 2.82x the 2.0x minimum
-          # the headroom floor requires (28.38m); it was 10m
+          # shards derive their budget from. The heavier leg carries 18.95m
+          # (#9017 re-cut both rows from the CI junit — see
+          # config/ci-surfaces.yml's #9017 block; the rows before it carried
+          # 14.808m / 14.443m off a stale map, and the legs that map produced
+          # measure 17.98m / 19.90m against CI's own per-test junit) and this
+          # literal is 40m, i.e. 2.11x the 2.0x minimum
+          # the headroom floor requires (37.89m); it was 10m
           # when the legs' committed weight was 2.84m (the measured pytest step
           # was 4.70m, which does not enter the headroom arithmetic). Re-deriving
           # the budget when the leg set moves is
@@ -2031,6 +2163,7 @@ jobs:
           set +e
           timeout -s INT -k 10 10m stdbuf -oL python -m pytest \
             tests/test_event_store.py::test_seq_is_monotonic_under_concurrency_live_falkor \
+            tests/test_event_store.py::test_next_seq_ceiling_is_atomic_across_workers_live_falkor \
             tests/test_embedded_concurrency.py::test_concurrent_writers_live_falkor_no_lost_writes \
             -v -rs --timeout=300 -p no:cacheprovider --maxfail=10 -rfE --durations=15 > /tmp/pytest.log 2>&1
           rc=$?
@@ -2056,7 +2189,7 @@ jobs:
           # Skip-fail guard: live tests must RUN here, never skip (vacuity).
           # Matches BOTH pytest output formats (-v progress: "nodeid SKIPPED";
           # -rs summary: "SKIPPED [N] tests/file.py:line").
-          if grep -E '(test_seq_is_monotonic_under_concurrency_live_falkor|test_concurrent_writers_live_falkor_no_lost_writes) SKIPPED|SKIPPED \[[0-9]+\] tests/(test_event_store|test_embedded_concurrency)\.py' /tmp/pytest.log; then
+          if grep -E '(test_seq_is_monotonic_under_concurrency_live_falkor|test_next_seq_ceiling_is_atomic_across_workers_live_falkor|test_concurrent_writers_live_falkor_no_lost_writes) SKIPPED|SKIPPED \[[0-9]+\] tests/(test_event_store|test_embedded_concurrency)\.py' /tmp/pytest.log; then
             echo "❌ live tests SKIPPED — the job would be green while testing nothing"
             rc=1
           fi
@@ -2766,8 +2899,15 @@ jobs:
         # goes back to naming tests).
         run: |
           set -eo pipefail
+          # #3470: the log is captured through `tee`, so this leg needs the SAME
+          # attribution every `tail -n` leg gets — without it a D14 leg killed at its
+          # 15m watchdog emits no INCOMPLETE marker and its unobservable failure set
+          # is indistinguishable from a clean leg, on a job `python-ci-gate` needs.
+          rc=0
           timeout -s INT -k 10 15m python -m pytest tests/ -m embedded_only \
-            -v --timeout=300 -p no:cacheprovider --junitxml=/tmp/junit-d14.xml -o junit_family=xunit1 2>&1 | tee /tmp/pytest-d14.log
+            -v --timeout=300 -p no:cacheprovider --junitxml=/tmp/junit-d14.xml -o junit_family=xunit1 2>&1 | tee /tmp/pytest-d14.log || rc=$?
+          bash .github/scripts/pytest-attribution.sh --log /tmp/pytest-d14.log --rc "$rc"
+          [ "$rc" -eq 0 ] || exit "$rc"
           # Fail-closed on a silent all-skip — the #2188 review P3-1 shape,
           # widened. The floor is 30 and the number is NOT arbitrary: the four
           # marked files that are ALREADY carve-out registered (precision_leak
@@ -2978,7 +3118,7 @@ jobs:
       # required `surface-guard` job would go green on a rewritten gate.
       #
       # PIN THE ENFORCEMENT, NOT THE GENERATOR. `tools/surface-guard.py` is the
-      # gate — it compares the declaration against the approved baseline, and it
+      # gate — it compares the declaration against the frozen baseline, and it
       # is SELF-CONTAINED (its own `_read_manifest`, deliberately independent of
       # `tools/surface_manifest.py`), so nothing in the PR's tree can influence
       # it. Pinning `tools/surface_manifest.py` as well looked symmetrical and was
@@ -3041,6 +3181,16 @@ jobs:
         run: |
           python3 tools/surface_manifest.py render
           git diff --exit-code -- docs/product/mcp-sdk-surface.md
+      # ── THE TARGET COMPLIANCE GAP, SURFACED BUT NOT GATING (#4185) ─────────
+      # The gap between the live surface (82/150) and the owner-approved target
+      # (26/40) is genuine, so a REQUIRED check would red `main` and block every
+      # unrelated merge while the migration is in flight. But a check nobody runs
+      # reports to nobody: this step prints the numbers and the deltas on EVERY
+      # run, and `continue-on-error` keeps it informational. The `::error::`
+      # annotation still shows up on the run page, so the gap stays visible.
+      - name: Surface target compliance (informational, #4185)
+        continue-on-error: true
+        run: python3 tools/surface-target-check.py
 
   # ── THE REQUIRED GATE OBSERVES EVERY SHARD IT CERTIFIES ──────────────────
   # `python-ci-gate` is a REQUIRED status check AND the only `merge_condition`
@@ -3170,7 +3320,15 @@ jobs:
     # the REQUIRED aggregate, so a stalled registry must not hold
     # `python-ci-gate` pending for hours on every PR.
     timeout-minutes: 5
-    runs-on: ubuntu-latest
+    # #7867: a VERSION-PINNED hosted label, NOT `ubuntu-latest`. On this repo
+    # `ubuntu-latest` ALSO matches the self-hosted ARM64 pool — the repo says so
+    # itself in finding-provenance.yml: "The self-hosted runners on this repo
+    # also advertise ubuntu-latest (self-hosted,Linux,ARM64,ubuntu-latest) … the
+    # routing is ambiguous, not fixed" — so `ubuntu-latest` does NOT mean
+    # "GitHub-hosted with its own egress IP". That premise is load-bearing here:
+    # this leg pulls its actionlint image with a single literal reference.
+    # `ubuntu-24.04` is claimed by no self-hosted runner.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: actionlint (workflow syntax + Actions-expression errors)
@@ -3185,8 +3343,15 @@ jobs:
             echo "no workflow files matched — refusing to certify an empty surface"
             exit 1
           fi
+          # #7867: deliberately NOT routed through the GHCR/mirror resolver.
+          # This leg is pinned to a HOSTED label (`runs-on: ubuntu-24.04`, see
+          # the job header), so it has its own egress IP and never shares the
+          # fleet's anonymous Docker Hub quota — there is nothing to fall back
+          # FROM. Keeping the pin literal and unquoted in the `docker run` line
+          # is also structural: tests/test_ci_selection.py reads it from there.
           docker run --rm -v "$PWD:/repo" -w /repo \
-            rhysd/actionlint:1.7.12 -shellcheck= "${files[@]}"
+            rhysd/actionlint:1.7.12 \
+            -shellcheck= "${files[@]}"
 
   python-ci-gate:
     if: always()
@@ -3198,15 +3363,7 @@ jobs:
           RESULTS="${{ join(needs.*.result, ' ') }}"
           echo "matrix results: $RESULTS"
 
-          # 1. Any declared need that failed or was cancelled blocks the merge.
-          #    `join(needs.*.result)` covers EVERY entry in `needs:`, so no leg
-          #    escapes the red check by accident of ordering or naming.
-          if echo "$RESULTS" | grep -qE 'failure|cancelled'; then
-            echo "::error::matrix leg failed or was cancelled — merge blocked"
-            exit 1
-          fi
-
-          # 2. `skipped` is NOT a pass by default. A docs-only diff legitimately
+          #    `skipped` is NOT a pass by default. A docs-only diff legitimately
           #    skips the matrix, so a leg the SELECTOR declined may skip — but a
           #    shard the selector DID select that reports `skipped` is a lost
           #    shard, and this REQUIRED check must not certify it (#5219).
@@ -3216,16 +3373,29 @@ jobs:
           #    `-` means the leg has no diff gate and must therefore always be
           #    SUCCESS (the surface guard's original explicit assertion, applied
           #    to every always-run leg).
-          while IFS='|' read -r leg result selected; do
-            if [ -z "$leg" ]; then continue; fi
-            if [ "$result" = "success" ]; then continue; fi
-            if [ "$result" = "skipped" ] && [ "$selected" = "false" ]; then
-              echo "  $leg: skipped by the selector (not selected for this diff)"
-              continue
-            fi
-            echo "::error::$leg reported '$result' and the selector did not decline it (selected='$selected') — merge blocked"
-            exit 1
-          done <<'LEGS'
+          #
+          #    THIS TABLE NOW RUNS FIRST. It used to be dead code for the red
+          #    class that dominates: a bare `grep -qE 'failure|cancelled'` bail
+          #    sat ABOVE it and exited first, so a `failure` or `cancelled` leg
+          #    reported only "matrix leg failed or was cancelled — merge blocked"
+          #    and never its name. Narrower than "on every red": the table's own
+          #    line (in the form `::error::$leg reported ...`) was REACHED for a
+          #    `skipped`-while-selected leg and for the empty (#5219) missing-leg
+          #    row, because neither matches that sweep — so those two classes
+          #    were already named pre-fix. The two above were not, and they are
+          #    what an operator sees on a normal red (agent-infra#2148 sibling).
+          #    Measured 2026-10-19: 11 open PRs red on this required check, every
+          #    one reporting only the bare sentence while a red shard sat
+          #    un-named.
+          #
+          #    Fail-closed is preserved and made explicit per class:
+          #      failure          -> red, named
+          #      cancelled        -> red, named (a cancelled leg certifies nothing)
+          #      empty (#5219)    -> red, named (a missing leg is not a pass)
+          #      skipped+selected -> red, named (a lost shard is not a pass)
+          #      skipped+declined -> pass (the selector declined this leg)
+          LEGS_FILE="$(mktemp)"
+          cat > "$LEGS_FILE" <<'LEGS'
           changes|${{ needs.changes.result }}|-
           manifest-integrity|${{ needs.manifest-integrity.result }}|-
           workflow-lint|${{ needs.workflow-lint.result }}|-
@@ -3238,4 +3408,67 @@ jobs:
           test-d14-hosted-api|${{ needs.test-d14-hosted-api.result }}|-
           surface-guard|${{ needs.surface-guard.result }}|-
           LEGS
+
+          # Fail closed by construction, and NAME the leg while doing it: every
+          # row class that is not a pass is recorded and reds the step, reported
+          # as "leg 'X' reported '...'" rather than as a bare "merge blocked".
+          # FAILED_LEGS accumulates NAMES (not a counter) so the summary counts a
+          # leg once even if a copy-pasted duplicate row makes the loop inspect it
+          # twice; the loop itself never skips a red row, so a duplicate cannot
+          # mask one.
+          FAILED_LEGS=""
+          while IFS='|' read -r leg result selected; do
+            if [ -z "$leg" ]; then
+              continue
+            fi
+            case "$result" in
+              success)
+                continue
+                ;;
+              skipped)
+                if [ "$selected" = "false" ]; then
+                  echo "  $leg: skipped by the selector (not selected for this diff)"
+                  continue
+                fi
+                echo "::error::leg '$leg' is SKIPPED although the selector selected it (selected='$selected') — a lost shard is not a pass (#5219); merge blocked"
+                FAILED_LEGS="$FAILED_LEGS$leg "
+                ;;
+              cancelled)
+                echo "::error::leg '$leg' was CANCELLED (selector: selected='$selected') — a cancelled leg certifies nothing; merge blocked"
+                FAILED_LEGS="$FAILED_LEGS$leg "
+                ;;
+              '')
+                echo "::error::leg '$leg' reported NO RESULT (empty) — the #5219 missing-leg shape is not a pass; merge blocked"
+                FAILED_LEGS="$FAILED_LEGS$leg "
+                ;;
+              *)
+                echo "::error::leg '$leg' reported '$result' (selector: selected='$selected') — merge blocked"
+                FAILED_LEGS="$FAILED_LEGS$leg "
+                ;;
+            esac
+          done < "$LEGS_FILE"
+
+          if [ -n "$FAILED_LEGS" ]; then
+            # $FAILED_LEGS is DELIBERATELY unquoted: the word-split is what puts
+            # one leg per line for `sort -u`. `wc` pads its output, so strip the
+            # spaces rather than printing them.
+            FAILED=$(printf '%s\n' $FAILED_LEGS | sort -u | wc -l | tr -d ' ')
+            echo "❌ $FAILED leg(s) did not pass — the ::error:: lines above name each one (GitHub shows at most 10 annotations per step; the log carries them all)"
+            rm -f "$LEGS_FILE"
+            exit 1
+          fi
+
+          # Defence in depth (#5219): the plain sweep over `needs.*.result` is
+          # identity-BLIND — it cannot say WHICH leg — so it is the last resort for
+          # a failing/cancelled result that reached `needs:` with no row at all.
+          # The invariant itself is owned by `.github/scripts/check-required-set.py
+          # ::check_gate_legs` (run inside `manifest-integrity`, whose failure the
+          # loop above already reports by name) and by
+          # `tests/test_required_set_sync.py` at test time; this is the narrowest
+          # third layer, and the only one still reachable if that guard is itself
+          # what drifted (pinned by tests/test_ci_selection.py).
+          if echo "$RESULTS" | grep -qE 'failure|cancelled'; then
+            echo "::error::a need reported failure-or-cancelled but no leg row named it — the leg table above has drifted from needs:; merge blocked"
+            exit 1
+          fi
           echo "✅ every declared leg ran to success, or was declined by the selector"
