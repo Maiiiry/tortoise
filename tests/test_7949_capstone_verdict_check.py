@@ -1426,6 +1426,90 @@ def test_the_readme_does_not_describe_the_retired_extraction_lookup():
         "the README must name the binding the probe actually uses")
 
 
+def test_the_readmes_line_citations_resolve_to_the_symbols_they_name():
+    """A cite that says it was re-derived at the head must BE the head's line.
+
+    #9089 review finding 2: the README printed
+    `` `sdk._extract_session_v2` (`sdk.py:10341`; called at `:9358`) `` in the
+    same paragraph that claimed the numbers were "re-derived at the head" — the
+    def is at 10422 and the call site at 9439 at this head, so BOTH were 22
+    lines stale (they named a comment inside the function and an unrelated
+    line), carried from an earlier revision and repeated in the PR body. The
+    prose cannot be the only thing keeping a cite true; it is mechanical, so it
+    is pinned. `main` moved `sdk.py` under the cites again while this branch
+    was open, which is exactly the drift this test exists to catch.
+
+    Non-vacuity: at the pre-fix head `sdk.py:10341` is a comment line inside
+    `_extract_session_v2`, so the `startswith("def …")` assertion reds, and
+    `:9358` carries no call to it, so the call-site assertion reds too.
+    """
+    readme = (PROBE.parents[1] / "README.md").read_text()
+    sources = {
+        "sdk": (_REPO / "tortoise/sdk.py").read_text().splitlines(),
+        "extractor_v2": (_REPO / "tortoise/extractor_v2.py").read_text().splitlines(),
+    }
+
+    # (a) The entry-point cites: the def, the CALL site and the one-pass body.
+    sdk_cites = re.search(r"`sdk\.py:(\d+)`; called at `:(\d+)`", readme)
+    assert sdk_cites, "the sdk.py cite paragraph moved; re-derive it, do not drop the pin"
+    def_line, call_line = (int(n) for n in sdk_cites.groups())
+    assert sources["sdk"][def_line - 1].lstrip().startswith("def _extract_session_v2("), (
+        f"README cites the _extract_session_v2 def at sdk.py:{def_line}, which is "
+        f"{sources['sdk'][def_line - 1].strip()!r} — the line moved and the cite did not")
+    assert "self._extract_session_v2(" in sources["sdk"][call_line - 1], (
+        f"README cites the call at sdk.py:{call_line}, which is "
+        f"{sources['sdk'][call_line - 1].strip()!r} — the line moved and the cite did not")
+    entry = re.search(r"`extractor_v2\.py:(\d+)`", readme)
+    assert entry, "the extractor_v2 entry-point cite is gone"
+    entry_line = int(entry.group(1))
+    assert sources["extractor_v2"][entry_line - 1].lstrip().startswith(
+        "def extract_session_v2("), (
+    f"README cites extract_session_v2 at extractor_v2.py:{entry_line}, which is "
+    f"{sources['extractor_v2'][entry_line - 1].strip()!r}")
+
+    # (b) The eight-row step table: `` `symbol` `:NNNN` `` into the same file.
+    pairs = re.findall(r"`([A-Za-z_][\w.]*)`\s*`:(\d+)`", readme)
+    assert len(pairs) >= 8, f"the step table's cites are gone: {pairs}"
+    for symbol, lineno in pairs:
+        text = sources["extractor_v2"][int(lineno) - 1]
+        assert symbol.split(".")[-1] in text, (
+            f"README cites `{symbol}` at extractor_v2.py:{lineno}, which reads "
+            f"{text.strip()!r} — the line moved and the cite did not")
+
+
+def test_the_readme_stamps_the_shipped_log_at_the_logs_own_head():
+    """ONE head for the shipped measurement (#9089 review finding 3).
+
+    The bundle printed a different sha for the same measurement in two places
+    (`Measured at: 6ccc06a23` here, `Re-measured at 717355e67` in the re-read
+    section and the probe's docstring), and the stamp itself named a commit
+    that did not exist anywhere in this repo — so the Reproduce block could not
+    regenerate the shipped log at its own stamp and no reader could check the
+    claim. The re-read base is a statement-level re-read of the ISSUE BODY, not
+    a second measurement head, and it is labelled that way now.
+
+    Non-vacuity: the pre-fix README and probe docstring both carried
+    `Re-measured at `717355e67``, so the second assertion reds there. The first
+    would not (the two shas agreed) — the drift it catches is mechanical, and
+    it reds the moment either the README or a re-run of the probe moves without
+    the other.
+    """
+    readme = (PROBE.parents[1] / "README.md").read_text()
+    log_head = re.search(r"^# head: ([0-9a-f]{40})$", LOG.read_text(),
+                         re.MULTILINE)
+    assert log_head, "the shipped log carries no `# head:` stamp"
+    cited = re.search(r"\*\*Measured at:\*\* `([0-9a-f]{7,40})`", readme)
+    assert cited, "the README carries no `Measured at` stamp"
+    assert log_head.group(1).startswith(cited.group(1)), (
+        f"the README stamps the bundle at {cited.group(1)}; the log it ships is "
+        f"stamped {log_head.group(1)} — one measurement, one head")
+    for name, text in (("README.md", readme),
+                       ("probes/capstone_run.py", PROBE.read_text())):
+        assert "Re-measured at" not in text, (
+            f"{name} prints a SECOND head for the capstone measurement; the "
+            "issue-body re-read is not the log's stamp")
+
+
 def test_the_durations_row_quotes_the_test_count_it_weights():
     """The shard weight's provenance must describe the file that SHIPS.
 

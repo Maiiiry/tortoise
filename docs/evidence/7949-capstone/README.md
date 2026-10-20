@@ -11,7 +11,7 @@ aboutObjects: "#7949, #9080, #9075, #9076, #9077, #9116, #5199, #7947, EXTRACTOR
 
 # Capstone evidence — `#7949` / `#9080` (extractor-v4, E1–E5)
 
-**Measured at:** `6ccc06a23` on branch `feat/9080-tm` (2026-10-20, after merging `origin/main` at `e14eed78b`). **Blast
+**Measured at:** `027c8c1ab` on branch `feat/9080-tm` (2026-10-20, after merging `origin/main` at `78ef670d3`). **Blast
 radius — the 13 files this branch touches** (`git diff --name-only origin/main...HEAD`):
 the bundle itself (`docs/evidence/7949-capstone/**`, `tools/capstone_verdict_check.py`,
 `tests/test_7949_capstone_verdict_check.py`); its registration (`config/ci-surfaces.yml`
@@ -80,7 +80,7 @@ issue's state, so E5 stays `BLOCKED` even though its measurement exists.
 
 ## What the run did
 
-The acceptance command from the issue, executed verbatim at `6ccc06a23`:
+The acceptance command from the issue, executed verbatim at `027c8c1ab`:
 
 ```bash
 python docs/evidence/7949-capstone/probes/capstone_run.py \
@@ -92,7 +92,7 @@ python docs/evidence/7949-capstone/probes/capstone_run.py \
 model call or write*):
 
 ```text
-run: REFUSED — commit 6ccc06a23… does not carry
+run: REFUSED — commit 027c8c1ab… does not carry
      docs/evidence/7949-capstone/preregistration.json
 steps observed: (none)   required: S0 S1 S2.1 S2.2 S2.3 S3 S5 S6
 ```
@@ -120,7 +120,10 @@ first — which is the exact inference the epic exists to stop.
 
 ## The re-measurement (the issue body is provenance-stale)
 
-The body's figures are pinned to `9037c7a7b`. Re-measured at `717355e67`:
+The body's figures are pinned to `9037c7a7b`. Re-read at `717355e67` — a MAIN commit (#8994),
+**not** a stamp for the capstone log (the log is stamped once, at `027c8c1ab` above): this block
+re-reads the issue BODY's claims, and it is the one the probe's docstring records. Two of the
+claims below are STALE, which is what the capstone run is built on:
 
 1. **`docs/evidence/7949-capstone/` did not exist** — **FALSE now, and it was already false when this was written**: `#9110` landed the E1/E2 evidence (`E1-E2.md`, `e1-e2.log`, `corpus/`, `probes/e1_e2_probe.py`) in this same directory, 16 h before the head this bundle first stamped. What this bundle adds is the *capstone* run and the gate, not the directory.
 2. **"No end-to-end v4 runner exists"** — still true, and now false in the specific
@@ -128,9 +131,9 @@ The body's figures are pinned to `9037c7a7b`. Re-measured at `717355e67`:
    runner is now this probe rather than nothing.
 3. **⚠️ CORRECTED — a single entry point CAN drive all eight steps.** The body asks this
    as an open question. It resolves YES: `TortoiseSDK.capture_session` →
-   `sdk._extract_session_v2` (`sdk.py:10341`; called at `:9358`) →
+   `sdk._extract_session_v2` (`sdk.py:10422`; called at `:9439`) →
    `extractor_v2.extract_session_v2` (`extractor_v2.py:7634`), which calls, in one pass
-   (line numbers re-derived at `6ccc06a23` — the symbol is authoritative and the line is a
+   (line numbers re-derived at `027c8c1ab` — the symbol is authoritative and the line is a
    convenience, which is how the pin's earlier numbers went stale here):
 
    | step | call site | witness the probe reads | on the receipt? |

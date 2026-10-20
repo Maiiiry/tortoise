@@ -7,9 +7,11 @@ the epic owns no implementation and its closing rule is an *execution*:
 not when the children close. A child closing is a claim; this epic is where the
 claim is checked against the pipeline running end to end."*
 
-⚠️ **Re-measured at `717355e67` (the issue body's figures are pinned to
-`9037c7a7b`).** Two of its statements are STALE and this probe is built on the
-corrected reading:
+⚠️ **The issue BODY's claims were re-read at `717355e67` (its figures are pinned
+to `9037c7a7b`).** That sha is a MAIN commit — the base for the body re-read, NOT
+a stamp for any capstone log (the shipped log is stamped at `027c8c1ab`; see
+``README.md``). Two of the body's statements are STALE and this probe is built on
+the corrected reading:
 
 1. **A single entry point DOES exist.** The body says *"whether any single
    entry point … can drive all eight in one pass"* is an open question. It can:
@@ -20,7 +22,7 @@ corrected reading:
    ``kind_classifier.classify_items``/``_apply_classify_kinds`` (S2.3,
    ``:7844``), ``search_graph`` (S3, ``:7860``), ``run_s4`` (the gap filler,
    ``:7881``), and ``execute_embed`` (S5+S6, ``:8080``). Line numbers re-derived
-   at ``6ccc06a23``; the symbol is authoritative and the line is a convenience,
+   at ``027c8c1ab``; the symbol is authoritative and the line is a convenience,
    which is how the pin's earlier numbers went stale here. So the capstone drives
    the REAL entry point — it does not compose the step functions, which the
    issue explicitly forbids.
