@@ -2130,6 +2130,7 @@ def test_the_capstone_gate_change_selects_core_not_tier1():
     assert "test_7949_capstone_verdict_check.py" in r["test_files"], r
     assert r["full"] is False, r
 
+
 def test_the_capstone_evidence_bundle_selects_core_not_tier1():
     # PR #9196 review P1: the S2 verdict's deciding artifacts are committed TEXT
     # — `s2-wiring-census.log` (the census output), `e2e-chain-probe.log` (the
