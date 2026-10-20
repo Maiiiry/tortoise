@@ -641,9 +641,14 @@ def _bfs_select_operators(proj, anchors: list[str], max_hops: int | None = 1,
                     # #7927: ``p`` is ID-ANCHORED (`p.id IN $frontier`) —
                     # label-swept so a :Subject/:Object/:Event anchor finds
                     # the operators pointing at it.
+                    # #6211: the anchor barrier — `p.id IN $frontier` is on
+                    # the pattern's FAR endpoint, so without `WITH *` the plan
+                    # is a label scan of every operator and a per-record filter
+                    # (same defect as `ep._EP_ANCHOR_BARRIER`, measured there).
                     rows = _sweep(
-                        ("MATCH (op:Point {is_operator:true})-[:{rel}]->(p:{label}) "
-                         f"WHERE p.id IN $frontier {live_op} "
+                        ("MATCH (p:{label}) WHERE p.id IN $frontier WITH * "
+                         "MATCH (op:Point)-[:{rel}]->(p) "
+                         f"WHERE op.is_operator = true {live_op} "
                          "RETURN DISTINCT op.id").replace("{rel}", rel),
                         {"frontier": frontier_list},
                         frontier_labels,
@@ -729,9 +734,15 @@ def _bfs_select_operators(proj, anchors: list[str], max_hops: int | None = 1,
             if rel == "NAND" or direction in ("incoming", "both"):
                 # #7927: ``b`` is ID-ANCHORED (`b.id IN $frontier`) → label
                 # sweep; ``a`` is the TRAVERSAL position → WHERE disjunction.
+                # #6211: the anchor barrier (see ep._EP_ANCHOR_BARRIER) —
+                # `b.id IN $frontier` sits on the far endpoint of the pattern,
+                # so the unbarriered form planned as `All Node Scan (a)`.
                 bwd_tpl = (
-                    "MATCH (a)-[r:" + safe_rel + "]->(b:{label}) "
-                    f"WHERE b.id IN $frontier {live_a} {live_b} "
+                    "MATCH (b:{label}) WHERE b.id IN $frontier WITH * "
+                    "MATCH (a)-[r:" + safe_rel + "]->(b) "
+                    # `1 = 1` keeps the AND-chained fragments (each begins
+                    # with AND) syntactically valid after the bare WHERE.
+                    f"WHERE 1 = 1 {live_a} {live_b} "
                     f"AND {epistemic_disjunction('a')} "
                     # A keyless legacy ``:Event`` (``session_indexer`` mints
                     # ``(e:Event {eventId:…})`` with no ``id``) has NO
@@ -795,9 +806,13 @@ def _bfs_select_operators(proj, anchors: list[str], max_hops: int | None = 1,
         # Expand to new frontier points from collected operators
         if new_ops and (max_hops is None or hop < max_hops - 1):
             ops_list = list(new_ops)
+            # #6211: barrier — `op.id IN $ops` must be read off the id index
+            # before the expansion; unbarriered the planner walked `p` instead
+            # (`All Node Scan (p)`, measured on the 160k-edge fixture).
             rows = proj.g.query(
-                "MATCH (op:Point {is_operator:true})-[r:IMPL|NAND]->(p) "
-                f"WHERE op.id IN $ops {live_p} "
+                "MATCH (op:Point) WHERE op.id IN $ops WITH * "
+                "MATCH (op)-[r:IMPL|NAND]->(p) "
+                f"WHERE op.is_operator = true {live_p} "
                 # #7927: ``p`` is reached from the anchored operator.
                 f"AND {epistemic_disjunction('p')} "
                 # The EXPANSION frontier is re-anchored by ``p.id`` on the next

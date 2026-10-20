@@ -145,7 +145,7 @@ class EPSubgraphHopError(_ResponseError):
                        pass-level queries.
 
                        A pass reads and writes the WHOLE affected set, not just
-                       its frontier: `_load_cache` sweeps 16 statements over it,
+                       its frontier: `_load_cache` sweeps 20 statements over it,
                        `_flush_cache` writes it back, and `run` pre-writes the
                        evidence priors over it. Every one of those is typed
                        too — they are the largest queries of a pass, so an

@@ -24,12 +24,13 @@ WHAT IS PINNED HERE, and why each test is discriminating:
 1. ``test_every_id_anchored_pass_query_is_planned_as_an_index_read`` — the
    queries ``ep.py`` actually EMITS (captured off the graph handle, not
    re-written in the test) plan through ``Node By Index Scan`` and contain no
-   ``Node By Label Scan``. Measured discriminating power: removing the barrier
-   reddens it at the seed neighbourhood, the plain-seed direct-edge expansion,
-   the bridge hop, Batch 1 and both OR-split sweeps. Removing it at the Batch 3
-   site alone does NOT (the two-``MATCH`` form happens to anchor on its own
-   there) — the barrier is kept there as the engine-6.0.0 predicate-drop guard
-   (#6976) rather than as a cost fix, and this file does not claim otherwise.
+   ``Node By Label Scan``. Measured discriminating power, per statement:
+   removing the barrier reddens it at the seed neighbourhood, the plain-seed
+   direct-edge expansion, the bridge hop and Batch 1. At the two OR-split
+   sweeps and at Batch 3 the barrier is NOT what does the work — the endpoint
+   split (and, at Batch 3, the two-``MATCH`` form) anchors on its own — so the
+   barrier is kept at those three as the engine-6.0.0 predicate-drop guard
+   (#6976), not as a cost fix, and this file does not claim otherwise.
 2. ``test_the_hop_budget_tracks_the_frontier_not_the_graph`` — the cost half:
    the hop's traversal touches fewer records than the graph has edges, on a
    fixture whose background is deliberately much larger than the frontier.
@@ -47,11 +48,13 @@ WHAT IS PINNED HERE, and why each test is discriminating:
    is the only way this fixture can produce a duplicate row for a single edge,
    so it is what makes the edge-keyed (``id(r)``) dedupe observable rather than
    assumed.
-4. ``test_the_operator_selection_query_is_planned_as_an_index_read`` — the
-   operator-viability query in ``tortoise/analyze.py`` is the SAME defect class
-   over the LARGEST id set of the pass (the whole operator frontier); measured
+4. ``test_the_operator_selection_queries_are_planned_as_index_reads`` — the
+   operator selector in ``tortoise/analyze.py`` is the SAME defect class over
+   the LARGEST id set of the pass (the whole operator frontier); all four of
+   its id-set legs are pinned, not just the viability query. Measured
    ``All Node Scan (t)`` at 242.5 ms -> ``Node By Index Scan (op)`` at 12.6 ms
-   on the same fixture.
+   on the same fixture, and 1.4-1.5 s -> under 0.1 s for the whole selection
+   (best of 3).
 """
 
 from __future__ import annotations
@@ -175,8 +178,12 @@ def _capture(ep: TortoiseEP, fn, *args, **kw) -> list[tuple[str, dict]]:
         ep.g = real
     # Only the id-set statements are in scope: a whole-graph count or the
     # :EpMeta epoch read are not id-anchored and a label scan is correct there.
-    # `$oids` is the operator-seed form of the same predicate (`seed_operators`).
-    return [(q, p) for q, p in rec.statements if "$ids" in q or "$oids" in q]
+    # The pass binds the set as `$ids` (claim seed) or `$oids` (operator seed);
+    # the operator selector binds it as `$frontier` (BFS frontier) or `$ops`
+    # (operator expansion) — all four are the SAME id-anchored shape, so a
+    # filter that knew only the pass's two would silently drop the selector's
+    # three extra legs before the assertion ever saw them.
+    return [(q, p) for q, p in rec.statements if any(n in q for n in _ID_PARAMS)]
 
 
 def _plan_text(handle, cypher: str, params: dict) -> str:
@@ -289,7 +296,13 @@ def test_direct_edge_factors_are_collected_once_per_edge_from_both_ends(graph):
         )
 
 
-def test_the_operator_selection_query_is_planned_as_an_index_read(graph):
+#: Every parameter name an id-set statement in this file's scope binds: the
+#: pass's claim (`$ids`) and operator (`$oids`) seeds, and the operator
+#: selector's frontier (`$frontier`) and expansion (`$ops`) sets.
+_ID_PARAMS = ("$ids", "$oids", "$frontier", "$ops")
+
+
+def test_the_operator_selection_queries_are_planned_as_index_reads(graph):
     """The SAME defect over the LARGEST id set of the pass (analyze.py).
 
     `MATCH (op:Point {is_operator:true})-[:IMPL|NAND]-(t) WHERE op.id IN $ids`
@@ -297,13 +310,40 @@ def test_the_operator_selection_query_is_planned_as_an_index_read(graph):
     with the anchor barrier on the 23k-node / 160k-edge fixture, identical
     rows. It is the operator-viability query, and its id set is the whole
     operator frontier, so it was the worst-anchored statement of the pass.
+
+    The selector's OTHER three id-set legs had the same shape with the id
+    predicate on the far endpoint and are pinned here too — measured
+    unanchored on the 23k/160k fixture before their barriers
+    (`Node By Label Scan (op:Point)`, `All Node Scan (a)`, `All Node Scan (p)`);
+    one `_bfs_select_operators` call took 1.4-1.5 s then and takes ~0.1 s now
+    (best of 3, same 168 operators).
     """
     from tortoise.analyze import _bfs_select_operators
 
     proj = graph._get_proj()
+    # Two seeds, because one seed cannot reach every leg: seeding the HUB
+    # collects HUB_OPS=300 operators, `op_cap` truncates that to 200 and the
+    # cap `break` PRECEDES the expansion query — so `op.id IN $ops` never runs
+    # there. A seed with a small neighbourhood (`f0`, whose operators are
+    # capped nowhere) does emit it. Both calls are needed, or the assertion is
+    # blind to a statement — the same failure mode as a capture filter that
+    # knows too few parameter names.
     statements = _capture(proj, _bfs_select_operators, proj, [HUB], 2)
-    anchored = [(q, p) for q, p in statements if "$ids" in q]
-    assert anchored, f"no id-set statement emitted by the selector: {statements}"
+    statements += _capture(proj, _bfs_select_operators, proj, ["f0"], 2)
+    anchored = [(q, p) for q, p in statements if any(n in q for n in _ID_PARAMS)]
+    assert len(anchored) >= 4, (
+        f"expected the selector's id-set legs, captured {[q for q, _ in anchored]}"
+    )
+    # Coverage guard: every leg must actually be PRESENT, or a cap/fixture
+    # change could drop one and this test would pass anyway. `$ops` alone is
+    # not enough — the selector binds it on the outgoing leg too, so the
+    # expansion leg is pinned by its own projection (`RETURN DISTINCT p.id`,
+    # which no other leg emits).
+    for needle in ("$ids", "$frontier", "$ops", "RETURN DISTINCT p.id"):
+        assert any(needle in q for q, _ in anchored), (
+            f"no statement matching {needle!r} captured — that leg is not "
+            f"pinned (captured: {[q[:60] for q, _ in anchored]})"
+        )
     offenders = [
         (q, _plan_text(proj.g, q, p))
         for q, p in anchored

@@ -247,16 +247,30 @@ edge set plus one traversal per edge (`frontier=1` still cost 0.78 s on the
 fixture above), and it grows with every point the map gains. The barrier is now
 at every id-anchored statement of the pass whose id predicate sits on the
 **far** endpoint of the traversal — the seed neighbourhood, the plain-seed
-direct-edge expansion and both BFS hops, factor extraction (Batch 1 and the
-operator-viability query in `analyze.py`) and the cache load's back-message
-sweep. Three statements are id-anchored but needed no barrier, because their id
+direct-edge expansion, both BFS hops, factor extraction (Batches 1 and 3), the
+cache load's back-message sweep, and four legs of the operator selector in
+`analyze.py` (the viability query, the incoming operator leg, the backward
+direct-edge leg and the operator-expansion leg — the last three measured
+unanchored on the same fixture, `Node By Label Scan (op:Point)` /
+`All Node Scan (a)` / `All Node Scan (p)`; one `_bfs_select_operators` call
+took **1,507 ms** before them and **98 ms** now (best of 3, same 168
+operators returned).
+
+Three statements are id-anchored but needed no barrier, because their id
 predicate is already on the pattern's anchored side: `_load_cache`'s message
 sweep, `seed_operators` and `_affected_factors` Batch 2 — each measured
-`Node By Index Scan` before the change. All three are pinned by
-`tests/test_6211_ep_anchor.py`, which asserts the PLAN of every statement the
-pass emits and not its text; each is reached by the fixture (`_load_cache`'s
-sweeps and Batch 2 directly, `seed_operators` through an operator seed — the
-300 operators hanging off the hub claim).
+`Node By Index Scan` before the change, so the barrier would have been
+redundant. All three are still in the pinned set: `tests/test_6211_ep_anchor.py`
+captures the statements the pass emits and asserts the PLAN of each
+(`Node By Index Scan`, no label or all-node scan), never their text; each is
+reached by the fixture (`_load_cache`'s sweeps and Batch 2 directly,
+`seed_operators` through an operator seed — the 300 operators hanging off the
+hub claim). On the 23k-node / 160k-edge fixture that assertion covers the pass's
+**49 distinct** id-set statements (95 emissions) and the operator selector's
+**12 distinct** (25 emissions) across its four legs — zero unanchored in
+either. On `origin/main` the same file fails 3 of its 5 tests, and the
+selector's expansion leg is individually discriminating: removing its barrier
+alone reddens the selector test.
 
 The two `OR`-shaped sweeps (`(a.id IN $ids OR b.id IN $ids)`, which can never be
 an index anchor) are split into one anchored sweep per endpoint: the
@@ -308,7 +322,7 @@ now visible to a programmatic caller instead of to a human reading stderr:
   `hop: None`, because there is no hop to name (`draft_filter` is the one phase
   that appears in BOTH shapes: hop-scoped when the loop asks it, `hop: None` on
   the final fail-safe strip). The cache phases are the
-  WIDEST statements a pass makes (16 load sweeps over the whole affected set,
+  WIDEST statements a pass makes (20 load sweeps over the whole affected set,
   plus the write-back) — a different query from factor extraction's single
   largest one, and untyped it would keep the issue's symptom
   reachable on the largest query of the pass; a `cache_flush` timeout is
