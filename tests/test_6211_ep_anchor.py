@@ -41,7 +41,12 @@ WHAT IS PINNED HERE, and why each test is discriminating:
    the split returns each direct edge exactly ONCE for all three cases (source
    in the affected set only, target only, both), that two byte-identical
    parallel edges stay two factors, and that the cache's back-message sweep
-   populates both directions.
+   populates both directions. The anchor endpoint (``hub``) is deliberately
+   MULTI-LABELLED (``:Point:Object`` — the shape ``update_point``'s promote arm
+   mints), because a per-label sweep matches such a node once per label: that
+   is the only way this fixture can produce a duplicate row for a single edge,
+   so it is what makes the edge-keyed (``id(r)``) dedupe observable rather than
+   assumed.
 4. ``test_the_operator_selection_query_is_planned_as_an_index_read`` — the
    operator-viability query in ``tortoise/analyze.py`` is the SAME defect class
    over the LARGEST id set of the pass (the whole operator frontier); measured
@@ -107,10 +112,21 @@ def _build(sdk: TortoiseSDK) -> None:
                 "       (o)-[:IMPL {idx: 1, direction: 'bidirectional'}]->(f)",
                 params={"rows": rows[s : s + 2_000]},
             )
+    # The direct-edge ANCHOR endpoint carries TWO epistemic labels — the
+    # ``:Point:Object`` shape ``update_point``'s promote arm mints, and one the
+    # write path admits as a direct-edge endpoint. In Cypher a node matches a
+    # single-label pattern, so ``hub`` is admitted by BOTH the ``Point`` and the
+    # ``Object`` iteration of each per-label sweep. This is the ONLY shape in
+    # which one edge can come back twice, so without it a fixture cannot
+    # distinguish an edge-keyed dedupe from no dedupe at all (#6211 review).
+    proj.g.query(
+        "MATCH (n:Point {id: $hub}) SET n:Object",
+        params={"hub": HUB},
+    )
     # Operator-less direct edges (#888 W5): one leaving the affected set, one
     # entering it, one entirely inside it, and TWO byte-identical parallel
     # edges leaving it (they must stay two factors — a row-keyed dedupe would
-    # collapse them, which is why the split does not dedupe).
+    # collapse them, which is why the dedupe key is the EDGE's internal id).
     proj.g.query(
         "MATCH (h:Point {id: $hub}), (o:Point {id: $out}), (i:Point {id: $in}), "
         "(b:Point {id: $both}) "
@@ -248,12 +264,16 @@ def test_direct_edge_factors_are_collected_once_per_edge_from_both_ends(graph):
 
     # (hub)->(direct-out) is reached from its SOURCE, (direct-in)->(hub) from its
     # TARGET, (hub)->(direct-both) from BOTH ends — each must appear exactly once.
+    # ``hub`` is :Point:Object, so the a-anchored AND b-anchored halves each see
+    # these edges twice (once per label sweep): a single factor per edge is only
+    # reachable if the split dedupes on the EDGE.
     assert (HUB, DIRECT_OUT) in direct, direct
     assert (DIRECT_IN, HUB) in direct, direct
     assert (HUB, DIRECT_BOTH) in direct, direct
     for pair in ((HUB, DIRECT_OUT), (DIRECT_IN, HUB)):
         assert sum(1 for f in factors if f[4] is None and tuple(f[2]) == pair) == 1, (
-            f"direct edge {pair} produced more than one factor"
+            f"direct edge {pair} produced more than one factor (a multi-labelled "
+            f"endpoint is swept once per label; the dedupe key must be id(r))"
         )
     # ... but TWO byte-identical parallel edges are TWO factors, not one.
     both = [f for f in factors if f[4] is None and tuple(f[2]) == (HUB, DIRECT_BOTH)]

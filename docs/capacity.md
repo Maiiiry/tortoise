@@ -252,17 +252,21 @@ operator-viability query in `analyze.py`) and the cache load's back-message
 sweep. Three statements are id-anchored but needed no barrier, because their id
 predicate is already on the pattern's anchored side: `_load_cache`'s message
 sweep, `seed_operators` and `_affected_factors` Batch 2 — each measured
-`Node By Index Scan` before the change. The first two are pinned by
-`tests/test_6211_ep_anchor.py` (which asserts the PLAN of every statement the
-pass emits, not its text); Batch 2's statement is emitted only when an operator
-seed is present, so it is measured here rather than asserted there.
+`Node By Index Scan` before the change. All three are pinned by
+`tests/test_6211_ep_anchor.py`, which asserts the PLAN of every statement the
+pass emits and not its text; each is reached by the fixture (`_load_cache`'s
+sweeps and Batch 2 directly, `seed_operators` through an operator seed — the
+300 operators hanging off the hub claim).
 
 The two `OR`-shaped sweeps (`(a.id IN $ids OR b.id IN $ids)`, which can never be
 an index anchor) are split into one anchored sweep per endpoint: the
 target-anchored sweep takes every edge whose target is affected, the
 source-anchored sweep takes the rest (`NOT b.id IN $ids`), so each edge is
-admitted once without de-duplicating rows — a row-keyed dedupe would collapse
-two byte-identical parallel direct edges into one factor. Same fixture, engine
+admitted once, de-duplicated on the EDGE's internal id (`id(r)`) — not on the
+row, because a row-keyed dedupe would collapse two byte-identical parallel
+direct edges into one factor, and not on a node id, because a multi-labelled
+endpoint (`:Point:Object`) is matched by one label sweep per label it carries
+and comes back once per label. Same fixture, engine
 at the issue's 1,000 ms query bound:
 `compute_confidence(anchors=[one claim], max_hops=2)` aborted at hop 1
 (operator_bridge) over a **29-claim** frontier before the change and now

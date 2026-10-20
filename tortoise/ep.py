@@ -1647,9 +1647,7 @@ class TortoiseEP:
         # #6211: `(a.id IN $ids OR b.id IN $ids)` cannot be an index anchor —
         # the plan scans EVERY IMPL|NAND edge in the graph and filters. An edge
         # qualifies iff it touches the affected set at EITHER end, so two
-        # sweeps — one anchored on each end — return exactly the OR's rows, and
-        # a row that both sweeps see is the SAME edge (byte-identical), so
-        # de-duplicating on the row preserves the one-factor-per-edge contract.
+        # sweeps — one anchored on each end — return exactly the OR's rows.
         # The unsplit form is measured at 0.36 s on a 23k-node / 160k-edge
         # graph REGARDLESS of the affected-set size; each anchored sweep is
         # bounded by the affected claims' incident edges.
