@@ -177,16 +177,24 @@ class ReconciliationReport:
     missing_in_cache: int
     extra_in_cache: int
     field_mismatches: int
+    divergent_keys: tuple[str, ...] = ()
+    truth_side: str = "record"
+    cache_side: str = "cache"
     #: Fields that agree only after a STORED-FORM rule normalised them — the
     #: vector width (#8615) and the boolean form of ``embedding_verbatim``
     #: (#9184). Kept OUT of ``field_mismatches`` because a faithful projection
     #: must be able to reach zero, and kept as its OWN count because otherwise
     #: the decision would be invisible: a comparison that forgives a difference
     #: has to say so (#9184: *"surfaced as its own named count"*).
+    #:
+    #: ⚠️ APPENDED LAST on purpose (#9189 review): this class is frozen but not
+    #: ``kw_only``, so a field inserted BEFORE the pre-existing defaulted ones
+    #: silently re-binds a positional construction — ``ReconciliationReport(1,
+    #: 0, 0, 0, 0, ("k",))`` would have put ``"k"`` in ``form_normalized`` and
+    #: left ``divergent_keys`` empty, i.e. the new count would eat a caller's
+    #: sample. Pinned by
+    #: ``tests/test_reconciliation.py::test_a_positional_construction_keeps_its_pre_existing_fields``.
     form_normalized: int = 0
-    divergent_keys: tuple[str, ...] = ()
-    truth_side: str = "record"
-    cache_side: str = "cache"
 
     def as_dict(self) -> dict:
         """The machine-readable shape (JSON-safe — tuples become lists)."""

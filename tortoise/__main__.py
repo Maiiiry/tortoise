@@ -626,16 +626,33 @@ def _cmd_record_reconcile(args):
     (``--db``/``--org``/``--graph``) or an unknown flag, and ``main()``
     re-raises that ``SystemExit`` rather than translating it. The two are not
     separated on purpose — a verb-specific remap in the shared dispatcher is
-    machinery nothing reads — but a scheduler must not read ``2`` as "your cron
-    line is malformed": it means only *no verdict was produced*. ``0`` and
-    ``3`` are the answers this verb promises.
+    machinery nothing reads — but a scheduler must not read ``2``
+    as "your cron line is malformed": it means only *no verdict was produced*.
+    ``0`` and ``3`` are the answers this verb promises.
+
+    ⛔ **``--cache-graph`` is REQUIRED, with no derived default.** The cache
+    graph's name is NOT the record's ``graph_id`` scope column: this tree names
+    it ``org_<org_id>`` (the org SDK's isolated graph) or
+    ``org_<org_id>_<graph_id>`` (the registry/ACL namespace). Guessing wrong
+    does not fail — FalkorDB opens an EMPTY graph — and an empty cache reports
+    every record key as ``missing_in_cache``, i.e. a coherent cache exits ``3``.
+    A wrong VERDICT is worse than no verdict, so an absent name is a refusal
+    (``2``) that prints both conventions.
+
+    Both stores are BOUNDED: the cache read by ``--timeout-ms``
+    (:data:`tortoise.record_reconcile.CACHE_READ_TIMEOUT_MS` by default) and the
+    record by a connect timeout plus a session ``statement_timeout`` — a
+    scheduled sweep must not be able to hang on either side.
     """
     import json as _json
 
     from tortoise.cache_projection import read_record_view
     from tortoise.reconciliation import ReconciliationUnavailable
     from tortoise.record_reconcile import (
+        CACHE_READ_TIMEOUT_MS,
         EXIT_UNAVAILABLE,
+        RECORD_CONNECT_TIMEOUT_S,
+        RECORD_STATEMENT_TIMEOUT_MS,
         VERDICT_CLEAN,
         exit_code_for,
         log_result,
@@ -673,18 +690,46 @@ def _cmd_record_reconcile(args):
     from tortoise.projection import FalkorProjection
     from tortoise.residency import read_declaration
 
+    # The cache graph's name is NOT the record's `graph_id` scope column (see
+    # this function's docstring): refuse rather than open an empty graph and
+    # report a coherent cache as divergent.
+    if not args.cache_graph:
+        print(
+            "Error: --cache-graph is required — the cache graph's name is not "
+            "the record's --graph scope. This tree names it org_<org_id> (the "
+            "org SDK's isolated graph) or org_<org_id>_<graph_id> (the "
+            "registry/ACL namespace); guessing wrong opens an EMPTY graph, so "
+            "every record key would report missing_in_cache and a coherent "
+            "cache would exit 3. Nothing was compared, so divergence is "
+            "UNKNOWN, not zero.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    cache_graph = args.cache_graph
+    timeout_ms = args.timeout_ms if args.timeout_ms is not None \
+        else CACHE_READ_TIMEOUT_MS
+    # A non-positive bound is not a bound: the driver reads 0 as "wait forever",
+    # which would silently re-open the unbounded read the flag exists to close.
+    if timeout_ms <= 0:
+        print(f"Error: --timeout-ms must be positive, got {timeout_ms} — a "
+              f"non-positive timeout is not a bound (0 means wait forever), so "
+              f"nothing was compared and divergence is UNKNOWN, not zero.",
+              file=sys.stderr)
+        return EXIT_UNAVAILABLE
+
     conn = None
     proj = None
     try:
         try:
-            conn = psycopg2.connect(dsn)
+            conn = psycopg2.connect(
+                dsn,
+                connect_timeout=RECORD_CONNECT_TIMEOUT_S,
+                options=f"-c statement_timeout={RECORD_STATEMENT_TIMEOUT_MS}",
+            )
             view = read_record_view(conn, org_id=args.org, graph_id=args.graph)
         except Exception as e:
             raise ReconciliationUnavailable(
                 f"record is unreadable ({type(e).__name__}) — divergence is "
                 f"UNKNOWN, not zero") from e
 
-        cache_graph = args.cache_graph or args.graph
         try:
             proj = FalkorProjection.from_uri(args.db, graph_name=cache_graph)
         except Exception as e:
@@ -694,7 +739,7 @@ def _cmd_record_reconcile(args):
         declaration = read_declaration(proj.g)
         result = reconcile_record_and_cache(
             record_key_map(view),
-            read_cache_view(proj.g),
+            read_cache_view(proj.g, timeout_ms=timeout_ms),
             declaration=declaration,
         )
     except ReconciliationUnavailable as e:
@@ -712,8 +757,18 @@ def _cmd_record_reconcile(args):
     else:
         print(line)
         if result.verdict() == VERDICT_CLEAN:
-            print(f"✓ record == cache for {args.org}/{args.graph} "
-                  f"({result.checked} keys checked)")
+            # ⛔ `not_hot > 0` means keys were NOT compared: after a `partial`
+            # declaration they were removed from the truth side, so this run
+            # established equality over the COMPARED keys only. Saying
+            # `record == cache` unqualified would state an equality the run did
+            # not establish — the §17.2 class this trigger exists to refuse.
+            if result.not_hot:
+                print(f"✓ record == cache FOR THE COMPARED KEYS for "
+                      f"{args.org}/{args.graph} ({result.checked} keys checked; "
+                      f"{result.not_hot} not-hot key(s) were NOT compared)")
+            else:
+                print(f"✓ record == cache for {args.org}/{args.graph} "
+                      f"({result.checked} keys checked)")
         else:
             print(f"✗ {result.verdict().upper()}: see the counts above",
                   file=sys.stderr)
@@ -11035,7 +11090,17 @@ def main(argv: list[str] | None = None) -> int:
     rr.add_argument("--org", required=True, help="Record org_id (the scope)")
     rr.add_argument("--graph", required=True, help="Record graph_id (the scope)")
     rr.add_argument("--cache-graph", default=None,
-                    help="Cache graph name (default: the same as --graph)")
+                    help="Cache graph name — REQUIRED in practice (the verb "
+                         "refuses without it, exit 2). The cache graph is NOT "
+                         "the record's --graph scope: this tree names it "
+                         "org_<org_id> (org SDK) or org_<org_id>_<graph_id> "
+                         "(registry/ACL namespace). No default is derived: a "
+                         "wrong guess opens an EMPTY graph and a coherent "
+                         "cache would report divergent")
+    rr.add_argument("--timeout-ms", type=int, default=None,
+                    help="Bound on EACH cache-label read (default: 2000, must "
+                         "be positive). A read that hits it refuses (exit 2) "
+                         "— it never returns a partial answer")
     rr.add_argument("--json", action="store_true",
                     help="Machine-readable JSON output")
     bk = sp.add_parser("backup", help="Backup events.jsonl + FalkorDB to timestamped dir")

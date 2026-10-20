@@ -145,6 +145,18 @@ VERBATIM_MARKER = "embedding_verbatim"
 #: either side). A genuinely different marker (``'true'`` vs ``False``) is still
 #: a divergence. One entry today, deliberately a SET so a second boolean-form
 #: property must be declared here rather than special-cased at a call site.
+#:
+#: ⚠️ **Reachable for the truthy spellings; the FALSY spelling waits on
+#: #9184's WRITER half.** This rule is the CHECK side only. The writer still
+#: decides the storage form with :func:`is_verbatim` (truthy for ``'false'``),
+#: so a projection of a record holding ``'false'`` stores the marker as ``True``
+#: and the vector un-narrowed — and the reconciler reports the MARKER as one
+#: divergence, correctly: that cache is not faithful to what the record
+#: declares. Fixing it means the writer reads the DECLARED boolean
+#: (:func:`declares_verbatim`), which is #9184's half and changes what is
+#: STORED, not what is compared. Pinned by
+#: ``tests/test_reconciliation.py::test_the_shipped_writer_stores_the_falsy_marker_truthily``
+#: and ``tests/test_record_reconcile_trigger.py::test_a_falsy_marker_point_reports_the_WRITER_half_as_divergence``.
 BOOLEAN_FORM_PROPS: frozenset[str] = frozenset({VERBATIM_MARKER})
 
 

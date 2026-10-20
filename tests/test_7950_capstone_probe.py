@@ -392,8 +392,9 @@ def test_the_census_pattern_sees_every_call_spelling(tmp_path):
     (`reconciliation.reconcile(a, b)`, the natural one for a module-level
     function imported as a module) reads as **0 production call sites** while
     the reconciler IS wired. That is the stale-evidence failure this census
-    exists to prevent, reproduced inside the census. Pre-fix this test fails on
-    the first two cases.
+    exists to prevent, reproduced inside the census. Pre-fix the BARE-call case
+    fails (only the dotted spelling had an alternative); the dotted case failed
+    against an earlier cut, which is why both are kept in one test.
     """
     source = "\n".join([
         "from tortoise import reconciliation",
@@ -454,6 +455,15 @@ def test_the_s2_census_log_is_a_LIVE_measurement(monkeypatch, capsys):
     Only the PRODUCTION population is pinned. The log's `test population:`
     counts are informational: they move whenever any test file mentions one of
     these names, which is not a claim about whether the product is wired.
+
+    ⚠️ **The hit lines are compared INCLUDING their `file:line`, and that is
+    deliberate** (#9189 review): the log is presented as a measurement, so a
+    line move in a caller must be re-cut rather than silently absorbed. The
+    cost is that any edit above that line in the caller re-reddens this pin;
+    the remedy is one command — re-run the probe over the head and commit its
+    own output — and `tools/ci_selection.py`'s `CORE_ALSO` keeps this
+    evidence bundle selecting the pin, so a log-only edit cannot land with the
+    pin unrun.
     """
     monkeypatch.chdir(_REPO_ROOT)
     measured = _CENSUS_MODULE.census_all(_CENSUS_MODULE.PROD_DIRS,

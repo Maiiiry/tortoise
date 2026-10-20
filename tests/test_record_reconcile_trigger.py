@@ -682,34 +682,45 @@ class _FakeProjection:
         self.closed = True
 
 
-def _drive_the_verb(monkeypatch, graph, view):
+def _drive_the_verb(monkeypatch, graph, view, *, extra_args=(), graph_wrapper=None):
     """Run ``python -m tortoise record-reconcile`` over a REAL cache graph.
 
     Only the two HANDLES are faked (the record connection and the projection's
     ``from_uri``): the cache reader, the record key map, the comparison and the
     verdict→exit-code mapping are the shipped ones, so what this asserts is
     that the verb really composes them and really reports the result.
+
+    ``graph_wrapper`` lets a caller observe the READ the verb makes (the
+    timeout knob's test); ``extra_args`` appends CLI flags.
     """
     from tortoise import __main__ as cli
     from tortoise.projection import FalkorProjection
 
     conn = _FakeConn()
+    connect_kwargs: dict = {}
+
+    def _connect(dsn, **kw):
+        connect_kwargs.update(kw)
+        return conn
+
     fake_psycopg2 = types.ModuleType("psycopg2")
-    fake_psycopg2.connect = lambda dsn, **kw: conn        # type: ignore[attr-defined]
+    fake_psycopg2.connect = _connect                   # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "psycopg2", fake_psycopg2)
     monkeypatch.setattr(
         cp, "read_record_view",
         lambda conn, *, org_id, graph_id: view, raising=True)
 
-    projection = _FakeProjection(graph)
+    projection = _FakeProjection(graph_wrapper if graph_wrapper is not None
+                                 else graph)
     monkeypatch.setattr(
         FalkorProjection, "from_uri",
         staticmethod(lambda uri, graph_name=None: projection))
 
     rc = cli.main(["record-reconcile", "--db", "docker://:x@localhost:6379/g",
                    "--record-dsn", "postgresql://fake/record",
-                   "--org", "o", "--graph", "g"])
-    return rc, conn, projection
+                   "--org", "o", "--graph", "g",
+                   "--cache-graph", "org_o_g", *extra_args])
+    return rc, conn, projection, connect_kwargs
 
 
 def test_the_cli_verb_COUNTS_a_divergent_cache(monkeypatch, cache_graph, capsys):
@@ -724,7 +735,7 @@ def test_the_cli_verb_COUNTS_a_divergent_cache(monkeypatch, cache_graph, capsys)
     _project(view, cache_graph)
     cache_graph.query("CREATE (:Point {id:'p-9189-cli-direct'})")
 
-    rc, conn, projection = _drive_the_verb(monkeypatch, cache_graph, view)
+    rc, conn, projection, _ = _drive_the_verb(monkeypatch, cache_graph, view)
     printed = capsys.readouterr()
 
     assert rc == rr.EXIT_DIVERGENT, printed.out + printed.err
@@ -743,8 +754,248 @@ def test_the_cli_verb_reports_clean_only_when_it_compared(
     view = _record_view()
     _project(view, cache_graph)
 
-    rc, _, _ = _drive_the_verb(monkeypatch, cache_graph, view)
+    rc, _, _, _ = _drive_the_verb(monkeypatch, cache_graph, view)
     printed = capsys.readouterr()
 
     assert rc == rr.EXIT_CLEAN, printed.out + printed.err
     assert "0 divergent of 2 checked" in printed.out, printed.out
+
+
+# ── 7. the verb's OPERATOR contract (#9189 review findings) ───────────────
+#
+# The exit code is the scheduler's only signal, so everything that decides
+# WHICH verdict is produced has to be pinned as tightly as the verdict itself:
+# the cache graph it reads, the bounds it puts on both stores, the machine
+# output a dashboard reads, and the sentence an operator reads. Each test below
+# covers a way the trigger could produce a CONFIDENT WRONG number or state an
+# equality it did not establish.
+
+
+class _RecordingGraph:
+    """A real cache graph that records the READ options the verb passed."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.read_kwargs: list[dict] = []
+
+    def query(self, *args, **kwargs):
+        self.read_kwargs.append(dict(kwargs))
+        return self._inner.query(*args, **kwargs)
+
+
+def test_the_verb_refuses_without_a_cache_graph(monkeypatch, capsys):
+    """A derived cache-graph name is a COHERENT CACHE reported as divergent.
+
+    The record's ``--graph`` is a ``graph_id`` scope COLUMN; the cache graph is
+    named ``org_<org_id>`` or ``org_<org_id>_<graph_id>``. FalkorDB opens a
+    graph on first touch, so the old ``--cache-graph`` default (``--graph``)
+    silently read an EMPTY graph: every record key became ``missing_in_cache``
+    and a coherent cache exited ``3``. A refusal that names both conventions is
+    the fail-closed direction.
+    """
+    from tortoise import __main__ as cli
+
+    fake = types.ModuleType("psycopg2")
+    fake.connect = lambda dsn, **kw: _FakeConn()        # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg2", fake)
+
+    rc = cli.main(["record-reconcile", "--db", "docker://:x@localhost:6379/g",
+                   "--record-dsn", "postgresql://fake/record",
+                   "--org", "acme", "--graph", "g1"])
+    err = capsys.readouterr().err
+
+    assert rc == rr.EXIT_UNAVAILABLE, err
+    assert "org_<org_id>" in err and "org_<org_id>_<graph_id>" in err, err
+    assert "UNKNOWN, not zero" in err, err
+
+
+def test_the_verb_bounds_BOTH_stores(monkeypatch, cache_graph):
+    """A wedged store must not hang a scheduled sweep — on either side.
+
+    The cache read was bounded and the record was not, so a wedged Postgres
+    blocked the sweep forever. Both bounds are asserted here because the pair
+    is the contract: a session ``statement_timeout`` (the server aborts) AND a
+    connect timeout (the handshake cannot block either).
+    """
+    view = _record_view()
+    _project(view, cache_graph)
+
+    _, _, _, connect_kwargs = _drive_the_verb(monkeypatch, cache_graph, view)
+
+    assert connect_kwargs.get("connect_timeout") == rr.RECORD_CONNECT_TIMEOUT_S
+    options = connect_kwargs.get("options", "")
+    assert f"statement_timeout={rr.RECORD_STATEMENT_TIMEOUT_MS}" in options, options
+
+
+def test_the_verb_passes_the_cache_timeout_knob(monkeypatch, cache_graph, capsys):
+    """`--timeout-ms` must reach the reader that applies it, not just the parser.
+
+    The bound was a constant with no knob, and the reader's docstring called the
+    read unbounded — a large cache would refuse (exit 2) forever on the
+    deployments that need the observer most, with nothing an operator could do.
+    """
+    view = _record_view()
+    _project(view, cache_graph)
+    recorder = _RecordingGraph(cache_graph)
+
+    rc, _, _, _ = _drive_the_verb(monkeypatch, cache_graph, view,
+                                  graph_wrapper=recorder,
+                                  extra_args=("--timeout-ms", "12345"))
+    printed = capsys.readouterr()
+
+    assert rc == rr.EXIT_CLEAN, printed.out + printed.err
+    assert recorder.read_kwargs, "the verb never read the cache"
+    # One bounded read per record label — the residency declaration's own read
+    # keeps its own (sibling) bound, so the assertion is on the COUNT of reads
+    # that carried this knob, not on the set of every timeout seen.
+    bounded = [kw for kw in recorder.read_kwargs if kw.get("timeout") == 12345]
+    assert len(bounded) == len(cp.NODE_TABLES), (
+        f"{len(bounded)} of {len(recorder.read_kwargs)} cache reads carried "
+        f"--timeout-ms: {recorder.read_kwargs}")
+
+
+def test_a_non_positive_timeout_is_refused(monkeypatch, cache_graph, capsys):
+    """0 is not a bound — the driver reads it as "wait forever".
+
+    The flag exists to close an UNBOUNDED read. Accepting `--timeout-ms 0` would
+    re-open exactly that while looking bounded, so a non-positive value refuses
+    before any store is touched.
+    """
+    view = _record_view()
+    _project(view, cache_graph)
+
+    rc, _, _, _ = _drive_the_verb(monkeypatch, cache_graph, view,
+                                  extra_args=("--timeout-ms", "0"))
+    err = capsys.readouterr().err
+
+    assert rc == rr.EXIT_UNAVAILABLE, err
+    assert "must be positive" in err, err
+    assert "UNKNOWN, not zero" in err, err
+
+
+def test_the_verb_prints_the_json_a_dashboard_reads(monkeypatch, cache_graph,
+                                                   capsys):
+    """`--json` is a landing place for the number — it must be driven, not narrated.
+
+    No test in this file passed `--json`, so the branch could be deleted with
+    every pin green while §17.2's third destination ("a dashboard can graph it
+    instead of grepping a log") quietly stopped existing.
+    """
+    import json
+
+    view = _record_view()
+    _project(view, cache_graph)
+    cache_graph.query("CREATE (:Point {id:'p-9189-json-direct'})")
+
+    rc, _, _, _ = _drive_the_verb(monkeypatch, cache_graph, view,
+                                  extra_args=("--json",))
+    printed = capsys.readouterr()
+
+    assert rc == rr.EXIT_DIVERGENT, printed.err
+    payload = json.loads(printed.out)
+    assert payload["verdict"] == rr.VERDICT_DIVERGENT
+    assert payload["extra_in_cache"] == 1
+    assert payload["checked"] == 3
+    assert payload["declaration_coverage"] == COVERAGE_COMPLETE
+
+
+def test_the_verb_does_not_claim_equality_for_keys_it_did_not_compare(
+        monkeypatch, cache_graph, capsys):
+    """`not_hot > 0` means a `partial` declaration REMOVED keys from the truth side.
+
+    The run then established equality over the compared keys only, and the old
+    `✓ record == cache … (N keys checked)` sentence stated an equality the run
+    did not establish — the §17.2 class ("a check that cannot see its evidence
+    must not report success") one line above the counts.
+    """
+    view = _record_view()
+    _project(view, cache_graph, limit=1)
+
+    rc, _, _, _ = _drive_the_verb(monkeypatch, cache_graph, view)
+    out = capsys.readouterr().out
+
+    assert rc == rr.EXIT_CLEAN, out
+    assert "1 not-hot key(s) were NOT compared" in out, out
+    assert "✓ record == cache for" not in out, out
+
+
+def test_log_result_severity_follows_the_verdict():
+    """Three verdicts, three levels — an `unanswerable` run must not be quieter.
+
+    The module docstring promised "WARNING when anything is divergent and INFO
+    otherwise", which logged a run that compared NOTHING (exit 2) at WARNING —
+    indistinguishable from a clean run at INFO for anyone filtering the log.
+    """
+    import logging
+
+    class _Rec:
+        def __init__(self) -> None:
+            self.levels: list[int] = []
+
+        def log(self, level, msg, *args) -> None:
+            self.levels.append(level)
+
+    rec = _Rec()
+    rr.log_result(rr.reconcile_record_and_cache({}, {}), rec)
+    rr.log_result(rr.reconcile_record_and_cache(
+        {"Point:p1": {"id": "p1"}}, {"Point:p1": {"id": "p1"}}), rec)
+    rr.log_result(rr.reconcile_record_and_cache(
+        {"Point:p1": {"id": "p1"}}, {}), rec)
+
+    assert rec.levels == [logging.ERROR, logging.INFO, logging.WARNING]
+
+
+def test_the_module_records_the_labels_this_trigger_cannot_see():
+    """`extra_in_cache` is not a whole-graph census — say so where a lane reads it.
+
+    The reader walks the six record `NODE_TABLES` labels, so an unjournalled node
+    under a label of a second writer's own (or the cache's `:Meta` bookkeeping
+    label) is invisible to the count. Counting or refusing unknown labels is not
+    an option (`:Meta` is always present, and the residency declaration lives
+    there), so the LIMITATION is recorded on the module that claims the count —
+    the alternative is a number read as more than it measures.
+    """
+    doc = rr.__doc__ or ""
+    assert "label OUTSIDE the record placement" in doc, doc
+    assert "extra_in_cache" in doc
+
+
+def test_a_falsy_marker_point_reports_the_WRITER_half_as_divergence(cache_graph):
+    """`'false'` end to end: the CHECK is fixed, the WRITER half is #9184's.
+
+    `cache_projection.node_statement` decides the storage form with
+    ``stored_form.is_verbatim``, whose truthiness reads the string `'false'` as
+    verbatim — so a faithful projection of that record stores the marker as
+    ``True`` (and the vector un-narrowed). The comparison then reports the
+    MARKER as one divergence, forever, until #9184's writer half lands. Pinning
+    the real output keeps the residue visible: the hand-built cache in
+    `tests/test_reconciliation.py` is what a CORRECTED writer will produce, and
+    a test that only ever feeds that cache certifies a fix the shipped writer
+    cannot reach.
+
+    Pre-fix (with `is_verbatim`'s truthiness in the CHECK's vector rule too) the
+    vector ALSO diverged and ``form_normalized`` was 0 — so this asserts the
+    split precisely: the vector agrees, the marker is the only mismatch.
+    """
+    view = cp.RecordView(nodes=(
+        cp.RecordNode(label="Point", key="p-9189-falsy",
+                      props={"id": "p-9189-falsy", "content": "alpha",
+                             "embedding": [0.1, 0.2],
+                             "embedding_verbatim": "false"}),
+    ))
+    _project(view, cache_graph)
+
+    cache = rr.read_cache_view(cache_graph)["Point:p-9189-falsy"]
+    assert cache["embedding_verbatim"] is True, (
+        "the shipped writer stores the falsy spelling truthily (#9184's writer "
+        "half) — if that changed, this pin has served its purpose: the "
+        "comparator's falsy agreement is now reachable end to end")
+    assert cache["embedding"] == [0.1, 0.2], (
+        "the writer stores the vector VERBATIM for the falsy spelling")
+
+    result = _run(view, cache_graph)
+
+    assert result.report.field_mismatches == 1, result.report.render()
+    assert result.report.divergent_keys == ("Point:p-9189-falsy",)
+    assert "form_normalized" not in result.report.render()
+    assert result.verdict() == rr.VERDICT_DIVERGENT

@@ -6,12 +6,12 @@ production population: ['tortoise', 'tools', 'scripts']/**/*.py
   tortoise/record_writer.py:375: report = record_projection.replay(
 
 == cache_projection.read_record_view: 1 production call site(s) ==
-  tortoise/__main__.py:680: view = read_record_view(conn, org_id=args.org, graph_id=args.graph)
+  tortoise/__main__.py:727: view = read_record_view(conn, org_id=args.org, graph_id=args.graph)
 
 == FalkorProjection.rebuild_from_record: 0 production call site(s) ==
 
 test population: tests/*.py
   reconciliation.reconcile: 12 test-file hit line(s)
-  record_projection.replay: 0 test-file hit line(s)
+  record_projection.replay: 1 test-file hit line(s)
   cache_projection.read_record_view: 2 test-file hit line(s)
   FalkorProjection.rebuild_from_record: 6 test-file hit line(s)

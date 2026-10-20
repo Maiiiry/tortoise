@@ -33,7 +33,16 @@ THE TRIGGER DECISION, AND ITS DETECTION LATENCY
   between two sweeps; (2) divergence introduced by a direct cache write between
   sweeps, which is observed at the NEXT sweep rather than as it happens; (3)
   RELATIONS — the comparison is over node keys, because ``reconcile_views`` is
-  (relation identity is a separate decision with its own contract, §Interface E).
+  (relation identity is a separate decision with its own contract, §Interface E);
+  (4) **nodes under a label OUTSIDE the record placement** — the cache side is
+  read over ``NODE_TABLES`` (the labels the projection writes), so a second
+  writer's node under a label of its own (or under the cache's ``:Meta``
+  bookkeeping label, which the residency declaration legitimately uses) is not
+  an ``extra_in_cache``. ``extra_in_cache`` is the signature for keys the
+  record PLACES, not a whole-graph census, and this trigger deliberately does
+  not count or refuse unknown labels: refusing would make every cache
+  unreadable (``:Meta`` is always there) and counting would report the
+  declaration as a second writer.
 
 WHERE THE NUMBER LANDS
 ======================
@@ -41,8 +50,11 @@ Three destinations, and a number nobody reads is not one of them:
 
 1. **The structured log line** — :func:`log_result` emits
    :meth:`ReconciliationReport.render` through the ``tortoise.record_reconcile``
-   logger, at WARNING when anything is divergent and at INFO otherwise. A
-   scheduled run's log is where an operator already looks.
+   logger, at a severity that follows the VERDICT: ``ERROR`` when the comparison
+   could not be made (``unanswerable`` — a run that produced no verdict must not
+   look like a quiet one), ``WARNING`` when anything is divergent, and ``INFO``
+   only for ``clean``. A scheduled run's log is where an operator already looks,
+   so the severity is part of the contract, not a formatting choice.
 2. **The process EXIT CODE** — ``0`` clean · ``3`` divergence observed · ``2``
    the comparison could not be made. A scheduler alerts on non-zero, and the
    three verdicts are distinct so "cannot answer" never reads as "agreement"
@@ -79,10 +91,13 @@ from .reconciliation import (
 from .residency import ResidencyDeclaration
 
 __all__ = [
+    "CACHE_READ_TIMEOUT_MS",
     "EXIT_CLEAN",
     "EXIT_DIVERGENT",
     "EXIT_UNAVAILABLE",
     "LOG_NAME",
+    "RECORD_CONNECT_TIMEOUT_S",
+    "RECORD_STATEMENT_TIMEOUT_MS",
     "VERDICT_CLEAN",
     "VERDICT_DIVERGENT",
     "VERDICT_UNANSWERABLE",
@@ -112,10 +127,29 @@ EXIT_CLEAN = 0
 EXIT_UNAVAILABLE = 2
 EXIT_DIVERGENT = 3
 
-#: How long a single cache read may block. The check annotates an operational
-#: sweep; a wedged store must not stall it (the bound
-#: ``residency.read_declaration`` already applies to the sibling read).
+#: The severity each verdict is logged at. Three verdicts, three levels: a
+#: run that could not answer must not be quieter than a clean one.
+_LOG_LEVEL = {
+    VERDICT_CLEAN: logging.INFO,
+    VERDICT_DIVERGENT: logging.WARNING,
+    VERDICT_UNANSWERABLE: logging.ERROR,
+}
+
+#: How long a single cache read may block — the DEFAULT, overridable per run
+#: with the CLI's ``--timeout-ms``. The check annotates an operational sweep; a
+#: wedged store must not stall it (the bound ``residency.read_declaration``
+#: already applies to the sibling read). A read that hits this refuses (exit
+#: ``2``) — it never returns a partial one.
 CACHE_READ_TIMEOUT_MS = 2000
+
+#: The RECORD side's two bounds, so a wedged Postgres cannot hang a scheduled
+#: sweep either (the cache read above is bounded, and a check that blocks
+#: forever on the other side is the same outage with half the fix).
+#: ``CONNECT_TIMEOUT_S`` bounds the handshake; ``STATEMENT_TIMEOUT_MS`` is set
+#: on the session (``-c statement_timeout=…``) so the server aborts a wedged
+#: query rather than the client waiting on it.
+RECORD_CONNECT_TIMEOUT_S = 5
+RECORD_STATEMENT_TIMEOUT_MS = 5000
 
 
 # ── the two readers ────────────────────────────────────────────────────────
@@ -149,11 +183,19 @@ def read_cache_view(g: Any, *, labels: Iterable[str] | None = None,
     part of a Cypher statement, and the only labels this check may read are the
     ones the projection writes.
 
-    ⚠️ **The read is unbounded ON PURPOSE.** A ``LIMIT`` would need truncation
-    detection of its own to stay honest, and a silently truncated read
-    UNDERCOUNTS ``extra_in_cache`` — the one number a second writer shows up in.
-    Bounding the sweep's cost is the scheduler's job, not a limit this function
-    applies and then cannot report.
+    ⚠️ **The read is never TRUNCATED — and it is BOUNDED.** A ``LIMIT`` would
+    need truncation detection of its own to stay honest, and a silently
+    truncated read UNDERCOUNTS ``extra_in_cache`` — the one number a second
+    writer shows up in. What bounds the sweep is a wall-clock ``timeout_ms``
+    (the CLI's ``--timeout-ms``, default :data:`CACHE_READ_TIMEOUT_MS`), which
+    either returns the whole answer or REFUSES: it can never return a partial
+    one, so bounding the cost cannot bias the count.
+
+    ⚠️ **The cache side is the labels the RECORD places** (``NODE_TABLES``). A
+    node under any other label is outside this comparison — see the module
+    docstring's "NOT observed under this trigger" item (4); ``extra_in_cache``
+    counts a second writer's nodes at coordinates the record OWNS, not the
+    graph's whole population.
 
     ⛔ **Every failure is a REFUSAL.** A query that raises, a row that is not a
     property mapping, a node with no contract key, and **two nodes claiming one
@@ -187,9 +229,12 @@ def read_cache_view(g: Any, *, labels: Iterable[str] | None = None,
                 timeout=int(timeout_ms),
             ).result_set
         except Exception as e:
+            # The driver's own message can carry the connection string (the
+            # cache DSN holds a password), so only the TYPE is reported — the
+            # same secret-hygiene rule the verb applies to the record side.
             raise ReconciliationUnavailable(
                 f"cache is unreadable at label {label!r} "
-                f"({type(e).__name__}: {e}) — divergence is UNKNOWN, not zero"
+                f"({type(e).__name__}) — divergence is UNKNOWN, not zero"
             ) from e
         key_property = KEY_PROPERTY[label]
         for row in rows:
@@ -325,7 +370,14 @@ def _refuse_vacuous(view: Mapping[str, Mapping], side: str) -> None:
 
 def log_result(result: RecordReconcileResult,
                logger: logging.Logger | None = None) -> str:
-    """Land the number: one structured log line, WARNING when divergent.
+    """Land the number: one structured log line, severity following the VERDICT.
+
+    ``ERROR`` for ``unanswerable`` (nothing was compared — a run that produced
+    no verdict must not read as a quiet, healthy one), ``WARNING`` for
+    ``divergent``, ``INFO`` only for ``clean``. The three verdicts get three
+    levels because a scheduler's log is read at a glance, and the module's own
+    thesis applies to severity too: a signal nobody can distinguish from
+    silence is not observability.
 
     Returns the rendered line so a caller (the CLI) prints exactly what it
     logged — one spelling of the summary, not two.
@@ -333,10 +385,10 @@ def log_result(result: RecordReconcileResult,
     line = result.report.render()
     if result.not_hot:
         line += f" [not_hot={result.not_hot} — residency, not divergence]"
-    line = f"{line} verdict={result.verdict()}"
+    verdict = result.verdict()
+    line = f"{line} verdict={verdict}"
     (logger or logging.getLogger(LOG_NAME)).log(
-        logging.WARNING if result.verdict() != VERDICT_CLEAN else logging.INFO,
-        "%s", line)
+        _LOG_LEVEL[verdict], "%s", line)
     return line
 
 

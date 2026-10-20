@@ -36,7 +36,7 @@ property that makes it safe is **`derived = replay(journal)`**. **§17** is the 
 | # | criterion | verdict | deciding artifact | homed |
 |---|---|---|---|---|
 | **S1** | every write goes to the truth store first; the cache is projected from it | ⛔ **NOT-GREEN** | `s1-bypass-probe.log`: an **armed** journal-backed projection refuses `apply` but lets `proj.g.query` write the cache directly (0 journal records) | **`#7951`** (OPEN) |
-| **S2** | truth↔cache divergence is OBSERVED, not assumed | ⛔ **NOT-GREEN** | `s2-wiring-census.log` **re-cut at `#9189`**: `read_record_view` has **1** production call site — the `record-reconcile` verb this change adds — and `record_projection.replay` **1** (`record_writer`, `#9187`). `reconcile` and `rebuild_from_record` are still **0**: nothing in the product composes them, and **no schedule drives the verb yet**, so divergence is observed only when a human runs the sweep. The measured half is clean since `#8615`: `e2e-chain-probe.log`'s clean record-sourced rebuild is `0 divergent of 7 checked (field_mismatches=0)`, and **both** second-writer signatures still register | **`#9189`** (the trigger, this change) + **`#7951`** + **`#7970`** (OPEN); the comparison rule for vector-valued properties is **CLOSED** on **`#8615`** |
+| **S2** | truth↔cache divergence is OBSERVED, not assumed | ⛔ **NOT-GREEN** | `s2-wiring-census.log` **re-cut at `#9189`**: `read_record_view` has **1** production call site — the `record-reconcile` verb this change adds — and `record_projection.replay` **1** (`record_writer`, `#9187`). `reconcile` and `rebuild_from_record` are still **0**: nothing in the product composes them, and **no schedule drives the verb yet**, so divergence is observed only when a human runs the sweep. The measured half is clean since `#8615`: `e2e-chain-probe.log`'s clean record-sourced rebuild is `0 divergent of 7 checked (missing_in_cache=0, extra_in_cache=0, field_mismatches=0, form_normalized=1)`, and **both** second-writer signatures still register | **`#9189`** (the trigger, this change) + **`#7951`** + **`#7970`** (OPEN); the comparison rule for vector-valued properties is **CLOSED** on **`#8615`** |
 | **S3** | ⭐ the completeness marker works | ✅ **GREEN** | `s3-s4-named-tests.log` + live bounded rebuild in `e2e-chain-probe.log` (`Point:p1` → `not-hot`) | `#7952` (CLOSED) |
 | **S4** | a residency miss is not an insufficiency | ✅ **GREEN** | `s3-s4-unit-tests.log`: 30 router tests; residency outranks sufficiency | `#7953` (CLOSED) |
 | **S5** | derived/volatile fields are NOT in the system of record | ✅ **GREEN** | `s5-s6-pglite-validate.log` (`20261012000001_record_schema.sql PASSED`, incl. the `subject.props.status` refusal) | `#8263` (CLOSED) |
@@ -64,7 +64,7 @@ real Postgres + a real FalkorDB:
 $ TORTOISE_DB_URI=<private lane> uv run --with psycopg2-binary \
     python docs/evidence/7950-capstone/probes/e2e_chain_probe.py
 journal records read: 39
-record projection: replayed 39 journal records → 60 record mutations (0 declared no-op)
+record projection: replayed 39 journal records → 57 record mutations (0 declared no-op)
 record row counts: {'journal_event': 39, 'source': 2, 'event': 1, 'session': 0, 'object': 1, 'subject': 1, 'point': 2, 'relation': 2, 'node_identity': 7}
 read_record_view -> 7 nodes, 2 relations
 record view by label: {'Point': 2, 'Event': 1, 'Subject': 1, 'Object': 1, 'Source': 2}
@@ -73,13 +73,13 @@ cache node counts (live read): [('Event', 1), ('Meta', 1), ('Object', 1), ('Poin
 hot read for Point 'p1': [['p1']]
 bounded rebuild declaration: coverage=partial
 unwritten record key 'Point:p1' covered-by-declaration=False → residency=not-hot
-RECONCILE (after a record-sourced rebuild): record vs cache: 0 divergent of 7 checked (missing_in_cache=0, extra_in_cache=0, field_mismatches=0)
+RECONCILE (after a record-sourced rebuild): record vs cache: 0 divergent of 7 checked (missing_in_cache=0, extra_in_cache=0, field_mismatches=0, form_normalized=1)
 ARMED FOLD (proj.apply):          refused (DirectCacheWriteRefused)
 ARMED RAW HANDLE (proj.g.query):  SUCCEEDED (direct cache write)
-RECONCILE (after a DIRECT raw-handle cache write): record vs cache: 1 divergent of 8 checked (missing_in_cache=0, extra_in_cache=1, field_mismatches=0)
+RECONCILE (after a DIRECT raw-handle cache write): record vs cache: 1 divergent of 8 checked (missing_in_cache=0, extra_in_cache=1, field_mismatches=0, form_normalized=1)
 second-writer signature -> extra_in_cache=1
 ARMED RAW HANDLE MUTATION:        Point:p1 gained an unauthorized property (Point.second_writer_marker)
-RECONCILE (after a DIRECT raw-handle property WRITE): record vs cache: 2 divergent of 8 checked (missing_in_cache=0, extra_in_cache=1, field_mismatches=1)
+RECONCILE (after a DIRECT raw-handle property WRITE): record vs cache: 2 divergent of 8 checked (missing_in_cache=0, extra_in_cache=1, field_mismatches=1, form_normalized=1)
 field-mutation signature -> field_mismatches=1
 CHAIN RESULT: journal -> record -> cache COMPLETED with the shipped modules
 ```
@@ -412,7 +412,7 @@ Recorded here because the proof touches the affected surface.
 | # | blocker |
 |---|---|
 | **S1** | enforcement on the raw-handle lane (`proj.g.query`) + the atomic write → **`#7951`** (OPEN) |
-| **S2** | a **scheduled** running reconciliation: `reconcile`/`rebuild_from_record` still have no caller and no timer drives the `record-reconcile` verb → **`#9189`** (the trigger, OPEN) + **`#7951`** + **`#7970`** (OPEN); `read_record_view` (**1** call site, `#9189`) and `record_projection.replay` (**1**, `#9187`) are wired; the comparison rule for vector-valued properties is **CLOSED** on **`#8615`** (a clean rebuild now reports `field_mismatches=0`, a second-writer property write still reports `field_mismatches=1`) |
+| **S2** | a **scheduled** running reconciliation: `reconcile`/`rebuild_from_record` still have no caller and no timer drives the `record-reconcile` verb → **`#9276`** (the scheduled sweep, OPEN) + **`#7951`** + **`#7970`** (OPEN); `read_record_view` (**1** call site, `#9189`) and `record_projection.replay` (**1**, `#9187`) are wired; the comparison rule for vector-valued properties is **CLOSED** on **`#8615`** (a clean rebuild now reports `field_mismatches=0`, a second-writer property write still reports `field_mismatches=1`) |
 | **S6 caveat** | live legacy-id normalisation (W1b) → **no issue home** |
 
 Not blocking, recorded: the marker is off by default under a `complete` declaration (§2.0's

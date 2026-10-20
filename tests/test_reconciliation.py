@@ -173,6 +173,25 @@ class TestReportShape:
         with pytest.raises(dataclasses.FrozenInstanceError):
             report.divergent = 7  # type: ignore[misc]
 
+    def test_a_positional_construction_keeps_its_pre_existing_fields(self):
+        """`form_normalized` is APPENDED LAST — a mid-dataclass field re-binds.
+
+        ``ReconciliationReport`` is frozen but NOT ``kw_only``, so inserting a
+        new defaulted field before the pre-existing defaulted ones silently
+        re-binds every positional construction: ``divergent_keys`` would arrive
+        in ``form_normalized`` and the sample would vanish while the counts
+        looked right (#9189 review). The first five fields are the count-only
+        shape callers already knew.
+        """
+        from tortoise.reconciliation import ReconciliationReport
+
+        report = ReconciliationReport(1, 0, 0, 0, 0, ("Point:p1",))
+
+        assert report.divergent_keys == ("Point:p1",)
+        assert report.form_normalized == 0
+        assert report.truth_side == "record"
+        assert report.cache_side == "cache"
+
 
 class TestFailClosed:
     """An unreadable side is UNKNOWN divergence — never agreement (#1382)."""
@@ -415,10 +434,21 @@ class TestStoredBooleanForm:
     # `embedding` at all.
 
     def test_the_falsy_spelling_does_not_force_a_permanent_vector_mismatch(self):
-        """`'false'` means the store NARROWS — a faithful cache agrees.
+        """`'false'` means the store NARROWS — a cache in the DECLARED form agrees.
 
-        Pre-fix (`is_verbatim`'s truthiness in the vector rule) this reported
-        `field_mismatches == 1` on a correctly projected point.
+        ⚠️ The cache here is the one a CORRECTED writer produces, not the one
+        the shipped `node_statement` produces today: `is_verbatim` still reads
+        the falsy spelling truthily, so the real end-to-end run stores the
+        marker `True` and the vector un-narrowed and reports the MARKER as one
+        divergence until #9184's writer half lands. That residue is pinned
+        where it is produced —
+        `test_the_shipped_writer_stores_the_falsy_marker_truthily` below and
+        `tests/test_record_reconcile_trigger.py::
+        test_a_falsy_marker_point_reports_the_WRITER_half_as_divergence`.
+
+        Pre-fix (`is_verbatim`'s truthiness in the CHECK's vector rule) this
+        reported `field_mismatches == 1` on a point whose form the DECLARED
+        marker says should narrow.
         """
         from tortoise.stored_form import narrow_to_stored_width
         stored = narrow_to_stored_width([0.1, 0.2])
@@ -451,6 +481,44 @@ class TestStoredBooleanForm:
              "embedding_verbatim": "maybe"},
             {"id": "p1", "embedding": stored, "embedding_verbatim": "maybe"})
         assert report.field_mismatches == 1, report.render()
+
+    def test_the_shipped_writer_stores_the_falsy_marker_truthily(self):
+        """#9184's remaining half, pinned against the SHIPPED writer's OUTPUT.
+
+        The hand-built caches above describe a corrected writer. This drives
+        `cache_projection.node_statement` — the module that actually materializes
+        a record node — and reconciles what it produces with the record, so the
+        residual is measured rather than narrated: the marker diverges
+        permanently for the falsy spelling until `is_verbatim` stops reading
+        `'false'` truthily, while the vector (stored un-narrowed) agrees exactly.
+
+        Pre-fix the framing claimed a clean end-to-end reconcile for `'false'`
+        on the strength of a cache the shipped writer cannot produce (#9189
+        review): a test that only feeds a hand-built cache certifies a fix the
+        product cannot reach.
+        """
+        from tortoise import cache_projection as cp
+
+        node = cp.RecordNode(label="Point", key="p1",
+                             props={"id": "p1", "embedding": [0.1, 0.2],
+                                    "embedding_verbatim": "false"})
+        stmt = cp.node_statement(node)
+        cache_props = dict(stmt.params["props"])
+        cache_props["embedding"] = stmt.params.get("embedding")
+
+        assert stmt.params.get("embedding") == [0.1, 0.2], (
+            "the writer stored the vector narrowed — `is_verbatim` changed, so "
+            "re-check this pin and the #9184 disposition")
+        assert cache_props[cp.VERBATIM_MARKER] is True, (
+            "the writer stored the marker as False — `is_verbatim` changed, so "
+            "the falsy spelling now agrees end to end")
+
+        report = reconcile_views({"Point:p1": dict(node.props)},
+                                 {"Point:p1": cache_props})
+
+        assert report.field_mismatches == 1, report.render()
+        assert report.divergent_keys == ("Point:p1",)
+        assert report.form_normalized == 0
 
     def test_the_check_and_the_writer_read_the_marker_differently(self):
         """#9184's remaining half, recorded where the difference is made.
