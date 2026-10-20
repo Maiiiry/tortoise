@@ -4396,3 +4396,21 @@ def test_a_pair_with_only_one_known_leg_count_is_not_comparable() -> None:
     assert ci_timing.candidate_flakes(history) == [], (
         "a one-sided leg count was compared and produced a pass for a test that never ran"
     )
+
+
+def test_a_killed_sample_is_not_comparable_with_a_complete_one() -> None:
+    """A killed run's unstarted shards look like passing tests afterwards.
+
+    The leg count can match (a killed run still reports a normal summary for the
+    legs that ran), so the leg-count rule alone cannot see it; `killed` is on the
+    row for exactly this (#9134 review cycle 14, non-blocking).
+    """
+    history = [
+        {"counts": {"failed": 0}, "failed_tests": [], "run_id": "2",
+         "sample_time": "t2", "legs": 16},
+        {"counts": {"failed": 1}, "failed_tests": ["tests/test_beta.py::test_never_ran"],
+         "run_id": "1", "sample_time": "t1", "legs": 16, "killed": True},
+    ]
+    assert ci_timing.candidate_flakes(history) == [], (
+        "a killed sample published its unstarted shards as tests that passed later"
+    )

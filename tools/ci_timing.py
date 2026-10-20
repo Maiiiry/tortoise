@@ -1905,6 +1905,13 @@ def candidate_flakes(history: list[dict]) -> list[dict]:
         # detector off.
         if len(known) == 1 or (len(known) == 2 and known[0] != known[1]):
             continue
+        # A KILLED sample is not a verdict on the tests it never ran either: the
+        # watchdog stops the suite mid-way, so everything in the unstarted shards
+        # is absent from `failed_tests` and would be published as having passed.
+        # The leg count may still match, because a killed run can report a normal
+        # summary per leg that did run (#9134 review cycle 14, non-blocking).
+        if newer.get("killed") or older.get("killed"):
+            continue
         prev_failed = set(older.get("failed_tests", []))
         cur_failed = set(newer.get("failed_tests", []))
         for nodeid in sorted(prev_failed - cur_failed):
