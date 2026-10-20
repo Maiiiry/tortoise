@@ -4089,19 +4089,19 @@ def test_a_partial_leg_set_must_not_replace_a_complete_measurement(
     out = tmp_path / "out"
     out.mkdir()
     (out / "ci-timing.json").write_text(json.dumps({
-        "files": {"test_alpha.py": {"max_ms": 1000.0, "tests": 42, "total_ms": 12340.0}},
-        "outcome": {"error": 0, "failed": 1, "passed": 42, "skipped": 3,
+        "files": {"test_alpha.py": {"max_ms": 1000.0, "tests": 100, "total_ms": 12340.0}},
+        "outcome": {"error": 0, "failed": 1, "passed": 100, "skipped": 3,
                     "xfailed": 0, "xpassed": 0},
         "failed_tests": ["tests/test_alpha.py::test_two"],
         "history": [{
-            "counts": {"error": 0, "failed": 1, "passed": 42, "skipped": 3,
+            "counts": {"error": 0, "failed": 1, "passed": 100, "skipped": 3,
                        "xfailed": 0, "xpassed": 0},
             "failed_tests": ["tests/test_alpha.py::test_two"],
             "run_id": "4242", "sample_time": "t1", "legs": 17,
         }],
     }))
     logs = tmp_path / "logs"
-    write_log(tmp_path, "pytest-log-test-a/pytest.log")  # ONE leg
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")  # ONE leg (reports 42 passed)
 
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
@@ -4112,7 +4112,80 @@ def test_a_partial_leg_set_must_not_replace_a_complete_measurement(
 
     assert proc.returncode == 0, proc.stderr[-400:]
     after = json.loads((out / "ci-timing.json").read_text())
-    assert after["outcome"]["passed"] == 42, (
+    assert after["outcome"]["passed"] == 100, (
         f"a one-leg render replaced a seventeen-leg measurement: {after['outcome']}"
     )
-    assert after["history"][0]["counts"]["passed"] == 42
+    assert after["history"][0]["counts"]["passed"] == 100
+
+
+def _seed_full_artifact(out: Path) -> str:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "ci-timing.json").write_text(json.dumps({
+        "files": {"test_alpha.py": {"max_ms": 1000.0, "tests": 100, "total_ms": 12340.0}},
+        "outcome": {"error": 0, "failed": 1, "passed": 100, "skipped": 3,
+                    "xfailed": 0, "xpassed": 0},
+        "failed_tests": ["tests/test_alpha.py::test_two"],
+        "history": [{
+            "counts": {"error": 0, "failed": 1, "passed": 100, "skipped": 3,
+                       "xfailed": 0, "xpassed": 0},
+            "failed_tests": ["tests/test_alpha.py::test_two"],
+            "run_id": "4242", "sample_time": "t1", "legs": 17,
+        }],
+    }))
+    return (out / "ci-timing.json").read_text()
+
+
+def test_a_partial_render_for_ANOTHER_run_cannot_shrink_the_artifact(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """The comparison is across run ids on purpose — the damage is to the artifact.
+
+    Scoping "fewer legs" to the SAME run id let the ordinary weekly case through:
+    a new run id with one of seventeen legs uploaded replaced the complete
+    measurement and omitted the failing test from history, so `candidate_flakes`
+    reported it as having PASSED later (#9134 review cycle 9).
+    """
+    out = tmp_path / "out"
+    before = _seed_full_artifact(out)
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")  # one leg, reports 42 passed
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4243",
+         "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert (out / "ci-timing.json").read_text() == before, (
+        "a one-leg render for a new run replaced a seventeen-leg measurement"
+    )
+
+
+def test_sixteen_empty_logs_do_not_make_a_complete_leg_set(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """An empty log is not a leg: it parsed nothing, so it measured nothing.
+
+    `legs` counted FILES, so seventeen files of which sixteen were 0-byte equalled
+    a complete set and the render was allowed to replace `passed 100 / failed 1`
+    with `passed 42 / failed 0` — erasing a failure (#9134 review cycle 9). Sources
+    that parsed nothing are recorded as `empty` and are not counted.
+    """
+    out = tmp_path / "out"
+    before = _seed_full_artifact(out)
+    write_log(tmp_path, "pytest-log-test-a/pytest.log")  # the one real leg
+    for i in range(16):
+        write_log(tmp_path, f"pytest-log-empty-{i}/pytest.log", "")
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(tmp_path / "logs"), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert (out / "ci-timing.json").read_text() == before, (
+        "sixteen empty logs passed for legs and let a one-leg measurement replace a full one"
+    )

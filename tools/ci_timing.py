@@ -1800,6 +1800,40 @@ def _row_is_measured(entry: dict) -> bool:
     )
 
 
+def _prior_legs(json_path: Path) -> int | None:
+    """How many legs did the artifact already record as having measured?
+
+    Read from, in order: the top-level `legs` count, the artifact's own
+    `log_sources` list (minus the sources that parsed to nothing), and the largest
+    `legs` any history row records. The `log_sources` fallback is what makes the
+    guard work against an artifact written before rows carried a count — the
+    shipped one lists 17 sources and no `legs` field at all.
+    """
+    if not json_path.exists():
+        return None
+    try:
+        data = json.loads(json_path.read_text())
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    known: list[int] = []
+    if isinstance(data.get("legs"), int):
+        known.append(data["legs"])
+    sources = data.get("log_sources")
+    if isinstance(sources, list):
+        known.append(sum(
+            1 for s in sources if isinstance(s, dict) and not s.get("empty")
+        ))
+    history = data.get("history")
+    if isinstance(history, list):
+        known.extend(
+            e["legs"] for e in history
+            if isinstance(e, dict) and isinstance(e.get("legs"), int)
+        )
+    return max(known) if known else None
+
+
 def load_history(json_path: Path) -> list[dict]:
     """Prior samples from the tool's OWN artifact, or [] if it is unusable.
 
@@ -2106,6 +2140,13 @@ def aggregate_logs(logs_dir: Path | str) -> dict:
                         "counts": parsed["counts"]}
         if from_progress:
             source["counts_from_progress"] = from_progress
+        # A log that parsed to NOTHING (0 bytes, or truncated before any output) is
+        # recorded for diagnosis but is not a leg that measured anything, so it
+        # must not count towards "how many legs did this render see": a set of 17
+        # files of which 16 are empty would otherwise look complete and be allowed
+        # to replace a full measurement with a one-leg one (#9134 review cycle 9).
+        if not parsed["files"] and not any(parsed["counts"].values()) and not parsed["outcomes"]:
+            source["empty"] = True
         log_sources.append(source)
     return {"files": files, "total_counts": total_counts, "killed_any": killed_any,
             "failed_tests": failed_tests, "log_sources": log_sources}
@@ -2219,7 +2260,7 @@ def main() -> int:
         "steps_total_ms": sum(s["duration_ms"] for job in steps.values() for s in job),
         "steps_max_job_ms": max((sum(s["duration_ms"] for s in job) for job in steps.values()), default=0),
         "failed_tests": sorted(failed_tests),
-        "legs": len(log_sources),
+        "legs": sum(1 for source in log_sources if not source.get("empty")),
     }
     previous = load_history(json_path)
     # A render that MEASURED NOTHING is not a measurement, and must not overwrite
@@ -2229,41 +2270,36 @@ def main() -> int:
     # The refusal is limited to an artifact that already HOLDS measurements
     # (`files`/`outcome`), so a history-only seed — and a first render into an
     # empty directory — still writes what it can.
-    measured_now = bool(files) or any(total_counts[key] > 0 for key in COUNT_KEYS)
+    legs = sum(1 for source in log_sources if not source.get("empty"))
     if run_id:
-        same = [e for e in previous if e.get("run_id") == run_id]
         rest = [e for e in previous if e.get("run_id") != run_id]
     else:
         # `--run-id ""` (what ci-timing.yml calls when no run is picked) carries
         # no run identity at all, so identical rows would otherwise accumulate up
         # to `--max-history` and evict real samples. One no-run row at most.
-        same = [e for e in previous if not e.get("run_id")]
         rest = [e for e in previous if e.get("run_id")]
 
-    # Refuse to write when this render would replace a measurement with LESS than
-    # the artifact already holds. Two ways that happens:
+    # Refuse to write when this render measured LESS than the artifact already
+    # records. One rule covers every case that used to be handled separately:
     #
-    #  * it measured NOTHING — no logs, or logs that parse to nothing (a 0-byte or
-    #    SIGKILL-truncated leg), reached when `pick_run` re-picks a run whose
-    #    artifacts have expired;
-    #  * it measured LESS — a partial artifact set (one leg of seventeen uploaded)
-    #    still counts as measured, so its smaller counts would replace the full
-    #    ones, and a test that failed in the kept history but is missing from the
-    #    partial render reads as a FLAKE that never happened (#9134 review cycle 8).
+    #  * it measured NOTHING — no logs, or logs that parsed to nothing (0-byte or
+    #    SIGKILL-truncated), reached when `pick_run` re-picks a run whose artifacts
+    #    have expired;
+    #  * it measured FEWER LEGS than the artifact already has — a partial upload
+    #    (one leg of seventeen), whether or not it carries the same run id. This is
+    #    the case that fabricates flakes: a smaller sample omits a test that failed
+    #    in the history, and `candidate_flakes` reads the omission as a pass.
     #
-    # Rows record how many legs produced them, so the second case is detectable.
-    # Both keep the artifact untouched: a render that measured less is not a
-    # correction of the one that measured more.
-    prior = same[0] if same and isinstance(same[0], dict) else None
-    prior_legs = prior.get("legs") if prior else None
-    fewer_legs = (
-        measured_now
-        and isinstance(prior_legs, int)
-        and len(log_sources) < prior_legs
-        and _row_is_measured(prior)
-    )
-    if (not measured_now or fewer_legs) and _holds_measurements(json_path):
-        reason = "nothing" if not measured_now else "fewer legs than the artifact already records"
+    # "Legs" counts sources that PARSED something, so seventeen files of which
+    # sixteen are empty cannot pass for a complete set. Comparing across run ids is
+    # deliberate: the damage is to the artifact, not to the run.
+    prior_legs = _prior_legs(json_path)
+    too_little = legs == 0 or (prior_legs is not None and legs < prior_legs)
+    if too_little and _holds_measurements(json_path):
+        reason = (
+            "nothing" if legs == 0
+            else f"{legs} leg(s) where the artifact already records {prior_legs}"
+        )
         print(
             f"::warning::this render measured {reason} — keeping the existing "
             "artifact instead of replacing measured numbers with a smaller sample",
@@ -2291,6 +2327,7 @@ def main() -> int:
         "outcome": {k: total_counts[k] for k in COUNT_KEYS} | {"killed": killed_any},
         "failed_tests": sorted(failed_tests),
         "log_sources": log_sources,
+        "legs": legs,
         "candidate_flakes": flakes,
         "history": history,
     }
