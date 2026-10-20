@@ -1495,7 +1495,7 @@ def _command_shape(args) -> _CommandShape | None:
     Both pinned ``redis`` serializers pack ``args[0]`` with
     ``args[0].encode().split()`` / ``args[0].split()`` before sending — the same
     measurement `projection._handle_command_words` records for the #9209
-    classifier — so these four spellings reach the server BYTE-IDENTICAL:
+    classifier — so the arguments of a command may ride inside its command WORD:
 
         execute_command("GRAPH.QUERY", <graph>, "CREATE (n:X)")       # canonical
         execute_command("GRAPH.QUERY <graph>", "CREATE (n:X)")        # 2 args
@@ -1504,9 +1504,22 @@ def _command_shape(args) -> _CommandShape | None:
 
     A reader that requires three positional arguments with an exact verb at
     ``args[0]`` closes ONE spelling and leaves the rest open — measured on an
-    ARMED journal-backed projection: the 2-arg and 1-arg spellings wrote the
-    cache with no refusal and no census entry, which is the exact hole the #9209
-    review closed at the classifier and this door had not closed for itself.
+    ARMED journal-backed projection: the 2-arg and the empty-head spellings wrote
+    the cache with no refusal and no census entry, which is the exact hole the
+    #9209 review closed at the classifier and this door had not closed for
+    itself.
+
+    ⚠️ THE 1-ARG SPELLING IS NOT THE SAME WRITE, and the difference is the
+    SERVER's, so it is stated instead of assumed (this docstring first claimed
+    all four were byte-identical, which review measured false): the split words
+    become SEPARATE SERVER ARGUMENTS and ``GRAPH.QUERY`` reads its Cypher from the
+    THIRD one only. ``execute_command("GRAPH.QUERY <graph> CREATE (n:X)")``
+    therefore arrives as ``("GRAPH.QUERY", <graph>, "CREATE", "(n:X)")`` and the
+    engine answers ``Invalid input at end of input … errCtx: CREATE`` (measured,
+    v4.20.6) — it cannot carry a multi-word statement at all. It is still READ
+    here, and the whole remainder is returned as the statement ON PURPOSE: the
+    fail-closed direction is to judge the text the caller asked to write, and
+    never to answer "not a write" because the wire would have truncated it.
 
     THE TWO READERS OF THIS CHANNEL MUST NOT DISAGREE (#9124): the projection's
     `_command_statement` and this module's `_guard_execute_command` both call this

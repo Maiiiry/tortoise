@@ -68,10 +68,10 @@ is only honest if it says where it stops:
     that one channel (stated on ``_JOURNAL_BACKED_KEYS``).
 
 WHAT THIS FILE PROVES ON THE PRE-FIX TREE (stated exactly, #9079 review P3). It
-collects **36** cases under pytest (25 at the first review head: 15 test
+collects **37** cases under pytest (25 at the first review head: 15 test
 functions, with one parametrisation adding 5 and one adding 7; the review fixes
-add the split-spelling, bytes-graph-name, `close()` and command-target pins, plus
-the two raw-shape pins). On ``origin/main`` it does
+add the split-spelling, bytes-graph-name, `close()`, `_NON_MUTATING_HANDLE_METHODS`
+detector and command-target pins, plus the two raw-shape pins). On ``origin/main`` it does
 not report "8 failed / 4 passed": its module-level imports
 (`_client_store_key`, `_journal_backed_graphs`, `_journal_backed_keys`,
 `_dispatch_decided`) do not exist there, so the run is a single collection
@@ -200,16 +200,25 @@ def test_escape_three_the_command_channel_is_refused_when_armed(armed_sdk, enfor
 #
 # ⛔ THE FIRST ARGUMENT IS SPLIT BY THE SERIALIZER (#9079 review, P1). Both
 # pinned ``redis`` packers do ``args[0].encode().split()`` / ``args[0].split()``
-# before sending, so these three spellings reach the server BYTE-IDENTICAL:
+# before sending, so the arguments of a command can ride inside its command WORD:
 #
 #     execute_command("GRAPH.QUERY", <graph>, "CREATE (n:Split {id:'s'})")
 #     execute_command("GRAPH.QUERY <graph>", "CREATE (n:Split {id:'s'})")
 #     execute_command("GRAPH.QUERY <graph> CREATE (n:Split {id:'s'})")
 #
 # A reader gated on ``len(args) >= 3`` and an exact verb at ``args[0]`` saw only
-# the first: MEASURED pre-fix, the other two wrote an ARMED journal-backed cache
-# with no refusal and no census entry — the same spelling-shaped class #9209
-# closed at the classifier, through the door this file is named after.
+# the first: MEASURED pre-fix, the 2-arg spelling wrote an ARMED journal-backed
+# cache with no refusal and no census entry (and the empty-head spelling, one
+# case below, did the same) — the same spelling-shaped class #9209 closed at the
+# classifier, through the door this file is named after.
+#
+# ⚠️ The fully-inline 1-arg spelling is NOT the same write on the wire, and it is
+# kept as a case anyway: the split words become separate SERVER arguments and
+# ``GRAPH.QUERY`` reads its Cypher from the THIRD one, so the engine receives the
+# single word ``CREATE`` and answers a grammar error (measured, v4.20.6). The
+# door refuses it before dispatch — the fail-closed direction, since a payload
+# that cannot be shown to be a read is not forwarded — and the census names the
+# text the caller asked to write.
 _SPLIT_WRITE = "CREATE (n:Split {id:'s'})"
 
 
@@ -270,6 +279,13 @@ def test_a_split_spelling_is_refused_at_the_client_handle(armed_sdk, enforced):
     ("proj.g.execute_command (head carries the graph)",
      lambda proj: proj.g.execute_command(
          f"GRAPH.QUERY {proj.graph_name}", "CREATE (n:Once {id:'once'})")),
+    # ... and for the spelling whose command starts at ``args[1]`` because the
+    # serializer DROPPED an empty command word: the key named ``args[1]`` (the
+    # VERB) rather than the graph, so again nothing was suppressed.
+    ("proj.g.execute_command (empty command word)",
+     lambda proj: proj.g.execute_command(
+         "", "GRAPH.QUERY", proj.graph_name,
+         "CREATE (n:Once {id:'once'})")),
 ])
 def test_one_write_is_counted_exactly_once_whatever_the_channel(
         armed_sdk, measure_only, shape):
@@ -573,19 +589,30 @@ def test_a_write_handle_over_a_journal_less_projection_cannot_write_a_journals_c
         with pytest.raises(DirectCacheWriteRefused):
             proj_outsider.db.select_graph(proj_victim.graph_name).query(
                 "CREATE (n:Hijack {id:'h2'})")
-        # ⛔ AND THE COMMAND CHANNEL NAMES ITS OWN GRAPH (#9079 review, P2): the
-        # journal-less projection's OWN handle (its own graph) issuing a
-        # GRAPH.QUERY that names the JOURNAL-BACKED graph. `execute_command`
-        # writes the graph the COMMAND names, which is not `self._g.name`, so
-        # judging the handle's name left the write undecided while
-        # `_decision_key` planted the suppression for the command's graph — the
-        # client door below stood down and the write landed.
+        # ⛔ THE SAME BYPASS ONE VERB OVER (#9079 review — MEASURED at the head:
+        # NOT REFUSED, the CREATE landed, census empty). `Graph.execute_command`
+        # is the CLIENT's raw method, so the graph it writes is the one its
+        # PAYLOAD names — while this door judged `self._g.name`, i.e. a graph
+        # nobody journals. The suppression key reads the payload's graph, so it
+        # then told the client door below to stand down and an ARMED projection
+        # accepted the write through a handle it had approved as out of scope.
+        # BOTH spellings are pinned: a foreign handle whose own graph nobody
+        # journals (`other`), and the journal-less projection's OWN handle.
+        other = _GuardedGraph(
+            proj_outsider.db.select_graph(f"not_the_victim_{id(proj_victim)}"),
+            proj_outsider)
+        with pytest.raises(DirectCacheWriteRefused):
+            other.execute_command(
+                "GRAPH.QUERY", proj_victim.graph_name,
+                "CREATE (n:HijackCmd {id:'h3'})")
+        assert int(proj_victim.db.select_graph(proj_victim.graph_name).query(
+            "MATCH (n:HijackCmd) RETURN count(n)").result_set[0][0]) == 0
         with pytest.raises(DirectCacheWriteRefused):
             proj_outsider.g.execute_command(
                 "GRAPH.QUERY", proj_victim.graph_name,
-                "CREATE (n:Hijack {id:'h3'})")
+                "CREATE (n:HijackCmd2 {id:'h6'})")
         assert int(proj_victim.db.select_graph(proj_victim.graph_name).query(
-            "MATCH (n:Hijack) RETURN count(n)").result_set[0][0]) == 0
+            "MATCH (n:HijackCmd2) RETURN count(n)").result_set[0][0]) == 0
     finally:
         victim.close()
         outsider.close()

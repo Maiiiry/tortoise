@@ -4731,8 +4731,7 @@ class _GuardedGraph:
         self._g = g
         self._proj = projection
 
-    def _refuse_unauthorized_cache_write(
-            self, statement: str, command_target=None) -> None:
+    def _refuse_unauthorized_cache_write(self, statement: str, target=None) -> None:
         """§17.1 at the THIRD door: this handle is not a bypass.
 
         `FalkorProjection.apply` (the fold) and `FalkorProjection.query` (the
@@ -4785,22 +4784,27 @@ class _GuardedGraph:
         # suppression then blinded. The registry is the same target test the
         # client door uses, so the two doors answer about the same graph.
         #
-        # ⛔ AND ON THE COMMAND CHANNEL IT IS *COMMAND_TARGET* (#9079 review,
-        # P2 — the last fail-open). ``execute_command`` writes the graph the
-        # COMMAND names, and that need not be ``self._g.name``: for
+        # ⛔ AND THE COMMAND CHANNEL'S TARGET IS *THE PAYLOAD'S GRAPH* (#9079
+        # review, both lanes — MEASURED fail-open). `Graph.execute_command` IS
+        # the client's raw method (the vendor binds it as an instance
+        # attribute), so it writes whatever graph its PAYLOAD NAMES, and
+        # nothing constrains that to `self._g`. For
         # `_GuardedGraph(<graph A>).execute_command("GRAPH.QUERY", <graph B>, …)`
         # this door judged A (nothing to decide), while `_decision_key` —
-        # correctly — planted the suppression key for B. The client door one hop
+        # correctly — planted the suppression key for B; the client door one hop
         # below then stood down for a graph this handle never decided about, so
-        # the write to B landed with NO refusal and NO census entry (measured:
-        # a journal-less owner's handle writing a journal-backed graph). Both
-        # targets are judged — the handle's own (the query verbs, and the
-        # journal-backed-OWNER polarity that over-refuses on purpose) AND the
-        # command's — so the key and the decision name one graph.
-        target = getattr(self._g, "name", None)
-        targets = [target]
-        if isinstance(command_target, str) and command_target != target:
-            targets.append(command_target)
+        # the write to B landed with NO refusal and NO census entry (measured on
+        # an ARMED projection: NOT REFUSED, the CREATE landed, census == {}).
+        #
+        # BOTH graphs are judged — the handle's own (the query verbs, and the
+        # journal-backed-OWNER polarity that over-refuses on purpose, so this
+        # change ADDS a target and relaxes nothing) AND the payload's (passed as
+        # *target* on the one verb whose graph is an ARGUMENT) — so the
+        # suppression key and the decision always name one graph.
+        own_target = getattr(self._g, "name", None)
+        targets = [own_target]
+        if isinstance(target, str) and target != own_target:
+            targets.append(target)
         store_key = _client_store_key(getattr(self._g, "client", None))
         if not (getattr(self._proj, "_journal_backed", False)
                 or any(_is_journal_backed_target(store_key, name)
@@ -4950,17 +4954,18 @@ class _GuardedGraph:
         # past as one token.
         statement = _command_statement(args, kwargs)
         if statement:
-            # ⛔ THE TARGET IS THE GRAPH THE COMMAND NAMES, not the handle's own
-            # (#9079 review, P2). `_decision_key` below keys the suppression on
-            # the SAME shape reader, so judging the handle's name here left one
-            # write to a journal-backed graph undecided AND suppressed. Read
-            # through `_command_shape` — never `args[1]` — for the same reason
-            # the statement is: the client splits `args[0]`, so the graph can
+            # ⛔ The TARGET is the graph the PAYLOAD names, not this handle's
+            # (#9079 review): `Graph.execute_command` is the client's raw
+            # method, so the command's own graph decides where the write lands
+            # and `self._g.name` need not even be the same graph. `_decision_key`
+            # below keys the suppression on the SAME shape reader, so judging
+            # the handle's name alone left one write to a journal-backed graph
+            # undecided AND suppressed. Read through `_command_shape` — never
+            # `args[1]` — because the client splits `args[0]`, so the graph can
             # ride inside the first argument.
-            payload = _command_shape(args)
+            shape = _command_shape(args)
             self._refuse_unauthorized_cache_write(
-                statement,
-                command_target=(payload.graph if payload is not None else None))
+                statement, target=shape.graph if shape is not None else None)
 
         # #9209: the guards below read a Cypher STATEMENT, so a command that
         # carries none (``GRAPH.DELETE``, ``FLUSHALL``) reached the graph
