@@ -61,12 +61,16 @@ neither the live nor the replay lane:
   the truthful 410 instead of `[]` forever. A declared truncation with a cursor
   contract, not corruption.
 * the watermark in `reestablish_watermark`, whose lane is stated by its CALLER
-  and opened HERE, at the handle: `rebuild()` re-derives the value from the
-  journal's own rebuild and declares the replay lane (`#9224`), while
-  `rebuild_all` puts back the value it CAPTURED before the wipe and names that
-  leg (`pre-wipe-restore: …`, `#9210`). The declaration has to live at the write
-  because an inner scope SHADOWS an outer one (`_cache_write_authorized` is a
-  `ContextVar`), so a `with` at the call site could not state the lane at all.
+  and opened HERE, at the handle: `rebuild_all` puts back the value it CAPTURED
+  before the wipe and names that leg (`pre-wipe-restore: …`, `#9210`), while
+  the journal engine `rebuild()` — which ALSO puts back a captured value, taken
+  by `capture_watermark` before its own wipe — keeps the engine's method-wide
+  `"replay"` and is a DEFERRED instance of the same defect, left to `#9213`
+  rather than claimed truthful (it was claimed to "re-derive" the value from
+  the journal, which the code refutes; see the helper's docstring). The
+  declaration has to live at the write because an inner scope SHADOWS an outer
+  one (`_cache_write_authorized` is a `ContextVar`), so a `with` at the call
+  site could not state the lane at all.
 
 ⚠️ The declarations are NOT a licence for the swallow: `append_event` and
 `_refresh_first_seq` still catch bare `Exception` (a store failure must never
@@ -481,9 +485,17 @@ def reestablish_watermark(proj, carried_last_seq: int | None, *,
     from this graph immediately before the wipe, so it names its restore leg
     (``pre-wipe-restore: :GraphEventMeta watermark (#4653)``, #9210) — the replay
     lane's contract ("this content came FROM the record") is FALSE for it. The
-    journal engine `rebuild()` re-derives the watermark from the replayed log
-    instead, keeps the default, and so keeps this module's landed declaration
-    (#9224). The lane is opened at the write below, never at the call site: the
+    journal engine `rebuild()` puts back a captured value TOO — it calls
+    `capture_watermark` before its own wipe and hands the result here — so the
+    same contract is false for it as well; it keeps the default and therefore
+    keeps this module's landed declaration (#9224) as a DEFERRED instance of
+    that defect, disclosed here and left to `#9213`, NOT because the value
+    comes from the replayed log (it does not: the carry is a pre-wipe read of
+    the live counter). ⚠️ A blanket restore reason is not the honest fix for
+    that caller either: `last_seq` is `max(carried, max(:GraphEvent.seq))`, so
+    the stored value can be the REPLAYED seq when it is higher — the two
+    sources have to be split before one lane can describe the write. The lane
+    is opened at the write below, never at the call site: the
     scope is a `ContextVar`, so an inner declaration shadows an outer one, and a
     `with` around the call would be silently discarded — the exact way the
     watermark went on declaring `"replay"` while restoring captured state.
@@ -599,11 +611,14 @@ def reestablish_watermark(proj, carried_last_seq: int | None, *,
     # reads the PRE-clause value — Cypher evaluates a SET clause against the
     # state before it.
     # §17.1 (#9124, #9210, #9224): this write never arrives at the handle
-    # undeclared, but WHICH lane it declares is the caller's to state — the
-    # replay lane when `rebuild()` re-derived the value from the replayed log
-    # (#9224's landed declaration), this lane's own named restore leg when
-    # `rebuild_all` is putting back the value it captured before the wipe
-    # (#9210). `_cache_write_authorized` is the same single-writer ContextVar
+    # undeclared, but WHICH lane it declares is the caller's to state — this
+    # lane's own named restore leg when `rebuild_all` is putting back the value
+    # it captured before the wipe (#9210), the engine's replay lane for
+    # `rebuild()`, which restores a captured counter as well but keeps the
+    # `"replay"` default as a DEFERRED #9213 item (not because its value is
+    # journal-derived — see the docstring; a blanket restore reason would be
+    # false for the `max(carried, max(:GraphEvent.seq))` leg).
+    # `_cache_write_authorized` is the same single-writer ContextVar
     # every scope uses, so an undeclared caller still fails closed on `None`;
     # the lane is opened here because an inner scope shadows an outer one, so a
     # `with` at the call site could never be the declaration.

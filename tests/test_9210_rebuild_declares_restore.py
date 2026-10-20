@@ -27,8 +27,17 @@ its own reason (`restore_reason=…`), and the helper opens the lane around its
 own `MERGE`. That is deliberate — an inner declaration SHADOWS an outer one, so
 `#9224`'s landed `_replay_write_scope()` inside that helper made a `with` at
 this call site inert, and the lane has to be stated at the write. The helper's
-other caller (`rebuild()`) passes nothing and keeps `#9224`'s `"replay"`,
-which is true there: it re-derives the value from the replayed log.
+other caller (`rebuild()`) passes nothing and keeps `#9224`'s `"replay"`.
+That is a DEFERRED instance of the same defect, disclosed rather than claimed
+truthful: `rebuild()` also puts back a value it CAPTURED from the graph before
+its own wipe (`capture_watermark`), so the replay lane's contract is false for
+it too — and a blanket restore reason would be false in the OTHER direction,
+because `reestablish_watermark` stores `max(carried, max(:GraphEvent.seq))`, so
+the stored `last_seq` can be the replayed seq when that is higher. The two
+sources have to be split before one lane can describe that write, which is why
+`#9213` owns it and why
+`test_the_journal_engines_watermark_stays_disclosed_as_deferred` measures the
+deferral instead of trusting a sentence about it.
 
 Handing them the replay permit is therefore an over-authorization: the
 declaration claims a wider write scope than the restore performs. `#9124`'s
@@ -85,6 +94,16 @@ covered by the properties above. THREE things, and the third is not bounded:
    `MERGE` — are caught only while they stay in the table. Closing the gap
    for all shapes is `#9124`'s handle guard armed, not a test that claims to
    have done it.
+
+AND ONE WRITE THAT IS NOT A RESTORE AT ALL, which is disclosed here because
+it is the mirror of the residual above rather than a part of it: the same
+engine also writes the sticky `config_reset` marker
+(`set_config_reset_marker()`, `#2814`) on the post-restore config-verification
+FAILURE path, and that write carries the engine's `"replay"` — correctly,
+since its props are AUTHORED at write time, not captured before the wipe. It
+is therefore NOT a `pre-wipe-restore:` leg and must not be judged as an
+undeclared one, which is why `_NOT_A_RESTORE_STATEMENTS` exempts it
+statement-exactly instead of the rule reddening on correct product code.
 
 Lane: either. The fixtures build the SDK the way the embedded carve-out suite
 does, and the bulk-wipe guard passes on the redirected `test_*_tortoise` graph
@@ -284,15 +303,43 @@ def _leg_of(cypher: str) -> str | None:
 #: `MERGE (m:TeamMeta) ON CREATE SET m += $props`). Matched WITHOUT the leg
 #: table on purpose: `#9210`'s residual is that the funnel is VOLUNTARY, so a
 #: pin that only knows the eleven classified statements cannot see a twelfth.
-#: MEASURED over a full `rebuild_all` run: this shape matches restore statements
-#: ONLY — the journal fold's own map write binds `$extra`, not `$props` — which
-#: is what lets it be a RULE here instead of one more table. Checked at source
-#: too: every `+= $props` statement in `tortoise/projection/__init__.py` is one
-#: of these restore legs, plus `_replay_log`'s `:TeamMeta` marker (another
-#: engine, never reached from `rebuild_all`). If a FUTURE non-restore write ever
-#: adopts the shape it must be exempted EXPLICITLY here — the alternative is a
-#: rule with a silent hole.
+#: MEASURED over a full `rebuild_all` run on a graph whose config restore
+#: SUCCEEDS: this shape matches the restore statements and nothing else — the
+#: journal fold's own map writes bind `$attrs` (`projection/__init__.py`'s two
+#: `SET r += $attrs` folds), not `$props` — which is what lets it be a RULE
+#: here instead of one more table. It is not TRUE of the whole module, and the
+#: difference is named rather than tolerated: see
+#: `_NOT_A_RESTORE_STATEMENTS` below, which is the shape-matching write
+#: `_rebuild_all_replay` CAN emit on a path this fixture never enters.
 _RESTORE_MAP_SHAPE = re.compile(r"\bSET \w+ \+= \$props\b")
+
+#: Writes that MATCH the restore MAP SHAPE and are NOT snapshot restores, so the
+#: shape rule must not judge them. Keyed on the WHOLE normalized statement
+#: (never a fragment): a fragment here would exempt a real restore leg that
+#: happened to share a prefix — a silent hole pointing the other way, which is
+#: the one direction this rule exists to avoid.
+#:
+#: ONE statement, two writers, both `:Meta` known-hot/state markers a rebuild
+#: AUTHORS at write time — `set_config_reset_marker()` (`#2814`, the sticky
+#: `config_reset` marker) and `residency.declare_residency` (reached through
+#: `cache_projection.write_declaration`, `#7952`). Neither puts back a captured
+#: property set: `set_config_reset_marker` builds its props from
+#: `_config_reset_props(read_config_reset(g), reason)` when it is called, so
+#: declaring it `pre-wipe-restore:` would make the lane's contract false in the
+#: other direction, and it is NOT the restore of a captured `config_reset` node
+#: (that one rides the config leg, whose statement binds `$identity`).
+#: REACHABILITY: the `config_reset` write is issued from INSIDE
+#: `_rebuild_all_replay` (`projection/__init__.py`, the post-restore
+#: config-verification failure branch) under the engine's method-wide
+#: `"replay"`, and
+#: `tests/test_rebuild_config_preservation.py::test_post_restore_mismatch_sets_config_reset_and_logs_error`
+#: drives exactly that path — so without this exemption the shape rule would
+#: red on CORRECT product code and blame the `#9210` lane for a marker write
+#: that is not a restore at all (`test_the_config_reset_marker_is_not_read_as_a_restore_leg`
+#: pins that, and pins that this exemption is statement-exact).
+_NOT_A_RESTORE_STATEMENTS: frozenset[str] = frozenset({
+    "MERGE (n:Meta {key:$key}) SET n += $props",
+})
 
 
 def _shape_violations(seen):
@@ -303,12 +350,18 @@ def _shape_violations(seen):
     is the half `_leg_of` cannot reach. The reason it must not carry is the
     engine's own `"replay"`, i.e. the false contract inherited by a write that
     never declared itself.
+
+    The rule has exactly one exemption, `_NOT_A_RESTORE_STATEMENTS` — writes in
+    the shape that are NOT restores — matched on the whole statement so it
+    cannot swallow a leg.
     """
     out: list[tuple[str, str | None]] = []
     for cypher, reason in seen:
         if not _RESTORE_MAP_SHAPE.search(_norm(cypher)):
             continue
         if isinstance(reason, str) and reason.startswith(f"{RESTORE}:"):
+            continue
+        if _norm(cypher) in _NOT_A_RESTORE_STATEMENTS:
             continue
         out.append((_norm(cypher)[:120], reason))
     return out
@@ -593,6 +646,72 @@ def test_a_bare_restore_write_in_the_map_shape_is_caught(tmp_path,
         sdk.close()
 
 
+def test_the_config_reset_marker_is_not_read_as_a_restore_leg(tmp_path,
+                                                             monkeypatch):
+    """The shape rule's ONE exemption, and why it is an exemption.
+
+    `_rebuild_all_replay` emits one write in the restore MAP SHAPE that is not a
+    snapshot restore: `set_config_reset_marker()`'s sticky `config_reset`
+    marker, on the post-restore config-verification FAILURE branch, under the
+    engine's method-wide `"replay"`. Its props are AUTHORED at write time, so
+    the restore lane would be FALSE for it — but without an explicit exemption
+    the shape rule flags it, and the flag lands on the `#9210` lane while the
+    suite that drives the path is green (`test_rebuild_config_preservation.py`).
+
+    NON-VACUITY, three ways:
+      * the statement really does match `_RESTORE_MAP_SHAPE` (asserted), so the
+        exemption is load-bearing — delete `_NOT_A_RESTORE_STATEMENTS` and the
+        second assertion reds;
+      * the reason observed at the handle is NOT a restore reason, so this is
+        the genuine un-declared case and not one already covered by the
+        reason branch above it (if a future edit routes the marker through the
+        funnel, this arm tells the next reader the exemption is now dead
+        rather than silently keeping it);
+      * EXACTNESS: the same shape one alias away is still flagged, so the
+        exemption is a statement, not a pattern that could swallow a leg.
+    """
+    from tortoise.projection import set_config_reset_marker
+
+    sdk, _events = _mk_sdk(tmp_path)
+    try:
+        proj = sdk._get_proj()
+        seen = _record_authorizations(monkeypatch)
+
+        # The engine's own method-wide permit (`rebuild_all` → `#9213`), which
+        # is the authorization this write inherits on the failure path.
+        with _replay_write_scope():
+            set_config_reset_marker(proj.g, "restore_incomplete")
+
+        marker = [(cypher, reason) for cypher, reason in seen
+                  if _RESTORE_MAP_SHAPE.search(_norm(cypher))]
+        assert marker, (
+            "the config_reset marker did not reach the handle in the restore "
+            "MAP SHAPE, so this test proves nothing about the exemption; "
+            f"observed={[(_norm(c)[:60], r) for c, r in seen]!r}")
+        _cypher, reason = marker[0]
+        assert not (isinstance(reason, str)
+                    and reason.startswith(f"{RESTORE}:")), (
+            "the config_reset marker is riding a `pre-wipe-restore:` "
+            "declaration. Its props are AUTHORED at write time, not captured "
+            "before the wipe, so that contract would be false: either route "
+            "it back to the engine's replay permit, or delete the now-dead "
+            f"exemption (reason={reason!r})")
+        assert _shape_violations(seen) == [], (
+            "the shape rule blamed the #9210 restore lane for a marker write "
+            "that is not a restore — the false RED the exemption exists to "
+            f"prevent: {_shape_violations(seen)!r}")
+
+        # The exemption is the WHOLE statement, not the shape.
+        near_miss = [("MERGE (m:Meta {key:$key}) SET m += $props",
+                      _CACHE_WRITE_AUTHORIZED.get())]
+        assert _shape_violations(near_miss), (
+            "the exemption matches a PATTERN, not a statement: a near-miss "
+            "restore-shaped write with no declaration must still be flagged, "
+            "or the rule has a hole it cannot see")
+    finally:
+        sdk.close()
+
+
 def test_the_restore_lane_does_not_claim_a_record_fold(tmp_path, monkeypatch):
     """The mirror defect: a lane that authorizes MORE than it describes.
 
@@ -616,6 +735,65 @@ def test_the_restore_lane_does_not_claim_a_record_fold(tmp_path, monkeypatch):
         assert not misattributed, (
             "the pre-wipe restore lane was in force over a write that is not a "
             f"snapshot restore (#9210): {misattributed}")
+    finally:
+        sdk.close()
+
+
+def test_the_journal_engines_watermark_stays_disclosed_as_deferred(tmp_path,
+                                                                 monkeypatch):
+    """`rebuild()`'s watermark is a DEFERRED #9213 item, measured, not asserted.
+
+    `rebuild_all` (this PR) declares its watermark leg; the journal engine
+    `rebuild()` puts back a value it CAPTURED before its own wipe
+    (`capture_watermark`) and still writes it under the engine's method-wide
+    `"replay"`. Five artifacts used to say that was fine because `rebuild()`
+    "re-derives the value from the replayed log" — the code refutes it (the
+    carry is a pre-wipe read of the live counter), and nothing observed the
+    reason at the write, which is how the claim drifted unchallenged. This is
+    that observation.
+
+    It is honest about what it is: a pin on the DISCLOSED state, not on a
+    defect this PR fixes. It is not vacuous in either direction — it reds if the
+    watermark write never reaches the handle (so it cannot pass on a rebuild
+    that silently did nothing), and it reds the moment the lane CHANGES, which
+    is exactly when the disclosure in `event_store.py`, the
+    `_prewipe_restore_write_scope` docstring and
+    `docs/architecture/STORAGE-ARCHITECTURE.md` §17.1 must be updated with it.
+    The value provenance that makes a blanket `pre-wipe-restore:` reason wrong
+    here (the replayed `seq` can win the `max`) is pinned at the helper seam by
+    `test_rebuild_event_meta_watermark_4653.py`;
+    `test_reestablish_watermark_never_moves_below_the_replayed_log`.
+    """
+    from tortoise.log import EventLog
+
+    sdk, events = _mk_sdk(tmp_path)
+    try:
+        sdk.create_point("statement", "the watermark carries across a rebuild")
+        proj = sdk._get_proj()
+        seen = _record_authorizations(monkeypatch)
+
+        proj.rebuild(EventLog(str(events / "events.jsonl")),
+                     confirm_destructive=True)
+
+        meta = [(cypher, reason) for cypher, reason in seen
+                if "GraphEventMeta" in _norm(cypher)
+                and _norm(cypher).startswith("MERGE")]
+        assert meta, (
+            "`rebuild()` issued no `:GraphEventMeta` write at the handle, so "
+            "this pin proves nothing about the lane it declares; "
+            f"observed={[( _norm(c)[:70], r) for c, r in seen]!r}")
+        reasons = {reason for _c, reason in meta}
+        assert reasons == {"replay"}, (
+            "`rebuild()`'s watermark lane changed. It is a DEFERRED #9213 item: "
+            "this engine restores a captured counter, so if it now names a "
+            "restore leg the split happened and every disclosure that says "
+            "`rebuild()` is left on `\"replay\"` must move with it "
+            "(event_store.py's module comment, `reestablish_watermark`'s "
+            "docstring, `_prewipe_restore_write_scope`'s WHERE-THE-WATERMARK "
+            "paragraph, and STORAGE-ARCHITECTURE.md §17.1). If the split did "
+            "NOT happen, a blanket `pre-wipe-restore:` reason is false in the "
+            "other direction and this test is what caught it: "
+            f"observed={reasons!r}")
     finally:
         sdk.close()
 

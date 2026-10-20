@@ -1444,15 +1444,37 @@ def _modules_reaching_the_handle():
 #: resolve but a human has PROVEN read-only (it is a `MATCH … RETURN` whose
 #: interpolated fragment carries no write clause). Empty in part 1; it carries the
 #: two `#9261` calibration READ statements today (`#9063`'s universe query and the
-#: audit that reuses it — see the entry's own note), and the flip is still
-#: blocked while the package-wide remainder is not empty.
-#: is blocked without it. Bucketing is PER FUNCTION, so of the 308 unresolved
-#: statements in the population 226 sit in the "unproven" bucket, 44 sit in
-#: functions that already declare a lane (no bucket), and 38 ride in a function
-#: that also has a provable write (so they are listed as a missing lane, not as
-#: unproven — the per-function granularity is the limit of a source-order
-#: census). Filling one in is a reviewed act — and it is never the right remedy
-#: to wrap a read in a write lane.
+#: audit that reuses it — see the entry's own note).
+#:
+#: ⚠️ THIS REGISTER IS THE #9124 ARMING GATE'S ALLOWLIST, so an entry written
+#: here pre-clears the surface `test_arming_the_guard_requires_a_fully_declared_surface`
+#: requires before `_HANDLE_GUARD_ENFORCES` may flip. The two entries landed in
+#: #9218's branch because `origin/main` was RED without them (that gate's
+#: `test_every_mutating_sdk_entry_point_is_declared_or_inventoried` reported both
+#: `#9261` functions as "NO declared lane and no inventory entry"); they are
+#: `#9261`'s verdicts, named in this PR's description rather than inherited
+#: silently. And the register is PER FUNCTION: an entry proves the STATEMENTS
+#: the census saw in that function today, so a WRITE added inside
+#: `calibrate_summary` tomorrow is exempted by this entry — a reason to keep the
+#: entries verified against the function's real statements, not a reason to
+#: widen them.
+#:
+#: Bucketing is PER FUNCTION, so the statements the census cannot resolve are
+#: accounted for in four places: the "unproven" bucket (a function whose every
+#: mutating call is unresolved), functions that already declare a lane (no
+#: bucket), functions that also hold a provable write (listed as a missing lane,
+#: not as unproven — the per-function granularity is the limit of a source-order
+#: census), and this register. Filling one in is a reviewed act — and it is
+#: never the right remedy to wrap a read in a write lane.
+#:
+#: THE FIGURES BELOW ARE A READING, NOT A STATE — re-derive them (this file's own
+#: `_modules_reaching_the_handle()` + bucketing) before quoting them, because they
+#: went stale once already: the previous snapshot said "308 unresolved … 226 / 44
+#: / 38" and #9218's review found it beside an edit that had moved two statements
+#: out of the unproven bucket. MEASURED 2026-10-20 over 59 modules: 307 unresolved
+#: statements in the population — 226 in the unproven bucket, 40 in functions
+#: that already declare a lane (no bucket), 39 in a function that also holds a
+#: provable write, and the 2 proven reads above.
 #:
 #: ⛔ THE KEY IS WHAT `enumerate_handle_surface` EMITS — scope-qualified, e.g.
 #: `("tortoise/sdk.py", "TortoiseSDK.delete_point")`, NOT `"delete_point"`. A
