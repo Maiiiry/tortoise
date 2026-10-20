@@ -24,6 +24,12 @@ Repo-local, zero network, stdlib only (the test_waitlist_form.py pattern):
    pinned so a paraphrase cannot slip past. The availability premise that used
    to sit over it is retired — outbound webhook push shipped (#2081, PR #8104)
    — see `TestAutomateBeatCopy`.
+6. `/investors` Progress cell order + the owner's sanctioned demand headline
+   (PR #9283): the section must OPEN on what exists (`Product & distribution`
+   left of `Early demand`), the headline bullet is pinned verbatim — curly
+   quotation marks included — and the retired `20+ prospective beta testers`
+   line must stay gone. The verbatim quotation is an ACCEPTED RISK recorded by
+   the owner, not a defect to "fix" — see `TestInvestorsProgressCopy`.
 
 Run:  TORTOISE_TEST_CARVE_OUT=1 python -m pytest tests/test_website_static.py -v
       (a URI-less run fails at session setup by construction — epic #1647 P4;
