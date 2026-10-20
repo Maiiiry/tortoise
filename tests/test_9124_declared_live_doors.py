@@ -272,10 +272,19 @@ _UNRESOLVED = {
     # part — for these rows the unresolvable fragment IS the `where` text, so
     # "the readable half has no write keyword" would not settle it: measured,
     # each function's only handle reach is a `MATCH … OPTIONAL MATCH … RETURN`
-    # read (sdk.py:23143) / `MATCH … RETURN n.id` read (sdk.py:23531), with no
-    # SET/CREATE/MERGE/DELETE/REMOVE in the assembled query and no write through
-    # another SDK method (`calibrate_summary` names `set_point_baseline` only
-    # inside advice strings).
+    # read (`calibrate_summary`) / `MATCH … RETURN n.id` read
+    # (`_uncalibrated_ep_participants`), with no SET/CREATE/MERGE/DELETE/REMOVE
+    # in the assembled query and no write through another SDK method
+    # (`calibrate_summary` names `set_point_baseline` only inside advice
+    # strings — it never calls it).
+    # ⛔ CITED BY SYMBOL, NEVER BY `sdk.py:<line>`. The numbers this note first
+    # carried were 268 lines off within hours of being measured (they landed in
+    # `_apply_source_inheritance`, whose `MATCH … REMOVE` is the opposite of the
+    # claim) — the §7/a citation-rot class: a reader who follows a stale line
+    # number cannot tell a rotten citation from a false claim. The symbol is
+    # authoritative; `test_the_unresolved_hand_check_cites_symbols_not_line_numbers`
+    # and `test_the_calibration_readers_assemble_no_write_clause` keep this note
+    # honest instead of trusting it.
     "calibrate_summary",
     "_uncalibrated_ep_participants",
     "_cross_lens_pool",
@@ -963,6 +972,191 @@ def test_no_two_census_entries_share_a_bare_function_name():
         "inventory, so ONE entry accounts for both — the undeclared one is "
         "covered by the other's row. Qualify the inventory entry (or split it) "
         "and resolve it the same way in `_inventory_of`:\n  "
+        + "\n  ".join(offenders))
+
+
+# ── the hand-check note behind the two #9063 rows is CHECKABLE ────────────
+#
+# That note is the only evidence a reader has for WHY `calibrate_summary` and
+# `_uncalibrated_ep_participants` sit in `_UNRESOLVED`. It first carried
+# `sdk.py:<line>` anchors and they were 268 lines off: following the first one
+# landed in `_apply_source_inheritance`, a function that WRITES
+# (`MATCH … REMOVE`) — the opposite of what the citation was offered as evidence
+# for. A reader who cannot tell a rotten citation from a false claim deletes the
+# rows, and deleting them reds the census (both classify `no-journal`). So the
+# note is pinned twice: no line-number anchor may come back (the #8093/#8506
+# citation-rot class — the SYMBOL is authoritative, the number is a
+# convenience), and the claim it makes is re-derived from `sdk.py` rather than
+# believed.
+
+#: A `sdk.py:<line>` anchor. `tortoise/sdk.py` is ~37k lines and moves under the
+#: note on almost every merge, so a number rots here without anything reddening.
+_SDK_LINE_ANCHOR = re.compile(r"sdk\.py:\d+")
+
+#: The Cypher clauses that make a statement a WRITE. Checked against the
+#: ASSEMBLED text, not the resolvable half, because for these two rows the
+#: unresolvable fragment IS the `WHERE` text — that is why the census could not
+#: settle them and why a human had to.
+_WRITE_CLAUSE_RE = re.compile(r"\b(?:SET|CREATE|MERGE|DELETE|DETACH|REMOVE)\b")
+
+#: The two rows the #9063 note covers, each with the read shape the note states.
+_CALIBRATION_READERS: tuple[tuple[str, str], ...] = (
+    ("calibrate_summary", "OPTIONAL MATCH"),
+    ("_uncalibrated_ep_participants", "RETURN n.id"),
+)
+
+
+def _unresolved_block_source() -> str:
+    """The source of the `_UNRESOLVED` set literal, comments included.
+
+    Sliced from THIS file by the AST's own line numbers, so the span cannot
+    silently shrink to a fragment that happens to pass.
+    """
+    source = Path(__file__).read_text()
+    lines = source.splitlines()
+    for node in ast.parse(source).body:
+        if (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", None) == "_UNRESOLVED"
+                        for t in node.targets)):
+            return "\n".join(lines[node.lineno - 1:node.end_lineno])
+    raise AssertionError(
+        "`_UNRESOLVED` is not a module-level assignment any more — this pin "
+        "reads its source to check the hand-check note, so move the pin with it")
+
+
+def _string_constants(node) -> list[str]:
+    """Every string literal inside `node` (f-string fragments included)."""
+    return [sub.value for sub in ast.walk(node)
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str)]
+
+
+def _local_bindings(func) -> dict[str, list[ast.expr]]:
+    """`name -> every value assigned to it` in `func` (one entry per BRANCH).
+
+    Every binding, not the last one: `_uncalibrated_ep_participants` builds its
+    `query` in an `if`/`else` pair, and checking only the surviving branch would
+    leave the other one unverified.
+    """
+    bound: dict[str, list[ast.expr]] = {}
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign) and node.value is not None:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bound.setdefault(target.id, []).append(node.value)
+        elif (isinstance(node, ast.AnnAssign) and node.value is not None
+              and isinstance(node.target, ast.Name)):
+            bound.setdefault(node.target.id, []).append(node.value)
+    return bound
+
+
+def _assembled_statement_fragments(func, call: ast.Call) -> list[str]:
+    """Every string fragment that can reach `call`'s statement argument.
+
+    Follows the LOCAL indirection transitively (`query` -> f-string -> `where`
+    -> f-string), because that indirection is exactly why the census could not
+    resolve these statements — a check that stopped at the literals in the call
+    would pass on the readable half and prove nothing about the whole.
+    """
+    bindings = _local_bindings(func)
+    pending: list[ast.expr] = list(call.args) + [kw.value for kw in call.keywords]
+    fragments: list[str] = []
+    seen: set[str] = set()
+    while pending:
+        expr = pending.pop()
+        fragments.extend(_string_constants(expr))
+        for sub in ast.walk(expr):
+            if (isinstance(sub, ast.Name) and sub.id in bindings
+                    and sub.id not in seen):
+                seen.add(sub.id)
+                pending.extend(bindings[sub.id])
+    return fragments
+
+
+def _handle_query_calls(func) -> list[ast.Call]:
+    """Every `proj.g.query(...)`-shaped call in `func` — its handle reach."""
+    return [node for node in ast.walk(func)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _HANDLE_MUTATING_VERBS
+            and _is_handle_ref(node.func.value, aliases=set())]
+
+
+def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
+    """The #9063 note must cite the two SYMBOLS, never a line number.
+
+    NON-VACUITY: the note as first committed carried `(sdk.py:23143)` and
+    `(sdk.py:23531)`, so a `sdk.py:<n>` anchor in the `_UNRESOLVED` block reds
+    this test. The positive half is what makes the note verifiable at all: both
+    function names must appear, because the symbol is the only anchor that
+    survives `sdk.py` moving under it.
+    """
+    block = _unresolved_block_source()
+    anchors = _SDK_LINE_ANCHOR.findall(block)
+    assert not anchors, (
+        "the `_UNRESOLVED` hand-check note cites sdk.py by LINE NUMBER "
+        f"({sorted(set(anchors))}) — sdk.py moves under it, so the anchor rots "
+        "into a pointer at whatever function happens to hold that line now "
+        "(measured on this note: 268 lines off, landing in a writer). Cite the "
+        "function by NAME — the symbol is authoritative, the number is not:"
+        f"\n  {block}")
+    missing = [name for name, _shape in _CALIBRATION_READERS if name not in block]
+    assert not missing, (
+        "the note no longer names the function(s) it is the hand-check FOR "
+        f"({missing}) — without the symbol the note anchors at nothing and a "
+        "reader cannot re-verify it, which is exactly how it rotted before")
+
+
+def test_the_calibration_readers_assemble_no_write_clause():
+    """Re-derive the note's claim from `sdk.py`: one handle READ each, no write.
+
+    The claim is not decorative — it is the entire reason these two functions
+    are in `_UNRESOLVED` (``statement not provably read-only``) instead of being
+    declared writers. Checked mechanically so a later edit that adds a `SET` to
+    one of them reds HERE (and forces the row to be re-examined) instead of
+    rotting the note into a false claim.
+
+    Every fragment that can reach the assembled statement is inspected, because
+    the reason the census could not settle these is that the `WHERE` text is
+    built in a LOCAL and interpolated — the same indirection is followed here.
+    """
+    module = ast.parse(SDK_PY.read_text(), str(SDK_PY))
+    functions = {node.name: node for node in ast.walk(module)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    offenders: list[str] = []
+    for name, read_shape in _CALIBRATION_READERS:
+        func = functions.get(name)
+        if func is None:
+            offenders.append(f"{name}: no such function in tortoise/sdk.py")
+            continue
+        calls = _handle_query_calls(func)
+        if len(calls) != 1:
+            offenders.append(
+                f"{name}: the note says ONE handle reach, found {len(calls)} "
+                "`<handle>.query(...)` call(s) — re-check the row before "
+                "trusting either")
+            continue
+        assembled = " ".join(_assembled_statement_fragments(func, calls[0]))
+        write = _WRITE_CLAUSE_RE.search(assembled)
+        if write:
+            offenders.append(
+                f"{name}: the assembled statement carries {write.group(0)!r} — "
+                "this row is not a read any more")
+        if read_shape not in assembled:
+            offenders.append(
+                f"{name}: the assembled statement no longer contains "
+                f"{read_shape!r}, so the note's stated read shape is stale")
+        # The note's second claim: no write through ANOTHER SDK method. The name
+        # may appear in advice strings (it does), so pin the CALL, not the word.
+        if any(isinstance(node, ast.Call)
+               and getattr(node.func, "attr", getattr(node.func, "id", None))
+               == "set_point_baseline"
+               for node in ast.walk(func)):
+            offenders.append(
+                f"{name}: CALLS `set_point_baseline` — the note says it only "
+                "names it in advice strings, so this row DOES write")
+    assert not offenders, (
+        "the hand-check note above `_UNRESOLVED` no longer matches the code it "
+        "describes — fix the note, or move the row out of that inventory:\n  "
         + "\n  ".join(offenders))
 
 
