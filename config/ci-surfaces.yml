@@ -193,9 +193,14 @@ surfaces:
   # row and re-running `select()` over the whole `tortoise/**/*.py` population
   # (242 files) the suite's AST walk parses. Withheld-row loss, measured at this
   # head (#9150 review, VGATE): `api` 12 · `core` 201 · `onboarding` 4 ·
-  # `sdk` 7 · `ep` 3 · `eval` 2. The remaining 13 files are reached without any
-  # arm — 7 are SHARED_MODULES (full matrix) and 6 resolve to two surfaces at
-  # once:
+  # `sdk` 7 · `ep` 3 · `eval` 2. The remaining 13 files lose nothing when any ONE
+  # row is withheld — 7 are SHARED_MODULES (full matrix) and 6 resolve to exactly
+  # two of these surfaces. None of them is reached by ZERO arms: every one
+  # resolves to at least two (measured at this head — `rglob` over
+  # `tortoise/**/*.py` through `select()` gives 13 multi-arm files and 0
+  # zero-arm files; an earlier revision of this sentence said "reached without
+  # any arm", which the two-surface arm of the same sentence contradicts and
+  # which reads as "these need no registration at all").
   #   * `onboarding` (lost=4: `state.py`, `seed.py`, `capture_disclosure.py`,
   #     `selfhost.py`) — an EXACT `SOURCE_PATTERNS` match for
   #     `tortoise/onboarding/**` that REPLACES the `core` fallback. The note these

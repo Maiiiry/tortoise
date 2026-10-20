@@ -19,9 +19,15 @@ so each assertion has a way to fail:
 
 * a SIXTH `eager_init_query()` site appearing anywhere in the SDK / hosted API
   fails `test_the_note_and_the_ast_inventory_agree` (the note would be stale);
-* a site being DELETED (or migrated off `select_graph`) fails
+* a site being DELETED fails `test_the_note_and_the_ast_inventory_agree` too —
+  it compares the measured inventory against the recorded one, so a site that
+  disappears is a mismatch. NOT the linkage pin below: that one iterates only
+  the sites the finder RETURNS, so one fewer site is one fewer iteration and no
+  failure at all (#9150 review P2 — a map that attributes a mutation to the
+  wrong pin is how a maintainer concludes an uncovered mutation is covered);
+* a site being MIGRATED off `select_graph` fails
   `test_every_eager_init_site_issues_its_statement_on_the_escape_three_handle`,
-  which now ASSERTS THE LINKAGE — the statement must be issued by a `query(...)`
+  which ASSERTS THE LINKAGE — the statement must be issued by a `query(...)`
   call on the handle the same function bound from `select_graph(...)`. The two
   wrong closures red it: `proj.g.query(...)` (the §17.1 violation this file
   exists to see) and `state._run(...)` (the honest fix, which would leave the
@@ -850,8 +856,14 @@ def test_a_diff_to_the_note_itself_selects_this_file():
     `onboarding` arm existed, an `onboarding`-only diff — the exact drift these
     two pins exist to catch — selected every suite EXCEPT this one, so the note
     could go stale green (the #1349/#2938 silent-drop class). The population is
-    the set of files this suite actually reads — the six subjects below, derived
-    from the pins above rather than copied from the registration. It is
+    the set of files this suite actually READS — the eight subjects below,
+    derived from the pins above rather than copied from the registration. The
+    two `docs/` records are in it because
+    `test_the_plan_doc_and_the_storage_ledger_carry_the_residual` reads them, and
+    their only wiring is the two `SOURCE_PATTERNS["onboarding"]` entries added
+    for this file: delete one and the pin silently stops running on the record
+    it guards (nothing reds — `test_every_source_pattern_is_selectable` checks
+    entry → runs, never the removal direction). It is
     deliberately NOT every file the suite PARSES: `_declaration_primitives()`
     walks all 242 modules under `tortoise/`, and covering that whole population
     is what the six arms in `config/ci-surfaces.yml` do (#9150 review: with
@@ -878,6 +890,14 @@ def test_a_diff_to_the_note_itself_selects_this_file():
         # mint path), so a diff there must run this file too (#9150 review P2).
         "tests/test_write_ahead_mint.py",
         "config/ci-surfaces.yml",
+        # read by `test_the_plan_doc_and_the_storage_ledger_carry_the_residual`
+        # — the two records were WITHOUT the residual and had no pin at all, so
+        # a docs-only edit to either is the change that silently un-pins them.
+        # Their only wiring is the two `SOURCE_PATTERNS["onboarding"]` entries
+        # in `tools/ci_selection.py`; this row is what notices one being
+        # dropped (#9150 review P1).
+        "docs/plans/2026-10-14-7951-atomic-write-outbox.md",
+        "docs/architecture/STORAGE-ARCHITECTURE.md",
     ):
         sel = select([subject], "pull_request", manifest)
         selected = (sel["full"] or sel["test_files"] == "ALL"
