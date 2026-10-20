@@ -14,12 +14,14 @@ corrected reading:
 1. **A single entry point DOES exist.** The body says *"whether any single
    entry point … can drive all eight in one pass"* is an open question. It can:
    ``TortoiseSDK.capture_session`` → ``sdk._extract_session_v2`` →
-   ``extractor_v2.extract_session_v2`` (``extractor_v2.py:7611``) calls
-   ``_edus_from_conversation`` (S0, ``:7719``), ``run_s1`` (S1, ``:7752``),
-   ``run_s2`` (S2.1, ``:7776``), ``_run_vet_pass`` (S2.2, ``:7805``),
+   ``extractor_v2.extract_session_v2`` (``extractor_v2.py:7634``) calls
+   ``_edus_from_conversation`` (S0, ``:7742``), ``run_s1`` (S1, ``:7775``),
+   ``run_s2`` (S2.1, ``:7799``), ``_run_vet_pass`` (S2.2, ``:7828``),
    ``kind_classifier.classify_items``/``_apply_classify_kinds`` (S2.3,
-   ``:7821``), ``search_graph`` (S3, ``:7837``), ``run_s4`` (the gap filler,
-   ``:7858``), and ``execute_embed`` (S5+S6, ``:8057``). So the capstone drives
+   ``:7844``), ``search_graph`` (S3, ``:7860``), ``run_s4`` (the gap filler,
+   ``:7881``), and ``execute_embed`` (S5+S6, ``:8080``). Line numbers re-derived
+   at ``6ccc06a23``; the symbol is authoritative and the line is a convenience,
+   which is how the pin's earlier numbers went stale here. So the capstone drives
    the REAL entry point — it does not compose the step functions, which the
    issue explicitly forbids.
 2. **``docs/evidence/7949-capstone/`` did not exist and still does not exist as

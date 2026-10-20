@@ -19,12 +19,16 @@ the bundle itself (`docs/evidence/7949-capstone/**`, `tools/capstone_verdict_che
 `tools/ci_selection.py` + `tests/test_ci_selection.py` **remove** a `CORE_ALSO`
 row this branch had added and could not justify (the bundle prefix
 `docs/evidence/7949-capstone/`, landed by #9076, already selects `core` for a
-PROBE-ONLY diff — measured, not assumed), and add a pin that no `CORE_ALSO` row
+PROBE-ONLY diff — measured, not assumed), and **add** one for the gate source
+(`tools/capstone_verdict_check.py`), because a GATE-ONLY diff selected no surface at all
+while the bundle prefix covers only the probe/evidence paths (pinned by
+`tests/test_ci_selection.py::test_the_capstone_gate_change_selects_core_not_tier1`) — and
+add a pin that no `CORE_ALSO` row
 is shadowed by a parent prefix; the surface re-cut the new caller forces
 (`config/surface-manifest.yml`, `docs/product/mcp-sdk-surface.md`); and two test-side
-edits that are NOT this bundle's subject — `tests/test_ci_check_repair.py` (the `gh`
-launcher stub) and `tests/test_uri_env_mutations_declared.py` (the declaration for
-`#9122`'s indexer `TORTOISE_DB_URI` setenv, a `main` red every lane inherited).
+edits — `tests/test_ci_check_repair.py` (the `gh`
+launcher stub) and `tests/test_uri_env_mutations_declared.py` (this suite's
+`TORTOISE_DB_URI` env-control declaration, plus the removal of a dead duplicate row).
 **Nothing under `tortoise/` changes behaviour and nothing instruments the
 extractor** — this bundle installs no wrapper, spy or step-composition anywhere
 in the measured path, so the E4 row's "no monkeypatch" clause holds on the fact
@@ -124,18 +128,20 @@ The body's figures are pinned to `9037c7a7b`. Re-measured at `717355e67`:
    runner is now this probe rather than nothing.
 3. **⚠️ CORRECTED — a single entry point CAN drive all eight steps.** The body asks this
    as an open question. It resolves YES: `TortoiseSDK.capture_session` →
-   `sdk._extract_session_v2` (`sdk.py:9698`) → `extractor_v2.extract_session_v2`
-   (`extractor_v2.py:7611`), which calls, in one pass:
+   `sdk._extract_session_v2` (`sdk.py:10341`; called at `:9358`) →
+   `extractor_v2.extract_session_v2` (`extractor_v2.py:7634`), which calls, in one pass
+   (line numbers re-derived at `6ccc06a23` — the symbol is authoritative and the line is a
+   convenience, which is how the pin's earlier numbers went stale here):
 
    | step | call site | witness the probe reads | on the receipt? |
    |---|---|---|---|
-   | S0 READ | `_edus_from_conversation` `:7719` | `stats["edus"]`, `stats["chunks"]` | ✅ |
-   | S1 NARRATE | `run_s1` `:7752` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
-   | S2.1 EXTRACT | `run_s2` `:7776` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
-   | S2.2 VET | `_run_vet_pass` `:7805` | `result["vet"]` | ❌ **#9116** |
-   | S2.3 CLASSIFY | `_apply_classify_kinds` `:7821` | `result["classify_later"]` | ❌ **#9116** |
-   | S3 RESOLVE | `search_graph` `:7837` | `result["search"]` | ❌ **#9116** |
-   | S5 CONNECT | `execute_embed` `:8057` (+ `run_s4` `:7858` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
+   | S0 READ | `_edus_from_conversation` `:7742` | `stats["edus"]`, `stats["chunks"]` | ✅ |
+   | S1 NARRATE | `run_s1` `:7775` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
+   | S2.1 EXTRACT | `run_s2` `:7799` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
+   | S2.2 VET | `_run_vet_pass` `:7828` | `result["vet"]` | ❌ **#9116** |
+   | S2.3 CLASSIFY | `_apply_classify_kinds` `:7844` | `result["classify_later"]` | ❌ **#9116** |
+   | S3 RESOLVE | `search_graph` `:7860` | `result["search"]` | ❌ **#9116** |
+   | S5 CONNECT | `execute_embed` `:8080` (+ `run_s4` `:7881` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
    | S6 COMMIT | `execute_embed` payload | `result["payload"]` | ❌ **#9116** |
 
    So the capstone drives the **real entry point**, which is what the epic's phrase *"the

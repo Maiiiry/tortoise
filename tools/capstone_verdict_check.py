@@ -53,7 +53,9 @@ marked green off closed children, with no artifact at all. This closes that.
     V9  --require-green (the EPIC's closing rule): 5/5 GREEN
     V10 a MEASURED E4 whose denominator is 4 fails the criterion on the row's
         own rule, and E4's row must carry the SAME denominator the run's
-        ``e4_receipt`` computed
+        ``e4_receipt`` computed. A MEASURED E4 must also carry a POSITIVE INT
+        denominator — an empty denominator measures nothing, and V5's GREEN arm
+        cannot reach this row (E4 is never GREEN on this surface)
     V11 (``--require-resolvable``) the provenance POINTERS resolve in this
         checkout — each row's sha AND the pre-registration commit. OFF by
         default: a squash-merged branch sha is unresolvable in ``main`` by

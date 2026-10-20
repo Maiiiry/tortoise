@@ -711,21 +711,23 @@ def test_two_verdict_blocks_is_a_usage_error_not_a_stale_green(tmp_path, capsys)
     """REGRESSION (#9089 review): the gate read only the FIRST block.
 
     `text.index(BEGIN)`/`text.index(END)` stop at the first marker pair, so a log
-    that holds a green table followed by a newer REFUSED run answered "the epic
-    is closeable" off the stale table. Reachable without any forgery: piping a
-    re-run into the committed log (`capstone_run.py | tee -a capstone.log`) is
-    enough, and the gate is the only thing that could have noticed.
+    holding a valid table followed by a NEWER run answered off the older one.
+    Reachable with no forgery at all: piping a re-run into the committed log
+    (`capstone_run.py | tee -a capstone.log`) is enough, and the gate is the only
+    thing that could have noticed.
 
-    Non-vacuity: measured on the pre-fix tool, the green-first case exited 0
-    with and without `--require-green`; both assertions below are unreachable
-    there.
+    The two blocks are the SHIPPED log's own machine table, duplicated — the
+    `tee -a` shape exactly, and a VALID table (the single-copy control below is
+    exit 0), not a hand-built summary fixture. MEASURED with the parent commit's
+    `extract_block` swapped back in over this same file: exit 0, "structurally
+    sound", because the first copy decided and the second was never read. Post-fix
+    it is a usage error.
     """
-    good = _record()
-    for row in good["rows"]:
-        row["verdict"] = "GREEN"
-    block = f"{cvc.BEGIN}\n{json.dumps(good)}\n{cvc.END}\n"
+    single = LOG.read_text()
+    assert cvc.main([str(LOG), "--repo", str(_REPO)]) == 0  # the control
+    doubled = single + "\n" + single[single.index(cvc.BEGIN):]
     log = tmp_path / "appended.log"
-    log.write_text(f"# run 1 (green)\n{block}\n# run 2 (refused)\n{block}")
+    log.write_text(doubled)
     assert cvc.main([str(log), "--repo", str(_REPO)]) == 2
     err = capsys.readouterr().err
     assert "exactly one verdict block" in err, err
@@ -733,7 +735,7 @@ def test_two_verdict_blocks_is_a_usage_error_not_a_stale_green(tmp_path, capsys)
     # And the module-level contract, so a direct caller cannot bypass main().
     import pytest
     with pytest.raises(ValueError, match="exactly one verdict block"):
-        cvc.extract_block(f"{block}{block}")
+        cvc.extract_block(doubled)
 
 
 # ── the RUN's observers — every row is derived from these ────────────────
