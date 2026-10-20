@@ -241,16 +241,52 @@ def _named(nodes, names: tuple[str, ...]) -> bool:
 
 
 def _bindings(enclosing: ast.AST) -> list[tuple[ast.AST, ast.AST | None]]:
-    """Every `(target, value)` binding inside `enclosing`, in EVERY binding form.
+    """Every `(target, value)` binding inside `enclosing`, in every form a
+    function BODY can spell.
+
+    Covered: `Assign`, `AnnAssign`, `AugAssign`, `For`/`AsyncFor`,
+    `With`/`AsyncWith`, `NamedExpr` (walrus), comprehension targets,
+    `except … as`, and the `match` capture patterns (`MatchAs`, `MatchStar`,
+    `MatchMapping`'s `__` rest). Out of scope on purpose: scope-ENTRY bindings
+    (`def` parameters, `import … as`), which bind a name before any handle exists
+    in this body rather than REBINDING one, and `del`, which unbinds.
 
     ⛔ `Assign`/`AnnAssign` only was the first revision (#9150 review cycle 9,
     P2). A handle-like name can equally be bound by a `for` target, a
     `with … as`, a walrus, an `AugAssign`, a comprehension target or an
     `except … as` — and on those shapes the detector stayed GREEN, which is the
-    false PASS the handle rule exists to prevent. `value` is `None` where the
-    syntax has no single value expression (`AugAssign`, `except … as`); such a
-    binding is treated as a REBINDING, i.e. it fails closed.
+    false PASS the handle rule exists to prevent. `match` captures were missed in
+    the same way one cycle later (cycle 10): `case graph:` rebound the name while
+    `rebound` stayed empty. `value` is `None` where the syntax has no single value
+    expression (`AugAssign`, `except … as`, match captures); such a binding is
+    treated as a REBINDING, i.e. it fails closed.
     """
+    out: list[tuple[ast.AST, ast.AST | None]] = []
+    for sub in ast.walk(enclosing):
+        if isinstance(sub, ast.Assign):
+            out.extend((target, sub.value) for target in sub.targets)
+        elif isinstance(sub, ast.AnnAssign):
+            out.append((sub.target, sub.value))
+        elif isinstance(sub, ast.AugAssign):
+            out.append((sub.target, None))
+        elif isinstance(sub, (ast.For, ast.AsyncFor)):
+            out.append((sub.target, sub.iter))
+        elif isinstance(sub, (ast.With, ast.AsyncWith)):
+            for item in sub.items:
+                if item.optional_vars is not None:
+                    out.append((item.optional_vars, item.context_expr))
+        elif isinstance(sub, ast.NamedExpr):
+            out.append((sub.target, sub.value))
+        elif isinstance(sub, ast.comprehension):
+            out.append((sub.target, sub.iter))
+        elif isinstance(sub, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar,
+                             ast.MatchMapping)):
+            # `except … as name`, `case name`, `case _ as name`, `case [*name]`,
+            # `case {**name}` — a capture, never an expression.
+            bound = sub.name if hasattr(sub, "name") else sub.rest
+            if bound:
+                out.append((ast.Name(id=bound, ctx=ast.Store()), None))
+    return out
     out: list[tuple[ast.AST, ast.AST | None]] = []
     for sub in ast.walk(enclosing):
         if isinstance(sub, ast.Assign):
@@ -300,11 +336,15 @@ def _rebound_handles(enclosing: ast.AST, handles: set[str]) -> set[str]:
     name bound both ways at this head is reported as an offender, because the
     detector cannot tell which binding the sink used.
 
-    "Both ways" covers every binding form Python has, not just assignment
-    (#9150 review cycle 9, P2): measured on four equivalent two-binding shapes,
-    a `for` target, a walrus and a `with … as` all left the detector GREEN while
-    the plain `Assign` red it — on exactly the closure this rule exists to
-    catch.
+    "Both ways" covers every binding form a function BODY can spell —
+    `Assign`/`AnnAssign`/`AugAssign`, `for`, `with … as`, walrus, comprehension
+    targets, `except … as`, and `match` captures (#9150 review cycles 9 and 10,
+    P2). Measured at cycle 9 on four equivalent two-binding shapes, a `for`
+    target, a walrus, a `with … as` and a comprehension target all left the
+    detector GREEN where the plain `Assign` red it; cycle 10 then measured the
+    same for `case graph:`. Scope-ENTRY bindings (`def` parameters, `import … as`)
+    are out of scope — they bind a name before a handle exists in this body rather
+    than rebinding one.
     """
     rebound: set[str] = set()
     for target, value in _bindings(enclosing):
@@ -941,6 +981,96 @@ def test_the_issuance_detector_reds_on_the_guarded_handle_and_on_run():
             )
 
 
+def test_the_rebinding_rule_covers_every_binding_form():
+    """The instrument check for `_bindings()` — one case per form it handles.
+
+    ⛔ Without this, the widening was pinned by nothing (#9150 review cycle 10,
+    P2): deleting every non-`Assign` arm left 16 passed, so the docstring's own
+    "these shapes left the detector GREEN" could not be re-measured after the
+    fix. Measured on a clean copy of the cycle-9 head: removing the `AugAssign`,
+    `For`, `With`, `NamedExpr`, comprehension and `except … as` arms changed no
+    test outcome.
+
+    Each snippet is the SAME site — handle bound from `select_graph`, statement
+    issued on it — with the handle name REBOUND by one form. The rule fails
+    closed: the detector cannot tell which binding the sink used, so every one of
+    these must come back as one offender, and the control (no rebinding) as none.
+    """
+    cases = {
+        "AugAssign": """
+            graph += val.g
+            graph.query(_init_q, params=_init_p)
+        """,
+        "for": """
+            for graph in [val.g]:
+                graph.query(_init_q, params=_init_p)
+        """,
+        "with_as": """
+            with contextlib.nullcontext(val.g) as graph:
+                graph.query(_init_q, params=_init_p)
+        """,
+        "walrus": """
+            if (graph := val.g):
+                graph.query(_init_q, params=_init_p)
+        """,
+        "comprehension": """
+            [graph.query(_init_q, params=_init_p) for graph in [val.g]]
+        """,
+        "except_as": """
+            try:
+                raise RuntimeError
+            except RuntimeError as graph:
+                graph.query(_init_q, params=_init_p)
+        """,
+        "match_capture": """
+            match val:
+                case graph:
+                    graph.query(_init_q, params=_init_p)
+        """,
+        # The handle's own declaration form, rebound: an annotated assignment.
+        "annassign": """
+            graph: object = val.g
+            graph.query(_init_q, params=_init_p)
+        """,
+    }
+    for form, tail in cases.items():
+        source = (
+            "def site(proj, val, _init_q, _init_p):\n"
+            "    graph = proj.db.select_graph('g')\n"
+            + textwrap.indent(textwrap.dedent(tail), "    ")
+        )
+        tree = ast.parse(source)
+        func = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "site"
+        )
+        handles = _escape_handle_names(func)
+        offenders = _not_on_the_escape_handle(
+            func, {"_init_q", "_init_p"}, handles,
+            _rebound_handles(func, handles))
+        assert len(offenders) == 1, (
+            f"the rebinding rule is blind to the {form!r} binding form: the sink "
+            f"on a rebound escape handle was certified clean ({offenders}). A "
+            "binding form `_bindings()` does not know is a false PASS on exactly "
+            "the §17.1 closure this file exists to see (#9150)"
+        )
+
+    # The control: the SAME site with no second binding stays clean, so the cases
+    # above are measuring the rebinding and not merely "is there a sink".
+    clean = ast.parse(
+        "def site(proj, _init_q, _init_p):\n"
+        "    graph = proj.db.select_graph('g')\n"
+        "    graph.query(_init_q, params=_init_p)\n"
+    )
+    func = next(node for node in ast.walk(clean)
+                if isinstance(node, ast.FunctionDef))
+    handles = _escape_handle_names(func)
+    assert _rebound_handles(func, handles) == set(), (
+        "the rebinding rule now cries wolf on a site that binds the handle once: "
+        f"handles {sorted(handles)}"
+    )
+
+
 def test_the_escape3_sites_are_the_mint_sites_that_use_eager_init():
     """The two inventories of this seam must be two VIEWS, not two copies.
 
@@ -972,12 +1102,22 @@ def test_no_escape3_function_opens_a_declaration_anywhere_yet():
     """THE COUPLING: today no escape-(3) function opens a §17.1 declaration.
 
     WHAT THIS MEASURES IS COARSER THAN ITS NAME USED TO SUGGEST, on purpose: it
-    reds on a declaration-scope `with` ANYWHERE inside an escape-(3) function
-    (`sdk.py` / `hosted_api.py`), not only around one of the five
-    `eager_init_query()` sites. Those functions ARE the sites, so a scope
-    appearing in one is worth a human look either way — but the two possible
-    causes are different, and the failure message names both rather than
-    assuming the interesting one.
+    reds on a declaration-scope `with` ANYWHERE inside an escape-(3) function,
+    not only around one of the five `eager_init_query()` sites. Those functions
+    ARE the sites, so a scope appearing in one is worth a human look either way
+    — but the two possible causes are different, and the failure message names
+    both rather than assuming the interesting one.
+
+    ⛔ IT SCANS THE INVENTORY, NOT A HARDCODED PAIR (#9150 review cycle 10, P1).
+    While this walked `("tortoise/sdk.py", "tortoise/hosted_api.py")`, a sixth
+    site landing in any THIRD module — `tortoise/selfhost.py` is named as a door
+    by the plan doc itself — could be wrapped in a declaration scope and
+    recorded properly in `_ESCAPE3_CALL_SITES` while every pin stayed green,
+    which falsifies the `onboarding/state.py` sentence "fails the day one of
+    those sites enters a declaration" for every site outside those two files.
+    The population is now DERIVED from the inventory this pin is coupled to, so
+    a sixth site joins it by being recorded (measured on that mutant: 16 passed
+    before, 1 failed after).
 
     It still turns RED the day `#9157` lands: putting a `with` over any scope
     opener (`_DECLARATION_PRIMITIVES`) into one of those functions around one of
@@ -993,7 +1133,7 @@ def test_no_escape3_function_opens_a_declaration_anywhere_yet():
     `select_graph` handle). Both are needed; neither alone is the coupling.
     """
     declared: dict[str, set[str]] = {}
-    for rel in ("tortoise/sdk.py", "tortoise/hosted_api.py"):
+    for rel in sorted({rel for rel, _func in _ESCAPE3_CALL_SITES}):
         tree, parents = _parse(rel)
         found = _declaring_functions(tree, parents)
         if found:
@@ -1501,7 +1641,14 @@ def test_the_plan_doc_and_the_storage_ledger_carry_the_residual():
         ("docs/plans/2026-10-14-7951-atomic-write-outbox.md",
          "the increment-4 tracker",
          "the {n} `eager_init_query()` call sites",
-         "**STILL OPEN: the five",
+         # ⛔ NUMERAL-FREE boundary (#9150 review cycle 10, P2): with
+         # `**STILL OPEN: the five` the marker EMBEDDED the numeral the count
+         # assertion checks, so (a) the count pin was self-satisfied by the
+         # marker — it could not see a contradictory count anywhere in the
+         # entry — and (b) when the inventory legitimately grew, correcting the
+         # header (the honest edit) red with "the record moved or was deleted".
+         # This prefix occurs once in the plan doc.
+         "**STILL OPEN: the ",
          "**LANDED SO FAR: the `delete_point` DOOR"),
         ("docs/architecture/STORAGE-ARCHITECTURE.md",
          "§17.1's door ledger",
