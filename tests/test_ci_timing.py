@@ -3983,3 +3983,90 @@ def test_a_measured_history_row_alone_still_blocks_a_logless_overwrite(tmp_path:
         f"a log-less render overwrote the last measured row with zeros: {row['counts']}"
     )
     assert row["failed_tests"] == ["tests/test_alpha.py::test_two"]
+
+
+def _seed_measured_artifact(out: Path, run_id: str = "4242", sample: str = "t1") -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "ci-timing.json").write_text(json.dumps({
+        "files": {"test_alpha.py": {"max_ms": 1000.0, "tests": 42, "total_ms": 12340.0}},
+        "outcome": {"error": 0, "failed": 1, "passed": 42, "skipped": 3,
+                    "xfailed": 0, "xpassed": 0},
+        "failed_tests": ["tests/test_alpha.py::test_two"],
+        "history": [{
+            "counts": {"error": 0, "failed": 1, "passed": 42, "skipped": 3,
+                       "xfailed": 0, "xpassed": 0},
+            "failed_tests": ["tests/test_alpha.py::test_two"],
+            "run_id": run_id, "sample_time": sample,
+        }],
+    }))
+
+
+def test_a_log_that_parses_to_nothing_must_not_zero_a_measured_artifact(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """The guard must key on the NUMBERS, not on a log file having arrived.
+
+    A 0-byte (or SIGKILL-truncated) `pytest-*.log` parses to no files and no
+    counts, so keying the refusal on "no log sources" let it through and a fully
+    measured artifact was rewritten as `files {}` / `outcome 0` / `failed_tests []`
+    with its history row zeroed (#9134 review cycle 7).
+    """
+    out = tmp_path / "out"
+    _seed_measured_artifact(out)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "pytest.log").write_text("")
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(logs), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    after = json.loads((out / "ci-timing.json").read_text())
+    assert after["files"], "an unparseable log erased the per-file measurements"
+    assert after["outcome"]["passed"] == 42, after["outcome"]
+    assert after["failed_tests"] == ["tests/test_alpha.py::test_two"]
+    assert after["history"][0]["counts"]["failed"] == 1
+
+
+def test_keeping_a_prior_row_does_not_reorder_the_history(
+    tmp_path: Path, fake_env: Path
+) -> None:
+    """Chronology is load-bearing: `candidate_flakes` reads [0] as newer than [1].
+
+    Hoisting the kept row to the front made an older sample appear newer than a
+    newer one, which turned a real flake (failed then passed) into "none"
+    (#9134 review cycle 7). A kept history must be left exactly as it was.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    counts_new = {"error": 0, "failed": 0, "passed": 42, "skipped": 0, "xfailed": 0, "xpassed": 0}
+    counts_old = dict(counts_new, failed=1, passed=41)
+    (out / "ci-timing.json").write_text(json.dumps({
+        "files": {"test_alpha.py": {"max_ms": 1000.0, "tests": 42, "total_ms": 12340.0}},
+        "outcome": {"error": 0, "failed": 0, "passed": 42, "skipped": 0, "xfailed": 0, "xpassed": 0},
+        "history": [
+            {"counts": counts_new, "failed_tests": [], "run_id": "4241", "sample_time": "t2"},
+            {"counts": counts_old, "failed_tests": ["tests/test_alpha.py::test_two"],
+             "run_id": "4242", "sample_time": "t1"},
+        ],
+    }))
+    logs = tmp_path / "logs"
+    logs.mkdir()
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent.parent / "tools" / "ci_timing.py"),
+         "--repo", "daniel-ospina/tortoise", "--run-id", "4242",
+         "--logs-dir", str(logs), "--out-dir", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr[-400:]
+    after = json.loads((out / "ci-timing.json").read_text())
+    assert [e["run_id"] for e in after["history"]] == ["4241", "4242"], (
+        f"the kept row was moved out of chronological order: "
+        f"{[(e['run_id'], e['sample_time']) for e in after['history']]}"
+    )

@@ -2211,62 +2211,44 @@ def main() -> int:
         "failed_tests": sorted(failed_tests),
     }
     previous = load_history(json_path)
-    # A render that read NO logs is not a measurement, and must not overwrite one.
-    # When `pick_run` re-picks an already-sampled run whose artifacts have
-    # expired, `--logs-dir` is empty: `outcome`, `files` and `failed_tests` all
-    # come from THIS render's logs, so the artifact would be rewritten with
-    # `failed: 0 / passed: 0` beside a history row that still reports the measured
-    # failures — two numbers for one run, and the CI step reports success. The
-    # history guard below cannot catch it because the damage is in the TOP-LEVEL
-    # parts. Refuse instead: an unmeasured render keeps what was measured.
-    # Reachable in CI: ci-timing.yml fails only when artifacts were EXPECTED and
-    # none arrived, so an expired run proceeds into this path.
-    #
-    # The refusal is limited to an artifact that actually HOLDS measurements
+    # A render that MEASURED NOTHING is not a measurement, and must not overwrite
+    # one. The test is the NUMBERS, not the presence of a log file: a 0-byte or
+    # SIGKILL-truncated `pytest-*.log` parses to nothing and would otherwise slip
+    # past both guards and zero a fully measured artifact (#9134 review cycle 7).
+    # The refusal is limited to an artifact that already HOLDS measurements
     # (`files`/`outcome`), so a history-only seed — and a first render into an
     # empty directory — still writes what it can.
-    if not log_sources and _holds_measurements(json_path):
+    measured_now = bool(files) or any(total_counts[key] > 0 for key in COUNT_KEYS)
+    if not measured_now and _holds_measurements(json_path):
         print(
-            "::warning::no pytest logs found, so this render measured nothing — "
-            "keeping the existing artifact instead of overwriting it with zeros",
+            "::warning::this render measured nothing — keeping the existing "
+            "artifact instead of overwriting it with zeros",
             file=sys.stderr,
         )
         return 0
 
-    # A re-render of an ALREADY SAMPLED run must replace its row, not stack a
+    # A re-render of an ALREADY SAMPLED run must REPLACE its row, not stack a
     # second one: the two rows describe the same run with whatever the generator
     # said at each time, so a corrected re-render left the stale copy beside it
     # (measured: 5 entries, 4 distinct run ids, `failed: 6` next to `failed: 5`).
     # The freshly measured row is the one that survives.
     #
-    # But replacement must not be BLIND: a render that read no logs (`--run-id`
-    # given while the run's artifacts have expired, so `--logs-dir` is empty) is
-    # not a measurement, and letting it replace a good row would silently erase
-    # history while every invariant still held — the row it writes is coherent
-    # (0 failures, 0 tests listed), so only the ABSENCE OF LOGS reveals it. A
-    # no-log render may only create a row when none exists yet.
-    #
     # The no-run path (`--run-id ""`, what ci-timing.yml calls when no run is
     # picked) carries no run identity at all, so identical rows would otherwise
-    # accumulate up to `--max-history` and evict real samples.
+    # accumulate up to `--max-history` and evict real samples. One no-run row.
     if run_id:
         same = [e for e in previous if e.get("run_id") == run_id]
         rest = [e for e in previous if e.get("run_id") != run_id]
     else:
-        # `--run-id ""` (what ci-timing.yml calls when no run is picked) carries
-        # no run identity, so identical rows would otherwise accumulate up to
-        # `--max-history` and evict real samples. One no-run row at most.
         same = [e for e in previous if not e.get("run_id")]
         rest = [e for e in previous if e.get("run_id")]
-    # An unmeasured render may not REPLACE a measured row. The artifact's worst
-    # state — top-level parts zeroed while a history row still reports the real
-    # failures — is what an earlier bug left behind; a log-less render over it
-    # would zero the last measurement too (#9134 review cycle 6). Keeping the
-    # prior row is enough here: the top-level guard above already refuses when
-    # there are top-level measurements to lose, and a history-only seed still
-    # records the new row.
-    keep_prior = not log_sources and bool(same) and _row_is_measured(same[0])
-    history = ([same[0]] if keep_prior else [row]) + rest
+    # An unmeasured render may not REPLACE a measured row — and a keep must not
+    # REORDER the history either: `candidate_flakes` reads `history[i]` as newer
+    # than `history[i+1]`, so hoisting the kept row to the front turned a real
+    # flake into "none" (#9134 review cycle 7). Leaving `previous` untouched
+    # preserves both the numbers and the chronology.
+    keep_prior = not measured_now and bool(same) and _row_is_measured(same[0])
+    history = previous if keep_prior else [row, *rest]
     history = history[: args.max_history]
 
     flakes = candidate_flakes(history)
