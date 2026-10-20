@@ -227,6 +227,14 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # would pass without the fix). The fixture-param monkeypatch auto-restores at
     # teardown, so no lane leaks into a later docker-lane test.
     "test_fallback_snapshot.py": [r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
+    # #9192: the two-tenant lane's fixture forces the EMBEDDED lane (the delenv IS
+    # the point — it then pins TORTOISE_DB_PATH to a tmp_path registry.db and
+    # TORTOISE_EVENT_LOG_BASE_DIR to a tmp_path, so the per-tenant orgs, graphs and
+    # `tk_` keys all live in ONE store this test can read back; a URI redirect
+    # would split the seed from the auth resolution and every leg would prove
+    # nothing). The fixture-param monkeypatch auto-restores at teardown, so no lane
+    # leaks into a later docker-lane test.
+    "test_9192_tenant_armed_by_request.py": [r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
     # ── DELIBERATE_URI: module-level live-FalkorDB probes (set + restore at
     #    import; the probe asserts the docker lane) ──────────────────────────
     "test_aggregative_facet_coverage.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])',
