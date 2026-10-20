@@ -213,6 +213,7 @@ curve, and one of those guards has a **measured failure threshold**.
 | EP affected-claim frontier guard (new **claims** per hop) | **200** (`_EP_GUARD_FRONTIER_CAP`) | `tortoise/ep.py` |
 | Operator-set cap on an explicit-k BFS (the ranking's operator input) | **200 operators**, truncated deterministically by id with a stderr warning — and reported in the caller's RESULT as `truncated` / `operators_seen` / `operators_used` since #6211 | `tortoise/analyze.py` |
 | EP pass query that the engine aborts on its own query timeout | raised as **`EPSubgraphHopError`** (a `ResponseError` subclass) carrying the hop index (or `None` for a pass-level query), phase and frontier size (#6211) | `tortoise/ep.py` |
+| EP id-anchored query planning | every id-set statement whose predicate sits on the pattern's **far** endpoint carries a `WITH *` anchor barrier (`_EP_ANCHOR_BARRIER`), so the plan is a `Node By Index Scan` on the frontier instead of a label scan of the graph (#6211, measured below) | `tortoise/ep.py`, `tortoise/analyze.py` |
 | EP degenerate-run guard | fires when the pass has collected **≥ 50%** of the graph's claims, on graphs of **≥ 500** claims | `tortoise/ep.py` |
 | Dreaming per-pass window budget (stale-first) | **200** operators (`TORTOISE_DREAM_WINDOW_BUDGET`) | `tortoise/dream.py` |
 | Dreaming full-mode operator cap (`dream_all`) | **200,000** (`max_total_operators`) | `tortoise/dream.py` |
@@ -227,8 +228,53 @@ set**. Twelve of fourteen per-anchor passes raised the timeout. That ~200 is the
 hop query's own growth (the two-hop pattern traverses operators), and
 `tortoise/analyze.py` separately caps the collected operator set at 200 — it is
 **not** `_EP_GUARD_FRONTIER_CAP`, which bounds **new claims per hop**. The full
-measurement, the traces, and the three distinct failure modes are in **#6211**,
-which is open.
+measurement, the traces, and the three distinct failure modes are in **#6211**.
+
+**The hop's cost tracked the GRAPH, not the frontier (#6211, measured).** The
+shape above looked frontier-proportional, but the frontier was never the anchor:
+every id-set query of the pass was **planned as a label scan of the traversal's
+other endpoint**, with `n.id IN $ids` applied per record afterwards. Measured
+with `GRAPH.PROFILE` on a 23,354-node / 160,000-edge fixture (falkordb-server
+4.20.6), two-hop bridge at a 30-id frontier:
+
+| plan | records walked | wall |
+|---|---|---|
+| `Node By Label Scan (op:Point)` — shipped | 23,353 → 160,000 → **1,280,000** | 1.15 s |
+| `Node By Index Scan (n:Point)` — `WITH *` barrier | 30 → **1,445** | 0.009 s |
+
+That is why a **single-anchor** pass failed too: its floor is the whole graph's
+edge set plus one traversal per edge (`frontier=1` still cost 0.78 s on the
+fixture above), and it grows with every point the map gains. The barrier is now
+at every id-anchored statement of the pass whose id predicate sits on the
+**far** endpoint of the traversal — the seed neighbourhood, the plain-seed
+direct-edge expansion and both BFS hops, factor extraction (Batch 1 and the
+operator-viability query in `analyze.py`) and the cache load's back-message
+sweep. Three statements are id-anchored but needed no barrier, because their id
+predicate is already on the pattern's anchored side:
+`_load_cache`'s message sweep, `seed_operators`, and `_affected_factors`
+Batch 2 — measured `Node By Index Scan` before the change (pinned by
+`tests/test_6211_ep_anchor.py`, which asserts the plan, not the text).
+
+The two `OR`-shaped sweeps (`(a.id IN $ids OR b.id IN $ids)`, which can never be
+an index anchor) are split into one anchored sweep per endpoint: the
+target-anchored sweep takes every edge whose target is affected, the
+source-anchored sweep takes the rest (`NOT b.id IN $ids`), so each edge is
+admitted once without de-duplicating rows — a row-keyed dedupe would collapse
+two byte-identical parallel direct edges into one factor. Same fixture, engine
+at the issue's 1,000 ms query bound:
+`compute_confidence(anchors=[one claim], max_hops=2)` aborted at hop 1
+(operator_bridge) over a **29-claim** frontier before the change and now
+completes; the hop at a 1,000-id frontier went from **5.55 s** to **0.32 s**,
+and `analyze`'s operator-viability query from **242.5 ms** (`All Node Scan`) to
+**12.6 ms** (`Node By Index Scan`) — identical rows in every case. The affected
+sets and the extracted factor lists are byte-identical before and after
+(posteriors agree to ~1e-12, the summation order).
+
+What remains open after it: the pass **completes slowly** — the same one-anchor
+pass took **89 s** on the fixture, of which ~43 s is a per-message graph read
+(`_read_node`, 45,087 `MATCH (n:Point {id:$id})` calls in one pass) rather than a
+cache hit — and the `ep_dirty` clearing path below. Neither is a hop-budget
+problem, and neither is fixed here.
 
 This is why the frontier guard exists, and why it is a *bound* rather than an
 optimisation: the guard trades an exact closure for staying inside the store's

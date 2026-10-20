@@ -563,8 +563,20 @@ def _bfs_select_operators(proj, anchors: list[str], max_hops: int | None = 1,
         if not ids:
             return set()
         rows = proj.g.query(
-            "MATCH (op:Point {is_operator:true})-[:IMPL|NAND]-(t) "
-            "WHERE op.id IN $ids "
+            # #6211: the ANCHOR BARRIER. `MATCH (op:Point {is_operator:true})
+            # -[:IMPL|NAND]-(t) WHERE op.id IN $ids` is planned as
+            # `All Node Scan (t)` — the id predicate degrades to a per-record
+            # filter, so this query (which runs over the WHOLE operator
+            # frontier, the largest id set of the pass) paid for every node in
+            # the graph. Measured on a 23,354-node / 160,000-edge fixture,
+            # 200-operator frontier: 242.5 ms `All Node Scan (t)` -> 12.6 ms
+            # `Node By Index Scan (op)`, identical rows. Same defect and same
+            # shape as `ep._EP_ANCHOR_BARRIER` (see that constant); `WITH *`
+            # rather than `WITH op` so an id predicate is never separated from
+            # a variable a later clause needs (#7162).
+            "MATCH (op:Point) WHERE op.id IN $ids WITH * "
+            "MATCH (op)-[:IMPL|NAND]-(t) "
+            "WHERE op.is_operator = true "
             # #7927: ``t`` is a TRAVERSAL position reached from the anchored
             # operator — the claim a non-Point belief feeds is epistemic too.
             f"AND {epistemic_disjunction('t')} "
